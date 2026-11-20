@@ -658,9 +658,29 @@ pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     {
         tracing::warn!(pid = %pid, %error, "planner: host to disk spill failed");
     }
-    let prepared = crate::store::registry::with_kv_lock(&stores.kv, "planner-evict", |kv| {
-        kv.prepare_suspend(&working_sets)
-    });
+    // A set released while the eviction waited above (its pipeline ended,
+    // or failed and let it go) has nothing left to move: it is passed over,
+    // never an error. Named an unknown set, the whole eviction failed, the
+    // process went back resident and was picked again, its lanes held.
+    // With every set gone it moves only what else it holds, and with
+    // nothing it is "found nothing", its lanes released as any such.
+    let (working_sets, prepared) =
+        crate::store::registry::with_kv_lock(&stores.kv, "planner-evict", |kv| {
+            let live: HashSet<WorkingSetId> = working_sets
+                .iter()
+                .copied()
+                .filter(|&ws| kv.page_len(ws).is_ok())
+                .collect();
+            if live.len() < working_sets.len() {
+                tracing::debug!(
+                    pid = %pid,
+                    gone = working_sets.len() - live.len(),
+                    "planner: an eviction's sets released while it waited are passed over"
+                );
+            }
+            let prepared = kv.prepare_suspend(&live);
+            (live, prepared)
+        });
     let kv = match prepared {
         Ok(kv) => kv,
         Err(error @ KvStoreError::HostSwapFull { .. }) => {

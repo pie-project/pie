@@ -136,6 +136,8 @@ struct SealedFrame {
     /// The widest of its fires' rung rows: a frame sealed under the cap
     /// goes as sealed, and the rung is not lowered under it until it has.
     widest: usize,
+    /// Its members whose fires in it are a prompt's.
+    prompts: BTreeSet<ProcessId>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -237,6 +239,16 @@ pub(crate) struct FramePolicy {
     /// The lanes with a fire in a posted frame, exactly
     /// ([`Self::on_frame_posted`], [`Self::on_frame_retired`]).
     in_flight_lanes: BTreeSet<ProcessId>,
+    /// Lanes whose prompt is executing on the engine now: posted
+    /// ([`Self::on_frame_posted`]) from a frame that sealed it as a prompt,
+    /// until it lands or fails ([`Self::on_frame_retired`]), its lane
+    /// leaves, or its owner is suspended or leaves. Only these hold a
+    /// prompt behind them: a prompt recorded in flight that no landing ever
+    /// clears held every later prompt for good.
+    prompts_executing: BTreeSet<ProcessId>,
+    /// The prompts of the frame last handed out to post
+    /// ([`FramePlan::Dispatch`]): executing once posted.
+    dispatched_prompts: BTreeSet<ProcessId>,
     in_flight_since: BTreeMap<ProcessId, Instant>,
     /// The rung rows a fire sealed now may take: the activation rung's cap
     /// ([`Self::cap_fires`]).
@@ -290,9 +302,13 @@ impl FramePolicy {
     /// A frame was posted to the engine with fires of `lanes`: they owe its
     /// output until it retires ([`Self::on_frame_retired`]).
     pub fn on_frame_posted(&mut self, lanes: impl IntoIterator<Item = ProcessId>, now: Instant) {
+        let prompts = std::mem::take(&mut self.dispatched_prompts);
         for lane in lanes {
             self.in_flight_lanes.insert(lane);
             self.in_flight_since.entry(lane).or_insert(now);
+            if prompts.contains(&lane) {
+                self.prompts_executing.insert(lane);
+            }
         }
     }
 
@@ -332,6 +348,8 @@ impl FramePolicy {
             gather_seq: 0,
             quiesce_mark: None,
             in_flight_lanes: BTreeSet::new(),
+            prompts_executing: BTreeSet::new(),
+            dispatched_prompts: BTreeSet::new(),
             fire_cap: usize::MAX,
             in_flight_since: BTreeMap::new(),
             submit_deadline: crate::scheduler::configured_submit_deadline(),
@@ -539,6 +557,7 @@ impl FramePolicy {
         for lane in lanes {
             self.in_flight_lanes.remove(&lane);
             self.in_flight_since.remove(&lane);
+            self.prompts_executing.remove(&lane);
             if let Some(state) = self.lanes.get_mut(&lane) {
                 state.clock_from = None;
                 state.retired_at = Some(now);
@@ -644,6 +663,8 @@ impl FramePolicy {
 
     pub fn on_lane_leave(&mut self, lane: ProcessId, owner: Option<ProcessId>, purge_queued: bool) {
         let owner = owner.or_else(|| self.lanes.get(&lane).and_then(|state| state.owner));
+        // Its prompt holds no other behind it from here, landed or not.
+        self.prompts_executing.remove(&lane);
         if purge_queued {
             self.lanes.remove(&lane);
             self.truncated_seqs.remove(&lane);
@@ -677,6 +698,7 @@ impl FramePolicy {
         for id in owned {
             self.truncated_seqs.remove(&id);
             self.in_flight_lanes.remove(&id);
+            self.prompts_executing.remove(&id);
         }
         self.lanes.retain(|_, lane| lane.owner != Some(owner));
         self.pending_binds.remove(&owner);
@@ -687,6 +709,19 @@ impl FramePolicy {
 
     pub fn on_process_suspend(&mut self, owner: ProcessId) {
         self.suspended.insert(owner);
+        // A suspended owner's prompt holds no other prompt: its fires are
+        // drained or cancelled by the suspension, and whether a landing
+        // for them ever reaches here is the suspension's, not the frame's.
+        let owned: Vec<ProcessId> = self
+            .lanes
+            .iter()
+            .filter(|(_, lane)| lane.owner == Some(owner))
+            .map(|(id, _)| *id)
+            .collect();
+        for lane in owned {
+            self.prompts_executing.remove(&lane);
+        }
+        self.prompts_executing.remove(&owner);
         self.pending_binds.remove(&owner);
         self.park_owner(owner);
     }
@@ -879,12 +914,13 @@ impl FramePolicy {
         // A lane whose own prompt is in flight continues it in the next frame
         // (its next piece reads what that one writes, in order on the
         // device): there is no prompt behind it to bind.
-        let prompting_in_flight: BTreeSet<ProcessId> = self
-            .in_flight_lanes
-            .iter()
-            .copied()
-            .filter(|lane| self.lanes.get(lane).is_some_and(|state| state.prompting))
-            .collect();
+        let prompting_in_flight: BTreeSet<ProcessId> = self.prompts_executing.clone();
+        debug_assert!(
+            self.prompts_executing.is_subset(&self.in_flight_lanes),
+            "a prompt executing on no lane in flight: {:?} of {:?}",
+            self.prompts_executing,
+            self.in_flight_lanes
+        );
         loop {
             let mut fresh: Vec<ProcessId> = Vec::new();
             let mut continuing: Vec<ProcessId> = Vec::new();
@@ -963,6 +999,7 @@ impl FramePolicy {
             let mut wave_rows = vec![0usize; k];
             let mut wave_readouts = vec![0usize; k];
             let mut members: HashSet<ProcessId> = HashSet::new();
+            let mut prompts: BTreeSet<ProcessId> = BTreeSet::new();
             let mut sealed_widest = 0usize;
             let mut dropped_empty = false;
             let mut skipped = SealSkips::default();
@@ -1057,12 +1094,19 @@ impl FramePolicy {
                 }
                 lane.served = true;
                 lane.prompting = prompting;
+                if prompting {
+                    prompts.insert(*lane_id);
+                }
                 lane.frames.pop_front();
             }
             if fire_waves.is_empty() {
                 if dropped_empty {
                     continue;
                 }
+                debug_assert!(
+                    skipped.prompt_held == 0 || !self.prompts_executing.is_empty(),
+                    "a prompt held behind none executing"
+                );
                 self.seal_skips = skipped;
                 self.lanes
                     .retain(|_, lane| {
@@ -1105,6 +1149,7 @@ impl FramePolicy {
                 waves,
                 members: members.iter().copied().collect(),
                 widest: sealed_widest,
+                prompts,
             });
             self.lanes
                 .retain(|_, lane| {
@@ -1153,6 +1198,8 @@ impl FramePolicy {
         executing: bool,
         now: Instant,
     ) -> FramePlan {
+        // A frame handed out and never posted makes no prompt executing.
+        self.dispatched_prompts.clear();
         let plan = self.plan_frames(still_queued, blocked_lanes, executing, now);
         debug_assert!(
             plan != FramePlan::Park
@@ -1323,6 +1370,7 @@ ready_age_newest={}us",
                 if starved_us >= idle_dump_threshold_us() {
                     println!("[idle-gap] {starved_us}us  {}", self.debug_summary());
                 }
+                self.dispatched_prompts = frame.prompts;
                 return FramePlan::Dispatch(frame.waves);
             }
             if self.boundary_open() {
@@ -1976,6 +2024,37 @@ mod tests {
         }
     }
 
+    /// A prompt's owner suspended while its prompt is in flight, its landing
+    /// never reaching the frame (its fires cancelled with the suspension):
+    /// the next prompt is sealed and dispatched at once, held behind no
+    /// prompt that is not executing; so too once a prompt's lane leaves
+    /// (its set released) before it lands.
+    #[test]
+    fn a_prompt_whose_owner_is_suspended_mid_flight_holds_no_later_prompt() {
+        let mut policy = FramePolicy::new(1, 64, 4096, None)
+            .with_submit_deadline(Duration::from_secs(86_400));
+        let (a, b, c) = (pid(), pid(), pid());
+        policy.on_fire_enqueued(stamp(a, 0, 0, 1), Some(a), 1, 8, 1);
+        let queued: QueuedFireIds = [1].into_iter().collect();
+        assert_eq!(fires(&plan(&mut policy, &queued, Instant::now())), vec![1]);
+        policy.on_frame_posted([a], Instant::now());
+        assert!(policy.prompts_executing.contains(&a), "a's prompt executes");
+        policy.on_fire_enqueued(stamp(b, 0, 0, 1), Some(b), 2, 8, 1);
+        let queued: QueuedFireIds = [2].into_iter().collect();
+        // a's owner is suspended; its landing never comes.
+        policy.on_process_suspend(a);
+        assert!(policy.prompts_executing.is_empty());
+        let planned = plan(&mut policy, &queued, Instant::now());
+        assert_eq!(fires(&planned), vec![2], "b's prompt goes");
+        policy.on_frame_posted([b], Instant::now());
+        // b's lane leaves (its set released) before it lands: c's prompt
+        // is held by nothing.
+        policy.on_lane_leave(b, Some(b), false);
+        policy.on_fire_enqueued(stamp(c, 0, 0, 1), Some(c), 3, 8, 1);
+        let queued: QueuedFireIds = [3].into_iter().collect();
+        assert_eq!(fires(&plan(&mut policy, &queued, Instant::now())), vec![3]);
+    }
+
     /// Shape (2) as a seeded schedule: lanes submit frames in rounds (one or
     /// two frames in flight per lane, landings out of order), some
     /// owners then pause briefly in a wait parked nowhere (their lanes stay
@@ -2021,6 +2100,7 @@ mod tests {
             let mut state = vec![0u8; lanes.len()];
             let mut parked_fires: Vec<u64> = Vec::new();
             let mut landing_late: Vec<ProcessId> = Vec::new();
+            let mut lost: HashSet<ProcessId> = HashSet::new();
             let mut schedule = vec![format!("k={k} slots={slots} lanes={}", lanes.len())];
             let mut failed = None;
             for round in 0..10 {
@@ -2042,8 +2122,10 @@ mod tests {
                     if state[at] != 0 {
                         continue;
                     }
+                    // Some frames are a prompt's (tokens past its row).
+                    let tokens = if rng.below(4) == 0 { 8 } else { 1 };
                     for slot in 0..slots {
-                        policy.on_fire_enqueued(stamp(lane, seq[at], slot, slots), Some(lane), next_id, 1, 1);
+                        policy.on_fire_enqueued(stamp(lane, seq[at], slot, slots), Some(lane), next_id, tokens, 1);
                         queued.push(next_id);
                         last[at] = next_id;
                         next_id += 1;
@@ -2081,6 +2163,13 @@ mod tests {
                         }
                         if rng.below(2) == 0 {
                             policy.on_process_suspend(lanes[at]);
+                            // Suspended mid-prompt, its landing may never
+                            // reach the frame (its fires cancelled).
+                            if rng.below(2) == 0 {
+                                landing_late.retain(|lane| *lane != lanes[at]);
+                                lost.insert(lanes[at]);
+                                schedule.push(format!("r{round}: lane {at}'s landing is lost"));
+                            }
                             schedule.push(format!("r{round}: lane {at} suspended"));
                         } else {
                             policy.on_owner_waits(lanes[at]);
@@ -2103,6 +2192,7 @@ mod tests {
                             parked_fires.retain(|id| !posted.contains(id));
                             let members: Vec<ProcessId> = lanes.clone();
                             policy.on_frame_posted(members.clone(), Instant::now());
+                            lost.clear();
                             // Landings out of order: some lanes retire now,
                             // the rest with a later frame.
                             let (now_lanes, later): (Vec<ProcessId>, Vec<ProcessId>) =
@@ -2128,6 +2218,23 @@ mod tests {
                 if failed.is_some() {
                     break;
                 }
+                // (A seal never holds a prompt behind none executing: asserted
+                // where it skips one, in this debug build.)
+                // A prompt executing holds the next prompt until it lands:
+                // a held frame then waits on that landing, not on nothing.
+                let prompt_lands = !policy.prompts_executing.is_empty();
+                // A prompt holds others only while it executes: none with
+                // no lane in flight, and none whose landing was lost with
+                // its owner's suspension (not posted since).
+                if !policy.prompts_executing.is_subset(&policy.in_flight_lanes)
+                    || policy.prompts_executing.iter().any(|lane| lost.contains(lane))
+                {
+                    failed = Some(format!(
+                        "r{round}: prompts held behind {:?} with {:?} in flight, {:?} lost",
+                        policy.prompts_executing, policy.in_flight_lanes, lost
+                    ));
+                    break;
+                }
                 // The invariant: a frame whose expected lanes have all
                 // submitted is sealed (nothing ready waits on nothing).
                 let ready: Vec<&LaneState> = policy
@@ -2142,7 +2249,7 @@ mod tests {
                     .all(|lane| lane.frames.front().is_some_and(PendingFrame::is_complete));
                 // A parked or blocked owner's complete frame waits only on
                 // lanes still expected: with all of them in, it is sealed.
-                let held_for_nobody = all_in && policy.lanes.values().any(|lane| {
+                let held_for_nobody = all_in && !prompt_lands && policy.lanes.values().any(|lane| {
                     !lane.awaited
                         && lane.owner.is_some_and(|owner| {
                             policy.suspended.contains(&owner) || policy.blocked.contains(&owner)
@@ -2155,14 +2262,14 @@ mod tests {
                     ));
                     break;
                 }
-                if !ready.is_empty() && all_in && !queued.is_empty() {
+                if !ready.is_empty() && all_in && !queued.is_empty() && !prompt_lands {
                     failed = Some(format!(
                         "r{round}: every expected lane submitted and {} complete frames unsealed",
                         ready.len()
                     ));
                     break;
                 }
-                if let Some(id) = parked_fires.iter().find(|id| all_in && queued.contains(id)) {
+                if let Some(id) = parked_fires.iter().find(|id| all_in && !prompt_lands && queued.contains(id)) {
                     failed = Some(format!("r{round}: a parked owner's complete fire {id} not dispatched"));
                     break;
                 }
