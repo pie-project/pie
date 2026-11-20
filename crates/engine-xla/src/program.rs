@@ -580,9 +580,6 @@ impl Plane {
     /// [`Plane::finish`] makes it the program. Until then no instance of
     /// it binds.
     pub fn prepare(&mut self, registration: &ProgramRegistration) -> Result<Pending, Refusal> {
-        // XLA's guest lowering has no bf16 yet: such a program is refused by
-        // name, never computed as another dtype.
-        registration.launch.refuse_bf16().map_err(Refusal::Program)?;
         let plan = eta_exec::adopt_launch_package(registration.launch.clone())
             .map_err(|error| Refusal::Program(error.to_string()))?;
         if !plan.executable {

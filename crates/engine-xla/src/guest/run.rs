@@ -566,8 +566,11 @@ fn encode(value: &Value, dtype: Dtype, n: usize, out: &mut Vec<u32>) -> Result<(
                 }
             }
         }
-        // A bf16 program is refused at its registration (`Plane::prepare`).
-        Value::Bf16(_) => return Err(eta_compiler::codegen::launch::NO_BF16.to_string()),
+        // two to a word, element `2w` in the low half (`eta_ir::types`)
+        Value::Bf16(v) => out.extend(
+            v.chunks(2)
+                .map(|pair| u32::from(pair[0]) | pair.get(1).map_or(0, |&h| u32::from(h) << 16)),
+        ),
     }
     Ok(())
 }
@@ -576,6 +579,11 @@ fn decode(words: &[u32], dtype: Dtype, n: usize) -> Value {
     match dtype {
         Dtype::F32 => Value::F32(words[..n].iter().map(|&w| f32::from_bits(w)).collect()),
         Dtype::I32 => Value::I32(words[..n].iter().map(|&w| w as i32).collect()),
+        Dtype::Bf16 => Value::Bf16(
+            (0..n)
+                .map(|j| (words[j / 2] >> (16 * (j % 2))) as u16)
+                .collect(),
+        ),
         Dtype::Bool => Value::Bool(
             (0..n)
                 .map(|j| (words[j / 32] >> (j % 32)) & 1 != 0)

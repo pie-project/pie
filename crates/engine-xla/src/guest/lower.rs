@@ -233,6 +233,9 @@ pub struct Lowered {
 pub fn words(dtype: Dtype, numel: usize) -> usize {
     if dtype == Dtype::Bool {
         numel.div_ceil(32)
+    } else if dtype == Dtype::Bf16 {
+        // two to a word, element `2w` in the low half (`eta_ir::types`)
+        numel.div_ceil(2)
     } else {
         numel
     }
@@ -240,7 +243,10 @@ pub fn words(dtype: Dtype, numel: usize) -> usize {
 
 fn elem(dtype: Dtype) -> Lowering<Elem> {
     Ok(match dtype {
-        Dtype::F32 => Elem::F32,
+        // A bf16 value is held as the f32 it stands for, rounded to bf16 on
+        // its store (`Lower::set`): every op loads it exactly and computes
+        // in f32 (`eta_ir::types`' bf16 rules).
+        Dtype::F32 | Dtype::Bf16 => Elem::F32,
         Dtype::I32 => Elem::I32,
         Dtype::U32 => Elem::U32,
         Dtype::Bool => Elem::Pred,
@@ -611,7 +617,16 @@ impl Lower<'_> {
         self.package.values[id as usize].shape.clone()
     }
 
+    /// The dtype value `id` computes as: a bf16 value is an f32 to every op
+    /// (it loads exactly); [`Self::stored`] is its declared dtype.
     fn dtype(&self, id: u32) -> Dtype {
+        match self.stored(id) {
+            Dtype::Bf16 => Dtype::F32,
+            d => d,
+        }
+    }
+
+    fn stored(&self, id: u32) -> Dtype {
         self.package.values[id as usize].dtype
     }
 
@@ -642,8 +657,41 @@ impl Lower<'_> {
                 self.f.elem(v)
             ));
         }
+        // A bf16 value's store rounds its f32 to bf16, nearest-even, a NaN
+        // quiet, and holds the f32 that bf16 stands for.
+        let v = if self.stored(id) == Dtype::Bf16 {
+            self.round_bf16(v)?
+        } else {
+            v
+        };
         self.env.insert(id, v);
         Ok(())
+    }
+
+    /// `v` (f32) rounded to bf16, nearest-even, as the f32 it stands for
+    /// (`eta_ir::types::bf16_bits`), in integer ops on its bits: XLA, free to
+    /// keep excess precision, drops an f32 -> bf16 -> f32 convert pair (v6e:
+    /// half of a row came back unrounded).
+    fn round_bf16(&mut self, v: Val) -> Lowering<Val> {
+        let bits = self.f.bitcast(v, Elem::U32)?;
+        let dims = self.f.dims(bits).to_vec();
+        let k = |f: &mut Func, x: i64| f.const_i(Elem::U32, x, &dims);
+        let sixteen = k(&mut self.f, 16);
+        let one = k(&mut self.f, 1);
+        let lsb = self.f.shr(bits, sixteen)?;
+        let lsb = self.f.and(lsb, one)?;
+        let half = k(&mut self.f, 0x7FFF);
+        let bias = self.f.add(half, lsb)?;
+        let up = self.f.add(bits, bias)?;
+        let top = k(&mut self.f, 0xFFFF_0000);
+        let rounded = self.f.and(up, top)?;
+        // a NaN stays a NaN, quiet: its sign and exponent, the quiet bit set
+        let quiet = k(&mut self.f, 0x0040_0000);
+        let nan = self.f.or(bits, quiet)?;
+        let nan = self.f.and(nan, top)?;
+        let is_nan = self.f.compare(Cmp::Ne, v, v)?;
+        let out = self.f.select(is_nan, nan, rounded)?;
+        Ok(self.f.bitcast(out, Elem::F32)?)
     }
 
     /// `v` (one lane's value is `[B, ..]` of any shape with the same count)
@@ -729,6 +777,22 @@ impl Lower<'_> {
             Dtype::U32 => cut,
             Dtype::F32 => self.f.bitcast(cut, Elem::F32)?,
             Dtype::I32 => self.f.bitcast(cut, Elem::I32)?,
+            Dtype::Bf16 => {
+                // element `2w` the low half of word `w`, `2w + 1` the high;
+                // each half shifted up 16 is the f32 it stands for
+                let dims = [b, w as i64, 2];
+                let spread = self.f.broadcast(cut, &dims, &[0, 1])?;
+                let half = self.f.iota(Elem::U32, &dims, 2);
+                let sixteen = self.f.const_i(Elem::U32, 16, &dims);
+                let by = self.f.mul(half, sixteen)?;
+                let moved = self.f.shr(spread, by)?;
+                let low = self.f.const_i(Elem::U32, 0xFFFF, &dims);
+                let bits = self.f.and(moved, low)?;
+                let up = self.f.shl(bits, sixteen)?;
+                let flat = self.f.reshape(up, &[b, (w * 2) as i64])?;
+                let flat = self.f.slice(flat, &[0, 0], &[b, n as i64], &[1, 1])?;
+                self.f.bitcast(flat, Elem::F32)?
+            }
             Dtype::Bool => {
                 let dims = [b, w as i64, 32];
                 let spread = self.f.broadcast(cut, &dims, &[0, 1])?;
@@ -752,6 +816,24 @@ impl Lower<'_> {
         Ok(match dtype {
             Dtype::U32 => flat,
             Dtype::F32 | Dtype::I32 => self.f.bitcast(flat, Elem::U32)?,
+            Dtype::Bf16 => {
+                // the held f32 is bf16-exact: its upper 16 bits, two a word
+                let w = n.div_ceil(2);
+                let bits = self.f.bitcast(flat, Elem::U32)?;
+                let sixteen = self.f.const_i(Elem::U32, 16, &[b, n as i64]);
+                let top = self.f.shr(bits, sixteen)?;
+                let zero = self.f.const_i(Elem::U32, 0, &[]);
+                let padded = self
+                    .f
+                    .pad(top, zero, &[0, 0], &[0, (w * 2 - n) as i64], &[0, 0])?;
+                let dims = [b, w as i64, 2];
+                let pairs = self.f.reshape(padded, &dims)?;
+                let half = self.f.iota(Elem::U32, &dims, 2);
+                let s16 = self.f.const_i(Elem::U32, 16, &dims);
+                let by = self.f.mul(half, s16)?;
+                let placed = self.f.shl(pairs, by)?;
+                self.f.reduce(placed, &[2], Fold::Sum)?
+            }
             Dtype::Bool => {
                 let w = n.div_ceil(32);
                 let bits = self.f.convert(flat, Elem::U32);
@@ -1139,6 +1221,32 @@ impl Lower<'_> {
             .const_f(Elem::F32, f64::from(rng::UNIFORM_MAX), &dims);
         let under = self.f.compare(Cmp::Lt, raw, cap)?;
         Ok(self.f.select(under, raw, cap)?)
+    }
+
+    /// The keyed stream's seed from operand `i`, an rng state of u32 words
+    /// (key, then counter): `rng_keyed`'s.
+    fn keyed_seed(&mut self, op: &LaunchOp, i: usize) -> Lowering<Val> {
+        let (is, state) = self.raw_arg(op, i)?;
+        if self.dtype(is) != Dtype::U32 || numel(&self.shape(is)) < 1 {
+            return refuse("an rng state that is not u32 words");
+        }
+        let per = numel(&self.shape(is)) as i64;
+        let b = self.b;
+        let words = self.f.reshape(state, &[b, per])?;
+        let key = self.f.slice(words, &[0, 0], &[b, 1], &[1, 1])?;
+        let key = self.f.reshape(key, &[b])?;
+        let key = self.f.convert(key, Elem::U64);
+        let ctr = if per > 1 {
+            let c = self.f.slice(words, &[0, 1], &[b, 2], &[1, 1])?;
+            let c = self.f.reshape(c, &[b])?;
+            self.f.convert(c, Elem::U64)
+        } else {
+            self.u64s(0, &[b])
+        };
+        let shift = self.u64s(u64::from(rng::RNG_FORMULA.keyed_word_bits), &[b]);
+        let hi = self.f.shl(key, shift)?;
+        let joined = self.f.or(hi, ctr)?;
+        self.splitmix(joined)
     }
 
     /// `rng_lanes(seed[b], n, kind)` as `[B, n]` f32.
@@ -1644,29 +1752,35 @@ impl Lower<'_> {
                     let s = rng::seed_eff_stream(0, op.imm);
                     self.u64s(s, &[self.b])
                 } else {
-                    let (is, state) = self.raw_arg(op, 0)?;
-                    if self.dtype(is) != Dtype::U32 || numel(&self.shape(is)) < 1 {
-                        return refuse("an rng state that is not u32 words");
-                    }
-                    let per = numel(&self.shape(is)) as i64;
-                    let b = self.b;
-                    let words = self.f.reshape(state, &[b, per])?;
-                    let key = self.f.slice(words, &[0, 0], &[b, 1], &[1, 1])?;
-                    let key = self.f.reshape(key, &[b])?;
-                    let key = self.f.convert(key, Elem::U64);
-                    let ctr = if per > 1 {
-                        let c = self.f.slice(words, &[0, 1], &[b, 2], &[1, 1])?;
-                        let c = self.f.reshape(c, &[b])?;
-                        self.f.convert(c, Elem::U64)
-                    } else {
-                        self.u64s(0, &[b])
-                    };
-                    let shift = self.u64s(u64::from(rng::RNG_FORMULA.keyed_word_bits), &[b]);
-                    let hi = self.f.shl(key, shift)?;
-                    let joined = self.f.or(hi, ctr)?;
-                    self.splitmix(joined)?
+                    self.keyed_seed(op, 0)?
                 };
                 let y = self.draw(seed, n, op.rng_kind)?;
+                let y = self.reshaped(y, &shape)?;
+                self.set(result, y)
+            }
+            tags::GUMBEL_ARGMAX => {
+                // Each lane `logits[i] / divisor + gumbel(state, i)`, `-inf`
+                // where `keep` is false, in f32 from its operands as loaded
+                // and never stored (a bf16 store would collapse near ties),
+                // then `reduce_argmax`: the unfused draw's operations in its
+                // order, `rng_keyed`'s noise over the logits' shape.
+                let (il, x) = self.raw_arg(op, 0)?;
+                if self.dtype(il) != Dtype::F32 {
+                    return refuse("a gumbel draw over non-float logits");
+                }
+                let row = self.shape(il);
+                let n = numel(&row) as i64;
+                let keep = self.arg(op, 1, &row)?;
+                let d = self.arg(op, 2, &row)?;
+                let scaled = self.f.div(x, d)?;
+                let floor = self.splat_f(scaled, f32::NEG_INFINITY);
+                let masked = self.f.select(keep, scaled, floor)?;
+                let seed = self.keyed_seed(op, 3)?;
+                let noise = self.draw(seed, n, RngKind::Gumbel)?;
+                let noise = self.reshaped(noise, &row)?;
+                let perturbed = self.f.add(masked, noise)?;
+                let (rows, _, _) = self.rows_of(perturbed)?;
+                let y = self.argmax_f32(rows)?;
                 let y = self.reshaped(y, &shape)?;
                 self.set(result, y)
             }
@@ -1675,6 +1789,10 @@ impl Lower<'_> {
     }
 
     fn cast(&mut self, x: Val, from: Dtype, to: Dtype) -> Lowering<Val> {
+        // bf16 widens exactly (it is held as its f32); a cast to bf16 is the
+        // f32's, rounded by the result's store
+        let f32_of = |d: Dtype| if d == Dtype::Bf16 { Dtype::F32 } else { d };
+        let (from, to) = (f32_of(from), f32_of(to));
         if from == to {
             return Ok(x);
         }
