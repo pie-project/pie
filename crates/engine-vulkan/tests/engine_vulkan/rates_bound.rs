@@ -17,9 +17,6 @@ const BOUND: std::time::Duration = std::time::Duration::from_millis(25);
 const TOP: u32 = 4096;
 
 #[test]
-#[ignore = "the warm-up cube's first fire (`engine_gpu::rates::warm_at`) is submitted with no \
-            estimate and, after the step's host-bound shapes, runs at a dropped clock: 26 to 44 ms \
-            on the device under this 25 ms bound on an L40S, 13 to 22 ms on other runs"]
 fn the_rates_step_stays_under_a_simulated_bound() {
     let Ok(device) = Context::bind(&crate::gpu::device_boot(), engine::Allowance::WHOLE) else {
         eprintln!("not asked: no device");
