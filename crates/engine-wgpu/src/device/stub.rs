@@ -99,6 +99,11 @@ impl Context {
     }
 
     #[must_use]
+    pub fn pool_segments(&self) -> usize {
+        match self.never {}
+    }
+
+    #[must_use]
     pub fn left(&self) -> u64 {
         match self.never {}
     }

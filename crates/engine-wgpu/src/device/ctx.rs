@@ -585,6 +585,12 @@ impl Context {
         self.core.limits.max_storage_buffers_per_shader_stage
     }
 
+    /// The segments the kernels bind the state pool in on this device.
+    #[must_use]
+    pub fn pool_segments(&self) -> usize {
+        kernels_slang::wgsl_pool_segments(self.storage_buffers())
+    }
+
     /// What the working set has left now, less this process's allocations.
     #[must_use]
     pub fn left(&self) -> u64 {

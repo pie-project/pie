@@ -31,13 +31,12 @@ pub struct Pool<B: Backend> {
     table: ChunkTable,
 }
 
-/// The chunks a segment holds: a quarter of the pool (the kernels bind four
-/// segments), never more than one binding spans, one at least.
+/// The chunks a segment holds: a `segments`-th of the pool, within one binding, one at least.
 #[must_use]
-pub fn segment_chunks(chunk_bytes: u64, total_chunks: u32, binding: u64) -> u32 {
-    let quarter = total_chunks.div_ceil(SEGMENTS as u32).max(1);
+pub fn segment_chunks(chunk_bytes: u64, total_chunks: u32, binding: u64, segments: usize) -> u32 {
+    let share = total_chunks.div_ceil(segments.max(1) as u32).max(1);
     let fits = u32::try_from(binding / chunk_bytes.max(1)).unwrap_or(u32::MAX);
-    quarter.min(fits).max(1)
+    share.min(fits).max(1)
 }
 
 impl<B: Backend> Pool<B> {

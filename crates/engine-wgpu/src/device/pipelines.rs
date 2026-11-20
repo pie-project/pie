@@ -123,8 +123,9 @@ fn reflect(wgsl: &str) -> std::result::Result<Declared, String> {
         used[b as usize] = reached;
         read_only[b as usize] = ro;
     }
+    // A one-segment build leaves a gap where the three unread segments were.
     if let Some(u) = uniform
-        && u != bindings
+        && u < bindings
     {
         return Err(format!(
             "the uniform block sits at binding {u} but the storage bindings end at {bindings}"
@@ -306,7 +307,12 @@ impl Pipelines {
         if let Some(pipeline) = self.built.borrow().get(key) {
             return Ok(Arc::clone(pipeline));
         }
-        let wgsl = kernels_slang::wgsl(key).ok_or(Fault::Shader {
+        let source = if device.pool_segments() < kernels_slang::SEGMENTS {
+            kernels_slang::one_segment(key).unwrap_or(key)
+        } else {
+            key
+        };
+        let wgsl = kernels_slang::wgsl(source).ok_or(Fault::Shader {
             file,
             entrypoint: key,
             why: "kernels-slang holds no WGSL module by that key (built without \
