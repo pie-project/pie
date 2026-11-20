@@ -238,9 +238,12 @@ pub(crate) fn analyze_direct_argmax(
                 draw_divisor = Some(divisor);
             }
             if every_lane && (unit || draw_divisor.is_some()) {
-                // A constant the draw alone reads is taken in with it.
-                let head = [keep, divisor]
-                    .into_iter()
+                // A constant the draw alone reads is taken in with it; a
+                // divisor the fused draw reads keeps its bytes.
+                let taken: &[u32] = if unit { &[keep, divisor] } else { &[keep] };
+                let head = taken
+                    .iter()
+                    .copied()
                     .filter(|&v| {
                         single_consumer(v, node as u32)
                             && ops[producers[v as usize] as usize].tag == tags::CONST
