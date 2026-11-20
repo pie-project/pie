@@ -19,6 +19,7 @@ default = ["net"]
 net = [
     "dep:client",
     "dep:mimalloc",
+    "dep:libmimalloc-sys",
     "dep:reqwest",
     "dep:tarpc",
     "dep:tokio-tungstenite",
@@ -77,6 +78,7 @@ tarpc = { version = "0.38", optional = true, features = [
 tokio-tungstenite = { version = "0.30.0", optional = true }
 futures = "0.3.33"
 mimalloc = { version = "0.1", features = ["local_dynamic_tls", "no_thp"], optional = true }
+libmimalloc-sys = { version = "0.1", features = ["extended"], optional = true }
 tracing = "0.1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "stream"], optional = true }
 
