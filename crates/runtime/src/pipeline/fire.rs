@@ -367,6 +367,15 @@ async fn acquire_grant<C: FireContext>(
     } else {
         acquire.await
     };
+    // A request the planner dropped while its process is still its own
+    // (its entry gone under it) is asked again, quoted anew: a wait, never
+    // the client's failure (the L40S on 5aa45805b: a beam failed "prefill
+    // submit ... KV capacity: planner request cancelled"). One whose
+    // process left the planner is its departure's.
+    if matches!(acquired, Err(crate::planner::PlannerError::Cancelled)) && planner.registered(pid) {
+        tracing::debug!(%pid, "pipeline: a KV request the planner dropped is asked again");
+        return Ok(None);
+    }
     match acquired.map_err(|error| format!("pipeline: KV capacity: {error}"))? {
         crate::planner::Acquired::Granted(grant) => Ok(Some(grant)),
         crate::planner::Acquired::Yield => {

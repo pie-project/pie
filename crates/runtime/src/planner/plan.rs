@@ -218,6 +218,13 @@ impl ResidencyPlanner {
             .join(" ")
     }
 
+    /// Whether `pid` is a process this planner holds: a request of its that
+    /// came back cancelled was dropped under it, not by its departure.
+    #[must_use]
+    pub fn registered(&self, pid: ProcessId) -> bool {
+        self.with_inner(|inner| inner.procs.contains_key(&pid))
+    }
+
     /// Plan passes so far, their total time (us), mean (us) and the power of
     /// two of microseconds 99 of each 100 fell under: the census the field
     /// reads a pass's cost by.
