@@ -78,7 +78,7 @@ pub enum Op {
     ReduceMin(ValueId),
     ReduceArgmax(ValueId),
     /// A Gumbel-max draw over the last axis, reduced with no row of its
-    /// own: the index of each row's largest `logits[i] / divisor +
+    /// own: the index of each row's largest `logits[i] * scale +
     /// gumbel(state, i)` (as `RngKeyed { state, shape: logits' shape,
     /// kind: Gumbel }` draws lane `i`), a lane whose `keep` is false
     /// `-inf`, each lane computed in f32 and never rounded, ties and NaN
@@ -86,7 +86,7 @@ pub enum Op {
     GumbelArgmax {
         logits: ValueId,
         keep: ValueId,
-        divisor: ValueId,
+        scale: ValueId,
         state: ValueId,
     },
 
@@ -464,7 +464,7 @@ declare_operands! {
 
         Op::Select { cond: a, a: b, b: c } => [a, b, c],
 
-        Op::GumbelArgmax { logits: a, keep: b, divisor: c, state: d } => [a, b, c, d],
+        Op::GumbelArgmax { logits: a, keep: b, scale: c, state: d } => [a, b, c, d],
 
         Op::ScatterAdd { base: a, idx: b, vals: c }
         | Op::ScatterSet { base: a, idx: b, vals: c } => [a, b, c],
@@ -602,7 +602,7 @@ declare_ops! {
     REDUCE_ARGMAX = 0x33, "reduce_argmax", ReduceScan, 1, 1,
         Op::ReduceArgmax(0), Op::ReduceArgmax(_), [Value];
     GUMBEL_ARGMAX = 0x34, "gumbel_argmax", ReduceScan, 4, 1,
-        Op::GumbelArgmax { logits: 0, keep: 1, divisor: 2, state: 3 }, Op::GumbelArgmax { .. },
+        Op::GumbelArgmax { logits: 0, keep: 1, scale: 2, state: 3 }, Op::GumbelArgmax { .. },
         [Value, Value, Value, Value];
     BROADCAST = 0x38, "broadcast", Shape, 1, 1,
         Op::Broadcast { value: 0, shape: Shape::vector(4) }, Op::Broadcast { .. }, [Value, Shape];

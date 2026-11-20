@@ -127,7 +127,7 @@ fn masking() -> Traced {
         let softened = softmax(&masked);
         let by_mass = pivot_threshold(&softened, cummass_le(0.9));
         let by_prob = pivot_threshold(&softened, prob_ge(0.1));
-        drawn.put(gumbel_argmax(&masked, &by_mass, 0.8f32, state.read()));
+        drawn.put(gumbel_argmax(&masked, &by_mass, 1.0 / 0.8f32, state.read()));
         out.put(add(masked, broadcast(add(by_mass, by_prob), [4, 8])));
     });
     builder.build().unwrap()

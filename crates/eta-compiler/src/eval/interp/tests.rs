@@ -294,7 +294,7 @@ fn the_interpreter_narrows_where_the_ir_types_bf16() {
 }
 
 /// `gumbel_argmax` over f32 logits is the draw it fuses, bit for bit:
-/// `reduce_argmax(select(keep, logits / divisor, -inf) + rng_keyed(state))`.
+/// `reduce_argmax(select(keep, logits * scale, -inf) + rng_keyed(state))`.
 #[test]
 fn gumbel_argmax_is_the_draw_it_fuses() {
     use eta_ir::types::Shape;
@@ -305,7 +305,7 @@ fn gumbel_argmax_is_the_draw_it_fuses() {
         let vals = vec![
             Value::F32(x.clone()),
             Value::Bool(keep.clone()),
-            Value::F32(vec![0.7]),
+            Value::F32(vec![1.0 / 0.7]),
             Value::U32(vec![seed, seed * 3 + 1]),
         ];
         let ty = |id: u32| match id {
@@ -318,7 +318,7 @@ fn gumbel_argmax_is_the_draw_it_fuses() {
             &Op::GumbelArgmax {
                 logits: 0,
                 keep: 1,
-                divisor: 2,
+                scale: 2,
                 state: 3,
             },
             &vals,
@@ -347,7 +347,7 @@ fn gumbel_argmax_is_the_draw_it_fuses() {
         };
         let perturbed: Vec<f32> = (0..n)
             .map(|i| {
-                let scaled = if keep[i] { x[i] / 0.7 } else { f32::NEG_INFINITY };
+                let scaled = if keep[i] { x[i] * (1.0 / 0.7) } else { f32::NEG_INFINITY };
                 scaled + noise[i]
             })
             .collect();
@@ -380,7 +380,7 @@ fn a_bf16_draw_splits_a_tie_evenly() {
             &Op::GumbelArgmax {
                 logits: 0,
                 keep: 1,
-                divisor: 2,
+                scale: 2,
                 state: 3,
             },
             &vals,

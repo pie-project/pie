@@ -265,7 +265,7 @@ impl OpWire {
             tags::GUMBEL_ARGMAX => Op::GumbelArgmax {
                 logits: a0()?,
                 keep: a1()?,
-                divisor: a2()?,
+                scale: a2()?,
                 state: self.arg(3)?,
             },
             tags::BROADCAST => Op::Broadcast {

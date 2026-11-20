@@ -13,7 +13,7 @@ const PINNED: &[(&str, u16, u64)] = &[
 
 /// The stepwise WGSL emitter's version and the fingerprint of what it
 /// writes: every call's module, in the order a stage's steps index them.
-const WGSL_PINNED: (u16, u64) = (9, 0xc901_c955_05d9_d257);
+const WGSL_PINNED: (u16, u64) = (10, 0x8709_d20e_5db8_8971);
 
 fn wgsl_fingerprint() -> u64 {
     let mut bytes = Vec::new();
