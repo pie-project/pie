@@ -1703,10 +1703,11 @@ impl<B: Serve> Shell<B> {
         // The probe a frame after an idle device re-times its clock by
         // (`crate::submit::Probe`), laid and fired once here, before the
         // load is ready: its pipeline built, its clock read. Its curve time
-        // is the estimate's own matmul curve at its shape, plus a launch.
+        // is the estimate's own matmul curve at its shape, plus a launch. A
+        // load that runs nothing on a device (a naming load, which lands no
+        // bytes: `Backend::LANDS`) submits nothing to re-time.
         let probe = match submit_bound.as_mut() {
-            None => None,
-            Some(held) => {
+            Some(held) if B::LANDS => {
                 let (m, n, k) = crate::submit::PROBE;
                 let rates = &held.estimate.rates;
                 let mut clock =
@@ -1721,6 +1722,7 @@ impl<B: Serve> Shell<B> {
                 );
                 Some((probe, clock))
             }
+            _ => None,
         };
 
         crate::window::no_schedule_straddles_its_readers(&boot.trace, &compiled)?;
