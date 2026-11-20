@@ -25,6 +25,7 @@ pub struct Planes(
     HashMap<u32, StepGates>,
     HashMap<u32, Corrected>,
     HashMap<u32, (Plane, u32, u32)>,
+    bool,
 );
 
 /// A decode step's gate prep, by its output: the step's `q k v` (whose keys
@@ -89,6 +90,15 @@ impl Planes {
     #[must_use]
     pub fn keys_of(&self, y: ValueId) -> Option<(Plane, u32, u32)> {
         self.4.get(&y.0).copied()
+    }
+
+    /// Whether a decode step re-steps its carried rows from the extended
+    /// run's scratch (a KDA or Mamba-2 layer's), rather than reading them
+    /// as a linear attention (a gated-delta layer's): a decoding lane's
+    /// carried rows then take rows of the run.
+    #[must_use]
+    pub fn restep(&self) -> bool {
+        self.5
     }
 
     #[must_use]
@@ -339,6 +349,7 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, Vec<u64>)
         let mut step_gates = HashMap::new();
         let mut corrected = HashMap::new();
         let mut keys_of = HashMap::new();
+        let mut restep = false;
         // The elements a token of each layer, prompt forms and step forms.
         let mut widths: Vec<u64> = Vec::new();
         let mut decode_widths: Vec<u64> = Vec::new();
@@ -526,6 +537,9 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, Vec<u64>)
                     ),
                 });
             }
+            if !chunked && !matches!(reads, Reads::GatedDelta { .. }) {
+                restep = true;
+            }
             if let (
                 Reads::GatedDelta {
                     gates,
@@ -609,7 +623,7 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, Vec<u64>)
             return Ok(None);
         }
         let lone_rows = lone.values().map(|(x, _)| x.0).collect();
-        Ok(Some((Planes(planes, lone_rows, step_gates, corrected, keys_of), widths)))
+        Ok(Some((Planes(planes, lone_rows, step_gates, corrected, keys_of, restep), widths)))
     }
 }
 

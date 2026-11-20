@@ -1669,9 +1669,24 @@ impl Shell {
         // runtime lets one carry (`engine::fire::rung_rows`): one that
         // replays more is refused here, before a page is committed or a
         // row written.
+        // A decoding lane's carried rows take none of the run where its
+        // decode step reads them as a linear attention.
+        let restep = self
+            .buffers
+            .as_ref()
+            .is_some_and(|buffers| buffers.planes().restep());
+        let in_run = |fire_lane: usize| {
+            restep
+                || composition
+                    .lanes()
+                    .get(fire_lane)
+                    .is_none_or(|row| !self.decoding.contains(row.class as usize))
+        };
         let replayed: u32 = rs_reads
             .iter()
-            .map(|reads| crate::run::replayed(reads))
+            .enumerate()
+            .filter(|(fire_lane, _)| in_run(*fire_lane))
+            .map(|(_, reads)| crate::run::replayed(reads))
             .sum();
         if replayed > self.budget.max_tokens {
             return Err(Fault::Ceiling {
@@ -1725,7 +1740,7 @@ impl Shell {
             let mut ext = 0u32;
             for (fire_lane, (verb, row)) in rs_moves.iter().zip(composition.lanes()).enumerate() {
                 let begin = ext;
-                ext += rs_replays[fire_lane] + row.rows;
+                ext += if in_run(fire_lane) { rs_replays[fire_lane] } else { 0 } + row.rows;
                 let RsMove::Scatter { pages, at, .. } = verb else {
                     rs_lanes.push(kernels_cuda::runtime::channel::RsLane {
                         ext: begin,

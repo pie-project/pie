@@ -1008,11 +1008,14 @@ impl Inputs {
                 permutation: take(rows * 4),
             })
             .collect();
-        // A fire replays no more rows than the widest bucket's tokens
-        // (`engine::fire::rung_rows`): the tables hold those, and the pages
-        // they and its own rows lie in.
+        // A fire replays through the run no more rows than the widest
+        // bucket's tokens (`engine::fire::rung_rows`); a decoding lane's
+        // carried rows are a kernel input and no rows of the run, so the
+        // tables hold four buckets' tokens of carried rows, and the pages
+        // they and its own rows lie in. A fire naming more is refused by
+        // name where the tables are staged.
         let rs = rs_page_tokens.map(|tokens| {
-            let replay_cap = rows;
+            let replay_cap = 4 * rows;
             let pages_cap = (replay_cap + rows).div_ceil(u64::from(tokens.max(1))) + 2 * lanes;
             RsAt {
                 lanes: take(rs_lane_table_bytes(lanes)),
