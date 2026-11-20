@@ -1,7 +1,7 @@
 #![allow(unsafe_code)]
 pub mod chunks;
 mod host;
-pub use host::Ring;
+pub use host::{Ring, STAGES};
 pub mod kv;
 pub mod layout;
 pub mod rs;
@@ -431,22 +431,17 @@ pub fn declared_context_that_fits(
     Ok(fits.saturating_mul(page_size))
 }
 
-/// The staging ring's bytes for a host tier of this rank, sized from the
-/// trace before the load measures the device: two sequences at `context`
-/// beside their state rows, the most one step moves, within what the tier
+/// The staging ring's bytes for a host tier of this rank, known before
+/// the load measures the device: a piece for each stage a move's piece
+/// passes ([`host::STAGES`]), a piece the largest chunk the pool's recipe
+/// may lay, so any shape's slot moves through one whole
+/// ([`poem_compiler::chunk::ChunkProfile::range`]); within what the tier
 /// may take (the operator's `host` bytes shared by `ranks`, else half of
 /// what the host has free, as [`crate::Shell::seat_host_kv`] bounds its
-/// default), never under two of a one-page sequence's slots
-/// ([`host::staging_ring`]). A sequence moves between steps, as it is held
-/// between fires: a windowed row its window alone, no fire's rows past it
-/// (`Paging::held`). `None` where no tier is stated.
-pub fn staging_ring_for(
-    trace: &Trace,
-    page_size: u32,
-    context: u32,
-    host: Option<u64>,
-    ranks: u32,
-) -> Result<Option<u64>> {
+/// default). The ring holds the copies in flight, not a sequence: a move
+/// of any size goes through it a piece at a time. `None` where no tier is
+/// stated.
+pub fn staging_ring_for(host: Option<u64>, ranks: u32) -> Result<Option<u64>> {
     let ranks = u64::from(ranks.max(1));
     let free = crate::weights::available_memory() / ranks;
     let budget = match host {
@@ -454,17 +449,8 @@ pub fn staging_ring_for(
         Some(bytes) => (bytes / ranks).min(free),
         None => free / 2,
     };
-    let page_size = page_size.max(1);
-    let window = window_of(trace)?;
-    let one = |tokens: u32| -> Result<u64> {
-        let paging = Paging::of(page_size, tokens.max(page_size), 1, 1)?.held(window);
-        one_slot_bytes(trace, paging)
-    };
-    Ok(Some(host::staging_ring(
-        one(context)?,
-        one(page_size)?,
-        budget,
-    )))
+    let (_, piece) = poem_compiler::chunk::ChunkProfile::SERVER_CUDA.range();
+    Ok(Some(host::staging_ring(piece, budget)))
 }
 
 pub fn one_slot_bytes(trace: &Trace, paging: Paging) -> Result<u64> {
