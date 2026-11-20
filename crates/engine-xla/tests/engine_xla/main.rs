@@ -1,5 +1,6 @@
 //! engine-xla's integration tests, one binary: each module was a test file.
 
+mod a_beam_step_matches_the_host_replay;
 mod common;
 mod common_dit;
 mod common_llm;
