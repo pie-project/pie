@@ -297,61 +297,6 @@ pub fn gated_delta_carried(
     )
 }
 
-/// The gate prep of a buffering decode fire: the own row's gates (as
-/// [`super::gdn_gates`] forms them; its `[b | a]` lands in the lane's
-/// buffer, plane 0) and each buffered row's attention weights against the
-/// own row (`q k v` rows `qkv`, their keys in plane 1) into the carried
-/// scratch, a value head's two floats a row, for [`gated_delta_carried`].
-#[allow(clippy::too_many_arguments)]
-pub fn gdn_gates_carried(
-    ctx: &Ctx,
-    ba: Tensor,
-    dt_bias: Tensor,
-    a_log: Tensor,
-    gates: &mut Tensor,
-    qkv: Tensor,
-    k_heads: u32,
-    k_dim: u32,
-    carry: &Carry,
-) -> Result<(), Error> {
-    const OP: &str = "ssm.gdn_gates";
-    dtype_dispatch!(OP, ba.dtype, { Bf16 => () });
-    dtype_dispatch!(OP, qkv.dtype, { Bf16 => () });
-    let v_heads = ba.width / 2;
-    if k_dim > 128 || !k_dim.is_multiple_of(4) || !v_heads.is_multiple_of(k_heads) || v_heads / k_heads > 4 {
-        return Err(refuse(
-            OP,
-            format!(
-                "a buffered row's attention weights are summed a warp a key head of at most \
-                 128 and four value heads; {k_heads} key heads of {k_dim} beside {v_heads} \
-                 value heads are not"
-            ),
-        ));
-    }
-    let rows = nonzero(OP, "rows", ba.rows)?;
-    #[allow(clippy::cast_precision_loss)]
-    let q_scale = (k_dim as f32).sqrt().recip();
-    ctx.fire(
-        OP,
-        Fire::at(kernel(GDN_RECURRENT, "::pie::ssm::gdn_gates_carried"))
-            .apply(Launch::grid([rows, k_heads, 1], [32, 1, 1])),
-        &[
-            ba.arg(),
-            dt_bias.arg(),
-            a_log.arg(),
-            gates.arg(),
-            qkv.arg(),
-            stated(OP, k_heads)?.arg(),
-            stated(OP, v_heads)?.arg(),
-            stated(OP, k_dim)?.arg(),
-            stated(OP, qkv.width)?.arg(),
-            q_scale.arg(),
-            carry.arg(),
-            ctx.stage(),
-        ],
-    )
-}
-
 /// The rows a chunked gated-delta fire's lanes land in their buffer past
 /// their commit, made ready for a later decode ([`gated_delta_carried`]):
 /// each row's corrected value and keys into the lane's buffer (planes 2 and

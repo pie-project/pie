@@ -484,174 +484,6 @@ __device__ __forceinline__ void gdn_fold_row(float (&s)[8][8], float g, const fl
     }
 }
 
-// The gate prep of a buffering decode fire (`gdn_prep_ba_gates`'s gates for
-// the own row, which lands its `[b | a]` in the lane's buffer), and the
-// attention weights of the lane's buffered rows for the step: a warp a
-// (lane, key head) sums each buffered row's keys' dots against the own
-// row's q and k (normalized, q scaled) and, a lane a row for each value head
-// of the group, its decay to the own row (the log-gates after it, a suffix
-// scan, and the own row's), into the carried scratch: row `ext + j` holds
-// the weights `(w k_j . k, w k_j . q)` a value head, row `ext + n` the
-// state's decay to the own row. The step reads them, not the rows' keys.
-__global__ void __launch_bounds__(32) gdn_gates_carried(
-    const bf16* __restrict__ ba,
-    const bf16* __restrict__ dt_bias,
-    const float* __restrict__ a_log,
-    float* __restrict__ gates,
-    const bf16* __restrict__ qkv_post,
-    int K_h, int V_h, int K_d, int conv_dim,
-    float q_scale,
-    Carry carry,
-    const u32* __restrict__ win)
-{
-    constexpr int B = 16;
-    const int r = blockIdx.x;
-    if (win != nullptr && r >= static_cast<int>(win[0])) return;
-    const int r_row = win != nullptr ? r + static_cast<int>(win[1]) : r;
-    const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
-    const int h_k = blockIdx.y;
-    const int lane = threadIdx.x;
-    const int group = V_h / K_h;
-    const int K_dim = K_h * K_d;
-    const CarryLane cl = carry.lane(rl);
-    const int n = carry.carried(cl);
-    float2* weights = reinterpret_cast<float2*>(carry.scratch);
-    // Every load the warp needs, issued together: the own row's `[b | a]`,
-    // q and k (four elements a lane), and each buffered row's page slot (a
-    // lane a row).
-    const bf16* own_ba = ba + (long long)r_row * 2 * V_h;
-    const bf16* row = qkv_post + (long long)r_row * conv_dim + (long long)h_k * K_d;
-    float oq[4] = {0.f, 0.f, 0.f, 0.f};
-    float ok[4] = {0.f, 0.f, 0.f, 0.f};
-    if (n > 0 && 4 * lane < K_d) {
-        const uint2 qr = *reinterpret_cast<const uint2*>(row + 4 * lane);
-        const uint2 kr = *reinterpret_cast<const uint2*>(row + K_dim + 4 * lane);
-        const float2 q0 = gdn_unpack(qr.x), q1 = gdn_unpack(qr.y);
-        const float2 k0 = gdn_unpack(kr.x), k1 = gdn_unpack(kr.y);
-        oq[0] = q0.x; oq[1] = q0.y; oq[2] = q1.x; oq[3] = q1.y;
-        ok[0] = k0.x; ok[1] = k0.y; ok[2] = k1.x; ok[3] = k1.y;
-    }
-    // The own row's gates, a value head a lane, its `[b | a]` landed.
-    float glog_own = 0.f;
-    if (lane < group) {
-        const int h = h_k * group + lane;
-        glog_own = gdn_log_gate(own_ba, h, V_h, dt_bias, a_log);
-        gates[(long long)r_row * 2 * V_h + h] = glog_own;
-        gates[(long long)r_row * 2 * V_h + V_h + h] =
-            1.f / (1.f + __expf(-Elem<bf16>::to_f32(own_ba[h])));
-        if (bf16* dst = carry.own_row<bf16>(cl, 0, 0)) {
-            dst[h] = own_ba[h];
-            dst[V_h + h] = own_ba[V_h + h];
-        }
-    }
-    if (carry.scratch == nullptr) return;
-    if (n == 0) {
-        if (lane < group) {
-            weights[(static_cast<long long>(cl.ext)) * V_h + h_k * group + lane] =
-                make_float2(__expf(glog_own), 0.f);
-        }
-        return;
-    }
-    float qs = 0.f;
-    float ks = 0.f;
-    #pragma unroll
-    for (int x = 0; x < 4; ++x) {
-        qs += oq[x] * oq[x];
-        ks += ok[x] * ok[x];
-    }
-    #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        qs += __shfl_xor_sync(0xffffffffu, qs, off);
-        ks += __shfl_xor_sync(0xffffffffu, ks, off);
-    }
-    const float nq = rsqrtf(qs + 1e-6f) * q_scale;
-    const float nk = rsqrtf(ks + 1e-6f);
-    // Each value head's decay through the later rows, from the own row's.
-    float after[4];
-    #pragma unroll
-    for (int gi = 0; gi < 4; ++gi) after[gi] = __shfl_sync(0xffffffffu, glog_own, gi < group ? gi : 0);
-    const int chunks = (n + B - 1) / B;
-    for (int c = chunks - 1; c >= 0; --c) {
-        const int base = B * c;
-        const int rows = min(B, n - base);
-        u64 slot = 0;
-        u32 tok = 0;
-        if (lane < rows) carry.carried_at(cl, base + lane, slot, tok);
-        // The rows' keys, a row's four elements a lane, all in flight.
-        float sq[B], sk[B], kk[B];
-        #pragma unroll
-        for (int b = 0; b < B; ++b) {
-            const unsigned lo = __shfl_sync(0xffffffffu, static_cast<unsigned>(slot), b);
-            const unsigned hi = __shfl_sync(0xffffffffu, static_cast<unsigned>(slot >> 32), b);
-            const u32 tb = __shfl_sync(0xffffffffu, tok, b);
-            const u64 sb = (static_cast<u64>(hi) << 32) | lo;
-            sq[b] = 0.f;
-            sk[b] = 0.f;
-            kk[b] = 0.f;
-            if (b < rows && 4 * lane < K_d) {
-                const uint2 kr = *reinterpret_cast<const uint2*>(
-                    carry.plane_at<const bf16>(sb, tb, 1) + (long long)h_k * K_d + 4 * lane);
-                const float2 k0 = gdn_unpack(kr.x), k1 = gdn_unpack(kr.y);
-                const float kv[4] = {k0.x, k0.y, k1.x, k1.y};
-                #pragma unroll
-                for (int x = 0; x < 4; ++x) {
-                    sq[b] += kv[x] * oq[x];
-                    sk[b] += kv[x] * ok[x];
-                    kk[b] += kv[x] * kv[x];
-                }
-            }
-        }
-        // Each row's log-gates (a lane a row) while the sums reduce.
-        float glog[4] = {0.f, 0.f, 0.f, 0.f};
-        if (lane < rows) {
-            const bf16* rb = carry.plane_at<const bf16>(slot, tok, 0);
-            for (int gi = 0; gi < group && gi < 4; ++gi) {
-                glog[gi] = gdn_log_gate(rb, h_k * group + gi, V_h, dt_bias, a_log);
-            }
-        }
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            #pragma unroll
-            for (int b = 0; b < B; ++b) {
-                sq[b] += __shfl_xor_sync(0xffffffffu, sq[b], off);
-                sk[b] += __shfl_xor_sync(0xffffffffu, sk[b], off);
-                kk[b] += __shfl_xor_sync(0xffffffffu, kk[b], off);
-            }
-        }
-        float dq = 0.f;
-        float dk = 0.f;
-        #pragma unroll
-        for (int b = 0; b < B; ++b) {
-            if (lane == b) {
-                const float nj = rsqrtf(kk[b] + 1e-6f);
-                dq = sq[b] * nj * nq;
-                dk = sk[b] * nj * nk;
-            }
-        }
-        for (int gi = 0; gi < group && gi < 4; ++gi) {
-            float later = glog[gi];
-            #pragma unroll
-            for (int off = 1; off < 32; off <<= 1) {
-                const float down = __shfl_down_sync(0xffffffffu, later, off);
-                if (lane + off < 32) later += down;
-            }
-            const float total = __shfl_sync(0xffffffffu, later, 0);
-            if (lane < rows) {
-                const float w = __expf(after[gi] + later - glog[gi]);
-                weights[(static_cast<long long>(cl.ext) + base + lane) * V_h + h_k * group + gi] =
-                    make_float2(w * dk, w * dq);
-            }
-            after[gi] += total;
-        }
-    }
-    if (lane < group && lane < 4) {
-        float a = after[0];
-        #pragma unroll
-        for (int gi = 1; gi < 4; ++gi) a = lane == gi ? after[gi] : a;
-        weights[(static_cast<long long>(cl.ext) + n) * V_h + h_k * group + lane] = make_float2(__expf(a), 0.f);
-    }
-}
-
 // `gdn_step_fused` over a lane's buffered rows then its own: the warp loads
 // its state tile once, folds the rows the lane commits among its carried
 // ones (`commit`), reads the rest as a linear attention for its own row's
@@ -688,12 +520,11 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
     const int K_dim = K_h * K_d;
     const int live_rows = win != nullptr ? static_cast<int>(win[0]) : 0x7fffffff;
     // A tile's buffered rows go in chunks of CH; the last chunk's corrected
-    // values and weights are prefetched with the tile's state, into the
+    // values and `a` gates are prefetched with the tile's state, into the
     // warp's carried stage of the state's stage.
     constexpr int CH = 16;
     constexpr int CSTAGE = CH * 16 * 4 + CH * 8;
     unsigned char* cring = gdn_ring + W * 2 * GDN_STREAM_STAGE + warp * 2 * CSTAGE;
-    const float2* weights = reinterpret_cast<const float2*>(carry.scratch);
 
     struct Tile {
         bool live;
@@ -709,8 +540,6 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
         // with the state's prefetch.
         int n;
         int commit;
-        u32 ext;
-        float g0;
         u64 slot;
         u32 tok;
     };
@@ -719,8 +548,6 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
         tl.live = false;
         tl.n = 0;
         tl.commit = 0;
-        tl.ext = 0;
-        tl.g0 = 0.f;
         tl.slot = 0;
         tl.tok = 0;
         if (tile >= tiles) return tl;
@@ -740,8 +567,6 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
         const CarryLane cl = carry.lane(tl.rl);
         tl.n = carry.carried(cl);
         tl.commit = carry.commit(tl.rl, tl.n + 1);
-        tl.ext = cl.ext;
-        tl.g0 = weights[(static_cast<long long>(cl.ext) + tl.n) * V_h + tl.h].x;
         const int j = CH * ((tl.n + CH - 1) / CH - 1) + lane;
         if (tl.n > 0 && lane < CH && j < tl.n) carry.carried_at(cl, j, tl.slot, tl.tok);
         return tl;
@@ -773,11 +598,9 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
                               (tl.j0 & ~15);
             #pragma unroll
             for (int q = 0; q < 4; ++q) gdn_cp16(cs + lane * 64 + q * 16, ur + 4 * q, true);
-            const int j = CH * ((tl.n + CH - 1) / CH - 1) + lane;
-            const float* wsrc = reinterpret_cast<const float*>(
-                weights + (static_cast<long long>(tl.ext) + j) * V_h + tl.h);
-            gdn_cp4(cs + CH * 64 + lane * 8, wsrc, true);
-            gdn_cp4(cs + CH * 64 + lane * 8 + 4, wsrc + 1, true);
+            // The word of the row's `[b | a]` its head's `a` lies in.
+            const unsigned char* ba_row = carry.plane_at<const unsigned char>(tl.slot, tl.tok, 0);
+            gdn_cp4(cs + CH * 64 + lane * 4, ba_row + ((2 * (V_h + tl.h)) & ~3), true);
         }
     };
     auto unpack8 = [&](const uint4& raw, float (&f8)[8]) {
@@ -801,11 +624,11 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
         gdn_cp_commit();
         // The tile's buffered rows, in chunks of CH, a lane a row: the
         // last chunk's corrected values (the tile's sixteen columns) and
-        // attention weights (the gate prep's, a value head each) came with
-        // the state; an earlier chunk's are read into the same stage.
+        // `a` gates came with the state; an earlier chunk's are read into the
+        // same stage.
         unsigned char* cs = cring + (it & 1) * CSTAGE;
         float* su = reinterpret_cast<float*>(cs);
-        const float2* sw = reinterpret_cast<const float2*>(cs + CH * 64);
+        const unsigned* sa = reinterpret_cast<const unsigned*>(cs + CH * 64);
         auto shfl64 = [&](u64 v, int from) {
             const unsigned lo = __shfl_sync(0xffffffffu, static_cast<unsigned>(v), from);
             const unsigned hi = __shfl_sync(0xffffffffu, static_cast<unsigned>(v >> 32), from);
@@ -822,8 +645,8 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
             u64 slot;
             u32 tok;
             carry.carried_at(cl, j, slot, tok);
-            reinterpret_cast<float2*>(cs + CH * 64)[lane] =
-                weights[(static_cast<long long>(cl.ext) + j) * V_h + cur.h];
+            reinterpret_cast<unsigned*>(cs + CH * 64)[lane] = *reinterpret_cast<const unsigned*>(
+                carry.plane_at<const unsigned char>(slot, tok, 0) + ((2 * (V_h + cur.h)) & ~3));
             const float4* ur = reinterpret_cast<const float4*>(
                 carry.plane_at<const float>(slot, tok, 2) + (long long)cur.h * V_d + (cur.j0 & ~15));
             float4* sr = reinterpret_cast<float4*>(su + lane * 16);
@@ -835,7 +658,6 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
         const CarryLane cl = carry.lane(cur.live ? cur.rl : 0);
         const int n = cur.n;
         const int chunks = (n + CH - 1) / CH;
-        const float g0 = cur.g0;
         asm volatile("cp.async.wait_group 1;\n" ::: "memory");
         __syncwarp();
         if (cur.live) {
@@ -872,28 +694,105 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
                 a[u] = 0.f;
                 o[u] = 0.f;
             }
+            // Each row's attention weights against the own row: its keys'
+            // dots with the normalized q and k (the warp's key rows, summed
+            // over the warp, the rows of a chunk together) and its decay to
+            // the own row (the log-gates after it, a suffix scan, and the own
+            // row's), formed here, where the own row's q, k and gates are.
+            float after = glog_n;
+            const float dtb = Elem<bf16>::to_f32(dt_bias[cur.h]);
+            const float ea = __expf(a_log[cur.h]);
             for (int c = chunks - 1; c >= 0; --c) {
                 const int base = CH * c;
                 if (c != chunks - 1) {
                     __syncwarp();
                     read_chunk(cl, n, base);
                 }
-                __syncwarp();
                 const int rows = min(CH, n - base);
+                u64 slot = cur.slot;
+                u32 tok = cur.tok;
+                if (c != chunks - 1 && lane < rows) carry.carried_at(cl, base + lane, slot, tok);
+                float pq[CH], pk[CH], pkk[CH];
+                #pragma unroll
+                for (int b = 0; b < CH; ++b) {
+                    const u64 sb = shfl64(slot, b);
+                    const u32 tb = __shfl_sync(0xffffffffu, tok, b);
+                    pq[b] = 0.f;
+                    pk[b] = 0.f;
+                    pkk[b] = 0.f;
+                    if (b < rows) {
+                        const bf16* kr = carry.plane_at<const bf16>(sb, tb, 1) + (long long)h_k * K_d + i0;
+                        #pragma unroll
+                        for (int m = 0; m < MR; ++m) {
+                            if (16 * m < K_d) {
+                                const float kv = Elem<bf16>::to_f32(kr[16 * m]);
+                                pq[b] += kv * qi[m];
+                                pk[b] += kv * ki[m];
+                                pkk[b] += kv * kv;
+                            }
+                        }
+                    }
+                }
+                #pragma unroll
+                for (int off = 2; off < 32; off <<= 1) {
+                    #pragma unroll
+                    for (int b = 0; b < CH; ++b) {
+                        pq[b] += __shfl_xor_sync(0xffffffffu, pq[b], off);
+                        pk[b] += __shfl_xor_sync(0xffffffffu, pk[b], off);
+                        pkk[b] += __shfl_xor_sync(0xffffffffu, pkk[b], off);
+                    }
+                }
+                __syncwarp();
+                float glog = 0.f;
+                float dq = 0.f;
+                float dk = 0.f;
+                if (lane < rows) {
+                    const unsigned word = sa[lane];
+                    const unsigned half = ((V_h + cur.h) & 1) ? (word >> 16) : (word & 0xffffu);
+                    const float av = __uint_as_float(half << 16);
+                    const float z = av + dtb;
+                    const float sp = (z > 20.f) ? z : log1pf(__expf(z));
+                    glog = -ea * sp;
+                    #pragma unroll
+                    for (int b = 0; b < CH; ++b) {
+                        if (b == lane) {
+                            const float nj = rsqrtf(pkk[b] + 1e-6f);
+                            dq = pq[b] * nj;
+                            dk = pk[b] * nj;
+                        }
+                    }
+                }
+                float later = glog;
+                #pragma unroll
+                for (int off = 1; off < 32; off <<= 1) {
+                    const float down = __shfl_down_sync(0xffffffffu, later, off);
+                    if (lane + off < 32) later += down;
+                }
+                const float total = __shfl_sync(0xffffffffu, later, 0);
+                float ca = 0.f;
+                float co = 0.f;
+                if (lane < rows) {
+                    const float w = __expf(after + later - glog);
+                    ca = w * dk;
+                    co = w * dq;
+                }
+                after += total;
                 #pragma unroll 4
                 for (int e = 0; e < rows; ++e) {
-                    const float2 wc = sw[e];
+                    const float cae = __shfl_sync(0xffffffffu, ca, e);
+                    const float coe = __shfl_sync(0xffffffffu, co, e);
                     const float4* ue = reinterpret_cast<const float4*>(su + e * 16 + (lane & 1) * 8);
                     const float4 u0 = ue[0];
                     const float4 u1 = ue[1];
                     const float uu[VEC] = {u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w};
                     #pragma unroll
                     for (int u = 0; u < VEC; ++u) {
-                        a[u] += wc.x * uu[u];
-                        o[u] += wc.y * uu[u];
+                        a[u] += cae * uu[u];
+                        o[u] += coe * uu[u];
                     }
                 }
             }
+            const float g0 = __expf(after);
             // The state's part: S^T k and S^T q over the tile, decayed to the
             // own row.
             float xq[VEC];
@@ -973,6 +872,13 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
                     out + ((long long)cur.r_row * V_h + cur.h) * V_d + cur.j0);
                 dst[0] = make_float4(o[0], o[1], o[2], o[3]);
                 dst[1] = make_float4(o[4], o[5], o[6], o[7]);
+            }
+            // The head's first tile lands the own row's `[b | a]` pair.
+            if ((cur.j0 & ~15) == 0 && lane < 2) {
+                if (bf16* dst = carry.own_row<bf16>(cl, 0, 0)) {
+                    const int at = lane * V_h + cur.h;
+                    dst[at] = ba[(long long)cur.r_row * 2 * V_h + at];
+                }
             }
         }
         __syncwarp();

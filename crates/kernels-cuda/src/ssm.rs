@@ -24,9 +24,7 @@ pub use conv1d::{
 pub use dyn_conv::dyn_conv;
 pub use gdn_chunk::{gated_delta_chunked, gated_delta_chunked_serial, gdn_lands_snapshots};
 pub use gdn_prep::gdn_gates;
-pub use gdn_recurrent::{
-    GdnGated, gated_delta, gated_delta_carried, gated_delta_tail, gdn_gates_carried,
-};
+pub use gdn_recurrent::{GdnGated, gated_delta, gated_delta_carried, gated_delta_tail};
 pub use kda::{kda, kda_carried, kda_chunked};
 pub use mamba2::{Mamba2, mamba2, mamba2_carried, mamba2_chunked};
 
