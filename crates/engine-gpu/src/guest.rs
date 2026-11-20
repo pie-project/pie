@@ -625,6 +625,9 @@ mod tests {
         pub fn standard(vocab: u32, shape: &eta_dsl::sampler::Shape) -> Traced {
             use eta_dsl::sampler::{self, Knobs, Slots};
             let knob = |on: bool| on.then(|| leak(Channel::from([0.9f32])));
+            let inverse = shape
+                .temperature
+                .then(|| leak(Channel::from([sampler::inverse_temperature(1.0)])));
             let top_p = knob(shape.top_p);
             let top_k = shape.top_k.then(|| leak(Channel::from([40u32])));
             let (min_p, repetition) = (knob(shape.min_p), knob(shape.repetition));
@@ -654,13 +657,12 @@ mod tests {
             });
             let out = leak(Channel::new([1], dtype::i32).capacity(8));
             out.note_host_take();
-            let temperature = shape.temperature;
             let logprob_top = shape.logprobs;
             let (mut b, tok_in) = builder(vocab);
             b.stage(Stage::Epilogue, move || {
                 let t = |c: Option<&'static Channel>| c.map(|c| reshape(c.read(), []));
                 let knobs = Knobs {
-                    temperature,
+                    temperature: t(inverse),
                     top_p: t(top_p),
                     top_k: t(top_k),
                     min_p: t(min_p),
@@ -682,7 +684,7 @@ mod tests {
         /// a penalized top-p one, each its decode fire, by name.
         pub fn standard_all(vocab: u32) -> Vec<(String, Traced)> {
             let penalized = eta_dsl::sampler::Shape {
-                temperature: Some(1.0),
+                temperature: true,
                 top_p: true,
                 repetition: true,
                 frequency: true,
@@ -777,7 +779,8 @@ mod tests {
 
     /// What a stage's scratch is for the standard sampler's decode fires at
     /// a vocabulary of 151,936 (each value its own bytes, and as laid), its
-    /// vocabulary-sized values bf16.
+    /// vocabulary-sized values bf16 and the temperature's reciprocal a value
+    /// read from its channel.
     #[test]
     fn the_standard_samplers_stage_scratch() {
         let vocab = shipped::QWEN_VOCAB;
@@ -804,11 +807,11 @@ mod tests {
             got,
             [
                 ("standard greedy", 3_689_472, 684_544),
-                ("standard gumbel-max", 3_689_984, 912_896),
-                ("standard top-p", 5_058_560, 3_537_152),
-                ("standard top-k + top-p", 5_363_200, 3_689_472),
+                ("standard gumbel-max", 3_690_240, 912_896),
+                ("standard top-p", 5_058_816, 3_537_152),
+                ("standard top-k + top-p", 5_363_456, 3_689_472),
                 ("standard top logprobs", 4_910_592, 2_736_896),
-                ("standard penalized top-p", 10_834_688, 4_448_768),
+                ("standard penalized top-p", 10_835_200, 4_449_024),
             ]
         );
     }
