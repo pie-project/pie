@@ -8520,3 +8520,62 @@ async fn a_refused_restore_short_of_state_is_served_by_the_room_signal() {
         "the room signal plans it, no fire landing"
     );
 }
+
+/// The policy's schedule floor (the test-pause policy of sc/amd-beam-pages
+/// holds a process below it for a while, then lifts it): a process held
+/// below the floor and parked stays parked while room stands free and its
+/// own lanes wait to be resident, and, taking sets that are off the
+/// device, owes them parked; its restore is queued once the policy lifts
+/// it, never before.
+#[tokio::test(flavor = "current_thread")]
+async fn a_process_held_below_the_floor_stays_parked_until_the_policy_lifts_it() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::new(64))));
+    let pid = ProcessId::new_v4();
+    planner.register(pid);
+    planner.note_admitted(pid);
+    let demand = Demand {
+        kv_pages: 2,
+        rs: RsUnits::default(),
+    };
+    planner.with_inner(|inner| {
+        inner.reschedule(|_| (0, true));
+        let proc = inner.procs.get_mut(&pid).unwrap();
+        proc.state = Residency::Evicted;
+        proc.parked = Some(demand);
+    });
+    let restore_queued = |planner: &ResidencyPlanner| {
+        planner.with_inner(|inner| {
+            inner
+                .queue
+                .values()
+                .any(|waiter| waiter.pid == pid && matches!(waiter.kind, WaitKind::Restore { .. }))
+        })
+    };
+    // Its lanes wait to be resident, 64 pages free.
+    let p = planner.clone();
+    let waiting = crate::rt::spawn(async move { p.wait_resident(pid).await });
+    for _ in 0..50 {
+        crate::rt::yield_now().await;
+    }
+    assert!(!restore_queued(&planner), "held: no restore queued for its waiting lanes");
+    assert_eq!(planner.with_inner(|inner| inner.procs[&pid].state), Residency::Evicted);
+    // It takes sets off the device: owed, still parked.
+    planner.owe(
+        pid,
+        Demand {
+            kv_pages: 1,
+            rs: RsUnits::default(),
+        },
+    );
+    assert!(!restore_queued(&planner), "held: what it owes stays parked");
+    assert_eq!(
+        planner.with_inner(|inner| inner.procs[&pid].parked.map(|d| d.kv_pages)),
+        Some(3),
+        "parked with what it owes"
+    );
+    // The policy lifts it: its restore goes.
+    planner.with_inner(|inner| inner.reschedule(|_| (1, false)));
+    assert!(restore_queued(&planner), "lifted: its restore is queued");
+    waiting.abort();
+}

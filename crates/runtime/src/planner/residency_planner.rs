@@ -1312,6 +1312,16 @@ impl ResidencyPlanner {
                 return;
             };
             proc.state = Residency::Evicted;
+            // Held below the schedule's floor: parked with what it owes,
+            // restored once the policy lifts it.
+            if proc.held {
+                let owed = proc.parked.take().unwrap_or_default();
+                proc.parked = Some(Demand {
+                    kv_pages: owed.kv_pages.saturating_add(demand.kv_pages),
+                    rs: owed.rs.add(demand.rs),
+                });
+                return;
+            }
             inner.enqueue(pid, WaitKind::Restore { demand });
         });
         self.poke();
