@@ -117,6 +117,7 @@ pub(super) fn spawn_spill(
 /// evicted, so no fire reads them; a failure leaves them where they lie.
 pub(super) fn spawn_park_down(
     planner: Arc<ResidencyPlanner>,
+    pids: Vec<ProcessId>,
     roles: Option<RoleMove>,
     rs: Option<RsResidencyTxn>,
 ) {
@@ -135,7 +136,7 @@ pub(super) fn spawn_park_down(
     let task = {
         let planner = planner.clone();
         async move {
-            let moved = park_down(&planner, guard).await;
+            let moved = park_down(&planner, &pids, guard).await;
             if let Err(error) = &moved {
                 tracing::warn!(%error, "planner: parked role slots could not move down");
             }
@@ -154,8 +155,17 @@ pub(super) fn spawn_park_down(
     }
 }
 
-async fn park_down(planner: &ResidencyPlanner, mut guard: MoveGuard) -> Result<(), String> {
-    guard.copy(planner, ProcessId::nil()).await?;
+async fn park_down(
+    planner: &ResidencyPlanner,
+    pids: &[ProcessId],
+    mut guard: MoveGuard,
+) -> Result<(), String> {
+    // The chunks its copy reads, fenced from a raise until it lands, as an
+    // eviction's are ([`MovingOut`]).
+    let reading = MovingOut::of_all(planner, pids);
+    let copied = guard.copy(planner, ProcessId::nil()).await;
+    drop(reading);
+    copied?;
     let Move::Suspend { roles, rs, .. } = guard.take() else {
         unreachable!("a park down is a move down")
     };
@@ -572,12 +582,16 @@ struct MovingOut<'a> {
 
 impl<'a> MovingOut<'a> {
     fn of(planner: &'a ResidencyPlanner, pid: ProcessId) -> Self {
-        let mut map = planner.port.chunk_occupants(&[pid]);
+        Self::of_all(planner, &[pid])
+    }
+
+    fn of_all(planner: &'a ResidencyPlanner, pids: &[ProcessId]) -> Self {
+        let mut map = planner.port.chunk_occupants(pids);
         map.merge(planner.port.parked_occupants(super::residency_planner::SWEEP));
         let chunks: Vec<u32> = map
             .held
             .iter()
-            .filter(|held| held.by.iter().any(|&(holder, _)| holder == pid))
+            .filter(|held| held.by.iter().any(|(holder, _)| pids.contains(holder)))
             .map(|held| held.chunk)
             .collect();
         planner.port.moving_out(&chunks);

@@ -1204,7 +1204,7 @@ impl PoolPort for RegistryPool {
         };
         let Some(roles) = stores.roles.clone() else {
             if rs.is_some() {
-                super::exec::spawn_park_down(planner.clone(), None, rs);
+                super::exec::spawn_park_down(planner.clone(), pids.to_vec(), None, rs);
                 return true;
             }
             return false;
@@ -1217,7 +1217,7 @@ impl PoolPort for RegistryPool {
             .unwrap()
             .prepare_park_down(&holders, stores.host.is_none());
         if down.txn.is_some() || rs.is_some() {
-            super::exec::spawn_park_down(planner.clone(), down.txn, rs);
+            super::exec::spawn_park_down(planner.clone(), pids.to_vec(), down.txn, rs);
             return true;
         }
         if let Some(host) = stores.host.as_ref().filter(|_| down.host_chunks > 0) {
@@ -1261,7 +1261,7 @@ impl PoolPort for RegistryPool {
         // now, else the disk.
         match roles.lock().unwrap().prepare_park_down(&holders, true).txn {
             Some(txn) => {
-                super::exec::spawn_park_down(planner.clone(), Some(txn), None);
+                super::exec::spawn_park_down(planner.clone(), pids.to_vec(), Some(txn), None);
                 true
             }
             None => false,
