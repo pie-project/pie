@@ -449,11 +449,8 @@ template <typename T, int LANES, int VROWS, int PER>
 // The rows of a committed scan one pass stages in threadgroup memory.
 constant constexpr int kVerifyChunk = 16;
 
-// The ints of a lane's row in a recurrent buffer's page table.
-#ifndef PIE_RS_PAGE_INTS
-#define PIE_RS_PAGE_INTS 72
-#endif
-
+// A lane's row of a recurrent buffer's page table is the load's width in
+// ints, which the dispatch passes (`paged`, or `page_ints`).
 // Row `e` of a lane's extended rows in its buffer's plane, `slab` the
 // plane's first row in the buffer's first slot: `pages` is the lane's row of
 // the page table, the in-page token of its first extended row, then the
@@ -650,7 +647,7 @@ template <typename T, int LANES, int SG, int VROWS>
   const int own = indptr[r] - rep;
   const int keep = min(commit[lane0 + r], span);
   const device int* pages =
-      paged != 0 ? page_table + size_t(lane0 + r) * PIE_RS_PAGE_INTS : nullptr;
+      paged != 0 ? page_table + size_t(lane0 + r) * uint(paged) : nullptr;
   const int hk = hv / (v_heads / k_heads);
   // Own rows land their corrected planes where the lane has a buffer page.
   const bool lands_corrected = corrected != 0 && (pages == nullptr || pages[0] >= 0);
@@ -860,6 +857,7 @@ template <typename T, int SG, int VROWS>
     device uchar* u_slab        [[buffer(21)]],
     const constant uint& u_row_bytes [[buffer(22)]],
     const device ulong* map     [[buffer(23)]],
+    const constant uint& page_ints [[buffer(24)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint lane_u [[thread_index_in_simdgroup]],
     uint sg_u [[simdgroup_index_in_threadgroup]]) {
@@ -897,7 +895,7 @@ template <typename T, int SG, int VROWS>
   const int own = indptr[r] - rep;
   const int t_own = rep;
   const int keep = min(commit[lane0 + r], rep + 1);
-  const device int* pages = page_table + size_t(lane0 + r) * PIE_RS_PAGE_INTS;
+  const device int* pages = page_table + size_t(lane0 + r) * page_ints;
   const bool lands = pages[0] >= 0;
   const int hk = hv / (v_heads / k_heads);
   const size_t keys = size_t(k_heads) * D;
@@ -1097,7 +1095,7 @@ template <typename T, int SG, int VROWS>
       const constant int&, const constant int&, device uchar*,                 \
       const device int*, const constant uint&, const constant uint&,           \
       const constant uint&, device uchar*, const constant uint&,               \
-      device uchar*, const constant uint&, const device ulong*, uint3, uint,   \
-      uint);
+      device uchar*, const constant uint&, const device ulong*,                \
+      const constant uint&, uint3, uint, uint);
 
 PIE_GDN_CARRIED(8, 2)

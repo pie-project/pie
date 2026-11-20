@@ -512,7 +512,8 @@ mod page_tests {
             scatter: Some(run(5, 1)),
             ..LanePlan::default()
         };
-        assert!(page_table(&[one], 16).is_some(), "one run reads in place");
+        let ints = super::page_ints(64, 16);
+        assert!(page_table(&[one], 16, ints).unwrap().is_some(), "one run reads in place");
         let two = LanePlan {
             replay: 2,
             gather: Some(run(3, 1)),
@@ -520,7 +521,7 @@ mod page_tests {
             scatter: Some(run(6, 1)),
             ..LanePlan::default()
         };
-        assert!(page_table(&[two], 16).is_none(), "two runs gather by copies");
+        assert!(page_table(&[two], 16, ints).unwrap().is_none(), "two runs gather by copies");
     }
 }
 
@@ -632,36 +633,51 @@ impl Buffers {
 }
 
 /// The ints of one lane's row in the page table a verify arm reads its
-/// buffer through: the in-page token of the lane's first extended row, or
+/// buffer through (the in-page token of the lane's first extended row, or
 /// -1 for a lane that buffers nothing, then the slab slots of the pages its
-/// extended rows touch.
-pub const PAGE_INTS: u32 = kernels_metal::ssm::RS_PAGE_INTS;
-
-/// The page table of `lanes`, one [`PAGE_INTS`] row a lane, where every
-/// lane's replayed and own rows fit the row's pages; else `None`, and the
-/// fire's recurrent ops gather and scatter by copies.
+/// extended rows touch) at a rung of `rung_tokens`, over an rs buffer of
+/// `page_tokens` rows a page: the pages of the most rows a lane touches in
+/// one fire (its carried rows, which the shell bounds by the rung's tokens,
+/// and its own, at most as many) from any in-page offset, and the header.
+/// 0 where the load buffers no rs row.
 #[must_use]
-pub fn page_table(lanes: &[LanePlan], page_tokens: u32) -> Option<Vec<i32>> {
+pub fn page_ints(rung_tokens: u32, page_tokens: u32) -> u32 {
+    if page_tokens == 0 {
+        return 0;
+    }
+    let rows = rung_tokens.saturating_mul(2);
+    1 + (page_tokens - 1).saturating_add(rows).div_ceil(page_tokens)
+}
+
+/// The page table of `lanes`, one `ints` row a lane ([`page_ints`]); `None`
+/// where a lane's rows lie in no one stretch of pages, and the fire's
+/// recurrent ops gather and scatter by copies. A lane touching more pages
+/// than the row holds is a count past the rung the width was derived from:
+/// refused by name.
+pub fn page_table(lanes: &[LanePlan], page_tokens: u32, ints: u32) -> Result<Option<Vec<i32>>> {
     let page_tokens = page_tokens.max(1);
-    let mut table = Vec::with_capacity(lanes.len() * PAGE_INTS as usize);
+    if ints < 2 {
+        return Ok(None);
+    }
+    let mut table = Vec::with_capacity(lanes.len() * ints as usize);
     for plan in lanes {
         // A lane replaying more than one run (its ancestry among siblings'
         // slots) reads no one stretch of pages: the fire gathers by copies.
         if plan.gathers.len() > 1 {
-            return None;
+            return Ok(None);
         }
-        let mut row = [0i32; PAGE_INTS as usize];
+        let mut row = vec![0i32; ints as usize];
         row[0] = -1;
         let (first, pages) = match (&plan.gather, &plan.scatter) {
             (Some(gather), Some(scatter)) => {
                 if scatter.from != gather.from + gather.count || scatter.pages != gather.pages {
-                    return None;
+                    return Ok(None);
                 }
                 (gather.from, &gather.pages)
             }
             (Some(run), None) | (None, Some(run)) => (run.from, &run.pages),
             (None, None) => {
-                table.extend(row);
+                table.extend(row.iter().copied());
                 continue;
             }
         };
@@ -670,16 +686,31 @@ pub fn page_table(lanes: &[LanePlan], page_tokens: u32) -> Option<Vec<i32>> {
         let page0 = (first / page_tokens) as usize;
         let in_page = first % page_tokens;
         let touched = (in_page + span).div_ceil(page_tokens) as usize;
-        if touched >= PAGE_INTS as usize {
-            return None;
+        if touched >= ints as usize {
+            return Err(Fault::program(
+                "rs::page_table",
+                format!(
+                    "a lane's {span} recurrent rows from in-page row {in_page} touch {touched} \
+                     pages of {page_tokens} rows, past the {} a page table row of this rung \
+                     holds (rs::page_ints); the fire is refused and writes nothing",
+                    ints - 1
+                ),
+            ));
         }
-        row[0] = i32::try_from(in_page).ok()?;
-        for (at, &slot) in pages.get(page0..page0 + touched)?.iter().enumerate() {
-            row[1 + at] = i32::try_from(slot).ok()?;
+        let (Ok(at), Some(slots)) = (i32::try_from(in_page), pages.get(page0..page0 + touched))
+        else {
+            return Ok(None);
+        };
+        row[0] = at;
+        for (at, &slot) in slots.iter().enumerate() {
+            let Ok(slot) = i32::try_from(slot) else {
+                return Ok(None);
+            };
+            row[1 + at] = slot;
         }
-        table.extend(row);
+        table.extend(row.iter().copied());
     }
-    Some(table)
+    Ok(Some(table))
 }
 
 #[derive(Debug)]
@@ -707,6 +738,8 @@ pub struct Seat {
     /// verify arm then reads the replayed rows from the buffer and lands the
     /// window's own there itself.
     pub pages: Option<Tensor>,
+    /// The ints of a lane's row of `pages` ([`page_ints`]).
+    pub page_ints: u32,
     pub ext: RefCell<HashMap<u32, Tensor>>,
     /// The gate preps whose gates the verify scan derives as it stages its
     /// rows, by the gates value: the `[b | a]` projection, `dt_bias` and
@@ -750,6 +783,7 @@ impl Seat {
         slots: Tensor,
         rows_ext: u32,
         pages: Option<Tensor>,
+        page_ints: u32,
     ) -> Result<Seat> {
         let lane_count = u32::try_from(lanes.len()).unwrap_or(u32::MAX);
         let need = Seat::scratch_bytes(layout, rows_ext, lane_count);
@@ -815,6 +849,7 @@ impl Seat {
             work,
             rows_ext,
             pages,
+            page_ints,
             ext: RefCell::new(HashMap::new()),
             prepped: RefCell::new(HashMap::new()),
         })
@@ -835,6 +870,7 @@ impl Seat {
             page_tokens: self.page_tokens,
             page_bytes: u32::try_from(self.page_bytes).ok()?,
             row_bytes: u32::try_from(self.layout.planes[plane].row_bytes).ok()?,
+            page_ints: self.page_ints,
         })
     }
 

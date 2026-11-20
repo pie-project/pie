@@ -396,6 +396,8 @@ pub struct Inputs {
     rs_commit: u64,
     rs_snaps: u64,
     rs_pages: u64,
+    /// The ints of a lane's rs page table row at this rung (`rs::page_ints`).
+    rs_page_ints: u32,
     /// The group masks' room in the store, sized for the widest fire where
     /// the model packs attention groups ([`group_mask_bytes`]).
     group_masks: (u64, u64),
@@ -428,6 +430,12 @@ pub fn window_ints(
 }
 
 impl Inputs {
+    /// The ints of a lane's rs page table row at this rung.
+    #[must_use]
+    pub fn rs_page_ints(&self) -> u32 {
+        self.rs_page_ints
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn reserve(
         device: &Context,
@@ -444,6 +452,7 @@ impl Inputs {
         bands: &[u32],
         pages_per_lane: u32,
         ragged: usize,
+        rs_page_ints: u32,
     ) -> Result<Inputs> {
         let width = u64::from(bands.iter().sum::<u32>().max(1));
         let rows = u64::from(budget.max_tokens);
@@ -539,7 +548,7 @@ impl Inputs {
         let snap_ints =
             u64::from(kernels_metal::ssm::RS_SNAPSHOTS) * (bands.len().max(1) as u64 + width);
         let rs_snaps = take(lanes * snap_ints.max(u64::from(SNAP_INTS)) * 4);
-        let rs_pages = take(lanes * u64::from(crate::rs::PAGE_INTS) * 4);
+        let rs_pages = take(lanes * u64::from(rs_page_ints) * 4);
         let mask_bytes = if ragged == 0 {
             0
         } else {
@@ -588,6 +597,7 @@ impl Inputs {
             rs_commit,
             rs_snaps,
             rs_pages,
+            rs_page_ints,
             group_masks,
         })
     }
@@ -786,11 +796,11 @@ impl Inputs {
             self.store.write(self.rs_snaps, bytes_of(snaps))?;
         }
         if let Some(pages) = fire.rs_pages {
-            if pages.len() != lanes as usize * crate::rs::PAGE_INTS as usize {
+            if pages.len() != lanes as usize * self.rs_page_ints as usize {
                 return Err(Fault::Ceiling {
                     what: "recurrent buffer page tables, one row per lane",
                     need: pages.len() as u64,
-                    have: u64::from(lanes) * u64::from(crate::rs::PAGE_INTS),
+                    have: u64::from(lanes) * u64::from(self.rs_page_ints),
                 });
             }
             self.store.write(self.rs_pages, bytes_of(pages))?;
@@ -1486,7 +1496,7 @@ mod rung_tests {
         };
         let paging = Paging::of(16, 64, 4, 1).expect("paging");
         let mut inputs = Inputs::reserve(
-            &device, &budget, paging, 1, 1, 0, None, None, false, &[], 0, &[1], 4, 0,
+            &device, &budget, paging, 1, 1, 0, None, None, false, &[], 0, &[1], 4, 0, 0,
         )
         .expect("a rung's regions");
         let wide = [0i32; 5];

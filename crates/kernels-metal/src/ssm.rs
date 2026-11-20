@@ -1188,10 +1188,6 @@ pub fn gated_delta_committed_landing(
     )
 }
 
-/// The ints of one lane's row in a recurrent buffer's page table
-/// (`PIE_RS_PAGE_INTS`).
-pub const RS_PAGE_INTS: u32 = 72;
-
 /// A recurrent buffer's plane as a verify arm reads it through the fire's
 /// page table: `slab` from the plane's first row in the buffer's first
 /// slot, and each lane's row of `pages` the in-page token of its first
@@ -1203,6 +1199,8 @@ pub struct Paged {
     pub page_tokens: u32,
     pub page_bytes: u32,
     pub row_bytes: u32,
+    /// The ints of a lane's row of `pages`, the load's width (nonzero).
+    pub page_ints: u32,
 }
 
 /// A buffer's corrected planes (`rs_corrected`), as a verify or carried
@@ -1241,7 +1239,7 @@ fn paged_args(ctx: &Ctx<'_>, paged: Option<Paged>) -> Result<[crate::encode::Arg
             paged.page_tokens.arg(),
             paged.page_bytes.arg(),
             paged.row_bytes.arg(),
-            1i32.arg(),
+            i32::try_from(paged.page_ints.max(1)).unwrap_or(i32::MAX).arg(),
         ],
         None => [
             ctx.absent()?,
@@ -1528,6 +1526,7 @@ pub fn gated_delta_carried(
             corrected.u.arg_mut(),
             corrected.u_row_bytes.arg(),
             state.segments.arg(),
+            ba_paged.page_ints.arg(),
         ],
     )
 }

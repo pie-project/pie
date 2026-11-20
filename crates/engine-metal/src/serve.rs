@@ -1055,6 +1055,10 @@ impl PreparedLoad<'_> {
                             &bands,
                             window_pages_per_slot,
                             feeds.ragged.len(),
+                            crate::rs::page_ints(
+                                *tokens,
+                                rows.rs.as_ref().map_or(0, |rs| rs.tokens),
+                            ),
                         )
                     })
                     .collect::<Result<Vec<_>>>()
@@ -5087,12 +5091,12 @@ impl Shell {
             ));
         }
         let rows_ext = rows.saturating_add(carried);
-        let rs_pages = if rs_active {
-            self.rs_buffers
-                .as_ref()
-                .and_then(|buffers| crate::rs::page_table(&rs_plans, buffers.page_tokens()))
-        } else {
-            None
+        let rs_page_ints = self.inputs[self.arena.current()][0].rs_page_ints();
+        let rs_pages = match (rs_active, self.rs_buffers.as_ref()) {
+            (true, Some(buffers)) => {
+                crate::rs::page_table(&rs_plans, buffers.page_tokens(), rs_page_ints)?
+            }
+            _ => None,
         };
         if rs_active {
             let layout = self
@@ -5505,6 +5509,7 @@ impl Shell {
                     bound.slot_ids,
                     rows_ext,
                     bound.rs_pages,
+                    rs_page_ints,
                 )?))
             } else {
                 None

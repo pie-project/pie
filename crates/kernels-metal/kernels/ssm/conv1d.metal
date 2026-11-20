@@ -8,11 +8,8 @@ using namespace metal;
 #define PIE_RS_SNAPSHOTS 4
 #endif
 
-// The ints of a lane's row in a recurrent buffer's page table.
-#ifndef PIE_RS_PAGE_INTS
-#define PIE_RS_PAGE_INTS 72
-#endif
-
+// A lane's row of a recurrent buffer's page table is `paged` ints wide
+// (the load's width; 0 where the fire reads no page table).
 
 inline float causal_conv1d_silu(float z) {
   return z / (1.0f + metal::exp(-z));
@@ -491,7 +488,7 @@ template <typename T>
   const size_t pcol = piece.col;
   const int own = indptr[r] - rep;
   const device int* pages =
-      paged != 0 ? page_table + size_t(lane0 + r) * PIE_RS_PAGE_INTS : nullptr;
+      paged != 0 ? page_table + size_t(lane0 + r) * uint(paged) : nullptr;
   const bool buffers = pages != nullptr && pages[0] >= 0;
   auto buffered = [&](int e) -> device vec<T, 4>* {
     return reinterpret_cast<device vec<T, 4>*>(
