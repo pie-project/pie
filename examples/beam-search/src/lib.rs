@@ -192,6 +192,9 @@ async fn main(input: Input) -> Result<String> {
     let mut hypotheses: Vec<Vec<u32>> = first.iter().map(|&token| vec![token as u32]).collect();
     // Each lane's score after each of its steps, its ancestry's first.
     let mut scored: Vec<Vec<f32>> = final_scores.iter().map(|&s| vec![s]).collect();
+    // Each step's best score, the one the next fire's candidates are taken
+    // relative to.
+    let mut bests: Vec<f32> = vec![best_of(&final_scores)];
 
     if decodes > 0 {
         let scores = Channel::from(&final_scores[..]);
@@ -348,6 +351,7 @@ async fn main(input: Input) -> Result<String> {
                 greedy_mismatches += picked.iter().zip(&greedy).filter(|(p, g)| p != g).count();
                 hypotheses = advance_hypotheses(&hypotheses, &picked, &parents)?;
                 scored = advance(&scored, &final_scores, &parents)?;
+                bests.push(best_of(&final_scores));
                 step += 1;
             }
         } else {
@@ -374,6 +378,7 @@ async fn main(input: Input) -> Result<String> {
                 greedy_mismatches += picked.iter().zip(&greedy).filter(|(p, g)| p != g).count();
                 hypotheses = advance_hypotheses(&hypotheses, &picked, &parents)?;
                 scored = advance(&scored, &final_scores, &parents)?;
+                bests.push(best_of(&final_scores));
                 step += 1;
                 Ok(ControlFlow::Continue(()))
             })
@@ -404,40 +409,44 @@ async fn main(input: Input) -> Result<String> {
     }
     let verified = if input.verify {
         let mut worst = 0f32;
-        // The most of its room any step came to (apart / room).
+        // The step that came closest to its room (apart / room), and what
+        // it was.
         let mut closest = 0f32;
+        let mut closest_at = String::new();
         // The most any step's log-probability moved between its 1-row and
         // its beam-width rescore (d_t).
         let mut drift = 0f32;
         for (lane, hypothesis) in hypotheses.iter().enumerate() {
             let alone = rescore(&prompt, hypothesis, b).await?;
             // Each step's log-probability as the beam took it (its score's
-            // step), against the hypothesis's own, within that step's room
-            // (`rescore`'s), and the quanta of the beam's scores either side
-            // of it.
+            // step), against the hypothesis's own, within its room.
             drift = drift.max(alone.iter().map(|s| s.drift).fold(0.0, f32::max));
             let mut before = 0f32;
-            for (at, (&after, &Rescored { step, room, .. })) in
-                scored[lane].iter().zip(&alone).enumerate()
-            {
+            for (at, (&after, rescored)) in scored[lane].iter().zip(&alone).enumerate() {
                 let took = after - before;
-                let room = room + quantum(after) + if at > 0 { quantum(before) } else { 0.0 };
+                let step = rescored.step;
+                let room = rescored.room(took, (at > 0).then(|| (before, after, bests[at - 1])));
                 let apart = (took - step).abs();
-                closest = closest.max(apart / room);
-                if apart > room {
-                    return Err(format!(
+                if apart / room.total() > closest {
+                    closest = apart / room.total();
+                    closest_at = format!(
                         "beam {lane} took {took:.4} at step {at}, and its hypothesis alone \
-                         {step:.4} there: {apart:.4} apart, past {room:.3}; its recurrence or \
-                         attention read another beam's cells",
-                    ));
+                         {step:.4} there: {apart:.4} apart, room {room}"
+                    );
                 }
                 before = after;
             }
             let total: f32 = alone.iter().map(|s| s.step).sum();
             worst = worst.max((total - final_scores[lane]).abs());
         }
+        if closest > 1.0 {
+            return Err(format!(
+                "{closest_at}: {closest:.2} times its room; its recurrence or attention read \
+                 another beam's cells",
+            ));
+        }
         format!(
-            " greedy_mismatches={greedy_mismatches} verified={} worst_apart={worst:.4} worst_step={closest:.3} max_drift={drift:.4}",
+            " greedy_mismatches={greedy_mismatches} verified={} worst_apart={worst:.4} worst_step={closest:.3} max_drift={drift:.4} closest: {closest_at}",
             hypotheses.len()
         )
     } else {
@@ -449,54 +458,115 @@ async fn main(input: Input) -> Result<String> {
     ))
 }
 
-/// The quantum of `x` in the dtype it was stored in: the gap between it and
-/// the next value away from zero, of bf16 (8 significant bits) where `x` is
-/// a bf16 widened (its low 16 bits zero), else of f32 (24). The logits are
-/// bf16; the scores and log-probabilities come off f32 channels, f32 or bf16
-/// as the program computed them. An f32 that is a bf16 by chance (one in
-/// 65536) is given bf16's room.
-fn quantum(x: f32) -> f32 {
-    let bits = x.abs().to_bits();
-    let exponent = ((bits >> 23) & 0xff) as i32 - 127;
-    let significant = if bits & 0xffff == 0 { 7 } else { 23 };
-    2f32.powi(exponent.max(-126) - significant)
+/// The gap between `x` and the next value away from zero in bf16 (8
+/// significant bits): the most a value rounded to bf16 at `x`'s magnitude
+/// may sit from the value it stands for.
+fn ulp_bf16(x: f32) -> f32 {
+    ulp(x, 7)
 }
 
-/// One step of a hypothesis rescored alone: its log-probability, the room a
-/// beam's step has from it, and its drift between row counts.
+/// The same gap in f32 (24 significant bits).
+fn ulp_f32(x: f32) -> f32 {
+    ulp(x, 23)
+}
+
+fn ulp(x: f32, fraction_bits: i32) -> f32 {
+    let exponent = ((x.abs().to_bits() >> 23) & 0xff) as i32 - 127;
+    2f32.powi(exponent.max(-126) - fraction_bits)
+}
+
+fn best_of(scores: &[f32]) -> f32 {
+    scores.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+}
+
+/// One step of a hypothesis rescored alone: its log-probability, its target
+/// and largest logit, and its drift between row counts.
 struct Rescored {
     step: f32,
-    room: f32,
+    picked: f32,
+    largest: f32,
     drift: f32,
+}
+
+impl Rescored {
+    /// The room a beam's step `took` has from this rescore, each part a bf16
+    /// (or f32) gap at the magnitude of the value it rounds:
+    ///
+    /// - the log-probability and the logits are rounded to bf16 by both
+    ///   fires. Two roundings of values a drift apart land at most that
+    ///   drift and one gap apart: one gap at the larger log-probability, and
+    ///   one each at the target logit and the largest logit (which leads the
+    ///   log-sum-exp). The beam's logits are not drained; they are the
+    ///   rescore's within the drift, so the rescore's give the magnitudes;
+    /// - a decode step (`carried`: the beam's score `before` it, `after` it,
+    ///   and the best score `best` its fire took candidates relative to)
+    ///   also rounds, on the beam alone, the relative score and the
+    ///   candidate (relative plus log-probability) to bf16, and its scores
+    ///   either side to f32;
+    /// - a drift: fires of other rows run other kernels (other tiles, splits
+    ///   and reduction orders, compounding through every layer and the cache
+    ///   rows written), which the user allows (no batch invariance); `drift`
+    ///   is this step's own measure of it, the log-probability moved between
+    ///   a 1-row fire and one of the beam's width. Both sides may carry one:
+    ///   twice the drift.
+    fn room(&self, took: f32, carried: Option<(f32, f32, f32)>) -> Room {
+        let candidate = carried.map_or(0.0, |(before, after, best)| {
+            ulp_bf16(before - best) + ulp_bf16(after - best) + ulp_f32(before) + ulp_f32(after)
+        });
+        Room {
+            log_prob: ulp_bf16(took.abs().max(self.step.abs())),
+            logits: ulp_bf16(self.picked) + ulp_bf16(self.largest),
+            candidate,
+            drift: 2.0 * self.drift,
+        }
+    }
+}
+
+/// A step's room, by part ([`Rescored::room`]).
+#[derive(Clone, Copy, Default)]
+struct Room {
+    log_prob: f32,
+    logits: f32,
+    candidate: f32,
+    drift: f32,
+}
+
+impl Room {
+    fn total(&self) -> f32 {
+        self.log_prob + self.logits + self.candidate + self.drift
+    }
+}
+
+impl std::fmt::Display for Room {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:.3} (log-probability {:.4}, logits {:.4}, candidate {:.4}, twice the drift {:.4})",
+            self.total(),
+            self.log_prob,
+            self.logits,
+            self.candidate,
+            self.drift
+        )
+    }
 }
 
 /// Each step of `hypothesis` after `prompt`, teacher-forced one token a fire
 /// on working sets of its own ([`teacher_forced`]), as a 1-row fire and as a
 /// fire of `width` rows (the hypothesis and copies of itself: as many rows as
 /// the beam's own fires take): what a beam that read only its own ancestry
-/// takes there, and its room.
+/// takes there, and how far its 1-row and `width`-row fires drift apart.
 async fn rescore(prompt: &[u32], hypothesis: &[u32], width: u32) -> Result<Vec<Rescored>> {
     let one = teacher_forced(prompt, hypothesis, 1).await?;
     let wide = teacher_forced(prompt, hypothesis, width).await?;
     Ok(one
         .iter()
         .zip(&wide)
-        .map(|(&(step, picked, largest), &(paired, ..))| {
-            // The beam's fire and the rescore are independent fires, each up
-            // to one drift and one rounding from the true value. A rounding:
-            // the logits are bf16, so each fire's target logit and largest
-            // logit (which leads the log-sum-exp) may sit one quantum from
-            // the true value, and the log-probability its own quantum. A
-            // drift: fires of other rows run other kernels (other tiles,
-            // splits and reduction orders, compounding through every layer
-            // and the cache rows written), which the user allows (no batch
-            // invariance); `drift` is this step's own measure of it, the
-            // log-probability moved between a 1-row fire and one of the
-            // beam's width (the row count its own fires take). Both
-            // sides of the comparison may carry one of each: twice the drift.
-            let drift = (step - paired).abs();
-            let room = quantum(step) + quantum(picked) + quantum(largest) + 2.0 * drift;
-            Rescored { step, room, drift }
+        .map(|(&(step, picked, largest), &(paired, ..))| Rescored {
+            step,
+            picked,
+            largest,
+            drift: (step - paired).abs(),
         })
         .collect())
 }
