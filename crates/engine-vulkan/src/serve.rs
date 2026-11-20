@@ -106,7 +106,7 @@ impl Serve for Api {
             &device,
             tuning,
             boot.profiles.as_deref(),
-            crate::rates::STATED_SUBMIT_BOUND,
+            crate::rates::stated_submit_bound(),
         )?;
         Ok((device, tuning))
     }
