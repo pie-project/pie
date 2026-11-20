@@ -680,24 +680,12 @@ mod tests {
             Box::leak(Box::new(slots))
         }
 
-        /// The standard sampler's shapes ([`eta_dsl::sampler::STANDARD`]) and
-        /// a penalized top-p one, each its decode fire, by name.
+        /// The standard sampler's shapes ([`eta_dsl::sampler::standard`]),
+        /// each its decode fire, by name.
         pub fn standard_all(vocab: u32) -> Vec<(String, Traced)> {
-            let penalized = eta_dsl::sampler::Shape {
-                temperature: true,
-                top_p: true,
-                repetition: true,
-                frequency: true,
-                presence: true,
-                ..eta_dsl::sampler::Shape::GREEDY
-            };
-            eta_dsl::sampler::STANDARD
+            eta_dsl::sampler::standard()
                 .iter()
                 .map(|(name, shape)| (format!("standard {name}"), standard(vocab, shape)))
-                .chain([(
-                    "standard penalized top-p".to_string(),
-                    standard(vocab, &penalized),
-                )])
                 .collect()
         }
 
@@ -810,8 +798,18 @@ mod tests {
                 ("standard gumbel-max", 3_690_240, 912_896),
                 ("standard top-p", 5_058_816, 3_537_152),
                 ("standard top-k + top-p", 5_363_456, 3_689_472),
-                ("standard top logprobs", 4_910_592, 2_736_896),
+                ("standard penalized greedy", 9_465_856, 2_888_448),
+                ("standard penalized gumbel-max", 9_466_624, 2_888_960),
                 ("standard penalized top-p", 10_835_200, 4_449_024),
+                ("standard penalized top-k + top-p", 11_139_840, 4_601_344),
+                ("standard greedy + top logprobs", 4_910_592, 2_736_896),
+                ("standard gumbel-max + top logprobs", 4_911_360, 2_736_896),
+                ("standard top-p + top logprobs", 5_975_552, 3_841_536),
+                ("standard top-k + top-p + top logprobs", 6_280_192, 3_993_856),
+                ("standard penalized greedy + top logprobs", 10_686_976, 3_952_384),
+                ("standard penalized gumbel-max + top logprobs", 10_687_744, 3_952_384),
+                ("standard penalized top-p + top logprobs", 12_056_320, 4_753_408),
+                ("standard penalized top-k + top-p + top logprobs", 12_360_960, 4_905_728),
             ]
         );
     }

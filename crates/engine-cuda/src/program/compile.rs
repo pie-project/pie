@@ -1,4 +1,5 @@
 #![allow(unsafe_code)]
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -687,6 +688,10 @@ pub struct Cache {
     /// symbol: stages whose regions are the same text but for their entry
     /// names (a sampler region in every stage that samples) build it once.
     built: Bounded<String, Arc<Module>>,
+    /// The modules the load's prewarm ([`Cache::warm`]) built, by the same
+    /// key: held for the load's life, out of `built`'s bound, so a guest's
+    /// registrations never evict a standard sampler's code.
+    warmed: HashMap<String, Arc<Module>>,
     /// The region modules a registration loaded or compiled because no
     /// prewarm ([`Cache::warm`]) or earlier registration had: each one a
     /// module built after ready.
@@ -709,6 +714,7 @@ impl Cache {
             stages: Stages::new(MAX_STAGE_ENTRIES),
             negative: Bounded::new(MAX_NEGATIVE_ENTRIES),
             built: Bounded::new(MAX_STAGE_ENTRIES),
+            warmed: HashMap::new(),
             late: 0,
             disk,
             stats: CacheStats::default(),
@@ -881,7 +887,7 @@ impl Cache {
                 }
             };
             let mut region = RegionBuild::new(target, region_index, entry, source);
-            region.module = self.built.get(&region.key).cloned();
+            region.module = self.module(&region.key);
             if region.module.is_none() {
                 self.late += 1;
             }
@@ -919,7 +925,11 @@ impl Cache {
             }
             let source = kernel.source.replace(&kernel.entry_name, REGION_SYMBOL);
             let key = region_key(target, &source);
-            if self.built.get(&key).is_some() || wanted.iter().any(|(seen, _, _)| *seen == key) {
+            if let Some(module) = self.built.remove(&key) {
+                self.warmed.insert(key, module);
+                continue;
+            }
+            if self.warmed.contains_key(&key) || wanted.iter().any(|(seen, _, _)| *seen == key) {
                 continue;
             }
             wanted.push((key, source, kernel.region_index));
@@ -976,9 +986,18 @@ impl Cache {
                         reason: format!("loading a prewarmed region: {error}"),
                     }
                 })?;
-            self.built.insert(key.clone(), Arc::new(module));
+            self.warmed.insert(key.clone(), Arc::new(module));
         }
         Ok(wanted.len() as u64)
+    }
+
+    /// The module this cache holds for the region text under `key`: a
+    /// prewarmed one, else a registration's.
+    fn module(&mut self, key: &str) -> Option<Arc<Module>> {
+        self.warmed
+            .get(key)
+            .or_else(|| self.built.get(&key.to_owned()))
+            .cloned()
     }
 
     /// A program's build made modules, on the engine's thread (a module
@@ -1061,7 +1080,7 @@ impl Cache {
         source: &str,
     ) -> std::result::Result<Arc<Module>, Failure> {
         let mut region = RegionBuild::new(target, region_index, entry, source);
-        region.module = self.built.get(&region.key).cloned();
+        region.module = self.module(&region.key);
         if region.module.is_none() {
             self.late += 1;
         }
@@ -1094,7 +1113,7 @@ impl Cache {
         if let Some(module) = &region.module {
             return Ok(Arc::clone(module));
         }
-        if let Some(module) = self.built.get(&region.key).cloned() {
+        if let Some(module) = self.module(&region.key) {
             return Ok(module);
         }
         let module = region.load(disk)?;
