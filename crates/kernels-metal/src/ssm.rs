@@ -1452,6 +1452,86 @@ fn gated_delta_verify_at(
     )
 }
 
+/// The most carried rows [`gated_delta_carried`] reads a lane.
+pub const GDN_CARRIED_MAX: u32 = 64;
+
+/// A decode step over each lane's buffered rows read as a linear attention
+/// (`gated_delta_carried`, new-memory/designs/lagged-fold.md): every lane a
+/// row of its own and at most [`GDN_CARRIED_MAX`] carried rows, read through
+/// the fire's page table from the buffer's `[b | a]` plane (`ba_paged`) and
+/// corrected planes (`corrected`), never re-stepped. Lands the own rows'
+/// readout in `y`, gates in `gates.gates`, and their keys, `u` and `[b | a]`
+/// in the buffer; folds the committed rows into the state (the verify
+/// scan's state, layout and threadgroup).
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_carried(
+    ctx: &Ctx<'_>,
+    qkv: Tensor,
+    indptr: Tensor,
+    committed: &Committed,
+    gates: &VerifyGates,
+    ba_paged: Paged,
+    corrected: Corrected,
+    state: &RecurrentPool,
+    k_heads: u32,
+    v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    y: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.gated_delta_carried";
+    let _ = dtype_dispatch!(OP, qkv.dtype, { Bf16 => "gated_delta_carried_bfloat16" });
+    nonzero(OP, "the key heads this statement states", k_heads)?;
+    nonzero(OP, "the value heads this statement states", v_heads)?;
+    if !v_heads.is_multiple_of(k_heads) {
+        return Err(refuse(
+            OP,
+            format!("the {v_heads} value heads are not a whole number of the {k_heads} key heads"),
+        ));
+    }
+    if !gated_delta_verify_fits(k_dim, v_dim) {
+        return Err(refuse(
+            OP,
+            format!("the carried step reads {GDN_VERIFY_DIM}-wide heads, and these are {k_dim} by {v_dim}"),
+        ));
+    }
+    let (groups, vrows) = GDN_VERIFY_GROUP;
+    let lanes = committed_lanes(OP, indptr)?;
+    let z = v_heads
+        .checked_mul(lanes)
+        .ok_or_else(|| refuse(OP, "the value heads of every lane overflow a launch"))?;
+    ctx.fire(
+        Fire::at(GDN_SCAN_FILE, "gated_delta_carried_bfloat16_s_8_v_2")
+            .apply(gated_delta_verify_grid(groups, vrows, z)),
+        &[
+            qkv.arg(),
+            indptr.arg(),
+            committed.replay.arg(),
+            committed.commit.arg(),
+            committed.slots.arg(),
+            stated(OP, committed.lane0)?.arg(),
+            gates.ba.arg(),
+            gates.a_log.arg(),
+            gates.dt_bias.arg(),
+            state.state.arg_mut(),
+            y.arg_mut(),
+            gates.gates.arg_mut(),
+            stated(OP, k_heads)?.arg(),
+            stated(OP, v_heads)?.arg(),
+            ba_paged.slab.arg_mut(),
+            ba_paged.pages.arg(),
+            ba_paged.page_tokens.arg(),
+            ba_paged.page_bytes.arg(),
+            ba_paged.row_bytes.arg(),
+            corrected.keys.arg_mut(),
+            corrected.key_row_bytes.arg(),
+            corrected.u.arg_mut(),
+            corrected.u_row_bytes.arg(),
+            state.segments.arg(),
+        ],
+    )
+}
+
 /// The rows of a lane one threadgroup of the verify conv runs side by side,
 /// and the threads of four channels beside them.
 const CONV_VERIFY_ROWS: u32 = 4;

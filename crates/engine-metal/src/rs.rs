@@ -372,6 +372,26 @@ impl Layout {
                     Some((values, Dtype::F32, u64::from(values) * 4)),
                 )?;
             }
+            // The decode form (`GatedDelta`) of a layer reads the planes its
+            // prompt form lays, by its own values: the same state's.
+            let of = |layout: &Layout, cache: u32, role: Role| {
+                layout
+                    .planes
+                    .iter()
+                    .position(|plane| plane.cache == cache && plane.role == role)
+            };
+            for node in &trace.nodes {
+                let Operation::Ssm(Ssm::GatedDelta { qkv, state, y, .. }) = &node.op else {
+                    continue;
+                };
+                let cache = cache_of(trace, *state)?;
+                if let (Some(keys), Some(u)) =
+                    (of(&layout, cache, Role::Keys), of(&layout, cache, Role::U))
+                {
+                    layout.in_of.insert(qkv.0, keys);
+                    layout.in_of.insert(y.0, u);
+                }
+            }
         }
         if layout.planes.is_empty() {
             return Ok(None);

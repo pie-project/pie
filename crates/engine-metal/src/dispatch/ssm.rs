@@ -198,6 +198,33 @@ impl Run<'_> {
                             u_row_bytes: plane_row_bytes(&seat, up, OP)?,
                         }),
                     };
+                    // A decode window (a row of its own every lane, few
+                    // carried) reads its carried rows as a linear attention.
+                    if let (Some(ba_paged), Some(corrected)) = (paged, corrected)
+                        && self.rs_snapshots(*state).is_none()
+                        && self.carried_window(&seat)
+                    {
+                        return ssm::gated_delta_carried(
+                            self.ctx(),
+                            ext_qkv,
+                            self.qo_indptr(),
+                            &self.rs_committed(&seat, *state),
+                            &ssm::VerifyGates {
+                                ba,
+                                dt_bias,
+                                a_log,
+                                gates: self.tensor(*gates),
+                            },
+                            ba_paged,
+                            corrected,
+                            &self.recurrent(*state),
+                            *k_heads,
+                            *v_heads,
+                            *k_dim,
+                            *v_dim,
+                            self.tensor(*y),
+                        );
+                    }
                     let scattered = planes.filter(|_| paged.is_none());
                     let landed = ssm::gated_delta_verify(
                         self.ctx(),
@@ -509,4 +536,21 @@ fn plane_row_bytes(
         op,
         detail: "a buffered plane's row is past a u32 of bytes".to_string(),
     })
+}
+
+impl crate::run::Run<'_> {
+    /// Whether this window's lanes each run one row of their own over at
+    /// most [`ssm::GDN_CARRIED_MAX`] carried rows: a decode step the carried
+    /// scan serves.
+    fn carried_window(&self, seat: &crate::rs::Seat) -> bool {
+        let indptr = self.qo_indptr_host();
+        let lane0 = self.window().span.lane_offset as usize;
+        indptr.windows(2).enumerate().all(|(r, pair)| {
+            pair[1] - pair[0] == 1
+                && seat
+                    .lanes
+                    .get(lane0 + r)
+                    .is_some_and(|plan| plan.replay <= ssm::GDN_CARRIED_MAX)
+        })
+    }
 }

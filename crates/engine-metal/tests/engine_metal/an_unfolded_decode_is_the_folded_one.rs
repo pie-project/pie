@@ -69,12 +69,31 @@ fn an_unfolded_decode_is_the_folded_one() {
             lineage: engine::fire::Lineage::Set,
         };
         let replayed = fire(&mut shell, 1, held, &[token], &unfolded, RsReset::Held);
+        // A replaying decode reads its buffered rows as a linear attention
+        // over the committed state (the carried scan): the folded walk's
+        // arithmetic in another f32 order, so the gap is relative to the
+        // logits' scale (engine-cuda's golden_lagged bound), and no argmax
+        // moves where the top two stand apart.
         let d = spread(&folded, &replayed);
-        worst = worst.max(d);
-        eprintln!("step {k} (replays {} rows): {d:.5}", k + 1);
-        if d > 0.05 && first.is_none() {
+        let scale = folded.iter().fold(0f32, |m, &x| m.max(x.abs())).max(1e-6);
+        let argmax = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .fold((0usize, f32::MIN), |best, (at, &x)| if x > best.1 { (at, x) } else { best })
+        };
+        let (top, top_logit) = argmax(&folded);
+        let runner_up = folded
+            .iter()
+            .enumerate()
+            .filter(|&(at, _)| at != top)
+            .fold(f32::MIN, |m, (_, &x)| m.max(x));
+        let flipped = argmax(&replayed).0 != top && top_logit - runner_up > 0.02;
+        let rel = d / scale;
+        worst = worst.max(rel);
+        eprintln!("step {k} (replays {} rows): {d:.5} ({rel:.4} of the logits' scale)", k + 1);
+        if (rel > 0.05 || flipped) && first.is_none() {
             first = Some(k);
         }
     }
-    assert!(first.is_none(), "an unfolded decode parts from the folded one at step {first:?}: worst {worst}");
+    assert!(first.is_none(), "an unfolded decode parts from the folded one at step {first:?}: worst {worst} of the logits' scale");
 }
