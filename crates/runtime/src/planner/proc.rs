@@ -89,9 +89,9 @@ pub(super) struct Proc {
     /// has moved past it, never on the same map twice (a refusal the map
     /// disagrees with re-sent every plan pass was a hot loop).
     pub(super) roles_short_gives: Option<u64>,
-    /// The free runs of its need's length (within the state budget) when
-    /// its last unpark was refused: it goes again on runs only once more
-    /// of them stand. A count of room given back moved with every refused
+    /// The length its last unpark refusal named, and the free runs of that
+    /// length (within the state budget) then: it goes again on runs only
+    /// once more of them stand. A count of room given back moved with every refused
     /// restore's own return, and refused restores sent each other again,
     /// round after round (Mac Pro's 2 GiB spin: 139,315 refusals, the free
     /// room no different).

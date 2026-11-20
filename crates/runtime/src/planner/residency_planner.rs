@@ -382,6 +382,11 @@ impl ResidencyPlanner {
         // a beat; frees that meet nothing plan nothing.
         if self.returns.freed_since_plan() && self.wants_met_now() {
             self.plan();
+        } else if self.quiet_unplanned() {
+            self.plan();
+            // Read after the pass: room its own steps took and gave back is
+            // the room it planned on, never a change that plans again.
+            self.quiet_unplanned();
         }
         self.report_short();
         self.note_lapsed_fires();
@@ -408,6 +413,34 @@ impl ResidencyPlanner {
         self.dump_stall();
     }
 
+    /// Whether the queue's head waits unserved with nothing in flight on
+    /// room no pass has planned it on since the fleet went quiet: the fleet
+    /// going quiet is an event no store tells (the last fire landing, an
+    /// eviction settling), and with no pass after it a restore head left
+    /// unfunded while fires were in flight waited for good (Mac Pro's
+    /// 2 GiB: one stall line in three minutes, 0 chunks free, 308
+    /// emptiable, no eviction issued). Once per head and room: the same
+    /// room plans nothing again. Records the room it reads.
+    fn quiet_unplanned(&self) -> bool {
+        let room = [
+            self.port.room_gives(),
+            u64::from(self.port.free_chunks()),
+            u64::from(self.port.device_stats().0),
+            u64::from(self.raw_swap_free()),
+        ];
+        self.with_inner(|inner| {
+            let Some((key, _)) = inner.unmet_head() else {
+                inner.quiet_planned = None;
+                return false;
+            };
+            if !inner.nothing_in_flight() || inner.quiet_planned == Some((key, room)) {
+                return false;
+            }
+            inner.quiet_planned = Some((key, room));
+            true
+        })
+    }
+
     /// Publishes what the queue's head lacks for room coming free to be
     /// weighed against without a lock ([`RoomReturns::met`]): the free
     /// chunks its runs take, the kv list slots its pages take, the swap
@@ -431,11 +464,18 @@ impl ResidencyPlanner {
             self.returns.want_nothing();
             return;
         };
-        let mut want_chunks = self
-            .head_room(key)
-            .map_or(u64::MAX, |(run, pieces)| u64::from(run) * u64::from(pieces));
+        // The pass ended with the head unserved on the room standing now:
+        // a count that room already meets moves nothing, so its want is past
+        // what stands. Its chunk count met by the free chunks (a restore
+        // short of a run of four, 231 chunks free), every chunk given back
+        // anywhere, the pass's own among them, woke a pass that found no
+        // step (Mac Pro's mx-3: ~470 a second, nothing in flight).
+        let mut want_chunks = self.head_room(key).map_or(u64::MAX, |(run, pieces)| {
+            (u64::from(run) * u64::from(pieces))
+                .max(u64::from(self.port.free_chunks()).saturating_add(1))
+        });
         let want_list = if kv_missing > 0 {
-            u64::from(kv_missing)
+            u64::from(kv_missing).max(u64::from(self.port.device_stats().0).saturating_add(1))
         } else {
             u64::MAX
         };

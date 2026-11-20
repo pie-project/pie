@@ -532,15 +532,18 @@ impl ResidencyPlanner {
                     // once more runs of its need's length stand than its
                     // refusal saw: never on the same room twice. Room a
                     // refused restore took and gave back is no more room.
-                    let runs_now = self.port.guest_free_runs(run);
-                    let map_moved = self.with_inner(|inner| {
-                        inner.unmet_head().is_some_and(|(_, waiter)| {
-                            inner.procs.get(&waiter.pid).is_some_and(|proc| {
-                                proc.roles_short_runs
-                                    .is_none_or(|(at_run, at)| at_run != run || runs_now > at)
-                            })
+                    // Read at the length its refusal named, in the room
+                    // the refusal read.
+                    let refused = self.with_inner(|inner| {
+                        inner.unmet_head().and_then(|(_, waiter)| {
+                            inner.procs.get(&waiter.pid).map(|proc| proc.roles_short_runs)
                         })
                     });
+                    let map_moved = match refused {
+                        Some(Some((at_run, at))) => self.port.guest_free_runs(at_run) > at,
+                        Some(None) => true,
+                        None => false,
+                    };
                     if !understated && map_moved && self.port.guest_room_free(run, pieces) {
                         self.with_inner(|inner| {
                             let pid = inner.unmet_head().map(|(_, waiter)| waiter.pid);

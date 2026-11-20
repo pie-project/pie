@@ -7457,3 +7457,125 @@ fn units_demand(pages: u32) -> Demand {
         rs: RsUnits::default(),
     }
 }
+
+/// Mac Pro's 5 GiB mx-3 spin (85,319 no-step lines, ~470 a second, nothing
+/// in flight): a refused restore head short of a run while chunks enough
+/// stood free. Its want of room was its need's chunk count, which the free
+/// chunks already met, so every chunk given back anywhere (a resident's,
+/// or the pass's own) woke a pass that found no step. Room coming free
+/// wakes such a head only past what stood free when its pass ended.
+#[tokio::test(flavor = "current_thread")]
+async fn a_refused_restore_head_short_of_a_run_is_not_woken_by_chunks_it_already_had() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.write().await;
+    let model = crate::store::registry::register_model(16, &[8], &[4]);
+    let pool = Arc::new(BindRoomPool {
+        model,
+        ..BindRoomPool::new(8, 0..0, 64)
+    });
+    // Four free chunks, no two adjacent.
+    pool.free.lock().extend([0, 2, 4, 6]);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    planner.arm_drain_task();
+    let head = ProcessId::new_v4();
+    planner.register(head);
+    planner.note_admitted(head);
+    planner.with_inner(|inner| {
+        inner.procs.get_mut(&head).unwrap().state = Residency::Evicted;
+    });
+    planner.requeue_restore_roles(head, (2, 1), Some(0));
+    planner.with_inner(|inner| {
+        if !inner.queue.values().any(|waiter| waiter.pid == head) {
+            inner.enqueue(
+                head,
+                WaitKind::Restore {
+                    demand: Demand::default(),
+                },
+            );
+        }
+    });
+    planner.returns.waiters.fetch_add(1, Ordering::AcqRel);
+    planner.plan();
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+    }
+    let passes = planner.stats.plan_passes.load(Ordering::Relaxed);
+    // Chunks given back and taken again elsewhere: four free each time.
+    for _ in 0..100 {
+        pool.gives.fetch_add(1, Ordering::Relaxed);
+        planner.returns.slots_freed(crate::store::slots::RoomCount {
+            tier: crate::store::slots::RoomTier::Device,
+            chunks: 4,
+            slots: 0,
+        });
+        for _ in 0..10 {
+            crate::rt::yield_now().await;
+        }
+    }
+    let more = planner.stats.plan_passes.load(Ordering::Relaxed) - passes;
+    planner.returns.waiters.fetch_sub(1, Ordering::AcqRel);
+    assert!(more <= 2, "a hundred give-backs of chunks it had planned {more} passes");
+}
+
+/// Mac Pro's 2 GiB stall: a restore head left unfunded while a fire was in
+/// flight, then the fleet went quiet with no store telling the planner (one
+/// stall line in three minutes, no eviction issued, no pass after). The
+/// beat plans a quiet unserved head once on the room it finds, and never
+/// again on the same room.
+#[tokio::test(flavor = "current_thread")]
+async fn the_fleet_going_quiet_plans_an_unserved_head_once() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.write().await;
+    let pool = Arc::new(RacePool::new(4));
+    pool.refill_after_stall(4, 0);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (resident, head) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [resident, head] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    let held = planner
+        .grant_now(
+            resident,
+            Demand {
+                kv_pages: 4,
+                rs: RsUnits::default(),
+            },
+        )
+        .expect("the pool is free");
+    planner.with_inner(|inner| {
+        inner.procs.get_mut(&head).unwrap().state = Residency::Evicted;
+        inner.enqueue(
+            head,
+            WaitKind::Restore {
+                demand: Demand {
+                    kv_pages: 2,
+                    rs: RsUnits::default(),
+                },
+            },
+        );
+        // A fire of the resident's in flight.
+        let proc = inner.procs.get_mut(&resident).unwrap();
+        proc.fires = 1;
+        proc.fired_at = crate::rt::Instant::now();
+    });
+    planner.tick();
+    let passes = planner.stats.plan_passes.load(Ordering::Relaxed);
+    planner.tick();
+    assert_eq!(
+        planner.stats.plan_passes.load(Ordering::Relaxed),
+        passes,
+        "a fire in flight: the beat plans nothing"
+    );
+    // The fire lands with no one told: the fleet is quiet.
+    planner.with_inner(|inner| inner.procs.get_mut(&resident).unwrap().fires = 0);
+    planner.tick();
+    let quiet = planner.stats.plan_passes.load(Ordering::Relaxed);
+    assert_eq!(quiet, passes + 1, "quiet with the head unserved: planned once");
+    planner.tick();
+    planner.tick();
+    assert_eq!(
+        planner.stats.plan_passes.load(Ordering::Relaxed),
+        quiet,
+        "the same room plans nothing again"
+    );
+    drop(held);
+}
