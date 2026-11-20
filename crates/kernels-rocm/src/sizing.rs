@@ -12,6 +12,19 @@ use core::cell::Cell;
 
 thread_local! {
     static ACTIVE: Cell<bool> = const { Cell::new(false) };
+    static LAUNCHES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// A launch a walk passed over (a kernel, a library's product): counted,
+/// so a caller can read how many kernels a fire it walked launches.
+pub fn counted() {
+    LAUNCHES.with(|c| c.set(c.get() + 1));
+}
+
+/// The launches this thread's walks have passed over ([`counted`]).
+#[must_use]
+pub fn launches() -> u64 {
+    LAUNCHES.with(Cell::get)
 }
 
 /// Whether this thread walks sizing only.

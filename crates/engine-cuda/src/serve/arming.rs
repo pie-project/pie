@@ -1251,8 +1251,10 @@ impl Shell {
         // By rows across every kind, the fewest first: what goes eager when
         // the bodies' allowance runs out is then always the largest rungs
         // (stated by name at load, `arm_end`). Within one row count, the
-        // composition of more classes first (each class its program's
-        // launches: more launches a fire), then by kind.
+        // composition that launches more kernels first (more launches, more
+        // an eager fire of it costs): as the size-only walk counted them
+        // (`walked_launches`), else by its classes (each its program's
+        // launches); then by kind.
         let classes_of = |target: &BodySynth| {
             let (lanes, _) = target.lanes();
             let mut seen: Vec<usize> = lanes.iter().map(|(class, _)| *class).collect();
@@ -1268,8 +1270,16 @@ impl Shell {
             Kind::Tower => 4,
             Kind::Idle => 5,
         };
+        let launches_of = |bucket: u32, target: &BodySynth| {
+            self.walked_launches.get(&(bucket, target.to_string())).copied()
+        };
         targets.sort_by_key(|(bucket, target)| {
-            (*bucket, core::cmp::Reverse(classes_of(target)), rank(target.kind()))
+            (
+                *bucket,
+                core::cmp::Reverse(launches_of(*bucket, target)),
+                core::cmp::Reverse(classes_of(target)),
+                rank(target.kind()),
+            )
         });
         if targets.is_empty() {
             return None;
@@ -1347,6 +1357,7 @@ impl Shell {
             } else {
                 vec![lanes]
             };
+            let launched = kernels_cuda::sizing::launches();
             for lanes in walks {
                 let owned = self.synthetic_lanes_with(&lanes, &media);
                 if matches!(target, BodySynth::Idle) {
@@ -1364,6 +1375,9 @@ impl Shell {
                     break 'targets;
                 }
             }
+            let launches = kernels_cuda::sizing::launches() - launched;
+            let entry = self.walked_launches.entry((*bucket, target.to_string())).or_insert(0);
+            *entry = (*entry).max(launches);
         }
         // The voxel walk is a plain fire: no recurrent treatment.
         self.arm_rs = record::RsBody::Folds;
@@ -1897,11 +1911,11 @@ impl Shell {
                 ),
             }
         }
-        // A load that records bodies and armed none would serve every fire
-        // eagerly: refused. One that stopped arming for want of room serves
-        // the rungs past the stop (the largest: arming runs by rows) eagerly,
-        // each stated by name above, and its fires counted apart
-        // (`BodyTally::stated_eager`). A load
+        // A load that stopped arming for want of room serves the rungs past
+        // the stop (the largest: arming runs by rows) eagerly, each stated
+        // by name above, its fires counted apart (`BodyTally::stated_eager`),
+        // even where that is every rung. One whose recordings failed while
+        // room remained armed none for a fault, not for room: refused. A load
         // that stages host-resident experts reads each fire's routes back,
         // so it records none by design (`Run::capturable`; stated at load).
         let attempted = st.wanted + st.never;
@@ -1911,10 +1925,12 @@ impl Shell {
             && !st.group
             && attempted > 0
             && st.armed == 0
+            && st.never == 0
+            && st.refused.is_some()
         {
             return Err(Fault::Residency(format!(
-                "the card does not hold this deployment's graph bodies: {} of {attempted} \
-                 compositions armed{}, so every fire would walk eagerly. Lower `[engine] max_context`, raise \
+                "this deployment's graph bodies would not record: {} of {attempted} \
+                 compositions armed{}, with room left. Lower `[engine] max_context`, raise \
                  `[engine.memory] budget_device`, or free what else holds the device; on a \
                  device another process shares, state `[engine.memory] budget_device` as this \
                  engine's part of it, so the fit leaves the other process its room. \

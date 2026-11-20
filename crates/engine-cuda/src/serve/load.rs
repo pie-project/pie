@@ -1599,6 +1599,7 @@ impl Shell {
             arming_at_load: false,
             rearming: false,
             arm_only: None,
+            walked_launches: std::collections::HashMap::new(),
             bodies_took: 0,
             measuring: false,
             workspace: None,

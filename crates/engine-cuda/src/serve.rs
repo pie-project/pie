@@ -159,6 +159,10 @@ pub struct Shell {
     rearming: bool,
     /// An arming narrowed to one bucket's targets (`Shell::rearm_bucket`).
     arm_only: Option<u32>,
+    /// The kernels each composition launches, as the size-only walk passed
+    /// over them (`Shell::size_arming`), by its bucket and composition: the
+    /// order arming takes within one row count (`lattice_targets`).
+    walked_launches: std::collections::HashMap<(u32, String), u64>,
     /// What the last arming's captures took, which a re-arm within the
     /// same load is allowed.
     bodies_took: u64,
