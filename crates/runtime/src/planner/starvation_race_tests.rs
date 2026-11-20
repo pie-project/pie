@@ -5691,8 +5691,8 @@ async fn a_bind_short_of_a_run_is_funded_by_the_map_never_waiting_on_a_compactio
 /// marks it understated and the census names the mismatch (map's runs
 /// against the refusal's), so the need gets fixed rather than the retry;
 /// it is re-sent at most once per change of the map. A plain short head
-/// (refused with the map short too) goes again once the map has moved past
-/// its refusal, and only then.
+/// (refused with the map short too) goes again once more runs of its need's
+/// length stand than its refusal saw, and only then.
 #[tokio::test(flavor = "current_thread")]
 async fn a_restore_refused_against_the_map_goes_again_at_most_once_per_map_change() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -5746,8 +5746,10 @@ async fn a_restore_refused_against_the_map_goes_again_at_most_once_per_map_chang
     }
     assert!(retried(&planner), "the map moved: sent once more");
 
-    // A plain short head (the map short too at its refusal) waits for the
-    // map to move past its refusal, then goes on the runs that stand.
+    // A plain short head (the map short too at its refusal) waits until
+    // more runs of its need's length stand than its refusal saw: room given
+    // back that leaves them as they were sends nothing; a run come free
+    // sends it.
     let pool = Arc::new(BindRoomPool {
         model,
         ..BindRoomPool::new(12, 0..0, 0)
@@ -5758,14 +5760,15 @@ async fn a_restore_refused_against_the_map_goes_again_at_most_once_per_map_chang
     planner.note_admitted(head);
     refuse(&planner, Some(0));
     assert_eq!(planner.with_inner(|inner| inner.procs[&head].roles_free_short), None);
-    pool.free.lock().extend([1]);
-    // Runs stand now, but the map's epoch has not moved: not yet.
-    planner.poke();
+    // Room given back elsewhere, no run of three: not re-sent.
+    pool.gives.fetch_add(3, Ordering::Relaxed);
+    planner.pages_freed();
     for _ in 0..50 {
         crate::rt::yield_now().await;
     }
-    assert!(!retried(&planner), "the same map epoch: not re-sent");
-    pool.gives.fetch_add(1, Ordering::Relaxed);
+    assert!(!retried(&planner), "no more usable room: not re-sent");
+    // A run of three stands now: sent.
+    pool.free.lock().extend([1]);
     planner.pages_freed();
     for _ in 0..200 {
         crate::rt::yield_now().await;
@@ -5773,7 +5776,7 @@ async fn a_restore_refused_against_the_map_goes_again_at_most_once_per_map_chang
             break;
         }
     }
-    assert!(retried(&planner), "the map moved past its refusal: sent");
+    assert!(retried(&planner), "a run come free: sent");
 }
 
 /// mx-2's cycle at the planner: a process suspended for its bind's room is
@@ -7276,4 +7279,118 @@ fn bench_the_pieces_of_a_plan_pass() {
     time("victim_set", &|| {
         let _ = planner.victim_set();
     });
+}
+
+/// Mac Pro's 2 GiB spin and the L40S's (139,315 and 132,792 refusals, the
+/// free room no different): refused restores sent one another again, each
+/// refusal's own return of what its unpark took counted as room moved. A
+/// refused restore goes again on runs only once more runs of its need's
+/// length stand than its refusal saw: give-backs that leave those runs as
+/// they were send no one; a run come free does.
+#[tokio::test(flavor = "current_thread")]
+async fn a_refused_restore_goes_again_only_on_more_usable_runs() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let model = crate::store::registry::register_model(16, &[8], &[4]);
+    let pool = Arc::new(BindRoomPool {
+        model,
+        ..BindRoomPool::new(8, 0..0, 64)
+    });
+    pool.free.lock().extend([0, 4]);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let head = ProcessId::new_v4();
+    planner.register(head);
+    planner.note_admitted(head);
+    planner.with_inner(|inner| {
+        inner.procs.get_mut(&head).unwrap().state = Residency::Evicted;
+    });
+    // Refused short of a run of two, none standing; queued again.
+    planner.requeue_restore_roles(head, (2, 1), Some(0));
+    planner.with_inner(|inner| {
+        if !inner.queue.values().any(|waiter| waiter.pid == head) {
+            inner.enqueue(
+                head,
+                WaitKind::Restore {
+                    demand: Demand::default(),
+                },
+            );
+        }
+    });
+    let sent = |planner: &ResidencyPlanner| {
+        planner.stats.restores.load(Ordering::Relaxed) > 0
+            || planner.with_inner(|inner| inner.procs[&head].roles_free_retry.is_some())
+    };
+    // Other refusals give back what their unparks took: the count of room
+    // given back moves, the runs do not.
+    pool.gives.fetch_add(5, Ordering::Relaxed);
+    planner.plan();
+    for _ in 0..50 {
+        crate::rt::yield_now().await;
+    }
+    assert!(!sent(&planner), "no more usable room: not sent again");
+    // A run of two comes free: it goes again.
+    pool.free.lock().push(1);
+    pool.gives.fetch_add(1, Ordering::Relaxed);
+    planner.plan();
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if sent(&planner) {
+            break;
+        }
+    }
+    assert!(sent(&planner), "a run come free: sent again");
+}
+
+/// The L40S's spin on 5f41b43e5 (a stuck head, the planner passing sixty
+/// times a second with nothing to issue): the policy's answers of nothing
+/// freed woke a pass each, the pass said the shortfall again and drew the
+/// next answer. A head with nothing to do now costs a bounded number of
+/// passes however often the policy answers nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn a_stuck_head_costs_a_bounded_number_of_passes() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.write().await;
+    let pool = Arc::new(RacePool::new(4));
+    pool.refill_after_stall(4, 0);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    planner.arm_drain_task();
+    let (holder, head) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [holder, head] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    let held = planner
+        .grant_now(
+            holder,
+            Demand {
+                kv_pages: 4,
+                rs: RsUnits::default(),
+            },
+        )
+        .expect("the pool is free");
+    std::mem::forget(held);
+    let p = planner.clone();
+    let task = crate::rt::spawn(async move {
+        p.acquire(
+            head,
+            head,
+            Demand {
+                kv_pages: 2,
+                rs: RsUnits::default(),
+            },
+        )
+        .await
+    });
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+    }
+    let passes = planner.stats.plan_passes.load(Ordering::Relaxed);
+    for _ in 0..100 {
+        crate::policy::pressure::answered_nothing(crate::policy::pressure::Tier::Device);
+        for _ in 0..10 {
+            crate::rt::yield_now().await;
+        }
+    }
+    let more = planner.stats.plan_passes.load(Ordering::Relaxed) - passes;
+    assert!(more <= 2, "a hundred answers of nothing freed planned {more} passes");
+    assert!(!task.is_finished());
+    task.abort();
 }

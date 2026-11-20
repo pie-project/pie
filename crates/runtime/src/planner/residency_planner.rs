@@ -350,15 +350,14 @@ impl ResidencyPlanner {
                     planner.plan();
                     continue;
                 }
-                let policy = crate::policy::pressure::answered();
-                tokio::pin!(policy);
-                policy.as_mut().enable();
+                // Not on the policy's answer of nothing freed: nothing
+                // changed, and a pass taken on it said the shortfall again,
+                // drew the next such answer and planned again, sixty times a
+                // second with nothing to issue (the L40S: a stuck head, 98
+                // passes between two stall reports). What the policy does
+                // free comes back through the pool's room signal.
                 tokio::select! {
                     () = notify.notified() => planner.plan(),
-                    // The policy answered a shortfall: what it freed (or
-                    // the grow, commit or move the last pass found no way
-                    // to) is planned on now.
-                    () = &mut policy => planner.plan(),
                     _ = crate::rt::time::timeout(
                         crate::policy::pressure::AGAIN,
                         std::future::pending::<()>(),

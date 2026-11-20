@@ -529,13 +529,15 @@ impl ResidencyPlanner {
                         })
                     });
                     // A plain short head goes again on runs that stand only
-                    // once the map has moved past its refusal: never twice on
-                    // the same map.
-                    let gives_now = self.port.room_gives();
+                    // once more runs of its need's length stand than its
+                    // refusal saw: never on the same room twice. Room a
+                    // refused restore took and gave back is no more room.
+                    let runs_now = self.port.guest_free_runs(run);
                     let map_moved = self.with_inner(|inner| {
                         inner.unmet_head().is_some_and(|(_, waiter)| {
                             inner.procs.get(&waiter.pid).is_some_and(|proc| {
-                                proc.roles_short_gives.is_none_or(|at| gives_now != at)
+                                proc.roles_short_runs
+                                    .is_none_or(|(at_run, at)| at_run != run || runs_now > at)
                             })
                         })
                     });

@@ -162,6 +162,7 @@ impl ResidencyPlanner {
             proc.roles_free_retry = None;
             proc.roles_free_short = None;
             proc.roles_short_gives = None;
+            proc.roles_short_runs = None;
             proc.roles_short_mismatch = None;
             // Back with room for it: the bind goes again.
             proc.bind_room = None;
@@ -266,6 +267,8 @@ impl ResidencyPlanner {
         // need is fixed as the restore takes it, and a refusal while those
         // runs stand is one the need truly understates.
         let (run, pieces) = self.whole_unpark(pid, (run, pieces));
+        // The runs of its need's length standing now, within the budget.
+        let stood_runs = self.port.guest_free_runs(run);
         // The map as the refusal leaves it: its epoch and its runs of the
         // need's length.
         let gives = self.port.room_gives();
@@ -300,6 +303,7 @@ impl ResidencyPlanner {
                 }
                 proc.roles_free_retry = None;
                 proc.roles_short_gives = Some(gives);
+                proc.roles_short_runs = Some((run, stood_runs));
                 proc.roles_short_mismatch = None;
                 if understated {
                     // Goes again only once more runs of the updated need

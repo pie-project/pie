@@ -502,7 +502,14 @@ impl ResidencyPlanner {
             Self::await_residency_change(
                 &signal,
                 || self.is_resident(pid) || self.restore_never_fits_now(pid),
-                || self.poke(),
+                // The policy answered nothing freed: plan again only where
+                // room came free since the last pass (else a pass said the
+                // shortfall again and drew the next such answer, a loop).
+                || {
+                    if self.returns.freed_since_plan() {
+                        self.poke();
+                    }
+                },
             )
             .await;
         }
@@ -551,6 +558,7 @@ impl ResidencyPlanner {
                 proc.roles_free_retry = None;
                 proc.roles_free_short = None;
                 proc.roles_short_gives = None;
+                proc.roles_short_runs = None;
                 proc.roles_short_mismatch = None;
                 return true;
             }
