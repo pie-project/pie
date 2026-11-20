@@ -512,7 +512,10 @@ impl ResidencyPlanner {
                 .filter(|(_, proc)| matches!(proc.state, Residency::Evicting | Residency::Restoring))
                 .map(|(pid, proc)| (*pid, proc.state))
                 .collect();
+            let (plan, blocked) = inner.plan_fields(key);
             Some((
+                plan,
+                blocked,
                 pid,
                 kind,
                 firing.len(),
@@ -523,13 +526,20 @@ impl ResidencyPlanner {
                 inner.parked_moving.iter().copied().collect::<Vec<_>>(),
             ))
         });
-        if let Some((pid, kind, firing, some_firing, moving, evicting, killing, parked_moving)) = held {
+        if let Some((plan, blocked, pid, kind, firing, some_firing, moving, evicting, killing, parked_moving)) =
+            held
+        {
             let quiet = self.with_inner(|inner| inner.nothing_in_flight());
             let held_by = self.held_by_state();
+            let store = self.store_holders();
             tracing::warn!(
                 %pid,
                 kind,
                 quiet,
+                %plan,
+                %blocked,
+                swap = ?self.swap_stats(),
+                %store,
                 %held_by,
                 firing,
                 ?some_firing,

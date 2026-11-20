@@ -67,6 +67,37 @@ pub(super) struct Inner {
 }
 
 impl Inner {
+    /// The fields every line of a head left unserved carries: where the
+    /// last plan for `head` stopped, whether the room below was short and
+    /// whom its quote found unhostable (`ended=none` where no plan has
+    /// stopped for it yet); and every victim blocked now and every restore
+    /// waiting on its rebinds.
+    pub(super) fn plan_fields(&self, head: super::wait::EntryKey) -> (String, String) {
+        use super::plan::some_pids;
+        let plan = match self.last_plan.as_ref() {
+            Some(end) if end.head == head => format!(
+                "ended={:?} host_short={} unhostable={}",
+                end.ended,
+                end.host_short,
+                some_pids(end.unhostable.iter())
+            ),
+            _ => "ended=none host_short=false unhostable=0[]".to_owned(),
+        };
+        let rebinding: Vec<String> = self
+            .procs
+            .iter()
+            .filter_map(|(pid, proc)| {
+                proc.rebind_waiting.as_ref().map(|unbound| format!("{pid}: {unbound}"))
+            })
+            .collect();
+        let blocked = format!(
+            "host_swap_blocked={} prepare_blocked={} rebind_waiting={rebinding:?}",
+            some_pids(self.host_swap_blocked.iter()),
+            some_pids(self.prepare_blocked.iter())
+        );
+        (plan, blocked)
+    }
+
     pub(super) fn kill_in_flight(&self) -> bool {
         self.killing.iter().any(|pid| {
             self.procs.contains_key(pid)

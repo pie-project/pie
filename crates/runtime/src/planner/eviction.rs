@@ -430,9 +430,20 @@ impl ResidencyPlanner {
         }
     }
 
+    /// Records where a plan pass stopped for the queue's head short of
+    /// the eviction plan (a grow, parked state moving down, something in
+    /// flight): every stall line then says where its head's plan stopped,
+    /// with the same fields an eviction plan's end carries.
+    pub(super) fn plan_stopped(&self, ended: &'static str) {
+        let Some(head) = self.with_inner(|inner| inner.unmet_head().map(|(key, _)| key)) else {
+            return;
+        };
+        self.plan_ended(head, ended, false, &[]);
+    }
+
     /// Records where the eviction plan for `head` stopped, for the stall
     /// dump ([`super::victim::PlanEnd`]).
-    fn plan_ended(&self, head: EntryKey, ended: &'static str, host_short: bool, unhostable: &[ProcessId]) {
+    pub(super) fn plan_ended(&self, head: EntryKey, ended: &'static str, host_short: bool, unhostable: &[ProcessId]) {
         self.with_inner(|inner| {
             inner.last_plan = Some(super::victim::PlanEnd {
                 head,

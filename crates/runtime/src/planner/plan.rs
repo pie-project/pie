@@ -86,7 +86,7 @@ pub(super) const STALL_SAYS_AGAIN: std::time::Duration =
     super::residency_planner::ADMIT_SAYS_AFTER;
 
 /// A count of processes and the first few of them, for a log line.
-fn some_pids<'a>(pids: impl ExactSizeIterator<Item = &'a ProcessId>) -> String {
+pub(super) fn some_pids<'a>(pids: impl ExactSizeIterator<Item = &'a ProcessId>) -> String {
     const SHOWN: usize = 4;
     let count = pids.len();
     let shown: Vec<String> = pids.take(SHOWN).map(ToString::to_string).collect();
@@ -369,33 +369,7 @@ impl ResidencyPlanner {
             let kv_missing = waiter.kv_need().saturating_sub(inner.accum.len() as u32);
             let again = inner.stall_dumped.is_some_and(|(at, seen, _)| (at, seen) == (key, gives));
             inner.stall_dumped = Some((key, gives, crate::rt::Instant::now()));
-            // Where the last eviction plan for this head stopped, whether
-            // the room below was short, and whom its quote found
-            // unhostable; and every victim blocked now (host swap: its move
-            // found no room below; prepare: its move found nothing).
-            let plan = match inner.last_plan.as_ref() {
-                Some(end) if end.head == key => format!(
-                    "ended={:?} host_short={} unhostable={}",
-                    end.ended,
-                    end.host_short,
-                    some_pids(end.unhostable.iter())
-                ),
-                _ => "no eviction plan for this head".to_owned(),
-            };
-            // Restores waiting on their instances' rebinds, nothing in
-            // flight on their account: each with the instances it waits on.
-            let rebinding: Vec<String> = inner
-                .procs
-                .iter()
-                .filter_map(|(pid, proc)| {
-                    proc.rebind_waiting.as_ref().map(|unbound| format!("{pid}: {unbound}"))
-                })
-                .collect();
-            let blocked = format!(
-                "host_swap_blocked={} prepare_blocked={} rebind_waiting={rebinding:?}",
-                some_pids(inner.host_swap_blocked.iter()),
-                some_pids(inner.prepare_blocked.iter())
-            );
+            let (plan, blocked) = inner.plan_fields(key);
             Some((key, pid, kind, pids, again, refusal, kv_missing, plan, blocked))
         });
         let Some((key, pid, kind, pids, again, refusal, kv_missing, plan, blocked)) = stalled else {
@@ -683,11 +657,13 @@ impl ResidencyPlanner {
                         rs: RsUnits::default(),
                     };
                     if self.wait_on_grow(no_grow, need) {
+                        self.plan_stopped("bind room: waits on a grow the walk makes");
                         return true;
                     }
                     // Parked state lying on the device moves down a tier
                     // before any resident does.
                     if self.park_down_for(&RunNeed::one(run, pieces)) {
+                        self.plan_stopped("bind room: parked state moves down");
                         return false;
                     }
                     true
@@ -735,11 +711,13 @@ impl ResidencyPlanner {
                     }
                     .within(self.port.state_chunks(), Some((need.run, need.pieces)));
                     if self.park_down_for(&room) {
+                        self.plan_stopped("bind-suspended restore: parked state moves down");
                         return false;
                     }
                     // Funded once nothing in flight can free room
                     // ([`Inner::nothing_in_flight`]).
                     if !self.with_inner(|inner| inner.nothing_in_flight()) {
+                        self.plan_stopped("bind-suspended restore: something in flight, not funded");
                         return false;
                     }
                     true
@@ -819,6 +797,7 @@ impl ResidencyPlanner {
                     // Not funded yet: it waits for a completion (one that
                     // frees room pokes the plan, which looks again here).
                     if !fund {
+                        self.plan_stopped("restore short of runs: something in flight, not funded");
                         return false;
                     }
                     // Idle cache holds chunks too: one set goes, and the
@@ -837,6 +816,7 @@ impl ResidencyPlanner {
                         rs: RsUnits::default(),
                     };
                     if self.wait_on_grow(no_grow, grow) {
+                        self.plan_stopped("restore short of runs: waits on a grow the walk makes");
                         return true;
                     }
                     // Parked state lying on the device (role slots their
@@ -845,6 +825,7 @@ impl ResidencyPlanner {
                     // stall: host full, every process evicted, the head's
                     // runs held by parked role slots, nothing to evict).
                     if self.park_down_for(&room) {
+                        self.plan_stopped("restore short of runs: parked state moves down");
                         return false;
                     }
                     // Else the occupants of the chunks it could take move
@@ -871,17 +852,20 @@ impl ResidencyPlanner {
                             rs: RsUnits::default(),
                         },
                     ) {
+                        self.plan_stopped("short of kv: waits on a grow the walk makes");
                         return true;
                     }
                     // Idle cache a policy keys above the floor moves down
                     // a tier before any is dropped; the rest is dropped.
                     if self.demote_idle(count) {
+                        self.plan_stopped("short of kv: idle cache moves down");
                         return false;
                     }
                     if self.reclaim_idle_once() {
                         continue;
                     }
                     if self.sweep_stranded(count, false) {
+                        self.plan_stopped("short of kv: stranded tails swept");
                         return false;
                     }
                     fund_by_eviction
@@ -915,6 +899,7 @@ impl ResidencyPlanner {
                             rs: ask,
                         },
                     ) {
+                        self.plan_stopped("short of state: waits on a grow the walk makes");
                         return true;
                     }
                     // On a shared pool the chunks idle cache holds open for
@@ -922,6 +907,7 @@ impl ResidencyPlanner {
                     // tier before any is dropped.
                     let as_pages = self.port.rs_as_pages(need);
                     if as_pages > 0 && self.demote_idle(as_pages) {
+                        self.plan_stopped("short of state: idle cache moves down");
                         return false;
                     }
                     if self.reclaim_idle_once() || self.reclaim_head_sharing() {
@@ -931,6 +917,7 @@ impl ResidencyPlanner {
                     // keep, lowest key first, before any set moves whole
                     // (its state with it).
                     if as_pages > 0 && self.sweep_stranded(as_pages, true) {
+                        self.plan_stopped("short of state: stranded tails swept");
                         return false;
                     }
                     fund_by_eviction
@@ -944,6 +931,7 @@ impl ResidencyPlanner {
                                 rs: demand.rs,
                             },
                         ) {
+                            self.plan_stopped("allocation: waits on a grow for its state");
                             return true;
                         }
                         continue;
@@ -1023,6 +1011,7 @@ impl ResidencyPlanner {
                                 rs: need.rs,
                             },
                         ) {
+                            self.plan_stopped("restore: waits on a grow for its state");
                             return true;
                         }
                         continue;
@@ -1075,6 +1064,7 @@ impl ResidencyPlanner {
             if fund_by_eviction {
                 self.plan_eviction();
             } else {
+                self.plan_stopped("restore short of kv: something in flight, not funded");
                 self.stats
                     .restore_absorb_short
                     .fetch_add(1, Ordering::Relaxed);

@@ -8682,3 +8682,46 @@ async fn four_scattered_free_chunks_and_a_run_of_four_asked_issue_a_plan() {
         "a plan is issued"
     );
 }
+
+/// Mac Pro at 5 GiB on 1e87ab171: the no-step lines carried "no eviction
+/// plan for this head" and none of ended= / host_short / unhostable, the
+/// pass having stopped short of the eviction plan. Every place a pass
+/// stops for its head says where, and every unserved-head line carries the
+/// same fields.
+#[tokio::test(flavor = "current_thread")]
+async fn a_pass_that_stops_short_of_the_eviction_plan_says_where() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (head, other) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [head, other] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    let key = planner.with_inner(|inner| {
+        let proc = inner.procs.get_mut(&head).unwrap();
+        proc.state = Residency::Evicted;
+        proc.roles_short = Some(PendingBind {
+            run: 4,
+            pieces: 1,
+            pages: 4,
+        });
+        proc.roles_short_stood = Some((false, 0));
+        inner.enqueue(
+            head,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        )
+    });
+    let fire = planner.fire_in_flight(other);
+    planner.plan();
+    let (plan, _) = planner.with_inner(|inner| inner.plan_fields(key));
+    assert!(
+        plan.contains("ended=\"restore short of runs: something in flight, not funded\"")
+            && plan.contains("host_short=")
+            && plan.contains("unhostable="),
+        "{plan}"
+    );
+    drop(fire);
+}
