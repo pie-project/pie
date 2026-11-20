@@ -648,6 +648,7 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
         // with the state into the block's stage; an earlier chunk is read
         // into the same stage, a warp's rows each.
         unsigned char* bs = bring + (it & 1) * BSTAGE;
+        __shared__ float2 t_dots[CH];
         auto shfl64 = [&](u64 v, int from) {
             const unsigned lo = __shfl_sync(0xffffffffu, static_cast<unsigned>(v), from);
             const unsigned hi = __shfl_sync(0xffffffffu, static_cast<unsigned>(v >> 32), from);
@@ -704,8 +705,8 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
             const bf16* sk = reinterpret_cast<const bf16*>(st + 4096 + 256);
             float qi[MR];
             float ki[MR];
-            gdn_keys(sq, i0, K_d, q_scale, qi);
-            gdn_keys(sk, i0, K_d, 1.f, ki);
+            const float nq = gdn_keys(sq, i0, K_d, q_scale, qi);
+            const float nk = gdn_keys(sk, i0, K_d, 1.f, ki);
             float vv[VEC];
             unpack8(*reinterpret_cast<const uint4*>(st + 4608 + (lane & 1) * 16), vv);
             const float* sgate = reinterpret_cast<const float*>(st + 4640);
@@ -739,34 +740,60 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
                 const bf16* kst = reinterpret_cast<const bf16*>(bs);
                 const float* ust = reinterpret_cast<const float*>(bs + CH * KROW);
                 const unsigned* ast = reinterpret_cast<const unsigned*>(bs + CH * (KROW + UROW));
-                float pq[CH], pk[CH], pkk[CH];
-                #pragma unroll
-                for (int b = 0; b < CH; ++b) {
-                    pq[b] = 0.f;
-                    pk[b] = 0.f;
-                    pkk[b] = 0.f;
-                    if (b < rows) {
-                        const bf16* kr = kst + b * (KROW / 2) + i0;
+                // A warp a row (row e by warp e mod W) sums the row's keys
+                // against the own row's raw q and k, four elements a lane,
+                // into the block's table once; every warp reads it.
+                {
+                    float oq[4] = {0.f, 0.f, 0.f, 0.f};
+                    float ok[4] = {0.f, 0.f, 0.f, 0.f};
+                    if (4 * lane < K_d) {
+                        const uint2 qr = *reinterpret_cast<const uint2*>(sq + 4 * lane);
+                        const uint2 kr = *reinterpret_cast<const uint2*>(sk + 4 * lane);
+                        const float2 q0 = gdn_unpack(qr.x), q1 = gdn_unpack(qr.y);
+                        const float2 k0 = gdn_unpack(kr.x), k1 = gdn_unpack(kr.y);
+                        oq[0] = q0.x; oq[1] = q0.y; oq[2] = q1.x; oq[3] = q1.y;
+                        ok[0] = k0.x; ok[1] = k0.y; ok[2] = k1.x; ok[3] = k1.y;
+                    }
+                    constexpr int OWN = (CH + W - 1) / W;
+                    float sums[OWN][3];
+                    #pragma unroll
+                    for (int i = 0; i < OWN; ++i) {
+                        const int r_ = warp + W * i;
+                        sums[i][0] = 0.f;
+                        sums[i][1] = 0.f;
+                        sums[i][2] = 0.f;
+                        if (r_ < rows && 4 * lane < K_d) {
+                            const uint2 kr = *reinterpret_cast<const uint2*>(kst + r_ * (KROW / 2) + 4 * lane);
+                            const float2 k0 = gdn_unpack(kr.x), k1 = gdn_unpack(kr.y);
+                            const float kv[4] = {k0.x, k0.y, k1.x, k1.y};
+                            #pragma unroll
+                            for (int x = 0; x < 4; ++x) {
+                                sums[i][0] += kv[x] * oq[x];
+                                sums[i][1] += kv[x] * ok[x];
+                                sums[i][2] += kv[x] * kv[x];
+                            }
+                        }
+                    }
+                    #pragma unroll
+                    for (int off = 16; off > 0; off >>= 1) {
                         #pragma unroll
-                        for (int m = 0; m < MR; ++m) {
-                            if (16 * m < K_d) {
-                                const float kv = Elem<bf16>::to_f32(kr[16 * m]);
-                                pq[b] += kv * qi[m];
-                                pk[b] += kv * ki[m];
-                                pkk[b] += kv * kv;
+                        for (int i = 0; i < OWN; ++i) {
+                            #pragma unroll
+                            for (int v = 0; v < 3; ++v) sums[i][v] += __shfl_xor_sync(0xffffffffu, sums[i][v], off);
+                        }
+                    }
+                    if (lane == 0) {
+                        #pragma unroll
+                        for (int i = 0; i < OWN; ++i) {
+                            const int r_ = warp + W * i;
+                            if (r_ < rows) {
+                                const float nj = rsqrtf(sums[i][2] + 1e-6f);
+                                t_dots[r_] = make_float2(sums[i][0] * nj * nq, sums[i][1] * nj * nk);
                             }
                         }
                     }
                 }
-                #pragma unroll
-                for (int off = 2; off < 32; off <<= 1) {
-                    #pragma unroll
-                    for (int b = 0; b < CH; ++b) {
-                        pq[b] += __shfl_xor_sync(0xffffffffu, pq[b], off);
-                        pk[b] += __shfl_xor_sync(0xffffffffu, pk[b], off);
-                        pkk[b] += __shfl_xor_sync(0xffffffffu, pkk[b], off);
-                    }
-                }
+                __syncthreads();
                 float glog = 0.f;
                 float dq = 0.f;
                 float dk = 0.f;
@@ -777,14 +804,9 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
                     const float z = av + dtb;
                     const float sp = (z > 20.f) ? z : log1pf(__expf(z));
                     glog = -ea * sp;
-                    #pragma unroll
-                    for (int b = 0; b < CH; ++b) {
-                        if (b == lane) {
-                            const float nj = rsqrtf(pkk[b] + 1e-6f);
-                            dq = pq[b] * nj;
-                            dk = pk[b] * nj;
-                        }
-                    }
+                    const float2 dd = t_dots[lane];
+                    dq = dd.x;
+                    dk = dd.y;
                 }
                 float later = glog;
                 #pragma unroll
