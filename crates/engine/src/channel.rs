@@ -54,6 +54,12 @@ impl Default for ChannelRegistration {
 pub trait MirrorMemory: Send + Sync + std::fmt::Debug {
     fn words(&self) -> &[AtomicU64];
     fn cells(&self) -> &[AtomicU8];
+    /// The cells as words where they start on a word boundary: the same
+    /// memory as `cells`, or the cells alone where `cells` is empty, which
+    /// then only the host touches.
+    fn cell_words(&self) -> &[AtomicU64] {
+        &[]
+    }
 }
 
 /// A host mapping, alive for as long as any clone of it is.

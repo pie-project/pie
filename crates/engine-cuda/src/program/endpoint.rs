@@ -282,6 +282,16 @@ impl engine::channel::MirrorMemory for Endpoint {
         // as long as `self`, and an `AtomicU8` is laid out as a `u8`.
         unsafe { std::slice::from_raw_parts(host.cast::<AtomicU8>(), self.mirror.bytes()) }
     }
+
+    fn cell_words(&self) -> &[AtomicU64] {
+        let host = self.mirror.host().cast::<AtomicU64>();
+        if host.is_null() || !host.is_aligned() {
+            return &[];
+        }
+        // SAFETY: as `cells`, and the words start on a word boundary and end
+        // within the mapping.
+        unsafe { std::slice::from_raw_parts(host, self.mirror.bytes() / 8) }
+    }
 }
 
 /// A closed channel's memory goes back to the pool for the next of its

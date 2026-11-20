@@ -211,6 +211,17 @@ impl engine::channel::MirrorMemory for ChannelState {
         // order the host's access to a cell against the interpreter's.
         unsafe { std::slice::from_raw_parts(self.cells_ptr().cast(), self.cells_len()) }
     }
+
+    #[allow(unsafe_code)]
+    fn cell_words(&self) -> &[AtomicU64] {
+        let cells = self.cells_ptr().cast::<AtomicU64>();
+        if !cells.is_aligned() {
+            return &[];
+        }
+        // SAFETY: as `cells`, and the words start on a word boundary and end
+        // within the cells.
+        unsafe { std::slice::from_raw_parts(cells, self.cells_len() / 8) }
+    }
 }
 
 #[must_use]

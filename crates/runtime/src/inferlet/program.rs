@@ -1,4 +1,3 @@
-#![allow(unsafe_code)]
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
@@ -235,7 +234,7 @@ impl ProgramService {
             return Ok(component.clone());
         }
         if let Some(precompiled) = self.language_precompiled.remove(&language) {
-            match deserialize_component(&self.wasm_engine, &precompiled) {
+            match runtime_sys::deserialize_component(&self.wasm_engine, &precompiled) {
                 Ok(component) => {
                     self.languages.insert(language, component.clone());
                     return Ok(component);
@@ -430,20 +429,6 @@ impl ServiceHandler for ProgramService {
             }
         }
     }
-}
-
-/// A component serialized by `precompile_component`. Wasmtime checks the
-/// artifact's header against this engine's version and settings and refuses
-/// a mismatch.
-fn deserialize_component(engine: &WasmEngine, precompiled: &[u8]) -> Result<Component> {
-    if WasmEngine::detect_precompiled(precompiled) != Some(wasmtime::Precompiled::Component) {
-        anyhow::bail!("not a component precompiled by wasmtime");
-    }
-    // SAFETY: deserializing trusts the bytes to be wasmtime's own output, as
-    // wasmtime cannot verify the code inside. They come from the host that
-    // embeds this runtime (the page, in a browser), which is trusted as much
-    // as the runtime itself: it supplies the language component's source too.
-    unsafe { Component::deserialize(engine, precompiled) }.map_err(|e| anyhow!("{e}"))
 }
 
 pub async fn compile_wasm_component(
