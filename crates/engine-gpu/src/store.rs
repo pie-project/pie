@@ -1331,8 +1331,9 @@ impl<B: Backend> Pools<B> {
 
     /// Slots of one shape copied as [`engine::Engine::copy_slots`] states
     /// them: on the device (whole slots, and token runs of the list),
-    /// between the device and the host chunks, or between the device and
-    /// the slot file. A host or disk copy waits out its frame. A record's
+    /// between the device and the host chunks, or between the device (or
+    /// the host chunks) and the slot file. A host or disk copy waits out its
+    /// frame. A record's
     /// own frozen position goes where its slot does ([`frozen`]).
     pub fn copy_slots(
         &mut self,
@@ -1464,10 +1465,18 @@ impl<B: Backend> Pools<B> {
                 let (slots, ids): (Vec<u32>, Vec<u32>) = copy.slots.iter().copied().unzip();
                 self.spill(device, copy.shape, false, &ids, &slots)
             }
+            (MemoryDomain::HostPinned, MemoryDomain::LocalDisk) => {
+                let (ids, slots): (Vec<u32>, Vec<u32>) = copy.slots.iter().copied().unzip();
+                self.spill_host(copy.shape, true, &ids, &slots)
+            }
+            (MemoryDomain::LocalDisk, MemoryDomain::HostPinned) => {
+                let (slots, ids): (Vec<u32>, Vec<u32>) = copy.slots.iter().copied().unzip();
+                self.spill_host(copy.shape, false, &ids, &slots)
+            }
             (src, dst) => Err(Fault::Unbound {
                 what: format!(
                     "a slot copy from {src:?} to {dst:?}: this pool moves slots within the \
-                     device, to its host chunks and to its slot file"
+                     device, to its host chunks, and from either to its slot file"
                 ),
             }),
         }
@@ -1623,6 +1632,76 @@ impl<B: Backend> Pools<B> {
         });
         self.disk = Some(disk);
         copied
+    }
+
+    /// Copies whole kv list slots between the host chunks (host slot refs
+    /// `ids`) and the slot file's `slots` the way `to_disk` says: the host
+    /// tier's idle cache going on down to disk, and back. The bytes pass
+    /// through the host alone. The caller has drained every frame.
+    fn spill_host(&mut self, id: ShapeId, to_disk: bool, ids: &[u32], slots: &[u32]) -> Result<()> {
+        if id != LIST {
+            return Err(Fault::Unbound {
+                what: format!("slot shape {id} to the slot file, which holds kv list slots"),
+            });
+        }
+        Spill::room(self.disk.as_ref(), "disk kv pages", slots)?;
+        let bytes = usize::try_from(self.page_bytes()).unwrap_or(usize::MAX);
+        let places = ids
+            .iter()
+            .map(|&slot| self.host_offset(LIST, slot))
+            .collect::<Result<Vec<_>>>()?;
+        let Some(file) = self.disk.as_ref().map(Spill::file) else {
+            return Ok(());
+        };
+        let stride = file.stride();
+        let mut stage = engine::disk::Aligned::zeroed(stride);
+        let staged = stage.as_mut_slice();
+        for (at, &slot) in places.into_iter().zip(slots) {
+            let span = |host_len: usize| {
+                let from = usize::try_from(at).unwrap_or(usize::MAX);
+                from.checked_add(bytes)
+                    .filter(|&end| end <= host_len)
+                    .map(|end| from..end)
+                    .ok_or(Fault::Ceiling {
+                        what: "bytes of the host chunks",
+                        need: at + bytes as u64,
+                        have: host_len as u64,
+                    })
+            };
+            if to_disk {
+                match &self.host {
+                    HostChunks::Mapped(host) => host
+                        .as_ref()
+                        .ok_or(Fault::Ceiling {
+                            what: "host chunks of the state pool",
+                            need: 1,
+                            have: 0,
+                        })?
+                        .read(at, &mut staged[..bytes])?,
+                    HostChunks::Heap(host) => {
+                        staged[..bytes].copy_from_slice(&host[span(host.len())?]);
+                    }
+                }
+                file.write(slot, staged).map_err(slot_file)?;
+            } else {
+                file.read(slot, staged).map_err(slot_file)?;
+                match &mut self.host {
+                    HostChunks::Mapped(host) => host
+                        .as_mut()
+                        .ok_or(Fault::Ceiling {
+                            what: "host chunks of the state pool",
+                            need: 1,
+                            have: 0,
+                        })?
+                        .write(at, &staged[..bytes])?,
+                    HostChunks::Heap(host) => {
+                        let span = span(host.len())?;
+                        host[span].copy_from_slice(&staged[..bytes]);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Opens the kv slot file under `dir` within `budget` bytes; the kv
