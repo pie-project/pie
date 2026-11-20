@@ -877,6 +877,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         scheduler.silence_timeout_secs,
     ));
     crate::scheduler::set_frame_size(scheduler.frame_size as usize);
+    crate::scheduler::set_frame_ceiling(scheduler.frame_size as usize);
     crate::scheduler::set_dispatch_depth(engine_frames as usize);
     let scheduler_shutdown = crate::scheduler::spawn(&engines, kv_page_size as u32).await?;
     // Each engine takes the weight residency it starts with before the load

@@ -391,6 +391,14 @@ pub async fn run(global: &crate::args::GlobalArgs, args: TuneArgs) -> Result<cra
         let mut worker = worker.clone();
         worker.runtime.frame_dispatch_depth =
             u32::try_from(depth).context("a dispatch depth past a u32")?;
+        // the load's frame size is the largest this depth tries: its window
+        // is laid for it, and the smaller ones sweep within the load
+        let largest = at_depth
+            .iter()
+            .map(|knobs| knobs.frame_size)
+            .max()
+            .unwrap_or(1);
+        worker.runtime.frame_size = u32::try_from(largest).context("a frame size past a u32")?;
         println!("  loading at {depth} frame(s) in flight");
         let pie = worker::standalone::run_standalone(
             controller.clone(),

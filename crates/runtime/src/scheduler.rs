@@ -346,6 +346,11 @@ pub fn configured_dispatch_depth() -> usize {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReconfigureRefused {
     Busy(usize),
+    /// A frame size past the load's (its run-ahead window was laid for it).
+    PastCeiling {
+        asked: usize,
+        ceiling: usize,
+    },
 }
 
 impl std::fmt::Display for ReconfigureRefused {
@@ -355,6 +360,11 @@ impl std::fmt::Display for ReconfigureRefused {
                 f,
                 "{n} process(es) still live; these knobs can only change while \
                  the runtime is idle"
+            ),
+            Self::PastCeiling { asked, ceiling } => write!(
+                f,
+                "a frame size of {asked} is past the load's {ceiling}, which its \
+                 run-ahead window was laid for; load at the larger frame size"
             ),
         }
     }
@@ -371,9 +381,32 @@ pub fn reconfigure(frame_size: usize) -> Result<(), ReconfigureRefused> {
     if live > 0 {
         return Err(ReconfigureRefused::Busy(live));
     }
+    let ceiling = frame_ceiling();
+    if frame_size > ceiling {
+        return Err(ReconfigureRefused::PastCeiling {
+            asked: frame_size,
+            ceiling,
+        });
+    }
     set_frame_size(frame_size);
     Ok(())
 }
+
+/// The load's largest frame size: the frame size it boots at, which its
+/// run-ahead window is laid for; a reconfigure stays at or under it.
+pub fn frame_ceiling() -> usize {
+    match FRAME_CEILING.load(Ordering::Relaxed) {
+        0 => configured_frame_size(),
+        k => k,
+    }
+}
+
+/// Sets the load's largest frame size (bootstrap, before any program).
+pub fn set_frame_ceiling(frame_size: usize) {
+    FRAME_CEILING.store(frame_size, Ordering::Relaxed);
+}
+
+static FRAME_CEILING: AtomicUsize = AtomicUsize::new(0);
 
 pub fn channel_capacity() -> usize {
     ::engine::runahead::Runahead::unstaged(
