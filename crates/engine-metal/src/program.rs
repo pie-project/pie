@@ -2428,6 +2428,11 @@ mod tests {
                 .map(|_| leak(Channel::new([1], dtype::i32).capacity(1)))
                 .collect();
             let draws_in = draws.clone();
+            // A tie bf16 makes of two distinct f32 logits (16 and 16.0625
+            // round to 16), drawn over TIES rows of independent lanes:
+            // each token wins half the draws.
+            const TIES: u32 = 4000;
+            let ties = leak(Channel::new([TIES], dtype::i32).capacity(1));
             // (reader, name, held within a bf16 ulp)
             let readers: [(&'static Channel, &str, bool); 15] = [
                 (exped, "exp", true),
@@ -2489,6 +2494,16 @@ mod tests {
                     row_scan.put(&cumsum(&x));
                     flipped.put(&x);
                 }
+                let offset = cast(iota(2), dtype::f32) * 0.0625f32;
+                let pair = cast(
+                    broadcast(16.0f32, [TIES, 2]) + broadcast(reshape(&offset, [1, 2]), [TIES, 2]),
+                    dtype::bf16,
+                );
+                let tie_state = broadcast(0x5bd1_e995u32 ^ vocab, [2]) + iota(2) * 3u32;
+                ties.put(&reshape(
+                    gumbel_argmax(&pair, gt(&pair, 0.0f32), 1.0f32, &tie_state),
+                    [TIES],
+                ));
                 let keep = gt(&x, -4.0f32);
                 for (k, draw) in draws_in.iter().enumerate() {
                     let k = k as u32;
@@ -2506,6 +2521,7 @@ mod tests {
             for draw in &draws {
                 draw.note_host_take();
             }
+            ties.note_host_take();
             let traced = b.build().expect("the bf16 program traces");
             let bound = eta_ir::validate::bind(
                 traced.container().clone(),
@@ -2631,6 +2647,27 @@ mod tests {
                 if got != want {
                     wrong.push(format!("vocab {vocab}, gumbel draw {k}: {got:02x?} != {want:02x?}"));
                 }
+            }
+            let want = wire(&reference.host_take(&bound, index(ties)).expect("the ties"));
+            let got = plane
+                .instance_mut(id)
+                .expect("bound")
+                .take(index(ties))
+                .expect("a take")
+                .expect("the ties");
+            if got != want {
+                wrong.push(format!("vocab {vocab}: the tie draws differ from the interpreter's"));
+            }
+            let second = got
+                .chunks_exact(4)
+                .filter(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) == 1)
+                .count() as f64
+                / f64::from(TIES);
+            eprintln!("vocab {vocab}: the bf16 tie drew its second token {second:.4} of {TIES}");
+            if (second - 0.5).abs() > 0.03 {
+                wrong.push(format!(
+                    "vocab {vocab}: the bf16 tie drew its second token {second:.3} of the time, not about half"
+                ));
             }
         }
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
