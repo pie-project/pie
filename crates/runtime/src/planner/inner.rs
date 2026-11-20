@@ -267,11 +267,23 @@ impl Inner {
             .filter(|waiter| waiter.is_unmet())
             .map(|waiter| waiter.pid)
             .collect();
+        // Its head served: no unmet waiter of its, and resident. A restore
+        // head leaves the queue while its restore runs and comes back if
+        // its unpark is short: read by its queue alone, it looked served
+        // in that gap, and the victim's restore went first (the L40S: one
+        // victim evicted 5,894 times for one restore head, never served).
+        let unserved = |head: ProcessId| {
+            waiting.contains(&head)
+                || self
+                    .procs
+                    .get(&head)
+                    .is_some_and(|proc| proc.state != Residency::Resident)
+        };
         let held_for_head = |pid: ProcessId| {
             self.procs
                 .get(&pid)
                 .and_then(|proc| proc.evicted_for)
-                .is_some_and(|head| head != pid && waiting.contains(&head))
+                .is_some_and(|head| head != pid && unserved(head))
         };
         for (&key, waiter) in &self.queue {
             if !waiter.is_unmet() {

@@ -267,7 +267,7 @@ impl ResidencyPlanner {
         // they off the device.
         let map = shape.map(|_| {
             let mut map = self.port.chunk_occupants(&residents);
-            map.merge(self.port.parked_occupants(victims.head_pid));
+            map.merge(self.port.parked_occupants(self.parked_except(victims.head_pid)));
             map
         });
         // No eviction forms the head's runs (a chunk in every window holds

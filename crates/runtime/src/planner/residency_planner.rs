@@ -511,27 +511,44 @@ impl ResidencyPlanner {
     /// the map asked less than the step took and moved no one. `None` for
     /// a head short of kv alone.
     pub(super) fn head_room(&self, key: EntryKey) -> Option<(u32, u32)> {
-        let (need, suspended) = self.with_inner(|inner| {
+        let (need, suspended, kv_missing) = self.with_inner(|inner| {
             let waiter = inner.queue.get(&inner.locate(key)?)?;
             match &waiter.kind {
-                WaitKind::BindRoom { run, pieces, .. } => Some(((*run, *pieces), None)),
+                WaitKind::BindRoom { run, pieces, .. } => Some(((*run, *pieces), None, 0)),
                 WaitKind::Restore { .. } => {
                     let proc = inner.procs.get(&waiter.pid)?;
                     let need = proc.restore_need()?;
                     let suspended = proc.bind_room.is_some() && proc.roles_short.is_none();
-                    Some((need, Some((waiter.pid, suspended))))
+                    // Its kv pages not yet gathered take chunks of the same
+                    // free pool as its runs.
+                    let kv_missing = waiter.kv_need().saturating_sub(inner.accum.len() as u32);
+                    Some((need, Some((waiter.pid, suspended)), kv_missing))
                 }
                 WaitKind::Allocation { .. } => None,
             }
         })?;
-        Some(match suspended {
+        let (run, pieces) = match suspended {
             // A bind's runs beside what its own unpark takes back first.
             Some((pid, true)) => self.beside_own(pid, need),
             // Short of its roles: the whole unpark, not the part it came up
             // short on (its own runs count that part among them).
             Some((pid, false)) => self.whole_unpark(pid, need),
             None => need,
-        })
+        };
+        // A restore's step gathers its kv pages, then lays its runs: the
+        // chunks the pages still need stand beside the runs, in runs of the
+        // same length (they need not be adjacent; asked so, they never fall
+        // short). Read as the runs alone, fitting runs stood (Mac Pro: a
+        // restore of (3, 3) and 41 kv pages, 8 runs open), the pages broke
+        // them as they were gathered, and the unpark came up short.
+        let per_chunk = self.port.chunks_as_pages(1);
+        let kv_runs = if per_chunk > 0 {
+            kv_missing.div_ceil(per_chunk).div_ceil(run.max(1))
+        } else {
+            0
+        };
+        let most = self.port.state_chunks() / run.max(1);
+        Some((run, pieces.saturating_add(kv_runs).min(most).max(pieces)))
     }
 
     /// The runs a restore short of its roles takes when its unpark runs:
@@ -559,6 +576,22 @@ impl ResidencyPlanner {
         (run, pieces.saturating_add(own).min(most).max(pieces))
     }
 
+    /// Whose parked state a map for `head` leaves out: its own while it is
+    /// resident (its state is live, whatever of it lies parked), nobody's
+    /// once it is evicted. Nothing runs on an evicted head's state parked in
+    /// place; moved down a tier, its restore lays it back compactly. Left
+    /// out, an evicted head's own tables and rings (126 instances on the
+    /// M1) held the chunks its bind's runs needed, and nothing moved them.
+    pub(super) fn parked_except(&self, head: ProcessId) -> ProcessId {
+        let evicted = self.with_inner(|inner| {
+            inner
+                .procs
+                .get(&head)
+                .is_some_and(|proc| proc.state == Residency::Evicted)
+        });
+        if evicted { SWEEP } else { head }
+    }
+
     /// Parked state lying on the device (role slots its park found no host
     /// room for) is room a move makes, as idle cache is: for the head's
     /// `pieces` runs of `run` adjacent chunks, the parked processes whose
@@ -569,7 +602,7 @@ impl ResidencyPlanner {
         let Some(head) = self.with_inner(|inner| inner.unmet_head().map(|(_, w)| w.pid)) else {
             return false;
         };
-        match self.port.parked_occupants(head).cheapest_runs(run, pieces) {
+        match self.port.parked_occupants(self.parked_except(head)).cheapest_runs(run, pieces) {
             Some(pids) if !pids.is_empty() => self.park_down(head, pids),
             _ => false,
         }
@@ -586,7 +619,7 @@ impl ResidencyPlanner {
         if pages == 0 || per_chunk == 0 {
             return false;
         }
-        let mut map = self.port.parked_occupants(head);
+        let mut map = self.port.parked_occupants(self.parked_except(head));
         let emptiable = map.held.iter().filter(|chunk| chunk.emptiable()).count() as u32;
         let chunks = pages.div_ceil(per_chunk).min(emptiable);
         if chunks == 0 {
@@ -604,7 +637,7 @@ impl ResidencyPlanner {
     /// Moves the parked state `pids` left on the device down a tier: the
     /// host where it has room, else host kv goes on down to disk first to
     /// make it, the evicted processes' in the order they would be evicted
-    /// (lowest first), `head`'s last of all and never its own state: the
+    /// (lowest first), `head`'s last of all, its own only once it is evicted: the
     /// tiers keep the newer above the older, as idle cache's do
     /// ([`Self::demote_idle`]). Only evicted processes' state moves, and
     /// none of them is restored until it lands. Whether a move is on its
@@ -621,12 +654,14 @@ impl ResidencyPlanner {
             // Parked state of a process the planner no longer knows (gone
             // while parked) moves down too: no one runs on it, and passed
             // over it held its chunks for good.
+            // An evicted head's own parked state moves too: nothing runs on
+            // it, and its restore lays it back compactly. A resident head's
+            // is never evicted, so never moved.
             let evicted = |pid: &ProcessId| {
-                *pid != head
-                    && inner
-                        .procs
-                        .get(pid)
-                        .is_none_or(|proc| proc.state == Residency::Evicted)
+                inner
+                    .procs
+                    .get(pid)
+                    .is_none_or(|proc| proc.state == Residency::Evicted)
             };
             let (pids, passed): (Vec<ProcessId>, Vec<ProcessId>) =
                 pids.into_iter().partition(|pid| evicted(pid));

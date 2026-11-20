@@ -2862,3 +2862,48 @@ fn an_unpark_asks_the_chunks_it_lays_not_a_chunk_a_part() {
     assert!(asked < 12, "not a chunk an instance: asked {asked}");
     assert_eq!(asked, laid, "asked what the unpark lays: {asked} vs {laid}");
 }
+
+/// Mac Pro's 2 GiB stall (a restore needing three runs of nine, open
+/// stretches of 10, 10 and 9 in three segments, nothing in flight): where
+/// the pool counts the runs a restore needs, the restore's own unpark
+/// seats it there. The count and the take read the same runs
+/// (`SlotPool::chunk_runs_for`).
+#[test]
+fn a_restore_needing_three_runs_of_nine_is_seated_in_stretches_of_ten_ten_and_nine() {
+    let Pools { device, roles } = pools_no_host(facts_in(80, 16));
+    let (program, mut engine) = runs_of(13, 9, 3, 0);
+    bind_as(&roles, &mut engine, program, 1).expect("an empty pool seats it");
+    park(&roles, 1);
+    // Every free chunk taken by single-chunk states of others.
+    let (singles, mut single) = runs_of(9, 1, 1, 1000);
+    let mut held = Vec::new();
+    for by in 0.. {
+        match bind_as(&roles, &mut single, singles, 500 + by) {
+            Ok(id) => held.push((id, single.bindings.last().unwrap().scratch.clone())),
+            Err(_) => {
+                roles.lock().unwrap().leave_guest_wait(holder(500 + by));
+                break;
+            }
+        }
+    }
+    // Free stretches of 10 (segment 1), 10 (segment 2) and 9 (segment 3).
+    let physical = |logical: u32| device.lock().unwrap().pool().physical(logical).unwrap();
+    let stretch = |chunk: u32| (16..26).contains(&chunk) || (32..42).contains(&chunk) || (48..57).contains(&chunk);
+    for (id, place) in &held {
+        if chunks(place).iter().all(|&logical| stretch(physical(logical))) {
+            roles.lock().unwrap().close_instance(*id);
+        }
+    }
+    assert_eq!(
+        device.lock().unwrap().pool().free_chunk_runs(9),
+        3,
+        "the pool counts three runs of nine"
+    );
+    let back = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(1))
+        .expect("seated where its runs stand")
+        .expect("it comes back");
+    roles.lock().unwrap().commit(back);
+}

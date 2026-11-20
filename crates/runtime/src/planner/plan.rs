@@ -180,7 +180,7 @@ impl ResidencyPlanner {
             .map(|set| set.candidates(true).into_iter().map(|(pid, _)| pid).collect())
             .unwrap_or(pids);
         let mut map = self.port.chunk_occupants(&pids);
-        map.merge(self.port.parked_occupants(pid));
+        map.merge(self.port.parked_occupants(self.parked_except(pid)));
         let (map, census) = (map.explain(run), self.port.chunk_census(run));
         // Every head queued fits the pool alone (one past it is refused at
         // its ask): unserved with nothing in flight, the planner found no
