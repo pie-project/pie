@@ -358,13 +358,17 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         let bytes = compiled
             .arena
             .bytes
-            .saturating_add(crate::inputs::attention_workspace_bytes(
-                &budget,
-                &facts,
-                &device.device(),
-                device.toggles(),
-                &crate::exports::schedule_streams(&boot.trace, &compiled),
-            ))
+            .saturating_add(
+                crate::inputs::attention_workspace_bytes(
+                    &budget,
+                    engine.fire_lanes_of(budget.max_lanes),
+                    &facts,
+                    &device.device(),
+                    device.toggles(),
+                    &crate::exports::schedule_streams(&boot.trace, &compiled),
+                )
+                .map_err(|e| e.to_string())?,
+            )
             .saturating_add(windowed);
         let launches = u32::try_from(compiled.template().len()).unwrap_or(u32::MAX);
         Ok((bytes, launches))
@@ -395,10 +399,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         // The lanes one fire carries (`Shell::fire_lanes`): the runtime
         // fires a wider wave as fires of this many, and a rung's check fire
         // (`RungFacts::check_fire`) lays its rows over them.
-        let fire_lanes = match engine.fire_lanes {
-            0 => boot.budget.max_lanes,
-            cap => boot.budget.max_lanes.min(cap),
-        };
+        let fire_lanes = engine.fire_lanes_of(boot.budget.max_lanes);
         let rungs = crate::top::rung_facts(
             &candidates,
             boot.budget.max_lanes,
@@ -776,13 +777,17 @@ fn refit(
         compiled
             .arena
             .bytes
-            .saturating_add(crate::inputs::attention_workspace_bytes(
-                &budget,
-                &facts,
-                &device.device(),
-                device.toggles(),
-                &schedule_streams(&boot.trace, &compiled),
-            ))
+            .saturating_add(
+                crate::inputs::attention_workspace_bytes(
+                    &budget,
+                    engine.fire_lanes_of(budget.max_lanes),
+                    &facts,
+                    &device.device(),
+                    device.toggles(),
+                    &schedule_streams(&boot.trace, &compiled),
+                )
+                .unwrap_or(u64::MAX),
+            )
             .saturating_add(tiles)
             .saturating_add(
                 u64::from(lanes)
@@ -1445,6 +1450,7 @@ impl Shell {
         }
         let inputs = Inputs::reserve(
             &boot.budget,
+            engine.fire_lanes_of(boot.budget.max_lanes),
             paging,
             page_tables,
             &facts,
