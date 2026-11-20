@@ -17,7 +17,8 @@ impl Knobs {
     }
 
     pub fn submit_depth(&self) -> usize {
-        worker::config::Runahead::of(self.dispatch_depth.min(255) as u8).submit_depth()
+        worker::config::Runahead::of(self.dispatch_depth.min(255) as u8)
+            .submit_depth(runtime::scheduler::host_cover())
     }
 
     pub fn admissible(&self) -> bool {

@@ -1,6 +1,6 @@
 use runtime::scheduler::{
     ReconfigureRefused, channel_capacity, configured_dispatch_depth, configured_frame_size,
-    configured_submit_depth, reconfigure, set_frame_ceiling,
+    configured_submit_depth, reconfigure, set_frame_ceiling, set_host_cover,
 };
 
 #[test]
@@ -10,6 +10,8 @@ fn scheduler_reconfigure_every_case() {
 }
 
 fn the_knobs_are_no_longer_write_once() {
+    // the cover the load measures; three frames here
+    set_host_cover(3);
     assert_eq!(configured_frame_size(), 2, "default k");
     assert_eq!(configured_dispatch_depth(), 2, "default horizon");
     assert_eq!(configured_submit_depth(), 5, "default window");

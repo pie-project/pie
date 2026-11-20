@@ -332,8 +332,28 @@ pub fn configured_submit_depth() -> usize {
     ::engine::runahead::Runahead::unstaged(
         u8::try_from(configured_dispatch_depth()).unwrap_or(u8::MAX),
     )
-    .submit_depth()
+    .submit_depth(host_cover())
 }
+
+/// The frames a lane's guest turnaround hides behind past the ones in
+/// flight, as measured at load: the turnaround (a frame's landing to the
+/// lane's next submit) over one frame's device time, rounded up, on a warm
+/// run of the standard sampler before ready (`bootstrap`). The frame seal
+/// waits for every lane, so too little cover idles the device: at one frame
+/// of cover, 256 requests of 1024 in / 256 out on Gemma-4-31B held 378 of
+/// 525 seals with the device idle; at three, 17. 0 until measured (the
+/// prewarm's registrations compile the same code at any capacity, and the
+/// warm run itself runs at depth 1).
+pub fn host_cover() -> usize {
+    HOST_COVER.load(Ordering::Relaxed)
+}
+
+/// Sets the measured cover (bootstrap, before ready).
+pub fn set_host_cover(cover: usize) {
+    HOST_COVER.store(cover, Ordering::Relaxed);
+}
+
+static HOST_COVER: AtomicUsize = AtomicUsize::new(0);
 
 pub fn set_dispatch_depth(depth: usize) {
     frame::set_dispatch_depth(depth);
@@ -412,14 +432,14 @@ pub fn channel_capacity() -> usize {
     ::engine::runahead::Runahead::unstaged(
         u8::try_from(configured_dispatch_depth()).unwrap_or(u8::MAX),
     )
-    .channel_capacity(configured_frame_size())
+    .channel_capacity(host_cover(), configured_frame_size())
 }
 
 pub fn run_ahead_window() -> usize {
     ::engine::runahead::Runahead::unstaged(
         u8::try_from(configured_dispatch_depth()).unwrap_or(u8::MAX),
     )
-    .submit_depth()
+    .submit_depth(host_cover())
         * configured_frame_size()
 }
 
