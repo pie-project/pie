@@ -2799,6 +2799,10 @@ mod tests {
         ) -> engine::Result<engine::FrameTicket> {
             panic!("the shape of an interpreter reading lane zero of an empty cell");
         }
+
+        fn settle_frame(&mut self, _ticket: &mut engine::FrameTicket) -> engine::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -2859,6 +2863,10 @@ mod tests {
 
         fn refused_unlaunched(&self) -> bool {
             true
+        }
+
+        fn settle_frame(&mut self, _ticket: &mut engine::FrameTicket) -> engine::Result<()> {
+            Ok(())
         }
     }
 
@@ -3142,6 +3150,10 @@ mod tests {
                 wanted: 2,
                 available: 1,
             })
+        }
+
+        fn settle_frame(&mut self, _ticket: &mut engine::FrameTicket) -> engine::Result<()> {
+            Ok(())
         }
     }
 
