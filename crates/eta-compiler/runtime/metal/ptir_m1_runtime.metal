@@ -2051,6 +2051,58 @@ inline void m4_argmax_final(
   }
 }
 
+// `gumbel_argmax`: each row's index of its largest `logits[i] / divisor +
+// gumbel(state, i)`, a lane whose `keep` is false `-inf`. Every lane is
+// made in f32 from its operands and never stored: the noise is lane `i`
+// (the flat index) of `rng_keyed(state, logits' shape, Gumbel)`, made with
+// the same operations as the keyed rng's Gumbel lane, so over f32 logits
+// the draw is bit for bit `reduce_argmax(select(keep, logits / divisor,
+// -inf) + rng_keyed(..))`. Ties and NaN as `reduce_argmax`'s.
+inline void m1_gumbel_argmax_mt(
+    const device uchar* logits,
+    const device uchar* keep,
+    const device uchar* divisor,
+    const device uchar* state,
+    device uchar* output,
+    const M1ValueDesc dl,
+    const M1ValueDesc dk,
+    const M1ValueDesc dd,
+    const M1ValueDesc ds,
+    uint tid,
+    uint nthreads,
+    threadgroup M1ArgmaxCandidate* tgbuf) {
+  const ulong key = ulong(m1_load_u(state, 0, ds.dtype));
+  const ulong counter = ulong(ds.len > 1 ? m1_load_u(state, 1, ds.dtype) : 0u);
+  const ulong seed = ptir_rng_keyed_seed(uint(key), uint(counter));
+  const float d = m1_load_f(divisor, 0, dd.dtype);
+  device int* result = reinterpret_cast<device int*>(output);
+  for (uint row = 0; row < dl.rows; ++row) {
+    const uint base = row * dl.last;
+    M1ArgmaxCandidate best = {-INFINITY, 0u, 0u, 0u};
+    for (uint i = tid; i < dl.last; i += nthreads) {
+      const uint flat = base + i;
+      float value = -INFINITY;
+      if (m1_load_b(keep, m1_pick(dk.len, flat), dk.dtype)) {
+        const float uniform = ptir_rng_hash_uniform(seed, flat);
+        const float noise = -precise::log(-precise::log(uniform));
+        value = m1_load_f(logits, flat, dl.dtype) / d + noise;
+      }
+      best = m1_argmax_combine(
+          best, M1ArgmaxCandidate{value, i, isnan(value) ? 0u : 1u, 0u});
+    }
+    tgbuf[tid] = best;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 1u; stride < nthreads; stride <<= 1) {
+      if ((tid % (2u * stride)) == 0u && tid + stride < nthreads) {
+        tgbuf[tid] = m1_argmax_combine(tgbuf[tid], tgbuf[tid + stride]);
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) result[row] = int(tgbuf[0].index);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+}
+
 inline void ptir_m1_execute_mt(
     uint generated_tag,
     device M1Status* status,
@@ -2072,6 +2124,13 @@ inline void ptir_m1_execute_mt(
 
   if (p.tag == 0x33) {
     m1_reduce_argmax_mt(a0, o0, temporary, d0, tid, nthreads, tgbuf);
+    return;
+  }
+  if (p.tag == 0x34) {
+    // The rng state, the fourth operand, is named by `imm` and its bytes
+    // ride in `o1` (the op has one result).
+    m1_gumbel_argmax_mt(a0, a1, a2, o1, o0, d0, descriptors[p.a1], descriptors[p.a2],
+                        descriptors[p.imm], tid, nthreads, tgbuf);
     return;
   }
   if (p.tag == 0x58 && nthreads > 1u && p.pred_tag != 2) {

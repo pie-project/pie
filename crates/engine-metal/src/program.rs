@@ -2421,6 +2421,13 @@ mod tests {
             let shaped = vocab == 1001;
             let row_scan = bf(vocab);
             let flipped = bf(vocab);
+            // Gumbel-max draws over the bf16 row, each its own keyed state:
+            // the lanes are made in f32 and never rounded (eta-ir's rule).
+            const DRAWS: u32 = 8;
+            let draws: Vec<&'static Channel> = (0..DRAWS)
+                .map(|_| leak(Channel::new([1], dtype::i32).capacity(1)))
+                .collect();
+            let draws_in = draws.clone();
             // (reader, name, held within a bf16 ulp)
             let readers: [(&'static Channel, &str, bool); 15] = [
                 (exped, "exp", true),
@@ -2482,9 +2489,22 @@ mod tests {
                     row_scan.put(&cumsum(&x));
                     flipped.put(&x);
                 }
+                let keep = gt(&x, -4.0f32);
+                for (k, draw) in draws_in.iter().enumerate() {
+                    let k = k as u32;
+                    // `[a, a + c]`: an affine ramp, the one shape a constant
+                    // state takes without a channel.
+                    let state = broadcast(0x9e37_79b9u32 ^ (k * 0x0101_0101), [2])
+                        + iota(2) * (k * 7919 + 1);
+                    let pick = gumbel_argmax(&x, &keep, 0.7f32, &state);
+                    draw.put(&reshape(pick, [1]));
+                }
             });
             for (reader, _, _) in readers {
                 reader.note_host_take();
+            }
+            for draw in &draws {
+                draw.note_host_take();
             }
             let traced = b.build().expect("the bf16 program traces");
             let bound = eta_ir::validate::bind(
@@ -2598,6 +2618,18 @@ mod tests {
                         shown(&got),
                         shown(&wire(&want))
                     ));
+                }
+            }
+            for (k, draw) in draws.iter().enumerate() {
+                let want = wire(&reference.host_take(&bound, index(draw)).expect("a draw"));
+                let got = plane
+                    .instance_mut(id)
+                    .expect("bound")
+                    .take(index(draw))
+                    .expect("a take")
+                    .expect("a draw");
+                if got != want {
+                    wrong.push(format!("vocab {vocab}, gumbel draw {k}: {got:02x?} != {want:02x?}"));
                 }
             }
         }

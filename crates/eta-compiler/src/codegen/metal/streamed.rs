@@ -138,7 +138,8 @@ pub fn op_step_kind(tag: u8, pred_tag: u8, argmax_over_f32: bool) -> StepKind {
                 StepKind::Single
             }
         }
-        tags::CUMSUM
+        tags::GUMBEL_ARGMAX
+        | tags::CUMSUM
         | tags::CUMPROD
         | tags::SORT_DESC
         | tags::TOP_K
@@ -1128,6 +1129,13 @@ pub fn emit_streamed_region(
                 },
             ));
             continue;
+        }
+        if op.tag == tags::GUMBEL_ARGMAX
+            && let Some(&state) = op.args.get(3)
+        {
+            // The rng state, the fourth operand, rides in `o1`: the op
+            // has one result.
+            slots.o1 = value_ptr(alias.resolve(state));
         }
         if op.tag == tags::CHAN_TAKE || op.tag == tags::CHAN_READ {
             slots.a0 = format!("current_{}", op.chan);
