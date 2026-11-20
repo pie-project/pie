@@ -481,6 +481,10 @@ impl ResidencyPlanner {
                                 || proc.bind_waiting
                         }
                         && proc.state == Residency::Resident
+                        // Restored or bound for a waiting head and not
+                        // fired since: never moved back before it runs,
+                        // while it can run.
+                        && !inner.unfired_protects(**pid)
                         && !inner.host_swap_blocked.contains(*pid)
                         && !inner.prepare_blocked.contains(*pid)
                         // Being failed: it frees its pages as it ends.
@@ -537,8 +541,8 @@ impl ResidencyPlanner {
     ) -> bool {
         let (wake, spawned) = self.with_inner(|inner| {
             let (mut wake, mut spawned) = (Vec::new(), Vec::new());
-            let head_rank = match inner.unmet_head() {
-                Some((key, _)) if key == head_key => key.0,
+            let (head_rank, head_pid) = match inner.unmet_head() {
+                Some((key, waiter)) if key == head_key => (key.0, waiter.pid),
                 _ => return (wake, spawned),
             };
             for (pid, expected) in picks {
@@ -551,12 +555,17 @@ impl ResidencyPlanner {
                 // nothing moved: AMD's wedge).
                 let yields = proc.idle || proc.held || proc.bind_waiting;
                 if proc.state != Residency::Resident
+                    || inner.unfired_protects(pid)
                     || (proc.rank() <= head_rank && !yields)
                     || (!proc.progressed && !yields && !e6_relaxed)
                 {
                     continue;
                 }
                 wake.extend(inner.begin_eviction(pid, expected));
+                // Evicted for this head: not restored while it waits.
+                if let Some(proc) = inner.procs.get_mut(&pid) {
+                    proc.evicted_for = Some(head_pid);
+                }
                 spawned.push(pid);
             }
             (wake, spawned)

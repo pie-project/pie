@@ -6304,3 +6304,101 @@ async fn a_head_no_eviction_can_fund_asks_a_compaction() {
     assert_eq!(planner.stats.evictions_started.load(Ordering::Relaxed), 0, "no one to evict");
     bind.abort();
 }
+
+/// The anti-thrash rule, on the L40S loop (a process evicted for one head,
+/// restored ~43 ms later, re-evicted ~4 ms after that, every ~65 ms, the
+/// head never served; one pid evicted 443 times). A victim evicted for
+/// head H is not restored while H waits unserved: its restore, ranked
+/// ahead of H, is passed over and H is the head the planner funds. Once H
+/// is served the victim's restore goes; restored for a waiting head, it is
+/// no eviction candidate for the next head until it has fired once, and is
+/// one again after.
+#[test]
+fn a_victim_is_not_restored_before_its_head_nor_evicted_again_before_it_fires() {
+    let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::with_swap(8, 64))));
+    let (victim, head, next) = (ProcessId::new_v4(), ProcessId::new_v4(), ProcessId::new_v4());
+    // The victim older than the head: its restore ranks ahead of the
+    // head's ask, as in the loop.
+    for pid in [victim, head, next] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    let demand = Demand {
+        kv_pages: 2,
+        rs: RsUnits::default(),
+    };
+    let head_key = planner.with_inner(|inner| {
+        let head_key = inner.enqueue(head, allocation(demand));
+        // Evicted for the head (as `commit_evictions` records it), its
+        // restore queued at once.
+        let proc = inner.procs.get_mut(&victim).unwrap();
+        proc.state = Residency::Evicted;
+        proc.evicted_for = Some(head);
+        let restore_key = inner.enqueue(
+            victim,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        );
+        assert!(restore_key < head_key, "the victim's restore ranks ahead of the head");
+        head_key
+    });
+    let unmet = |planner: &ResidencyPlanner| {
+        planner.with_inner(|inner| inner.unmet_head().map(|(_, waiter)| waiter.pid))
+    };
+    assert_eq!(unmet(&planner), Some(head), "the head is funded, its victim's restore passed over");
+
+    // The head is served: its victim's restore goes.
+    planner.with_inner(|inner| {
+        inner.queue.remove(&head_key);
+    });
+    assert_eq!(unmet(&planner), Some(victim), "served, the head no longer holds it");
+
+    // Restored for a waiting head: no candidate for the next head until it
+    // fires once.
+    planner.with_inner(|inner| {
+        inner.queue.retain(|_, waiter| waiter.pid != victim);
+        inner.procs.get_mut(&victim).unwrap().state = Residency::Restoring;
+    });
+    planner.report_restored(victim);
+    planner.with_inner(|inner| {
+        inner.enqueue(next, allocation(demand));
+        let proc = inner.procs.get_mut(&victim).unwrap();
+        proc.idle = true;
+        proc.progressed = true;
+    });
+    let members = |planner: &ResidencyPlanner| {
+        planner
+            .victim_set()
+            .map(|set| set.members.iter().map(|v| v.pid).collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+    // Something in flight (another's fire on its way): the victim can run.
+    let running = planner.fire_in_flight(head);
+    assert!(
+        !members(&planner).contains(&victim),
+        "restored for a waiting head and able to run: not moved back before it runs"
+    );
+    // Waiting itself, behind the head (its lanes blocked on the planner):
+    // it cannot run, so the mark does not hold it, and no stall comes of it.
+    let own = planner.with_inner(|inner| inner.enqueue(victim, allocation(demand)));
+    assert!(
+        members(&planner).contains(&victim),
+        "blocked on the head's progress: a candidate, the head not held"
+    );
+    planner.with_inner(|inner| {
+        inner.queue.remove(&own);
+    });
+    // Nothing in flight anywhere: nothing of it runs either.
+    drop(running);
+    assert!(
+        members(&planner).contains(&victim),
+        "nothing in flight: a candidate, no stall"
+    );
+    // Able to run again, then fired once: a candidate for good.
+    let running = planner.fire_in_flight(head);
+    assert!(!members(&planner).contains(&victim));
+    drop(planner.fire_in_flight(victim));
+    assert!(members(&planner).contains(&victim), "fired once: a candidate again");
+    drop(running);
+}

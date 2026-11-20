@@ -751,7 +751,9 @@ impl ResidencyPlanner {
     pub(super) fn serve_bind_room(self: &Arc<Self>, key: EntryKey) {
         let notify = self.with_inner(|inner| {
             let key = inner.locate(key)?;
-            match &mut inner.queue.get_mut(&key)?.kind {
+            let waiter = inner.queue.get_mut(&key)?;
+            let pid = waiter.pid;
+            let notify = match &mut waiter.kind {
                 WaitKind::BindRoom {
                     served,
                     notify,
@@ -759,10 +761,16 @@ impl ResidencyPlanner {
                     ..
                 } => {
                     *served = true;
-                    Some(notify.clone())
+                    notify.clone()
                 }
-                _ => None,
+                _ => return None,
+            };
+            // Bound for a waiting head (its own bind): no victim until it
+            // has fired once.
+            if let Some(proc) = inner.procs.get_mut(&pid) {
+                proc.unfired = true;
             }
+            Some(notify)
         });
         if let Some(notify) = notify {
             notify.notify_waiters();

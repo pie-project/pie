@@ -154,6 +154,10 @@ impl ResidencyPlanner {
             debug_assert_eq!(proc.state, Residency::Restoring);
             proc.state = Residency::Resident;
             proc.progressed = false;
+            // Back for a waiting head (its own restore): no victim until it
+            // has fired once; and what it was evicted for is past.
+            proc.unfired = true;
+            proc.evicted_for = None;
             proc.roles_short = None;
             proc.roles_free_retry = None;
             proc.roles_free_short = None;

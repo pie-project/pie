@@ -50,6 +50,8 @@ impl ResidencyPlanner {
                     inner.bind_restoring = None;
                 }
                 proc.fire_lapsed = false;
+                // It runs: an eviction candidate again.
+                proc.unfired = false;
                 true
             })
         });

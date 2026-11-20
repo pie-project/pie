@@ -255,8 +255,29 @@ impl Inner {
     pub(super) fn unmet_head(&self) -> Option<(EntryKey, &Waiter)> {
         let mut oldest_restore: Option<EntryKey> = None;
         let mut allocation: Option<EntryKey> = None;
+        // A process evicted for a head that still waits unserved is not
+        // restored before it (the anti-thrash rule's second half): its
+        // restore is passed over, the queue not held, so the head it was
+        // evicted for is planned for. Restored first, the victim was
+        // evicted again for the same head every ~65 ms, the head never
+        // served.
+        let waiting: HashSet<ProcessId> = self
+            .queue
+            .values()
+            .filter(|waiter| waiter.is_unmet())
+            .map(|waiter| waiter.pid)
+            .collect();
+        let held_for_head = |pid: ProcessId| {
+            self.procs
+                .get(&pid)
+                .and_then(|proc| proc.evicted_for)
+                .is_some_and(|head| head != pid && waiting.contains(&head))
+        };
         for (&key, waiter) in &self.queue {
             if !waiter.is_unmet() {
+                continue;
+            }
+            if matches!(waiter.kind, WaitKind::Restore { .. }) && held_for_head(waiter.pid) {
                 continue;
             }
             match &waiter.kind {
@@ -473,6 +494,21 @@ impl Inner {
         if let Some(proc) = self.procs.get_mut(&pid) {
             proc.roles_short = None;
         }
+    }
+
+    /// Whether `pid`'s anti-thrash mark ([`super::proc::Proc::unfired`])
+    /// keeps it out of the victims: only while it can fire, by state, never
+    /// a clock. Waiting in the queue itself (its lanes blocked on the
+    /// planner, which serves the head first) or with nothing in flight
+    /// anywhere (nothing of it runs), it cannot, and protected it would hold
+    /// the head that waits on its room for good: it is a candidate.
+    pub(super) fn unfired_protects(&self, pid: ProcessId) -> bool {
+        self.procs.get(&pid).is_some_and(|proc| proc.unfired)
+            && !self
+                .queue
+                .values()
+                .any(|waiter| waiter.pid == pid && waiter.is_unmet())
+            && !self.nothing_in_flight()
     }
 
     /// Nothing in flight can free room: no fire submitted and not landed,

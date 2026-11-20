@@ -5,6 +5,7 @@ use tokio::sync::Notify;
 
 use super::departure::Departure;
 use super::grant::Demand;
+use super::ProcessId;
 use super::rank::Rank;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,6 +100,15 @@ pub(super) struct Proc {
     /// ([`super::wait::WaitKind::BindRoom`]), so it never comes back to be
     /// short again.
     pub(super) bind_room: Option<PendingBind>,
+    /// Restored, or its bind served, for a waiting head, and not fired
+    /// since: no eviction candidate until it fires once (the anti-thrash
+    /// rule's first half). Evicted back before it ran, a process was moved
+    /// 443 times with the head it was moved for never served.
+    pub(super) unfired: bool,
+    /// The head (its process) this one was evicted for: its restore is not
+    /// served while that head waits unserved (the rule's second half),
+    /// whatever key the head waits under now.
+    pub(super) evicted_for: Option<ProcessId>,
 }
 
 /// The guest-state room a suspended process's pending bind asks:
@@ -180,6 +190,8 @@ impl Proc {
             roles_short_gives: None,
             roles_short_mismatch: None,
             bind_room: None,
+            unfired: false,
+            evicted_for: None,
         }
     }
 }
