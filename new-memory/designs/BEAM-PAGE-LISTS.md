@@ -1,6 +1,7 @@
 # Beam page lists: `Port::Parents` (spec)
 
-Status: agreed (GPU, Mac, Leader, ROCm), 2026-11-19; reviewed edits folded in. The single written spec the
+Status: agreed (GPU, Mac, Leader, ROCm), 2026-11-19; reviewed edits folded in.
+Hybrid models (§11) and a search's finish (§6.6): agreed (GPU, Leader), 2026-11-20. The single written spec the
 device kernels (engine-cuda CUDA/HIP, engine-gpu Vulkan/wgpu, engine-metal)
 and the host replay all follow. Where an implementation and this text
 disagree, this text is right and the implementation is the bug.
@@ -20,6 +21,12 @@ pages as resident state of the instance, and at the head of each fire
 reorders the lists by the parents, copies the tail pages forks need, and
 resolves the fire's page tables over the lists. Nothing of it is guest
 memory, and nothing waits on the host.
+
+On a hybrid model (recurrent layers beside full attention, §11) the same
+lists page each beam's buffered recurrent rows as well: the recurrent state
+stays the set's one shared state, committed at `folded` and never written
+during the search, and a beam's generated rows are its own rows of the set's
+rs buffer, on the same pool pages as its kv slots.
 
 ## 2. Guest surface
 
@@ -60,6 +67,10 @@ memory, and nothing waits on the host.
   slots `[(f0 + j) S, (f0 + j + 1) S)`.
 - `P` (list width): columns a list may hold, `P = ceil(reserved / S) - f0`
   bounds it; an engine may size by its context pages (`pages_per_slot`).
+- A pool page `q` is the set's page `f0 + q` of every paged plane the set
+  holds: its kv pages and, on a hybrid (§11), its rs buffer pages, one
+  reservation for both. `Q_t` below counts pool pages, each priced at the
+  bytes of all its planes.
 - `F`: the fires a freed page waits before it is handed out again (§6.3).
   The engine states its `F` at bind (its frames in flight); the guest sizes
   with `run_ahead_window()` (the fires its pipeline holds in flight), which
@@ -150,10 +161,11 @@ pages stay named and none is freed under it.
   reorder, whatever the engine's queue model.
 
 **6.4 Copy.** For each `b` with a copy: copy the first `tokens` slots of the
-set's page `f0 + src` to page `f0 + dst`, in every kv plane a page holds
-(keys and values of every full-context layer), before any lane of the fire
-appends or reads. Checks (else lane `b` faults `COPY_BOUNDS` and nothing is
-copied): `src < Q`, `dst < Q`, `tokens <= S`, `(f0 + dst) S >= folded`.
+set's page `f0 + src` to page `f0 + dst`, in every plane a page holds (keys
+and values of every full-context layer, and on a hybrid every rs buffer
+plane of every recurrent layer: its conv input, `[b|a]`, keys and `u` rows,
+§11), before any lane of the fire appends or reads. Checks (else lane `b`
+faults `COPY_BOUNDS` and nothing is copied): `src < Q`, `dst < Q`, `tokens <= S`, `(f0 + dst) S >= folded`.
 
 **6.5 Resolve.** Over the page tables the fire stages for each lane as for
 any envelope lane (its slots `[0, s_t + 1)`): entry `f0 + j` of lane `b`'s
@@ -168,9 +180,23 @@ name its own set's pages): `map'[b][j] < Q` (`PAST_RESERVE`), `c < P`
 (`SHORT`), and the absolute write slot `(f0 + map'[b][c]) S + o >= folded`
 and `< reserved` (`BELOW_FLOOR`).
 
+On a hybrid it also resolves each lane's **rs page table** the same way:
+entry `f0 + j` becomes the set's rs buffer page `f0 + map'[b][j]` for
+`j <= c`, through the set's whole reserved rs translation (staged with the kv
+one), and the row's rs write page `f0 + map'[b][c]`; the checks are the kv
+table's, one fault a lane for both.
+
 Commit the state (`map = map'`, `free = free'`, `pending = pending'`) for
 every lane, faulted or not. A faulted lane fails its fire by name
 (`Overreach: lane b's page list ...`); the others proceed.
+
+**6.6 Finish.** A search ends when the guest names its chosen beam `b*`
+(`group.finish(b*)`) after its last fire lands: the runtime reads
+`map[b*][0..=c]` once (the search's one host read, off the per-fire path)
+and re-lists the set, its page `f0 + j` becoming pool page `map[b*][j]` of
+every plane for `j <= c`; every other pool page is released. The set then
+holds the chosen hypothesis at slots `[folded, s_T + 1)` in its own order,
+and later passes bind it as any set (no `parents`).
 
 ## 7. Faults (one word a lane, read at settle)
 
@@ -215,6 +241,11 @@ retirements (beams no child continues). After every step the device's
 resolved table entries equal the replay's; and a run suspended and restored
 mid-search continues with beams identical to an unsuspended run.
 
+A hybrid case runs beside it: qwen35-tiny at widths 2, 4, 8 from a `folded`
+with `tail > 0` and one with `tail == 0`, the device's rs page tables and rs
+copies equal to the replay's after every step, and the chosen beam's logits
+after `finish` and its fold equal to an unbranched decode of the same tokens.
+
 ## 10. Costs (MI300X, Qwen3-0.6B)
 
 - Copy: one launch per fire for all of its copies, 2.3–4.1 µs (1–3 copies of
@@ -224,3 +255,35 @@ mid-search continues with beams identical to an unsuspended run.
   `folded + B t` with the earlier shared pool and ancestry mask.
 - Memory: live pages at most `B (c_t + 1)` plus `2B + 1`, against
   `folded + B T` slots held to the end before.
+
+## 11. Hybrid models (recurrent layers beside full attention)
+
+- State and rows: a recurrent layer keeps the set's state `h`, committed at
+  `folded` (the prompt), and its buffered rows: per generated slot its conv
+  input, `[b|a]`, keys and `u`, the rows a step folds into `h`. On a parents
+  pass `h` is read-only: every beam's step reads `h` and its own buffered
+  rows `[folded, s_t]` through its rs page table (§6.5), in one kernel over
+  the state and the rows, and writes its row `s_t` to its rs write page.
+  Nothing writes `h` while the pass is bound.
+- Pages: the rs buffer is paged like the kv slots, page size `S`: beam `b`'s
+  slot `s` lies on rs page `map[b][s / S - f0]` (`f0`, `map` as §3–4; one
+  `map` for both). The prompt's tail rows (`tail > 0`) on pool page 0 are
+  committed into `h`, so no beam reads them as buffered rows: priming's
+  copies (§5) need cover only the kv planes, and the rs rows of page 0's
+  first `tail` slots are never read.
+- No fold: a pass binding `parents` binds no `fold` (§2), and the recurrent
+  state is not folded by it. The chosen beam's rows fold into `h` after
+  `finish` (§6.6) through an ordinary fire that folds the set's rows
+  `[folded, s_T + 1)`, as any pass that commits buffered rows does.
+- Pricing: one rule for both planes. A pool page is one reservation of its
+  kv and rs bytes (§3), priced in the ledger as part of the set's working
+  set, and the pool grows a column at a time through it, as §3 grows the kv
+  pool. At bind the runtime checks that the search's full depth (`steps`:
+  the `Q_t` of its last column, both planes) could fit alone, and refuses
+  the group by name if it never could. A group that cannot grow a column
+  mid-search waits like any reservation (served slower), never fails
+  partway and never silently.
+- Engines: the state + buffer decode kernel reads a lane's rows through its
+  rs page table when the pass binds `parents`, and through the set's own
+  rows otherwise; the head step (§6) resolves both tables and makes both
+  planes' copies in its one launch.
