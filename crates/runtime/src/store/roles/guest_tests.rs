@@ -3163,13 +3163,22 @@ fn a_restore_s_need_and_standing_are_the_placement_of_every_piece_it_takes() {
         let device = std::sync::Arc::clone(&roles.device);
         roles.give(&device, &dead);
     }
+    // A chunk of single slots, mostly free: its free slots outnumber the
+    // run's, but a run of slots never lies among single slots.
+    let singles_part = {
+        let roles = roles.lock().unwrap();
+        let device = std::sync::Arc::clone(&roles.device);
+        roles.take(&device, SlotRole::Instance, 1000, false).expect("single slots")
+    };
+    let partial = device.lock().unwrap().pool().partial_free(shape);
+    assert!(partial >= 512, "{partial} free single slots in a chunk");
     let singles = fill_with_singles(&roles);
     roles.lock().unwrap().close_instance(singles[0]);
     assert_eq!(device.lock().unwrap().pool().free_chunks(), 1, "one chunk free");
     assert_eq!(
         roles.lock().unwrap().unpark_need(holder(1)),
         vec![(1, 1)],
-        "its run of slots asks the free chunk"
+        "its run of slots asks the free chunk, whatever single slots stand free"
     );
     assert!(roles.lock().unwrap().unpark_stands(holder(1), &[], None), "it stands");
     let chunk = u64::from(device.lock().unwrap().pool().shape(shape).unwrap().slots_per_chunk);
@@ -3181,4 +3190,5 @@ fn a_restore_s_need_and_standing_are_the_placement_of_every_piece_it_takes() {
         !roles.lock().unwrap().unpark_stands(holder(1), &[], Some((1, 1))),
         "nor with a pending bind's chunk beside it"
     );
+    drop(singles_part);
 }

@@ -5833,7 +5833,13 @@ async fn a_restore_refused_against_the_map_goes_again_at_most_once_per_map_chang
 #[tokio::test(flavor = "current_thread")]
 async fn a_process_suspended_for_its_bind_s_room_is_restored_only_once_the_room_stands() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
-    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    // Its own stores: its restore runs against them, whatever another test
+    // registered.
+    let model = crate::store::registry::register_model(16, &[8], &[4]);
+    let pool = Arc::new(BindRoomPool {
+        model,
+        ..BindRoomPool::new(8, 0..0, 64)
+    });
     // Four chunks free, no three adjacent.
     pool.free.lock().extend([0, 2, 4, 6]);
     let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
