@@ -527,6 +527,7 @@ fn host_rs_plan(
     req: &crate::engine::FireRequest,
     fold: &geometry::Fold,
     snapshots: &[u32],
+    beam_ends: Option<&[u32]>,
 ) -> Result<rs::RsPlan, String> {
     if ids.is_empty() {
         return Ok(rs::RsPlan::Groups(Vec::new()));
@@ -538,7 +539,7 @@ fn host_rs_plan(
         (lane.kv.held, lane.kv.held.saturating_add(rows))
     };
     let mut plans = Vec::with_capacity(groups.len());
-    for (_, lanes) in groups {
+    for (at, (_, lanes)) in groups.iter().enumerate() {
         if let Some(&empty) = lanes
             .iter()
             .find(|&&lane| req.lanes[lane].tokens.is_empty())
@@ -566,6 +567,17 @@ fn host_rs_plan(
                 let high = lanes.iter().map(|&lane| span(lane).1).max().unwrap_or(end);
                 Some(low..high)
             };
+        // A beam group's beams name any page of its pool, and their rows lie
+        // slot by slot on its pages (§11): its buffer is backed from the
+        // state's end to the pool's.
+        let beam_end = beam_ends.and_then(|ends| ends.get(at).copied());
+        let writes = match beam_end {
+            Some(end) => {
+                let high = writes.as_ref().map_or(end, |writes| writes.end);
+                Some(frozen..high.max(end))
+            }
+            None => writes,
+        };
         let snapshots = match (&writes, groups.len()) {
             (None, 1) => snapshots.to_vec(),
             _ => Vec::new(),
@@ -575,7 +587,7 @@ fn host_rs_plan(
             writes,
             fold,
             snapshots,
-            beams: false,
+            beams: beam_end.is_some(),
         });
     }
     Ok(rs::RsPlan::Groups(plans))
@@ -597,6 +609,22 @@ fn device_rs_plan(
     if ids.is_empty() {
         return Ok(rs::RsPlan::Groups(Vec::new()));
     }
+    // A beam group's beams name any page of their set's kv reservation (its
+    // pool, grown a column at a time), and their rows lie slot by slot on its
+    // pages (`BEAM-PAGE-LISTS.md` §11): the rs buffer is backed to the same
+    // end. Read before the rs store's lock is taken.
+    let mut beam_ends = std::collections::HashMap::new();
+    if beams {
+        let page = u64::from(stores.kv_page_size.max(1));
+        for (_, group) in groups {
+            let first = group[0];
+            let pages = crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
+                kv.page_len(lanes.kv[first].id)
+            })
+            .map_err(|error| format!("pipeline: a beam group's kv reservation: {error}"))?;
+            beam_ends.insert(first, u32::try_from(pages * page).unwrap_or(u32::MAX));
+        }
+    }
     let store = stores.rs.lock().unwrap();
     let mut plans = Vec::with_capacity(groups.len());
     for (_, group) in groups {
@@ -604,7 +632,10 @@ fn device_rs_plan(
         let frozen = store
             .frozen(ids[first])
             .map_err(|error| error.to_string())?;
-        let reserved = lanes.cursors[first].lock().unwrap().reserved;
+        let mut reserved = lanes.cursors[first].lock().unwrap().reserved;
+        if let Some(&end) = beam_ends.get(&first) {
+            reserved = reserved.max(end);
+        }
         let rows = split[first + 1] - split[first];
         let fold = match device_fold(
             fold.of(first),
@@ -3909,6 +3940,9 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // their sets' reserve the device names: every page from the frozen
         // full pages to what `reserve` granted is backed, and the engine is
         // handed each set's whole table to resolve them in.
+        // Each beam group's pool end (a slot), which its rs buffer is backed
+        // to as well (`BEAM-PAGE-LISTS.md` §11).
+        let mut beam_ends: Vec<u32> = Vec::new();
         let paged_reserve: Option<Vec<Vec<u64>>> = if binds_pages(ctx, &fwd)? {
             let page = u64::from(page_size.max(1));
             let mut reserves = Vec::with_capacity(groups.len());
@@ -3954,6 +3988,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     let mut cursor = pass_lanes.cursors[lane].lock().unwrap();
                     cursor.reserved = cursor.reserved.max(end_slot);
                 }
+                beam_ends.push(end_slot);
                 // Only the pages the column adds are backed here: the pool's
                 // pages are the group's alone and the device keeps what they
                 // hold, so a page an earlier fire still in flight writes is
@@ -4553,7 +4588,15 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 if windowed {
                     host_window_plan(&req, &fold, &rs_ws_ids, keep)
                 } else {
-                    host_rs_plan(&stores, &rs_ws_ids, &groups, &req, &fold, &inside)
+                    host_rs_plan(
+                        &stores,
+                        &rs_ws_ids,
+                        &groups,
+                        &req,
+                        &fold,
+                        &inside,
+                        (!beam_ends.is_empty()).then_some(beam_ends.as_slice()),
+                    )
                 }
             };
             let reserved = reserve(
@@ -8327,7 +8370,7 @@ pub(crate) mod fold_tests {
         let ids = [rs, rs];
         let groups = lane_groups(&[ws, ws]);
         assert_eq!(groups.len(), 1);
-        let plan = host_rs_plan(&stores, &ids, &groups, &req, &all(), &[]).unwrap();
+        let plan = host_rs_plan(&stores, &ids, &groups, &req, &all(), &[], None).unwrap();
         let rs::RsPlan::Groups(plan) = plan else {
             panic!("a plain recurrent model plans groups");
         };
@@ -8529,7 +8572,7 @@ pub(crate) mod fold_tests {
         };
         if let Some(rs) = rs {
             let groups = lane_groups(&[ws]);
-            let plan = host_rs_plan(stores, &[rs], &groups, &req, fold, &[]).unwrap();
+            let plan = host_rs_plan(stores, &[rs], &groups, &req, fold, &[], None).unwrap();
             let rs::RsPlan::Groups(plan) = plan else {
                 panic!("a plain recurrent model plans groups");
             };
@@ -10782,7 +10825,7 @@ mod unfolded_tests {
             let plan = if device_places {
                 device_rs_plan(&stores, &ids, &groups_of, &pass, &[0, 4], fold, false)
             } else {
-                host_rs_plan(&stores, &ids, &groups_of, &req, fold, &[])
+                host_rs_plan(&stores, &ids, &groups_of, &req, fold, &[], None)
             }
             .expect(&what);
             let prepared =
@@ -10859,6 +10902,7 @@ mod unfolded_tests {
                 &lane(held, rows),
                 &geometry::Fold::Host(fold),
                 &[],
+                None,
             )
         };
 

@@ -161,11 +161,11 @@ pages stay named and none is freed under it.
   reorder, whatever the engine's queue model.
 
 **6.4 Copy.** For each `b` with a copy: copy the first `tokens` slots of the
-set's page `f0 + src` to page `f0 + dst`, in every plane a page holds (keys
-and values of every full-context layer, and on a hybrid every rs buffer
-plane of every recurrent layer: its conv input, `[b|a]`, keys and `u` rows,
-§11), before any lane of the fire appends or reads. Checks (else lane `b`
-faults `COPY_BOUNDS` and nothing is copied): `src < Q`, `dst < Q`, `tokens <= S`, `(f0 + dst) S >= folded`.
+set's page `f0 + src` to page `f0 + dst`, in every kv plane a page holds
+(keys and values of every full-context layer), before any lane of the fire
+appends or reads. Checks (else lane `b` faults `COPY_BOUNDS` and nothing is
+copied): `src < Q`, `dst < Q`, `tokens <= S`, `(f0 + dst) S >= folded`. On a
+hybrid the same copy moves the beam's rs rows too, slot by slot (§11.2).
 
 **6.5 Resolve.** Over the page tables the fire stages for each lane as for
 any envelope lane (its slots `[0, s_t + 1)`): entry `f0 + j` of lane `b`'s
@@ -180,11 +180,8 @@ name its own set's pages): `map'[b][j] < Q` (`PAST_RESERVE`), `c < P`
 (`SHORT`), and the absolute write slot `(f0 + map'[b][c]) S + o >= folded`
 and `< reserved` (`BELOW_FLOOR`).
 
-On a hybrid it also resolves each lane's **rs page table** the same way:
-entry `f0 + j` becomes the set's rs buffer page `f0 + map'[b][j]` for
-`j <= c`, through the set's whole reserved rs translation (staged with the kv
-one), and the row's rs write page `f0 + map'[b][c]`; the checks are the kv
-table's, one fault a lane for both.
+On a hybrid it also resolves each lane's **rs page table**, slot by slot
+(§11.1), one fault word a lane for both tables.
 
 Commit the state (`map = map'`, `free = free'`, `pending = pending'`) for
 every lane, faulted or not. A faulted lane fails its fire by name
@@ -241,10 +238,17 @@ retirements (beams no child continues). After every step the device's
 resolved table entries equal the replay's; and a run suspended and restored
 mid-search continues with beams identical to an unsuspended run.
 
-A hybrid case runs beside it: qwen35-tiny at widths 2, 4, 8 from a `folded`
-with `tail > 0` and one with `tail == 0`, the device's rs page tables and rs
-copies equal to the replay's after every step, and the chosen beam's logits
-after `finish` and its fold equal to an unbranched decode of the same tokens.
+A hybrid case runs beside it: widths 2, 4, 8 from a `folded` with
+`tail > 0` and one with `tail == 0`, rs pages of `T` = 1, 2 and 4 rows from
+a buffer base off a kv page boundary (as a frozen slot of 38 at `T` = 2,
+`S` = 16); after every step each beam's resolved rs entries equal §11.1's
+over the replay's `map'`. The copy is checked alone: a fork whose copy ends
+mid rs page, one from the prompt's own page (its tail's slots below the
+buffer skipped), and one out of bounds that faults and moves nothing; every
+destination row equals its source row and every other byte stays. Served
+(qwen35 at widths 2, 4, 8): beam `--verify` passes, and the chosen beam's
+logits after `finish` and its fold equal an unbranched decode of the same
+tokens.
 
 ## 10. Costs (MI300X, Qwen3-0.6B)
 
@@ -265,12 +269,22 @@ after `finish` and its fold equal to an unbranched decode of the same tokens.
   rows `[folded, s_t]` through its rs page table (§6.5), in one kernel over
   the state and the rows, and writes its row `s_t` to its rs write page.
   Nothing writes `h` while the pass is bound.
-- Pages: the rs buffer is paged like the kv slots, page size `S`: beam `b`'s
-  slot `s` lies on rs page `map[b][s / S - f0]` (`f0`, `map` as §3–4; one
-  `map` for both). The prompt's tail rows (`tail > 0`) on pool page 0 are
-  committed into `h`, so no beam reads them as buffered rows: priming's
-  copies (§5) need cover only the kv planes, and the rs rows of page 0's
-  first `tail` slots are never read.
+- Rows by slot: the set's rs buffer is paged as the engine's chunk recipe
+  pages it, `T` rows a page from slot `base` (the slot its buffer starts at,
+  `<= folded`; Qwen3.5-0.8B: `T` = 2 from the frozen slot), not as the kv
+  slots. One `map` serves both: beam `b`'s buffered row of slot `s`
+  (`s >= f0 S`) is the set's row of slot
+  `σ_b(s) = (f0 + map[b][s / S - f0]) S + s mod S`, that is the slot at the
+  same offset of the pool page its list names for `s`'s column. The set's
+  row of slot `σ` lies on its rs entry `(σ - base) / T`, row `(σ - base) mod
+  T`. Slots below `base` (the prompt's tail on pool page 0) are in `h`: no
+  beam reads them as buffered rows, and no copy moves them.
+- Divisibility: `T` divides `S`, and `T` divides `base` (so no entry
+  straddles two of a beam's pages). An engine refuses a `parents` bind on a
+  hybrid whose recipe has `T ∤ S` by name with `T` and `S`, before any beam
+  fires; a buffer base off a row page is refused by name at the fire. A
+  recipe that cannot meet it chooses its `T` to divide `S`: there is no
+  fallback.
 - No fold: a pass binding `parents` binds no `fold` (§2), and the recurrent
   state is not folded by it. The chosen beam's rows fold into `h` after
   `finish` (§6.6) through an ordinary fire that folds the set's rows
@@ -285,5 +299,49 @@ after `finish` and its fold equal to an unbranched decode of the same tokens.
   partway and never silently.
 - Engines: the state + buffer decode kernel reads a lane's rows through its
   rs page table when the pass binds `parents`, and through the set's own
-  rows otherwise; the head step (§6) resolves both tables and makes both
-  planes' copies in its one launch.
+  rows otherwise; the head step (§6) resolves both tables, and the copies
+  (§6.4, §11.2) run after it, ahead of the fire's first append or read.
+- Staging: a lane's rs page table holds the entries its replayed rows and
+  its own rows touch this fire (`[base, s_t + 1)`); the set's whole rs
+  translation (every entry the pool's reservation backs) is staged once per
+  group for the resolve and the copies.
+
+### 11.1 Resolve (rs)
+
+Inputs per beam `b`: its rs table's entries `pages[from ..]` (as the host
+staged them: the set's), `entries = (s_t - base) / T + 1`, `base`, `T`, the
+set's rs entries' addresses `set[0 .. E)`, and `map'[b]` (§6.2). For each
+`e < entries`, `slot = base + e T`:
+
+    if slot < f0 S: leave pages[from + e]          (a frozen page: the set's)
+    j = slot / S - f0                               (j >= cap: SHORT)
+    q = map'[b][j]                                  (q >= the pool's staged: PAST_RESERVE / EXHAUSTED as §6.5)
+    σ = (f0 + q) S + slot mod S
+    a = (σ - base) / T                              (a >= E: PAST_RESERVE)
+    pages[from + e] = set[a]
+
+A faulted entry keeps its staged word. The row's write entry is among them
+(`e = (s_t - base) / T`), so the beam's row lands on its own page.
+
+### 11.2 Copy (rs): `copy_rs_rows`
+
+One run per beam with a copy, over every rs plane (a block per (run,
+plane), a plane's row per step). Inputs: the copy `[src, dst, tokens]` the
+step left (§6.4), the pool's staged pages `Q`, `S`, `T`, `base`, `f0`,
+`floor_rel = folded - f0 S`, the set's rs entries `set[0 .. E)`, and the
+planes: each `(offset, cell)`, the byte offset of its rows in an rs page and
+the bytes one row takes (row `r` of a plane at `set[a] + offset + r cell`).
+
+    if tokens == 0 or src == dst: nothing
+    if src >= Q or dst >= Q or tokens > S or dst S < floor_rel:
+        fault COPY_BOUNDS, copy nothing
+    for k in 0 .. tokens:
+        from = (f0 + src) S + k;  to = (f0 + dst) S + k
+        if from < base or to < base: next           (in the state, no row)
+        fe = (from - base) / T;  te = (to - base) / T
+        if fe >= E or te >= E: fault COPY_BOUNDS, stop
+        copy plane.cell bytes from set[fe] + offset + ((from - base) mod T) cell
+                           to   set[te] + offset + ((to - base) mod T) cell
+
+It runs after the head step and its kv copies, in the fire's stream, ahead
+of the fire's first append or read; its fault word is the lane's (§7).

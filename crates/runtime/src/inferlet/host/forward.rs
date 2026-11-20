@@ -1368,7 +1368,8 @@ impl ProcessCtx {
                     seed_values,
                     geometry_class,
                     ::engine::BindExtents {
-                        sampled_rows: bind_rows(decode_envelope, pricing_rows),
+                        sampled_rows: bind_rows(decode_envelope, pricing_rows).0,
+                        rows_per_lane: bind_rows(decode_envelope, pricing_rows).1,
                         ..::engine::BindExtents::default()
                     },
                     // The ports the program computes on the device: the
@@ -1843,17 +1844,17 @@ mod tests {
     }
 }
 
-/// The readout rows a lane of a pass reads, as its bind states them: a beam
-/// group's pass (`parents`) runs each beam as a lane of its own reading one
-/// row, so the group's rows count against the fire's readout seats as its
-/// lanes, never as one lane's (the interleaved beam, one lane reading the
-/// whole group, read them so); any other pass reads the rows its program
-/// prices.
-fn bind_rows(envelope: Option<PortMask>, pricing_rows: u32) -> u32 {
+/// The readout rows a pass's bind states, by instance and by lane: an
+/// instance reads the rows its program prices; a beam group's (`parents`)
+/// beams are each a lane reading one row of them, any other pass's lanes
+/// read what the instance does. An engine checks the figure its readout
+/// seats are laid by (engine-cuda the instance's, engine-metal the lane's).
+fn bind_rows(envelope: Option<PortMask>, pricing_rows: u32) -> (u32, u32) {
+    let instance = pricing_rows.max(1);
     if envelope.is_some_and(|ports| ports.contains(eta_ir::registry::Port::Parents)) {
-        1
+        (instance, 1)
     } else {
-        pricing_rows.max(1)
+        (instance, instance)
     }
 }
 
@@ -1862,14 +1863,14 @@ mod bind_rows_tests {
     use super::{PortMask, bind_rows};
 
     #[test]
-    fn a_beam_group_of_eight_binds_one_readout_row_a_lane() {
+    fn a_beam_group_of_eight_reads_eight_rows_an_instance_and_one_a_lane() {
         let parents = PortMask::NONE.with(eta_ir::registry::Port::Parents);
-        // Eight beams, each its own lane: one row a lane, whatever the
-        // program prices for the group (a load laying fewer rows a lane
-        // than the beams, Metal's 5, binds them).
-        assert_eq!(bind_rows(Some(parents), 8), 1);
-        // A pass of no beam group reads what its program prices.
-        assert_eq!(bind_rows(Some(PortMask::NONE), 8), 8);
-        assert_eq!(bind_rows(None, 0), 1);
+        // Eight beams: the instance reads all eight rows (engine-cuda's
+        // seats), each beam's lane one (a load laying fewer rows a lane than
+        // the beams, Metal's 5, binds them).
+        assert_eq!(bind_rows(Some(parents), 8), (8, 1));
+        // A pass of no beam group: its lanes read what its instance does.
+        assert_eq!(bind_rows(Some(PortMask::NONE), 8), (8, 8));
+        assert_eq!(bind_rows(None, 0), (1, 1));
     }
 }

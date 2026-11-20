@@ -282,6 +282,7 @@ fn a_cell_table_reads_each_rows_patch_and_group() {
                         row_count: rows,
                         token_count: rows,
                         sampled_rows: rows,
+                        rows_per_lane: rows,
                         query_len: rows,
                         ..engine::program::BindExtents::default()
                     },
