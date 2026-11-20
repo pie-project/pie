@@ -42,8 +42,40 @@ struct Want {
 }
 
 impl Shell {
-    /// Fires the warm ladder; answers how many fires ran.
+    /// The most rows a lane carries unfolded that this load lays grids
+    /// for: the decode step's carried grid and a buffering fire's tail
+    /// grid are this wide, static for the load. One grain of the rs list
+    /// (its page's tokens): a lane's carried rows are read from the grains
+    /// its buffer holds, and one grain's run of them is what a step reads
+    /// in one block. The runtime runs ahead no further than it allows.
+    #[must_use]
+    pub fn carried_rows(&self) -> u32 {
+        self.paging().page_size.max(1)
+    }
+
+    /// Fires the warm ladder; answers how many fires ran. A load whose
+    /// recurrence buffers lays it twice, its lanes folding and then
+    /// buffering (carrying nothing, committing their rows: the program is
+    /// the same at any count), the programs a fire under the run-ahead runs.
     pub fn prewarm(&mut self) -> Result<usize> {
+        let folding = self.prewarm_lanes()?;
+        if self.rs_layout.is_none() || folding == 0 {
+            return Ok(folding);
+        }
+        self.warm_buffers = true;
+        let buffering = self.prewarm_lanes();
+        self.warm_buffers = false;
+        let buffering = buffering?;
+        tracing::info!(
+            folding,
+            buffering,
+            carried_rows = self.carried_rows(),
+            "xla warm ladder laid with its lanes folding, then buffering"
+        );
+        Ok(folding + buffering)
+    }
+
+    fn prewarm_lanes(&mut self) -> Result<usize> {
         let facts = &self.trace().facts;
         let decode = facts.word(&Request::new(1, false));
         let prefill = facts.word(&Request::new(2, false));
@@ -682,6 +714,7 @@ impl Shell {
             crate::store::Scratch,
             Vec<u32>,
             Option<engine::fire::Masking>,
+            engine::fire::RsVerb,
         );
         let owned: Vec<Owned> = shape
             .iter()
@@ -695,11 +728,26 @@ impl Shell {
                         u64::from(keys),
                     ))
                 });
+                let scratch = self.pools.scratch(0, n as usize);
+                // a buffering lane carries nothing and commits its rows: the
+                // program is the same at any count
+                let verb = if self.warm_buffers {
+                    engine::fire::RsVerb::Buffer {
+                        pages: scratch.rs.clone(),
+                        base: 0,
+                        folded: held_of(want, page_size),
+                        fold: engine::fire::FoldLen::Host(want.rows),
+                        lineage: engine::fire::Lineage::Set,
+                    }
+                } else {
+                    engine::fire::RsVerb::Fold
+                };
                 (
                     vec![0; want.rows as usize],
-                    self.pools.scratch(0, n as usize),
+                    scratch,
                     (0..want.rows).collect(),
                     mask,
+                    verb,
                 )
             })
             .collect();
@@ -710,7 +758,7 @@ impl Shell {
             .iter()
             .zip(&owned)
             .enumerate()
-            .map(|(at, (want, (tokens, scratch, every, mask)))| {
+            .map(|(at, (want, (tokens, scratch, every, mask, verb)))| {
                 let mut seated = Seated::of(Lane {
                     slot: at as u32 % slots,
                     word: want.word,
@@ -724,6 +772,7 @@ impl Shell {
                     seated.readout = Some(every);
                 }
                 seated.mask = mask.as_ref();
+                seated.rs = verb;
                 seated
             })
             .collect();

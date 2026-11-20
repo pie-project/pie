@@ -345,6 +345,9 @@ pub struct Shell {
     /// The warm ladder walked this load: a fire of the lanes it lays fires
     /// of is refused when its program was not built before ready.
     laddered: bool,
+    /// The warm ladder seats its lanes buffering (`RsVerb::Buffer`): the
+    /// programs a fire under the run-ahead runs.
+    warm_buffers: bool,
     /// The classes of the drafting lanes the ladder lays, every row read out.
     drafting: Vec<usize>,
     /// The drafts a drafting lane's window carries past its token.
@@ -1156,6 +1159,7 @@ impl Shell {
             deferred: None,
             readouts: std::collections::BTreeSet::new(),
             laddered: false,
+            warm_buffers: false,
             drafting: Vec::new(),
             draft_depth: 0,
             gathers: std::collections::HashMap::new(),
@@ -2881,7 +2885,13 @@ impl Shell {
                 // A fire that replays lays each window's scratch for the
                 // rung's own rows and its carried room; one that replays
                 // nothing, for its own rows alone.
-                let replays = carried > 0;
+                // Every buffering fire lays the same programs whatever its
+                // lanes carry: each window's scratch for the rung's rows and
+                // its carried room, a tail and a carried grid the run-ahead
+                // window wide.
+                let replays = true;
+                let _ = carried;
+                let window_rows = self.carried_rows();
                 let mut maps = std::collections::HashMap::new();
                 let mut carried_maps = std::collections::HashMap::new();
                 for window in windows.all() {
@@ -2899,6 +2909,7 @@ impl Shell {
                         span.lane_offset,
                         paging.page_size.max(1),
                         replays.then_some(descriptor.bucket),
+                        window_rows,
                     )?;
                     // a window of single-token lanes runs each layer's decode
                     // form, the state + buffer step over its carried rows
@@ -2909,7 +2920,7 @@ impl Shell {
                             lanes,
                             span.lane_offset,
                             paging.page_size.max(1),
-                            crate::rs::carried_room(descriptor.bucket),
+                            window_rows,
                         )?;
                         let rows: Vec<i32> = step
                             .buffer_rows

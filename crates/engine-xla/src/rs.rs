@@ -466,6 +466,7 @@ impl WindowMap {
         lane0: u32,
         page_tokens: u32,
         rung: Option<u32>,
+        tail_width: u32,
     ) -> Result<WindowMap> {
         let mut map = WindowMap::default();
         let rows_own = indptr.last().copied().unwrap_or(0).max(0) as usize;
@@ -555,9 +556,17 @@ impl WindowMap {
             .map(|(&(begin, commit, _, _), &end)| (end - begin - commit).max(0))
             .collect();
         let widest = counts.iter().copied().max().unwrap_or(0) as u32;
-        if widest > 0 {
-            // a pow2 width, as the extended rows' (one program per width)
-            let t = widest.next_power_of_two();
+        if widest > tail_width {
+            return Err(Fault::Ceiling {
+                what: "rows a lane leaves past its commit (the run-ahead window)",
+                need: u64::from(widest),
+                have: u64::from(tail_width),
+            });
+        }
+        if tail_width > 0 {
+            // the run-ahead window wide, whatever the lanes leave: one
+            // program per rung
+            let t = tail_width;
             map.tail_rows = t;
             map.tail = vec![0; tails.len() * t as usize];
             map.own_tail = vec![-1; rows_own];
@@ -696,10 +705,12 @@ mod tail_map {
                 ..LanePlan::default()
             },
         ];
-        let map = WindowMap::of(&plans, &[0, 3, 5], 0, 16, None).unwrap();
+        let map = WindowMap::of(&plans, &[0, 3, 5], 0, 16, None, 3).unwrap();
         assert_eq!(map.tail_count, vec![2, 0]);
-        assert_eq!(map.tail_rows, 2);
-        assert_eq!(map.tail, vec![3, 4, 0, 0]);
+        assert_eq!(map.tail_rows, 3);
+        assert_eq!(map.tail, vec![3, 4, 0, 0, 0, 0]);
         assert_eq!(map.own_tail, vec![-1, 0, 1, -1, -1]);
+        // past the window, refused
+        assert!(WindowMap::of(&plans, &[0, 3, 5], 0, 16, None, 1).is_err());
     }
 }
