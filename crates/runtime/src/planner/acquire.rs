@@ -56,14 +56,14 @@ impl ResidencyPlanner {
             return None;
         }
         if demand.is_zero() {
-            if self.waiters.load(Ordering::Acquire) != 0
+            if self.returns.waiters.load(Ordering::Acquire) != 0
                 || self.nonresident.load(Ordering::Acquire) != 0
             {
                 self.note_progress(pid);
             }
             return Some(AllocationGrant::empty());
         }
-        let uncontended = self.waiters.load(Ordering::Acquire) == 0
+        let uncontended = self.returns.waiters.load(Ordering::Acquire) == 0
             && self.nonresident.load(Ordering::Acquire) == 0;
         if !self.seated_first {
             if !uncontended {
@@ -254,6 +254,13 @@ impl ResidencyPlanner {
                     let notified = notify.notified();
                     tokio::pin!(notified);
                     notified.as_mut().enable();
+                    // Room a grant gives back as it drops (no lock taken
+                    // there, `RoomReturns`): read before it parks, and
+                    // after every wake, a move plans again.
+                    let returned = self.returns.returned();
+                    tokio::pin!(returned);
+                    returned.as_mut().enable();
+                    let seen = self.returns.epoch();
                     let acquired = match self.collect_outcome(key) {
                         // Short, it waits however long: its own notify
                         // (served, room given back, an eviction landed, a
@@ -262,12 +269,20 @@ impl ResidencyPlanner {
                         // (the gauge keeps a band only while it is told);
                         // only a need past the whole device pool, which the
                         // pool shrinking under it can make, is refused.
+                        Collect::Wait if self.returns.epoch() != seen => {
+                            self.poke();
+                            continue;
+                        }
                         Collect::Wait => {
                             let again = crate::policy::pressure::AGAIN;
                             let woke = tokio::select! {
                                 () = &mut notified => true,
+                                () = &mut returned => true,
                                 _ = crate::rt::time::timeout(again, std::future::pending::<()>()) => false,
                             };
+                            if self.returns.epoch() != seen {
+                                self.poke();
+                            }
                             if !woke {
                                 // Each re-report plans again too, as the
                                 // give-up's check did: a grow, a commit or a
@@ -691,6 +706,10 @@ impl ResidencyPlanner {
             let notified = notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
+            let returned = self.returns.returned();
+            tokio::pin!(returned);
+            returned.as_mut().enable();
+            let seen = self.returns.epoch();
             let served = self.with_inner(|inner| {
                 let key = inner.locate(key)?;
                 match inner.queue.get(&key)?.kind {
@@ -704,6 +723,7 @@ impl ResidencyPlanner {
                 None => return Err(PlannerError::Cancelled),
                 Some((_, true)) => return Ok((BindRoomWait::Withdrawn, Some(registration))),
                 Some((true, false)) => return Ok((BindRoomWait::Served, Some(registration))),
+                Some((false, false)) if self.returns.epoch() != seen => self.poke(),
                 Some((false, false)) => {
                     // Room that comes free or moves (the rung lowered or
                     // raised, a segment committed, guest state given back)
@@ -722,6 +742,7 @@ impl ResidencyPlanner {
                     };
                     tokio::select! {
                         () = notified => {}
+                        () = returned => self.poke(),
                         () = rung => self.poke(),
                         () = given => self.poke(),
                     }

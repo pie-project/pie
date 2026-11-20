@@ -1,13 +1,13 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use tokio::sync::Notify;
 
 use crate::store::rs::RsUnits;
 
 use super::departure::Departure;
-use super::grant::{AllocationGrant, Demand, DevicePageReservation, RsSlotReservation};
+use super::grant::{AllocationGrant, Demand, DevicePageReservation, RoomReturns, RsSlotReservation};
 use super::holdings::{held_page_count, held_rs_units};
 use super::inner::Inner;
 use super::pool::PoolPort;
@@ -38,9 +38,10 @@ const DEMOTE: ProcessId = ProcessId::max();
 pub struct ResidencyPlanner {
     pub(super) inner: parking_lot::Mutex<Inner>,
     pub(super) pause_due: AtomicBool,
-    pub(super) waiters: AtomicUsize,
     pub(super) nonresident: AtomicUsize,
-    drain: OnceLock<Arc<Notify>>,
+    /// Room grants give back as they drop, the queue's length and the drain
+    /// task's wake: shared with every reservation handed out.
+    pub(super) returns: Arc<RoomReturns>,
     idle_reclaim_exhausted: std::sync::atomic::AtomicBool,
     pub(super) sweeping: AtomicBool,
     sweep_exhausted: AtomicBool,
@@ -103,9 +104,8 @@ impl ResidencyPlanner {
         Self {
             inner: parking_lot::Mutex::new(Inner::default()),
             pause_due: AtomicBool::new(false),
-            waiters: AtomicUsize::new(0),
             nonresident: AtomicUsize::new(0),
-            drain: OnceLock::new(),
+            returns: Arc::default(),
             idle_reclaim_exhausted: std::sync::atomic::AtomicBool::new(false),
             sweeping: AtomicBool::new(false),
             sweep_exhausted: AtomicBool::new(false),
@@ -322,7 +322,7 @@ impl ResidencyPlanner {
             return;
         };
         let notify = Arc::new(Notify::new());
-        if self.drain.set(notify.clone()).is_err() {
+        if self.returns.drain.set(notify.clone()).is_err() {
             return;
         }
         let planner = self.clone();
@@ -335,7 +335,7 @@ impl ResidencyPlanner {
     }
 
     pub(super) fn poke(self: &Arc<Self>) {
-        match self.drain.get() {
+        match self.returns.drain.get() {
             Some(notify) => notify.notify_one(),
             None => self.plan(),
         }
@@ -646,7 +646,9 @@ impl ResidencyPlanner {
     pub(super) fn with_inner<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> R {
         let mut inner = self.lock_inner();
         let result = f(&mut inner);
-        self.waiters.store(inner.queue.len(), Ordering::Release);
+        self.returns
+            .waiters
+            .store(inner.queue.len(), Ordering::Release);
         self.nonresident
             .store(inner.nonresident_count(), Ordering::Release);
         inner.admit_unpreempted();
@@ -1423,7 +1425,7 @@ impl ResidencyPlanner {
         // A set let go or a segment backed: admission reads its seats again.
         self.seat_room.notify_waiters();
         self.re_arm_idle_reclaim();
-        if self.waiters.load(Ordering::Acquire) != 0 {
+        if self.returns.waiters.load(Ordering::Acquire) != 0 {
             self.poke();
         }
     }
@@ -1431,7 +1433,7 @@ impl ResidencyPlanner {
     pub(super) fn try_reserve(&self, demand: Demand) -> Option<AllocationGrant> {
         let kv = if demand.kv_pages > 0 {
             let pages = self.port.reserve_device(demand.kv_pages)?;
-            DevicePageReservation::new(pages, self.port.clone())
+            DevicePageReservation::new(pages, self.port.clone(), self.returns.clone())
         } else {
             DevicePageReservation::empty()
         };
@@ -1444,7 +1446,7 @@ impl ResidencyPlanner {
             return Some(RsSlotReservation::empty());
         }
         let grant = self.port.reserve_rs(need)?;
-        Some(RsSlotReservation::new(grant, self.port.clone()))
+        Some(RsSlotReservation::new(grant, self.port.clone(), self.returns.clone()))
     }
 
     pub(super) fn absorb_free(&self, count: u32) -> bool {
@@ -1452,7 +1454,7 @@ impl ResidencyPlanner {
         if pages.is_empty() {
             return false;
         }
-        let reservation = DevicePageReservation::new(pages, self.port.clone());
+        let reservation = DevicePageReservation::new(pages, self.port.clone(), self.returns.clone());
         self.with_inner(|inner| inner.accum.absorb(reservation));
         true
     }

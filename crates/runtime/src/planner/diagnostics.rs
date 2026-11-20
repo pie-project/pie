@@ -301,7 +301,7 @@ impl ResidencyPlanner {
         // parked idle comes back only when it fires, so on its own it must
         // never hold a launch.
         if self.nonresident.load(Ordering::Acquire) != 0
-            || self.waiters.load(Ordering::Acquire) != 0
+            || self.returns.waiters.load(Ordering::Acquire) != 0
         {
             bucket = bucket.max(224);
         }

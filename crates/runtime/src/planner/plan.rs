@@ -78,7 +78,17 @@ enum Board {
 
 impl ResidencyPlanner {
     pub fn plan(self: &Arc<Self>) {
-        let on_grow = self.plan_once();
+        // A grant dropped unspent during the pass gave back room the pass
+        // may have read before it came: the pass runs again on the pool as
+        // it stands ([`super::grant::RoomReturns`]), so the drop, which
+        // cannot plan itself, wakes the head within this step.
+        let on_grow = loop {
+            let seen = self.returns.epoch();
+            let on_grow = self.plan_once();
+            if self.returns.epoch() == seen {
+                break on_grow;
+            }
+        };
         // The waiters parked behind a grow the walk was promised, now.
         let parked = if on_grow {
             self.with_inner(|inner| inner.queue.values().filter(|w| w.is_unmet()).count())

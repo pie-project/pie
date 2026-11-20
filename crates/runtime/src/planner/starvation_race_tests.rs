@@ -4873,7 +4873,10 @@ async fn a_restore_head_whose_run_stands_is_sent_and_an_understated_one_once_roo
 /// of nothing freed, no waiter is refused unless its need could never fit
 /// the pool alone (none here can't): no allocation's outcome is an error,
 /// and the head's bind or restore gate ends only served. Failing seeds are
-/// printed to replay.
+/// printed to replay. In a rise seed fires take grants of free chunks and
+/// drop them unused, the drop alone telling the planner (no `pages_freed`,
+/// no poke): room it gives back that serves the head is the head's within
+/// that step.
 #[tokio::test(flavor = "current_thread")]
 async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
     // Alone: it raises the policy's global answer.
@@ -5006,6 +5009,27 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
         if is_rise && !walk_rise {
             pool.pages.store(true, Ordering::Release);
         }
+        // Grants a fire took and holds unspent (a rise seed's pool hands
+        // its free chunks out as pages): one dropped unused gives them back
+        // with nothing else said, no `pages_freed`, no poke. Half the rise
+        // seeds start with one, taken before the head asks, so the head
+        // may wait on the room it holds. Only beside a resident holding
+        // chunks: a grant is no process's, and with no one else holding any
+        // the head would read as the pool's sole holder (the starvation
+        // endgame), not as waiting on room that comes back.
+        let mut held: Vec<AllocationGrant> = Vec::new();
+        if is_rise && !walk_rise && !pool.kv.lock().is_empty() && rng.below(2) == 0 {
+            let free = pool.free.lock().len() as u64;
+            if free > 0 {
+                let pages = 1 + rng.below(free) as u32;
+                if let Some(grant) = planner.try_reserve(Demand {
+                    kv_pages: pages,
+                    rs: RsUnits::default(),
+                }) {
+                    held.push(grant);
+                }
+            }
+        }
         let bind = (!is_restore).then(|| {
             let p = planner.clone();
             let taker = pool.clone();
@@ -5075,15 +5099,26 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
         let mut schedule = vec![format!(
             "total={total} host={host} run={run} pieces={pieces} restore={is_restore} \
              understated_at={understated_at:?} runs_now={runs_now} residents={} grants={grants} \
-             compactable={} mixed={mixed} rise={is_rise} walk_rise={walk_rise} kv={:?}",
+             compactable={} mixed={mixed} rise={is_rise} walk_rise={walk_rise} kv={:?} \
+             held={:?}",
             residents.len(),
             pool.compactable.load(Ordering::Acquire),
-            pool.kv.lock()
+            pool.kv.lock(),
+            held.iter().map(AllocationGrant::remaining_kv).collect::<Vec<_>>()
         )];
         let mut applied = 0u32;
         let mut alive = residents.clone();
         for step in 0..8 {
-            if step > 0 {
+            // This step's event was a grant dropped unused: only the drop
+            // tells the planner.
+            let mut dropped_unused = false;
+            if step > 0 && !held.is_empty() && rng.below(2) == 0 {
+                let grant = held.remove(rng.below(held.len() as u64) as usize);
+                let pages = grant.remaining_kv();
+                drop(grant);
+                dropped_unused = true;
+                schedule.push(format!("a grant of {pages} dropped unused"));
+            } else if step > 0 {
                 match rng.below(6) {
                     // A chunk taken: fragmentation.
                     0 => {
@@ -5172,13 +5207,36 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
                         planner.unregister(pid);
                         schedule.push("a resident completes".into());
                     }
+                    // A fire takes a grant of free chunks, or drops one
+                    // it holds unused.
+                    _ if is_rise && !walk_rise => {
+                        let free = pool.free.lock().len() as u64;
+                        if !held.is_empty() && (free == 0 || rng.below(2) == 0) {
+                            let grant = held.remove(rng.below(held.len() as u64) as usize);
+                            let pages = grant.remaining_kv();
+                            drop(grant);
+                            dropped_unused = true;
+                            schedule.push(format!("a grant of {pages} dropped unused"));
+                        } else if free > 0 {
+                            let pages = 1 + rng.below(free.min(3)) as u32;
+                            if let Some(grant) = planner.try_reserve(Demand {
+                                kv_pages: pages,
+                                rs: RsUnits::default(),
+                            }) {
+                                held.push(grant);
+                                schedule.push(format!("a grant of {pages} taken"));
+                            }
+                        }
+                    }
                     _ => schedule.push("nothing".into()),
                 }
             }
             let before = progress(&planner, &pool)
                 + u64::from(bind.as_ref().is_some_and(|bind| bind.is_finished()));
-            planner.pages_freed();
-            planner.poke();
+            if !dropped_unused {
+                planner.pages_freed();
+                planner.poke();
+            }
             for _ in 0..200 {
                 crate::rt::yield_now().await;
             }
@@ -5293,6 +5351,14 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
             // head's within that step (the event that made it, a give, a
             // landing, a completion, wakes the plan at once): one step from
             // room appearing to the head served, never a later one.
+            if dropped_unused && servable && !retried && !head_served && !is_restore {
+                failures.push(format!(
+                    "seed {seed} step {step}: a grant dropped unused gave back the head's room \
+                     and the head was not reconsidered within the step\n  schedule: {}",
+                    schedule.join(" -> ")
+                ));
+                break;
+            }
             if servable && !retried && !head_served && !is_restore {
                 failures.push(format!(
                     "seed {seed} step {step}: the head's room stood and it was not served \
@@ -5659,4 +5725,138 @@ async fn a_rise_whose_room_no_move_frees_waits_and_is_served_once_the_room_retur
     }
     assert!(rise.is_finished(), "served once the room returns");
     assert!(matches!(rise.await, Ok(Ok(()))));
+}
+
+/// A head parked for two pages behind a holder's grant of the whole pool;
+/// `drain` arms the planner's drain task (as `init_planner` does) or
+/// leaves it unarmed (each parked waiter plans for itself).
+async fn head_behind_a_held_grant(
+    drain: bool,
+) -> (
+    Arc<ResidencyPlanner>,
+    AllocationGrant,
+    crate::rt::JoinHandle<Result<super::acquire::Acquired, PlannerError>>,
+) {
+    let pool = Arc::new(RacePool::new(4));
+    pool.refill_after_stall(4, 0);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone()));
+    if drain {
+        planner.arm_drain_task();
+    }
+    let (holder, head) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [holder, head] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    let grant = planner
+        .grant_now(
+            holder,
+            Demand {
+                kv_pages: 4,
+                rs: RsUnits::default(),
+            },
+        )
+        .expect("the pool is free: the holder's grant is taken at once");
+    let p = planner.clone();
+    let head_task = crate::rt::spawn(async move {
+        p.acquire(
+            head,
+            head,
+            Demand {
+                kv_pages: 2,
+                rs: RsUnits::default(),
+            },
+        )
+        .await
+    });
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.diagnostics().queue.len() == 1 {
+            break;
+        }
+    }
+    assert_eq!(planner.diagnostics().queue.len(), 1, "the head parks");
+    // Quiet: the head stays parked with nothing else happening.
+    for _ in 0..50 {
+        crate::rt::yield_now().await;
+    }
+    assert!(!head_task.is_finished(), "nothing frees room: the head waits");
+    (planner, grant, head_task)
+}
+
+/// Whether `head_task` ends granted within a few scheduler turns: well
+/// inside one planner step, never by the short-wait re-report
+/// (`pressure::AGAIN`), the only other wake a quiet pool gives it.
+async fn served_at_once(
+    head_task: crate::rt::JoinHandle<Result<super::acquire::Acquired, PlannerError>>,
+    since: std::time::Instant,
+) {
+    for _ in 0..50 {
+        if head_task.is_finished() {
+            break;
+        }
+        crate::rt::yield_now().await;
+    }
+    assert!(
+        head_task.is_finished(),
+        "room a dropped grant gave back serves the head within one step"
+    );
+    assert!(since.elapsed() < crate::policy::pressure::AGAIN, "served before any re-report");
+    match head_task.await.expect("the head's task ends") {
+        Ok(super::acquire::Acquired::Granted(grant)) => assert_eq!(grant.remaining_kv(), 2),
+        Ok(_) => panic!("the head yielded or requoted instead of being served"),
+        Err(error) => panic!("the head was refused: {error}"),
+    }
+}
+
+/// An allocation's grant dropped unused gives its pages back to the pool,
+/// and the planner hears of it from the drop alone: a head that room can
+/// serve is served within one planner step, with no completion, no map
+/// change and no `pages_freed` (the gap the no-deadline wait exposed, a
+/// head asleep until an unrelated event). With the drain task armed and
+/// without it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_grant_dropped_unused_wakes_the_head_its_room_serves() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    for drain in [true, false] {
+        let (planner, grant, head_task) = head_behind_a_held_grant(drain).await;
+        let epoch = planner.returns.epoch();
+        let since = std::time::Instant::now();
+        drop(grant);
+        assert_eq!(planner.returns.epoch(), epoch + 1, "the drop moves the epoch");
+        served_at_once(head_task, since).await;
+    }
+}
+
+/// The drop may run under the planner's lock (a waiter's entry, its served
+/// grant in it, removed under the lock): it takes no planner lock and plans
+/// nothing itself, so it never deadlocks, and the head its room serves is
+/// still served once the lock is let go.
+#[tokio::test(flavor = "current_thread")]
+async fn a_grant_dropped_under_the_planner_lock_does_not_deadlock() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    for drain in [true, false] {
+        let (planner, grant, head_task) = head_behind_a_held_grant(drain).await;
+        let p = planner.clone();
+        let (done, dropped) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let guard = p.lock_inner();
+            drop(grant);
+            drop(guard);
+            // And inside the planner's own critical section, a grant
+            // holding pages (two of the four now free; the head asks two).
+            let grant = p
+                .try_reserve(Demand {
+                    kv_pages: 2,
+                    rs: RsUnits::default(),
+                })
+                .expect("four pages stand free");
+            p.with_inner(|_| drop(grant));
+            let _ = done.send(());
+        });
+        dropped
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a grant dropped under the planner's lock must not deadlock");
+        served_at_once(head_task, std::time::Instant::now()).await;
+    }
 }
