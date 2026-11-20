@@ -134,6 +134,10 @@ impl engine_gpu::backend::Frame<Api> for Frame {
         Frame::flush_settled(self)
     }
 
+    fn submit_segment(&self) -> Result<()> {
+        Frame::submit_segment(self)
+    }
+
     fn commit(self) -> Result<()> {
         Frame::commit(self)
     }
