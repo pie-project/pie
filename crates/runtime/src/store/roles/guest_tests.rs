@@ -1821,20 +1821,23 @@ fn with_no_host_tier_a_park_gives_guest_scratch_back_and_a_restore_takes_it_fres
     assert!(roles.lock().unwrap().holds_guest_state(holder(parked)));
 }
 
-/// The Instance chunks parking a process empties: per chunk, the slots of
-/// its dead parts (guest scratch) on the device, its live tables never;
-/// after its park, none.
+/// The chunks moving a process empties: per chunk, every slot of the guest
+/// items it holds bound on the device, its scratch's two whole chunks and
+/// its tables alike (a park takes the tables below or leaves them parked in
+/// place for a move down a tier: either way they go); after its park, none
+/// (what lies parked in place is a parked occupant).
 #[test]
-fn a_process_s_guest_chunk_slots_are_its_scratch_on_the_device() {
+fn a_process_s_guest_chunk_slots_are_all_its_bound_slots() {
     let Pools { roles, .. } = pools_no_host(facts_in(64, 8));
     let (program, mut engine) = runs_of(13, 2, 1, 0);
-    bind_as(&roles, &mut engine, program, 1).unwrap();
+    let id = bind_as(&roles, &mut engine, program, 1).unwrap();
     bind_as(&roles, &mut engine, program, 2).unwrap();
     let slots = roles.lock().unwrap().guest_chunk_slots(&[holder(1)]);
     let total: u32 = slots.iter().map(|&(_, _, n)| n).sum();
-    assert_eq!(total, 2 * SPC, "its run of two whole chunks");
+    let bound = roles.lock().unwrap().slots(Owner::Instance(id)).len() as u32;
+    assert!(total >= 2 * SPC, "its run of two whole chunks at least: {total}");
+    assert_eq!(total, bound, "its scratch and every table slot: {total}");
     assert!(slots.iter().all(|&(_, by, _)| by == holder(1)));
-    assert_eq!(slots.len(), 2, "two chunks");
     park(&roles, 1);
     assert!(roles.lock().unwrap().guest_chunk_slots(&[holder(1)]).is_empty());
 }
@@ -2802,4 +2805,30 @@ fn a_parked_process_s_own_retake_is_counted_in_runs() {
     roles.lock().unwrap().commit(back);
     assert_eq!(roles.lock().unwrap().unpark_runs(holder(1), 2), 0, "back: nothing parked");
     roles.lock().unwrap().close_instance(id);
+}
+
+/// A bind short of room asks for all it takes, not the part that came up
+/// short first: an instance's scratch and its pair's state, each two whole
+/// chunks, the pair's first bind, three chunks free. The scratch fits and
+/// the pair does not, and the scratch goes back with the refusal; asked for
+/// the pair's two alone, the restore its suspension waits on came back
+/// once two stood, the bind took them for the scratch, came up short on
+/// the pair, and was suspended again (bind, suspend, restore, short).
+#[test]
+fn a_bind_short_of_room_asks_for_its_scratch_and_its_pair_together() {
+    let Pools { device, roles } = pools(64);
+    let singles = fill_with_singles(&roles);
+    for id in singles.iter().take(3) {
+        roles.lock().unwrap().close_instance(*id);
+    }
+    assert_eq!(device.lock().unwrap().pool().free_chunks(), 3, "three chunks free");
+    let mut engine = GuestEngine::new(2 * CHUNK, 2 * CHUNK);
+    let error = bind(&roles, &mut engine, 1).expect_err("four chunks asked, three free");
+    let short = error.downcast_ref::<RolesError>().expect("a roles error");
+    assert!(matches!(short, RolesError::BindShort(_)), "a wait: {short}");
+    assert_eq!(
+        short.room_runs(),
+        Some((1, 4)),
+        "its scratch's two chunks and its pair's two, together: {short}"
+    );
 }

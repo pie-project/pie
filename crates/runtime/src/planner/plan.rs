@@ -141,23 +141,17 @@ impl ResidencyPlanner {
             {
                 return None;
             }
-            let need = match &waiter.kind {
-                WaitKind::BindRoom { run, pieces, .. } => Some((*run, *pieces)),
-                WaitKind::Restore { .. } => inner
-                    .procs
-                    .get(&waiter.pid)
-                    .and_then(super::proc::Proc::restore_need),
-                WaitKind::Allocation { .. } => None,
-            };
             let (pid, kind) = (waiter.pid, waiter.kind_name());
             let pids: Vec<ProcessId> = inner.procs.keys().copied().collect();
             let again = inner.stall_dumped.is_some_and(|(at, seen, _)| (at, seen) == (key, gives));
             inner.stall_dumped = Some((key, gives, crate::rt::Instant::now()));
-            Some((key, pid, kind, need, pids, again))
+            Some((key, pid, kind, pids, again))
         });
-        let Some((key, pid, kind, need, pids, again)) = stalled else {
+        let Some((key, pid, kind, pids, again)) = stalled else {
             return;
         };
+        // What the head's step takes, read as the map and the step read it.
+        let need = self.head_room(key);
         self.stats.stall_dumps.fetch_add(1, Ordering::Relaxed);
         let (free, total) = self.port.device_stats();
         // A head short of kv reads the map at runs of one chunk: what holds

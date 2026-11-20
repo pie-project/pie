@@ -442,6 +442,35 @@ impl ResidencyPlanner {
         self.poke();
     }
 
+    /// The runs of whole chunks the head `key`'s step takes when it runs,
+    /// `(run, pieces)`: a bind waiting for room, its runs; the restore of a
+    /// process a bind suspended, its bind's runs beside what its own unpark
+    /// takes back first ([`Self::beside_own`]); a restore short of its
+    /// roles, the shortfall its unpark named. One reading for the stall
+    /// record, the census, the chunk map's ask and the step: read apart,
+    /// the map asked less than the step took and moved no one. `None` for
+    /// a head short of kv alone.
+    pub(super) fn head_room(&self, key: EntryKey) -> Option<(u32, u32)> {
+        let (need, suspended) = self.with_inner(|inner| {
+            let waiter = inner.queue.get(&inner.locate(key)?)?;
+            match &waiter.kind {
+                WaitKind::BindRoom { run, pieces, .. } => Some(((*run, *pieces), None)),
+                WaitKind::Restore { .. } => {
+                    let proc = inner.procs.get(&waiter.pid)?;
+                    let need = proc.restore_need()?;
+                    let suspended = (proc.bind_room.is_some() && proc.roles_short.is_none())
+                        .then_some(waiter.pid);
+                    Some((need, suspended))
+                }
+                WaitKind::Allocation { .. } => None,
+            }
+        })?;
+        Some(match suspended {
+            Some(pid) => self.beside_own(pid, need),
+            None => need,
+        })
+    }
+
     /// The runs a restore a bind suspended asks of the chunk map: its bind's
     /// `pieces` runs of `run` chunks beside those its own unpark takes back
     /// first (`PoolPort::unpark_runs`), never more than the pool stands.

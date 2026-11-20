@@ -234,34 +234,7 @@ impl ResidencyPlanner {
         // So is a restore whose role slots are short of runs of chunks
         // ([`super::proc::Proc::roles_short`]): its unpark retakes its dead
         // parts fresh, in their class.
-        let shape = self.with_inner(|inner| match inner.queue.get(&victims.head) {
-            Some(waiter) => match &waiter.kind {
-                WaitKind::BindRoom { run, pieces, .. } => Some((*run, *pieces)),
-                // So is the restore of a process a bind short of room
-                // suspended: the room that bind asks.
-                WaitKind::Restore { .. } => inner
-                    .procs
-                    .get(&waiter.pid)
-                    .and_then(super::proc::Proc::restore_need),
-                WaitKind::Allocation { .. } => None,
-            },
-            None => None,
-        });
-        // The restore of a process a bind suspended asks its bind's runs
-        // beside what its own unpark takes back first, as the census reads
-        // it ([`Self::beside_own`]).
-        let suspended = self.with_inner(|inner| {
-            let waiter = inner.queue.get(&victims.head)?;
-            let proc = inner.procs.get(&waiter.pid)?;
-            (matches!(waiter.kind, WaitKind::Restore { .. })
-                && proc.bind_room.is_some()
-                && proc.roles_short.is_none())
-            .then_some(waiter.pid)
-        });
-        let shape = match (shape, suspended) {
-            (Some(need), Some(pid)) => Some(self.beside_own(pid, need)),
-            (shape, _) => shape,
-        };
+        let shape = self.head_room(victims.head);
         // Kv the head lacks, with parked state lying on the device (role
         // slots its park found no room below for, as on a home with no host
         // tier): that state moves down a tier first, no one running on it.

@@ -309,6 +309,28 @@ impl GuestRoom {
         }
     }
 
+    /// The same room, asking `whole` runs of its run where that is more
+    /// than it named: what the whole bind takes, not the part that came up
+    /// short first.
+    fn asking(self, whole: u32) -> Self {
+        match self {
+            Self::Runs {
+                run,
+                pieces,
+                free_runs,
+                free_chunks,
+                committable,
+            } => Self::Runs {
+                run,
+                pieces: pieces.max(whole),
+                free_runs,
+                free_chunks,
+                committable,
+            },
+            slots => slots,
+        }
+    }
+
     fn with_committable(self, runs: u32) -> Self {
         match self {
             Self::Slots { slots, .. } => Self::Slots {
@@ -328,6 +350,39 @@ impl GuestRoom {
                 free_chunks,
                 committable: runs,
             },
+        }
+    }
+}
+
+impl RolesError {
+    /// A bind's refusal for want of room, asking `whole` runs: every guest
+    /// part the bind takes fresh, so the room its wait (or its suspended
+    /// process's restore) is served on holds the whole bind. Asked for the
+    /// part short first, the restore came back once that stood, the bind
+    /// took it for another part, came up short again and was suspended
+    /// again (bind, suspend, restore, short).
+    fn asking(self, whole: u32) -> Self {
+        match self {
+            Self::BindShort(short) => Self::BindShort(Box::new(short.asking(whole))),
+            Self::GuestShort { what, bytes, room } => Self::GuestShort {
+                what,
+                bytes,
+                room: room.asking(whole),
+            },
+            Self::GuestGrow {
+                what,
+                bytes,
+                room,
+                run,
+                prefix,
+            } => Self::GuestGrow {
+                what,
+                bytes,
+                room: room.asking(whole),
+                run,
+                prefix,
+            },
+            other => other,
         }
     }
 }
@@ -887,18 +942,23 @@ impl Roles {
         }
     }
 
-    /// Per logical chunk, the slots each of `holders` holds there in dead
-    /// parts on the device (guest scratch and pair state, which a park gives
-    /// back whatever lies below): the Instance chunks parking them empties.
+    /// Per logical chunk, the slots each of `holders` holds there in guest
+    /// items bound on the device: dead parts (scratch and pair state, given
+    /// back at a park whatever lies below) and live ones (tables, rings),
+    /// which a park takes below or, with no room there, leaves parked in
+    /// place for a move down a tier to clear. Every one of them goes once
+    /// its holder moves, so a chunk they fill is emptiable, as the pool's
+    /// census counts it: counting the dead parts alone, a chunk holding a
+    /// table never qualified for a run, and a long run (nine chunks, two
+    /// of them) found no window, though moving its holders stood it.
+    /// Parked items lying on the device are not here: they are the parked
+    /// occupants (`parked_chunk_slots`).
     #[must_use]
     pub fn guest_chunk_slots(&self, holders: &[Holder]) -> Vec<(u32, Holder, u32)> {
-        let Some(shape) = self.shapes.of(SlotRole::Instance) else {
-            return Vec::new();
-        };
         let device = self.device.lock().unwrap();
         let mut counts: BTreeMap<(u32, Holder), u32> = BTreeMap::new();
         for (owner, item) in &self.items {
-            if item.tier != Tier::Device {
+            if item.tier != Tier::Device || item.shed {
                 continue;
             }
             let Some(holder) = holders
@@ -908,7 +968,10 @@ impl Roles {
             else {
                 continue;
             };
-            for part in item.parts.iter().filter(|part| part.dead()) {
+            for part in &item.parts {
+                let Some(shape) = self.shapes.of(part.role) else {
+                    continue;
+                };
                 for &slot_ref in &part.refs {
                     let slot = device.slot(shape.pool, slot_ref);
                     *counts.entry((slot.chunk, holder)).or_default() += 1;
@@ -1615,6 +1678,29 @@ impl Roles {
         if (per_instance > 0 || state.per_pair > 0) && self.stated.insert(pair) {
             self.state_room(pair, state);
         }
+        // Every part the bind takes fresh (its scratch, and its pair's state
+        // where the pair holds none on the device now), in runs of the
+        // longest: what a refusal for want of room asks
+        // ([`RolesError::asking`]), so the room it waits on holds the bind.
+        let pair_fresh = state.per_pair > 0
+            && !matches!(
+                self.items.get(&Owner::Pair(pair)),
+                Some(item) if item.tier == Tier::Device && !item.shed
+            );
+        let fresh: Vec<(u32, u32)> = [
+            (per_instance > 0).then_some(per_instance),
+            pair_fresh.then_some(state.per_pair),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|bytes| self.scratch_part(bytes, run).ok())
+        .map(|part| part.chunk_runs())
+        .collect();
+        let longest = fresh.iter().map(|&(run, _)| run).max().unwrap_or(1).max(1);
+        let whole: u32 = fresh
+            .iter()
+            .map(|&(run, pieces)| run.div_ceil(longest).saturating_mul(pieces))
+            .sum();
         if per_instance > 0 {
             match self.take_scratch(
                 per_instance,
@@ -1625,7 +1711,7 @@ impl Roles {
                 Ok(part) => taken.scratch = Some(part),
                 Err(error) => {
                     self.untake_guest(taken);
-                    return Err(error);
+                    return Err(error.asking(whole));
                 }
             }
         }
@@ -1667,7 +1753,8 @@ impl Roles {
                                 RolesError::BindShort(Box::new(short))
                             } else {
                                 short
-                            });
+                            }
+                            .asking(whole));
                         }
                     }
                 }
@@ -1685,7 +1772,7 @@ impl Roles {
                         Ok(part) => Some((pair, part, true, self.next_generation())),
                         Err(error) => {
                             self.untake_guest(taken);
-                            return Err(error);
+                            return Err(error.asking(whole));
                         }
                     }
                 }
