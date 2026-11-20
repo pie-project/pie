@@ -1605,6 +1605,7 @@ impl Shell {
             bodies_from_record: false,
             arming_at_load: false,
             rearming: false,
+            arm_only: None,
             bodies_took: 0,
             measuring: false,
             workspace: None,

@@ -161,6 +161,8 @@ pub struct Shell {
     /// A re-arm within the load is under way, allowed what the load's own
     /// arming took ([`Shell::rearm_bodies`]).
     rearming: bool,
+    /// An arming narrowed to one bucket's targets (`Shell::rearm_bucket`).
+    arm_only: Option<u32>,
     /// What the last arming's captures took, which a re-arm within the
     /// same load is allowed.
     bodies_took: u64,
