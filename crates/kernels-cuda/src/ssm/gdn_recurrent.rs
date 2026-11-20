@@ -68,6 +68,11 @@ pub fn gated_delta(
     )
 }
 
+/// The shared memory a warp of the carried step stages a chunk of buffered
+/// rows in, double-buffered with its state: 16 rows of its sixteen columns
+/// of their corrected values and their two attention weights, f32.
+const CARRIED_ROWS_SMEM: u32 = 2 * (16 * 16 * 4 + 16 * 8);
+
 /// The value columns one warp of the fused step owns.
 const FUSED_BV: u32 = 16;
 
@@ -240,7 +245,7 @@ pub fn gated_delta_carried(
     let shape = Delta::of(OP, qkv, gates, y, k_heads, v_heads, k_dim, v_dim)?;
     seated(OP, state, "gdn_step_carried", true, false, false)?;
     let rows = state.rows(OP, state.slab, state.slot_stride_elems, v_heads)?;
-    if !fused_fits(&shape, state, &rows, qkv, y) || !aligned16(carry.scratch) {
+    if !fused_fits(&shape, state, &rows, qkv, y) {
         return Err(refuse(
             OP,
             format!(
@@ -265,8 +270,10 @@ pub fn gated_delta_carried(
     };
     ctx.fire(
         OP,
-        Fire::at(kernel(GDN_RECURRENT, entrypoint))
-            .apply(Launch::grid([blocks, 1, 1], [32 * warps, 1, 1]).smem(fused_smem(warps))),
+        Fire::at(kernel(GDN_RECURRENT, entrypoint)).apply(
+            Launch::grid([blocks, 1, 1], [32 * warps, 1, 1])
+                .smem(fused_smem(warps) + warps * CARRIED_ROWS_SMEM),
+        ),
         &[
             qkv.arg(),
             gates.arg(),
@@ -284,6 +291,61 @@ pub fn gated_delta_carried(
             state.write_state.arg(),
             state.write_state_mask.arg(),
             stated(OP, tiles)?.arg(),
+            carry.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
+/// The gate prep of a buffering decode fire: the own row's gates (as
+/// [`super::gdn_gates`] forms them; its `[b | a]` lands in the lane's
+/// buffer, plane 0) and each buffered row's attention weights against the
+/// own row (`q k v` rows `qkv`, their keys in plane 1) into the carried
+/// scratch, a value head's two floats a row, for [`gated_delta_carried`].
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_gates_carried(
+    ctx: &Ctx,
+    ba: Tensor,
+    dt_bias: Tensor,
+    a_log: Tensor,
+    gates: &mut Tensor,
+    qkv: Tensor,
+    k_heads: u32,
+    k_dim: u32,
+    carry: &Carry,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.gdn_gates";
+    dtype_dispatch!(OP, ba.dtype, { Bf16 => () });
+    dtype_dispatch!(OP, qkv.dtype, { Bf16 => () });
+    let v_heads = ba.width / 2;
+    if k_dim > 128 || !k_dim.is_multiple_of(4) || !v_heads.is_multiple_of(k_heads) || v_heads / k_heads > 4 {
+        return Err(refuse(
+            OP,
+            format!(
+                "a buffered row's attention weights are summed a warp a key head of at most \
+                 128 and four value heads; {k_heads} key heads of {k_dim} beside {v_heads} \
+                 value heads are not"
+            ),
+        ));
+    }
+    let rows = nonzero(OP, "rows", ba.rows)?;
+    #[allow(clippy::cast_precision_loss)]
+    let q_scale = (k_dim as f32).sqrt().recip();
+    ctx.fire(
+        OP,
+        Fire::at(kernel(GDN_RECURRENT, "::pie::ssm::gdn_gates_carried"))
+            .apply(Launch::grid([rows, k_heads, 1], [32, 1, 1])),
+        &[
+            ba.arg(),
+            dt_bias.arg(),
+            a_log.arg(),
+            gates.arg(),
+            qkv.arg(),
+            stated(OP, k_heads)?.arg(),
+            stated(OP, v_heads)?.arg(),
+            stated(OP, k_dim)?.arg(),
+            stated(OP, qkv.width)?.arg(),
+            q_scale.arg(),
             carry.arg(),
             ctx.stage(),
         ],

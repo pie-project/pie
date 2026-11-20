@@ -24,7 +24,9 @@ pub use conv1d::{
 pub use dyn_conv::dyn_conv;
 pub use gdn_chunk::{gated_delta_chunked, gated_delta_chunked_serial, gdn_lands_snapshots};
 pub use gdn_prep::gdn_gates;
-pub use gdn_recurrent::{GdnGated, gated_delta, gated_delta_carried, gated_delta_tail};
+pub use gdn_recurrent::{
+    GdnGated, gated_delta, gated_delta_carried, gated_delta_tail, gdn_gates_carried,
+};
 pub use kda::{kda, kda_carried, kda_chunked};
 pub use mamba2::{Mamba2, mamba2, mamba2_carried, mamba2_chunked};
 
@@ -44,6 +46,7 @@ pub struct Carry {
     pub lanes: u64,
     pub pages: u64,
     pub replay_tok: u64,
+    pub replay_slot: u64,
     pub commit_len: u64,
     pub scratch: u64,
     pub plane_off: [u64; 3],
@@ -52,13 +55,14 @@ pub struct Carry {
     pub pad: u32,
 }
 
-const _: () = assert!(size_of::<Carry>() == 96);
+const _: () = assert!(size_of::<Carry>() == 104);
 
 impl Carry {
     pub const NONE: Carry = Carry {
         lanes: 0,
         pages: 0,
         replay_tok: 0,
+        replay_slot: 0,
         commit_len: 0,
         scratch: 0,
         plane_off: [0; 3],

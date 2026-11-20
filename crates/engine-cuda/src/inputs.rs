@@ -194,6 +194,9 @@ pub struct RsHandles {
     pub lanes: u64,
     pub pages: u64,
     pub replay_tok: u64,
+    /// Each replayed row's page slot address, resolved on the host: a
+    /// decode step reads a buffered row through it in one load.
+    pub replay_slot: u64,
 }
 
 const RS_LANE_BYTES: u64 = size_of::<kernels_cuda::runtime::channel::RsLane>() as u64;
@@ -210,6 +213,7 @@ pub struct RsFire<'a> {
     pub lanes: &'a [kernels_cuda::runtime::channel::RsLane],
     pub pages: &'a [u64],
     pub replay_tok: &'a [u32],
+    pub replay_slot: &'a [u64],
 }
 
 /// The rs section's offsets and capacities.
@@ -219,6 +223,7 @@ struct RsAt {
     pages: u64,
     pages_cap: u64,
     replay_tok: u64,
+    replay_slot: u64,
     replay_cap: u64,
 }
 
@@ -725,6 +730,7 @@ impl Inputs {
                 pages: take(pages_cap * 8),
                 pages_cap,
                 replay_tok: take(replay_cap * 4),
+                replay_slot: take(replay_cap * 8),
                 replay_cap,
             }
         });
@@ -1216,6 +1222,14 @@ impl Inputs {
                     u32_bytes_of(tables.replay_tok),
                     "staged rs replay rows",
                 )?;
+                // SAFETY: plain integers, read as their bytes.
+                let slots = unsafe {
+                    core::slice::from_raw_parts(
+                        tables.replay_slot.as_ptr().cast::<u8>(),
+                        tables.replay_slot.len() * 8,
+                    )
+                };
+                put(at.replay_slot, slots, "staged rs replay slots")?;
                 Some((tables.pages.len() as u32, tables.replay_tok.len() as u32))
             }
         };
@@ -1542,10 +1556,12 @@ impl Inputs {
                 )?;
                 copy(at.pages, *pages as usize * 8)?;
                 copy(at.replay_tok, *toks as usize * 4)?;
+                copy(at.replay_slot, *toks as usize * 8)?;
                 Some(RsHandles {
                     lanes: base + at.lanes,
                     pages: base + at.pages,
                     replay_tok: base + at.replay_tok,
+                    replay_slot: base + at.replay_slot,
                 })
             }
             _ => None,

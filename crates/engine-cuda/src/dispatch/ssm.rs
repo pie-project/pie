@@ -171,6 +171,10 @@ impl Run<'_> {
                     )?;
                     return self.rs_land(OP, gates_ext, *gates);
                 }
+                #[cfg(not(feature = "rocm"))]
+                if step {
+                    return self.gdn_gates_carried(*ba, *dt_bias, *a_log, *gates);
+                }
                 if !step {
                     self.rs_move("ssm.gdn_gates", *ba, self.tensor(*ba))?;
                 }
@@ -539,6 +543,74 @@ impl Run<'_> {
         }
     }
 
+    /// A decode step's gate prep in a buffering fire: the own row's gates and
+    /// its `[b | a]` landed, and each buffered row's attention weights (its
+    /// keys against the step's q and k, its decay to the own row) into a
+    /// carried plane the step reads.
+    #[cfg(not(feature = "rocm"))]
+    fn gdn_gates_carried(
+        &self,
+        ba: ValueId,
+        dt_bias: ValueId,
+        a_log: ValueId,
+        gates: ValueId,
+    ) -> Result<(), kernels_cuda::Error> {
+        const OP: &str = "ssm.gdn_gates";
+        let step = self
+            .rs_planes()
+            .and_then(|planes| planes.step_gates(gates))
+            .ok_or_else(|| kernels_cuda::Error::Backend {
+                op: OP,
+                detail: format!("value {} is no decode step's gate prep", gates.0),
+            })?;
+        let y = self.gdn_step_output(gates).ok_or_else(|| kernels_cuda::Error::Backend {
+            op: OP,
+            detail: format!("the gate prep landing value {} feeds no decode step", gates.0),
+        })?;
+        let v_heads = u64::from(self.tensor(ba).width / 2);
+        let weights = self.rs_carried_rows(OP, gates, v_heads * 8)?;
+        let pool = self.recurrent_absolute(self.gdn_step_state(gates).ok_or_else(|| {
+            kernels_cuda::Error::Backend {
+                op: OP,
+                detail: format!("the gate prep landing value {} feeds no decode step", gates.0),
+            }
+        })?);
+        let carry = self.rs_carry(OP, &self.gdn_planes(OP, ba, y)?, weights, &pool)?;
+        kernels_cuda::ssm::gdn_gates_carried(
+            self.ctx(),
+            self.tensor(ba),
+            self.tensor(dt_bias),
+            self.tensor(a_log),
+            &mut self.tensor(gates),
+            self.tensor(step.qkv),
+            step.k_heads,
+            step.k_dim,
+            &carry,
+        )
+    }
+
+    /// The decode step reading gate prep output `gates`: its output and its
+    /// state.
+    #[cfg(not(feature = "rocm"))]
+    fn gdn_step_of(&self, gates: ValueId) -> Option<(ValueId, ValueId)> {
+        self.nodes().iter().find_map(|node| match &node.op {
+            poem_ir::Operation::Ssm(Ssm::GatedDelta {
+                gates: g, y, state, ..
+            }) if *g == gates => Some((*y, *state)),
+            _ => None,
+        })
+    }
+
+    #[cfg(not(feature = "rocm"))]
+    fn gdn_step_output(&self, gates: ValueId) -> Option<ValueId> {
+        self.gdn_step_of(gates).map(|(y, _)| y)
+    }
+
+    #[cfg(not(feature = "rocm"))]
+    fn gdn_step_state(&self, gates: ValueId) -> Option<ValueId> {
+        self.gdn_step_of(gates).map(|(_, state)| state)
+    }
+
     /// A gated-delta layer's buffered planes, as its kernels read them: the
     /// rows' `[b | a]`, keys and corrected values.
     #[cfg(not(feature = "rocm"))]
@@ -632,7 +704,7 @@ impl Run<'_> {
         let x_plane = self.rs_plane(OP, x)?;
         let keys = self.rs_planes().and_then(|planes| planes.keys_of(y));
         let (scratch, planes, keys) = match keys {
-            Some((k_plane, k_off)) => (
+            Some((k_plane, k_off, _)) => (
                 0,
                 vec![x_plane, k_plane],
                 Some((k_off, u32::try_from(k_plane.width).unwrap_or(u32::MAX))),
@@ -675,7 +747,8 @@ impl Run<'_> {
         const OP: &str = "ssm.gated_delta";
         let pool = self.recurrent_absolute(state);
         let _ = qkv;
-        let carry = self.rs_carry(OP, &self.gdn_planes(OP, ba, y)?, 0, &pool)?;
+        let weights = self.rs_carried_of(OP, gates)?;
+        let carry = self.rs_carry(OP, &self.gdn_planes(OP, ba, y)?, weights, &pool)?;
         kernels_cuda::ssm::gated_delta_carried(
             self.ctx(),
             self.tensor(qkv),

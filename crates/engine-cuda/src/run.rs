@@ -1359,7 +1359,7 @@ impl<'c> Run<'c> {
             && self
                 .rs
                 .as_ref()
-                .is_some_and(|seat| seat.buffers.planes().step_gates(gates))
+                .is_some_and(|seat| seat.buffers.planes().step_gates(gates).is_some())
     }
 
     /// Value `id`'s buffered plane.
@@ -1414,6 +1414,7 @@ impl<'c> Run<'c> {
             lanes: tables.lanes,
             pages: tables.pages,
             replay_tok: tables.replay_tok,
+            replay_slot: tables.replay_slot,
             commit_len: pool.commit_len.ptr,
             scratch,
             page_tokens: tables.page_tokens.max(1),
@@ -1438,7 +1439,6 @@ impl<'c> Run<'c> {
         op: &'static str,
         id: ValueId,
     ) -> Result<u64, kernels_cuda::Error> {
-        let (_, scratch) = self.rs_seat_and_scratch(op)?;
         let own = self.tensor(id);
         let elem = poem_compiler::arena::elem_bytes(own.dtype).ok_or_else(|| {
             kernels_cuda::Error::Backend {
@@ -1446,8 +1446,21 @@ impl<'c> Run<'c> {
                 detail: format!("{:?} has no element size", own.dtype),
             }
         })?;
+        self.rs_carried_rows(op, id, u64::from(own.width) * elem)
+    }
+
+    /// A carried plane of rows `row_bytes` wide, landed for value `id`
+    /// ([`Run::rs_carried_of`]).
+    #[cfg(not(feature = "rocm"))]
+    pub(crate) fn rs_carried_rows(
+        &self,
+        op: &'static str,
+        id: ValueId,
+        row_bytes: u64,
+    ) -> Result<u64, kernels_cuda::Error> {
+        let (_, scratch) = self.rs_seat_and_scratch(op)?;
         let at = scratch
-            .carried_plane(u64::from(own.width) * elem)
+            .carried_plane(row_bytes)
             .map_err(|fault| Self::rs_fault(op, fault))?;
         scratch
             .carried_of

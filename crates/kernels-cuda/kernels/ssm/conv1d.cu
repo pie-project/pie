@@ -808,10 +808,10 @@ __global__ void conv1d_carried(
 }
 
 // `conv1d_carried` eight channels a thread, `conv1d_update_vec8`'s sums: a
-// dilation of one, at most eight taps. The window's `K` cells (the oldest
-// too, which the step keeps but never reads) are gathered from the state
-// and the carried rows, so the stored window is the one a fold a row would
-// store.
+// dilation of one, four taps. The window's four cells (the oldest too, which
+// the step keeps but never reads) are gathered from the state and the
+// carried rows, each carried row's page slot resolved once, so the stored
+// window is the one a fold a row would store.
 template <class T, bool SILU = true, bool RESIDUAL = false>
 __global__ void conv1d_carried_vec8(
     const T* __restrict__ x,
@@ -819,7 +819,7 @@ __global__ void conv1d_carried_vec8(
     const T* __restrict__ bias,
     StateRows rows,
     T* __restrict__ y,
-    int R, int C, int K,
+    int R, int C, int K_,
     bool write_state,
     const u8* __restrict__ write_state_mask,
     Carry carry,
@@ -829,8 +829,9 @@ __global__ void conv1d_carried_vec8(
     pdl_wait();
     pdl_launch();
     constexpr int VEC = 8;
-    constexpr int K_MAX = 8;
+    constexpr int K = 4;
     union Vec { uint4 raw; T e[VEC]; };
+    (void)K_;
 
     const int r = blockIdx.y;
     if (win != nullptr && r >= static_cast<int>(win[0])) return;
@@ -849,24 +850,6 @@ __global__ void conv1d_carried_vec8(
     const int cs = rows.atoms;
     const int ci = c0 % cs;
     T* state = rows.piece<T>(rid, c0 / cs);
-    const int span = K - 1;
-
-    Vec bv;
-    bv.raw = make_uint4(0u, 0u, 0u, 0u);
-    if (bias != nullptr) bv.raw = *reinterpret_cast<const uint4*>(bias + c0);
-    Vec wv[K_MAX];
-    const uint4* w = reinterpret_cast<const uint4*>(weight + (long long)c0 * K);
-    #pragma unroll
-    for (int t = 0; t < K_MAX; ++t) {
-        if (t < K) wv[t].raw = w[t];
-    }
-    const T* wflat = &wv[0].e[0];
-    // The committed window's cells, positions -K..-1, the newest last.
-    Vec hs[K_MAX];
-    #pragma unroll
-    for (int k = 0; k < K_MAX; ++k) {
-        if (k < K) hs[k].raw = *reinterpret_cast<const uint4*>(state + (long long)k * cs + ci);
-    }
     const int n = carry.carried(lane);
     const int commit = carry.commit(rl, n + 1);
     const bool fold = folds(write_state, write_state_mask, rl) && commit > 0;
@@ -875,10 +858,7 @@ __global__ void conv1d_carried_vec8(
     auto cell = [&](int t) {
         Vec v;
         if (t < 0) {
-            #pragma unroll
-            for (int k = 0; k < K_MAX; ++k) {
-                if (k == K + t) v = hs[k];
-            }
+            v.raw = *reinterpret_cast<const uint4*>(state + (long long)(K + t) * cs + ci);
         } else if (t < n) {
             v.raw = *reinterpret_cast<const uint4*>(carry.carried_row<T>(lane, t, 0) + c0);
         } else {
@@ -886,37 +866,39 @@ __global__ void conv1d_carried_vec8(
         }
         return v;
     };
-    // Position t's output from its window (cells t - K + 1 .. t).
-    auto step = [&](int t) {
-        Vec win_[K_MAX];
+    float wf[K][VEC];
+    {
+        const uint4* w = reinterpret_cast<const uint4*>(weight + (long long)c0 * K);
+        Vec wv[K];
         #pragma unroll
-        for (int k = 0; k < K_MAX; ++k) {
-            if (k < K) win_[k] = cell(t - (K - 1) + k);
-        }
-        float acc[VEC];
+        for (int t = 0; t < K; ++t) wv[t].raw = w[t];
+        const T* wflat = &wv[0].e[0];
         #pragma unroll
-        for (int u = 0; u < VEC; ++u) {
-            acc[u] = bias != nullptr ? Elem<T>::to_f32(bv.e[u]) : 0.f;
-        }
-        #pragma unroll
-        for (int k = 0; k < K_MAX - 1; ++k) {
-            if (k >= span) break;
+        for (int k = 0; k < K; ++k) {
             #pragma unroll
-            for (int u = 0; u < VEC; ++u) {
-                acc[u] += Elem<T>::to_f32(wflat[u * K + k]) * Elem<T>::to_f32(win_[k].e[u]);
-            }
+            for (int u = 0; u < VEC; ++u) wf[k][u] = Elem<T>::to_f32(wflat[u * K + k]);
         }
+    }
+    float bias_v[VEC];
+    {
+        Vec bv;
+        bv.raw = make_uint4(0u, 0u, 0u, 0u);
+        if (bias != nullptr) bv.raw = *reinterpret_cast<const uint4*>(bias + c0);
+        #pragma unroll
+        for (int u = 0; u < VEC; ++u) bias_v[u] = bias != nullptr ? Elem<T>::to_f32(bv.e[u]) : 0.f;
+    }
+    // Position t's output from its window (cells t - 3 .. t).
+    auto step = [&](int t) {
+        Vec h[K];
+        #pragma unroll
+        for (int k = 0; k < K; ++k) h[k] = cell(t - (K - 1) + k);
         Vec yv;
         #pragma unroll
         for (int u = 0; u < VEC; ++u) {
+            float acc = bias_v[u];
             #pragma unroll
-            for (int k = 0; k < K_MAX; ++k) {
-                if (k == span) {
-                    acc[u] += Elem<T>::to_f32(wflat[u * K + span]) * Elem<T>::to_f32(win_[k].e[u]);
-                    yv.e[u] = Elem<T>::from_f32(
-                        conv_out<SILU, RESIDUAL>(acc[u], Elem<T>::to_f32(win_[k].e[u])));
-                }
-            }
+            for (int k = 0; k < K; ++k) acc += wf[k][u] * Elem<T>::to_f32(h[k].e[u]);
+            yv.e[u] = Elem<T>::from_f32(conv_out<SILU, RESIDUAL>(acc, Elem<T>::to_f32(h[K - 1].e[u])));
         }
         return yv;
     };
@@ -934,14 +916,12 @@ __global__ void conv1d_carried_vec8(
         }
     }
     if (!fold) return;
-    Vec out[K_MAX];
+    Vec out[K];
     #pragma unroll
-    for (int k = 0; k < K_MAX; ++k) {
-        if (k < K) out[k] = cell(commit - K + k);
-    }
+    for (int k = 0; k < K; ++k) out[k] = cell(commit - K + k);
     #pragma unroll
-    for (int k = 0; k < K_MAX; ++k) {
-        if (k < K) *reinterpret_cast<uint4*>(state + (long long)k * cs + ci) = out[k].raw;
+    for (int k = 0; k < K; ++k) {
+        *reinterpret_cast<uint4*>(state + (long long)k * cs + ci) = out[k].raw;
     }
 }
 

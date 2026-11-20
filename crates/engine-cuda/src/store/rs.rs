@@ -22,10 +22,20 @@ pub struct Plane {
 pub struct Planes(
     HashMap<u32, Plane>,
     std::collections::HashSet<u32>,
-    std::collections::HashSet<u32>,
+    HashMap<u32, StepGates>,
     HashMap<u32, Corrected>,
-    HashMap<u32, (Plane, u32)>,
+    HashMap<u32, (Plane, u32, u32)>,
 );
+
+/// A decode step's gate prep, by its output: the step's `q k v` (whose keys
+/// and queries its buffered rows' attention weights are dotted against) and
+/// its key heads' count and width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StepGates {
+    pub qkv: ValueId,
+    pub k_heads: u32,
+    pub k_dim: u32,
+}
 
 /// A gated-delta layer's corrected planes (`ChunkProfile::rs_corrected`):
 /// each buffered row's keys (the conv output's key heads, bf16) and its
@@ -54,8 +64,8 @@ impl Planes {
     /// (A plane's value may be read by both forms of a layer, the two arms
     /// of one branch; the gates are each form's own.)
     #[must_use]
-    pub fn step_gates(&self, gates: ValueId) -> bool {
-        self.2.contains(&gates.0)
+    pub fn step_gates(&self, gates: ValueId) -> Option<StepGates> {
+        self.2.get(&gates.0).copied()
     }
 
     /// The corrected planes of the gated-delta recurrence landing `y`.
@@ -65,9 +75,10 @@ impl Planes {
     }
 
     /// Where a decode conv landing `y` (a gated-delta layer's `q k v`) lands
-    /// its row's keys: their plane, and the channel of `y` they start at.
+    /// its row's keys: their plane, the channel of `y` they start at, and a
+    /// key head's width.
     #[must_use]
-    pub fn keys_of(&self, y: ValueId) -> Option<(Plane, u32)> {
+    pub fn keys_of(&self, y: ValueId) -> Option<(Plane, u32, u32)> {
         self.4.get(&y.0).copied()
     }
 
@@ -288,6 +299,7 @@ enum Reads {
         y: ValueId,
         keys: u64,
         values: u64,
+        key_head: u32,
     },
     Kda {
         mixed: ValueId,
@@ -315,7 +327,7 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, Vec<u64>)
         }
 
         let mut planes: HashMap<u32, Plane> = HashMap::new();
-        let mut step_gates = std::collections::HashSet::new();
+        let mut step_gates = HashMap::new();
         let mut corrected = HashMap::new();
         let mut keys_of = HashMap::new();
         // The elements a token of each layer, prompt forms and step forms.
@@ -392,6 +404,7 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, Vec<u64>)
                         y: *y,
                         keys: u64::from(k_heads * k_dim),
                         values: u64::from(v_heads * v_dim),
+                        key_head: *k_dim,
                     },
                     true,
                 ),
@@ -411,6 +424,7 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, Vec<u64>)
                         y: *y,
                         keys: u64::from(k_heads * k_dim),
                         values: u64::from(v_heads * v_dim),
+                        key_head: *k_dim,
                     },
                     false,
                 ),
@@ -503,8 +517,25 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, Vec<u64>)
                     ),
                 });
             }
-            if let (Reads::GatedDelta { gates, .. }, false) = (reads, chunked) {
-                step_gates.insert(gates.0);
+            if let (
+                Reads::GatedDelta {
+                    gates,
+                    qkv,
+                    keys,
+                    key_head,
+                    ..
+                },
+                false,
+            ) = (reads, chunked)
+            {
+                step_gates.insert(
+                    gates.0,
+                    StepGates {
+                        qkv,
+                        k_heads: u32::try_from(keys).unwrap_or(0) / key_head.max(1),
+                        k_dim: key_head,
+                    },
+                );
             }
             let page = u64::from(paging);
             let layer = if chunked { layers } else { decode_layers };
@@ -524,7 +555,11 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, Vec<u64>)
             // The keys and corrected values after them, as the recipe's
             // rs row lays them (`rs_corrected`).
             if let Reads::GatedDelta {
-                y, keys, values, ..
+                y,
+                keys,
+                values,
+                key_head,
+                ..
             } = reads
             {
                 let k = Plane {
@@ -541,7 +576,7 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, Vec<u64>)
                 here += 2 * values;
                 corrected.insert(y.0, Corrected { k, u });
                 if let Reads::GatedDelta { qkv, .. } = reads {
-                    keys_of.insert(qkv.0, (k, u32::try_from(keys).unwrap_or(u32::MAX)));
+                    keys_of.insert(qkv.0, (k, u32::try_from(keys).unwrap_or(u32::MAX), key_head));
                 }
             }
             if chunked {

@@ -454,6 +454,7 @@ fn conv1d_carried(
     let rows = state.rows(op, state.conv_slab, state.conv_stride, channels)?;
     let vectors = channels % CONV_VEC == 0
         && dilation == 1
+        && conv_width == 4
         && rows.keeps(i64::from(CONV_VEC))
         && rows.atoms().is_multiple_of(CONV_VEC)
         && aligned16(x.ptr)
@@ -465,6 +466,16 @@ fn conv1d_carried(
         && carry.plane_off.iter().all(|off| off.is_multiple_of(16))
         && carry.plane_stride.iter().all(|stride| stride.is_multiple_of(16))
         && keys.is_none_or(|(off, len)| off % CONV_VEC == 0 && len % CONV_VEC == 0);
+    if keys.is_some() && !vectors {
+        return Err(refuse(
+            op,
+            format!(
+                "a gated-delta layer's decode conv lands its rows' keys eight channels a \
+                 thread, and this {channels}-channel, {conv_width}-tap conv \
+                 of dilation {dilation} takes the scalar step"
+            ),
+        ));
+    }
     let mut args = vec![
         x.arg(),
         weight.arg(),
