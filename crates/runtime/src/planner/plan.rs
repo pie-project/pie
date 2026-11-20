@@ -366,6 +366,9 @@ impl ResidencyPlanner {
         // pass: what it asks past its kv stands.
         let mut room_stood: Option<EntryKey> = None;
         loop {
+            // Each step reads the head's need afresh (the cache spans one
+            // step's reads: its own, the map's, the eviction's).
+            *self.need_cache.lock() = None;
             let (rs_free, rs_total) = self.port.rs_stats();
             let rs_growth = self.rs_growth();
             // What the device has free past the pages the head gathered:

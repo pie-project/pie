@@ -328,11 +328,30 @@ impl Inner {
                 .and_then(|proc| proc.evicted_for)
                 .is_some_and(|head| head != pid && unserved(head))
         };
+        // Evicted while it waited in the queue: held while any process
+        // ahead of it (older) has an entry in the queue.
+        let behind_queue = |pid: ProcessId| {
+            let Some(seq) = self
+                .procs
+                .get(&pid)
+                .filter(|proc| proc.evicted_queued)
+                .map(|proc| proc.seq)
+            else {
+                return false;
+            };
+            self.queue.values().any(|other| {
+                other.pid != pid
+                    && !matches!(other.kind, WaitKind::Restore { .. })
+                    && self.procs.get(&other.pid).is_some_and(|proc| proc.seq < seq)
+            })
+        };
         for (&key, waiter) in &self.queue {
             if !waiter.is_unmet() {
                 continue;
             }
-            if matches!(waiter.kind, WaitKind::Restore { .. }) && held_for_head(waiter.pid) {
+            if matches!(waiter.kind, WaitKind::Restore { .. })
+                && (held_for_head(waiter.pid) || behind_queue(waiter.pid))
+            {
                 continue;
             }
             match &waiter.kind {

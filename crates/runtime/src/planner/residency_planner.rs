@@ -35,6 +35,10 @@ const DEMOTE: ProcessId = ProcessId::max();
 
 pub struct ResidencyPlanner {
     pub(super) inner: parking_lot::Mutex<Inner>,
+    /// The head's need read this pass ([`Self::head_room`]), by the pass,
+    /// the head and the pages gathered: the step, the map, the wants and
+    /// the stall line read it once a pass, not once each.
+    pub(super) need_cache: parking_lot::Mutex<Option<(u64, EntryKey, u32, Option<RunNeed>)>>,
     pub(super) pause_due: AtomicBool,
     pub(super) nonresident: AtomicUsize,
     /// Room grants give back as they drop, the queue's length and the drain
@@ -117,6 +121,7 @@ impl ResidencyPlanner {
         })));
         Self {
             inner: parking_lot::Mutex::new(Inner::default()),
+            need_cache: parking_lot::Mutex::new(None),
             pause_due: AtomicBool::new(false),
             nonresident: AtomicUsize::new(0),
             returns,
@@ -739,7 +744,21 @@ impl ResidencyPlanner {
     /// the map asked less than the step took and moved no one. `None` for
     /// a head short of kv alone.
     pub(super) fn head_room(&self, key: EntryKey) -> Option<RunNeed> {
-        self.head_room_within(key, true)
+        // Read once a step of a pass: outside a pass (the wants published
+        // after it, a test, a report) it is read as it stands.
+        if !self.returns.planning.load(Ordering::Acquire) {
+            return self.head_room_within(key, true);
+        }
+        let pass = self.stats.plan_passes.load(Ordering::Relaxed);
+        let gathered = self.with_inner(|inner| inner.accum.len() as u32);
+        if let Some((at, head, pages, need)) = self.need_cache.lock().as_ref()
+            && (*at, *head, *pages) == (pass, key, gathered)
+        {
+            return need.clone();
+        }
+        let need = self.head_room_within(key, true);
+        *self.need_cache.lock() = Some((pass, key, gathered, need.clone()));
+        need
     }
 
     /// [`Self::head_room`], `capped` to the pool's state chunks or not:

@@ -492,16 +492,23 @@ impl ResidencyPlanner {
             // nothing: its resident slots are a victim's like any other's,
             // whatever its rank or the head's seating (the M1 on 3b45462d4:
             // 138 queued, 364 opened chunks, no candidate holding one).
-            let quiet = inner.nothing_in_flight();
-            let waiting: HashSet<ProcessId> = if quiet {
-                inner
-                    .queue
-                    .values()
-                    .filter(|waiter| waiter.is_unmet())
-                    .map(|waiter| waiter.pid)
-                    .collect()
-            } else {
-                HashSet::new()
+            // Read once for every member, each only where some member
+            // needs it: per member, the anti-thrash rule's own reads (the
+            // queue, then every process) cost a pass tenfold.
+            let quiet_cell = std::cell::OnceCell::new();
+            let quiet = || *quiet_cell.get_or_init(|| inner.nothing_in_flight());
+            let waiting_cell = std::cell::OnceCell::<HashSet<ProcessId>>::new();
+            let queued = |pid: &ProcessId| {
+                waiting_cell
+                    .get_or_init(|| {
+                        inner
+                            .queue
+                            .values()
+                            .filter(|waiter| waiter.is_unmet())
+                            .map(|waiter| waiter.pid)
+                            .collect()
+                    })
+                    .contains(pid)
             };
             let members = inner
                 .procs
@@ -518,7 +525,10 @@ impl ResidencyPlanner {
                         // Waiting at a bind for room, it makes no progress
                         // until room comes: it yields as an idle one does,
                         // to a prompt not yet seated too.
-                        && if waiting.contains(*pid) {
+                        // With nothing in flight no resident runs: any is a
+                        // victim, queued or not (the L40S on 22b0a3e83:
+                        // "running" processes holding chunks, none firing).
+                        && if quiet() {
                             true
                         } else if seating {
                             proc.idle || proc.held || proc.bind_waiting
@@ -532,7 +542,8 @@ impl ResidencyPlanner {
                         // Restored or bound for a waiting head and not
                         // fired since: never moved back before it runs,
                         // while it can run.
-                        && !inner.unfired_protects(**pid)
+                        // ([`Inner::unfired_protects`], its reads shared.)
+                        && !(proc.unfired && !queued(*pid) && !quiet())
                         && !inner.host_swap_blocked.contains(*pid)
                         && !inner.prepare_blocked.contains(*pid)
                         // Being failed: it frees its pages as it ends.
@@ -548,7 +559,7 @@ impl ResidencyPlanner {
                         || proc.idle
                         || proc.held
                         || proc.bind_waiting
-                        || waiting.contains(pid),
+                        || quiet(),
                 })
                 .collect();
             Some((
@@ -597,6 +608,13 @@ impl ResidencyPlanner {
                 Some((key, waiter)) if key == head_key => (key.0, waiter.pid),
                 _ => return (wake, spawned),
             };
+            let quiet = inner.nothing_in_flight();
+            let queued: HashSet<ProcessId> = inner
+                .queue
+                .values()
+                .filter(|waiter| waiter.is_unmet() && !matches!(waiter.kind, WaitKind::Restore { .. }))
+                .map(|waiter| waiter.pid)
+                .collect();
             for (pid, expected) in picks {
                 let Some(proc) = inner.procs.get(&pid) else {
                     continue;
@@ -605,7 +623,11 @@ impl ResidencyPlanner {
                 // yields as an idle one does, as the victim set chose it
                 // (dropped here, it was chosen again on every quote and
                 // nothing moved: AMD's wedge).
-                let yields = proc.idle || proc.held || proc.bind_waiting;
+                // So does one waiting in the queue with nothing in flight
+                // (the victim set's rule; dropped here, the queued-victim
+                // change never took: the L40S on 22b0a3e83).
+                let waits = queued.contains(&pid);
+                let yields = proc.idle || proc.held || proc.bind_waiting || quiet;
                 if proc.state != Residency::Resident
                     || inner.unfired_protects(pid)
                     || (proc.rank() <= head_rank && !yields)
@@ -614,9 +636,12 @@ impl ResidencyPlanner {
                     continue;
                 }
                 wake.extend(inner.begin_eviction(pid, expected));
-                // Evicted for this head: not restored while it waits.
+                // Evicted for this head: not restored while it waits. And
+                // evicted while it waited in the queue: restored only once
+                // nothing ahead of it waits ([`Inner::unmet_head`]).
                 if let Some(proc) = inner.procs.get_mut(&pid) {
                     proc.evicted_for = Some(head_pid);
+                    proc.evicted_queued = waits;
                 }
                 spawned.push(pid);
             }

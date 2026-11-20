@@ -3325,7 +3325,12 @@ fn a_process_waiting_at_a_bind_yields_to_a_prompt_not_yet_seated() {
         planner.note_admitted(pid);
     }
     planner.with_inner(|inner| {
-        inner.procs.get_mut(&waiting).unwrap().seated = true;
+        let proc = inner.procs.get_mut(&waiting).unwrap();
+        proc.seated = true;
+        // Mid-decode: a fire of its in flight (with none anywhere, every
+        // resident is a victim).
+        proc.fires = 1;
+        proc.fired_at = crate::rt::Instant::now();
         inner.enqueue(
             prompt,
             allocation(Demand {
@@ -8188,4 +8193,71 @@ async fn fire_landings_plan_no_pass_for_a_head_refused_on_room_unmoved() {
         planner.stats.plan_passes.load(Ordering::Relaxed) > passes + more,
         "room moved: planned"
     );
+}
+
+/// The L40S on 46296784b: four binds queued (seq 10 to 13), the youngest
+/// evicted while it waited, restored for its own bind while the binds of 11
+/// and 12 ahead of it still waited, and evicted for them again 1,730 times
+/// (rs disk churn: 256,939 copies out). A process evicted while it waited
+/// in the queue is restored only once no process ahead of it has an entry
+/// there.
+#[test]
+fn a_process_evicted_while_queued_is_restored_only_behind_the_queue_ahead_of_it() {
+    let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::new(8))));
+    let pids: Vec<ProcessId> = (0..4).map(|_| ProcessId::new_v4()).collect();
+    for &pid in &pids {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    let bind = || WaitKind::BindRoom {
+        run: 1,
+        pieces: 1,
+        pages: 1,
+        notify: Arc::new(Notify::new()),
+        served: false,
+        withdrawn: false,
+        rise: None,
+    };
+    let youngest = pids[3];
+    let keys = planner.with_inner(|inner| {
+        let keys: Vec<EntryKey> = pids[..3].iter().map(|&pid| inner.enqueue(pid, bind())).collect();
+        let proc = inner.procs.get_mut(&youngest).unwrap();
+        proc.state = Residency::Evicted;
+        proc.evicted_queued = true;
+        inner.enqueue(
+            youngest,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        );
+        keys
+    });
+    let head_pid = |planner: &ResidencyPlanner| {
+        planner.with_inner(|inner| inner.unmet_head().map(|(_, waiter)| waiter.pid))
+    };
+    // The oldest's bind served and not yet taken, the next two waiting.
+    planner.with_inner(|inner| {
+        if let Some(super::wait::Waiter {
+            kind: WaitKind::BindRoom { served, .. },
+            ..
+        }) = inner.queue.get_mut(&keys[0])
+        {
+            *served = true;
+        }
+    });
+    assert_eq!(head_pid(&planner), Some(pids[1]), "the binds ahead of it go first");
+    planner.with_inner(|inner| {
+        for key in &keys[1..] {
+            inner.queue.remove(key);
+        }
+    });
+    assert_ne!(
+        head_pid(&planner),
+        Some(youngest),
+        "the oldest's served bind not yet taken: still held"
+    );
+    planner.with_inner(|inner| {
+        inner.queue.remove(&keys[0]);
+    });
+    assert_eq!(head_pid(&planner), Some(youngest), "nothing ahead of it: restored");
 }

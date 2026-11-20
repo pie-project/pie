@@ -106,6 +106,11 @@ pub(super) struct Proc {
     /// back to its bind's runs and its own, and the run of nine its unpark
     /// was refused was never asked of the map (Mac Pro on 22b0a3e83).
     pub(super) roles_refused: Option<(u32, u32)>,
+    /// Evicted while it waited in the queue: its restore goes only once no
+    /// process ahead of it (older) has an entry in the queue. Restored for
+    /// its own queued bind while the binds ahead of it still waited, it was
+    /// evicted for them again, 1,730 times (the L40S on 46296784b).
+    pub(super) evicted_queued: bool,
     /// Refused while the map showed runs of its need standing that its
     /// unpark did not see: `(map's free runs, the refusal's)`, for the
     /// census, so the need is fixed rather than the retry.
@@ -208,6 +213,7 @@ impl Proc {
             roles_short_runs: None,
             roles_short_free: None,
             roles_refused: None,
+            evicted_queued: false,
             roles_short_mismatch: None,
             bind_room: None,
             unfired: false,

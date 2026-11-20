@@ -165,6 +165,7 @@ impl ResidencyPlanner {
             proc.roles_short_runs = None;
             proc.roles_short_free = None;
             proc.roles_refused = None;
+            proc.evicted_queued = false;
             proc.roles_short_mismatch = None;
             // Back with room for it: the bind goes again.
             proc.bind_room = None;
