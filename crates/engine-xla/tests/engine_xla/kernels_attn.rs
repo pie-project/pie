@@ -222,12 +222,29 @@ impl Pool {
             values,
             page_indices,
             page_indptr,
+            page_table: None,
             page_size: self.ps as i32,
             max_pages: self.max_pages,
             seq_stride: w as u64,
             head_stride: self.d as u64,
             keys_map: self.keys_map,
             values_map: self.values_map,
+        }
+    }
+}
+
+impl Pool {
+    /// [`Pool::bind`] with the page table also laid dense, a row of
+    /// `max_pages` a lane, the rest of each row `sink` (as serve lays it).
+    fn bind_dense(&self, b: &mut Bench, sink: i32) -> KvPool {
+        let mut table = vec![sink; self.lanes.len() * self.max_pages as usize];
+        for (l, pages) in self.lanes.iter().enumerate() {
+            let at = l * self.max_pages as usize;
+            table[at..at + pages.len()].copy_from_slice(pages);
+        }
+        KvPool {
+            page_table: Some(b.i32(table.len() as u32, 1, &table)),
+            ..self.bind(b)
         }
     }
 }
@@ -2927,5 +2944,263 @@ fn a_wide_lanes_causal_windowed_rows_read_no_later_key() {
     assert!(
         (0..rows).filter(|&r| early(r)).any(|r| !same(&before, &before_twin, r)),
         "flag 2 and a plane of ones read the later key"
+    );
+}
+
+/// One mixed fire's attention a layer, as a mixed program lays it: `b`
+/// rows; a prompt of `prompt` fresh rows and the rest lane (fresh rows to
+/// the decode window) through the prefill walk; `decodes` lanes of 512
+/// held keys and a row each, then `window - decodes` slots with no keys
+/// (position -1, the sink page), through the decode walk; the append over
+/// every row. `layers` pools over one page table. Device ms a run.
+fn mixed_layout_case(b: usize, prompt: usize, decodes: usize, window: usize, layers: usize) -> f64 {
+    let mut rng = Rng(23);
+    let (qh, kvh, d, ps) = (16usize, 8usize, 128usize, 16usize);
+    let held = 512usize;
+    let rest = b - window - prompt;
+    let mut next = 0i32;
+    let mut take = |n: usize| -> Vec<i32> {
+        let pages = n.div_ceil(ps).max(1) as i32;
+        let l = (next..next + pages).collect();
+        next += pages;
+        l
+    };
+    let mut lanes: Vec<Vec<i32>> = vec![take(prompt), take(rest)];
+    for _ in 0..decodes {
+        lanes.push(take(held + 1));
+    }
+    // the empty slots' lanes hold no page
+    lanes.extend(std::iter::repeat_n(Vec::new(), window - decodes));
+    let max_pages = (lanes.iter().map(Vec::len).max().unwrap() as u32)
+        .max(16)
+        .next_power_of_two();
+    let pool = Pool::new(
+        &mut rng,
+        ps,
+        kvh,
+        d,
+        next as usize + 1,
+        lanes.clone(),
+        max_pages,
+    );
+    let sink = next;
+    let mut runs: Vec<(i32, i32, i32)> = vec![(0, 0, prompt as i32), (1, 0, rest as i32)];
+    runs.extend((0..decodes).map(|i| (2 + i as i32, held as i32, 1)));
+    let mut rows: Vec<(i32, i32)> = prefill_rows(&runs, 0);
+    rows.extend((0..window - decodes).map(|i| ((2 + decodes + i) as i32, -1)));
+    assert_eq!(rows.len(), b);
+    let kv_len: Vec<i32> = (0..lanes.len())
+        .map(|l| match l {
+            0 => prompt as i32,
+            1 => rest as i32,
+            l if l < 2 + decodes => held as i32 + 1,
+            _ => 0,
+        })
+        .collect();
+    let w = kvh * d;
+    let (page, off): (Vec<i32>, Vec<i32>) = rows
+        .iter()
+        .map(|&(lane, kp)| {
+            if kp < 0 {
+                (sink, 0)
+            } else {
+                let slot = pool.slot(lane as usize, kp as usize);
+                ((slot / ps) as i32, (slot % ps) as i32)
+            }
+        })
+        .unzip();
+    let split = prompt + rest;
+    let window_fire = |from: usize, to: usize| {
+        let mut f = Fire::plain(&rows[from..to]);
+        f.kv_len = kv_len.clone();
+        f
+    };
+    let (pf, df) = (window_fire(0, split), window_fire(split, b));
+    let q = rng.bf16s(b * qh * d, 1.0);
+    let k = rng.bf16s(b * w, 1.0);
+    let v = rng.bf16s(b * w, 1.0);
+    let mut tuning = kernels_xla::tuning::Tuning::DEFAULT;
+    tuning.chunks.block_rows = 256;
+    tuning.chunks.decode_pages = 64;
+    let mut bench = Bench::new().with_tuning(tuning);
+    let first = pool.bind(&mut bench);
+    let pools: Vec<KvPool> = (0..layers)
+        .map(|i| {
+            if i == 0 {
+                first
+            } else {
+                KvPool {
+                    page_indices: first.page_indices,
+                    page_indptr: first.page_indptr,
+                    ..pool.bind(&mut bench)
+                }
+            }
+        })
+        .collect();
+    let wq = (qh * d) as u32;
+    let (kt, vt) = (
+        bench.bf16(b as u32, w as u32, &k),
+        bench.bf16(b as u32, w as u32, &v),
+    );
+    let pt = bench.i32(b as u32, 1, &page);
+    let ot = bench.i32(b as u32, 1, &off);
+    let qp = bench.bf16(split as u32, wq, &q[..split * qh * d]);
+    let qd = bench.bf16(window as u32, wq, &q[split * qh * d..]);
+    let qr = ragged(&mut bench, &runs[..2], qp);
+    let plan_p = pf.prefill(&mut bench);
+    let plan_d = df.decode(&mut bench);
+    let outs: Vec<(Tensor, Tensor)> = (0..layers)
+        .map(|_| {
+            (
+                bench.zeros(Dtype::Bf16, split as u32, wq),
+                bench.zeros(Dtype::Bf16, window as u32, wq),
+            )
+        })
+        .collect();
+    let donated: Vec<Tensor> = pools.iter().flat_map(|p| [p.keys, p.values]).collect();
+    let secs = bench
+        .time_pipelined_in_place(50, &donated, |ctx| {
+            for (kv, &(op, od)) in pools.iter().zip(&outs) {
+                let read = low::kv_append(ctx, kt, vt, kv, pt, ot)?;
+                // `PIE_XLA_LAYOUT_ONLY=prefill|decode`: one window's walk
+                let only = std::env::var("PIE_XLA_LAYOUT_ONLY").ok();
+                if only.as_deref() != Some("decode") {
+                    let call =
+                        arbiter::prefill(qr, &plan_p, kv, None, d as u32, kvh as u32, 0.1, op, 1)?;
+                    low::attend_fresh(ctx, call, *kv, read)?;
+                }
+                if only.as_deref() != Some("prefill") {
+                    low::attend(
+                        ctx,
+                        attn::decode(qd, &plan_d, None, d as u32, 0.1, od)?,
+                        *kv,
+                    )?;
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+    secs.map_or(f64::NAN, |s| s * 1e3)
+}
+
+/// `PIE_XLA_LAYOUT_BENCH=1`: a mixed fire's attention over 4 layers, as
+/// today's rung layout lays it (the decode window the decodes' rung, the
+/// rest lane to the bucket) and as a fixed one does (the decode window at
+/// the decode capacity, its unused slots keyless).
+#[test]
+fn a_mixed_layout_is_timed() {
+    if std::env::var_os("PIE_XLA_LAYOUT_BENCH").is_none() {
+        return;
+    }
+    // `PIE_XLA_LAYOUT_WINDOWS`: the decode windows timed beside the rung's
+    let windows: Vec<usize> = std::env::var("PIE_XLA_LAYOUT_WINDOWS")
+        .ok()
+        .map(|v| v.split(',').map(|w| w.parse().unwrap()).collect())
+        .unwrap_or_else(|| vec![64]);
+    for b in [512usize, 2048] {
+        let prompt = b / 2;
+        for decodes in [1usize, 8, 64] {
+            let rung = decodes.next_power_of_two();
+            let today = mixed_layout_case(b, prompt, decodes, rung, 4);
+            let mut line = format!("LAYOUT b={b} decodes={decodes}: rung {rung} {today:.4} ms");
+            for &w in windows.iter().filter(|&&w| w >= decodes && w != rung) {
+                let t = mixed_layout_case(b, prompt, decodes, w, 4);
+                line += &format!(
+                    " | window {w} {t:.4} ms ({:+.1}%)",
+                    (t / today - 1.0) * 100.0
+                );
+            }
+            eprintln!("{line}");
+        }
+    }
+}
+
+/// A page table the host lays dense (`KvPool::page_table`) reads the same
+/// pages the device gathers from the CSR table: a decode through the
+/// page-copy kernel and a prompt through the flash kernel answer the same
+/// bits either way, over identity and mapped planes.
+#[test]
+fn a_dense_page_table_answers_what_the_gathered_one_does() {
+    for maps in [IDENTITY, MAPPED] {
+        dense_case(maps);
+    }
+}
+
+fn dense_case(maps: (PageMap, PageMap)) {
+    let mut rng = Rng(61);
+    let (qh, kvh, d, ps) = (16usize, 8usize, 128usize, 16usize);
+    // lane 0 a 448-row prompt, then 64 decodes of 300 held keys and a row
+    let mut lanes: Vec<Vec<i32>> = vec![(0..28).collect()];
+    let mut next = 28;
+    for l in 0..64 {
+        let n = 19 + l % 3;
+        lanes.push((next..next + n).collect());
+        next += n;
+    }
+    let pool = Pool::new(&mut rng, ps, kvh, d, next as usize + 1, lanes, 32).with_maps(maps);
+    let sink = next;
+    let w = kvh * d;
+    let wq = (qh * d) as u32;
+    let mut tuning = kernels_xla::tuning::Tuning::DEFAULT;
+    tuning.chunks.block_rows = 256;
+    tuning.chunks.decode_pages = 64;
+    let mut b = Bench::new().with_tuning(tuning);
+    let (gathered, dense) = (pool.bind(&mut b), pool.bind_dense(&mut b, sink));
+    // the prompt, through the flash kernel, its rows appended fresh
+    let runs = [(0, 0, 448)];
+    let mut prompt = Fire::plain(&prefill_rows(&runs, 0));
+    prompt.kv_len = (0..65).map(|l| if l == 0 { 448 } else { 300 }).collect();
+    let rows = prompt.positions.len();
+    let page: Vec<i32> = (0..rows).map(|i| (pool.slot(0, i) / ps) as i32).collect();
+    let off: Vec<i32> = (0..rows).map(|i| (i % ps) as i32).collect();
+    let q = rng.bf16s(rows * qh * d, 1.0);
+    let (k, v) = (rng.bf16s(rows * w, 1.0), rng.bf16s(rows * w, 1.0));
+    let plan = prompt.prefill(&mut b);
+    let qt = b.bf16(rows as u32, wq, &q);
+    let qr = ragged(&mut b, &runs, qt);
+    let (kt, vt) = (
+        b.bf16(rows as u32, w as u32, &k),
+        b.bf16(rows as u32, w as u32, &v),
+    );
+    let (pt, ot) = (b.i32(rows as u32, 1, &page), b.i32(rows as u32, 1, &off));
+    // the decodes, through the page-copy kernel
+    let decodes = Fire::plain(&(1..65).map(|l| (l, 299)).collect::<Vec<_>>());
+    let dplan = decodes.decode(&mut b);
+    let dq = rng.bf16s(64 * qh * d, 1.0);
+    let dqt = b.bf16(64, wq, &dq);
+    let outs: Vec<Tensor> = (0..4)
+        .map(|i| b.zeros(Dtype::Bf16, if i < 2 { rows as u32 } else { 64 }, wq))
+        .collect();
+    if !b
+        .run(|ctx| {
+            for (pool, o) in [(gathered, outs[0]), (dense, outs[1])] {
+                let read = low::kv_append(ctx, kt, vt, &pool, pt, ot)?;
+                let call =
+                    arbiter::prefill(qr, &plan, &pool, None, d as u32, kvh as u32, 0.1, o, 1)?;
+                low::attend_fresh(ctx, call, pool, read)?;
+            }
+            for (pool, o) in [(gathered, outs[2]), (dense, outs[3])] {
+                low::attend(
+                    ctx,
+                    attn::decode(dqt, &dplan, None, d as u32, 0.1, o)?,
+                    pool,
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap()
+    {
+        return;
+    }
+    let bits = |t: Tensor| -> Vec<u32> { b.read_f32(t).iter().map(|x| x.to_bits()).collect() };
+    assert_eq!(
+        bits(outs[0]),
+        bits(outs[1]),
+        "the prompt read other pages through the dense table"
+    );
+    assert_eq!(
+        bits(outs[2]),
+        bits(outs[3]),
+        "the decodes read other pages through the dense table"
     );
 }

@@ -218,6 +218,12 @@ pub struct KvPool<T> {
 
     pub page_indptr: T,
 
+    /// The fire's page table laid dense by the host where it is (`[lanes ·
+    /// max_pages]` i32, lane `l`'s pages from `l · max_pages`, the rest of
+    /// each row the sink page): the paged walks read it in place of
+    /// gathering it from `page_indices` on the device (`paged::geometry`).
+    pub page_table: Option<T>,
+
     pub page_size: i32,
 
     /// The most pages any lane of this fire holds, rounded up to the fire's

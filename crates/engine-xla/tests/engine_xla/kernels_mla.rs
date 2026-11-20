@@ -238,6 +238,7 @@ impl Pool {
             values,
             page_indices: b.i32(indices.len() as u32, 1, &indices),
             page_indptr: b.i32(indptr.len() as u32, 1, &indptr),
+            page_table: None,
             page_size: self.ps as i32,
             max_pages: self.max_pages,
             seq_stride: self.rank as u64,

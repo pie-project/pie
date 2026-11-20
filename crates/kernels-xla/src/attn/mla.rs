@@ -411,6 +411,10 @@ impl<T: Stored> MlaCall<T> {
         let roped = self.heads != 0 && self.q_pe.width() / self.heads != 0;
         let page_indptr = read(pool.page_indptr)?;
         let page_indices = read(pool.page_indices)?;
+        let page_table = match pool.page_table {
+            Some(t) => Some(read(t)?),
+            None => None,
+        };
         let positions = read(self.positions)?;
         let request_of_token = read(self.request_of_token)?;
         let q = read(self.q)?;
@@ -440,6 +444,7 @@ impl<T: Stored> MlaCall<T> {
                 values,
                 page_indices,
                 page_indptr,
+                page_table,
                 page_size: pool.page_size,
                 max_pages: pool.max_pages,
                 seq_stride: pool.seq_stride,

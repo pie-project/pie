@@ -98,6 +98,9 @@ fn map_of(layout: &Layout, shape: &layout::Shape, plane: &Plane) -> Map {
 pub struct TableSeat {
     pub page_indptr: Tensor,
     pub page_indices: Tensor,
+    /// The same pages laid dense, a row of `max_pages` a lane
+    /// (`KvPool::page_table`).
+    pub page_table: Tensor,
     pub max_pages: u32,
 }
 
@@ -1501,6 +1504,7 @@ impl Pools {
                         values: values.0,
                         page_indices: at.page_indices,
                         page_indptr: at.page_indptr,
+                        page_table: Some(at.page_table),
                         page_size: i32::try_from(self.paging.page_size).unwrap_or(i32::MAX),
                         max_pages: at.max_pages,
                         seq_stride: u64::from(kv_heads) * u64::from(head_dim),

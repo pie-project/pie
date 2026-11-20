@@ -184,6 +184,20 @@ pub(crate) fn geometry(
     ps: i64,
     pages: i64,
 ) -> Built<Geom> {
+    let mut geom = geometry_counts(f, indptr, ps, pages)?;
+    let lanes = geom.lanes;
+    let start = f.slice(indptr, &[0], &[lanes], &[1])?;
+    let p = f.iota(Elem::I32, &[lanes, pages], 1);
+    let s = f.broadcast(start, &[lanes, pages], &[0])?;
+    let at = f.add(s, p)?;
+    let pt = take(f, indices, at)?;
+    geom.pt = f.reshape(pt, &[lanes * pages])?;
+    Ok(geom)
+}
+
+/// [`geometry`] but for its table (`pt` left the indptr): each lane's page
+/// count, the fire's lanes and spans.
+fn geometry_counts(f: &mut Func, indptr: Val, ps: i64, pages: i64) -> Built<Geom> {
     let lanes = f.dims(indptr)[0] - 1;
     // A key's place over the fire is `lane · span + position`, an i32.
     if lanes * pages * ps > i64::from(i32::MAX) {
@@ -198,17 +212,12 @@ pub(crate) fn geometry(
     let start = f.slice(indptr, &[0], &[lanes], &[1])?;
     let end = f.slice(indptr, &[1], &[lanes + 1], &[1])?;
     let count = f.sub(end, start)?;
-    let p = f.iota(Elem::I32, &[lanes, pages], 1);
-    let s = f.broadcast(start, &[lanes, pages], &[0])?;
-    let at = f.add(s, p)?;
-    let pt = take(f, indices, at)?;
-    let pt = f.reshape(pt, &[lanes * pages])?;
     Ok(Geom {
         lanes,
         pages,
         ps,
         span: pages * ps,
-        pt,
+        pt: indptr,
         count,
     })
 }
@@ -1795,14 +1804,25 @@ pub(crate) fn pool_paging(op: &'static str, pool: &KvPool<impl Stored>) -> Resul
 /// Reads the pool's paging into a dense page table.
 pub(crate) fn read_geometry(f: &mut Func, pool: &KvPool<Operand>) -> Result<Geom, Error> {
     let indptr = flat_i32(f, pool.page_indptr.val)?;
-    let indices = flat_i32(f, pool.page_indices.val)?;
-    Ok(geometry(
-        f,
-        indptr,
-        indices,
-        i64::from(pool.page_size),
-        i64::from(pool.max_pages),
-    )?)
+    let (ps, pages) = (i64::from(pool.page_size), i64::from(pool.max_pages));
+    let Some(table) = pool.page_table else {
+        let indices = flat_i32(f, pool.page_indices.val)?;
+        return Ok(geometry(f, indptr, indices, ps, pages)?);
+    };
+    // The host laid the table dense: the walks read it as it lies.
+    let lanes = f.dims(indptr)[0] - 1;
+    if table.elements() != u64::try_from(lanes * pages).unwrap_or(u64::MAX) {
+        return Err(refuse(
+            "paged attention",
+            format!(
+                "a dense page table of {} entries for {lanes} lanes of {pages} pages",
+                table.elements()
+            ),
+        ));
+    }
+    let mut geom = geometry_counts(f, indptr, ps, pages)?;
+    geom.pt = flat_i32(f, table.val)?;
+    Ok(geom)
 }
 
 /// A per-row i32 table cut to the fire's `r` rows.
@@ -1873,6 +1893,10 @@ impl<T: Stored> Paged<T> {
     ) -> Result<(Paged<O, Landing>, KvPool<O>), E> {
         let page_indptr = read(pool.page_indptr)?;
         let page_indices = read(pool.page_indices)?;
+        let page_table = match pool.page_table {
+            Some(t) => Some(read(t)?),
+            None => None,
+        };
         let positions = read(self.tables.positions)?;
         let request_of_token = read(self.tables.request_of_token)?;
         let masks = if self.masked {
@@ -1926,6 +1950,7 @@ impl<T: Stored> Paged<T> {
                 values,
                 page_indices,
                 page_indptr,
+                page_table,
                 page_size: pool.page_size,
                 max_pages: pool.max_pages,
                 seq_stride: pool.seq_stride,

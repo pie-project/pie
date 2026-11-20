@@ -129,6 +129,7 @@ fn kv_pool(b: &mut Bench, keys: Tensor) -> KvPool {
         values: keys,
         page_indices: pi,
         page_indptr: pp,
+        page_table: None,
         page_size: PS as i32,
         max_pages: 3,
         seq_stride: u64::from(keys.width),

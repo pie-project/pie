@@ -2721,11 +2721,24 @@ impl Shell {
             let padded = (lane_count as usize) * (max_pages as usize);
             let sink = if in_window { window_sink } else { sink_page };
             indices.resize(padded.max(indices.len()), sink as i32);
+            // The same pages a row of `max_pages` a lane, the rest of each
+            // row the sink: the paged walks read it as it lies, not
+            // gathered on the device (v6e: 6-9 ns an entry, once a fire).
+            let mut table = vec![sink as i32; padded];
+            for (lane, run) in g.indptr.windows(2).enumerate().take(lane_count as usize) {
+                let (from, to) = (run[0].max(0) as usize, run[1].max(0) as usize);
+                let row = &g.indices[from.min(g.indices.len())..to.min(g.indices.len())];
+                let at = lane * max_pages as usize;
+                let n = row.len().min(max_pages as usize);
+                table[at..at + n].copy_from_slice(&row[..n]);
+            }
             let indptr = inputs.i32s(handles, &g.indptr, 1);
             let indices = inputs.i32s(handles, &indices, 1);
+            let table = inputs.i32s(handles, &table, 1);
             table_seats.push(TableSeat {
                 page_indptr: indptr,
                 page_indices: indices,
+                page_table: table,
                 max_pages,
             });
             geometry.push(CacheGeometry {

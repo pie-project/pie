@@ -22,6 +22,7 @@ fn kv_pool(b: &mut Bench, keys: Tensor) -> KvPool {
         values: keys,
         page_indices: b.i32(indices.len() as u32, 1, &indices),
         page_indptr: b.i32(3, 1, &[0, 3, 5]),
+        page_table: None,
         page_size: PS as i32,
         max_pages: 3,
         seq_stride: u64::from(keys.width),

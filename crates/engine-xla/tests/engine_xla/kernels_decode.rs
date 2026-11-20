@@ -221,6 +221,7 @@ fn a_pooled_reader_whose_bound_closes_no_block_reads_nothing() {
         values: keys,
         page_indices: b.u32(3, 1, &[0, 1, 2]),
         page_indptr: b.u32(2, 1, &[0, 3]),
+        page_table: None,
         page_size: ps as i32,
         max_pages: 3,
         seq_stride: hd as u64,
