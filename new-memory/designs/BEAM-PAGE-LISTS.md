@@ -104,18 +104,24 @@ rs buffer, on the same pool pages as its kv slots.
     fired          u32   fires run; 0 until the first fire primes
     pool           u32   the pool's pages at the last fire
 
-It lives in the instance's **per-bind scratch**, sized by the engine's
-`guest_state(program, extents)` from the bind's `key_len` (`end`, §3), never
-in the per-program instance item (one program binds searches of many
-depths): `B*P*4 + (F + 1)*ceil(Q/32)*4 + 16` bytes, by the engine's bounds on
-`P` and `Q` (`Q <= B P + B (F + 1) + 1`; an engine may hold a word where a
-bit is stated, and may keep two copies of `map` to reorder in place). That
-scratch is priced in the ledger at the bind like any guest slot, is a
-declared part of the instance's state that the roles move (it parks and
-restores with the set), and stands from the bind to the search's finish:
-it is cleared once, at the bind, and no fire writes it but the head step.
-engine-cuda lays it past the lane's value scratch in the instance's scratch
-item; engine-gpu, Metal and XLA keep it in the same per-bind place. It is one copy, device-owned, changed
+It is the instance's **resident state** (`engine::GuestState::resident`),
+sized by the engine's `guest_state(program, extents)` from the bind's
+`key_len` (`end`, §3), never in the per-program instance item (one program
+binds searches of many depths): `B*P*4 + (F + 1)*ceil(Q/32)*4 + 16` bytes, by
+the engine's bounds on `P` and `Q` (`Q <= B P + B (F + 1) + 1`; an engine may
+hold a word where a bit is stated, and may keep two copies of `map` to
+reorder in place). The runtime takes it at the bind as a live part of the
+instance: one run of adjacent `Instance` slots, at most a chunk (past one the
+bind is refused by name), priced in the ledger at the bind like any guest
+slot and named to the engine as `InstanceBinding::resident`. It is not the
+guest's scratch, which is dead between fires and given back on a park. A
+park copies the resident run wherever the instance's tables go (the host,
+else the disk tier's slot file) and the unpark copies it back into fresh
+device slots, named in `Rebind::Instance::resident`; the engine clears it
+once, at the bind, follows it to wherever a rebind names, and clears nothing
+there. So it stands from the bind to the search's finish. engine-cuda lays
+the group's state at the start of that run; engine-gpu, Metal and XLA state
+the same bytes as resident and read them where the binding names. It is one copy, device-owned, changed
 only by head kernels in queue order: never part of what an engine
 double-buffers for fires in flight, and never touched by staging a later
 fire on the host. It is pool-relative: it never names a physical page, so
@@ -260,8 +266,19 @@ widths 2, 4, 8; at least `3S` steps from a `folded` with `tail > 0` and one
 with `tail == 0`; parents drawn with forks (repeated parents) and
 retirements (beams no child continues). After every step the device's
 `map` (columns `<= c`), `free`, `pending`, the copies it made and the
-resolved table entries equal the replay's; and a run suspended and restored
-mid-search continues with beams identical to an unsuspended run.
+resolved table entries equal the replay's.
+
+Parked mid-search: the runtime's roles take the resident run live (the
+roles test: with a host tier and with none, a parked instance's resident run
+is copied out whole, copied back from where it went into a fresh run that is
+neither its old one nor another instance's, the engine told that run, and
+nothing of the scratch copied). Served, the `test-pause` worker policy
+pauses a process from `pause-at-ms` after its arrival: beam `--verify` at
+width 4 over 256 steps, paused inside the search (MI300X Qwen3-0.6B: +200,
++300 and +450 ms; one process and four at once; a host tier, and a pool
+with none whose disk tier holds it) finishes verified, its resident run back
+in other slots each time. The same pause with the state in the scratch, or
+with its copy left out, faults the next fire by name (`Overreach`).
 
 A hybrid case runs beside it: widths 2, 4, 8 from a `folded` with
 `tail > 0` and one with `tail == 0`, rs pages of `T` = 1, 2 and 4 rows from

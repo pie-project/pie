@@ -989,8 +989,8 @@ impl Shell {
         program: engine::ProgramId,
         extents: eta_exec::Extents,
     ) -> Result<engine::GuestState> {
-        let (per_instance, per_pair) = self.programs.state_bytes(program, extents)?;
-        self.pools.guest_state(per_instance, per_pair)
+        let (per_instance, resident, per_pair) = self.programs.state_bytes(program, extents)?;
+        self.pools.guest_state(per_instance, resident, per_pair)
     }
 
     /// What an instance of `program` keeps in the pool's `Instance` and

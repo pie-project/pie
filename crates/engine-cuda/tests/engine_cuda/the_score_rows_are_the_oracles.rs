@@ -233,6 +233,7 @@ fn bind(shell: &mut Shell, rows: u32) -> engine::InstanceId {
             &[None],
             &[engine::ChannelId(1)],
             engine_cuda::program::Slots {
+                resident: engine::ScratchPlace::None,
                 instance: slots.0,
                 rings: slots.1,
                 scratch,

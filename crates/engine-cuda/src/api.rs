@@ -1032,6 +1032,7 @@ impl Engine for Cuda {
                 instance,
                 rings,
                 scratch,
+                resident,
                 pair,
                 pair_generation,
                 ..
@@ -1043,6 +1044,7 @@ impl Engine for Cuda {
                         instance,
                         rings,
                         scratch,
+                        resident,
                         pair,
                         pair_generation,
                     },
@@ -1391,6 +1393,7 @@ impl Engine for Cuda {
                     instance: binding.instance_slots.clone(),
                     rings: binding.ring_slots.clone(),
                     scratch: binding.scratch.clone(),
+                    resident: binding.resident.clone(),
                     pair: binding.pair.clone(),
                     pair_generation: binding.pair_generation,
                 },
