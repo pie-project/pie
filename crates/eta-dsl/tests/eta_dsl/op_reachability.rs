@@ -107,6 +107,7 @@ fn masking() -> Traced {
     let state = Channel::from([7u32, 0]);
     let positions = Channel::seeded([4], dtype::u32);
     let out = Channel::new([4, 8], dtype::f32);
+    let drawn = Channel::new([4], dtype::i32);
 
     let mut builder = Builder::new(32_000, 16);
     builder.outputs(crate::outputs::logits(32_000));
@@ -126,6 +127,7 @@ fn masking() -> Traced {
         let softened = softmax(&masked);
         let by_mass = pivot_threshold(&softened, cummass_le(0.9));
         let by_prob = pivot_threshold(&softened, prob_ge(0.1));
+        drawn.put(gumbel_argmax(&masked, &by_mass, 1.0 / 0.8f32, state.read()));
         out.put(add(masked, broadcast(add(by_mass, by_prob), [4, 8])));
     });
     builder.build().unwrap()

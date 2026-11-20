@@ -22,6 +22,7 @@ pub mod extent;
 pub mod fire;
 pub mod fit;
 pub mod frame;
+pub mod host_memory;
 pub mod live;
 pub mod load;
 pub mod memory;
@@ -36,7 +37,9 @@ pub mod runahead;
 pub mod transfer;
 
 pub use adapter::{AdapterPlane, AdapterRegistration};
-pub use caps::{Capabilities, DeviceFacts, FireLimits, GuestCost, PoolFacts};
+pub use caps::{
+    Capabilities, DeviceFacts, FireLimits, GuestCost, MixedLanes, MixedRung, PoolFacts,
+};
 pub use channel::{ChannelId, ChannelRegistration, ChannelSeed, HostMirror, RegisteredChannel};
 pub use chunk::{
     ChunkFacts, ChunkRun, ChunkTable, Evacuation, Growth, Pinned, Reserved, ReservedRun,

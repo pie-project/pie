@@ -549,6 +549,14 @@ impl Engine for Xla {
             .map_err(fault)?;
         let chunks = shell.tiered_facts();
         shell.log_chunk_recipe(&chunks);
+        if let engine::MixedLanes::Laid(rungs) = shell.mixed_lanes() {
+            tracing::info!(
+                pairs = ?rungs.iter().map(|r| (r.prompt_lanes, r.decode_lanes)).collect::<Vec<_>>(),
+                max_tokens = budgets.max_tokens,
+                max_lanes = budgets.max_lanes,
+                "xla mixed fires laid: prompt_lanes -> decode_lanes"
+            );
+        }
         let caps = Capabilities {
             device: DeviceFacts {
                 backend: "xla".to_string(),
@@ -595,6 +603,7 @@ impl Engine for Xla {
             classes: shell.classes(),
             // XLA states no bound on one submission.
             guest_cost: engine::GuestCost::default(),
+            mixed_lanes: shell.mixed_lanes(),
         };
         self.programs.seat(budgets.max_lanes);
         self.programs.seat_readouts(shell.readouts());
@@ -605,6 +614,7 @@ impl Engine for Xla {
         // is served worse than the load prepared: counted.
         shell.device().report_to(self.live.clone());
         self.programs.report_to(self.live.clone());
+        shell.state_limits(caps.limits);
         self.shell = Some(shell);
         self.caps = Some(caps.clone());
         Ok(Loaded {
@@ -625,6 +635,14 @@ impl Engine for Xla {
 
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
         let submitted = self.submit_frame(frame);
+        // A frame whose step refused its lanes by name fired the steps
+        // before it alone: a refusal too.
+        if submitted
+            .as_ref()
+            .is_ok_and(|ticket| !ticket.refused.is_empty())
+        {
+            self.live.tally(engine::live::Tally::Refused, 1);
+        }
         self.refused(submitted)
     }
 

@@ -3,7 +3,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use eta_ir::op::{Family, Op};
-use eta_ir::types::ValueId;
+use eta_ir::types::{Dtype, ValueId};
 
 use super::normalize::{ChannelSlot, NodeIndex, NormalizedStage, result_layout};
 use super::nucleus::LibraryMatch;
@@ -85,6 +85,12 @@ pub(crate) fn singleton_partition(stage: &NormalizedStage, index: &StageIndex) -
     }
 }
 
+/// The most cells of a value one block covers in a single pass, a thread a
+/// cell: the most threads a block launches with on CUDA and HIP (their
+/// launch limit, engine-cuda's `MAX_BLOCK_THREADS`; a Metal region's 512
+/// threads cover it two cells a thread). A device fact, not a tuned cut.
+pub(crate) const BLOCK_CELLS: u64 = 1024;
+
 pub(crate) fn fused_partition(
     stage: &NormalizedStage,
     index: &StageIndex,
@@ -121,7 +127,36 @@ pub(crate) fn fused_partition(
             _ => None,
         })
         .collect();
+    // A node whose every value one block covers in a pass gains nothing from
+    // a block a row: it runs with its neighbours in one block, so a run of
+    // small ops (a beam's bookkeeping over its few rows) is one region and
+    // one launch, not one a shape.
+    let fits_a_block = |node: NodeIndex| {
+        let op = &stage.ops[node.index()];
+        let base = index.base(node).unwrap_or_default();
+        !matches!(
+            op.tag(),
+            eta_ir::op::tags::RNG | eta_ir::op::tags::RNG_KEYED
+        ) && op
+            .operands()
+            .into_iter()
+            .chain((0..op.result_count()).map(|result| base + result))
+            .all(|value| {
+                stage.value_types.get(value as usize).is_some_and(|ty| {
+                    ty.dims
+                        .iter()
+                        .try_fold(1u64, |cells, dim| match dim {
+                            Dimension::Static(n) => Some(cells.saturating_mul(u64::from(*n))),
+                            _ => None,
+                        })
+                        .is_some_and(|cells| cells <= BLOCK_CELLS)
+                })
+            })
+    };
     let class = |node: NodeIndex| -> (Geometry, Option<ValueId>) {
+        if fits_a_block(node) {
+            return (Geometry::Single, None);
+        }
         match geometries[node.index()] {
             (Geometry::Rows { fixed, extent }, witness)
                 if arithmetic.contains(&(fixed, extent)) =>
@@ -405,7 +440,11 @@ pub(crate) fn build_region(
                 let op = &stage.ops[node.index()];
                 if !matches!(
                     op,
-                    Op::ReduceSum(_) | Op::ReduceMax(_) | Op::ReduceMin(_) | Op::ReduceArgmax(_)
+                    Op::ReduceSum(_)
+                        | Op::ReduceMax(_)
+                        | Op::ReduceMin(_)
+                        | Op::ReduceArgmax(_)
+                        | Op::GumbelArgmax { .. }
                 ) {
                     return false;
                 }
@@ -448,7 +487,9 @@ pub(crate) enum Geometry {
 
 pub(crate) struct DirectTopK {
     pub(crate) intrinsic: NodeIndex,
+    /// The one element the row is divided by, or (`scales`) multiplied by.
     pub(crate) divisor: Option<ValueId>,
+    pub(crate) scales: bool,
 }
 
 pub(crate) fn direct_topk(
@@ -460,6 +501,11 @@ pub(crate) fn direct_topk(
         return None;
     };
     let input = *input;
+    // A direct read computes the row in f32: a bf16 row (its every store
+    // rounded) is ranked from its own bytes.
+    if stage.value_types.get(input as usize)?.dtype != Dtype::F32 {
+        return None;
+    }
     let through_reshapes = |mut value: ValueId| -> ValueId {
         while let Some(producer) = index.producer(value) {
             match stage.ops[producer.index()] {
@@ -478,12 +524,21 @@ pub(crate) fn direct_topk(
     };
     let mut value = through_reshapes(input);
     let mut divisor = None;
-    if let Some(producer) = index.producer(value)
-        && let Op::Div(numerator, element) = stage.ops[producer.index()]
-        && one_element(element)
-    {
-        divisor = Some(element);
-        value = through_reshapes(numerator);
+    let mut scales = false;
+    if let Some(producer) = index.producer(value) {
+        // A temperature divided in, or multiplied in as its reciprocal.
+        match stage.ops[producer.index()] {
+            Op::Div(numerator, element) if one_element(element) => {
+                divisor = Some(element);
+                value = through_reshapes(numerator);
+            }
+            Op::Mul(numerator, element) if one_element(element) => {
+                divisor = Some(element);
+                scales = true;
+                value = through_reshapes(numerator);
+            }
+            _ => {}
+        }
     }
     let intrinsic = index.producer(value)?;
     if !matches!(stage.ops[intrinsic.index()], Op::Output { .. })
@@ -494,7 +549,11 @@ pub(crate) fn direct_topk(
     let plane = &stage.value_types.get(index.base(intrinsic)? as usize)?.dims;
     let ranked = &stage.value_types.get(input as usize)?.dims;
     let same_rows = value_rows(plane).is_some() && value_rows(plane) == value_rows(ranked);
-    (same_rows && plane.last() == ranked.last()).then_some(DirectTopK { intrinsic, divisor })
+    (same_rows && plane.last() == ranked.last()).then_some(DirectTopK {
+        intrinsic,
+        divisor,
+        scales,
+    })
 }
 
 pub fn value_rows(dims: &[Dimension]) -> Option<(u64, u32)> {

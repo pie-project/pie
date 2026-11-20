@@ -148,8 +148,19 @@ pub(crate) fn skinny_norm_bf16(
 ) -> Result<bool, Error> {
     const OP: &str = "linear.skinny";
     let gated = matches!(epilogue, SkinnyEpilogue::Swiglu | SkinnyEpilogue::Geglu);
-    if !super::skinny::fits(m, n, k) {
+    let Some(plan) = skinny_norm_plan(ctx, m, n, k, gated)? else {
         return Ok(false);
+    };
+    norm_aligned(OP, weight, &norm)?;
+    skinny_launch(ctx, weight, 0, out, m, n, k, epilogue, plan, Some(norm))?;
+    Ok(true)
+}
+
+/// The skinny kernel's walk of a normed product, where it stages the rows
+/// and the fold pays ([`fold_pays`]); `None` where it does not.
+pub(crate) fn skinny_norm_plan(ctx: &Ctx, m: i32, n: i32, k: i32, gated: bool) -> Result<Option<SkinnyPlan>, Error> {
+    if !super::skinny::fits(m, n, k) {
+        return Ok(None);
     }
     let plan = skinny_plan(
         m.unsigned_abs(),
@@ -157,21 +168,16 @@ pub(crate) fn skinny_norm_bf16(
         k.unsigned_abs(),
         gated,
         ctx.tuning().gemm_skinny_quad_from,
-        ctx.multiprocessors(OP)?,
+        ctx.multiprocessors("linear.skinny")?,
     );
     let staged = m.unsigned_abs() * k.unsigned_abs() * 2;
     // The prologue sums a row as `residual_add_rmsnorm`'s packed path does,
     // a row of at most NORM_ROW_PACKS packs (`gemv.hip`'s kNormBlock x
     // kNormPpt); a wider one stays apart.
     if plan.quad || plan.act_global || staged > SKINNY_LDS || k / 8 > NORM_ROW_PACKS {
-        return Ok(false);
+        return Ok(None);
     }
-    if !fold_pays(ctx, "skinny", m, n, k, gated, plan.grid) {
-        return Ok(false);
-    }
-    norm_aligned(OP, weight, &norm)?;
-    skinny_launch(ctx, weight, 0, out, m, n, k, epilogue, plan, Some(norm))?;
-    Ok(true)
+    Ok(fold_pays(ctx, "skinny", m, n, k, gated, plan.grid).then_some(plan))
 }
 
 /// Whether a norm folded into a product of `grid` blocks pays: every block
@@ -670,6 +676,17 @@ pub(crate) fn skinnyt_norm(
 ) -> Result<bool, Error> {
     const OP: &str = "linear.skinnyt";
     let gated = matches!(epilogue, SkinnyEpilogue::Swiglu | SkinnyEpilogue::Geglu);
+    if !skinnyt_norm_covers(ctx, m, n, k, gated)? {
+        return Ok(false);
+    }
+    norm_aligned(OP, weight, &norm)?;
+    turn_launch(ctx, weight, 0, out, m, n, k, epilogue, Some(norm))?;
+    Ok(true)
+}
+
+/// Whether the turned kernel stages a normed product's rows (they and their
+/// sums within its turn) and the fold pays ([`fold_pays`]).
+pub(crate) fn skinnyt_norm_covers(ctx: &Ctx, m: i32, n: i32, k: i32, gated: bool) -> Result<bool, Error> {
     if m <= 0 || n <= 0 || k <= 0 || k / 8 > NORM_ROW_PACKS {
         return Ok(false);
     }
@@ -677,19 +694,14 @@ pub(crate) fn skinnyt_norm(
         m.unsigned_abs(),
         n.unsigned_abs() * if gated { 2 } else { 1 },
         k.unsigned_abs(),
-        ctx.multiprocessors(OP)?,
+        ctx.multiprocessors("linear.skinnyt")?,
     ) else {
         return Ok(false);
     };
-    // The normed rows and their partial sums (four floats a row) in the turn.
-    if m.unsigned_abs() * (k.unsigned_abs() * 2 + 16) > ks * TURN_WAVE_LDS
-        || !fold_pays(ctx, "turned", m, n, k, gated, grid)
-    {
-        return Ok(false);
-    }
-    norm_aligned(OP, weight, &norm)?;
-    turn_launch(ctx, weight, 0, out, m, n, k, epilogue, Some(norm))?;
-    Ok(true)
+    // The normed rows (each padded a 16-byte pack, spread over the LDS
+    // banks) and their partial sums (four floats a row) in the turn.
+    Ok(m.unsigned_abs() * (k.unsigned_abs() * 2 + 32) <= ks * TURN_WAVE_LDS
+        && fold_pays(ctx, "turned", m, n, k, gated, grid))
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -1,10 +1,10 @@
 //! The causal depthwise conv with its rolling history (`ssm.causal_conv1d`,
 //! its chunked and committed forms), from `kernels/ssm/conv1d.slang`.
 
-use super::{Committed, StatePool, requests, rows, window_lanes};
+use super::{Committed, Csr, RowSpan, StatePool, rows};
 use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, nonzero, refuse, stated};
 use crate::error::Error;
-use crate::tensor::{RaggedTensor, Tensor};
+use crate::tensor::Tensor;
 
 const CONV1D: &str = "ssm/conv1d.slang";
 
@@ -92,6 +92,7 @@ impl Shape {
 
 /// One decode step a row: each row convolved over its slot's history, which
 /// then rolls by the row.
+#[allow(clippy::too_many_arguments)]
 pub fn conv1d(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -100,16 +101,23 @@ pub fn conv1d(
     conv_width: u32,
     dilation: u32,
     y: Tensor,
+    span: RowSpan,
 ) -> Result<(), Error> {
     const OP: &str = "ssm.causal_conv1d";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "ssm_conv1d_bf16" });
     let shape = Shape::of(OP, x, weight, state, conv_width, dilation, y)?;
+    let launched = span.rows(OP, &[x, y, state.slots])?;
     ctx.fire(
-        Fire::at(CONV1D, entry).apply(shape.grid(rows(OP, x)?)),
+        Fire::at(CONV1D, entry).apply(shape.grid(launched)),
         &[
             &[x.arg(), weight.arg(), state.slots.arg(), y.arg_mut()][..],
             &state.piece_args(true),
-            &[shape.channels.arg(), shape.taps.arg(), shape.dilation.arg()],
+            &[
+                shape.channels.arg(),
+                shape.taps.arg(),
+                shape.dilation.arg(),
+                span.row0.arg(),
+            ],
         ]
         .concat(),
     )
@@ -117,32 +125,41 @@ pub fn conv1d(
 
 /// Each request's rows of the query CSR, convolved in order over its slot,
 /// which then holds the request's last rows.
+#[allow(clippy::too_many_arguments)]
 pub fn conv1d_chunked(
     ctx: &Ctx<'_>,
-    x: RaggedTensor,
+    x: Tensor,
+    csr: Csr,
     weight: Tensor,
     state: &StatePool,
     conv_width: u32,
     dilation: u32,
     y: Tensor,
+    row0: u32,
 ) -> Result<(), Error> {
     const OP: &str = "ssm.causal_conv1d_chunked";
-    let entry = dtype_dispatch!(OP, x.data.dtype, { Bf16 => "ssm_conv1d_chunked_bf16" });
-    let shape = Shape::of(OP, x.data, weight, state, conv_width, dilation, y)?;
-    rows(OP, x.data)?;
+    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "ssm_conv1d_chunked_bf16" });
+    let shape = Shape::of(OP, x, weight, state, conv_width, dilation, y)?;
+    rows(OP, x)?;
     ctx.fire(
-        Fire::at(CONV1D, state.entry(OP, entry)?).apply(shape.grid(requests(OP, x)?)),
+        Fire::at(CONV1D, state.entry(OP, entry)?).apply(shape.grid(csr.lanes(OP)?)),
         &[
             &[
-                x.data.arg(),
-                x.indptr.arg(),
+                x.arg(),
+                csr.table.arg(),
                 weight.arg(),
                 state.slots.arg(),
                 y.arg_mut(),
             ][..],
             &state.snap_table(),
             &state.piece_args(true),
-            &[shape.channels.arg(), shape.taps.arg(), shape.dilation.arg()],
+            &[
+                shape.channels.arg(),
+                shape.taps.arg(),
+                shape.dilation.arg(),
+                row0.arg(),
+            ],
+            &[csr.at.arg()],
             &state.snap_lane0(OP)?,
         ]
         .concat(),
@@ -155,7 +172,7 @@ pub fn conv1d_chunked(
 pub fn conv1d_committed(
     ctx: &Ctx<'_>,
     x: Tensor,
-    indptr: Tensor,
+    csr: Csr,
     committed: &Committed,
     weight: Tensor,
     state: &StatePool,
@@ -168,11 +185,11 @@ pub fn conv1d_committed(
     let shape = Shape::of(OP, x, weight, state, conv_width, dilation, y)?;
     nonzero(OP, "extended rows", x.rows)?;
     ctx.fire(
-        Fire::at(CONV1D, state.entry(OP, entry)?).apply(shape.grid(window_lanes(OP, indptr)?)),
+        Fire::at(CONV1D, state.entry(OP, entry)?).apply(shape.grid(csr.lanes(OP)?)),
         &[
             &[
                 x.arg(),
-                indptr.arg(),
+                csr.table.arg(),
                 committed.replay.arg(),
                 committed.commit.arg(),
                 committed.slots.arg(),
@@ -186,7 +203,9 @@ pub fn conv1d_committed(
                 shape.channels.arg(),
                 shape.taps.arg(),
                 shape.dilation.arg(),
+                0u32.arg(),
             ],
+            &[csr.at.arg()],
             &state.snap_lane0(OP)?,
         ]
         .concat(),

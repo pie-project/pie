@@ -29,6 +29,9 @@ pub struct Plane {
     pub width: u32,
     pub layers: u32,
     pub dtype: Dtype,
+    /// The plane holds no denormal: a matmul wrote every value of it
+    /// (`Shell::normal_exports`), set by the engine, never by a guest.
+    pub normal: bool,
     host: OnceLock<Result<Value, String>>,
 }
 
@@ -54,8 +57,16 @@ impl Plane {
             width,
             layers,
             dtype,
+            normal: false,
             host: OnceLock::new(),
         }
+    }
+
+    /// The plane, stated free of denormals where `normal`.
+    #[must_use]
+    pub fn with_normal(mut self, normal: bool) -> Plane {
+        self.normal = normal;
+        self
     }
 
     fn on_host(&self) -> Result<&Value, String> {

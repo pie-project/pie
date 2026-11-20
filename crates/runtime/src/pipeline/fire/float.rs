@@ -24,6 +24,7 @@ fn fold_one_plan(ids: &[crate::store::rs::RsWorkingSetId]) -> rs::RsPlan {
                 writes: None,
                 fold: rs::GroupFold::Host(1),
                 snapshots: Vec::new(),
+                beams: false,
             }),
         }
     }

@@ -121,7 +121,9 @@ struct Output {
 /// `top_p < 1` (`top_p >= 1` keeps every token, so it is no knob). The same
 /// shapes the runtime's prewarm builds, so a request builds nothing.
 struct SampleKnobs {
-    temperature: Option<f32>,
+    /// The temperature's reciprocal (`sampler::inverse_temperature`), data
+    /// the stage reads, so every temperature runs one program.
+    temperature: Option<Channel>,
     top_p: Option<Channel>,
 }
 
@@ -129,7 +131,8 @@ impl SampleKnobs {
     fn new(temperature: f32, top_p: f32) -> Self {
         let sampled = temperature > 0.0;
         Self {
-            temperature: sampled.then_some(temperature),
+            temperature: sampled
+                .then(|| Channel::from([sampler::inverse_temperature(temperature)])),
             top_p: (sampled && top_p < 1.0).then(|| Channel::from([top_p])),
         }
     }
@@ -137,7 +140,7 @@ impl SampleKnobs {
     /// Read without consuming: the seeded value stays for every fire.
     fn read(&self) -> sampler::Knobs {
         sampler::Knobs {
-            temperature: self.temperature,
+            temperature: self.temperature.as_ref().map(|c| reshape(c.read(), [])),
             top_p: self.top_p.as_ref().map(|c| reshape(c.read(), [])),
             top_k: None,
             min_p: None,

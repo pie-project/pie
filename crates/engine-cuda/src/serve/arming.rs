@@ -1113,6 +1113,126 @@ impl Shell {
         armed
     }
 
+    /// The decode products `wanted` names, each timed in its real
+    /// neighbourhood: for each shape (by rows, ascending), its bucket's
+    /// bodies armed with that bank on the skinny kernel and then on the
+    /// turned kernel (the other buckets' kept armed)
+    /// (every bank decided before it as decided), and the decode body of its
+    /// rows (that many one-row lanes) replayed [`BODY_ROUNDS`] rounds of
+    /// [`BODY_FIRES`] fires under each. The faster past the rounds'
+    /// interquartile spread is kept for the shapes after it; equal within
+    /// it, the skinny kernel. The table the bodies end armed under is laid
+    /// on the context. What it measured: each shape under each kernel, the
+    /// step's median ns and spread.
+    #[cfg(feature = "rocm")]
+    pub(super) fn routes_by_body(
+        &mut self,
+        base: std::sync::Arc<kernels_cuda::linear::routes::Routes>,
+        wanted: &std::collections::BTreeMap<
+            kernels_cuda::linear::routes::Shape,
+            kernels_cuda::linear::routes::Wanted,
+        >,
+    ) -> Result<crate::rates::ProductTimes> {
+        use kernels_cuda::linear::routes::Kernel;
+        // A load that decodes nothing chooses no decode product's kernel.
+        if self.decoding.iter().next().is_none() {
+            return Ok(Vec::new());
+        }
+        let mut shapes: Vec<_> = wanted.keys().copied().collect();
+        shapes.sort_by_key(|s| (s.m, s.rows, s.k));
+        let mut decided = base;
+        let mut measured = Vec::new();
+        for shape in shapes {
+            let mut times = Vec::new();
+            for kernel in [Kernel::Skinny, Kernel::Turned] {
+                self.device
+                    .set_routes(std::sync::Arc::new(decided.forcing(shape, kernel)));
+                // A product's rows in a body are its bucket's: only that
+                // bucket's bodies change with its kernel.
+                self.rearm_bucket(shape.m)?;
+                let (ns, spread) = self.time_decode_body(shape.m)?;
+                times.push((kernel, ns, spread));
+            }
+            let entries: Vec<_> = times.iter().map(|&(kernel, ns, spread)| (shape, kernel, ns, spread)).collect();
+            decided = std::sync::Arc::new(decided.with(&entries));
+            measured.extend(entries);
+        }
+        self.device.set_routes(decided);
+        let mut buckets: Vec<u32> = wanted.keys().map(|s| s.m).collect();
+        buckets.dedup();
+        for bucket in buckets {
+            self.rearm_bucket(bucket)?;
+        }
+        Ok(measured)
+    }
+
+    /// The body the lattice armed at bucket `m` that carries `m` rows
+    /// ([`timing_target`]: the decode step's `m` one-row lanes where it
+    /// armed one), replayed: its median ns a fire over [`BODY_ROUNDS`]
+    /// rounds and their interquartile spread. Every timed fire must replay
+    /// the body (none walks eagerly).
+    #[cfg(feature = "rocm")]
+    fn time_decode_body(&mut self, m: u32) -> Result<(f64, f64)> {
+        let targets = self
+            .lattice_targets()
+            .map_or_else(Vec::new, |lattice| lattice.targets);
+        let (target, treatment) = timing_target(
+            targets
+                .iter()
+                .map(|(bucket, target, treatment)| (*bucket, target, treatment.rs)),
+            m,
+        )
+        .ok_or_else(|| {
+            Fault::Card(format!(
+                "timing a product of {m} rows: no body the lattice arms at bucket {m} \
+                 carries them"
+            ))
+        })?;
+        self.arm_rs = treatment;
+        let (lanes, media) = target.lanes();
+        let owned = self.synthetic_lanes_with(&lanes, &media);
+        for _ in 0..BODY_FIRES {
+            self.fire_synthetic(&owned)?;
+            self.device.synchronize()?;
+        }
+        let before = self.cache.body_stats().tally.hits;
+        let mut rounds = Vec::with_capacity(BODY_ROUNDS);
+        for _ in 0..BODY_ROUNDS {
+            let began = std::time::Instant::now();
+            for _ in 0..BODY_FIRES {
+                self.fire_synthetic(&owned)?;
+                self.device.synchronize()?;
+            }
+            rounds.push(began.elapsed().as_secs_f64() * 1e9 / BODY_FIRES as f64);
+        }
+        let replayed = self.cache.body_stats().tally.hits - before;
+        if replayed < (BODY_ROUNDS * BODY_FIRES) as u64 {
+            return Err(Fault::Card(format!(
+                "timing the decode body of {m} lanes: {replayed} of {} fires replayed it; a \
+                 product's kernel is chosen by its body's time, never an eager walk's",
+                BODY_ROUNDS * BODY_FIRES
+            )));
+        }
+        rounds.sort_by(f64::total_cmp);
+        Ok((
+            rounds[BODY_ROUNDS / 2],
+            rounds[3 * BODY_ROUNDS / 4] - rounds[BODY_ROUNDS / 4],
+        ))
+    }
+
+    /// Bucket `bucket`'s bodies forgotten and armed again, the other
+    /// buckets' kept: a re-arm allowed what the load's own arming took.
+    #[cfg(feature = "rocm")]
+    fn rearm_bucket(&mut self, bucket: u32) -> Result<()> {
+        self.cache.forget_bodies_at(bucket);
+        self.arm_only = Some(bucket);
+        self.rearming = true;
+        let armed = self.arm_bodies();
+        self.rearming = false;
+        self.arm_only = None;
+        armed
+    }
+
     pub(super) fn arm_bodies(&mut self) -> Result<()> {
         let armed = self.arm_lattice(false);
         self.pools.forget_weight_uses(self.device.stream())?;
@@ -1448,10 +1568,13 @@ impl Shell {
             }
         }
         let LatticeTargets {
-            targets,
+            mut targets,
             top,
             unfireable,
         } = self.lattice_targets()?;
+        if let Some(bucket) = self.arm_only {
+            targets.retain(|(at, ..)| *at == bucket);
+        }
         // The top bucket's bodies and every decode body arm first; the
         // narrower prefill, mixed and wide ones after them are what the
         // lattice coarsens to fit the allowance, each priced at what its
@@ -1542,7 +1665,7 @@ impl Shell {
         let headroom = !st.from_record && spare < margin;
         let mine = !st.verify
             && (spent.census.bodies >= record::MAX_BODIES
-                || (st.capped && spent.census.bytes >= self.bodies_mem)
+                || (st.capped && allowance_spent(spent.census.bytes, self.bodies_mem))
                 || headroom);
         let stop = match self.ep.as_ref() {
             // The group's ranks fire one sequence of steps: the allowance
@@ -1561,6 +1684,19 @@ impl Shell {
             }
             st.never += 1;
             if !st.group {
+                // Fired once, sealed, so nothing captures: its key is stated
+                // eager by name at load, and its fires walk eagerly by that
+                // statement (`BodyTally::stated_eager`), not as a body
+                // missing (`sealed_declines`).
+                self.cache.seal_bodies();
+                self.cache.state_eager(true);
+                let (lanes, media) = target.lanes();
+                let owned = self.synthetic_lanes_with(&lanes, &media);
+                let fired = self.fire_synthetic(&owned).and(self.device.synchronize());
+                self.cache.state_eager(false);
+                if let Err(why) = fired {
+                    st.refused = Some(format!("bucket {bucket}, {target}: {why}"));
+                }
                 return Ok(());
             }
             // An expert-parallel rank fires it anyway, sealed so nothing
@@ -1820,6 +1956,19 @@ impl Shell {
             "engine-cuda: {report}; armed in {:.1} s",
             st.began.elapsed().as_secs_f64()
         );
+        // Every composition arming stopped before (the report above says
+        // why), by name: they walk eagerly for the life of the load by this
+        // statement, their fires tallied as such (`BodyTally::stated_eager`).
+        let stated = self.cache.stated_eager();
+        if !stated.is_empty() {
+            eprintln!(
+                "engine-cuda: {} composition key(s) walk eagerly by statement, arming stopped \
+                 before them from bucket {}: {}",
+                stated.len(),
+                st.never_from,
+                stated.join(", ")
+            );
+        }
         // The lattice the bodies armed over against the profile's: fewer
         // buckets is the allowance binding, each fire padded further.
         eprintln!(
@@ -2162,4 +2311,88 @@ struct LatticeTargets {
     targets: Vec<(u32, BodySynth, Treatment)>,
     top: Option<u32>,
     unfireable: Vec<String>,
+}
+
+/// The composition a product of `m` rows is timed in
+/// (`Shell::routes_by_body`), with what rides it (its recurrent rows'
+/// treatment): a body the lattice armed at bucket `m` that carries `m`
+/// rows, the decode step's (`m` one-row lanes) where the lattice armed one,
+/// else the first that does (where a fire carries fewer lanes than `m`, an
+/// artifact baked for fewer, its rows are a prompt's). `None` where no
+/// armed body carries them.
+#[cfg_attr(not(feature = "rocm"), allow(dead_code))]
+fn timing_target<'a, R: Copy>(
+    targets: impl IntoIterator<Item = (u32, &'a BodySynth, R)>,
+    m: u32,
+) -> Option<(&'a BodySynth, R)> {
+    let rows = |target: &BodySynth| target.lanes().0.iter().map(|&(_, rows)| rows).sum::<u32>();
+    let at: Vec<(&BodySynth, R)> = targets
+        .into_iter()
+        .filter(|&(bucket, target, _)| bucket == m && rows(target) == m)
+        .map(|(_, target, ride)| (target, ride))
+        .collect();
+    at.iter()
+        .copied()
+        .find(|(target, _)| matches!(target, BodySynth::Decode { .. }))
+        .or_else(|| at.first().copied())
+}
+
+/// Rounds a decode body is timed in (`Shell::routes_by_body`): the median
+/// kept, the interquartile range the spread a choice must clear.
+#[cfg(feature = "rocm")]
+const BODY_ROUNDS: usize = 9;
+
+/// Fires a round of a decode body's timing: each replayed and waited on, as
+/// a serving step is.
+#[cfg(feature = "rocm")]
+const BODY_FIRES: usize = 20;
+
+/// Whether bodies weighing `bytes` have spent an allowance of `allowance`:
+/// past it, not at it. A re-arm is allowed exactly what the arming before it
+/// took (`Shell::measured_refit`), and its compositions past the last new
+/// body re-capture bodies it already holds (a wide composition's key a
+/// mixed one's): at the allowance they cost nothing, and stopping there
+/// would leave them walking eagerly for the life of the load.
+fn allowance_spent(bytes: usize, allowance: usize) -> bool {
+    bytes > allowance
+}
+
+#[cfg(test)]
+mod allowance_tests {
+    use super::allowance_spent;
+
+    #[test]
+    fn a_re_arm_at_exactly_what_the_arming_before_took_arms_on() {
+        // The measuring boot's refit: 53 bodies weighing what the first
+        // arming's 53 weighed, ten compositions still to re-capture.
+        let took = 150 << 20;
+        assert!(!allowance_spent(took, took));
+        assert!(allowance_spent(took + 1, took));
+        assert!(!allowance_spent(took - 1, took));
+    }
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::{BodySynth, timing_target};
+
+    #[test]
+    fn a_product_is_timed_in_a_body_the_lattice_armed() {
+        let decode = BodySynth::Decode { lanes: 4, class: 0 };
+        let prompt = BodySynth::Prefill {
+            class: 0,
+            rows: vec![4],
+        };
+        let decoded = |found: Option<(&BodySynth, ())>| found.map(|(target, ())| target.lanes().0);
+        // A lattice that arms the decode step at bucket 4: its body.
+        let both = [(4, &prompt, ()), (4, &decode, ()), (8, &decode, ())];
+        assert_eq!(decoded(timing_target(both, 4)), Some(vec![(0, 1); 4]));
+        // An artifact baked for one lane arms no four-lane decode step
+        // (golden_offload's micro model on ROCm): the prompt's body of 4.
+        let one = BodySynth::Decode { lanes: 1, class: 0 };
+        let one_lane = [(4, &prompt, ()), (4, &one, ())];
+        assert_eq!(decoded(timing_target(one_lane, 4)), Some(vec![(0, 4)]));
+        // Nothing armed at the bucket carries its rows.
+        assert_eq!(decoded(timing_target([(2, &prompt, ())], 4)), None);
+    }
 }

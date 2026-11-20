@@ -1132,6 +1132,10 @@ impl Shell {
         let mut rs_ends: Vec<Option<u32>> = vec![None; lanes.len()];
         let mut rs_lens: Vec<i32> = Vec::with_capacity(lanes.len());
         let mut rs_order: Vec<u32> = vec![0; lanes.len()];
+        // Each lane's rs buffer's first slot and its pages, where it buffers
+        // rows (a hybrid beam's page table starts there, and its rows lie on
+        // any of the set's pages, `serve::pages`).
+        let mut rs_bases: Vec<Option<(u32, &[u32])>> = vec![None; lanes.len()];
         let mut snapshots = crate::store::rs::SnapTable {
             indptr: vec![0],
             ..Default::default()
@@ -1355,6 +1359,7 @@ impl Shell {
                     lineage,
                 } => {
                     rs_pages.extend_from_slice(pages);
+                    rs_bases[row.source as usize] = Some((*base, pages.as_slice()));
                     // A device-counted fold not yet settled left the state
                     // past the runtime's length.
                     let slot = seated.rs_slot.unwrap_or(lane.slot);
@@ -1728,7 +1733,18 @@ impl Shell {
                     page_off: rs_slots.len() as u32,
                     ext: begin,
                 });
-                for &page in pages.iter() {
+                // Only the pages the fire reads or writes of the lane's: its
+                // replayed tokens and its own rows (a beam group's set is
+                // backed to its pool's end, which no beam reads this fire).
+                let tokens = buffers.page_tokens().max(1);
+                let reach = rs_reads[fire_lane]
+                    .iter()
+                    .map(|span| span.end)
+                    .chain(core::iter::once(*at + row.rows))
+                    .max()
+                    .unwrap_or(0)
+                    .div_ceil(tokens) as usize;
+                for &page in pages.iter().take(reach.max(1)) {
                     rs_slots.push(buffers.slot(&self.pools, page)?);
                 }
             }
@@ -1851,6 +1867,27 @@ impl Shell {
                 (0..device_geometries.len()).any(|table| self.pools.geometry_window(table).is_some());
             let planes = self.pools.page_planes();
             let pools = &self.pools;
+            // A hybrid's beams (§11): their rs page tables as this fire
+            // stages them, and the planes a fork copies.
+            let rs_fire = match self.buffers.as_ref() {
+                Some(buffers) if !rs_lanes.is_empty() => Some(super::pages::RsFire {
+                    lanes: &rs_lanes,
+                    order: &rs_order,
+                    page_tokens: buffers.page_tokens(),
+                    base: &|source| rs_bases.get(source).copied().flatten().map(|(base, _)| base),
+                    set: &|source| {
+                        rs_bases
+                            .get(source)
+                            .copied()
+                            .flatten()
+                            .map_or_else(|| Ok(Vec::new()), |(_, pages)| {
+                                pages.iter().map(|&page| buffers.slot(pools, page)).collect()
+                            })
+                    },
+                    planes: buffers.page_planes()?,
+                }),
+                _ => None,
+            };
             super::pages::plan(
                 &page_groups,
                 &device_geometries,
@@ -1859,6 +1896,7 @@ impl Shell {
                 &|source| lanes[source].translation.to_vec(),
                 &|source| lanes[source].folded,
                 &planes,
+                rs_fire.as_ref(),
                 &mut |ids| pools.page_ids(0, ids),
                 &mut |page| pools.page_base(0, page),
             )?

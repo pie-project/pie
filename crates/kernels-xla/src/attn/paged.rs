@@ -2285,12 +2285,15 @@ pub fn attend_fresh(
             }
         }
         (Walk::PerRow, None)
-            if ch.decode_pages > 0
-                && r >= ch.decode_pages
-                // narrow kv heads read so little a row that the kernel's
-                // per-row work costs more than the walk's reads (v6e
-                // gemma-4-E2B c256, one 256-wide kv head: 13.8k -> 9.2k tok/s)
-                && heads.kvh * heads.d >= 1024
+            // A decode reads its rows' pages through the page-copy kernel
+            // wherever it holds them, at any row count (v6e qwen3-0.6b, against
+            // the per-row walk: c1 +3.7%, c8 +8.4%, c16 +16.7%, c32 +13.1%,
+            // c64 level, a masked beam-4 step 2.353 -> 2.162 ms); the walk
+            // reads what it cannot hold.
+            // (narrow kv heads read so little a row that the kernel's
+            // per-row work costs more than the walk's reads: v6e
+            // gemma-4-E2B c256, one 256-wide kv head, 13.8k -> 9.2k tok/s)
+            if heads.kvh * heads.d >= 1024
                 && rule.rel.is_none()
                 && rule.rbias.is_none()
                 && rule.bits.is_none()

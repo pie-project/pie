@@ -73,11 +73,27 @@ struct Params {
     int channels;
     int conv_width;
     int dilation;
+    // The fire row a window's row 0 is: `x`, `y` and the slots table are the
+    // fire's whole, bound once whatever window a fire cuts (0 for the
+    // committed form, whose extended planes are the window's).
+    uint row0;
+#if defined(PIE_CHUNKED) || defined(PIE_COMMITTED)
+    // The window's CSR lies at int `indptr_at` of the fire's packed windows
+    // table, which is bound whole: one view whatever window a fire cuts.
+    int indptr_at;
+#endif
 #if defined(PIE_SNAPS)
     int snap_lane0;
 #endif
 };
 PIE_PARAMS(PARAMS_AT, Params, params);
+
+#if defined(PIE_CHUNKED) || defined(PIE_COMMITTED)
+// The window's CSR boundary `i`.
+int csr(uint i) {
+    return indptr[uint(params.indptr_at) + i];
+}
+#endif
 PIE_POOL_READ(float, params.seg_words)
 PIE_POOL_WRITE(float, params.seg_words)
 PIE_POOL_VIEW(state, float, params.state_origin)
@@ -108,12 +124,12 @@ float silu(float z) {
 
 // Channels `c` and `c + 1` of row `row`.
 float2 x_at(uint row, uint chans, uint c) {
-    uint word = x[(row * chans + c) >> 1];
+    uint word = x[((params.row0 + row) * chans + c) >> 1];
     return float2(bf16_to_f32(word & 0xffffu), bf16_to_f32(word >> 16));
 }
 
 void y_put(uint row, uint chans, uint c, float2 v) {
-    y[(row * chans + c) >> 1] = pack_bf16(silu(v.x), silu(v.y));
+    y[((params.row0 + row) * chans + c) >> 1] = pack_bf16(silu(v.x), silu(v.y));
 }
 
 // The slot's `hist` rows of channels `c`, `c + 1` (column `at.col`).
@@ -202,11 +218,11 @@ void main(uint3 gid : SV_DispatchThreadID) {
 
 #if defined(PIE_COMMITTED)
     uint lane = uint(params.lane0) + r;
-    int begin = indptr[r];
+    int begin = csr(r);
     for (uint j = 0; j < r; j++) {
         begin += replay[uint(params.lane0) + j];
     }
-    int span = (indptr[r + 1] - indptr[r]) + replay[lane];
+    int span = (csr(r + 1) - csr(r)) + replay[lane];
     if (span <= 0 || pie_state_none(lane)) {
         return;
     }
@@ -217,8 +233,8 @@ void main(uint3 gid : SV_DispatchThreadID) {
 #endif
     walk(column(lane, chans, c), begin, span, min(commit[lane], span), chans, c, snap);
 #elif defined(PIE_CHUNKED)
-    int begin = indptr[r];
-    int span = indptr[r + 1] - begin;
+    int begin = csr(r);
+    int span = csr(r + 1) - begin;
     if (span <= 0) {
         return;
     }
@@ -227,9 +243,9 @@ void main(uint3 gid : SV_DispatchThreadID) {
 #else
     int snap = -1;
 #endif
-    walk(column(uint(begin), chans, c), begin, span, span, chans, c, snap);
+    walk(column(params.row0 + uint(begin), chans, c), begin, span, span, chans, c, snap);
 #else
-    Column slab = column(r, chans, c);
+    Column slab = column(params.row0 + r, chans, c);
     float2 past[HIST_MAX];
     past_load(slab, hist, past);
     uint tap0 = c * uint(width);

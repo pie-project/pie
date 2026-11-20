@@ -226,6 +226,10 @@ pub struct LaunchRegion {
     /// out over.
     #[serde(default)]
     pub order: Vec<u32>,
+    /// Whether the CUDA emitter's kernel runs each row across several blocks
+    /// of its lane ([`crate::codegen::cuda::fused::splits_rows`]).
+    #[serde(default)]
+    pub splits_rows: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -324,7 +328,7 @@ pub fn generated_temporary_bytes(
             .args
             .first()
             .and_then(|&value| plan.value_types.get(value as usize))
-            .is_some_and(|value| value.dtype == Dtype::F32);
+            .is_some_and(|value| eta_ir::types::is_float(value.dtype));
         if float {
             floats += 1;
         } else {
@@ -354,7 +358,49 @@ pub struct LaunchPackage {
     pub fault_classes: Vec<FaultClass>,
 }
 
+/// The words an engine with no `bf16` guest dtype refuses a program by.
+pub const NO_BF16: &str = "this engine has no bf16 guest dtype";
+
 impl LaunchPackage {
+    /// Whether the program takes the bf16 guest work: it stores anything as
+    /// `bf16` (a value, a stage plan's value, a channel or a constant port)
+    /// or draws with `gumbel_argmax`, the reduction that keeps a bf16 row's
+    /// draw in f32. An engine whose guest runtime has neither refuses such
+    /// a program at registration ([`LaunchPackage::refuse_bf16`]); it never
+    /// computes it as another dtype.
+    #[must_use]
+    pub fn stores_bf16(&self) -> bool {
+        self.plans
+            .iter()
+            .flat_map(|plan| &plan.ops)
+            .any(|op| op.tag == tags::GUMBEL_ARGMAX)
+            || self.values.iter().any(|value| value.dtype == Dtype::Bf16)
+            || self
+                .plans
+                .iter()
+                .flat_map(|plan| &plan.value_types)
+                .any(|value| value.dtype == Dtype::Bf16)
+            || self
+                .channels
+                .iter()
+                .any(|channel| channel.dtype == ChanDType::Concrete(Dtype::Bf16))
+            || self.ports.iter().any(|port| port.const_dtype == Dtype::Bf16)
+    }
+
+    /// The refusal of an engine with no `bf16` guest dtype: `Err` naming it
+    /// ([`NO_BF16`]) where the program stores a `bf16`, else `Ok`.
+    pub fn refuse_bf16(&self) -> Result<(), String> {
+        if self.stores_bf16() {
+            Err(alloc::format!(
+                "{NO_BF16}: the program stores a bf16 value or draws with gumbel_argmax \
+                 (vocab-sized guest intermediates are bf16 by default), and this engine runs \
+                 it once its guest runtime has both"
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     #[must_use]
     pub fn plan_local(&self, global: u32) -> Option<(usize, Option<u32>)> {
         let mut base = 0u32;
@@ -680,6 +726,7 @@ fn lower_region(stage: &CompiledStage, region: &Region) -> LaunchRegion {
     LaunchRegion {
         spent: crate::codegen::cuda::spent_values(stage, region),
         order: crate::codegen::cuda::emitted_order(stage, region),
+        splits_rows: crate::codegen::cuda::fused::splits_rows(stage, region),
         kind: region.kind,
         schedule: region.schedule as u8,
         nodes: region.nodes.iter().copied().map(NodeIndex::get).collect(),

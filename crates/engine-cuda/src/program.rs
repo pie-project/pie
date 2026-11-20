@@ -1180,6 +1180,11 @@ impl Plane {
             });
         }
         wave.fly(context, wave_base)?;
+        for (_, _, id) in staged.iter() {
+            if let Some(bound) = instances.get_mut(id) {
+                bound.session.fly_in(wave);
+            }
+        }
         let streams = fan.fork(&meet, main)?;
         let flown = groups.into_iter().zip(streams).zip(places).try_for_each(
             |(((program_id, extents, members), stream), (base, lanes, fresh))| {

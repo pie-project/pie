@@ -22,23 +22,7 @@
 // elements for each of `M1_LANE_ARENAS` homes, however few blocks the lane
 // runs on, so a block's gathers past its own home stay in its lane's span.
 
-#define M1_LANE_HALF 24576u
-#define M1_LANE_HEAD 64u
-#define M1_LANE_MAX_SLICES 64u
-// The gather homes a lane has (the launcher's LANE_SAMPLER_BLOCKS: the most
-// blocks a lane runs on), and the gathered elements each holds (two buffers
-// of them).
-#define M1_LANE_ARENAS 16u
-#define M1_FAST_GATHER 512u
-// A block's arena, from one to the next in a lane's span: its line and its
-// halves, to 256 bytes (the launcher's `lane_arena_stride`).
-#define M1_LANE_ARENA_STRIDE ((M1_LANE_HEAD + 2u * M1_LANE_HALF + 255u) & ~255u)
-// A lane's gather buffers, after its blocks' arenas (the launcher's
-// `LANE_SAMPLER_GATHERS`).
-#define M1_LANE_GATHERS (M1_LANE_ARENAS * 2u * M1_FAST_GATHER * 8u)
-// A lane's span of the lane arenas on `blocks` blocks (the launcher's
-// `lane_span`).
-#define M1_LANE_SPAN(blocks) ((m1_u64)(blocks) * M1_LANE_ARENA_STRIDE + M1_LANE_GATHERS)
+// The arena geometry is `lane_arena.cuh`'s, which precedes this text.
 
 // ---------------------------------------------------------- the fast cut --
 //
@@ -1494,6 +1478,220 @@ __device__ M1_CALLEE void ptir_lane_sample(
       if (kept) {
         const float uniform = ptir_rng_hash_uniform(seed, base + i);
         value = x[base + i] + (-logf(-logf(uniform)));
+      }
+      const M1ArgmaxCandidate next{value, i, m1_isnan(value) ? 0u : 1u, 0u};
+      best = m1_argmax_combine(best, next);
+    }
+    best = m1_argmax_warp_reduce(best, lane);
+    if (lane == 0u) block_best[warp] = best;
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+      M1ArgmaxCandidate t{m1_neg_inf(), 0u, 0u, 0u};
+      for (m1_u32 w = 0u; w < warps; ++w) t = m1_argmax_combine(t, block_best[w]);
+      block_best[0] = t;
+    }
+    __syncthreads();
+    const M1ArgmaxCandidate chosen =
+        g.merge(block_best[0], [](M1ArgmaxCandidate a, M1ArgmaxCandidate b) { return m1_argmax_combine(a, b); });
+    if (g.slice == 0u && threadIdx.x == 0u) m1_store_i(token, row, (int)chosen.index);
+    __syncthreads();
+  }
+}
+
+// Where the bf16 draw reads its f32 logits: rows `stride` apart in the
+// storage `mode` names (`m1_intrinsic_row_base`), from `first`; a row at
+// `rows` or past it is not the lane's.
+struct M1DrawRow {
+  const m1_u8* base;
+  m1_u32 mode;
+  m1_u32 stride;
+  m1_u64 first;
+  m1_u32 rows;
+};
+
+// The standard sampler's bf16 draw of each of a lane's rows, on the lane's
+// blocks (`eta_dsl::sampler`): the cut's probabilities q = e / sum(e), e =
+// exp((x - bf16(max x)) * r), r the temperature's reciprocal, the shifted
+// row, its product, e and q rounded to bf16 as their stores round them; the
+// top-p or top-k cut of q (stored as the bf16 `probs` plane); and
+// gumbel_argmax(x, keep, r, state):
+// each kept lane x * r + gumbel in f32, never rounded. q rises with x, so
+// its bounds are those of the row's largest and least logits.
+template <bool RANK>
+__device__ M1_CALLEE void ptir_lane_draw(
+    M1Lane& g,
+    const M1DrawRow logits,
+    const float inverse,
+    const m1_u8* threshold,
+    const M1ValueDesc threshold_desc,
+    const m1_u8* state,
+    const M1ValueDesc state_desc,
+    m1_u8* probs,
+    m1_u8* keep,
+    m1_u8* token,
+    m1_u32 rows,
+    m1_u32 len) {
+  M1_CUT_STATE(cut);
+  float* tree_work = cut.before;
+  __shared__ M1Range block_range[32];
+  __shared__ M1ArgmaxCandidate block_best[32];
+  const m1_u32 lane = threadIdx.x & 31u;
+  const m1_u32 warp = threadIdx.x >> 5u;
+  const m1_u32 warps = blockDim.x >> 5u;
+  // The cut's probability of a logit: every step rounded where the chain
+  // stores bf16.
+  auto prob = [&](float v, float shift, float sum) {
+    const float e = m1_round_bf16(expf(m1_round_bf16(m1_round_bf16(v - shift) * inverse)));
+    return m1_round_bf16(e / sum);
+  };
+  const m1_u32 key = m1_load_u(state, 0u, state_desc.dtype);
+  const m1_u32 counter = state_desc.len > 1u ? m1_load_u(state, 1u, state_desc.dtype) : 0u;
+  const m1_u64 seed = ptir_rng_keyed_seed(key, counter);
+  g.row(len);
+  for (m1_u32 row = 0u; row < rows; ++row) {
+    const m1_u32 base = row * len;
+    if (logits.first + row >= (m1_u64)logits.rows) break;
+    const m1_u8* x_row = m1_intrinsic_row_base(logits.base, logits.first + row, logits.stride, logits.mode);
+    auto x_at = [&](m1_u32 i) { return m1_intrinsic_column_load(x_row, i, logits.mode); };
+    // The row's maximum (order-free: the canonical max is), and its least
+    // value and whether every value is finite (the top-p cut's first pass
+    // then rides the probability pass).
+    float m = m1_neg_inf();
+    float least_x = __int_as_float(0x7F800000);
+    m1_u32 finite = 1u;
+    for (m1_u32 i = g.lo + threadIdx.x; i < g.hi; i += blockDim.x) {
+      const float v = x_at(i);
+      m = m1_canonical_max(m, v);
+      least_x = fminf(least_x, v);
+      if (!(fabsf(v) < __int_as_float(0x7F800000))) finite = 0u;
+    }
+    for (m1_u32 offset = 16u; offset > 0u; offset >>= 1u) {
+      m = m1_canonical_max(m, m1_chunk_down(m, offset));
+      least_x = fminf(least_x, m1_chunk_down(least_x, offset));
+      finite &= m1_chunk_down(finite, offset);
+    }
+    if (lane == 0u) block_range[warp] = M1Range{m, least_x, finite};
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+      M1Range t{m1_neg_inf(), __int_as_float(0x7F800000), 1u};
+      for (m1_u32 w = 0u; w < warps; ++w) t = m1_range_combine(t, block_range[w]);
+      block_range[0] = t;
+    }
+    __syncthreads();
+    const M1Range range = g.merge(block_range[0], m1_range_combine);
+    const float maximum = range.maximum;
+    const float shift = m1_round_bf16(maximum);
+    // The exponentials, and their width-32 chunk sums (the tree's first
+    // level) into the keep plane, which the cut has not reached yet.
+    float* chunk_sums = reinterpret_cast<float*>(keep + ((base + 3u) & ~3u));
+    const m1_u32 first_chunk = g.lo >> 5;
+    const m1_u32 end_chunk = (g.hi + 31u) >> 5;
+    for (m1_u32 c = first_chunk + warp; c < end_chunk; c += warps) {
+      const m1_u32 i = c * 32u + lane;
+      float e = i < len
+          ? m1_round_bf16(expf(m1_round_bf16(m1_round_bf16(x_at(i) - shift) * inverse)))
+          : 0.0f;
+      for (m1_u32 offset = 16u; offset > 0u; offset >>= 1u) {
+        const float other = m1_chunk_down(e, offset);
+        if (lane < offset) e = e + other;
+      }
+      if (lane == 0u) M1_LANE_PUT32(reinterpret_cast<m1_u32*>(chunk_sums) + c, __float_as_uint(e));
+    }
+    g.barrier();
+    const float sum = m1_lane_tree(chunk_sums, (len + 31u) >> 5, 0.0f, tree_work,
+                                   [](float a, float b) { return a + b; });
+    // Every block has read the chunk sums before any overwrites them (the
+    // cut writes the keep plane).
+    g.barrier();
+    // The probabilities (the exponentials again, as the reference's), the
+    // top-p cut's notes taken on the way. Over finite logits they are known
+    // before they are made: none negative, wide or NaN, the largest the
+    // maximum's 1 / sum, the least the least logit's; the fast cut's first
+    // pass rides along.
+    if constexpr (!RANK) m1_cut_reset(cut);
+    const bool counted = !RANK && range.finite != 0u;
+    m1_u32 least = 0xFFFFFFFFu;
+    m1_u32 most = 0u;
+    int stretch = 0;
+    M1Fast& fs = m1_fast_state();
+    if (counted) {
+      // q is monotone in x (rising for a positive scale): its bounds are the
+      // probabilities of the row's largest and least logits, either way.
+      const m1_u32 at_max = m1_desc_key(prob(maximum, shift, sum));
+      const m1_u32 at_least = m1_desc_key(prob(range.least, shift, sum));
+      least = at_max < at_least ? at_max : at_least;
+      most = at_max < at_least ? at_least : at_max;
+      if (most < least) most = least;
+      stretch = m1_fast_stretch(least, most);
+      m1_fast_clear(fs);
+    }
+    __syncthreads();
+    for (m1_u32 i = g.lo + threadIdx.x; i < g.hi; i += blockDim.x) {
+      const float q = prob(x_at(i), shift, sum);
+      m1_store_h(probs, base + i, q);
+      if constexpr (!RANK) {
+        if (counted) m1_fast_note(fs, m1_fast_bucket(m1_desc_key(q), least, stretch), i, q);
+        else m1_cut_note(cut, i, q, least, most);
+      }
+    }
+    // The cut; where its verdicts follow from its outcome (top-k's key, a
+    // top-p walk's pivot), the argmax pass takes them from it.
+    bool marked = false;
+    m1_u32 rank_key = 0u;
+    m1_u32 rank_k = 0u;
+    if constexpr (RANK) {
+      m1_u32 k;
+      if (threshold_desc.dtype == 1u) {
+        const int signed_k = m1_load_i(threshold, m1_pick(threshold_desc.len, row), threshold_desc.dtype);
+        k = signed_k <= 0 ? 0u : (m1_u32)signed_k;
+      } else {
+        k = m1_load_u(threshold, m1_pick(threshold_desc.len, row), threshold_desc.dtype);
+      }
+      if (k > len) k = len;
+      __syncthreads();
+      rank_k = k;
+      if (k != 0u) rank_key = m1_rank_row(probs, base, len, M1_DT_BF16, k, keep, g, false);
+    } else {
+      const float cutoff = m1_load_f(threshold, m1_pick(threshold_desc.len, row), threshold_desc.dtype);
+      if (counted) {
+        __syncthreads();
+        g.fast_counted(fs);
+        if (threadIdx.x == 0u) {
+          cut.key_least = least;
+          cut.key_most = most;
+          const m1_u32 differ = least ^ most;
+          m1_u32 skip = 0u;
+          while (skip < 3u && (differ >> (24u - 8u * skip)) == 0u) ++skip;
+          cut.key_skip = skip;
+        }
+        __syncthreads();
+        g.counted = true;
+      } else {
+        m1_cut_enter(cut, g, least, most);
+      }
+      m1_cut_walk(probs, base, len, M1_DT_BF16, cutoff, keep, cut, g);
+      if (cut.negative != 0u) {
+        m1_cut_mark(probs, base, M1_DT_BF16, keep, cut, g);
+        marked = true;
+      }
+    }
+    // The cut logits, Gumbel noise, the argmax.
+    M1ArgmaxCandidate best{m1_neg_inf(), 0u, 0u, 0u};
+    for (m1_u32 i = g.lo + threadIdx.x; i < g.hi; i += blockDim.x) {
+      bool kept;
+      if (marked) {
+        kept = m1_load_b(keep, base + i, 3u);
+      } else {
+        const float q = m1_load_h(probs, base + i);
+        if constexpr (RANK) kept = rank_k != 0u && !m1_isnan(q) && m1_desc_key(q) <= rank_key;
+        else kept = m1_cut_kept(cut, i, q);
+      }
+      // A cut element's value is -inf whatever its noise (the uniform draw
+      // stays inside (0, 1), so the noise is finite): it is not drawn.
+      float value = m1_neg_inf();
+      if (kept) {
+        const float uniform = ptir_rng_hash_uniform(seed, base + i);
+        value = x_at(i) * inverse + (-logf(-logf(uniform)));
       }
       const M1ArgmaxCandidate next{value, i, m1_isnan(value) ? 0u : 1u, 0u};
       best = m1_argmax_combine(best, next);

@@ -684,7 +684,7 @@ impl<B: Backend> Pools<B> {
             self.pool.growth(),
             self.pool.committed_segments(),
             &self.shape_rows,
-            [self.host_chunks, self.disk_pages()],
+            [self.host_chunks, self.disk_chunks()],
             &self.act_chunks,
         )
     }
@@ -847,6 +847,14 @@ impl<B: Backend> Pools<B> {
             vec![0; self.pieces() as usize]
         };
         Ok((pages, record))
+    }
+
+    /// `pages` rs-list slot refs any lane may take, as
+    /// [`Pools::walk_refs`] names the kv list's: a bind-only fire reads and
+    /// writes none of them.
+    pub fn walk_rs_refs(&self, pages: u32) -> Result<Vec<u32>> {
+        let per_chunk = self.shape(RS)?.per_chunk.max(1);
+        Ok((0..pages).map(|at| per_chunk + at % per_chunk).collect())
     }
 
     /// The physical page explicit write descriptor page `page` names.
@@ -1175,16 +1183,17 @@ impl<B: Backend> Pools<B> {
         Ok(CacheTable(rows, states))
     }
 
-    /// Zeroes the record at `units` (a piece each): a fresh lane's state.
-    /// The caller has drained every frame.
-    pub fn clear(&mut self, units: &[u32]) -> Result<()> {
+    /// Zeroes the record at `units` (a piece each) in `frame`: a fresh
+    /// lane's state, written in queue order, after every frame submitted
+    /// before and before every one submitted after.
+    pub fn clear(&self, frame: &mut B::Frame, units: &[u32]) -> Result<()> {
         if !self.has_state() {
             return Ok(());
         }
         let bytes = self.shape(FIXED)?.slot_bytes;
         let unit = self.unit(FIXED)?;
         for &id in units {
-            self.pool.zero(u64::from(id) * unit, bytes)?;
+            self.pool.zero(frame, u64::from(id) * unit, bytes)?;
         }
         Ok(())
     }
@@ -1322,8 +1331,9 @@ impl<B: Backend> Pools<B> {
 
     /// Slots of one shape copied as [`engine::Engine::copy_slots`] states
     /// them: on the device (whole slots, and token runs of the list),
-    /// between the device and the host chunks, or between the device and
-    /// the slot file. A host or disk copy waits out its frame. A record's
+    /// between the device and the host chunks, or between the device (or
+    /// the host chunks) and the slot file. A host or disk copy waits out its
+    /// frame. A record's
     /// own frozen position goes where its slot does ([`frozen`]).
     pub fn copy_slots(
         &mut self,
@@ -1455,10 +1465,18 @@ impl<B: Backend> Pools<B> {
                 let (slots, ids): (Vec<u32>, Vec<u32>) = copy.slots.iter().copied().unzip();
                 self.spill(device, copy.shape, false, &ids, &slots)
             }
+            (MemoryDomain::HostPinned, MemoryDomain::LocalDisk) => {
+                let (ids, slots): (Vec<u32>, Vec<u32>) = copy.slots.iter().copied().unzip();
+                self.spill_host(copy.shape, true, &ids, &slots)
+            }
+            (MemoryDomain::LocalDisk, MemoryDomain::HostPinned) => {
+                let (slots, ids): (Vec<u32>, Vec<u32>) = copy.slots.iter().copied().unzip();
+                self.spill_host(copy.shape, false, &ids, &slots)
+            }
             (src, dst) => Err(Fault::Unbound {
                 what: format!(
                     "a slot copy from {src:?} to {dst:?}: this pool moves slots within the \
-                     device, to its host chunks and to its slot file"
+                     device, to its host chunks, and from either to its disk chunks"
                 ),
             }),
         }
@@ -1573,8 +1591,45 @@ impl<B: Backend> Pools<B> {
         Ok(())
     }
 
-    /// Copies whole kv list slots (slot refs `ids`) and the slot file's
-    /// `slots` the way `to_disk` says. The caller has drained every frame.
+    /// The bytes one disk chunk takes: a pool chunk, on a direct I/O
+    /// boundary. A disk chunk is laid out as the device's (and the host
+    /// tier's), any shape's slots in any chunk.
+    #[must_use]
+    pub fn disk_chunk_bytes(&self) -> u64 {
+        self.layout
+            .chunk_bytes
+            .next_multiple_of(engine::disk::ALIGN as u64)
+    }
+
+    /// How the slot file divides the disk tier: each shape's id, its slots
+    /// a disk chunk and the bytes of each, packed as on the device.
+    #[must_use]
+    pub fn disk_division(&self) -> Vec<(ShapeId, u32, u64)> {
+        self.layout
+            .shapes()
+            .map(|shape| (shape.id, shape.per_chunk, shape.slot_bytes))
+            .collect()
+    }
+
+    /// The byte of the slot file disk ref `slot` of shape `id` starts at:
+    /// slot `index` of disk chunk `chunk`, as on the device.
+    fn disk_place(&self, id: ShapeId, slot: u32) -> Result<u64> {
+        let shape = *self.shape(id)?;
+        let (chunk, index) = shape.split(slot);
+        let have = self.disk_chunks();
+        if chunk >= have {
+            return Err(Fault::Ceiling {
+                what: "chunks of the disk tier",
+                need: u64::from(chunk) + 1,
+                have: u64::from(have),
+            });
+        }
+        Ok(u64::from(chunk) * self.disk_chunk_bytes() + u64::from(index) * shape.slot_bytes)
+    }
+
+    /// Copies whole slots of shape `id` between the device (slot refs
+    /// `ids`) and the slot file (disk refs `slots`) the way `to_disk` says.
+    /// The caller has drained every frame.
     fn spill(
         &mut self,
         device: &B::Context,
@@ -1583,41 +1638,116 @@ impl<B: Backend> Pools<B> {
         ids: &[u32],
         slots: &[u32],
     ) -> Result<()> {
-        if id != LIST {
-            return Err(Fault::Unbound {
-                what: format!("slot shape {id} to the slot file, which holds kv list slots"),
-            });
-        }
-        Spill::room(self.disk.as_ref(), "disk kv pages", slots)?;
-        let bytes = self.page_bytes();
-        let places = ids
+        let bytes = self.shape(id)?.slot_bytes;
+        let places = slots
             .iter()
-            .map(|&slot| self.slot_offset(LIST, slot))
+            .map(|&slot| self.disk_place(id, slot))
+            .collect::<Result<Vec<_>>>()?;
+        let offsets = ids
+            .iter()
+            .map(|&slot| self.slot_offset(id, slot))
             .collect::<Result<Vec<_>>>()?;
         let Some(mut disk) = self.disk.take() else {
             return Ok(());
         };
-        let copied = places.into_iter().zip(slots).try_for_each(|(at, &slot)| {
-            let (buffer, local) = self.pool.locate(at)?;
-            disk.copy(device, buffer, local, bytes, to_disk, slot)
-        });
+        let copied = offsets
+            .into_iter()
+            .map(|at| self.pool.locate(at))
+            .collect::<Result<Vec<_>>>()
+            .and_then(|rows| disk.copy(device, &rows, &places, bytes, to_disk));
         self.disk = Some(disk);
         copied
     }
 
-    /// Opens the kv slot file under `dir` within `budget` bytes; the kv
-    /// pages it holds.
+    /// Copies whole slots of shape `id` between the host chunks (host slot
+    /// refs `ids`) and the slot file (disk refs `slots`) the way `to_disk`
+    /// says: the host tier's idle state going on down to disk, and back.
+    /// The bytes pass through the host alone. The caller has drained every
+    /// frame.
+    fn spill_host(&mut self, id: ShapeId, to_disk: bool, ids: &[u32], slots: &[u32]) -> Result<()> {
+        let bytes = self.shape(id)?.slot_bytes;
+        let places = slots
+            .iter()
+            .map(|&slot| self.disk_place(id, slot))
+            .collect::<Result<Vec<_>>>()?;
+        let hosts = ids
+            .iter()
+            .map(|&slot| self.host_offset(id, slot))
+            .collect::<Result<Vec<_>>>()?;
+        let Some(file) = self.disk.as_ref().map(Spill::file) else {
+            return Ok(());
+        };
+        let len = usize::try_from(bytes).unwrap_or(usize::MAX);
+        let mut stage = engine::disk::Aligned::zeroed(cover_room(bytes));
+        let mut edge = engine::disk::Aligned::zeroed(engine::disk::ALIGN);
+        for (at, disk_at) in hosts.into_iter().zip(places) {
+            let (start, span, lead) = cover(disk_at, bytes);
+            let staged = &mut stage.as_mut_slice()[..span];
+            let span = |host_len: usize| {
+                let from = usize::try_from(at).unwrap_or(usize::MAX);
+                from.checked_add(len)
+                    .filter(|&end| end <= host_len)
+                    .map(|end| from..end)
+                    .ok_or(Fault::Ceiling {
+                        what: "bytes of the host chunks",
+                        need: at + bytes,
+                        have: host_len as u64,
+                    })
+            };
+            if to_disk {
+                let slot = &mut staged[lead..lead + len];
+                match &self.host {
+                    HostChunks::Mapped(host) => host
+                        .as_ref()
+                        .ok_or(Fault::Ceiling {
+                            what: "host chunks of the state pool",
+                            need: 1,
+                            have: 0,
+                        })?
+                        .read(at, slot)?,
+                    HostChunks::Heap(host) => {
+                        slot.copy_from_slice(&host[span(host.len())?]);
+                    }
+                }
+                keep_edges(file, start, staged, lead, len, &mut edge)?;
+                file.write_span(start, staged).map_err(slot_file)?;
+            } else {
+                file.read_span(start, staged).map_err(slot_file)?;
+                let slot = &staged[lead..lead + len];
+                match &mut self.host {
+                    HostChunks::Mapped(host) => host
+                        .as_mut()
+                        .ok_or(Fault::Ceiling {
+                            what: "host chunks of the state pool",
+                            need: 1,
+                            have: 0,
+                        })?
+                        .write(at, slot)?,
+                    HostChunks::Heap(host) => {
+                        let span = span(host.len())?;
+                        host[span].copy_from_slice(slot);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Opens the slot file under `dir` within `budget` bytes: chunks of
+    /// [`Self::disk_chunk_bytes`], any shape's slots in any chunk, laid out
+    /// as on the device. The disk chunks it holds.
     pub fn seat_disk(
         &mut self,
         device: &B::Context,
         dir: &std::path::Path,
         budget: u64,
     ) -> Result<u32> {
-        let page = self.page_bytes();
-        if page > 0 {
-            self.disk = Spill::open(device, dir, "r0.kv", page, budget)?;
+        let chunk = self.disk_chunk_bytes();
+        let widest = self.layout.shapes().map(|shape| shape.slot_bytes).max();
+        if let (true, Some(widest)) = (chunk > 0, widest) {
+            self.disk = Spill::open(device, dir, "r0.state", chunk, cover_room(widest) as u64, budget)?;
         }
-        Ok(self.disk_pages())
+        Ok(self.disk_chunks())
     }
 
     /// Whether the host chunks are device-mapped memory a frame copies
@@ -1641,8 +1771,9 @@ impl<B: Backend> Pools<B> {
         self.disk = None;
     }
 
+    /// The disk tier's chunks.
     #[must_use]
-    pub fn disk_pages(&self) -> u32 {
+    pub fn disk_chunks(&self) -> u32 {
         Spill::slots(self.disk.as_ref())
     }
 
@@ -1738,7 +1869,54 @@ enum HostChunks<B: Backend> {
 /// The bytes a batched spill stages at once.
 const STAGE_BYTES: usize = 32 << 20;
 
-/// The kv slot file and how slots reach it: through one mapped stage that
+/// The aligned span of the slot file the bytes `[at, at + len)` lie in:
+/// its first byte, its length, and the byte `at` falls on within it.
+fn cover(at: u64, len: u64) -> (u64, usize, usize) {
+    let align = engine::disk::ALIGN as u64;
+    let start = at / align * align;
+    let end = (at + len).next_multiple_of(align);
+    (
+        start,
+        usize::try_from(end - start).unwrap_or(usize::MAX),
+        usize::try_from(at - start).unwrap_or(usize::MAX),
+    )
+}
+
+/// The bytes a cover of a slot of `slot_bytes` takes at most.
+fn cover_room(slot_bytes: u64) -> usize {
+    let align = engine::disk::ALIGN as u64;
+    usize::try_from(slot_bytes.next_multiple_of(align) + align).unwrap_or(usize::MAX)
+}
+
+/// Fills `span` (the cover from `start`) outside the slot's `[lead, lead +
+/// len)` from the file, so writing the whole span leaves the slots beside
+/// it as they are; `edge` is one aligned block of scratch. Run right before
+/// the write, after any earlier write of the same blocks.
+fn keep_edges(
+    file: &engine::disk::SlotFile,
+    start: u64,
+    span: &mut [u8],
+    lead: usize,
+    len: usize,
+    edge: &mut engine::disk::Aligned,
+) -> Result<()> {
+    let align = engine::disk::ALIGN;
+    let block = edge.as_mut_slice();
+    if lead > 0 {
+        file.read_span(start, block).map_err(slot_file)?;
+        span[..lead].copy_from_slice(&block[..lead]);
+    }
+    let end = lead + len;
+    if end < span.len() {
+        let last = span.len() - align;
+        file.read_span(start + last as u64, block)
+            .map_err(slot_file)?;
+        span[end..].copy_from_slice(&block[end - last..]);
+    }
+    Ok(())
+}
+
+/// The slot file and how slots reach it: through one mapped stage that
 /// stands for the file's life where the API maps host memory, else through
 /// stages that live for one copy, so an idle tier holds no memory.
 #[derive(Debug)]
@@ -1748,6 +1926,8 @@ enum Spill<B: Backend> {
         stage: B::Buffer,
         /// The mapping need not start on the boundary direct I/O asks for.
         at: usize,
+        /// The bytes the stage holds past `at`: the widest slot's cover.
+        room: usize,
         /// A copy out of the stage may still be in flight.
         landing: Option<B::Pending>,
     },
@@ -1757,24 +1937,28 @@ enum Spill<B: Backend> {
 }
 
 impl<B: Backend> Spill<B> {
+    /// The file of `budget` bytes in chunks of `chunk_bytes`, a slot's
+    /// cover `stride` bytes at most.
     fn open(
         device: &B::Context,
         dir: &std::path::Path,
         name: &str,
-        slot_bytes: u64,
+        chunk_bytes: u64,
+        stride: u64,
         budget: u64,
     ) -> Result<Option<Spill<B>>> {
         let Some(file) =
-            engine::disk::SlotFile::open(dir, name, slot_bytes, budget).map_err(slot_file)?
+            engine::disk::SlotFile::open(dir, name, chunk_bytes, budget).map_err(slot_file)?
         else {
             return Ok(None);
         };
         if !B::MAPS_HOST {
             return Ok(Some(Spill::Batched { file }));
         }
+        let room = usize::try_from(stride).unwrap_or(usize::MAX);
         let stage = B::Buffer::host(
             device,
-            (file.stride() + engine::disk::ALIGN) as u64,
+            stride + engine::disk::ALIGN as u64,
             crate::books::owners::SPILL,
         )?;
         let mapped = stage.mapped_ptr().ok_or(Fault::Deviceless)?;
@@ -1782,6 +1966,7 @@ impl<B: Backend> Spill<B> {
             file,
             stage,
             at: mapped.next_multiple_of(engine::disk::ALIGN) - mapped,
+            room,
             landing: None,
         }))
     }
@@ -1796,60 +1981,62 @@ impl<B: Backend> Spill<B> {
         spill.map_or(0, |spill| spill.file().slots())
     }
 
-    fn room(spill: Option<&Spill<B>>, what: &'static str, slots: &[u32]) -> Result<()> {
-        let have = u64::from(Spill::slots(spill));
-        match slots.iter().find(|&&slot| u64::from(slot) >= have) {
-            Some(&slot) => Err(Fault::Ceiling {
-                what,
-                need: u64::from(slot) + 1,
-                have,
-            }),
-            None => Ok(()),
-        }
-    }
-
-    /// One slot's `bytes` at `local` of `buffer` and file slot `slot`: a
-    /// write returns once on disk; a read once its copy onto the device is
-    /// submitted (mapped) or has landed (batched).
+    /// Slots of `bytes` each at `rows` (a buffer and the byte in it) and at
+    /// bytes `places` of the file: a write returns once on disk; a read
+    /// once its copy onto the device is submitted (mapped) or has landed
+    /// (batched).
     #[allow(unsafe_code)]
     fn copy(
         &mut self,
         device: &B::Context,
-        buffer: &B::Buffer,
-        local: u64,
+        rows: &[(&B::Buffer, u64)],
+        places: &[u64],
         bytes: u64,
         to_disk: bool,
-        slot: u32,
     ) -> Result<()> {
         let Spill::Mapped {
             file,
             stage,
             at,
+            room,
             landing,
         } = self
         else {
-            return self.copy_batched(device, &[(buffer, local, bytes)], to_disk, &[0], &[slot]);
+            return self.copy_batched(device, rows, places, bytes, to_disk);
         };
-        let stride = file.stride();
         let base = stage.mapped_ptr().ok_or(Fault::Deviceless)? + *at;
-        if let Some(landing) = landing.take() {
-            landing.wait()?;
-        }
-        // SAFETY: the stage stays mapped while `self` lives, and no copy in
-        // flight touches it now (waited above, or committed below).
-        let staged = unsafe { std::slice::from_raw_parts_mut(base as *mut u8, stride) };
-        if !to_disk {
-            file.read(slot, staged).map_err(slot_file)?;
-        }
-        let mut frame = device.frame()?;
-        let offset = *at as u64;
-        if to_disk {
-            frame.copy(buffer, local, stage, offset, bytes)?;
-            frame.commit()?;
-            file.write(slot, staged).map_err(slot_file)?;
-        } else {
-            frame.copy(stage, offset, buffer, local, bytes)?;
-            *landing = Some(frame.commit_async(None)?);
+        let len = usize::try_from(bytes).unwrap_or(usize::MAX);
+        let mut edge = engine::disk::Aligned::zeroed(engine::disk::ALIGN);
+        for (&(buffer, local), &disk_at) in rows.iter().zip(places) {
+            let (start, span, lead) = cover(disk_at, bytes);
+            if span > *room {
+                return Err(Fault::Ceiling {
+                    what: "bytes of the slot file's stage",
+                    need: span as u64,
+                    have: *room as u64,
+                });
+            }
+            if let Some(landing) = landing.take() {
+                landing.wait()?;
+            }
+            // SAFETY: the stage stays mapped while `self` lives, holds
+            // `room` bytes past `at`, and no copy in flight touches it now
+            // (waited above, or committed below).
+            let staged = unsafe { std::slice::from_raw_parts_mut(base as *mut u8, span) };
+            if !to_disk {
+                file.read_span(start, staged).map_err(slot_file)?;
+            }
+            let mut frame = device.frame()?;
+            let offset = (*at + lead) as u64;
+            if to_disk {
+                frame.copy(buffer, local, stage, offset, bytes)?;
+                frame.commit()?;
+                keep_edges(file, start, staged, lead, len, &mut edge)?;
+                file.write_span(start, staged).map_err(slot_file)?;
+            } else {
+                frame.copy(stage, offset, buffer, local, bytes)?;
+                *landing = Some(frame.commit_async(None)?);
+            }
         }
         Ok(())
     }
@@ -1862,17 +2049,19 @@ impl<B: Backend> Spill<B> {
     fn copy_batched(
         &self,
         device: &B::Context,
-        planes: &[(&B::Buffer, u64, u64)],
+        rows: &[(&B::Buffer, u64)],
+        places: &[u64],
+        bytes: u64,
         to_disk: bool,
-        ids: &[u32],
-        slots: &[u32],
     ) -> Result<()> {
         let file = self.file();
-        let stride = file.stride();
-        let batch = (STAGE_BYTES / stride).max(1).min(ids.len());
-        if batch == 0 {
+        if rows.is_empty() {
             return Ok(());
         }
+        // Each row's cover in a stride of its own, from an `ALIGN` boundary.
+        let stride = cover_room(bytes);
+        let len = usize::try_from(bytes).unwrap_or(usize::MAX);
+        let batch = (STAGE_BYTES / stride).max(1).min(rows.len());
         let kind = if to_disk {
             Memory::Readback
         } else {
@@ -1884,35 +2073,37 @@ impl<B: Backend> Spill<B> {
             kind,
             crate::books::owners::SPILL,
         )?;
-        // A multiple of the stride from an `ALIGN` boundary, so each slot in
-        // it is one aligned stage.
         let mut host = engine::disk::Aligned::zeroed(batch * stride);
-        for (ids, slots) in ids.chunks(batch).zip(slots.chunks(batch)) {
-            let staged = &mut host.as_mut_slice()[..ids.len() * stride];
+        let mut edge = engine::disk::Aligned::zeroed(engine::disk::ALIGN);
+        for (rows, places) in rows.chunks(batch).zip(places.chunks(batch)) {
+            let staged = &mut host.as_mut_slice()[..rows.len() * stride];
             if !to_disk {
-                for (&slot, row) in slots.iter().zip(staged.chunks_exact_mut(stride)) {
-                    file.read(slot, row).map_err(slot_file)?;
+                for (&at, row) in places.iter().zip(staged.chunks_exact_mut(stride)) {
+                    let (start, span, _) = cover(at, bytes);
+                    file.read_span(start, &mut row[..span])
+                        .map_err(slot_file)?;
                 }
                 stage.write(0, staged)?;
             }
             let mut frame = device.frame()?;
-            for (row, &id) in ids.iter().enumerate() {
-                let mut offset = (row * stride) as u64;
-                for &(slab, plane, bytes) in planes {
-                    let on_device = plane + u64::from(id) * bytes;
-                    if to_disk {
-                        frame.copy(slab, on_device, &stage, offset, bytes)?;
-                    } else {
-                        frame.copy(&stage, offset, slab, on_device, bytes)?;
-                    }
-                    offset += bytes;
+            for (row, (&(slab, on_device), &at)) in rows.iter().zip(places).enumerate() {
+                let offset = (row * stride + cover(at, bytes).2) as u64;
+                if to_disk {
+                    frame.copy(slab, on_device, &stage, offset, bytes)?;
+                } else {
+                    frame.copy(&stage, offset, slab, on_device, bytes)?;
                 }
             }
             frame.commit()?;
             if to_disk {
                 stage.read(0, staged)?;
-                for (&slot, row) in slots.iter().zip(staged.chunks_exact(stride)) {
-                    file.write(slot, row).map_err(slot_file)?;
+                // One row after another, each keeping what the rows before
+                // it wrote beside it.
+                for (&at, row) in places.iter().zip(staged.chunks_exact_mut(stride)) {
+                    let (start, span, lead) = cover(at, bytes);
+                    let row = &mut row[..span];
+                    keep_edges(file, start, row, lead, len, &mut edge)?;
+                    file.write_span(start, row).map_err(slot_file)?;
                 }
             }
         }

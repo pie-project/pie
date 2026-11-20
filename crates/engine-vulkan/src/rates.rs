@@ -22,8 +22,8 @@ pub fn provenance(device: &str) -> (&'static str, String) {
 }
 
 /// The bound the platform states on one GPU submission
-/// ([`engine_gpu::rates::STATED_SUBMIT_BOUND`]).
-pub use engine_gpu::rates::STATED_SUBMIT_BOUND;
+/// ([`engine_gpu::rates::stated_submit_bound`]).
+pub use engine_gpu::rates::stated_submit_bound;
 
 /// `tuning` with every roofline constant stated
 /// (`engine::rates::rates_at_load`, every engine's rule): as its layers
@@ -47,7 +47,7 @@ pub fn at_load(
     });
     let chip = engine::rates::rates_at_load(
         chip,
-        &engine_gpu::rates::KEYS,
+        &engine_gpu::rates::keys_at(max_submit),
         save,
         Some(device.left()),
         max_submit,
@@ -72,7 +72,7 @@ pub fn measure(
     let timer = |frame: Frame| Ok((None, (frame.commit_timed()? * 1e9) as u64));
     tracing::debug!(
         bound_ms = ?max_submit.map(|b| b.as_secs_f64() * 1e3),
-        stated = ?STATED_SUBMIT_BOUND.map(|b| b.as_secs_f64() * 1e3),
+        stated = ?stated_submit_bound().map(|b| b.as_secs_f64() * 1e3),
         "rates: measuring, each submission within the bound"
     );
     engine_gpu::rates::measure::<Api, _>(device, tuning, tier, &timer, max_submit, stated)
@@ -87,7 +87,7 @@ pub fn measure_saying(
     let tier = <Api as engine_gpu::serve::Serve>::tier(device);
     let timer = |frame: Frame| Ok((None, (frame.commit_timed()? * 1e9) as u64));
     tracing::debug!(
-        bound_ms = ?STATED_SUBMIT_BOUND.map(|b| b.as_secs_f64() * 1e3),
+        bound_ms = ?stated_submit_bound().map(|b| b.as_secs_f64() * 1e3),
         "rates: measuring (pie tune), each submission within the bound"
     );
     engine_gpu::rates::measure_saying::<Api, _>(
@@ -95,7 +95,7 @@ pub fn measure_saying(
         tuning,
         tier,
         &timer,
-        STATED_SUBMIT_BOUND,
+        stated_submit_bound(),
         &profile::fire::Rates::default(),
         say,
     )

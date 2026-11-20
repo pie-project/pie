@@ -51,6 +51,10 @@ impl Serve for Api {
     /// takes from there and lands its puts there.
     const CHANNEL_CELLS: bool = false;
 
+    /// A step's guest passes run once it landed (`landing`), and a later
+    /// fire may be on the queue by then: they read the arm's seat.
+    const READS_SPAN: bool = false;
+
     const TARGET: kernels_slang::Target = kernels_slang::Target::Wgsl;
 
     fn table_align(device: &Context) -> u64 {
@@ -80,7 +84,7 @@ impl Serve for Api {
             &device,
             tuning,
             boot.profiles.as_deref(),
-            crate::rates::STATED_SUBMIT_BOUND,
+            crate::rates::stated_submit_bound(),
         )?;
         Ok((device, tuning))
     }
@@ -253,13 +257,19 @@ impl Serve for Api {
             ..
         } = launch;
         let arm = prepared.arm;
-        let hosted = layout
+        // The host reads back its own spans alone: the rest of the seat is
+        // for the step's programs, on the device.
+        let hosted: Vec<(u64, u64, u64)> = layout
             .iter()
-            .filter(|span| span.host)
-            .map(|span| span.at + span.bytes())
-            .max()
-            .unwrap_or(0);
-        frame.copy(&shell.readout[arm], 0, &shell.shelf.mirror[arm], 0, hosted)?;
+            .filter(|span| span.hosted && span.rows > 0)
+            .map(|span| (span.at, span.at, span.bytes()))
+            .collect();
+        engine_gpu::backend::Frame::copy_regions(
+            &mut frame,
+            &shell.readout[arm],
+            &shell.shelf.mirror[arm],
+            &hosted,
+        )?;
         let on_done = crate::landing::on_done(
             crate::landing::Seat {
                 seq,
