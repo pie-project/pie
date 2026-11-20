@@ -427,6 +427,16 @@ impl Shell {
         Ok(fired)
     }
 
+    /// Runs a beam group's head (`crate::store::beam`) before its fire.
+    pub fn run_beam_head(
+        &mut self,
+        layout: kernels_xla::beam::Layout,
+        head: &crate::store::beam::Head,
+    ) -> Result<()> {
+        self.pools
+            .run_beam_head(&self.device, &self.handles, layout, head)
+    }
+
     /// Lays a beam group's head program at every width rung up to the lane
     /// cap (powers of two; at most a pool row of parents, 128): a group runs
     /// on the smallest rung that holds it. None on a load that keeps no kv

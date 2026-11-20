@@ -680,6 +680,42 @@ impl Plane {
         self.instances.get(&id).and_then(|seat| seat.beam)
     }
 
+    /// Where instance `id`'s beams' parents lie for its next head: its
+    /// carried cell's pool row. A group's first fire primes it and reads no
+    /// parents; a later one whose last epilogue ran on the host (its cell in
+    /// a host ring, not the pool) is refused by name: the parents are read
+    /// on the device only (BEAM-PAGE-LISTS §2).
+    pub fn parents_row(&self, id: InstanceId) -> Result<u32, Refusal> {
+        let held = self.instances.get(&id).ok_or(Refusal::Closed {
+            what: "instance",
+            id: id.0,
+        })?;
+        let Some(seat) = held.beam else {
+            return Err(Refusal::Program(format!("instance {id} states no parents")));
+        };
+        let cell = held
+            .cells
+            .iter()
+            .find(|&&(channel, _)| channel == seat.group.channel);
+        match cell {
+            Some(&(_, row)) if held.on_device => Ok(row),
+            _ if seat.fires == 0 => Ok(seat.row),
+            _ => Err(Refusal::Program(format!(
+                "instance {id}'s parents are in a host ring (its last epilogue ran on the \
+                 host); a beam group reads its parents on the device only"
+            ))),
+        }
+    }
+
+    /// Counts a head run for instance `id`'s group; returns the fire's
+    /// index (its fault set's).
+    pub fn beam_fired(&mut self, id: InstanceId) -> Option<u64> {
+        let seat = self.instances.get_mut(&id)?.beam.as_mut()?;
+        let at = seat.fires;
+        seat.fires += 1;
+        Some(at)
+    }
+
     /// Instance `id`'s beam state moved to the `Instance` run at `row`
     /// (`Engine::rebind_slots`: the runtime copied it there).
     pub fn rebind_beam(&mut self, id: InstanceId, row: u32) {

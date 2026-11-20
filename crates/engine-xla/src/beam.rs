@@ -78,4 +78,43 @@ pub struct Seat {
     pub group: Group,
     pub layout: Layout,
     pub row: u32,
+    /// The heads run for it: its next fire's index (its fault set's).
+    pub fires: u64,
+}
+
+/// A beam of a group in this fire, as its fire reads it: where its group's
+/// head landed the resolved entries (the first row past its state), its
+/// beam and the rung's beams and columns, the set's first pool page (`f0`)
+/// and the fire's column (`c`). Entry `f0 + j` of its table (`j <= c`) and
+/// its row's write page are the head's, not the staged words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BeamLane {
+    pub results_row: u32,
+    pub beam: u32,
+    pub lanes: u32,
+    pub cap: u32,
+    pub first_page: u32,
+    pub column: u32,
+}
+
+impl BeamLane {
+    /// The pool row and lane of word `w` of its group's results.
+    fn word(&self, w: u64) -> (i32, i32) {
+        let row = u64::from(self.results_row) + w / 128;
+        (i32::try_from(row).unwrap_or(i32::MAX), (w % 128) as i32)
+    }
+
+    /// Where entry `j` of its table lies, where the head resolved it.
+    #[must_use]
+    pub fn entry(&self, j: u32) -> Option<(i32, i32)> {
+        let k = j.checked_sub(self.first_page)?;
+        (k <= self.column && k < self.cap)
+            .then(|| self.word(u64::from(self.beam) * u64::from(self.cap) + u64::from(k)))
+    }
+
+    /// Where its row's write page lies.
+    #[must_use]
+    pub fn write(&self) -> (i32, i32) {
+        self.word(u64::from(self.lanes) * u64::from(self.cap) + u64::from(self.beam))
+    }
 }

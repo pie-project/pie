@@ -585,6 +585,7 @@ impl Engine for Xla {
             draft_proposals_from: drafter.map_or(1, |d| d.proposals_from),
             ports: PortMask::DEVICE_GEOMETRY
                 .with(eta_ir::registry::Port::AttnMask)
+                .with(eta_ir::registry::Port::Parents)
                 .with(eta_ir::registry::Port::Fold),
             geometry: GeometryClass::DeviceGeometry,
             kv_handle: None,
@@ -948,7 +949,12 @@ impl Engine for Xla {
                 let row = shell.pools().instance_row(first).ok_or_else(|| {
                     Error::Program(format!("Instance slot {first} lies past the pool"))
                 })?;
-                Some(crate::beam::Seat { group, layout, row })
+                Some(crate::beam::Seat {
+                    group,
+                    layout,
+                    row,
+                    fires: 0,
+                })
             }
             (Some(_), None) => {
                 return Err(Error::Program("a beam group bound before load".to_string()));
@@ -1804,6 +1810,93 @@ impl Xla {
                 }
             }
         }
+        // Beam groups (BEAM-PAGE-LISTS): an instance stating parents, its
+        // lanes its beams; each group's head runs before the fire.
+        let mut beam_lanes: Vec<Option<crate::beam::BeamLane>> = vec![None; submission.lanes.len()];
+        let mut heads: Vec<(kernels_xla::beam::Layout, crate::store::beam::Head)> = Vec::new();
+        for attachment in &submission.attachments {
+            let Some(seat) = self.programs.beam_seat(attachment.instance) else {
+                continue;
+            };
+            let shell = self
+                .shell
+                .as_ref()
+                .ok_or_else(|| Error::Program("a beam fire before load".to_string()))?;
+            let kv = shell.pools().kv_shape().ok_or_else(|| {
+                Error::Program("a beam group on a load that keeps no kv".to_string())
+            })?;
+            let live = self
+                .programs
+                .lane_count(attachment.instance)
+                .map_err(refusal)?;
+            let first = attachment.lane as usize;
+            let beams = submission.lanes.get(first..first + live).ok_or_else(|| {
+                Error::Invalid(format!(
+                    "instance {}'s beams run past the fire's lanes",
+                    attachment.instance
+                ))
+            })?;
+            if live as i64 > seat.layout.lanes {
+                return Err(Error::Program(format!(
+                    "instance {}'s beam group runs {live} beams on a rung of {}",
+                    attachment.instance, seat.layout.lanes
+                )));
+            }
+            let lane0 = &beams[0];
+            let slot = lane0.kv.held;
+            if beams
+                .iter()
+                .any(|lane| lane.kv.held != slot || lane.rows() != 1)
+            {
+                return Err(Error::Program(format!(
+                    "instance {}'s beams write different slots or more than one row; every \
+                     beam writes its depth, one row a fire",
+                    attachment.instance
+                )));
+            }
+            let page = shell.paging().page_size.max(1);
+            let folded = lane0.kv.folded;
+            let f0 = folded / page;
+            let column = (slot / page).saturating_sub(f0);
+            let pool_refs = lane0.reserve.get(f0 as usize..).unwrap_or(&[]);
+            // the pages the beams can name this fire (the lowest-free rule
+            // bounds them: §3), as engine-cuda stages them
+            let frames = self.caps.as_ref().map_or(1, |caps| caps.frames_in_flight);
+            let live32 = live as u32;
+            let backed = (live32 * (column + 2) + live32 * frames + 1).min(pool_refs.len() as u32);
+            let pool = shell
+                .pools()
+                .grains(kv, &pool_refs[..backed as usize])
+                .map_err(fault)?;
+            let parents_row = self
+                .programs
+                .parents_row(attachment.instance)
+                .map_err(refusal)?;
+            let results_row =
+                seat.row + u32::try_from((seat.layout.words() + 127) / 128).unwrap_or(u32::MAX);
+            for (b, slot_of) in beam_lanes[first..first + live].iter_mut().enumerate() {
+                *slot_of = Some(crate::beam::BeamLane {
+                    results_row,
+                    beam: b as u32,
+                    lanes: seat.layout.lanes as u32,
+                    cap: seat.layout.cap as u32,
+                    first_page: f0,
+                    column,
+                });
+            }
+            heads.push((
+                seat.layout,
+                crate::store::beam::Head {
+                    state_row: seat.row,
+                    parents_row,
+                    folded,
+                    slot,
+                    live: live32,
+                    pool,
+                },
+            ));
+            self.programs.beam_fired(attachment.instance);
+        }
         let mut verbs: Vec<engine::fire::RsVerb> = submission
             .lanes
             .iter()
@@ -2037,6 +2130,7 @@ impl Xla {
                 },
                 fixed: lane.record.pieces(),
                 copies: &lane.slot_copies,
+                beam: beam_lanes[at],
             })
             .collect();
         let clips: Vec<crate::serve::Clips<'_>> = submission
@@ -2051,6 +2145,10 @@ impl Xla {
             .collect();
         // The readout stays on the device: guest passes read it there, and
         // the host copy is made only for a row something on the host reads.
+        // each beam group's head, on the pool before the fire (stream order)
+        for (layout, head) in &heads {
+            shell.run_beam_head(*layout, head).map_err(fault)?;
+        }
         shell.feed_tokens(token_feeds);
         let fired = shell.fire_kept_with(&seated, &clips).map_err(fault)?;
         let kept = fired.kept.clone();
