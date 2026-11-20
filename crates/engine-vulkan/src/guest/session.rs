@@ -578,7 +578,7 @@ impl Session {
             // Its bases in words of the run its tables binding spans: the same
             // wherever the run moves, so its records are written once.
             let (bases, _) = run_bases(&tables, slot_bytes)?;
-            let args = StepArgs::of(device, lowered, bases)?;
+            let args = StepArgs::of(device, lowered, &resolved.areas, bases)?;
             stages.push(build_stage(
                 device, plan, lowered, resolved, tables, library, &args, heap,
             )?);
@@ -1229,7 +1229,7 @@ fn staging_fits(core: &Core, resolved: &[StageTables]) -> Result<()> {
 }
 
 /// A stage's step records ([`step_records`]), `stride` apart, with its
-/// instance's `bases` in the run its tables lie in.
+/// nodes' areas and its instance's `bases` in the run its tables lie in.
 pub struct StepArgs {
     buffer: Buffer,
     stride: u64,
@@ -1239,10 +1239,11 @@ impl StepArgs {
     pub fn of(
         device: &Context,
         lowered: &engine_gpu::guest::Lowered,
+        areas: &[u32],
         bases: Bases,
     ) -> Result<StepArgs> {
         let stride = step_stride(device.core().limits.min_uniform_buffer_offset_alignment);
-        let uniforms = step_records(&lowered.steps, stride, bases);
+        let uniforms = step_records(&lowered.steps, areas, stride, bases);
         let mut buffer = Buffer::with(
             device,
             uniforms.len() as u64,

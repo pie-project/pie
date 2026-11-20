@@ -1437,18 +1437,15 @@ fn puts_into(plan: &ExecPlan, channel: u32) -> bool {
 
 /// The bytes a channel's cell takes on the device, where a pass may keep one
 /// there: a channel the host does not read (`guest::run`). A value lies in a
-/// guest heap a word an element, a byte a bool (`ValueDesc::device_bytes`).
+/// guest heap at its dtype's width an element (`eta_exec::element_bytes`,
+/// as `ValueDesc::device_bytes` lays it).
 fn device_cell_bytes(shape: &[u32], dtype: ChanDType, host_role: HostRole) -> Option<u64> {
     if host_role == HostRole::Reader {
         return None;
     }
     let numel = numel_of(shape) as u64;
-    let bytes = if eta_exec::concrete_dtype(dtype) == eta_ir::Dtype::Bool {
-        numel
-    } else {
-        numel * 4
-    };
-    Some(bytes.max(4))
+    let element = eta_exec::element_bytes(eta_exec::concrete_dtype(dtype));
+    Some(numel.saturating_mul(element).max(4))
 }
 
 /// A channel's device cell as `Channel` slots: a slot where the cell fits

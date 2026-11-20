@@ -34,7 +34,7 @@ pub use cache::{
 };
 pub use channel::{ChannelState, HostOp, InterpInstance, host_put, host_take, make_host_instance};
 pub use emitted::{Duplicate, Emitted, Slot};
-pub use extent::{Extents, Role, Unresolvable, ValueDesc, describe};
+pub use extent::{Extents, Role, Unresolvable, ValueDesc, describe, element_bytes};
 pub use identity::{
     Backend, COMPILER_VERSION, REGION_PLAN_VERSION, Versions, cache_identity, combined_signature,
 };
@@ -52,9 +52,9 @@ pub use registry::{
 };
 pub use scratch::{
     ALIGN as SCRATCH_ALIGN, ChunkLayout, DUMMY_BYTES as SCRATCH_DUMMY_BYTES, Item as ScratchItem,
-    Launch, Launches, Layout, Lifetime, MAX_BYTES as SCRATCH_MAX_BYTES, POISON as SCRATCH_POISON,
+    Area as ScratchArea, Keeps, Launch, Launches, Layout, Lifetime, MAX_BYTES as SCRATCH_MAX_BYTES, POISON as SCRATCH_POISON,
     Pieces, Placed, SELECT_RESERVE, TemporaryNeed, TemporaryRefused, TooLarge, describe_launched,
-    lay_out, lay_out_chunked, layout, layout_chunked, layout_reusing, most_alive,
+    launch_areas, lay_out, lay_out_chunked, layout, layout_chunked, layout_reusing, most_alive,
     read_only_unlaunched, region_rows, stage_temporaries, value_lifetimes, whole_value_temporaries,
 };
 pub use stage_cache::{Lookup, Stages};
