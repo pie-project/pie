@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -479,6 +480,21 @@ impl ResidencyPlanner {
                     .procs
                     .get(&waiter.pid)
                     .is_some_and(|proc| !proc.seated);
+            // With nothing in flight, a process waiting in the queue runs
+            // nothing: its resident slots are a victim's like any other's,
+            // whatever its rank or the head's seating (the M1 on 3b45462d4:
+            // 138 queued, 364 opened chunks, no candidate holding one).
+            let quiet = inner.nothing_in_flight();
+            let waiting: HashSet<ProcessId> = if quiet {
+                inner
+                    .queue
+                    .values()
+                    .filter(|waiter| waiter.is_unmet())
+                    .map(|waiter| waiter.pid)
+                    .collect()
+            } else {
+                HashSet::new()
+            };
             let members = inner
                 .procs
                 .iter()
@@ -494,7 +510,9 @@ impl ResidencyPlanner {
                         // Waiting at a bind for room, it makes no progress
                         // until room comes: it yields as an idle one does,
                         // to a prompt not yet seated too.
-                        && if seating {
+                        && if waiting.contains(*pid) {
+                            true
+                        } else if seating {
                             proc.idle || proc.held || proc.bind_waiting
                         } else {
                             proc.rank() > head_rank
@@ -518,7 +536,11 @@ impl ResidencyPlanner {
                     // A bind waiter makes no progress until room comes: it
                     // counts as fresh, as an idle one does, or it is never
                     // a pick and the bind waits on it for good.
-                    e6_fresh: proc.progressed || proc.idle || proc.held || proc.bind_waiting,
+                    e6_fresh: proc.progressed
+                        || proc.idle
+                        || proc.held
+                        || proc.bind_waiting
+                        || waiting.contains(pid),
                 })
                 .collect();
             Some((

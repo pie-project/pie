@@ -58,7 +58,14 @@ pub(super) enum WaitKind {
 pub(super) struct Waiter {
     pub(super) pid: ProcessId,
     pub(super) kind: WaitKind,
+    /// When it was queued: a wait past [`LONG_WAIT`] is said with what
+    /// woke the pass that served it.
+    pub(super) since: crate::rt::Instant,
 }
+
+/// A wait long enough that what finally served it is said: a field's gaps
+/// between dispatches past it were what one serve waited on.
+pub(super) const LONG_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
 
 impl Waiter {
     pub(super) fn is_unmet(&self) -> bool {

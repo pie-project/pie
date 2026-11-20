@@ -53,6 +53,9 @@ pub(super) struct Inner {
     /// The room a pass last planned a quiet head on (nothing in flight):
     /// the head and the pool's counts ([`super::ResidencyPlanner::tick`]).
     pub(super) quiet_planned: Option<(super::wait::EntryKey, [u64; 4])>,
+    /// Waits served this pass past [`super::wait::LONG_WAIT`]: the kind and
+    /// how long.
+    pub(super) long_waits: Vec<(&'static str, std::time::Duration)>,
     /// The head held unserved on something in flight: since when, on what
     /// room, and whether that was said ([`super::ResidencyPlanner::tick`]).
     pub(super) held_in_flight:
@@ -223,7 +226,14 @@ impl Inner {
         if matches!(kind, WaitKind::Allocation { .. }) && self.bind_restoring == Some(pid) {
             self.bind_restoring = None;
         }
-        self.queue.insert(key, Waiter { pid, kind });
+        self.queue.insert(
+            key,
+            Waiter {
+                pid,
+                kind,
+                since: crate::rt::Instant::now(),
+            },
+        );
         key
     }
 
@@ -250,6 +260,7 @@ impl Inner {
             if let Some(Waiter {
                 pid,
                 kind: WaitKind::Restore { demand },
+                ..
             }) = self.queue.remove(&key)
                 && let Some(proc) = self.procs.get_mut(&pid)
             {
@@ -441,11 +452,17 @@ impl Inner {
         if !matches!(waiter.kind, WaitKind::Allocation { .. }) {
             return wake;
         }
-        let Inner { queue, accum, .. } = self;
+        let Inner {
+            queue,
+            accum,
+            long_waits,
+            ..
+        } = self;
         for (&key, waiter) in queue.range_mut(head..) {
             if !waiter.is_unmet() {
                 continue;
             }
+            let waited = waiter.since.elapsed();
             let WaitKind::Allocation {
                 demand,
                 notify,
@@ -465,6 +482,9 @@ impl Inner {
             let kv = accum.donate(demand.kv_pages);
             debug_assert!(outcome.is_none(), "an unmet waiter carries no outcome");
             *outcome = Some(Ok(AllocationGrant::new(kv, RsSlotReservation::empty())));
+            if waited > super::wait::LONG_WAIT {
+                long_waits.push(("allocation", waited));
+            }
             wake.push((key, demand.kv_pages, notify.clone()));
         }
         wake

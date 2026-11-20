@@ -7683,6 +7683,82 @@ fn a_quiet_allocation_head_is_planned_again_when_room_comes_free() {
     );
     // Pages come free by a path that tells no one.
     pool.refill_after_stall(2, 0);
+    planner.with_inner(|inner| {
+        let waiter = inner.queue.get_mut(&key).unwrap();
+        waiter.since -= std::time::Duration::from_millis(200);
+    });
     planner.tick();
     assert!(served(&planner), "the free counts moved: planned again, served");
+    assert_eq!(
+        planner.stats.long_waits[usize::from(super::grant::WAKE_BEAT)].load(Ordering::Relaxed),
+        1,
+        "a wait past 100 ms served, attributed to the beat"
+    );
+}
+
+/// The M1 on 3b45462d4: 138 processes queued, 364 opened chunks, none held
+/// by a candidate. A prompt not yet seated takes only idle or held
+/// processes' room, and an older process waits ahead of it untouched; but
+/// with nothing in flight a process waiting in the queue runs nothing, and
+/// its resident slots are a victim's like any other's.
+#[test]
+fn with_nothing_in_flight_a_queued_process_s_slots_are_a_victim_s() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
+    let pool = Arc::new(RacePool::new(8));
+    pool.refill_after_stall(4, 0);
+    let planner = Arc::new(
+        ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>).seated_first(true),
+    );
+    let (waiting, prompt) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [prompt, waiting] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    let held = planner
+        .grant_now(
+            waiting,
+            Demand {
+                kv_pages: 4,
+                rs: RsUnits::default(),
+            },
+        )
+        .expect("the pool is free");
+    planner.with_inner(|inner| {
+        inner.procs.get_mut(&waiting).unwrap().seated = true;
+        // The prompt, not yet seated, heads the queue; the seated process
+        // waits behind it for more.
+        inner.enqueue(
+            prompt,
+            allocation(Demand {
+                kv_pages: 2,
+                rs: RsUnits::default(),
+            }),
+        );
+        inner.enqueue(
+            waiting,
+            allocation(Demand {
+                kv_pages: 1,
+                rs: RsUnits::default(),
+            }),
+        );
+    });
+    let members = |planner: &ResidencyPlanner| {
+        planner
+            .victim_set()
+            .map(|set| set.members.iter().map(|v| v.pid).collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+    // A fire in flight elsewhere: the seating rule holds.
+    let other = ProcessId::new_v4();
+    planner.register(other);
+    planner.note_admitted(other);
+    let fire = planner.fire_in_flight(other);
+    assert!(!members(&planner).contains(&waiting), "a fire in flight: it is spared");
+    drop(fire);
+    planner.with_inner(|inner| inner.procs.get_mut(&other).unwrap().idle = true);
+    assert!(
+        members(&planner).contains(&waiting),
+        "nothing in flight: the queued process's slots are a victim's"
+    );
+    drop(held);
 }

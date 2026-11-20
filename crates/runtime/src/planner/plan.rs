@@ -92,6 +92,10 @@ impl ResidencyPlanner {
         // it stands ([`super::grant::RoomReturns`]), so the drop, which
         // cannot plan itself, wakes the head within this step.
         self.stats.plan_passes.fetch_add(1, Ordering::Relaxed);
+        let cause = self
+            .returns
+            .wake_cause
+            .swap(super::grant::WAKE_CALL, Ordering::AcqRel);
         let on_grow = loop {
             self.returns.planning.store(true, Ordering::Release);
             self.returns.plan_begins();
@@ -127,6 +131,98 @@ impl ResidencyPlanner {
         }
         // A waiter served or gone lacks nothing now.
         self.report_short();
+        self.say_long_waits(cause);
+    }
+
+    /// Every opened chunk, by the live slots it holds and the state of the
+    /// processes holding them: `running` (resident, not queued),
+    /// `queued` (waiting in the queue), `parked` (evicted, its state lying
+    /// on the device), `other` (slots no process is named for: cache, a
+    /// checkpoint). Read as `class:slots-bucket=chunks`. The M1 on
+    /// 3b45462d4: 364 opened chunks, none emptiable, no candidate holding
+    /// any: whose slots held them was unsaid.
+    pub(super) fn held_by_state(&self) -> String {
+        let (all, class) = self.with_inner(|inner| {
+            let queued: std::collections::HashSet<ProcessId> = inner
+                .queue
+                .values()
+                .filter(|waiter| waiter.is_unmet())
+                .map(|waiter| waiter.pid)
+                .collect();
+            let class: std::collections::HashMap<ProcessId, &'static str> = inner
+                .procs
+                .iter()
+                .map(|(pid, proc)| {
+                    let label = if queued.contains(pid) {
+                        "queued"
+                    } else if proc.state == Residency::Resident {
+                        "running"
+                    } else {
+                        "parked"
+                    };
+                    (*pid, label)
+                })
+                .collect();
+            (inner.procs.keys().copied().collect::<Vec<_>>(), class)
+        });
+        let mut map = self.port.chunk_occupants(&all);
+        map.merge(self.port.parked_occupants(super::residency_planner::SWEEP));
+        let bucket = |slots: u32| match slots {
+            0 => "0",
+            1 => "1",
+            2..=3 => "2-3",
+            4..=15 => "4-15",
+            16..=63 => "16-63",
+            _ => "64+",
+        };
+        let mut counts: std::collections::BTreeMap<(String, &'static str), u32> =
+            std::collections::BTreeMap::new();
+        for chunk in &map.held {
+            let mut labels: std::collections::BTreeSet<&'static str> = chunk
+                .by
+                .iter()
+                .map(|(pid, _)| class.get(pid).copied().unwrap_or("parked"))
+                .collect();
+            let named: u32 = chunk.by.iter().map(|&(_, slots)| slots).sum();
+            if named < chunk.used {
+                labels.insert("other");
+            }
+            let label = labels.into_iter().collect::<Vec<_>>().join("+");
+            *counts.entry((label, bucket(chunk.used))).or_default() += 1;
+        }
+        counts
+            .into_iter()
+            .map(|((label, slots), chunks)| format!("{label}:{slots}={chunks}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Each wait served this pass past [`super::wait::LONG_WAIT`], with
+    /// what woke the pass: a field's gaps between dispatches past 100 ms
+    /// (the L40S at 6 GiB) are attributed to the room signal, a poke, the
+    /// beat or a call.
+    fn say_long_waits(&self, cause: u8) {
+        let waits = self.with_inner(|inner| std::mem::take(&mut inner.long_waits));
+        if waits.is_empty() {
+            return;
+        }
+        let woken_by = match cause {
+            super::grant::WAKE_SIGNAL => "room signal",
+            super::grant::WAKE_POKE => "poke (a fire landing, a move ending, pages freed)",
+            super::grant::WAKE_BEAT => "beat",
+            _ => "call (an arrival, a release)",
+        };
+        for (kind, waited) in waits {
+            if let Some(count) = self.stats.long_waits.get(usize::from(cause)) {
+                count.fetch_add(1, Ordering::Relaxed);
+            }
+            tracing::info!(
+                kind,
+                waited_ms = waited.as_millis() as u64,
+                woken_by,
+                "planner: a wait past 100 ms served"
+            );
+        }
     }
 
     /// The pass ended with the queue's head unserved and nothing in flight
@@ -202,6 +298,7 @@ impl ResidencyPlanner {
         let need_moves = need
             .as_ref()
             .map(|need| map.cheapest_need(need).map(|pids| pids.len()));
+        let held_by = self.held_by_state();
         let (map, census) = (map.explain(run), self.port.chunk_census(run));
         // Every head queued fits the pool alone (one past it is refused at
         // its ask): unserved with nothing in flight, the planner found no
@@ -216,6 +313,7 @@ impl ResidencyPlanner {
             again,
             refusal = %refusal.unwrap_or_default(),
             ?need_moves,
+            %held_by,
             free_runs = ?need.as_ref().map(|need| {
                 need.entries()
                     .iter()
@@ -802,7 +900,12 @@ impl ResidencyPlanner {
                             return Board::Replan;
                         }
                         proc.state = Residency::Restoring;
-                        inner.queue.remove(&key);
+                        if let Some(waiter) = inner.queue.remove(&key) {
+                            let waited = waiter.since.elapsed();
+                            if waited > super::wait::LONG_WAIT {
+                                inner.long_waits.push(("restore", waited));
+                            }
+                        }
                         Board::Go(inner.accum.donate(need.kv_pages))
                     });
                     match boarded {

@@ -4,6 +4,9 @@ use std::sync::atomic::AtomicU64;
 pub struct PlannerStats {
     /// Plan passes run (`ResidencyPlanner::plan`).
     pub plan_passes: AtomicU64,
+    /// Waits served past 100 ms, by what woke the pass that served them:
+    /// the room signal, a poke, the beat, a call.
+    pub long_waits: [AtomicU64; 4],
     pub parks: AtomicU64,
     pub serves: AtomicU64,
     pub evictions_started: AtomicU64,

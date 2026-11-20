@@ -19,6 +19,15 @@ impl Demand {
     }
 }
 
+/// A pass woken by an arrival or a call of its own.
+pub(super) const WAKE_CALL: u8 = 0;
+/// By room given back meeting the head's want (the pool's room signal).
+pub(super) const WAKE_SIGNAL: u8 = 1;
+/// By a poke: a fire landing, a move ending, pages freed.
+pub(super) const WAKE_POKE: u8 = 2;
+/// By the beat.
+pub(super) const WAKE_BEAT: u8 = 3;
+
 /// Room given back by a grant dropped with pages or slots unspent, told
 /// the planner without its lock: the drop may run under it (a waiter
 /// cancelled, its served grant dropped with its entry), so it only bumps
@@ -45,6 +54,9 @@ pub(super) struct RoomReturns {
     /// gathered for a head that left) wake nothing, or a pass would wake
     /// its own next pass.
     pub(super) planning: std::sync::atomic::AtomicBool,
+    /// What woke the next pass ([`WAKE_SIGNAL`] and the rest): what served
+    /// a long wait is said by it.
+    pub(super) wake_cause: std::sync::atomic::AtomicU8,
     /// What the queue's head lacks, as the last plan pass left it
     /// ([`super::ResidencyPlanner::publish_wants`]): the device's free
     /// chunks its runs take, the kv list's free slots its pages take, and
@@ -83,6 +95,7 @@ impl RoomReturns {
         if !self.met(count) {
             return;
         }
+        self.wake_cause.store(WAKE_SIGNAL, Ordering::Release);
         match self.drain.get() {
             Some(drain) => drain.notify_one(),
             None => self.room.notify_waiters(),

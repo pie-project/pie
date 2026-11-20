@@ -27,7 +27,7 @@ use super::{ProcessId, exec};
 pub(super) const FIXED_SETS_PER_WORKING_SET: u32 = 1;
 
 /// It suspends no process of its own.
-const SWEEP: ProcessId = ProcessId::nil();
+pub(super) const SWEEP: ProcessId = ProcessId::nil();
 /// The key a demote's pages are expected under while it moves: they come
 /// back once its copy has landed, and a shortfall read meanwhile counts them
 /// arriving instead of evicting another process for room on its way.
@@ -380,9 +380,16 @@ impl ResidencyPlanner {
         // last pass began and now meets what the head lacks (a free that
         // raced that pass, or a path that woke no one) is planned on within
         // a beat; frees that meet nothing plan nothing.
+        let beat = || {
+            self.returns
+                .wake_cause
+                .store(super::grant::WAKE_BEAT, Ordering::Release);
+        };
         if self.returns.freed_since_plan() && self.wants_met_now() {
+            beat();
             self.plan();
         } else if self.quiet_unplanned() {
+            beat();
             self.plan();
             // Read after the pass: room its own steps took and gave back is
             // the room it planned on, never a change that plans again.
@@ -590,6 +597,9 @@ impl ResidencyPlanner {
     }
 
     pub(super) fn poke(self: &Arc<Self>) {
+        self.returns
+            .wake_cause
+            .store(super::grant::WAKE_POKE, Ordering::Release);
         match self.returns.drain.get() {
             Some(notify) => notify.notify_one(),
             None => self.plan(),

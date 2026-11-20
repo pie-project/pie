@@ -546,6 +546,7 @@ impl ResidencyPlanner {
             if let Some(super::wait::Waiter {
                 pid,
                 kind: WaitKind::Restore { demand },
+                ..
             }) = inner.queue.remove(&key)
                 && let Some(proc) = inner.procs.get_mut(&pid)
                 && proc.state == Residency::Evicted
