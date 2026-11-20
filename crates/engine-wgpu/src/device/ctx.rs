@@ -854,6 +854,10 @@ pub(crate) struct UniformRegion {
 pub(crate) struct UniformRing {
     chunks: Vec<Held>,
     used: u64,
+    /// The end of the most the frame's encoder has staged through its
+    /// chunk: a copy gives its slot back once encoded, and a staging the
+    /// queue writes lies past this, where no command of the frame writes.
+    high: u64,
 }
 
 pub(crate) struct Inner {
@@ -1047,16 +1051,46 @@ impl Frame {
         Some((set, 2 * at))
     }
 
+    /// The bytes one slot of this frame's scratch can still hold: its
+    /// chunk's room past what it took, or a whole chunk before it takes one.
+    fn scratch_room(&self) -> u64 {
+        let core = &self.inner.core;
+        let align = u64::from(core.limits.min_storage_buffer_offset_alignment).max(256);
+        let ring = self.inner.scratch.lock().expect("scratch lock poisoned");
+        match ring.chunks.last() {
+            None => core.pooled_scratch(),
+            Some(chunk) => chunk
+                .size()
+                .saturating_sub(ring.used.next_multiple_of(align)),
+        }
+    }
+
+    /// `bytes` of this frame's scratch the frame's encoder writes: the
+    /// chunk and the slot's first byte in it.
     pub(crate) fn scratch_slot(&self, bytes: u64) -> Result<(wgpu::Buffer, u64)> {
+        self.scratch_take(bytes, false)
+    }
+
+    /// `bytes` of this frame's scratch the queue writes, which lands before
+    /// any command of the frame runs: past every slot the encoder has
+    /// written, so no command of the frame writes over it.
+    pub(crate) fn scratch_slot_queued(&self, bytes: u64) -> Result<(wgpu::Buffer, u64)> {
+        self.scratch_take(bytes, true)
+    }
+
+    fn scratch_take(&self, bytes: u64, queued: bool) -> Result<(wgpu::Buffer, u64)> {
         let core = &self.inner.core;
         let align = u64::from(core.limits.min_storage_buffer_offset_alignment).max(256);
         let mut ring = self.inner.scratch.lock().expect("scratch lock poisoned");
-        let at = ring.used.next_multiple_of(align);
         if ring.chunks.is_empty() {
             ring.chunks.push(core.scratch_chunk(bytes)?);
-            ring.used = bytes;
-            return Ok(((*ring.chunks.last().expect("just pushed")).clone(), 0));
         }
+        let from = if queued {
+            ring.used.max(ring.high)
+        } else {
+            ring.used
+        };
+        let at = from.next_multiple_of(align);
         let room = ring.chunks.last().map_or(0, |chunk| chunk.size());
         if at + bytes > room {
             return Err(Fault::Ceiling {
@@ -1066,6 +1100,7 @@ impl Frame {
             });
         }
         ring.used = at + bytes;
+        ring.high = ring.high.max(ring.used);
         Ok(((*ring.chunks.last().expect("non-empty")).clone(), at))
     }
 
@@ -1098,16 +1133,45 @@ impl Frame {
         }
         crate::encode::record_copy();
         let (from, to) = (&source.slab().buffer, &into.slab().buffer);
+        if from != to {
+            return self.encode(|encoder| {
+                encoder.copy_buffer_to_buffer(from, source_at, to, into_at, Some(len))
+            });
+        }
         // wgpu refuses a copy whose ends are one buffer: it goes through
-        // scratch, which also reads overlapping ends as they were.
-        let stage = (from == to).then(|| self.scratch_slot(len)).transpose()?;
-        self.encode(|encoder| match &stage {
-            None => encoder.copy_buffer_to_buffer(from, source_at, to, into_at, Some(len)),
-            Some((scratch, at)) => {
-                encoder.copy_buffer_to_buffer(from, source_at, scratch, *at, Some(len));
-                encoder.copy_buffer_to_buffer(scratch, *at, to, into_at, Some(len));
+        // scratch a piece at a time, every piece through one slot (a frame's
+        // encoder runs its copies in order), so a copy of any length stages
+        // in what room the frame's chunk has. Where the destination lies past
+        // an overlapping source the pieces go from the end, so each reads its
+        // source as it was.
+        // The slot is given back once the copy is encoded: a later slot the
+        // encoder writes runs after the copy's pieces, and one the queue
+        // writes lies past it (`scratch_slot_queued`).
+        let piece = len.min(self.scratch_room() & !3).max(4);
+        let given = self
+            .inner
+            .scratch
+            .lock()
+            .expect("scratch lock poisoned")
+            .used;
+        let (scratch, at) = self.scratch_slot(piece)?;
+        let mut starts: Vec<u64> = (0..len).step_by(piece as usize).collect();
+        if into_at > source_at && into_at < source_at + len {
+            starts.reverse();
+        }
+        self.encode(|encoder| {
+            for start in starts {
+                let bytes = piece.min(len - start);
+                encoder.copy_buffer_to_buffer(from, source_at + start, &scratch, at, Some(bytes));
+                encoder.copy_buffer_to_buffer(&scratch, at, to, into_at + start, Some(bytes));
             }
-        })
+        })?;
+        self.inner
+            .scratch
+            .lock()
+            .expect("scratch lock poisoned")
+            .used = given;
+        Ok(())
     }
 
     pub fn fill_zero(&mut self, into: &super::Buffer, at: u64, len: u64) -> Result<()> {
@@ -1392,6 +1456,7 @@ mod tests {
             budget: Some(1 << 30),
         };
         let device = Context::bind(&DeviceBoot::default(), allowance).unwrap();
+        device.core().stock_rings(1);
         let owner = engine_gpu::books::owners::TEST;
         let mut buffer = Buffer::zeroed(&device, 64, owner).unwrap();
         // A frame opened before the loss and submitted after it.
@@ -1430,6 +1495,58 @@ mod tests {
         buffer.read(0, &mut got).unwrap();
         assert_eq!(got[32..48], ramp[..16]);
         assert_eq!(got[8..24], ramp[..16]);
+    }
+
+    /// A copy within one buffer longer than the whole scratch chunk lands,
+    /// in pieces through what room the frame's chunk has (some taken first
+    /// by a smaller staged copy), its overlapping ends read as they were
+    /// whichever side the destination lies on.
+    #[test]
+    fn a_copy_within_one_buffer_past_its_scratch_chunk_lands_in_pieces() {
+        if !present() {
+            return;
+        }
+        let allowance = engine::Allowance {
+            budget: Some(1 << 30),
+        };
+        let device = Context::bind(&DeviceBoot::default(), allowance).unwrap();
+        device.core().stock_rings(1);
+        let pooled = device.core().pooled_scratch();
+        let len = (pooled + pooled / 2) & !3;
+        let size = 3 * pooled + 8192;
+        let words: Vec<u8> = (0..size / 4)
+            .flat_map(|w| (w as u32).wrapping_mul(2_654_435_761).to_le_bytes())
+            .collect();
+        // (source, destination): past an overlapping source, before one,
+        // and apart from it.
+        for (from, into) in [(0, 4096), (4096, 0), (0, len + 4096)] {
+            let mut buffer =
+                Buffer::zeroed(&device, size, engine_gpu::books::owners::TEST).unwrap();
+            buffer.write(0, &words).unwrap();
+            let mut frame = device.frame().unwrap();
+            frame
+                .copy(&buffer, size - 64, &buffer, size - 32, 16)
+                .unwrap();
+            frame.copy(&buffer, from, &buffer, into, len).unwrap();
+            // The copy gave its slot back: a view staged after it in the frame
+            // still finds the chunk's room.
+            frame.scratch_slot(pooled - 4096).unwrap();
+            frame.commit().unwrap();
+            let mut want = words.clone();
+            want.copy_within(
+                (size - 64) as usize..(size - 48) as usize,
+                (size - 32) as usize,
+            );
+            want.copy_within(from as usize..(from + len) as usize, into as usize);
+            let mut got = vec![0u8; size as usize];
+            buffer.read(0, &mut got).unwrap();
+            assert!(
+                got == want,
+                "a copy of {len} bytes from {from} to {into} (scratch chunk {pooled}) did not land \
+                 as one copy of the bytes as they were"
+            );
+        }
+        device.core.take_error("the copies").unwrap();
     }
 
     /// No buffer is made past the device's bound on one reservation: a
