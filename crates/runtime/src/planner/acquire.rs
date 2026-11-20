@@ -269,8 +269,13 @@ impl ResidencyPlanner {
                                 _ = crate::rt::time::timeout(again, std::future::pending::<()>()) => false,
                             };
                             if !woke {
+                                // Each re-report plans again too, as the
+                                // give-up's check did: a grow, a commit or a
+                                // move the last pass found no way to is
+                                // tried again on the pool as it stands now.
                                 self.report_short();
                                 self.note_lapsed_fires();
+                                self.poke();
                             }
                             let Some(error) = self.never_fits(key) else {
                                 continue;
@@ -315,14 +320,29 @@ impl ResidencyPlanner {
     /// the policy answering a shortfall does not wake it. (On a 100 ms
     /// re-report it woke each waiter ten times a second while it stayed
     /// evicted.)
-    async fn await_residency_change(signal: &Notify, settled: impl Fn() -> bool) {
+    async fn await_residency_change(
+        signal: &Notify,
+        settled: impl Fn() -> bool,
+        answered: impl Fn(),
+    ) {
         let notified = signal.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        if settled() {
-            return;
+        loop {
+            let policy = crate::policy::pressure::answered();
+            tokio::pin!(policy);
+            policy.as_mut().enable();
+            if settled() {
+                return;
+            }
+            // The policy answering a shortfall plans again, as the give-up's
+            // check did (a grow, a commit or a move tried again), and
+            // refuses nothing.
+            tokio::select! {
+                () = &mut notified => return,
+                () = &mut policy => answered(),
+            }
         }
-        notified.await;
     }
 
     fn collect_outcome(&self, key: EntryKey) -> Collect {
@@ -464,9 +484,11 @@ impl ResidencyPlanner {
             self.stats.gate_parks.fetch_add(1, Ordering::Relaxed);
             // Waiting its restore turn: its owner is parked here.
             let _parked = crate::inferlet::process::parks_here();
-            Self::await_residency_change(&signal, || {
-                self.is_resident(pid) || self.restore_never_fits_now(pid)
-            })
+            Self::await_residency_change(
+                &signal,
+                || self.is_resident(pid) || self.restore_never_fits_now(pid),
+                || self.poke(),
+            )
             .await;
         }
     }
