@@ -30,8 +30,6 @@ moe.gmm_glu = 1
 # VMEM between them (Gemma-4-26B-A4B's 32-expert cut, 2176 tokens: 761 -> 736 us a layer, 1024: 514 -> 493;
 # Qwen3.6-35B-A3B's 2176: 523 -> 504, 1792 equal; at 640 tokens one kernel is 10% slower)
 moe.gmm_fuse_from = 1024
-# a decode of 64 rows and more reads each row's own pages through the page-copy kernel
-attn.decode_pages = 64
 # a prompt's GeGLU rows land before the down dot reads them, not fused into its operand (Gemma-4-31B cut's
 # 2304-row fire 74.8 -> 72.2 ms, pf256-512 28.3k -> 29.3k tok/s)
 glu.land_from = 1024
@@ -48,7 +46,6 @@ measured = [
   "kernel.attn.block_keys",
   "kernel.attn.block_rows",
   "kernel.attn.budget_mi",
-  "kernel.attn.decode_pages",
   "kernel.attn.per_row_max",
   "kernel.glu.gemm_from",
   "kernel.glu.land_from",
