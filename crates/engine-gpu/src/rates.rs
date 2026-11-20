@@ -113,10 +113,13 @@ pub const fn stated_submit_bound(android: bool) -> Option<std::time::Duration> {
 /// `profile::fire::KEYS`): what a load whose profile lacks one measures.
 /// `vector_tflops_by_rows` and `tile_tflops_by_rows` are each vector and
 /// tiled matmul kernel's rate by rows, which the dense matmul's kernel is
-/// chosen by (`crate::dense`). `few_row_tflops` and `workgroups_per_core`
+/// chosen by (`crate::dense`), with the rows they were timed to
+/// (`kernels_timed_to`) and where and why any stopped short (`kernel_stops`),
+/// saved with them so a load does not time a stopped curve again.
+/// `few_row_tflops` and `workgroups_per_core`
 /// are not weighed here: no choice on these backends reads them, so a load
 /// measures neither.
-pub const KEYS: [&str; 9] = [
+pub const KEYS: [&str; 10] = [
     "launch_ns",
     "gemm_tflops_by_rows",
     "attn_tflops_by_keys",
@@ -126,6 +129,7 @@ pub const KEYS: [&str; 9] = [
     "tile_tflops_by_rows",
     "vector_tflops_by_rows",
     "kernels_timed_to",
+    "kernel_stops",
 ];
 
 /// The rows each vector and tiled kernel is timed at for
@@ -767,8 +771,12 @@ impl Wanted {
         Wanted {
             launch: lacks("launch_ns") || lacks("hbm_gbps"),
             gemm: lacks("gemm_tflops_by_rows"),
-            vectors: lacks("vector_tflops_by_rows") || lacks("kernels_timed_to"),
-            tiles: lacks("tile_tflops_by_rows") || lacks("kernels_timed_to"),
+            vectors: lacks("vector_tflops_by_rows")
+                || lacks("kernels_timed_to")
+                || lacks("kernel_stops"),
+            tiles: lacks("tile_tflops_by_rows")
+                || lacks("kernels_timed_to")
+                || lacks("kernel_stops"),
             attn: lacks("attn_tflops_by_keys"),
             elementwise: lacks("elementwise_gbps"),
             scan: lacks("scan_gelems"),
@@ -1830,6 +1838,8 @@ mod curve_tests {
                 .with_tuned(tuned)
         };
         assert_eq!(reaching(chip(rates.clone()), 8192).rates(), rates);
+        // What a load saves (the keys it measured) keeps where they stopped.
+        assert_eq!(rates.only(&KEYS).kernel_stops, rates.kernel_stops);
         let again = reaching(chip(rates.clone()), 10240).rates();
         assert!(again.vector_tflops_by_rows.is_none() && again.kernels_timed_to.is_none());
         let unsaid = profile::fire::Rates {
