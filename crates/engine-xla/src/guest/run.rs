@@ -686,6 +686,8 @@ fn encode(value: &Value, dtype: Dtype, n: usize, out: &mut Vec<u32>) -> Result<(
                 }
             }
         }
+        // A bf16 program is refused at its registration (`Plane::prepare`).
+        Value::Bf16(_) => return Err(eta_compiler::codegen::launch::NO_BF16.to_string()),
     }
     Ok(())
 }

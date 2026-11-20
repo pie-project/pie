@@ -22,9 +22,10 @@ use eta_dsl::sampler::{self, Knobs, Shape, Slots};
 use eta_ir::registry::OutputDecl;
 
 /// The channels a pass's knobs ride in, as the built-in inferlets seed them
-/// (read in the stage, never consumed).
+/// (read in the stage, never consumed): the temperature as its reciprocal
+/// (`sampler::inverse_temperature`).
 struct KnobChannels {
-    temperature: Option<f32>,
+    temperature: Option<Channel>,
     top_p: Option<Channel>,
     top_k: Option<Channel>,
     min_p: Option<Channel>,
@@ -57,7 +58,9 @@ impl KnobChannels {
     fn new(shape: &Shape, request: &Request) -> Self {
         let f = |on: bool| on.then(|| Channel::from([request.knob]));
         Self {
-            temperature: shape.temperature.map(|_| request.temperature),
+            temperature: shape
+                .temperature
+                .then(|| Channel::from([sampler::inverse_temperature(request.temperature)])),
             top_p: f(shape.top_p),
             top_k: shape.top_k.then(|| Channel::from([request.top_k])),
             min_p: f(shape.min_p),
@@ -71,7 +74,7 @@ impl KnobChannels {
     fn read(&self) -> Knobs {
         let t = |c: &Option<Channel>| c.as_ref().map(|c| reshape(c.read(), []));
         Knobs {
-            temperature: self.temperature,
+            temperature: t(&self.temperature),
             top_p: t(&self.top_p),
             top_k: t(&self.top_k),
             min_p: t(&self.min_p),

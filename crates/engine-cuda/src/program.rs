@@ -528,8 +528,11 @@ impl Plane {
         registrations: &[ProgramRegistration],
     ) -> Result<()> {
         let started = std::time::Instant::now();
+        // A program that stores bf16 is refused at its registration
+        // (`Plane::prepare`); its regions are not built.
         let kernels: Vec<eta_exec::EmittedKernel> = registrations
             .iter()
+            .filter(|registration| !registration.launch.stores_bf16())
             .flat_map(|registration| registration.emitted_kernels.iter().cloned())
             .collect();
         let compiled_before = self.cache.stats().compilations;
@@ -572,6 +575,12 @@ impl Plane {
                 work: Work::Registered,
             });
         }
+        // CUDA's guest kernels have no bf16 yet: such a program is refused
+        // by name, never computed as another dtype.
+        registration
+            .launch
+            .refuse_bf16()
+            .map_err(|why| Fault::program("program::plane", why))?;
         let plan = adopt_launch_package_with(registration.launch.clone(), Boundaries::CUDA)?;
         let planned = self.cache.plan(
             registration.program_hash,

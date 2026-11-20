@@ -435,7 +435,11 @@ pub(crate) fn build_region(
                 let op = &stage.ops[node.index()];
                 if !matches!(
                     op,
-                    Op::ReduceSum(_) | Op::ReduceMax(_) | Op::ReduceMin(_) | Op::ReduceArgmax(_)
+                    Op::ReduceSum(_)
+                        | Op::ReduceMax(_)
+                        | Op::ReduceMin(_)
+                        | Op::ReduceArgmax(_)
+                        | Op::GumbelArgmax { .. }
                 ) {
                     return false;
                 }

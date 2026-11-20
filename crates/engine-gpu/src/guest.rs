@@ -455,16 +455,12 @@ mod tests {
             let (mut b, tok_in) = builder(vocab);
             b.stage(Stage::Epilogue, move || {
                 let logits = intrinsics::output(0, "logits");
-                let scaled = logits / temperature;
-                let probs = softmax(&scaled);
+                let probs = softmax(cast(&logits, dtype::bf16) * (1.0 / temperature));
                 let keep = pivot_threshold(probs, cummass_le(top_p));
-                let neg_inf = broadcast(f32::NEG_INFINITY, [vocab]);
-                let masked = select(&keep, &scaled, &neg_inf);
                 let r = rng.take();
-                let g = gumbel(&r, [vocab]);
                 let r_next = &r + iota(2);
                 rng.put(&r_next);
-                let t = reshape(reduce_argmax(masked + g), [1]);
+                let t = reshape(gumbel_argmax(&logits, &keep, 1.0 / temperature, &r), [1]);
                 tok_in.put(&t);
                 out.put(&t);
             });
@@ -482,12 +478,11 @@ mod tests {
             b.stage(Stage::Epilogue, move || {
                 let r = rng.take();
                 let logits = reshape(intrinsics::output(0, "logits"), [vocab]);
-                let scaled = &logits / temperature;
-                let probs = softmax(&scaled);
+                let probs = softmax(cast(&logits, dtype::bf16) * (1.0 / temperature));
                 let ranked = pivot_threshold(&probs, rank_le(40u32));
                 let nucleus = pivot_threshold(&probs, cummass_le(0.9f32));
                 let keep = and(&ranked, &nucleus);
-                let token = reshape(gumbel_max(mask_apply(&scaled, keep), &r), [1]);
+                let token = reshape(gumbel_argmax(&logits, keep, 1.0 / temperature, &r), [1]);
                 rng.put(&r + iota(2));
                 tok_in.put(&token);
                 out.put(&token);
@@ -503,8 +498,8 @@ mod tests {
             let (mut b, tok_in) = builder(vocab);
             b.stage(Stage::Epilogue, move || {
                 let r = rng.take();
-                let scaled = intrinsics::output(0, "logits") / 0.7f32;
-                let token = reshape(gumbel_max(scaled, &r), [1]);
+                let logits = intrinsics::output(0, "logits");
+                let token = reshape(gumbel_argmax(logits, true, 1.0 / 0.7f32, &r), [1]);
                 rng.put(&r + iota(2));
                 tok_in.put(&token);
                 out.put(&token);
@@ -535,8 +530,8 @@ mod tests {
             b.stage(Stage::Epilogue, move || {
                 let logits = reshape(intrinsics::output(0, "logits"), [vocab]);
                 let t = reshape(reduce_argmax(&logits), [1]);
-                let (values, ids) = top_k(log_softmax(&logits), 5);
-                values_out.put(&values);
+                let (values, ids) = top_k(log_softmax(cast(&logits, dtype::bf16)), 5);
+                values_out.put(cast(&values, dtype::f32));
                 ids_out.put(cast(&ids, dtype::i32));
                 tok_in.put(&t);
                 out.put(&t);
@@ -555,7 +550,7 @@ mod tests {
             b.stage(Stage::Epilogue, move || {
                 let logits = reshape(intrinsics::output(0, "logits"), [vocab]);
                 let t = reshape(reduce_argmax(&logits), [1]);
-                let (_, ids) = sort_desc(softmax(&logits));
+                let (_, ids) = sort_desc(softmax(cast(&logits, dtype::bf16)));
                 ids_out.put(cast(&ids, dtype::i32));
                 tok_in.put(&t);
                 out.put(&t);
@@ -573,10 +568,13 @@ mod tests {
             let greedy = leak(Channel::new([1], dtype::i32));
             let (mut b, _) = builder(vocab);
             b.stage(Stage::Epilogue, move || {
-                let logits = reshape(intrinsics::output(0, "logits"), [vocab]);
+                let logits = cast(
+                    reshape(intrinsics::output(0, "logits"), [vocab]),
+                    dtype::bf16,
+                );
                 let (s, i) = top_k(log_softmax(&logits), beams);
                 ids.put(cast(&i, dtype::i32));
-                scores.put(&s);
+                scores.put(cast(&s, dtype::f32));
                 greedy.put(reshape(reduce_argmax(&logits), [1]));
             });
             ids.note_host_take();
@@ -600,11 +598,17 @@ mod tests {
             b.bind_port(Port::EmbedIndptr, leak(Channel::from((0u32..=beams).collect::<Vec<u32>>())));
             b.bind_port(Port::Fold, leak(Channel::from([u32::MAX])));
             b.stage(Stage::Epilogue, move || {
-                let logits = reshape(intrinsics::output(0, "logits"), [beams, vocab]);
-                let cand = broadcast(reshape(carried.take(), [beams, 1]), [beams, vocab])
+                let logits = cast(
+                    reshape(intrinsics::output(0, "logits"), [beams, vocab]),
+                    dtype::bf16,
+                );
+                let scores = carried.take();
+                let best = reduce_max(&scores);
+                let relative = cast(&scores - &best, dtype::bf16);
+                let cand = broadcast(reshape(relative, [beams, 1]), [beams, vocab])
                     + log_softmax(&logits);
                 let (s, i) = top_k(reshape(cand, [beams * vocab]), beams);
-                carried.put(&s);
+                carried.put(cast(&s, dtype::f32) + &best);
                 out.put(cast(&i % vocab, dtype::i32));
                 parents.put(&i / vocab);
                 greedy.put(reshape(reduce_argmax(&logits), [beams]));
@@ -613,6 +617,88 @@ mod tests {
             parents.note_host_take();
             greedy.note_host_take();
             b.build().expect("the beam decode epilogue traces")
+        }
+
+        /// The SDK's standard sampler's decode fire of `shape`
+        /// (`eta_dsl::sampler::decode`), its knobs in channels read in the
+        /// stage, as the built-in inferlets build it.
+        pub fn standard(vocab: u32, shape: &eta_dsl::sampler::Shape) -> Traced {
+            use eta_dsl::sampler::{self, Knobs, Slots};
+            let knob = |on: bool| on.then(|| leak(Channel::from([0.9f32])));
+            let inverse = shape
+                .temperature
+                .then(|| leak(Channel::from([sampler::inverse_temperature(1.0)])));
+            let top_p = knob(shape.top_p);
+            let top_k = shape.top_k.then(|| leak(Channel::from([40u32])));
+            let (min_p, repetition) = (knob(shape.min_p), knob(shape.repetition));
+            let (frequency, presence) = (knob(shape.frequency), knob(shape.presence));
+            let penalized = shape.repetition || shape.frequency || shape.presence;
+            let hist = penalized.then(|| {
+                (
+                    Channel::from(vec![0.0f32; vocab as usize]),
+                    Channel::from(vec![0.0f32; vocab as usize]),
+                )
+            });
+            let logprobs = shape.logprobs.map(|top| {
+                let values = Channel::new([1 + top], dtype::f32).capacity(8);
+                values.note_host_take();
+                let ids = (top > 0).then(|| {
+                    let ids = Channel::new([top], dtype::i32).capacity(8);
+                    ids.note_host_take();
+                    ids
+                });
+                (values, ids)
+            });
+            let slots = leak_slots(Slots {
+                rng: Channel::from([0x9e37u32, 1]),
+                hist,
+                mask: None,
+                logprobs,
+            });
+            let out = leak(Channel::new([1], dtype::i32).capacity(8));
+            out.note_host_take();
+            let logprob_top = shape.logprobs;
+            let (mut b, tok_in) = builder(vocab);
+            b.stage(Stage::Epilogue, move || {
+                let t = |c: Option<&'static Channel>| c.map(|c| reshape(c.read(), []));
+                let knobs = Knobs {
+                    temperature: t(inverse),
+                    top_p: t(top_p),
+                    top_k: t(top_k),
+                    min_p: t(min_p),
+                    repetition: t(repetition),
+                    frequency: t(frequency),
+                    presence: t(presence),
+                    logprobs: logprob_top,
+                };
+                sampler::decode(vocab, &knobs, slots, tok_in, out);
+            });
+            b.build().expect("the standard sampler traces")
+        }
+
+        fn leak_slots(slots: eta_dsl::sampler::Slots) -> &'static eta_dsl::sampler::Slots {
+            Box::leak(Box::new(slots))
+        }
+
+        /// The standard sampler's shapes ([`eta_dsl::sampler::STANDARD`]) and
+        /// a penalized top-p one, each its decode fire, by name.
+        pub fn standard_all(vocab: u32) -> Vec<(String, Traced)> {
+            let penalized = eta_dsl::sampler::Shape {
+                temperature: true,
+                top_p: true,
+                repetition: true,
+                frequency: true,
+                presence: true,
+                ..eta_dsl::sampler::Shape::GREEDY
+            };
+            eta_dsl::sampler::STANDARD
+                .iter()
+                .map(|(name, shape)| (format!("standard {name}"), standard(vocab, shape)))
+                .chain([(
+                    "standard penalized top-p".to_string(),
+                    standard(vocab, &penalized),
+                )])
+                .collect()
         }
 
         /// Every program here, by name.
@@ -679,14 +765,53 @@ mod tests {
         assert_eq!(
             totals,
             [
-                ("top-p", 9_312_512, 3_841_024),
-                ("top-k + top-p", 9_616_896, 3_993_344),
-                ("gumbel-max", 5_512_960, 1_823_744),
+                ("top-p", 5_361_920, 3_537_152),
+                ("top-k + top-p", 5_666_304, 3_689_472),
+                ("gumbel-max", 3_689_984, 912_896),
                 ("greedy", 3_688_704, 684_288),
-                ("top logprobs", 6_728_960, 3_039_744),
-                ("sorted", 8_551_168, 4_254_720),
-                ("beam prefill", 6_728_960, 3_647_232),
-                ("beam-4 decode", 31_647_232, 14_586_880),
+                ("top logprobs", 4_906_240, 2_735_872),
+                ("sorted", 6_424_064, 3_646_976),
+                ("beam prefill", 4_906_240, 3_039_488),
+                ("beam-4 decode", 24_356_096, 12_156_160),
+            ]
+        );
+    }
+
+    /// What a stage's scratch is for the standard sampler's decode fires at
+    /// a vocabulary of 151,936 (each value its own bytes, and as laid), its
+    /// vocabulary-sized values bf16 and the temperature's reciprocal a value
+    /// read from its channel.
+    #[test]
+    fn the_standard_samplers_stage_scratch() {
+        let vocab = shipped::QWEN_VOCAB;
+        let totals: Vec<(String, u64, u64)> = shipped::standard_all(vocab)
+            .into_iter()
+            .map(|(name, traced)| {
+                let package = shipped::package(&traced, vocab);
+                let [plan] = &package.plans[..] else {
+                    panic!("{name}: one stage");
+                };
+                step_source(0, plan).unwrap_or_else(|why| panic!("{name}: {why}"));
+                scratch_holds_the_hosts_values(&package)
+                    .unwrap_or_else(|why| panic!("{name}: {why}"));
+                let tables =
+                    session::stage_tables(plan, &Extents::default()).expect("static shapes");
+                let own = eta_exec::layout(&tables.descriptors).expect("fits").total;
+                eprintln!("{name}: own {own}, laid {}", tables.scratch);
+                (name, own, tables.scratch)
+            })
+            .collect();
+        let got: Vec<(&str, u64, u64)> =
+            totals.iter().map(|(n, a, b)| (n.as_str(), *a, *b)).collect();
+        assert_eq!(
+            got,
+            [
+                ("standard greedy", 3_689_472, 684_544),
+                ("standard gumbel-max", 3_690_240, 912_896),
+                ("standard top-p", 5_058_816, 3_537_152),
+                ("standard top-k + top-p", 5_363_456, 3_689_472),
+                ("standard top logprobs", 4_910_592, 2_736_896),
+                ("standard penalized top-p", 10_835_200, 4_449_024),
             ]
         );
     }

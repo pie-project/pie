@@ -113,6 +113,7 @@ pub fn stage_read_bytes(package: &LaunchPackage) -> std::result::Result<Vec<u64>
                     .product::<u64>();
                 let bytes = match channel.dtype {
                     eta_ir::container::ChanDType::Concrete(eta_ir::Dtype::Bool) => len,
+                    eta_ir::container::ChanDType::Concrete(eta_ir::Dtype::Bf16) => len * 2,
                     _ => len * 4,
                 };
                 Ok(sum + bytes.max(4).next_multiple_of(4))

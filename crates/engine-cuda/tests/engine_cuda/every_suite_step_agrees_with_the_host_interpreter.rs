@@ -381,6 +381,14 @@ fn wire_value(bytes: &[u8], like: &Value) -> Value {
                 .map(|i| bytes[i / 8] >> (i % 8) & 1 == 1)
                 .collect(),
         ),
+        Value::Bf16(_) => Value::Bf16(
+            bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_le_bytes(*c))
+                .collect(),
+        ),
     }
 }
 
