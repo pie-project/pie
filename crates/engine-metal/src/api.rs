@@ -706,6 +706,7 @@ impl Engine for Metal {
             // Metal states no bound on one submission yet
             // (`crate::rates::at_load`).
             guest_cost: engine::GuestCost::default(),
+            mixed_lanes: engine::MixedLanes::Any,
         };
 
         // Every pipeline the load's rungs dispatch is built now, before

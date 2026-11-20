@@ -976,6 +976,7 @@ where
                     elementwise_gbps: rates.elementwise_gbps,
                 }
             },
+            mixed_lanes: engine::MixedLanes::Any,
         };
 
         self.shell = Some(shell);
