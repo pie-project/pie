@@ -1661,7 +1661,6 @@ impl Shell {
         let mut rs_lanes: Vec<kernels_cuda::runtime::channel::RsLane> = Vec::new();
         let mut rs_slots: Vec<u64> = Vec::new();
         let mut rs_tokens: Vec<u32> = Vec::new();
-        let mut rs_token_slots: Vec<u64> = Vec::new();
         if rs_body.buffers() {
             let buffers = self.buffers.as_ref().ok_or_else(|| Fault::Unbound {
                 what: "the rs buffer of a fire whose lanes buffer recurrent rows, against a \
@@ -1686,17 +1685,8 @@ impl Shell {
                 for &page in pages.iter() {
                     rs_slots.push(buffers.slot(&self.pools, page)?);
                 }
-                let page_tokens = buffers.page_tokens().max(1);
                 for span in &rs_reads[fire_lane] {
-                    for tok in span.clone() {
-                        rs_tokens.push(tok);
-                        rs_token_slots.push(
-                            rs_slots
-                                .get(page_off + (tok / page_tokens) as usize)
-                                .copied()
-                                .unwrap_or(0),
-                        );
-                    }
+                    rs_tokens.extend(span.clone());
                 }
                 rs_lanes.push(kernels_cuda::runtime::channel::RsLane {
                     at: *at,
@@ -2107,7 +2097,6 @@ impl Shell {
                     lanes: &rs_lanes,
                     pages: &rs_slots,
                     replay_tok: &rs_tokens,
-                    replay_slot: &rs_token_slots,
                 }),
             },
         )?;

@@ -546,6 +546,8 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
         int commit;
         u64 slot;
         u32 tok;
+        // The block stage its last chunk lies in.
+        int buf;
     };
     auto plan = [&](int tile) {
         Tile tl;
@@ -554,6 +556,7 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
         tl.commit = 0;
         tl.slot = 0;
         tl.tok = 0;
+        tl.buf = 0;
         if (tile >= tiles) return tl;
         const int vt = tile % vts;
         const int rest = tile / vts;
@@ -595,11 +598,13 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
             gdn_cp16(st + 4608 + lane * 16, row + 2 * K_dim + (long long)tl.h * V_d + tl.j0, true);
             gdn_cp4(st + 4640 + lane * 4, gates + (long long)tl.r_row * 2 * V_h + lane * V_h + tl.h, true);
         }
-        // The last chunk of the lane's buffered rows, a warp's rows of it
-        // (row e by warp e mod W), each row's slot from the lane that
-        // resolved it.
-        if (tl.n > 0) {
-            unsigned char* bs = bring + stage * BSTAGE;
+    };
+    // The last chunk of a tile's lane's buffered rows into block stage
+    // `buf`, a warp's rows of it (row e by warp e mod W), each row's slot
+    // from the lane that resolved it.
+    auto issue_last = [&](const Tile& tl, int buf) {
+        if (tl.live && tl.n > 0) {
+            unsigned char* bs = bring + buf * BSTAGE;
             const int rows = tl.n - CH * ((tl.n + CH - 1) / CH - 1);
             for (int e = warp; e < CH; e += W) {
                 const unsigned lo = __shfl_sync(0xffffffffu, static_cast<unsigned>(tl.slot), e);
@@ -623,6 +628,30 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
             }
         }
     };
+    // A chunk of a tile's lane's rows from `base` into block stage `buf`,
+    // a warp's rows each, each row's slot resolved by the warp.
+    auto issue_rows = [&](const Tile& tl, const CarryLane& cl, int base, int buf) {
+        unsigned char* bs = bring + buf * BSTAGE;
+        const int rows = min(CH, tl.n - base);
+        const int h_k = tl.h / group;
+        for (int e = warp; e < rows; e += W) {
+            u64 sb;
+            u32 tb;
+            carry.carried_at(cl, base + e, sb, tb);
+            if (lane * 8 < K_d) {
+                gdn_cp16(bs + e * KROW + lane * 16,
+                         carry.plane_at<const bf16>(sb, tb, 1) + (long long)h_k * K_d + lane * 8, true);
+            }
+            if (lane * 4 < V_d) {
+                gdn_cp16(bs + CH * KROW + e * UROW + lane * 16,
+                         carry.plane_at<const float>(sb, tb, 2) + (long long)tl.h * V_d + lane * 4, true);
+            }
+            if (lane == 0) {
+                gdn_cp4(bs + CH * (KROW + UROW) + e * 4,
+                        carry.plane_at<const unsigned char>(sb, tb, 0) + ((2 * (V_h + tl.h)) & ~3), true);
+            }
+        }
+    };
     auto unpack8 = [&](const uint4& raw, float (&f8)[8]) {
         const unsigned* w32 = reinterpret_cast<const unsigned*>(&raw);
         #pragma unroll
@@ -637,17 +666,24 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
     int t = blockIdx.x * W + warp;
     Tile cur = plan(t);
     issue(cur, 0);
+    issue_last(cur, 0);
     gdn_cp_commit();
     for (int it = 0; t < tiles; t += stride, ++it) {
-        // Every warp is done with the stage the next prefetch overwrites.
+        // Every warp is done with the stages the next prefetches overwrite.
         __syncthreads();
-        const Tile nxt = plan(t + stride);
+        Tile nxt = plan(t + stride);
         issue(nxt, (it + 1) & 1);
+        // A tile of more than a chunk streams its earlier chunks through the
+        // other block stage, and prefetches the next tile's last chunk once
+        // they are through; else the next tile's comes now.
+        const bool streams = cur.n > CH;
+        nxt.buf = cur.buf ^ 1;
+        if (!streams) issue_last(nxt, nxt.buf);
         gdn_cp_commit();
         // The tile's buffered rows, in chunks of CH: the last chunk came
         // with the state into the block's stage; an earlier chunk is read
         // into the same stage, a warp's rows each.
-        unsigned char* bs = bring + (it & 1) * BSTAGE;
+        int cbuf = cur.buf;
         __shared__ float2 t_dots[CH];
         auto shfl64 = [&](u64 v, int from) {
             const unsigned lo = __shfl_sync(0xffffffffu, static_cast<unsigned>(v), from);
@@ -658,29 +694,6 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
             slot = 0;
             tok = 0;
             if (j < n) carry.carried_at(cl, j, slot, tok);
-        };
-        auto read_chunk = [&](const CarryLane& cl, int n, int base) {
-            const int rows = min(CH, n - base);
-            for (int e = warp; e < rows; e += W) {
-                u64 sb;
-                u32 tb;
-                carry.carried_at(cl, base + e, sb, tb);
-                const int h_k = cur.h / group;
-                if (lane * 8 < K_d) {
-                    *reinterpret_cast<uint4*>(bs + e * KROW + lane * 16) = *reinterpret_cast<const uint4*>(
-                        carry.plane_at<const bf16>(sb, tb, 1) + (long long)h_k * K_d + lane * 8);
-                }
-                if (lane * 4 < V_d) {
-                    *reinterpret_cast<float4*>(bs + CH * KROW + e * UROW + lane * 16) =
-                        *reinterpret_cast<const float4*>(
-                            carry.plane_at<const float>(sb, tb, 2) + (long long)cur.h * V_d + lane * 4);
-                }
-                if (lane == 0) {
-                    *reinterpret_cast<unsigned*>(bs + CH * (KROW + UROW) + e * 4) =
-                        *reinterpret_cast<const unsigned*>(
-                            carry.plane_at<const unsigned char>(sb, tb, 0) + ((2 * (V_h + cur.h)) & ~3));
-                }
-            }
         };
         const CarryLane cl = carry.lane(cur.live ? cur.rl : 0);
         const int n = cur.n;
@@ -731,11 +744,12 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
             const float ea = __expf(a_log[cur.h]);
             for (int c = chunks - 1; c >= 0; --c) {
                 const int base = CH * c;
-                if (c != chunks - 1) {
-                    __syncthreads();
-                    read_chunk(cl, n, base);
-                    __syncthreads();
+                // The chunk before this one streams into the other stage.
+                if (c > 0) {
+                    issue_rows(cur, cl, CH * (c - 1), cbuf ^ 1);
+                    gdn_cp_commit();
                 }
+                const unsigned char* bs = bring + cbuf * BSTAGE;
                 const int rows = min(CH, n - base);
                 const bf16* kst = reinterpret_cast<const bf16*>(bs);
                 const float* ust = reinterpret_cast<const float*>(bs + CH * KROW);
@@ -837,6 +851,11 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
                         o[u] += coe * uu[u];
                     }
                 }
+                if (c > 0) {
+                    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+                    __syncthreads();
+                    cbuf ^= 1;
+                }
             }
             const float g0 = __expf(after);
             // The state's part: S^T k and S^T q over the tile, decayed to the
@@ -926,6 +945,13 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
                     dst[at] = ba[(long long)cur.r_row * 2 * V_h + at];
                 }
             }
+        }
+        // The next tile's last chunk, into the stage the streamed chunks
+        // left free.
+        if (streams) {
+            nxt.buf = cbuf ^ 1;
+            issue_last(nxt, nxt.buf);
+            gdn_cp_commit();
         }
         __syncwarp();
         cur = nxt;

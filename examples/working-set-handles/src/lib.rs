@@ -24,29 +24,60 @@ struct Input {
     /// drawing a token at a time would have written, whatever ran ahead.
     #[serde(default)]
     stop_after: Option<usize>,
+    /// Draw the most likely token, not a Gumbel draw: a run whose tokens
+    /// part from another's then parts by its logits alone.
+    #[serde(default)]
+    greedy: bool,
+}
+
+/// The token a row's logits pick: the most likely one when `greedy`, else
+/// a Gumbel draw keyed by `r`.
+fn pick(logits: Tensor, r: &Tensor, greedy: bool) -> Tensor {
+    if greedy { reduce_argmax(logits) } else { gumbel_max(logits, r) }
 }
 
 #[derive(Serialize)]
 struct Output {
     tokens: Vec<u32>,
+    /// A token drawn one at a time: the gap between its row's two largest
+    /// logits over the largest's magnitude (a near tie is a small one).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    gaps: Vec<f32>,
 }
 
 /// Writes `tokens` to `ws` and draws the token after them.
-async fn draw(ws: &WorkingSet, pipe: &Pipeline, tokens: &[i32], seed: u32, at: u32) -> Result<i32> {
+async fn draw(
+    ws: &WorkingSet,
+    pipe: &Pipeline,
+    tokens: &[i32],
+    seed: u32,
+    at: u32,
+    greedy: bool,
+) -> Result<(i32, f32)> {
     let toks = Channel::from(tokens);
     let indptr = Channel::from([0u32, tokens.len() as u32]);
     let rng = Channel::from([seed, at]);
     let out = Channel::new([1], dtype::i32);
+    let gap = Channel::new([2], dtype::f32);
     let fwd = ForwardPass::new();
     fwd.embed(&toks, &indptr)?;
     fwd.state(&[ws], StateGeometry::folding())?;
-    let sampled = out.clone();
+    let (sampled, top) = (out.clone(), gap.clone());
     fwd.epilogue(move || {
         let r = rng.take();
-        sampled.put(&gumbel_max(intrinsics::output(0, "logits"), &r));
+        let logits = intrinsics::output(0, "logits");
+        sampled.put(&pick(logits.clone(), &r, greedy));
+        let (values, _) = top_k(logits, 2);
+        top.put(&values);
     });
     fwd.submit(pipe).context("submit")?;
-    Ok(out.take_host::<i32>().await.context("drain")?)
+    let token = out.take_host::<i32>().await.context("drain")?;
+    let two = gap.take_host::<Vec<f32>>().await.context("drain gap")?;
+    let g = match two.as_slice() {
+        [a, b, ..] => (a - b) / a.abs().max(f32::MIN_POSITIVE),
+        _ => 0.0,
+    };
+    Ok((token, g))
 }
 
 /// Writes `tokens` to `ws`, then draws up to `max_tokens` ahead of reading
@@ -58,7 +89,7 @@ async fn draw_ahead(
     stop_after: usize,
 ) -> Result<Vec<u32>> {
     let tokens: Vec<i32> = input.tokens.iter().map(|&t| t as i32).collect();
-    let first = draw(ws, pipe, &tokens, input.seed, input.drawn).await?;
+    let (first, _) = draw(ws, pipe, &tokens, input.seed, input.drawn, input.greedy).await?;
     let mut drawn = vec![first as u32];
     if input.max_tokens <= 1 || stop_after <= 1 {
         return Ok(drawn);
@@ -71,9 +102,10 @@ async fn draw_ahead(
     fwd.embed(&tok, &indptr)?;
     fwd.state(&[ws], StateGeometry::folding())?;
     let (tok_in, sampled) = (tok.clone(), out.clone());
+    let greedy = input.greedy;
     fwd.epilogue(move || {
         let r = rng.take();
-        let next = gumbel_max(intrinsics::output(0, "logits"), &r);
+        let next = pick(intrinsics::output(0, "logits"), &r, greedy);
         tok_in.put(&next);
         sampled.put(&next);
         rng.put(&(&r + iota(2)));
@@ -98,18 +130,27 @@ async fn main(input: Input) -> Result<Output> {
         let generated = draw_ahead(&input.ws, &pipe, &input, stop_after).await?;
         pipe.close();
         input.ws.give("ws")?;
-        return Ok(Output { tokens: generated });
+        return Ok(Output {
+            tokens: generated,
+            gaps: Vec::new(),
+        });
     }
     let ws = input.ws;
     let pipe = Pipeline::new();
     let mut tokens: Vec<i32> = input.tokens.iter().map(|&t| t as i32).collect();
     let mut generated = Vec::with_capacity(input.max_tokens);
+    let mut gaps = Vec::with_capacity(input.max_tokens);
     for i in 0..input.max_tokens as u32 {
-        let next = draw(&ws, &pipe, &tokens, input.seed, input.drawn + i).await?;
+        let (next, gap) =
+            draw(&ws, &pipe, &tokens, input.seed, input.drawn + i, input.greedy).await?;
         generated.push(next as u32);
+        gaps.push(gap);
         tokens = vec![next];
     }
     pipe.close();
     ws.give("ws")?;
-    Ok(Output { tokens: generated })
+    Ok(Output {
+        tokens: generated,
+        gaps: if input.greedy { gaps } else { Vec::new() },
+    })
 }

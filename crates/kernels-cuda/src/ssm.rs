@@ -44,7 +44,6 @@ pub struct Carry {
     pub lanes: u64,
     pub pages: u64,
     pub replay_tok: u64,
-    pub replay_slot: u64,
     pub commit_len: u64,
     pub scratch: u64,
     pub plane_off: [u64; 3],
@@ -53,14 +52,13 @@ pub struct Carry {
     pub pad: u32,
 }
 
-const _: () = assert!(size_of::<Carry>() == 104);
+const _: () = assert!(size_of::<Carry>() == 96);
 
 impl Carry {
     pub const NONE: Carry = Carry {
         lanes: 0,
         pages: 0,
         replay_tok: 0,
-        replay_slot: 0,
         commit_len: 0,
         scratch: 0,
         plane_off: [0; 3],

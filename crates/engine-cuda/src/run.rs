@@ -1414,7 +1414,6 @@ impl<'c> Run<'c> {
             lanes: tables.lanes,
             pages: tables.pages,
             replay_tok: tables.replay_tok,
-            replay_slot: tables.replay_slot,
             commit_len: pool.commit_len.ptr,
             scratch,
             page_tokens: tables.page_tokens.max(1),
