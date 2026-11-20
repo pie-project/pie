@@ -141,6 +141,12 @@ pub fn emit_fused_region(
             return Err(EmitError::RegionNodeOutOfRange(RegionForm::Fused));
         };
         let mut slots = Slots::of(op, bases[node], value_ptr);
+        if op.tag == tags::GUMBEL_ARGMAX
+            && let Some(&state) = op.args.get(3)
+        {
+            // The rng state, the fourth operand, rides in `o1`.
+            slots.o1 = value_ptr(state);
+        }
         if op.tag == tags::CHAN_TAKE || op.tag == tags::CHAN_READ {
             if op.chan < 0 || op.chan as usize >= channel_bindings.len() {
                 return Err(EmitError::ChannelRootBindingOutOfRange);
@@ -366,6 +372,12 @@ pub fn emit_grouped_fused_region(
             continue;
         }
         let mut slots = Slots::of(op, base, |value| value_ptr(alias.resolve(value)));
+        if op.tag == tags::GUMBEL_ARGMAX
+            && let Some(&state) = op.args.get(3)
+        {
+            // The rng state, the fourth operand, rides in `o1`.
+            slots.o1 = value_ptr(alias.resolve(state));
+        }
         if op.tag == tags::OUTPUT
             && let Some(slot) = addressed_slot(stage, op, base)
         {
