@@ -1175,16 +1175,17 @@ impl<B: Backend> Pools<B> {
         Ok(CacheTable(rows, states))
     }
 
-    /// Zeroes the record at `units` (a piece each): a fresh lane's state.
-    /// The caller has drained every frame.
-    pub fn clear(&mut self, units: &[u32]) -> Result<()> {
+    /// Zeroes the record at `units` (a piece each) in `frame`: a fresh
+    /// lane's state, written in queue order, after every frame submitted
+    /// before and before every one submitted after.
+    pub fn clear(&self, frame: &mut B::Frame, units: &[u32]) -> Result<()> {
         if !self.has_state() {
             return Ok(());
         }
         let bytes = self.shape(FIXED)?.slot_bytes;
         let unit = self.unit(FIXED)?;
         for &id in units {
-            self.pool.zero(u64::from(id) * unit, bytes)?;
+            self.pool.zero(frame, u64::from(id) * unit, bytes)?;
         }
         Ok(())
     }

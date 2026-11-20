@@ -625,6 +625,14 @@ impl Engine for Xla {
 
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
         let submitted = self.submit_frame(frame);
+        // A frame whose step refused its lanes by name fired the steps
+        // before it alone: a refusal too.
+        if submitted
+            .as_ref()
+            .is_ok_and(|ticket| !ticket.refused.is_empty())
+        {
+            self.live.tally(engine::live::Tally::Refused, 1);
+        }
         self.refused(submitted)
     }
 

@@ -9,7 +9,8 @@
 //! so each fire waits for the one before it to settle (its fires
 //! serialize). That happens for one of two reasons, each named at bind
 //! ([`HostGeometry::bind_message`]) and both counted per fire in the model
-//! status's `host_geometry_fires` ([`fires`]):
+//! status: `host_geometry_fires` sums them, and `host_geometry_fires_by`
+//! splits them by engine, reason and program ([`counter`], [`by`]):
 //!
 //! - **An engine limit** ([`HostGeometry::EngineLacks`]): the program is
 //!   device geometry or a decode envelope, and the engine's port mask lacks
@@ -19,25 +20,29 @@
 //!   is neither (not a decode envelope, or its device-dependent geometry is
 //!   not one), on any engine. Host-evaluated is its class, not a fallback.
 //!
-//! Which geometry ports each engine's mask lacks today (`EngineCaps::ports`;
-//! a decode envelope needs `embed_tokens` plus what the program computes,
-//! device geometry `embed_tokens`, `positions`, `slots`, `kv_len`, and
-//! `attn_mask` when a channel feeds it; `embed_indptr` no class requires):
+//! Which geometry ports each engine's mask lacks today, as each states it
+//! in `EngineCaps::ports` (a decode envelope needs `embed_tokens` plus what
+//! the program computes, device geometry `embed_tokens`, `positions`,
+//! `slots`, `kv_len`, and `attn_mask` when a channel feeds it;
+//! `embed_indptr` no class requires). The mask is the engine's, read where
+//! it is stated:
 //!
-//! | engine            | mask                                      | lacks                                     |
-//! |-------------------|-------------------------------------------|-------------------------------------------|
-//! | cuda (and ROCm)   | device geometry + attn_mask + fold        | embed_indptr                              |
-//! | metal             | device geometry + attn_mask + fold        | embed_indptr                              |
-//! | xla               | device geometry + attn_mask + fold        | embed_indptr                              |
-//! | cerebras          | device geometry                           | attn_mask, fold, embed_indptr             |
-//! | vulkan            | embed_tokens + fold                       | positions, kv_len, slots, attn_mask, embed_indptr |
-//! | wgpu              | embed_tokens + fold + attn_mask           | positions, kv_len, slots, embed_indptr    |
+//! | engine          | mask (stated at)                                          | lacks                                 |
+//! |-----------------|-----------------------------------------------------------|---------------------------------------|
+//! | cuda (and ROCm) | device geometry + attn_mask + fold (engine-cuda `api.rs`)  | embed_indptr                          |
+//! | metal           | device geometry + attn_mask + fold (engine-metal `api.rs`) | embed_indptr                          |
+//! | xla             | device geometry + attn_mask + fold (engine-xla `api.rs`)   | embed_indptr                          |
+//! | cerebras        | device geometry (engine-cerebras `spatial/engine/mod.rs`)  | attn_mask, fold, embed_indptr         |
+//! | vulkan          | embed_tokens + fold + attn_mask (engine-vulkan `Host::ports`) | positions, kv_len, slots, embed_indptr |
+//! | wgpu            | embed_tokens + fold + attn_mask (engine-wgpu `Host::ports`)   | positions, kv_len, slots, embed_indptr |
 //!
 //! So on Vulkan and wgpu no device-geometry program (beam search's, for
 //! one) binds as device geometry: its fires are host-resolved, an engine
 //! limit, until engine-gpu carries device geometry.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use eta_ir::registry::{GeometryClass, Port, PortMask};
 
@@ -56,6 +61,15 @@ pub enum HostGeometry {
 }
 
 impl HostGeometry {
+    /// Its reason as the model status names it.
+    #[must_use]
+    pub fn reason(&self) -> &'static str {
+        match self {
+            HostGeometry::EngineLacks { .. } => "engine_lacks",
+            HostGeometry::Program { .. } => "program",
+        }
+    }
+
     /// What bind says of the pass, `program` its container hash.
     #[must_use]
     pub fn bind_message(&self, program: u64) -> String {
@@ -171,18 +185,42 @@ pub fn classify(program: ProgramGeometry, device: PortMask, engine: &'static str
     }
 }
 
-static FIRES: AtomicU64 = AtomicU64::new(0);
-
-/// A fire of a pass bound with a [`HostGeometry`] resolved its geometry on
-/// the host.
-pub fn count_fire() {
-    FIRES.fetch_add(1, Ordering::Relaxed);
+/// What a host-resolved fire is counted under: the engine its pass bound
+/// on (its id and kind), why the host resolves it
+/// ([`HostGeometry::reason`]), and the program (its container hash).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FireKey {
+    pub engine: usize,
+    pub kind: &'static str,
+    pub reason: &'static str,
+    pub program: u64,
 }
 
-/// The fires counted so far: the model status's `host_geometry_fires`.
+static FIRES: Mutex<BTreeMap<FireKey, Arc<AtomicU64>>> = Mutex::new(BTreeMap::new());
+
+/// The count a pass bound with a [`HostGeometry`] adds each fire to, one a
+/// key: passes of one program on one engine for one reason share it.
+#[must_use]
+pub fn counter(key: FireKey) -> Arc<AtomicU64> {
+    Arc::clone(FIRES.lock().unwrap().entry(key).or_default())
+}
+
+/// The fires counted so far, each key's.
+#[must_use]
+pub fn by() -> Vec<(FireKey, u64)> {
+    FIRES
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(key, fires)| (key.clone(), fires.load(Ordering::Relaxed)))
+        .collect()
+}
+
+/// The fires counted so far, summed: the model status's
+/// `host_geometry_fires`.
 #[must_use]
 pub fn fires() -> u64 {
-    FIRES.load(Ordering::Relaxed)
+    by().iter().map(|(_, fires)| fires).sum()
 }
 
 #[cfg(test)]
@@ -202,7 +240,10 @@ mod tests {
         }
     }
 
-    const VULKAN: PortMask = PortMask::DECODE_ENVELOPE.with(Port::Fold);
+    /// engine-gpu's mask, Vulkan's and wgpu's alike (their `Host::ports`).
+    const VULKAN: PortMask = PortMask::DECODE_ENVELOPE
+        .with(Port::Fold)
+        .with(Port::AttnMask);
     const CUDA: PortMask = PortMask::DEVICE_GEOMETRY
         .with(Port::AttnMask)
         .with(Port::Fold);
@@ -238,6 +279,18 @@ mod tests {
         assert!(message.contains("its fires serialize"), "{message}");
         assert!(!message.contains("falling back"), "{message}");
 
+        // Its mask port is the engine's: a channel-fed mask adds no lack.
+        let mut masked = program(Some(vec![0, 2]), Ok(None));
+        masked.needs_mask_port = true;
+        let bound = classify(masked, VULKAN, "vulkan");
+        assert_eq!(
+            bound.host,
+            Some(HostGeometry::EngineLacks {
+                engine: "vulkan",
+                lacks: PortMask::of(&[Port::Positions, Port::KvLen, Port::Slots])
+            })
+        );
+
         // A decode envelope whose required ports the engine lacks.
         let required = PortMask::DECODE_ENVELOPE.with(Port::Positions);
         let bound = classify(program(None, Ok(Some(required))), VULKAN, "vulkan");
@@ -249,9 +302,18 @@ mod tests {
             })
         );
 
-        let before = fires();
-        count_fire();
-        assert!(fires() > before);
+        let key = FireKey {
+            engine: 0,
+            kind: "vulkan",
+            reason: host.reason(),
+            program: 0xabc,
+        };
+        let fires_before = fires();
+        counter(key.clone()).fetch_add(1, Ordering::Relaxed);
+        counter(key.clone()).fetch_add(1, Ordering::Relaxed);
+        assert!(fires() >= fires_before + 2);
+        let counted = by().into_iter().find(|(at, _)| *at == key).map(|(_, n)| n);
+        assert!(counted.is_some_and(|n| n >= 2), "one count a key: {counted:?}");
     }
 
     fn a_program_only_host_class_is_named_and_counted() {
@@ -273,9 +335,16 @@ mod tests {
             assert!(message.contains("its fires serialize"), "{message}");
             assert!(!message.contains("falling back"), "{message}");
         }
-        let before = fires();
-        count_fire();
-        assert!(fires() > before);
+        let key = FireKey {
+            engine: 1,
+            kind: "cuda",
+            reason: "program",
+            program: 0xdef,
+        };
+        let before = by().into_iter().find(|(at, _)| *at == key).map_or(0, |(_, n)| n);
+        counter(key.clone()).fetch_add(1, Ordering::Relaxed);
+        let after = by().into_iter().find(|(at, _)| *at == key).map_or(0, |(_, n)| n);
+        assert_eq!(after, before + 1, "counted under its own engine, reason and program");
     }
 
     fn device_classes_and_host_derivable_name_nothing() {
