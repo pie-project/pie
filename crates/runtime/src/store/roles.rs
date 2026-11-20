@@ -3064,7 +3064,8 @@ pub fn bind_taken(
 /// waits by `grown(prefix, run)` ([`grow_for_guest`]: the walk commits a
 /// segment past the committed prefix `prefix`, as it does for a kv
 /// admission short of room) and binds again; a wait that ends with no
-/// segment left to commit is the bind's refusal.
+/// segment left to commit binds again too, short of room the planner then
+/// makes ([`RolesError::BindShort`]), never refused for it.
 ///
 /// This is not a retry: nothing is attempted again on the chance it now
 /// fits, and nothing is degraded or made smaller. The bind is sent again
@@ -3251,9 +3252,19 @@ where
                 }
             };
             tokio::select! {
+                // No segment left to commit within the budget by the time
+                // it looked (the room the refusal counted was committed
+                // for others, or the target came down): the room is the
+                // planner's to make now, never the client's refusal. It
+                // binds again, and a bind short of room then waits in the
+                // planner (`BindShort`); only a need that can never fit
+                // alone is refused (Mac Pro at 5 GiB on 1e87ab171: two
+                // first-frame binds refused to the client "no segment is
+                // left to commit" beside "the segments left ... hold 3
+                // more", two reads at two instants).
                 grew = grown(prefix, run) => {
                     if let Err(why) = grew {
-                        return Err(error.context(format!("refused: {why}")));
+                        tracing::debug!(%pid, %why, "a bind's commit will not come: the planner makes its room");
                     }
                 }
                 () = freed => {}

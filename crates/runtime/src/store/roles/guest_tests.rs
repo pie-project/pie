@@ -2977,3 +2977,91 @@ fn an_unpark_lays_its_runs_of_chunks_before_its_runs_of_slots() {
         roles.lock().unwrap().commit(back);
     }
 }
+
+/// Mac Pro at 5 GiB on 1e87ab171: a first-frame bind short of a run of
+/// three waited on a segment commit (the segments left within the budget
+/// held three more), the walk then had none left for it, and the bind was
+/// refused to the client. A commit that will not come is no refusal: the
+/// bind goes again, short of room the planner makes, and binds once it
+/// has made it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_bind_whose_commit_will_not_come_waits_in_the_planner_and_binds() {
+    use crate::governor::PoolTarget;
+    const ENGINE: usize = 69;
+    let Pools { device, roles } = pools_of(facts_committed(64, 8, 1));
+    let grow = std::rc::Rc::new(std::cell::RefCell::new(crate::store::shared::SharedGrow::new(
+        0,
+        ENGINE,
+        device.clone(),
+    )));
+    let _ = grow.borrow_mut().retarget(u64::from(u32::MAX));
+    let (held_program, mut held_engine) = runs_of(13, 4, 2, 5000);
+    let victim = bind_as(&roles, &mut held_engine, held_program, 7).expect("a resident");
+    fill_with_singles(&roles);
+    let (long, long_engine) = runs_of(8, 4, 2, 0);
+    let mut long_engine = long_engine;
+    let error = bind_as(&roles, &mut long_engine, long, 1).expect_err("no room yet");
+    assert!(
+        matches!(error.downcast_ref::<RolesError>(), Some(RolesError::GuestGrow { .. })),
+        "a commit's to wait on first: {error}"
+    );
+    roles.lock().unwrap().leave_guest_wait(holder(1));
+    let long_engine = std::rc::Rc::new(std::cell::RefCell::new(long_engine));
+    let asked = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    let mapped = device.lock().unwrap().mapped_segments();
+    let bound = super::bind_when_resident(
+        holder(1),
+        {
+            let (roles, engine) = (roles.clone(), long_engine.clone());
+            move || std::future::ready(bind_as(&roles, &mut engine.borrow_mut(), long, 1))
+        },
+        || std::future::pending::<Result<(), String>>(),
+        {
+            // The walk has no segment left for it: the target came down.
+            let grow = grow.clone();
+            move |_, _| {
+                let _ = grow.borrow_mut().retarget(u64::from(mapped));
+                std::future::ready(Err::<(), String>(
+                    "no free run of 4 adjacent chunks, and no segment is left to commit within \
+                     the budget"
+                        .into(),
+                ))
+            }
+        },
+        {
+            let roles = roles.clone();
+            move || Some(roles.lock().unwrap().room_watch())
+        },
+        {
+            let roles = roles.clone();
+            move |run, pieces| roles.lock().unwrap().free_runs(run) >= pieces
+        },
+        |_, _| false,
+        {
+            // The planner: asked beside the commit, it makes room only once
+            // the bind is short of room it makes (its second ask).
+            let (roles, asked) = (roles.clone(), asked.clone());
+            move |_, _| {
+                asked.set(asked.get() + 1);
+                let roles = roles.clone();
+                let second = asked.get() >= 2;
+                async move {
+                    if !second {
+                        return std::future::pending().await;
+                    }
+                    roles.lock().unwrap().close_instance(victim);
+                    Ok::<_, String>(crate::planner::BindRoomWait::Served)
+                }
+            }
+        },
+        {
+            let roles = roles.clone();
+            move || roles.lock().unwrap().leave_guest_wait(holder(1))
+        },
+        |_| {},
+        || std::future::ready(()),
+    )
+    .await;
+    assert!(bound.is_ok(), "served, never refused: {bound:?}");
+    assert_eq!(long_engine.borrow().bindings.len(), 1);
+}
