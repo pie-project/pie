@@ -171,11 +171,14 @@ impl ResidencyPlanner {
                     proc.roles_short_why,
                 )
             });
+            // Its kv pages still to gather: an allocation's need, and a
+            // restore's beside its runs.
+            let kv_missing = waiter.kv_need().saturating_sub(inner.accum.len() as u32);
             let again = inner.stall_dumped.is_some_and(|(at, seen, _)| (at, seen) == (key, gives));
             inner.stall_dumped = Some((key, gives, crate::rt::Instant::now()));
-            Some((key, pid, kind, pids, again, refusal))
+            Some((key, pid, kind, pids, again, refusal, kv_missing))
         });
-        let Some((key, pid, kind, pids, again, refusal)) = stalled else {
+        let Some((key, pid, kind, pids, again, refusal, kv_missing)) = stalled else {
             return;
         };
         // What the head's step takes, read as the map and the step read it.
@@ -208,6 +211,8 @@ impl ResidencyPlanner {
             %pid,
             kind,
             need = ?need,
+            kv_missing,
+            kv_chunks = kv_missing.div_ceil(self.port.chunks_as_pages(1).max(1)),
             again,
             refusal = %refusal.unwrap_or_default(),
             ?need_moves,

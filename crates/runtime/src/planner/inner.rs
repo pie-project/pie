@@ -53,6 +53,10 @@ pub(super) struct Inner {
     /// The room a pass last planned a quiet head on (nothing in flight):
     /// the head and the pool's counts ([`super::ResidencyPlanner::tick`]).
     pub(super) quiet_planned: Option<(super::wait::EntryKey, [u64; 4])>,
+    /// The head held unserved on something in flight: since when, on what
+    /// room, and whether that was said ([`super::ResidencyPlanner::tick`]).
+    pub(super) held_in_flight:
+        Option<(super::wait::EntryKey, u64, crate::rt::Instant, bool)>,
 }
 
 impl Inner {

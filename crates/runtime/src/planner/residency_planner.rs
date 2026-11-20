@@ -387,6 +387,8 @@ impl ResidencyPlanner {
             // Read after the pass: room its own steps took and gave back is
             // the room it planned on, never a change that plans again.
             self.quiet_unplanned();
+        } else {
+            self.say_held_in_flight();
         }
         self.report_short();
         self.note_lapsed_fires();
@@ -439,6 +441,72 @@ impl ResidencyPlanner {
             inner.quiet_planned = Some((key, room));
             true
         })
+    }
+
+    /// The head unserved while something stays in flight with no room
+    /// given back (the beat plans only a quiet head): what is in flight is
+    /// said, once per head and room, after [`super::plan::STALL_SAYS_AGAIN`].
+    /// Mac Pro's 2 GiB mix went silent after one stall line, a head waiting
+    /// on something in flight no line named.
+    fn say_held_in_flight(&self) {
+        let gives = self.port.room_gives();
+        let held = self.with_inner(|inner| {
+            let (key, pid, kind) = inner
+                .unmet_head()
+                .map(|(key, waiter)| (key, waiter.pid, waiter.kind_name()))?;
+            if inner.nothing_in_flight() {
+                return None;
+            }
+            let now = crate::rt::Instant::now();
+            match inner.held_in_flight {
+                Some((at, seen, since, said)) if (at, seen) == (key, gives) => {
+                    if said || since.elapsed() < super::plan::STALL_SAYS_AGAIN {
+                        return None;
+                    }
+                    inner.held_in_flight = Some((key, gives, since, true));
+                }
+                _ => {
+                    inner.held_in_flight = Some((key, gives, now, false));
+                    return None;
+                }
+            }
+            let firing: Vec<ProcessId> = inner
+                .procs
+                .iter()
+                .filter(|(_, proc)| proc.firing())
+                .map(|(pid, _)| *pid)
+                .collect();
+            let moving: Vec<(ProcessId, Residency)> = inner
+                .procs
+                .iter()
+                .filter(|(_, proc)| matches!(proc.state, Residency::Evicting | Residency::Restoring))
+                .map(|(pid, proc)| (*pid, proc.state))
+                .collect();
+            Some((
+                pid,
+                kind,
+                firing.len(),
+                firing.into_iter().take(4).collect::<Vec<_>>(),
+                moving,
+                inner.evicting.keys().copied().collect::<Vec<_>>(),
+                inner.kill_in_flight(),
+                inner.parked_moving.iter().copied().collect::<Vec<_>>(),
+            ))
+        });
+        if let Some((pid, kind, firing, some_firing, moving, evicting, killing, parked_moving)) = held {
+            tracing::warn!(
+                %pid,
+                kind,
+                firing,
+                ?some_firing,
+                ?moving,
+                ?evicting,
+                killing,
+                ?parked_moving,
+                "planner: the queue's head waits unserved on what is in flight, no room given \
+                 back since"
+            );
+        }
     }
 
     /// Publishes what the queue's head lacks for room coming free to be

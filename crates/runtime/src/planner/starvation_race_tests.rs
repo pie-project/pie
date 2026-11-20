@@ -7628,3 +7628,61 @@ async fn a_restore_head_whose_need_stands_is_attempted_in_its_first_pass() {
         drop(fires);
     }
 }
+
+/// Mac Pro's 2 GiB mix on 0d96fb179: an allocation head, 0 chunks free,
+/// one stall line, then silence while chunks came free (35 later). A
+/// quiet unserved head is planned by the beat on the room it finds, and
+/// again whenever the free counts differ from its last plan: room come
+/// free with no one told serves it on the next beat.
+#[test]
+fn a_quiet_allocation_head_is_planned_again_when_room_comes_free() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
+    let pool = Arc::new(RacePool::new(8));
+    pool.refill_after_stall(4, 0);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (holder, head) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [holder, head] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    // A resident holds every page.
+    let held = planner
+        .grant_now(
+            holder,
+            Demand {
+                kv_pages: 4,
+                rs: RsUnits::default(),
+            },
+        )
+        .expect("the pool is free");
+    std::mem::forget(held);
+    let key = planner.with_inner(|inner| {
+        inner.enqueue(
+            head,
+            allocation(Demand {
+                kv_pages: 2,
+                rs: RsUnits::default(),
+            }),
+        )
+    });
+    let served = |planner: &ResidencyPlanner| {
+        planner.with_inner(|inner| {
+            inner.queue.get(&key).is_some_and(|waiter| {
+                matches!(&waiter.kind, WaitKind::Allocation { outcome: Some(Ok(_)), .. })
+            })
+        })
+    };
+    planner.tick();
+    assert!(!served(&planner), "nothing free");
+    let passes = planner.stats.plan_passes.load(Ordering::Relaxed);
+    planner.tick();
+    assert_eq!(
+        planner.stats.plan_passes.load(Ordering::Relaxed),
+        passes,
+        "the same room: no pass"
+    );
+    // Pages come free by a path that tells no one.
+    pool.refill_after_stall(2, 0);
+    planner.tick();
+    assert!(served(&planner), "the free counts moved: planned again, served");
+}
