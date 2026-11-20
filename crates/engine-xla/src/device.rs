@@ -905,40 +905,15 @@ fn free_bytes(dir: &std::path::Path) -> Option<u64> {
     Some((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
 }
 
-/// The host memory free for new allocations (`MemAvailable`), where the host
-/// says.
+/// The host memory free for new allocations, where the host says: the least
+/// of `MemAvailable` and what each capped cgroup ancestor of the process
+/// leaves ([`engine::host_memory`]). A cap the host's `MemAvailable` does
+/// not see OOM-kills a load or a registration whose compiles fit the host
+/// but not the cap.
 pub(crate) fn available_memory() -> Option<u64> {
-    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let line = info.lines().find(|l| l.starts_with("MemAvailable:"))?;
-    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-    let host = kib << 10;
-    Some(cgroup_room().map_or(host, |room| room.min(host)))
-}
-
-/// The memory this process's cgroups leave it: each ancestor with a
-/// `memory.max`, less its `memory.current`, the least of them (`None`
-/// where none is capped). A cap the host's `MemAvailable` does not see
-/// (v6e: the user slice at 150 GiB on a 172 GB host) OOM-kills a load or a
-/// registration whose compiles fit the host but not the cap.
-fn cgroup_room() -> Option<u64> {
-    let own = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-    let path = own.lines().find_map(|l| l.strip_prefix("0::"))?;
-    let mut dir = std::path::PathBuf::from("/sys/fs/cgroup").join(path.trim_start_matches('/'));
-    let mut least: Option<u64> = None;
-    loop {
-        let read = |name: &str| std::fs::read_to_string(dir.join(name)).ok();
-        if let (Some(max), Some(current)) = (read("memory.max"), read("memory.current"))
-            && let (Ok(max), Ok(current)) =
-                (max.trim().parse::<u64>(), current.trim().parse::<u64>())
-        {
-            let room = max.saturating_sub(current);
-            least = Some(least.map_or(room, |l| l.min(room)));
-        }
-        if dir == std::path::Path::new("/sys/fs/cgroup") || !dir.pop() {
-            break;
-        }
-    }
-    least
+    engine::host_memory::available()
+        .ok()
+        .map(|available| available.bytes())
 }
 
 /// The host memory a compiled program holds: ~64 bytes a byte of its text,
