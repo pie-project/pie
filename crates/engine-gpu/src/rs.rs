@@ -53,6 +53,10 @@ pub struct Layout {
 
     pub work_elems: u64,
 
+    /// The heads of the scan whose work is widest: a committed dispatch's
+    /// workgroups are its lanes times these.
+    pub work_heads: u32,
+
     /// Each plane's life over the trace's nodes, first and last: a plane is
     /// read only by the ops that extend its value.
     pub plane_life: Vec<(usize, usize)>,
@@ -108,6 +112,13 @@ impl<B: Backend> Reservation<B> {
                 });
             }
         }
+        tracing::info!(
+            planes_bytes = planes,
+            rows,
+            work_bytes = work,
+            work_lanes = lanes.max(1),
+            "the recurrent planes and work plane, each a reservation of its own"
+        );
         Ok(Reservation {
             planes: B::Buffer::zeroed(device, planes.max(256), crate::books::owners::RS_WORK)?,
             rows,
@@ -278,9 +289,11 @@ impl Layout {
                     let _ = k_heads;
                     gates_cache.insert(gates.0, cache);
                     region(&mut layout, cache, "scan", *y, at)?;
-                    layout.work_elems = layout
-                        .work_elems
-                        .max(u64::from(*v_heads) * u64::from(*v_dim) * u64::from(*k_dim));
+                    let elems = u64::from(*v_heads) * u64::from(*v_dim) * u64::from(*k_dim);
+                    if elems > layout.work_elems {
+                        layout.work_elems = elems;
+                        layout.work_heads = *v_heads;
+                    }
                 }
                 Operation::Ssm(
                     Ssm::Kda {
@@ -306,9 +319,11 @@ impl Layout {
                     plane(&mut layout, cache, Role::KdaF, *f, at)?;
                     plane(&mut layout, cache, Role::KdaB, *b, at)?;
                     region(&mut layout, cache, "scan", *y, at)?;
-                    layout.work_elems = layout
-                        .work_elems
-                        .max(u64::from(*heads) * u64::from(*head_dim) * u64::from(*head_dim));
+                    let elems = u64::from(*heads) * u64::from(*head_dim) * u64::from(*head_dim);
+                    if elems > layout.work_elems {
+                        layout.work_elems = elems;
+                        layout.work_heads = *heads;
+                    }
                 }
                 Operation::Gather(
                     Gather::NgramIds { ids, state, .. } | Gather::NgramIdsChunked { ids, state, .. },
@@ -474,7 +489,6 @@ impl Seat {
         slots: Tensor,
         rows_ext: u32,
     ) -> Result<Seat> {
-        let lane_count = u32::try_from(lanes.len()).unwrap_or(u32::MAX);
         // The planes lie where the load's reservation lays them for the top
         // rung's rows, bound at their room: one view whatever the fire.
         let (buffer, room_rows) = (&held.planes, held.rows);
@@ -483,13 +497,6 @@ impl Seat {
                 what: "extended rows of the recurrent planes the load lays",
                 need: u64::from(rows_ext),
                 have: u64::from(room_rows),
-            });
-        }
-        if lane_count > held.lanes {
-            return Err(Fault::Ceiling {
-                what: "lanes of the recurrent work plane the load lays",
-                need: u64::from(lane_count),
-                have: u64::from(held.lanes),
             });
         }
         // Each plane and region where the room packs them by their lives.
@@ -511,9 +518,11 @@ impl Seat {
         for (region, &offset) in layout.regions.iter().zip(&region_at) {
             ext_out.push(take(offset, region.row_bytes, region.width, region.dtype)?);
         }
+        // The work plane holds a committed dispatch's lanes: a window of more
+        // takes as many dispatches (`dispatch::ssm`).
         let work = Tensor::new(
             handles.bind(&held.work, 0, held.work.bytes())?,
-            lane_count.max(1),
+            held.lanes,
             u32::try_from(layout.work_elems).unwrap_or(u32::MAX),
             Dtype::F32,
         );
