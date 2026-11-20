@@ -295,6 +295,11 @@ pub struct Shell {
     /// The outputs the plan's classes write, and per class the one its
     /// lanes read back to the host: the last float row or voxel output.
     exports: Vec<poem_exec::feeds::ClassOutput>,
+    /// Per export, whether a matmul writes every value of it: v6e's matmul
+    /// flushes denormal results, so such a plane holds none, and a guest
+    /// stage reading it rounds it to bf16 without the denormal form
+    /// (`readout::Plane::normal`, `guest::lower::Lower::denormal`).
+    normal_exports: Vec<bool>,
     readback: Vec<Option<usize>>,
     dit: crate::dit::Dit,
     rs_layout: Option<std::sync::Arc<crate::rs::Layout>>,
@@ -426,7 +431,7 @@ impl Shell {
     /// program's registration compiles each stage for them
     /// (`Stages::compile_all`). An output no ring holds lands no plane.
     #[must_use]
-    pub fn guest_planes(&self) -> Vec<(String, u32, u32, u32, bool, Dtype)> {
+    pub fn guest_planes(&self) -> Vec<(String, u32, u32, u32, bool, Dtype, bool)> {
         (self.readout_specs.iter())
             .flat_map(|spec| {
                 spec.exports.iter().map(|&export| {
@@ -438,6 +443,7 @@ impl Shell {
                         decl.layers,
                         decl.readout,
                         spec.dtype,
+                        self.normal_exports[export],
                     )
                 })
             })
@@ -983,6 +989,14 @@ impl Shell {
 
         let exports = poem_exec::feeds::class_outputs(&boot.trace, &compiled, boot.context, boot.page_size)
             .map_err(|why| Fault::Unbound { what: why })?;
+        let normal_exports = normal_exports(&boot.trace, &exports);
+        tracing::info!(
+            planes = ?(exports.iter().zip(&normal_exports))
+                .filter(|(_, n)| **n)
+                .map(|(e, _)| e.decl.name.as_str())
+                .collect::<Vec<_>>(),
+            "xla readout planes a matmul writes, free of denormals"
+        );
         if exports.is_empty() {
             return Err(Fault::Unbound {
                 what: "no output, so a fire would compute nothing a reader can take".to_string(),
@@ -1108,6 +1122,7 @@ impl Shell {
             staging_facts: staging_facts.clone(),
             host: crate::store::tier::Host::default(),
             disk: None,
+            normal_exports,
             exports,
             readback,
             dit,
@@ -3568,6 +3583,7 @@ impl Shell {
                     out.decl.layers,
                     plane.dtype,
                 )
+                .with_normal(self.normal_exports[plane.export])
             })
             .collect();
         Some(std::sync::Arc::new(crate::readout::Kept {
@@ -4524,4 +4540,25 @@ mod append_runs_tests {
             .to_string();
         assert!(why.contains("not the next offset"), "{why}");
     }
+}
+
+/// Per export, whether every value of it is a matmul's result
+/// (`Operation::Linear`): v6e's matmul flushes denormal results to zero,
+/// so such a plane holds no denormal. Any other writer (an elementwise
+/// op, a gather, a transcendental) leaves it as one that may.
+fn normal_exports(trace: &poem_ir::Trace, exports: &[poem_exec::feeds::ClassOutput]) -> Vec<bool> {
+    use poem_ir::Operands;
+    let mut linear = std::collections::HashSet::new();
+    let mut outs = Vec::new();
+    for node in &trace.nodes {
+        if matches!(node.op, poem_ir::Operation::Linear(_)) {
+            outs.clear();
+            node.op.outputs(&mut outs);
+            linear.extend(outs.iter().copied());
+        }
+    }
+    exports
+        .iter()
+        .map(|e| !e.values.is_empty() && e.values.iter().all(|v| linear.contains(v)))
+        .collect()
 }

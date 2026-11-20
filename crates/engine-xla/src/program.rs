@@ -545,7 +545,10 @@ impl Plane {
     /// Every plane a fire of the load can return (`Shell::guest_planes`):
     /// what a registration checks every output its program reads against
     /// and compiles each stage for.
-    pub fn seat_planes(&mut self, planes: Vec<(String, u32, u32, u32, bool, poem_ir::Dtype)>) {
+    pub fn seat_planes(
+        &mut self,
+        planes: Vec<(String, u32, u32, u32, bool, poem_ir::Dtype, bool)>,
+    ) {
         self.stages.planes = planes;
     }
 
@@ -580,9 +583,6 @@ impl Plane {
     /// [`Plane::finish`] makes it the program. Until then no instance of
     /// it binds.
     pub fn prepare(&mut self, registration: &ProgramRegistration) -> Result<Pending, Refusal> {
-        // XLA's guest lowering has no bf16 yet: such a program is refused by
-        // name, never computed as another dtype.
-        registration.launch.refuse_bf16().map_err(Refusal::Program)?;
         let plan = eta_exec::adopt_launch_package(registration.launch.clone())
             .map_err(|error| Refusal::Program(error.to_string()))?;
         if !plan.executable {
