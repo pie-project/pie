@@ -575,6 +575,7 @@ fn host_rs_plan(
             writes,
             fold,
             snapshots,
+            beams: false,
         });
     }
     Ok(rs::RsPlan::Groups(plans))
@@ -591,6 +592,7 @@ fn device_rs_plan(
     lanes: &PassLanes,
     split: &[u32],
     fold: &geometry::Fold,
+    beams: bool,
 ) -> Result<rs::RsPlan, String> {
     if ids.is_empty() {
         return Ok(rs::RsPlan::Groups(Vec::new()));
@@ -622,6 +624,7 @@ fn device_rs_plan(
             writes: Some(frozen..reserved),
             fold,
             snapshots: Vec::new(),
+            beams,
         });
     }
     Ok(rs::RsPlan::Groups(plans))
@@ -5794,6 +5797,18 @@ async fn fire_device_geometry<C: FireContext>(
         .ports
         .iter()
         .any(|binding| binding.port == Port::Positions);
+    // A beam group's pass (`parents`): its beams' recurrent rows are each
+    // their own list's (`BEAM-PAGE-LISTS.md` §11).
+    let states_parents = ctx
+        .resources()
+        .get(&fwd)?
+        .instance
+        .program
+        .bound
+        .container
+        .ports
+        .iter()
+        .any(|binding| binding.port == Port::Parents);
     let mut write_indexes: Vec<Vec<u64>> = Vec::with_capacity(groups.len());
     let mut write_ends: Vec<u32> = Vec::with_capacity(groups.len());
     for (_, lanes) in &groups {
@@ -5909,7 +5924,7 @@ async fn fire_device_geometry<C: FireContext>(
         if windowed {
             device_window_plan(&stores, ws.id, &write_indexes[0], &rs_ws_ids)
         } else {
-            device_rs_plan(&stores, &rs_ws_ids, &groups, &pass_lanes, &split, &fold)
+            device_rs_plan(&stores, &rs_ws_ids, &groups, &pass_lanes, &split, &fold, states_parents)
         }
     };
     let reserved = reserve(
@@ -8378,7 +8393,7 @@ pub(crate) mod fold_tests {
             assert_eq!(stated, Count(1));
             // Its recurrent state folds the same count, as the plan is
             // reserved.
-            let plan = device_rs_plan(&stores, &[rs], &groups, &pass, &[0, 1], &all()).unwrap();
+            let plan = device_rs_plan(&stores, &[rs], &groups, &pass, &[0, 1], &all(), false).unwrap();
             let rs::RsPlan::Groups(plan) = plan else {
                 panic!("a plain recurrent model plans groups");
             };
@@ -8485,7 +8500,7 @@ pub(crate) mod fold_tests {
         let groups = lane_groups(&[ws]);
         let pass = lanes(19, true, &[&cell]);
         let over = geometry::Fold::Host(vec![9]);
-        let refused = device_rs_plan(&stores, &[rs], &groups, &pass, &[0, 2], &over)
+        let refused = device_rs_plan(&stores, &[rs], &groups, &pass, &[0, 2], &over, false)
             .err()
             .expect("a recurrent state's fold is final as stated");
         assert_eq!(refused, past_rows_refusal(0, 2));
@@ -10765,7 +10780,7 @@ mod unfolded_tests {
             };
             let mut req = lane(10, 4);
             let plan = if device_places {
-                device_rs_plan(&stores, &ids, &groups_of, &pass, &[0, 4], fold)
+                device_rs_plan(&stores, &ids, &groups_of, &pass, &[0, 4], fold, false)
             } else {
                 host_rs_plan(&stores, &ids, &groups_of, &req, fold, &[])
             }
@@ -10918,6 +10933,7 @@ mod unfolded_tests {
                 &lanes,
                 &[0, 5],
                 &geometry::Fold::Device,
+                false,
             )
         };
         let planned = groups(device(13 + 5 + 5).unwrap());
