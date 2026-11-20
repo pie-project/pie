@@ -304,6 +304,16 @@ pub trait PoolPort: Send + Sync + 'static {
         let _ = rs;
         0
     }
+    /// Whether `pid` holds device room the registry's page and state counts
+    /// do not see: guest state (its instances' scratch, parked role slots
+    /// lying on the device). Moving it frees chunks, so a process holding
+    /// only that is still a holder: the starvation endgame's "alone holds
+    /// what the pool holds" ([`super::ResidencyPlanner::sole_holder`]) is
+    /// false while one does. None where the pool keeps no guest state.
+    fn holds_device_room(&self, pid: ProcessId) -> bool {
+        let _ = pid;
+        false
+    }
     /// Whether `pieces` free runs of `run` adjacent chunks stand for a
     /// guest's state now: what a bind short of room waits on
     /// ([`super::wait::WaitKind::BindRoom`]). None where the pool keeps
@@ -570,6 +580,19 @@ impl PoolPort for RegistryPool {
         crate::store::registry::try_get(self.model, self.engine)
             .and_then(|stores| stores.shared)
             .map_or(0, |shared| shared.lock().unwrap().pool().free_chunk_runs(run))
+    }
+
+    fn holds_device_room(&self, pid: ProcessId) -> bool {
+        crate::store::registry::try_get(self.model, self.engine)
+            .and_then(|stores| stores.roles)
+            .is_some_and(|roles| {
+                let roles = roles.lock().unwrap();
+                roles.holds_guest_state(pid)
+                    || roles
+                        .parked_chunk_slots(ProcessId::nil())
+                        .iter()
+                        .any(|&(_, holder, _)| holder == pid)
+            })
     }
 
     fn room_beside_own(&self, pid: ProcessId, run: u32, pieces: u32) -> bool {

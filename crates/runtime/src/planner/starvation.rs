@@ -124,6 +124,20 @@ impl ResidencyPlanner {
             Some(victim) if self.sole_holder(victim) => StarveCause::SoleHolder,
             _ => cause,
         };
+        // The head itself picked, short only of room others hold that no
+        // move frees now (no eligible victim), its need fitting the pool
+        // alone: it waits (the user's ruling: no waiter that fits alone
+        // gives up). The holders' completions, a room change or an arrival
+        // plan again; the stall is named meanwhile (`dump_stall`). Failed
+        // here, a rise that fit was refused once its holders' moves found
+        // nothing to move.
+        let head_fits_alone = self.with_inner(|inner| {
+            let (head_key, head) = inner.unmet_head()?;
+            Some(head_key == victim_key && head.kv_need() <= total)
+        });
+        if cause != StarveCause::SoleHolder && head_fits_alone == Some(true) {
+            return;
+        }
         let (rs_free, rs_total) = self.port.rs_stats();
         let notify = self.with_inner(|inner| {
             let (_, head) = inner.unmet_head()?;
@@ -189,7 +203,10 @@ impl ResidencyPlanner {
     }
 
     /// `pid` holds all that is held in the pool: no other process holds kv
-    /// pages or state, none is on its way back, and no idle cache could go.
+    /// pages or state or guest state on the device
+    /// ([`super::PoolPort::holds_device_room`]: its instances' scratch, its
+    /// parked role slots lying there), none is on its way back, and no idle
+    /// cache could go.
     /// Stalled (nothing of it in flight), it is stuck on what it holds
     /// itself, and a restart frees only that to ask for the same again.
     pub(super) fn sole_holder(&self, pid: ProcessId) -> bool {
@@ -208,6 +225,7 @@ impl ResidencyPlanner {
             && others.into_iter().all(|other| {
                 held_page_count(other, model, engine) == 0
                     && held_rs_units(other, model, engine).is_zero()
+                    && !self.port.holds_device_room(other)
             })
     }
 

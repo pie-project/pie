@@ -2634,6 +2634,13 @@ impl PoolPort for BindRoomPool {
     fn room_gives(&self) -> u64 {
         self.gives.load(Ordering::Relaxed)
     }
+    /// A resident's kv chunks and parked state lying on the device are
+    /// room it holds, as the registry would count them for a real one.
+    fn holds_device_room(&self, pid: ProcessId) -> bool {
+        self.kv.lock().iter().any(|&(_, holder)| holder == pid)
+            || self.parked.lock().iter().any(|&(_, holder)| holder == pid)
+            || *self.occupant.lock() == Some(pid)
+    }
     fn room_beside_own(&self, _pid: ProcessId, run: u32, pieces: u32) -> bool {
         let own = self.own.lock().clone();
         let kept: Vec<u32> = self.free.lock().iter().copied().filter(|c| !own.contains(c)).collect();
@@ -4770,11 +4777,20 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
         // Mixed shapes: in some pools the chunks not free hold residents'
         // kv pages, each resident's whole, emptied for any shape once it
         // moves off the device.
-        let mixed = !residents.is_empty() && rng.below(2) == 0;
+        // A rise seed's chunks not free are all residents' (a real pool's
+        // are someone's, which the registry counts): none lies held by no
+        // one, as a chunk taken here otherwise does.
+        let mixed = !residents.is_empty() && (is_rise || rng.below(2) == 0);
+        if is_rise && residents.is_empty() {
+            // No one to hold a chunk: every chunk is free.
+            let mut free = pool.free.lock();
+            free.clear();
+            free.extend(0..total);
+        }
         if mixed {
             let held: Vec<u32> = (0..total).filter(|id| !pool.free.lock().contains(id)).collect();
             for chunk in held {
-                if rng.below(10) < 7 {
+                if is_rise || rng.below(10) < 7 {
                     let pid = residents[rng.below(residents.len() as u64) as usize];
                     pool.kv.lock().push((chunk, pid));
                 }
@@ -4899,8 +4915,23 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
                         let mut free = pool.free.lock();
                         if !free.is_empty() {
                             let at = rng.below(free.len() as u64) as usize;
-                            let id = free.remove(at);
-                            schedule.push(format!("take {id}"));
+                            // In a rise seed a live resident takes it, or
+                            // no one does.
+                            let by = alive.iter().copied().find(|pid| {
+                                planner.with_inner(|inner| {
+                                    inner.procs.get(pid).is_some_and(|proc| proc.state == Residency::Resident)
+                                })
+                            });
+                            match (is_rise, by) {
+                                (true, None) => {}
+                                (rise, by) => {
+                                    let id = free.remove(at);
+                                    if let (true, Some(pid)) = (rise, by) {
+                                        pool.kv.lock().push((id, pid));
+                                    }
+                                    schedule.push(format!("take {id}"));
+                                }
+                            }
                         }
                     }
                     // A chunk given back.
@@ -4951,6 +4982,18 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
                     // A resident completes.
                     3 if !alive.is_empty() => {
                         let pid = alive.remove(rng.below(alive.len() as u64) as usize);
+                        // Its sets go with it: their chunks come back as it
+                        // leaves, not after (a real departure's pages are
+                        // counted on their way back).
+                        let gone: Vec<u32> = pool
+                            .kv
+                            .lock()
+                            .iter()
+                            .filter(|&&(_, holder)| holder == pid)
+                            .map(|&(chunk, _)| chunk)
+                            .collect();
+                        pool.kv.lock().retain(|&(_, holder)| holder != pid);
+                        pool.free.lock().extend(&gone);
                         planner.unregister(pid);
                         schedule.push("a resident completes".into());
                     }
@@ -5037,9 +5080,12 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
                 .unwrap_or((run, pieces));
             let alive_now: Vec<ProcessId> = planner.with_inner(|inner| inner.procs.keys().copied().collect());
             let map_serves = if is_rise {
-                // Any chunks: free, or emptied by moving residents' kv.
-                let kv = pool.kv.lock().iter().filter(|(_, pid)| alive_now.contains(pid)).count();
-                pool.free.lock().len() + kv >= (run * pieces) as usize
+                // Any free chunks. A rise is an allocation: its victims are
+                // chosen by the registry's page quotes, which this pool's
+                // residents' kv is not in (it is in the chunk map only), so
+                // their chunks count as held here, as room the head waits
+                // for with no deadline, never as room it is refused for.
+                pool.free.lock().len() >= (run * pieces) as usize
             } else {
                 pool.chunk_occupants(&alive_now).cheapest_runs(need.0, need.1).is_some()
                     || pool.runs_free(need.0, need.1)
@@ -5107,14 +5153,11 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
         if let Some(bind) = bind {
             if bind.is_finished() {
                 match bind.await {
-                    // As for the allocations above: the starvation endgame
-                    // meets a pool this one cannot stand for. Its chunks
-                    // not free are held by no process the registry counts,
-                    // so a rise that gathered the free ones "alone holds
-                    // the pool".
-                    Ok(Err(PlannerError::Starved { .. })) if is_rise => {}
                     Ok(Err(error)) => {
-                        failures.push(format!("seed {seed}: the head's bind was refused: {error}"));
+                        failures.push(format!(
+                            "seed {seed}: the head's bind was refused: {error}\n  schedule: {}",
+                            schedule.join(" -> ")
+                        ));
                     }
                     _ => {}
                 }
@@ -5371,4 +5414,56 @@ async fn a_refused_restore_s_need_is_its_refusal_s_and_the_planner_moves_for_it(
         planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
         "the occupants of the cheapest runs of the updated need are moved"
     );
+}
+
+/// A rise (a cut fire's raise funded as a head) whose room an older
+/// resident holds that no move frees here (its pages are in no quote this
+/// pool makes, so no victim stands): the starvation endgame never refuses
+/// it, its need fitting the pool alone; and the resident, holding device
+/// room the registry's counts do not see (`holds_device_room`), is no
+/// sole holder's "nobody". It waits, named as a stall, and is served once
+/// the resident leaves and its chunks come back.
+#[tokio::test(flavor = "current_thread")]
+async fn a_rise_whose_room_no_move_frees_waits_and_is_served_once_the_room_returns() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.write().await;
+    let model = crate::store::registry::register_model(16, &[8], &[4]);
+    let pool = Arc::new(BindRoomPool {
+        model,
+        ..BindRoomPool::new(8, 0..0, 0)
+    });
+    pool.pages.store(true, Ordering::Release);
+    let (resident, head) = (ProcessId::new_v4(), ProcessId::new_v4());
+    pool.free.lock().extend([6, 7]);
+    pool.kv.lock().extend((0..6).map(|chunk| (chunk, resident)));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    for pid in [resident, head] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    planner.with_inner(|inner| inner.procs.get_mut(&resident).unwrap().idle = true);
+    assert!(pool.holds_device_room(resident));
+    let p = planner.clone();
+    let rise = crate::rt::spawn(async move { p.acquire_rise(head, head, 4).await.map(drop) });
+    for _ in 0..3 {
+        planner.pages_freed();
+        planner.poke();
+        crate::policy::pressure::answered_nothing(crate::policy::pressure::Tier::Device);
+        for _ in 0..200 {
+            crate::rt::yield_now().await;
+        }
+    }
+    assert!(!rise.is_finished(), "it waits, never refused: it fits the pool alone");
+    assert!(planner.stats.stall_dumps.load(Ordering::Relaxed) > 0, "the stall is named");
+    // The resident leaves: its chunks come back, and the rise is served.
+    pool.kv.lock().clear();
+    pool.free.lock().extend(0..6);
+    planner.unregister(resident);
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if rise.is_finished() {
+            break;
+        }
+    }
+    assert!(rise.is_finished(), "served once the room returns");
+    assert!(matches!(rise.await, Ok(Ok(()))));
 }
