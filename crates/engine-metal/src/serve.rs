@@ -2528,13 +2528,22 @@ impl Shell {
             .map_or(0, crate::rs::Buffers::page_bytes);
         let budget = match budget {
             Some(bytes) => bytes,
-            None => engine::disk::unstated_budget(
-                dir,
-                if self.pools.state_slot_bytes() + buffered > 0 { u64::from(seats) } else { 0 },
-                self.pools.state_slot_bytes() + buffered,
-                u64::from(seats) * u64::from(context).div_ceil(u64::from(paging.page_size.max(1))),
-                self.pools.page_bytes()?,
-            ),
+            None => {
+                let state_bytes = self.pools.state_slot_bytes() + buffered;
+                let state_rows = if state_bytes > 0 { u64::from(seats) } else { 0 };
+                let pages =
+                    u64::from(seats) * u64::from(context).div_ceil(u64::from(paging.page_size.max(1)));
+                let page_bytes = self.pools.page_bytes()?;
+                let free = engine::disk::free_space(dir);
+                let bytes =
+                    engine::disk::derived_budget(state_rows, state_bytes, pages, page_bytes, free);
+                // Its inputs, stated at load: what the field rules on.
+                eprintln!(
+                    "engine-metal: the unstated disk tier: {bytes} bytes = {seats} seats x                      (state {state_bytes} B + {context} tokens of kv in {} pages of {page_bytes} B),                      within {free} bytes free",
+                    context.div_ceil(paging.page_size.max(1)),
+                );
+                bytes
+            }
         };
         self.pools.seat_disk(dir, budget)
     }

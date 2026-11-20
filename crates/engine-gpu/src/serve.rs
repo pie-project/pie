@@ -2210,7 +2210,14 @@ impl<B: Serve> Shell<B> {
                 u64::from(seats) * u64::from(context).div_ceil(u64::from(paging.page_size.max(1)));
             let per_list = layout.list.map_or(1, |list| u64::from(list.per_chunk.max(1)));
             let state = (u64::from(seats) * self.state_slot_bytes()).div_ceil(chunk.max(1));
-            engine::disk::unstated_budget(dir, 0, 0, pages.div_ceil(per_list) + state, chunk)
+            let bytes = engine::disk::unstated_budget(dir, 0, 0, pages.div_ceil(per_list) + state, chunk);
+            // Its inputs, stated at load: what the field rules on.
+            eprintln!(
+                "engine-gpu: the unstated disk tier: {bytes} bytes = {seats} seats x {context}                  tokens: {pages} kv pages in {} chunks and {state} chunks of state ({} B a seat),                  chunks of {chunk} B",
+                pages.div_ceil(per_list),
+                self.state_slot_bytes(),
+            );
+            bytes
         });
         self.pools.seat_disk(&self.device, dir, budget)?;
         let chunks = self.pools.disk_chunks();

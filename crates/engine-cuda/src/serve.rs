@@ -679,6 +679,13 @@ impl Shell {
                     chunk,
                     free / ranks,
                 );
+                // Its inputs, stated at load: what the field rules on.
+                eprintln!(
+                    "engine-cuda: the unstated disk tier: {bytes} bytes = {seats} seats x                      {context} tokens: {pages} kv pages in {} chunks and {state} chunks of state                      ({} B a seat), chunks of {chunk} B, within {} bytes free a rank",
+                    pages.div_ceil(per_chunk),
+                    self.state_row_bytes(),
+                    free / ranks,
+                );
                 self.pools.seat_disk(dir, world.rank, bytes, keep)?;
                 Some(bytes)
             }
