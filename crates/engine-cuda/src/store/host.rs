@@ -4,20 +4,24 @@
 //!
 //! The tier is one anonymous mapping of the budget's bytes, committed by the
 //! kernel page by page as moves first write it: the process holds what the
-//! tier holds, never the budget. The ring is [`STAGES`] pieces, and a move
-//! of any size goes through it in pieces of whole slots: the device copies
-//! one piece on the swap stream while a thread of the tier's own (the
-//! landing thread) moves the one before it between the ring and the tier,
-//! and a piece is reused once both are done with it. The ring is sized by
+//! tier holds, never the budget. A move of any size goes through the ring
+//! in pieces of whole slots: the device copies one piece on the swap stream
+//! while a thread of the tier's own (the landing thread) moves the one
+//! before it between the ring and the tier, and a piece is reused once both
+//! are done with it. The ring holds a piece for each of those [`STAGES`]
+//! for each frame the engine keeps in flight, since moves ride between
+//! frames, one frame's ahead of the next ([`staging_ring`]): it is sized by
 //! the copies in flight, not by what one move carries.
 //!
 //! A move to the host copies a piece of device slots into the ring on the
 //! swap stream; the landing thread waits for it to land and moves it into
 //! the tier. A move to the device has the landing thread move a piece from
 //! the tier into the ring, and the swap stream copies it to the device once
-//! that is done. Every wait for a piece sits on the swap stream (a host
-//! function there that waits for the landing thread, [`HostTier::gate`]),
-//! never on the engine thread: a move costs the engine thread what
+//! that is done. Every wait for a piece sits on the swap stream, never on
+//! the engine thread: the stream waits on the device for a word past the
+//! ring's pieces, the last job the landing thread finished, which that
+//! thread writes into the mapped ring ([`HostTier::gate`]); no host function
+//! blocks and no driver thread waits. A move costs the engine thread what
 //! enqueueing it does, as it did when the ring held whole moves. Each
 //! landing-thread job waits only for copies enqueued on the swap stream
 //! before every stream wait for it, so the two never wait on each other.
@@ -27,7 +31,7 @@
 //! ring takes is gone from what the device is sized by, and a ring that
 //! cannot be pinned refuses the load by name.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -36,25 +40,44 @@ use crate::device::alloc;
 use crate::device::graph::Event;
 use crate::error::{Fault, Result};
 
-/// The pieces the staging ring holds: one for each stage a piece passes
-/// through, the device's copy (on the swap stream) and the host's move
-/// between the ring and the tier (on the landing thread), so each stage
-/// works on one piece while the other works on the next.
+/// The stages a piece passes through, each holding one piece while the
+/// other works on the next: the device's copy (on the swap stream) and the
+/// host's move between the ring and the tier (on the landing thread).
 pub const STAGES: u64 = 2;
 
 /// The page a piece is a whole number of.
 const PIECE_GRAIN: u64 = 4096;
 
-/// The page-locked staging ring's bytes for a tier of at most `budget`
-/// bytes whose moves go through it in pieces of `piece` bytes: [`STAGES`]
-/// pieces, within the tier's budget (a tier never moves more than it
-/// holds), never under a page a stage.
+/// The staging ring's shape: `pieces` pieces of `piece` bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RingSize {
+    pub piece: u64,
+    pub pieces: u64,
+}
+
+impl RingSize {
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        self.piece.saturating_mul(self.pieces)
+    }
+}
+
+/// The page-locked staging ring for a tier of at most `budget` bytes whose
+/// moves go through it in pieces of at most `piece` bytes, behind an
+/// engine that keeps `frames` frames in flight: a piece for each of the
+/// [`STAGES`] for each frame, since the runtime hands the engine moves
+/// between frames (its pre-launch copies), so the moves handed before each
+/// frame still in flight may be on their way at once. Within the tier's
+/// budget (a tier never moves more than it holds), a piece never under a
+/// page.
 #[must_use]
-pub fn staging_ring(piece: u64, budget: u64) -> u64 {
-    piece
-        .saturating_mul(STAGES)
-        .min(budget)
-        .max(STAGES * PIECE_GRAIN)
+pub fn staging_ring(piece: u64, frames: u8, budget: u64) -> RingSize {
+    let pieces = STAGES * u64::from(frames.max(1));
+    let piece = piece.min(budget / pieces) / PIECE_GRAIN * PIECE_GRAIN;
+    RingSize {
+        piece: piece.max(PIECE_GRAIN),
+        pieces,
+    }
 }
 
 /// How a move's slots, `(device address, tier offset, bytes)` each, go
@@ -96,26 +119,35 @@ fn pieces(slots: &[(u64, usize, usize)], piece: usize) -> Vec<Vec<(usize, u64, u
 /// The staging ring, page-locked on the load's path ([`Ring::pin`]): the
 /// tier copies every move through it.
 #[derive(Debug)]
-pub struct Ring(Pinned);
+pub struct Ring(Pinned, RingSize);
 
 impl Ring {
-    /// Pins `bytes` of staging ring, or refuses the load naming them: a
+    /// Pins a staging ring of `size`, or refuses the load naming it: a
     /// ring pinned later would take page-locked memory after ready, under
     /// whatever the device was sized to leave.
-    pub fn pin(bytes: u64) -> Result<Ring> {
+    pub fn pin(size: RingSize) -> Result<Ring> {
+        // The pieces, and a page past them for the landing thread's word.
+        let bytes = size.bytes() + PIECE_GRAIN;
         let len = usize::try_from(bytes).unwrap_or(usize::MAX);
-        pin_ring(len).map(Ring).map_err(|why| {
-            Fault::Residency(format!(
-                "the host tier's staging ring of {} MiB could not be pinned: {why}; state a \
+        pin_ring(len)
+            .map(|pinned| Ring(pinned, size))
+            .map_err(|why| {
+                Fault::Residency(format!(
+                    "the host tier's staging ring of {} MiB could not be pinned: {why}; state a \
                  smaller `[engine.memory] budget_host`",
-                bytes >> 20
-            ))
-        })
+                    bytes >> 20
+                ))
+            })
     }
 
     #[must_use]
     pub fn bytes(&self) -> u64 {
         self.0.bytes() as u64
+    }
+
+    #[must_use]
+    pub fn size(&self) -> RingSize {
+        self.1
     }
 }
 
@@ -148,6 +180,9 @@ struct Landed {
 struct Shared {
     landed: Mutex<Landed>,
     moved: Condvar,
+    /// The host address of the ring's word the swap stream waits on: the
+    /// low 32 bits of the last job done.
+    word: usize,
 }
 
 impl Shared {
@@ -166,6 +201,10 @@ impl Shared {
         if fault.is_some() && landed.fault.is_none() {
             landed.fault = fault;
         }
+        // Released after the job's bytes: a stream past the word reads them.
+        // SAFETY: the word is the ring's own, aligned, and lives as long as
+        // the tier (the ring drops after the landing thread is joined).
+        unsafe { &*(self.word as *const AtomicU32) }.store(landed.done as u32, Ordering::Release);
         self.moved.notify_all();
     }
 }
@@ -189,7 +228,7 @@ pub struct HostTier {
     /// The staging ring, pinned at the load. Dropped after the landing
     /// thread is joined (fields drop after [`Drop::drop`]).
     ring: Ring,
-    /// A piece's bytes: the ring is [`STAGES`] of them.
+    /// A piece's bytes, and who holds each of the ring's pieces.
     piece: usize,
     held: Vec<Piece>,
     /// The piece the next one taken is.
@@ -243,17 +282,14 @@ impl HostTier {
         unsafe {
             libc::madvise(base.cast(), len.max(1), libc::MADV_HUGEPAGE);
         }
-        let piece = (ring.bytes() / STAGES / PIECE_GRAIN * PIECE_GRAIN).max(1);
-        if piece * STAGES > ring.bytes() {
-            return Err(Fault::Ceiling {
-                what: "bytes of the host tier's staging ring",
-                need: piece * STAGES,
-                have: ring.bytes(),
-            });
-        }
+        let RingSize { piece, pieces } = ring.size();
+        let word = ring.0.host() as usize + (piece * pieces) as usize;
+        // SAFETY: the word lies in the ring's page past its pieces, aligned.
+        unsafe { &*(word as *const AtomicU32) }.store(0, Ordering::Release);
         let shared = Arc::new(Shared {
             landed: Mutex::new(Landed::default()),
             moved: Condvar::new(),
+            word,
         });
         let (send, jobs) = std::sync::mpsc::channel::<Job>();
         let thread = {
@@ -273,7 +309,7 @@ impl HostTier {
             len,
             ring,
             piece: usize::try_from(piece).unwrap_or(usize::MAX),
-            held: (0..STAGES).map(|_| Piece::Free).collect(),
+            held: (0..pieces).map(|_| Piece::Free).collect(),
             turn: 0,
             next: 0,
             writing: vec![0; chunks as usize],
@@ -309,19 +345,17 @@ impl HostTier {
         }
     }
 
-    /// Holds `swap` until landing-thread job `id` is done: a host function
-    /// on the stream, enqueued only where the job is not done already.
+    /// Holds `swap` until landing-thread job `id` is done: the stream waits
+    /// on the device for the landing thread's word to reach it (compared
+    /// wrapping, so the word's 32 bits never run out), enqueued only where
+    /// the job is not done already.
     fn gate(&self, swap: *mut core::ffi::c_void, id: u64) -> Result<()> {
         if self.shared.landed.lock().expect("the landing state").done >= id {
             return Ok(());
         }
-        let shared = self.shared.clone();
-        crate::device::ctx::host_fn_on(
-            swap,
-            Box::new(move || {
-                drop(shared.wait(id));
-            }),
-        )
+        let RingSize { piece, pieces } = self.ring.size();
+        let word = self.ring.0.device() + piece * pieces;
+        crate::device::ctx::wait_value(swap, word, id as u32)
     }
 
     fn job(
@@ -514,8 +548,6 @@ impl Drop for HostTier {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
-        // Nothing on a stream waits on a job past this.
-        self.shared.finish(u64::MAX, None);
         // This tier's own mapping, no longer read or written.
         alloc::unmap_anon(self.base, self.len);
     }
@@ -527,7 +559,10 @@ fn land(jobs: &Receiver<Job>, shared: &Shared, ordinal: i32) {
     if let Err(why) = crate::device::ctx::bind_thread(ordinal) {
         let what = format!("the host tier's landing thread bound no device: {why}");
         eprintln!("engine-cuda: {what}");
-        shared.finish(u64::MAX, Some(what));
+        // Every job finishes, moving nothing, so no stream waits forever.
+        while let Ok(job) = jobs.recv() {
+            shared.finish(job.id, Some(what.clone()));
+        }
         return;
     }
     while let Ok(job) = jobs.recv() {
@@ -622,18 +657,20 @@ fn split(moves: &[(usize, usize, usize)], share: usize) -> Vec<Vec<(usize, usize
 
 #[cfg(test)]
 mod tests {
-    use super::{STAGES, pieces, split, staging_ring};
+    use super::{RingSize, pieces, split, staging_ring};
 
     const MIB: u64 = 1 << 20;
 
     #[test]
-    fn the_ring_holds_a_piece_for_each_stage_within_the_tier() {
-        // 32 MiB pieces over a 28 GiB tier: a piece a stage, whatever the
-        // context or the move.
-        assert_eq!(staging_ring(32 * MIB, 28 << 30), STAGES * 32 * MIB);
-        // No more than the tier holds, never under a page a stage.
-        assert_eq!(staging_ring(32 * MIB, 20 * MIB), 20 * MIB);
-        assert_eq!(staging_ring(32 * MIB, 1), STAGES * 4096);
+    fn the_ring_holds_a_piece_a_stage_a_frame_within_the_tier() {
+        let ring = |piece, pieces| RingSize { piece, pieces };
+        // 32 MiB pieces over a 28 GiB tier, two frames in flight: a piece
+        // for each of the two stages of each frame, whatever the context.
+        assert_eq!(staging_ring(32 * MIB, 2, 28 << 30), ring(32 * MIB, 4));
+        assert_eq!(staging_ring(32 * MIB, 1, 28 << 30), ring(32 * MIB, 2));
+        // No more than the tier holds, never under a page a piece.
+        assert_eq!(staging_ring(32 * MIB, 2, 20 * MIB), ring(5 * MIB, 4));
+        assert_eq!(staging_ring(32 * MIB, 2, 1), ring(4096, 4));
     }
 
     #[test]

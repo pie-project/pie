@@ -705,16 +705,18 @@ impl Engine for Cuda {
         // gone from the driver's free bytes and Windows' commit alike. A
         // ring that cannot be pinned refuses the load, here and not after
         // ready.
-        let ring = crate::store::staging_ring_for(residency.host_kv_budget, ranks)
-            .and_then(|bytes| bytes.map(crate::store::Ring::pin).transpose())
+        let frames = engine::runahead::Runahead::of(frames_in_flight).frames_in_flight;
+        let ring = crate::store::staging_ring_for(residency.host_kv_budget, ranks, frames)
+            .and_then(|size| size.map(crate::store::Ring::pin).transpose())
             .map_err(fault)?;
         if let Some(ring) = &ring {
+            let size = ring.size();
             eprintln!(
-                "engine-cuda: the host tier's staging ring: {} MiB pinned, {} pieces of {} MiB \
-                 in flight",
-                ring.bytes() >> 20,
-                crate::store::STAGES,
-                ring.bytes() / crate::store::STAGES >> 20
+                "engine-cuda: the host tier's staging ring: {} MiB pinned, {} pieces of {} MiB (a \
+                 piece for each of 2 stages for each of {frames} frames in flight)",
+                size.bytes() >> 20,
+                size.pieces,
+                size.piece >> 20
             );
         }
         let mut budgets = budgets;

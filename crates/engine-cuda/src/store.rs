@@ -1,7 +1,7 @@
 #![allow(unsafe_code)]
 pub mod chunks;
 mod host;
-pub use host::{Ring, STAGES};
+pub use host::{Ring, RingSize};
 pub mod kv;
 pub mod layout;
 pub mod rs;
@@ -431,17 +431,17 @@ pub fn declared_context_that_fits(
     Ok(fits.saturating_mul(page_size))
 }
 
-/// The staging ring's bytes for a host tier of this rank, known before
-/// the load measures the device: a piece for each stage a move's piece
-/// passes ([`host::STAGES`]), a piece the largest chunk the pool's recipe
-/// may lay, so any shape's slot moves through one whole
-/// ([`poem_compiler::chunk::ChunkProfile::range`]); within what the tier
-/// may take (the operator's `host` bytes shared by `ranks`, else half of
-/// what the host has free, as [`crate::Shell::seat_host_kv`] bounds its
-/// default). The ring holds the copies in flight, not a sequence: a move
-/// of any size goes through it a piece at a time. `None` where no tier is
-/// stated.
-pub fn staging_ring_for(host: Option<u64>, ranks: u32) -> Result<Option<u64>> {
+/// The staging ring for a host tier of this rank, known before the load
+/// measures the device: a piece for each stage a move's piece passes for
+/// each of the `frames` the engine keeps in flight ([`host::staging_ring`]),
+/// a piece the largest chunk the pool's recipe may lay, so any shape's slot
+/// moves through one whole ([`poem_compiler::chunk::ChunkProfile::range`]);
+/// within what the tier may take (the operator's `host` bytes shared by
+/// `ranks`, else half of what the host has free, as
+/// [`crate::Shell::seat_host_kv`] bounds its default). The ring holds the
+/// copies in flight, not a sequence: a move of any size goes through it a
+/// piece at a time. `None` where no tier is stated.
+pub fn staging_ring_for(host: Option<u64>, ranks: u32, frames: u8) -> Result<Option<RingSize>> {
     let ranks = u64::from(ranks.max(1));
     let free = crate::weights::available_memory() / ranks;
     let budget = match host {
@@ -450,7 +450,7 @@ pub fn staging_ring_for(host: Option<u64>, ranks: u32) -> Result<Option<u64>> {
         None => free / 2,
     };
     let (_, piece) = poem_compiler::chunk::ChunkProfile::SERVER_CUDA.range();
-    Ok(Some(host::staging_ring(piece, budget)))
+    Ok(Some(host::staging_ring(piece, frames, budget)))
 }
 
 pub fn one_slot_bytes(trace: &Trace, paging: Paging) -> Result<u64> {
