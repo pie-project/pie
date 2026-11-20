@@ -110,12 +110,18 @@ fn heavier_epilogue(rounds: u32) -> eta_ir::container::TraceContainer {
 /// thread (`Engine::prepare_program`): its fires keep landing, none waiting
 /// out the compile, and the program registers at the finish.
 ///
+/// The test holds the device alone (`gpu::alone`): a model test beside it
+/// (the score oracles' loads and fires) keeps the device busy for tens of
+/// milliseconds, and the lane's fence wait across it reads as a stall behind
+/// the compile, which is host work alone (`program::adopt`).
+///
 /// Known to fail on the RTX Spark (Windows NVIDIA driver): a one-time submit stall early in
 /// the engine's life lands inside the compile window in about half the runs, with no pie lock
 /// involved (`new-memory/FOLLOWUPS.md` F41). The measurement stays strict.
 #[test]
 fn a_cold_registration_compiles_while_a_lane_fires() {
     use engine::fire::{Attachment, FrameSubmission, InputFeed, Lane, Readout, Step};
+    crate::gpu::alone();
     let Some(super::outputs::Bound {
         mut engine,
         instance,
