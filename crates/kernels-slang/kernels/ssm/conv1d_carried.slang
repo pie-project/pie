@@ -60,58 +60,86 @@ float2 pair(uint word) {
     return float2(bf16_to_f32(word & 0xffffu), bf16_to_f32(word >> 16));
 }
 
+// A run-ahead's carried positions a workgroup resolves once (each to its
+// row's first word in the pool) for every lane's taps to read in one load.
+#define PMAX 16
+groupshared uint srow[PMAX];
+
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
-void main(uint3 gid : SV_DispatchThreadID) {
+void main(uint3 gid : SV_DispatchThreadID, uint3 local : SV_GroupThreadID) {
     uint c = 2u * gid.x;
     uint r = gid.y;
+    uint tid = local.x;
     uint chans = uint(params.channels);
-    if (c >= chans) {
-        return;
-    }
+    // A workgroup's lanes are one lane's channels: none returns before its
+    // barrier.
+    bool active = c < chans;
     uint lane = uint(params.lane0) + r;
     uint row = params.row0 + r;
+    int width = params.conv_width;
+    int dil = params.dilation;
+    int hist = (width - 1) * dil + 1;
+    bool none = pie_state_none(lane);
+    // Channel `c`'s history in the record (`ssm/conv1d.slang`'s column),
+    // found once (a slot's history lies in one segment) and loaded first,
+    // its loads overlapping the buffered rows' lookups.
+    uint pitch = min(params.piece_atoms, chans);
+    uint col = c % params.piece_atoms;
+    uint seg = 0u;
+    uint first = 0u;
+    float2 past[HIST_MAX];
+    if (active && !none) {
+        uint slab = pie_piece_unit(lane, c) * params.slot_stride;
+        pie_pool_find(params.state_origin + slab, seg, first);
+#define CONV_CARRIED_LOAD(buf_) \
+        for (int s = 0; s < hist; s++) { \
+            uint i = first + uint(s) * pitch + col; \
+            past[s] = float2(asfloat(buf_[i]), asfloat(buf_[i + 1u])); \
+        }
+        PIE_POOL_BRANCH(seg, CONV_CARRIED_LOAD)
+    }
     CarryLane cl = carry_lane(lane);
+    int n = cl.n;
+    int commit = min(cl.commit, n + 1);
+    // The carried positions the step reads: its window's and the kept
+    // history's, from `lo` to the own row; the last `PMAX` of them resolved
+    // a lane a position.
+    int lo = n - (width - 1) * dil;
+    if (commit > 0) {
+        lo = min(lo, commit - hist);
+    }
+    lo = max(max(lo, 0), n - int(PMAX));
+    if (int(tid) < n - lo) {
+        srow[tid] = carry_word(cl, carry_tok(cl, uint(lo) + tid), params.x_at, params.x_row);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (!active) {
+        return;
+    }
     uint own_word = x[(row * chans + c) >> 1];
     if (cl.at >= 0) {
         pie_pool_set(carry_word(cl, uint(cl.at), params.x_at, params.x_row) + (c >> 1), own_word);
     }
-    if (pie_state_none(lane)) {
+    if (none) {
         return;
     }
-    int width = params.conv_width;
-    int dil = params.dilation;
-    int hist = (width - 1) * dil + 1;
-    int n = cl.n;
-    int commit = min(cl.commit, n + 1);
-
-    // Channel `c`'s history in the record (`ssm/conv1d.slang`'s column),
-    // found once: a slot's history lies in one segment.
-    uint slab = pie_piece_unit(lane, c) * params.slot_stride;
-    uint pitch = min(params.piece_atoms, chans);
-    uint col = c % params.piece_atoms;
-    uint seg, first;
-    pie_pool_find(params.state_origin + slab, seg, first);
-    float2 past[HIST_MAX];
-#define CONV_CARRIED_LOAD(buf_) \
-    for (int s = 0; s < hist; s++) { \
-        uint i = first + uint(s) * pitch + col; \
-        past[s] = float2(asfloat(buf_[i]), asfloat(buf_[i + 1u])); \
-    }
-    PIE_POOL_BRANCH(seg, CONV_CARRIED_LOAD)
     float2 own = pair(own_word);
 
-    // Run position `t`'s input pair.
+    // Run position `t`'s input pair: a resolved carried row in one load, an
+    // earlier one through the lane's tables.
 #define CONV_AT(t_, out_) \
     { \
         int t = (t_); \
         if (t < 0) { \
             out_ = past[hist + t]; \
-        } else if (t < n) { \
+        } else if (t >= n) { \
+            out_ = own; \
+        } else if (t >= lo) { \
+            out_ = pair(pie_pool_get(srow[t - lo] + (c >> 1))); \
+        } else { \
             uint w = carry_word(cl, carry_tok(cl, uint(t)), params.x_at, params.x_row) + (c >> 1); \
             out_ = pair(pie_pool_get(w)); \
-        } else { \
-            out_ = own; \
         } \
     }
 
