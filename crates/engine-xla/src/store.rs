@@ -984,6 +984,16 @@ impl Pools {
                 pinned: None,
                 role: SlotRole::Channel,
             }))
+            .chain(std::iter::once(SlotShape {
+                id: layout::INSTANCE,
+                kind: SlotKind::Fixed { pieces: 1 },
+                slot_bytes: crate::guest::CHANNEL_SLOT,
+                slots_per_chunk: narrow(self.layout.chunk_bytes / crate::guest::CHANNEL_SLOT),
+                sets_per_working_set: 1,
+                rows: Vec::new(),
+                pinned: None,
+                role: SlotRole::Instance,
+            }))
             .chain((self.adapter_slot > 0).then(|| SlotShape {
                 id: layout::ADAPTER,
                 kind: SlotKind::Fixed { pieces: 1 },
@@ -1102,6 +1112,13 @@ impl Pools {
     /// ([`layout::CHANNEL`], 1 KiB slots).
     #[must_use]
     pub fn channel_row(&self, slot: u32) -> Option<u32> {
+        self.carved_row(crate::guest::CHANNEL_SLOT, slot)
+    }
+
+    /// The pool row `Instance` slot ref `slot` starts at
+    /// ([`layout::INSTANCE`], 1 KiB slots as `Channel`'s).
+    #[must_use]
+    pub fn instance_row(&self, slot: u32) -> Option<u32> {
         self.carved_row(crate::guest::CHANNEL_SLOT, slot)
     }
 
@@ -1544,7 +1561,7 @@ impl Pools {
     /// Pool rows a slot of shape `id` takes: a state shape's, or a
     /// `Channel` slot's ([`layout::CHANNEL`]).
     fn slot_rows(&self, id: ShapeId) -> Result<u64> {
-        if id == layout::CHANNEL {
+        if id == layout::CHANNEL || id == layout::INSTANCE {
             return Ok(crate::guest::CHANNEL_SLOT / ROW_BYTES);
         }
         if id == layout::ADAPTER && self.adapter_slot > 0 {
@@ -1559,6 +1576,14 @@ impl Pools {
             return self.channel_row(slot).map(i64::from).ok_or_else(|| Fault::Unbound {
                 what: format!("Channel slot {slot}, which lies past the pool"),
             });
+        }
+        if id == layout::INSTANCE {
+            return self
+                .instance_row(slot)
+                .map(i64::from)
+                .ok_or_else(|| Fault::Unbound {
+                    what: format!("Instance slot {slot}, which lies past the pool"),
+                });
         }
         if id == layout::ADAPTER {
             return self.adapter_row(slot).map(i64::from).ok_or_else(|| Fault::Unbound {

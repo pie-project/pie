@@ -756,9 +756,32 @@ impl Engine for Xla {
             }
             _ => engine::program::Footprint::default(),
         };
+        // A beam group's state (BEAM-PAGE-LISTS §4): one run of `Instance`
+        // slots, laid from the load's paging and frames in flight.
+        let instance = match (
+            self.programs
+                .package(program)
+                .and_then(crate::beam::group_of),
+            self.shell.as_ref(),
+        ) {
+            (Some(group), Some(shell)) => {
+                let paging = shell.paging();
+                let frames = self.caps.as_ref().map_or(1, |caps| caps.frames_in_flight);
+                let layout =
+                    crate::beam::layout(group, paging.page_size, paging.pages_per_slot, frames);
+                let (bytes, slots) = crate::beam::state_slots(layout, crate::guest::CHANNEL_SLOT);
+                engine::program::Footprint {
+                    bytes,
+                    slots,
+                    contiguous: true,
+                }
+            }
+            _ => engine::program::Footprint::default(),
+        };
         Ok(engine::program::ProgramFacts {
             rings: self.programs.compiled_form(program).map_or_else(Vec::new, |c| c.rings()),
             adapter,
+            instance,
             ..Default::default()
         })
     }
@@ -835,8 +858,27 @@ impl Engine for Xla {
     fn rebind_slots(&mut self, rebind: engine::program::Rebind) -> EngineResult<()> {
         match rebind {
             engine::program::Rebind::Instance {
-                id, rings, adapter, ..
+                id,
+                rings,
+                adapter,
+                instance,
+                ..
             } => {
+                // a beam group's state: the runtime copied it into the run
+                // `instance` names
+                if let (Some(_), Some(&first), Some(shell)) = (
+                    self.programs.beam_seat(id),
+                    instance.first(),
+                    self.shell.as_ref(),
+                ) {
+                    let row = shell.pools().instance_row(first).ok_or_else(|| {
+                        Error::Program(format!(
+                            "instance {id:?}'s beam state moved to Instance slot {first}, past \
+                             the pool"
+                        ))
+                    })?;
+                    self.programs.rebind_beam(id, row);
+                }
                 if let (Some(held), Some(shell)) = (self.adapters.get_mut(&id), self.shell.as_mut())
                     && !adapter.is_empty()
                 {
@@ -874,7 +916,60 @@ impl Engine for Xla {
         }
         let shell = self.shell.as_ref();
         let cell_row = |slot: u32| shell.and_then(|shell| shell.channel_row(slot));
-        let bound = self.programs.bind(binding, &cell_row).map_err(refusal)?;
+        // A beam group's state (BEAM-PAGE-LISTS §4) in the `Instance` run
+        // the runtime took for it, zeroed so its first fire primes it.
+        let beam = match (
+            self.programs
+                .package(binding.program)
+                .and_then(crate::beam::group_of),
+            shell,
+        ) {
+            (Some(group), Some(shell)) => {
+                let paging = shell.paging();
+                let layout = crate::beam::layout(
+                    group,
+                    paging.page_size,
+                    paging.pages_per_slot,
+                    caps.frames_in_flight,
+                );
+                let (_, slots) = crate::beam::state_slots(layout, crate::guest::CHANNEL_SLOT);
+                if binding.instance_slots.len() != slots as usize {
+                    return Err(Error::Program(format!(
+                        "a beam group of {} lanes keeps its state in {slots} Instance slot(s); \
+                         the bind names {}",
+                        group.lanes,
+                        binding.instance_slots.len()
+                    )));
+                }
+                let first = binding.instance_slots[0];
+                let row = shell.pools().instance_row(first).ok_or_else(|| {
+                    Error::Program(format!("Instance slot {first} lies past the pool"))
+                })?;
+                Some(crate::beam::Seat { group, layout, row })
+            }
+            (Some(_), None) => {
+                return Err(Error::Program("a beam group bound before load".to_string()));
+            }
+            (None, _) => None,
+        };
+        let bound = self
+            .programs
+            .bind(binding, &cell_row, beam)
+            .map_err(refusal)?;
+        if beam.is_some()
+            && let Some(shell) = self.shell.as_mut()
+        {
+            let slots: Vec<(engine::chunk::ShapeId, u32)> = binding
+                .instance_slots
+                .iter()
+                .map(|&slot| (crate::store::layout::INSTANCE, slot))
+                .collect();
+            let zeros = vec![0u8; slots.len() * crate::guest::CHANNEL_SLOT as usize];
+            if let Err(why) = shell.write_slot_bytes(&slots, &zeros) {
+                let _ = self.programs.close_instance(bound.id);
+                return Err(fault(why));
+            }
+        }
         let seeds: Vec<(u32, Vec<u8>)> = binding
             .seeds
             .iter()

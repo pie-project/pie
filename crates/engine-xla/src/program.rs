@@ -46,6 +46,9 @@ struct Instance {
     plan: Arc<ExecPlan>,
     inst: InterpInstance,
     geometry: GeometryClass,
+    /// Its beam group's state on the device, where its program states each
+    /// beam's parent (`BEAM-PAGE-LISTS.md`).
+    beam: Option<crate::beam::Seat>,
 
     channels: Vec<ChannelId>,
     /// The `Channel` slots of the rings the instance holds itself, as its
@@ -670,6 +673,25 @@ impl Plane {
         Ok(())
     }
 
+    /// Instance `id`'s beam group on the device, if its program states
+    /// parents.
+    #[must_use]
+    pub fn beam_seat(&self, id: InstanceId) -> Option<crate::beam::Seat> {
+        self.instances.get(&id).and_then(|seat| seat.beam)
+    }
+
+    /// Instance `id`'s beam state moved to the `Instance` run at `row`
+    /// (`Engine::rebind_slots`: the runtime copied it there).
+    pub fn rebind_beam(&mut self, id: InstanceId, row: u32) {
+        if let Some(seat) = self
+            .instances
+            .get_mut(&id)
+            .and_then(|seat| seat.beam.as_mut())
+        {
+            seat.row = row;
+        }
+    }
+
     #[must_use]
     pub fn package(
         &self,
@@ -929,6 +951,7 @@ impl Plane {
         &mut self,
         binding: &InstanceBinding,
         cell_row: &dyn Fn(u32) -> Option<u32>,
+        beam: Option<crate::beam::Seat>,
     ) -> Result<BoundInstance, Refusal> {
         let plan = self
             .programs
@@ -989,6 +1012,7 @@ impl Plane {
                 plan,
                 inst,
                 geometry: binding.geometry,
+                beam,
                 channels: binding.channels.clone(),
                 own_rings: binding.ring_slots.clone(),
                 poisoned,
