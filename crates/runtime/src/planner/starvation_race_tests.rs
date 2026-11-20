@@ -6066,3 +6066,51 @@ async fn parked_state_of_a_process_gone_while_parked_moves_down_for_the_head() {
     assert!(bind.await.unwrap().is_ok());
     assert_eq!(*pool.moved.lock(), vec!["disk"]);
 }
+
+/// A swap tier nearly full (a tight disk budget) defers the eviction rung
+/// only while something in flight can bring the head its pages. With no
+/// fire, move or kill under way, and residents neither firing nor parked
+/// in the queue (blocked elsewhere: on another process, a sibling lane),
+/// the rung goes on: before, the fleet read as not stalled by its waiters'
+/// kinds and the head was deferred for good (the disk-only M1 hang).
+#[tokio::test(flavor = "current_thread")]
+async fn a_nearly_full_swap_defers_eviction_only_while_something_is_in_flight() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(RacePool {
+        host: 4,
+        host_total: 64,
+        ..RacePool::new(4)
+    });
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone()));
+    let head = ProcessId::new_v4();
+    planner.register(head);
+    planner.note_admitted(head);
+    // Admitted, not idle, not queued, not firing: blocked outside the planner.
+    for _ in 0..3 {
+        let pid = ProcessId::new_v4();
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    let demand = Demand {
+        kv_pages: 1,
+        rs: RsUnits::default(),
+    };
+    let p = planner.clone();
+    let parked = crate::rt::spawn(async move { p.acquire(head, head, demand).await });
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.diagnostics().queue.len() == 1 {
+            break;
+        }
+    }
+    assert_eq!(planner.diagnostics().queue.len(), 1, "the ask parks");
+    assert!(!planner.is_wedged(), "its waiters' kinds read no stall");
+    assert!(planner.with_inner(|inner| inner.nothing_in_flight()), "nothing is in flight");
+    planner.plan();
+    assert_eq!(
+        planner.stats.eviction_deferrals.load(Ordering::Relaxed),
+        0,
+        "nothing in flight brings supply: the rung goes on"
+    );
+    parked.abort();
+}

@@ -213,9 +213,15 @@ impl ResidencyPlanner {
                 self.check_starvation(StarveCause::NoSwapRoom);
                 return;
             }
+            // Waiting on the supply holds only while something in flight
+            // can bring it ([`Inner::nothing_in_flight`]): the fleet counted
+            // stalled by its waiters' kinds (`is_wedged`) missed a resident
+            // blocked elsewhere (on another process, a sibling lane), and a
+            // swap tier nearly full deferred the head for good with no fire,
+            // move or kill to free anything (the disk-only M1 hang).
+            let in_flight = !self.with_inner(|inner| inner.nothing_in_flight());
             if kv_deficit > 0
-                && ((swap_free.saturating_mul(HOST_RESERVE_DIVISOR) <= swap_total
-                    && !self.is_wedged())
+                && ((swap_free.saturating_mul(HOST_RESERVE_DIVISOR) <= swap_total && in_flight)
                     || !self.supply_stalled())
             {
                 self.stats
