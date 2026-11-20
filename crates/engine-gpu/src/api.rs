@@ -1705,6 +1705,15 @@ impl<B: Host> Gpu<B> {
             .flat_map(|lane| lane.slot_copies.iter().cloned())
             .collect();
         shell.copy_slot_pairs(&slot_copies).map_err(fault)?;
+        let mut attached = vec![false; submission.lanes.len()];
+        for attachment in program_attachments(submission) {
+            let lanes = attachment.lane..attachment.lane + attachment.lanes.max(1);
+            for at in lanes {
+                if let Some(lane) = attached.get_mut(at as usize) {
+                    *lane = true;
+                }
+            }
+        }
         let seated: Vec<Seated<'_, B>> = submission
             .lanes
             .iter()
@@ -1730,6 +1739,10 @@ impl<B: Host> Gpu<B> {
                     Readout::Rows(rows) => Some(rows.as_slice()),
                     Readout::Last | Readout::None => None,
                 },
+                // A program attached to the lane reads its rows on the
+                // device and hands back what it makes through its
+                // channels: the host reads back the lanes no program reads.
+                hosts: !matches!(lane.readout, Readout::None) && !attached[at],
                 reads: &reads[at],
                 scores: scores[at].as_ref(),
 
