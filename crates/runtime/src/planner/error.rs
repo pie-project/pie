@@ -77,6 +77,16 @@ pub enum PlannerError {
         total: u32,
         runs: Option<(u32, u32)>,
     },
+    /// An activation raise whose rung could never fit the pool, even with
+    /// all state moved off it: the reserved chunks and the rung's span
+    /// (`need` chunks) past the pool's `total` chunks. Refused by name at
+    /// once; every raise short of this waits, funded, while the planner
+    /// makes room.
+    PastRung {
+        rung: u32,
+        need: u32,
+        total: u32,
+    },
     Cancelled,
 }
 
@@ -137,6 +147,12 @@ impl std::fmt::Display for PlannerError {
                      moved off it — raise [engine.memory] budget_device or ask for less"
                 )
             }
+            PlannerError::PastRung { rung, need, total } => write!(
+                f,
+                "the activation rung of {rung} tokens can never fit: with the reserved \
+                 chunks it takes {need} chunks of a {total}-chunk pool, even with all \
+                 state moved off it"
+            ),
             PlannerError::Cancelled => f.write_str("planner request cancelled"),
         }
     }

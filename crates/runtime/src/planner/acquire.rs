@@ -590,6 +590,67 @@ impl ResidencyPlanner {
                 runs: Some((run.max(1), pieces)),
             });
         }
+        self.wait_room(pid, run, pieces, pages, None)
+            .await
+            .map(|(wait, _registration)| wait)
+    }
+
+    /// `pid`'s raise of the activation to `rung` (tokens) short of room,
+    /// a walk's raise to frames its scheduler holds out under a lowered cap
+    /// (`store::shared::owe_cut_rows`): queued in the planner by `pid`'s
+    /// key beside admissions, restores and binds, and funded exactly as a
+    /// bind's room is (idle cache first, a grow, parked state down a tier,
+    /// then the occupants of the chunks it takes by the chunk map, under
+    /// the key rule), however long; completions, evictions landed and room
+    /// moved quote it again. Once its room stands `take` runs (the raise,
+    /// its moves and the engine's copy) with the queue held behind it, so
+    /// no head after it is served into that room first; its result is
+    /// returned. A rung that could never fit the pool alone is refused by
+    /// name, at once ([`PlannerError::PastRung`]). `Ok(None)` where `pid`
+    /// is being evicted meanwhile (its frames leave with it).
+    pub async fn fund_rise<T, F>(
+        self: &Arc<Self>,
+        pid: ProcessId,
+        rung: u32,
+        take: impl FnOnce() -> F,
+    ) -> Result<Option<T>, PlannerError>
+    where
+        F: std::future::Future<Output = T>,
+    {
+        let pieces = match self.port.rise_room(rung) {
+            super::pool::RiseRoom::Past { need, total } => {
+                return Err(PlannerError::PastRung { rung, need, total });
+            }
+            super::pool::RiseRoom::Fits => return Ok(Some(take().await)),
+            super::pool::RiseRoom::Short { pieces } => pieces,
+        };
+        let pages = self.port.chunks_as_pages(pieces);
+        let (wait, registration) = self.wait_room(pid, 1, pieces, pages, Some(rung)).await?;
+        if wait == BindRoomWait::Withdrawn {
+            return Ok(None);
+        }
+        // Served: it fits, or (the pool shrank under it) never will.
+        if let super::pool::RiseRoom::Past { need, total } = self.port.rise_room(rung) {
+            return Err(PlannerError::PastRung { rung, need, total });
+        }
+        let taken = take().await;
+        // Off the queue: the heads behind it are planned again.
+        drop(registration);
+        Ok(Some(taken))
+    }
+
+    /// Queues `pid`'s wait for room (a bind's runs, or a rung raise's
+    /// chunks: `rise`) and waits until it is served or withdrawn; the
+    /// registration that takes it off the queue is handed back, held for
+    /// as long as the caller keeps the room the wait was served.
+    async fn wait_room(
+        self: &Arc<Self>,
+        pid: ProcessId,
+        run: u32,
+        pieces: u32,
+        pages: u32,
+        rise: Option<u32>,
+    ) -> Result<(BindRoomWait, Option<WaitRegistration<'_>>), PlannerError> {
         let notify = Arc::new(Notify::new());
         let key = self
             .with_inner(|inner| {
@@ -608,18 +669,19 @@ impl ResidencyPlanner {
                             notify: notify.clone(),
                             served: false,
                             withdrawn: false,
+                            rise,
                         },
                     )
                 }))
             })
             .ok_or(PlannerError::Cancelled)?;
         let Some(key) = key else {
-            return Ok(BindRoomWait::Withdrawn);
+            return Ok((BindRoomWait::Withdrawn, None));
         };
         // Queued for room: its owner is parked here until served.
         let _parked = crate::inferlet::process::parks_here();
         // Off the queue however the wait ends.
-        let _registration = WaitRegistration {
+        let registration = WaitRegistration {
             planner: self,
             key,
             active: true,
@@ -640,8 +702,8 @@ impl ResidencyPlanner {
             });
             match served {
                 None => return Err(PlannerError::Cancelled),
-                Some((_, true)) => return Ok(BindRoomWait::Withdrawn),
-                Some((true, false)) => return Ok(BindRoomWait::Served),
+                Some((_, true)) => return Ok((BindRoomWait::Withdrawn, Some(registration))),
+                Some((true, false)) => return Ok((BindRoomWait::Served, Some(registration))),
                 Some((false, false)) => {
                     // Room that comes free or moves (the rung lowered or
                     // raised, a segment committed, guest state given back)

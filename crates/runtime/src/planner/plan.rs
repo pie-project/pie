@@ -54,11 +54,13 @@ enum Step {
         key: EntryKey,
         need: PendingBind,
     },
-    /// The head is a bind short of device room for its guest state.
+    /// The head is a bind short of device room for its guest state, or a
+    /// rung raise short of room (`rise`, its rung's tokens).
     BindRoom {
         key: EntryKey,
         run: u32,
         pieces: u32,
+        rise: Option<u32>,
     },
     Release(DevicePageReservation),
     Done,
@@ -108,7 +110,11 @@ impl ResidencyPlanner {
                 inner.stall_dumped = None;
                 return None;
             };
-            if !inner.nothing_in_flight() || !inner.parked_moving.is_empty() {
+            // A rung raise taking the room it was served is in flight.
+            if !inner.nothing_in_flight()
+                || !inner.parked_moving.is_empty()
+                || inner.queue.values().any(Waiter::rise_untaken)
+            {
                 return None;
             }
             if inner.stall_dumped == Some((key, gives)) {
@@ -190,6 +196,12 @@ impl ResidencyPlanner {
             // room a restore may take.
             let spare = self.port.device_stats().0;
             let step = self.with_inner(|inner| {
+                // A rung raise served and not yet taken holds the queue:
+                // the room it was funded is its, and its leaving plans
+                // again.
+                if inner.queue.values().any(Waiter::rise_untaken) {
+                    return Step::Done;
+                }
                 let Some((key, waiter)) = inner.unmet_head() else {
                     if inner.accum.len() > 0 && inner.queue.is_empty() {
                         let stranded = std::mem::take(&mut inner.accum);
@@ -197,8 +209,16 @@ impl ResidencyPlanner {
                     }
                     return Step::Done;
                 };
-                if let WaitKind::BindRoom { run, pieces, .. } = waiter.kind {
-                    return Step::BindRoom { key, run, pieces };
+                if let WaitKind::BindRoom {
+                    run, pieces, rise, ..
+                } = waiter.kind
+                {
+                    return Step::BindRoom {
+                        key,
+                        run,
+                        pieces,
+                        rise,
+                    };
                 }
                 let is_restore = matches!(waiter.kind, WaitKind::Restore { .. });
                 let pid = waiter.pid;
@@ -263,6 +283,7 @@ impl ResidencyPlanner {
                                         key: *key,
                                         run,
                                         pieces,
+                                        rise: None,
                                     }),
                                     _ => None,
                                 })
@@ -284,9 +305,49 @@ impl ResidencyPlanner {
             });
             let fund_by_eviction = match step {
                 Step::Done => return false,
-                Step::BindRoom { key, run, pieces } => {
+                Step::BindRoom {
+                    key,
+                    run,
+                    pieces,
+                    rise,
+                } => {
+                    // A rung raise asks what its raise lacks now, as a run
+                    // of one chunk a piece: the chunks free now and those
+                    // to empty, funded from here exactly as a bind's runs
+                    // (idle cache, a grow, parked state down a tier, then
+                    // the chunk map's occupants under the key rule). One
+                    // that fits, or never will, is served: its waiter
+                    // takes the raise or refuses it by name.
+                    let (run, pieces) = match rise {
+                        None => (run, pieces),
+                        Some(rung) => match self.port.rise_room(rung) {
+                            super::pool::RiseRoom::Short { pieces } => {
+                                let pages = self.port.chunks_as_pages(pieces);
+                                self.with_inner(|inner| {
+                                    if let Some(Waiter {
+                                        kind:
+                                            WaitKind::BindRoom {
+                                                pieces: asked,
+                                                pages: room,
+                                                ..
+                                            },
+                                        ..
+                                    }) = inner.queue.get_mut(&key)
+                                    {
+                                        *asked = pieces;
+                                        *room = pages;
+                                    }
+                                });
+                                (1, pieces)
+                            }
+                            super::pool::RiseRoom::Fits | super::pool::RiseRoom::Past { .. } => {
+                                self.serve_bind_room(key);
+                                continue;
+                            }
+                        },
+                    };
                     // Its runs stand free: the bind takes them.
-                    if self.port.guest_room_free(run, pieces) {
+                    if rise.is_none() && self.port.guest_room_free(run, pieces) {
                         self.serve_bind_room(key);
                         continue;
                     }

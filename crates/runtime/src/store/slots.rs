@@ -1077,6 +1077,15 @@ impl SlotPool {
     /// The chunks raising the activation to `rung` lacks now: past what is
     /// committed, and in free chunks below its span for the state in it.
     /// 0 when the raise fits.
+    /// Where `rung`'s activation and the reserved chunks could never fit
+    /// the pool, even with all state moved off it: the chunks they take
+    /// and the pool's total.
+    #[must_use]
+    pub fn rung_past(&self, rung: u32) -> Option<(u32, u32)> {
+        let need = self.reserved.saturating_add(self.act_chunks(rung));
+        (need > self.total).then_some((need, self.total))
+    }
+
     pub fn rung_short(&self, rung: u32) -> u32 {
         let act = self.act_chunks(rung);
         let budget = (self.reserved + self.held + act).saturating_sub(self.committed_for(act));

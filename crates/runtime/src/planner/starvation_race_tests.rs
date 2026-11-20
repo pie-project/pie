@@ -2621,6 +2621,20 @@ impl PoolPort for BindRoomPool {
     fn guest_free_runs(&self, run: u32) -> u32 {
         (0..).take_while(|&k| self.runs_free(run, k + 1)).count() as u32
     }
+    /// A rung here is the free chunks its raise takes, anywhere.
+    fn rise_room(&self, rung: u32) -> super::pool::RiseRoom {
+        if rung > self.total {
+            return super::pool::RiseRoom::Past {
+                need: rung,
+                total: self.total,
+            };
+        }
+        if self.free.lock().len() as u32 >= rung {
+            super::pool::RiseRoom::Fits
+        } else {
+            super::pool::RiseRoom::Short { pieces: rung }
+        }
+    }
     fn compaction_comes(&self, run: u32, pieces: u32) -> bool {
         let comes = !self.runs_free(run, pieces) && self.compactable.load(Ordering::Acquire);
         if comes {
@@ -2817,6 +2831,18 @@ async fn a_bind_short_of_room_lands_once_a_resident_is_parked() {
 }
 
 impl BindRoomPool {
+    /// Takes `count` free chunks anywhere, as a rung raise does; whether
+    /// they stood.
+    fn take_chunks(&self, count: u32) -> bool {
+        let mut free = self.free.lock();
+        if (free.len() as u32) < count {
+            return false;
+        }
+        let at = free.len() - count as usize;
+        free.truncate(at);
+        true
+    }
+
     /// Takes a free run of `run` adjacent chunks, as a bind does.
     fn take_run(&self, run: u32) -> Option<Vec<u32>> {
         let mut free = self.free.lock();
@@ -2875,6 +2901,135 @@ async fn short_lived_binds_over_a_cache_filled_pool_all_land() {
         0,
         "cache alone was dropped for them"
     );
+}
+
+/// A walk's raise to frames held out under a lowered cap, short of room,
+/// beside many binds also waiting for room, nothing else in flight: every
+/// chunk is held by idle residents' kv. The raise is a planner head keyed
+/// by its frame's process, funded exactly as a bind's room (the chunk map's
+/// occupants moved for it), and once its room stands it takes it with the
+/// queue held behind it, so no bind is served into that room first. Every
+/// bind lands and the raise is taken: none stalls, none is refused.
+#[tokio::test(flavor = "current_thread")]
+async fn a_raise_short_of_room_among_waiting_binds_is_funded_and_all_are_served() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let model = crate::store::registry::register_model(16, &[8], &[4]);
+    let pool = Arc::new(BindRoomPool {
+        model,
+        ..BindRoomPool::new(16, 0..0, 64)
+    });
+    pool.disk_free.store(64, Ordering::Relaxed);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    // Idle residents hold every chunk, two each: the oldest, the victims.
+    let holders: Vec<ProcessId> = (0..8).map(|_| ProcessId::new_v4()).collect();
+    for (at, &pid) in holders.iter().enumerate() {
+        planner.register(pid);
+        planner.note_admitted(pid);
+        planner.with_inner(|inner| inner.procs.get_mut(&pid).unwrap().idle = true);
+        let at = at as u32;
+        pool.kv.lock().extend([(2 * at, pid), (2 * at + 1, pid)]);
+    }
+    // Binds of two chunks each, and among them the raise's process (its
+    // frame owed 6 chunks of rung): binds before it and after it.
+    let mut binds = Vec::new();
+    let mut rise = None;
+    for at in 0..6 {
+        let pid = ProcessId::new_v4();
+        planner.register(pid);
+        planner.note_admitted(pid);
+        let (planner, pool) = (planner.clone(), pool.clone());
+        if at == 3 {
+            rise = Some(crate::rt::spawn(async move {
+                let taker = pool.clone();
+                planner
+                    .fund_rise(pid, 6, || async move { taker.take_chunks(6) })
+                    .await
+            }));
+            continue;
+        }
+        binds.push(crate::rt::spawn(async move {
+            let run = loop {
+                if let Some(run) = pool.take_run(2) {
+                    break run;
+                }
+                planner
+                    .wait_bind_room(pid, 2, 1)
+                    .await
+                    .map_err(|why| format!("{pid}: {why}"))?;
+            };
+            for _ in 0..2 {
+                crate::rt::yield_now().await;
+            }
+            // Its fire done, its process ends: its run comes back.
+            pool.free.lock().extend(run);
+            planner.unregister(pid);
+            planner.pages_freed();
+            Ok::<(), String>(())
+        }));
+    }
+    let rise = rise.unwrap();
+    // The moves land as the engine would land them; nothing else happens.
+    for _ in 0..64 {
+        for _ in 0..200 {
+            crate::rt::yield_now().await;
+        }
+        if rise.is_finished() && binds.iter().all(|bind| bind.is_finished()) {
+            break;
+        }
+        if pool.land_moves(&planner) > 0 {
+            planner.pages_freed();
+        }
+        planner.poke();
+    }
+    assert!(
+        rise.is_finished(),
+        "the raise stalled: queue {}",
+        planner.debug_queue()
+    );
+    assert_eq!(
+        rise.await.expect("the task ends").expect("not refused"),
+        Some(true),
+        "served with its six chunks free, and took them"
+    );
+    for bind in binds {
+        assert!(bind.is_finished(), "a bind stalled: queue {}", planner.debug_queue());
+        bind.await.expect("the task ends").expect("it landed");
+    }
+    assert!(
+        planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
+        "residents were moved for them"
+    );
+}
+
+/// A raise whose rung could never fit the pool, even with every resident
+/// moved off it, is refused by name at once: never queued, nothing moved,
+/// its take never run.
+#[tokio::test(flavor = "current_thread")]
+async fn a_raise_past_the_whole_pool_is_refused_by_name_at_once() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (owner, holder) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [owner, holder] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    *pool.occupant.lock() = Some(holder);
+    let refused = planner
+        .fund_rise(owner, 9, || async { unreachable!("a raise past the pool is never taken") })
+        .await;
+    let error = refused.expect_err("refused");
+    assert_eq!(
+        error,
+        PlannerError::PastRung {
+            rung: 9,
+            need: 9,
+            total: 8
+        }
+    );
+    assert!(error.to_string().contains("can never fit"), "{error}");
+    assert!(planner.diagnostics().queue.is_empty(), "never queued");
+    assert_eq!(planner.stats.evictions_started.load(Ordering::Relaxed), 0);
 }
 
 /// A process a bind short of guest-state room suspended comes back only
@@ -4765,6 +4920,10 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
         let runs_now = pool.guest_free_runs(run);
         let is_restore = rng.below(3) != 0;
         let is_rise = !is_restore && rng.below(2) == 0;
+        // Half the rise seeds are a walk's raise to frames held out under
+        // the cap (`fund_rise`): funded as a bind's room is, by the chunk
+        // map, its chunks any free ones; the rest a pass's (`acquire_rise`).
+        let walk_rise = is_rise && seed % 2 == 1;
         // An understated restore: refused while some count of runs stood,
         // at, below or past what stands now.
         let understated_at = (is_restore && rng.below(2) == 0)
@@ -4844,16 +5003,32 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
         // Not a restore: a bind waiting for room, or an activation rise
         // (a cut fire's raise funded as a planner head, its chunks taken as
         // pages, any chunks), each served or waiting, never refused.
-        if is_rise {
+        if is_rise && !walk_rise {
             pool.pages.store(true, Ordering::Release);
         }
         let bind = (!is_restore).then(|| {
             let p = planner.clone();
+            let taker = pool.clone();
             crate::rt::spawn(async move {
-                if is_rise {
-                    p.acquire_rise(head, head, run * pieces).await.map(drop)
+                if walk_rise {
+                    match p
+                        .fund_rise(head, run * pieces, || async { taker.take_chunks(run * pieces) })
+                        .await
+                    {
+                        Ok(Some(false)) => Err("served with its chunks not free".to_string()),
+                        Ok(_) => Ok(()),
+                        Err(error) => Err(error.to_string()),
+                    }
+                } else if is_rise {
+                    p.acquire_rise(head, head, run * pieces)
+                        .await
+                        .map(drop)
+                        .map_err(|error| error.to_string())
                 } else {
-                    p.wait_bind_room(head, run, pieces).await.map(drop)
+                    p.wait_bind_room(head, run, pieces)
+                        .await
+                        .map(drop)
+                        .map_err(|error| error.to_string())
                 }
             })
         });
@@ -4900,7 +5075,7 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
         let mut schedule = vec![format!(
             "total={total} host={host} run={run} pieces={pieces} restore={is_restore} \
              understated_at={understated_at:?} runs_now={runs_now} residents={} grants={grants} \
-             compactable={} mixed={mixed} rise={is_rise} kv={:?}",
+             compactable={} mixed={mixed} rise={is_rise} walk_rise={walk_rise} kv={:?}",
             residents.len(),
             pool.compactable.load(Ordering::Acquire),
             pool.kv.lock()
@@ -5050,6 +5225,7 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
                 break;
             }
             let stands = if is_rise {
+                // Before its take: a walk's raise takes them as it is served.
                 pool.free.lock().len() >= (run * pieces) as usize
             } else {
                 pool.guest_room_free(run, pieces)
@@ -5079,7 +5255,12 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
                 .with_inner(|inner| inner.procs[&head].restore_need())
                 .unwrap_or((run, pieces));
             let alive_now: Vec<ProcessId> = planner.with_inner(|inner| inner.procs.keys().copied().collect());
-            let map_serves = if is_rise {
+            let map_serves = if walk_rise {
+                // Any chunks, free or emptied by moving their occupants:
+                // the chunk map serves it as a bind's runs of one.
+                pool.chunk_occupants(&alive_now).cheapest_runs(1, run * pieces).is_some()
+                    || pool.free.lock().len() >= (run * pieces) as usize
+            } else if is_rise {
                 // Any free chunks. A rise is an allocation: its victims are
                 // chosen by the registry's page quotes, which this pool's
                 // residents' kv is not in (it is in the chunk map only), so
@@ -5104,6 +5285,18 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
                 failures.push(format!(
                     "seed {seed} step {step}: the head is unserved with nothing in flight and \
                      no stall was named\n  schedule: {}",
+                    schedule.join(" -> ")
+                ));
+                break;
+            }
+            // Wake latency: room that stands at a step's quiescence is the
+            // head's within that step (the event that made it, a give, a
+            // landing, a completion, wakes the plan at once): one step from
+            // room appearing to the head served, never a later one.
+            if servable && !retried && !head_served && !is_restore {
+                failures.push(format!(
+                    "seed {seed} step {step}: the head's room stood and it was not served \
+                     within the step\n  schedule: {}",
                     schedule.join(" -> ")
                 ));
                 break;

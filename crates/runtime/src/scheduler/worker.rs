@@ -1613,10 +1613,17 @@ impl BatchScheduler {
             // Frames held out under the cap are owed a raise: the cap's
             // owner is told, its walk raising the rung to them (a hold with
             // nothing in flight waited on a raise nothing asked for).
+            let (owed, owed_by) = frame_policy.cut_owed_by();
             crate::store::shared::owe_cut_rows(
                 engine_id,
-                u32::try_from(frame_policy.cut_owed()).unwrap_or(u32::MAX),
+                u32::try_from(owed).unwrap_or(u32::MAX),
+                owed_by,
             );
+            // The cap this turn sealed under is read again after the hold
+            // is told: a cap the walk moved meanwhile (raised back before
+            // the report it would have nudged on) is the next turn's at
+            // once, never a cached value the scheduler parks on.
+            progress |= crate::store::shared::cap_moved(engine_id, cap);
             progress |= dispatched;
             if stopping
                 && pending.is_empty()

@@ -95,6 +95,10 @@ struct RungGate {
     /// or the frame waited on a raise nothing asked for, nothing in flight
     /// to wake it. 0 where none is held.
     owed: std::sync::atomic::AtomicU32,
+    /// The process whose lane holds that widest frame: the key the walk's
+    /// raise to it is funded under in the planner, short of room
+    /// ([`crate::planner::ResidencyPlanner::fund_rise`]).
+    owed_by: Mutex<Option<uuid::Uuid>>,
     /// The event every wait on the activation rung waits on: the fire cap
     /// moved, a raise was applied, copied or refused, the rung was lowered,
     /// segments were committed, or room was freed (a fire retired).
@@ -126,6 +130,7 @@ fn rung_gate(engine: usize) -> &'static RungGate {
                 grant: std::sync::atomic::AtomicU32::new(u32::MAX),
                 held: std::sync::atomic::AtomicU32::new(u32::MAX),
                 owed: std::sync::atomic::AtomicU32::new(0),
+                owed_by: Mutex::new(None),
                 event: tokio::sync::Notify::new(),
                 walk: tokio::sync::Notify::new(),
             }))
@@ -133,17 +138,27 @@ fn rung_gate(engine: usize) -> &'static RungGate {
 }
 
 /// The scheduler of `engine` holds frames out under the cap whose widest
-/// fire takes `rows` rung rows (0: none): what the walk raises the rung to
-/// as admitted work ([`RungGate::owed`]). A change asks the walk to look,
+/// fire takes `rows` rung rows (0: none), in the lane of process `by`:
+/// what the walk raises the rung to as admitted work ([`RungGate::owed`]),
+/// funded short of room under `by`'s key. A change asks the walk to look,
 /// so the raise is triggered by the hold itself, not by a fire that may
 /// never come.
-pub fn owe_cut_rows(engine: usize, rows: u32) {
-    let was = rung_gate(engine)
+pub fn owe_cut_rows(engine: usize, rows: u32, by: Option<uuid::Uuid>) {
+    let gate = rung_gate(engine);
+    *gate.owed_by.lock().unwrap() = by.filter(|_| rows > 0);
+    let was = gate
         .owed
         .swap(rows, std::sync::atomic::Ordering::AcqRel);
     if rows > 0 && rows != was {
         ask_walk(engine);
     }
+}
+
+/// The process whose held frame the walk's owed raise is for
+/// ([`owe_cut_rows`]); `None` where none is held.
+#[must_use]
+pub fn owed_by(engine: usize) -> Option<uuid::Uuid> {
+    *rung_gate(engine).owed_by.lock().unwrap()
 }
 
 /// See [`owe_cut_rows`].
@@ -223,11 +238,20 @@ fn set_fire_cap(engine: usize, tokens: u32) {
         .cap
         .swap(tokens, std::sync::atomic::Ordering::AcqRel);
     rung_changed(engine);
-    // A cap risen to frames the scheduler holds out: it looks again now,
-    // nothing in flight being sure to wake it.
-    if tokens > was && owed_cut_rows(engine) > 0 {
+    // A cap risen: the scheduler looks again now, nothing in flight being
+    // sure to wake it, whether or not it has told the frames it holds out
+    // under the cap yet (its report may be on its way).
+    if tokens > was {
         crate::scheduler::nudge(engine);
     }
+}
+
+/// Whether `engine`'s fire cap is another than `used`, the one a scheduler
+/// turn sealed under: that turn's holds are planned again under the cap as
+/// it stands.
+#[must_use]
+pub fn cap_moved(engine: usize, used: u32) -> bool {
+    fire_cap(engine) != used
 }
 
 /// The rows a step on `engine` may take: the rung the engine holds
@@ -1899,6 +1923,26 @@ impl SharedPool {
     #[must_use]
     pub fn rung_moves(evacuation: &RungEvacuation) -> EngineEvacuation {
         engine_moves(&evacuation.moves)
+    }
+
+    /// Where a raise to `rung` stands for the planner
+    /// ([`crate::planner::PoolPort::rise_room`]): past the pool, short of
+    /// the chunks it lacks (its pieces those free now and those to empty),
+    /// or fitting, a raise's copy under way included (nothing to fund).
+    #[must_use]
+    pub fn rise_room(&self, rung: u32) -> crate::planner::RiseRoom {
+        if let Some((need, total)) = self.pool.rung_past(rung) {
+            return crate::planner::RiseRoom::Past { need, total };
+        }
+        if self.copying.is_some() {
+            return crate::planner::RiseRoom::Fits;
+        }
+        match self.pool.rung_short(rung) {
+            0 => crate::planner::RiseRoom::Fits,
+            short => crate::planner::RiseRoom::Short {
+                pieces: self.pool.free_chunk_runs(1).saturating_add(short),
+            },
+        }
     }
 
     /// The chunks raising the activation to `rung` lacks now, and the kv

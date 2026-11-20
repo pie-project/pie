@@ -43,6 +43,15 @@ pub(super) enum WaitKind {
         notify: Arc<Notify>,
         served: bool,
         withdrawn: bool,
+        /// A rung raise short of room, its rung's tokens
+        /// ([`super::ResidencyPlanner::fund_rise`]): served once the raise
+        /// fits ([`super::PoolPort::rise_room`]), `pieces` (of a run of
+        /// one) the free chunks it takes, kept current by each plan, so
+        /// its victims are picked by the chunk map as a bind's are. Once
+        /// served it holds the queue until the raise is taken (its waiter
+        /// leaves): no head behind it is served into the room it was
+        /// funded.
+        rise: Option<u32>,
     },
 }
 
@@ -66,6 +75,20 @@ impl Waiter {
 
     /// The pages its own room stands for, beside its kv (a bind's runs of
     /// chunks, [`WaitKind::BindRoom`]).
+    /// A rung raise served and not yet taken: it holds the queue
+    /// ([`WaitKind::BindRoom::rise`]).
+    pub(super) fn rise_untaken(&self) -> bool {
+        matches!(
+            self.kind,
+            WaitKind::BindRoom {
+                rise: Some(_),
+                served: true,
+                withdrawn: false,
+                ..
+            }
+        )
+    }
+
     pub(super) fn room_pages(&self) -> u32 {
         match &self.kind {
             WaitKind::BindRoom { pages, .. } => *pages,
@@ -91,6 +114,7 @@ impl Waiter {
         match self.kind {
             WaitKind::Allocation { .. } => "allocation",
             WaitKind::Restore { .. } => "restore",
+            WaitKind::BindRoom { rise: Some(_), .. } => "rise room",
             WaitKind::BindRoom { .. } => "bind room",
         }
     }

@@ -241,6 +241,20 @@ impl ChunkMap {
     }
 }
 
+/// Where an activation raise to a rung stands against the pool's room
+/// ([`PoolPort::rise_room`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RiseRoom {
+    /// It fits now (or nothing is left to raise): the raise is taken.
+    Fits,
+    /// Short of room: `pieces` free chunks are what it takes, those free
+    /// now and those to empty, as a bind's runs of one chunk.
+    Short { pieces: u32 },
+    /// The rung's span and the reserved chunks, `need` chunks, past the
+    /// pool's `total`: no move of state ever makes the room.
+    Past { need: u32, total: u32 },
+}
+
 pub trait PoolPort: Send + Sync + 'static {
     /// The device's chunks by shape.
     fn chunk_stats(&self) -> ChunkStats;
@@ -327,6 +341,14 @@ pub trait PoolPort: Send + Sync + 'static {
     /// them watches change.
     fn guest_free_runs(&self, run: u32) -> u32 {
         u32::from(self.guest_room_free(run, 1))
+    }
+    /// Where a raise of the activation to `rung` (tokens) stands now: what
+    /// a rung raise short of room waits on
+    /// ([`super::ResidencyPlanner::fund_rise`]). `Fits` where the pool has
+    /// no rungs.
+    fn rise_room(&self, rung: u32) -> RiseRoom {
+        let _ = rung;
+        RiseRoom::Fits
     }
     /// Whether `pieces` free runs of `run` adjacent chunks stand beside
     /// the guest state `pid`'s restore retakes first (its parked dead
@@ -574,6 +596,12 @@ impl PoolPort for RegistryPool {
 
     fn guest_room_free(&self, run: u32, pieces: u32) -> bool {
         self.guest_free_runs(run) >= pieces
+    }
+
+    fn rise_room(&self, rung: u32) -> RiseRoom {
+        crate::store::registry::try_get(self.model, self.engine)
+            .and_then(|stores| stores.shared)
+            .map_or(RiseRoom::Fits, |shared| shared.lock().unwrap().rise_room(rung))
     }
 
     fn guest_free_runs(&self, run: u32) -> u32 {

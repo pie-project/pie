@@ -1412,6 +1412,7 @@ impl ResidencyPlanner {
                     && !matches!(
                         waiter.kind,
                         super::wait::WaitKind::Allocation { rise: true, .. }
+                            | super::wait::WaitKind::BindRoom { rise: Some(_), .. }
                     )
             })
         })

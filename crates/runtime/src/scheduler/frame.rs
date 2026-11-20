@@ -293,15 +293,30 @@ impl FramePolicy {
     /// raise lets go. What the cap's owner is told
     /// ([`crate::store::shared::owe_cut_rows`]) so a hold is never on a
     /// raise nothing asks for. 0 where none is held.
+    #[cfg(test)]
     #[must_use]
     pub fn cut_owed(&self) -> usize {
+        self.cut_owed_by().0
+    }
+
+    /// [`Self::cut_owed`], and the lane whose frame holds that widest
+    /// fire: the process a raise to it is funded for.
+    #[must_use]
+    pub fn cut_owed_by(&self) -> (usize, Option<ProcessId>) {
         self.lanes
-            .values()
-            .filter_map(|lane| lane.frames.front().filter(|front| front.is_complete()))
-            .flat_map(|front| front.fires.iter().map(|fire| fire.rung_rows))
-            .filter(|&rows| rows > self.fire_cap)
-            .max()
-            .unwrap_or(0)
+            .iter()
+            .filter_map(|(&pid, lane)| {
+                let front = lane.frames.front().filter(|front| front.is_complete())?;
+                let widest = front
+                    .fires
+                    .iter()
+                    .map(|fire| fire.rung_rows)
+                    .filter(|&rows| rows > self.fire_cap)
+                    .max()?;
+                Some((widest, pid))
+            })
+            .max_by_key(|&(rows, _)| rows)
+            .map_or((0, None), |(rows, pid)| (rows, Some(pid)))
     }
 
     /// The widest rung rows a sealed frame still to go takes; 0 where none
@@ -2150,6 +2165,76 @@ mod tests {
         sent.sort_unstable();
         assert_eq!(sent, prompts);
         assert_eq!(policy.cut_owed(), 0);
+    }
+
+    /// The soak's stall as the scheduler's turns meet the walk: the cap
+    /// lowered 512 -> 256 -> 128 fast, a prompt cut at 512 queued; a turn
+    /// reads 128 and holds the prompt out, and before its report of the
+    /// hold lands (`owe_cut_rows`) the walk raises the rung back and the
+    /// cap with it, so the raise had no hold to nudge for and the report
+    /// found the cap already up. The turn reads the cap again after its
+    /// report (`cap_moved`): the next turn seals the prompt under the
+    /// current cap at once, nothing in flight, never parked on the 128 it
+    /// cached.
+    #[test]
+    fn a_cap_raised_back_before_the_hold_is_told_seals_on_the_next_turn() {
+        const ENGINE: usize = 9401;
+        fn settled(policy: &mut FramePolicy, ids: &QueuedFireIds) -> FramePlan {
+            let mut now = Instant::now();
+            for _ in 0..100 {
+                match plan(policy, ids, now) {
+                    FramePlan::Hold(wait) => now += wait.max(Duration::from_millis(1)),
+                    plan => return plan,
+                }
+            }
+            panic!("held for good: {}", policy.debug_summary());
+        }
+        // One scheduler turn: the cap read, the frames planned under it,
+        // and the hold told; `between` runs where the walk may move the
+        // cap after the read. Whether the turn goes again at once.
+        fn turn(
+            policy: &mut FramePolicy,
+            ids: &QueuedFireIds,
+            between: impl FnOnce(),
+        ) -> (FramePlan, bool) {
+            let cap = crate::store::shared::fire_cap(ENGINE);
+            policy.cap_fires(cap as usize);
+            let planned = settled(policy, ids);
+            between();
+            let (owed, by) = policy.cut_owed_by();
+            crate::store::shared::owe_cut_rows(ENGINE, owed as u32, by);
+            (planned, crate::store::shared::cap_moved(ENGINE, cap))
+        }
+        let mut policy = FramePolicy::new(2, 4096, 1 << 20, None)
+            .with_submit_deadline(Duration::from_secs(86_400));
+        let lane = pid();
+        policy.on_fire_enqueued(stamp(lane, 0, 0, 1), Some(lane), 1, 1, 1);
+        let first: QueuedFireIds = [1].into_iter().collect();
+        crate::store::shared::set_fire_cap_for_test(ENGINE, 512);
+        assert_eq!(fires(&turn(&mut policy, &first, || {}).0), vec![1]);
+        policy.on_frame_posted([lane], Instant::now());
+        policy.on_frame_retired([lane]);
+        // The walk lowers the cap twice, fast; a prompt cut at 512 queues.
+        crate::store::shared::set_fire_cap_for_test(ENGINE, 256);
+        crate::store::shared::set_fire_cap_for_test(ENGINE, 128);
+        policy.on_fire_enqueued(stamp(lane, 1, 0, 1), Some(lane), 2, 512, 1);
+        let prompt: QueuedFireIds = [2].into_iter().collect();
+        // The turn reads 128 and holds the prompt; the raise lands before
+        // the hold is told.
+        let (held, again) = turn(&mut policy, &prompt, || {
+            crate::store::shared::set_fire_cap_for_test(ENGINE, 512);
+        });
+        assert!(
+            matches!(held, FramePlan::Park),
+            "held out under the 128 it read: {}",
+            policy.debug_summary()
+        );
+        assert_eq!(policy.cut_owed(), 512, "owed, told");
+        assert!(again, "the cap moved since the read: the scheduler goes again");
+        let (sealed, again) = turn(&mut policy, &prompt, || {});
+        assert_eq!(fires(&sealed), vec![2], "sealed under the current cap at once");
+        assert!(!again);
+        crate::store::shared::owe_cut_rows(ENGINE, 0, None);
     }
 
     /// Shape (2) as a seeded schedule: lanes submit frames in rounds (one or
