@@ -293,6 +293,7 @@ impl<B: Host> Gpu<B> {
             estimate_ms = whole / 1e6,
             per_layer_ms = per_layer / 1e6,
             worst = held.worst,
+            scale = held.scale,
             bound_ms = held.bound_ns / 1e6,
             split = admitted.split(),
             refused = matches!(admitted, crate::submit::Admitted::Refused { .. }),
@@ -387,6 +388,12 @@ impl<B: Host> Gpu<B> {
         if guest > 0 {
             self.live.tally(engine::live::Tally::BuiltInFire, guest);
             self.warn_in_fire("a guest step's pipeline");
+        }
+        // The submit-bound probes, apart from the model's fires: recorded at
+        // load where the backend keeps recordings.
+        let probed = self.shell.as_mut().map_or(0, Shell::probed_serving);
+        if probed > 0 {
+            self.live.tally(engine::live::Tally::Probed, probed);
         }
         let unkept = self.shell.as_mut().map_or(0, Shell::unkept_serving);
         if unkept > 0 {
@@ -1448,6 +1455,10 @@ where
         // The frame before can no longer be asked for its rows.
         if let Some(shell) = self.shell.as_mut() {
             shell.open_frame();
+            // Under a stated submit bound, a frame that follows an idle
+            // device re-times its clock before its first step is admitted
+            // (`crate::submit`); nothing runs where no bound is stated.
+            shell.retime(id).map_err(fault)?;
         }
 
         let mut steps = Vec::with_capacity(frame.steps.len());
