@@ -822,3 +822,37 @@ Read: a one-time host-side stall in the Windows NVIDIA driver's submit path, lan
 whichever submit is in flight; the test catches it when that submit overlaps the compile.
 The test stays strict, known on this device. Owed: driver-level tracing on that box (not
 nsys, which bluescreens it), or a driver update that moves it.
+
+## F43. XLA: a laid program's first execution costs 2.5-6 ms more than its later ones
+
+The warm ladder compiles and loads every program at boot but only traces its fires
+(6123377f2); nothing executes a program until a served fire does. Each executable's first
+execution then runs 2.5-6 ms longer on the device than its median (v6e qwen3-0.6b, census
+config, PIE_XLA_TIMING after ready: a 1536-row mixed fire 23.6 against 17.4 ms, an 8-lane
+decode 5.6 against 2.2 ms, a 128-row mixed fire 9.7 against 5.3 ms; host stage unchanged;
+nothing compiled or loaded after ready, 0 misses). A burst that touches many shapes pays it
+many times: the first staggered load after boot runs 1508 tok/s against 2189 on the next
+(tip e465dd459; the same with the mixed decode capacity, 1392 against 2150 under timing).
+
+Pre-existing; the libtpu per-executable work on first execute (likely its program image
+reaching the device) is not named by the PJRT API. Lever: execute each laid program once at
+load, on scratch (the warm fires did so before 6123377f2, at boot time's cost: ~436 programs
+x a few ms, plus staging), so a served fire is never an executable's first.
+
+## F44. A mixed fire with no canonical shape compiles after ready (the runtime composes it)
+
+`canonical_pads` (engine-xla serve) pads a fire that prefills to rungs so a laid program
+holds it, and returns None where no laid shape exists; the fire then goes out at its exact
+lane counts and compiles mid-run. One composition the runtime forms: 35 three-row prompts
+beside 17 decodes (128 rows, 53 lanes, v6e qwen3-0.6b c64). Its prompts pad to the 64-lane
+rung, which leaves 16 decode lanes within max_lanes (80); 17 decodes fit neither 16 nor
+their rung 32 (96 lanes). Base's rule has the same gap (the decodes' rung 32 > the 16 left
+and 17 > 16); with the mixed decode capacity (decodes beside prompts pad to the largest
+decode rung their prompts' rung leaves) it hit 2 of 4 serving runs (a c64 pass at 642
+tok/s), base 0 of ~10.
+
+A contract bug: a served fire with no laid shape is a compile after ready. Fix on the
+cutter (runtime, every backend): never compose a mixed fire the engine has no canonical
+shape for; seat the decodes and the prompts that fit beside them, and defer the rest to the
+next fire. The ladder stays as it is (no half rungs, no extra programs). Test case: the
+composition above.
