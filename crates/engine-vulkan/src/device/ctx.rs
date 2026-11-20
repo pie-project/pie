@@ -1226,6 +1226,14 @@ impl Context {
         Ok(())
     }
 
+    /// Lays the slab every host write to device memory stages through
+    /// (a guest bind's tables among them), where nothing has made it yet:
+    /// a load lays it, so serving reserves none.
+    pub fn lay_staging(&self) -> Result<()> {
+        let mut transfer = self.core.transfer.lock().expect("transfer lock poisoned");
+        self.core.staging(&mut transfer).map(|_| ())
+    }
+
     pub fn frame(&self) -> Result<Frame> {
         self.frame_with(true)
     }

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use eta_compiler::codegen::launch::{LaunchPackage, LaunchStagePlan};
+use eta_compiler::codegen::launch::LaunchPackage;
 use eta_exec::{Extents, ValueDesc};
 
 use crate::device::Context;
@@ -17,8 +17,8 @@ use engine_gpu::store::layout::INSTANCE;
 use engine_gpu::guest::claims::{Claims, Run};
 use engine_gpu::guest::held::{self, consecutive};
 use engine_gpu::guest::session::{
-    HEAP_BINDING, STATUS_BINDING, STEP_BINDING, StageTables, TABLES_BINDING, bases, groups_for,
-    stage_tables, step_records, step_stride,
+    HEAP_BINDING, STATUS_BINDING, STATUS_SPAN, STEP_BINDING, StageTables, TABLES_BINDING, bases,
+    groups_for, stage_tables, step_records, step_stride,
 };
 use engine_gpu::guest::state::{GuestLayout, Side};
 
@@ -70,8 +70,6 @@ fn widened(call: usize, source: String) -> std::result::Result<String, String> {
     })
 }
 
-const STATUS_SPAN: u64 = eta_exec::STATUS_BYTES as u64;
-
 /// A status's fault code: none where it is unset, the code where it is a
 /// fault, and refused where its state is one no guest runtime writes.
 fn read_status(status: eta_exec::Status) -> std::result::Result<Option<u32>, String> {
@@ -84,28 +82,6 @@ fn read_status(status: eta_exec::Status) -> std::result::Result<Option<u32>, Str
             status.state, status.fault, status.reserved0, status.reserved1, status.state
         )),
     }
-}
-
-/// What an instance's tables take in its `Instance` slots, in the order a
-/// bind places them: each stage's four bind-time tables and its steps'
-/// uniforms (`stride` apart), then the status word its stages share.
-#[must_use]
-pub fn instance_table_sizes(
-    plans: &[LaunchStagePlan],
-    code: &[engine_gpu::guest::Lowered],
-    stride: u64,
-) -> Vec<u64> {
-    let mut sizes: Vec<u64> = plans
-        .iter()
-        .zip(code)
-        .flat_map(|(plan, lowered)| {
-            let mut stage = eta_exec::tables::table_sizes(plan).to_vec();
-            stage.push(lowered.steps.len().max(1) as u64 * stride);
-            stage
-        })
-        .collect();
-    sizes.push(STATUS_SPAN);
-    sizes
 }
 
 /// What each stage of `package` reads back at its collect: its status, then
@@ -448,10 +424,7 @@ impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Session")
             .field("stages", &self.stages.len())
-            .field(
-                "heap",
-                &self.stages.iter().map(|s| s.heap.2).sum::<u64>(),
-            )
+            .field("heap", &self.stages.iter().map(|s| s.heap.2).sum::<u64>())
             .finish()
     }
 }
@@ -495,7 +468,8 @@ impl Session {
             })
             .collect::<Result<Vec<StageTables>>>()?;
         // Every stage's tables and step records, then the status word, in
-        // one run of the instance's slots ([`instance_table_sizes`]), written
+        // one run of the instance's slots
+        // ([`engine_gpu::guest::session::instance_table_sizes`]), written
         // at once. The records lie in a pool segment beside storage, so they
         // bind as storage too, each at an offset storage's alignment allows;
         // each states where the instance lies, so they are written once the
@@ -534,7 +508,10 @@ impl Session {
                     pair.bytes(),
                     layout.stages,
                     plans.len(),
-                    resolved.iter().map(|stage| stage.scratch).collect::<Vec<_>>()
+                    resolved
+                        .iter()
+                        .map(|stage| stage.scratch)
+                        .collect::<Vec<_>>()
                 ),
             });
         }
@@ -591,12 +568,10 @@ impl Session {
             )?;
             self.library
                 .group(self.status.buffer(), heap_span(places, stage.heap)?.0)?;
-            stage
-                .args
-                .write(
-                    0,
-                    &step_records(&stage.lowered, &stage.areas, stage.stride, bases),
-                )?;
+            stage.args.write(
+                0,
+                &step_records(&stage.lowered, &stage.areas, stage.stride, bases),
+            )?;
         }
         let (start, end) = self.status.run_span(self.slot_bytes);
         let mut runs = vec![Run {

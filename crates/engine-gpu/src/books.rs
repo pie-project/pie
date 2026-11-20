@@ -104,6 +104,10 @@ pub struct Books {
     /// stage's staging), which no device ledger holds: counted here so they
     /// are refused past the host's room rather than taken unseen.
     host: AtomicU64,
+    /// The reservations taken, device and host, ever: read at a load's end
+    /// and after, those since are what serving reserved, which the north
+    /// star holds at none.
+    takes: AtomicU64,
     /// Whether these bytes are the process's: a device's are, and a naming
     /// load's ([`Books::apart`]) reserve nothing.
     process: bool,
@@ -123,6 +127,7 @@ impl Books {
             ledger: Mutex::new(Ledger::new(1, u64::MAX)),
             device: AtomicU64::new(0),
             host: AtomicU64::new(0),
+            takes: AtomicU64::new(0),
             process: true,
         }
     }
@@ -143,6 +148,7 @@ impl Books {
 
     /// The device gave `bytes` to `owner`.
     pub fn take(&self, owner: Owner, bytes: u64) {
+        self.takes.fetch_add(1, Ordering::Relaxed);
         self.device.fetch_add(bytes, Ordering::Relaxed);
         if self.process {
             PROCESS.fetch_add(bytes, Ordering::Relaxed);
@@ -167,7 +173,15 @@ impl Books {
 
     /// The driver gave `bytes` of host memory off the device's heaps.
     pub fn host_take(&self, bytes: u64) {
+        self.takes.fetch_add(1, Ordering::Relaxed);
         self.host.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// The reservations taken so far, device and host ([`Books::take`],
+    /// [`Books::host_take`]), none given back uncounted.
+    #[must_use]
+    pub fn takes(&self) -> u64 {
+        self.takes.load(Ordering::Relaxed)
     }
 
     /// Host memory of `bytes` off the device's heaps went back.

@@ -128,6 +128,10 @@ impl Context {
         match self.never {}
     }
 
+    pub fn lay_staging(&self) -> Result<()> {
+        match self.never {}
+    }
+
     pub fn frame(&self) -> Result<Frame> {
         match self.never {}
     }

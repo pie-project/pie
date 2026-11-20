@@ -19,7 +19,16 @@ pub struct Shelf {
     /// Bumped by every step: a landed seat a later step may have rewritten
     /// is read no more.
     generation: u64,
+
+    /// The host room every guest pass stages its host-held roots through
+    /// and reads its status and puts back into
+    /// ([`engine_gpu::guest::ring`]): laid here, before the pool is sized.
+    #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
+    pub(crate) guest: GuestRing,
 }
+
+/// The guest plane's ring of host room, a berth a pass in flight.
+pub type GuestRing = std::sync::Arc<engine_gpu::guest::ring::Ring<Buffer>>;
 
 struct LandedSeat {
     arm: usize,
@@ -162,12 +171,28 @@ impl Serve for Api {
     }
 
     fn shelf(
-        _device: &Context,
+        device: &Context,
         _pipelines: &Pipelines,
         _readout: &[Buffer],
         weights_stream: bool,
-        _guest: engine_gpu::serve::GuestRoom,
+        guest: engine_gpu::serve::GuestRoom,
     ) -> Result<Shelf> {
+        // A guest bind writes its tables through the device's staging slab,
+        // laid here where the load has not yet written through it.
+        device.lay_staging()?;
+        // Every guest pass stages and reads back through a berth of one
+        // ring of host room, laid for the frames in flight
+        // ([`engine_gpu::guest::ring::ring_bytes`]).
+        let ring = engine_gpu::guest::ring::ring_bytes(guest.chunk_bytes, guest.seats);
+        let guest = engine_gpu::guest::ring::Ring::new(
+            Buffer::with(
+                device,
+                ring,
+                engine_gpu::Memory::Host,
+                engine_gpu::books::owners::GUEST,
+            )?,
+            ring,
+        );
         // Every fire records whatever is resident: a row table's misses are
         // staged by the host before the fire, a routed expert's between the
         // segments of the recording its stage cut ([`Kept::replay_cut`]).
@@ -179,6 +204,7 @@ impl Serve for Api {
             },
             landed_seats: BTreeMap::new(),
             generation: 0,
+            guest,
         })
     }
 
@@ -432,9 +458,11 @@ fn record_key(shell: &Shell<Api>, p: &Prepared<'_, Api>) -> crate::record::Key {
         key.shown(&lane.reads);
         // A score room is its pair's place in the pool, which an unpark
         // or an evacuation moves: a recording binds the one it was taken at.
-        key.hashed(&lane.scores.map(|room| {
-            (engine_gpu::backend::Buffer::slab_id(&room.buffer), room.at)
-        }));
+        key.hashed(
+            &lane
+                .scores
+                .map(|room| (engine_gpu::backend::Buffer::slab_id(&room.buffer), room.at)),
+        );
     }
 
     key.finish()

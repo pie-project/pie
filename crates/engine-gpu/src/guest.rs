@@ -12,6 +12,7 @@ use eta_compiler::codegen::wgsl;
 
 pub mod claims;
 pub mod held;
+pub mod ring;
 pub mod run;
 pub mod session;
 pub mod state;
