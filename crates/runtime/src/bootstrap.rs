@@ -936,6 +936,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     match measure_host_cover(&name, warm_context).await {
         Ok(cover) => crate::scheduler::set_host_cover(cover),
         Err(error) => {
+            tracing::error!(%error, "measuring the host cover at load");
             scheduler_shutdown.shutdown().await.ok();
             return Err(error.context("measuring the host cover at load"));
         }
@@ -1031,12 +1032,19 @@ async fn measure_host_cover(model: &str, context: usize) -> Result<usize> {
                 turns.saturating_sub(n0),
                 turn_us.saturating_sub(t0),
             );
-            anyhow::ensure!(
-                df > 0 && dn > 0 && dd > 0,
-                "warm runs of {} and {tokens} tokens timed no more frames ({df} fires, {dn} \
-                 turnarounds more)",
-                tokens / 2
-            );
+            // too short a difference to hold a frame and a turnaround: the
+            // next round, twice as long, measures
+            if df == 0 || dn == 0 || dd == 0 {
+                if past_context {
+                    anyhow::bail!(
+                        "warm runs up to the engines' context of {context} timed no decode \
+                         frame's turnaround ({df} fires, {dn} turnarounds more)"
+                    );
+                }
+                prev = Some(grown);
+                tokens = next;
+                continue;
+            }
             let frame_us = dd as f64 / df as f64;
             let turnaround_us = dt as f64 / dn as f64;
             let cover = (turnaround_us / frame_us).ceil() as usize;
