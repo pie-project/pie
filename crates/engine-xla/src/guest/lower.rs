@@ -1759,11 +1759,12 @@ impl Lower<'_> {
                 self.set(result, y)
             }
             tags::GUMBEL_ARGMAX => {
-                // Each lane `logits[i] / divisor + gumbel(state, i)`, `-inf`
+                // Each lane `logits[i] * scale + gumbel(state, i)`, `-inf`
                 // where `keep` is false, in f32 from its operands as loaded
                 // and never stored (a bf16 store would collapse near ties),
                 // then `reduce_argmax`: the unfused draw's operations in its
-                // order, `rng_keyed`'s noise over the logits' shape.
+                // order, `rng_keyed`'s noise over the logits' shape. `scale`
+                // is the host's rounded reciprocal of the temperature.
                 let (il, x) = self.raw_arg(op, 0)?;
                 if self.dtype(il) != Dtype::F32 {
                     return refuse("a gumbel draw over non-float logits");
@@ -1771,8 +1772,8 @@ impl Lower<'_> {
                 let row = self.shape(il);
                 let n = numel(&row) as i64;
                 let keep = self.arg(op, 1, &row)?;
-                let d = self.arg(op, 2, &row)?;
-                let scaled = self.f.div(x, d)?;
+                let scale = self.arg(op, 2, &row)?;
+                let scaled = self.f.mul(x, scale)?;
                 let floor = self.splat_f(scaled, f32::NEG_INFINITY);
                 let masked = self.f.select(keep, scaled, floor)?;
                 let seed = self.keyed_seed(op, 3)?;

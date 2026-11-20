@@ -392,14 +392,15 @@ fn flat_top_k() -> (TraceContainer, Vec<u32>) {
     (p.container(), outs)
 }
 
-/// A Gumbel draw fused (`gumbel_argmax`) and unfused (`select`, `add` of
-/// `rng_keyed`'s noise, `reduce_argmax`) over f32 logits, and fused over
-/// their bf16 rounding; `keep` masks the lanes at or under `floor`.
+/// A Gumbel draw fused (`gumbel_argmax`) and unfused (a multiply by the
+/// scale, `select`, `add` of `rng_keyed`'s noise, `reduce_argmax`) over f32
+/// logits, and fused over their bf16 rounding; `keep` masks the lanes at or
+/// under `floor`.
 fn gumbel_draws() -> (TraceContainer, Vec<u32>) {
     let mut p = Program::new();
-    let (_, divisor) = p.input(Shape::vector(1), Dtype::F32);
-    let divisor = p.op(Op::Reshape {
-        value: divisor,
+    let (_, scale) = p.input(Shape::vector(1), Dtype::F32);
+    let scale = p.op(Op::Reshape {
+        value: scale,
         shape: Shape::new(&[]).unwrap(),
     });
     let (_, state) = p.input(Shape::vector(2), Dtype::U32);
@@ -414,10 +415,10 @@ fn gumbel_draws() -> (TraceContainer, Vec<u32>) {
     let fused = p.op(Op::GumbelArgmax {
         logits,
         keep,
-        divisor,
+        scale,
         state,
     });
-    let scaled = p.op(Op::Div(logits, divisor));
+    let scaled = p.op(Op::Mul(logits, scale));
     let ninf = p.f(f32::NEG_INFINITY);
     let masked = p.op(Op::Select {
         cond: keep,
@@ -438,7 +439,7 @@ fn gumbel_draws() -> (TraceContainer, Vec<u32>) {
     let fused_half = p.op(Op::GumbelArgmax {
         logits: half,
         keep,
-        divisor,
+        scale,
         state,
     });
     let outs = vec![
@@ -1371,8 +1372,9 @@ fn a_flat_top_k_agrees(device: &Device, stages: &mut Stages) {
 }
 
 /// `gumbel_argmax` answers the unfused draw over f32 logits bit for bit, on
-/// the device and in the interpreter, at every seed; over bf16 logits it
-/// answers the interpreter.
+/// the device and in the interpreter, at every seed and scale (the host's
+/// rounded 1 / T, 1.0 / 0.7 among them); over bf16 logits it answers the
+/// interpreter.
 fn the_gumbel_draws_agree(device: &Device, stages: &mut Stages) {
     let (container, outs) = gumbel_draws();
     let plan = plan_of(container, VOCAB);
@@ -1380,7 +1382,7 @@ fn the_gumbel_draws_agree(device: &Device, stages: &mut Stages) {
     let kept = kept(device, &plane, ROWS, vec![(0, ROWS)]);
     for seed in 0..12u32 {
         let seeds = vec![
-            (0, Value::F32(vec![0.6 + 0.1 * (seed % 5) as f32])),
+            (0, Value::F32(vec![1.0 / (0.6 + 0.1 * (seed % 5) as f32)])),
             (1, Value::U32(vec![0x9E37_79B9 ^ (seed * 7919), seed])),
         ];
         let want = host(&plan, &seeds, &plane, ROWS, &outs);
