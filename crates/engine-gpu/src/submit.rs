@@ -60,10 +60,11 @@
 //! device time is measured once it lands ([`DeviceTime`], from
 //! [`FireTiming`], stated at load), read where its landing is already seen
 //! (a fence waited, a work-done callback), never by a wait of its own, and
-//! its ratio to its estimate kept for one bound's span ([`Measured`]): the
-//! scale every estimate is read at is the worst of them where it passes
-//! the probe's ([`SubmitBound::scale_now`]), so a slowing device's next
-//! steps are split before they reach the bound.
+//! its ratio to its estimate at a ratio of 1 kept for one bound's span
+//! ([`Measured`]): every estimate is read at the worst of them where it
+//! passes the stored ratio, the worst ratio times the probe's scale
+//! ([`SubmitBound::ratio_now`]), so a slowing device's next steps are split
+//! before they reach the bound.
 
 use engine::load::{FireEstimate, RungFacts};
 use kernels_slang::Tensor;
@@ -377,8 +378,9 @@ pub struct SubmitBound {
     /// ([`Clock::scale`]), 1 before any.
     pub scale: f64,
     /// The ratios of the serving fires' measured device times to their
-    /// estimates, landed within the last bound ([`Measured`]): the scale is
-    /// read at the worst of them where it passes the probe's.
+    /// estimates at a ratio of 1, landed within the last bound
+    /// ([`Measured`]): an estimate is read at the worst of them where it
+    /// passes the worst ratio times the scale ([`SubmitBound::ratio_now`]).
     pub measured: Measured,
 }
 
@@ -445,14 +447,14 @@ impl DeviceTime {
 /// The ratios of serving fires' measured device times to their estimates
 /// (each the estimate at a ratio of 1, before the worst ratio and the
 /// scale), each kept from its landing for one bound's span (the span the
-/// next submission is held to): the scale every estimate is read at is the
-/// worst of them where it passes the probe's. A device that slows under
+/// next submission is held to): every estimate is read at the worst of
+/// them where it passes the stored ratio ([`SubmitBound::ratio_now`]). A device that slows under
 /// load (a phone's GPU heating to its thermal cap, its clock 1300 to ~830
 /// MHz within seconds) runs each fire longer than its estimate taken at
 /// load; the next fires are read at that ratio and split before they reach
 /// the bound. The worst, not a mean: while the device slows, splitting only
-/// grows more conservative. Nothing landed within the span: the probe's
-/// scale alone.
+/// grows more conservative. Nothing landed within the span: the stored
+/// ratio alone.
 #[derive(Debug, Clone, Default)]
 pub struct Measured {
     landed: std::collections::VecDeque<(std::time::Instant, f64)>,
@@ -573,22 +575,33 @@ impl SubmitBound {
         (whole, per_layer)
     }
 
-    /// The scale an estimate is read at: the last probe's, or the worst
-    /// ratio of a fire's measured time to its estimate landed within the
-    /// last bound where that passes it ([`Measured`]); never below 1.
+    /// The ratio of a fire's time to its estimate at a ratio of 1
+    /// ([`SubmitBound::raw_ns`]) an estimate is read at: the stored one (the
+    /// worst ratio the rates step measured times the last probe's scale),
+    /// or the worst one measured over the fires landed within the last
+    /// bound ([`Measured`]) where it passes that. One quantity, actual over
+    /// estimate, both ways: the stored covers a cold start and the fires
+    /// before any lands, the measured a device slowing past it. Never below
+    /// 1.
     #[must_use]
-    pub fn scale_now(&self) -> f64 {
-        self.scale.max(self.measured.worst()).max(1.0)
+    pub fn ratio_now(&self) -> f64 {
+        self.stored_ratio().max(self.measured.worst())
     }
 
-    /// The estimate of `step` at the worst ratio and the scale
-    /// ([`SubmitBound::scale_now`]), ns: `(whole, per layer)`
-    /// ([`SubmitBound::raw_ns`]).
+    /// The stored ratio: the worst ratio the rates step measured times the
+    /// last probe's scale, each at least 1.
+    #[must_use]
+    pub fn stored_ratio(&self) -> f64 {
+        self.worst.max(1.0) * self.scale.max(1.0)
+    }
+
+    /// The estimate of `step` at [`SubmitBound::ratio_now`], ns: `(whole,
+    /// per layer)` ([`SubmitBound::raw_ns`]).
     #[must_use]
     pub fn step_ns(&self, step: StepRows) -> (f64, f64) {
         let (whole, per_layer) = self.raw_ns(step);
-        let factor = self.worst.max(1.0) * self.scale_now();
-        (whole * factor, per_layer * factor)
+        let ratio = self.ratio_now();
+        (whole * ratio, per_layer * ratio)
     }
 
     /// A serving fire estimated at `estimate_ns` (its whole [`raw_ns`])
@@ -673,10 +686,11 @@ impl SubmitBound {
         };
         format!(
             "a step of {} rows over {} lanes at {} keys is estimated at {:.0} ms whole and {:.0} \
-             ms a layer at a time ({} layers, at the worst ratio {:.3} of a frame's time to its \
-             estimate the rates step measured, `[rates] submit_worst_ratio`, and the scale \
-             {:.3}: its last probe's {:.3}, or the worst ratio {:.3} of a fire's measured time \
-             to its estimate over the {} fires landed within the last bound), past the \
+             ms a layer at a time ({} layers, at the ratio {:.3} of a fire's time to its \
+             estimate: the worst ratio {:.3} the rates step measured, `[rates] \
+             submit_worst_ratio`, times the clock's scale {:.3} its last probe read, or the \
+             worst ratio {:.3} measured over the {} fires landed within the last bound where \
+             it passes that), past the \
              platform's stated bound of {:.0} ms on one GPU submission \
              (engine_gpu::rates::stated_submit_bound); the widest prefill rung this load lays \
              is {} rows",
@@ -686,8 +700,8 @@ impl SubmitBound {
             admitted.ns() / 1e6,
             per / 1e6,
             self.layers,
+            self.ratio_now(),
             self.worst,
-            self.scale_now(),
             self.scale,
             self.measured.worst(),
             self.measured.len(),
@@ -924,19 +938,20 @@ mod tests {
     }
 
     /// A device slowing under load (a phone's GPU at its thermal cap):
-    /// each fire's measured time over its estimate rises from fire to fire.
-    /// A step that fit whole at load is read at the worst ratio landed
-    /// within the last bound and split before it reaches the bound; one
-    /// fast fire after a slow one does not lower it (the worst, not a
-    /// mean), and once the slow fires are a bound old the probe's scale is
-    /// read again.
+    /// each fire's measured time over its estimate at a ratio of 1 rises
+    /// from fire to fire. An estimate is read at the stored ratio (the
+    /// rates step's worst times the probe's scale) until a measured ratio
+    /// passes it, then at that one: a step that fit whole at load is split
+    /// before it reaches the bound. One fast fire after a slow one does not
+    /// lower it (the worst, not a mean); once the slow fires are a bound
+    /// old, the stored ratio again.
     #[test]
     fn a_device_slowing_fire_by_fire_splits_a_step_that_fit_at_load() {
         let at_one = bound(1.0);
         let step = prompt(256, 1024);
         let (raw, per_layer) = at_one.raw_ns(step);
-        // The field's worst ratio, the step whole under it with a layer to
-        // spare, by ~5%.
+        // The field's worst ratio; the step whole under it with a layer to
+        // spare, by 5%.
         let worst = 2.062;
         let mut b = SubmitBound {
             worst,
@@ -944,35 +959,40 @@ mod tests {
             ..at_one
         };
         assert!(matches!(b.admit(step), Admitted::Whole { .. }));
-        assert_eq!(b.scale_now(), 1.0);
-        // Fires land at their estimate, then slower each time.
+        assert_eq!(b.ratio_now(), worst);
         let t0 = std::time::Instant::now();
         let ms = |n: u64| std::time::Duration::from_millis(n);
         let fire = 100.0 * MS;
-        let mut admitted = Vec::new();
-        for (at, ratio) in [1.0, 1.02, 1.04, 1.1, 1.3].into_iter().enumerate() {
+        let mut read = Vec::new();
+        for (at, ratio) in [1.5, 2.0, 2.1, 2.3, 2.6].into_iter().enumerate() {
             b.landed(t0 + ms(at as u64 * 100), fire, (fire * ratio) as u64);
-            admitted.push(b.admit(step).split());
+            read.push((b.ratio_now(), b.admit(step).split()));
         }
-        assert_eq!(admitted, [false, false, false, true, true], "{admitted:?}");
-        assert!((b.scale_now() - 1.3).abs() < 1e-6, "{}", b.scale_now());
+        // Under the stored ratio: read at it, whole (2.1 is past it but
+        // within the 5% to spare). Past it: read at the measured, split.
+        let want = [(worst, false), (worst, false), (2.1, false), (2.3, true), (2.6, true)];
+        for ((got, split), (ratio, splits)) in read.iter().zip(want) {
+            assert!((got - ratio).abs() < 1e-6 && *split == splits, "{read:?}");
+        }
         let (scaled, _) = b.step_ns(step);
-        assert!((scaled - raw * worst * 1.3).abs() < 1e-6 * scaled);
+        assert!((scaled - raw * 2.6).abs() < 1e-6 * scaled);
         // A fast fire after: the worst stands.
-        b.landed(t0 + ms(500), fire, (fire * 0.9) as u64);
+        b.landed(t0 + ms(500), fire, fire as u64);
         assert!(b.admit(step).split());
-        assert!((b.scale_now() - 1.3).abs() < 1e-6);
+        assert!((b.ratio_now() - 2.6).abs() < 1e-6);
         let why = b.refusal(step, &b.admit(step));
-        assert!(why.contains("the worst ratio 1.300"), "{why}");
-        // A bound past the slow fires: the probe's scale again.
+        assert!(why.contains("at the ratio 2.600"), "{why}");
+        assert!(why.contains("worst ratio 2.600 measured over the 6 fires"), "{why}");
+        // A bound past the slow fires: the stored ratio again.
         b.age(t0 + ms(501) + std::time::Duration::from_nanos(b.bound_ns as u64));
         assert!(b.measured.is_empty());
-        assert_eq!(b.scale_now(), 1.0);
+        assert_eq!(b.ratio_now(), worst);
         assert!(matches!(b.admit(step), Admitted::Whole { .. }));
-        // A probe's scale past the fires' ratios is read over them.
-        b.landed(t0 + ms(10_000), fire, (fire * 1.2) as u64);
-        let probed = SubmitBound { scale: 1.5, ..b };
-        assert!((probed.scale_now() - 1.5).abs() < 1e-6);
+        // A probe's scale raises the stored ratio over a measured one it
+        // passes: 2.062 x 1.2 = 2.474 over 2.3.
+        b.landed(t0 + ms(10_000), fire, (fire * 2.3) as u64);
+        let probed = SubmitBound { scale: 1.2, ..b };
+        assert!((probed.ratio_now() - worst * 1.2).abs() < 1e-6);
     }
 
     /// A fire's device time reads nothing until its backend fills it, then
