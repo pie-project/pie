@@ -3,6 +3,7 @@ mod bool_gather;
 mod bool_moves;
 mod fold;
 mod guest_state;
+mod hosted;
 mod lane_refusal;
 mod outputs;
 mod port;

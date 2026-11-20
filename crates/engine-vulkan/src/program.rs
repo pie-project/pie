@@ -146,12 +146,6 @@ pub struct Plane {
     #[cfg(feature = "vulkan")]
     library: Option<Arc<crate::guest::session::Library>>,
 
-    /// Each program's stages' step uniforms, made at its first bind and
-    /// shared by every bind after: a round that binds the program afresh
-    /// makes none.
-    #[cfg(feature = "vulkan")]
-    step_args: BTreeMap<ProgramId, Vec<crate::guest::session::StepArgs>>,
-
     #[cfg(feature = "vulkan")]
     kept: crate::guest::session::Kept,
 
@@ -193,8 +187,6 @@ impl Plane {
             id: id.0,
         })?;
         self.forms.forget(id);
-        #[cfg(feature = "vulkan")]
-        self.step_args.remove(&id);
         Ok(())
     }
 
@@ -924,6 +916,9 @@ impl Plane {
         let inputs = PassInputs::none();
 
         #[cfg(feature = "vulkan")]
+        offered_read(seat, instance, &seats)?;
+
+        #[cfg(feature = "vulkan")]
         let (outcome, ran) = {
             let widen = widen.as_ref().expect("the device arm checked for one");
             let session = &mut seat.session;
@@ -1039,6 +1034,7 @@ impl Plane {
                 "instance {instance} has a device half, but the plane built no readout widen"
             ))
         })?;
+        offered_read(seat, instance, &seats)?;
         let inputs = PassInputs::none();
         let mut runner =
             crate::guest::run::OnDevice::new(device, &mut seat.session, widen, seats).deferred();
@@ -1215,24 +1211,10 @@ impl Plane {
                 .map_err(|why| format!("its state does not lie at {:?}: {why}", binding.scratch))?;
         let pair = engine_gpu::guest::state::Placed::at(place.pools, &binding.pair, layout.pair)
             .map_err(|why| format!("its pair's state does not lie at {:?}: {why}", binding.pair))?;
-        let args = match self.step_args.get(&binding.program) {
-            Some(args) => args.clone(),
-            None => {
-                let args = compiled
-                    .all()
-                    .iter()
-                    .map(|lowered| crate::guest::session::StepArgs::of(device, lowered))
-                    .collect::<engine_gpu::error::Result<Vec<_>>>()
-                    .map_err(|why| format!("its step uniforms did not build: {why}"))?;
-                self.step_args.insert(binding.program, args.clone());
-                args
-            }
-        };
         crate::guest::session::Session::new(
             device,
             &plan.package.plans,
             compiled.all(),
-            &args,
             &extents,
             &library,
             Arc::clone(&self.kept),
@@ -1427,16 +1409,7 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
         })?;
         #[cfg(feature = "vulkan")]
         {
-            let session = &seat.session;
-            let unread = engine_gpu::guest::run::unread_seat(
-                &seat.plan.package,
-                |at, local| session.span(at, local).map(|(_, held)| held),
-                &seats,
-            )
-            .map_err(|fault| Refusal::Program(fault.to_string()))?;
-            if let Some((output, lane)) = unread {
-                return Err(engine_gpu::program::unread(instance, &output, lane));
-            }
+            let _ = seat;
             self.fire(instance, Stage::Epilogue, Some(device), seats)?;
             self.instances.get_mut(&instance).map_or(Ok(()), |seat| {
                 seat.session
@@ -1464,18 +1437,15 @@ fn puts_into(plan: &ExecPlan, channel: u32) -> bool {
 
 /// The bytes a channel's cell takes on the device, where a pass may keep one
 /// there: a channel the host does not read (`guest::run`). A value lies in a
-/// guest heap a word an element, a byte a bool (`ValueDesc::device_bytes`).
+/// guest heap at its dtype's width an element (`eta_exec::element_bytes`,
+/// as `ValueDesc::device_bytes` lays it).
 fn device_cell_bytes(shape: &[u32], dtype: ChanDType, host_role: HostRole) -> Option<u64> {
     if host_role == HostRole::Reader {
         return None;
     }
     let numel = numel_of(shape) as u64;
-    let bytes = if eta_exec::concrete_dtype(dtype) == eta_ir::Dtype::Bool {
-        numel
-    } else {
-        numel * 4
-    };
-    Some(bytes.max(4))
+    let element = eta_exec::element_bytes(eta_exec::concrete_dtype(dtype));
+    Some(numel.saturating_mul(element).max(4))
 }
 
 /// A channel's device cell as `Channel` slots: a slot where the cell fits
@@ -1638,5 +1608,27 @@ mod registration_tests {
         assert!(why.contains("emits no WGSL for"), "{why}");
         assert_eq!(plane.forms.tally(), (0, 0), "the refusal is not kept");
         assert!(plane.programs.is_empty());
+    }
+}
+
+/// What a pass is offered it reads: every seat the fire read out for its
+/// lanes (the arm's seat, or rows where they lie in the fire's span) is a
+/// row of an output the program reads, else the pass is refused by name.
+#[cfg(feature = "vulkan")]
+fn offered_read(
+    seat: &Instance,
+    instance: InstanceId,
+    seats: &[Vec<crate::guest::run::Readout<'_>>],
+) -> Result<(), Refusal> {
+    let session = &seat.session;
+    let unread = engine_gpu::guest::run::unread_seat(
+        &seat.plan.package,
+        |at, local| session.span(at, local).map(|(_, held)| held),
+        seats,
+    )
+    .map_err(|fault| Refusal::Program(fault.to_string()))?;
+    match unread {
+        Some((output, lane)) => Err(engine_gpu::program::unread(instance, &output, lane)),
+        None => Ok(()),
     }
 }

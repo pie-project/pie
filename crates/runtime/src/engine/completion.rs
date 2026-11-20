@@ -467,10 +467,22 @@ struct WorkItemCompletionState {
     guard: Option<Arc<dyn CompletionLease>>,
     /// Run once the completion resolves (or, never resolved, as the last
     /// handle on it goes): see [`WorkItemCompletion::on_settled`].
-    on_settled: Mutex<Vec<SettledHook>>,
+    on_settled: Mutex<Vec<LandedHook>>,
 }
 
 type SettledHook = Box<dyn FnOnce() + Send>;
+
+/// A hook told whether its completion landed, as it resolved.
+type LandedHook = Box<dyn FnOnce(bool) + Send>;
+
+/// `hooks`, each told `landed` now: they may run once no handle on the
+/// completion is left, past where it could still be asked.
+fn told(hooks: Vec<LandedHook>, landed: bool) -> Vec<SettledHook> {
+    hooks
+        .into_iter()
+        .map(|hook| Box::new(move || hook(landed)) as SettledHook)
+        .collect()
+}
 
 std::thread_local! {
     /// Hooks gathered by [`settle_batched`] on this thread, run together
@@ -549,7 +561,7 @@ impl WorkItemCompletionState {
 
     fn settled(&self) {
         let hooks = std::mem::take(&mut *self.on_settled.lock().unwrap());
-        run_settled(hooks);
+        run_settled(told(hooks, matches!(self.result(), Some(Ok(())))));
     }
 
     fn target_epoch(&self) -> u64 {
@@ -658,7 +670,10 @@ impl Drop for WorkItemCompletionState {
             self.terminal.mark_recyclable();
         }
         // No one holds the work item any more: nothing runs it now.
-        run_settled(std::mem::take(self.on_settled.get_mut().unwrap()));
+        run_settled(told(
+            std::mem::take(self.on_settled.get_mut().unwrap()),
+            false,
+        ));
     }
 }
 
@@ -766,26 +781,21 @@ impl WorkItemCompletion {
     /// this takes no waker and no task: a hook runs where the completion
     /// resolves, with nothing left to poll.
     pub fn on_settled(&self, hook: impl FnOnce() + Send + 'static) {
-        let mut hooks = self.state.on_settled.lock().unwrap();
-        if self.state.result().is_none() {
-            hooks.push(Box::new(hook));
-            return;
-        }
-        drop(hooks);
-        hook();
+        self.on_settled_landed(move |_| hook());
     }
 
-    /// [`Self::on_settled`], told whether it landed: never where no handle
-    /// on it is left by the time the hook runs, which holds none of its own.
+    /// [`Self::on_settled`], told whether it landed, as it resolved: never
+    /// where it resolved otherwise, or no handle on it was left unresolved.
+    /// Its hooks run off the resolving stack, often once the last handle
+    /// is gone, so what it is told is fixed where it resolves.
     pub fn on_settled_landed(&self, hook: impl FnOnce(bool) + Send + 'static) {
-        let state = Arc::downgrade(&self.state);
-        self.on_settled(move || {
-            hook(
-                state
-                    .upgrade()
-                    .is_some_and(|state| matches!(state.result(), Some(Ok(())))),
-            );
-        });
+        let mut hooks = self.state.on_settled.lock().unwrap();
+        let Some(result) = self.state.result() else {
+            hooks.push(Box::new(hook));
+            return;
+        };
+        drop(hooks);
+        hook(result.is_ok());
     }
 
     pub fn same_request(&self, other: &Self) -> bool {

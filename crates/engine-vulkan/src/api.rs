@@ -94,9 +94,7 @@ impl Host for Api {
             let faulted = std::mem::take(&mut step_pending.faulted);
             let fed = step_pending.fed.take();
             defer_attachment(gpu, step, at, &landed, wrote, faulted, fed)?;
-            let shell = gpu.loaded_mut()?;
-            shell.leave_unread(&landed);
-            shell.forget_seat(&landed);
+            gpu.loaded_mut()?.forget_seat(&landed);
             step_pending.rows = Some(Vec::new());
             return Ok((ticket, step_pending));
         }

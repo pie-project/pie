@@ -2015,6 +2015,26 @@ impl Func {
         )
     }
 
+    /// The `k` largest of `x` along its last axis, descending, and their
+    /// indices (i32): `chlo.top_k`, equal elements in index order.
+    pub fn top_k(&mut self, x: Val, k: i64) -> Built<(Val, Val)> {
+        let mut dims = self.dims(x).to_vec();
+        let n = *dims.last().ok_or_else(|| Malformed {
+            op: "chlo.top_k",
+            detail: "a scalar has no last axis".into(),
+        })?;
+        if k < 1 || k > n {
+            return Err(Malformed {
+                op: "chlo.top_k",
+                detail: format!("top-{k} of {n}"),
+            });
+        }
+        *dims.last_mut().expect("a last axis") = k;
+        let outs = vec![Ty::new(self.elem(x), &dims), Ty::new(Elem::I32, &dims)];
+        let vs = self.op_named("chlo.top_k", &[x], &format!("k = {k} : i64"), outs);
+        Ok((vs[0], vs[1]))
+    }
+
     // ---------------------------------------------------------------- control
 
     /// `while` over loop-carried `inits`: `cond` yields an i1 scalar, `body`

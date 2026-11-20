@@ -2825,9 +2825,12 @@ impl Shell {
             self.gather_shapes.insert((plane.rows, plane.width));
         }
 
-        // Each window's readouts (its lanes'): a window short of every lane
-        // cuts its readout-rowed values to them, so they reach the text.
-        let readout_spans: Vec<(u32, u32)> = windows
+        // Each window's readouts (its lanes'), as the walk cuts them
+        // (`Run::readout_span`): a window short of every lane cuts its
+        // readout-rowed values to them, so they reach the text; a window over
+        // all of them cuts nothing, whatever their count (a draft block's six
+        // lanes or nine at one lane rung read out alike, one program).
+        let readout_spans: Vec<Option<(u32, u32)>> = windows
             .all()
             .iter()
             .map(|w| {
@@ -2838,10 +2841,12 @@ impl Shell {
                         .copied()
                         .unwrap_or(0)
                 };
-                (
+                let (first, end) = (
                     at(w.span.lane_offset),
                     at(w.span.lane_offset + w.span.lanes),
-                )
+                );
+                let all = readout_indptr.last().copied().unwrap_or(0);
+                (first > 0 || end < all).then_some((first, end - first))
             })
             .collect();
         let bindings = FireBindings {

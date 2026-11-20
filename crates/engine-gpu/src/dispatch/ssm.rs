@@ -97,7 +97,7 @@ impl<B: Backend> Run<'_, B> {
                 conv1d::conv1d_committed(
                     ctx,
                     ext_x,
-                    self.qo_indptr(),
+                    self.csr(),
                     &self.rs_committed(&seat),
                     self.slang_of(*weight),
                     &self.state_pool(*state),
@@ -157,7 +157,7 @@ impl<B: Backend> Run<'_, B> {
                     ctx,
                     self.tuning().recurrent(),
                     ext_qkv,
-                    self.qo_indptr(),
+                    self.csr(),
                     &self.rs_committed(&seat),
                     ext_gates,
                     &self.state_pool(*state),
@@ -216,7 +216,7 @@ impl<B: Backend> Run<'_, B> {
                     ctx,
                     self.tuning().recurrent().tier,
                     ext_mixed,
-                    self.qo_indptr(),
+                    self.csr(),
                     &self.rs_committed(&seat),
                     &gates,
                     &self.state_pool(*state),
@@ -252,7 +252,8 @@ impl<B: Backend> Run<'_, B> {
                 ..
             } => conv1d::conv1d_chunked(
                 ctx,
-                self.ragged(*x),
+                self.slang_of(*x),
+                self.csr(),
                 self.slang_of(*weight),
                 &self.state_pool(*state),
                 *conv_width,
@@ -306,7 +307,8 @@ impl<B: Backend> Run<'_, B> {
             } => gdn_recurrent::gated_delta_chunked(
                 ctx,
                 self.tuning().recurrent(),
-                self.ragged(*qkv),
+                self.slang_of(*qkv),
+                self.csr(),
                 self.slang_of(*gates),
                 &self.state_pool(*state),
                 *k_heads,
@@ -373,7 +375,8 @@ impl<B: Backend> Run<'_, B> {
                 kda::kda_chunked(
                     ctx,
                     self.tuning().recurrent().tier,
-                    self.ragged(*mixed),
+                    self.slang_of(*mixed),
+                    self.csr(),
                     &gates,
                     &self.state_pool(*state),
                     self.slang_of(*y),

@@ -30,6 +30,7 @@ mod a_carried_history_copies_none_of_the_pool;
 mod a_guest_reading_no_plane_is_refused_at_registration;
 mod a_sink_xla_does_not_run_is_refused_at_registration;
 mod an_epilogue_agrees_with_the_host_interpreter;
+mod beam_topk;
 mod host_bank;
 mod kernels_act;
 mod kernels_attn;

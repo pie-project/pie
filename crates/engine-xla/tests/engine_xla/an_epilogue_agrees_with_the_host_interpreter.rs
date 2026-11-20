@@ -367,6 +367,31 @@ fn statistics() -> (TraceContainer, Vec<u32>) {
     (p.container(), outs)
 }
 
+/// A beam's pick: the top-k over every row of the logits as one vector (a
+/// beam inferlet's top-b of b x vocab scores), at two widths.
+fn flat_top_k() -> (TraceContainer, Vec<u32>) {
+    let mut p = Program::new();
+    let logits = p.op(Op::Output {
+        index: 0,
+        lane: 0,
+        shape: Shape::matrix(ROWS, VOCAB),
+        dtype: Dtype::F32,
+    });
+    let flat = p.op(Op::Reshape {
+        value: logits,
+        shape: Shape::vector(ROWS * VOCAB),
+    });
+    let four = p.op(Op::TopK { input: flat, k: 4 });
+    let nine = p.op(Op::TopK { input: flat, k: 9 });
+    let outs = vec![
+        p.output(Shape::vector(4), Dtype::U32, four + 1),
+        p.output(Shape::vector(4), Dtype::F32, four),
+        p.output(Shape::vector(9), Dtype::U32, nine + 1),
+        p.output(Shape::vector(9), Dtype::F32, nine),
+    ];
+    (p.container(), outs)
+}
+
 /// The compat sampler over one row: penalties over a carried histogram, a
 /// grammar mask (bools and packed words), temperature, top-k, top-p and a
 /// keyed Gumbel draw; plus the greedy token and the next histogram.
@@ -1050,6 +1075,7 @@ fn an_epilogue_agrees_with_the_host_interpreter_every_case() {
     let mut stages = Stages::default();
 
     the_statistics_agree(device, &mut stages);
+    a_flat_top_k_agrees(device, &mut stages);
     the_acceptance_rule_agrees(device, &mut stages);
     the_corners_agree(device, &mut stages);
     the_sampler_agrees(device, &mut stages, VOCAB);
@@ -1215,6 +1241,43 @@ fn the_statistics_agree(device: &Device, stages: &mut Stages) {
     close(&got[3], &want[3], 1e-5, "top-4 values");
     close(&got[4], &want[4], 1e-4, "softmax row mass");
     close(&got[5], &want[5], 1e-5, "probability at the argmax");
+}
+
+/// A flat top-k breaks its ties as the interpreter's order does: equal
+/// values in index order, -0 equal to +0 (each keeping its own bits), NaN
+/// after every number.
+fn a_flat_top_k_agrees(device: &Device, stages: &mut Stages) {
+    let (container, outs) = flat_top_k();
+    let plan = plan_of(container, VOCAB);
+    let mut plane = logits_plane(ROWS, VOCAB, 11);
+    let n = plane.len();
+    for x in &mut plane {
+        *x -= 20.0;
+    }
+    // ties at the top across rows, a signed-zero pair above them, NaNs
+    for at in [n - 3, 5, 3 * VOCAB as usize + 1, 9, 6 * VOCAB as usize] {
+        plane[at] = -1.5;
+    }
+    plane[2 * VOCAB as usize + 7] = 0.0;
+    plane[VOCAB as usize + 3] = -0.0;
+    for at in [0, 4 * VOCAB as usize + 2, n - 1] {
+        plane[at] = f32::NAN;
+    }
+    let want = host(&plan, &[], &plane, ROWS, &outs);
+    let kept = kept(device, &plane, ROWS, vec![(0, ROWS)]);
+    let got = on_device(
+        device,
+        stages,
+        &plan,
+        &[],
+        Some(&kept),
+        bound(&plan, &kept, 0),
+        &outs,
+    );
+    exact(&got[0], &want[0], "flat top-4 ids");
+    exact(&got[1], &want[1], "flat top-4 values");
+    exact(&got[2], &want[2], "flat top-9 ids");
+    exact(&got[3], &want[3], "flat top-9 values");
 }
 
 fn the_acceptance_rule_agrees(device: &Device, stages: &mut Stages) {

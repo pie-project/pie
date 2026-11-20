@@ -10,6 +10,7 @@ use std::sync::Arc;
 use eta_compiler::codegen::launch::{LaunchPackage, LaunchStagePlan, ValueOrigin};
 use eta_compiler::codegen::wgsl;
 
+pub mod claims;
 pub mod held;
 pub mod run;
 pub mod session;
@@ -563,6 +564,56 @@ mod tests {
             b.build().expect("the sorted epilogue traces")
         }
 
+        /// `beam-search`'s prompt epilogue: the prompt's top `beams` by log
+        /// probability, and its greedy pick beside them.
+        pub fn beam_prefill(vocab: u32, beams: u32) -> Traced {
+            let ids = leak(Channel::new([beams], dtype::i32));
+            let scores = leak(Channel::new([beams], dtype::f32));
+            let greedy = leak(Channel::new([1], dtype::i32));
+            let (mut b, _) = builder(vocab);
+            b.stage(Stage::Epilogue, move || {
+                let logits = reshape(intrinsics::output(0, "logits"), [vocab]);
+                let (s, i) = top_k(log_softmax(&logits), beams);
+                ids.put(cast(&i, dtype::i32));
+                scores.put(&s);
+                greedy.put(reshape(reduce_argmax(&logits), [1]));
+            });
+            ids.note_host_take();
+            scores.note_host_take();
+            greedy.note_host_take();
+            b.build().expect("the beam prefill epilogue traces")
+        }
+
+        /// `beam-search`'s decode epilogue over `beams` rows: each beam's
+        /// score plus its row's log probabilities, the top `beams` of all
+        /// of them, their parents and tokens, and each row's greedy pick.
+        pub fn beam_decode(vocab: u32, beams: u32) -> Traced {
+            let carried = leak(Channel::from(vec![0f32; beams as usize]));
+            let out = leak(Channel::new([beams], dtype::i32).capacity(8));
+            let parents = leak(Channel::new([beams], dtype::u32).capacity(8));
+            let greedy = leak(Channel::new([beams], dtype::i32).capacity(8));
+            let mut b = Builder::new(vocab, 16);
+            b.outputs(logits(vocab));
+            let rows = beams as usize;
+            b.bind_port(Port::EmbedTokens, leak(Channel::from(vec![42i32; rows])));
+            b.bind_port(Port::EmbedIndptr, leak(Channel::from((0u32..=beams).collect::<Vec<u32>>())));
+            b.bind_port(Port::Fold, leak(Channel::from([u32::MAX])));
+            b.stage(Stage::Epilogue, move || {
+                let logits = reshape(intrinsics::output(0, "logits"), [beams, vocab]);
+                let cand = broadcast(reshape(carried.take(), [beams, 1]), [beams, vocab])
+                    + log_softmax(&logits);
+                let (s, i) = top_k(reshape(cand, [beams * vocab]), beams);
+                carried.put(&s);
+                out.put(cast(&i % vocab, dtype::i32));
+                parents.put(&i / vocab);
+                greedy.put(reshape(reduce_argmax(&logits), [beams]));
+            });
+            out.note_host_take();
+            parents.note_host_take();
+            greedy.note_host_take();
+            b.build().expect("the beam decode epilogue traces")
+        }
+
         /// Every program here, by name.
         pub fn all(vocab: u32) -> Vec<(&'static str, Traced)> {
             vec![
@@ -589,12 +640,29 @@ mod tests {
 
     /// What a stage's scratch is for the programs inferlets ship, at a
     /// vocabulary of 151,936: each value its own bytes, and as laid here.
+    /// `beam-search`'s decode stage fires four rows.
     #[test]
     fn a_shipped_programs_stage_scratch() {
         let vocab = shipped::QWEN_VOCAB;
-        let totals: Vec<(&str, u64, u64)> = shipped::all(vocab)
+        let four = Extents {
+            row_count: 4,
+            token_count: 4,
+            sampled_rows: 4,
+            ..Extents::default()
+        };
+        let mut programs: Vec<(&str, eta_dsl::Traced, Extents)> = shipped::all(vocab)
+            .into_iter()
+            .map(|(name, traced)| (name, traced, Extents::default()))
+            .collect();
+        programs.push((
+            "beam prefill",
+            shipped::beam_prefill(vocab, 4),
+            Extents::default(),
+        ));
+        programs.push(("beam-4 decode", shipped::beam_decode(vocab, 4), four));
+        let totals: Vec<(&str, u64, u64)> = programs
             .iter()
-            .map(|(name, traced)| {
+            .map(|(name, traced, extents)| {
                 let package = shipped::package(traced, vocab);
                 let [plan] = &package.plans[..] else {
                     panic!("{name}: one stage");
@@ -602,8 +670,7 @@ mod tests {
                 step_source(0, plan).unwrap_or_else(|why| panic!("{name}: {why}"));
                 scratch_holds_the_hosts_values(&package)
                     .unwrap_or_else(|why| panic!("{name}: {why}"));
-                let tables =
-                    session::stage_tables(plan, &Extents::default()).expect("static shapes");
+                let tables = session::stage_tables(plan, extents).expect("static shapes");
                 let own = eta_exec::layout(&tables.descriptors).expect("fits").total;
                 (*name, own, tables.scratch)
             })
@@ -611,14 +678,94 @@ mod tests {
         assert_eq!(
             totals,
             [
-                ("top-p", 9_312_512, 5_056_512),
-                ("top-k + top-p", 9_616_896, 5_208_832),
-                ("gumbel-max", 5_512_960, 4_296_448),
-                ("greedy", 3_688_704, 3_688_448),
-                ("top logprobs", 6_728_960, 4_904_192),
-                ("sorted", 8_551_168, 4_903_936),
+                ("top-p", 9_312_512, 3_841_024),
+                ("top-k + top-p", 9_616_896, 3_993_344),
+                ("gumbel-max", 5_512_960, 1_823_744),
+                ("greedy", 3_688_704, 684_288),
+                ("top logprobs", 6_728_960, 3_039_744),
+                ("sorted", 8_551_168, 4_254_720),
+                ("beam prefill", 6_728_960, 3_647_232),
+                ("beam-4 decode", 31_647_232, 14_586_880),
             ]
         );
+    }
+
+    /// Laid over the shipped programs, no two values alive together share a
+    /// byte, a reshape read as its source lies at its source's offset and
+    /// keeps the source alive through its own readers, and no value alive
+    /// with a node's temporary area shares a byte of it or of the reserve
+    /// below it: an area takes only bytes of values dead while it is.
+    #[test]
+    fn a_shipped_program_s_live_items_share_no_bytes() {
+        let vocab = shipped::QWEN_VOCAB;
+        let four = Extents {
+            row_count: 4,
+            token_count: 4,
+            sampled_rows: 4,
+            ..Extents::default()
+        };
+        let mut programs: Vec<(&str, eta_dsl::Traced, Extents)> = shipped::all(vocab)
+            .into_iter()
+            .map(|(name, traced)| (name, traced, Extents::default()))
+            .collect();
+        programs.push(("beam prefill", shipped::beam_prefill(vocab, 4), Extents::default()));
+        programs.push(("beam-4 decode", shipped::beam_decode(vocab, 4), four));
+        for (name, traced, extents) in &programs {
+            let package = shipped::package(traced, vocab);
+            let plan = &package.plans[0];
+            let tables = session::stage_tables(plan, extents).expect("static shapes");
+            let stepping = session::Stepping::of(plan);
+            let launches = stepping.launches(&tables.descriptors);
+            let lifetimes = eta_exec::value_lifetimes(plan, &launches).expect("every node runs");
+            let laid = eta_exec::lay_out(plan, &tables.descriptors, &launches).expect("fits");
+            let span = |value: usize| {
+                let at = tables.offsets[value];
+                (at, at + tables.descriptors[value].device_bytes())
+            };
+            let overlap = |a: eta_exec::Lifetime, b: eta_exec::Lifetime| {
+                a.last >= b.def && b.last >= a.def
+            };
+            let aliases = eta_compiler::codegen::wgsl_analysis::analyze_stage(plan).aliases;
+            for &(result, source) in &aliases {
+                let (result, source) = (result as usize, source as usize);
+                assert!(lifetimes[result].dead, "{name}: alias {result} takes no bytes");
+                assert_eq!(tables.offsets[result], tables.offsets[source], "{name}");
+                assert!(
+                    lifetimes[source].last >= lifetimes[result].last,
+                    "{name}: value {source} dies before its alias {result} is read"
+                );
+            }
+            let live: Vec<usize> = (0..lifetimes.len()).filter(|&v| !lifetimes[v].dead).collect();
+            for (at, &a) in live.iter().enumerate() {
+                for &b in &live[at + 1..] {
+                    let ((sa, ea), (sb, eb)) = (span(a), span(b));
+                    if overlap(lifetimes[a], lifetimes[b]) {
+                        assert!(ea <= sb || eb <= sa, "{name}: values {a} and {b} alive together");
+                    }
+                }
+            }
+            let areas = eta_exec::launch_areas(&launches);
+            assert_eq!(areas.len(), laid.areas.len(), "{name}");
+            for (at, (area, &first)) in areas.iter().zip(&laid.areas).enumerate() {
+                let low = first - area.reserve;
+                let high = first + area.bytes;
+                for &value in &live {
+                    let (start, end) = span(value);
+                    if overlap(lifetimes[value], area.life) {
+                        assert!(end <= low || high <= start, "{name}: value {value} in area {at}");
+                    }
+                }
+                for (other, (them, &their)) in areas.iter().zip(&laid.areas).enumerate().skip(at + 1) {
+                    if overlap(area.life, them.life) {
+                        assert!(
+                            high <= their - them.reserve || their + them.bytes <= low,
+                            "{name}: areas {at} and {other}"
+                        );
+                    }
+                }
+            }
+            assert_eq!(laid.temporary_bytes, 0, "{name}: no area is the stage's");
+        }
     }
 
     /// A value the host stages or reads back that the stage's plan does not
