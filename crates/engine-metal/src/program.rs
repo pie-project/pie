@@ -2578,7 +2578,9 @@ mod tests {
                     // state takes without a channel.
                     let state = broadcast(0x9e37_79b9u32 ^ (k * 0x0101_0101), [2])
                         + iota(2) * (k * 7919 + 1);
-                    let pick = gumbel_argmax(&x, &keep, 0.7f32, &state);
+                    // A temperature of 0.7 as the draw takes it: its reciprocal,
+                    // rounded once on the host.
+                    let pick = gumbel_argmax(&x, &keep, 1.0f32 / 0.7f32, &state);
                     draw.put(&reshape(pick, [1]));
                 }
             });

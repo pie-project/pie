@@ -2095,11 +2095,16 @@ inline void m4_gumbel_partial(
     uint tid,
     uint nthreads,
     threadgroup M1ArgmaxCandidate* tgbuf) {
+  #pragma clang fp contract(off)
   device M1ArgmaxCandidate* partials = reinterpret_cast<device M1ArgmaxCandidate*>(temporary);
   const ulong key = ulong(m1_load_u(state, 0, ds.dtype));
   const ulong counter = ulong(ds.len > 1 ? m1_load_u(state, 1, ds.dtype) : 0u);
   const ulong seed = ptir_rng_keyed_seed(uint(key), uint(counter));
-  const float d = m1_load_f(divisor, 0, dd.dtype);
+  // The draw multiplies by its scale (the host's rounded 1 / T), never
+  // divides: a multiply is correctly rounded on every backend. The product
+  // is its own statement and nothing contracts it, so the lane is the
+  // interpreter's two roundings, `logit * scale` then `+ noise`.
+  const float scale = m1_load_f(divisor, 0, dd.dtype);
   const uint span = groups * nthreads;
   const uint begin = group * nthreads + tid;
   for (uint row = 0; row < dl.rows; ++row) {
@@ -2111,7 +2116,8 @@ inline void m4_gumbel_partial(
       if (m1_load_b(keep, m1_pick(dk.len, flat), dk.dtype)) {
         const float uniform = ptir_rng_hash_uniform(seed, flat);
         const float noise = -precise::log(-precise::log(uniform));
-        value = m1_load_f(logits, flat, dl.dtype) / d + noise;
+        const float scaled = m1_load_f(logits, flat, dl.dtype) * scale;
+        value = scaled + noise;
       }
       best = m1_argmax_combine(best, M1ArgmaxCandidate{value, i, isnan(value) ? 0u : 1u, 0u});
     }
@@ -2127,12 +2133,12 @@ inline void m4_gumbel_partial(
   }
 }
 
-// `gumbel_argmax`: each row's index of its largest `logits[i] / divisor +
+// `gumbel_argmax`: each row's index of its largest `logits[i] * scale +
 // gumbel(state, i)`, a lane whose `keep` is false `-inf`. Every lane is
 // made in f32 from its operands and never stored: the noise is lane `i`
 // (the flat index) of `rng_keyed(state, logits' shape, Gumbel)`, made with
 // the same operations as the keyed rng's Gumbel lane, so over f32 logits
-// the draw is bit for bit `reduce_argmax(select(keep, logits / divisor,
+// the draw is bit for bit `reduce_argmax(select(keep, logits * scale,
 // -inf) + rng_keyed(..))`. Ties and NaN as `reduce_argmax`'s.
 inline void m1_gumbel_argmax_mt(
     const device uchar* logits,
@@ -2147,10 +2153,15 @@ inline void m1_gumbel_argmax_mt(
     uint tid,
     uint nthreads,
     threadgroup M1ArgmaxCandidate* tgbuf) {
+  #pragma clang fp contract(off)
   const ulong key = ulong(m1_load_u(state, 0, ds.dtype));
   const ulong counter = ulong(ds.len > 1 ? m1_load_u(state, 1, ds.dtype) : 0u);
   const ulong seed = ptir_rng_keyed_seed(uint(key), uint(counter));
-  const float d = m1_load_f(divisor, 0, dd.dtype);
+  // The draw multiplies by its scale (the host's rounded 1 / T), never
+  // divides: a multiply is correctly rounded on every backend. The product
+  // is its own statement and nothing contracts it, so the lane is the
+  // interpreter's two roundings, `logit * scale` then `+ noise`.
+  const float scale = m1_load_f(divisor, 0, dd.dtype);
   device int* result = reinterpret_cast<device int*>(output);
   for (uint row = 0; row < dl.rows; ++row) {
     const uint base = row * dl.last;
@@ -2161,7 +2172,8 @@ inline void m1_gumbel_argmax_mt(
       if (m1_load_b(keep, m1_pick(dk.len, flat), dk.dtype)) {
         const float uniform = ptir_rng_hash_uniform(seed, flat);
         const float noise = -precise::log(-precise::log(uniform));
-        value = m1_load_f(logits, flat, dl.dtype) / d + noise;
+        const float scaled = m1_load_f(logits, flat, dl.dtype) * scale;
+        value = scaled + noise;
       }
       best = m1_argmax_combine(
           best, M1ArgmaxCandidate{value, i, isnan(value) ? 0u : 1u, 0u});
