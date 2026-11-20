@@ -45,7 +45,18 @@ pub(super) struct Streams<'a> {
     pub producers: Vec<u32>,
     pub direct_topk: &'a [Option<super::fused::TopKDirect>],
     pub order: Vec<usize>,
+    /// Whether each row runs across several blocks of its lane
+    /// ([`super::fused::splits_rows`]): each block streams its stretch of
+    /// the row, its reductions' partials meeting in the row's work before
+    /// every block folds them alike.
+    pub split: bool,
+    /// The meetings the kernel's reductions have emitted so far.
+    pub meets: core::cell::Cell<u32>,
 }
+
+/// The narrowest row a split stream's reduction folds: below it a row's
+/// chunks fit one block well and the meeting costs more than it saves.
+pub(super) const SPLIT_ROW_MIN: u64 = 32_768;
 
 impl<'a> Streams<'a> {
     #[allow(clippy::too_many_arguments)]
@@ -85,6 +96,8 @@ impl<'a> Streams<'a> {
             producers,
             direct_topk,
             order: Vec::new(),
+            split: false,
+            meets: core::cell::Cell::new(0),
         };
         streams.order = streams.emission_order();
         streams
@@ -376,6 +389,25 @@ impl<'a> Streams<'a> {
             }
             _ => None,
         }
+    }
+
+    /// The ops the stream at `at` covers, and whether its rows may split
+    /// across blocks: its members map, broadcast, read the model's row or
+    /// reduce a static row at least [`SPLIT_ROW_MIN`] wide, which a block's
+    /// stretch computes alone or folds after the meeting.
+    pub(super) fn split_safe(&self, at: usize) -> Option<(usize, bool)> {
+        let members = self.plan(at)?;
+        let safe = members.iter().all(|member| match member.role {
+            Role::Map | Role::Broadcast | Role::Intrinsic => true,
+            Role::Reduce | Role::Argmax => self.ops[member.node].args.first().is_some_and(|&arg| {
+                matches!(
+                    self.class(arg),
+                    RowClass::Full(Dimension::Static(width)) if u64::from(width) >= SPLIT_ROW_MIN
+                )
+            }),
+            Role::Rng => false,
+        });
+        Some((members.len(), safe))
     }
 
     fn plan(&self, at: usize) -> Option<Vec<Member>> {
@@ -762,7 +794,8 @@ fn intrinsic_read(streams: &Streams<'_>, node: usize, out: u32, pass: &mut Pass<
         );
         let _ = writeln!(
             p,
-            "    p{node}.intrinsic_row_offset = intrinsic_offsets[intrinsic_index{node}] + lane_row;"
+            "    p{node}.intrinsic_row_offset = intrinsic_offsets[intrinsic_index{node}] + {};",
+            if streams.split { "ptir_row" } else { "lane_row" }
         );
         let _ = writeln!(
             p,
@@ -940,11 +973,24 @@ pub(super) fn emit_stream(
     s.push_str("    const m1_u32 stream_lane = threadIdx.x & 31u;\n");
     s.push_str("    const m1_u32 stream_warp = threadIdx.x >> 5u;\n");
     s.push_str("    const m1_u32 stream_warps = blockDim.x >> 5u;\n");
-    s.push_str("    float* stream_work = reinterpret_cast<float*>(temporary);\n");
+    if streams.split {
+        // The row's reductions' first levels lie in its work, every block's
+        // partials at their chunks; each block folds them in its own area.
+        s.push_str("    float* stream_work = reinterpret_cast<float*>(ptir_row_work);\n");
+        s.push_str("    float* stream_own = reinterpret_cast<float*>(temporary);\n");
+    } else {
+        s.push_str("    float* stream_work = reinterpret_cast<float*>(temporary);\n");
+    }
     let _ = writeln!(
         s,
         "    const m1_u32 stream_width = descriptors[{witness}u].len;"
     );
+    if streams.split {
+        s.push_str("    const m1_u32 stream_lo = ptir_stretch(stream_width, ptir_part, ptir_split);\n");
+        s.push_str(
+            "    const m1_u32 stream_hi = ptir_stretch(stream_width, ptir_part + 1u, ptir_split);\n",
+        );
+    }
 
     let mut needed = vec![false; members.len()];
     for idx in (0..members.len()).rev() {
@@ -1039,7 +1085,8 @@ pub(super) fn emit_stream(
                 let _ = writeln!(pass.body.s, "      const float red{node} = {first};");
                 let _ = writeln!(
                     pass.body.fold_s,
-                    "      if (stream_lane == 0u) stream_work[{slot}u + (stream_base >> 5u)] = red{node};"
+                    "      if (stream_lane == 0u) {};",
+                    work_put(streams.split, &format!("{slot}u + (stream_base >> 5u)"), &format!("red{node}"))
                 );
                 let _ = writeln!(pass.body.pre, "        float red{node}[4];");
                 let _ = writeln!(pass.body.v, "      red{node}[j] = {x};");
@@ -1084,17 +1131,33 @@ pub(super) fn emit_stream(
                 let _ = writeln!(f, "          r0 = {};", combine("r0", "r1"));
                 let _ = writeln!(
                     f,
-                    "          if ((stream_lane & 7u) == 0u && stream_live) stream_work[{slot}u + (i4 >> 5u)] = r0;"
+                    "          if ((stream_lane & 7u) == 0u && stream_live) {};",
+                    work_put(streams.split, &format!("{slot}u + (i4 >> 5u)"), "r0")
                 );
                 let _ = writeln!(f, "        }}");
                 let ptr = (pass.pointer)(out);
                 let _ = writeln!(epilogue, "    __syncthreads();");
                 let _ = writeln!(epilogue, "    {{");
-                let _ = writeln!(
-                    epilogue,
-                    "      const float total = ptir_canonical_reduce({tag}u, stream_work + {slot}u, {chunks}u, stream_work + {}u, stream_work + {slot}u);",
-                    slot + chunks
-                );
+                if streams.split {
+                    // Every block's partials are in: each folds them all in
+                    // the reference's order, so every block holds the
+                    // one-block answer.
+                    let meet = streams.meets.get() + 1;
+                    streams.meets.set(meet);
+                    let _ = writeln!(epilogue, "      ptir_meet(ptir_meet_word, {meet}u * ptir_split);");
+                    let _ = writeln!(
+                        epilogue,
+                        "      const float total = ptir_canonical_reduce_met({tag}u, stream_work + {slot}u, {chunks}u, stream_own + {}u, stream_own + {}u);",
+                        slot + chunks,
+                        slot + chunks + chunks.div_ceil(32)
+                    );
+                } else {
+                    let _ = writeln!(
+                        epilogue,
+                        "      const float total = ptir_canonical_reduce({tag}u, stream_work + {slot}u, {chunks}u, stream_work + {}u, stream_work + {slot}u);",
+                        slot + chunks
+                    );
+                }
                 let _ = writeln!(
                     epilogue,
                     "      if (threadIdx.x == 0u) m1_store_f({ptr}, 0u, total);"
@@ -1130,6 +1193,28 @@ pub(super) fn emit_stream(
                     "      cand{node} = m1_argmax_warp_reduce(cand{node}, stream_lane);"
                 );
                 let ptr = (pass.pointer)(out);
+                if streams.split {
+                    // Each part's candidate to the lane arena; after the
+                    // meeting every block takes the row's best of them, the
+                    // one a block's scan picks (the order is total).
+                    let meet = streams.meets.get() + 1;
+                    streams.meets.set(meet);
+                    let _ = writeln!(
+                        epilogue,
+                        "      if (stream_lane == 0u) ptir_put_candidate(ptir_meet_word, ptir_row, ptir_part, cand{node});"
+                    );
+                    let _ = writeln!(epilogue, "    }}");
+                    let _ = writeln!(epilogue, "    ptir_meet(ptir_meet_word, {meet}u * ptir_split);");
+                    let _ = writeln!(epilogue, "    if (stream_warp == 0u) {{");
+                    let _ = writeln!(
+                        epilogue,
+                        "      cand{node} = stream_lane < ptir_split ? ptir_get_candidate(ptir_meet_word, ptir_row, stream_lane) : M1ArgmaxCandidate{{m1_neg_inf(), 0u, 0u, 0u}};"
+                    );
+                    let _ = writeln!(
+                        epilogue,
+                        "      cand{node} = m1_argmax_warp_reduce(cand{node}, stream_lane);"
+                    );
+                }
                 let _ = writeln!(
                     epilogue,
                     "      if (stream_lane == 0u) m1_store_i({ptr}, 0u, (int)cand{node}.index);"
@@ -1154,11 +1239,18 @@ pub(super) fn emit_stream(
     // Whole warps iterate together, so that a reduction's chunk folds by
     // shuffles: a lane past the row reads the row's last element and keeps
     // what it computes to itself.
+    // A split row's block walks its stretch, from `stream_lo` to `stream_hi`.
+    let (lo, hi) = if streams.split {
+        ("stream_lo + ", "stream_hi")
+    } else {
+        ("", "stream_width")
+    };
     s.push_str("    if (stream_vec) {\n");
-    s.push_str(
-        "      for (m1_u32 stream_base = stream_warp * 128u; stream_base < stream_width; stream_base += blockDim.x * 4u) {\n",
+    let _ = writeln!(
+        s,
+        "      for (m1_u32 stream_base = {lo}stream_warp * 128u; stream_base < {hi}; stream_base += blockDim.x * 4u) {{"
     );
-    s.push_str("        const bool stream_live = stream_base + stream_lane * 4u < stream_width;\n");
+    let _ = writeln!(s, "        const bool stream_live = stream_base + stream_lane * 4u < {hi};");
     s.push_str(
         "        const m1_u32 i4 = stream_live ? stream_base + stream_lane * 4u : stream_width - 4u;\n",
     );
@@ -1172,10 +1264,11 @@ pub(super) fn emit_stream(
     s.push_str(&body.fold_v);
     s.push_str("      }\n");
     s.push_str("    } else {\n");
-    s.push_str(
-        "    for (m1_u32 stream_base = stream_warp * 32u; stream_base < stream_width; stream_base += blockDim.x) {\n",
+    let _ = writeln!(
+        s,
+        "    for (m1_u32 stream_base = {lo}stream_warp * 32u; stream_base < {hi}; stream_base += blockDim.x) {{"
     );
-    s.push_str("      const bool stream_live = stream_base + stream_lane < stream_width;\n");
+    let _ = writeln!(s, "      const bool stream_live = stream_base + stream_lane < {hi};");
     s.push_str(
         "      const m1_u32 i = stream_live ? stream_base + stream_lane : stream_width - 1u;\n",
     );
@@ -1350,4 +1443,19 @@ pub fn spent_values(stage: &CompiledStage, region: &Region) -> Vec<u32> {
         at += members.len() - 1;
     }
     spent
+}
+
+/// A reduction's chunk partial stored at `at` of the row's work. Where the
+/// row is split across blocks the others read it after the meeting
+/// (`ptir_canonical_reduce_met`): stored at the device's coherence point
+/// (`M1_LANE_PUT32`, agent scope), where every block's reads look, not in
+/// the writing block's cache. On a device whose last-level caches are not
+/// coherent with each other (MI300X's eight XCDs) a plain store waits there
+/// unseen.
+fn work_put(split: bool, at: &str, value: &str) -> String {
+    if split {
+        format!("M1_LANE_PUT32(reinterpret_cast<m1_u32*>(stream_work + ({at})), __float_as_uint({value}))")
+    } else {
+        format!("stream_work[{at}] = {value}")
+    }
 }
