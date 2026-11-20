@@ -849,6 +849,14 @@ impl<B: Backend> Pools<B> {
         Ok((pages, record))
     }
 
+    /// `pages` rs-list slot refs any lane may take, as
+    /// [`Pools::walk_refs`] names the kv list's: a bind-only fire reads and
+    /// writes none of them.
+    pub fn walk_rs_refs(&self, pages: u32) -> Result<Vec<u32>> {
+        let per_chunk = self.shape(RS)?.per_chunk.max(1);
+        Ok((0..pages).map(|at| per_chunk + at % per_chunk).collect())
+    }
+
     /// The physical page explicit write descriptor page `page` names.
     pub fn kv_page(&self, page: u32) -> Result<u32> {
         self.units(LIST, page)

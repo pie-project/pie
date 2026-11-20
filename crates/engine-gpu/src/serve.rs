@@ -834,6 +834,8 @@ pub struct Shell<B: Serve> {
 
     rs_buffers: Option<crate::rs::Buffers>,
 
+    rs_held: Option<crate::rs::Reservation<B>>,
+
     out: Option<ValueId>,
     readouts: Vec<ReadoutPlane>,
     feeds: poem_exec::feeds::Feeds,
@@ -1289,7 +1291,6 @@ impl<B: Serve> Shell<B> {
                 &rung_tokens,
                 least,
                 &tuning,
-                rs_layout.as_deref(),
             )?;
             // A capturing lane's row is as wide as the load's context, in its
             // pages: the widths the span lays its rows at.
@@ -1839,6 +1840,22 @@ impl<B: Serve> Shell<B> {
         let readout = (0..arms)
             .map(|_| B::Buffer::host(&device, readout_bytes, crate::books::owners::READOUT))
             .collect::<Result<Vec<_>>>()?;
+        // The recurrent planes and work plane, for the top rung's rows and
+        // lanes: reservations of their own beside the span
+        // ([`crate::rs::Reservation`]).
+        let rs_held = match rs_layout.as_deref() {
+            Some(layout) => {
+                let top = span.rungs().last().map_or(1, |rung| rung.tokens);
+                Some(crate::rs::Reservation::lay(
+                    &device,
+                    layout,
+                    top.saturating_mul(2),
+                    top.min(boot.budget.max_lanes),
+                    device.max_buffer(),
+                )?)
+            }
+            None => None,
+        };
 
         // Every reservation the load makes beside the pool is made before
         // the pool is sized, so the pool is sized past them: the weight row
@@ -2049,6 +2066,7 @@ impl<B: Serve> Shell<B> {
             snaps: None,
             last_capture: None,
             rs_buffers,
+            rs_held,
             out,
             readouts,
             feeds,
@@ -4681,8 +4699,8 @@ impl<B: Serve> Shell<B> {
             voxels: bound.voxels,
             capture: bound.capture,
             rs: if rs_active {
-                let (Some(layout), Some(buffers), Some(room)) =
-                    (&self.rs_layout, &self.rs_buffers, self.span.rs_room(rung)?)
+                let (Some(layout), Some(buffers), Some(held)) =
+                    (&self.rs_layout, &self.rs_buffers, &self.rs_held)
                 else {
                     return Err(Fault::Unbound {
                         what: "the recurrent seat of a fire whose plan buffers nothing".to_string(),
@@ -4700,7 +4718,7 @@ impl<B: Serve> Shell<B> {
                     layout,
                     buffers,
                     self.pools.segments(&self.handles)?,
-                    room,
+                    held,
                     rs_plans,
                     replay,
                     commit,
@@ -5862,6 +5880,13 @@ struct NamingLane<B: Serve> {
     /// Where it names its slots by ref, its pages and its record (the null
     /// record, ref 0 a piece), as a fire of more lanes than seats names them.
     by_ref: Option<(Vec<u32>, Vec<u32>)>,
+    /// Its recurrent verb: the bind walk's rs lanes buffer their rows
+    /// (`RsVerb::Buffer`), so the committed scans bind as a speculative
+    /// fire's do.
+    rs: engine::fire::RsVerb,
+    /// The rows it holds before its own (its first row's position), which
+    /// an rs lane folded at 0 replays from its buffer.
+    carried: u32,
 }
 
 struct NamingMedia {
@@ -5911,9 +5936,10 @@ fn lane_views<B: Serve>(
             inputs: &lane.inputs,
             reads: &lane.reads,
             refs: lane.by_ref.is_some(),
-            held: lane.by_ref.as_ref().map(|_| 0),
+            held: lane.by_ref.as_ref().map(|_| lane.carried),
             pages: lane.by_ref.as_ref().map_or(&[][..], |(pages, _)| pages),
             record: lane.by_ref.as_ref().map(|(_, record)| record.as_slice()),
+            rs: &lane.rs,
             ..Seated::of(Lane {
                 slot: at as u32,
                 word: lane.word,
@@ -6012,24 +6038,63 @@ impl<B: Serve> Shell<B> {
                 }
             }
         }
+        // Where the trace buffers a recurrence, a lane buffering its rows at
+        // each power of two of rows: the committed scans bind the rung's
+        // recurrent planes, which every speculative fire of the rung binds.
+        // Its lanes buffer a page of rows each, as speculative lanes buffer
+        // few, so a rung's rows spread over as many lanes as they take. A
+        // rung's fires extend past half its tokens and up to twice them, so
+        // each rung is walked at the least rows that choose it and at its
+        // tokens (a scan's kernel follows the rows), and once with a lane
+        // replaying a page it carries (the buffer's rows gathered back).
+        let rs_shapes = shapes.len();
+        let mut carried = vec![0u32; shapes.len()];
+        if let Some(rs) = self
+            .rs_buffers
+            .as_ref()
+            .filter(|_| self.rs_layout.is_some())
+        {
+            let page = u64::from(rs.page_tokens());
+            for class in (0..self.compiled.classes.classes.len()).filter(|&c| !self.captures(c)) {
+                let mut tokens = 1u64;
+                while tokens <= u64::from(top) {
+                    for rows in [tokens / 2 + 1, tokens] {
+                        let lanes = rows.div_ceil(page).min(u64::from(lanes_cap)).max(1);
+                        shapes.push(
+                            (0..lanes)
+                                .map(|at| {
+                                    let own = spread(rows, lanes, at);
+                                    (class, u32::try_from(own).unwrap_or(u32::MAX))
+                                })
+                                .collect(),
+                        );
+                        carried.push(0);
+                    }
+                    tokens = tokens.saturating_mul(2);
+                }
+                shapes.push(vec![(class, 1)]);
+                carried.push(u32::try_from(page).unwrap_or(u32::MAX));
+            }
+        }
         let depth = self.arms.depth();
         tracing::info!(
             top,
             seats,
             lanes_cap,
             shapes = shapes.len(),
+            rs_shapes = shapes.len() - rs_shapes,
             arms = depth,
             rungs = ?self.span.rungs().iter().map(|rung| rung.tokens).collect::<Vec<_>>(),
             "the bind walk's fire shapes"
         );
         let mut walked = 0u64;
-        for lanes in &shapes {
+        for (at, lanes) in shapes.iter().enumerate() {
             // Every arm: each walk holds its arm until the shape has taken
             // them all, then gives them back.
             let mut taken = Vec::with_capacity(depth);
             let mut fault = None;
             for _ in 0..depth {
-                match self.bind_fire(lanes) {
+                match self.bind_fire(lanes, (at >= rs_shapes).then_some(carried[at])) {
                     Ok(arm) => {
                         // A bind-only fire settles nothing, which is where
                         // a fire takes its arm: the walk takes it, so the
@@ -6055,18 +6120,44 @@ impl<B: Serve> Shell<B> {
     }
 
     /// One fire of `lanes`, each `(class, rows)`, staged and walked
-    /// bind-only; the arm it took.
-    fn bind_fire(&mut self, lanes: &[(usize, u32)]) -> Result<usize> {
+    /// bind-only, its lanes buffering their rows where `rs` states the rows
+    /// each carries ahead of its own; the arm it took.
+    fn bind_fire(&mut self, lanes: &[(usize, u32)], rs: Option<u32>) -> Result<usize> {
         let owned = lanes
             .iter()
             .map(|&(class, rows)| {
                 let mut lane = self.naming_lane(class, rows)?;
-                if lanes.len() > self.held.len() {
+                let carried = rs.unwrap_or(0);
+                if rs.is_some() || lanes.len() > self.held.len() {
                     // Refs the pool takes as any lane's: a bind-only fire
                     // reads and writes none, and a load need lay no seat
                     // runs ([`Pools::walk_refs`]).
                     let page = self.pools.paging().page_size.max(1);
-                    lane.by_ref = Some(self.pools.walk_refs(rows.div_ceil(page).max(1))?);
+                    let held = (rows + carried).div_ceil(page).max(1);
+                    lane.by_ref = Some(self.pools.walk_refs(held)?);
+                }
+                if rs.is_some() {
+                    lane.carried = carried;
+                    // A masked class's mask reaches the rows it carries too.
+                    if lane.mask.is_some() {
+                        let extent = rows + carried;
+                        lane.mask = Some(Masking::Extent(engine::fire::Mask::new(
+                            vec![0, extent],
+                            u64::from(extent),
+                        )));
+                    }
+                    // A fresh lane buffering its own rows and carrying none,
+                    // its rs pages refs as its kv pages are.
+                    let page = self.rs_buffers.as_ref().map_or(1, |rs| rs.page_tokens());
+                    lane.rs = engine::fire::RsVerb::Buffer {
+                        pages: self
+                            .pools
+                            .walk_rs_refs((rows + carried).div_ceil(page).max(1))?,
+                        base: 0,
+                        folded: 0,
+                        fold: engine::fire::FoldLen::Host(0),
+                        lineage: engine::fire::Lineage::Set,
+                    };
                 }
                 Ok(lane)
             })
@@ -6213,6 +6304,8 @@ impl<B: Serve> Shell<B> {
                 .map(|plane| plane.output.clone())
                 .collect(),
             by_ref: None,
+            rs: engine::fire::RsVerb::Fold,
+            carried: 0,
         })
     }
 
