@@ -1,5 +1,3 @@
-#![allow(unsafe_code)]
-
 /// A prologue that takes or puts a channel commits before its fire's forward.
 fn container_prologue_moves(container: &eta_ir::container::TraceContainer) -> bool {
     use eta_ir::op::ChannelUse;
@@ -4568,12 +4566,10 @@ pub(crate) mod lifecycle_tests {
         if failed {
             completion.reject("test callback failure");
         } else {
-            // SAFETY: `completion` is borrowed for the whole call and owns this
-            // terminal cell, so the pointer is live; `publish` is an atomic store.
-            unsafe {
-                (*completion.terminal_cell_ptr().0)
-                    .publish(crate::engine::completion::TERMINAL_OUTCOME_SUCCESS);
-            }
+            completion
+                .terminal_cell_ptr()
+                .0
+                .publish(crate::engine::completion::TERMINAL_OUTCOME_SUCCESS);
             completion
                 .resolve_from_terminal()
                 .expect("publish successful completion");
