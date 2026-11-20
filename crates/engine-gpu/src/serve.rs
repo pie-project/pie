@@ -1323,7 +1323,7 @@ impl<B: Serve> Shell<B> {
         let row_tile: engine::roofline::RowTile = {
             let dense = std::sync::Arc::clone(&dense);
             std::sync::Arc::new(move |m, n, k| {
-                kernels_slang::linear::gemm::tile_for(B::TARGET, dense.at(m), n, k).row_tile()
+                kernels_slang::linear::gemm::tile_for(B::TARGET, dense.at(m, n, k), n, k).row_tile()
             })
         };
         let mut chosen: Option<engine::load::TopRung> = None;
@@ -1591,13 +1591,21 @@ impl<B: Serve> Shell<B> {
             // past it; a check's load lays on past it.
             if let (Some(counts), None) = (counts.as_ref(), chosen.as_ref()) {
                 let launches = u32::try_from(compiled.template().len()).unwrap_or(u32::MAX);
+                // The most any plane's tactic pads a fire of the rows to.
                 let padded = |rows: u32| {
-                    kernels_slang::linear::gemm::padded_rows(
-                        B::TARGET,
-                        dense.at(rows),
-                        rows,
-                        counts.width,
-                    )
+                    dense
+                        .tactics_at(rows)
+                        .into_iter()
+                        .map(|tactic| {
+                            kernels_slang::linear::gemm::padded_rows(
+                                B::TARGET,
+                                tactic,
+                                rows,
+                                counts.width,
+                            )
+                        })
+                        .max()
+                        .unwrap_or(rows)
                 };
                 // Each rung's span, the live range's share it takes; its
                 // other reservations bind it only through `why`.
@@ -2260,7 +2268,9 @@ impl<B: Serve> Shell<B> {
         let budget = budget.unwrap_or_else(|| {
             let pages =
                 u64::from(seats) * u64::from(context).div_ceil(u64::from(paging.page_size.max(1)));
-            let per_list = layout.list.map_or(1, |list| u64::from(list.per_chunk.max(1)));
+            let per_list = layout
+                .list
+                .map_or(1, |list| u64::from(list.per_chunk.max(1)));
             engine::disk::unstated_budget(
                 dir,
                 0,

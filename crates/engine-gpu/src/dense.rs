@@ -24,44 +24,76 @@ use engine::roofline::Constants;
 use kernels_slang::Target;
 use kernels_slang::linear::gemm::{self, Tactic};
 
-/// The tactic a matmul of some rows runs.
+/// The tactic a matmul of some rows runs: at each of the model's planes its
+/// own pick, else the pick weighed over the model's planes together.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Dense {
     /// `(rows, tactic)`, ascending: a rung's top and its tactic where fires
-    /// are recorded a rung, else every row count to the top.
+    /// are recorded a rung, else every row count to the top; weighed over
+    /// every plane together (a plane of none of `planes`' shapes).
     by_rows: Vec<(u32, Tactic)>,
+    /// Each plane's own `(n, k)` and its `by_rows`, weighed at it alone.
+    planes: Vec<((u32, u32), Vec<(u32, Tactic)>)>,
+}
+
+/// The tactic of `by_rows` (ascending) a matmul of `rows` runs: that of the
+/// fewest rows stated that hold them, the most past them all.
+fn at_rows(by_rows: &[(u32, Tactic)], rows: u32) -> Tactic {
+    by_rows
+        .iter()
+        .find(|&&(at, _)| at >= rows)
+        .or(by_rows.last())
+        .map(|&(_, tactic)| tactic)
+        .expect("a load has one rung at least")
+}
+
+/// `by_rows` said compactly: `rows-rows name` for every run of one tactic.
+fn runs_of(by_rows: &[(u32, Tactic)]) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut from = 1;
+    for (i, &(rows, tactic)) in by_rows.iter().enumerate() {
+        if by_rows.get(i + 1).is_none_or(|&(_, next)| next != tactic) {
+            out.push(format!("{from}-{rows} {}", name(&tactic)));
+            from = rows + 1;
+        }
+    }
+    out.join(", ")
 }
 
 impl Dense {
-    /// The tactic each run of row counts takes, said compactly: `rows-rows
-    /// name` for every run of one tactic, ascending.
+    /// The tactic each run of row counts takes at each plane, said
+    /// compactly: `n x k: rows-rows name, ...; ...`.
     #[must_use]
     pub fn runs(&self) -> String {
-        let mut out: Vec<String> = Vec::new();
-        let mut from = 1;
-        for (i, &(rows, tactic)) in self.by_rows.iter().enumerate() {
-            let last = self
-                .by_rows
-                .get(i + 1)
-                .is_none_or(|&(_, next)| next != tactic);
-            if last {
-                out.push(format!("{from}-{rows} {}", name(&tactic)));
-                from = rows + 1;
-            }
-        }
-        out.join(", ")
+        self.planes
+            .iter()
+            .map(|((n, k), by_rows)| format!("{n}x{k}: {}", runs_of(by_rows)))
+            .collect::<Vec<_>>()
+            .join("; ")
     }
 
-    /// The tactic a matmul of `rows` runs: that of the fewest rows stated
-    /// that hold them (its rung's, or its own), the most past them all.
+    /// The tactic a matmul of `rows` over an `n x k` plane runs: the
+    /// plane's own pick, else the pick over the model's planes together.
     #[must_use]
-    pub fn at(&self, rows: u32) -> Tactic {
-        self.by_rows
-            .iter()
-            .find(|&&(at, _)| at >= rows)
-            .or(self.by_rows.last())
-            .map(|&(_, tactic)| tactic)
-            .expect("a load has one rung at least")
+    pub fn at(&self, rows: u32, n: u32, k: u32) -> Tactic {
+        match self.planes.iter().find(|(at, _)| *at == (n, k)) {
+            Some((_, by_rows)) => at_rows(by_rows, rows),
+            None => at_rows(&self.by_rows, rows),
+        }
+    }
+
+    /// Every tactic a fire of `rows` runs at some plane: what its rows are
+    /// padded for (the most any of them pads).
+    #[must_use]
+    pub fn tactics_at(&self, rows: u32) -> Vec<Tactic> {
+        let mut all = vec![at_rows(&self.by_rows, rows)];
+        for (_, by_rows) in &self.planes {
+            let tactic = at_rows(by_rows, rows);
+            if !all.contains(&tactic) {
+                all.push(tactic);
+            }
+        }
+        all
     }
 }
 
@@ -245,6 +277,38 @@ pub fn choose(
     planes: &[(u32, u32, u32, f64)],
     records: bool,
 ) -> Result<(Dense, Vec<Weighed>), &'static str> {
+    let (by_rows, weighed) = pick(target, rungs, &tiled, rates, planes, records)?;
+    // Each plane its own pick, by its own curves (a kernel beaten at one
+    // plane, an output head's, may win another): a plane no kernel was timed
+    // at takes the pick over every plane together.
+    let mut own: Vec<((u32, u32), Vec<(u32, Tactic)>)> = Vec::new();
+    for plane @ &(n, k, ..) in planes {
+        if own.iter().any(|(at, _)| *at == (n, k)) {
+            continue;
+        }
+        if let Ok((by_rows, _)) = pick(target, rungs, &tiled, rates, &[*plane], records) {
+            own.push(((n, k), by_rows));
+        }
+    }
+    Ok((
+        Dense {
+            by_rows,
+            planes: own,
+        },
+        weighed,
+    ))
+}
+
+/// [`choose`] over `planes` together: one tactic a rung (or a row count)
+/// for all of them, and each rung's weighing.
+fn pick(
+    target: Target,
+    rungs: &[u32],
+    tiled: &dyn Fn(u32) -> Tactic,
+    rates: &profile::fire::Rates,
+    planes: &[(u32, u32, u32, f64)],
+    records: bool,
+) -> Result<(Vec<(u32, Tactic)>, Vec<Weighed>), &'static str> {
     let c = Constants::of(rates)?;
     let curves = rates.kernel_tflops_by_shape.as_deref().ok_or(UNREACHED)?;
     // The candidates at `kernel_rows` (a rung's, or a fire's own): each
@@ -266,14 +330,6 @@ pub fn choose(
     // measured row counts in log rows; below the first row count timed, that
     // count's time (a kernel takes no less for fewer rows than it was timed
     // at, so its rate there is not held).
-    //
-    // Past a vector kernel's stop as beaten at a plane
-    // (`KernelCurve::BEATEN`: slower there than twice a tiled kernel), its
-    // time at its last rows grown with the rows: what that stop rests on (a
-    // vector kernel's time grows at least as its rows do, a weight pass for
-    // every workgroup's rows), so a floor on its time, never below it. The
-    // kernel stays a candidate: beaten at one plane (an output head's), it
-    // may still win the model's planes together.
     let time_at = |tactic: Tactic, n: u32, k: u32, rows: u32| -> Option<f64> {
         let (kind, key) = crate::rates::curve_key(target, tactic, n, k);
         let found = curves.iter().find(|c| c.id() == (kind, key, n, k))?;
@@ -284,11 +340,7 @@ pub fn choose(
             profile::fire::interpolate(curve, f64::from(at)).map(|t| flops / (t * 1e3))
         };
         if rows > most {
-            let beaten =
-                matches!(found.stop, Some((_, why)) if why == profile::fire::KernelCurve::BEATEN);
-            return (beaten && tactic.vector > 0)
-                .then(|| time(most).map(|t| t * f64::from(rows) / f64::from(most)))
-                .flatten();
+            return None;
         }
         time(rows.max(first))
     };
@@ -361,7 +413,7 @@ pub fn choose(
         });
         below = rung;
     }
-    Ok((Dense { by_rows }, weighed))
+    Ok((by_rows, weighed))
 }
 
 #[cfg(test)]
@@ -489,14 +541,14 @@ mod tests {
         assert!(vector[..4].iter().all(|&v| v), "{weighed:?}");
         assert!(vector[9..].iter().all(|&v| !v), "{weighed:?}");
         for (i, &rows) in rungs.iter().enumerate() {
-            assert_eq!(dense.at(rows).vector > 0, vector[i]);
+            assert_eq!(dense.at(rows, 4096, 4096).vector > 0, vector[i]);
             assert_eq!(
-                dense.at(rows.div_ceil(2) + 1).vector > 0,
+                dense.at(rows.div_ceil(2) + 1, 4096, 4096).vector > 0,
                 vector[i],
                 "{rows}"
             );
         }
-        assert!(dense.at(3).vector > 0);
+        assert!(dense.at(3, 4096, 4096).vector > 0);
         assert!(
             weighed[2].to_string().starts_with("rung 4: gemv x"),
             "{}",
@@ -530,7 +582,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            dense.at(200).wide && dense.at(200).vector == 0,
+            dense.at(200, 4096, 4096).wide && dense.at(200, 4096, 4096).vector == 0,
             "{weighed:?}"
         );
         assert_eq!(weighed[1].costs.len(), gemm::VECTOR_ROWS.len() + 2);
@@ -573,7 +625,7 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!(dense.at(1).vector, 0);
+        assert_eq!(dense.at(1, 4096, 4096).vector, 0);
     }
 
     /// Each kernel is weighed at the model's own planes: where the narrow
@@ -624,7 +676,7 @@ mod tests {
         };
         let (dense, weighed) =
             choose(Target::Wgsl, &[512], tiled, &r, &planes(&model, None), true).unwrap();
-        let at = dense.at(512);
+        let at = dense.at(512, 1024, 3072);
         assert!(at.vector == 0 && !at.wide, "{}", weighed[0]);
     }
 
@@ -658,7 +710,7 @@ mod tests {
                 .min_by(|a, b| a.2.total_cmp(&b.2))
                 .map(|c| c.0)
                 .unwrap();
-            assert_eq!(eager.at(rows), fastest, "{rows}");
+            assert_eq!(eager.at(rows, 4096, 4096), fastest, "{rows}");
         }
     }
 
@@ -712,15 +764,14 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(eager.at(3).vector, 1);
+        assert_eq!(eager.at(3, 4096, 4096).vector, 1);
     }
 
-    /// A vector kernel beaten at one plane (an output head's) stays a
-    /// candidate past its stop, priced there at its last time grown with the
-    /// rows: it still takes the rungs where it wins the model's planes
-    /// together.
+    /// Each plane takes its own kernel at a rung: the vector kernel the
+    /// layers' planes it wins, the tile the head where the vector kernel was
+    /// beaten (or stopped by the bound).
     #[test]
-    fn a_vector_kernel_beaten_at_one_plane_stays_a_candidate() {
+    fn each_plane_takes_its_own_kernel_at_one_rung() {
         let tiled = |_| Tactic {
             tier: Tier::Subgroup,
             vector: 0,
@@ -783,8 +834,12 @@ mod tests {
         };
         let (dense, weighed) =
             choose(Target::Wgsl, &[128], tiled, &r, &planes(&model, None), true).unwrap();
-        assert_eq!(dense.at(128).vector, 16, "{}", weighed[0]);
-        // Stopped for another reason it is no candidate past its stop.
+        // At one rung the layers' planes take the vector kernel and the head,
+        // where it was beaten, the tile.
+        assert_eq!(dense.at(128, 1024, 1024).vector, 16, "{}", dense.runs());
+        assert_eq!(dense.at(128, 8192, 1024).vector, 0, "{}", dense.runs());
+        let _ = weighed;
+        // Stopped by the bound at the head instead: the same.
         curves[3].stop = Some((64, profile::fire::KernelCurve::BOUND));
         let r = profile::fire::Rates {
             kernel_tflops_by_shape: Some(curves),
@@ -792,7 +847,8 @@ mod tests {
         };
         let (dense, weighed) =
             choose(Target::Wgsl, &[128], tiled, &r, &planes(&model, None), true).unwrap();
-        assert_eq!(dense.at(128).vector, 0, "{}", weighed[0]);
+        assert_eq!(dense.at(128, 1024, 1024).vector, 16, "{}", weighed[0]);
+        assert_eq!(dense.at(128, 8192, 1024).vector, 0, "{}", weighed[0]);
     }
 
     /// Below the first row count a kernel was timed at it takes that count's
@@ -860,9 +916,9 @@ mod tests {
             true,
         )
         .unwrap();
-        assert!(!dense.at(256).wide, "{weighed:?}");
+        assert!(!dense.at(256, 4096, 4096).wide, "{weighed:?}");
         for rows in [512, 1024] {
-            assert!(dense.at(rows).wide, "{rows}: {weighed:?}");
+            assert!(dense.at(rows, 4096, 4096).wide, "{rows}: {weighed:?}");
         }
         assert!(weighed[1].costs.iter().all(|c| c.0.wide || c.0.vector > 0));
         // No kernel timed at 8192 rows: the rung keeps 4096's; alone, it is
@@ -876,7 +932,7 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!(dense.at(8192), dense.at(4096));
+        assert_eq!(dense.at(8192, 4096, 4096), dense.at(4096, 4096, 4096));
         assert!(
             weighed[1].held && weighed[1].to_string().contains("held"),
             "{}",
