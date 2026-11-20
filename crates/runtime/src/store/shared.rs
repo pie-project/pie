@@ -2156,6 +2156,10 @@ impl SharedPool {
         let lowered = self.lower_rung(rung).map(|_| ());
         if lowered.is_err() {
             let _ = self.tell(rung);
+        } else {
+            // The engine gave back its carve above the rung it holds now:
+            // the span there is the state's to take.
+            self.pool.engine_narrowed();
         }
         lowered
     }
@@ -2181,7 +2185,16 @@ impl SharedPool {
             return Ok(self.tell(rung));
         }
         self.pool.set_rung(rung).map_err(RungError::Pool)?;
-        Ok(self.tell(rung))
+        let notice = self.tell(rung);
+        // Told the lower (its notice rides the engine's lane ahead of any
+        // copy or fire of state placed after it), the engine gives back its
+        // carve above the rung: the span there is lent. Not told (the rung
+        // standing, a guest term given back), its carve stays as wide, and
+        // no state opens in it ([`SlotPool::engine_narrowed`]).
+        if notice.is_some() {
+            self.pool.engine_narrowed();
+        }
+        Ok(notice)
     }
 
     // ---- segments ----

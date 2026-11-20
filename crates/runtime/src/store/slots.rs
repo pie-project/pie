@@ -523,6 +523,16 @@ pub struct SlotPool {
     shapes: Vec<ShapeState>,
     act_chunks: Vec<(u32, u32)>,
     act: u32,
+    /// The activation chunks the engine may still back for fires: where
+    /// the span is backed on demand, the widest activation set aside since
+    /// the engine last narrowed its carve ([`Self::engine_narrowed`]). No
+    /// state opens there: a lower the engine was not told (the rung
+    /// standing, a guest term given back) left its carve as wide as
+    /// before, and state lent into it was refused at its first copy (Mac
+    /// Pro at 5 GiB on 5aa45805b: an eviction's copy of chunk 1936, inside
+    /// the engine's carve, refused, and the process failed). Elsewhere it
+    /// is the activation itself.
+    carved: u32,
     /// What a fire takes for the guest programs it carries, on top of
     /// every rung's activation ([`Self::act_chunks`]): the term of the
     /// pairs that can be in a fire ([`::engine::GuestTerm`]).
@@ -698,6 +708,7 @@ impl SlotPool {
             shapes: facts.shapes.into_iter().map(ShapeState::new).collect(),
             act_chunks,
             act: 0,
+            carved: 0,
             fire: ::engine::GuestTerm::default(),
             standing: 0,
             readout_row_bytes: 0,
@@ -1032,7 +1043,7 @@ impl SlotPool {
     /// State chunks lie at physical ids below this: the activation of the
     /// current rung takes the rest.
     pub fn state_limit(&self) -> u32 {
-        self.total - self.act
+        self.total - self.act.max(self.carved)
     }
 
     /// Committed segments below the top span: what `commit_segments(n)`
@@ -1078,8 +1089,26 @@ impl SlotPool {
     }
 
     fn set_act(&mut self, act: u32) {
-        let (was, now) = (self.state_limit(), self.total - act);
+        let was = self.state_limit();
         self.act = act;
+        self.carved = if self.span_on_demand {
+            self.carved.max(act)
+        } else {
+            act
+        };
+        let now = self.state_limit();
+        for chunk in was.min(now)..was.max(now) {
+            self.reopen(chunk);
+        }
+    }
+
+    /// The engine narrowed its carve to the activation set aside now (a
+    /// lower's notice landed, `Engine::set_rung`): the span above it opens
+    /// for state ([`Self::carved`]).
+    pub fn engine_narrowed(&mut self) {
+        let was = self.state_limit();
+        self.carved = self.act;
+        let now = self.state_limit();
         for chunk in was.min(now)..was.max(now) {
             self.reopen(chunk);
         }
@@ -1458,6 +1487,8 @@ impl SlotPool {
         }
         self.fences.retain(|_, chunks| !chunks.is_empty());
         self.set_act(act);
+        // The engine refused it: its carve is the one it held.
+        self.engine_narrowed();
     }
 
     /// Moves a held chunk onto free physical chunk `step.to`, as the
@@ -3327,6 +3358,25 @@ mod tests {
                 ],
             );
         }
+    }
+
+    /// Mac Pro at 5 GiB on 5aa45805b: an eviction's copy of state in chunk
+    /// 1936 refused, "inside the activation span's backed carve", and the
+    /// process failed. With the span backed on demand, a lower the engine
+    /// is not told leaves its carve as wide as before: the chunks it gave
+    /// back to the rung open for no state until the engine narrows.
+    #[test]
+    fn no_state_opens_where_the_engine_s_carve_still_lies() {
+        let fixed = [(ShapeKind::Fixed, 4)];
+        let mut facts = facts_with(16, 4, 4, &fixed, &[(16, 2), (256, 6)]);
+        facts.span_on_demand = true;
+        let mut pool = SlotPool::new(facts);
+        pool.set_rung(256).expect("the wide rung");
+        let wide = pool.state_limit();
+        pool.set_rung(16).expect("lowered, the engine not told");
+        assert_eq!(pool.state_limit(), wide, "its carve still lies there: nothing lent");
+        pool.engine_narrowed();
+        assert_eq!(pool.state_limit(), 16 - 2, "narrowed: the span is lent");
     }
 
     /// Mac Pro at 5 GiB on 1e87ab171: the planner read a run of four free
