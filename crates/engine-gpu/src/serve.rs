@@ -916,7 +916,9 @@ impl<B: Serve> Shell<B> {
         // is chosen by (`crate::dense`), for the naming walk and the load
         // alike.
         if tuning.profile().rates().complete(&crate::rates::KEYS) {
-            let shapes: Vec<(u32, u32)> = crate::dense::planes(&crate::top::counts(&boot.trace)?)
+            let multiplied = crate::dense::multiplied(&boot.trace);
+            let counts = crate::top::counts(&boot.trace)?;
+            let shapes: Vec<(u32, u32)> = crate::dense::planes(&counts, Some(&multiplied))
                 .into_iter()
                 .map(|(n, k, ..)| (n, k))
                 .collect();
@@ -1266,7 +1268,7 @@ impl<B: Serve> Shell<B> {
                 &rungs,
                 |rows| tuning.gemm(tier, rows),
                 &device_profile.rates(),
-                counts,
+                &crate::dense::planes(counts, Some(&crate::dense::multiplied(&boot.trace))),
                 B::RECORDS,
             )
             .map_err(|key| {

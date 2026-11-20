@@ -147,16 +147,28 @@ pub fn keys_at(max_submit: Option<std::time::Duration>) -> Vec<&'static str> {
 /// Vulkan's 1024, and the narrower a phone's room leaves).
 pub const PREFIX_ROWS: [u32; 4] = [128, 256, 512, 1024];
 
-/// The rows each dense kernel is timed at at a shape
-/// (`profile::fire::Rates::kernel_tflops_by_shape`): every power of two from
-/// one row to `top`, then `top`, the most rows a fire of the load may bring,
-/// so no kernel is weighed past the rows it was timed at.
+/// The rows a load's rungs lie at: every power of two from one row to
+/// `top`, then `top`, the most rows a fire of the load may bring.
 fn kernel_rows(top: u32) -> Vec<u32> {
     let top = top.max(1);
     let mut rows = engine::memory::rungs(1, top);
     if rows.last() != Some(&top) {
         rows.push(top);
     }
+    rows
+}
+
+/// The rows each dense kernel is timed at at a shape
+/// (`profile::fire::Rates::kernel_tflops_by_shape`): every power of four
+/// from one row to `top`, then `top`, so no kernel is weighed past the rows
+/// it was timed at; a rung between two is read between them, in log rows
+/// (`crate::dense`).
+fn timed_rows(top: u32) -> Vec<u32> {
+    let top = top.max(1);
+    let mut rows: Vec<u32> = std::iter::successors(Some(1u32), |&r| r.checked_mul(4))
+        .take_while(|&r| r < top)
+        .collect();
+    rows.push(top);
     rows
 }
 
@@ -268,16 +280,19 @@ fn operands_fit(m: u32, n: u32, k: u32, largest: u64) -> bool {
 /// ratio (a fire takes no less time for more rows), the first's `first`; no
 /// point fires without one. The curve stops at the first point whose
 /// operands `fit` refuses ([`profile::fire::KernelCurve::BUFFER`]) or whose
-/// fire the bound refuses ([`profile::fire::KernelCurve::BOUND`]): its
-/// points as measured, and where and why it stopped.
+/// fire the bound refuses ([`profile::fire::KernelCurve::BOUND`]), or past
+/// the first point `beaten` says the kernel can no longer win from (its rows
+/// and time; [`profile::fire::KernelCurve::BEATEN`]): its points as
+/// measured, and where and why it stopped.
 fn curve_of(
     rows: &[u32],
     first: f64,
     fit: impl Fn(u32) -> bool,
+    beaten: impl Fn(u32, f64) -> bool,
     mut time: impl FnMut(u32, f64) -> Result<Option<f64>>,
 ) -> Result<(Vec<(u32, f64)>, Option<(u32, u32)>)> {
     let mut points: Vec<(u32, f64)> = Vec::new();
-    for &m in rows {
+    for (i, &m) in rows.iter().enumerate() {
         if !fit(m) {
             return Ok((points, Some((m, profile::fire::KernelCurve::BUFFER))));
         }
@@ -287,6 +302,11 @@ fn curve_of(
         match time(m, estimate)? {
             Some(ns) => points.push((m, ns)),
             None => return Ok((points, Some((m, profile::fire::KernelCurve::BOUND)))),
+        }
+        if let (Some(&next), Some(&(at, ns))) = (rows.get(i + 1), points.last())
+            && beaten(at, ns)
+        {
+            return Ok((points, Some((next, profile::fire::KernelCurve::BEATEN))));
         }
     }
     Ok((points, None))
@@ -772,22 +792,94 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
         warmed.rotations,
         warmed.rate / 1e3
     ));
-    let rows = kernel_rows(top);
+    let rows = timed_rows(top);
     let largest = rig.device.max_buffer();
+    // Each shape's tiled kernels first: a vector kernel stops where it runs
+    // slower than twice the fastest of them at the same rows. A tiled
+    // kernel's time at twice the rows is no more than twice its time (it
+    // could run as two fires), and a vector kernel's time never falls with
+    // more rows, so it is beaten over the next doubling at least; past that
+    // its weight passes (one a workgroup's rows) only grow with the rows.
+    let mut order: Vec<(kernels_slang::linear::gemm::Tactic, u32, u32)> = wanted.to_vec();
+    order.sort_by_key(|&(t, n, k)| {
+        let shape = wanted.iter().position(|&(_, sn, sk)| (sn, sk) == (n, k));
+        (shape, t.vector > 0)
+    });
+    // `(n, k, [(rows, ns a fire)])` of every tiled kernel's curve, stated
+    // or timed here.
+    let mut tiled: Vec<(u32, u32, Vec<(u32, f64)>)> = stated
+        .kernel_tflops_by_shape
+        .iter()
+        .flatten()
+        .filter(|c| c.kind == profile::fire::KernelCurve::TILE)
+        .map(|c| {
+            let ns = c
+                .curve
+                .iter()
+                .map(|&(m, t)| (m, gemm_flops(m, c.n, c.k) / (t * 1e3) + launch))
+                .collect();
+            (c.n, c.k, ns)
+        })
+        .collect();
     let mut curves = Vec::with_capacity(wanted.len());
-    for &(tactic, n, k) in wanted {
+    for (tactic, n, k) in order {
         let (kind, key) = curve_key(B::TARGET, tactic, n, k);
+        let fastest_tiled = |m: u32| {
+            tiled
+                .iter()
+                .filter(|(tn, tk, curve)| {
+                    (*tn, *tk) == (n, k)
+                        && curve.first().is_some_and(|&(at, _)| at <= m)
+                        && curve.last().is_some_and(|&(at, _)| at >= m)
+                })
+                .filter_map(|(_, _, curve)| profile::fire::interpolate(curve, f64::from(m)))
+                .reduce(f64::min)
+        };
+        let beaten =
+            |m: u32, ns: f64| tactic.vector > 0 && fastest_tiled(m).is_some_and(|t| ns > 2.0 * t);
         let name = match kind {
             profile::fire::KernelCurve::VECTOR => format!("vector matmul ({key} rows a workgroup)"),
             _ => format!("{key}-row tile matmul"),
         };
+        // The curve's operands laid once, at the most of its rows they fit
+        // (each point a view of its rows), its weight planes read once
+        // untimed for every point over them.
+        let fits = |m: u32| operands_fit(m, n, k, largest);
+        let most = rows.iter().rev().copied().find(|&m| fits(m));
+        let laid = match most {
+            Some(most) => {
+                let act = rig.operand(most, k, Dtype::Bf16)?;
+                let weights = (0..weights_at(n, k))
+                    .map(|_| rig.operand(n, k, Dtype::Bf16))
+                    .collect::<Result<Vec<Tensor>>>()?;
+                let y = rig.zeros(most, n, Dtype::Bf16)?;
+                Some((act, weights, y))
+            }
+            None => None,
+        };
+        let touched = Touched::default();
         let (points, stop) = curve_of(
             &rows,
             first_fire_estimate(n, k, launch, bytes_per_ns),
-            |m| operands_fit(m, n, k, largest),
+            |m| laid.is_some() && fits(m),
+            beaten,
             |m, estimate| {
-                let rate = matmul(&mut rig, tactic, timer, (m, n, k), launch, Some(estimate));
-                rig.release();
+                let Some((act, weights, y)) = &laid else {
+                    return Ok(None);
+                };
+                let rate = matmul_on(
+                    &mut rig,
+                    tactic,
+                    timer,
+                    (
+                        Tensor { rows: m, ..*act },
+                        weights,
+                        Tensor { rows: m, ..*y },
+                    ),
+                    &touched,
+                    launch,
+                    Some(estimate),
+                );
                 let Some(rate) = dropped(&rig, rate, say)? else {
                     tracing::info!(
                         kernel = name.as_str(),
@@ -828,6 +920,11 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
                 why,
                 "rates curve stops short of the load's rows"
             );
+        }
+        drop(laid);
+        rig.release();
+        if kind == profile::fire::KernelCurve::TILE {
+            tiled.push((n, k, points.clone()));
         }
         curves.push(profile::fire::KernelCurve {
             kind,
@@ -1524,9 +1621,33 @@ fn matmul<B: Serve>(
         .map(|_| rig.operand(n, k, Dtype::Bf16))
         .collect::<Result<Vec<Tensor>>>()?;
     let y = rig.zeros(m, n, Dtype::Bf16)?;
+    matmul_on(
+        rig,
+        tactic,
+        timer,
+        (act, &weights, y),
+        &Touched::default(),
+        launch,
+        estimate,
+    )
+}
+
+/// [`matmul`] over operands laid already: `act` (its rows the matmul's),
+/// the weight planes its fires rotate through, `y`; `touched` the planes'
+/// one untimed read, shared by every point over them.
+fn matmul_on<B: Serve>(
+    rig: &mut Rig<'_, B>,
+    tactic: kernels_slang::linear::gemm::Tactic,
+    timer: Timer<'_, B>,
+    (act, weights, y): (Tensor, &[Tensor], Tensor),
+    touched: &Touched,
+    launch: f64,
+    estimate: Option<f64>,
+) -> Result<f64> {
+    let (m, n, k) = (act.rows, y.width, act.width);
     let next = std::cell::Cell::new(0usize);
     rig.step(format!("matmul {m}x{n}x{k}"), estimate);
-    let ns = rig.each(timer, &Touched::default(), weights.len(), &|sink| {
+    let ns = rig.each(timer, touched, weights.len(), &|sink| {
         let w = weights[next.get() % weights.len()];
         next.set(next.get() + 1);
         kernels_slang::linear::gemm::matmul(sink, tactic, act, w, y).map_err(fault("rates: matmul"))
@@ -1899,6 +2020,7 @@ mod curve_tests {
             &rows,
             1.5e6,
             |_| true,
+            |_, _| false,
             |m, estimate| {
                 // The rates frame's admission: refused, never submitted,
                 // past the bound.
@@ -1919,10 +2041,46 @@ mod curve_tests {
             assert!(estimate >= 1.5e6 * f64::from(m) - 1.0, "{m}: {estimate}");
         }
         // An operand past the device's largest buffer ends the curve there.
-        let (points, stop) =
-            curve_of(&rows, 1.0, |m| m < 512, |m, _| Ok(Some(f64::from(m)))).unwrap();
+        let (points, stop) = curve_of(
+            &rows,
+            1.0,
+            |m| m < 512,
+            |_, _| false,
+            |m, _| Ok(Some(f64::from(m))),
+        )
+        .unwrap();
         assert_eq!(points.len(), 9);
         assert_eq!(stop, Some((512, profile::fire::KernelCurve::BUFFER)));
+        // Beaten at 64 rows: stopped at the next, 64 timed.
+        let (points, stop) = curve_of(
+            &rows,
+            1.0,
+            |_| true,
+            |m, _| m >= 64,
+            |m, _| Ok(Some(f64::from(m))),
+        )
+        .unwrap();
+        assert_eq!(points.last().unwrap().0, 64);
+        assert_eq!(stop, Some((128, profile::fire::KernelCurve::BEATEN)));
+        // Beaten at its first rows: stopped at the next.
+        let (_, stop) = curve_of(
+            &[1, 2],
+            1.0,
+            |_| true,
+            |_, _| true,
+            |m, _| Ok(Some(f64::from(m))),
+        )
+        .unwrap();
+        assert_eq!(stop, Some((2, profile::fire::KernelCurve::BEATEN)));
+    }
+
+    /// The rows a shape's curves are timed at: every power of four, then the
+    /// load's most.
+    #[test]
+    fn a_shape_is_timed_at_every_power_of_four_to_the_top() {
+        assert_eq!(timed_rows(10240), [1, 4, 16, 64, 256, 1024, 4096, 10240]);
+        assert_eq!(timed_rows(4096), [1, 4, 16, 64, 256, 1024, 4096]);
+        assert_eq!(timed_rows(1), [1]);
     }
 
     /// A load times, at each of its shapes, each kernel whose curve the

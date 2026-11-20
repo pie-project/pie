@@ -161,14 +161,45 @@ pub fn tiled_kernels(target: Target, base: Tactic) -> Vec<Tactic> {
 /// rows at any of its planes: the key whose curves it lacks.
 pub const UNREACHED: &str = "kernel_tflops_by_shape";
 
-/// `(n, k, planes, bytes a plane)` of every dense plane a row of the model
-/// `counts` describes reads: each dense shape, and the output head.
+/// The `(n, k)` of every weight a dense matmul of `trace` multiplies by
+/// (`Linear::Matmul`, the output head's among them): the planes the dense
+/// kernel runs over, of the params [`Counts`] holds.
 #[must_use]
-pub fn planes(counts: &Counts) -> Vec<(u32, u32, u32, f64)> {
+pub fn multiplied(trace: &poem_ir::Trace) -> Vec<(u32, u32)> {
+    let mut out: Vec<(u32, u32)> = trace
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.op {
+            poem_ir::Operation::Linear(poem_ir::Linear::Matmul { w, .. }) => {
+                match trace.values.get(w.0 as usize).map(|decl| &decl.def) {
+                    Some(poem_ir::Def::Weight(at)) => trace.params.get(*at as usize),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .map(|param| {
+            let (n, k) = engine::load::rectangle(&param.shape);
+            let to = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
+            (to(n), to(k))
+        })
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// `(n, k, planes, bytes a plane)` of every dense plane a row of the model
+/// `counts` describes reads: each dense shape a matmul multiplies by (of
+/// `multiplied`, [`multiplied`]; every one where `None`), and the output
+/// head.
+#[must_use]
+pub fn planes(counts: &Counts, multiplied: Option<&[(u32, u32)]>) -> Vec<(u32, u32, u32, f64)> {
     let mut planes: Vec<(u32, u32, u32, f64)> = counts
         .gemm_shapes
         .iter()
         .filter(|s| !s.routed && s.planes > 0)
+        .filter(|s| multiplied.is_none_or(|m| m.contains(&(s.n, s.k))))
         .map(|s| (s.n, s.k, s.planes, s.bytes as f64 / f64::from(s.planes)))
         .collect();
     if counts.readout_flops > 0 {
@@ -181,8 +212,8 @@ pub fn planes(counts: &Counts) -> Vec<(u32, u32, u32, f64)> {
 }
 
 /// The dense tactic over `rungs` (ascending rows) on `target`, the model's
-/// dense planes (`counts`: every dense shape and the output head, each a
-/// dispatch reading its plane) weighed over `rates`; `tiled` is the
+/// dense planes (`planes`, [`planes`]: each a dispatch reading its plane)
+/// weighed over `rates`; `tiled` is the
 /// backend's tiled tactic at some rows. One a rung where the backend
 /// `records` its fires, else one a row count to the top rung. Each rung's
 /// weighing beside it; the `[rates]` key it lacks where the profile states
@@ -192,12 +223,11 @@ pub fn choose(
     rungs: &[u32],
     tiled: impl Fn(u32) -> Tactic,
     rates: &profile::fire::Rates,
-    counts: &Counts,
+    planes: &[(u32, u32, u32, f64)],
     records: bool,
 ) -> Result<(Dense, Vec<Weighed>), &'static str> {
     let c = Constants::of(rates)?;
     let curves = rates.kernel_tflops_by_shape.as_deref().ok_or(UNREACHED)?;
-    let planes = planes(counts);
     // The candidates at `kernel_rows` (a rung's, or a fire's own): each
     // vector kernel, and each tiled one.
     let candidates = |kernel_rows: u32| -> Vec<Tactic> {
@@ -236,7 +266,7 @@ pub fn choose(
     let cost = |among: &[Tactic], tactic: Tactic, rows: u32| -> Option<f64> {
         let mut ns = 0.0;
         let mut weighed = false;
-        for &(n, k, count, _) in &planes {
+        for &(n, k, count, _) in planes {
             if among.iter().all(|&t| time_at(t, n, k, rows).is_none()) {
                 continue;
             }
@@ -412,7 +442,15 @@ mod tests {
     fn each_rung_takes_the_kernel_the_estimate_weighs_faster() {
         let rungs = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048];
         let r = rates(Some(5.0), coopmat_tiles());
-        let (dense, weighed) = choose(Target::Spirv, &rungs, coopmat, &r, &counts(), true).unwrap();
+        let (dense, weighed) = choose(
+            Target::Spirv,
+            &rungs,
+            coopmat,
+            &r,
+            &planes(&counts(), None),
+            true,
+        )
+        .unwrap();
         let vector: Vec<bool> = weighed.iter().map(Weighed::vector).collect();
         assert!(vector[..4].iter().all(|&v| v), "{weighed:?}");
         assert!(vector[9..].iter().all(|&v| !v), "{weighed:?}");
@@ -448,8 +486,15 @@ mod tests {
             (256, vec![(4, 0.1), (128, 6.0), (256, 10.0)]),
         ];
         let r = rates(Some(0.5), tiles);
-        let (dense, weighed) =
-            choose(Target::Spirv, &[128, 256], baseline, &r, &counts(), true).unwrap();
+        let (dense, weighed) = choose(
+            Target::Spirv,
+            &[128, 256],
+            baseline,
+            &r,
+            &planes(&counts(), None),
+            true,
+        )
+        .unwrap();
         assert!(
             dense.at(200).wide && dense.at(200).vector == 0,
             "{weighed:?}"
@@ -463,20 +508,34 @@ mod tests {
     fn a_missing_rate_is_refused_by_its_key() {
         let mut none = rates(Some(5.0), coopmat_tiles());
         none.kernel_tflops_by_shape = None;
-        let refused = choose(Target::Spirv, &[1, 2], coopmat, &none, &counts(), true);
+        let refused = choose(
+            Target::Spirv,
+            &[1, 2],
+            coopmat,
+            &none,
+            &planes(&counts(), None),
+            true,
+        );
         assert_eq!(refused.unwrap_err(), "kernel_tflops_by_shape");
         let mut elsewhere = rates(Some(5.0), coopmat_tiles());
         for c in elsewhere.kernel_tflops_by_shape.iter_mut().flatten() {
             c.n = 1024;
         }
-        let refused = choose(Target::Spirv, &[1, 2], coopmat, &elsewhere, &counts(), true);
+        let refused = choose(
+            Target::Spirv,
+            &[1, 2],
+            coopmat,
+            &elsewhere,
+            &planes(&counts(), None),
+            true,
+        );
         assert_eq!(refused.unwrap_err(), UNREACHED);
         let (dense, _) = choose(
             Target::Spirv,
             &[1, 2],
             coopmat,
             &rates(None, coopmat_tiles()),
-            &counts(),
+            &planes(&counts(), None),
             true,
         )
         .unwrap();
@@ -529,7 +588,8 @@ mod tests {
             kernel_tflops_by_shape: Some(curves),
             ..rates(None, Vec::new())
         };
-        let (dense, weighed) = choose(Target::Wgsl, &[512], tiled, &r, &model, true).unwrap();
+        let (dense, weighed) =
+            choose(Target::Wgsl, &[512], tiled, &r, &planes(&model, None), true).unwrap();
         let at = dense.at(512);
         assert!(at.vector == 0 && !at.wide, "{}", weighed[0]);
     }
@@ -539,9 +599,25 @@ mod tests {
     fn an_eager_fire_takes_the_fastest_at_its_own_rows() {
         let r = rates(Some(5.0), coopmat_tiles());
         let rungs = engine::memory::rungs(1, 2048);
-        let (eager, _) = choose(Target::Spirv, &rungs, coopmat, &r, &counts(), false).unwrap();
+        let (eager, _) = choose(
+            Target::Spirv,
+            &rungs,
+            coopmat,
+            &r,
+            &planes(&counts(), None),
+            false,
+        )
+        .unwrap();
         for rows in [1, 3, 5, 17, 100, 129, 200, 256, 300, 2048] {
-            let (_, w) = choose(Target::Spirv, &[rows], coopmat, &r, &counts(), true).unwrap();
+            let (_, w) = choose(
+                Target::Spirv,
+                &[rows],
+                coopmat,
+                &r,
+                &planes(&counts(), None),
+                true,
+            )
+            .unwrap();
             let fastest = w[0]
                 .costs
                 .iter()
@@ -569,7 +645,8 @@ mod tests {
                     vector: 0,
                     wide: true,
                 };
-                let (_, weighed) = choose(target, &rungs, tiled, &flat, &counts(), true).unwrap();
+                let (_, weighed) =
+                    choose(target, &rungs, tiled, &flat, &planes(&counts(), None), true).unwrap();
                 for pair in weighed.windows(2) {
                     for (a, b) in pair[0].costs.iter().zip(&pair[1].costs) {
                         assert!(b.2 >= a.2, "{target:?} {tier:?}: {pair:?}");
@@ -592,7 +669,15 @@ mod tests {
                 (4, vec![(1, 1.0), (4, 3.0), (256, 12.0)]),
             ],
         );
-        let (eager, _) = choose(Target::Wgsl, &[1, 2, 4], coopmat, &r, &counts(), false).unwrap();
+        let (eager, _) = choose(
+            Target::Wgsl,
+            &[1, 2, 4],
+            coopmat,
+            &r,
+            &planes(&counts(), None),
+            false,
+        )
+        .unwrap();
         assert_eq!(eager.at(3).vector, 1);
     }
 
@@ -611,8 +696,24 @@ mod tests {
             (256, vec![(4, 4.0), (256, 8.0)]),
         ];
         let r = rates(Some(1.0), tiles);
-        let (_, one) = choose(Target::Spirv, &[1], baseline, &r, &counts(), true).unwrap();
-        let (_, four) = choose(Target::Spirv, &[4], baseline, &r, &counts(), true).unwrap();
+        let (_, one) = choose(
+            Target::Spirv,
+            &[1],
+            baseline,
+            &r,
+            &planes(&counts(), None),
+            true,
+        )
+        .unwrap();
+        let (_, four) = choose(
+            Target::Spirv,
+            &[4],
+            baseline,
+            &r,
+            &planes(&counts(), None),
+            true,
+        )
+        .unwrap();
         let tiled = |w: &[Weighed]| w[0].costs.iter().find(|c| c.0.vector == 0).unwrap().2;
         assert_eq!(tiled(&one), tiled(&four));
     }
@@ -641,7 +742,7 @@ mod tests {
             &[256, 512, 1024],
             baseline,
             &r,
-            &counts(),
+            &planes(&counts(), None),
             true,
         )
         .unwrap();
@@ -652,15 +753,29 @@ mod tests {
         assert!(weighed[1].costs.iter().all(|c| c.0.wide || c.0.vector > 0));
         // No kernel timed at 8192 rows: the rung keeps 4096's; alone, it is
         // refused by name.
-        let (dense, weighed) =
-            choose(Target::Spirv, &[4096, 8192], baseline, &r, &counts(), true).unwrap();
+        let (dense, weighed) = choose(
+            Target::Spirv,
+            &[4096, 8192],
+            baseline,
+            &r,
+            &planes(&counts(), None),
+            true,
+        )
+        .unwrap();
         assert_eq!(dense.at(8192), dense.at(4096));
         assert!(
             weighed[1].held && weighed[1].to_string().contains("held"),
             "{}",
             weighed[1]
         );
-        let refused = choose(Target::Spirv, &[8192], baseline, &r, &counts(), true);
+        let refused = choose(
+            Target::Spirv,
+            &[8192],
+            baseline,
+            &r,
+            &planes(&counts(), None),
+            true,
+        );
         assert_eq!(refused.unwrap_err(), UNREACHED);
     }
 }

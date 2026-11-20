@@ -134,7 +134,9 @@ pub struct Rates {
 /// it was asked to reach, if it did (`stop`: the rows not timed, and why,
 /// [`KernelCurve::BOUND`]: that fire's estimate passed the device's bound on
 /// one submission; [`KernelCurve::BUFFER`]: an operand passed the device's
-/// largest buffer). A stopped curve is final: no load times it again.
+/// largest buffer; [`KernelCurve::BEATEN`]: a vector kernel ran slower than
+/// twice a tiled kernel at the same rows, beaten at every rows past them).
+/// A stopped curve is final: no load times it again.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KernelCurve {
     pub kind: u32,
@@ -150,6 +152,7 @@ impl KernelCurve {
     pub const TILE: u32 = 2;
     pub const BOUND: u32 = 1;
     pub const BUFFER: u32 = 2;
+    pub const BEATEN: u32 = 3;
 
     /// What the curve measures: its kernel and shape.
     #[must_use]
