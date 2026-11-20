@@ -2039,6 +2039,7 @@ dependencies = [
 name = "eta-exec"
 version = "0.6.0"
 dependencies = [
+ "engine",
  "eta-compiler",
  "pie-eta-ir",
 ]

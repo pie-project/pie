@@ -1097,8 +1097,7 @@ impl Engine for Cuda {
                 .map_err(fault)?,
         );
         let mirror = (!device_only).then(|| HostMirror {
-            mirror: endpoint.mirror_host(),
-            words: endpoint.words_host(),
+            memory: endpoint.clone(),
             cell_bytes,
             capacity,
         });

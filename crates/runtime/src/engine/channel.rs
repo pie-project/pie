@@ -16,6 +16,7 @@ pub struct ChannelValue {
 #[derive(Debug)]
 pub struct HostRing {
     owned: Option<OwnedRing>,
+    _mirror: Option<Arc<dyn engine::channel::MirrorMemory>>,
     mirror_base: u64,
     word_base: u64,
     mirror_bytes: u64,
@@ -43,26 +44,31 @@ impl HostRing {
             word_base: words.as_ptr() as u64,
             mirror_bytes: mirror.len() as u64,
             owned: Some((mirror, words)),
+            _mirror: None,
             cell_bytes,
             capacity,
         }
     }
 
-    /// # Safety
-    ///
-    /// `mirror` and `words` must point at a live mapping of at least
-    /// `capacity + 1` cells of `cell_bytes` that outlives the returned ring.
+    /// A ring over the engine's mapping, which it holds alive; `None` if the
+    /// mapping is short of four words or of `capacity + 1` cells.
     #[must_use]
-    pub unsafe fn adopt(mirror: u64, words: u64, cell_bytes: u32, capacity: u32) -> HostRing {
-        let slots = u64::from(capacity).saturating_add(1);
-        HostRing {
-            owned: None,
-            mirror_base: mirror,
-            word_base: words,
-            mirror_bytes: slots * u64::from(cell_bytes),
-            cell_bytes,
-            capacity,
+    pub fn adopt(mirror: engine::HostMirror) -> Option<HostRing> {
+        let slots = u64::from(mirror.capacity).saturating_add(1);
+        let mirror_bytes = slots * u64::from(mirror.cell_bytes);
+        let (words, cells) = (mirror.memory.words(), mirror.memory.cells());
+        if words.len() < 4 || (cells.len() as u64) < mirror_bytes {
+            return None;
         }
+        Some(HostRing {
+            owned: None,
+            mirror_base: cells.as_ptr() as u64,
+            word_base: words.as_ptr() as u64,
+            mirror_bytes,
+            cell_bytes: mirror.cell_bytes,
+            capacity: mirror.capacity,
+            _mirror: Some(mirror.memory),
+        })
     }
 
     #[must_use]
