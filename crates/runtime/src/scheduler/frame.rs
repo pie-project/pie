@@ -1749,6 +1749,77 @@ mod tests {
         }
     }
 
+    /// od-1 with the expected lanes two frames deep (qf=2, k=2): with every
+    /// expected lane in, the front frame seals at once with the parked
+    /// owners' complete frames riding it, and the next frame seals in the
+    /// same pass of plans, before anything lands (two frames in flight per
+    /// lane): no candidate with nothing missing is left for a later wake.
+    #[test]
+    fn od_1_census_seals_front_and_next_frames_with_every_expected_lane_in() {
+        let mut policy =
+            FramePolicy::new(2, 64, 4096, None).with_submit_deadline(Duration::from_secs(86_400));
+        let lanes: Vec<ProcessId> = (0..44).map(|_| pid()).collect();
+        let mut next = 1u64;
+        let mut submit = |policy: &mut FramePolicy, lane: ProcessId, seq: u64| -> Vec<u64> {
+            let ids = vec![next, next + 1];
+            for (slot, &id) in ids.iter().enumerate() {
+                policy.on_fire_enqueued(stamp(lane, seq, slot as u32, 2), Some(lane), id, 1, 1);
+            }
+            next += 2;
+            ids
+        };
+        let mut queued: Vec<u64> = Vec::new();
+        for &lane in &lanes {
+            queued.extend(submit(&mut policy, lane, 0));
+        }
+        let ids: QueuedFireIds = queued.iter().copied().collect();
+        assert_eq!(fires(&plan(&mut policy, &ids, Instant::now())).len(), 88);
+        policy.on_frame_posted(lanes.clone(), Instant::now());
+        policy.on_frame_retired(lanes.clone());
+        let mut queued: Vec<u64> = Vec::new();
+        let (expected, rest) = lanes.split_at(10);
+        let (blocked_full, rest) = rest.split_at(13);
+        let (blocked_empty, rest) = rest.split_at(10);
+        let (both_empty, suspended_full) = rest.split_at(10);
+        for &lane in expected {
+            queued.extend(submit(&mut policy, lane, 1));
+            queued.extend(submit(&mut policy, lane, 2));
+        }
+        for &lane in blocked_full {
+            queued.extend(submit(&mut policy, lane, 1));
+            policy.on_owner_waits(lane);
+        }
+        for &lane in blocked_empty {
+            policy.on_owner_waits(lane);
+        }
+        for &lane in both_empty {
+            policy.on_process_suspend(lane);
+            policy.on_owner_waits(lane);
+        }
+        for &lane in suspended_full {
+            queued.extend(submit(&mut policy, lane, 1));
+            policy.on_process_suspend(lane);
+        }
+        // Plan as the scheduler does: each dispatch posted, nothing landing.
+        let mut frames = Vec::new();
+        for _ in 0..4 {
+            let ids: QueuedFireIds = queued.iter().copied().collect();
+            match plan(&mut policy, &ids, Instant::now()) {
+                FramePlan::Dispatch(waves) => {
+                    let sent: Vec<u64> = waves.iter().flatten().copied().collect();
+                    queued.retain(|id| !sent.contains(id));
+                    let members: Vec<ProcessId> =
+                        lanes.iter().copied().filter(|_| true).collect();
+                    policy.on_frame_posted(members, Instant::now());
+                    frames.push(sent.len());
+                }
+                _ => break,
+            }
+        }
+        assert_eq!(frames, vec![48, 20], "front frame of 24 lanes, then the next of 10, at once\n{}", policy.debug_summary());
+        assert!(queued.is_empty());
+    }
+
     /// Frames under pressure: 32 lanes, one frame each a round (one fire
     /// at k=1, two slots at k=2), a quarter of the owners blocking on the
     /// planner each round and coming back the next. A blocked owner is never

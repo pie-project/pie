@@ -116,9 +116,38 @@ impl ChunkMap {
             longest = longest.max(stretch);
             last = Some(chunk);
         }
+        // Free chunks alone: the longest stretch inside one segment, the
+        // disjoint runs of `run` they hold, and how many of those a stretch
+        // crossing a segment's edge breaks (free chunks enough, no run).
+        let (mut longest_free, mut free_runs, mut cut_at_edge) = (0u32, 0u32, 0u32);
+        let (mut stretch, mut last) = (0u32, None::<u32>);
+        for &chunk in &free {
+            let adjacent = last == Some(chunk.wrapping_sub(1));
+            let same = self.segment_chunks == 0
+                || last.is_some_and(|last| last / self.segment_chunks == chunk / self.segment_chunks);
+            if adjacent && !same {
+                cut_at_edge += 1;
+            }
+            if adjacent && same {
+                stretch += 1;
+            } else {
+                free_runs += stretch / run;
+                stretch = 1;
+            }
+            longest_free = longest_free.max(stretch);
+            last = Some(chunk);
+        }
+        free_runs += stretch / run;
+        // What opening those runs takes of the budget's headroom.
+        let headroom_short = self
+            .headroom
+            .is_some_and(|headroom| headroom < run);
         format!(
             "map: run={run} free={} held={} emptiable={} stuck={stuck} candidates={} \
-             headroom={:?} segment_chunks={} longest_usable_stretch={longest} cheapest={:?}",
+             headroom={:?} segment_chunks={} longest_usable_stretch={longest} \
+             longest_free_stretch={longest_free} free_runs={free_runs} \
+             free_stretches_cut_at_segment_edges={cut_at_edge} \
+             headroom_short_for_one_run={headroom_short} cheapest={:?}",
             free.len(),
             self.held.len(),
             emptiable.len(),
