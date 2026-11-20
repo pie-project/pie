@@ -1225,17 +1225,18 @@ impl ProcessCtx {
                         qo_indptr.last().copied().unwrap_or(0)
                     );
                 }
-                if let Some(host) = &bound.host {
+                let counted = bound.host.as_ref().map(|host| {
                     tracing::info!("{}", host.bind_message(prog.hash));
-                }
-                (
-                    bound.devgeo,
-                    bound.decode_envelope,
-                    bound.class,
-                    bound.host.is_some(),
-                )
+                    host_geometry::counter(host_geometry::FireKey {
+                        engine,
+                        kind: spec.kind,
+                        reason: host.reason(),
+                        program: prog.hash,
+                    })
+                });
+                (bound.devgeo, bound.decode_envelope, bound.class, counted)
             } else {
-                (None, None, GeometryClass::Host, false)
+                (None, None, GeometryClass::Host, None)
             };
 
             let instance_id = crate::pipeline::instance::next_instance_id();

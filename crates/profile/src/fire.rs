@@ -88,6 +88,27 @@ pub struct Rates {
     /// `S = W · t / t_full`, over the cores. A real number of workgroups a
     /// unit.
     pub workgroups_per_core: Option<f64>,
+    /// How much slower the device ran than its own measurements said, as
+    /// its rates step measured: the largest of the worst ratio of a frame's
+    /// time to the same step's frame before it, the clock's swing from fire
+    /// to fire, and the drop of its settled clock under sustained load (the
+    /// warm-up's cube rotated again once every rate is timed). The margin a
+    /// serving step's estimate is held to a stated bound on one GPU
+    /// submission at (`engine_gpu::submit`). At least 1. Measured, and read,
+    /// only where the platform states such a bound (Android); not one of
+    /// [`KEYS`], which the estimate weighs a fire by.
+    pub submit_worst_ratio: Option<f64>,
+    /// Prefill attention TFLOP/s (the rectangle's flops, four a query
+    /// element a key, as [`Rates::attn_tflops_by_keys`] counts them) of a
+    /// step's rows against a longer prefix: `(rows, [(keys, TFLOP/s)])`, the
+    /// rows a prompt step fires at its rung attending `keys` keys of which
+    /// all but their own are held before them, ascending in rows, each curve
+    /// strictly ascending in keys. A square self-attending prompt skips half
+    /// its rectangle causally, a prefixed step almost none of it, so the
+    /// square curve reads such a step's attention as up to twice as fast as
+    /// it runs. Measured, and read, only where the platform states a bound
+    /// on one submission (`engine_gpu::submit`); not one of [`KEYS`].
+    pub attn_tflops_by_rows_keys: Option<Vec<(u32, Vec<(u32, f64)>)>>,
     /// Each tiled matmul kernel's bf16 TFLOP/s by rows below the matmul
     /// curve's, its flops counted at the rows it lands (not its tile's):
     /// `(row tile, [(rows, TFLOP/s)])`, ascending in row tile, keyed by the
@@ -150,6 +171,15 @@ pub const KEYS: [&str; 11] = [
     "vector_tflops_by_rows",
 ];
 
+/// The `[rates]` key of [`Rates::submit_worst_ratio`]: what a load on a
+/// platform that states a bound on one submission measures beside the
+/// estimate's [`KEYS`].
+pub const SUBMIT_WORST_RATIO: &str = "submit_worst_ratio";
+
+/// The `[rates]` key of [`Rates::attn_tflops_by_rows_keys`]: measured beside
+/// [`SUBMIT_WORST_RATIO`] where the platform states a submit bound.
+pub const ATTN_BY_ROWS_KEYS: &str = "attn_tflops_by_rows_keys";
+
 impl Rates {
     /// `self` laid over `below`: each key `self` states replaces `below`'s.
     #[must_use]
@@ -164,6 +194,10 @@ impl Rates {
             scan_gelems: self.scan_gelems.or(below.scan_gelems),
             few_row_tflops: self.few_row_tflops.or(below.few_row_tflops),
             workgroups_per_core: self.workgroups_per_core.or(below.workgroups_per_core),
+            submit_worst_ratio: self.submit_worst_ratio.or(below.submit_worst_ratio),
+            attn_tflops_by_rows_keys: self
+                .attn_tflops_by_rows_keys
+                .or(below.attn_tflops_by_rows_keys),
             tile_tflops_by_rows: self.tile_tflops_by_rows.or(below.tile_tflops_by_rows),
             vector_tflops_by_rows: self.vector_tflops_by_rows.or(below.vector_tflops_by_rows),
             // Entry by entry: a load's shapes join those already measured,
@@ -210,6 +244,13 @@ impl Rates {
             workgroups_per_core: self
                 .workgroups_per_core
                 .filter(|_| has("workgroups_per_core")),
+            submit_worst_ratio: self
+                .submit_worst_ratio
+                .filter(|_| has(SUBMIT_WORST_RATIO)),
+            attn_tflops_by_rows_keys: self
+                .attn_tflops_by_rows_keys
+                .clone()
+                .filter(|_| has(ATTN_BY_ROWS_KEYS)),
             tile_tflops_by_rows: self
                 .tile_tflops_by_rows
                 .clone()
@@ -237,6 +278,8 @@ impl Rates {
             "scan_gelems" => self.scan_gelems.is_none(),
             "few_row_tflops" => self.few_row_tflops.is_none(),
             "workgroups_per_core" => self.workgroups_per_core.is_none(),
+            SUBMIT_WORST_RATIO => self.submit_worst_ratio.is_none(),
+            ATTN_BY_ROWS_KEYS => self.attn_tflops_by_rows_keys.is_none(),
             "tile_tflops_by_rows" => self.tile_tflops_by_rows.is_none(),
             "vector_tflops_by_rows" => self.vector_tflops_by_rows.is_none(),
             "product_ns" => self.product_ns.is_none(),
@@ -293,6 +336,7 @@ impl Rates {
         float("scan_gelems", self.scan_gelems);
         float("few_row_tflops", self.few_row_tflops);
         float("workgroups_per_core", self.workgroups_per_core);
+        float(SUBMIT_WORST_RATIO, self.submit_worst_ratio);
         keyed(&mut out, "tile_tflops_by_rows", &self.tile_tflops_by_rows);
         keyed(
             &mut out,
@@ -311,6 +355,7 @@ impl Rates {
                 .collect();
             let _ = writeln!(out, "product_ns = [\n{}]", rows.concat());
         }
+        keyed(&mut out, ATTN_BY_ROWS_KEYS, &self.attn_tflops_by_rows_keys);
         out
     }
 }
@@ -465,6 +510,8 @@ mod tests {
             scan_gelems: Some(2684.3),
             few_row_tflops: Some(4.2),
             workgroups_per_core: Some(3.3),
+            submit_worst_ratio: None,
+            attn_tflops_by_rows_keys: None,
             tile_tflops_by_rows: Some(vec![(32, vec![(8, 1.0), (256, 9.5)])]),
             vector_tflops_by_rows: Some(vec![(4, vec![(1, 0.5)])]),
             product_ns: None,
@@ -488,6 +535,30 @@ mod tests {
              cached_gbps = 28800.0\nelementwise_gbps = 450.0\nscan_gelems = 2684.3\nfew_row_tflops = 4.2\n\
              workgroups_per_core = 3.3\ntile_tflops_by_rows = [\n  [32, [[8, 1.0], [256, 9.5]]],\n]\nvector_tflops_by_rows = [\n  [4, [[1, 0.5]]],\n]\n"
         );
+    }
+
+    /// The margin a load measures under a stated submit bound is saved with
+    /// the rates and read back: a boot on saved rates holds its steps at it.
+    #[test]
+    fn the_submit_rates_are_saved_and_read_back_with_the_rates() {
+        let measured = Rates {
+            launch_ns: Some(904),
+            submit_worst_ratio: Some(1.83),
+            attn_tflops_by_rows_keys: Some(vec![(512, vec![(1024, 0.35), (4096, 0.3)])]),
+            ..Rates::default()
+        };
+        let text = format!("api = 1\n{}", measured.toml());
+        assert!(text.contains("submit_worst_ratio = 1.83\n"), "{text}");
+        let registry = crate::Registry::new("test", &[], &[]);
+        let read = registry.load_user(&text, "test").unwrap().rates();
+        assert_eq!(read.submit_worst_ratio, Some(1.83));
+        assert_eq!(read.attn_tflops_by_rows_keys, measured.attn_tflops_by_rows_keys);
+        assert!(read.missing(&[SUBMIT_WORST_RATIO]).is_empty());
+        assert_eq!(
+            Rates::default().missing(&[SUBMIT_WORST_RATIO]),
+            [SUBMIT_WORST_RATIO]
+        );
+        assert_eq!(measured.only(&[SUBMIT_WORST_RATIO]).submit_worst_ratio, Some(1.83));
     }
 
     #[test]

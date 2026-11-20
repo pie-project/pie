@@ -3687,8 +3687,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 }
             };
             crate::probe_fire_record!(submit_probe.geometry_us, geometry_clock.elapsed());
-            if p.host_geometry {
-                host_geometry::count_fire();
+            if let Some(fires) = &p.host_geometry {
+                fires.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             let accesses = p.instance.program.channel_accesses.clone();
             (

@@ -247,6 +247,8 @@ fn paged_attention_answers_the_reference() {
                 request_of_token: t(own, rows, 1, Dtype::I32),
                 mask: t(mb, 1, rows * MASK_STRIDE, Dtype::U8),
                 mask_words: t(eb, rows, 2, Dtype::U32),
+                row0: 0,
+                rows: rows as u32,
             };
             let n = rows * QH * hd;
             let qt = t(q, rows, QH * hd, Dtype::Bf16);
@@ -332,58 +334,79 @@ fn paged_attention_answers_the_reference() {
                                 prefill_work,
                                 ..tactic
                             };
-                            let (o, l) = (gpu.zeros(n), gpu.up_f32(&vec![0.0; rows * QH]));
-                            let lse = with_lse.then(|| t(l, rows, QH, Dtype::F32));
-                            let ot = t(o, rows, QH * hd, Dtype::Bf16);
-                            gpu.run(|c| match form {
-                                Form::Tiled => sdpa::prefill(
-                                    c,
-                                    tactic,
-                                    qt,
-                                    &tables,
-                                    &spool,
-                                    win,
-                                    hd as u32,
-                                    scale as f32,
-                                    ot,
-                                    lse,
-                                ),
-                                Form::Selected => sdpa::selected(
-                                    c,
-                                    tactic,
-                                    qt,
-                                    &tables,
-                                    &spool,
-                                    hd as u32,
-                                    scale as f32,
-                                    RATIO as u32,
-                                    t(sel, rows, TOP_K, Dtype::I32),
-                                    ot,
-                                ),
-                                Form::Decode | Form::Split => sdpa::decode(
-                                    c,
-                                    tactic,
-                                    qt,
-                                    &tables,
-                                    &spool,
-                                    win,
-                                    hd as u32,
-                                    scale as f32,
-                                    ot,
-                                    lse,
-                                    matches!(form, Form::Split).then_some(split),
-                                ),
-                            });
+                            let fire =
+                                |c: &kernels_slang::Ctx<'_>,
+                                 tables: &sdpa::Tables,
+                                 ot: Tensor,
+                                 lse: Option<Tensor>| match form {
+                                    Form::Tiled => sdpa::prefill(
+                                        c,
+                                        tactic,
+                                        qt,
+                                        tables,
+                                        &spool,
+                                        win,
+                                        hd as u32,
+                                        scale as f32,
+                                        ot,
+                                        lse,
+                                    ),
+                                    Form::Selected => sdpa::selected(
+                                        c,
+                                        tactic,
+                                        qt,
+                                        tables,
+                                        &spool,
+                                        hd as u32,
+                                        scale as f32,
+                                        RATIO as u32,
+                                        t(sel, rows, TOP_K, Dtype::I32),
+                                        ot,
+                                    ),
+                                    Form::Decode | Form::Split => sdpa::decode(
+                                        c,
+                                        tactic,
+                                        qt,
+                                        tables,
+                                        &spool,
+                                        win,
+                                        hd as u32,
+                                        scale as f32,
+                                        ot,
+                                        lse,
+                                        matches!(form, Form::Split).then_some(split),
+                                    ),
+                                };
                             let label = format!(
                                 "{shape} subgroup {subgroup} threads {threads} rows {tile} lanes {lanes} lse {with_lse}"
                             );
-                            close(&gpu.down(o, n), &want_o, &label);
-                            if with_lse {
-                                close(
-                                    &gpu.down_f32(l, rows * QH),
-                                    &want_l,
-                                    &format!("{label}: lse"),
-                                );
+                            // The fire whole, then cut in two windows over the
+                            // same whole planes, the second from row `cut` on:
+                            // a window's rows land what the whole fire's do.
+                            let cut = (rows / 3) as u32;
+                            let windows: [&[(u32, u32)]; 2] =
+                                [&[(0, rows as u32)], &[(0, cut), (cut, rows as u32 - cut)]];
+                            for (cuts, spans) in windows.iter().enumerate() {
+                                let (o, l) = (gpu.zeros(n), gpu.up_f32(&vec![0.0; rows * QH]));
+                                let lse = with_lse.then(|| t(l, rows, QH, Dtype::F32));
+                                let ot = t(o, rows, QH * hd, Dtype::Bf16);
+                                for &(row0, span) in spans.iter() {
+                                    let window = sdpa::Tables {
+                                        row0,
+                                        rows: span,
+                                        ..tables
+                                    };
+                                    gpu.run(|c| fire(c, &window, ot, lse));
+                                }
+                                let label = format!("{label} windows {}", cuts + 1);
+                                close(&gpu.down(o, n), &want_o, &label);
+                                if with_lse {
+                                    close(
+                                        &gpu.down_f32(l, rows * QH),
+                                        &want_l,
+                                        &format!("{label}: lse"),
+                                    );
+                                }
                             }
                         }
                     }

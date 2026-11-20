@@ -160,6 +160,10 @@ impl Frame {
         Err(Fault::Deviceless)
     }
 
+    pub fn submit_segment(&self) -> Result<()> {
+        Err(Fault::Deviceless)
+    }
+
     #[must_use]
     pub fn dispatches(&self) -> u64 {
         match self.never {}

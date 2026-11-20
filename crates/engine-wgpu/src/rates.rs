@@ -52,7 +52,7 @@ pub fn at_load(
     });
     let chip = engine::rates::rates_at_load(
         chip,
-        &engine_gpu::rates::KEYS,
+        &engine_gpu::rates::keys_at(max_submit),
         save,
         Some(device.left()),
         max_submit,

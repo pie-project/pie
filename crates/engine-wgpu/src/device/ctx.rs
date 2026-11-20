@@ -168,6 +168,9 @@ pub(crate) struct Core {
     scratch_stock: std::sync::atomic::AtomicUsize,
 
     pub(crate) last_error: Arc<Mutex<Option<String>>>,
+    /// The device's loss, once seen ([`Lost`]): every call after fails by
+    /// name ([`Fault::DeviceLost`]).
+    pub(crate) lost: Lost,
     pub(crate) books: Arc<engine_gpu::Books>,
     pub(crate) name: String,
     /// `None` without the subgroup feature.
@@ -186,12 +189,60 @@ pub(crate) struct Core {
     pub(crate) bound: u64,
 }
 
+/// A wgpu device's loss, once seen, and where: its lost callback (a driver
+/// fault, or `Device::destroy`), or a mapping it refused (wgpu refuses a map
+/// of a buffer the load made only once the device is lost: a submission the
+/// driver faulted). Nothing recovers it: once set it stands, and every call
+/// on the device after fails as [`Fault::DeviceLost`], never as the
+/// validation errors a lost device's objects raise.
+#[derive(Clone, Default)]
+pub(crate) struct Lost(Arc<Mutex<Option<(&'static str, String)>>>);
+
+impl Lost {
+    /// The device was lost at `what` for `why`: the first loss seen stands.
+    pub(crate) fn mark(&self, what: &'static str, why: impl ToString) {
+        let mut lost = self.0.lock().expect("lost lock poisoned");
+        if lost.is_none() {
+            let why = why.to_string();
+            tracing::error!(what, %why, "wgpu: the device was lost; every call on it fails from here");
+            *lost = Some((what, why));
+        }
+    }
+
+    /// The loss, by name, where the device was lost.
+    pub(crate) fn fault(&self) -> Option<Fault> {
+        self.0
+            .lock()
+            .expect("lost lock poisoned")
+            .as_ref()
+            .map(|(what, why)| Fault::DeviceLost {
+                what,
+                why: why.clone(),
+            })
+    }
+
+    /// `Ok` while the device stands; its loss by name once lost.
+    pub(crate) fn alive(&self) -> Result<()> {
+        self.fault().map_or(Ok(()), Err)
+    }
+}
+
 impl Core {
+    /// `what` refused for `why`: a mapping refused marks the device lost,
+    /// and a lost device answers with its loss.
     pub(crate) fn fault(&self, what: &'static str, why: impl ToString) -> Fault {
-        Fault::Wgpu {
+        if what == "map_async" {
+            self.lost.mark(what, why.to_string());
+        }
+        self.lost.fault().unwrap_or_else(|| Fault::Wgpu {
             what,
             why: why.to_string(),
-        }
+        })
+    }
+
+    /// `Ok` while the device stands; its loss by name once lost.
+    pub(crate) fn alive(&self) -> Result<()> {
+        self.lost.alive()
     }
 
     pub(crate) fn take_error(&self, what: &'static str) -> Result<()> {
@@ -200,6 +251,9 @@ impl Core {
             .lock()
             .expect("last error lock poisoned")
             .take();
+        // A lost device's objects raise validation errors of their own (a
+        // buffer made on it is invalid): the loss is what names them.
+        self.alive()?;
         match taken {
             Some(why) => Err(Fault::Wgpu { what, why }),
             None => Ok(()),
@@ -566,6 +620,13 @@ impl Context {
                 *sink.lock().expect("sink lock poisoned") = Some(text);
             }));
         }
+        let lost = Lost::default();
+        {
+            let lost = lost.clone();
+            device.set_device_lost_callback(move |reason, message| {
+                lost.mark("device lost callback", format!("{reason:?}: {message}"));
+            });
+        }
         let enabled = Enabled {
             subgroups: features.contains(wgpu::Features::SUBGROUP),
             f16: features.contains(wgpu::Features::SHADER_F16),
@@ -599,6 +660,7 @@ impl Context {
             uniform_stock: std::sync::atomic::AtomicUsize::new(0),
             scratch_stock: std::sync::atomic::AtomicUsize::new(0),
             last_error,
+            lost,
             books: Arc::new(engine_gpu::Books::new()),
             subgroup_min,
             budget,
@@ -745,6 +807,7 @@ impl Context {
 
     pub fn frame(&self) -> Result<Frame> {
         let core = &self.core;
+        core.alive()?;
         let encoder = core
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1071,10 +1134,43 @@ impl Frame {
         self.flush()
     }
 
+    /// [`engine_gpu::backend::Frame::submit_segment`]: the frame's encoder
+    /// submitted unawaited and a new one opened. WebGPU's queue orders the
+    /// next submission after it, and the frame's uniform region and scratch
+    /// chunk stay the frame's (given back at its commit).
+    pub fn submit_segment(&self) -> Result<()> {
+        self.close_pass();
+        self.land_uniforms();
+        let core = &self.inner.core;
+        core.alive()?;
+        let taken = self
+            .inner
+            .encoder
+            .lock()
+            .expect("encoder lock poisoned")
+            .take();
+        let Some(encoder) = taken else {
+            return Err(Fault::Device {
+                call: "submit_segment",
+                why: "this frame was already submitted".to_string(),
+            });
+        };
+        core.queue.submit(std::iter::once(encoder.finish()));
+        core.kick();
+        *self.inner.encoder.lock().expect("encoder lock poisoned") = Some(
+            core.device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("pie frame"),
+                }),
+        );
+        core.take_error("submit_segment")
+    }
+
     pub fn flush(&self) -> Result<()> {
         self.close_pass();
         self.land_uniforms();
         let core = &self.inner.core;
+        core.alive()?;
         let taken = self
             .inner
             .encoder
@@ -1105,6 +1201,7 @@ impl Frame {
         self.close_pass();
         self.land_uniforms();
         let core = &self.inner.core;
+        core.alive()?;
         let taken = self
             .inner
             .encoder
@@ -1256,6 +1353,60 @@ impl Pending {
 mod tests {
     use super::*;
     use crate::device::Buffer;
+
+    fn lost_by_name(fault: Fault) {
+        assert!(
+            matches!(fault, Fault::DeviceLost { .. }),
+            "refused as {fault}, not as DeviceLost"
+        );
+        assert!(fault.to_string().starts_with("DeviceLost: "), "{fault}");
+    }
+
+    /// The loss's state: none until marked; the first loss marked stands,
+    /// and every fault after names it.
+    #[test]
+    fn a_loss_once_marked_stands_and_names_every_fault_after() {
+        let lost = Lost::default();
+        assert!(lost.alive().is_ok());
+        lost.mark("map_async", "Validation");
+        lost.mark("device lost callback", "a later loss");
+        match lost.fault().expect("lost") {
+            Fault::DeviceLost { what, why } => {
+                assert_eq!(what, "map_async");
+                assert_eq!(why, "Validation");
+            }
+            other => panic!("{other}"),
+        }
+        lost_by_name(lost.alive().unwrap_err());
+    }
+
+    /// A device lost (here by `Device::destroy`, as a driver fault loses
+    /// it) fails every later call by name: a buffer, a frame, a write, a
+    /// read, a submit, never wgpu's "Buffer with '' label is invalid".
+    #[test]
+    fn a_lost_device_fails_every_later_call_as_device_lost() {
+        if !present() {
+            return;
+        }
+        let allowance = engine::Allowance {
+            budget: Some(1 << 30),
+        };
+        let device = Context::bind(&DeviceBoot::default(), allowance).unwrap();
+        let owner = engine_gpu::books::owners::TEST;
+        let mut buffer = Buffer::zeroed(&device, 64, owner).unwrap();
+        // A frame opened before the loss and submitted after it.
+        let mut before = device.frame().unwrap();
+        before.copy(&buffer, 0, &buffer, 32, 16).unwrap();
+        device.core.device.destroy();
+        // The lost callback runs as the device is polled.
+        let _ = device.core.device.poll(wgpu::PollType::wait_indefinitely());
+        lost_by_name(before.commit().err().expect("refused"));
+        lost_by_name(Buffer::zeroed(&device, 64, owner).err().expect("refused"));
+        lost_by_name(device.frame().err().expect("refused"));
+        lost_by_name(buffer.write(0, &[1, 2, 3, 4]).err().expect("refused"));
+        let mut got = [0u8; 4];
+        lost_by_name(buffer.read(0, &mut got).err().expect("refused"));
+    }
 
     #[test]
     fn a_copy_between_two_spans_of_one_buffer_lands() {

@@ -1309,6 +1309,8 @@ impl Context {
                 core: Arc::clone(core),
                 cmd: std::sync::atomic::AtomicU64::new(vk::Handle::as_raw(cmd)),
                 cuts: Mutex::new(Vec::new()),
+                segments: Mutex::new(Vec::new()),
+                segmented: std::sync::atomic::AtomicBool::new(false),
                 cmd_pool: pool,
                 fence,
                 pools: Mutex::new(Vec::new()),
@@ -1351,6 +1353,14 @@ pub(crate) struct Inner {
     /// expert stage); a replay submits each, waits, and lets its caller do
     /// that host work before the next.
     cuts: Mutex<Vec<vk::CommandBuffer>>,
+    /// A split step's segments before its last, submitted unawaited
+    /// ([`Frame::submit_segment`]): each held until the frame is dropped,
+    /// whose last segment's fence lands after them (it begins with a barrier
+    /// on every command before it on the queue).
+    segments: Mutex<Vec<vk::CommandBuffer>>,
+    /// A segment was submitted: a frame dropped unsubmitted waits for the
+    /// queue before it frees them.
+    segmented: std::sync::atomic::AtomicBool,
 
     pub(crate) cmd_pool: vk::CommandPool,
     pub(crate) fence: vk::Fence,
@@ -1396,6 +1406,9 @@ impl Drop for Inner {
         unsafe {
             if self.submitted.load(Ordering::Acquire) {
                 let _ = d.wait_for_fences(&[self.fence], true, FENCE_TIMEOUT_NS);
+            } else if self.segmented.load(Ordering::Acquire) {
+                let queue = self.core.queue.lock().expect("queue lock poisoned");
+                let _ = d.queue_wait_idle(*queue);
             }
             for pool in self.pools.get_mut().expect("pools lock poisoned").drain(..) {
                 d.destroy_descriptor_pool(pool, None);
@@ -1411,6 +1424,9 @@ impl Drop for Inner {
                 .get(&std::thread::current().id())
                 == Some(&self.cmd_pool);
             let mut buffers = std::mem::take(self.cuts.get_mut().expect("cuts lock poisoned"));
+            buffers.extend(std::mem::take(
+                self.segments.get_mut().expect("segments lock poisoned"),
+            ));
             buffers.push(self.cmd());
             if owned {
                 d.free_command_buffers(self.cmd_pool, &buffers);
@@ -1754,6 +1770,75 @@ impl Frame {
         // SAFETY: the queue is this device's, and its lock is the external
         // sync `vkQueueWaitIdle` needs.
         unsafe { core.device.queue_wait_idle(*queue) }.map_err(|e| core.fault("vkQueueWaitIdle", e))
+    }
+
+    /// [`engine_gpu::backend::Frame::submit_segment`]: what the frame holds
+    /// submitted unawaited, recording on in a new buffer from the same
+    /// (this thread's) pool that begins with a barrier on every command
+    /// submitted before it, as every frame begins. A kept frame's segment is
+    /// a cut its replays wait on ([`Frame::flush`]).
+    pub fn submit_segment(&self) -> Result<()> {
+        if self.kept {
+            return self.flush();
+        }
+        let core = &self.inner.core;
+        let d = &core.device;
+        let cmd = self.inner.cmd();
+        // SAFETY: as in `flush`: this frame's `cmd` is recording and only
+        // `&self` records into it.
+        unsafe { d.end_command_buffer(cmd) }.map_err(|e| core.fault("vkEndCommandBuffer", e))?;
+        {
+            let bufs = [cmd];
+            let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
+            let queue = core.queue.lock().expect("queue lock poisoned");
+            // SAFETY: `cmd` is executable and submitted once, with no
+            // fence; the queue is held under its lock.
+            unsafe { d.queue_submit(*queue, &submits, vk::Fence::null()) }
+                .map_err(|e| core.fault("vkQueueSubmit", e))?;
+        }
+        self.inner.segmented.store(true, Ordering::Release);
+        self.inner
+            .segments
+            .lock()
+            .expect("segments lock poisoned")
+            .push(cmd);
+        // SAFETY: `cmd_pool` is this frame's (this thread's) pool.
+        let next = unsafe {
+            d.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(self.inner.cmd_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )
+        }
+        .map_err(|e| core.fault("vkAllocateCommandBuffers", e))?[0];
+        self.inner
+            .cmd
+            .store(vk::Handle::as_raw(next), Ordering::Release);
+        // SAFETY: `next` was just allocated, in the initial state; the
+        // barrier records into it while only this frame holds it.
+        unsafe {
+            d.begin_command_buffer(
+                next,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+            .map_err(|e| core.fault("vkBeginCommandBuffer", e))?;
+            let all = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+            d.cmd_pipeline_barrier(
+                next,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[all],
+                &[],
+                &[],
+            );
+        }
+        self.hazards_settled();
+        Ok(())
     }
 
     pub fn flush(&self) -> Result<()> {

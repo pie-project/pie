@@ -698,8 +698,9 @@ pub(crate) fn skinnyt_norm_covers(ctx: &Ctx, m: i32, n: i32, k: i32, gated: bool
     ) else {
         return Ok(false);
     };
-    // The normed rows and their partial sums (four floats a row) in the turn.
-    Ok(m.unsigned_abs() * (k.unsigned_abs() * 2 + 16) <= ks * TURN_WAVE_LDS
+    // The normed rows (each padded a 16-byte pack, spread over the LDS
+    // banks) and their partial sums (four floats a row) in the turn.
+    Ok(m.unsigned_abs() * (k.unsigned_abs() * 2 + 32) <= ks * TURN_WAVE_LDS
         && fold_pays(ctx, "turned", m, n, k, gated, grid))
 }
 

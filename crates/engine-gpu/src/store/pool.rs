@@ -523,22 +523,11 @@ impl<B: Backend> Pool<B> {
         buffer.read(local, into)
     }
 
-    /// Zeroes `len` bytes at virtual byte `at`. The caller has drained every
-    /// frame that touches them.
-    pub fn zero(&mut self, at: u64, len: u64) -> Result<()> {
-        let span = u64::from(self.segment_chunks) * self.chunk_bytes;
-        let segment = usize::try_from(at / span).unwrap_or(usize::MAX);
-        let committed = self.committed_segments();
-        let buffer = self
-            .segments
-            .get_mut(segment)
-            .and_then(Option::as_mut)
-            .ok_or(Fault::Ceiling {
-                what: "committed segments of the state pool",
-                need: segment as u64 + 1,
-                have: u64::from(committed),
-            })?;
-        buffer.zero_span(at % span, len)
+    /// Zeroes `len` bytes at virtual byte `at` in `frame`; the run crosses
+    /// no segment.
+    pub fn zero(&self, frame: &mut B::Frame, at: u64, len: u64) -> Result<()> {
+        let (buffer, local) = self.locate(at)?;
+        frame.fill_zero(buffer, local, len)
     }
 }
 

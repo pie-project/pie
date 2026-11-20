@@ -674,6 +674,11 @@ was an artifact: under `rocprofv3 --attach --kernel-trace` every kernel starts a
 The serialized PMC run gives o-proj + down only about +1 µs a layer, and LDS bank conflicts
 are 0.
 
+**Correction (2026-11-20): the product rows below are warm-cache lower bounds; do not plan from
+them.** A duplicated launch re-reads the weights its first launch just pulled into the 256 MB
+Infinity Cache (8–13 MB a product here): it times a warm second run. At the kernel level the
+folded qkv at m = 4 duplicated read +0 µs. The cold-weight ledger below replaces them.
+
 The instrument that measures in context is ablation by duplication. Launch one product
 twice (idempotent) under a scratch switch, and difference the step cost (32 → 160 tokens,
 median of 5, two rounds):
@@ -726,6 +731,56 @@ Next:
 - the ~30 µs host / channel / sampling share at four lanes;
 - the duplication switch is a scratch patch: a profile probe that times a kernel in place
   (in a captured body) would make it a standing instrument.
+
+### Cold-weight ledger (2026-11-20, tip a7052acfc + the padded turn rows)
+
+Each product is duplicated over the next layer's weight, last read about a step (≈ 1 GB of other
+weights) earlier, so the duplicate pays a real HBM stream. The lm head's one 311 MB weight is
+past the cache, so its plain duplicate is already cold. Δ step (µs, all layers), 32 → 160
+tokens, median of 5:
+
+| product (its kernel at 1 / 4 rows) | 1 row | 4 rows | 4-row extra |
+|---|---|---|---|
+| gate-up, folded (skinny / turned) | +207 (7.4 a call) | +274 (9.8) | +67 |
+| o-proj + down (skinny / skinny) | +237 (4.2 a call) | +275 (4.9) | +38 |
+| qkv, folded (skinny / skinny, F39's choice) | +171 (6.3 a call) | +195 (7.2) | +24 |
+| lm head (skinny / turned) | +71 | +72 | +1 |
+
+That is ≈ 130 µs of the 152 µs 4-parallel-over-greedy gap (1.456 vs 1.304 ms): the products
+are most of it.
+
+Counters on the gated turned product at m = 4:
+- 2 waves per SIMD (4-wave blocks, 160 AGPRs + 16 VGPRs; 2 blocks per CU by the 32 KB turn);
+- waves wait 61% of their cycles, mostly on memory;
+- LDS bank conflicts were 147 k a dispatch, fixed by padding the staged rows (sc/amd-gated-turn).
+
+Occupancy does not bind. 384 tiles × 4 waves is 1,536 waves, about 5 per CU against 8
+resident. Every wave's whole weight share is requested at once: 12.6 MB in flight, a floor of
+≈ 1 µs latency + 12.6 MB / 5.3 TB/s ≈ 3.4 µs. The rest is each block's serial tail after its
+data lands (the fold's dependent loads, the MFMAs, the cross-wave LDS reduction, the epilogue),
+longer at four rows. So split-K (no loads added in flight) and 8-wave blocks (no residency
+added) are not expected to help.
+
+Tried, none kept: the norm weight fetched under the row loads (greedy +12 µs); the first tile's
+weight issued after the norm (no change).
+
+In-wave pipelining, checked (2026-11-20):
+- The skinny kernel at m = 4 already computes each chunk as it lands: its ISA waits vmcnt(3),
+  (2), (1), (0), each before its group of MFMAs.
+- The turned folded kernel issued its weight loads, then each norm item's row loads followed by
+  vmcnt(0). The counter retires in issue order, so the norm waited for the whole weight share. A
+  two-phase norm (rows and the norm's weight loaded first from clamped places, then the weight,
+  then the stage's arithmetic in its order; bit-exact; ISA vmcnt(14…8)) overlaps them. It
+  measured slower: 4 parallel 1.482 / 1.480 vs 1.465 / 1.469 ms, beam-4 2.153 / 2.154 vs
+  2.140 / 2.145. Not kept. Issuing the weight after the norm made no difference either.
+
+So the norm's serial chain is not what the four-row products pay. Ruled out: occupancy, split-K,
+load ordering, in-wave pipelining; LDS conflicts were real (fixed, −5 µs). What remains is the
+per-byte work at four rows (each weight byte feeds four rows' MFMAs and reductions).
+
+Next: an MFMA shape that covers four rows without waste. The turned kernel's 16x16x16 spends
+three quarters of each product on padding rows at m = 4; skinny4's 4x4x4-per-block layout lost on
+narrow banks. Each candidate is judged by the cold-weight A/B.
 
 ## F41. Windows NVIDIA (RTX Spark): a one-time submit stall early in an engine's life
 

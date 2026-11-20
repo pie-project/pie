@@ -1133,6 +1133,10 @@ impl<'a> Walk<'a> {
                     rates.vector_tflops_by_rows = self.width_curves(v, key);
                     continue;
                 }
+                key @ crate::fire::ATTN_BY_ROWS_KEYS => {
+                    rates.attn_tflops_by_rows_keys = self.width_curves(v, key);
+                    continue;
+                }
                 key @ "attn_tflops_by_keys" => {
                     rates.attn_tflops_by_keys = self.curve(v, key);
                     continue;
@@ -1147,6 +1151,7 @@ impl<'a> Walk<'a> {
                 "scan_gelems" => &mut rates.scan_gelems,
                 "few_row_tflops" => &mut rates.few_row_tflops,
                 "workgroups_per_core" => &mut rates.workgroups_per_core,
+                crate::fire::SUBMIT_WORST_RATIO => &mut rates.submit_worst_ratio,
                 "launch_ns" => {
                     match int(v.get_ref()).and_then(|i| u64::try_from(i).ok()) {
                         Some(ns) => rates.launch_ns = Some(ns),
@@ -1170,8 +1175,8 @@ impl<'a> Walk<'a> {
                             "`rates` holds `launch_ns`, `gemm_tflops_by_rows`, \
                              `attn_tflops_by_keys`, `hbm_gbps`, `cached_gbps`, `elementwise_gbps`, \
                              `scan_gelems`, `few_row_tflops`, `workgroups_per_core`, \
-                             `tile_tflops_by_rows`, `vector_tflops_by_rows` and `product_ns`, not \
-                             `{other}`"
+                             `tile_tflops_by_rows`, `vector_tflops_by_rows`, `product_ns`, \
+                             `submit_worst_ratio` and `attn_tflops_by_rows_keys`, not `{other}`"
                         ),
                     );
                     continue;
@@ -1192,9 +1197,6 @@ impl<'a> Walk<'a> {
         rates
     }
 
-    /// `rates.<key>` (`gemm_tflops_by_rows`, `tile_tflops_by_rows`): `[key,
-    /// curve]` pairs, a whole positive key (a width, a row tile) and a curve
-    /// of `[rows, TFLOP/s]` each, strictly ascending in the key.
     /// `rates.product_ns`: a list of `[kind, rows, k, m, kernel, ns, spread]`,
     /// whole numbers then a positive time and a spread at least zero, no
     /// shape twice.
@@ -1237,14 +1239,23 @@ impl<'a> Walk<'a> {
         Some(out)
     }
 
+    /// `rates.<key>` (`gemm_tflops_by_rows`, `tile_tflops_by_rows`,
+    /// `vector_tflops_by_rows`, `attn_tflops_by_rows_keys`): `[outer, curve]`
+    /// pairs, a whole positive outer key (a width, a row tile, rows) and a
+    /// curve of `[x, TFLOP/s]` each, strictly ascending in the outer key.
     fn width_curves(
         &mut self,
         value: &Spanned<DeValue<'_>>,
         key: &str,
     ) -> Option<Vec<(u32, Vec<(u32, f64)>)>> {
+        let (outer, inner) = if key == crate::fire::ATTN_BY_ROWS_KEYS {
+            ("rows", "keys")
+        } else {
+            ("width", "rows")
+        };
         let what = format!(
-            "`rates.{key}` is a non-empty list of [width, [[rows, TFLOP/s], ...]] pairs, \
-             ascending in width"
+            "`rates.{key}` is a non-empty list of [{outer}, [[{inner}, TFLOP/s], ...]] pairs, \
+             ascending in {outer}"
         );
         let what = what.as_str();
         let DeValue::Array(widths) = value.get_ref() else {
