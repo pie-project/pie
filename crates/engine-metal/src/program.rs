@@ -4103,8 +4103,9 @@ mod tests {
         assert_eq!(read(&pools), before, "the device slots hold their bytes again");
         assert_eq!(fire(&mut plane, &mut logits, 654), 654, "after the round trip");
 
-        // A role slot asked to the disk tier is refused by name: only kv
-        // pages and rs rows have slot files.
+        // A role slot asked to the disk tier of a load that seated none is
+        // refused by name (CONTRACT-BC 22: any shape goes to disk, within
+        // the disk chunks the load seats).
         let standing = read(&pools);
         let mut frame = context.frame().expect("a frame");
         let refused = pools
@@ -4118,9 +4119,9 @@ mod tests {
                     runs: Vec::new(),
                 },
             )
-            .expect_err("a role slot has no slot file");
+            .expect_err("a load with no disk tier has no disk chunk");
         assert!(
-            format!("{refused}").contains("only kv pages (list) and parked rs rows (fixed) go to disk"),
+            format!("{refused}").contains("chunks of the disk tier"),
             "the refusal names why: {refused}"
         );
         assert_eq!(read(&pools), standing, "the refusal touched nothing");

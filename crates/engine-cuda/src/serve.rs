@@ -619,9 +619,11 @@ impl Shell {
         self.pools.seat_tier(budget, ring)?;
         Ok(self.pools.host_pages())
     }
-    /// Opens this rank's share of `budget` disk kv bytes under `dir`.
-    /// Seats this rank's disk tier; `persistent` keeps its slot file for the
-    /// next run. Answers the pages it holds.
+    /// Seats this rank's share of `budget` disk bytes under `dir`: disk
+    /// chunks of a pool chunk each, any state shape's slots in any chunk,
+    /// laid out as the device's (CONTRACT-BC 22), the division stated at
+    /// load. `persistent` keeps its slot file for the next run. Answers
+    /// the disk chunks it holds.
     pub fn seat_disk_kv(
         &mut self,
         budget: Option<u64>,
@@ -633,17 +635,18 @@ impl Shell {
         let keep =
             persistent.then(|| format!("{} rank {}/{}", self.trace().name, world.rank, ranks));
         let keep = keep.as_deref();
-        match (budget, dir) {
-            (Some(0), _) | (_, None) => {}
+        let stated = match (budget, dir) {
+            (Some(0), _) | (_, None) => None,
             (Some(bytes), Some(dir)) => {
                 self.pools.seat_disk(dir, world.rank, bytes / ranks, keep)?;
+                Some(bytes / ranks)
             }
             (None, Some(dir)) => {
                 // What kept files take already is theirs again, so a restart
                 // sizes the tier as the run that wrote it did.
                 let kept: u64 = if persistent {
-                    (0..ranks)
-                        .map(|rank| engine::disk::kept_bytes(dir, &format!("r{rank}.kv")))
+                    (0..world.size.max(1))
+                        .map(|rank| engine::disk::kept_bytes(dir, &crate::store::disk_file(rank)))
                         .sum()
                 } else {
                     0
@@ -654,9 +657,25 @@ impl Shell {
                 if self.pools.seat_disk(dir, world.rank, bytes, keep).is_err() {
                     self.pools.unseat_disk();
                 }
+                Some(bytes)
             }
+        };
+        let chunks = self.pools.disk_chunks();
+        if let (Some(budget), true) = (stated, chunks > 0) {
+            let division = self
+                .pools
+                .disk_division()
+                .iter()
+                .map(|(id, per, bytes)| format!("shape {id}: {per} slots of {bytes} bytes"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            eprintln!(
+                "engine-cuda: the disk tier: {budget} bytes in {chunks} disk chunks of {} bytes, \
+                 each laid out as the device's, any state shape's slots in any chunk ({division})",
+                self.pools.disk_chunk_bytes()
+            );
         }
-        Ok(self.pools.disk_pages())
+        Ok(chunks)
     }
 
     /// The disk tier is kept, and holds what the last run left.
@@ -955,6 +974,12 @@ impl Shell {
         bytes: u64,
     ) -> Result<u64> {
         self.pools.guest_span(role, refs, bytes)
+    }
+
+    /// The device address of slot ref `slot` of `shape`, its chunk seated
+    /// for the shape.
+    pub fn slot_span(&mut self, shape: engine::chunk::ShapeId, slot: u32) -> Result<u64> {
+        self.pools.slot_span(shape, slot)
     }
 
     /// The slots a guest item of `bytes` takes.

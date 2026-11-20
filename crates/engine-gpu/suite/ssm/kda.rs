@@ -7,7 +7,7 @@
 use kernels_slang::Tensor;
 use poem_ir::Dtype;
 
-use crate::gpu::{CSR_AT, Gpu, Out, csr_at, landed, noise};
+use crate::gpu::{CSR_AT, Gpu, Out, committed_batches, csr_at, landed, noise};
 
 const SLOTS: usize = 3;
 const HEADS: usize = 2;
@@ -317,30 +317,48 @@ fn the_kda_answers_the_reference() {
                 lane0: lane0 as u32,
             };
             let work = 4 * slab;
-            let work_t = |buf: u32| t(buf, 4, slab, Dtype::F32);
+            // The window's 3 lanes in one dispatch, and in dispatches of a
+            // work plane holding 2 and 1 of them.
             for at in CSR_AT {
-                let csr = csr_at(&mut gpu, &indptr, at);
-                landed(
-                    &mut gpu,
-                    &format!("{} csr at {at}", what("committed")),
-                    &fresh(rows, work),
-                    &[want_y.clone(), want_s.clone()],
-                    &|g, o| {
-                        g.run(|c| {
-                            kernels_slang::ssm::kda::kda_committed(
-                                c,
-                                tier,
-                                p.mixed,
-                                csr,
-                                &committed,
-                                &p.gates(fl, p.f, p.b),
-                                &pool(o[1].0, sb, 4),
-                                work_t(o[2].0),
-                                y(o[0].0, rows),
-                            )
-                        })
-                    },
-                );
+                for batch in [3u32, 2, 1] {
+                    let csr = csr_at(&mut gpu, &indptr, at);
+                    let batches = committed_batches(3, batch, &replay, lane0 as u32);
+                    landed(
+                        &mut gpu,
+                        &format!(
+                            "{} csr at {at}, {batch} lane(s) a dispatch",
+                            what("committed")
+                        ),
+                        &fresh(rows, work),
+                        &[want_y.clone(), want_s.clone()],
+                        &|g, o| {
+                            g.run(|c| {
+                                for &(first, lanes, row0) in &batches {
+                                    kernels_slang::ssm::kda::kda_committed(
+                                        c,
+                                        tier,
+                                        p.mixed,
+                                        kernels_slang::ssm::Csr {
+                                            at: csr.at + first,
+                                            lanes,
+                                            ..csr
+                                        },
+                                        &kernels_slang::ssm::Committed {
+                                            lane0: committed.lane0 + first,
+                                            ..committed
+                                        },
+                                        &p.gates(fl, p.f, p.b),
+                                        &pool(o[1].0, sb, 4),
+                                        t(o[2].0, batch as usize, slab, Dtype::F32),
+                                        y(o[0].0, rows),
+                                        row0,
+                                    )?;
+                                }
+                                Ok(())
+                            })
+                        },
+                    );
+                }
             }
         }
     }
