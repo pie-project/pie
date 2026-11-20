@@ -451,6 +451,11 @@ pub struct RsTables {
     pub lanes: DevicePtr,
     pub pages: DevicePtr,
     pub replay_tok: DevicePtr,
+    /// Each replayed row resolved, at its token's index: its page slot's
+    /// address with the row in the page in the top 16 bits. The host writes
+    /// a plain lane's; a beam group's head step writes its beams' once it
+    /// has resolved their pages (`BeamRsRun`).
+    pub resolved: DevicePtr,
     /// The rows a page holds.
     pub page_tokens: u32,
 }
@@ -745,9 +750,15 @@ pub struct BeamRsRun {
     pub base: u32,
     pub tokens: u32,
     pub bases_len: u32,
+    /// The fire's staged rs lanes, replay rows and resolved rows: the head
+    /// step resolves the lane's replayed rows over the pages it wrote (null
+    /// `resolved`: none).
+    pub lanes_tab: DevicePtr,
+    pub replay_tok: DevicePtr,
+    pub resolved: DevicePtr,
 }
 
-const _: () = assert!(size_of::<BeamRsRun>() == 40);
+const _: () = assert!(size_of::<BeamRsRun>() == 64);
 
 /// A beam's rs copy (`BEAM-PAGE-LISTS.md` §6.4 on a hybrid, `channel.hip`'s
 /// `RsCopyRun`): the `[src, dst, tokens]` its group's step left at `copy`,

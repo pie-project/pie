@@ -113,6 +113,9 @@ fn search_rs(gpu: &mut Gpu, lanes: u32, folded: u32, steps: u32, seed: u64, rs_t
         let rs_entries = (slot - rs_from_slot) / rs_tokens + 1;
         let rs_runs: Vec<BeamRsRun> = (0..lanes)
             .map(|b| BeamRsRun {
+                lanes_tab: 0,
+                replay_tok: 0,
+                resolved: 0,
                 pages: rs_pages_at,
                 bases: rs_bases_at,
                 lane: b,

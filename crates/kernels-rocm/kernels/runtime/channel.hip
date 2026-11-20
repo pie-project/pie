@@ -677,9 +677,14 @@ struct BeamRsRun {
     u32 base;
     u32 tokens;
     u32 bases_len;
+    // The fire's staged rs lanes, replay rows and resolved rows (null
+    // `resolved`: none to resolve).
+    const RsLane* lanes_tab;
+    const u32* replay_tok;
+    u64* resolved;
 };
 
-static_assert(sizeof(BeamRsRun) == 40, "BeamRsRun: the Rust `channel::BeamRsRun` mirrors this layout");
+static_assert(sizeof(BeamRsRun) == 64, "BeamRsRun: the Rust `channel::BeamRsRun` mirrors this layout");
 
 // A beam's rs copy (§6.4 on a hybrid): the first `tokens` slots of pool page
 // `src` to pool page `dst` (the `[src, dst, tokens]` its group's step left
@@ -987,6 +992,20 @@ __global__ void beam_step(const BeamStepRun* __restrict__ runs, u32 run_count)
                 continue;
             }
             l.pages[l.from + e] = l.bases[at];
+        }
+    }
+    __syncthreads();
+    // Each beam lane's replayed rows resolved over the pages just written:
+    // a row's page slot with its row in the top 16 bits.
+    for (u32 i = 0u; i < r.rs_count; ++i) {
+        const BeamRsRun l = r.rs[i];
+        if (l.resolved == nullptr) continue;
+        const RsLane lane = l.lanes_tab[l.lane];
+        const u32 T = l.tokens == 0u ? 1u : l.tokens;
+        for (u32 k = threadIdx.x; k < lane.replay; k += blockDim.x) {
+            const u32 tok = l.replay_tok[lane.replay_off + k];
+            l.resolved[lane.replay_off + k] =
+                l.pages[lane.page_off + tok / T] | (static_cast<u64>(tok % T) << 48);
         }
     }
     __syncthreads();

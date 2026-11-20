@@ -33,6 +33,10 @@ struct Carry {
     const CarryLane* lanes;
     const u64* pages;
     const u32* replay_tok;
+    // Each replayed row resolved: its page slot's address, the row in the
+    // page in the top 16 bits (`RsTables::resolved`), at the index its token
+    // has in the replay table. One read reaches a carried row.
+    const u64* resolved;
     const int* commit_len;
     u8* scratch;
     u64 plane_off[3];
@@ -69,7 +73,10 @@ struct Carry {
     // The page row of the lane's j-th carried row of plane `p`.
     template <class T>
     __device__ __forceinline__ const T* carried_row(const CarryLane& l, int j, int p) const {
-        return at_tok<const T>(l, replay_tok[l.replay_off + j], p);
+        u64 slot;
+        u32 tok;
+        carried_at(l, j, slot, tok);
+        return plane_at<const T>(slot, tok, p);
     }
 
     // The page row the lane's own row `e` lands at, of plane `p`; null where
@@ -83,9 +90,9 @@ struct Carry {
     // The page slot of the lane's j-th carried row, and its token in it:
     // what `plane_at` reads any plane of the row from.
     __device__ __forceinline__ void carried_at(const CarryLane& l, int j, u64& slot, u32& tok) const {
-        const u32 t = replay_tok[l.replay_off + j];
-        slot = pages[l.page_off + t / page_tokens];
-        tok = t % page_tokens;
+        const u64 w = resolved[l.replay_off + j];
+        slot = w & 0xffffffffffffull;
+        tok = static_cast<u32>(w >> 48);
     }
 
     template <class T>

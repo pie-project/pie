@@ -36,6 +36,10 @@ struct Carry {
     const CarryLane* lanes;
     const u64* pages;
     const u32* replay_tok;
+    // Each replayed row resolved: its page slot's address, the row in the
+    // page in the top 16 bits (`RsTables::resolved`), at the index its token
+    // has in the replay table. One read reaches a carried row.
+    const u64* resolved;
     const int* commit_len;
     u8* scratch;
     u64 plane_off[3];
@@ -72,7 +76,9 @@ struct Carry {
 
     // The page slot and row of the lane's j-th carried row.
     __device__ __forceinline__ void carried_at(const CarryLane& l, int j, u64& slot, u32& row) const {
-        slot_of(l, replay_tok[l.replay_off + j], slot, row);
+        const u64 w = resolved[l.replay_off + j];
+        slot = w & 0xffffffffffffull;
+        row = static_cast<u32>(w >> 48);
     }
 
     // Plane `p` of the lane's j-th carried row.

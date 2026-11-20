@@ -1729,6 +1729,10 @@ impl Shell {
         let mut rs_lanes: Vec<kernels_cuda::runtime::channel::RsLane> = Vec::new();
         let mut rs_slots: Vec<u64> = Vec::new();
         let mut rs_tokens: Vec<u32> = Vec::new();
+        // Each replayed row resolved over its lane's pages: a carried row is
+        // one read from the kernels that step it (a beam group's lanes',
+        // over pages its head step writes, it resolves itself).
+        let mut rs_resolved: Vec<u64> = Vec::new();
         if rs_body.buffers() {
             let buffers = self.buffers.as_ref().ok_or_else(|| Fault::Unbound {
                 what: "the rs buffer of a fire whose lanes buffer recurrent rows, against a \
@@ -1766,6 +1770,13 @@ impl Shell {
                 }
                 for span in &rs_reads[fire_lane] {
                     rs_tokens.extend(span.clone());
+                }
+                for &tok in &rs_tokens[replay_off as usize..] {
+                    let slot = rs_slots
+                        .get(page_off + (tok / tokens) as usize)
+                        .copied()
+                        .unwrap_or(0);
+                    rs_resolved.push(slot | (u64::from(tok % tokens) << 48));
                 }
                 rs_lanes.push(kernels_cuda::runtime::channel::RsLane {
                     at: *at,
@@ -2236,6 +2247,7 @@ impl Shell {
                     lanes: &rs_lanes,
                     pages: &rs_slots,
                     replay_tok: &rs_tokens,
+                    resolved: &rs_resolved,
                 }),
             },
         )?;

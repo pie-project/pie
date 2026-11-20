@@ -931,6 +931,7 @@ impl FireCtx<'_> {
                     lanes: tables.lanes,
                     pages: tables.pages,
                     replay_tok: tables.replay_tok,
+                    resolved: tables.resolved,
                     page_tokens: buffers.page_tokens(),
                 },
                 extended: p.rs.body == record::RsBody::Replays,

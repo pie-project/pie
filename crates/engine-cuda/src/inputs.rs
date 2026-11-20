@@ -249,6 +249,8 @@ pub struct RsHandles {
     pub lanes: u64,
     pub pages: u64,
     pub replay_tok: u64,
+    /// Each replayed row resolved (`RsTables::resolved`).
+    pub resolved: u64,
 }
 
 const RS_LANE_BYTES: u64 = size_of::<kernels_cuda::runtime::channel::RsLane>() as u64;
@@ -265,6 +267,9 @@ pub struct RsFire<'a> {
     pub lanes: &'a [kernels_cuda::runtime::channel::RsLane],
     pub pages: &'a [u64],
     pub replay_tok: &'a [u32],
+    /// `replay_tok` resolved over `pages` where the host knows them (a beam
+    /// group's lanes' are written by its head step).
+    pub resolved: &'a [u64],
 }
 
 /// The rs section's offsets and capacities.
@@ -274,6 +279,7 @@ struct RsAt {
     pages: u64,
     pages_cap: u64,
     replay_tok: u64,
+    resolved: u64,
     replay_cap: u64,
 }
 
@@ -621,7 +627,7 @@ fn stage_pages(
     store: &mut Buffer,
     at: PagesAt,
     tables: &[TableHandles],
-    rs_pages: Option<u64>,
+    rs: Option<RsHandles>,
     work: &crate::serve::pages::PageWork,
     slot: u32,
 ) -> Result<Option<u64>> {
@@ -704,9 +710,12 @@ fn stage_pages(
         .rs
         .iter()
         .map(|list| {
-            rs_pages
-                .map(|pages| BeamRsRun {
-                    pages,
+            rs
+                .map(|rs| BeamRsRun {
+                    pages: rs.pages,
+                    lanes_tab: rs.lanes,
+                    replay_tok: rs.replay_tok,
+                    resolved: rs.resolved,
                     bases: base + at.bases + u64::from(list.bases_at) * 8,
                     lane: list.lane,
                     from: list.from,
@@ -1066,6 +1075,7 @@ impl Inputs {
                 pages: take(pages_cap * 8),
                 pages_cap,
                 replay_tok: take(replay_cap * 4),
+                resolved: take(replay_cap * 8),
                 replay_cap,
             }
         });
@@ -1565,6 +1575,14 @@ impl Inputs {
                     u32_bytes_of(tables.replay_tok),
                     "staged rs replay rows",
                 )?;
+                // SAFETY: plain integers, read as their bytes.
+                let resolved = unsafe {
+                    core::slice::from_raw_parts(
+                        tables.resolved.as_ptr().cast::<u8>(),
+                        tables.resolved.len() * 8,
+                    )
+                };
+                put(at.resolved, resolved, "staged rs resolved rows")?;
                 Some((tables.pages.len() as u32, tables.replay_tok.len() as u32))
             }
         };
@@ -1893,10 +1911,12 @@ impl Inputs {
                 )?;
                 copy(at.pages, *pages as usize * 8)?;
                 copy(at.replay_tok, *toks as usize * 4)?;
+                copy(at.resolved, *toks as usize * 8)?;
                 Some(RsHandles {
                     lanes: base + at.lanes,
                     pages: base + at.pages,
                     replay_tok: base + at.replay_tok,
+                    resolved: base + at.resolved,
                 })
             }
             _ => None,
@@ -1932,7 +1952,7 @@ impl Inputs {
             &mut *store,
             *pages_at,
             &page_tables,
-            rs.as_ref().map(|handles| handles.pages),
+            rs,
             pages,
             slot.at(),
         )?;
