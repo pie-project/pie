@@ -361,11 +361,11 @@ fn conv1d_chunked(
 
 /// The causal conv's decode step over each lane's carried rows then its own
 /// ([`Carry`]): `conv1d_update`'s sums a row, the own row's window from the
-/// committed cells and at most `conv_width - 1` carried rows, the carried
-/// rows' outputs into the carried scratch where it is laid (a recurrence
-/// that re-steps them), the window stored at the lane's commit length; the
-/// own row's input lands in the lane's buffer (plane 0), and its output's
-/// channels `keys` (offset, count: a gated-delta layer's keys) in plane 1.
+/// committed cells and at most `conv_width - 1` carried rows, the window
+/// stored at the lane's commit length; the own row's input lands in the
+/// lane's buffer (plane 0), and its output's channels `keys` (offset,
+/// count: the channels its recurrence reads its buffered rows by) in plane
+/// 1.
 #[allow(clippy::too_many_arguments)]
 pub fn causal_conv1d_carried(
     ctx: &Ctx,
@@ -462,20 +462,9 @@ fn conv1d_carried(
         && aligned16(weight.ptr)
         && bias.is_none_or(|b| aligned16(b.ptr))
         && aligned16(state.conv_slab.ptr)
-        && aligned16(carry.scratch)
         && carry.plane_off.iter().all(|off| off.is_multiple_of(16))
         && carry.plane_stride.iter().all(|stride| stride.is_multiple_of(16))
         && keys.is_none_or(|(off, len)| off % CONV_VEC == 0 && len % CONV_VEC == 0);
-    if keys.is_some() && !vectors {
-        return Err(refuse(
-            op,
-            format!(
-                "a gated-delta layer's decode conv lands its rows' keys eight channels a \
-                 thread, and this {channels}-channel, {conv_width}-tap conv \
-                 of dilation {dilation} takes the scalar step"
-            ),
-        ));
-    }
     let mut args = vec![
         x.arg(),
         weight.arg(),

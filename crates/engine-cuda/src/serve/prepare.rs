@@ -1670,18 +1670,13 @@ impl Shell {
         // runtime lets one carry (`engine::fire::rung_rows`): one that
         // replays more is refused here, before a page is committed or a
         // row written.
-        // A decoding lane's carried rows take none of the run where its
-        // decode step reads them as a linear attention.
-        let restep = self
-            .buffers
-            .as_ref()
-            .is_some_and(|buffers| buffers.planes().restep());
+        // A decoding lane's carried rows take none of the run: its decode
+        // steps read them as a linear attention.
         let in_run = |fire_lane: usize| {
-            restep
-                || composition
-                    .lanes()
-                    .get(fire_lane)
-                    .is_none_or(|row| !self.decoding.contains(row.class as usize))
+            composition
+                .lanes()
+                .get(fire_lane)
+                .is_none_or(|row| !self.decoding.contains(row.class as usize))
         };
         let replayed: u32 = rs_reads
             .iter()

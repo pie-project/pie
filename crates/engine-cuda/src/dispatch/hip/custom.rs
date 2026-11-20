@@ -726,11 +726,11 @@ impl Run<'_> {
                 .map(|(plane, _, _)| plane);
             if let Some(k_plane) = k_plane {
                 let conv_carry = self
-                    .rs_carry(OP, &[x_plane, k_plane], 0, &conv_pool)
+                    .rs_carry(OP, &[x_plane, k_plane], &conv_pool)
                     .map_err(crate::error::kernel)?;
                 let step_planes = self.gdn_planes(OP, ba, y).map_err(crate::error::kernel)?;
                 let step_carry = self
-                    .rs_carry(OP, &step_planes, 0, &pool)
+                    .rs_carry(OP, &step_planes, &pool)
                     .map_err(crate::error::kernel)?;
                 let done = kernels_cuda::ssm::gdn_step_fused_carried(
                     self.ctx(),

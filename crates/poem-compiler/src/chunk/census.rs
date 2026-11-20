@@ -516,18 +516,49 @@ fn rs_rows(
                     recurrences.push((planes, *state, node.layer));
                 }
             }
+            // With `rs_corrected` a KDA row keeps its keys (the conv
+            // output's key plane, bf16) and its corrected values (f32), as
+            // a gated-delta row does.
             Operation::Ssm(Ssm::KdaChunked {
-                mixed, f, b, state, ..
+                mixed,
+                f,
+                b,
+                state,
+                y,
+                heads,
+                head_dim,
+                ..
             }) => {
                 if let Some(x) = conv_x(*mixed) {
-                    recurrences.push((vec![(x, None), (*f, None), (*b, None)], *state, node.layer));
+                    let mut planes = vec![(x, None), (*f, None), (*b, None)];
+                    if rs_corrected {
+                        let width = u64::from(heads * head_dim);
+                        planes.push((*mixed, Some(width * RS_ELEMENT)));
+                        planes.push((*y, Some(width * 4)));
+                    }
+                    recurrences.push((planes, *state, node.layer));
                 }
             }
             // A Mamba-2 layer replays its conv's input and its step sizes;
-            // its gate `z` reads only the rows a fire lands.
-            Operation::Ssm(Ssm::Mamba2Chunked { xbc, dt, state, .. }) => {
+            // its gate `z` reads only the rows a fire lands. With
+            // `rs_corrected` a row keeps its convolved `x | B` (the conv
+            // output but its `C`), which its decode step reads it by.
+            Operation::Ssm(Ssm::Mamba2Chunked {
+                xbc,
+                dt,
+                state,
+                groups,
+                state_dim,
+                ..
+            }) => {
                 if let Some(x) = conv_x(*xbc) {
-                    recurrences.push((vec![(x, None), (*dt, None)], *state, node.layer));
+                    let mut planes = vec![(x, None), (*dt, None)];
+                    if rs_corrected {
+                        let xbc_width = width_of(trace, *xbc).ok_or(ChunkError::UnsizedRs)?;
+                        let xb = xbc_width.saturating_sub(u64::from(groups * state_dim));
+                        planes.push((*xbc, Some(xb * RS_ELEMENT)));
+                    }
+                    recurrences.push((planes, *state, node.layer));
                 }
             }
             Operation::Gather(
