@@ -127,6 +127,9 @@ impl Compiled {
 /// one-cell ring the host neither reads nor writes, bound to no port, input
 /// or extern, taken and put by one stage and touched by no other. Their
 /// cells can stay on the device between passes (`Plane::fire_guests`).
+/// So does a beam group's parents (`Port::Parents`, BEAM-PAGE-LISTS §2): a
+/// one-cell ring the host never sees, put by one stage, read by the group's
+/// next head from its cell on the device and by nothing else.
 #[must_use]
 pub fn carried_channels(package: &LaunchPackage) -> Vec<u32> {
     let mut out = Vec::new();
@@ -135,7 +138,9 @@ pub fn carried_channels(package: &LaunchPackage) -> Vec<u32> {
         if decl.capacity != 1
             || decl.host_role != eta_ir::container::HostRole::None
             || decl.extern_dir.is_some()
-            || package.ports.iter().any(|p| !p.is_const && p.channel == c)
+            || package.ports.iter().any(|p| {
+                !p.is_const && p.channel == c && p.port != eta_ir::registry::Port::Parents
+            })
             || package.inputs.contains(&c)
         {
             continue;
@@ -154,7 +159,11 @@ pub fn carried_channels(package: &LaunchPackage) -> Vec<u32> {
         };
         let takes = stage.takes.iter().filter(|&&t| t == c).count();
         let puts = stage.puts.iter().filter(|p| p.channel == c).count();
-        if takes == 1 && puts == 1 && !stage.reads.contains(&c) {
+        let parents = package
+            .ports
+            .iter()
+            .any(|p| !p.is_const && p.channel == c && p.port == eta_ir::registry::Port::Parents);
+        if (takes == 1 || parents && takes == 0) && puts == 1 && !stage.reads.contains(&c) {
             out.push(c);
         }
     }
