@@ -183,6 +183,14 @@ pub trait Frame<B: Backend>: 'static {
     /// The dispatches the frame has encoded so far.
     fn dispatches(&self) -> u64;
 
+    /// `(taken, room)`: the bytes the frame's dispatches have taken so far of
+    /// the region a frame writes its dispatches' parameters to, and that
+    /// region's bytes, where the backend bounds them so; `None` where it
+    /// bounds none.
+    fn uniform_room(&self) -> Option<(u64, u64)> {
+        None
+    }
+
     /// Submits what the frame holds so far; it records on.
     fn flush(&self) -> Result<()>;
 

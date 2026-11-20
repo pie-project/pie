@@ -894,6 +894,13 @@ impl Frame {
         Ok(f(encoder))
     }
 
+    /// The bytes this frame's dispatches have taken of its uniform region,
+    /// and the region's bytes.
+    pub(crate) fn uniform_room(&self) -> (u64, u64) {
+        let ring = self.inner.uniforms.lock().expect("uniforms lock poisoned");
+        (if ring.region.is_some() { ring.used } else { 0 }, UNIFORM_CHUNK)
+    }
+
     /// `bytes` of this frame's region of the uniform buffer: the buffer and
     /// the slot's first byte in it.
     pub(crate) fn uniform_slot(&self, bytes: u64) -> Result<(wgpu::Buffer, u64)> {

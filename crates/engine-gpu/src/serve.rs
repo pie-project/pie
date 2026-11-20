@@ -107,11 +107,14 @@ pub trait Serve: Backend {
     /// Opens the device (adopting `handed` where the host handed one) and
     /// its tuning.
     /// Opens the device (adopting `handed` where the host handed one), of
-    /// which the load takes no more than `allowance` caps, and its tuning.
+    /// which the load takes no more than `allowance` caps, and its tuning,
+    /// its rates reaching `top_rows`, the most rows a fire of the load may
+    /// bring.
     fn open(
         boot: &Self::DeviceBoot,
         allowance: engine::Allowance,
         handed: Option<Self::Handed>,
+        top_rows: u32,
     ) -> Result<(Self::Context, Self::Tuning)>;
 
     /// The chunk size the pool's recipe aims at in place of the profile's.
@@ -880,7 +883,12 @@ impl<B: Serve> Shell<B> {
     /// device binds.
     fn fit(boot: Boot<'_, B>) -> Result<(Boot<'_, B>, Fitted<B>)> {
         let mut boot = boot;
-        let (device, mut tuning) = B::open(boot.device, boot.residency.device, boot.handed.take())?;
+        let (device, mut tuning) = B::open(
+            boot.device,
+            boot.residency.device,
+            boot.handed.take(),
+            boot.budget.max_tokens.max(1),
+        )?;
         let tier = B::tier(&device);
         let mut boot = Boot {
             trace: poem_compiler::fuse::fuse(

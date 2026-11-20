@@ -40,8 +40,11 @@ pub fn at_load(
     tuning: crate::tuning::Tuning,
     profiles: Option<&std::path::Path>,
     max_submit: Option<std::time::Duration>,
+    top_rows: u32,
 ) -> Result<crate::tuning::Tuning> {
-    let chip = tuning.profile().clone();
+    // A curve of the kernels' rates by rows that stops short of the load's
+    // most rows is measured again, to them (`engine_gpu::rates::reaching`).
+    let chip = engine_gpu::rates::reaching(tuning.profile().clone(), top_rows);
     // What the profile states stands; a load times only what it lacks.
     let stated = chip.rates();
     let measured = device.chip();
@@ -56,7 +59,9 @@ pub fn at_load(
         save,
         Some(device.left()),
         max_submit,
-        |max_submit| measure(device, &tuning, max_submit, &stated).map_err(|e| e.to_string()),
+        |max_submit| {
+            measure(device, &tuning, max_submit, &stated, top_rows).map_err(|e| e.to_string())
+        },
     )
     .map_err(|why| engine_gpu::error::Fault::Device {
         call: "rates at load",
@@ -73,8 +78,9 @@ pub fn measure(
     tuning: &crate::tuning::Tuning,
     max_submit: Option<std::time::Duration>,
     stated: &profile::fire::Rates,
+    top_rows: u32,
 ) -> Result<engine::rates::Measured> {
-    measure_saying(device, tuning, max_submit, stated, &mut |_| {})
+    measure_saying(device, tuning, max_submit, stated, top_rows, &mut |_| {})
 }
 
 /// [`measure`], saying how the warm-up ended and what each shape reached.
@@ -83,6 +89,7 @@ pub fn measure_saying(
     tuning: &crate::tuning::Tuning,
     max_submit: Option<std::time::Duration>,
     stated: &profile::fire::Rates,
+    top_rows: u32,
     say: &mut dyn FnMut(&str),
 ) -> Result<engine::rates::Measured> {
     let tier = <Api as engine_gpu::serve::Serve>::tier(device);
@@ -97,7 +104,7 @@ pub fn measure_saying(
         Ok((span, (host * 1e9) as u64))
     };
     engine_gpu::rates::measure_saying::<Api, _>(
-        device, tuning, tier, &timer, max_submit, stated, say,
+        device, tuning, tier, &timer, max_submit, stated, top_rows, say,
     )
 }
 

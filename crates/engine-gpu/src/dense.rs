@@ -2,12 +2,11 @@
 //! whichever the estimate (`engine::roofline`) weighs fastest over the
 //! model's dense planes, from the device's measured rates: each vector
 //! kernel (by the rows a workgroup carries) at its measured rate at the rows
-//! it lands (`vector_tflops_by_rows`); each tiled kernel at its own measured rate
-//! at the rows it lands (`tile_tflops_by_rows`) below the matmul curve's
-//! first row count, and on the `gemm_tflops_by_rows` curve, its rows padded
-//! to its tile, from there. A measured rate holds every weight pass the
-//! kernel makes; past its measurements a kernel reads its plane once a group
-//! of rows that share a read (`gemm::Kernel::rows_a_read`), no cache assumed.
+//! it lands (`vector_tflops_by_rows`); each tiled kernel at its own measured
+//! rate at the rows it lands (`tile_tflops_by_rows`). A measured rate holds
+//! every weight pass the kernel makes. No kernel is weighed past the rows it
+//! was timed at: it is no candidate there (the rates step times every kernel
+//! to the load's most rows, `crate::rates::reaching`).
 //!
 //! A backend that records its fires (one recording a rung) takes one kernel
 //! a rung, whatever rows a fire of it lands: the one whose worse cost over
@@ -142,6 +141,11 @@ pub fn tiled_kernels(target: Target, base: Tactic) -> Vec<Tactic> {
     }
 }
 
+/// What a load is refused by where no kernel was timed at a rung's rows:
+/// the rates step times every kernel to the load's most rows
+/// (`crate::rates::reaching`), so the key whose curves stop short.
+pub const UNREACHED: &str = "tile_tflops_by_rows";
+
 /// The dense tactic over `rungs` (ascending rows) on `target`, the model's
 /// dense planes (`counts`: every dense shape and the output head, each a
 /// dispatch reading its plane) weighed over `rates`; `tiled` is the
@@ -208,45 +212,24 @@ pub fn choose(
             let at = rows.max(first);
             profile::fire::interpolate(curve, f64::from(at)).map(|t| flops(at) / (t * 1e3))
         };
-    // `tactic`'s cost over every plane at `rows`, in ns.
-    let cost = |tactic: Tactic, rows: u32| -> f64 {
+    // `tactic`'s cost over every plane at `rows`, in ns: each plane at the
+    // kernel's measured rate at the rows it lands (timed as it runs, every
+    // weight pass it makes and whatever a cache spares it in the time), and
+    // a launch. `None` where its curve does not reach the rows: no kernel is
+    // weighed past the rows it was timed at.
+    let cost = |tactic: Tactic, rows: u32| -> Option<f64> {
         let mut ns = 0.0;
-        for &(n, k, count, bytes) in &planes {
+        for &(n, k, count, _) in &planes {
             let flops = |rows: u32| 2.0 * f64::from(rows) * f64::from(n) * f64::from(k);
             let kernel = gemm::tile_for(target, tactic, n, k);
-            // The kernel's measured rate at the rows it lands, where its curve
-            // reaches them: timed as it runs, every weight pass it makes (and
-            // whatever a cache spares it) in the time: that time alone, no
-            // bandwidth floor beside it. Else the vector kernel's last measured rate and
-            // a tiled kernel's on the matmul curve, its rows padded to its
-            // tile, each reading the plane once a group of rows sharing a
-            // read (no cache assumed).
-            let timed = if tactic.vector > 0 {
-                measured(vectors, tactic.vector, rows, &flops)
+            let work = if tactic.vector > 0 {
+                measured(vectors, tactic.vector, rows, &flops)?
             } else {
-                measured(tiles, kernel.row_tile().max(1), rows, &flops)
-            };
-            let work = match timed {
-                Some(ns) => ns,
-                None => {
-                    let passes = f64::from(rows.div_ceil(kernel.rows_a_read().max(1)));
-                    let compute = if tactic.vector > 0 {
-                        let last = vectors
-                            .iter()
-                            .find(|(at, _)| *at == tactic.vector)
-                            .and_then(|(_, c)| c.last())
-                            .map_or(f64::MIN_POSITIVE, |&(_, t)| t * 1e3);
-                        flops(rows) / last
-                    } else {
-                        let tile = kernel.row_tile().max(1);
-                        flops(rows.div_ceil(tile) * tile) / c.gemm_rate(rows, n, k)
-                    };
-                    compute.max(passes * bytes / c.bytes_per_ns)
-                }
+                measured(tiles, kernel.row_tile().max(1), rows, &flops)?
             };
             ns += f64::from(count) * (c.launch_ns + work);
         }
-        ns
+        Some(ns)
     };
 
     let mut by_rows = Vec::new();
@@ -254,10 +237,14 @@ pub fn choose(
     let mut below = 0;
     for &rung in rungs {
         let bottom = (below + 1).min(rung);
+        // The candidates timed over the rung's rows, bottom to top.
         let costs: Vec<(Tactic, f64, f64)> = candidates(rung)
             .into_iter()
-            .map(|t| (t, cost(t, bottom), cost(t, rung)))
+            .filter_map(|t| Some((t, cost(t, bottom)?, cost(t, rung)?)))
             .collect();
+        if costs.is_empty() {
+            return Err(UNREACHED);
+        }
         let rows_of = |t: &Tactic| rows_a_workgroup(target, t);
         let taken = Weighed::least_regret(&costs, &rows_of);
         if records {
@@ -266,10 +253,10 @@ pub fn choose(
             for rows in bottom..=rung {
                 let fastest = candidates(rows)
                     .into_iter()
-                    .map(|t| (t, cost(t, rows)))
+                    .filter_map(|t| Some((t, cost(t, rows)?)))
                     .min_by(|a, b| a.1.total_cmp(&b.1).then(rows_of(&a.0).cmp(&rows_of(&b.0))))
                     .map(|(t, _)| t)
-                    .expect("one candidate at least");
+                    .ok_or(UNREACHED)?;
                 by_rows.push((rows, fastest));
             }
         }
@@ -324,7 +311,7 @@ mod tests {
             elementwise_gbps: Some(700.0),
             vector_tflops_by_rows: few.map(|t| {
                 gemm::VECTOR_ROWS
-                    .map(|rows| (rows, vec![(1, t), (256, t)]))
+                    .map(|rows| (rows, vec![(1, t), (8192, t)]))
                     .to_vec()
             }),
             tile_tflops_by_rows: Some(tiles),
@@ -333,9 +320,18 @@ mod tests {
     }
 
     /// A coopmat tile measured at a sixtieth of the curve's rate at 4 rows,
-    /// rising to it at 256.
+    /// rising to it at 256 and on to 8192.
     fn coopmat_tiles() -> Vec<(u32, Vec<(u32, f64)>)> {
-        vec![(64, vec![(4, 0.16), (64, 2.5), (256, 10.0)])]
+        vec![(
+            64,
+            vec![
+                (4, 0.16),
+                (64, 2.5),
+                (256, 10.0),
+                (2048, 30.0),
+                (8192, 30.0),
+            ],
+        )]
     }
 
     fn coopmat(_: u32) -> Tactic {
@@ -441,7 +437,7 @@ mod tests {
     fn the_cost_grows_with_the_rows() {
         let rungs: Vec<u32> = engine::memory::rungs(1, 8192);
         let flat_tiles: Vec<(u32, Vec<(u32, f64)>)> = [16, 32, 64, 256]
-            .map(|t| (t, vec![(4, 20.0), (256, 20.0)]))
+            .map(|t| (t, vec![(4, 20.0), (8192, 20.0)]))
             .to_vec();
         let mut flat = rates(Some(5.0), flat_tiles);
         flat.gemm_tflops_by_rows = Some(vec![(4096, vec![(256, 20.0)])]);
@@ -495,5 +491,53 @@ mod tests {
         let (_, four) = choose(Target::Spirv, &[4], baseline, &r, &counts(), true).unwrap();
         let tiled = |w: &[Weighed]| w[0].costs.iter().find(|c| c.0.vector == 0).unwrap().2;
         assert_eq!(tiled(&one), tiled(&four));
+    }
+
+    /// A tiled kernel whose curve stops short of a rung is no candidate
+    /// there (no pick from a rate it was never timed at), and a profile whose
+    /// curves all stop short of the load's most rows has them measured again.
+    #[test]
+    fn a_curve_that_stops_short_is_no_candidate_past_it() {
+        let baseline = |_| Tactic {
+            tier: Tier::Baseline,
+            vector: 0,
+            wide: true,
+        };
+        // The 32-row tile measured fast but only to 256 rows; the register
+        // tile measured to 4096, slower.
+        let tiles = vec![
+            (32, vec![(1, 0.5), (256, 50.0)]),
+            (256, vec![(1, 0.1), (256, 5.0), (4096, 8.0)]),
+        ];
+        let mut r = rates(Some(0.01), tiles);
+        r.vector_tflops_by_rows = Some(vec![(4, vec![(1, 0.01), (4096, 0.01)])]);
+        let (dense, weighed) = choose(
+            Target::Spirv,
+            &[256, 512, 1024],
+            baseline,
+            &r,
+            &counts(),
+            true,
+        )
+        .unwrap();
+        assert!(!dense.at(256).wide, "{weighed:?}");
+        for rows in [512, 1024] {
+            assert!(dense.at(rows).wide, "{rows}: {weighed:?}");
+        }
+        assert!(weighed[1].costs.iter().all(|c| c.0.wide || c.0.vector > 0));
+        // No kernel timed at 8192 rows: refused by name.
+        let refused = choose(Target::Spirv, &[8192], baseline, &r, &counts(), true);
+        assert_eq!(refused.unwrap_err(), UNREACHED);
+        // A profile timed to 4096 rows has its curves measured again for a
+        // load of 8192; to 4096 it keeps them.
+        let mut tuned = profile::fire::Tuned::default();
+        tuned.rates = r;
+        let chip = profile::Registry::new("test", &[], &[])
+            .defaults()
+            .with_tuned(tuned);
+        let again = crate::rates::reaching(chip.clone(), 8192).rates();
+        assert!(again.tile_tflops_by_rows.is_none() && again.vector_tflops_by_rows.is_none());
+        let kept = crate::rates::reaching(chip, 4096).rates();
+        assert!(kept.tile_tflops_by_rows.is_some() && kept.vector_tflops_by_rows.is_some());
     }
 }

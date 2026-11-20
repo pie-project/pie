@@ -81,6 +81,7 @@ impl Serve for Api {
         boot: &crate::api::DeviceBoot,
         allowance: engine::Allowance,
         handed: Option<std::convert::Infallible>,
+        top_rows: u32,
     ) -> Result<(Context, crate::tuning::Tuning)> {
         if let Some(handed) = handed {
             match handed {}
@@ -98,6 +99,7 @@ impl Serve for Api {
             tuning,
             boot.profiles.as_deref(),
             crate::rates::STATED_SUBMIT_BOUND,
+            top_rows,
         )?;
         Ok((device, tuning))
     }

@@ -35,8 +35,11 @@ pub fn at_load(
     tuning: crate::tuning::Tuning,
     profiles: Option<&std::path::Path>,
     max_submit: Option<std::time::Duration>,
+    top_rows: u32,
 ) -> Result<crate::tuning::Tuning> {
-    let chip = tuning.profile().clone();
+    // A curve of the kernels' rates by rows that stops short of the load's
+    // most rows is measured again, to them (`engine_gpu::rates::reaching`).
+    let chip = engine_gpu::rates::reaching(tuning.profile().clone(), top_rows);
     // What the profile states stands; a load times only what it lacks.
     let stated = chip.rates();
     let measured = device.chip();
@@ -51,7 +54,9 @@ pub fn at_load(
         save,
         Some(device.left()),
         max_submit,
-        |max_submit| measure(device, &tuning, max_submit, &stated).map_err(|e| e.to_string()),
+        |max_submit| {
+            measure(device, &tuning, max_submit, &stated, top_rows).map_err(|e| e.to_string())
+        },
     )
     .map_err(|why| engine_gpu::error::Fault::Device {
         call: "rates at load",
@@ -67,6 +72,7 @@ pub fn measure(
     tuning: &crate::tuning::Tuning,
     max_submit: Option<std::time::Duration>,
     stated: &profile::fire::Rates,
+    top_rows: u32,
 ) -> Result<engine::rates::Measured> {
     let tier = <Api as engine_gpu::serve::Serve>::tier(device);
     let timer = |frame: Frame| Ok((None, (frame.commit_timed()? * 1e9) as u64));
@@ -75,7 +81,7 @@ pub fn measure(
         stated = ?STATED_SUBMIT_BOUND.map(|b| b.as_secs_f64() * 1e3),
         "rates: measuring, each submission within the bound"
     );
-    engine_gpu::rates::measure::<Api, _>(device, tuning, tier, &timer, max_submit, stated)
+    engine_gpu::rates::measure::<Api, _>(device, tuning, tier, &timer, max_submit, stated, top_rows)
 }
 
 /// [`measure`], saying how the warm-up ended.
@@ -97,6 +103,7 @@ pub fn measure_saying(
         &timer,
         STATED_SUBMIT_BOUND,
         &profile::fire::Rates::default(),
+        engine_gpu::rates::TUNED_TOP,
         say,
     )
 }

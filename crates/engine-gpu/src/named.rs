@@ -415,6 +415,7 @@ impl<B: Serve> Serve for Named<B> {
         _boot: &B::DeviceBoot,
         _allowance: engine::Allowance,
         _handed: Option<B::Handed>,
+        _top_rows: u32,
     ) -> Result<(Facts, B::Tuning)> {
         Err(Fault::Deviceless)
     }

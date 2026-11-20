@@ -65,6 +65,7 @@ impl Serve for Api {
         boot: &crate::api::DeviceBoot,
         allowance: engine::Allowance,
         handed: Option<crate::device::Handed>,
+        top_rows: u32,
     ) -> Result<(Context, crate::tuning::Tuning)> {
         let device = match handed {
             Some(handed) => Context::adopt(boot, allowance, handed)?,
@@ -85,6 +86,7 @@ impl Serve for Api {
             tuning,
             boot.profiles.as_deref(),
             crate::rates::STATED_SUBMIT_BOUND,
+            top_rows,
         )?;
         Ok((device, tuning))
     }

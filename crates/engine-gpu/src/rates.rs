@@ -14,9 +14,9 @@
 //!   `engine::rates::weights_at` weight planes (past the last-level cache),
 //!   for `gemm_tflops_by_rows`;
 //! - each of its vector matmul kernels (by the rows a workgroup carries) at
-//!   each of [`VECTOR_ROWS_TIMED`] over the widest plane, for
-//!   `vector_tflops_by_rows`, and each tiled kernel at each of [`TILE_ROWS`],
-//!   for `tile_tflops_by_rows`;
+//!   each power of two of rows to the load's most ([`kernel_rows`]) over the
+//!   widest plane, for `vector_tflops_by_rows`, and each tiled kernel at the
+//!   same rows, for `tile_tflops_by_rows`;
 //! - its prefill attention at `engine::rates::ATTN_SHAPE`'s heads over each
 //!   of `engine::rates::ATTN_KEYS` keys at head width 128 (64 and 256 at the
 //!   longest keys, said beside it), through the kernel a served fire selects
@@ -127,13 +127,58 @@ pub const KEYS: [&str; 8] = [
     "vector_tflops_by_rows",
 ];
 
-/// The rows each tiled kernel is timed at for `tile_tflops_by_rows`: from a
-/// decode's few to the matmul curve's first.
-const TILE_ROWS: [u32; 9] = [1, 2, 4, 8, 16, 32, 64, 128, 256];
+/// The rows each vector and tiled kernel is timed at for
+/// `vector_tflops_by_rows` and `tile_tflops_by_rows`: every power of two from
+/// one row to `top`, then `top`, the most rows a fire of the load may bring,
+/// so no kernel is weighed past the rows it was timed at.
+fn kernel_rows(top: u32) -> Vec<u32> {
+    let top = top.max(1);
+    let mut rows = engine::memory::rungs(1, top);
+    if rows.last() != Some(&top) {
+        rows.push(top);
+    }
+    rows
+}
 
-/// The rows each vector kernel is timed at for `vector_tflops_by_rows`: a
-/// decode's one to the matmul curve's first.
-const VECTOR_ROWS_TIMED: [u32; 9] = [1, 2, 4, 8, 16, 32, 64, 128, 256];
+/// The most rows `pie tune --rates` times the kernels to, for no load in
+/// particular: the matmul curve's last.
+pub const TUNED_TOP: u32 = engine::rates::GEMM_ROWS[engine::rates::GEMM_ROWS.len() - 1];
+
+/// The most rows any of `curves` was timed at (0 for none).
+fn reach(curves: &Option<Vec<(u32, Vec<(u32, f64)>)>>) -> u32 {
+    curves.as_ref().map_or(0, |curves| {
+        curves
+            .iter()
+            .filter_map(|(_, curve)| curve.last().map(|&(rows, _)| rows))
+            .max()
+            .unwrap_or(0)
+    })
+}
+
+/// `chip` with each of its kernels' rate curves (`vector_tflops_by_rows`,
+/// `tile_tflops_by_rows`) unstated where none of them reaches `top_rows`: a
+/// profile saved for a load of fewer rows has them measured again, to the
+/// rows this load may bring (`engine::rates::rates_at_load` measures what is
+/// unstated and keeps the rest).
+#[must_use]
+pub fn reaching(chip: profile::Profile, top_rows: u32) -> profile::Profile {
+    let mut tuned = chip.tuned().clone();
+    let rates = &mut tuned.rates;
+    let short_vectors =
+        rates.vector_tflops_by_rows.is_some() && reach(&rates.vector_tflops_by_rows) < top_rows;
+    let short_tiles =
+        rates.tile_tflops_by_rows.is_some() && reach(&rates.tile_tflops_by_rows) < top_rows;
+    if !(short_vectors || short_tiles) {
+        return chip;
+    }
+    if short_vectors {
+        rates.vector_tflops_by_rows = None;
+    }
+    if short_tiles {
+        rates.tile_tflops_by_rows = None;
+    }
+    chip.with_tuned(tuned)
+}
 
 /// The matmul a launch is timed with: its work is nothing beside a launch.
 pub const LAUNCH: u32 = 16;
@@ -196,6 +241,14 @@ struct Rig<'a, B: Serve> {
     /// fire, which a settled frame's admission carries as its least worst
     /// ratio (the Adreno 840 swung ~10% inside one settled step).
     swing: std::cell::Cell<f64>,
+    /// The current step's fire's bytes of a frame's parameter region and
+    /// the region's bytes, as its first frame took them, where the backend
+    /// bounds that region ([`crate::backend::Frame::uniform_room`]): a frame
+    /// of the step holds no more fires than fit it.
+    uniforms: std::cell::Cell<Option<(u64, u64)>>,
+    /// Whether the backend bounds a frame's parameter region (the first
+    /// frame says).
+    bounds_uniforms: std::cell::Cell<bool>,
 }
 
 impl<'a, B: Serve> Rig<'a, B> {
@@ -214,6 +267,8 @@ impl<'a, B: Serve> Rig<'a, B> {
             admission: std::cell::Cell::new(engine::rates::Admission::new(max_submit)),
             past_bound: std::cell::RefCell::new(None),
             swing: std::cell::Cell::new(1.0),
+            uniforms: std::cell::Cell::new(None),
+            bounds_uniforms: std::cell::Cell::new(true),
         }
     }
 
@@ -224,6 +279,20 @@ impl<'a, B: Serve> Rig<'a, B> {
         *self.step.borrow_mut() = step.into();
         self.per_fire.set(per_fire);
         self.basis.set(0);
+        self.uniforms.set(None);
+    }
+
+    /// The most fires of the current step a frame's parameter region holds:
+    /// one until a frame of the step has said what a fire takes of it, none
+    /// past it where the backend bounds no such region.
+    fn uniform_fires(&self) -> u32 {
+        if !self.bounds_uniforms.get() {
+            return u32::MAX;
+        }
+        match self.uniforms.get() {
+            Some((per, room)) => u32::try_from(room / per.max(1)).unwrap_or(u32::MAX).max(1),
+            None => 1,
+        }
     }
 
     /// The bound one frame is admitted under: `max_submit` over the worst
@@ -237,7 +306,7 @@ impl<'a, B: Serve> Rig<'a, B> {
     /// it fits the bound; a single fire past it refused by name.
     fn fitting(&self, count: u32) -> Result<u32> {
         let a = self.admission.get();
-        a.fires(count, self.per_fire.get())
+        a.fires(count.min(self.uniform_fires()), self.per_fire.get())
             .ok_or_else(|| self.refuse(self.per_fire.get().unwrap_or(0.0), 1))
     }
 
@@ -339,12 +408,31 @@ impl<'a, B: Serve> Rig<'a, B> {
         if !self.admission.get().fits(estimate) {
             return Err(self.refuse(self.per_fire.get().unwrap_or(0.0), count));
         }
+        // A frame holds no more fires than its parameter region does
+        // (`Rig::fitting` sizes frames so): one past it would not enqueue.
+        if self.uniforms.get().is_some() && count > self.uniform_fires() {
+            return Err(Fault::Device {
+                call: "rates",
+                why: format!(
+                    "{step}: a frame of {count} fires passes the {} its parameter region holds",
+                    self.uniform_fires()
+                ),
+            });
+        }
         let mut f = self.device.frame()?;
         {
             let sink = B::sink(self.device, &f, &self.pipelines, &self.handles);
             for _ in 0..count {
                 fire(&sink)?;
             }
+        }
+        match crate::backend::Frame::uniform_room(&f) {
+            Some((taken, room)) => {
+                let per = taken.div_ceil(u64::from(count.max(1)));
+                let held = self.uniforms.get().map_or(0, |(p, _)| p);
+                self.uniforms.set(Some((per.max(held), room)));
+            }
+            None => self.bounds_uniforms.set(false),
         }
         then(&mut f)?;
         let timed = timer(f)?;
@@ -511,6 +599,7 @@ pub fn measure<B: Serve, T: Tactics + ?Sized>(
     timer: Timer<'_, B>,
     max_submit: Option<std::time::Duration>,
     stated: &Rates,
+    top_rows: u32,
 ) -> Result<engine::rates::Measured> {
     measure_saying::<B, T>(
         device,
@@ -519,6 +608,7 @@ pub fn measure<B: Serve, T: Tactics + ?Sized>(
         timer,
         max_submit,
         stated,
+        top_rows,
         &mut |_| {},
     )
 }
@@ -561,8 +651,10 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     timer: Timer<'_, B>,
     max_submit: Option<std::time::Duration>,
     stated: &Rates,
+    top_rows: u32,
     say: &mut dyn FnMut(&str),
 ) -> Result<engine::rates::Measured> {
+    let timed_rows = kernel_rows(top_rows);
     // Only what `stated` lacks is timed; what it states stands in for the
     // rates the timed ones read (the launch, the bandwidth, the curve's peak).
     let want = Wanted::of(stated);
@@ -609,7 +701,7 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         }
     }
     // `vector_tflops_by_rows`: each vector kernel, by the rows a workgroup
-    // carries, at `VECTOR_ROWS_TIMED` of the widest plane, each fire reading
+    // carries, at each of `timed_rows` of the widest plane, each fire reading
     // the next plane past the last-level cache: its flops over its time,
     // every weight pass it makes in it.
     let w = engine::rates::GEMM_WIDTH;
@@ -625,7 +717,7 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
             ..tactics.gemm(tier, 1)
         };
         let mut curve = Vec::new();
-        for m in VECTOR_ROWS_TIMED {
+        for &m in &timed_rows {
             let rate = matmul(&mut rig, vector, timer, (m, w, w), launch);
             rig.release();
             let Some(rate) = dropped(&rig, rate, say)? else {
@@ -642,14 +734,14 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         }
     }
     // `tile_tflops_by_rows`: each tiled kernel the backend can take, at
-    // `TILE_ROWS` of the widest plane, its flops at the rows it lands over
+    // `timed_rows` of the widest plane, its flops at the rows it lands over
     // its time, keyed by its row tile.
     let mut tile_curves: Vec<(u32, Vec<(u32, f64)>)> = Vec::new();
     // Every tiled kernel the profile's path reaches at some timed rows (a
     // device whose path takes the 32x32 tile below some rows and the
     // cooperative-matrix tile above times both).
     let mut tiled_kernels: Vec<kernels_slang::linear::gemm::Tactic> = Vec::new();
-    for m in TILE_ROWS.into_iter().filter(|_| want.tiles) {
+    for &m in timed_rows.iter().filter(|_| want.tiles) {
         for tactic in crate::dense::tiled_kernels(B::TARGET, tactics.gemm(tier, m)) {
             if !tiled_kernels.contains(&tactic) {
                 tiled_kernels.push(tactic);
@@ -659,7 +751,7 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     for tactic in tiled_kernels {
         let tile = kernels_slang::linear::gemm::tile_for(B::TARGET, tactic, w, w).row_tile();
         let mut curve = Vec::new();
-        for m in TILE_ROWS {
+        for &m in &timed_rows {
             let rate = matmul(&mut rig, tactic, timer, (m, w, w), launch);
             rig.release();
             let Some(rate) = dropped(&rig, rate, say)? else {
