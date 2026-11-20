@@ -128,9 +128,6 @@ impl Library {
                 .and_then(|code| build_call(core, handle, layout, code))
         });
         cache.built();
-        if let Err(fault) = cache.persist() {
-            tracing::warn!(%fault, "writing the pipeline cache");
-        }
         for (call, why) in pipelines
             .iter()
             .enumerate()
