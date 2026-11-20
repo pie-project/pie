@@ -116,6 +116,14 @@ pub trait Encode {
         Ok(())
     }
 
+    /// Whether the fire's row counts are constants of its commands: a host
+    /// that keeps recordings of fires whose rows vary within one body reads
+    /// them from per-fire data where this is false. True for a sink that
+    /// keeps nothing.
+    fn fixed_rows(&self) -> bool {
+        true
+    }
+
     /// The sink's naming side, where it names kernels and fires none: a
     /// host that picks its kernel by the rows of a fire then states every
     /// kernel its widths allow ([`Naming::either`]) and fires nothing.

@@ -318,6 +318,16 @@ impl Serve for Api {
         shell
             .device
             .arm_next(shell.shelf.arms.get(prepared.arm).cloned());
+        // A decode (padded to its bucket) or a fire no wider than the vector
+        // GEMM's widest row tile carries its rows in its commands; a wider
+        // one reads them from the fire block, one body for every row count
+        // of its rung.
+        let tile = *kernels_slang::linear::gemm::VECTOR_ROWS
+            .last()
+            .expect("the vector GEMM states its row tiles");
+        let rows: u32 = prepared.seats.iter().map(|seat| seat.rows).sum();
+        let decode = prepared.seats.iter().all(|seat| seat.rows == 1);
+        shell.device.fixed_next(decode || rows <= tile);
         Ok(Plan::Walk { keep, split })
     }
 

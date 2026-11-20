@@ -236,6 +236,10 @@ impl Encode for Sink<'_> {
         Target::Spirv
     }
 
+    fn fixed_rows(&self) -> bool {
+        self.frame.fixed_rows()
+    }
+
     fn comm(&self, op: &'static str) -> Result<kernels_slang::Comm, Error> {
         let comm = self.comm.ok_or(Error::Unsupported { op })?;
 
@@ -493,6 +497,18 @@ impl Sink<'_> {
                 for &(at, len) in words {
                     pushed[at as usize..(at + len) as usize].fill(0);
                 }
+            }
+            if tracing::enabled!(target: "vkbake", tracing::Level::TRACE) {
+                tracing::trace!(
+                    target: "vkbake",
+                    key,
+                    baked = ?scratch.baked,
+                    fired = ?fired.map(|(place, _)| place),
+                    groups = ?groups_place,
+                    owed,
+                    pushed = ?pushed,
+                    "bake"
+                );
             }
             self.frame.bake(&(
                 key,

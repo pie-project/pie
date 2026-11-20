@@ -451,6 +451,9 @@ pub struct Context {
     indirect_next: Mutex<Option<Arc<Vec<bool>>>>,
     /// The fire block the next frame opened lays in ([`Context::arm_next`]).
     arm_next: Mutex<Option<Arc<super::block::ArmBlock>>>,
+    /// Whether the next frame's rows are constants of its commands
+    /// ([`Context::fixed_next`]).
+    fixed_next: Mutex<Option<bool>>,
 }
 
 /// The kernel [`Frame::copy_rows`] dispatches.
@@ -1082,6 +1085,7 @@ impl Context {
             copier,
             indirect_next: Mutex::new(None),
             arm_next: Mutex::new(None),
+            fixed_next: Mutex::new(None),
         })
     }
 
@@ -1316,6 +1320,13 @@ impl Context {
         *self.arm_next.lock().expect("arm lock poisoned") = arm;
     }
 
+    /// Whether the next frame opened carries its rows as constants of its
+    /// commands (a decode body, a fire no wider than a row tile) or reads
+    /// them from the fire block (a body every row count of a rung shares).
+    pub fn fixed_next(&self, fixed: bool) {
+        *self.fixed_next.lock().expect("fixed lock poisoned") = Some(fixed);
+    }
+
     pub fn frame_kept(&self) -> Result<Frame> {
         self.frame_with(false)
     }
@@ -1420,6 +1431,12 @@ impl Context {
                 },
             ),
             copier: Arc::clone(&self.copier),
+            fixed_rows: self
+                .fixed_next
+                .lock()
+                .expect("fixed lock poisoned")
+                .take()
+                .unwrap_or(true),
             indirect: if one_time {
                 None
             } else {
@@ -1625,6 +1642,8 @@ impl Hazards {
 pub struct Frame {
     pub(crate) inner: Arc<Inner>,
     open: bool,
+    /// The fire's rows are constants of its commands ([`Context::fixed_next`]).
+    fixed_rows: bool,
     /// Opened by `frame_kept`: a flush cuts a segment rather than reusing
     /// the command buffer, so the whole frame replays.
     kept: bool,
@@ -1651,6 +1670,10 @@ pub struct Frame {
 }
 
 impl Frame {
+    pub(crate) fn fixed_rows(&self) -> bool {
+        self.fixed_rows
+    }
+
     /// Takes the next dispatch's group counts, and answers whether it reads
     /// them from the fire block (indirect) rather than carrying them.
     pub(crate) fn dispatched(&self, groups: [u32; 3]) -> bool {

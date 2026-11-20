@@ -144,6 +144,10 @@ impl Context {
         match self.never {}
     }
 
+    pub fn fixed_next(&self, _fixed: bool) {
+        match self.never {}
+    }
+
     #[must_use]
     pub fn fire_alignments(&self) -> (u64, u64) {
         match self.never {}

@@ -5629,6 +5629,10 @@ impl<S: kernels_slang::Encode> kernels_slang::Encode for Encoded<S> {
     fn naming(&self) -> Option<&dyn kernels_slang::Naming> {
         self.0.naming()
     }
+
+    fn fixed_rows(&self) -> bool {
+        self.0.fixed_rows()
+    }
 }
 
 /// An f32 cell lands in a bf16 seat rounded; any other as it is.

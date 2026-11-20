@@ -680,7 +680,7 @@ impl<B: Backend> Run<'_, B> {
         matmul: impl Fn(kernels_slang::linear::gemm::Tactic) -> Result<(), kernels_slang::Error>,
     ) -> Result<(), kernels_slang::Error> {
         let Some(names) = self.ctx.naming() else {
-            return matmul(self.dense().at(self.tensor(act).rows));
+            return matmul(self.dense().at(self.tactic_rows(act)));
         };
         // The walk fires at one rung; a fire of the load brings up to the
         // most rows its rungs hold.
@@ -716,6 +716,19 @@ impl<B: Backend> Run<'_, B> {
                     .qmm_rungs(names.most_rows().max(capacity), y.width, act.width, bank)
             }
             None => self.tuning().qmm_ladder(act.rows, y.width, act.width, bank),
+        }
+    }
+
+    /// The rows a matmul of `act` picks its kernel by: its own where they
+    /// are its commands' constants, else the power of two that holds them
+    /// (within what `act` holds), so every fire of a body whose rows vary
+    /// between those picks the same kernel.
+    fn tactic_rows(&self, act: poem_ir::ValueId) -> u32 {
+        let rows = self.tensor(act).rows;
+        if self.ctx.fixed_rows() {
+            rows
+        } else {
+            rows.next_power_of_two().min(self.capacity(act).max(rows))
         }
     }
 }
