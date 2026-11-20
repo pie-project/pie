@@ -1905,6 +1905,7 @@ impl<B: Host> Gpu<B> {
                     && lane.lane.word == first.lane.word
                     && lane.group.is_none()
                     && lane.rs_snapshots.is_empty()
+                    && matches!(lane.rs, engine::fire::RsVerb::Fold)
             })
             && let Some(bucket) = shell.pad_bucket(seated.len())
         {

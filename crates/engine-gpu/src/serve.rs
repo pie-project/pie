@@ -2654,12 +2654,12 @@ impl<B: Serve> Shell<B> {
     /// that keeps recordings: the narrowest decode bucket that holds them
     /// ([`Shell::decode_buckets`]), where that is wider. A padded decode is
     /// its bucket, so every decode of a bucket replays one body. `None`
-    /// where it fires as it is: a count of lanes that is a bucket, or a load
-    /// with recurrent state, whose lanes' records a copy would share (step
-    /// (b) of VULKAN-RECORD-AT-LOAD).
+    /// where it fires as it is: a count of lanes that is a bucket. A
+    /// padding lane of a load with recurrent state holds no record (its slot
+    /// entries -1), so its recurrent layers fold nothing.
     #[must_use]
     pub fn pad_bucket(&self, lanes: usize) -> Option<usize> {
-        if !B::RECORDS || self.rs_layout.is_some() || lanes == 0 {
+        if !B::RECORDS || lanes == 0 {
             return None;
         }
         let bucket = self.decode_buckets().into_iter().find(|&bucket| bucket >= lanes)?;
@@ -3986,7 +3986,7 @@ impl<B: Serve> Shell<B> {
             if let Some(report) = report {
                 wrote.push(report);
             }
-            if let Some(pieces) = record_refs {
+            if let Some(pieces) = record_refs.filter(|_| !seated.pad) {
                 left.push((pieces, fold.left));
             }
             let plan = fold.plan;
@@ -3996,9 +3996,13 @@ impl<B: Serve> Shell<B> {
                 Some(run) if plan.commit == 0 => self.pools.record(Some(run), seat_slot)?,
                 _ => record.clone(),
             };
-            // The record as the slot tables state it, once a lane.
-            let state = crate::store::slot_entries(&state)?;
-            if fresh {
+            // The record as the slot tables state it, once a lane; a padding
+            // lane's is none (-1 a piece), so its recurrent layers fold
+            // nothing.
+            let mut state = crate::store::slot_entries(&state)?;
+            if seated.pad {
+                state.fill(-1);
+            } else if fresh {
                 beginning.push(record);
             }
             seats.push(Seat {
@@ -4255,6 +4259,7 @@ impl<B: Serve> Shell<B> {
                 .map_or(0, |pages| u32::try_from(pages).unwrap_or(u32::MAX)),
             state_slots: slot_ids
                 .iter()
+                .filter(|&&row| row >= 0)
                 .map(|&row| (row as u32).saturating_add(1))
                 .chain(std::iter::once(snap_units))
                 .max()
@@ -6175,7 +6180,7 @@ impl<B: Serve> Shell<B> {
     /// runs as a decode of the bucket does and is recorded, and the first
     /// serving decode of the bucket replays it. The bodies recorded.
     pub fn record_decodes(&mut self) -> Result<u64> {
-        if !B::RECORDS || self.rs_layout.is_some() {
+        if !B::RECORDS {
             return Ok(0);
         }
         let facts = &self.trace.facts;
