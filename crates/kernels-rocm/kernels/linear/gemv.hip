@@ -141,15 +141,16 @@ struct SkinnyNorm {
     int plus_one;
 };
 
-// Stages `ROWS` rows normed as `SkinnyNorm` says into `dst` (`ROWS * K`
-// bf16, packed): every row in one pass, each summed as
+// Stages `ROWS` rows normed as `SkinnyNorm` says into `dst`, a row every
+// `pitch` packs (K / 8, or past it to spread the rows over LDS banks): every
+// row in one pass, each summed as
 // `residual_add_rmsnorm`'s packed path sums it, so a product over them lands
 // the unfused path's bits. `t` of `threads` is the calling thread; `sums`
 // is LDS for ROWS x kNormGroups floats (a row's first then holds its inverse
 // root). Ends past a barrier.
 constexpr int kNormBlock = 256, kNormPpt = 4, kNormGroups = kNormBlock / kWave;
 template <int ROWS>
-__device__ __forceinline__ void skinny_norm_stage(const SkinnyNorm& norm, int K, int t, int threads, b128* dst,
+__device__ __forceinline__ void skinny_norm_stage(const SkinnyNorm& norm, int K, int pitch, int t, int threads, b128* dst,
                                                   float* sums) {
     const int packs = K / 8, l = lane();
     // Every row in one pass, each summed as `residual_add_rmsnorm` sums
@@ -192,7 +193,7 @@ __device__ __forceinline__ void skinny_norm_stage(const SkinnyNorm& norm, int K,
                     const float h = to_f32(he[e]);
                     local += h * h;
                 }
-                dst[g] = hv;
+                dst[row * pitch + i] = hv;
                 if (blockIdx.x == 0) og[g] = hv;
             }
         }
@@ -207,9 +208,9 @@ __device__ __forceinline__ void skinny_norm_stage(const SkinnyNorm& norm, int K,
     }
     __syncthreads();
     for (int g = t; g < pairs; g += threads) {
-        const int row = g / packs, i = g - row * packs;
+        const int row = g / packs, i = g - row * packs, at = row * pitch + i;
         const float inv = sums[row * kNormGroups];
-        b128 hv = dst[g];
+        b128 hv = dst[at];
         const b128 wv = wg[i];
         bf16* he = reinterpret_cast<bf16*>(&hv);
         const bf16* we = reinterpret_cast<const bf16*>(&wv);
@@ -218,7 +219,7 @@ __device__ __forceinline__ void skinny_norm_stage(const SkinnyNorm& norm, int K,
             const float w = to_f32(we[e]) + (norm.plus_one ? 1.f : 0.f);
             he[e] = from_f32<bf16>(to_f32(he[e]) * inv * w);
         }
-        dst[g] = hv;
+        dst[at] = hv;
         if (blockIdx.x == 0) reinterpret_cast<b128*>(norm.out)[g] = hv;
     }
     __syncthreads();
@@ -237,7 +238,7 @@ __global__ __launch_bounds__(1024) void skinny_bf16(const bf16* __restrict__ wei
     const b128* act_g = reinterpret_cast<const b128*>(act);
     if constexpr (NORM) {
         __shared__ float sums[ROWS * kNormGroups];
-        skinny_norm_stage<ROWS>(norm, K, wave * kWave + l, blockDim.y * kWave, act_s, sums);
+        skinny_norm_stage<ROWS>(norm, K, packs, wave * kWave + l, blockDim.y * kWave, act_s, sums);
     } else if constexpr (!ACT_G) {
         for (int i = wave * kWave + l; i < ROWS * packs; i += blockDim.y * kWave) act_s[i] = act_g[i];
         __syncthreads();
@@ -585,13 +586,19 @@ __global__ __launch_bounds__(kWave* KS) void skinnyt_bf16(const bf16* __restrict
     if (tile >= tiles) return;
     // The first tile's weight is in flight under the rows' staging.
     load(wa, tile);
-    const bf16* rows = act;
+    // The activation's rows, a row every `pitch` packs. Staged normed in
+    // the turn, a row is padded a pack: rows K * 2 bytes apart (a whole
+    // number of the LDS's bank cycle) would put a slice's sixteen rows on
+    // the same banks.
+    const b128* rows = reinterpret_cast<const b128*>(act);
+    int pitch = K / 8;
     if constexpr (NORM) {
+        pitch = K / 8 + 1;
         // The rows' partial sums past them in the turn, so the block's LDS
         // stays the turn's alone (two blocks a compute unit).
-        float* sums = reinterpret_cast<float*>(&turn[0][0]) + M * K / 2;
-        skinny_norm_stage<M>(norm, K, wave * kWave + l, KS * kWave, &turn[0][0], sums);
-        rows = reinterpret_cast<const bf16*>(&turn[0][0]);
+        float* sums = reinterpret_cast<float*>(&turn[0][0]) + M * pitch * 4;
+        skinny_norm_stage<M>(norm, K, pitch, wave * kWave + l, KS * kWave, &turn[0][0], sums);
+        rows = &turn[0][0];
     }
 #pragma unroll
     for (int b = 0; b < MB; ++b)
@@ -600,9 +607,8 @@ __global__ __launch_bounds__(kWave* KS) void skinnyt_bf16(const bf16* __restrict
             const int sl = wave + KS * p, j = 16 * b + r;
 #pragma unroll
             for (int s = 0; s < 8; ++s)
-                xv[b][p][s] = j < M && sl < slices
-                                  ? reinterpret_cast<const b128*>(rows + static_cast<long long>(j) * K + sl * 256)[4 * s + q]
-                                  : b128{};
+                xv[b][p][s] = j < M && sl < slices ? rows[static_cast<long long>(j) * pitch + sl * 32 + 4 * s + q]
+                                                   : b128{};
         }
     // The turn is the staged rows' until every wavefront holds its slices.
     if constexpr (NORM) __syncthreads();
