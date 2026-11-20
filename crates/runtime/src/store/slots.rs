@@ -1526,6 +1526,15 @@ impl SlotPool {
     }
 
     /// Free slots `shape` could take now without breaking the budget.
+    /// Free slots of `shape` in its partly filled chunks: what a take of
+    /// its slots fills before it opens a chunk.
+    #[must_use]
+    pub fn partial_free(&self, shape: ShapeId) -> u64 {
+        self.shapes
+            .get(shape as usize)
+            .map_or(0, |state| state.partial_free)
+    }
+
     pub fn available(&self, shape: ShapeId) -> u64 {
         let Some(state) = self.shapes.get(shape as usize) else {
             return 0;

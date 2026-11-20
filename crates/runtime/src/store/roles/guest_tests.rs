@@ -2832,3 +2832,33 @@ fn a_bind_short_of_room_asks_for_its_scratch_and_its_pair_together() {
         "its scratch's two chunks and its pair's two, together: {short}"
     );
 }
+
+/// The L40S's guest-only restore (kv 0, rs 0, asking 21 one-chunk pieces
+/// against 22 state chunks): what an unpark lays fresh is what its parked
+/// parts take, by shape, packed into chunks and into the free slots of the
+/// chunks open for that shape, not a chunk a part. A process of many small
+/// instances parked on the host asks exactly the chunks its unpark takes.
+#[test]
+fn an_unpark_asks_the_chunks_it_lays_not_a_chunk_a_part() {
+    let Pools { device, roles } = pools(64);
+    let (program, mut engine) = (PROGRAM, GuestEngine::new(SLOT, 0));
+    let _ = program;
+    // Many small instances of one process: each a few slots.
+    for _ in 0..12 {
+        bind(&roles, &mut engine, 1).unwrap();
+    }
+    park(&roles, 1);
+    let free = || device.lock().unwrap().pool().free_chunks();
+    let before = free();
+    let asked = roles.lock().unwrap().unpark_runs(holder(1), 1);
+    let back = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(1))
+        .unwrap()
+        .expect("it comes back");
+    let laid = before - free();
+    roles.lock().unwrap().commit(back);
+    assert!(asked < 12, "not a chunk an instance: asked {asked}");
+    assert_eq!(asked, laid, "asked what the unpark lays: {asked} vs {laid}");
+}

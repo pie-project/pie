@@ -1326,35 +1326,57 @@ impl Roles {
             .chunk_runs_beside(&own, run, pieces)
     }
 
-    /// The runs of `run` adjacent chunks `holder`'s unpark takes for its
-    /// own parked state before any bind's room: each dead part given back
-    /// at its park (its runs of whole chunks, or a run of slots in a
-    /// chunk), and the live parts of items parked below the device, each
-    /// counted in whole runs. What a map of free chunks must stand beside
-    /// a bind's runs for the restore that bind suspended, as
-    /// [`Self::fits_beside_unpark`] reads it from the pool; counted short,
-    /// the map saw free runs and moved no one while the restore stood
-    /// short beside its own (restore heads with runs open and no step).
+    /// The runs of `run` adjacent chunks `holder`'s unpark lays fresh for
+    /// its own parked state before any bind's room, as the unpark takes it:
+    /// each dead part given back at its park in whole chunks (its pieces of
+    /// whole runs), and the slots of its dead runs of slots and of the live
+    /// parts of items parked below the device, by shape, past the free
+    /// slots that shape's partly filled chunks hold, in whole chunks once.
+    /// Parts still on the device (parked in place, or never parked) lay
+    /// nothing. What a map of free chunks must stand beside a bind's runs
+    /// for the restore that bind suspended, as [`Self::fits_beside_unpark`]
+    /// reads it, and what a restore short of its roles asks. Counting every
+    /// part a chunk of its own, a restore of twenty small items asked
+    /// twenty-one chunks it would lay in one or none.
     #[must_use]
     pub fn unpark_runs(&self, holder: Holder, run: u32) -> u32 {
         let run = u64::from(run.max(1));
         let mut runs = 0u64;
+        let mut slots: HashMap<SlotRole, u64> = HashMap::new();
         for (owner, item) in &self.items {
             let below = matches!(item.tier, Tier::Host | Tier::Disk);
             let parked = below || (item.tier == Tier::Device && item.shed);
             if !parked || !self.unparks_with(*owner, item, holder) {
                 continue;
             }
-            for part in item.parts.iter().filter(|part| part.dead() && part.refs.is_empty()) {
-                runs += if part.pieces > 0 {
-                    u64::from(part.pieces) * u64::from(part.chunks).div_ceil(run)
-                } else {
-                    1
-                };
+            for part in &item.parts {
+                if part.dead() {
+                    if !part.refs.is_empty() {
+                        continue;
+                    }
+                    if part.pieces > 0 {
+                        runs += u64::from(part.pieces) * u64::from(part.chunks).div_ceil(run);
+                    } else {
+                        *slots.entry(part.role).or_default() += u64::from(part.run);
+                    }
+                } else if below {
+                    *slots.entry(part.role).or_default() += part.refs.len() as u64;
+                }
             }
-            if below {
-                runs += self.chunks_on(&self.device, &item.parts).div_ceil(run);
-            }
+        }
+        let device = self.device.lock().unwrap();
+        for (role, wanted) in slots {
+            let Some(shape) = self.shapes.of(role) else {
+                continue;
+            };
+            let Some(state) = device.pool().shape(shape.pool) else {
+                continue;
+            };
+            let per_chunk = u64::from(state.slots_per_chunk.max(1));
+            let chunks = wanted
+                .saturating_sub(device.pool().partial_free(shape.pool))
+                .div_ceil(per_chunk);
+            runs += chunks.div_ceil(run);
         }
         u32::try_from(runs).unwrap_or(u32::MAX)
     }
