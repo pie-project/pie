@@ -368,7 +368,7 @@ fn statistics() -> (TraceContainer, Vec<u32>) {
 }
 
 /// A beam's pick: the top-k over every row of the logits as one vector (a
-/// beam inferlet's top-b of b x vocab scores), at two widths.
+/// beam inferlet's top-b of b x vocab scores), at three widths.
 fn flat_top_k() -> (TraceContainer, Vec<u32>) {
     let mut p = Program::new();
     let logits = p.op(Op::Output {
@@ -383,11 +383,14 @@ fn flat_top_k() -> (TraceContainer, Vec<u32>) {
     });
     let four = p.op(Op::TopK { input: flat, k: 4 });
     let nine = p.op(Op::TopK { input: flat, k: 9 });
+    let one = p.op(Op::TopK { input: flat, k: 1 });
     let outs = vec![
         p.output(Shape::vector(4), Dtype::U32, four + 1),
         p.output(Shape::vector(4), Dtype::F32, four),
         p.output(Shape::vector(9), Dtype::U32, nine + 1),
         p.output(Shape::vector(9), Dtype::F32, nine),
+        p.output(Shape::vector(1), Dtype::U32, one + 1),
+        p.output(Shape::vector(1), Dtype::F32, one),
     ];
     (p.container(), outs)
 }
@@ -1389,6 +1392,8 @@ fn a_flat_top_k_agrees(device: &Device, stages: &mut Stages) {
     exact(&got[1], &want[1], "flat top-4 values");
     exact(&got[2], &want[2], "flat top-9 ids");
     exact(&got[3], &want[3], "flat top-9 values");
+    exact(&got[4], &want[4], "flat top-1 id");
+    exact(&got[5], &want[5], "flat top-1 value");
 }
 
 /// `gumbel_argmax` answers the unfused draw over f32 logits bit for bit, on
