@@ -2455,6 +2455,9 @@ struct BindRoomPool {
     /// Moves of parked state down a tier that begin and then fail (the
     /// engine refused the copy), counted down.
     park_down_fails: AtomicU32,
+    /// Disk slots only idle cache holds (`PoolPort::idle_below_device`):
+    /// room a suspend makes by dropping it.
+    disk_idle: AtomicU32,
 }
 
 impl BindRoomPool {
@@ -2477,6 +2480,7 @@ impl BindRoomPool {
             kv: parking_lot::Mutex::new(Vec::new()),
             pages: std::sync::atomic::AtomicBool::new(false),
             park_down_fails: AtomicU32::new(0),
+            disk_idle: AtomicU32::new(0),
         }
     }
 
@@ -2536,7 +2540,7 @@ impl PoolPort for BindRoomPool {
     }
     fn disk_stats(&self) -> (u32, u32) {
         let free = self.disk_free.load(Ordering::Relaxed);
-        (free, free)
+        (free, free + self.disk_idle.load(Ordering::Relaxed))
     }
     fn rs_host_stats(&self) -> (RsUnits, RsUnits) {
         Default::default()
@@ -2620,10 +2624,12 @@ impl PoolPort for BindRoomPool {
         self.cache.lock().len() as u32
     }
     fn idle_below_device(&self) -> (u32, u32) {
-        (0, 0)
+        (0, self.disk_idle.load(Ordering::Relaxed))
     }
     fn suspend_capable(&self) -> bool {
-        self.host > 0 || self.disk_free.load(Ordering::Relaxed) > 0
+        self.host > 0
+            || self.disk_free.load(Ordering::Relaxed) > 0
+            || self.disk_idle.load(Ordering::Relaxed) > 0
     }
     fn locus(&self) -> (usize, usize) {
         (self.model, 0)
@@ -5990,6 +5996,73 @@ async fn a_failed_park_down_is_tried_again_once_room_moves() {
         }
     }
     assert!(bind.is_finished(), "the parked state moved down and the head was served");
+    assert!(bind.await.unwrap().is_ok());
+    assert_eq!(*pool.moved.lock(), vec!["disk"]);
+}
+
+/// A disk tier with no slot free but idle cache in it is room for a
+/// suspend (it drops the cache to make its room, `make_swap_room`): the
+/// head short of a run its occupant holds is funded, the occupant moved.
+/// Counted as full, the planner returned with nothing issued (no swap room)
+/// while the head fit the pool alone.
+#[tokio::test(flavor = "current_thread")]
+async fn a_disk_tier_full_of_idle_cache_is_room_for_a_victim() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 0));
+    pool.free.lock().extend([0, 2, 4, 6]);
+    pool.disk_idle.store(64, Ordering::Relaxed);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (binder, resident) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [binder, resident] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    *pool.occupant.lock() = Some(resident);
+    let p = planner.clone();
+    let bind = crate::rt::spawn(async move { p.wait_bind_room(binder, 2, 1).await });
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.stats.evictions_started.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+    }
+    assert!(
+        planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
+        "the occupant is moved, the disk's idle cache its room"
+    );
+    bind.abort();
+}
+
+/// Parked state lying on the device whose process the planner no longer
+/// knows (it left while parked) moves down a tier for a head as an evicted
+/// process's does: passed over (only evicted processes' moved), it held the
+/// head's runs for good with the chunk map naming it each pass.
+#[tokio::test(flavor = "current_thread")]
+async fn parked_state_of_a_process_gone_while_parked_moves_down_for_the_head() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.write().await;
+    let model = crate::store::registry::register_model(16, &[8], &[4]);
+    let pool = Arc::new(BindRoomPool {
+        model,
+        ..BindRoomPool::new(8, 0..0, 0)
+    });
+    pool.disk_free.store(64, Ordering::Relaxed);
+    pool.free.lock().extend([0, 2, 4, 6]);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let head = ProcessId::new_v4();
+    planner.register(head);
+    planner.note_admitted(head);
+    // Never registered here: a process gone while parked.
+    let gone = ProcessId::new_v4();
+    pool.parked.lock().extend([(1, gone), (3, gone), (5, gone), (7, gone)]);
+    let p = planner.clone();
+    let bind = crate::rt::spawn(async move { p.wait_bind_room(head, 2, 1).await.map(drop) });
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if bind.is_finished() {
+            break;
+        }
+    }
+    assert!(bind.is_finished(), "its parked state moved down and the head was served");
     assert!(bind.await.unwrap().is_ok());
     assert_eq!(*pool.moved.lock(), vec!["disk"]);
 }

@@ -503,14 +503,30 @@ impl ResidencyPlanner {
             return true;
         }
         let (pids, order) = self.with_inner(|inner| {
+            // Parked state of a process the planner no longer knows (gone
+            // while parked) moves down too: no one runs on it, and passed
+            // over it held its chunks for good.
             let evicted = |pid: &ProcessId| {
                 *pid != head
                     && inner
                         .procs
                         .get(pid)
-                        .is_some_and(|proc| proc.state == Residency::Evicted)
+                        .is_none_or(|proc| proc.state == Residency::Evicted)
             };
-            let pids: Vec<ProcessId> = pids.into_iter().filter(|pid| evicted(pid)).collect();
+            let (pids, passed): (Vec<ProcessId>, Vec<ProcessId>) =
+                pids.into_iter().partition(|pid| evicted(pid));
+            if !passed.is_empty() {
+                // One evicting or restoring is in flight; the head's own
+                // state is never moved for it. Named, never silent.
+                let states: Vec<String> = passed
+                    .iter()
+                    .map(|pid| {
+                        let state = inner.procs.get(pid).map(|proc| proc.state);
+                        format!("{pid}: {state:?}{}", if *pid == head { " (the head)" } else { "" })
+                    })
+                    .collect();
+                tracing::debug!(%head, ?states, "planner: parked state passed over for a move down");
+            }
             let mut order: Vec<(std::cmp::Reverse<Rank>, ProcessId)> = inner
                 .procs
                 .iter()
@@ -558,7 +574,11 @@ impl ResidencyPlanner {
         {
             return false;
         }
-        let (swap_free, swap_total) = self.swap_stats();
+        // The slots free now, idle cache's not counted: a sweep takes
+        // only what stands free.
+        let (host_free, host_total) = self.port.host_stats();
+        let (disk_free, disk_total) = self.port.disk_stats();
+        let (swap_free, swap_total) = (host_free + disk_free, host_total + disk_total);
         let room = swap_free.saturating_sub(swap_total / HOST_RESERVE_DIVISOR) as usize;
         let (model, engine) = self.port.locus();
         // What rests goes in the order it would be evicted, and no more of

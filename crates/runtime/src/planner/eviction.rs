@@ -160,11 +160,21 @@ impl ResidencyPlanner {
         (picks, unhostable)
     }
 
-    /// Free and total slots suspended kv can go to: host, then disk.
+    /// Free and total slots suspended kv can go to: host, then disk. The
+    /// slots only idle cache holds there count as free: a suspend makes its
+    /// room by dropping them (`KvStore::make_swap_room`). Counted as full,
+    /// a disk tier holding idle cache made every victim unhostable, and a
+    /// head the pool fits alone waited with nothing issued.
     pub(super) fn swap_stats(&self) -> (u32, u32) {
         let (host_free, host_total) = self.port.host_stats();
         let (disk_free, disk_total) = self.port.disk_stats();
-        (host_free + disk_free, host_total + disk_total)
+        let (host_idle, disk_idle) = self.port.idle_below_device();
+        let free = host_free
+            .saturating_add(disk_free)
+            .saturating_add(host_idle)
+            .saturating_add(disk_idle)
+            .min(host_total.saturating_add(disk_total));
+        (free, host_total + disk_total)
     }
 
     /// The room below the device: swap slots for pages, host rows for rs.

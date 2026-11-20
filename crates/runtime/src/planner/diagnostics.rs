@@ -243,7 +243,10 @@ impl ResidencyPlanner {
     }
 
     pub fn kv_pressure_bucket(&self) -> u8 {
-        let (swap_free, swap_total) = self.swap_stats();
+        // The slots free now; idle cache below the device is added below.
+        let (host_free, host_total) = self.port.host_stats();
+        let (disk_free, disk_total) = self.port.disk_stats();
+        let (swap_free, swap_total) = (host_free + disk_free, host_total + disk_total);
         let ratio = |(free, total): (u32, u32)| {
             if total == 0 {
                 0.0
