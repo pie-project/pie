@@ -126,7 +126,7 @@ pub fn kda(
                 y.arg_mut(),
             ][..],
             &state.piece_args(true),
-            &[heads, head_dim, eps, floor],
+            &[heads, head_dim, eps, floor, 0u32.arg()],
         ]
         .concat(),
     )
@@ -164,7 +164,7 @@ pub fn kda_chunked(
             ][..],
             &state.snap_table(),
             &state.piece_args(true),
-            &[heads, head_dim, eps, floor],
+            &[heads, head_dim, eps, floor, 0u32.arg()],
             &[csr.at.arg()],
             &state.snap_lane0(OP)?,
         ]
@@ -185,10 +185,12 @@ pub fn kda_committed(
     state: &StatePool,
     work: Tensor,
     y: Tensor,
+    row0: u32,
 ) -> Result<(), Error> {
     const OP: &str = "ssm.kda_committed";
     let entry = dtype_dispatch!(OP, mixed.dtype, { Bf16 => "ssm_kda_committed_bf16" });
     gates.check(OP, mixed, y)?;
+    super::work_holds(OP, work, csr)?;
     let [f, b, dt_bias, a_log] = gates.planes();
     let [heads, head_dim, eps, floor] = gates.scalars(OP)?;
     ctx.fire(
@@ -217,6 +219,7 @@ pub fn kda_committed(
                 head_dim,
                 eps,
                 floor,
+                row0.arg(),
             ],
             &[csr.at.arg()],
             &state.snap_lane0(OP)?,

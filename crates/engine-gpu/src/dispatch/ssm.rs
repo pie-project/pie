@@ -26,6 +26,61 @@ impl<B: Backend> Run<'_, B> {
         }
     }
 
+    /// A committed scan's dispatches over the window's lanes, as many lanes
+    /// each as the work plane holds: each one's CSR from its first lane,
+    /// its lanes' tables and snapshots from it, and the extended row its
+    /// first lane's rows start at (the rows the lanes before it replay
+    /// ahead of theirs).
+    fn committed_batches(
+        &self,
+        seat: &crate::rs::Seat,
+        state: ValueId,
+    ) -> Vec<(
+        kernels_slang::ssm::Csr,
+        kernels_slang::ssm::Committed,
+        StatePool,
+        u32,
+    )> {
+        let csr = self.csr();
+        let committed = self.rs_committed(seat);
+        let batch = seat.work.rows.max(1);
+        let mut out = Vec::new();
+        let (mut first, mut row0) = (0u32, 0u32);
+        while first < csr.lanes {
+            let lanes = batch.min(csr.lanes - first);
+            out.push((
+                kernels_slang::ssm::Csr {
+                    at: csr.at + first,
+                    lanes,
+                    ..csr
+                },
+                kernels_slang::ssm::Committed {
+                    lane0: committed.lane0 + first,
+                    ..committed
+                },
+                {
+                    let pool = self.state_pool(state);
+                    StatePool {
+                        snapshots: pool.snapshots.map(|snaps| kernels_slang::ssm::Snapshots {
+                            lane0: snaps.lane0 + first,
+                            ..snaps
+                        }),
+                        ..pool
+                    }
+                },
+                row0,
+            ));
+            for lane in first..first + lanes {
+                row0 += seat
+                    .lanes
+                    .get((committed.lane0 + lane) as usize)
+                    .map_or(0, |plan| plan.replay);
+            }
+            first += lanes;
+        }
+        out
+    }
+
     fn slang_of(&self, id: ValueId) -> kernels_slang::Tensor {
         self.tensor(id)
     }
@@ -123,6 +178,7 @@ impl<B: Backend> Run<'_, B> {
                     self.slang_of(*dt_bias),
                     self.slang_of(*a_log),
                     ext_gates,
+                    kernels_slang::ssm::RowSpan::whole(ext_ba),
                 )?;
                 self.rs_land(OP, &seat, ext_gates, *gates)
             }
@@ -153,21 +209,24 @@ impl<B: Backend> Run<'_, B> {
                 let ext_qkv = self.rs_ext_of(OP, &seat, *qkv)?;
                 let ext_gates = self.rs_ext_of(OP, &seat, *gates)?;
                 let ext_y = self.rs_out(OP, &seat, *y)?;
-                gdn_recurrent::gated_delta_committed(
-                    ctx,
-                    self.tuning().recurrent(),
-                    ext_qkv,
-                    self.csr(),
-                    &self.rs_committed(&seat),
-                    ext_gates,
-                    &self.state_pool(*state),
-                    seat.work,
-                    *k_heads,
-                    *v_heads,
-                    *k_dim,
-                    *v_dim,
-                    ext_y,
-                )?;
+                for (csr, committed, pool, row0) in self.committed_batches(&seat, *state) {
+                    gdn_recurrent::gated_delta_committed(
+                        ctx,
+                        self.tuning().recurrent(),
+                        ext_qkv,
+                        csr,
+                        &committed,
+                        ext_gates,
+                        &pool,
+                        seat.work,
+                        *k_heads,
+                        *v_heads,
+                        *k_dim,
+                        *v_dim,
+                        ext_y,
+                        row0,
+                    )?;
+                }
                 self.rs_land(OP, &seat, ext_y, *y)
             }
             Ssm::Kda {
@@ -212,17 +271,20 @@ impl<B: Backend> Run<'_, B> {
                     *norm_eps,
                     *gate_floor,
                 );
-                kda::kda_committed(
-                    ctx,
-                    self.tuning().recurrent().tier,
-                    ext_mixed,
-                    self.csr(),
-                    &self.rs_committed(&seat),
-                    &gates,
-                    &self.state_pool(*state),
-                    seat.work,
-                    ext_y,
-                )?;
+                for (csr, committed, pool, row0) in self.committed_batches(&seat, *state) {
+                    kda::kda_committed(
+                        ctx,
+                        self.tuning().recurrent().tier,
+                        ext_mixed,
+                        csr,
+                        &committed,
+                        &gates,
+                        &pool,
+                        seat.work,
+                        ext_y,
+                        row0,
+                    )?;
+                }
                 self.rs_land(OP, &seat, ext_y, *y)
             }
             Ssm::CausalConv1d {
@@ -235,12 +297,13 @@ impl<B: Backend> Run<'_, B> {
                 ..
             } => conv1d::conv1d(
                 ctx,
-                self.slang_of(*x),
+                self.attended(*x),
                 self.slang_of(*weight),
                 &self.state_pool(*state),
                 *conv_width,
                 *dilation,
-                self.slang_of(*y),
+                self.attended(*y),
+                self.row_span(),
             ),
             Ssm::CausalConv1dChunked {
                 x,
@@ -252,13 +315,14 @@ impl<B: Backend> Run<'_, B> {
                 ..
             } => conv1d::conv1d_chunked(
                 ctx,
-                self.slang_of(*x),
+                self.attended(*x),
                 self.csr(),
                 self.slang_of(*weight),
                 &self.state_pool(*state),
                 *conv_width,
                 *dilation,
-                self.slang_of(*y),
+                self.attended(*y),
+                self.row0(),
             ),
             Ssm::GdnGates {
                 ba,
@@ -267,10 +331,11 @@ impl<B: Backend> Run<'_, B> {
                 gates,
             } => gdn_prep::gdn_prep(
                 ctx,
-                self.slang_of(*ba),
+                self.attended(*ba),
                 self.slang_of(*dt_bias),
                 self.slang_of(*a_log),
-                self.slang_of(*gates),
+                self.attended(*gates),
+                self.row_span(),
             ),
             Ssm::GatedDelta {
                 qkv,
@@ -285,14 +350,15 @@ impl<B: Backend> Run<'_, B> {
             } => gdn_recurrent::gated_delta(
                 ctx,
                 self.tuning().recurrent(),
-                self.slang_of(*qkv),
-                self.slang_of(*gates),
+                self.attended(*qkv),
+                self.attended(*gates),
                 &self.state_pool(*state),
                 *k_heads,
                 *v_heads,
                 *k_dim,
                 *v_dim,
-                self.slang_of(*y),
+                self.attended(*y),
+                self.row_span(),
             ),
             Ssm::GatedDeltaChunked {
                 qkv,
@@ -307,15 +373,16 @@ impl<B: Backend> Run<'_, B> {
             } => gdn_recurrent::gated_delta_chunked(
                 ctx,
                 self.tuning().recurrent(),
-                self.slang_of(*qkv),
+                self.attended(*qkv),
                 self.csr(),
-                self.slang_of(*gates),
+                self.attended(*gates),
                 &self.state_pool(*state),
                 *k_heads,
                 *v_heads,
                 *k_dim,
                 *v_dim,
-                self.slang_of(*y),
+                self.attended(*y),
+                self.row_span(),
             ),
             Ssm::Kda {
                 mixed,

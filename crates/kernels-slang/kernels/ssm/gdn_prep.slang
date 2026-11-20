@@ -13,6 +13,9 @@
 
 struct Params {
     int v_heads;
+    // The fire row a window's row 0 is: `ba` and `gates` are the fire's
+    // whole, bound once whatever window a fire cuts.
+    uint row0;
 };
 PIE_PARAMS(4, Params, params);
 
@@ -20,7 +23,7 @@ PIE_PARAMS(4, Params, params);
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID) {
     uint h = gid.x;
-    uint t = gid.y;
+    uint t = params.row0 + gid.y;
     uint vh = uint(params.v_heads);
     if (h >= vh) {
         return;

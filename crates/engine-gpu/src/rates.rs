@@ -1365,10 +1365,22 @@ fn scan<B: Serve>(
             s.conv_width,
             1,
             qkv,
+            0,
         )
         .map_err(fault("rates: conv"))?;
         kernels_slang::ssm::gdn_recurrent::gated_delta_chunked(
-            sink, tactic, qkv, csr, gates, scan_state, s.k_heads, s.v_heads, s.k_dim, s.v_dim, y,
+            sink,
+            tactic,
+            qkv,
+            csr,
+            gates,
+            scan_state,
+            s.k_heads,
+            s.v_heads,
+            s.k_dim,
+            s.v_dim,
+            y,
+            kernels_slang::ssm::RowSpan::whole(qkv),
         )
         .map_err(fault("rates: scan"))
     })?;

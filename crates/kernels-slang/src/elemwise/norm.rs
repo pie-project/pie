@@ -189,6 +189,7 @@ fn gated(
     vd: u32,
     eps: f32,
     y: Tensor,
+    span: crate::ssm::RowSpan,
 ) -> Result<(), Error> {
     debug_assert_eq!(x.dtype, Dtype::F32, "`{op}` norms an f32 accumulator");
     debug_assert_eq!(weight.dtype, Dtype::F32, "`{op}` scales by an f32 weight");
@@ -208,10 +209,15 @@ fn gated(
             format!("a {vd}-wide head is odd; the landing is two values a word"),
         ));
     }
+    let rows = span.rows(op, &[x, gate, y])?;
     let groups = (x.width / vd)
-        .checked_mul(x.rows)
+        .checked_mul(rows)
         .and_then(|g| g.checked_mul(GROUP))
         .ok_or_else(|| refuse(op, "the grid will not launch"))?;
+    let first = span
+        .row0
+        .checked_mul(x.width)
+        .ok_or_else(|| refuse(op, "the window's first row is past an element index"))?;
     ctx.fire(
         Fire::at(NORM, entry).apply(Grid::of([groups, 1, 1], [GROUP, 1, 1])),
         &[
@@ -221,6 +227,7 @@ fn gated(
             y.arg_mut(),
             eps.arg(),
             stated(op, vd)?.arg(),
+            first.arg(),
         ],
     )
 }
@@ -237,6 +244,7 @@ pub fn rmsnorm_gated(
     eps: f32,
     sigmoid_gate: bool,
     y: Tensor,
+    span: crate::ssm::RowSpan,
 ) -> Result<(), Error> {
     const OP: &str = "elemwise.rmsnorm_gated";
     let entry = if sigmoid_gate {
@@ -245,10 +253,11 @@ pub fn rmsnorm_gated(
         dtype_dispatch!(OP, gate.dtype, { Bf16 => "elemwise_norm_gated_rms_bf16" })
     };
     let vd = nonzero(OP, "the stated value-head width", head_dim)?;
-    gated(ctx, OP, entry, x, gate, weight, vd, eps, y)
+    gated(ctx, OP, entry, x, gate, weight, vd, eps, y, span)
 }
 
 /// The row normed in `heads` equal heads, each gated by `sigmoid(z)`.
+#[allow(clippy::too_many_arguments)]
 pub fn rmsnorm_gated_by(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -257,6 +266,7 @@ pub fn rmsnorm_gated_by(
     heads: u32,
     eps: f32,
     y: Tensor,
+    span: crate::ssm::RowSpan,
 ) -> Result<(), Error> {
     const OP: &str = "elemwise.rmsnorm_gated_by";
     let entry = dtype_dispatch!(OP, gate.dtype, { Bf16 => "elemwise_norm_gated_rms_sigmoid_bf16" });
@@ -270,7 +280,18 @@ pub fn rmsnorm_gated_by(
             ),
         ));
     }
-    gated(ctx, OP, entry, x, gate, weight, x.width / heads, eps, y)
+    gated(
+        ctx,
+        OP,
+        entry,
+        x,
+        gate,
+        weight,
+        x.width / heads,
+        eps,
+        y,
+        span,
+    )
 }
 
 fn row_grid(op: &'static str, x: Tensor) -> Result<Grid, Error> {
