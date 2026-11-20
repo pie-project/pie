@@ -193,10 +193,24 @@ impl Run<'_> {
                 v_dim,
                 y,
             } => {
+                // A buffering fire's decode step reads its lanes' carried
+                // rows, through the gate prep whose `[b | a]` it lands: one
+                // whose gates no buffered gate prep forms is refused by name,
+                // never run as the plain step over the state alone.
                 #[cfg(not(feature = "rocm"))]
-                if self.rs_step_gates(*gates)
-                    && let Some(gated) = self.gdn_gated(*gates)
-                {
+                if self.rs_buffering() {
+                    let gated = self
+                        .rs_step_gates(*gates)
+                        .then(|| self.gdn_gated(*gates))
+                        .flatten()
+                        .ok_or_else(|| kernels_cuda::Error::Backend {
+                            op: "ssm.gated_delta",
+                            detail: format!(
+                                "a buffering fire's decode step whose gates (value {}) no \
+                                 buffered gate prep forms: its carried rows would go unread",
+                                gates.0
+                            ),
+                        })?;
                     return self.gated_delta_carried(
                         *qkv, *gates, gated, *state, *k_heads, *v_heads, *k_dim, *v_dim, *y,
                     );

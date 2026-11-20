@@ -1087,6 +1087,13 @@ impl<'c> Run<'c> {
     /// Whether the fire's recurrences run over extended rows: a lane of it
     /// replays buffered rows. One answer a fire, so a body keyed by it
     /// replays the kernels it recorded.
+    /// Whether this fire buffers recurrent rows (its lanes carry rows past
+    /// their states).
+    #[cfg(not(feature = "rocm"))]
+    pub(crate) fn rs_buffering(&self) -> bool {
+        self.rs.is_some()
+    }
+
     pub(crate) fn rs_extended(&self) -> bool {
         self.rs
             .as_ref()
