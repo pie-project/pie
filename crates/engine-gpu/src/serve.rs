@@ -725,6 +725,9 @@ pub struct Shell<B: Serve> {
     /// The steps walked and not kept since the last count: each ran its
     /// regions eagerly, with no recording to replay.
     unkept: u64,
+    /// The tier moves through the host since the last count that found
+    /// frames in flight and waited for them ([`Shell::drained_serving`]).
+    drained: u64,
 
     /// The most dispatches a walked fire's frame encoded, and the most
     /// launches a walked fire made of its regions, since the last count
@@ -1918,6 +1921,7 @@ impl<B: Serve> Shell<B> {
             built: B::compiled(&pipelines),
             recorded: 0,
             unkept: 0,
+            drained: 0,
             walked: (0, 0),
             walk_only: false,
             readout_tally: (0, 0),
@@ -1989,14 +1993,16 @@ impl<B: Serve> Shell<B> {
         Ok(shell)
     }
 
-    /// Opens seat `slot` for a direct fire: its record zeroed, nothing held.
+    /// Opens seat `slot` for a direct fire: its record zeroed on the queue,
+    /// nothing held.
     pub fn open(&mut self, slot: u32) -> Result<()> {
         if self.pools.has_state() {
-            self.drain()?;
             let seats = self.pools.seat_segments();
             self.commit_segments(seats)?;
             let units = self.pools.record(None, slot)?;
-            self.pools.clear(&units)?;
+            let mut frame = self.device.frame()?;
+            self.pools.clear(&mut frame, &units)?;
+            self.grafted = Some(frame.commit_async(None)?);
         }
         let seats = self.held.len() as u64;
         let held = self.held.get_mut(slot as usize).ok_or(Fault::Ceiling {
@@ -2086,7 +2092,7 @@ impl<B: Serve> Shell<B> {
     /// out here.
     pub fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> Result<()> {
         if !self.copy_slots_landing(copy, Some(Box::new(|| ())))? {
-            self.drain()?;
+            self.drain_for_host()?;
         }
         Ok(())
     }
@@ -2099,11 +2105,10 @@ impl<B: Serve> Shell<B> {
     ///   once its frame's fence lands: its device slots, once back, may be
     ///   written by anything; without a `landed` it is refused before
     ///   anything is encoded. The rest answer
-    ///   `true`: a later write reaching a device source is a fire or copy on
-    ///   the same queue, or a host write that first settles the queue
-    ///   (`Frame::update`, a record's clear after a drain); one reaching a
-    ///   host source is a move onto it on the queue, or a tier write, which
-    ///   drains.
+    ///   `true`: a later write reaching a device source is a fire, a copy or
+    ///   a record's clear on the same queue, or a host write that first
+    ///   settles the queue (`Frame::update`); one reaching a host source is
+    ///   a move onto it on the queue, or a tier write, which drains.
     /// - A heap host tier and the slot file: every frame lands first and the
     ///   copy is waited out (or read on the host) in the call: `true`.
     pub fn copy_slots_landing(
@@ -2131,7 +2136,7 @@ impl<B: Serve> Shell<B> {
             None => None,
         };
         if !queued {
-            self.drain()?;
+            self.drain_for_host()?;
         }
         let mut frame = self.device.frame()?;
         self.pools.copy_slots(&self.device, &mut frame, copy)?;
@@ -2166,7 +2171,7 @@ impl<B: Serve> Shell<B> {
         &mut self,
         slots: &[(engine::chunk::ShapeId, Vec<u32>)],
     ) -> Result<Vec<u8>> {
-        self.drain()?;
+        self.drain_for_host()?;
         self.pools.read_tier_slots(slots)
     }
 
@@ -2176,7 +2181,7 @@ impl<B: Serve> Shell<B> {
         slots: &[(engine::chunk::ShapeId, Vec<u32>)],
         bytes: &[u8],
     ) -> Result<()> {
-        self.drain()?;
+        self.drain_for_host()?;
         self.pools.write_tier_slots(slots, bytes)
     }
 
@@ -2526,6 +2531,21 @@ impl<B: Serve> Shell<B> {
     /// served with no recording, which no later fire replays either.
     pub fn unkept_serving(&mut self) -> u64 {
         std::mem::take(&mut self.unkept)
+    }
+
+    /// The tier moves through the host since the last count that waited
+    /// for frames in flight ([`engine::live::Tally::Drained`]).
+    pub fn drained_serving(&mut self) -> u64 {
+        std::mem::take(&mut self.drained)
+    }
+
+    /// [`Shell::drain`] before a tier move through the host, counted where
+    /// a frame or a copy was still in flight.
+    fn drain_for_host(&mut self) -> Result<()> {
+        if !self.inflight.is_empty() || self.grafted.is_some() {
+            self.drained += 1;
+        }
+        self.drain()
     }
 
     /// The most dispatches one walked fire's frame encoded, and the most
@@ -3085,11 +3105,16 @@ impl<B: Serve> Shell<B> {
     }
 
     fn feed(&self, p: &Prepared<'_, B>) -> Result<Option<B::Pending>> {
-        if p.feeds.is_empty() && p.input_copies.is_empty() {
+        if p.feeds.is_empty() && p.input_copies.is_empty() && p.beginning.is_empty() {
             return Ok(None);
         }
         let (store, tokens) = self.inputs[p.arm].token_seat();
         let mut frame = self.device.frame()?;
+        // A fresh lane's record is zeroed in queue order: after every frame
+        // in flight that read the slot, before the fire that folds into it.
+        for units in &p.beginning {
+            self.pools.clear(&mut frame, units)?;
+        }
         for &(row, cell) in &p.feeds {
             frame.copy(&cell.buffer, cell.at, store, tokens + u64::from(row) * 4, 4)?;
         }
@@ -4068,13 +4093,6 @@ impl<B: Serve> Shell<B> {
         };
         self.pools.admit(demand)?;
 
-        if !beginning.is_empty() && self.pools.has_state() {
-            self.drain()?;
-        }
-        for units in beginning {
-            self.pools.clear(&units)?;
-        }
-
         let indptr_host = kv::indptr(&seats)?;
         let table_refs: Vec<&[u32]> = tables.iter().map(std::convert::AsRef::as_ref).collect();
         let mut geometries = Vec::with_capacity(self.page_tables);
@@ -4629,6 +4647,11 @@ impl<B: Serve> Shell<B> {
             done,
             wrote,
             left: merged(left),
+            beginning: if self.pools.has_state() {
+                beginning
+            } else {
+                Vec::new()
+            },
             feeds,
             fed_lanes,
             fed_check: None,
@@ -4804,6 +4827,9 @@ pub struct Prepared<'a, B: Serve> {
     /// Where the fire leaves each record it folds
     /// ([`crate::store::frozen`]), kept once the fire is on its way.
     left: Vec<(Vec<u32>, Option<u32>)>,
+    /// The record of each lane the fire begins, zeroed on the queue before
+    /// the fire ([`Shell::feed`]).
+    beginning: Vec<Vec<u32>>,
     feeds: Vec<(u32, &'a DeviceCell<B>)>,
     /// Each device-fed lane: its index among the step's lanes and its row
     /// in the token seat.
