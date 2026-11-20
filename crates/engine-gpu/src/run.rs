@@ -233,6 +233,15 @@ pub struct FireBindings {
     pub capture: Option<Tensor>,
 }
 
+/// A step submitted a layer at a time: the layer whose work the frame holds
+/// unsubmitted, the step it is (for the per-layer line), and when the last
+/// layer's submission returned.
+struct Split {
+    layer: Option<u32>,
+    step: Option<engine::StepDone>,
+    since: std::time::Instant,
+}
+
 pub struct Run<'c, B: Backend> {
     pub ctx: &'c Ctx<'c>,
 
@@ -282,7 +291,7 @@ pub struct Run<'c, B: Backend> {
 
     /// The layer whose work the frame holds unsubmitted, when the step is
     /// submitted a layer at a time.
-    split: Option<Option<u32>>,
+    split: Option<Split>,
 
     /// The highest kernels-slang tier the adapter runs, where the backend's
     /// tactics read it.
@@ -359,14 +368,18 @@ impl<'c, B: Backend> Run<'c, B> {
     }
 
     /// Submits the frame each time a node of a new layer has run.
-    pub fn flush_between_layers(&mut self) {
-        self.split = Some(None);
+    pub fn flush_between_layers(&mut self, step: Option<engine::StepDone>) {
+        self.split = Some(Split {
+            layer: None,
+            step,
+            since: std::time::Instant::now(),
+        });
     }
 
     /// After `node` runs: submits what the frame holds once a new layer
     /// starts. A failed submit faults the frame, which its commit reports.
     pub fn split_at(&mut self, node: &Node) {
-        let Some(held) = self.split.as_mut() else {
+        let Some(split) = self.split.as_mut() else {
             return;
         };
         let Some(layer) = node.layer else {
@@ -379,12 +392,29 @@ impl<'c, B: Backend> Run<'c, B> {
             }
             return;
         };
-        if held.is_some_and(|held| held != layer)
-            && let Err(fault) = B::flush_recording()
-        {
-            tracing::warn!(%fault, "submitting a layer of a split step");
+        if let Some(held) = split.layer.filter(|&held| held != layer) {
+            let at = std::time::Instant::now();
+            let flushed = B::flush_recording();
+            let done = std::time::Instant::now();
+            // Each layer's submission said where the platform's bound is
+            // held (`crate::submit`): the wall from the last submission's
+            // return to this one's, which waits for it to land, and the
+            // submit-and-wait alone.
+            tracing::debug!(
+                target: "engine_gpu::api",
+                frame = split.step.map(|s| s.frame.0),
+                step = split.step.map(|s| s.step),
+                layer = held,
+                wall_ms = done.duration_since(split.since).as_secs_f64() * 1e3,
+                submit_ms = done.duration_since(at).as_secs_f64() * 1e3,
+                "submit bound: a layer's submission landed"
+            );
+            split.since = done;
+            if let Err(fault) = flushed {
+                tracing::warn!(%fault, "submitting a layer of a split step");
+            }
         }
-        *held = Some(layer);
+        split.layer = Some(layer);
     }
 
     pub fn window(&self) -> &'c Window {

@@ -312,6 +312,13 @@ pub fn unmeasured(rates: &profile::fire::Rates) -> Option<(&'static str, String)
             }
         }
     }
+    if let Some(by_rows) = &rates.attn_tflops_by_rows_keys {
+        for (rows, curve) in by_rows {
+            if let Some((key, at)) = point(profile::fire::ATTN_BY_ROWS_KEYS, "keys", curve) {
+                return Some((key, format!("{at} ({rows} rows)")));
+            }
+        }
+    }
     if let Some(tiles) = &rates.tile_tflops_by_rows {
         for (tile, curve) in tiles {
             if let Some((key, at)) = point("tile_tflops_by_rows", "rows", curve) {
@@ -339,6 +346,7 @@ pub fn unmeasured(rates: &profile::fire::Rates) -> Option<(&'static str, String)
         ("scan_gelems", rates.scan_gelems),
         ("few_row_tflops", rates.few_row_tflops),
         ("workgroups_per_core", rates.workgroups_per_core),
+        (profile::fire::SUBMIT_WORST_RATIO, rates.submit_worst_ratio),
     ] {
         if let Some(v) = v.filter(|&v| bad(v)) {
             return Some((key, format!("as {v}")));
@@ -1375,6 +1383,8 @@ mod tests {
             scan_gelems: Some(2000.0),
             few_row_tflops: Some(4.0),
             workgroups_per_core: Some(3.3),
+            submit_worst_ratio: None,
+            attn_tflops_by_rows_keys: None,
             tile_tflops_by_rows: Some(vec![(32, vec![(8, 1.0), (256, 9.0)])]),
             vector_tflops_by_rows: Some(vec![(4, vec![(1, 0.5), (256, 4.0)])]),
             product_ns: None,
@@ -2210,6 +2220,8 @@ mod tests {
             scan_gelems: Some(7.0),
             few_row_tflops: Some(4.5),
             workgroups_per_core: Some(3.3),
+            submit_worst_ratio: None,
+            attn_tflops_by_rows_keys: None,
             tile_tflops_by_rows: None,
             vector_tflops_by_rows: None,
             product_ns: None,
