@@ -1680,9 +1680,14 @@ impl Frame {
         let mut seen = self.groups.borrow_mut();
         let at = seen.len();
         seen.push(groups);
-        self.indirect
-            .as_ref()
-            .is_some_and(|set| set.get(at).copied().unwrap_or(false))
+        // A kept frame whose rows vary within its body reads every
+        // dispatch's group counts from the block: its first recording serves
+        // every row count of its body.
+        (self.kept && !self.fixed_rows)
+            || self
+                .indirect
+                .as_ref()
+                .is_some_and(|set| set.get(at).copied().unwrap_or(false))
     }
 
     /// Lays `bytes` in the frame's fire block at an offset a multiple of
@@ -2478,6 +2483,7 @@ impl Frame {
             baked: self.baked.borrow().finish(),
             groups: std::mem::take(&mut *self.groups.borrow_mut()),
             indirect: self.indirect.clone(),
+            indirect_all: !self.fixed_rows,
         })
     }
 
@@ -2522,6 +2528,10 @@ pub struct Kept {
     groups: Vec<[u32; 3]>,
 
     indirect: Option<Arc<Vec<bool>>>,
+
+    /// Every dispatch reads its group counts from the block (a body whose
+    /// rows vary).
+    indirect_all: bool,
 }
 
 impl std::fmt::Debug for Kept {
@@ -2553,9 +2563,11 @@ impl Kept {
     /// fire block.
     #[must_use]
     pub fn indirect(&self, at: usize) -> bool {
-        self.indirect
-            .as_ref()
-            .is_some_and(|set| set.get(at).copied().unwrap_or(false))
+        self.indirect_all
+            || self
+                .indirect
+                .as_ref()
+                .is_some_and(|set| set.get(at).copied().unwrap_or(false))
     }
 
     /// Writes `image`, a walk's whose commands hash as this frame's, into
