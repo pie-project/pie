@@ -1058,6 +1058,7 @@ impl ProcessCtx {
             )
         };
         {
+            let t0 = crate::rt::Instant::now();
             let prog = match crate::pipeline::program::register(
                 container_bytes,
                 readouts,
@@ -1066,6 +1067,7 @@ impl ProcessCtx {
                 Ok(p) => p,
                 Err(e) => return Ok(Err(e.to_string())),
             };
+            let t_register = t0.elapsed();
             crate::inferlet::process::ensure_bind_admitted(self).await;
 
             let decls = prog.bound.container.channels.clone();
@@ -1239,6 +1241,7 @@ impl ProcessCtx {
                 (None, None, GeometryClass::Host, None)
             };
 
+            let t_geometry = t0.elapsed();
             let instance_id = crate::pipeline::instance::next_instance_id();
             for (dense, cell) in cells.iter().enumerate() {
                 let extern_binding = extern_bindings[dense]
@@ -1287,6 +1290,7 @@ impl ProcessCtx {
                 reference_ptir: prog.bytes.clone(),
                 ..Default::default()
             };
+            let t_launch = t0.elapsed();
             let pricing_rows = prog.pricing.rows;
             let mut instance_seeds = Vec::new();
             let mut seed_values = Vec::new();
@@ -1354,6 +1358,7 @@ impl ProcessCtx {
                     return Ok(Err(format!("pipeline: register+bind: {error:#}")));
                 }
             };
+            let t_bind = t0.elapsed();
             if registered.len() != missing_dense.len() {
                 let _ = scheduler
                     .close_instance(bound_instance.instance_id, bound_instance.pacing_wait_id);
@@ -1395,6 +1400,17 @@ impl ProcessCtx {
                 &instance.program.bound,
                 instance.program.shadow_plan(),
                 &instance.seeds,
+            );
+            tracing::debug!(
+                target: "pie::launch",
+                process = %process_id,
+                program = format_args!("0x{:016x}", instance.program.hash),
+                register_us = t_register.as_micros() as u64,
+                geometry_us = (t_geometry - t_register).as_micros() as u64,
+                launch_us = (t_launch - t_geometry).as_micros() as u64,
+                bind_us = (t_bind - t_launch).as_micros() as u64,
+                shadow_us = (t0.elapsed() - t_bind).as_micros() as u64,
+                "pass bound"
             );
             let bound = BoundForwardPass {
                 instance,
