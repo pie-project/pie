@@ -951,8 +951,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     })
 }
 
-/// What each built-in's name runs for the system (the operator's install of
-/// that name, else the built-in), compiled and linked.
 /// The host cover (`scheduler::host_cover`), measured before ready on warm
 /// runs of the standard sampler through the ordinary pipeline at one frame
 /// in flight: the cover is a lane's guest turnaround (its frame landing to
@@ -963,7 +961,10 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
 /// difference (a decode frame's marginal cost: the prompt fire and every
 /// fixed cost cancel, as in the beam rule's T(256) - T(32)), until two
 /// successive differences give the same cover (or a round would pass the
-/// engines' context).
+/// engines' context). The cover is the largest any difference gave: a
+/// difference spanning few frames swings with the turnaround's noise, and a
+/// cover too small leaves the device idle where one too large costs only
+/// window.
 async fn measure_host_cover(model: &str, context: usize) -> Result<usize> {
     let depth = crate::scheduler::configured_dispatch_depth();
     crate::scheduler::set_dispatch_depth(1);
@@ -973,6 +974,7 @@ async fn measure_host_cover(model: &str, context: usize) -> Result<usize> {
     let frame = crate::scheduler::configured_frame_size().max(1);
     let mut tokens = frame;
     let mut last: Option<usize> = None;
+    let mut most = 0usize;
     // the previous round's growth: fires, device us, turnarounds, turnaround us
     let mut prev: Option<(u64, u64, u64, u64)> = None;
     let measured = loop {
@@ -1055,8 +1057,9 @@ async fn measure_host_cover(model: &str, context: usize) -> Result<usize> {
                 cover,
                 "a warm run of the standard sampler, measuring the host cover"
             );
+            most = most.max(cover);
             if last == Some(cover) || past_context {
-                break (cover, frame_us, turnaround_us);
+                break (most, frame_us, turnaround_us);
             }
             last = Some(cover);
         } else if past_context {
@@ -1077,6 +1080,8 @@ async fn measure_host_cover(model: &str, context: usize) -> Result<usize> {
     Ok(cover)
 }
 
+/// What each built-in's name runs for the system (the operator's install of
+/// that name, else the built-in), compiled and linked.
 async fn prepare_builtins(names: Vec<&'static str>) -> Result<()> {
     for name in names {
         let reference = program::ProgramRef::parse(name)?;
