@@ -14,6 +14,12 @@ use crate::store::kv::Paging;
 pub enum Role {
     ConvX,
     Ba,
+    /// A gated-delta row's keys (the conv output's key heads, bf16): what
+    /// a decode step reads a buffered row's attention weight by.
+    Keys,
+    /// A gated-delta row's corrected value `u` (f32): the value its delta
+    /// rule writes, which a decode step reads as a linear attention.
+    U,
     Ids,
     KdaF,
     KdaB,
@@ -151,9 +157,13 @@ impl Layout {
         let mut plane = |layout: &mut Layout,
                          cache: u32,
                          role: Role,
-                         value: ValueId|
+                         value: ValueId,
+                         sized: Option<(u32, Dtype, u64)>|
          -> Result<()> {
-            let (width, dtype, row_bytes) = row_of(trace, value)?;
+            let (width, dtype, row_bytes) = match sized {
+                Some(sized) => sized,
+                None => row_of(trace, value)?,
+            };
             let at = match plane_keys.get(&(cache, role)) {
                 Some(&at) => {
                     let have = layout.planes[at];
@@ -217,7 +227,7 @@ impl Layout {
                     | Ssm::CausalConv1dChunked { x, state, y, .. },
                 ) if deferred.contains(&y.0) => {
                     let cache = cache_of(trace, *state)?;
-                    plane(&mut layout, cache, Role::ConvX, *x)?;
+                    plane(&mut layout, cache, Role::ConvX, *x, None)?;
                     region(&mut layout, cache, "conv", *y)?;
                 }
                 Operation::Ssm(
@@ -271,8 +281,8 @@ impl Layout {
                     },
                 ) => {
                     let cache = cache_of(trace, *state)?;
-                    plane(&mut layout, cache, Role::KdaF, *f)?;
-                    plane(&mut layout, cache, Role::KdaB, *b)?;
+                    plane(&mut layout, cache, Role::KdaF, *f, None)?;
+                    plane(&mut layout, cache, Role::KdaB, *b, None)?;
                     region(&mut layout, cache, "scan", *y)?;
                     layout.work_elems = layout
                         .work_elems
@@ -293,7 +303,7 @@ impl Layout {
                     },
                 ) => {
                     let cache = cache_of(trace, *state)?;
-                    plane(&mut layout, cache, Role::Ids, *ids)?;
+                    plane(&mut layout, cache, Role::Ids, *ids, None)?;
                     region(&mut layout, cache, "ngram", *ngram_ids)?;
                 }
                 _ => {}
@@ -309,8 +319,59 @@ impl Layout {
                     gates.0
                 ),
             })?;
-            plane(&mut layout, cache, Role::Ba, *ba)?;
+            plane(&mut layout, cache, Role::Ba, *ba, None)?;
             region(&mut layout, cache, "gates", *gates)?;
+        }
+        // The corrected row (`ChunkProfile::rs_corrected`, Metal's profile):
+        // a buffered gated-delta row keeps its keys (the conv output's key
+        // heads, bf16) and its corrected values `u` (f32), as the chunk plan
+        // lays them (`poem_compiler::chunk::census::rs_rows`): a decode step
+        // reads the buffered rows as a linear attention and re-steps none.
+        if poem_compiler::chunk::ChunkProfile::ON_DEVICE_METAL.rs_corrected {
+            let gated: std::collections::HashSet<u32> = trace
+                .nodes
+                .iter()
+                .filter_map(|node| match &node.op {
+                    Operation::Ssm(Ssm::GdnGates { gates, .. }) => Some(gates.0),
+                    _ => None,
+                })
+                .collect();
+            for node in &trace.nodes {
+                let Operation::Ssm(Ssm::GatedDeltaChunked {
+                    qkv,
+                    gates,
+                    state,
+                    y,
+                    k_heads,
+                    k_dim,
+                    v_heads,
+                    v_dim,
+                    ..
+                }) = &node.op
+                else {
+                    continue;
+                };
+                if !deferred.contains(&qkv.0) || !gated.contains(&gates.0) {
+                    continue;
+                }
+                let cache = cache_of(trace, *state)?;
+                let keys = k_heads * k_dim;
+                let values = v_heads * v_dim;
+                plane(
+                    &mut layout,
+                    cache,
+                    Role::Keys,
+                    *qkv,
+                    Some((keys, Dtype::Bf16, u64::from(keys) * 2)),
+                )?;
+                plane(
+                    &mut layout,
+                    cache,
+                    Role::U,
+                    *y,
+                    Some((values, Dtype::F32, u64::from(values) * 4)),
+                )?;
+            }
         }
         if layout.planes.is_empty() {
             return Ok(None);
