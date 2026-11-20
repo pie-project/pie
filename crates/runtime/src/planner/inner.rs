@@ -46,10 +46,11 @@ pub(super) struct Inner {
     /// ([`super::ResidencyPlanner::park_down`]): none is restored until it
     /// lands, so no restore misses an item moving under it.
     pub(super) parked_moving: HashSet<ProcessId>,
-    /// The unservable head the last stall dump named, and the pool's room
-    /// count then ([`super::ResidencyPlanner::dump_stall`]): one dump per
-    /// head and room change.
-    pub(super) stall_dumped: Option<(super::wait::EntryKey, u64)>,
+    /// The unservable head the last stall dump named, the pool's room
+    /// count then, and when ([`super::ResidencyPlanner::dump_stall`]): one
+    /// dump per head and room change, and again each
+    /// [`super::plan::STALL_SAYS_AGAIN`] while it stays unserved.
+    pub(super) stall_dumped: Option<(super::wait::EntryKey, u64, crate::rt::Instant)>,
 }
 
 impl Inner {

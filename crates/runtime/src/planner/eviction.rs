@@ -836,6 +836,29 @@ mod chunk_picks_tests {
         assert_eq!(map.cheapest_runs(3, 1), None, "no three adjacent");
     }
 
+    /// Runs chosen together, not cheapest first: free runs at 1-3 and 6-8
+    /// of eleven chunks, A's pages at 0, 4, 5 and 9, three runs of three
+    /// asked. The two free runs leave no third beside them; moving A stands
+    /// 0-2, 3-5 and 6-8. Taken cheapest first, the map said no runs, and
+    /// the head (fitting the pool alone) waited with no one moved.
+    #[test]
+    fn runs_that_fit_only_with_an_occupant_moved_are_found_beside_free_ones() {
+        let map = ChunkMap {
+            held: vec![
+                held(0, 1, &[(1, 1)]),
+                held(4, 1, &[(1, 1)]),
+                held(5, 1, &[(1, 1)]),
+                held(9, 1, &[(1, 1)]),
+            ],
+            free: vec![1, 2, 3, 6, 7, 8, 10],
+            headroom: None,
+            segment_chunks: 0,
+        };
+        assert_eq!(map.cheapest_runs(3, 2), Some(vec![]), "two free runs stand");
+        assert_eq!(map.cheapest_runs(3, 3), Some(vec![pid(1)]), "A moves for the third");
+        assert_eq!(map.cheapest_runs(3, 4), None, "no four runs of three in eleven");
+    }
+
     /// The plan's candidates for a bind short of a chunk: the chosen
     /// chunk's occupants only, every one quoted (the deficit past them);
     /// for any other head, or where no chunk empties, the candidates as

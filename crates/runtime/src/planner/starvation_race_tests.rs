@@ -2645,6 +2645,9 @@ impl PoolPort for BindRoomPool {
     fn chunks_as_pages(&self, chunks: u32) -> u32 {
         chunks
     }
+    fn state_chunks(&self) -> u32 {
+        self.total
+    }
     fn room_gives(&self) -> u64 {
         self.gives.load(Ordering::Relaxed)
     }
@@ -4929,8 +4932,11 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
         let walk_rise = is_rise && seed % 2 == 1;
         // An understated restore: refused while some count of runs stood,
         // at, below or past what stands now.
+        // Never at the most runs the pool stands or past (the planner marks
+        // no need understated there, `requeue_restore_roles`).
         let understated_at = (is_restore && rng.below(2) == 0)
-            .then(|| (runs_now + rng.below(3) as u32).saturating_sub(1).max(pieces));
+            .then(|| (runs_now + rng.below(3) as u32).saturating_sub(1).max(pieces))
+            .filter(|&at| at < total / run);
         let residents: Vec<ProcessId> = (0..rng.below(4)).map(|_| ProcessId::new_v4()).collect();
         for &pid in &residents {
             planner.register(pid);
@@ -4958,6 +4964,45 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
                 }
             }
         }
+        // Fragmented: free chunks and residents' chunks alternate, so the
+        // free count covers the head's need but no run of two stands. The
+        // head fits the pool alone; only moving residents stands its runs.
+        let fragmented = !is_rise && !residents.is_empty() && rng.below(4) == 0;
+        if fragmented {
+            let mut free = pool.free.lock();
+            free.clear();
+            free.extend((0..total).step_by(2));
+            let mut kv = pool.kv.lock();
+            kv.clear();
+            for (k, chunk) in (1..total).step_by(2).enumerate() {
+                kv.push((chunk, residents[k % residents.len()]));
+            }
+        }
+        // Half the fragmented pools also hold an evicted process's state
+        // parked in place (no host tier took its live parts) in every other
+        // held chunk: no one runs on it, and only moving it down a tier
+        // frees those chunks.
+        if fragmented && rng.below(2) == 0 {
+            let sleeper = ProcessId::new_v4();
+            planner.register(sleeper);
+            planner.note_admitted(sleeper);
+            planner.with_inner(|inner| {
+                inner.procs.get_mut(&sleeper).unwrap().state = Residency::Evicted;
+            });
+            let mut kv = pool.kv.lock();
+            let mut parked = pool.parked.lock();
+            let mut k = 0;
+            kv.retain(|&(chunk, _)| {
+                k += 1;
+                if k % 2 == 0 {
+                    parked.push((chunk, sleeper));
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        let mixed = mixed || fragmented;
         // A rise's residents are idle: a grant here is never taken by a
         // task, and the fleet it leaves never stalls (a granted waiter is
         // no stalled one), so a rise head would wait on completions this
@@ -5099,7 +5144,8 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
         let mut schedule = vec![format!(
             "total={total} host={host} run={run} pieces={pieces} restore={is_restore} \
              understated_at={understated_at:?} runs_now={runs_now} residents={} grants={grants} \
-             compactable={} mixed={mixed} rise={is_rise} walk_rise={walk_rise} kv={:?} \
+             compactable={} mixed={mixed} fragmented={fragmented} rise={is_rise} \
+             walk_rise={walk_rise} kv={:?} \
              held={:?}",
             residents.len(),
             pool.compactable.load(Ordering::Acquire),
@@ -5334,6 +5380,31 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
                 failures.push(format!(
                     "seed {seed} step {step}: the map serves the head's {need:?} and the planner \
                      is silent\n  schedule: {}",
+                    schedule.join(" -> ")
+                ));
+                break;
+            }
+            // Every chunk free or a live resident's (none held by no one, as
+            // in a real pool): the head fits the pool alone, so unserved
+            // with nothing in flight is a planner bug, never a wait.
+            // Each chunk counted once: a give here may free a chunk a
+            // resident's kv still names.
+            let owned = {
+                let mut chunks: HashSet<u32> = pool.free.lock().iter().copied().collect();
+                chunks.extend(
+                    pool.kv
+                        .lock()
+                        .iter()
+                        .filter(|(_, pid)| alive_now.contains(pid))
+                        .map(|&(chunk, _)| chunk),
+                );
+                chunks.extend(pool.parked.lock().iter().map(|&(chunk, _)| chunk));
+                chunks.len() == total as usize
+            };
+            if owned && quiet && !retried && !is_rise {
+                failures.push(format!(
+                    "seed {seed} step {step}: every chunk is free or a resident's, the head \
+                     fits alone, and nothing is in flight\n  schedule: {}",
                     schedule.join(" -> ")
                 ));
                 break;

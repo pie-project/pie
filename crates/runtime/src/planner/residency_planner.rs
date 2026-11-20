@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::Notify;
@@ -51,9 +51,12 @@ pub struct ResidencyPlanner {
     spill_failed: AtomicBool,
     /// Parked state is on its way down a tier ([`Self::park_down`]).
     parking_down: AtomicBool,
-    /// A move of parked state down a tier failed: the engine moves no such
-    /// slots, and none is tried again.
-    park_down_failed: AtomicBool,
+    /// A move of parked state down a tier failed: the pool's room count
+    /// then (`PoolPort::room_gives`), `u64::MAX` for none. It is tried
+    /// again once the pool has moved past it, never on the same map twice:
+    /// latched for good, one failure left every parked-in-place process's
+    /// state holding the device while their owners waited to be served.
+    park_down_failed: AtomicU64,
     /// The segment walk made no grow it promised: the next pass goes on
     /// past its grow steps ([`Self::no_grow`]).
     pub(super) no_grow: AtomicBool,
@@ -112,7 +115,7 @@ impl ResidencyPlanner {
             demoting: AtomicBool::new(false),
             spill_failed: AtomicBool::new(false),
             parking_down: AtomicBool::new(false),
-            park_down_failed: AtomicBool::new(false),
+            park_down_failed: AtomicU64::new(u64::MAX),
             no_grow: AtomicBool::new(false),
             port,
             stats: PlannerStats::default(),
@@ -328,8 +331,17 @@ impl ResidencyPlanner {
         let planner = self.clone();
         crate::rt::spawn(async move {
             loop {
-                notify.notified().await;
-                planner.plan();
+                let woke =
+                    crate::rt::time::timeout(super::plan::STALL_SAYS_AGAIN, notify.notified())
+                        .await
+                        .is_ok();
+                if woke {
+                    planner.plan();
+                } else if planner.returns.waiters.load(Ordering::Acquire) != 0 {
+                    // Quiet a while with someone queued: a stall goes on
+                    // being said, nothing planned for it.
+                    planner.dump_stall();
+                }
             }
         });
     }
@@ -483,7 +495,8 @@ impl ResidencyPlanner {
     /// none of them is restored until it lands. Whether a move is on its
     /// way.
     pub(super) fn park_down(self: &Arc<Self>, head: ProcessId, pids: Vec<ProcessId>) -> bool {
-        if self.park_down_failed.load(Ordering::Acquire) {
+        let failed_at = self.park_down_failed.load(Ordering::Acquire);
+        if failed_at != u64::MAX && failed_at == self.port.room_gives() {
             return false;
         }
         if self.parking_down.swap(true, Ordering::AcqRel) {
@@ -519,11 +532,11 @@ impl ResidencyPlanner {
 
     /// A move of parked state down a tier ended: its processes may be
     /// restored again, and the plan looks at the room it made. One that
-    /// failed is not tried again: it would fail the same way.
+    /// failed is not tried again on the same map: it would fail the same
+    /// way until room moves (`park_down_failed`).
     pub(super) fn parked_down_done(self: &Arc<Self>, moved: bool) {
-        if !moved {
-            self.park_down_failed.store(true, Ordering::Release);
-        }
+        let failed_at = if moved { u64::MAX } else { self.port.room_gives() };
+        self.park_down_failed.store(failed_at, Ordering::Release);
         self.with_inner(|inner| inner.parked_moving.clear());
         self.parking_down.store(false, Ordering::Release);
         self.poke();

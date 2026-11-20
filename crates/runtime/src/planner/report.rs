@@ -262,8 +262,15 @@ impl ResidencyPlanner {
         let refused_runs = refused_free_runs.filter(|_| run == need.0);
         let refused_saw = refused_runs.is_some_and(|free| free >= pieces);
         let map_shows = map_runs >= pieces;
-        let understated = refused_saw || map_shows;
         let stood = map_runs.max(refused_runs.unwrap_or(0));
+        // Understated asks one run more than stood, and only while the pool
+        // can stand one more: past that the need asked chunks no pool of
+        // this size holds, and the head waited for good with room it fits
+        // alone in (the seeded liveness test: three runs of three in a pool
+        // of eight). There it is a plain short head, going again once the
+        // map has moved past its refusal.
+        let max_runs = self.port.state_chunks() / run.max(1);
+        let understated = (refused_saw || map_shows) && stood < max_runs;
         let pieces = if understated { pieces.max(stood.saturating_add(1)) } else { pieces };
         let updated = super::proc::PendingBind {
             run,

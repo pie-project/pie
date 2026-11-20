@@ -58,6 +58,56 @@ impl ChunkHeld {
     }
 }
 
+/// The `pieces` disjoint windows of `run` adjacent chunks, each from
+/// `windows` (`(cost, first chunk)`), whose costs sum least, as `(cost,
+/// first)`; `None` where no `pieces` of them are disjoint. A line of chunks
+/// takes them exactly: the least cost of `k` windows within the chunks
+/// below each position, built up position by position.
+fn cheapest_disjoint(windows: &[(u32, u32)], run: u32, pieces: u32) -> Option<Vec<(u32, u32)>> {
+    if pieces == 0 {
+        return Some(Vec::new());
+    }
+    let cost: std::collections::HashMap<u32, u32> =
+        windows.iter().map(|&(sum, first)| (first, sum)).collect();
+    let end = windows.iter().map(|&(_, first)| first + run).max()? as usize;
+    let run = run as usize;
+    let pieces = pieces as usize;
+    if pieces.saturating_mul(run) > end {
+        return None;
+    }
+    // best[k][i]: the least cost of `k` windows inside chunks `0..i`.
+    let mut best = vec![vec![u64::MAX; end + 1]; pieces + 1];
+    best[0].fill(0);
+    for k in 1..=pieces {
+        for i in 1..=end {
+            let mut least = best[k][i - 1];
+            if i >= run
+                && let Some(&sum) = cost.get(&((i - run) as u32))
+                && best[k - 1][i - run] != u64::MAX
+            {
+                least = least.min(best[k - 1][i - run] + u64::from(sum));
+            }
+            best[k][i] = least;
+        }
+    }
+    if best[pieces][end] == u64::MAX {
+        return None;
+    }
+    let mut taken = Vec::with_capacity(pieces);
+    let (mut k, mut i) = (pieces, end);
+    while k > 0 {
+        if best[k][i] == best[k][i - 1] {
+            i -= 1;
+            continue;
+        }
+        let first = (i - run) as u32;
+        taken.push((cost[&first], first));
+        i -= run;
+        k -= 1;
+    }
+    Some(taken)
+}
+
 impl ChunkMap {
     /// `other`'s chunks counted in as well: a chunk both hold has the
     /// occupants of each, a pid in both its slots summed.
@@ -187,7 +237,7 @@ impl ChunkMap {
         // its cost; then the cheapest disjoint ones.
         let starts: std::collections::BTreeSet<u32> =
             free.iter().chain(held.keys()).copied().collect();
-        let mut windows: Vec<(u32, u32)> = starts
+        let windows: Vec<(u32, u32)> = starts
             .iter()
             .filter(|&&first| one_segment(first))
             .filter_map(|&first| {
@@ -197,19 +247,13 @@ impl ChunkMap {
                     .map(|sum| (sum, first))
             })
             .collect();
-        windows.sort_unstable();
-        let mut taken: Vec<(u32, u32)> = Vec::new();
-        for (sum, first) in windows {
-            if taken.len() as u32 == pieces {
-                break;
-            }
-            if taken.iter().all(|&(_, at)| first + run <= at || at + run <= first) {
-                taken.push((sum, first));
-            }
-        }
-        if (taken.len() as u32) < pieces {
-            return None;
-        }
+        // The cheapest `pieces` disjoint windows, chosen exactly: taking the
+        // cheapest window first could leave no room for the rest where a
+        // costlier set of them fits (free runs at 1-3 and 6-8 of eleven
+        // chunks, a third run asked: the two free ones taken, nothing fit
+        // beside them, and no one was moved, though moving one occupant
+        // stood three runs at 0, 3 and 6).
+        let taken = cheapest_disjoint(&windows, run, pieces)?;
         let in_runs: std::collections::BTreeSet<u32> = taken
             .iter()
             .flat_map(|&(_, first)| first..first + run)
@@ -426,6 +470,13 @@ pub trait PoolPort: Send + Sync + 'static {
     ) -> bool {
         let _ = (planner, pids, order);
         false
+    }
+    /// The chunks the device pool holds for kv and state at most (its
+    /// chunks past the reserved and the activation's): the most runs of
+    /// any length a need can ask. `u32::MAX` where the pool keeps no
+    /// chunks.
+    fn state_chunks(&self) -> u32 {
+        u32::MAX
     }
     /// The device pool's count of room given back (a chunk opened for
     /// state, [`crate::store::slots::SlotPool::room_gives`]): moved since
@@ -652,6 +703,12 @@ impl PoolPort for RegistryPool {
             crate::store::shared::ask_walk(self.engine);
         }
         comes
+    }
+
+    fn state_chunks(&self) -> u32 {
+        crate::store::registry::try_get(self.model, self.engine)
+            .and_then(|stores| stores.shared)
+            .map_or(u32::MAX, |shared| shared.lock().unwrap().state_chunks_now())
     }
 
     fn room_gives(&self) -> u64 {

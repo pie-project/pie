@@ -76,6 +76,12 @@ enum Board {
     Replan,
 }
 
+/// While a head stays unserved with nothing in flight, its stall dump is
+/// said again this often ([`ResidencyPlanner::dump_stall`]), the drain task
+/// looking with no plan pass: a stall that goes on is never silent, and no
+/// timer ends it.
+pub(super) const STALL_SAYS_AGAIN: std::time::Duration = std::time::Duration::from_secs(5);
+
 impl ResidencyPlanner {
     pub fn plan(self: &Arc<Self>) {
         // A grant dropped unspent during the pass gave back room the pass
@@ -127,7 +133,10 @@ impl ResidencyPlanner {
             {
                 return None;
             }
-            if inner.stall_dumped == Some((key, gives)) {
+            if let Some((at, seen, said)) = inner.stall_dumped
+                && (at, seen) == (key, gives)
+                && said.elapsed() < STALL_SAYS_AGAIN
+            {
                 return None;
             }
             let need = match &waiter.kind {
@@ -140,30 +149,38 @@ impl ResidencyPlanner {
             };
             let (pid, kind) = (waiter.pid, waiter.kind_name());
             let pids: Vec<ProcessId> = inner.procs.keys().copied().collect();
-            inner.stall_dumped = Some((key, gives));
-            Some((key, pid, kind, need, pids))
+            let again = inner.stall_dumped.is_some_and(|(at, seen, _)| (at, seen) == (key, gives));
+            inner.stall_dumped = Some((key, gives, crate::rt::Instant::now()));
+            Some((key, pid, kind, need, pids, again))
         });
-        let Some((key, pid, kind, need, pids)) = stalled else {
+        let Some((key, pid, kind, need, pids, again)) = stalled else {
             return;
         };
         self.stats.stall_dumps.fetch_add(1, Ordering::Relaxed);
         let (free, total) = self.port.device_stats();
-        let (map, census) = need.map_or((String::new(), String::new()), |(run, _)| {
-            let mut map = self.port.chunk_occupants(&pids);
-            map.merge(self.port.parked_occupants(pid));
-            (map.explain(run), self.port.chunk_census(run))
-        });
-        tracing::warn!(
+        // A head short of kv reads the map at runs of one chunk: what holds
+        // the chunks it could take, parked state lying on the device among
+        // it (a no-host pool's parked-in-place sets).
+        let run = need.map_or(1, |(run, _)| run);
+        let mut map = self.port.chunk_occupants(&pids);
+        map.merge(self.port.parked_occupants(pid));
+        let (map, census) = (map.explain(run), self.port.chunk_census(run));
+        // Every head queued fits the pool alone (one past it is refused at
+        // its ask): unserved with nothing in flight, the planner found no
+        // step for room that is there, which is its bug, never a wait.
+        tracing::error!(
             ?key,
             %pid,
             kind,
             need = ?need,
+            again,
             free_runs = need.map(|(run, _)| self.port.guest_free_runs(run)),
             device = ?(free, total),
             queue = %self.debug_queue(),
             %map,
             pool = %census,
-            "planner: the queue's head is unserved with nothing in flight"
+            "planner: the queue's head fits the pool alone and is unserved with nothing in \
+             flight (a planner bug: no step found)"
         );
     }
 
