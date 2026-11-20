@@ -351,6 +351,10 @@ impl ResidencyPlanner {
                 proc.roles_short_gives = Some(gives);
                 proc.roles_short_runs = Some((need.0, refused_room));
                 proc.roles_short_free = Some(free_chunks);
+                // Read below, once it is queued again: until then, as if
+                // its placement stood it (the stricter key), so a pass the
+                // requeue runs sends it on no less.
+                proc.roles_short_stood = Some(true);
                 proc.roles_refused = Some(need);
                 // Refused against runs the map shows: the census names the
                 // mismatch (a room the map does not read).
@@ -379,10 +383,9 @@ impl ResidencyPlanner {
             let stood = self
                 .head_room(key)
                 .is_some_and(|need| self.port.guest_need_free(&need, state));
-            let gives = self.port.room_gives();
             self.with_inner(|inner| {
                 if let Some(proc) = inner.procs.get_mut(&pid) {
-                    proc.roles_short_stood = Some((stood, gives));
+                    proc.roles_short_stood = Some(stood);
                 }
             });
         }

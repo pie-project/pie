@@ -112,15 +112,15 @@ pub(super) struct Proc {
     pub(super) roles_short_free: Option<u32>,
     /// Whether the store's own placement ([`super::pool::PoolPort::guest_need_free`],
     /// its serve's state laid first) stood its need as its last unpark
-    /// refusal left the pool, and the pool's count of room given back then.
-    /// Refused while the store's placement stood it, the placement read a
-    /// room the unpark did not: it goes again only once room has been given
-    /// back since. Refused where it did not stand, it goes again once it
-    /// does: one placement decides, never a count of free chunks or runs
-    /// beside it (Mac Pro at 5 GiB on 1e87ab171: 4 chunks free, a run of
-    /// four standing, the refused restore held on "no more chunks free
-    /// than it left", 18,973 no-step lines).
-    pub(super) roles_short_stood: Option<(bool, u64)>,
+    /// refusal left the pool. Refused where it did not stand, it goes again
+    /// once it does: the placement decides, not a count of free chunks
+    /// beside it (Mac Pro at 5 GiB on 1e87ab171: 4 chunks free, the
+    /// refused restore held on "no more chunks free than it left", 18,973
+    /// no-step lines). Refused while it stood it, the placement read a
+    /// room the unpark did not, and it goes again only once more chunks
+    /// stand free than the refusal left ([`Self::roles_short_free`]): a
+    /// decoding fleet's takes and gives sent it again ~350 times a second.
+    pub(super) roles_short_stood: Option<bool>,
     /// The run its last unpark was refused, `(run, pieces)`, kept across a
     /// re-send until a restore serves it: its need always holds what the
     /// unpark asked. Cleared with the refusal at a re-send, the need fell

@@ -769,21 +769,25 @@ impl ResidencyPlanner {
                     // state laid first ([`super::pool::PoolPort::guest_need_free`]). It
                     // goes again where that stands now, unless it stood as
                     // the refusal left the pool too (it read a room the
-                    // unpark did not) and no room has been given back
-                    // since ([`super::proc::Proc::roles_short_stood`]).
-                    let (state, stood_at) = self.with_inner(|inner| {
+                    // unpark did not): then only once more chunks stand
+                    // free than the refusal left
+                    // ([`super::proc::Proc::roles_short_stood`]).
+                    let (state, stood_at, free_left) = self.with_inner(|inner| {
                         inner
                             .unmet_head()
                             .map(|(_, waiter)| {
+                                let proc = inner.procs.get(&waiter.pid);
                                 (
                                     waiter.rs_need(),
-                                    inner.procs.get(&waiter.pid).and_then(|proc| proc.roles_short_stood),
+                                    proc.and_then(|proc| proc.roles_short_stood),
+                                    proc.and_then(|proc| proc.roles_short_free),
                                 )
                             })
                             .unwrap_or_default()
                     });
-                    let moved = stood_at
-                        .is_none_or(|(stood, gives)| !stood || self.port.room_gives() != gives);
+                    let moved = stood_at.is_none_or(|stood| {
+                        !stood || free_left.is_none_or(|left| self.port.free_chunks() > left)
+                    });
                     if !understated && moved && self.port.guest_need_free(&room, state) {
                         self.with_inner(|inner| {
                             let pid = inner.unmet_head().map(|(_, waiter)| waiter.pid);

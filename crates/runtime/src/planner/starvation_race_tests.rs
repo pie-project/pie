@@ -8645,7 +8645,6 @@ async fn four_scattered_free_chunks_and_a_run_of_four_asked_issue_a_plan() {
         planner.note_admitted(pid);
     }
     pool.kv.lock().extend([1, 3, 5, 7].map(|chunk| (chunk, resident)));
-    let gives = pool.room_gives();
     let key = planner.with_inner(|inner| {
         inner.procs.get_mut(&resident).unwrap().idle = true;
         let proc = inner.procs.get_mut(&head).unwrap();
@@ -8655,7 +8654,7 @@ async fn four_scattered_free_chunks_and_a_run_of_four_asked_issue_a_plan() {
             pieces: 1,
             pages: 4,
         });
-        proc.roles_short_stood = Some((false, gives));
+        proc.roles_short_stood = Some(false);
         inner.enqueue(
             head,
             WaitKind::Restore {
@@ -8706,7 +8705,7 @@ async fn a_pass_that_stops_short_of_the_eviction_plan_says_where() {
             pieces: 1,
             pages: 4,
         });
-        proc.roles_short_stood = Some((false, 0));
+        proc.roles_short_stood = Some(false);
         inner.enqueue(
             head,
             WaitKind::Restore {
