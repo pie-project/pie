@@ -36,6 +36,8 @@ struct RacePool {
     host_total: u32,
     // A registered model whose RS store backs the slot calls.
     rs_model: Option<usize>,
+    // Where set, the pool grows and keeps each ask.
+    grows: Option<parking_lot::Mutex<Vec<Demand>>>,
 }
 
 impl RacePool {
@@ -48,6 +50,7 @@ impl RacePool {
             pulls: parking_lot::Mutex::new(Vec::new()),
             host_total: 0,
             rs_model: None,
+            grows: None,
         }
     }
 
@@ -103,6 +106,12 @@ impl PoolPort for RacePool {
     }
     fn locus(&self) -> (usize, usize) {
         (self.rs_model.unwrap_or(0), 0)
+    }
+    fn grow(&self, need: Demand) -> bool {
+        self.grows.as_ref().is_some_and(|grows| {
+            grows.lock().push(need);
+            true
+        })
     }
     fn reserve_device(&self, count: u32) -> Option<Vec<PhysicalKvPageId>> {
         let mut free = self.free.lock();
@@ -237,6 +246,45 @@ fn a_head_short_of_state_beside_free_pages_is_funded_by_eviction() {
     );
     assert_eq!(victims.members.len(), 1);
     assert_eq!(victims.members[0].pid, younger);
+}
+
+#[test]
+fn a_head_short_of_state_asks_the_pool_for_all_it_takes() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
+    // Two of four slots free, the head takes three: it asks for all three, not the one it lacks.
+    let model = crate::store::registry::register_model(16, &[64], &[4]);
+    let stores = crate::store::registry::get(model, 0);
+    let held = stores
+        .rs
+        .lock()
+        .unwrap()
+        .reserve(RsUnits {
+            slots: 2,
+            pages: 0,
+            ..RsUnits::default()
+        })
+        .unwrap();
+    let pool = Arc::new(RacePool {
+        rs_model: Some(model),
+        grows: Some(parking_lot::Mutex::new(Vec::new())),
+        ..RacePool::new(8)
+    });
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let head = ProcessId::new_v4();
+    planner.register(head);
+    planner.note_admitted(head);
+    let rs = RsUnits {
+        slots: 3,
+        pages: 0,
+        ..RsUnits::default()
+    };
+    planner.with_inner(|inner| {
+        inner.enqueue(head, allocation(Demand { kv_pages: 0, rs }));
+    });
+    planner.plan();
+    let grows = pool.grows.as_ref().unwrap().lock().clone();
+    assert_eq!(grows, vec![Demand { kv_pages: 0, rs }]);
+    stores.rs.lock().unwrap().release_reservation(held);
 }
 
 #[test]
