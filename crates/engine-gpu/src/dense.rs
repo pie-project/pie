@@ -320,6 +320,7 @@ mod tests {
             launch_ns: Some(3000),
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 10.0), (2048, 30.0)])]),
             hbm_gbps: Some(650.0),
+            cached_gbps: None,
             elementwise_gbps: Some(700.0),
             vector_tflops_by_rows: few.map(|t| {
                 gemm::VECTOR_ROWS

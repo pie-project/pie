@@ -826,6 +826,29 @@ impl<B: Backend> Pools<B> {
         refs.iter().map(|&r| self.units(LIST, r)).collect()
     }
 
+    /// What a lane of a bind-only fire names by ref: `pages` slot refs of
+    /// the list shape and a record (a slot ref of the fixed shape a piece),
+    /// each in the first chunk past the null chunk. The fire reads and writes
+    /// none of them; the pool takes them as any lane's (none of a shape the
+    /// pool holds not).
+    pub fn walk_refs(&self, pages: u32) -> Result<(Vec<u32>, Vec<u32>)> {
+        let first = |id: ShapeId, count: u32| -> Result<Vec<u32>> {
+            let per_chunk = self.shape(id)?.per_chunk.max(1);
+            Ok((0..count).map(|at| per_chunk + at % per_chunk).collect())
+        };
+        let pages = if self.layout.list.is_some() {
+            first(LIST, pages)?
+        } else {
+            Vec::new()
+        };
+        let record = if self.has_state() {
+            first(FIXED, self.pieces())?
+        } else {
+            vec![0; self.pieces() as usize]
+        };
+        Ok((pages, record))
+    }
+
     /// The physical page explicit write descriptor page `page` names.
     pub fn kv_page(&self, page: u32) -> Result<u32> {
         self.units(LIST, page)

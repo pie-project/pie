@@ -240,7 +240,9 @@ impl Guests {
                     let spans: Vec<Vec<engine_gpu::serve::ReadSpan>> = (lane..lane + lanes as u32)
                         .map(|lane| {
                             (layout.iter())
-                                .filter(|span| span.lane == lane && span.rows > 0)
+                                .filter(|span| {
+                                    span.lane == lane && span.rows > 0 && span.seated
+                                })
                                 .copied()
                                 .collect()
                         })
@@ -1149,16 +1151,19 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
         {
             // A stage's collect reads back through its thread's buffer, a
             // chunk of the pool each (a program whose stage reads back more
-            // is refused at registration).
+            // is refused at registration). The buffers, and the widen's
+            // table, are the shelf's: reserved before the pool was sized.
+            let (outboxes, table) = &place.shelf.guest;
             let library = crate::guest::session::Library::build(
                 place.device,
-                place.pools.chunk_bytes(),
-                u32::try_from(crate::landing::guest_threads()).unwrap_or(u32::MAX),
+                outboxes.clone(),
+                &place.pools.segment_buffers(),
             )
             .map_err(|why| Refusal::Program(format!("the guest pipelines did not build: {why}")))?;
             self.library = Some(Arc::new(library));
             let widen = crate::guest::widen::Widen::new(
                 place.device,
+                table.clone(),
                 &place.seats,
                 &place.pools.segment_buffers(),
                 u32::try_from(crate::landing::guest_threads()).unwrap_or(u32::MAX),

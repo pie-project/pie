@@ -12,6 +12,12 @@ use engine_gpu::error::Result;
 pub struct Shelf {
     mirror: Vec<Buffer>,
 
+    /// The guest plane's readback buffers, one a thread that runs guest
+    /// passes, a chunk of the pool each, and its readout widen's table:
+    /// reserved before the pool is sized, the plane takes them at its load.
+    #[cfg(feature = "wgpu")]
+    pub(crate) guest: (Vec<Buffer>, Buffer),
+
     mailbox: crate::landing::Mailbox,
 
     worker: crate::landing::Worker,
@@ -44,6 +50,10 @@ impl Serve for Api {
     /// Every cell of a guest's rings lies on the host: a pass reads its
     /// takes from there and lands its puts there.
     const CHANNEL_CELLS: bool = false;
+
+    /// A step's guest passes run once it landed (`landing`), and a later
+    /// fire may be on the queue by then: they read the arm's seat.
+    const READS_SPAN: bool = false;
 
     const TARGET: kernels_slang::Target = kernels_slang::Target::Wgsl;
 
@@ -142,26 +152,60 @@ impl Serve for Api {
         device.frame()
     }
 
+    const BINDS_AT_LOAD: bool = true;
+
+    fn bind_frame(device: &Context) -> Result<Frame> {
+        device.bind_frame()
+    }
+
+    fn bound(pipelines: &Pipelines) -> u64 {
+        pipelines.bound()
+    }
+
     fn shelf(
         device: &Context,
         pipelines: &Pipelines,
         readout: &[Buffer],
         _weights_stream: bool,
+        guest: engine_gpu::serve::GuestRoom,
     ) -> Result<Shelf> {
-        // A frame takes a uniform and a scratch chunk from the rings and a
-        // bind group's uniforms from the pipelines' arena: the rings are
-        // stocked for each frame in flight (an arm a readout seat) and the
-        // one a settle or a walk holds beside them, and the arena's first
-        // chunk is made, here at the load, before the pool is sized past
-        // them. A shell fires frames with or without a guest program.
+        // A frame takes a scratch chunk from the ring: stocked for each frame
+        // in flight (an arm a readout seat) and the one a settle or a walk
+        // holds beside them, here at the load, before the pool is sized past
+        // them. A shell fires frames with or without a guest program. Its
+        // uniforms are the device's, made with it.
         #[cfg(feature = "wgpu")]
-        {
-            device.core().stock_rings(readout.len() + 1);
-            pipelines.stock_arena(device.core());
-        }
+        device.core().stock_rings(readout.len() + 1);
         #[cfg(not(feature = "wgpu"))]
-        let _ = (device, pipelines);
+        let _ = (device, guest);
+        let _ = pipelines;
+        #[cfg(feature = "wgpu")]
+        let threads = u32::try_from(crate::landing::guest_threads()).unwrap_or(u32::MAX);
         Ok(Shelf {
+            #[cfg(feature = "wgpu")]
+            guest: (
+                (0..threads)
+                    .map(|_| {
+                        Buffer::with(
+                            device,
+                            guest.chunk_bytes,
+                            crate::device::Memory::Readback,
+                            engine_gpu::books::owners::GUEST,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                Buffer::with(
+                    device,
+                    crate::guest::widen::Widen::table_bytes(
+                        device,
+                        guest.seats,
+                        threads,
+                        u64::from(guest.max_lanes) * u64::from(guest.planes),
+                    ),
+                    crate::device::Memory::Device,
+                    engine_gpu::books::owners::GUEST,
+                )?,
+            ),
             mirror: readout
                 .iter()
                 .map(|seat| {
@@ -213,13 +257,19 @@ impl Serve for Api {
             ..
         } = launch;
         let arm = prepared.arm;
-        let hosted = layout
+        // The host reads back its own spans alone: the rest of the seat is
+        // for the step's programs, on the device.
+        let hosted: Vec<(u64, u64, u64)> = layout
             .iter()
-            .filter(|span| span.host)
-            .map(|span| span.at + span.bytes())
-            .max()
-            .unwrap_or(0);
-        frame.copy(&shell.readout[arm], 0, &shell.shelf.mirror[arm], 0, hosted)?;
+            .filter(|span| span.hosted && span.rows > 0)
+            .map(|span| (span.at, span.at, span.bytes()))
+            .collect();
+        engine_gpu::backend::Frame::copy_regions(
+            &mut frame,
+            &shell.readout[arm],
+            &shell.shelf.mirror[arm],
+            &hosted,
+        )?;
         let on_done = crate::landing::on_done(
             crate::landing::Seat {
                 seq,

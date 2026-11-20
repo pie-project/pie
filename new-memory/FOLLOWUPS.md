@@ -487,3 +487,267 @@ Streamed PLE rows (per-fire row indices, no cut) could roll as adapter banks do.
 
 Host RAM is attacked by shrinking the ladder instead: logprobs sharing the forward's
 programs, and prefill buckets chosen from measured costs.
+
+## F36. XLA prefill buckets: which rungs a model can drop is measured per model, not per device
+
+The token rungs come from `Pad::ladder` (`engine-xla chip.rs`). They are the powers of
+two up to 512, then `engine.pad.row_steps` steps between powers of two from 512 up (v6e:
+4, i.e. 640, 768, 896, 1024, …). Each rung brings its prefill and mixed ladder shapes.
+
+The rule (Leader): a rung goes if padding every prompt it serves up to the next remaining
+rung costs at most 2%. Measured as t(next) / t(rung) on single-lane prefill fires (engine
+probe), and on batched fires (several lanes beside decodes, a c64 step); both must stay
+within 2%.
+
+qwen3-0.6b on v6e, single-lane prefill, ms per fire:
+
+| rung | ms | dropping it pads to | cost |
+|---|---|---|---|
+| 64 | 3.40 | 128 | +3.2% |
+| 128 | 3.51 | 256 | +10.9% |
+| 256 | 3.89 | 512 | +16.5% |
+| 512 | 4.53 | 640 | +10.6% |
+| 640 | 5.01 | 768 | +0.6% |
+| 768 | 5.04 | 896 | +17.2% |
+| 896 | 5.91 | 1024 | −1.0% |
+| 1024 | 5.78 | 1280 | +17% |
+| 1280 | 6.77 | 1536 | +16.1% |
+| 1536 | 7.86 | | |
+| 1792 | 9.04 | 2048 | +15.5% |
+| 2048 | 10.44 | | |
+| 2560 | 13.29 | | |
+
+Only 640 and 896 pass. The model is weight-bound up to about 1024 rows and compute-bound
+past that.
+
+Why per model:
+- `row_steps = 4` is itself a measured device decision. It came from Gemma-4-31B, where a
+  512-token prompt plus its template ran a 1024-row fire, and the 128-row steps took cut
+  Raw prefill toward vLLM-TPU (8.8k vs 12.8k tok/s).
+- A compute-bound model pays nearly in proportion to its rows for the same padding.
+- So the kept set is a property of (device, model).
+
+What it would need:
+- the kept set derived at load from a measured cost curve: the device's measured rates (bandwidth, MXU throughput) against the model's weight bytes and FLOPs per row, or a per-model probe;
+- the batched-fire check beside it.
+
+What it would buy on qwen3-0.6b: 2 of 21 rungs, of the order of 50 programs, about 8–10
+GB of host at ready, against 126 GiB (F37). Not built.
+
+## F37. XLA host RAM at ready is libtpu's live per-executable data, about 200 MB a program
+
+qwen3-0.6b's ladder (652 programs, tip e88370f2c, census config) holds 126 GiB of host RSS
+at ready. 129 GiB peaks on a cold boot. A ladder twice the size froze the 172 GB host
+(readout iii).
+
+smaps at ready: 132.8 GB RSS, all anonymous (61 GB in THP, 0.15 GB file-backed).
+
+| mapping class | maps | RSS |
+|---|---|---|
+| exactly 64 MiB (glibc's per-thread arena heaps) | 992 | 49.9 GB |
+| variable 16 MiB – 1 GiB large mmaps | 319 | 49.9 GB |
+| 128 MiB | 147 | 19.1 GB |
+| 1–2 GiB | 21 | 13.5 GB |
+
+It is live: `malloc_trim(0)` after the warm ladder returned nothing (126 GiB before and
+after).
+
+Per executable, in a bare PJRT client, the 28-layer qwen3 decode program (22.5 MB of code,
+38.5 MB serialized, 1.8 MB of StableHLO) holds:
+- 177 MB after `DeserializeAndLoad` (about 7.6× its code);
+- 380 MB after a compile.
+
+Pie keeps nothing besides the loaded executable: `Executable::adopt` destroys the
+`PJRT_Executable` it reads, and the cache bytes are dropped.
+
+libtpu flags tried, deserialize per program:
+
+| flag | deserialize | compile |
+|---|---|---|
+| `xla_xprof_register_llo_debug_info=false` | 174 MB | |
+| `xla_tpu_impure_track_debug_metadata=false` | 177 MB | 306 MB |
+| `xla_tpu_keep_hlo_proto_literals_up_to=0` | 176 MB | |
+
+The PJRT C API has no call that drops a loaded executable's host-side data.
+
+Levers:
+- fewer programs (the ladder: logprobs share the forward's programs since 6123377f2; buckets, F36);
+- smaller code a program (rolling, F35, does not land under 2%);
+- a libtpu change: release or make configurable the host-side program data after load (an upstream request);
+- evicting cold executables to the disk cache (parked: a reload at fire time is a fire built after ready).
+
+Draft of the upstream request (text only; filing it is the user's call):
+
+> **libtpu: release (or make configurable) a loaded executable's host-side data after it is
+> on the device.** A serving engine that loads many fixed-shape programs at startup
+> (hundreds, through `PJRT_Executable_DeserializeAndLoad`) holds about 180 MB of live host
+> memory per loaded executable on v6e (libtpu 0.0.48). That is about 7.6× the program's
+> generated code (22.5 MB of code, 38.5 MB serialized), and 380 MB when the program is
+> compiled in process instead. 652 programs hold 126 GiB of host RAM; a ladder of 1178 has
+> exhausted a 172 GB host. The engine keeps no references beyond the
+> `PJRT_LoadedExecutable` (it destroys the `PJRT_Executable` it reads), `malloc_trim`
+> returns nothing, and the flags `xla_xprof_register_llo_debug_info`,
+> `xla_tpu_impure_track_debug_metadata` and `xla_tpu_keep_hlo_proto_literals_up_to` do not
+> change it. Request:
+> - document what a loaded executable keeps on the host after its first execute;
+> - an option (a compile or load option, or a flag) to release whatever is not needed to
+>   execute the program (the optimized HLO module, buffer assignment, debug or profiling
+>   metadata, serialized form), keeping only what a re-execute needs;
+> - if the program binary itself must stay host-resident (for instruction overlays or a
+>   reload into HBM), a way to share or page it rather than hold a private copy per
+>   executable.
+
+## F38. ROCm 1-lane greedy moves +0.6% when gemv.hip's code object changes, its 1-row kernels unchanged
+
+The turned norm fold (the norm prologue in `skinnyt_bf16`) leaves every 1-row kernel
+untouched, yet 1-lane greedy on MI300X (qwen3-0.6b) is 0.6% slower. Over 10 ABAB runs of
+1,536 tokens the wall is 2.122 vs 2.107 s, and the step cost (32 → 544 tokens) is 1.345 vs
+1.338 ms. c64, 4-parallel, beam-4 and prefill are flat or faster.
+
+Bisect:
+
+| build | g1 ms/step, 32 → 544 |
+|---|---|
+| tip before the fold | 1.334 – 1.338 |
+| the fold's kernels with the old routing (the fold never taken) | 1.343 – 1.344 |
+| the same, the skinny kernel's prologue the tip's verbatim | 1.344 – 1.345 |
+| the fold | 1.343 – 1.348 |
+
+The 1-row decode runs only `skinny_bf16` instantiations. Their summed device time per step
+is equal within 2 µs (rocprofv3, 1,024 tokens), and their registers, LDS and occupancy
+match (no scratch). What moved is the module the kernels share, so the suspicion is code
+placement (instruction-cache or alignment), not the kernels' work.
+
+Next:
+- dump the code object's kernel offsets on both builds; place or align the hot skinny entry
+  points and see whether the 7 µs follows;
+- if it does, a stable placement for the decode kernels, rather than chasing each module
+  edit.
+
+## F39. ROCm `kernel.gemm.turn_min_n` (2048) stands in for the turned kernel's narrow-bank idle
+
+The turned kernel (`skinnyt_bf16`) walks one 16-row tile a block, so a bank of n rows is
+n / 16 blocks. Below 2048 rows the route keeps the skinny kernel, and that constant is
+the narrow-bank idle, not a measured choice.
+
+Removing it costs MI300X 4-parallel decode +28 µs a step (qwen3-0.6b: 1.475 → 1.510 ms;
+beam-4 2.155 → 2.188). o-proj (1024 x 2048) moves to the turned kernel: 64 blocks on 304
+compute units, two serial 256-element slices a wavefront. It takes 7.2 µs a call against the
+skinny kernel's 6.2 (rocprofv3 device durations).
+
+Stream-timed microbenchmarks said the opposite: turn ahead from 128 columns up, cold weights
+too. Their back-to-back launches were capped by the dispatch rate (about 5 µs) and hid kernel
+duration. Kernel choices are compared on device durations.
+
+What replaces it: turn vs skinny priced per (n, k, m) from device durations. Either a probe
+that times kernels (not dispatches) in the profiler's rates step, or a tiles-per-CU /
+slices-per-wavefront model fitted on rocprof durations. Then the decision goes.
+
+Resolved: the decision is gone. Inside the turn rows, a bank both kernels cover takes the kernel
+its decode body is measured faster on. At the first boot that meets a shape, the lattice is
+armed with that bank on each kernel and the m-lane decode body replayed (9 rounds of 20 fires).
+The turned kernel is kept where it is faster past the rounds' interquartile spread, else the
+skinny kernel. The step times are saved in the device's user profile (`[rates] product_ns`,
+keyed by kind, bank rows, K and m), so later boots measure nothing.
+
+On qwen3-0.6b / MI300X the first boot chose 5 shapes in 7.5 s:
+- o-proj at m = 4: skinny;
+- gate-up at m = 4, the lm head at m = 4, and o-proj at m = 8: turned;
+- qkv at m = 4: skinny (22 µs within its 26 µs spread).
+
+The second boot: 4-parallel 1.463 ms a step, beam-4 2.138 (against 1.475 / 2.15 with the
+constant); greedy, c64, prefill flat.
+
+Per-product graph bursts were tried first and mispredict. One product back to back over its
+layers' weights put gate-up at m = 4 on skinny (8.74 vs 8.89 µs); the step has turn 20 µs
+faster. A product's cost is measured in its real neighbourhood (F40).
+
+Open: the first boot's 7.5 s re-arms the whole lattice once per choice. Arming only the
+buckets a shape's rows name would cut it to the decode bodies'.
+
+## F40. ROCm 4-row decode: where the 4-parallel step's ~170 µs over 1 greedy goes (MI300X, qwen3-0.6b)
+
+At short context 1 greedy is 1.31 ms a step and 4 parallel 1.48 (after the turned norm
+fold). The attach kernel trace attributed the gap mostly to o-proj + down (+78 µs). That
+was an artifact: under `rocprofv3 --attach --kernel-trace` every kernel starts after a
+~290 µs idle gap, so its durations describe a cold, down-clocked device, not graph replay.
+The serialized PMC run gives o-proj + down only about +1 µs a layer, and LDS bank conflicts
+are 0.
+
+The instrument that measures in context is ablation by duplication. Launch one product
+twice (idempotent) under a scratch switch, and difference the step cost (32 → 160 tokens,
+median of 5, two rounds):
+
+| product (per call) | m = 1 | m = 4 | 4-row extra a step |
+|---|---|---|---|
+| o-proj 1024 x 2048, skinny | 3.7 µs | 3.7 µs | 0 |
+| down 1024 x 3072, skinny | 4.6 µs | 4.8 µs | +6 |
+| qkv 4096 x 1024, folded norm (skinny / turned), 27 layers | 6.0 µs | 7.1 µs | +30 |
+| gate-up 3072 x 1024 gated, folded norm (skinny / turned), 28 layers | 6.6 µs | 9.0 µs | +67 |
+
+The other kernels, ablated the same way (one extra launch of each, Δ step µs at g1 → g4):
+
+| kernel | g1 | g4 | 4-row extra |
+|---|---|---|---|
+| attention decode (`paged_decode_mfma`) | +204 | +202 | 0 |
+| `merge_partials` | +125 | +128 | 0 |
+| qkv / rope / KV write | +137 | +162 | +25 |
+| lm head (one call a step) | +71 | +81 | +10 |
+
+The ledger: gated turned gate-up +67, folded qkv on turn +30, qkv/rope +25, lm head +10,
+down +6. o-proj, attention and merge add nothing. That is ≈138 µs; the remaining ~30 is
+host / channel / sampling work, not kernel-ablated.
+
+The routes are already the faster ones here. Gate-up on the folded skinny kernel instead of
+turn costs 4-parallel +20 µs (1.497 vs 1.476 ms); o-proj on turn costs +28 (F39). The gated
+turned product's cost is its own: 9.0 µs a call against skinny's 6.6 at m = 1, about
+1.4 TB/s against 1.9. More tiles a block (one norm stage walking them) does not help: two a
+block 1.488 ms (the same), three 1.524, four 1.573. A 16 + 16-column gated tile is the same
+work a block as two tiles, so it is not expected to help either.
+
+Tried, none kept (4-parallel ms a step, against 1.475–1.484):
+- skinny at m = 4: staging the activation four loads at a time (worse); reading it from
+  global, not LDS (no change); 16-wave blocks over 64 (worse); a grid trimmed to the blocks
+  with rows (noise); the quad kernel on narrow banks (much worse, 402 vs 306 µs traced);
+- turn_min_n removed (o-proj on turn): 1.510 (F39);
+- the turned kernel's tiles spread evenly (192 two-tile blocks for gate-up's 384 tiles over
+  304 CUs): 1.498–1.505.
+
+Instruments, ranked by fidelity, for a kernel's cost in a decode step:
+- the step's own replay, the body armed each way (F39), or duplication of the kernel inside it;
+- graph bursts of one product (a different neighbourhood: they reversed gate-up's order);
+- the attach kernel trace (kernels ~290 µs apart);
+- stream-timed microbenchmarks (dispatch-capped near 5 µs).
+
+Next:
+- gated turned product at m = 4: why its walk streams at 1.4 TB/s (latency per tile under
+  one wave a SIMD), with the PMC counters inside a duplication run rather than the attach
+  trace;
+- the ~30 µs host / channel / sampling share at four lanes;
+- the duplication switch is a scratch patch: a profile probe that times a kernel in place
+  (in a captured body) would make it a standing instrument.
+
+## F41. Windows NVIDIA (RTX Spark): a one-time submit stall early in an engine's life
+
+`runtime::register::a_cold_registration_compiles_while_a_lane_fires` fails on the Spark
+(Windows on Arm, NVIDIA driver) in about half its runs, on wgpu-Vulkan and on native Vulkan,
+on memory-redesign (04df99f24) as on the branches after it. It passes on Linux (RTX PRO 4500).
+One fire stalls 100 to 600 ms; the lane fires once inside the compile window instead of
+~100 times. Measured in-process (no nsys on the Spark):
+
+- The time is inside the submit: wgpu's `queue.submit`, or the native submit. The fire's
+  settle (its fence wait) is ~1.5 ms.
+- It is not the compile and not a lock in pie. `program::adopt` is host-only and
+  single-threaded, ~46 ms, and the stall outlasts it by up to 470 ms. With the off-lane thread
+  replaced by a pure spin, a spin that yields every millisecond, or a thread that only
+  sleeps, the stall still shows (1 of 3, 3 of 5, 3 of 5 runs).
+- It is not native Vulkan's pipeline-cache write either. In the test the cache has no file,
+  so `PipelineCache::persist` never reads the driver's data, and a run still stalled 601 ms.
+- It lands on one submit early in the engine's life. Three or more fires between building
+  the registration and the compile window avoid it in every variant run (16 of 16), and the
+  fires after the stalled one take ~1 ms.
+
+Read: a one-time host-side stall in the Windows NVIDIA driver's submit path, landing on
+whichever submit is in flight; the test catches it when that submit overlaps the compile.
+The test stays strict, known on this device. Owed: driver-level tracing on that box (not
+nsys, which bluescreens it), or a driver update that moves it.

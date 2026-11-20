@@ -38,67 +38,208 @@ fn wgsl_compiles_every_case() {
     a_sort_ladder_compiles();
     the_shader_declares_the_bindings_a_shell_binds();
     a_stepwise_module_compiles();
-    no_step_module_stores_to_its_tables();
+    a_step_module_writes_only_its_heap_and_its_status();
 }
 
-/// The tables a step reads at host-written indices with no device check
-/// (the runtime's `d_word`): no store of any step module reaches one, so a
-/// backend may bind them read_write beside the heap (wgpu's usage scope) and
-/// still lose nothing of the read-only binding's guarantee.
-fn no_step_module_stores_to_its_tables() {
-    const TABLES: [&str; 5] = ["descs", "params", "offs", "cfg", "pie_step"];
+/// Fails the check with its message where `cond` does not hold.
+macro_rules! check {
+    ($cond:expr, $($why:tt)+) => {
+        if !$cond {
+            return Err(format!($($why)+));
+        }
+    };
+}
+
+/// What a step can write, store by store (the runtime's isolation facts):
+/// its heap only through `hst`, at `b_heap + w` (w checked against the
+/// heap's words there); its status only through `pie_fault`, at `b_status`
+/// and a constant; its tables and its record nowhere. The bases and the heap
+/// bound are written only at the entry, from the record and the config
+/// table. A backend may then bind the tables read_write beside the status
+/// (wgpu's usage scope) and lose nothing of a read-only binding's guarantee.
+/// Each way out is refused (the negative controls).
+fn a_step_module_writes_only_its_heap_and_its_status() {
     for call in step_calls() {
         let source = step_module("main", &call);
-        let module = naga::front::wgsl::parse_str(&source).expect("a step module parses");
-        let tables: Vec<naga::Handle<naga::GlobalVariable>> = module
-            .global_variables
-            .iter()
-            .filter(|(_, var)| {
-                var.name
-                    .as_deref()
-                    .is_some_and(|name| TABLES.contains(&name))
-            })
-            .map(|(handle, _)| handle)
-            .collect();
-        assert_eq!(
-            tables.len(),
-            TABLES.len(),
-            "call {call} declares every table"
-        );
-        let functions = module
-            .functions
-            .iter()
-            .map(|(_, function)| function)
-            .chain(module.entry_points.iter().map(|entry| &entry.function));
-        for function in functions {
-            let mut stores = Vec::new();
-            stores_in(&function.body, &mut stores);
-            for pointer in stores {
-                match root_of(&function.expressions, pointer) {
-                    Root::Global(global) => assert!(
-                        !tables.contains(&global),
-                        "call {call} stores to the table `{}`",
-                        module.global_variables[global]
-                            .name
-                            .as_deref()
-                            .unwrap_or("?")
-                    ),
-                    Root::Argument => panic!(
-                        "call {call} stores through a pointer argument, which this test                          cannot follow to its table or not"
-                    ),
-                    Root::Local => {}
-                }
-            }
+        if let Err(why) = writes_only_its_heap_and_its_status(&call, &source) {
+            panic!("{why}");
         }
+    }
+    let call = &step_calls()[0];
+    let source = step_module("main", call);
+    for (planted, refused) in [
+        ("fn planted() { heap[3u] = 1u; }", "stores to the heap"),
+        (
+            "fn planted() { heap[b_heap + 1u] = 1u; }",
+            "stores to the heap",
+        ),
+        (
+            "fn planted() { atomicStore(&status[0u], 1u); }",
+            "stores to the status",
+        ),
+        ("fn planted() { b_heap = 0u; }", "sets `b_heap`"),
+        ("fn planted() { lim_heap = 4096u; }", "sets `lim_heap`"),
+    ] {
+        let source = format!(
+            "{source}
+{planted}
+"
+        );
+        let why = writes_only_its_heap_and_its_status(call, &source).expect_err(planted);
+        assert!(
+            why.contains(refused),
+            "`{planted}` refused as `{why}`, not `{refused}`"
+        );
     }
 }
 
-fn stores_in(block: &naga::Block, out: &mut Vec<naga::Handle<naga::Expression>>) {
+fn writes_only_its_heap_and_its_status(call: &str, source: &str) -> Result<(), String> {
+    const READ_ONLY: [&str; 2] = ["tables", "pie_step"];
+    const SET_AT_ENTRY: [&str; 7] = [
+        "b_status",
+        "b_descs",
+        "b_params",
+        "b_offs",
+        "b_heap",
+        "lim_heap",
+        "cfg_temporary",
+    ];
+    let module = naga::front::wgsl::parse_str(source).map_err(|e| e.emit_to_string(source))?;
+    let named = |name: &str| {
+        module
+            .global_variables
+            .iter()
+            .find(|(_, var)| var.name.as_deref() == Some(name))
+            .map(|(handle, _)| handle)
+            .ok_or_else(|| format!("call {call} declares no `{name}`"))
+    };
+    let (status, heap) = (named("status")?, named("heap")?);
+    let (b_status, b_heap) = (named("b_status")?, named("b_heap")?);
+    let read_only = READ_ONLY
+        .iter()
+        .map(|name| named(name))
+        .collect::<Result<Vec<_>, _>>()?;
+    let set_at_entry = SET_AT_ENTRY
+        .iter()
+        .map(|name| named(name))
+        .collect::<Result<Vec<_>, _>>()?;
+    let functions = module
+        .functions
+        .iter()
+        .map(|(_, function)| (function, false))
+        .chain(
+            module
+                .entry_points
+                .iter()
+                .map(|entry| (&entry.function, true)),
+        );
+    for (function, entry) in functions {
+        let name = function.name.as_deref().unwrap_or("?");
+        let exprs = &function.expressions;
+        let mut stores = Vec::new();
+        stores_in(&function.body, &mut stores);
+        for (pointer, value) in stores {
+            let Root::Global(global) = root_of(exprs, pointer) else {
+                check!(
+                    !matches!(root_of(exprs, pointer), Root::Argument),
+                    "call {call}: `{name}` stores through a pointer argument, which this \
+                     test cannot follow"
+                );
+                continue;
+            };
+            let global_name = module.global_variables[global]
+                .name
+                .as_deref()
+                .unwrap_or("?");
+            check!(
+                !read_only.contains(&global),
+                "call {call}: `{name}` stores to `{global_name}`"
+            );
+            if global == status {
+                check!(
+                    name == "pie_fault",
+                    "call {call}: `{name}` stores to the status"
+                );
+                let index = index_of(exprs, pointer).ok_or("a status store indexes no word")?;
+                check!(
+                    based(exprs, index, b_status, |e| matches!(
+                        e,
+                        naga::Expression::Literal(_)
+                    )),
+                    "call {call}: a status store not at `b_status` and a constant"
+                );
+            } else if global == heap {
+                check!(name == "hst", "call {call}: `{name}` stores to the heap");
+                let index = index_of(exprs, pointer).ok_or("a heap store indexes no word")?;
+                check!(
+                    based(exprs, index, b_heap, |_| true),
+                    "call {call}: a heap store not at `b_heap` and its word"
+                );
+            } else if set_at_entry.contains(&global) {
+                check!(entry, "call {call}: `{name}` sets `{global_name}`");
+                let read = value
+                    .and_then(|value| match exprs[value] {
+                        naga::Expression::Load { pointer } => Some(root_of(exprs, pointer)),
+                        _ => None,
+                    })
+                    .and_then(|root| match root {
+                        Root::Global(read) => Some(read),
+                        _ => None,
+                    });
+                check!(
+                    read.is_some_and(|read| read_only.contains(&read)),
+                    "call {call}: `{global_name}` set from other than the record or the \
+                     config table"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The index a store's pointer takes into its global, where it is one.
+fn index_of(
+    exprs: &naga::Arena<naga::Expression>,
+    pointer: naga::Handle<naga::Expression>,
+) -> Option<naga::Handle<naga::Expression>> {
+    match exprs[pointer] {
+        naga::Expression::Access { index, .. } => Some(index),
+        _ => None,
+    }
+}
+
+/// Whether `index` is the base `base` read, alone or plus a term `rest`
+/// takes.
+fn based(
+    exprs: &naga::Arena<naga::Expression>,
+    index: naga::Handle<naga::Expression>,
+    base: naga::Handle<naga::GlobalVariable>,
+    rest: impl Fn(&naga::Expression) -> bool,
+) -> bool {
+    let reads_base = |at: naga::Handle<naga::Expression>| {
+        matches!(exprs[at], naga::Expression::Load { pointer }
+            if matches!(exprs[pointer], naga::Expression::GlobalVariable(global) if global == base))
+    };
+    match exprs[index] {
+        naga::Expression::Binary {
+            op: naga::BinaryOperator::Add,
+            left,
+            right,
+        } => reads_base(left) && rest(&exprs[right]),
+        _ => reads_base(index),
+    }
+}
+
+type Stored = (
+    naga::Handle<naga::Expression>,
+    Option<naga::Handle<naga::Expression>>,
+);
+
+fn stores_in(block: &naga::Block, out: &mut Vec<Stored>) {
     for statement in block.iter() {
         match statement {
-            naga::Statement::Store { pointer, .. } | naga::Statement::Atomic { pointer, .. } => {
-                out.push(*pointer);
-            }
+            naga::Statement::Store { pointer, value } => out.push((*pointer, Some(*value))),
+            naga::Statement::Atomic { pointer, .. } => out.push((*pointer, None)),
             naga::Statement::Block(inner) => stores_in(inner, out),
             naga::Statement::If { accept, reject, .. } => {
                 stores_in(accept, out);
@@ -185,11 +326,8 @@ fn a_sort_ladder_compiles() {
 fn the_shader_declares_the_bindings_a_shell_binds() {
     for declaration in [
         "@group(0) @binding(0) var<storage, read_write> status",
-        "@group(0) @binding(1) var<storage, read>       descs",
-        "@group(0) @binding(2) var<storage, read>       params",
-        "@group(0) @binding(3) var<storage, read>       offs",
+        "@group(0) @binding(1) var<storage, read>       tables",
         "@group(0) @binding(4) var<storage, read_write> heap",
-        "@group(0) @binding(5) var<uniform>             cfg",
     ] {
         assert!(
             RUNTIME.contains(declaration),

@@ -28,6 +28,11 @@
 //!   beside it); its launches rotate through `engine::rates::attn_sets_at`
 //!   sets of q rows and kv pages.
 //! - `hbm_gbps`: a [`COPY_BYTES`] device-to-device copy, read plus write.
+//! - `cached_gbps` (ROCm): the reads the last-level caches serve, as a
+//!   normed skinny product's blocks read its rows: [`CACHED_BLOCKS`] blocks
+//!   each reading one [`CACHED_SET_BYTES`] set once, block b the set b %
+//!   [`CACHED_SETS`] (the sets together past a compute unit's first-level
+//!   cache, within the last-level ones), their bytes over their time.
 //! - `elementwise_gbps`: the rmsnorm and the swiglu as a fire runs them at
 //!   `engine::rates::ELEMENTWISE_SHAPE`, rotating through
 //!   `engine::rates::elementwise_sets` sets.
@@ -63,11 +68,27 @@ use profile::fire::Rates;
 /// The `[rates]` keys this backend's estimate weighs a fire by (of
 /// `profile::fire::KEYS`, all but the slang backends' `tile_tflops_by_rows` and `vector_tflops_by_rows`):
 /// what a load whose profile lacks one measures.
+#[cfg(not(feature = "rocm"))]
 pub const KEYS: [&str; 8] = [
     "launch_ns",
     "gemm_tflops_by_rows",
     "attn_tflops_by_keys",
     "hbm_gbps",
+    "elementwise_gbps",
+    "scan_gelems",
+    "few_row_tflops",
+    "workgroups_per_core",
+];
+
+/// On ROCm also `cached_gbps`, the cached-read rate a normed skinny
+/// product's redundant reads are priced at (`kernels_rocm::tuning`).
+#[cfg(feature = "rocm")]
+pub const KEYS: [&str; 9] = [
+    "launch_ns",
+    "gemm_tflops_by_rows",
+    "attn_tflops_by_keys",
+    "hbm_gbps",
+    "cached_gbps",
     "elementwise_gbps",
     "scan_gelems",
     "few_row_tflops",
@@ -144,6 +165,47 @@ fn ensure_by(
     })
 }
 
+/// What a load measured of its decode products (`Shell::routes_by_body`):
+/// each shape under each kernel, the median ns of the decode step whose
+/// body serves it so, and the interquartile spread of the rounds.
+#[cfg(feature = "rocm")]
+pub type ProductTimes =
+    Vec<(kernels_cuda::linear::routes::Shape, kernels_cuda::linear::routes::Kernel, f64, f64)>;
+
+/// `measured` saved in device `device`'s user profile under `profiles`
+/// (`[rates] product_ns`, joining what it holds), with its provenance; the
+/// path, or `None` where the load names no profile directory.
+#[cfg(feature = "rocm")]
+pub fn save_product_times(
+    profiles: Option<&std::path::Path>,
+    device: &str,
+    measured: &ProductTimes,
+) -> Result<Option<String>, String> {
+    let Some(profiles) = profiles else {
+        return Ok(None);
+    };
+    let path = crate::chip::SHELF.user_path(profiles, device);
+    let registry = crate::chip::registry();
+    let existing = std::fs::read_to_string(&path).ok().map(|text| registry.prune(&text).0);
+    let rates = Rates {
+        product_ns: Some(kernels_cuda::linear::routes::product_times(measured)),
+        ..Rates::default()
+    };
+    let how = (
+        "product_ns",
+        format!("\"measured in place at load, {}\"", engine::rates::build_commit()),
+    );
+    let text = engine::rates::saved_text(existing.as_deref(), &rates, &how);
+    registry
+        .parse(&text, "the measured product times", profile::Strict::User)
+        .map_err(|why| format!("{}: the product times would not read back: {why}", path.display()))?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    std::fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(Some(path.display().to_string()))
+}
+
 /// The rows `few_row_tflops` is timed at: the most the backend's few-rows
 /// kernel takes (`linear::gemm::FEW_ROWS`).
 pub const FEW_ROWS: u32 = kernels_cuda::linear::gemm::FEW_ROWS;
@@ -153,6 +215,13 @@ pub const PAGE: u32 = 16;
 
 /// The copy's bytes: past every last-level cache, so it moves device memory.
 pub const COPY_BYTES: usize = 256 << 20;
+
+/// The cached-read probe's set: a few rows of a model's width, bf16.
+pub const CACHED_SET_BYTES: usize = 16 << 10;
+/// Its sets: together past a compute unit's first-level cache.
+pub const CACHED_SETS: usize = 64;
+/// Its blocks: enough that their reads, not the launch, set the time.
+pub const CACHED_BLOCKS: u32 = 16384;
 
 /// Timed bursts of each kind; the median is kept.
 pub const ROUNDS: usize = 5;
@@ -473,6 +542,10 @@ mod on_device {
         let elementwise = elementwise(device.ctx(), &clock, &random, &mut held, gap)?;
         let scan = scan(device.ctx(), &clock, &random, &mut held, SCAN_SHAPE, gap)?;
         let bytes = copy(stream, &clock, gap)?;
+        #[cfg(feature = "rocm")]
+        let cached = Some(cached(device.ctx(), &clock, gap)?);
+        #[cfg(not(feature = "rocm"))]
+        let cached: Option<f64> = None;
         let (few_row, resident) = few_rows(device.ctx(), &clock, &random, &mut held, gap)?;
         eprintln!(
             "[rates]: the few-rows kernel at {FEW_ROWS} x {w} x {w}: {:.1} TFLOP/s, {resident} \
@@ -504,12 +577,14 @@ mod on_device {
                 ),
                 attn_tflops_by_keys: Some(tflops(attn)),
                 hbm_gbps: Some(tenth(bytes)),
+                cached_gbps: cached.map(tenth),
                 elementwise_gbps: Some(tenth(elementwise)),
                 scan_gelems: Some(tenth(scan)),
                 few_row_tflops: Some(tenth(few_row / 1e3)),
                 workgroups_per_core: Some(f64::from(resident)),
                 tile_tflops_by_rows: None,
                 vector_tflops_by_rows: None,
+                product_ns: None,
             },
             attn_by_dim,
         })
@@ -962,6 +1037,31 @@ mod on_device {
         Ok((rate, resident))
     }
 
+    #[cfg(feature = "rocm")]
+    fn cached(ctx: &Ctx, clock: &Clock, gap: f64) -> Result<f64, String> {
+        let sets = zeroed(CACHED_SET_BYTES * CACHED_SETS)?;
+        let sink = zeroed(CACHED_BLOCKS as usize * 4)?;
+        let packs = (CACHED_SET_BYTES / 16) as u32;
+        let ns = clock.burst(ROUNDS, &Touched::default(), 1, &mut |_| {
+            kernels_cuda::linear::cached_read_probe(
+                ctx,
+                sets.ptr(),
+                packs,
+                CACHED_SETS as u32,
+                CACHED_BLOCKS,
+                sink.ptr(),
+            )
+            .map_err(say("the cached-read probe"))
+        })?;
+        engine::rates::rate_from(
+            "cached reads",
+            ns,
+            engine::rates::COPY_DISPATCHES,
+            gap,
+            CACHED_BLOCKS as f64 * CACHED_SET_BYTES as f64,
+        )
+    }
+
     fn copy(stream: *mut c_void, clock: &Clock, gap: f64) -> Result<f64, String> {
         let from = zeroed(COPY_BYTES)?;
         let into = zeroed(COPY_BYTES)?;
@@ -1071,12 +1171,15 @@ mod ensure_tests {
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 100.0), (8192, 200.0)])]),
             attn_tflops_by_keys: Some(vec![(512, 50.0), (8192, 300.0)]),
             hbm_gbps: Some(600.0),
+            // ROCm's rates step measures it; CUDA's estimate weighs none.
+            cached_gbps: cfg!(feature = "rocm").then_some(28800.0),
             elementwise_gbps: Some(500.0),
             scan_gelems: Some(2000.0),
             few_row_tflops: Some(20.0),
             workgroups_per_core: Some(4.0),
             tile_tflops_by_rows: None,
             vector_tflops_by_rows: None,
+            product_ns: None,
         }
     }
 

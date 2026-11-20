@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::device::Context;
-use crate::device::alloc::{Buffer, Memory};
+use crate::device::alloc::Buffer;
 use crate::device::ctx::Frame;
 use engine_gpu::guest::widen::{Cfg, TABLE_SOURCE, WG, config_bytes, word};
 
@@ -54,11 +54,27 @@ fn key(buffer: &Buffer) -> usize {
 }
 
 impl Widen {
+    /// The bytes of the table a widen over `seats` seats takes, with
+    /// `regions` regions of `entries` rows each and the one beside them.
+    pub fn table_bytes(device: &Context, seats: usize, regions: u32, entries: u64) -> u64 {
+        Self::region_bytes(device, seats, entries) * (u64::from(regions) + 1)
+    }
+
+    /// A table region's bytes: a stage's rows lie in at most one group per
+    /// seat (one destination segment, its heap's), each group's rows from an
+    /// aligned start.
+    fn region_bytes(device: &Context, seats: usize, entries: u64) -> u64 {
+        let align = u64::from(device.core().limits.min_storage_buffer_offset_alignment).max(16);
+        (entries * size_of::<Cfg>() as u64).next_multiple_of(align) + seats as u64 * align
+    }
+
     /// The widen over `seats` (each arm's readout and pixel seats) into
     /// `segments` (the pool's), with `regions` table regions of `entries`
-    /// rows each.
+    /// rows each in `table` (the load's shelf reserved it: at least
+    /// [`Widen::table_bytes`], refused by name where it is less).
     pub fn new(
         device: &Context,
+        table: Buffer,
         seats: &[&Buffer],
         segments: &[&Buffer],
         regions: u32,
@@ -66,16 +82,15 @@ impl Widen {
     ) -> Result<Widen> {
         let core = device.core().clone();
         let align = u64::from(core.limits.min_storage_buffer_offset_alignment).max(16);
-        let cfg = size_of::<Cfg>() as u64;
-        // A stage's rows lie in at most one group per seat (one destination
-        // segment, its heap's), each group's rows from an aligned start.
-        let region = (entries * cfg).next_multiple_of(align) + seats.len() as u64 * align;
-        let table = Buffer::with(
-            device,
-            region * (u64::from(regions) + 1),
-            Memory::Device,
-            engine_gpu::books::owners::GUEST,
-        )?;
+        let region = Self::region_bytes(device, seats.len(), entries);
+        let need = Self::table_bytes(device, seats.len(), regions, entries);
+        if table.bytes() < need {
+            return Err(Fault::Ceiling {
+                what: "bytes of the readout widen's table",
+                need,
+                have: table.bytes(),
+            });
+        }
 
         let storage = |at: u32, read_only: bool, dynamic: bool| wgpu::BindGroupLayoutEntry {
             binding: at,
@@ -278,6 +293,7 @@ fn whole(buffer: &Buffer) -> wgpu::BindingResource<'_> {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::{Row, Widen};
+    use crate::device::alloc::Memory;
     use crate::device::{Buffer, Context, present};
 
     fn device() -> Option<Context> {
@@ -310,7 +326,14 @@ mod tests {
         a.write(0, &bf16(&first)).unwrap();
         a.write(64, &bf16(&second)).unwrap();
         b.write(0, &bf16(&third)).unwrap();
-        let widen = Widen::new(&device, &[&a, &b], &[&dst], 1, 3).unwrap();
+        let table = Buffer::with(
+            &device,
+            Widen::table_bytes(&device, 2, 1, 3),
+            Memory::Device,
+            owner,
+        )
+        .unwrap();
+        let widen = Widen::new(&device, table, &[&a, &b], &[&dst], 1, 3).unwrap();
         let frame = device.frame().unwrap();
         let rows = [
             Row {
@@ -357,7 +380,14 @@ mod tests {
         let owner = engine_gpu::books::owners::TEST;
         let src = Buffer::zeroed(&device, 64, owner).unwrap();
         let dst = Buffer::zeroed(&device, 64, owner).unwrap();
-        let widen = Widen::new(&device, &[&src], &[&dst], 1, 1).unwrap();
+        let table = Buffer::with(
+            &device,
+            Widen::table_bytes(&device, 1, 1, 1),
+            Memory::Device,
+            owner,
+        )
+        .unwrap();
+        let widen = Widen::new(&device, table, &[&src], &[&dst], 1, 1).unwrap();
         let frame = device.frame().unwrap();
         let row = |dst_at| Row {
             src: &src,

@@ -161,30 +161,64 @@ fn reflect(wgsl: &str) -> std::result::Result<Declared, String> {
 
 pub(crate) type View = (wgpu::Buffer, u64, u64);
 
-type BindKey = (usize, Vec<View>, Vec<u8>);
+/// A group by its layout, not its pipeline: kernels of one layout (the
+/// variants of a kernel, by the rows they take) share what a dispatch binds
+/// over the same views.
+type BindKey = (wgpu::BindGroupLayout, Vec<View>);
+
+/// A bind group layout by what it holds: each storage binding a kernel
+/// reaches and whether it is read-only, and its uniform's binding.
+type LayoutKey = (Vec<(u32, bool)>, Option<u32>);
 
 #[derive(Default)]
 struct BindCache {
     groups: HashMap<BindKey, wgpu::BindGroup>,
-
-    chunks: Vec<super::ctx::Held>,
-    used: u64,
 }
 
-const BIND_CACHE_CAP: usize = 16 * 1024;
-const UNIFORM_ARENA_CHUNK: u64 = 1 << 20;
-
-/// A chunk of the uniform arena bind groups take their uniforms from.
-fn arena_chunk(core: &Arc<Core>) -> super::ctx::Held {
-    core.held(
-        &wgpu::BufferDescriptor {
-            label: Some("pie uniform arena"),
-            size: UNIFORM_ARENA_CHUNK,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        },
-        engine_gpu::books::owners::UNIFORMS,
-    )
+/// A bind group of `pipeline` over `views` (those it declares), its uniform
+/// `uniform_bytes` of the frames' uniform buffer from its first byte, read
+/// at a dispatch's dynamic offset.
+pub(crate) fn group_of(
+    core: &Arc<Core>,
+    pipeline: &Pipeline,
+    views: &[View],
+    uniform_bytes: u64,
+) -> Result<wgpu::BindGroup> {
+    let mut entries: Vec<wgpu::BindGroupEntry<'_>> = Vec::with_capacity(views.len() + 1);
+    for (at, (buffer, offset, size)) in views.iter().enumerate() {
+        if at >= pipeline.used.len() || !pipeline.used[at] {
+            continue;
+        }
+        entries.push(wgpu::BindGroupEntry {
+            binding: at as u32,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer,
+                offset: *offset,
+                size: std::num::NonZeroU64::new(*size),
+            }),
+        });
+    }
+    if let Some(binding) = pipeline.uniform {
+        let buffer = core.uniform_buffer.get().ok_or_else(|| Fault::Device {
+            call: "create_bind_group",
+            why: "the frames' uniform buffer is made at load, and this bind is before it".into(),
+        })?;
+        entries.push(wgpu::BindGroupEntry {
+            binding,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer,
+                offset: 0,
+                size: std::num::NonZeroU64::new(uniform_bytes),
+            }),
+        });
+    }
+    let group = core.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(pipeline.name),
+        layout: &pipeline.layout,
+        entries: &entries,
+    });
+    core.take_error("create_bind_group")?;
+    Ok(group)
 }
 
 #[derive(Default)]
@@ -193,8 +227,13 @@ pub struct Pipelines {
     /// The kernels built, in the order their pipelines were.
     order: RefCell<Vec<&'static str>>,
     binds: RefCell<BindCache>,
+    /// One layout for every kernel that declares the same bindings.
+    layouts: RefCell<HashMap<LayoutKey, wgpu::BindGroupLayout>>,
     bind_hits: Cell<u64>,
     bind_misses: Cell<u64>,
+    /// Groups a fire made of its own frame's scratch views, which no cache
+    /// keeps.
+    scratch_groups: Cell<u64>,
 }
 
 static BIND_TRAFFIC: [std::sync::atomic::AtomicU64; 2] = [
@@ -250,15 +289,16 @@ impl Pipelines {
         engine_gpu::storage_buffers(key, own, pool, device.storage_buffers())
     }
 
-    /// Makes the uniform arena's first chunk where it has none, at the
-    /// load: a fire's bind groups take their uniforms from it, so it is
-    /// reserved before the pool is sized past it, not at the first fire.
-    pub(crate) fn stock_arena(&self, core: &Arc<Core>) {
-        let mut binds = self.binds.borrow_mut();
-        if binds.chunks.is_empty() {
-            binds.chunks.push(arena_chunk(core));
-            binds.used = 0;
-        }
+    /// The bind groups made so far: each cache miss, and each group of a
+    /// fire's scratch views ([`engine_gpu::serve::Serve::bound`]).
+    #[must_use]
+    pub fn bound(&self) -> u64 {
+        self.bind_misses.get() + self.scratch_groups.get()
+    }
+
+    /// Counts a group a fire made of its own frame's scratch views.
+    pub(crate) fn note_scratch_group(&self) {
+        self.scratch_groups.set(self.scratch_groups.get() + 1);
     }
 
     #[must_use]
@@ -266,81 +306,27 @@ impl Pipelines {
         (self.bind_hits.get(), self.bind_misses.get())
     }
 
+    /// The bind group of `pipeline` over `views`, its uniform the frames'
+    /// uniform buffer, which a dispatch reads at a dynamic offset (the
+    /// frame's slot): one group for every set of views, whatever the scalars.
     pub(crate) fn bind_group(
         &self,
         core: &Arc<Core>,
         pipeline: &Pipeline,
         views: &[View],
-        scalars: &[u8],
         uniform_bytes: u64,
-    ) -> wgpu::BindGroup {
-        let key: BindKey = (
-            std::ptr::from_ref(pipeline) as usize,
-            views.to_vec(),
-            scalars.to_vec(),
-        );
+    ) -> Result<wgpu::BindGroup> {
+        let key: BindKey = (pipeline.layout.clone(), views.to_vec());
         if let Some(group) = self.binds.borrow().groups.get(&key) {
             self.bind_hits.set(self.bind_hits.get() + 1);
             BIND_TRAFFIC[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return group.clone();
+            return Ok(group.clone());
         }
         self.bind_misses.set(self.bind_misses.get() + 1);
         BIND_TRAFFIC[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut binds = self.binds.borrow_mut();
-        if binds.groups.len() >= BIND_CACHE_CAP {
-            binds.groups.clear();
-            // The groups that read the earlier chunks are gone: keep the one
-            // the next uniform is written to.
-            let from = binds.chunks.len().saturating_sub(1);
-            binds.chunks.drain(..from);
-            binds.used = 0;
-        }
-        let uniform = pipeline.uniform.map(|binding| {
-            let align = u64::from(core.limits.min_uniform_buffer_offset_alignment).max(16);
-            let at = binds.used.next_multiple_of(align);
-            if binds.chunks.is_empty() || at + uniform_bytes > UNIFORM_ARENA_CHUNK {
-                binds.chunks.push(arena_chunk(core));
-                binds.used = 0;
-            }
-            let at = binds.used.next_multiple_of(align);
-            binds.used = at + uniform_bytes;
-            let chunk = (*binds.chunks.last().expect("non-empty")).clone();
-            let mut padded = scalars.to_vec();
-            padded.resize(uniform_bytes as usize, 0);
-            core.queue.write_buffer(&chunk, at, &padded);
-            (binding, chunk, at)
-        });
-        let mut entries: Vec<wgpu::BindGroupEntry<'_>> = Vec::with_capacity(views.len() + 1);
-        for (at, (buffer, offset, size)) in views.iter().enumerate() {
-            if at >= pipeline.used.len() || !pipeline.used[at] {
-                continue;
-            }
-            entries.push(wgpu::BindGroupEntry {
-                binding: at as u32,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer,
-                    offset: *offset,
-                    size: std::num::NonZeroU64::new(*size),
-                }),
-            });
-        }
-        if let Some((binding, chunk, at)) = &uniform {
-            entries.push(wgpu::BindGroupEntry {
-                binding: *binding,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: chunk,
-                    offset: *at,
-                    size: std::num::NonZeroU64::new(uniform_bytes),
-                }),
-            });
-        }
-        let group = core.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some(pipeline.name),
-            layout: &pipeline.layout,
-            entries: &entries,
-        });
-        binds.groups.insert(key, group.clone());
-        group
+        let group = group_of(core, pipeline, views, uniform_bytes)?;
+        self.binds.borrow_mut().groups.insert(key, group.clone());
+        Ok(group)
     }
 
     /// The pipeline of kernels-slang's module `key` (an instantiation at a
@@ -355,7 +341,7 @@ impl Pipelines {
             return Ok(Arc::clone(pipeline));
         }
         let wgsl = module(file, key)?;
-        let pipeline = Arc::new(build(device.core(), file, key, &wgsl)?);
+        let pipeline = Arc::new(build(device.core(), &self.layouts, file, key, &wgsl)?);
         self.order.borrow_mut().push(key);
         self.built.borrow_mut().insert(key, Arc::clone(&pipeline));
         Ok(pipeline)
@@ -390,10 +376,11 @@ pub fn storage(file: &'static str, key: &'static str) -> Result<(u32, u32)> {
 fn descriptor<'a>(
     name: &'static str,
     module: &'a wgpu::ShaderModule,
+    layout: &'a wgpu::PipelineLayout,
 ) -> wgpu::ComputePipelineDescriptor<'a> {
     wgpu::ComputePipelineDescriptor {
         label: Some(name),
-        layout: None,
+        layout: Some(layout),
         module,
         entry_point: Some("main"),
         compilation_options: wgpu::PipelineCompilationOptions::default(),
@@ -405,6 +392,7 @@ fn compile(
     core: &Arc<Core>,
     name: &'static str,
     wgsl: &str,
+    layout: &wgpu::PipelineLayout,
 ) -> std::result::Result<wgpu::ComputePipeline, String> {
     crate::guest::validated(core, "create_compute_pipeline", || {
         let module = core
@@ -414,12 +402,81 @@ fn compile(
                 source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(wgsl)),
             });
         core.device
-            .create_compute_pipeline(&descriptor(name, &module))
+            .create_compute_pipeline(&descriptor(name, &module, layout))
     })
+}
+
+/// The bind group layout of a kernel as `declared`: each storage buffer
+/// `main` reaches, read-only as it is declared, and its uniform block at a
+/// dynamic offset (a dispatch's slot of the frames' uniform buffer). One for
+/// every kernel declaring the same, so a group binds any of them.
+fn bind_layout(
+    core: &Arc<Core>,
+    layouts: &RefCell<HashMap<LayoutKey, wgpu::BindGroupLayout>>,
+    name: &'static str,
+    declared: &Declared,
+) -> wgpu::BindGroupLayout {
+    let key: LayoutKey = (
+        (0..declared.bindings)
+            .filter(|&at| declared.used.get(at as usize).copied().unwrap_or(false))
+            .map(|at| {
+                (
+                    at,
+                    declared.read_only.get(at as usize).copied().unwrap_or(false),
+                )
+            })
+            .collect(),
+        declared.uniform,
+    );
+    layouts
+        .borrow_mut()
+        .entry(key)
+        .or_insert_with(|| made_layout(core, name, declared))
+        .clone()
+}
+
+fn made_layout(core: &Arc<Core>, name: &'static str, declared: &Declared) -> wgpu::BindGroupLayout {
+    let mut entries: Vec<wgpu::BindGroupLayoutEntry> = (0..declared.bindings)
+        .filter(|&at| declared.used.get(at as usize).copied().unwrap_or(false))
+        .map(|at| wgpu::BindGroupLayoutEntry {
+            binding: at,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage {
+                    read_only: declared
+                        .read_only
+                        .get(at as usize)
+                        .copied()
+                        .unwrap_or(false),
+                },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        })
+        .collect();
+    if let Some(binding) = declared.uniform {
+        entries.push(wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: true,
+                min_binding_size: None,
+            },
+            count: None,
+        });
+    }
+    core.device
+        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some(name),
+            entries: &entries,
+        })
 }
 
 fn build(
     core: &Arc<Core>,
+    layouts: &RefCell<HashMap<LayoutKey, wgpu::BindGroupLayout>>,
     file: &'static str,
     name: &'static str,
     wgsl: &str,
@@ -439,8 +496,15 @@ fn build(
         declared.pool,
         core.limits.max_storage_buffers_per_shader_stage,
     )?;
-    let pipeline = compile(core, name, wgsl).map_err(shader)?;
-    let layout = pipeline.get_bind_group_layout(0);
+    let layout = bind_layout(core, layouts, name, &declared);
+    let pipelined = core
+        .device
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(name),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+    let pipeline = compile(core, name, wgsl, &pipelined).map_err(shader)?;
     Ok(Pipeline {
         name,
         pipeline,

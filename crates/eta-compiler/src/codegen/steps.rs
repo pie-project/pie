@@ -21,13 +21,15 @@ pub const REDUCE_LEVELS: u32 = 7;
 /// in the buffer the finish reads).
 pub const SORT_ROUNDS: u32 = 28;
 
-/// The bytes of a step's uniform ([`StepUniform`]), a uniform's sixteen.
-pub const STEP_BYTES: u32 = 16;
+/// The bytes of a step's record ([`StepUniform`]), in whole sixteens.
+pub const STEP_BYTES: u32 = 48;
 
-/// Where a step's uniform holds its node, rung and selector.
+/// Where a step's record holds its node, rung and selector, and the bases
+/// of its instance's tables, status and heap.
 pub const NODE_AT: u32 = 0;
 pub const RUNG_AT: u32 = 4;
 pub const SELECTOR_AT: u32 = 8;
+pub const BASES_AT: u32 = 16;
 
 /// What a step's call reads: the node it runs (its op's params), the rung
 /// of the node's ladder (a reduce's level, a sort's round, a select's
@@ -41,18 +43,40 @@ pub struct StepUniform {
     pub selector: u32,
 }
 
+/// Where a stage's instance lies, in words of the segments a backend binds:
+/// its status word and its descriptor, op param, offset and config tables
+/// in the segment holding its slots, and its heap in the segment holding
+/// its state. The host writes them, and a bind checks each.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Bases {
+    pub status: u32,
+    pub descs: u32,
+    pub params: u32,
+    pub offs: u32,
+    pub cfg: u32,
+    pub heap: u32,
+}
+
 impl StepUniform {
-    /// The uniform's bytes: node, rung, selector, little-endian u32s at
-    /// [`NODE_AT`], [`RUNG_AT`] and [`SELECTOR_AT`], padded to
-    /// [`STEP_BYTES`].
+    /// The record's bytes, little-endian u32s: node, rung and selector at
+    /// [`NODE_AT`], [`RUNG_AT`] and [`SELECTOR_AT`], then `bases` from
+    /// [`BASES_AT`] (status, descriptors, params, offsets, config, heap),
+    /// padded to [`STEP_BYTES`].
     #[must_use]
-    pub fn bytes(self) -> [u8; STEP_BYTES as usize] {
+    pub fn bytes(self, bases: Bases) -> [u8; STEP_BYTES as usize] {
         let mut out = [0u8; STEP_BYTES as usize];
-        for (at, word) in [
+        let words = [
             (NODE_AT, self.node),
             (RUNG_AT, self.rung),
             (SELECTOR_AT, self.selector),
-        ] {
+            (BASES_AT, bases.status),
+            (BASES_AT + 4, bases.descs),
+            (BASES_AT + 8, bases.params),
+            (BASES_AT + 12, bases.offs),
+            (BASES_AT + 16, bases.cfg),
+            (BASES_AT + 20, bases.heap),
+        ];
+        for (at, word) in words {
             let at = at as usize;
             out[at..at + 4].copy_from_slice(&word.to_le_bytes());
         }
@@ -479,19 +503,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_uniform_lays_its_words_where_it_says() {
+    fn a_record_lays_its_words_where_it_says() {
+        let bases = Bases {
+            status: 11,
+            descs: 13,
+            params: 17,
+            offs: 19,
+            cfg: 23,
+            heap: 29,
+        };
         let bytes = StepUniform {
             node: 7,
             rung: 3,
             selector: 2,
         }
-        .bytes();
+        .bytes(bases);
         let word = |at: u32| {
             let at = at as usize;
             u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
         };
         assert_eq!((word(NODE_AT), word(RUNG_AT), word(SELECTOR_AT)), (7, 3, 2));
         assert_eq!(word(12), 0, "the pad is zero");
+        let laid: Vec<u32> = (0..6).map(|k| word(BASES_AT + 4 * k)).collect();
+        assert_eq!(laid, [11, 13, 17, 19, 23, 29]);
+        assert_eq!((word(40), word(44)), (0, 0), "the pad is zero");
+        assert_eq!(STEP_BYTES % 16, 0, "a record is whole sixteens");
     }
 
     #[test]

@@ -412,8 +412,30 @@ impl<B: Backend> Span<B> {
                 (Some(Grain::Pages), Some((_, pages))) => pages,
                 (Some(_), None) => None,
                 (None, _) => match rect(&at.map, value, rows) {
+                    // Bound at its room, what the rung's map lays for it, not
+                    // at the rows this fire brings: a view then depends on
+                    // where the value lies, so what a dispatch binds over it
+                    // is one for every fire of the rung. The tensor's rows
+                    // are the fire's own.
+                    Some(rect) if rect.bytes > rect.room => {
+                        return Err(Fault::Ceiling {
+                            what: "bytes of a value's room at its rung a fire's rows take",
+                            need: rect.bytes,
+                            have: rect.room,
+                        });
+                    }
+                    // The carve lies in the chunks the rung holds, and the
+                    // span below it is lent to state (a guest's among it):
+                    // a room past the carve would reach that state.
+                    Some(rect) if rect.offset + rect.room > at.map.bytes => {
+                        return Err(Fault::Ceiling {
+                            what: "bytes of a rung's carve a value's room reaches",
+                            need: rect.offset + rect.room,
+                            have: at.map.bytes,
+                        });
+                    }
                     Some(rect) => Some(Tensor::new(
-                        handles.bind(buffer, base + rect.offset, rect.bytes)?,
+                        handles.bind(buffer, base + rect.offset, rect.room)?,
                         rect.rows,
                         rect.width,
                         rect.dtype,

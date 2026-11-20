@@ -11,33 +11,40 @@ const DT_I32 : u32 = 1u;
 const DT_U32 : u32 = 2u;
 const DT_BOOL : u32 = 3u;
 
-struct Cfg {
-
-  value_count : u32,
-
-  temporary : u32,
-
-  op_count : u32,
-
-  lane : u32,
-
-  // The words of the stage's heap: no access reaches past it.
-  heap_words : u32,
-
-  pad0 : u32,
-  pad1 : u32,
-  pad2 : u32,
-}
+// A stage's config table, by word: its values, its temporary words' first
+// heap word, its ops, its lane, and its heap's words (no access reaches past
+// them).
+const CFG_TEMPORARY : u32 = 1u;
+const CFG_HEAP_WORDS : u32 = 4u;
 
 // The fault classes this runtime writes (eta-compiler codegen::fault).
 const OUT_OF_BOUNDS : u32 = 0xB5u;
 
+// What a stage reads and writes, in two pool segments a backend binds whole:
+// the segment holding the instance's slots (its status word, read as
+// atomics, and its tables: descriptors, offsets, op params and config, each
+// at a base the step's record states) and the segment holding its heap. So
+// one bind group serves every instance whose slots and heap lie in the same
+// two segments, each step dispatched at its record's offset.
+//
+// Isolation, by three facts a bind and this runtime hold together:
+//   1. The only words a step writes are heap[heap_base + w], w checked on
+//      the device against the stage's heap words (hst), and
+//      status[status_base + k] with k a constant (pie_fault). The naga test
+//      of the step modules holds that no other store exists, and none to
+//      the step's record.
+//   2. Every table index starts from words the host wrote and no guest
+//      store reaches (a value id from an op's params, an op from the step's
+//      record, a constant word), checked at registration against the
+//      stage's own counts (engine_gpu's plan_tables_valid), so a table read
+//      stays in the instance's own table.
+//   3. The bases come from the step's record, which the host writes: a bind
+//      refuses a base whose table, status or heap runs outside the
+//      instance's own slots or state, or its segment, and a heap that
+//      overlaps a table where both lie in one segment.
 @group(0) @binding(0) var<storage, read_write> status  : array<atomic<u32>>;
-@group(0) @binding(1) var<storage, read>       descs   : array<u32>;
-@group(0) @binding(2) var<storage, read>       params  : array<u32>;
-@group(0) @binding(3) var<storage, read>       offs    : array<u32>;
+@group(0) @binding(1) var<storage, read>       tables  : array<u32>;
 @group(0) @binding(4) var<storage, read_write> heap    : array<u32>;
-@group(0) @binding(5) var<uniform>             cfg     : Cfg;
 
 var<private> tid : u32;
 
@@ -51,11 +58,19 @@ var<private> sel_groups : u32;
 
 // The stage's heap bound, read once at the step's entry: every heap access
 // is checked against it (the tables need no device check; see d_word). A heap
-// index is relative to the stage's own heap binding, which spans exactly its
-// heap: [0, lim_heap). Where that binding spans more (a pool segment at a
-// dynamic offset), the check must become [the instance's base, base +
-// limit), never the binding's size.
+// index is relative to the stage's heap, [0, lim_heap), at its base in the
+// segment the heap binding spans: never checked against the binding's size.
 var<private> lim_heap : u32;
+
+// Where the step's tables, status and heap start, in words of their
+// segments, and its temporary words' first heap word: read once at the
+// step's entry from its record and its config table.
+var<private> b_status : u32;
+var<private> b_descs : u32;
+var<private> b_params : u32;
+var<private> b_offs : u32;
+var<private> b_heap : u32;
+var<private> cfg_temporary : u32;
 
 // A fault in the runtimes' status layout (eta_exec::Status): the state
 // Fault (3), its code, and the index and limit an access was refused at.
@@ -63,10 +78,10 @@ var<private> lim_heap : u32;
 // swaps the state from unset writes the code, index and limit, so the three
 // are one fault's.
 fn pie_fault(code : u32, at : u32, limit : u32) {
-  if (atomicExchange(&status[0], 3u) != 0u) { return; }
-  atomicStore(&status[1], code);
-  atomicStore(&status[2], at);
-  atomicStore(&status[3], limit);
+  if (atomicExchange(&status[b_status], 3u) != 0u) { return; }
+  atomicStore(&status[b_status + 1u], code);
+  atomicStore(&status[b_status + 2u], at);
+  atomicStore(&status[b_status + 3u], limit);
 }
 
 // The heap's words, each access refused past the stage's heap: a read
@@ -85,13 +100,13 @@ fn heap_refuse(w : u32, ok : bool) {
 fn hld(w : u32) -> u32 {
   let ok = w < lim_heap;
   heap_refuse(w, ok);
-  return select(0u, heap[min(w, lim_heap - 1u)], ok);
+  return select(0u, heap[b_heap + min(w, lim_heap - 1u)], ok);
 }
 
 fn hst(w : u32, x : u32) {
   let ok = w < lim_heap;
   heap_refuse(w, ok);
-  if (ok) { heap[w] = x; }
+  if (ok) { heap[b_heap + w] = x; }
 }
 
 fn heap_flush() {
@@ -99,17 +114,15 @@ fn heap_flush() {
 }
 
 // A value's descriptor word `k`. The descriptors, offsets and op params
-// are read at indices with no device check: every index is host-written (a
-// value id from an op's params, an op from the step's uniform, a constant
-// word), the host refuses a plan whose tables name past themselves at its
-// registration (engine_gpu's plan_tables_valid) and a layout that lays a
-// value past its heap at a bind, and no store of this runtime reaches
-// those tables (it declares them read-only; a backend that must bind them
-// read_write beside the heap in one buffer, wgpu, still stores to them
+// are read at indices with no device check, by facts 2 and 3 above: every
+// index is host-written and checked at registration against the stage's own
+// counts, each table's base is checked at the bind, and no store of this
+// runtime reaches the tables (it declares them read-only; a backend that
+// binds them read_write beside the status, wgpu, still stores to them
 // nowhere, as the step modules' test holds). Only the heap, whose indices
 // come from guest data, is checked on the device (hld / hst).
 fn d_word(v : u32, k : u32) -> u32 {
-  return descs[v * DESC_WORDS + k];
+  return tables[b_descs + v * DESC_WORDS + k];
 }
 
 fn d_len(v : u32) -> u32 { return d_word(v, 0u); }
@@ -118,7 +131,7 @@ fn d_rank(v : u32) -> u32 { return d_word(v, 3u); }
 fn d_dtype(v : u32) -> u32 { return d_word(v, 4u); }
 fn d_dim(v : u32, k : u32) -> u32 { return d_word(v, 5u + k); }
 
-fn base(v : u32) -> u32 { return offs[v] >> 2u; }
+fn base(v : u32) -> u32 { return tables[b_offs + v] >> 2u; }
 
 fn rows_of(v : u32) -> u32 {
   let rank = d_rank(v);
@@ -129,7 +142,7 @@ fn rows_of(v : u32) -> u32 {
 }
 
 
-fn p_at(p : u32, k : u32) -> u32 { return params[p * PARAM_WORDS + k]; }
+fn p_at(p : u32, k : u32) -> u32 { return tables[b_params + p * PARAM_WORDS + k]; }
 fn p_tag(p : u32) -> u32 { return p_at(p, 0u); }
 fn p_a0(p : u32) -> u32 { return p_at(p, 1u); }
 fn p_a1(p : u32) -> u32 { return p_at(p, 2u); }
@@ -561,7 +574,7 @@ const PTIR_REDUCE_LEVELS : u32 = 7u;
 fn red_stride(len : u32) -> u32 { return (len + 31u) / 32u; }
 
 fn tmp_v(row : u32, stride : u32, c : u32, buf : u32, span : u32) -> u32 {
-  return cfg.temporary + (buf * span + row * stride + c) * 2u;
+  return cfg_temporary + (buf * span + row * stride + c) * 2u;
 }
 
 fn red_read_buf(level : u32) -> u32 { return level % 2u; }
@@ -1135,7 +1148,7 @@ fn key_less(ah : u32, al : u32, bh : u32, bl : u32) -> bool {
 }
 
 fn sort_cell(buf : u32, n : u32, c : u32) -> u32 {
-  return cfg.temporary + ((buf * n) + c) * 2u;
+  return cfg_temporary + ((buf * n) + c) * 2u;
 }
 
 fn sort_rows_of(p : u32, a : u32) -> u32 {
@@ -1209,10 +1222,10 @@ fn op_sort_round(p : u32, r : u32) {
   }
 }
 
-fn pivot_flag(n : u32, t : u32) -> u32 { return cfg.temporary + t; }
-fn pivot_meta(n : u32, row : u32) -> u32 { return cfg.temporary + n + row; }
-fn pivot_val(n : u32, t : u32) -> u32 { return cfg.temporary + 2u * n + t; }
-fn pivot_pos(n : u32, i : u32) -> u32 { return cfg.temporary + 3u * n + i; }
+fn pivot_flag(n : u32, t : u32) -> u32 { return cfg_temporary + t; }
+fn pivot_meta(n : u32, row : u32) -> u32 { return cfg_temporary + n + row; }
+fn pivot_val(n : u32, t : u32) -> u32 { return cfg_temporary + 2u * n + t; }
+fn pivot_pos(n : u32, i : u32) -> u32 { return cfg_temporary + 3u * n + i; }
 
 const PIVOT_UNROLL : u32 = 32u;
 
@@ -1503,7 +1516,7 @@ var<workgroup> sel_wg_key : array<u32, 1024>;
 var<workgroup> sel_wg_idx : array<u32, 1024>;
 var<workgroup> sel_wg_skip : u32;
 
-fn sel_at(k : u32) -> u32 { return cfg.temporary - SEL_WORDS + k; }
+fn sel_at(k : u32) -> u32 { return cfg_temporary - SEL_WORDS + k; }
 fn sel_part(g : u32, b : u32) -> u32 { return sel_at(16u + g * 256u + b); }
 fn sel_count(g : u32, which : u32) -> u32 { return sel_at(16u + SEL_GROUPS * 256u + g * 2u + which); }
 fn sel_cand_key(i : u32) -> u32 { return sel_at(16u + SEL_GROUPS * 258u + i); }

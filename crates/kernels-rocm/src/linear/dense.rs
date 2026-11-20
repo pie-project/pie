@@ -12,6 +12,7 @@ use crate::hip::{lt, sys};
 use crate::jit::{Ctx, aligned16, kernel, refuse};
 
 use super::dense_batch::dense_batch_bf16;
+use super::routes::{Kernel, Kind, Shape};
 use super::skinny;
 use super::gemv::{
     SkinnyEpilogue, gemv_bf16, skinny_bf16, skinny_f32, skinny_swiglu_bf16, skinnyt, turn_fits,
@@ -30,7 +31,8 @@ const SKINNY_QUAD_ROWS: i32 = super::gemv::QUAD_MIN_ROWS as i32;
 /// so the two land the same bits.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Route {
-    /// The turned kernel (`kernel.gemm.turn_*`; past 16 rows, an lm head).
+    /// The turned kernel (`kernel.gemm.turn_*`'s rows; over the skinny
+    /// kernel where the device's measured times say, `super::routes`).
     Turn,
     /// The skinny kernels (`linear/gemv.hip`).
     Skinny,
@@ -43,9 +45,9 @@ enum Route {
 
 /// Whether the diagonal kernels' vector reads take these planes: each one
 /// there, and the weight and the activation 16-byte aligned.
-/// [`act_x_wt`] over rows normed where the skinny kernel stages them
-/// (`super::gemv::skinny_norm_bf16`), where the product takes the skinny
-/// kernel; `Ok(false)` otherwise or where the fold does not pay.
+/// [`act_x_wt`] over rows normed where the skinny or turned kernel stages
+/// them (`super::gemv::skinny_norm_bf16`, `skinnyt_norm`), where the product
+/// takes either; `Ok(false)` otherwise or where the fold does not pay.
 pub(crate) fn act_x_wt_normed(
     ctx: &Ctx,
     w: u64,
@@ -55,14 +57,18 @@ pub(crate) fn act_x_wt_normed(
     k: i32,
     norm: super::gemv::SkinnyNorm,
 ) -> Result<bool, Error> {
-    if m <= 0 || n <= 0 || k <= 0 || route(ctx, m, n, k, vector_operands(w, norm.x, y)) != Route::Skinny {
+    if m <= 0 || n <= 0 || k <= 0 {
         return Ok(false);
     }
-    super::gemv::skinny_norm_bf16(ctx, w, y, m, n, k, norm, SkinnyEpilogue::Store)
+    match route(ctx, Kind::Normed, m, n, k, w, vector_operands(w, norm.x, y)) {
+        Route::Skinny => super::gemv::skinny_norm_bf16(ctx, w, y, m, n, k, norm, SkinnyEpilogue::Store),
+        Route::Turn => super::gemv::skinnyt_norm(ctx, w, y, m, n, k, norm, SkinnyEpilogue::Store),
+        _ => Ok(false),
+    }
 }
 
-/// [`act_x_wt_swiglu`] over rows normed where the skinny kernel stages them,
-/// where the gated product takes the skinny kernel; `Ok(false)` otherwise or
+/// [`act_x_wt_swiglu`] over rows normed where the skinny or turned kernel
+/// stages them, where the gated product takes either; `Ok(false)` otherwise or
 /// where the fold does not pay.
 pub(crate) fn act_x_wt_swiglu_normed(
     ctx: &Ctx,
@@ -73,39 +79,56 @@ pub(crate) fn act_x_wt_swiglu_normed(
     k: i32,
     norm: super::gemv::SkinnyNorm,
 ) -> Result<bool, Error> {
-    if m <= 0
-        || intermediate <= 0
-        || k <= 0
-        || route(ctx, m, 2 * intermediate, k, vector_operands(gate_up, norm.x, h)) != Route::Skinny
-    {
+    if m <= 0 || intermediate <= 0 || k <= 0 {
         return Ok(false);
     }
-    super::gemv::skinny_norm_bf16(ctx, gate_up, h, m, intermediate, k, norm, SkinnyEpilogue::Swiglu)
+    let (i, e) = (intermediate, SkinnyEpilogue::Swiglu);
+    match route(ctx, Kind::NormedGated, m, 2 * intermediate, k, gate_up, vector_operands(gate_up, norm.x, h)) {
+        Route::Skinny => super::gemv::skinny_norm_bf16(ctx, gate_up, h, m, i, k, norm, e),
+        Route::Turn => super::gemv::skinnyt_norm(ctx, gate_up, h, m, i, k, norm, e),
+        _ => Ok(false),
+    }
 }
 
 fn vector_operands(w: u64, act: u64, y: u64) -> bool {
     w != 0 && act != 0 && y != 0 && aligned16(w) && aligned16(act)
 }
 
-/// The route for `m` rows over a bank of `rows` weight rows of K `k`: a
-/// kernel is named only where it serves the product, its shape and its
-/// planes (`vectors`, [`vector_operands`]), so a route named is a route
-/// that runs, and one that refuses is a fault.
-fn route(ctx: &Ctx, m: i32, rows: i32, k: i32, vectors: bool) -> Route {
+/// The route for `m` rows over a bank of `rows` weight rows of K `k` (the
+/// bank `w`, a product of `kind`): a kernel is named only where it serves
+/// the product, its shape and its planes (`vectors`, [`vector_operands`]),
+/// so a route named is a route that runs, and one that refuses is a fault.
+/// Where the turned kernel's rows hold `m` and the skinny kernel would take
+/// it too, the device's measured times choose (`super::routes`); against
+/// hipBLASLt or the batch engine the turned kernel takes them.
+fn route(ctx: &Ctx, kind: Kind, m: i32, rows: i32, k: i32, w: u64, vectors: bool) -> Route {
     let t = ctx.tuning();
     let until = if rows.unsigned_abs() >= t.gemm_skinny_batch_min_n {
         t.gemm_turn_wide_until
     } else {
         t.gemm_turn_until.min(16)
     };
-    if t.gemm_turn_from > 0
+    let apart = route_apart(ctx, m, rows, k, vectors);
+    let turns = t.gemm_turn_from > 0
         && (t.gemm_turn_from as i32..=until as i32).contains(&m)
-        && rows.unsigned_abs() >= t.gemm_turn_min_n
         && vectors
-        && turn_fits(m.unsigned_abs(), rows.unsigned_abs(), k.unsigned_abs())
-    {
+        && turn_fits(m.unsigned_abs(), rows.unsigned_abs(), k.unsigned_abs());
+    if !turns {
+        return apart;
+    }
+    if apart != Route::Skinny {
         return Route::Turn;
     }
+    let shape = Shape { kind, rows: rows.unsigned_abs(), k: k.unsigned_abs(), m: m.unsigned_abs() };
+    match ctx.routes().map(|routes| routes.pick(shape, w)) {
+        Some(Kernel::Turned) => Route::Turn,
+        Some(Kernel::Skinny) | None => Route::Skinny,
+    }
+}
+
+/// [`route`] where the turned kernel takes nothing.
+fn route_apart(ctx: &Ctx, m: i32, rows: i32, k: i32, vectors: bool) -> Route {
+    let t = ctx.tuning();
     let skinny = vectors && skinny::fits(m, rows, k);
     if skinny && m <= SKINNY_SMALL && i64::from(rows) * i64::from(k) <= SKINNY_SMALL_WEIGHT {
         return Route::Skinny;
@@ -146,7 +169,7 @@ pub(crate) fn act_x_wt(
         return Ok(false);
     }
     let vectors = vector_operands(w, act, y);
-    let way = route(ctx, m, n, k, vectors);
+    let way = route(ctx, Kind::Plain, m, n, k, w, vectors);
     if bias == 0 && way == Route::Turn {
         skinnyt(ctx, w, act, y, m, n, k, SkinnyEpilogue::Store)?;
         return Ok(false);
@@ -217,7 +240,7 @@ pub(crate) fn act_x_wt_f32(
     n: i32,
     k: i32,
 ) -> Result<(), Error> {
-    let way = route(ctx, m, n, k, vector_operands(w, act, y));
+    let way = route(ctx, Kind::PlainF32, m, n, k, w, vector_operands(w, act, y));
     if way == Route::Turn {
         return skinnyt(ctx, w, act, y, m, n, k, SkinnyEpilogue::F32);
     }
@@ -275,7 +298,7 @@ pub(crate) fn act_x_wt_swiglu(
     if m <= 0 || intermediate <= 0 || k <= 0 {
         return Ok(false);
     }
-    let way = route(ctx, m, 2 * intermediate, k, vector_operands(gate_up, act, h));
+    let way = route(ctx, Kind::Gated, m, 2 * intermediate, k, gate_up, vector_operands(gate_up, act, h));
     if way == Route::Turn {
         skinnyt(
             ctx,

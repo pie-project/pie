@@ -400,6 +400,8 @@ impl<B: Serve> Serve for Named<B> {
 
     const CHANNEL_CELLS: bool = B::CHANNEL_CELLS;
 
+    const READS_SPAN: bool = B::READS_SPAN;
+
     const NAMES: bool = true;
 
     const TARGET: kernels_slang::Target = B::TARGET;
@@ -458,6 +460,18 @@ impl<B: Serve> Serve for Named<B> {
         )
     }
 
+    const BINDS_AT_LOAD: bool = false;
+
+    fn bind_frame(_device: &Facts) -> Result<NoFrame> {
+        Err(Fault::Unbound {
+            what: "a bind walk on the naming load, which keeps nothing a dispatch binds".into(),
+        })
+    }
+
+    fn bound(_pipelines: &Asked<B>) -> u64 {
+        0
+    }
+
     fn walk_frame(_device: &Facts, _keep: bool) -> Result<NoFrame> {
         Ok(NoFrame)
     }
@@ -467,6 +481,7 @@ impl<B: Serve> Serve for Named<B> {
         _pipelines: &Self::Pipelines,
         _readout: &[NoBuffer],
         _weights_stream: bool,
+        _guest: crate::serve::GuestRoom,
     ) -> Result<()> {
         Ok(())
     }

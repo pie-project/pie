@@ -2,3 +2,6 @@
 # The emitters embed these runtimes (include_str!) and their fingerprints pin the
 # bytes: a checkout keeps them LF, whatever core.autocrlf says.
 crates/eta-compiler/runtime/** text eol=lf
+# The model catalog's packages: tests edit their source as text by its lines, so a
+# checkout keeps them LF too.
+*.poem text eol=lf

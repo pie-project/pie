@@ -1182,7 +1182,13 @@ mod hip {
             want.gemm_turn_from = 3;
             want.gemm_turn_wide_until = 32;
             want.ssm_gdn_wide_from = 512;
-            assert_eq!(kernels_cuda::tuning::Tuning::of(&profile), want, "{gpu}");
+            // The rates are the device's own file's (the norm fold's pricing
+            // reads them), not the family's: not what this checks.
+            let got = kernels_cuda::tuning::Tuning::of(&profile);
+            want.launch_ns = got.launch_ns;
+            want.hbm_gbps = got.hbm_gbps;
+            want.cached_gbps = got.cached_gbps;
+            assert_eq!(got, want, "{gpu}");
         }
     }
 

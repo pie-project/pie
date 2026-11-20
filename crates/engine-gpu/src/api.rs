@@ -320,6 +320,13 @@ impl<B: Host> Gpu<B> {
             self.live.tally(engine::live::Tally::BuiltInFire, 1);
             self.warn_in_fire(kernel);
         }
+        // What a dispatch binds, built on the fire's path: the load's walk
+        // built every one it reached.
+        let bound = self.shell.as_mut().map_or(0, Shell::bound_serving);
+        if bound > 0 {
+            self.live.tally(engine::live::Tally::BoundInFire, bound);
+            self.warn_in_fire("what a dispatch binds (a bind group the load's walk did not build)");
+        }
         let recorded = self.shell.as_mut().map_or(0, Shell::recorded_serving);
         if recorded > 0 {
             self.live.tally(engine::live::Tally::Compiled, recorded);
@@ -493,6 +500,7 @@ fn place<B: Host>(shell: &Shell<B>) -> Place<'_, B> {
         max_lanes: shell.budget().max_lanes,
         planes: u32::try_from(shell.output_names().len() + shell.pixel_planes())
             .unwrap_or(u32::MAX),
+        shelf: &shell.shelf,
     }
 }
 
@@ -800,8 +808,19 @@ where
         })
         .map_err(fault)?;
         self.programs.load(&place(&shell)).map_err(refusal)?;
+        let started = std::time::Instant::now();
+        let walked = shell.walk_binds().map_err(fault)?;
+        if walked > 0 {
+            tracing::info!(
+                engine = B::KIND,
+                walked,
+                ms = started.elapsed().as_millis() as u64,
+                "every fire shape the load serves walked bind-only: what a dispatch binds is built"
+            );
+        }
         // What the load itself walked is the load's: serving counts from here.
         shell.unkept_serving();
+        shell.bound_serving();
         // The fire the shell took, which a binding may have bounded below
         // the one asked.
         let (max_lanes, max_tokens) = (shell.budget().max_lanes, shell.budget().max_tokens);
@@ -1686,6 +1705,15 @@ impl<B: Host> Gpu<B> {
             .flat_map(|lane| lane.slot_copies.iter().cloned())
             .collect();
         shell.copy_slot_pairs(&slot_copies).map_err(fault)?;
+        let mut attached = vec![false; submission.lanes.len()];
+        for attachment in program_attachments(submission) {
+            let lanes = attachment.lane..attachment.lane + attachment.lanes.max(1);
+            for at in lanes {
+                if let Some(lane) = attached.get_mut(at as usize) {
+                    *lane = true;
+                }
+            }
+        }
         let seated: Vec<Seated<'_, B>> = submission
             .lanes
             .iter()
@@ -1711,6 +1739,10 @@ impl<B: Host> Gpu<B> {
                     Readout::Rows(rows) => Some(rows.as_slice()),
                     Readout::Last | Readout::None => None,
                 },
+                // A program attached to the lane reads its rows on the
+                // device and hands back what it makes through its
+                // channels: the host reads back the lanes no program reads.
+                hosts: !matches!(lane.readout, Readout::None) && !attached[at],
                 reads: &reads[at],
                 scores: scores[at].as_ref(),
 

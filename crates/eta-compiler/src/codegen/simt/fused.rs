@@ -913,10 +913,22 @@ fn emit_body(
             );
             source.push_str("    __syncthreads();\n");
         }
-        let _ = writeln!(
-            source,
-            "    if (threadIdx.x == 0u) ptir_scatter_updates({tag}u, {a1}, {a2}, {o0}, descriptors[p.a0], descriptors[p.a1], descriptors[p.a2]);"
-        );
+        let integer_add = tag == tags::SCATTER_ADD
+            && matches!(
+                stage.normalized.value_types[op.args[0] as usize].dtype,
+                Dtype::I32 | Dtype::U32
+            );
+        if integer_add {
+            let _ = writeln!(
+                source,
+                "    ptir_parallel_scatter_add_int({a1}, {a2}, {o0}, descriptors[p.a0], descriptors[p.a1], descriptors[p.a2]);"
+            );
+        } else {
+            let _ = writeln!(
+                source,
+                "    if (threadIdx.x == 0u) ptir_scatter_updates({tag}u, {a1}, {a2}, {o0}, descriptors[p.a0], descriptors[p.a1], descriptors[p.a2]);"
+            );
+        }
     } else if tag == tags::PIVOT_THRESHOLD && op.pred_tag == 1 {
         source.push_str(cut_mark);
         let _ = writeln!(

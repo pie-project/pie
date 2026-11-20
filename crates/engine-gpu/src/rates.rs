@@ -760,11 +760,13 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         }),
         attn_tflops_by_keys: (!attn.is_empty()).then(|| tflops(attn)),
         hbm_gbps: want.launch.then_some(bytes_per_ns),
+        cached_gbps: None,
         elementwise_gbps: elementwise,
         scan_gelems: scan,
         few_row_tflops: None,
         tile_tflops_by_rows: (!tile_curves.is_empty()).then_some(tile_curves),
         vector_tflops_by_rows: (!vector_curves.is_empty()).then_some(vector_curves),
+        product_ns: None,
         workgroups_per_core: None,
     };
     // A rate that settled at nothing is refused by name, never saved or
@@ -1364,12 +1366,14 @@ mod wanted_tests {
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 10.0)])]),
             attn_tflops_by_keys: Some(vec![(512, 5.0)]),
             hbm_gbps: Some(650.0),
+            cached_gbps: None,
             elementwise_gbps: Some(700.0),
             scan_gelems: Some(100.0),
             few_row_tflops: None,
             workgroups_per_core: None,
             tile_tflops_by_rows: Some(vec![(32, vec![(4, 1.0)])]),
             vector_tflops_by_rows: Some(vec![(4, vec![(1, 0.5)])]),
+            product_ns: None,
         };
         let none = Wanted {
             launch: false,
@@ -1394,6 +1398,7 @@ mod wanted_tests {
         );
         let copy = Rates {
             hbm_gbps: None,
+            cached_gbps: None,
             ..all.clone()
         };
         assert_eq!(
