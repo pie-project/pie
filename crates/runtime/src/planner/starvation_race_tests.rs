@@ -2452,6 +2452,9 @@ struct BindRoomPool {
     /// Its free chunks are handed out as device pages (a chunk a page), as
     /// an activation rise's grant takes them; else it hands out none.
     pages: std::sync::atomic::AtomicBool,
+    /// Moves of parked state down a tier that begin and then fail (the
+    /// engine refused the copy), counted down.
+    park_down_fails: AtomicU32,
 }
 
 impl BindRoomPool {
@@ -2473,6 +2476,7 @@ impl BindRoomPool {
             compactions: AtomicU32::new(0),
             kv: parking_lot::Mutex::new(Vec::new()),
             pages: std::sync::atomic::AtomicBool::new(false),
+            park_down_fails: AtomicU32::new(0),
         }
     }
 
@@ -2572,6 +2576,15 @@ impl PoolPort for BindRoomPool {
             .collect();
         if chunks.is_empty() {
             return false;
+        }
+        if self
+            .park_down_fails
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            let planner = planner.clone();
+            crate::rt::spawn(async move { planner.parked_down_done(false) });
+            return true;
         }
         let want = chunks.len() as u32;
         let host_free = self.host - self.host_used.load(Ordering::Relaxed);
@@ -5930,4 +5943,53 @@ async fn a_grant_dropped_under_the_planner_lock_does_not_deadlock() {
             .expect("a grant dropped under the planner's lock must not deadlock");
         served_at_once(head_task, std::time::Instant::now()).await;
     }
+}
+
+/// A move of parked-in-place state down a tier that failed is tried again
+/// once the pool's room has moved past the failure. Latched for good, one
+/// failure left every such set on the device: the head's runs held by an
+/// evicted process's parked state, the chunk map naming it each pass, and
+/// nothing issued (no move, no eviction), with room the head fits alone in.
+#[tokio::test(flavor = "current_thread")]
+async fn a_failed_park_down_is_tried_again_once_room_moves() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.write().await;
+    let model = crate::store::registry::register_model(16, &[8], &[4]);
+    let pool = Arc::new(BindRoomPool {
+        model,
+        ..BindRoomPool::new(8, 0..0, 0)
+    });
+    pool.disk_free.store(64, Ordering::Relaxed);
+    pool.free.lock().extend([0, 2, 4, 6]);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (head, sleeper) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [head, sleeper] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    planner.with_inner(|inner| {
+        inner.procs.get_mut(&sleeper).unwrap().state = Residency::Evicted;
+    });
+    // The evicted process's state parked in place between the free chunks:
+    // no run of two stands until it moves down.
+    pool.parked.lock().extend([(1, sleeper), (3, sleeper), (5, sleeper), (7, sleeper)]);
+    pool.park_down_fails.store(1, Ordering::SeqCst);
+    let p = planner.clone();
+    let bind = crate::rt::spawn(async move { p.wait_bind_room(head, 2, 1).await.map(drop) });
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+    }
+    assert_eq!(pool.park_down_fails.load(Ordering::SeqCst), 0, "the first move failed");
+    assert!(!bind.is_finished(), "its room is still held");
+    // Room moves (a chunk given back elsewhere): the move goes again.
+    pool.gives.fetch_add(1, Ordering::Relaxed);
+    planner.pages_freed();
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if bind.is_finished() {
+            break;
+        }
+    }
+    assert!(bind.is_finished(), "the parked state moved down and the head was served");
+    assert!(bind.await.unwrap().is_ok());
+    assert_eq!(*pool.moved.lock(), vec!["disk"]);
 }
