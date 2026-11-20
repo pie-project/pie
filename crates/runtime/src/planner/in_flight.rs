@@ -70,6 +70,9 @@ impl ResidencyPlanner {
                 proc.fire_lapsed = false;
             }
         });
+        self.stats
+            .fires_landed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // After the count drops: a poke read before it would see the fire
         // still in flight and wait on a settling that has passed.
         self.pages_freed();

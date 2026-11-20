@@ -1094,7 +1094,28 @@ impl PoolPort for RegistryPool {
         let Some(stores) = crate::store::registry::try_get(self.model, self.engine) else {
             return false;
         };
+        // An evicted process's state left on the device at its eviction
+        // (records and rs list slots its suspend found no row for, or still
+        // settling then) goes down with its parked role slots: left there,
+        // queued processes waiting to be restored held chunks no move
+        // freed (Mac Pro on 22b0a3e83: 85 chunks of one live slot each, all
+        // queued processes').
+        let sets: HashSet<crate::store::rs::RsWorkingSetId> = pids
+            .iter()
+            .flat_map(|&pid| {
+                crate::inferlet::process::residency::rs_working_set_ids(pid, self.model, self.engine)
+            })
+            .collect();
+        let rs = if sets.is_empty() {
+            None
+        } else {
+            stores.rs.lock().unwrap().prepare_suspend(&sets)
+        };
         let Some(roles) = stores.roles.clone() else {
+            if rs.is_some() {
+                super::exec::spawn_park_down(planner.clone(), None, rs);
+                return true;
+            }
             return false;
         };
         let holders: Vec<crate::store::roles::Holder> = pids.to_vec();
@@ -1104,8 +1125,8 @@ impl PoolPort for RegistryPool {
             .lock()
             .unwrap()
             .prepare_park_down(&holders, stores.host.is_none());
-        if let Some(txn) = down.txn {
-            super::exec::spawn_park_down(planner.clone(), txn);
+        if down.txn.is_some() || rs.is_some() {
+            super::exec::spawn_park_down(planner.clone(), down.txn, rs);
             return true;
         }
         if let Some(host) = stores.host.as_ref().filter(|_| down.host_chunks > 0) {
@@ -1131,6 +1152,11 @@ impl PoolPort for RegistryPool {
                     .or_else(|| kv.prepare_parked_spill(wanted, &sets))
             });
             if let Some(txn) = spill {
+                // The state goes down once the spill has made the room:
+                // the next move down takes it.
+                if let Some(rs) = rs {
+                    stores.rs.lock().unwrap().abort_suspend(rs);
+                }
                 super::exec::spawn_spill(
                     planner.clone(),
                     txn,
@@ -1144,7 +1170,7 @@ impl PoolPort for RegistryPool {
         // now, else the disk.
         match roles.lock().unwrap().prepare_park_down(&holders, true).txn {
             Some(txn) => {
-                super::exec::spawn_park_down(planner.clone(), txn);
+                super::exec::spawn_park_down(planner.clone(), Some(txn), None);
                 true
             }
             None => false,

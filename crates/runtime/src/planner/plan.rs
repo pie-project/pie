@@ -296,7 +296,7 @@ impl ResidencyPlanner {
             .map(|set| set.candidates(true).into_iter().map(|(pid, _)| pid).collect())
             .unwrap_or(pids);
         let mut map = self.port.chunk_occupants(&pids);
-        map.merge(self.port.parked_occupants(self.parked_except(pid)));
+        map.merge(self.parked_map(pid));
         // The moves the whole need takes, every length laid together (the
         // map's own line reads one run of the longest length alone).
         let need_moves = need

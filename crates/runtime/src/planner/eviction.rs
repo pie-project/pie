@@ -270,7 +270,7 @@ impl ResidencyPlanner {
         // they off the device.
         let map = shape.as_ref().map(|_| {
             let mut map = self.port.chunk_occupants(&residents);
-            map.merge(self.port.parked_occupants(self.parked_except(victims.head_pid)));
+            map.merge(self.parked_map(victims.head_pid));
             map
         });
         // No eviction forms the head's runs (a chunk in every window holds
@@ -410,7 +410,15 @@ impl ResidencyPlanner {
     pub(super) fn pool_now(&self) -> (u64, u32) {
         let (host_free, _) = self.port.host_stats();
         let (disk_free, _) = self.port.disk_stats();
-        (self.port.room_gives(), host_free.saturating_add(disk_free))
+        // A fire landed is a change too: a victim whose move found nothing
+        // to move (its state still settling) may find it settled now, and
+        // stayed blocked for good where no room came back (the L40S on
+        // 22b0a3e83: a queued process's chunk, no candidate).
+        let landed = self.stats.fires_landed.load(Ordering::Relaxed);
+        (
+            self.port.room_gives().wrapping_add(landed),
+            host_free.saturating_add(disk_free),
+        )
     }
 
     /// Victims blocked (their move found no swap room, or nothing to move)

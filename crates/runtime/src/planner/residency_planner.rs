@@ -795,6 +795,34 @@ impl ResidencyPlanner {
         need.within(self.port.state_chunks(), Some((run, pieces)))
     }
 
+    /// Parked state lying on the device, for a map for `head`: role slots
+    /// parked where they lie ([`PoolPort::parked_occupants`]), and the state
+    /// evicted processes left on the device at their eviction (records, rs
+    /// list slots, [`PoolPort::chunk_occupants`] of them), the head's own
+    /// once it is evicted. A move down a tier frees either
+    /// ([`Self::park_down`]); counted as no one's, queued processes waiting
+    /// to be restored held chunks no move freed (Mac Pro on 22b0a3e83).
+    pub(super) fn parked_map(&self, head: ProcessId) -> super::pool::ChunkMap {
+        let except = self.parked_except(head);
+        let evicted: Vec<ProcessId> = self.with_inner(|inner| {
+            inner
+                .procs
+                .iter()
+                .filter(|(pid, proc)| {
+                    proc.state == Residency::Evicted
+                        && **pid != except
+                        && !inner.parked_moving.contains(*pid)
+                })
+                .map(|(pid, _)| *pid)
+                .collect()
+        });
+        let mut map = self.port.parked_occupants(except);
+        if !evicted.is_empty() {
+            map.merge(self.port.chunk_occupants(&evicted));
+        }
+        map
+    }
+
     /// Whose parked state a map for `head` leaves out: its own while it is
     /// resident (its state is live, whatever of it lies parked), nobody's
     /// once it is evicted. Nothing runs on an evicted head's state parked in
@@ -821,7 +849,7 @@ impl ResidencyPlanner {
         let Some(head) = self.with_inner(|inner| inner.unmet_head().map(|(_, w)| w.pid)) else {
             return false;
         };
-        match self.port.parked_occupants(self.parked_except(head)).cheapest_need(need) {
+        match self.parked_map(head).cheapest_need(need) {
             Some(pids) if !pids.is_empty() => self.park_down(head, pids),
             _ => false,
         }
@@ -838,7 +866,7 @@ impl ResidencyPlanner {
         if pages == 0 || per_chunk == 0 {
             return false;
         }
-        let mut map = self.port.parked_occupants(self.parked_except(head));
+        let mut map = self.parked_map(head);
         let emptiable = map.held.iter().filter(|chunk| chunk.emptiable()).count() as u32;
         let chunks = pages.div_ceil(per_chunk).min(emptiable);
         if chunks == 0 {

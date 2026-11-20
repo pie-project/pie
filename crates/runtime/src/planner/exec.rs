@@ -115,7 +115,11 @@ pub(super) fn spawn_spill(
 /// Parked role slots left on the device go on down a tier, the host or the
 /// disk ([`crate::store::roles::Roles::prepare_park_down`]): their process is
 /// evicted, so no fire reads them; a failure leaves them where they lie.
-pub(super) fn spawn_park_down(planner: Arc<ResidencyPlanner>, txn: RoleMove) {
+pub(super) fn spawn_park_down(
+    planner: Arc<ResidencyPlanner>,
+    roles: Option<RoleMove>,
+    rs: Option<RsResidencyTxn>,
+) {
     let (model, engine) = planner.locus();
     // The guard owns the move from here: a task that never runs drops it,
     // and that gives back what the move took.
@@ -124,8 +128,8 @@ pub(super) fn spawn_park_down(planner: Arc<ResidencyPlanner>, txn: RoleMove) {
         engine,
         Move::Suspend {
             kv: None,
-            rs: None,
-            roles: Some(txn),
+            rs,
+            roles,
         },
     );
     let task = {
@@ -152,15 +156,17 @@ pub(super) fn spawn_park_down(planner: Arc<ResidencyPlanner>, txn: RoleMove) {
 
 async fn park_down(planner: &ResidencyPlanner, mut guard: MoveGuard) -> Result<(), String> {
     guard.copy(planner, ProcessId::nil()).await?;
-    let Move::Suspend {
-        roles: Some(txn), ..
-    } = guard.take()
-    else {
-        unreachable!("a park down carries role slots")
+    let Move::Suspend { roles, rs, .. } = guard.take() else {
+        unreachable!("a park down is a move down")
     };
     let (model, engine) = planner.locus();
-    if let Some(store) = &crate::store::registry::get(model, engine).roles {
+    let stores = crate::store::registry::get(model, engine);
+    if let (Some(txn), Some(store)) = (roles, &stores.roles) {
         store.lock().unwrap().commit(txn);
+    }
+    // An evicted process's state left on the device at its eviction.
+    if let Some(txn) = rs {
+        stores.rs.lock().unwrap().commit_suspend(txn);
     }
     Ok(())
 }

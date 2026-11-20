@@ -2615,6 +2615,23 @@ impl PoolPort for BindRoomPool {
             .filter(|(_, pid)| pids.contains(pid))
             .map(|&(chunk, _)| chunk)
             .collect();
+        // An evicted process's state left on the device (kept with the
+        // residents' here, `kv`): it goes down to disk at once.
+        let state: Vec<u32> = self
+            .kv
+            .lock()
+            .iter()
+            .filter(|(_, pid)| pids.contains(pid))
+            .map(|&(chunk, _)| chunk)
+            .collect();
+        if !state.is_empty() && chunks.is_empty() {
+            self.kv.lock().retain(|(_, pid)| !pids.contains(pid));
+            self.free.lock().extend(state);
+            self.moved.lock().push("state");
+            let planner = planner.clone();
+            crate::rt::spawn(async move { planner.parked_down_done(true) });
+            return true;
+        }
         if chunks.is_empty() {
             return false;
         }
@@ -7872,4 +7889,109 @@ async fn a_restore_refused_in_its_unpark_s_room_goes_again_only_on_more_room() {
         }
     }
     assert!(sent(&planner), "more room: sent");
+}
+
+/// Mac Pro and the L40S on 22b0a3e83: the opened chunks all held by queued
+/// processes waiting to be restored (85 chunks of one live slot each), no
+/// candidate among them. An evicted process's state left on the device at
+/// its eviction is parked state: the map counts it, and it moves down a
+/// tier for the head, its chunks freed.
+#[tokio::test(flavor = "current_thread")]
+async fn an_evicted_process_s_state_left_on_the_device_moves_down_for_the_head() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(4, 0..0, 0));
+    pool.disk_free.store(64, Ordering::Relaxed);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (head, evicted) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [head, evicted] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    // Every chunk holds the evicted process's state; it waits to be
+    // restored behind the head.
+    pool.kv.lock().extend((0..4).map(|chunk| (chunk, evicted)));
+    planner.with_inner(|inner| {
+        for pid in [head, evicted] {
+            inner.procs.get_mut(&pid).unwrap().state = Residency::Evicted;
+        }
+        inner.procs.get_mut(&head).unwrap().bind_room = Some(PendingBind {
+            run: 2,
+            pieces: 1,
+            pages: 2,
+        });
+        for pid in [head, evicted] {
+            inner.enqueue(
+                pid,
+                WaitKind::Restore {
+                    demand: Demand::default(),
+                },
+            );
+        }
+    });
+    planner.poke();
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if !pool.moved.lock().is_empty() {
+            break;
+        }
+    }
+    assert_eq!(*pool.moved.lock(), vec!["state"], "its state moves down for the head");
+    assert_eq!(pool.free.lock().len(), 4, "its chunks free");
+}
+
+/// A victim whose move found nothing to move (its state still settling) is
+/// blocked until the pool moves on; a fire landing (state settled) is such
+/// a move too, so a stall with no room given back keeps it out for good no
+/// longer (the L40S on 22b0a3e83: a queued process's chunk, no candidate).
+#[test]
+fn a_victim_that_found_nothing_is_a_candidate_again_once_a_fire_lands() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
+    let pool = Arc::new(RacePool::new(8));
+    pool.refill_after_stall(4, 0);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (head, held) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [held, head] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    let grant = planner
+        .grant_now(
+            held,
+            Demand {
+                kv_pages: 4,
+                rs: RsUnits::default(),
+            },
+        )
+        .expect("the pool is free");
+    planner.with_inner(|inner| {
+        inner.enqueue(
+            head,
+            allocation(Demand {
+                kv_pages: 2,
+                rs: RsUnits::default(),
+            }),
+        );
+    });
+    let fire = planner.fire_in_flight(held);
+    let now = planner.pool_now();
+    planner.with_inner(|inner| {
+        // Idle: a member, but for the block.
+        inner.procs.get_mut(&held).unwrap().idle = true;
+        inner.prepare_blocked.insert(held);
+        inner.blocked_at = Some(now);
+    });
+    let member = |planner: &ResidencyPlanner| {
+        planner
+            .victim_set()
+            .is_some_and(|set| set.members.iter().any(|v| v.pid == held))
+    };
+    let blocked = |planner: &ResidencyPlanner| {
+        planner.lapse_blocks();
+        planner.with_inner(|inner| inner.prepare_blocked.contains(&held))
+    };
+    assert!(blocked(&planner), "blocked on this pool");
+    assert!(!member(&planner), "no candidate while blocked");
+    drop(fire);
+    assert!(!blocked(&planner), "a fire landed: a candidate again");
+    drop(grant);
 }
