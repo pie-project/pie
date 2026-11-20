@@ -135,9 +135,11 @@ impl ResidencyPlanner {
     }
 
     /// Every opened chunk, by the live slots it holds and the state of the
-    /// processes holding them: `running` (resident, not queued),
-    /// `queued` (waiting in the queue), `parked` (evicted, its state lying
-    /// on the device), `other` (slots no process is named for: cache, a
+    /// processes holding them: `firing` / `running` (resident, not queued,
+    /// a fire in flight or none), `queued` / `queued-firing` (resident,
+    /// waiting in the queue), `queued-evicted` (evicted, waiting to be
+    /// restored, its state still on the device), `parked` (evicted, not
+    /// queued), `other` (slots no process is named for: cache, a
     /// checkpoint). Read as `class:slots-bucket=chunks`. The M1 on
     /// 3b45462d4: 364 opened chunks, none emptiable, no candidate holding
     /// any: whose slots held them was unsaid.
@@ -153,12 +155,14 @@ impl ResidencyPlanner {
                 .procs
                 .iter()
                 .map(|(pid, proc)| {
-                    let label = if queued.contains(pid) {
-                        "queued"
-                    } else if proc.state == Residency::Resident {
-                        "running"
-                    } else {
-                        "parked"
+                    let resident = proc.state == Residency::Resident;
+                    let label = match (queued.contains(pid), resident) {
+                        (true, true) if proc.firing() => "queued-firing",
+                        (true, true) => "queued",
+                        (true, false) => "queued-evicted",
+                        (false, true) if proc.firing() => "firing",
+                        (false, true) => "running",
+                        (false, false) => "parked",
                     };
                     (*pid, label)
                 })
@@ -649,14 +653,24 @@ impl ResidencyPlanner {
                     // refused restore took and gave back is no more room.
                     // Read at the length its refusal named, in the room
                     // the refusal read.
+                    // And only once more chunks stand free than it left:
+                    // runs of four fluctuating with a decoding fleet's
+                    // takes sent it again ~350 times a second, each unpark
+                    // short of a chunk (Mac Pro on 3b45462d4).
                     let refused = self.with_inner(|inner| {
                         inner.unmet_head().and_then(|(_, waiter)| {
-                            inner.procs.get(&waiter.pid).map(|proc| proc.roles_short_runs)
+                            inner
+                                .procs
+                                .get(&waiter.pid)
+                                .map(|proc| (proc.roles_short_runs, proc.roles_short_free))
                         })
                     });
                     let map_moved = match refused {
-                        Some(Some((at_run, at))) => self.port.guest_free_runs(at_run) > at,
-                        Some(None) => true,
+                        Some((Some((at_run, at)), free)) => {
+                            self.port.guest_free_runs(at_run) > at
+                                && free.is_none_or(|free| self.port.free_chunks() > free)
+                        }
+                        Some((None, _)) => true,
                         None => false,
                     };
                     if !understated && map_moved && self.port.guest_need_free(&room) {

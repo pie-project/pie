@@ -2487,6 +2487,8 @@ struct BindRoomPool {
     /// The state budget's headroom: the chunks that may be opened, free
     /// ones beyond it standing open but unusable (`None`: no budget).
     headroom: parking_lot::Mutex<Option<u32>>,
+    /// The pages a unit of state (an rs slot) stands for (`rs_as_pages`).
+    rs_pages: AtomicU32,
 }
 
 impl BindRoomPool {
@@ -2511,6 +2513,7 @@ impl BindRoomPool {
             park_down_fails: AtomicU32::new(0),
             disk_idle: AtomicU32::new(0),
             headroom: parking_lot::Mutex::new(None),
+            rs_pages: AtomicU32::new(0),
         }
     }
 
@@ -2694,6 +2697,9 @@ impl PoolPort for BindRoomPool {
             self.compactions.fetch_add(1, Ordering::Relaxed);
         }
         comes
+    }
+    fn rs_as_pages(&self, rs: RsUnits) -> u32 {
+        rs.slots * self.rs_pages.load(Ordering::Relaxed)
     }
     fn chunks_as_pages(&self, chunks: u32) -> u32 {
         chunks
@@ -5701,14 +5707,20 @@ async fn a_restore_refused_against_the_map_goes_again_at_most_once_per_map_chang
         });
         planner.requeue_restore_roles(head, (3, 1), refused);
     };
-    // Refused with its own view short (free_runs 0) while the map shows 2.
+    // Refused with its own view short (free_runs 0) while the map shows 2:
+    // a room the map does not read. Its need is not grown on it (Mac Pro on
+    // 3b45462d4: (7, 6) to (7, 22)); the census names the mismatch.
     refuse(&planner, Some(0));
-    let (understated, at, mismatch) = planner.with_inner(|inner| {
+    let (understated, need, mismatch) = planner.with_inner(|inner| {
         let proc = &inner.procs[&head];
-        (proc.roles_free_short, proc.roles_free_short_at, proc.roles_short_mismatch)
+        (
+            proc.roles_free_short,
+            proc.roles_short.map(|need| (need.run, need.pieces)),
+            proc.roles_short_mismatch,
+        )
     });
-    assert_eq!(understated, Some((3, 3)), "refused against runs the map shows: understated, one run more");
-    assert_eq!(at, 2);
+    assert_eq!(understated, None, "not understated on runs only the map shows");
+    assert_eq!(need, Some((3, 1)), "its need as refused, not grown");
     assert_eq!(mismatch, Some((2, Some(0))), "the census names the mismatch");
     let retried = |planner: &Arc<ResidencyPlanner>| {
         planner.with_inner(|inner| inner.procs[&head].roles_free_retry.is_some())
@@ -7761,4 +7773,103 @@ fn with_nothing_in_flight_a_queued_process_s_slots_are_a_victim_s() {
         "nothing in flight: the queued process's slots are a victim's"
     );
     drop(held);
+}
+
+/// Mac Pro's 2 GiB on 3b45462d4: a restore refused a run of four (no chunk
+/// free in its unpark's room) while the map showed its need standing,
+/// spinning ~350 lines a second, its need growing. Its need counts the
+/// state its serve opens chunks for first (records, rs list slots); it is
+/// not grown on runs only the map shows; and it goes again only once more
+/// chunks stand free than its refusal left, not on chunks given back and
+/// taken again.
+#[tokio::test(flavor = "current_thread")]
+async fn a_restore_refused_in_its_unpark_s_room_goes_again_only_on_more_room() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let model = crate::store::registry::register_model(16, &[8], &[4]);
+    let pool = Arc::new(BindRoomPool {
+        model,
+        ..BindRoomPool::new(16, 0..0, 64)
+    });
+    pool.rs_pages.store(4, Ordering::Relaxed);
+    // Two runs of four stand in the map.
+    pool.free.lock().extend(0..8);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let head = ProcessId::new_v4();
+    planner.register(head);
+    planner.note_admitted(head);
+    planner.with_inner(|inner| {
+        inner.procs.get_mut(&head).unwrap().state = Residency::Evicted;
+    });
+    planner.requeue_restore_roles(head, (4, 1), Some(0));
+    let key = planner.with_inner(|inner| {
+        let at = inner.queue.iter().find(|(_, w)| w.pid == head).map(|(k, _)| *k);
+        let key = at.unwrap_or_else(|| {
+            inner.enqueue(
+                head,
+                WaitKind::Restore {
+                    demand: Demand::default(),
+                },
+            )
+        });
+        if let Some(super::wait::Waiter {
+            kind: WaitKind::Restore { demand },
+            ..
+        }) = inner.queue.get_mut(&key)
+        {
+            demand.rs = RsUnits {
+                slots: 2,
+                pages: 0,
+                ..RsUnits::default()
+            };
+        }
+        key
+    });
+    assert_eq!(
+        planner.with_inner(|inner| inner.procs[&head].roles_short.map(|n| (n.run, n.pieces))),
+        Some((4, 1)),
+        "not grown on runs only the map shows"
+    );
+    assert_eq!(
+        planner.head_room(key),
+        Some(super::pool::RunNeed::one(4, 3)),
+        "its run of four, and its state's eight chunks in runs of four"
+    );
+    // (The pool here holds no state slots: the rest asks none.)
+    planner.with_inner(|inner| {
+        if let Some(super::wait::Waiter {
+            kind: WaitKind::Restore { demand },
+            ..
+        }) = inner.queue.get_mut(&key)
+        {
+            demand.rs = RsUnits::default();
+        }
+    });
+    let sent = |planner: &ResidencyPlanner| {
+        planner.stats.restores.load(Ordering::Relaxed) > 0
+            || planner.with_inner(|inner| inner.procs[&head].roles_free_retry.is_some())
+    };
+    // A decoding fleet takes a chunk and gives it back: no more room.
+    for _ in 0..50 {
+        let taken = pool.free.lock().pop();
+        if let Some(chunk) = taken {
+            pool.free.lock().push(chunk);
+        }
+        pool.gives.fetch_add(1, Ordering::Relaxed);
+        planner.pages_freed();
+        for _ in 0..5 {
+            crate::rt::yield_now().await;
+        }
+    }
+    assert!(!sent(&planner), "chunks given back and taken again: not sent");
+    // More chunks stand free, a run of four among them: sent.
+    pool.free.lock().extend(8..12);
+    pool.gives.fetch_add(1, Ordering::Relaxed);
+    planner.pages_freed();
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if sent(&planner) {
+            break;
+        }
+    }
+    assert!(sent(&planner), "more room: sent");
 }

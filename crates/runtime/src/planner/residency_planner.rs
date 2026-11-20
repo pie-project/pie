@@ -394,9 +394,8 @@ impl ResidencyPlanner {
             // Read after the pass: room its own steps took and gave back is
             // the room it planned on, never a change that plans again.
             self.quiet_unplanned();
-        } else {
-            self.say_held_in_flight();
         }
+        self.say_held_in_flight();
         self.report_short();
         self.note_lapsed_fires();
         // One read of the queue, as `never_fits` reads each need.
@@ -450,27 +449,26 @@ impl ResidencyPlanner {
         })
     }
 
-    /// The head unserved while something stays in flight with no room
-    /// given back (the beat plans only a quiet head): what is in flight is
-    /// said, once per head and room, after [`super::plan::STALL_SAYS_AGAIN`].
-    /// Mac Pro's 2 GiB mix went silent after one stall line, a head waiting
-    /// on something in flight no line named.
+    /// A head unserved past [`super::plan::STALL_SAYS_AGAIN`], spinning or
+    /// quiet: what is in flight and whose slots hold the opened chunks are
+    /// said, once per head each such span. Mac Pro's 2 GiB mix went silent
+    /// after one stall line, a head waiting on something no line named.
     fn say_held_in_flight(&self) {
         let gives = self.port.room_gives();
         let held = self.with_inner(|inner| {
             let (key, pid, kind) = inner
                 .unmet_head()
                 .map(|(key, waiter)| (key, waiter.pid, waiter.kind_name()))?;
-            if inner.nothing_in_flight() {
-                return None;
-            }
+            // Once per head each STALL_SAYS_AGAIN, spinning or quiet: a
+            // head re-planned continuously never goes quiet, and its line
+            // was never said (Mac Pro on 22b0a3e83).
             let now = crate::rt::Instant::now();
             match inner.held_in_flight {
-                Some((at, seen, since, said)) if (at, seen) == (key, gives) => {
-                    if said || since.elapsed() < super::plan::STALL_SAYS_AGAIN {
+                Some((at, _, since, _)) if at == key => {
+                    if since.elapsed() < super::plan::STALL_SAYS_AGAIN {
                         return None;
                     }
-                    inner.held_in_flight = Some((key, gives, since, true));
+                    inner.held_in_flight = Some((key, gives, now, true));
                 }
                 _ => {
                     inner.held_in_flight = Some((key, gives, now, false));
@@ -501,17 +499,21 @@ impl ResidencyPlanner {
             ))
         });
         if let Some((pid, kind, firing, some_firing, moving, evicting, killing, parked_moving)) = held {
+            let quiet = self.with_inner(|inner| inner.nothing_in_flight());
+            let held_by = self.held_by_state();
             tracing::warn!(
                 %pid,
                 kind,
+                quiet,
+                %held_by,
                 firing,
                 ?some_firing,
                 ?moving,
                 ?evicting,
                 killing,
                 ?parked_moving,
-                "planner: the queue's head waits unserved on what is in flight, no room given \
-                 back since"
+                "planner: the queue's head stays unserved: what is in flight and whose slots \
+                 hold the opened chunks"
             );
         }
     }
@@ -709,7 +711,9 @@ impl ResidencyPlanner {
         let (need, suspended, kv_missing) = self.with_inner(|inner| {
             let waiter = inner.queue.get(&inner.locate(key)?)?;
             match &waiter.kind {
-                WaitKind::BindRoom { run, pieces, .. } => Some(((*run, *pieces), None, 0)),
+                WaitKind::BindRoom { run, pieces, .. } => {
+                    Some(((*run, *pieces), None, (0, RsUnits::default())))
+                }
                 WaitKind::Restore { .. } => {
                     let proc = inner.procs.get(&waiter.pid)?;
                     let need = proc.restore_need()?;
@@ -721,9 +725,10 @@ impl ResidencyPlanner {
                         .filter(|bind| !suspended && bind.run != need.0)
                         .map(|bind| (bind.run, bind.pieces));
                     // Its kv pages not yet gathered take chunks of the same
-                    // free pool as its runs.
+                    // free pool as its runs, and so does its state (records,
+                    // rs list slots) its serve takes before its unpark.
                     let kv_missing = waiter.kv_need().saturating_sub(inner.accum.len() as u32);
-                    Some((need, Some((waiter.pid, suspended, bind)), kv_missing))
+                    Some((need, Some((waiter.pid, suspended, bind)), (kv_missing, waiter.rs_need())))
                 }
                 WaitKind::Allocation { .. } => None,
             }
@@ -750,10 +755,17 @@ impl ResidencyPlanner {
         // the runs alone, fitting runs stood (Mac Pro: a restore of (3, 3)
         // and 41 kv pages, 8 runs open), the pages broke them as they were
         // gathered, and the unpark came up short.
+        // Its state the serve takes first (Mac Pro's 2 GiB on 3b45462d4: a
+        // restore's records opened chunks between the map's read and its
+        // unpark, which came up short of a run of four with no chunk free,
+        // the map showing its need standing, round after round) is asked
+        // the same way.
+        let (kv_missing, rs) = kv_missing;
+        let pages = kv_missing.saturating_add(self.port.rs_as_pages(rs));
         let per_chunk = self.port.chunks_as_pages(1);
-        if per_chunk > 0 && kv_missing > 0 {
+        if per_chunk > 0 && pages > 0 {
             let (run, _) = room.longest().unwrap_or(need);
-            room.add(run, kv_missing.div_ceil(per_chunk).div_ceil(run.max(1)));
+            room.add(run, pages.div_ceil(per_chunk).div_ceil(run.max(1)));
         }
         Some(room.within(self.port.state_chunks(), Some(need)))
     }

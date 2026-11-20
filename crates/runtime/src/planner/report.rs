@@ -163,6 +163,7 @@ impl ResidencyPlanner {
             proc.roles_free_short = None;
             proc.roles_short_gives = None;
             proc.roles_short_runs = None;
+            proc.roles_short_free = None;
             proc.roles_short_mismatch = None;
             // Back with room for it: the bind goes again.
             proc.bind_room = None;
@@ -280,6 +281,9 @@ impl ResidencyPlanner {
         // freed sent it again while the run of four it was refused never
         // stood (Mac Pro's mx-3).
         let refused_room = self.port.guest_free_runs(need.0);
+        // The free chunks a guest's take reads (within the state budget),
+        // as the refusal leaves them: what it goes again on too.
+        let free_chunks = self.port.free_chunks();
         // The map as the refusal leaves it: its epoch and its runs of the
         // need's length.
         let gives = self.port.room_gives();
@@ -296,7 +300,13 @@ impl ResidencyPlanner {
         // of eight). There it is a plain short head, going again once the
         // map has moved past its refusal.
         let max_runs = self.port.state_chunks() / run.max(1);
-        let understated = (refused_saw || map_shows) && stood < max_runs;
+        // Only a refusal that saw runs of its need standing understates the
+        // need. One the map shows runs for while the refusal saw none names
+        // a room the map does not read (the unpark's own takes, chunks its
+        // serve opened first): grown on it, the need ballooned a run a
+        // refusal ((7, 6) to (7, 22), Mac Pro's 2 GiB and mx-2 on
+        // 3b45462d4) with nothing issued.
+        let understated = refused_saw && stood < max_runs;
         let pieces = if understated { pieces.max(stood.saturating_add(1)) } else { pieces };
         let updated = super::proc::PendingBind {
             run,
@@ -315,15 +325,16 @@ impl ResidencyPlanner {
                 proc.roles_free_retry = None;
                 proc.roles_short_gives = Some(gives);
                 proc.roles_short_runs = Some((need.0, refused_room));
-                proc.roles_short_mismatch = None;
+                proc.roles_short_free = Some(free_chunks);
+                // Refused against runs the map shows: the census names the
+                // mismatch (a room the map does not read).
+                proc.roles_short_mismatch =
+                    (map_shows && !refused_saw).then_some((map_runs, refused_runs));
                 if understated {
                     // Goes again only once more runs of the updated need
                     // stand than its refusal saw.
                     proc.roles_free_short = Some((run, pieces));
                     proc.roles_free_short_at = stood;
-                    if map_shows && !refused_saw {
-                        proc.roles_short_mismatch = Some((map_runs, refused_runs));
-                    }
                 } else {
                     proc.roles_free_short = None;
                 }
