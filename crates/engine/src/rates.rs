@@ -1387,6 +1387,7 @@ mod tests {
             attn_tflops_by_rows_keys: None,
             tile_tflops_by_rows: Some(vec![(32, vec![(8, 1.0), (256, 9.0)])]),
             vector_tflops_by_rows: Some(vec![(4, vec![(1, 0.5), (256, 4.0)])]),
+            product_ns: None,
         }
     }
 
@@ -2223,6 +2224,7 @@ mod tests {
             attn_tflops_by_rows_keys: None,
             tile_tflops_by_rows: None,
             vector_tflops_by_rows: None,
+            product_ns: None,
         };
         assert_eq!(tuned(&rates), rates.toml());
         let (key, text) = provenance("vulkan", "the matmul through Coopmat");

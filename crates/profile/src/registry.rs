@@ -1141,6 +1141,10 @@ impl<'a> Walk<'a> {
                     rates.attn_tflops_by_keys = self.curve(v, key);
                     continue;
                 }
+                "product_ns" => {
+                    rates.product_ns = self.product_times(v);
+                    continue;
+                }
                 "elementwise_gbps" => &mut rates.elementwise_gbps,
                 "hbm_gbps" => &mut rates.hbm_gbps,
                 "cached_gbps" => &mut rates.cached_gbps,
@@ -1171,8 +1175,8 @@ impl<'a> Walk<'a> {
                             "`rates` holds `launch_ns`, `gemm_tflops_by_rows`, \
                              `attn_tflops_by_keys`, `hbm_gbps`, `cached_gbps`, `elementwise_gbps`, \
                              `scan_gelems`, `few_row_tflops`, `workgroups_per_core`, \
-                             `tile_tflops_by_rows`, `vector_tflops_by_rows`, `submit_worst_ratio` \
-                             and `attn_tflops_by_rows_keys`, not `{other}`"
+                             `tile_tflops_by_rows`, `vector_tflops_by_rows`, `product_ns`, \
+                             `submit_worst_ratio` and `attn_tflops_by_rows_keys`, not `{other}`"
                         ),
                     );
                     continue;
@@ -1191,6 +1195,48 @@ impl<'a> Walk<'a> {
             }
         }
         rates
+    }
+
+    /// `rates.product_ns`: a list of `[kind, rows, k, m, kernel, ns, spread]`,
+    /// whole numbers then a positive time and a spread at least zero, no
+    /// shape twice.
+    fn product_times(&mut self, value: &Spanned<DeValue<'_>>) -> Option<Vec<crate::fire::ProductTime>> {
+        let what = "`rates.product_ns` is a list of [kind, rows, k, m, kernel, ns, spread], each \
+                    shape once";
+        let DeValue::Array(entries) = value.get_ref() else {
+            self.err(value.span().start, format!("{what}, not {}", found(value.get_ref())));
+            return None;
+        };
+        let number = |v: &DeValue<'_>| match v {
+            DeValue::Float(f) => f.as_str().replace('_', "").parse::<f64>().ok(),
+            DeValue::Integer(_) => int(v).map(|i| i as f64),
+            _ => None,
+        };
+        let mut out: Vec<crate::fire::ProductTime> = Vec::with_capacity(entries.len());
+        for entry in entries.iter() {
+            let parsed = match entry.get_ref() {
+                DeValue::Array(f) if f.len() == 7 => {
+                    let whole = |i: usize| int(f[i].get_ref()).and_then(|v| u32::try_from(v).ok());
+                    match (whole(0), whole(1), whole(2), whole(3), whole(4), number(f[5].get_ref()), number(f[6].get_ref())) {
+                        (Some(kind), Some(rows), Some(k), Some(m), Some(kernel), Some(ns), Some(spread))
+                            if ns.is_finite() && ns > 0.0 && spread.is_finite() && spread >= 0.0 =>
+                        {
+                            Some(crate::fire::ProductTime { kind, rows, k, m, kernel, ns, spread })
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            match parsed {
+                Some(t) if out.iter().all(|o| o.key() != t.key()) => out.push(t),
+                _ => {
+                    self.err(entry.span().start, format!("{what}, not {}", found(entry.get_ref())));
+                    return None;
+                }
+            }
+        }
+        Some(out)
     }
 
     /// `rates.<key>` (`gemm_tflops_by_rows`, `tile_tflops_by_rows`,

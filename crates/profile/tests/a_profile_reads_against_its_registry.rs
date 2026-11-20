@@ -958,6 +958,7 @@ fn a_device_file_states_its_rates_and_a_layer_above_replaces_them() {
             attn_tflops_by_rows_keys: None,
             tile_tflops_by_rows: None,
             vector_tflops_by_rows: None,
+            product_ns: None,
         }
     );
 
@@ -1169,4 +1170,21 @@ fn a_stale_inline_table_takes_only_itself() {
     assert!(kept.contains("prefill.chunk = 2048"), "{kept}");
     assert!(kept.contains("[compiler]\nlaunch_us = 3.0"), "{kept}");
     assert!(!kept.contains("group_at") && !kept.contains("grouped"), "{kept}");
+}
+
+/// `[rates] product_ns` reads back as it was written, and a load's newly
+/// measured shapes join the saved ones, its own replacing a shape both state.
+#[test]
+fn product_times_read_back_and_accumulate() {
+    use profile::fire::{ProductTime, Rates};
+    let t = |kind, m, kernel, ns| ProductTime { kind, rows: 6144, k: 1024, m, kernel, ns, spread: 40.0 };
+    let saved = Rates { product_ns: Some(vec![t(3, 4, 0, 6600.0), t(3, 4, 1, 6100.0)]), ..Rates::default() };
+    let text = format!("api = 1\n{}", saved.toml());
+    let read = profile::Registry::new("t", &[], &[]).parse(&text, "p.toml", profile::Strict::User).unwrap();
+    assert_eq!(read.tuned.rates, saved, "{text}");
+    let measured = Rates { product_ns: Some(vec![t(3, 8, 0, 7000.0), t(3, 4, 1, 6000.0)]), ..Rates::default() };
+    let merged = measured.over(saved).product_ns.unwrap();
+    assert_eq!(merged, vec![t(3, 4, 0, 6600.0), t(3, 4, 1, 6000.0), t(3, 8, 0, 7000.0)]);
+    let twice = "api = 1\n[rates]\nproduct_ns = [[3, 6144, 1024, 4, 0, 1.0, 0.0], [3, 6144, 1024, 4, 0, 2.0, 0.0]]\n";
+    assert!(refusal(twice).contains("each shape once"));
 }

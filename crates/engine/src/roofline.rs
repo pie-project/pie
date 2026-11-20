@@ -552,6 +552,7 @@ mod tests {
             attn_tflops_by_rows_keys: None,
             tile_tflops_by_rows: None,
             vector_tflops_by_rows: None,
+            product_ns: None,
         };
         assert!(Constants::of(&all).is_ok());
         for (bad, key) in [

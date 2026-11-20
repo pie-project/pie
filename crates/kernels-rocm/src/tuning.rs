@@ -143,12 +143,6 @@ pub struct GemmTurnUntil(pub u32);
 #[decision(id = "kernel.gemm.turn_wide_until", constant(range(0..=32)), default = 16, tune = search)]
 pub struct GemmTurnWideUntil(pub u32);
 
-/// The fewest output columns (a bank's rows) the turned kernel takes: a
-/// narrower bank's tiles leave the card idle.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.gemm.turn_min_n", constant(range(0..=4_194_304)), default = 2048, tune = search)]
-pub struct GemmTurnMinN(pub u32);
-
 /// Routes an expert must average before bf16/f16 routed matmuls group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.moe.group_at", constant(range(1..=4096)), default = 4, tune = search)]
@@ -314,7 +308,6 @@ pub fn register(registry: &mut Registry) {
         .add::<GemmTurnFrom>()
         .add::<GemmTurnUntil>()
         .add::<GemmTurnWideUntil>()
-        .add::<GemmTurnMinN>()
         .add::<MoeGroupAt>()
         .add::<MoeMxfp4GroupedReuse>()
         .add::<MoeAffineGrouped>()
@@ -368,7 +361,6 @@ pub struct Tuning {
     pub gemm_turn_from: u32,
     pub gemm_turn_until: u32,
     pub gemm_turn_wide_until: u32,
-    pub gemm_turn_min_n: u32,
     pub moe_group_at: u32,
     pub mxfp4_grouped_reuse: u32,
     pub affine_grouped: bool,
@@ -533,11 +525,6 @@ impl Tuning {
     }
 
     #[must_use]
-    pub const fn gemm_turn_min_n(&self) -> u32 {
-        self.gemm_turn_min_n
-    }
-
-    #[must_use]
     pub const fn moe_group_at(&self) -> u32 {
         self.moe_group_at
     }
@@ -685,7 +672,6 @@ impl Tuning {
         gemm_turn_from: 0,
         gemm_turn_until: 16,
         gemm_turn_wide_until: 16,
-        gemm_turn_min_n: 2048,
         moe_group_at: 4,
         mxfp4_grouped_reuse: 2,
         affine_grouped: true,
@@ -742,7 +728,6 @@ impl Tuning {
             gemm_turn_from: profile.get::<GemmTurnFrom>().0,
             gemm_turn_until: profile.get::<GemmTurnUntil>().0,
             gemm_turn_wide_until: profile.get::<GemmTurnWideUntil>().0,
-            gemm_turn_min_n: profile.get::<GemmTurnMinN>().0,
             moe_group_at: profile.get::<MoeGroupAt>().0,
             mxfp4_grouped_reuse: profile.get::<MoeMxfp4GroupedReuse>().0,
             affine_grouped: profile.on::<MoeAffineGrouped>(&Anywhere),

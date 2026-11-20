@@ -122,9 +122,41 @@ pub struct Rates {
     /// workgroup carries, [(rows, TFLOP/s)])`, ascending in the rows a
     /// workgroup carries (the slang backends' vector kernels). Measured.
     pub vector_tflops_by_rows: Option<Vec<(u32, Vec<(u32, f64)>)>>,
+    /// Each decode product's time on each kernel that can serve it, measured
+    /// in place (a captured burst over the model's own layer weights, as a
+    /// step meets them), keyed by the product's shape: what a backend picks
+    /// between candidate kernels by, where a threshold would otherwise stand.
+    /// Entries accumulate load to load, a load measuring only the shapes the
+    /// table lacks. Not a roofline rate: no load requires it.
+    pub product_ns: Option<Vec<ProductTime>>,
 }
 
-/// Every key `[rates]` holds, in the order a profile writes them.
+/// One product's measured time on one kernel ([`Rates::product_ns`]): the
+/// product's kind, bank rows (`2n` for a packed `[gate | up]` bank), K and
+/// rows, the kernel (the backend's code), and the median ns of a launch with
+/// the spread of its repeats (max − min, ns), which bounds what a choice
+/// between two kernels may call a difference.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ProductTime {
+    pub kind: u32,
+    pub rows: u32,
+    pub k: u32,
+    pub m: u32,
+    pub kernel: u32,
+    pub ns: f64,
+    pub spread: f64,
+}
+
+impl ProductTime {
+    /// What the entry measures: everything but its time.
+    #[must_use]
+    pub const fn key(&self) -> (u32, u32, u32, u32, u32) {
+        (self.kind, self.rows, self.k, self.m, self.kernel)
+    }
+}
+
+/// Every roofline key `[rates]` holds, in the order a profile writes them
+/// ([`Rates::product_ns`] is not one: no load requires it).
 pub const KEYS: [&str; 11] = [
     "launch_ns",
     "gemm_tflops_by_rows",
@@ -168,6 +200,20 @@ impl Rates {
                 .or(below.attn_tflops_by_rows_keys),
             tile_tflops_by_rows: self.tile_tflops_by_rows.or(below.tile_tflops_by_rows),
             vector_tflops_by_rows: self.vector_tflops_by_rows.or(below.vector_tflops_by_rows),
+            // Entry by entry: a load's shapes join those already measured,
+            // its own replacing a shape both state.
+            product_ns: match (self.product_ns, below.product_ns) {
+                (Some(mine), Some(theirs)) => {
+                    let mut all: Vec<ProductTime> = theirs
+                        .into_iter()
+                        .filter(|t| mine.iter().all(|m| m.key() != t.key()))
+                        .collect();
+                    all.extend(mine);
+                    all.sort_by_key(ProductTime::key);
+                    Some(all)
+                }
+                (mine, theirs) => mine.or(theirs),
+            },
         }
     }
 
@@ -213,6 +259,7 @@ impl Rates {
                 .vector_tflops_by_rows
                 .clone()
                 .filter(|_| has("vector_tflops_by_rows")),
+            product_ns: self.product_ns.clone().filter(|_| has("product_ns")),
         }
     }
 
@@ -235,6 +282,7 @@ impl Rates {
             ATTN_BY_ROWS_KEYS => self.attn_tflops_by_rows_keys.is_none(),
             "tile_tflops_by_rows" => self.tile_tflops_by_rows.is_none(),
             "vector_tflops_by_rows" => self.vector_tflops_by_rows.is_none(),
+            "product_ns" => self.product_ns.is_none(),
             _ => true,
         };
         keys.iter().copied().filter(|key| unstated(key)).collect()
@@ -295,6 +343,18 @@ impl Rates {
             "vector_tflops_by_rows",
             &self.vector_tflops_by_rows,
         );
+        if let Some(times) = &self.product_ns {
+            let rows: Vec<String> = times
+                .iter()
+                .map(|t| {
+                    format!(
+                        "  [{}, {}, {}, {}, {}, {:?}, {:?}],\n",
+                        t.kind, t.rows, t.k, t.m, t.kernel, t.ns, t.spread
+                    )
+                })
+                .collect();
+            let _ = writeln!(out, "product_ns = [\n{}]", rows.concat());
+        }
         keyed(&mut out, ATTN_BY_ROWS_KEYS, &self.attn_tflops_by_rows_keys);
         out
     }
@@ -454,6 +514,7 @@ mod tests {
             attn_tflops_by_rows_keys: None,
             tile_tflops_by_rows: Some(vec![(32, vec![(8, 1.0), (256, 9.5)])]),
             vector_tflops_by_rows: Some(vec![(4, vec![(1, 0.5)])]),
+            product_ns: None,
         };
         assert!(rates.complete(&KEYS));
         assert_eq!(

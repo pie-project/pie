@@ -961,6 +961,7 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         few_row_tflops: None,
         tile_tflops_by_rows: (!tile_curves.is_empty()).then_some(tile_curves),
         vector_tflops_by_rows: (!vector_curves.is_empty()).then_some(vector_curves),
+        product_ns: None,
         workgroups_per_core: None,
         // How much slower the device ran than its own measurements said:
         // like frames' drift, the clock's swing and its sustained drop
@@ -1588,6 +1589,7 @@ mod wanted_tests {
             vector_tflops_by_rows: Some(vec![(4, vec![(1, 0.5)])]),
             submit_worst_ratio: None,
             attn_tflops_by_rows_keys: None,
+            product_ns: None,
         };
         let none = Wanted {
             launch: false,
