@@ -1280,46 +1280,45 @@ impl<B: Serve> Shell<B> {
         // rows, then the top): the vector or the tiled kernels, whichever the
         // estimate weighs faster, one a rung where fires are recorded a rung
         // (`crate::dense`), else at each fire's rows.
-        let dense = {
-            let top = budgets.tokens.max_tokens.max(1);
+        let counts_of_rates = counts.as_ref().ok_or_else(|| {
+            Fault::Residency(format!(
+                "the profile states no `[rates]` {:?}, which the dense matmul's kernel at each \
+                 rung is chosen by",
+                device_profile.rates().missing(&crate::rates::KEYS)
+            ))
+        })?;
+        let dense_planes = crate::dense::planes(
+            counts_of_rates,
+            Some(&crate::dense::multiplied(&boot.trace)),
+        );
+        // The rungs to `chunk`, the most rows a fire takes and the rows the
+        // chunker cuts a prompt by (every full chunk lands at its rung's top,
+        // which is picked there, `crate::dense::choose`).
+        let choose_dense = |chunk: u32| {
+            let top = chunk.max(1);
             let mut rungs = engine::memory::rungs(1, top);
             if rungs.last() != Some(&top) {
                 rungs.push(top);
             }
-            let counts = counts.as_ref().ok_or_else(|| {
-                Fault::Residency(format!(
-                    "the profile states no `[rates]` {:?}, which the dense matmul's kernel at \
-                     each rung is chosen by",
-                    device_profile.rates().missing(&crate::rates::KEYS)
-                ))
-            })?;
-            let (dense, weighed) = crate::dense::choose(
+            crate::dense::choose(
                 B::TARGET,
                 &rungs,
                 |rows| tuning.gemm(tier, rows),
                 &device_profile.rates(),
-                &crate::dense::planes(counts, Some(&crate::dense::multiplied(&boot.trace))),
+                &dense_planes,
                 B::RECORDS,
+                Some(top),
             )
             .map_err(|key| {
                 Fault::Residency(format!(
                     "the profile states no `[rates] {key}`, which the dense matmul's kernel at \
                      each rung is chosen by"
                 ))
-            })?;
-            // Said once, by the load that serves: its naming walk weighs the same.
-            if !B::NAMES {
-                tracing::info!("dense matmul by rows: {}", dense.runs());
-                for w in &weighed {
-                    if B::RECORDS {
-                        tracing::info!("dense matmul {w}");
-                    } else {
-                        tracing::info!("dense matmul {w}; eager, each fire at its own rows");
-                    }
-                }
-            }
-            std::sync::Arc::new(dense)
+            })
         };
+        let asked_chunk = budgets.tokens.max_tokens.max(1);
+        let (dense, mut weighed_dense) = choose_dense(asked_chunk)?;
+        let mut dense = std::sync::Arc::new(dense);
         let row_tile: engine::roofline::RowTile = {
             let dense = std::sync::Arc::clone(&dense);
             std::sync::Arc::new(move |m, n, k| {
@@ -1695,6 +1694,24 @@ impl<B: Serve> Shell<B> {
                 }
             }
         };
+        // A chunk the binding bounded below the one asked lands at its own
+        // rung's top: the dense kernel chosen again for it.
+        if budgets.tokens.max_tokens.max(1) != asked_chunk {
+            let (again, weighed_again) = choose_dense(budgets.tokens.max_tokens)?;
+            dense = std::sync::Arc::new(again);
+            weighed_dense = weighed_again;
+        }
+        // Said once, by the load that serves: its naming walk weighs the same.
+        if !B::NAMES {
+            tracing::info!("dense matmul by rows: {}", dense.runs());
+            for w in &weighed_dense {
+                if B::RECORDS {
+                    tracing::info!("dense matmul {w}");
+                } else {
+                    tracing::info!("dense matmul {w}; eager, each fire at its own rows");
+                }
+            }
+        }
         // The widest rung a check's load laid: its top once bounded.
         if let Some(weighed) = weighed.as_mut() {
             weighed.laid = budgets.tokens.max_tokens;

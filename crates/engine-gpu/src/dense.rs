@@ -264,7 +264,9 @@ pub fn planes(counts: &Counts, multiplied: Option<&[(u32, u32)]>) -> Vec<(u32, u
 
 /// The dense tactic over `rungs` (ascending rows) on `target`, the model's
 /// dense planes (`planes`, [`planes`]: each a dispatch reading its plane)
-/// weighed over `rates`; `tiled` is the
+/// weighed over `rates`; `full` the rows the chunker cuts a prompt by, whose
+/// rung (where every full chunk lands, at its top) is picked at its top rows
+/// alone; `tiled` is the
 /// backend's tiled tactic at some rows. One a rung where the backend
 /// `records` its fires, else one a row count to the top rung. Each rung's
 /// weighing beside it; the `[rates]` key it lacks where the profile states
@@ -276,8 +278,9 @@ pub fn choose(
     rates: &profile::fire::Rates,
     planes: &[(u32, u32, u32, f64)],
     records: bool,
+    full: Option<u32>,
 ) -> Result<(Dense, Vec<Weighed>), &'static str> {
-    let (by_rows, weighed) = pick(target, rungs, &tiled, rates, planes, records)?;
+    let (by_rows, weighed) = pick(target, rungs, &tiled, rates, planes, records, full)?;
     // Each plane its own pick, by its own curves (a kernel beaten at one
     // plane, an output head's, may win another): a plane no kernel was timed
     // at takes the pick over every plane together.
@@ -286,7 +289,7 @@ pub fn choose(
         if own.iter().any(|(at, _)| *at == (n, k)) {
             continue;
         }
-        if let Ok((by_rows, _)) = pick(target, rungs, &tiled, rates, &[*plane], records) {
+        if let Ok((by_rows, _)) = pick(target, rungs, &tiled, rates, &[*plane], records, full) {
             own.push(((n, k), by_rows));
         }
     }
@@ -308,6 +311,7 @@ fn pick(
     rates: &profile::fire::Rates,
     planes: &[(u32, u32, u32, f64)],
     records: bool,
+    full: Option<u32>,
 ) -> Result<(Vec<(u32, Tactic)>, Vec<Weighed>), &'static str> {
     let c = Constants::of(rates)?;
     let curves = rates.kernel_tflops_by_shape.as_deref().ok_or(UNREACHED)?;
@@ -366,7 +370,13 @@ fn pick(
     let mut weighed = Vec::with_capacity(rungs.len());
     let mut below = 0;
     for &rung in rungs {
-        let bottom = (below + 1).min(rung);
+        // The rung full prompt chunks land on is picked at its top rows,
+        // where they land; every other rung over the rows it serves.
+        let bottom = if full == Some(rung) {
+            rung
+        } else {
+            (below + 1).min(rung)
+        };
         let among = candidates(rung);
         // The candidates timed over the rung's rows, bottom to top.
         let costs: Vec<(Tactic, f64, f64)> = among
@@ -535,6 +545,7 @@ mod tests {
             &r,
             &planes(&counts(), None),
             true,
+            None,
         )
         .unwrap();
         let vector: Vec<bool> = weighed.iter().map(Weighed::vector).collect();
@@ -579,6 +590,7 @@ mod tests {
             &r,
             &planes(&counts(), None),
             true,
+            None,
         )
         .unwrap();
         assert!(
@@ -601,6 +613,7 @@ mod tests {
             &none,
             &planes(&counts(), None),
             true,
+            None,
         );
         assert_eq!(refused.unwrap_err(), "kernel_tflops_by_shape");
         let mut elsewhere = rates(Some(5.0), coopmat_tiles());
@@ -614,6 +627,7 @@ mod tests {
             &elsewhere,
             &planes(&counts(), None),
             true,
+            None,
         );
         assert_eq!(refused.unwrap_err(), UNREACHED);
         let (dense, _) = choose(
@@ -623,6 +637,7 @@ mod tests {
             &rates(None, coopmat_tiles()),
             &planes(&counts(), None),
             true,
+            None,
         )
         .unwrap();
         assert_eq!(dense.at(1, 4096, 4096).vector, 0);
@@ -674,8 +689,16 @@ mod tests {
             kernel_tflops_by_shape: Some(curves),
             ..rates(None, Vec::new())
         };
-        let (dense, weighed) =
-            choose(Target::Wgsl, &[512], tiled, &r, &planes(&model, None), true).unwrap();
+        let (dense, weighed) = choose(
+            Target::Wgsl,
+            &[512],
+            tiled,
+            &r,
+            &planes(&model, None),
+            true,
+            None,
+        )
+        .unwrap();
         let at = dense.at(512, 1024, 3072);
         assert!(at.vector == 0 && !at.wide, "{}", weighed[0]);
     }
@@ -692,6 +715,7 @@ mod tests {
             &r,
             &planes(&counts(), None),
             false,
+            None,
         )
         .unwrap();
         for rows in [1, 3, 5, 17, 100, 129, 200, 256, 300, 2048] {
@@ -702,6 +726,7 @@ mod tests {
                 &r,
                 &planes(&counts(), None),
                 true,
+                None,
             )
             .unwrap();
             let fastest = w[0]
@@ -731,8 +756,16 @@ mod tests {
                     vector: 0,
                     wide: true,
                 };
-                let (_, weighed) =
-                    choose(target, &rungs, tiled, &flat, &planes(&counts(), None), true).unwrap();
+                let (_, weighed) = choose(
+                    target,
+                    &rungs,
+                    tiled,
+                    &flat,
+                    &planes(&counts(), None),
+                    true,
+                    None,
+                )
+                .unwrap();
                 for pair in weighed.windows(2) {
                     for (a, b) in pair[0].costs.iter().zip(&pair[1].costs) {
                         assert!(b.2 >= a.2, "{target:?} {tier:?}: {pair:?}");
@@ -762,6 +795,7 @@ mod tests {
             &r,
             &planes(&counts(), None),
             false,
+            None,
         )
         .unwrap();
         assert_eq!(eager.at(3, 4096, 4096).vector, 1);
@@ -832,8 +866,16 @@ mod tests {
             kernel_tflops_by_shape: Some(curves.clone()),
             ..rates(None, Vec::new())
         };
-        let (dense, weighed) =
-            choose(Target::Wgsl, &[128], tiled, &r, &planes(&model, None), true).unwrap();
+        let (dense, weighed) = choose(
+            Target::Wgsl,
+            &[128],
+            tiled,
+            &r,
+            &planes(&model, None),
+            true,
+            None,
+        )
+        .unwrap();
         // At one rung the layers' planes take the vector kernel and the head,
         // where it was beaten, the tile.
         assert_eq!(dense.at(128, 1024, 1024).vector, 16, "{}", dense.runs());
@@ -845,10 +887,86 @@ mod tests {
             kernel_tflops_by_shape: Some(curves),
             ..rates(None, Vec::new())
         };
-        let (dense, weighed) =
-            choose(Target::Wgsl, &[128], tiled, &r, &planes(&model, None), true).unwrap();
+        let (dense, weighed) = choose(
+            Target::Wgsl,
+            &[128],
+            tiled,
+            &r,
+            &planes(&model, None),
+            true,
+            None,
+        )
+        .unwrap();
         assert_eq!(dense.at(128, 1024, 1024).vector, 16, "{}", weighed[0]);
         assert_eq!(dense.at(128, 8192, 1024).vector, 0, "{}", weighed[0]);
+    }
+
+    /// The rung full prompt chunks land on is picked at its top rows: on the
+    /// L40S's native curves at the o_proj plane, gemv x16 is least regret
+    /// over (512, 1024] (it wins at 513 rows) but coopmat wins at 1024, where
+    /// every full chunk of 1024 rows lands.
+    #[test]
+    fn the_full_chunk_rung_is_picked_at_its_top_rows() {
+        let (n, k) = (1024, 2048);
+        let tile = crate::rates::curve_key(Target::Spirv, coopmat(0), n, k).1;
+        let curve = |kind, key, points: Vec<(u32, f64)>| profile::fire::KernelCurve {
+            kind,
+            key,
+            n,
+            k,
+            curve: points,
+            stop: None,
+        };
+        let r = profile::fire::Rates {
+            kernel_tflops_by_shape: Some(vec![
+                curve(
+                    profile::fire::KernelCurve::TILE,
+                    tile,
+                    vec![(1, 0.02), (256, 3.8), (1024, 15.4)],
+                ),
+                curve(
+                    profile::fire::KernelCurve::VECTOR,
+                    16,
+                    vec![(1, 0.6), (256, 11.2), (1024, 12.6)],
+                ),
+            ]),
+            ..rates(None, Vec::new())
+        };
+        let shape = engine::load::GemmShape {
+            planes: 28,
+            ..engine::load::GemmShape::dense(n, k, 2 * u64::from(n * k), 2 * u64::from(n * k))
+        };
+        let model = Counts {
+            gemm_shapes: vec![shape],
+            ..counts()
+        };
+        let rungs = [512, 1024];
+        let spread = choose(
+            Target::Spirv,
+            &rungs,
+            coopmat,
+            &r,
+            &planes(&model, None),
+            true,
+            None,
+        )
+        .unwrap()
+        .0;
+        assert_eq!(spread.at(1024, n, k).vector, 16, "{}", spread.runs());
+        let full = choose(
+            Target::Spirv,
+            &rungs,
+            coopmat,
+            &r,
+            &planes(&model, None),
+            true,
+            Some(1024),
+        )
+        .unwrap()
+        .0;
+        assert_eq!(full.at(1024, n, k).vector, 0, "{}", full.runs());
+        // Only that rung: the one below still weighs the rows it serves.
+        assert_eq!(full.at(512, n, k), spread.at(512, n, k));
     }
 
     /// Below the first row count a kernel was timed at it takes that count's
@@ -873,6 +991,7 @@ mod tests {
             &r,
             &planes(&counts(), None),
             true,
+            None,
         )
         .unwrap();
         let (_, four) = choose(
@@ -882,6 +1001,7 @@ mod tests {
             &r,
             &planes(&counts(), None),
             true,
+            None,
         )
         .unwrap();
         let tiled = |w: &[Weighed]| w[0].costs.iter().find(|c| c.0.vector == 0).unwrap().2;
@@ -914,6 +1034,7 @@ mod tests {
             &r,
             &planes(&counts(), None),
             true,
+            None,
         )
         .unwrap();
         assert!(!dense.at(256, 4096, 4096).wide, "{weighed:?}");
@@ -930,6 +1051,7 @@ mod tests {
             &r,
             &planes(&counts(), None),
             true,
+            None,
         )
         .unwrap();
         assert_eq!(dense.at(8192, 4096, 4096), dense.at(4096, 4096, 4096));
@@ -945,6 +1067,7 @@ mod tests {
             &r,
             &planes(&counts(), None),
             true,
+            None,
         );
         assert_eq!(refused.unwrap_err(), UNREACHED);
     }
