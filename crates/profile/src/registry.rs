@@ -1292,7 +1292,8 @@ impl<'a> Walk<'a> {
         value: &Spanned<DeValue<'_>>,
     ) -> Option<Vec<crate::fire::KernelCurve>> {
         let what = "`rates.kernel_tflops_by_shape` is a list of [kind, key, n, k, stopped at \
-                    rows, why, [[rows, TFLOP/s], ...]], no kernel and shape twice";
+                    rows, why, [[rows, TFLOP/s], ...], optionally [[rows, spread], ...]], no \
+                    kernel and shape twice";
         let DeValue::Array(entries) = value.get_ref() else {
             self.err(
                 value.span().start,
@@ -1303,20 +1304,28 @@ impl<'a> Walk<'a> {
         let mut out: Vec<crate::fire::KernelCurve> = Vec::with_capacity(entries.len());
         for entry in entries.iter() {
             let fields = match entry.get_ref() {
-                DeValue::Array(f) if f.len() == 7 => {
+                DeValue::Array(f) if f.len() == 7 || f.len() == 8 => {
                     let whole = |i: usize| int(f[i].get_ref()).and_then(|v| u32::try_from(v).ok());
                     match (whole(0), whole(1), whole(2), whole(3), whole(4), whole(5)) {
                         (Some(kind), Some(key), Some(n), Some(k), Some(at), Some(why))
                             if n > 0 && k > 0 && (at == 0) == (why == 0) =>
                         {
-                            Some((kind, key, n, k, (at > 0).then_some((at, why)), &f[6]))
+                            Some((
+                                kind,
+                                key,
+                                n,
+                                k,
+                                (at > 0).then_some((at, why)),
+                                &f[6],
+                                f.get(7),
+                            ))
                         }
                         _ => None,
                     }
                 }
                 _ => None,
             };
-            let Some((kind, key, n, k, stop, points)) = fields
+            let Some((kind, key, n, k, stop, points, spread)) = fields
                 .filter(|&(kind, key, n, k, ..)| out.iter().all(|c| c.id() != (kind, key, n, k)))
             else {
                 self.err(
@@ -1332,6 +1341,46 @@ impl<'a> Walk<'a> {
             } else {
                 self.curve(points, "kernel_tflops_by_shape")?
             };
+            // The points' spreads, `[rows, fraction at least zero]` each.
+            let spread = match spread.map(|s| s.get_ref()) {
+                None => Vec::new(),
+                Some(DeValue::Array(items)) => {
+                    let mut out = Vec::with_capacity(items.len());
+                    for item in items.iter() {
+                        let pair = match item.get_ref() {
+                            DeValue::Array(p) if p.len() == 2 => {
+                                let x = int(p[0].get_ref()).and_then(|v| u32::try_from(v).ok());
+                                let f = match p[1].get_ref() {
+                                    DeValue::Float(f) => f.as_str().replace('_', "").parse().ok(),
+                                    DeValue::Integer(_) => int(p[1].get_ref()).map(|i| i as f64),
+                                    _ => None,
+                                }
+                                .filter(|f: &f64| f.is_finite() && *f >= 0.0);
+                                x.zip(f)
+                            }
+                            _ => None,
+                        };
+                        match pair {
+                            Some(pair) => out.push(pair),
+                            None => {
+                                self.err(
+                                    item.span().start,
+                                    format!("{what}: a spread is [rows, fraction at least zero]"),
+                                );
+                                return None;
+                            }
+                        }
+                    }
+                    out
+                }
+                Some(_) => {
+                    self.err(
+                        entry.span().start,
+                        format!("{what}: the spreads are a list"),
+                    );
+                    return None;
+                }
+            };
             out.push(crate::fire::KernelCurve {
                 kind,
                 key,
@@ -1339,6 +1388,7 @@ impl<'a> Walk<'a> {
                 k,
                 curve,
                 stop,
+                spread,
             });
         }
         Some(out)

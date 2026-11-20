@@ -145,6 +145,10 @@ pub struct KernelCurve {
     pub k: u32,
     pub curve: Vec<(u32, f64)>,
     pub stop: Option<(u32, u32)>,
+    /// Each point's spread over its repeats, `(max - min) / median`, by
+    /// rows as `curve`: what a choice between two kernels may call a
+    /// difference (none stated: no spread measured).
+    pub spread: Vec<(u32, f64)>,
 }
 
 impl KernelCurve {
@@ -403,8 +407,18 @@ impl Rates {
                         .map(|(x, r)| format!("[{x}, {r:?}]"))
                         .collect();
                     let (at, why) = c.stop.unwrap_or((0, 0));
+                    let spread = if c.spread.is_empty() {
+                        String::new()
+                    } else {
+                        let s: Vec<String> = c
+                            .spread
+                            .iter()
+                            .map(|(x, f)| format!("[{x}, {f:?}]"))
+                            .collect();
+                        format!(", [{}]", s.join(", "))
+                    };
                     format!(
-                        "  [{}, {}, {}, {}, {at}, {why}, [{}]],\n",
+                        "  [{}, {}, {}, {}, {at}, {why}, [{}]{spread}],\n",
                         c.kind,
                         c.key,
                         c.n,
@@ -579,6 +593,7 @@ mod tests {
                 k: 2048,
                 curve: vec![(1, 0.5)],
                 stop: Some((512, KernelCurve::BOUND)),
+                spread: Vec::new(),
             }]),
         };
         assert!(rates.complete(&KEYS));
@@ -609,13 +624,19 @@ mod tests {
             .unwrap();
         assert_eq!(file.tuned.rates.launch_ns, Some(904));
         assert_eq!(file.tuned.rates.hbm_gbps, Some(650.0));
-        assert_eq!(file.ignored_rates, ["vector_tflops_by_rows", "kernel_stops"]);
+        assert_eq!(
+            file.ignored_rates,
+            ["vector_tflops_by_rows", "kernel_stops"]
+        );
         let read = registry.load_user(text, "user").unwrap().rates();
         assert_eq!(read.launch_ns, Some(904));
         let refused = registry
             .parse(text, "checked in", crate::registry::Strict::CheckedIn)
             .unwrap_err();
-        assert_eq!(refused.stale_rates, ["vector_tflops_by_rows", "kernel_stops"]);
+        assert_eq!(
+            refused.stale_rates,
+            ["vector_tflops_by_rows", "kernel_stops"]
+        );
         // A save drops them.
         let (kept, dropped) = registry.prune(text);
         assert!(!kept.contains("vector_tflops_by_rows"), "{kept}");

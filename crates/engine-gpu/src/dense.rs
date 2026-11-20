@@ -352,6 +352,26 @@ fn pick(
     // there (every weight pass it makes and whatever a cache spares it in the
     // time) and a launch. `None` where its curve at one of them does not
     // reach the rows, or no plane was timed to them.
+    // `tactic`'s measured spread at an `n x k` plane at `rows` (its points'
+    // repeats, `(max - min) / median`, between its points in log rows): 0
+    // where none was measured.
+    let spread_at = |tactic: Tactic, n: u32, k: u32, rows: u32| -> f64 {
+        let (kind, key) = crate::rates::curve_key(target, tactic, n, k);
+        curves
+            .iter()
+            .find(|c| c.id() == (kind, key, n, k))
+            .and_then(|c| profile::fire::interpolate(&c.spread, f64::from(rows)))
+            .unwrap_or(0.0)
+    };
+    // `tactic`'s spread at `rows` over every plane some candidate of
+    // `among` was timed at to the rows: the widest of them.
+    let noise = |among: &[Tactic], tactic: Tactic, rows: u32| -> f64 {
+        planes
+            .iter()
+            .filter(|&&(n, k, ..)| among.iter().any(|&t| time_at(t, n, k, rows).is_some()))
+            .map(|&(n, k, ..)| spread_at(tactic, n, k, rows))
+            .fold(0.0, f64::max)
+    };
     let cost = |among: &[Tactic], tactic: Tactic, rows: u32| -> Option<f64> {
         let mut ns = 0.0;
         let mut weighed = false;
@@ -399,20 +419,58 @@ fn pick(
             continue;
         }
         let rows_of = |t: &Tactic| rows_a_workgroup(target, t);
-        let taken = Weighed::least_regret(&costs, &rows_of);
+        let mut taken = Weighed::least_regret(&costs, &rows_of);
+        // The profile path's own tactic keeps the rung unless the pick beats
+        // it by more than the two kernels' measured spread there: a gap
+        // narrower than their repeats spread over is no difference.
+        let path = tiled(rung);
+        if let Some(kept) = costs.iter().position(|c| c.0 == path) {
+            let best = |of: fn(&(Tactic, f64, f64)) -> f64| {
+                costs
+                    .iter()
+                    .map(of)
+                    .fold(f64::INFINITY, f64::min)
+                    .max(f64::MIN_POSITIVE)
+            };
+            let (low, high) = (best(|c| c.1), best(|c| c.2));
+            let regret = |c: &(Tactic, f64, f64)| (c.1 / low).max(c.2 / high);
+            let spread = |t: Tactic| noise(&among, t, bottom).max(noise(&among, t, rung));
+            let gap = regret(&costs[kept]) - regret(&costs[taken]);
+            if taken != kept && gap <= spread(costs[taken].0) + spread(path) {
+                taken = kept;
+            }
+        }
         if records {
             by_rows.push((rung, costs[taken].0));
         } else {
             for rows in bottom..=rung {
                 let among = candidates(rows);
-                let fastest = among
+                let priced: Vec<(Tactic, f64)> = among
                     .iter()
                     .filter_map(|&t| Some((t, cost(&among, t, rows)?)))
-                    .min_by(|a, b| a.1.total_cmp(&b.1).then(rows_of(&a.0).cmp(&rows_of(&b.0))))
-                    .map(|(t, _)| t)
+                    .collect();
+                let fastest = priced
+                    .iter()
+                    .copied()
+                    .min_by(|a, b| a.1.total_cmp(&b.1).then(rows_of(&a.0).cmp(&rows_of(&b.0))));
+                let path = tiled(rows);
+                // The path's tactic unless the fastest beats it by more than
+                // their spreads at these rows.
+                let pick = match (fastest, priced.iter().find(|p| p.0 == path)) {
+                    (Some((t, ns)), Some(&(_, path_ns))) => {
+                        let spread = noise(&among, t, rows) + noise(&among, path, rows);
+                        if (path_ns - ns) / path_ns.max(f64::MIN_POSITIVE) > spread {
+                            Some(t)
+                        } else {
+                            Some(path)
+                        }
+                    }
+                    (fastest, _) => fastest.map(|(t, _)| t),
+                };
+                let pick = pick
                     .or_else(|| by_rows.last().map(|&(_, t)| t))
                     .unwrap_or_else(|| tiled(rows));
-                by_rows.push((rows, fastest));
+                by_rows.push((rows, pick));
             }
         }
         weighed.push(Weighed {
@@ -465,6 +523,7 @@ mod tests {
             k: 4096,
             curve,
             stop: None,
+            spread: Vec::new(),
         }
     }
 
@@ -676,6 +735,7 @@ mod tests {
             k,
             curve: vec![(1, rate / 100.0), (512, rate)],
             stop: None,
+            spread: Vec::new(),
         };
         let tile =
             |wide, n, k| crate::rates::curve_key(Target::Wgsl, Tactic { wide, ..tiled(0) }, n, k).1;
@@ -833,6 +893,7 @@ mod tests {
             k,
             curve: points,
             stop,
+            spread: Vec::new(),
         };
         let tile = |n, k| crate::rates::curve_key(Target::Wgsl, tiled(0), n, k).1;
         let (v, t) = (
@@ -922,6 +983,7 @@ mod tests {
             k,
             curve: points,
             stop: None,
+            spread: Vec::new(),
         };
         let r = profile::fire::Rates {
             kernel_tflops_by_shape: Some(vec![
@@ -973,6 +1035,64 @@ mod tests {
         assert_eq!(full.at(1024, n, k).vector, 0, "{:?}", full.runs());
         // Only that rung: the one below still weighs the rows it serves.
         assert_eq!(full.at(512, n, k), spread.at(512, n, k));
+    }
+
+    /// The profile path's tactic keeps a rung unless the pick beats it by
+    /// more than their measured spread: a wide tile 5% faster than the
+    /// path's narrow one replaces it at a 1% spread, not at 10%.
+    #[test]
+    fn a_pick_replaces_the_paths_tactic_only_past_their_spread() {
+        let narrow = |_| Tactic {
+            tier: Tier::Subgroup,
+            vector: 0,
+            wide: false,
+        };
+        let (n, k) = (1024, 1024);
+        let key =
+            |wide| crate::rates::curve_key(Target::Wgsl, Tactic { wide, ..narrow(0) }, n, k).1;
+        let with = |spread: f64| {
+            let curve = |wide, rate: f64| profile::fire::KernelCurve {
+                kind: profile::fire::KernelCurve::TILE,
+                key: key(wide),
+                n,
+                k,
+                curve: vec![(1, rate / 100.0), (256, rate)],
+                stop: None,
+                spread: vec![(1, spread), (256, spread)],
+            };
+            profile::fire::Rates {
+                kernel_tflops_by_shape: Some(vec![curve(false, 10.0), curve(true, 10.5)]),
+                ..rates(None, Vec::new())
+            }
+        };
+        let shape = engine::load::GemmShape {
+            planes: 28,
+            ..engine::load::GemmShape::dense(n, k, 2 * u64::from(n * k), 2 * u64::from(n * k))
+        };
+        let model = Counts {
+            gemm_shapes: vec![shape],
+            ..counts()
+        };
+        let planes = planes(&model, None);
+        for records in [true, false] {
+            let wide = |spread| {
+                choose(
+                    Target::Wgsl,
+                    &[256],
+                    narrow,
+                    &with(spread),
+                    &planes,
+                    records,
+                    None,
+                )
+                .unwrap()
+                .0
+                .at(256, n, k)
+                .wide
+            };
+            assert!(wide(0.01), "records {records}");
+            assert!(!wide(0.10), "records {records}");
+        }
     }
 
     /// Below the first row count a kernel was timed at it takes that count's
