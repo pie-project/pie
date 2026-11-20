@@ -88,7 +88,7 @@ impl Raw {
                 label: Some("pie clear"),
             });
         encoder.clear_buffer(&buffer, 0, None);
-        core.queue.submit(std::iter::once(encoder.finish()));
+        core.submit(encoder.finish());
         core.take_error("clear_buffer")?;
         Ok(Arc::new(Raw {
             core: Arc::clone(core),
@@ -203,7 +203,7 @@ impl Raw {
                 label: Some("pie read"),
             });
         encoder.copy_buffer_to_buffer(&self.buffer, start, &staging, 0, Some(span));
-        core.queue.submit(std::iter::once(encoder.finish()));
+        core.submit(encoder.finish());
         let mapped = staging.clone();
         let core = Arc::clone(core);
         staging
@@ -239,7 +239,7 @@ impl Raw {
                 label: Some("pie zero"),
             });
         encoder.clear_buffer(&self.buffer, start, Some(end - start));
-        core.queue.submit(std::iter::once(encoder.finish()));
+        core.submit(encoder.finish());
         core.take_error("clear_buffer")
     }
 }

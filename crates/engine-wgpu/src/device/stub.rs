@@ -142,6 +142,11 @@ impl Context {
         match self.never {}
     }
 
+    #[must_use]
+    pub fn idle(&self) -> bool {
+        match self.never {}
+    }
+
     pub fn bind_frame(&self) -> Result<Frame> {
         match self.never {}
     }

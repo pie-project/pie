@@ -3653,10 +3653,10 @@ impl<B: Serve> Shell<B> {
     }
 
     /// Under a stated submit bound, re-times the device's clock where frame
-    /// `frame` follows an idle device: where nothing the load submitted is
-    /// still in flight as its first step goes out (every step in flight
-    /// reaped as landed, read without waiting, and no grafted copy
-    /// pending), the probe is fired alone and timed, and its time over its
+    /// `frame` follows an idle device: where the device's queue is empty as
+    /// its first step goes out (every submission made on it so far landed,
+    /// a forward's, a sampler's, a guest pass's or a copy's alike, read
+    /// without waiting: `backend::Context::idle`), the probe is fired alone and timed, and its time over its
     /// curve time is the scale every step's estimate is read at from here
     /// ([`crate::submit::SubmitBound::scale`]). A frame queued behind work
     /// still running follows no idle and keeps the scale. Nothing is done
@@ -3665,13 +3665,7 @@ impl<B: Serve> Shell<B> {
         if self.probe.is_none() {
             return Ok(());
         }
-        B::reap(self)?;
-        let idle = self.inflight.is_empty()
-            && self
-                .grafted
-                .as_ref()
-                .is_none_or(crate::backend::Pending::landed);
-        if !idle {
+        if !crate::backend::Context::idle(&self.device) {
             return Ok(());
         }
         let (Some((probe, clock)), Some(held)) = (self.probe.as_mut(), self.submit_bound.as_mut())

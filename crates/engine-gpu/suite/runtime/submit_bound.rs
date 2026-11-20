@@ -61,6 +61,11 @@ fn loads(retime: bool) -> Option<(f64, Vec<Submitted>)> {
     let mut probe = Probe::<Api>::new(&gpu.device, tactic).expect("the probe lays");
     // The probe first: the one fire before anything is measured.
     let first = probe.fire(&gpu.device).expect("the probe fires");
+    // Waited for, the probe leaves the queue empty: the device reads idle.
+    assert!(
+        engine_gpu::backend::Context::idle(&gpu.device),
+        "the device is idle once every submission landed"
+    );
     let mut clock = Clock::new(first);
     let (m, n, k) = PROBE;
     let probed = Fired {

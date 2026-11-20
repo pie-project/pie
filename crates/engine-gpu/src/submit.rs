@@ -44,10 +44,12 @@
 //! smallest shape on the matmul curve ([`PROBE`]) fired alone and timed on
 //! the device, its time over its curve time the scale every estimate is
 //! read at ([`SubmitBound::scale`]) until a later probe. The device is
-//! idle where nothing the load submitted is still in flight when the
-//! frame's first step goes out (every step in flight landed, read without
-//! waiting: `Shell::retime`); a frame queued behind one still running
-//! follows no idle and keeps the scale.
+//! idle where its queue is empty when the frame's first step goes out
+//! (every submission made on it landed, read without waiting:
+//! `backend::Context::idle`, `Shell::retime`); a frame queued behind work
+//! still running follows no idle and keeps the scale. The probe is
+//! recorded at load where the backend keeps recordings, and counted apart
+//! from the model's fires (`engine::live::Tally::Probed`).
 
 use engine::load::{FireEstimate, RungFacts};
 use kernels_slang::Tensor;

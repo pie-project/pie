@@ -169,6 +169,8 @@ pub(crate) struct Core {
     pub(crate) spent: Mutex<Vec<wgpu::Buffer>>,
 
     poller: host::Poller,
+    /// The submissions on the queue not yet seen done ([`Core::submit`]).
+    in_flight: Arc<std::sync::atomic::AtomicU64>,
 
     /// The uniform buffer frames write their dispatches' scalars to, made
     /// at load, a region of it each frame in flight; and the regions free.
@@ -276,6 +278,26 @@ impl Core {
         self.poller.kick();
     }
 
+    /// `buffer` submitted, counted on the queue until its work is done (the
+    /// poller polls the device from the kick until its queue is empty).
+    pub(crate) fn submit(&self, buffer: wgpu::CommandBuffer) -> wgpu::SubmissionIndex {
+        self.in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let index = self.queue.submit(std::iter::once(buffer));
+        let in_flight = Arc::clone(&self.in_flight);
+        self.queue.on_submitted_work_done(move || {
+            in_flight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        });
+        self.kick();
+        index
+    }
+
+    /// Whether every submission on the queue is done, read now without
+    /// waiting.
+    pub(crate) fn idle(&self) -> bool {
+        self.in_flight.load(std::sync::atomic::Ordering::Acquire) == 0
+    }
+
     pub(crate) fn wait_for(&self, _index: &wgpu::SubmissionIndex) -> Result<()> {
         let done = Signal::new();
         let landed = done.clone();
@@ -297,7 +319,7 @@ impl Core {
     }
 
     pub(crate) fn submit_once(&self, encoder: wgpu::CommandEncoder) -> Result<()> {
-        let index = self.queue.submit(std::iter::once(encoder.finish()));
+        let index = self.submit(encoder.finish());
         self.wait_for(&index)
     }
 
@@ -666,6 +688,7 @@ impl Context {
             enabled,
             spent: Mutex::new(Vec::new()),
             poller,
+            in_flight: Arc::default(),
             uniform_buffer: std::sync::OnceLock::new(),
             uniforms: Mutex::new(Vec::new()),
             scratch: Mutex::new(Vec::new()),
@@ -877,6 +900,13 @@ impl Context {
         frame.encode(|encoder| encoder.write_timestamp(&span.set, 0))?;
         *frame.inner.span.lock().expect("span lock poisoned") = Some(span);
         Ok(frame)
+    }
+
+    /// Whether every submission made on the device so far is done, read now
+    /// without waiting: the queue is empty.
+    #[must_use]
+    pub fn idle(&self) -> bool {
+        self.core.idle()
     }
 
     /// A frame a load's bind walk walks into ([`Frame::bind_only`]).
@@ -1269,7 +1299,7 @@ impl Frame {
                 why: "this frame was already submitted".to_string(),
             });
         };
-        core.queue.submit(std::iter::once(encoder.finish()));
+        core.submit(encoder.finish());
         core.kick();
         *self.inner.encoder.lock().expect("encoder lock poisoned") = Some(
             core.device
@@ -1363,7 +1393,7 @@ impl Frame {
         let started = Mark::now();
         let finished = encoder.finish();
         crate::encode::record_read_phase(0, started.ns());
-        let index = core.queue.submit(std::iter::once(finished));
+        let index = core.submit(finished);
         crate::encode::record_submit(started.ns(), 0);
         // What the frame staged through goes back to the load's stock now,
         // submitted, not when its work completes: the queue runs what any

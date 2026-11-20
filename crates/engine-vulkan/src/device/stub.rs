@@ -140,6 +140,11 @@ impl Context {
         match self.never {}
     }
 
+    #[must_use]
+    pub fn idle(&self) -> bool {
+        match self.never {}
+    }
+
     pub fn spanned_kept(&self) -> Result<Frame> {
         match self.never {}
     }

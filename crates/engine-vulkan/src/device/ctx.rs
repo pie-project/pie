@@ -167,6 +167,10 @@ pub(crate) struct Core {
 
     spare_fences: Mutex<Vec<vk::Fence>>,
 
+    /// The frame whose fenced submission went to the queue last: the
+    /// queue has emptied once it landed ([`Context::idle`]).
+    last: Mutex<std::sync::Weak<Inner>>,
+
     /// Command buffers whose frame was dropped off the thread that owns
     /// their pool, which a pool's own thread frees: a pool is not shared.
     orphans: Mutex<Vec<(vk::CommandPool, vk::CommandBuffer)>>,
@@ -1069,6 +1073,7 @@ impl Context {
                 pool,
             )])),
             spare_fences: Mutex::new(Vec::new()),
+            last: Mutex::new(std::sync::Weak::new()),
             orphans: Mutex::new(Vec::new()),
             family,
             memory,
@@ -1314,6 +1319,31 @@ impl Context {
         self.frame_with(false)
     }
 
+    /// Whether every submission made on the device so far has landed, read
+    /// now without waiting: the queue is empty. Frames run in queue order
+    /// (each begins with a barrier on all work before it), so the queue is
+    /// empty once the frame that submitted last has landed: dropped (a
+    /// submitted frame's drop waits its fence), seen landed by a wait, or
+    /// its fence signaled now.
+    #[must_use]
+    pub fn idle(&self) -> bool {
+        let last = self.core.last.lock().expect("last lock poisoned").upgrade();
+        let Some(last) = last else {
+            return true;
+        };
+        if last.landed.load(Ordering::Acquire) >= last.seq.load(Ordering::Acquire) {
+            return true;
+        }
+        // SAFETY: the fence lives as long as `last`; querying it needs no
+        // external sync.
+        let signaled =
+            unsafe { self.core.device.get_fence_status(last.fence) }.unwrap_or(false);
+        if signaled {
+            last.landed_now();
+        }
+        signaled
+    }
+
     /// A frame whose device time [`Frame::commit_spanned`] reads back: a
     /// timestamp written at the top of the pipe before its work and one at
     /// the bottom after it, where the queue writes timestamps (its family's
@@ -1443,6 +1473,8 @@ impl Context {
                 timing: Mutex::new(timing),
                 span: Mutex::new(None),
                 spare: Mutex::new(std::collections::HashMap::new()),
+                seq: std::sync::atomic::AtomicU64::new(0),
+                landed: std::sync::atomic::AtomicU64::new(0),
                 waiters: std::sync::atomic::AtomicU32::new(0),
                 most_waiters: std::sync::atomic::AtomicU32::new(0),
             }),
@@ -1502,6 +1534,11 @@ pub(crate) struct Inner {
     span: Mutex<Option<vk::QueryPool>>,
 
     spare: Mutex<std::collections::HashMap<u64, Vec<vk::DescriptorSet>>>,
+
+    /// The fenced submissions of this frame so far, and the most of them
+    /// seen landed ([`Context::idle`]).
+    seq: std::sync::atomic::AtomicU64,
+    landed: std::sync::atomic::AtomicU64,
 
     /// Threads blocked on `fence` now, and the most at once.
     waiters: std::sync::atomic::AtomicU32,
@@ -2019,10 +2056,12 @@ impl Frame {
             // each wait) and the queue is held under its lock.
             unsafe { d.queue_submit(*queue, &submits, self.inner.fence) }
                 .map_err(|e| core.fault("vkQueueSubmit", e))?;
+            self.inner.submitted_now();
         }
         // SAFETY: the fence is this frame's own, just submitted.
         unsafe { d.wait_for_fences(&[self.inner.fence], true, FENCE_TIMEOUT_NS) }
             .map_err(|e| core.fault("vkWaitForFences", e))?;
+        self.inner.landed_now();
         // SAFETY: the wait returned success, so no submission names the fence.
         unsafe { d.reset_fences(&[self.inner.fence]) }
             .map_err(|e| core.fault("vkResetFences", e))?;
@@ -2094,6 +2133,7 @@ impl Frame {
         // frame's own unsignaled one, and the queue is held under its lock.
         unsafe { core.device.queue_submit(*queue, &submits, self.inner.fence) }
             .map_err(|e| core.fault("vkQueueSubmit", e))?;
+        self.inner.submitted_now();
         self.inner.submitted.store(true, Ordering::Release);
         Ok(())
     }
@@ -2224,6 +2264,7 @@ impl Kept {
             // SAFETY: the fence is this kept frame's own.
             unsafe { d.wait_for_fences(&[self.inner.fence], true, FENCE_TIMEOUT_NS) }
                 .map_err(|e| core.fault("vkWaitForFences", e))?;
+            self.inner.landed_now();
         }
         // SAFETY: no pending submission names the fence (waited above, or
         // the last one was a segment, waited and reset below).
@@ -2239,10 +2280,12 @@ impl Kept {
             // held under its lock.
             unsafe { d.queue_submit(*queue, &submits, self.inner.fence) }
                 .map_err(|e| core.fault("vkQueueSubmit", e))?;
+            self.inner.submitted_now();
         }
         // SAFETY: the fence is this frame's own, just submitted.
         unsafe { d.wait_for_fences(&[self.inner.fence], true, FENCE_TIMEOUT_NS) }
             .map_err(|e| core.fault("vkWaitForFences", e))?;
+        self.inner.landed_now();
         // SAFETY: the wait returned, so no submission names the fence.
         unsafe { d.reset_fences(&[self.inner.fence]) }.map_err(|e| core.fault("vkResetFences", e))
     }
@@ -2271,6 +2314,7 @@ impl Kept {
             // SAFETY: the fence is this kept frame's own.
             unsafe { d.wait_for_fences(&[self.inner.fence], true, FENCE_TIMEOUT_NS) }
                 .map_err(|e| core.fault("vkWaitForFences", e))?;
+            self.inner.landed_now();
         }
         // SAFETY: any previous submission has signaled (waited above), so no
         // pending submission names the fence.
@@ -2285,6 +2329,7 @@ impl Kept {
             // unsignaled, and the queue is held under its lock.
             unsafe { d.queue_submit(*queue, &submits, self.inner.fence) }
                 .map_err(|e| core.fault("vkQueueSubmit", e))?;
+            self.inner.submitted_now();
         }
         self.inner.submitted.store(true, Ordering::Release);
         if let Some(at) = at {
@@ -2402,7 +2447,24 @@ impl Inner {
                 .wait_for_fences(&[self.fence], true, FENCE_TIMEOUT_NS)
         };
         self.waiters.fetch_sub(1, Ordering::AcqRel);
+        if result.is_ok() {
+            self.landed_now();
+        }
         result
+    }
+
+    /// A fenced submission of this frame went to the queue: the device's
+    /// last ([`Context::idle`]).
+    fn submitted_now(self: &Arc<Self>) {
+        self.seq.fetch_add(1, Ordering::AcqRel);
+        *self.core.last.lock().expect("last lock poisoned") = Arc::downgrade(self);
+    }
+
+    /// This frame's fence was seen signaled: every submission of it so far
+    /// has landed.
+    fn landed_now(&self) {
+        self.landed
+            .fetch_max(self.seq.load(Ordering::Acquire), Ordering::AcqRel);
     }
 
     fn harvest_timing(&self) {

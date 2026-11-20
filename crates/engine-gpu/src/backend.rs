@@ -118,6 +118,10 @@ pub trait Context<B: Backend> {
     /// device's queue writes timestamps; a plain frame where it writes none.
     fn spanned(&self) -> Result<B::Frame>;
 
+    /// Whether every submission made on the device so far has landed, read
+    /// now without waiting: the device's queue is empty.
+    fn idle(&self) -> bool;
+
     /// The bytes one buffer may span.
     fn max_buffer(&self) -> u64;
 

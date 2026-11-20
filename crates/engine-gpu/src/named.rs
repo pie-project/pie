@@ -92,6 +92,11 @@ impl<B: Serve> Context<Named<B>> for Facts {
         Ok(NoFrame)
     }
 
+    /// Nothing is ever submitted.
+    fn idle(&self) -> bool {
+        true
+    }
+
     fn max_buffer(&self) -> u64 {
         self.max_buffer
     }

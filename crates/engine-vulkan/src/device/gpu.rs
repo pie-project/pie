@@ -64,6 +64,10 @@ impl engine_gpu::backend::Context<Api> for Context {
         Context::spanned(self)
     }
 
+    fn idle(&self) -> bool {
+        Context::idle(self)
+    }
+
     fn max_buffer(&self) -> u64 {
         Context::max_buffer(self)
     }
