@@ -138,8 +138,10 @@ pub fn op_step_kind(tag: u8, pred_tag: u8, argmax_over_f32: bool) -> StepKind {
                 StepKind::Single
             }
         }
-        tags::GUMBEL_ARGMAX
-        | tags::CUMSUM
+        // A draw over the whole grid, as an f32 argmax: its lanes are made
+        // from its operands in the first level.
+        tags::GUMBEL_ARGMAX => StepKind::Argmax,
+        tags::CUMSUM
         | tags::CUMPROD
         | tags::SORT_DESC
         | tags::TOP_K
@@ -1251,6 +1253,13 @@ pub fn emit_streamed_region(
                     two_level,
                 }
             }
+            StepKind::Argmax if op.tag == tags::GUMBEL_ARGMAX => Plan::Argmax {
+                text: format!(
+                    "    if (step.level == 0u) m4_gumbel_partial({}, {}, {}, {}, temporary, descriptors[lane_params[{node}].a0], descriptors[lane_params[{node}].a1], descriptors[lane_params[{node}].a2], descriptors[lane_params[{node}].imm], m4_group.x, m4_groups.x, m3_tid, m3_threads, m3_tgbuf);\n    else {{ if (m4_group.x != 0) return; m4_argmax_final(temporary, {}, descriptors[lane_params[{node}].a0], step.groups, m3_tid, m3_threads, m3_tgbuf); }}\n",
+                    slots.a0, slots.a1, slots.a2, slots.o1, slots.o0
+                ),
+                input: reads.first().copied().unwrap_or(base),
+            },
             StepKind::Argmax => Plan::Argmax {
                 text: format!(
                     "    if (step.level == 0u) m4_argmax_partial({}, temporary, descriptors[lane_params[{node}].a0], m4_group.x, m4_groups.x, m3_tid, m3_threads, m3_tgbuf);\n    else {{ if (m4_group.x != 0) return; m4_argmax_final(temporary, {}, descriptors[lane_params[{node}].a0], step.groups, m3_tid, m3_threads, m3_tgbuf); }}\n",

@@ -2051,6 +2051,56 @@ inline void m4_argmax_final(
   }
 }
 
+// `gumbel_argmax`'s first level across the grid: each group's best lane of
+// each row, every lane made as `m1_gumbel_argmax_mt` makes it; the second
+// level is `m4_argmax_final`.
+inline void m4_gumbel_partial(
+    const device uchar* logits,
+    const device uchar* keep,
+    const device uchar* divisor,
+    const device uchar* state,
+    device uchar* temporary,
+    const M1ValueDesc dl,
+    const M1ValueDesc dk,
+    const M1ValueDesc dd,
+    const M1ValueDesc ds,
+    uint group,
+    uint groups,
+    uint tid,
+    uint nthreads,
+    threadgroup M1ArgmaxCandidate* tgbuf) {
+  device M1ArgmaxCandidate* partials = reinterpret_cast<device M1ArgmaxCandidate*>(temporary);
+  const ulong key = ulong(m1_load_u(state, 0, ds.dtype));
+  const ulong counter = ulong(ds.len > 1 ? m1_load_u(state, 1, ds.dtype) : 0u);
+  const ulong seed = ptir_rng_keyed_seed(uint(key), uint(counter));
+  const float d = m1_load_f(divisor, 0, dd.dtype);
+  const uint span = groups * nthreads;
+  const uint begin = group * nthreads + tid;
+  for (uint row = 0; row < dl.rows; ++row) {
+    const uint base = row * dl.last;
+    M1ArgmaxCandidate best = {-INFINITY, 0u, 0u, 0u};
+    for (uint i = begin; i < dl.last; i += span) {
+      const uint flat = base + i;
+      float value = -INFINITY;
+      if (m1_load_b(keep, m1_pick(dk.len, flat), dk.dtype)) {
+        const float uniform = ptir_rng_hash_uniform(seed, flat);
+        const float noise = -precise::log(-precise::log(uniform));
+        value = m1_load_f(logits, flat, dl.dtype) / d + noise;
+      }
+      best = m1_argmax_combine(best, M1ArgmaxCandidate{value, i, isnan(value) ? 0u : 1u, 0u});
+    }
+    tgbuf[tid] = best;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 1u; stride < nthreads; stride <<= 1) {
+      if ((tid % (2u * stride)) == 0u && tid + stride < nthreads)
+        tgbuf[tid] = m1_argmax_combine(tgbuf[tid], tgbuf[tid + stride]);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) partials[row * groups + group] = tgbuf[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+}
+
 // `gumbel_argmax`: each row's index of its largest `logits[i] / divisor +
 // gumbel(state, i)`, a lane whose `keep` is false `-inf`. Every lane is
 // made in f32 from its operands and never stored: the noise is lane `i`
