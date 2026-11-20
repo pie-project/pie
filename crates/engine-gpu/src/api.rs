@@ -889,7 +889,19 @@ where
                 "every fire shape the load serves walked bind-only: what a dispatch binds is built"
             );
         }
+        let started = std::time::Instant::now();
+        let bodies = shell.record_decodes().map_err(fault)?;
+        if bodies > 0 {
+            tracing::info!(
+                engine = B::KIND,
+                bodies,
+                recorded = shell.recorded_serving(),
+                ms = started.elapsed().as_millis() as u64,
+                "every decode bucket the load serves recorded at load, on every arm"
+            );
+        }
         // What the load itself walked is the load's: serving counts from here.
+        shell.recorded_serving();
         shell.unkept_serving();
         shell.bound_serving();
         // The fire the shell took, which a binding may have bounded below
@@ -1878,8 +1890,42 @@ impl<B: Host> Gpu<B> {
                 feed: feeds[at].as_ref(),
                 group: lane.group,
                 inputs: &input_cells[at],
+                pad: false,
             })
             .collect();
+        // A decode of one-row lanes of one class pads to its bucket with
+        // lanes that read as its first and write nothing: every decode of a
+        // bucket is then one body, recorded at load.
+        let mut seated = seated;
+        if submission.media.is_empty()
+            && submission.voxels.is_empty()
+            && let Some(first) = seated.first().copied()
+            && seated.iter().all(|lane| {
+                lane.lane.tokens.len() == 1
+                    && lane.lane.word == first.lane.word
+                    && lane.group.is_none()
+                    && lane.rs_snapshots.is_empty()
+            })
+            && let Some(bucket) = shell.pad_bucket(seated.len())
+        {
+            const PAD_TOKEN: [u32; 1] = [0];
+            let pad = Seated {
+                lane: Lane {
+                    tokens: &PAD_TOKEN,
+                    ..first.lane
+                },
+                mask: None,
+                readout: None,
+                hosts: false,
+                reads: &[],
+                scores: None,
+                feed: None,
+                inputs: &[],
+                pad: true,
+                ..first
+            };
+            seated.resize(bucket, pad);
+        }
 
         let wrote;
         let mut faulted = faulted.faulted;

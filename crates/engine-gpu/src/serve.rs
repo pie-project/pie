@@ -528,6 +528,11 @@ pub struct Seated<'a, B: Serve> {
 
     pub group: Option<u32>,
     pub inputs: &'a [(engine::fire::InputFeed, InputCell<B>)],
+
+    /// A lane that pads a decode to its bucket ([`Shell::pad_bucket`]): it
+    /// reads as the lane it copies and writes nothing, its kv rows' write
+    /// entries -1.
+    pub pad: bool,
 }
 
 impl<'a, B: Serve> Seated<'a, B> {
@@ -557,6 +562,7 @@ impl<'a, B: Serve> Seated<'a, B> {
             feed: None,
             group: None,
             inputs: &[],
+            pad: false,
         }
     }
 
@@ -2622,6 +2628,24 @@ impl<B: Serve> Shell<B> {
         now - std::mem::replace(&mut self.bound, now)
     }
 
+    /// The lanes a decode of `lanes` one-row lanes pads to on a backend
+    /// that keeps recordings: the narrowest rung that holds them, where
+    /// that is wider and the load seats that many. A padded decode is its
+    /// bucket, so every decode of a bucket replays one body. `None` where
+    /// it fires as it is: a load with recurrent state, whose lanes' records
+    /// a copy would share (step (b) of VULKAN-RECORD-AT-LOAD).
+    #[must_use]
+    pub fn pad_bucket(&self, lanes: usize) -> Option<usize> {
+        if !B::RECORDS || self.rs_layout.is_some() || lanes == 0 {
+            return None;
+        }
+        let bucket = (self.span.rungs().iter())
+            .map(|rung| rung.tokens as usize)
+            .filter(|&tokens| tokens >= lanes)
+            .min()?;
+        (bucket > lanes && bucket <= self.budgets.tokens.max_lanes as usize).then_some(bucket)
+    }
+
     /// The steps walked to be kept since the last count: each is a shape a
     /// fire waited on, recorded at its first fire and replayed after.
     pub fn recorded_serving(&mut self) -> u64 {
@@ -3830,12 +3854,18 @@ impl<B: Serve> Shell<B> {
         let mut snap_units = 0u32;
 
         let mut writes: Vec<Option<(i32, i32)>> = Vec::with_capacity(rows as usize);
+        // The rows of padding lanes: their kv write entries are -1.
+        let mut pad_rows: Vec<std::ops::Range<usize>> = Vec::new();
         let mut feeds: Vec<(u32, &'a DeviceCell<B>)> = Vec::new();
         let mut fed_lanes: Vec<(u32, u32)> = Vec::new();
         for row in composition.lanes() {
             let source = row.source as usize;
             let seated = &lanes[source];
             let lane = &seated.lane;
+            if seated.pad {
+                let first = row.row_offset as usize;
+                pad_rows.push(first..first + row.rows as usize);
+            }
             if let Some(cell) = seated.feed {
                 if row.rows != 1 {
                     return Err(program(
@@ -4266,6 +4296,15 @@ impl<B: Serve> Shell<B> {
                     };
                     *write_page = page;
                     *write_offset = offset;
+                }
+            }
+        }
+        for geometry in &mut geometries {
+            for rows in &pad_rows {
+                for row in rows.clone() {
+                    if let Some(page) = geometry.write_page.get_mut(row) {
+                        *page = -1;
+                    }
                 }
             }
         }
@@ -5363,25 +5402,17 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
         let mut frame = walked.frame.expect("the walk opened a frame");
 
         // Each read plane's buffer (the span's, or a score room's) and every
-        // layer's base in it.
+        // layer's base in it: every plane the carve lays, read in this fire
+        // or not.
         let mut bases: Vec<Option<(B::Buffer, Vec<u64>)>> = vec![None; self.readouts.len()];
-        for span in (prepared.readout_layout.iter())
-            .filter(|span| span.rows > 0 && (span.seated || span.spanned))
-        {
-            let at = span.plane as usize;
-            if bases[at].is_some() {
-                continue;
-            }
-            let plane = &self.readouts[at];
+        for (at, plane) in self.readouts.iter().enumerate() {
             let mut layers = Vec::with_capacity(plane.values.len());
             let mut buffer = None;
             for value in &plane.values {
-                let rect = prepared.slots.0[value.0 as usize].ok_or_else(|| Fault::Unbound {
-                    what: format!(
-                        "value {}, of output `{}`, which the carve gave no rectangle",
-                        value.0, plane.output
-                    ),
-                })?;
+                let Some(rect) = prepared.slots.0[value.0 as usize] else {
+                    buffer = None;
+                    break;
+                };
                 if rect.width != plane.width {
                     return Err(Fault::Ceiling {
                         what: "elements in one readout row",
@@ -5404,8 +5435,17 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
         // Every read lands in the arm's seat by one copy of all its regions
         // a source buffer: a pair of barriers each, not one a lane.
         let mut layout = prepared.readout_layout.clone();
-        // Its regions, and the layers of the planes read from it.
+        // Its regions, and the layers of the planes read from it. Every
+        // plane's buffer takes its copy whether or not a lane reads it in
+        // this fire, so a fire's commands are its shape's whatever its lanes
+        // read (the regions are the copy's data).
         let mut regions: Vec<(B::Buffer, Vec<(u64, u64, u64)>, usize)> = Vec::new();
+        for (from, layers) in bases.iter().flatten() {
+            match (regions.iter_mut()).find(|(buffer, ..)| buffer.slab_id() == from.slab_id()) {
+                Some((_, _, planes)) => *planes += layers.len(),
+                None => regions.push((from.clone(), Vec::new(), layers.len())),
+            }
+        }
         for span in (layout.iter_mut())
             .filter(|span| span.rows > 0 && (span.seated || span.spanned))
         {
@@ -5446,12 +5486,10 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
             let copies = span_copies(span, layers, row_bytes, source_row)
                 .into_iter()
                 .map(|copy| (copy.from, copy.to, copy.bytes));
-            match (regions.iter_mut()).find(|(buffer, ..)| buffer.slab_id() == from.slab_id()) {
-                Some((_, list, planes)) => {
-                    list.extend(copies);
-                    *planes += layers.len();
-                }
-                None => regions.push((from.clone(), copies.collect(), layers.len())),
+            if let Some((_, list, _)) =
+                (regions.iter_mut()).find(|(buffer, ..)| buffer.slab_id() == from.slab_id())
+            {
+                list.extend(copies);
             }
         }
         // One copy of all its regions a source buffer, at most a row of each
@@ -6107,6 +6145,72 @@ impl<B: Serve> Shell<B> {
             }
         }
         Ok(walked)
+    }
+
+    /// Records, on a backend that keeps recordings, the body of every
+    /// decode the load serves before it serves: for each class a plain
+    /// one-row request lands in, a decode of each bucket's lanes
+    /// ([`Shell::pad_bucket`]) up to the lane cap, on every arm. Its lanes
+    /// pad (they read the pool's walk refs and write nothing), so the fire
+    /// runs as a decode of the bucket does and is recorded, and the first
+    /// serving decode of the bucket replays it. The bodies recorded.
+    pub fn record_decodes(&mut self) -> Result<u64> {
+        if !B::RECORDS || self.rs_layout.is_some() {
+            return Ok(0);
+        }
+        let facts = &self.trace.facts;
+        let table = &self.compiled.classes;
+        let mut decoding = vec![false; table.classes.len()];
+        for request in facts.requests() {
+            if let Some(class) = table.class_of(facts.word(&request) & table.mask)
+                && request.plain()
+                && request.query_len() == 1
+            {
+                decoding[class] = true;
+            }
+        }
+        let classes: Vec<usize> = (0..decoding.len())
+            .filter(|&class| decoding[class] && !self.captures(class))
+            .collect();
+        let cap = self.budget().max_lanes.max(1) as usize;
+        let mut buckets: Vec<usize> = (self.span.rungs().iter())
+            .map(|rung| rung.tokens as usize)
+            .filter(|&tokens| tokens <= cap)
+            .collect();
+        buckets.dedup();
+        let page = self.pools.paging().page_size.max(1);
+        let depth = self.arms.depth();
+        let mut recorded = 0u64;
+        for &class in &classes {
+            for &bucket in &buckets {
+                for arm in 0..depth {
+                    let owned = (0..bucket)
+                        .map(|_| {
+                            let mut lane = self.naming_lane(class, 1)?;
+                            lane.by_ref = Some(self.pools.walk_refs(1u32.div_ceil(page).max(1))?);
+                            Ok(lane)
+                        })
+                        .collect::<Result<Vec<NamingLane<B>>>>()?;
+                    let (mut seated, _, _) = lane_views(&owned);
+                    for lane in &mut seated {
+                        lane.pad = true;
+                        lane.hosts = false;
+                    }
+                    // The fire stages on the first free arm: the ones before
+                    // `arm` are held while it fires.
+                    for before in 0..arm {
+                        self.arms.take(before);
+                    }
+                    let fired = self.fire_seated(&seated);
+                    for before in 0..arm {
+                        self.arms.give(before);
+                    }
+                    fired?;
+                    recorded += 1;
+                }
+            }
+        }
+        Ok(recorded)
     }
 
     /// One fire of `lanes`, each `(class, rows)`, staged and walked
