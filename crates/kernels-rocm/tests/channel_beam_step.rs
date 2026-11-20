@@ -11,7 +11,7 @@ mod common;
 
 use common::Gpu;
 use engine::beam::{self, Fire, State};
-use kernels_rocm::runtime::channel::{self, BeamListRun, BeamStepRun};
+use kernels_rocm::runtime::channel::{self, BeamListRun, BeamRsRun, BeamStepRun};
 
 const PAGE: u32 = 16;
 const FRAMES: u32 = 2;
@@ -39,6 +39,16 @@ impl Lcg {
     }
 }
 
+/// The slot address the synthetic rs translation gives rs pool page `q`
+/// (a hybrid's, `BEAM-PAGE-LISTS.md` §11).
+fn rs_base(q: u32) -> u64 {
+    0x7000_0000 + u64::from(q) * 0x100
+}
+
+/// Where column 0 lies in a beam's rs page table: the buffer starts pages
+/// before the beams' first (`f0 - base / S`).
+const RS_FROM: u32 = 3;
+
 /// The device id the synthetic translation gives pool page `q`.
 fn device_id(q: u32) -> i32 {
     1000 + q as i32
@@ -57,6 +67,12 @@ fn search(gpu: &Gpu, lanes: u32, folded: u32, steps: u32, seed: u64) {
     // A table each beam: its entries from `f0`, one row.
     let indices_at = gpu.up(&vec![-1i32; (lanes * cap) as usize]);
     let write_page_at = gpu.up(&vec![-1i32; lanes as usize]);
+    // An rs page table each beam (its run `RS_FROM + cap` long), and the rs
+    // pool pages' slot addresses.
+    let rs_span = RS_FROM + cap;
+    let rs_pages_at = gpu.up(&vec![0u64; (lanes * rs_span) as usize]);
+    let rs_bases: Vec<u64> = (0..reserve).map(rs_base).collect();
+    let rs_bases_at = gpu.up(&rs_bases);
     let mut replay = State::new(lanes, cap, FRAMES);
     let mut rng = Lcg(seed);
     for t in 0..steps {
@@ -86,6 +102,17 @@ fn search(gpu: &Gpu, lanes: u32, folded: u32, steps: u32, seed: u64) {
             })
             .collect();
         let lists_at = gpu.up(&lists);
+        let rs_runs: Vec<BeamRsRun> = (0..lanes)
+            .map(|b| BeamRsRun {
+                pages: rs_pages_at,
+                bases: rs_bases_at,
+                lane: b,
+                from: b * rs_span + RS_FROM,
+                entries: c + 1,
+                _pad: 0,
+            })
+            .collect();
+        let rs_at = gpu.up(&rs_runs);
         let run = BeamStepRun {
             state: state_at,
             parents: parents_at,
@@ -103,7 +130,8 @@ fn search(gpu: &Gpu, lanes: u32, folded: u32, steps: u32, seed: u64) {
             // The pages the engine stages: the lowest-free rule keeps every
             // page the step names below them, or a lane faults.
             backed: pool,
-            _pad: 0,
+            rs_count: lanes,
+            rs: rs_at,
         };
         let run_at = gpu.up(&[run]);
         channel::beam_step(&ctx, run_at, 1).expect("beam_step launches");
@@ -153,6 +181,22 @@ fn search(gpu: &Gpu, lanes: u32, folded: u32, steps: u32, seed: u64) {
             assert_eq!(entries, &list[..], "{at}: beam {b}'s resolved entries");
             assert_eq!(writes[b], device_id(want.lists[b][c as usize]), "{at}: beam {b}'s write page");
         }
+        // A hybrid's rs page tables (§11): each beam's columns over the same
+        // list, its write page among them.
+        let rs_resolved: Vec<u64> = gpu.down(rs_pages_at, (lanes * rs_span) as usize);
+        for b in 0..lanes as usize {
+            let want_rs: Vec<u64> = want.lists[b].iter().map(|&q| rs_base(q)).collect();
+            let at_b = b * rs_span as usize + RS_FROM as usize;
+            assert_eq!(
+                &rs_resolved[at_b..at_b + c as usize + 1],
+                &want_rs[..],
+                "{at}: beam {b}'s rs page table"
+            );
+            assert!(
+                rs_resolved[b * rs_span as usize..at_b].iter().all(|&w| w == 0),
+                "{at}: beam {b}'s rs entries before column 0 untouched"
+            );
+        }
     }
 }
 
@@ -199,7 +243,8 @@ fn a_parent_past_the_group_faults_its_lane() {
             list_count: 0,
             frames: FRAMES,
             backed: reserve,
-            _pad: 0,
+            rs_count: 0,
+            rs: 0,
         };
         channel::beam_step(&ctx, gpu.up(&[run]), 1).expect("beam_step launches");
         gpu.sync();

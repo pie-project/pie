@@ -729,6 +729,23 @@ pub struct BeamListRun {
 
 const _: () = assert!(size_of::<BeamListRun>() == 40);
 
+/// A lane's rs page table [`beam_step`] resolves over its group's list, on a
+/// hybrid (`BEAM-PAGE-LISTS.md` §11; `channel.hip`'s `BeamRsRun`): its
+/// entries from `from` (column 0's), `entries` columns, each the slot address
+/// of its rs pool page in `bases`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BeamRsRun {
+    pub pages: DevicePtr,
+    pub bases: DevicePtr,
+    pub lane: u32,
+    pub from: u32,
+    pub entries: u32,
+    pub _pad: u32,
+}
+
+const _: () = assert!(size_of::<BeamRsRun>() == 32);
+
 /// One beam group's step (`new-memory/designs/BEAM-PAGE-LISTS.md`,
 /// `channel.hip`'s `BeamStepRun`): its resident state, the parents its
 /// last epilogue wrote, its pool's device ids, its lanes' list runs and
@@ -758,10 +775,12 @@ pub struct BeamStepRun {
     /// names lies below them (the lowest-free rule), and one that does not
     /// faults its lane.
     pub backed: u32,
-    pub _pad: u32,
+    /// Its lanes' rs page tables (a hybrid's, §11), `rs_count` of them.
+    pub rs_count: u32,
+    pub rs: DevicePtr,
 }
 
-const _: () = assert!(size_of::<BeamStepRun>() == 80);
+const _: () = assert!(size_of::<BeamStepRun>() == 88);
 
 /// The most beams one group holds.
 pub const BEAM_MAX_LANES: u32 = 64;

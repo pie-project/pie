@@ -663,8 +663,23 @@ struct BeamListRun {
 
 static_assert(sizeof(BeamListRun) == 40, "BeamListRun: the Rust `channel::BeamListRun` mirrors this layout");
 
+// A lane's rs page table to resolve (§11, a hybrid's): its entries from
+// `from` (the entry of column 0, slot `f0 * page`), `entries` columns of
+// them, each the slot address of its rs pool page (`bases`).
+struct BeamRsRun {
+    u64* pages;
+    const u64* bases;
+    u32 lane;
+    u32 from;
+    u32 entries;
+    u32 pad;
+};
+
+static_assert(sizeof(BeamRsRun) == 32, "BeamRsRun: the Rust `channel::BeamRsRun` mirrors this layout");
+
 // A group's step: its state, the parents its last epilogue wrote, its pool's
-// device ids, its lanes' list runs and fault words, and the numbers of §3.
+// device ids, its lanes' list runs and fault words, the numbers of §3, and
+// on a hybrid its lanes' rs page tables (§11).
 struct BeamStepRun {
     u32* state;
     const u32* parents;
@@ -680,10 +695,11 @@ struct BeamStepRun {
     u32 list_count;
     u32 frames;
     u32 backed;
-    u32 pad;
+    u32 rs_count;
+    const BeamRsRun* rs;
 };
 
-static_assert(sizeof(BeamStepRun) == 80, "BeamStepRun: the Rust `channel::BeamStepRun` mirrors this layout");
+static_assert(sizeof(BeamStepRun) == 88, "BeamStepRun: the Rust `channel::BeamStepRun` mirrors this layout");
 
 #define PIE_BEAM_MAX_LANES 64u
 
@@ -877,6 +893,24 @@ __global__ void beam_step(const BeamStepRun* __restrict__ runs, u32 run_count)
                 continue;
             }
             l.write_page[row] = r.trans[q];
+        }
+    }
+    // §6.5 on a hybrid (§11): each lane's rs page table over the same list,
+    // its write page among them (column `c`).
+    for (u32 i = 0u; i < r.rs_count; ++i) {
+        const BeamRsRun l = r.rs[i];
+        const u32* list = map_new + l.lane * cap;
+        if (l.entries > cap) {
+            if (threadIdx.x == 0u) atomicMax(&r.faults[l.lane], PIE_PAGES_SHORT);
+            continue;
+        }
+        for (u32 j = threadIdx.x; j < l.entries; j += blockDim.x) {
+            const u32 q = list[j];
+            if (q >= K) {
+                atomicMax(&r.faults[l.lane], q >= Q ? PIE_PAGES_PAST_RESERVE : PIE_PAGES_EXHAUSTED);
+                continue;
+            }
+            l.pages[l.from + j] = l.bases[q];
         }
     }
     __syncthreads();
