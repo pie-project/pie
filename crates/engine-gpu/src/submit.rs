@@ -1,5 +1,5 @@
 //! A serving step held to the bound the platform states on one GPU
-//! submission ([`crate::rates::STATED_SUBMIT_BOUND`]: KGSL's 2 s on
+//! submission ([`crate::rates::stated_submit_bound`]: KGSL's 2 s on
 //! Android, none elsewhere). Past it the driver faults the submission and
 //! the device is lost (an Adreno 840 on wgpu lost it on a 3843-token
 //! prompt's prefill steps of ~480 rows at ~3 to 3.8k keys, each 1 to 2 s).
@@ -319,7 +319,7 @@ impl SubmitBound {
              ms a layer at a time ({} layers, at the worst ratio {:.3} of a frame's time to its \
              estimate the rates step measured, `[rates] submit_worst_ratio`), past the platform's \
              stated bound of {:.0} ms on \
-             one GPU submission (engine_gpu::rates::STATED_SUBMIT_BOUND); the widest prefill \
+             one GPU submission (engine_gpu::rates::stated_submit_bound); the widest prefill \
              rung this load lays is {} rows",
             step.rows,
             step.lanes,

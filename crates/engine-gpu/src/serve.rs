@@ -1627,7 +1627,7 @@ impl<B: Serve> Shell<B> {
         // Where the platform states a bound on one submission, every serving
         // step is held to it by the estimate (`crate::submit`), which must
         // then be stated: refused by its key otherwise.
-        let submit_bound = match crate::rates::STATED_SUBMIT_BOUND {
+        let submit_bound = match crate::rates::stated_submit_bound() {
             None => None,
             Some(bound) => {
                 let Some(estimate) = fire_estimate else {
