@@ -289,6 +289,10 @@ pub const SOURCES: &[(&str, &str)] = &[
         include_str!(concat!(source_root!(), "/prim/state_map.h")),
     ),
     (
+        "runtime/beam.metal",
+        include_str!(concat!(source_root!(), "/runtime/beam.metal")),
+    ),
+    (
         "runtime/blit.metal",
         include_str!(concat!(source_root!(), "/runtime/blit.metal")),
     ),
