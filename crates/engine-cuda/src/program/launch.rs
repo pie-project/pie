@@ -889,9 +889,27 @@ fn block_temporary(
         .max(1);
     match region.kind {
         // A generated region's block keeps its reductions' levels here and
-        // nothing else.
+        // nothing else, laid from the rows its reductions stream (each
+        // reduction's input's row, `stream_width`), not the stage's widest
+        // value: a beam step's flattened candidates are a value of the
+        // stage no reduction of its log-softmax streams.
         RegionKind::Generated => {
-            eta_compiler::codegen::launch::generated_temporary_bytes(plan, region, widest)
+            let streamed = region
+                .nodes
+                .iter()
+                .filter_map(|&node| plan.ops.get(node as usize))
+                .filter(|op| {
+                    matches!(
+                        op.tag,
+                        tags::REDUCE_SUM | tags::REDUCE_MAX | tags::REDUCE_MIN
+                    )
+                })
+                .filter_map(|op| descriptors.get(*op.args.first()? as usize))
+                .map(|d| u64::from(d.last))
+                .max()
+                .unwrap_or(1)
+                .max(1);
+            eta_compiler::codegen::launch::generated_temporary_bytes(plan, region, streamed)
         }
         // A sampler's blocks meet in the engine's lane arenas, not here.
         kind if lane_sampler(kind) => 0,
