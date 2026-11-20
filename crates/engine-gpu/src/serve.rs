@@ -4554,7 +4554,7 @@ impl<B: Serve> Shell<B> {
         // place under the span's end.
         let rung = self
             .span
-            .rung_of(fire_rows, if rs_active { rows_ext } else { 0 });
+            .rung_of(fire_rows, if rs_active { rows_ext - rows } else { 0 });
         // A fire's capturing lanes' rows lie in the score room of its first
         // capturing lane's pair, laid for the most lanes a fire carries.
         let room = composition

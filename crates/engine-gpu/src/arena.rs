@@ -52,9 +52,10 @@ pub struct Rung {
 }
 
 /// A rung's room for the recurrent buffer's planes ([`crate::rs::Seat`]):
-/// laid for the rung's rows (a fire's own and the ones it replays, the rows
-/// its rung is chosen by) and the most lanes it carries, so a seat's planes
-/// lie at one place whatever the fire.
+/// laid for the rung's tokens of a fire's own rows and as many carried rows
+/// (`engine::fire::ActivationRows`: a fire granted the rung may carry its
+/// tokens), and the most lanes it carries, so a seat's planes lie at one
+/// place whatever the fire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RsRoom {
     /// Its first byte in the rung's bytes.
@@ -180,13 +181,14 @@ impl Rung {
         let rooms_end = (rooms_at + rooms.bytes()).next_multiple_of(ALIGN);
         let rs = rs.map(|layout| {
             let lanes = tokens.min(budgets.tokens.max_lanes);
+            let rows = tokens.saturating_mul(2);
             (
                 RsRoom {
                     at: rooms_end,
-                    rows: tokens,
+                    rows,
                     lanes,
                 },
-                crate::rs::Seat::scratch_bytes(layout, tokens, lanes),
+                crate::rs::Seat::scratch_bytes(layout, rows, lanes),
             )
         });
         let bytes = (rooms_end + rs.map_or(0, |(_, bytes)| bytes)).next_multiple_of(ALIGN);
@@ -207,14 +209,15 @@ impl Rung {
         self.bytes
     }
 
-    /// Whether a fire of `rows`, which extends to `extended` rows into the
-    /// recurrent planes, fits this rung's carve and planes.
-    fn holds(&self, rows: FireRows, extended: u32) -> bool {
+    /// Whether a fire of `rows` carrying `carried` recurrent rows ahead of
+    /// its own fits this rung: its own rows and its carried rows each at
+    /// most the rung's tokens (`engine::fire::ActivationRows`).
+    fn holds(&self, rows: FireRows, carried: u32) -> bool {
         let tokens = u64::from(self.tokens);
         rows.tokens <= tokens
             && rows.lanes <= tokens
             && rows.readouts <= tokens
-            && extended <= self.tokens
+            && carried <= self.tokens
     }
 }
 
@@ -330,15 +333,15 @@ impl<B: Backend> Span<B> {
         Ok(self.placed()?.0)
     }
 
-    /// The carve a fire of `rows` takes, its rows extending to `extended`
-    /// in the recurrent planes: the widest whose bytes lie in the chunks
-    /// stated for the narrowest rung that holds it ([`Span::widen`]).
+    /// The carve a fire of `rows` carrying `carried` recurrent rows takes:
+    /// the widest whose bytes lie in the chunks stated for the narrowest
+    /// rung that holds it ([`Span::widen`]).
     #[must_use]
-    pub fn rung_of(&self, rows: FireRows, extended: u32) -> usize {
+    pub fn rung_of(&self, rows: FireRows, carried: u32) -> usize {
         let narrowest = self
             .rungs
             .iter()
-            .position(|rung| rung.holds(rows, extended))
+            .position(|rung| rung.holds(rows, carried))
             .unwrap_or(self.rungs.len().saturating_sub(1));
         self.widest.get(narrowest).copied().unwrap_or(narrowest)
     }
