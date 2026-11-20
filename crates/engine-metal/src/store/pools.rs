@@ -4,7 +4,7 @@
 //! the copies, spills and evacuations that move slots.
 
 use engine::chunk::{ChunkFacts, Evacuation, ShapeId, SlotCopy};
-use engine::transfer::{KvRun, MemoryDomain};
+use engine::transfer::{DeviceReach, KvRun, MemoryDomain};
 use kernels_metal::{KvPool, RecurrentPool, StateMap, Tensor};
 use poem_compiler::chunk::{ChunkRecipe, RowId, SlotLayout};
 use poem_ir::{CacheRow, Dtype, Trace};
@@ -1469,7 +1469,10 @@ impl Pools {
     /// them: on the device (whole slots, and token runs of the list), or
     /// between the device and the slot files.
     pub fn copy_slots(&mut self, frame: &mut Frame, copy: &SlotCopy) -> Result<()> {
-        let device = MemoryDomain::MetalShared;
+        let device = MemoryDomain::Device {
+            ordinal: 0,
+            reach: DeviceReach::HostShared,
+        };
         match (copy.src, copy.dst) {
             (src, dst) if src == device && dst == device => {
                 self.copy_whole(frame, copy.shape, &copy.slots)?;

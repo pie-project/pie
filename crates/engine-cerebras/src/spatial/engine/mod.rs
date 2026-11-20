@@ -18,7 +18,7 @@ use engine::error::{Error, Result as EngineResult};
 use engine::fire::{FireId, FireTicket, FrameId, FrameSubmission, FrameTicket, LaneReadout};
 use engine::load::{Checkpoint, LoadFacts, LoadRequest, Loaded};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
-use engine::transfer::MemoryDomain;
+use engine::transfer::{DeviceReach, MemoryDomain};
 use eta_ir::registry::{GeometryClass, PortMask};
 
 use kv::Kv;
@@ -213,7 +213,10 @@ impl Engine for Spatial {
         let caps = Capabilities {
             device: DeviceFacts {
                 backend: "cerebras".to_string(),
-                domain: MemoryDomain::CerebrasDevice(0),
+                domain: MemoryDomain::Device {
+                    ordinal: 0,
+                    reach: DeviceReach::Private,
+                },
                 sms: 1,
                 unified_memory: false,
                 fp8_native: false,

@@ -26,7 +26,13 @@ impl engine_gpu::Backend for Api {
     type Tuning = crate::tuning::Tuning;
 
     fn is_device(domain: engine::transfer::MemoryDomain) -> bool {
-        matches!(domain, engine::transfer::MemoryDomain::WgpuDevice(_))
+        matches!(
+            domain,
+            engine::transfer::MemoryDomain::Device {
+                reach: engine::transfer::DeviceReach::Private,
+                ..
+            }
+        )
     }
 
     fn stage_rows(
