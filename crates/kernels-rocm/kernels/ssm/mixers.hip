@@ -1820,19 +1820,59 @@ __global__ __launch_bounds__(BLOCK) void ssm_gdn_step_fused_carried(
         for (int k = 0; k < KMAX; ++k) wk[u][k] = k < K ? to_f32(conv_w[ch[u] * K + k]) : 0.f;
     }
     __syncthreads();
-    // Run position t's input of channel slot u: a committed cell, a carried
-    // row's input or the own row's.
-    auto at = [&](int u, int t) -> float {
-        if (t < 0) return to_f32(cst[u][(K + t) * ccs + cc[u]]);
+    // Every carried row fits one stage at a natural lag: its keys, values
+    // and gates are read now, under the conv and the ticket.
+    const bool whole = n <= SCH;
+    if (n > 0 && whole) {
+        constexpr int KP = KD / 8, UP = VD / 4;
+        for (int x = tid; x < n * KP; x += BLOCK) {
+            const int e = x / KP, p8 = x % KP;
+            *reinterpret_cast<u32x4*>(&s_k[e][p8 * 8]) = *reinterpret_cast<const u32x4*>(
+                step.plane_at<const bf16>(t_slot[e], t_pos[e], 1) + static_cast<long long>(h_k) * KD + p8 * 8);
+        }
+        for (int x = tid; x < n * UP; x += BLOCK) {
+            const int e = x / UP, p4 = x % UP;
+            *reinterpret_cast<f32x4*>(&s_u[e][p4 * 4]) = *reinterpret_cast<const f32x4*>(
+                step.plane_at<const float>(t_slot[e], t_pos[e], 2) + static_cast<long long>(h) * VD + p4 * 4);
+        }
+        if (tid < n) s_a[tid] = gdn_log_gate(step.plane_at<const bf16>(t_slot[tid], t_pos[tid], 0), h, V_h, dt_bias, a_log);
+    }
+    const bool cfold = folds_uniform(conv_write, conv_mask, rl) && commit > 0;
+    // Where run position t's input of channel slot u lies: a committed
+    // cell or a carried row's input; null for the own row. Every tap's and
+    // every stored cell's source is placed first and all of them read at
+    // once, never one dependent load a tap.
+    auto src = [&](int u, int t) -> const bf16* {
+        if (t < 0) return &cst[u][(K + t) * ccs + cc[u]];
         if (t < n) {
             u64 slot;
             u32 pos;
             where(conv, xl, t, slot, pos);
-            return to_f32(conv.plane_at<const bf16>(slot, pos, 0)[ch[u]]);
+            return conv.plane_at<const bf16>(slot, pos, 0) + ch[u];
         }
-        return xn[u];
+        return nullptr;
     };
-    const bool cfold = folds_uniform(conv_write, conv_mask, rl) && commit > 0;
+    float hv[CPT][KMAX], wv[CPT][KMAX];
+    {
+        const bf16* hp[CPT][KMAX];
+        const bf16* wp[CPT][KMAX];
+#pragma unroll
+        for (int u = 0; u < CPT; ++u) {
+#pragma unroll
+            for (int k = 0; k < KMAX; ++k) {
+                hp[u][k] = k < K ? src(u, n - (K - 1 - k)) : nullptr;
+                wp[u][k] = cfold && k < K ? src(u, commit - K + k) : nullptr;
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < CPT; ++u) {
+#pragma unroll
+            for (int k = 0; k < KMAX; ++k) {
+                hv[u][k] = hp[u][k] != nullptr ? to_f32(*hp[u][k]) : xn[u];
+                wv[u][k] = wp[u][k] != nullptr ? to_f32(*wp[u][k]) : xn[u];
+            }
+        }
+    }
     bf16* own_x = conv.own_row<bf16>(xl, 0, 0);
     bf16* own_k = conv.own_row<bf16>(xl, 0, 1);
 #pragma unroll
@@ -1842,7 +1882,7 @@ __global__ __launch_bounds__(BLOCK) void ssm_gdn_step_fused_carried(
         float acc = 0.f;
 #pragma unroll
         for (int k = 0; k < KMAX; ++k)
-            if (k < K) acc += wk[u][k] * at(u, n - (K - 1 - k));
+            if (k < K) acc += wk[u][k] * hv[u][k];
         const bf16 out_c = from_f32<bf16>(silu(acc));
         cv[i] = to_f32(out_c);
         const bool own = i >= 2 * KD;
@@ -1869,12 +1909,9 @@ __global__ __launch_bounds__(BLOCK) void ssm_gdn_step_fused_carried(
         for (int u = 0; u < CPT; ++u) {
             const int i = tid + u * BLOCK;
             if (i >= CH || (i < 2 * KD && !last_s)) continue;
-            float cells[KMAX];
-#pragma unroll
-            for (int k = 0; k < KMAX; ++k) cells[k] = k < K ? at(u, commit - K + k) : 0.f;
 #pragma unroll
             for (int k = 0; k < KMAX; ++k)
-                if (k < K) cst[u][k * ccs + cc[u]] = from_f32<bf16>(cells[k]);
+                if (k < K) cst[u][k * ccs + cc[u]] = from_f32<bf16>(wv[u][k]);
         }
     }
 
@@ -1949,8 +1986,10 @@ __global__ __launch_bounds__(BLOCK) void ssm_gdn_step_fused_carried(
     // Rows [lo, lo + m) staged (m <= SCH): each thread a 16-byte piece of
     // the keys and two of the values, then a wavefront a row forms its dots,
     // norm and log-gate from the stage.
-    auto stage = [&](int lo, int m) {
-        lds_barrier();
+    // Rows [lo, lo + m) into the stage (m <= SCH): each thread a 16-byte
+    // piece of the keys and two of the values. Their gates and dots wait for
+    // the own row ([`dots`]).
+    auto stage_load = [&](int lo, int m) {
         constexpr int KP = KD / 8, UP = VD / 4;
         for (int x = tid; x < m * KP; x += BLOCK) {
             const int e = x / KP, p8 = x % KP;
@@ -1974,6 +2013,10 @@ __global__ __launch_bounds__(BLOCK) void ssm_gdn_step_fused_carried(
             where(step, cl, lo + tid, slot, pos);
             s_a[tid] = gdn_log_gate(step.plane_at<const bf16>(slot, pos, 0), h, V_h, dt_bias, a_log);
         }
+    };
+    // The staged rows' dots with the own row's q̂ and k̂, their norms and
+    // gates: a wavefront a row, every row at once.
+    auto dots = [&](int m) {
         lds_barrier();
         for (int e = wave; e < m; e += WAVES) {
             float a2 = 0.f, dq = 0.f, dk = 0.f;
@@ -1997,6 +2040,11 @@ __global__ __launch_bounds__(BLOCK) void ssm_gdn_step_fused_carried(
         }
         lds_barrier();
     };
+    auto stage = [&](int lo, int m) {
+        lds_barrier();
+        stage_load(lo, m);
+        dots(m);
+    };
     // Staged row e folded into this thread's rows: S' = bf16(bf16(S·g) + k̂·u).
     auto fold_row = [&](int e) {
         const float g = __expf(c_glog[e]), nj = c_nj[e];
@@ -2015,8 +2063,7 @@ __global__ __launch_bounds__(BLOCK) void ssm_gdn_step_fused_carried(
     };
     // Where every carried row fits one stage, it is staged once for the
     // fold and the linear attention both.
-    const bool whole = n <= SCH;
-    if (n > 0 && whole) stage(0, n);
+    if (n > 0 && whole) dots(n);
     for (int lo = 0; lo < c; lo += SCH) {
         const int m = min(SCH, c - lo);
         if (!whole) stage(lo, m);
