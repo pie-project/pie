@@ -326,12 +326,16 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     } = config.model;
 
     // The library forms programs are planned with: what every engine served
-    // here emits (`pipeline::program::serve_backend`), before any program
+    // here states (`pipeline::program::serve_forms`), before any program
     // (the standard samplers first) is registered.
     for d in engine_configs.iter() {
-        if let Some(backend) = crate::engine::verbs::codegen_backend(&d.engine_backend) {
-            crate::pipeline::program::serve_backend(backend);
-        }
+        let facts = d.engine_backend.device_facts().ok_or_else(|| {
+            anyhow::anyhow!(
+                "an engine states no device facts, so no library forms its emitters serve; \
+                 programs are planned with the forms every engine states"
+            )
+        })?;
+        crate::pipeline::program::serve_forms(&facts.backend, facts.library_forms);
     }
 
     // Each engine's readouts, a fire bound (`Engine::readout_facts`): a

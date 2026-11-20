@@ -668,6 +668,7 @@ impl Engine for Metal {
                 storage_alignment: 256,
                 storage_max_tile_bytes: shell.max_buffer(),
                 codegen_backend: Some("metal".to_string()),
+                library_forms: eta_compiler::codegen::metal::LIBRARY_FORMS,
             },
             pools,
             chunks,

@@ -95,7 +95,7 @@ impl CompiledStage {
 /// library region only of a form the backend states, and leaves any other
 /// dataflow to generated regions (what a backend without the form ran
 /// before the form existed).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct LibraryForms {
     /// A temperature-scaled Gumbel draw over a top-p / top-k cut as one
     /// `NucleusSample` region (`match_draw_dataflow`).

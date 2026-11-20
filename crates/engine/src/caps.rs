@@ -15,7 +15,14 @@ pub struct DeviceFacts {
     pub storage_alignment: u32,
     pub storage_max_tile_bytes: u64,
     pub codegen_backend: Option<String>,
+    /// The library forms this engine's guest emitters serve
+    /// ([`LibraryForms`]): the planner forms a library region only of a form
+    /// every engine of the process states, and plans any other as generated
+    /// regions. Required: an engine states what it serves.
+    pub library_forms: LibraryForms,
 }
+
+pub use eta_compiler::plan::LibraryForms;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FireLimits {
