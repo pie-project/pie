@@ -207,7 +207,14 @@ impl ResidencyPlanner {
             && ((victims.deficit.pages > 0 && swap_free == 0) || !room.rs.covers(state));
         // Kv the head itself lacks waits on the supply first; kv that stands
         // for state it lacks moves now, as nothing else frees its chunks.
+        // The queue's quantum (other waiters' one-page asks, counted in the
+        // deficit) is no kv of the head's: a bind or a restore whose kv is
+        // gathered waited on a full disk for it, its runs one queued
+        // resident away and nothing issued (Mac Pro's M5 on 5120cbc3c:
+        // need_moves Some(Some(1)), 69 to 91 candidates). A victim the
+        // room below cannot take is found unhostable at its quote.
         let kv_deficit = victims.deficit.pages.saturating_sub(victims.rs_pages);
+        let kv_own = victims.own_pages.min(kv_deficit);
         if victims.deficit.pages > 0 {
             // No room below for kv: only kv the head itself lacks waits on
             // it. Chunks a head's runs need empty as their occupants' guest
@@ -215,7 +222,8 @@ impl ResidencyPlanner {
             // swap tier does not stop; returning here for them left a
             // restore head with a plan (an eviction, or the compaction
             // after it) issuing nothing on a disk full of parked kv.
-            if kv_deficit > 0 && (!self.port.suspend_capable() || swap_free == 0) {
+            if kv_own > 0 && (!self.port.suspend_capable() || swap_free == 0) {
+                self.plan_ended(victims.head, "no room below for the head's own kv", host_short, &[]);
                 self.swap_bound.store(true, Ordering::Release);
                 self.note_short(victims.head, deficit, if host_short { deficit } else { 0 });
                 self.check_starvation(StarveCause::NoSwapRoom);
@@ -229,6 +237,7 @@ impl ResidencyPlanner {
             // anything (the disk-only M1 hang), and a victim the swap
             // cannot take is found unhostable when it is quoted.
             if kv_deficit > 0 && !self.supply_stalled() {
+                self.plan_ended(victims.head, "kv on its way", host_short, &[]);
                 self.stats
                     .eviction_deferrals
                     .fetch_add(1, Ordering::Relaxed);
@@ -253,6 +262,7 @@ impl ResidencyPlanner {
             && victims.deficit.pages > 0
             && self.park_down_for_pages(victims.head_pid, victims.deficit.pages)
         {
+            self.plan_ended(victims.head, "parked state moves down", host_short, &[]);
             self.note_short(victims.head, 0, 0);
             return;
         }
@@ -290,6 +300,7 @@ impl ResidencyPlanner {
             && self.port.compaction_comes(run, pieces)
         {
             self.stats.compaction_waits.fetch_add(1, Ordering::Relaxed);
+            self.plan_ended(victims.head, "compaction asked", host_short, &[]);
             tracing::debug!(
                 head = %victims.head_pid,
                 run,
@@ -371,6 +382,7 @@ impl ResidencyPlanner {
             self.record_host_swap_exhaustion();
         }
         if picks.is_empty() && parking_down {
+            self.plan_ended(victims.head, "parked state moves down", host_short, &unhostable);
             // The parked state's move funds it: nothing for the policy yet.
             self.note_short(victims.head, 0, 0);
             return;
@@ -384,6 +396,16 @@ impl ResidencyPlanner {
             } else {
                 0
             };
+            self.plan_ended(
+                victims.head,
+                if unhostable.is_empty() {
+                    "no pick: the policy is asked"
+                } else {
+                    "every pick unhostable: the policy is asked"
+                },
+                host_short,
+                &unhostable,
+            );
             self.note_short(victims.head, deficit, host);
             if victims.deficit.pages == 0 {
                 self.check_rs_starvation(victims.head);
@@ -395,14 +417,29 @@ impl ResidencyPlanner {
             return;
         }
         if self.commit_evictions(victims.head, picks, quiet) {
+            self.plan_ended(victims.head, "evictions issued", host_short, &unhostable);
             // Moves on their way fund it: nothing for the policy yet.
             self.note_short(victims.head, 0, 0);
         } else {
             // Every pick declined at its start: the head is short as with
             // none, and says so, rather than waiting on moves never begun.
             tracing::debug!(head = ?victims.head_pid, "planner: no pick could start its move");
+            self.plan_ended(victims.head, "no pick could start its move", host_short, &unhostable);
             self.note_short(victims.head, deficit, if host_short { deficit } else { 0 });
         }
+    }
+
+    /// Records where the eviction plan for `head` stopped, for the stall
+    /// dump ([`super::victim::PlanEnd`]).
+    fn plan_ended(&self, head: EntryKey, ended: &'static str, host_short: bool, unhostable: &[ProcessId]) {
+        self.with_inner(|inner| {
+            inner.last_plan = Some(super::victim::PlanEnd {
+                head,
+                ended,
+                host_short,
+                unhostable: unhostable.to_vec(),
+            });
+        });
     }
 
     /// The pool's room count and the swap tiers' free slots now: what a
@@ -466,6 +503,10 @@ impl ResidencyPlanner {
             // whole, free its chunks: free pages are no runs of chunks. So
             // is the restore of a process such a bind suspended.
             let room = inner.room_pages(waiter).saturating_sub(expected.pages);
+            let own_pages = waiter
+                .kv_need()
+                .saturating_sub(inner.accum.len() as u32)
+                .saturating_sub(expected.pages.saturating_add(free));
             let deficit = Reclaim {
                 pages: missing
                     .saturating_sub(expected.pages.saturating_add(free))
@@ -571,6 +612,7 @@ impl ResidencyPlanner {
                     // wait on the supply for: moved now, as nothing else
                     // frees their chunks.
                     rs_pages: room,
+                    own_pages,
                     rs_short: RsUnits::default(),
                     restore: matches!(waiter.kind, WaitKind::Restore { .. }),
                     members,

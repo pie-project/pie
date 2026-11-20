@@ -85,6 +85,14 @@ enum Board {
 pub(super) const STALL_SAYS_AGAIN: std::time::Duration =
     super::residency_planner::ADMIT_SAYS_AFTER;
 
+/// A count of processes and the first few of them, for a log line.
+fn some_pids<'a>(pids: impl ExactSizeIterator<Item = &'a ProcessId>) -> String {
+    const SHOWN: usize = 4;
+    let count = pids.len();
+    let shown: Vec<String> = pids.take(SHOWN).map(ToString::to_string).collect();
+    format!("{count}{:?}", shown)
+}
+
 impl ResidencyPlanner {
     pub fn plan(self: &Arc<Self>) {
         // A grant dropped unspent during the pass gave back room the pass
@@ -276,9 +284,27 @@ impl ResidencyPlanner {
             let kv_missing = waiter.kv_need().saturating_sub(inner.accum.len() as u32);
             let again = inner.stall_dumped.is_some_and(|(at, seen, _)| (at, seen) == (key, gives));
             inner.stall_dumped = Some((key, gives, crate::rt::Instant::now()));
-            Some((key, pid, kind, pids, again, refusal, kv_missing))
+            // Where the last eviction plan for this head stopped, whether
+            // the room below was short, and whom its quote found
+            // unhostable; and every victim blocked now (host swap: its move
+            // found no room below; prepare: its move found nothing).
+            let plan = match inner.last_plan.as_ref() {
+                Some(end) if end.head == key => format!(
+                    "ended={:?} host_short={} unhostable={}",
+                    end.ended,
+                    end.host_short,
+                    some_pids(end.unhostable.iter())
+                ),
+                _ => "no eviction plan for this head".to_owned(),
+            };
+            let blocked = format!(
+                "host_swap_blocked={} prepare_blocked={}",
+                some_pids(inner.host_swap_blocked.iter()),
+                some_pids(inner.prepare_blocked.iter())
+            );
+            Some((key, pid, kind, pids, again, refusal, kv_missing, plan, blocked))
         });
-        let Some((key, pid, kind, pids, again, refusal, kv_missing)) = stalled else {
+        let Some((key, pid, kind, pids, again, refusal, kv_missing, plan, blocked)) = stalled else {
             return;
         };
         // What the head's step takes, read as the map and the step read it.
@@ -317,6 +343,9 @@ impl ResidencyPlanner {
             again,
             refusal = %refusal.unwrap_or_default(),
             ?need_moves,
+            %plan,
+            %blocked,
+            swap = ?self.swap_stats(),
             %held_by,
             free_runs = ?need.as_ref().map(|need| {
                 need.entries()

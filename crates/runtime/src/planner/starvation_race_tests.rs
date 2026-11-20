@@ -8261,3 +8261,111 @@ fn a_process_evicted_while_queued_is_restored_only_behind_the_queue_ahead_of_it(
     });
     assert_eq!(head_pid(&planner), Some(youngest), "nothing ahead of it: restored");
 }
+
+/// Mac Pro's M5 at 2 GiB on 5120cbc3c, stuck at 77 serves: a bind head
+/// short of a run of chunks (need [(9, 1)]), one queued resident's chunk
+/// in the cheapest window (need_moves Some(Some(1))), 300 more queued
+/// behind, nothing in flight, and no eviction ever issued. Here: a run of
+/// three over chunks 0..3, chunk 1 a queued resident's, the disk with no
+/// slot free, and more one-page allocations queued than chunks stand
+/// free. The one move is issued.
+#[tokio::test(flavor = "current_thread")]
+async fn a_bind_head_one_queued_resident_away_is_funded_with_nothing_in_flight() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(3, 0..0, 0));
+    pool.free.lock().extend([0, 2]);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let binder = ProcessId::new_v4();
+    let occupant = ProcessId::new_v4();
+    let queued: Vec<ProcessId> = (0..4).map(|_| ProcessId::new_v4()).collect();
+    for &pid in [binder, occupant].iter().chain(&queued) {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    pool.kv.lock().push((1, occupant));
+    planner.with_inner(|inner| {
+        for &pid in std::iter::once(&occupant).chain(&queued) {
+            inner.enqueue(
+                pid,
+                allocation(Demand {
+                    kv_pages: 1,
+                    rs: RsUnits::default(),
+                }),
+            );
+        }
+    });
+    let p = planner.clone();
+    let _bind = crate::rt::spawn(async move { p.wait_bind_room(binder, 3, 1).await });
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.stats.evictions_started.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+    }
+    assert!(
+        planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
+        "the queued occupant is moved for the head"
+    );
+    assert!(
+        planner.with_inner(|inner| inner.last_plan.is_some()),
+        "the stall dump's plan line says where the plan stopped"
+    );
+}
+
+/// Mac Pro's M5 at 5 GiB on 5120cbc3c, stalled at 2,637 serves: a restore
+/// head refused in its unpark (UnparkShort, a run of four short, no free
+/// run), its need two runs of seven and one of four, one queued resident
+/// away (need_moves Some(Some(1))), 1,600 queued, nothing in flight, no
+/// eviction ever issued. Here: a run of two over chunks 0..2, chunk 1 a
+/// queued resident's, more one-page allocations queued than chunks stand
+/// free, the disk with no slot free. The one move is issued.
+#[tokio::test(flavor = "current_thread")]
+async fn a_restore_head_one_queued_resident_away_is_funded_with_nothing_in_flight() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(3, 0..0, 0));
+    pool.free.lock().extend([0, 2]);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let head = ProcessId::new_v4();
+    let occupant = ProcessId::new_v4();
+    let queued: Vec<ProcessId> = (0..4).map(|_| ProcessId::new_v4()).collect();
+    for &pid in [head, occupant].iter().chain(&queued) {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    pool.kv.lock().push((1, occupant));
+    planner.with_inner(|inner| {
+        let proc = inner.procs.get_mut(&head).unwrap();
+        proc.state = Residency::Evicted;
+        proc.roles_short = Some(PendingBind {
+            run: 2,
+            pieces: 1,
+            pages: 2,
+        });
+        inner.enqueue(
+            head,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        );
+        for &pid in std::iter::once(&occupant).chain(&queued) {
+            inner.enqueue(
+                pid,
+                allocation(Demand {
+                    kv_pages: 1,
+                    rs: RsUnits::default(),
+                }),
+            );
+        }
+    });
+    planner.poke();
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.stats.evictions_started.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+    }
+    assert!(
+        planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
+        "the queued occupant is moved for the head"
+    );
+}

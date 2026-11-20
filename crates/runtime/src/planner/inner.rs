@@ -60,6 +60,10 @@ pub(super) struct Inner {
     /// room, and whether that was said ([`super::ResidencyPlanner::tick`]).
     pub(super) held_in_flight:
         Option<(super::wait::EntryKey, u64, crate::rt::Instant, bool)>,
+    /// How the last eviction plan ended, for the stall dump: the head it
+    /// planned for, where it stopped, whether the room below was short,
+    /// and the candidates its quote found unhostable.
+    pub(super) last_plan: Option<super::victim::PlanEnd>,
 }
 
 impl Inner {
