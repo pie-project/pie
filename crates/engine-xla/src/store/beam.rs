@@ -64,12 +64,13 @@ pub fn run_rows(layout: Layout) -> i64 {
 }
 
 impl Pools {
-    /// Lays (compiles) the head program of width rung `layout`.
-    pub fn lay_beam_head(
+    /// Lays (compiles) the head programs of width rungs `layouts`: traced in
+    /// turn, compiled side by side.
+    pub fn lay_beam_heads(
         &mut self,
         device: &Device,
         handles: &Handles,
-        layout: Layout,
+        layouts: &[Layout],
     ) -> Result<()> {
         let blank = Head {
             state_row: 0,
@@ -79,10 +80,32 @@ impl Pools {
             live: 0,
             pool: Vec::new(),
         };
-        let (tracer, _) = self.beam_head_tracer(handles, layout, &blank)?;
-        let program = crate::exec::compile(device, tracer, &[])?;
-        self.beam_heads.retain(|(laid, _)| *laid != layout);
-        self.beam_heads.push((layout, program));
+        let mut texts = Vec::with_capacity(layouts.len());
+        for &layout in layouts {
+            let (tracer, _) = self.beam_head_tracer(handles, layout, &blank)?;
+            texts.push(tracer.finish(&[]));
+        }
+        let compiled: Vec<Result<std::sync::Arc<crate::device::Program>>> =
+            std::thread::scope(|scope| {
+                let jobs: Vec<_> = texts
+                    .iter()
+                    .map(|(text, sig)| scope.spawn(move || device.program(text, sig.clone())))
+                    .collect();
+                jobs.into_iter()
+                    .map(|job| {
+                        job.join().unwrap_or_else(|_| {
+                            Err(Fault::Unbound {
+                                what: "a beam head's compile panicked".to_string(),
+                            })
+                        })
+                    })
+                    .collect()
+            });
+        for (&layout, program) in layouts.iter().zip(compiled) {
+            let program = program?;
+            self.beam_heads.retain(|(laid, _)| *laid != layout);
+            self.beam_heads.push((layout, program));
+        }
         Ok(())
     }
 
@@ -138,7 +161,8 @@ impl Pools {
         let slot_rows = i64::try_from(shape.slot_bytes / super::ROW_BYTES).unwrap_or(0);
         if grain_rows == 0 || slot_rows == 0 {
             return Err(Fault::Unbound {
-                what: "a kv page narrower than a pool row, which a beam copy moves whole".to_string(),
+                what: "a kv page narrower than a pool row, which a beam copy moves whole"
+                    .to_string(),
             });
         }
         let root = self.root();
@@ -238,7 +262,8 @@ impl Pools {
                         let d_row = cx.select(pick, dst_row, z)?;
                         let d_row = cx.reduce(d_row, &[0], kernels_xla::hlo::Fold::Sum)?;
                         let lane0 = cx.const_i(Elem::I32, 0, &[]);
-                        let block = cx.dynamic_slice(a[1], &[s_row, lane0], &[slot_rows, ROW_WORDS])?;
+                        let block =
+                            cx.dynamic_slice(a[1], &[s_row, lane0], &[slot_rows, ROW_WORDS])?;
                         let next = cx.dynamic_update_slice(a[1], block, &[d_row, lane0])?;
                         let one = cx.const_i(Elem::I32, 1, &[]);
                         Ok(vec![cx.add(a[0], one)?, next])

@@ -476,15 +476,19 @@ impl Shell {
         let frames = self.staging_facts().ring_slots.saturating_sub(1).max(1);
         let top = self.budgets.tokens.max_lanes.min(128);
         let mut rung = 1u32;
-        let mut laid = 0;
+        let mut layouts = Vec::new();
         while rung <= top {
-            let layout =
-                crate::beam::rung_layout(rung, paging.page_size, paging.pages_per_slot, frames);
-            self.pools
-                .lay_beam_head(&self.device, &self.handles, layout)?;
-            laid += 1;
+            layouts.push(crate::beam::rung_layout(
+                rung,
+                paging.page_size,
+                paging.pages_per_slot,
+                frames,
+            ));
             rung *= 2;
         }
+        self.pools
+            .lay_beam_heads(&self.device, &self.handles, &layouts)?;
+        let laid = layouts.len();
         tracing::info!(
             programs = laid,
             top_rung = rung / 2,

@@ -105,9 +105,23 @@ fn take(f: &mut Func, table: Val, idx: Val) -> Built<Val> {
     )
 }
 
-/// `base` (`[n]`) with `base[idx[i]] = max(base[idx[i]], upd[i])`; an index
+/// The inclusive prefix sum of `x` (`[n]` i32): log2(n) shifted adds.
+fn prefix_sum(f: &mut Func, mut x: Val) -> Built<Val> {
+    let n = f.dims(x)[0];
+    let zero = f.const_i(Elem::I32, 0, &[]);
+    let mut k = 1;
+    while k < n {
+        let head = f.slice_axis(x, 0, 0, n - k)?;
+        let shifted = f.pad(head, zero, &[k], &[0], &[0])?;
+        x = f.add(x, shifted)?;
+        k *= 2;
+    }
+    Ok(x)
+}
+
+/// `base` (`[n]`) with each `upd[i]` combined into `base[idx[i]]`; an index
 /// out of range lands nowhere.
-fn scatter_max(f: &mut Func, base: Val, idx: Val, upd: Val) -> Built<Val> {
+fn scatter_with(f: &mut Func, base: Val, idx: Val, upd: Val, combine: Combine) -> Built<Val> {
     let m = f.dims(idx)[0];
     let at = f.reshape(idx, &[m, 1])?;
     f.scatter(
@@ -122,7 +136,7 @@ fn scatter_max(f: &mut Func, base: Val, idx: Val, upd: Val) -> Built<Val> {
             scatter_dims_to_operand_dims: vec![0],
             index_vector_dim: 1,
         },
-        Combine::Max,
+        combine,
     )
 }
 
@@ -267,13 +281,7 @@ pub fn step(f: &mut Func, layout: Layout, state: Val, parents: Val, at: At) -> B
     let free_b = f.compare(Cmp::Gt, free0, q_zero)?;
     let free_i = i32_of(f, free_b);
     let place = {
-        let fq = f.broadcast(free_i, &[cap, cap], &[1])?; // [q, r] = free[r]
-        let qi = f.iota(i, &[cap, cap], 0);
-        let ri = f.iota(i, &[cap, cap], 1);
-        let upto = f.compare(Cmp::Le, ri, qi)?;
-        let z = f.like_i(fq, 0);
-        let fq = f.select(upto, fq, z)?;
-        let count = f.reduce(fq, &[1], Fold::Sum)?;
+        let count = prefix_sum(f, free_i)?;
         let one_q = f.like_i(count, 1);
         f.sub(count, one_q)?
     };
@@ -297,13 +305,19 @@ pub fn step(f: &mut Func, layout: Layout, state: Val, parents: Val, at: At) -> B
     let gets = f.and(need, found)?;
     // inh[b] = map[par[b]]
     let inh = {
-        let pr = f.broadcast(par, &[b_n, b_n, cap], &[0])?; // [b, e, j] = par[b]
-        let ei = f.iota(i, &[b_n, b_n, cap], 1);
-        let pick = f.compare(Cmp::Eq, pr, ei)?;
-        let rows = f.broadcast(map, &[b_n, b_n, cap], &[1, 2])?; // [b, e, j] = map[e, j]
-        let z = f.like_i(rows, 0);
-        let rows = f.select(pick, rows, z)?;
-        f.reduce(rows, &[1], Fold::Sum)?
+        let at = f.reshape(par, &[b_n, 1])?;
+        f.gather(
+            map,
+            at,
+            &GatherDims {
+                offset_dims: vec![1],
+                collapsed_slice_dims: vec![0],
+                start_index_map: vec![0],
+                index_vector_dim: 1,
+                ..GatherDims::default()
+            },
+            &[1, cap],
+        )?
     };
     let c_bc = f.splat(c, &[b_n, cap])?;
     let at_c = f.compare(Cmp::Eq, col_iota, c_bc)?;
@@ -350,32 +364,36 @@ pub fn step(f: &mut Func, layout: Layout, state: Val, parents: Val, at: At) -> B
     let free_s = i32_of(f, free_s);
     // a page some beam held in a column through the last fire and no beam
     // holds there now
+    // A page lies in one column of every list that names it (§6.3), and a
+    // parent with any child keeps its pages through its first child, so a
+    // page held through the last fire is freed when only rows no child
+    // continues name it: one max over the pages of 1 + (its row continues).
     let freed = {
-        let old = f.broadcast(map, &[b_n, b_n, cap], &[0, 2])?; // [p, b, j] = map[p, j]
-        let new = f.broadcast(map_s, &[b_n, b_n, cap], &[1, 2])?; // [p, b, j] = map'[b, j]
-        let same = f.compare(Cmp::Eq, old, new)?;
-        // only a live beam holds a page
-        let holder = f.broadcast(alive, &[b_n, b_n, cap], &[1])?;
-        let same = f.and(same, holder)?;
-        let held = any(f, same, &[1])?; // [p, j]
+        let parent_of = f.broadcast(par, &[b_n, b_n], &[0])?; // [b, p] = par[b]
+        let rows = f.iota(i, &[b_n, b_n], 1);
+        let child = f.compare(Cmp::Eq, parent_of, rows)?;
+        let child_alive = f.broadcast(alive, &[b_n, b_n], &[0])?;
+        let child = f.and(child, child_alive)?;
+        let continues = any(f, child, &[0])?; // [p]
+        let continues = i32_of(f, continues);
+        let one_b = f.like_i(continues, 1);
+        let mark = f.add(continues, one_b)?;
+        let mark = f.broadcast(mark, &[b_n, cap], &[0])?;
+        let was_live = f.broadcast(alive, &[b_n, cap], &[0])?;
         let cp_bc = f.splat(cp, &[b_n, cap])?;
         let through = f.compare(Cmp::Le, col_iota, cp_bc)?;
-        let not_held = f.not(held);
-        let gone = f.and(through, not_held)?;
-        let was_live = f.broadcast(alive, &[b_n, cap], &[0])?;
-        let gone = f.and(gone, was_live)?;
-        // page 0 under a mid-page prompt is never freed
-        let map_zero = f.like_i(map, 0);
-        let is0 = f.compare(Cmp::Eq, map, map_zero)?;
-        let tail_bc = f.splat(has_tail, &[b_n, cap])?;
-        let prompt0 = f.and(is0, tail_bc)?;
-        let not_prompt0 = f.not(prompt0);
-        let gone = f.and(gone, not_prompt0)?;
-        let gone = i32_of(f, gone);
+        let held = f.and(through, was_live)?;
+        let none = f.like_i(map, 0);
+        let mark = f.select(held, mark, none)?;
         let idx = f.reshape(map, &[b_n * cap])?;
-        let upd = f.reshape(gone, &[b_n * cap])?;
+        let upd = f.reshape(mark, &[b_n * cap])?;
         let base = f.like_i(q_iota, 0);
-        scatter_max(f, base, idx, upd)?
+        let worst = scatter_with(f, base, idx, upd, Combine::Max)?;
+        let only_ended = f.like_i(worst, 1);
+        let gone = f.compare(Cmp::Eq, worst, only_ended)?;
+        // page 0 under a mid-page prompt is never freed
+        let gone = f.and(gone, not_frozen0)?;
+        i32_of(f, gone)
     };
     let freed = f.reshape(freed, &[1, cap])?;
     let pending_s = f.dynamic_update_slice(pending, freed, &[k, zero])?;
