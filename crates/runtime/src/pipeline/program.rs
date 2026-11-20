@@ -6,7 +6,45 @@ use std::sync::{Arc, Mutex};
 use eta_compiler::codegen::cuda::region_analysis::RegionAnalysis;
 use eta_compiler::codegen::launch::LaunchPackage;
 use eta_compiler::codegen::program::{Backend, EmittedKernel, emit_program};
-use eta_compiler::plan::CompiledStage;
+use eta_compiler::plan::{CompiledStage, LibraryForms};
+
+/// The library forms this process plans programs with: every form, less
+/// what an engine it serves states its emitters lack
+/// ([`Backend::library_forms`]), narrowed at boot before any program is
+/// registered ([`serve_backend`]).
+static PLAN_FORMS: Mutex<LibraryForms> = Mutex::new(LibraryForms::ALL);
+
+/// Narrows the forms programs are planned with to what `backend` (an
+/// engine's codegen backend) serves; logs once what it plans as generated
+/// regions instead.
+pub fn serve_backend(backend: &str) {
+    let Some(parsed) = Backend::parse(backend) else {
+        return;
+    };
+    let states = parsed.library_forms();
+    let mut forms = PLAN_FORMS.lock().unwrap();
+    let narrowed = forms.and(states);
+    if narrowed != *forms {
+        let mut generated = Vec::new();
+        if forms.draw && !narrowed.draw {
+            generated.push("the temperature-scaled gumbel draw over a top-p / top-k cut");
+        }
+        if forms.bf16_cut && !narrowed.bf16_cut {
+            generated.push("a bf16 row's lane cut");
+        }
+        tracing::info!(
+            backend,
+            generated = %generated.join("; "),
+            "the {backend} emitters state no library form for these: programs are planned with \
+             them as generated regions"
+        );
+    }
+    *forms = narrowed;
+}
+
+fn plan_forms() -> LibraryForms {
+    *PLAN_FORMS.lock().unwrap()
+}
 use eta_ir::container::{self, ContainerDecodeError, PortSource, TraceContainer};
 use eta_ir::container_hash;
 use eta_ir::op::Op;
@@ -307,7 +345,7 @@ impl RegisteredProgram {
         let bound = bind_within(decoded, lanes, caps, budget).map_err(RegisterError::Bind)?;
         let channel_accesses = Registry::channel_accesses(&bound.container);
         let reads = Registry::reads(&bound.container);
-        let compiled_stages = eta_compiler::plan::compile_bound(&bound);
+        let compiled_stages = eta_compiler::plan::compile_bound_with(&bound, plan_forms());
         Ok(Self {
             bytes,
             hash,
