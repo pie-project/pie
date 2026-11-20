@@ -131,6 +131,12 @@ pub struct Capabilities {
     /// ([`GuestCost`]): none stated, the default, holds it to nothing.
     #[serde(default)]
     pub guest_cost: GuestCost,
+    /// The frames this engine keeps in flight, its run-ahead depth (at
+    /// least 1): the one number the runtime dispatches frames by and sizes
+    /// a beam group's pool with (`BEAM-PAGE-LISTS.md` §3's `F`). The load
+    /// request's depth is what the runtime asks for; this is what the
+    /// engine runs.
+    pub frames_in_flight: u32,
 
     /// The mixed fires (prompt rows beside one-row decode lanes) the load
     /// serves without building a program: the runtime's cutter composes no
@@ -275,5 +281,20 @@ mod mixed_lanes {
         assert!(!laid.fits(&limits, 0, 0, 65));
         assert!(MixedLanes::Any.fits(&limits, 35, 105, 17));
         assert!(!MixedLanes::Any.fits(&limits, 60, 120, 11));
+    }
+}
+
+/// The frames in flight an engine states ([`Capabilities::frames_in_flight`])
+/// from the depth it runs: refused by name at load where none or more than
+/// a `u32` holds, never clamped.
+pub fn stated_frames(depth: usize) -> Result<u32, crate::error::Error> {
+    match u32::try_from(depth) {
+        Ok(0) => Err(crate::error::Error::Program(
+            "this load keeps no frame in flight; a fire needs one".to_string(),
+        )),
+        Ok(frames) => Ok(frames),
+        Err(_) => Err(crate::error::Error::Program(format!(
+            "this load keeps {depth} frames in flight, past what a u32 states"
+        ))),
     }
 }

@@ -990,6 +990,7 @@ where
                 }
             },
             mixed_lanes: engine::MixedLanes::Any,
+            frames_in_flight: engine::stated_frames(shell.frames_in_flight())?,
         };
 
         self.shell = Some(shell);

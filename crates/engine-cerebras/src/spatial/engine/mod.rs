@@ -270,6 +270,8 @@ impl Engine for Spatial {
             // Cerebras states no bound on one submission.
             guest_cost: engine::GuestCost::default(),
             mixed_lanes: engine::MixedLanes::Any,
+            // one frame at a time: no run-ahead
+            frames_in_flight: 1,
         };
         self.facts = Some(facts);
         self.caps = Some(caps.clone());

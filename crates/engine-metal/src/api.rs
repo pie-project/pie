@@ -708,6 +708,7 @@ impl Engine for Metal {
             // (`crate::rates::at_load`).
             guest_cost: engine::GuestCost::default(),
             mixed_lanes: engine::MixedLanes::Any,
+            frames_in_flight: engine::stated_frames(shell.frames_in_flight())?,
         };
 
         // Every pipeline the load's rungs dispatch is built now, before

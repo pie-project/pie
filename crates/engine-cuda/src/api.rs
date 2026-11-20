@@ -898,6 +898,9 @@ impl Engine for Cuda {
             // compute device).
             guest_cost: engine::GuestCost::default(),
             mixed_lanes: engine::MixedLanes::Any,
+            frames_in_flight: u32::from(
+                engine::runahead::Runahead::of(frames_in_flight).frames_in_flight,
+            ),
         };
 
         // A fire's lanes, rows and readouts bound the scheduler's waves: a
