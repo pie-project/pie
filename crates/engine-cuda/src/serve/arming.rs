@@ -84,7 +84,6 @@ pub(super) struct Arming {
     verify: bool,
     group: bool,
     records: bool,
-    priced: bool,
     dropped: std::collections::BTreeSet<u32>,
     weighed: [(usize, usize); Kind::COUNT],
     armed: usize,
@@ -996,105 +995,6 @@ impl Shell {
         }
     }
 
-    /// Arms the lattice over synthetic lanes. Their reads of the streamed
-    /// weights are the shell's, not a fire the runtime asked for: the use
-    /// record forgets them, so the runtime's first window orders the cache
-    /// by served tokens alone (a load arming at its starting residency arms
-    /// after the runtime last read the record).
-    /// The lattice's buckets a doubling past `engine.prefill_lattice_from`,
-    /// halved until the bodies of `rest` (the narrower prefill, mixed and
-    /// wide targets' buckets, still to arm) fit what the allowance has left
-    /// each at what the bodies of its kind armed so far weigh (`weighed`,
-    /// bytes and bodies a kind; the top bucket arms one of each first, and a
-    /// kind's bodies hold about as many nodes at any bucket, where kinds
-    /// differ: Qwen3.6-35B-A3B's mixed bodies 8.9 MiB, its lattice's 5.5 MiB
-    /// on average): a load whose
-    /// allowance arms every key keeps the profile's lattice, and one that
-    /// would leave keys to walk eagerly pads its fires to fewer buckets
-    /// instead. A coarser default lattice's buckets are the finer one's
-    /// every other past the fine rows, so nothing compiled changes. Returns
-    /// the buckets dropped; says so, and loudly where even the coarsest
-    /// lattice does not fit.
-    fn fit_lattice(
-        &mut self,
-        rest: &[(u32, Kind)],
-        kept: usize,
-        weighed: &[(usize, usize); Kind::COUNT],
-    ) -> std::collections::BTreeSet<u32> {
-        let Some((steps, from, mut fine)) = self.lattice else {
-            return std::collections::BTreeSet::new();
-        };
-        let spent = self.cache.body_stats().census;
-        if spent.bodies == 0 {
-            return std::collections::BTreeSet::new();
-        }
-        let average = spent.bytes / spent.bodies;
-        let price = |kind: Kind| match weighed[kind.at()] {
-            (bytes, bodies) if bodies > 0 => bytes / bodies,
-            _ => average,
-        };
-        let was = self.budget.buckets.clone();
-        let mut buckets = was.clone();
-        let need = |buckets: &[u32]| {
-            rest.iter()
-                .filter(|(b, _)| buckets.contains(b))
-                .map(|&(_, kind)| price(kind))
-                .sum::<usize>()
-                + kept * average
-        };
-        // What the allowance has left, or the card where it has less: the
-        // ceiling's spare stops arming as the allowance does.
-        let allowance = self.bodies_mem.saturating_sub(spent.bytes);
-        let spare = self
-            .pools
-            .spare_bytes_for_bodies(allowance as u64)
-            .map_or(allowance, |spare| {
-                usize::try_from(spare).unwrap_or(usize::MAX)
-            });
-        let room = allowance.min(spare);
-        while need(&buckets) > room {
-            if fine <= steps.max(1) {
-                eprintln!(
-                    "engine-cuda: WARNING: the bodies' hold of {} MiB arms no \
-                     lattice's every key: at {fine} bucket(s) a doubling past {from} rows the {} \
-                     narrower bodies still to arm weigh some {} MiB of the {} MiB left. Free \
-                     the card.",
-                    self.bodies_mem >> 20,
-                    rest.iter().filter(|(b, _)| buckets.contains(b)).count(),
-                    need(&buckets) >> 20,
-                    room >> 20,
-                );
-                break;
-            }
-            fine /= 2;
-            buckets = crate::api::default_lattice(self.budget.max_tokens, steps, from, fine);
-            buckets.retain(|bucket| was.contains(bucket));
-        }
-        if buckets.len() < was.len() {
-            eprintln!(
-                "engine-cuda: the bodies' hold of {} MiB arms every key at {fine} \
-                 bucket(s) a doubling past {from} rows, not the profile's {}: {} bucket(s), not \
-                 {} ({} bodies armed at {} KiB on average, {} still to arm at the profile's \
-                 lattice, {} MiB left).",
-                self.bodies_mem >> 20,
-                self.lattice.map_or(0, |(_, _, fine)| fine),
-                buckets.len(),
-                was.len(),
-                spent.bodies,
-                average >> 10,
-                rest.iter().filter(|(b, _)| was.contains(b)).count(),
-                room >> 20,
-            );
-        }
-        let dropped = was
-            .iter()
-            .filter(|b| !buckets.contains(b))
-            .copied()
-            .collect();
-        self.budget.buckets = buckets;
-        dropped
-    }
-
     /// Forgets the recorded bodies and arms the lattice again within the
     /// same load, allowed what its last arming took: the pool is backed by
     /// now and those bodies' memory is what the forgetting frees, whatever
@@ -1348,6 +1248,18 @@ impl Shell {
             unfireable,
         } = found;
         let top = targets.iter().map(|(bucket, _)| *bucket).max();
+        // By rows across every kind, the fewest first: what goes eager when
+        // the bodies' allowance runs out is then always the largest rungs
+        // (stated by name at load, `arm_end`). Within one row count, the
+        // composition of more classes first (each class its program's
+        // launches: more launches a fire), then by kind.
+        let classes_of = |target: &BodySynth| {
+            let (lanes, _) = target.lanes();
+            let mut seen: Vec<usize> = lanes.iter().map(|(class, _)| *class).collect();
+            seen.sort_unstable();
+            seen.dedup();
+            seen.len()
+        };
         let rank = |kind: Kind| match kind {
             Kind::Decode => 0u8,
             Kind::Mixed => 1,
@@ -1356,8 +1268,9 @@ impl Shell {
             Kind::Tower => 4,
             Kind::Idle => 5,
         };
-        targets
-            .sort_by_key(|(bucket, target)| (Some(*bucket) != top, rank(target.kind()), *bucket));
+        targets.sort_by_key(|(bucket, target)| {
+            (*bucket, core::cmp::Reverse(classes_of(target)), rank(target.kind()))
+        });
         if targets.is_empty() {
             return None;
         }
@@ -1555,10 +1468,8 @@ impl Shell {
         if let Some(bucket) = self.arm_only {
             targets.retain(|(at, ..)| *at == bucket);
         }
-        // The top bucket's bodies and every decode body arm first; the
-        // narrower prefill, mixed and wide ones after them are what the
-        // lattice coarsens to fit the allowance, each priced at what its
-        // kind's bodies armed so far weigh.
+        // By rows, every kind's fewest first (`lattice_targets`): the
+        // allowance running out leaves the largest rungs, stated eager.
         Some(Arming {
             targets: targets.into(),
             top,
@@ -1566,7 +1477,6 @@ impl Shell {
             verify,
             group,
             records,
-            priced: verify || group || self.lattice.is_none(),
             dropped: std::collections::BTreeSet::new(),
             weighed: [(0usize, 0usize); Kind::COUNT],
             armed: 0,
@@ -1606,24 +1516,6 @@ impl Shell {
         target: BodySynth,
         treatment: Treatment,
     ) -> Result<()> {
-        // A record says the lattice fit whole: it arms as recorded.
-        if !st.priced && !st.from_record && st.narrower(bucket, &target) {
-            st.priced = true;
-            // What is still to arm: the narrower targets a coarser lattice
-            // may drop, and the rest (the top bucket's, the decodes'), which
-            // arm whatever the lattice.
-            let rest: Vec<(u32, Kind)> = std::iter::once((bucket, target.kind()))
-                .chain(
-                    st.targets
-                        .iter()
-                        .filter(|(bucket, target, _)| st.narrower(*bucket, target))
-                        .map(|(bucket, target, _)| (*bucket, target.kind())),
-                )
-                .collect();
-            let kept = st.targets.len() + 1 - rest.len();
-            let dropped = self.fit_lattice(&rest, kept, &st.weighed);
-            st.dropped.extend(dropped);
-        }
         let weighed_before = self.cache.body_stats().census;
         if st.dropped.contains(&bucket) {
             return Ok(());
@@ -1939,14 +1831,14 @@ impl Shell {
         // Every composition arming stopped before (the report above says
         // why), by name: they walk eagerly for the life of the load by this
         // statement, their fires tallied as such (`BodyTally::stated_eager`).
-        let stated = self.cache.stated_eager();
-        if !stated.is_empty() {
+        let stated_now = self.cache.stated_eager();
+        if !stated_now.is_empty() && self.arm_only.is_none() {
             eprintln!(
                 "engine-cuda: {} composition key(s) walk eagerly by statement, arming stopped \
                  before them from bucket {}: {}",
-                stated.len(),
+                stated_now.len(),
                 st.never_from,
-                stated.join(", ")
+                stated_now.join(", ")
             );
         }
         // The lattice the bodies armed over against the profile's: fewer
@@ -1968,8 +1860,12 @@ impl Shell {
             // directory) measures all the same.
             self.bodies_took = captured.max(took);
         }
+        // A re-arm of one bucket (a product's kernel choice) is no
+        // arming of the deployment's: it concludes no record.
+        let stated = self.cache.stated_eager();
         if let Some(record) = self.bodies_record.as_deref()
             && !st.verify
+            && self.arm_only.is_none()
         {
             let measured = super::measured::Measured {
                 bytes: took,
@@ -1987,7 +1883,8 @@ impl Shell {
             match super::measured::conclude(
                 record,
                 self.bodies_from_record,
-                matches!(seal, Seal::Complete),
+                // Whole only where nothing walks eagerly by statement.
+                matches!(seal, Seal::Complete) && stated.is_empty(),
                 measured,
                 st.armed,
                 st.wanted + st.never,
@@ -2000,9 +1897,11 @@ impl Shell {
                 ),
             }
         }
-        // A load that records bodies serves every composition it fires from
-        // one: one that armed none, or stopped arming for want of room, would
-        // serve eagerly, which is never what a deployment asked for. A load
+        // A load that records bodies and armed none would serve every fire
+        // eagerly: refused. One that stopped arming for want of room serves
+        // the rungs past the stop (the largest: arming runs by rows) eagerly,
+        // each stated by name above, and its fires counted apart
+        // (`BodyTally::stated_eager`). A load
         // that stages host-resident experts reads each fire's routes back,
         // so it records none by design (`Run::capturable`; stated at load).
         let attempted = st.wanted + st.never;
@@ -2011,12 +1910,11 @@ impl Shell {
             && !st.verify
             && !st.group
             && attempted > 0
-            && (st.armed == 0 || st.starved.is_some())
+            && st.armed == 0
         {
             return Err(Fault::Residency(format!(
                 "the card does not hold this deployment's graph bodies: {} of {attempted} \
-                 compositions armed{}. A load that records bodies serves every composition \
-                 from one rather than eagerly. Lower `[engine] max_context`, raise \
+                 compositions armed{}, so every fire would walk eagerly. Lower `[engine] max_context`, raise \
                  `[engine.memory] budget_device`, or free what else holds the device; on a \
                  device another process shares, state `[engine.memory] budget_device` as this \
                  engine's part of it, so the fit leaves the other process its room. \
