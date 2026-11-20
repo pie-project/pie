@@ -21,6 +21,7 @@ pub mod extent;
 pub mod fire;
 pub mod fit;
 pub mod frame;
+pub mod host_memory;
 pub mod live;
 pub mod load;
 pub mod memory;
