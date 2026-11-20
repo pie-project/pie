@@ -1595,11 +1595,23 @@ pub fn causal_conv1d_verify(
     let lanes = committed_lanes(OP, indptr)?;
     let [snaps, lane0] = snapshot_args(ctx, OP, snapshots)?;
     let [slab, pages, page_tokens, page_bytes, row_bytes, is_paged] = paged_args(ctx, paged)?;
-    ctx.fire(
-        Fire::at("ssm/conv1d.metal", entry).apply(Grid::of(
+    // A decode window that makes its own row's output alone runs one row of
+    // threads: the conv's rows are its one own row, and a thread commits
+    // every row of a history it holds whole (`kConvVerifyHeld`).
+    let hist = (conv_width - 1) * dilation + 1;
+    let grid = if own_only && hist <= CONV_VERIFY_HIST / CONV_VERIFY_ROWS {
+        Grid::of(
+            [channels / 4, 1, lanes],
+            [(channels / 4).min(CONV_VERIFY_CHANNELS * CONV_VERIFY_ROWS), 1, 1],
+        )
+    } else {
+        Grid::of(
             [channels / 4, CONV_VERIFY_ROWS, lanes],
             [CONV_VERIFY_CHANNELS, CONV_VERIFY_ROWS, 1],
-        )),
+        )
+    };
+    ctx.fire(
+        Fire::at("ssm/conv1d.metal", entry).apply(grid),
         &[
             x.arg(),
             indptr.arg(),
