@@ -1,6 +1,7 @@
 //! bf16 guest values on the device: a cast in, elementwise ops mixing an
 //! f32 constant, a scan over rows of odd length, a gather, a scatter-add, a
-//! transpose, a top-k and a sum, each stored two elements a word by one
+//! transpose, a top-k, a sum and two Gumbel-max draws (one over the bf16
+//! row, masked and divided, one over the f32 row), each stored two elements a word by one
 //! invocation and read back against the host interpreter, which computes
 //! in f32 and rounds every store to nearest even. The values are an odd
 //! number of elements, past one workgroup, so the last word holds padding
@@ -29,7 +30,7 @@ const TOP: u32 = 5;
 
 /// The readers, in channel order past the writers (0: the values, 1: the
 /// miniature's timestep).
-const READERS: [(&str, u32, EtaDtype); 9] = [
+const READERS: [(&str, u32, EtaDtype); 11] = [
     ("x * 0.5 + 1 (bf16 bits)", N, EtaDtype::Bf16),
     ("exp(x * 0.5 + 1)", N, EtaDtype::F32),
     ("cumsum over [7, 143] rows", N, EtaDtype::F32),
@@ -39,6 +40,8 @@ const READERS: [(&str, u32, EtaDtype); 9] = [
     ("top-5 values", TOP, EtaDtype::F32),
     ("top-5 ids", TOP, EtaDtype::U32),
     ("sum", 1, EtaDtype::F32),
+    ("gumbel_argmax of bf16 x, x > 0 kept, / 0.7", 1, EtaDtype::I32),
+    ("gumbel_argmax of f32 x / 0.7", 1, EtaDtype::I32),
 ];
 
 fn program() -> TraceContainer {
@@ -101,6 +104,17 @@ fn program() -> TraceContainer {
         Op::ReduceSum(1),                                         // 27 f32 []
         Op::Reshape { value: 27, shape: Shape::vector(1) },       // 28
         Op::ChanPut { chan: 10, value: 28 },
+        Op::Const(Literal::F32(0.0)),                             // 29
+        Op::Gt(1, 29),                                            // 30 keep
+        Op::Const(Literal::F32(0.7)),                             // 31
+        Op::Iota { len: 2 },                                      // 32 rng state
+        Op::GumbelArgmax { logits: 1, keep: 30, divisor: 31, state: 32 }, // 33
+        Op::Reshape { value: 33, shape: Shape::vector(1) },       // 34
+        Op::ChanPut { chan: 11, value: 34 },
+        Op::Const(Literal::Bool(true)),                           // 35
+        Op::GumbelArgmax { logits: 0, keep: 35, divisor: 31, state: 32 }, // 36
+        Op::Reshape { value: 36, shape: Shape::vector(1) },       // 37
+        Op::ChanPut { chan: 12, value: 37 },
     ];
     TraceContainer {
         names: Vec::new(),
@@ -148,6 +162,7 @@ fn interpreted(decls: &[eta_ir::registry::OutputDecl], x: &[f32]) -> Vec<Vec<f32
         .map(|at| match inst.host_take(&bound, 2 + at).expect("a cell") {
             Value::F32(v) => v,
             Value::U32(v) => v.into_iter().map(|u| u as f32).collect(),
+            Value::I32(v) => v.into_iter().map(|u| u as f32).collect(),
             Value::Bf16(v) => v.into_iter().map(eta_ir::types::bf16_to_f32).collect(),
             other => panic!("{other:?}"),
         })
@@ -161,6 +176,12 @@ fn cells(raw: &[u8], dtype: EtaDtype) -> Vec<f32> {
             .0
             .iter()
             .map(|c| eta_ir::types::bf16_to_f32(u16::from_le_bytes(*c)))
+            .collect(),
+        EtaDtype::I32 => raw
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_le_bytes(*c) as f32)
             .collect(),
         EtaDtype::U32 => raw
             .as_chunks::<4>()

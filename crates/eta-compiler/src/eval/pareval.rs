@@ -582,34 +582,56 @@ mod tests {
         a_bf16_value_the_host_cannot_know_folds_as_unknown();
     }
 
-    /// A bf16 value derived from one the host cannot know (a channel no
-    /// host put holds) is held unknown like any other dtype's, not refused
-    /// as a dtype without a lane: the runtime folds every served program's
-    /// stages on the host (sc/mac-eta-bf16: a bf16 beam's server panicked
-    /// here).
+    /// A bf16 value the host cannot know (here a cast of a channel it has
+    /// no cell of) holds its place in the fold as unknown, and what is put
+    /// from it is blocked by that channel, never a panic: the runtime folds
+    /// every registered program's stages this way.
     fn a_bf16_value_the_host_cannot_know_folds_as_unknown() {
         let c = TraceContainer {
             channels: vec![
                 chan(Shape::vector(4), Dtype::F32, 1),
-                chan(Shape::vector(1), Dtype::F32, 1),
+                chan(Shape::vector(4), Dtype::F32, 1),
+                chan(Shape::vector(4), Dtype::F32, 1),
             ],
             stages: vec![StageProgram {
                 stage: Stage::Prologue,
                 ops: vec![
                     Op::ChanTake(0),
-                    Op::Cast { value: 0, dtype: Dtype::Bf16 },
-                    Op::ReduceSum(1),
-                    Op::Reshape { value: 2, shape: Shape::vector(1) },
-                    Op::ChanPut { chan: 1, value: 3 },
+                    Op::Cast {
+                        value: 0,
+                        dtype: Dtype::Bf16,
+                    },
+                    Op::Cast {
+                        value: 1,
+                        dtype: Dtype::F32,
+                    },
+                    Op::ChanPut { chan: 1, value: 2 },
+                    Op::ChanTake(2),
+                    Op::Cast {
+                        value: 3,
+                        dtype: Dtype::Bf16,
+                    },
+                    Op::Cast {
+                        value: 4,
+                        dtype: Dtype::F32,
+                    },
+                    Op::ChanPut { chan: 2, value: 5 },
                 ],
             }],
             ..TraceContainer::default()
         };
         let bound = bind(c, vec![vec![]], EngineCaps::default()).unwrap();
-        let fold = fold_stage(&bound, Stage::Prologue, &mut |_| None);
-        assert!(
-            !matches!(&fold, Ok(fold) if matches!(fold.puts.get(&1), Some(Ok(_)))),
-            "a value of an unknown take is not known: {fold:?}"
+        // Channel 2's cell is known; channel 0's is not.
+        let known = Value::F32(alloc::vec![1.0, 1.00390625, 3.0, -0.5]);
+        let fold = fold_stage(&bound, Stage::Prologue, &mut |chan| {
+            (chan == 2).then(|| known.clone())
+        })
+        .unwrap();
+        assert_eq!(fold.puts.get(&1), Some(&Err(EvalBlocker::UnknownChannel(0))));
+        assert_eq!(
+            fold.puts.get(&2),
+            Some(&Ok(Value::F32(alloc::vec![1.0, 1.0, 3.0, -0.5]))),
+            "a known bf16 value folds rounded to nearest even"
         );
     }
 

@@ -452,16 +452,13 @@ mod tests {
             let out = leak(Channel::new([1], dtype::i32).capacity(8));
             let (mut b, tok_in) = builder(vocab);
             b.stage(Stage::Epilogue, move || {
-                let logits = cast(intrinsics::output(0, "logits"), dtype::bf16);
-                let scaled = logits / temperature;
-                let probs = softmax(&scaled);
+                let logits = intrinsics::output(0, "logits");
+                let probs = softmax(cast(&logits, dtype::bf16) / temperature);
                 let keep = pivot_threshold(probs, cummass_le(top_p));
-                let masked = select(&keep, &scaled, f32::NEG_INFINITY);
                 let r = rng.take();
-                let g = gumbel(&r, [vocab]);
                 let r_next = &r + iota(2);
                 rng.put(&r_next);
-                let t = reshape(reduce_argmax(masked + g), [1]);
+                let t = reshape(gumbel_argmax(&logits, &keep, temperature, &r), [1]);
                 tok_in.put(&t);
                 out.put(&t);
             });
@@ -478,16 +475,12 @@ mod tests {
             let (mut b, tok_in) = builder(vocab);
             b.stage(Stage::Epilogue, move || {
                 let r = rng.take();
-                let logits = cast(
-                    reshape(intrinsics::output(0, "logits"), [vocab]),
-                    dtype::bf16,
-                );
-                let scaled = &logits / temperature;
-                let probs = softmax(&scaled);
+                let logits = reshape(intrinsics::output(0, "logits"), [vocab]);
+                let probs = softmax(cast(&logits, dtype::bf16) / temperature);
                 let ranked = pivot_threshold(&probs, rank_le(40u32));
                 let nucleus = pivot_threshold(&probs, cummass_le(0.9f32));
                 let keep = and(&ranked, &nucleus);
-                let token = reshape(gumbel_max(mask_apply(&scaled, keep), &r), [1]);
+                let token = reshape(gumbel_argmax(&logits, keep, temperature, &r), [1]);
                 rng.put(&r + iota(2));
                 tok_in.put(&token);
                 out.put(&token);
@@ -503,8 +496,8 @@ mod tests {
             let (mut b, tok_in) = builder(vocab);
             b.stage(Stage::Epilogue, move || {
                 let r = rng.take();
-                let scaled = cast(intrinsics::output(0, "logits"), dtype::bf16) / 0.7f32;
-                let token = reshape(gumbel_max(scaled, &r), [1]);
+                let logits = intrinsics::output(0, "logits");
+                let token = reshape(gumbel_argmax(logits, true, 0.7f32, &r), [1]);
                 rng.put(&r + iota(2));
                 tok_in.put(&token);
                 out.put(&token);
@@ -768,9 +761,9 @@ mod tests {
         assert_eq!(
             totals,
             [
-                ("top-p", 6_577_664, 3_233_280),
-                ("top-k + top-p", 6_882_048, 3_385_600),
-                ("gumbel-max", 5_209_088, 1_216_256),
+                ("top-p", 5_361_920, 3_537_152),
+                ("top-k + top-p", 5_666_304, 3_689_472),
+                ("gumbel-max", 3_689_984, 912_896),
                 ("greedy", 3_688_704, 684_288),
                 ("top logprobs", 4_906_240, 2_735_872),
                 ("sorted", 6_424_064, 3_646_976),
@@ -809,11 +802,11 @@ mod tests {
             got,
             [
                 ("standard greedy", 3_689_472, 684_544),
-                ("standard gumbel-max", 5_209_088, 1_216_256),
-                ("standard top-p", 6_577_920, 3_233_280),
-                ("standard top-k + top-p", 6_882_560, 3_385_600),
-                ("standard top logprobs", 4_910_080, 2_736_896),
-                ("standard penalized top-p", 12_050_176, 4_449_024),
+                ("standard gumbel-max", 3_689_984, 912_896),
+                ("standard top-p", 5_058_560, 3_537_152),
+                ("standard top-k + top-p", 5_363_200, 3_689_472),
+                ("standard top logprobs", 4_910_592, 2_736_896),
+                ("standard penalized top-p", 10_834_688, 4_448_768),
             ]
         );
     }

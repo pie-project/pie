@@ -586,6 +586,28 @@ const RED_SUM : u32 = 0u;
 const RED_MAX : u32 = 1u;
 const RED_MIN : u32 = 2u;
 const RED_ARGMAX : u32 = 3u;
+// gumbel_argmax (tag 0x34): an argmax over lanes logits[i] / divisor +
+// gumbel(state, i), -inf where keep is false, each made in f32 in the first
+// level and never stored (eta_ir::types: a draw is never a bf16 row). Its
+// operands: a0 the logits, a1 keep, a2 the divisor, imm the rng state.
+const RED_GUMBEL : u32 = 4u;
+
+fn gumbel_seed(p : u32) -> U64 {
+  let st = p_imm(p);
+  var ctr : u32 = 0u;
+  if (d_len(st) > 1u) { ctr = ld_u(st, 1u); }
+  return rng_keyed_seed(ld_u(st, 0u), ctr);
+}
+
+// Lane i of a gumbel_argmax: what `select(keep, logits / divisor, -inf) +
+// rng_keyed(state)` holds at i, in the same f32 operations.
+fn gumbel_lane(p : u32, seed : U64, i : u32) -> f32 {
+  let kp = p_a1(p);
+  if (!ld_b(kp, pick(d_len(kp), i))) { return NEG_INF(); }
+  let u = rng_hash_uniform(seed, i);
+  let noise = -log(-log(u));
+  return ld_f(p_a0(p), i) / ld_f(p_a2(p), 0u) + noise;
+}
 
 fn POS_INF() -> f32 { return bitcast<f32>(0x7F800000u); }
 fn NEG_INF() -> f32 { return bitcast<f32>(0xFF800000u); }
@@ -639,7 +661,28 @@ fn red_combine(kind : u32, l : f32, r : f32) -> f32 {
 
 const PTIR_REDUCE_LEVELS : u32 = 7u;
 
-fn red_stride(len : u32) -> u32 { return (len + 31u) / 32u; }
+// The lanes a job of a reduction's first level folds: 32, but 8 for a
+// gumbel_argmax, whose lanes each hash the rng and take two logs, so a row
+// spreads over four times the invocations (eta_compiler::codegen::steps::
+// first_fan). Every level above folds 32.
+fn red_fan0(kind : u32) -> u32 { return select(32u, 8u, kind == RED_GUMBEL); }
+
+// The groups of a row the first level writes, which the levels above read:
+// the reduction's temporary cells a row (wgsl::temporary_bytes).
+fn red_stride_k(len : u32, kind : u32) -> u32 {
+  let fan = red_fan0(kind);
+  return (len + fan - 1u) / fan;
+}
+
+// The values a row has left before level `level`.
+fn red_n_in(len : u32, kind : u32, level : u32) -> u32 {
+  var n = len;
+  for (var l : u32 = 0u; l < level; l = l + 1u) {
+    let fan = select(32u, red_fan0(kind), l == 0u);
+    n = (n + fan - 1u) / fan;
+  }
+  return n;
+}
 
 fn tmp_v(row : u32, stride : u32, c : u32, buf : u32, span : u32) -> u32 {
   return tmp_base + (buf * span + row * stride + c) * 2u;
@@ -653,24 +696,29 @@ fn op_reduce_level(p : u32, kind : u32, level : u32) {
   let a = p_a0(p);
   let rows = rows_of(a);
   let len = d_len(a) / max(rows, 1u);
-  let stride = red_stride(len);
-  var n_in = len;
-  for (var l : u32 = 0u; l < level; l = l + 1u) { n_in = (n_in + 31u) / 32u; }
+  let stride = red_stride_k(len, kind);
+  let n_in = red_n_in(len, kind, level);
   if (n_in <= 1u) { return; }
-  let n_out = (n_in + 31u) / 32u;
+  var seed : U64;
+  if (kind == RED_GUMBEL && level == 0u) { seed = gumbel_seed(p); }
+  let fan = select(32u, red_fan0(kind), level == 0u);
+  let n_out = (n_in + fan - 1u) / fan;
   let total = rows * n_out;
   for (var job : u32 = tid; job < total; job = job + lanes) {
     let row = job / n_out;
     let c = job % n_out;
     var vs : array<f32, 32>;
     var ix : array<u32, 32>;
-    let count = min(32u, n_in - c * 32u);
+    let count = min(fan, n_in - c * fan);
     for (var k : u32 = 0u; k < 32u; k = k + 1u) {
       vs[k] = red_identity(kind);
       ix[k] = 0u;
       if (k < count) {
-        let at = c * 32u + k;
-        if (level == 0u) {
+        let at = c * fan + k;
+        if (level == 0u && kind == RED_GUMBEL) {
+          vs[k] = gumbel_lane(p, seed, row * len + at);
+          ix[k] = at;
+        } else if (level == 0u) {
           vs[k] = ld_f(a, row * len + at);
           ix[k] = at;
         } else {
@@ -683,7 +731,7 @@ fn op_reduce_level(p : u32, kind : u32, level : u32) {
 
     for (var off : u32 = 16u; off >= 1u; off = off / 2u) {
       for (var lane : u32 = 0u; lane < off; lane = lane + 1u) {
-        if (kind == RED_ARGMAX) {
+        if (kind == RED_ARGMAX || kind == RED_GUMBEL) {
           let takes = arg_takes(vs[lane], ix[lane], vs[lane + off], ix[lane + off], level, count, lane, off);
           if (takes) { vs[lane] = vs[lane + off]; ix[lane] = ix[lane + off]; }
         } else {
@@ -712,7 +760,7 @@ fn op_reduce_finish(p : u32, kind : u32) {
   let o = p_o0(p);
   let rows = rows_of(a);
   let len = d_len(a) / max(rows, 1u);
-  let stride = red_stride(len);
+  let stride = red_stride_k(len, kind);
   for (var row : u32 = tid; row < rows; row = row + lanes) {
     var v : f32;
     var idx : u32;
@@ -725,18 +773,16 @@ fn op_reduce_finish(p : u32, kind : u32) {
       idx = 0u;
     } else {
 
-      var folded : u32 = len;
       var last : u32 = 0u;
       for (var l : u32 = 0u; l < PTIR_REDUCE_LEVELS; l = l + 1u) {
-        if (folded <= 1u) { break; }
+        if (red_n_in(len, kind, l) <= 1u) { break; }
         last = l;
-        folded = (folded + 31u) / 32u;
       }
       let cell = tmp_v(row, stride, 0u, red_write_buf(last), rows * stride);
       v = bitcast<f32>(hld(cell));
       idx = hld(cell + 1u);
     }
-    if (kind == RED_ARGMAX) { st_i(o, row, bitcast<i32>(idx)); }
+    if (kind == RED_ARGMAX || kind == RED_GUMBEL) { st_i(o, row, bitcast<i32>(idx)); }
     else { st_as_f(o, row, v); }
   }
 }
@@ -2105,6 +2151,7 @@ fn ptir_reduce_level(p : u32, level : u32) {
     case 0x31u: { op_reduce_level(p, RED_MAX, level); }
     case 0x32u: { op_reduce_level(p, RED_MIN, level); }
     case 0x33u: { op_reduce_level(p, RED_ARGMAX, level); }
+    case 0x34u: { op_reduce_level(p, RED_GUMBEL, level); }
     default: {}
   }
 }
@@ -2116,6 +2163,7 @@ fn ptir_reduce_finish(p : u32) {
     case 0x31u: { op_reduce_finish(p, RED_MAX); }
     case 0x32u: { op_reduce_finish(p, RED_MIN); }
     case 0x33u: { op_reduce_finish(p, RED_ARGMAX); }
+    case 0x34u: { op_reduce_finish(p, RED_GUMBEL); }
     default: {}
   }
 }
@@ -2143,5 +2191,5 @@ fn ptir_is_sort(p : u32) -> bool {
 
 fn ptir_is_reduce(p : u32) -> bool {
   let tag = p_tag(p);
-  return tag >= 0x30u && tag <= 0x33u;
+  return tag >= 0x30u && tag <= 0x34u;
 }

@@ -7,10 +7,14 @@
 //! log-probability under the model's raw logits and the likeliest tokens'.
 //!
 //! The vocabulary-sized values a step computes (the penalized and masked
-//! logits, the probabilities, the truncation's row, the perturbed row, the
-//! log-probabilities) are bf16 (`eta_ir::types`' rules: computed in f32,
-//! each rounded once on its store, every reduction over them in f32). A
-//! greedy step that changes no logit reads the model's f32 logits whole.
+//! logits, the probabilities its cuts read, the log-probabilities) are bf16
+//! (`eta_ir::types`' rules: computed in f32, each rounded once on its
+//! store, every reduction over them in f32). The draw is one
+//! `gumbel_argmax` over the logits as they are, the model's f32 row where
+//! no penalty or grammar mask changed them: temperature, the cut and the
+//! noise are applied per lane in f32 inside the reduction, so no
+//! perturbed row is rounded and no noise row is laid. A greedy step that
+//! changes no logit reads the model's f32 logits whole.
 //!
 //! A runtime builds the guest code of [`STANDARD`]'s shapes before ready:
 //! a program's regions are keyed by their text, which the knobs' values
@@ -201,10 +205,10 @@ pub fn sample(
     mask: Option<&Tensor>,
 ) -> (Tensor, Option<Tensor>, Option<Landed>) {
     let model = reshape(intrinsics::output(0, "logits"), [vocab]);
-    let raw = k.logprobs.map(|_| cast(&model, dtype::bf16));
-    // A step that changes the logits works on a bf16 copy of them; a plain
-    // greedy step reads the model's f32 row.
-    let changes = histogram.is_some() || mask.is_some() || k.temperature.is_some();
+    let raw = k.logprobs.map(|_| shifted(&model));
+    // A step that changes the logits works on a bf16 copy of them; one
+    // that does not (greedy, or a draw) reads the model's f32 row.
+    let changes = histogram.is_some() || mask.is_some();
     let mut logits = if changes {
         cast(&model, dtype::bf16)
     } else {
@@ -241,10 +245,10 @@ pub fn sample(
     let token = match k.temperature {
         None => reduce_argmax(&logits),
         Some(temperature) => {
-            let scaled = &logits / temperature;
             let mut keep: Option<Tensor> = None;
             if k.top_k.is_some() || k.top_p.is_some() || k.min_p.is_some() {
-                let probs = softmax(&scaled);
+                // The cuts read bf16 probabilities of the scaled row.
+                let probs = cut_probabilities(&logits, temperature);
                 if let Some(min_p) = &k.min_p {
                     let floor = reduce_max(&probs) * knob(min_p);
                     keep = Some(ge(&probs, floor));
@@ -264,11 +268,10 @@ pub fn sample(
                     });
                 }
             }
-            let truncated = match keep {
-                Some(keep) => mask_apply(&scaled, keep),
-                None => scaled,
-            };
-            gumbel_max(&truncated, r)
+            match keep {
+                Some(keep) => gumbel_argmax(&logits, keep, temperature, r),
+                None => gumbel_argmax(&logits, true, temperature, r),
+            }
         }
     };
     let next = histogram.map(|(counts, _)| scatter_add(counts, &token, 1.0f32));
@@ -292,6 +295,23 @@ pub fn sample(
         }
     });
     (token, next, landed)
+}
+
+/// `row` less its max rounded to bf16, as a bf16 row: a softmax and a
+/// log-softmax do not see the shift, and the row's largest values, which
+/// decide them, round near zero, where a bf16 is finest (a logit of 20
+/// rounded alone is 1/16 off, its shifted value a few thousandths).
+fn shifted(row: &Tensor) -> Tensor {
+    row - cast(reduce_max(row), dtype::bf16)
+}
+
+/// The probabilities the cuts read, `softmax(logits / temperature)`, as a
+/// bf16 row: the exponent is the row less its max rounded to bf16, divided
+/// by the temperature, so its largest values round near zero and no lane
+/// overflows; the one max the row needs is that shift.
+fn cut_probabilities(logits: &Tensor, temperature: f32) -> Tensor {
+    let e = exp(shifted(logits) / temperature);
+    &e / reduce_sum(&e)
 }
 
 /// `[1]` and `[n]` f32 rows as one `[1 + n]` row.

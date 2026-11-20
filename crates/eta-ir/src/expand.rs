@@ -188,11 +188,31 @@ pub fn nucleus_sample(
     shape: Shape,
     dtype: Dtype,
 ) -> ValueId {
-    let probabilities = if dtype == Dtype::Bf16 {
-        softmax_bf16(sink, logits, shape)
-    } else {
-        softmax(sink, logits, shape)
-    };
+    if dtype == Dtype::Bf16 {
+        // The draw reduces the perturbed lanes in f32 (`types`: a draw is
+        // never a bf16 row).
+        let probabilities = softmax_bf16(sink, logits, shape);
+        let keep = push(
+            sink,
+            Op::PivotThreshold {
+                input: probabilities,
+                predicate: Predicate::CummassLe(top_p),
+            },
+            StepShape::RowMask,
+        );
+        let one = push(sink, Op::Const(Literal::F32(1.0)), StepShape::Scalar);
+        return push(
+            sink,
+            Op::GumbelArgmax {
+                logits,
+                keep,
+                divisor: one,
+                state,
+            },
+            StepShape::ReducedIndex,
+        );
+    }
+    let probabilities = softmax(sink, logits, shape);
     let keep = push(
         sink,
         Op::PivotThreshold {
