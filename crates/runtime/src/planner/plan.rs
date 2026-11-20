@@ -276,6 +276,16 @@ impl ResidencyPlanner {
                     };
                 }
                 let is_restore = matches!(waiter.kind, WaitKind::Restore { .. });
+                // Pages gathered past what a restore head needs were gathered
+                // for another head (one a restore went ahead of): held while
+                // this one waits, they spent the state budget its runs need
+                // (the L40S: 8 of 9 opened chunks held by no candidate and
+                // nothing parked, nothing in flight). They go back. An
+                // allocation's surplus stays: a burst serves several from it.
+                if is_restore && inner.accum.len() as u32 > waiter.kv_need() {
+                    let spare = inner.accum.len() as u32 - waiter.kv_need();
+                    return Step::Release(inner.accum.donate(spare));
+                }
                 let pid = waiter.pid;
                 // Its parked state is on its way down a tier: restored now,
                 // it would miss the items moving. The landing pokes.
@@ -321,7 +331,8 @@ impl ResidencyPlanner {
                         Some(_)
                             if inner
                                 .bind_restoring
-                                .is_some_and(|restoring| restoring != pid) =>
+                                .is_some_and(|restoring| restoring != pid)
+                                && !inner.bind_restoring_released() =>
                         {
                             let restoring = inner.bind_restoring;
                             inner
@@ -450,10 +461,14 @@ impl ResidencyPlanner {
                         let pid = inner.queue.get(&key).map(|waiter| waiter.pid);
                         (
                             pid,
-                            inner.bind_restoring.is_some_and(|restoring| Some(restoring) != pid),
+                            inner.bind_restoring.is_some_and(|restoring| Some(restoring) != pid)
+                                && !inner.bind_restoring_released(),
                         )
                     });
-                    debug_assert!(!other_restoring, "selected only with no other restoring");
+                    debug_assert!(
+                        !other_restoring,
+                        "selected only with no other restoring that can still fire"
+                    );
                     if pid.is_some_and(|pid| self.port.room_beside_own(pid, need.run, need.pieces)) {
                         room_stood = Some(key);
                         continue;
@@ -567,8 +582,9 @@ impl ResidencyPlanner {
                     true
                 }
                 Step::Release(stranded) => {
+                    // Back to the pool; the head is planned on what came back.
                     drop(stranded);
-                    return false;
+                    continue;
                 }
                 Step::Absorb {
                     count,

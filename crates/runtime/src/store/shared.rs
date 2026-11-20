@@ -1998,8 +1998,10 @@ impl SharedPool {
         None
     }
 
-    /// The pool shape of engine shape `engine`, a state shape's.
-    fn pool_shape(&self, engine: EngineShape) -> Option<ShapeId> {
+    /// The pool shape of engine shape `engine`, a state shape's or a
+    /// role's: the inverse of [`Self::engine_shape`].
+    #[must_use]
+    pub fn pool_shape(&self, engine: EngineShape) -> Option<ShapeId> {
         self.list
             .iter()
             .chain(&self.rs_list)
@@ -2009,6 +2011,7 @@ impl SharedPool {
             .or_else(|| {
                 self.fixed
                     .iter()
+                    .chain(self.roles.iter())
                     .find(|shape| shape.id == engine)
                     .map(|shape| shape.pool)
             })

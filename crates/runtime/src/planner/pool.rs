@@ -188,6 +188,12 @@ impl ChunkMap {
             last = Some(chunk);
         }
         free_runs += stretch / run;
+        // Of those, what the state budget's headroom lets be opened: the
+        // pool's own take reads runs so (`SlotPool::chunk_runs_for`). Runs
+        // standing open past it are no room until chunks elsewhere empty.
+        let usable_runs = self
+            .headroom
+            .map_or(free_runs, |headroom| free_runs.min(headroom / run));
         // What opening those runs takes of the budget's headroom.
         let headroom_short = self
             .headroom
@@ -198,6 +204,7 @@ impl ChunkMap {
              candidate_or_parked_held={} emptiable={} stuck={stuck} candidates={} \
              headroom={:?} segment_chunks={} longest_usable_stretch={longest} \
              longest_free_stretch={longest_free} free_runs={free_runs} \
+             runs_within_headroom={usable_runs} \
              free_stretches_cut_at_segment_edges={cut_at_edge} \
              headroom_short_for_one_run={headroom_short} \
              cheapest_one_run_moves={:?}",
@@ -794,6 +801,25 @@ impl PoolPort for RegistryPool {
             .as_ref()
             .map(|roles| roles.lock().unwrap().guest_chunk_slots(pids))
             .unwrap_or_default();
+        // Their state's slots (records, its lists and windows): every slot of
+        // every shape a candidate holds empties with it. Read before the
+        // pools' locks, as the state store takes the shared pool's itself.
+        let state: Vec<(ProcessId, Vec<(::engine::chunk::ShapeId, Vec<u32>)>)> = pids
+            .iter()
+            .map(|&pid| {
+                let sets = crate::inferlet::process::residency::rs_working_set_ids(
+                    pid,
+                    self.model,
+                    self.engine,
+                );
+                let refs = if sets.is_empty() {
+                    Vec::new()
+                } else {
+                    stores.rs.lock().unwrap().private_slot_refs(&sets)
+                };
+                (pid, refs)
+            })
+            .collect();
         // The kv lock first, then the shared pool's: the order kv takes.
         crate::store::registry::with_kv_lock(&stores.kv, "planner-chunks", |kv| {
             let pool = shared.lock().unwrap();
@@ -817,6 +843,29 @@ impl PoolPort for RegistryPool {
                 }
                 for (physical, pages) in counts {
                     by.get_mut(&physical).expect("entered").1.push((pid, pages));
+                }
+            }
+            for (pid, refs) in &state {
+                let mut counts: std::collections::BTreeMap<u32, u32> = Default::default();
+                for (engine, refs) in refs {
+                    let Some(shape) = pool.pool_shape(*engine) else {
+                        continue;
+                    };
+                    for &slot_ref in refs {
+                        let slot = pool.slot(shape, slot_ref);
+                        if let Some(physical) = pool.pool().physical(slot.chunk) {
+                            *counts.entry(physical).or_default() += 1;
+                            by.entry(physical)
+                                .or_insert_with(|| (pool.pool().chunk_used(slot.chunk), Vec::new()));
+                        }
+                    }
+                }
+                for (physical, slots) in counts {
+                    let entry = by.get_mut(&physical).expect("entered");
+                    match entry.1.iter_mut().find(|(held, _)| held == pid) {
+                        Some((_, count)) => *count += slots,
+                        None => entry.1.push((*pid, slots)),
+                    }
                 }
             }
             for (logical, pid, slots) in guest {

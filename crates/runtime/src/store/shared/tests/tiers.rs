@@ -384,3 +384,36 @@ fn the_kv_store_s_disk_slots_coming_back_tell_the_room_signal() {
     kv.give_disk_chunks(&chunks, tiers.disk_chunk_slots);
     assert_eq!(told.load(std::sync::atomic::Ordering::Relaxed), 1, "given back: told");
 }
+
+/// What evicting a process empties counts its state's slots too (records,
+/// the state lists), not its kv pages and guest parts alone: the M1's
+/// bind room found 356 opened chunks of a state shape and a map of six,
+/// every candidate's state unattributed. A working set's own device slots
+/// are named, by the engine's shape and ref, each in a chunk the pool
+/// holds used.
+#[test]
+fn a_working_set_s_state_slots_are_named_in_the_chunks_they_hold() {
+    use crate::store::rs::{RsGeometry, RsStore};
+    let facts = fixed_facts();
+    let tiers = Tiers::of(&facts).unwrap();
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
+    let mut s = RsStore::shared(&shared, tiers.host.as_ref());
+    let ws = s.create_working_set(RsGeometry {
+        state_size: 4096,
+        buffer_page_tokens: RS_TOKENS,
+    });
+    let prepared = s.prepare_group(ws, true, false, None, None, None).unwrap();
+    let published = s.publish_prepared(prepared).unwrap();
+    s.settle(published);
+    s.fold(ws, 4);
+    let refs = s.private_slot_refs(&HashSet::from([ws]));
+    assert!(!refs.is_empty(), "its state's slots are named");
+    let pool = shared.lock().unwrap();
+    for (engine, refs) in &refs {
+        let shape = pool.pool_shape(*engine).expect("a state shape the pool knows");
+        for &slot_ref in refs {
+            let slot = pool.slot(shape, slot_ref);
+            assert!(pool.pool().chunk_used(slot.chunk) > 0, "in a chunk it holds used");
+        }
+    }
+}

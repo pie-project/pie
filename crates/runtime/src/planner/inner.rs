@@ -523,6 +523,31 @@ impl Inner {
             && !self.nothing_in_flight()
     }
 
+    /// Whether the one bind-suspended restore at a time
+    /// ([`Self::bind_restoring`]) no longer holds the next: its process
+    /// cannot fire (nothing in flight anywhere, or it waits in the queue on
+    /// something other than its bind) and its bind is not queued for room
+    /// (which the gate funds first). By state, never a clock: held while it
+    /// could not fire, every other bind-suspended restore waited for good
+    /// with its runs standing (Mac Pro's no-step lines with no refusal).
+    pub(super) fn bind_restoring_released(&self) -> bool {
+        let Some(restoring) = self.bind_restoring else {
+            return true;
+        };
+        let mut bind_queued = false;
+        let mut waits = false;
+        for waiter in self.queue.values().filter(|waiter| waiter.pid == restoring) {
+            if !waiter.is_unmet() {
+                continue;
+            }
+            match waiter.kind {
+                WaitKind::BindRoom { .. } => bind_queued = true,
+                _ => waits = true,
+            }
+        }
+        !bind_queued && (waits || self.nothing_in_flight())
+    }
+
     /// Nothing in flight can free room: no fire submitted and not landed,
     /// no eviction, restore or kill under way. What the others wait on
     /// (grants, binds, gates, anything not yet named) does not matter:

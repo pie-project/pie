@@ -2495,6 +2495,9 @@ struct BindRoomPool {
     /// Disk slots only idle cache holds (`PoolPort::idle_below_device`):
     /// room a suspend makes by dropping it.
     disk_idle: AtomicU32,
+    /// The state budget's headroom: the chunks that may be opened, free
+    /// ones beyond it standing open but unusable (`None`: no budget).
+    headroom: parking_lot::Mutex<Option<u32>>,
 }
 
 impl BindRoomPool {
@@ -2518,6 +2521,7 @@ impl BindRoomPool {
             pages: std::sync::atomic::AtomicBool::new(false),
             park_down_fails: AtomicU32::new(0),
             disk_idle: AtomicU32::new(0),
+            headroom: parking_lot::Mutex::new(None),
         }
     }
 
@@ -2560,6 +2564,10 @@ impl BindRoomPool {
                 runs += 1;
                 stretch = 0;
             }
+        }
+        // As the pool's own count: no more runs than the budget opens.
+        if let Some(headroom) = *self.headroom.lock() {
+            runs = runs.min(headroom / run.max(1));
         }
         runs >= pieces
     }
@@ -2742,6 +2750,7 @@ impl PoolPort for BindRoomPool {
             return super::pool::ChunkMap {
                 held: kv,
                 free: self.free.lock().clone(),
+                headroom: *self.headroom.lock(),
                 ..Default::default()
             };
         }
@@ -3988,11 +3997,14 @@ async fn bind_suspended_restores_come_back_one_at_a_time() {
     pool.free.lock().extend(0..8);
     pool.gives.store(1, Ordering::Relaxed);
     let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
-    let (a, b) = (ProcessId::new_v4(), ProcessId::new_v4());
-    for pid in [a, b] {
+    let (a, b, running) = (ProcessId::new_v4(), ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [a, b, running] {
         planner.register(pid);
         planner.note_admitted(pid);
     }
+    // The fleet runs (a fire in flight): the first restored can fire, so
+    // the other waits for it (one at a time holds only while it can).
+    let in_flight = planner.fire_in_flight(running);
     planner.with_inner(|inner| {
         for pid in [a, b] {
             let proc = inner.procs.get_mut(&pid).unwrap();
@@ -4039,6 +4051,7 @@ async fn bind_suspended_restores_come_back_one_at_a_time() {
         inner.enqueue(other, allocation(Demand::default()));
         assert_eq!(inner.bind_restoring, None, "released as it asks for pages");
     });
+    drop(in_flight);
 }
 
 /// A short restore that gives up parks its process out of the queue and
@@ -6955,4 +6968,138 @@ async fn trickling_frees_short_of_the_head_s_need_plan_nothing() {
     }
     assert!(task.is_finished(), "the free that meets its need wakes it within a turn");
     assert!(matches!(task.await.unwrap(), Ok(super::acquire::Acquired::Granted(_))));
+}
+
+/// Mac Pro's 5 GiB stall (a restore needing runs of four, 19 open runs in
+/// the map, the unpark refused with no free chunk and nothing committable):
+/// the state budget's headroom was spent, so no free chunk could be opened
+/// however many stood open. A head short of runs there is funded by
+/// emptying chunks elsewhere, giving budget back, not by the open runs.
+/// Here two runs of four stand free, the headroom is none, and a resident
+/// holds four chunks elsewhere: it is moved.
+#[tokio::test(flavor = "current_thread")]
+async fn a_head_short_of_runs_with_no_headroom_frees_budget_elsewhere() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(12, 0..0, 64));
+    pool.free.lock().extend(0..8);
+    *pool.headroom.lock() = Some(0);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (binder, resident) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [binder, resident] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    planner.with_inner(|inner| inner.procs.get_mut(&resident).unwrap().idle = true);
+    pool.kv.lock().extend([(8, resident), (9, resident), (10, resident), (11, resident)]);
+    assert!(!pool.guest_room_free(4, 1), "runs stand open, the budget opens none");
+    let p = planner.clone();
+    let bind = crate::rt::spawn(async move { p.wait_bind_room(binder, 4, 1).await });
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.stats.evictions_started.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+    }
+    assert!(
+        planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
+        "the resident is moved to give budget back"
+    );
+    bind.abort();
+}
+
+/// The L40S on 81aa5f879 (8 of 9 opened chunks held by no candidate and
+/// nothing parked, the head a restore of no kv, nothing in flight): pages
+/// gathered for another head stay gathered while a restore that needs none
+/// of them waits, holding the chunks (and the state budget) its runs need.
+/// They go back: here four of eight chunks gathered, a restore of no kv
+/// needing six single chunks; released, its runs stand and it is served.
+#[tokio::test(flavor = "current_thread")]
+async fn pages_gathered_for_another_head_go_back_for_a_restore_that_needs_none() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let model = crate::store::registry::register_model(16, &[8], &[4]);
+    let pool = Arc::new(BindRoomPool {
+        model,
+        ..BindRoomPool::new(8, 0..0, 64)
+    });
+    pool.pages.store(true, Ordering::Release);
+    pool.free.lock().extend(0..8);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    // Gathered for a head that went: four chunks held as pages.
+    assert!(planner.absorb_free(4));
+    assert_eq!(pool.free.lock().len(), 4);
+    let head = ProcessId::new_v4();
+    planner.register(head);
+    planner.note_admitted(head);
+    planner.with_inner(|inner| {
+        let proc = inner.procs.get_mut(&head).unwrap();
+        proc.state = Residency::Evicted;
+        proc.roles_short = Some(super::proc::PendingBind {
+            run: 1,
+            pieces: 6,
+            pages: 6,
+        });
+        inner.enqueue(
+            head,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        );
+    });
+    planner.poke();
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.stats.restores.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+    }
+    assert_eq!(planner.with_inner(|inner| inner.accum.len()), 0, "the pages went back");
+    assert!(planner.stats.restores.load(Ordering::Relaxed) > 0, "the restore is served");
+}
+
+/// Mac Pro's no-step restores with no refusal on record: one bind-suspended
+/// restore at a time, the next waiting until the first fires. A first that
+/// cannot fire (nothing in flight) held every other for good, their runs
+/// standing. By state, the gate lets the next go: here the first never
+/// fires, and the second, its room standing, is restored.
+#[tokio::test(flavor = "current_thread")]
+async fn a_bind_suspended_restore_that_cannot_fire_holds_the_next_no_longer() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let model = crate::store::registry::register_model(16, &[8], &[4]);
+    let pool = Arc::new(BindRoomPool {
+        model,
+        ..BindRoomPool::new(8, 0..0, 64)
+    });
+    pool.free.lock().extend(0..8);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (first, second) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [first, second] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    planner.with_inner(|inner| {
+        // The first was restored for its bind and never fired.
+        inner.bind_restoring = Some(first);
+        let proc = inner.procs.get_mut(&second).unwrap();
+        proc.state = Residency::Evicted;
+        proc.bind_room = Some(super::proc::PendingBind {
+            run: 1,
+            pieces: 1,
+            pages: 1,
+        });
+        inner.enqueue(
+            second,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        );
+    });
+    assert!(planner.with_inner(|inner| inner.nothing_in_flight()), "the first cannot fire");
+    planner.poke();
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.stats.restores.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+    }
+    assert!(planner.stats.restores.load(Ordering::Relaxed) > 0, "the second is restored");
 }

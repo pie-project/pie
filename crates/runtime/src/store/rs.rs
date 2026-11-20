@@ -2138,6 +2138,20 @@ impl RsStore {
             .collect()
     }
 
+    /// The device slots `working_sets` alone hold (what a suspend of them
+    /// takes along), as the engine's slot refs by shape: what holds their
+    /// chunks, for a map of what evicting their process empties.
+    #[must_use]
+    pub fn private_slot_refs(
+        &self,
+        working_sets: &HashSet<RsWorkingSetId>,
+    ) -> Vec<(::engine::chunk::ShapeId, Vec<u32>)> {
+        self.private(working_sets)
+            .into_iter()
+            .flat_map(|id| self.pool_of(id).slot_refs(id))
+            .collect()
+    }
+
     pub fn suspendable(&self, working_sets: &HashSet<RsWorkingSetId>) -> RsUnits {
         self.units(self.private(working_sets))
     }
