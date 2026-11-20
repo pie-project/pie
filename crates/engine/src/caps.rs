@@ -124,6 +124,12 @@ pub struct Capabilities {
     /// ([`GuestCost`]): none stated, the default, holds it to nothing.
     #[serde(default)]
     pub guest_cost: GuestCost,
+    /// The frames this engine keeps in flight, its run-ahead depth (at
+    /// least 1): the one number the runtime dispatches frames by and sizes
+    /// a beam group's pool with (`BEAM-PAGE-LISTS.md` §3's `F`). The load
+    /// request's depth is what the runtime asks for; this is what the
+    /// engine runs.
+    pub frames_in_flight: u32,
 }
 
 /// What bounds a guest stage's time on a device: the bound it states on one

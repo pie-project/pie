@@ -158,6 +158,10 @@ pub struct EngineConfig {
     /// What a guest stage's cost is held to
     /// ([`::engine::Capabilities::guest_cost`]).
     pub guest_cost: ::engine::GuestCost,
+    /// The frames the engine keeps in flight
+    /// ([`::engine::Capabilities::frames_in_flight`]): the scheduler's
+    /// dispatch depth and a beam group's pool's `F`.
+    pub frames_in_flight: u32,
     pub device_geometry_port_mask: eta_ir::registry::PortMask,
     pub limits: crate::engine::SchedulerLimits,
     /// The facts the engine's trace branches on.
@@ -217,6 +221,23 @@ fn guest_budget(engines: &[EngineConfig]) -> Result<eta_ir::validate::Budget> {
 /// The admission cap: `cap`, held to the `seats` a seated-first kv pool
 /// seats where the model holds no recurrent state (whose processes its
 /// planner admits against the state pool instead).
+/// The frames the model's engines keep in flight
+/// ([`::engine::Capabilities::frames_in_flight`]): one number, so engines
+/// stating different ones are refused by name.
+fn frames_in_flight(engines: &[EngineConfig]) -> Result<u32> {
+    let mut stated = engines.iter().map(|e| e.frames_in_flight.max(1));
+    let Some(first) = stated.next() else {
+        anyhow::bail!("a model served by no engine states no frames in flight");
+    };
+    if let Some(other) = stated.find(|&f| f != first) {
+        anyhow::bail!(
+            "the model's engines keep {first} and {other} frames in flight; the scheduler \
+             dispatches by one number"
+        );
+    }
+    Ok(first)
+}
+
 fn seat_cap(cap: usize, has_state: bool, seats: Option<usize>) -> usize {
     match seats {
         Some(seats) if !has_state && cap > seats.max(1) => seats.max(1),
@@ -331,7 +352,10 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         })
         .collect::<Result<Vec<::engine::ReadoutFacts>>>()?;
 
-    crate::scheduler::set_dispatch_depth(scheduler.frame_dispatch_depth as usize);
+    // The frames the engines keep in flight: the one number the scheduler
+    // dispatches by and a beam group's pool is sized with.
+    let engine_frames = frames_in_flight(&engine_configs)?;
+    crate::scheduler::set_dispatch_depth(engine_frames as usize);
     // A model with fixed recurrent state is admitted by its planner, which
     // charges each process the fixed set its working set holds against the
     // state pool, beside a copy-on-write set per lane a fire runs
@@ -827,7 +851,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         scheduler.silence_timeout_secs,
     ));
     crate::scheduler::set_frame_size(scheduler.frame_size as usize);
-    crate::scheduler::set_dispatch_depth(scheduler.frame_dispatch_depth as usize);
+    crate::scheduler::set_dispatch_depth(engine_frames as usize);
     let scheduler_shutdown = crate::scheduler::spawn(&engines, kv_page_size as u32).await?;
     // Each engine takes the weight residency it starts with before the load
     // returns, so before any fire is submitted: none reads from the host a

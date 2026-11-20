@@ -267,6 +267,8 @@ impl Engine for Spatial {
             classes: facts.classes(),
             // Cerebras states no bound on one submission.
             guest_cost: engine::GuestCost::default(),
+            // one frame at a time: no run-ahead
+            frames_in_flight: 1,
         };
         self.facts = Some(facts);
         self.caps = Some(caps.clone());
