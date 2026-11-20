@@ -257,6 +257,31 @@ impl ResidencyPlanner {
             map.merge(self.port.parked_occupants(victims.head_pid));
             map
         });
+        // No eviction forms the head's runs (a chunk in every window holds
+        // what no move off the device clears: a resident ranked above the
+        // head, the head's own live parts, a shared item a resident holds,
+        // a victim no swap room takes): moving chunks is the only way, and
+        // a compaction is asked for them. Taken out of the heads' paths
+        // after a soak asked one that never came (4a267be69), such heads
+        // waited for good with the pool able to stand their runs.
+        // Only with nothing in flight: an eviction on its way (its victim
+        // no candidate now, the map empty of it) forms the runs as it lands,
+        // and a compaction asked meanwhile waited on what it would make.
+        if let (Some((run, pieces)), Some(map)) = (shape, map.as_ref())
+            && map.cheapest_runs(run, pieces).is_none()
+            && self.with_inner(|inner| inner.nothing_in_flight())
+            && self.port.compaction_comes(run, pieces)
+        {
+            self.stats.compaction_waits.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                head = %victims.head_pid,
+                run,
+                pieces,
+                "planner: no eviction forms the head's runs; a compaction moves chunks for them"
+            );
+            self.note_short(victims.head, 0, 0);
+            return;
+        }
         let (candidates, wanted, occupants) =
             chunk_picks(candidates, victims.deficit, shape, map.as_ref());
         let (occupants, parked): (Vec<ProcessId>, Vec<ProcessId>) = occupants

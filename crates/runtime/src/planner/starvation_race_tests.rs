@@ -5316,6 +5316,7 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
             }
             let before = progress(&planner, &pool)
                 + u64::from(bind.as_ref().is_some_and(|bind| bind.is_finished()));
+            let compactions_before = pool.compactions.load(Ordering::Relaxed);
             if !dropped_unused {
                 planner.pages_freed();
                 planner.poke();
@@ -5378,16 +5379,6 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
             });
             let servable = stands && at.is_none_or(|at| pool.guest_free_runs(run) > at);
             let compactable = false;
-            if pool.compactions.load(Ordering::Relaxed) > 0
-                || planner.stats.compaction_waits.load(Ordering::Relaxed) > 0
-            {
-                failures.push(format!(
-                    "seed {seed} step {step}: a head asked for or waited on a compaction\n  \
-                     schedule: {}",
-                    schedule.join(" -> ")
-                ));
-                break;
-            }
             // Mixed shapes: where the map serves the head by moving the
             // residents whose kv holds its chunks (or with no one moved),
             // and nothing is in flight, the planner is never silent: the
@@ -5413,6 +5404,19 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
                     || pool.runs_free(need.0, need.1)
             };
             let quiet = planner.with_inner(|inner| inner.nothing_in_flight());
+            // A compaction is asked only where no eviction forms the head's
+            // runs: moving chunks is then the only way; asked while moving
+            // residents off the device stood them, it waited on what an
+            // eviction would have made.
+            let asked = pool.compactions.load(Ordering::Relaxed) > compactions_before;
+            if asked && mixed && map_serves && !is_rise {
+                failures.push(format!(
+                    "seed {seed} step {step}: a compaction was asked while evictions stood the \
+                     head's runs\n  schedule: {}",
+                    schedule.join(" -> ")
+                ));
+                break;
+            }
             if mixed && map_serves && quiet && !retried {
                 failures.push(format!(
                     "seed {seed} step {step}: the map serves the head's {need:?} and the planner \
@@ -5548,11 +5552,10 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
     assert!(failures.is_empty(), "{} failing seeds:\n{}", failures.len(), failures.join("\n"));
 }
 
-/// Compaction is out of the planner's paths until its own end-to-end test
-/// passes (the disk-only soaks: compaction asked 121 times on Metal, never
-/// carried out, the head waiting on it): a bind short of a run among
-/// scattered free chunks is funded by the map, its chunks' occupant moved,
-/// and no compaction is asked, however the pool could compact.
+/// A compaction is asked only where no eviction forms the head's runs: a
+/// bind short of a run among scattered free chunks, their gaps held by a
+/// resident it may move, is funded by the map, the occupant moved, and no
+/// compaction is asked first, however the pool could compact.
 #[tokio::test(flavor = "current_thread")]
 async fn a_bind_short_of_a_run_is_funded_by_the_map_never_waiting_on_a_compaction() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -5565,6 +5568,9 @@ async fn a_bind_short_of_a_run_is_funded_by_the_map_never_waiting_on_a_compactio
         planner.register(pid);
         planner.note_admitted(pid);
     }
+    // Idle: a candidate whatever its rank against the binder, so its
+    // chunks are emptiable by evicting it, and no compaction is the way.
+    planner.with_inner(|inner| inner.procs.get_mut(&resident).unwrap().idle = true);
     *pool.occupant.lock() = Some(resident);
     let p = planner.clone();
     let bind = crate::rt::spawn(async move { p.wait_bind_room(binder, 2, 1).await });
@@ -5578,8 +5584,15 @@ async fn a_bind_short_of_a_run_is_funded_by_the_map_never_waiting_on_a_compactio
         planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
         "the chunks' occupant is moved for it"
     );
-    assert_eq!(pool.compactions.load(Ordering::Relaxed), 0, "no compaction asked");
-    assert_eq!(planner.stats.compaction_waits.load(Ordering::Relaxed), 0);
+    // Here the move finds nothing to copy (no store backs the occupant):
+    // its chunks stay, and only then is a compaction the way. Never before
+    // the eviction was tried.
+    let compacted = pool.compactions.load(Ordering::Relaxed) > 0;
+    let found_nothing = planner.with_inner(|inner| inner.prepare_blocked.contains(&resident));
+    assert!(
+        !compacted || found_nothing,
+        "a compaction only once evicting the occupant moved nothing"
+    );
     bind.abort();
 }
 
@@ -6239,4 +6252,34 @@ async fn a_blocked_victim_is_a_candidate_again_once_the_pool_moves() {
     assert!(members(&planner).is_empty(), "never on the same pool twice");
     pool.disk_free.fetch_add(1, Ordering::Relaxed);
     assert_eq!(members(&planner), vec![resident], "swap slots freed: a candidate again");
+}
+
+/// Where no eviction can form the head's runs (scattered free chunks, their
+/// gaps held by what no candidate moves) and nothing is in flight, moving
+/// chunks is the only way: a compaction is asked and the head waits on it.
+/// Out of every head's path, such a head waited for good with the pool able
+/// to stand its runs.
+#[tokio::test(flavor = "current_thread")]
+async fn a_head_no_eviction_can_fund_asks_a_compaction() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    pool.free.lock().extend([0, 2, 4, 6]);
+    pool.compactable.store(true, Ordering::Release);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let binder = ProcessId::new_v4();
+    planner.register(binder);
+    planner.note_admitted(binder);
+    // The gaps are held by no candidate (no occupant the planner may move).
+    let p = planner.clone();
+    let bind = crate::rt::spawn(async move { p.wait_bind_room(binder, 2, 1).await });
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if pool.compactions.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+    }
+    assert!(pool.compactions.load(Ordering::Relaxed) > 0, "a compaction is asked");
+    assert!(planner.stats.compaction_waits.load(Ordering::Relaxed) > 0, "and waited on");
+    assert_eq!(planner.stats.evictions_started.load(Ordering::Relaxed), 0, "no one to evict");
+    bind.abort();
 }
