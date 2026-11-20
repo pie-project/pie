@@ -706,6 +706,67 @@ impl Engine for Xla {
     /// The program checked and its stage shapes named here; its stages
     /// compile in the returned compile, off the engine's thread, while
     /// fires go on (`Plane::prepare`).
+    /// The runtime's standard samplers' guest stages, compiled before ready
+    /// at every batch rung exactly as their registrations compile them, so a
+    /// request that registers one finds every stage compiled (the device's
+    /// program cache holds them) and builds nothing after ready. The
+    /// programs compile side by side, each stage admitted by the guest
+    /// compile ledger (`guest::run`), so a cold boot is bounded by host
+    /// memory, not run in turn. A program that does not lower or compile
+    /// fails the load by name.
+    fn prewarm_programs(&mut self, registrations: &[ProgramRegistration]) -> EngineResult<()> {
+        let device = self
+            .shell
+            .as_ref()
+            .map(Shell::device_shared)
+            .ok_or_else(|| Error::Program("the standard samplers prewarmed before load".into()))?;
+        let started = std::time::Instant::now();
+        let mut pending = Vec::with_capacity(registrations.len());
+        for registration in registrations {
+            pending.push(self.programs.prepare(registration).map_err(refusal)?);
+        }
+        let compiled: Vec<Result<(usize, f64), String>> = std::thread::scope(|scope| {
+            let jobs: Vec<_> = pending
+                .iter()
+                .map(|program| {
+                    let device = &device;
+                    scope.spawn(move || {
+                        let at = std::time::Instant::now();
+                        program
+                            .compile(device)
+                            .map(|staged| (staged.len(), at.elapsed().as_secs_f64()))
+                    })
+                })
+                .collect();
+            jobs.into_iter()
+                .map(|job| {
+                    job.join()
+                        .unwrap_or_else(|_| Err("a standard sampler's compile panicked".into()))
+                })
+                .collect()
+        });
+        let mut stages = 0;
+        let mut slowest = 0f64;
+        for (registration, done) in registrations.iter().zip(compiled) {
+            let (count, seconds) = done.map_err(|why| {
+                Error::Load(format!(
+                    "the standard sampler program 0x{:016x}'s guest stages: {why}",
+                    registration.program_hash
+                ))
+            })?;
+            stages += count;
+            slowest = slowest.max(seconds);
+        }
+        tracing::info!(
+            programs = registrations.len(),
+            stages,
+            slowest_s = slowest,
+            s = started.elapsed().as_secs_f64(),
+            "xla standard samplers' guest stages compiled before ready"
+        );
+        Ok(())
+    }
+
     fn prepare_program(
         &mut self,
         registration: &ProgramRegistration,
