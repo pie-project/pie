@@ -339,6 +339,21 @@ pub fn gated_delta_carried(
             ),
         ));
     }
+    // The step reads a state row four words a load: the pool's segments,
+    // the state's origin and its slot stride are whole vectors.
+    if [state.pool.words, state.origin, state.slot_stride]
+        .iter()
+        .any(|words| !words.is_multiple_of(4))
+    {
+        return Err(refuse(
+            OP,
+            format!(
+                "the state pool's segments of {} words, origin {} and slot stride {} are not \
+                 whole vectors of four words, which the carried step reads its state rows by",
+                state.pool.words, state.origin, state.slot_stride
+            ),
+        ));
+    }
     let heads = Heads {
         k_heads,
         v_heads,
