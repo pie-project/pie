@@ -132,7 +132,7 @@ impl SampleKnobs {
         let sampled = temperature > 0.0;
         Self {
             temperature: sampled
-                .then(|| Channel::from([sampler::inverse_temperature(temperature.max(1e-4))])),
+                .then(|| Channel::from([sampler::inverse_temperature(temperature)])),
             top_p: (sampled && top_p < 1.0).then(|| Channel::from([top_p])),
         }
     }
