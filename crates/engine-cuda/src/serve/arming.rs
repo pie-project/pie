@@ -1622,7 +1622,7 @@ impl Shell {
         let headroom = !st.from_record && spare < margin;
         let mine = !st.verify
             && (spent.census.bodies >= record::MAX_BODIES
-                || (st.capped && spent.census.bytes >= self.bodies_mem)
+                || (st.capped && allowance_spent(spent.census.bytes, self.bodies_mem))
                 || headroom);
         let stop = match self.ep.as_ref() {
             // The group's ranks fire one sequence of steps: the allowance
@@ -2253,3 +2253,28 @@ const BODY_ROUNDS: usize = 9;
 /// a serving step is.
 #[cfg(feature = "rocm")]
 const BODY_FIRES: usize = 20;
+
+/// Whether bodies weighing `bytes` have spent an allowance of `allowance`:
+/// past it, not at it. A re-arm is allowed exactly what the arming before it
+/// took (`Shell::measured_refit`), and its compositions past the last new
+/// body re-capture bodies it already holds (a wide composition's key a
+/// mixed one's): at the allowance they cost nothing, and stopping there
+/// would leave them walking eagerly for the life of the load.
+fn allowance_spent(bytes: usize, allowance: usize) -> bool {
+    bytes > allowance
+}
+
+#[cfg(test)]
+mod allowance_tests {
+    use super::allowance_spent;
+
+    #[test]
+    fn a_re_arm_at_exactly_what_the_arming_before_took_arms_on() {
+        // The measuring boot's refit: 53 bodies weighing what the first
+        // arming's 53 weighed, ten compositions still to re-capture.
+        let took = 150 << 20;
+        assert!(!allowance_spent(took, took));
+        assert!(allowance_spent(took + 1, took));
+        assert!(!allowance_spent(took - 1, took));
+    }
+}
