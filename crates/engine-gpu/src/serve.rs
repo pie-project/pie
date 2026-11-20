@@ -2132,8 +2132,8 @@ impl<B: Serve> Shell<B> {
     /// The disk tier: a slot file of `budget` bytes in disk chunks, any
     /// state shape's slots in any chunk, as [`Pools::disk_chunk_bytes`] and
     /// [`Pools::disk_division`] lay them; stated at load. Unstated
-    /// `budget`: a disk chunk for each of the pool's chunks, and at least
-    /// the kv pages of `seats` sequences at `context`, within the free disk
+    /// `budget`: the disk chunks `seats` sequences' kv pages at `context`
+    /// and their state take, within the free disk
     /// ([`engine::disk::derived_budget`]). One that cannot be seated is
     /// refused by name, stated or not. The disk chunks it holds.
     pub fn seat_disk_kv(
@@ -2151,14 +2151,8 @@ impl<B: Serve> Shell<B> {
             let pages =
                 u64::from(seats) * u64::from(context).div_ceil(u64::from(paging.page_size.max(1)));
             let per_list = layout.list.map_or(1, |list| u64::from(list.per_chunk.max(1)));
-            engine::disk::unstated_budget(
-                dir,
-                0,
-                0,
-                u64::from(layout.total_chunks),
-                pages.div_ceil(per_list),
-                chunk,
-            )
+            let state = (u64::from(seats) * self.state_slot_bytes()).div_ceil(chunk.max(1));
+            engine::disk::unstated_budget(dir, 0, 0, pages.div_ceil(per_list) + state, chunk)
         });
         self.pools.seat_disk(&self.device, dir, budget)?;
         let chunks = self.pools.disk_chunks();

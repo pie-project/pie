@@ -2511,7 +2511,7 @@ impl Shell {
         Ok(())
     }
 
-    /// Unstated `budget`: `seats` sequences at `context` and at least the pool,
+    /// Unstated `budget`: `seats` sequences' state and kv at `context`,
     /// within the free space ([`engine::disk::derived_budget`]).
     pub fn seat_disk_kv(
         &mut self,
@@ -2530,9 +2530,8 @@ impl Shell {
             Some(bytes) => bytes,
             None => engine::disk::unstated_budget(
                 dir,
-                u64::from(paging.slots),
+                if self.pools.state_slot_bytes() + buffered > 0 { u64::from(seats) } else { 0 },
                 self.pools.state_slot_bytes() + buffered,
-                paging.pages(),
                 u64::from(seats) * u64::from(context).div_ceil(u64::from(paging.page_size.max(1))),
                 self.pools.page_bytes()?,
             ),

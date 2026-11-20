@@ -653,10 +653,10 @@ impl Shell {
                 } else {
                     0
                 };
-                // Derived on its own ([`engine::disk::derived_budget`]): a
-                // disk chunk for each of the pool's chunks, at least the kv
-                // pages of `seats` sequences at `context`, within this
-                // rank's share of the free disk. Never four times the host
+                // Derived on its own ([`engine::disk::derived_budget`]): the
+                // disk chunks `seats` sequences' kv pages at `context` and
+                // their state take, within this rank's share of the free
+                // disk; nothing of the device pool enters it. Never four times the host
                 // tier (a host budget below one chunk seated no disk tier)
                 // nor a quarter of the disk. One that cannot be seated is
                 // refused by name.
@@ -670,12 +670,13 @@ impl Shell {
                     .list
                     .as_ref()
                     .map_or(1, |list| u64::from(list.per_chunk.max(1)));
+                let chunk = self.pools.disk_chunk_bytes();
+                let state = (u64::from(seats) * self.state_row_bytes()).div_ceil(chunk.max(1));
                 let bytes = engine::disk::derived_budget(
                     0,
                     0,
-                    u64::from(self.pools.pool_chunks()),
-                    pages.div_ceil(per_chunk),
-                    self.pools.disk_chunk_bytes(),
+                    pages.div_ceil(per_chunk) + state,
+                    chunk,
                     free / ranks,
                 );
                 self.pools.seat_disk(dir, world.rank, bytes, keep)?;
