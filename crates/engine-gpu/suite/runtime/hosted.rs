@@ -107,6 +107,7 @@ fn each_lane_hosts_what_it_reads_out_and_a_program_reads_its_rows_on_the_device(
                 row_count: 1,
                 token_count: ROWS,
                 sampled_rows: 1,
+                rows_per_lane: 1,
                 query_len: ROWS,
                 ..engine::program::BindExtents::default()
             },

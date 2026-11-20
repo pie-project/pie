@@ -242,6 +242,7 @@ fn a_chain_of_rows_answers_the_host_cell_for_cell() {
                 row_count: 1,
                 token_count: rows,
                 sampled_rows: 1,
+                rows_per_lane: 1,
                 query_len: rows,
                 ..engine::program::BindExtents::default()
             },

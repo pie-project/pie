@@ -2029,6 +2029,7 @@ fn reading(program: ProgramId, rows: u32) -> FireKey {
         program,
         extents: ::engine::BindExtents {
             sampled_rows: rows,
+            rows_per_lane: rows,
             ..::engine::BindExtents::default()
         },
     }
