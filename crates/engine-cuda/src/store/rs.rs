@@ -410,9 +410,21 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, Vec<u64>)
                 continue;
             }
             // The fused decode step reads the planes its primitives would:
-            // the conv's rows (the split it lands) and the gate prep's
-            // `[b | a]`.
-            if let Operation::Fused(poem_ir::Fused::GdnStep { qkv, ba, .. }) = &node.op {
+            // the conv's rows (the split it lands), the gate prep's
+            // `[b | a]`, and the recurrence's keys and corrected values.
+            if let Operation::Fused(poem_ir::Fused::GdnStep {
+                qkv,
+                ba,
+                conv,
+                gates,
+                y,
+                k_heads,
+                k_dim,
+                v_heads,
+                v_dim,
+                ..
+            }) = &node.op
+            {
                 let page = u64::from(paging);
                 let mut here = 0u64;
                 for (what, id) in [
@@ -430,6 +442,30 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, Vec<u64>)
                     );
                     here += width;
                 }
+                let keys = u64::from(k_heads * k_dim);
+                let values = u64::from(v_heads * v_dim);
+                let k = Plane {
+                    layer: decode_layers,
+                    at: page * here,
+                    width: keys,
+                };
+                here += keys;
+                let u = Plane {
+                    layer: decode_layers,
+                    at: page * here,
+                    width: 2 * values,
+                };
+                here += 2 * values;
+                corrected.insert(y.0, Corrected { k, u });
+                keys_of.insert(conv.0, (k, u32::try_from(keys).unwrap_or(u32::MAX), *k_dim));
+                step_gates.insert(
+                    gates.0,
+                    StepGates {
+                        qkv: *conv,
+                        k_heads: *k_heads,
+                        k_dim: *k_dim,
+                    },
+                );
                 decode_widths.push(here);
                 decode_layers += 1;
                 continue;

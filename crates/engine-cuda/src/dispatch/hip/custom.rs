@@ -712,7 +712,54 @@ impl Run<'_> {
         else {
             unreachable!("only the gated-delta step comes here");
         };
-        if !self.rs_extended() {
+        // A buffering fire's lanes carry rows and land their own: the fused
+        // step reads them where it covers the shape, else its primitives'
+        // carried steps do.
+        if !self.rs_extended() && self.rs_buffered(qkv) {
+            const OP: &str = "fused.gdn_step";
+            let conv_pool = self.recurrent_absolute(conv_state);
+            let pool = self.recurrent_absolute(state);
+            let x_plane = self.rs_plane(OP, qkv).map_err(crate::error::kernel)?;
+            let k_plane = self
+                .rs_planes()
+                .and_then(|planes| planes.keys_of(conv))
+                .map(|(plane, _, _)| plane);
+            if let Some(k_plane) = k_plane {
+                let conv_carry = self
+                    .rs_carry(OP, &[x_plane, k_plane], 0, &conv_pool)
+                    .map_err(crate::error::kernel)?;
+                let step_planes = self.gdn_planes(OP, ba, y).map_err(crate::error::kernel)?;
+                let step_carry = self
+                    .rs_carry(OP, &step_planes, 0, &pool)
+                    .map_err(crate::error::kernel)?;
+                let done = kernels_cuda::ssm::gdn_step_fused_carried(
+                    self.ctx(),
+                    self.tensor(qkvz),
+                    self.tensor(conv_weight),
+                    &crate::run::one_token(conv_pool),
+                    conv_width,
+                    dilation,
+                    self.tensor(ba),
+                    self.tensor(dt_bias),
+                    self.tensor(a_log),
+                    &crate::run::one_token(pool),
+                    k_heads,
+                    v_heads,
+                    k_dim,
+                    v_dim,
+                    &mut self.tensor(qkv),
+                    &mut self.tensor(z),
+                    &mut self.tensor(y),
+                    &conv_carry,
+                    &step_carry,
+                )
+                .map_err(crate::error::kernel)?;
+                if done {
+                    return Ok(());
+                }
+            }
+        }
+        if !self.rs_extended() && !self.rs_buffered(qkv) {
             let done = kernels_cuda::ssm::gdn_step_fused(
                 self.ctx(),
                 self.tensor(qkvz),

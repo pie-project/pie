@@ -1711,15 +1711,14 @@ impl Shell {
         let rs_lands = rs_moves.iter().any(|verb| !matches!(verb, RsMove::None));
         // A decoding lane replays its carried rows in its decode step's own
         // kernels (`dispatch::ssm`, `kernels_cuda::ssm::Carry`), in the body
-        // that buffers; only a wider lane's replay runs extended (and every
-        // lane's on ROCm, whose decode steps carry none).
+        // that buffers; only a wider lane's replay runs extended.
         let rs_extends = composition
             .lanes()
             .iter()
             .zip(&rs_replays)
             .any(|(row, replay)| {
                 *replay > 0
-                    && (cfg!(feature = "rocm") || !self.decoding.contains(row.class as usize))
+                    && !self.decoding.contains(row.class as usize)
             });
         let rs_body = match self.arm_rs {
             armed if arming && armed.buffers() => armed,
