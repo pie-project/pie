@@ -10,6 +10,8 @@
 //! `name` at the baseline and `name.tier` above it; a target not asked for
 //! is an empty table.
 //!
+//! A WGSL unit that binds the pool is also built with `PIE_ONE_SEGMENT` as `<key>.seg1`.
+//!
 //! The tree's rules, checked here: `prim/` holds the headers and no
 //! instantiation; every other unit instantiates at least one entry, and
 //! every entry is named for its path (`linear/moe/route.slang` instantiates
@@ -34,14 +36,21 @@ struct Variant {
     only: Option<String>,
     /// The tier it is built at; `None` is the baseline.
     tier: Option<String>,
+    /// The `PIE_ONE_SEGMENT` build of a WGSL instantiation that binds the pool.
+    one_segment: bool,
 }
 
 impl Variant {
-    /// The table key: the name, and the tier above the baseline.
+    /// The table key: the name, the tier above the baseline, and `.seg1` for one segment.
     fn key(&self) -> String {
-        match &self.tier {
+        let key = match &self.tier {
             Some(t) => format!("{}.{t}", self.name),
             None => self.name.clone(),
+        };
+        if self.one_segment {
+            format!("{key}.seg1")
+        } else {
+            key
         }
     }
 
@@ -80,13 +89,32 @@ fn main() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let kernels = root.join("kernels");
     let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("cargo sets OUT_DIR"));
-    let variants = collect(&kernels);
+    let mut variants = collect(&kernels);
     assert!(
         !variants.is_empty(),
         "no `// pie:instantiate` line under {}",
         kernels.display()
     );
     emit_census(&out, &variants);
+    let one_segment: Vec<Variant> = variants
+        .values()
+        .filter(|v| v.builds_for(Target::Wgsl) && binds_pool(&kernels, &v.file))
+        .filter(|v| !v.defines.iter().any(|(k, _)| k == "PIE_ONE_SEGMENT"))
+        .map(|v| Variant {
+            name: v.name.clone(),
+            file: v.file.clone(),
+            defines: v
+                .defines
+                .iter()
+                .cloned()
+                .chain([("PIE_ONE_SEGMENT".to_string(), "1".to_string())])
+                .collect(),
+            only: Some(Target::Wgsl.slang().to_string()),
+            tier: v.tier.clone(),
+            one_segment: true,
+        })
+        .collect();
+    variants.extend(one_segment.into_iter().map(|v| (v.key(), v)));
 
     let slangc =
         std::env::var_os("PIE_SLANGC").map_or_else(|| PathBuf::from("slangc"), PathBuf::from);
@@ -94,13 +122,29 @@ fn main() {
         (Target::Spirv, "CARGO_FEATURE_SPIRV", "spirv.rs", "&[u8]"),
         (Target::Wgsl, "CARGO_FEATURE_WGSL", "wgsl.rs", "&str"),
     ] {
+        let mut widest = 0;
         let rows = if std::env::var_os(feature).is_some() {
             let dir = out.join(target.ext());
             std::fs::create_dir_all(&dir).expect("OUT_DIR is writable");
             compile_all(&slangc, &kernels, &dir, &variants, target);
+            let module = |key: &str| {
+                std::fs::read_to_string(dir.join(format!("{key}.{}", target.ext())))
+                    .unwrap_or_default()
+            };
             variants
                 .iter()
                 .filter(|(_, v)| v.builds_for(target))
+                .filter(|(key, v)| {
+                    if !v.one_segment {
+                        return true;
+                    }
+                    let four = module(key.trim_end_matches(".seg1"));
+                    if four == module(key) {
+                        return false;
+                    }
+                    widest = widest.max(four.matches("var<storage").count());
+                    true
+                })
                 .map(|(key, v)| {
                     (
                         key.clone(),
@@ -112,8 +156,26 @@ fn main() {
         } else {
             Vec::new()
         };
-        emit_table(&out, table, ty, target, &rows);
+        let trailer = match target {
+            Target::Spirv => String::new(),
+            Target::Wgsl => format!("pub const WGSL_POOL_STORAGE_BUFFERS: u32 = {widest};\n"),
+        };
+        emit_table(&out, table, ty, target, &rows, &trailer);
     }
+}
+
+/// Whether `file` or a header it includes declares the pool's segments.
+fn binds_pool(kernels: &Path, file: &Path) -> bool {
+    let text = std::fs::read_to_string(kernels.join(file))
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", file.display()));
+    text.lines().any(|line| {
+        line.trim()
+            .strip_prefix("#include \"")
+            .and_then(|rest| rest.strip_suffix('"'))
+            .is_some_and(|header| {
+                header == "prim/pool.slang" || binds_pool(kernels, Path::new(header))
+            })
+    })
 }
 
 fn compile_all(
@@ -229,6 +291,7 @@ fn emit_table(
     ty: &str,
     target: Target,
     rows: &[(String, String, PathBuf)],
+    trailer: &str,
 ) {
     let include = match target {
         Target::Spirv => "include_bytes!",
@@ -245,6 +308,7 @@ fn emit_table(
         text.push_str(&format!("    ({name:?}, {file:?}, {include}({path:?})),\n"));
     }
     text.push_str("];\n");
+    text.push_str(trailer);
     std::fs::write(out.join(table), text).expect("OUT_DIR is writable");
 }
 
@@ -323,6 +387,7 @@ fn collect(kernels: &Path) -> BTreeMap<String, Variant> {
                 defines,
                 only,
                 tier,
+                one_segment: false,
             };
             if let Some(prior) = out.insert(variant.key(), variant) {
                 panic!(

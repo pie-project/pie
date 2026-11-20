@@ -98,6 +98,11 @@ pub trait Context<B: Backend> {
     /// The bytes one buffer may span.
     fn max_buffer(&self) -> u64;
 
+    /// The segments a kernel binds the state pool in, at most [`kernels_slang::SEGMENTS`].
+    fn pool_segments(&self) -> usize {
+        kernels_slang::SEGMENTS
+    }
+
     fn name(&self) -> &str;
 
     fn cores(&self) -> u32;
