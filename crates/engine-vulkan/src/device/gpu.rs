@@ -60,6 +60,10 @@ impl engine_gpu::backend::Context<Api> for Context {
         Context::frame(self)
     }
 
+    fn spanned(&self) -> Result<Frame> {
+        Context::spanned(self)
+    }
+
     fn max_buffer(&self) -> u64 {
         Context::max_buffer(self)
     }
@@ -145,11 +149,19 @@ impl engine_gpu::backend::Frame<Api> for Frame {
     fn commit_async(self, on_done: Option<OnDone>) -> Result<Pending> {
         Frame::commit_async(self, on_done)
     }
+
+    fn commit_spanned(self) -> Result<Option<u64>> {
+        Frame::commit_spanned(self)
+    }
 }
 
 impl engine_gpu::backend::Pending for Pending {
     fn wait(&self) -> Result<()> {
         Pending::wait(self)
+    }
+
+    fn landed(&self) -> bool {
+        Pending::landed(self)
     }
 }
 

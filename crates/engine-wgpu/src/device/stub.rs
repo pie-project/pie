@@ -138,6 +138,10 @@ impl Context {
         match self.never {}
     }
 
+    pub fn spanned(&self) -> Result<Frame> {
+        match self.never {}
+    }
+
     pub fn bind_frame(&self) -> Result<Frame> {
         match self.never {}
     }
@@ -174,6 +178,10 @@ impl Frame {
     }
 
     pub fn commit_timed(self) -> Result<f64> {
+        match self.never {}
+    }
+
+    pub fn commit_spanned(self) -> Result<Option<u64>> {
         match self.never {}
     }
 

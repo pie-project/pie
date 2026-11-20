@@ -296,6 +296,7 @@ impl<B: Host> Gpu<B> {
             estimate_ms = whole / 1e6,
             per_layer_ms = per_layer / 1e6,
             worst = held.worst,
+            scale = held.scale,
             bound_ms = held.bound_ns / 1e6,
             split = admitted.split(),
             refused = matches!(admitted, crate::submit::Admitted::Refused { .. }),
@@ -1450,6 +1451,10 @@ where
         // The frame before can no longer be asked for its rows.
         if let Some(shell) = self.shell.as_mut() {
             shell.open_frame();
+            // Under a stated submit bound, a frame that follows an idle
+            // device re-times its clock before its first step is admitted
+            // (`crate::submit`); nothing runs where no bound is stated.
+            shell.retime(id).map_err(fault)?;
         }
 
         let mut steps = Vec::with_capacity(frame.steps.len());

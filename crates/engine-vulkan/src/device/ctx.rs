@@ -313,6 +313,22 @@ impl Core {
 const FENCE_TIMEOUT_NS: u64 = 120_000_000_000;
 
 impl Core {
+    /// The bits of a timestamp the queue's family writes: 0 where it writes
+    /// none (or the device states no `timestampPeriod`).
+    fn stamp_bits(&self) -> u32 {
+        if self.limits.timestamp_period <= 0.0 {
+            return 0;
+        }
+        // SAFETY: `physical` is the instance's live physical device.
+        let families = unsafe {
+            self.instance
+                .get_physical_device_queue_family_properties(self.physical)
+        };
+        families
+            .get(self.family as usize)
+            .map_or(0, |family| family.timestamp_valid_bits)
+    }
+
     fn lend_fence(&self) -> Result<vk::Fence> {
         if let Some(fence) = self
             .spare_fences
@@ -1242,6 +1258,39 @@ impl Context {
         self.frame_with(false)
     }
 
+    /// A frame whose device time [`Frame::commit_spanned`] reads back: a
+    /// timestamp written at the top of the pipe before its work and one at
+    /// the bottom after it, where the queue writes timestamps (its family's
+    /// `timestampValidBits` nonzero, a nonzero `timestampPeriod`); a plain
+    /// frame where it writes none.
+    pub fn spanned(&self) -> Result<Frame> {
+        let frame = self.frame_with(true)?;
+        let core = &self.core;
+        if core.stamp_bits() == 0 {
+            return Ok(frame);
+        }
+        let d = &core.device;
+        // SAFETY: `d` is live; the queue writes timestamps (checked above).
+        let pool = unsafe {
+            d.create_query_pool(
+                &vk::QueryPoolCreateInfo::default()
+                    .query_type(vk::QueryType::TIMESTAMP)
+                    .query_count(2),
+                None,
+            )
+        }
+        .map_err(|e| core.fault("vkCreateQueryPool", e))?;
+        let cmd = frame.inner.cmd();
+        // SAFETY: `cmd` is recording outside a render pass and only this
+        // frame records into it; the range is the pool's two queries.
+        unsafe {
+            d.cmd_reset_query_pool(cmd, pool, 0, 2);
+            d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, pool, 0);
+        }
+        *frame.inner.span.lock().expect("span lock poisoned") = Some(pool);
+        Ok(frame)
+    }
+
     fn frame_with(&self, one_time: bool) -> Result<Frame> {
         let core = &self.core;
         let d = &core.device;
@@ -1325,6 +1374,7 @@ impl Context {
                 keep: Mutex::new(Vec::new()),
                 submitted: std::sync::atomic::AtomicBool::new(false),
                 timing: Mutex::new(timing),
+                span: Mutex::new(None),
                 spare: Mutex::new(std::collections::HashMap::new()),
                 waiters: std::sync::atomic::AtomicU32::new(0),
                 most_waiters: std::sync::atomic::AtomicU32::new(0),
@@ -1380,6 +1430,10 @@ pub(crate) struct Inner {
 
     pub(crate) timing: Mutex<Option<Timing>>,
 
+    /// A spanned frame's two timestamps, before its work and after it
+    /// ([`Context::spanned`]).
+    span: Mutex<Option<vk::QueryPool>>,
+
     spare: Mutex<std::collections::HashMap<u64, Vec<vk::DescriptorSet>>>,
 
     /// Threads blocked on `fence` now, and the most at once.
@@ -1423,6 +1477,9 @@ impl Drop for Inner {
             }
             if let Some(timing) = self.timing.get_mut().expect("timing lock poisoned").take() {
                 d.destroy_query_pool(timing.pool, None);
+            }
+            if let Some(span) = self.span.get_mut().expect("span lock poisoned").take() {
+                d.destroy_query_pool(span, None);
             }
             let owned = self
                 .core
@@ -1963,6 +2020,54 @@ impl Frame {
         }
         .wait()?;
         Ok(started.elapsed().as_secs_f64())
+    }
+
+    /// Submits and waits: the device's time between the two timestamps a
+    /// [`Context::spanned`] frame writes, ns; `None` for another frame.
+    pub fn commit_spanned(mut self) -> Result<Option<u64>> {
+        let span = *self.inner.span.lock().expect("span lock poisoned");
+        if let Some(pool) = span
+            && self.open
+        {
+            // SAFETY: the frame is open, so `cmd` is recording; query 1 of
+            // the pool was reset when the frame opened.
+            unsafe {
+                self.inner.core.device.cmd_write_timestamp(
+                    self.inner.cmd(),
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    pool,
+                    1,
+                );
+            }
+        }
+        self.submit()?;
+        Pending {
+            inner: Arc::clone(&self.inner),
+            landing: None,
+        }
+        .wait()?;
+        let Some(pool) = span else {
+            return Ok(None);
+        };
+        let core = &self.inner.core;
+        let mut ticks = [0u64; 2];
+        // SAFETY: the frame's fence was waited on, so both queries are
+        // written; `ticks` holds one u64 for each with `TYPE_64`.
+        unsafe {
+            core.device.get_query_pool_results(
+                pool,
+                0,
+                &mut ticks,
+                vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+            )
+        }
+        .map_err(|e| core.fault("vkGetQueryPoolResults", e))?;
+        let bits = core.stamp_bits();
+        let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+        let ticks = ticks[1].wrapping_sub(ticks[0]) & mask;
+        Ok(Some(
+            (ticks as f64 * f64::from(core.limits.timestamp_period)) as u64,
+        ))
     }
 
     pub fn into_kept(mut self) -> Result<Kept> {

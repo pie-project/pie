@@ -88,6 +88,10 @@ impl<B: Serve> Context<Named<B>> for Facts {
         Ok(NoFrame)
     }
 
+    fn spanned(&self) -> Result<NoFrame> {
+        Ok(NoFrame)
+    }
+
     fn max_buffer(&self) -> u64 {
         self.max_buffer
     }
@@ -262,6 +266,11 @@ impl<B: Serve> Frame<Named<B>> for NoFrame {
         }
         Ok(Landed)
     }
+
+    /// A frame of nothing runs on no device: no time to read.
+    fn commit_spanned(self) -> Result<Option<u64>> {
+        Ok(None)
+    }
 }
 
 /// A frame of nothing has landed.
@@ -271,6 +280,10 @@ pub struct Landed;
 impl Pending for Landed {
     fn wait(&self) -> Result<()> {
         Ok(())
+    }
+
+    fn landed(&self) -> bool {
+        true
     }
 }
 

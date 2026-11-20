@@ -746,6 +746,10 @@ pub struct Shell<B: Serve> {
     /// The platform's bound on one submission and what holds a serving step
     /// to it (`crate::submit`); none where it states none.
     submit_bound: Option<crate::submit::SubmitBound>,
+    /// Under a stated submit bound, the probe a frame that follows an idle
+    /// device re-times its clock by, and the clock it last read
+    /// ([`Shell::retime`]).
+    probe: Option<(crate::submit::Probe<B>, crate::submit::Clock)>,
     /// The next step walks a layer at a time: its estimate is past the
     /// bound whole (`crate::submit::Admitted::Layers`).
     split_next: bool,
@@ -1627,7 +1631,7 @@ impl<B: Serve> Shell<B> {
         // Where the platform states a bound on one submission, every serving
         // step is held to it by the estimate (`crate::submit`), which must
         // then be stated: refused by its key otherwise.
-        let submit_bound = match crate::rates::STATED_SUBMIT_BOUND {
+        let mut submit_bound = match crate::rates::STATED_SUBMIT_BOUND {
             None => None,
             Some(bound) => {
                 let Some(estimate) = fire_estimate else {
@@ -1680,6 +1684,7 @@ impl<B: Serve> Shell<B> {
                     layers: crate::submit::layers(&boot.trace),
                     fire_lanes: budgets.tokens.max_lanes,
                     rungs: span.rungs().iter().map(|rung| rung.tokens).collect(),
+                    scale: 1.0,
                 };
                 tracing::info!(
                     bound_ms = bound.as_millis() as u64,
@@ -1692,6 +1697,29 @@ impl<B: Serve> Shell<B> {
                     "submit bound: each serving step held to the platform's bound on one submission"
                 );
                 Some(held)
+            }
+        };
+
+        // The probe a frame after an idle device re-times its clock by
+        // (`crate::submit::Probe`), laid and fired once here, before the
+        // load is ready: its pipeline built, its clock read. Its curve time
+        // is the estimate's own matmul curve at its shape, plus a launch.
+        let probe = match submit_bound.as_mut() {
+            None => None,
+            Some(held) => {
+                let (m, n, k) = crate::submit::PROBE;
+                let rates = &held.estimate.rates;
+                let mut clock =
+                    crate::submit::Clock::new(rates.gemm_compute_ns(m, n, k) + rates.launch_ns);
+                let probe = crate::submit::Probe::<B>::new(&device, tuning.gemm(tier, m))?;
+                clock.probed(probe.fire(&device)?);
+                held.scale = clock.scale();
+                tracing::info!(
+                    curve_us = clock.curve_ns / 1e3,
+                    ratio = clock.ratio,
+                    "submit bound: the probe re-times the device's clock after it idles"
+                );
+                Some((probe, clock))
             }
         };
 
@@ -2023,6 +2051,7 @@ impl<B: Serve> Shell<B> {
             readout_tally: (0, 0),
             weighed,
             submit_bound,
+            probe,
             split_next: false,
             pipelines,
             asks,
@@ -3553,6 +3582,62 @@ impl<B: Serve> Shell<B> {
     #[must_use]
     pub fn submit_bound(&self) -> Option<&crate::submit::SubmitBound> {
         self.submit_bound.as_ref()
+    }
+
+    /// Under a stated submit bound, re-times the device's clock where frame
+    /// `frame` follows an idle device: where nothing the load submitted is
+    /// still in flight as its first step goes out (every step in flight
+    /// reaped as landed, read without waiting, and no grafted copy
+    /// pending), the probe is fired alone and timed, and its time over its
+    /// curve time is the scale every step's estimate is read at from here
+    /// ([`crate::submit::SubmitBound::scale`]). A frame queued behind work
+    /// still running follows no idle and keeps the scale. Nothing is done
+    /// where no bound is stated.
+    pub fn retime(&mut self, frame: engine::FrameId) -> Result<()> {
+        if self.probe.is_none() {
+            return Ok(());
+        }
+        B::reap(self)?;
+        let idle = self.inflight.is_empty()
+            && self
+                .grafted
+                .as_ref()
+                .is_none_or(crate::backend::Pending::landed);
+        if !idle {
+            return Ok(());
+        }
+        let (Some((probe, clock)), Some(held)) = (self.probe.as_mut(), self.submit_bound.as_mut())
+        else {
+            return Ok(());
+        };
+        // The probe is admitted by its own estimate, as every submission is.
+        let estimate = clock.probe_ns() * held.worst.max(1.0);
+        if estimate > held.bound_ns {
+            return Err(Fault::Device {
+                call: "submit bound: probe",
+                why: format!(
+                    "the probe ({:?} matmul) is estimated at {:.1} ms at its last ratio {:.3} \
+                     and the worst ratio {:.3}, past the platform's stated bound of {:.0} ms on \
+                     one GPU submission: not submitted",
+                    crate::submit::PROBE,
+                    estimate / 1e6,
+                    clock.ratio,
+                    held.worst,
+                    held.bound_ns / 1e6
+                ),
+            });
+        }
+        let took = probe.fire(&self.device)?;
+        clock.probed(took);
+        held.scale = clock.scale();
+        tracing::debug!(
+            frame = frame.0,
+            took_us = took / 1e3,
+            curve_us = clock.curve_ns / 1e3,
+            scale = held.scale,
+            "submit bound: the device idled; re-timed"
+        );
+        Ok(())
     }
 
     /// The next step this shell enqueues walks a layer at a time (or, at
