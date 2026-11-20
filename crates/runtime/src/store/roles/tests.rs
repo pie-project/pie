@@ -1573,13 +1573,14 @@ impl super::DiskSlots for FakeDisk {
     }
 }
 
-/// The M1 shape, a load on unified memory: no host tier, so a park leaves
-/// an instance's tables and rings on the device, parked all the same. They
-/// are room a move makes: counted as the chunks they hold, they go down to
-/// the disk tier's slot file, a slot of it a role slot, freeing every
-/// device slot, and the restore copies them back into fresh device slots
-/// and gives the file's slots back. With no slot file either, nothing
-/// below holds them: they are no movable room.
+/// The M1 shape, a load on unified memory: no host tier. A park sends an
+/// instance's tables and rings straight to the disk tier's slot file, a
+/// slot of it a role slot, freeing every device slot; the restore copies
+/// them back into fresh device slots and gives the file's slots back. Left
+/// on the device at the park (the M1 on 0d96fb179: 379 opened chunks of the
+/// Instance shape after 107 evictions, no move down ever asked), they held
+/// their chunks. With no slot file either, nothing below holds them: they
+/// stay, and are no movable room.
 #[test]
 fn with_no_host_tier_parked_role_slots_go_down_to_disk_and_come_back() {
     let facts = facts(true);
@@ -1595,33 +1596,13 @@ fn with_no_host_tier_parked_role_slots_go_down_to_disk_and_come_back() {
     let was = roles.lock().unwrap().slots(Owner::Instance(instance));
 
     let park = roles.lock().unwrap().prepare_park(holder(1)).unwrap();
-    assert!(park.copies().is_empty(), "no host: nothing copied at the park");
-    roles.lock().unwrap().commit(park);
-    assert_eq!(held(&device), resident, "its live parts stay on the device");
-    let chunks = roles.lock().unwrap().parked_chunk_slots(holder(2));
+    assert!(park.copies().iter().all(|copy| copy.disk), "to the slot file at the park");
     assert_eq!(
-        chunks.iter().map(|&(_, _, slots)| slots).sum::<u32>(),
+        park.copies().iter().map(|copy| copy.host.len()).sum::<usize>(),
         3 + 3 + 2,
-        "the instance's tables and ring, and the channel's ring, counted"
+        "the instance's tables and ring, and the channel's ring"
     );
-    assert!(chunks.iter().all(|&(_, by, _)| by == holder(1)));
-    assert!(
-        roles.lock().unwrap().parked_chunk_slots(holder(1)).is_empty(),
-        "its own restore keeps them where they lie: no room for it"
-    );
-
-    let down = roles
-        .lock()
-        .unwrap()
-        .prepare_park_down(&[holder(1)], true);
-    assert_eq!(down.host_chunks, 0);
-    let down = down.txn.expect("the disk holds them");
-    assert!(down.copies().iter().all(|copy| copy.disk), "to the slot file");
-    assert_eq!(
-        down.copies().iter().map(|copy| copy.host.len()).sum::<usize>(),
-        8
-    );
-    roles.lock().unwrap().commit(down);
+    roles.lock().unwrap().commit(park);
     assert_eq!(held(&device), before, "every device slot is free");
     assert!(disk.taken() > 0, "disk chunks of the roles' own shapes hold them");
     assert!(roles.lock().unwrap().parked_chunk_slots(holder(2)).is_empty());
@@ -1642,8 +1623,6 @@ fn with_no_host_tier_parked_role_slots_go_down_to_disk_and_come_back() {
     // Parked again and closed while on disk: its file slots go back.
     let park = roles.lock().unwrap().prepare_park(holder(1)).unwrap();
     roles.lock().unwrap().commit(park);
-    let down = roles.lock().unwrap().prepare_park_down(&[holder(1)], true);
-    roles.lock().unwrap().commit(down.txn.unwrap());
     roles.lock().unwrap().close_instance(instance);
     roles.lock().unwrap().close_channel(channel);
     assert_eq!(disk.taken(), 0);
@@ -1659,12 +1638,12 @@ fn with_no_host_tier_parked_role_slots_go_down_to_disk_and_come_back() {
     assert!(bare.lock().unwrap().prepare_park_down(&[holder(3)], true).txn.is_none());
 }
 
-/// A discrete load whose host is full at the park: the live parts stay on
-/// the device. The host first: short of room, the move counts the host
-/// chunks it lacks (what host kv going on down to disk makes) and takes
-/// nothing; with room made, they go to the host, and come back from it.
+/// A discrete load whose host is full at the park (or a host tier of no
+/// room, as a budget of a few MiB seats): the live parts go to the disk
+/// tier's slot file rather than stay on the device, and come back from it.
+/// With host room, they go to the host.
 #[test]
-fn with_the_host_full_parked_role_slots_wait_for_host_room_then_go_there() {
+fn with_the_host_full_parked_role_slots_go_to_disk() {
     let Pools {
         device,
         host,
@@ -1682,25 +1661,25 @@ fn with_the_host_full_parked_role_slots_wait_for_host_room_then_go_there() {
     let kv = host.lock().unwrap().take_refs(list, free).unwrap();
 
     let park = roles.lock().unwrap().prepare_park(holder(1)).unwrap();
+    assert!(park.copies().iter().all(|copy| copy.disk), "no host room: to the slot file");
     roles.lock().unwrap().commit(park);
-    assert_eq!(held(&device), resident, "no host room: they stay");
-    assert!(!roles.lock().unwrap().parked_chunk_slots(holder(2)).is_empty());
-    let down = roles.lock().unwrap().prepare_park_down(&[holder(1)], false);
-    assert!(down.txn.is_none(), "the host first");
-    assert!(down.host_chunks > 0, "short the host chunks it lacks");
-    assert_eq!(disk.taken(), 0);
-
-    // Host kv went on down to disk: room.
-    host.lock().unwrap().give_refs(list, &kv);
-    let down = roles
+    assert_eq!(held(&device), before, "every device slot is free");
+    assert!(disk.taken() > 0);
+    let unpark = roles
         .lock()
         .unwrap()
-        .prepare_park_down(&[holder(1)], false)
-        .txn
-        .expect("the host has room now");
-    assert!(down.copies().iter().all(|copy| !copy.disk), "to the host");
-    roles.lock().unwrap().commit(down);
-    assert_eq!(held(&device), before);
+        .prepare_unpark(holder(1))
+        .unwrap()
+        .unwrap();
+    roles.lock().unwrap().commit(unpark);
+    assert_eq!(disk.taken(), 0, "the file's slots are back");
+    assert_eq!(held(&device), resident);
+
+    // Host room: to the host.
+    host.lock().unwrap().give_refs(list, &kv);
+    let park = roles.lock().unwrap().prepare_park(holder(1)).unwrap();
+    assert!(park.copies().iter().all(|copy| !copy.disk), "to the host");
+    roles.lock().unwrap().commit(park);
     assert!(held(&host) > 0);
     let unpark = roles
         .lock()
@@ -1710,7 +1689,6 @@ fn with_the_host_full_parked_role_slots_wait_for_host_room_then_go_there() {
         .unwrap();
     roles.lock().unwrap().commit(unpark);
     assert_eq!(held(&host), 0);
-    assert_eq!(held(&device), resident);
     roles.lock().unwrap().close_instance(instance);
     assert_eq!(held(&device), before);
 }

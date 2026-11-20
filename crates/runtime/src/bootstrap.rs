@@ -604,7 +604,12 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 host_chunks = d.chunks.host_chunks,
                 disk_chunks = d.chunks.disk_chunks,
                 chunk_bytes = d.chunks.chunk_bytes,
-                "kv tiers: suspended kv goes to the host, then the disk"
+                "kv tiers: suspended kv goes to {}",
+                if d.chunks.host_chunks == 0 {
+                    "the disk (no host tier)"
+                } else {
+                    "the host, then the disk"
+                }
             );
         } else if kv_swap_capable {
             tracing::info!(

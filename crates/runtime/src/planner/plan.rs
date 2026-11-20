@@ -194,6 +194,11 @@ impl ResidencyPlanner {
             .unwrap_or(pids);
         let mut map = self.port.chunk_occupants(&pids);
         map.merge(self.port.parked_occupants(self.parked_except(pid)));
+        // The moves the whole need takes, every length laid together (the
+        // map's own line reads one run of the longest length alone).
+        let need_moves = need
+            .as_ref()
+            .map(|need| map.cheapest_need(need).map(|pids| pids.len()));
         let (map, census) = (map.explain(run), self.port.chunk_census(run));
         // Every head queued fits the pool alone (one past it is refused at
         // its ask): unserved with nothing in flight, the planner found no
@@ -205,6 +210,7 @@ impl ResidencyPlanner {
             need = ?need,
             again,
             refusal = %refusal.unwrap_or_default(),
+            ?need_moves,
             free_runs = ?need.as_ref().map(|need| {
                 need.entries()
                     .iter()
@@ -257,7 +263,6 @@ impl ResidencyPlanner {
             let rs_growth = self.rs_growth();
             // What the device has free past the pages the head gathered:
             // room a restore may take.
-            let spare = self.port.device_stats().0;
             let step = self.with_inner(|inner| {
                 // A rung raise served and not yet taken holds the queue:
                 // the room it was funded is its, and its leaving plans
@@ -367,9 +372,8 @@ impl ResidencyPlanner {
                         Some(need) if room_stood != Some(key) => {
                             Step::RestoreBindRoom { key, need }
                         }
-                        _ => match inner.restore_gate(pid, spare) {
+                        _ => match inner.restore_gate(pid) {
                             RestoreGate::Serve => Step::ServeRestore { key, pid },
-                            RestoreGate::Wait => Step::Done,
                             RestoreGate::Evict { need, fund } => {
                                 Step::EvictForRoles { need, fund }
                             }

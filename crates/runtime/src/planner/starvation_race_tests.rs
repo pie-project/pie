@@ -341,28 +341,6 @@ fn a_wedged_head_short_of_state_alone_still_reclaims_by_restart() {
     stores.rs.lock().unwrap().release_reservation(held);
 }
 
-#[test]
-fn a_restore_leaves_a_page_for_each_running_resident_process() {
-    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
-    let pool = RacePool::new(64);
-    pool.refill_after_stall(10, 0);
-    let planner = Arc::new(ResidencyPlanner::new(Arc::new(pool) as Arc<dyn PoolPort>));
-    let running: Vec<ProcessId> = (0..4).map(|_| ProcessId::new_v4()).collect();
-    for &pid in &running {
-        planner.register(pid);
-        planner.note_admitted(pid);
-    }
-    // Four lanes resident and running: four pages held back for their next
-    // steps, whatever the restore takes.
-    planner.with_inner(|inner| {
-        assert_eq!(inner.growth_reserve(), 4);
-        inner.procs.get_mut(&running[0]).unwrap().idle = true;
-        assert_eq!(inner.growth_reserve(), 3, "an idle process grows nothing");
-        inner.procs.get_mut(&running[1]).unwrap().state = Residency::Evicted;
-        assert_eq!(inner.growth_reserve(), 2, "nor one off the device");
-    });
-}
-
 /// A dry pool of eight pages, an older lane's growth and a younger prompt
 /// waiting on it, neither holding a page a kill could free: the off run's
 /// moment, when a third process had just finished.
@@ -2161,8 +2139,7 @@ fn a_restore_that_fails_a_step_is_failed_once_not_queued_again() {
         planner.register(pid);
         planner.note_admitted(pid);
     }
-    // A fire in flight elsewhere: a queued restore waits for it rather
-    // than being served at once with nothing moving.
+    // A fire in flight elsewhere.
     let decoding = ProcessId::new_v4();
     planner.register(decoding);
     planner.note_admitted(decoding);
@@ -2189,7 +2166,12 @@ fn a_restore_that_fails_a_step_is_failed_once_not_queued_again() {
 
     // Negative control: more of its pages were swapped out since its quote;
     // queued again, to be quoted anew.
+    // (Its parked state moving down a tier holds it queued, so the pass
+    // does not serve it at once here, with no executor to run it.)
     restoring(&planner, moved);
+    planner.with_inner(|inner| {
+        inner.parked_moving.insert(moved);
+    });
     planner.requeue_restore(moved);
     assert!(queued(&planner, moved), "queued again, quoted anew");
     assert_eq!(faults(&planner), 0);
@@ -3149,9 +3131,8 @@ async fn a_restore_suspended_for_a_bind_waits_for_the_bind_s_room_too() {
         planner.with_inner(|inner| inner.procs.get(&binder).unwrap().state)
     };
     // Control: by kv pages alone it would go now.
-    let spare = pool.chunk_stats().pages.0;
     assert_eq!(
-        planner.with_inner(|inner| inner.restore_gate(binder, spare)),
+        planner.with_inner(|inner| inner.restore_gate(binder)),
         RestoreGate::Serve,
         "its kv room stands"
     );
@@ -7586,4 +7567,64 @@ async fn the_fleet_going_quiet_plans_an_unserved_head_once() {
         "the same room plans nothing again"
     );
     drop(held);
+}
+
+/// Mac Pro's 2 GiB mix on c27717c48: a restore head suspended for a bind,
+/// its need [(7, 1), (4, 1)] standing (open stretches of 19 and 11), 33 kv
+/// pages to gather, never refused (why=None), and never attempted while a
+/// fleet of 248 decoded. A head that arrives with its room standing is
+/// attempted in its first pass, fires in flight or none.
+#[tokio::test(flavor = "current_thread")]
+async fn a_restore_head_whose_need_stands_is_attempted_in_its_first_pass() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    for decoding in [true, false] {
+        let pool = Arc::new(BindRoomPool::new(200, 0..0, 64));
+        pool.pages.store(true, Ordering::Release);
+        // Stretches of 19 and 11, and pages enough for its kv past them.
+        pool.free.lock().extend((0..19).chain(30..41).chain(100..140));
+        // Its own unpark lays four chunks.
+        pool.own.lock().extend(150..154);
+        let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+        let head = ProcessId::new_v4();
+        planner.register(head);
+        planner.note_admitted(head);
+        // A decoding fleet larger than the pages free.
+        let fleet: Vec<ProcessId> = (0..248).map(|_| ProcessId::new_v4()).collect();
+        for &pid in &fleet {
+            planner.register(pid);
+            planner.note_admitted(pid);
+        }
+        let fires: Vec<_> = if decoding {
+            fleet.iter().take(8).map(|&pid| planner.fire_in_flight(pid)).collect()
+        } else {
+            Vec::new()
+        };
+        planner.with_inner(|inner| {
+            let proc = inner.procs.get_mut(&head).unwrap();
+            proc.state = Residency::Evicted;
+            proc.bind_room = Some(super::proc::PendingBind {
+                run: 7,
+                pieces: 1,
+                pages: 7,
+            });
+            inner.enqueue(
+                head,
+                WaitKind::Restore {
+                    demand: Demand {
+                        kv_pages: 33,
+                        rs: RsUnits::default(),
+                    },
+                },
+            );
+        });
+        // One pass (no drain task: the poke plans at once).
+        planner.poke();
+        let state = planner.with_inner(|inner| inner.procs[&head].state);
+        assert_ne!(
+            state,
+            Residency::Evicted,
+            "decoding={decoding}: its need stands, it is attempted"
+        );
+        drop(fires);
+    }
 }

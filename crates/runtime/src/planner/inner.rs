@@ -466,30 +466,16 @@ impl Inner {
         wake
     }
 
-    /// The pages the resident lanes' next steps take: one each process
-    /// running (admitted, resident, not idle). A restore leaves this much of
-    /// the device free, so bringing one back does not suspend another at
-    /// the next page boundary.
-    pub(super) fn growth_reserve(&self) -> u32 {
-        self.procs
-            .values()
-            .filter(|proc| proc.admitted && !proc.idle && proc.state == Residency::Resident)
-            .count() as u32
-    }
-
-    /// Whether the restore of `pid`, the head, goes now (`spare`: device
-    /// pages free past what the head gathered). A restore goes back once a
-    /// resident process has finished (its credit), or the fleet can do
-    /// nothing else, or the device has room for it and still a page for
-    /// each resident lane's next one: suspended processes come back as
-    /// soon as room appears, every one it holds at once, not one a
+    /// Whether the restore of `pid`, the head, goes now, its kv gathered:
+    /// suspended processes come back as soon as their room stands, fires
+    /// in flight or none, every one it holds at once, not one a
     /// completion. One whose role slots found no room last time
     /// ([`super::proc::Proc::roles_short`]) goes again on the runs that
     /// stand free, and has room made for its runs (idle cache, a coming
     /// grow, then the occupants of the chunks it could take) only once
     /// nothing in flight can free room, a fleet waiting at binds included:
     /// funding it while the fleet decoded thrashed.
-    pub(super) fn restore_gate(&mut self, pid: ProcessId, spare: u32) -> RestoreGate {
+    pub(super) fn restore_gate(&mut self, pid: ProcessId) -> RestoreGate {
         let roles_short = self
             .procs
             .get(&pid)
@@ -518,9 +504,12 @@ impl Inner {
                 fund: stalled || self.bind_waits_behind(pid),
             };
         }
-        if spare < self.growth_reserve() && !stalled {
-            return RestoreGate::Wait;
-        }
+        // Its kv gathered (the step before), its rs and its bind's runs
+        // standing: it goes, fires in flight or none. Held for a page for
+        // each running lane past the pages it had already gathered, it held
+        // them idle while a fleet of 248 decoded, its need standing and
+        // never attempted (Mac Pro's 2 GiB mix); seated lanes' growth goes
+        // ahead of it anyway (`growth_first`).
         RestoreGate::Serve
     }
 
@@ -632,7 +621,6 @@ impl Inner {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RestoreGate {
     Serve,
-    Wait,
     /// Its role slots are short of `need`, `(run, pieces)` runs of whole
     /// chunks: it goes again where they stand free, and (`fund`) room is
     /// made for it ([`Step::EvictForRoles`](super::plan)).

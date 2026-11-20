@@ -126,7 +126,7 @@ fn a_restore_short_of_room_for_its_roles_waits_then_evicts_once_stalled() {
     ]);
     park_restore(&mut inner, pids[0], 4);
     assert_eq!(
-        inner.restore_gate(pids[0], 64),
+        inner.restore_gate(pids[0]),
         RestoreGate::Serve,
         "control"
     );
@@ -143,7 +143,7 @@ fn a_restore_short_of_room_for_its_roles_waits_then_evicts_once_stalled() {
     }
     assert!(!inner.nothing_in_flight());
     assert_eq!(
-        inner.restore_gate(pids[0], 64),
+        inner.restore_gate(pids[0]),
         RestoreGate::Evict {
             need: (3, 1),
             fund: false
@@ -153,7 +153,7 @@ fn a_restore_short_of_room_for_its_roles_waits_then_evicts_once_stalled() {
     );
     inner.completion_credit = 1;
     assert_eq!(
-        inner.restore_gate(pids[0], 64),
+        inner.restore_gate(pids[0]),
         RestoreGate::Serve,
         "a completion's credit"
     );
@@ -167,7 +167,7 @@ fn a_restore_short_of_room_for_its_roles_waits_then_evicts_once_stalled() {
     }
     assert!(inner.nothing_in_flight(), "nothing in flight frees room");
     assert_eq!(
-        inner.restore_gate(pids[0], 0),
+        inner.restore_gate(pids[0]),
         RestoreGate::Evict {
             need: (3, 1),
             fund: true
@@ -408,7 +408,7 @@ fn a_roles_short_head_with_a_bind_waiting_behind_it_is_funded_while_a_decoder_fi
     }
     assert!(!inner.nothing_in_flight());
     assert_eq!(
-        inner.restore_gate(head, 0),
+        inner.restore_gate(head),
         RestoreGate::Evict {
             need: (3, 1),
             fund: false
@@ -419,7 +419,7 @@ fn a_roles_short_head_with_a_bind_waiting_behind_it_is_funded_while_a_decoder_fi
     inner.procs.get_mut(&binder).unwrap().bind_waiting = true;
     assert!(!inner.nothing_in_flight(), "the decoder has not stopped");
     assert_eq!(
-        inner.restore_gate(head, 0),
+        inner.restore_gate(head),
         RestoreGate::Evict {
             need: (3, 1),
             fund: true
@@ -430,7 +430,7 @@ fn a_roles_short_head_with_a_bind_waiting_behind_it_is_funded_while_a_decoder_fi
     inner.procs.get_mut(&binder).unwrap().bind_waiting = false;
     inner.procs.get_mut(&head).unwrap().bind_waiting = true;
     assert_eq!(
-        inner.restore_gate(head, 0),
+        inner.restore_gate(head),
         RestoreGate::Evict {
             need: (3, 1),
             fund: false

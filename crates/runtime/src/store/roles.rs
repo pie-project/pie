@@ -703,6 +703,11 @@ pub struct RoleCopy {
 /// as the engine places it. The chunks are the kv store's disk slots, taken
 /// whole and given back whole through it, counted against the disk's budget
 /// with kv's.
+///
+/// Lock order: a taker holds its own lock (the roles', or the rs store's)
+/// and then the kv store's, which in turn may take the shared pool's; no
+/// path takes the roles' or the rs store's lock under the kv store's, and
+/// the planner reads the file's room outside the rs store's lock.
 pub trait DiskSlots: Send + Sync {
     /// `n` whole free disk chunks, as chunk ids; all or none.
     fn take_chunks(&self, n: usize) -> Option<Vec<u32>>;
@@ -2124,6 +2129,7 @@ impl Roles {
             .map(|(owner, _)| *owner)
             .collect();
         let mut items = Vec::new();
+        let mut below = Vec::new();
         let mut shed = Vec::new();
         for owner in owners {
             let parts = self.items[&owner].parts.clone();
@@ -2142,24 +2148,30 @@ impl Roles {
                     })
                     .collect()
             };
+            // Its live parts to the host where it takes them, else to the
+            // disk tier's slot file (no host tier on unified memory, or a
+            // host with no room for them): left on the device there, a
+            // process's tables and rings held their chunks until a move
+            // down was asked for them, and none was (the M1: 379 opened
+            // chunks of the Instance shape after 107 evictions).
             let moved = if parts.iter().all(Part::dead) {
-                Some(emptied(&parts))
+                Some((emptied(&parts), Tier::Host))
             } else {
-                match self.host.clone() {
-                    Some(host) => match self.take_parts(&host, &parts, false) {
-                        Ok(to) => Some(to),
-                        Err(error) => {
-                            tracing::debug!(?owner, %error, "an item's live parts stay on the device: host short");
-                            None
-                        }
-                    },
-                    None => None,
-                }
+                let host = self.host.clone().and_then(|host| {
+                    self.take_parts(&host, &parts, false)
+                        .map_err(|error| {
+                            tracing::debug!(?owner, %error, "an item's live parts find no host room");
+                        })
+                        .ok()
+                });
+                host.map(|to| (to, Tier::Host))
+                    .or_else(|| self.take_disk(&parts).map(|to| (to, Tier::Disk)))
             };
             match moved {
-                Some(to) => {
+                Some((to, tier)) => {
                     self.items.get_mut(&owner).expect("present").tier = Tier::Moving;
                     items.push((owner, to));
+                    below.push(tier);
                 }
                 // Its live parts stay where they lie, parked all the same:
                 // room a move down a tier makes once the device wants it
@@ -2171,7 +2183,6 @@ impl Roles {
             }
         }
         (!items.is_empty() || !shed.is_empty()).then(|| {
-            let below = vec![Tier::Host; items.len()];
             let mut txn = self.moving(true, items, below);
             txn.shed = shed;
             txn

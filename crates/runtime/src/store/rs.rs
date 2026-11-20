@@ -673,18 +673,18 @@ impl RsStore {
         self.disk.as_ref().map(|disk| disk.slots.clone())
     }
 
-    /// The rows the disk tier takes, `free_chunks` of its chunks free: each
-    /// shape's free slots in its open disk chunks and its share of the free
-    /// chunks (every shape opens chunks of the same file), records by their
-    /// pieces. What a victim's state finds room in below the device where
-    /// no host row is free.
+    /// The rows the disk tier takes, `free_chunks` of its chunks free: for
+    /// each shape, the free chunks at that shape's slots a chunk (a disk
+    /// chunk holds any shape, CONTRACT-BC 22) and the free slots of its
+    /// partly used disk chunks; records by their pieces of each shape. What
+    /// a victim's state finds room in below the device where no host row is
+    /// free.
     #[must_use]
     pub fn disk_units(&self, free_chunks: u32) -> RsUnits {
         let Some(disk) = self.disk.as_ref() else {
             return RsUnits::default();
         };
-        let shapes = (disk.records.len() + disk.lists.len()).max(1) as u64;
-        let share = u64::from(free_chunks) / shapes;
+        let share = u64::from(free_chunks);
         let room = |shape: ::engine::chunk::ShapeId| -> u64 {
             let open: u64 = disk
                 .chunks

@@ -457,25 +457,31 @@ impl ResidencyPlanner {
                 (
                     key,
                     waiter.kv_need().saturating_sub(inner.accum.len() as u32),
+                    inner
+                        .procs
+                        .get(&waiter.pid)
+                        .is_some_and(|proc| proc.roles_short.is_some()),
                 )
             })
         });
-        let Some((key, kv_missing)) = head else {
+        let Some((key, kv_missing, refused)) = head else {
             self.returns.want_nothing();
             return;
         };
-        // The pass ended with the head unserved on the room standing now:
-        // a count that room already meets moves nothing, so its want is past
-        // what stands. Its chunk count met by the free chunks (a restore
-        // short of a run of four, 231 chunks free), every chunk given back
-        // anywhere, the pass's own among them, woke a pass that found no
-        // step (Mac Pro's mx-3: ~470 a second, nothing in flight).
+        // A head refused on the room standing now (its unpark came up short
+        // there): a count that room already meets moves nothing, so its
+        // want is past what stands. Its chunk count met by the free chunks
+        // (a restore short of a run of four, 231 chunks free), every chunk
+        // given back anywhere, the pass's own among them, woke a pass that
+        // found no step (Mac Pro's mx-3: ~470 a second, nothing in flight).
+        // A head never refused is tried against the room standing, its
+        // want its need.
+        let past = |count: u32| if refused { u64::from(count).saturating_add(1) } else { 0 };
         let mut want_chunks = self.head_room(key).map_or(u64::MAX, |need| {
-            need.chunks()
-                .max(u64::from(self.port.free_chunks()).saturating_add(1))
+            need.chunks().max(if refused { past(self.port.free_chunks()) } else { 0 })
         });
         let want_list = if kv_missing > 0 {
-            u64::from(kv_missing).max(u64::from(self.port.device_stats().0).saturating_add(1))
+            u64::from(kv_missing).max(if refused { past(self.port.device_stats().0) } else { 0 })
         } else {
             u64::MAX
         };
