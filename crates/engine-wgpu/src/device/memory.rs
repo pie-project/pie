@@ -119,11 +119,13 @@ fn host_room() -> std::result::Result<u64, String> {
     tracing::info!(
         available = room.available,
         defended = room.defended,
+        cgroup = ?room.cgroup,
         floor = engine_gpu::host_memory::SAFETY_FLOOR_BYTES,
         room = room.room,
         held,
         "the device shares the host's memory, so the load takes what it has available, \
-         less what lmkd keeps free past it, less the floor"
+         less what lmkd keeps free past it, capped at what \
+         its cgroups leave, less the floor"
     );
     Ok(room.room.saturating_add(held))
 }
