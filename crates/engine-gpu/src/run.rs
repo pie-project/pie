@@ -498,6 +498,15 @@ impl<'c, B: Backend> Run<'c, B> {
         }
     }
 
+    /// The window's rows of what [`Self::attended`] binds, from
+    /// [`Self::row0`].
+    pub fn row_span(&self) -> kernels_slang::ssm::RowSpan {
+        kernels_slang::ssm::RowSpan {
+            row0: self.row0(),
+            rows: self.window_rows(),
+        }
+    }
+
     /// The window's rows.
     pub fn window_rows(&self) -> u32 {
         match &self.window().gathered {
@@ -1247,7 +1256,7 @@ impl<'c, B: Backend> Run<'c, B> {
     pub fn recurrent(&self, id: ValueId) -> RecurrentPool {
         match self.cache(id) {
             CachePool::Recurrent(pool) => RecurrentPool {
-                slots: self.cut_rows(pool.slots),
+                slots: self.attended_rows(pool.slots),
                 ..*pool
             },
             CachePool::Kv(_) => panic!(

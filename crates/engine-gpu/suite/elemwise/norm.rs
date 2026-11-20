@@ -136,43 +136,58 @@ fn the_gated_norms_answer_the_reference() {
         for sigmoid in [false, true] {
             let want = gated_reference(&xv, &zv, &wv, vd, eps, sigmoid);
             let wt = Tensor::new(w, 1, vd as u32, Dtype::F32);
+            for spans in crate::gpu::row_cuts(rows as u32) {
+                let y = gpu.zeros(n);
+                gpu.run(|s| {
+                    for &span in &spans {
+                        kernels_slang::elemwise::norm::rmsnorm_gated(
+                            s,
+                            f32t(x, width),
+                            bt(z),
+                            wt,
+                            vd as u32,
+                            eps,
+                            sigmoid,
+                            bt(y),
+                            span,
+                        )?;
+                    }
+                    Ok(())
+                });
+                close(
+                    &gpu.down(y, n),
+                    &want,
+                    &format!(
+                        "gated rms sigmoid={sigmoid} {shape}, {} window(s)",
+                        spans.len()
+                    ),
+                );
+            }
+        }
+        let want = gated_reference(&xv, &zv, &wv, vd, eps, true);
+        for spans in crate::gpu::row_cuts(rows as u32) {
             let y = gpu.zeros(n);
             gpu.run(|s| {
-                kernels_slang::elemwise::norm::rmsnorm_gated(
-                    s,
-                    f32t(x, width),
-                    bt(z),
-                    wt,
-                    vd as u32,
-                    eps,
-                    sigmoid,
-                    bt(y),
-                )
+                for &span in &spans {
+                    kernels_slang::elemwise::norm::rmsnorm_gated_by(
+                        s,
+                        f32t(x, width),
+                        bt(z),
+                        Tensor::new(w, 1, vd as u32, Dtype::F32),
+                        heads as u32,
+                        eps,
+                        bt(y),
+                        span,
+                    )?;
+                }
+                Ok(())
             });
             close(
                 &gpu.down(y, n),
                 &want,
-                &format!("gated rms sigmoid={sigmoid} {shape}"),
+                &format!("gated rms by heads {shape}, {} window(s)", spans.len()),
             );
         }
-        let want = gated_reference(&xv, &zv, &wv, vd, eps, true);
-        let y = gpu.zeros(n);
-        gpu.run(|s| {
-            kernels_slang::elemwise::norm::rmsnorm_gated_by(
-                s,
-                f32t(x, width),
-                bt(z),
-                Tensor::new(w, 1, vd as u32, Dtype::F32),
-                heads as u32,
-                eps,
-                bt(y),
-            )
-        });
-        close(
-            &gpu.down(y, n),
-            &want,
-            &format!("gated rms by heads {shape}"),
-        );
     }
 }
 

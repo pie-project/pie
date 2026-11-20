@@ -123,6 +123,7 @@ impl<B: Backend> Run<'_, B> {
                     self.slang_of(*dt_bias),
                     self.slang_of(*a_log),
                     ext_gates,
+                    kernels_slang::ssm::RowSpan::whole(ext_ba),
                 )?;
                 self.rs_land(OP, &seat, ext_gates, *gates)
             }
@@ -235,12 +236,13 @@ impl<B: Backend> Run<'_, B> {
                 ..
             } => conv1d::conv1d(
                 ctx,
-                self.slang_of(*x),
+                self.attended(*x),
                 self.slang_of(*weight),
                 &self.state_pool(*state),
                 *conv_width,
                 *dilation,
-                self.slang_of(*y),
+                self.attended(*y),
+                self.row_span(),
             ),
             Ssm::CausalConv1dChunked {
                 x,
@@ -252,13 +254,14 @@ impl<B: Backend> Run<'_, B> {
                 ..
             } => conv1d::conv1d_chunked(
                 ctx,
-                self.slang_of(*x),
+                self.attended(*x),
                 self.csr(),
                 self.slang_of(*weight),
                 &self.state_pool(*state),
                 *conv_width,
                 *dilation,
-                self.slang_of(*y),
+                self.attended(*y),
+                self.row0(),
             ),
             Ssm::GdnGates {
                 ba,
@@ -267,10 +270,11 @@ impl<B: Backend> Run<'_, B> {
                 gates,
             } => gdn_prep::gdn_prep(
                 ctx,
-                self.slang_of(*ba),
+                self.attended(*ba),
                 self.slang_of(*dt_bias),
                 self.slang_of(*a_log),
-                self.slang_of(*gates),
+                self.attended(*gates),
+                self.row_span(),
             ),
             Ssm::GatedDelta {
                 qkv,
@@ -285,14 +289,15 @@ impl<B: Backend> Run<'_, B> {
             } => gdn_recurrent::gated_delta(
                 ctx,
                 self.tuning().recurrent(),
-                self.slang_of(*qkv),
-                self.slang_of(*gates),
+                self.attended(*qkv),
+                self.attended(*gates),
                 &self.state_pool(*state),
                 *k_heads,
                 *v_heads,
                 *k_dim,
                 *v_dim,
-                self.slang_of(*y),
+                self.attended(*y),
+                self.row_span(),
             ),
             Ssm::GatedDeltaChunked {
                 qkv,
@@ -307,15 +312,16 @@ impl<B: Backend> Run<'_, B> {
             } => gdn_recurrent::gated_delta_chunked(
                 ctx,
                 self.tuning().recurrent(),
-                self.slang_of(*qkv),
+                self.attended(*qkv),
                 self.csr(),
-                self.slang_of(*gates),
+                self.attended(*gates),
                 &self.state_pool(*state),
                 *k_heads,
                 *v_heads,
                 *k_dim,
                 *v_dim,
-                self.slang_of(*y),
+                self.attended(*y),
+                self.row_span(),
             ),
             Ssm::Kda {
                 mixed,

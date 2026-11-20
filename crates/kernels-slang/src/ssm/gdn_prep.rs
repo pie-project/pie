@@ -3,7 +3,7 @@
 
 use dtype::Dtype;
 
-use super::rows;
+use super::RowSpan;
 use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, refuse, stated};
 use crate::error::Error;
 use crate::tensor::Tensor;
@@ -19,6 +19,7 @@ pub fn gdn_prep(
     dt_bias: Tensor,
     a_log: Tensor,
     gates: Tensor,
+    span: RowSpan,
 ) -> Result<(), Error> {
     const OP: &str = "ssm.gdn_gates";
     let entry = dtype_dispatch!(OP, ba.dtype, { Bf16 => "ssm_gdn_prep_bf16" });
@@ -38,14 +39,16 @@ pub fn gdn_prep(
         gates.rows == ba.rows && gates.width == ba.width,
         "the fused `[g | beta]` row rides the projection it is derived from"
     );
+    let launched = span.rows(OP, &[ba, gates])?;
     ctx.fire(
-        Fire::at(GDN_PREP, entry).apply(Grid::of([v_heads, rows(OP, ba)?, 1], [256, 1, 1])),
+        Fire::at(GDN_PREP, entry).apply(Grid::of([v_heads, launched, 1], [256, 1, 1])),
         &[
             ba.arg(),
             a_log.arg(),
             dt_bias.arg(),
             gates.arg_mut(),
             stated(OP, v_heads)?.arg(),
+            span.row0.arg(),
         ],
     )
 }

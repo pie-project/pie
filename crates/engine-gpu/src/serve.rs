@@ -6127,37 +6127,16 @@ impl<B: Serve> Shell<B> {
             .iter()
             .map(|&(class, rows)| {
                 let mut lane = self.naming_lane(class, rows)?;
-                let carried = rs.unwrap_or(0);
-                if rs.is_some() || lanes.len() > self.held.len() {
-                    // Refs the pool takes as any lane's: a bind-only fire
-                    // reads and writes none, and a load need lay no seat
-                    // runs ([`Pools::walk_refs`]).
-                    let page = self.pools.paging().page_size.max(1);
-                    let held = (rows + carried).div_ceil(page).max(1);
-                    lane.by_ref = Some(self.pools.walk_refs(held)?);
-                }
-                if rs.is_some() {
-                    lane.carried = carried;
-                    // A masked class's mask reaches the rows it carries too.
-                    if lane.mask.is_some() {
-                        let extent = rows + carried;
-                        lane.mask = Some(Masking::Extent(engine::fire::Mask::new(
-                            vec![0, extent],
-                            u64::from(extent),
-                        )));
+                match rs {
+                    Some(carried) => self.rs_walk_lane(&mut lane, rows, carried)?,
+                    None if lanes.len() > self.held.len() => {
+                        // Refs the pool takes as any lane's: a bind-only fire
+                        // reads and writes none, and a load need lay no seat
+                        // runs ([`Pools::walk_refs`]).
+                        let page = self.pools.paging().page_size.max(1);
+                        lane.by_ref = Some(self.pools.walk_refs(rows.div_ceil(page).max(1))?);
                     }
-                    // A fresh lane buffering its own rows and carrying none,
-                    // its rs pages refs as its kv pages are.
-                    let page = self.rs_buffers.as_ref().map_or(1, |rs| rs.page_tokens());
-                    lane.rs = engine::fire::RsVerb::Buffer {
-                        pages: self
-                            .pools
-                            .walk_rs_refs((rows + carried).div_ceil(page).max(1))?,
-                        base: 0,
-                        folded: 0,
-                        fold: engine::fire::FoldLen::Host(0),
-                        lineage: engine::fire::Lineage::Set,
-                    };
+                    None => {}
                 }
                 Ok(lane)
             })
@@ -6189,6 +6168,39 @@ impl<B: Serve> Shell<B> {
             &mut Cursor::new(&place),
         )?;
         Ok(arm)
+    }
+
+    /// `lane` (of `rows` rows) as a load's walks make an rs lane: buffering
+    /// its rows (`RsVerb::Buffer`, folded at 0) and carrying `carried` rows
+    /// before them, which it replays from its buffer; its kv and rs pages
+    /// named by ref, as a walk's lanes past the seats are (a walk reads and
+    /// writes none of them), and a masked class's mask reaching the rows it
+    /// carries too.
+    fn rs_walk_lane(&self, lane: &mut NamingLane<B>, rows: u32, carried: u32) -> Result<()> {
+        let page = self.pools.paging().page_size.max(1);
+        lane.by_ref = Some(
+            self.pools
+                .walk_refs((rows + carried).div_ceil(page).max(1))?,
+        );
+        lane.carried = carried;
+        if lane.mask.is_some() {
+            let extent = rows + carried;
+            lane.mask = Some(Masking::Extent(engine::fire::Mask::new(
+                vec![0, extent],
+                u64::from(extent),
+            )));
+        }
+        let rs_page = self.rs_buffers.as_ref().map_or(1, |rs| rs.page_tokens());
+        lane.rs = engine::fire::RsVerb::Buffer {
+            pages: self
+                .pools
+                .walk_rs_refs((rows + carried).div_ceil(rs_page).max(1))?,
+            base: 0,
+            folded: 0,
+            fold: engine::fire::FoldLen::Host(0),
+            lineage: engine::fire::Lineage::Set,
+        };
+        Ok(())
     }
 
     /// Whether a lane of `class` runs a region of `axis`.
@@ -6405,10 +6417,17 @@ impl<B: Serve> Shell<Named<B>> {
         &mut self,
         lanes: &[(usize, u32)],
         found: &mut Found,
+        rs: Option<u32>,
     ) -> Result<Option<poem_exec::KernelError>> {
         let owned = lanes
             .iter()
-            .map(|&(class, rows)| self.naming_lane(class, rows))
+            .map(|&(class, rows)| {
+                let mut lane = self.naming_lane(class, rows)?;
+                if let Some(carried) = rs {
+                    self.rs_walk_lane(&mut lane, rows, carried)?;
+                }
+                Ok(lane)
+            })
             .collect::<Result<Vec<NamingLane<Named<B>>>>>()?;
         let (seated, media, clips) = lane_views(&owned);
         // Its seat-addressed lanes read the seats' runs: back their segments
@@ -6534,7 +6553,7 @@ impl<B: Serve> Shell<Named<B>> {
             let mut found = Found::new(regions);
             for class in 0..classes {
                 let lanes = self.alone(class, u64::from(tokens));
-                if let Some(refusal) = self.name_fire(&lanes, &mut found)?
+                if let Some(refusal) = self.name_fire(&lanes, &mut found, None)?
                     && !unservable.iter().any(|held| held.class == class)
                 {
                     tracing::warn!(
@@ -6559,8 +6578,29 @@ impl<B: Serve> Shell<Named<B>> {
                     .collect();
                 for trio in self.cuts(&refused) {
                     let lanes = trio.map(|class| (class, rows));
-                    if let Some(refusal) = self.name_fire(&lanes, &mut found)? {
+                    if let Some(refusal) = self.name_fire(&lanes, &mut found, None)? {
                         mixes.push((trio, refusal));
+                    }
+                }
+            }
+            // Where the trace buffers a recurrence, a lane of each servable
+            // class buffering its rows, and one replaying a page it carries:
+            // a speculative fire's committed scans and the buffer's gather.
+            if let Some(page) = self
+                .rs_buffers
+                .as_ref()
+                .filter(|_| self.rs_layout.is_some())
+                .map(|rs| rs.page_tokens())
+            {
+                for class in
+                    (0..classes).filter(|&c| !unservable.iter().any(|held| held.class == c))
+                {
+                    for (rows, carried) in [(tokens.min(page), 0), (1, page)] {
+                        if let Some(refusal) =
+                            self.name_fire(&[(class, rows)], &mut found, Some(carried))?
+                        {
+                            return Err(Fault::Fire(poem_exec::Error::Kernel(refusal)));
+                        }
                     }
                 }
             }
