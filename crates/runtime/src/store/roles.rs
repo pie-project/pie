@@ -2413,6 +2413,11 @@ where
         }
     }
     let _ends = Ends(&waiting);
+    // Suspended for this bind's room once and restored: short again, it
+    // waits parked for room the planner makes, never suspended and evicted
+    // again (mx-2: suspend, evict, restore, short, every ~25 ms, 222,924
+    // evictions and no serve).
+    let mut restored_for_room = false;
     loop {
         // Taken before the bind: room given back meanwhile is not lost.
         let watch = room();
@@ -2442,7 +2447,7 @@ where
             // Holding guest state of its own, it would wait on itself: it is
             // suspended, its state given back, and binds once restored with
             // room for this bind (`run`, `pieces`) beside its own.
-            if suspend(run, pieces) {
+            if !restored_for_room && suspend(run, pieces) {
                 tracing::debug!(%pid, %error, "a bind short of room suspends its process");
                 // Waiting for its restore, not for room: its need is not
                 // counted meanwhile.
@@ -2452,6 +2457,7 @@ where
                         "its process was suspended for room and is not resident again: {why}"
                     )));
                 }
+                restored_for_room = true;
                 continue;
             }
             // Else it waits, queued in the planner, for room: given back

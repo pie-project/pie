@@ -3822,3 +3822,55 @@ async fn a_head_short_only_by_fragmentation_waits_and_is_served_once_eviction_ma
         .expect("the task");
     assert!(matches!(served, Ok(())), "{served:?}");
 }
+
+/// mx-2's cycle at the planner: a process suspended for its bind's room is
+/// restored only once that room stands (the map shows its run beside its
+/// own), not on room for its kv alone; while no run of its need stands it
+/// stays parked, no one moved and no restore sent, however often the plan
+/// runs; the run appears and it is restored, once.
+#[tokio::test(flavor = "current_thread")]
+async fn a_process_suspended_for_its_bind_s_room_is_restored_only_once_the_room_stands() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    // Four chunks free, no three adjacent.
+    pool.free.lock().extend([0, 2, 4, 6]);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let pid = ProcessId::new_v4();
+    planner.register(pid);
+    planner.note_admitted(pid);
+    planner.with_inner(|inner| {
+        let proc = inner.procs.get_mut(&pid).unwrap();
+        proc.state = Residency::Evicted;
+        proc.bind_room = Some(super::proc::PendingBind {
+            run: 3,
+            pieces: 1,
+            pages: 3,
+        });
+        inner.enqueue(
+            pid,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        );
+    });
+    for _ in 0..50 {
+        planner.pages_freed();
+        planner.poke();
+        for _ in 0..10 {
+            crate::rt::yield_now().await;
+        }
+    }
+    assert_eq!(planner.stats.restores.load(Ordering::Relaxed), 0, "no run of its need: not restored");
+    assert_eq!(planner.stats.evictions_started.load(Ordering::Relaxed), 0, "no one moved, no cycle");
+    // The run appears.
+    pool.free.lock().push(1);
+    pool.gives.fetch_add(1, Ordering::Relaxed);
+    planner.pages_freed();
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.stats.restores.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+    }
+    assert_eq!(planner.stats.restores.load(Ordering::Relaxed), 1, "its room stands: restored once");
+}

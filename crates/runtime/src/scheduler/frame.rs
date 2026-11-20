@@ -181,6 +181,17 @@ impl FromIterator<u64> for QueuedFireIds {
     }
 }
 
+/// Ready lanes a seal passed over, by why ([`FramePolicy::seal`]).
+#[derive(Debug, Clone, Copy, Default)]
+struct SealSkips {
+    /// A fire cut under a cap since lowered.
+    capped: usize,
+    /// Past the wave's rows, tokens or readouts.
+    unfit: usize,
+    /// A prompt behind another in flight.
+    prompt_held: usize,
+}
+
 pub(crate) struct FramePolicy {
     k: usize,
     max_wave_tokens: usize,
@@ -211,6 +222,11 @@ pub(crate) struct FramePolicy {
     /// Owners blocked on the planner or a store ([`Self::on_owner_waits`])
     /// until their wait ends ([`Self::on_owner_unblocked`]).
     blocked: BTreeSet<ProcessId>,
+    /// Why the last seal that sealed nothing passed over each ready lane.
+    seal_skips: SealSkips,
+    /// When an unsealed complete frame with every expected lane in was last
+    /// named.
+    unsealed_said: Option<Instant>,
     truncated_seqs: BTreeMap<ProcessId, u64>,
     strict_watchdog_deadline: Option<Instant>,
     /// When a held frame last said which lanes it waits on.
@@ -307,6 +323,8 @@ impl FramePolicy {
             departing: BTreeSet::new(),
             suspended: BTreeSet::new(),
             blocked: BTreeSet::new(),
+            seal_skips: SealSkips::default(),
+            unsealed_said: None,
             truncated_seqs: BTreeMap::new(),
             strict_watchdog_deadline: None,
             hold_said: None,
@@ -947,6 +965,7 @@ impl FramePolicy {
             let mut members: HashSet<ProcessId> = HashSet::new();
             let mut sealed_widest = 0usize;
             let mut dropped_empty = false;
+            let mut skipped = SealSkips::default();
             for lane_id in &order {
                 let Some(lane) = self.lanes.get_mut(lane_id) else {
                     continue;
@@ -961,6 +980,7 @@ impl FramePolicy {
                     .iter()
                     .any(|fire| fire.rung_rows > self.fire_cap)
                 {
+                    skipped.capped += 1;
                     continue;
                 }
                 let mut live: Vec<PlacedFire> = front
@@ -998,6 +1018,7 @@ impl FramePolicy {
                                 || reading + fire.readouts <= max_wave_readouts)
                 });
                 if !fits {
+                    skipped.unfit += 1;
                     continue;
                 }
                 let prompting = live.iter().any(|fire| fire.tokens > fire.rows);
@@ -1006,6 +1027,7 @@ impl FramePolicy {
                     && !self.prompts_only
                     && prompting_in_flight.iter().any(|lane| lane != lane_id)
                 {
+                    skipped.prompt_held += 1;
                     continue;
                 }
                 for fire in &live {
@@ -1041,6 +1063,7 @@ impl FramePolicy {
                 if dropped_empty {
                     continue;
                 }
+                self.seal_skips = skipped;
                 self.lanes
                     .retain(|_, lane| {
                         lane.awaited || lane.leashed || lane.parked || !lane.frames.is_empty()
@@ -1417,7 +1440,25 @@ ready_age_newest={}us",
             match self.seal() {
                 Some(FramePlan::Dispatch(_)) => continue,
                 Some(plan) => return plan,
-                None => return FramePlan::Park,
+                None => {
+                    // Every expected lane in and a complete frame unsealed:
+                    // say what each ready lane was passed over for, once a
+                    // while, so a held frame names its cause.
+                    if self.have_seal_candidate()
+                        && self
+                            .unsealed_said
+                            .is_none_or(|said| now.saturating_duration_since(said) >= HOLD_SAYS_AFTER)
+                    {
+                        self.unsealed_said = Some(now);
+                        tracing::warn!(
+                            skips = ?self.seal_skips,
+                            fire_cap = self.fire_cap,
+                            summary = %self.debug_summary(),
+                            "every expected lane is in and a complete frame went unsealed"
+                        );
+                    }
+                    return FramePlan::Park;
+                }
             }
         }
     }
@@ -1629,6 +1670,156 @@ mod tests {
         );
     }
 
+    /// od-1's census, held for good ("frame k=2 lanes=44 awaited=10
+    /// sealed=0 suspended=11 blocked=40", gate "missing=0 candidate=true
+    /// in_flight=0"): 10 lanes expected and complete; 13 blocked owners'
+    /// lanes with a complete frame; 10 blocked owners' lanes with none; 10
+    /// suspended and blocked owners' lanes with none; 1 suspended owner's
+    /// lane with a complete frame. Every expected lane is in, so the frame
+    /// seals at once, the 14 parked owners' complete frames riding it: 24
+    /// lanes' fires in one seal, nothing left behind. Run with the parked
+    /// owners' frames submitted before their park and after it (a straggler),
+    /// and at k=2 with each frame two slots.
+    #[test]
+    fn od_1_census_seals_with_every_expected_lane_in() {
+        for straggle in [false, true] {
+            let mut policy = FramePolicy::new(2, 64, 4096, None)
+                .with_submit_deadline(Duration::from_secs(86_400));
+            let lanes: Vec<ProcessId> = (0..44).map(|_| pid()).collect();
+            let mut next = 1u64;
+            let mut submit = |policy: &mut FramePolicy, lane: ProcessId, seq: u64| -> Vec<u64> {
+                let ids = vec![next, next + 1];
+                for (slot, &id) in ids.iter().enumerate() {
+                    policy.on_fire_enqueued(stamp(lane, seq, slot as u32, 2), Some(lane), id, 1, 1);
+                }
+                next += 2;
+                ids
+            };
+            // A first frame of all 44: every lane expected after it.
+            let mut queued: Vec<u64> = Vec::new();
+            for &lane in &lanes {
+                queued.extend(submit(&mut policy, lane, 0));
+            }
+            let ids: QueuedFireIds = queued.iter().copied().collect();
+            assert_eq!(fires(&plan(&mut policy, &ids, Instant::now())).len(), 88);
+            policy.on_frame_posted(lanes.clone(), Instant::now());
+            policy.on_frame_retired(lanes.clone());
+            let mut queued: Vec<u64> = Vec::new();
+            let (expected, rest) = lanes.split_at(10);
+            let (blocked_full, rest) = rest.split_at(13);
+            let (blocked_empty, rest) = rest.split_at(10);
+            let (both_empty, suspended_full) = rest.split_at(10);
+            for &lane in expected {
+                queued.extend(submit(&mut policy, lane, 1));
+            }
+            for &lane in blocked_full {
+                if !straggle {
+                    queued.extend(submit(&mut policy, lane, 1));
+                }
+                policy.on_owner_waits(lane);
+                if straggle {
+                    queued.extend(submit(&mut policy, lane, 1));
+                }
+            }
+            for &lane in blocked_empty {
+                policy.on_owner_waits(lane);
+            }
+            for &lane in both_empty {
+                policy.on_process_suspend(lane);
+                policy.on_owner_waits(lane);
+            }
+            for &lane in suspended_full {
+                if !straggle {
+                    queued.extend(submit(&mut policy, lane, 1));
+                }
+                policy.on_process_suspend(lane);
+                if straggle {
+                    queued.extend(submit(&mut policy, lane, 1));
+                }
+            }
+            assert_eq!(policy.lanes.values().filter(|lane| lane.awaited).count(), 10);
+            let ids: QueuedFireIds = queued.iter().copied().collect();
+            let FramePlan::Dispatch(waves) = plan(&mut policy, &ids, Instant::now()) else {
+                panic!("straggle={straggle}: every expected lane is in: the frame seals at once\n{}", policy.debug_summary());
+            };
+            let mut sent: Vec<u64> = waves.iter().flatten().copied().collect();
+            sent.sort_unstable();
+            queued.sort_unstable();
+            assert_eq!(sent, queued, "straggle={straggle}: all 24 lanes' fires in the one seal");
+        }
+    }
+
+    /// od-1 with the expected lanes two frames deep (qf=2, k=2): with every
+    /// expected lane in, the front frame seals at once with the parked
+    /// owners' complete frames riding it, and the next frame seals in the
+    /// same pass of plans, before anything lands (two frames in flight per
+    /// lane): no candidate with nothing missing is left for a later wake.
+    #[test]
+    fn od_1_census_seals_front_and_next_frames_with_every_expected_lane_in() {
+        let mut policy =
+            FramePolicy::new(2, 64, 4096, None).with_submit_deadline(Duration::from_secs(86_400));
+        let lanes: Vec<ProcessId> = (0..44).map(|_| pid()).collect();
+        let mut next = 1u64;
+        let mut submit = |policy: &mut FramePolicy, lane: ProcessId, seq: u64| -> Vec<u64> {
+            let ids = vec![next, next + 1];
+            for (slot, &id) in ids.iter().enumerate() {
+                policy.on_fire_enqueued(stamp(lane, seq, slot as u32, 2), Some(lane), id, 1, 1);
+            }
+            next += 2;
+            ids
+        };
+        let mut queued: Vec<u64> = Vec::new();
+        for &lane in &lanes {
+            queued.extend(submit(&mut policy, lane, 0));
+        }
+        let ids: QueuedFireIds = queued.iter().copied().collect();
+        assert_eq!(fires(&plan(&mut policy, &ids, Instant::now())).len(), 88);
+        policy.on_frame_posted(lanes.clone(), Instant::now());
+        policy.on_frame_retired(lanes.clone());
+        let mut queued: Vec<u64> = Vec::new();
+        let (expected, rest) = lanes.split_at(10);
+        let (blocked_full, rest) = rest.split_at(13);
+        let (blocked_empty, rest) = rest.split_at(10);
+        let (both_empty, suspended_full) = rest.split_at(10);
+        for &lane in expected {
+            queued.extend(submit(&mut policy, lane, 1));
+            queued.extend(submit(&mut policy, lane, 2));
+        }
+        for &lane in blocked_full {
+            queued.extend(submit(&mut policy, lane, 1));
+            policy.on_owner_waits(lane);
+        }
+        for &lane in blocked_empty {
+            policy.on_owner_waits(lane);
+        }
+        for &lane in both_empty {
+            policy.on_process_suspend(lane);
+            policy.on_owner_waits(lane);
+        }
+        for &lane in suspended_full {
+            queued.extend(submit(&mut policy, lane, 1));
+            policy.on_process_suspend(lane);
+        }
+        // Plan as the scheduler does: each dispatch posted, nothing landing.
+        let mut frames = Vec::new();
+        for _ in 0..4 {
+            let ids: QueuedFireIds = queued.iter().copied().collect();
+            match plan(&mut policy, &ids, Instant::now()) {
+                FramePlan::Dispatch(waves) => {
+                    let sent: Vec<u64> = waves.iter().flatten().copied().collect();
+                    queued.retain(|id| !sent.contains(id));
+                    let members: Vec<ProcessId> =
+                        lanes.iter().copied().filter(|_| true).collect();
+                    policy.on_frame_posted(members, Instant::now());
+                    frames.push(sent.len());
+                }
+                _ => break,
+            }
+        }
+        assert_eq!(frames, vec![48, 20], "front frame of 24 lanes, then the next of 10, at once\n{}", policy.debug_summary());
+        assert!(queued.is_empty());
+    }
+
     /// Frames under pressure: 32 lanes, one frame each a round (one fire
     /// at k=1, two slots at k=2), a quarter of the owners blocking on the
     /// planner each round and coming back the next. A blocked owner is never
@@ -1772,6 +1963,9 @@ mod tests {
             let mut rng = Rng(seed);
             // One frame or two in flight per lane (the dumps' k=2).
             let k = 1 + rng.below(2) as usize;
+            // At k=2, frames of one slot or two (a blocked owner's complete
+            // next frame two fires, as od-1's were).
+            let slots = 1 + rng.below(k as u64) as u32;
             let mut policy = FramePolicy::new(k, 64, 4096, None)
                 .with_submit_deadline(Duration::from_secs(86_400));
             let lanes: Vec<ProcessId> = (0..2 + rng.below(4)).map(|_| pid()).collect();
@@ -1783,18 +1977,20 @@ mod tests {
             let mut state = vec![0u8; lanes.len()];
             let mut parked_fires: Vec<u64> = Vec::new();
             let mut landing_late: Vec<ProcessId> = Vec::new();
-            let mut schedule = vec![format!("k={k} lanes={}", lanes.len())];
+            let mut schedule = vec![format!("k={k} slots={slots} lanes={}", lanes.len())];
             let mut failed = None;
             for round in 0..10 {
                 for (at, &lane) in lanes.iter().enumerate() {
                     // A parked owner's straggler: a fire that raced its
                     // park rides the next seal, its lane not expected.
                     if state[at] == 2 && rng.below(4) == 0 {
-                        policy.on_fire_enqueued(stamp(lane, seq[at], 0, 1), Some(lane), next_id, 1, 1);
-                        queued.push(next_id);
-                        parked_fires.push(next_id);
-                        last[at] = next_id;
-                        next_id += 1;
+                        for slot in 0..slots {
+                            policy.on_fire_enqueued(stamp(lane, seq[at], slot, slots), Some(lane), next_id, 1, 1);
+                            queued.push(next_id);
+                            parked_fires.push(next_id);
+                            last[at] = next_id;
+                            next_id += 1;
+                        }
                         seq[at] += 1;
                         schedule.push(format!("r{round}: parked lane {at} submits"));
                         continue;
@@ -1802,10 +1998,12 @@ mod tests {
                     if state[at] != 0 {
                         continue;
                     }
-                    policy.on_fire_enqueued(stamp(lane, seq[at], 0, 1), Some(lane), next_id, 1, 1);
-                    queued.push(next_id);
-                    last[at] = next_id;
-                    next_id += 1;
+                    for slot in 0..slots {
+                        policy.on_fire_enqueued(stamp(lane, seq[at], slot, slots), Some(lane), next_id, 1, 1);
+                        queued.push(next_id);
+                        last[at] = next_id;
+                        next_id += 1;
+                    }
                     seq[at] += 1;
                 }
                 // A brief wait parked nowhere (a lock, a turn) ends: its
