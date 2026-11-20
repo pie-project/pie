@@ -126,7 +126,7 @@ impl ResidencyPlanner {
     /// program's fire term): a keyed demand, served in the requester's key
     /// order like any, its grant given back at once for the rise to take.
     /// The requester's own pages in the span are moved by the rise, never
-    /// freed, so they weigh in no hog or overcommit check, and a pool
+    /// freed, so they weigh in no hog check, and a pool
     /// whose rise cannot seat what one process holds was refused at load
     /// (its largest rung beside one sequence at the context).
     pub async fn acquire_rise(
@@ -162,6 +162,20 @@ impl ResidencyPlanner {
             }
             return Err(PlannerError::Impossible {
                 need: demand.kv_pages,
+                total: kv_total,
+            });
+        }
+        // On a shared pool the ask's state takes chunks its kv would: kv and
+        // state together past the pool never fit, whatever the process holds
+        // (an empty-handed ask is caught here, not by a wedge's verdict).
+        let state_pages = self.port.rs_as_pages(demand.rs);
+        if !rise && state_pages > 0 && demand.kv_pages.saturating_add(state_pages) > kv_total {
+            let need = demand.kv_pages.saturating_add(state_pages);
+            if let Some(room) = self.port.room() {
+                return Err(PlannerError::PastPool { need, room });
+            }
+            return Err(PlannerError::Impossible {
+                need,
                 total: kv_total,
             });
         }
@@ -239,38 +253,29 @@ impl ResidencyPlanner {
                     tokio::pin!(notified);
                     notified.as_mut().enable();
                     let acquired = match self.collect_outcome(key) {
-                        // Short of room only the policy can make, it says so
-                        // again while it waits (the gauge keeps a band only
-                        // while it is told), up to the seat deadline.
+                        // Short, it waits however long: its own notify
+                        // (served, room given back, an eviction landed, a
+                        // completion) ends the wait. While it stands short
+                        // of room only the policy can make it says so again
+                        // (the gauge keeps a band only while it is told);
+                        // only a need past the whole device pool, which the
+                        // pool shrinking under it can make, is refused.
                         Collect::Wait => {
-                            // Woken by its own notify, by the policy
-                            // answering pressure with nothing freed (what it
-                            // fails on), or by the re-report's interval.
                             let again = crate::policy::pressure::AGAIN;
-                            let answered = crate::policy::pressure::answered();
-                            tokio::pin!(answered);
-                            answered.as_mut().enable();
-                            if self.short.lock().answered_nothing(key.1) {
-                                // Answered between the report and here.
-                            } else {
-                                let woke = tokio::select! {
-                                    () = &mut notified => true,
-                                    () = &mut answered => false,
-                                    _ = crate::rt::time::timeout(again, std::future::pending::<()>()) => false,
-                                };
-                                if woke {
-                                    continue;
-                                }
+                            let woke = tokio::select! {
+                                () = &mut notified => true,
+                                _ = crate::rt::time::timeout(again, std::future::pending::<()>()) => false,
+                            };
+                            if !woke {
+                                self.report_short();
+                                self.note_lapsed_fires();
                             }
-                            self.report_short();
-                            self.note_lapsed_fires();
-                            let Some(error) = self.short_expired(key) else {
+                            let Some(error) = self.never_fits(key) else {
                                 continue;
                             };
                             match self.collect_outcome(key) {
                                 Collect::Wait => {
-                                    tracing::warn!(%pid, %error, "planner: a short waiter gives up");
-                                    // The registration's drop takes it off the queue.
+                                    tracing::warn!(%pid, %error, "planner: an allocation past the device pool is refused");
                                     Err(error)
                                 }
                                 Collect::Ready(outcome) => outcome.map(Acquired::Granted),
@@ -285,7 +290,7 @@ impl ResidencyPlanner {
                         Collect::Yield => Ok(Acquired::Yield),
                         Collect::Requote => Ok(Acquired::Requote),
                     };
-                    if !matches!(acquired, Err(PlannerError::Short { .. })) {
+                    if !matches!(acquired, Err(PlannerError::PastDevice { .. })) {
                         registration.disarm();
                     }
                     self.poke();
@@ -303,55 +308,19 @@ impl ResidencyPlanner {
 
     /// Sleeps until what a non-resident process waits on changes: its own
     /// residency (`signal`, told as it is evicted, restored, rolled back or
-    /// gone), or the policy answering pressure with nothing freed where
-    /// that answer is the event its own short restore gives up on
-    /// (`answered_mine`, [`Self::restore_expired`]). No clock: a planner
-    /// poke for another process, the shortfall standing, or the policy
-    /// answering a shortfall that is not its restore's (any planner's,
-    /// any tier's: the answer is process-wide) does not wake it. (On a
-    /// 100 ms re-report it woke each waiter ten times a second while it
-    /// stayed evicted; on every answer of nothing it woke every evicted
-    /// gate, a restore queued or not.)
-    async fn await_residency_change(
-        signal: &Notify,
-        settled: impl Fn() -> bool,
-        answered_mine: impl Fn() -> bool,
-    ) {
+    /// gone, or as its queued restore is found past the device pool). No
+    /// clock: a planner poke for another process, the shortfall standing, or
+    /// the policy answering a shortfall does not wake it. (On a 100 ms
+    /// re-report it woke each waiter ten times a second while it stayed
+    /// evicted.)
+    async fn await_residency_change(signal: &Notify, settled: impl Fn() -> bool) {
         let notified = signal.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        loop {
-            let answered = crate::policy::pressure::answered();
-            tokio::pin!(answered);
-            answered.as_mut().enable();
-            if settled() || answered_mine() {
-                return;
-            }
-            tokio::select! {
-                () = &mut notified => return,
-                () = &mut answered => {}
-            }
+        if settled() {
+            return;
         }
-    }
-
-    /// Whether `pid`'s queued restore is short and the policy has since
-    /// answered a tier it is short on with nothing freed: the answer
-    /// [`Self::restore_expired`] acts on. An answer counted before the
-    /// restore became short is not its (the shortfall reads the count as
-    /// it is noted), so no answer is missed for a restore queued later.
-    fn restore_answered(&self, pid: ProcessId) -> bool {
-        let Some(key) = self.with_inner(|inner| {
-            inner
-                .queue
-                .iter()
-                .find(|(_, waiter)| {
-                    waiter.pid == pid && matches!(waiter.kind, WaitKind::Restore { .. })
-                })
-                .map(|(key, _)| *key)
-        }) else {
-            return false;
-        };
-        self.short.lock().answered_nothing(key.1)
+        notified.await;
     }
 
     fn collect_outcome(&self, key: EntryKey) -> Collect {
@@ -463,8 +432,8 @@ impl ResidencyPlanner {
                 if proc.state == Residency::Resident {
                     return Ok(());
                 }
-                // Parked owing its restore (a short one gave up, or it went
-                // idle): a process waiting to be resident asks for it again.
+                // Parked owing its restore (it went idle): a process waiting
+                // to be resident asks for it again.
                 // Left parked, nothing queues it, and the wait never ends
                 // (the M1 / M5 stress: the earliest admitted sat evicted
                 // with no restore queued once the rest drained).
@@ -484,26 +453,23 @@ impl ResidencyPlanner {
                 left_pipeline = true;
                 crate::scheduler::worker::notify_process_suspend(pid);
             }
-            self.stats.gate_parks.fetch_add(1, Ordering::Relaxed);
-            Self::await_residency_change(
-                &signal,
-                || self.is_resident(pid),
-                || self.restore_answered(pid),
-            )
-            .await;
-            if let Some(error) = self.restore_expired(pid) {
-                tracing::warn!(%pid, %error, "planner: a short restore gives up");
+            // A restore past the whole device pool is refused by name, at
+            // once; any other waits for room, however long.
+            if let Some(error) = self.restore_never_fits(pid) {
+                tracing::warn!(%pid, %error, "planner: a restore past the device pool is refused");
                 return Err(error);
             }
+            self.stats.gate_parks.fetch_add(1, Ordering::Relaxed);
+            Self::await_residency_change(&signal, || {
+                self.is_resident(pid) || self.restore_never_fits_now(pid)
+            })
+            .await;
         }
     }
 
-    /// A restore of `pid` short of room only the policy can make past the
-    /// seat deadline, as a parked allocation is: it leaves the queue owing
-    /// what it did (parked, as a holder's set is), and its error says what
-    /// was short. `None` while it may still wait.
-    pub(super) fn restore_expired(self: &Arc<Self>, pid: ProcessId) -> Option<PlannerError> {
-        let key = self.with_inner(|inner| {
+    /// `pid`'s queued restore, if one is queued.
+    fn queued_restore(&self, pid: ProcessId) -> Option<EntryKey> {
+        self.with_inner(|inner| {
             inner
                 .queue
                 .iter()
@@ -511,8 +477,23 @@ impl ResidencyPlanner {
                     waiter.pid == pid && matches!(waiter.kind, WaitKind::Restore { .. })
                 })
                 .map(|(key, _)| *key)
-        })?;
-        let error = self.short_expired(key)?;
+        })
+    }
+
+    /// Whether `pid`'s queued restore could never fit the device pool
+    /// ([`Self::never_fits`]), read without acting on it.
+    pub(super) fn restore_never_fits_now(&self, pid: ProcessId) -> bool {
+        self.queued_restore(pid)
+            .is_some_and(|key| self.never_fits(key).is_some())
+    }
+
+    /// A queued restore of `pid` whose need could never fit the device pool
+    /// ([`Self::never_fits`]): it leaves the queue owing what it did
+    /// (parked, as a holder's set is), and its error says what is past the
+    /// pool. `None` for every need that fits: it waits.
+    pub(super) fn restore_never_fits(self: &Arc<Self>, pid: ProcessId) -> Option<PlannerError> {
+        let key = self.queued_restore(pid)?;
+        let error = self.never_fits(key)?;
         let settled = self.with_inner(|inner| {
             if let Some(super::wait::Waiter {
                 pid,
@@ -524,11 +505,7 @@ impl ResidencyPlanner {
                 proc.parked = Some(demand);
                 // What its restore learned of the room is the room's then:
                 // queued again ([`Self::wait_resident`]) it starts from
-                // the room as it stands. Kept, a need marked understated
-                // skipped the free runs that stood once every resident had
-                // gone, and the restore waited on evictions that could not
-                // come (Mac Pro's M5 shape C: 1861 chunks free, nothing
-                // resident, the head never tried again).
+                // the room as it stands.
                 proc.roles_short = None;
                 proc.roles_free_retry = None;
                 proc.roles_free_short = None;
@@ -562,6 +539,16 @@ impl ResidencyPlanner {
         pieces: u32,
     ) -> Result<(), PlannerError> {
         let pages = self.port.chunks_as_pages(run.max(1).saturating_mul(pieces));
+        // Runs past the whole device pool never stand: refused by name, at
+        // once. Any other bind waits for its runs, however long.
+        let (_, total) = self.port.device_stats();
+        if pages > total {
+            return Err(PlannerError::PastDevice {
+                need: pages,
+                total,
+                runs: Some((run.max(1), pieces)),
+            });
+        }
         let notify = Arc::new(Notify::new());
         let key = self
             .with_inner(|inner| {

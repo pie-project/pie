@@ -240,6 +240,13 @@ impl ResidencyPlanner {
             }
         });
         self.requeue_restore(pid);
+        // A need past the whole device pool: its gate is told, to refuse it
+        // by name ([`Self::restore_never_fits`]) rather than wait.
+        if self.restore_never_fits_now(pid)
+            && let Some(signal) = self.with_inner(|inner| inner.procs.get(&pid).map(|proc| proc.signal.clone()))
+        {
+            signal.notify_waiters();
+        }
     }
 
     /// More of `pid`'s pages were swapped out since its restore was quoted:

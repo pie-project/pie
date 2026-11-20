@@ -167,7 +167,7 @@ impl ResidencyPlanner {
     /// The head is short of room only the policy can make, and there is
     /// something the policy could let go: idle cache, a checkpoint, or a
     /// handle at rest on the device. A starved fleet then waits on the
-    /// policy, up to the head's deadline, instead of restarting anyone.
+    /// policy instead of restarting anyone.
     pub(super) fn waits_on_policy(&self) -> bool {
         let Some((head, resting)) = self.with_inner(|inner| {
             let (head, _) = inner.unmet_head()?;
@@ -179,11 +179,11 @@ impl ResidencyPlanner {
         }) else {
             return false;
         };
-        if self.short.lock().since(head.1).is_none() {
+        if !self.short.lock().is_short(head.1) {
             return false;
         }
         // The host is what is short: the policy frees it by letting a set at
-        // rest go, and the head fails at its deadline if none does.
+        // rest go, and the head waits until one does.
         if self.short.lock().host_short(head.1) {
             return true;
         }
@@ -242,39 +242,37 @@ impl ResidencyPlanner {
         }
     }
 
-    /// The error waiter `key` fails with when it has stood short of what
-    /// only the policy can free past the seat deadline, rather than wait on.
-    pub(super) fn short_expired(&self, key: EntryKey) -> Option<super::PlannerError> {
-        let (waited, host, answered) = {
-            let short = self.short.lock();
-            (
-                short.since(key.1)?.elapsed(),
-                short.host_short(key.1),
-                short.answered_nothing(key.1),
-            )
-        };
-        // The event, not a clock: the policy answered its pressure and
-        // freed nothing.
-        if !answered {
-            return None;
-        }
-        // Short of device room while processes still run, it is behind
-        // them, not starved: their completions give the room back, so its
-        // deadline runs again from now, and only a fleet standing still (or
-        // a host short of room) fails it. Failed so, a gpt-oss prompt behind
-        // 24 running 31k-token passes was refused room their completions
-        // would have given it.
-        if !host && !self.is_wedged() {
-            self.short.lock().restart(key.1);
-            return None;
-        }
-        let short = self.short.lock();
-        let (tier, bytes) = short.worst(key.1)?;
-        Some(super::PlannerError::Short {
-            tier,
-            bytes,
-            waited,
-        })
+    /// The error waiter `key` is refused with where its need could never
+    /// fit the device pool, even with nothing else resident: its kv pages
+    /// and the pages that free the runs of whole chunks it asks (a bind's,
+    /// or a restore's for its roles or the bind that suspended it), together
+    /// past the pool's total ([`super::PlannerError::PastDevice`]). `None`
+    /// for every other need, however short and for however long: it waits
+    /// (its owner parked) while the planner suspends and evicts by its
+    /// victim choice and the chunk map, and room given back, an eviction
+    /// landed or a completion wakes it. Over-demand is served slower, never
+    /// failed; no clock and no answer of the policy refuses a need that fits.
+    pub(super) fn never_fits(&self, key: EntryKey) -> Option<super::PlannerError> {
+        let (_, total) = self.port.device_stats();
+        let (need, runs) = self.with_inner(|inner| {
+            let waiter = inner.queue.get(&key)?;
+            let runs = match waiter.kind {
+                WaitKind::BindRoom { run, pieces, .. } => Some((run, pieces)),
+                WaitKind::Restore { .. } => inner.procs.get(&waiter.pid).and_then(|proc| {
+                    proc.roles_short
+                        .into_iter()
+                        .chain(proc.bind_room)
+                        .max_by_key(|need| need.pages)
+                        .map(|need| (need.run, need.pieces))
+                }),
+                WaitKind::Allocation { .. } => None,
+            };
+            Some((
+                waiter.kv_need().saturating_add(inner.room_pages(waiter)),
+                runs,
+            ))
+        })?;
+        (need > total).then_some(super::PlannerError::PastDevice { need, total, runs })
     }
 
     /// With `PoolFacts::seat_to_end`, a process starts only while the pools
