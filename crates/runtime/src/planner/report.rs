@@ -226,46 +226,69 @@ impl ResidencyPlanner {
 
     /// `refused_free_runs`: the free runs of the need's length the refusal
     /// itself saw, where it says ([`crate::store::roles::RolesError::unpark_free_runs`]).
-    /// A refusal that saw runs of its need standing and was short all the
-    /// same understates what the unpark takes; one that saw too few is a
-    /// plain short head, sent again as soon as the runs stand.
+    ///
+    /// The head's need becomes the refusal's own, never less than what was
+    /// recorded for it: the longest run and the most pieces of the refused
+    /// need, the bind that suspended it and its last refusal, kept as both
+    /// (mx-7: recorded (3,1) beside a refused (4,1), the plan funding the
+    /// smaller while the restore waited on the larger, nothing moved). A
+    /// refusal that came while runs of that need stood (in its own view or
+    /// the map's) understates what the unpark takes: its need becomes one
+    /// run more than stood, which the planner funds by moving the occupants
+    /// of the cheapest such runs, rather than wait for the map to change on
+    /// its own. Each such refusal asks one run more, so it ends: served, or
+    /// past the whole pool and refused by name.
     pub(super) fn requeue_restore_roles(
         self: &Arc<Self>,
         pid: ProcessId,
         need: (u32, u32),
         refused_free_runs: Option<u32>,
     ) {
-        let pages = self.port.chunks_as_pages(need.0.saturating_mul(need.1));
+        let recorded = self.with_inner(|inner| {
+            inner
+                .procs
+                .get(&pid)
+                .map(|proc| proc.bind_room.into_iter().chain(proc.roles_short).collect::<Vec<_>>())
+                .unwrap_or_default()
+        });
+        let (run, pieces) = recorded
+            .iter()
+            .fold(need, |(run, pieces), had| (run.max(had.run), pieces.max(had.pieces)));
         // The map as the refusal leaves it: its epoch and its runs of the
         // need's length.
         let gives = self.port.room_gives();
-        let map_runs = self.port.guest_free_runs(need.0);
+        let map_runs = self.port.guest_free_runs(run);
+        // The refusal's own count is of runs of its own length.
+        let refused_runs = refused_free_runs.filter(|_| run == need.0);
+        let refused_saw = refused_runs.is_some_and(|free| free >= pieces);
+        let map_shows = map_runs >= pieces;
+        let understated = refused_saw || map_shows;
+        let stood = map_runs.max(refused_runs.unwrap_or(0));
+        let pieces = if understated { pieces.max(stood.saturating_add(1)) } else { pieces };
+        let updated = super::proc::PendingBind {
+            run,
+            pieces,
+            pages: self.port.chunks_as_pages(run.saturating_mul(pieces)),
+        };
         self.stats
             .restore_roles_short
             .fetch_add(1, Ordering::Relaxed);
         self.with_inner(|inner| {
             if let Some(proc) = inner.procs.get_mut(&pid) {
-                proc.roles_short = Some(super::proc::PendingBind {
-                    run: need.0,
-                    pieces: need.1,
-                    pages,
-                });
-                // Refused while runs of this need stood (its refusal's own
-                // view): the need understates its unpark. Refused with too
-                // few standing, it is a plain short head, whatever it was
-                // sent on.
+                proc.roles_short = Some(updated);
+                if proc.bind_room.is_some() {
+                    proc.bind_room = Some(updated);
+                }
                 proc.roles_free_retry = None;
                 proc.roles_short_gives = Some(gives);
                 proc.roles_short_mismatch = None;
-                let refused_saw = refused_free_runs.is_some_and(|free| free >= need.1);
-                let map_shows = map_runs >= need.1;
-                if refused_saw || map_shows {
-                    // Short while runs of its need stood, in its own view or
-                    // the map's: the need understates its unpark.
-                    proc.roles_free_short = Some(need);
-                    proc.roles_free_short_at = map_runs.max(refused_free_runs.unwrap_or(0));
+                if understated {
+                    // Goes again only once more runs of the updated need
+                    // stand than its refusal saw.
+                    proc.roles_free_short = Some((run, pieces));
+                    proc.roles_free_short_at = stood;
                     if map_shows && !refused_saw {
-                        proc.roles_short_mismatch = Some((map_runs, refused_free_runs));
+                        proc.roles_short_mismatch = Some((map_runs, refused_runs));
                     }
                 } else {
                     proc.roles_free_short = None;

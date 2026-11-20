@@ -3428,13 +3428,18 @@ fn a_restore_short_again_on_free_runs_of_its_need_marks_the_need_understated() {
         None,
         "refused short of runs: not understated"
     );
-    // Refused while runs of its need stood: understated, at what it saw.
+    // Refused while runs of its need stood: understated, at what it saw,
+    // its need one run more than stood.
     restoring(&planner, Some((1, 1)));
     planner.requeue_restore_roles(pid, (1, 1), Some(2));
     assert_eq!(
         planner.with_inner(|inner| inner.procs[&pid].roles_free_short),
-        Some((1, 1)),
-        "refused with runs of its need standing: understated"
+        Some((1, 3)),
+        "refused with runs of its need standing: understated, the need updated"
+    );
+    assert_eq!(
+        planner.with_inner(|inner| inner.procs[&pid].roles_short.map(|need| (need.run, need.pieces))),
+        Some((1, 3))
     );
     assert_eq!(planner.with_inner(|inner| inner.procs[&pid].roles_free_short_at), 2);
     assert_eq!(planner.with_inner(|inner| inner.procs[&pid].roles_free_retry), None);
@@ -4751,9 +4756,11 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
                 })
             })
         };
+        // Progress is the head served (its restore sent, sent again, or its
+        // bind's runs given), never a move alone: an eviction and restore
+        // cycle with no serve is no progress.
         let progress = |planner: &Arc<ResidencyPlanner>, pool: &BindRoomPool| {
             planner.stats.restores.load(Ordering::Relaxed)
-                + planner.stats.evictions_started.load(Ordering::Relaxed)
                 + u64::from(pool.compactions.load(Ordering::Relaxed))
                 + u64::from(
                     planner.with_inner(|inner| inner.procs[&head].roles_free_retry.is_some()),
@@ -4920,6 +4927,16 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
                 break;
             }
         }
+        // No ping-pong: each process is moved at most once for the head
+        // (none here comes back to be moved again).
+        let processes = residents.len() as u64 + alive.len() as u64 + 1;
+        let moves = planner.stats.evictions_started.load(Ordering::Relaxed);
+        if moves > processes + schedule.iter().filter(|e| e.as_str() == "an arrival").count() as u64 {
+            failures.push(format!(
+                "seed {seed}: {moves} moves for {processes} processes: a move cycle\n  schedule: {}",
+                schedule.join(" -> ")
+            ));
+        }
         // A bind or gate that ended did so served, never refused.
         if let Some(bind) = bind {
             if bind.is_finished() {
@@ -5015,7 +5032,7 @@ async fn a_restore_refused_against_the_map_goes_again_at_most_once_per_map_chang
         let proc = &inner.procs[&head];
         (proc.roles_free_short, proc.roles_free_short_at, proc.roles_short_mismatch)
     });
-    assert_eq!(understated, Some((3, 1)), "refused against runs the map shows: understated");
+    assert_eq!(understated, Some((3, 3)), "refused against runs the map shows: understated, one run more");
     assert_eq!(at, 2);
     assert_eq!(mismatch, Some((2, Some(0))), "the census names the mismatch");
     let retried = |planner: &Arc<ResidencyPlanner>| {
@@ -5070,4 +5087,113 @@ async fn a_restore_refused_against_the_map_goes_again_at_most_once_per_map_chang
         }
     }
     assert!(retried(&planner), "the map moved past its refusal: sent");
+}
+
+/// mx-2's cycle at the planner: a process suspended for its bind's room is
+/// restored only once that room stands (the map shows its run beside its
+/// own), not on room for its kv alone; while no run of its need stands it
+/// stays parked, no one moved and no restore sent, however often the plan
+/// runs; the run appears and it is restored, once.
+#[tokio::test(flavor = "current_thread")]
+async fn a_process_suspended_for_its_bind_s_room_is_restored_only_once_the_room_stands() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    // Four chunks free, no three adjacent.
+    pool.free.lock().extend([0, 2, 4, 6]);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let pid = ProcessId::new_v4();
+    planner.register(pid);
+    planner.note_admitted(pid);
+    planner.with_inner(|inner| {
+        let proc = inner.procs.get_mut(&pid).unwrap();
+        proc.state = Residency::Evicted;
+        proc.bind_room = Some(super::proc::PendingBind {
+            run: 3,
+            pieces: 1,
+            pages: 3,
+        });
+        inner.enqueue(
+            pid,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        );
+    });
+    for _ in 0..50 {
+        planner.pages_freed();
+        planner.poke();
+        for _ in 0..10 {
+            crate::rt::yield_now().await;
+        }
+    }
+    assert_eq!(planner.stats.restores.load(Ordering::Relaxed), 0, "no run of its need: not restored");
+    assert_eq!(planner.stats.evictions_started.load(Ordering::Relaxed), 0, "no one moved, no cycle");
+    // The run appears.
+    pool.free.lock().push(1);
+    pool.gives.fetch_add(1, Ordering::Relaxed);
+    planner.pages_freed();
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.stats.restores.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+    }
+    assert_eq!(planner.stats.restores.load(Ordering::Relaxed), 1, "its room stands: restored once");
+}
+
+/// mx-7's state (a restore waiting for room for its roles, recorded
+/// bind_room (3,1) beside a refused roles_short (4,1), free 4-runs standing
+/// in the map, every other chunk emptiable by residents, and nothing ever
+/// moved, evictions frozen): the refusal's need becomes the head's need, the
+/// larger of the two, and, refused while runs of it stood, one run more than
+/// stood; the planner plans against that and moves the occupants of the
+/// cheapest such runs. No wait for a map change that never comes.
+#[tokio::test(flavor = "current_thread")]
+async fn a_refused_restore_s_need_is_its_refusal_s_and_the_planner_moves_for_it() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let model = crate::store::registry::register_model(16, &[8], &[4]);
+    let pool = Arc::new(BindRoomPool {
+        model,
+        ..BindRoomPool::new(16, 0..0, 64)
+    });
+    // Two free runs of 4 (0..4 and 8..12): the map shows them.
+    pool.free.lock().extend([0, 1, 2, 3, 8, 9, 10, 11]);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (head, resident) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [head, resident] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    *pool.occupant.lock() = Some(resident);
+    planner.with_inner(|inner| {
+        inner.procs.get_mut(&resident).unwrap().idle = true;
+        let proc = inner.procs.get_mut(&head).unwrap();
+        proc.state = Residency::Restoring;
+        proc.bind_room = Some(super::proc::PendingBind {
+            run: 3,
+            pieces: 1,
+            pages: 3,
+        });
+    });
+    // Its unpark is refused short of (4,1), having seen two runs of 4.
+    planner.requeue_restore_roles(head, (4, 1), Some(2));
+    let (roles_short, bind_room) = planner.with_inner(|inner| {
+        let proc = &inner.procs[&head];
+        (
+            proc.roles_short.map(|need| (need.run, need.pieces)),
+            proc.bind_room.map(|need| (need.run, need.pieces)),
+        )
+    });
+    assert_eq!(roles_short, Some((4, 3)), "its refusal's run, one more piece than stood");
+    assert_eq!(bind_room, Some((4, 3)), "the recorded need follows: never less than refused");
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.stats.evictions_started.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+    }
+    assert!(
+        planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
+        "the occupants of the cheapest runs of the updated need are moved"
+    );
 }

@@ -2457,3 +2457,59 @@ fn rebinds_never_name_an_emptied_guest_part_over_random_park_and_restore_schedul
     }
     assert!(failures.is_empty(), "{} failing seeds:\n{}", failures.len(), failures.join("\n"));
 }
+
+/// mx-2's cycle: a bind short of room suspended its process, the process
+/// was restored, the bind was short again and suspended it again, every
+/// ~25 ms. Suspended once for its bind's room and restored, a bind short
+/// again waits parked in the planner for the room, and binds once served;
+/// its process is suspended once only.
+#[tokio::test(flavor = "current_thread")]
+async fn a_bind_suspended_once_for_room_waits_parked_when_short_again() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let short = || {
+        anyhow::Error::new(RolesError::BindShort(Box::new(RolesError::Short {
+            role: SlotRole::Instance,
+            slots: 3,
+        })))
+    };
+    let (binds, suspends, waits) = (Rc::new(Cell::new(0u32)), Rc::new(Cell::new(0u32)), Rc::new(Cell::new(0u32)));
+    let bound = super::bind_when_resident(
+        holder(7),
+        {
+            let binds = binds.clone();
+            move || {
+                binds.set(binds.get() + 1);
+                // Short three times (before the suspend, after the restore,
+                // and once more while it waits), then bound.
+                std::future::ready(if binds.get() <= 3 { Err(short()) } else { Ok(()) })
+            }
+        },
+        || std::future::ready(Ok::<(), String>(())),
+        |_, _| std::future::ready(Ok::<(), String>(())),
+        || None,
+        |_, _| false,
+        {
+            let suspends = suspends.clone();
+            move |_, _| {
+                suspends.set(suspends.get() + 1);
+                true
+            }
+        },
+        {
+            let waits = waits.clone();
+            move |_, _| {
+                waits.set(waits.get() + 1);
+                std::future::ready(Ok::<_, String>(crate::planner::BindRoomWait::Served))
+            }
+        },
+        || {},
+        |_| {},
+        || std::future::ready(()),
+    )
+    .await;
+    assert!(bound.is_ok(), "{bound:?}");
+    assert_eq!(suspends.get(), 1, "suspended once for its room, never again");
+    assert_eq!(waits.get(), 2, "short again after its restore, it waits parked for room");
+    assert_eq!(binds.get(), 4);
+}
