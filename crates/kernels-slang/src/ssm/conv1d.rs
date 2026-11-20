@@ -1,12 +1,13 @@
 //! The causal depthwise conv with its rolling history (`ssm.causal_conv1d`,
 //! its chunked and committed forms), from `kernels/ssm/conv1d.slang`.
 
-use super::{Committed, Csr, RowSpan, StatePool, rows};
+use super::{Carry, CarryPlane, Committed, Csr, RowSpan, StatePool, rows};
 use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, nonzero, refuse, stated};
 use crate::error::Error;
 use crate::tensor::Tensor;
 
 const CONV1D: &str = "ssm/conv1d.slang";
+const CONV1D_CARRIED: &str = "ssm/conv1d_carried.slang";
 
 const GROUP: u32 = 128;
 
@@ -207,6 +208,53 @@ pub fn conv1d_committed(
             ],
             &[csr.at.arg()],
             &state.snap_lane0(OP)?,
+        ]
+        .concat(),
+    )
+}
+
+/// One decode step a lane over its buffered rows then its own
+/// (`kernels/ssm/conv1d_carried.slang`): the own row's window from the
+/// committed history and the lane's last buffered rows' inputs, read where
+/// they lie in its rs buffer pages (plane `x_plane`); the history kept as
+/// of the lane's commit; the own row's input landed in its buffer.
+#[allow(clippy::too_many_arguments)]
+pub fn conv1d_carried(
+    ctx: &Ctx<'_>,
+    x: Tensor,
+    weight: Tensor,
+    state: &StatePool,
+    carry: &Carry,
+    x_plane: CarryPlane,
+    conv_width: u32,
+    dilation: u32,
+    y: Tensor,
+    span: RowSpan,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.causal_conv1d_carried";
+    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "ssm_conv1d_carried_bf16" });
+    let shape = Shape::of(OP, x, weight, state, conv_width, dilation, y)?;
+    let launched = span.rows(OP, &[x, y])?;
+    ctx.fire(
+        Fire::at(CONV1D_CARRIED, entry).apply(shape.grid(launched)),
+        &[
+            &[
+                x.arg(),
+                weight.arg(),
+                carry.slots.arg(),
+                carry.table.arg(),
+                y.arg_mut(),
+            ][..],
+            &state.piece_args(true),
+            &[
+                stated(OP, carry.lane0)?.arg(),
+                shape.channels.arg(),
+                shape.taps.arg(),
+                shape.dilation.arg(),
+                span.row0.arg(),
+            ],
+            &carry.page_args(OP)?,
+            &x_plane.args(),
         ]
         .concat(),
     )
