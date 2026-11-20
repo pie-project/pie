@@ -72,10 +72,15 @@ pub enum Tally {
     /// views made for a fire the load's bind walk did not reach. The rule
     /// is that the load builds every one a fire can bind, so this reads 0.
     BoundInFire,
+    /// A call that waited for every frame in flight to land before the host
+    /// touched device memory (a tier move through the host): dispatch fell
+    /// to depth one for it. Counted while such a move is not yet on the
+    /// queue, so a backend's remaining drains are seen.
+    Drained,
 }
 
 impl Tally {
-    pub const ALL: [Tally; 8] = [
+    pub const ALL: [Tally; 9] = [
         Tally::Compiled,
         Tally::Fallback,
         Tally::Unrecorded,
@@ -84,6 +89,7 @@ impl Tally {
         Tally::BuiltAtRegister,
         Tally::BuiltInFire,
         Tally::BoundInFire,
+        Tally::Drained,
     ];
 
     /// Its name in the model status.
@@ -98,6 +104,7 @@ impl Tally {
             Tally::BuiltAtRegister => "built_at_register",
             Tally::BuiltInFire => "built_in_fire",
             Tally::BoundInFire => "bound_in_fire",
+            Tally::Drained => "drained",
         }
     }
 }

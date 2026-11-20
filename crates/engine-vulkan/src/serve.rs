@@ -275,15 +275,11 @@ impl Serve for Api {
         }
 
         // A split step is not recorded: a recording replays as one submit.
-        let split_rows = shell
-            .tuning
-            .profile()
-            .get::<crate::chip::SubmitSplitRows>()
-            .0;
-        // Whole, a 512x512 VAE decode outlasts one Adreno submission and loses the device.
-        let split = (split_rows > 0
-            && prepared.seats.iter().map(|seat| seat.rows).sum::<u32>() >= split_rows)
-            || prepared.bindings.voxels.is_some();
+        // A step past the platform's bound on one submission walks a layer
+        // at a time by the shell's own admission (`engine_gpu::submit`);
+        // whole, a 512x512 VAE decode outlasts one Adreno submission and
+        // loses the device, and nothing estimates it.
+        let split = prepared.bindings.voxels.is_some();
         let keep = key.filter(|_| !split && shell.shelf.recorder.has_room());
         Ok(Plan::Walk { keep, split })
     }
