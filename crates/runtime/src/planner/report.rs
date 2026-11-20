@@ -374,15 +374,20 @@ impl ResidencyPlanner {
         // The store's own placement of its whole need, its serve's state
         // laid first, as the refusal leaves the pool.
         let queued = self.with_inner(|inner| {
+            let bind = inner
+                .procs
+                .get(&pid)
+                .and_then(|proc| proc.bind_room)
+                .map(|need| (need.run, need.pieces));
             inner.queue.iter().find_map(|(key, waiter)| {
                 (waiter.pid == pid && matches!(waiter.kind, WaitKind::Restore { .. }))
-                    .then(|| (*key, waiter.rs_need()))
+                    .then(|| (*key, waiter.rs_need(), bind))
             })
         });
-        if let Some((key, state)) = queued {
+        if let Some((key, state, bind)) = queued {
             let stood = self
                 .head_room(key)
-                .is_some_and(|need| self.port.guest_need_free(&need, state));
+                .is_some_and(|need| self.port.restore_stands(pid, &need, state, bind));
             self.with_inner(|inner| {
                 if let Some(proc) = inner.procs.get_mut(&pid) {
                     proc.roles_short_stood = Some(stood);

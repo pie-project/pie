@@ -3138,3 +3138,47 @@ fn a_restore_takes_the_runs_its_rebinds_name_before_it_commits() {
     }
     assert!(roles.lock().unwrap().unbound(holder(1)).is_empty(), "nothing left unbound");
 }
+
+/// The L40S on 5aa45805b: a restore's need read [(1, 1)] while its unpark
+/// was refused a run of 465 slots (Slots { slots: 465, committable: 0 }):
+/// counted by the free slots partly filled chunks held, its run asked no
+/// chunk, the map stood the need, and nothing was moved. A restore's need
+/// and its standing are the pool's own placement of every piece it takes:
+/// a run of slots no partly filled chunk of its class holds asks a free
+/// chunk, and the state its serve takes first is laid before it.
+#[test]
+fn a_restore_s_need_and_standing_are_the_placement_of_every_piece_it_takes() {
+    let Pools { device, roles } = pools_of(facts_in(64, 8));
+    let mut engine = GuestEngine::new(2 * MIB, 0);
+    let id = bind(&roles, &mut engine, 1).expect("a run of slots");
+    let shape = roles.lock().unwrap().shapes.of(SlotRole::Instance).expect("shape").pool;
+    // Its scratch has no slots now (its rebind's to take).
+    {
+        let mut roles = roles.lock().unwrap();
+        let item = roles.items.get_mut(&Owner::Instance(id)).expect("bound");
+        let dead: Vec<super::Part> = item.parts.iter().filter(|part| part.dead()).cloned().collect();
+        for part in item.parts.iter_mut().filter(|part| part.dead()) {
+            part.refs.clear();
+        }
+        let device = std::sync::Arc::clone(&roles.device);
+        roles.give(&device, &dead);
+    }
+    let singles = fill_with_singles(&roles);
+    roles.lock().unwrap().close_instance(singles[0]);
+    assert_eq!(device.lock().unwrap().pool().free_chunks(), 1, "one chunk free");
+    assert_eq!(
+        roles.lock().unwrap().unpark_need(holder(1)),
+        vec![(1, 1)],
+        "its run of slots asks the free chunk"
+    );
+    assert!(roles.lock().unwrap().unpark_stands(holder(1), &[], None), "it stands");
+    let chunk = u64::from(device.lock().unwrap().pool().shape(shape).unwrap().slots_per_chunk);
+    assert!(
+        !roles.lock().unwrap().unpark_stands(holder(1), &[(shape, chunk)], None),
+        "its serve's state takes that chunk first: it does not stand"
+    );
+    assert!(
+        !roles.lock().unwrap().unpark_stands(holder(1), &[], Some((1, 1))),
+        "nor with a pending bind's chunk beside it"
+    );
+}

@@ -810,15 +810,18 @@ impl ResidencyPlanner {
                     // unpark did not): then only once more chunks stand
                     // free than the refusal left
                     // ([`super::proc::Proc::roles_short_stood`]).
-                    let (state, stood_at, free_left) = self.with_inner(|inner| {
+                    let (head_pid, state, stood_at, free_left, bind) = self.with_inner(|inner| {
                         inner
                             .unmet_head()
                             .map(|(_, waiter)| {
                                 let proc = inner.procs.get(&waiter.pid);
                                 (
+                                    Some(waiter.pid),
                                     waiter.rs_need(),
                                     proc.and_then(|proc| proc.roles_short_stood),
                                     proc.and_then(|proc| proc.roles_short_free),
+                                    proc.and_then(|proc| proc.bind_room)
+                                        .map(|need| (need.run, need.pieces)),
                                 )
                             })
                             .unwrap_or_default()
@@ -826,7 +829,10 @@ impl ResidencyPlanner {
                     let moved = stood_at.is_none_or(|stood| {
                         !stood || free_left.is_none_or(|left| self.port.free_chunks() > left)
                     });
-                    if !understated && moved && self.port.guest_need_free(&room, state) {
+                    if !understated
+                        && moved
+                        && head_pid.is_some_and(|pid| self.port.restore_stands(pid, &room, state, bind))
+                    {
                         self.plan_stopped("restore sent again: its placement stands");
                         self.with_inner(|inner| {
                             let pid = inner.unmet_head().map(|(_, waiter)| waiter.pid);

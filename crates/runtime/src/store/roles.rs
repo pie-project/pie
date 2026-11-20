@@ -1353,66 +1353,128 @@ impl Roles {
             .chunk_runs_beside(&own, run, pieces)
     }
 
-    /// The runs of adjacent chunks `holder`'s unpark lays fresh for its own
-    /// parked state before any bind's room, one entry per run length, the
-    /// longest first, as the unpark takes it: each dead part given back at
-    /// its park in whole chunks (its pieces of runs of its length), and the
-    /// slots of its dead runs of slots and of the live parts of items
-    /// parked below the device, by shape, past the free slots that shape's
-    /// partly filled chunks hold, in single chunks. Parts still on the
-    /// device (parked in place, or never parked) lay nothing. What a map of
-    /// free chunks must stand beside a bind's runs for the restore that
-    /// bind suspended, as [`Self::fits_beside_unpark`] reads it, and what a
-    /// restore short of its roles asks. Counted in runs of one length, a
-    /// run of two read as two single chunks (the L40S: a need of sixteen
-    /// single chunks while the unpark was refused a run of two), and every
-    /// part a chunk of its own asked twenty-one chunks for twenty small
-    /// items it would lay in one or none.
-    #[must_use]
-    pub fn unpark_need(&self, holder: Holder) -> Vec<(u32, u32)> {
-        let mut runs: BTreeMap<u32, u64> = BTreeMap::new();
-        let mut slots: HashMap<SlotRole, u64> = HashMap::new();
+    /// Every piece `holder`'s unpark takes on the device, in the order it
+    /// takes them, as the pool's placement reads them
+    /// ([`super::slots::OwnPiece`]): each dead part with no slots (given
+    /// back at its park, or short of slots its rebind names) as its runs of
+    /// whole chunks or its run of slots, and each live part of an item
+    /// parked below the device as the take that brings it back (a run of
+    /// slots where it is contiguous, single slots else); the whole-chunk
+    /// runs first, the longest first, then the rest
+    /// ([`Self::prepare_unpark`]).
+    fn unpark_pieces(&self, holder: Holder) -> Vec<super::slots::OwnPiece> {
+        use super::slots::OwnPiece;
+        let mut own: Vec<OwnPiece> = Vec::new();
         for (owner, item) in &self.items {
             let below = matches!(item.tier, Tier::Host | Tier::Disk);
-            let parked = below || item.takes_fresh();
-            if !parked || !self.unparks_with(*owner, item, holder) {
+            if !(below || item.takes_fresh()) || !self.unparks_with(*owner, item, holder) {
                 continue;
             }
             for part in &item.parts {
+                let Some(shape) = self.shapes.of(part.role) else {
+                    continue;
+                };
                 if part.dead() {
                     if !part.refs.is_empty() {
                         continue;
                     }
-                    if part.pieces > 0 {
-                        *runs.entry(part.chunks.max(1)).or_default() += u64::from(part.pieces);
+                    own.push(if part.pieces > 0 {
+                        OwnPiece::Chunks {
+                            run: part.chunks.max(1),
+                            pieces: part.pieces,
+                        }
                     } else {
-                        *slots.entry(part.role).or_default() += u64::from(part.run);
-                    }
-                } else if below {
-                    *slots.entry(part.role).or_default() += part.refs.len() as u64;
+                        OwnPiece::Slots {
+                            shape: shape.pool,
+                            slots: part.run,
+                        }
+                    });
+                } else if below && !part.refs.is_empty() {
+                    let slots = u32::try_from(part.refs.len()).unwrap_or(u32::MAX);
+                    own.push(if part.contiguous {
+                        OwnPiece::Slots {
+                            shape: shape.pool,
+                            slots,
+                        }
+                    } else {
+                        OwnPiece::Take {
+                            shape: shape.pool,
+                            slots: u64::from(slots),
+                        }
+                    });
                 }
             }
         }
-        let device = self.device.lock().unwrap();
-        for (role, wanted) in slots {
-            let Some(shape) = self.shapes.of(role) else {
-                continue;
-            };
-            let Some(state) = device.pool().shape(shape.pool) else {
-                continue;
-            };
-            let per_chunk = u64::from(state.slots_per_chunk.max(1));
-            let chunks = wanted
-                .saturating_sub(device.pool().partial_free(shape.pool))
-                .div_ceil(per_chunk);
-            if chunks > 0 {
-                *runs.entry(1).or_default() += chunks;
+        own.sort_by_key(|piece| match *piece {
+            OwnPiece::Chunks { run, .. } => (0, std::cmp::Reverse(run)),
+            OwnPiece::Slots { .. } | OwnPiece::Take { .. } => (1, std::cmp::Reverse(0)),
+        });
+        own
+    }
+
+    /// The runs of adjacent chunks `holder`'s unpark lays fresh, one entry
+    /// per run length, the longest first, read from the pool's own
+    /// placement of every piece it takes ([`Self::unpark_pieces`]): its
+    /// runs of whole chunks, and the chunks its runs and takes of slots
+    /// open beyond the partly filled ones, in single chunks. A run of 465
+    /// slots asks a chunk wherever no partly filled chunk of its class holds
+    /// it, whatever free slots other chunks hold: counted by free slots, it
+    /// asked none, the need stood, and the unpark was refused for good (the
+    /// L40S on 5aa45805b: need [(1, 1)], refused a run of 465 slots).
+    /// Where the pool cannot place them all now, each run of slots and
+    /// take asks a chunk of its own.
+    #[must_use]
+    pub fn unpark_need(&self, holder: Holder) -> Vec<(u32, u32)> {
+        use super::slots::OwnPiece;
+        let own = self.unpark_pieces(holder);
+        let mut runs: BTreeMap<u32, u64> = BTreeMap::new();
+        let mut whole = 0u32;
+        let mut rest = 0u32;
+        for piece in &own {
+            match *piece {
+                OwnPiece::Chunks { run, pieces } => {
+                    *runs.entry(run).or_default() += u64::from(pieces);
+                    whole = whole.saturating_add(run.saturating_mul(pieces));
+                }
+                OwnPiece::Slots { .. } | OwnPiece::Take { .. } => rest += 1,
             }
+        }
+        let singles = self
+            .device
+            .lock()
+            .unwrap()
+            .pool()
+            .opens_beside(&own)
+            .map_or(rest, |opened| opened.saturating_sub(whole));
+        if singles > 0 {
+            *runs.entry(1).or_default() += u64::from(singles);
         }
         runs.into_iter()
             .rev()
             .map(|(run, pieces)| (run, u32::try_from(pieces).unwrap_or(u32::MAX)))
             .collect()
+    }
+
+    /// Whether `holder`'s whole restore stands now: `state` (the single
+    /// slots its serve takes first, by shape), then every piece its unpark
+    /// takes, then `bind` (the runs a pending bind asks beside them), each
+    /// placed by the pool's own placement as the restore takes them, so
+    /// what stands here is what the restore finds.
+    #[must_use]
+    pub fn unpark_stands(
+        &self,
+        holder: Holder,
+        state: &[(super::slots::ShapeId, u64)],
+        bind: Option<(u32, u32)>,
+    ) -> bool {
+        use super::slots::OwnPiece;
+        let own: Vec<OwnPiece> = state
+            .iter()
+            .map(|&(shape, slots)| OwnPiece::Take { shape, slots })
+            .chain(self.unpark_pieces(holder))
+            .chain(bind.map(|(run, pieces)| OwnPiece::Chunks { run, pieces }))
+            .collect();
+        self.device.lock().unwrap().pool().opens_beside(&own).is_some()
     }
 
     /// What `holder`'s restore would take back, in one line for a stall

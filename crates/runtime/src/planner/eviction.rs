@@ -252,7 +252,36 @@ impl ResidencyPlanner {
         // So is a restore whose role slots are short of runs of chunks
         // ([`super::proc::Proc::roles_short`]): its unpark retakes its dead
         // parts fresh, in their class.
-        let shape = self.head_room(victims.head);
+        let mut shape = self.head_room(victims.head);
+        // The map stands a restore's need while the store's placement of
+        // its whole restore does not (room there only by emptying, the
+        // map's free chunks laid otherwise than the takes lay them): one
+        // more piece of its longest run is asked, so the map names the
+        // occupants whose move makes it (the L40S on 4cef0c7d3: 1,195 of
+        // 1,199 lines with free runs and emptiable chunks enough and no
+        // move planned). Once the restore stands, it is sent again.
+        if victims.restore
+            && let Some(need) = shape.as_mut()
+            && let Some((run, _)) = need.longest()
+        {
+            let (state, bind) = self.with_inner(|inner| {
+                let state = inner.queue.get(&victims.head).map(super::wait::Waiter::rs_need);
+                let bind = inner
+                    .procs
+                    .get(&victims.head_pid)
+                    .and_then(|proc| proc.bind_room)
+                    .map(|need| (need.run, need.pieces));
+                (state.unwrap_or_default(), bind)
+            });
+            let mut map = self.port.chunk_occupants(&[]);
+            map.merge(self.parked_map(victims.head_pid));
+            self.lay_serve_state(victims.head, &mut map);
+            if map.cheapest_need(need).is_some_and(|moves| moves.is_empty())
+                && !self.port.restore_stands(victims.head_pid, need, state, bind)
+            {
+                need.add(run, 1);
+            }
+        }
         // Kv the head lacks, with parked state lying on the device (role
         // slots its park found no room below for, as on a home with no host
         // tier): that state moves down a tier first, no one running on it.

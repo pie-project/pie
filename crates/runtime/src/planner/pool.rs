@@ -526,6 +526,22 @@ pub trait PoolPort: Send + Sync + 'static {
             .iter()
             .all(|&(run, pieces)| self.guest_room_free(run, pieces))
     }
+    /// Whether `pid`'s whole restore stands now: `state` its serve takes
+    /// first, every piece its unpark takes, then `bind` (a pending bind's
+    /// runs) beside them, each where the store's placement puts it
+    /// ([`crate::store::roles::Roles::unpark_stands`]): the one check a
+    /// restore is sent on. Where the pool keeps no roles, `need` against
+    /// the placement of [`Self::guest_need_free`].
+    fn restore_stands(
+        &self,
+        pid: ProcessId,
+        need: &RunNeed,
+        state: RsUnits,
+        bind: Option<(u32, u32)>,
+    ) -> bool {
+        let _ = (pid, bind);
+        self.guest_need_free(need, state)
+    }
     /// The free physical chunks a restore's `state` would open as its serve
     /// takes it, lowest first after the shapes' partly filled chunks
     /// ([`crate::store::slots::SlotPool::opens_for`]): chunks the map must
@@ -844,6 +860,25 @@ impl PoolPort for RegistryPool {
                     .collect();
                 shared.pool().chunk_runs_beside(&own, last.0, last.1)
             })
+    }
+
+    fn restore_stands(
+        &self,
+        pid: ProcessId,
+        need: &RunNeed,
+        state: RsUnits,
+        bind: Option<(u32, u32)>,
+    ) -> bool {
+        let Some(stores) = crate::store::registry::try_get(self.model, self.engine) else {
+            return false;
+        };
+        let (Some(shared), Some(roles)) = (stores.shared.clone(), stores.roles.clone()) else {
+            return self.guest_need_free(need, state);
+        };
+        // The state's takes, read under the pool's lock and let go: the
+        // roles take the pool's lock themselves.
+        let takes = shared.lock().unwrap().state_takes(state);
+        roles.lock().unwrap().unpark_stands(pid, &takes, bind)
     }
 
     fn serve_opens(&self, state: RsUnits) -> Vec<u32> {

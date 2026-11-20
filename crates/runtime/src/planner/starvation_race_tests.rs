@@ -2489,6 +2489,9 @@ struct BindRoomPool {
     rs_pages: AtomicU32,
     /// The state slots free (`rs_stats`).
     rs_free: AtomicU32,
+    /// The store's placement refuses a restore its map stands
+    /// (`PoolPort::restore_stands`).
+    store_refuses: std::sync::atomic::AtomicBool,
 }
 
 impl BindRoomPool {
@@ -2515,6 +2518,7 @@ impl BindRoomPool {
             headroom: parking_lot::Mutex::new(None),
             rs_pages: AtomicU32::new(0),
             rs_free: AtomicU32::new(0),
+            store_refuses: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -2567,6 +2571,15 @@ impl BindRoomPool {
 }
 
 impl PoolPort for BindRoomPool {
+    fn restore_stands(
+        &self,
+        _pid: ProcessId,
+        need: &super::pool::RunNeed,
+        state: RsUnits,
+        _bind: Option<(u32, u32)>,
+    ) -> bool {
+        !self.store_refuses.load(Ordering::Relaxed) && self.guest_need_free(need, state)
+    }
     fn chunk_stats(&self) -> ChunkStats {
         let rs = self.rs_free.load(Ordering::Relaxed);
         ChunkStats {
@@ -8833,4 +8846,52 @@ async fn a_pass_that_sends_a_refused_restore_again_says_so() {
     let (plan, _) = planner.with_inner(|inner| inner.plan_fields(key));
     assert!(plan.contains("restore sent again: its placement stands"), "{plan}");
     drop(fire);
+}
+
+/// The L40S on 4cef0c7d3: 1,195 of 1,199 no-step lines had free runs and
+/// emptiable chunks enough and no move planned: the map stood the head's
+/// need (nothing to move) while the store's placement of its whole restore
+/// did not. The map is then asked one more piece of the need's longest
+/// run, and names the occupants whose move makes it.
+#[tokio::test(flavor = "current_thread")]
+async fn room_there_only_by_emptying_is_made_by_the_map_s_moves() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(4, 0..0, 64));
+    pool.free.lock().extend([0, 1, 3]);
+    pool.store_refuses.store(true, Ordering::Relaxed);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (head, resident) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [head, resident] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    pool.kv.lock().push((2, resident));
+    planner.with_inner(|inner| {
+        inner.procs.get_mut(&resident).unwrap().idle = true;
+        let proc = inner.procs.get_mut(&head).unwrap();
+        proc.state = Residency::Evicted;
+        proc.roles_short = Some(PendingBind {
+            run: 2,
+            pieces: 1,
+            pages: 2,
+        });
+        proc.roles_short_stood = Some(false);
+        inner.enqueue(
+            head,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        );
+    });
+    planner.poke();
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.stats.evictions_started.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+    }
+    assert!(
+        planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
+        "the occupant of the chunk that completes another run is moved"
+    );
 }

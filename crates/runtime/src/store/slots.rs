@@ -1980,6 +1980,17 @@ impl SlotPool {
             .map(|(opened, _)| opened.into_iter().collect())
     }
 
+    /// Where `own` (placed in order as the takes would place it) fits at
+    /// all, the free chunks it opens: the runs of whole chunks, then the
+    /// chunks its runs and takes of slots open beyond the partly filled
+    /// ones. `None` where it does not fit: the one placement a restore's
+    /// need and its standing are read by ([`super::roles::Roles::unpark_need`]).
+    #[must_use]
+    pub fn opens_beside(&self, own: &[OwnPiece]) -> Option<u32> {
+        self.free_beside(own)
+            .map(|(opened, _)| u32::try_from(opened.len()).unwrap_or(u32::MAX))
+    }
+
     /// The chunks `own` opens placed in order as the takes would place it,
     /// and the headroom it leaves; `None` where it does not fit.
     fn free_beside(&self, own: &[OwnPiece]) -> Option<(std::collections::BTreeSet<u32>, u32)> {
