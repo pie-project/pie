@@ -1343,9 +1343,7 @@ impl<'c> Run<'c> {
 
     /// Whether `id` is a buffered plane of this buffering fire: a decode
     /// step reading it carries each lane's buffered rows ahead of its own
-    /// and lands its own row in the buffer itself. (ROCm's decode steps
-    /// replay a lane's carried rows extended.)
-    #[cfg(not(feature = "rocm"))]
+    /// and lands its own row in the buffer itself.
     pub(crate) fn rs_buffered(&self, id: ValueId) -> bool {
         self.rs
             .as_ref()
@@ -1355,15 +1353,12 @@ impl<'c> Run<'c> {
     /// Whether `gates` is a decode step's gate prep output in a buffering
     /// fire, whose `[b | a]` its recurrence lands.
     pub(crate) fn rs_step_gates(&self, gates: ValueId) -> bool {
-        cfg!(not(feature = "rocm"))
-            && self
-                .rs
+        self.rs
                 .as_ref()
                 .is_some_and(|seat| seat.buffers.planes().step_gates(gates).is_some())
     }
 
     /// Value `id`'s buffered plane.
-    #[cfg(not(feature = "rocm"))]
     pub(crate) fn rs_plane(
         &self,
         op: &'static str,
@@ -1383,13 +1378,11 @@ impl<'c> Run<'c> {
     }
 
     /// The window's qo boundaries as its recurrent kernels read them.
-    #[cfg(not(feature = "rocm"))]
     pub(crate) fn rs_qo_indptr(&self) -> Tensor {
         self.rs_indptr().0
     }
 
     /// This load's buffered planes, where the fire buffers.
-    #[cfg(not(feature = "rocm"))]
     pub(crate) fn rs_planes(&self) -> Option<&'c crate::store::rs::Planes> {
         self.rs.as_ref().map(|seat| seat.buffers.planes())
     }
@@ -1398,7 +1391,6 @@ impl<'c> Run<'c> {
     /// tables, the commit lengths of `pool`, the places of the step's
     /// buffered `planes` (in the order its kernel reads them) and the
     /// carried scratch at `scratch` (0: none).
-    #[cfg(not(feature = "rocm"))]
     pub(crate) fn rs_carry(
         &self,
         op: &'static str,
@@ -1432,7 +1424,6 @@ impl<'c> Run<'c> {
 
     /// The carried plane value `id`'s carried rows land in, for the decode
     /// step of this window's layer that reads them ([`Run::rs_carried_of`]).
-    #[cfg(not(feature = "rocm"))]
     pub(crate) fn rs_carried_out(
         &self,
         op: &'static str,
@@ -1450,7 +1441,6 @@ impl<'c> Run<'c> {
 
     /// A carried plane of rows `row_bytes` wide, landed for value `id`
     /// ([`Run::rs_carried_of`]).
-    #[cfg(not(feature = "rocm"))]
     pub(crate) fn rs_carried_rows(
         &self,
         op: &'static str,
@@ -1470,7 +1460,6 @@ impl<'c> Run<'c> {
 
     /// Where value `id`'s carried rows were landed by an earlier decode step
     /// of this window's layer.
-    #[cfg(not(feature = "rocm"))]
     pub(crate) fn rs_carried_of(
         &self,
         op: &'static str,
