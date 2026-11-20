@@ -342,6 +342,77 @@ pub fn carried_room(rung: u32) -> u32 {
     rung
 }
 
+/// A decode fire's carried rows as the state + buffer step reads them
+/// (`kernels_xla::ssm::carried`): each lane's buffered rows' rs list rows in
+/// a `[lanes, rows]` grid (`DROP` past its own), how many it carries, and
+/// its commit (the carried and own rows its fold takes, `LanePlan::commit`,
+/// the step's `0..=count + 1`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CarriedMap {
+    pub rows: u32,
+    pub buffer_rows: Vec<i32>,
+    pub count: Vec<i32>,
+    pub commit: Vec<i32>,
+}
+
+impl CarriedMap {
+    /// The map of the window over lanes `lane0..lane0 + lanes`, `rows` the
+    /// carried rows a lane may hold (the step's grid); a lane carrying more
+    /// is refused by name.
+    pub fn of(
+        plans: &[LanePlan],
+        lanes: u32,
+        lane0: u32,
+        page_tokens: u32,
+        rows: u32,
+    ) -> Result<CarriedMap> {
+        let mut map = CarriedMap {
+            rows,
+            buffer_rows: vec![DROP; (lanes * rows) as usize],
+            count: vec![0; lanes as usize],
+            commit: vec![0; lanes as usize],
+        };
+        for r in 0..lanes {
+            let Some(plan) = plans.get((lane0 + r) as usize) else {
+                continue;
+            };
+            let mut at = 0u32;
+            for run in &plan.gathers {
+                for t in 0..run.count {
+                    if at >= rows {
+                        return Err(Fault::Ceiling {
+                            what: "carried rows a decode lane's step reads",
+                            need: u64::from(plan.gathers.iter().map(|g| g.count).sum::<u32>()),
+                            have: u64::from(rows),
+                        });
+                    }
+                    let token = run.from + t;
+                    let page = token / page_tokens;
+                    let slot = *run.pages.get(page as usize).ok_or(Fault::Ceiling {
+                        what: "recurrent buffer pages",
+                        need: u64::from(page) + 1,
+                        have: run.pages.len() as u64,
+                    })?;
+                    let row =
+                        u64::from(slot) * u64::from(page_tokens) + u64::from(token % page_tokens);
+                    map.buffer_rows[(r * rows + at) as usize] = i32::try_from(row)
+                        .ok()
+                        .filter(|&v| v != DROP)
+                        .ok_or(Fault::Ceiling {
+                            what: "rs list rows an i32 addresses",
+                            need: row,
+                            have: i32::MAX as u64 - 1,
+                        })?;
+                    at += 1;
+                }
+            }
+            map.count[r as usize] = at as i32;
+            map.commit[r as usize] = i32::try_from(plan.commit).unwrap_or(i32::MAX);
+        }
+        Ok(map)
+    }
+}
+
 impl WindowMap {
     /// The map of the window covering lanes `lane0..lane0 + lanes` whose own
     /// rows are cut by `indptr` (window-local), for rs list slots of
@@ -462,4 +533,36 @@ pub struct Seat {
     pub maps: HashMap<(u32, u32, u32, u32), WindowInputs>,
     /// Extended outputs landed by an earlier op of the current window.
     pub ext: std::cell::RefCell<HashMap<u32, crate::handle::Tensor>>,
+}
+
+#[cfg(test)]
+mod carried_map {
+    use super::*;
+
+    #[test]
+    fn a_decode_lanes_carried_rows_land_in_its_row_of_the_grid() {
+        let run = |pages: Vec<u32>, from: u32, count: u32| Run { pages, from, count };
+        let plans = vec![
+            LanePlan {
+                commit: 0,
+                ..LanePlan::default()
+            },
+            LanePlan {
+                gathers: vec![run(vec![7, 9], 14, 3)],
+                commit: 4,
+                ..LanePlan::default()
+            },
+        ];
+        let map = CarriedMap::of(&plans, 2, 0, 16, 4).unwrap();
+        assert_eq!(map.count, vec![0, 3]);
+        assert_eq!(map.commit, vec![0, 4]);
+        // tokens 14, 15 on page 7, 16 on page 9
+        assert_eq!(
+            &map.buffer_rows[4..],
+            &[7 * 16 + 14, 7 * 16 + 15, 9 * 16, DROP]
+        );
+        assert!(map.buffer_rows[..4].iter().all(|&r| r == DROP));
+        // a lane carrying past the grid is refused
+        assert!(CarriedMap::of(&plans, 2, 0, 16, 2).is_err());
+    }
 }
