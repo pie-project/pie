@@ -559,6 +559,13 @@ impl Device {
         self.disk.is_some()
     }
 
+    /// Whether `text`'s program is had without a compile: held
+    /// ([`Self::holds`]), or in the disk cache.
+    #[must_use]
+    pub fn has_without_compile(&self, text: &str) -> bool {
+        self.holds(text) || self.on_disk(text)
+    }
+
     /// Whether the disk cache holds the program compiled from `text`.
     #[must_use]
     pub fn on_disk(&self, text: &str) -> bool {
@@ -904,7 +911,34 @@ pub(crate) fn available_memory() -> Option<u64> {
     let info = std::fs::read_to_string("/proc/meminfo").ok()?;
     let line = info.lines().find(|l| l.starts_with("MemAvailable:"))?;
     let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-    Some(kib << 10)
+    let host = kib << 10;
+    Some(cgroup_room().map_or(host, |room| room.min(host)))
+}
+
+/// The memory this process's cgroups leave it: each ancestor with a
+/// `memory.max`, less its `memory.current`, the least of them (`None`
+/// where none is capped). A cap the host's `MemAvailable` does not see
+/// (v6e: the user slice at 150 GiB on a 172 GB host) OOM-kills a load or a
+/// registration whose compiles fit the host but not the cap.
+fn cgroup_room() -> Option<u64> {
+    let own = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let path = own.lines().find_map(|l| l.strip_prefix("0::"))?;
+    let mut dir = std::path::PathBuf::from("/sys/fs/cgroup").join(path.trim_start_matches('/'));
+    let mut least: Option<u64> = None;
+    loop {
+        let read = |name: &str| std::fs::read_to_string(dir.join(name)).ok();
+        if let (Some(max), Some(current)) = (read("memory.max"), read("memory.current"))
+            && let (Ok(max), Ok(current)) =
+                (max.trim().parse::<u64>(), current.trim().parse::<u64>())
+        {
+            let room = max.saturating_sub(current);
+            least = Some(least.map_or(room, |l| l.min(room)));
+        }
+        if dir == std::path::Path::new("/sys/fs/cgroup") || !dir.pop() {
+            break;
+        }
+    }
+    least
 }
 
 /// The host memory a compiled program holds: ~64 bytes a byte of its text,
