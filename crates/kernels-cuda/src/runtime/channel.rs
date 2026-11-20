@@ -788,7 +788,7 @@ pub fn copy_rs_rows(
     }
     ctx.fire(
         OP,
-        Fire::at(kernel(FILE, "::pie::channel::copy_rs_rows"))
+        Fire::at(kernel(FILE, "::pie::runtime::channel::copy_rs_rows"))
             .apply(Launch::grid([run_count, max_planes, 1], [PAGES_BLOCK, 1, 1])),
         &[
             ArgValue::Ptr(runs),
