@@ -54,10 +54,16 @@ impl Planes {
         self.0.get(&id.0).copied()
     }
 
-    /// Every buffered plane once, by layer and place.
+    /// Every buffered plane once, by layer and place: the read values' and
+    /// a gated-delta layer's keys and corrected values.
     #[must_use]
     pub fn all(&self) -> Vec<Plane> {
-        let mut planes: Vec<Plane> = self.0.values().copied().collect();
+        let mut planes: Vec<Plane> = self
+            .0
+            .values()
+            .copied()
+            .chain(self.3.values().flat_map(|c| [c.k, c.u]))
+            .collect();
         planes.sort_by_key(|plane| (plane.layer, plane.at, plane.width));
         planes.dedup_by_key(|plane| (plane.layer, plane.at, plane.width));
         planes
