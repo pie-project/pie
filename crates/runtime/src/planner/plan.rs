@@ -17,6 +17,8 @@ enum Step {
     },
     ShortRs {
         need: RsUnits,
+        /// All the head takes when served: the pool grows until this much stands free.
+        seated: RsUnits,
         fund_by_eviction: bool,
         /// Pages gathered past the head's own kv need.
         surplus: u32,
@@ -92,6 +94,7 @@ impl ResidencyPlanner {
                 if !rs_free.covers(seated) {
                     return Step::ShortRs {
                         need: seated.sub(rs_free),
+                        seated,
                         fund_by_eviction: !is_restore || inner.fleet_stalled(),
                         surplus: (inner.accum.len() as u32).saturating_sub(waiter.kv_need()),
                     };
@@ -148,6 +151,7 @@ impl ResidencyPlanner {
                 }
                 Step::ShortRs {
                     need,
+                    seated,
                     fund_by_eviction,
                     surplus,
                 } => {
@@ -167,7 +171,7 @@ impl ResidencyPlanner {
                             continue;
                         }
                     }
-                    if self.port.grow_rs(need) {
+                    if self.port.grow_rs(seated) {
                         return;
                     }
                     // On a shared pool the chunks idle cache holds open for

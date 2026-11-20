@@ -50,8 +50,8 @@ pub trait PoolPort: Send + Sync + 'static {
     fn rs_growth(&self) -> RsUnits {
         RsUnits::default()
     }
-    /// Asks for `need` more of each shape than stands free now; true when
-    /// memory is on its way, and `pages_freed` follows it.
+    /// Asks that `need` of each shape stand free; true when memory is on its
+    /// way, and `pages_freed` follows it.
     fn grow(&self, need: super::Demand) -> bool {
         let _ = need;
         false
