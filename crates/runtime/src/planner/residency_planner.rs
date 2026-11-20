@@ -442,6 +442,18 @@ impl ResidencyPlanner {
         self.poke();
     }
 
+    /// The runs a restore a bind suspended asks of the chunk map: its bind's
+    /// `pieces` runs of `run` chunks beside those its own unpark takes back
+    /// first (`PoolPort::unpark_runs`), never more than the pool stands.
+    /// The census reads the bind's runs beside its own retake
+    /// (`room_beside_own`); a map asked for the bind's runs alone saw them
+    /// free, found no one to move, and the restore waited with no step.
+    pub(super) fn beside_own(&self, pid: ProcessId, (run, pieces): (u32, u32)) -> (u32, u32) {
+        let own = self.port.unpark_runs(pid, run);
+        let most = self.port.state_chunks() / run.max(1);
+        (run, pieces.saturating_add(own).min(most).max(pieces))
+    }
+
     /// Parked state lying on the device (role slots its park found no host
     /// room for) is room a move makes, as idle cache is: for the head's
     /// `pieces` runs of `run` adjacent chunks, the parked processes whose

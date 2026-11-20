@@ -2678,6 +2678,10 @@ impl PoolPort for BindRoomPool {
     fn chunks_as_pages(&self, chunks: u32) -> u32 {
         chunks
     }
+    /// The chunks its own restore retakes first, in runs of `run`.
+    fn unpark_runs(&self, _pid: ProcessId, run: u32) -> u32 {
+        (self.own.lock().len() as u32).div_ceil(run.max(1))
+    }
     fn state_chunks(&self) -> u32 {
         self.total
     }
@@ -6127,4 +6131,55 @@ async fn a_nearly_full_swap_defers_eviction_only_while_something_is_in_flight() 
         "nothing in flight brings supply: the rung goes on"
     );
     parked.abort();
+}
+
+/// A restore a bind suspended is served by the chunk map as its census
+/// reads it: the bind's runs beside those its own unpark takes back first.
+/// Free runs at 0-1 and 4-5, its own retake taking 0-1, the bind asking two
+/// runs of two: the census finds one beside its own, short; the map asked
+/// for the bind's two alone saw both free, found no one to move, and the
+/// restore waited with no step (restore heads with runs open, no step).
+/// Asked for three, the map moves the resident holding 2-3 or 6-7.
+#[tokio::test(flavor = "current_thread")]
+async fn a_bind_suspended_restore_is_funded_beside_its_own_retake() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    pool.free.lock().extend([0, 1, 4, 5]);
+    pool.own.lock().extend([0, 1]);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (head, resident) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [head, resident] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    pool.kv.lock().extend([(2, resident), (3, resident), (6, resident), (7, resident)]);
+    planner.with_inner(|inner| {
+        inner.procs.get_mut(&resident).unwrap().idle = true;
+        let proc = inner.procs.get_mut(&head).unwrap();
+        proc.state = Residency::Evicted;
+        proc.bind_room = Some(super::proc::PendingBind {
+            run: 2,
+            pieces: 2,
+            pages: 4,
+        });
+        inner.enqueue(
+            head,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        );
+    });
+    assert!(pool.guest_room_free(2, 2), "the map sees two runs free");
+    assert!(!pool.room_beside_own(head, 2, 2), "the census: one beside its own retake");
+    planner.poke();
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.stats.evictions_started.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+    }
+    assert!(
+        planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
+        "the resident holding a run beside them is moved for it"
+    );
 }

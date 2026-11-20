@@ -247,6 +247,21 @@ impl ResidencyPlanner {
             },
             None => None,
         });
+        // The restore of a process a bind suspended asks its bind's runs
+        // beside what its own unpark takes back first, as the census reads
+        // it ([`Self::beside_own`]).
+        let suspended = self.with_inner(|inner| {
+            let waiter = inner.queue.get(&victims.head)?;
+            let proc = inner.procs.get(&waiter.pid)?;
+            (matches!(waiter.kind, WaitKind::Restore { .. })
+                && proc.bind_room.is_some()
+                && proc.roles_short.is_none())
+            .then_some(waiter.pid)
+        });
+        let shape = match (shape, suspended) {
+            (Some(need), Some(pid)) => Some(self.beside_own(pid, need)),
+            (shape, _) => shape,
+        };
         // Kv the head lacks, with parked state lying on the device (role
         // slots its park found no room below for, as on a home with no host
         // tier): that state moves down a tier first, no one running on it.

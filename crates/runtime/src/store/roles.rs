@@ -1206,6 +1206,39 @@ impl Roles {
             .chunk_runs_beside(&own, run, pieces)
     }
 
+    /// The runs of `run` adjacent chunks `holder`'s unpark takes for its
+    /// own parked state before any bind's room: each dead part given back
+    /// at its park (its runs of whole chunks, or a run of slots in a
+    /// chunk), and the live parts of items parked below the device, each
+    /// counted in whole runs. What a map of free chunks must stand beside
+    /// a bind's runs for the restore that bind suspended, as
+    /// [`Self::fits_beside_unpark`] reads it from the pool; counted short,
+    /// the map saw free runs and moved no one while the restore stood
+    /// short beside its own (restore heads with runs open and no step).
+    #[must_use]
+    pub fn unpark_runs(&self, holder: Holder, run: u32) -> u32 {
+        let run = u64::from(run.max(1));
+        let mut runs = 0u64;
+        for (owner, item) in &self.items {
+            let below = matches!(item.tier, Tier::Host | Tier::Disk);
+            let parked = below || (item.tier == Tier::Device && item.shed);
+            if !parked || !self.unparks_with(*owner, item, holder) {
+                continue;
+            }
+            for part in item.parts.iter().filter(|part| part.dead() && part.refs.is_empty()) {
+                runs += if part.pieces > 0 {
+                    u64::from(part.pieces) * u64::from(part.chunks).div_ceil(run)
+                } else {
+                    1
+                };
+            }
+            if below {
+                runs += self.chunks_on(&self.device, &item.parts).div_ceil(run);
+            }
+        }
+        u32::try_from(runs).unwrap_or(u32::MAX)
+    }
+
     /// What `holder`'s restore would take back, in one line for a stall
     /// census: each parked item (instance, channel, adapter, pair) with its
     /// tier, and each part by role and size (scratch runs of whole chunks,

@@ -471,6 +471,15 @@ pub trait PoolPort: Send + Sync + 'static {
         let _ = (planner, pids, order);
         false
     }
+    /// The runs of `run` adjacent chunks `pid`'s restore takes for its own
+    /// parked guest state before a bind's room
+    /// ([`crate::store::roles::Roles::unpark_runs`]): what the chunk map
+    /// must stand beside the runs of the bind that suspended it. 0 where
+    /// the pool keeps no guest state.
+    fn unpark_runs(&self, pid: ProcessId, run: u32) -> u32 {
+        let _ = (pid, run);
+        0
+    }
     /// The chunks the device pool holds for kv and state at most (its
     /// chunks past the reserved and the activation's): the most runs of
     /// any length a need can ask. `u32::MAX` where the pool keeps no
@@ -703,6 +712,12 @@ impl PoolPort for RegistryPool {
             crate::store::shared::ask_walk(self.engine);
         }
         comes
+    }
+
+    fn unpark_runs(&self, pid: ProcessId, run: u32) -> u32 {
+        crate::store::registry::try_get(self.model, self.engine)
+            .and_then(|stores| stores.roles)
+            .map_or(0, |roles| roles.lock().unwrap().unpark_runs(pid, run))
     }
 
     fn state_chunks(&self) -> u32 {

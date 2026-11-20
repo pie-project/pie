@@ -2779,3 +2779,27 @@ fn with_no_host_tier_a_restored_instance_fires_on_its_rebound_place() {
     apart(&engine, &[a, b]).expect("each fires on its own place");
     assert_eq!(fires_on(&engine, a).1, fires_on(&engine, b).1, "one pair, where it landed");
 }
+
+/// What a restore takes back for its own parked state before any bind's
+/// room, in runs of a length: none while bound, its scratch's runs once it
+/// parks where it lies (no host tier, its dead parts given back), and none
+/// again once it is back.
+#[test]
+fn a_parked_process_s_own_retake_is_counted_in_runs() {
+    let Pools { roles, .. } = pools_no_host(facts_in(64, 8));
+    let (program, mut engine) = runs_of(13, 2, 1, 0);
+    let id = bind_as(&roles, &mut engine, program, 1).unwrap();
+    assert_eq!(roles.lock().unwrap().unpark_runs(holder(1), 2), 0, "bound: nothing to take back");
+    park(&roles, 1);
+    assert_eq!(roles.lock().unwrap().unpark_runs(holder(1), 2), 1, "its run of two comes back first");
+    assert_eq!(roles.lock().unwrap().unpark_runs(holder(1), 1), 2, "two runs of one");
+    let back = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(1))
+        .unwrap()
+        .expect("it comes back");
+    roles.lock().unwrap().commit(back);
+    assert_eq!(roles.lock().unwrap().unpark_runs(holder(1), 2), 0, "back: nothing parked");
+    roles.lock().unwrap().close_instance(id);
+}

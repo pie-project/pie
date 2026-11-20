@@ -438,8 +438,13 @@ impl ResidencyPlanner {
                     // Parked state lying on the device moves down a tier for
                     // it, no one running on it (the M1 stress: every
                     // Instance chunk held by parked processes' role slots,
-                    // the bind-suspended head's runs never funded).
-                    if self.park_down_for(need.run, need.pieces) {
+                    // the bind-suspended head's runs never funded): the
+                    // bind's runs beside its own retake ([`Self::beside_own`]).
+                    let (run, pieces) = match pid {
+                        Some(pid) => self.beside_own(pid, (need.run, need.pieces)),
+                        None => (need.run, need.pieces),
+                    };
+                    if self.park_down_for(run, pieces) {
                         return false;
                     }
                     // Funded once nothing in flight can free room
