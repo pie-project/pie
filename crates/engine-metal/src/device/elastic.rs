@@ -462,6 +462,12 @@ pub struct Elastic {
     /// committed bottom chunks past `top_from` lie in them, so no unmap of
     /// the top gives them back.
     held_low: usize,
+    /// The top's heaps no slot maps: made at load ([`Elastic::back_whole_top`])
+    /// or given back by an unmap, each with the timeline value its unmap
+    /// lands at. A map takes one before it makes a heap, so the top, backed
+    /// whole at load, makes none after: a raise, a lower, a lend and a span
+    /// commit within it move the same heaps.
+    spare: Vec<Pending>,
     owner: Weak<Mutex<State>>,
     /// The mapping side this buffer was created on: the device that makes
     /// its heaps, the queue that maps them, and the residency set they are
@@ -633,6 +639,27 @@ impl Elastic {
         self.map_slots(first, self.top.len())
     }
 
+    /// Makes a heap for every slot of the top, kept spare: the load backs
+    /// the whole top (the ledger's fire class reserved its bytes), so no
+    /// map of it after makes one. A heap the system refuses is
+    /// [`Fault::Refused`], like any growth.
+    ///
+    /// # Errors
+    ///
+    /// As [`make_chunk`].
+    pub fn back_whole_top(&mut self) -> Result<()> {
+        let (from, end) = (self.top_from, self.virtual_bytes);
+        for slot in 0..self.top.len() {
+            if self.top[slot].is_some() {
+                continue;
+            }
+            let bytes = CHUNK.min(end - (from + slot as u64 * CHUNK));
+            let chunk = make_chunk(&self.sparse, bytes)?;
+            self.spare.push(Pending { through: 0, chunk });
+        }
+        Ok(())
+    }
+
     /// Maps the top's slots `first..last` that are not mapped, charged to
     /// the arena like any growth; what is mapped already stands.
     fn map_slots(&mut self, first: usize, last: usize) -> Result<()> {
@@ -670,7 +697,30 @@ impl Elastic {
                 continue;
             }
             let bytes = size(slot, from, end);
-            match make_chunk(&self.sparse, bytes) {
+            let signalled = self.sparse.signalled();
+            let reused = self
+                .spare
+                .iter()
+                .position(|spare| spare.chunk.bytes == bytes && spare.through <= signalled)
+                .map(|at| self.spare.swap_remove(at).chunk);
+            let made = match reused {
+                Some(chunk) => {
+                    // A heap given back holds what its last owner wrote; a
+                    // made one comes zeroed, and so does this. Its unmap has
+                    // landed, so no GPU work touches it.
+                    // SAFETY: the alias spans the heap's `bytes`, host-visible.
+                    unsafe {
+                        std::ptr::write_bytes(
+                            chunk.alias.contents().as_ptr().cast::<u8>(),
+                            0,
+                            usize_of(chunk.bytes),
+                        );
+                    }
+                    Ok(chunk)
+                }
+                None => make_chunk(&self.sparse, bytes),
+            };
+            match made {
                 Ok(mut chunk) => {
                     self.sparse.issue(
                         &target_buffer,
@@ -795,11 +845,10 @@ impl Elastic {
             let mut state = arena.lock();
             state.budget.committed = state.budget.committed.saturating_sub(released);
             state.budget.reserved = state.budget.reserved.saturating_sub(released);
-            state
-                .pending
-                .extend(emptied.into_iter().map(|chunk| Pending { through, chunk }));
         }
-        arena.collect(self.sparse.signalled(), self.sparse.residency());
+        // Kept, not freed: the next map of the top takes them back.
+        self.spare
+            .extend(emptied.into_iter().map(|chunk| Pending { through, chunk }));
         Ok(())
     }
 
@@ -1096,7 +1145,12 @@ impl Drop for Elastic {
         if self.drained() {
             let residency = self.sparse.residency();
             residency.removeAllocation(ProtocolObject::from_ref(&*self.buffer));
-            for chunk in self.chunks.iter().chain(self.top.iter().flatten()) {
+            for chunk in self
+                .chunks
+                .iter()
+                .chain(self.top.iter().flatten())
+                .chain(self.spare.iter().map(|spare| &spare.chunk))
+            {
                 residency.removeAllocation(ProtocolObject::from_ref(&*chunk.heap));
             }
             residency.commit();
@@ -1106,7 +1160,12 @@ impl Drop for Elastic {
             // free them: a leak costs this process memory it was already
             // holding, and the alternative costs the machine.
             leak(self.buffer.clone());
-            for chunk in self.chunks.drain(..).chain(self.top.drain(..).flatten()) {
+            for chunk in self
+                .chunks
+                .drain(..)
+                .chain(self.top.drain(..).flatten())
+                .chain(self.spare.drain(..).map(|spare| spare.chunk))
+            {
                 let Chunk { heap, alias, .. } = chunk;
                 leak(heap);
                 leak(alias);
@@ -1143,6 +1202,19 @@ impl std::fmt::Debug for Elastic {
     }
 }
 
+thread_local! {
+    /// Heaps [`make_chunk`] made on this thread: what a test reads to see
+    /// that a walk of the backed top made none (per thread, so tests beside
+    /// it count their own).
+    static HEAPS_MADE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Heaps made so far on this thread.
+#[must_use]
+pub fn heaps_made() -> u64 {
+    HEAPS_MADE.with(std::cell::Cell::get)
+}
+
 /// Make a placement heap of `bytes` and a buffer aliasing all of it.
 #[cfg(target_vendor = "apple")]
 fn make_chunk(sparse: &Sparse, bytes: u64) -> Result<Chunk> {
@@ -1159,6 +1231,8 @@ fn make_chunk(sparse: &Sparse, bytes: u64) -> Result<Chunk> {
     descriptor.setSize(usize_of(bytes));
     descriptor.setMaxCompatiblePlacementSparsePageSize(MTLSparsePageSize::Size256);
 
+    crate::diag::made("placement heap", bytes);
+    HEAPS_MADE.with(|made| made.set(made.get() + 1));
     let heap = sparse
         .device()
         .newHeapWithDescriptor(&descriptor)
@@ -1211,6 +1285,7 @@ pub fn create(sparse: &Arc<Sparse>, arena: &Arena, len: u64) -> Result<Elastic> 
         });
     }
     let virtual_bytes = tiles_up(len);
+    crate::diag::made("sparse buffer", virtual_bytes);
     // SAFETY: the length is a whole number of tiles at the page size given,
     // which is what this call requires; nothing is mapped yet, so there is no
     // aliasing to violate.
@@ -1241,6 +1316,7 @@ pub fn create(sparse: &Arc<Sparse>, arena: &Arena, len: u64) -> Result<Elastic> 
         top_from: virtual_bytes,
         top: Vec::new(),
         held_low: 0,
+        spare: Vec::new(),
         owner: Arc::downgrade(&arena.state),
         sparse: sparse.clone(),
         fence: None,

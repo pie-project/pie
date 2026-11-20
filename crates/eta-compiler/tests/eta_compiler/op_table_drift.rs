@@ -33,6 +33,7 @@ const GENERATED_TAGS: &[u8] = &[
     tags::REDUCE_MAX,
     tags::REDUCE_MIN,
     tags::REDUCE_ARGMAX,
+    tags::GUMBEL_ARGMAX,
     tags::BROADCAST,
     tags::RESHAPE,
     tags::TRANSPOSE,

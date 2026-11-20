@@ -846,6 +846,8 @@ impl Engine for Cuda {
                 storage_alignment: 256,
                 storage_max_tile_bytes: u64::MAX,
                 codegen_backend: Some(CODEGEN.to_string()),
+                // its CUDA / HIP emitters serve every form
+                library_forms: engine::LibraryForms::ALL,
             },
             pools: PoolFacts {
                 adapter_banks: shell
@@ -897,6 +899,7 @@ impl Engine for Cuda {
             // CUDA states no bound on one submission (no watchdog on a
             // compute device).
             guest_cost: engine::GuestCost::default(),
+            mixed_lanes: engine::MixedLanes::Any,
         };
 
         // A fire's lanes, rows and readouts bound the scheduler's waves: a

@@ -167,6 +167,10 @@ pub(crate) struct Core {
 
     spare_fences: Mutex<Vec<vk::Fence>>,
 
+    /// The frame whose fenced submission went to the queue last: the
+    /// queue has emptied once it landed ([`Context::idle`]).
+    last: Mutex<std::sync::Weak<Inner>>,
+
     /// Command buffers whose frame was dropped off the thread that owns
     /// their pool, which a pool's own thread frees: a pool is not shared.
     orphans: Mutex<Vec<(vk::CommandPool, vk::CommandBuffer)>>,
@@ -313,6 +317,22 @@ impl Core {
 const FENCE_TIMEOUT_NS: u64 = 120_000_000_000;
 
 impl Core {
+    /// The bits of a timestamp the queue's family writes: 0 where it writes
+    /// none (or the device states no `timestampPeriod`).
+    fn stamp_bits(&self) -> u32 {
+        if self.limits.timestamp_period <= 0.0 {
+            return 0;
+        }
+        // SAFETY: `physical` is the instance's live physical device.
+        let families = unsafe {
+            self.instance
+                .get_physical_device_queue_family_properties(self.physical)
+        };
+        families
+            .get(self.family as usize)
+            .map_or(0, |family| family.timestamp_valid_bits)
+    }
+
     fn lend_fence(&self) -> Result<vk::Fence> {
         if let Some(fence) = self
             .spare_fences
@@ -1053,6 +1073,7 @@ impl Context {
                 pool,
             )])),
             spare_fences: Mutex::new(Vec::new()),
+            last: Mutex::new(std::sync::Weak::new()),
             orphans: Mutex::new(Vec::new()),
             family,
             memory,
@@ -1298,6 +1319,75 @@ impl Context {
         self.frame_with(false)
     }
 
+    /// Whether every submission made on the device so far has landed, read
+    /// now without waiting: the queue is empty. Frames run in queue order
+    /// (each begins with a barrier on all work before it), so the queue is
+    /// empty once the frame that submitted last has landed: dropped (a
+    /// submitted frame's drop waits its fence), seen landed by a wait, or
+    /// its fence signaled now.
+    #[must_use]
+    pub fn idle(&self) -> bool {
+        let last = self.core.last.lock().expect("last lock poisoned").upgrade();
+        let Some(last) = last else {
+            return true;
+        };
+        if last.landed.load(Ordering::Acquire) >= last.seq.load(Ordering::Acquire) {
+            return true;
+        }
+        // SAFETY: the fence lives as long as `last`; querying it needs no
+        // external sync.
+        let signaled =
+            unsafe { self.core.device.get_fence_status(last.fence) }.unwrap_or(false);
+        if signaled {
+            last.landed_now();
+        }
+        signaled
+    }
+
+    /// A frame whose device time [`Frame::commit_spanned`] reads back: a
+    /// timestamp written at the top of the pipe before its work and one at
+    /// the bottom after it, where the queue writes timestamps (its family's
+    /// `timestampValidBits` nonzero, a nonzero `timestampPeriod`); a plain
+    /// frame where it writes none.
+    pub fn spanned(&self) -> Result<Frame> {
+        self.spanned_with(true)
+    }
+
+    /// [`Context::spanned`] kept to replay ([`Frame::into_kept_spanned`],
+    /// [`Kept::replay_spanned`]): its timestamps' reset and writes recorded
+    /// with its work, so each replay writes them anew.
+    pub fn spanned_kept(&self) -> Result<Frame> {
+        self.spanned_with(false)
+    }
+
+    fn spanned_with(&self, one_time: bool) -> Result<Frame> {
+        let frame = self.frame_with(one_time)?;
+        let core = &self.core;
+        if core.stamp_bits() == 0 {
+            return Ok(frame);
+        }
+        let d = &core.device;
+        // SAFETY: `d` is live; the queue writes timestamps (checked above).
+        let pool = unsafe {
+            d.create_query_pool(
+                &vk::QueryPoolCreateInfo::default()
+                    .query_type(vk::QueryType::TIMESTAMP)
+                    .query_count(2),
+                None,
+            )
+        }
+        .map_err(|e| core.fault("vkCreateQueryPool", e))?;
+        let cmd = frame.inner.cmd();
+        // SAFETY: `cmd` is recording outside a render pass and only this
+        // frame records into it; the range is the pool's two queries.
+        unsafe {
+            d.cmd_reset_query_pool(cmd, pool, 0, 2);
+            d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, pool, 0);
+        }
+        *frame.inner.span.lock().expect("span lock poisoned") = Some(pool);
+        Ok(frame)
+    }
+
     fn frame_with(&self, one_time: bool) -> Result<Frame> {
         let core = &self.core;
         let d = &core.device;
@@ -1381,7 +1471,10 @@ impl Context {
                 keep: Mutex::new(Vec::new()),
                 submitted: std::sync::atomic::AtomicBool::new(false),
                 timing: Mutex::new(timing),
+                span: Mutex::new(None),
                 spare: Mutex::new(std::collections::HashMap::new()),
+                seq: std::sync::atomic::AtomicU64::new(0),
+                landed: std::sync::atomic::AtomicU64::new(0),
                 waiters: std::sync::atomic::AtomicU32::new(0),
                 most_waiters: std::sync::atomic::AtomicU32::new(0),
             }),
@@ -1436,7 +1529,16 @@ pub(crate) struct Inner {
 
     pub(crate) timing: Mutex<Option<Timing>>,
 
+    /// A spanned frame's two timestamps, before its work and after it
+    /// ([`Context::spanned`]).
+    span: Mutex<Option<vk::QueryPool>>,
+
     spare: Mutex<std::collections::HashMap<u64, Vec<vk::DescriptorSet>>>,
+
+    /// The fenced submissions of this frame so far, and the most of them
+    /// seen landed ([`Context::idle`]).
+    seq: std::sync::atomic::AtomicU64,
+    landed: std::sync::atomic::AtomicU64,
 
     /// Threads blocked on `fence` now, and the most at once.
     waiters: std::sync::atomic::AtomicU32,
@@ -1480,6 +1582,9 @@ impl Drop for Inner {
             if let Some(timing) = self.timing.get_mut().expect("timing lock poisoned").take() {
                 d.destroy_query_pool(timing.pool, None);
             }
+            if let Some(span) = self.span.get_mut().expect("span lock poisoned").take() {
+                d.destroy_query_pool(span, None);
+            }
             let owned = self
                 .core
                 .pools
@@ -1502,6 +1607,35 @@ impl Drop for Inner {
             }
         }
         self.core.return_fence(self.fence);
+    }
+}
+
+impl Inner {
+    /// The device's time between a spanned frame's two timestamps, ns, once
+    /// it landed; `None` for a frame that writes none.
+    fn span_ns(&self) -> Result<Option<u64>> {
+        let Some(pool) = *self.span.lock().expect("span lock poisoned") else {
+            return Ok(None);
+        };
+        let core = &self.core;
+        let mut ticks = [0u64; 2];
+        // SAFETY: the frame's fence was waited on, so both queries are
+        // written; `ticks` holds one u64 for each with `TYPE_64`.
+        unsafe {
+            core.device.get_query_pool_results(
+                pool,
+                0,
+                &mut ticks,
+                vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+            )
+        }
+        .map_err(|e| core.fault("vkGetQueryPoolResults", e))?;
+        let bits = core.stamp_bits();
+        let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+        let ticks = ticks[1].wrapping_sub(ticks[0]) & mask;
+        Ok(Some(
+            (ticks as f64 * f64::from(core.limits.timestamp_period)) as u64,
+        ))
     }
 }
 
@@ -1922,10 +2056,12 @@ impl Frame {
             // each wait) and the queue is held under its lock.
             unsafe { d.queue_submit(*queue, &submits, self.inner.fence) }
                 .map_err(|e| core.fault("vkQueueSubmit", e))?;
+            self.inner.submitted_now();
         }
         // SAFETY: the fence is this frame's own, just submitted.
         unsafe { d.wait_for_fences(&[self.inner.fence], true, FENCE_TIMEOUT_NS) }
             .map_err(|e| core.fault("vkWaitForFences", e))?;
+        self.inner.landed_now();
         // SAFETY: the wait returned success, so no submission names the fence.
         unsafe { d.reset_fences(&[self.inner.fence]) }
             .map_err(|e| core.fault("vkResetFences", e))?;
@@ -1997,6 +2133,7 @@ impl Frame {
         // frame's own unsignaled one, and the queue is held under its lock.
         unsafe { core.device.queue_submit(*queue, &submits, self.inner.fence) }
             .map_err(|e| core.fault("vkQueueSubmit", e))?;
+        self.inner.submitted_now();
         self.inner.submitted.store(true, Ordering::Release);
         Ok(())
     }
@@ -2019,6 +2156,45 @@ impl Frame {
         }
         .wait()?;
         Ok(started.elapsed().as_secs_f64())
+    }
+
+    /// Submits and waits: the device's time between the two timestamps a
+    /// [`Context::spanned`] frame writes, ns; `None` for another frame.
+    pub fn commit_spanned(mut self) -> Result<Option<u64>> {
+        self.stamp_end();
+        self.submit()?;
+        Pending {
+            inner: Arc::clone(&self.inner),
+            landing: None,
+        }
+        .wait()?;
+        self.inner.span_ns()
+    }
+
+    /// A spanned frame's closing timestamp, written while it is open.
+    fn stamp_end(&self) {
+        let span = *self.inner.span.lock().expect("span lock poisoned");
+        if let Some(pool) = span
+            && self.open
+        {
+            // SAFETY: the frame is open, so `cmd` is recording; query 1 of
+            // the pool was reset when the frame opened.
+            unsafe {
+                self.inner.core.device.cmd_write_timestamp(
+                    self.inner.cmd(),
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    pool,
+                    1,
+                );
+            }
+        }
+    }
+
+    /// A [`Context::spanned_kept`] frame, its closing timestamp written,
+    /// kept to replay ([`Kept::replay_spanned`]).
+    pub fn into_kept_spanned(self) -> Result<Kept> {
+        self.stamp_end();
+        self.into_kept()
     }
 
     pub fn into_kept(mut self) -> Result<Kept> {
@@ -2088,6 +2264,7 @@ impl Kept {
             // SAFETY: the fence is this kept frame's own.
             unsafe { d.wait_for_fences(&[self.inner.fence], true, FENCE_TIMEOUT_NS) }
                 .map_err(|e| core.fault("vkWaitForFences", e))?;
+            self.inner.landed_now();
         }
         // SAFETY: no pending submission names the fence (waited above, or
         // the last one was a segment, waited and reset below).
@@ -2103,12 +2280,21 @@ impl Kept {
             // held under its lock.
             unsafe { d.queue_submit(*queue, &submits, self.inner.fence) }
                 .map_err(|e| core.fault("vkQueueSubmit", e))?;
+            self.inner.submitted_now();
         }
         // SAFETY: the fence is this frame's own, just submitted.
         unsafe { d.wait_for_fences(&[self.inner.fence], true, FENCE_TIMEOUT_NS) }
             .map_err(|e| core.fault("vkWaitForFences", e))?;
+        self.inner.landed_now();
         // SAFETY: the wait returned, so no submission names the fence.
         unsafe { d.reset_fences(&[self.inner.fence]) }.map_err(|e| core.fault("vkResetFences", e))
+    }
+
+    /// Replays a [`Frame::into_kept_spanned`] frame and waits: the device's
+    /// time between its timestamps, ns (`None` where it writes none).
+    pub fn replay_spanned(&self) -> Result<Option<u64>> {
+        self.replay(None)?.wait()?;
+        self.inner.span_ns()
     }
 
     pub fn replay(
@@ -2128,6 +2314,7 @@ impl Kept {
             // SAFETY: the fence is this kept frame's own.
             unsafe { d.wait_for_fences(&[self.inner.fence], true, FENCE_TIMEOUT_NS) }
                 .map_err(|e| core.fault("vkWaitForFences", e))?;
+            self.inner.landed_now();
         }
         // SAFETY: any previous submission has signaled (waited above), so no
         // pending submission names the fence.
@@ -2142,6 +2329,7 @@ impl Kept {
             // unsignaled, and the queue is held under its lock.
             unsafe { d.queue_submit(*queue, &submits, self.inner.fence) }
                 .map_err(|e| core.fault("vkQueueSubmit", e))?;
+            self.inner.submitted_now();
         }
         self.inner.submitted.store(true, Ordering::Release);
         if let Some(at) = at {
@@ -2259,7 +2447,24 @@ impl Inner {
                 .wait_for_fences(&[self.fence], true, FENCE_TIMEOUT_NS)
         };
         self.waiters.fetch_sub(1, Ordering::AcqRel);
+        if result.is_ok() {
+            self.landed_now();
+        }
         result
+    }
+
+    /// A fenced submission of this frame went to the queue: the device's
+    /// last ([`Context::idle`]).
+    fn submitted_now(self: &Arc<Self>) {
+        self.seq.fetch_add(1, Ordering::AcqRel);
+        *self.core.last.lock().expect("last lock poisoned") = Arc::downgrade(self);
+    }
+
+    /// This frame's fence was seen signaled: every submission of it so far
+    /// has landed.
+    fn landed_now(&self) {
+        self.landed
+            .fetch_max(self.seq.load(Ordering::Acquire), Ordering::AcqRel);
     }
 
     fn harvest_timing(&self) {

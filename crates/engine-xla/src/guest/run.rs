@@ -123,7 +123,7 @@ pub struct Stages {
     /// (`Shell::guest_planes`): output, rows, width, layers, readout flag,
     /// dtype. A registration's outputs are checked against these, and each
     /// stage compiled for them.
-    pub planes: Vec<(String, u32, u32, u32, bool, Dtype)>,
+    pub planes: Vec<(String, u32, u32, u32, bool, Dtype, bool)>,
     /// Stages a fire compiled (`Stages::get` past `compile_all`): a defect.
     pub fire_compiles: u64,
 }
@@ -458,6 +458,7 @@ impl Stages {
                         layers: p.3,
                         width: p.2,
                         dtype: p.5,
+                        normal: p.6,
                     })
                     .collect();
                 combos = combos
@@ -641,6 +642,7 @@ pub fn batch_of(
                     layers: plane.layers,
                     width: plane.width,
                     dtype: plane.dtype,
+                    normal: plane.normal,
                 })
             })
             .collect()
@@ -686,6 +688,11 @@ fn encode(value: &Value, dtype: Dtype, n: usize, out: &mut Vec<u32>) -> Result<(
                 }
             }
         }
+        // two to a word, element `2w` in the low half (`eta_ir::types`)
+        Value::Bf16(v) => out.extend(
+            v.chunks(2)
+                .map(|pair| u32::from(pair[0]) | pair.get(1).map_or(0, |&h| u32::from(h) << 16)),
+        ),
     }
     Ok(())
 }
@@ -694,6 +701,11 @@ fn decode(words: &[u32], dtype: Dtype, n: usize) -> Value {
     match dtype {
         Dtype::F32 => Value::F32(words[..n].iter().map(|&w| f32::from_bits(w)).collect()),
         Dtype::I32 => Value::I32(words[..n].iter().map(|&w| w as i32).collect()),
+        Dtype::Bf16 => Value::Bf16(
+            (0..n)
+                .map(|j| (words[j / 2] >> (16 * (j % 2))) as u16)
+                .collect(),
+        ),
         Dtype::Bool => Value::Bool(
             (0..n)
                 .map(|j| (words[j / 32] >> (j % 32)) & 1 != 0)

@@ -36,7 +36,10 @@ pub mod runahead;
 pub mod transfer;
 
 pub use adapter::{AdapterPlane, AdapterRegistration};
-pub use caps::{Capabilities, DeviceFacts, FireLimits, GuestCost, PoolFacts};
+pub use caps::{
+    Capabilities, DeviceFacts, FireLimits, GuestCost, LibraryForms, MixedLanes, MixedRung,
+    PoolFacts,
+};
 pub use channel::{ChannelId, ChannelRegistration, ChannelSeed, HostMirror, RegisteredChannel};
 pub use chunk::{
     ChunkFacts, ChunkRun, ChunkTable, Evacuation, Growth, Pinned, Reserved, ReservedRun,

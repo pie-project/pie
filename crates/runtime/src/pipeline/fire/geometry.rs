@@ -885,6 +885,10 @@ pub(crate) fn value_as_u32(value: &eta_compiler::eval::interp::Value) -> Vec<u32
         Value::I32(v) => v.iter().map(|&x| x as u32).collect(),
         Value::F32(v) => v.iter().map(|&x| x as u32).collect(),
         Value::Bool(v) => v.iter().map(|&b| b as u32).collect(),
+        Value::Bf16(v) => v
+            .iter()
+            .map(|&b| eta_ir::types::bf16_to_f32(b) as u32)
+            .collect(),
     }
 }
 

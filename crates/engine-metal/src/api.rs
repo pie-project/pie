@@ -664,6 +664,7 @@ impl Engine for Metal {
                 storage_alignment: 256,
                 storage_max_tile_bytes: shell.max_buffer(),
                 codegen_backend: Some("metal".to_string()),
+                library_forms: eta_compiler::codegen::metal::LIBRARY_FORMS,
             },
             pools,
             chunks,
@@ -702,6 +703,7 @@ impl Engine for Metal {
             // Metal states no bound on one submission yet
             // (`crate::rates::at_load`).
             guest_cost: engine::GuestCost::default(),
+            mixed_lanes: engine::MixedLanes::Any,
         };
 
         // Every pipeline the load's rungs dispatch is built now, before
