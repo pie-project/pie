@@ -1,5 +1,6 @@
 //! engine-xla's integration tests, one binary: each module was a test file.
 
+mod a_carried_conv_step_matches_the_sequential_window;
 mod a_carried_gdn_step_matches_the_sequential_fold;
 mod common;
 mod common_dit;

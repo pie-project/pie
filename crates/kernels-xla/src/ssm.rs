@@ -18,6 +18,7 @@
 //! after it.
 
 pub mod carried;
+pub mod carried_conv;
 mod chunk;
 mod conv_step;
 pub mod dyn_conv;
