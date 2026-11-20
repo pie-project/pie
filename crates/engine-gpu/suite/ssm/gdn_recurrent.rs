@@ -9,7 +9,7 @@ use kernels_slang::Tensor;
 use kernels_slang::ssm::gdn_recurrent::Tactic;
 use poem_ir::Dtype;
 
-use crate::gpu::{CSR_AT, Gpu, Out, csr_at, landed, lane_cuts, noise, row_cuts};
+use crate::gpu::{CSR_AT, Gpu, Out, committed_batches, csr_at, landed, lane_cuts, noise, row_cuts};
 
 const SLOTS: usize = 3;
 
@@ -357,34 +357,52 @@ fn the_gdn_recurrence_answers_the_reference() {
                 lane0: lane0 as u32,
             };
             let work = 5 * slab;
-            let work_t = |buf: u32| t(buf, 5, slab, Dtype::F32);
+            // The window's 4 lanes in one dispatch, and in dispatches of a
+            // work plane holding 2 and 1 of them.
             for at in CSR_AT {
-                let csr = csr_at(&mut gpu, &indptr, at);
-                landed(
-                    &mut gpu,
-                    &format!("{} csr at {at}", what("committed")),
-                    &fresh(rows, work),
-                    &[want_y.clone(), want_s.clone()],
-                    &|g, o| {
-                        g.run(|c| {
-                            kernels_slang::ssm::gdn_recurrent::gated_delta_committed(
-                                c,
-                                tactic,
-                                qkv,
-                                csr,
-                                &committed,
-                                gates,
-                                &pool(o[1].0, sb, 5),
-                                work_t(o[2].0),
-                                kh,
-                                vh,
-                                dk,
-                                dv,
-                                y(o[0].0, rows),
-                            )
-                        })
-                    },
-                );
+                for batch in [4u32, 2, 1] {
+                    let csr = csr_at(&mut gpu, &indptr, at);
+                    let batches = committed_batches(4, batch, &replay, lane0 as u32);
+                    landed(
+                        &mut gpu,
+                        &format!(
+                            "{} csr at {at}, {batch} lane(s) a dispatch",
+                            what("committed")
+                        ),
+                        &fresh(rows, work),
+                        &[want_y.clone(), want_s.clone()],
+                        &|g, o| {
+                            g.run(|c| {
+                                for &(first, lanes, row0) in &batches {
+                                    kernels_slang::ssm::gdn_recurrent::gated_delta_committed(
+                                        c,
+                                        tactic,
+                                        qkv,
+                                        kernels_slang::ssm::Csr {
+                                            at: csr.at + first,
+                                            lanes,
+                                            ..csr
+                                        },
+                                        &kernels_slang::ssm::Committed {
+                                            lane0: committed.lane0 + first,
+                                            ..committed
+                                        },
+                                        gates,
+                                        &pool(o[1].0, sb, 5),
+                                        t(o[2].0, batch as usize, slab, Dtype::F32),
+                                        kh,
+                                        vh,
+                                        dk,
+                                        dv,
+                                        y(o[0].0, rows),
+                                        row0,
+                                    )?;
+                                }
+                                Ok(())
+                            })
+                        },
+                    );
+                }
             }
         }
     }

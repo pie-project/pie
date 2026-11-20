@@ -295,6 +295,30 @@ pub fn row_cuts(rows: u32) -> Vec<Vec<kernels_slang::ssm::RowSpan>> {
     cuts
 }
 
+/// A committed scan's dispatches over `lanes` lanes of a work plane holding
+/// `batch` (the engine's `committed_batches`): each one's first lane, its
+/// lanes, and the extended row its first lane starts at, past the rows the
+/// lanes before it replay (`replay[lane0 + lane]`).
+#[must_use]
+pub fn committed_batches(
+    lanes: u32,
+    batch: u32,
+    replay: &[i32],
+    lane0: u32,
+) -> Vec<(u32, u32, u32)> {
+    let mut out = Vec::new();
+    let (mut first, mut row0) = (0u32, 0u32);
+    while first < lanes {
+        let n = batch.min(lanes - first);
+        out.push((first, n, row0));
+        for lane in first..first + n {
+            row0 += replay[(lane0 + lane) as usize].max(0) as u32;
+        }
+        first += n;
+    }
+    out
+}
+
 /// A fire's requests (`indptr`) walked whole, and cut in two windows at a
 /// lane: each window's first row and its own CSR, rebased to it, as a
 /// window states them.

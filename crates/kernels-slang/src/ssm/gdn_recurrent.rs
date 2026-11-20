@@ -230,10 +230,12 @@ pub fn gated_delta_committed(
     k_dim: u32,
     v_dim: u32,
     y: Tensor,
+    row0: u32,
 ) -> Result<(), Error> {
     const OP: &str = "ssm.gated_delta_committed";
     dtype_dispatch!(OP, qkv.dtype, { Bf16 => () });
     let heads = Heads::of(OP, qkv, gates, y, k_heads, v_heads, k_dim, v_dim)?;
+    super::work_holds(OP, work, csr)?;
     let kernel = |rows: u32| {
         scan_kernel(
             OP,
@@ -269,7 +271,7 @@ pub fn gated_delta_committed(
                 vh,
                 kd,
                 vd,
-                0u32.arg(),
+                row0.arg(),
             ],
             &[csr.at.arg()],
             &state.snap_lane0(OP)?,

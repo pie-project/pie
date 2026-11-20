@@ -1840,17 +1840,23 @@ impl<B: Serve> Shell<B> {
         let readout = (0..arms)
             .map(|_| B::Buffer::host(&device, readout_bytes, crate::books::owners::READOUT))
             .collect::<Result<Vec<_>>>()?;
-        // The recurrent planes and work plane, for the top rung's rows and
-        // lanes: reservations of their own beside the span
-        // ([`crate::rs::Reservation`]).
+        // The recurrent planes, for the top rung's rows, and the work plane,
+        // for the lanes one committed dispatch fills the device with (its
+        // workgroups are lanes times the scan's heads): reservations of their
+        // own beside the span ([`crate::rs::Reservation`]); a fire of more
+        // lanes takes as many dispatches.
         let rs_held = match rs_layout.as_deref() {
             Some(layout) => {
                 let top = span.rungs().last().map_or(1, |rung| rung.tokens);
+                let fills = tuning
+                    .sdpa_split_groups()
+                    .div_ceil(layout.work_heads.max(1))
+                    .clamp(1, top.min(boot.budget.max_lanes).max(1));
                 Some(crate::rs::Reservation::lay(
                     &device,
                     layout,
                     top.saturating_mul(2),
-                    top.min(boot.budget.max_lanes),
+                    fills,
                     device.max_buffer(),
                 )?)
             }
@@ -6041,12 +6047,12 @@ impl<B: Serve> Shell<B> {
         // Where the trace buffers a recurrence, a lane buffering its rows at
         // each power of two of rows: the committed scans bind the rung's
         // recurrent planes, which every speculative fire of the rung binds.
-        // Its lanes buffer a page of rows each, as speculative lanes buffer
-        // few, so a rung's rows spread over as many lanes as they take. A
-        // rung's fires extend past half its tokens and up to twice them, so
-        // each rung is walked at the least rows that choose it and at its
-        // tokens (a scan's kernel follows the rows), and once with a lane
-        // replaying a page it carries (the buffer's rows gathered back).
+        // A lane buffering its rows at each rung's least rows and at its
+        // tokens (a rung's fires extend past half its tokens and up to twice
+        // them, and a scan's kernel follows the rows; the planes and the
+        // work plane are one view whatever the lanes), and one replaying a
+        // page it carries (the buffer's rows gathered back). One lane each:
+        // what binds is the rung and the rows, never the lanes.
         let rs_shapes = shapes.len();
         let mut carried = vec![0u32; shapes.len()];
         if let Some(rs) = self
@@ -6054,26 +6060,18 @@ impl<B: Serve> Shell<B> {
             .as_ref()
             .filter(|_| self.rs_layout.is_some())
         {
-            let page = u64::from(rs.page_tokens());
+            let page = rs.page_tokens();
             for class in (0..self.compiled.classes.classes.len()).filter(|&c| !self.captures(c)) {
-                let mut tokens = 1u64;
-                while tokens <= u64::from(top) {
+                let mut tokens = 1u32;
+                while tokens <= top {
                     for rows in [tokens / 2 + 1, tokens] {
-                        let lanes = rows.div_ceil(page).min(u64::from(lanes_cap)).max(1);
-                        shapes.push(
-                            (0..lanes)
-                                .map(|at| {
-                                    let own = spread(rows, lanes, at);
-                                    (class, u32::try_from(own).unwrap_or(u32::MAX))
-                                })
-                                .collect(),
-                        );
+                        shapes.push(vec![(class, rows)]);
                         carried.push(0);
                     }
                     tokens = tokens.saturating_mul(2);
                 }
                 shapes.push(vec![(class, 1)]);
-                carried.push(u32::try_from(page).unwrap_or(u32::MAX));
+                carried.push(page);
             }
         }
         let depth = self.arms.depth();

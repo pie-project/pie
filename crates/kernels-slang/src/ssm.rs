@@ -182,6 +182,21 @@ fn csr_lanes(op: &'static str, what: &str, indptr: Tensor) -> Result<u32, Error>
     }
 }
 
+/// Refuses a committed dispatch of more lanes than its work plane holds:
+/// a fire's lanes take as many dispatches as the plane holds lanes.
+fn work_holds(op: &'static str, work: Tensor, csr: Csr) -> Result<(), Error> {
+    if csr.lanes > work.rows {
+        return Err(refuse(
+            op,
+            format!(
+                "a dispatch of {} lanes, and the work plane holds {}",
+                csr.lanes, work.rows
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// The rows a window's dispatch walks of the fire's whole row tensors: from
 /// fire row `row0`, `rows` of them. The tensors are bound whole, one view
 /// whatever window a fire cuts; the kernels add `row0` to each row.

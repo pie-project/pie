@@ -316,7 +316,9 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 #endif
     }
 #else
-    uint state_base = (lane * uint(params.v_heads) + hv) * head;
+    // The work plane holds the dispatch's lanes, the lane's at its own `r`:
+    // a fire's lanes take as many dispatches as the plane holds lanes.
+    uint state_base = (r * uint(params.v_heads) + hv) * head;
     // A row of the head's state lies in one segment: found once a row.
     for (uint c = tid; c < dv; c += uint(PIE_GROUP_X)) {
         uint seg, at;
