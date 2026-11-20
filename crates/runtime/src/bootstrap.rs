@@ -354,6 +354,10 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         })
         .collect::<Result<Vec<::engine::ReadoutFacts>>>()?;
 
+    // The frame size and depth, before anything reads a channel's capacity
+    // (`scheduler::channel_capacity`): the standard samplers' prewarm below
+    // traces its programs at the capacity a request's programs take.
+    crate::scheduler::set_frame_size(scheduler.frame_size as usize);
     crate::scheduler::set_dispatch_depth(scheduler.frame_dispatch_depth as usize);
     // A model with fixed recurrent state is admitted by its planner, which
     // charges each process the fixed set its working set holds against the
@@ -849,8 +853,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     crate::scheduler::set_silence_timeout(std::time::Duration::from_secs(
         scheduler.silence_timeout_secs,
     ));
-    crate::scheduler::set_frame_size(scheduler.frame_size as usize);
-    crate::scheduler::set_dispatch_depth(scheduler.frame_dispatch_depth as usize);
     let scheduler_shutdown = crate::scheduler::spawn(&engines, kv_page_size as u32).await?;
     // Each engine takes the weight residency it starts with before the load
     // returns, so before any fire is submitted: none reads from the host a
