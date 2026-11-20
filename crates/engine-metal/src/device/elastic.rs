@@ -1159,6 +1159,7 @@ fn make_chunk(sparse: &Sparse, bytes: u64) -> Result<Chunk> {
     descriptor.setSize(usize_of(bytes));
     descriptor.setMaxCompatiblePlacementSparsePageSize(MTLSparsePageSize::Size256);
 
+    crate::diag::made("placement heap", bytes);
     let heap = sparse
         .device()
         .newHeapWithDescriptor(&descriptor)
@@ -1211,6 +1212,7 @@ pub fn create(sparse: &Arc<Sparse>, arena: &Arena, len: u64) -> Result<Elastic> 
         });
     }
     let virtual_bytes = tiles_up(len);
+    crate::diag::made("sparse buffer", virtual_bytes);
     // SAFETY: the length is a whole number of tiles at the page size given,
     // which is what this call requires; nothing is mapped yet, so there is no
     // aliasing to violate.
