@@ -26,6 +26,14 @@ pub enum Role {
     M2Dt,
 
     M2Z,
+
+    /// A gated-delta row's raw keys (bf16, `k_heads · k_dim`): what the
+    /// state + buffer step reads a carried row's key by.
+    GdnK,
+
+    /// A gated-delta row's corrected value `u` (f32, `v_heads · v_dim`):
+    /// what the step reads a carried row's update by and folds it with.
+    GdnU,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -110,6 +118,9 @@ impl Layout {
         let mut plane_keys: HashMap<(u32, Role), usize> = HashMap::new();
         let mut region_keys: HashMap<(u32, &'static str), usize> = HashMap::new();
         let mut gates_cache: HashMap<u32, u32> = HashMap::new();
+        // the planes no trace value carries whole (a gated-delta row's keys
+        // and corrected values), each once a cache
+        let mut laid: std::collections::HashSet<(u32, Role)> = std::collections::HashSet::new();
 
         let mut plane = |layout: &mut Layout,
                          cache: u32,
@@ -198,8 +209,24 @@ impl Layout {
                     },
                 ) => {
                     let cache = cache_of(trace, *state)?;
-                    let _ = k_heads;
                     gates_cache.insert(gates.0, cache);
+                    // the step reads a carried row as a linear attention:
+                    // its raw keys and corrected values ride the buffer
+                    for (role, width, dtype, bytes) in [
+                        (Role::GdnK, k_heads * k_dim, Dtype::Bf16, 2u64),
+                        (Role::GdnU, v_heads * v_dim, Dtype::F32, 4u64),
+                    ] {
+                        if !laid.insert((cache, role)) {
+                            continue;
+                        }
+                        layout.planes.push(Plane {
+                            cache,
+                            role,
+                            width,
+                            dtype,
+                            row_bytes: u64::from(width) * bytes,
+                        });
+                    }
                     region(&mut layout, cache, "scan", *y)?;
                     layout.work_elems = layout
                         .work_elems
