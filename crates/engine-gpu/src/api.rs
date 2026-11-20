@@ -934,6 +934,8 @@ where
                 storage_max_tile_bytes: shell.max_buffer(),
 
                 codegen_backend: None,
+                // what it planned with before forms were stated: every form
+                library_forms: engine::LibraryForms::ALL,
             },
             pools,
             chunks,

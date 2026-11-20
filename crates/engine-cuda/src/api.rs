@@ -844,6 +844,8 @@ impl Engine for Cuda {
                 storage_alignment: 256,
                 storage_max_tile_bytes: u64::MAX,
                 codegen_backend: Some(CODEGEN.to_string()),
+                // its CUDA / HIP emitters serve every form
+                library_forms: engine::LibraryForms::ALL,
             },
             pools: PoolFacts {
                 adapter_banks: shell

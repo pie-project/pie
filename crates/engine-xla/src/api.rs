@@ -568,6 +568,12 @@ impl Engine for Xla {
                 storage_alignment: 256,
                 storage_max_tile_bytes: u64::MAX,
                 codegen_backend: None,
+                // its guest lowering (`guest::lower`) lowers a draw over a
+                // top-p / top-k cut and a bf16 row's cut as one region each
+                library_forms: engine::LibraryForms {
+                    draw: true,
+                    bf16_cut: true,
+                },
             },
             pools,
             chunks,
