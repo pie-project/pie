@@ -934,8 +934,12 @@ where
                 storage_max_tile_bytes: shell.max_buffer(),
 
                 codegen_backend: None,
-                // what it planned with before forms were stated: every form
-                library_forms: engine::LibraryForms::ALL,
+                // The WGSL emitter compiles a program's steps from its ops and
+                // has no library regions: no form is served as a library call.
+                library_forms: engine::LibraryForms {
+                    draw: false,
+                    bf16_cut: false,
+                },
             },
             pools,
             chunks,
