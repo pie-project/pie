@@ -329,19 +329,63 @@ impl ResidencyPlanner {
         let planner = self.clone();
         crate::rt::spawn(async move {
             loop {
-                let woke =
-                    crate::rt::time::timeout(super::plan::STALL_SAYS_AGAIN, notify.notified())
-                        .await
-                        .is_ok();
-                if woke {
+                // With no one queued it sleeps until a poke (an enqueue
+                // pokes, so the first waiter is seen at once).
+                if planner.returns.waiters.load(Ordering::Acquire) == 0 {
+                    notify.notified().await;
                     planner.plan();
-                } else if planner.returns.waiters.load(Ordering::Acquire) != 0 {
-                    // Quiet a while with someone queued: a stall goes on
-                    // being said, nothing planned for it.
-                    planner.dump_stall();
+                    continue;
+                }
+                let policy = crate::policy::pressure::answered();
+                tokio::pin!(policy);
+                policy.as_mut().enable();
+                tokio::select! {
+                    () = notify.notified() => planner.plan(),
+                    // The policy answered a shortfall: what it freed (or
+                    // the grow, commit or move the last pass found no way
+                    // to) is planned on now.
+                    () = &mut policy => planner.plan(),
+                    _ = crate::rt::time::timeout(
+                        crate::policy::pressure::AGAIN,
+                        std::future::pending::<()>(),
+                    ) => planner.tick(),
                 }
             }
         });
+    }
+
+    /// The drain task's beat while anyone waits, once a
+    /// [`crate::policy::pressure::AGAIN`] for the whole planner, never one
+    /// per waiter: a shortfall that stands is said again (the default
+    /// responder looks again when its last discard freed too little),
+    /// fires stood unsettled past their window are noted (a fleet that
+    /// stalls so is planned for), a waiter whose need the pool shrank under
+    /// is woken to be refused, and a stall that goes on is said again. It
+    /// plans nothing on the clock: events plan.
+    pub(super) fn tick(self: &Arc<Self>) {
+        self.report_short();
+        self.note_lapsed_fires();
+        // One read of the queue, as `never_fits` reads each need.
+        let (_, total) = self.port.device_stats();
+        let past: Vec<Arc<Notify>> = self.with_inner(|inner| {
+            inner
+                .queue
+                .values()
+                .filter(|waiter| waiter.is_unmet())
+                .filter_map(|waiter| match &waiter.kind {
+                    WaitKind::Allocation { notify, .. }
+                        if waiter.kv_need().saturating_add(inner.room_pages(waiter)) > total =>
+                    {
+                        Some(notify.clone())
+                    }
+                    _ => None,
+                })
+                .collect()
+        });
+        for notify in past {
+            notify.notify_waiters();
+        }
+        self.dump_stall();
     }
 
     pub(super) fn poke(self: &Arc<Self>) {

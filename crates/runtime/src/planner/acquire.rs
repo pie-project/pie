@@ -274,22 +274,18 @@ impl ResidencyPlanner {
                             continue;
                         }
                         Collect::Wait => {
-                            let again = crate::policy::pressure::AGAIN;
-                            let woke = tokio::select! {
-                                () = &mut notified => true,
-                                () = &mut returned => true,
-                                _ = crate::rt::time::timeout(again, std::future::pending::<()>()) => false,
-                            };
-                            if self.returns.epoch() != seen {
-                                self.poke();
+                            // Events alone wake it: its own notify, room a
+                            // dropped grant gave back, or the drain task's
+                            // tick finding its need past the pool
+                            // ([`ResidencyPlanner::tick`]). On a 100 ms
+                            // timer each parked waiter woke, re-reported
+                            // and planned ten times a second, hundreds of
+                            // them under pressure.
+                            tokio::select! {
+                                () = &mut notified => {}
+                                () = &mut returned => {}
                             }
-                            if !woke {
-                                // Each re-report plans again too, as the
-                                // give-up's check did: a grow, a commit or a
-                                // move the last pass found no way to is
-                                // tried again on the pool as it stands now.
-                                self.report_short();
-                                self.note_lapsed_fires();
+                            if self.returns.epoch() != seen {
                                 self.poke();
                             }
                             let Some(error) = self.never_fits(key) else {
