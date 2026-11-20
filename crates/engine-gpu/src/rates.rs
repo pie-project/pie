@@ -262,14 +262,28 @@ fn first_fire_estimate(n: u32, k: u32, launch: f64, bytes_per_ns: f64) -> f64 {
     launch + 2.0 * f64::from(n) * f64::from(k) / bytes_per_ns.max(f64::MIN_POSITIVE)
 }
 
+/// The weight planes a kernel's curve at an `n x k` plane rotates through:
+/// `engine::rates::weights_at`'s (past the last-level cache), but one where
+/// the plane alone passes every last-level cache served (a third of
+/// `engine::rates::WEIGHT_BYTES`): read cold every fire by itself, as an
+/// output head is.
+fn shape_planes(n: u32, k: u32) -> usize {
+    let plane = 2 * n as usize * k as usize;
+    if plane > engine::rates::WEIGHT_BYTES / 3 {
+        1
+    } else {
+        weights_at(n, k)
+    }
+}
+
 /// Whether a rates matmul at `m x n x k` may be laid: no operand past the
 /// device's `largest` buffer, and the set (its activation, the weight planes
-/// it rotates through, its result; bf16) within the room the load admitted
-/// the rates step to lay (`engine::rates::step_bytes`).
+/// it rotates through, [`shape_planes`]; its result; bf16) within the room
+/// the load admitted the rates step to lay (`engine::rates::step_bytes`).
 fn operands_fit(m: u32, n: u32, k: u32, largest: u64) -> bool {
     let (m64, n64, k64) = (u64::from(m), u64::from(n), u64::from(k));
     let (act, plane, y) = (2 * m64 * k64, 2 * n64 * k64, 2 * m64 * n64);
-    let set = act + engine::rates::weights_at(n, k) as u64 * plane + y;
+    let set = act + shape_planes(n, k) as u64 * plane + y;
     act.max(plane).max(y) <= largest && set <= engine::rates::step_bytes()
 }
 
@@ -311,6 +325,12 @@ fn curve_of(
     }
     Ok((points, None))
 }
+
+/// The device time a point of a kernel's curve at a shape fills with its
+/// fires' frame (`Rig::budgeted`): enough fires that a submission's own
+/// time is a small part of it, few enough that a curve's points take
+/// milliseconds each.
+const POINT_NS: f64 = 2e6;
 
 /// The matmul a launch is timed with: its work is nothing beside a launch.
 pub const LAUNCH: u32 = 16;
@@ -669,6 +689,49 @@ impl<'a, B: Serve> Rig<'a, B> {
     /// rate stops moving (`engine::rates::warmed_frames`, every engine's
     /// rule; the device's `max_submit` the only cap), the host's clock around
     /// each frame's one submit.
+    /// The current step's fire's ns at a point of a kernel's curve at a
+    /// shape (`measure_shapes`): its sets touched once (`touched`, shared by
+    /// every point over them), one warm fire untimed, one fire timed, then
+    /// one frame of as many fires as the step's estimate says fill
+    /// [`POINT_NS`] of the device (as many as fit the bound), the fire's time
+    /// the two frames' difference over the fires between (the device's
+    /// span where the backend times one, else the host's clock).
+    fn budgeted(
+        &self,
+        timer: Timer<'_, B>,
+        touched: &Touched,
+        sets: usize,
+        fire: &dyn Fn(&kernels_slang::Ctx<'_>) -> Result<()>,
+    ) -> Result<u64> {
+        let nothing = |_: &mut B::Frame| Ok(());
+        let fitted = |n: u32| -> Result<f64> {
+            let m = self.fitting(n)?;
+            self.frame(timer, m, fire, &nothing)
+                .map(|(_, w)| w as f64 * f64::from(n) / f64::from(m))
+        };
+        engine::rates::touch_once(
+            touched,
+            self.admitting(),
+            u32::try_from(sets).unwrap_or(u32::MAX),
+            &mut |n| fitted(n),
+        )?;
+        self.fitting(1)?;
+        self.frame(timer, 1, fire, &nothing)?;
+        let (span, host) = self.frame(timer, 1, fire, &nothing)?;
+        let estimate = self.per_fire.get().unwrap_or(POINT_NS).max(1.0);
+        let wanted = (POINT_NS / estimate).ceil().clamp(2.0, f64::from(u32::MAX)) as u32;
+        let count = self.fitting(wanted)?;
+        if count < 2 {
+            return Ok(span.unwrap_or(host).max(1));
+        }
+        let (many_span, many_host) = self.frame(timer, count, fire, &nothing)?;
+        let (one, many) = match (span, many_span) {
+            (Some(one), Some(many)) => (one, many),
+            _ => (host, many_host),
+        };
+        Ok((many.saturating_sub(one) / u64::from(count - 1)).max(1))
+    }
+
     fn each(
         &self,
         timer: Timer<'_, B>,
@@ -849,7 +912,7 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
         let laid = match most {
             Some(most) => {
                 let act = rig.operand(most, k, Dtype::Bf16)?;
-                let weights = (0..weights_at(n, k))
+                let weights = (0..shape_planes(n, k))
                     .map(|_| rig.operand(n, k, Dtype::Bf16))
                     .collect::<Result<Vec<Tensor>>>()?;
                 let y = rig.zeros(most, n, Dtype::Bf16)?;
@@ -876,7 +939,7 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
                         weights,
                         Tensor { rows: m, ..*y },
                     ),
-                    &touched,
+                    Some(&touched),
                     launch,
                     Some(estimate),
                 );
@@ -1626,7 +1689,7 @@ fn matmul<B: Serve>(
         tactic,
         timer,
         (act, &weights, y),
-        &Touched::default(),
+        None,
         launch,
         estimate,
     )
@@ -1640,18 +1703,24 @@ fn matmul_on<B: Serve>(
     tactic: kernels_slang::linear::gemm::Tactic,
     timer: Timer<'_, B>,
     (act, weights, y): (Tensor, &[Tensor], Tensor),
-    touched: &Touched,
+    touched: Option<&Touched>,
     launch: f64,
     estimate: Option<f64>,
 ) -> Result<f64> {
     let (m, n, k) = (act.rows, y.width, act.width);
     let next = std::cell::Cell::new(0usize);
     rig.step(format!("matmul {m}x{n}x{k}"), estimate);
-    let ns = rig.each(timer, touched, weights.len(), &|sink| {
+    let fire = |sink: &kernels_slang::Ctx<'_>| {
         let w = weights[next.get() % weights.len()];
         next.set(next.get() + 1);
         kernels_slang::linear::gemm::matmul(sink, tactic, act, w, y).map_err(fault("rates: matmul"))
-    })?;
+    };
+    // A curve's point (its planes' touch shared) to a small device budget;
+    // a rate of the device's own, settled over repeated rounds.
+    let ns = match touched {
+        Some(touched) => rig.budgeted(timer, touched, weights.len(), &fire)?,
+        None => rig.each(timer, &Touched::default(), weights.len(), &fire)?,
+    };
     engine::rates::rate_from(
         &format!("matmul {m}x{n}x{k}"),
         ns as f64,
@@ -2072,6 +2141,18 @@ mod curve_tests {
         )
         .unwrap();
         assert_eq!(stop, Some((2, profile::fire::KernelCurve::BEATEN)));
+    }
+
+    /// A plane past every last-level cache (an output head) is timed over
+    /// itself alone; a layer's plane rotates through enough copies to pass
+    /// the cache, as every rate's does.
+    #[test]
+    fn a_head_is_timed_over_one_plane() {
+        assert_eq!(shape_planes(151_936, 1024), 1);
+        assert_eq!(shape_planes(1024, 2048), weights_at(1024, 2048));
+        assert!(shape_planes(1024, 2048) > 1);
+        // Its operands at a few rows fit the room the rates step was admitted.
+        assert!(operands_fit(16, 151_936, 1024, u64::MAX));
     }
 
     /// The rows a shape's curves are timed at: every power of four, then the
