@@ -697,31 +697,33 @@ pub struct RoleCopy {
 }
 
 /// The disk tier's slot file, for the live parts of parked items no host
-/// tier holds (a load on unified memory states none): a role slot lies
-/// whole in a run of `span` adjacent slots of the file, `span` the kv list
-/// slots its bytes take (one where it is no wider), named by the run's
-/// first slot (CONTRACT-BC 22). The kv store's disk slots, taken and given
-/// back through it, counted against the disk's budget with kv's.
+/// tier holds (a load on unified memory states none). A disk chunk is laid
+/// out as the device's (CONTRACT-BC 22): a role shape's slots lie in a disk
+/// chunk of their own, a slot's disk ref `chunk * slots a chunk + index`,
+/// as the engine places it. The chunks are the kv store's disk slots, taken
+/// whole and given back whole through it, counted against the disk's budget
+/// with kv's.
 pub trait DiskSlots: Send + Sync {
-    /// `n` runs of `span` adjacent free slots of the file, as each run's
-    /// first slot; all or none.
-    fn take(&self, n: usize, span: u32) -> Option<Vec<u32>>;
-    /// Runs taken before, each from its first slot, free again.
-    fn give(&self, firsts: &[u32], span: u32);
+    /// `n` whole free disk chunks, as chunk ids; all or none.
+    fn take_chunks(&self, n: usize) -> Option<Vec<u32>>;
+    /// Chunks taken before, free again.
+    fn give_chunks(&self, chunks: &[u32]);
 }
 
-/// The disk tier a [`Roles`] parks on, and the bytes a slot of it holds.
+/// The disk tier a [`Roles`] parks on: its chunks, and each role shape's
+/// disk chunks with the slots free in each.
 #[derive(Clone)]
 struct Disk {
     slots: Arc<dyn DiskSlots>,
-    slot_bytes: u64,
+    /// The slots of each role shape a disk chunk holds, as a device chunk:
+    /// read once, so asking takes no lock (a caller may hold the device's).
+    per_chunk: HashMap<SlotRole, u32>,
+    chunks: Arc<std::sync::Mutex<HashMap<SlotRole, BTreeMap<u32, BTreeSet<u32>>>>>,
 }
 
 impl std::fmt::Debug for Disk {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Disk")
-            .field("slot_bytes", &self.slot_bytes)
-            .finish_non_exhaustive()
+        f.debug_struct("Disk").finish_non_exhaustive()
     }
 }
 
@@ -845,34 +847,37 @@ impl Roles {
         })
     }
 
-    /// Parks on `disk` too, the disk tier's slot file whose slots hold a kv
-    /// list slot's bytes: the live parts of every role lie there where no
-    /// host tier holds them, a role slot in a run of the file's slots
-    /// ([`DiskSlots`]).
+    /// Parks on `disk` too, the disk tier's slot file: the live parts of
+    /// every role lie there where no host tier holds them, in disk chunks of
+    /// their own shape ([`DiskSlots`]).
     pub fn set_disk(&mut self, disk: Arc<dyn DiskSlots>) {
-        let slot_bytes = self
-            .device
-            .lock()
-            .unwrap()
-            .list()
-            .map_or(0, |list| list.slot_bytes);
-        self.disk = (slot_bytes > 0).then_some(Disk {
+        let per_chunk = {
+            let device = self.device.lock().unwrap();
+            [SlotRole::Instance, SlotRole::Channel, SlotRole::Adapter]
+                .into_iter()
+                .filter_map(|role| {
+                    let shape = self.shapes.of(role)?;
+                    let per_chunk = device.pool().shape(shape.pool)?.slots_per_chunk;
+                    (per_chunk > 0).then_some((role, per_chunk))
+                })
+                .collect()
+        };
+        self.disk = Some(Disk {
             slots: disk,
-            slot_bytes,
+            per_chunk,
+            chunks: Arc::default(),
         });
     }
 
-    /// The run of the disk file's slots a slot of `role` lies in whole,
-    /// where the load keeps a disk tier: its bytes in kv list slots.
-    fn disk_span(&self, role: SlotRole) -> Option<u32> {
-        let disk = self.disk.as_ref()?;
-        let shape = self.shapes.of(role)?;
-        Some(u32::try_from(shape.slot_bytes.div_ceil(disk.slot_bytes).max(1)).unwrap_or(u32::MAX))
+    /// The slots of `role` a disk chunk holds, laid out as a device chunk,
+    /// where the load keeps a disk tier.
+    fn disk_per_chunk(&self, role: SlotRole) -> Option<u32> {
+        self.disk.as_ref()?.per_chunk.get(&role).copied()
     }
 
     /// Whether the disk tier holds slots of `role`.
     fn disk_holds(&self, role: SlotRole) -> bool {
-        self.disk_span(role).is_some()
+        self.disk_per_chunk(role).is_some()
     }
 
     /// Whether some tier below the device holds every live part of `parts`.
@@ -885,7 +890,8 @@ impl Roles {
     }
 
     /// Disk slots for the live parts of `parts`, all or none: a dead part
-    /// holds nothing off the device.
+    /// holds nothing off the device. Each role's slots come from its own
+    /// disk chunks, a chunk opened whole where those are full.
     fn take_disk(&self, parts: &[Part]) -> Option<Vec<Part>> {
         let disk = self.disk.as_ref()?;
         if !parts
@@ -900,9 +906,9 @@ impl Roles {
             let refs = if part.dead() || part.refs.is_empty() {
                 Vec::new()
             } else {
-                let span = self.disk_span(part.role)?;
-                match disk.slots.take(part.refs.len(), span) {
-                    Some(firsts) => firsts,
+                let per_chunk = self.disk_per_chunk(part.role)?;
+                match Self::take_disk_slots(disk, part.role, per_chunk, part.refs.len()) {
+                    Some(refs) => refs,
                     None => {
                         self.give_on(Tier::Disk, &taken);
                         return None;
@@ -917,6 +923,57 @@ impl Roles {
         Some(taken)
     }
 
+    /// `n` free slots of `role` in its disk chunks, `per_chunk` a chunk,
+    /// opening whole chunks for what they lack; all or none.
+    fn take_disk_slots(disk: &Disk, role: SlotRole, per_chunk: u32, n: usize) -> Option<Vec<u32>> {
+        let mut shapes = disk.chunks.lock().unwrap();
+        let chunks = shapes.entry(role).or_default();
+        let free: usize = chunks.values().map(BTreeSet::len).sum();
+        if free < n {
+            let opened = (n - free).div_ceil(per_chunk as usize);
+            for chunk in disk.slots.take_chunks(opened)? {
+                chunks.insert(chunk, (0..per_chunk).collect());
+            }
+        }
+        let mut refs = Vec::with_capacity(n);
+        for (&chunk, slots) in chunks.iter_mut() {
+            while refs.len() < n {
+                let Some(index) = slots.pop_first() else {
+                    break;
+                };
+                refs.push(chunk * per_chunk + index);
+            }
+            if refs.len() == n {
+                break;
+            }
+        }
+        Some(refs)
+    }
+
+    /// `refs` of `role` free again in its disk chunks; a chunk wholly free
+    /// goes back to the slot file.
+    fn give_disk_slots(disk: &Disk, role: SlotRole, per_chunk: u32, refs: &[u32]) {
+        let mut shapes = disk.chunks.lock().unwrap();
+        let chunks = shapes.entry(role).or_default();
+        let mut emptied = Vec::new();
+        for &slot in refs {
+            let (chunk, index) = (slot / per_chunk, slot % per_chunk);
+            let slots = chunks.entry(chunk).or_default();
+            slots.insert(index);
+            if slots.len() == per_chunk as usize {
+                emptied.push(chunk);
+            }
+        }
+        for chunk in &emptied {
+            chunks.remove(chunk);
+        }
+        emptied.sort_unstable();
+        emptied.dedup();
+        if !emptied.is_empty() {
+            disk.slots.give_chunks(&emptied);
+        }
+    }
+
     /// Gives `parts` back on tier `on` (their refs that tier's).
     fn give_on(&self, on: Tier, parts: &[Part]) {
         match on {
@@ -925,8 +982,8 @@ impl Roles {
                     return;
                 };
                 for part in parts.iter().filter(|part| !part.refs.is_empty()) {
-                    if let Some(span) = self.disk_span(part.role) {
-                        disk.slots.give(&part.refs, span);
+                    if let Some(per_chunk) = self.disk_per_chunk(part.role) {
+                        Self::give_disk_slots(disk, part.role, per_chunk, &part.refs);
                     }
                 }
             }

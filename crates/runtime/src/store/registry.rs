@@ -245,7 +245,10 @@ pub fn shared_stores(
         host: tiers.host.clone(),
         roles: super::roles::Roles::new(shared, tiers.host.as_ref()).map(|mut roles| {
             if tiers.disk_slots > 0 {
-                roles.set_disk(Arc::new(KvDiskSlots(Arc::downgrade(&kv))));
+                roles.set_disk(Arc::new(KvDiskSlots(
+                    Arc::downgrade(&kv),
+                    tiers.disk_chunk_slots,
+                )));
             }
             Arc::new(Mutex::new(roles))
         }),
@@ -254,19 +257,19 @@ pub fn shared_stores(
     }
 }
 
-/// The disk tier's slot file as the roles park on it: the kv store's disk
-/// slots ([`super::roles::DiskSlots`]).
-struct KvDiskSlots(std::sync::Weak<parking_lot::Mutex<KvStore>>);
+/// The disk tier's slot file as the roles park on it: whole disk chunks of
+/// the kv store's slots, `.1` kv slots a chunk ([`super::roles::DiskSlots`]).
+struct KvDiskSlots(std::sync::Weak<parking_lot::Mutex<KvStore>>, u32);
 
 impl super::roles::DiskSlots for KvDiskSlots {
-    fn take(&self, n: usize, span: u32) -> Option<Vec<u32>> {
+    fn take_chunks(&self, n: usize) -> Option<Vec<u32>> {
         let kv = self.0.upgrade()?;
-        with_kv_lock(&kv, "roles-disk", |kv| kv.take_disk_slots(n, span))
+        with_kv_lock(&kv, "roles-disk", |kv| kv.take_disk_chunks(n, self.1))
     }
 
-    fn give(&self, firsts: &[u32], span: u32) {
+    fn give_chunks(&self, chunks: &[u32]) {
         if let Some(kv) = self.0.upgrade() {
-            with_kv_lock(&kv, "roles-disk", |kv| kv.give_disk_slots(firsts, span));
+            with_kv_lock(&kv, "roles-disk", |kv| kv.give_disk_chunks(chunks, self.1));
         }
     }
 }

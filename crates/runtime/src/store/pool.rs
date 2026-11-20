@@ -76,12 +76,11 @@ impl<I: PoolId> Pool<I> {
         Some(taken)
     }
 
-    /// `n` runs of `span` adjacent free ids each, lowest first, as each
-    /// run's first id; all or none.
-    pub fn try_alloc_runs(&mut self, n: usize, span: u32) -> Option<Vec<I>> {
-        if span <= 1 {
-            return self.try_alloc_n(n);
-        }
+    /// `n` runs of `span` adjacent free ids each, every run starting at a
+    /// multiple of `span` (a whole chunk of a pool laid out in chunks of
+    /// `span` ids), lowest first, as each run's first id; all or none.
+    pub fn try_alloc_aligned_runs(&mut self, n: usize, span: u32) -> Option<Vec<I>> {
+        let span = span.max(1);
         if self.available < n.saturating_mul(span as usize) {
             return None;
         }
@@ -89,16 +88,11 @@ impl<I: PoolId> Pool<I> {
             let (word, bit) = locate(offset);
             self.free[word] & bit != 0
         };
-        let mut firsts: Vec<u32> = Vec::with_capacity(n);
-        let (mut at, mut stretch) = (0u32, 0u32);
-        while firsts.len() < n && at < self.capacity {
-            stretch = if free(at) { stretch + 1 } else { 0 };
-            if stretch == span {
-                firsts.push(at + 1 - span);
-                stretch = 0;
-            }
-            at += 1;
-        }
+        let firsts: Vec<u32> = (0..self.capacity / span)
+            .map(|chunk| chunk * span)
+            .filter(|&first| (first..first + span).all(free))
+            .take(n)
+            .collect();
         if firsts.len() < n {
             return None;
         }
@@ -120,8 +114,8 @@ impl<I: PoolId> Pool<I> {
         )
     }
 
-    /// Runs [`Self::try_alloc_runs`] took, each from its first id, free
-    /// again.
+    /// Runs [`Self::try_alloc_aligned_runs`] took, each from its first id,
+    /// free again.
     pub fn release_runs(&mut self, firsts: &[I], span: u32) {
         let ids = firsts
             .iter()
@@ -212,17 +206,21 @@ mod tests {
     }
 
     #[test]
-    fn runs_take_adjacent_free_ids_and_go_back_whole() {
-        let mut pool = Pool::<u32>::new(10);
+    fn aligned_runs_take_whole_chunks_and_go_back_whole() {
+        let mut pool = Pool::<u32>::new(12);
         assert_eq!(pool.try_alloc_n(1), Some(vec![0]));
-        assert!(pool.take(4));
-        // Free: 1 2 3 . 5 6 7 8 9: runs of three at 1 and 5.
-        assert_eq!(pool.try_alloc_runs(2, 3), Some(vec![1, 5]));
-        assert_eq!(pool.available(), 2);
-        assert_eq!(pool.try_alloc_runs(1, 3), None, "8 9 is no run of three");
-        pool.release_runs(&[1], 3);
-        assert_eq!(pool.available(), 5);
-        assert_eq!(pool.try_alloc_n(2), Some(vec![1, 2]));
+        assert!(pool.take(9));
+        // Chunks of three: 0-2 holds 0, 9-11 holds 9; 3-5 and 6-8 are whole.
+        assert_eq!(pool.try_alloc_aligned_runs(2, 3), Some(vec![3, 6]));
+        assert_eq!(pool.available(), 4);
+        assert_eq!(
+            pool.try_alloc_aligned_runs(1, 3),
+            None,
+            "1 2 and 10 11 are free, no whole chunk"
+        );
+        pool.release_runs(&[3], 3);
+        assert_eq!(pool.available(), 7);
+        assert_eq!(pool.try_alloc_aligned_runs(1, 3), Some(vec![3]));
     }
 
     #[test]

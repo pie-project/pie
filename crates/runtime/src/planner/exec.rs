@@ -1183,6 +1183,7 @@ mod abandon_tests {
                 tiers: crate::store::shared::Tiers {
                     host: Some(pools.host.clone()),
                     disk_slots: 0,
+                    disk_chunk_slots: 0,
                 },
                 max_context: 256,
                 ..Default::default()

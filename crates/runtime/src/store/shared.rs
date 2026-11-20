@@ -711,6 +711,9 @@ impl RoleShapes {
 pub struct Tiers {
     pub host: Option<Shared>,
     pub disk_slots: u32,
+    /// The kv list slots a disk chunk holds: a disk chunk is laid out as
+    /// the device's, a role shape's slots in a chunk of their own.
+    pub disk_chunk_slots: u32,
 }
 
 impl Tiers {
@@ -737,7 +740,12 @@ impl Tiers {
                     })?
             }
         };
-        Ok(Self { host, disk_slots })
+        let disk_chunk_slots = list.map_or(0, |list| list.slots_per_chunk);
+        Ok(Self {
+            host,
+            disk_slots,
+            disk_chunk_slots,
+        })
     }
 }
 

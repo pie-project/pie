@@ -1218,22 +1218,26 @@ impl KvStore {
         })
     }
 
-    /// `n` runs of `span` adjacent free slots of the disk tier's slot file
-    /// for something other than kv (a parked role's slots, each wider than
-    /// a kv slot taking a run, [`crate::store::roles::DiskSlots`]), as each
-    /// run's first slot, all or none: counted out of the disk's room as
-    /// kv's are.
-    pub fn take_disk_slots(&mut self, n: usize, span: u32) -> Option<Vec<u32>> {
-        let slots = self.disk_pool.try_alloc_runs(n, span)?;
+    /// `n` whole disk chunks of the slot file for something other than kv
+    /// (a parked role's slots, laid out in a chunk of their own shape as on
+    /// the device, CONTRACT-BC 22, [`crate::store::roles::DiskSlots`]), a
+    /// disk chunk `per_chunk` kv slots, as chunk ids, all or none: counted
+    /// out of the disk's room as kv's are.
+    pub fn take_disk_chunks(&mut self, n: usize, per_chunk: u32) -> Option<Vec<u32>> {
+        let per_chunk = per_chunk.max(1);
+        let firsts = self.disk_pool.try_alloc_aligned_runs(n, per_chunk)?;
         self.below_cached.set(None);
-        Some(slots.into_iter().map(|slot| slot.0).collect())
+        Some(firsts.into_iter().map(|slot| slot.0 / per_chunk).collect())
     }
 
-    /// Runs [`Self::take_disk_slots`] took, each from its first slot, free
-    /// again.
-    pub fn give_disk_slots(&mut self, firsts: &[u32], span: u32) {
-        let firsts: Vec<DiskKvSlotId> = firsts.iter().map(|&slot| DiskKvSlotId(slot)).collect();
-        self.disk_pool.release_runs(&firsts, span);
+    /// Chunks [`Self::take_disk_chunks`] took, free again.
+    pub fn give_disk_chunks(&mut self, chunks: &[u32], per_chunk: u32) {
+        let per_chunk = per_chunk.max(1);
+        let firsts: Vec<DiskKvSlotId> = chunks
+            .iter()
+            .map(|&chunk| DiskKvSlotId(chunk * per_chunk))
+            .collect();
+        self.disk_pool.release_runs(&firsts, per_chunk);
         self.below_cached.set(None);
     }
 
