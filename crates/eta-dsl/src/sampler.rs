@@ -15,13 +15,14 @@
 //! noise are applied per lane in f32 inside the reduction, so no
 //! perturbed row is rounded and no noise row is laid. Temperature has one
 //! form, in the cut and the draw alike: a multiply by `1 / T`, rounded once
-//! to f32 here on the host (`eta_ir::types`). A greedy step that
-//! changes no logit reads the model's f32 logits whole.
+//! to f32 on the host ([`inverse_temperature`], `eta_ir::types`). A greedy
+//! step that changes no logit reads the model's f32 logits whole.
 //!
 //! A runtime builds the guest code of [`STANDARD`]'s shapes before ready:
-//! a program's regions are keyed by their text, which the knobs' values
-//! (they ride in channels, or are constants the text does not hold) do not
-//! change, so a request of one of these shapes builds nothing.
+//! every knob's value, the temperature's reciprocal among them, rides in a
+//! channel the stage reads, so no value is in a program's text, its hash or
+//! its launch package, by which the engines key what they compile, and a
+//! request of one of these shapes builds nothing.
 
 use crate::channel::Channel;
 use crate::dtype;
@@ -32,8 +33,8 @@ use crate::value::*;
 /// request's.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Shape {
-    /// A program constant; `None` samples greedily.
-    pub temperature: Option<f32>,
+    /// A draw at a temperature; `false` samples greedily.
+    pub temperature: bool,
     pub top_p: bool,
     pub top_k: bool,
     pub min_p: bool,
@@ -46,7 +47,7 @@ pub struct Shape {
 
 impl Shape {
     pub const GREEDY: Shape = Shape {
-        temperature: None,
+        temperature: false,
         top_p: false,
         top_k: false,
         min_p: false,
@@ -65,14 +66,14 @@ pub const STANDARD: [(&str, Shape); 5] = [
     (
         "gumbel-max",
         Shape {
-            temperature: Some(1.0),
+            temperature: true,
             ..Shape::GREEDY
         },
     ),
     (
         "top-p",
         Shape {
-            temperature: Some(1.0),
+            temperature: true,
             top_p: true,
             ..Shape::GREEDY
         },
@@ -80,7 +81,7 @@ pub const STANDARD: [(&str, Shape); 5] = [
     (
         "top-k + top-p",
         Shape {
-            temperature: Some(1.0),
+            temperature: true,
             top_p: true,
             top_k: true,
             ..Shape::GREEDY
@@ -97,9 +98,9 @@ pub const STANDARD: [(&str, Shape); 5] = [
 
 /// The sampler's knob values as scalars.
 pub struct Knobs {
-    /// A program constant: a channel-fed divisor costs the fused sampler
-    /// ~20% of a decode step, more than mixed temperatures cost by splitting.
-    pub temperature: Option<f32>,
+    /// The temperature's reciprocal ([`inverse_temperature`]), an f32 the
+    /// cut and the draw multiply by; `None` samples greedily.
+    pub temperature: Option<Tensor>,
     pub top_p: Option<Tensor>,
     pub top_k: Option<Tensor>,
     pub min_p: Option<Tensor>,
@@ -107,6 +108,14 @@ pub struct Knobs {
     pub frequency: Option<Tensor>,
     pub presence: Option<Tensor>,
     pub logprobs: Option<u32>,
+}
+
+/// The value a request's temperature `t` rides in its channel as: `1 / t`,
+/// rounded once to f32 on the host, which the cut and the draw multiply by
+/// (a multiply is correctly rounded on every backend, a divide is not).
+#[must_use]
+pub fn inverse_temperature(t: f32) -> f32 {
+    1.0 / t
 }
 
 /// What a step lands beside its token when asked for logprobs: the sampled
@@ -244,15 +253,15 @@ pub fn sample(
     if let Some(mask) = mask {
         logits = mask_apply(&logits, mask);
     }
-    let token = match k.temperature {
+    let token = match &k.temperature {
         None => reduce_argmax(&logits),
-        Some(temperature) => {
+        Some(inverse) => {
             // The temperature's one form: a multiply by its reciprocal.
-            let inverse = 1.0 / temperature;
+            let inverse = knob(inverse);
             let mut keep: Option<Tensor> = None;
             if k.top_k.is_some() || k.top_p.is_some() || k.min_p.is_some() {
                 // The cuts read bf16 probabilities of the scaled row.
-                let probs = cut_probabilities(&logits, inverse);
+                let probs = cut_probabilities(&logits, &inverse);
                 if let Some(min_p) = &k.min_p {
                     let floor = reduce_max(&probs) * knob(min_p);
                     keep = Some(ge(&probs, floor));
@@ -273,8 +282,8 @@ pub fn sample(
                 }
             }
             match keep {
-                Some(keep) => gumbel_argmax(&logits, keep, inverse, r),
-                None => gumbel_argmax(&logits, true, inverse, r),
+                Some(keep) => gumbel_argmax(&logits, keep, &inverse, r),
+                None => gumbel_argmax(&logits, true, &inverse, r),
             }
         }
     };
@@ -314,7 +323,7 @@ fn shifted(row: &Tensor) -> Tensor {
 /// the row less its max rounded to bf16, times `inverse`, so its largest
 /// values round near zero and no lane overflows; the one max the row needs
 /// is that shift.
-fn cut_probabilities(logits: &Tensor, inverse: f32) -> Tensor {
+fn cut_probabilities(logits: &Tensor, inverse: &Tensor) -> Tensor {
     let e = exp(shifted(logits) * inverse);
     &e / reduce_sum(&e)
 }
