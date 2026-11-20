@@ -275,6 +275,9 @@ impl Pool {
                 if at + 1 == parts && act > 0 {
                     let top = top_first(total_chunks, segment_chunks, act);
                     store.reserve_top(pinned_from(top, first, chunk_bytes))?;
+                    // The whole top backed now: a raise, a lower or a span
+                    // commit after ready moves these heaps, makes none.
+                    store.back_whole_top()?;
                 }
                 built.push(Part {
                     first,
@@ -1375,6 +1378,37 @@ mod tests {
             }
         }
         assert!(checked > 100, "the walks held chunks across steps: {checked}");
+    }
+
+    /// The top is backed whole at load: a walk of carves, narrows and span
+    /// lends over it makes no heap (no allocation after ready), and a heap a
+    /// narrow gave back reads zeros when a raise maps it again, as a made
+    /// one does.
+    #[test]
+    fn a_walk_of_the_backed_top_makes_no_heap() {
+        let device = Context::bind().expect("a device");
+        let small = 12 << 20;
+        let mut pool = Pool::reserve(&device, small, 10, 3, 2, u64::MAX).expect("a pool");
+        let span = pool.bytes() - pool.pinned_from();
+        let made = crate::device::elastic::heaps_made();
+        pool.cover(span).expect("the widest carve");
+        pool.write(7 * small, &[0x5c; 64]).expect("a span chunk under the carve");
+        for round in 0..3u32 {
+            // SAFETY: nothing ran on this pool.
+            unsafe { pool.narrow(small) }.expect("the rung lowers");
+            pool.commit_span(1).expect("the span's segment backs state");
+            // SAFETY: nothing ran on this pool.
+            unsafe { pool.release_span(0) }.expect("the lend ends");
+            pool.cover(span).expect("the rung raises again");
+            let mut seen = [0u8; 64];
+            pool.read(7 * small, &mut seen).expect("backed again");
+            assert_eq!(seen, [0u8; 64], "round {round}: a heap mapped again reads zeros");
+        }
+        assert_eq!(
+            crate::device::elastic::heaps_made(),
+            made,
+            "the walk moved the top's heaps and made none"
+        );
     }
 
     /// The negative control: what a copy on the GPU reads out of a tile no
