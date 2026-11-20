@@ -165,6 +165,13 @@ pub struct Pools {
     /// Each streamed weight plane's view of the pool: `(width, view)`,
     /// bf16 rows of `width`.
     weight_views: Vec<(u32, Tensor)>,
+    /// Each width rung's beam head program, laid at load
+    /// ([`beam::Head`]): a fire stages its inputs and runs it, never traces
+    /// it again.
+    beam_heads: Vec<(
+        kernels_xla::beam::Layout,
+        std::sync::Arc<crate::device::Program>,
+    )>,
     /// Each streamed bank's miss copy in pinned host memory: `(param, pool
     /// rows an expert's plane takes, root, buffer)`.
     host_banks: Vec<(u32, u32, Tensor, Buffer)>,
@@ -690,6 +697,7 @@ impl Pools {
             bytes: total,
             weight_chunks,
             weight_views: Vec::new(),
+            beam_heads: Vec::new(),
             host_banks: Vec::new(),
             slab: (slab_row, staging.rows),
             act_chunks,

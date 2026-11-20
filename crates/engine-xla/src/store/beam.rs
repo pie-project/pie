@@ -80,10 +80,14 @@ impl Pools {
             pool: Vec::new(),
         };
         let (tracer, _) = self.beam_head_tracer(handles, layout, &blank)?;
-        crate::exec::compile(device, tracer, &[]).map(|_| ())
+        let program = crate::exec::compile(device, tracer, &[])?;
+        self.beam_heads.retain(|(laid, _)| *laid != layout);
+        self.beam_heads.push((layout, program));
+        Ok(())
     }
 
-    /// Runs group `head`'s step on width rung `layout`, before its fire.
+    /// Runs group `head`'s step on width rung `layout` (laid at load),
+    /// before its fire: its inputs staged as the laid program reads them.
     pub fn run_beam_head(
         &mut self,
         device: &Device,
@@ -91,8 +95,19 @@ impl Pools {
         layout: Layout,
         head: &Head,
     ) -> Result<()> {
-        let (tracer, inputs) = self.beam_head_tracer(handles, layout, head)?;
-        crate::exec::maintain(device, tracer, self, &inputs)
+        let program = self
+            .beam_heads
+            .iter()
+            .find(|(laid, _)| *laid == layout)
+            .map(|(_, program)| std::sync::Arc::clone(program))
+            .ok_or_else(|| Fault::Unbound {
+                what: format!(
+                    "a beam head of {} lanes, which the load did not lay",
+                    layout.lanes
+                ),
+            })?;
+        let (inputs, ..) = head_inputs(handles, layout, head)?;
+        crate::exec::run_program(device, &program, None, self, &inputs, false).map(|_| ())
     }
 
     fn beam_head_tracer<'h>(
@@ -116,40 +131,32 @@ impl Pools {
             });
         }
         let page = i64::from(self.paging.page_size.max(1));
-        let mut inputs = crate::inputs::Inputs::new();
-        let params: Vec<i32> = [
-            head.state_row,
-            head.parents_row,
-            head.folded,
-            head.pool.len() as u32,
-            head.slot,
-            head.live,
-        ]
-        .iter()
-        .map(|&v| i32::try_from(v).unwrap_or(i32::MAX))
-        .collect();
-        let params_t = inputs.i32s(handles, &params, 1);
-        let mut pool: Vec<i32> = head
-            .pool
-            .iter()
-            .map(|&g| i32::try_from(g).unwrap_or(i32::MAX))
-            .collect();
-        pool.resize(cap as usize, 0);
-        let pool_t = inputs.i32s(handles, &pool, 1);
-        let planes: Vec<(crate::handle::Tensor, super::Map)> = self
-            .shape(kv)?
-            .planes
-            .iter()
-            .map(|plane| {
-                self.views
-                    .iter()
-                    .find(|(what, ..)| *what == plane.what)
-                    .map(|&(_, view, map)| (view, map))
-                    .ok_or_else(|| Fault::Unbound {
-                        what: format!("pool plane {:?}, which has no view", plane.what),
-                    })
-            })
-            .collect::<Result<_>>()?;
+        let (inputs, params_t, pool_t) = head_inputs(handles, layout, head)?;
+        // The kv planes by view: planes of one dtype, width and row order are
+        // one reinterpretation of the pool apart from their maps, so each
+        // such group copies with one gather and one scatter (a scatter a
+        // plane cost ~27 us, 56 of them on qwen3-0.6b).
+        let mut planes: Vec<(
+            (dtype::Dtype, u32, Option<kernels_xla::hlo::PoolOrder>),
+            crate::handle::Tensor,
+            Vec<super::Map>,
+        )> = Vec::new();
+        let pool_rows = u64::from(self.root().rows);
+        for plane in &self.shape(kv)?.planes {
+            let (view, map) = self
+                .views
+                .iter()
+                .find(|(what, ..)| *what == plane.what)
+                .map(|&(_, view, map)| (view, map))
+                .ok_or_else(|| Fault::Unbound {
+                    what: format!("pool plane {:?}, which has no view", plane.what),
+                })?;
+            let key = (plane.dtype, plane.width, super::kv_order(plane, pool_rows)?);
+            match planes.iter_mut().find(|(k, ..)| *k == key) {
+                Some((_, _, maps)) => maps.push(map),
+                None => planes.push((key, view, vec![map])),
+            }
+        }
         let root = self.root();
         let tracer = Tracer::new(handles).with_stage(self.stage_at(inputs.rows()));
         let (b_n, words) = (layout.lanes, layout.words());
@@ -217,27 +224,33 @@ impl Pools {
                 let clean = cx.compare(Cmp::Eq, step.faults, zero_b)?;
                 let clean = cx.broadcast(clean, &[b_n, page], &[0])?;
                 let moves = cx.and(within, clean)?;
-                for &(view, map) in &planes {
-                    let plane = cx.read(view)?;
-                    let cell = |cx: &mut crate::emit::Cx<'_>, g| {
-                        let g = cx.broadcast(g, &[b_n, page], &[0])?;
-                        let stride = cx.const_i(Elem::I32, map.stride, &[b_n, page]);
-                        let offset = cx.const_i(Elem::I32, map.offset, &[b_n, page]);
-                        let pg = cx.const_i(Elem::I32, page, &[b_n, page]);
-                        let v = cx.mul(g, stride)?;
-                        let v = cx.add(v, offset)?;
-                        let v = cx.mul(v, pg)?;
-                        cx.add(v, t)
-                    };
-                    let from = cell(cx, src_g)?;
-                    let to = cell(cx, dst_g)?;
-                    // a cell no copy moves lands on itself
-                    let from = cx.select(moves, from, to)?;
-                    let from = cx.reshape(from, &[b_n * page])?;
-                    let to = cx.reshape(to, &[b_n * page])?;
+                for (_, view, maps) in &planes {
+                    let plane = cx.read(*view)?;
+                    let mut froms = Vec::with_capacity(maps.len());
+                    let mut tos = Vec::with_capacity(maps.len());
+                    for map in maps {
+                        let cell = |cx: &mut crate::emit::Cx<'_>, g| {
+                            let g = cx.broadcast(g, &[b_n, page], &[0])?;
+                            let stride = cx.const_i(Elem::I32, map.stride, &[b_n, page]);
+                            let offset = cx.const_i(Elem::I32, map.offset, &[b_n, page]);
+                            let pg = cx.const_i(Elem::I32, page, &[b_n, page]);
+                            let v = cx.mul(g, stride)?;
+                            let v = cx.add(v, offset)?;
+                            let v = cx.mul(v, pg)?;
+                            cx.add(v, t)
+                        };
+                        let from = cell(cx, src_g)?;
+                        let to = cell(cx, dst_g)?;
+                        // a cell no copy moves lands on itself
+                        let from = cx.select(moves, from, to)?;
+                        froms.push(cx.reshape(from, &[b_n * page])?);
+                        tos.push(cx.reshape(to, &[b_n * page])?);
+                    }
+                    let from = cx.concat(&froms, 0)?;
+                    let to = cx.concat(&tos, 0)?;
                     let rows = cx.take_rows(plane, from)?;
                     let next = cx.put_rows(plane, to, rows, Combine::Set)?;
-                    cx.write(view, next)?;
+                    cx.write(*view, next)?;
                 }
 
                 // the state after, and the results beside it
@@ -277,4 +290,43 @@ impl Pools {
         }
         Ok((tracer, inputs))
     }
+}
+
+/// A head's inputs, in the order its program reads them: the fire's
+/// numbers, then its pool's pages padded to the layout's columns.
+fn head_inputs(
+    handles: &Handles,
+    layout: Layout,
+    head: &Head,
+) -> Result<(
+    crate::inputs::Inputs,
+    crate::handle::Tensor,
+    crate::handle::Tensor,
+)> {
+    let narrow = |v: u32| {
+        i32::try_from(v).map_err(|_| Fault::Unbound {
+            what: format!("a beam head number {v}, past an i32"),
+        })
+    };
+    let mut inputs = crate::inputs::Inputs::new();
+    let params = [
+        head.state_row,
+        head.parents_row,
+        head.folded,
+        head.pool.len() as u32,
+        head.slot,
+        head.live,
+    ]
+    .iter()
+    .map(|&v| narrow(v))
+    .collect::<Result<Vec<i32>>>()?;
+    let params_t = inputs.i32s(handles, &params, 1);
+    let mut pool = head
+        .pool
+        .iter()
+        .map(|&g| narrow(g))
+        .collect::<Result<Vec<i32>>>()?;
+    pool.resize(layout.cap as usize, 0);
+    let pool_t = inputs.i32s(handles, &pool, 1);
+    Ok((inputs, params_t, pool_t))
 }
