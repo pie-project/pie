@@ -9,7 +9,7 @@ use crate::handle::Tensor;
 use kernels_xla::Error;
 use poem_ir::ValueId;
 
-use crate::rs::{Seat, WindowInputs};
+use crate::rs::{CarriedInputs, Seat, WindowInputs};
 use crate::run::Run;
 use crate::trace::{Root, Source};
 
@@ -52,7 +52,93 @@ impl Run<'_> {
             })
     }
 
-    fn rs_temp(&self, rows: u32, width: u32, dtype: poem_ir::Dtype) -> Tensor {
+    /// The carried rows of the current window when it runs each layer's
+    /// decode form (a window of single-token lanes), or none.
+    pub(crate) fn rs_carried(&self, seat: &Seat) -> Option<CarriedInputs> {
+        let span = self.window().span;
+        seat.carried
+            .get(&(span.lane_offset, span.lanes, span.row_offset, span.rows))
+            .copied()
+    }
+
+    /// Layout plane `plane`'s rows each lane of the window carries, as the
+    /// decode step reads them: `[lanes · rows, width]` in the plane's dtype,
+    /// lane-major (rows past a lane's count read buffer row 0, unread).
+    pub(crate) fn rs_carried_plane(
+        &self,
+        op: &'static str,
+        seat: &Seat,
+        carried: &CarriedInputs,
+        plane: usize,
+    ) -> Result<Tensor, Error> {
+        let spec = *seat
+            .layout
+            .planes
+            .get(plane)
+            .ok_or_else(|| Error::Backend {
+                op,
+                detail: format!("no layout plane {plane}"),
+            })?;
+        let n = self.window().span.lanes * carried.rows.max(1);
+        let out = self.rs_temp(n, spec.width, spec.dtype);
+        let (buffer, at) = seat.buffers[plane];
+        let tokens = i64::from(seat.page_tokens.max(1));
+        let rows = carried.buffer_rows;
+        self.ctx().emit(&mut |cx| {
+            let buf = cx.read(buffer)?;
+            let r = cx.read(rows)?;
+            let all = cx.ty(r).elements();
+            let r = cx.reshape(r, &[all])?;
+            let r = cx.slice_axis(r, 0, 0, i64::from(n))?;
+            let r = plane_rows(cx, r, at, tokens)?;
+            let got = cx.take_rows(buf, r)?;
+            cx.write(out, got)
+        })?;
+        Ok(out)
+    }
+
+    /// Columns `col0..col0 + width` of `src` (the window's own rows) into
+    /// layout plane `plane` at the buffer rows the window stashes its own
+    /// rows into (`WindowMap::stash`): a plane no trace value carries whole
+    /// (a gated-delta row's keys, its corrected values).
+    pub(crate) fn rs_stash_cols(
+        &self,
+        op: &'static str,
+        seat: &Seat,
+        plane: usize,
+        src: Tensor,
+        col0: u32,
+    ) -> Result<(), Error> {
+        let spec = *seat
+            .layout
+            .planes
+            .get(plane)
+            .ok_or_else(|| Error::Backend {
+                op,
+                detail: format!("no layout plane {plane}"),
+            })?;
+        let map = self.rs_window(op, seat)?;
+        let (buffer, at) = seat.buffers[plane];
+        let tokens = i64::from(seat.page_tokens.max(1));
+        let rows_own = i64::from(src.rows);
+        let (lo, hi) = (i64::from(col0), i64::from(col0 + spec.width));
+        self.ctx().emit(&mut |cx| {
+            let buf = cx.read(buffer)?;
+            let mine = cx.read(src)?;
+            let mine = cx.slice_axis(mine, 1, lo, hi)?;
+            let elem = cx.elem(buf);
+            let mine = cx.convert(mine, elem);
+            let stash = cx.read(map.stash)?;
+            let all = cx.ty(stash).elements();
+            let stash = cx.reshape(stash, &[all])?;
+            let stash = cx.slice_axis(stash, 0, 0, rows_own)?;
+            let stash = plane_rows(cx, stash, at, tokens)?;
+            let next = cx.put_rows(buf, stash, mine, kernels_xla::hlo::Combine::Set)?;
+            cx.write(buffer, next)
+        })
+    }
+
+    pub(crate) fn rs_temp(&self, rows: u32, width: u32, dtype: poem_ir::Dtype) -> Tensor {
         self.handles().root(Root {
             source: Source::Temp,
             dtype,

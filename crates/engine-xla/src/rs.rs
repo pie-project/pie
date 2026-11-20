@@ -62,6 +62,19 @@ pub struct Layout {
 
     pub out_of: HashMap<u32, usize>,
 
+    /// A gated-delta recurrence's corrected planes (its `GdnK`, `GdnU`), by
+    /// the value it lands.
+    pub corrected: HashMap<u32, (usize, usize)>,
+
+    /// Where the conv landing a gated-delta layer's `q k v` lays its rows'
+    /// keys: the `GdnK` plane and the channel of the conv output they start
+    /// at (after the query heads), by the conv's output.
+    pub keys_of: HashMap<u32, (usize, u32)>,
+
+    /// A gate prep's `[b | a]`, `dt_bias` and `a_log`, by the gates it
+    /// lands: what a decode step forms its carried rows' log decays from.
+    pub gate_prep: HashMap<u32, (ValueId, ValueId, ValueId)>,
+
     pub token_bytes: u64,
 
     pub work_elems: u64,
@@ -120,7 +133,7 @@ impl Layout {
         let mut gates_cache: HashMap<u32, u32> = HashMap::new();
         // the planes no trace value carries whole (a gated-delta row's keys
         // and corrected values), each once a cache
-        let mut laid: std::collections::HashSet<(u32, Role)> = std::collections::HashSet::new();
+        let mut laid: HashMap<(u32, Role), usize> = HashMap::new();
 
         let mut plane = |layout: &mut Layout,
                          cache: u32,
@@ -188,6 +201,7 @@ impl Layout {
                 }
                 Operation::Ssm(
                     Ssm::GatedDelta {
+                        qkv,
                         gates,
                         state,
                         k_heads,
@@ -198,6 +212,7 @@ impl Layout {
                         ..
                     }
                     | Ssm::GatedDeltaChunked {
+                        qkv,
                         gates,
                         state,
                         k_heads,
@@ -212,21 +227,27 @@ impl Layout {
                     gates_cache.insert(gates.0, cache);
                     // the step reads a carried row as a linear attention:
                     // its raw keys and corrected values ride the buffer
-                    for (role, width, dtype, bytes) in [
+                    let mut at = [0usize; 2];
+                    for (i, (role, width, dtype, bytes)) in [
                         (Role::GdnK, k_heads * k_dim, Dtype::Bf16, 2u64),
                         (Role::GdnU, v_heads * v_dim, Dtype::F32, 4u64),
-                    ] {
-                        if !laid.insert((cache, role)) {
-                            continue;
-                        }
-                        layout.planes.push(Plane {
-                            cache,
-                            role,
-                            width,
-                            dtype,
-                            row_bytes: u64::from(width) * bytes,
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        at[i] = *laid.entry((cache, role)).or_insert_with(|| {
+                            layout.planes.push(Plane {
+                                cache,
+                                role,
+                                width,
+                                dtype,
+                                row_bytes: u64::from(width) * bytes,
+                            });
+                            layout.planes.len() - 1
                         });
                     }
+                    layout.corrected.insert(y.0, (at[0], at[1]));
+                    layout.keys_of.insert(qkv.0, (at[0], k_heads * k_dim));
                     region(&mut layout, cache, "scan", *y)?;
                     layout.work_elems = layout
                         .work_elems
@@ -295,7 +316,13 @@ impl Layout {
             }
         }
         for node in &trace.nodes {
-            let Operation::Ssm(Ssm::GdnGates { ba, gates, .. }) = &node.op else {
+            let Operation::Ssm(Ssm::GdnGates {
+                ba,
+                gates,
+                dt_bias,
+                a_log,
+            }) = &node.op
+            else {
                 continue;
             };
             let cache = *gates_cache.get(&gates.0).ok_or_else(|| Fault::Unbound {
@@ -305,6 +332,7 @@ impl Layout {
                 ),
             })?;
             plane(&mut layout, cache, Role::Ba, *ba)?;
+            layout.gate_prep.insert(gates.0, (*ba, *dt_bias, *a_log));
             region(&mut layout, cache, "gates", *gates)?;
         }
         if layout.planes.is_empty() {
@@ -459,7 +487,10 @@ impl WindowMap {
                 continue;
             };
             let begin = map.from_buffer.len() as i32;
-            for run in &plan.gathers {
+            // a single-token lane's carried rows are its decode step's input
+            // (`CarriedMap`), none replayed (`engine::fire::lane_carried`)
+            let gathers: &[Run] = if rows == 1 { &[] } else { &plan.gathers };
+            for run in gathers {
                 for t in 0..run.count {
                     map.from_buffer.push(1);
                     map.buffer_row.push(locate(run, run.from + t)?);
@@ -514,6 +545,17 @@ pub struct WindowInputs {
     pub land: crate::handle::Tensor,
 }
 
+/// A [`CarriedMap`] staged: each lane's carried rows' rs list rows
+/// (`[lanes, rows]`, 0 past its own: the step reads none of them), count
+/// and commit.
+#[derive(Clone, Copy, Debug)]
+pub struct CarriedInputs {
+    pub rows: u32,
+    pub buffer_rows: crate::handle::Tensor,
+    pub count: crate::handle::Tensor,
+    pub commit: crate::handle::Tensor,
+}
+
 /// A fire's recurrent seat: each lane's plan and tables, the buffer planes,
 /// and the maps of every window the walk may run the recurrence over.
 #[derive(Debug)]
@@ -531,6 +573,9 @@ pub struct Seat {
     pub page_tokens: u32,
     /// By window `(lane_offset, lanes, row_offset, rows)`.
     pub maps: HashMap<(u32, u32, u32, u32), WindowInputs>,
+    /// By window, as `maps`: a window of single-token lanes' carried rows,
+    /// the state + buffer step's input.
+    pub carried: HashMap<(u32, u32, u32, u32), CarriedInputs>,
     /// Extended outputs landed by an earlier op of the current window.
     pub ext: std::cell::RefCell<HashMap<u32, crate::handle::Tensor>>,
 }

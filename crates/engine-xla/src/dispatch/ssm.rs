@@ -160,6 +160,77 @@ impl Run<'_> {
                 conv_width,
                 dilation,
                 y,
+            } if self
+                .rs_seat()
+                .is_some_and(|seat| self.rs_carried(&seat).is_some()) =>
+            {
+                // a window of single-token lanes: the state + buffer step over
+                // each lane's carried rows, none replayed
+                const OP: &str = "ssm.causal_conv1d_carried";
+                let seat = self.rs_seat().expect("guarded");
+                let carried = self.rs_carried(&seat).expect("guarded");
+                let plane =
+                    *seat
+                        .layout
+                        .in_of
+                        .get(&x.0)
+                        .ok_or_else(|| kernels_xla::Error::Backend {
+                            op: OP,
+                            detail: format!("value {} is no conv input this load buffers", x.0),
+                        })?;
+                let rows = self.rs_carried_plane(OP, &seat, &carried, plane)?;
+                let ext_x = self.rs_extend(OP, &seat, *x)?;
+                let ext_y = self.rs_out(OP, &seat, *y)?;
+                let pool = self.recurrent(*state);
+                conv_bank(OP, &pool)?;
+                let committed = self.rs_committed(&seat, *state);
+                let lanes = i64::from(self.window().span.lanes);
+                let r = i64::from(carried.rows.max(1));
+                lower(self.ctx(), |l| {
+                    let xv = l.read(ext_x)?;
+                    let c = i64::from(xv.width);
+                    let rows = l.read(rows)?.val;
+                    let rows = l.f().reshape(rows, &[lanes, r, c])?;
+                    let count = l.read(carried.count)?.val;
+                    let count = l.f().reshape(count, &[lanes])?;
+                    let count = l.f().convert(count, kernels_xla::hlo::Elem::I32);
+                    let w = l.read(self.tensor(*weight))?;
+                    let bias = bias.map(|b| l.read(self.tensor(b))).transpose()?;
+                    let bank = l.read(pool.conv_state)?;
+                    let indptr = l.read(self.qo_indptr())?;
+                    let seat = read_seat(l, &committed, pool.map)?;
+                    let (yv, next) = ssm::causal_conv1d_carried(
+                        l.f(),
+                        xv,
+                        rows,
+                        count,
+                        indptr,
+                        seat,
+                        w,
+                        bias,
+                        bank,
+                        *conv_width,
+                        *dilation,
+                        ext_y.landing(),
+                    )?;
+                    l.land(ext_y, yv)?;
+                    l.land(pool.new_conv_state, next)
+                })?;
+                self.rs_land(OP, &seat, ext_y, *y)?;
+                // a gated-delta layer's keys ride the buffer with the row
+                if let Some(&(keys, col0)) = seat.layout.keys_of.get(&y.0) {
+                    self.rs_stash_cols(OP, &seat, keys, self.tensor(*y), col0)?;
+                }
+                Ok(())
+            }
+            Ssm::CausalConv1d {
+                x,
+                weight,
+                state,
+                bias,
+                conv_width,
+                dilation,
+                y,
             }
             | Ssm::CausalConv1dChunked {
                 x,
@@ -213,6 +284,100 @@ impl Run<'_> {
                 let ext_gates = self.rs_out(OP, &seat, *gates)?;
                 self.gdn_prep(ext_ba, *dt_bias, *a_log, ext_gates)?;
                 self.rs_land(OP, &seat, ext_gates, *gates)
+            }
+            Ssm::GatedDelta {
+                qkv,
+                z: _,
+                gates,
+                state,
+                k_heads,
+                v_heads,
+                k_dim,
+                v_dim,
+                y,
+            } if self
+                .rs_seat()
+                .is_some_and(|seat| self.rs_carried(&seat).is_some()) =>
+            {
+                // a window of single-token lanes: the state + buffer step,
+                // its carried rows read as a linear attention
+                const OP: &str = "ssm.gated_delta_carried";
+                let seat = self.rs_seat().expect("guarded");
+                let carried = self.rs_carried(&seat).expect("guarded");
+                let missing = |what: String| kernels_xla::Error::Backend {
+                    op: OP,
+                    detail: what,
+                };
+                let &(k_plane, u_plane) = seat.layout.corrected.get(&y.0).ok_or_else(|| {
+                    missing(format!(
+                        "the recurrence landing value {} keeps no corrected rows",
+                        y.0
+                    ))
+                })?;
+                let &(ba, dt_bias, a_log) =
+                    seat.layout.gate_prep.get(&gates.0).ok_or_else(|| {
+                        missing(format!(
+                            "the gates value {} come from no gate prep",
+                            gates.0
+                        ))
+                    })?;
+                let &ba_plane = seat.layout.in_of.get(&ba.0).ok_or_else(|| {
+                    missing(format!("the `[b | a]` value {} is not buffered", ba.0))
+                })?;
+                let keys = self.rs_carried_plane(OP, &seat, &carried, k_plane)?;
+                let us = self.rs_carried_plane(OP, &seat, &carried, u_plane)?;
+                let bas = self.rs_carried_plane(OP, &seat, &carried, ba_plane)?;
+                let ext_qkv = self.rs_ext_of(OP, &seat, *qkv)?;
+                let ext_gates = self.rs_ext_of(OP, &seat, *gates)?;
+                let ext_y = self.rs_out(OP, &seat, *y)?;
+                let lanes = self.window().span.lanes;
+                let u_own = self.rs_temp(lanes, v_heads * v_dim, poem_ir::Dtype::F32);
+                let pool = self.recurrent(*state);
+                let committed = self.rs_committed(&seat, *state);
+                let (l_, r) = (i64::from(lanes), i64::from(carried.rows.max(1)));
+                lower(self.ctx(), |l| {
+                    let qkv = l.read(ext_qkv)?;
+                    let gates = l.read(ext_gates)?;
+                    let grid = |l: &mut Lower<'_, '_>, t, w: i64| {
+                        let v = l.read(t)?.val;
+                        Ok::<_, kernels_xla::Error>(l.f().reshape(v, &[l_, r, w])?)
+                    };
+                    let keys = grid(l, keys, i64::from(k_heads * k_dim))?;
+                    let us = grid(l, us, i64::from(v_heads * v_dim))?;
+                    let bas = grid(l, bas, 2 * i64::from(*v_heads))?;
+                    let count = l.read(carried.count)?.val;
+                    let count = l.f().reshape(count, &[l_])?;
+                    let count = l.f().convert(count, kernels_xla::hlo::Elem::I32);
+                    let dt_bias = l.read(self.tensor(dt_bias))?;
+                    let a_log = l.read(self.tensor(a_log))?;
+                    let slab = l.read(pool.state)?;
+                    let indptr = l.read(self.qo_indptr())?;
+                    let seat = read_seat(l, &committed, pool.map)?;
+                    let (yv, u, next) = ssm::gated_delta_carried(
+                        l.f(),
+                        qkv,
+                        gates,
+                        keys,
+                        us,
+                        bas,
+                        dt_bias,
+                        a_log,
+                        count,
+                        indptr,
+                        seat,
+                        slab,
+                        *k_heads,
+                        *v_heads,
+                        *k_dim,
+                        *v_dim,
+                    )?;
+                    l.land(ext_y, yv)?;
+                    l.land(u_own, u)?;
+                    l.land(pool.state, next)
+                })?;
+                self.rs_land(OP, &seat, ext_y, *y)?;
+                // the row's corrected value rides the buffer for the next step
+                self.rs_stash_cols(OP, &seat, u_plane, u_own, 0)
             }
             Ssm::GatedDelta {
                 qkv,

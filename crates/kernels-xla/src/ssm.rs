@@ -608,6 +608,77 @@ pub fn causal_conv1d_committed(
     )
 }
 
+/// The conv's decode step over each lane's committed window (its slot of
+/// `conv_state`) and its carried rows (`carried`, `[lanes, rows, channels]`,
+/// gathered from the rs buffer), then its own row (`x`, one a lane): the
+/// state + buffer step (`carried_conv::conv_step_carried`). The window at
+/// each lane's commit lands in its slot where the commit takes any row
+/// (`seat`'s commit, as the committed form reads it).
+#[allow(clippy::too_many_arguments)]
+pub fn causal_conv1d_carried(
+    f: &mut Func,
+    x: Operand,
+    carried: Val,
+    count: Val,
+    indptr: Operand,
+    seat: Committed<Operand>,
+    weight: Operand,
+    bias: Option<Operand>,
+    conv_state: Operand,
+    conv_width: u32,
+    dilation: u32,
+    y: Landing,
+) -> Result<(Val, Val), Error> {
+    const OP: &str = "ssm.causal_conv1d_carried";
+    expect(OP, x, &[Dtype::Bf16])?;
+    let channels = nonzero(OP, "the conv's channel count", x.width)?;
+    let taps = nonzero(OP, "the conv width this statement states", conv_width)?;
+    let dil = nonzero(OP, "the dilation this statement states", dilation)?;
+    if y.rows != x.rows || y.width != x.width {
+        return Err(refuse(OP, "the conv lands the row it convolves"));
+    }
+    if weight.elements() != u64::from(channels) * u64::from(taps) {
+        return Err(refuse(OP, "the weight is not the conv's channels of taps"));
+    }
+    let hist = u64::from(taps - 1) * u64::from(dil) + 1;
+    let per = slot_rows(OP, "conv", conv_state, hist * u64::from(channels))?;
+    let lanes = LaneTables::Committed { indptr, seat }.lanes(f, OP, i64::from(x.rows))?;
+    let l = f.dims(lanes.slot)[0];
+    if l != i64::from(x.rows) {
+        return Err(refuse(OP, "a decode step's lanes are its rows, one each"));
+    }
+    let (c, k, h) = (i64::from(channels), i64::from(taps), hist as i64);
+    let slab = conv_state.val;
+    let past = take_slots(f, slab, lanes.slot, per)?;
+    let past = f.convert(past, Elem::F32);
+    let window = f.reshape(past, &[l, h, c])?;
+    let carried = f.convert(carried, Elem::F32);
+    let own = x.f32(f);
+    let w = weight.f32(f);
+    let w = f.reshape(w, &[c, k])?;
+    let bias = bias.map(|b| flat_f32(f, b)).transpose()?;
+    let commit = flat_i32(f, seat.commit)?;
+    let lane0 = i64::from(seat.lane0);
+    let commit = f.slice_axis(commit, 0, lane0, lane0 + l)?;
+    let stepped = carried_conv::conv_step_carried(
+        f,
+        &carried_conv::CarriedConv {
+            window,
+            carried,
+            own,
+            count,
+            commit,
+            weight: w,
+            bias,
+        },
+        i64::from(dil),
+    )?;
+    let next = f.reshape(stepped.window, &[l, h * c])?;
+    let next = f.convert(next, f.elem(slab));
+    let slab = land_slots(f, slab, lanes.slot, lanes.write, next, per)?;
+    Ok((stepped.y, slab))
+}
+
 /// `y = conv(state ++ x) + x`, one row per lane.
 /// Reference: kernels-cuda `ssm::conv1d::short_conv` (`ConvOut::Residual`).
 pub fn short_conv(
@@ -1997,6 +2068,121 @@ pub fn gated_delta_committed(
     let input = gdn_in(OP, qkv, gates, k_heads, v_heads, k_dim, v_dim)?;
     let lanes = LaneTables::Committed { indptr, seat };
     delta(f, OP, input, lanes, state, y, tuning)
+}
+
+/// The gated-delta decode step over each lane's committed state (its slot
+/// of `state`) and its carried rows, read as a linear attention (`keys`
+/// `[lanes, rows, k_heads · k_dim]`, corrected values `us` `[lanes, rows,
+/// v_heads · v_dim]` and `[b | a]` rows `ba` `[lanes, rows, 2 · v_heads]`,
+/// gathered from the rs buffer), then its own row (`qkv`, `gates`): the
+/// state + buffer step (`carried::gdn_step_carried`). The carried rows' log
+/// decays are the gate prep's (`gdn_prep`) over their `[b | a]`. Returns the
+/// own row's output and corrected value (`[lanes, v_heads · v_dim]`, f32)
+/// and the bank with the state at each lane's commit landed where the
+/// commit takes any row (`seat`'s commit, as the committed form reads it).
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_carried(
+    f: &mut Func,
+    qkv: Operand,
+    gates: Operand,
+    keys: Val,
+    us: Val,
+    ba: Val,
+    dt_bias: Operand,
+    a_log: Operand,
+    count: Val,
+    indptr: Operand,
+    seat: Committed<Operand>,
+    state: Operand,
+    k_heads: u32,
+    v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+) -> Result<(Val, Val, Val), Error> {
+    const OP: &str = "ssm.gated_delta_carried";
+    let (hk, hv, dk, dv) = (
+        i64::from(k_heads),
+        i64::from(v_heads),
+        i64::from(k_dim),
+        i64::from(v_dim),
+    );
+    if hk == 0 || hv % hk != 0 || dk == 0 || dv == 0 {
+        return Err(refuse(OP, "the heads do not group into key heads"));
+    }
+    if i64::from(qkv.width) != 2 * hk * dk + hv * dv || i64::from(gates.width) != 2 * hv {
+        return Err(refuse(
+            OP,
+            "the `[q | k | v]` or `[g_log | beta]` row is not the heads'",
+        ));
+    }
+    let per = slot_rows(
+        OP,
+        &format!("state ({hv} heads of {dk}x{dv})"),
+        state,
+        (hv * dk * dv) as u64,
+    )?;
+    let lanes = LaneTables::Committed { indptr, seat }.lanes(f, OP, i64::from(qkv.rows))?;
+    let l = f.dims(lanes.slot)[0];
+    if l != i64::from(qkv.rows) {
+        return Err(refuse(OP, "a decode step's lanes are its rows, one each"));
+    }
+    let r = f.dims(keys)[1];
+    let slab = state.val;
+    let s0 = take_slots(f, slab, lanes.slot, per)?;
+    let s0 = f.convert(s0, Elem::F32);
+    let s0 = f.reshape(s0, &[l, hv, dk, dv])?;
+    let row = qkv.f32(f);
+    let q = f.slice_axis(row, 1, 0, hk * dk)?;
+    let q = f.reshape(q, &[l, hk, dk])?;
+    let k = f.slice_axis(row, 1, hk * dk, 2 * hk * dk)?;
+    let k = f.reshape(k, &[l, hk, dk])?;
+    let v = f.slice_axis(row, 1, 2 * hk * dk, 2 * hk * dk + hv * dv)?;
+    let v = f.reshape(v, &[l, hv, dv])?;
+    let g = gates.f32(f);
+    let decay = f.slice_axis(g, 1, 0, hv)?;
+    let beta = f.slice_axis(g, 1, hv, 2 * hv)?;
+    let keys = f.convert(keys, Elem::F32);
+    let keys = f.reshape(keys, &[l, r, hk, dk])?;
+    let us = f.convert(us, Elem::F32);
+    let us = f.reshape(us, &[l, r, hv, dv])?;
+    // the carried rows' log decays, as `gdn_prep` forms them
+    let ba = f.convert(ba, Elem::F32);
+    let a = f.slice_axis(ba, 2, hv, 2 * hv)?;
+    let db = flat_f32(f, dt_bias)?;
+    let db = f.broadcast(db, &[l, r, hv], &[2])?;
+    let z = f.add(a, db)?;
+    let sp = softplus20(f, z)?;
+    let al = flat_f32(f, a_log)?;
+    let al = f.exp(al);
+    let al = f.broadcast(al, &[l, r, hv], &[2])?;
+    let decays = f.mul(al, sp)?;
+    let decays = f.neg(decays);
+    let commit = flat_i32(f, seat.commit)?;
+    let lane0 = i64::from(seat.lane0);
+    let commit = f.slice_axis(commit, 0, lane0, lane0 + l)?;
+    let stepped = carried::gdn_step_carried(
+        f,
+        &carried::Carried {
+            state: s0,
+            keys,
+            values: us,
+            decays,
+            count,
+            commit,
+            q,
+            k,
+            v,
+            decay,
+            beta,
+        },
+        (1.0 / (dk as f64).sqrt()) as f32,
+    )?;
+    let y = f.reshape(stepped.y, &[l, hv * dv])?;
+    let u = f.reshape(stepped.u, &[l, hv * dv])?;
+    let next = f.reshape(stepped.state, &[l, hv * dk * dv])?;
+    let next = f.convert(next, f.elem(slab));
+    let slab = land_slots(f, slab, lanes.slot, lanes.write, next, per)?;
+    Ok((y, u, slab))
 }
 
 fn kda_in(

@@ -2245,7 +2245,12 @@ impl Shell {
                         at: "serve::rs",
                         why: format!("lane {at}: {e}"),
                     })?;
-                carried += reads.iter().map(|r| r.len() as u32).sum::<u32>();
+                // a decode lane's carried rows are its step's input, no rows
+                // of the fire (`engine::fire::lane_carried`)
+                carried += engine::fire::lane_carried(
+                    seated.positions.len() as u32,
+                    reads.iter().map(|r| r.len() as u32).sum::<u32>(),
+                );
             }
         }
         // A fire carries at most its rung's tokens of carried rows, summed
@@ -2878,6 +2883,7 @@ impl Shell {
                 // nothing, for its own rows alone.
                 let replays = carried > 0;
                 let mut maps = std::collections::HashMap::new();
+                let mut carried_maps = std::collections::HashMap::new();
                 for window in windows.all() {
                     if window.indptr_host.is_empty() {
                         continue;
@@ -2894,6 +2900,32 @@ impl Shell {
                         paging.page_size.max(1),
                         replays.then_some(descriptor.bucket),
                     )?;
+                    // a window of single-token lanes runs each layer's decode
+                    // form, the state + buffer step over its carried rows
+                    let lanes = window.indptr_host.len().saturating_sub(1) as u32;
+                    if lanes > 0 && window.indptr_host.windows(2).all(|w| w[1] - w[0] == 1) {
+                        let step = crate::rs::CarriedMap::of(
+                            &rs_plans,
+                            lanes,
+                            span.lane_offset,
+                            paging.page_size.max(1),
+                            crate::rs::carried_room(descriptor.bucket),
+                        )?;
+                        let rows: Vec<i32> = step
+                            .buffer_rows
+                            .iter()
+                            .map(|&r| if r == crate::rs::DROP { 0 } else { r })
+                            .collect();
+                        carried_maps.insert(
+                            key,
+                            crate::rs::CarriedInputs {
+                                rows: step.rows,
+                                buffer_rows: inputs.i32s(handles, &rows, 1),
+                                count: inputs.i32s(handles, &step.count, 1),
+                                commit: inputs.i32s(handles, &step.commit, 1),
+                            },
+                        );
+                    }
                     maps.insert(
                         key,
                         crate::rs::WindowInputs {
@@ -2918,6 +2950,7 @@ impl Shell {
                     buffers: self.pools.rs_buffers(),
                     page_tokens: paging.page_size.max(1),
                     maps,
+                    carried: carried_maps,
                     ext: std::cell::RefCell::new(std::collections::HashMap::new()),
                 }))
             }
