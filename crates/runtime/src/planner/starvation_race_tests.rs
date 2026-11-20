@@ -8935,3 +8935,25 @@ fn a_victim_is_restored_only_once_its_head_has_fired_on_the_room() {
     drop(head_fire);
     drop(fire);
 }
+
+/// Mac Pro at 5 GiB on 5aa45805b: an eviction's copy refused untouched by
+/// the engine (state the runtime placed inside its carve) failed the
+/// process: a beam lost. A copy refused untouched takes the eviction back
+/// and keeps the process, no victim again until the pool moves.
+#[test]
+fn an_eviction_copy_refused_untouched_keeps_its_process() {
+    let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::with_swap(8, 64))));
+    let pid = ProcessId::new_v4();
+    planner.register(pid);
+    planner.note_admitted(pid);
+    planner.with_inner(|inner| {
+        let _ = inner.begin_eviction(pid, Reclaim::default());
+    });
+    planner.eviction_copy_refused(pid, "kv to LocalDisk copy: impossible submission: ...");
+    planner.with_inner(|inner| {
+        assert_eq!(inner.procs[&pid].state, Residency::Resident, "kept, resident");
+        assert!(!inner.killing.contains(&pid), "not failed");
+        assert!(inner.prepare_blocked.contains(&pid), "no victim until the pool moves");
+        assert!(inner.evicting.is_empty(), "its eviction is settled");
+    });
+}

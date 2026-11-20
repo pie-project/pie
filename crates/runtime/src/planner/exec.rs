@@ -531,13 +531,13 @@ impl MoveGuard {
     }
 
     /// Submits every copy of the move, then waits for them all.
-    async fn copy(&mut self, planner: &ResidencyPlanner, pid: ProcessId) -> Result<(), String> {
+    async fn copy(&mut self, planner: &ResidencyPlanner, pid: ProcessId) -> Result<(), CopyFailure> {
         let mut waits = Vec::new();
         for copy in self.txn.as_ref().expect("move present").copies() {
             tracing::debug!(pid = %pid, copy = %copy.label(), count = copy.device.len(), "planner: residency copy");
             let started = Instant::now();
             let completion = crate::scheduler::copy_tier_tracked(self.engine, &copy)
-                .map_err(|error| format!("{} submit: {error:#}", copy.label()))?;
+                .map_err(|error| CopyFailure::of(&copy.label(), "submit", &error))?;
             self.submitted = true;
             self.in_flight.push(completion.clone());
             waits.push((copy, started, completion));
@@ -551,7 +551,7 @@ impl MoveGuard {
                 started.elapsed().as_millis()
             );
             planner.record_tier_copy(&copy, started.elapsed());
-            copied.map_err(|error| format!("{} copy: {error}", copy.label()))?;
+            copied.map_err(|error| CopyFailure::of(&copy.label(), "copy", &error))?;
         }
         self.in_flight.clear();
         Ok(())
@@ -559,6 +559,39 @@ impl MoveGuard {
 
     fn take(&mut self) -> Move {
         self.txn.take().expect("move present")
+    }
+}
+
+/// A residency move's copy that did not land: what it says, and whether
+/// the engine refused it before reading or writing any of it (its state
+/// lies where it lay, untouched: a placement the engine will not copy,
+/// the runtime's own doing, never the process's fault).
+#[derive(Debug)]
+pub(super) struct CopyFailure {
+    message: String,
+    untouched: bool,
+}
+
+impl CopyFailure {
+    fn of(label: &str, step: &str, error: &anyhow::Error) -> Self {
+        Self {
+            message: format!("{label} {step}: {error:#}"),
+            untouched: error
+                .chain()
+                .any(|cause| cause.downcast_ref::<crate::scheduler::RefusedUntouched>().is_some()),
+        }
+    }
+}
+
+impl std::fmt::Display for CopyFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<CopyFailure> for String {
+    fn from(failure: CopyFailure) -> Self {
+        failure.message
     }
 }
 
@@ -754,7 +787,14 @@ pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     let mut guard = MoveGuard::new(model, engine, Move::Suspend { kv, rs, roles });
     if let Err(error) = guard.copy(&planner, pid).await {
         tracing::warn!(pid = %pid, %error, "planner: eviction copy failed");
-        planner.eviction_copy_failed(pid, &error);
+        if error.untouched {
+            // Refused untouched: its state lies where it lay, and the move
+            // is taken back; the process stays as it was.
+            drop(guard);
+            planner.eviction_copy_refused(pid, &error.message);
+        } else {
+            planner.eviction_copy_failed(pid, &error.message);
+        }
         return;
     }
     let copied = began.elapsed();

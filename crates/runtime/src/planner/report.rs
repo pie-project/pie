@@ -83,6 +83,24 @@ impl ResidencyPlanner {
         self.poke();
     }
 
+    /// An eviction whose copy the engine refused before reading or writing
+    /// any of it (a placement it will not copy: the runtime's own doing,
+    /// never the process's): the move is taken back, the process stays
+    /// resident, and it is no victim again until the pool moves past the
+    /// refusal, said as the runtime's bug. Failed for it, a beam lost its
+    /// process (Mac Pro at 5 GiB on 5aa45805b: "state chunk 1936 ... lies
+    /// inside the activation span's backed carve").
+    pub(super) fn eviction_copy_refused(self: &Arc<Self>, pid: ProcessId, error: &str) {
+        tracing::error!(
+            pid = %pid,
+            %error,
+            "planner: the engine refused an eviction's copy untouched: the runtime placed state \
+             it will not copy (a runtime bug); the eviction is taken back, the process kept"
+        );
+        self.stats.eviction_faults.fetch_add(1, Ordering::Relaxed);
+        self.eviction_failed_inner(pid, false, true);
+    }
+
     pub(super) fn eviction_found_nothing(self: &Arc<Self>, pid: ProcessId) {
         self.eviction_failed_inner(pid, false, true);
     }

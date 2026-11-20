@@ -32,9 +32,16 @@ pub(crate) struct ControlCompletion {
 }
 
 struct ControlCompletionState {
-    result: Mutex<Option<std::result::Result<(), String>>>,
+    result: Mutex<Option<std::result::Result<(), (String, bool)>>>,
     notify: tokio::sync::Notify,
 }
+
+/// An engine refused a control (a copy) before reading or writing any of
+/// it: its submission was impossible as stated (`engine::Error::Impossible`).
+/// What it would have moved lies where it lay.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct RefusedUntouched(pub String);
 
 impl ControlCompletion {
     fn new() -> Self {
@@ -49,23 +56,36 @@ impl ControlCompletion {
     pub(crate) async fn wait(&self) -> Result<()> {
         loop {
             if let Some(result) = self.inner.result.lock().unwrap().clone() {
-                return result.map_err(anyhow::Error::msg);
+                return result.map_err(Self::error);
             }
             let notified = self.inner.notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             if let Some(result) = self.inner.result.lock().unwrap().clone() {
-                return result.map_err(anyhow::Error::msg);
+                return result.map_err(Self::error);
             }
             notified.await;
         }
     }
 
+    fn error((message, untouched): (String, bool)) -> anyhow::Error {
+        if untouched {
+            anyhow::Error::new(RefusedUntouched(message))
+        } else {
+            anyhow::Error::msg(message)
+        }
+    }
+
     fn resolve(&self, result: &Result<()>) {
-        let result = result
-            .as_ref()
-            .map(|_| ())
-            .map_err(|error| format!("{error:#}"));
+        let result = result.as_ref().map(|_| ()).map_err(|error| {
+            let untouched = error.chain().any(|cause| {
+                matches!(
+                    cause.downcast_ref::<::engine::Error>(),
+                    Some(::engine::Error::Impossible(_))
+                )
+            });
+            (format!("{error:#}"), untouched)
+        });
         *self.inner.result.lock().unwrap() = Some(result);
         self.inner.notify.notify_waiters();
     }
@@ -578,5 +598,28 @@ mod abort_tests {
             !freed.load(Ordering::SeqCst),
             "copies that did not settle keep their slots out"
         );
+    }
+}
+
+#[cfg(test)]
+mod refused_untouched_tests {
+    use super::*;
+
+    /// An engine refusing a copy as impossible (before reading or writing
+    /// any of it) is told apart from a copy that failed: the waiter can
+    /// take the move back rather than fail the process.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_copy_refused_as_impossible_is_told_untouched() {
+        let refused = ControlCompletion::new();
+        refused.resolve(&Err(anyhow::Error::new(::engine::Error::Impossible(
+            "state chunk 1936 lies inside the carve".into(),
+        ))
+        .context("kv to LocalDisk copy")));
+        let error = refused.wait().await.expect_err("refused");
+        assert!(error.downcast_ref::<RefusedUntouched>().is_some(), "{error:#}");
+        let failed = ControlCompletion::new();
+        failed.resolve(&Err(anyhow::anyhow!("device lost")));
+        let error = failed.wait().await.expect_err("failed");
+        assert!(error.downcast_ref::<RefusedUntouched>().is_none(), "{error:#}");
     }
 }
