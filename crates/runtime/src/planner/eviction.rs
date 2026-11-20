@@ -318,10 +318,12 @@ impl ResidencyPlanner {
             }
         }
         if !unhostable.is_empty() {
+            let pool_now = self.pool_now();
             self.with_inner(|inner| {
                 for pid in &unhostable {
                     inner.host_swap_blocked.insert(*pid);
                 }
+                inner.blocked_at = Some(pool_now);
             });
             self.record_host_swap_exhaustion();
         }
@@ -360,7 +362,40 @@ impl ResidencyPlanner {
         }
     }
 
+    /// The pool's room count and the swap tiers' free slots now: what a
+    /// block of a victim is set on ([`Self::lapse_blocks`]).
+    pub(super) fn pool_now(&self) -> (u64, u32) {
+        let (host_free, _) = self.port.host_stats();
+        let (disk_free, _) = self.port.disk_stats();
+        (self.port.room_gives(), host_free.saturating_add(disk_free))
+    }
+
+    /// Victims blocked (their move found no swap room, or nothing to move)
+    /// go back among the candidates once the pool has moved past the
+    /// block: room given back, or swap slots freed. Cleared only by a
+    /// restore or a departure, a block outlived the pool it was set on, and
+    /// a stall where neither came kept every such resident out of the
+    /// victim set for good. Never on the same pool twice.
+    pub(super) fn lapse_blocks(&self) {
+        let blocked = self.with_inner(|inner| inner.blocked_at);
+        let Some(at) = blocked else {
+            return;
+        };
+        let now = self.pool_now();
+        if now.0 == at.0 && now.1 <= at.1 {
+            return;
+        }
+        self.with_inner(|inner| {
+            if inner.blocked_at == Some(at) {
+                inner.host_swap_blocked.clear();
+                inner.prepare_blocked.clear();
+                inner.blocked_at = None;
+            }
+        });
+    }
+
     pub(super) fn victim_set(&self) -> Option<VictimSet> {
+        self.lapse_blocks();
         let (free, _) = self.port.device_stats();
         let (rs_free, rs_total) = self.port.rs_stats();
         let rs_growth = self.rs_growth();

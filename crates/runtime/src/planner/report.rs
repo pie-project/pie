@@ -98,7 +98,11 @@ impl ResidencyPlanner {
         host_swap_full: bool,
         found_nothing: bool,
     ) {
+        let pool_now = self.pool_now();
         let signal = self.with_inner(|inner| {
+            if host_swap_full || found_nothing {
+                inner.blocked_at = Some(pool_now);
+            }
             // One that left meanwhile is settled by its departure.
             if inner.procs.contains_key(&pid) {
                 inner.settle_eviction(pid);

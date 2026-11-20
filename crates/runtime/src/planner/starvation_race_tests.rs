@@ -6183,3 +6183,60 @@ async fn a_bind_suspended_restore_is_funded_beside_its_own_retake() {
         "the resident holding a run beside them is moved for it"
     );
 }
+
+/// A victim blocked when its move found no swap room (or nothing to move)
+/// goes back among the candidates once the pool has moved past the block:
+/// never on the same pool twice, and never held out for good. Cleared only
+/// by a restore or a departure, the block outlived the pool it was set on,
+/// and a stall in which neither came kept the resident out of every victim
+/// set, the head waiting with no one to move.
+#[tokio::test(flavor = "current_thread")]
+async fn a_blocked_victim_is_a_candidate_again_once_the_pool_moves() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 0));
+    pool.disk_free.store(4, Ordering::Relaxed);
+    pool.free.lock().extend([0, 2, 4, 6]);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (head, resident) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [head, resident] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    let pool_now = planner.pool_now();
+    planner.with_inner(|inner| {
+        inner.procs.get_mut(&resident).unwrap().idle = true;
+        inner.enqueue(
+            head,
+            WaitKind::BindRoom {
+                run: 2,
+                pieces: 1,
+                pages: 2,
+                notify: Arc::new(Notify::new()),
+                served: false,
+                withdrawn: false,
+                rise: None,
+            },
+        );
+        inner.host_swap_blocked.insert(resident);
+        inner.blocked_at = Some(pool_now);
+    });
+    let members = |planner: &ResidencyPlanner| {
+        planner
+            .victim_set()
+            .map(|set| set.members.iter().map(|v| v.pid).collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+    assert!(members(&planner).is_empty(), "blocked on the pool as it stands");
+    // Room given back elsewhere: the pool has moved past the block.
+    pool.gives.fetch_add(1, Ordering::Relaxed);
+    assert_eq!(members(&planner), vec![resident], "a candidate again");
+    // Blocked again on the new pool, it stays out until that moves too.
+    let pool_now = planner.pool_now();
+    planner.with_inner(|inner| {
+        inner.host_swap_blocked.insert(resident);
+        inner.blocked_at = Some(pool_now);
+    });
+    assert!(members(&planner).is_empty(), "never on the same pool twice");
+    pool.disk_free.fetch_add(1, Ordering::Relaxed);
+    assert_eq!(members(&planner), vec![resident], "swap slots freed: a candidate again");
+}

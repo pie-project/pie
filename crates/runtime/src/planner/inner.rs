@@ -34,6 +34,10 @@ pub(super) struct Inner {
     pub(super) completion_credit: u32,
     pub(super) host_swap_blocked: HashSet<ProcessId>,
     pub(super) prepare_blocked: HashSet<ProcessId>,
+    /// The pool's room count and the swap tiers' free slots when the last
+    /// of those blocks was set ([`super::ResidencyPlanner::lapse_blocks`]):
+    /// a block holds only on the pool it was set on.
+    pub(super) blocked_at: Option<(u64, u32)>,
     pub(super) killing: HashSet<ProcessId>,
     pub(super) admitting: BTreeMap<(Rank, ProcessId), Arc<Notify>>,
     pub(super) to_end: super::to_end::ToEnd,
