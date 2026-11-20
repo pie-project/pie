@@ -2887,7 +2887,13 @@ where
             && let Some(watch) = &watch
         {
             tracing::debug!(%pid, %key, "a bind waits for its pair's move to land");
-            crate::inferlet::process::said("bind: its pair's move", pid, watch.clone().freed()).await;
+            let freed = watch.clone().freed();
+            crate::inferlet::process::said("bind: its pair's move", pid, async move {
+                // Waiting on its pair's move: its owner is parked here.
+                let _parked = crate::inferlet::process::parks_here();
+                freed.await
+            })
+            .await;
             continue;
         }
         if let Some((run, pieces)) = error
@@ -3053,6 +3059,8 @@ pub async fn grow_for_guest(
             }
         }
         crate::store::shared::ask_walk(engine);
+        // Waiting on a segment's commit: its owner is parked here.
+        let _parked = crate::inferlet::process::parks_here();
         watch.await;
     }
 }

@@ -211,9 +211,6 @@ pub(crate) struct FramePolicy {
     /// Owners blocked on the planner or a store ([`Self::on_owner_waits`])
     /// until their wait ends ([`Self::on_owner_unblocked`]).
     blocked: BTreeSet<ProcessId>,
-    /// A seal for a parked owner's complete frame ([`Self::seal_owner_now`])
-    /// is under way: every ready lane goes, whatever the boundary.
-    seal_regardless: bool,
     truncated_seqs: BTreeMap<ProcessId, u64>,
     strict_watchdog_deadline: Option<Instant>,
     /// When a held frame last said which lanes it waits on.
@@ -310,7 +307,6 @@ impl FramePolicy {
             departing: BTreeSet::new(),
             suspended: BTreeSet::new(),
             blocked: BTreeSet::new(),
-            seal_regardless: false,
             truncated_seqs: BTreeMap::new(),
             strict_watchdog_deadline: None,
             hold_said: None,
@@ -367,13 +363,6 @@ impl FramePolicy {
                 rung_rows,
             },
         );
-        // A fire of an owner parked or blocked: nothing more of it is
-        // coming while it is, so its frame goes at once, not at a boundary.
-        if let Some(owner) = owner
-            && (self.suspended.contains(&owner) || self.blocked.contains(&owner))
-        {
-            self.seal_owner_now(owner);
-        }
         if let (Some(began), Some(stats)) = (accept_began, &self.stats) {
             use std::sync::atomic::Ordering::Relaxed;
             stats
@@ -406,7 +395,10 @@ impl FramePolicy {
             self.joins_in_flight.remove(&owner);
         }
         let lane_owner = owner.or_else(|| self.lanes.get(&stamp.lane).and_then(|lane| lane.owner));
-        let suspended = lane_owner.is_some_and(|owner| self.suspended.contains(&owner));
+        // An owner suspended or blocked is not waited for: a fire of its
+        // that raced its park rides the next seal, its lane not expected.
+        let suspended = lane_owner
+            .is_some_and(|owner| self.suspended.contains(&owner) || self.blocked.contains(&owner));
         let late = match self.truncated_seqs.get(&stamp.lane).copied() {
             Some(seq) if seq == stamp.seq => true,
             Some(seq) if seq < stamp.seq => {
@@ -690,7 +682,8 @@ impl FramePolicy {
     /// submit ([`Self::record_arrival`]).
     /// For a test of the waits that park an owner: `owner`'s lane fired at
     /// a boundary another lane holds open, its next frame complete; told
-    /// it waits, its frame goes at once.
+    /// it waits, no frame waits on it: its frame rides the seal the other,
+    /// still expected, lane completes.
     #[cfg(test)]
     pub(crate) fn parked_owner_frame_goes_at_once(owner: ProcessId) -> bool {
         Self::parked_owner_frame_goes_at_once_by(owner, false)
@@ -728,11 +721,17 @@ impl FramePolicy {
         } else {
             policy.on_owner_waits(owner);
         }
-        let goes = matches!(
+        // The other lane, still expected, submits: the parked owner's frame
+        // rides the seal it completes, one frame of both.
+        policy.on_fire_enqueued(stamp(other, 1), Some(other), 4, 1, 1);
+        let queued: QueuedFireIds = [3, 4].into_iter().collect();
+        let rides = matches!(
             policy.plan_dispatch(&queued, &HashSet::new(), false, now),
-            FramePlan::Dispatch(waves) if waves.iter().flatten().any(|&id| id == 3)
+            FramePlan::Dispatch(waves)
+                if waves.iter().flatten().any(|&id| id == 3)
+                    && waves.iter().flatten().any(|&id| id == 4)
         );
-        !held && goes
+        !held && rides
     }
 
     pub fn on_owner_waits(&mut self, owner: ProcessId) {
@@ -754,58 +753,41 @@ impl FramePolicy {
                 lane.awaited = false;
                 lane.parked = true;
             }
+            // Kept, drained or not: its owner's return makes it expected
+            // again ([`Self::expect_again`]), before its next submit.
             self.truncate_incomplete(lane_id);
-            let drained = self
-                .lanes
-                .get(&lane_id)
-                .is_some_and(|lane| lane.frames.is_empty());
-            if drained {
-                self.lanes.remove(&lane_id);
-            }
         }
         // Not joining while it waits: it holds no frame back as one.
         self.forget_staged(owner);
-        self.seal_owner_now(owner);
         self.maybe_reset_episode();
-    }
-
-    /// `owner`'s complete frames are not held: parked (suspended, or
-    /// waiting on the planner or a store), it submits nothing more, and what
-    /// waits on these fires (its eviction's wait on their leases, its bind's
-    /// settle) must not wait on lanes whose owners wait on the planner in
-    /// turn (the disk-only soaks: a complete front frame of a parked owner
-    /// never sealed while the boundary stayed open, its eviction waiting on
-    /// its lease for good). The seal decision runs now, its lanes no longer
-    /// expected, over every lane ready at this moment: the owner's frame
-    /// goes with whatever else is ready, not alone (sealed alone, each
-    /// parked owner's fires went as frames of their own, a full forward
-    /// each, and batches fragmented with dozens of owners blocked).
-    fn seal_owner_now(&mut self, owner: ProcessId) {
-        let ready = self.lanes.values().any(|lane| {
-            lane.owner == Some(owner) && lane.frames.front().is_some_and(PendingFrame::is_complete)
-        });
-        if !ready {
-            return;
-        }
-        self.seal_regardless = true;
-        while self.lanes.values().any(|lane| {
-            lane.owner == Some(owner) && lane.frames.front().is_some_and(PendingFrame::is_complete)
-        }) {
-            if self.seal().is_none() {
-                break;
-            }
-        }
-        self.seal_regardless = false;
     }
 
     /// `owner`'s wait on the planner or a store ended, before control went
     /// back to its guest: its next fires are awaited as before.
     pub fn on_owner_unblocked(&mut self, owner: ProcessId) {
         self.blocked.remove(&owner);
+        self.expect_again(owner);
     }
 
     pub fn on_process_resume(&mut self, owner: ProcessId) {
         self.suspended.remove(&owner);
+        self.expect_again(owner);
+    }
+
+    /// `owner` neither suspended nor blocked now: its parked lanes are
+    /// expected again, its next submit coming. Forgotten until that submit,
+    /// a frame sealed at another's park went without them, and batches
+    /// split at every block.
+    fn expect_again(&mut self, owner: ProcessId) {
+        if self.suspended.contains(&owner) || self.blocked.contains(&owner) {
+            return;
+        }
+        for lane in self.lanes.values_mut() {
+            if lane.owner == Some(owner) && lane.parked && !lane.leashed {
+                lane.parked = false;
+                lane.awaited = true;
+            }
+        }
     }
 
     fn truncate_incomplete(&mut self, lane_id: ProcessId) {
@@ -868,10 +850,7 @@ impl FramePolicy {
         if !self.have_seal_candidate() {
             return None;
         }
-        // A parked owner's seal ([`Self::seal_owner_now`]) takes every ready
-        // lane, fresh or continuing, and leaves the boundary as it stands.
-        let open = self.boundary_open();
-        let mid_boundary = open && !self.seal_regardless;
+        let mid_boundary = self.boundary_open();
 
         let k = self.k;
         let max_wave_rows = self.max_wave_rows;
@@ -933,7 +912,6 @@ impl FramePolicy {
             // beside a prompt: alone they would split the wave those lanes
             // rejoin.
             if self.prompts_only
-                && !self.seal_regardless
                 && !order.iter().any(|lane| {
                     self.lanes.get(lane).is_some_and(|state| {
                         state.frames.front().is_some_and(|front| {
@@ -973,10 +951,6 @@ impl FramePolicy {
                 let Some(lane) = self.lanes.get_mut(lane_id) else {
                     continue;
                 };
-                let parked_owner = lane.parked
-                    || lane.owner.is_some_and(|owner| {
-                        self.suspended.contains(&owner) || self.blocked.contains(&owner)
-                    });
                 let Some(front) = lane.frames.front() else {
                     continue;
                 };
@@ -1027,12 +1001,9 @@ impl FramePolicy {
                     continue;
                 }
                 let prompting = live.iter().any(|fire| fire.tokens > fire.rows);
-                // A parked owner's prompt is not held behind another in
-                // flight: nothing more of it comes while it is parked.
                 if prompting
                     && !mid_boundary
                     && !self.prompts_only
-                    && !(self.seal_regardless && parked_owner)
                     && prompting_in_flight.iter().any(|lane| lane != lane_id)
                 {
                     continue;
@@ -1071,7 +1042,9 @@ impl FramePolicy {
                     continue;
                 }
                 self.lanes
-                    .retain(|_, lane| lane.awaited || lane.leashed || !lane.frames.is_empty());
+                    .retain(|_, lane| {
+                        lane.awaited || lane.leashed || lane.parked || !lane.frames.is_empty()
+                    });
                 return None;
             }
             if super::worker::wave_trace() {
@@ -1094,7 +1067,7 @@ impl FramePolicy {
                     self.executing_now
                 ));
             }
-            if !open && !self.prompts_only {
+            if !mid_boundary && !self.prompts_only {
                 self.open_boundary();
             }
             for member in &members {
@@ -1111,7 +1084,9 @@ impl FramePolicy {
                 widest: sealed_widest,
             });
             self.lanes
-                .retain(|_, lane| lane.awaited || lane.leashed || !lane.frames.is_empty());
+                .retain(|_, lane| {
+                        lane.awaited || lane.leashed || lane.parked || !lane.frames.is_empty()
+                    });
             return Some(FramePlan::Dispatch(Vec::new()));
         }
     }
@@ -1559,8 +1534,9 @@ mod tests {
     /// boundary, and the boundary stayed open on lanes whose owners waited
     /// on the planner's grants. Its frame was never sealed, so its fire
     /// never ran, its lease never went back, and its eviction waited on it
-    /// for good. Parked (suspended, or waiting at its bind), an owner's
-    /// complete frames go to the engine at once, not at a boundary.
+    /// for good. Parked (suspended, or waiting at its bind), an owner is
+    /// waited on by no frame; with the other owner blocked on its grant too,
+    /// no lane is expected and the frame goes.
     fn a_parked_owner_s_complete_frame_goes_without_waiting_on_the_boundary() {
         for suspend in [true, false] {
             let mut policy = FramePolicy::new(1, 64, 4096, None)
@@ -1584,80 +1560,154 @@ mod tests {
                 !matches!(&held, FramePlan::Dispatch(waves) if waves.iter().flatten().any(|&id| id == 3)),
                 "control: mid boundary, it waits for the other lane: {held:?}"
             );
-            // Its guest goes into a bind that waits, or it is evicted.
+            // Its guest goes into a bind that waits, or it is evicted: no
+            // frame waits on it.
             if suspend {
                 policy.on_process_suspend(binder);
             } else {
                 policy.on_owner_waits(binder);
             }
+            // The other owner, blocked on its grant, is waited on by no one
+            // either: no lane is expected, and the binder's frame goes.
+            policy.on_owner_waits(waiting);
             assert_eq!(
                 fires(&plan(&mut policy, &queued, Instant::now())),
                 vec![3],
-                "parked, its complete frame goes at once"
+                "no lane left expected: its complete frame goes"
             );
         }
     }
 
-    /// Frames under pressure: 32 lanes, one fire each a round, a quarter of
-    /// the owners blocking on the planner each round and coming back the
-    /// next. A parked owner's complete frame is never held, and it goes with
-    /// whatever else is ready, not alone: blocking after the whole round has
-    /// submitted, every frame is as wide as with no one blocking; blocking
-    /// as each submits (the worst case), the round splits only at each block.
-    /// Prints frames and lanes per frame for each case.
+    /// The frame / eviction cycle (a process waited at admission behind a
+    /// preempted one, then its eviction waited on its set's fires, which
+    /// sat in an unsealed frame): 42 lanes, 41 of them in with complete
+    /// frames, the 42nd mid-frame (one of its two fires in). Its owner's
+    /// eviction starts: its lane leaves the expected set, its front cut to
+    /// what it submitted, and the frame seals at once, all 42 lanes' fires
+    /// in one seal and one dispatch, none of them sent apart; the evicted
+    /// owner's fire is with the engine, so the eviction's wait on it ends.
+    #[test]
+    fn an_owner_s_eviction_seals_the_frame_it_holds_whole() {
+        let mut policy =
+            FramePolicy::new(1, 64, 4096, None).with_submit_deadline(Duration::from_secs(86_400));
+        let lanes: Vec<ProcessId> = (0..42).map(|_| pid()).collect();
+        // A first frame of all 42: every lane is expected after it.
+        for (at, &lane) in lanes.iter().enumerate() {
+            policy.on_fire_enqueued(stamp(lane, 0, 0, 1), Some(lane), at as u64 + 1, 1, 1);
+        }
+        let queued: QueuedFireIds = (1..=42).collect();
+        assert_eq!(fires(&plan(&mut policy, &queued, Instant::now())).len(), 42);
+        policy.on_frame_posted(lanes.clone(), Instant::now());
+        policy.on_frame_retired(lanes.clone());
+        // The next frame: 41 lanes in, the 42nd one fire of two.
+        let mut queued: Vec<u64> = Vec::new();
+        for (at, &lane) in lanes.iter().enumerate().take(41) {
+            policy.on_fire_enqueued(stamp(lane, 1, 0, 1), Some(lane), 100 + at as u64, 1, 1);
+            queued.push(100 + at as u64);
+        }
+        let evicted = lanes[41];
+        policy.on_fire_enqueued(stamp(evicted, 1, 0, 2), Some(evicted), 200, 1, 1);
+        queued.push(200);
+        let ids: QueuedFireIds = queued.iter().copied().collect();
+        assert!(
+            !matches!(plan(&mut policy, &ids, Instant::now()), FramePlan::Dispatch(_)),
+            "control: the 42nd lane is expected and mid-frame: the frame waits"
+        );
+        // Its eviction starts.
+        policy.on_process_suspend(evicted);
+        let FramePlan::Dispatch(waves) = plan(&mut policy, &ids, Instant::now()) else {
+            panic!("its eviction seals the frame at once");
+        };
+        let sent: Vec<u64> = waves.iter().flatten().copied().collect();
+        assert_eq!(sent.len(), 42, "all 42 lanes' fires in the one seal: {waves:?}");
+        assert!(sent.contains(&200), "the evicted owner's fire goes with the engine");
+        assert_eq!(waves.iter().filter(|wave| !wave.is_empty()).count(), 1, "one dispatch");
+        let rest: QueuedFireIds = std::iter::empty().collect();
+        assert!(
+            !matches!(plan(&mut policy, &rest, Instant::now()), FramePlan::Dispatch(_)),
+            "nothing sent apart"
+        );
+    }
+
+    /// Frames under pressure: 32 lanes, one frame each a round (one fire
+    /// at k=1, two slots at k=2), a quarter of the owners blocking on the
+    /// planner each round and coming back the next. A blocked owner is never
+    /// waited for: its lanes leave the expected set, and what it submitted
+    /// rides the frame the remaining expected lanes complete. So under every
+    /// pattern (no one blocking; blocking once the round is in; blocking
+    /// right after each own submit) a round is one seal, each seal k
+    /// dispatches (one per slot, none out of frame), each dispatch a row per
+    /// lane: as wide as with no one blocking. Prints seals, dispatches per
+    /// seal and rows per dispatch for each.
     #[test]
     fn owners_blocking_under_pressure_keep_frames_whole() {
         const LANES: usize = 32;
         const ROUNDS: usize = 20;
         // 0: no one blocks; 1: a quarter block once the round is in; 2: a
         // quarter block each right after its own submit.
-        let run = |mode: u8| -> (usize, usize) {
-            let mut policy = FramePolicy::new(1, 64, 4096, None)
+        let run = |mode: u8, k: usize| -> (usize, usize, usize) {
+            let mut policy = FramePolicy::new(k, 64, 4096, None)
                 .with_submit_deadline(Duration::from_secs(86_400));
             let lanes: Vec<ProcessId> = (0..LANES).map(|_| pid()).collect();
             let mut blocked: Vec<ProcessId> = Vec::new();
             let mut lane_of: HashMap<u64, ProcessId> = HashMap::new();
             let mut queued: Vec<u64> = Vec::new();
-            let (mut frames, mut fired) = (0usize, 0usize);
+            let (mut seals, mut dispatches, mut rows) = (0usize, 0usize, 0usize);
             let mut next_id = 1u64;
+            let drain = |policy: &mut FramePolicy,
+                         queued: &mut Vec<u64>,
+                         lane_of: &HashMap<u64, ProcessId>|
+             -> (usize, usize, usize) {
+                let (mut seals, mut dispatches, mut rows) = (0, 0, 0);
+                loop {
+                    let ids: QueuedFireIds = queued.iter().copied().collect();
+                    match plan(policy, &ids, Instant::now()) {
+                        FramePlan::Dispatch(waves) => {
+                            seals += 1;
+                            for wave in waves.iter().filter(|wave| !wave.is_empty()) {
+                                dispatches += 1;
+                                rows += wave.len();
+                            }
+                            let posted: Vec<u64> = waves.iter().flatten().copied().collect();
+                            queued.retain(|id| !posted.contains(id));
+                            let mut members: Vec<ProcessId> =
+                                posted.iter().map(|id| lane_of[id]).collect();
+                            members.sort_unstable();
+                            members.dedup();
+                            policy.on_frame_posted(members.clone(), Instant::now());
+                            policy.on_frame_retired(members);
+                        }
+                        _ => return (seals, dispatches, rows),
+                    }
+                }
+            };
             for round in 0..ROUNDS {
                 for owner in blocked.drain(..) {
                     policy.on_owner_unblocked(owner);
                 }
-                let blocks = |at: usize| mode > 0 && (at + round) % 4 == 0;
-                let drain = |policy: &mut FramePolicy,
-                             queued: &mut Vec<u64>,
-                             lane_of: &HashMap<u64, ProcessId>|
-                 -> (usize, usize) {
-                    let (mut frames, mut fired) = (0, 0);
-                    loop {
-                        let ids: QueuedFireIds = queued.iter().copied().collect();
-                        match plan(policy, &ids, Instant::now()) {
-                            FramePlan::Dispatch(waves) => {
-                                let posted: Vec<u64> = waves.iter().flatten().copied().collect();
-                                frames += 1;
-                                fired += posted.len();
-                                queued.retain(|id| !posted.contains(id));
-                                let members: Vec<ProcessId> =
-                                    posted.iter().map(|id| lane_of[id]).collect();
-                                policy.on_frame_posted(members.clone(), Instant::now());
-                                policy.on_frame_retired(members);
-                            }
-                            _ => return (frames, fired),
-                        }
-                    }
-                };
+                // Round 0 is the lanes' arrival: every one known before any
+                // blocks, as a serving fleet's lanes are.
+                let blocks = |at: usize| mode > 0 && round > 0 && (at + round) % 4 == 0;
                 for (at, &lane) in lanes.iter().enumerate() {
-                    policy.on_fire_enqueued(stamp(lane, round as u64, 0, 1), Some(lane), next_id, 1, 1);
-                    lane_of.insert(next_id, lane);
-                    queued.push(next_id);
-                    next_id += 1;
+                    for slot in 0..k {
+                        policy.on_fire_enqueued(
+                            stamp(lane, round as u64, slot as u32, k as u32),
+                            Some(lane),
+                            next_id,
+                            1,
+                            1,
+                        );
+                        lane_of.insert(next_id, lane);
+                        queued.push(next_id);
+                        next_id += 1;
+                    }
                     if mode == 2 && blocks(at) {
                         policy.on_owner_waits(lane);
                         blocked.push(lane);
-                        let (f, n) = drain(&mut policy, &mut queued, &lane_of);
-                        frames += f;
-                        fired += n;
+                        let (s, d, r) = drain(&mut policy, &mut queued, &lane_of);
+                        seals += s;
+                        dispatches += d;
+                        rows += r;
                     }
                 }
                 if mode == 1 {
@@ -1668,57 +1718,40 @@ mod tests {
                         }
                     }
                 }
-                let (f, n) = drain(&mut policy, &mut queued, &lane_of);
-                frames += f;
-                fired += n;
-                // Lanes still expected hold what is ready behind them, as
-                // with no one blocking; a blocked owner's fire never waits.
-                assert!(
-                    queued.iter().all(|id| !blocked.contains(&lane_of[id])),
-                    "mode {mode} round {round}: a blocked owner's fire held"
-                );
+                let (s, d, r) = drain(&mut policy, &mut queued, &lane_of);
+                seals += s;
+                dispatches += d;
+                rows += r;
+                assert!(queued.is_empty(), "mode {mode} k={k} round {round}: {} fires held", queued.len());
             }
-            assert_eq!(fired + queued.len(), LANES * ROUNDS, "mode {mode}: every fire seen");
-            (frames, fired)
+            (seals, dispatches, rows)
         };
-        let (calm_frames, calm_fired) = run(0);
-        let (after_frames, after_fired) = run(1);
-        let (each_frames, each_fired) = run(2);
-        let per = |frames: usize, fired: usize| fired as f64 / frames.max(1) as f64;
-        println!(
-            "lanes per frame: calm {:.1} ({calm_frames} frames), blocking after the round {:.1} \
-             ({after_frames}), blocking as each submits {:.1} ({each_frames})",
-            per(calm_frames, calm_fired),
-            per(after_frames, after_fired),
-            per(each_frames, each_fired),
-        );
-        assert_eq!(calm_frames, ROUNDS, "calm: one frame a round");
-        assert_eq!(after_frames, ROUNDS, "blocking once the round is in: one frame a round");
-        assert_eq!(calm_fired, LANES * ROUNDS);
-        assert_eq!(after_fired, LANES * ROUNDS);
-        // Sealed alone, each blocked owner's fire was a frame of its own
-        // beside the round's (LANES / 4 + 1 frames a round, 3.6 lanes per
-        // frame); sealed with what is ready, a block takes every lane ready
-        // then.
-        assert!(
-            each_frames <= ROUNDS * (LANES / 4),
-            "blocking as each submits: a frame at most per block"
-        );
-        assert!(
-            per(each_frames, each_fired) >= 3.5,
-            "at least the lanes between two blocks ride each frame"
-        );
+        for k in [1, 2] {
+            for (mode, what) in [(0, "no one blocking"), (1, "blocking once the round is in"), (2, "blocking right after each own submit")] {
+                let (seals, dispatches, rows) = run(mode, k);
+                println!(
+                    "k={k} {what}: {seals} seals, {:.2} dispatches per seal, {:.1} rows per dispatch",
+                    dispatches as f64 / seals.max(1) as f64,
+                    rows as f64 / dispatches.max(1) as f64,
+                );
+                assert_eq!(rows, LANES * ROUNDS * k, "k={k} {what}: every fire dispatched");
+                assert_eq!(seals, ROUNDS, "k={k} {what}: one seal a round");
+                assert_eq!(dispatches, ROUNDS * k, "k={k} {what}: k dispatches a seal, none out of frame");
+            }
+        }
     }
 
     /// Shape (2) as a seeded schedule: lanes submit frames in rounds (one or
     /// two frames in flight per lane, landings out of order), some
-    /// owners then stop submitting because they wait on the planner (their
-    /// lanes stay awaited, holding the boundary open), and some owners are
-    /// parked (suspended, or waiting at a bind) with a complete frame
-    /// queued. After every plan, no parked owner's complete frame is left
-    /// undispatched: what waits on its fires (an eviction's wait on their
-    /// leases, a bind's settle) waits only on work the engine has. Failing
-    /// seeds print their schedules.
+    /// owners then pause briefly in a wait parked nowhere (their lanes stay
+    /// expected, holding the frame until they submit), and some owners are
+    /// parked (suspended, or blocked on the planner) with a complete frame
+    /// queued, some coming back, some sending stragglers. After every plan,
+    /// with every expected lane in, no complete frame is left unsealed and
+    /// no parked owner's fire undispatched: what waits on its fires (an
+    /// eviction's wait on their leases, a bind's settle) waits only on lanes
+    /// still expected, never on a parked one. Failing seeds print their
+    /// schedules.
     #[test]
     fn no_parked_owner_s_complete_frame_waits_on_a_boundary_over_seeded_schedules() {
         struct Rng(u64);
@@ -1755,7 +1788,7 @@ mod tests {
             for round in 0..10 {
                 for (at, &lane) in lanes.iter().enumerate() {
                     // A parked owner's straggler: a fire that raced its
-                    // park goes at once (it seals that owner's frame).
+                    // park rides the next seal, its lane not expected.
                     if state[at] == 2 && rng.below(4) == 0 {
                         policy.on_fire_enqueued(stamp(lane, seq[at], 0, 1), Some(lane), next_id, 1, 1);
                         queued.push(next_id);
@@ -1775,6 +1808,14 @@ mod tests {
                     next_id += 1;
                     seq[at] += 1;
                 }
+                // A brief wait parked nowhere (a lock, a turn) ends: its
+                // owner submits again next round.
+                for at in 0..lanes.len() {
+                    if state[at] == 1 && rng.below(2) == 0 {
+                        state[at] = 0;
+                        schedule.push(format!("r{round}: lane {at}'s brief wait ends"));
+                    }
+                }
                 // Some parked owners come back (their wait ended, or they
                 // were restored) and submit again next round.
                 for at in 0..lanes.len() {
@@ -1789,7 +1830,7 @@ mod tests {
                 for at in 0..lanes.len() {
                     if state[at] == 0 && rng.below(5) == 0 {
                         state[at] = 1;
-                        schedule.push(format!("r{round}: lane {at} waits on the planner"));
+                        schedule.push(format!("r{round}: lane {at} waits briefly, parked nowhere"));
                     } else if state[at] == 0 && rng.below(6) == 0 {
                         state[at] = 2;
                         // Its last-submitted fire, if still queued, is complete.
@@ -1842,7 +1883,9 @@ mod tests {
                     .values()
                     .filter(|lane| lane.awaited)
                     .all(|lane| lane.frames.front().is_some_and(PendingFrame::is_complete));
-                let held_for_nobody = policy.lanes.values().any(|lane| {
+                // A parked or blocked owner's complete frame waits only on
+                // lanes still expected: with all of them in, it is sealed.
+                let held_for_nobody = all_in && policy.lanes.values().any(|lane| {
                     !lane.awaited
                         && lane.owner.is_some_and(|owner| {
                             policy.suspended.contains(&owner) || policy.blocked.contains(&owner)
@@ -1862,7 +1905,7 @@ mod tests {
                     ));
                     break;
                 }
-                if let Some(id) = parked_fires.iter().find(|id| queued.contains(id)) {
+                if let Some(id) = parked_fires.iter().find(|id| all_in && queued.contains(id)) {
                     failed = Some(format!("r{round}: a parked owner's complete fire {id} not dispatched"));
                     break;
                 }
@@ -2256,19 +2299,15 @@ mod tests {
             "a suspended owner's arrival must not rejoin the wait-set"
         );
 
-        // The victim's stranded slot goes at once, alone (its lease has to
-        // drain); the healthy lane's frame seals without waiting for it.
+        // The victim's stranded slot rides the healthy lane's frame (its
+        // lease has to drain), which seals without waiting for the victim.
         let queued: QueuedFireIds = [200, 300, 301].into_iter().collect();
-        let FramePlan::Dispatch(waves) = plan(&mut policy, &queued, Instant::now()) else {
-            panic!("the victim's straggler must go at once");
-        };
-        assert_eq!(fires(&FramePlan::Dispatch(waves)), vec![200], "nothing else is ready: the victim's stranded slot goes alone");
-        let queued: QueuedFireIds = [300, 301].into_iter().collect();
         let FramePlan::Dispatch(waves) = plan(&mut policy, &queued, Instant::now()) else {
             panic!("the boundary must seal without waiting for the victim");
         };
-        assert_eq!(waves[0], vec![300]);
-        assert_eq!(waves[1], vec![301]);
+        let mut sent = fires(&FramePlan::Dispatch(waves));
+        sent.sort_unstable();
+        assert_eq!(sent, vec![200, 300, 301], "one frame: the straggler rides it");
 
         policy.on_process_resume(victim);
         policy.on_fire_enqueued(stamp(victim, 1, 1, 2), Some(victim), 201, 1, 1);
