@@ -68,10 +68,10 @@ pub fn gated_delta(
     )
 }
 
-/// The shared memory a warp of the carried step stages a chunk of buffered
-/// rows in, double-buffered with its state: 16 rows of its sixteen columns
-/// of their corrected values and their two attention weights, f32.
-const CARRIED_ROWS_SMEM: u32 = 2 * (16 * 16 * 4 + 16 * 8);
+/// The shared memory a block of the carried step stages a chunk of buffered
+/// rows in, double-buffered with its state: 16 rows of a head's keys (at
+/// most 128 bf16), corrected values (at most 128 f32) and `a` gate word.
+const CARRIED_ROWS_SMEM: u32 = 2 * 16 * (128 * 2 + 128 * 4 + 4);
 
 /// The value columns one warp of the fused step owns.
 const FUSED_BV: u32 = 16;
@@ -262,6 +262,18 @@ pub fn gated_delta_carried(
         .checked_mul(v_heads * (v_dim / FUSED_BV))
         .ok_or_else(|| refuse(OP, format!("{} rows of value tiles overflow a grid", shape.n)))?;
     let (warps, per_sm) = fused_seats(ctx.smem_per_sm(), ctx.tuning().ssm_gdn_step_blocks());
+    // A block's warps share one (lane, head)'s buffered rows: they are a
+    // whole number of the head's value tiles.
+    let head_tiles = v_dim / FUSED_BV;
+    if !head_tiles.is_multiple_of(warps) || v_dim > 128 {
+        return Err(refuse(
+            OP,
+            format!(
+                "a block of {warps} warps stages one head's buffered rows, and a {v_dim}-wide \
+                 head's {head_tiles} value tiles do not split into it"
+            ),
+        ));
+    }
     let blocks = tiles.div_ceil(warps).min(sms * per_sm);
     let entrypoint = if warps == FUSED_WARPS_WIDE {
         "::pie::ssm::gdn_step_carried<8>"
@@ -272,7 +284,7 @@ pub fn gated_delta_carried(
         OP,
         Fire::at(kernel(GDN_RECURRENT, entrypoint)).apply(
             Launch::grid([blocks, 1, 1], [32 * warps, 1, 1])
-                .smem(fused_smem(warps) + warps * CARRIED_ROWS_SMEM),
+                .smem(fused_smem(warps) + CARRIED_ROWS_SMEM),
         ),
         &[
             qkv.arg(),
