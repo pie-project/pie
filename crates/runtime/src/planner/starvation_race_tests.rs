@@ -6156,7 +6156,11 @@ async fn a_nearly_full_swap_defers_eviction_only_while_something_is_in_flight() 
 #[tokio::test(flavor = "current_thread")]
 async fn a_bind_suspended_restore_is_funded_beside_its_own_retake() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
-    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    let model = crate::store::registry::register_model(16, &[8], &[4]);
+    let pool = Arc::new(BindRoomPool {
+        model,
+        ..BindRoomPool::new(8, 0..0, 64)
+    });
     pool.free.lock().extend([0, 1, 4, 5]);
     pool.own.lock().extend([0, 1]);
     let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
@@ -6194,6 +6198,23 @@ async fn a_bind_suspended_restore_is_funded_beside_its_own_retake() {
     assert!(
         planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
         "the resident holding a run beside them is moved for it"
+    );
+    // Its move lands, its chunks free: the restore is served on the step's
+    // real need, its bind's runs standing beside its own retake.
+    for _ in 0..8 {
+        if pool.land_moves(&planner) == 0 && planner.stats.restores.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+        planner.pages_freed();
+        planner.poke();
+        for _ in 0..200 {
+            crate::rt::yield_now().await;
+        }
+    }
+    assert!(pool.room_beside_own(head, 2, 2), "its runs stand beside its own retake");
+    assert!(
+        planner.stats.restores.load(Ordering::Relaxed) > 0,
+        "the restore is served once they stand"
     );
 }
 
