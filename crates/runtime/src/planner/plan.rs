@@ -158,6 +158,12 @@ impl ResidencyPlanner {
         // the chunks it could take, parked state lying on the device among
         // it (a no-host pool's parked-in-place sets).
         let run = need.map_or(1, |(run, _)| run);
+        // The candidates the eviction pass reads (nothing is in flight
+        // here: every member), so the dump's map is the plan's.
+        let pids: Vec<ProcessId> = self
+            .victim_set()
+            .map(|set| set.candidates(true).into_iter().map(|(pid, _)| pid).collect())
+            .unwrap_or(pids);
         let mut map = self.port.chunk_occupants(&pids);
         map.merge(self.port.parked_occupants(pid));
         let (map, census) = (map.explain(run), self.port.chunk_census(run));

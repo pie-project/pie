@@ -28,6 +28,17 @@ pub(super) struct VictimSet {
 }
 
 impl VictimSet {
+    /// The candidates an eviction pass reads: the fresh ([`Self::preferred`]),
+    /// or with nothing in flight (`quiet`) every member, nothing coming to
+    /// move the rest on.
+    pub(super) fn candidates(&self, quiet: bool) -> Vec<(ProcessId, Rank)> {
+        if quiet {
+            self.members.iter().map(|v| (v.pid, v.rank)).collect()
+        } else {
+            self.preferred()
+        }
+    }
+
     pub(super) fn preferred(&self) -> Vec<(ProcessId, Rank)> {
         self.members
             .iter()

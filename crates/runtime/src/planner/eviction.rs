@@ -253,7 +253,14 @@ impl ResidencyPlanner {
             self.note_short(victims.head, 0, 0);
             return;
         }
-        let candidates = victims.preferred();
+        // A process made no progress since its last move is spared only
+        // while something in flight may move it on: with nothing in flight
+        // (every waiter parked, none progressing), the fresh alone were a
+        // map of two stuck chunks, and the head's window never qualified
+        // while 371 chunks stood emptiable. Then every member is a
+        // candidate; the anti-thrash rule still spares what can fire.
+        let quiet = self.with_inner(|inner| inner.nothing_in_flight());
+        let candidates = victims.candidates(quiet);
         let residents: Vec<ProcessId> = candidates.iter().map(|&(pid, _)| pid).collect();
         // Parked state lying on the device is an occupant too: a chunk it
         // shares with residents empties once both move, it down a tier and
@@ -382,7 +389,7 @@ impl ResidencyPlanner {
             }
             return;
         }
-        if self.commit_evictions(victims.head, picks, false) {
+        if self.commit_evictions(victims.head, picks, quiet) {
             // Moves on their way fund it: nothing for the policy yet.
             self.note_short(victims.head, 0, 0);
         } else {
@@ -472,7 +479,12 @@ impl ResidencyPlanner {
                 .procs
                 .iter()
                 .filter(|(pid, proc)| {
-                    proc.admitted
+                    // Never the head's own process: a bind short of room
+                    // waiting is "bind waiting" as its victims are, and
+                    // picked, it evicted itself, came back, and was evicted
+                    // again (the M1: three times over, itself first).
+                    **pid != waiter.pid
+                        && proc.admitted
                         // On its way into a process: it was asked back.
                         && (!proc.holder || proc.idle)
                         // Waiting at a bind for room, it makes no progress

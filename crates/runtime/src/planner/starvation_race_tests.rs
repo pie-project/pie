@@ -6383,8 +6383,8 @@ fn a_victim_is_not_restored_before_its_head_nor_evicted_again_before_it_fires() 
     // it cannot run, so the mark does not hold it, and no stall comes of it.
     let own = planner.with_inner(|inner| inner.enqueue(victim, allocation(demand)));
     assert!(
-        members(&planner).contains(&victim),
-        "blocked on the head's progress: a candidate, the head not held"
+        planner.with_inner(|inner| !inner.unfired_protects(victim)),
+        "blocked on the head's progress: the mark does not hold it, the head not held"
     );
     planner.with_inner(|inner| {
         inner.queue.remove(&own);
@@ -6529,4 +6529,72 @@ async fn a_restore_asking_nothing_is_served_from_free_room() {
         }
     }
     assert!(planner.stats.restores.load(Ordering::Relaxed) > 0, "served at once");
+}
+
+/// The M1's self-eviction (a bind short of room picked its own process
+/// first, evicted it, and did again on its return, three times over): a
+/// head's own process is never among its victims, though waiting at its
+/// bind it yields as its victims do.
+#[tokio::test(flavor = "current_thread")]
+async fn a_bind_never_picks_its_own_process() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    pool.free.lock().extend([0, 2, 4, 6]);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let binder = ProcessId::new_v4();
+    planner.register(binder);
+    planner.note_admitted(binder);
+    planner.with_inner(|inner| inner.procs.get_mut(&binder).unwrap().bind_waiting = true);
+    // Its own state holds the chunks between the free ones.
+    *pool.occupant.lock() = Some(binder);
+    let p = planner.clone();
+    let bind = crate::rt::spawn(async move { p.wait_bind_room(binder, 2, 1).await });
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+    }
+    assert_eq!(planner.stats.evictions_started.load(Ordering::Relaxed), 0, "itself no victim");
+    assert!(
+        planner.with_inner(|inner| inner.procs[&binder].state == Residency::Resident),
+        "its process stays"
+    );
+    bind.abort();
+}
+
+/// The M1's 4-run restore that never found a window (3,710 passes, picks
+/// empty, a map of two stuck chunks): with nothing in flight, residents
+/// that made no progress since their last move are candidates too, nothing
+/// coming to move them on. Read as the fresh alone, the map held none of
+/// their chunks and the head waited with 371 of them emptiable.
+#[tokio::test(flavor = "current_thread")]
+async fn with_nothing_in_flight_a_head_is_funded_by_residents_that_made_no_progress() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    pool.free.lock().extend([0, 2, 4, 6]);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (binder, a, b) = (ProcessId::new_v4(), ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [binder, a, b] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    // Neither idle nor progressed: not "fresh".
+    planner.with_inner(|inner| {
+        for pid in [a, b] {
+            inner.procs.get_mut(&pid).unwrap().progressed = false;
+        }
+    });
+    pool.kv.lock().extend([(1, a), (3, a), (5, b), (7, b)]);
+    assert!(planner.with_inner(|inner| inner.nothing_in_flight()));
+    let p = planner.clone();
+    let bind = crate::rt::spawn(async move { p.wait_bind_room(binder, 2, 1).await });
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.stats.evictions_started.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+    }
+    assert!(
+        planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
+        "a resident holding a run beside the free chunks is moved"
+    );
+    bind.abort();
 }
