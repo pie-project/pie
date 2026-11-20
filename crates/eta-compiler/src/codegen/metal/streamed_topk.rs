@@ -113,8 +113,12 @@ const SMALL_BODY: &str = r#"
   const M1ValueDesc in_desc = descriptors[kInput];
   const uint rows = in_desc.rows;
   const uint last = in_desc.last;
-  const device float* input = reinterpret_cast<const device float*>(scratch + offsets[kInput]);
-  device float* top_values = reinterpret_cast<device float*>(scratch + offsets[kValues]);
+  // The row is read at its dtype and the values stored at theirs: a bf16
+  // element widens exactly and stores back exactly.
+  const device uchar* input = scratch + offsets[kInput];
+  const uint in_dtype = in_desc.dtype;
+  device uchar* top_values = scratch + offsets[kValues];
+  const uint top_dtype = descriptors[kValues].dtype;
   device uint* top_indices = reinterpret_cast<device uint*>(scratch + offsets[kIndices]);
   device uint* sel_pick = reinterpret_cast<device uint*>(temporary) + rows * 512u;
   const uint sel_at = ((rows * 512u + rows * 4u + rows * 2u) * 4u + 15u) & ~15u;
@@ -143,10 +147,10 @@ const SMALL_BODY: &str = r#"
     if (m4_group.x >= groups) return;
     const uint stride = groups * m3_threads;
     for (uint r = 0u; r < rows; ++r) {
-      const device float* row_in = input + ulong(r) * last;
+      const uint row_at = r * last;
       for (uint j = 0u; j < kKP; ++j) top[j] = ~ulong(0);
       for (uint i = m4_group.x * m3_threads + m3_tid; i < last; i += stride) {
-        m4_sel_keep<kKP>(top, m4_sel_entry(row_in[i], i));
+        m4_sel_keep<kKP>(top, m4_sel_entry(m1_load_f(input, row_at + i, in_dtype), i));
       }
       M4_SEL_GROUP()
       if (sel_simd == 0u && sel_lane == 0u) {
@@ -160,14 +164,14 @@ const SMALL_BODY: &str = r#"
     if (m4_group.x != 0u) return;
     const uint held = sel_pick[0] * kK;
     for (uint r = 0u; r < rows; ++r) {
-      const device float* row_in = input + ulong(r) * last;
+      const uint row_at = r * last;
       for (uint j = 0u; j < kKP; ++j) top[j] = ~ulong(0);
       for (uint e = m3_tid; e < held; e += m3_threads) m4_sel_keep<kKP>(top, sel_cand[ulong(r) * kCap + e]);
       M4_SEL_GROUP()
       if (sel_simd == 0u && sel_lane == 0u) {
         for (uint j = 0u; j < count_k; ++j) {
           const uint index = uint(top[j] & 0xFFFFFFFFul);
-          top_values[ulong(r) * kK + j] = row_in[index];
+          m1_store_fd(top_values, r * kK + j, m1_load_f(input, row_at + index, in_dtype), top_dtype);
           top_indices[ulong(r) * kK + j] = index;
         }
       }
