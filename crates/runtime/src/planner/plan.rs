@@ -106,7 +106,9 @@ impl ResidencyPlanner {
             self.publish_wants();
             // Room that came free while the pass ran (its signal woke no one
             // then) and meets what the head lacks now: planned on at once.
-            if !(self.returns.freed_since_plan() && self.wants_met_now()) {
+            if self.returns.waiters.load(Ordering::Acquire) == 0
+                || !(self.returns.freed_since_plan() && self.wants_met_now())
+            {
                 break on_grow;
             }
         };
@@ -234,7 +236,7 @@ impl ResidencyPlanner {
     }
 
     /// One pass; true where it ends waiting on a grow.
-    fn plan_once(self: &Arc<Self>) -> bool {
+    pub(super) fn plan_once(self: &Arc<Self>) -> bool {
         if self.pause_due.swap(false, Ordering::AcqRel) {
             self.pause_held();
         }

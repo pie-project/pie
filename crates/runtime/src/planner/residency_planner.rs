@@ -415,6 +415,11 @@ impl ResidencyPlanner {
     /// slots its victims' moves wait on. A head whose lack none of those
     /// measures (state slots, a gate) is woken by any chunk coming free.
     pub(super) fn publish_wants(&self) {
+        // No one waits: nothing to weigh, nothing read.
+        if self.returns.waiters.load(Ordering::Acquire) == 0 {
+            self.returns.want_nothing();
+            return;
+        }
         let head = self.with_inner(|inner| {
             inner.unmet_head().map(|(key, waiter)| {
                 (
@@ -451,16 +456,19 @@ impl ResidencyPlanner {
     /// Whether the pool as it stands meets what the head lacks
     /// ([`Self::publish_wants`]).
     pub(super) fn wants_met_now(&self) -> bool {
-        use crate::store::slots::{RoomCount, RoomTier};
-        self.returns.met(RoomCount {
-            tier: RoomTier::Device,
-            chunks: u64::from(self.port.free_chunks()),
-            slots: u64::from(self.port.device_stats().0),
-        }) || self.returns.met(RoomCount {
-            tier: RoomTier::Swap,
-            chunks: 0,
-            slots: u64::from(self.raw_swap_free()),
-        })
+        // Only the counts a want is set for are read: each takes a store's
+        // lock, and this runs at the end of plan passes on the fire path.
+        let want = |field: &AtomicU64| field.load(Ordering::Acquire);
+        let chunks = want(&self.returns.want_chunks);
+        if chunks != u64::MAX && u64::from(self.port.free_chunks()) >= chunks {
+            return true;
+        }
+        let list = want(&self.returns.want_list);
+        if list != u64::MAX && u64::from(self.port.device_stats().0) >= list {
+            return true;
+        }
+        let swap = want(&self.returns.want_swap);
+        swap != u64::MAX && u64::from(self.raw_swap_free()) >= swap
     }
 
     /// The host's and the disk's free slots, idle cache's not counted.

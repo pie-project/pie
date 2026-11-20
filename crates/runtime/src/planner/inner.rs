@@ -261,19 +261,26 @@ impl Inner {
         // evicted for is planned for. Restored first, the victim was
         // evicted again for the same head every ~65 ms, the head never
         // served.
-        let waiting: HashSet<ProcessId> = self
-            .queue
-            .values()
-            .filter(|waiter| waiter.is_unmet())
-            .map(|waiter| waiter.pid)
-            .collect();
+        // Read only where a restore of a victim is met (a process with an
+        // evicted-for head): built on every call it was a scan and a set of
+        // the whole queue each time, and this runs many times a pass.
+        let waiting = std::cell::OnceCell::<HashSet<ProcessId>>::new();
+        let waiting = || {
+            waiting.get_or_init(|| {
+                self.queue
+                    .values()
+                    .filter(|waiter| waiter.is_unmet())
+                    .map(|waiter| waiter.pid)
+                    .collect()
+            })
+        };
         // Its head served: no unmet waiter of its, and resident. A restore
         // head leaves the queue while its restore runs and comes back if
         // its unpark is short: read by its queue alone, it looked served
         // in that gap, and the victim's restore went first (the L40S: one
         // victim evicted 5,894 times for one restore head, never served).
         let unserved = |head: ProcessId| {
-            waiting.contains(&head)
+            waiting().contains(&head)
                 || self
                     .procs
                     .get(&head)

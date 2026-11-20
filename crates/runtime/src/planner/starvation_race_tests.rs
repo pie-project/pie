@@ -4935,6 +4935,57 @@ async fn a_restore_head_whose_run_stands_is_sent_and_an_understated_one_once_roo
     }
 }
 
+/// Yields until the planner and the pool stand still: no plan pass, move,
+/// restore, serve, park, queue or pool change, and no task ending, for a
+/// run of consecutive turns. A verdict read there holds however loaded the
+/// machine is (a fixed count of turns could end before the planner had
+/// done its work). False where it never stands still within the bound: a
+/// planner that keeps stepping with nothing coming.
+async fn quiesce(planner: &ResidencyPlanner, pool: &BindRoomPool, finished: impl Fn() -> u64) -> bool {
+    let snapshot = || {
+        let stats = &planner.stats;
+        let (queue, unmet) = planner.with_inner(|inner| {
+            (
+                inner.queue.len() as u64,
+                inner.queue.values().filter(|waiter| waiter.is_unmet()).count() as u64,
+            )
+        });
+        vec![
+            stats.plan_passes.load(Ordering::Relaxed),
+            stats.evictions_started.load(Ordering::Relaxed),
+            stats.restores.load(Ordering::Relaxed),
+            stats.serves.load(Ordering::Relaxed),
+            stats.parks.load(Ordering::Relaxed),
+            stats.compaction_waits.load(Ordering::Relaxed),
+            stats.grow_waits.load(Ordering::Relaxed),
+            queue,
+            unmet,
+            pool.free.lock().len() as u64,
+            pool.gives.load(Ordering::Relaxed),
+            pool.kv.lock().len() as u64,
+            pool.parked.lock().len() as u64,
+            pool.moved.lock().len() as u64,
+            finished(),
+        ]
+    };
+    let mut last = snapshot();
+    let mut still = 0;
+    for _ in 0..200_000 {
+        crate::rt::yield_now().await;
+        let now = snapshot();
+        if now == last {
+            still += 1;
+            if still >= 64 {
+                return true;
+            }
+        } else {
+            still = 0;
+            last = now;
+        }
+    }
+    false
+}
+
 /// The planner's liveness, as a property over seeded random states (the
 /// soaks' "free chunks and no run" stalls): a pool of random size and
 /// fragmentation, disk-only or with a host tier; a head that is a restore
@@ -5357,8 +5408,16 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
                 planner.pages_freed();
                 planner.poke();
             }
-            for _ in 0..200 {
-                crate::rt::yield_now().await;
+            let finished = || {
+                u64::from(bind.as_ref().is_some_and(|bind| bind.is_finished())) * 2
+                    + u64::from(gate.as_ref().is_some_and(|gate| gate.is_finished()))
+            };
+            if !quiesce(&planner, &pool, finished).await {
+                failures.push(format!(
+                    "seed {seed} step {step}: the planner never stood still\n  schedule: {}",
+                    schedule.join(" -> ")
+                ));
+                break;
             }
             // The residents' moves land: their kv chunks come back free,
             // and the plan looks again, until no more land.
@@ -5370,9 +5429,7 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
                 schedule.push(format!("{landed} kv chunks land free"));
                 planner.pages_freed();
                 planner.poke();
-                for _ in 0..200 {
-                    crate::rt::yield_now().await;
-                }
+                quiesce(&planner, &pool, finished).await;
             }
             if let Some(why) = refused(&planner) {
                 failures.push(format!(
@@ -5384,9 +5441,7 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
             // Policy answers of nothing freed refuse no one either.
             crate::policy::pressure::answered_nothing(crate::policy::pressure::Tier::Device);
             crate::policy::pressure::answered_nothing(crate::policy::pressure::Tier::Host);
-            for _ in 0..20 {
-                crate::rt::yield_now().await;
-            }
+            quiesce(&planner, &pool, finished).await;
             if gate.as_ref().is_some_and(|gate| gate.is_finished())
                 && planner.stats.restores.load(Ordering::Relaxed) == 0
             {
@@ -5529,15 +5584,13 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
                 planner.stats.compaction_waits.load(Ordering::Relaxed),
                 planner.stats.grow_waits.load(Ordering::Relaxed),
             );
-            for _ in 0..100 {
-                crate::rt::yield_now().await;
-            }
+            let stood_still = quiesce(&planner, &pool, finished).await;
             let after = (
                 progress(&planner, &pool),
                 planner.stats.compaction_waits.load(Ordering::Relaxed),
                 planner.stats.grow_waits.load(Ordering::Relaxed),
             );
-            if still != after {
+            if still != after || !stood_still {
                 failures.push(format!(
                     "seed {seed} step {step}: a quiescent planner kept stepping: {still:?} -> \
                      {after:?}\n  schedule: {}",
@@ -7102,4 +7155,125 @@ async fn a_bind_suspended_restore_that_cannot_fire_holds_the_next_no_longer() {
         }
     }
     assert!(planner.stats.restores.load(Ordering::Relaxed) > 0, "the second is restored");
+}
+
+/// One plan pass with ~250 residents, a queued restore head short of its
+/// roles and a queue of waiters behind it, nothing to do: timed. Run with
+/// `--ignored --nocapture`.
+#[test]
+#[ignore]
+fn bench_a_plan_pass_with_nothing_to_do() {
+    let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::with_swap(4096, 64))));
+    let residents: Vec<ProcessId> = (0..250).map(|_| ProcessId::new_v4()).collect();
+    for &pid in &residents {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    let head = ProcessId::new_v4();
+    planner.register(head);
+    planner.note_admitted(head);
+    planner.with_inner(|inner| {
+        let proc = inner.procs.get_mut(&head).unwrap();
+        proc.state = Residency::Evicted;
+        proc.roles_short = Some(PendingBind {
+            run: 4,
+            pieces: 2,
+            pages: 8,
+        });
+        inner.enqueue(
+            head,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        );
+        for &pid in residents.iter().take(100) {
+            inner.enqueue(
+                pid,
+                allocation(Demand {
+                    kv_pages: 1,
+                    rs: RsUnits::default(),
+                }),
+            );
+        }
+    });
+    planner.plan();
+    let rounds = 2_000u32;
+    let began = std::time::Instant::now();
+    for _ in 0..rounds {
+        planner.plan();
+    }
+    eprintln!(
+        "BENCH plan pass: {} us",
+        began.elapsed().as_micros() / u128::from(rounds)
+    );
+}
+
+/// The pieces of a plan pass, each timed alone in the same state as
+/// `bench_a_plan_pass_with_nothing_to_do`. Run with `--ignored --nocapture`.
+#[test]
+#[ignore]
+fn bench_the_pieces_of_a_plan_pass() {
+    let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::with_swap(4096, 64))));
+    let residents: Vec<ProcessId> = (0..250).map(|_| ProcessId::new_v4()).collect();
+    for &pid in &residents {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    let head = ProcessId::new_v4();
+    planner.register(head);
+    planner.note_admitted(head);
+    let key = planner.with_inner(|inner| {
+        let proc = inner.procs.get_mut(&head).unwrap();
+        proc.state = Residency::Evicted;
+        proc.roles_short = Some(PendingBind {
+            run: 4,
+            pieces: 2,
+            pages: 8,
+        });
+        let key = inner.enqueue(
+            head,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        );
+        for &pid in residents.iter().take(100) {
+            inner.enqueue(
+                pid,
+                allocation(Demand {
+                    kv_pages: 1,
+                    rs: RsUnits::default(),
+                }),
+            );
+        }
+        key
+    });
+    planner.plan();
+    let rounds = 2_000u32;
+    let time = |name: &str, f: &dyn Fn()| {
+        let began = std::time::Instant::now();
+        for _ in 0..rounds {
+            f();
+        }
+        eprintln!("BENCH {name}: {} us", began.elapsed().as_micros() / u128::from(rounds));
+    };
+    time("unmet_head", &|| {
+        planner.with_inner(|inner| {
+            let _ = inner.unmet_head().map(|(key, _)| key);
+        })
+    });
+    time("head_room", &|| {
+        let _ = planner.head_room(key);
+    });
+    time("publish_wants", &|| planner.publish_wants());
+    time("wants_met_now", &|| {
+        let _ = planner.wants_met_now();
+    });
+    time("dump_stall", &|| planner.dump_stall());
+    time("report_short", &|| planner.report_short());
+    time("plan_once", &|| {
+        let _ = planner.plan_once();
+    });
+    time("victim_set", &|| {
+        let _ = planner.victim_set();
+    });
 }

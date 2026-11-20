@@ -3402,6 +3402,39 @@ mod tests {
         assert_eq!(pool.plan_compaction(3), None, "too few free chunks: it waits");
     }
 
+    /// What the room signal adds to a release: acquire and release of a
+    /// slot, timed with no signal and with one shaped as the planner's
+    /// (a counter and three loads). Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn the_room_signal_s_cost_on_release() {
+        let holder = Holder::WorkingSet(1);
+        let run = |signal: bool| {
+            let mut pool = run_pool();
+            if signal {
+                let freed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let want = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+                pool.set_room_signal(
+                    RoomSignal(std::sync::Arc::new(move |count| {
+                        freed.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                        let _ = count.chunks >= want.load(std::sync::atomic::Ordering::Acquire);
+                    })),
+                    RoomTier::Device,
+                    Some(0),
+                );
+            }
+            let rounds = 200_000u32;
+            let began = std::time::Instant::now();
+            for _ in 0..rounds {
+                let slots = pool.acquire(holder, 0, 1).unwrap();
+                pool.release(holder, &slots, 0);
+            }
+            began.elapsed().as_nanos() / u128::from(rounds)
+        };
+        let (bare, signalled) = (run(false), run(true));
+        eprintln!("release round trip: {bare} ns bare, {signalled} ns with the room signal");
+    }
+
     /// Every return of slots tells the room signal once: a release whose
     /// slots no fire still reads, at once; one a fire still reads, when that
     /// fire's epoch retires, not before. What wakes a planner's waiter
