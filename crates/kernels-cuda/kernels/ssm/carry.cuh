@@ -21,22 +21,19 @@ static_assert(sizeof(CarryLane) == 20, "CarryLane: `channel::RsLane` mirrors thi
 constexpr u32 CARRY_NONE = 0xffffffffu;
 
 // A decode step's carried rows (the Rust `ssm::Carry`): the rows a lane
-// buffered past its committed state and replays ahead of its own, read
-// from its rs buffer pages through the staged tables, and the length of
-// its run (carried then own) the state is committed at. `lanes` null: the
-// fire buffers nothing, every lane carries none and commits all it runs.
+// buffered past its committed state and reads ahead of its own, from its
+// rs buffer pages through the staged tables, and the length of its run
+// (carried then own) the state is committed at. `lanes` null: the fire
+// buffers nothing, every lane carries none and commits all it runs.
 //
-// `plane[i]` is where the op's i-th buffered plane lies in a page's slot;
-// `scratch` the carried rows' conv outputs, row `lane.ext + j` the lane's
-// j-th carried row (the conv writes them, the recurrence reads them).
+// `plane[i]` is where the op's i-th buffered plane lies in a page's slot.
 struct Carry {
     const CarryLane* lanes;
     const u64* pages;
     const u32* replay_tok;
     const int* commit_len;
-    u8* scratch;
-    u64 plane_off[3];
-    u64 plane_stride[3];
+    u64 plane_off[4];
+    u64 plane_stride[4];
     u32 page_tokens;
     u32 pad_;
 
@@ -91,12 +88,6 @@ struct Carry {
     template <class T>
     __device__ __forceinline__ T* plane_at(u64 slot, u32 tok, int p) const {
         return reinterpret_cast<T*>(slot + plane_off[p] + static_cast<u64>(tok) * plane_stride[p]);
-    }
-
-    // The scratch row of the lane's j-th carried row, `row_bytes` a row.
-    template <class T>
-    __device__ __forceinline__ T* scratch_row(const CarryLane& l, int j, u64 row_bytes) const {
-        return reinterpret_cast<T*>(scratch + static_cast<u64>(l.ext + j) * row_bytes);
     }
 };
 
