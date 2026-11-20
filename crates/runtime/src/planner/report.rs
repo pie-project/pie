@@ -181,6 +181,7 @@ impl ResidencyPlanner {
             proc.roles_short_gives = None;
             proc.roles_short_runs = None;
             proc.roles_short_free = None;
+            proc.roles_short_stood = None;
             proc.roles_refused = None;
             proc.evicted_queued = false;
             proc.roles_short_mismatch = None;
@@ -366,6 +367,25 @@ impl ResidencyPlanner {
             }
         });
         self.requeue_restore(pid);
+        // The store's own placement of its whole need, its serve's state
+        // laid first, as the refusal leaves the pool.
+        let queued = self.with_inner(|inner| {
+            inner.queue.iter().find_map(|(key, waiter)| {
+                (waiter.pid == pid && matches!(waiter.kind, WaitKind::Restore { .. }))
+                    .then(|| (*key, waiter.rs_need()))
+            })
+        });
+        if let Some((key, state)) = queued {
+            let stood = self
+                .head_room(key)
+                .is_some_and(|need| self.port.guest_need_free(&need, state));
+            let gives = self.port.room_gives();
+            self.with_inner(|inner| {
+                if let Some(proc) = inner.procs.get_mut(&pid) {
+                    proc.roles_short_stood = Some((stood, gives));
+                }
+            });
+        }
         // A need past the whole device pool: its gate is told, to refuse it
         // by name ([`Self::restore_never_fits`]) rather than wait.
         if self.restore_never_fits_now(pid)

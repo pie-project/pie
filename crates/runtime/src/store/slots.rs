@@ -69,6 +69,10 @@ pub type ShapeId = u16;
 pub enum OwnPiece {
     Chunks { run: u32, pieces: u32 },
     Slots { shape: ShapeId, slots: u32 },
+    /// `slots` single slots of `shape`, as [`SlotPool::acquire`] takes them:
+    /// the shape's partly filled chunks first, then free chunks opened
+    /// lowest first ([`SlotPool::opens_for`]).
+    Take { shape: ShapeId, slots: u64 },
 }
 
 /// Fixed sets each working set holds: the one its fires read. Derived, not
@@ -1922,6 +1926,32 @@ impl SlotPool {
     /// same after.
     #[must_use]
     pub fn chunk_runs_beside(&self, own: &[OwnPiece], run: u32, pieces: u32) -> bool {
+        self.free_beside(own).is_some_and(|(opened, room)| {
+            self.runs_where(run, room, |c| self.open.get(c) && !opened.contains(&c))
+                .len()
+                >= pieces as usize
+        })
+    }
+
+    /// The free chunks `takes` (single slots by shape, as
+    /// [`Self::acquire`] places them) would open, lowest first, the shapes'
+    /// partly filled chunks filled first: read only. The one placement the
+    /// planner's map and need read a restore's state by, so they see the
+    /// room its unpark sees once its serve has taken that state. `None`
+    /// where they do not fit.
+    #[must_use]
+    pub fn opens_for(&self, takes: &[(ShapeId, u64)]) -> Option<Vec<u32>> {
+        let own: Vec<OwnPiece> = takes
+            .iter()
+            .map(|&(shape, slots)| OwnPiece::Take { shape, slots })
+            .collect();
+        self.free_beside(&own)
+            .map(|(opened, _)| opened.into_iter().collect())
+    }
+
+    /// The chunks `own` opens placed in order as the takes would place it,
+    /// and the headroom it leaves; `None` where it does not fit.
+    fn free_beside(&self, own: &[OwnPiece]) -> Option<(std::collections::BTreeSet<u32>, u32)> {
         use std::collections::{BTreeSet, HashMap};
         // Physical chunks the view has opened, and the slots it has placed
         // in logical chunks (those open before, and those it opened, by
@@ -1937,22 +1967,37 @@ impl SlotPool {
                     let firsts =
                         self.runs_where(own_run, room, |c| self.open.get(c) && !opened.contains(&c));
                     if firsts.len() < own_pieces as usize {
-                        return false;
+                        return None;
                     }
                     for &first in &firsts[..own_pieces as usize] {
                         opened.extend(first..first + own_run);
                     }
                     room = room.saturating_sub(own_run * own_pieces);
                 }
+                OwnPiece::Take { shape, slots } => {
+                    let Some(state) = self.shapes.get(shape as usize) else {
+                        return None;
+                    };
+                    let spc = u64::from(state.spc());
+                    let fresh = slots.saturating_sub(state.partial_free).div_ceil(spc);
+                    for _ in 0..fresh {
+                        if room == 0 {
+                            return None;
+                        }
+                        let physical = self.open.iter_in(0, self.total).find(|c| !opened.contains(c))?;
+                        opened.insert(physical);
+                        room -= 1;
+                    }
+                }
                 OwnPiece::Slots { shape, slots } => {
                     let Some(state) = self.shapes.get(shape as usize) else {
-                        return false;
+                        return None;
                     };
                     if slots == 0 {
                         continue;
                     }
                     if slots > state.spc() {
-                        return false;
+                        return None;
                     }
                     let held = |logical: u32, index: u32| {
                         placed.get(&logical).is_some_and(|slots| slots.contains(&index))
@@ -1973,10 +2018,10 @@ impl SlotPool {
                     let Some(physical) =
                         self.open_chunks().into_iter().find(|c| !opened.contains(c))
                     else {
-                        return false;
+                        return None;
                     };
                     if room == 0 {
-                        return false;
+                        return None;
                     }
                     opened.insert(physical);
                     fresh.push((shape, slots, slots));
@@ -1984,9 +2029,7 @@ impl SlotPool {
                 }
             }
         }
-        self.runs_where(run, room, |c| self.open.get(c) && !opened.contains(&c))
-            .len()
-            >= pieces as usize
+        Some((opened, room))
     }
 
     /// Free runs of `run` adjacent chunks inside one segment live state may
@@ -3284,6 +3327,36 @@ mod tests {
                 ],
             );
         }
+    }
+
+    /// Mac Pro at 5 GiB on 1e87ab171: the planner read a run of four free
+    /// (four free chunks, adjacent) while the restore's unpark found none,
+    /// its serve having taken its state first into the lowest free chunk.
+    /// One placement answers both: a restore's state taken as `acquire`
+    /// takes it opens the lowest free chunk, and the runs the store says
+    /// stand beside it are the runs left after that take.
+    #[test]
+    fn a_serve_s_state_is_placed_where_its_take_puts_it_before_the_runs() {
+        let fixed = [(ShapeKind::Fixed, 4)];
+        let mut pool = SlotPool::new(facts_with(16, 4, 4, &fixed, &[(16, 4)]));
+        let holder = Holder::WorkingSet(1);
+        let held = pool.acquire_chunk_runs(holder, 0, 1, 11).unwrap();
+        let freed: Vec<Slot> = held
+            .iter()
+            .copied()
+            .filter(|slot| (4..8).contains(&pool.physical(slot.chunk).unwrap()))
+            .collect();
+        pool.release(holder, &freed, 0);
+        assert_eq!(pool.free_chunk_runs(4), 1, "chunks 4..8 free: a run of four");
+        let take = [(0, 1)];
+        assert_eq!(pool.opens_for(&take), Some(vec![4]), "the state opens the lowest free chunk");
+        let own = [OwnPiece::Take { shape: 0, slots: 1 }];
+        assert!(
+            !pool.chunk_runs_beside(&own, 4, 1),
+            "after the serve's state, no run of four stands: the unpark's room"
+        );
+        assert!(pool.chunk_runs_beside(&own, 3, 1), "a run of three does");
+        assert_eq!(pool.free_chunk_runs(4), 1, "read only");
     }
 
     /// What a restore's parked pieces leave of the free runs, read where

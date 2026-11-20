@@ -8628,3 +8628,57 @@ fn a_restore_waiting_on_its_rebinds_is_nothing_in_flight() {
     planner.report_restored(rebinding);
     assert!(planner.with_inner(|inner| inner.procs[&rebinding].rebind_waiting.is_none()));
 }
+
+/// Four free chunks scattered and a restore head refused a run of four:
+/// the store stands no run, so the head is not sent again on the free
+/// count; the map reads moves for it, and with nothing in flight the
+/// residents between the free chunks are moved for it.
+#[tokio::test(flavor = "current_thread")]
+async fn four_scattered_free_chunks_and_a_run_of_four_asked_issue_a_plan() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    pool.free.lock().extend([0, 2, 4, 6]);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (head, resident) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [head, resident] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    pool.kv.lock().extend([1, 3, 5, 7].map(|chunk| (chunk, resident)));
+    let gives = pool.room_gives();
+    let key = planner.with_inner(|inner| {
+        inner.procs.get_mut(&resident).unwrap().idle = true;
+        let proc = inner.procs.get_mut(&head).unwrap();
+        proc.state = Residency::Evicted;
+        proc.roles_short = Some(PendingBind {
+            run: 4,
+            pieces: 1,
+            pages: 4,
+        });
+        proc.roles_short_stood = Some((false, gives));
+        inner.enqueue(
+            head,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        )
+    });
+    let mut map = pool.chunk_occupants(&[resident]);
+    map.merge(planner.parked_map(head));
+    let need = planner.head_room(key).expect("a need of runs");
+    assert!(
+        map.cheapest_need(&need).is_some_and(|moves| !moves.is_empty()),
+        "need_moves > 0"
+    );
+    planner.poke();
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.stats.evictions_started.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+    }
+    assert!(
+        planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
+        "a plan is issued"
+    );
+}

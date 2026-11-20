@@ -209,6 +209,28 @@ impl ResidencyPlanner {
             .join(" ")
     }
 
+    /// A restore head's serve takes its state before its unpark: the free
+    /// chunks the store would open for it ([`super::pool::PoolPort::serve_opens`], the
+    /// store's own placement) are no room for its runs, and leave the map,
+    /// so the map lays the head's runs in the room its unpark finds.
+    pub(super) fn lay_serve_state(&self, head: EntryKey, map: &mut super::pool::ChunkMap) {
+        let state = self.with_inner(|inner| {
+            inner
+                .queue
+                .get(&head)
+                .filter(|waiter| matches!(waiter.kind, WaitKind::Restore { .. }))
+                .map(Waiter::rs_need)
+        });
+        let Some(state) = state.filter(|state| !state.is_zero()) else {
+            return;
+        };
+        let opened = self.port.serve_opens(state);
+        map.free.retain(|chunk| !opened.contains(chunk));
+        map.headroom = map
+            .headroom
+            .map(|room| room.saturating_sub(u32::try_from(opened.len()).unwrap_or(u32::MAX)));
+    }
+
     /// Whose the device's kv pages and state units are: every process the
     /// planner knows (resident or evicted), idle cache, and the rest no
     /// one here names (state of a process gone, a checkpoint). The L40S at
@@ -395,6 +417,7 @@ impl ResidencyPlanner {
             .unwrap_or(pids);
         let mut map = self.port.chunk_occupants(&pids);
         map.merge(self.parked_map(pid));
+        self.lay_serve_state(key, &mut map);
         // The moves the whole need takes, every length laid together (the
         // map's own line reads one run of the longest length alone).
         let need_moves = need
@@ -764,23 +787,26 @@ impl ResidencyPlanner {
                     // runs of four fluctuating with a decoding fleet's
                     // takes sent it again ~350 times a second, each unpark
                     // short of a chunk (Mac Pro on 3b45462d4).
-                    let refused = self.with_inner(|inner| {
-                        inner.unmet_head().and_then(|(_, waiter)| {
-                            inner
-                                .procs
-                                .get(&waiter.pid)
-                                .map(|proc| (proc.roles_short_runs, proc.roles_short_free))
-                        })
+                    // One placement decides: the store's own, its serve's
+                    // state laid first ([`super::pool::PoolPort::guest_need_free`]). It
+                    // goes again where that stands now, unless it stood as
+                    // the refusal left the pool too (it read a room the
+                    // unpark did not) and no room has been given back
+                    // since ([`super::proc::Proc::roles_short_stood`]).
+                    let (state, stood_at) = self.with_inner(|inner| {
+                        inner
+                            .unmet_head()
+                            .map(|(_, waiter)| {
+                                (
+                                    waiter.rs_need(),
+                                    inner.procs.get(&waiter.pid).and_then(|proc| proc.roles_short_stood),
+                                )
+                            })
+                            .unwrap_or_default()
                     });
-                    let map_moved = match refused {
-                        Some((Some((at_run, at)), free)) => {
-                            self.port.guest_free_runs(at_run) > at
-                                && free.is_none_or(|free| self.port.free_chunks() > free)
-                        }
-                        Some((None, _)) => true,
-                        None => false,
-                    };
-                    if !understated && map_moved && self.port.guest_need_free(&room) {
+                    let moved = stood_at
+                        .is_none_or(|(stood, gives)| !stood || self.port.room_gives() != gives);
+                    if !understated && moved && self.port.guest_need_free(&room, state) {
                         self.with_inner(|inner| {
                             let pid = inner.unmet_head().map(|(_, waiter)| waiter.pid);
                             if let Some(proc) = pid.and_then(|pid| inner.procs.get_mut(&pid)) {

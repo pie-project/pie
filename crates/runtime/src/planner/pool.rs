@@ -512,14 +512,27 @@ pub trait PoolPort: Send + Sync + 'static {
     fn guest_free_runs(&self, run: u32) -> u32 {
         u32::from(self.guest_room_free(run, 1))
     }
-    /// Whether every entry of `need` stands free together, as a guest's
-    /// takes lay them: the longest runs first, each shorter length beside
-    /// them, the budget's headroom spent by all of them. Where the pool
-    /// lays nothing apart, each entry read on its own.
-    fn guest_need_free(&self, need: &RunNeed) -> bool {
+    /// Whether every entry of `need` stands free together once `state` (a
+    /// restore's state, taken by its serve before its unpark) is placed, as
+    /// the takes lay them: the state's single slots where the store puts
+    /// them, then the longest runs first, each shorter length beside them,
+    /// the budget's headroom spent by all of them. The store's own
+    /// placement ([`crate::store::slots::SlotPool::chunk_runs_beside`]), so
+    /// what stands here is what the unpark finds. Where the pool lays
+    /// nothing apart, each entry read on its own.
+    fn guest_need_free(&self, need: &RunNeed, state: RsUnits) -> bool {
+        let _ = state;
         need.entries()
             .iter()
             .all(|&(run, pieces)| self.guest_room_free(run, pieces))
+    }
+    /// The free physical chunks a restore's `state` would open as its serve
+    /// takes it, lowest first after the shapes' partly filled chunks
+    /// ([`crate::store::slots::SlotPool::opens_for`]): chunks the map must
+    /// not lay the head's runs in. Empty where the pool keeps no chunks.
+    fn serve_opens(&self, state: RsUnits) -> Vec<u32> {
+        let _ = state;
+        Vec::new()
     }
     /// Where a raise of the activation to `rung` (tokens) stands now: what
     /// a rung raise short of room waits on
@@ -814,24 +827,36 @@ impl PoolPort for RegistryPool {
         self.guest_free_runs(run) >= pieces
     }
 
-    fn guest_need_free(&self, need: &RunNeed) -> bool {
+    fn guest_need_free(&self, need: &RunNeed, state: RsUnits) -> bool {
         use crate::store::slots::OwnPiece;
         let Some((last, laid)) = need.entries().split_last() else {
             return true;
         };
-        let own: Vec<OwnPiece> = laid
-            .iter()
-            .map(|&(run, pieces)| OwnPiece::Chunks { run, pieces })
-            .collect();
         crate::store::registry::try_get(self.model, self.engine)
             .and_then(|stores| stores.shared)
             .is_some_and(|shared| {
-                shared
-                    .lock()
-                    .unwrap()
-                    .pool()
-                    .chunk_runs_beside(&own, last.0, last.1)
+                let shared = shared.lock().unwrap();
+                let own: Vec<OwnPiece> = shared
+                    .state_takes(state)
+                    .into_iter()
+                    .map(|(shape, slots)| OwnPiece::Take { shape, slots })
+                    .chain(laid.iter().map(|&(run, pieces)| OwnPiece::Chunks { run, pieces }))
+                    .collect();
+                shared.pool().chunk_runs_beside(&own, last.0, last.1)
             })
+    }
+
+    fn serve_opens(&self, state: RsUnits) -> Vec<u32> {
+        if state.is_zero() {
+            return Vec::new();
+        }
+        crate::store::registry::try_get(self.model, self.engine)
+            .and_then(|stores| stores.shared)
+            .and_then(|shared| {
+                let shared = shared.lock().unwrap();
+                shared.pool().opens_for(&shared.state_takes(state))
+            })
+            .unwrap_or_default()
     }
 
     fn rise_room(&self, rung: u32) -> RiseRoom {

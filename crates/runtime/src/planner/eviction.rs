@@ -281,6 +281,7 @@ impl ResidencyPlanner {
         let map = shape.as_ref().map(|_| {
             let mut map = self.port.chunk_occupants(&residents);
             map.merge(self.parked_map(victims.head_pid));
+            self.lay_serve_state(victims.head, &mut map);
             map
         });
         // No eviction forms the head's runs (a chunk in every window holds

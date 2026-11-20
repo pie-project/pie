@@ -1333,7 +1333,7 @@ impl Roles {
         // then its runs of slots ([`Self::prepare_unpark`]).
         own.sort_by_key(|piece| match *piece {
             OwnPiece::Chunks { run, .. } => (0, std::cmp::Reverse(run)),
-            OwnPiece::Slots { .. } => (1, std::cmp::Reverse(0)),
+            OwnPiece::Slots { .. } | OwnPiece::Take { .. } => (1, std::cmp::Reverse(0)),
         });
         self.device
             .lock()

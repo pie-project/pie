@@ -1204,6 +1204,27 @@ impl SharedPool {
         })
     }
 
+    /// The single slots of each state shape `rs` takes: the rs list's
+    /// (`pages`), each window list's (`windows`) and whole records'
+    /// (`slots`, each fixed shape's pieces), as a restore's serve takes
+    /// them before its unpark ([`SlotPool::opens_for`] places them).
+    #[must_use]
+    pub fn state_takes(&self, rs: crate::store::rs::RsUnits) -> Vec<(ShapeId, u64)> {
+        let mut takes = Vec::new();
+        if rs.windows.iter().any(|&n| n > 0) {
+            for (window, &n) in self.windows.iter().zip(&rs.windows) {
+                takes.push((window.pool, u64::from(n)));
+            }
+        } else if let Some(rs_list) = self.rs_list {
+            takes.push((rs_list.pool, u64::from(rs.pages)));
+        }
+        for shape in &self.fixed {
+            takes.push((shape.pool, u64::from(rs.slots) * u64::from(shape.pieces)));
+        }
+        takes.retain(|&(_, slots)| slots > 0);
+        takes
+    }
+
     /// The kv list slots whose chunks, let go whole, hold `rs` of the state
     /// shapes: the rs list's slots (`pages`), each window list's
     /// (`windows`, a store of windows) and whole records (`slots`). Any
