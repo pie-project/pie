@@ -126,7 +126,7 @@ impl ResidencyPlanner {
     /// program's fire term): a keyed demand, served in the requester's key
     /// order like any, its grant given back at once for the rise to take.
     /// The requester's own pages in the span are moved by the rise, never
-    /// freed, so they weigh in no hog or overcommit check, and a pool
+    /// freed, so they weigh in no hog check, and a pool
     /// whose rise cannot seat what one process holds was refused at load
     /// (its largest rung beside one sequence at the context).
     pub async fn acquire_rise(
@@ -162,6 +162,20 @@ impl ResidencyPlanner {
             }
             return Err(PlannerError::Impossible {
                 need: demand.kv_pages,
+                total: kv_total,
+            });
+        }
+        // On a shared pool the ask's state takes chunks its kv would: kv and
+        // state together past the pool never fit, whatever the process holds
+        // (an empty-handed ask is caught here, not by a wedge's verdict).
+        let state_pages = self.port.rs_as_pages(demand.rs);
+        if !rise && state_pages > 0 && demand.kv_pages.saturating_add(state_pages) > kv_total {
+            let need = demand.kv_pages.saturating_add(state_pages);
+            if let Some(room) = self.port.room() {
+                return Err(PlannerError::PastPool { need, room });
+            }
+            return Err(PlannerError::Impossible {
+                need,
                 total: kv_total,
             });
         }
