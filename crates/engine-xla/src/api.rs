@@ -525,6 +525,9 @@ impl Engine for Xla {
         // ready: none is built after it (a fire outside it is a ladder miss,
         // named with its shape).
         shell.prewarm().map_err(fault)?;
+        // A beam group's head program a width rung (BEAM-PAGE-LISTS): a
+        // group's bind, after ready, builds none.
+        shell.lay_beam_heads().map_err(fault)?;
         // The program a bind or a host pass lands guest cells with.
         let (rows, _) = shell.pool_geometry();
         crate::guest::run::cells_program(shell.device(), rows).map_err(Error::Load)?;

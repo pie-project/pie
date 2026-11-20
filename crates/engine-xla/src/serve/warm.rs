@@ -427,6 +427,38 @@ impl Shell {
         Ok(fired)
     }
 
+    /// Lays a beam group's head program at every width rung up to the lane
+    /// cap (powers of two; at most a pool row of parents, 128): a group runs
+    /// on the smallest rung that holds it. None on a load that keeps no kv
+    /// or reads windowed tables (a beam group's lists resolve over
+    /// full-context tables only).
+    pub fn lay_beam_heads(&mut self) -> Result<usize> {
+        if self.pools.kv_shape().is_none() || self.pools.tables().contains(&true) {
+            return Ok(0);
+        }
+        let started = std::time::Instant::now();
+        let paging = self.paging();
+        let frames = self.staging_facts().ring_slots.saturating_sub(1).max(1);
+        let top = self.budgets.tokens.max_lanes.min(128);
+        let mut rung = 1u32;
+        let mut laid = 0;
+        while rung <= top {
+            let layout =
+                crate::beam::rung_layout(rung, paging.page_size, paging.pages_per_slot, frames);
+            self.pools
+                .lay_beam_head(&self.device, &self.handles, layout)?;
+            laid += 1;
+            rung *= 2;
+        }
+        tracing::info!(
+            programs = laid,
+            top_rung = rung / 2,
+            ms = started.elapsed().as_secs_f64() * 1e3,
+            "xla beam head programs laid: one a width rung"
+        );
+        Ok(laid)
+    }
+
     /// Compiles what the ladder traced, a thread a core up to 8, and seats
     /// each program under its keys; answers how many programs it left out.
     ///
