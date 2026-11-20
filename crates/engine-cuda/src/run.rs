@@ -198,6 +198,14 @@ pub struct RsScratch {
     taken: std::cell::RefCell<std::collections::HashMap<u32, (usize, u32, bool)>>,
     layouts: std::cell::RefCell<std::collections::HashMap<u32, RsLayout>>,
     ext: std::cell::RefCell<std::collections::HashMap<(u32, u32), Tensor>>,
+    /// The carried scratch: a plane of each row width a decode step's conv
+    /// lands its lanes' carried rows' outputs in (row `RsLane::ext + j`),
+    /// shared by every window and layer of the fire (a window's rows are its
+    /// lanes', a layer's recurrence reads them before the next layer's conv
+    /// writes), and the plane each window's conv output was landed in, by
+    /// value.
+    carried: std::cell::RefCell<std::collections::HashMap<u64, u64>>,
+    carried_of: std::cell::RefCell<std::collections::HashMap<(u32, u32), u64>>,
 }
 
 /// A window's extended rows, as `channel.rs_ext_csr` lays them on the
@@ -231,7 +239,20 @@ impl RsScratch {
             taken: std::cell::RefCell::new(std::collections::HashMap::new()),
             layouts: std::cell::RefCell::new(std::collections::HashMap::new()),
             ext: std::cell::RefCell::new(std::collections::HashMap::new()),
+            carried: std::cell::RefCell::new(std::collections::HashMap::new()),
+            carried_of: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// The carried plane of rows `row_bytes` wide, laid at its first ask.
+    #[cfg_attr(feature = "rocm", allow(dead_code))]
+    fn carried_plane(&self, row_bytes: u64) -> crate::error::Result<u64> {
+        if let Some(&base) = self.carried.borrow().get(&row_bytes) {
+            return Ok(self.ptr + base);
+        }
+        let base = self.lay(u64::from(self.rows) * row_bytes)?;
+        self.carried.borrow_mut().insert(row_bytes, base);
+        Ok(self.ptr + base)
     }
 
     /// The bytes the extended runs of a fire reaching `rows_ext` rows take:
@@ -335,6 +356,8 @@ impl RsScratch {
         self.taken.borrow_mut().clear();
         self.layouts.borrow_mut().clear();
         self.ext.borrow_mut().clear();
+        self.carried.borrow_mut().clear();
+        self.carried_of.borrow_mut().clear();
     }
 }
 
@@ -1316,6 +1339,156 @@ impl<'c> Run<'c> {
         if let Some(scratch) = self.rs.as_ref().and_then(|seat| seat.scratch) {
             scratch.layer_done(self.window().span().lane_offset);
         }
+    }
+
+    /// Whether `id` is a buffered plane of this buffering fire: a decode
+    /// step reading it carries each lane's buffered rows ahead of its own
+    /// and lands its own row in the buffer itself. (ROCm's decode steps
+    /// replay a lane's carried rows extended.)
+    #[cfg(not(feature = "rocm"))]
+    pub(crate) fn rs_buffered(&self, id: ValueId) -> bool {
+        self.rs
+            .as_ref()
+            .is_some_and(|seat| seat.buffers.planes().of(id).is_some())
+    }
+
+    /// Whether `gates` is a decode step's gate prep output in a buffering
+    /// fire, whose `[b | a]` its recurrence lands.
+    pub(crate) fn rs_step_gates(&self, gates: ValueId) -> bool {
+        cfg!(not(feature = "rocm"))
+            && self
+                .rs
+                .as_ref()
+                .is_some_and(|seat| seat.buffers.planes().step_gates(gates).is_some())
+    }
+
+    /// Value `id`'s buffered plane.
+    #[cfg(not(feature = "rocm"))]
+    pub(crate) fn rs_plane(
+        &self,
+        op: &'static str,
+        id: ValueId,
+    ) -> Result<crate::store::rs::Plane, kernels_cuda::Error> {
+        self.rs
+            .as_ref()
+            .and_then(|seat| seat.buffers.planes().of(id))
+            .ok_or_else(|| kernels_cuda::Error::Backend {
+                op,
+                detail: format!(
+                    "value {} is no plane this load buffers, so a lane's carried rows have \
+                     nowhere to be read from",
+                    id.0
+                ),
+            })
+    }
+
+    /// The window's qo boundaries as its recurrent kernels read them.
+    #[cfg(not(feature = "rocm"))]
+    pub(crate) fn rs_qo_indptr(&self) -> Tensor {
+        self.rs_indptr().0
+    }
+
+    /// This load's buffered planes, where the fire buffers.
+    #[cfg(not(feature = "rocm"))]
+    pub(crate) fn rs_planes(&self) -> Option<&'c crate::store::rs::Planes> {
+        self.rs.as_ref().map(|seat| seat.buffers.planes())
+    }
+
+    /// The carried rows a decode step of this window reads: the staged
+    /// tables, the commit lengths of `pool`, the places of the step's
+    /// buffered `planes` (in the order its kernel reads them) and the
+    /// carried scratch at `scratch` (0: none).
+    #[cfg(not(feature = "rocm"))]
+    pub(crate) fn rs_carry(
+        &self,
+        op: &'static str,
+        planes: &[crate::store::rs::Plane],
+        scratch: u64,
+        pool: &RecurrentPool,
+    ) -> Result<kernels_cuda::ssm::Carry, kernels_cuda::Error> {
+        let Some(seat) = self.rs.as_ref() else {
+            return Ok(kernels_cuda::ssm::Carry::NONE);
+        };
+        let tables = self.rs_tables(seat);
+        let mut carry = kernels_cuda::ssm::Carry {
+            lanes: tables.lanes,
+            pages: tables.pages,
+            replay_tok: tables.replay_tok,
+            commit_len: pool.commit_len.ptr,
+            scratch,
+            page_tokens: tables.page_tokens.max(1),
+            ..kernels_cuda::ssm::Carry::NONE
+        };
+        for (at, &plane) in planes.iter().enumerate() {
+            let place = seat
+                .buffers
+                .place(plane)
+                .map_err(|fault| Self::rs_fault(op, fault))?;
+            carry.plane_off[at] = place.off;
+            carry.plane_stride[at] = place.stride;
+        }
+        Ok(carry)
+    }
+
+    /// The carried plane value `id`'s carried rows land in, for the decode
+    /// step of this window's layer that reads them ([`Run::rs_carried_of`]).
+    #[cfg(not(feature = "rocm"))]
+    pub(crate) fn rs_carried_out(
+        &self,
+        op: &'static str,
+        id: ValueId,
+    ) -> Result<u64, kernels_cuda::Error> {
+        let own = self.tensor(id);
+        let elem = poem_compiler::arena::elem_bytes(own.dtype).ok_or_else(|| {
+            kernels_cuda::Error::Backend {
+                op,
+                detail: format!("{:?} has no element size", own.dtype),
+            }
+        })?;
+        self.rs_carried_rows(op, id, u64::from(own.width) * elem)
+    }
+
+    /// A carried plane of rows `row_bytes` wide, landed for value `id`
+    /// ([`Run::rs_carried_of`]).
+    #[cfg(not(feature = "rocm"))]
+    pub(crate) fn rs_carried_rows(
+        &self,
+        op: &'static str,
+        id: ValueId,
+        row_bytes: u64,
+    ) -> Result<u64, kernels_cuda::Error> {
+        let (_, scratch) = self.rs_seat_and_scratch(op)?;
+        let at = scratch
+            .carried_plane(row_bytes)
+            .map_err(|fault| Self::rs_fault(op, fault))?;
+        scratch
+            .carried_of
+            .borrow_mut()
+            .insert((id.0, self.window().span().lane_offset), at);
+        Ok(at)
+    }
+
+    /// Where value `id`'s carried rows were landed by an earlier decode step
+    /// of this window's layer.
+    #[cfg(not(feature = "rocm"))]
+    pub(crate) fn rs_carried_of(
+        &self,
+        op: &'static str,
+        id: ValueId,
+    ) -> Result<u64, kernels_cuda::Error> {
+        let (_, scratch) = self.rs_seat_and_scratch(op)?;
+        scratch
+            .carried_of
+            .borrow()
+            .get(&(id.0, self.window().span().lane_offset))
+            .copied()
+            .ok_or_else(|| kernels_cuda::Error::Backend {
+                op,
+                detail: format!(
+                    "value {}'s carried rows were not landed by a decode conv of this window",
+                    id.0
+                ),
+            })
     }
 
     pub(crate) fn values(&self) -> &'c [ValueDecl] {

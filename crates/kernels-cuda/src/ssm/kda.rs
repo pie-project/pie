@@ -290,6 +290,86 @@ pub fn kda(
     )
 }
 
+/// [`kda`] over each lane's carried rows then its own ([`Carry`]): each
+/// head's state rows, a warp's four in registers, step the carried rows
+/// (their `[q | k | v]` from the carried scratch, their forget and beta rows
+/// from their buffered rows, planes 0 and 1) then the own row, and are
+/// stored at the lane's commit length; the own row's forget and beta rows
+/// land in the lane's buffer. Heads 32, 64 or 128 wide only.
+#[allow(clippy::too_many_arguments)]
+pub fn kda_carried(
+    ctx: &Ctx,
+    mixed: Tensor,
+    f: Tensor,
+    b: Tensor,
+    dt_bias: Tensor,
+    a_log: Tensor,
+    state: &RecurrentPool,
+    heads: u32,
+    head_dim: u32,
+    norm_eps: f32,
+    gate_floor: f32,
+    y: &mut Tensor,
+    carry: &Carry,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.kda";
+    /// Eight warps of four state rows each.
+    const STEP_BLOCK: u32 = 256;
+    const BLOCK_ROWS: u32 = 32;
+    dtype_dispatch!(OP, mixed.dtype, { Bf16 => () });
+    debug_assert_eq!(dt_bias.dtype, Dtype::F32, "`{OP}` reads an f32 decay bias");
+    debug_assert_eq!(a_log.dtype, Dtype::F32, "`{OP}` reads an f32 decay bank");
+    debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
+    let shape = Kda::of(OP, mixed, f, b, y, heads, head_dim)?;
+    f32_state(OP, state)?;
+    let rows = state.rows(OP, state.slab, state.slot_stride_elems, heads)?;
+    seated(OP, state, "kda_step_carried", true, false, false)?;
+    if !matches!(shape.head_dim, 32 | 64 | 128) {
+        return Err(refuse(
+            OP,
+            format!(
+                "a lane's carried rows step {}-wide heads in registers, and the step holds 32, \
+                 64 or 128",
+                shape.head_dim
+            ),
+        ));
+    }
+    ctx.fire(
+        OP,
+        Fire::at(kernel(
+            KDA,
+            &format!(
+                "::pie::ssm::kda_step_carried<::pie::bf16, {}>",
+                shape.head_dim / WARP
+            ),
+        ))
+        .apply(
+            Launch::grid(
+                [shape.n, shape.heads, shape.head_dim.div_ceil(BLOCK_ROWS)],
+                [STEP_BLOCK, 1, 1],
+            )
+            .smem(kda_shmem(shape.head_dim) + shape.head_dim * FLOAT),
+        ),
+        &[
+            mixed.arg(),
+            f.arg(),
+            b.arg(),
+            a_log.arg(),
+            dt_bias.arg(),
+            gate_floor.arg(),
+            norm_eps.arg(),
+            rows.arg(),
+            y.arg(),
+            stated(OP, shape.heads)?.arg(),
+            stated(OP, shape.head_dim)?.arg(),
+            state.write_state.arg(),
+            state.write_state_mask.arg(),
+            carry.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
 /// The blocks a decode step's head splits its value rows over: four at least
 /// (a quarter of the state a block, as vLLM's decode reads it), as many as
 /// keep two blocks a multiprocessor where the rows and heads alone do not, at

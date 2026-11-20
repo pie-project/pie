@@ -321,6 +321,13 @@ export class Pipeline {
     this.wit.close();
   }
 
+  /** Take back what the last `fires` fires submitted on this closed pipeline
+   * wrote, once every fire on it has landed: the rows a program ran ahead
+   * past its stop. */
+  retract(fires: number): void {
+    wit('retract', () => this.wit.retract(fires));
+  }
+
   /** Leave the frame wait-set until this pipeline submits again. */
   park(): void {
     witForward.park(this.wit);
@@ -379,7 +386,11 @@ export class Pipeline {
     while (consumed < submitted) {
       if (onToken() === false) {
         if (!ended) this.close();
-        return consumed + 1;
+        // The fire whose output broke the loop read a token the program
+        // took, so its rows stay; those past it are taken back.
+        const kept = consumed + 1;
+        if (submitted > kept) this.retract(submitted - kept);
+        return kept;
       }
       consumed += 1;
       if (submitted < budget && submitted - consumed <= (windowFrames - 1) * r) submitOneFrame();

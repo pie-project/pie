@@ -1,5 +1,6 @@
 #include "ssm/copy.cuh"
 #include "prim/state_rows.cuh"
+#include "ssm/carry.cuh"
 
 namespace pie::ssm {
 
@@ -349,6 +350,173 @@ __global__ void kda_step_fused(
             for (int j = 0; j < kRows; ++j) acc[j] += __shfl_xor_sync(0xffffffffu, acc[j], off);
         }
         if (lane < kRows && base + lane < v1) out_h[base + lane] = acc[lane];
+    }
+}
+
+// `kda_step_fused` over a lane's carried rows then its own (`Carry`): each
+// warp holds its four value rows of the head's state in registers (the
+// grid's `gridDim.z` slices a block's rows to the warps' 32), each step's
+// q, k, gates, v and beta staged by the block as the fused step stages its
+// one row (a carried row's `[q | k | v]` from the carried scratch, its
+// forget and beta rows from its rs buffer pages: planes 0 and 1), and the
+// rows stored once, as they stand after `commit` rows of the run. The
+// state is f32, so each step is the bits a fold a row gives. Carried rows
+// land no output; the own row's forget and beta rows land in its buffer.
+template <class ElemT, int kPer>
+__global__ void kda_step_carried(
+    const ElemT* __restrict__ mixed,
+    const ElemT* __restrict__ raw_g,
+    const ElemT* __restrict__ raw_beta,
+    const float* __restrict__ A_log,
+    const float* __restrict__ dt_bias,
+    float lower_bound,
+    float eps,
+    StateRows rows,
+    float* __restrict__ out,
+    int H, int D,
+    bool write_state,
+    const u8* __restrict__ write_state_mask,
+    Carry carry,
+    const u32* __restrict__ win)
+{
+    const int r = blockIdx.x;
+    if (win != nullptr && r >= static_cast<int>(win[0])) return;
+    const int r_row = win != nullptr ? r + static_cast<int>(win[1]) : r;
+    const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+    const int h = blockIdx.y;
+    const long long width = (long long)H * D;
+    const long long gsrc = ((long long)r_row * H + h) * D;
+    const CarryLane cl = carry.lane(rl);
+    if (blockIdx.z == 0) {
+        if (ElemT* dst = carry.own_row<ElemT>(cl, 0, 0)) {
+            for (int d = threadIdx.x; d < D; d += blockDim.x) dst[(long long)h * D + d] = raw_g[gsrc + d];
+        }
+        if (threadIdx.x == 0) {
+            if (ElemT* dst = carry.own_row<ElemT>(cl, 0, 1)) dst[h] = raw_beta[(long long)r_row * H + h];
+        }
+    }
+    const i32* rid = rows.row(rl);
+    if (rid[0] < 0) return;
+    const int per = (D + gridDim.z - 1) / gridDim.z;
+    const int v0 = blockIdx.z * per;
+    const int v1 = min(D, v0 + per);
+    float* st = rows.atom<float>(rid, h, (long long)D * D);
+    float* out_h = out + ((long long)r_row * H + h) * D;
+
+    extern __shared__ float smem[];
+    float* sq = smem;
+    float* sk = smem + D;
+    float* sg = smem + 2 * D;
+    float* sv = smem + 3 * D;
+    __shared__ float norms[2];
+    __shared__ float beta_s;
+
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    constexpr int kRows = 4;
+    using Vec = Packed<kPer>;
+    const int k0 = lane * kPer;
+    const int base = v0 + warp * kRows;
+    float s[kRows][kPer];
+    #pragma unroll
+    for (int j = 0; j < kRows; ++j) {
+        if (base + j < v1) Vec::load(s[j], st + (long long)(base + j) * D + k0);
+    }
+    const int n = carry.carried(cl);
+    const int commit = carry.commit(rl, n + 1);
+    const bool fold = folds(write_state, write_state_mask, rl) && commit > 0;
+    const float a = __expf(A_log[h]);
+    const u64 mixed_bytes = static_cast<u64>(3 * width) * sizeof(ElemT);
+    for (int t = 0; t <= n; ++t) {
+        const bool own = t == n;
+        const ElemT* row = own ? mixed + (long long)r_row * 3 * width + (long long)h * D
+                               : carry.scratch_row<ElemT>(cl, t, mixed_bytes) + (long long)h * D;
+        const ElemT* graw = own ? raw_g + gsrc
+                                : carry.carried_row<ElemT>(cl, t, 0) + (long long)h * D;
+        const ElemT braw = own ? raw_beta[(long long)r_row * H + h]
+                               : carry.carried_row<ElemT>(cl, t, 1)[h];
+        if (warp < 2) {
+            const ElemT* src = row + (long long)warp * width;
+            float acc = 0.f;
+            for (int d = lane; d < D; d += 32) {
+                const float x = Elem<ElemT>::to_f32(src[d]);
+                acc += x * x;
+            }
+            acc = ::pie::warp_sum(acc);
+            if (lane == 0) norms[warp] = acc;
+        }
+        if (threadIdx.x == 0) beta_s = sigmoidf(Elem<ElemT>::to_f32(braw));
+        for (int d = threadIdx.x; d < D; d += blockDim.x) {
+            const float g = Elem<ElemT>::to_f32(graw[d]) + dt_bias[(long long)h * D + d];
+            float gate;
+            if (lower_bound < 0.f) {
+                gate = lower_bound * sigmoidf(a * g);
+            } else {
+                const float sp = (g > 20.f) ? g : __logf(1.f + __expf(g));
+                gate = -a * sp;
+            }
+            sg[d] = __expf(gate);
+            sv[d] = Elem<ElemT>::to_f32(row[2 * width + d]);
+        }
+        __syncthreads();
+        {
+            const float q_scale = rsqrtf(static_cast<float>(D));
+            const float inv_q = rsqrtf(norms[0] + eps);
+            const float inv_k = rsqrtf(norms[1] + eps);
+            for (int d = threadIdx.x; d < D; d += blockDim.x) {
+                sq[d] = Elem<ElemT>::to_f32(row[d]) * inv_q * q_scale;
+                sk[d] = Elem<ElemT>::to_f32(row[width + d]) * inv_k * 1.f;
+            }
+        }
+        __syncthreads();
+        const float beta_h = beta_s;
+        float g[kPer], k[kPer], q[kPer];
+        #pragma unroll
+        for (int i = 0; i < kPer; ++i) {
+            g[i] = sg[k0 + i];
+            k[i] = sk[k0 + i];
+            q[i] = sq[k0 + i];
+        }
+        if (base < v1) {
+            float mem[kRows];
+            #pragma unroll
+            for (int j = 0; j < kRows; ++j) {
+                mem[j] = 0.f;
+                #pragma unroll
+                for (int i = 0; i < kPer; ++i) {
+                    s[j][i] *= g[i];
+                    mem[j] += s[j][i] * k[i];
+                }
+            }
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                #pragma unroll
+                for (int j = 0; j < kRows; ++j) mem[j] += __shfl_xor_sync(0xffffffffu, mem[j], off);
+            }
+            float acc[kRows];
+            #pragma unroll
+            for (int j = 0; j < kRows; ++j) {
+                const float delta = (sv[min(base + j, D - 1)] - mem[j]) * beta_h;
+                acc[j] = 0.f;
+                #pragma unroll
+                for (int i = 0; i < kPer; ++i) {
+                    s[j][i] += k[i] * delta;
+                    acc[j] += s[j][i] * q[i];
+                }
+                if (fold && t + 1 == commit && base + j < v1) {
+                    Vec::store(st + (long long)(base + j) * D + k0, s[j]);
+                }
+            }
+            if (own) {
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1) {
+                    #pragma unroll
+                    for (int j = 0; j < kRows; ++j) acc[j] += __shfl_xor_sync(0xffffffffu, acc[j], off);
+                }
+                if (lane < kRows && base + lane < v1) out_h[base + lane] = acc[lane];
+            }
+        }
+        __syncthreads();
     }
 }
 
