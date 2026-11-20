@@ -1,6 +1,6 @@
 use kernels_slang::attn::sdpa;
 use poem_exec::{DispatchAttn, KernelError};
-use poem_ir::{Attn, IndexScore, Operands, StructKind};
+use poem_ir::{Attn, Dim, IndexScore, Operands, StructKind, Ty};
 
 use crate::backend::{Backend, Tactics as _};
 use crate::run::{Run, StructSlot};
@@ -40,6 +40,33 @@ impl<B: Backend> Run<'_, B> {
             mask: mask.unwrap_or(plan.mask),
             ..plan
         })
+    }
+
+    /// The plan's tables as a dispatch over `q` reads them. A query of the
+    /// fire's token rows reads them as the plan holds them: whole, from the
+    /// window's first row. A query of the fire's readouts (a head over each
+    /// lane's readout row, whose rows are not the window's tokens) reads the
+    /// window's own cut of them from its row 0, over its own rows.
+    fn tables_over(&self, q: poem_ir::ValueId, plan: sdpa::Tables) -> sdpa::Tables {
+        let readouts = matches!(
+            &self.values()[q.0 as usize].ty,
+            Ty::Tensor { shape, .. } if shape.first() == Some(&Dim::Readouts)
+        );
+        if !readouts {
+            return plan;
+        }
+        let rows = self.attended(q).rows;
+        if self.window().gathered.is_some() {
+            return sdpa::Tables { rows, ..plan };
+        }
+        sdpa::Tables {
+            positions: self.cut_rows(plan.positions),
+            request_of_token: self.cut_rows(plan.request_of_token),
+            mask_words: self.cut_rows(plan.mask_words),
+            row0: 0,
+            rows,
+            ..plan
+        }
     }
 
     /// Refuses a mask the shader would read as something else.
@@ -96,12 +123,12 @@ impl<B: Backend> Run<'_, B> {
         lse: Option<kernels_slang::Tensor>,
     ) -> Result<(), kernels_slang::Error> {
         const OP: &str = "attn.prefill";
+        let tables = self.tables_over(q, self.prefill_tables(plan, mask));
         let q = self.attended(q);
         let pool = self.pool(cache);
         Self::kv_heads_agree(OP, pool, kv_heads)?;
         Self::mask_is_bytes(OP, mask)?;
         let tactic = self.tuning().sdpa(self.tier(), head_dim);
-        let tables = self.prefill_tables(plan, mask);
         let (q, pool, o) = (q, *pool, o);
         let tiled = || {
             sdpa::prefill(
@@ -148,7 +175,7 @@ impl<B: Backend> Run<'_, B> {
             self.ctx,
             self.tuning().sdpa(self.tier(), head_dim),
             self.attended(q),
-            &self.decode_tables("attn.decode", plan, mask)?,
+            &self.tables_over(q, self.decode_tables("attn.decode", plan, mask)?),
             self.pool(cache),
             window,
             head_dim,
@@ -483,7 +510,7 @@ impl<B: Backend> Run<'_, B> {
             } => self.selected_attention(
                 "attn.decode",
                 self.attended(*q),
-                &self.decode_tables("attn.decode", *plan, *mask)?,
+                &self.tables_over(*q, self.decode_tables("attn.decode", *plan, *mask)?),
                 *selection,
                 *cache,
                 *window,
@@ -522,7 +549,7 @@ impl<B: Backend> Run<'_, B> {
                 self.selected_attention(
                     OP,
                     self.attended(*q),
-                    &self.prefill_tables(*plan, mask),
+                    &self.tables_over(*q, self.prefill_tables(*plan, mask)),
                     *selection,
                     *cache,
                     *window,
