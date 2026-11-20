@@ -86,12 +86,10 @@ pub(crate) fn singleton_partition(stage: &NormalizedStage, index: &StageIndex) -
 }
 
 /// The most cells of a value one block covers in a single pass, a thread a
-/// cell, on every target a plan serves: the smallest region a backend
-/// launches whole, Metal's 512 threads (CUDA and HIP launch up to 1,024).
-/// Past it a Metal region walks two cells a thread, and beam's mask values
-/// of 513 to 1,024 cells read wrong ancestry there, so no value that size
-/// shares a region until that walk is right. A device fact, not a tuned cut.
-pub(crate) const BLOCK_CELLS: u64 = 512;
+/// cell: the most threads a block launches with on CUDA and HIP (their
+/// launch limit, engine-cuda's `MAX_BLOCK_THREADS`; a Metal region's 512
+/// threads cover it two cells a thread). A device fact, not a tuned cut.
+pub(crate) const BLOCK_CELLS: u64 = 1024;
 
 pub(crate) fn fused_partition(
     stage: &NormalizedStage,

@@ -41,6 +41,18 @@ pub async fn instantiate(
     rx.await?
 }
 
+/// Link `program`, compiled, against the host: its first instance then
+/// costs what every later one does. Done as it is installed or loaded,
+/// before any launch of it waits on the link.
+pub async fn prepare(program: &Program) -> Result<()> {
+    let (tx, rx) = oneshot::channel();
+    SERVICE.send(Message::Prepare {
+        program: program.clone(),
+        response: tx,
+    })?;
+    rx.await?
+}
+
 /// Drop what is linked of these builds: nothing runs them by name any more.
 pub(crate) fn forget(hashes: Vec<ProgramHash>) {
     if !hashes.is_empty() {
@@ -119,6 +131,61 @@ impl Linker {
         }
     }
 
+    /// `program` linked against the host, once per build: by its
+    /// install or load ([`prepare`]), so a launch finds it linked.
+    async fn pre(
+        engine: &Engine,
+        policy: &InstancePolicy,
+        base_linker_cache: &BaseLinkerCache,
+        instance_pre_cache: &InstancePreCache,
+        program: &Program,
+        component: &Component,
+        language: bool,
+    ) -> Result<InstancePre<ProcessCtx>> {
+        let cell = Self::instance_pre_cell(instance_pre_cache, &program.hash);
+        let pre = cell
+            .get_or_try_init(|| async {
+                let started = crate::rt::Instant::now();
+                let base_linker = Self::base_linker(engine, base_linker_cache).await?;
+                let pre = Self::linker_for(engine, &base_linker, component, language, policy)?
+                    .instantiate_pre(component)
+                    .map_err(|error| anyhow!("Instantiation pre-link error: {error}"))?;
+                tracing::debug!(
+                    target: "pie::launch",
+                    %program,
+                    link_us = started.elapsed().as_micros() as u64,
+                    "linked"
+                );
+                Ok::<_, anyhow::Error>(pre)
+            })
+            .await?;
+        Ok(pre.clone())
+    }
+
+    async fn prepare(
+        engine: Engine,
+        policy: InstancePolicy,
+        base_linker_cache: BaseLinkerCache,
+        instance_pre_cache: InstancePreCache,
+        program: &Program,
+    ) -> Result<()> {
+        let main = program::get_wasm_component(program)
+            .await
+            .ok_or_else(|| anyhow!("{program} is not loaded"))?;
+        let language = main.script.is_some();
+        Self::pre(
+            &engine,
+            &policy,
+            &base_linker_cache,
+            &instance_pre_cache,
+            program,
+            &main.component,
+            language,
+        )
+        .await
+        .map(drop)
+    }
+
     async fn instantiate(
         engine: Engine,
         policy: InstancePolicy,
@@ -128,6 +195,7 @@ impl Linker {
         program: &Program,
         output: OutputMode,
     ) -> Result<(Store<ProcessCtx>, Instance)> {
+        let started = crate::rt::Instant::now();
         let main = program::get_wasm_component(program)
             .await
             .ok_or_else(|| anyhow!("{program} is not loaded"))?;
@@ -139,20 +207,29 @@ impl Linker {
         let mut store = Store::new(&engine, process_ctx);
         store.limiter(|ctx| ctx.limits());
 
-        let base_linker = Self::base_linker(&engine, &base_linker_cache).await?;
-
-        let cell = Self::instance_pre_cell(&instance_pre_cache, &program.hash);
-        let pre = cell
-            .get_or_try_init(|| async {
-                Self::linker_for(&engine, &base_linker, &component, language, &policy)?
-                    .instantiate_pre(&component)
-                    .map_err(|error| anyhow!("Instantiation pre-link error: {error}"))
-            })
-            .await?;
+        let pre = Self::pre(
+            &engine,
+            &policy,
+            &base_linker_cache,
+            &instance_pre_cache,
+            program,
+            &component,
+            language,
+        )
+        .await?;
+        let linked = started.elapsed();
         let instance = pre
             .instantiate_async(&mut store)
             .await
             .map_err(|e| anyhow!("Instantiation error: {e}"))?;
+        tracing::debug!(
+            target: "pie::launch",
+            %program,
+            %process_id,
+            linked_us = linked.as_micros() as u64,
+            instantiate_us = (started.elapsed() - linked).as_micros() as u64,
+            "instantiated"
+        );
         Ok((store, instance))
     }
 
@@ -196,6 +273,10 @@ enum Message {
         output: OutputMode,
         response: oneshot::Sender<Result<(Store<ProcessCtx>, Instance)>>,
     },
+    Prepare {
+        program: Program,
+        response: oneshot::Sender<Result<()>>,
+    },
     Forget {
         hashes: Vec<ProgramHash>,
     },
@@ -221,6 +302,17 @@ impl ServiceHandler for Linker {
                         engine, policy, base_cache, pre_cache, process_id, &program, output,
                     )
                     .await;
+                    let _ = response.send(result);
+                });
+            }
+            Message::Prepare { program, response } => {
+                let engine = self.engine.clone();
+                let policy = self.policy.clone();
+                let base_cache = Arc::clone(&self.base_linker_cache);
+                let pre_cache = Arc::clone(&self.instance_pre_cache);
+                crate::rt::spawn(async move {
+                    let result =
+                        Linker::prepare(engine, policy, base_cache, pre_cache, &program).await;
                     let _ = response.send(result);
                 });
             }
