@@ -209,6 +209,52 @@ impl ResidencyPlanner {
             .join(" ")
     }
 
+    /// Whose the device's kv pages and state units are: every process the
+    /// planner knows (resident or evicted), idle cache, and the rest no
+    /// one here names (state of a process gone, a checkpoint). The L40S at
+    /// 3 GiB on 5120cbc3c held 150 pages and 17 chunks with no process
+    /// resident, the pool's census naming only "store" as their holder.
+    pub(super) fn store_holders(&self) -> String {
+        let (model, engine) = self.port.locus();
+        let pids: Vec<(ProcessId, bool)> = self.with_inner(|inner| {
+            inner
+                .procs
+                .iter()
+                .map(|(pid, proc)| (*pid, proc.state == Residency::Resident))
+                .collect()
+        });
+        let (mut kv_resident, mut kv_away) = (0u32, 0u32);
+        let (mut rs_resident, mut rs_away) = (RsUnits::default(), RsUnits::default());
+        for &(pid, resident) in &pids {
+            let pages = super::holdings::held_page_count(pid, model, engine);
+            let rs = super::holdings::held_rs_units(pid, model, engine);
+            if resident {
+                kv_resident += pages;
+                rs_resident = rs_resident.add(rs);
+            } else {
+                kv_away += pages;
+                rs_away = rs_away.add(rs);
+            }
+        }
+        let kv_out = self.port.device_out();
+        let idle = self.port.reclaimable_idle();
+        let (rs_free, rs_total) = self.port.rs_stats();
+        let rs_held = rs_total.sub(rs_free);
+        format!(
+            "kv: out={kv_out} resident={kv_resident} not_resident={kv_away} idle={idle} \
+             unnamed={}; state: held=({},{}) resident=({},{}) not_resident=({},{}) unnamed=({},{})",
+            kv_out.saturating_sub(kv_resident + kv_away + idle),
+            rs_held.slots,
+            rs_held.pages,
+            rs_resident.slots,
+            rs_resident.pages,
+            rs_away.slots,
+            rs_away.pages,
+            rs_held.sub(rs_resident.add(rs_away)).slots,
+            rs_held.sub(rs_resident.add(rs_away)).pages,
+        )
+    }
+
     /// Each wait served this pass past [`super::wait::LONG_WAIT`], with
     /// what woke the pass: a field's gaps between dispatches past 100 ms
     /// (the L40S at 6 GiB) are attributed to the room signal, a poke, the
@@ -346,6 +392,7 @@ impl ResidencyPlanner {
             .as_ref()
             .map(|need| map.cheapest_need(need).map(|pids| pids.len()));
         let held_by = self.held_by_state();
+        let store = self.store_holders();
         let (map, census) = (map.explain(run), self.port.chunk_census(run));
         // Every head queued fits the pool alone (one past it is refused at
         // its ask): unserved with nothing in flight, the planner found no
@@ -364,6 +411,7 @@ impl ResidencyPlanner {
             %blocked,
             swap = ?self.swap_stats(),
             %held_by,
+            %store,
             free_runs = ?need.as_ref().map(|need| {
                 need.entries()
                     .iter()
