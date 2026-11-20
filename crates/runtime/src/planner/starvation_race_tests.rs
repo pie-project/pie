@@ -2449,6 +2449,9 @@ struct BindRoomPool {
     /// head's runs are not, emptied (free for any shape) once their
     /// resident moves off the device.
     kv: parking_lot::Mutex<Vec<(u32, ProcessId)>>,
+    /// Its free chunks are handed out as device pages (a chunk a page), as
+    /// an activation rise's grant takes them; else it hands out none.
+    pages: std::sync::atomic::AtomicBool,
 }
 
 impl BindRoomPool {
@@ -2469,6 +2472,7 @@ impl BindRoomPool {
             compactable: std::sync::atomic::AtomicBool::new(false),
             compactions: AtomicU32::new(0),
             kv: parking_lot::Mutex::new(Vec::new()),
+            pages: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -2676,13 +2680,32 @@ impl PoolPort for BindRoomPool {
             segment_chunks: 0,
         }
     }
-    fn reserve_device(&self, _count: u32) -> Option<Vec<PhysicalKvPageId>> {
-        None
+    fn reserve_device(&self, count: u32) -> Option<Vec<PhysicalKvPageId>> {
+        if !self.pages.load(Ordering::Acquire) {
+            return None;
+        }
+        let mut free = self.free.lock();
+        if (free.len() as u32) < count {
+            return None;
+        }
+        let at = free.len() - count as usize;
+        Some(free.split_off(at).into_iter().map(PhysicalKvPageId).collect())
     }
-    fn reserve_device_up_to(&self, _count: u32) -> Vec<PhysicalKvPageId> {
-        Vec::new()
+    fn reserve_device_up_to(&self, count: u32) -> Vec<PhysicalKvPageId> {
+        if !self.pages.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+        let mut free = self.free.lock();
+        let take = (free.len() as u32).min(count) as usize;
+        let at = free.len() - take;
+        free.split_off(at).into_iter().map(PhysicalKvPageId).collect()
     }
-    fn release_device(&self, _pages: Vec<PhysicalKvPageId>) {}
+    fn release_device(&self, pages: Vec<PhysicalKvPageId>) {
+        if self.pages.load(Ordering::Acquire) {
+            self.free.lock().extend(pages.into_iter().map(|page| page.0));
+            self.gives.fetch_add(1, Ordering::Relaxed);
+        }
+    }
     fn reserve_rs(&self, _need: RsUnits) -> Option<crate::store::rs::RsGrant> {
         Some(Default::default())
     }
@@ -4734,6 +4757,7 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
         let pieces = 1 + rng.below(2) as u32;
         let runs_now = pool.guest_free_runs(run);
         let is_restore = rng.below(3) != 0;
+        let is_rise = !is_restore && rng.below(2) == 0;
         // An understated restore: refused while some count of runs stood,
         // at, below or past what stands now.
         let understated_at = (is_restore && rng.below(2) == 0)
@@ -4756,7 +4780,11 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
                 }
             }
         }
-        let grants = rng.below(2) == 0;
+        // A rise's residents are idle: a grant here is never taken by a
+        // task, and the fleet it leaves never stalls (a granted waiter is
+        // no stalled one), so a rise head would wait on completions this
+        // pool never makes.
+        let grants = !is_rise && rng.below(2) == 0;
         planner.with_inner(|inner| {
             if is_restore {
                 let proc = inner.procs.get_mut(&head).unwrap();
@@ -4797,9 +4825,21 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
                 }
             }
         });
+        // Not a restore: a bind waiting for room, or an activation rise
+        // (a cut fire's raise funded as a planner head, its chunks taken as
+        // pages, any chunks), each served or waiting, never refused.
+        if is_rise {
+            pool.pages.store(true, Ordering::Release);
+        }
         let bind = (!is_restore).then(|| {
             let p = planner.clone();
-            crate::rt::spawn(async move { p.wait_bind_room(head, run, pieces).await })
+            crate::rt::spawn(async move {
+                if is_rise {
+                    p.acquire_rise(head, head, run * pieces).await.map(drop)
+                } else {
+                    p.wait_bind_room(head, run, pieces).await.map(drop)
+                }
+            })
         });
         // The restore's gate, as its process waits to be resident.
         let gate = is_restore.then(|| {
@@ -4844,7 +4884,7 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
         let mut schedule = vec![format!(
             "total={total} host={host} run={run} pieces={pieces} restore={is_restore} \
              understated_at={understated_at:?} runs_now={runs_now} residents={} grants={grants} \
-             compactable={} mixed={mixed} kv={:?}",
+             compactable={} mixed={mixed} rise={is_rise} kv={:?}",
             residents.len(),
             pool.compactable.load(Ordering::Acquire),
             pool.kv.lock()
@@ -4966,7 +5006,11 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
             if head_served {
                 break;
             }
-            let stands = pool.guest_room_free(run, pieces);
+            let stands = if is_rise {
+                pool.free.lock().len() >= (run * pieces) as usize
+            } else {
+                pool.guest_room_free(run, pieces)
+            };
             let retried = planner.with_inner(|inner| inner.procs[&head].roles_free_retry.is_some());
             let at = planner.with_inner(|inner| {
                 let proc = &inner.procs[&head];
@@ -4992,8 +5036,14 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
                 .with_inner(|inner| inner.procs[&head].restore_need())
                 .unwrap_or((run, pieces));
             let alive_now: Vec<ProcessId> = planner.with_inner(|inner| inner.procs.keys().copied().collect());
-            let map_serves = pool.chunk_occupants(&alive_now).cheapest_runs(need.0, need.1).is_some()
-                || pool.runs_free(need.0, need.1);
+            let map_serves = if is_rise {
+                // Any chunks: free, or emptied by moving residents' kv.
+                let kv = pool.kv.lock().iter().filter(|(_, pid)| alive_now.contains(pid)).count();
+                pool.free.lock().len() + kv >= (run * pieces) as usize
+            } else {
+                pool.chunk_occupants(&alive_now).cheapest_runs(need.0, need.1).is_some()
+                    || pool.runs_free(need.0, need.1)
+            };
             let quiet = planner.with_inner(|inner| inner.nothing_in_flight());
             if mixed && map_serves && quiet && !retried {
                 failures.push(format!(
@@ -5056,8 +5106,17 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
         // A bind or gate that ended did so served, never refused.
         if let Some(bind) = bind {
             if bind.is_finished() {
-                if let Ok(Err(error)) = bind.await {
-                    failures.push(format!("seed {seed}: the head's bind was refused: {error}"));
+                match bind.await {
+                    // As for the allocations above: the starvation endgame
+                    // meets a pool this one cannot stand for. Its chunks
+                    // not free are held by no process the registry counts,
+                    // so a rise that gathered the free ones "alone holds
+                    // the pool".
+                    Ok(Err(PlannerError::Starved { .. })) if is_rise => {}
+                    Ok(Err(error)) => {
+                        failures.push(format!("seed {seed}: the head's bind was refused: {error}"));
+                    }
+                    _ => {}
                 }
             } else {
                 bind.abort();
