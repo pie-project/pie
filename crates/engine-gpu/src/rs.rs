@@ -620,9 +620,12 @@ impl Seat {
                 dtype,
             ))
         };
+        // A fire whose lanes all carry their rows in their decode steps
+        // extends none: it binds no view of the run.
+        let extends = !carried.iter().all(|&carried| carried);
         let mut ext_in = Vec::with_capacity(layout.planes.len());
         for (plane, &offset) in layout.planes.iter().zip(&plane_at) {
-            ext_in.push(if plane.extended {
+            ext_in.push(if plane.extended && extends {
                 Some(take(offset, plane.row_bytes, plane.width, plane.dtype)?)
             } else {
                 None
@@ -630,7 +633,9 @@ impl Seat {
         }
         let mut ext_out = Vec::with_capacity(layout.regions.len());
         for (region, &offset) in layout.regions.iter().zip(&region_at) {
-            ext_out.push(take(offset, region.row_bytes, region.width, region.dtype)?);
+            if extends {
+                ext_out.push(take(offset, region.row_bytes, region.width, region.dtype)?);
+            }
         }
         // The work plane holds a committed dispatch's lanes: a window of more
         // takes as many dispatches (`dispatch::ssm`).

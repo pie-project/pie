@@ -196,7 +196,14 @@ impl<B: Backend> Run<'_, B> {
                     value.0
                 ),
             })?;
-        let ext = seat.ext_out[region];
+        let ext = *seat.ext_out.get(region).ok_or_else(|| Error::Backend {
+            op,
+            detail: format!(
+                "value {} lands extended in a fire whose lanes all carry their rows, which \
+                 extends none",
+                value.0
+            ),
+        })?;
         seat.ext.borrow_mut().insert(value.0, ext);
         Ok(ext)
     }
