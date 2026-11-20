@@ -228,6 +228,21 @@ impl Gpu {
         frame.commit().expect("the frame lands");
     }
 
+    /// `f` in a frame of its own, timed: the device's time across its work
+    /// where it writes timestamps (a spanned frame), else the host's clock
+    /// around the submit and the wait (never shorter), ns.
+    pub fn timed(&self, f: impl FnOnce(&Sink<'_>) -> Result<(), kernels_slang::Error>) -> f64 {
+        let started = std::time::Instant::now();
+        let frame = self.device.spanned().expect("a frame");
+        {
+            let sink = Sink::new(&self.device, &frame, &self.pipelines, &self.handles);
+            f(&sink).expect("the kernel fires");
+        }
+        let span = frame.commit_spanned().expect("the frame lands");
+        let host = started.elapsed().as_nanos() as f64;
+        span.map_or(host, |ns| ns as f64)
+    }
+
     pub fn down(&self, handle: u32, n: usize) -> Vec<f32> {
         let bytes = self
             .handles
