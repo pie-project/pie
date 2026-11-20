@@ -86,8 +86,69 @@ impl ResidencyPlanner {
         self.stats
             .grow_parked
             .store(parked as u64, Ordering::Relaxed);
+        if !on_grow {
+            self.dump_stall();
+        }
         // A waiter served or gone lacks nothing now.
         self.report_short();
+    }
+
+    /// The pass ended with the queue's head unserved and nothing in flight
+    /// (no eviction, restore, fire or kill, no parked state moving down, no
+    /// grow promised): only an outside event (an arrival, a departure, room
+    /// given back, a policy answer) plans again, and the engine's stall
+    /// watchdog sees no fire to time. Said once per head and room change,
+    /// with what the head asks, the queue, and, for a head short of whole
+    /// chunks, the pool's own census and the planner's map over every
+    /// process, so a silent scheduler names the head that holds it.
+    pub(super) fn dump_stall(self: &Arc<Self>) {
+        let gives = self.port.room_gives();
+        let stalled = self.with_inner(|inner| {
+            let Some((key, waiter)) = inner.unmet_head() else {
+                inner.stall_dumped = None;
+                return None;
+            };
+            if !inner.nothing_in_flight() || !inner.parked_moving.is_empty() {
+                return None;
+            }
+            if inner.stall_dumped == Some((key, gives)) {
+                return None;
+            }
+            let need = match &waiter.kind {
+                WaitKind::BindRoom { run, pieces, .. } => Some((*run, *pieces)),
+                WaitKind::Restore { .. } => inner
+                    .procs
+                    .get(&waiter.pid)
+                    .and_then(super::proc::Proc::restore_need),
+                WaitKind::Allocation { .. } => None,
+            };
+            let (pid, kind) = (waiter.pid, waiter.kind_name());
+            let pids: Vec<ProcessId> = inner.procs.keys().copied().collect();
+            inner.stall_dumped = Some((key, gives));
+            Some((key, pid, kind, need, pids))
+        });
+        let Some((key, pid, kind, need, pids)) = stalled else {
+            return;
+        };
+        self.stats.stall_dumps.fetch_add(1, Ordering::Relaxed);
+        let (free, total) = self.port.device_stats();
+        let (map, census) = need.map_or((String::new(), String::new()), |(run, _)| {
+            let mut map = self.port.chunk_occupants(&pids);
+            map.merge(self.port.parked_occupants(pid));
+            (map.explain(run), self.port.chunk_census(run))
+        });
+        tracing::warn!(
+            ?key,
+            %pid,
+            kind,
+            need = ?need,
+            free_runs = need.map(|(run, _)| self.port.guest_free_runs(run)),
+            device = ?(free, total),
+            queue = %self.debug_queue(),
+            %map,
+            pool = %census,
+            "planner: the queue's head is unserved with nothing in flight"
+        );
     }
 
     /// The segment walk made no grow it promised: the plan this wakes goes
@@ -318,7 +379,7 @@ impl ResidencyPlanner {
                     let understated = self.with_inner(|inner| {
                         inner.unmet_head().is_some_and(|(_, waiter)| {
                             inner.procs.get(&waiter.pid).is_some_and(|proc| {
-                                proc.roles_free_short == Some((run, pieces))
+                                proc.roles_free_short.is_some_and(|(short, _)| short == run)
                                     && free_runs <= proc.roles_free_short_at
                             })
                         })

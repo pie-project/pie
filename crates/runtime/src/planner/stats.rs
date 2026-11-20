@@ -36,6 +36,10 @@ pub struct PlannerStats {
     /// The unmet waiters behind the last plan's wait on a grow; 0 where it
     /// did not end on one.
     pub grow_parked: AtomicU64,
+    /// Plans that ended with the queue's head unserved and nothing in
+    /// flight to wake them, each named once per head and room change
+    /// ([`super::ResidencyPlanner::dump_stall`]).
+    pub stall_dumps: AtomicU64,
     /// Walks that ended without the grow they promised
     /// ([`super::ResidencyPlanner::no_grow`]).
     pub no_grows: AtomicU64,

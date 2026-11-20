@@ -112,6 +112,22 @@ pub(super) struct PendingBind {
 }
 
 impl Proc {
+    /// The runs its restore waits on, `(run, pieces)`: its roles' need (or
+    /// the bind that suspended it), and, marked understated, one run more
+    /// than its refusal saw, the count it goes again on
+    /// ([`Self::roles_free_short_at`]). What room is made for is what lets
+    /// it go: funded for fewer, the map's cheapest runs cost nothing, no
+    /// one moved, and the head waited for runs past the ones standing with
+    /// nothing in flight (the planner silent).
+    pub(super) fn restore_need(&self) -> Option<(u32, u32)> {
+        let need = self.roles_short.or(self.bind_room)?;
+        let pieces = match self.roles_free_short {
+            Some((run, _)) if run == need.run => need.pieces.max(self.roles_free_short_at.saturating_add(1)),
+            _ => need.pieces,
+        };
+        Some((need.run, pieces))
+    }
+
     /// A fire of its own is on its way through the engine and has been
     /// begun or settled lately: it is making progress, whatever of it is
     /// parked (see [`super::in_flight`]).

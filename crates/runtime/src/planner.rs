@@ -46,7 +46,7 @@ pub use global::{
 };
 pub use grant::{AllocationGrant, Demand};
 pub use in_flight::FireInFlight;
-pub use pool::{ChunkStats, PoolPort, RegistryPool};
+pub use pool::{ChunkMap, ChunkStats, PoolPort, RegistryPool};
 pub use residency_planner::ResidencyPlanner;
 pub use short::WeightShed;
 pub use stats::PlannerStats;

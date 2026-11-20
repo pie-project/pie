@@ -230,8 +230,7 @@ impl ResidencyPlanner {
                 WaitKind::Restore { .. } => inner
                     .procs
                     .get(&waiter.pid)
-                    .and_then(|proc| proc.roles_short.or(proc.bind_room))
-                    .map(|need| (need.run, need.pieces)),
+                    .and_then(super::proc::Proc::restore_need),
                 WaitKind::Allocation { .. } => None,
             },
             None => None,

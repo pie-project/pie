@@ -619,8 +619,11 @@ pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
         .as_ref()
         .is_some_and(|roles| roles.lock().unwrap().holds_guest_state(pid));
     if working_sets.is_empty() && rs_working_sets.is_empty() && !holds_guest {
+        // Nothing to move now is nothing to move on the next pass either:
+        // it is no victim again until the room changes (a restore clears
+        // the blocks), or the plan picked it again at once, forever.
         tracing::debug!(pid = %pid, "planner: eviction found no working set");
-        planner.eviction_failed(pid);
+        planner.eviction_found_nothing(pid);
         return;
     }
     let began = Instant::now();

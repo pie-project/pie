@@ -2513,3 +2513,75 @@ async fn a_bind_suspended_once_for_room_waits_parked_when_short_again() {
     assert_eq!(waits.get(), 2, "short again after its restore, it waits parked for room");
     assert_eq!(binds.get(), 4);
 }
+
+/// Shape E's stall (Metal, unified, every segment committed to kv early):
+/// kv pages fill every committed segment, so a bind needing a run of 3
+/// whole `Instance` chunks finds none and waits for room
+/// (`RolesError::BindShort`). Once the kv pages go (their owners evicted),
+/// the chunks they emptied are free for any shape: the bind lands in
+/// them, the planner's map and the pool's own count agree on what is free
+/// (the same physical ids), and a run the map counts free is one the bind
+/// takes.
+#[test]
+fn chunks_kv_filled_and_emptied_take_an_instance_run() {
+    let Pools { device, roles } = pools_of(facts_in(64, 8));
+    let list = device.lock().unwrap().list().expect("a kv list");
+    let spc = u64::from(list.slots_per_chunk);
+    // A chunk of kv pages at a time, until no chunk opens: every chunk
+    // below the span held by kv.
+    let mut kv: Vec<Vec<u32>> = Vec::new();
+    while let Some(refs) = device.lock().unwrap().take_refs(list.pool, spc) {
+        kv.push(refs);
+    }
+    assert!(!kv.is_empty());
+    assert_eq!(device.lock().unwrap().pool().free_chunk_runs(1), 0, "kv holds every chunk");
+    let (program, mut engine) = runs_of(8, 3, 1, 0);
+    let error = bind_as(&roles, &mut engine, program, 1).expect_err("no free run");
+    assert!(
+        matches!(
+            error.downcast_ref::<RolesError>(),
+            Some(RolesError::BindShort(_))
+        ),
+        "short of room the pool holds: it waits, {error}"
+    );
+    roles.lock().unwrap().leave_guest_wait(holder(1));
+    // Every kv owner evicted: its pages go back, and their chunks close.
+    for refs in kv.drain(..) {
+        device.lock().unwrap().give_refs(list.pool, &refs);
+    }
+    {
+        let pool = device.lock().unwrap();
+        let free = pool.pool().state_open_chunks();
+        assert!(!free.is_empty());
+        let runs = pool.pool().free_chunk_runs(3);
+        assert!(runs >= 1, "the emptied chunks stand runs of 3");
+        // The planner's map over the same pool: one notion of free, one
+        // id space. Its cheapest run moves no one, and is one the pool
+        // counts.
+        let map = crate::planner::ChunkMap {
+            held: Vec::new(),
+            free,
+            headroom: Some(pool.pool().headroom()),
+            segment_chunks: pool.pool().segments().segment_chunks(),
+        };
+        assert_eq!(map.cheapest_runs(3, runs), Some(Vec::new()));
+        assert_eq!(map.cheapest_runs(3, runs + 1), None, "the map counts no run the pool lacks");
+    }
+    bind_as(&roles, &mut engine, program, 1).expect("it lands in the chunks kv gave back");
+    let piece = &pieces_of(&device, &engine.bindings[0].scratch)[0];
+    assert_eq!(piece.len(), 3);
+    assert!(piece.windows(2).all(|w| w[0].0 + 1 == w[1].0 && w[0].1 == w[1].1), "{piece:?}");
+}
+
+/// An empty pool whose segments past the load's are all uncommitted: a
+/// bind needing a run of 4 is served at once where a committed segment
+/// holds the run, and else waits on the commit that holds it, never
+/// refused.
+#[test]
+fn an_empty_pool_serves_a_run_of_four_at_once() {
+    let Pools { device, roles } = pools_of(facts_committed(64, 8, 1));
+    let (program, mut engine) = runs_of(8, 4, 1, 0);
+    bind_as(&roles, &mut engine, program, 1).expect("an empty committed segment holds a run of 4");
+    let piece = &pieces_of(&device, &engine.bindings[0].scratch)[0];
+    assert_eq!(piece, &[(1, 0), (2, 0), (3, 0), (4, 0)], "segment 0's first run past the null chunk");
+}

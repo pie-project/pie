@@ -1870,6 +1870,8 @@ impl KvStore {
         }
         let freed = self.table.release_working_set_backings(ws);
         self.recycle_backings(freed, epoch);
+        // What no fire in flight reads is free now, not at a next fire.
+        self.retire_idle();
         self.flat.remove(&ws);
         self.note_cached();
     }

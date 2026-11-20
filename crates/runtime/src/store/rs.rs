@@ -2504,6 +2504,11 @@ impl RsStore {
             let epoch = self.newest_touch(id).unwrap_or(settled);
             self.recycle(vec![id], epoch);
         }
+        // What no fire in flight reads is free now, its chunk with it once
+        // empty: left waiting for the next fire's settle, it held its chunk
+        // for its shape while nothing fired (a head short of whole chunks,
+        // every owner moved, the scheduler silent).
+        self.retire_idle();
         freed
     }
 
@@ -2563,6 +2568,7 @@ impl RsStore {
                 .map_or(self.seq, |&oldest| oldest - 1)
         });
         self.recycle(vec![id], epoch);
+        self.retire_idle();
         true
     }
 }

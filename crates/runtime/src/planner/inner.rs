@@ -46,6 +46,10 @@ pub(super) struct Inner {
     /// ([`super::ResidencyPlanner::park_down`]): none is restored until it
     /// lands, so no restore misses an item moving under it.
     pub(super) parked_moving: HashSet<ProcessId>,
+    /// The unservable head the last stall dump named, and the pool's room
+    /// count then ([`super::ResidencyPlanner::dump_stall`]): one dump per
+    /// head and room change.
+    pub(super) stall_dumped: Option<(super::wait::EntryKey, u64)>,
 }
 
 impl Inner {
@@ -429,7 +433,11 @@ impl Inner {
     /// nothing in flight can free room, a fleet waiting at binds included:
     /// funding it while the fleet decoded thrashed.
     pub(super) fn restore_gate(&mut self, pid: ProcessId, spare: u32) -> RestoreGate {
-        let roles_short = self.procs.get(&pid).and_then(|proc| proc.roles_short);
+        let roles_short = self
+            .procs
+            .get(&pid)
+            .filter(|proc| proc.roles_short.is_some())
+            .and_then(super::proc::Proc::restore_need);
         if self.completion_credit > 0 {
             self.completion_credit -= 1;
             return RestoreGate::Serve;
@@ -449,7 +457,7 @@ impl Inner {
         // behind a steady decoder with binds waiting on it).
         if let Some(need) = roles_short {
             return RestoreGate::Evict {
-                need: (need.run, need.pieces),
+                need,
                 fund: stalled || self.bind_waits_behind(pid),
             };
         }

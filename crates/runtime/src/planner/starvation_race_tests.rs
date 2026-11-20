@@ -2445,6 +2445,10 @@ struct BindRoomPool {
     /// ([`PoolPort::compaction_comes`]), and how often it was asked.
     compactable: std::sync::atomic::AtomicBool,
     compactions: AtomicU32,
+    /// Chunks residents' kv pages hold, one resident's whole: a shape the
+    /// head's runs are not, emptied (free for any shape) once their
+    /// resident moves off the device.
+    kv: parking_lot::Mutex<Vec<(u32, ProcessId)>>,
 }
 
 impl BindRoomPool {
@@ -2464,7 +2468,32 @@ impl BindRoomPool {
             moved: parking_lot::Mutex::new(Vec::new()),
             compactable: std::sync::atomic::AtomicBool::new(false),
             compactions: AtomicU32::new(0),
+            kv: parking_lot::Mutex::new(Vec::new()),
         }
+    }
+
+    /// The kv chunks of residents no longer on the device go back free,
+    /// each a room given back: their moves landed.
+    fn land_moves(&self, planner: &ResidencyPlanner) -> u32 {
+        let gone: Vec<u32> = self
+            .kv
+            .lock()
+            .iter()
+            .filter(|&&(_, pid)| {
+                // Here a move finds no working set to copy (none is
+                // registered): one tried (blocked as found nothing) lands
+                // as one that copied would.
+                planner.with_inner(|inner| {
+                    inner.prepare_blocked.contains(&pid)
+                        || inner.procs.get(&pid).is_none_or(|proc| proc.state != Residency::Resident)
+                })
+            })
+            .map(|&(chunk, _)| chunk)
+            .collect();
+        self.kv.lock().retain(|(chunk, _)| !gone.contains(chunk));
+        self.free.lock().extend(&gone);
+        self.gives.fetch_add(gone.len() as u64, Ordering::Relaxed);
+        gone.len() as u32
     }
 
     /// Whether `pieces` disjoint runs of `run` adjacent free ids stand.
@@ -2610,6 +2639,24 @@ impl PoolPort for BindRoomPool {
         fits
     }
     fn chunk_occupants(&self, pids: &[ProcessId]) -> super::pool::ChunkMap {
+        let kv: Vec<super::pool::ChunkHeld> = self
+            .kv
+            .lock()
+            .iter()
+            .filter(|(_, pid)| pids.contains(pid))
+            .map(|&(chunk, pid)| super::pool::ChunkHeld {
+                chunk,
+                used: 1,
+                by: vec![(pid, 1)],
+            })
+            .collect();
+        if !kv.is_empty() {
+            return super::pool::ChunkMap {
+                held: kv,
+                free: self.free.lock().clone(),
+                ..Default::default()
+            };
+        }
         let Some(occupant) = *self.occupant.lock() else {
             return super::pool::ChunkMap::default();
         };
@@ -4034,6 +4081,9 @@ async fn a_short_restore_on_a_wedged_fleet_is_funded_and_refused_only_past_the_p
     );
 
     // Alone on the device, nothing else to move: a need that fits waits on.
+    // The resident leaves while being moved for it (a departure mid-move
+    // is no completion that sends the restore on its credit).
+    planner.with_inner(|inner| inner.procs.get_mut(&resident).unwrap().state = Residency::Evicting);
     planner.unregister(resident);
     planner.with_inner(|inner| {
         inner.evicting.clear();
@@ -4658,7 +4708,11 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
     }
     let model = crate::store::registry::register_model(16, &[8], &[4]);
     let mut failures = Vec::new();
+    let only: Option<u64> = std::env::var("PIE_TEST_SEED").ok().and_then(|s| s.parse().ok());
     for seed in 0..2000u64 {
+        if only.is_some_and(|only| only != seed) {
+            continue;
+        }
         let mut rng = Rng(seed);
         let total = 8 + rng.below(17) as u32;
         let host = if rng.below(2) == 0 { 0 } else { 64 };
@@ -4688,6 +4742,19 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
         for &pid in &residents {
             planner.register(pid);
             planner.note_admitted(pid);
+        }
+        // Mixed shapes: in some pools the chunks not free hold residents'
+        // kv pages, each resident's whole, emptied for any shape once it
+        // moves off the device.
+        let mixed = !residents.is_empty() && rng.below(2) == 0;
+        if mixed {
+            let held: Vec<u32> = (0..total).filter(|id| !pool.free.lock().contains(id)).collect();
+            for chunk in held {
+                if rng.below(10) < 7 {
+                    let pid = residents[rng.below(residents.len() as u64) as usize];
+                    pool.kv.lock().push((chunk, pid));
+                }
+            }
         }
         let grants = rng.below(2) == 0;
         planner.with_inner(|inner| {
@@ -4777,9 +4844,10 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
         let mut schedule = vec![format!(
             "total={total} host={host} run={run} pieces={pieces} restore={is_restore} \
              understated_at={understated_at:?} runs_now={runs_now} residents={} grants={grants} \
-             compactable={}",
+             compactable={} mixed={mixed} kv={:?}",
             residents.len(),
-            pool.compactable.load(Ordering::Acquire)
+            pool.compactable.load(Ordering::Acquire),
+            pool.kv.lock()
         )];
         let mut applied = 0u32;
         let mut alive = residents.clone();
@@ -4856,6 +4924,20 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
             for _ in 0..200 {
                 crate::rt::yield_now().await;
             }
+            // The residents' moves land: their kv chunks come back free,
+            // and the plan looks again, until no more land.
+            for _ in 0..8 {
+                let landed = pool.land_moves(&planner);
+                if landed == 0 {
+                    break;
+                }
+                schedule.push(format!("{landed} kv chunks land free"));
+                planner.pages_freed();
+                planner.poke();
+                for _ in 0..200 {
+                    crate::rt::yield_now().await;
+                }
+            }
             if let Some(why) = refused(&planner) {
                 failures.push(format!(
                     "seed {seed} step {step}: {why}\n  schedule: {}",
@@ -4898,6 +4980,34 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
                 failures.push(format!(
                     "seed {seed} step {step}: a head asked for or waited on a compaction\n  \
                      schedule: {}",
+                    schedule.join(" -> ")
+                ));
+                break;
+            }
+            // Mixed shapes: where the map serves the head by moving the
+            // residents whose kv holds its chunks (or with no one moved),
+            // and nothing is in flight, the planner is never silent: the
+            // head was served, or a move is on its way.
+            let need = planner
+                .with_inner(|inner| inner.procs[&head].restore_need())
+                .unwrap_or((run, pieces));
+            let alive_now: Vec<ProcessId> = planner.with_inner(|inner| inner.procs.keys().copied().collect());
+            let map_serves = pool.chunk_occupants(&alive_now).cheapest_runs(need.0, need.1).is_some()
+                || pool.runs_free(need.0, need.1);
+            let quiet = planner.with_inner(|inner| inner.nothing_in_flight());
+            if mixed && map_serves && quiet && !retried {
+                failures.push(format!(
+                    "seed {seed} step {step}: the map serves the head's {need:?} and the planner \
+                     is silent\n  schedule: {}",
+                    schedule.join(" -> ")
+                ));
+                break;
+            }
+            // Unserved with nothing in flight: the stall is named.
+            if quiet && planner.stats.stall_dumps.load(Ordering::Relaxed) == 0 {
+                failures.push(format!(
+                    "seed {seed} step {step}: the head is unserved with nothing in flight and \
+                     no stall was named\n  schedule: {}",
                     schedule.join(" -> ")
                 ));
                 break;

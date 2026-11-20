@@ -1142,7 +1142,51 @@ impl FramePolicy {
         }
     }
 
+    /// What to do with the queued frames now. A park is a wait for an
+    /// event: with nothing executing (no landing to wake it) and frames
+    /// queued, one is always scheduled ([`Self::wake_scheduled`]), never a
+    /// silent scheduler; asserted in debug builds.
     pub fn plan_dispatch(
+        &mut self,
+        still_queued: &QueuedFireIds,
+        blocked_lanes: &HashSet<ProcessId>,
+        executing: bool,
+        now: Instant,
+    ) -> FramePlan {
+        let plan = self.plan_frames(still_queued, blocked_lanes, executing, now);
+        debug_assert!(
+            plan != FramePlan::Park
+                || executing
+                || !self.has_queued_frames()
+                || !blocked_lanes.is_empty()
+                || self.wake_scheduled(),
+            "a park with nothing executing, frames queued and no wake scheduled: {}",
+            self.debug_summary()
+        );
+        plan
+    }
+
+    /// Whether an event is coming that plans the queued frames again, with
+    /// nothing executing: a lane still expected to submit (awaited with no
+    /// frame, or a frame begun and not complete: its owner sends the rest), a bind or a join
+    /// on its way, an owner suspended or blocked (its resume or its wait's
+    /// end), or a ready frame cut wider than the cap (the cap's rise).
+    #[must_use]
+    pub fn wake_scheduled(&self) -> bool {
+        self.has_pending_binds()
+            || self.is_joining()
+            || !self.suspended.is_empty()
+            || !self.blocked.is_empty()
+            || self.lanes.values().any(|lane| {
+                (lane.awaited && lane.frames.is_empty())
+                    || lane.frames.front().is_some_and(|front| !front.is_complete())
+                    || lane.frames.front().is_some_and(|front| {
+                        front.fires.iter().any(|fire| fire.rung_rows > self.fire_cap)
+                    })
+            })
+    }
+
+    fn plan_frames(
         &mut self,
         still_queued: &QueuedFireIds,
         blocked_lanes: &HashSet<ProcessId>,
@@ -2066,8 +2110,23 @@ mod tests {
                             policy.on_frame_retired(now_lanes);
                             landing_late.extend(later);
                         }
+                        // A park with nothing executing waits on an event
+                        // that comes: frames queued and none scheduled is
+                        // a silent scheduler.
+                        FramePlan::Park
+                            if policy.has_queued_frames() && !policy.wake_scheduled() =>
+                        {
+                            failed = Some(format!(
+                                "r{round}: parked with frames queued and no wake scheduled: {}",
+                                policy.debug_summary()
+                            ));
+                            break;
+                        }
                         _ => break,
                     }
+                }
+                if failed.is_some() {
+                    break;
                 }
                 // The invariant: a frame whose expected lanes have all
                 // submitted is sealed (nothing ready waits on nothing).
