@@ -228,6 +228,7 @@ impl Session {
         plan: &ExecPlan,
         class: GeometryClass,
         device: eta_ir::registry::PortMask,
+        device_positions: bool,
     ) {
         let fires_alone = (0..compiled.stages.len()).any(|index| plan.runs_at(index, Stage::Prologue));
         let other_ports = plan.package.ports.iter().any(|binding| {
@@ -235,6 +236,10 @@ impl Session {
                 && binding.port != eta_ir::registry::Port::EmbedTokens
                 // Read on the device by the beam step, never on the host.
                 && binding.port != eta_ir::registry::Port::Parents
+                // Copied from its cell on the device before the forward
+                // where the load feeds positions there
+                // ([`Self::positions_cell`]).
+                && !(device_positions && binding.port == eta_ir::registry::Port::Positions)
                 && engine::ports::engine_resolves(class, device, binding.port)
         });
         self.run_ahead = !fires_alone && !other_ports;
@@ -296,6 +301,28 @@ impl Session {
     pub fn beam_row(&self) -> Option<u64> {
         let held = self.beam.as_ref()?;
         held.buffer().address_at(held.offset() + capture_pad(held))
+    }
+
+    /// Where the next pass's positions cell lies (`Port::Positions` from a
+    /// channel): the cell at the head its staging cursors name, one u32 a
+    /// row, copied on the device into the staged rotations before the
+    /// forward (as [`Self::token_cell`]'s tokens are). `None` where the
+    /// program states no positions channel.
+    pub fn positions_cell(&self, plan: &ExecPlan) -> Result<Option<(Buffer, u64)>> {
+        let Some(binding) = plan
+            .package
+            .ports
+            .iter()
+            .find(|binding| binding.port == eta_ir::registry::Port::Positions && !binding.is_const)
+        else {
+            return Ok(None);
+        };
+        let channel = binding.channel as usize;
+        let cursors = self.staging_cursors(plan);
+        let Some(cursor) = cursors.get(channel) else {
+            return Ok(None);
+        };
+        self.rings.cell_at(channel, cursor.head).map(Some)
     }
 
     /// Where the next pass's parents cell lies (`Port::Parents`): the cell

@@ -148,6 +148,11 @@ pub struct Plane {
     /// pages wait (BEAM-PAGE-LISTS §3): the context's pages and the frames
     /// in flight.
     beam_bounds: (u32, u32),
+    /// Whether a decode envelope's positions are copied from their cell on
+    /// the device ([`Session::positions_cell`]) rather than read on the
+    /// host: every load but one whose rows rotate by a host-built mrope
+    /// table.
+    device_positions: bool,
     next_program: u64,
     next_instance: u64,
 }
@@ -194,6 +199,7 @@ impl Plane {
             rows: 1,
             capture: 0,
             beam_bounds: (0, 1),
+            device_positions: false,
             next_program: 1,
             next_instance: 1,
         }
@@ -397,7 +403,13 @@ impl Plane {
                 // runs: its pages and slots are the host's, its token the
                 // device's.
                 if geometry == GeometryClass::DecodeEnvelope {
-                    session.allow_run_ahead(&program.compiled, &program.plan, geometry, device);
+                    session.allow_run_ahead(
+                        &program.compiled,
+                        &program.plan,
+                        geometry,
+                        device,
+                        self.device_positions,
+                    );
                     tracing::debug!(
                         program = program_id.0,
                         runs_ahead = session.runs_ahead(),
@@ -598,6 +610,34 @@ impl Plane {
     /// its freed pages wait (the frames in flight).
     pub fn set_beam_bounds(&mut self, pages: u32, frames: u32) {
         self.beam_bounds = (pages, frames.max(1));
+    }
+
+    /// Whether decode envelopes' positions are fed on the device.
+    pub fn set_device_positions(&mut self, on: bool) {
+        self.device_positions = on;
+    }
+
+    /// Whether decode envelopes' positions are fed on the device.
+    #[must_use]
+    pub const fn device_positions(&self) -> bool {
+        self.device_positions
+    }
+
+    /// The cell instance `id`'s next pass reads its positions from
+    /// ([`Session::positions_cell`]); `None` where the load reads them on
+    /// the host or the program states none.
+    pub fn positions_cell(&self, id: InstanceId) -> Result<Option<(crate::device::Buffer, u64)>> {
+        if !self.device_positions {
+            return Ok(None);
+        }
+        let bound = self
+            .instances
+            .get(&id)
+            .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
+        let Some(program) = self.programs.get(&bound.program_id) else {
+            return Ok(None);
+        };
+        bound.session.positions_cell(&program.plan)
     }
 
     /// A beam group's layout where `program` states each beam's parent

@@ -896,6 +896,11 @@ impl Inputs {
         (self.store.view(), self.store.at(self.tokens))
     }
 
+    /// Where the staged rotations (each row's RoPE position) lie.
+    pub fn rotations_seat(&self) -> (&Buffer, u64) {
+        (self.store.view(), self.store.at(self.rotations))
+    }
+
     pub fn store_mut(&mut self) -> &mut Region {
         &mut self.store
     }
