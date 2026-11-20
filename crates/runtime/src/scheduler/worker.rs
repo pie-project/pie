@@ -1588,10 +1588,18 @@ impl BatchScheduler {
             // flight is either, nor a frame sealed before still to go, the
             // pool may lower its rung.
             frame_policy.cap_fires(stepped.max_forward_tokens);
+            // Nor while a complete frame cut wider than the cap waits
+            // unsealed (capped): lowered under it, the frame went only once
+            // raised again, a raise its owner's eviction could not fund
+            // while that eviction waited on the frame (Mac Pro at 2 GiB on
+            // 4cef0c7d3 and 6c21ebca3: capped frames, evictions waiting on
+            // them, the raise never served). Kept, the walk lifts the cap
+            // to the frame with no raise at all.
             if in_flight_launches
                 .iter()
                 .all(|batch| batch.rung_rows <= cap as usize)
                 && frame_policy.sealed_widest() <= cap as usize
+                && frame_policy.cut_owed_by().0 <= cap as usize
             {
                 crate::store::shared::grant_rung(engine_id, cap);
             }
