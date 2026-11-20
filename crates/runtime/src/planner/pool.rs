@@ -876,7 +876,10 @@ impl PoolPort for RegistryPool {
     fn chunk_census(&self, run: u32) -> String {
         crate::store::registry::try_get(self.model, self.engine)
             .and_then(|stores| stores.shared)
-            .map(|shared| shared.lock().unwrap().pool().census(run))
+            .map(|shared| {
+                let shared = shared.lock().unwrap();
+                format!("{} {}", shared.pool().census(run), shared.pool().budget_line())
+            })
             .unwrap_or_default()
     }
 

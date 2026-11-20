@@ -603,7 +603,8 @@ impl ResidencyPlanner {
                     let room = match pid {
                         Some(pid) => self.beside_own(pid, (need.run, need.pieces)),
                         None => RunNeed::one(need.run, need.pieces),
-                    };
+                    }
+                    .within(self.port.state_chunks(), Some((need.run, need.pieces)));
                     if self.park_down_for(&room) {
                         return false;
                     }

@@ -1314,6 +1314,44 @@ impl SlotPool {
         self.compacted.clear();
     }
 
+    /// The state budget a guest's room is read against, in one line: what
+    /// `free_chunks` (the open chunks within the headroom) and
+    /// `committable_runs` (segments still to commit within the budget)
+    /// stop at. The committed chunks, less the reserved, the held and the
+    /// activation's, are the headroom (bounded by the ceiling where it sits
+    /// below the pool); the uncommitted segments below the top span, and
+    /// what the pool could still grow to, bound what commits.
+    #[must_use]
+    pub fn budget_line(&self) -> String {
+        let uncommitted: Vec<u32> = self
+            .segments
+            .uncommitted()
+            .filter(|&segment| segment < self.top_segment)
+            .collect();
+        let backed = uncommitted.iter().filter(|&&segment| self.backs(segment)).count();
+        format!(
+            "budget: total={} reserved={} held={} act={} committed={} headroom={} \
+             ceiling={} state_limit={} open={} free_chunks={} segments={} top_segment={} \
+             uncommitted_below_top={} of_them_backed={} growable={} committable_one_chunk={}",
+            self.total,
+            self.reserved,
+            self.held,
+            self.act,
+            self.committed_chunks(),
+            self.headroom(),
+            self.ceiling,
+            self.state_limit(),
+            self.open.count,
+            self.free_chunks(),
+            self.segments.count(),
+            self.top_segment,
+            uncommitted.len(),
+            backed,
+            self.growable_chunks(),
+            self.committable_runs(1),
+        )
+    }
+
     /// What stands between free chunks and a run of `run` adjacent ones,
     /// said in one line for a head short of a run (the soaks' "free chunks
     /// and no run" stalls): the budget's terms and its headroom, the free

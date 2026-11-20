@@ -275,7 +275,11 @@ impl ResidencyPlanner {
         // need is fixed as the restore takes it, and a refusal while those
         // runs stand is one the need truly understates. Its other lengths
         // are read where its need is ([`Self::head_room`]).
-        let pieces = self.whole_unpark(pid, (run, pieces)).pieces_at(run).max(pieces);
+        let pieces = self
+            .whole_unpark(pid, (run, pieces))
+            .pieces_at(run)
+            .min(self.port.state_chunks() / run.max(1))
+            .max(pieces);
         // The runs of the length its refusal named, standing now: what it
         // goes again on. Read at its need's length (a run of seven, the
         // bind's, folded over the unpark's run of four), runs of seven

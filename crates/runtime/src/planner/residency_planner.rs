@@ -276,6 +276,26 @@ impl ResidencyPlanner {
     /// failed; no clock and no answer of the policy refuses a need that fits.
     pub(super) fn never_fits(&self, key: EntryKey) -> Option<super::PlannerError> {
         let (_, total) = self.port.device_stats();
+        // Its runs, its unpark's and its state's chunks together past every
+        // chunk state may take: with every other process evicted and all
+        // parked state moved down it still would not fit, and it is refused
+        // by name, never waited on (the L40S on 3b45462d4: a restore's 1,058
+        // slots of guest state against what the state limit leaves).
+        let most = self.port.state_chunks();
+        if most != u32::MAX
+            && let Some(room) = self.head_room_within(key, false)
+            && room.chunks() > u64::from(most)
+        {
+            let pages = |chunks: u64| {
+                self.port
+                    .chunks_as_pages(u32::try_from(chunks).unwrap_or(u32::MAX))
+            };
+            return Some(super::PlannerError::PastDevice {
+                need: pages(room.chunks()),
+                total: pages(u64::from(most)),
+                runs: room.longest(),
+            });
+        }
         let (need, runs) = self.with_inner(|inner| {
             let waiter = inner.queue.get(&key)?;
             let runs = match waiter.kind {
@@ -538,10 +558,11 @@ impl ResidencyPlanner {
                         .procs
                         .get(&waiter.pid)
                         .is_some_and(|proc| proc.roles_short.is_some()),
+                    waiter.rs_need(),
                 )
             })
         });
-        let Some((key, kv_missing, refused)) = head else {
+        let Some((key, kv_missing, refused, rs_need)) = head else {
             self.returns.want_nothing();
             return;
         };
@@ -567,6 +588,16 @@ impl ResidencyPlanner {
         } else {
             u64::MAX
         };
+        // Short of state slots (records, rs list or window slots), never
+        // refused: slots of those shapes given back fill no chunk and move
+        // no kv slot, so no count the signal carries measures them; any
+        // room given back wakes it. Left to the free chunks' count, a
+        // restore short of its state waited for a fire landing's poke, up
+        // to 15 s (the L40S at 6 GiB on 22b0a3e83: restores served almost
+        // all by pokes, about one a run by the room signal).
+        if !refused && !rs_need.is_zero() && !self.port.rs_stats().0.covers(rs_need) {
+            want_chunks = 0;
+        }
         if want_chunks == u64::MAX && want_list == u64::MAX && want_swap == u64::MAX {
             want_chunks = u64::from(self.port.free_chunks()).saturating_add(1);
         }
@@ -708,6 +739,13 @@ impl ResidencyPlanner {
     /// the map asked less than the step took and moved no one. `None` for
     /// a head short of kv alone.
     pub(super) fn head_room(&self, key: EntryKey) -> Option<RunNeed> {
+        self.head_room_within(key, true)
+    }
+
+    /// [`Self::head_room`], `capped` to the pool's state chunks or not:
+    /// uncapped, what the head's step takes whole, for whether it ever
+    /// fits alone ([`Self::never_fits`]).
+    fn head_room_within(&self, key: EntryKey, capped: bool) -> Option<RunNeed> {
         let (need, suspended, kv_missing) = self.with_inner(|inner| {
             let waiter = inner.queue.get(&inner.locate(key)?)?;
             match &waiter.kind {
@@ -778,6 +816,9 @@ impl ResidencyPlanner {
             let (run, _) = room.longest().unwrap_or(need);
             room.add(run, pages.div_ceil(per_chunk).div_ceil(run.max(1)));
         }
+        if !capped {
+            return Some(room);
+        }
         Some(room.within(self.port.state_chunks(), Some(need)))
     }
 
@@ -791,19 +832,19 @@ impl ResidencyPlanner {
     pub(super) fn whole_unpark(&self, pid: ProcessId, (run, pieces): (u32, u32)) -> RunNeed {
         let mut need = self.port.unpark_need(pid);
         need.at_least(run, pieces);
-        need.within(self.port.state_chunks(), Some((run, pieces)))
+        need
     }
 
     /// The runs a restore a bind suspended asks of the chunk map: its bind's
     /// `pieces` runs of `run` chunks beside those its own unpark lays first
-    /// (`PoolPort::unpark_need`, one entry per run length), never more than
-    /// the pool stands. The census reads the bind's runs beside its own
+    /// (`PoolPort::unpark_need`, one entry per run length; the pool's bound
+    /// read by the caller). The census reads the bind's runs beside its own
     /// retake (`room_beside_own`); a map asked for the bind's runs alone saw
     /// them free, found no one to move, and the restore waited with no step.
     pub(super) fn beside_own(&self, pid: ProcessId, (run, pieces): (u32, u32)) -> RunNeed {
         let mut need = self.port.unpark_need(pid);
         need.add(run, pieces);
-        need.within(self.port.state_chunks(), Some((run, pieces)))
+        need
     }
 
     /// Parked state lying on the device, for a map for `head`: role slots

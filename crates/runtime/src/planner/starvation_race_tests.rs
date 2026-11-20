@@ -2489,6 +2489,8 @@ struct BindRoomPool {
     headroom: parking_lot::Mutex<Option<u32>>,
     /// The pages a unit of state (an rs slot) stands for (`rs_as_pages`).
     rs_pages: AtomicU32,
+    /// The state slots free (`rs_stats`).
+    rs_free: AtomicU32,
 }
 
 impl BindRoomPool {
@@ -2514,6 +2516,7 @@ impl BindRoomPool {
             disk_idle: AtomicU32::new(0),
             headroom: parking_lot::Mutex::new(None),
             rs_pages: AtomicU32::new(0),
+            rs_free: AtomicU32::new(0),
         }
     }
 
@@ -2567,9 +2570,19 @@ impl BindRoomPool {
 
 impl PoolPort for BindRoomPool {
     fn chunk_stats(&self) -> ChunkStats {
+        let rs = self.rs_free.load(Ordering::Relaxed);
         ChunkStats {
             pages: (self.free.lock().len() as u32, self.total),
-            rs: Default::default(),
+            rs: (
+                RsUnits {
+                    slots: rs,
+                    ..RsUnits::default()
+                },
+                RsUnits {
+                    slots: rs.max(8),
+                    ..RsUnits::default()
+                },
+            ),
         }
     }
     fn host_stats(&self) -> (u32, u32) {
@@ -8029,4 +8042,92 @@ fn a_refused_run_stays_in_the_need_across_a_re_send() {
     // Re-sent: its refusal cleared for the try.
     planner.with_inner(|inner| inner.roles_retry_head());
     assert!(has_nine(&planner), "re-sent: its need still asks the run of nine");
+}
+
+/// The L40S at 6 GiB on 22b0a3e83 (+12% against its base): restores waited
+/// for a fire landing's poke, up to 15 s, the room signal waking about one
+/// a run. A restore short of its state slots publishes no count the signal
+/// measures; room given back wakes it within a turn, never left for a poke.
+#[tokio::test(flavor = "current_thread")]
+async fn a_restore_short_of_state_is_served_by_the_room_signal() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let model = crate::store::registry::register_model(16, &[8], &[4]);
+    let pool = Arc::new(BindRoomPool {
+        model,
+        ..BindRoomPool::new(8, 0..0, 64)
+    });
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    planner.arm_drain_task();
+    let head = ProcessId::new_v4();
+    planner.register(head);
+    planner.note_admitted(head);
+    planner.with_inner(|inner| {
+        inner.procs.get_mut(&head).unwrap().state = Residency::Evicted;
+        inner.enqueue(
+            head,
+            WaitKind::Restore {
+                demand: Demand {
+                    kv_pages: 0,
+                    rs: RsUnits {
+                        slots: 1,
+                        ..RsUnits::default()
+                    },
+                },
+            },
+        );
+    });
+    planner.poke();
+    for _ in 0..50 {
+        crate::rt::yield_now().await;
+    }
+    let state = |planner: &ResidencyPlanner| planner.with_inner(|inner| inner.procs[&head].state);
+    assert_eq!(state(&planner), Residency::Evicted, "no state slot free");
+    // A state slot is given back: the room signal, no fire landing.
+    pool.rs_free.store(1, Ordering::Relaxed);
+    planner.returns.slots_freed(crate::store::slots::RoomCount {
+        tier: crate::store::slots::RoomTier::Device,
+        chunks: 0,
+        slots: 0,
+    });
+    for _ in 0..50 {
+        crate::rt::yield_now().await;
+        if planner.stats.restores.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+    }
+    assert!(
+        planner.stats.restores.load(Ordering::Relaxed) > 0 || state(&planner) != Residency::Evicted,
+        "the room signal serves it"
+    );
+}
+
+/// The L40S on 3b45462d4: a restore whose guest state (1,058 slots, about
+/// sixteen chunks) and runs past what the state limit leaves, waiting with
+/// nothing evictable. A head whose whole step takes more chunks than state
+/// may ever take is refused by name as never fitting alone; one that fits
+/// waits.
+#[test]
+fn a_restore_past_every_state_chunk_is_refused_as_never_fitting_alone() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let head = ProcessId::new_v4();
+    planner.register(head);
+    planner.note_admitted(head);
+    planner.with_inner(|inner| {
+        inner.procs.get_mut(&head).unwrap().state = Residency::Restoring;
+    });
+    // Its unpark lays four chunks beside a run of one: it fits.
+    pool.own.lock().extend(0..4);
+    planner.requeue_restore_roles(head, (1, 1), Some(0));
+    let key = planner
+        .with_inner(|inner| inner.queue.iter().find(|(_, w)| w.pid == head).map(|(k, _)| *k))
+        .expect("queued again");
+    assert!(planner.never_fits(key).is_none(), "five chunks of eight: it waits");
+    // Its unpark lays ten: past the eight chunks state may take.
+    pool.own.lock().extend(4..10);
+    assert!(
+        matches!(planner.never_fits(key), Some(super::PlannerError::PastDevice { .. })),
+        "past every state chunk: refused by name"
+    );
 }
