@@ -19,13 +19,17 @@ pub(crate) struct LibraryMatch {
 pub(crate) fn recognize_library_dataflows(
     stage: &NormalizedStage,
     index: &StageIndex,
+    forms: super::LibraryForms,
 ) -> Vec<LibraryMatch> {
     let mut claimed = BTreeSet::new();
     let mut matches = Vec::new();
     for final_node in (0..stage.ops.len() as u32).map(NodeIndex) {
-        let Some(candidate) = match_nucleus_dataflow(stage, final_node, index)
-            .or_else(|| match_draw_dataflow(stage, final_node, index))
-        else {
+        let Some(candidate) = match_nucleus_dataflow(stage, final_node, index).or_else(|| {
+            forms
+                .draw
+                .then(|| match_draw_dataflow(stage, final_node, index))
+                .flatten()
+        }) else {
             continue;
         };
         if candidate.nodes.iter().any(|node| claimed.contains(node)) {
@@ -55,7 +59,8 @@ pub(crate) fn recognize_library_dataflows(
             Some(Dimension::Static(width)) if *width >= LANE_CUT_WIDTH
         );
         // A bf16 row's cut reads it as f32 (`eta_ir::types`), as an f32 row's.
-        let float = matches!(input_type.dtype, Dtype::F32 | Dtype::Bf16);
+        let float = input_type.dtype == Dtype::F32
+            || (forms.bf16_cut && input_type.dtype == Dtype::Bf16);
         if !float || !wide || !(1..=2).contains(&input_type.rank()) {
             continue;
         }

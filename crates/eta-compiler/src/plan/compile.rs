@@ -91,9 +91,50 @@ impl CompiledStage {
     }
 }
 
+/// The library forms a backend's emitters serve: the planner forms a
+/// library region only of a form the backend states, and leaves any other
+/// dataflow to generated regions (what a backend without the form ran
+/// before the form existed).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct LibraryForms {
+    /// A temperature-scaled Gumbel draw over a top-p / top-k cut as one
+    /// `NucleusSample` region (`match_draw_dataflow`).
+    pub draw: bool,
+    /// A lane cut over bf16 rows (an f32 row's cut is every backend's).
+    pub bf16_cut: bool,
+}
+
+impl LibraryForms {
+    /// Every form: what the planner forms where no backend says less.
+    pub const ALL: LibraryForms = LibraryForms {
+        draw: true,
+        bf16_cut: true,
+    };
+
+    /// The forms both `self` and `other` serve.
+    #[must_use]
+    pub const fn and(self, other: LibraryForms) -> LibraryForms {
+        LibraryForms {
+            draw: self.draw && other.draw,
+            bf16_cut: self.bf16_cut && other.bf16_cut,
+        }
+    }
+}
+
+impl Default for LibraryForms {
+    fn default() -> LibraryForms {
+        LibraryForms::ALL
+    }
+}
+
 pub fn compile_bound(bound: &BoundTrace) -> Vec<CompiledStage> {
+    compile_bound_with(bound, LibraryForms::ALL)
+}
+
+/// [`compile_bound`] forming library regions of `forms` only.
+pub fn compile_bound_with(bound: &BoundTrace, forms: LibraryForms) -> Vec<CompiledStage> {
     (0..bound.container.stages.len())
-        .map(|stage_index| compile_stage_at(bound, stage_index))
+        .map(|stage_index| compile_stage_with(bound, stage_index, forms))
         .collect()
 }
 
@@ -107,12 +148,16 @@ pub fn compile_stage(bound: &BoundTrace, stage: Stage) -> Option<CompiledStage> 
 }
 
 pub fn compile_stage_at(bound: &BoundTrace, stage_index: usize) -> CompiledStage {
+    compile_stage_with(bound, stage_index, LibraryForms::ALL)
+}
+
+fn compile_stage_with(bound: &BoundTrace, stage_index: usize, forms: LibraryForms) -> CompiledStage {
     let mut normalized = normalize_stage(bound, stage_index);
     localize_stage(bound, &mut normalized);
     let signature = stage_signature(bound, &normalized);
     let index = StageIndex::of(&normalized);
     let singleton = singleton_partition(&normalized, &index);
-    let matches = recognize_library_dataflows(&normalized, &index);
+    let matches = recognize_library_dataflows(&normalized, &index, forms);
     let fused = fused_partition(&normalized, &index, &matches);
     CompiledStage {
         normalized,

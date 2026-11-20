@@ -993,18 +993,11 @@ fn bf16_suites() -> Vec<Suite> {
         bf16_draw(3, true),
     ];
     suites.extend(
-        eta_dsl::sampler::STANDARD
+        eta_dsl::sampler::standard()
             .iter()
             .map(|(name, shape)| standard(name, shape)),
     );
     suites.push(standard("penalized min-p + top-p", &penalized));
-    suites.push(standard(
-        "penalized top-p",
-        &eta_dsl::sampler::Shape {
-            min_p: false,
-            ..penalized
-        },
-    ));
     suites.extend([beam_bf16(1), beam_bf16(4)]);
     suites
 }
