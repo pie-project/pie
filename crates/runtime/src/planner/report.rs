@@ -268,7 +268,15 @@ impl ResidencyPlanner {
 
     fn fail_restore_loud(self: &Arc<Self>, pid: ProcessId, reason: &str) {
         let reason = format!("KV restore failed: {reason}");
-        tracing::error!(pid = %pid, %reason, "planner: failing evicted process loud");
+        // The engine's scheduler gone: the worker is shutting down, and the
+        // restore was cut by it, no failure of the process's (logs after
+        // SIGTERM: "engine 0 has no scheduler").
+        let (_, engine) = self.port.locus();
+        if crate::scheduler::scheduler_handle(engine).is_err() {
+            tracing::debug!(pid = %pid, %reason, "planner: a restore cut by shutdown");
+        } else {
+            tracing::error!(pid = %pid, %reason, "planner: failing evicted process loud");
+        }
         crate::inferlet::process::terminate_by(pid, Err(reason), crate::policy::By::Host);
     }
 

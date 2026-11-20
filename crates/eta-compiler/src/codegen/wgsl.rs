@@ -233,7 +233,6 @@ fn reduce_finish_call(at: usize, tag: u8) -> String {
 }
 
 fn emit_op(body: &mut String, at: usize, tag: u8, rounds: u32, levels: u32) {
-    let _ = writeln!(body, "  tmp_base = node_area({at}u);");
     if is_sort(tag) {
         let _ = writeln!(body, "  ptir_sort_seed({at}u);");
         body.push_str(BARRIER);
@@ -392,25 +391,25 @@ pub struct Stepwise {
 /// stage's cfg (the heap's words, its values, its ops), indices read from
 /// the heap by their own bounds, and a refused access writes the runtimes'
 /// fault status (state 3, `OUT_OF_BOUNDS`, the index, the limit).
-/// 4: a node keeps its temporaries in an area of its own, at its op's word
-/// past the values' in the offsets table (`node_area`), in place of the
-/// stage's one area at `cfg.temporary`.
-/// 5: a reshape that covers its source is read as its source whatever the
+/// 4: a step reads its tables, status and heap at the bases its record
+/// states, in the two pool segments a backend binds whole (the instance's
+/// slots, its heap), and its config from its config table: one bind group
+/// serves every instance whose slots and heap share two segments.
+/// 5: a node keeps its temporaries in an area of its own, at the heap word
+/// its step's record carries (`pie_step.area`), in place of the stage's one
+/// area its config table named.
+/// 6: a reshape that covers its source is read as its source whatever the
 /// stage's channel slots number, and launches nothing.
-/// 6: a step finds its node's area in its uniform (`pie_step.area`), not
-/// by a load from the offsets table; a module that spells its steps reads
-/// the table (`node_area`).
 pub const WGSL_STEP_EMITTER_VERSION: u16 = 6;
 
-/// The binding of the uniform a step module reads its node, rung and
-/// selector from ([`StepUniform`]), beside the runtime's (0 to 5): a
+/// The binding of the record a step module reads its node, rung, selector
+/// and bases from ([`StepUniform`]), beside the runtime's (0, 1 and 4): a
 /// backend binds each step's at its own dynamic offset.
 pub const STEP_BINDING: u32 = 6;
 
 const NODE: &str = "pie_step.node";
 const RUNG: &str = "pie_step.rung";
 const SELECTOR: &str = "pie_step.selector";
-const AREA: &str = "pie_step.area";
 
 /// The ops this backend steps: every one it emits but a boundary op.
 fn stepped(tag: u8) -> bool {
@@ -492,41 +491,11 @@ fn call_text(call: Call) -> String {
             | Call::Finish { guarded: true, .. }
             | Call::PivotPack { guarded: true }
     );
-    // A call that may keep something in a temporary area finds its node's
-    // first in the step's uniform, as uniform as the node; a plain op's
-    // named call keeps none.
-    let plain = named
-        && matches!(
-            call,
-            Call::Unary
-                | Call::Arith
-                | Call::Compare
-                | Call::Logic
-                | Call::Select
-                | Call::Cumulative
-                | Call::Broadcast
-                | Call::Copy
-                | Call::Transpose
-                | Call::Gather
-                | Call::GatherRow
-                | Call::Scatter
-                | Call::Iota
-                | Call::MaskApply
-                | Call::StructMask
-                | Call::Rng
-                | Call::Matmul
-                | Call::Const
-        );
-    let area = if plain {
-        String::new()
-    } else {
-        alloc::format!("  tmp_base = {AREA};\n")
-    };
     if guarded {
         // The ladder runs only for a row the select handed over.
-        alloc::format!("{area}  if (sel_ladder_idle()) {{ return; }}\n  {body};\n")
+        alloc::format!("  if (sel_ladder_idle()) {{ return; }}\n  {body};\n")
     } else {
-        alloc::format!("{area}  {body};\n")
+        alloc::format!("  {body};\n")
     }
 }
 
@@ -547,9 +516,11 @@ pub fn step_module(entry: &str, call: &str) -> String {
     let mut source = String::with_capacity(RUNTIME.len() + 1024);
     source.push_str(RUNTIME);
     source.push('\n');
-    // The words at `steps::NODE_AT`, `RUNG_AT`, `SELECTOR_AT` and `AREA_AT`.
+    // The words [`StepUniform::bytes`] lays.
     source.push_str(
-        "struct PieStep {\n  node : u32,\n  rung : u32,\n  selector : u32,\n  area : u32,\n}\n",
+        "struct PieStep {\n  node : u32,\n  rung : u32,\n  selector : u32,\n  area : u32,\n  \
+         status_base : u32,\n  descs_base : u32,\n  params_base : u32,\n  offs_base : u32,\n  \
+         cfg_base : u32,\n  heap_base : u32,\n  pad1 : u32,\n  pad2 : u32,\n}\n",
     );
     let _ = writeln!(
         source,
@@ -566,8 +537,7 @@ pub fn step_module(entry: &str, call: &str) -> String {
 #[must_use]
 pub fn spelled(call: &str, step: &Step) -> String {
     let flag = if step.selector != 0 { "true" } else { "false" };
-    call.replace(AREA, &alloc::format!("node_area({}u)", step.node))
-        .replace(NODE, &alloc::format!("{}u", step.node))
+    call.replace(NODE, &alloc::format!("{}u", step.node))
         .replace(&alloc::format!("{SELECTOR} != 0u"), flag)
         .replace(SELECTOR, &alloc::format!("{}u", step.selector))
         .replace(RUNG, &alloc::format!("{}u", step.rung))
@@ -586,8 +556,16 @@ fn wrap_step(source: &mut String, entry_name: &str, call: &str) {
     );
     let _ = writeln!(source, "  lanes = grid.x * {WORKGROUP}u;");
     source.push_str("  sel_lt = lid.x;\n  sel_group = wid.x;\n  sel_groups = grid.x;\n");
-    // The stage's heap bound, read once ([`RUNTIME`]'s `hld` / `hst`).
-    source.push_str("  lim_heap = cfg.heap_words;\n");
+    // The step's bases, its heap bound ([`RUNTIME`]'s `hld` / `hst`) and
+    // its node's temporary area's first word, read once: the area from the
+    // record, as uniform as the node, with no table load ahead of it.
+    source.push_str(
+        "  b_status = pie_step.status_base;\n  b_descs = pie_step.descs_base;\n  \
+         b_params = pie_step.params_base;\n  b_offs = pie_step.offs_base;\n  \
+         b_heap = pie_step.heap_base;\n  \
+         lim_heap = tables[pie_step.cfg_base + CFG_HEAP_WORDS];\n  \
+         tmp_base = pie_step.area;\n",
+    );
     source.push_str(call);
     source.push_str("  heap_flush();\n}\n");
 }

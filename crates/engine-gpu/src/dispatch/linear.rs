@@ -670,16 +670,17 @@ impl<B: Backend> Run<'_, B> {
 }
 
 impl<B: Backend> Run<'_, B> {
-    /// A dense matmul from `act` into `y` at the device's tactic for the
-    /// rows it lands. A naming sink is told every way it goes: `matmul` at
-    /// each tactic some fire of up to the load's most rows takes.
+    /// A dense matmul from `act` into `y` at its rung's tactic
+    /// ([`crate::dense`]). A naming sink is told every way it goes: `matmul`
+    /// at each tactic some fire of up to the load's most rows takes, each
+    /// naming the vector kernels besides its tiled ones.
     fn gemm(
         &self,
         act: ValueId,
         matmul: impl Fn(kernels_slang::linear::gemm::Tactic) -> Result<(), kernels_slang::Error>,
     ) -> Result<(), kernels_slang::Error> {
         let Some(names) = self.ctx.naming() else {
-            return matmul(self.tuning().gemm(self.tier(), self.tensor(act).rows));
+            return matmul(self.dense().at(self.tensor(act).rows));
         };
         // The walk fires at one rung; a fire of the load brings up to the
         // most rows its rungs hold.

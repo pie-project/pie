@@ -12,7 +12,7 @@ use engine::load::check::{Dissection, Fired, Run, Shell as CheckShell, Weighed};
 use poem_ir::{Platform, Request, Trace};
 
 use crate::api::ContractFor;
-use crate::serve::{Boot, CheckRungs, Lane, Serve, Shell};
+use crate::serve::{Boot, CheckRungs, Lane, Seated, Serve, Shell};
 
 /// The widest fire a check's load is asked: [`engine::load::check::PAST_TOP`]
 /// times the widest row count the rates step measures, past any fire top a
@@ -166,17 +166,23 @@ impl<B: Serve> Loaded<B> {
             .trace()
             .facts
             .word(&Request::new(fire.tokens_per_lane, false));
-        let lanes: Vec<Lane<'_>> = (0..fire.lanes)
-            .map(|slot| Lane {
-                slot,
-                word,
-                tokens: &tokens,
+        // The fire serving makes: every lane's rows laid, and none read
+        // back by the host, since a serving lane's rows are read on the
+        // device by the program attached to it (or by nothing).
+        let lanes: Vec<Seated<'_, B>> = (0..fire.lanes)
+            .map(|slot| Seated {
+                hosts: false,
+                ..Seated::of(Lane {
+                    slot,
+                    word,
+                    tokens: &tokens,
+                })
             })
             .collect();
         self.shell.recorded_serving();
         self.shell.unkept_serving();
         let began = Instant::now();
-        self.shell.fire(&lanes).map_err(|e| e.to_string())?;
+        self.shell.fire_seated(&lanes).map_err(|e| e.to_string())?;
         let ns = began.elapsed().as_secs_f64() * 1e9;
         let walked = self.shell.recorded_serving() + self.shell.unkept_serving() > 0;
         Ok((ns, walked))

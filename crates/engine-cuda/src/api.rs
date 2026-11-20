@@ -322,6 +322,23 @@ fn fault(fault: Fault) -> Error {
     if let Some(lane) = fault.lane() {
         return Error::lane(lane, fault);
     }
+    // A program overreaching its attachment refuses every lane it spans.
+    if let Fault::Overreach {
+        instance, lanes, ..
+    } = &fault
+    {
+        let reason = fault.to_string();
+        return Error::Lanes(
+            lanes
+                .clone()
+                .map(|lane| engine::LaneFault {
+                    lane,
+                    instance: Some(*instance),
+                    reason: reason.clone(),
+                })
+                .collect(),
+        );
+    }
     match fault {
         Fault::Runtimeless | Fault::Device { .. } | Fault::Unsupported(_) => {
             Error::Device(fault.to_string())
@@ -350,7 +367,10 @@ fn fault(fault: Fault) -> Error {
         | Fault::MaskRows { .. }
         | Fault::Maskless { .. }
         | Fault::MaskUnread { .. } => Error::Invalid(fault.to_string()),
-        Fault::Adapterless { .. } | Fault::AdapterWord { .. } => Error::Invalid(fault.to_string()),
+        Fault::Adapterless { .. }
+        | Fault::AdapterWord { .. }
+        | Fault::KvWrite { .. }
+        | Fault::Overreach { .. } => Error::Invalid(fault.to_string()),
         Fault::Adapter { .. } => Error::Load(fault.to_string()),
         Fault::AdapterSlots { .. } => Error::Exhausted {
             resource: "adapter slots",
@@ -1780,12 +1800,15 @@ impl Cuda {
                         .filter(|_| !placed[at])
                         .map(|_| lane.kv.held),
                     folded: lane.kv.folded,
+                    readable: lane.kv.readable,
+                    set: lane.kv.set,
                     kv_less: lane.kv_less,
                     translation: if placed[at] {
                         table(lane, LIST).unwrap_or(&[])
                     } else {
                         &[]
                     },
+                    write_end: lane.kv.write_end,
                     window: table(lane, WINDOW).unwrap_or(&[]),
                     more_windows: &more_windows[at],
                     mask: lane.mask.as_ref(),

@@ -1645,6 +1645,39 @@ __device__ __forceinline__ void ptir_parallel_pivot(
   }
 }
 
+// An integer scatter-add over the block: each thread adds its updates into
+// the output with an atomic add. Integer addition is exact and commutes, so
+// the sums are the serial loop's in any order (the u32 wrap included).
+__device__ __forceinline__ void ptir_parallel_scatter_add_int(
+    const m1_u8* indices,
+    const m1_u8* updates,
+    m1_u8* output,
+    const M1ValueDesc base_desc,
+    const M1ValueDesc index_desc,
+    const M1ValueDesc update_desc) {
+  m1_u32 rest = 1u;
+  m1_u32 rows = 1u;
+  if (base_desc.rank != 0u) {
+    rows = base_desc.dims[0];
+    rest = rows == 0u ? 1u : base_desc.len / rows;
+  }
+  const bool scalar =
+      update_desc.len == 1u && index_desc.len * rest != 1u;
+  const m1_u32 total = index_desc.len * rest;
+  for (m1_u32 at = threadIdx.x; at < total; at += blockDim.x) {
+    const m1_u32 k = at / rest;
+    const m1_u32 r = at - k * rest;
+    const long long row = m1_load_index(indices, k, index_desc.dtype);
+    if (row < 0 || (m1_u64)row >= rows) continue;
+    const m1_u32 destination = (m1_u32)row * rest + r;
+    const m1_u32 source = scalar ? 0u : k * rest + r;
+    const m1_u32 value = base_desc.dtype == 1u
+        ? (m1_u32)m1_load_i(updates, source, update_desc.dtype)
+        : m1_load_u(updates, source, update_desc.dtype);
+    atomicAdd(reinterpret_cast<unsigned int*>(output) + destination, value);
+  }
+}
+
 __device__ __forceinline__ void ptir_scatter_updates(
     m1_u32 tag,
     const m1_u8* indices,
