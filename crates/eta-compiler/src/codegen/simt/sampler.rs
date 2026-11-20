@@ -19,6 +19,8 @@ use super::runtime::{Dialect, runtime_source};
 use super::singleton::valid_identifier;
 
 const SAMPLE_LANE: &str = include_str!("../../../runtime/cuda/sample_lane.cuh");
+/// The lane arenas' geometry, which a sampler and a split select share.
+pub(super) const LANE_ARENA: &str = include_str!("../../../runtime/cuda/lane_arena.cuh");
 
 /// A sampler block's threads: at most 512, so its walks and plans keep their
 /// state in registers (a 1024-thread block holds 128 a lane).
@@ -175,6 +177,7 @@ pub fn emit_sampler_region(
     let mut source = runtime_source(dialect);
     source.push_str(&PROLOGUE[..cut]);
     source.push_str(dialect.lane);
+    source.push_str(LANE_ARENA);
     source.push_str(SAMPLE_LANE);
     source.push('\n');
     source.push_str(ENTRY);
