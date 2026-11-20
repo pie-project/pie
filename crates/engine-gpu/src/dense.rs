@@ -531,7 +531,10 @@ mod tests {
         // A profile timed to 4096 rows has its curves measured again for a
         // load of 8192; to 4096 it keeps them.
         let mut tuned = profile::fire::Tuned::default();
-        tuned.rates = r;
+        tuned.rates = profile::fire::Rates {
+            kernels_timed_to: Some(4096),
+            ..r
+        };
         let chip = profile::Registry::new("test", &[], &[])
             .defaults()
             .with_tuned(tuned);

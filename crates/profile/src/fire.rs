@@ -129,6 +129,35 @@ pub struct Rates {
     /// Entries accumulate load to load, a load measuring only the shapes the
     /// table lacks. Not a roofline rate: no load requires it.
     pub product_ns: Option<Vec<ProductTime>>,
+    /// The rows the vector and tiled kernels' curves were asked to reach
+    /// (`vector_tflops_by_rows`, `tile_tflops_by_rows`): a load of more rows
+    /// times them again; a curve that ends short of these rows stopped where
+    /// [`Rates::kernel_stops`] says.
+    pub kernels_timed_to: Option<u32>,
+    /// Where each kernel curve that ends short of
+    /// [`Rates::kernels_timed_to`] stopped, and why.
+    pub kernel_stops: Option<Vec<KernelStop>>,
+}
+
+/// Where a kernel's curve stopped short of the rows it was asked to reach
+/// ([`Rates::kernel_stops`]): the curve (`kind` [`KernelStop::VECTOR`] or
+/// [`KernelStop::TILE`], `key` its rows a workgroup or row tile), the rows
+/// it was not timed at, and `why` ([`KernelStop::BOUND`]: one fire's
+/// estimate passed the device's bound on one submission;
+/// [`KernelStop::BUFFER`]: an operand passed the device's largest buffer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KernelStop {
+    pub kind: u32,
+    pub key: u32,
+    pub rows: u32,
+    pub why: u32,
+}
+
+impl KernelStop {
+    pub const VECTOR: u32 = 1;
+    pub const TILE: u32 = 2;
+    pub const BOUND: u32 = 1;
+    pub const BUFFER: u32 = 2;
 }
 
 /// One product's measured time on one kernel ([`Rates::product_ns`]): the
@@ -214,6 +243,8 @@ impl Rates {
                 }
                 (mine, theirs) => mine.or(theirs),
             },
+            kernels_timed_to: self.kernels_timed_to.or(below.kernels_timed_to),
+            kernel_stops: self.kernel_stops.or(below.kernel_stops),
         }
     }
 
@@ -260,6 +291,8 @@ impl Rates {
                 .clone()
                 .filter(|_| has("vector_tflops_by_rows")),
             product_ns: self.product_ns.clone().filter(|_| has("product_ns")),
+            kernels_timed_to: self.kernels_timed_to.filter(|_| has("kernels_timed_to")),
+            kernel_stops: self.kernel_stops.clone().filter(|_| has("kernel_stops")),
         }
     }
 
@@ -283,6 +316,8 @@ impl Rates {
             "tile_tflops_by_rows" => self.tile_tflops_by_rows.is_none(),
             "vector_tflops_by_rows" => self.vector_tflops_by_rows.is_none(),
             "product_ns" => self.product_ns.is_none(),
+            "kernels_timed_to" => self.kernels_timed_to.is_none(),
+            "kernel_stops" => self.kernel_stops.is_none(),
             _ => true,
         };
         keys.iter().copied().filter(|key| unstated(key)).collect()
@@ -356,6 +391,16 @@ impl Rates {
             let _ = writeln!(out, "product_ns = [\n{}]", rows.concat());
         }
         keyed(&mut out, ATTN_BY_ROWS_KEYS, &self.attn_tflops_by_rows_keys);
+        if let Some(rows) = self.kernels_timed_to {
+            let _ = writeln!(out, "kernels_timed_to = {rows}");
+        }
+        if let Some(stops) = &self.kernel_stops {
+            let stops: Vec<String> = stops
+                .iter()
+                .map(|s| format!("[{}, {}, {}, {}]", s.kind, s.key, s.rows, s.why))
+                .collect();
+            let _ = writeln!(out, "kernel_stops = [{}]", stops.join(", "));
+        }
         out
     }
 }
@@ -515,6 +560,8 @@ mod tests {
             tile_tflops_by_rows: Some(vec![(32, vec![(8, 1.0), (256, 9.5)])]),
             vector_tflops_by_rows: Some(vec![(4, vec![(1, 0.5)])]),
             product_ns: None,
+            kernels_timed_to: None,
+            kernel_stops: None,
         };
         assert!(rates.complete(&KEYS));
         assert_eq!(

@@ -587,6 +587,8 @@ mod on_device {
                 tile_tflops_by_rows: None,
                 vector_tflops_by_rows: None,
                 product_ns: None,
+                kernels_timed_to: None,
+                kernel_stops: None,
             },
             attn_by_dim,
         })
@@ -1184,6 +1186,8 @@ mod ensure_tests {
             tile_tflops_by_rows: None,
             vector_tflops_by_rows: None,
             product_ns: None,
+            kernels_timed_to: None,
+            kernel_stops: None,
         }
     }
 

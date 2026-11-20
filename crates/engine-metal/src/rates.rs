@@ -787,6 +787,8 @@ pub fn measure(
         tile_tflops_by_rows: None,
         vector_tflops_by_rows: None,
         product_ns: None,
+        kernels_timed_to: None,
+        kernel_stops: None,
     })
 }
 

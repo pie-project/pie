@@ -959,6 +959,8 @@ fn a_device_file_states_its_rates_and_a_layer_above_replaces_them() {
             tile_tflops_by_rows: None,
             vector_tflops_by_rows: None,
             product_ns: None,
+            kernels_timed_to: None,
+            kernel_stops: None,
         }
     );
 
@@ -1022,12 +1024,12 @@ fn rates_are_refused_where_they_do_not_read_and_fire_times_are_no_profiles() {
         ("[rates]\ngemm_tflops = 1.0\n", "not `gemm_tflops`"),
         (
             "[rates]\nflops = 1.0\n",
-            "`submit_worst_ratio` and `attn_tflops_by_rows_keys`, not `flops`",
+            "`kernels_timed_to` and `kernel_stops`, not `flops`",
         ),
         // The measured grids are gone: an unknown key like any other.
         (
             "[rates]\nbf16_flops_per_ns_by_rows_n_k = [[16, 1024, 1024, 1.0]]\n",
-            "`attn_tflops_by_rows_keys`, not `bf16_flops_per_ns_by_rows_n_k`",
+            "`kernel_stops`, not `bf16_flops_per_ns_by_rows_n_k`",
         ),
         (
             "[rates]\nattn_flops_per_ns_by_keys_and_dim = [[2048, 128, 2.0]]\n",

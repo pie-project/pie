@@ -1145,6 +1145,26 @@ impl<'a> Walk<'a> {
                     rates.product_ns = self.product_times(v);
                     continue;
                 }
+                "kernel_stops" => {
+                    rates.kernel_stops = self.kernel_stops(v);
+                    continue;
+                }
+                "kernels_timed_to" => {
+                    match int(v.get_ref())
+                        .and_then(|i| u32::try_from(i).ok())
+                        .filter(|&r| r > 0)
+                    {
+                        Some(rows) => rates.kernels_timed_to = Some(rows),
+                        None => self.err(
+                            v.span().start,
+                            format!(
+                                "`rates.kernels_timed_to` is a whole number of rows, not {}",
+                                found(v.get_ref())
+                            ),
+                        ),
+                    }
+                    continue;
+                }
                 "elementwise_gbps" => &mut rates.elementwise_gbps,
                 "hbm_gbps" => &mut rates.hbm_gbps,
                 "cached_gbps" => &mut rates.cached_gbps,
@@ -1176,7 +1196,8 @@ impl<'a> Walk<'a> {
                              `attn_tflops_by_keys`, `hbm_gbps`, `cached_gbps`, `elementwise_gbps`, \
                              `scan_gelems`, `few_row_tflops`, `workgroups_per_core`, \
                              `tile_tflops_by_rows`, `vector_tflops_by_rows`, `product_ns`, \
-                             `submit_worst_ratio` and `attn_tflops_by_rows_keys`, not `{other}`"
+                             `submit_worst_ratio`, `attn_tflops_by_rows_keys`, `kernels_timed_to` \
+                             and `kernel_stops`, not `{other}`"
                         ),
                     );
                     continue;
@@ -1200,11 +1221,64 @@ impl<'a> Walk<'a> {
     /// `rates.product_ns`: a list of `[kind, rows, k, m, kernel, ns, spread]`,
     /// whole numbers then a positive time and a spread at least zero, no
     /// shape twice.
-    fn product_times(&mut self, value: &Spanned<DeValue<'_>>) -> Option<Vec<crate::fire::ProductTime>> {
+    /// `rates.kernel_stops`: a list of `[kind, key, rows, why]`, whole
+    /// numbers each.
+    fn kernel_stops(
+        &mut self,
+        value: &Spanned<DeValue<'_>>,
+    ) -> Option<Vec<crate::fire::KernelStop>> {
+        let what = "`rates.kernel_stops` is a list of [kind, key, rows, why], whole numbers";
+        let DeValue::Array(entries) = value.get_ref() else {
+            self.err(
+                value.span().start,
+                format!("{what}, not {}", found(value.get_ref())),
+            );
+            return None;
+        };
+        let mut out = Vec::with_capacity(entries.len());
+        for entry in entries.iter() {
+            let parsed = match entry.get_ref() {
+                DeValue::Array(f) if f.len() == 4 => {
+                    let whole = |i: usize| int(f[i].get_ref()).and_then(|v| u32::try_from(v).ok());
+                    match (whole(0), whole(1), whole(2), whole(3)) {
+                        (Some(kind), Some(key), Some(rows), Some(why)) => {
+                            Some(crate::fire::KernelStop {
+                                kind,
+                                key,
+                                rows,
+                                why,
+                            })
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            match parsed {
+                Some(stop) => out.push(stop),
+                None => {
+                    self.err(
+                        entry.span().start,
+                        format!("{what}, not {}", found(entry.get_ref())),
+                    );
+                    return None;
+                }
+            }
+        }
+        Some(out)
+    }
+
+    fn product_times(
+        &mut self,
+        value: &Spanned<DeValue<'_>>,
+    ) -> Option<Vec<crate::fire::ProductTime>> {
         let what = "`rates.product_ns` is a list of [kind, rows, k, m, kernel, ns, spread], each \
                     shape once";
         let DeValue::Array(entries) = value.get_ref() else {
-            self.err(value.span().start, format!("{what}, not {}", found(value.get_ref())));
+            self.err(
+                value.span().start,
+                format!("{what}, not {}", found(value.get_ref())),
+            );
             return None;
         };
         let number = |v: &DeValue<'_>| match v {
@@ -1217,11 +1291,33 @@ impl<'a> Walk<'a> {
             let parsed = match entry.get_ref() {
                 DeValue::Array(f) if f.len() == 7 => {
                     let whole = |i: usize| int(f[i].get_ref()).and_then(|v| u32::try_from(v).ok());
-                    match (whole(0), whole(1), whole(2), whole(3), whole(4), number(f[5].get_ref()), number(f[6].get_ref())) {
-                        (Some(kind), Some(rows), Some(k), Some(m), Some(kernel), Some(ns), Some(spread))
-                            if ns.is_finite() && ns > 0.0 && spread.is_finite() && spread >= 0.0 =>
-                        {
-                            Some(crate::fire::ProductTime { kind, rows, k, m, kernel, ns, spread })
+                    match (
+                        whole(0),
+                        whole(1),
+                        whole(2),
+                        whole(3),
+                        whole(4),
+                        number(f[5].get_ref()),
+                        number(f[6].get_ref()),
+                    ) {
+                        (
+                            Some(kind),
+                            Some(rows),
+                            Some(k),
+                            Some(m),
+                            Some(kernel),
+                            Some(ns),
+                            Some(spread),
+                        ) if ns.is_finite() && ns > 0.0 && spread.is_finite() && spread >= 0.0 => {
+                            Some(crate::fire::ProductTime {
+                                kind,
+                                rows,
+                                k,
+                                m,
+                                kernel,
+                                ns,
+                                spread,
+                            })
                         }
                         _ => None,
                     }
@@ -1231,7 +1327,10 @@ impl<'a> Walk<'a> {
             match parsed {
                 Some(t) if out.iter().all(|o| o.key() != t.key()) => out.push(t),
                 _ => {
-                    self.err(entry.span().start, format!("{what}, not {}", found(entry.get_ref())));
+                    self.err(
+                        entry.span().start,
+                        format!("{what}, not {}", found(entry.get_ref())),
+                    );
                     return None;
                 }
             }
