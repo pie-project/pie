@@ -2501,6 +2501,9 @@ impl Landing {
     }
 }
 
+/// A clone is the same submission: each of the sessions whose passes one
+/// frame carries keeps one, and the frame's last drop waits on its fence.
+#[derive(Clone)]
 pub struct Pending {
     inner: Arc<Inner>,
     /// Set where a watcher thread is the fence's one waiter.
