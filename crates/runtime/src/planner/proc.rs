@@ -168,7 +168,7 @@ pub(super) struct Proc {
     pub(super) evicted_for: Option<ProcessId>,
     /// The head this one was evicted for, its restore served ahead of it
     /// while that head stood passed over with no move to make
-    /// ([`super::ResidencyPlanner::pass_over_stuck`]): no victim for that
+    /// ([`super::ResidencyPlanner::stuck_head`]): no victim for that
     /// head until it has fired. Moved back first, it went round with the
     /// head, restored past it and evicted for it again, its waits never
     /// served (seed 3392: queued for a page behind the head, so the mark

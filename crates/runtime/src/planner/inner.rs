@@ -69,7 +69,7 @@ pub(super) struct Inner {
     pub(super) ends: super::PidMap<super::victim::PlanEnd>,
     /// Heads this pass planned and left stuck, and their processes: no
     /// move named for them and nothing in flight
-    /// ([`super::ResidencyPlanner::pass_over_stuck`]). Passed over for the
+    /// ([`super::ResidencyPlanner::stuck_head`]). Passed over for the
     /// rest of the pass, so a waiter behind that can go does, and holding
     /// no victim's restore behind them meanwhile (no move is there for
     /// them to keep room for); cleared as the pass ends, each heading the
@@ -740,7 +740,7 @@ impl Inner {
     /// moved back first, it went round with the head it made room for,
     /// restored ahead of it and evicted for it again without a fire between
     /// (seed 4139). A head no move serves while such a one holds its room
-    /// is passed over ([`super::ResidencyPlanner::pass_over_stuck`]).
+    /// is passed over ([`super::ResidencyPlanner::stuck_head`]).
     pub(super) fn unfired_protects(&self, pid: ProcessId) -> bool {
         self.procs
             .get(&pid)
