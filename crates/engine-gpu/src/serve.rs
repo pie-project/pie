@@ -2509,6 +2509,8 @@ impl<B: Serve> Shell<B> {
                 // from the curves, unchecked.
                 let mut estimates: Vec<f64> = Vec::new();
                 let bound_ns = self.submit_bound.as_ref().map(|held| held.bound_ns);
+                let offered = options.len();
+                let mut said = false;
                 if self.submit_bound.is_some() && options.len() > 1 {
                     self.retime(engine::FrameId(0))?;
                     self.track();
@@ -2557,9 +2559,21 @@ impl<B: Serve> Shell<B> {
                                 },
                                 held.bound_ns / 1e6
                             );
+                            said = true;
                             options.truncate(1);
                         }
                     }
+                }
+                if options.len() <= 1 && !said {
+                    tracing::info!(
+                        "dense matmul in the served step, {bottom}-{top} rows: from the curves, \
+                         unchecked ({})",
+                        if offered <= 1 {
+                            "no other kernel to weigh"
+                        } else {
+                            "no other kernel's step fits the submit bound"
+                        }
+                    );
                 }
                 self.settled.push(Settled {
                     bottom,
@@ -2582,6 +2596,9 @@ impl<B: Serve> Shell<B> {
                     };
                     let tokens: Vec<u32> = (0..per_lane).map(|i| 100 + (i * 7919) % 5000).collect();
                     let mut samples: Vec<Vec<f64>> = vec![Vec::new(); options.len()];
+                    // Whether a fire was timed by the host's clock (the
+                    // device stated no span of it).
+                    let host_clock = std::cell::Cell::new(false);
                     // A first round warms each option, untimed.
                     for round in 0..=ROUNDS {
                         for (i, option) in options.iter().enumerate() {
@@ -2610,7 +2627,10 @@ impl<B: Serve> Shell<B> {
                                 // host's clock only where the device times
                                 // nothing.
                                 Ok(B::take_span_ns().map_or_else(
-                                    || began.elapsed().as_secs_f64() * 1e9,
+                                    || {
+                                        host_clock.set(true);
+                                        began.elapsed().as_secs_f64() * 1e9
+                                    },
                                     |ns| ns as f64,
                                 ))
                             })();
@@ -2651,12 +2671,23 @@ impl<B: Serve> Shell<B> {
                         })
                         .collect();
                     tracing::info!(
-                        "dense matmul in the served step, {bottom}-{top} rows: {} ({})",
+                        "dense matmul in the served step, {bottom}-{top} rows: {} ({}; timed by \
+                         the {})",
                         if taken == 0 { "kept" } else { "replaced" },
-                        weighed.join(" vs ")
+                        weighed.join(" vs "),
+                        if host_clock.get() {
+                            "host's clock (the device stated no span)"
+                        } else {
+                            "device's spans"
+                        }
                     );
                     self.dense = options.swap_remove(taken);
                 }
+            } else {
+                tracing::info!(
+                    "dense matmul in the served step, {bottom}-{top} rows: unchecked (no rung of \
+                     the load lies in these rows)"
+                );
             }
             bottom = top + 1;
             rows = rows.saturating_mul(2);
