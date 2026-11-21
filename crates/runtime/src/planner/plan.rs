@@ -631,7 +631,7 @@ impl ResidencyPlanner {
                         // this restore instead moved every resident for a
                         // restore the planner would not serve, and the
                         // restored one's bind waited behind it for good.
-                        Some(_)
+                        Some(need)
                             if inner
                                 .bind_restoring
                                 .is_some_and(|restoring| restoring != pid)
@@ -656,7 +656,27 @@ impl ResidencyPlanner {
                                     }),
                                     _ => None,
                                 })
-                                .unwrap_or(Step::Done("waits for the restored one's bind to fire"))
+                                .unwrap_or_else(|| {
+                                    // Its bind served and not yet taken: the
+                                    // hand-off is under way, no wait on a
+                                    // fire. Withdrawn (evicted again): it
+                                    // holds this head no longer.
+                                    let bind = inner.queue.values().find_map(|waiter| match waiter.kind {
+                                        WaitKind::BindRoom { served, withdrawn, .. }
+                                            if Some(waiter.pid) == restoring && waiter.is_unmet() =>
+                                        {
+                                            Some((served, withdrawn))
+                                        }
+                                        _ => None,
+                                    });
+                                    match bind {
+                                        Some((true, _)) => {
+                                            Step::Done("the restored one's bind is served and not yet taken")
+                                        }
+                                        Some((_, true)) => Step::RestoreBindRoom { key, need },
+                                        _ => Step::Done("waits for the restored one's bind to fire"),
+                                    }
+                                })
                         }
                         // Its whole need: the room its bind asks too.
                         Some(need) if room_stood != Some(key) => {
