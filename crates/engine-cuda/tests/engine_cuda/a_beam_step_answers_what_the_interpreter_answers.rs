@@ -7,7 +7,7 @@ use engine_cuda::device::{Buffer, Context};
 use engine_cuda::program::launch::INTRINSIC_STORAGE_F32;
 use engine_cuda::program::session::Fired;
 use eta_compiler::codegen::program::{Backend, emit_program};
-use eta_compiler::contract::{Binding, Case, Seat, beam_stage};
+use eta_compiler::contract::{Accuracy, Binding, Case, Seat, beam_stage, split_stage};
 use eta_compiler::plan::compile_bound;
 use eta_exec::Extents;
 use eta_ir::registry::GeometryClass;
@@ -15,6 +15,23 @@ use eta_ir::registry::GeometryClass;
 /// What the device puts in each of `case`'s readers, its logits seated at
 /// `seats`, or why the fire was refused.
 fn fired(case: &Case, seats: &[Seat]) -> Result<Vec<Vec<u8>>, String> {
+    fired_over(case, seats, &crate::guest::alone_span)
+}
+
+/// A guest item in a buffer of its own, every byte 0x7f: an f32 or bf16
+/// cell of it reads 3.4e38, above any log-probability.
+fn poisoned_span(_: engine_cuda::program::Item<'_>, bytes: u64) -> engine_cuda::Result<u64> {
+    let mut buffer = Buffer::zeroed(bytes as usize)?;
+    buffer.write(0, &vec![0x7f; bytes as usize])?;
+    Ok(Box::leak(Box::new(buffer)).ptr())
+}
+
+/// [`fired`], the instance's items laid by `span`.
+fn fired_over(
+    case: &Case,
+    seats: &[Seat],
+    span: &dyn Fn(engine_cuda::program::Item<'_>, u64) -> engine_cuda::Result<u64>,
+) -> Result<Vec<Vec<u8>>, String> {
     let context = Context::bind(0, None).expect("a device context");
     let stages = compile_bound(&case.bound);
     let backend = Backend::parse(engine_cuda::api::CODEGEN).expect("the engine's codegen");
@@ -49,7 +66,7 @@ fn fired(case: &Case, seats: &[Seat]) -> Result<Vec<Vec<u8>>, String> {
             &vec![None; count],
             &ids,
             crate::guest::alone_slots(&plane, program),
-            &crate::guest::alone_span,
+            span,
             context.stream(),
         )
         .expect("the instance binds");
@@ -110,6 +127,35 @@ fn a_beam_step_answers_what_the_interpreter_answers() {
     seats.push(Seat { lane: 3, ..seats[0] });
     let refused = fired(case, &seats).expect_err("a seat past the rows is refused");
     assert!(refused.contains("bound at lane 3"), "{refused}");
+}
+
+/// The split cases (`contract::split_stage`): a one-row region over the
+/// model's row run across the lane's blocks, at a width of whole stretches
+/// and one with a ragged last stretch, answers what the interpreter answers.
+/// The candidates' ids byte for byte and their values within rounding; the
+/// instance's scratch filled with a value above every log-probability, so
+/// an element a block left unwritten, or read before another block wrote
+/// it, lands among the top.
+#[test]
+fn a_split_row_answers_what_the_interpreter_answers() {
+    if !engine_cuda::device::present() {
+        eprintln!("no device: skipping");
+        return;
+    }
+    // CUDA's `expf` and `logf` (Programming Guide, Table 13): 2 and 1 ulp.
+    let cuda = Accuracy {
+        exp_ulps: 2,
+        log_ulps: 1,
+    };
+    for case in split_stage() {
+        let want = case.expected();
+        let got = fired_over(&case, &case.seats(), &poisoned_span)
+            .unwrap_or_else(|why| panic!("{}: {why}", case.name));
+        for ((&channel, got), want) in case.readers.iter().zip(&got).zip(&want) {
+            case.agrees(channel, got, want, cuda, 1)
+                .unwrap_or_else(|why| panic!("{why}"));
+        }
+    }
 }
 
 /// Binds `case` in `plane`, its logits seated as the case states: the

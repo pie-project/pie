@@ -39,12 +39,12 @@ pub const fn temporary_bytes(tag: u8, len: u64, rows: u64) -> u64 {
     }
 }
 
-/// Whether a node of `tag` runs the one-row select, which keeps its state
-/// in the [`SELECT_WORDS`] just below the temporary area (`sel_at`): a
-/// pivot's select ladder.
+/// Whether a node of `tag` may run the one-row select, which keeps its
+/// state in the [`SELECT_WORDS`] just below the temporary area (`sel_at`):
+/// a pivot's select ladder, and a one-row top-k's.
 #[must_use]
 pub const fn selects(tag: u8) -> bool {
-    tag == tags::PIVOT_THRESHOLD
+    tag == tags::PIVOT_THRESHOLD || tag == tags::TOP_K
 }
 
 const BARRIER: &str = "  storageBarrier();\n";
@@ -413,7 +413,10 @@ pub struct Stepwise {
 /// (`red_fan0`), so its hashes spread over four times the invocations.
 /// 10: a `gumbel_argmax` lane multiplies its logit by the op's `scale`
 /// (the temperature's reciprocal) where it divided by a divisor.
-pub const WGSL_STEP_EMITTER_VERSION: u16 = 10;
+/// 11: a one-row `top_k` takes the select ladder (`sel_top_k`), and every
+/// NaN test reads the value's bits (`f32_is_nan`): the compiler took `x != x`
+/// as false, so the sort keyed NaN first.
+pub const WGSL_STEP_EMITTER_VERSION: u16 = 11;
 
 /// The binding of the record a step module reads its node, rung, selector
 /// and bases from ([`StepUniform`]), beside the runtime's (0, 1 and 4): a
@@ -507,6 +510,7 @@ fn call_text(call: Call) -> String {
         Call::SelTally => alloc::format!("sel_tally({p})"),
         Call::SelPlace => alloc::format!("sel_place({p})"),
         Call::SelWalk => alloc::format!("sel_walk({p})"),
+        Call::SelTopK => alloc::format!("sel_top_k({p})"),
         _ if !named => alloc::format!("ptir_step({p})"),
         Call::Unary => alloc::format!("map_unary({p}, {j})"),
         Call::Arith => alloc::format!("bin_arith({p}, {j})"),
@@ -1128,8 +1132,8 @@ mod stepwise_tests {
         assert_eq!(temporary_bytes(tags::GUMBEL_ARGMAX, 4 * 151_936, 4), 4 * 18_992 * 16);
         assert_eq!(temporary_bytes(tags::ADD, 151_936, 1), 0);
         assert_eq!(temporary_bytes(tags::SORT_DESC, u64::MAX, 1), u64::MAX);
-        assert!(selects(tags::PIVOT_THRESHOLD));
-        assert!(!selects(tags::TOP_K) && !selects(tags::REDUCE_ARGMAX));
+        assert!(selects(tags::PIVOT_THRESHOLD) && selects(tags::TOP_K));
+        assert!(!selects(tags::SORT_DESC) && !selects(tags::REDUCE_ARGMAX));
         for cell in [
             "return tmp_base + ((buf * n) + c) * 2u;",
             "return tmp_base + (buf * span + row * stride + c) * 2u;",
@@ -1453,9 +1457,11 @@ mod bf16_store_tests {
             if stores_h {
                 storers += 1;
                 // An invocation strides over words (or rows of whole words,
-                // the scan), never over elements.
+                // the scan; or, a select's one workgroup, its invocations'
+                // words), never over elements.
                 let by_words = body.contains("< h_words(") && body.contains("= w + lanes")
-                    || body.contains("< h_words(") && body.contains("= w2 + lanes");
+                    || body.contains("< h_words(") && body.contains("= w2 + lanes")
+                    || body.contains("< h_words(") && body.contains("= w + PTIR_WG");
                 let by_groups = name == "op_cumulative" && body.contains("g < groups");
                 assert!(
                     by_words || by_groups,

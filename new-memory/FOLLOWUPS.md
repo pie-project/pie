@@ -922,3 +922,45 @@ the partials and candidates the split regions publish there: silent wrong result
 Tool for whoever picks it up: the sync-and-read check above, on a build without the memset
 (the self-resetting branch, `sc/amd-meet-reset-dropped`, local on the MI300X host), plus the
 fire's stream map at the stalled launch.
+
+Resolved (2026-11-21): the counters the meetings disturbed are gone or sized out. Not the
+writer found: the dropped branch's last work points at the sampler itself (a sampler lays its
+lanes at `lane_span(16)` apart, its blocks' arrival words and data over the lines split rows
+meet in at `lane_span(1)`, where a self-resetting count read them as arrivals), not proven by a
+repro. What closes it:
+- A region whose rows split runs a launch a phase (`ptir_phase`): its blocks fold every block's
+  partials in the next launch, so no split row counts arrivals or waits. The spin meeting also
+  had a race of its own: a block past a meeting wrote its next reduction's partials into the
+  slot a slower block still folded; a phase's partials now alternate between the slot's halves,
+  an argmax's candidates between two banks.
+- A sampler lane's blocks still meet at `M1Lane::barrier`, laid over no more units than this
+  process's queues run on (`device_units`, CU masks counted) at the kernel's occupancy, checked
+  at launch. A split select's last block merges; none waits.
+- `blocks_that_meet_run_on_a_few_units` runs the epilogue's cases (split rows) and the lane
+  sampler's in a process `HSA_CU_MASK` keeps to four units; both hung there before.
+
+## F47. `resident_workgroups` is not reproducible across boots: its consumers must tolerate +-40%
+
+The load's rates step measures the workgroups a device holds at once (`[rates]
+resident_workgroups`, `engine_gpu::rates::resident_workgroups`): one workgroup of the matmul's
+peak kernel timed against the peak of the curve. Across boots of one device it moves
+20-40% (RTX Spark, 2026-11-21: wgpu 154, 156, 196, and a saved 299; native Vulkan 30, 45, 28;
+Android Adreno homes 8.8-9.0 and 10.9). Timing the peak shape and the one workgroup back
+to back over 5 rounds, median, floored, did not settle it: wgpu 319, 262, 271; Vulkan 109,
+114, 136. That spreads ~20%, adds 35-75 s to each boot, and moves Vulkan ~3x, so it changes
+what is measured instead of fixing it (the patch is not kept).
+
+So whatever reads it must give the same answer for a value 40% off: a guest step's grid
+(`step_jobs`), Vulkan's `cores` where the driver reports none (the qmm ladder's `fill`, the
+decode split per core). Or derive it from device facts instead of a timing. Note that the
+measured count is saved at a home's first boot and kept, so two homes of one device can
+size differently forever.
+
+## F48. A batched top-k (more than one row) still sorts each row whole
+
+A one-row `top_k` (a flattened beam's candidates) selects its `k`-th key and sorts only
+what lies past it (`steps::Ladder::Select`, `sel_top_k`): on wgpu Qwen3 the beam-4 step
+went from 1.11-1.20x a greedy-4 step to 1.08-1.15x. A `top_k` over `[rows, vocab]` (a batched
+top-k sampler, a per-beam pre-cut) takes the full merge sort per row (~43 us a merge round,
+~780 us a step at Qwen3's vocab). If a guest program uses one on the hot path, carry the
+select per row: its state (`SELECT_WORDS`) is one row's today.

@@ -63,7 +63,7 @@ impl<T> Ring<T> {
     /// A berth of `bytes`: refused by name past the ring, and, where the
     /// passes in flight leave no room for it, taken once enough of them land.
     pub fn take(self: &Arc<Self>, bytes: u64) -> Result<Berth<T>> {
-        let want = bytes.max(1).next_multiple_of(BERTH_ALIGN);
+        let want = berth_bytes(bytes);
         if want > self.bytes {
             return Err(Fault::Ceiling {
                 what: "bytes one guest pass stages and reads back (the guest ring the load laid)",
@@ -92,6 +92,12 @@ impl<T> Ring<T> {
         }
         self.given.notify_all();
     }
+}
+
+/// The berth a pass of `bytes` takes of the ring: whole aligned words.
+#[must_use]
+pub fn berth_bytes(bytes: u64) -> u64 {
+    bytes.max(1).next_multiple_of(BERTH_ALIGN)
 }
 
 /// The first gap of `want` bytes among `taken` (sorted by first byte) in a
@@ -131,59 +137,136 @@ impl<T> Drop for Berth<T> {
     }
 }
 
-/// A pass's layout in its berth: what it stages, from the berth's first
-/// byte, then its status, then each value it reads back, each at a word.
+/// A pass's layout in its berth, laid before the berth is taken: each value
+/// it may stage from the host, from the berth's first byte, then its
+/// status, then each value it may read back, each from a word and each
+/// once, however many of a fire's values the stage's compile folded into
+/// it (two equal constants, a put of a value another put names). The berth
+/// a pass takes is [`PassLayout::bytes`] of this layout, and every copy the
+/// pass records lands at the byte this layout gave its value, so a pass
+/// never asks for more of its berth than it took.
 #[derive(Debug, Default, Clone)]
 pub struct PassLayout {
-    /// (value, byte in the berth, bytes) a root staged from the host.
-    pub staged: Vec<(u32, u64, u64)>,
-    /// The status word's byte in the berth.
-    pub status: Option<u64>,
-    /// (value, byte in the berth, bytes) a value read back.
-    pub read: Vec<(u32, u64, u64)>,
+    /// (value, byte in the berth, bytes) a root the host may stage.
+    stage: Vec<(u32, u64, u64)>,
+    status_at: u64,
+    /// (value, byte in the berth, bytes) a value the host may read back.
+    back: Vec<(u32, u64, u64)>,
     end: u64,
+    /// Which of `stage` the pass staged, which of `back` it read back, and
+    /// whether it copied its status.
+    staged: Vec<bool>,
+    read: Vec<bool>,
+    status: bool,
 }
 
 impl PassLayout {
-    /// The next `bytes` of the berth, refused by name past `room`.
-    pub fn next(&mut self, bytes: u64, room: u64) -> Result<u64> {
-        let at = self.end.next_multiple_of(4);
-        let end = at.saturating_add(bytes);
-        if end > room {
-            return Err(Fault::Ceiling {
-                what: "bytes of a guest pass's berth in the ring",
-                need: end,
-                have: room,
-            });
+    /// The layout of a pass that may stage the roots `staged` and read back
+    /// `read` (each a value and its bytes; a value named twice is laid
+    /// once), its status of `status` bytes between them.
+    pub fn plan(
+        staged: impl IntoIterator<Item = (u32, u64)>,
+        status: u64,
+        read: impl IntoIterator<Item = (u32, u64)>,
+    ) -> PassLayout {
+        let mut end = 0u64;
+        let mut lay = |bytes: u64| {
+            let at = end;
+            end = (at + bytes).next_multiple_of(4);
+            at
+        };
+        let mut stage: Vec<(u32, u64, u64)> = Vec::new();
+        for (value, bytes) in staged {
+            if !stage.iter().any(|&(laid, _, _)| laid == value) {
+                stage.push((value, lay(bytes), bytes));
+            }
         }
-        self.end = end;
-        Ok(at)
+        let status_at = lay(status);
+        let mut back: Vec<(u32, u64, u64)> = Vec::new();
+        for (value, bytes) in read {
+            if !back.iter().any(|&(laid, _, _)| laid == value) {
+                back.push((value, lay(bytes), bytes));
+            }
+        }
+        PassLayout {
+            staged: vec![false; stage.len()],
+            read: vec![false; back.len()],
+            stage,
+            status_at,
+            back,
+            end,
+            status: false,
+        }
+    }
+
+    /// The berth the pass takes: every span it laid.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        self.end
+    }
+
+    /// Where root `value` stages to: its byte in the berth and bytes, marked
+    /// staged. A value the layout did not lay is the caller's error, by name.
+    pub fn stage(&mut self, value: u32) -> Result<(u64, u64)> {
+        let index = self
+            .stage
+            .iter()
+            .position(|&(laid, _, _)| laid == value)
+            .ok_or_else(|| Fault::Program {
+                at: "guest::ring",
+                why: format!("value {value} was staged and its pass laid no span for it"),
+            })?;
+        self.staged[index] = true;
+        let (_, at, bytes) = self.stage[index];
+        Ok((at, bytes))
+    }
+
+    /// Where the status word lands, marked copied.
+    pub fn status(&mut self) -> u64 {
+        self.status = true;
+        self.status_at
+    }
+
+    /// Where value `value` reads back to: its byte in the berth and bytes,
+    /// marked read. A value the layout did not lay is the caller's error.
+    pub fn read_back(&mut self, value: u32) -> Result<(u64, u64)> {
+        let index = self
+            .back
+            .iter()
+            .position(|&(laid, _, _)| laid == value)
+            .ok_or_else(|| Fault::Program {
+                at: "guest::ring",
+                why: format!("value {value} was read back and its pass laid no span for it"),
+            })?;
+        self.read[index] = true;
+        let (_, at, bytes) = self.back[index];
+        Ok((at, bytes))
+    }
+
+    /// (value, byte in the berth, bytes) of each root the pass staged.
+    pub fn staged(&self) -> impl Iterator<Item = (u32, u64, u64)> + '_ {
+        self.stage
+            .iter()
+            .zip(&self.staged)
+            .filter(|&(_, &staged)| staged)
+            .map(|(&span, _)| span)
+    }
+
+    /// The status word's byte in the berth, once the pass copied it there.
+    #[must_use]
+    pub fn status_at(&self) -> Option<u64> {
+        self.status.then_some(self.status_at)
     }
 
     /// Where value `value` was read back to: its byte in the berth and bytes.
     #[must_use]
     pub fn read_at(&self, value: u32) -> Option<(u64, u64)> {
-        self.read
+        self.back
             .iter()
-            .find(|&&(read, _, _)| read == value)
-            .map(|&(_, at, bytes)| (at, bytes))
+            .zip(&self.read)
+            .find(|&(&(laid, _, _), &read)| read && laid == value)
+            .map(|(&(_, at, bytes), _)| (at, bytes))
     }
-}
-
-/// The berth a pass of these spans takes: each staged root's bytes, the
-/// status word, and each value read back's, each from a word.
-#[must_use]
-pub fn pass_bytes(
-    staged: impl IntoIterator<Item = u64>,
-    status: u64,
-    read: impl IntoIterator<Item = u64>,
-) -> u64 {
-    staged
-        .into_iter()
-        .chain(std::iter::once(status))
-        .chain(read)
-        .map(|bytes| bytes.next_multiple_of(4))
-        .sum()
 }
 
 /// The ring a load lays for the guest passes of `seats` frames in flight
@@ -196,12 +279,56 @@ pub fn ring_bytes(chunk_bytes: u64, seats: usize) -> u64 {
     chunk_bytes.saturating_mul(seats as u64 + 1)
 }
 
-/// The most a pass of stage `at` of `package` takes of the ring
-/// ([`pass_bytes`]): every root of the stage the host may stage (a
-/// constant, a channel's take or read), its status of `status` bytes, and
-/// every value it puts, each of the bytes `span` states for the stage's
-/// value. Known at the bind, so a stage whose pass could outgrow the ring
-/// binds no session.
+/// The layout of a pass of stage `at` of `package` over the stage's roots
+/// `roots` and the values `wanted` the host may read back (global ids):
+/// each root the host may stage (all but an output's, which the device
+/// binds), its status of `status` bytes, and each wanted value, each of the
+/// bytes `span` states for the stage's value and each once. A fire lays its
+/// pass by this, and the bind its most ([`stage_need`]), so the two are one
+/// computation.
+pub fn pass_layout(
+    package: &eta_compiler::codegen::launch::LaunchPackage,
+    at: usize,
+    roots: &[u32],
+    wanted: &[u32],
+    status: u64,
+    span: impl Fn(u32) -> Option<u64>,
+) -> Result<PassLayout> {
+    use eta_compiler::codegen::launch::ValueOrigin;
+    let sized = |local: u32| {
+        span(local)
+            .map(|bytes| (local, bytes))
+            .ok_or_else(|| Fault::Program {
+                at: "guest::ring",
+                why: format!("value {local} is not stage {at}'s"),
+            })
+    };
+    let mut staged = Vec::new();
+    for &global in roots {
+        let origin = package
+            .values
+            .get(global as usize)
+            .map(|value| value.source);
+        if origin != Some(ValueOrigin::Output)
+            && let Some(local) = super::run::local_of(package, at, global)?
+        {
+            staged.push(sized(local)?);
+        }
+    }
+    let mut read = Vec::new();
+    for &global in wanted {
+        if let Some(local) = super::run::local_of(package, at, global)? {
+            read.push(sized(local)?);
+        }
+    }
+    Ok(PassLayout::plan(staged, status, read))
+}
+
+/// The most a pass of stage `at` of `package` takes of the ring: the
+/// [`pass_layout`] over every root of the stage the host may stage (a
+/// constant, a channel's take or read) and every value it puts, as a berth
+/// of it is taken. Known at the bind, so a stage whose pass could outgrow
+/// the ring binds no session; every fire's pass lays a part of it.
 pub fn stage_need(
     package: &eta_compiler::codegen::launch::LaunchPackage,
     at: usize,
@@ -209,43 +336,27 @@ pub fn stage_need(
     span: impl Fn(u32) -> Option<u64>,
 ) -> Result<u64> {
     use eta_compiler::codegen::launch::ValueOrigin;
-    let local = |global: u32| match package.plan_local(global) {
-        Some((stage, local)) if stage == at => local,
-        _ => None,
-    };
-    let bytes = |value: u32| {
-        span(value).ok_or_else(|| Fault::Program {
-            at: "guest::ring",
-            why: format!("value {value} is not stage {at}'s"),
+    let ours = |global: u32| matches!(package.plan_local(global), Some((stage, _)) if stage == at);
+    let roots: Vec<u32> = (0..package.values.len())
+        .filter_map(|global| u32::try_from(global).ok())
+        .filter(|&global| {
+            ours(global)
+                && matches!(
+                    package.values[global as usize].source,
+                    ValueOrigin::Const | ValueOrigin::ChannelTake | ValueOrigin::ChannelRead
+                )
         })
-    };
-    let staged = package
-        .values
-        .iter()
-        .enumerate()
-        .filter(|(_, value)| {
-            matches!(
-                value.source,
-                ValueOrigin::Const | ValueOrigin::ChannelTake | ValueOrigin::ChannelRead
-            )
-        })
-        .filter_map(|(global, _)| local(u32::try_from(global).ok()?))
-        .map(bytes)
-        .collect::<Result<Vec<u64>>>()?;
-    let mut put: Vec<u32> = Vec::new();
-    for value in package
+        .collect();
+    let puts: Vec<u32> = package
         .stages
         .get(at)
         .into_iter()
         .flat_map(|stage| &stage.puts)
-        .filter_map(|put| local(put.value))
-    {
-        if !put.contains(&value) {
-            put.push(value);
-        }
-    }
-    let read = put.into_iter().map(bytes).collect::<Result<Vec<u64>>>()?;
-    Ok(pass_bytes(staged, status, read).next_multiple_of(BERTH_ALIGN))
+        .map(|put| put.value)
+        .filter(|&global| ours(global))
+        .collect();
+    let layout = pass_layout(package, at, &roots, &puts, status, span)?;
+    Ok(berth_bytes(layout.bytes()))
 }
 
 #[cfg(test)]
@@ -294,12 +405,40 @@ mod tests {
         assert_eq!(waiter.join().unwrap().unwrap(), 0);
     }
 
-    /// A pass lays its spans one after another and is refused past its berth.
+    /// A pass lays each value once, its status between what it stages and
+    /// what it reads back, and asks for no byte past what it laid: two of a
+    /// fire's roots the compile folded into one value (two equal constants)
+    /// stage to one span, and two puts of one value read back to one.
     #[test]
-    fn a_pass_lays_its_spans_inside_its_berth() {
-        let mut layout = PassLayout::default();
-        assert_eq!(layout.next(6, 32).unwrap(), 0);
-        assert_eq!(layout.next(16, 32).unwrap(), 8);
-        assert!(layout.next(9, 32).is_err());
+    fn a_pass_lays_each_value_once_inside_its_berth() {
+        // A fire's roots: an 8-byte value, a 4-byte constant named twice
+        // (two globals folded into local 1), a 40-byte value; status 16;
+        // reads back local 4 (4 bytes) twice and local 5 (6 bytes).
+        let mut layout = PassLayout::plan(
+            [(0, 8), (1, 4), (1, 4), (2, 40)],
+            16,
+            [(4, 4), (4, 4), (5, 6)],
+        );
+        // Laid once each: 8 + 4 + 40 + 16 + 4 + 8 = 80. Laid per name, it
+        // would have asked 88, past the 80-byte berth.
+        assert_eq!(layout.bytes(), 80);
+        assert_eq!(layout.stage(1).unwrap(), (8, 4));
+        assert_eq!(
+            layout.stage(1).unwrap(),
+            (8, 4),
+            "the folded constant stages once"
+        );
+        assert_eq!(layout.stage(2).unwrap(), (12, 40));
+        assert_eq!(layout.status(), 52);
+        assert_eq!(layout.read_back(4).unwrap(), (68, 4));
+        assert_eq!(layout.read_back(4).unwrap(), (68, 4));
+        assert_eq!(layout.read_back(5).unwrap(), (72, 6));
+        assert_eq!(
+            layout.staged().collect::<Vec<_>>(),
+            [(1, 8, 4), (2, 12, 40)],
+            "only what was staged copies to the heap"
+        );
+        assert_eq!(layout.read_at(5), Some((72, 6)));
+        assert!(layout.stage(9).is_err(), "a value the pass did not lay");
     }
 }

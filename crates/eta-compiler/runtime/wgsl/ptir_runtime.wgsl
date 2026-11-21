@@ -623,8 +623,8 @@ var<private> pie_neg_zero_bits : u32 = 0x80000000u;
 fn NEG_ZERO() -> f32 { return bitcast<f32>(pie_neg_zero_bits); }
 
 fn cmax(l : f32, r : f32) -> f32 {
-  let ln = l != l;
-  let rn = r != r;
+  let ln = f32_is_nan(l);
+  let rn = f32_is_nan(r);
   if (ln && rn) { return NEG_INF(); }
   if (ln) { return r; }
   if (rn) { return l; }
@@ -637,8 +637,8 @@ fn cmax(l : f32, r : f32) -> f32 {
 }
 
 fn cmin(l : f32, r : f32) -> f32 {
-  let ln = l != l;
-  let rn = r != r;
+  let ln = f32_is_nan(l);
+  let rn = f32_is_nan(r);
   if (ln && rn) { return POS_INF(); }
   if (ln) { return r; }
   if (rn) { return l; }
@@ -651,6 +651,13 @@ fn cmin(l : f32, r : f32) -> f32 {
 }
 
 fn sign_bit(x : f32) -> bool { return (bitcast<u32>(x) & 0x80000000u) != 0u; }
+
+// A NaN read off its bits: WGSL compilers fold a self-compare (`x != x`)
+// to false, so a NaN test written as one never fires.
+fn f32_is_nan(x : f32) -> bool {
+  let b = bitcast<u32>(x);
+  return (b & 0x7F800000u) == 0x7F800000u && (b & 0x007FFFFFu) != 0u;
+}
 
 fn red_identity(kind : u32) -> f32 {
   if (kind == RED_SUM) { return 0.0; }
@@ -753,8 +760,8 @@ fn op_reduce_level(p : u32, kind : u32, level : u32) {
 
 fn arg_takes(lv : f32, li : u32, rv : f32, ri : u32, level : u32, count : u32, lane : u32, off : u32) -> bool {
   if (lane + off >= count) { return false; }
-  let lnan = lv != lv;
-  let rnan = rv != rv;
+  let lnan = f32_is_nan(lv);
+  let rnan = f32_is_nan(rv);
   if (rnan) { return false; }
   if (lnan) { return true; }
   return rv > lv || (rv == lv && ri < li);
@@ -1375,7 +1382,7 @@ fn op_rng(p : u32, keyed : bool) {
 const SORT_ROUNDS : u32 = 28u;
 
 fn sort_key(x : f32) -> u32 {
-  if (x != x) { return 0xFFFFFFFFu; }
+  if (f32_is_nan(x)) { return 0xFFFFFFFFu; }
 
   let b = select(bitcast<u32>(x), 0u, x == 0.0);
   var asc : u32;
@@ -1609,7 +1616,7 @@ fn op_pivot_finish(p : u32) {
       let flags = pivot_flag(n, rowb);
 
       let last = bitcast<f32>(hld(vals + len - 1u));
-      let monotone = !(last < 0.0) && last == last;
+      let monotone = !(last < 0.0) && !f32_is_nan(last);
       var excl : f32 = 0.0;
       var t : u32 = 0u;
       loop {
@@ -1740,7 +1747,7 @@ fn op_pivot_finish(p : u32) {
         if (pred == 0u) {
           let want = clamp(ld_i(payload, pick(np, row)), 0, i32(len));
 
-          if (!(x != x)) {
+          if (!f32_is_nan(x)) {
             on = i32(count_key_below(n, rowb, len, sort_key(x))) < want;
           }
         } else {
@@ -1821,8 +1828,11 @@ fn sel_ladder_idle() -> bool {
 fn sel_init(p : u32) {
   let o = p_o0(p);
   let n = d_len(p_a0(p));
-  let words = (n + 3u) / 4u;
-  for (var w : u32 = tid; w < words; w = w + lanes) { hst(base(o) + w, 0u); }
+  // A pivot's mask starts clear; a top-k writes each of its results.
+  if (p_tag(p) != 0x51u) {
+    let words = (n + 3u) / 4u;
+    for (var w : u32 = tid; w < words; w = w + lanes) { hst(base(o) + w, 0u); }
+  }
   if (tid == 0u) {
     hst(sel_at(SEL_MODE), SEL_RUNS);
     hst(sel_at(SEL_ACTIVE), max(min(SEL_GROUPS, sel_groups), 1u));
@@ -1841,7 +1851,7 @@ fn sel_hist(p : u32, sweep : u32) {
   workgroupBarrier();
   for (var i : u32 = span.x + sel_lt; i < span.y; i = i + PTIR_WG) {
     let x = ld_f(a, i);
-    if (x != x) { continue; }
+    if (f32_is_nan(x)) { continue; }
     let key = sort_key(x);
     if (sweep == 0u || (key >> (shift + 8u)) == (prefix >> (shift + 8u))) {
       atomicAdd(&sel_wg_hist[(key >> shift) & 255u], 1u);
@@ -1870,7 +1880,16 @@ fn sel_pick(p : u32, sweep : u32) {
     }
     let payload = p_pred_payload(p);
     var want : u32 = 0u;
-    if (p_pred_tag(p) == 0u) {
+    if (p_tag(p) == 0x51u) {
+      // A top-k: its `k` from the node. None, or more than the row's
+      // non-NaN keys or the candidates hold, is the sort's to take.
+      let k = p_imm(p);
+      if (k == 0u || k >= count || k > SEL_CAP) {
+        hst(sel_at(SEL_MODE), SEL_LADDER);
+        return;
+      }
+      want = k;
+    } else if (p_pred_tag(p) == 0u) {
       let k = ld_i(payload, 0u);
       if (k <= 0) {
         hst(sel_at(SEL_KEEP), SEL_KEEP_NONE);
@@ -1929,7 +1948,7 @@ fn sel_rank_mask(p : u32) {
       var on = false;
       if (i < n && keep != SEL_KEEP_NONE) {
         let x = ld_f(a, i);
-        on = !(x != x) && (keep == SEL_KEEP_ALL || sort_key(x) <= cut);
+        on = !f32_is_nan(x) && (keep == SEL_KEEP_ALL || sort_key(x) <= cut);
       }
       b[k] = on;
     }
@@ -2051,6 +2070,82 @@ fn sel_walk(p : u32) {
   }
   let whole = held == d_len(a);
   hst(sel_at(SEL_MODE), select(SEL_LADDER, SEL_DECIDED, reached || !(excl < cut) || whole));
+}
+
+// A top-k's candidates sorted by (key, index), the sort's order, its first
+// `k` written as its values and indices. Ties at the cut past the cap
+// landed in no particular order, so the row is the sort's then.
+fn sel_top_k(p : u32) {
+  if (sel_skips(true)) { return; }
+  let a = p_a0(p);
+  let o = p_o0(p);
+  let o1 = p_o1(p);
+  let busy = hld(sel_at(SEL_ACTIVE));
+  var ties : u32 = 0u;
+  for (var g : u32 = 0u; g < busy; g = g + 1u) { ties = ties + hld(sel_count(g, 1u)); }
+  let below = hld(sel_at(SEL_TOTAL_LT));
+  let held = below + ties;
+  if (sel_lt == 0u) {
+    sel_wg_skip = select(0u, 1u, held > SEL_CAP);
+    if (held > SEL_CAP) { hst(sel_at(SEL_MODE), SEL_LADDER); }
+  }
+  if (workgroupUniformLoad(&sel_wg_skip) != 0u) { return; }
+  for (var i : u32 = sel_lt; i < SEL_CAP; i = i + PTIR_WG) {
+    if (i < held) {
+      sel_wg_key[i] = hld(sel_cand_key(i));
+      sel_wg_idx[i] = hld(sel_cand_idx(i));
+    } else {
+      sel_wg_key[i] = 0xFFFFFFFFu;
+      sel_wg_idx[i] = 0xFFFFFFFFu;
+    }
+  }
+  workgroupBarrier();
+  for (var size : u32 = 2u; size <= SEL_CAP; size = size * 2u) {
+    for (var stride : u32 = size / 2u; stride > 0u; stride = stride / 2u) {
+      for (var t : u32 = sel_lt; t < SEL_CAP / 2u; t = t + PTIR_WG) {
+        let lo = 2u * stride * (t / stride) + (t % stride);
+        let hi = lo + stride;
+        let ascending = (lo & size) == 0u;
+        let klo = sel_wg_key[lo];
+        let khi = sel_wg_key[hi];
+        let ilo = sel_wg_idx[lo];
+        let ihi = sel_wg_idx[hi];
+        let lo_greater = klo > khi || (klo == khi && ilo > ihi);
+        if (lo_greater == ascending) {
+          sel_wg_key[lo] = khi;
+          sel_wg_key[hi] = klo;
+          sel_wg_idx[lo] = ihi;
+          sel_wg_idx[hi] = ilo;
+        }
+      }
+      workgroupBarrier();
+    }
+  }
+  let want = hld(sel_at(SEL_WANT));
+  let len = d_len(a);
+  if (d_dtype(o) == DT_BF16) {
+    for (var w : u32 = sel_lt; w < h_words(want); w = w + PTIR_WG) {
+      var xs = array<f32, 2>(0.0, 0.0);
+      for (var k : u32 = 0u; k < 2u; k = k + 1u) {
+        let j = w * 2u + k;
+        if (j >= want) { continue; }
+        let idx = sel_wg_idx[j];
+        if (idx >= len) { pie_fault(OUT_OF_BOUNDS, idx, len); continue; }
+        xs[k] = ld_f(a, idx);
+        st_u(o1, j, idx);
+      }
+      st_h_word(o, w, want, xs[0], xs[1]);
+    }
+    if (sel_lt == 0u) { hst(sel_at(SEL_MODE), SEL_DECIDED); }
+    return;
+  }
+  for (var j : u32 = sel_lt; j < want; j = j + PTIR_WG) {
+    let idx = sel_wg_idx[j];
+    if (idx >= len) { pie_fault(OUT_OF_BOUNDS, idx, len); continue; }
+    st_as_f(o, j, ld_f(a, idx));
+    st_u(o1, j, idx);
+  }
+  if (sel_lt == 0u) { hst(sel_at(SEL_MODE), SEL_DECIDED); }
 }
 
 fn op_matmul(p : u32) {

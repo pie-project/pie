@@ -395,6 +395,31 @@ impl ExpertShape {
     }
 }
 
+/// Whether ROCm streams fp8 bank `codes` as it lies, codes put in the FP8
+/// matrix core's order (`weights::hip::canonical_fp8`): an `[experts, n,
+/// k]` bank of e4m3 codes beside f32 factors a 128x128 block, n in whole
+/// 16-row strips (the order's unit, so an expert's codes never cross into
+/// the next). Never on another backend (CUDA lays its fp8 banks' factors in
+/// atoms, `weights::laid_planes`).
+#[must_use]
+pub fn fp8_ordered(trace: &poem_ir::Trace, codes: usize) -> bool {
+    use poem_ir::Dtype;
+    if !cfg!(feature = "rocm") {
+        return false;
+    }
+    let Some(param) = trace.params.get(codes) else {
+        return false;
+    };
+    if param.dtype != Dtype::E4m3 || param.shape.len() < 3 || param.shape[1] % 16 != 0 {
+        return false;
+    }
+    let leads = poem_ir::residency::leads(trace);
+    let scales = poem::declare::scales_name(&param.name);
+    trace.params.iter().enumerate().any(|(at, other)| {
+        at != codes && leads[at] == codes && other.name == scales && other.dtype == Dtype::F32
+    })
+}
+
 /// Whether ROCm lays MXFP4 bank `codes` in the matrix core's lane order
 /// (`weights::hip::order_mxfp4_banks`): an `[experts, n, ..]` bank of n in
 /// whole 16-row strips and K in whole 128-code units, under e8m0 exponents
@@ -490,6 +515,14 @@ pub fn packed_planes(trace: &poem_ir::Trace, codes: usize) -> Vec<Option<u32>> {
         param.dtype,
         Dtype::E4m3 | Dtype::E4m3tile128 | Dtype::E4m3g128
     ) {
+        // ROCm's: its codes in the FP8 matrix core's order, its f32 factors
+        // as they lie (`fp8_ordered`): `[codes, factors]`.
+        if fp8_ordered(trace, codes) {
+            return match scales {
+                Some(scales) => vec![Some(codes as u32), Some(scales)],
+                None => Vec::new(),
+            };
+        }
         let laid = crate::weights::laid_planes(trace).into_iter().any(|laid| {
             laid.codes == codes && laid.leads > 1 && Some(laid.scales as u32) == scales
         });

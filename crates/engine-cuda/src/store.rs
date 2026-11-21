@@ -708,6 +708,10 @@ pub struct Pools {
     /// ([`Pools::lane_banks`]): a slot filled from the serving file, or a
     /// copy pinned from it, is laid in that order once filled.
     lanes: Vec<LaneBank>,
+    /// The fp8 banks ROCm puts in the FP8 matrix core's order
+    /// ([`Pools::fp8_banks`]): a slot filled from the serving file, or a
+    /// copy pinned from it, has its codes put in that order once filled.
+    fp8: Vec<Fp8Bank>,
     /// The pinned copy misses are read from, where the load left the
     /// weights in the file and the runtime streams them after all.
     miss_copy: Option<crate::device::Pinned>,
@@ -1247,6 +1251,7 @@ impl Pools {
             hosts_dropped: false,
             weights_filed: false,
             lanes: Vec::new(),
+            fp8: Vec::new(),
             miss_copy: None,
             preseated: false,
             stand_in: false,
@@ -3322,8 +3327,10 @@ impl Pools {
             }
             let mut fills = Vec::new();
             // The lane-order banks' slots filled from the serving file, as
-            // it lies: laid once filled.
+            // it lies: laid once filled (and the fp8 banks' codes put in
+            // their order).
             let mut laid = Vec::new();
+            let mut fp8 = Vec::new();
             for (atom, slot) in named.iter().enumerate() {
                 let Some(slot) = *slot else { continue };
                 if self.expert_caches[at].slots[atom] == Some(slot) {
@@ -3350,6 +3357,11 @@ impl Pools {
                     ));
                 }
                 if self.weights_filed {
+                    for bank in &self.fp8 {
+                        if let Some(codes) = banks().find(|b| b.plane.param == bank.codes) {
+                            fp8.push((to + codes.plane.offset, bank.rows, bank.k));
+                        }
+                    }
                     for lane in &self.lanes {
                         let at_of = |param: u32| {
                             banks()
@@ -3364,6 +3376,7 @@ impl Pools {
             }
             self.fill_weights(stream, &fills)?;
             self.lay_lanes(stream, &laid)?;
+            self.lay_fp8(stream, &fp8)?;
             self.expert_caches[at].slots = named;
         }
         self.stage_row_tables(stream)?;
@@ -3449,6 +3462,28 @@ impl Pools {
     /// rows and K.
     pub fn lane_banks(&mut self, lanes: Vec<LaneBank>) {
         self.lanes = lanes;
+    }
+
+    /// The fp8 banks the load puts in the FP8 matrix core's order
+    /// (`store::layout::fp8_ordered`): their codes' params, rows and K.
+    pub fn fp8_banks(&mut self, banks: Vec<Fp8Bank>) {
+        self.fp8 = banks;
+    }
+
+    /// Each `(codes, rows, k)` span of e4m3 codes put in the FP8 matrix
+    /// core's order and made canonical where it lies, host or device
+    /// (`weights::hip::order_fp8_span`); a span holding a NaN code refuses
+    /// the load.
+    fn lay_fp8(&self, stream: *mut core::ffi::c_void, spans: &[(u64, u64, u64)]) -> Result<()> {
+        #[cfg(feature = "rocm")]
+        {
+            crate::weights::order_fp8_spans(stream, spans)
+        }
+        #[cfg(not(feature = "rocm"))]
+        {
+            let _ = (stream, spans);
+            Ok(())
+        }
     }
 
     /// Each `(codes, exponents)` span of `rows` rows of K `k` laid in lane
@@ -3672,6 +3707,19 @@ impl Pools {
                 bank.host = copies.next().unwrap_or(bank.host);
             }
         }
+        // The file holds an fp8 bank's codes as it lies: its pinned copy's
+        // are put in the FP8 matrix core's order, an expert at a time.
+        let mut fp8 = Vec::new();
+        for cache in &self.expert_caches {
+            for bank in &self.fp8 {
+                for codes in cache.planes.iter().filter(|b| b.plane.param == bank.codes) {
+                    for expert in 0..u64::from(cache.shape.experts) {
+                        fp8.push((codes.host + expert * codes.plane.bytes, bank.rows, bank.k));
+                    }
+                }
+            }
+        }
+        self.lay_fp8(core::ptr::null_mut(), &fp8)?;
         // The file holds a lane-order bank as it lies: its pinned copy, what
         // misses read and slots are filled from, is laid in lane order.
         let mut laid = Vec::new();
@@ -5150,6 +5198,16 @@ struct ExpertBank {
 pub struct LaneBank {
     pub codes: u32,
     pub scales: u32,
+    pub rows: u64,
+    pub k: u64,
+}
+
+/// An fp8 bank ROCm puts in the FP8 matrix core's order
+/// (`store::layout::fp8_ordered`): its codes' param, an expert's rows and
+/// K.
+#[derive(Debug, Clone, Copy)]
+pub struct Fp8Bank {
+    pub codes: u32,
     pub rows: u64,
     pub k: u64,
 }
