@@ -48,6 +48,16 @@ The fused step's shape plus at most one barrier.
   blocks a head follow from the shape (lanes x heads against the resident
   blocks), as the fused step already picks its warps.
 
+Measured on CUDA (L40S, Qwen3.5-0.8B): the no-stage form above, as
+written, is slower than the staged one: c1 / c4 / c64 351 / 1385 / 9564
+tok/s against 355 / 1400 / 10008. Without the stage, each row's keys and
+`u` load after the state instead of being prefetched with it a tile ahead,
+which is what made the staged form fast; folding the committed rows from
+the staged chunk changed nothing. Keep the stage prefetch; measure on each
+engine before porting the no-stage part. On CUDA about half the c1 gap to
+the plain step is host-side (per-step prepare and rs staging), not the
+kernel's shape.
+
 ### Stored per-row scalars (a buffered-row layout change)
 
 Store each row's key norm (kinv) and its log-gate g
