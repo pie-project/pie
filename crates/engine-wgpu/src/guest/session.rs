@@ -18,7 +18,7 @@ use engine::guest_claims::{Claims, Holder, PairClaim, Run};
 use engine_gpu::guest::held::{self, consecutive};
 use engine_gpu::guest::session::{
     HEAP_BINDING, STATUS_BINDING, STATUS_SPAN, STEP_BINDING, StageTables, TABLES_BINDING, bases,
-    groups_for, stage_tables, step_records, step_stride,
+    stage_tables, step_groups, step_records, step_stride,
 };
 use engine_gpu::guest::state::{GuestLayout, Side};
 
@@ -319,6 +319,20 @@ impl Library {
         })
     }
 
+    /// Why call `call` has no pipeline built, or `None` where it has one.
+    #[must_use]
+    pub fn unbuilt(&self, call: u32) -> Option<String> {
+        let pipelines = self.pipelines.lock().expect("library lock poisoned");
+        match pipelines.get(call as usize) {
+            Some(Ok(_)) => None,
+            Some(Err(why)) => Some(why.clone()),
+            None => Some(format!(
+                "call {call} is past the {} the library holds",
+                pipelines.len()
+            )),
+        }
+    }
+
     /// The pipelines built after the load, each at a bind that found its
     /// call missing: none, where the load built every call.
     #[must_use]
@@ -378,7 +392,8 @@ struct Stage {
     areas: Vec<u32>,
     stride: u64,
 
-    groups: u32,
+    /// Each step's workgroups ([`engine_gpu::guest::session::step_groups`]).
+    groups: Vec<u32>,
 
     offsets: Vec<u64>,
 
@@ -552,7 +567,7 @@ impl Session {
                     why: format!("stage {at}: {why}"),
                 })?;
             stages.push(build_stage(
-                device, &library, resolved, tables, lowered, args, stride, heap,
+                device, &plans[at], &library, resolved, tables, lowered, args, stride, heap,
             )?);
         }
 
@@ -845,7 +860,13 @@ impl Session {
                         why: "a step's record lies past a dynamic offset's reach".into(),
                     }
                 })?;
-            frame.dispatch_at("guest", pipeline, group, &[offset], [stage.groups, 1, 1])?;
+            frame.dispatch_at(
+                "guest",
+                pipeline,
+                group,
+                &[offset],
+                [stage.groups[step], 1, 1],
+            )?;
         }
         Ok(())
     }
@@ -1089,6 +1110,7 @@ fn heap_span(
 #[allow(clippy::too_many_arguments)]
 fn build_stage(
     device: &Context,
+    plan: &eta_compiler::codegen::launch::LaunchStagePlan,
     library: &Library,
     resolved: StageTables,
     tables: [Held; 4],
@@ -1116,9 +1138,18 @@ fn build_stage(
         areas,
         stride,
         groups: if lowered.strides_the_grid {
-            groups_for(&descriptors, device.cores())
+            step_groups(
+                plan,
+                &descriptors,
+                &lowered.steps,
+                device.resident().ok_or_else(|| Fault::Device {
+                    call: "guest stage",
+                    why: "a guest step strides the grid by the workgroups the device holds, which the load measures before it binds a guest"
+                        .into(),
+                })?,
+            )
         } else {
-            1
+            vec![1; lowered.steps.len()]
         },
         offsets,
         descriptors,

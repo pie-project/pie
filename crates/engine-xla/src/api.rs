@@ -517,6 +517,7 @@ impl Engine for Xla {
         )
         .map_err(fault)?;
         let mut shell = shell;
+        shell.set_host_programs(residency.host_programs);
         // Every maintenance program a fire, a fork or a park runs later, one
         // a slot size, compiled now whether or not the ladder runs: none is
         // built after the load.
@@ -610,6 +611,10 @@ impl Engine for Xla {
             // XLA states no bound on one submission.
             guest_cost: engine::GuestCost::default(),
             mixed_lanes: shell.mixed_lanes(),
+            // the staging ring's slots less the one being written
+            frames_in_flight: engine::stated_frames(
+                (shell.staging_facts().ring_slots as usize).saturating_sub(1),
+            )?,
         };
         self.programs.seat(budgets.max_lanes);
         self.programs.seat_readouts(shell.readouts());

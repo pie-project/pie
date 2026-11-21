@@ -17,7 +17,8 @@ impl Knobs {
     }
 
     pub fn submit_depth(&self) -> usize {
-        worker::config::Runahead::of(self.dispatch_depth.min(255) as u8).submit_depth()
+        worker::config::Runahead::of(self.dispatch_depth.min(255) as u8)
+            .submit_depth(runtime::scheduler::host_cover())
     }
 
     pub fn admissible(&self) -> bool {
@@ -197,7 +198,16 @@ pub async fn sweep_all(
 
     for pass in 0..repeats {
         for (index, knobs) in candidates.iter().enumerate() {
-            runtime::scheduler::reconfigure(knobs.frame_size, knobs.dispatch_depth)
+            // the depth is the loaded engine's: a candidate of another
+            // depth belongs to another load
+            let running = runtime::scheduler::configured_dispatch_depth();
+            if running != knobs.dispatch_depth {
+                anyhow::bail!(
+                    "{knobs} wants {} frames in flight and the loaded engine runs {running}",
+                    knobs.dispatch_depth
+                );
+            }
+            runtime::scheduler::reconfigure(knobs.frame_size)
                 .map_err(anyhow::Error::from)
                 .with_context(|| format!("apply {knobs}"))?;
             let run = fleet::run(addr, program, inputs).await;

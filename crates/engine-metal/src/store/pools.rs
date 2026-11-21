@@ -1671,6 +1671,14 @@ impl Pools {
         self.pool.top_held_bytes()
     }
 
+    /// The bytes of the heaps kept spare for the span: made at the load
+    /// (the whole top backed), so the device holds them beside its mapped
+    /// heaps.
+    #[must_use]
+    pub fn span_spare_bytes(&self) -> u64 {
+        self.pool.top_spare_bytes()
+    }
+
     /// The span's bytes, backed or not, which the ledger holds reserved.
     #[must_use]
     pub fn span_reserved_bytes(&self) -> u64 {

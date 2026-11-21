@@ -364,7 +364,7 @@ pub fn conv3d_boxed(
         let [_, sh, sw] = conv.stride.map(i64::from);
         let st = i64::from(conv.stride[0]);
         let attrs = format!(
-            "window_strides = array<i64: {st}, {sh}, {sw}>, padding = dense<[[0, 0], [{}, {}], [{}, {}]]> : tensor<3x2xi64>, lhs_dilation = array<i64: 1, 1, 1>, rhs_dilation = array<i64: 1, 1, 1>, dimension_numbers = #stablehlo.conv<[b, 0, 1, 2, fq]x[o, 0, 1, 2, i]->[b, 0, 1, 2, fq]>, feature_group_count = 1 : i64, batch_group_count = 1 : i64",
+            "window_strides = array<i64: {st}, {sh}, {sw}>, padding = dense<[[0, 0], [{}, {}], [{}, {}]]> : tensor<3x2xi64>, lhs_dilation = array<i64: 1, 1, 1>, rhs_dilation = array<i64: 1, 1, 1>, dimension_numbers = #stablehlo.conv<[b, 0, 1, 2, f]x[o, 0, 1, 2, i]->[b, 0, 1, 2, f]>, feature_group_count = 1 : i64, batch_group_count = 1 : i64",
             conv.pad[1], conv.pad_back[1], conv.pad[2], conv.pad_back[2]
         );
         let (ot, oh, ow) = (i64::from(ot), i64::from(oh), i64::from(ow));

@@ -30,8 +30,12 @@ struct Input {
     /// for `enable_thinking: false`.
     #[serde(default)]
     no_think: bool,
-    /// Busy-wait inside WASM for this many microseconds per drained token —
-    /// simulates per-token inferlet work.
+    /// Per-token inferlet compute, in microseconds: after each drained token
+    /// the guest spins on the monotonic clock this long (it reads the clock;
+    /// it never waits on a timer, which the host would read as outside input
+    /// and park the lane for). The lane stays awaited throughout, as a guest
+    /// computing between fires does. Off by default (0): each delayed lane
+    /// burns one CPU while it spins.
     #[serde(default)]
     wasm_delay_us: u64,
     /// Decode and return generated text (the throughput benchmark only needs
@@ -568,7 +572,10 @@ async fn run_one(
             last_tick = now;
         }
         if input.wasm_delay_us > 0 {
-            std::thread::sleep(wasm_delay);
+            let until = std::time::Instant::now() + wasm_delay;
+            while std::time::Instant::now() < until {
+                std::hint::spin_loop();
+            }
         }
         // Refill the window after draining an accepted token. A stopped lane
         // `continue`s above and never reaches here, so it never submits more.

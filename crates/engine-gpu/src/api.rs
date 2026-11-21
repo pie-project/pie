@@ -278,10 +278,14 @@ impl<B: Host> Gpu<B> {
     /// lane's where it carries no prompt). `None` where it is admitted.
     fn admit_step(&mut self, step: &Step, at: engine::StepDone) -> Option<Error> {
         let shell = self.shell.as_mut()?;
+        // The fires landed so far move the scale this step is read at
+        // (`crate::submit::Measured`).
+        shell.track();
         let held = shell.submit_bound()?;
         let rows = crate::submit::StepRows::of(step);
         let admitted = held.admit(rows);
         let (whole, per_layer) = held.step_ns(rows);
+        let raw = held.raw_ns(rows).0;
         tracing::debug!(
             frame = at.frame.0,
             step = at.step,
@@ -293,9 +297,21 @@ impl<B: Host> Gpu<B> {
             estimate_ms = whole / 1e6,
             per_layer_ms = per_layer / 1e6,
             worst = held.worst,
-            scale = held.scale,
+            probe_scale = held.scale,
+            measured_worst = held
+                .measured_rung(rows)
+                .map_or_else(|| held.measured.worst(), |rung| held.measured.worst_of(rung)),
+            measured_fires = held
+                .measured_rung(rows)
+                .map_or_else(|| held.measured.len(), |rung| held.measured.len_of(rung)),
+            stored_ratio = held.stored_ratio(),
+            measured_rung = ?held.measured_rung(rows),
+            error = held.error_for(rows),
+            floor_factor = held.floor_factor(),
+            ratio = held.ratio_for(rows),
             bound_ms = held.bound_ns / 1e6,
             split = admitted.split(),
+            layers_a_piece = ?admitted.layers_a_piece(),
             refused = matches!(admitted, crate::submit::Admitted::Refused { .. }),
             "submit bound: a step admitted"
         );
@@ -321,8 +337,56 @@ impl<B: Host> Gpu<B> {
                     .collect(),
             ));
         }
-        shell.split_next(admitted.split());
+        shell.split_next(admitted.layers_a_piece());
+        shell.estimate_next(Some(crate::submit::Estimated {
+            ns: raw,
+            at,
+            rows: rows.rows,
+            lanes: rows.lanes,
+            pieces: match admitted {
+                crate::submit::Admitted::Layers { submissions, .. } => submissions,
+                _ => 1,
+            },
+            hz: None,
+        }));
         None
+    }
+
+    /// Under a stated submit bound, where `step` is past it even a layer at
+    /// a time: the piece to fire before it and the rest, cut at the ratio
+    /// read now (`crate::submit::next_cut`). `None` where it is admitted as
+    /// it is, where no bound is stated, or where it cannot be cut (then
+    /// refused by name as it is admitted, the reason said here).
+    fn next_piece(&mut self, step: &Step) -> Option<(Step, Step)> {
+        let shell = self.shell.as_mut()?;
+        shell.track();
+        let held = shell.submit_bound()?;
+        let rows = crate::submit::StepRows::of(step);
+        match crate::submit::next_cut(held, step, &shell.trace().facts) {
+            Ok(None) => None,
+            Ok(Some((piece, rest, piece_rows))) => {
+                tracing::debug!(
+                    rows = rows.rows,
+                    lanes = rows.lanes,
+                    keys = rows.keys,
+                    piece_rows,
+                    ratio = held.ratio_for(rows),
+                    "submit bound: a step past the bound a layer at a time: a piece cut by rows"
+                );
+                Some((piece, rest))
+            }
+            Err(why) => {
+                tracing::warn!(
+                    rows = rows.rows,
+                    lanes = rows.lanes,
+                    keys = rows.keys,
+                    %why,
+                    "submit bound: a step past the bound a layer at a time cannot be cut by rows; \
+                     refused by name"
+                );
+                None
+            }
+        }
     }
 
     #[must_use]
@@ -986,13 +1050,13 @@ where
             guest_cost: {
                 let rates = crate::backend::Tactics::profile(shell.tuning()).rates();
                 engine::GuestCost {
-                    submit_bound_ns: crate::rates::stated_submit_bound()
-                        .map(|bound| u64::try_from(bound.as_nanos()).unwrap_or(u64::MAX)),
+                    submit_bound_ns: shell.submit_bound().map(|held| held.bound_ns as u64),
                     launch_ns: rates.launch_ns,
                     elementwise_gbps: rates.elementwise_gbps,
                 }
             },
             mixed_lanes: engine::MixedLanes::Any,
+            frames_in_flight: engine::stated_frames(shell.frames_in_flight())?,
         };
 
         self.shell = Some(shell);
@@ -1187,6 +1251,46 @@ where
         let registered = self.programs.register(registration).map_err(refusal);
         self.count_registered();
         self.refused(registered)
+    }
+
+    /// The runtime's standard samplers, before ready: each adopted and its
+    /// stages lowered as its registration does them, and every step call
+    /// their stages dispatch held to a pipeline the load built
+    /// (`Programs::load`), so a request that registers one, or binds it,
+    /// builds nothing. A program that does not adopt, or that dispatches a
+    /// call the load could not build, fails the load by name. No stage holds
+    /// code of its own (`guest::Compiled`): nothing here is keyed on a
+    /// program's hash, which its channels' capacities enter.
+    fn prewarm_programs(&mut self, registrations: &[ProgramRegistration]) -> EngineResult<()> {
+        if self.shell.is_none() {
+            return Err(Error::Program(
+                "the standard samplers prewarmed before load".to_owned(),
+            ));
+        }
+        let started = std::time::Instant::now();
+        let prewarmed = crate::program::prewarm(registrations).map_err(refusal)?;
+        for &call in &prewarmed.calls {
+            if let Some(why) = self.programs.unbuilt(call) {
+                return Err(Error::Load(format!(
+                    "a standard sampler dispatches guest step call {call}, which the load did \
+                     not build: {why}"
+                )));
+            }
+        }
+        tracing::info!(
+            engine = B::KIND,
+            programs = prewarmed.programs,
+            stages = prewarmed.stages,
+            calls = prewarmed.calls.len(),
+            built_serving = self.programs.built_serving(),
+            slowest_ms = prewarmed.slowest.as_secs_f64() * 1e3,
+            ms = started.elapsed().as_secs_f64() * 1e3,
+            hashes = format_args!("{:016x}", prewarmed.hashes),
+            forms = format_args!("{:016x}", prewarmed.forms),
+            "the standard samplers adopted before ready; every step call they dispatch has its \
+             pipeline from the load"
+        );
+        Ok(())
     }
 
     /// The program adopted and its stages lowered in the returned compile,
@@ -1490,8 +1594,48 @@ where
             };
             // Held to the platform's bound on one submission, where it
             // states one (`crate::submit`): a step past it whole walks a
-            // layer at a time; past it even so, its lanes are refused by
-            // name. Nothing is estimated where no bound is stated.
+            // layer at a time; past it even so, its prompt lane is cut by
+            // rows, its leading pieces fired first, each alone and held
+            // to the bound in turn; a step no row of which fits, or that
+            // cannot be cut, has its lanes refused by name. Nothing is
+            // estimated where no bound is stated.
+            let mut rest: Option<Step> = None;
+            let mut piece_failed = None;
+            loop {
+                let current = rest.as_ref().unwrap_or(step);
+                // The first piece at the ratio read now: the pieces landed
+                // before move it (`crate::submit::Measured`).
+                let Some((piece, after)) = self.next_piece(current) else {
+                    break;
+                };
+                if self.admit_step(&piece, at).is_some() {
+                    // Chosen to fit: refused only past what was weighed;
+                    // the step is refused as a whole, by name.
+                    piece_failed = self.admit_step(current, at);
+                    break;
+                }
+                // A piece tells no completion: the step's last piece does.
+                let fired = self.fire_step(&piece, at, true, None);
+                if let Some(shell) = self.shell.as_mut() {
+                    shell.split_next(None);
+                    shell.estimate_next(None);
+                }
+                if let Err(error) = fired {
+                    piece_failed = Some(error);
+                    break;
+                }
+                rest = Some(after);
+            }
+            if let Some(error) = piece_failed {
+                if error.stops_frame_at(index) {
+                    refused = Some(error);
+                    break;
+                }
+                self.pending = None;
+                self.count_built();
+                return Err(error);
+            }
+            let step = rest.as_ref().unwrap_or(step);
             if let Some(refused_lanes) = self.admit_step(step, at) {
                 if refused_lanes.stops_frame_at(index) {
                     refused = Some(refused_lanes);
@@ -1503,7 +1647,8 @@ where
             }
             let fired = B::step(self, step, at);
             if let Some(shell) = self.shell.as_mut() {
-                shell.split_next(false);
+                shell.split_next(None);
+                shell.estimate_next(None);
             }
             match fired {
                 Ok((ticket, step_pending)) => {

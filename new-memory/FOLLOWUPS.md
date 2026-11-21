@@ -963,10 +963,54 @@ by name). engine-cuda nets the page cache in its own reader (`weights.rs` ~372-4
 inactive only (what the kernel reclaims first, before a charge fails: the conservative room) or
 inactive + active (all file cache, which reclaim reaches under pressure).
 
-## F45. General per-lane split of a pass whose whole demand exceeds the device
+## F47. General per-lane split of a pass whose whole demand exceeds the device
 
 A pass whose whole demand (every lane's kv and state) is past the device while each lane fits
 alone is refused today (only a unit past the whole device alone is refused at submit, bc9354e5a).
 The general split by lanes into sub-fires that each fit needs part outputs held and joined by the
 engine across backends, and per-set parking of finished groups in the planner. The beam example's
 per-copy prefill is fixed by forking instead; not a runtime gate.
+
+## F45. Remove the 600 s silence timeout
+
+The frame gate no longer drops a lane on a timer (the leash and `submit-deadline-us` are gone):
+a lane whose guest waits on outside input is parked by the host (`process::away_while`: session
+receives, `wasi:clocks` waits, an HTTP request until its response head), and a computing lane
+stays awaited. `runtime.silence_timeout` still terminates an awaited lane silent that long.
+Remove it once each case it still catches has its own mechanism:
+- (a) poll-mixed waits are classified: `wasi:io/poll` in componentize-js / py language
+  components (one poll can mix the guest's own pie futures with outside ones, so parking on
+  every poll would un-await own-fire waits), HTTP response-body streams after the head, and
+  sockets;
+- (b) a guest spinning in wasm without submitting;
+- (c) a completion that never arrives (a lane in flight for twice the timeout is terminated
+  through the same path today).
+
+## F46. Something writes into the guest lane arenas' split lines while a meeting runs, under overlap (ROCm, found 2026-11-20)
+
+While building self-resetting meet counters (each split row's meeting leaving its word's count
+zero, the split select's merge zeroing its count, so no memset before each split launch), the
+engine-cuda ROCm integration set (every_op / epilogue / suite / beam / guest, 18 tests) hung at
+every_op_agrees_with_the_host_interpreter when run in one process. It needed the accumulation
+of the earlier tests: each test alone, each paired with every_op, and either half of the set
+passed. The tip passes that point.
+
+The check: before every split row or split select launch, sync the stream, read every split
+lane line of the arenas (16 words each, `lane_span(1)` apart) and report any non-zero count,
+naming the launch before it. With it on, the whole set passes (152 s) and no count is ever
+found dirty. So no launch leaves a count behind. Something disturbs a meeting while it runs,
+and only when work overlaps: the sync before each split launch removes the overlap and the
+hang.
+
+Meeting groups are forked onto main (`fan.fork(&meet, main)`), so two meeting regions do not
+run side by side. The writer is not found. Candidates: a run-ahead frame's staging next to the
+arenas in the activation span, or another run of that span (`Shell::staged_runs`) laid over
+them.
+
+The tip's per-launch memset (`zero_barriers` before each split launch) re-zeroes the counters,
+so its meetings are immune. But a concurrent writer into the guest arenas could as well corrupt
+the partials and candidates the split regions publish there: silent wrong results, not a hang.
+
+Tool for whoever picks it up: the sync-and-read check above, on a build without the memset
+(the self-resetting branch, `sc/amd-meet-reset-dropped`, local on the MI300X host), plus the
+fire's stream map at the stalled launch.

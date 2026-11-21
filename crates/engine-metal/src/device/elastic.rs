@@ -529,6 +529,14 @@ impl Elastic {
         self.top.iter().flatten().map(|chunk| chunk.bytes).sum()
     }
 
+    /// The bytes of the heaps kept spare for the top (`back_whole_top`, and
+    /// those a narrowing emptied): made, so the device holds them, but
+    /// mapped under no tile until the top's next map takes them back.
+    #[must_use]
+    pub fn spare_held(&self) -> u64 {
+        self.spare.iter().map(|spare| spare.chunk.bytes).sum()
+    }
+
     /// Where the top's mapped run to its end starts: its end where none is
     /// mapped. A low heap held for the bottom ([`Elastic::hold_low`]) below
     /// an unmapped one is the bottom's, not the run's.

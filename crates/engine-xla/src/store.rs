@@ -322,8 +322,10 @@ pub fn pool_demand(trace: &Trace, paging: Paging) -> Result<u64> {
             CacheRow::State {
                 name, slab, dtype, ..
             } => {
-                let stride: u64 = slab.iter().product();
-                stride * u64::from(paging.slots + 1) * elem_bytes(name, state_dtype(*dtype))?
+                // a slot as the layout lays it: whole pool rows
+                let elem = elem_bytes(name, state_dtype(*dtype))?;
+                let (per, width) = state_block(slab, elem);
+                per * width * u64::from(paging.slots + 1) * elem
             }
         };
     }
@@ -401,8 +403,11 @@ fn layout_rows<'a>(
                     windowed_row(paging, *window),
                 ));
             }
-            CacheRow::State { slab, dtype, .. } => {
-                let (per, width) = state_block(slab);
+            CacheRow::State {
+                name, slab, dtype, ..
+            } => {
+                let elem = elem_bytes(name, state_dtype(*dtype))?;
+                let (per, width) = state_block(slab, elem);
                 state[index] = Some((narrow(per), narrow(width), state_dtype(*dtype)));
             }
         }
@@ -2200,12 +2205,23 @@ fn elem_bytes(name: &str, dtype: Dtype) -> Result<u64> {
     })
 }
 
-fn state_block(slab: &[u64]) -> (u64, u64) {
+/// A state slot's rows and width: blocks of whole tiles where the slab's
+/// shape gives them, else one row; and a slot whose bytes fill no whole
+/// pool rows (a small state: a narrow conv's frame cache) laid one row
+/// padded to whole pool rows, the kernels reading its live stride at the
+/// row's front (`kernels_xla::lanes::slot_rows`).
+fn state_block(slab: &[u64], elem: u64) -> (u64, u64) {
     let stride: u64 = slab.iter().product();
-    match *slab {
+    let (per, width) = match *slab {
         [h, d1, d2] if (h * d1).is_multiple_of(8) && d2.is_multiple_of(128) => (h * d1, d2),
         [_, _] if stride.is_multiple_of(8 * 128) => (8, stride / 8),
         _ => (1, stride),
+    };
+    let row = layout::ROW_BYTES / elem.max(1);
+    if (per * width * elem).is_multiple_of(layout::ROW_BYTES) {
+        (per, width)
+    } else {
+        (1, stride.div_ceil(row) * row)
     }
 }
 
