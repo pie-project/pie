@@ -9,6 +9,11 @@ pub struct PlannerStats {
     /// by the planner's census ([`Self::pass_census`]).
     pub plan_pass_us: AtomicU64,
     pub plan_pass_buckets: [AtomicU64; 24],
+    /// A pass's time by phase, in total microseconds: its steps
+    /// (`plan_once`), the wants published after them, and the rest (the
+    /// stall dump, the reports): where a pass's cost goes, said by the
+    /// census.
+    pub plan_phase_us: [AtomicU64; 3],
     /// Fires landed: state settled, so a victim whose move found nothing
     /// (its state still settling) may find something now.
     pub fires_landed: AtomicU64,

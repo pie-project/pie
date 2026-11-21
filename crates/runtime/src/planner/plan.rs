@@ -117,6 +117,7 @@ impl ResidencyPlanner {
             self.returns.planning.store(true, Ordering::Release);
             self.returns.plan_begins();
             self.swap_bound.store(false, Ordering::Release);
+            let steps = crate::rt::Instant::now();
             let on_grow = loop {
                 let seen = self.returns.epoch();
                 let on_grow = self.plan_once();
@@ -124,8 +125,11 @@ impl ResidencyPlanner {
                     break on_grow;
                 }
             };
-            self.returns.planning.store(false, Ordering::Release);
+            self.phase_took(0, steps);
+            let wants = crate::rt::Instant::now();
             self.publish_wants();
+            self.returns.planning.store(false, Ordering::Release);
+            self.phase_took(1, wants);
             // Room that came free while the pass ran (its signal woke no one
             // then) and meets what the head lacks now: planned on at once.
             if self.returns.waiters.load(Ordering::Acquire) == 0
@@ -134,6 +138,7 @@ impl ResidencyPlanner {
                 break on_grow;
             }
         };
+        let rest = crate::rt::Instant::now();
         // The waiters parked behind a grow the walk was promised, now.
         let parked = if on_grow {
             self.with_inner(|inner| inner.queue.values().filter(|w| w.is_unmet()).count())
@@ -149,6 +154,23 @@ impl ResidencyPlanner {
         // A waiter served or gone lacks nothing now.
         self.report_short();
         self.say_long_waits(cause);
+        self.phase_took(2, rest);
+    }
+
+    fn phase_took(&self, phase: usize, since: crate::rt::Instant) {
+        if let Some(total) = self.stats.plan_phase_us.get(phase) {
+            total.fetch_add(
+                u64::try_from(since.elapsed().as_micros()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// A pass's time by phase, in total microseconds: its steps, the wants
+    /// published after them, the rest ([`super::stats::PlannerStats::plan_phase_us`]).
+    #[must_use]
+    pub fn phase_census(&self) -> [u64; 3] {
+        [0, 1, 2].map(|phase| self.stats.plan_phase_us[phase].load(Ordering::Relaxed))
     }
 
     /// Every opened chunk, by the live slots it holds and the state of the
