@@ -722,6 +722,7 @@ impl Plane {
                 slots,
                 scores,
                 scratch,
+                parked: false,
             },
         );
         Ok(id)
@@ -738,7 +739,17 @@ impl Plane {
     /// Points every instance's rings at where their pool slots lie now:
     /// after an evacuation moved chunks, ahead of the next fire staged.
     pub fn rebase(&mut self, span: Span<'_>) -> Result<()> {
-        for bound in self.instances.values_mut() {
+        // A parked instance's slots are another owner's
+        // (`engine::Rebind::Parked`): repointed at its rebind, not here, and
+        // a pair none of whose instances is bound now lies nowhere of its
+        // own.
+        let live: Vec<(ProgramId, Extents)> = self
+            .instances
+            .values()
+            .filter(|bound| !bound.parked)
+            .map(|bound| (bound.program_id, bound.session.extents()))
+            .collect();
+        for bound in self.instances.values_mut().filter(|bound| !bound.parked) {
             let Some(program) = self.programs.get(&bound.program_id) else {
                 continue;
             };
@@ -750,8 +761,10 @@ impl Plane {
             bound.scratch = piece_at(&bound.slots.scratch, room.instance_bytes(), span)?
                 .next_multiple_of(launch::SPAN_ALIGN);
         }
-        for program in self.programs.values_mut() {
-            for batch in program.batches.iter_mut().filter(|batch| batch.bound > 0) {
+        for (program_id, program) in &mut self.programs {
+            for batch in program.batches.iter_mut().filter(|batch| {
+                batch.bound > 0 && live.contains(&(*program_id, batch.extents))
+            }) {
                 let base = piece_at(&batch.pair, batch.room.bytes(), span)?;
                 if base != batch.base {
                     batch.base = base;
@@ -759,6 +772,17 @@ impl Plane {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Instance `id`'s process parked (`engine::Rebind::Parked`): nothing
+    /// of it is repointed or fired until [`Self::rebind`] names where it
+    /// lies.
+    pub fn park(&mut self, id: InstanceId) -> Result<()> {
+        self.instances
+            .get_mut(&id)
+            .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?
+            .parked = true;
         Ok(())
     }
 
@@ -819,6 +843,7 @@ impl Plane {
         bound.scores = scores;
         bound.scratch = scratch;
         bound.slots = slots;
+        bound.parked = false;
         let pair = bound.slots.pair.clone();
         let generation = bound.slots.pair_generation;
         let batch = self
@@ -1027,6 +1052,15 @@ impl Plane {
         let bound = instances
             .get_mut(&id)
             .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
+        if bound.parked {
+            return Err(Fault::program(
+                "program::plane",
+                format!(
+                    "instance {id} is fired while parked: its slots are another owner's until a \
+                     rebind names where it lies"
+                ),
+            ));
+        }
         let program_id = bound.program_id;
         let program = programs.get(&program_id).ok_or_else(|| {
             Fault::program(
@@ -1393,6 +1427,10 @@ struct Bound {
     /// Where its lane's value scratch lies now
     /// (`engine::InstanceBinding::scratch`, [`PairRoom::instance_bytes`]).
     scratch: u64,
+    /// Its process parked (`engine::Rebind::Parked`): its slots are
+    /// another owner's until a rebind names where it lies, so nothing of
+    /// it is repointed or fired meanwhile.
+    parked: bool,
 }
 
 /// Where a guest item lies in the pool, as a binding names it.

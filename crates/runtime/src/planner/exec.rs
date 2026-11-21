@@ -597,6 +597,17 @@ impl MoveGuard {
     fn take(&mut self) -> Move {
         self.txn.take().expect("move present")
     }
+
+    /// The instances its park moves down or leaves where they lie
+    /// ([`RoleMove::parked`]).
+    fn parked(&self) -> Vec<::engine::Rebind> {
+        match self.txn.as_ref() {
+            Some(Move::Suspend {
+                roles: Some(roles), ..
+            }) => roles.parked(),
+            _ => Vec::new(),
+        }
+    }
 }
 
 /// The physical chunks a process's state holds, fenced against a raise's
@@ -889,6 +900,18 @@ pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
         return;
     }
     let copied = began.elapsed();
+    // Its instances said parked on its lane before the commit hands their
+    // slots to anyone else: an engine still holding them at those slots
+    // refuses the next owner's bind there (Vulkan on a0bfb512f, long
+    // prompts: "Instance slots ... already hold instance N's run"), or
+    // lays a parked pair over it after an evacuation (Metal). One it
+    // refuses fails the process by name, its move taken back.
+    if let Err(error) = park(engine, guard.parked()).await {
+        tracing::warn!(pid = %pid, %error, "planner: eviction's park not taken by the engine");
+        drop(guard);
+        planner.eviction_copy_failed(pid, &error);
+        return;
+    }
     let Move::Suspend { kv, rs, roles } = guard.take() else {
         unreachable!("an eviction carries a suspend")
     };
@@ -955,6 +978,19 @@ async fn rebind(engine: usize, roles: &RolesHandle, pid: ProcessId) -> Result<()
         crate::scheduler::rebind_slots(engine, rebind)
             .await
             .map_err(|error| format!("rebind {owner:?}: {error:#}"))?;
+    }
+    Ok(())
+}
+
+/// Says each of a park's instances parked to the engine, on its lane
+/// ahead of any later bind or rebind ([`::engine::Rebind::Parked`]); one
+/// the lane closed since is not said ([`crate::store::roles::rebind`]).
+async fn park(engine: usize, parked: Vec<::engine::Rebind>) -> Result<(), String> {
+    for rebind in parked {
+        let owner = Owner::of(&rebind);
+        crate::scheduler::rebind_slots(engine, rebind)
+            .await
+            .map_err(|error| format!("park {owner:?}: {error:#}"))?;
     }
     Ok(())
 }

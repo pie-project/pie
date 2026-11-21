@@ -1044,6 +1044,11 @@ impl Shell {
             .rebase(&|item, bytes| pools.guest_item(item, bytes))
     }
 
+    /// Instance `id`'s process parked (`engine::Rebind::Parked`).
+    pub fn park_program(&mut self, id: engine::InstanceId) -> Result<()> {
+        self.programs.park(id)
+    }
+
     /// Instance `id`'s items lie in `slots` now.
     pub fn rebind_program(
         &mut self,

@@ -419,6 +419,7 @@ impl Plane {
                 device,
                 shared: adopted,
                 ids: channels.to_vec(),
+                parked: false,
             },
         );
         // Its pair's batch sets and its own scratch are laid now, in the
@@ -868,19 +869,38 @@ impl Plane {
     /// Points every pooled table and ring at the chunks their slots sit in
     /// now: after an evacuation moved chunks under unchanged refs.
     pub fn rebind(&mut self, pools: &Pools) -> Result<()> {
-        for bound in self.instances.values_mut() {
+        // A parked instance's slots are another owner's
+        // (`engine::Rebind::Parked`): repointed and laid at its rebind,
+        // never here over what that owner holds (Mac Pro: a shed pair laid
+        // at its stale place after every evacuation).
+        for bound in self.instances.values_mut().filter(|bound| !bound.parked) {
             bound.session.rebind(pools)?;
         }
         for ring in self.channels.values() {
             ring.rebind(pools)?;
         }
         // The guests' state: the pairs' batch sets and each instance's
-        // scratch, laid again where their chunks sit now.
-        let pairs: Vec<u64> = self.pairs.iter().map(|held| held.id).collect();
+        // scratch, laid again where their chunks sit now; a pair none of
+        // whose instances is bound now lies nowhere of its own.
+        let pairs: Vec<u64> = self
+            .pairs
+            .iter()
+            .map(|held| held.id)
+            .filter(|&pair| {
+                self.instances
+                    .values()
+                    .any(|bound| bound.pair == pair && !bound.parked)
+            })
+            .collect();
         for pair in pairs {
             self.lay_pair(pools, pair)?;
         }
-        let ids: Vec<InstanceId> = self.instances.keys().copied().collect();
+        let ids: Vec<InstanceId> = self
+            .instances
+            .iter()
+            .filter(|(_, bound)| !bound.parked)
+            .map(|(id, _)| *id)
+            .collect();
         for id in ids {
             self.lay_scratch(pools, id)?;
         }
@@ -905,6 +925,7 @@ impl Plane {
                     .get_mut(id)
                     .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
                 bound.session.retarget(pools, instance, rings)?;
+                bound.parked = false;
                 // Its state moved with it: its scratch, and its pair's sets
                 // where the pair's place moved too. Their contents are dead
                 // between fires; the tables are written again where laid.
@@ -920,6 +941,13 @@ impl Plane {
                     }
                     self.lay_pair(pools, owner)?;
                 }
+                Ok(())
+            }
+            engine::Rebind::Parked { id } => {
+                self.instances
+                    .get_mut(id)
+                    .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?
+                    .parked = true;
                 Ok(())
             }
             engine::Rebind::Channel { id, slots } => self
@@ -1190,6 +1218,9 @@ impl Plane {
             .instances
             .get_mut(&id)
             .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
+        if bound.parked {
+            return Err(parked_fire(id));
+        }
         let program = self.programs.get(&bound.program_id).ok_or_else(|| {
             Fault::program(
                 "program::plane",
@@ -1226,6 +1257,9 @@ impl Plane {
                 .instances
                 .get_mut(&id)
                 .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
+            if bound.parked {
+                return Err(parked_fire(id));
+            }
             let program = self.programs.get(&bound.program_id).ok_or_else(|| {
                 Fault::program(
                     "program::plane",
@@ -1571,6 +1605,22 @@ struct Bound {
     device: eta_ir::registry::PortMask,
     shared: Vec<Option<Arc<SharedRing>>>,
     ids: Vec<ChannelId>,
+    /// Its process parked (`engine::Rebind::Parked`): its slots are
+    /// another owner's until a rebind names where it lies, so nothing of
+    /// it is repointed, laid or fired meanwhile.
+    parked: bool,
+}
+
+/// A fire naming an instance whose process parked, before a rebind named
+/// where it lies (`engine::Rebind::Parked`): the runtime's ordering broke.
+fn parked_fire(id: InstanceId) -> Fault {
+    Fault::program(
+        "program::plane",
+        format!(
+            "instance {id} is fired while parked: its slots are another owner's until a rebind \
+             names where it lies"
+        ),
+    )
 }
 
 /// Whether `plan` reads a capturing lane's score rows out.

@@ -94,7 +94,7 @@ impl Owner {
     #[must_use]
     pub fn of(rebind: &Rebind) -> Self {
         match rebind {
-            Rebind::Instance { id, .. } => Owner::Instance(*id),
+            Rebind::Instance { id, .. } | Rebind::Parked { id } => Owner::Instance(*id),
             Rebind::Channel { id, .. } => Owner::Channel(*id),
         }
     }
@@ -763,6 +763,25 @@ impl RoleMove {
     #[must_use]
     pub fn copies(&self) -> &[RoleCopy] {
         &self.copies
+    }
+
+    /// A park's instances, moved down or left where they lie
+    /// ([`Item::shed`]): each is said to the engine as parked
+    /// ([`Rebind::Parked`]) once the copies have landed and before the
+    /// commit gives its device slots to anyone else. None for an unpark.
+    #[must_use]
+    pub fn parked(&self) -> Vec<Rebind> {
+        if !self.out {
+            return Vec::new();
+        }
+        self.items
+            .iter()
+            .chain(&self.shed)
+            .filter_map(|(owner, _)| match *owner {
+                Owner::Instance(id) => Some(Rebind::Parked { id }),
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -1749,6 +1768,7 @@ impl Roles {
             }
             self.free_if_done(owner);
         }
+        self.release_unheld_pairs();
     }
 
     /// `holder`'s guest bind no longer waits: it bound, was refused, or
@@ -2330,7 +2350,27 @@ impl Roles {
                         instance(id).is_some_and(|instance| instance.holder == Some(holder))
                     })
             }
-            Owner::Adapter(_) | Owner::Pair(_) => {
+            // A pair's run is its batch's while any member is on the device
+            // or on its way to or from it: a member mid-park (its move may
+            // yet be taken back, the tier below full) or mid-unpark holds
+            // it. Read as parked, the pair went with another holder's park,
+            // the member's park was taken back, and the run, given back
+            // under a resident member, was another program's fresh room
+            // (the L40S at 3 GiB on c8077be0f: instance 371's pair run
+            // bound by 372-374 of another program, CUDA 700 on its next
+            // fire). The member's park landing gives it back
+            // ([`Self::release_unheld_pairs`]).
+            Owner::Pair(_) => {
+                item.attached
+                    .iter()
+                    .any(|id| instance(id).is_some_and(|instance| instance.holder == Some(holder)))
+                    && item.attached.iter().all(|id| {
+                        instance(id).is_none_or(|instance| {
+                            instance.holder == Some(holder) || Self::settled_parked(instance)
+                        })
+                    })
+            }
+            Owner::Adapter(_) => {
                 item.attached
                     .iter()
                     .any(|id| instance(id).is_some_and(|instance| instance.holder == Some(holder)))
@@ -2350,6 +2390,55 @@ impl Roles {
                         })
                     })
             }
+        }
+    }
+
+    /// A member parked and settled: off the device, or parked where it
+    /// lies ([`Item::shed`]); never one on its way (`Moving`).
+    fn settled_parked(instance: &Item) -> bool {
+        matches!(instance.tier, Tier::Host | Tier::Disk)
+            || (instance.tier == Tier::Device && instance.shed)
+    }
+
+    /// Gives back the run of each pair on the device every member of which
+    /// is parked and settled, nothing reading it: what a member's park
+    /// left behind while another member was on its way
+    /// ([`Self::moves_with`]). Its state is dead between fires; it parks
+    /// as one with no slots below, and a member's restore takes it fresh.
+    fn release_unheld_pairs(&mut self) {
+        let unheld: Vec<Owner> = self
+            .items
+            .iter()
+            .filter(|(owner, item)| {
+                matches!(owner, Owner::Pair(_))
+                    && item.tier == Tier::Device
+                    && !item.shed
+                    && item.reads == 0
+                    && item.parts.iter().all(Part::dead)
+                    && !item.attached.is_empty()
+                    && item.attached.iter().all(|id| {
+                        self.items
+                            .get(&Owner::Instance(*id))
+                            .is_none_or(Self::settled_parked)
+                    })
+            })
+            .map(|(owner, _)| *owner)
+            .collect();
+        for owner in unheld {
+            let item = self.items.get_mut(&owner).expect("present");
+            let emptied: Vec<Part> = item
+                .parts
+                .iter()
+                .map(|part| Part {
+                    refs: Vec::new(),
+                    ..part.clone()
+                })
+                .collect();
+            let old = std::mem::replace(&mut item.parts, emptied);
+            item.tier = Tier::Host;
+            item.stale = false;
+            let device = Arc::clone(&self.device);
+            self.give_freeing(&device, &old);
         }
     }
 
@@ -2781,6 +2870,10 @@ impl Roles {
             item.stale = !txn.out;
             self.give_on(if txn.out { Tier::Device } else { below }, &old);
             self.free_if_done(owner);
+        }
+        // A pair a member's park left behind, every member now parked.
+        if txn.out {
+            self.release_unheld_pairs();
         }
         // A bind waiting on a pair's move looks again.
         self.freed
@@ -3678,7 +3771,12 @@ pub fn rebind(
         );
         return Ok(());
     }
+    let parked = matches!(rebind, Rebind::Parked { .. });
     engine.rebind_slots(rebind)?;
+    // A park names no new slots: nothing is rebound, no held write goes.
+    if parked {
+        return Ok(());
+    }
     let Some(roles) = roles else {
         return Ok(());
     };

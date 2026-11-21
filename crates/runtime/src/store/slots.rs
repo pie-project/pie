@@ -1386,8 +1386,12 @@ impl SlotPool {
             }
         }
         for step in &evacuation.moves {
-            self.move_chunk(*step);
+            // Fenced before the move reopens it, as a compaction's: a run's
+            // member below the span (moved whole with the one in it) was
+            // left open while its copy still read it, another owner's to
+            // take mid-copy (Mac Pro hazard B's test).
             self.fenced.set(step.from);
+            self.move_chunk(*step);
             // Its destination too, until the copy into it has landed: let
             // go meanwhile, it would reopen and be handed to another owner
             // whose data the copy then overwrote (the M1 on ca5c710a7:
@@ -3877,6 +3881,36 @@ mod tests {
         let moved: BTreeSet<(u32, u32)> =
             evacuation.moves.iter().map(|step| (step.from, step.to)).collect();
         assert!(moved.contains(&(10, 5)) && moved.contains(&(11, 6)), "whole: {moved:?}");
+        pool.apply_rung(&evacuation, 7).unwrap();
+        pool.check();
+    }
+
+    /// Mac Pro's hazard B: a run with one chunk below the raise's span and
+    /// one in it moves whole (`moves_keeping_runs` under `plan_rung`): the
+    /// member below the limit goes with the one the span takes, never left
+    /// behind with its partner moved alone.
+    #[test]
+    fn a_raise_moves_a_run_straddling_its_span_whole() {
+        let fixed = [(ShapeKind::Fixed, 4)];
+        let mut pool = SlotPool::new(facts_with(16, 4, 4, &fixed, &[(16, 2), (256, 6)]));
+        let holder = Holder::WorkingSet(1);
+        pool.set_rung(16).unwrap();
+        let low = pool.acquire_chunk_runs(holder, 0, 1, 8).unwrap();
+        let at = |pool: &SlotPool, slot: &Slot| pool.chunk_table()[slot.chunk as usize];
+        let run = pool.acquire_chunk_runs(holder, 0, 2, 1).unwrap();
+        let firsts: BTreeSet<u32> = run.iter().map(|slot| at(&pool, slot)).collect();
+        assert_eq!(firsts, BTreeSet::from([9, 10]), "the run straddles the span's limit");
+        let freed: Vec<Slot> = low
+            .iter()
+            .copied()
+            .filter(|slot| [5, 6].contains(&at(&pool, slot)))
+            .collect();
+        pool.release(holder, &freed, 0);
+        pool.retire_through(u64::MAX);
+        let evacuation = pool.plan_rung(256).expect("a free run of two below");
+        let moved: BTreeSet<(u32, u32)> =
+            evacuation.moves.iter().map(|step| (step.from, step.to)).collect();
+        assert_eq!(moved, BTreeSet::from([(9, 5), (10, 6)]), "whole, both members");
         pool.apply_rung(&evacuation, 7).unwrap();
         pool.check();
     }

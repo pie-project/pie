@@ -33,6 +33,11 @@ struct Instance {
     /// (`engine::InstanceBinding::pair_generation`).
     #[cfg(feature = "vulkan")]
     pair_generation: u64,
+    /// Its process parked (`engine::Rebind::Parked`): its slots are
+    /// another owner's until a rebind names where it lies, so nothing of
+    /// it is repointed, claimed or fired meanwhile.
+    #[cfg(feature = "vulkan")]
+    parked: bool,
 
     /// The channels whose device cells this instance holds itself (none
     /// registered covers them), in its `ring_slots`.
@@ -46,6 +51,16 @@ struct Instance {
 }
 
 use engine_gpu::serve::InputCell;
+
+/// A fire naming an instance whose process parked, before a rebind named
+/// where it lies (`engine::Rebind::Parked`): the runtime's ordering broke.
+#[cfg(feature = "vulkan")]
+fn parked_fire(instance: InstanceId) -> Refusal {
+    Refusal::Program(format!(
+        "instance {instance} is fired while parked: its slots are another owner's until a \
+         rebind names where it lies"
+    ))
+}
 
 /// Ring cells a pass on the queue has yet to land, as (channel, sequence):
 /// the ring holds a cell for each from the pass's submit, and its value only
@@ -393,6 +408,8 @@ impl Plane {
                 session,
                 #[cfg(feature = "vulkan")]
                 pair_generation: binding.pair_generation,
+                #[cfg(feature = "vulkan")]
+                parked: false,
                 own_cells,
                 landing: Arc::default(),
                 faulted: Arc::default(),
@@ -505,7 +522,9 @@ impl Plane {
         #[cfg(feature = "vulkan")]
         {
             let program = |fault: engine_gpu::error::Fault| Refusal::Program(fault.to_string());
-            for seat in self.instances.values_mut() {
+            // A parked instance's slots are another owner's: repointed and
+            // claimed at its rebind, not here.
+            for seat in self.instances.values_mut().filter(|seat| !seat.parked) {
                 seat.session.rebind(pools).map_err(program)?;
             }
             for cell in self
@@ -555,6 +574,7 @@ impl Plane {
                     self.takings.give(&was.0, was.1);
                     let fresh_pair = self.takings.take(pair, *pair_generation);
                     seat.pair_generation = *pair_generation;
+                    seat.parked = false;
                     seat.session.clear(fresh_pair).map_err(program)?;
                     let mut kept = self.kept.lock().expect("kept cells lock poisoned");
                     for ring in rings {
@@ -573,6 +593,14 @@ impl Plane {
                             .retarget(pools, &ring.slots)
                             .map_err(program)?;
                     }
+                }
+                Rebind::Parked { id } => {
+                    let seat = self.instances.get_mut(id).ok_or(Refusal::Closed {
+                        what: "instance",
+                        id: id.0,
+                    })?;
+                    seat.session.park().map_err(program)?;
+                    seat.parked = true;
                 }
                 Rebind::Channel { id, slots } => {
                     // The passes reading it land first.
@@ -910,6 +938,10 @@ impl Plane {
             what: "instance",
             id: instance.0,
         })?;
+        #[cfg(feature = "vulkan")]
+        if seat.parked {
+            return Err(parked_fire(instance));
+        }
         if seat.faulted.load(Ordering::Acquire) {
             return Err(Refusal::Program(format!("instance {instance} is poisoned")));
         }
@@ -1045,6 +1077,9 @@ impl Plane {
             what: "instance",
             id: instance.0,
         })?;
+        if seat.parked {
+            return Err(parked_fire(instance));
+        }
         let widen = widen.as_ref().ok_or_else(|| {
             Refusal::Program(format!(
                 "instance {instance} has a device half, but the plane built no readout widen"

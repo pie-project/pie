@@ -437,6 +437,13 @@ impl Drop for Session {
 }
 
 impl Session {
+    /// Its process parked (`engine::Rebind::Parked`), its passes landed:
+    /// its slots and heap are claimed no longer, another owner's to take
+    /// until [`Self::retarget`] claims where it lies again.
+    pub fn park(&self) {
+        self.library.claims.release(self.claim);
+    }
+
     pub fn new(
         device: &Context,
         package: &LaunchPackage,

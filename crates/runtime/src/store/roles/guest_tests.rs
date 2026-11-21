@@ -175,6 +175,33 @@ struct GuestEngine {
     next: u64,
     bindings: Vec<InstanceBinding>,
     rebinds: Vec<Rebind>,
+    /// Where each live instance's scratch lies, as a Vulkan or wgpu engine
+    /// claims it (`engine_gpu::guest::claims`): a bind or rebind onto
+    /// slots another live instance claims is refused by name, a park
+    /// (`Rebind::Parked`) releases them. `None`: nothing claimed.
+    claims: Option<std::collections::BTreeMap<InstanceId, Vec<u32>>>,
+}
+
+impl GuestEngine {
+    /// Claims `place` for `id` in place of what it held, as
+    /// `engine_gpu::guest::claims::Claims::claim` does.
+    fn claim(&mut self, id: InstanceId, place: &ScratchPlace) -> ::engine::Result<()> {
+        let Some(claims) = self.claims.as_mut() else {
+            return Ok(());
+        };
+        let refs = refs_of(place);
+        if let Some((holder, _)) = claims
+            .iter()
+            .find(|(holder, held)| **holder != id && held.iter().any(|slot| refs.contains(slot)))
+        {
+            return Err(::engine::Error::Program(format!(
+                "guest::claims: Instance slots already hold instance {holder}'s run: instance \
+                 {id}'s would overlap it"
+            )));
+        }
+        claims.insert(id, refs);
+        Ok(())
+    }
 }
 
 impl GuestEngine {
@@ -190,6 +217,7 @@ impl GuestEngine {
             next: 0,
             bindings: Vec::new(),
             rebinds: Vec::new(),
+            claims: None,
         }
     }
 }
@@ -255,6 +283,7 @@ impl Engine for GuestEngine {
     }
 
     fn bind_instance(&mut self, binding: &InstanceBinding) -> ::engine::Result<BoundInstance> {
+        self.claim(InstanceId(self.next + 1), &binding.scratch)?;
         self.next += 1;
         self.bindings.push(binding.clone());
         Ok(BoundInstance {
@@ -266,6 +295,15 @@ impl Engine for GuestEngine {
     }
 
     fn rebind_slots(&mut self, rebind: Rebind) -> ::engine::Result<()> {
+        match &rebind {
+            Rebind::Instance { id, scratch, .. } => self.claim(*id, scratch)?,
+            Rebind::Parked { id } => {
+                if let Some(claims) = self.claims.as_mut() {
+                    claims.remove(id);
+                }
+            }
+            Rebind::Channel { .. } => {}
+        }
         self.rebinds.push(rebind);
         Ok(())
     }
@@ -502,6 +540,118 @@ fn a_park_gives_the_scratch_back_whole_and_an_unpark_takes_fresh_chunks() {
         roles.lock().unwrap().rebound(Owner::Instance(id));
     }
     assert!(roles.lock().unwrap().stale(holder(1)).is_empty());
+}
+
+/// A park's instances are said parked before its commit gives their
+/// slots to anyone else, so an engine claiming where each instance lies
+/// (Vulkan, wgpu) takes another process's bind there, and the parked
+/// one's restore rebinds it to fresh slots none other claims. Untold, the
+/// next bind on the freed slots is refused by name: the Vulkan long-prompt
+/// mix on a0bfb512f ("Instance slots ... already hold instance N's run").
+#[test]
+fn a_park_is_said_to_the_engine_before_its_slots_are_another_s() {
+    for told in [true, false] {
+        let Pools { roles, .. } = pools(64);
+        let mut engine = GuestEngine::new(2 * CHUNK, PAIR);
+        engine.claims = Some(Default::default());
+        let id = bind(&roles, &mut engine, 1).unwrap();
+        let parked_at = engine.bindings[0].scratch.clone();
+        let park = roles
+            .lock()
+            .unwrap()
+            .prepare_park(holder(1))
+            .expect("the instance parks");
+        assert_eq!(park.parked(), vec![Rebind::Parked { id }], "the park names it");
+        if told {
+            for rebind in park.parked() {
+                super::rebind(Some(&roles), &mut engine, rebind, |_, _, _| Ok(())).unwrap();
+            }
+            assert!(
+                roles.lock().unwrap().stale(holder(1)).is_empty(),
+                "a park rebinds nothing"
+            );
+        }
+        roles.lock().unwrap().commit(park);
+        // Another process's instance takes the freed chunks.
+        let other = bind(&roles, &mut engine, 2);
+        if !told {
+            let error = other.expect_err("untold, the engine still claims the parked slots");
+            assert!(error.to_string().contains("would overlap"), "{error:#}");
+            continue;
+        }
+        other.expect("told, the freed slots are another's");
+        assert_eq!(
+            refs_of(&engine.bindings[1].scratch).first(),
+            refs_of(&parked_at).first(),
+            "the second bind lies where the parked one did"
+        );
+        let unpark = roles
+            .lock()
+            .unwrap()
+            .prepare_unpark(holder(1))
+            .unwrap()
+            .expect("it unparks");
+        assert!(unpark.parked().is_empty(), "an unpark names no park");
+        roles.lock().unwrap().commit(unpark);
+        let stale = roles.lock().unwrap().stale(holder(1));
+        for rebind in stale {
+            super::rebind(Some(&roles), &mut engine, rebind, |_, _, _| Ok(()))
+                .expect("its fresh slots are claimed by none");
+        }
+        assert!(roles.lock().unwrap().stale(holder(1)).is_empty());
+    }
+}
+
+/// A pair's run is its batch's while any member is on the device or on
+/// its way: with one member's park in flight, another member's park leaves
+/// the pair where it lies, so when the first park is taken back (the tier
+/// below full) its member is resident on its pair, and another program's
+/// bind never takes that run as fresh room (the L40S at 3 GiB on
+/// c8077be0f: CUDA 700, program 4's pair run bound by program 6). Once
+/// every member's park has landed, the run is given back.
+#[test]
+fn a_pair_run_is_never_another_program_s_while_a_member_may_still_fire() {
+    let Pools { device, roles } = pools(64);
+    let mut engine = GuestEngine::new(2 * CHUNK, PAIR);
+    let before = held(&device);
+    let a1 = bind(&roles, &mut engine, 1).unwrap();
+    let _a2 = bind(&roles, &mut engine, 2).unwrap();
+    let pair_at = engine.bindings[0].pair.clone();
+    assert_eq!(pair_at, engine.bindings[1].pair, "one pair run for the batch");
+    // The first member's park in flight; the second parks and lands.
+    let first = roles.lock().unwrap().prepare_park(holder(1)).expect("it parks");
+    let second = roles.lock().unwrap().prepare_park(holder(2)).expect("it parks");
+    roles.lock().unwrap().commit(second);
+    // The first's move is taken back: its member is resident again.
+    roles.lock().unwrap().abort(first);
+    assert!(roles.lock().unwrap().stale(holder(1)).is_empty(), "nothing moved of {a1:?}");
+    // Another program binds: none of its room is the resident pair's.
+    let mut other = GuestEngine::new(2 * CHUNK, PAIR);
+    other.next = 100;
+    learn_program(&roles, &mut other, ProgramId(8)).unwrap();
+    bind_instance(
+        Some(&roles),
+        &mut other,
+        &InstanceBinding {
+            program: ProgramId(8),
+            ..InstanceBinding::default()
+        },
+        Some(holder(3)),
+        |_| false,
+    )
+    .unwrap();
+    let theirs = &other.bindings[0];
+    disjoint(&[&pair_at, &theirs.pair, &theirs.scratch, &engine.bindings[0].scratch])
+        .expect("the resident member's pair run is its batch's alone");
+    // The first member's park lands now: the pair goes back with it.
+    let first = roles.lock().unwrap().prepare_park(holder(1)).expect("it parks");
+    roles.lock().unwrap().commit(first);
+    let mine = 2 * CHUNK + slots(PAIR) * SLOT;
+    assert_eq!(
+        held(&device) - before,
+        mine,
+        "only the other program's room is held: the batch's run went back"
+    );
 }
 
 /// The `Instance` slot refs `place` covers.

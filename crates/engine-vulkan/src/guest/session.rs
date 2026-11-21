@@ -1300,6 +1300,15 @@ impl Session {
         Ok(())
     }
 
+    /// Its process parked (`engine::Rebind::Parked`): the passes on the
+    /// queue land, and its slots and heap are claimed no longer, another
+    /// owner's to take until [`Self::retarget`] claims where it lies again.
+    pub fn park(&mut self) -> Result<()> {
+        self.settle()?;
+        self.library.claims.release(self.claim);
+        Ok(())
+    }
+
     /// Clears the status word a faulted stage left in the instance's slots.
     pub fn clear_status(&mut self) -> Result<()> {
         self.status.write(0, &[0u8; eta_exec::STATUS_BYTES])

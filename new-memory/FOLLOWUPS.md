@@ -970,3 +970,13 @@ alone is refused today (only a unit past the whole device alone is refused at su
 The general split by lanes into sub-fires that each fit needs part outputs held and joined by the
 engine across backends, and per-set parking of finished groups in the planner. The beam example's
 per-copy prefill is fixed by forking instead; not a runtime gate.
+
+## F?? An adapter parks with one holder while another of its holders is on its way
+
+`Roles::moves_with` still reads a member mid-park or mid-unpark (`Tier::Moving`) as parked for an
+adapter, as it did for a pair until the L40S's CUDA 700 (c8077be0f): the adapter's live parts go
+down with another holder's park, the member's park is taken back (tier below full), and it is
+resident on adapter slots given back. A pair now waits for every member parked and settled, and a
+member's landing park gives it back (`release_unheld_pairs`). An adapter holds live parts, so the
+same rule needs a home for it once its last member's park lands: mark it parked where it lies
+(`Item::shed`) for a move down to take, never free it. Not seen in the field yet.

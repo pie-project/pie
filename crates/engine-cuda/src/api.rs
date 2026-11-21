@@ -1052,6 +1052,9 @@ impl Engine for Cuda {
                     },
                 )
                 .map_err(fault),
+            engine::program::Rebind::Parked { id } => {
+                self.loaded_mut()?.park_program(id).map_err(fault)
+            }
             engine::program::Rebind::Channel { id, slots } => {
                 let old = self.channels.get(&id).cloned().ok_or_else(|| {
                     Error::Program(format!("channel {id} is not registered on this engine"))

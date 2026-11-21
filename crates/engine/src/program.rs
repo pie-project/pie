@@ -116,12 +116,22 @@ pub struct InstanceBinding {
 /// taken at the bind and held while bound ([`InstanceBinding::scratch`],
 /// [`InstanceBinding::pair`], [`ScratchPlace`]). Their contents are dead
 /// between fires: a park gives them back and an unpark takes fresh room,
-/// nothing copied, the engine told where ([`Rebind::Instance`]).
+/// nothing copied, the engine told where ([`Rebind::Instance`]). Whatever
+/// of them a later fire reads is the engine's own to lay again: at every
+/// bind or rebind naming a new place or taking (Metal's batch sets and
+/// scratch sets, at the rebind), or at the next fire of a pair whose
+/// place moved (CUDA's flight tables, staged again once stale); the rest
+/// (lane scratch, a pair's heaps and score rows) a fire writes before it
+/// reads. Anything a fire leaves for a later one to read without such a
+/// lay belongs in the instance's tables ([`InstanceBinding::instance_slots`]),
+/// which a park copies byte for byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuestState {
-    /// Bytes an instance holds from bind to unbind, at rest included: launch tables,
-    /// status words, rings, anything a later fire reads. Placed at bind (today's
-    /// per_instance minus the value scratch).
+    /// Bytes an instance holds from bind to unbind (today's per_instance
+    /// minus the value scratch), dead between fires as the rest of the
+    /// state is: what of it a later fire reads, the engine lays again at
+    /// every bind and rebind. Status words, rings and anything else a fire
+    /// leaves for a later one lie in the instance's tables.
     #[serde(default)]
     pub resident: u64,
     /// Bytes ONE fire of the instance needs for its value scratch: dead outside that
@@ -441,6 +451,17 @@ pub enum Rebind {
         id: crate::channel::ChannelId,
         slots: Vec<u32>,
     },
+    /// Instance `id`'s process parked: the slots it was last bound or
+    /// rebound at are given back (its live parts copied down a tier, or
+    /// left where they lie with its scratch given back), and another owner
+    /// may take them once this returns. Sent after the park's copies have
+    /// landed and before any of those slots is handed out again. Until a
+    /// [`Rebind::Instance`] names where it lies again, no fire names it,
+    /// and the engine holds and writes nothing at its old slots: no claim
+    /// on them, nothing laid there (an evacuation repoints none of it, and
+    /// a pair none of whose instances is bound is laid by none), nothing
+    /// read.
+    Parked { id: InstanceId },
 }
 
 /// The `Channel` slots the runtime took for one of an instance's rings.
