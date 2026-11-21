@@ -2194,7 +2194,13 @@ impl Roles {
                     .iter()
                     .any(|id| instance(id).is_some_and(|instance| instance.holder == Some(holder)))
                     && item.attached.iter().all(|id| {
-                        instance(id).is_some_and(|instance| {
+                        // Gone (closed) holds it no longer: read as held, a
+                        // beam pair's scratch whose other copies had ended
+                        // never moved with the last one, and its chunk stayed
+                        // on the device for good (the L40S at 3 GiB on
+                        // c10d7de5d: chunk 17, a pair of 73 dead refs, its
+                        // evicted holder no candidate, the head one chunk short).
+                        instance(id).is_none_or(|instance| {
                             // Parked already: off the device, or parked
                             // where it lies (no room below, [`Item::shed`]).
                             instance.holder == Some(holder)
@@ -2483,16 +2489,49 @@ impl Roles {
     /// `disk_too`, is counted in host chunks: the room kv on the host
     /// moving on down to disk makes for it, older below newer.
     pub fn prepare_park_down(&mut self, holders: &[Holder], disk_too: bool) -> ParkDown {
-        let owners: Vec<Owner> = self
+        let mut owners: Vec<Owner> = self
             .parked_on_device()
             .filter(|(_, _, holder)| holders.contains(holder))
             .map(|(owner, ..)| owner)
             .collect();
+        // Left behind: a shared item (a pair, an adapter) still on the
+        // device that moves with one of these parked holders now, its other
+        // holders parked or gone since that holder's park (which left it,
+        // shared then). It goes down as a parked item does, its dead parts
+        // given back (the L40S at 3 GiB on c10d7de5d: a beam pair of 73 dead
+        // refs on chunk 17, its last holder evicted, the head one chunk
+        // short for good).
+        let behind: Vec<Owner> = self
+            .items
+            .iter()
+            .filter(|(owner, item)| {
+                matches!(owner, Owner::Pair(_) | Owner::Adapter(_))
+                    && item.tier == Tier::Device
+                    && !item.shed
+                    && holders.iter().any(|&holder| self.moves_with(**owner, item, holder))
+            })
+            .map(|(owner, _)| *owner)
+            .collect();
+        owners.extend(behind);
         let mut items = Vec::new();
         let mut below = Vec::new();
         let mut host_chunks = 0u64;
         for owner in owners {
             let parts = self.items[&owner].parts.clone();
+            // Nothing live: nothing to copy, its dead parts given back.
+            if parts.iter().all(Part::dead) {
+                let emptied: Vec<Part> = parts
+                    .iter()
+                    .map(|part| Part {
+                        refs: Vec::new(),
+                        ..part.clone()
+                    })
+                    .collect();
+                self.items.get_mut(&owner).expect("present").tier = Tier::Moving;
+                items.push((owner, emptied));
+                below.push(Tier::Host);
+                continue;
+            }
             let on_host = self
                 .host
                 .clone()

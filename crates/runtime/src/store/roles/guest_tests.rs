@@ -3192,3 +3192,32 @@ fn a_restore_s_need_and_standing_are_the_placement_of_every_piece_it_takes() {
     );
     drop(singles_part);
 }
+
+/// The L40S at 3 GiB on c10d7de5d: a beam pair's scratch (73 dead refs)
+/// stayed on chunk 17 for good: its first holder parked while the pair was
+/// still another's, that other then ended, and nothing moved the pair with
+/// the parked one. A move down for the parked holder takes it now, its dead
+/// parts given back.
+#[test]
+fn a_pair_left_behind_by_a_parked_holder_goes_with_its_move_down() {
+    let facts = facts(64);
+    let device = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
+    let roles: RolesHandle = Arc::new(Mutex::new(Roles::new(&device, None).unwrap()));
+    let mut engine = GuestEngine::new(2 * CHUNK, PAIR);
+    let before = held(&device);
+    let _first = bind(&roles, &mut engine, 1).unwrap();
+    let second = bind(&roles, &mut engine, 2).unwrap();
+    let park = roles.lock().unwrap().prepare_park(holder(1)).unwrap();
+    roles.lock().unwrap().commit(park);
+    // The other holder ends: the pair is the parked one's alone, on the device.
+    roles.lock().unwrap().close_instance(second);
+    let left = held(&device) - before;
+    let down = roles.lock().unwrap().prepare_park_down(&[holder(1)], true);
+    let txn = down.txn.expect("the pair left behind moves down with its parked holder");
+    roles.lock().unwrap().commit(txn);
+    assert!(
+        held(&device) - before < left,
+        "its dead slots given back: {} of {left} left",
+        held(&device) - before
+    );
+}
