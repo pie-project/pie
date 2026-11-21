@@ -112,6 +112,65 @@ pub(super) fn spawn_spill(
     }
 }
 
+/// Parked role slots left on the device go on down a tier, the host or the
+/// disk ([`crate::store::roles::Roles::prepare_park_down`]): their process is
+/// evicted, so no fire reads them; a failure leaves them where they lie.
+pub(super) fn spawn_park_down(
+    planner: Arc<ResidencyPlanner>,
+    roles: Option<RoleMove>,
+    rs: Option<RsResidencyTxn>,
+) {
+    let (model, engine) = planner.locus();
+    // The guard owns the move from here: a task that never runs drops it,
+    // and that gives back what the move took.
+    let guard = MoveGuard::new(
+        model,
+        engine,
+        Move::Suspend {
+            kv: None,
+            rs,
+            roles,
+        },
+    );
+    let task = {
+        let planner = planner.clone();
+        async move {
+            let moved = park_down(&planner, guard).await;
+            if let Err(error) = &moved {
+                tracing::warn!(%error, "planner: parked role slots could not move down");
+            }
+            planner.parked_down_done(moved.is_ok());
+        }
+    };
+    let spawned = spawn_watched(
+        planner.clone(),
+        ProcessId::nil(),
+        "park-down",
+        task,
+        |planner, _| planner.parked_down_done(false),
+    );
+    if !spawned {
+        planner.parked_down_done(false);
+    }
+}
+
+async fn park_down(planner: &ResidencyPlanner, mut guard: MoveGuard) -> Result<(), String> {
+    guard.copy(planner, ProcessId::nil()).await?;
+    let Move::Suspend { roles, rs, .. } = guard.take() else {
+        unreachable!("a park down is a move down")
+    };
+    let (model, engine) = planner.locus();
+    let stores = crate::store::registry::get(model, engine);
+    if let (Some(txn), Some(store)) = (roles, &stores.roles) {
+        store.lock().unwrap().commit(txn);
+    }
+    // An evicted process's state left on the device at its eviction.
+    if let Some(txn) = rs {
+        stores.rs.lock().unwrap().commit_suspend(txn);
+    }
+    Ok(())
+}
+
 /// Copies a spill's host slots to its disk slots (`copy_slots`, HostPinned
 /// -> LocalDisk) and commits it: answers the pages moved.
 pub(super) async fn spill(
@@ -311,16 +370,24 @@ impl Move {
         if let Some(rs) = rs.as_ref() {
             let plan = rs.copy_plan();
             // A shared pool's state moves shape by shape (CONTRACT-BC 22).
-            for (shape, pairs) in &plan.shared {
-                let (device, slots) = pairs.iter().copied().unzip();
-                copies.push(TierMove {
-                    kind: TierKind::RsSlots(*shape),
-                    tier: MemoryDomain::HostPinned,
-                    out,
-                    device,
-                    slots,
-                    source: None,
-                });
+            // With no host row free (no host tier on unified memory) it
+            // moves to the disk tier's slot file, laid out by shape too.
+            let tiers = [
+                (&plan.shared, MemoryDomain::HostPinned),
+                (&plan.disk, MemoryDomain::LocalDisk),
+            ];
+            for (moves, tier) in tiers {
+                for (shape, pairs) in moves {
+                    let (device, slots) = pairs.iter().copied().unzip();
+                    copies.push(TierMove {
+                        kind: TierKind::RsSlots(*shape),
+                        tier,
+                        out,
+                        device,
+                        slots,
+                        source: None,
+                    });
+                }
             }
         }
         // Instance tables and rings park with their process (never
@@ -328,7 +395,11 @@ impl Move {
         for copy in roles.iter().flat_map(RoleMove::copies) {
             copies.push(TierMove {
                 kind: TierKind::RoleSlots(copy.shape),
-                tier: MemoryDomain::HostPinned,
+                tier: if copy.disk {
+                    MemoryDomain::LocalDisk
+                } else {
+                    MemoryDomain::HostPinned
+                },
                 out,
                 device: copy.device.clone(),
                 slots: copy.host.clone(),
@@ -337,6 +408,71 @@ impl Move {
         }
         copies
     }
+}
+
+/// A dropped move whose copies were handed to the engine: aborted once
+/// they have landed and the engine says it settled them (`settled`), or,
+/// where it cannot, abandoned ([`abandon`]): either way it ends.
+async fn settle_or_abandon(
+    model: usize,
+    engine: usize,
+    in_flight: Vec<crate::scheduler::ControlCompletion>,
+    settled: impl std::future::Future<Output = anyhow::Result<()>>,
+    txn: Move,
+) {
+    let held = std::sync::Mutex::new(Some(txn));
+    let aborted = crate::scheduler::abort_once_landed(in_flight, settled, || {
+        if let Some(txn) = held.lock().unwrap().take() {
+            abort(model, engine, txn);
+        }
+    })
+    .await;
+    if let Err(error) = aborted {
+        if let Some(txn) = held.lock().unwrap().take() {
+            abandon(model, engine, txn, &error);
+        }
+        return;
+    }
+    if let Some(planner) = crate::planner::planner_for(model, engine) {
+        planner.pages_freed();
+    }
+}
+
+/// A move whose copies the engine could not settle: its kv and state
+/// pages stay out of reuse as before (a late copy may still write them),
+/// and its role items end their move where it found them, the slots taken
+/// for them leaked by name ([`crate::store::roles::Roles::abandon`]), so a
+/// pair's other holders never wait on it.
+fn abandon(model: usize, engine: usize, txn: Move, why: &str) {
+    let roles = match txn {
+        Move::Suspend { kv, rs, roles } | Move::Restore { kv, rs, roles } => {
+            // Kept out of reuse: dropped without an abort, their pages and
+            // slots are not given back.
+            drop((kv, rs));
+            roles
+        }
+    };
+    let stores = crate::store::registry::get(model, engine);
+    let (leaked, total) = match (roles, &stores.roles) {
+        (Some(txn), Some(store)) => {
+            let mut store = store.lock().unwrap();
+            let leaked = store.abandon(txn);
+            (leaked, store.leaked())
+        }
+        _ => (0, 0),
+    };
+    if let Some(planner) = crate::planner::planner_for(model, engine) {
+        planner.note_leaked(total);
+    }
+    tracing::error!(
+        model,
+        engine,
+        why,
+        leaked_role_slots = leaked,
+        "leaked: an engine could not settle the copies of an aborted move; its kv and \
+         state pages and the role slots it took stay out of service, and its items end \
+         their move where it found them"
+    );
 }
 
 fn abort(model: usize, engine: usize, txn: Move) {
@@ -448,22 +584,7 @@ impl Drop for MoveGuard {
         };
         crate::rt::spawn(async move {
             let settled = crate::scheduler::settle_copies(engine);
-            if let Err(error) =
-                crate::scheduler::abort_once_landed(in_flight, settled, || abort(model, engine, txn))
-                    .await
-            {
-                tracing::error!(
-                    model,
-                    engine,
-                    %error,
-                    "a residency move's copies did not settle; preserving its pages and \
-                     slots to avoid reuse under a copy"
-                );
-                return;
-            }
-            if let Some(planner) = crate::planner::planner_for(model, engine) {
-                planner.pages_freed();
-            }
+            settle_or_abandon(model, engine, in_flight, settled, txn).await;
         });
     }
 }
@@ -512,8 +633,11 @@ pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
         .as_ref()
         .is_some_and(|roles| roles.lock().unwrap().holds_guest_state(pid));
     if working_sets.is_empty() && rs_working_sets.is_empty() && !holds_guest {
+        // Nothing to move now is nothing to move on the next pass either:
+        // it is no victim again until the room changes (a restore clears
+        // the blocks), or the plan picked it again at once, forever.
         tracing::debug!(pid = %pid, "planner: eviction found no working set");
-        planner.eviction_failed(pid);
+        planner.eviction_found_nothing(pid);
         return;
     }
     let began = Instant::now();
@@ -548,9 +672,29 @@ pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     {
         tracing::warn!(pid = %pid, %error, "planner: host to disk spill failed");
     }
-    let prepared = crate::store::registry::with_kv_lock(&stores.kv, "planner-evict", |kv| {
-        kv.prepare_suspend(&working_sets)
-    });
+    // A set released while the eviction waited above (its pipeline ended,
+    // or failed and let it go) has nothing left to move: it is passed over,
+    // never an error. Named an unknown set, the whole eviction failed, the
+    // process went back resident and was picked again, its lanes held.
+    // With every set gone it moves only what else it holds, and with
+    // nothing it is "found nothing", its lanes released as any such.
+    let (working_sets, prepared) =
+        crate::store::registry::with_kv_lock(&stores.kv, "planner-evict", |kv| {
+            let live: HashSet<WorkingSetId> = working_sets
+                .iter()
+                .copied()
+                .filter(|&ws| kv.page_len(ws).is_ok())
+                .collect();
+            if live.len() < working_sets.len() {
+                tracing::debug!(
+                    pid = %pid,
+                    gone = working_sets.len() - live.len(),
+                    "planner: an eviction's sets released while it waited are passed over"
+                );
+            }
+            let prepared = kv.prepare_suspend(&live);
+            (live, prepared)
+        });
     let kv = match prepared {
         Ok(kv) => kv,
         Err(error @ KvStoreError::HostSwapFull { .. }) => {
@@ -808,8 +952,15 @@ async fn restore(
             // Room the budget holds but nothing has freed yet: the restore
             // waits, queued, as an admission does.
             if let Some(need) = error.unpark_runs() {
-                tracing::debug!(%pid, %error, "planner: a restore waits for room for its roles");
-                planner.requeue_restore_roles(pid, need);
+                tracing::debug!(
+                    %pid,
+                    %error,
+                    ?error,
+                    ?need,
+                    "planner: a restore waits for room for its roles"
+                );
+                planner.requeue_restore_roles(pid, need, error.unpark_free_runs());
+                planner.note_roles_short_why(pid, format!("{error:?}"));
                 return;
             }
             // Its pair is on its way back with another process's restore:
@@ -864,7 +1015,7 @@ async fn restore(
     {
         abort(model, engine, Move::Restore { kv, rs, roles });
         tracing::debug!(%pid, "planner: a restore waits for room for its pending bind");
-        planner.requeue_restore_roles(pid, (need.run, need.pieces));
+        planner.requeue_restore_roles(pid, (need.run, need.pieces), None);
         return;
     }
     let mut guard = MoveGuard::new(model, engine, Move::Restore { kv, rs, roles });
@@ -906,6 +1057,24 @@ async fn restore(
         if let Err(error) = rebind(engine, store, pid).await {
             planner.restore_failed(pid, &error);
             return;
+        }
+        // An instance its rebinds could not name yet (its pair still on its
+        // way back with another process's restore) is bound once that move
+        // lands: the process is not resident until then, so no fire of it
+        // runs on the places it gave back at its park. Each change of the
+        // roles (a move committed or aborted) looks again.
+        loop {
+            let watch = store.lock().unwrap().room_watch();
+            let unbound = store.lock().unwrap().unbound(pid);
+            if unbound.is_empty() {
+                break;
+            }
+            tracing::debug!(%pid, ?unbound, "planner: a restore waits for its instances' rebinds");
+            watch.freed().await;
+            if let Err(error) = rebind(engine, store, pid).await {
+                planner.restore_failed(pid, &error);
+                return;
+            }
         }
     }
     ptrace!(
@@ -1003,5 +1172,98 @@ impl Drop for PersistGuard {
                  keeping its slots to avoid reuse during the copy"
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod abandon_tests {
+    use super::*;
+    use crate::store::roles::tests::{FakeEngine, PROGRAM, holder, pools};
+    use crate::store::roles::{RolesError, bind_instance, learn_program};
+
+    /// A restore's move whose copies the engine cannot settle (its
+    /// `settle_copies` fails): the dropped move takes the abandon path. It
+    /// ends, each item where it lay; the slots it took are leaked by name and
+    /// counted in the planner's status; and both holders' restores go after
+    /// it, the planner serving on.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_move_the_engine_cannot_settle_ends_its_slots_leaked_and_counted() {
+        let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+        let pools = pools();
+        let model = crate::store::registry::register_model_with_chunks(
+            16,
+            &[crate::store::registry::EngineStores {
+                shared: Some(pools.device.clone()),
+                tiers: crate::store::shared::Tiers {
+                    host: Some(pools.host.clone()),
+                    disk_slots: 0,
+                    disk_chunk_slots: 0,
+                },
+                max_context: 256,
+                ..Default::default()
+            }],
+        );
+        let planner = super::super::ResidencyPlanner::new(Arc::new(
+            super::super::pool::RegistryPool::new(model, 0, true),
+        ));
+        super::super::global::init_planner(model, 0, planner);
+        let roles = crate::store::registry::get(model, 0).roles.expect("roles");
+        let mut engine = FakeEngine::default();
+        learn_program(&roles, &mut engine, PROGRAM).unwrap();
+        let mut ids = Vec::new();
+        for by in [1, 2] {
+            let binding = ::engine::InstanceBinding {
+                program: PROGRAM,
+                ..::engine::InstanceBinding::default()
+            };
+            ids.push(
+                bind_instance(Some(&roles), &mut engine, &binding, Some(holder(by)), |_| false)
+                    .unwrap()
+                    .id,
+            );
+        }
+        for by in [1, 2] {
+            let park = roles.lock().unwrap().prepare_park(holder(by)).unwrap();
+            roles.lock().unwrap().commit(park);
+        }
+        // The first's restore: its copies handed to the engine, never settled.
+        let unpark = roles
+            .lock()
+            .unwrap()
+            .prepare_unpark(holder(1))
+            .unwrap()
+            .expect("it unparks");
+        let txn = Move::Restore {
+            kv: None,
+            rs: None,
+            roles: Some(unpark),
+        };
+        settle_or_abandon(model, 0, Vec::new(), async {
+            Err(anyhow::anyhow!("the device was lost"))
+        }, txn)
+        .await;
+        let leaked = roles.lock().unwrap().leaked();
+        assert!(leaked > 0, "the slots it took, leaked");
+        let planner = super::super::global::planner_for(model, 0).expect("the planner");
+        assert_eq!(
+            planner.stats.leaked_role_slots.load(std::sync::atomic::Ordering::Relaxed),
+            leaked,
+            "counted in the status"
+        );
+        assert_eq!(planner.diagnostics().leaked_role_slots_total, leaked);
+        // The move ended: both restores go.
+        for by in [1, 2] {
+            let back = roles.lock().unwrap().prepare_unpark(holder(by));
+            assert!(
+                !matches!(back, Err(RolesError::PairParked(_))),
+                "nothing moves now"
+            );
+            let back = back.expect("it unparks").expect("it comes back");
+            roles.lock().unwrap().commit(back);
+        }
+        for id in ids {
+            roles.lock().unwrap().close_instance(id);
+        }
+        assert_eq!(roles.lock().unwrap().leaked(), leaked, "still out of service");
     }
 }

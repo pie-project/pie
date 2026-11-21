@@ -146,6 +146,47 @@ fn take_landing(
     taken
 }
 
+/// Closes instance `id`'s books on the lane once the engine answered its
+/// close (`closed`, the standing guest bytes it states after): its channels
+/// unbound, its role items closed (its slots go back once no step on its
+/// way names them, and a pair, channel or adapter it shares is held by it
+/// no more), and the pool told. A close the engine refused (an instance a
+/// failed fire left unusable) is closed all the same: in the engine's eyes
+/// no fire of it can run again. Kept, a failed process's items stayed on
+/// the device and in its pair for good (Mac Pro's M5: pairs of dead
+/// processes on the device and the host, a 6-chunk bind short with 1850
+/// chunks free).
+pub(crate) fn close_books(
+    id: ::engine::InstanceId,
+    closed: anyhow::Result<u64>,
+    channels: &mut crate::engine::channel::ChannelJoin,
+    roles: Option<&crate::store::roles::RolesHandle>,
+    shared: Option<&crate::store::shared::Shared>,
+) {
+    let standing = match closed {
+        Ok(standing) => Some(standing),
+        Err(err) => {
+            tracing::warn!(
+                instance_id = id.0,
+                ?err,
+                "scheduler close_instance failed; its slots go back all the same"
+            );
+            None
+        }
+    };
+    channels.unbind(id);
+    if let Some(roles) = roles {
+        roles.lock().unwrap().close_instance(id);
+    }
+    if let Some(shared) = shared {
+        let mut pool = shared.lock().unwrap();
+        pool.instance_closed(id);
+        if let Some(standing) = standing {
+            pool.standing_stated(standing);
+        }
+    }
+}
+
 fn roles_of(engine_idx: usize) -> Option<crate::store::roles::RolesHandle> {
     crate::store::registry::try_get(0, engine_idx).and_then(|stores| stores.roles)
 }
@@ -1428,50 +1469,17 @@ impl Lane {
                 LaneCommit::None
             }
             QueuedItem::CloseInstance { id, .. } => {
-                match backend(engine)
-                    .and_then(|engine| engine.close_instance(id).map_err(anyhow::Error::from))
-                {
-                    Ok(standing) => {
-                        channels.unbind(id);
-                        if let Some(roles) = roles_of(engine_idx) {
-                            roles.lock().unwrap().close_instance(id);
-                        }
-                        if let Some(shared) =
-                            crate::store::registry::try_get(0, engine_idx).and_then(|s| s.shared)
-                        {
-                            let mut pool = shared.lock().unwrap();
-                            pool.instance_closed(id);
-                            pool.standing_stated(standing);
-                        }
-                        LaneCommit::CloseInstance { id }
-                    }
-                    // The engine refused the close (an instance a failed
-                    // fire left unusable): it is closed all the same, here
-                    // as in the engine's eyes no fire of it can run again,
-                    // so its slots go back once no step on its way names it
-                    // (the roles' reads), and a pair it shares is held by
-                    // it no more. Kept, a failed process's items stayed on
-                    // the device and in its pair for good (Mac Pro's M5:
-                    // pairs of dead processes on the device and the host,
-                    // a 6-chunk bind short with 1850 chunks free).
-                    Err(err) => {
-                        tracing::warn!(
-                            instance_id = id.0,
-                            ?err,
-                            "scheduler close_instance failed; its slots go back all the same"
-                        );
-                        channels.unbind(id);
-                        if let Some(roles) = roles_of(engine_idx) {
-                            roles.lock().unwrap().close_instance(id);
-                        }
-                        if let Some(shared) =
-                            crate::store::registry::try_get(0, engine_idx).and_then(|s| s.shared)
-                        {
-                            shared.lock().unwrap().instance_closed(id);
-                        }
-                        LaneCommit::CloseInstance { id }
-                    }
-                }
+                let closed = backend(engine)
+                    .and_then(|engine| engine.close_instance(id).map_err(anyhow::Error::from));
+                let shared = crate::store::registry::try_get(0, engine_idx).and_then(|s| s.shared);
+                close_books(
+                    id,
+                    closed,
+                    channels,
+                    roles_of(engine_idx).as_ref(),
+                    shared.as_ref(),
+                );
+                LaneCommit::CloseInstance { id }
             }
             QueuedItem::CloseChannels { ids } => {
                 for id in ids {

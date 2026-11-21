@@ -459,6 +459,15 @@ impl KvStore {
         self.disk_pool = Pool::new(disk_slots);
     }
 
+    /// Calls `signal` each time host or disk slots come free: room a
+    /// waiter blocked on swap room (a victim's move with no slot below)
+    /// waits on.
+    pub fn set_room_signal(&mut self, signal: super::slots::RoomSignal) {
+        self.host_pool
+            .set_room_signal(signal.clone(), super::slots::RoomTier::Swap);
+        self.disk_pool.set_room_signal(signal);
+    }
+
     pub fn set_domain(&mut self, domain: Hash256) {
         self.domain = domain;
     }
@@ -1218,6 +1227,98 @@ impl KvStore {
         })
     }
 
+    /// `n` whole disk chunks of the slot file for something other than kv
+    /// (a parked role's slots, laid out in a chunk of their own shape as on
+    /// the device, CONTRACT-BC 22, [`crate::store::roles::DiskSlots`]), a
+    /// disk chunk `per_chunk` kv slots, as chunk ids, all or none: counted
+    /// out of the disk's room as kv's are.
+    pub fn take_disk_chunks(&mut self, n: usize, per_chunk: u32) -> Option<Vec<u32>> {
+        let per_chunk = per_chunk.max(1);
+        let firsts = self.disk_pool.try_alloc_aligned_runs(n, per_chunk)?;
+        self.below_cached.set(None);
+        Some(firsts.into_iter().map(|slot| slot.0 / per_chunk).collect())
+    }
+
+    /// The disk tier's free slots, idle cache's not counted.
+    #[must_use]
+    pub fn disk_free_slots(&self) -> usize {
+        self.disk_pool.available()
+    }
+
+    /// Chunks [`Self::take_disk_chunks`] took, free again.
+    pub fn give_disk_chunks(&mut self, chunks: &[u32], per_chunk: u32) {
+        let per_chunk = per_chunk.max(1);
+        let firsts: Vec<DiskKvSlotId> = chunks
+            .iter()
+            .map(|&chunk| DiskKvSlotId(chunk * per_chunk))
+            .collect();
+        self.disk_pool.release_runs(&firsts, per_chunk);
+        self.below_cached.set(None);
+    }
+
+    /// Parked sets' pages on the host going on down to disk, the sets of
+    /// `order` first (the victim order: what would be evicted first), until
+    /// `wanted` pages go or the disk is full: host room for a parked
+    /// process's role slots, older parked kv going below the newer role
+    /// state. A page the disk tier keeps a copy of
+    /// settles on it, nothing copied; a page another move holds stays.
+    /// `None` when nothing goes.
+    pub fn prepare_parked_spill(
+        &mut self,
+        wanted: usize,
+        order: &[WorkingSetId],
+    ) -> Option<KvSpillTxn> {
+        let shape = self.shape?;
+        let mut room = self.disk_pool.available();
+        let mut pages: Vec<(TriePageLocation, HostKvSlotId)> = Vec::new();
+        let mut taken: HashSet<TriePageLocation> = HashSet::new();
+        for &ws in order {
+            if pages.len() >= wanted || room == 0 {
+                break;
+            }
+            let Ok(swapped) = self.table.swapped_pages(&HashSet::from([ws])) else {
+                continue;
+            };
+            let mut group: Vec<(TriePageLocation, HostKvSlotId)> = swapped
+                .into_iter()
+                .filter_map(|(location, backing)| match backing {
+                    KvPageBacking::Swapped(host) => Some((location, host)),
+                    _ => None,
+                })
+                .filter(|&(location, _)| {
+                    !taken.contains(&location) && !self.table.page_location_pinned(location)
+                })
+                .collect();
+            let before = group.len();
+            self.settle_host_on_disk(&mut group);
+            let settled = before - group.len();
+            group.truncate(room.min(wanted.saturating_sub(pages.len() + settled)));
+            room -= group.len();
+            taken.extend(group.iter().map(|&(at, _)| at));
+            pages.extend(group);
+        }
+        self.below_cached.set(None);
+        if pages.is_empty() {
+            return None;
+        }
+        let disk = self
+            .disk_pool
+            .try_alloc_n(pages.len())
+            .expect("counted above");
+        self.table
+            .pin_swap_locations(pages.iter().map(|&(location, _)| location));
+        tracing::debug!(target: "pie::kv", pages = pages.len(), "parked kv host to disk");
+        Some(KvSpillTxn {
+            pages: pages
+                .into_iter()
+                .zip(disk)
+                .map(|((location, host), disk)| (location, host, disk))
+                .collect(),
+            shape,
+            records: HashMap::new(),
+        })
+    }
+
     /// The spill that makes host room for suspending `working_sets`, where
     /// the host is short of it: host room is for what is paused before what
     /// is cached, and cache that goes on down to disk is not dropped.
@@ -1793,6 +1894,8 @@ impl KvStore {
         }
         let freed = self.table.release_working_set_backings(ws);
         self.recycle_backings(freed, epoch);
+        // What no fire in flight reads is free now, not at a next fire.
+        self.retire_idle();
         self.flat.remove(&ws);
         self.note_cached();
     }

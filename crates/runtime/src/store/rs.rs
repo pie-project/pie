@@ -251,6 +251,98 @@ impl RsGrant {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RsCopyPlan {
     pub shared: Vec<(::engine::chunk::ShapeId, Vec<(u32, u32)>)>,
+    /// The same, `(device, disk)`: slot refs of the disk tier's slot file,
+    /// a disk chunk laid out as a device chunk of the shape, where no host
+    /// tier holds the state ([`RsStore::set_disk`]).
+    pub disk: Vec<(::engine::chunk::ShapeId, Vec<(u32, u32)>)>,
+}
+
+/// The first id of a disk row ([`RsStore::set_disk`]): past every host
+/// pool's ids.
+const DISK_ROWS: u32 = 1 << 30;
+
+/// The disk tier a shared pool's state parks on where no host tier holds
+/// it (a load on unified memory states none, so an evicted process's
+/// records and rs list slots kept their device chunks): whole chunks of the
+/// slot file, each laid out as a device chunk of one shape (CONTRACT-BC 22),
+/// counted against the disk's budget with kv's.
+struct RsDisk {
+    slots: std::sync::Arc<dyn crate::store::roles::DiskSlots>,
+    /// The slots of each engine shape a disk chunk holds, as a device chunk.
+    per_chunk: HashMap<::engine::chunk::ShapeId, u32>,
+    /// Each shape's disk chunks and the slots free in each.
+    chunks: HashMap<::engine::chunk::ShapeId, BTreeMap<u32, BTreeSet<u32>>>,
+    rows: HashMap<RsSlotId, DiskRow>,
+    free_ids: Vec<u32>,
+    next: u32,
+    /// A record's shapes and its pieces of each; the pages' shape (the rs
+    /// list's, or window list 0's); window lists 1..'s.
+    records: Vec<(::engine::chunk::ShapeId, u32)>,
+    lists: Vec<::engine::chunk::ShapeId>,
+}
+
+/// A device slot parked on disk: what it was (a window list's slot, a
+/// page, a record) and its disk refs by shape.
+struct DiskRow {
+    list: Option<usize>,
+    page: bool,
+    refs: Vec<(::engine::chunk::ShapeId, Vec<u32>)>,
+}
+
+impl RsDisk {
+    /// `n` free slots of `shape` in its disk chunks, opening whole chunks
+    /// for what they lack; all or none.
+    fn take(&mut self, shape: ::engine::chunk::ShapeId, n: usize) -> Option<Vec<u32>> {
+        let per_chunk = *self.per_chunk.get(&shape)?;
+        let chunks = self.chunks.entry(shape).or_default();
+        let free: usize = chunks.values().map(BTreeSet::len).sum();
+        if free < n {
+            let opened = (n - free).div_ceil(per_chunk as usize);
+            for chunk in self.slots.take_chunks(opened)? {
+                chunks.insert(chunk, (0..per_chunk).collect());
+            }
+        }
+        let mut refs = Vec::with_capacity(n);
+        for (&chunk, slots) in chunks.iter_mut() {
+            while refs.len() < n {
+                let Some(index) = slots.pop_first() else {
+                    break;
+                };
+                refs.push(chunk * per_chunk + index);
+            }
+            if refs.len() == n {
+                break;
+            }
+        }
+        Some(refs)
+    }
+
+    /// `refs` of `shape` free again; a chunk wholly free goes back to the
+    /// slot file.
+    fn give(&mut self, shape: ::engine::chunk::ShapeId, refs: &[u32]) {
+        let Some(&per_chunk) = self.per_chunk.get(&shape) else {
+            return;
+        };
+        let chunks = self.chunks.entry(shape).or_default();
+        let mut emptied = Vec::new();
+        for &slot in refs {
+            let (chunk, index) = (slot / per_chunk, slot % per_chunk);
+            if let Some(free) = chunks.get_mut(&chunk) {
+                free.insert(index);
+                if free.len() == per_chunk as usize {
+                    emptied.push(chunk);
+                }
+            }
+        }
+        emptied.sort_unstable();
+        emptied.dedup();
+        for chunk in &emptied {
+            chunks.remove(chunk);
+        }
+        if !emptied.is_empty() {
+            self.slots.give_chunks(&emptied);
+        }
+    }
 }
 
 /// What a set holds, in its own numbering: see [`RsEntry`].
@@ -353,6 +445,9 @@ pub struct RsStore {
     /// whatever a set's geometry says, and the buffer starts at a multiple
     /// of it.
     rs_tokens: Option<u32>,
+    /// The disk tier state parks on where no host row is free
+    /// ([`Self::set_disk`]).
+    disk: Option<RsDisk>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -524,7 +619,201 @@ impl RsStore {
             moved: std::sync::Arc::new(tokio::sync::Notify::new()),
             device_folded: std::sync::Arc::new(tokio::sync::Notify::new()),
             rs_tokens: None,
+            disk: None,
         }
+    }
+
+    /// Parks on `disk` too, the disk tier's slot file, where no host row is
+    /// free (no host tier at all on unified memory): each record's pieces
+    /// and each rs list or window slot in disk chunks of its own shape, as
+    /// the engine lays them out (CONTRACT-BC 22). Without it an evicted
+    /// process's state stayed on the device, its chunks held.
+    pub fn set_disk(&mut self, shared: &Shared, disk: std::sync::Arc<dyn crate::store::roles::DiskSlots>) {
+        if !self.is_shared() && self.window.is_empty() {
+            return;
+        }
+        let (per_chunk, records, lists) = {
+            let pool = shared.lock().unwrap();
+            let records: Vec<(::engine::chunk::ShapeId, u32)> =
+                pool.fixed().iter().map(|shape| (shape.id, shape.pieces)).collect();
+            let lists: Vec<::engine::chunk::ShapeId> = pool
+                .rs_list()
+                .map(|list| list.id)
+                .into_iter()
+                .chain(pool.windows().iter().map(|list| list.id))
+                .collect();
+            let engines: Vec<::engine::chunk::ShapeId> = pool
+                .fixed()
+                .iter()
+                .map(|shape| shape.id)
+                .chain(pool.rs_list().map(|list| list.id))
+                .chain(pool.windows().iter().map(|list| list.id))
+                .collect();
+            let per_chunk = engines
+                .into_iter()
+                .filter_map(|engine| {
+                    let shape = pool.pool_shape(engine)?;
+                    let per_chunk = pool.pool().shape(shape)?.slots_per_chunk;
+                    (per_chunk > 0).then_some((engine, per_chunk))
+                })
+                .collect();
+            (per_chunk, records, lists)
+        };
+        debug_assert!(
+            std::iter::once(&self.host_slots)
+                .chain([&self.host_pages])
+                .chain(&self.host_windows)
+                .all(|pool| pool.ids_end() < DISK_ROWS),
+            "host ids reach the disk rows'"
+        );
+        self.disk = Some(RsDisk {
+            slots: disk,
+            per_chunk,
+            chunks: HashMap::new(),
+            rows: HashMap::new(),
+            free_ids: Vec::new(),
+            next: 0,
+            records,
+            lists,
+        });
+    }
+
+    /// The disk tier's slot file, where state parks on it: what its free
+    /// room is read from, outside this store's lock.
+    #[must_use]
+    pub fn disk_slots(&self) -> Option<std::sync::Arc<dyn crate::store::roles::DiskSlots>> {
+        self.disk.as_ref().map(|disk| disk.slots.clone())
+    }
+
+    /// The rows the disk tier takes, `free_chunks` of its chunks free: for
+    /// each shape, the free chunks at that shape's slots a chunk (a disk
+    /// chunk holds any shape, CONTRACT-BC 22) and the free slots of its
+    /// partly used disk chunks; records by their pieces of each shape. What
+    /// a victim's state finds room in below the device where no host row is
+    /// free.
+    #[must_use]
+    pub fn disk_units(&self, free_chunks: u32) -> RsUnits {
+        let Some(disk) = self.disk.as_ref() else {
+            return RsUnits::default();
+        };
+        let share = u64::from(free_chunks);
+        let room = |shape: ::engine::chunk::ShapeId| -> u64 {
+            let open: u64 = disk
+                .chunks
+                .get(&shape)
+                .map_or(0, |chunks| chunks.values().map(|free| free.len() as u64).sum());
+            open + share * u64::from(disk.per_chunk.get(&shape).copied().unwrap_or(0))
+        };
+        let clamp = |n: u64| u32::try_from(n).unwrap_or(u32::MAX);
+        let slots = disk
+            .records
+            .iter()
+            .map(|&(shape, pieces)| room(shape) / u64::from(pieces.max(1)))
+            .min()
+            .map_or(0, clamp);
+        if self.is_window() {
+            let mut windows = [0; MAX_WINDOW_LISTS];
+            for (out, &shape) in windows.iter_mut().zip(&disk.lists) {
+                *out = clamp(room(shape));
+            }
+            return RsUnits::of_windows(windows);
+        }
+        let pages = disk.lists.first().map_or(0, |&shape| clamp(room(shape)));
+        RsUnits::of(slots, pages)
+    }
+
+    /// Whether `id` is a disk row.
+    fn is_disk(&self, id: RsSlotId) -> bool {
+        id.0 >= DISK_ROWS
+    }
+
+    /// Whether `id` is a disk row: its state lies in the disk tier.
+    #[must_use]
+    pub fn on_disk(&self, id: RsSlotId) -> bool {
+        self.is_disk(id)
+    }
+
+    /// Disk rows for each of `ids` (device slots), in order; none unless
+    /// all fit.
+    fn take_disk_rows(&mut self, ids: &[RsSlotId]) -> Option<Vec<RsSlotId>> {
+        self.disk.as_ref()?;
+        let rows: Vec<(Option<usize>, bool, Vec<(::engine::chunk::ShapeId, Vec<u32>)>)> = ids
+            .iter()
+            .map(|&id| (self.list_of(id), self.is_page(id), self.pool_of(id).slot_refs(id)))
+            .collect();
+        let disk = self.disk.as_mut()?;
+        let mut taken: Vec<RsSlotId> = Vec::with_capacity(ids.len());
+        let mut failed = false;
+        'rows: for (list, page, device) in rows {
+            let mut refs = Vec::with_capacity(device.len());
+            for (shape, slots) in &device {
+                match disk.take(*shape, slots.len()) {
+                    Some(at) => refs.push((*shape, at)),
+                    None => {
+                        for (shape, at) in &refs {
+                            disk.give(*shape, at);
+                        }
+                        failed = true;
+                        break 'rows;
+                    }
+                }
+            }
+            let index = disk.free_ids.pop().unwrap_or_else(|| {
+                disk.next += 1;
+                disk.next - 1
+            });
+            let id = RsSlotId(DISK_ROWS + index);
+            disk.rows.insert(id, DiskRow { list, page, refs });
+            taken.push(id);
+        }
+        if failed {
+            self.give_disk_rows(taken);
+            return None;
+        }
+        Some(taken)
+    }
+
+    /// Disk rows free again, their slots back in their disk chunks.
+    fn give_disk_rows(&mut self, ids: impl IntoIterator<Item = RsSlotId>) {
+        let Some(disk) = self.disk.as_mut() else {
+            return;
+        };
+        for id in ids {
+            if let Some(row) = disk.rows.remove(&id) {
+                for (shape, refs) in &row.refs {
+                    disk.give(*shape, refs);
+                }
+                disk.free_ids.push(id.0 - DISK_ROWS);
+            }
+        }
+    }
+
+    /// The disk rows parked state holds.
+    #[must_use]
+    #[cfg(test)]
+    pub fn disk_rows(&self) -> usize {
+        self.disk.as_ref().map_or(0, |disk| disk.rows.len())
+    }
+
+    /// The refs of an off-device row (a host row, or a disk row), by shape.
+    fn row_refs(&self, id: RsSlotId) -> Vec<(::engine::chunk::ShapeId, Vec<u32>)> {
+        if self.is_disk(id) {
+            return self
+                .disk
+                .as_ref()
+                .and_then(|disk| disk.rows.get(&id))
+                .map(|row| row.refs.clone())
+                .unwrap_or_default();
+        }
+        self.host_pool_of(id).slot_refs(id)
+    }
+
+    /// The disk row `id`, where it is one.
+    fn disk_row(&self, id: RsSlotId) -> Option<&DiskRow> {
+        if !self.is_disk(id) {
+            return None;
+        }
+        self.disk.as_ref()?.rows.get(&id)
     }
 
     /// In a shared pool, records that waiters are short `need` of each of
@@ -625,6 +914,9 @@ impl RsStore {
         if self.window.is_empty() {
             return None;
         }
+        if let Some(row) = self.disk_row(id) {
+            return row.list;
+        }
         if self.pages.owns(id) || self.host_pages.contains(id) {
             return Some(0);
         }
@@ -680,6 +972,9 @@ impl RsStore {
     }
 
     fn is_page(&self, id: RsSlotId) -> bool {
+        if let Some(row) = self.disk_row(id) {
+            return row.page;
+        }
         (id.0 >= self.pages_at && id.0 < self.host_slots.base())
             || self.host_pages.contains(id)
             || self.host_window(id).is_some()
@@ -744,7 +1039,11 @@ impl RsStore {
 
     fn release_host(&mut self, ids: impl IntoIterator<Item = RsSlotId>) {
         for id in ids {
-            self.host_pool(id).release_reserved(vec![id]);
+            if self.is_disk(id) {
+                self.give_disk_rows([id]);
+            } else {
+                self.host_pool(id).release_reserved(vec![id]);
+            }
         }
     }
 
@@ -805,7 +1104,7 @@ impl RsStore {
     /// Whether `id` is a host row already.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn on_host(&self, id: RsSlotId) -> bool {
-        self.is_host(id)
+        self.is_host(id) && !self.is_disk(id)
     }
 
     /// Host rows for a read or a write that is none of the planner's: state
@@ -839,7 +1138,7 @@ impl RsStore {
     pub fn tier_refs(&self, rows: &[RsSlotId]) -> Vec<(::engine::chunk::ShapeId, Vec<u32>)> {
         let mut out: Vec<(::engine::chunk::ShapeId, Vec<u32>)> = Vec::new();
         for &row in rows {
-            for (shape, refs) in self.host_pool_of(row).slot_refs(row) {
+            for (shape, refs) in self.row_refs(row) {
                 match out.last_mut() {
                     Some((last, all)) if *last == shape => all.extend(refs),
                     _ => out.push((shape, refs)),
@@ -858,7 +1157,7 @@ impl RsStore {
     ) -> Vec<(::engine::chunk::ShapeId, Vec<(u32, u32)>)> {
         let mut out: Vec<(::engine::chunk::ShapeId, Vec<(u32, u32)>)> = Vec::new();
         for &(device, host) in moves {
-            let host_refs = self.host_pool_of(host).slot_refs(host);
+            let host_refs = self.row_refs(host);
             for ((shape, device), (_, host)) in self
                 .pool_of(device)
                 .slot_refs(device)
@@ -2202,6 +2501,20 @@ impl RsStore {
             .collect()
     }
 
+    /// The device slots `working_sets` alone hold (what a suspend of them
+    /// takes along), as the engine's slot refs by shape: what holds their
+    /// chunks, for a map of what evicting their process empties.
+    #[must_use]
+    pub fn private_slot_refs(
+        &self,
+        working_sets: &HashSet<RsWorkingSetId>,
+    ) -> Vec<(::engine::chunk::ShapeId, Vec<u32>)> {
+        self.private(working_sets)
+            .into_iter()
+            .flat_map(|id| self.pool_of(id).slot_refs(id))
+            .collect()
+    }
+
     pub fn suspendable(&self, working_sets: &HashSet<RsWorkingSetId>) -> RsUnits {
         self.units(self.private(working_sets))
     }
@@ -2280,7 +2593,12 @@ impl RsStore {
         if slots.is_empty() {
             return None;
         }
-        let host = self.take_host_rows(&slots)?;
+        // Host rows where the host holds them all, else disk rows: with no
+        // host tier (unified memory) the state goes straight to disk.
+        let host = match self.take_host_rows(&slots) {
+            Some(host) => host,
+            None => self.take_disk_rows(&slots)?,
+        };
         self.moving.extend(slots.iter().copied());
         let scope = self.with_sharing(working_sets);
         Some(self.txn(&scope, slots.into_iter().zip(host).collect()))
@@ -2320,7 +2638,12 @@ impl RsStore {
             } else {
                 (from, to)
             };
-            let host_refs = self.host_pool_of(host).slot_refs(host);
+            let host_refs = self.row_refs(host);
+            let into = if self.is_disk(host) {
+                &mut plan.disk
+            } else {
+                &mut plan.shared
+            };
             for ((shape, device), (_, host)) in self
                 .pool_of(device)
                 .slot_refs(device)
@@ -2328,9 +2651,9 @@ impl RsStore {
                 .zip(host_refs)
             {
                 let pairs: Vec<(u32, u32)> = device.into_iter().zip(host).collect();
-                match plan.shared.iter_mut().find(|(at, _)| *at == shape) {
+                match into.iter_mut().find(|(at, _)| *at == shape) {
                     Some((_, all)) => all.extend(pairs),
-                    None => plan.shared.push((shape, pairs)),
+                    None => into.push((shape, pairs)),
                 }
             }
         }
@@ -2616,6 +2939,11 @@ impl RsStore {
             let epoch = self.newest_touch(id).unwrap_or(settled);
             self.recycle(vec![id], epoch);
         }
+        // What no fire in flight reads is free now, its chunk with it once
+        // empty: left waiting for the next fire's settle, it held its chunk
+        // for its shape while nothing fired (a head short of whole chunks,
+        // every owner moved, the scheduler silent).
+        self.retire_idle();
         freed
     }
 
@@ -2675,6 +3003,7 @@ impl RsStore {
                 .map_or(self.seq, |&oldest| oldest - 1)
         });
         self.recycle(vec![id], epoch);
+        self.retire_idle();
         true
     }
 }
