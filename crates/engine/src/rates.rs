@@ -1396,6 +1396,7 @@ mod tests {
             attn_tflops_by_rows_keys: None,
             product_ns: None,
             kernel_tflops_by_shape: None,
+            dense_settled: None,
         }
     }
 
@@ -2250,6 +2251,7 @@ mod tests {
             attn_tflops_by_rows_keys: None,
             product_ns: None,
             kernel_tflops_by_shape: None,
+            dense_settled: None,
         };
         assert_eq!(tuned(&rates), rates.toml());
         let (key, text) = provenance("vulkan", "the matmul through Coopmat");

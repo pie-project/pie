@@ -92,6 +92,30 @@ pub fn measure(
     engine_gpu::rates::measure::<Api, _>(device, tuning, tier, &timer, max_submit, stated)
 }
 
+/// `rates` saved into the user's profile under `profiles` for this device
+/// (`engine::rates::save_rates`), where a load names a profile directory.
+pub fn save_rates(
+    device: &Context,
+    profiles: Option<&std::path::Path>,
+    rates: &profile::fire::Rates,
+) -> Result<()> {
+    let Some(profiles) = profiles else {
+        return Ok(());
+    };
+    let measured = device.chip();
+    let save = engine::rates::SaveTo {
+        path: crate::chip::SHELF.user_path(profiles, &measured.name),
+        provenance: provenance(&measured.name),
+        registry: crate::chip::registry(),
+    };
+    engine::rates::save_rates(&save, rates)
+        .map(drop)
+        .map_err(|why| engine_gpu::Fault::Device {
+            call: "rates at load",
+            why,
+        })
+}
+
 /// `tuning` with each dense kernel's curve at each of the model's `shapes`
 /// to `top_rows` (`engine_gpu::rates::shapes_at_load`), saved to the user's
 /// profile under `profiles`, each timed frame under `max_submit` where the
@@ -112,7 +136,10 @@ pub fn shapes_at_load(
     let timer = |frame: Frame| {
         let started = std::time::Instant::now();
         let span = frame.commit_spanned()?;
-        Ok((span.filter(|&ns| ns > 0), started.elapsed().as_nanos() as u64))
+        Ok((
+            span.filter(|&ns| ns > 0),
+            started.elapsed().as_nanos() as u64,
+        ))
     };
     let measured = device.chip();
     let save = profiles.map(|profiles| engine::rates::SaveTo {

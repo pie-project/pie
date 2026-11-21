@@ -441,6 +441,14 @@ impl<B: Serve> Serve for Named<B> {
         Err(Fault::Deviceless)
     }
 
+    fn save_rates(
+        _device: &Self::Context,
+        _boot: &Self::DeviceBoot,
+        _rates: &profile::fire::Rates,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     fn rate_shapes(
         _device: &Facts,
         _boot: &B::DeviceBoot,

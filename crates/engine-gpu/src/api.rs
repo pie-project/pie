@@ -976,6 +976,17 @@ where
         // taken kernel binds is built by a second bind walk, and what either
         // walked is the load's.
         shell.settle_dense().map_err(fault)?;
+        // The settle this load ran, kept in the user's profile for a later
+        // load of the same curves, model, rungs and build.
+        if let Some(settled) = shell.take_settled() {
+            let rates = profile::fire::Rates {
+                dense_settled: Some(settled),
+                ..profile::fire::Rates::default()
+            };
+            if let Err(why) = B::save_rates(shell.device(), &self.boot, &rates) {
+                tracing::warn!(%why, "the dense settle was not kept in the profile");
+            }
+        }
         shell.walk_binds().map_err(fault)?;
         shell.unkept_serving();
         shell.bound_serving();

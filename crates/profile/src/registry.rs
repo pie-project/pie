@@ -1150,6 +1150,10 @@ impl<'a> Walk<'a> {
                     rates.kernel_tflops_by_shape = self.kernel_curves(v);
                     continue;
                 }
+                crate::fire::DENSE_SETTLED => {
+                    rates.dense_settled = self.dense_settled(v);
+                    continue;
+                }
                 "elementwise_gbps" => &mut rates.elementwise_gbps,
                 "hbm_gbps" => &mut rates.hbm_gbps,
                 "cached_gbps" => &mut rates.cached_gbps,
@@ -1190,7 +1194,7 @@ impl<'a> Walk<'a> {
                              `attn_tflops_by_keys`, `hbm_gbps`, `cached_gbps`, `elementwise_gbps`, \
                              `scan_gelems`, `few_row_tflops`, `workgroups_per_core`, \
                              `product_ns`, `submit_worst_ratio`, `attn_tflops_by_rows_keys`, \
-                             `resident_workgroups` and `kernel_tflops_by_shape_spanned`, not `{other}`"
+                             `resident_workgroups`, `kernel_tflops_by_shape_spanned` and `dense_settled`, not `{other}`"
                         ),
                     );
                     continue;
@@ -1283,6 +1287,48 @@ impl<'a> Walk<'a> {
             }
         }
         Some(out)
+    }
+
+    /// `rates.dense_settled`: `[of, [[bottom, top, replaced, vector, wide,
+    /// tier], ...]]`, whole numbers.
+    fn dense_settled(&mut self, v: &Spanned<DeValue<'_>>) -> Option<crate::fire::DenseSettled> {
+        let what = "`rates.dense_settled` is [of, [[bottom, top, replaced, vector, wide, tier], \
+                    ...]], whole \
+                    numbers";
+        let whole = |v: &DeValue<'_>| int(v).and_then(|x| u32::try_from(x).ok());
+        let parsed = match v.get_ref() {
+            DeValue::Array(f) if f.len() == 2 => {
+                let of = whole(f[0].get_ref());
+                let ranges = match f[1].get_ref() {
+                    DeValue::Array(rs) => rs
+                        .iter()
+                        .map(|r| match r.get_ref() {
+                            DeValue::Array(x) if x.len() == 6 => {
+                                let mut out = [0u32; 6];
+                                for (slot, x) in out.iter_mut().zip(x.iter()) {
+                                    *slot = whole(x.get_ref())?;
+                                }
+                                Some(out)
+                            }
+                            _ => None,
+                        })
+                        .collect::<Option<Vec<[u32; 6]>>>(),
+                    _ => None,
+                };
+                of.zip(ranges)
+            }
+            _ => None,
+        };
+        match parsed {
+            Some((of, ranges)) => Some(crate::fire::DenseSettled { of, ranges }),
+            None => {
+                self.err(
+                    v.span().start,
+                    format!("{what}, not {}", found(v.get_ref())),
+                );
+                None
+            }
+        }
     }
 
     /// `rates.kernel_tflops_by_shape`: a list of `[kind, key, n, k, stopped

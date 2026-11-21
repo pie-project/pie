@@ -123,6 +123,14 @@ pub trait Serve: Backend {
         handed: Option<Self::Handed>,
     ) -> Result<(Self::Context, Self::Tuning)>;
 
+    /// `rates` saved into the user's profile under `boot`, beside the rates
+    /// a load measured there: what a later load reads back.
+    fn save_rates(
+        device: &Self::Context,
+        boot: &Self::DeviceBoot,
+        rates: &profile::fire::Rates,
+    ) -> Result<()>;
+
     /// `tuning` with each dense kernel's rate curve at each of the model's
     /// dense plane shapes (`shapes`, `(n, k)`) to `top_rows`, the most rows a
     /// fire of the load may bring (`profile::fire::Rates::kernel_tflops_by_shape`):
@@ -538,6 +546,31 @@ pub struct Settled {
     pub checked: bool,
     /// Whether the check replaced the range's kernel.
     pub replaced: bool,
+    /// The kernel it took over the range where it replaced it.
+    pub kernel: Option<kernels_slang::linear::gemm::Tactic>,
+    /// Whether the kernel taken (kept or replacing) ran apart from every
+    /// other option: what a later load takes again without firing.
+    pub decided: bool,
+}
+
+/// `tier` as the number a stored settle names it by.
+fn tier_number(tier: kernels_slang::Tier) -> u32 {
+    match tier {
+        kernels_slang::Tier::Baseline => 0,
+        kernels_slang::Tier::Subgroup => 1,
+        kernels_slang::Tier::Fp16 => 2,
+        kernels_slang::Tier::Coopmat => 3,
+    }
+}
+
+/// The tier a stored settle's number names ([`tier_number`]).
+fn tier_of(number: u32) -> kernels_slang::Tier {
+    match number {
+        1 => kernels_slang::Tier::Subgroup,
+        2 => kernels_slang::Tier::Fp16,
+        3 => kernels_slang::Tier::Coopmat,
+        _ => kernels_slang::Tier::Baseline,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -807,6 +840,8 @@ pub struct Shell<B: Serve> {
     dense_rates: profile::fire::Rates,
     /// What the dense settle did at each range ([`Shell::settled`]).
     settled: Vec<Settled>,
+    /// The settle this load ran, for the engine to keep in the profile.
+    to_store: Option<profile::fire::DenseSettled>,
 
     pipelines: B::Pipelines,
 
@@ -2358,6 +2393,7 @@ impl<B: Serve> Shell<B> {
             dense_planes: dense_planes.clone(),
             dense_rates: device_profile.rates(),
             settled: Vec::new(),
+            to_store: None,
             built: B::compiled(&pipelines),
             recorded: 0,
             unkept: 0,
@@ -2470,6 +2506,28 @@ impl<B: Serve> Shell<B> {
             return Ok(());
         }
         self.settled.clear();
+        // The ranges a settle of the same curves, model, rungs and build
+        // stored as decided are taken again without firing; the rest are
+        // settled (again) this load.
+        let of = self.settle_key(lanes);
+        let stored: Vec<[u32; 6]> = self
+            .dense_rates
+            .dense_settled
+            .clone()
+            .filter(|stored| stored.of == of)
+            .map(|stored| stored.ranges)
+            .unwrap_or_default();
+        for &[bottom, top, replaced, vector, wide, tier] in &stored {
+            if replaced != 0 {
+                let tactic = kernels_slang::linear::gemm::Tactic {
+                    tier: tier_of(tier),
+                    vector,
+                    wide: wide != 0,
+                };
+                self.dense = self.dense.with_rows(bottom, top, tactic);
+            }
+        }
+        let decided: Vec<(u32, u32)> = stored.iter().map(|r| (r[0], r[1])).collect();
         // Each fire in one submission, as a step admitted whole goes out.
         self.split_next(None);
         let walk_only = std::mem::replace(&mut self.walk_only, true);
@@ -2482,7 +2540,7 @@ impl<B: Serve> Shell<B> {
                 .map(|_| B::lay_stamps(&self.device, 1))
                 .collect::<Result<Vec<_>>>()?;
         }
-        let settled = self.settle_dense_to(lanes);
+        let settled = self.settle_dense_to(lanes, &decided);
         if laid {
             self.stamps.clear();
         }
@@ -2510,10 +2568,93 @@ impl<B: Serve> Shell<B> {
              fire, with the settled kernels)",
             self.settled.len()
         );
-        settled
+        settled?;
+        // Stored for a later load of the same curves, model, rungs and build:
+        // the ranges decided before and those decided now; an undecided
+        // range is settled again on the next load.
+        let mut ranges = stored.clone();
+        for range in self.settled.iter().filter(|range| range.decided) {
+            let (vector, wide, tier) = range.kernel.map_or((0, 0, 0), |t| {
+                (t.vector, u32::from(t.wide), tier_number(t.tier))
+            });
+            ranges.push([
+                range.bottom,
+                range.top,
+                u32::from(range.replaced),
+                vector,
+                wide,
+                tier,
+            ]);
+        }
+        let status: Vec<String> = self
+            .settled
+            .iter()
+            .map(|range| {
+                let what = if decided.contains(&(range.bottom, range.top)) {
+                    "stored, decided"
+                } else if !range.checked {
+                    "unchecked"
+                } else if range.decided {
+                    "decided this load"
+                } else {
+                    "undecided (settled again next load)"
+                };
+                format!("{}-{} {what}", range.bottom, range.top)
+            })
+            .collect();
+        tracing::info!("dense settle ranges: {}", status.join(", "));
+        if ranges.len() > stored.len() {
+            let keep = profile::fire::DenseSettled { of, ranges };
+            self.dense_rates.dense_settled = Some(keep.clone());
+            self.to_store = Some(keep);
+        }
+        self.say_served(
+            if stored.is_empty() {
+                "settled this load"
+            } else {
+                "stored settle, the rest settled this load"
+            },
+            replaced,
+        );
+        Ok(())
     }
 
-    fn settle_dense_to(&mut self, lanes: u32) -> Result<()> {
+    /// A fingerprint of what the settle weighs: the curves, the model's
+    /// planes, the kernels the choice took by them, the rungs and lanes it
+    /// fires, the backend and the build.
+    fn settle_key(&self, lanes: u32) -> u32 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        format!(
+            "{:?}|{:?}|{:?}|{lanes}|{}|{:?}|{}",
+            self.dense_rates.kernel_tflops_by_shape,
+            self.dense_planes,
+            self.dense,
+            self.budgets.tokens.max_tokens,
+            B::TARGET,
+            env!("CARGO_PKG_VERSION"),
+        )
+        .hash(&mut h);
+        (h.finish() & u64::from(u32::MAX)) as u32
+    }
+
+    /// The kernel each plane serves at each row range now, said once the
+    /// settle is done (`whence`: stored or settled this load, `replaced` of
+    /// its ranges replaced).
+    fn say_served(&self, whence: &str, replaced: usize) {
+        for plane in self.dense.runs() {
+            tracing::info!(
+                "dense matmul served, plane {plane} ({whence}; {replaced} ranges replaced)"
+            );
+        }
+    }
+
+    /// The settle the load ran and the profile should keep, taken once.
+    pub fn take_settled(&mut self) -> Option<profile::fire::DenseSettled> {
+        self.to_store.take()
+    }
+
+    fn settle_dense_to(&mut self, lanes: u32, decided: &[(u32, u32)]) -> Result<()> {
         use kernels_slang::linear::gemm::{Tactic, tile_for};
         // Rounds a range's fires take, interleaved: the shape step's.
         const ROUNDS: usize = crate::rates::REPEATS;
@@ -2526,7 +2667,19 @@ impl<B: Serve> Shell<B> {
         let mut rows = 1u32;
         while bottom <= chunk {
             let top = rows.min(chunk);
-            if entries.iter().any(|&at| (bottom..=top).contains(&at)) {
+            if decided.contains(&(bottom, top)) {
+                // Decided by a stored settle: not fired again.
+                self.settled.push(Settled {
+                    bottom,
+                    top,
+                    estimates: Vec::new(),
+                    bound_ns: self.submit_bound.as_ref().map(|held| held.bound_ns),
+                    checked: false,
+                    replaced: false,
+                    kernel: None,
+                    decided: false,
+                });
+            } else if entries.iter().any(|&at| (bottom..=top).contains(&at)) {
                 let standing = self.dense.clone();
                 // The most rows any plane's kernel pads a fire to, over the
                 // range: no option pads past it.
@@ -2562,10 +2715,12 @@ impl<B: Serve> Shell<B> {
                     }
                 }
                 let mut options = vec![standing.clone()];
+                let mut taking: Vec<Option<Tactic>> = vec![None];
                 for t in kernels {
                     let option = standing.with_rows(bottom, top, t);
                     if !options.contains(&option) {
                         options.push(option);
+                        taking.push(Some(t));
                     }
                 }
                 // As many decode lanes, else one lane's prompt.
@@ -2656,6 +2811,8 @@ impl<B: Serve> Shell<B> {
                     bound_ns,
                     checked: options.len() > 1,
                     replaced: false,
+                    kernel: None,
+                    decided: false,
                 });
                 if options.len() > 1 {
                     let word = if per_lane == 1 {
@@ -2670,6 +2827,8 @@ impl<B: Serve> Shell<B> {
                     // Whether a fire was timed by the host's clock (the
                     // device stated no span of it).
                     let host_clock = std::cell::Cell::new(false);
+                    // The GPU's clock at the range's first fire.
+                    let mut clock: Option<u64> = None;
                     // A first round warms each option, untimed.
                     for round in 0..=ROUNDS {
                         for (i, option) in options.iter().enumerate() {
@@ -2717,13 +2876,30 @@ impl<B: Serve> Shell<B> {
                                 // step's, which replays its recording. The
                                 // host's clock only where the device times
                                 // nothing.
-                                Ok(device.map_or_else(
+                                let ns = device.map_or_else(
                                     || {
                                         host_clock.set(true);
                                         host
                                     },
                                     |ns| ns as f64,
-                                ))
+                                );
+                                // At the clock the GPU ran at the range's
+                                // first fire, where the platform reads it: a
+                                // clock that fell between fires slows every
+                                // later one alike, not the option it fell on.
+                                Ok(
+                                    match self
+                                        .submit_bound
+                                        .as_ref()
+                                        .and_then(|held| held.clock_now())
+                                    {
+                                        Some(hz) => {
+                                            let first = *clock.get_or_insert(hz);
+                                            ns * hz as f64 / first as f64
+                                        }
+                                        None => ns,
+                                    },
+                                )
                             })();
                             match fired {
                                 Ok(ns) if round > 0 => samples[i].push(ns),
@@ -2775,8 +2951,17 @@ impl<B: Serve> Shell<B> {
                             "device's spans"
                         }
                     );
+                    // Decided where the kernel taken ran apart from every other
+                    // option: each of its fires faster than each of theirs.
+                    let decided = samples
+                        .iter()
+                        .enumerate()
+                        .filter(|&(i, _)| i != taken)
+                        .all(|(_, s)| slowest(&samples[taken]) < fastest(s));
                     if let Some(range) = self.settled.last_mut() {
                         range.replaced = taken != 0;
+                        range.kernel = taking.get(taken).copied().flatten();
+                        range.decided = decided;
                     }
                     self.dense = options.swap_remove(taken);
                 }

@@ -135,6 +135,14 @@ impl Serve for Api {
         )
     }
 
+    fn save_rates(
+        device: &Context,
+        boot: &crate::api::DeviceBoot,
+        rates: &profile::fire::Rates,
+    ) -> Result<()> {
+        crate::rates::save_rates(device, boot.profiles.as_deref(), rates)
+    }
+
     fn chunk_bytes(boot: &crate::api::DeviceBoot) -> Option<u64> {
         boot.chunk_bytes
     }

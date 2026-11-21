@@ -132,6 +132,21 @@ pub struct Rates {
     /// Measured; not one of [`KEYS`] (a load measures it once its model's
     /// shapes are known).
     pub kernel_tflops_by_shape: Option<Vec<KernelCurve>>,
+    /// The dense kernels a load's settle took in context over the curves'
+    /// picks ([`DENSE_SETTLED`]): what a later load of the same curves,
+    /// model and build takes again without walking a fire. Measured.
+    pub dense_settled: Option<DenseSettled>,
+}
+
+/// A settle's outcome: `of`, a fingerprint of what it settled (the curves,
+/// the model's planes, the load's rungs and kernels, the build), and each
+/// row range it decided, `[bottom, top, replaced, vector, wide, tier]`: 1
+/// where it replaced the curves' kernel with the one named (the tier
+/// `kernels_slang::Tier` as a number), 0 where it kept theirs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DenseSettled {
+    pub of: u32,
+    pub ranges: Vec<[u32; 6]>,
 }
 
 /// One dense kernel's measured curve at one shape
@@ -234,6 +249,10 @@ pub const KERNEL_CURVES: &str = "kernel_tflops_by_shape_spanned";
 /// dispatch ([`KERNEL_CURVES`]).
 pub const KERNEL_CURVES_PER_DISPATCH: &str = "kernel_tflops_by_shape";
 
+/// The `[rates]` key of [`Rates::dense_settled`]:
+/// `[of, [[bottom, top, replaced, vector, wide, tier], ...]]`.
+pub const DENSE_SETTLED: &str = "dense_settled";
+
 /// The `[rates]` key of [`Rates::submit_worst_ratio`]: what a load on a
 /// platform that states a bound on one submission measures beside the
 /// estimate's [`KEYS`].
@@ -297,6 +316,7 @@ impl Rates {
                 }
                 (mine, theirs) => mine.or(theirs),
             },
+            dense_settled: self.dense_settled.or(below.dense_settled),
         }
     }
 
@@ -340,6 +360,7 @@ impl Rates {
                 .kernel_tflops_by_shape
                 .clone()
                 .filter(|_| has(KERNEL_CURVES)),
+            dense_settled: self.dense_settled.clone().filter(|_| has(DENSE_SETTLED)),
         }
     }
 
@@ -363,6 +384,7 @@ impl Rates {
             ATTN_BY_ROWS_KEYS => self.attn_tflops_by_rows_keys.is_none(),
             "product_ns" => self.product_ns.is_none(),
             KERNEL_CURVES => self.kernel_tflops_by_shape.is_none(),
+            DENSE_SETTLED => self.dense_settled.is_none(),
             _ => true,
         };
         keys.iter().copied().filter(|key| unstated(key)).collect()
@@ -462,6 +484,24 @@ impl Rates {
                 })
                 .collect();
             let _ = writeln!(out, "{KERNEL_CURVES} = [\n{}]", rows.concat());
+        }
+        if let Some(settled) = &self.dense_settled {
+            let ranges: Vec<String> = settled
+                .ranges
+                .iter()
+                .map(|r| {
+                    format!(
+                        "[{}, {}, {}, {}, {}, {}]",
+                        r[0], r[1], r[2], r[3], r[4], r[5]
+                    )
+                })
+                .collect();
+            let _ = writeln!(
+                out,
+                "{DENSE_SETTLED} = [{}, [{}]]",
+                settled.of,
+                ranges.join(", ")
+            );
         }
         out
     }
@@ -630,6 +670,10 @@ mod tests {
                 stop: Some((512, KernelCurve::BOUND)),
                 spread: Vec::new(),
             }]),
+            dense_settled: Some(DenseSettled {
+                of: 77,
+                ranges: vec![[3, 4, 1, 4, 0, 1]],
+            }),
         };
         assert!(rates.complete(&KEYS));
         assert_eq!(
@@ -642,8 +686,19 @@ mod tests {
              150.0]]],\n  [4096, [[256, 90.5], [8192, 210.0]]],\n]\n\
              attn_tflops_by_keys = [[512, 60.0], [8192, 400.0]]\nhbm_gbps = 654.4\n\
              cached_gbps = 28800.0\nelementwise_gbps = 450.0\nscan_gelems = 2684.3\nfew_row_tflops = 4.2\n\
-             workgroups_per_core = 3.3\nkernel_tflops_by_shape_spanned = [\n  [1, 4, 1024, 2048, 512, 1, [[1, 0.5]]],\n]\n"
+             workgroups_per_core = 3.3\nkernel_tflops_by_shape_spanned = [\n  [1, 4, 1024, 2048, 512, 1, [[1, 0.5]]],\n]\n\
+             dense_settled = [77, [[3, 4, 1, 4, 0, 1]]]\n"
         );
+        // It reads back.
+        let registry = crate::Registry::new("test", &[], &[]);
+        let read = registry
+            .parse(
+                &format!("api = 1\n{}", rates.toml()),
+                "user",
+                crate::registry::Strict::User,
+            )
+            .unwrap();
+        assert_eq!(read.tuned.rates.dense_settled, rates.dense_settled);
     }
 
     /// A user file an older pie wrote, stating rates this pie no longer

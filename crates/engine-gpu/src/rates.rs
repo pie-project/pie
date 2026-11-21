@@ -1071,8 +1071,15 @@ impl<'a, B: Serve> Rig<'a, B> {
             u32::try_from(sets).unwrap_or(u32::MAX),
             &mut |n| fitted(n),
         )?;
-        self.fitting(1)?;
-        self.frame(timer, 1, fire, &nothing)?;
+        // A fire past the point's budget alone (an output head's at hundreds
+        // of rows: a second a fire on a phone) is its own point: no warming
+        // frame before it and no frame of more fires after it, whose one
+        // frame's fixed cost it dwarfs.
+        let long = |ns: Option<f64>| ns.is_some_and(|ns| ns >= POINT_NS);
+        if !long(self.per_fire_now()) {
+            self.fitting(1)?;
+            self.frame(timer, 1, fire, &nothing)?;
+        }
         // Each frame twice, the faster kept, by the device's span where the
         // backend times one, else the host's clock (whose wait only ever adds
         // to a frame's: it ran 0.3 to 2.4 ms on wgpu).
@@ -1081,6 +1088,9 @@ impl<'a, B: Serve> Rig<'a, B> {
             Ok(span.unwrap_or(host))
         };
         let one = timed(1)?;
+        if long(self.per_fire_now()) {
+            return Ok(one.max(1));
+        }
         let estimate = self.per_fire_now().unwrap_or(POINT_NS).max(1.0);
         let wanted = (POINT_NS / estimate).ceil().clamp(2.0, f64::from(u32::MAX)) as u32;
         let count = self.fitting(wanted)?;
@@ -2103,6 +2113,7 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         product_ns: None,
         workgroups_per_core: None,
         kernel_tflops_by_shape: None,
+        dense_settled: None,
         resident_workgroups: resident,
         // How much slower the device ran than its own measurements said:
         // like frames' drift, the clock's swing and its sustained drop
@@ -2997,6 +3008,7 @@ mod wanted_tests {
             attn_tflops_by_rows_keys: None,
             product_ns: None,
             kernel_tflops_by_shape: None,
+            dense_settled: None,
         };
         let none = Wanted {
             launch: false,
