@@ -70,6 +70,19 @@ struct Input {
     /// none of the search's buffered rows.
     #[serde(default)]
     corrupt: Option<String>,
+    /// In place of a search, a check of the beam groups themselves
+    /// ([`check_groups`]): this many groups of width `beams`, one after
+    /// another in this one process, each prefilling the prompt on a working
+    /// set of its own and firing its beams once; each first fire's rows
+    /// against 1-row fires of the same tokens.
+    #[serde(default)]
+    groups_check: Option<u32>,
+    /// How [`check_groups`] feeds its beams' tokens: `host` (the default)
+    /// as a channel the host seeds and no fire puts, `device` put by the
+    /// fire's own epilogue, as a search's are. A group must run as a group
+    /// either way.
+    #[serde(default)]
+    groups_tokens: Option<String>,
 }
 
 fn default_prompt() -> String {
@@ -140,6 +153,16 @@ async fn main(input: Input) -> Result<String> {
         return Err("empty prompt".into());
     }
     let n = u32::try_from(prompt.len()).map_err(|_| "the prompt exceeds the u32 range")?;
+    if let Some(groups) = input.groups_check {
+        let device = match input.groups_tokens.as_deref() {
+            None | Some("host") => false,
+            Some("device") => true,
+            Some(other) => {
+                return Err(format!("groups_tokens is host or device, not {other}"));
+            }
+        };
+        return check_groups(&prompt, b, groups, device).await;
+    }
     let decodes = max_steps - 1;
     let ws = WorkingSet::new();
 
@@ -848,6 +871,161 @@ impl std::fmt::Display for Room {
             self.drift
         )
     }
+}
+
+/// `groups` beam groups of width `b`, one after another in this process,
+/// each on a working set of its own (all held to the end, as a search's set
+/// is while its verifier runs): the prompt prefilled folding, its top `b`
+/// tokens picked, then the group's first fire, each beam fed its own pick
+/// (as a channel the host seeds, or, under `device`, one the fire's
+/// epilogue puts, as a search's is). Two checks, each failing by name:
+///
+/// - the group ran as a group: its finish ([`ForwardPass::adopt_beam`])
+///   finds its page lists primed. A fire that states parents but ran
+///   without its group's step leaves them unprimed, its lanes read and
+///   wrote one shared working set as plain lanes;
+/// - each beam's row (its argmax's log-probability and its largest logit)
+///   against a 1-row fire of the prompt and its pick, within the
+///   verifier's room for a step ([`Rescored::room`], its drift measured on
+///   `b` copies).
+///
+/// On engine-metal (2026-11-21) a pass whose geometry the runtime resolves
+/// on the host (its tokens a host-seeded channel) has no envelope there,
+/// and the stage skips the beam group of an instance without one: every
+/// group, the first in a process too, runs as plain lanes, and its rows
+/// come out different on every run. Under `device` every group passes.
+async fn check_groups(prompt: &[u32], b: u32, groups: u32, device: bool) -> Result<String> {
+    if groups == 0 {
+        return Err("groups_check names no group".into());
+    }
+    let v = model::output_vocab_size();
+    let n = u32::try_from(prompt.len()).map_err(|_| "a prompt past u32 rows")?;
+    let lanes = b as usize;
+    let fed_by = if device { "device" } else { "host" };
+    let mut held: Vec<WorkingSet> = Vec::new();
+    let mut worst = 0f32;
+    for g in 0..groups {
+        let ws = WorkingSet::new();
+        let pipeline = Pipeline::new();
+        let fed: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
+        let picks = Channel::new([b], dtype::i32);
+        let fwd_p = ForwardPass::new();
+        fwd_p.embed(&Channel::from(&fed[..]), &Channel::from([0u32, n]))?;
+        fwd_p
+            .state(&[&ws], StateGeometry::folding())
+            .with_context(|| format!("group {g}: bind the prefill"))?;
+        fwd_p.epilogue(move || {
+            let logits = cast(reshape(intrinsics::output(0, "logits"), [v]), dtype::bf16);
+            let (_, i) = top_k(log_softmax(&logits), b);
+            picks.put(cast(&i, dtype::i32));
+        });
+        fwd_p
+            .submit(&pipeline)
+            .with_context(|| format!("group {g}: prefill submit"))?;
+        let first = picks
+            .take_host::<Vec<i32>>()
+            .await
+            .with_context(|| format!("group {g}: prefill drain"))?;
+
+        let toks = Channel::from(&first[..]);
+        let (top, own, largest) = (
+            Channel::new([b], dtype::u32),
+            Channel::new([b], dtype::f32),
+            Channel::new([b], dtype::f32),
+        );
+        // Each beam continues itself: the identity, carried through a
+        // channel as a search's parents are (a constant the trace could
+        // fold into the program is no parents port at all).
+        let ident = Channel::from_iter(0u32..b);
+        let fwd = ForwardPass::new();
+        fwd.embed(&toks, &Channel::from_iter(0u32..=b))?;
+        let group = BeamGroup::new(&ws, b, n, 1)
+            .with_context(|| format!("group {g}: reserve the beams' pages"))?;
+        fwd.state(&vec![&ws; lanes], group.geometry())
+            .with_context(|| format!("group {g}: bind the beams' page lists"))?;
+        fwd.epilogue(move || {
+            let logits = cast(
+                reshape(intrinsics::output(0, "logits"), [b, v]),
+                dtype::bf16,
+            );
+            let flat = reshape(&logits, [b * v]);
+            let best = cast(reduce_argmax(&logits), dtype::u32);
+            let at = iota(b) * v + &best;
+            top.put(&best);
+            own.put(cast(
+                gather(reshape(log_softmax(&logits), [b * v]), &at),
+                dtype::f32,
+            ));
+            largest.put(cast(gather(&flat, &at), dtype::f32));
+            if device {
+                toks.put(cast(&best, dtype::i32));
+            }
+            let parent = ident.take();
+            ident.put(&parent);
+            group.reorder(&parent);
+        });
+        fwd.submit(&pipeline)
+            .with_context(|| format!("group {g}: first fire submit"))?;
+        pipeline.close();
+        let drain = async |c: Channel| -> Result<Vec<f32>> {
+            let got = c
+                .take_host::<Vec<f32>>()
+                .await
+                .with_context(|| format!("group {g}: first fire drain"))?;
+            if got.len() == lanes {
+                Ok(got)
+            } else {
+                Err(format!(
+                    "group {g}: its first fire returned {} of {lanes} rows",
+                    got.len()
+                ))
+            }
+        };
+        let tops = top
+            .take_host::<Vec<u32>>()
+            .await
+            .with_context(|| format!("group {g}: first fire drain"))?;
+        let (own, largest) = (drain(own).await?, drain(largest).await?);
+        // The finish reads the group's lists as its last step left them.
+        fwd.adopt_beam(0, n + 1).map_err(|why| {
+            format!(
+                "group {g} of {groups} in this process (tokens fed by the {fed_by}): its \
+                 first fire ran and its finish found no step of its group: {why}; the fire \
+                 that stated parents ran without its group's page lists, its lanes on one \
+                 shared working set as plain lanes"
+            )
+        })?;
+
+        for beam in 0..lanes {
+            let token = u32::try_from(first[beam]).map_err(|_| "a negative token")?;
+            let alone = rescore(prompt, &[token, tops[beam]], b).await?;
+            let want = &alone[1];
+            for (what, got, from) in [
+                ("log-probability", own[beam], want.step),
+                ("largest logit", largest[beam], want.largest),
+            ] {
+                let got = finite(&format!("group {g}'s beam {beam} {what}"), got)?;
+                let room = want.room(got, None);
+                let apart = (got - from).abs();
+                worst = worst.max(apart / room.total());
+                if apart > room.total() {
+                    return Err(format!(
+                        "group {g} of {groups} in this process (tokens fed by the {fed_by}): \
+                         beam {beam}'s first fire, after the prompt and token {token}, read \
+                         {what} {got:.4} for token {}, and a 1-row fire of the same tokens \
+                         {from:.4}: {apart:.4} apart, past its room {room}; its first fire read \
+                         rows it did not write",
+                        tops[beam],
+                    ));
+                }
+            }
+        }
+        held.push(ws);
+    }
+    Ok(format!(
+        "[groups_check] groups={groups} width={b} prompt={n} tokens={fed_by} ok \
+         worst={worst:.3} of its room"
+    ))
 }
 
 /// Each step of `hypothesis` after `prompt`, teacher-forced one token a fire
