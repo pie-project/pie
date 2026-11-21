@@ -441,7 +441,7 @@ fn run_rs(gpu: &mut Gpu, lanes: u32, folded: u32, tokens: u32, base: u32, seed: 
     // The set's rs entries: every slot from the base through the pool's
     // last page, held past the rest of the state.
     let set_len = ((f0 + cap) * PAGE - base).div_ceil(tokens);
-    let layout = layout.buffering((f0 + cap) * PAGE, tokens);
+    let layout = layout.buffering(PAGE, tokens);
     assert!(layout.bases >= set_len);
     let bases_pool = layout.bases_word() as u32;
     let state_words = (layout.bytes() / 4) as u32;

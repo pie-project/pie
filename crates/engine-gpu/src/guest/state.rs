@@ -130,11 +130,17 @@ impl BeamLayout {
         })
     }
 
-    /// This layout on a hybrid buffering `rs_tokens` rows an rs page: its
-    /// set's rs entries to `end` held in the state (§11.1).
+    /// This layout on a hybrid buffering `rs_tokens` rows an rs page over
+    /// kv pages of `page` slots: its set's rs entries held in the state
+    /// (§11.1), one for each rs page of the pool's pages (a beam's slot `s`
+    /// lies at `(f0 + q) page + s mod page`, `q` below the pool's `cap`).
     #[must_use]
-    pub fn buffering(mut self, end: u32, rs_tokens: u32) -> BeamLayout {
-        self.bases = end.div_ceil(rs_tokens.max(1)).saturating_add(1);
+    pub fn buffering(mut self, page: u32, rs_tokens: u32) -> BeamLayout {
+        self.bases = self
+            .cap
+            .saturating_mul(page)
+            .div_ceil(rs_tokens.max(1))
+            .saturating_add(1);
         self
     }
 

@@ -599,7 +599,7 @@ impl<B: Host> Gpu<B> {
                 )
                 .map(|layout| match shell.pools().rs_rows() {
                     // On a hybrid its set's rs entries are held with it.
-                    Some(rows) => layout.buffering(extents.key_len, rows.tokens),
+                    Some(rows) => layout.buffering(shell.paging().page_size, rows.tokens),
                     None => layout,
                 })
             })

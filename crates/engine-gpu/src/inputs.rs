@@ -609,6 +609,15 @@ impl Laid {
             .map(|((at, _), _)| u32::try_from(at / 4).unwrap_or(u32::MAX))
     }
 
+    /// The ints the rs table and the folds' table each hold a fire.
+    #[must_use]
+    pub fn rs_table_ints(&self) -> (u64, u64) {
+        (
+            self.rs_carry.map_or(0, |(_, ints)| ints),
+            self.rs_folds.map_or(0, |((_, ints), _)| ints),
+        )
+    }
+
     /// Where the rs table lies: its first u32 word in the store.
     #[must_use]
     pub fn rs_carry_word(&self) -> Option<u32> {

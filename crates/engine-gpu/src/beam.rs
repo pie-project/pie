@@ -530,13 +530,6 @@ pub fn plan<'a, B: Backend>(
             // The set's entries live in the group's state; this fire stages
             // only those past what its state holds, which its step appends.
             let held = layout.bases;
-            if bases_len > held {
-                return Err(refused(format!(
-                    "instance {}'s set buffers {bases_len} rs entries, past the {held} its \
-                     state holds for the search's depth (state-geometry parents-end)",
-                    group.instance
-                )));
-            }
             let bases_word = u64::from(group.state) + layout.bases_word();
             let bases_at = u32::try_from(bases_word).map_err(|_| Fault::Ceiling {
                 what: "pool words a beam group's rs entries lie at",
@@ -551,6 +544,13 @@ pub fn plan<'a, B: Backend>(
             )
             .unwrap_or(u32::MAX)
             .min(bases_len);
+            if needed > held {
+                return Err(refused(format!(
+                    "instance {}'s rows resolve into {needed} of its set's rs entries, past \
+                     the {held} its state holds for its pool's pages",
+                    group.instance
+                )));
+            }
             let from = if group.appended.0 == base { group.appended.1.min(needed) } else { 0 };
             let new = &set[from as usize..needed as usize];
             append = (rs_bases.push(new)?, bases_at + from, u32::try_from(new.len()).unwrap_or(u32::MAX));

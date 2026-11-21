@@ -5222,9 +5222,8 @@ impl<B: Serve> Shell<B> {
         // The staged rs table: every lane's header, then its carried
         // tokens and its buffer pages. A fire carries no more rows than the
         // widest bucket's tokens, the most the runtime lets one carry.
-        // A beam lane's rows the table neither lists nor pages (a span its
-        // list resolves): every other lane's carried rows, the most the
-        // runtime lets one carry, are no more than the widest bucket's.
+        // A beam lane's pages resolve through its list (`prim/carry.slang`):
+        // the table names neither its rows nor its pages.
         let rs_beam: Vec<bool> = {
             let mut beamed = vec![false; rs_plans.len()];
             for (source, group) in beam_of.iter().enumerate() {
@@ -5237,17 +5236,27 @@ impl<B: Serve> Shell<B> {
             }
             beamed
         };
+        // The staged rs table: every lane's header, then the carried tokens
+        // of a lane whose rows are not one run and the pages of a lane that
+        // is no beam's. A fire is refused only where that is past the table
+        // the load laid (`inputs::rs_carry_ints`), never by its rows alone:
+        // a lane carrying one run of rows takes a span.
         let rs_carry = if rs_active {
-            let carried: u32 = rs_plans
-                .iter()
-                .zip(&rs_beam)
-                .filter(|(plan, beamed)| !**beamed || plan.gathers.len() > 1)
-                .map(|(plan, _)| plan.replay)
-                .sum();
+            let page_tokens = self.rs_buffers.as_ref().map_or(1, crate::rs::Buffers::page_tokens);
+            let table = carry_table(&rs_plans, page_tokens, &rs_beam)?;
+            let laid = self.inputs.first().map_or(0, |store| store.laid().rs_table_ints().0);
+            if table.len() as u64 > laid {
+                return Err(Fault::Ceiling {
+                    what: "ints of the staged rs table a fire's buffered rows take (a header \
+                           a lane, a non-beam lane's pages, a scattered lane's tokens)",
+                    need: table.len() as u64,
+                    have: laid,
+                });
+            }
             let beamed: u32 = rs_plans
                 .iter()
                 .zip(&rs_beam)
-                .filter(|(plan, beamed)| **beamed && plan.gathers.len() <= 1)
+                .filter(|(_, beamed)| **beamed)
                 .map(|(plan, _)| plan.replay)
                 .sum();
             if beamed > self.budget().max_tokens {
@@ -5257,15 +5266,7 @@ impl<B: Serve> Shell<B> {
                     "beam lanes replay past the widest bucket's rows, resolved through their lists"
                 );
             }
-            if carried > self.budget().max_tokens {
-                return Err(Fault::Ceiling {
-                    what: "buffered recurrent rows a fire carries ahead of its own",
-                    need: u64::from(carried),
-                    have: u64::from(self.budget().max_tokens),
-                });
-            }
-            let page_tokens = self.rs_buffers.as_ref().map_or(1, crate::rs::Buffers::page_tokens);
-            Some(carry_table(&rs_plans, page_tokens, &rs_beam)?)
+            Some(table)
         } else {
             None
         };
@@ -6689,20 +6690,33 @@ fn carry_table(
         // pages resolved through its list from the record its head step
         // writes (`prim/carry.slang`), so the table holds neither, whatever
         // the rows.
-        let beamed = beam.get(lane).copied().unwrap_or(false) && plan.gathers.len() <= 1;
-        if beamed {
+        // Any lane whose carried rows are one run of its buffer takes a span.
+        if plan.gathers.len() <= 1 {
             let from = plan.gathers.first().map_or(0, |run| run.from);
             table[at + 2] = -int(u64::from(from))? - 1;
+        } else {
+            table[at + 2] = int(table.len() as u64)?;
+            for run in &plan.gathers {
+                for token in run.from..run.from + run.count {
+                    table.push(int(u64::from(token))?);
+                }
+            }
+        }
+        if beam.get(lane).copied().unwrap_or(false) {
+            if plan.gathers.len() > 1 {
+                return Err(program(
+                    "serve::rs",
+                    format!(
+                        "beam lane {lane} carries {} runs of rows: a beam's are one run past its \
+                         group's fold",
+                        plan.gathers.len()
+                    ),
+                ));
+            }
             table[at + 3] = -int(table.len() as u64)? - 1;
             table.extend([0i32; RESOLVE_INTS]);
             table[at + 4] = int(u64::from(plan.commit))?;
             continue;
-        }
-        table[at + 2] = int(table.len() as u64)?;
-        for run in &plan.gathers {
-            for token in run.from..run.from + run.count {
-                table.push(int(u64::from(token))?);
-            }
         }
         table[at + 3] = int(table.len() as u64)?;
         let pages = plan
