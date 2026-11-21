@@ -142,7 +142,7 @@ static WARMED: std::sync::Mutex<Warmed> = std::sync::Mutex::new(Warmed {
 });
 
 fn warmed_streams() -> std::sync::MutexGuard<'static, Warmed> {
-    WARMED.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    WARMED.lock().expect("warmed streams lock poisoned")
 }
 
 /// The copy queues the streams [`warm_copies`] warmed made, which the
@@ -165,7 +165,17 @@ pub fn forget(stream: super::sys::Stream) {
 /// area, is made before the load sizes its pools. Device memory for the
 /// copy's target is the caller's `scratch`, at least one byte past the
 /// threshold.
-pub fn warm_copies(streams: &[super::sys::Stream], scratch: *mut core::ffi::c_void) -> Result<(), String> {
+///
+/// # Safety
+///
+/// `scratch` is live device memory of at least [`blit_threshold`] + 1
+/// bytes on the current device, unused by anything else until this
+/// returns, and every stream in `streams` is a live stream of that device
+/// (or the null stream).
+pub unsafe fn warm_copies(
+    streams: &[super::sys::Stream],
+    scratch: *mut core::ffi::c_void,
+) -> Result<(), String> {
     let bytes = blit_threshold() + 1;
     let mut host: *mut core::ffi::c_void = core::ptr::null_mut();
     // SAFETY: a live out-parameter; freed below.
