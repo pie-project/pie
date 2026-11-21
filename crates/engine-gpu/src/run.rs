@@ -296,6 +296,11 @@ pub struct Run<'c, B: Backend> {
     /// submitted a layer at a time.
     split: Option<Split>,
 
+    /// The kernels the walk picked, by class (a dense matmul at its rows,
+    /// attention, its tile or its walk), each once: what a step's line says
+    /// it ran ([`Run::take_picks`]).
+    picks: std::cell::RefCell<std::collections::BTreeSet<String>>,
+
     /// The highest kernels-slang tier the adapter runs, where the backend's
     /// tactics read it.
     tier: kernels_slang::Tier,
@@ -356,6 +361,7 @@ impl<'c, B: Backend> Run<'c, B> {
             hashes,
             tuning,
             split: None,
+            picks: std::cell::RefCell::new(std::collections::BTreeSet::new()),
             tier,
             dense,
         }
@@ -1092,6 +1098,20 @@ impl<'c, B: Backend> Run<'c, B> {
 
     /// The host steps of the expert stages this walk made, in order: one
     /// for each segment a kept frame's flushes cut.
+    /// The walk picked `what` (a kernel by class).
+    pub fn pick(&self, what: impl FnOnce() -> String) {
+        if self.ctx.naming().is_none() {
+            self.picks.borrow_mut().insert(what());
+        }
+    }
+
+    /// The kernels the walk picked so far, by class, each once.
+    pub fn take_picks(&self) -> Vec<String> {
+        std::mem::take(&mut *self.picks.borrow_mut())
+            .into_iter()
+            .collect()
+    }
+
     pub fn take_cuts(&self) -> Vec<crate::store::experts::Cut<B>> {
         std::mem::take(&mut self.staged_layer.borrow_mut().cuts)
     }

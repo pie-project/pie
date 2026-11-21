@@ -161,6 +161,7 @@ fn a_split_step_costs_its_submits_alone() {
         let shell = engine.loaded_mut().expect("loaded");
         shell.track();
         let device = shell.last_landed_ns().map_or(f64::NAN, |ns| ns as f64 / 1e6);
+        let picks = shell.last_picks().to_vec();
         if let Some(mode) = profile {
             engine_vulkan::encode::profile_kernels(false);
             let mut kinds = engine_vulkan::encode::kernel_profile();
@@ -182,19 +183,31 @@ fn a_split_step_costs_its_submits_alone() {
                 }
             }
         }
-        (wall, device)
+        (wall, device, picks)
     };
     let modes = ["whole-replayed", "split", "whole-walked"];
     let mut times: Vec<Vec<(f64, f64)>> = vec![Vec::new(); modes.len()];
+    // Each mode's kernel picks as its first round walked them (the
+    // replayed mode's recording is walked then).
+    let mut picks: Vec<Vec<String>> = vec![Vec::new(); modes.len()];
+    let mut keep = |at: usize, round: u32, (wall, device, walked): (f64, f64, Vec<String>)| {
+        times[at].push((wall, device));
+        if round == 0 {
+            picks[at] = walked;
+        }
+    };
     for round in 0..ROUNDS {
         let last = round == ROUNDS - 1;
-        times[0].push(fire(&mut engine, 0, bound_ns, last.then_some(modes[0])));
-        times[1].push(fire(&mut engine, 1, tight, last.then_some(modes[1])));
+        keep(0, round, fire(&mut engine, 0, bound_ns, last.then_some(modes[0])));
+        keep(1, round, fire(&mut engine, 1, tight, last.then_some(modes[1])));
     }
     engine.loaded_mut().expect("loaded").walk_every_fire();
     for round in 0..ROUNDS {
         let last = round == ROUNDS - 1;
-        times[2].push(fire(&mut engine, 2, bound_ns, last.then_some(modes[2])));
+        keep(2, round, fire(&mut engine, 2, bound_ns, last.then_some(modes[2])));
+    }
+    for (mode, picks) in modes.iter().zip(&picks) {
+        eprintln!("{mode}: kernel picks {picks:?}");
     }
     for (mode, times) in modes.iter().zip(&times) {
         eprintln!(

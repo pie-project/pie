@@ -680,7 +680,10 @@ impl<B: Backend> Run<'_, B> {
         matmul: impl Fn(kernels_slang::linear::gemm::Tactic) -> Result<(), kernels_slang::Error>,
     ) -> Result<(), kernels_slang::Error> {
         let Some(names) = self.ctx.naming() else {
-            return matmul(self.dense().at(self.tensor(act).rows));
+            let rows = self.tensor(act).rows;
+            let tactic = self.dense().at(rows);
+            self.pick(|| format!("dense at {rows} rows: {}", crate::dense::name(&tactic)));
+            return matmul(tactic);
         };
         // The walk fires at one rung; a fire of the load brings up to the
         // most rows its rungs hold.
