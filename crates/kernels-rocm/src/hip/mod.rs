@@ -71,7 +71,10 @@ pub fn warm_copies(streams: &[sys::Stream]) -> Result<(), Error> {
     if code != sys::HIP_SUCCESS {
         return Err(hip_fault(OP, "hipMalloc", code));
     }
-    let warmed = kfd::warm_copies(streams, scratch);
+    // SAFETY: `scratch` was just allocated with `bytes`, one past the blit
+    // threshold, and nothing else holds it; the streams are the caller's
+    // live ones.
+    let warmed = unsafe { kfd::warm_copies(streams, scratch) };
     // SAFETY: allocated above, freed once, after every copy synchronized.
     unsafe { rt::hipFree(scratch) };
     warmed.map_err(|detail| Error::Backend { op: OP, detail })
