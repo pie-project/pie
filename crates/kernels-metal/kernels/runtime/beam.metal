@@ -5,6 +5,7 @@
 // layout, the same run records (every address a GPU virtual address), the
 // same fault codes.
 #include <metal_stdlib>
+#include "../prim/kv_page.h"
 using namespace metal;
 
 #define PIE_PAGES_PAST_RESERVE 1u
@@ -29,9 +30,26 @@ struct BeamListRun {
     uint pad;
 };
 
+// A hybrid lane's rs page table to resolve (§11.1): its row's slot entries
+// from the one holding buffer entry `first` (`pages`: the row past its
+// in-page header), entry `e` the rows of slot `base + e * tokens` on, each
+// resolved to the set's entry holding the same rows of its beam's list's
+// page (`bases`: the set's entries' slab slots, `bases_len` of them, from
+// its entry 0), through `entries` (its last row's entry, plus one).
+struct BeamRsRun {
+    ulong pages;
+    ulong bases;
+    uint lane;
+    uint first;
+    uint entries;
+    uint base;
+    uint tokens;
+    uint bases_len;
+};
+
 // A group's step: its state, the parents its last epilogue wrote, its pool's
-// device page ids, its lanes' list runs and fault words, and the numbers of
-// §3.
+// device page ids, its lanes' list runs and fault words, the numbers of §3,
+// and on a hybrid its lanes' rs page tables (§11).
 struct BeamStepRun {
     ulong state;
     ulong parents;
@@ -47,7 +65,8 @@ struct BeamStepRun {
     uint list_count;
     uint frames;
     uint backed;
-    uint pad;
+    uint rs_count;
+    ulong rs;
 };
 
 // A lane's page copy (the copy `beam_step` left in its group's state):
@@ -278,6 +297,38 @@ kernel void beam_step(
             write_page[row] = trans[q];
         }
     }
+    // §11.1 on a hybrid: each lane's rs page table over the same list, slot
+    // by slot: entry e (slot `base + e T`) holds the rows of the set's slot
+    // (f0 + list[j]) S + (slot mod S), j its column; its write entry among
+    // them. A frozen entry (below `f0 S`) keeps the set's staged slot.
+    const device BeamRsRun* rs = reinterpret_cast<const device BeamRsRun*>(r.rs);
+    for (uint i = 0u; i < r.rs_count; ++i) {
+        const BeamRsRun l = rs[i];
+        const device uint* list = map_new + l.lane * cap;
+        const ulong T = l.tokens == 0u ? 1u : l.tokens;
+        device int* pages = reinterpret_cast<device int*>(l.pages);
+        const device int* bases = reinterpret_cast<const device int*>(l.bases);
+        for (uint e = l.first + tid; e < l.entries; e += threads_in) {
+            const ulong slot = ulong(l.base) + ulong(e) * T;
+            if (slot < ulong(f0) * S) continue;
+            const ulong j = slot / S - f0;
+            if (j >= cap) {
+                fault_max(r.faults, l.lane, PIE_PAGES_SHORT);
+                continue;
+            }
+            const uint q = list[j];
+            if (q >= K) {
+                fault_max(r.faults, l.lane, q >= Q ? PIE_PAGES_PAST_RESERVE : PIE_PAGES_EXHAUSTED);
+                continue;
+            }
+            const ulong sigma = (ulong(f0) + q) * S + slot % S;
+            if (sigma < l.base || (sigma - l.base) / T >= l.bases_len) {
+                fault_max(r.faults, l.lane, PIE_PAGES_PAST_RESERVE);
+                continue;
+            }
+            pages[e - l.first] = bases[(sigma - l.base) / T];
+        }
+    }
     threadgroup_barrier(mem_flags::mem_device);
     if (tid == 0u) {
         header[0] = 1u;
@@ -325,5 +376,77 @@ kernel void beam_copy_pages(
         const device uchar* f = reinterpret_cast<const device uchar*>(from_at);
         device uchar* t = reinterpret_cast<device uchar*>(to_at);
         for (ulong i = tid; i < bytes; i += threads_in) t[i] = f[i];
+    }
+}
+
+// A beam's rs copy (§11.2): the first `tokens` slots of pool page `src` to
+// pool page `dst` (the `[src, dst, tokens]` its group's step left at
+// `copy`), row by row of each plane, through the set's rs entries (`bases`:
+// slab slots, as `BeamRsRun`'s, each a page of `page_bytes` in `slab`): a
+// slot below the buffer (the prompt's tail, in the state) has no row and is
+// skipped.
+struct RsCopyRun {
+    ulong copy;
+    ulong bases;
+    ulong fault;
+    ulong slab;
+    uint reserve;
+    uint page;
+    uint tokens;
+    uint base;
+    uint f0;
+    uint floor_rel;
+    uint plane_at;
+    uint planes;
+    uint bases_len;
+    uint page_bytes;
+};
+
+// Copies each run's rows, a threadgroup a (run, plane), a slot's row a step:
+// after the head step and its kv copies, ahead of the fire's first append or
+// read. A copy out of its bounds copies nothing past the fault and states
+// the lane's fault.
+kernel void copy_rs_rows(
+    const device RsCopyRun* runs [[buffer(0)]],
+    const device PagePlane* planes [[buffer(1)]],
+    constant uint& run_count [[buffer(2)]],
+    uint3 at [[threadgroup_position_in_grid]],
+    uint3 tid3 [[thread_position_in_threadgroup]],
+    uint3 threads3 [[threads_per_threadgroup]])
+{
+    const uint tid = tid3.x, threads_in = threads3.x;
+    const uint run = at.x;
+    if (run >= run_count) return;
+    const RsCopyRun r = runs[run];
+    if (at.y >= r.planes) return;
+    const device uint* copy = reinterpret_cast<const device uint*>(r.copy);
+    const uint src = copy[0], dst = copy[1], tokens = copy[2];
+    if (tokens == 0u || src == dst) return;
+    device atomic_uint* fault = reinterpret_cast<device atomic_uint*>(r.fault);
+    if (src >= r.reserve || dst >= r.reserve || tokens > r.page
+        || ulong(dst) * r.page < r.floor_rel) {
+        if (at.y == 0u && tid == 0u) {
+            atomic_fetch_max_explicit(fault, PIE_PAGES_COPY_BOUNDS, memory_order_relaxed);
+        }
+        return;
+    }
+    const PagePlane plane = planes[r.plane_at + at.y];
+    const ulong T = r.tokens == 0u ? 1u : r.tokens;
+    const device int* bases = reinterpret_cast<const device int*>(r.bases);
+    device uchar* slab = reinterpret_cast<device uchar*>(r.slab);
+    for (uint k = 0u; k < tokens; ++k) {
+        const ulong from_slot = (ulong(r.f0) + src) * r.page + k;
+        const ulong to_slot = (ulong(r.f0) + dst) * r.page + k;
+        if (from_slot < r.base || to_slot < r.base) continue;
+        const ulong fe = (from_slot - r.base) / T, te = (to_slot - r.base) / T;
+        if (fe >= r.bases_len || te >= r.bases_len) {
+            if (tid == 0u) atomic_fetch_max_explicit(fault, PIE_PAGES_COPY_BOUNDS, memory_order_relaxed);
+            return;
+        }
+        const device uchar* from = slab + pie_page_at(uint(bases[fe]), r.page_bytes, 1) + plane.offset
+                                   + ((from_slot - r.base) % T) * plane.cell;
+        device uchar* to = slab + pie_page_at(uint(bases[te]), r.page_bytes, 1) + plane.offset
+                           + ((to_slot - r.base) % T) * plane.cell;
+        for (ulong b = tid; b < plane.cell; b += threads_in) to[b] = from[b];
     }
 }

@@ -71,7 +71,51 @@ pub struct BeamStepRun {
     pub list_count: u32,
     pub frames: u32,
     pub backed: u32,
-    pub pad: u32,
+    /// The hybrid lanes' rs page tables to resolve ([`BeamRsRun`]s at `rs`).
+    pub rs_count: u32,
+    pub rs: u64,
+}
+
+/// A hybrid lane's rs page table to resolve (`BEAM-PAGE-LISTS.md` §11.1):
+/// its row's slot entries from the one holding buffer entry `first`
+/// (`pages`, past the row's in-page header), entry `e` the rows of slot
+/// `base + e * tokens` on, through `entries`, each resolved to the set's
+/// entry (`bases`: its entries' slab slots, `bases_len` of them) holding
+/// the same rows of its beam's list's page.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BeamRsRun {
+    pub pages: u64,
+    pub bases: u64,
+    pub lane: u32,
+    pub first: u32,
+    pub entries: u32,
+    pub base: u32,
+    pub tokens: u32,
+    pub bases_len: u32,
+}
+
+/// A beam's rs copy (`BEAM-PAGE-LISTS.md` §11.2): the `[src, dst, tokens]`
+/// its group's step left at `copy`, moved row by row of each plane through
+/// the set's rs entries (`bases`: slab slots of `page_bytes` pages in
+/// `slab`); slots below the buffer have no row.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RsCopyRun {
+    pub copy: u64,
+    pub bases: u64,
+    pub fault: u64,
+    pub slab: u64,
+    pub reserve: u32,
+    pub page: u32,
+    pub tokens: u32,
+    pub base: u32,
+    pub f0: u32,
+    pub floor_rel: u32,
+    pub plane_at: u32,
+    pub planes: u32,
+    pub bases_len: u32,
+    pub page_bytes: u32,
 }
 
 /// A beam's copy over the kv planes a page holds.
@@ -147,7 +191,40 @@ impl Record for BeamStepRun {
             self.list_count,
             self.frames,
             self.backed,
-            self.pad,
+            self.rs_count,
+        ] {
+            put32(out, v);
+        }
+        put64(out, self.rs);
+    }
+}
+
+impl Record for BeamRsRun {
+    fn put(&self, out: &mut Vec<u8>) {
+        put64(out, self.pages);
+        put64(out, self.bases);
+        for v in [self.lane, self.first, self.entries, self.base, self.tokens, self.bases_len] {
+            put32(out, v);
+        }
+    }
+}
+
+impl Record for RsCopyRun {
+    fn put(&self, out: &mut Vec<u8>) {
+        for v in [self.copy, self.bases, self.fault, self.slab] {
+            put64(out, v);
+        }
+        for v in [
+            self.reserve,
+            self.page,
+            self.tokens,
+            self.base,
+            self.f0,
+            self.floor_rel,
+            self.plane_at,
+            self.planes,
+            self.bases_len,
+            self.page_bytes,
         ] {
             put32(out, v);
         }
@@ -192,7 +269,9 @@ impl Record for u64 {
 
 const _: () = {
     assert!(core::mem::size_of::<BeamListRun>() == 40);
-    assert!(core::mem::size_of::<BeamStepRun>() == 80);
+    assert!(core::mem::size_of::<BeamStepRun>() == 88);
+    assert!(core::mem::size_of::<BeamRsRun>() == 40);
+    assert!(core::mem::size_of::<RsCopyRun>() == 72);
     assert!(core::mem::size_of::<PageCopyRun>() == 48);
     assert!(core::mem::size_of::<PagePlane>() == 16);
 };
@@ -200,8 +279,12 @@ const _: () = {
 /// The pipelines the head step dispatches: a load builds them before
 /// ready, where any fire may meet a beam group.
 #[must_use]
-pub fn pipelines() -> [Fire; 2] {
-    [Fire::at(FILE, "beam_step"), Fire::at(FILE, "beam_copy_pages")]
+pub fn pipelines() -> [Fire; 3] {
+    [
+        Fire::at(FILE, "beam_step"),
+        Fire::at(FILE, "beam_copy_pages"),
+        Fire::at(FILE, "copy_rs_rows"),
+    ]
 }
 
 /// Runs `run_count` [`BeamStepRun`]s from `runs` (bytes), a threadgroup a
@@ -233,6 +316,28 @@ pub fn beam_copy_pages(
     }
     ctx.fire(
         Fire::at(FILE, "beam_copy_pages").apply(Grid::of(
+            [COPY_THREADS * run_count, max_planes, 1],
+            [COPY_THREADS, 1, 1],
+        )),
+        &[runs.arg(), planes.arg(), run_count.arg()],
+    )
+}
+
+/// Copies `run_count` [`RsCopyRun`]s from `runs` over their planes of
+/// `planes`, a threadgroup a (run, plane); `max_planes` the most a run spans
+/// (`BEAM-PAGE-LISTS.md` §11.2).
+pub fn copy_rs_rows(
+    ctx: &Ctx<'_>,
+    runs: Tensor,
+    planes: Tensor,
+    run_count: u32,
+    max_planes: u32,
+) -> Result<(), Error> {
+    if run_count == 0 || max_planes == 0 {
+        return Ok(());
+    }
+    ctx.fire(
+        Fire::at(FILE, "copy_rs_rows").apply(Grid::of(
             [COPY_THREADS * run_count, max_planes, 1],
             [COPY_THREADS, 1, 1],
         )),

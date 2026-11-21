@@ -227,7 +227,8 @@ pub fn plan(
             list_count,
             frames: group.layout.frames,
             backed,
-            pad: 0,
+            rs_count: 0,
+            rs: 0,
         });
         let bases_at = records.bases.len() as u32;
         records.bases.extend_from_slice(&bases);

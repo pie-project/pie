@@ -18,7 +18,7 @@ use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::Tensor;
 use kernels_metal::runtime::beam::{
-    self as kbeam, BeamListRun, BeamStepRun, PageCopyRun, PagePlane, Record,
+    self as kbeam, BeamListRun, BeamRsRun, BeamStepRun, PageCopyRun, PagePlane, Record, RsCopyRun,
 };
 use poem_ir::Dtype;
 
@@ -103,7 +103,15 @@ impl Dev {
     }
 }
 
-fn search(dev: &Dev, lanes: u32, folded: u32, steps: u32, seed: u64) {
+/// The set's rs entry `a` as the tests stage it: a slab slot id.
+fn set_entry(a: u32) -> i32 {
+    5000 + a as i32
+}
+
+/// A search over `steps` fires; with `rs_t > 0` a hybrid's too: each beam's
+/// rs page table of `rs_t` rows a page from a buffer base off the kv page
+/// boundary, resolved by the step (§11.1) and checked fire by fire.
+fn search(dev: &Dev, lanes: u32, folded: u32, steps: u32, seed: u64, rs_t: u32) {
     let f0 = folded / PAGE;
     let columns = (folded + steps - 1) / PAGE - f0 + 1;
     let reserve = lanes * columns + lanes + lanes * FRAMES + u32::from(folded % PAGE > 0);
@@ -119,6 +127,16 @@ fn search(dev: &Dev, lanes: u32, folded: u32, steps: u32, seed: u64) {
     let faults_at = arena.take(u64::from(lanes) * 4);
     let indices_at = arena.take(u64::from(lanes * cap) * 4);
     let writes_at = arena.take(u64::from(lanes) * 4);
+    // A hybrid's rs tables: the buffer based at a multiple of `rs_t` below
+    // `folded` (two rs pages below its kv page's start where it can be, so
+    // frozen entries stand below `f0 S`), entries through the last fire's.
+    let rt = rs_t.max(1);
+    let rs_base = ((f0 * PAGE).saturating_sub(2 * rt) / rt) * rt;
+    let rs_cap = (folded + steps - rs_base) / rt + 1;
+    let rs_len = ((f0 + reserve) * PAGE - rs_base) / rt;
+    let rs_runs_at = arena.take(u64::from(lanes) * std::mem::size_of::<BeamRsRun>() as u64);
+    let rs_pages_at = arena.take(u64::from(lanes * rs_cap) * 4);
+    let rs_bases_at = arena.take(u64::from(rs_len) * 4);
     let mut buffer = Buffer::zeroed(&dev.device, arena.at).expect("a buffer");
     let base = buffer.address_at(0).expect("an address");
     let address = move |at: u64| base + at;
@@ -134,6 +152,8 @@ fn search(dev: &Dev, lanes: u32, folded: u32, steps: u32, seed: u64) {
     );
     let trans: Vec<i32> = (0..reserve).map(device_id).collect();
     buffer.write(trans_at, &bytes_of(&trans)).expect("trans");
+    let set: Vec<i32> = (0..rs_len).map(set_entry).collect();
+    buffer.write(rs_bases_at, &bytes_of(&set)).expect("the set's rs entries");
     let mut replay = State::new(lanes, cap, FRAMES);
     let mut rng = Lcg(seed);
     let runs = dev.handles.bind(&buffer, 0, buffer.bytes()).expect("the runs");
@@ -174,6 +194,27 @@ fn search(dev: &Dev, lanes: u32, folded: u32, steps: u32, seed: u64) {
             })
             .collect();
         buffer.write(lists_at, &bytes_of(&lists)).expect("lists");
+        // Each beam's rs row, staged as the set's (-1 here, so an entry the
+        // step leaves reads as left), entries through this fire's row.
+        let rs_entries = (slot - rs_base) / rt + 1;
+        if rs_t > 0 {
+            buffer
+                .write(rs_pages_at, &bytes_of(&vec![-1i32; (lanes * rs_cap) as usize]))
+                .expect("rs pages");
+            let rs_runs: Vec<BeamRsRun> = (0..lanes)
+                .map(|b| BeamRsRun {
+                    pages: address(rs_pages_at) + u64::from(b * rs_cap) * 4,
+                    bases: address(rs_bases_at),
+                    lane: b,
+                    first: 0,
+                    entries: rs_entries,
+                    base: rs_base,
+                    tokens: rs_t,
+                    bases_len: rs_len,
+                })
+                .collect();
+            buffer.write(rs_runs_at, &bytes_of(&rs_runs)).expect("rs runs");
+        }
         let run = BeamStepRun {
             state: a_state,
             parents: a_parents,
@@ -189,11 +230,13 @@ fn search(dev: &Dev, lanes: u32, folded: u32, steps: u32, seed: u64) {
             list_count: lanes,
             frames: FRAMES,
             backed: pool,
-            pad: 0,
+            rs_count: if rs_t > 0 { lanes } else { 0 },
+            rs: if rs_t > 0 { address(rs_runs_at) } else { 0 },
         };
         buffer.write(run_at, &bytes_of(&[run])).expect("the run");
         dev.run(&|sink| {
-            kbeam::beam_step(sink, Tensor::new(runs, 1, 80, Dtype::U8), 1).expect("beam_step encodes");
+            let width = std::mem::size_of::<BeamStepRun>() as u32;
+            kbeam::beam_step(sink, Tensor::new(runs, 1, width, Dtype::U8), 1).expect("beam_step encodes");
         });
         let want = beam::step(
             &mut replay,
@@ -244,7 +287,144 @@ fn search(dev: &Dev, lanes: u32, folded: u32, steps: u32, seed: u64) {
                 "{at}: beam {b}'s write page"
             );
         }
+        if rs_t > 0 {
+            // §11.1 over the replay's map': a frozen entry left, every other
+            // the set's entry holding the same rows of the beam's list's page.
+            let held = words(&dev.read(&buffer, rs_pages_at, u64::from(lanes * rs_cap) * 4));
+            for b in 0..lanes as usize {
+                for e in 0..rs_entries {
+                    let rs_slot = rs_base + e * rt;
+                    let want_entry = if rs_slot < f0 * PAGE {
+                        -1i32
+                    } else {
+                        let q = want.lists[b][(rs_slot / PAGE - f0) as usize];
+                        let sigma = (f0 + q) * PAGE + rs_slot % PAGE;
+                        set_entry((sigma - rs_base) / rt)
+                    };
+                    assert_eq!(
+                        held[b * rs_cap as usize + e as usize] as i32,
+                        want_entry,
+                        "{at}: T {rs_t} base {rs_base}: beam {b}'s rs entry {e} (slot {rs_slot})"
+                    );
+                }
+            }
+        }
     }
+}
+
+/// §11.2 over the four planes of a gated-delta row (conv x, [b|a], keys,
+/// u: four cells of different widths), rs pages of `T` = 2 rows from a
+/// buffer base at slot 38 (off the kv page of 16): a fork's copy that ends
+/// mid rs page, one from the prompt's own page (its slots below the base
+/// skipped), and one out of bounds that faults and moves nothing. Every
+/// destination row is its source row; every other byte stays.
+fn rs_copies_move_every_plane(dev: &Dev) {
+    const S: u32 = 16;
+    const T: u32 = 2;
+    const BASE: u32 = 38;
+    let f0 = BASE / S;
+    let reserve = 6u32;
+    let planes = [
+        PagePlane { offset: 0, cell: 24 },
+        PagePlane { offset: 2 * 24, cell: 8 },
+        PagePlane { offset: 2 * 24 + 2 * 8, cell: 64 },
+        PagePlane { offset: 2 * 24 + 2 * 8 + 2 * 64, cell: 128 },
+    ];
+    let row_bytes: u64 = planes.iter().map(|p| 2 * p.cell).sum();
+    let page_bytes = row_bytes.next_multiple_of(256);
+    let entries = ((f0 + reserve) * S - BASE) / T;
+    // The set's entries on slab slots in reverse, so an entry is not its
+    // slot: a copy that confused them would land elsewhere.
+    let set: Vec<i32> = (0..entries).map(|a| (entries - 1 - a) as i32).collect();
+    let mut arena = Arena { at: 0 };
+    let runs_at = arena.take(3 * std::mem::size_of::<RsCopyRun>() as u64);
+    let planes_at = arena.take(std::mem::size_of_val(&planes) as u64);
+    let copy_at = arena.take(9 * 4);
+    let fault_at = arena.take(3 * 4);
+    let set_at = arena.take(u64::from(entries) * 4);
+    let slab_at = arena.take(u64::from(entries) * page_bytes).next_multiple_of(256);
+    let mut buffer = Buffer::zeroed(&dev.device, slab_at + u64::from(entries) * page_bytes + 256)
+        .expect("a buffer");
+    let base = buffer.address_at(0).expect("an address");
+    let address = move |at: u64| base + at;
+    let content: Vec<u8> = (0..u64::from(entries) * page_bytes)
+        .map(|i| (i * 13 + 5) as u8)
+        .collect();
+    buffer.write(slab_at, &content).expect("the slab");
+    buffer.write(set_at, &bytes_of(&set)).expect("the set's entries");
+    buffer.write(planes_at, &bytes_of(&planes)).expect("planes");
+    // Beam 0: 5 slots of pool page 1 onto page 3 (ends mid rs page). Beam 1:
+    // 9 slots of page 0 (the prompt's own, from slot 32: 32..37 below the
+    // base) onto page 4. Beam 2: a copy onto page 9, past the pool.
+    let copies = [[1u32, 3, 5], [0, 4, 9], [0, 9, 5]];
+    buffer
+        .write(copy_at, &bytes_of(&copies.concat()))
+        .expect("copies");
+    let run = |beam: u64| RsCopyRun {
+        copy: address(copy_at + beam * 12),
+        bases: address(set_at),
+        fault: address(fault_at + beam * 4),
+        slab: address(slab_at),
+        reserve,
+        page: S,
+        tokens: T,
+        base: BASE,
+        f0,
+        floor_rel: 0,
+        plane_at: 0,
+        planes: 4,
+        bases_len: entries,
+        page_bytes: u32::try_from(page_bytes).expect("a page's bytes"),
+    };
+    buffer.write(runs_at, &bytes_of(&[run(0), run(1), run(2)])).expect("runs");
+    let runs = dev.handles.bind(&buffer, runs_at, buffer.bytes() - runs_at).expect("runs");
+    let planes_h = dev
+        .handles
+        .bind(&buffer, planes_at, std::mem::size_of_val(&planes) as u64)
+        .expect("planes");
+    let width = std::mem::size_of::<RsCopyRun>() as u32;
+    dev.run(&|sink| {
+        kbeam::copy_rs_rows(
+            sink,
+            Tensor::new(runs, 3, width, Dtype::U8),
+            Tensor::new(planes_h, 4, 16, Dtype::U8),
+            3,
+            4,
+        )
+        .expect("copy_rs_rows encodes");
+    });
+    let after = dev.read(&buffer, slab_at, u64::from(entries) * page_bytes);
+    let mut want = content.clone();
+    let row_at = |slot: u32, plane: &PagePlane| -> usize {
+        let a = (slot - BASE) / T;
+        (u64::from(set[a as usize] as u32) * page_bytes
+            + plane.offset
+            + u64::from((slot - BASE) % T) * plane.cell) as usize
+    };
+    for [src, dst, tokens] in copies {
+        if dst >= reserve || src >= reserve {
+            continue;
+        }
+        for k in 0..tokens {
+            let (from, to) = ((f0 + src) * S + k, (f0 + dst) * S + k);
+            if from < BASE || to < BASE {
+                continue;
+            }
+            for plane in &planes {
+                let n = plane.cell as usize;
+                let (f, d) = (row_at(from, plane), row_at(to, plane));
+                let src_row = content[f..f + n].to_vec();
+                want[d..d + n].copy_from_slice(&src_row);
+            }
+        }
+    }
+    assert_eq!(after, want, "every copied row of all four planes, nothing else");
+    let faults = words(&dev.read(&buffer, fault_at, 12));
+    assert_eq!(
+        faults,
+        vec![0, 0, kbeam::PAGES_COPY_BOUNDS],
+        "only the copy past the pool faults its lane"
+    );
 }
 
 /// A fork's tail copy over two planes of a page, and a copy past the pool
@@ -330,9 +510,14 @@ fn a_beam_step_follows_the_spec() {
     for lanes in [2, 4, 8] {
         for folded in [37, 32] {
             for seed in 0..3 {
-                search(&dev, lanes, folded, 3 * PAGE + 9, seed);
+                search(&dev, lanes, folded, 3 * PAGE + 9, seed, 0);
+            }
+            // A hybrid's rs tables beside, at T = 1, 2 and 4 rows a page.
+            for rs_t in [1, 2, 4] {
+                search(&dev, lanes, folded, 3 * PAGE + 9, 7, rs_t);
             }
         }
     }
     copies_move_every_plane(&dev);
+    rs_copies_move_every_plane(&dev);
 }
