@@ -78,6 +78,12 @@ struct BeamAt {
     lists_cap: u64,
     planes_cap: u64,
     pages_cap: u64,
+    /// A hybrid's (BEAM-PAGE-LISTS §11): its beams' rs page tables, the
+    /// sets' rs entries and its beams' rs copies.
+    rs_runs: u64,
+    rs_bases: u64,
+    rs_copies: u64,
+    rs_entries_cap: u64,
 }
 
 /// What a fire's beam groups stage ([`Inputs::stage_beam`]): every record
@@ -91,6 +97,11 @@ pub struct BeamRecords {
     pub trans: Vec<i32>,
     pub bases: Vec<u64>,
     pub lanes: u32,
+    /// A hybrid's beams' rs page tables, its sets' rs entries (slab
+    /// slots) and its beams' rs copies (BEAM-PAGE-LISTS §11).
+    pub rs: Vec<kernels_metal::runtime::beam::BeamRsRun>,
+    pub rs_bases: Vec<i32>,
+    pub rs_copies: Vec<kernels_metal::runtime::beam::RsCopyRun>,
 }
 
 /// The GPU addresses a fire's beam records point into.
@@ -100,6 +111,8 @@ pub struct BeamAddresses {
     pub trans: u64,
     pub bases: u64,
     pub faults: u64,
+    pub rs: u64,
+    pub rs_bases: u64,
 }
 
 /// The staged records, as the head step's kernels bind them.
@@ -111,6 +124,9 @@ pub struct BeamStaged {
     pub planes: Tensor,
     pub copy_count: u32,
     pub plane_count: u32,
+    /// A hybrid's rs copies (`copy_rs_rows`), over the same planes.
+    pub rs_copies: Tensor,
+    pub rs_copy_count: u32,
 }
 
 /// A fire's beam fault words, read once its command buffer completes
@@ -541,7 +557,17 @@ impl Inputs {
             trans: at(self.beam.trans)?,
             bases: at(self.beam.bases)?,
             faults: at(self.beam.faults)?,
+            rs: at(self.beam.rs_runs)?,
+            rs_bases: at(self.beam.rs_bases)?,
         })
+    }
+
+    /// The GPU address of the fire's rs page table (a lane's row of
+    /// [`Self::rs_page_ints`] ints a seat), as a beam's rs runs point
+    /// into it.
+    #[must_use]
+    pub fn rs_pages_address(&self) -> Option<u64> {
+        self.store.view().address_at(self.store.at(self.rs_pages))
     }
 
     /// Stages a fire's beam records, its fault words zeroed; `None` where
@@ -573,6 +599,9 @@ impl Inputs {
         fits("kv planes a beam page copy spans", records.planes.len(), b.planes_cap)?;
         fits("beam pool pages in one fire", records.trans.len(), b.pages_cap)?;
         fits("beam pool pages copied in one fire", records.bases.len(), b.pages_cap)?;
+        fits("beam rs page tables in one fire", records.rs.len(), b.lanes)?;
+        fits("beam rs copies in one fire", records.rs_copies.len(), b.lanes)?;
+        fits("beam sets' rs entries in one fire", records.rs_bases.len(), b.rs_entries_cap)?;
         self.store.write(b.groups, &bytes(&records.groups))?;
         self.store.write(b.lists, &bytes(&records.lists))?;
         self.store.write(b.copies, &bytes(&records.copies))?;
@@ -580,13 +609,16 @@ impl Inputs {
         self.store.write(b.trans, &bytes(&records.trans))?;
         self.store.write(b.bases, &bytes(&records.bases))?;
         self.store.write(b.faults, &vec![0u8; records.lanes as usize * 4])?;
+        self.store.write(b.rs_runs, &bytes(&records.rs))?;
+        self.store.write(b.rs_bases, &bytes(&records.rs_bases))?;
+        self.store.write(b.rs_copies, &bytes(&records.rs_copies))?;
         let view = self.store.view();
         let bind = |offset: u64, count: usize, size: usize| -> Result<Tensor> {
             let len = (count.max(1) * size) as u64;
             let handle = handles.bind(view, self.store.at(offset), len)?;
             Ok(Tensor::new(handle, count.max(1) as u32, size as u32, Dtype::U8))
         };
-        use kernels_metal::runtime::beam::{BeamStepRun, PageCopyRun, PagePlane};
+        use kernels_metal::runtime::beam::{BeamStepRun, PageCopyRun, PagePlane, RsCopyRun};
         Ok(Some(BeamStaged {
             groups: bind(b.groups, records.groups.len(), std::mem::size_of::<BeamStepRun>())?,
             group_count: records.groups.len() as u32,
@@ -594,6 +626,8 @@ impl Inputs {
             planes: bind(b.planes, records.planes.len(), std::mem::size_of::<PagePlane>())?,
             copy_count: records.copies.len() as u32,
             plane_count: records.planes.len() as u32,
+            rs_copies: bind(b.rs_copies, records.rs_copies.len(), std::mem::size_of::<RsCopyRun>())?,
+            rs_copy_count: records.rs_copies.len() as u32,
         }))
     }
 
@@ -751,10 +785,14 @@ impl Inputs {
         // lane; a list a lane a table; a page a lane's table holds plus
         // the pages a fire hands out and holds pending (BEAM-PAGE-LISTS §3).
         let beam = {
-            use kernels_metal::runtime::beam::{BeamListRun, BeamStepRun, PageCopyRun, PagePlane};
+            use kernels_metal::runtime::beam::{
+                BeamListRun, BeamRsRun, BeamStepRun, PageCopyRun, PagePlane, RsCopyRun,
+            };
             let lists_cap = lanes * page_tables.len().max(1) as u64;
             let planes_cap = 1024u64;
             let pages_cap = pages + lanes * 16 + 64;
+            // A set's rs entries: at most 16 rs pages a kv page (T >= S / 16).
+            let rs_entries_cap = pages_cap * 16;
             BeamAt {
                 groups: take(lanes * std::mem::size_of::<BeamStepRun>() as u64),
                 lists: take(lists_cap * std::mem::size_of::<BeamListRun>() as u64),
@@ -767,6 +805,10 @@ impl Inputs {
                 lists_cap,
                 planes_cap,
                 pages_cap,
+                rs_runs: take(lanes * std::mem::size_of::<BeamRsRun>() as u64),
+                rs_bases: take(rs_entries_cap * 4),
+                rs_copies: take(lanes * std::mem::size_of::<RsCopyRun>() as u64),
+                rs_entries_cap,
             }
         };
         let total = at;

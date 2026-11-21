@@ -512,7 +512,7 @@ mod page_tests {
             scatter: Some(run(5, 1)),
             ..LanePlan::default()
         };
-        let ints = super::page_ints(64, 16);
+        let ints = super::page_ints(256, 16);
         assert!(page_table(&[one], 16, ints).unwrap().is_some(), "one run reads in place");
         let two = LanePlan {
             replay: 2,
@@ -619,6 +619,19 @@ impl Buffers {
         self.page_tokens
     }
 
+    /// The GPU address an rs page id's slot is reached from (`pie_page_at`
+    /// over the pool's first buffer), as a beam's rs copies address it.
+    #[must_use]
+    pub fn slab_address(&self) -> Option<u64> {
+        self.parts.first()?.address_at(0)
+    }
+
+    /// Each plane's rows' byte offset in an rs page.
+    #[must_use]
+    pub fn plane_offsets(&self) -> &[u64] {
+        &self.plane_at
+    }
+
     #[must_use]
     pub fn page_bytes(&self) -> u64 {
         self.page_bytes
@@ -635,18 +648,19 @@ impl Buffers {
 /// The ints of one lane's row in the page table a verify arm reads its
 /// buffer through (the in-page token of the lane's first extended row, or
 /// -1 for a lane that buffers nothing, then the slab slots of the pages its
-/// extended rows touch) at a rung of `rung_tokens`, over an rs buffer of
-/// `page_tokens` rows a page: the pages of the most rows a lane touches in
-/// one fire (its carried rows, which the shell bounds by the rung's tokens,
-/// and its own, at most as many) from any in-page offset, and the header.
-/// 0 where the load buffers no rs row.
+/// extended rows touch) over an rs buffer of `page_tokens` rows a page, for
+/// a load of `context` tokens: the pages of the most rows a lane touches in
+/// one fire (its buffered rows and its own, all within its context: a
+/// decode lane's carried rows count toward no rung, as
+/// `engine::fire::lane_carried` states, and a beam in a parents pass
+/// carries every row since its fold) from any in-page offset, and the
+/// header. 0 where the load buffers no rs row.
 #[must_use]
-pub fn page_ints(rung_tokens: u32, page_tokens: u32) -> u32 {
+pub fn page_ints(context: u32, page_tokens: u32) -> u32 {
     if page_tokens == 0 {
         return 0;
     }
-    let rows = rung_tokens.saturating_mul(2);
-    1 + (page_tokens - 1).saturating_add(rows).div_ceil(page_tokens)
+    1 + (page_tokens - 1).saturating_add(context).div_ceil(page_tokens)
 }
 
 /// The page table of `lanes`, one `ints` row a lane ([`page_ints`]); `None`

@@ -1056,7 +1056,7 @@ impl PreparedLoad<'_> {
                             window_pages_per_slot,
                             feeds.ragged.len(),
                             crate::rs::page_ints(
-                                *tokens,
+                                boot.context,
                                 rows.rs.as_ref().map_or(0, |rs| rs.tokens),
                             ),
                         )
@@ -4432,6 +4432,12 @@ impl Shell {
         // (checked backed) once the fire's segments are committed.
         let mut state_ids: Vec<u32> = Vec::new();
         let mut rs_plans: Vec<engine::rs::LanePlan> = Vec::with_capacity(lanes.len());
+        // Per seat, its buffer's base and its set's rs pages (slab slots),
+        // where it buffers: what a hybrid's beams resolve over (§11).
+        let mut rs_sets: Vec<Option<(u32, Vec<u32>)>> = Vec::with_capacity(lanes.len());
+        // Per seat, its own rows: what its carried rows count toward the
+        // rung by (`engine::fire::lane_carried`).
+        let mut rs_own: Vec<u32> = Vec::with_capacity(lanes.len());
         // Per reporting lane whose rows a port places, one past the last
         // slot they land at, in the set's own numbering (`KvWrites::end`).
         let mut ends: Vec<engine::KvWrites> = Vec::new();
@@ -4813,6 +4819,11 @@ impl Shell {
                     at += width as usize;
                 }
             }
+            rs_sets.push(match &rs {
+                engine::fire::RsVerb::Buffer { pages, base, .. } => Some((*base, pages.clone())),
+                _ => None,
+            });
+            rs_own.push(row.rows);
             rs_plans.push(plan);
             if !seated.positions.is_empty() && seated.positions.len() != lane.tokens.len() {
                 return Err(Fault::Positions {
@@ -5076,7 +5087,7 @@ impl Shell {
         let geometries = geometries;
         // The beam groups' head step, planned over the tables as staged
         // (BEAM-PAGE-LISTS §6): its records point into this arm's inputs.
-        let (beam_records, beam_faults) = if beam_groups.is_empty() || self.warming {
+        let (mut beam_records, beam_faults) = if beam_groups.is_empty() || self.warming {
             (crate::inputs::BeamRecords::default(), Vec::new())
         } else {
             for group in &mut beam_groups {
@@ -5237,20 +5248,27 @@ impl Shell {
         let rs_replay: Vec<i32> = rs_plans.iter().map(|plan| plan.replay as i32).collect();
         let rs_commit: Vec<i32> = rs_plans.iter().map(|plan| plan.commit as i32).collect();
         let carried = rs_plans.iter().map(|plan| plan.replay).sum::<u32>();
-        // The rows the lanes carry in, summed, are no more than the tokens of
-        // the rung the fire stages in (`engine::fire::rung_rows`): the
-        // runtime asks the rung for them, and its rs scratch holds that many
-        // beside the fire's own rows. Where the device places a lane's rows
-        // only the engine counts them; a count past the rung is a wrong
-        // count, refused by name before anything is encoded.
+        // The rows the lanes carry in, counted as the runtime counts them
+        // toward the rung (`engine::fire::lane_carried`: a decode lane's
+        // none, its step reading them in place through its page table; a
+        // wider lane's all), are no more than the tokens of the rung the
+        // fire stages in (`engine::fire::rung_rows`). Where the device
+        // places a lane's rows only the engine counts them; a count past the
+        // rung is a wrong count, refused by name before anything is
+        // encoded. The rs scratch's own bound is checked at the seat.
+        let counted = rs_plans
+            .iter()
+            .zip(&rs_own)
+            .map(|(plan, &own)| engine::fire::lane_carried(own, plan.replay))
+            .sum::<u32>();
         let rung_tokens = self.arena.current_tokens();
-        if rs_active && carried > rung_tokens {
+        if rs_active && counted > rung_tokens {
             return Err(Fault::program(
                 "serve::rs",
                 format!(
-                    "this fire's lanes carry {carried} recurrent rows into it, past the \
-                     {rung_tokens} tokens of the rung it stages in (engine::fire::rung_rows); \
-                     the fire is refused and writes nothing"
+                    "this fire's lanes carry {counted} recurrent rows into it toward the rung, \
+                     past the {rung_tokens} tokens of the rung it stages in \
+                     (engine::fire::rung_rows); the fire is refused and writes nothing"
                 ),
             ));
         }
@@ -5262,6 +5280,48 @@ impl Shell {
             }
             _ => None,
         };
+        // A hybrid's beams (BEAM-PAGE-LISTS §11): each beam's rs page table,
+        // resolved over its list by the head step, and its rs copies over
+        // every rs plane, through its set's rs entries.
+        if !beam_records.groups.is_empty()
+            && let (Some(_), Some(buffers), Some(layout)) =
+                (rs_pages.as_ref(), self.rs_buffers.as_ref(), self.rs_layout.as_ref())
+        {
+            let inputs = &self.inputs[self.arena.current()][arm];
+            let addresses = inputs.beam_addresses().ok_or_else(|| {
+                Fault::program("serve::prepare", "the beam step's inputs have no address")
+            })?;
+            let table = inputs.rs_pages_address().ok_or_else(|| {
+                Fault::program("serve::prepare", "the rs page table has no staged address")
+            })?;
+            let slab = buffers.slab_address().ok_or_else(|| {
+                Fault::program("serve::prepare", "the rs buffer's pool has no GPU address")
+            })?;
+            let planes = buffers
+                .plane_offsets()
+                .iter()
+                .zip(&layout.planes)
+                .map(|(&offset, plane)| kernels_metal::runtime::beam::PagePlane {
+                    offset,
+                    cell: plane.row_bytes,
+                })
+                .collect();
+            crate::beam::plan_rs(
+                &mut beam_records,
+                &beam_groups,
+                &crate::beam::RsStaged {
+                    sets: &rs_sets,
+                    plans: &rs_plans,
+                    table,
+                    ints: rs_page_ints,
+                    page_tokens: buffers.page_tokens(),
+                    page_bytes: buffers.page_bytes(),
+                    slab,
+                    planes,
+                },
+                &addresses,
+            )?;
+        }
         if rs_active {
             let layout = self
                 .rs_layout
@@ -6079,6 +6139,21 @@ impl Shell {
                     beam.copies,
                     beam.planes,
                     beam.copy_count,
+                    beam.plane_count,
+                )
+                .map_err(crate::error::kernel)?;
+            }
+            // A hybrid's rs copies (BEAM-PAGE-LISTS §11.2), after the kv
+            // copies and ahead of the fire's first append or read.
+            if beam.rs_copy_count > 0 {
+                #[cfg(target_vendor = "apple")]
+                frame.next_pass()?;
+                let sink = Sink::new(&self.device, &frame, &self.pipelines, &self.handles);
+                kernels_metal::runtime::beam::copy_rs_rows(
+                    &sink,
+                    beam.rs_copies,
+                    beam.planes,
+                    beam.rs_copy_count,
                     beam.plane_count,
                 )
                 .map_err(crate::error::kernel)?;

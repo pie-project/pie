@@ -18,7 +18,9 @@
 use crate::error::{Fault, Result};
 use crate::inputs::{BeamAddresses, BeamRecords};
 use crate::program::BeamLayout;
-use kernels_metal::runtime::beam::{self as kbeam, BeamListRun, BeamStepRun, PageCopyRun};
+use kernels_metal::runtime::beam::{
+    self as kbeam, BeamListRun, BeamRsRun, BeamStepRun, PageCopyRun, RsCopyRun,
+};
 
 /// A beam group of a fire: one instance's lanes.
 #[derive(Clone, Debug)]
@@ -253,4 +255,121 @@ pub fn plan(
     }
     records.lanes = faults.len() as u32;
     Ok((records, faults))
+}
+
+/// What [`plan_rs`] reads of a hybrid fire's rs buffer (BEAM-PAGE-LISTS
+/// §11): each seat's buffer base and its set's rs pages (slab slots, every
+/// one of its buffer), each seat's lane plan, the fire's rs page table (its
+/// address and a row's ints), the rows a page holds, an rs page's bytes,
+/// the slab its page ids address and each plane's `(offset, cell)`.
+pub struct RsStaged<'a> {
+    pub sets: &'a [Option<(u32, Vec<u32>)>],
+    pub plans: &'a [engine::rs::LanePlan],
+    pub table: u64,
+    pub ints: u32,
+    pub page_tokens: u32,
+    pub page_bytes: u64,
+    pub slab: u64,
+    pub planes: Vec<kbeam::PagePlane>,
+}
+
+/// A hybrid's beams over the records [`plan`] laid (BEAM-PAGE-LISTS §11):
+/// each group's set's rs entries, each beam's rs page table to resolve over
+/// its list (its row of the fire's rs page table, from the buffer entry the
+/// row's first slot holds) and each beam's rs copy over every rs plane. A
+/// group whose lanes buffer no rows is left as it is. Refused by name where
+/// a page's rows do not divide a kv page, or where the buffer does not
+/// start on a row page (an entry would straddle two of a beam's pages).
+pub fn plan_rs(
+    records: &mut BeamRecords,
+    groups: &[Group],
+    rs: &RsStaged<'_>,
+    addresses: &BeamAddresses,
+) -> Result<()> {
+    let tokens = rs.page_tokens.max(1);
+    let plane_at = records.planes.len() as u32;
+    records.planes.extend_from_slice(&rs.planes);
+    let run_bytes = std::mem::size_of::<BeamRsRun>() as u64;
+    for (group, step) in groups.iter().zip(records.groups.iter_mut()) {
+        let first = group.lanes.first().ok_or_else(|| {
+            Fault::program("beam", "a beam group of no lanes".to_string())
+        })?;
+        let Some(Some((base, set))) = rs.sets.get(first.seat) else {
+            continue;
+        };
+        let (base, page) = (*base, step.page.max(1));
+        if page % tokens != 0 || base % tokens != 0 {
+            return Err(Fault::program(
+                "beam",
+                format!(
+                    "instance {}'s beams buffer recurrent rows {tokens} a page from slot {base}, \
+                     and their page lists page kv slots {page} a page: a hybrid's beams need \
+                     the rs page's rows to divide the kv page's and its buffer to start on a \
+                     row page (BEAM-PAGE-LISTS.md §11)",
+                    group.instance
+                ),
+            ));
+        }
+        if step.slot < base {
+            continue;
+        }
+        let bases_at = records.rs_bases.len() as u32;
+        records.rs_bases.extend(set.iter().map(|&slot| slot as i32));
+        let bases_len = set.len() as u32;
+        let entries = (step.slot - base) / tokens + 1;
+        let rs_at = records.rs.len() as u32;
+        for (beam, lane) in group.lanes.iter().enumerate() {
+            let plan = rs.plans.get(lane.seat).ok_or_else(|| {
+                Fault::program("beam", format!("lane {} has no rs plan", lane.source))
+            })?;
+            // The row's first slot holds the buffer page of its first
+            // extended row (`rs::page_table`).
+            let Some(run) = plan.gather.as_ref().or(plan.scatter.as_ref()) else {
+                return Err(Fault::program(
+                    "beam",
+                    format!(
+                        "instance {}'s beam {beam} buffers no recurrent rows where beam 0 does",
+                        group.instance
+                    ),
+                ));
+            };
+            let row = rs.table + (u64::from(lane.seat as u32) * u64::from(rs.ints) + 1) * 4;
+            records.rs.push(BeamRsRun {
+                pages: row,
+                bases: addresses.rs_bases + u64::from(bases_at) * 4,
+                lane: beam as u32,
+                first: run.from / tokens,
+                entries,
+                base,
+                tokens,
+                bases_len,
+            });
+        }
+        step.rs_count = records.rs.len() as u32 - rs_at;
+        step.rs = addresses.rs + u64::from(rs_at) * run_bytes;
+        let f0 = step.folded / page;
+        let copies = kbeam::beam_copies_word(step.lanes, step.cap, step.frames);
+        let fault_at = (step.faults - addresses.faults) / 4;
+        for beam in 0..step.lanes {
+            records.rs_copies.push(RsCopyRun {
+                copy: step.state + (copies + 3 * u64::from(beam)) * 4,
+                bases: addresses.rs_bases + u64::from(bases_at) * 4,
+                fault: addresses.faults + (fault_at + u64::from(beam)) * 4,
+                slab: rs.slab,
+                reserve: step.backed,
+                page,
+                tokens,
+                base,
+                f0,
+                floor_rel: step.folded - f0 * page,
+                plane_at,
+                planes: rs.planes.len() as u32,
+                bases_len,
+                page_bytes: u32::try_from(rs.page_bytes).map_err(|_| {
+                    Fault::program("beam", "an rs page past 4 GiB".to_string())
+                })?,
+            });
+        }
+    }
+    Ok(())
 }
