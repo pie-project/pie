@@ -2307,12 +2307,19 @@ impl Xla {
             let hold = std::sync::Arc::clone(latch);
             std::thread::spawn(move || {
                 let outcome = words.download().map_err(|e| e.to_string()).map(|bytes| {
-                    for (b, word) in bytes.chunks_exact(4).take(live as usize).enumerate() {
-                        let code = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
+                    let words: Vec<u32> = bytes
+                        .chunks_exact(4)
+                        .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+                        .collect();
+                    for (b, &code) in words.iter().take(live as usize).enumerate() {
                         if code != 0 {
                             let lane = first + b as u32;
                             hold.fault_lane(lane, instance, &crate::beam::fault_reason(code, lane));
                         }
+                    }
+                    // the group's common slot, after the lanes' faults (§11.3)
+                    if let Some(&common) = words.last() {
+                        hold.beam_common(instance, common);
                     }
                 });
                 hold.release(outcome);

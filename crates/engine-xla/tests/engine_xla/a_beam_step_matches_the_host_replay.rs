@@ -44,6 +44,12 @@ fn search(lanes: u32, rung: u32, folded: u32, steps: u32, seed: u64) -> Option<(
     let mut at_all: Vec<i32> = Vec::new();
     let mut want = Vec::new();
     let mut state = beam::State::new(lanes, cap, FRAMES);
+    // §11.4's reference: each lane's history a token a fire unique to it,
+    // a lane's the one of the parent it continues (clamped as the head step
+    // clamps it), the rung's dead lanes their own; the common slot the
+    // longest common prefix of the live lanes' histories, from `folded`
+    let mut hist: Vec<Vec<u64>> = vec![Vec::new(); rung as usize];
+    let mut commons: Vec<u32> = Vec::new();
     for t in 0..steps {
         let mut parents: Vec<u32> = if rng.next() % 3 == 0 {
             (0..lanes).collect()
@@ -69,6 +75,30 @@ fn search(lanes: u32, rung: u32, folded: u32, steps: u32, seed: u64) -> Option<(
                 slot,
             },
         );
+        {
+            let prev = hist.clone();
+            for b in 0..rung as usize {
+                let from = if t == 0 {
+                    Vec::new()
+                } else if b < lanes as usize {
+                    prev[(parents[b] as usize).min(rung as usize - 1)].clone()
+                } else {
+                    prev[b].clone()
+                };
+                hist[b] = from;
+                hist[b].push(u64::from(t) << 8 | b as u64);
+            }
+            let live = &hist[..lanes as usize];
+            let lcp = (0..live[0].len())
+                .take_while(|&k| live.iter().all(|h| h[k] == live[0][k]))
+                .count() as u32;
+            let common = if lanes == 1 {
+                slot + 1
+            } else {
+                (folded + lcp).min(slot + 1)
+            };
+            commons.push(common.max(folded));
+        }
         parents_all.extend(parents.iter().map(|&p| p as i32));
         // the rung's dead beams continue themselves
         parents_all.extend((lanes..rung).map(|b| b as i32));
@@ -85,6 +115,7 @@ fn search(lanes: u32, rung: u32, folded: u32, steps: u32, seed: u64) -> Option<(
     let lists = b.zeros(dtype::Dtype::I32, n, rung * cap);
     let copies = b.zeros(dtype::Dtype::I32, n, rung * 3);
     let faults = b.zeros(dtype::Dtype::I32, n, rung);
+    let common = b.zeros(dtype::Dtype::I32, n, 1);
     let ran = b
         .run(|ctx| {
             engine_xla::lower::lower(ctx, |l| {
@@ -101,6 +132,7 @@ fn search(lanes: u32, rung: u32, folded: u32, steps: u32, seed: u64) -> Option<(
                     z(f, rung * cap),
                     z(f, rung * 3),
                     z(f, rung),
+                    z(f, 1),
                 ];
                 let out = f.for_loop(i64::from(n), &inits, |f, ci, st| {
                     let zero = f.const_i(Elem::I32, 0, &[]);
@@ -125,18 +157,21 @@ fn search(lanes: u32, rung: u32, folded: u32, steps: u32, seed: u64) -> Option<(
                     let l_row = row(f, step.lists, rung * cap)?;
                     let c_row = row(f, step.copies, rung * 3)?;
                     let f_row = row(f, step.faults, rung)?;
+                    let m_row = row(f, step.common, 1)?;
                     Ok(vec![
                         step.state,
                         f.dynamic_update_slice(st[1], s_row, &[ci, zero])?,
                         f.dynamic_update_slice(st[2], l_row, &[ci, zero])?,
                         f.dynamic_update_slice(st[3], c_row, &[ci, zero])?,
                         f.dynamic_update_slice(st[4], f_row, &[ci, zero])?,
+                        f.dynamic_update_slice(st[5], m_row, &[ci, zero])?,
                     ])
                 })?;
                 l.land(states, out[1])?;
                 l.land(lists, out[2])?;
                 l.land(copies, out[3])?;
-                l.land(faults, out[4])
+                l.land(faults, out[4])?;
+                l.land(common, out[5])
             })
         })
         .expect("the step runs");
@@ -147,6 +182,7 @@ fn search(lanes: u32, rung: u32, folded: u32, steps: u32, seed: u64) -> Option<(
     let got_lists = b.read_i32(lists);
     let got_copies = b.read_i32(copies);
     let got_faults = b.read_i32(faults);
+    let got_common = b.read_i32(common);
     let (cap_u, lanes_u, rung_u) = (cap as usize, lanes as usize, rung as usize);
     for (t, (step, after, c)) in want.iter().enumerate() {
         let tag = format!("lanes {lanes} rung {rung} folded {folded} seed {seed} fire {t}");
@@ -170,7 +206,11 @@ fn search(lanes: u32, rung: u32, folded: u32, steps: u32, seed: u64) -> Option<(
             .map(|&x| x != 0)
             .collect();
         assert_eq!(free, after.free, "{tag}: free");
-        let pending: Vec<bool> = st[at_free + cap_u..].iter().map(|&x| x != 0).collect();
+        let at_pending = at_free + cap_u;
+        let pending: Vec<bool> = st[at_pending..at_pending + FRAMES as usize * cap_u]
+            .iter()
+            .map(|&x| x != 0)
+            .collect();
         assert_eq!(pending, after.pending, "{tag}: pending");
         let lists_t = row(&got_lists, rung_u * cap_u);
         for (bm, list) in step.lists.iter().enumerate() {
@@ -195,6 +235,10 @@ fn search(lanes: u32, rung: u32, folded: u32, steps: u32, seed: u64) -> Option<(
         }
         let faults_t: Vec<u32> = row(&got_faults, rung_u).iter().map(|&x| x as u32).collect();
         assert_eq!(faults_t[..lanes_u], step.faults[..], "{tag}: faults");
+        assert_eq!(
+            got_common[t] as u32, commons[t],
+            "{tag}: the group's common slot (the live lanes' longest common history)"
+        );
         assert!(
             faults_t[lanes_u..].iter().all(|&f| f == 0),
             "{tag}: a dead beam faults"

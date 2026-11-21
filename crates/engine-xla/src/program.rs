@@ -187,6 +187,16 @@ impl Latch {
         faults.fault_lanes(lane..lane + 1, Some(instance), why);
     }
 
+    /// Beam group `instance`'s common slot as the step's head step left it
+    /// (`BEAM-PAGE-LISTS.md` §11.3): told with its landing.
+    pub(crate) fn beam_common(&self, instance: InstanceId, slot: u32) {
+        self.lane_faults
+            .lock()
+            .expect("lane faults lock poisoned")
+            .beam_common
+            .push((instance, slot));
+    }
+
     /// The step's reported lanes wrote `writes`: told with its landing.
     pub(crate) fn report(&self, writes: Vec<engine::KvWrites>) {
         self.writes
@@ -222,13 +232,10 @@ impl Latch {
                         let mut outcome = engine::StepOutcome::wrote(std::mem::take(
                             &mut *self.writes.lock().expect("writes lock poisoned"),
                         ));
-                        outcome.faulted = std::mem::take(
-                            &mut self
-                                .lane_faults
-                                .lock()
-                                .expect("lane faults lock poisoned")
-                                .faulted,
-                        );
+                        let mut held = self.lane_faults.lock().expect("lane faults lock poisoned");
+                        outcome.faulted = std::mem::take(&mut held.faulted);
+                        outcome.beam_common = std::mem::take(&mut held.beam_common);
+                        drop(held);
                         outcome
                     }
                     Some(why) => engine::StepOutcome::lost(self.lanes, why),

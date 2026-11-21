@@ -34,10 +34,14 @@ pub struct Layout {
 }
 
 impl Layout {
-    /// The state's i32 words: fired, pool, map, free, pending.
+    /// The state's i32 words: fired, pool, map, free, pending, and each
+    /// pair of lanes' common depth (`lca`, `[lanes, lanes]`, §11.4).
     #[must_use]
     pub fn words(&self) -> i64 {
-        2 + self.lanes * self.cap + self.cap + self.frames.max(1) * self.cap
+        2 + self.lanes * self.cap
+            + self.cap
+            + self.frames.max(1) * self.cap
+            + self.lanes * self.lanes
     }
 }
 
@@ -67,6 +71,10 @@ pub struct Step {
     pub column: Val,
     pub offset: Val,
     pub first_page: Val,
+    /// The group's common slot `c_t` (§11.3, to the row §11.4): the live
+    /// lanes' most recent common ancestor's depth, capped at the slot past
+    /// the fire's row and never below the folded slot (scalar).
+    pub common: Val,
 }
 
 fn scalar(f: &mut Func, x: i64) -> Val {
@@ -187,6 +195,9 @@ pub fn step(f: &mut Func, layout: Layout, state: Val, parents: Val, at: At) -> B
     let free = f.slice_axis(state, 0, at_free, at_pending)?;
     let pending = f.slice_axis(state, 0, at_pending, at_pending + frames * cap)?;
     let pending = f.reshape(pending, &[frames, cap])?;
+    let at_lca = at_pending + frames * cap;
+    let lca = f.slice_axis(state, 0, at_lca, at_lca + b_n * b_n)?;
+    let lca = f.reshape(lca, &[b_n, b_n])?;
 
     let q_iota = f.iota(i, &[cap], 0);
     let b_iota = f.iota(i, &[b_n], 0);
@@ -476,13 +487,48 @@ pub fn step(f: &mut Func, layout: Layout, state: Val, parents: Val, at: At) -> B
     faults2 = f.max(faults2, copy_f)?;
     let faults2 = f.select(alive, faults2, zero_b)?;
 
+    // ---- §11.4: each pair's common depth, and the group's common slot.
+    // Lanes forked from one parent agree below this fire's row; others
+    // keep their parents' pair's depth. Priming: every pair the fire's slot.
+    let p = {
+        let hi = scalar(f, b_n - 1);
+        f.clamp(zero, parents, hi)?
+    };
+    let lca_p = {
+        let rows = f.take_rows(lca, p)?; // [i][j] = lca[p_i][j]
+        let rows = f.transpose(rows, &[1, 0])?;
+        let both = f.take_rows(rows, p)?; // [j][i] = lca[p_i][p_j]
+        f.transpose(both, &[1, 0])?
+    };
+    let pi = f.broadcast(p, &[b_n, b_n], &[0])?;
+    let pj = f.broadcast(p, &[b_n, b_n], &[1])?;
+    let same = f.compare(Cmp::Eq, pi, pj)?;
+    let slot_bb = f.splat(at.slot, &[b_n, b_n])?;
+    let lca_s = f.select(same, slot_bb, lca_p)?;
+    let lca2 = pick(f, slot_bb, lca_s)?;
+    let end_t = f.add(at.slot, one)?;
+    let common = {
+        let ii = f.iota(i, &[b_n, b_n], 0);
+        let jj = f.iota(i, &[b_n, b_n], 1);
+        let upper = f.compare(Cmp::Lt, ii, jj)?;
+        let live_bb = f.splat(at.live, &[b_n, b_n])?;
+        let live_j = f.compare(Cmp::Lt, jj, live_bb)?;
+        let pair = f.and(upper, live_j)?;
+        let end_bb = f.splat(end_t, &[b_n, b_n])?;
+        let depth = f.select(pair, lca2, end_bb)?;
+        let least = f.reduce(depth, &[0, 1], Fold::Min)?;
+        let least = f.min(least, end_t)?;
+        f.max(least, at.folded)?
+    };
+
     // ---- the state after
     let fired2 = f.add(fired, one)?;
     let fired2 = f.reshape(fired2, &[1])?;
     let pool2 = f.reshape(q_n, &[1])?;
     let map_flat = f.reshape(map2, &[b_n * cap])?;
     let pending_flat = f.reshape(pending2, &[frames * cap])?;
-    let state2 = f.concat(&[fired2, pool2, map_flat, free2, pending_flat], 0)?;
+    let lca_flat = f.reshape(lca2, &[b_n * b_n])?;
+    let state2 = f.concat(&[fired2, pool2, map_flat, free2, pending_flat, lca_flat], 0)?;
     Ok(Step {
         state: state2,
         lists: map2,
@@ -491,6 +537,7 @@ pub fn step(f: &mut Func, layout: Layout, state: Val, parents: Val, at: At) -> B
         column: c,
         offset: o,
         first_page: f0,
+        common,
     })
 }
 

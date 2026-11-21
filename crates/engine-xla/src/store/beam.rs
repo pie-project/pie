@@ -200,7 +200,9 @@ impl Pools {
                 let parents = cx.reshape(parents, &[ROW_WORDS])?;
                 let parents = cx.slice_axis(parents, 0, 0, b_n)?;
                 let step = kernels_xla::beam::step(cx, layout, state, parents, at)?;
-                faults_out.set(Some(step.faults));
+                // the fire's faults, then the group's common slot (§11.3)
+                let common = cx.reshape(step.common, &[1])?;
+                faults_out.set(Some(cx.concat(&[step.faults, common], 0)?));
                 let entries = kernels_xla::beam::resolve(cx, step.lists, translation)?;
                 // each beam's write page: its entry at the fire's column
                 let col = cx.iota(Elem::I32, &[b_n, cap], 1);
