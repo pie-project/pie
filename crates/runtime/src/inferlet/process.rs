@@ -224,6 +224,7 @@ pub(crate) fn blocks_on_planner(stage: &str) -> bool {
             | "enqueue: the activation rung"
             | "bind: its pair's move"
             | "seat the lanes"
+            | "plan: pages another pass computes"
     )
 }
 
@@ -1460,6 +1461,7 @@ mod blocked_tests {
             "enqueue: the activation rung",
             "bind: its pair's move",
             "seat the lanes",
+            "plan: pages another pass computes",
         ];
         let told = |pid: ProcessId| {
             crate::scheduler::worker::OWNERS_BLOCKED.lock().unwrap().contains(&pid)
