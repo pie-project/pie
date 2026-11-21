@@ -1450,12 +1450,10 @@ fn gated_delta_verify_at(
     )
 }
 
-/// The most carried rows [`gated_delta_carried`] reads a lane.
-pub const GDN_CARRIED_MAX: u32 = 64;
-
 /// A decode step over each lane's buffered rows read as a linear attention
 /// (`gated_delta_carried`, new-memory/designs/lagged-fold.md): every lane a
-/// row of its own and at most [`GDN_CARRIED_MAX`] carried rows, read through
+/// row of its own and any number of carried rows (their gates and weights a
+/// chunk at a time), read through
 /// the fire's page table from the buffer's `[b | a]` plane (`ba_paged`) and
 /// corrected planes (`corrected`), never re-stepped. Lands the own rows'
 /// readout in `y`, gates in `gates.gates`, and their keys, `u` and `[b | a]`

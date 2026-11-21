@@ -814,9 +814,6 @@ PIE_GDN_VERIFY(32, 8, 2)
 PIE_GDN_VERIFY(32, 4, 4)
 PIE_GDN_VERIFY(32, 8, 4)
 
-// The most carried rows one carried step reads (their log-gates staged).
-constant constexpr int kCarriedMax = 64;
-
 // A decode step over a lane's buffered rows read as a linear attention
 // (new-memory/designs/lagged-fold.md): one row of the window's own a lane,
 // its `rep` carried rows never re-stepped. With the committed state S0, the
@@ -874,8 +871,14 @@ template <typename T, int SG, int VROWS>
 
   threadgroup float q_s[D];
   threadgroup float k_s[D];
-  threadgroup float glog_s[kCarriedMax + 1];
-  threadgroup float weight_s[kCarriedMax + 1];
+  // The carried rows' log-gates and weights, a chunk at a time, so a lane
+  // carries any number of rows (a beam in a parents pass carries every row
+  // since its fold): `total_s` is every gate's sum (G, the state's weight's
+  // log), `part_s` a simdgroup's share of it.
+  threadgroup float glog_c[kVerifyChunk];
+  threadgroup float weight_c[kVerifyChunk];
+  threadgroup float part_s[SG];
+  threadgroup float total_s;
   threadgroup float kn_s[kVerifyChunk][D];
   threadgroup float u_s[kVerifyChunk][GROUP_ROWS];
   threadgroup float dq_s[kVerifyChunk];
@@ -889,7 +892,7 @@ template <typename T, int SG, int VROWS>
   const int rep = replay[lane0 + r];
   const device int* ids = slots + size_t(lane0 + r) * pie_state_pieces(map);
   // One own row a lane (the dispatch's rule); uniform over the threadgroup.
-  if (indptr[r + 1] - indptr[r] != 1 || ids[0] < 0 || rep > kCarriedMax) {
+  if (indptr[r + 1] - indptr[r] != 1 || ids[0] < 0) {
     return;
   }
   const int own = indptr[r] - rep;
@@ -946,31 +949,39 @@ template <typename T, int SG, int VROWS>
                                          ba_row_bytes);
     own_s[1] = g.x;
     own_s[2] = g.y;
-    glog_s[rep] = g.x;
     if (group.y == 0) {
       const size_t at = size_t(own + t_own) * 2 * vh + size_t(hv);
       gates[at] = g.x;
       gates[at + vh] = g.y;
     }
   }
-  // The carried rows' log-gates, from their buffered `[b | a]`.
-  for (int t = tid; t < rep; t += SG * 32) {
+  // A carried row's log-gate, from its buffered `[b | a]`.
+  const float a_scale = -metal::fast::exp(a_log[hv]);
+  const float bias = float(dt_bias[hv]);
+  auto log_gate = [&](int t) -> float {
     const device T* brow = reinterpret_cast<const device T*>(
         gdn_buffered_row(ba_slab, pages, t, page_tokens, page_bytes, ba_row_bytes));
-    const float z = float(brow[vh + size_t(hv)]) + float(dt_bias[hv]);
+    const float z = float(brow[vh + size_t(hv)]) + bias;
     const float sp = (z > 20.0f) ? z : metal::log(1.0f + metal::fast::exp(z));
-    glog_s[t] = -metal::fast::exp(a_log[hv]) * sp;
+    return a_scale * sp;
+  };
+  // Every carried row's log-gate summed (each thread its rows, then each
+  // simdgroup, then thread 0 with the own row's): G.
+  float part = 0.0f;
+  for (int t = tid; t < rep; t += SG * 32) {
+    part += log_gate(t);
+  }
+  part = gdn_row_sum<32>(part);
+  if (lane == 0) {
+    part_s[sg_u] = part;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  // Each carried row's weight: the gates past it, the own row's with them;
-  // weight_s[rep] is G0, every gate's.
   if (tid == 0) {
-    float after = glog_s[rep];
-    for (int t = rep - 1; t >= 0; --t) {
-      weight_s[t] = metal::exp(after);
-      after += glog_s[t];
+    float total = own_s[1];
+    for (int g = 0; g < SG; ++g) {
+      total += part_s[g];
     }
-    weight_s[rep] = metal::exp(after);
+    total_s = total;
   }
 
   // The committed state's reads of the own q and k, before any fold.
@@ -998,7 +1009,11 @@ template <typename T, int SG, int VROWS>
     so[v] = gdn_row_sum<32>(po);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  const float g0 = weight_s[rep];
+  // The state's weight: every gate's. A carried row's: the gates past it,
+  // exp(G - P), P its own and every earlier row's, run on by thread 0.
+  const float total = total_s;
+  const float g0 = metal::exp(total);
+  float run = 0.0f;
   float acc_a[VROWS], acc_o[VROWS];
   for (int v = 0; v < VROWS; ++v) {
     acc_a[v] = g0 * sa[v];
@@ -1007,6 +1022,9 @@ template <typename T, int SG, int VROWS>
 
   for (int c0 = 0; c0 < rep; c0 += kVerifyChunk) {
     const int rows = min(kVerifyChunk, rep - c0);
+    if (tid < rows) {
+      glog_c[tid] = log_gate(c0 + tid);
+    }
     // One simdgroup a row: its normed keys and their dots with the own q, k.
     for (int j = int(sg_u); j < rows; j += SG) {
       const device T* krow = reinterpret_cast<const device T*>(gdn_buffered_row(
@@ -1048,16 +1066,23 @@ template <typename T, int SG, int VROWS>
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+      for (int j = 0; j < rows; ++j) {
+        run += glog_c[j];
+        weight_c[j] = metal::exp(total - run);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     for (int j = 0; j < rows; ++j) {
       const int t = c0 + j;
-      const float w = weight_s[t];
+      const float w = weight_c[j];
       for (int v = 0; v < VROWS; ++v) {
         const float u = u_s[j][my_rows + v];
         acc_a[v] += w * dk_s[j] * u;
         acc_o[v] += w * dq_s[j] * u;
       }
       if (t < keep) {
-        const float g = metal::exp(glog_s[t]);
+        const float g = metal::exp(glog_c[j]);
         for (int v = 0; v < VROWS; ++v) {
           const float u = u_s[j][my_rows + v];
           for (int i = 0; i < PER; ++i) {

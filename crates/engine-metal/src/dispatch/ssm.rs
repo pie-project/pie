@@ -539,18 +539,15 @@ fn plane_row_bytes(
 }
 
 impl crate::run::Run<'_> {
-    /// Whether this window's lanes each run one row of their own over at
-    /// most [`ssm::GDN_CARRIED_MAX`] carried rows: a decode step the carried
-    /// scan serves.
+    /// Whether this window's lanes each run one row of their own over their
+    /// carried rows (any number of them): a decode step the carried scan
+    /// serves.
     pub(crate) fn carried_window(&self, seat: &crate::rs::Seat) -> bool {
         let indptr = self.qo_indptr_host();
         let lane0 = self.window().span.lane_offset as usize;
-        indptr.windows(2).enumerate().all(|(r, pair)| {
-            pair[1] - pair[0] == 1
-                && seat
-                    .lanes
-                    .get(lane0 + r)
-                    .is_some_and(|plan| plan.replay <= ssm::GDN_CARRIED_MAX)
-        })
+        indptr
+            .windows(2)
+            .enumerate()
+            .all(|(r, pair)| pair[1] - pair[0] == 1 && seat.lanes.get(lane0 + r).is_some())
     }
 }
