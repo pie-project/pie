@@ -124,6 +124,7 @@ table!(Hip from "libamdhip64.so" {
     fn hipStreamCreateWithFlags(stream: *mut Stream, flags: c_uint) -> HipError;
     fn hipStreamWaitEvent(stream: Stream, event: Event, flags: c_uint) -> HipError;
     fn hipLaunchHostFunc(stream: Stream, func: HostFn, data: *mut c_void) -> HipError;
+    fn hipStreamWaitValue32(stream: Stream, ptr: *mut c_void, value: u32, flags: c_uint, mask: u32) -> HipError;
     fn hipStreamBeginCapture(stream: Stream, mode: c_int) -> HipError;
     fn hipStreamEndCapture(stream: Stream, graph: *mut Graph) -> HipError;
     fn hipEventCreate(event: *mut Event) -> HipError;

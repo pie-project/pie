@@ -140,6 +140,18 @@ impl Timing {
     }
 }
 
+/// A spanned frame's two timestamps ([`Context::spanned`]): the set they
+/// are written to, the buffer it resolves into, and the host's copy.
+pub(crate) struct Span {
+    set: wgpu::QuerySet,
+    resolve: Held,
+    readback: wgpu::Buffer,
+}
+
+/// The bytes a span's buffers take: two timestamps, at the resolve's
+/// alignment.
+const SPAN_BYTES: u64 = wgpu::QUERY_RESOLVE_BUFFER_ALIGNMENT;
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Enabled {
     pub subgroups: bool,
@@ -157,6 +169,8 @@ pub(crate) struct Core {
     pub(crate) spent: Mutex<Vec<wgpu::Buffer>>,
 
     poller: host::Poller,
+    /// The submissions on the queue not yet seen done ([`Core::submit`]).
+    in_flight: Arc<std::sync::atomic::AtomicU64>,
 
     /// The uniform buffer frames write their dispatches' scalars to, made
     /// at load, a region of it each frame in flight; and the regions free.
@@ -168,6 +182,9 @@ pub(crate) struct Core {
     scratch_stock: std::sync::atomic::AtomicUsize,
 
     pub(crate) last_error: Arc<Mutex<Option<String>>>,
+    /// The device's loss, once seen ([`Lost`]): every call after fails by
+    /// name ([`Fault::DeviceLost`]).
+    pub(crate) lost: Lost,
     pub(crate) books: Arc<engine_gpu::Books>,
     pub(crate) name: String,
     /// `None` without the subgroup feature.
@@ -186,12 +203,60 @@ pub(crate) struct Core {
     pub(crate) bound: u64,
 }
 
+/// A wgpu device's loss, once seen, and where: its lost callback (a driver
+/// fault, or `Device::destroy`), or a mapping it refused (wgpu refuses a map
+/// of a buffer the load made only once the device is lost: a submission the
+/// driver faulted). Nothing recovers it: once set it stands, and every call
+/// on the device after fails as [`Fault::DeviceLost`], never as the
+/// validation errors a lost device's objects raise.
+#[derive(Clone, Default)]
+pub(crate) struct Lost(Arc<Mutex<Option<(&'static str, String)>>>);
+
+impl Lost {
+    /// The device was lost at `what` for `why`: the first loss seen stands.
+    pub(crate) fn mark(&self, what: &'static str, why: impl ToString) {
+        let mut lost = self.0.lock().expect("lost lock poisoned");
+        if lost.is_none() {
+            let why = why.to_string();
+            tracing::error!(what, %why, "wgpu: the device was lost; every call on it fails from here");
+            *lost = Some((what, why));
+        }
+    }
+
+    /// The loss, by name, where the device was lost.
+    pub(crate) fn fault(&self) -> Option<Fault> {
+        self.0
+            .lock()
+            .expect("lost lock poisoned")
+            .as_ref()
+            .map(|(what, why)| Fault::DeviceLost {
+                what,
+                why: why.clone(),
+            })
+    }
+
+    /// `Ok` while the device stands; its loss by name once lost.
+    pub(crate) fn alive(&self) -> Result<()> {
+        self.fault().map_or(Ok(()), Err)
+    }
+}
+
 impl Core {
+    /// `what` refused for `why`: a mapping refused marks the device lost,
+    /// and a lost device answers with its loss.
     pub(crate) fn fault(&self, what: &'static str, why: impl ToString) -> Fault {
-        Fault::Wgpu {
+        if what == "map_async" {
+            self.lost.mark(what, why.to_string());
+        }
+        self.lost.fault().unwrap_or_else(|| Fault::Wgpu {
             what,
             why: why.to_string(),
-        }
+        })
+    }
+
+    /// `Ok` while the device stands; its loss by name once lost.
+    pub(crate) fn alive(&self) -> Result<()> {
+        self.lost.alive()
     }
 
     pub(crate) fn take_error(&self, what: &'static str) -> Result<()> {
@@ -200,6 +265,9 @@ impl Core {
             .lock()
             .expect("last error lock poisoned")
             .take();
+        // A lost device's objects raise validation errors of their own (a
+        // buffer made on it is invalid): the loss is what names them.
+        self.alive()?;
         match taken {
             Some(why) => Err(Fault::Wgpu { what, why }),
             None => Ok(()),
@@ -208,6 +276,26 @@ impl Core {
 
     pub(crate) fn kick(&self) {
         self.poller.kick();
+    }
+
+    /// `buffer` submitted, counted on the queue until its work is done (the
+    /// poller polls the device from the kick until its queue is empty).
+    pub(crate) fn submit(&self, buffer: wgpu::CommandBuffer) -> wgpu::SubmissionIndex {
+        self.in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let index = self.queue.submit(std::iter::once(buffer));
+        let in_flight = Arc::clone(&self.in_flight);
+        self.queue.on_submitted_work_done(move || {
+            in_flight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        });
+        self.kick();
+        index
+    }
+
+    /// Whether every submission on the queue is done, read now without
+    /// waiting.
+    pub(crate) fn idle(&self) -> bool {
+        self.in_flight.load(std::sync::atomic::Ordering::Acquire) == 0
     }
 
     pub(crate) fn wait_for(&self, _index: &wgpu::SubmissionIndex) -> Result<()> {
@@ -231,7 +319,7 @@ impl Core {
     }
 
     pub(crate) fn submit_once(&self, encoder: wgpu::CommandEncoder) -> Result<()> {
-        let index = self.queue.submit(std::iter::once(encoder.finish()));
+        let index = self.submit(encoder.finish());
         self.wait_for(&index)
     }
 
@@ -566,6 +654,13 @@ impl Context {
                 *sink.lock().expect("sink lock poisoned") = Some(text);
             }));
         }
+        let lost = Lost::default();
+        {
+            let lost = lost.clone();
+            device.set_device_lost_callback(move |reason, message| {
+                lost.mark("device lost callback", format!("{reason:?}: {message}"));
+            });
+        }
         let enabled = Enabled {
             subgroups: features.contains(wgpu::Features::SUBGROUP),
             f16: features.contains(wgpu::Features::SHADER_F16),
@@ -593,12 +688,14 @@ impl Context {
             enabled,
             spent: Mutex::new(Vec::new()),
             poller,
+            in_flight: Arc::default(),
             uniform_buffer: std::sync::OnceLock::new(),
             uniforms: Mutex::new(Vec::new()),
             scratch: Mutex::new(Vec::new()),
             uniform_stock: std::sync::atomic::AtomicUsize::new(0),
             scratch_stock: std::sync::atomic::AtomicUsize::new(0),
             last_error,
+            lost,
             books: Arc::new(engine_gpu::Books::new()),
             subgroup_min,
             budget,
@@ -745,6 +842,7 @@ impl Context {
 
     pub fn frame(&self) -> Result<Frame> {
         let core = &self.core;
+        core.alive()?;
         let encoder = core
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -759,12 +857,56 @@ impl Context {
                 index: Mutex::new(None),
                 done: AtomicBool::new(false),
                 timing: Mutex::new(Vec::new()),
+                span: Mutex::new(None),
                 pass: Mutex::new(None),
             }),
             open: true,
             dispatches: std::cell::Cell::new(0),
             bind_only: false,
         })
+    }
+
+    /// A frame whose device time [`Frame::commit_spanned`] reads back: a
+    /// timestamp written into its encoder before its work and one after it,
+    /// where the device enabled timestamp queries; a plain frame elsewhere.
+    pub fn spanned(&self) -> Result<Frame> {
+        let frame = self.frame()?;
+        let core = &self.core;
+        if !core.enabled.timestamps {
+            return Ok(frame);
+        }
+        let span = Span {
+            set: core.device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("pie span"),
+                ty: wgpu::QueryType::Timestamp,
+                count: 2,
+            }),
+            resolve: core.held(
+                &wgpu::BufferDescriptor {
+                    label: Some("pie span resolve"),
+                    size: SPAN_BYTES,
+                    usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                },
+                engine_gpu::books::owners::TIMESTAMPS,
+            ),
+            readback: core.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("pie span readback"),
+                size: SPAN_BYTES,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+        };
+        frame.encode(|encoder| encoder.write_timestamp(&span.set, 0))?;
+        *frame.inner.span.lock().expect("span lock poisoned") = Some(span);
+        Ok(frame)
+    }
+
+    /// Whether every submission made on the device so far is done, read now
+    /// without waiting: the queue is empty.
+    #[must_use]
+    pub fn idle(&self) -> bool {
+        self.core.idle()
     }
 
     /// A frame a load's bind walk walks into ([`Frame::bind_only`]).
@@ -791,6 +933,10 @@ pub(crate) struct UniformRegion {
 pub(crate) struct UniformRing {
     chunks: Vec<Held>,
     used: u64,
+    /// The end of the most the frame's encoder has staged through its
+    /// chunk: a copy gives its slot back once encoded, and a staging the
+    /// queue writes lies past this, where no command of the frame writes.
+    high: u64,
 }
 
 pub(crate) struct Inner {
@@ -801,6 +947,7 @@ pub(crate) struct Inner {
     index: Mutex<Option<wgpu::SubmissionIndex>>,
     done: AtomicBool,
     timing: Mutex<Vec<Timing>>,
+    span: Mutex<Option<Span>>,
 
     pass: Mutex<Option<wgpu::ComputePass<'static>>>,
 }
@@ -984,16 +1131,46 @@ impl Frame {
         Some((set, 2 * at))
     }
 
+    /// The bytes one slot of this frame's scratch can still hold: its
+    /// chunk's room past what it took, or a whole chunk before it takes one.
+    fn scratch_room(&self) -> u64 {
+        let core = &self.inner.core;
+        let align = u64::from(core.limits.min_storage_buffer_offset_alignment).max(256);
+        let ring = self.inner.scratch.lock().expect("scratch lock poisoned");
+        match ring.chunks.last() {
+            None => core.pooled_scratch(),
+            Some(chunk) => chunk
+                .size()
+                .saturating_sub(ring.used.next_multiple_of(align)),
+        }
+    }
+
+    /// `bytes` of this frame's scratch the frame's encoder writes: the
+    /// chunk and the slot's first byte in it.
     pub(crate) fn scratch_slot(&self, bytes: u64) -> Result<(wgpu::Buffer, u64)> {
+        self.scratch_take(bytes, false)
+    }
+
+    /// `bytes` of this frame's scratch the queue writes, which lands before
+    /// any command of the frame runs: past every slot the encoder has
+    /// written, so no command of the frame writes over it.
+    pub(crate) fn scratch_slot_queued(&self, bytes: u64) -> Result<(wgpu::Buffer, u64)> {
+        self.scratch_take(bytes, true)
+    }
+
+    fn scratch_take(&self, bytes: u64, queued: bool) -> Result<(wgpu::Buffer, u64)> {
         let core = &self.inner.core;
         let align = u64::from(core.limits.min_storage_buffer_offset_alignment).max(256);
         let mut ring = self.inner.scratch.lock().expect("scratch lock poisoned");
-        let at = ring.used.next_multiple_of(align);
         if ring.chunks.is_empty() {
             ring.chunks.push(core.scratch_chunk(bytes)?);
-            ring.used = bytes;
-            return Ok(((*ring.chunks.last().expect("just pushed")).clone(), 0));
         }
+        let from = if queued {
+            ring.used.max(ring.high)
+        } else {
+            ring.used
+        };
+        let at = from.next_multiple_of(align);
         let room = ring.chunks.last().map_or(0, |chunk| chunk.size());
         if at + bytes > room {
             return Err(Fault::Ceiling {
@@ -1003,6 +1180,7 @@ impl Frame {
             });
         }
         ring.used = at + bytes;
+        ring.high = ring.high.max(ring.used);
         Ok(((*ring.chunks.last().expect("non-empty")).clone(), at))
     }
 
@@ -1035,16 +1213,45 @@ impl Frame {
         }
         crate::encode::record_copy();
         let (from, to) = (&source.slab().buffer, &into.slab().buffer);
+        if from != to {
+            return self.encode(|encoder| {
+                encoder.copy_buffer_to_buffer(from, source_at, to, into_at, Some(len))
+            });
+        }
         // wgpu refuses a copy whose ends are one buffer: it goes through
-        // scratch, which also reads overlapping ends as they were.
-        let stage = (from == to).then(|| self.scratch_slot(len)).transpose()?;
-        self.encode(|encoder| match &stage {
-            None => encoder.copy_buffer_to_buffer(from, source_at, to, into_at, Some(len)),
-            Some((scratch, at)) => {
-                encoder.copy_buffer_to_buffer(from, source_at, scratch, *at, Some(len));
-                encoder.copy_buffer_to_buffer(scratch, *at, to, into_at, Some(len));
+        // scratch a piece at a time, every piece through one slot (a frame's
+        // encoder runs its copies in order), so a copy of any length stages
+        // in what room the frame's chunk has. Where the destination lies past
+        // an overlapping source the pieces go from the end, so each reads its
+        // source as it was.
+        // The slot is given back once the copy is encoded: a later slot the
+        // encoder writes runs after the copy's pieces, and one the queue
+        // writes lies past it (`scratch_slot_queued`).
+        let piece = len.min(self.scratch_room() & !3).max(4);
+        let given = self
+            .inner
+            .scratch
+            .lock()
+            .expect("scratch lock poisoned")
+            .used;
+        let (scratch, at) = self.scratch_slot(piece)?;
+        let mut starts: Vec<u64> = (0..len).step_by(piece as usize).collect();
+        if into_at > source_at && into_at < source_at + len {
+            starts.reverse();
+        }
+        self.encode(|encoder| {
+            for start in starts {
+                let bytes = piece.min(len - start);
+                encoder.copy_buffer_to_buffer(from, source_at + start, &scratch, at, Some(bytes));
+                encoder.copy_buffer_to_buffer(&scratch, at, to, into_at + start, Some(bytes));
             }
-        })
+        })?;
+        self.inner
+            .scratch
+            .lock()
+            .expect("scratch lock poisoned")
+            .used = given;
+        Ok(())
     }
 
     pub fn fill_zero(&mut self, into: &super::Buffer, at: u64, len: u64) -> Result<()> {
@@ -1071,10 +1278,43 @@ impl Frame {
         self.flush()
     }
 
+    /// [`engine_gpu::backend::Frame::submit_segment`]: the frame's encoder
+    /// submitted unawaited and a new one opened. WebGPU's queue orders the
+    /// next submission after it, and the frame's uniform region and scratch
+    /// chunk stay the frame's (given back at its commit).
+    pub fn submit_segment(&self) -> Result<()> {
+        self.close_pass();
+        self.land_uniforms();
+        let core = &self.inner.core;
+        core.alive()?;
+        let taken = self
+            .inner
+            .encoder
+            .lock()
+            .expect("encoder lock poisoned")
+            .take();
+        let Some(encoder) = taken else {
+            return Err(Fault::Device {
+                call: "submit_segment",
+                why: "this frame was already submitted".to_string(),
+            });
+        };
+        core.submit(encoder.finish());
+        core.kick();
+        *self.inner.encoder.lock().expect("encoder lock poisoned") = Some(
+            core.device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("pie frame"),
+                }),
+        );
+        core.take_error("submit_segment")
+    }
+
     pub fn flush(&self) -> Result<()> {
         self.close_pass();
         self.land_uniforms();
         let core = &self.inner.core;
+        core.alive()?;
         let taken = self
             .inner
             .encoder
@@ -1105,6 +1345,7 @@ impl Frame {
         self.close_pass();
         self.land_uniforms();
         let core = &self.inner.core;
+        core.alive()?;
         let taken = self
             .inner
             .encoder
@@ -1152,7 +1393,7 @@ impl Frame {
         let started = Mark::now();
         let finished = encoder.finish();
         crate::encode::record_read_phase(0, started.ns());
-        let index = core.queue.submit(std::iter::once(finished));
+        let index = core.submit(finished);
         crate::encode::record_submit(started.ns(), 0);
         // What the frame staged through goes back to the load's stock now,
         // submitted, not when its work completes: the queue runs what any
@@ -1195,6 +1436,56 @@ impl Frame {
         Ok(started.secs())
     }
 
+    /// Submits and waits: the device's time between the two timestamps a
+    /// [`Context::spanned`] frame writes, ns; `None` for another frame.
+    pub fn commit_spanned(mut self) -> Result<Option<u64>> {
+        let span = self.inner.span.lock().expect("span lock poisoned").take();
+        if let Some(span) = &span
+            && self.open
+        {
+            self.encode(|encoder| {
+                encoder.write_timestamp(&span.set, 1);
+                encoder.resolve_query_set(&span.set, 0..2, &span.resolve, 0);
+                encoder.copy_buffer_to_buffer(&span.resolve, 0, &span.readback, 0, Some(16));
+            })?;
+        }
+        self.submit()?;
+        Pending {
+            inner: Arc::clone(&self.inner),
+        }
+        .wait()?;
+        let Some(span) = span else {
+            return Ok(None);
+        };
+        let core = &self.inner.core;
+        let slice = span.readback.slice(0..16);
+        let mapped = Signal::new();
+        let deliver = mapped.clone();
+        slice.map_async(wgpu::MapMode::Read, move |r| deliver.notify(r));
+        core.kick();
+        mapped
+            .park("span readback")?
+            .map_err(|e| Fault::Device {
+                call: "span readback",
+                why: e.to_string(),
+            })?;
+        let ticks = {
+            let view = slice.get_mapped_range().map_err(|e| Fault::Device {
+                call: "span readback",
+                why: e.to_string(),
+            })?;
+            let word = |i: usize| {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&view[i * 8..i * 8 + 8]);
+                u64::from_le_bytes(b)
+            };
+            word(1).saturating_sub(word(0))
+        };
+        span.readback.unmap();
+        let period = f64::from(core.queue.get_timestamp_period());
+        Ok(Some((ticks as f64 * period) as u64))
+    }
+
     pub fn commit_async(mut self, on_done: Option<OnDone>) -> Result<Pending> {
         self.submit()?;
         let pending = Pending {
@@ -1235,6 +1526,14 @@ impl std::fmt::Debug for Pending {
 }
 
 impl Pending {
+    /// Whether the frame has landed, read now without waiting: its
+    /// submitted-work-done callback has run (the poller polls the device
+    /// from the submit until its queue is empty).
+    #[must_use]
+    pub fn landed(&self) -> bool {
+        self.inner.done.load(Ordering::Acquire)
+    }
+
     pub fn wait(&self) -> Result<()> {
         if !self.inner.done.load(Ordering::Acquire) {
             let done = Signal::new();
@@ -1256,6 +1555,61 @@ impl Pending {
 mod tests {
     use super::*;
     use crate::device::Buffer;
+
+    fn lost_by_name(fault: Fault) {
+        assert!(
+            matches!(fault, Fault::DeviceLost { .. }),
+            "refused as {fault}, not as DeviceLost"
+        );
+        assert!(fault.to_string().starts_with("DeviceLost: "), "{fault}");
+    }
+
+    /// The loss's state: none until marked; the first loss marked stands,
+    /// and every fault after names it.
+    #[test]
+    fn a_loss_once_marked_stands_and_names_every_fault_after() {
+        let lost = Lost::default();
+        assert!(lost.alive().is_ok());
+        lost.mark("map_async", "Validation");
+        lost.mark("device lost callback", "a later loss");
+        match lost.fault().expect("lost") {
+            Fault::DeviceLost { what, why } => {
+                assert_eq!(what, "map_async");
+                assert_eq!(why, "Validation");
+            }
+            other => panic!("{other}"),
+        }
+        lost_by_name(lost.alive().unwrap_err());
+    }
+
+    /// A device lost (here by `Device::destroy`, as a driver fault loses
+    /// it) fails every later call by name: a buffer, a frame, a write, a
+    /// read, a submit, never wgpu's "Buffer with '' label is invalid".
+    #[test]
+    fn a_lost_device_fails_every_later_call_as_device_lost() {
+        if !present() {
+            return;
+        }
+        let allowance = engine::Allowance {
+            budget: Some(1 << 30),
+        };
+        let device = Context::bind(&DeviceBoot::default(), allowance).unwrap();
+        device.core().stock_rings(1);
+        let owner = engine_gpu::books::owners::TEST;
+        let mut buffer = Buffer::zeroed(&device, 64, owner).unwrap();
+        // A frame opened before the loss and submitted after it.
+        let mut before = device.frame().unwrap();
+        before.copy(&buffer, 0, &buffer, 32, 16).unwrap();
+        device.core.device.destroy();
+        // The lost callback runs as the device is polled.
+        let _ = device.core.device.poll(wgpu::PollType::wait_indefinitely());
+        lost_by_name(before.commit().err().expect("refused"));
+        lost_by_name(Buffer::zeroed(&device, 64, owner).err().expect("refused"));
+        lost_by_name(device.frame().err().expect("refused"));
+        lost_by_name(buffer.write(0, &[1, 2, 3, 4]).err().expect("refused"));
+        let mut got = [0u8; 4];
+        lost_by_name(buffer.read(0, &mut got).err().expect("refused"));
+    }
 
     #[test]
     fn a_copy_between_two_spans_of_one_buffer_lands() {
@@ -1279,6 +1633,58 @@ mod tests {
         buffer.read(0, &mut got).unwrap();
         assert_eq!(got[32..48], ramp[..16]);
         assert_eq!(got[8..24], ramp[..16]);
+    }
+
+    /// A copy within one buffer longer than the whole scratch chunk lands,
+    /// in pieces through what room the frame's chunk has (some taken first
+    /// by a smaller staged copy), its overlapping ends read as they were
+    /// whichever side the destination lies on.
+    #[test]
+    fn a_copy_within_one_buffer_past_its_scratch_chunk_lands_in_pieces() {
+        if !present() {
+            return;
+        }
+        let allowance = engine::Allowance {
+            budget: Some(1 << 30),
+        };
+        let device = Context::bind(&DeviceBoot::default(), allowance).unwrap();
+        device.core().stock_rings(1);
+        let pooled = device.core().pooled_scratch();
+        let len = (pooled + pooled / 2) & !3;
+        let size = 3 * pooled + 8192;
+        let words: Vec<u8> = (0..size / 4)
+            .flat_map(|w| (w as u32).wrapping_mul(2_654_435_761).to_le_bytes())
+            .collect();
+        // (source, destination): past an overlapping source, before one,
+        // and apart from it.
+        for (from, into) in [(0, 4096), (4096, 0), (0, len + 4096)] {
+            let mut buffer =
+                Buffer::zeroed(&device, size, engine_gpu::books::owners::TEST).unwrap();
+            buffer.write(0, &words).unwrap();
+            let mut frame = device.frame().unwrap();
+            frame
+                .copy(&buffer, size - 64, &buffer, size - 32, 16)
+                .unwrap();
+            frame.copy(&buffer, from, &buffer, into, len).unwrap();
+            // The copy gave its slot back: a view staged after it in the frame
+            // still finds the chunk's room.
+            frame.scratch_slot(pooled - 4096).unwrap();
+            frame.commit().unwrap();
+            let mut want = words.clone();
+            want.copy_within(
+                (size - 64) as usize..(size - 48) as usize,
+                (size - 32) as usize,
+            );
+            want.copy_within(from as usize..(from + len) as usize, into as usize);
+            let mut got = vec![0u8; size as usize];
+            buffer.read(0, &mut got).unwrap();
+            assert!(
+                got == want,
+                "a copy of {len} bytes from {from} to {into} (scratch chunk {pooled}) did not land \
+                 as one copy of the bytes as they were"
+            );
+        }
+        device.core.take_error("the copies").unwrap();
     }
 
     /// No buffer is made past the device's bound on one reservation: a

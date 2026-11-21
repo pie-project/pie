@@ -40,6 +40,9 @@ impl Serve for Api {
 
     type Keep = std::convert::Infallible;
 
+    /// Eager by design: the probe is encoded at each fire.
+    type Probed = ();
+
     const FUSIONS: &'static [poem_compiler::fuse::Rule] = &crate::FUSIONS;
 
     const MAX_BUFFER_SOURCE: &'static str = "the least of wgpu::Limits::max_buffer_size, \
@@ -50,6 +53,10 @@ impl Serve for Api {
     /// Every cell of a guest's rings lies on the host: a pass reads its
     /// takes from there and lands its puts there.
     const CHANNEL_CELLS: bool = false;
+
+    /// A step's guest passes run once it landed (`landing`), and a later
+    /// fire may be on the queue by then: they read the arm's seat.
+    const READS_SPAN: bool = false;
 
     const TARGET: kernels_slang::Target = kernels_slang::Target::Wgsl;
 
@@ -80,7 +87,7 @@ impl Serve for Api {
             &device,
             tuning,
             boot.profiles.as_deref(),
-            crate::rates::STATED_SUBMIT_BOUND,
+            crate::rates::stated_submit_bound(),
         )?;
         Ok((device, tuning))
     }
@@ -146,6 +153,20 @@ impl Serve for Api {
 
     fn walk_frame(device: &Context, _keep: bool) -> Result<Frame> {
         device.frame()
+    }
+
+    fn record_probe(_device: &Context, _record: &dyn Fn(&Frame) -> Result<()>) -> Result<()> {
+        Ok(())
+    }
+
+    fn replay_probe(
+        device: &Context,
+        _probed: &(),
+        record: &dyn Fn(&Frame) -> Result<()>,
+    ) -> Result<Option<u64>> {
+        let frame = device.spanned()?;
+        record(&frame)?;
+        frame.commit_spanned()
     }
 
     const BINDS_AT_LOAD: bool = true;
@@ -253,13 +274,19 @@ impl Serve for Api {
             ..
         } = launch;
         let arm = prepared.arm;
-        let hosted = layout
+        // The host reads back its own spans alone: the rest of the seat is
+        // for the step's programs, on the device.
+        let hosted: Vec<(u64, u64, u64)> = layout
             .iter()
-            .filter(|span| span.host)
-            .map(|span| span.at + span.bytes())
-            .max()
-            .unwrap_or(0);
-        frame.copy(&shell.readout[arm], 0, &shell.shelf.mirror[arm], 0, hosted)?;
+            .filter(|span| span.hosted && span.rows > 0)
+            .map(|span| (span.at, span.at, span.bytes()))
+            .collect();
+        engine_gpu::backend::Frame::copy_regions(
+            &mut frame,
+            &shell.readout[arm],
+            &shell.shelf.mirror[arm],
+            &hosted,
+        )?;
         let on_done = crate::landing::on_done(
             crate::landing::Seat {
                 seq,

@@ -722,8 +722,8 @@ fn a_window_walk_bounded_by_its_rows_reach_answers_the_same_bits() {
     }
 }
 
-/// A batched decode through the page-copy kernel (`kernel.attn.decode_pages`)
-/// answers the reference as the walk does.
+/// A batched decode through the page-copy kernel (`attn::pages`, every
+/// decode it holds) answers the reference as the walk does.
 /// Whether the device is a TPU: the Mosaic kernels (`tpu_custom_call`) run
 /// nowhere else.
 pub fn on_tpu() -> bool {
@@ -744,8 +744,7 @@ fn the_page_copy_kernel_reads_mapped_planes_tpu_only() {
         eprintln!("skipped: the page-copy kernel runs on a TPU");
         return;
     }
-    let mut tuning = kernels_xla::tuning::Tuning::DEFAULT;
-    tuning.chunks.decode_pages = 8;
+    let tuning = kernels_xla::tuning::Tuning::DEFAULT;
     for (qh, kvh, d, window) in [(16usize, 8usize, 128usize, None), (8, 2, 256, Some(512))] {
         let want = long_decode_case(qh, kvh, d, window, tuning, IDENTITY, false);
         let got = long_decode_case(qh, kvh, d, window, tuning, MAPPED, false);
@@ -760,8 +759,7 @@ fn the_page_copy_kernel_reads_mapped_planes_tpu_only() {
 
 #[test]
 fn a_batched_decode_through_the_page_copy_kernel_answers_the_reference() {
-    let mut tuning = kernels_xla::tuning::Tuning::DEFAULT;
-    tuning.chunks.decode_pages = 8;
+    let tuning = kernels_xla::tuning::Tuning::DEFAULT;
     for (qh, kvh, d) in [
         (16usize, 8usize, 128usize),
         (8, 2, 128),
@@ -800,8 +798,7 @@ fn long_decode_with(
 /// choice of the walk.
 #[test]
 fn a_masked_decode_through_the_page_copy_kernel_answers_the_reference() {
-    let mut tuning = kernels_xla::tuning::Tuning::DEFAULT;
-    tuning.chunks.decode_pages = 8;
+    let tuning = kernels_xla::tuning::Tuning::DEFAULT;
     for (qh, kvh, d) in [(16usize, 8usize, 128usize), (8, 1, 256)] {
         long_decode_case(qh, kvh, d, None, tuning, IDENTITY, true);
     }

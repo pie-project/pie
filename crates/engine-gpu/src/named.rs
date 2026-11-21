@@ -88,6 +88,15 @@ impl<B: Serve> Context<Named<B>> for Facts {
         Ok(NoFrame)
     }
 
+    fn spanned(&self) -> Result<NoFrame> {
+        Ok(NoFrame)
+    }
+
+    /// Nothing is ever submitted.
+    fn idle(&self) -> bool {
+        true
+    }
+
     fn max_buffer(&self) -> u64 {
         self.max_buffer
     }
@@ -262,6 +271,11 @@ impl<B: Serve> Frame<Named<B>> for NoFrame {
         }
         Ok(Landed)
     }
+
+    /// A frame of nothing runs on no device: no time to read.
+    fn commit_spanned(self) -> Result<Option<u64>> {
+        Ok(None)
+    }
 }
 
 /// A frame of nothing has landed.
@@ -271,6 +285,10 @@ pub struct Landed;
 impl Pending for Landed {
     fn wait(&self) -> Result<()> {
         Ok(())
+    }
+
+    fn landed(&self) -> bool {
+        true
     }
 }
 
@@ -392,6 +410,8 @@ impl<B: Serve> Serve for Named<B> {
 
     type Keep = std::convert::Infallible;
 
+    type Probed = ();
+
     const FUSIONS: &'static [poem_compiler::fuse::Rule] = B::FUSIONS;
 
     const MAX_BUFFER_SOURCE: &'static str = B::MAX_BUFFER_SOURCE;
@@ -399,6 +419,8 @@ impl<B: Serve> Serve for Named<B> {
     const RECORDS: bool = B::RECORDS;
 
     const CHANNEL_CELLS: bool = B::CHANNEL_CELLS;
+
+    const READS_SPAN: bool = B::READS_SPAN;
 
     const NAMES: bool = true;
 
@@ -472,6 +494,22 @@ impl<B: Serve> Serve for Named<B> {
 
     fn walk_frame(_device: &Facts, _keep: bool) -> Result<NoFrame> {
         Ok(NoFrame)
+    }
+
+    /// A naming load runs nothing on a device: no probe to lay.
+    fn record_probe(
+        _device: &Facts,
+        _record: &dyn Fn(&NoFrame) -> Result<()>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn replay_probe(
+        _device: &Facts,
+        _probed: &(),
+        _record: &dyn Fn(&NoFrame) -> Result<()>,
+    ) -> Result<Option<u64>> {
+        Ok(None)
     }
 
     fn shelf(

@@ -1039,6 +1039,11 @@ impl Process {
                 }
             };
             admission_wait_us = store.data().admission_wait_us();
+            tracing::debug!(
+                target: "pie::launch",
+                %program, %process_id, instantiate_us, wasm_run_us,
+                "guest returned"
+            );
             drop(store);
             result
         }

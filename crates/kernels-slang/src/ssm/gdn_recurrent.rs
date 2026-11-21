@@ -3,12 +3,10 @@
 
 use dtype::Dtype;
 
-use super::{Committed, StatePool, head_width, requests, rows, window_lanes};
-use crate::encode::{
-    Arg, Ctx, Fire, Grid, Tier, dtype_dispatch, every, nonzero, refuse, stated,
-};
+use super::{Committed, Csr, RowSpan, StatePool, head_width};
+use crate::encode::{Arg, Ctx, Fire, Grid, Tier, dtype_dispatch, every, nonzero, refuse, stated};
 use crate::error::Error;
-use crate::tensor::{RaggedTensor, Tensor};
+use crate::tensor::Tensor;
 
 const GDN_RECURRENT: &str = "ssm/gdn_recurrent.slang";
 
@@ -117,10 +115,12 @@ pub fn gated_delta(
     k_dim: u32,
     v_dim: u32,
     y: Tensor,
+    span: RowSpan,
 ) -> Result<(), Error> {
     const OP: &str = "ssm.gated_delta";
     dtype_dispatch!(OP, qkv.dtype, { Bf16 => () });
     let heads = Heads::of(OP, qkv, gates, y, k_heads, v_heads, k_dim, v_dim)?;
+    let launched = span.rows(OP, &[qkv, gates, y, state.slots])?;
     let entry = if heads.registers() {
         "ssm_gdn_recurrent_r128_bf16"
     } else {
@@ -130,11 +130,11 @@ pub fn gated_delta(
     ctx.fire(
         Fire::at(GDN_RECURRENT, entry)
             .tier(tactic.tier)
-            .apply(heads.grid(rows(OP, qkv)?)),
+            .apply(heads.grid(launched)),
         &[
             &[qkv.arg(), gates.arg(), state.slots.arg(), y.arg_mut()][..],
             &state.piece_args(true),
-            &[kh, vh, kd, vd],
+            &[kh, vh, kd, vd, span.row0.arg()],
         ]
         .concat(),
     )
@@ -165,7 +165,8 @@ fn scan_kernel(
 pub fn gated_delta_chunked(
     ctx: &Ctx<'_>,
     tactic: Tactic,
-    qkv: RaggedTensor,
+    qkv: Tensor,
+    csr: Csr,
     gates: Tensor,
     state: &StatePool,
     k_heads: u32,
@@ -173,10 +174,11 @@ pub fn gated_delta_chunked(
     k_dim: u32,
     v_dim: u32,
     y: Tensor,
+    span: RowSpan,
 ) -> Result<(), Error> {
     const OP: &str = "ssm.gated_delta_chunked";
-    dtype_dispatch!(OP, qkv.data.dtype, { Bf16 => () });
-    let heads = Heads::of(OP, qkv.data, gates, y, k_heads, v_heads, k_dim, v_dim)?;
+    dtype_dispatch!(OP, qkv.dtype, { Bf16 => () });
+    let heads = Heads::of(OP, qkv, gates, y, k_heads, v_heads, k_dim, v_dim)?;
     let kernel = |rows: u32| {
         scan_kernel(
             OP,
@@ -192,18 +194,19 @@ pub fn gated_delta_chunked(
     }
     let [kh, vh, kd, vd] = heads.args(OP)?;
     ctx.fire(
-        kernel(qkv.data.rows)?.apply(heads.grid(requests(OP, qkv)?)),
+        kernel(span.rows(OP, &[qkv, gates, y])?)?.apply(heads.grid(csr.lanes(OP)?)),
         &[
             &[
-                qkv.data.arg(),
-                qkv.indptr.arg(),
+                qkv.arg(),
+                csr.table.arg(),
                 gates.arg(),
                 state.slots.arg(),
                 y.arg_mut(),
             ][..],
             &state.snap_table(),
             &state.piece_args(true),
-            &[kh, vh, kd, vd],
+            &[kh, vh, kd, vd, span.row0.arg()],
+            &[csr.at.arg()],
             &state.snap_lane0(OP)?,
         ]
         .concat(),
@@ -217,7 +220,7 @@ pub fn gated_delta_committed(
     ctx: &Ctx<'_>,
     tactic: Tactic,
     qkv: Tensor,
-    indptr: Tensor,
+    csr: Csr,
     committed: &Committed,
     gates: Tensor,
     state: &StatePool,
@@ -227,10 +230,12 @@ pub fn gated_delta_committed(
     k_dim: u32,
     v_dim: u32,
     y: Tensor,
+    row0: u32,
 ) -> Result<(), Error> {
     const OP: &str = "ssm.gated_delta_committed";
     dtype_dispatch!(OP, qkv.dtype, { Bf16 => () });
     let heads = Heads::of(OP, qkv, gates, y, k_heads, v_heads, k_dim, v_dim)?;
+    super::work_holds(OP, work, csr)?;
     let kernel = |rows: u32| {
         scan_kernel(
             OP,
@@ -246,11 +251,11 @@ pub fn gated_delta_committed(
     }
     let [kh, vh, kd, vd] = heads.args(OP)?;
     ctx.fire(
-        kernel(qkv.rows)?.apply(heads.grid(window_lanes(OP, indptr)?)),
+        kernel(qkv.rows)?.apply(heads.grid(csr.lanes(OP)?)),
         &[
             &[
                 qkv.arg(),
-                indptr.arg(),
+                csr.table.arg(),
                 committed.replay.arg(),
                 committed.commit.arg(),
                 committed.slots.arg(),
@@ -260,7 +265,15 @@ pub fn gated_delta_committed(
             ][..],
             &state.snap_table(),
             &state.piece_args(true),
-            &[stated(OP, committed.lane0)?.arg(), kh, vh, kd, vd],
+            &[
+                stated(OP, committed.lane0)?.arg(),
+                kh,
+                vh,
+                kd,
+                vd,
+                row0.arg(),
+            ],
+            &[csr.at.arg()],
             &state.snap_lane0(OP)?,
         ]
         .concat(),

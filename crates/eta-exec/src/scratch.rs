@@ -4,8 +4,8 @@ pub use eta_compiler::codegen::temporary::TemporaryNeed;
 mod lifetime;
 
 pub use lifetime::{
-    Launch, Launches, describe_launched, lay_out, lay_out_chunked, read_only_unlaunched,
-    region_rows, value_lifetimes,
+    Keeps, Launch, Launches, describe_launched, lay_out, lay_out_chunked, launch_areas,
+    read_only_unlaunched, region_rows, value_lifetimes,
 };
 
 pub const ALIGN: u64 = 256;
@@ -56,6 +56,8 @@ pub enum TooLarge {
 pub enum Item {
     Value(u32),
     Temporary,
+    /// The area launch `n` of those that keep one takes ([`Area`]).
+    Area(u32),
 }
 
 impl core::fmt::Display for TooLarge {
@@ -77,6 +79,17 @@ impl core::fmt::Display for TooLarge {
                 f,
                 "value {value} takes {bytes} bytes, past a segment of {segment} {chunk}-byte \
                  chunks, and a value lies whole in one run of a segment's chunks"
+            ),
+            Self::PastSegment {
+                item: Item::Area(area),
+                bytes,
+                chunk,
+                segment,
+            } => write!(
+                f,
+                "launch area {area} and its reserve take {bytes} bytes, past a segment of \
+                 {segment} {chunk}-byte chunks, and they lie whole in one run of a segment's \
+                 chunks"
             ),
             Self::PastSegment {
                 item: Item::Temporary,
@@ -101,7 +114,21 @@ pub struct Layout {
 
     pub temporary_bytes: u64,
 
+    /// Each launch's own temporary area ([`Area`]), in the order stated:
+    /// its first byte, its reserve right below.
+    pub areas: Vec<u64>,
+
     pub total: u64,
+}
+
+/// A temporary area one launch keeps for itself ([`Keeps`]): alive over
+/// its steps, `reserve` bytes clear below its `bytes`. It shares bytes
+/// with a value as another value would, by their lifetimes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Area {
+    pub life: Lifetime,
+    pub reserve: u64,
+    pub bytes: u64,
 }
 
 fn align_up(value: u64) -> Option<u64> {
@@ -140,6 +167,7 @@ pub fn layout(descriptors: &[ValueDesc]) -> Result<Layout, TooLarge> {
         values,
         temporary,
         temporary_bytes,
+        areas: Vec::new(),
         total,
     })
 }
@@ -283,6 +311,8 @@ pub struct ChunkLayout {
     pub temporary: Placed,
     /// The bytes the temporary area holds.
     pub temporary_bytes: u64,
+    /// Each launch's own area's first byte ([`Area`]), in the order stated.
+    pub areas: Vec<Placed>,
     /// Each piece's bytes in use, from its first: none past
     /// [`Self::piece_bytes`].
     pub ends: Vec<u64>,
@@ -388,6 +418,7 @@ fn run_for(
     lifetimes: &[Lifetime],
     reserve: u64,
     temporary: u64,
+    areas: &[Area],
     pieces: Pieces,
 ) -> Result<u32, TooLarge> {
     let chunk = pieces.chunk.clamp(1, MAX_BYTES);
@@ -413,6 +444,20 @@ fn run_for(
         }
         run = run.max(span);
     }
+    for (at, area) in areas.iter().enumerate() {
+        let bytes = align_up(area.reserve)
+            .zip(align_up(area.bytes))
+            .and_then(|(reserve, bytes)| reserve.checked_add(bytes))
+            .ok_or(TooLarge::Overflow)?;
+        let span = runs(bytes);
+        if span > u64::from(pieces.segment) {
+            return Err(past(
+                Item::Area(u32::try_from(at).unwrap_or(u32::MAX)),
+                bytes,
+            ));
+        }
+        run = run.max(span);
+    }
     let area = align_up(reserve)
         .zip(align_up(temporary))
         .and_then(|(reserve, temporary)| reserve.checked_add(temporary))
@@ -428,31 +473,54 @@ fn run_for(
 }
 
 /// `descriptors` laid by `lifetimes` in pieces of at most `limit` bytes,
-/// largest first: each value at the lowest offset of the first piece where
-/// it shares bytes only with values it may share them with ([`share`]),
-/// else in a new piece. Two values share bytes only where one is last read
-/// before the other is written, so the bytes laid are what the values live
-/// together at once take, short of the gaps that sizes leave. `reserve`
-/// bytes lie right below the temporary area, which holds `temporary` bytes,
-/// both in one piece past every value. The caller has sized `limit` for
-/// every item ([`run_for`]).
+/// largest first, with each of `areas` an item of its own: each at the
+/// lowest offset of the first piece where it shares bytes only with items
+/// it may share them with ([`share`]), else in a new piece. Two items
+/// share bytes only where one is last read before the other is written,
+/// so the bytes laid are what the items alive together at once take, short
+/// of the gaps that sizes leave. `reserve` bytes lie right below the
+/// stage's temporary area, which holds `temporary` bytes, both in one
+/// piece past every item: the area alive across the stage. The caller has
+/// sized `limit` for every item ([`run_for`]).
 fn place(
     descriptors: &[ValueDesc],
     lifetimes: &[Lifetime],
     reserve: u64,
     temporary: u64,
+    areas: &[Area],
     limit: u64,
 ) -> Result<ChunkLayout, TooLarge> {
     let count = descriptors.len();
-    let mut spans = vec![0u64; count];
-    for (i, descriptor) in descriptors.iter().enumerate() {
-        spans[i] = align_up(descriptor.device_bytes()).ok_or(TooLarge::Overflow)?;
+    let mut spans = Vec::with_capacity(count + areas.len());
+    for descriptor in descriptors {
+        spans.push(align_up(descriptor.device_bytes()).ok_or(TooLarge::Overflow)?);
     }
-    let mut order: Vec<usize> = (0..count).filter(|&i| !lifetimes[i].dead).collect();
-    order.sort_by_key(|&i| (core::cmp::Reverse(spans[i]), lifetimes[i].def, i));
+    // An area's item: its reserve, aligned, then its bytes.
+    let mut leads = Vec::with_capacity(areas.len());
+    for area in areas {
+        let lead = align_up(area.reserve).ok_or(TooLarge::Overflow)?;
+        let span = align_up(area.bytes)
+            .and_then(|bytes| bytes.checked_add(lead))
+            .ok_or(TooLarge::Overflow)?;
+        leads.push(lead);
+        spans.push(span);
+    }
+    let life_of = |i: usize| -> Lifetime {
+        if i < count {
+            lifetimes[i]
+        } else {
+            areas[i - count].life
+        }
+    };
+    let mut order: Vec<usize> = (0..count)
+        .filter(|&i| !lifetimes[i].dead)
+        .chain(count..count + areas.len())
+        .collect();
+    order.sort_by_key(|&i| (core::cmp::Reverse(spans[i]), life_of(i).def, i));
 
-    let mut values = vec![Placed::default(); count];
-    // Each piece's values, as laid.
+    let mut starts = vec![0u64; spans.len()];
+    let mut pieces = vec![0u32; spans.len()];
+    // Each piece's items, as laid.
     let mut laid: Vec<Vec<usize>> = Vec::new();
     let mut ends = vec![DUMMY_BYTES];
     let mut near: Vec<(u64, u64, bool)> = Vec::new();
@@ -468,8 +536,8 @@ fn place(
             candidates.clear();
             candidates.push(base);
             for &j in laid.get(piece).map_or(&[][..], Vec::as_slice) {
-                let at = values[j].offset;
-                let one = match share(lifetimes[i], lifetimes[j]) {
+                let at = starts[j];
+                let one = match share(life_of(i), life_of(j)) {
                     Share::Anywhere => continue,
                     Share::AtItsOffset => true,
                     Share::Apart => false,
@@ -498,7 +566,11 @@ fn place(
         }
         let Some((piece, offset)) = found else {
             return Err(TooLarge::Bound {
-                bytes: descriptors[i].device_bytes(),
+                bytes: if i < count {
+                    descriptors[i].device_bytes()
+                } else {
+                    span
+                },
                 limit,
             });
         };
@@ -510,11 +582,27 @@ fn place(
             ends.push(0);
         }
         ends[piece] = ends[piece].max(offset + span);
-        values[i] = Placed {
-            piece: u32::try_from(piece).map_err(|_| TooLarge::Overflow)?,
-            offset,
-        };
+        starts[i] = offset;
+        pieces[i] = u32::try_from(piece).map_err(|_| TooLarge::Overflow)?;
     }
+    let placed = |i: usize, lead: u64| Placed {
+        piece: pieces[i],
+        offset: starts[i] + lead,
+    };
+    let values = (0..count)
+        .map(|i| {
+            if lifetimes[i].dead {
+                Placed::default()
+            } else {
+                placed(i, 0)
+            }
+        })
+        .collect();
+    let areas = leads
+        .iter()
+        .enumerate()
+        .map(|(at, &lead)| placed(count + at, lead))
+        .collect();
 
     let temporary_bytes = align_up(temporary).ok_or(TooLarge::Overflow)?;
     let (piece, offset) = bump(&mut ends, reserve, temporary_bytes, limit)
@@ -529,6 +617,7 @@ fn place(
         values,
         temporary: Placed { piece, offset },
         temporary_bytes,
+        areas,
         ends,
     })
 }
@@ -600,6 +689,19 @@ pub fn layout_chunked(
     temporary: u64,
     pieces: Pieces,
 ) -> Result<ChunkLayout, TooLarge> {
+    chunked_with(descriptors, lifetimes, reserve, temporary, &[], pieces)
+}
+
+/// [`layout_chunked`] with each of `areas` laid as an item of its own
+/// ([`place`]).
+pub(crate) fn chunked_with(
+    descriptors: &[ValueDesc],
+    lifetimes: &[Lifetime],
+    reserve: u64,
+    temporary: u64,
+    areas: &[Area],
+    pieces: Pieces,
+) -> Result<ChunkLayout, TooLarge> {
     let own;
     let lifetimes = if lifetimes.len() == descriptors.len() {
         lifetimes
@@ -607,13 +709,13 @@ pub fn layout_chunked(
         own = each_its_own(descriptors.len());
         &own
     };
-    let run = run_for(descriptors, lifetimes, reserve, temporary, pieces)?;
+    let run = run_for(descriptors, lifetimes, reserve, temporary, areas, pieces)?;
     let chunk = pieces.chunk.clamp(1, MAX_BYTES);
     let limit = u64::from(run)
         .checked_mul(chunk)
         .ok_or(TooLarge::Overflow)?
         .min(MAX_BYTES);
-    let laid = place(descriptors, lifetimes, reserve, temporary, limit)?;
+    let laid = place(descriptors, lifetimes, reserve, temporary, areas, limit)?;
     Ok(ChunkLayout { run, chunk, ..laid })
 }
 
@@ -628,10 +730,23 @@ pub fn layout_reusing(
     reserve: u64,
     temporary: u64,
 ) -> Result<Layout, TooLarge> {
+    reusing_with(descriptors, lifetimes, reserve, temporary, &[])
+}
+
+/// [`layout_reusing`] with each of `areas` laid as an item of its own
+/// ([`place`]). Where `lifetimes` are not the values', each value holds
+/// its own bytes and each area its own past them.
+pub(crate) fn reusing_with(
+    descriptors: &[ValueDesc],
+    lifetimes: &[Lifetime],
+    reserve: u64,
+    temporary: u64,
+    areas: &[Area],
+) -> Result<Layout, TooLarge> {
     if lifetimes.len() != descriptors.len() {
-        return layout(descriptors);
+        return layout_with_areas(descriptors, areas);
     }
-    let laid = place(descriptors, lifetimes, reserve, temporary, u64::MAX)?;
+    let laid = place(descriptors, lifetimes, reserve, temporary, areas, u64::MAX)?;
     let total = laid
         .temporary
         .offset
@@ -647,8 +762,33 @@ pub fn layout_reusing(
         values: laid.values.iter().map(|placed| placed.offset).collect(),
         temporary: laid.temporary.offset,
         temporary_bytes: laid.temporary_bytes,
+        areas: laid.areas.iter().map(|placed| placed.offset).collect(),
         total,
     })
+}
+
+/// Each value its own bytes ([`layout`]), and each of `areas` its own
+/// past them, its reserve below it.
+fn layout_with_areas(descriptors: &[ValueDesc], areas: &[Area]) -> Result<Layout, TooLarge> {
+    let mut laid = layout(descriptors)?;
+    for area in areas {
+        let at = laid
+            .total
+            .checked_add(area.reserve)
+            .and_then(align_up)
+            .ok_or(TooLarge::Overflow)?;
+        laid.total = align_up(area.bytes)
+            .and_then(|bytes| at.checked_add(bytes))
+            .ok_or(TooLarge::Overflow)?;
+        laid.areas.push(at);
+    }
+    if laid.total > MAX_BYTES {
+        return Err(TooLarge::Bound {
+            bytes: laid.total,
+            limit: MAX_BYTES,
+        });
+    }
+    Ok(laid)
 }
 
 #[cfg(test)]
@@ -923,6 +1063,141 @@ mod tests {
                 piece != temporary.piece || end <= low || high <= start,
                 "value {i} lies in the temporary area"
             );
+        }
+    }
+
+    fn area(def: u32, last: u32, reserve: u64, bytes: u64) -> Area {
+        Area {
+            life: life(def, last),
+            reserve,
+            bytes,
+        }
+    }
+
+    /// A launch's area, alive over its steps, takes the bytes of values
+    /// dead then and none of a value alive then, its reserve with it; two
+    /// areas of launches apart share theirs; with no area the layout is
+    /// the one before.
+    #[test]
+    fn a_launch_s_area_shares_bytes_like_a_value() {
+        // Four values of 4 KiB in a chain, each read by the next; an area
+        // of 8 KiB at step 1 and one of 4 KiB with 512 B below it at step 3.
+        let descriptors = [desc(1024); 4];
+        let lifetimes = [life(0, 1), life(1, 2), life(2, 3), life(3, 3)];
+        let areas = [area(1, 1, 0, 8192), area(3, 3, 512, 4096)];
+        let laid = reusing_with(&descriptors, &lifetimes, 0, 0, &areas).unwrap();
+        assert_eq!(laid.areas.len(), 2);
+        for (at, (area, &first)) in areas.iter().zip(&laid.areas).enumerate() {
+            let (low, high) = (first - area.reserve, first + area.bytes);
+            assert!(low >= DUMMY_BYTES && high <= laid.total, "{laid:?}");
+            for (i, life) in lifetimes.iter().enumerate() {
+                let (start, end) = (laid.values[i], laid.values[i] + 4096);
+                if life.last >= area.life.def && area.life.last >= life.def {
+                    assert!(end <= low || high <= start, "value {i} in area {at}: {laid:?}");
+                }
+            }
+        }
+        // The second area takes the first's bytes.
+        assert!(laid.areas[1] - 512 < laid.areas[0] + 8192, "{laid:?}");
+        // Two values alive at once beside the widest area: 16 KiB.
+        assert_eq!(laid.total, DUMMY_BYTES + 8192 + 8192);
+        assert_eq!(laid.temporary_bytes, 0);
+        // The stage's own area of the same 8 KiB lies past every value.
+        let whole = layout_reusing(&descriptors, &lifetimes, 512, 8192).unwrap();
+        assert!(whole.areas.is_empty());
+        assert!(whole.values.iter().all(|&at| at + 4096 <= whole.temporary - 512));
+        assert!(laid.total < whole.total);
+        assert_eq!(
+            reusing_with(&descriptors, &lifetimes, 0, 0, &[]).unwrap(),
+            layout_reusing(&descriptors, &lifetimes, 0, 0).unwrap()
+        );
+        // Lifetimes not the values': each its own, each area past them.
+        let own = reusing_with(&descriptors, &[], 0, 0, &areas).unwrap();
+        let naive = layout(&descriptors).unwrap();
+        assert_eq!(own.values, naive.values);
+        assert!(own.areas[0] >= naive.total && own.areas[1] - 512 >= own.areas[0] + 8192);
+        // An area past a segment is refused by name.
+        assert_eq!(
+            chunked_with(&descriptors, &lifetimes, 0, 0, &[area(0, 0, 0, CHUNK + 1)], ONE),
+            Err(TooLarge::PastSegment {
+                item: Item::Area(0),
+                bytes: CHUNK + 256,
+                chunk: CHUNK,
+                segment: 1,
+            })
+        );
+    }
+
+    /// Random values and areas: no value alive with an area shares a byte
+    /// of it or of its reserve, nor two areas alive together, nor two
+    /// values alive together, and every item lies inside the scratch.
+    #[test]
+    fn no_item_alive_with_another_shares_its_bytes() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+        let overlap = |a: Lifetime, b: Lifetime| a.last >= b.def && b.last >= a.def;
+        for round in 0..20_000 {
+            let count = 1 + next(10) as usize;
+            let mut descriptors = Vec::new();
+            let mut lifetimes = Vec::new();
+            for _ in 0..count {
+                descriptors.push(desc(1 + next(4096) as u32));
+                let def = next(8) as u32;
+                let mut value = life(def, def + next(4) as u32);
+                value.reusable = next(6) != 0;
+                value.dead = next(10) == 0;
+                lifetimes.push(value);
+            }
+            let areas: Vec<Area> = (0..next(4))
+                .map(|_| {
+                    let def = next(8) as u32;
+                    let reserve = [0, SELECT_RESERVE, 100][next(3) as usize];
+                    area(def, def, reserve, next(40_000))
+                })
+                .collect();
+            let laid = if round % 2 == 0 {
+                reusing_with(&descriptors, &lifetimes, 0, 0, &areas).unwrap()
+            } else {
+                let chunked =
+                    chunked_with(&descriptors, &lifetimes, 0, 0, &areas, PIECES).unwrap();
+                // One piece's worth of items is all the check below reads.
+                if chunked.pieces() != 1 {
+                    continue;
+                }
+                Layout {
+                    values: chunked.values.iter().map(|placed| placed.offset).collect(),
+                    temporary: chunked.temporary.offset,
+                    temporary_bytes: chunked.temporary_bytes,
+                    areas: chunked.areas.iter().map(|placed| placed.offset).collect(),
+                    total: chunked.ends[0],
+                }
+            };
+            let mut items: Vec<(u64, u64, Lifetime, bool)> = (0..count)
+                .filter(|&i| !lifetimes[i].dead)
+                .map(|i| {
+                    let at = laid.values[i];
+                    (at, at + descriptors[i].device_bytes(), lifetimes[i], lifetimes[i].reusable)
+                })
+                .collect();
+            items.extend(areas.iter().zip(&laid.areas).map(|(area, &first)| {
+                (first - area.reserve, first + area.bytes, area.life, true)
+            }));
+            for (x, &(start, end, life, ours)) in items.iter().enumerate() {
+                assert!(start >= DUMMY_BYTES && end <= laid.total, "{laid:?}");
+                for &(s, e, them, theirs) in &items[x + 1..] {
+                    // A value that may go unwritten in part takes no bytes
+                    // any item held before it.
+                    let fresh = (!theirs && them.def > life.last) || (!ours && life.def > them.last);
+                    if overlap(life, them) || fresh {
+                        assert!(end <= s || e <= start, "{items:?}");
+                    }
+                }
+            }
         }
     }
 

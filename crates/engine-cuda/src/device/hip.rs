@@ -771,6 +771,19 @@ pub mod dr {
             )
         })
     }
+    /// The GEQ flag of `cuStreamWaitValue32_v2`, as HIP's `hipStreamWaitValueGte`.
+    pub const CU_STREAM_WAIT_VALUE_GEQ: c_uint = 0;
+    pub unsafe fn cuStreamWaitValue32_v2(
+        stream: CUstream,
+        addr: CUdeviceptr,
+        value: u32,
+        flags: c_uint,
+    ) -> CUresult {
+        // SAFETY: the caller's contract for a device-visible word at `addr`.
+        CUresult::of(unsafe {
+            hip::hipStreamWaitValue32(stream, addr as *mut c_void, value, flags, u32::MAX)
+        })
+    }
     pub unsafe fn cuGraphGetNodes(
         graph: CUgraph,
         nodes: *mut CUgraphNode,

@@ -312,6 +312,13 @@ pub fn unmeasured(rates: &profile::fire::Rates) -> Option<(&'static str, String)
             }
         }
     }
+    if let Some(by_rows) = &rates.attn_tflops_by_rows_keys {
+        for (rows, curve) in by_rows {
+            if let Some((key, at)) = point(profile::fire::ATTN_BY_ROWS_KEYS, "keys", curve) {
+                return Some((key, format!("{at} ({rows} rows)")));
+            }
+        }
+    }
     if let Some(tiles) = &rates.tile_tflops_by_rows {
         for (tile, curve) in tiles {
             if let Some((key, at)) = point("tile_tflops_by_rows", "rows", curve) {
@@ -339,6 +346,7 @@ pub fn unmeasured(rates: &profile::fire::Rates) -> Option<(&'static str, String)
         ("scan_gelems", rates.scan_gelems),
         ("few_row_tflops", rates.few_row_tflops),
         ("workgroups_per_core", rates.workgroups_per_core),
+        (profile::fire::SUBMIT_WORST_RATIO, rates.submit_worst_ratio),
     ] {
         if let Some(v) = v.filter(|&v| bad(v)) {
             return Some((key, format!("as {v}")));
@@ -375,12 +383,14 @@ impl Admission {
     }
 
     /// Whether a frame estimated at `estimate_ns` fits the bound at the
-    /// worst ratio seen (always, with no bound or no estimate).
+    /// worst ratio seen: always with no bound, never with a bound and no
+    /// estimate (a fire with no estimate is never submitted under one).
     #[must_use]
     pub fn fits(&self, estimate_ns: Option<f64>) -> bool {
         match (self.bound, estimate_ns) {
             (Some(cap), Some(e)) => e * self.worst <= cap.as_nanos() as f64,
-            _ => true,
+            (Some(_), None) => false,
+            (None, _) => true,
         }
     }
 
@@ -420,7 +430,9 @@ pub const WARM_PROBE: u32 = 1024;
 
 /// The side of the warm-up's cube matmul (`side x side x side`), walked up
 /// by doubling with a real fire timed at each size (`time(side, estimate)`,
-/// ns; `estimate` the walk's own for that fire, none for the two probes):
+/// ns; `estimate` the walk's own for that fire, none for the two probes;
+/// `None` where the caller's own estimate of the fire is past the bound and
+/// it was never submitted: the walk stops at the size before):
 /// [`WARM_PROBE`] / 2 and [`WARM_PROBE`] first, then the next size only
 /// while its fire, estimated from the last one timed by the growth the last
 /// two measured (their time ratio, carried forward: not the flops' ratio),
@@ -435,14 +447,18 @@ pub const WARM_PROBE: u32 = 1024;
 pub fn warm_side<E>(
     max_submit: Option<std::time::Duration>,
     mut worst: f64,
-    mut time: impl FnMut(u32, Option<f64>) -> Result<f64, E>,
+    mut time: impl FnMut(u32, Option<f64>) -> Result<Option<f64>, E>,
 ) -> Result<(u32, f64), E> {
     let Some(cap) = max_submit else {
         return Ok((WARM_SHAPE.0, worst));
     };
     let bound = cap.as_nanos() as f64;
-    let mut before = time(WARM_PROBE / 2, None)?;
-    let mut last = time(WARM_PROBE, None)?;
+    let Some(mut before) = time(WARM_PROBE / 2, None)? else {
+        return Ok((WARM_PROBE / 2, worst));
+    };
+    let Some(mut last) = time(WARM_PROBE, None)? else {
+        return Ok((WARM_PROBE / 2, worst));
+    };
     let mut side = WARM_PROBE;
     if last * worst > bound {
         return Ok((WARM_PROBE / 2, worst));
@@ -453,7 +469,9 @@ pub fn warm_side<E>(
         if estimate * worst > bound {
             break;
         }
-        let next = time(side * 2, Some(estimate))?;
+        let Some(next) = time(side * 2, Some(estimate))? else {
+            break;
+        };
         worst = worst.max(next / estimate.max(f64::MIN_POSITIVE));
         if next * worst > bound {
             break;
@@ -1375,8 +1393,11 @@ mod tests {
             scan_gelems: Some(2000.0),
             few_row_tflops: Some(4.0),
             workgroups_per_core: Some(3.3),
+            submit_worst_ratio: None,
+            attn_tflops_by_rows_keys: None,
             tile_tflops_by_rows: Some(vec![(32, vec![(8, 1.0), (256, 9.0)])]),
             vector_tflops_by_rows: Some(vec![(4, vec![(1, 0.5), (256, 4.0)])]),
+            product_ns: None,
         }
     }
 
@@ -1732,9 +1753,11 @@ mod tests {
         assert_eq!(a.fires(16, Some(100e6)), Some(8));
         // One fire past the bound: refused.
         assert_eq!(a.fires(4, Some(1.2e9)), None);
-        // No estimate yet, or no bound: the frame as asked.
-        assert_eq!(a.fires(4, None), Some(4));
+        // No estimate under a bound: not one fire; no bound: the frame as
+        // asked.
+        assert_eq!(a.fires(4, None), None);
         assert_eq!(Admission::new(None).fires(4, Some(1e12)), Some(4));
+        assert_eq!(Admission::new(None).fires(4, None), Some(4));
     }
 
     /// The warm-up's cube walks up while its next fire, estimated from the
@@ -1749,7 +1772,7 @@ mod tests {
         let mut timed = Vec::new();
         let (side, worst) = warm_side(kgsl, 1.0, |s, _| {
             timed.push(s);
-            Ok::<f64, ()>(cubic(s))
+            Ok::<Option<f64>, ()>(Some(cubic(s)))
         })
         .unwrap();
         assert_eq!((side, worst), (8192, 1.0));
@@ -1761,19 +1784,19 @@ mod tests {
         let mut timed = Vec::new();
         let (side, _) = warm_side(kgsl, 1.0, |s, _| {
             timed.push(s);
-            Ok::<f64, ()>(sinking(s))
+            Ok::<Option<f64>, ()>(Some(sinking(s)))
         })
         .unwrap();
         assert_eq!(side, 4096);
         assert_eq!(timed, vec![512, 1024, 2048, 4096]);
         // No bound stated: the widest, nothing timed.
-        let side = warm_side(None, 1.0, |_, _| -> Result<f64, ()> {
+        let side = warm_side(None, 1.0, |_, _| -> Result<Option<f64>, ()> {
             panic!("timed with no bound")
         });
         assert_eq!(side, Ok((WARM_SHAPE.0, 1.0)));
         // The probe itself past the bound: the cube under it.
         assert_eq!(
-            warm_side(kgsl, 1.0, |_, _| Ok::<f64, ()>(3e9)),
+            warm_side(kgsl, 1.0, |_, _| Ok::<Option<f64>, ()>(Some(3e9))),
             Ok((WARM_PROBE / 2, 1.0))
         );
         // The walk's own estimate low by 1.3x at 4096 (its fire 1.3x the
@@ -1788,12 +1811,27 @@ mod tests {
         };
         let (side, worst) = warm_side(Some(std::time::Duration::from_millis(1500)), 1.0, |s, _| {
             timed.push(s);
-            Ok::<f64, ()>(lagging(s))
+            Ok::<Option<f64>, ()>(Some(lagging(s)))
         })
         .unwrap();
         assert_eq!(side, 4096);
         assert!((worst - 1.3).abs() < 0.01, "{worst}");
         assert_eq!(timed, vec![512, 1024, 2048, 4096]);
+        // A size the caller's own estimate holds past the bound is never
+        // submitted (`None`): the walk stops at the size before it.
+        let mut timed = Vec::new();
+        let (side, _) = warm_side(kgsl, 1.0, |s, _| {
+            timed.push(s);
+            Ok::<Option<f64>, ()>((s < 2048).then(|| cubic(s)))
+        })
+        .unwrap();
+        assert_eq!(side, 1024);
+        assert_eq!(timed, vec![512, 1024, 2048]);
+        // The first probe never submitted: the cube under it.
+        assert_eq!(
+            warm_side(kgsl, 1.0, |_, _| Ok::<Option<f64>, ()>(None)),
+            Ok((WARM_PROBE / 2, 1.0))
+        );
     }
 
     /// The attention curve's keys are where its shape is compute-bound on
@@ -2209,8 +2247,11 @@ mod tests {
             scan_gelems: Some(7.0),
             few_row_tflops: Some(4.5),
             workgroups_per_core: Some(3.3),
+            submit_worst_ratio: None,
+            attn_tflops_by_rows_keys: None,
             tile_tflops_by_rows: None,
             vector_tflops_by_rows: None,
+            product_ns: None,
         };
         assert_eq!(tuned(&rates), rates.toml());
         let (key, text) = provenance("vulkan", "the matmul through Coopmat");

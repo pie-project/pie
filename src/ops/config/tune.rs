@@ -372,38 +372,71 @@ pub async fn run(global: &crate::args::GlobalArgs, args: TuneArgs) -> Result<cra
     println!();
 
     let inputs = lane_inputs(workload.fleet, workload.tokens);
-    let rounds = async {
+    // The frames in flight are the loaded engine's (its stated depth): each
+    // depth the plan holds is a load of its own, `frame_dispatch_depth` the
+    // depth it asks for, and the frame sizes sweep within it.
+    let mut depths: Vec<usize> = Vec::new();
+    for knobs in &plan {
+        if !depths.contains(&knobs.dispatch_depth) {
+            depths.push(knobs.dispatch_depth);
+        }
+    }
+    let mut rounds = Vec::with_capacity(plan.len());
+    for depth in depths {
+        let at_depth: Vec<Knobs> = plan
+            .iter()
+            .copied()
+            .filter(|knobs| knobs.dispatch_depth == depth)
+            .collect();
+        let mut worker = worker.clone();
+        worker.runtime.frame_dispatch_depth =
+            u32::try_from(depth).context("a dispatch depth past a u32")?;
+        // the load's frame size is the largest this depth tries: its window
+        // is laid for it, and the smaller ones sweep within the load
+        let largest = at_depth
+            .iter()
+            .map(|knobs| knobs.frame_size)
+            .max()
+            .unwrap_or(1);
+        worker.runtime.frame_size = u32::try_from(largest).context("a frame size past a u32")?;
+        println!("  loading at {depth} frame(s) in flight");
         let pie = worker::standalone::run_standalone(
-            controller,
-            gateway,
+            controller.clone(),
+            gateway.clone(),
             worker,
             &crate::paths::pie_home(),
         )
         .await
         .context("boot the engine (is something already serving on this port?)")?;
         let addr = pie.listen_addr.to_string();
-
-        sweep::warmup(&addr, &args.program, &inputs)
+        let swept = async {
+            sweep::warmup(&addr, &args.program, &inputs)
+                .await
+                .with_context(|| {
+                    format!(
+                        "warmup with {}: is it in `pie inferlet list`?",
+                        args.program
+                    )
+                })?;
+            sweep::sweep_all(
+                &addr,
+                &args.program,
+                &inputs,
+                &at_depth,
+                workload.repeats,
+                |pass, total| {
+                    println!(
+                        "  pass {pass}/{total} over {} candidate(s) at depth {depth}",
+                        at_depth.len()
+                    )
+                },
+            )
             .await
-            .with_context(|| {
-                format!(
-                    "warmup with {}: is it in `pie inferlet list`?",
-                    args.program
-                )
-            })?;
-
-        let rounds = sweep::sweep_all(
-            &addr,
-            &args.program,
-            &inputs,
-            &plan,
-            workload.repeats,
-            |pass, total| println!("  pass {pass}/{total} over {} candidates", plan.len()),
-        )
-        .await?;
-        anyhow::Ok(rounds)
+        }
+        .await;
+        pie.shutdown().await;
+        rounds.extend(swept?);
     }
-    .await?;
     println!();
 
     let best = winner(&rounds, &baseline, metric);

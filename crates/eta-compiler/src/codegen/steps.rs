@@ -24,11 +24,12 @@ pub const SORT_ROUNDS: u32 = 28;
 /// The bytes of a step's record ([`StepUniform`]), in whole sixteens.
 pub const STEP_BYTES: u32 = 48;
 
-/// Where a step's record holds its node, rung and selector, and the bases
-/// of its instance's tables, status and heap.
+/// Where a step's record holds its node, rung, selector and its node's
+/// temporary area, and the bases of its instance's tables, status and heap.
 pub const NODE_AT: u32 = 0;
 pub const RUNG_AT: u32 = 4;
 pub const SELECTOR_AT: u32 = 8;
+pub const AREA_AT: u32 = 12;
 pub const BASES_AT: u32 = 16;
 
 /// What a step's call reads: the node it runs (its op's params), the rung
@@ -41,6 +42,10 @@ pub struct StepUniform {
     pub node: u32,
     pub rung: u32,
     pub selector: u32,
+    /// The word its node's temporary area begins at in the stage's heap, as
+    /// a bind lays it (`eta_exec::tables::StageTables::areas`); 0 where the
+    /// node keeps none.
+    pub area: u32,
 }
 
 /// Where a stage's instance lies, in words of the segments a backend binds:
@@ -58,10 +63,10 @@ pub struct Bases {
 }
 
 impl StepUniform {
-    /// The record's bytes, little-endian u32s: node, rung and selector at
-    /// [`NODE_AT`], [`RUNG_AT`] and [`SELECTOR_AT`], then `bases` from
-    /// [`BASES_AT`] (status, descriptors, params, offsets, config, heap),
-    /// padded to [`STEP_BYTES`].
+    /// The record's bytes, little-endian u32s: node, rung, selector and
+    /// area at [`NODE_AT`], [`RUNG_AT`], [`SELECTOR_AT`] and [`AREA_AT`],
+    /// then `bases` from [`BASES_AT`] (status, descriptors, params, offsets,
+    /// config, heap), padded to [`STEP_BYTES`].
     #[must_use]
     pub fn bytes(self, bases: Bases) -> [u8; STEP_BYTES as usize] {
         let mut out = [0u8; STEP_BYTES as usize];
@@ -69,6 +74,7 @@ impl StepUniform {
             (NODE_AT, self.node),
             (RUNG_AT, self.rung),
             (SELECTOR_AT, self.selector),
+            (AREA_AT, self.area),
             (BASES_AT, bases.status),
             (BASES_AT + 4, bases.descs),
             (BASES_AT + 8, bases.params),
@@ -90,6 +96,9 @@ pub enum Reduce {
     Max,
     Min,
     Argmax,
+    /// `gumbel_argmax`: an argmax whose lanes are the Gumbel-perturbed
+    /// logits, made in the reduction's first level.
+    GumbelArgmax,
 }
 
 /// What a sort ladder's finishing step lands.
@@ -186,7 +195,11 @@ pub struct NodeStep {
 pub const fn is_reduce(tag: u8) -> bool {
     matches!(
         tag,
-        tags::REDUCE_SUM | tags::REDUCE_MAX | tags::REDUCE_MIN | tags::REDUCE_ARGMAX
+        tags::REDUCE_SUM
+            | tags::REDUCE_MAX
+            | tags::REDUCE_MIN
+            | tags::REDUCE_ARGMAX
+            | tags::GUMBEL_ARGMAX
     )
 }
 
@@ -201,6 +214,7 @@ const fn reduce_of(tag: u8) -> Option<Reduce> {
         tags::REDUCE_MAX => Some(Reduce::Max),
         tags::REDUCE_MIN => Some(Reduce::Min),
         tags::REDUCE_ARGMAX => Some(Reduce::Argmax),
+        tags::GUMBEL_ARGMAX => Some(Reduce::GumbelArgmax),
         _ => None,
     }
 }
@@ -306,12 +320,22 @@ pub fn reduce_levels(plan: &LaunchStagePlan, at: usize) -> u32 {
     let Some(mut len) = last_extent(plan, at) else {
         return REDUCE_LEVELS;
     };
+    let first = plan.ops.get(at).map_or(32, |op| first_fan(op.tag));
     let mut levels = 0;
     while len > 1 && levels < REDUCE_LEVELS {
-        len = len.div_ceil(32);
+        len = len.div_ceil(if levels == 0 { first } else { 32 });
         levels += 1;
     }
     levels
+}
+
+/// The lanes a job of a reduction's first level folds (the runtime's
+/// `red_fan0`): 32, but 8 for a `gumbel_argmax`, whose lanes each hash the
+/// rng and take two logs, so a row spreads over four times the
+/// invocations. Every level above folds 32.
+#[must_use]
+pub const fn first_fan(tag: u8) -> u64 {
+    if tag == tags::GUMBEL_ARGMAX { 8 } else { 32 }
 }
 
 /// Whether `at`'s argument is one row, which the one-row select handles.
@@ -516,14 +540,17 @@ mod tests {
             node: 7,
             rung: 3,
             selector: 2,
+            area: 9,
         }
         .bytes(bases);
         let word = |at: u32| {
             let at = at as usize;
             u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
         };
-        assert_eq!((word(NODE_AT), word(RUNG_AT), word(SELECTOR_AT)), (7, 3, 2));
-        assert_eq!(word(12), 0, "the pad is zero");
+        assert_eq!(
+            (word(NODE_AT), word(RUNG_AT), word(SELECTOR_AT), word(AREA_AT)),
+            (7, 3, 2, 9)
+        );
         let laid: Vec<u32> = (0..6).map(|k| word(BASES_AT + 4 * k)).collect();
         assert_eq!(laid, [11, 13, 17, 19, 23, 29]);
         assert_eq!((word(40), word(44)), (0, 0), "the pad is zero");

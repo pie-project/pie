@@ -705,15 +705,20 @@ impl Engine for Cuda {
         // gone from the driver's free bytes and Windows' commit alike. A
         // ring that cannot be pinned refuses the load, here and not after
         // ready.
-        let ring = crate::store::staging_ring_for(
-            &trace,
-            budgets.page_size,
-            budgets.max_context,
-            residency.host_kv_budget,
-            ranks,
-        )
-        .and_then(|bytes| bytes.map(crate::store::Ring::pin).transpose())
-        .map_err(fault)?;
+        let frames = engine::runahead::Runahead::of(frames_in_flight).frames_in_flight;
+        let ring = crate::store::staging_ring_for(residency.host_kv_budget, ranks, frames)
+            .and_then(|size| size.map(crate::store::Ring::pin).transpose())
+            .map_err(fault)?;
+        if let Some(ring) = &ring {
+            let size = ring.size();
+            eprintln!(
+                "engine-cuda: the host tier's staging ring: {} MiB pinned, {} pieces of {} MiB (a \
+                 piece for each of 2 stages for each of {frames} frames in flight)",
+                size.bytes() >> 20,
+                size.pieces,
+                size.piece >> 20
+            );
+        }
         let mut budgets = budgets;
         if budgets.context_declared && kv_budget.is_none() {
             let fits = crate::store::declared_context_that_fits(
@@ -844,6 +849,8 @@ impl Engine for Cuda {
                 storage_alignment: 256,
                 storage_max_tile_bytes: u64::MAX,
                 codegen_backend: Some(CODEGEN.to_string()),
+                // its CUDA / HIP emitters serve every form
+                library_forms: engine::LibraryForms::ALL,
             },
             pools: PoolFacts {
                 adapter_banks: shell
@@ -895,6 +902,10 @@ impl Engine for Cuda {
             // CUDA states no bound on one submission (no watchdog on a
             // compute device).
             guest_cost: engine::GuestCost::default(),
+            mixed_lanes: engine::MixedLanes::Any,
+            frames_in_flight: u32::from(
+                engine::runahead::Runahead::of(frames_in_flight).frames_in_flight,
+            ),
         };
 
         // A fire's lanes, rows and readouts bound the scheduler's waves: a
@@ -1180,6 +1191,14 @@ impl Engine for Cuda {
 
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
         let submitted = self.submit_frame(frame);
+        // A frame whose step refused its lanes by name fired the steps
+        // before it alone: a refusal too.
+        if submitted
+            .as_ref()
+            .is_ok_and(|ticket| !ticket.refused.is_empty())
+        {
+            engine::Engine::live(self).tally(engine::live::Tally::Refused, 1);
+        }
         self.refused(submitted)
     }
 

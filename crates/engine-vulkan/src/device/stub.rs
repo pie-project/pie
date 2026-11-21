@@ -128,7 +128,24 @@ impl Context {
         match self.never {}
     }
 
+    pub fn lay_staging(&self) -> Result<()> {
+        match self.never {}
+    }
+
     pub fn frame(&self) -> Result<Frame> {
+        match self.never {}
+    }
+
+    pub fn spanned(&self) -> Result<Frame> {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn idle(&self) -> bool {
+        match self.never {}
+    }
+
+    pub fn spanned_kept(&self) -> Result<Frame> {
         match self.never {}
     }
 
@@ -150,6 +167,10 @@ impl Frame {
         Err(Fault::Deviceless)
     }
 
+    pub fn submit_segment(&self) -> Result<()> {
+        Err(Fault::Deviceless)
+    }
+
     #[must_use]
     pub fn dispatches(&self) -> u64 {
         match self.never {}
@@ -165,6 +186,10 @@ impl Frame {
     }
 
     pub fn commit_timed(self) -> Result<f64> {
+        match self.never {}
+    }
+
+    pub fn commit_spanned(self) -> Result<Option<u64>> {
         match self.never {}
     }
 
@@ -199,6 +224,10 @@ impl Frame {
     pub fn into_kept(self) -> Result<Kept> {
         match self.never {}
     }
+
+    pub fn into_kept_spanned(self) -> Result<Kept> {
+        match self.never {}
+    }
 }
 
 #[derive(Debug)]
@@ -209,6 +238,10 @@ pub struct Kept {
 impl Kept {
     #[must_use]
     pub fn cuts(&self) -> usize {
+        match self.never {}
+    }
+
+    pub fn replay_spanned(&self) -> Result<Option<u64>> {
         match self.never {}
     }
 

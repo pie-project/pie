@@ -3,10 +3,12 @@ pub use compile::{is_row_vector, same_rows, value_rows};
 pub mod lane_table;
 
 pub use compile::{
-    COMPILER_VERSION, ChannelSink, ChannelSlot, CompiledStage, Dimension, LibraryOp, NodeIndex,
+    COMPILER_VERSION, ChannelSink, ChannelSlot, CompiledStage, Dimension, LibraryForms, LibraryOp,
+    NodeIndex,
     NormalizedStage, PartitionKind, PlanMetrics, REGION_PLAN_VERSION, Region, RegionKind,
     RegionPartition, ScheduleTemplate, StageSignature, SymbolicExtent, SymbolicType, ValueDomain,
-    compile_bound, compile_stage, compile_stage_at, debug_stage_plan, library_op_for_tag,
+    compile_bound, compile_bound_with, compile_stage, compile_stage_at, debug_stage_plan,
+    library_op_for_tag,
     stage_identity,
 };
 pub(crate) use compile::{StageIndex, direct_topk, readout_plane, row_views};

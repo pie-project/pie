@@ -35,6 +35,7 @@ pub(crate) type Slab = Arc<Raw>;
 
 impl Raw {
     pub(crate) fn new(core: &Arc<Core>, bytes: u64, kind: Memory, owner: Owner) -> Result<Slab> {
+        core.alive()?;
         note_reservation();
         let size = bytes.max(4).next_multiple_of(4);
         if size > core.bound {
@@ -87,7 +88,7 @@ impl Raw {
                 label: Some("pie clear"),
             });
         encoder.clear_buffer(&buffer, 0, None);
-        core.queue.submit(std::iter::once(encoder.finish()));
+        core.submit(encoder.finish());
         core.take_error("clear_buffer")?;
         Ok(Arc::new(Raw {
             core: Arc::clone(core),
@@ -116,6 +117,7 @@ impl Raw {
         if bytes.is_empty() {
             return Ok(());
         }
+        self.core.alive()?;
         let len = bytes.len() as u64;
         if offset.is_multiple_of(4) && len.is_multiple_of(4) {
             self.core.queue.write_buffer(&self.buffer, offset, bytes);
@@ -155,7 +157,7 @@ impl Raw {
         len: u64,
         on_read: impl FnOnce(Result<Vec<u8>>) + Send + 'static,
     ) {
-        if let Err(fault) = self.span(offset, len) {
+        if let Err(fault) = self.span(offset, len).and_then(|()| self.core.alive()) {
             return on_read(Err(fault));
         }
         if len == 0 {
@@ -201,7 +203,7 @@ impl Raw {
                 label: Some("pie read"),
             });
         encoder.copy_buffer_to_buffer(&self.buffer, start, &staging, 0, Some(span));
-        core.queue.submit(std::iter::once(encoder.finish()));
+        core.submit(encoder.finish());
         let mapped = staging.clone();
         let core = Arc::clone(core);
         staging
@@ -237,7 +239,7 @@ impl Raw {
                 label: Some("pie zero"),
             });
         encoder.clear_buffer(&self.buffer, start, Some(end - start));
-        core.queue.submit(std::iter::once(encoder.finish()));
+        core.submit(encoder.finish());
         core.take_error("clear_buffer")
     }
 }

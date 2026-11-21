@@ -138,6 +138,15 @@ impl Context {
         match self.never {}
     }
 
+    pub fn spanned(&self) -> Result<Frame> {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn idle(&self) -> bool {
+        match self.never {}
+    }
+
     pub fn bind_frame(&self) -> Result<Frame> {
         match self.never {}
     }
@@ -160,6 +169,10 @@ impl Frame {
         Err(Fault::Deviceless)
     }
 
+    pub fn submit_segment(&self) -> Result<()> {
+        Err(Fault::Deviceless)
+    }
+
     #[must_use]
     pub fn dispatches(&self) -> u64 {
         match self.never {}
@@ -170,6 +183,10 @@ impl Frame {
     }
 
     pub fn commit_timed(self) -> Result<f64> {
+        match self.never {}
+    }
+
+    pub fn commit_spanned(self) -> Result<Option<u64>> {
         match self.never {}
     }
 

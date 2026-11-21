@@ -411,6 +411,13 @@ impl Context {
         self.ctx.set_tuning(tuning);
     }
 
+    /// Lay the device's measured product times on this context
+    /// (`kernels_cuda::linear::routes`).
+    #[cfg(feature = "rocm")]
+    pub fn set_routes(&mut self, routes: std::sync::Arc<kernels_cuda::linear::routes::Routes>) {
+        self.ctx.set_routes(routes);
+    }
+
     #[must_use]
     pub fn capability(&self) -> (i32, i32) {
         self.capability
@@ -486,6 +493,36 @@ impl Drop for Context {
 }
 
 /// `work` on the host once what `stream` has before it is done.
+/// Holds `stream` until the 32-bit word at device address `word` (mapped
+/// host memory a host thread writes) is at least `value`, compared as the
+/// driver does, wrapping: the stream waits on the device, no host function
+/// and no driver thread blocked for it.
+pub fn wait_value(stream: *mut c_void, word: u64, value: u32) -> Result<()> {
+    #[cfg(feature = "device")]
+    {
+        use crate::device::dr;
+        #[cfg(feature = "cuda")]
+        let geq = dr::CUstreamWaitValue_flags::CU_STREAM_WAIT_VALUE_GEQ as core::ffi::c_uint;
+        #[cfg(feature = "rocm")]
+        let geq = dr::CU_STREAM_WAIT_VALUE_GEQ;
+        // SAFETY: `word` is a live device-visible address of mapped host
+        // memory the caller holds while the stream may read it.
+        let code = unsafe { dr::cuStreamWaitValue32_v2(stream.cast(), word, value, geq) };
+        if code != dr::CUresult::CUDA_SUCCESS {
+            return Err(Fault::Device {
+                call: "cuStreamWaitValue32_v2",
+                code: code as i32,
+            });
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "device"))]
+    {
+        let _ = (stream, word, value);
+        Err(Fault::Runtimeless)
+    }
+}
+
 pub fn host_fn_on(stream: *mut c_void, work: Box<dyn FnOnce() + Send + 'static>) -> Result<()> {
     #[cfg(feature = "device")]
     {

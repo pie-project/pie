@@ -760,12 +760,19 @@ __device__ __forceinline__ void paged_prefill_wide_body(const Paged& p, const Pr
             }
         }
     };
-    if (chunk_start < chunk_end) fetch(chunk_start);
+    // The next tile is read into registers across the tile's products, where
+    // they have room: at D = 512 the output's (D/16 · 4) and Qᵀ's (D/32 · 4)
+    // registers take 192 of the 256 a lane has at two wavefronts a SIMD, and
+    // a tile held beside them spills to scratch. There the tile is read just
+    // before it is staged.
+    constexpr bool AHEAD = D < 512;
+    if (AHEAD && chunk_start < chunk_end) fetch(chunk_start);
 
     for (int kv0 = chunk_start; kv0 < chunk_end; kv0 += BC) {
+        if constexpr (!AHEAD) fetch(kv0);
         stage(kv0);
         lds_barrier();
-        if (kv0 + BC < chunk_end) fetch(kv0 + BC);
+        if (AHEAD && kv0 + BC < chunk_end) fetch(kv0 + BC);
         if (wave_live) {
             // Sᵀ: lane holds keys 4·quad + t of each 16-key tile, for its row;
             // two chains over the head, so a product waits on the one before

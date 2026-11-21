@@ -3,7 +3,7 @@
 //! (`engine::Engine::prewarm_programs`). The stage bodies are the SDK's own
 //! ([`eta_dsl::sampler`], which the built-in inferlets' generation loop
 //! runs as `inferlet::sampler`), traced for each of
-//! [`eta_dsl::sampler::STANDARD`]'s shapes over the channels and ports that
+//! [`eta_dsl::sampler::standard`]'s shapes over the channels and ports that
 //! loop binds: the prompt's last fire and the decode fire. An engine keys a
 //! program's regions by their text, which a request's knob values do not
 //! change, so a request of one of these shapes builds nothing.
@@ -22,9 +22,10 @@ use eta_dsl::sampler::{self, Knobs, Shape, Slots};
 use eta_ir::registry::OutputDecl;
 
 /// The channels a pass's knobs ride in, as the built-in inferlets seed them
-/// (read in the stage, never consumed).
+/// (read in the stage, never consumed): the temperature as its reciprocal
+/// (`sampler::inverse_temperature`).
 struct KnobChannels {
-    temperature: Option<f32>,
+    temperature: Option<Channel>,
     top_p: Option<Channel>,
     top_k: Option<Channel>,
     min_p: Option<Channel>,
@@ -57,7 +58,9 @@ impl KnobChannels {
     fn new(shape: &Shape, request: &Request) -> Self {
         let f = |on: bool| on.then(|| Channel::from([request.knob]));
         Self {
-            temperature: shape.temperature.map(|_| request.temperature),
+            temperature: shape
+                .temperature
+                .then(|| Channel::from([sampler::inverse_temperature(request.temperature)])),
             top_p: f(shape.top_p),
             top_k: shape.top_k.then(|| Channel::from([request.top_k])),
             min_p: f(shape.min_p),
@@ -71,7 +74,7 @@ impl KnobChannels {
     fn read(&self) -> Knobs {
         let t = |c: &Option<Channel>| c.as_ref().map(|c| reshape(c.read(), []));
         Knobs {
-            temperature: self.temperature,
+            temperature: t(&self.temperature),
             top_p: t(&self.top_p),
             top_k: t(&self.top_k),
             min_p: t(&self.min_p),
@@ -194,7 +197,7 @@ pub fn traces(
     capacity: u32,
 ) -> Result<Vec<(String, Traced)>, String> {
     let mut all = Vec::new();
-    for (name, shape) in &sampler::STANDARD {
+    for (name, shape) in &sampler::standard() {
         let [prefill, decode] = passes(vocab, page_size, outputs, capacity, shape, &PREWARM)
             .map_err(|error| format!("the standard sampler `{name}`: {error}"))?;
         all.push((format!("{name} (prompt)"), prefill));
@@ -272,6 +275,45 @@ mod tests {
         }]
     }
 
+    /// Every standard sampler, prompt and decode at Qwen3's vocabulary,
+    /// planned with the forms Metal states (`Backend::library_forms`), forms
+    /// only library regions Metal's emitter serves: the boot registers them
+    /// all, and a region Metal declines fails the load (the tip after the
+    /// bf16 landing did not boot on Metal: the temperature-scaled draw was
+    /// formed as a `NucleusSample` region). The control: planned with every
+    /// form, a region Metal declines is formed, so the check bites.
+    #[test]
+    fn metal_plans_every_standard_sampler_in_forms_it_serves() {
+        use eta_compiler::codegen::metal::validate::library_region_valid;
+        use eta_compiler::codegen::program::Backend;
+        use eta_compiler::plan::{LibraryForms, RegionKind, compile_bound_with};
+        let traced = traces(VOCAB, 16, &outputs(), 8).expect("the standard samplers trace");
+        let declined = |forms: LibraryForms| -> Vec<String> {
+            let mut declined = Vec::new();
+            for (name, traced) in &traced {
+                let bound =
+                    eta_ir::validate::bind(traced.container().clone(), vec![outputs()], EngineCaps::default())
+                        .expect("the sampler binds");
+                for (at, stage) in compile_bound_with(&bound, forms).iter().enumerate() {
+                    for region in &stage.fused.regions {
+                        if matches!(region.kind, RegionKind::Library(_))
+                            && !library_region_valid(stage, region)
+                        {
+                            declined.push(format!("{name}: stage {at} {:?}", region.kind));
+                        }
+                    }
+                }
+            }
+            declined
+        };
+        let metal = declined(Backend::Metal.library_forms());
+        assert!(metal.is_empty(), "Metal declines regions planned in its forms: {metal:?}");
+        assert!(
+            !declined(LibraryForms::ALL).is_empty(),
+            "planned with every form, a standard sampler forms a region Metal declines"
+        );
+    }
+
     /// The regions `backend`'s emitter gives a program, each by its text
     /// under one symbol: what engine-cuda and engine-metal key a region's
     /// module by. For `wgsl`, the step calls its stages dispatch, each by its
@@ -325,7 +367,8 @@ mod tests {
     #[test]
     fn a_standard_request_registers_the_regions_the_prewarm_built() {
         let prewarmed = traces(VOCAB, 16, &outputs(), 8).expect("traces");
-        assert_eq!(prewarmed.len(), 2 * sampler::STANDARD.len());
+        let standard = sampler::standard();
+        assert_eq!(prewarmed.len(), 2 * standard.len());
         let requests = [
             Request {
                 temperature: 0.7,
@@ -342,7 +385,7 @@ mod tests {
                 prompt: 280,
             },
         ];
-        for ((name, shape), built) in sampler::STANDARD.iter().zip(prewarmed.chunks(2)) {
+        for ((name, shape), built) in standard.iter().zip(prewarmed.chunks(2)) {
             for request in &requests {
                 let asked = passes(VOCAB, 16, &outputs(), 8, shape, request).expect("traces");
                 for (pass, (built, asked)) in

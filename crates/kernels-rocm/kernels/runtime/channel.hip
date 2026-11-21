@@ -70,8 +70,10 @@ struct SettleLane {
     const u32* commit;
     u32 ticket_offset;
     u32 ticket_count;
+    // Where the host reads the pass's verdict, handed over by the settle.
+    u32* commit_host;
 };
-static_assert(sizeof(SettleLane) == 16, "SettleLane ABI");
+static_assert(sizeof(SettleLane) == 24, "SettleLane ABI");
 
 __device__ __forceinline__ void store_system_relaxed(u64* word, u64 value) {
     __hip_atomic_store(word, value, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
@@ -251,6 +253,9 @@ __global__ void settle(const Ticket* __restrict__ tickets, const SettleLane* __r
                        u32 lane_count) {
     if (blockIdx.x >= lane_count) return;
     const SettleLane lane = lanes[blockIdx.x];
+    if (threadIdx.x == 0 && lane.commit_host != nullptr && lane.commit != nullptr) {
+        __hip_atomic_store(lane.commit_host, *lane.commit, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
     if (lane.commit == nullptr || *lane.commit == 0u) return;
     for (u32 index = threadIdx.x; index < lane.ticket_count; index += blockDim.x) {
         const Ticket ticket = tickets[lane.ticket_offset + index];

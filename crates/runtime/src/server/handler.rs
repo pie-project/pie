@@ -75,9 +75,36 @@ impl Session {
                     // Fires whose geometry the host resolved though it is
                     // not host-derivable: an engine limit or the program's
                     // class, each named at bind.
+                    // Summed, and split by the engine the pass bound on, the
+                    // reason and the program.
+                    let host_fires = crate::pipeline::fire::host_geometry::by();
                     stats.insert(
                         format!("{}.host_geometry_fires", model_name),
                         serde_json::Value::from(crate::pipeline::fire::host_geometry::fires()),
+                    );
+                    stats.insert(
+                        format!("{}.host_geometry_fires_by", model_name),
+                        serde_json::Value::Array(
+                            host_fires
+                                .iter()
+                                .map(|(key, fires)| {
+                                    serde_json::json!({
+                                        "engine": key.engine,
+                                        "kind": key.kind,
+                                        "reason": key.reason,
+                                        "program": format!("{:016x}", key.program),
+                                        "fires": fires,
+                                    })
+                                })
+                                .collect(),
+                        ),
+                    );
+
+                    // Prefills a peer asked for streamed that went whole:
+                    // this engine streams no layer out as it computes.
+                    stats.insert(
+                        format!("{}.offload.prefill_unstreamed", model_name),
+                        serde_json::Value::from(crate::offload::stream::unstreamed()),
                     );
 
                     let inf = crate::scheduler::get_stats().await;
@@ -567,8 +594,17 @@ impl Session {
     /// The program `inferlet` names for this session's tenant, compiled.
     async fn launchable(&self, inferlet: &str) -> anyhow::Result<program::Program> {
         let reference = ProgramRef::parse(inferlet)?;
+        let t0 = crate::rt::Instant::now();
         let program = program::resolve(Some(&self.tenant), &reference).await?;
+        let resolved = t0.elapsed();
         program::load(&program).await?;
+        tracing::debug!(
+            target: "pie::launch",
+            %program,
+            resolve_us = resolved.as_micros() as u64,
+            load_us = (t0.elapsed() - resolved).as_micros() as u64,
+            "launchable"
+        );
         Ok(program)
     }
 

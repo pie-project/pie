@@ -63,6 +63,9 @@ struct Params {
     int n_rows;
     int q_heads;
     int head_dim;
+    // The fire row the window's row 0 is: `o` and the LSE are the fire's
+    // whole planes, the partials the window's own.
+    uint row0;
 };
 PIE_PARAMS(PIE_PARAMS_AT, Params, params);
 
@@ -110,10 +113,11 @@ void main(uint3 gid : SV_DispatchThreadID) {
         }
     }
     float2 v = total == 0.0 ? float2(0.0, 0.0) : acc / total;
-    o[(row * width + e) >> 1] = pack_bf16(v.x, v.y);
+    uint at = params.row0 + row;
+    o[(at * width + e) >> 1] = pack_bf16(v.x, v.y);
 #if defined(PIE_LSE)
     if (d == 0u) {
-        lse_out[row * heads + head] = finite_(top) ? top + log2(total) : neg_inf();
+        lse_out[at * heads + head] = finite_(top) ? top + log2(total) : neg_inf();
     }
 #endif
 }
@@ -197,6 +201,10 @@ struct Params {
     float scale;
     int window;
     int n_q_heads;
+    // The fire row the window's row 0 is: the queries, the output, the LSE,
+    // the tables and the selection are the fire's whole, bound once at load
+    // whatever window a fire cuts; a dispatch's `row` is the window's.
+    uint row0;
 #if defined(PIE_SELECTED)
     int top_k;
     int ratio;
@@ -214,6 +222,11 @@ struct Params {
 PIE_PARAMS(PIE_PARAMS_AT, Params, params);
 PIE_POOL_READ(SDPA_KV, SDPA_KV_SCALE * params.seg_words)
 
+// The fire row a window's row `row` is.
+uint fire_row(uint row) {
+    return params.row0 + row;
+}
+
 // The bf16 element key `kp` of request `req` starts at in its plane: its
 // page, `page_stride` words a page, then the token's row in it.
 uint page_row(int req, int kp) {
@@ -224,7 +237,7 @@ uint page_row(int req, int kp) {
 
 // Row `row`'s boundary, read once a row: `MASK_NONE` where it states no mask.
 uint mask_origin(uint row) {
-    return attention_mask_words[2u * row];
+    return attention_mask_words[2u * fire_row(row)];
 }
 
 // Whether row `row`'s mask admits key `kp`, `origin` its boundary. A row's
@@ -237,7 +250,7 @@ bool mask_admits(uint row, uint origin, uint kp) {
     if (kp < origin) {
         return true;
     }
-    return mask_byte(attention_mask_words[2u * row + 1u] + (kp - origin)) != 0u;
+    return mask_byte(attention_mask_words[2u * fire_row(row) + 1u] + (kp - origin)) != 0u;
 }
 
 bool keeps(uint row, uint origin, int kp, int q_pos, int start) {
@@ -252,7 +265,7 @@ int window_start(int q_pos) {
 }
 
 uint row_base(uint row, uint q_head) {
-    return (row * uint(params.n_q_heads) + q_head) * uint(PIE_HEAD_DIM);
+    return (fire_row(row) * uint(params.n_q_heads) + q_head) * uint(PIE_HEAD_DIM);
 }
 
 #if defined(PIE_TILED)
@@ -286,8 +299,8 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     uint row = tile * uint(PIE_TILE_ROWS) + slot_y;
     bool live = row < uint(params.n_rows);
 
-    int req = live ? req_of_token[row] : 0;
-    int q_pos = live ? position_ids[row] : -1;
+    int req = live ? req_of_token[fire_row(row)] : 0;
+    int q_pos = live ? position_ids[fire_row(row)] : -1;
     uint origin = live ? mask_origin(row) : MASK_NONE;
     int start = window_start(q_pos);
     uint q_base = row_base(row, q_head);
@@ -300,7 +313,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         for (uint r = 0u; r < uint(PIE_TILE_ROWS); r++) {
             uint at = tile * uint(PIE_TILE_ROWS) + r;
             if (at < uint(params.n_rows)) {
-                last = max(last, position_ids[at]);
+                last = max(last, position_ids[fire_row(at)]);
             }
         }
         sdpa_last = last;
@@ -412,7 +425,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 
 #if defined(PIE_LSE)
     if (live && lane == 0u) {
-        lse_out[row * uint(params.n_q_heads) + q_head] = lse_base2(max_score, sum_exp);
+        lse_out[fire_row(row) * uint(params.n_q_heads) + q_head] = lse_base2(max_score, sum_exp);
     }
 #endif
     if (live) {
@@ -452,7 +465,7 @@ float bf16_of(uint16_t h) {
 // `subgroups`-th step from its own and reduces within itself.
 void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos, int start,
                  out float merged_max, out float merged_sum, out uint subgroups) {
-    int req = req_of_token[row];
+    int req = req_of_token[fire_row(row)];
     uint origin = mask_origin(row);
     uint base_row = row_base(row, q_head);
     int kv_head = int(q_head) / params.gqa_factor;
@@ -494,7 +507,7 @@ void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos,
 #if defined(PIE_SELECTED)
             int kp;
             if (n < sel_end) {
-                int c = selection[row * uint(params.top_k) + uint(n / params.ratio)];
+                int c = selection[fire_row(row) * uint(params.top_k) + uint(n / params.ratio)];
                 if (c < 0 || c >= nblocks) {
                     continue;
                 }
@@ -584,7 +597,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     uint q_head = group.x;
     uint row = group.y;
     uint tid = local.x;
-    int q_pos = position_ids[row];
+    int q_pos = position_ids[fire_row(row)];
     int start = window_start(q_pos);
     uint base_row = row_base(row, q_head);
     float merged_max, merged_sum;
@@ -609,7 +622,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         if (tid == 0u) {
             part_lse[slice] = pos_inf();
 #if defined(PIE_SPLIT_LSE)
-            lse_out[row * uint(params.n_q_heads) + q_head] = lse_base2(merged_max, merged_sum);
+            lse_out[fire_row(row) * uint(params.n_q_heads) + q_head] = lse_base2(merged_max, merged_sum);
 #endif
         }
         for (uint d = tid; d < uint(PIE_HEAD_DIM); d += uint(PIE_DECODE_THREADS)) {
@@ -629,7 +642,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     decode_walk(row, q_head, tid, start, q_pos, q_pos, start, merged_max, merged_sum, subgroups);
 #if defined(PIE_LSE)
     if (tid == 0u) {
-        lse_out[row * uint(params.n_q_heads) + q_head] = lse_base2(merged_max, merged_sum);
+        lse_out[fire_row(row) * uint(params.n_q_heads) + q_head] = lse_base2(merged_max, merged_sum);
     }
 #endif
     for (uint d = tid; d < uint(PIE_HEAD_DIM); d += uint(PIE_DECODE_THREADS)) {
@@ -659,7 +672,7 @@ groupshared int sdpa_pos;
 // `walkers`-th step from its own.
 void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos, int start,
                  out float merged_max, out float merged_sum, out uint walkers) {
-    int req = req_of_token[row];
+    int req = req_of_token[fire_row(row)];
     uint origin = mask_origin(row);
     uint base_row = row_base(row, q_head);
     int kv_head = int(q_head) / params.gqa_factor;
@@ -698,7 +711,7 @@ void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos,
 #if defined(PIE_SELECTED)
         int kp = -1;
         if (n < sel_end) {
-            int c = selection[row * uint(params.top_k) + uint(n / params.ratio)];
+            int c = selection[fire_row(row) * uint(params.top_k) + uint(n / params.ratio)];
             if (c >= 0 && c < nblocks) {
                 kp = c * params.ratio + (n % params.ratio);
             }
@@ -807,7 +820,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     // Every lane reads the same row; staged and read uniformly, as the key
     // bound below decides loops of barriers and an early return.
     if (tid == 0u) {
-        sdpa_pos = position_ids[row];
+        sdpa_pos = position_ids[fire_row(row)];
     }
     GroupMemoryBarrierWithGroupSync();
     int q_pos = workgroupUniformLoad(sdpa_pos);
@@ -836,7 +849,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         if (tid == 0u) {
             part_lse[slice] = pos_inf();
 #if defined(PIE_SPLIT_LSE)
-            lse_out[row * uint(params.n_q_heads) + q_head] = lse_base2(merged_max, merged_sum);
+            lse_out[fire_row(row) * uint(params.n_q_heads) + q_head] = lse_base2(merged_max, merged_sum);
 #endif
         }
         for (uint d = 2u * tid; d < uint(PIE_HEAD_DIM); d += 2u * uint(PIE_DECODE_THREADS)) {
@@ -856,7 +869,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     decode_walk(row, q_head, tid, start, q_pos, q_pos, start, merged_max, merged_sum, walkers);
 #if defined(PIE_LSE)
     if (tid == 0u) {
-        lse_out[row * uint(params.n_q_heads) + q_head] = lse_base2(merged_max, merged_sum);
+        lse_out[fire_row(row) * uint(params.n_q_heads) + q_head] = lse_base2(merged_max, merged_sum);
     }
 #endif
     for (uint d = 2u * tid; d < uint(PIE_HEAD_DIM); d += 2u * uint(PIE_DECODE_THREADS)) {

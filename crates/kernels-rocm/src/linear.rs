@@ -9,6 +9,8 @@ pub mod gemm;
 
 pub mod lane_gemm;
 
+pub mod routes;
+
 #[cfg(feature = "rocm")]
 mod gemv;
 /// The rates step's cached-read probe (`[rates] cached_gbps`).

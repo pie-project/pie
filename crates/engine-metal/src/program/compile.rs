@@ -171,6 +171,7 @@ impl Module {
             let path = dir.join(format!("{entry}.metal"));
             let _ = std::fs::write(path, source);
         }
+        crate::diag::made(&format!("guest library+pipeline {entry}"), 0);
         let text = crate::device::ctx::nsstring(source);
         let library = device
             .newLibraryWithSource_options_error(&text, Some(&options))

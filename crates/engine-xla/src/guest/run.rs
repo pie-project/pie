@@ -123,7 +123,7 @@ pub struct Stages {
     /// (`Shell::guest_planes`): output, rows, width, layers, readout flag,
     /// dtype. A registration's outputs are checked against these, and each
     /// stage compiled for them.
-    pub planes: Vec<(String, u32, u32, u32, bool, Dtype)>,
+    pub planes: Vec<(String, u32, u32, u32, bool, Dtype, bool)>,
     /// Stages a fire compiled (`Stages::get` past `compile_all`): a defect.
     pub fire_compiles: u64,
 }
@@ -181,9 +181,121 @@ pub fn compile_wanted(
     tracing::info!(
         programs = wanted.len(),
         seconds = started.elapsed().as_secs_f32(),
+        need_mib = guest_compile_need() >> 20,
         "guest stages compiled"
     );
     Ok(staged)
+}
+
+/// The process's ledger of guest stage compiles, every registration's:
+/// the host memory the running ones may take (each at the learned need),
+/// how many run, and the need learned, the largest peak a stage compile
+/// running alone grew the process by. A guest stage's compile takes host
+/// memory its text does not tell (v6e: 0.1-1 GB a 45 KB sampler stage), so
+/// the need is measured, not read off the text; concurrent registrations
+/// each sizing their own room from the free memory OOM-killed a server at
+/// its cgroup cap.
+struct GuestLedger {
+    state: std::sync::Mutex<(u64, u32, u64)>,
+    ended: std::sync::Condvar,
+}
+
+static GUEST_LEDGER: std::sync::OnceLock<GuestLedger> = std::sync::OnceLock::new();
+
+/// A guest stage compile the ledger let in. Calibrating (none learned
+/// yet): it runs alone and its peak growth becomes the need.
+struct GuestAdmitted {
+    need: u64,
+    calibrating: Option<u64>,
+}
+
+fn guest_ledger() -> &'static GuestLedger {
+    GUEST_LEDGER.get_or_init(|| GuestLedger {
+        state: std::sync::Mutex::new((0, 0, 0)),
+        ended: std::sync::Condvar::new(),
+    })
+}
+
+/// The process's peak RSS (`VmHWM`), bytes.
+fn peak_rss() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|l| l.starts_with("VmHWM:"))?;
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kib << 10)
+}
+
+/// Waits until a guest stage compile fits; refuses by name one that does
+/// not fit even alone.
+fn guest_admit() -> Result<GuestAdmitted, String> {
+    let ledger = guest_ledger();
+    let mut state = ledger
+        .state
+        .lock()
+        .map_err(|_| "the guest compile ledger poisoned")?;
+    loop {
+        let (running, count, learned) = *state;
+        if learned == 0 {
+            if count > 0 {
+                state = ledger
+                    .ended
+                    .wait(state)
+                    .map_err(|_| "the guest compile ledger poisoned")?;
+                continue;
+            }
+            // the first compile runs alone; its peak growth is the need
+            // (the peak reset to the resident set first)
+            let _ = std::fs::write("/proc/self/clear_refs", "5");
+            *state = (running, 1, learned);
+            return Ok(GuestAdmitted {
+                need: 0,
+                calibrating: peak_rss(),
+            });
+        }
+        let room = available_memory().unwrap_or(u64::MAX);
+        if count == 0 && learned > room {
+            return Err(format!(
+                "a guest stage compile takes ~{} MiB of host memory and {} MiB is free under the \
+                 host's and its cgroups' caps: the program is refused, not compiled",
+                learned >> 20,
+                room >> 20
+            ));
+        }
+        if count == 0 || running + learned <= room {
+            *state = (running + learned, count + 1, learned);
+            return Ok(GuestAdmitted {
+                need: learned,
+                calibrating: None,
+            });
+        }
+        state = ledger
+            .ended
+            .wait(state)
+            .map_err(|_| "the guest compile ledger poisoned")?;
+    }
+}
+
+impl Drop for GuestAdmitted {
+    fn drop(&mut self) {
+        let ledger = guest_ledger();
+        if let Ok(mut state) = ledger.state.lock() {
+            let (running, count, learned) = *state;
+            let learned = match (self.calibrating, peak_rss()) {
+                (Some(before), Some(after)) => learned.max(after.saturating_sub(before).max(1)),
+                _ => learned,
+            };
+            *state = (
+                running.saturating_sub(self.need),
+                count.saturating_sub(1),
+                learned,
+            );
+        }
+        ledger.ended.notify_all();
+    }
+}
+
+/// The need the guest ledger has learned, bytes (0: none yet).
+pub fn guest_compile_need() -> u64 {
+    guest_ledger().state.lock().map_or(0, |s| s.2)
 }
 
 /// Stage `at` of `package` lowered for `batch` and compiled.
@@ -222,6 +334,14 @@ fn stage(
         let program = match registering {
             Some(admission) => {
                 let _admitted = admission.admit(&lowered.text);
+                // A compile (not a held or cached program) is admitted on
+                // the process's guest ledger: one learned need a stage,
+                // against the memory the host and its cgroups leave.
+                let _guest = if device.has_without_compile(&lowered.text) {
+                    None
+                } else {
+                    Some(guest_admit()?)
+                };
                 device.prepare(&lowered.text, sig)
             }
             None => device.program(&lowered.text, sig),
@@ -338,6 +458,7 @@ impl Stages {
                         layers: p.3,
                         width: p.2,
                         dtype: p.5,
+                        normal: p.6,
                     })
                     .collect();
                 combos = combos
@@ -521,6 +642,7 @@ pub fn batch_of(
                     layers: plane.layers,
                     width: plane.width,
                     dtype: plane.dtype,
+                    normal: plane.normal,
                 })
             })
             .collect()
@@ -566,6 +688,11 @@ fn encode(value: &Value, dtype: Dtype, n: usize, out: &mut Vec<u32>) -> Result<(
                 }
             }
         }
+        // two to a word, element `2w` in the low half (`eta_ir::types`)
+        Value::Bf16(v) => out.extend(
+            v.chunks(2)
+                .map(|pair| u32::from(pair[0]) | pair.get(1).map_or(0, |&h| u32::from(h) << 16)),
+        ),
     }
     Ok(())
 }
@@ -574,6 +701,11 @@ fn decode(words: &[u32], dtype: Dtype, n: usize) -> Value {
     match dtype {
         Dtype::F32 => Value::F32(words[..n].iter().map(|&w| f32::from_bits(w)).collect()),
         Dtype::I32 => Value::I32(words[..n].iter().map(|&w| w as i32).collect()),
+        Dtype::Bf16 => Value::Bf16(
+            (0..n)
+                .map(|j| (words[j / 2] >> (16 * (j % 2))) as u16)
+                .collect(),
+        ),
         Dtype::Bool => Value::Bool(
             (0..n)
                 .map(|j| (words[j / 32] >> (j % 32)) & 1 != 0)

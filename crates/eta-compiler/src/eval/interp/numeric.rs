@@ -10,6 +10,7 @@ pub(super) fn lanes_f32(v: &Value) -> Vec<f32> {
         Value::I32(x) => x.iter().map(|&a| a as f32).collect(),
         Value::U32(x) => x.iter().map(|&a| a as f32).collect(),
         Value::Bool(x) => x.iter().map(|&b| if b { 1.0 } else { 0.0 }).collect(),
+        Value::Bf16(x) => x.iter().map(|&b| eta_ir::types::bf16_to_f32(b)).collect(),
     }
 }
 
@@ -19,6 +20,10 @@ pub(super) fn lanes_i64(v: &Value) -> Vec<i64> {
         Value::I32(x) => x.iter().map(|&a| a as i64).collect(),
         Value::U32(x) => x.iter().map(|&a| a as i64).collect(),
         Value::Bool(x) => x.iter().map(|&b| b as i64).collect(),
+        Value::Bf16(x) => x
+            .iter()
+            .map(|&b| eta_ir::types::bf16_to_f32(b) as i64)
+            .collect(),
     }
 }
 
@@ -28,6 +33,11 @@ pub(super) fn from_i64(dtype: Dtype, x: Vec<i64>) -> Value {
         Dtype::U32 => Value::U32(x.iter().map(|&a| a as u32).collect()),
         Dtype::F32 => Value::F32(x.iter().map(|&a| a as f32).collect()),
         Dtype::Bool => Value::Bool(x.iter().map(|&a| a != 0).collect()),
+        Dtype::Bf16 => Value::Bf16(
+            x.iter()
+                .map(|&a| eta_ir::types::bf16_bits(a as f32))
+                .collect(),
+        ),
         _ => super::no_interpreter_lane(dtype),
     }
 }

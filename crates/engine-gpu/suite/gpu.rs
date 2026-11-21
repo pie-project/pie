@@ -54,24 +54,76 @@ pub fn device_boot() -> DeviceBoot {
 /// device has left when it loads (which a load beside it then takes).
 pub const SHARES: u64 = 4;
 
-/// The tests holding a share now, and the signal one gave its share back.
-static HOLDERS: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+/// The tests holding a share now, whether one of them holds the device
+/// alone ([`alone`]), and the signal one gave its share back.
+struct Holders {
+    count: u64,
+    alone: bool,
+}
+
+static HOLDERS: std::sync::Mutex<Holders> = std::sync::Mutex::new(Holders {
+    count: 0,
+    alone: false,
+});
 static FREED: std::sync::Condvar = std::sync::Condvar::new();
 
-/// A test's share, held by its thread until the test ends.
-struct Held;
+/// A test's share, held by its thread until the test ends; `alone` where
+/// the test holds the whole device.
+struct Held {
+    alone: bool,
+}
 
 impl Drop for Held {
     fn drop(&mut self) {
-        *HOLDERS
+        let mut holders = HOLDERS
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) -= 1;
-        FREED.notify_one();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        holders.count -= 1;
+        holders.alone &= !self.alone;
+        // Waiters wait on different conditions (a free share, an empty
+        // device): each looks again.
+        FREED.notify_all();
     }
 }
 
 thread_local! {
     static HELD: std::cell::RefCell<Option<Held>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Takes the calling test's share, once `free` says the holders leave room
+/// for it, unless it holds one already.
+fn take(alone: bool, free: impl Fn(&Holders) -> bool) {
+    HELD.with(|held| {
+        let mut held = held.borrow_mut();
+        if let Some(held) = held.as_ref() {
+            assert!(
+                held.alone || !alone,
+                "a test takes the device alone before any load takes its share"
+            );
+            return;
+        }
+        let mut holders = HOLDERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !free(&holders) {
+            holders = FREED
+                .wait(holders)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        holders.count += 1;
+        holders.alone = alone;
+        *held = Some(Held { alone });
+    });
+}
+
+/// The calling test holds the device alone until it ends: it waits until no
+/// other test holds a share, and no test takes one meanwhile. For a test
+/// that times the device's answers against its own host work (a lane's
+/// fires against a compile on another thread), which a model test beside it
+/// would stretch by its own fires and loads. The test's loads still take
+/// its share ([`share`]); call this before them.
+pub fn alone() {
+    take(true, |holders| holders.count == 0);
 }
 
 /// The bytes of one share: a [`SHARES`]th of what the device states it has
@@ -93,25 +145,11 @@ fn share_bytes() -> Option<u64> {
 
 /// The device allowance of a load of the calling test: its share of the
 /// device. The test takes its share (waiting while `SHARES - 1` other tests
-/// hold theirs) where it holds none yet, and holds it until it ends; every
+/// hold theirs, or one holds the device [`alone`]) where it holds none yet, and holds it until it ends; every
 /// load it makes then takes the same share. Take it before
 /// `model_logits::loading`, which a test holding a share waits on.
 pub fn share() -> engine::Allowance {
-    HELD.with(|held| {
-        let mut held = held.borrow_mut();
-        if held.is_none() {
-            let mut holders = HOLDERS
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            while *holders >= SHARES - 1 {
-                holders = FREED
-                    .wait(holders)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-            }
-            *holders += 1;
-            *held = Some(Held);
-        }
-    });
+    take(false, |holders| !holders.alone && holders.count < SHARES - 1);
     engine::Allowance {
         budget: share_bytes(),
     }
@@ -228,6 +266,21 @@ impl Gpu {
         frame.commit().expect("the frame lands");
     }
 
+    /// `f` in a frame of its own, timed: the device's time across its work
+    /// where it writes timestamps (a spanned frame), else the host's clock
+    /// around the submit and the wait (never shorter), ns.
+    pub fn timed(&self, f: impl FnOnce(&Sink<'_>) -> Result<(), kernels_slang::Error>) -> f64 {
+        let started = std::time::Instant::now();
+        let frame = self.device.spanned().expect("a frame");
+        {
+            let sink = Sink::new(&self.device, &frame, &self.pipelines, &self.handles);
+            f(&sink).expect("the kernel fires");
+        }
+        let span = frame.commit_spanned().expect("the frame lands");
+        let host = started.elapsed().as_nanos() as f64;
+        span.map_or(host, |ns| ns as f64)
+    }
+
     pub fn down(&self, handle: u32, n: usize) -> Vec<f32> {
         let bytes = self
             .handles
@@ -256,6 +309,90 @@ impl Gpu {
 
 /// The tiers a kernel with a subgroup form is checked at: its subgroup form
 /// is SPIR-V's.
+/// A window's query CSR at int `at` of a table whose other ints are zero
+/// (a scan blind to `at` reads empty requests there): `at` 0 is the CSR
+/// alone, a later one a window's cut of the fire's packed table.
+pub fn csr_at(gpu: &mut Gpu, indptr: &[i32], at: usize) -> kernels_slang::ssm::Csr {
+    let mut table = vec![0i32; at];
+    table.extend_from_slice(indptr);
+    table.extend_from_slice(&[0; 3]);
+    let buf = gpu.up_i32(&table);
+    kernels_slang::ssm::Csr {
+        table: kernels_slang::Tensor::new(buf, table.len() as u32, 1, poem_ir::Dtype::I32),
+        at: at as u32,
+        lanes: indptr.len() as u32 - 1,
+    }
+}
+
+/// The ints a scan's CSR is placed at in the suite: alone, and as a
+/// window's cut of a packed table.
+pub const CSR_AT: [usize; 2] = [0, 5];
+
+/// A fire's `rows` walked whole, and cut in two windows over the same
+/// planes (the second from a third of the rows on), as a fire whose lanes
+/// lie in two runs of a region takes them.
+#[must_use]
+pub fn row_cuts(rows: u32) -> Vec<Vec<kernels_slang::ssm::RowSpan>> {
+    let whole = kernels_slang::ssm::RowSpan { row0: 0, rows };
+    let cut = (rows / 3).max(1);
+    let mut cuts = vec![vec![whole]];
+    if rows > 1 {
+        cuts.push(vec![
+            kernels_slang::ssm::RowSpan { row0: 0, rows: cut },
+            kernels_slang::ssm::RowSpan {
+                row0: cut,
+                rows: rows - cut,
+            },
+        ]);
+    }
+    cuts
+}
+
+/// A committed scan's dispatches over `lanes` lanes of a work plane holding
+/// `batch` (the engine's `committed_batches`): each one's first lane, its
+/// lanes, and the extended row its first lane starts at, past the rows the
+/// lanes before it replay (`replay[lane0 + lane]`).
+#[must_use]
+pub fn committed_batches(
+    lanes: u32,
+    batch: u32,
+    replay: &[i32],
+    lane0: u32,
+) -> Vec<(u32, u32, u32)> {
+    let mut out = Vec::new();
+    let (mut first, mut row0) = (0u32, 0u32);
+    while first < lanes {
+        let n = batch.min(lanes - first);
+        out.push((first, n, row0));
+        for lane in first..first + n {
+            row0 += replay[(lane0 + lane) as usize].max(0) as u32;
+        }
+        first += n;
+    }
+    out
+}
+
+/// A fire's requests (`indptr`) walked whole, and cut in two windows at a
+/// lane: each window's first row and its own CSR, rebased to it, as a
+/// window states them.
+#[must_use]
+pub fn lane_cuts(indptr: &[i32]) -> Vec<Vec<(u32, Vec<i32>)>> {
+    let lanes = indptr.len() - 1;
+    let mut cuts = vec![vec![(0, indptr.to_vec())]];
+    if lanes > 1 {
+        let at = lanes / 2;
+        let first = indptr[at];
+        cuts.push(vec![
+            (0, indptr[..=at].to_vec()),
+            (
+                first as u32,
+                indptr[at..].iter().map(|&b| b - first).collect(),
+            ),
+        ]);
+    }
+    cuts
+}
+
 pub fn tiers() -> &'static [kernels_slang::Tier] {
     if crate::backend::SPIRV {
         &[kernels_slang::Tier::Baseline, kernels_slang::Tier::Subgroup]

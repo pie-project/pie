@@ -949,7 +949,15 @@ impl Lane {
             );
             // A refusal of lanes names lanes of the first step that did not
             // fire: the frame fired the steps before it (`Engine::submit`).
-            let (ticket, refused) = match engine.submit(&submitted) {
+            let submit_start = crate::rt::Instant::now();
+            let submit_result = engine.submit(&submitted);
+            tracing::debug!(
+                target: "pie::launch",
+                steps = submitted.steps.len(),
+                submit_us = submit_start.elapsed().as_micros() as u64,
+                "engine submit"
+            );
+            let (ticket, refused) = match submit_result {
                 Ok(mut ticket) => {
                     let refused = std::mem::take(&mut ticket.refused);
                     (Some(ticket), refused)

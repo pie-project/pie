@@ -55,6 +55,8 @@ pub struct Read {
     pub layers: u32,
     pub width: u32,
     pub dtype: Dtype,
+    /// The plane holds no denormal (`readout::Plane::normal`).
+    pub normal: bool,
 }
 
 /// The shape of one lowering: how many lanes, and the outputs the device
@@ -233,6 +235,9 @@ pub struct Lowered {
 pub fn words(dtype: Dtype, numel: usize) -> usize {
     if dtype == Dtype::Bool {
         numel.div_ceil(32)
+    } else if dtype == Dtype::Bf16 {
+        // two to a word, element `2w` in the low half (`eta_ir::types`)
+        numel.div_ceil(2)
     } else {
         numel
     }
@@ -240,7 +245,10 @@ pub fn words(dtype: Dtype, numel: usize) -> usize {
 
 fn elem(dtype: Dtype) -> Lowering<Elem> {
     Ok(match dtype {
-        Dtype::F32 => Elem::F32,
+        // A bf16 value is held as the f32 it stands for, rounded to bf16 on
+        // its store (`Lower::set`): every op loads it exactly and computes
+        // in f32 (`eta_ir::types`' bf16 rules).
+        Dtype::F32 | Dtype::Bf16 => Elem::F32,
         Dtype::I32 => Elem::I32,
         Dtype::U32 => Elem::U32,
         Dtype::Bool => Elem::Pred,
@@ -459,6 +467,8 @@ pub fn lower(
         b: i64::from(batch.lanes.max(1)),
         env: HashMap::new(),
         splats: HashSet::new(),
+        denormal: HashSet::new(),
+        making_denormal: true,
     };
     let pack = (layout.in_words > 0).then(|| {
         l.f.param(Ty::new(Elem::U32, &[l.b, layout.in_words as i64]), None)
@@ -512,6 +522,7 @@ pub fn lower(
         let v = l.unpack(cells, 0, dtype, n)?;
         let v = l.reshaped(v, &package.values[slot.value as usize].shape)?;
         l.env.insert(slot.value, v);
+        l.denormal.insert(slot.value);
     }
 
     // Roots.
@@ -542,7 +553,21 @@ pub fn lower(
                 }
             }
         };
+        // A loaded value may hold a denormal (`Lower::denormal`), but for a
+        // row of a plane the engine states free of them, or a constant
+        // that is not one.
+        let normal = if value.source == ValueOrigin::Const {
+            let x = f32::from_bits(value.literal_bits);
+            value.dtype != Dtype::F32 || x == 0.0 || x.is_normal() || !x.is_finite()
+        } else {
+            layout.inputs.iter().find(|s| s.value == id).is_some_and(
+                |s| matches!(s.feed, Feed::Row { read, .. } if layout.reads[read].normal),
+            )
+        };
         l.env.insert(id, v);
+        if !normal {
+            l.denormal.insert(id);
+        }
     }
 
     for op in &stage.ops {
@@ -604,6 +629,13 @@ struct Lower<'p> {
     /// one. A division by one keeps XLA's divide, which it turns into a
     /// multiply and shifts.
     splats: HashSet<u32>,
+    /// Values that may hold an f32 denormal on the device: loaded ones,
+    /// transcendental results, and what moves them unchanged. v6e's float
+    /// arithmetic flushes denormal operands and results to zero, so a sum,
+    /// product, quotient or matmul never holds one (`round_bf16`).
+    denormal: HashSet<u32>,
+    /// Whether the op being lowered may make a denormal (`Lower::op`).
+    making_denormal: bool,
 }
 
 impl Lower<'_> {
@@ -611,7 +643,16 @@ impl Lower<'_> {
         self.package.values[id as usize].shape.clone()
     }
 
+    /// The dtype value `id` computes as: a bf16 value is an f32 to every op
+    /// (it loads exactly); [`Self::stored`] is its declared dtype.
     fn dtype(&self, id: u32) -> Dtype {
+        match self.stored(id) {
+            Dtype::Bf16 => Dtype::F32,
+            d => d,
+        }
+    }
+
+    fn stored(&self, id: u32) -> Dtype {
         self.package.values[id as usize].dtype
     }
 
@@ -642,8 +683,71 @@ impl Lower<'_> {
                 self.f.elem(v)
             ));
         }
+        // A bf16 value's store rounds its f32 to bf16, nearest-even, a NaN
+        // quiet, and holds the f32 that bf16 stands for.
+        let v = if self.stored(id) != Dtype::Bf16 {
+            v
+        } else if self.making_denormal {
+            self.round_bf16(v)?
+        } else {
+            self.round_bf16_normal(v)?
+        };
+        if self.making_denormal {
+            self.denormal.insert(id);
+        }
         self.env.insert(id, v);
         Ok(())
+    }
+
+    /// `v` (f32) rounded to bf16, nearest-even, as the f32 it stands for
+    /// (`eta_ir::types::bf16_bits`), in integer ops on its bits: XLA, free to
+    /// keep excess precision, drops an f32 -> bf16 -> f32 convert pair (v6e:
+    /// half of a row came back unrounded).
+    fn round_bf16(&mut self, v: Val) -> Lowering<Val> {
+        let bits = self.f.bitcast(v, Elem::U32)?;
+        let dims = self.f.dims(bits).to_vec();
+        let k = |f: &mut Func, x: i64| f.const_i(Elem::U32, x, &dims);
+        let sixteen = k(&mut self.f, 16);
+        let one = k(&mut self.f, 1);
+        let lsb = self.f.shr(bits, sixteen)?;
+        let lsb = self.f.and(lsb, one)?;
+        let half = k(&mut self.f, 0x7FFF);
+        let bias = self.f.add(half, lsb)?;
+        let up = self.f.add(bits, bias)?;
+        let top = k(&mut self.f, 0xFFFF_0000);
+        let rounded = self.f.and(up, top)?;
+        // a NaN stays a NaN, quiet: its sign and exponent, the quiet bit set
+        let quiet = k(&mut self.f, 0x0040_0000);
+        let nan = self.f.or(bits, quiet)?;
+        let nan = self.f.and(nan, top)?;
+        let is_nan = self.f.compare(Cmp::Ne, v, v)?;
+        let out = self.f.select(is_nan, nan, rounded)?;
+        Ok(self.f.bitcast(out, Elem::F32)?)
+    }
+
+    /// [`Self::round_bf16`] of a value that holds no denormal (a sum,
+    /// product, quotient or matmul: v6e flushes them): `reduce_precision`
+    /// rounds a normal or zero f32 to bf16 nearest-even as `bf16_bits` does
+    /// (it flushes a denormal, which such a value never is), a NaN made
+    /// quiet as `bf16_bits` makes it. One op where the bit form takes ten
+    /// (v6e qwen3-0.6b sampled c64: the bit form's rounding ~1.5%).
+    fn round_bf16_normal(&mut self, v: Val) -> Lowering<Val> {
+        let ty = self.f.ty(v).clone();
+        let rounded = self.f.op_named(
+            "stablehlo.reduce_precision",
+            &[v],
+            "exponent_bits = 8 : i32, mantissa_bits = 7 : i32",
+            vec![ty],
+        )[0];
+        let bits = self.f.bitcast(v, Elem::U32)?;
+        let dims = self.f.dims(bits).to_vec();
+        let quiet = self.f.const_i(Elem::U32, 0x0040_0000, &dims);
+        let top = self.f.const_i(Elem::U32, 0xFFFF_0000, &dims);
+        let nan = self.f.or(bits, quiet)?;
+        let nan = self.f.and(nan, top)?;
+        let nan = self.f.bitcast(nan, Elem::F32)?;
+        let is_nan = self.f.compare(Cmp::Ne, v, v)?;
+        Ok(self.f.select(is_nan, nan, rounded)?)
     }
 
     /// `v` (one lane's value is `[B, ..]` of any shape with the same count)
@@ -729,6 +833,22 @@ impl Lower<'_> {
             Dtype::U32 => cut,
             Dtype::F32 => self.f.bitcast(cut, Elem::F32)?,
             Dtype::I32 => self.f.bitcast(cut, Elem::I32)?,
+            Dtype::Bf16 => {
+                // element `2w` the low half of word `w`, `2w + 1` the high;
+                // each half shifted up 16 is the f32 it stands for
+                let dims = [b, w as i64, 2];
+                let spread = self.f.broadcast(cut, &dims, &[0, 1])?;
+                let half = self.f.iota(Elem::U32, &dims, 2);
+                let sixteen = self.f.const_i(Elem::U32, 16, &dims);
+                let by = self.f.mul(half, sixteen)?;
+                let moved = self.f.shr(spread, by)?;
+                let low = self.f.const_i(Elem::U32, 0xFFFF, &dims);
+                let bits = self.f.and(moved, low)?;
+                let up = self.f.shl(bits, sixteen)?;
+                let flat = self.f.reshape(up, &[b, (w * 2) as i64])?;
+                let flat = self.f.slice(flat, &[0, 0], &[b, n as i64], &[1, 1])?;
+                self.f.bitcast(flat, Elem::F32)?
+            }
             Dtype::Bool => {
                 let dims = [b, w as i64, 32];
                 let spread = self.f.broadcast(cut, &dims, &[0, 1])?;
@@ -752,6 +872,24 @@ impl Lower<'_> {
         Ok(match dtype {
             Dtype::U32 => flat,
             Dtype::F32 | Dtype::I32 => self.f.bitcast(flat, Elem::U32)?,
+            Dtype::Bf16 => {
+                // the held f32 is bf16-exact: its upper 16 bits, two a word
+                let w = n.div_ceil(2);
+                let bits = self.f.bitcast(flat, Elem::U32)?;
+                let sixteen = self.f.const_i(Elem::U32, 16, &[b, n as i64]);
+                let top = self.f.shr(bits, sixteen)?;
+                let zero = self.f.const_i(Elem::U32, 0, &[]);
+                let padded = self
+                    .f
+                    .pad(top, zero, &[0, 0], &[0, (w * 2 - n) as i64], &[0, 0])?;
+                let dims = [b, w as i64, 2];
+                let pairs = self.f.reshape(padded, &dims)?;
+                let half = self.f.iota(Elem::U32, &dims, 2);
+                let s16 = self.f.const_i(Elem::U32, 16, &dims);
+                let by = self.f.mul(half, s16)?;
+                let placed = self.f.shl(pairs, by)?;
+                self.f.reduce(placed, &[2], Fold::Sum)?
+            }
             Dtype::Bool => {
                 let w = n.div_ceil(32);
                 let bits = self.f.convert(flat, Elem::U32);
@@ -918,21 +1056,6 @@ impl Lower<'_> {
         Ok(y)
     }
 
-    /// Exclusive prefix sum along the last axis.
-    fn scan_exclusive(&mut self, x: Val) -> Lowering<Val> {
-        let dims = self.f.dims(x).to_vec();
-        let r = dims.len();
-        let n = dims[r - 1];
-        let mut hi = dims.clone();
-        hi[r - 1] = n - 1;
-        let kept = self.f.slice(x, &vec![0; r], &hi, &vec![1; r])?;
-        let zero = self.f.const_f(Elem::F32, 0.0, &[]);
-        let mut lo = vec![0; r];
-        lo[r - 1] = 1;
-        let shifted = self.f.pad(kept, zero, &lo, &vec![0; r], &vec![0; r])?;
-        self.scan(shifted, Fold::Sum)
-    }
-
     /// `x` (f32) sorted descending along the last axis in the interpreter's
     /// order (`sort_desc_order`): NaN last, -0 equal to +0, ties by the lower
     /// index. Returns the sorted values and their source indices (i32).
@@ -946,6 +1069,129 @@ impl Lower<'_> {
             f.compare(Cmp::Gt, a[0], b[0])
         })?;
         Ok((sorted[2], sorted[1]))
+    }
+
+    /// The first `k` of `x` (`[B, R, n]` f32) in [`Self::sort_desc`]'s order
+    /// and their source indices (i32), as `[B, R, k]`, by selection, not a
+    /// sort: each row splits into chunks enough to fill an f32 tile's
+    /// sublanes, each chunk gives its first `k` ([`Self::select_first`]),
+    /// and the chunks' candidates give the row's. XLA lowers `chlo.top_k`
+    /// to a sort (v6e, the beam inferlet's guest stage: its top-1 of 151936
+    /// log-probs a whole-row sort, 793 us a step, its top-4 of 4 x 151936 a
+    /// sort of 128 chunks, 154 us).
+    fn top_desc(&mut self, x: Val, k: i64) -> Lowering<(Val, Val)> {
+        let dims = self.f.dims(x).to_vec();
+        let flat = flat_rows(&dims);
+        let (rows, n) = (flat[0], flat[1]);
+        let key = self.order_key(x)?;
+        let key = self.f.reshape(key, &flat)?;
+        // chunks of whole lane tiles, enough that the rows fill the sublanes,
+        // each holding more than its `k` candidates
+        let chunks = (F32_SUBLANES / rows).min(n / k.max(LANE_TILE)).max(1);
+        let index = self.f.iota(Elem::I32, &flat, 1);
+        let (key, index) = if chunks > 1 {
+            let width = ((n + chunks - 1) / chunks + LANE_TILE - 1) / LANE_TILE * LANE_TILE;
+            let pad = width * chunks - n;
+            let lowest = self.f.const_i(Elem::I32, i64::from(i32::MIN), &[]);
+            let far = self.f.const_i(Elem::I32, i64::from(i32::MAX), &[]);
+            let key = self.f.pad(key, lowest, &[0, 0], &[0, pad], &[0, 0])?;
+            let index = self.f.pad(index, far, &[0, 0], &[0, pad], &[0, 0])?;
+            let key = self.f.reshape(key, &[rows * chunks, width])?;
+            let index = self.f.reshape(index, &[rows * chunks, width])?;
+            let (key, index) = self.select_first(key, index, k, Some(n))?;
+            (
+                self.f.reshape(key, &[rows, chunks * k])?,
+                self.f.reshape(index, &[rows, chunks * k])?,
+            )
+        } else {
+            (key, index)
+        };
+        let (_, index) = self.select_first(key, index, k, None)?;
+        // `x[r, index[r, j]]`, through the flat row-major plane
+        let plane = self.f.reshape(x, &[rows * n])?;
+        let base = self.f.iota(Elem::I32, &[rows, k], 0);
+        let stride = self.f.const_i(Elem::I32, n, &[rows, k]);
+        let base = self.f.mul(base, stride)?;
+        let at = self.f.add(base, index)?;
+        let at = self.f.reshape(at, &[rows, k, 1])?;
+        let values = self.f.gather(
+            plane,
+            at,
+            &kernels_xla::hlo::GatherDims {
+                offset_dims: vec![],
+                collapsed_slice_dims: vec![0],
+                start_index_map: vec![0],
+                index_vector_dim: 2,
+                ..kernels_xla::hlo::GatherDims::default()
+            },
+            &[1],
+        )?;
+        let mut out = dims;
+        *out.last_mut().expect("a last axis") = k;
+        Ok((self.f.reshape(values, &out)?, self.f.reshape(index, &out)?))
+    }
+
+    /// The first `k` of each row of the order keys `key` (`[M, m]` i32,
+    /// beside their source indices `index`), in order: `k` rounds, each one
+    /// reduce taking the row's first still-held lane (the greater key, the
+    /// lower index on equal keys) and letting it go. A lane indexed at
+    /// `past` or beyond (a chunk's padding) is held by none. Exact: what a
+    /// stable descending sort's first `k` are.
+    fn select_first(
+        &mut self,
+        key: Val,
+        index: Val,
+        k: i64,
+        past: Option<i64>,
+    ) -> Lowering<(Val, Val)> {
+        let dims = self.f.dims(key).to_vec();
+        let mut held = match past {
+            Some(n) => {
+                let bound = self.f.const_i(Elem::I32, n, &dims);
+                let within = self.f.compare(Cmp::Lt, index, bound)?;
+                self.f.convert(within, Elem::I32)
+            }
+            None => self.f.const_i(Elem::I32, 1, &dims),
+        };
+        let none = self.f.const_i(Elem::I32, 0, &[]);
+        let lowest = self.f.const_i(Elem::I32, i64::from(i32::MIN), &[]);
+        let far = self.f.const_i(Elem::I32, i64::from(i32::MAX), &[]);
+        let (mut keys, mut picks) = (Vec::new(), Vec::new());
+        for round in 0..k {
+            let out = self.f.reduce_with(
+                &[held, key, index],
+                &[none, lowest, far],
+                &[1],
+                |f, a, b| {
+                    let more_held = f.compare(Cmp::Gt, a[0], b[0])?;
+                    let both = f.compare(Cmp::Eq, a[0], b[0])?;
+                    let gt = f.compare(Cmp::Gt, a[1], b[1])?;
+                    let eq = f.compare(Cmp::Eq, a[1], b[1])?;
+                    let lt = f.compare(Cmp::Lt, a[2], b[2])?;
+                    let tie = f.and(eq, lt)?;
+                    let first = f.or(gt, tie)?;
+                    let first = f.and(both, first)?;
+                    let take = f.or(more_held, first)?;
+                    Ok(vec![
+                        f.select(take, a[0], b[0])?,
+                        f.select(take, a[1], b[1])?,
+                        f.select(take, a[2], b[2])?,
+                    ])
+                },
+            )?;
+            let (got_key, got) = (out[1], out[2]);
+            keys.push(self.f.reshape(got_key, &[dims[0], 1])?);
+            picks.push(self.f.reshape(got, &[dims[0], 1])?);
+            if round + 1 < k {
+                let at = self.f.broadcast(got, &dims, &[0])?;
+                let taken = self.f.compare(Cmp::Eq, index, at)?;
+                let zero = self.f.const_i(Elem::I32, 0, &dims);
+                held = self.f.select(taken, zero, held)?;
+            }
+        }
+        let keys = self.f.concat(&keys, 1)?;
+        let picks = self.f.concat(&picks, 1)?;
+        Ok((keys, picks))
     }
 
     /// The order keys of `x` sorted descending (stably) along the last
@@ -964,16 +1210,6 @@ impl Lower<'_> {
             f.compare(Cmp::Gt, a[0], b[0])
         })?;
         Ok((sorted[0], Some(sorted[1])))
-    }
-
-    /// The value an order key stands for (-0 read as +0, NaN as a NaN).
-    fn key_value(&mut self, key: Val) -> Lowering<Val> {
-        let flip = self.f.like_i(key, 0x7FFF_FFFF);
-        let flipped = self.f.xor(key, flip)?;
-        let zero = self.f.like_i(key, 0);
-        let negative = self.f.compare(Cmp::Lt, key, zero)?;
-        let bits = self.f.select(negative, flipped, key)?;
-        Ok(self.f.bitcast(bits, Elem::F32)?)
     }
 
     /// Per row of the sorted `[B, R, n]` `plane`, the element at position
@@ -1104,6 +1340,32 @@ impl Lower<'_> {
         Ok(self.f.select(under, raw, cap)?)
     }
 
+    /// The keyed stream's seed from operand `i`, an rng state of u32 words
+    /// (key, then counter): `rng_keyed`'s.
+    fn keyed_seed(&mut self, op: &LaunchOp, i: usize) -> Lowering<Val> {
+        let (is, state) = self.raw_arg(op, i)?;
+        if self.dtype(is) != Dtype::U32 || numel(&self.shape(is)) < 1 {
+            return refuse("an rng state that is not u32 words");
+        }
+        let per = numel(&self.shape(is)) as i64;
+        let b = self.b;
+        let words = self.f.reshape(state, &[b, per])?;
+        let key = self.f.slice(words, &[0, 0], &[b, 1], &[1, 1])?;
+        let key = self.f.reshape(key, &[b])?;
+        let key = self.f.convert(key, Elem::U64);
+        let ctr = if per > 1 {
+            let c = self.f.slice(words, &[0, 1], &[b, 2], &[1, 1])?;
+            let c = self.f.reshape(c, &[b])?;
+            self.f.convert(c, Elem::U64)
+        } else {
+            self.u64s(0, &[b])
+        };
+        let shift = self.u64s(u64::from(rng::RNG_FORMULA.keyed_word_bits), &[b]);
+        let hi = self.f.shl(key, shift)?;
+        let joined = self.f.or(hi, ctr)?;
+        self.splitmix(joined)
+    }
+
     /// `rng_lanes(seed[b], n, kind)` as `[B, n]` f32.
     fn draw(&mut self, seed: Val, n: i64, kind: RngKind) -> Lowering<Val> {
         let b = self.b;
@@ -1163,6 +1425,42 @@ impl Lower<'_> {
             return refuse(format!("result {result} is past the package's values"));
         }
         let shape = self.shape(result);
+        // Whether this op's results may hold a denormal: never a computed
+        // one (the device flushes them), what moves a value unchanged where
+        // an operand may, and everything else (a transcendental, a load).
+        self.making_denormal = match op.tag {
+            tags::ADD
+            | tags::SUB
+            | tags::MUL
+            | tags::DIV
+            | tags::REM
+            | tags::MATMUL
+            | tags::REDUCE_SUM
+            | tags::CUMSUM
+            | tags::CUMPROD => false,
+            tags::ABS
+            | tags::NEG
+            | tags::SELECT
+            | tags::MAX_ELEM
+            | tags::MIN_ELEM
+            | tags::RESHAPE
+            | tags::BROADCAST
+            | tags::TRANSPOSE
+            | tags::GATHER
+            | tags::GATHER_ROW
+            | tags::SORT_DESC
+            | tags::TOP_K
+            | tags::REDUCE_MAX
+            | tags::REDUCE_MIN
+            | tags::SCATTER_SET
+            | tags::SCATTER_ADD
+            | tags::CAST
+            | tags::MASK_APPLY_PACKED
+            | tags::CAUSAL_MASK
+            | tags::SLIDING_WINDOW_MASK
+            | tags::SINK_WINDOW_MASK => op.args.iter().any(|a| self.denormal.contains(a)),
+            _ => true,
+        };
         let dt =
             |l: &Self, i: usize| -> Dtype { op.args.get(i).map_or(Dtype::F32, |&a| l.dtype(a)) };
         match op.tag {
@@ -1443,14 +1741,11 @@ impl Lower<'_> {
                 if k < 1 || k > n {
                     return refuse(format!("top-{k} of {n}"));
                 }
-                let (values, index) = self.sort_desc(grid)?;
-                let d = self.f.dims(values).to_vec();
-                let values = self
-                    .f
-                    .slice(values, &[0, 0, 0], &[d[0], d[1], k], &[1, 1, 1])?;
-                let index = self
-                    .f
-                    .slice(index, &[0, 0, 0], &[d[0], d[1], k], &[1, 1, 1])?;
+                let (values, index) = if k < n {
+                    self.top_desc(grid, k)?
+                } else {
+                    self.sort_desc(grid)?
+                };
                 let index = self.f.bitcast(index, Elem::U32)?;
                 let values = self.reshaped(values, &shape)?;
                 let second = self.shape(result + 1);
@@ -1610,29 +1905,36 @@ impl Lower<'_> {
                     let s = rng::seed_eff_stream(0, op.imm);
                     self.u64s(s, &[self.b])
                 } else {
-                    let (is, state) = self.raw_arg(op, 0)?;
-                    if self.dtype(is) != Dtype::U32 || numel(&self.shape(is)) < 1 {
-                        return refuse("an rng state that is not u32 words");
-                    }
-                    let per = numel(&self.shape(is)) as i64;
-                    let b = self.b;
-                    let words = self.f.reshape(state, &[b, per])?;
-                    let key = self.f.slice(words, &[0, 0], &[b, 1], &[1, 1])?;
-                    let key = self.f.reshape(key, &[b])?;
-                    let key = self.f.convert(key, Elem::U64);
-                    let ctr = if per > 1 {
-                        let c = self.f.slice(words, &[0, 1], &[b, 2], &[1, 1])?;
-                        let c = self.f.reshape(c, &[b])?;
-                        self.f.convert(c, Elem::U64)
-                    } else {
-                        self.u64s(0, &[b])
-                    };
-                    let shift = self.u64s(u64::from(rng::RNG_FORMULA.keyed_word_bits), &[b]);
-                    let hi = self.f.shl(key, shift)?;
-                    let joined = self.f.or(hi, ctr)?;
-                    self.splitmix(joined)?
+                    self.keyed_seed(op, 0)?
                 };
                 let y = self.draw(seed, n, op.rng_kind)?;
+                let y = self.reshaped(y, &shape)?;
+                self.set(result, y)
+            }
+            tags::GUMBEL_ARGMAX => {
+                // Each lane `logits[i] * scale + gumbel(state, i)`, `-inf`
+                // where `keep` is false, in f32 from its operands as loaded
+                // and never stored (a bf16 store would collapse near ties),
+                // then `reduce_argmax`: the unfused draw's operations in its
+                // order, `rng_keyed`'s noise over the logits' shape. `scale`
+                // is the host's rounded reciprocal of the temperature.
+                let (il, x) = self.raw_arg(op, 0)?;
+                if self.dtype(il) != Dtype::F32 {
+                    return refuse("a gumbel draw over non-float logits");
+                }
+                let row = self.shape(il);
+                let n = numel(&row) as i64;
+                let keep = self.arg(op, 1, &row)?;
+                let scale = self.arg(op, 2, &row)?;
+                let scaled = self.f.mul(x, scale)?;
+                let floor = self.splat_f(scaled, f32::NEG_INFINITY);
+                let masked = self.f.select(keep, scaled, floor)?;
+                let seed = self.keyed_seed(op, 3)?;
+                let noise = self.draw(seed, n, RngKind::Gumbel)?;
+                let noise = self.reshaped(noise, &row)?;
+                let perturbed = self.f.add(masked, noise)?;
+                let (rows, _, _) = self.rows_of(perturbed)?;
+                let y = self.argmax_f32(rows)?;
                 let y = self.reshaped(y, &shape)?;
                 self.set(result, y)
             }
@@ -1641,6 +1943,10 @@ impl Lower<'_> {
     }
 
     fn cast(&mut self, x: Val, from: Dtype, to: Dtype) -> Lowering<Val> {
+        // bf16 widens exactly (it is held as its f32); a cast to bf16 is the
+        // f32's, rounded by the result's store
+        let f32_of = |d: Dtype| if d == Dtype::Bf16 { Dtype::F32 } else { d };
+        let (from, to) = (f32_of(from), f32_of(to));
         if from == to {
             return Ok(x);
         }
@@ -1829,58 +2135,49 @@ impl Lower<'_> {
                 self.f.and(keep, some)?
             }
             1 => {
-                // cummass_le(p): in descending order, a lane is kept while
-                // the mass before it is below p.
+                // cummass_le(p): in descending order (order keys, ties by the
+                // lower index), a lane is kept while the mass before it is
+                // below p.
                 if pd != Dtype::F32 {
                     return refuse("cummass_le over a non-float p");
                 }
                 let key = self.order_key(x)?;
-                let (sorted, index) = self.sort_keys(key, true)?;
-                let index = index.expect("indexed");
-                let values = self.key_value(sorted)?;
-                let before = self.scan_exclusive(values)?;
                 let p = self.f.broadcast(per_row, &grid, &[0, 1])?;
-                let kept = self.f.compare(Cmp::Lt, before, p)?;
-                let kept = self.f.convert(kept, Elem::I32);
-                // With no negative lane the mass before a lane only grows
-                // along the order, so the kept lanes are the first `L`: a
-                // lane is kept when it orders at or before the `L`-th. With
-                // a negative lane anywhere, sort the verdicts back by index.
                 let zero_f = self.f.const_f(Elem::F32, 0.0, &grid);
                 let negative = self.f.compare(Cmp::Lt, x, zero_f)?;
                 let all: Vec<i64> = vec![0, 1, 2];
                 let any = self.f.reduce(negative, &all, Fold::Or)?;
                 let branch = self.f.convert(any, Elem::I32);
                 let out_ty = Ty::new(Elem::I32, &grid);
-                let kept_rows = self.f.reduce(kept, &[2], Fold::Sum)?;
-                let one = self.f.const_i(Elem::I32, 1, &[b, rows]);
-                let last = self.f.sub(kept_rows, one)?;
-                let pivot_key = self.at_position(sorted, last, i64::from(i32::MIN))?;
-                let pivot_at = self.at_position(index, last, -1)?;
-                let prefix = Box::new(|f: &mut Func| -> kernels_xla::hlo::Built<Vec<Val>> {
-                    let pk = f.broadcast(pivot_key, &grid, &[0, 1])?;
-                    let pi = f.broadcast(pivot_at, &grid, &[0, 1])?;
-                    let col = f.iota(Elem::I32, &grid, 2);
-                    let above = f.compare(Cmp::Gt, key, pk)?;
-                    let level = f.compare(Cmp::Eq, key, pk)?;
-                    let early = f.compare(Cmp::Le, col, pi)?;
-                    let tie = f.and(level, early)?;
-                    let keep = f.or(above, tie)?;
-                    let zero = f.like_i(kept_rows, 0);
-                    let some = f.compare(Cmp::Gt, kept_rows, zero)?;
-                    let some = f.broadcast(some, &grid, &[0, 1])?;
-                    let keep = f.and(keep, some)?;
+                // With no negative lane the mass before a lane only grows
+                // along the order, so the kept lanes are a prefix of it: the
+                // levels (keys) above a pivot level whole, and the pivot
+                // level's lanes up to a pivot index. Both are found by
+                // bisection, a masked reduce a round, without a sort
+                // (v6e census, sampled c64: the sort was most of the step).
+                let cut = Box::new(move |f: &mut Func| -> kernels_xla::hlo::Built<Vec<Val>> {
+                    let keep = nucleus_prefix(f, x, key, p, per_row, &grid)?;
                     Ok(vec![f.convert(keep, Elem::I32)])
                 })
                     as Box<dyn FnOnce(&mut Func) -> kernels_xla::hlo::Built<Vec<Val>>>;
-                let back = Box::new(|f: &mut Func| -> kernels_xla::hlo::Built<Vec<Val>> {
-                    let back = f.sort(&[index, kept], 2, false, |f, a, b| {
+                // With a negative lane the mass before a lane need not grow:
+                // the lanes in order, their verdicts sorted back by index.
+                let general = Box::new(move |f: &mut Func| -> kernels_xla::hlo::Built<Vec<Val>> {
+                    let index = f.iota(Elem::I32, &grid, 2);
+                    let sorted = f.sort(&[key, index], 2, true, |f, a, b| {
+                        f.compare(Cmp::Gt, a[0], b[0])
+                    })?;
+                    let values = key_value_of(f, sorted[0])?;
+                    let before = scan_sum_exclusive(f, values)?;
+                    let kept = f.compare(Cmp::Lt, before, p)?;
+                    let kept = f.convert(kept, Elem::I32);
+                    let back = f.sort(&[sorted[1], kept], 2, false, |f, a, b| {
                         f.compare(Cmp::Lt, a[0], b[0])
                     })?;
                     Ok(vec![back[1]])
                 })
                     as Box<dyn FnOnce(&mut Func) -> kernels_xla::hlo::Built<Vec<Val>>>;
-                let verdict = self.f.case(branch, &[out_ty], vec![prefix, back])?;
+                let verdict = self.f.case(branch, &[out_ty], vec![cut, general])?;
                 let zero = self.f.const_i(Elem::I32, 0, &grid);
                 self.f.compare(Cmp::Ne, verdict[0], zero)?
             }
@@ -2079,4 +2376,155 @@ fn fmod(f: &mut Func, x: Val, y: Val) -> kernels_xla::hlo::Built<Val> {
     let res = f.select(pass, x, res)?;
     let nan = f.const_f(Elem::F32, f64::NAN, &dims);
     f.select(bad, nan, res)
+}
+
+/// Rows an f32 tile holds on v6e's (and v5e's) vector unit, `T(8,128)`: a
+/// reduce along the lanes of fewer rows leaves sublanes idle.
+const F32_SUBLANES: i64 = 8;
+
+/// Lanes a tile holds, `T(8,128)`.
+const LANE_TILE: i64 = 128;
+
+/// `dims` as `[rows, n]`: every axis but the last folded into the rows
+/// (`chlo.top_k`'s operand).
+fn flat_rows(dims: &[i64]) -> Vec<i64> {
+    let (&n, lead) = dims.split_last().expect("a sorted value has an axis");
+    vec![lead.iter().product(), n]
+}
+
+/// The value an order key stands for (-0 read as +0, NaN as a NaN).
+fn key_value_of(f: &mut Func, key: Val) -> kernels_xla::hlo::Built<Val> {
+    let flip = f.like_i(key, 0x7FFF_FFFF);
+    let flipped = f.xor(key, flip)?;
+    let zero = f.like_i(key, 0);
+    let negative = f.compare(Cmp::Lt, key, zero)?;
+    let bits = f.select(negative, flipped, key)?;
+    f.bitcast(bits, Elem::F32)
+}
+
+/// The exclusive prefix sum of `x` (f32) along its last axis: log2(n)
+/// shifted adds.
+fn scan_sum_exclusive(f: &mut Func, x: Val) -> kernels_xla::hlo::Built<Val> {
+    let dims = f.dims(x).to_vec();
+    let r = dims.len();
+    let n = dims[r - 1];
+    let zero = f.const_f(Elem::F32, 0.0, &[]);
+    let shift = |f: &mut Func, v: Val, k: i64| -> kernels_xla::hlo::Built<Val> {
+        let mut hi = dims.clone();
+        hi[r - 1] = n - k;
+        let head = f.slice(v, &vec![0; r], &hi, &vec![1; r])?;
+        let mut lo = vec![0; r];
+        lo[r - 1] = k;
+        f.pad(head, zero, &lo, &vec![0; r], &vec![0; r])
+    };
+    let mut v = shift(f, x, 1)?;
+    let mut k = 1;
+    while k < n {
+        let moved = shift(f, v, k)?;
+        v = f.add(v, moved)?;
+        k *= 2;
+    }
+    Ok(v)
+}
+
+/// The kept lanes of `cummass_le(p)` over a row with no negative lane, as
+/// `[B, R, n]` bools: in descending order (order keys `key`, ties by the
+/// lower index), a lane is kept while the mass before it is below `p`
+/// (`[B, R, n]`, its row's `p` broadcast; `p_row` `[B, R]`). The kept lanes
+/// are a prefix of the order, so the pivot is found by bisection: the
+/// smallest key `T` whose mass above is below `p` (32 rounds over the keys
+/// as unsigned), the pivot level the least key at or above it (every level
+/// above is kept whole: its mass before is bounded by a kept key's), and in
+/// that level the last index whose mass before (the mass above the level,
+/// and the level's lanes of lower index) is below `p` (one round a bit of
+/// the row's length). A NaN lane (the least key) adds a NaN to any mass it
+/// enters, as the order's running sum does.
+fn nucleus_prefix(
+    f: &mut Func,
+    x: Val,
+    key: Val,
+    p: Val,
+    p_row: Val,
+    grid: &[i64; 3],
+) -> kernels_xla::hlo::Built<Val> {
+    let [b, rows, n] = *grid;
+    let row = [b, rows];
+    // the keys as unsigned, in the same order
+    let sign = f.like_i(key, i64::from(i32::MIN));
+    let ukey = f.xor(key, sign)?;
+    let ukey = f.bitcast(ukey, Elem::U32)?;
+    let zero_x = f.const_f(Elem::F32, 0.0, grid);
+    // the mass of the lanes whose key is above `at` (`[B, R]` u32)
+    let mass_above = |f: &mut Func, at: Val| -> kernels_xla::hlo::Built<Val> {
+        let at = f.broadcast(at, grid, &[0, 1])?;
+        let above = f.compare(Cmp::Gt, ukey, at)?;
+        let v = f.select(above, x, zero_x)?;
+        f.reduce(v, &[2], Fold::Sum)
+    };
+    // T: the least u32 K with mass(key > K) < p. mass(key > max) is 0.
+    let lo0 = f.const_i(Elem::U32, 0, &row);
+    let hi0 = f.const_i(Elem::U32, i64::from(u32::MAX), &row);
+    let m0 = mass_above(f, lo0)?;
+    let below0 = f.compare(Cmp::Lt, m0, p_row)?;
+    let out = f.for_loop(32, &[lo0, hi0], |f, _, st| {
+        let (lo, hi) = (st[0], st[1]);
+        let span = f.sub(hi, lo)?;
+        let one = f.like_i(span, 1);
+        let half = f.shr(span, one)?;
+        let mid = f.add(lo, half)?;
+        let m = mass_above(f, mid)?;
+        let ok = f.compare(Cmp::Lt, m, p_row)?;
+        let hi = f.select(ok, mid, hi)?;
+        let lo = f.select(ok, lo, mid)?;
+        Ok(vec![lo, hi])
+    })?;
+    let t = f.select(below0, lo0, out[1])?;
+    // the pivot level: the least key at or above T
+    let t_grid = f.broadcast(t, grid, &[0, 1])?;
+    let at_or_above = f.compare(Cmp::Ge, ukey, t_grid)?;
+    let top = f.like_i(ukey, i64::from(u32::MAX));
+    let candidates = f.select(at_or_above, ukey, top)?;
+    let level = f.reduce(candidates, &[2], Fold::Min)?;
+    let above = mass_above(f, level)?;
+    let level_grid = f.broadcast(level, grid, &[0, 1])?;
+    let in_level = f.compare(Cmp::Eq, ukey, level_grid)?;
+    let level_x = f.select(in_level, x, zero_x)?;
+    let col = f.iota(Elem::I32, grid, 2);
+    // J: the last index whose mass before is below p (index 0 always is:
+    // the mass above the level is below p, the level's key at or above T)
+    let mass_before = |f: &mut Func, j: Val| -> kernels_xla::hlo::Built<Val> {
+        let j = f.broadcast(j, grid, &[0, 1])?;
+        let earlier = f.compare(Cmp::Lt, col, j)?;
+        let v = f.select(earlier, level_x, zero_x)?;
+        let s = f.reduce(v, &[2], Fold::Sum)?;
+        f.add(above, s)
+    };
+    let bits = 64 - (n as u64).leading_zeros() as i64;
+    let jlo = f.const_i(Elem::I32, 0, &row);
+    let jhi = f.const_i(Elem::I32, n, &row);
+    let out = f.for_loop(bits, &[jlo, jhi], |f, _, st| {
+        let (lo, hi) = (st[0], st[1]);
+        let span = f.sub(hi, lo)?;
+        let one = f.like_i(span, 1);
+        let half = f.shr(span, one)?;
+        let mid = f.add(lo, half)?;
+        let next = f.add(lo, one)?;
+        let mid = f.max(mid, next)?;
+        let m = mass_before(f, mid)?;
+        let ok = f.compare(Cmp::Lt, m, p_row)?;
+        let lo = f.select(ok, mid, lo)?;
+        let hi = f.select(ok, hi, mid)?;
+        Ok(vec![lo, hi])
+    })?;
+    let last = out[0];
+    // the kept lanes: above the level, or in it up to the last index; none
+    // where p is not above zero (the first lane's mass before, 0, is not
+    // below it)
+    let level_up = f.compare(Cmp::Gt, ukey, level_grid)?;
+    let last_grid = f.broadcast(last, grid, &[0, 1])?;
+    let early = f.compare(Cmp::Le, col, last_grid)?;
+    let tie = f.and(in_level, early)?;
+    let keep = f.or(level_up, tie)?;
+    let positive = f.compare(Cmp::Gt, p, zero_x)?;
+    f.and(keep, positive)
 }

@@ -26,6 +26,13 @@ fn reference(a: &[f32], w: &[f32], bias: Option<&[f32]>, m: usize, n: usize, k: 
     y
 }
 
+
+/// The table that answers the turned kernel wherever it and the skinny
+/// kernel both cover a product: a test of the turned kernel runs under it.
+fn turned_table() -> std::sync::Arc<kernels_rocm::linear::routes::Routes> {
+    std::sync::Arc::new(kernels_rocm::linear::routes::Routes::all(kernels_rocm::linear::routes::Kernel::Turned))
+}
+
 #[test]
 fn linear_matmul() {
     let Some(gpu) = Gpu::open() else { return };
@@ -227,9 +234,8 @@ fn the_turned_projection() {
     let mut t = kernels_rocm::tuning::Tuning::DEFAULT;
     t.gemm_turn_from = 1;
     t.gemm_turn_wide_until = 32;
-    t.gemm_turn_min_n = 0;
     t.gemm_skinny_batch_min_n = 0;
-    let ctx = gpu.ctx().with_tuning(t);
+    let ctx = gpu.ctx().with_tuning(t).with_routes(turned_table());
     for (m, n, k) in [
         (1u32, 2056u32, 256u32),
         (8, 4096, 2048),
@@ -449,7 +455,7 @@ fn the_normed_skinny_product_is_the_norm_then_the_product() {
         t.hbm_gbps = 4090;
         t.cached_gbps = cached;
         t.gemm_turn_from = if turn { 2 } else { 0 };
-        let ctx = gpu.ctx().with_tuning(t);
+        let ctx = if turn { gpu.ctx().with_tuning(t).with_routes(turned_table()) } else { gpu.ctx().with_tuning(t) };
         let x: Vec<f32> = values((m * k) as usize, 41, 1.0).into_iter().map(round_bf16).collect();
         let y: Vec<f32> = values((m * k) as usize, 42, 1.0).into_iter().map(round_bf16).collect();
         let nw: Vec<f32> = values(k as usize, 43, 0.5).into_iter().map(round_bf16).collect();
@@ -527,7 +533,7 @@ fn the_normed_gated_skinny_product_is_the_norm_then_the_gated_product() {
         let mut t = t;
         t.cached_gbps = cached;
         t.gemm_turn_from = if turn { 2 } else { 0 };
-        let ctx = gpu.ctx().with_tuning(t);
+        let ctx = if turn { gpu.ctx().with_tuning(t).with_routes(turned_table()) } else { gpu.ctx().with_tuning(t) };
         let x: Vec<f32> = values((m * k) as usize, 51, 1.0).into_iter().map(round_bf16).collect();
         let y: Vec<f32> = values((m * k) as usize, 52, 1.0).into_iter().map(round_bf16).collect();
         let nw: Vec<f32> = values(k as usize, 53, 0.5).into_iter().map(round_bf16).collect();

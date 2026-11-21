@@ -65,6 +65,12 @@ pub struct Recorder {
     sealed_seen: HashSet<BodyKey>,
     /// The key of the body the last fire replayed.
     replayed: Option<BodyKey>,
+    /// Compositions arming stated eager by name (the bodies' allowance
+    /// spent before them): their fires walk eagerly by statement.
+    stated: HashSet<BodyKey>,
+    /// A fire arming makes to learn a stated composition's key, not to
+    /// capture it (`Bodies::state_eager`).
+    stating: bool,
 }
 
 /// Whether a sealed-map decline is worth a log line: the first fire of each
@@ -774,6 +780,10 @@ pub struct BodyTally {
     /// their composition was never armed (and not captured as it served)
     /// or is one a body cannot carry. Each is warned of at a power of two.
     pub eager_unbodied: u64,
+    /// Fires of compositions the load stated eager by name at arming (the
+    /// bodies' allowance spent before them): eager by statement, not a
+    /// body that should have been there (`sealed_declines`).
+    pub stated_eager: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -807,7 +817,7 @@ impl core::fmt::Display for BodyStats {
             f,
             "[body-stats] hits={} misses={} reshapes={} captures={} \
              declines={} refusals={} evictions={} armed_at_load={} \
-             sealed_declines={} sealed_short={} eager_buffered={} \
+             sealed_declines={} stated_eager={} sealed_short={} eager_buffered={} \
              eager_copy_world={} | last-capture: nodes={} edges={} islands={} \
              | resident: bodies={} segmented={} bytes={}",
             tally.hits,
@@ -819,6 +829,7 @@ impl core::fmt::Display for BodyStats {
             tally.evictions,
             tally.armed_at_load,
             tally.sealed_declines,
+            tally.stated_eager,
             tally.sealed_short,
             tally.eager_buffered,
             tally.eager_copy_world,
@@ -889,6 +900,21 @@ impl Bodies {
         self.map.seal();
     }
 
+    /// While `on`, a sealed fire states its composition eager by name
+    /// instead of declining it: arming fires a composition the allowance
+    /// left no room for once, sealed, to learn its key.
+    pub fn state_eager(&mut self, on: bool) {
+        self.recorder.stating = on;
+    }
+
+    /// The compositions stated eager at arming, by name, in a stable order.
+    #[must_use]
+    pub fn stated_eager(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self.recorder.stated.iter().map(ToString::to_string).collect();
+        keys.sort();
+        keys
+    }
+
     /// Whether the load's arming sealed the bodies: from then on a fire is
     /// a serving one.
     #[must_use]
@@ -902,6 +928,16 @@ impl Bodies {
     pub fn forget_bodies(&mut self) {
         self.map = BodyMap::default();
         self.recorder.sealed_seen.clear();
+        self.recorder.stated.clear();
+    }
+
+    /// Drops the recorded bodies of bucket `bucket` (every kind) and what
+    /// was refused there, unsealed so they arm again; the other buckets'
+    /// stay armed. What a load's product choice re-arms where it timed a
+    /// choice over that bucket's rows (`Shell::routes_by_body`).
+    pub fn forget_bodies_at(&mut self, bucket: u32) {
+        self.map.forget_bucket(bucket);
+        self.recorder.sealed_seen.retain(|key| key.bucket != bucket);
     }
 
     #[must_use]
@@ -1038,6 +1074,16 @@ impl Bodies {
         }
 
         if self.sealed_decline() {
+            // Stated at arming, or being stated: eager by statement.
+            if self.recorder.stating {
+                self.recorder.stated.insert(key.clone());
+                return Ok(());
+            }
+            if self.recorder.stated.contains(&key) {
+                self.recorder.bstats.stated_eager += 1;
+                return Ok(());
+            }
+            self.recorder.bstats.sealed_declines += 1;
             let declines = self.recorder.bstats.sealed_declines;
             if reports_decline(&mut self.recorder.sealed_seen, &key, declines) {
                 let why = if !self.map.bodies.contains_key(&key) {
@@ -1070,9 +1116,10 @@ impl Bodies {
                     "engine-cuda: body {key} declines to capture ({}), so this \
                      composition walks eagerly for good, each serving fire counted \
                      unrecorded. A prefill schedule that refused its graph form: \
-                     the prefill float grant is sized at the lattice's top rung in \
-                     `inputs::reserve` (`prefill_float_bytes`); a bucket that \
-                     outgrows it is this line.",
+                     the prefill float grant holds the most any bucket of the \
+                     lattice asks over the window's lanes \
+                     (`inputs::prefill_float_bytes`), so this body carved a shape \
+                     outside the lattice the load sized it for.",
                     run.uncapturable_why().join("; ")
                 );
             }
@@ -1222,11 +1269,7 @@ impl Bodies {
     }
 
     fn sealed_decline(&mut self) -> bool {
-        if !self.map.sealed() {
-            return false;
-        }
-        self.recorder.bstats.sealed_declines += 1;
-        true
+        self.map.sealed()
     }
 
     fn insert_body(&mut self, key: BodyKey, body: Body) -> bool {
@@ -1244,6 +1287,15 @@ struct Seating {
 }
 
 impl BodyMap {
+    fn forget_bucket(&mut self, bucket: u32) {
+        self.bodies.retain(|key, _| key.bucket != bucket);
+        self.body_order.retain(|key| key.bucket != bucket);
+        self.body_warm.retain(|key, _| key.bucket != bucket);
+        self.cold_refused.retain(|key| key.bucket != bucket);
+        self.bodies_refused.retain(|key| key.bucket != bucket);
+        self.sealed = false;
+    }
+
     fn holds(&self, key: &BodyKey) -> bool {
         self.bodies.contains_key(key)
     }

@@ -80,8 +80,6 @@ impl Host for Api {
         gpu.fire_step(step, at, false, None)
     }
 
-    fn submitted(_gpu: &Wgpu) {}
-
     fn run_prologues(
         gpu: &mut Wgpu,
         step: &Step,

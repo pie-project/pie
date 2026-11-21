@@ -30,7 +30,16 @@ pub use streamed_topk::{TOPK_ROW_BYTES, emit_streamed_topk, streamed_topk_tempor
 pub use topk::emit_grouped_topk;
 pub use validate::validate_singleton_plan;
 
-pub const METAL_M1_EMITTER_VERSION: u16 = 72;
+/// The library forms Metal's emitters serve: the nucleus sampler over f32
+/// rows, its rank cut, an f32 lane cut. The temperature-scaled Gumbel draw
+/// and a bf16 row's lane cut are planned as generated regions (Metal's own
+/// two-level draw, `m4_gumbel_*`), as before those forms existed.
+pub const LIBRARY_FORMS: crate::plan::LibraryForms = crate::plan::LibraryForms {
+    draw: false,
+    bf16_cut: false,
+};
+
+pub const METAL_M1_EMITTER_VERSION: u16 = 76;
 
 pub const METAL_M1_MAX_CHANNELS: usize = 29;
 

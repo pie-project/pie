@@ -782,8 +782,11 @@ pub fn measure(
         scan_gelems: Some(scan),
         few_row_tflops: few_row,
         workgroups_per_core: per_core,
+        submit_worst_ratio: None,
+        attn_tflops_by_rows_keys: None,
         tile_tflops_by_rows: None,
         vector_tflops_by_rows: None,
+        product_ns: None,
     })
 }
 

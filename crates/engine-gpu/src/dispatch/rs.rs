@@ -1,7 +1,7 @@
 use kernels_slang::{Error, Tensor};
 use poem_ir::ValueId;
 
-use crate::backend::Backend;
+use crate::backend::{Backend, Buffer as _};
 use crate::rs::Seat;
 use crate::run::Run;
 
@@ -46,20 +46,54 @@ impl<B: Backend> Run<'_, B> {
         if bytes == 0 {
             return Ok(());
         }
-        let src = self
-            .handles()
-            .cut(src.0, src.1, bytes)
-            .map_err(|fault| Self::kernel(fault, op))?;
-        let dst = self
-            .handles()
-            .cut(dst.0, dst.1, bytes)
-            .map_err(|fault| Self::kernel(fault, op))?;
-        kernels_slang::gather::rows::copy_words(
-            self.ctx,
-            Tensor::new(src, 1, 1, poem_ir::Dtype::U32),
-            Tensor::new(dst, 1, 1, poem_ir::Dtype::U32),
-            bytes,
-        )
+        // Each end is its reservation bound whole from byte 0, the run a word
+        // offset in it: the same view whatever binding or run a copy names,
+        // so one group a pair of reservations. The run is refused past its
+        // binding's bound range (as a cut of it would be), and `copy_words`
+        // refuses it past the reservation.
+        let whole = |(handle, at): (u32, u64)| -> Result<(Tensor, u32), Error> {
+            let (buffer, base) = {
+                let binding = self.handles().get(handle).ok_or_else(|| Error::Backend {
+                    op,
+                    detail: format!("handle {handle}, which no row answers"),
+                })?;
+                if at.saturating_add(bytes) > binding.extent() {
+                    return Err(Error::Backend {
+                        op,
+                        detail: format!(
+                            "a run of {bytes} bytes at {at} passes the {} bytes handle {handle}                              is bound at",
+                            binding.extent()
+                        ),
+                    });
+                }
+                (binding.buffer().clone(), binding.offset())
+            };
+            let first = base + at;
+            if !first.is_multiple_of(4) {
+                return Err(Error::Backend {
+                    op,
+                    detail: format!("a run at byte {first}, which is not a whole word"),
+                });
+            }
+            let reservation = self
+                .handles()
+                .bind(&buffer, 0, buffer.bytes())
+                .map_err(|fault| Self::kernel(fault, op))?;
+            let words = u32::try_from(buffer.bytes() / 4).unwrap_or(u32::MAX);
+            let first = u32::try_from(first / 4).map_err(|_| Error::Backend {
+                op,
+                detail: format!(
+                    "a run at byte {}, past what a word offset addresses",
+                    base + at
+                ),
+            })?;
+            Ok((
+                Tensor::new(reservation, words, 1, poem_ir::Dtype::U32),
+                first,
+            ))
+        };
+        let ((src, src_at), (dst, dst_at)) = (whole(src)?, whole(dst)?);
+        kernels_slang::gather::rows::copy_words(self.ctx, src, src_at, dst, dst_at, bytes)
     }
 
     #[allow(clippy::too_many_arguments)]

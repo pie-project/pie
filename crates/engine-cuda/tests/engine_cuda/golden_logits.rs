@@ -831,24 +831,30 @@ fn golden_logits_by_refs() {
     probe(served_by_refs);
 }
 
-/// Host refs handed out as the runtime's host tier would (CONTRACT-BC 22):
-/// a fresh host chunk for a shape whose open one is full, host chunk ids
-/// their own places.
-struct HostRefs {
+/// Tier refs handed out as the runtime's host and disk tiers would
+/// (CONTRACT-BC 22): a fresh chunk of the tier's `chunks` for a shape whose
+/// open one is full, chunk ids their own places.
+struct TierRefs {
     next: u32,
+    chunks: u32,
     open: Vec<Option<(u32, u32)>>,
 }
 
-impl HostRefs {
+impl TierRefs {
+    fn of(facts: &engine::chunk::ChunkFacts, chunks: u32) -> TierRefs {
+        TierRefs {
+            next: 0,
+            chunks,
+            open: vec![None; facts.shapes.len()],
+        }
+    }
+
     fn take(&mut self, facts: &engine::chunk::ChunkFacts, shape: usize) -> u32 {
         let per_chunk = facts.shapes[shape].slots_per_chunk;
         let (chunk, index) = match self.open[shape] {
             Some((chunk, index)) if index < per_chunk => (chunk, index),
             _ => {
-                assert!(
-                    self.next < facts.host_chunks,
-                    "the host tier holds the lane"
-                );
+                assert!(self.next < self.chunks, "the tier holds the lane");
                 self.next += 1;
                 (self.next - 1, 0)
             }
@@ -859,12 +865,13 @@ impl HostRefs {
 }
 
 /// Every slot of `refs` (shape `shape`; ref 0, a trimmed window slot,
-/// stays) out to `tier` and back into fresh device slots, as a suspend and
-/// a restore move them: the refs the lane names from then on.
+/// stays) out to `tier` (its refs handed out by `parked`) and back into
+/// fresh device slots, as a suspend and a restore move them: the refs the
+/// lane names from then on.
 fn park(
     shell: &mut Shell,
     refs: &mut Refs,
-    host: &mut HostRefs,
+    parked: &mut TierRefs,
     tier: engine_cuda::store::Tier,
     shape: usize,
     slots: &[u32],
@@ -872,20 +879,10 @@ fn park(
     use engine_cuda::store::Tier;
     let id = refs.facts.shapes[shape].id;
     let facts = refs.facts.clone();
-    let mut disk = 0u32;
     let out: Vec<(u32, u32)> = slots
         .iter()
         .filter(|&&slot| slot != 0)
-        .map(|&slot| {
-            let parked = match tier {
-                Tier::Disk => {
-                    disk += 1;
-                    disk - 1
-                }
-                _ => host.take(&facts, shape),
-            };
-            (slot, parked)
-        })
+        .map(|&slot| (slot, parked.take(&facts, shape)))
         .collect();
     shell
         .copy_tier_slots(id, Tier::Device, tier, &out)
@@ -908,8 +905,7 @@ fn park(
 /// serves it but for evacuations; where `offload`, after steps 2 and 6
 /// every slot the lane holds (kv list pages, window list pages, the record's
 /// pieces) parks below the device and comes back to fresh slots in fresh
-/// chunks: the host tier the first time, the kv list pages through the slot
-/// file the second. The logits are the never-offloaded serving's, bit for
+/// chunks: the host tier the first time, the disk tier the second. The logits are the never-offloaded serving's, bit for
 /// bit.
 fn served_offloaded(fixture: &Fixture, cache: &Path, offload: bool) -> Vec<(u64, u32)> {
     use engine::chunk::SlotKind;
@@ -941,9 +937,13 @@ fn served_offloaded(fixture: &Fixture, cache: &Path, offload: bool) -> Vec<(u64,
         resident("before it is seated");
     }
     let host = Some(stated.map_or(1 << 30, |mib| mib << 20));
-    let ring = engine_cuda::store::staging_ring_for(shell.trace(), PAGE, CONTEXT, host, 1)
-        .and_then(|bytes| bytes.map(engine_cuda::store::Ring::pin).transpose())
-        .expect("the staging ring pins");
+    let ring = engine_cuda::store::staging_ring_for(
+        host,
+        1,
+        engine::runahead::Runahead::DEFAULT_FRAMES_IN_FLIGHT,
+    )
+    .and_then(|bytes| bytes.map(engine_cuda::store::Ring::pin).transpose())
+    .expect("the staging ring pins");
     shell
         .seat_host_kv(host, 1, CONTEXT, 1, ring)
         .expect("the host tier seats");
@@ -965,10 +965,8 @@ fn served_offloaded(fixture: &Fixture, cache: &Path, offload: bool) -> Vec<(u64,
     assert!(facts.host_chunks > 0, "a host tier is stated");
     assert!(facts.disk_chunks > 0, "a disk tier is stated");
     let mut refs = Refs::of(facts.clone(), 1);
-    let mut host = HostRefs {
-        next: 0,
-        open: vec![None; facts.shapes.len()],
-    };
+    let mut host = TierRefs::of(&facts, facts.host_chunks);
+    let mut disk = TierRefs::of(&facts, facts.disk_chunks);
     let list = refs.shape(|kind| matches!(kind, SlotKind::List { window: None, .. }));
     let window_list = refs.shape(|kind| kind.window().is_some());
     let fixed = refs.shape(|kind| matches!(kind, SlotKind::Fixed { .. }));
@@ -1068,15 +1066,19 @@ fn served_offloaded(fixture: &Fixture, cache: &Path, offload: bool) -> Vec<(u64,
         last = Some(top);
         steps.push((hash_logits(&logits), top));
         if offload && (at == 2 || at == 6) {
-            let kv_tier = if at == 2 { Tier::Host } else { Tier::Disk };
+            let (tier, parked) = if at == 2 {
+                (Tier::Host, &mut host)
+            } else {
+                (Tier::Disk, &mut disk)
+            };
             if let Some(shape) = list {
-                pages = park(&mut shell, &mut refs, &mut host, kv_tier, shape, &pages);
+                pages = park(&mut shell, &mut refs, parked, tier, shape, &pages);
             }
             if let Some(shape) = window_list {
-                window = park(&mut shell, &mut refs, &mut host, Tier::Host, shape, &window);
+                window = park(&mut shell, &mut refs, parked, tier, shape, &window);
             }
             if let Some(shape) = fixed {
-                pieces = park(&mut shell, &mut refs, &mut host, Tier::Host, shape, &pieces);
+                pieces = park(&mut shell, &mut refs, parked, tier, shape, &pieces);
                 record = Some(shell.name_record(&pieces).expect("the record is named"));
             }
         }
@@ -1085,7 +1087,7 @@ fn served_offloaded(fixture: &Fixture, cache: &Path, offload: bool) -> Vec<(u64,
 }
 
 /// CONTRACT-BC 22: a lane offloaded mid-decode (every slot it holds to the
-/// host tier and back, then its kv pages through the slot file) serves the
+/// host tier and back, then to the disk tier and back) serves the
 /// never-offloaded lane's logits bit for bit, in one process.
 #[test]
 #[ignore = "a probe run by hand: see the module's doc"]
@@ -1114,6 +1116,281 @@ fn golden_offload() {
         }
     }
     assert!(moved.is_empty(), "offloaded logits moved: {moved:?}");
+}
+
+/// A slot's words, every one's low half set: no bf16 (nor a narrowing of
+/// f32 to one) keeps them. Some are NaNs with payloads, some denormals.
+fn tier_pattern(seed: u32, bytes: u64) -> Vec<u8> {
+    (0..bytes / 4)
+        .flat_map(|at| {
+            let x = (at as u32 ^ seed.wrapping_mul(0x9e37_79b9)).wrapping_mul(0x85eb_ca6b);
+            let word = match at % 7 {
+                0 => 0x7fc0_0000 | (x & 0x003f_ffff) | 1,
+                1 => x & 0x007f_ffff | 1,
+                _ => x ^ (x >> 15) | 0x0001_0001,
+            };
+            word.to_le_bytes()
+        })
+        .collect()
+}
+
+fn tier_check(what: &str, got: &[u8], want: &[u8]) {
+    assert_eq!(got.len(), want.len(), "{what}: length");
+    if let Some(at) = got.iter().zip(want).position(|(a, b)| a != b) {
+        panic!(
+            "{what}: byte {at} of {} differs ({:#04x} for {:#04x}); {} bytes differ",
+            want.len(),
+            got[at],
+            want[at],
+            got.iter().zip(want).filter(|(a, b)| a != b).count()
+        );
+    }
+}
+
+/// Every parked shape of `model`'s load through the tiers below the device
+/// ([`a_tier_round_trip_is_bit_exact_for_every_parked_shape`]): each shape
+/// it moved, named by what it holds, and its slot's bytes.
+fn tier_round_trip(model: &str, cache: &Path) -> Vec<(String, u64)> {
+    use engine_cuda::store::Tier;
+    let fixture = fixture(model, cache);
+    let mut shell = load(&fixture, cache);
+    let host = Some(256 << 20);
+    let ring = engine_cuda::store::staging_ring_for(
+        host,
+        1,
+        engine::runahead::Runahead::DEFAULT_FRAMES_IN_FLIGHT,
+    )
+    .and_then(|bytes| bytes.map(engine_cuda::store::Ring::pin).transpose())
+    .expect("the staging ring pins");
+    shell
+        .seat_host_kv(host, 1, CONTEXT, 1, ring)
+        .expect("the host tier seats");
+    // Three disk chunks a parked shape, and a part chunk the tier leaves.
+    let stated = shell.chunk_facts().expect("the pool states its chunks");
+    let disk_chunk = stated.chunk_bytes.next_multiple_of(4096);
+    let budget = 3 * stated.shapes.len() as u64 * disk_chunk + disk_chunk / 2;
+    let dir = tempfile::tempdir().expect("a disk tier's dir");
+    let chunks = shell
+        .seat_disk_kv(
+            Some(budget),
+            Some(dir.path()),
+            false,
+            engine_cuda::World::default(),
+        )
+        .expect("the disk tier seats");
+    shell.take_refs();
+    let facts = shell.chunk_facts().expect("the pool states its chunks");
+    facts.validate().expect("the engine's chunk facts hold");
+    // The budget divides into disk chunks of a pool chunk each, on the
+    // direct I/O boundary, laid out as the device's.
+    assert_eq!(facts.disk_chunks, chunks, "{model}: the facts state the disk chunks");
+    assert_eq!(u64::from(chunks), budget / disk_chunk, "{model}: disk chunks of the budget");
+    let parked: Vec<engine::chunk::SlotShape> = facts
+        .shapes
+        .iter()
+        .filter(|shape| shape.role != engine::chunk::SlotRole::Adapter)
+        .cloned()
+        .collect();
+    // The null chunk and four device chunks a shape.
+    let segments = (1 + 4 * parked.len() as u32)
+        .div_ceil(facts.segment_chunks.max(1))
+        .min(facts.segments.max);
+    shell
+        .commit_segments(segments)
+        .expect("the segments commit");
+    let committed = segments * facts.segment_chunks;
+    assert!(
+        1 + 4 * parked.len() as u32 <= committed,
+        "{model}: four device chunks a shape in the {committed} committed"
+    );
+    assert!(
+        3 * parked.len() as u32 <= chunks && 2 * parked.len() as u32 <= facts.host_chunks,
+        "{model}: three disk chunks and two host chunks a shape"
+    );
+    let stream = shell.stream();
+    let write = |shell: &mut Shell, id, slot: u32, bytes: &[u8]| {
+        let at = shell.slot_span(id, slot).expect("a slot's place");
+        engine_cuda::device::alloc::stage_raw(stream, at, bytes).expect("the slot is written");
+    };
+    let read = |shell: &mut Shell, id, slot: u32, len: u64| -> Vec<u8> {
+        shell.settle_moves().expect("every move lands");
+        let at = shell.slot_span(id, slot).expect("a slot's place");
+        let mut out = vec![0u8; len as usize];
+        engine_cuda::device::alloc::copy_d2h_on(stream, at, &mut out).expect("the slot reads");
+        out
+    };
+    let zip = |a: &[u32], b: &[u32]| -> Vec<(u32, u32)> {
+        a.iter().copied().zip(b.iter().copied()).collect()
+    };
+    let mut moved = Vec::new();
+    for (k, shape) in parked.iter().enumerate() {
+        let k = k as u32;
+        let (id, per, bytes) = (shape.id, shape.slots_per_chunk, shape.slot_bytes);
+        assert!(
+            u64::from(per) * bytes <= facts.chunk_bytes,
+            "{model}: shape {id} packs a chunk as on the device"
+        );
+        // Device chunks `1 + 4k ..`, disk chunks `3k ..`, host chunks `2k ..`:
+        // each shape's own. Slots `n` adjacent ones of a chunk, from `first`.
+        let n = per.min(3);
+        let refs = |chunk: u32, first: u32| -> Vec<u32> {
+            (0..n).map(|i| chunk * per + (first + i) % per).collect()
+        };
+        let what = |how: &str| format!("{model} shape {id} ({bytes} bytes a slot) {how}");
+
+        // Device -> disk -> device: adjacent disk slots, out of order, in
+        // one copy; the device slots overwritten; restored into other
+        // slots in two copies back to back.
+        let (source, into) = (refs(1 + 4 * k, 0), refs(2 + 4 * k, 0));
+        let held: Vec<Vec<u8>> = source
+            .iter()
+            .enumerate()
+            .map(|(i, &slot)| {
+                let pattern = tier_pattern(100 * (k + 1) + i as u32, bytes);
+                write(&mut shell, id, slot, &pattern);
+                pattern
+            })
+            .collect();
+        let disk: Vec<u32> = refs(3 * k, 1).into_iter().rev().collect();
+        shell
+            .copy_tier_slots(id, Tier::Device, Tier::Disk, &zip(&source, &disk))
+            .expect("the slots park on disk");
+        for &slot in &source {
+            write(&mut shell, id, slot, &vec![0xa5; bytes as usize]);
+        }
+        let (disk_a, disk_b) = disk.split_at(1);
+        let (into_a, into_b) = into.split_at(1);
+        shell
+            .copy_tier_slots(id, Tier::Disk, Tier::Device, &zip(disk_a, into_a))
+            .expect("the first slot restores");
+        shell
+            .copy_tier_slots(id, Tier::Disk, Tier::Device, &zip(disk_b, into_b))
+            .expect("the rest restore");
+        for (i, &slot) in into.iter().enumerate() {
+            tier_check(
+                &what(&format!("slot {i} device -> disk -> device")),
+                &read(&mut shell, id, slot, bytes),
+                &held[i],
+            );
+        }
+        // The slot beside the parked ones in their disk chunk, written
+        // after them in a copy of its own (sharing a block with them where
+        // a slot is off the boundary), leaves them as they were.
+        if per > n + 1 {
+            let beside = 3 * k * per + n + 1;
+            let other = refs(3 + 4 * k, 0)[0];
+            write(&mut shell, id, other, &tier_pattern(7, bytes));
+            shell
+                .copy_tier_slots(id, Tier::Device, Tier::Disk, &[(other, beside)])
+                .expect("the slot beside parks");
+            shell
+                .copy_tier_slots(id, Tier::Disk, Tier::Device, &zip(&disk, &into))
+                .expect("the slots restore again");
+            for (i, &slot) in into.iter().enumerate() {
+                tier_check(
+                    &what(&format!("slot {i} beside a later neighbour")),
+                    &read(&mut shell, id, slot, bytes),
+                    &held[i],
+                );
+            }
+        }
+        // Negative control: a restore from a disk slot this shape never
+        // parked to does not read as the parked bytes.
+        let never = refs(3 * k + 2, 0)[0];
+        let blank = refs(3 + 4 * k, 1)[0];
+        write(&mut shell, id, blank, &vec![0x3c; bytes as usize]);
+        shell
+            .copy_tier_slots(id, Tier::Disk, Tier::Device, &[(never, blank)])
+            .expect("an unparked disk slot restores");
+        let got = read(&mut shell, id, blank, bytes);
+        assert!(
+            held.iter().all(|held| *held != got),
+            "{}",
+            what("restored from an unparked disk slot reads as a parked one")
+        );
+
+        // Host -> disk -> host, into other host slots; and the disk slots
+        // up to the device too.
+        let host_in = refs(2 * k, 0);
+        let host_back = refs(2 * k + 1, 0);
+        let seeded: Vec<u8> = (0..n)
+            .flat_map(|i| tier_pattern(100 * (k + 1) + 50 + i, bytes))
+            .collect();
+        shell
+            .write_tier_slots(&[(id, host_in.clone())], &seeded)
+            .expect("the host slots take the pattern");
+        let down: Vec<u32> = refs(3 * k + 1, 1).into_iter().rev().collect();
+        shell
+            .copy_tier_slots(id, Tier::Host, Tier::Disk, &zip(&host_in, &down))
+            .expect("the host slots go down to disk");
+        shell
+            .write_tier_slots(&[(id, host_in.clone())], &vec![0x5a; seeded.len()])
+            .expect("the host slots are written over");
+        shell
+            .copy_tier_slots(id, Tier::Disk, Tier::Host, &zip(&down, &host_back))
+            .expect("the disk slots come up to the host");
+        let got = shell
+            .read_tier_slots(&[(id, host_back)])
+            .expect("the host slots read");
+        tier_check(&what("host -> disk -> host"), &got, &seeded);
+        let up = refs(4 + 4 * k, 0);
+        shell
+            .copy_tier_slots(id, Tier::Disk, Tier::Device, &zip(&down, &up))
+            .expect("the disk slots come up to the device");
+        let row = bytes as usize;
+        for (i, &slot) in up.iter().enumerate() {
+            tier_check(
+                &what(&format!("slot {i} host -> disk -> device")),
+                &read(&mut shell, id, slot, bytes),
+                &seeded[i * row..(i + 1) * row],
+            );
+        }
+        println!("{}: every round trip bit-exact", what("parks"));
+        let held = match (shape.role, &shape.kind) {
+            (_, engine::chunk::SlotKind::List { window: Some(_), .. }) => "window".to_string(),
+            (engine::chunk::SlotRole::State, engine::chunk::SlotKind::List { .. }) => {
+                "kv".to_string()
+            }
+            (engine::chunk::SlotRole::State, engine::chunk::SlotKind::Fixed { .. }) => {
+                "record".to_string()
+            }
+            (role, _) => format!("{role:?}"),
+        };
+        moved.push((held, bytes));
+    }
+    moved
+}
+
+/// Every shape a parked set carries comes back bit for bit through the
+/// tiers below the device (CONTRACT-BC 22): the kv list, the window lists
+/// (Gemma's miniature), the hybrid's rs-list rows and records (Qwen3.5's),
+/// and the guests' instance and channel slots, device -> disk -> device
+/// and host -> disk -> host (and on up to the device), into other slots,
+/// the disk budget divided into disk chunks laid out as the device's.
+/// Words no bf16 holds; disk slots adjacent and out of order, restored in
+/// two copies back to back; a slot off the 4 KiB boundary written beside
+/// its parked neighbours without disturbing them; and a negative control,
+/// a restore from a disk slot never parked to, that reads as none of them.
+#[test]
+fn a_tier_round_trip_is_bit_exact_for_every_parked_shape() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    let cache = cache_dir();
+    let mut roles = std::collections::BTreeSet::new();
+    let mut unaligned = false;
+    for model in ["qwen35-tiny", "gemma4-e4b-mini-l6"] {
+        for (held, bytes) in tier_round_trip(model, &cache) {
+            roles.insert(held);
+            unaligned |= bytes % 4096 != 0;
+        }
+    }
+    println!("parked shapes: {roles:?}");
+    for want in ["kv", "window", "record", "RsBuffer", "Instance", "Channel"] {
+        assert!(roles.contains(want), "a {want} shape parked: {roles:?}");
+    }
+    assert!(unaligned, "a slot off the 4 KiB boundary parked");
 }
 
 fn probe(served: fn(&Fixture, &Path) -> Vec<(u64, u32)>) {

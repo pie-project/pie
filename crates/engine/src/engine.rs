@@ -507,10 +507,10 @@ pub trait Engine: Send {
     /// [`crate::transfer::MemoryDomain::HostPinned`], a host ref `r` of
     /// shape `s` at [`crate::chunk::SlotShape::tier_offset`] of its host
     /// chunks, laid out as the device slot (one span a slot); one that
-    /// states [`crate::chunk::ChunkFacts::disk_chunks`] moves kv list slots
-    /// between the device (or the host tier) and
-    /// [`crate::transfer::MemoryDomain::LocalDisk`], disk ref `r` slot `r`
-    /// of its kv slot file. Token runs are device to device only. Each copy
+    /// states [`crate::chunk::ChunkFacts::disk_chunks`] moves whole slots
+    /// of every state shape between the device (or the host tier) and
+    /// [`crate::transfer::MemoryDomain::LocalDisk`], a disk ref laid out
+    /// in its disk chunks as a host ref is in its host chunks. Token runs are device to device only. Each copy
     /// is ordered after every fire submitted before it and before every one
     /// after (a stream-ordered copy, or a drain), and copies in submission
     /// order: the runtime names a destination again as soon as the call

@@ -102,7 +102,13 @@ impl OpParams {
             } else {
                 o0
             },
-            imm: op.imm,
+            // A gumbel_argmax's fourth operand, its rng state, rides in
+            // `imm` (the words carry three operands).
+            imm: if tag == tags::GUMBEL_ARGMAX {
+                op.args.get(3).copied().unwrap_or(0)
+            } else {
+                op.imm
+            },
             imm2: op.imm2,
             imm3: op.imm3,
             kind: op.rng_kind as u32,

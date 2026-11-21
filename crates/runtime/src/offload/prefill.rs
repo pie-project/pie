@@ -807,22 +807,33 @@ pub async fn serve(
     };
     let whole = tokens[..(pages * page) as usize].to_vec();
     // Streamed, the asker fetches the run as it is computed: its fires'
-    // layers go out as they land.
-    if delivery == Delivery::Streamed
-        && let Some(run) = super::stream::expect(&keys, from as usize).await
-    {
-        tokio::spawn(async move {
-            let ran = run_prefill(&whole).await.map(drop);
-            super::stream::done(run, ran);
-        });
-        tracing::debug!(
-            target: "pie::offload",
-            have,
-            fetched,
-            fetch_ms = t_fetch.as_millis() as u64,
-            "streaming a prefill"
-        );
-        return Ok(answer);
+    // layers go out as they land. Where this engine cannot stream, the run
+    // goes whole, counted and said.
+    if delivery == Delivery::Streamed {
+        match super::stream::expect(&keys, from as usize).await {
+            Ok(run) => {
+                tokio::spawn(async move {
+                    let ran = run_prefill(&whole).await.map(drop);
+                    super::stream::done(run, ran);
+                });
+                tracing::debug!(
+                    target: "pie::offload",
+                    have,
+                    fetched,
+                    fetch_ms = t_fetch.as_millis() as u64,
+                    "streaming a prefill"
+                );
+                return Ok(answer);
+            }
+            Err(why) => {
+                super::stream::count_unstreamed();
+                tracing::debug!(
+                    target: "pie::offload",
+                    %why,
+                    "a prefill asked for streamed goes whole"
+                );
+            }
+        }
     }
     let departure = run_prefill(&whole).await?;
     let t_run = t0.elapsed();

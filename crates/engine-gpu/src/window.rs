@@ -17,6 +17,10 @@ pub struct Window {
 
     pub indptr: Tensor,
 
+    /// The int of the fire's packed table [`Self::indptr`] starts at
+    /// ([`Windows::table`] binds the table whole).
+    pub indptr_at: u32,
+
     pub gathered: Option<Gathered>,
 
     pub pass: u32,
@@ -115,6 +119,9 @@ impl Copies<'_> {
 #[derive(Debug, Clone, Default)]
 pub struct Windows {
     windows: Vec<Window>,
+
+    /// The fire's packed table bound whole, once [`Windows::bind`] has.
+    table: Option<Tensor>,
 
     runs: Vec<u32>,
 
@@ -235,6 +242,7 @@ fn gather_of(runs: &[MaskSpan], indptr_host: &[i32], copies: Copies<'_>) -> Wind
         },
         indptr_host: bounds,
         indptr: Tensor::new(NIL, 0, 1, Dtype::I32),
+        indptr_at: 0,
         gathered: Some(Gathered {
             runs: runs.to_vec(),
             rows: Tensor::new(NIL, 0, 1, Dtype::I32),
@@ -357,6 +365,7 @@ impl Windows {
                         poem_ir::RowAxis::Patches | poem_ir::RowAxis::Voxels => Vec::new(),
                     },
                     indptr: Tensor::new(NIL, 0, 1, Dtype::I32),
+                    indptr_at: 0,
                     gathered: None,
                     patch,
                     voxel,
@@ -369,6 +378,7 @@ impl Windows {
 
         Ok(Windows {
             windows,
+            table: None,
             runs,
             of_region,
         })
@@ -408,30 +418,33 @@ impl Windows {
     }
 
     pub fn bind<B: Backend>(&mut self, handles: &Handles<B>, packed: u32) -> Result<()> {
+        let ints = self.packed().len() as u32;
+        self.table = Some(Tensor::new(packed, ints, 1, Dtype::I32));
         let mut at = 0u64;
-        let mut take = |vector: &[i32]| -> Result<Tensor> {
+        let take = |at: &mut u64, vector: &[i32]| -> Result<Tensor> {
             let rows = vector.len() as u32;
             let bytes = u64::from(rows) * 4;
-            let cut = handles.cut(packed, at, bytes)?;
-            at += bytes;
+            let cut = handles.cut(packed, *at, bytes)?;
+            *at += bytes;
             Ok(Tensor::new(cut, rows, 1, Dtype::I32))
         };
         for window in &mut self.windows {
-            window.indptr = take(&window.indptr_host)?;
+            window.indptr_at = u32::try_from(at / 4).unwrap_or(u32::MAX);
+            window.indptr = take(&mut at, &window.indptr_host)?;
             let Some(gathered) = &mut window.gathered else {
                 continue;
             };
-            gathered.rows = take(&gathered.rows_host)?;
-            gathered.positions = take(&gathered.positions_host)?;
-            gathered.rotations = take(&gathered.rotations_host)?;
-            gathered.request_of_token = take(&gathered.request_of_token_host)?;
-            let words = take(&gathered.mask_words_host)?;
+            gathered.rows = take(&mut at, &gathered.rows_host)?;
+            gathered.positions = take(&mut at, &gathered.positions_host)?;
+            gathered.rotations = take(&mut at, &gathered.rotations_host)?;
+            gathered.request_of_token = take(&mut at, &gathered.request_of_token_host)?;
+            let words = take(&mut at, &gathered.mask_words_host)?;
             gathered.mask_words = Tensor::new(words.buf, words.rows / 2, 2, Dtype::U32);
             for table in &mut gathered.page_tables {
-                table.page_indptr = take(&table.page_indptr_host)?;
-                table.page_indices = take(&table.page_indices_host)?;
-                table.last_page_lens = take(&table.last_page_lens_host)?;
-                table.kv_len = take(&table.kv_len_host)?;
+                table.page_indptr = take(&mut at, &table.page_indptr_host)?;
+                table.page_indices = take(&mut at, &table.page_indices_host)?;
+                table.last_page_lens = take(&mut at, &table.last_page_lens_host)?;
+                table.kv_len = take(&mut at, &table.kv_len_host)?;
             }
         }
         Ok(())
@@ -468,6 +481,12 @@ impl Windows {
             .max()
             .unwrap_or(1)
             .max(1)
+    }
+
+    /// The fire's packed table, bound whole, once [`Self::bind`] has.
+    #[must_use]
+    pub fn table(&self) -> Tensor {
+        self.table.unwrap_or(Tensor::new(NIL, 0, 1, Dtype::I32))
     }
 
     #[must_use]

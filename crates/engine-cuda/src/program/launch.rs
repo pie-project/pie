@@ -203,10 +203,10 @@ impl CudaOpParams {
 
 #[must_use]
 pub fn native_cell_bytes(dtype: Dtype, numel: usize) -> usize {
-    if dtype == Dtype::Bool {
-        numel.max(1)
-    } else {
-        numel.max(1) * 4
+    match dtype {
+        Dtype::Bool => numel.max(1),
+        Dtype::Bf16 => numel.max(1) * 2,
+        _ => numel.max(1) * 4,
     }
 }
 
@@ -714,6 +714,12 @@ pub struct Prepared {
     temporary_bytes: u32,
     region_rows: Vec<u32>,
     samplers: Vec<bool>,
+    /// The most blocks each select split across a lane's blocks takes
+    /// ([`splits`]), a region each.
+    splits: Vec<Option<u32>>,
+    /// The rows of each region whose rows split across blocks
+    /// ([`splits_rows`]).
+    row_splits: Vec<Option<u32>>,
     lanes: u32,
     filled: u32,
     bindings: Vec<u32>,
@@ -757,13 +763,41 @@ fn region_blocks(plan: &LaunchStagePlan, descriptors: &[ValueDesc]) -> Vec<u32> 
         .iter()
         .zip(region_rows(plan, descriptors))
         .map(|(region, rows)| match region.kind {
+            // A row of a region that splits its rows runs on up to a
+            // sampler's blocks: its temporary area is laid for them all.
+            RegionKind::Generated if splits_rows(region, rows) => {
+                rows.saturating_mul(LANE_SAMPLER_BLOCKS)
+            }
             RegionKind::Generated => rows,
             kind if lane_sampler(kind) => LANE_SAMPLER_BLOCKS,
+            RegionKind::Library(LibraryOp::TopK) if splits(plan, region, rows).is_some() => 1,
             RegionKind::Library(LibraryOp::TopK) if selects(plan, region) => rows,
             RegionKind::Library(LibraryOp::TopK | LibraryOp::Sort) => rows.min(ORDER_ROW_BLOCKS),
             RegionKind::Library(_) => 1,
         })
         .collect()
+}
+
+/// Whether `region`'s kernel runs each of its `rows` across several blocks
+/// (its rows meet at a word each of the lane arenas' barrier line, which
+/// holds a word for each of [`LANE_SAMPLER_BLOCKS`] rows).
+fn splits_rows(region: &LaunchRegion, rows: u32) -> bool {
+    region.splits_rows && (1..=LANE_SAMPLER_BLOCKS).contains(&rows)
+}
+
+/// The most blocks `region` splits across, where it is a select over a
+/// lane's one row (`rows` 1) narrow enough a cut to split
+/// ([`eta_compiler::codegen::cuda::order::top_k_splits`]): its blocks' merged
+/// candidates meet in the lane's first arena.
+fn splits(plan: &LaunchStagePlan, region: &LaunchRegion, rows: u32) -> Option<u32> {
+    let op = region
+        .nodes
+        .first()
+        .and_then(|&node| plan.ops.get(node as usize))?;
+    (rows == 1
+        && selects(plan, region)
+        && eta_compiler::codegen::cuda::order::top_k_splits(op.imm))
+    .then(|| eta_compiler::codegen::cuda::order::top_k_split_blocks(op.imm))
 }
 
 fn selects(plan: &LaunchStagePlan, region: &LaunchRegion) -> bool {
@@ -909,10 +943,26 @@ impl Prepared {
         let temporary_bytes = u32::try_from(scratch_layout.temporary_bytes)
             .map_err(|_| Fault::program("program::launch", "a temporary arena past a u32"))?;
         let region_rows = region_blocks(plan, &descriptors);
+        let rows_of = eta_exec::region_rows(plan, &descriptors);
+        // A sampler, or a select split across a lane's blocks: both meet in
+        // the lane arenas, on as many blocks as the device holds with the
+        // fire's lanes.
         let samplers = plan
             .fused
             .iter()
             .map(|region| lane_sampler(region.kind))
+            .collect();
+        let splits = plan
+            .fused
+            .iter()
+            .zip(&rows_of)
+            .map(|(region, &rows)| splits(plan, region, rows))
+            .collect();
+        let row_splits = plan
+            .fused
+            .iter()
+            .zip(&rows_of)
+            .map(|(region, &rows)| splits_rows(region, rows).then_some(rows))
             .collect();
 
         let mut records = Vec::with_capacity(plan.ops.len());
@@ -1013,6 +1063,8 @@ impl Prepared {
             temporary_bytes,
             region_rows,
             samplers,
+            splits,
+            row_splits,
             lanes: 0,
             filled: 0,
             bindings: plan.channel_bindings.clone(),
@@ -1442,16 +1494,28 @@ impl Prepared {
             .copied()
             .unwrap_or(1)
             .max(1);
-        let sampler = self
-            .samplers
-            .get(region.region_index as usize)
-            .copied()
-            .unwrap_or(false);
+        let at = region.region_index as usize;
+        let sampler = self.samplers.get(at).copied().unwrap_or(false);
         // A sampler lane runs on as many blocks as the device holds at once
         // with the fire's lanes (its blocks wait on one another), in its own
         // span of the engine's lane arenas: its blocks' arenas and its
         // gather buffers; the lanes' barrier words start at zero.
-        let rows = if sampler {
+        let rows = if let Some(Some(most)) = self.splits.get(at).copied() {
+            // A split select's lane runs on as many blocks as the device
+            // holds with the fire's lanes, its candidates and its count in
+            // its first arena; its last block merges (none waits).
+            let blocks = (device_units() / self.filled.max(1)).clamp(1, most);
+            let need = u64::from(self.filled) * lane_span(1);
+            if need > arenas.bytes {
+                return Err(Fault::Ceiling {
+                    what: "bytes of the engine's lane arenas a fire's split selects meet in",
+                    need,
+                    have: arenas.bytes,
+                });
+            }
+            self.zero_barriers(arenas, lane_span(1), stream)?;
+            blocks
+        } else if sampler {
             let rows = lane_blocks(device_units(), self.filled).min(rows);
             let need = u64::from(self.filled) * lane_span(rows);
             if need > arenas.bytes {
@@ -1463,6 +1527,24 @@ impl Prepared {
             }
             self.zero_barriers(arenas, lane_span(rows), stream)?;
             rows
+        } else if let Some(Some(region_rows)) = self.row_splits.get(at).copied() {
+            // Each row on as many blocks as the device holds at once with
+            // the fire's lanes' rows (they wait on one another), meeting at
+            // its word of its lane's barrier line.
+            let split =
+                (device_units() / self.filled.saturating_mul(region_rows).max(1)).clamp(1, LANE_SAMPLER_BLOCKS);
+            if split > 1 {
+                let need = u64::from(self.filled) * lane_span(1);
+                if need > arenas.bytes {
+                    return Err(Fault::Ceiling {
+                        what: "bytes of the engine's lane arenas a fire's split rows meet in",
+                        need,
+                        have: arenas.bytes,
+                    });
+                }
+                self.zero_barriers(arenas, lane_span(1), stream)?;
+            }
+            region_rows * split
         } else {
             rows
         };
@@ -1485,11 +1567,17 @@ impl Prepared {
         )
     }
 
-    /// Whether a region of this stage is a lane sampler, whose blocks wait
-    /// for one another and so need their grid resident at once.
+    /// Whether a region of this stage meets across its lane's blocks in the
+    /// engine's lane arenas (a lane sampler, a split select, a split row):
+    /// its blocks may wait for one another, so their grid is resident at
+    /// once, and the arenas are one buffer every launch's lanes lay at the
+    /// same offsets, so no other group's launch (another program's select,
+    /// a decode's sampler) may run beside it on a side stream.
     #[must_use]
     pub fn meets_across_blocks(&self) -> bool {
         self.samplers.iter().any(|&sampler| sampler)
+            || self.splits.iter().any(Option::is_some)
+            || self.row_splits.iter().any(Option::is_some)
     }
 
     #[must_use]
@@ -1981,6 +2069,72 @@ mod tests {
             b.build().expect("the sorted epilogue traces")
         }
 
+        /// The SDK's standard sampler's decode fire of `shape`
+        /// (`eta_dsl::sampler::decode`), its knobs in channels, as the
+        /// built-in inferlets build it.
+        pub fn standard(vocab: u32, shape: &eta_dsl::sampler::Shape) -> Traced {
+            use eta_dsl::sampler::{self, Knobs, Slots};
+            let knob = |on: bool| on.then(|| leak(Channel::from([0.9f32])));
+            let inverse = shape
+                .temperature
+                .then(|| leak(Channel::from([sampler::inverse_temperature(1.0)])));
+            let top_p = knob(shape.top_p);
+            let top_k = shape.top_k.then(|| leak(Channel::from([40u32])));
+            let (min_p, repetition) = (knob(shape.min_p), knob(shape.repetition));
+            let (frequency, presence) = (knob(shape.frequency), knob(shape.presence));
+            let penalized = shape.repetition || shape.frequency || shape.presence;
+            let hist = penalized.then(|| {
+                (
+                    Channel::from(vec![0.0f32; vocab as usize]),
+                    Channel::from(vec![0.0f32; vocab as usize]),
+                )
+            });
+            let logprobs = shape.logprobs.map(|top| {
+                let values = Channel::new([1 + top], dtype::f32).capacity(8);
+                values.note_host_take();
+                let ids = (top > 0).then(|| {
+                    let ids = Channel::new([top], dtype::i32).capacity(8);
+                    ids.note_host_take();
+                    ids
+                });
+                (values, ids)
+            });
+            let slots: &'static Slots = Box::leak(Box::new(Slots {
+                rng: Channel::from([0x9e37u32, 1]),
+                hist,
+                mask: None,
+                logprobs,
+            }));
+            let out = leak(Channel::new([1], dtype::i32).capacity(8));
+            out.note_host_take();
+            let logprob_top = shape.logprobs;
+            let (mut b, tok_in) = builder(vocab);
+            b.stage(Stage::Epilogue, move || {
+                let t = |c: Option<&'static Channel>| c.map(|c| reshape(c.read(), []));
+                let knobs = Knobs {
+                    temperature: t(inverse),
+                    top_p: t(top_p),
+                    top_k: t(top_k),
+                    min_p: t(min_p),
+                    repetition: t(repetition),
+                    frequency: t(frequency),
+                    presence: t(presence),
+                    logprobs: logprob_top,
+                };
+                sampler::decode(vocab, &knobs, slots, tok_in, out);
+            });
+            b.build().expect("the standard sampler traces")
+        }
+
+        /// The standard sampler's shapes ([`eta_dsl::sampler::standard`]),
+        /// each its decode fire, by name.
+        pub fn standard_all(vocab: u32) -> Vec<(String, Traced)> {
+            eta_dsl::sampler::standard()
+                .iter()
+                .map(|(name, shape)| (format!("standard {name}"), standard(vocab, shape)))
+                .collect()
+        }
+
         /// Every program here, by name.
         pub fn all(vocab: u32) -> Vec<(&'static str, Traced)> {
             vec![
@@ -2066,17 +2220,80 @@ mod tests {
             totals,
             [
                 ("top-p", 9_312_512, 1_368_576, 0),
-                ("top-k + top-p", 9_616_896, 2_812_672, 76_032),
+                ("top-k + top-p", 9_616_896, 2_204_928, 76_032),
                 ("gumbel-max", 5_512_960, 1_792, 0),
                 ("greedy", 3_688_704, 768, 0),
-                ("top logprobs", 6_728_960, 1_900_800, 76_032),
-                ("sorted", 8_551_168, 3_040_000, 1_215_488),
+                ("top logprobs", 6_728_960, 1_293_056, 76_032),
+                ("sorted", 8_551_168, 3_039_488, 1_215_488),
             ]
         );
         for ((name, _, now, _), was) in totals.iter().zip(WAS) {
             assert!(*now < was, "{name}: {now} bytes a lane, {was} before");
         }
     }
+
+    /// What a lane's scratch is for the standard sampler's decode fires,
+    /// their vocabulary-sized values bf16: each value's own bytes, and as
+    /// laid.
+    #[test]
+    fn the_standard_samplers_scratch_a_lane() {
+        let vocab = shipped::QWEN_VOCAB;
+        let totals: Vec<(String, u64, u64)> = shipped::standard_all(vocab)
+            .into_iter()
+            .map(|(name, traced)| {
+                let package = shipped::package(&traced, vocab);
+                let [plan] = &package.plans[..] else {
+                    panic!("{name}: one stage");
+                };
+                let descriptors = describe_values(plan, Extents::default()).expect("static shapes");
+                let own = eta_exec::layout(&descriptors).expect("fits").total;
+                let laid = lay_out(plan, &descriptors).expect("fits").total;
+                (name, own, laid)
+            })
+            .collect();
+        let got: Vec<(&str, u64, u64)> =
+            totals.iter().map(|(n, a, b)| (n.as_str(), *a, *b)).collect();
+        assert_eq!(got, STANDARD_SCRATCH);
+        for (name, f32_laid) in STANDARD_F32_LAID {
+            let (_, _, laid) = got.iter().find(|(n, _, _)| n == name).expect("a standard shape");
+            assert!(laid <= f32_laid, "{name}: {laid} bytes laid, {f32_laid} with f32");
+        }
+    }
+
+    /// Each standard decode fire's scratch, its own and as laid, as
+    /// `eta_dsl::sampler` builds it (its vocabulary-sized values bf16, the
+    /// draw a gumbel_argmax, the temperature's reciprocal a value it reads),
+    /// the model's output row read in place by every region that reads it.
+    const STANDARD_SCRATCH: &[(&str, u64, u64)] = &[
+        ("standard greedy", 3_689_472, 1_536),
+        ("standard gumbel-max", 3_690_240, 1_792),
+        ("standard top-p", 5_058_816, 457_728),
+        ("standard top-k + top-p", 5_363_456, 990_720),
+        ("standard penalized greedy", 9_465_856, 1_826_304),
+        ("standard penalized gumbel-max", 9_466_624, 1_826_816),
+        ("standard penalized top-p", 10_835_200, 1_977_088),
+        ("standard penalized top-k + top-p", 11_139_840, 2_511_360),
+        ("standard greedy + top logprobs", 4_910_592, 724_992),
+        ("standard gumbel-max + top logprobs", 4_911_360, 725_504),
+        ("standard top-p + top logprobs", 5_975_552, 1_142_016),
+        ("standard top-k + top-p + top logprobs", 6_280_192, 1_294_592),
+        ("standard penalized greedy + top logprobs", 10_686_976, 2_549_760),
+        ("standard penalized gumbel-max + top logprobs", 10_687_744, 2_550_272),
+        ("standard penalized top-p + top logprobs", 12_056_320, 2_509_824),
+        ("standard penalized top-k + top-p + top logprobs", 12_360_960, 3_156_480),
+    ];
+
+    /// What each laid out with f32 intermediates and the output row copied
+    /// into scratch (top-p on the f32 lane sampler): no fire lays out more,
+    /// whichever dtype the sampler's intermediates take.
+    const STANDARD_F32_LAID: &[(&str, u64)] = &[
+        ("standard greedy", 1_536),
+        ("standard gumbel-max", 1_792),
+        ("standard top-p", 1_368_832),
+        ("standard top-k + top-p", 2_813_440),
+        ("standard greedy + top logprobs", 1_901_312),
+        ("standard penalized top-p", 2_585_600),
+    ];
 
     /// No generated kernel of the programs inferlets ship names the bytes
     /// of a value its stage states to take none (a generated kernel

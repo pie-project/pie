@@ -1171,6 +1171,17 @@ impl Layout {
         }
     }
 
+    /// Every state shape the load lays (weights excepted): the kv list,
+    /// the window lists, the rs list, the record, the guests'.
+    pub fn state_shapes(&self) -> impl Iterator<Item = &SlotShape> {
+        self.list
+            .iter()
+            .chain(&self.windows)
+            .chain(self.rs.as_ref().map(|rs| &rs.slot))
+            .chain(self.fixed.as_ref().map(|fixed| &fixed.slot))
+            .chain([&self.instance, &self.channel])
+    }
+
     /// The guest shape of `role`; `None` for a role that is not a guest's.
     #[must_use]
     pub fn guest(&self, role: engine::chunk::SlotRole) -> Option<GuestShape> {

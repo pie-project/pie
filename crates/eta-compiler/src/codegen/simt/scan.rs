@@ -29,6 +29,8 @@ const BODY: &str = r#"
   const M1ValueDesc scan_desc = descriptors[kInput];
   const m1_u8* scan_input = scratch + offsets[kInput];
   m1_u8* scan_output = scratch + offsets[kOutput];
+  // A bf16 scan's prefixes: the f32 running value, each rounded once.
+  const m1_u32 scan_output_dtype = descriptors[kOutput].dtype;
   const m1_u32 scan_len = scan_desc.last;
   const m1_u32 scan_rows = scan_desc.rows;
 
@@ -55,7 +57,7 @@ const BODY: &str = r#"
         const float value = m1_load_f(scan_input, index, scan_desc.dtype);
         accumulated_f = kIsSum ? accumulated_f + value
                                : accumulated_f * value;
-        m1_store_f(scan_output, index, accumulated_f);
+        m1_store_fd(scan_output, index, accumulated_f, scan_output_dtype);
       }
     }
   }

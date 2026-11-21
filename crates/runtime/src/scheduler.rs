@@ -274,24 +274,24 @@ pub(crate) async fn host_kv_layout(engine_id: usize) -> Option<state::PageLayout
 
 /// The groups the engine reads a tapped page's planes out in, as spans of a
 /// host slot; `None` where it taps nothing. Once asked, known.
-pub(crate) async fn tap_groups(engine_id: usize) -> Option<::engine::TapGroups> {
+pub(crate) async fn tap_groups(engine_id: usize) -> Result<Option<::engine::TapGroups>> {
     type Known = Option<Option<::engine::TapGroups>>;
     static GROUPS: std::sync::Mutex<Vec<Known>> = std::sync::Mutex::new(Vec::new());
     if let Some(Some(known)) = GROUPS.lock().unwrap().get(engine_id) {
-        return known.clone();
+        return Ok(known.clone());
     }
-    let bytes = scheduler_handle(engine_id)
-        .ok()?
+    let bytes = scheduler_handle(engine_id)?
         .host_kv(worker::HostKvOp::TapGroups)
         .await
-        .ok()?;
-    let groups: Option<::engine::TapGroups> = serde_json::from_slice(&bytes).ok().flatten();
+        .map_err(|error| anyhow!("engine {engine_id}'s tap groups: {error}"))?;
+    let groups: Option<::engine::TapGroups> = serde_json::from_slice(&bytes)
+        .map_err(|error| anyhow!("engine {engine_id}'s tap groups did not parse: {error}"))?;
     let mut known = GROUPS.lock().unwrap();
     if known.len() <= engine_id {
         known.resize(engine_id + 1, None);
     }
     known[engine_id] = Some(groups.clone());
-    groups
+    Ok(groups)
 }
 
 pub fn configured_submit_deadline() -> Duration {
@@ -332,8 +332,28 @@ pub fn configured_submit_depth() -> usize {
     ::engine::runahead::Runahead::unstaged(
         u8::try_from(configured_dispatch_depth()).unwrap_or(u8::MAX),
     )
-    .submit_depth()
+    .submit_depth(host_cover())
 }
+
+/// The frames a lane's guest turnaround hides behind past the ones in
+/// flight, as measured at load: the turnaround (a frame's landing to the
+/// lane's next submit) over one frame's device time, rounded up, on a warm
+/// run of the standard sampler before ready (`bootstrap`). The frame seal
+/// waits for every lane, so too little cover idles the device: at one frame
+/// of cover, 256 requests of 1024 in / 256 out on Gemma-4-31B held 378 of
+/// 525 seals with the device idle; at three, 17. 0 until measured (the
+/// prewarm's registrations compile the same code at any capacity, and the
+/// warm run itself runs at depth 1).
+pub fn host_cover() -> usize {
+    HOST_COVER.load(Ordering::Relaxed)
+}
+
+/// Sets the measured cover (bootstrap, before ready).
+pub fn set_host_cover(cover: usize) {
+    HOST_COVER.store(cover, Ordering::Relaxed);
+}
+
+static HOST_COVER: AtomicUsize = AtomicUsize::new(0);
 
 pub fn set_dispatch_depth(depth: usize) {
     frame::set_dispatch_depth(depth);
@@ -346,6 +366,11 @@ pub fn configured_dispatch_depth() -> usize {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReconfigureRefused {
     Busy(usize),
+    /// A frame size past the load's (its run-ahead window was laid for it).
+    PastCeiling {
+        asked: usize,
+        ceiling: usize,
+    },
 }
 
 impl std::fmt::Display for ReconfigureRefused {
@@ -356,34 +381,65 @@ impl std::fmt::Display for ReconfigureRefused {
                 "{n} process(es) still live; these knobs can only change while \
                  the runtime is idle"
             ),
+            Self::PastCeiling { asked, ceiling } => write!(
+                f,
+                "a frame size of {asked} is past the load's {ceiling}, which its \
+                 run-ahead window was laid for; load at the larger frame size"
+            ),
         }
     }
 }
 
 impl std::error::Error for ReconfigureRefused {}
 
-pub fn reconfigure(frame_size: usize, dispatch_depth: usize) -> Result<(), ReconfigureRefused> {
+/// Sets the frame size while the runtime is idle. The dispatch depth is
+/// the engines' stated frames in flight
+/// ([`::engine::Capabilities::frames_in_flight`]) and changes only with a
+/// load: a sweep over it reloads the engine at each depth.
+pub fn reconfigure(frame_size: usize) -> Result<(), ReconfigureRefused> {
     let live = crate::inferlet::process::live_count();
     if live > 0 {
         return Err(ReconfigureRefused::Busy(live));
     }
+    let ceiling = frame_ceiling();
+    if frame_size > ceiling {
+        return Err(ReconfigureRefused::PastCeiling {
+            asked: frame_size,
+            ceiling,
+        });
+    }
     set_frame_size(frame_size);
-    set_dispatch_depth(dispatch_depth);
     Ok(())
 }
+
+/// The load's largest frame size: the frame size it boots at, which its
+/// run-ahead window is laid for; a reconfigure stays at or under it.
+pub fn frame_ceiling() -> usize {
+    match FRAME_CEILING.load(Ordering::Relaxed) {
+        0 => configured_frame_size(),
+        k => k,
+    }
+}
+
+/// Sets the load's largest frame size (bootstrap, before any program).
+pub fn set_frame_ceiling(frame_size: usize) {
+    FRAME_CEILING.store(frame_size, Ordering::Relaxed);
+}
+
+static FRAME_CEILING: AtomicUsize = AtomicUsize::new(0);
 
 pub fn channel_capacity() -> usize {
     ::engine::runahead::Runahead::unstaged(
         u8::try_from(configured_dispatch_depth()).unwrap_or(u8::MAX),
     )
-    .channel_capacity(configured_frame_size())
+    .channel_capacity(host_cover(), configured_frame_size())
 }
 
 pub fn run_ahead_window() -> usize {
     ::engine::runahead::Runahead::unstaged(
         u8::try_from(configured_dispatch_depth()).unwrap_or(u8::MAX),
     )
-    .submit_depth()
+    .submit_depth(host_cover())
         * configured_frame_size()
 }
 

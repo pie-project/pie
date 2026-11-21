@@ -379,7 +379,7 @@ impl Sink<'_> {
                             let staged_len = bytes.len() as u64;
                             let (chunk, slot) = self
                                 .frame
-                                .scratch_slot(staged_len)
+                                .scratch_slot_queued(staged_len)
                                 .map_err(|fault| Sink::refuse(fire, fault))?;
                             core.queue.write_buffer(&chunk, slot, &bytes);
                             scratch_views += 1;

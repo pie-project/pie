@@ -46,7 +46,7 @@ pub fn rated(profiles: &Path, say: &mut dyn FnMut(&str)) -> Result<engine::rates
     let measured = crate::rates::measure_saying(
         &device,
         &tuning,
-        crate::rates::STATED_SUBMIT_BOUND,
+        crate::rates::stated_submit_bound(),
         &profile::fire::Rates::default(),
         say,
     )

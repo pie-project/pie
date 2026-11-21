@@ -57,7 +57,7 @@ __device__ __forceinline__ void ptir_parallel_copy(
     m1_u32 len,
     m1_u32 dtype) {
   if (input == output) return;
-  const m1_u32 bytes = dtype == 3u ? len : len * 4u;
+  const m1_u32 bytes = len * m1_elem_bytes(dtype);
   // Sixteen bytes a thread where both ends allow it (a vocabulary-wide
   // value moved a byte a thread is a block's whole pass), the tail bytewise.
   m1_u32 head = 0u;
@@ -174,28 +174,30 @@ __device__ __forceinline__ void ptir_parallel_elementwise(
     const m1_u32 yindex = m1_pick(d1.len, i);
     if (tag == 0x01u || tag == 0x02u || tag == 0x04u) {
       const float value = m1_load_f(a0, xindex, d0.dtype);
-      m1_store_f(
+      m1_store_fd(
           o0,
           i,
           tag == 0x01u
               ? expf(value)
-              : (tag == 0x02u ? logf(value) : 1.0f / value));
+              : (tag == 0x02u ? logf(value) : 1.0f / value),
+          out.dtype);
       continue;
     }
     if (tag >= 0x08u && tag <= 0x0bu) {
       const float value = m1_load_f(a0, xindex, d0.dtype);
-      m1_store_f(
+      m1_store_fd(
           o0,
           i,
           tag == 0x08u
               ? sinf(value)
               : (tag == 0x09u
                      ? cosf(value)
-                     : (tag == 0x0au ? sqrtf(value) : 1.0f / sqrtf(value))));
+                     : (tag == 0x0au ? sqrtf(value) : 1.0f / sqrtf(value))),
+          out.dtype);
       continue;
     }
     if (tag == 0x03u || tag == 0x05u || tag == 0x06u) {
-      if (d0.dtype == 0u) {
+      if (m1_is_float(d0.dtype)) {
         const float value = m1_load_f(a0, xindex, d0.dtype);
         const float result =
             tag == 0x03u
@@ -205,7 +207,7 @@ __device__ __forceinline__ void ptir_parallel_elementwise(
                        : (value > 0.0f
                               ? 1.0f
                               : (value < 0.0f ? -1.0f : 0.0f)));
-        m1_store_f(o0, i, result);
+        m1_store_fd(o0, i, result, out.dtype);
       } else if (d0.dtype == 1u) {
         const int value = m1_load_i(a0, xindex, d0.dtype);
         int result = value;
@@ -231,8 +233,8 @@ __device__ __forceinline__ void ptir_parallel_elementwise(
       continue;
     }
     if (tag == 0x07u) {
-      if (out.dtype == 0u)
-        m1_store_f(o0, i, m1_load_f(a0, xindex, d0.dtype));
+      if (m1_is_float(out.dtype))
+        m1_store_fd(o0, i, m1_load_f(a0, xindex, d0.dtype), out.dtype);
       else if (out.dtype == 1u)
         m1_store_i(o0, i, m1_load_i(a0, xindex, d0.dtype));
       else if (out.dtype == 2u)
@@ -248,7 +250,7 @@ __device__ __forceinline__ void ptir_parallel_elementwise(
           const bool left = m1_load_b(a0, xindex, d0.dtype);
           const bool right = m1_load_b(a1, yindex, d1.dtype);
           result = tag == 0x1cu ? left && right : left || right;
-        } else if (d0.dtype == 0u) {
+        } else if (m1_is_float(d0.dtype) || m1_is_float(d1.dtype)) {
           const float left = m1_load_f(a0, xindex, d0.dtype);
           const float right = m1_load_f(a1, yindex, d1.dtype);
           if (tag == 0x16u) result = left > right;
@@ -277,7 +279,7 @@ __device__ __forceinline__ void ptir_parallel_elementwise(
           else result = left <= right;
         }
         m1_store_b(o0, i, result);
-      } else if (d0.dtype == 0u) {
+      } else if (m1_is_float(out.dtype)) {
         const float left = m1_load_f(a0, xindex, d0.dtype);
         const float right = m1_load_f(a1, yindex, d1.dtype);
         float result = 0.0f;
@@ -288,7 +290,7 @@ __device__ __forceinline__ void ptir_parallel_elementwise(
         else if (tag == 0x14u) result = m1_element_max(left, right);
         else if (tag == 0x15u) result = m1_element_min(left, right);
         else result = fmodf(left, right);
-        m1_store_f(o0, i, result);
+        m1_store_fd(o0, i, result, out.dtype);
       } else if (d0.dtype == 1u) {
         const int left = m1_load_i(a0, xindex, d0.dtype);
         const int right = m1_load_i(a1, yindex, d1.dtype);
@@ -326,13 +328,14 @@ __device__ __forceinline__ void ptir_parallel_elementwise(
       const bool condition = m1_load_b(a0, xindex, d0.dtype);
       const m1_u32 left_index = m1_pick(d1.len, i);
       const m1_u32 right_index = m1_pick(d2.len, i);
-      if (out.dtype == 0u)
-        m1_store_f(
+      if (m1_is_float(out.dtype))
+        m1_store_fd(
             o0,
             i,
             condition
                 ? m1_load_f(a1, left_index, d1.dtype)
-                : m1_load_f(a2, right_index, d2.dtype));
+                : m1_load_f(a2, right_index, d2.dtype),
+            out.dtype);
       else if (out.dtype == 1u)
         m1_store_i(
             o0,
@@ -366,12 +369,13 @@ __device__ __forceinline__ void ptir_parallel_elementwise(
       const m1_u32 word = column >> 5;
       const m1_u32 mask =
           word < d1.len ? m1_load_u(a1, word, d1.dtype) : 0u;
-      m1_store_f(
+      m1_store_fd(
           o0,
           i,
           ((mask >> (column & 31u)) & 1u) != 0u
               ? m1_load_f(a0, i, d0.dtype)
-              : m1_neg_inf());
+              : m1_neg_inf(),
+          out.dtype);
       continue;
     }
     if (tag == 0x66u || tag == 0x67u || tag == 0x68u) {
@@ -409,7 +413,10 @@ __device__ __forceinline__ void ptir_copy_element(
     m1_u32 source,
     m1_u32 destination,
     m1_u32 dtype) {
-  if (dtype == 0u)
+  if (dtype == M1_DT_BF16)
+    reinterpret_cast<m1_u16*>(output)[destination] =
+        reinterpret_cast<const m1_u16*>(input)[source];
+  else if (dtype == 0u)
     m1_store_f(output, destination, m1_load_f(input, source, dtype));
   else if (dtype == 1u)
     m1_store_i(output, destination, m1_load_i(input, source, dtype));
@@ -423,7 +430,9 @@ __device__ __forceinline__ void ptir_zero_element(
     m1_u8* output,
     m1_u32 destination,
     m1_u32 dtype) {
-  if (dtype == 0u)
+  if (dtype == M1_DT_BF16)
+    reinterpret_cast<m1_u16*>(output)[destination] = 0u;
+  else if (dtype == 0u)
     m1_store_f(output, destination, 0.0f);
   else if (dtype == 1u)
     m1_store_i(output, destination, 0);
@@ -443,6 +452,19 @@ __device__ __forceinline__ void ptir_parallel_broadcast(
     if (output_desc.dtype == 3u) {
       const m1_u8 v = input[0] != 0u ? 1u : 0u;
       for (m1_u32 i = threadIdx.x; i < output_desc.len; i += blockDim.x) output[i] = v;
+    } else if (output_desc.dtype == M1_DT_BF16) {
+      const m1_u16 h = reinterpret_cast<const m1_u16*>(input)[0];
+      m1_u16* out = reinterpret_cast<m1_u16*>(output);
+      m1_u32 head = 0u;
+      if ((reinterpret_cast<m1_u64>(output) & 3ull) == 0ull) {
+        // Two elements a word on a word boundary.
+        const m1_u32 v = (m1_u32)h | ((m1_u32)h << 16);
+        const m1_u32 words = output_desc.len >> 1;
+        for (m1_u32 w = threadIdx.x; w < words; w += blockDim.x)
+          reinterpret_cast<m1_u32*>(output)[w] = v;
+        head = words << 1;
+      }
+      for (m1_u32 i = head + threadIdx.x; i < output_desc.len; i += blockDim.x) out[i] = h;
     } else {
       const m1_u32 v = reinterpret_cast<const m1_u32*>(input)[0];
       m1_u32* out = reinterpret_cast<m1_u32*>(output);
@@ -558,7 +580,7 @@ __device__ __forceinline__ void ptir_parallel_gather(
     rest = rows == 0u ? 1u : input_desc.len / rows;
   }
   if (rest >= blockDim.x) {
-    const m1_u64 elem = output_desc.dtype == 3u ? 1ull : 4ull;
+    const m1_u64 elem = m1_elem_bytes(output_desc.dtype);
     for (m1_u32 k = 0u; k < index_desc.len; ++k) {
       const long long row =
           m1_load_index(indices, k, index_desc.dtype);
@@ -720,6 +742,32 @@ __device__ __forceinline__ void m1_cut_scan_range(
     }
     for (m1_u32 i = (whole << 2) + threadIdx.x; i < len; i += stride)
       body(lo + i, row[i]);
+    return;
+  }
+  const m1_u8* half_row = input + ((m1_u64)base + lo) * 2ull;
+  if (dtype == M1_DT_BF16 && (reinterpret_cast<m1_u64>(half_row) & 7ull) == 0ull) {
+    // A bf16 row on an 8-byte boundary: four elements a load, two loads in
+    // flight a thread.
+    const m1_u32 whole = len >> 2;
+    for (m1_u32 at = threadIdx.x; at < whole; at += 2u * stride) {
+      const bool second = at + stride < whole;
+      const float4 a = m1_load4_h(half_row, at);
+      const float4 b = second ? m1_load4_h(half_row, at + stride) : a;
+      const m1_u32 i = lo + (at << 2);
+      body(i, a.x);
+      body(i + 1u, a.y);
+      body(i + 2u, a.z);
+      body(i + 3u, a.w);
+      if (second) {
+        const m1_u32 j = lo + ((at + stride) << 2);
+        body(j, b.x);
+        body(j + 1u, b.y);
+        body(j + 2u, b.z);
+        body(j + 3u, b.w);
+      }
+    }
+    for (m1_u32 i = (whole << 2) + threadIdx.x; i < len; i += stride)
+      body(lo + i, m1_load_h(half_row, i));
     return;
   }
   for (m1_u32 at = threadIdx.x; at < len; at += 8u * stride) {
@@ -1694,6 +1742,11 @@ __device__ __forceinline__ void ptir_scatter_updates(
   }
   const bool scalar =
       update_desc.len == 1u && index_desc.len * rest != 1u;
+  if (base_desc.dtype == M1_DT_BF16) {
+    m1_scatter_bf16(tag == 0x62u, indices, updates, output, index_desc.len,
+                    index_desc.dtype, update_desc.dtype, rows, rest, scalar);
+    return;
+  }
   for (m1_u32 k = 0; k < index_desc.len; ++k) {
     const long long row =
         m1_load_index(indices, k, index_desc.dtype);
@@ -1810,6 +1863,33 @@ __device__ __forceinline__ void ptir_parallel_reduce_f32(
   float* work_b = work_a + (input_desc.last + 31u) / 32u;
   const float* values = reinterpret_cast<const float*>(input);
   float* result = reinterpret_cast<float*>(output);
+  if (input_desc.dtype == M1_DT_BF16) {
+    // A bf16 row: its first level folds the widened elements as they load,
+    // the levels above in f32 as for an f32 row (`ptir_canonical_reduce`).
+    const m1_u32 lane = threadIdx.x & 31u;
+    const m1_u32 warp = threadIdx.x >> 5u;
+    const m1_u32 warps = blockDim.x >> 5u;
+    const m1_u32 count = input_desc.last;
+    for (m1_u32 row = 0; row < input_desc.rows; ++row) {
+      const m1_u32 base = row * count;
+      float answer = m1_reduce_identity(tag);
+      if (count == 1u) {
+        answer = m1_load_h(input, base);
+      } else if (count > 1u) {
+        const m1_u32 chunks = (count + 31u) / 32u;
+        for (m1_u32 chunk = warp; chunk < chunks; chunk += warps) {
+          const m1_u32 index = chunk * 32u + lane;
+          const float value = m1_reduce_chunk(
+              tag, index < count ? m1_load_h(input, base + index) : m1_reduce_identity(tag));
+          if (lane == 0u) work_a[chunk] = value;
+        }
+        __syncthreads();
+        answer = ptir_canonical_reduce(tag, work_a, chunks, work_b, work_a);
+      }
+      if (threadIdx.x == 0u) result[row] = answer;
+    }
+    return;
+  }
   for (m1_u32 row = 0; row < input_desc.rows; ++row) {
     const float answer = ptir_canonical_reduce(
         tag, values + row * input_desc.last, input_desc.last, work_a, work_b);
@@ -1856,14 +1936,13 @@ __device__ __forceinline__ void ptir_fast_argmax(
   const m1_u32 warps = blockDim.x >> 5u;
   for (m1_u32 row = 0; row < input_desc.rows; ++row) {
     const m1_u32 base = row * input_desc.last;
-    if (input_desc.dtype == 0u) {
+    if (m1_is_float(input_desc.dtype)) {
       M1ArgmaxCandidate candidate{
           m1_neg_inf(), 0u, 0u, 0u};
       for (m1_u32 index = threadIdx.x;
            index < input_desc.last;
            index += blockDim.x) {
-        const float value =
-            reinterpret_cast<const float*>(input)[base + index];
+        const float value = m1_load_f(input, base + index, input_desc.dtype);
         const M1ArgmaxCandidate next{
             value, index, m1_isnan(value) ? 0u : 1u, 0u};
         candidate = m1_argmax_combine(candidate, next);
@@ -1901,6 +1980,64 @@ __device__ __forceinline__ void ptir_fast_argmax(
               ? int_candidates[lane]
               : M1IntArgmaxCandidate{0ll, 0u, 0u};
       candidate = m1_int_argmax_warp_reduce(candidate, lane);
+      if (lane == 0u) result[row] = (int)candidate.index;
+    }
+    __syncthreads();
+  }
+}
+
+// gumbel_argmax (tag 0x34): lane `i` of a row is `logits[i] * scale +
+// gumbel(state, i)`, -inf where `keep` is false, made in f32 with the f32
+// operations of `reduce_argmax(select(keep, logits * scale, -inf) +
+// rng_keyed(state))` (a multiply, correctly rounded; no divide) and never
+// stored (eta_ir::types: a draw is never a bf16
+// row). The noise is lane `noise_index` of the keyed draw.
+__device__ __forceinline__ float ptir_gumbel_lane(
+    const m1_u8* logits, m1_u32 logits_dtype, const m1_u8* keep,
+    const M1ValueDesc& keep_desc, float scale, m1_u64 seed, m1_u32 at,
+    m1_u32 noise_index) {
+  if (!m1_load_b(keep, m1_pick(keep_desc.len, at), keep_desc.dtype)) return m1_neg_inf();
+  const float uniform = ptir_rng_hash_uniform(seed, noise_index);
+  const float noise = -logf(-logf(uniform));
+  return m1_load_f(logits, at, logits_dtype) * scale + noise;
+}
+
+// Each row's gumbel_argmax, one block over the row: the index of its largest
+// lane, ties to the least index, NaN never (as `reduce_argmax`).
+__device__ __forceinline__ void ptir_gumbel_argmax(
+    const m1_u8* logits,
+    const m1_u8* keep,
+    const m1_u8* divisor,
+    const m1_u8* state,
+    m1_u8* output,
+    const M1ValueDesc logits_desc,
+    const M1ValueDesc keep_desc,
+    const M1ValueDesc divisor_desc,
+    const M1ValueDesc state_desc,
+    m1_u32 noise_base) {
+  __shared__ M1ArgmaxCandidate candidates[32];
+  int* result = reinterpret_cast<int*>(output);
+  const m1_u32 lane = threadIdx.x & 31u;
+  const m1_u32 warp = threadIdx.x >> 5u;
+  const m1_u32 warps = blockDim.x >> 5u;
+  const m1_u64 seed = ptir_rng_state_seed(state, state_desc);
+  const float scale = m1_load_f(divisor, 0u, divisor_desc.dtype);
+  for (m1_u32 row = 0; row < logits_desc.rows; ++row) {
+    const m1_u32 base = row * logits_desc.last;
+    M1ArgmaxCandidate candidate{m1_neg_inf(), 0u, 0u, 0u};
+    for (m1_u32 index = threadIdx.x; index < logits_desc.last; index += blockDim.x) {
+      const float value = ptir_gumbel_lane(
+          logits, logits_desc.dtype, keep, keep_desc, scale, seed, base + index,
+          noise_base + base + index);
+      const M1ArgmaxCandidate next{value, index, m1_isnan(value) ? 0u : 1u, 0u};
+      candidate = m1_argmax_combine(candidate, next);
+    }
+    candidate = m1_argmax_warp_reduce(candidate, lane);
+    if (lane == 0u) candidates[warp] = candidate;
+    __syncthreads();
+    if (warp == 0u) {
+      candidate = lane < warps ? candidates[lane] : M1ArgmaxCandidate{m1_neg_inf(), 0u, 0u, 0u};
+      candidate = m1_argmax_warp_reduce(candidate, lane);
       if (lane == 0u) result[row] = (int)candidate.index;
     }
     __syncthreads();
@@ -2031,7 +2168,16 @@ __device__ __forceinline__ void ptir_fast_gumbel_argmax_intrinsic(
     const M1ValueDesc state_desc,
     const m1_u8* divisor,
     const M1ValueDesc divisor_desc,
-    m1_u32 noise_base) {
+    m1_u32 noise_base,
+    m1_u32 rounding) {
+  // Where the op-by-op chain stores bf16 (the cast logits 1, the scaled
+  // logits 2, the perturbed row 4), the draw rounds there once; else every
+  // step is f32.
+  const bool round_logits = (rounding & 1u) != 0u;
+  const bool round_scaled = (rounding & 2u) != 0u;
+  const bool round_perturbed = (rounding & 4u) != 0u;
+  // A gumbel_argmax's scale multiplies (8); a chain's divisor divides.
+  const bool multiplies = (rounding & 8u) != 0u;
   __shared__ M1ArgmaxCandidate candidates[32];
   int* result = reinterpret_cast<int*>(output);
   const m1_u32 lane = threadIdx.x & 31u;
@@ -2058,9 +2204,11 @@ __device__ __forceinline__ void ptir_fast_gumbel_argmax_intrinsic(
       for (m1_u32 k = 0; k < 8u; ++k) {
         const m1_u32 index = v * 8u + k;
         float value = __uint_as_float((words[k >> 1] >> ((k & 1u) * 16u)) << 16);
-        if (scaled) value = value / divide_by;
+        if (scaled) value = multiplies ? value * divide_by : value / divide_by;
+        if (round_scaled) value = m1_round_bf16(value);
         const float uniform = ptir_rng_hash_uniform(seed, element_base + index);
         value = value + (-logf(-logf(uniform)));
+        if (round_perturbed) value = m1_round_bf16(value);
         const M1ArgmaxCandidate next{value, index, m1_isnan(value) ? 0u : 1u, 0u};
         candidate = m1_argmax_combine(candidate, next);
       }
@@ -2069,9 +2217,12 @@ __device__ __forceinline__ void ptir_fast_gumbel_argmax_intrinsic(
          index < last;
          index += blockDim.x) {
       float value = m1_intrinsic_column_load(row_base, index, mode);
-      if (scaled) value = value / divide_by;
+      if (round_logits) value = m1_round_bf16(value);
+      if (scaled) value = multiplies ? value * divide_by : value / divide_by;
+      if (round_scaled) value = m1_round_bf16(value);
       const float uniform = ptir_rng_hash_uniform(seed, element_base + index);
       value = value + (-logf(-logf(uniform)));
+      if (round_perturbed) value = m1_round_bf16(value);
       const M1ArgmaxCandidate next{value, index, m1_isnan(value) ? 0u : 1u, 0u};
       candidate = m1_argmax_combine(candidate, next);
     }
