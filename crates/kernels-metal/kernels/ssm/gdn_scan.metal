@@ -1142,11 +1142,16 @@ template <typename T, int SG, int VROWS>
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) {
-      for (int j = 0; j < rows; ++j) {
-        run += glog_c[j];
-        weight_c[j] = metal::exp(total - run);
+    // The chunk's weights in parallel, a row a lane of the first
+    // simdgroup: each row's prefix of log-gates within the chunk on the
+    // run before it, the run moved on by the chunk's sum.
+    if (sg_u == 0) {
+      const float g = lane < rows ? glog_c[lane] : 0.0f;
+      const float prefix = metal::simd_prefix_inclusive_sum(g);
+      if (lane < rows) {
+        weight_c[lane] = metal::exp(total - (run + prefix));
       }
+      run += metal::simd_sum(g);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (int j = 0; j < rows; ++j) {
