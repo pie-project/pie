@@ -16,7 +16,7 @@ use crate::serve::GuestRing;
 use engine_gpu::backend::Buffer as _;
 use engine_gpu::guest::claims::{Claims, Run};
 use engine_gpu::guest::held::{self, TableLayout, consecutive};
-use engine_gpu::guest::ring::{Berth, PassLayout, pass_bytes};
+use engine_gpu::guest::ring::{Berth, PassLayout};
 use engine_gpu::guest::session::{
     Bases, HEAP_BINDING, STATUS_BINDING, STATUS_SPAN, STEP_BINDING, StageTables, TABLES_BINDING,
     run_bases, stage_tables, step_groups, step_records, step_stride,
@@ -361,7 +361,7 @@ impl std::fmt::Debug for Pass {
 impl Pass {
     /// The fault code the landed pass's status holds, if it faulted.
     pub fn status(&self) -> Result<Option<u32>> {
-        let at = self.layout.status.ok_or_else(|| Fault::Program {
+        let at = self.layout.status_at().ok_or_else(|| Fault::Program {
             at: "guest::session",
             why: "a pass's status was read before it was copied back".into(),
         })?;
@@ -1001,23 +1001,29 @@ impl Session {
         self.heap_at(stage).ok()
     }
 
-    /// A pass of stage `stage` that stages the host-held roots `staged` and
-    /// reads back `read` (values of the stage): a berth of the guest ring
-    /// for them and its status, taken now and given back as the pass drops.
-    pub fn pass(&self, stage: usize, staged: &[u32], read: &[u32]) -> Result<Pass> {
-        let bytes = |value: &u32| {
-            self.span(stage, *value)
-                .map(|(_, bytes)| bytes)
-                .ok_or_else(|| Fault::Program {
-                    at: "guest::session",
-                    why: format!("value {value} is not stage {stage}'s"),
-                })
-        };
-        let staged = staged.iter().map(bytes).collect::<Result<Vec<u64>>>()?;
-        let read = read.iter().map(bytes).collect::<Result<Vec<u64>>>()?;
+    /// A pass of stage `stage` over its roots `roots` and the values
+    /// `wanted` the host may read back (global ids of `package`): a berth of
+    /// the guest ring of what its layout ([`engine_gpu::guest::ring::pass_layout`],
+    /// the computation the bind sized the stage's most by) lays, taken now
+    /// and given back as the pass drops.
+    pub fn pass(
+        &self,
+        package: &LaunchPackage,
+        stage: usize,
+        roots: &[u32],
+        wanted: &[u32],
+    ) -> Result<Pass> {
+        let layout = engine_gpu::guest::ring::pass_layout(
+            package,
+            stage,
+            roots,
+            wanted,
+            STATUS_SPAN,
+            |value| self.span(stage, value).map(|(_, bytes)| bytes),
+        )?;
         Ok(Pass {
-            berth: self.ring.take(pass_bytes(staged, STATUS_SPAN, read))?,
-            layout: PassLayout::default(),
+            berth: self.ring.take(layout.bytes())?,
+            layout,
         })
     }
 
@@ -1044,18 +1050,17 @@ impl Session {
         }
         // A pass still on the queue may read the heap the copy writes.
         self.settle()?;
-        let at = pass.layout.next(len, pass.berth.bytes())?;
+        let (at, _) = pass.layout.stage(value)?;
         pass.berth
             .buffer()
             .write_shared(pass.berth.at() + at, bytes)?;
-        pass.layout.staged.push((value, at, len));
         Ok(())
     }
 
     /// Copies what `pass` staged into stage `at_stage`'s heap.
     pub fn flush(&mut self, frame: &mut Frame, pass: &Pass, at_stage: usize) -> Result<()> {
         let (heap, base) = self.heap_at(at_stage)?;
-        for &(value, at, len) in &pass.layout.staged {
+        for (value, at, len) in pass.layout.staged() {
             let (into, _) = self.span(at_stage, value).ok_or_else(|| Fault::Program {
                 at: "guest::session",
                 why: format!("value {value} is not stage {at_stage}'s"),
@@ -1074,7 +1079,7 @@ impl Session {
     /// Copies the status word into `pass`'s berth, behind the stage's
     /// dispatch.
     pub fn read_status(&self, frame: &mut Frame, pass: &mut Pass) -> Result<()> {
-        let at = pass.layout.next(STATUS_SPAN, pass.berth.bytes())?;
+        let at = pass.layout.status();
         frame.copy(
             self.status.buffer(),
             self.status.offset(),
@@ -1082,7 +1087,6 @@ impl Session {
             pass.berth.at() + at,
             STATUS_SPAN,
         )?;
-        pass.layout.status = Some(at);
         Ok(())
     }
 
@@ -1100,7 +1104,7 @@ impl Session {
             why: format!("value {value} is not stage {stage}'s"),
         })?;
         let (heap, base) = self.heap_at(stage)?;
-        let at = pass.layout.next(len, pass.berth.bytes())?;
+        let (at, _) = pass.layout.read_back(value)?;
         frame.copy(
             heap,
             base + from,
@@ -1108,7 +1112,6 @@ impl Session {
             pass.berth.at() + at,
             len,
         )?;
-        pass.layout.read.push((value, at, len));
         Ok(())
     }
 
