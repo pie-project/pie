@@ -19,6 +19,10 @@
 //! sequence, so width 1 is greedy decoding of the same prompt to the same
 //! length (the beam identity, checked under `verify` every step against the
 //! raw argmax).
+//!
+//! A fire refused after submit (a never-fits refusal, one through a restore
+//! wait) poisons its pass's host-reader channels: every take, read and host
+//! call here propagates its Err as the process's error, never a trap.
 
 use inferlet::beam::BeamGroup;
 use inferlet::chat;
@@ -270,15 +274,16 @@ async fn main(input: Input) -> Result<String> {
         let ckpt_sync = mode == "ckpt_sync";
         let stop_wait = mode == "stop_wait";
         let mut held_ckpt = if ckpt_sync || stop_wait {
-            ws.fork(&pipeline).ok()
+            Some(ws.fork(&pipeline).context("checkpoint the pool")?)
         } else {
             None
         };
         if ckpt_sync || stop_wait {
             for _ in 0..decodes {
-                if let Ok(c) = ws.fork(&pipeline) {
-                    held_ckpt = Some(c);
-                }
+                held_ckpt = Some(
+                    ws.fork(&pipeline)
+                        .with_context(|| format!("@{step}: checkpoint the pool"))?,
+                );
                 fwd.submit(&pipeline).with_context(|| format!("@{step}"))?;
                 let picked = out
                     .take_host::<Vec<i32>>()
@@ -301,22 +306,20 @@ async fn main(input: Input) -> Result<String> {
                 };
                 if stop_wait || parents.iter().enumerate().any(|(i, &p)| p as usize != i) {
                     if let Some(ref ckpt_ws) = held_ckpt {
-                        if let Ok(restore_ws) = ckpt_ws.fork(&pipeline) {
-                            let toks_r = Channel::from(&picked[..1]);
-                            let ind_r = Channel::from([0u32, 1]);
-                            let out_r = Channel::new([1], dtype::i32);
-                            let fwd_r = ForwardPass::new();
-                            fwd_r.embed(&toks_r, &ind_r)?;
-                            fwd_r.state(&[&restore_ws], StateGeometry::folding())?;
-                            fwd_r.epilogue(move || {
-                                out_r.put(reshape(
-                                    reduce_argmax(intrinsics::output(0, "logits")),
-                                    [1],
-                                ));
-                            });
-                            fwd_r.submit(&pipeline)?;
-                            let _ = out_r.take_host::<Vec<i32>>().await?;
-                        }
+                        let restore_ws = ckpt_ws
+                            .fork(&pipeline)
+                            .with_context(|| format!("@{step}: restore the checkpoint"))?;
+                        let toks_r = Channel::from(&picked[..1]);
+                        let ind_r = Channel::from([0u32, 1]);
+                        let out_r = Channel::new([1], dtype::i32);
+                        let fwd_r = ForwardPass::new();
+                        fwd_r.embed(&toks_r, &ind_r)?;
+                        fwd_r.state(&[&restore_ws], StateGeometry::folding())?;
+                        fwd_r.epilogue(move || {
+                            out_r.put(reshape(reduce_argmax(intrinsics::output(0, "logits")), [1]));
+                        });
+                        fwd_r.submit(&pipeline)?;
+                        let _ = out_r.take_host::<Vec<i32>>().await?;
                     }
                 }
                 greedy_mismatches += picked.iter().zip(&greedy).filter(|(p, g)| p != g).count();
