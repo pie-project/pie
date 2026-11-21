@@ -44,6 +44,14 @@ pub struct FireLimits {
     /// 0: as many as `max_tokens`.
     #[serde(default)]
     pub max_readouts: u32,
+    /// The most buffered recurrent rows one fire's lanes replay, summed over
+    /// every lane, a decode lane's (`lane_carried`'s none) included: what
+    /// the engine's staged replay table holds a fire (0: no bound past each
+    /// lane's rung, [`crate::fire::rung_rows`]). The runtime steps no more
+    /// replayed rows than this together, a fire that would carry more
+    /// going in the steps after.
+    #[serde(default)]
+    pub replayed_rows: u32,
 }
 
 /// What a load states beside its chunk pool ([`ChunkFacts`], which holds
@@ -243,6 +251,7 @@ mod mixed_lanes {
                 prefill_rows: 0,
                 prefill_lanes: 0,
                 max_readouts: 0,
+                replayed_rows: 0,
             },
         )
     }

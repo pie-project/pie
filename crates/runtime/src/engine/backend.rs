@@ -29,6 +29,10 @@ pub struct SchedulerLimits {
     /// (`scheduler::batch::AdmissionLimits`); a float lane's rows are not
     /// held to the store (`FireRequest::sequence_readouts`).
     pub readout_store: usize,
+    /// The most buffered recurrent rows the lanes of one step replay,
+    /// summed ([`::engine::FireLimits::replayed_rows`]; 0: no bound past
+    /// each fire's rung).
+    pub max_replayed_rows: usize,
 }
 
 impl SchedulerLimits {
@@ -291,6 +295,7 @@ mod tests {
             prefill_lanes: 0,
             max_readouts: 0,
             readout_store: 0,
+            max_replayed_rows: 0,
         };
         assert_eq!(smallest_fire(std::iter::empty()), None, "no engine yet");
         assert_eq!(
