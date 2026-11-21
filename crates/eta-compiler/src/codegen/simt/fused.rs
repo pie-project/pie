@@ -738,7 +738,7 @@ pub fn emit_fused_region(
             });
             if reduces {
                 source.push_str(
-                    "  m1_u8* ptir_row_work = scratch + temporary_offset + (m1_u64)(ptir_row * ptir_split) * temporary_stride;\n",
+                    "  m1_u8* ptir_row_work = scratch + temporary_offset + (m1_u64)ptir_row * temporary_stride;\n",
                 );
             }
             source.push_str(
