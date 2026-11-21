@@ -74,7 +74,14 @@
 #endif
 // The state bank (and the rs list), in the chunk pool's segments
 // (`prim/pool.slang`), as words: f32 state and bf16 keys alike.
+// The register forms read a state row as vectors of four words (the pool's
+// segments, the state's origin and its slot stride whole vectors: the host
+// refuses another pool); the others as words.
+#if defined(PIE_DK_REG)
+PIE_POOL_SEGMENTS(RWStructuredBuffer, uint4, SEGMENTS_AT)
+#else
 PIE_POOL_SEGMENTS(RWStructuredBuffer, uint, SEGMENTS_AT)
+#endif
 #define PARAMS_AT (SEGMENTS_AT + 4)
 
 struct Params {
@@ -121,6 +128,16 @@ int csr(uint i) {
     return indptr[uint(params.indptr_at) + i];
 }
 #endif
+#if defined(PIE_DK_REG)
+PIE_POOL_READ(uint4, params.seg_words / 4u)
+// Virtual word `v` of the pool, set.
+void pie_pool_set(uint v, uint x) {
+    uint seg, at;
+    pie_pool_find(v >> 2, seg, at);
+#define GDN_WORD_SET(buf_) buf_[at][v & 3u] = x;
+    PIE_POOL_BRANCH(seg, GDN_WORD_SET)
+}
+#else
 PIE_POOL_READ(uint, params.seg_words)
 PIE_POOL_WRITE(uint, params.seg_words)
 // The state from its origin on, as f32.
@@ -131,6 +148,7 @@ struct rstate_pool_view {
     }
 };
 static rstate_pool_view rstate;
+#endif
 
 PIE_STATE_PIECES
 #if defined(PIE_COMMITTED)
@@ -269,7 +287,8 @@ void land_at(CarryLane cl, int replay, int t, uint tid, uint row, uint hv, uint 
 #endif
 
 #if defined(PIE_DK_REG)
-// A lane's state row lies in one slot, so in one segment: found once.
+// A lane's state row lies in one slot, so in one segment: found once, and
+// read and written four words a vector.
 void reg_load(uint tid, uint base) {
     uint dk = uint(params.k_dim);
     if (tid >= uint(params.v_dim)) {
@@ -279,10 +298,14 @@ void reg_load(uint tid, uint base) {
         return;
     }
     uint seg, at;
-    pie_pool_find(params.state_origin + base + tid * dk, seg, at);
+    pie_pool_find((params.state_origin + base + tid * dk) / 4u, seg, at);
 #define GDN_REG_LOAD(buf_) \
-    [ForceUnroll] for (uint i = 0; i < uint(PIE_DK_REG); i++) { \
-        st[i] = asfloat(buf_[at + i]); \
+    [ForceUnroll] for (uint m = 0; m < uint(PIE_DK_REG) / 4u; m++) { \
+        uint4 v = buf_[at + m]; \
+        st[4u * m] = asfloat(v.x); \
+        st[4u * m + 1u] = asfloat(v.y); \
+        st[4u * m + 2u] = asfloat(v.z); \
+        st[4u * m + 3u] = asfloat(v.w); \
     }
     PIE_POOL_BRANCH(seg, GDN_REG_LOAD)
 }
@@ -291,10 +314,11 @@ void reg_store(uint tid, uint base) {
     uint dk = uint(params.k_dim);
     if (tid < uint(params.v_dim)) {
         uint seg, at;
-        pie_pool_find(params.state_origin + base + tid * dk, seg, at);
+        pie_pool_find((params.state_origin + base + tid * dk) / 4u, seg, at);
 #define GDN_REG_STORE(buf_) \
-        [ForceUnroll] for (uint i = 0; i < uint(PIE_DK_REG); i++) { \
-            buf_[at + i] = asuint(st[i]); \
+        [ForceUnroll] for (uint m = 0; m < uint(PIE_DK_REG) / 4u; m++) { \
+            buf_[at + m] = uint4(asuint(st[4u * m]), asuint(st[4u * m + 1u]), \
+                                 asuint(st[4u * m + 2u]), asuint(st[4u * m + 3u])); \
         }
         PIE_POOL_BRANCH(seg, GDN_REG_STORE)
     }
