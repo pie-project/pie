@@ -258,7 +258,7 @@ impl<B: Backend> Placed<B> {
                         pieces.len()
                     )));
                 };
-                let (buffer, at) = pools.chunk_place(first)?;
+                let (buffer, at) = pools.run_place(first, *run)?;
                 let within = at / layout.chunk_bytes.max(1);
                 if u64::from(*run) * layout.chunk_bytes < self.bytes
                     || within + u64::from(*run) > u64::from(layout.segment_chunks)

@@ -757,6 +757,36 @@ impl<B: Backend> Pools<B> {
     /// (`guest::state`): the segment buffer its physical chunk sits in now
     /// and its offset there, its segment committed. A run of chunks from it
     /// lies at the next physical chunks of the same segment.
+    /// Where a run of `run` chunks from logical chunk `first` lies, refused
+    /// by name unless every chunk of it lies on the physical chunk after
+    /// the one before: a run is addressed from its first chunk, so a run
+    /// a move split would read its later chunks from another owner.
+    pub fn run_place(&self, first: u32, run: u32) -> Result<(&B::Buffer, u64)> {
+        let place = self.chunk_place(first)?;
+        let base = self.pool.physical(first)?;
+        for k in 1..run {
+            let logical = first.checked_add(k).ok_or_else(|| Fault::Ceiling {
+                what: "chunks a guest's state may name (past the null chunk)",
+                need: u64::from(first) + u64::from(k) + 1,
+                have: u64::from(self.layout.total_chunks),
+            })?;
+            let _ = self.chunk_place(logical)?;
+            let physical = self.pool.physical(logical)?;
+            if physical != base + k {
+                return Err(Fault::Program {
+                    at: "store::run_place",
+                    why: format!(
+                    "a run of {run} chunk(s) from logical chunk {first} (physical {base}) is \
+                     split: logical chunk {logical} lies on physical {physical}, not {}; \
+                     refused, not read or written",
+                        base + k
+                    ),
+                });
+            }
+        }
+        Ok(place)
+    }
+
     pub fn chunk_place(&self, chunk: u32) -> Result<(&B::Buffer, u64)> {
         if chunk == 0 || chunk >= self.layout.total_chunks {
             return Err(Fault::Ceiling {
