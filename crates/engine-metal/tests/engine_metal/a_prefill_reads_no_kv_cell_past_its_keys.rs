@@ -8,7 +8,8 @@
 //! one; under `test-slot-fill` the pool's new bytes are NaN, so a read of an
 //! unwritten cell fails here rather than finding a zero. Several lanes of the
 //! same prompt, of lengths off the tile, prefilled in one fire, each read
-//! finite logits, and the same ones.
+//! finite logits, and the same ones: 57 rows end in a tile's second page at
+//! a page of 16 (25 keys held of its 32), past the first.
 
 use engine_metal::serve::Seated;
 use engine_metal::{Boot, Lane, Shell};
@@ -50,7 +51,7 @@ fn a_prefill_reads_no_kv_cell_past_its_keys() {
     for model in ["qwen3-micro-text", "qwen3-micro-text-hd128"] {
         let fixture = fixture_of(model, None);
         for page_size in [16u32, 32] {
-            for (lanes, rows) in [(1u32, 35u32), (4, 35), (4, 33), (2, 47), (8, 35)] {
+            for (lanes, rows) in [(1u32, 35u32), (4, 35), (4, 33), (2, 47), (8, 35), (1, 57), (4, 57)] {
                 let mut shell = load(&fixture, page_size);
                 let prompt: Vec<u32> = (0..rows).map(|t| (t * 7 + 3) % 200).collect();
                 for slot in 0..lanes {
