@@ -295,6 +295,16 @@ impl Kept {
     }
 
     #[must_use]
+    pub fn copies(&self) -> &[[u32; 3]] {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn fixed(&self) -> bool {
+        match self.never {}
+    }
+
+    #[must_use]
     pub fn indirect(&self, _at: usize) -> bool {
         match self.never {}
     }

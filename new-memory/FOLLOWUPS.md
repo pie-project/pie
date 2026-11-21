@@ -842,3 +842,20 @@ naming rung, but the dispatch bound (`Asks::dispatches`, which sizes the
 fire block) is the folding fires'. The copies become one kernel over the
 lane's page table (the rs copy loop in VULKAN-RECORD-AT-LOAD §4), after
 which the buffering fire's count is rung-free and joins the bound.
+
+## F47. Vulkan: a first-seen prefill wider than the GEMV row tile walks once for its fill
+The load records every body (VULKAN-RECORD-AT-LOAD), and a fire of a fixed
+body (decode buckets, fires within the widest vector-GEMM row tile) fills
+from it without a walk (`fill_body`). A prefill wider than the tile runs an
+indirect body: its fire block carries per-dispatch fired values (`m`, `n`,
+`n_rows`, `row0`, `count`, `splits`) and group counts that vary with its rows,
+and the walk is what lays them. So each new row count of such a prefill walks
+once (commands baked and discarded, the body's recording replayed with the
+walk's image). Measured on the L40S (sc/l40s-vkrec-bodykey): over check,
+lanes, mixed, mixsmall and pfsweep, Qwen3-0.6B walked 36 such fills at about
+5 ms of host time each, about 180 ms over the session, once per new prefill
+shape. Two ways out were weighed and set aside: grids sized to the rung's top
+with every kernel reading its live rows from a makeup table (every kernel
+family, and the rung-top grid paid on prefills), or each fired value stated
+symbolically by the dispatch layer and expanded on the device from the
+makeup. Revisit if a first-seen prefill's TTFT shows in a measurement.

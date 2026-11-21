@@ -2862,6 +2862,123 @@ impl<B: Serve> Shell<B> {
         self.fire_seated(&seated)
     }
 
+    /// What a fire reads out: its readout layout, and each source buffer's
+    /// copy into the arm's seat, the regions and the most rows that copy
+    /// moves (a row of each layer read from it for every readout the fire's
+    /// rung holds). A host function of the fire's makeup: a recorded body's
+    /// fill writes them as the walk would.
+    #[allow(clippy::type_complexity)]
+    pub fn readout_copies(
+        &self,
+        prepared: &Prepared<'_, B>,
+    ) -> Result<(Vec<ReadSpan>, Vec<(B::Buffer, Vec<(u64, u64, u64)>, usize)>)> {
+        // Each read plane's buffer (the span's, or a score room's) and every
+        // layer's base in it: every plane the carve lays, read in this fire
+        // or not.
+        let mut bases: Vec<Option<(B::Buffer, Vec<u64>)>> = vec![None; self.readouts.len()];
+        for (at, plane) in self.readouts.iter().enumerate() {
+            let mut layers = Vec::with_capacity(plane.values.len());
+            let mut buffer = None;
+            for value in &plane.values {
+                let Some(rect) = prepared.slots.0[value.0 as usize] else {
+                    buffer = None;
+                    break;
+                };
+                if rect.width != plane.width {
+                    return Err(Fault::Ceiling {
+                        what: "elements in one readout row",
+                        need: u64::from(rect.width),
+                        have: u64::from(plane.width),
+                    });
+                }
+                let row = self.handles.get(rect.buf).ok_or_else(|| Fault::Unbound {
+                    what: format!(
+                        "handle {}, output `{}`'s, which this load minted no row for",
+                        rect.buf, plane.output
+                    ),
+                })?;
+                layers.push(row.offset());
+                buffer.get_or_insert_with(|| row.buffer().clone());
+            }
+            bases[at] = buffer.map(|buffer| (buffer, layers));
+        }
+
+        // Every read lands in the arm's seat by one copy of all its regions
+        // a source buffer: a pair of barriers each, not one a lane.
+        let mut layout = prepared.readout_layout.clone();
+        // Its regions, and the layers of the planes read from it. Every
+        // plane's buffer takes its copy whether or not a lane reads it in
+        // this fire, so a fire's commands are its shape's whatever its lanes
+        // read (the regions are the copy's data).
+        let mut regions: Vec<(B::Buffer, Vec<(u64, u64, u64)>, usize)> = Vec::new();
+        for (from, layers) in bases.iter().flatten() {
+            match (regions.iter_mut()).find(|(buffer, ..)| buffer.slab_id() == from.slab_id()) {
+                Some((_, _, planes)) => *planes += layers.len(),
+                None => regions.push((from.clone(), Vec::new(), layers.len())),
+            }
+        }
+        for span in (layout.iter_mut())
+            .filter(|span| span.rows > 0 && (span.seated || span.spanned))
+        {
+            let plane = &self.readouts[span.plane as usize];
+            let (from, layers) = bases[span.plane as usize]
+                .as_ref()
+                .ok_or_else(|| Fault::Unbound {
+                    what: format!("output `{}`, a read plane of no value", plane.output),
+                })?;
+            let row_bytes = u64::from(plane.width) * elem(plane.dtype);
+            let gathered = self.gathers_readout && plane.seam == Kind::Readout;
+            let (first, direct) = (span.first, span.direct);
+            // A direct span's rows run from `first` (as `span_copies` lays
+            // them); a gathered plane's rows are the table's, in order.
+            let source_row = |k: u32| {
+                let cursor = u64::from(first + k);
+                if gathered || direct {
+                    cursor
+                } else {
+                    u64::try_from(prepared.readout_rows[cursor as usize]).unwrap_or(0)
+                }
+            };
+            if span.spanned {
+                // One run, one layer: its first row's byte in the span, the
+                // buffer a reader of it is offered (`Shell::span_buffer`).
+                if from.slab_id() != self.span.buffer()?.slab_id() {
+                    return Err(Fault::Unbound {
+                        what: format!(
+                            "output `{}`, read on the device where it lies, and it lies \
+                             outside the fire's span",
+                            plane.output
+                        ),
+                    });
+                }
+                span.at = layers[0] + source_row(0) * row_bytes;
+                continue;
+            }
+            let copies = span_copies(span, layers, row_bytes, source_row)
+                .into_iter()
+                .map(|copy| (copy.from, copy.to, copy.bytes));
+            if let Some((_, list, _)) =
+                (regions.iter_mut()).find(|(buffer, ..)| buffer.slab_id() == from.slab_id())
+            {
+                list.extend(copies);
+            }
+        }
+        // One copy of all its regions a source buffer, at most a row of each
+        // layer read from it for every readout the fire's rung holds.
+        let readouts = self
+            .span
+            .rungs()
+            .get(prepared.rung)
+            .map_or(0, |rung| rung.tokens as usize);
+        Ok((
+            layout,
+            regions
+                .into_iter()
+                .map(|(from, list, layers)| (from, list, readouts * layers))
+                .collect(),
+        ))
+    }
+
     pub fn fire_seated(&mut self, lanes: &[Seated<'_, B>]) -> Result<Vec<Vec<f32>>> {
         use engine::frame::Shell as FrameShell;
         // A direct fire's seat-addressed lanes read the seats' runs: back
@@ -5447,106 +5564,9 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
         let walked = self.walk_once(&prepared, keep.is_some(), split)?;
         let mut frame = walked.frame.expect("the walk opened a frame");
 
-        // Each read plane's buffer (the span's, or a score room's) and every
-        // layer's base in it: every plane the carve lays, read in this fire
-        // or not.
-        let mut bases: Vec<Option<(B::Buffer, Vec<u64>)>> = vec![None; self.readouts.len()];
-        for (at, plane) in self.readouts.iter().enumerate() {
-            let mut layers = Vec::with_capacity(plane.values.len());
-            let mut buffer = None;
-            for value in &plane.values {
-                let Some(rect) = prepared.slots.0[value.0 as usize] else {
-                    buffer = None;
-                    break;
-                };
-                if rect.width != plane.width {
-                    return Err(Fault::Ceiling {
-                        what: "elements in one readout row",
-                        need: u64::from(rect.width),
-                        have: u64::from(plane.width),
-                    });
-                }
-                let row = self.handles.get(rect.buf).ok_or_else(|| Fault::Unbound {
-                    what: format!(
-                        "handle {}, output `{}`'s, which this load minted no row for",
-                        rect.buf, plane.output
-                    ),
-                })?;
-                layers.push(row.offset());
-                buffer.get_or_insert_with(|| row.buffer().clone());
-            }
-            bases[at] = buffer.map(|buffer| (buffer, layers));
-        }
-
-        // Every read lands in the arm's seat by one copy of all its regions
-        // a source buffer: a pair of barriers each, not one a lane.
-        let mut layout = prepared.readout_layout.clone();
-        // Its regions, and the layers of the planes read from it. Every
-        // plane's buffer takes its copy whether or not a lane reads it in
-        // this fire, so a fire's commands are its shape's whatever its lanes
-        // read (the regions are the copy's data).
-        let mut regions: Vec<(B::Buffer, Vec<(u64, u64, u64)>, usize)> = Vec::new();
-        for (from, layers) in bases.iter().flatten() {
-            match (regions.iter_mut()).find(|(buffer, ..)| buffer.slab_id() == from.slab_id()) {
-                Some((_, _, planes)) => *planes += layers.len(),
-                None => regions.push((from.clone(), Vec::new(), layers.len())),
-            }
-        }
-        for span in (layout.iter_mut())
-            .filter(|span| span.rows > 0 && (span.seated || span.spanned))
-        {
-            let plane = &self.readouts[span.plane as usize];
-            let (from, layers) = bases[span.plane as usize]
-                .as_ref()
-                .ok_or_else(|| Fault::Unbound {
-                    what: format!("output `{}`, a read plane of no value", plane.output),
-                })?;
-            let row_bytes = u64::from(plane.width) * elem(plane.dtype);
-            let gathered = self.gathers_readout && plane.seam == Kind::Readout;
-            let (first, direct) = (span.first, span.direct);
-            // A direct span's rows run from `first` (as `span_copies` lays
-            // them); a gathered plane's rows are the table's, in order.
-            let source_row = |k: u32| {
-                let cursor = u64::from(first + k);
-                if gathered || direct {
-                    cursor
-                } else {
-                    u64::try_from(prepared.readout_rows[cursor as usize]).unwrap_or(0)
-                }
-            };
-            if span.spanned {
-                // One run, one layer: its first row's byte in the span, the
-                // buffer a reader of it is offered (`Shell::span_buffer`).
-                if from.slab_id() != self.span.buffer()?.slab_id() {
-                    return Err(Fault::Unbound {
-                        what: format!(
-                            "output `{}`, read on the device where it lies, and it lies \
-                             outside the fire's span",
-                            plane.output
-                        ),
-                    });
-                }
-                span.at = layers[0] + source_row(0) * row_bytes;
-                continue;
-            }
-            let copies = span_copies(span, layers, row_bytes, source_row)
-                .into_iter()
-                .map(|copy| (copy.from, copy.to, copy.bytes));
-            if let Some((_, list, _)) =
-                (regions.iter_mut()).find(|(buffer, ..)| buffer.slab_id() == from.slab_id())
-            {
-                list.extend(copies);
-            }
-        }
-        // One copy of all its regions a source buffer, at most a row of each
-        // layer read from it for every readout the fire's rung holds.
-        let readouts = self
-            .span
-            .rungs()
-            .get(prepared.rung)
-            .map_or(0, |rung| rung.tokens as usize);
-        for (from, list, layers) in &regions {
-            frame.copy_rows(from, &self.readout[prepared.arm], list, readouts * layers)?;
+        let (layout, regions) = self.readout_copies(&prepared)?;
+        for (from, list, most) in &regions {
+            frame.copy_rows(from, &self.readout[prepared.arm], list, *most)?;
         }
 
         self.tally_reads(&layout);

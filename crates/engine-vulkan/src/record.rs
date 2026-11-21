@@ -113,6 +113,20 @@ impl Fill {
     }
 }
 
+/// A fixed body: a family whose commands carry their rows, found by what
+/// a fire binds and launches, not by its makeup ([`Recorder::body`]). Its
+/// image and group counts are any fill's of it; a fire of it whose readout
+/// copies move the regions its recording's do fills without a walk.
+pub(crate) struct Body {
+    pub(crate) family: Key,
+
+    pub(crate) groups: Arc<Vec<[u32; 3]>>,
+
+    pub(crate) image: Arc<Image>,
+
+    pub(crate) launches: u32,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Key(u64);
 
@@ -192,6 +206,9 @@ pub(crate) struct Recorder {
     /// Each fire shape's fill, under the shape's key.
     fills: Held<Fill>,
 
+    /// Each fixed body, under its body key.
+    bodies: HashMap<Key, Body>,
+
     recorded: std::cell::Cell<u64>,
     filled: std::cell::Cell<u64>,
 
@@ -214,6 +231,7 @@ impl Recorder {
             // serves, a fixed set, and none leaves for a later one.
             families: Held::new(usize::MAX),
             fills: Held::new(FILLS_KEPT),
+            bodies: HashMap::new(),
             recorded: std::cell::Cell::new(0),
             filled: std::cell::Cell::new(0),
             clock: std::cell::Cell::new(0),
@@ -282,6 +300,7 @@ impl Recorder {
     pub(crate) fn forget(&mut self) {
         self.families.by_key.clear();
         self.fills.by_key.clear();
+        self.bodies.clear();
     }
 
     /// Makes `recording` its family's, varying in `varying`.
@@ -294,6 +313,14 @@ impl Recorder {
             });
     }
 
+    pub(crate) fn body(&self, key: Key) -> Option<&Body> {
+        self.bodies.get(&key)
+    }
+
+    pub(crate) fn insert_body(&mut self, key: Key, body: Body) {
+        self.bodies.insert(key, body);
+    }
+
     pub(crate) fn insert_fill(&mut self, shape: Key, fill: Fill) {
         self.filled.set(self.filled.get() + 1);
         fill.used.set(self.tick());
@@ -304,4 +331,15 @@ impl Recorder {
     pub(crate) fn counts(&self) -> (u64, u64) {
         (self.recorded.get(), self.filled.get())
     }
+}
+
+/// A readout copy's regions, hashed: what stands for them in a family's
+/// weighing and in a recorded body's fill.
+#[must_use]
+pub fn rows_signature(regions: &[(u64, u64, u64)]) -> [u32; 3] {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    regions.hash(&mut hasher);
+    let h = hasher.finish();
+    [h as u32, (h >> 32) as u32, regions.len() as u32]
 }

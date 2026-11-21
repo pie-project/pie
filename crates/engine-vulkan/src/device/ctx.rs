@@ -1446,6 +1446,7 @@ impl Context {
                     .take()
             },
             groups: std::cell::RefCell::new(Vec::new()),
+            copies: std::cell::RefCell::new(Vec::new()),
             baked: std::cell::RefCell::new(std::collections::hash_map::DefaultHasher::new()),
         })
     }
@@ -1667,6 +1668,9 @@ pub struct Frame {
 
     /// Each dispatch's group counts, in the walk's order.
     groups: std::cell::RefCell<Vec<[u32; 3]>>,
+
+    /// Each readout copy's regions, hashed ([`crate::record::rows_signature`]), in order.
+    copies: std::cell::RefCell<Vec<[u32; 3]>>,
 }
 
 impl Frame {
@@ -2040,6 +2044,7 @@ impl Frame {
         let range = u64::from(limits.max_storage_buffer_range);
         let (src, dst) = (source.slab(), into.slab());
         let (src_range, dst_range) = (src.size.min(range), dst.size.min(range));
+        self.copies.borrow_mut().push(crate::record::rows_signature(regions));
         let words = |n: u64| n.is_multiple_of(4);
         let movable = regions.len() <= most
             && most as u64 <= u64::from(limits.max_compute_work_group_count[1])
@@ -2090,14 +2095,7 @@ impl Frame {
         // family whose shapes move the same regions copies them as carried
         // commands; one whose shapes differ moves them with the copier, from
         // the table.
-        let signature = {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            regions.hash(&mut hasher);
-            let h = hasher.finish();
-            [h as u32, (h >> 32) as u32, regions.len() as u32]
-        };
-        let indirect = self.dispatched(signature);
+        let indirect = self.dispatched(crate::record::rows_signature(regions));
         // The count is read from the fire block alone: the push block
         // carries none of it.
         let pushed = vec![0u8; self.copier.push_bytes as usize];
@@ -2485,6 +2483,7 @@ impl Frame {
             block: std::mem::take(&mut *self.block.borrow_mut()),
             baked: self.baked.borrow().finish(),
             groups: std::mem::take(&mut *self.groups.borrow_mut()),
+            copies: std::mem::take(&mut *self.copies.borrow_mut()),
             indirect: self.indirect.clone(),
             indirect_all: !self.fixed_rows,
         })
@@ -2530,6 +2529,8 @@ pub struct Kept {
 
     groups: Vec<[u32; 3]>,
 
+    copies: Vec<[u32; 3]>,
+
     indirect: Option<Arc<Vec<bool>>>,
 
     /// Every dispatch reads its group counts from the block (a body whose
@@ -2560,6 +2561,19 @@ impl Kept {
     #[must_use]
     pub fn groups(&self) -> &[[u32; 3]] {
         &self.groups
+    }
+
+    /// Each readout copy's regions, hashed, in order ([`crate::record::rows_signature`]).
+    #[must_use]
+    pub fn copies(&self) -> &[[u32; 3]] {
+        &self.copies
+    }
+
+    /// Whether its commands carry their rows: no dispatch reads its group
+    /// counts from the block.
+    #[must_use]
+    pub fn fixed(&self) -> bool {
+        !self.indirect_all && self.indirect.as_ref().is_none_or(|set| !set.iter().any(|&v| v))
     }
 
     /// Whether dispatch `at` of its walk reads its group counts from the
@@ -2969,3 +2983,4 @@ mod tests {
         eprintln!("caller woke {median:?} (median), {worst:?} (worst) after the watcher's landing");
     }
 }
+
