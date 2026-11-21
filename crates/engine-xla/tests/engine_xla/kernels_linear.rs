@@ -456,9 +456,10 @@ fn a_lora_correction_adds_each_rows_own_adapter() {
 #[test]
 fn the_glu_gemm_kernel_answers_the_host() {
     // A GeGLU's gate-up over its `[K, 2·I]` landing and the GLU in one
-    // Mosaic kernel: two 512-wide column blocks of each half; 48 rows as one
-    // block.
-    for (m, k, i) in [(64usize, 256usize, 1024usize), (48, 128, 512)] {
+    // Mosaic kernel, at the narrowest rows it takes (`glu_gemm::LEAST_K`,
+    // 3840: measured, narrower ones run faster as two GEMMs): 512- and
+    // 256-wide column blocks of each half; 48 rows as one block.
+    for (m, k, i) in [(64usize, 3840usize, 512usize), (48, 3840, 256)] {
         let xs = data(m * k, 11);
         // `w` row-major `[2i, k]` (gate rows, then up rows), landed `[k, 2i]`.
         let ws: Vec<f32> = data(2 * i * k, 12).iter().map(|v| v * 0.125).collect();
@@ -497,4 +498,32 @@ fn the_glu_gemm_kernel_answers_the_host() {
             .collect();
         assert_close(&b.read_f32(y), &want, 2e-2, 2e-2);
     }
+}
+
+#[test]
+fn the_glu_gemm_kernel_declines_rows_below_its_narrowest() {
+    // Rows narrower than `glu_gemm::LEAST_K` (3840) run as two GEMMs, the
+    // measured faster form: the kernel answers none for them.
+    let (m, k, i) = (64u32, 256u32, 1024u32);
+    let mut b = Bench::new();
+    let x = b.bf16(m, k, &data((m * k) as usize, 11));
+    let w = b.bf16(k, 2 * i, &data((k * 2 * i) as usize, 12));
+    let y = b.zeros(Dtype::Bf16, m, i);
+    b.run(|ctx| {
+        engine_xla::lower::lower(ctx, |l| {
+            let x_v = l.read(x)?.val;
+            let w_v = l.read(w)?.val;
+            assert!(
+                glu_gemm::geglu(l.f(), x_v, w_v, m, i64::from(i))?.is_none(),
+                "rows {k} wide are below the kernel's narrowest"
+            );
+            let zero = l.f().const_f(
+                kernels_xla::hlo::Elem::Bf16,
+                0.0,
+                &[i64::from(m), i64::from(i)],
+            );
+            l.land(y, zero)
+        })
+    })
+    .unwrap();
 }
