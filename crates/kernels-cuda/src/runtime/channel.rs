@@ -847,7 +847,11 @@ pub const PAGES_EXHAUSTED: u32 = 6;
 /// (`channel.cu`'s state layout).
 #[must_use]
 pub const fn beam_state_words(lanes: u32, cap: u32, frames: u32) -> u64 {
-    4 + 2 * lanes as u64 * cap as u64 + cap as u64 + frames as u64 * cap as u64 + 3 * lanes as u64
+    4 + 2 * lanes as u64 * cap as u64
+        + cap as u64
+        + frames as u64 * cap as u64
+        + 3 * lanes as u64
+        + lanes as u64 * lanes as u64
 }
 
 /// The state words where a group's copies for this fire lie.
