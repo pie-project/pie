@@ -6309,6 +6309,28 @@ impl<B: Serve> Shell<B> {
             (lanes.iter().map(|&(_, rows)| rows).sum::<u32>(), std::cmp::Reverse(lanes.len()))
         });
         shapes.dedup();
+        // A decode whose token a pass still on the queue writes is fed it on
+        // the device: where the weight cache streams the token table's rows,
+        // the host cannot lay its misses in the arm's stage, and its gather
+        // reads the fire's own (`FireBindings::row_ring`): another body.
+        // Each shape carrying decode lanes is recorded so too.
+        let fed_too = !self.row_caches.is_empty() && self.row_caches.by_tokens();
+        let shapes: Vec<(Vec<(usize, u32)>, bool)> = shapes
+            .into_iter()
+            .flat_map(|lanes| {
+                let fed = fed_too && lanes.iter().any(|&(class, rows)| rows == 1 && decoding[class]);
+                let both = std::iter::once((lanes.clone(), false));
+                both.chain(fed.then_some((lanes, true)))
+            })
+            .collect();
+        let cell = {
+            let (store, at) = self.inputs[0].token_seat();
+            DeviceCell {
+                buffer: store.clone(),
+                at,
+                bytes: 4,
+            }
+        };
         let page = self.pools.paging().page_size.max(1);
         let depth = self.arms.depth();
         let mut recorded = 0u64;
@@ -6351,13 +6373,13 @@ impl<B: Serve> Shell<B> {
         };
         let before = rss();
         let mut dearest = 0u64;
-        for (at, lanes) in shapes.iter().enumerate() {
+        for (at, (lanes, fed)) in shapes.iter().enumerate() {
             let used = rss().saturating_sub(before);
             if used.saturating_add(dearest.saturating_mul(depth as u64)) > allowance {
                 let from = lanes.iter().map(|&(_, rows)| rows).sum::<u32>();
                 let eager: Vec<String> = shapes[at..]
                     .iter()
-                    .map(|lanes| {
+                    .map(|(lanes, _)| {
                         format!(
                             "{} lane(s) of classes {:?}, {} rows",
                             lanes.len(),
@@ -6387,9 +6409,12 @@ impl<B: Serve> Shell<B> {
                     })
                     .collect::<Result<Vec<NamingLane<B>>>>()?;
                 let (mut seated, _, _) = lane_views(&owned);
-                for lane in &mut seated {
+                for (lane, &(class, rows)) in seated.iter_mut().zip(lanes) {
                     lane.pad = true;
                     lane.hosts = false;
+                    if *fed && rows == 1 && decoding[class] {
+                        lane.feed = Some(&cell);
+                    }
                 }
                 // The fire stages on the first free arm: the ones before
                 // `arm` are held while it fires.

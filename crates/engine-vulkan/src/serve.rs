@@ -221,8 +221,7 @@ impl Serve for Api {
         .then(|| record_key(shell, prepared));
 
         let mut varying = None;
-        let kind = fire_kind(prepared);
-        let replayable = match key.map(|key| shell.shelf.recorder.next(key, kind)) {
+        let replayable = match key.map(|key| shell.shelf.recorder.next(key)) {
             Some(crate::record::Next::Replay(fill, _)) => {
                 Some((fill.layout.clone(), fill.launches))
             }
@@ -240,7 +239,7 @@ impl Serve for Api {
             let counts = shell.airborne.clone();
             let done = prepared.done.take();
             let fed = prepared.fed_check.clone();
-            let crate::record::Next::Replay(fill, recording) = shell.shelf.recorder.next(key, kind)
+            let crate::record::Next::Replay(fill, recording) = shell.shelf.recorder.next(key)
             else {
                 unreachable!("the fill replayed a line ago");
             };
@@ -411,6 +410,13 @@ impl Serve for Api {
                 let pending = match act {
                     _ if arming => {
                         if let Act::Record(varying) = act {
+                            tracing::debug!(
+                                arm = prepared.arm,
+                                classes = ?prepared.descriptor.classes,
+                                family = ?family,
+                                indirect = varying.iter().filter(|&&v| v).count(),
+                                "vulkan recorded a body at load"
+                            );
                             shell.shelf.recorder.insert(
                                 family,
                                 crate::record::Recording::new(kept, cuts),
@@ -466,7 +472,6 @@ impl Serve for Api {
                 let recorder = &mut shell.shelf.recorder;
                 recorder.insert_fill(
                     shape,
-                    fire_kind(prepared),
                     crate::record::Fill::new(family, groups, image, layout.to_vec(), launches),
                 );
                 let (recorded, filled) = recorder.counts();
@@ -534,17 +539,6 @@ impl Serve for Api {
         shell.land(flight.seq, flight.arm, rows);
         Ok(())
     }
-}
-
-/// A fire's arm, rung and class subset: what a family is likely shared by.
-fn fire_kind(p: &Prepared<'_, Api>) -> crate::record::Key {
-    let mut key = crate::record::KeyBuilder::new();
-    key.hashed(&p.arm);
-    key.hashed(&p.rung);
-    for window in p.descriptor.classes.as_slice() {
-        key.hashed(&(window.rows > 0));
-    }
-    key.finish()
 }
 
 fn record_key(shell: &Shell<Api>, p: &Prepared<'_, Api>) -> crate::record::Key {

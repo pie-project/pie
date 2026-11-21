@@ -192,10 +192,6 @@ pub(crate) struct Recorder {
     /// Each fire shape's fill, under the shape's key.
     fills: Held<Fill>,
 
-    /// The family a fire of each (arm, rung, class subset) took last: a new
-    /// shape of it walks with that family's varying dispatches indirect.
-    likely: HashMap<Key, Key>,
-
     recorded: std::cell::Cell<u64>,
     filled: std::cell::Cell<u64>,
 
@@ -218,7 +214,6 @@ impl Recorder {
             // serves, a fixed set, and none leaves for a later one.
             families: Held::new(usize::MAX),
             fills: Held::new(FILLS_KEPT),
-            likely: HashMap::new(),
             recorded: std::cell::Cell::new(0),
             filled: std::cell::Cell::new(0),
             clock: std::cell::Cell::new(0),
@@ -251,13 +246,11 @@ impl Recorder {
 
     /// What the fire shape `shape`, of the (arm, rung, class subset)
     /// `kind`, does next.
-    pub(crate) fn next(&self, shape: Key, kind: Key) -> Next<'_> {
+    pub(crate) fn next(&self, shape: Key) -> Next<'_> {
+        // A shape without a fill walks direct: the load recorded every
+        // family it serves, so its walk bakes one of them and fills it.
         let Some(fill) = self.fills.by_key.get(&shape) else {
-            let likely = self
-                .likely
-                .get(&kind)
-                .and_then(|family| self.family(*family));
-            return Next::Walk(likely.map(|family| Arc::clone(&family.varying)));
+            return Next::Walk(None);
         };
         let Some(family) = self.family(fill.family) else {
             return Next::Walk(None);
@@ -289,7 +282,6 @@ impl Recorder {
     pub(crate) fn forget(&mut self) {
         self.families.by_key.clear();
         self.fills.by_key.clear();
-        self.likely.clear();
     }
 
     /// Makes `recording` its family's, varying in `varying`.
@@ -302,8 +294,7 @@ impl Recorder {
             });
     }
 
-    pub(crate) fn insert_fill(&mut self, shape: Key, kind: Key, fill: Fill) {
-        self.likely.insert(kind, fill.family);
+    pub(crate) fn insert_fill(&mut self, shape: Key, fill: Fill) {
         self.filled.set(self.filled.get() + 1);
         fill.used.set(self.tick());
         self.fills.insert(shape, fill, |held| held.used.get());
