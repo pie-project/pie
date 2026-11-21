@@ -257,13 +257,10 @@ pub fn located(segment: (u64, u64), laid: [Laid; 6], heap: Laid) -> Result<Bases
 
 pub const WORKGROUP: u32 = eta_compiler::codegen::wgsl::WORKGROUP;
 
-pub const GROUPS_PER_CORE: u32 = 4;
-
-pub fn groups_for(descriptors: &[ValueDesc], cores: u32) -> u32 {
+pub fn groups_for(descriptors: &[ValueDesc], workgroups: u32) -> u32 {
     let widest = descriptors.iter().map(|d| d.len).max().unwrap_or(1).max(1);
     let wanted = widest.div_ceil(WORKGROUP);
-    let cap = cores.max(1).saturating_mul(GROUPS_PER_CORE);
-    wanted.clamp(1, cap)
+    wanted.clamp(1, workgroups.max(1))
 }
 
 #[cfg(test)]

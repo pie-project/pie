@@ -459,6 +459,9 @@ pub struct Context {
     pub(crate) dummy: Slab,
     pipeline_cache: Arc<PipelineCache>,
     device_index: u32,
+    /// The workgroups the device holds at once, as the load's rates step
+    /// measured them ([`Context::resident`]).
+    resident: std::sync::OnceLock<u32>,
 }
 
 /// The device's pipeline cache, which kernel and guest pipelines share. A
@@ -1108,6 +1111,7 @@ impl Context {
             dummy,
             pipeline_cache,
             device_index: boot.device_index,
+            resident: std::sync::OnceLock::new(),
         })
     }
 
@@ -1150,9 +1154,27 @@ impl Context {
         self.max_buffer
     }
 
+    /// What sizes work to the device, as its kernels count cores: the
+    /// compute units the driver reports, or where it reports none the
+    /// workgroups the device holds at once ([`Context::resident`]). `None`
+    /// before the load has measured them.
     #[must_use]
-    pub fn cores(&self) -> u32 {
-        self.core.cores.unwrap_or(crate::chip::UNREPORTED_CORES)
+    pub fn cores(&self) -> Option<u32> {
+        self.core.cores.or_else(|| self.resident.get().copied())
+    }
+
+    /// The workgroups the device holds at once, as the load's rates step
+    /// measured them on every device (`profile::fire::RESIDENT_WORKGROUPS`):
+    /// what a guest step's grid strides over. `None` before the load has.
+    #[must_use]
+    pub fn resident(&self) -> Option<u32> {
+        self.resident.get().copied()
+    }
+
+    /// Lays the workgroups the load's rates step measured
+    /// ([`Context::resident`]); the first holds.
+    pub(crate) fn hold_resident(&self, workgroups: u32) {
+        let _ = self.resident.set(workgroups);
     }
 
     /// The alignment a guest table takes in its pool slot: 16 at least, and
@@ -1180,7 +1202,11 @@ impl Context {
     #[must_use]
     pub fn limits(&self) -> crate::tuning::Limits {
         crate::tuning::Limits {
-            cores: self.cores(),
+            // Before the rates step has measured a device the driver reports
+            // no cores of, one: that step's own tuning, whose timed kernels
+            // read neither the qmm's fill nor a decode's split per core (a
+            // load's tuning states them, `crate::rates::at_load`).
+            cores: self.cores().unwrap_or(1),
             lanes: self.lanes(),
             shared_bytes: self.core.limits.max_compute_shared_memory_size,
             invocations: self.core.limits.max_compute_work_group_invocations,

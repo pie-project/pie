@@ -225,6 +225,13 @@ pub fn kernels(
     Ok(all)
 }
 
+/// The workgroups a projection of `m` rows over `n` columns and a
+/// contraction of `k` launches under `tactic`: its kernel's grid.
+pub fn workgroups(target: Target, tactic: Tactic, m: u32, n: u32, k: u32) -> Result<u64, Error> {
+    let fire = kernel(target, tactic, "linear.workgroups", m, n, k)?;
+    Ok(fire.groups.iter().map(|&g| u64::from(g)).product())
+}
+
 /// The kernel a projection of `m` rows takes, at its grid.
 fn kernel(
     target: Target,
