@@ -1247,22 +1247,20 @@ impl Pools {
                 .map(|&logical| {
                     let physical = self.pool.physical(logical)?;
                     // A piece is addressed from its first chunk and read on
-                    // through the next physical chunks: each of its logical
-                    // chunks must lie on the physical chunk after the one
-                    // before, or its bytes past the first are another
-                    // owner's (a move that split the run).
-                    for at in 1..*run {
-                        let next = self.pool.physical(logical + at)?;
-                        if next != physical + at {
-                            return Err(Fault::Residency(format!(
-                                "a guest piece of {run} chunk(s) from logical chunk {logical} lies \
-                                 on physical chunk {physical}, but its logical chunk {} lies on \
-                                 physical chunk {next}, not {}: its bytes past the first chunk \
-                                 would be another owner's",
-                                logical + at,
-                                physical + at
-                            )));
-                        }
+                    // through the next physical chunks (the runtime moves a
+                    // run whole, its chunks' logical ids not kept in order):
+                    // those chunks must lie in its first chunk's segment, and
+                    // each in memory the pool holds (`admit`), or its later
+                    // bytes are another owner's or none.
+                    let seg = self.pool.segment_chunks().max(1);
+                    let last = physical + run.saturating_sub(1);
+                    if physical / seg != last / seg {
+                        return Err(Fault::Residency(format!(
+                            "a guest piece of {run} chunk(s) from logical chunk {logical} lies \
+                             on physical chunks {physical}..={last}, across the end of its \
+                             segment of {seg} chunks: its bytes past the segment would be \
+                             another owner's"
+                        )));
                     }
                     for at in 0..*run {
                         self.pool.admit(physical + at)?;
@@ -2914,30 +2912,42 @@ mod run_tests {
     use engine::chunk::Evacuation;
 
     /// A guest piece of several chunks is read on from its first chunk's
-    /// physical chunk: a move that splits its logical run across physical
-    /// chunks that are not adjacent is refused by name, naming the chunks,
-    /// rather than read as another owner's bytes.
+    /// physical chunk through the next ones: a run moved whole reads
+    /// whatever its logical ids (the runtime keeps them as they were), and a
+    /// run whose physical chunks would cross the end of a segment is
+    /// refused by name, naming its chunks, rather than read as another
+    /// owner's bytes.
     #[test]
-    fn a_split_guest_run_is_refused_naming_its_chunks() {
+    fn a_guest_run_across_a_segment_end_is_refused_naming_its_chunks() {
         let Ok(context) = Context::bind() else {
             eprintln!("no device: skipping");
             return;
         };
-        let mut pools = Pools::guests_only(&context, 16 << 20, 24).expect("a pool");
+        // 24 chunks in segments of 8: a run from chunk 7 crosses one's end.
+        let mut pools = Pools::guests_over(&context, 16 << 20, 24, 8).expect("a pool");
         let place = engine::ScratchPlace::Chunks { run: 2, pieces: vec![4] };
         assert_eq!(pools.guest_pieces(&place).expect("an adjacent run reads").len(), 1);
+        // Its second chunk's logical id moved elsewhere: the piece still reads
+        // the physical chunks after its first, adjacent and in one segment.
         let mut frame = context.frame().expect("a frame");
         pools
             .evacuate(&mut frame, &Evacuation { moves: vec![(5, 10)] })
             .expect("the evacuation");
         frame.commit().expect("the copy lands");
+        assert_eq!(
+            pools.guest_pieces(&place).expect("a physically adjacent run reads").len(),
+            1
+        );
+        let seg = pools.pool.segment_chunks();
+        assert_eq!(seg, 8, "the pool is laid in segments of 8");
+        let across = engine::ScratchPlace::Chunks { run: 2, pieces: vec![seg - 1] };
         let refused = format!(
             "{}",
-            pools.guest_pieces(&place).expect_err("a split run is refused")
+            pools.guest_pieces(&across).expect_err("a run across a segment's end is refused")
         );
         assert!(
-            refused.contains("logical chunk 4") && refused.contains("logical chunk 5")
-                && refused.contains("physical chunk 10"),
+            refused.contains(&format!("logical chunk {}", seg - 1))
+                && refused.contains(&format!("{}..={}", seg - 1, seg)),
             "the refusal names the chunks: {refused}"
         );
     }
