@@ -447,20 +447,38 @@ fn pick(
     // measured row counts in log rows; below the first row count timed, that
     // count's time (a kernel takes no less for fewer rows than it was timed
     // at, so its rate there is not held).
-    let time_at = |tactic: Tactic, n: u32, k: u32, rows: u32| -> Option<f64> {
+    // `tactic`'s time at an `n x k` plane at `rows`, ns, and whether it is
+    // measured there (else carried past the curve's last point): within the
+    // curve, its rate there; past it (the curve stopped short, by the
+    // bound, the buffer, a beating or no measurement), its last point's
+    // rate held, so the time only grows with the rows from the last point's
+    // (never below it scaled by rows: a kernel past its curve is never
+    // cheaper than where it was last timed). `None` where no point was
+    // timed at the plane.
+    let timed_at = |tactic: Tactic, n: u32, k: u32, rows: u32| -> Option<(f64, bool)> {
         let (kind, key) = crate::rates::curve_key(target, tactic, n, k);
         let found = curves.iter().find(|c| c.id() == (kind, key, n, k))?;
         let curve = &found.curve;
-        let (&(first, _), &(most, _)) = (curve.first()?, curve.last()?);
-        let time = |at: u32| {
-            let flops = 2.0 * f64::from(at) * f64::from(n) * f64::from(k);
-            profile::fire::interpolate(curve, f64::from(at)).map(|t| flops / (t * 1e3))
-        };
+        let (&(first, _), &(most, last)) = (curve.first()?, curve.last()?);
+        let flops = |at: u32| 2.0 * f64::from(at) * f64::from(n) * f64::from(k);
         if rows > most {
-            return None;
+            return (last > 0.0).then(|| (flops(rows) / (last * 1e3), false));
         }
-        time(rows.max(first))
+        // Below its first point, a kernel takes that point's time; and never
+        // less than at any point of fewer rows (more rows are never less
+        // work: a curve whose rate rises faster than its rows between two
+        // noisy points does not make the rows between them cheaper).
+        let at = rows.max(first);
+        let floor = curve
+            .iter()
+            .filter(|&&(r, _)| r <= at)
+            .map(|&(r, t)| flops(r) / (t * 1e3))
+            .fold(0.0, f64::max);
+        profile::fire::interpolate(curve, f64::from(at))
+            .map(|t| ((flops(at) / (t * 1e3)).max(floor), true))
     };
+    let time_at =
+        |tactic: Tactic, n: u32, k: u32, rows: u32| timed_at(tactic, n, k, rows).map(|(ns, _)| ns);
     // `tactic`'s cost at `rows` over every plane some candidate of `among`
     // was timed at to the rows, in ns: each at the kernel's rate measured
     // there (every weight pass it makes and whatever a cache spares it in the
@@ -522,6 +540,23 @@ fn pick(
         }
         weighed.then_some(ns)
     };
+    // Whether `tactic`'s cost at `rows` over the planes `among` is weighed
+    // at is measured at every one (none carried past a curve's last point).
+    let measured = |among: &[Tactic], tactic: Tactic, rows: u32| -> bool {
+        planes.iter().all(|&(n, k, ..)| {
+            !weighed_at(among, n, k, rows)
+                || timed_at(tactic, n, k, rows).is_some_and(|(_, measured)| measured)
+        })
+    };
+    // The candidates that may be taken at `bottom..=top` rows: those
+    // measured at every weighed plane at both. A kernel carried past its
+    // curve's last point at a plane still weighs that plane for the others
+    // (it is not dropped from the sum, so no estimate falls as the rows
+    // grow), but it never wins by the carried cost; where no kernel is
+    // measured, the rung keeps the kernel below it.
+    let takeable = |among: &[Tactic], t: Tactic, bottom: u32, top: u32| -> bool {
+        measured(among, t, bottom) && measured(among, t, top)
+    };
 
     let mut by_rows: Vec<(u32, Tactic)> = Vec::new();
     let mut weighed = Vec::with_capacity(rungs.len());
@@ -538,6 +573,7 @@ fn pick(
         // The candidates timed over the rung's rows, bottom to top.
         let costs: Vec<(Tactic, f64, f64)> = among
             .iter()
+            .filter(|&&t| takeable(&among, t, bottom, rung))
             .filter_map(|&t| Some((t, cost(&among, t, bottom)?, cost(&among, t, rung)?)))
             .collect();
         if costs.is_empty() {
@@ -595,6 +631,7 @@ fn pick(
                 let among = candidates(rows);
                 let priced: Vec<(Tactic, f64)> = among
                     .iter()
+                    .filter(|&&t| takeable(&among, t, rows, rows))
                     .filter_map(|&t| Some((t, cost(&among, t, rows)?)))
                     .collect();
                 let fastest = priced
@@ -1037,10 +1074,937 @@ mod tests {
         assert_eq!(eager.at(3, 4096, 4096).vector, 1);
     }
 
+    /// The Adreno 840's curves for Qwen3-0.6B (022833c03, native), some
+    /// stopped short (beaten, or by the buffer at the head): each rung's
+    /// estimate for the kernel it takes only grows with the rows, and is the
+    /// model's planes' flops over that kernel's measured rates (within a
+    /// factor of two: launches and the spread aside). Weighing only the
+    /// planes every kernel reached dropped all but one plane: rung 1024 was
+    /// estimated at 256 ms where its flops at the curves' rates take ~2.6 s,
+    /// and rung 512 below rung 256.
+    #[test]
+    fn the_phones_rung_estimates_grow_with_the_rows_and_are_the_curves_rates() {
+        let tiled = |_| Tactic {
+            tier: Tier::Subgroup,
+            vector: 0,
+            wide: true,
+        };
+        type Curve = (
+            u32,
+            u32,
+            u32,
+            u32,
+            Option<(u32, u32)>,
+            Vec<(u32, f64)>,
+            Vec<(u32, f64)>,
+        );
+        let phone: Vec<Curve> = vec![
+            (
+                1,
+                1,
+                1024,
+                2048,
+                Some((4096, 3)),
+                vec![
+                    (1, 0.004),
+                    (4, 0.016),
+                    (16, 0.041),
+                    (64, 0.09),
+                    (256, 0.117),
+                    (1024, 0.153),
+                ],
+                vec![
+                    (1, 0.44),
+                    (4, 0.52),
+                    (16, 0.04),
+                    (64, 0.14),
+                    (256, 0.07),
+                    (1024, 0.01),
+                ],
+            ),
+            (
+                1,
+                4,
+                1024,
+                2048,
+                None,
+                vec![
+                    (1, 0.006),
+                    (4, 0.023),
+                    (16, 0.085),
+                    (64, 0.151),
+                    (256, 0.368),
+                    (1024, 0.433),
+                    (4096, 0.565),
+                    (10240, 0.574),
+                ],
+                vec![
+                    (1, 0.1),
+                    (4, 0.18),
+                    (16, 0.27),
+                    (64, 0.03),
+                    (256, 0.15),
+                    (1024, 0.04),
+                    (4096, 0.0),
+                    (10240, 0.11),
+                ],
+            ),
+            (
+                1,
+                8,
+                1024,
+                2048,
+                None,
+                vec![
+                    (1, 0.006),
+                    (4, 0.026),
+                    (16, 0.094),
+                    (64, 0.183),
+                    (256, 0.375),
+                    (1024, 0.47),
+                    (4096, 0.627),
+                    (10240, 0.611),
+                ],
+                vec![
+                    (1, 0.16),
+                    (4, 0.09),
+                    (16, 0.16),
+                    (64, 0.45),
+                    (256, 0.11),
+                    (1024, 0.03),
+                    (4096, 0.03),
+                    (10240, 0.01),
+                ],
+            ),
+            (
+                1,
+                16,
+                1024,
+                2048,
+                None,
+                vec![
+                    (1, 0.006),
+                    (4, 0.026),
+                    (16, 0.101),
+                    (64, 0.183),
+                    (256, 0.21),
+                    (1024, 0.378),
+                    (4096, 0.427),
+                    (10240, 0.451),
+                ],
+                vec![
+                    (1, 0.09),
+                    (4, 0.06),
+                    (16, 0.22),
+                    (64, 0.5),
+                    (256, 0.11),
+                    (1024, 0.05),
+                    (4096, 0.01),
+                    (10240, 0.01),
+                ],
+            ),
+            (
+                2,
+                32,
+                1024,
+                2048,
+                None,
+                vec![
+                    (1, 0.005),
+                    (4, 0.019),
+                    (16, 0.068),
+                    (64, 0.148),
+                    (256, 0.189),
+                    (1024, 0.326),
+                    (4096, 0.376),
+                    (10240, 0.391),
+                ],
+                vec![
+                    (1, 0.02),
+                    (4, 0.01),
+                    (16, 0.01),
+                    (64, 0.23),
+                    (256, 0.01),
+                    (1024, 0.02),
+                    (4096, 0.01),
+                    (10240, 0.0),
+                ],
+            ),
+            (
+                2,
+                256,
+                1024,
+                2048,
+                None,
+                vec![
+                    (1, 0.002),
+                    (4, 0.007),
+                    (16, 0.021),
+                    (64, 0.1),
+                    (256, 0.221),
+                    (1024, 0.459),
+                    (4096, 0.671),
+                    (10240, 0.762),
+                ],
+                vec![
+                    (1, 0.01),
+                    (4, 0.11),
+                    (16, 0.15),
+                    (64, 0.21),
+                    (256, 0.02),
+                    (1024, 0.13),
+                    (4096, 0.03),
+                    (10240, 0.02),
+                ],
+            ),
+            (
+                1,
+                1,
+                1024,
+                3072,
+                Some((256, 3)),
+                vec![(1, 0.006), (4, 0.017), (16, 0.048), (64, 0.071)],
+                vec![(1, 0.58), (4, 0.27), (16, 0.29), (64, 0.18)],
+            ),
+            (
+                1,
+                4,
+                1024,
+                3072,
+                None,
+                vec![
+                    (1, 0.008),
+                    (4, 0.027),
+                    (16, 0.073),
+                    (64, 0.173),
+                    (256, 0.283),
+                    (1024, 0.472),
+                    (4096, 0.581),
+                    (10240, 0.55),
+                ],
+                vec![
+                    (1, 0.08),
+                    (4, 0.08),
+                    (16, 0.16),
+                    (64, 0.23),
+                    (256, 0.13),
+                    (1024, 0.0),
+                    (4096, 0.01),
+                    (10240, 0.01),
+                ],
+            ),
+            (
+                1,
+                8,
+                1024,
+                3072,
+                None,
+                vec![
+                    (1, 0.008),
+                    (4, 0.033),
+                    (16, 0.115),
+                    (64, 0.248),
+                    (256, 0.303),
+                    (1024, 0.554),
+                    (4096, 0.635),
+                    (10240, 0.638),
+                ],
+                vec![
+                    (1, 0.09),
+                    (4, 0.16),
+                    (16, 0.27),
+                    (64, 0.55),
+                    (256, 0.18),
+                    (1024, 0.05),
+                    (4096, 0.03),
+                    (10240, 0.02),
+                ],
+            ),
+            (
+                1,
+                16,
+                1024,
+                3072,
+                None,
+                vec![
+                    (1, 0.009),
+                    (4, 0.032),
+                    (16, 0.12),
+                    (64, 0.264),
+                    (256, 0.258),
+                    (1024, 0.438),
+                    (4096, 0.494),
+                    (10240, 0.481),
+                ],
+                vec![
+                    (1, 0.13),
+                    (4, 0.11),
+                    (16, 0.42),
+                    (64, 0.52),
+                    (256, 0.17),
+                    (1024, 0.07),
+                    (4096, 0.01),
+                    (10240, 0.02),
+                ],
+            ),
+            (
+                2,
+                32,
+                1024,
+                3072,
+                None,
+                vec![
+                    (1, 0.005),
+                    (4, 0.02),
+                    (16, 0.073),
+                    (64, 0.174),
+                    (256, 0.217),
+                    (1024, 0.329),
+                    (4096, 0.385),
+                    (10240, 0.385),
+                ],
+                vec![
+                    (1, 0.05),
+                    (4, 0.03),
+                    (16, 0.06),
+                    (64, 0.29),
+                    (256, 0.11),
+                    (1024, 0.04),
+                    (4096, 0.03),
+                    (10240, 0.01),
+                ],
+            ),
+            (
+                2,
+                256,
+                1024,
+                3072,
+                None,
+                vec![
+                    (1, 0.001),
+                    (4, 0.006),
+                    (16, 0.02),
+                    (64, 0.079),
+                    (256, 0.269),
+                    (1024, 0.526),
+                    (4096, 0.711),
+                    (10240, 0.799),
+                ],
+                vec![
+                    (1, 0.18),
+                    (4, 0.24),
+                    (16, 0.25),
+                    (64, 0.29),
+                    (256, 0.1),
+                    (1024, 0.06),
+                    (4096, 0.1),
+                    (10240, 0.11),
+                ],
+            ),
+            (
+                1,
+                1,
+                4096,
+                1024,
+                Some((256, 3)),
+                vec![(1, 0.007), (4, 0.027), (16, 0.066), (64, 0.087)],
+                vec![(1, 0.45), (4, 0.53), (16, 0.09), (64, 0.12)],
+            ),
+            (
+                1,
+                4,
+                4096,
+                1024,
+                None,
+                vec![
+                    (1, 0.012),
+                    (4, 0.037),
+                    (16, 0.106),
+                    (64, 0.241),
+                    (256, 0.288),
+                    (1024, 0.405),
+                    (4096, 0.414),
+                    (10240, 0.424),
+                ],
+                vec![
+                    (1, 0.13),
+                    (4, 0.12),
+                    (16, 0.47),
+                    (64, 0.09),
+                    (256, 0.07),
+                    (1024, 0.05),
+                    (4096, 0.05),
+                    (10240, 0.01),
+                ],
+            ),
+            (
+                1,
+                8,
+                4096,
+                1024,
+                None,
+                vec![
+                    (1, 0.011),
+                    (4, 0.04),
+                    (16, 0.12),
+                    (64, 0.247),
+                    (256, 0.302),
+                    (1024, 0.434),
+                    (4096, 0.449),
+                    (10240, 0.449),
+                ],
+                vec![
+                    (1, 0.11),
+                    (4, 0.15),
+                    (16, 0.63),
+                    (64, 0.13),
+                    (256, 0.1),
+                    (1024, 0.01),
+                    (4096, 0.01),
+                    (10240, 0.01),
+                ],
+            ),
+            (
+                1,
+                16,
+                4096,
+                1024,
+                Some((4096, 3)),
+                vec![
+                    (1, 0.011),
+                    (4, 0.045),
+                    (16, 0.121),
+                    (64, 0.173),
+                    (256, 0.251),
+                    (1024, 0.31),
+                ],
+                vec![
+                    (1, 0.16),
+                    (4, 0.23),
+                    (16, 0.27),
+                    (64, 0.09),
+                    (256, 0.06),
+                    (1024, 0.03),
+                ],
+            ),
+            (
+                2,
+                32,
+                4096,
+                1024,
+                None,
+                vec![
+                    (1, 0.007),
+                    (4, 0.027),
+                    (16, 0.103),
+                    (64, 0.182),
+                    (256, 0.279),
+                    (1024, 0.36),
+                    (4096, 0.39),
+                    (10240, 0.392),
+                ],
+                vec![
+                    (1, 0.02),
+                    (4, 0.06),
+                    (16, 0.09),
+                    (64, 0.18),
+                    (256, 0.1),
+                    (1024, 0.05),
+                    (4096, 0.01),
+                    (10240, 0.01),
+                ],
+            ),
+            (
+                2,
+                256,
+                4096,
+                1024,
+                None,
+                vec![
+                    (1, 0.002),
+                    (4, 0.007),
+                    (16, 0.025),
+                    (64, 0.101),
+                    (256, 0.393),
+                    (1024, 0.638),
+                    (4096, 0.776),
+                    (10240, 0.774),
+                ],
+                vec![
+                    (1, 0.34),
+                    (4, 0.2),
+                    (16, 0.03),
+                    (64, 0.17),
+                    (256, 0.14),
+                    (1024, 0.06),
+                    (4096, 0.02),
+                    (10240, 0.03),
+                ],
+            ),
+            (
+                1,
+                1,
+                6144,
+                1024,
+                Some((1024, 3)),
+                vec![
+                    (1, 0.012),
+                    (4, 0.038),
+                    (16, 0.066),
+                    (64, 0.092),
+                    (256, 0.13),
+                ],
+                vec![(1, 0.84), (4, 0.48), (16, 0.15), (64, 0.13), (256, 0.01)],
+            ),
+            (
+                1,
+                4,
+                6144,
+                1024,
+                None,
+                vec![
+                    (1, 0.015),
+                    (4, 0.047),
+                    (16, 0.144),
+                    (64, 0.237),
+                    (256, 0.347),
+                    (1024, 0.417),
+                    (4096, 0.401),
+                    (10240, 0.415),
+                ],
+                vec![
+                    (1, 0.16),
+                    (4, 0.53),
+                    (16, 0.55),
+                    (64, 0.1),
+                    (256, 0.13),
+                    (1024, 0.02),
+                    (4096, 0.01),
+                    (10240, 0.01),
+                ],
+            ),
+            (
+                1,
+                8,
+                6144,
+                1024,
+                None,
+                vec![
+                    (1, 0.016),
+                    (4, 0.055),
+                    (16, 0.186),
+                    (64, 0.249),
+                    (256, 0.37),
+                    (1024, 0.438),
+                    (4096, 0.442),
+                    (10240, 0.44),
+                ],
+                vec![
+                    (1, 0.13),
+                    (4, 0.04),
+                    (16, 0.36),
+                    (64, 0.16),
+                    (256, 0.07),
+                    (1024, 0.1),
+                    (4096, 0.02),
+                    (10240, 0.02),
+                ],
+            ),
+            (
+                1,
+                16,
+                6144,
+                1024,
+                Some((4096, 3)),
+                vec![
+                    (1, 0.014),
+                    (4, 0.056),
+                    (16, 0.138),
+                    (64, 0.144),
+                    (256, 0.26),
+                    (1024, 0.314),
+                ],
+                vec![
+                    (1, 0.18),
+                    (4, 0.14),
+                    (16, 0.47),
+                    (64, 0.29),
+                    (256, 0.06),
+                    (1024, 0.02),
+                ],
+            ),
+            (
+                2,
+                32,
+                6144,
+                1024,
+                None,
+                vec![
+                    (1, 0.007),
+                    (4, 0.027),
+                    (16, 0.088),
+                    (64, 0.154),
+                    (256, 0.281),
+                    (1024, 0.365),
+                    (4096, 0.382),
+                    (10240, 0.391),
+                ],
+                vec![
+                    (1, 0.07),
+                    (4, 0.05),
+                    (16, 0.21),
+                    (64, 0.16),
+                    (256, 0.01),
+                    (1024, 0.0),
+                    (4096, 0.03),
+                    (10240, 0.01),
+                ],
+            ),
+            (
+                2,
+                256,
+                6144,
+                1024,
+                None,
+                vec![
+                    (1, 0.002),
+                    (4, 0.009),
+                    (16, 0.031),
+                    (64, 0.124),
+                    (256, 0.466),
+                    (1024, 0.716),
+                    (4096, 0.745),
+                    (10240, 0.795),
+                ],
+                vec![
+                    (1, 0.14),
+                    (4, 0.17),
+                    (16, 0.1),
+                    (64, 0.18),
+                    (256, 0.1),
+                    (1024, 0.03),
+                    (4096, 0.05),
+                    (10240, 0.09),
+                ],
+            ),
+            (
+                1,
+                1,
+                151936,
+                1024,
+                Some((256, 3)),
+                vec![(1, 0.029), (4, 0.062), (16, 0.116), (64, 0.138)],
+                vec![(1, 0.06), (4, 0.26), (16, 0.11), (64, 0.03)],
+            ),
+            (
+                1,
+                4,
+                151936,
+                1024,
+                Some((4096, 2)),
+                vec![
+                    (1, 0.029),
+                    (4, 0.102),
+                    (16, 0.282),
+                    (64, 0.385),
+                    (256, 0.412),
+                    (1024, 0.42),
+                ],
+                vec![
+                    (1, 0.11),
+                    (4, 0.15),
+                    (16, 0.11),
+                    (64, 0.04),
+                    (256, 0.03),
+                    (1024, 0.07),
+                ],
+            ),
+            (
+                1,
+                8,
+                151936,
+                1024,
+                Some((4096, 2)),
+                vec![
+                    (1, 0.029),
+                    (4, 0.104),
+                    (16, 0.289),
+                    (64, 0.407),
+                    (256, 0.439),
+                    (1024, 0.42),
+                ],
+                vec![
+                    (1, 0.08),
+                    (4, 0.13),
+                    (16, 0.14),
+                    (64, 0.01),
+                    (256, 0.01),
+                    (1024, 0.08),
+                ],
+            ),
+            (
+                1,
+                16,
+                151936,
+                1024,
+                Some((1024, 3)),
+                vec![
+                    (1, 0.028),
+                    (4, 0.09),
+                    (16, 0.204),
+                    (64, 0.293),
+                    (256, 0.298),
+                ],
+                vec![(1, 0.04), (4, 0.14), (16, 0.12), (64, 0.03), (256, 0.01)],
+            ),
+            (
+                2,
+                32,
+                151936,
+                1024,
+                Some((4096, 2)),
+                vec![
+                    (1, 0.01),
+                    (4, 0.035),
+                    (16, 0.136),
+                    (64, 0.329),
+                    (256, 0.352),
+                    (1024, 0.334),
+                ],
+                vec![
+                    (1, 0.04),
+                    (4, 0.21),
+                    (16, 0.15),
+                    (64, 0.01),
+                    (256, 0.02),
+                    (1024, 0.08),
+                ],
+            ),
+            (
+                2,
+                256,
+                151936,
+                1024,
+                Some((4096, 2)),
+                vec![
+                    (1, 0.003),
+                    (4, 0.011),
+                    (16, 0.047),
+                    (64, 0.207),
+                    (256, 0.698),
+                    (1024, 0.69),
+                ],
+                vec![
+                    (1, 0.02),
+                    (4, 0.08),
+                    (16, 0.12),
+                    (64, 0.03),
+                    (256, 0.02),
+                    (1024, 0.07),
+                ],
+            ),
+        ];
+        let mut curves: Vec<profile::fire::KernelCurve> = phone
+            .into_iter()
+            .map(
+                |(kind, key, n, k, stop, curve, spread)| profile::fire::KernelCurve {
+                    kind,
+                    key,
+                    n,
+                    k,
+                    curve,
+                    stop,
+                    spread,
+                },
+            )
+            .collect();
+        curves.sort_by_key(profile::fire::KernelCurve::id);
+        let r = profile::fire::Rates {
+            kernel_tflops_by_shape: Some(curves.clone()),
+            ..rates(None, Vec::new())
+        };
+        let shape = |n: u32, k: u32, planes| engine::load::GemmShape {
+            planes,
+            ..engine::load::GemmShape::dense(
+                n,
+                k,
+                2 * u64::from(n) * u64::from(k),
+                2 * u64::from(n) * u64::from(k),
+            )
+        };
+        let model = Counts {
+            gemm_shapes: vec![
+                shape(1024, 2048, 28),
+                shape(1024, 3072, 28),
+                shape(4096, 1024, 28),
+                shape(6144, 1024, 28),
+                shape(151_936, 1024, 1),
+            ],
+            ..counts()
+        };
+        let planes = planes(&model, None);
+        let rungs: Vec<u32> = (0..=10).map(|p| 1 << p).collect();
+        let (_, weighed) =
+            choose(Target::Spirv, &rungs, tiled, &r, &planes, true, Some(1024)).unwrap();
+        // The model's flops at `rows` over `tactic`'s rate at each plane.
+        let at_rates = |tactic: Tactic, rows: u32| -> f64 {
+            planes
+                .iter()
+                .map(|&(n, k, count, _)| {
+                    let (kind, key) = crate::rates::curve_key(Target::Spirv, tactic, n, k);
+                    let c = curves.iter().find(|c| c.id() == (kind, key, n, k)).unwrap();
+                    let last = c.curve.last().unwrap();
+                    let rate = if rows > last.0 {
+                        last.1
+                    } else {
+                        profile::fire::interpolate(&c.curve, f64::from(rows)).unwrap()
+                    };
+                    f64::from(count) * 2.0 * f64::from(rows) * f64::from(n) * f64::from(k)
+                        / (rate * 1e3)
+                })
+                .sum()
+        };
+        // Each kernel's estimate at a rung's top only grows with the rungs.
+        for pair in weighed.windows(2) {
+            for &(tactic, _, top) in &pair[1].costs {
+                if let Some(&(_, _, below)) = pair[0].costs.iter().find(|c| c.0 == tactic) {
+                    assert!(
+                        top >= below,
+                        "{tactic:?}: {below} ns at {} rows, {top} ns at {}",
+                        pair[0].top,
+                        pair[1].top
+                    );
+                }
+            }
+        }
+        for w in &weighed {
+            let (tactic, _, top) = w.costs[w.taken];
+            let flops = at_rates(tactic, w.top);
+            assert!(
+                top >= flops / 2.0 && top <= flops * 2.0,
+                "rung {}: estimated {:.1} ms, its flops at the curves' rates {:.1} ms",
+                w.top,
+                top / 1e6,
+                flops / 1e6
+            );
+        }
+    }
+
+    /// A curve stopped short of a rung's rows (the phone's head, its vector
+    /// curve beaten at 512 rows) keeps weighing its plane: no candidate's
+    /// estimate falls as the rungs grow, and the kernel measured at every
+    /// plane is taken over one whose cost there would be carried past its
+    /// curve. Dropping the head from the sum instead had a rung of 512 rows
+    /// estimated below one of 256 and the vector kernel taken at 512 and
+    /// 1024 by the layers alone.
+    #[test]
+    fn a_curve_stopped_short_neither_lowers_an_estimate_nor_wins_past_it() {
+        let tiled = |_| Tactic {
+            tier: Tier::Subgroup,
+            vector: 0,
+            wide: false,
+        };
+        let shape = |n: u32, k: u32, planes| engine::load::GemmShape {
+            planes,
+            ..engine::load::GemmShape::dense(
+                n,
+                k,
+                2 * u64::from(n) * u64::from(k),
+                2 * u64::from(n) * u64::from(k),
+            )
+        };
+        let (head_n, head_k) = (151_936, 1024);
+        let model = Counts {
+            gemm_shapes: vec![shape(1024, 1024, 28), shape(head_n, head_k, 1)],
+            ..counts()
+        };
+        let curve = |kind, key, n, k, points: Vec<(u32, f64)>, stop| profile::fire::KernelCurve {
+            kind,
+            key,
+            n,
+            k,
+            curve: points,
+            stop,
+            spread: Vec::new(),
+        };
+        let tile = |n, k| crate::rates::curve_key(Target::Wgsl, tiled(0), n, k).1;
+        let (v, t) = (
+            profile::fire::KernelCurve::VECTOR,
+            profile::fire::KernelCurve::TILE,
+        );
+        let mut curves = vec![
+            // The layers: the vector kernel ahead of the tile to 1024 rows.
+            curve(
+                t,
+                tile(1024, 1024),
+                1024,
+                1024,
+                vec![(1, 0.01), (1024, 1.0)],
+                None,
+            ),
+            curve(v, 8, 1024, 1024, vec![(1, 0.05), (1024, 2.0)], None),
+            // The head: the tile timed to 1024; the vector kernel beaten at
+            // 512, its last point at 256.
+            curve(
+                t,
+                tile(head_n, head_k),
+                head_n,
+                head_k,
+                vec![(1, 0.02), (1024, 8.0)],
+                None,
+            ),
+            curve(
+                v,
+                8,
+                head_n,
+                head_k,
+                vec![(1, 1.0), (256, 1.5)],
+                Some((512, profile::fire::KernelCurve::BEATEN)),
+            ),
+        ];
+        curves.sort_by_key(profile::fire::KernelCurve::id);
+        let r = profile::fire::Rates {
+            kernel_tflops_by_shape: Some(curves),
+            ..rates(None, Vec::new())
+        };
+        let rungs = [256, 512, 1024];
+        let (dense, weighed) = choose(
+            Target::Wgsl,
+            &rungs,
+            tiled,
+            &r,
+            &planes(&model, None),
+            true,
+            None,
+        )
+        .unwrap();
+        for rows in [512, 1024] {
+            assert_eq!(
+                dense.at(rows, head_n, head_k).vector,
+                0,
+                "{rows}: {:?}",
+                dense.runs()
+            );
+            assert!(!weighed[1].costs.is_empty());
+        }
+        // Each kernel's estimate at a rung's top only grows with the rungs.
+        for pair in weighed.windows(2) {
+            for &(tactic, _, top) in &pair[1].costs {
+                if let Some(&(_, _, below)) = pair[0].costs.iter().find(|c| c.0 == tactic) {
+                    assert!(
+                        top >= below,
+                        "{tactic:?}: {below} at {} then {top} at {}",
+                        pair[0].top,
+                        pair[1].top
+                    );
+                }
+            }
+        }
+    }
+
     /// Each plane takes its own kernel at a rung: the vector kernel the
     /// layers' planes it wins, the tile the head where the vector kernel was
-    /// beaten; stopped by the bound instead, the head keeps the kernel the
-    /// planes take together.
+    /// beaten, or stopped short by the bound (unmeasured there).
     #[test]
     fn each_plane_takes_its_own_kernel_at_one_rung() {
         let tiled = |_| Tactic {
@@ -1135,10 +2099,17 @@ mod tests {
             None,
         )
         .unwrap();
-        // Stopped by the bound, no measurement says x16 loses at the head
-        // there: it keeps the pick over every plane together.
+        // Stopped by the bound at 64 rows, x16 is not measured at the head at
+        // 128: the measured tile takes it (a cost carried past a curve never
+        // wins against a measured one); the layers keep x16.
         assert_eq!(dense.at(128, 1024, 1024).vector, 16, "{}", weighed[0]);
-        assert_eq!(dense.at(128, 8192, 1024).vector, 16, "{}", weighed[0]);
+        assert_eq!(
+            dense.at(128, 8192, 1024).vector,
+            0,
+            "{} {:?}",
+            weighed[0],
+            dense.runs()
+        );
     }
 
     /// The rung full prompt chunks land on is picked at its top rows: on the
