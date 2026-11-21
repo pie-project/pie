@@ -287,6 +287,7 @@ impl<B: Backend> Weights<B> {
         let landed = if B::LANDS {
             let mut sink = Landing {
                 store: &mut store,
+                device,
                 host: host_map.as_ref().map(|map| (map, &host_planes)),
                 places: &places,
                 index: &index,
@@ -904,6 +905,10 @@ fn places(trace: &Trace, layout: &Layout) -> Result<Vec<Place>> {
 
 struct Landing<'a, B: Backend> {
     store: &'a mut Store<B>,
+    /// Where each landing's write is settled before the next: a queue that
+    /// stages a write until a submission carries it holds the whole model
+    /// staged otherwise, beside the planes it lands in (wgpu).
+    device: &'a B::Context,
 
     host: Option<(&'a Mapping, &'a BTreeMap<usize, HostPlane>)>,
     places: &'a [Place],
@@ -953,10 +958,17 @@ impl<B: Backend> TensorSink for Landing<'_, B> {
             )));
         }
         match place.tier {
-            Tier::Device => self
-                .store
-                .write(place.offset, bytes)
-                .map_err(|fault| LoadError::Internal(fault.to_string()))?,
+            Tier::Device => {
+                self.store
+                    .write(place.offset, bytes)
+                    .map_err(|fault| LoadError::Internal(fault.to_string()))?;
+                // The write lands and its staging goes before the next plane
+                // stages: the load holds one plane staged at most.
+                self.device
+                    .frame()
+                    .and_then(crate::backend::Frame::commit)
+                    .map_err(|fault| LoadError::Internal(fault.to_string()))?;
+            }
             Tier::Host => {
                 let (map, planes) = self.host.ok_or_else(|| {
                     LoadError::Internal(format!(

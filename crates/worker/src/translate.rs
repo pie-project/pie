@@ -163,6 +163,7 @@ fn build_model(
                 adapter_attachments: g.caps.adapter_attachments,
                 rs_snapshots: g.caps.rs_snapshots,
                 guest_cost: g.caps.guest_cost,
+                frames_in_flight: g.caps.frames_in_flight,
                 device_geometry_port_mask: g.caps.ports,
                 facts: g.caps.facts.clone(),
                 inputs: g.caps.inputs.clone(),

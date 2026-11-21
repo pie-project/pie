@@ -100,6 +100,93 @@ pub fn adopt(registration: &ProgramRegistration) -> Prepared {
     Ok(Adopted { plan, form })
 }
 
+/// What a load's prewarm of programs adopted ([`prewarm`]): every program
+/// lowered as its registration lowers it.
+pub struct Prewarmed {
+    pub programs: usize,
+
+    pub stages: usize,
+
+    /// The step calls their stages dispatch, each once: each a pipeline the
+    /// load must have built ([`Programs::unbuilt`]).
+    pub calls: std::collections::BTreeSet<u32>,
+
+    /// The longest one program's adopt took.
+    pub slowest: std::time::Duration,
+
+    /// A digest of the programs' hashes, and one of what their stages
+    /// dispatch (each step's call, node, rung and selector), in the
+    /// registrations' order. A program's hash covers its channels'
+    /// capacities, which the runtime's frame size sets; what its stages
+    /// dispatch does not, and nothing the plane builds is keyed on more.
+    pub hashes: u64,
+
+    pub forms: u64,
+}
+
+/// `registrations` each adopted as [`adopt`] does at its registration, over
+/// the host's cores: the runtime's prewarm of its standard samplers
+/// (`Engine::prewarm_programs`). A program that does not adopt refuses by
+/// its hash, as its registration would.
+pub fn prewarm(registrations: &[ProgramRegistration]) -> Result<Prewarmed, Refusal> {
+    use std::hash::{Hash, Hasher};
+
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let threads = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .clamp(1, registrations.len().max(1));
+    let mut adopted: Vec<(usize, Prepared, std::time::Duration)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut mine = Vec::new();
+                    loop {
+                        let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(registration) = registrations.get(at) else {
+                            return mine;
+                        };
+                        let started = std::time::Instant::now();
+                        let prepared = adopt(registration);
+                        mine.push((at, prepared, started.elapsed()));
+                    }
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| worker.join().expect("a program's adopt panicked"))
+            .collect()
+    });
+    adopted.sort_by_key(|(at, _, _)| *at);
+
+    let mut prewarmed = Prewarmed {
+        programs: registrations.len(),
+        stages: 0,
+        calls: std::collections::BTreeSet::new(),
+        slowest: std::time::Duration::ZERO,
+        hashes: 0,
+        forms: 0,
+    };
+    let mut hashes = std::collections::hash_map::DefaultHasher::new();
+    let mut forms = std::collections::hash_map::DefaultHasher::new();
+    for (at, prepared, took) in adopted {
+        let Adopted { form, .. } = prepared?;
+        registrations[at].program_hash.hash(&mut hashes);
+        prewarmed.stages += form.len();
+        prewarmed.slowest = prewarmed.slowest.max(took);
+        for stage in form.all() {
+            for step in &stage.steps {
+                prewarmed.calls.insert(step.call);
+                (step.call, step.node, step.rung, step.selector).hash(&mut forms);
+            }
+            stage.steps.len().hash(&mut forms);
+        }
+    }
+    prewarmed.hashes = hashes.finish();
+    prewarmed.forms = forms.finish();
+    Ok(prewarmed)
+}
+
 /// A backend's program plane.
 pub trait Programs<B: Serve>: Default {
     /// A registration's last step, on the engine's thread: the adopted
@@ -123,6 +210,11 @@ pub trait Programs<B: Serve>: Default {
     /// its config. Binding an instance, or registering a program, while
     /// serving then builds no pipeline.
     fn load(&mut self, place: &Place<'_, B>) -> Result<(), Refusal>;
+
+    /// Why guest step call `call` has no pipeline [`Programs::load`] built,
+    /// or `None` where it has one: a bind that dispatches it would build it
+    /// while serving.
+    fn unbuilt(&self, call: u32) -> Option<String>;
 
     /// The pipelines built after the load, at a bind: none, where
     /// [`Programs::load`] built every one a guest stage can dispatch.
