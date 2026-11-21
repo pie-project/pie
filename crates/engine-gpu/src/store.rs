@@ -731,6 +731,56 @@ impl<B: Backend> Pools<B> {
         Ok(u64::from(chunk) * self.layout.chunk_bytes + u64::from(index) * shape.slot_bytes)
     }
 
+    /// Slot ref `slot` of shape `id`'s first u32 word in the pool, as a
+    /// kernel binding the segments addresses it.
+    pub fn slot_word(&self, id: ShapeId, slot: u32) -> Result<u32> {
+        let at = self.slot_offset(id, slot)?;
+        u32::try_from(at / 4).map_err(|_| Fault::Ceiling {
+            what: "pool words a kernel indexes",
+            need: at / 4,
+            have: u64::from(u32::MAX),
+        })
+    }
+
+    /// The pool words a kv page id counts, and each kv plane a page holds:
+    /// its first word in the page and the words a slot holds there.
+    /// Refused by name where a plane does not lie in whole words.
+    pub fn kv_planes(&self) -> Result<(u32, Vec<[u32; 2]>)> {
+        let unit = self.unit(LIST)?;
+        let word = |bytes: u64, what: &'static str| {
+            if bytes % 4 != 0 {
+                return Err(Fault::Program {
+                    at: "store::kv_planes",
+                    why: format!(
+                        "{what} of {bytes} bytes, not whole words: a beam copy moves a page's \
+                         slots a word at a time"
+                    ),
+                });
+            }
+            u32::try_from(bytes / 4).map_err(|_| Fault::Ceiling {
+                what: "pool words a kv page plane holds",
+                need: bytes / 4,
+                have: u64::from(u32::MAX),
+            })
+        };
+        let planes = self
+            .kv_runs()
+            .into_iter()
+            .map(|(offset, cell)| {
+                Ok([word(offset, "a kv plane's offset")?, word(cell, "a kv slot's cell")?])
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((word(unit, "a kv page id's unit")?, planes))
+    }
+
+    /// Whether a list page holds anything but kv rows (a compressed
+    /// attention's state), which a page copy of its kv planes alone would
+    /// leave behind.
+    #[must_use]
+    pub fn pages_hold_more_than_kv(&self) -> bool {
+        !self.compressed.is_empty()
+    }
+
     /// The virtual byte weight slot ref `slot` (of a shape `per_chunk`
     /// slots of `slot_bytes` a chunk) starts at, its chunk committed.
     pub fn weight_slot(&self, per_chunk: u32, slot_bytes: u64, slot: u32) -> Result<u64> {

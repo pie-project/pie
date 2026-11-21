@@ -39,6 +39,10 @@ struct Instance {
     #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
     own_cells: Vec<ChannelId>,
 
+    /// Its beam group's state, where its program states each beam's
+    /// parent (`engine_gpu::beam`).
+    beam: Option<engine_gpu::beam::Resident<crate::device::Api>>,
+
     /// Ring cells a pass on the queue has yet to land.
     landing: Arc<Owed>,
     /// Set by a pass that faulted after its fire returned.
@@ -350,6 +354,27 @@ impl Plane {
                 )));
             }
         }
+        // Its beam group's state, cleared: the first fire primes it.
+        let beam = match (layout.beam, place) {
+            (None, _) => None,
+            (Some(beam), Some(place)) => Some(
+                engine_gpu::beam::Resident::bind(place.pools, &binding.resident, beam).map_err(
+                    |fault| {
+                        Refusal::Program(format!(
+                            "program {} does not bind: its beam group's state: {fault}",
+                            binding.program
+                        ))
+                    },
+                )?,
+            ),
+            (Some(_), None) => {
+                return Err(Refusal::Program(format!(
+                    "program {} states each beam's parent, and this engine bound no device to \
+                     keep its beam group's state",
+                    binding.program
+                )));
+            }
+        };
         // The device cells of the channels this instance holds itself.
         #[cfg_attr(not(feature = "vulkan"), allow(unused_mut))]
         let mut own_cells = Vec::new();
@@ -394,6 +419,7 @@ impl Plane {
                 #[cfg(feature = "vulkan")]
                 pair_generation: binding.pair_generation,
                 own_cells,
+                beam,
                 landing: Arc::default(),
                 faulted: Arc::default(),
             },
@@ -507,6 +533,9 @@ impl Plane {
             let program = |fault: engine_gpu::error::Fault| Refusal::Program(fault.to_string());
             for seat in self.instances.values_mut() {
                 seat.session.rebind(pools).map_err(program)?;
+                if let Some(beam) = seat.beam.as_mut() {
+                    beam.rebind(pools).map_err(program)?;
+                }
             }
             for cell in self
                 .kept
@@ -538,6 +567,7 @@ impl Plane {
                     instance,
                     rings,
                     scratch,
+                    resident,
                     pair,
                     pair_generation,
                     ..
@@ -546,6 +576,11 @@ impl Plane {
                         what: "instance",
                         id: id.0,
                     })?;
+                    // Its beam group's state moved with its bytes: the
+                    // runtime copied them into `resident`.
+                    if let Some(beam) = seat.beam.as_mut() {
+                        beam.retarget(pools, resident).map_err(program)?;
+                    }
                     let was = (seat.session.pair_place().clone(), seat.pair_generation);
                     seat.session
                         .retarget(pools, instance, scratch, pair)
@@ -799,6 +834,68 @@ impl Plane {
         let indptr = engine_gpu::program::embed_indptr(&seat.plan, &seat.inst);
         engine_gpu::program::lane_mask(&ring.front(), keys, &indptr, instance, rows, lane_at)
             .map(Some)
+    }
+
+    /// `instance`'s beam group at a fire: its state's first pool word, its
+    /// layout, and its parents: the device cell a pass still on the queue
+    /// keeps, which the fire copies in behind it, or else the cell the
+    /// ring holds once the pass that put it landed.
+    pub fn beam_group(
+        &self,
+        instance: InstanceId,
+        pools: &Pools<crate::device::Api>,
+    ) -> Result<
+        Option<(
+            u32,
+            engine_gpu::guest::state::BeamLayout,
+            engine_gpu::beam::Parents<crate::device::Api>,
+        )>,
+        Refusal,
+    > {
+        let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
+            what: "instance",
+            id: instance.0,
+        })?;
+        let Some(beam) = seat.beam.as_ref() else {
+            return Ok(None);
+        };
+        let state = beam
+            .word(pools)
+            .map_err(|fault| Refusal::Program(fault.to_string()))?;
+        let binding = seat
+            .plan
+            .package
+            .ports
+            .iter()
+            .find(|binding| binding.port == Port::Parents && !binding.is_const)
+            .ok_or_else(|| {
+                Refusal::Program(format!("instance {instance} keeps a beam group and binds no parents"))
+            })?;
+        #[cfg(feature = "vulkan")]
+        if let Some(cell) = seat.session.kept_cell(binding.channel) {
+            return Ok(Some((state, beam.layout(), engine_gpu::beam::Parents::Cell(cell))));
+        }
+        let ring = &seat.inst.channels[binding.channel as usize];
+        seat.landing.wait((binding.channel, ring.head()), &seat.faulted);
+        if seat.faulted.load(Ordering::Acquire) {
+            return Err(Refusal::Program(format!("instance {instance} is poisoned")));
+        }
+        if ring.is_empty() {
+            return Err(Refusal::Program(format!(
+                "instance {instance}: the `parents` ring is empty at the fire"
+            )));
+        }
+        let parents = match ring.front() {
+            Value::U32(cells) => cells,
+            Value::I32(cells) => cells.iter().map(|&p| p as u32).collect(),
+            other => {
+                return Err(Refusal::Program(format!(
+                    "instance {instance}: `parents` holds {:?}, not beams",
+                    other.dtype()
+                )));
+            }
+        };
+        Ok(Some((state, beam.layout(), engine_gpu::beam::Parents::Host(parents))))
     }
 
     pub fn publish(
@@ -1401,6 +1498,28 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
 
     fn close_instance(&mut self, id: InstanceId) -> Result<(), Refusal> {
         Plane::close_instance(self, id)
+    }
+
+    fn beam_group(
+        &self,
+        instance: InstanceId,
+        pools: &Pools<crate::device::Api>,
+    ) -> Result<
+        Option<(
+            u32,
+            engine_gpu::guest::state::BeamLayout,
+            engine_gpu::beam::Parents<crate::device::Api>,
+        )>,
+        Refusal,
+    > {
+        Plane::beam_group(self, instance, pools)
+    }
+
+    fn beam_state(
+        &self,
+        instance: InstanceId,
+    ) -> Option<&engine_gpu::beam::Resident<crate::device::Api>> {
+        self.instances.get(&instance)?.beam.as_ref()
     }
 
     fn input_cell(

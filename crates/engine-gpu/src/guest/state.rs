@@ -27,8 +27,15 @@
 //!   from the room's first byte, in the room of one pair it carries that
 //!   reads them; their contents are dead once the fire has read them out.
 //!
-//! The contents are dead between fires, so a park copies nothing and an
-//! unpark takes fresh room, the engine told where (`Rebind::Instance`).
+//! - where the program states each beam's parent, its beam group's state
+//!   (`resident`, [`BeamLayout`]), in a run of the instance's `Instance`
+//!   slots of its own: the one part a later fire reads.
+//!
+//! The heaps' and score rows' contents are dead between fires, so a park
+//! copies nothing and an unpark takes fresh room, the engine told where
+//! (`Rebind::Instance`). The beam state is live: the runtime copies it
+//! wherever a park moves the instance and back into the fresh run it names
+//! at the unpark, so it is cleared only at the bind.
 //! Room that changes owner is zeroed before the guest's first fire there
 //! ([`Placed::clear`]): an instance's at its bind and its unpark, a pair's
 //! at each new taking of its slots ([`Takings`]); never per fire.
@@ -74,6 +81,50 @@ pub struct GuestLayout {
     pub instance: u64,
     /// The bytes the pair's side takes.
     pub pair: u64,
+    /// A beam group's state (`BEAM-PAGE-LISTS.md` §4), where the program
+    /// states each beam's parent: the instance's resident run, live from
+    /// the bind to the close, laid for the bind's depth.
+    pub beam: Option<BeamLayout>,
+}
+
+/// A beam group's resident state as `kernels_slang::runtime::beam` lays it:
+/// its beams, the pool pages and columns it holds at most, and the frames
+/// in flight a freed page waits out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BeamLayout {
+    pub lanes: u32,
+    pub cap: u32,
+    pub frames: u32,
+}
+
+impl BeamLayout {
+    /// A group of `lanes` beams searching to `end` (the bind's `key_len`,
+    /// the slot past its last row) over `page`-slot kv pages, `frames`
+    /// frames in flight: each beam's pages to `end`, the pages a fire hands
+    /// out, those pending over the frames and the prompt's own page
+    /// (`BEAM-PAGE-LISTS.md` §3, §4). Refused by name with no depth.
+    pub fn of(lanes: u32, end: u32, page: u32, frames: u32) -> std::result::Result<BeamLayout, String> {
+        if end <= 1 {
+            return Err("a beam group (parents) binds with no depth: its pass states the slot \
+                        past the search's last row (state-geometry parents-end)"
+                .to_string());
+        }
+        kernels_slang::runtime::beam::admit_lanes(lanes).map_err(|why| why.to_string())?;
+        let frames = frames.max(1);
+        let pages = end.div_ceil(page.max(1));
+        let cap = lanes
+            .checked_mul(pages)
+            .and_then(|held| held.checked_add(lanes.checked_mul(frames + 1)?))
+            .and_then(|held| held.checked_add(1))
+            .ok_or_else(|| format!("a beam group of {lanes} beams to slot {end} passes u32 pages"))?;
+        Ok(BeamLayout { lanes, cap, frames })
+    }
+
+    /// The state's bytes.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        kernels_slang::runtime::beam::state_words(self.lanes, self.cap, self.frames) * 4
+    }
 }
 
 impl GuestLayout {
@@ -101,7 +152,21 @@ impl GuestLayout {
             scores,
             instance: ends[0],
             pair: ends[1],
+            beam: None,
         }
+    }
+
+    /// This layout beside a beam group's state.
+    #[must_use]
+    pub fn with_beam(mut self, beam: Option<BeamLayout>) -> GuestLayout {
+        self.beam = beam;
+        self
+    }
+
+    /// The resident run's bytes: a beam group's state, or none.
+    #[must_use]
+    pub fn resident(&self) -> u64 {
+        self.beam.map_or(0, |beam| beam.bytes())
     }
 
     /// The layout of `plans`' stages bound at `extents`, beside `scores`
@@ -154,11 +219,20 @@ impl GuestLayout {
                 self.instance, self.pair, facts.chunk, facts.segment_chunks
             )));
         }
+        let resident = self.resident();
+        if resident > facts.chunk {
+            return Err(refused(format!(
+                "a beam group's state of {resident} bytes is past a chunk of {}, and an \
+                 instance's resident run lies in one chunk's slots",
+                facts.chunk
+            )));
+        }
         Ok(GuestState {
-            // Today's arms are folded into the instance's bytes: one arm, no
-            // scratch apart.
-            resident: self.instance,
-            scratch: 0,
+            // The stage heaps are dead between fires (one arm: a pass runs
+            // whole before the next stages anything); a beam group's state
+            // is what a later fire reads, live and moved with the instance.
+            resident,
+            scratch: self.instance,
             scratch_arms: 1,
             per_pair: self.pair,
             run: u32::try_from(run).unwrap_or(u32::MAX),
@@ -429,8 +503,8 @@ mod tests {
         assert_eq!(
             small.state(&FACTS).expect("fits"),
             GuestState {
-                resident: 100_000,
-                scratch: 0,
+                resident: 0,
+                scratch: 100_000,
                 scratch_arms: 1,
                 per_pair: 0,
                 run: 0
@@ -440,8 +514,8 @@ mod tests {
         assert_eq!(
             top_p.state(&FACTS).expect("fits"),
             GuestState {
-                resident: 5_056_768,
-                scratch: 0,
+                resident: 0,
+                scratch: 5_056_768,
                 scratch_arms: 1,
                 per_pair: 0,
                 run: 2
@@ -450,6 +524,16 @@ mod tests {
         // A 9 MiB score room beside a small heap: the room's run.
         let scored = GuestLayout::of(&[100_000], 9 << 20);
         assert_eq!(scored.state(&FACTS).expect("fits").run, 3);
+        // A beam group's state is the instance's resident run, the heaps
+        // its scratch; a state past a chunk is refused by name.
+        let beam = super::BeamLayout::of(4, 1100, 16, 2).expect("a depth");
+        assert_eq!(beam.cap, 4 * 69 + 4 * 3 + 1);
+        let beamed = GuestLayout::of(&[100_000], 0).with_beam(Some(beam));
+        let state = beamed.state(&FACTS).expect("fits");
+        assert_eq!((state.resident, state.scratch), (beam.bytes(), 100_000));
+        let deep = super::BeamLayout::of(64, 1 << 20, 16, 2).expect("a depth");
+        assert!(GuestLayout::of(&[100_000], 0).with_beam(Some(deep)).state(&FACTS).is_err());
+        assert!(super::BeamLayout::of(4, 1, 16, 2).is_err(), "no depth is refused");
         let past = GuestLayout::of(&[65 * (4 << 20)], 0);
         assert!(past.state(&FACTS).is_err());
         assert_eq!(
