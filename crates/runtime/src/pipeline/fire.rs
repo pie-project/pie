@@ -3701,6 +3701,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
     this: Resource<Pipeline>,
     fwd: Resource<ForwardPass>,
     frame: Option<crate::scheduler::FrameStamp>,
+    ahead: u32,
 ) -> Anyhow<Result<(), String>> {
     let submit_probe = crate::scheduler::probe::host_submit();
     let submit_clock = crate::scheduler::probe::ProbeClock::start();
@@ -4159,6 +4160,9 @@ pub async fn submit_pass_stamped<C: FireContext>(
             &forced,
             &switched.tails,
         );
+        if let Err(refusal) = every_lane_in_last_piece(&cuts, full.lanes.len()) {
+            return Ok(Err(refusal));
+        }
         // Only a lone lane's rest is cut again once a raise lands.
         let recuttable = full.lanes.len() == 1 && cuts.len() > 1;
         // A piece that would not cut to the rung asks for its own width,
@@ -4243,6 +4247,25 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // The pieces in frames of their own, in the order they are cut, so
         // the pieces of concurrent prompts seal together.
         let frame_size = crate::scheduler::configured_frame_size().max(1);
+        // A cut pass behind fires of its own frame would run its leading
+        // pieces (unframed) between them and its last piece (framed with
+        // them): no order runs both before it. The frame goes with the fires
+        // ahead of it, and the pass and the frame's later slots in frames of
+        // their own, in order.
+        let frame = match frame {
+            Some(stamp) if reframes(stamp, ahead, cuts.len()) => {
+                let _ = scheduler.frame_truncate(stamp.lane, stamp.seq, ahead);
+                let pipeline = ctx.resources().get(&this)?;
+                pipeline.mark_reframed(stamp.seq);
+                Some(crate::scheduler::FrameStamp {
+                    seq: pipeline.next_frame_seq(),
+                    slot: 0,
+                    fires: 1,
+                    ..stamp
+                })
+            }
+            frame => frame,
+        };
         let mut frames = {
             let pipeline = ctx.resources().get(&this)?;
             piece_frames(frame, cuts.len(), frame_size, || pipeline.next_frame_seq())
@@ -4724,6 +4747,30 @@ pub async fn submit_pass_stamped<C: FireContext>(
 /// pieces queue in their order and the pieces of concurrent lanes seal
 /// together rather than one launch at a time. A pass sharing its frame keeps
 /// that frame for its last piece, its earlier pieces unframed.
+/// Whether a pass cut into `pieces`, stamped `stamp` behind `ahead` fires
+/// of its own frame, goes in frames of its own: its leading pieces go
+/// unframed and its last with the frame, so with fires of its frame ahead
+/// no order would run them all first.
+fn reframes(stamp: crate::scheduler::FrameStamp, ahead: u32, pieces: usize) -> bool {
+    stamp.fires > 1 && ahead > 0 && pieces > 1
+}
+
+/// Every lane of a pass rides its last fire, the one that runs the program:
+/// a pass whose last fire left a lane out would read it nowhere.
+fn every_lane_in_last_piece(cuts: &[Vec<Option<(u32, u32)>>], lanes: usize) -> Result<(), String> {
+    let held = cuts
+        .last()
+        .map_or(0, |piece| piece.iter().filter(|cut| cut.is_some()).count());
+    if held == lanes {
+        Ok(())
+    } else {
+        Err(format!(
+            "pipeline: the last fire of a pass of {lanes} lanes carries {held}: every lane of \
+             a pass rides its last fire, the one that runs its program"
+        ))
+    }
+}
+
 pub(crate) fn piece_frames(
     frame: Option<crate::scheduler::FrameStamp>,
     pieces: usize,
@@ -4789,7 +4836,7 @@ pub async fn submit_frame<C: FireContext>(
     }
     if k == 1 {
         let (_, rep) = fired[0];
-        return submit_pass_stamped(ctx, this, Resource::new_borrow(rep), None).await;
+        return submit_pass_stamped(ctx, this, Resource::new_borrow(rep), None, 0).await;
     }
     {
         let probe = crate::scheduler::probe::host_submit();
@@ -4810,16 +4857,31 @@ pub async fn submit_frame<C: FireContext>(
     };
     let fires = fired.len() as u32;
     for (index, &(slot, rep)) in fired.iter().enumerate() {
-        let stamp = crate::scheduler::FrameStamp {
-            lane,
-            seq,
-            slot,
-            fires,
+        // Once a cut pass truncated the frame, each slot after it goes in a
+        // frame of its own.
+        let reframed = ctx.resources().get(&this)?.reframed(seq);
+        let (stamp, ahead) = if reframed {
+            let seq = ctx.resources().get(&this)?.next_frame_seq();
+            let own = crate::scheduler::FrameStamp {
+                lane,
+                seq,
+                slot: 0,
+                fires: 1,
+            };
+            (own, 0)
+        } else {
+            let stamp = crate::scheduler::FrameStamp {
+                lane,
+                seq,
+                slot,
+                fires,
+            };
+            (stamp, index as u32)
         };
         let pipeline: Resource<Pipeline> = Resource::new_borrow(this.rep());
         let fwd: Resource<ForwardPass> = Resource::new_borrow(rep);
-        let outcome = submit_pass_stamped(ctx, pipeline, fwd, Some(stamp)).await;
-        if !matches!(outcome, Ok(Ok(()))) && index > 0 {
+        let outcome = submit_pass_stamped(ctx, pipeline, fwd, Some(stamp), ahead).await;
+        if !matches!(outcome, Ok(Ok(()))) && index > 0 && !reframed {
             let first: Resource<ForwardPass> = Resource::new_borrow(fired[0].1);
             if let Ok(pass) = ctx.resources().get(&first)
                 && let Ok(bound) = pass.bound()
@@ -6964,6 +7026,8 @@ mod cut_tests {
         a_masked_pass_is_cut_with_its_rows_masks();
         the_last_piece_holds_what_the_program_reads();
         several_lanes_are_cut_and_end_together();
+        every_lane_of_a_pass_rides_its_last_fire();
+        a_cut_pass_behind_fires_of_its_frame_goes_in_frames_of_its_own();
         a_lane_only_in_the_last_piece_is_not_written_before_it();
         a_pass_with_media_is_cut_before_its_first_span();
         a_pass_with_media_keys_the_rows_before_it();
@@ -7132,6 +7196,39 @@ mod cut_tests {
         assert!(!tail.media.is_empty(), "it cuts the log");
         req.lanes[0].positions = (0..100).collect();
         assert_eq!(keyed_rows(&req), 0, "rows rotated off their slots");
+    }
+
+    /// The pieces a pass is cut into end together: its last fire holds
+    /// every lane, and a last piece that left one out is refused by name.
+    fn every_lane_of_a_pass_rides_its_last_fire() {
+        let mut req = prefill_lane(5, 100, 16);
+        let other = prefill_lane(0, 40, 16).lanes.remove(0);
+        req.lanes.push(other);
+        let pieces = pass_pieces(&req, true, true, 32, 16, &[], &[]);
+        assert!(pieces.len() > 1);
+        assert_eq!(every_lane_in_last_piece(&pieces, 2), Ok(()));
+        let short = vec![vec![Some((0, 50)), Some((0, 40))], vec![Some((50, 100)), None]];
+        let refusal = every_lane_in_last_piece(&short, 2).unwrap_err();
+        assert!(
+            refusal.contains("a pass of 2 lanes carries 1"),
+            "{refusal}"
+        );
+    }
+
+    /// A cut pass sends its leading pieces unframed and its last with its
+    /// frame: behind fires of its own frame it goes in frames of its own;
+    /// first in its frame, alone in it, or uncut, it keeps the frame.
+    fn a_cut_pass_behind_fires_of_its_frame_goes_in_frames_of_its_own() {
+        let stamp = |fires| crate::scheduler::FrameStamp {
+            lane: uuid::Uuid::from_u128(1),
+            seq: 3,
+            slot: 1,
+            fires,
+        };
+        assert!(reframes(stamp(2), 1, 3), "slot 1 behind slot 0, cut");
+        assert!(!reframes(stamp(2), 0, 3), "first in its frame");
+        assert!(!reframes(stamp(1), 0, 3), "a frame of its own");
+        assert!(!reframes(stamp(2), 1, 1), "uncut");
     }
 
     fn several_lanes_are_cut_and_end_together() {

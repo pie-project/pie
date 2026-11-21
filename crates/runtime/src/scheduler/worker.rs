@@ -803,6 +803,9 @@ struct QueueScan {
     /// behind its copy.
     untracked: Vec<u64>,
     riding: HashSet<Option<ProcessId>>,
+    /// The pipelines with a framed launch queued: an unframed one behind it
+    /// does not ride ahead of it.
+    framed_ahead: HashSet<ProcessId>,
     drain_eligible: Vec<u64>,
     /// The rider batch is one fire fired alone ([`QueuedLaunch::solo`]).
     solo: bool,
@@ -814,6 +817,7 @@ impl QueueScan {
         self.blocked_lanes.clear();
         self.untracked.clear();
         self.riding.clear();
+        self.framed_ahead.clear();
         self.solo = false;
         self.drain_eligible.clear();
     }
@@ -2590,11 +2594,18 @@ impl BatchScheduler {
                     }
                     // A launch never overtakes a copy its pipeline queued
                     // ahead of it: the copy fills what the launch reads.
-                    let behind_copy = launch
-                        .pipeline_id
-                        .is_some_and(|pipeline| scan.blocked_lanes.contains(&pipeline));
+                    // Nor a framed launch its pipeline queued ahead of it:
+                    // what that fire writes (its kv, its rings), this one
+                    // reads. It rides once that one's frame has gone.
+                    let behind_copy = launch.pipeline_id.is_some_and(|pipeline| {
+                        scan.blocked_lanes.contains(&pipeline)
+                            || scan.framed_ahead.contains(&pipeline)
+                    });
                     if launch.framed {
                         scan.queued_ids.push(launch.fire_id);
+                        if let Some(pipeline) = launch.pipeline_id {
+                            scan.framed_ahead.insert(pipeline);
+                        }
                     } else if launch.solo {
                         // Fired alone: the first such, and with no rider.
                         if !behind_copy && scan.untracked.is_empty() {
@@ -2745,6 +2756,7 @@ impl BatchScheduler {
             };
             let (frame_progress, posted) = Self::post_frame(
                 slot_buffer,
+                frame_policy,
                 engine_loop,
                 replies,
                 instances,
@@ -2812,6 +2824,7 @@ impl BatchScheduler {
     )]
     fn post_frame(
         slot_buffer: &mut SlotBuffer,
+        frame_policy: &mut FramePolicy,
         engine_loop: &Lane,
         replies: &mut LaneReplies,
         instances: &mut HashMap<::engine::InstanceId, TrackedInstance>,
@@ -2884,6 +2897,26 @@ impl BatchScheduler {
             } else {
                 progress = true;
             }
+        }
+        // The device runs the waves in order, and a pipeline's fires in a
+        // wave in the order they stand: each pipeline's fires post in the
+        // order it submitted them, or the one out of order is refused.
+        for wave in &mut survivors {
+            wave.retain(|request| {
+                let Some(pipeline) = request.pipeline_id else {
+                    return true;
+                };
+                match frame_policy.admit_post(pipeline, request.logical_fire_id) {
+                    Ok(()) => true,
+                    Err(later) => {
+                        let reason = super::frame::out_of_order(pipeline, request.logical_fire_id, later);
+                        tracing::error!("{reason}");
+                        request.completion.reject_unsubmitted(reason);
+                        progress = true;
+                        false
+                    }
+                }
+            });
         }
         if survivors.iter().all(Vec::is_empty) {
             return (progress, false);
@@ -3703,6 +3736,7 @@ mod tests {
         a_panicking_engine_fails_its_launch_instead_of_leaving_it_in_flight();
         a_retryable_refusal_past_admission_fails_by_name_instead_of_replaying();
         a_launch_waits_for_the_copy_queued_ahead_of_it();
+        an_unframed_piece_waits_for_its_pipelines_framed_fire_queued_ahead();
         a_pass_that_only_reorders_lets_the_worker_park();
         what_a_frame_settled_inside_submit_wrote_is_kept_when_it_is_answered();
         a_step_wider_than_the_rung_the_engine_holds_never_reaches_it();
@@ -3843,6 +3877,44 @@ mod tests {
         let mut cache = ScanCache::default();
         let scan = BatchScheduler::scan_queue(&mut cache, &pending, false);
         assert_eq!(scan.untracked, [9]);
+    }
+
+    /// A cut pass in slot 1 sends its leading pieces unframed: they never
+    /// ride ahead of slot 0 of the same pipeline, queued framed before them
+    /// and waiting for its frame. Another pipeline's piece still rides; once
+    /// slot 0's frame has gone, the piece rides too.
+    fn an_unframed_piece_waits_for_its_pipelines_framed_fire_queued_ahead() {
+        let (pipeline, other) = (ProcessId::from_u128(5), ProcessId::from_u128(6));
+        let launch = |fire: u64, pipeline: ProcessId, framed: bool| PendingRequest {
+            lora_program: false,
+            logical_fire_id: fire,
+            request: crate::engine::FireRequest::default(),
+            instance_id: ::engine::InstanceId(fire),
+            completion: crate::engine::WorkItemCompletion::new(fire, 0),
+            process_id: None,
+            pipeline_id: Some(pipeline),
+            prelaunch_copy: None,
+            prelaunch_state_copy: None,
+            frame: framed.then_some(FrameStamp {
+                lane: pipeline,
+                seq: 0,
+                slot: 0,
+                fires: 2,
+            }),
+        };
+        let mut pending = PendingQueue::default();
+        BatchScheduler::queue_attempt(&mut pending, launch(1, pipeline, true));
+        BatchScheduler::queue_attempt(&mut pending, launch(2, pipeline, false));
+        BatchScheduler::queue_attempt(&mut pending, launch(3, other, false));
+        let mut cache = ScanCache::default();
+        let scan = BatchScheduler::scan_queue(&mut cache, &pending, false);
+        assert_eq!(scan.untracked, [3], "slot 1's piece waits behind slot 0");
+        assert_eq!(scan.queued_ids, [1].into_iter().collect());
+        // Slot 0's frame is posted: the piece rides.
+        assert!(matches!(pending.pop_front(), Some(QueuedItem::Launch(_))));
+        let mut cache = ScanCache::default();
+        let scan = BatchScheduler::scan_queue(&mut cache, &pending, false);
+        assert_eq!(scan.untracked, [2, 3]);
     }
 
     fn a_panicking_engine_fails_its_launch_instead_of_leaving_it_in_flight() {

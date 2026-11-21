@@ -256,9 +256,33 @@ pub(crate) struct FramePolicy {
     submit_deadline: Duration,
     silence_timeout: Duration,
     stats: Option<Arc<SchedulerStats>>,
+    /// Each pipeline's last fire posted, by its submit order (the logical
+    /// fire id its pass took at submit): a fire posted behind a later one of
+    /// its pipeline is refused by name ([`Self::admit_post`]).
+    posted_through: HashMap<ProcessId, u64>,
+}
+
+/// Why a fire posted behind a later one of its pipeline is refused.
+pub(crate) fn out_of_order(pipeline: ProcessId, fire: u64, later: u64) -> String {
+    format!(
+        "scheduler: fire {fire} of pipeline {pipeline} would post after its later fire {later}: \
+         a pipeline's fires reach the device in the order it submitted them"
+    )
 }
 
 impl FramePolicy {
+    /// Admits `fire` of `pipeline` to the device if no later fire of the
+    /// pipeline has posted before it; else names that later fire.
+    pub fn admit_post(&mut self, pipeline: ProcessId, fire: u64) -> Result<(), u64> {
+        match self.posted_through.get(&pipeline) {
+            Some(&later) if later > fire => Err(later),
+            _ => {
+                self.posted_through.insert(pipeline, fire);
+                Ok(())
+            }
+        }
+    }
+
     #[cfg(test)]
     fn with_submit_deadline(mut self, deadline: Duration) -> Self {
         self.submit_deadline = deadline;
@@ -406,6 +430,7 @@ impl FramePolicy {
             submit_deadline: crate::scheduler::configured_submit_deadline(),
             silence_timeout: crate::scheduler::configured_silence_timeout(),
             stats,
+            posted_through: HashMap::new(),
         }
     }
 
@@ -716,6 +741,7 @@ impl FramePolicy {
         let owner = owner.or_else(|| self.lanes.get(&lane).and_then(|state| state.owner));
         // Its prompt holds no other behind it from here, landed or not.
         self.prompts_executing.remove(&lane);
+        self.posted_through.remove(&lane);
         if purge_queued {
             self.lanes.remove(&lane);
             self.truncated_seqs.remove(&lane);
@@ -750,7 +776,9 @@ impl FramePolicy {
             self.truncated_seqs.remove(&id);
             self.in_flight_lanes.remove(&id);
             self.prompts_executing.remove(&id);
+            self.posted_through.remove(&id);
         }
+        self.posted_through.remove(&owner);
         self.lanes.retain(|_, lane| lane.owner != Some(owner));
         self.pending_binds.remove(&owner);
         self.suspended.remove(&owner);
@@ -1709,6 +1737,7 @@ mod tests {
         a_wave_reads_out_no_more_than_the_engine_carves();
         a_policys_bound_packs_prompts_into_a_frame_up_to_it_and_no_further();
         a_frame_goes_without_a_lane_whose_process_waits();
+        a_pipelines_fire_posted_behind_a_later_one_is_refused_by_name();
         a_prompt_piece_cut_under_a_cap_since_lowered_waits_whole_and_owes_nothing();
         a_parked_owner_s_complete_frame_goes_without_waiting_on_the_boundary();
     }
@@ -2572,6 +2601,24 @@ mod tests {
         policy.cap_fires(128);
         let queued: QueuedFireIds = [3].into_iter().collect();
         assert_eq!(fires(&plan(&mut policy, &queued, Instant::now())), vec![3]);
+    }
+
+    /// Each pipeline's fires post in the order it submitted them: one that
+    /// would post behind a later fire of its pipeline is refused, naming
+    /// both; other pipelines keep their own order; a pipeline that leaves
+    /// is forgotten.
+    fn a_pipelines_fire_posted_behind_a_later_one_is_refused_by_name() {
+        let mut policy = FramePolicy::new(2, 64, 4096, None);
+        let (a, b) = (pid(), pid());
+        assert_eq!(policy.admit_post(a, 5), Ok(()));
+        assert_eq!(policy.admit_post(a, 7), Ok(()));
+        assert_eq!(policy.admit_post(b, 6), Ok(()), "another pipeline's order is its own");
+        assert_eq!(policy.admit_post(a, 6), Err(7), "6 would post after 7");
+        assert_eq!(policy.admit_post(a, 8), Ok(()), "the refused fire moved nothing");
+        let reason = out_of_order(a, 6, 7);
+        assert!(reason.contains("fire 6") && reason.contains("later fire 7"), "{reason}");
+        policy.on_lane_leave(a, None, true);
+        assert_eq!(policy.admit_post(a, 1), Ok(()), "a pipeline that left is forgotten");
     }
 
     /// A process whose bind found no room for its guest state (or whose
