@@ -209,6 +209,11 @@ pub enum SlotError {
     StaleRung,
     #[error("a compaction no longer matches the pool")]
     StaleCompaction,
+    /// Moves that would leave a run of chunks split: one of its chunks
+    /// moved without the rest, or not to the next physical chunk after its
+    /// first's destination. Refused whoever planned them.
+    #[error("chunk moves would split the run of {run} chunk(s) from logical chunk {head} at its chunk {at}")]
+    SplitsRun { head: u32, run: u32, at: u32 },
     /// A claim named a chunk that cannot be taken whole as it stands.
     #[error("chunk {chunk} cannot be claimed: {why}")]
     Unclaimable { chunk: u32, why: &'static str },
@@ -1218,6 +1223,9 @@ impl SlotPool {
         if act != evacuation.act {
             return Err(SlotError::StaleRung);
         }
+        if let Some((head, run, at)) = self.splits_run(&evacuation.moves) {
+            return Err(SlotError::SplitsRun { head, run, at });
+        }
         let mut targets = BTreeSet::new();
         let froms: BTreeSet<u32> = evacuation.moves.iter().map(|step| step.from).collect();
         if !self.held_in(limit, self.state_limit()).iter().all(|chunk| froms.contains(chunk)) {
@@ -1350,6 +1358,9 @@ impl SlotPool {
     /// `epoch` copies: each chunk moved off stays closed until that fire
     /// retires, and then the run it cleared stands free. All or nothing.
     pub fn apply_compaction(&mut self, moves: &[ChunkMove], epoch: u64) -> Result<(), SlotError> {
+        if let Some((head, run, at)) = self.splits_run(moves) {
+            return Err(SlotError::SplitsRun { head, run, at });
+        }
         let mut targets = BTreeSet::new();
         for step in moves {
             let fits = (step.logical as usize) < self.logical_to_physical.len()
@@ -1408,6 +1419,40 @@ impl SlotPool {
             .collect();
         let targets: BTreeSet<u32> = self.open.iter_in(0, limit).collect();
         self.moves_keeping_runs(&sources, targets, true).unwrap_or_default()
+    }
+
+    /// Whether `moves` would split a run of chunks ([`Self::runs`]), and
+    /// how, by name: a run lies at its first chunk's physical chunk and the
+    /// next ones, in one segment, and the engine addresses it so (a piece
+    /// from its first chunk's first byte); moved, every chunk of it moves,
+    /// each to the chunk after its predecessor's destination, in one
+    /// segment. Read on the moves alone, whoever planned them: the check
+    /// the movers' own placement does not stand in for (the M1 and the
+    /// L40S on ca5c710a7, runs split by a raise moving them chunk by chunk).
+    #[must_use]
+    pub fn splits_run(&self, moves: &[ChunkMove]) -> Option<(u32, u32, u32)> {
+        let to_of: HashMap<u32, u32> = moves.iter().map(|step| (step.from, step.to)).collect();
+        for (&head, &run) in &self.runs {
+            let Some(&start) = self.logical_to_physical.get(head as usize) else {
+                continue;
+            };
+            let moved: Vec<Option<u32>> = (start..start + run).map(|at| to_of.get(&at).copied()).collect();
+            if moved.iter().all(Option::is_none) {
+                continue;
+            }
+            let Some(first) = moved[0] else {
+                let at = moved.iter().position(Option::is_some).unwrap_or(0);
+                return Some((head, run, u32::try_from(at).unwrap_or(u32::MAX)));
+            };
+            for (k, to) in (0..run).zip(&moved) {
+                let whole = *to == Some(first + k)
+                    && self.segments.of(first + k) == self.segments.of(first);
+                if !whole {
+                    return Some((head, run, k));
+                }
+            }
+        }
+        None
     }
 
     /// Moves of the chunks at physical `sources` to `targets` (free
@@ -2968,6 +3013,14 @@ impl SlotPool {
         let segment = evacuation.segment;
         self.segments.check(segment)?;
         let stale = SegmentError::Stale(segment);
+        if let Some((head, run, at)) = self.splits_run(&evacuation.moves) {
+            return Err(SegmentError::SplitsRun {
+                segment,
+                head,
+                run,
+                at,
+            });
+        }
         if segment >= self.top_segment || self.segments.state(segment) != SegmentState::Committed {
             return Err(stale);
         }
@@ -3163,6 +3216,17 @@ impl SlotPool {
     /// Checks every internal invariant; for tests.
     #[cfg(test)]
     pub(crate) fn check(&self) {
+        for (&head, &run) in &self.runs {
+            let start = self.logical_to_physical[head as usize];
+            for at in start..start + run {
+                assert!(
+                    at < self.total
+                        && !self.free.get(at)
+                        && self.segments.of(at) == self.segments.of(start),
+                    "the run of {run} from logical chunk {head} (physical {start}) is split at {at}"
+                );
+            }
+        }
         let mut held = 0;
         let mut seg_used = vec![0u32; self.segments.count() as usize];
         for logical in 0..self.total {
@@ -3567,6 +3631,42 @@ mod tests {
             evacuation.moves.iter().map(|step| (step.from, step.to)).collect();
         assert!(moved.contains(&(10, 5)) && moved.contains(&(11, 6)), "whole: {moved:?}");
         pool.apply_rung(&evacuation, 7).unwrap();
+        pool.check();
+    }
+
+    /// Whoever plans them, moves that would split a run are refused by
+    /// name: one of its chunks without the rest, or the rest not following
+    /// its first. A run moved whole is applied.
+    #[test]
+    fn moves_that_split_a_run_are_refused_whoever_planned_them() {
+        let fixed = [(ShapeKind::Fixed, 4)];
+        let mut pool = SlotPool::new(facts_with(16, 4, 4, &fixed, &[(16, 2)]));
+        let holder = Holder::WorkingSet(1);
+        let filler = pool.acquire_chunk_runs(holder, 0, 1, 4).unwrap();
+        let run = pool.acquire_chunk_runs(holder, 0, 2, 1).unwrap();
+        let at = |pool: &SlotPool, chunk: u32| pool.chunk_table()[chunk as usize];
+        let low = filler.iter().map(|slot| at(&pool, slot.chunk)).min().unwrap();
+        pool.release(holder, &filler, 0);
+        pool.retire_through(u64::MAX);
+        let mut chunks: Vec<u32> = run.iter().map(|slot| slot.chunk).collect();
+        chunks.dedup();
+        chunks.sort_by_key(|&chunk| at(&pool, chunk));
+        let (head, second) = (chunks[0], chunks[1]);
+        let (from, next) = (at(&pool, head), at(&pool, second));
+        assert_eq!(next, from + 1);
+        let alone = [ChunkMove { logical: second, from: next, to: low }];
+        assert!(matches!(pool.apply_compaction(&alone, 3), Err(SlotError::SplitsRun { .. })));
+        let apart = [
+            ChunkMove { logical: head, from, to: low },
+            ChunkMove { logical: second, from: next, to: low + 2 },
+        ];
+        assert!(matches!(pool.apply_compaction(&apart, 3), Err(SlotError::SplitsRun { .. })));
+        let whole = [
+            ChunkMove { logical: head, from, to: low },
+            ChunkMove { logical: second, from: next, to: low + 1 },
+        ];
+        pool.apply_compaction(&whole, 3).unwrap();
+        pool.retire_through(u64::MAX);
         pool.check();
     }
 
