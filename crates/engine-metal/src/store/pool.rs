@@ -751,6 +751,20 @@ impl Pool {
         }
     }
 
+    /// The bytes of the heaps kept spare for the top: the device holds them,
+    /// mapped or not.
+    #[must_use]
+    pub fn top_spare_bytes(&self) -> u64 {
+        #[cfg(target_vendor = "apple")]
+        {
+            self.last().store.spare_held()
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            0
+        }
+    }
+
     /// The device bytes the span's backed segments hold.
     #[must_use]
     pub fn top_held_bytes(&self) -> u64 {

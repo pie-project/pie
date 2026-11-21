@@ -149,6 +149,19 @@ impl Context {
         match self.never {}
     }
 
+    #[must_use]
+    pub fn writes_timestamps(&self) -> bool {
+        match self.never {}
+    }
+
+    pub fn stamps(&self) -> Result<Stamps> {
+        match self.never {}
+    }
+
+    pub fn spanned_into(&self, _stamps: &Stamps, _keep: bool) -> Result<Frame> {
+        match self.never {}
+    }
+
     pub fn frame_kept(&self) -> Result<Frame> {
         match self.never {}
     }
@@ -157,6 +170,9 @@ impl Context {
 pub struct Frame {
     never: std::convert::Infallible,
 }
+
+#[derive(Clone, Debug)]
+pub enum Stamps {}
 
 impl Frame {
     pub fn flush_settled(&self) -> Result<()> {
@@ -269,6 +285,10 @@ impl Pending {
     }
 
     pub fn wait(&self) -> Result<()> {
+        match self.never {}
+    }
+
+    pub fn span_ns(&self) -> Result<Option<u64>> {
         match self.never {}
     }
 }

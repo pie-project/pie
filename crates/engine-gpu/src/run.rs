@@ -240,6 +240,9 @@ struct Split {
     layer: Option<u32>,
     step: Option<engine::StepDone>,
     since: std::time::Instant,
+    /// The layers a submission takes, and the layers begun since the last.
+    each: u32,
+    begun: u32,
 }
 
 pub struct Run<'c, B: Backend> {
@@ -367,12 +370,15 @@ impl<'c, B: Backend> Run<'c, B> {
         self.dense
     }
 
-    /// Submits the frame each time a node of a new layer has run.
-    pub fn flush_between_layers(&mut self, step: Option<engine::StepDone>) {
+    /// Submits the frame each time a node of a new layer has run past
+    /// every `each` layers (`crate::submit::pack_layers`).
+    pub fn flush_between_layers(&mut self, step: Option<engine::StepDone>, each: u32) {
         self.split = Some(Split {
             layer: None,
             step,
             since: std::time::Instant::now(),
+            each: each.max(1),
+            begun: 0,
         });
     }
 
@@ -392,7 +398,12 @@ impl<'c, B: Backend> Run<'c, B> {
             }
             return;
         };
-        if let Some(held) = split.layer.filter(|&held| held != layer) {
+        if let Some(held) = split.layer.filter(|&held| held != layer)
+            && {
+                split.begun += 1;
+                split.begun % split.each == 0
+            }
+        {
             let at = std::time::Instant::now();
             let flushed = B::submit_recording();
             let done = std::time::Instant::now();

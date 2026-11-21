@@ -325,6 +325,39 @@ pub fn planes(counts: &Counts, multiplied: Option<&[(u32, u32)]>) -> Vec<(u32, u
     planes
 }
 
+/// How many times `standing`'s dense matmul time at `rows` over `planes`
+/// `option`'s takes, by the kernels' curves (`rates`): the most it could
+/// lengthen a step `standing` is estimated at. `None` where a curve does
+/// not price a kernel either takes at a plane.
+#[must_use]
+pub fn slower_by(
+    target: Target,
+    rates: &profile::fire::Rates,
+    planes: &[(u32, u32, u32, f64)],
+    standing: &Dense,
+    option: &Dense,
+    rows: u32,
+) -> Option<f64> {
+    let curves = rates.kernel_tflops_by_shape.as_deref()?;
+    let time = |tactic: Tactic, n: u32, k: u32| -> Option<f64> {
+        let (kind, key) = crate::rates::curve_key(target, tactic, n, k);
+        let found = curves.iter().find(|c| c.id() == (kind, key, n, k))?;
+        let (&(first, _), &(most, _)) = (found.curve.first()?, found.curve.last()?);
+        if rows > most {
+            return None;
+        }
+        let at = rows.max(first);
+        let flops = 2.0 * f64::from(at) * f64::from(n) * f64::from(k);
+        profile::fire::interpolate(&found.curve, f64::from(at)).map(|t| flops / (t * 1e3))
+    };
+    let (mut was, mut is) = (0.0, 0.0);
+    for &(n, k, count, _) in planes {
+        was += f64::from(count) * time(standing.at(rows, n, k), n, k)?;
+        is += f64::from(count) * time(option.at(rows, n, k), n, k)?;
+    }
+    (was > 0.0).then(|| is / was)
+}
+
 /// The dense tactic over `rungs` (ascending rows) on `target`, the model's
 /// dense planes (`planes`, [`planes`]: each a dispatch reading its plane)
 /// weighed over `rates`; `full` the rows the chunker cuts a prompt by, whose

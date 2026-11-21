@@ -1360,16 +1360,40 @@ impl Context {
         self.spanned_with(false)
     }
 
+    /// Whether the queue writes timestamps (its family's
+    /// `timestampValidBits` nonzero, a nonzero `timestampPeriod`): a
+    /// spanned frame then reads its device time back.
+    #[must_use]
+    pub fn writes_timestamps(&self) -> bool {
+        self.core.stamp_bits() > 0
+    }
+
     fn spanned_with(&self, one_time: bool) -> Result<Frame> {
-        let frame = self.frame_with(one_time)?;
+        if self.core.stamp_bits() == 0 {
+            return self.frame_with(one_time);
+        }
+        let stamps = self.stamps()?;
+        self.spanned_into(&stamps, !one_time)
+    }
+
+    /// Two timestamps' query pool, laid now, which a spanned frame writes
+    /// ([`Context::spanned_into`]): laid at load and written by one frame
+    /// in flight at a time, so no serving frame lays one.
+    pub fn stamps(&self) -> Result<Stamps> {
         let core = &self.core;
         if core.stamp_bits() == 0 {
-            return Ok(frame);
+            return Err(Fault::Unbound {
+                what: format!(
+                    "timestamps on {}, whose queue family writes none (timestampValidBits 0, or \
+                     timestampPeriod 0)",
+                    core.name
+                ),
+            });
         }
-        let d = &core.device;
-        // SAFETY: `d` is live; the queue writes timestamps (checked above).
+        // SAFETY: `core.device` is live; the queue writes timestamps
+        // (checked above).
         let pool = unsafe {
-            d.create_query_pool(
+            core.device.create_query_pool(
                 &vk::QueryPoolCreateInfo::default()
                     .query_type(vk::QueryType::TIMESTAMP)
                     .query_count(2),
@@ -1377,6 +1401,22 @@ impl Context {
             )
         }
         .map_err(|e| core.fault("vkCreateQueryPool", e))?;
+        Ok(Stamps(Arc::new(StampPool {
+            core: Arc::clone(core),
+            pool,
+        })))
+    }
+
+    /// A frame writing its two timestamps into `stamps` (laid before,
+    /// [`Context::stamps`]): their reset and the opening one recorded first,
+    /// the closing one as it is submitted or kept; kept to replay where
+    /// `keep`, each replay writing them anew. One frame in flight writes a
+    /// pool at a time: its device time is read ([`Pending::span_ns`])
+    /// before the next is submitted.
+    pub fn spanned_into(&self, stamps: &Stamps, keep: bool) -> Result<Frame> {
+        let frame = self.frame_with(!keep)?;
+        let d = &self.core.device;
+        let pool = stamps.0.pool;
         let cmd = frame.inner.cmd();
         // SAFETY: `cmd` is recording outside a render pass and only this
         // frame records into it; the range is the pool's two queries.
@@ -1384,7 +1424,7 @@ impl Context {
             d.cmd_reset_query_pool(cmd, pool, 0, 2);
             d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, pool, 0);
         }
-        *frame.inner.span.lock().expect("span lock poisoned") = Some(pool);
+        *frame.inner.span.lock().expect("span lock poisoned") = Some(stamps.clone());
         Ok(frame)
     }
 
@@ -1531,7 +1571,7 @@ pub(crate) struct Inner {
 
     /// A spanned frame's two timestamps, before its work and after it
     /// ([`Context::spanned`]).
-    span: Mutex<Option<vk::QueryPool>>,
+    span: Mutex<Option<Stamps>>,
 
     spare: Mutex<std::collections::HashMap<u64, Vec<vk::DescriptorSet>>>,
 
@@ -1548,6 +1588,31 @@ pub(crate) struct Inner {
 impl Inner {
     pub(crate) fn cmd(&self) -> vk::CommandBuffer {
         vk::Handle::from_raw(self.cmd.load(Ordering::Acquire))
+    }
+}
+
+/// Two timestamps' query pool a spanned frame writes
+/// ([`Context::stamps`]), shared by the frames that write it, one in flight
+/// at a time; destroyed with the last.
+#[derive(Clone)]
+pub struct Stamps(Arc<StampPool>);
+
+impl std::fmt::Debug for Stamps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Stamps").finish()
+    }
+}
+
+struct StampPool {
+    core: Arc<Core>,
+    pool: vk::QueryPool,
+}
+
+impl Drop for StampPool {
+    fn drop(&mut self) {
+        // SAFETY: the last frame holding the pool is gone, and a submitted
+        // frame waits its fence before it drops, so no submission names it.
+        unsafe { self.core.device.destroy_query_pool(self.pool, None) };
     }
 }
 
@@ -1582,9 +1647,6 @@ impl Drop for Inner {
             if let Some(timing) = self.timing.get_mut().expect("timing lock poisoned").take() {
                 d.destroy_query_pool(timing.pool, None);
             }
-            if let Some(span) = self.span.get_mut().expect("span lock poisoned").take() {
-                d.destroy_query_pool(span, None);
-            }
             let owned = self
                 .core
                 .pools
@@ -1614,7 +1676,13 @@ impl Inner {
     /// The device's time between a spanned frame's two timestamps, ns, once
     /// it landed; `None` for a frame that writes none.
     fn span_ns(&self) -> Result<Option<u64>> {
-        let Some(pool) = *self.span.lock().expect("span lock poisoned") else {
+        let Some(pool) = self
+            .span
+            .lock()
+            .expect("span lock poisoned")
+            .as_ref()
+            .map(|stamps| stamps.0.pool)
+        else {
             return Ok(None);
         };
         let core = &self.core;
@@ -2173,7 +2241,13 @@ impl Frame {
 
     /// A spanned frame's closing timestamp, written while it is open.
     fn stamp_end(&self) {
-        let span = *self.inner.span.lock().expect("span lock poisoned");
+        let span = self
+            .inner
+            .span
+            .lock()
+            .expect("span lock poisoned")
+            .as_ref()
+            .map(|stamps| stamps.0.pool);
         if let Some(pool) = span
             && self.open
         {
@@ -2193,18 +2267,24 @@ impl Frame {
     /// A [`Context::spanned_kept`] frame, its closing timestamp written,
     /// kept to replay ([`Kept::replay_spanned`]).
     pub fn into_kept_spanned(self) -> Result<Kept> {
-        self.stamp_end();
         self.into_kept()
     }
 
+    /// Kept to replay; a spanned frame's closing timestamp written first,
+    /// so each replay writes both anew.
     pub fn into_kept(mut self) -> Result<Kept> {
+        self.stamp_end();
         self.end()?;
         Ok(Kept {
             inner: Arc::clone(&self.inner),
         })
     }
 
+    /// Submits; `on_done` runs once it lands. A spanned frame's closing
+    /// timestamp is written first, so [`Pending::span_ns`] reads its device
+    /// time once it landed.
     pub fn commit_async(mut self, on_done: Option<engine_gpu::backend::OnDone>) -> Result<Pending> {
+        self.stamp_end();
         let at = crate::encode::profiling().then(std::time::Instant::now);
         self.submit()?;
         if let Some(at) = at {
@@ -2430,6 +2510,13 @@ impl Pending {
         }
         self.inner.harvest_timing();
         Ok(())
+    }
+
+    /// The device's time between a spanned frame's two timestamps, ns, read
+    /// once it landed (its fence waited: the read waits on nothing more);
+    /// `None` for a frame that writes none.
+    pub fn span_ns(&self) -> Result<Option<u64>> {
+        self.inner.span_ns()
     }
 }
 

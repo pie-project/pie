@@ -869,6 +869,31 @@ and 0.032 s, 0 compiles after ready, and the beam fires themselves were on the l
 misses). The width is a constant of the inferlet's trace, so no ladder derives them; laying
 built-ins' guest programs before ready is GPU's queued item.
 
+## F44. engine-cuda reads its cgroup room itself; move it onto engine::host_memory
+
+`engine::host_memory::available` now leaves a capped cgroup `memory.max` less `memory.current` less
+`memory.stat inactive_file` (v6e: 150 GiB user.slice, 115 GiB charged, 96 GiB of it file cache,
+read 2 GiB free before and ~95 GiB after; the XLA guest compile ledger had refused a 2.3 GiB stage
+by name). engine-cuda nets the page cache in its own reader (`weights.rs` ~372-407), counting
+`inactive_file + active_file`. Move engine-cuda onto the shared reader and settle one rule for both:
+inactive only (what the kernel reclaims first, before a charge fails: the conservative room) or
+inactive + active (all file cache, which reclaim reaches under pressure).
+
+## F45. Remove the 600 s silence timeout
+
+The frame gate no longer drops a lane on a timer (the leash and `submit-deadline-us` are gone):
+a lane whose guest waits on outside input is parked by the host (`process::away_while`: session
+receives, `wasi:clocks` waits, an HTTP request until its response head), and a computing lane
+stays awaited. `runtime.silence_timeout` still terminates an awaited lane silent that long.
+Remove it once each case it still catches has its own mechanism:
+- (a) poll-mixed waits are classified: `wasi:io/poll` in componentize-js / py language
+  components (one poll can mix the guest's own pie futures with outside ones, so parking on
+  every poll would un-await own-fire waits), HTTP response-body streams after the head, and
+  sockets;
+- (b) a guest spinning in wasm without submitting;
+- (c) a completion that never arrives (a lane in flight for twice the timeout is terminated
+  through the same path today).
+
 ## F?? An unplaced served load hangs the GPU (slang backends, 2026-11-21)
 A direct fire on a served load before the engine places its programs (`Programs::load`)
 hangs the device instead of being refused: found when the dense settle fired from inside
