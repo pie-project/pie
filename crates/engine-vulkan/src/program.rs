@@ -621,8 +621,9 @@ impl Plane {
                         what: "instance",
                         id: id.0,
                     })?;
+                    // Said again by a move down of its tables: kept nowhere now.
+                    seat.session.park(*kept).map_err(program)?;
                     if !seat.parked {
-                        seat.session.park(*kept).map_err(program)?;
                         // It leaves its pair's taking as it leaves the group.
                         self.takings
                             .give(seat.session.pair_place(), seat.pair_generation);

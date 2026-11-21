@@ -208,8 +208,8 @@ impl GuestEngine {
     fn new(per_instance: u64, per_pair: u64) -> Self {
         Self {
             state: GuestState {
-                resident: per_instance,
-                scratch: 0,
+                resident: 0,
+                scratch: per_instance,
                 scratch_arms: 1,
                 per_pair,
                 run: 1,

@@ -280,7 +280,10 @@ impl ResidencyPlanner {
         // flight (the progress invariant, [`Self::dump_stall`]).
         // There its whole need is planned on the map as it stands, the
         // placement's reading of the room set aside.
-        let forced = self.force_moves.swap(false, Ordering::AcqRel);
+        // Something in flight since the stall moves the generation: that is
+        // progress, and the pass plans as any other.
+        let forced = self.force_moves.swap(false, Ordering::AcqRel)
+            && self.with_inner(|inner| inner.nothing_in_flight());
         let mismatch = placement.as_ref().is_some_and(super::pool::RestorePlacement::stands)
             && self.no_more_room_than_refused(victims.head_pid);
         if forced {
@@ -304,6 +307,9 @@ impl ResidencyPlanner {
                 head = %victims.head_pid,
                 restore = victims.restore,
                 need = ?shape,
+                kv_deficit,
+                kv_own,
+                rs_short = ?victims.rs_short,
                 short = ?placement.as_ref().map(|placement| &placement.short),
                 own_opened = ?placement.as_ref().map(|placement| placement.opened.len()),
                 bind_free_runs_after_own = ?placement.as_ref().and_then(|placement| placement.bind_free_runs),

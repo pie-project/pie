@@ -166,6 +166,9 @@ async fn park_down(
     let copied = guard.copy(planner, ProcessId::nil()).await;
     drop(reading);
     copied?;
+    // Its instances' tables leave the device now: said parked again, kept
+    // nowhere, before the commit hands their slots to anyone else.
+    park(planner.locus().1, guard.parked()).await?;
     let Move::Suspend { roles, rs, .. } = guard.take() else {
         unreachable!("a park down is a move down")
     };

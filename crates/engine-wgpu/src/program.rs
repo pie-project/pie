@@ -1171,8 +1171,9 @@ impl Plane {
                 {
                     seat.gate.settle(*id)?;
                     let mut half = seat.half.lock().expect("half lock poisoned");
+                    // Said again by a move down of its tables: kept nowhere now.
+                    half.session.park(*kept);
                     if !half.parked {
-                        half.session.park(*kept);
                         // It leaves its pair's taking as it leaves the group.
                         self.takings
                             .give(half.session.pair_place(), half.pair_generation);

@@ -540,7 +540,7 @@ impl Plane {
             Some(held) => held.place.clone(),
             None => take(state.per_pair),
         };
-        let scratch = take(state.resident);
+        let scratch = take(state.instance_bytes());
         self.bind(
             context, program_id, seeds, extents, geometry, device, channels, pooled, &scratch, &pair, 0,
         )

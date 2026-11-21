@@ -116,22 +116,23 @@ pub struct InstanceBinding {
 /// taken at the bind and held while bound ([`InstanceBinding::scratch`],
 /// [`InstanceBinding::pair`], [`ScratchPlace`]). Their contents are dead
 /// between fires: a park gives them back and an unpark takes fresh room,
-/// nothing copied, the engine told where ([`Rebind::Instance`]). Whatever
-/// of them a later fire reads is the engine's own to lay again: at every
-/// bind or rebind naming a new place or taking (Metal's batch sets and
-/// scratch sets, at the rebind), or at the next fire of a pair whose
-/// place moved (CUDA's flight tables, staged again once stale); the rest
-/// (lane scratch, a pair's heaps and score rows) a fire writes before it
-/// reads. Anything a fire leaves for a later one to read without such a
-/// lay belongs in the instance's tables ([`InstanceBinding::instance_slots`]),
-/// which a park copies byte for byte.
+/// nothing copied, the engine told where ([`Rebind::Instance`]). A pair
+/// holds no state across fires: everything a later fire reads from it is
+/// restaged at launch or at the rebind (CUDA's flight tables, staged again
+/// at the next fire of a moved pair; Metal's batch sets, laid at the
+/// rebind; Vulkan's and wgpu's heaps and score rows, written in the fire),
+/// pending Mac's and TPU's confirmation for theirs. Anything a fire leaves
+/// for a later one to read lies in the instance's tables
+/// ([`InstanceBinding::instance_slots`]), which a park copies byte for
+/// byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuestState {
-    /// Bytes an instance holds from bind to unbind (today's per_instance
-    /// minus the value scratch), dead between fires as the rest of the
-    /// state is: what of it a later fire reads, the engine lays again at
-    /// every bind and rebind. Status words, rings and anything else a fire
-    /// leaves for a later one lie in the instance's tables.
+    /// Bytes an instance holds from bind to unbind that a later fire reads
+    /// as a fire left them. None today: the runtime refuses a bind stating
+    /// any by name (`ResidentState`), as a park would give them back
+    /// uncopied; such bytes are stated as the instance's tables
+    /// ([`ProgramFacts::instance`]), copied with it. Every engine states 0
+    /// and its value scratch as [`Self::scratch`].
     #[serde(default)]
     pub resident: u64,
     /// Bytes ONE fire of the instance needs for its value scratch: dead outside that

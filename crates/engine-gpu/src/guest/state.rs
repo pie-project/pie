@@ -10,7 +10,7 @@
 //!
 //! - each stage's heap, the values its launches lay over their lifetimes
 //!   ([`eta_exec::tables::StageTables::scratch`]): the instance's own
-//!   (`resident`), in its own `Instance` slots or run of chunks, so the
+//!   (`scratch`, dead between fires), in its own `Instance` slots or run of chunks, so the
 //!   pool holds a heap for every bound instance and none more. Its stages
 //!   share one region as wide as the widest: a stage runs whole (staged
 //!   in, dispatched, read back, its kept puts copied to their channels'
@@ -155,10 +155,13 @@ impl GuestLayout {
             )));
         }
         Ok(GuestState {
-            // Today's arms are folded into the instance's bytes: one arm, no
-            // scratch apart.
-            resident: self.instance,
-            scratch: 0,
+            // The instance's value scratch, dead between fires: a park gives it
+            // back and an unpark takes fresh room. Today's arms are folded into
+            // it: one arm. What a later fire reads lies in the instance's
+            // tables, which the runtime copies with the instance, so no
+            // resident part is stated apart.
+            resident: 0,
+            scratch: self.instance,
             scratch_arms: 1,
             per_pair: self.pair,
             run: u32::try_from(run).unwrap_or(u32::MAX),
@@ -448,8 +451,8 @@ mod tests {
         assert_eq!(
             small.state(&FACTS).expect("fits"),
             GuestState {
-                resident: 100_000,
-                scratch: 0,
+                resident: 0,
+                scratch: 100_000,
                 scratch_arms: 1,
                 per_pair: 0,
                 run: 0
@@ -459,8 +462,8 @@ mod tests {
         assert_eq!(
             top_p.state(&FACTS).expect("fits"),
             GuestState {
-                resident: 5_056_768,
-                scratch: 0,
+                resident: 0,
+                scratch: 5_056_768,
                 scratch_arms: 1,
                 per_pair: 0,
                 run: 2

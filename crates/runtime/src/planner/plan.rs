@@ -174,6 +174,12 @@ impl ResidencyPlanner {
         self.stats
             .grow_parked
             .store(parked as u64, Ordering::Relaxed);
+        // A force spans the one pass after the stall that set it: one this
+        // pass did not take (it ended before its eviction step, or on
+        // something in flight) is stale, read later beside evictions and
+        // restores in flight (the L40S at 3 GiB on c8077be0f: forced passes
+        // said with evicting=2 restoring=1, and after "kv on its way").
+        self.force_moves.store(false, Ordering::Release);
         if !on_grow {
             self.dump_stall();
         }

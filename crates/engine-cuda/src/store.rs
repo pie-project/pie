@@ -2421,10 +2421,13 @@ impl Pools {
             });
         }
         Ok(engine::GuestState {
-            // Today's arms are folded into the instance's bytes: one arm, no
-            // scratch apart.
-            resident: per_instance,
-            scratch: 0,
+            // The instance's value scratch, dead between fires: a park gives it
+            // back and an unpark takes fresh room. Today's arms are folded into
+            // it: one arm. What a later fire reads lies in the instance's
+            // tables, which the runtime copies with the instance, so no
+            // resident part is stated apart.
+            resident: 0,
+            scratch: per_instance,
             scratch_arms: 1,
             per_pair,
             run,

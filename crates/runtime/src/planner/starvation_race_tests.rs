@@ -10320,6 +10320,47 @@ async fn a_forced_pass_never_restores_or_reserves_for_a_held_process() {
     );
 }
 
+/// The L40S at 3 GiB on c8077be0f (scratchpad
+/// stalls/l40s-c807-forced.txt, lines 1 and 2): forced passes said with
+/// evictions and a restore in flight, and after "kv on its way". A force
+/// spans the one pass after its stall: something in flight by then is
+/// progress, the pass plans as any other, and the force is gone after it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_force_with_something_in_flight_is_no_forced_pass_and_lasts_one_pass() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    pool.free.lock().extend(0..8);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (head, moving) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [head, moving] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    planner.with_inner(|inner| {
+        inner.procs.get_mut(&head).unwrap().state = Residency::Evicted;
+        inner.enqueue(
+            head,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        );
+        // Another process's eviction copy in flight.
+        inner.procs.get_mut(&moving).unwrap().state = Residency::Evicting;
+        inner.evicting.insert(moving, Reclaim::default());
+    });
+    planner.force_moves.store(true, Ordering::Release);
+    planner.plan();
+    assert_eq!(
+        planner.stats.forced_passes.load(Ordering::Relaxed),
+        0,
+        "an eviction in flight: no forced pass"
+    );
+    assert!(
+        !planner.force_moves.load(Ordering::Acquire),
+        "the force lasts the one pass"
+    );
+}
+
 /// Mac Pro at 2 GiB (g2) on c201812ea, serves 10,594 (scratchpad
 /// stalls/macpro-c2018-g2.txt): a restore head, need [(7, 2), (2, 2)], its
 /// own takes opening four chunks (its two runs of two), the placement

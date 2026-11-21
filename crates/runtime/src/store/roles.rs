@@ -185,6 +185,17 @@ pub enum RolesError {
         slot_bytes: u64,
         per_chunk: u32,
     },
+    /// The engine states guest state a later fire reads beside the
+    /// instance's tables (`GuestState::resident`): a park would give it
+    /// back uncopied, every part of the guest state being dead between
+    /// fires. What a later fire reads lies in the tables
+    /// (`ProgramFacts::instance`), which a park copies byte for byte.
+    #[error(
+        "{pair} states {bytes} resident bytes of guest state beside its tables; the runtime \
+         copies only an instance's tables (ProgramFacts::instance) across a park, and its \
+         guest state is dead between fires: state them as tables, or as scratch"
+    )]
+    ResidentState { pair: FireKey, bytes: u64 },
 }
 
 /// Whether `error` is a bind waiting for room for its guest state
@@ -278,8 +289,14 @@ pub const GUEST_WAITER: u64 = u64::MAX - 1;
 /// budget hold ([`super::slots::SlotPool::committable_runs`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuestRoom {
-    /// One run of `slots` adjacent `Instance` slots in a chunk.
-    Slots { slots: u32, committable: u32 },
+    /// One run of `slots` adjacent `Instance` slots in a chunk; `chunks`,
+    /// the fresh chunks the whole bind asks with it (each of its parts a
+    /// run of slots, the part short first among them), at least one.
+    Slots {
+        slots: u32,
+        committable: u32,
+        chunks: u32,
+    },
     /// `pieces` runs of `run` adjacent whole chunks, each inside one
     /// segment, and the free runs of that length and free chunks there
     /// were.
@@ -298,7 +315,7 @@ impl GuestRoom {
     #[must_use]
     pub fn chunk_runs(self) -> (u32, u32) {
         match self {
-            Self::Slots { .. } => (1, 1),
+            Self::Slots { chunks, .. } => (1, chunks.max(1)),
             Self::Runs { run, pieces, .. } => (run, pieces),
         }
     }
@@ -327,15 +344,29 @@ impl GuestRoom {
                 free_chunks,
                 committable,
             },
-            slots => slots,
+            // Each of the bind's parts a run of slots opening a chunk of its
+            // own: the room asked is every one of them, never the part short
+            // first alone (seed 16 of the simulation: an instance's and its
+            // pair's runs each opening a chunk, refused as one, served one
+            // chunk, short again, a spin).
+            Self::Slots {
+                slots,
+                committable,
+                chunks,
+            } => Self::Slots {
+                slots,
+                committable,
+                chunks: chunks.max(whole),
+            },
         }
     }
 
     fn with_committable(self, runs: u32) -> Self {
         match self {
-            Self::Slots { slots, .. } => Self::Slots {
+            Self::Slots { slots, chunks, .. } => Self::Slots {
                 slots,
                 committable: runs,
+                chunks,
             },
             Self::Runs {
                 run,
@@ -390,7 +421,12 @@ impl RolesError {
 impl std::fmt::Display for GuestRoom {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Slots { slots, .. } => write!(f, "no chunk has a run of {slots} free slots")?,
+            Self::Slots { slots, chunks, .. } => {
+                write!(f, "no chunk has a run of {slots} free slots")?;
+                if *chunks > 1 {
+                    write!(f, " (the bind opens {chunks} chunks)")?;
+                }
+            }
             Self::Runs {
                 run,
                 pieces,
@@ -463,6 +499,7 @@ impl Part {
             GuestRoom::Slots {
                 slots: self.run,
                 committable: 0,
+                chunks: 1,
             }
         }
     }
@@ -768,7 +805,9 @@ impl RoleMove {
     /// A park's instances, moved down or left where they lie
     /// ([`Item::shed`]): each is said to the engine as parked
     /// ([`Rebind::Parked`]) once the copies have landed and before the
-    /// commit gives its device slots to anyone else. None for an unpark.
+    /// commit gives its device slots to anyone else; a move down of one
+    /// parked where it lies says it again, its tables kept nowhere now.
+    /// None for an unpark.
     #[must_use]
     pub fn parked(&self) -> Vec<Rebind> {
         if !self.out {
@@ -2044,6 +2083,16 @@ impl Roles {
                     holder: item.holder,
                 });
             }
+        }
+        // Every guest part is dead between fires, given back at a park:
+        // bytes a later fire reads belong in the tables, copied with the
+        // instance (the simulation's data check on f152f9631: resident
+        // bytes lost at every park).
+        if state.resident > 0 {
+            return Err(RolesError::ResidentState {
+                pair,
+                bytes: state.resident,
+            });
         }
         let mut taken = GuestTaken::default();
         let run = state.chunks_a_piece();
