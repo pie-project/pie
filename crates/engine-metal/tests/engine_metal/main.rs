@@ -4,6 +4,7 @@ mod a_bank_past_2_gib_reads_its_last_rows;
 mod a_bound_guest_leaves_the_span_as_it_was;
 mod a_cold_registration_compiles_while_lanes_fire;
 mod a_mixed_fires_last_rows_are_each_lanes_own;
+mod a_prefill_reads_no_kv_cell_past_its_keys;
 mod a_prewarmed_program_registers_off_thread_without_compiling;
 mod a_faulted_epilogue_fails_its_own_lanes_alone;
 mod a_few_row_dense_matmul_reads_each_weight_once;
