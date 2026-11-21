@@ -1195,8 +1195,31 @@ impl Range {
         }];
         let outcome = commit_atomically(pool, &mut targets)?;
         if outcome == Commit::Committed {
+            let bottom = |segments: u32| {
+                (u64::from(segments) * self.segment_bytes)
+                    .min(self.arena.max_bytes)
+                    .min(self.limit)
+            };
+            let before = bottom(self.committed);
+            let after = bottom(segments);
             self.committed = segments;
             self.segment_high = self.segment_high.max(self.segment_bytes_committed());
+            // `unwritten-nan`: what the segments back anew holds NaN until a
+            // kernel writes it.
+            if crate::serve::diag::on().unwritten_nan {
+                let [low, high] = laid(after, self.parted);
+                let [was_low, was_high] = laid(before, self.parted);
+                // Each piece grows at its end, from what it held.
+                for ((at, len), (_, was)) in [(low, was_low), (high, was_high)] {
+                    if len > was {
+                        crate::device::fill_span(
+                            self.span(at + was, len - was)?,
+                            usize::try_from(len - was).unwrap_or(0),
+                            0xFF,
+                        )?;
+                    }
+                }
+            }
         }
         Ok(outcome)
     }
