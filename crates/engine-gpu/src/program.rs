@@ -287,6 +287,27 @@ pub trait Programs<B: Serve>: Default {
 
     fn close_instance(&mut self, id: InstanceId) -> Result<(), Refusal>;
 
+    /// `instance`'s beam group at a fire (`crate::beam`): its resident
+    /// state's first pool word, its layout, and where the parents its last
+    /// pass put come from; `None` for an instance whose program states no
+    /// parents.
+    fn beam_group(
+        &self,
+        instance: InstanceId,
+        pools: &Pools<B>,
+    ) -> Result<Option<(u32, crate::guest::state::BeamLayout, crate::beam::Parents<B>)>, Refusal>
+    {
+        let _ = (instance, pools);
+        Ok(None)
+    }
+
+    /// `instance`'s beam group's resident state, where its program states
+    /// each beam's parent.
+    fn beam_state(&self, instance: InstanceId) -> Option<&crate::beam::Resident<B>> {
+        let _ = instance;
+        None
+    }
+
     /// The ring ends `instance`'s stages move, as (channel, whether the end
     /// is the tail), each once; none for an instance the plane holds no
     /// longer.

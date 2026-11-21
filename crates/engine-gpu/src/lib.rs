@@ -7,6 +7,7 @@ pub mod host_memory;
 pub mod api;
 pub mod arena;
 pub mod backend;
+pub mod beam;
 pub mod blob;
 pub mod books;
 pub mod chunks;

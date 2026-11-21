@@ -1212,6 +1212,16 @@ impl<B: Serve> Shell<B> {
                 capture,
                 rows.rs.as_ref().map(|rs| rs.tokens),
                 binding,
+                // Every load lays a fire's beam groups (`crate::beam`): the
+                // kv planes a page holds (each kv row's keys and values) and
+                // the rs planes an rs page holds.
+                Some(crate::inputs::BeamFacts {
+                    planes: u32::try_from(2 * rows.kv_rows.len()).unwrap_or(u32::MAX),
+                    rs_planes: rows.rs.as_ref().map_or(0, |rs| {
+                        u32::try_from(rs.plane_at.len()).unwrap_or(u32::MAX)
+                    }),
+                    frames: u32::try_from(boot.runahead.frames().max(1)).unwrap_or(u32::MAX),
+                }),
             )
         };
         let arms = u32::try_from(boot.runahead.frames().max(1)).unwrap_or(u32::MAX);
@@ -2963,6 +2973,7 @@ impl<B: Serve> Shell<B> {
                 folds: &[],
                 done: None,
                 guests: None,
+                beams: &[],
             },
             None,
         )?;
@@ -2990,6 +3001,7 @@ impl<B: Serve> Shell<B> {
                 folds: &[],
                 done: None,
                 guests: None,
+                beams: &[],
             },
             None,
         )?;
@@ -3046,6 +3058,7 @@ impl<B: Serve> Shell<B> {
                 folds: &[],
                 done: None,
                 guests: None,
+                beams: &[],
             },
             None,
         )?;
@@ -3354,7 +3367,12 @@ impl<B: Serve> Shell<B> {
     }
 
     fn feed(&self, p: &Prepared<'_, B>) -> Result<Option<B::Pending>> {
-        if p.feeds.is_empty() && p.input_copies.is_empty() && p.beginning.is_empty() {
+        let beams = p.beams.as_ref().filter(|planned| !planned.is_empty());
+        if p.feeds.is_empty()
+            && p.input_copies.is_empty()
+            && p.beginning.is_empty()
+            && beams.is_none()
+        {
             return Ok(None);
         }
         let (store, tokens) = self.inputs[p.arm].token_seat();
@@ -3399,7 +3417,126 @@ impl<B: Serve> Shell<B> {
                 .map_err(crate::error::kernel)?;
             }
         }
+        if let Some(planned) = beams {
+            self.run_beams(&mut frame, p.arm, planned)?;
+        }
         frame.commit_async(None).map(Some)
+    }
+
+    /// Plans the fire's beam groups over its staged tables
+    /// ([`crate::beam::plan`]).
+    fn plan_beams<'a>(
+        &self,
+        arm: usize,
+        beams: &'a [crate::beam::Group<B>],
+        geometries: &[poem_exec::store::kv::Geometry],
+        seats: &[Seat],
+        seat_of: &[Option<(usize, u32)>],
+    ) -> Result<crate::beam::Planned<'a, B>> {
+        let laid = self.inputs[arm].laid();
+        let room = laid.beams().ok_or_else(|| {
+            program(
+                "serve::beams",
+                "a fire of beam groups on a load that laid no room for them".to_string(),
+            )
+        })?;
+        if self.pools.rs_rows().is_some() {
+            return Err(program(
+                "serve::beams",
+                "a beam group (parents) on a load that buffers recurrent rows: engine-gpu \
+                 pages a hybrid's beams' rs rows by their lists (BEAM-PAGE-LISTS.md §11) in \
+                 no kernel yet"
+                    .to_string(),
+            ));
+        }
+        if self.pools.pages_hold_more_than_kv() || self.copies {
+            return Err(program(
+                "serve::beams",
+                "a beam group (parents) on a load whose pages hold more than kv rows, or \
+                 whose windows copy their tables: a beam's copy moves kv planes alone and its \
+                 step resolves the staged tables alone"
+                    .to_string(),
+            ));
+        }
+        let (unit, planes) = self.pools.kv_planes()?;
+        let tables = geometries
+            .iter()
+            .enumerate()
+            .map(|(at, geometry)| {
+                let words = laid.table_words(at).ok_or_else(|| {
+                    program("serve::beams", format!("page table {at} is laid nowhere"))
+                })?;
+                Ok((geometry.indptr.as_slice(), words))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let staged = crate::beam::Staged {
+            room,
+            tables,
+            windowed: self.pools.tables().iter().any(|paged| paged.window().is_some()),
+            page: self.pools.paging().page_size,
+            planes,
+            unit,
+        };
+        let seat = |lane: usize| {
+            let (at, row_offset) = (*seat_of.get(lane)?)?;
+            let held = seats.get(at)?;
+            Some(crate::beam::Seat {
+                seat: at,
+                row_offset,
+                have: held.have,
+                rows: held.rows,
+            })
+        };
+        crate::beam::plan(beams, &staged, &seat, &mut |refs: &[u32]| {
+            self.pools.kv_pages(refs, None)
+        })
+    }
+
+    /// The fire's beam groups' step and page copies, ahead of its forward
+    /// in `frame`, behind the passes whose parents cells it copies in.
+    fn run_beams(
+        &self,
+        frame: &mut B::Frame,
+        arm: usize,
+        planned: &crate::beam::Planned<'_, B>,
+    ) -> Result<()> {
+        let store = self.inputs[arm].store();
+        for &(cell, word) in &planned.cells {
+            frame.copy(&cell.buffer, cell.at, store, u64::from(word) * 4, cell.bytes)?;
+        }
+        self.dispatch_beams(frame, arm, planned.steps, planned.copies, planned.planes)
+    }
+
+    /// The beam kernels over arm `arm`'s records: `steps` groups' steps,
+    /// then `copies` beams' copies over `planes` kv planes.
+    fn dispatch_beams(
+        &self,
+        frame: &B::Frame,
+        arm: usize,
+        steps: u32,
+        copies: u32,
+        planes: u32,
+    ) -> Result<()> {
+        let store = self.inputs[arm].store();
+        let room = self.inputs[arm].laid().beams().ok_or_else(|| {
+            program("serve::beams", "a load that laid no room for beam groups".to_string())
+        })?;
+        let sink = B::sink(&self.device, frame, &self.pipelines, &self.handles);
+        let whole = self.handles.bind(store, 0, store.bytes())?;
+        let words = u32::try_from(store.bytes() / 4).unwrap_or(u32::MAX);
+        let pool = self.pools.segments(&self.handles)?;
+        let records = |runs: u32, count: u32| kernels_slang::runtime::beam::Records {
+            store: kernels_slang::Tensor::new(whole, 1, words, Dtype::U32),
+            pool,
+            runs,
+            count,
+            planes: room.planes.0,
+        };
+        kernels_slang::runtime::beam::step(&sink, records(room.steps.0, steps))
+            .map_err(crate::error::kernel)?;
+        kernels_slang::runtime::beam::copy_pages(&sink, records(room.copies.0, copies), planes)
+            .map_err(crate::error::kernel)?;
+        Ok(())
     }
 
     fn pixel_rect(&self, p: &Prepared<'_, B>) -> Result<Option<(u64, u32, usize)>> {
@@ -3793,6 +3930,18 @@ impl<B: Serve> Shell<B> {
         })
     }
 
+    /// Reads u32 word `word` of arm `arm`'s input store.
+    pub fn store_word_reader(&self, arm: usize) -> crate::settle::ReadRow {
+        let store = self.inputs[arm].store().clone();
+        Box::new(move |word| {
+            let mut bytes = [0u8; 4];
+            store
+                .read(u64::from(word) * 4, &mut bytes)
+                .ok()
+                .map(|()| u32::from_le_bytes(bytes))
+        })
+    }
+
     /// Takes step `seq`'s host `rows` and gives its arm back.
     pub fn land(&mut self, seq: u64, arm: usize, rows: Vec<Vec<f32>>) {
         self.arms.give(arm);
@@ -3812,6 +3961,7 @@ impl<B: Serve> Shell<B> {
             folds,
             mut done,
             guests,
+            beams,
         } = step;
         // A fire whose fold length is the device's: its lanes report what
         // their folds froze.
@@ -3986,6 +4136,8 @@ impl<B: Serve> Shell<B> {
             ));
         }
         let mut seats: Vec<Seat> = Vec::with_capacity(lanes.len());
+        // Each lane's seat in the staged tables and its first row.
+        let mut seat_of: Vec<Option<(usize, u32)>> = vec![None; lanes.len()];
         let mut kv_less: Vec<bool> = Vec::with_capacity(lanes.len());
 
         let mut tables: Vec<std::borrow::Cow<'_, [u32]>> = Vec::with_capacity(lanes.len());
@@ -4146,6 +4298,7 @@ impl<B: Serve> Shell<B> {
             if fresh {
                 beginning.push(record);
             }
+            seat_of[source] = Some((seats.len(), row.row_offset));
             seats.push(Seat {
                 slot: lane.slot,
                 have,
@@ -4466,6 +4619,11 @@ impl<B: Serve> Shell<B> {
             }
         }
         let geometries = geometries;
+        let planned = if beams.is_empty() {
+            None
+        } else {
+            Some(self.plan_beams(arm, beams, &geometries, &seats, &seat_of)?)
+        };
         let pages = geometries
             .first()
             .map_or(0, |geometry| geometry.indices.len() as u32);
@@ -4753,6 +4911,11 @@ impl<B: Serve> Shell<B> {
                 capture: &capture_table,
             },
         )?;
+        if let Some(planned) = &planned {
+            for (at, words) in &planned.writes {
+                self.inputs[arm].write_words(*at, words)?;
+            }
+        }
         let group_masks =
             self.inputs[arm].stage_group_masks(&self.device, &self.handles, &group_masks)?;
         windows.bind(&self.handles, bound.windows)?;
@@ -5017,6 +5180,10 @@ impl<B: Serve> Shell<B> {
             bindings,
             demand,
             guests,
+            beam_faults: planned
+                .as_ref()
+                .map_or_else(Vec::new, |planned| planned.faults.clone()),
+            beams: planned,
         })
     }
 
@@ -5155,6 +5322,10 @@ pub struct StepView<'a, B: Serve> {
     pub done: Option<Done>,
 
     pub guests: Option<B::Guests>,
+
+    /// The fire's beam groups (`crate::beam`): each reorders its beams'
+    /// page lists on the device ahead of the forward.
+    pub beams: &'a [crate::beam::Group<B>],
 }
 
 pub struct Prepared<'a, B: Serve> {
@@ -5198,6 +5369,12 @@ pub struct Prepared<'a, B: Serve> {
     demand: Demand,
 
     pub guests: Option<B::Guests>,
+
+    /// What the fire's beam groups run ahead of its forward
+    /// ([`Shell::feed`]), and each beam's fault word, its lane and its
+    /// instance, read once the fire lands.
+    beams: Option<crate::beam::Planned<'a, B>>,
+    pub beam_faults: Vec<(u32, usize, engine::InstanceId)>,
 }
 
 impl<B: Serve> PreparedPhase for Prepared<'_, B> {
@@ -6441,6 +6618,16 @@ impl<B: Serve> Shell<B> {
                 return Err(why);
             }
         }
+        // A fire's beam groups' kernels bind each arm's store whole and the
+        // pool (`Shell::run_beams`), outside the walk: bound here, at load,
+        // so a serving beam fire binds nothing.
+        for arm in 0..self.inputs.len() {
+            let frame = B::bind_frame(&self.device)?;
+            let planes = self.pools.kv_planes().map_or(0, |(_, planes)| planes.len() as u32);
+            self.dispatch_beams(&frame, arm, 1, 1, planes.max(1))?;
+            self.handles.rewind();
+            walked += 1;
+        }
         Ok(walked)
     }
 
@@ -6482,6 +6669,7 @@ impl<B: Serve> Shell<B> {
             folds: &[],
             done: None,
             guests: None,
+            beams: &[],
         })?;
         let arm = prepared.arm;
         self.feed(&prepared)?;
@@ -6777,6 +6965,7 @@ impl<B: Serve> Shell<Named<B>> {
             folds: &[],
             done: None,
             guests: None,
+            beams: &[],
         })?;
         let mut whole = Vec::with_capacity(self.compiled.template().len());
         for (at, region) in self.compiled.template().iter().enumerate() {
@@ -7010,6 +7199,12 @@ impl<B: Serve> Shell<Named<B>> {
                     nodes.start, nodes.end
                 ),
             ));
+        }
+        // A fire's beam groups run their step and copies ahead of its
+        // forward, outside its walk (`Shell::feed`): every load serves
+        // them, so it names their kernels with its own.
+        for fire in kernels_slang::runtime::beam::kernels() {
+            self.pipelines.0.name(fire).map_err(crate::error::kernel)?;
         }
         Ok(Asks {
             kernels: self.pipelines.0.kernels(),

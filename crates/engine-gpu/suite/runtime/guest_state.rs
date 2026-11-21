@@ -347,6 +347,7 @@ fn an_unparked_guest_serves_on_from_fresh_room_with_nothing_copied() {
             rings: Vec::new(),
             adapter: Vec::new(),
             scratch: scratch.clone(),
+            resident: ::engine::ScratchPlace::None,
             pair: pair.clone(),
             pair_generation: 0,
         })
@@ -478,6 +479,7 @@ fn a_guests_state_reads_zero_when_its_slots_change_owner() {
             rings: Vec::new(),
             adapter: Vec::new(),
             scratch: scratch.clone(),
+            resident: ::engine::ScratchPlace::None,
             pair: pair.clone(),
             pair_generation: 1,
         })

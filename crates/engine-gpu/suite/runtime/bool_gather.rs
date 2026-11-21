@@ -230,6 +230,7 @@ fn a_gathered_bool_row_keeps_its_parents_cells() {
             ring_slots: Vec::new(),
             adapter_slots: Vec::new(),
             scratch: engine::ScratchPlace::None,
+            resident: ::engine::ScratchPlace::None,
             pair: engine::ScratchPlace::None,
             pair_generation: 0,
         },
