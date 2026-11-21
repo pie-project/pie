@@ -152,7 +152,6 @@ impl KeyBuilder {
     }
 }
 
-const SHAPES_KEPT: usize = 64;
 
 /// Fills kept: one a fire shape, each a few bytes a dispatch.
 const FILLS_KEPT: usize = 256;
@@ -215,7 +214,9 @@ pub(crate) enum Next<'a> {
 impl Recorder {
     pub(crate) fn new() -> Recorder {
         Recorder {
-            families: Held::new(SHAPES_KEPT),
+            // Every family stands: the load records its bodies before it
+            // serves, a fixed set, and none leaves for a later one.
+            families: Held::new(usize::MAX),
             fills: Held::new(FILLS_KEPT),
             likely: HashMap::new(),
             recorded: std::cell::Cell::new(0),

@@ -1805,7 +1805,10 @@ impl Frame {
     }
 
     /// Folds `what`, a command the frame records, into its hash.
-    pub(crate) fn bake(&self, what: &impl std::hash::Hash) {
+    pub(crate) fn bake(&self, what: &(impl std::hash::Hash + std::fmt::Debug)) {
+        if tracing::enabled!(target: "vkbakeall", tracing::Level::TRACE) {
+            tracing::trace!(target: "vkbakeall", what = ?what, "bake");
+        }
         what.hash(&mut *self.baked.borrow_mut());
     }
 
