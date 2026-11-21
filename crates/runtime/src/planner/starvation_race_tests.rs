@@ -5847,7 +5847,10 @@ async fn a_restore_refused_against_the_map_goes_again_at_most_once_per_map_chang
             crate::rt::yield_now().await;
         }
     }
-    assert!(!retried(&planner), "no re-send on the same map");
+    // Refused with nothing else in flight, its placement standing and no
+    // move to make: sent once on this room (the progress rule), never
+    // again on it.
+    assert!(retried(&planner), "one re-send on the same map, nothing to move");
     // The map changes (more runs stand): one re-send.
     pool.free.lock().extend([3, 4, 5]);
     pool.gives.fetch_add(1, Ordering::Relaxed);
@@ -8451,7 +8454,9 @@ async fn a_restore_refused_in_its_unpark_s_room_goes_again_only_on_more_room() {
             crate::rt::yield_now().await;
         }
     }
-    assert!(!sent(&planner), "chunks given back and taken again: not sent");
+    // Nothing to move and its placement standing: sent once on this room
+    // (the progress rule), whatever the fleet's takes and gives.
+    assert!(sent(&planner), "sent once, nothing to move");
     // More chunks stand free, a run of four among them: sent.
     pool.free.lock().extend(8..12);
     pool.gives.fetch_add(1, Ordering::Relaxed);
@@ -9530,10 +9535,16 @@ async fn a_bind_suspended_restore_is_sent_only_where_its_whole_placement_stands(
             crate::rt::yield_now().await;
         }
     }
-    let state = planner.with_inner(|inner| inner.procs[&pid].state);
-    assert_eq!(state, Residency::Evicted, "its placement does not stand: not sent");
+    // Its placement does not stand, the map stands it, and nothing moves:
+    // sent once on this room by the progress rule (the takes decide),
+    // never re-sent on it.
     let (plan, _) = planner.with_inner(|inner| inner.plan_fields(key));
-    assert!(!plan.contains("bind-suspended restore sent"), "{plan}");
+    assert!(plan.contains("sent"), "{plan}");
+    assert_eq!(
+        planner.with_inner(|inner| inner.procs[&pid].mismatch_sent_at),
+        Some(16),
+        "sent once on this room"
+    );
     // Its placement stands: sent.
     pool.store_refuses.store(false, Ordering::Relaxed);
     planner.pages_freed();
@@ -9982,6 +9993,9 @@ struct SnapProc {
     /// in flight (`roles_short_quiet`).
     refused_free: Option<u32>,
     quiet: bool,
+    /// Restoring, waiting on its rebinds (`rebind_waiting`): waiting, not
+    /// in flight.
+    rebind_waiting: Option<&'static str>,
 }
 
 impl SnapProc {
@@ -9992,6 +10006,7 @@ impl SnapProc {
             refused: None,
             refused_free: None,
             quiet: false,
+            rebind_waiting: None,
         }
     }
 
@@ -10029,6 +10044,9 @@ struct StallSnapshot {
     /// The chunks the head's own restore retakes, single chunks (its
     /// unpark need, `RunNeed([(1, own.len())])`): those free it takes first.
     own: Vec<u32>,
+    /// The store refuses a restore the planner's map stands (the placement
+    /// and the takes differ).
+    store_refuses: bool,
 }
 
 /// Rebuilds `snap` as a pool and a planner and runs the planner's passes to
@@ -10045,6 +10063,7 @@ async fn replay(snap: &StallSnapshot) -> Result<(), String> {
     pool.disk_free.store(snap.disk_free, Ordering::Relaxed);
     pool.sweeps_shared.store(snap.sweeps_shared, Ordering::Relaxed);
     pool.own.lock().extend(snap.own.iter().copied());
+    pool.store_refuses.store(snap.store_refuses, Ordering::Relaxed);
     let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
     let pids: Vec<ProcessId> = snap.procs.iter().map(|_| ProcessId::new_v4()).collect();
     for &pid in &pids {
@@ -10080,6 +10099,7 @@ async fn replay(snap: &StallSnapshot) -> Result<(), String> {
                 proc.bind_room = proc.roles_short;
                 proc.roles_short_free = snap_proc.refused_free;
                 proc.roles_short_quiet = snap_proc.quiet;
+                proc.rebind_waiting = snap_proc.rebind_waiting.map(str::to_owned);
                 snap_proc.queued.map(|wait| {
                     inner.enqueue(
                         pid,
@@ -10154,6 +10174,7 @@ fn stall_d41e15f24() -> StallSnapshot {
         head: 0,
         sweeps_shared: true,
         own: (5..17).chain([4]).collect(),
+        store_refuses: false,
     }
 }
 
@@ -10205,6 +10226,7 @@ fn stall_c201812ea() -> StallSnapshot {
         head: 1,
         sweeps_shared: true,
         own: Vec::new(),
+        store_refuses: false,
     }
 }
 
@@ -10336,6 +10358,7 @@ fn stall_macpro_c2018_g2(quiet: bool) -> StallSnapshot {
         head: 0,
         sweeps_shared: true,
         own: vec![0, 1, 2, 3],
+        store_refuses: false,
     }
 }
 
@@ -10385,6 +10408,7 @@ fn stall_macpro_c2018_mx(quiet: bool) -> StallSnapshot {
         head: 0,
         sweeps_shared: true,
         own: vec![4, 5, 8, 9],
+        store_refuses: false,
     }
 }
 
@@ -10447,4 +10471,83 @@ fn a_fire_held_at_its_bind_is_not_in_flight() {
     assert!(!planner.with_inner(|inner| inner.nothing_in_flight()), "a fire submitted is");
     planner.with_inner(|inner| inner.procs.get_mut(&pid).unwrap().bind_waiting = true);
     assert!(planner.with_inner(|inner| inner.nothing_in_flight()), "one held at its bind is not");
+}
+
+/// The L40S at 3 GiB disk-only on bd4f4ffe7 (serve-B4_3s-1, 998 lines of
+/// it): a restore head (6ae0bc15) refused PendingBindShort (run 1) with
+/// nothing else in flight, one free run left, its placement standing in the
+/// same room ("a planner bug: the placement and the takes differ"): held,
+/// with nothing in flight.
+fn stall_bd4f4ffe7_quiet_mismatch() -> StallSnapshot {
+    StallSnapshot {
+        name: "bd4f4ffe7 serve-B4_3s-1",
+        chunks: 22,
+        free: vec![9],
+        headroom: Some(1),
+        host: 0,
+        disk_free: 4014,
+        procs: vec![SnapProc {
+            refused: Some((1, 1)),
+            refused_free: Some(1),
+            quiet: true,
+            ..SnapProc::evicted_restore()
+        }],
+        held: Vec::new(),
+        head: 0,
+        sweeps_shared: true,
+        own: Vec::new(),
+        store_refuses: false,
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn replay_bd4f4ffe7_quiet_refusal_standing_in_its_placement() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    replay(&stall_bd4f4ffe7_quiet_mismatch()).await.unwrap();
+}
+
+/// The L40S at 3 GiB disk-only on bd4f4ffe7 under CUDA_LAUNCH_BLOCKING=1
+/// (serve-B4_3b-1): a restore head refused PendingBindShort (five single
+/// chunks beside its own one) needing six singles with eight free and
+/// need_moves 0, the policy asked, while another process waits restoring on
+/// an instance rebind (InstanceId(19541)): nothing in flight.
+fn stall_bd4f4ffe7_rebind_waiting() -> StallSnapshot {
+    StallSnapshot {
+        name: "bd4f4ffe7 serve-B4_3b-1",
+        chunks: 22,
+        free: vec![2, 3, 5, 9, 11, 14, 18, 20],
+        headroom: Some(8),
+        host: 0,
+        disk_free: 4014,
+        procs: vec![
+            SnapProc {
+                refused: Some((1, 6)),
+                refused_free: Some(8),
+                ..SnapProc::evicted_restore()
+            },
+            SnapProc {
+                state: Residency::Restoring,
+                rebind_waiting: Some("InstanceId(19541)"),
+                ..SnapProc::resident()
+            },
+        ],
+        held: Vec::new(),
+        head: 0,
+        sweeps_shared: true,
+        own: vec![2],
+        store_refuses: true,
+    }
+}
+
+// Ignored: it models the store refusing for good what the map stands
+// (`store_refuses`), which the fake pool cannot lift; in the real store the
+// refusal was the pending-bind count leaving out the restore's own
+// reservation, which `Roles::place_claimed` removes (tested in
+// `a_restore_whose_bind_runs_are_held_for_it_finds_them`). The head is
+// sent once on the room; the fake refuses again. Kept for the simulation.
+#[tokio::test(flavor = "current_thread")]
+#[ignore]
+async fn replay_bd4f4ffe7_head_beside_a_rebind_waiting_restore() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    replay(&stall_bd4f4ffe7_rebind_waiting()).await.unwrap();
 }

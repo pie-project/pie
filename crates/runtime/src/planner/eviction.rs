@@ -281,11 +281,40 @@ impl ResidencyPlanner {
         // There its whole need is planned on the map as it stands, the
         // placement's reading of the room set aside.
         let forced = self.force_moves.swap(false, Ordering::AcqRel);
-        if forced {
-            self.stats.forced_passes.fetch_add(1, Ordering::Relaxed);
-        }
         let mismatch = placement.as_ref().is_some_and(super::pool::RestorePlacement::stands)
             && self.no_more_room_than_refused(victims.head_pid);
+        if forced {
+            self.stats.forced_passes.fetch_add(1, Ordering::Relaxed);
+            // Each forced pass is a placement disagreement still in the
+            // planner: said once, with what a replay snapshot needs.
+            let (refusal, end) = self.with_inner(|inner| {
+                let refusal = inner.procs.get(&victims.head_pid).map(|proc| {
+                    format!(
+                        "roles_short={:?} bind_room={:?} refused_free={:?} quiet={} why={:?}",
+                        proc.roles_short.map(|need| (need.run, need.pieces)),
+                        proc.bind_room.map(|need| (need.run, need.pieces)),
+                        proc.roles_short_free,
+                        proc.roles_short_quiet,
+                        proc.roles_short_why,
+                    )
+                });
+                (refusal, inner.plan_fields(victims.head).0)
+            });
+            tracing::warn!(
+                head = %victims.head_pid,
+                restore = victims.restore,
+                need = ?shape,
+                short = ?placement.as_ref().map(|placement| &placement.short),
+                own_opened = ?placement.as_ref().map(|placement| placement.opened.len()),
+                bind_free_runs_after_own = ?placement.as_ref().and_then(|placement| placement.bind_free_runs),
+                room = ?placement.as_ref().and_then(|placement| placement.room),
+                refusal = %refusal.unwrap_or_default(),
+                free_chunks = self.port.free_chunks(),
+                %end,
+                "planner: a pass forced for a head left waiting with nothing in flight \
+                 (a placement disagreement: its snapshot)"
+            );
+        }
         if let (true, true, Some(head)) =
             (forced || mismatch, victims.restore, self.head_room(victims.head))
         {
@@ -433,6 +462,46 @@ impl ResidencyPlanner {
             self.plan_ended(victims.head, "parked state moves down", host_short, &unhostable);
             // The parked state's move funds it: nothing for the policy yet.
             self.note_short(victims.head, 0, 0);
+            return;
+        }
+        // A placement mismatch with nothing to move: its placement stands
+        // and no move makes more room, so the takes decide. It is sent on
+        // its placement, never held (the L40S at 3 GiB on bd4f4ffe7, 998
+        // lines: held, the policy asked, nothing in flight). Refused again
+        // on the same room, the repeat is counted and planned for as any.
+        let free_now = self.port.free_chunks();
+        // So too where the map stands the head with no move and its store
+        // refuses it: the two disagree, nothing moves, the takes decide.
+        let map_stands_store_refuses = victims.restore
+            && placement.as_ref().is_some_and(|placement| !placement.stands())
+            && matches!(
+                (shape.as_ref(), map.as_ref()),
+                (Some(need), Some(map)) if map.cheapest_need(need).is_some_and(|moves| moves.is_empty())
+            );
+        let send_once = (mismatch || map_stands_store_refuses)
+            && picks.is_empty()
+            && self.with_inner(|inner| {
+                inner.procs.get_mut(&victims.head_pid).is_some_and(|proc| {
+                    if proc.mismatch_sent_at == Some(free_now) {
+                        return false;
+                    }
+                    proc.mismatch_sent_at = Some(free_now);
+                    proc.roles_short_free = None;
+                    proc.send_regardless = true;
+                    true
+                })
+            });
+        if send_once {
+            self.plan_ended(
+                victims.head,
+                "a placement mismatch with no move to make: sent on its placement",
+                host_short,
+                &unhostable,
+            );
+            self.events.fetch_add(1, Ordering::AcqRel);
+            if let Some(notify) = self.returns.drain.get() {
+                notify.notify_one();
+            }
             return;
         }
         if picks.is_empty() {

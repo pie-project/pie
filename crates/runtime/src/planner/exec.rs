@@ -542,6 +542,33 @@ impl MoveGuard {
 
     /// Submits every copy of the move, then waits for them all.
     async fn copy(&mut self, planner: &ResidencyPlanner, pid: ProcessId) -> Result<(), CopyFailure> {
+        // Every device chunk the copies read or write is fenced until they
+        // land: no evacuation moves it, no segment holding it is released,
+        // no compaction or raise takes it (the L40S at 3 GiB on a0bfb512f:
+        // CUDA 700 on an eviction's queued kv-to-disk copy).
+        let fenced: Vec<u32> = self
+            .txn
+            .as_ref()
+            .expect("move present")
+            .copies()
+            .iter()
+            .filter(|copy| copy.source.is_none())
+            .flat_map(|copy| match copy.kind {
+                crate::scheduler::dispatch::TierKind::KvSlots(shape)
+                | crate::scheduler::dispatch::TierKind::RsSlots(shape)
+                | crate::scheduler::dispatch::TierKind::RoleSlots(shape) => {
+                    planner.port.copy_chunks(shape, &copy.device)
+                }
+                crate::scheduler::dispatch::TierKind::Kv => Vec::new(),
+            })
+            .collect();
+        planner.port.moving_out(&fenced);
+        let copied = self.copy_fenced(planner, pid).await;
+        planner.port.moved_out(&fenced);
+        copied
+    }
+
+    async fn copy_fenced(&mut self, planner: &ResidencyPlanner, pid: ProcessId) -> Result<(), CopyFailure> {
         let mut waits = Vec::new();
         for copy in self.txn.as_ref().expect("move present").copies() {
             tracing::debug!(pid = %pid, copy = %copy.label(), count = copy.device.len(), "planner: residency copy");
@@ -1182,7 +1209,12 @@ async fn restore(
         );
         tracing::debug!(%pid, %why, "planner: a restore waits for room for its pending bind");
         planner.note_roles_short_why(pid, why);
-        planner.requeue_restore_roles(pid, (need.run, need.pieces.saturating_add(own)), Some(free));
+        // The bind's own runs: its unpark's were placed first by the one
+        // placement, so they are never added again (added each refusal,
+        // the need grew 1, 3, 5, 7 until it fit nowhere: the simulation's
+        // seed 13, 455 of 5,000 seeds).
+        let _ = own;
+        planner.requeue_restore_roles(pid, (need.run, need.pieces), Some(free));
         return;
     }
     let mut guard = MoveGuard::new(model, engine, Move::Restore { kv, rs, roles });

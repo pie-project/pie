@@ -118,6 +118,12 @@ pub(super) struct Proc {
     /// length): the same refusal again on the same room is a settled stall
     /// ([`super::ResidencyPlanner::requeue_restore_roles`]).
     pub(super) last_refusal: Option<((u32, u32), u32, u32)>,
+    /// The free chunks it was last sent on as a placement mismatch with no
+    /// move to make: sent once a room, never re-sent on the same one.
+    pub(super) mismatch_sent_at: Option<u32>,
+    /// Sent once on that room whatever its placement reads: the takes
+    /// decide ([`Self::mismatch_sent_at`]).
+    pub(super) send_regardless: bool,
     /// Whether the store's own placement ([`super::pool::PoolPort::guest_need_free`],
     /// its serve's state laid first) stood its need as its last unpark
     /// refusal left the pool. Refused where it did not stand, it goes again
@@ -244,6 +250,8 @@ impl Proc {
             roles_short_free: None,
             roles_short_quiet: false,
             last_refusal: None,
+            mismatch_sent_at: None,
+            send_regardless: false,
             roles_short_stood: None,
             roles_refused: None,
             evicted_queued: false,

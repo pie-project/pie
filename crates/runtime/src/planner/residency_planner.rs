@@ -58,6 +58,9 @@ pub struct ResidencyPlanner {
     /// The occupancy map last built, by the generation and the candidates
     /// it was built for: the same pool and candidates read the same map.
     pub(super) map_cache: parking_lot::Mutex<Option<(u64, Vec<ProcessId>, super::pool::ChunkMap)>>,
+    /// The last restriction read of it, by generation and candidates: a
+    /// list read again in the same generation is no new restriction.
+    pub(super) restricted_cache: parking_lot::Mutex<Option<(u64, Vec<ProcessId>, super::pool::ChunkMap)>>,
     pub(super) pause_due: AtomicBool,
     pub(super) nonresident: AtomicUsize,
     /// Room grants give back as they drop, the queue's length and the drain
@@ -146,6 +149,7 @@ impl ResidencyPlanner {
             pass_landed: AtomicU64::new(0),
             settled_at: parking_lot::Mutex::new(None),
             map_cache: parking_lot::Mutex::new(None),
+            restricted_cache: parking_lot::Mutex::new(None),
             pause_due: AtomicBool::new(false),
             nonresident: AtomicUsize::new(0),
             returns,
@@ -322,17 +326,44 @@ impl ResidencyPlanner {
         if !pids.is_empty() {
             self.stats.map_built.store(true, Ordering::Relaxed);
         }
+        if pids.is_empty() {
+            return self.port.chunk_occupants(pids);
+        }
+        // One map a generation, over every process the planner knows and
+        // those asked: each candidate list (the eviction plan's, the stall
+        // line's, the parked map's) reads its own restriction of it. Built
+        // per list, a pass built it up to three times (the L40S's 14 s of
+        // map passes in a 334 s run).
         let generation = self.generation();
-        if let Some((at, of, map)) = self.map_cache.lock().as_ref()
+        if let Some((at, of, map)) = self.restricted_cache.lock().as_ref()
             && *at == generation
             && of == pids
         {
             self.stats.map_cache_hits.fetch_add(1, Ordering::Relaxed);
             return map.clone();
         }
-        let map = self.port.chunk_occupants(pids);
-        *self.map_cache.lock() = Some((generation, pids.to_vec(), map.clone()));
-        map
+        let mut all: Vec<ProcessId> = self.with_inner(|inner| inner.procs.keys().copied().collect());
+        all.extend(pids.iter().copied());
+        all.sort_unstable();
+        all.dedup();
+        let cached = self.map_cache.lock().as_ref().and_then(|(at, of, map)| {
+            (*at == generation && pids.iter().all(|pid| of.binary_search(pid).is_ok()))
+                .then(|| map.restricted(pids))
+        });
+        let restricted = match cached {
+            Some(map) => {
+                self.stats.map_cache_hits.fetch_add(1, Ordering::Relaxed);
+                map
+            }
+            None => {
+                let map = self.port.chunk_occupants(&all);
+                let restricted = map.restricted(pids);
+                *self.map_cache.lock() = Some((generation, all, map));
+                restricted
+            }
+        };
+        *self.restricted_cache.lock() = Some((generation, pids.to_vec(), restricted.clone()));
+        restricted
     }
 
     /// One count of everything a pass reads that can change its answer:
@@ -1105,6 +1136,17 @@ impl ResidencyPlanner {
     /// ([`Self::demote_idle`]). Only evicted processes' state moves, and
     /// none of them is restored until it lands. Whether a move is on its
     /// way.
+    /// Whether `pid` is to be sent once whatever its placement reads (a
+    /// disagreement with nothing to move), taken as read.
+    pub(super) fn take_send_regardless(&self, pid: ProcessId) -> bool {
+        self.with_inner(|inner| {
+            inner
+                .procs
+                .get_mut(&pid)
+                .is_some_and(|proc| std::mem::take(&mut proc.send_regardless))
+        })
+    }
+
     /// The processes whose restore is under way.
     pub(super) fn restoring_pids(&self) -> Vec<ProcessId> {
         self.with_inner(|inner| {

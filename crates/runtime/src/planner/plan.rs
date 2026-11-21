@@ -238,6 +238,12 @@ impl ResidencyPlanner {
         )
     }
 
+    /// Restores refused again on the room their last refusal left.
+    #[must_use]
+    pub fn refusal_repeats(&self) -> u64 {
+        self.stats.refusal_repeats.load(Ordering::Relaxed)
+    }
+
     /// A pass's time by phase, in total microseconds: its steps, the wants
     /// published after them, the rest ([`super::stats::PlannerStats::plan_phase_us`]).
     #[must_use]
@@ -918,9 +924,10 @@ impl ResidencyPlanner {
                         .unwrap_or_else(|| RunNeed::one(need.run, need.pieces));
                     if pid.is_some_and(|pid| {
                         !self.no_more_room_than_refused(pid)
-                            && self
+                            && (self
                                 .head_placement(key, &whole)
                                 .is_some_and(|placement| placement.stands())
+                                || self.take_send_regardless(pid))
                     }) {
                         self.plan_stopped("bind-suspended restore sent: its placement stands");
                         room_stood = Some(key);
@@ -1025,6 +1032,9 @@ impl ResidencyPlanner {
                         && head_key.is_some_and(|key| {
                             self.head_placement(key, &room)
                                 .is_some_and(|placement| placement.stands())
+                                || self
+                                    .with_inner(|inner| inner.queue.get(&key).map(|waiter| waiter.pid))
+                                    .is_some_and(|pid| self.take_send_regardless(pid))
                         })
                     {
                         self.plan_stopped("restore sent again: its placement stands");

@@ -286,6 +286,32 @@ fn cheapest_disjoint(windows: &[(u32, u32)], run: u32, pieces: u32) -> Option<Ve
 }
 
 impl ChunkMap {
+    /// The map as read for `pids` alone: each chunk's holders among them,
+    /// a chunk none of them holds left out. One map built for every
+    /// process serves every candidate list in a generation.
+    #[must_use]
+    pub fn restricted(&self, pids: &[ProcessId]) -> ChunkMap {
+        let wanted: std::collections::HashSet<ProcessId> = pids.iter().copied().collect();
+        ChunkMap {
+            held: self
+                .held
+                .iter()
+                .filter_map(|chunk| {
+                    let by: Vec<(ProcessId, u32)> =
+                        chunk.by.iter().copied().filter(|(pid, _)| wanted.contains(pid)).collect();
+                    (!by.is_empty()).then(|| ChunkHeld {
+                        chunk: chunk.chunk,
+                        used: chunk.used,
+                        by,
+                    })
+                })
+                .collect(),
+            free: self.free.clone(),
+            headroom: self.headroom,
+            segment_chunks: self.segment_chunks,
+        }
+    }
+
     /// `other`'s chunks counted in as well: a chunk both hold has the
     /// occupants of each, a pid in both its slots summed.
     pub fn merge(&mut self, other: ChunkMap) {
@@ -681,6 +707,14 @@ pub trait PoolPort: Send + Sync + 'static {
     /// was withdrawn, landed with no bind pending, or its process is gone.
     fn release_restore(&self, pid: ProcessId) {
         let _ = pid;
+    }
+    /// The physical device chunks slot refs `refs` of engine shape `shape`
+    /// lie in: what a residency copy of them reads or writes, fenced
+    /// ([`Self::moving_out`]) until it lands. Empty where the pool keeps
+    /// no chunks.
+    fn copy_chunks(&self, shape: ::engine::chunk::ShapeId, refs: &[u32]) -> Vec<u32> {
+        let _ = (shape, refs);
+        Vec::new()
     }
     /// A residency move's copy reads `chunks` (physical) until
     /// [`Self::moved_out`]: no raise takes them back for its activation
@@ -1085,6 +1119,25 @@ impl PoolPort for RegistryPool {
         {
             roles.lock().unwrap().release_claim(pid);
         }
+    }
+
+    fn copy_chunks(&self, shape: ::engine::chunk::ShapeId, refs: &[u32]) -> Vec<u32> {
+        let Some(shared) =
+            crate::store::registry::try_get(self.model, self.engine).and_then(|stores| stores.shared)
+        else {
+            return Vec::new();
+        };
+        let shared = shared.lock().unwrap();
+        let Some(pool_shape) = shared.pool_shape(shape) else {
+            return Vec::new();
+        };
+        let mut chunks: Vec<u32> = refs
+            .iter()
+            .filter_map(|&slot_ref| shared.pool().physical(shared.slot(pool_shape, slot_ref).chunk))
+            .collect();
+        chunks.sort_unstable();
+        chunks.dedup();
+        chunks
     }
 
     fn moving_out(&self, chunks: &[u32]) {

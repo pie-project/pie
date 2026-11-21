@@ -412,9 +412,8 @@ impl ResidencyPlanner {
             let quiet = repeat || inner.nothing_in_flight_but(pid);
             if let Some(proc) = inner.procs.get_mut(&pid) {
                 proc.roles_short = Some(updated);
-                if proc.bind_room.is_some_and(|bind| bind.run == run) {
-                    proc.bind_room = Some(updated);
-                }
+                // The pending bind keeps its own runs: written back with its
+                // unpark's folded in, the next refusal folded them in again.
                 proc.roles_free_retry = None;
                 proc.roles_short_gives = Some(gives);
                 proc.roles_short_runs = Some((need.0, refused_room));

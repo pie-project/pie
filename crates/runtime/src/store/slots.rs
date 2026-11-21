@@ -3184,6 +3184,14 @@ impl SlotPool {
         if needed > self.committed_chunks() - self.segments.len(segment) {
             return None;
         }
+        // A segment a residency copy still reads or writes is never
+        // evacuated: the copy's addresses were resolved at its submit, and
+        // a segment released (unmapped) under a copy queued on another
+        // stream is read unmapped (the L40S at 3 GiB on a0bfb512f: CUDA 700
+        // on an eviction's kv-to-disk copy).
+        if self.moving_out.range(range.start..range.end).next().is_some() {
+            return None;
+        }
         let sources: Vec<u32> = (range.start..range.end)
             .filter(|&chunk| !self.free.get(chunk))
             .collect();
@@ -3359,6 +3367,13 @@ impl SlotPool {
         let held = self.segments.used(segment);
         if held > 0 {
             return Err(SegmentError::Held { segment, held });
+        }
+        // Nor released while a residency copy still reads or writes one of
+        // its chunks: it waits for the copy to land ([`Self::moved_out`]).
+        let range = self.segments.range(segment);
+        let copying = u32::try_from(self.moving_out.range(range.start..range.end).count()).unwrap_or(u32::MAX);
+        if copying > 0 {
+            return Err(SegmentError::Held { segment, held: copying });
         }
         match self.segments.state(segment) {
             SegmentState::Draining { until } if until > self.retired => {
@@ -4159,6 +4174,31 @@ mod tests {
     /// is the takes' own: the runs of three it leaves are those the real
     /// takes leave (the field's disagreement was a refusal taken on another
     /// pool, refused_on_this_pool=false, not a placement unlike the takes).
+    /// The L40S at 3 GiB on a0bfb512f: CUDA 700 on an eviction's queued
+    /// kv-to-disk copy. A segment a residency copy still reads is neither
+    /// evacuated nor released (unmapped) until the copy lands.
+    #[test]
+    fn a_segment_under_a_copy_is_neither_evacuated_nor_released() {
+        let fixed = [(ShapeKind::Fixed, 4)];
+        let mut pool = SlotPool::new(facts_with(16, 4, 4, &fixed, &[(16, 4)]));
+        let holder = Holder::WorkingSet(1);
+        let held = pool.acquire_chunk_runs(holder, 0, 1, pool.free_chunk_runs(1)).unwrap();
+        // Segment 1 (chunks 4..8) keeps one held chunk, 5; the rest of the
+        // pool below it free enough to take it.
+        let (five, freed): (Vec<Slot>, Vec<Slot>) =
+            held.iter().copied().partition(|slot| pool.physical(slot.chunk).unwrap() == 5);
+        pool.release(holder, &freed, 0);
+        assert!(pool.plan_evacuation(1).is_some(), "unfenced, it is evacuated");
+        pool.moving_out(&[5]);
+        assert!(pool.plan_evacuation(1).is_none(), "under a copy, it is not");
+        // Its chunk given back (the copy's commit) while the copy's fence
+        // still stands: the empty segment is not released.
+        pool.release(holder, &five, 0);
+        assert!(pool.release_segment(1).is_err(), "not released under a copy");
+        pool.moved_out(&[5]);
+        assert!(pool.release_segment(1).is_ok(), "released once it landed");
+    }
+
     #[test]
     fn a_placement_of_runs_leaves_what_the_real_takes_leave() {
         let fixed = [(ShapeKind::Fixed, 4)];

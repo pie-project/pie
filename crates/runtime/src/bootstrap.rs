@@ -66,7 +66,7 @@ impl RuntimeShutdown {
             println!(
                 "[planner-census] at shutdown: passes={} pass_ms={} pass_mean_us={} \
                  map_passes={} map_pass_ms={} quiet_waits={} skipped_wakes={} map_cache_hits={} \
-                 stuck_settles={} forced_passes={} oldest_wait_ms={}",
+                 stuck_settles={} forced_passes={} oldest_wait_ms={} refusal_repeats={}",
                 pass.0,
                 pass.1 / 1000,
                 pass.2,
@@ -78,6 +78,7 @@ impl RuntimeShutdown {
                 stuck.0,
                 stuck.1,
                 stuck.2,
+                planner.refusal_repeats(),
             );
         }
         let scheduler_result = self.scheduler.shutdown().await;
@@ -810,7 +811,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                      passes={} pass_ms={} pass_mean_us={} pass_p99_under_us={} \
                      pass_steps_ms={} pass_wants_ms={} pass_rest_ms={} \
                      map_passes={} map_pass_ms={} quiet_waits={} skipped_wakes={} map_cache_hits={} \
-                     stuck_settles={} forced_passes={} oldest_wait_ms={} \
+                     stuck_settles={} forced_passes={} oldest_wait_ms={} refusal_repeats={} \
                      runners=[{}]",
                     d.queue.len(),
                     d.unmet_queued,
@@ -888,6 +889,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     stuck.0,
                     stuck.1,
                     stuck.2,
+                    planner.refusal_repeats(),
                     d.runners
                         .iter()
                         .map(|(seq, held, progressed)| format!("{seq}:h{held}:p{progressed}"))
