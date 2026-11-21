@@ -90,6 +90,23 @@ impl ResidencyPlanner {
     /// refusal, said as the runtime's bug. Failed for it, a beam lost its
     /// process (Mac Pro at 5 GiB on 5aa45805b: "state chunk 1936 ... lies
     /// inside the activation span's backed carve").
+    /// An eviction whose copy down failed because the tier below is full
+    /// (the disk tier's slot file, `StorageFull`): nothing on the device
+    /// changed, so the move is taken back and the process stays resident,
+    /// said by name, and it is no victim again until the pool moves past
+    /// it (its block lapses, [`Self::lapse_blocks`]): moved again at once,
+    /// it would find the tier as full.
+    pub(super) fn eviction_tier_full(self: &Arc<Self>, pid: ProcessId, error: &str) {
+        tracing::warn!(
+            pid = %pid,
+            %error,
+            "planner: the tier below is full: the eviction is taken back, the process kept \
+             resident, no victim until the pool moves"
+        );
+        self.stats.eviction_tier_full.fetch_add(1, Ordering::Relaxed);
+        self.eviction_failed_inner(pid, false, true);
+    }
+
     pub(super) fn eviction_copy_refused(self: &Arc<Self>, pid: ProcessId, error: &str) {
         tracing::error!(
             pid = %pid,
@@ -360,6 +377,7 @@ impl ResidencyPlanner {
             .restore_roles_short
             .fetch_add(1, Ordering::Relaxed);
         self.with_inner(|inner| {
+            let quiet = inner.nothing_in_flight_but(pid);
             if let Some(proc) = inner.procs.get_mut(&pid) {
                 proc.roles_short = Some(updated);
                 if proc.bind_room.is_some_and(|bind| bind.run == run) {
@@ -369,6 +387,8 @@ impl ResidencyPlanner {
                 proc.roles_short_gives = Some(gives);
                 proc.roles_short_runs = Some((need.0, refused_room));
                 proc.roles_short_free = Some(free_chunks);
+                // Its own restore was in flight; anyone else's?
+                proc.roles_short_quiet = quiet;
                 // Read below, once it is queued again: until then, as if
                 // its placement stood it (the stricter key), so a pass the
                 // requeue runs sends it on no less.

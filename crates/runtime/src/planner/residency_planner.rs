@@ -338,7 +338,7 @@ impl ResidencyPlanner {
     /// the last read, and its answer is the same.
     pub(super) fn generation(&self) -> u64 {
         use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut hasher = rustc_hash::FxHasher::default();
         self.port.room_changes().hash(&mut hasher);
         self.returns.freed_count().hash(&mut hasher);
         self.returns.epoch().hash(&mut hasher);
@@ -1099,6 +1099,18 @@ impl ResidencyPlanner {
     /// ([`Self::demote_idle`]). Only evicted processes' state moves, and
     /// none of them is restored until it lands. Whether a move is on its
     /// way.
+    /// The processes whose restore is under way.
+    pub(super) fn restoring_pids(&self) -> Vec<ProcessId> {
+        self.with_inner(|inner| {
+            inner
+                .procs
+                .iter()
+                .filter(|(_, proc)| proc.state == Residency::Restoring)
+                .map(|(pid, _)| *pid)
+                .collect()
+        })
+    }
+
     pub(super) fn park_down(self: &Arc<Self>, head: ProcessId, pids: Vec<ProcessId>) -> bool {
         let failed_at = self.park_down_failed.load(Ordering::Acquire);
         if failed_at != u64::MAX && failed_at == self.port.room_gives() {

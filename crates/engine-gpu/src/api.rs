@@ -616,6 +616,7 @@ pub fn fault(fault: Fault) -> Error {
     }
     match fault {
         Fault::Deviceless | Fault::Device { .. } => Error::Device(fault.to_string()),
+        Fault::TierFull(_) => Error::TierFull(fault.to_string()),
 
         Fault::PatchPayload { .. } => Error::Invalid(fault.to_string()),
 

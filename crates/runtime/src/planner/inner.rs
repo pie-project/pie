@@ -64,6 +64,9 @@ pub(super) struct Inner {
     /// planned for, where it stopped, whether the room below was short,
     /// and the candidates its quote found unhostable.
     pub(super) last_plan: Option<super::victim::PlanEnd>,
+    /// Each queued process's own last plan end: a stall line names its own
+    /// head's, never another entry's ([`Self::plan_fields`]).
+    pub(super) ends: HashMap<ProcessId, super::victim::PlanEnd>,
 }
 
 impl Inner {
@@ -74,22 +77,26 @@ impl Inner {
     /// waiting on its rebinds.
     pub(super) fn plan_fields(&self, head: super::wait::EntryKey) -> (String, String) {
         use super::plan::some_pids;
-        let plan = match self.last_plan.as_ref() {
-            // By the entry's id: a reschedule re-ranks its key, and a plan's
-            // end recorded under the old rank read "ended=none" (Mac Pro at
-            // 2 GiB on ca5c710a7, 68,866 such lines).
-            Some(end) if end.head.1 == head.1 => format!(
-                "ended={:?} host_short={} unhostable={}",
-                end.ended,
-                end.host_short,
-                some_pids(end.unhostable.iter())
-            ),
-            // Recorded for another entry (this one queued since, as a
-            // refused restore is again): what that end said, named so.
+        // Its own process's last end, whatever entry it was queued under
+        // then (a refused restore is queued again under a new one): read
+        // as the planner's last end of any entry, a stall line named
+        // another head's (Mac Pro at 2 GiB: "ended=none (last ... for
+        // entry ...)").
+        let pid = self.queue.get(&head).map(|waiter| waiter.pid);
+        // An entry served and gone from the queue: the last end, where it
+        // was this entry's.
+        let own = pid.and_then(|pid| self.ends.get(&pid)).or_else(|| {
+            self.last_plan.as_ref().filter(|end| end.head.1 == head.1)
+        });
+        let plan = match own {
             Some(end) => format!(
-                "ended=none (last {:?} for entry {}) host_short={} unhostable={}",
+                "ended={:?}{} host_short={} unhostable={}",
                 end.ended,
-                end.head.1,
+                if end.head.1 == head.1 {
+                    String::new()
+                } else {
+                    format!(" (as entry {})", end.head.1)
+                },
                 end.host_short,
                 some_pids(end.unhostable.iter())
             ),
@@ -748,37 +755,48 @@ impl Inner {
     /// ([`super::ResidencyPlanner::generation`]).
     pub(super) fn book_print(&self) -> u64 {
         use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        self.next_id.hash(&mut hasher);
-        self.accum.len().hash(&mut hasher);
-        self.bind_restoring.hash(&mut hasher);
-        for (key, waiter) in &self.queue {
-            (key, waiter.pid, waiter.is_unmet(), waiter.kind_name()).hash(&mut hasher);
+        // Unordered sets fold by a wrapping sum of each member's hash: no
+        // sort, no allocation, the same print whatever the map's order.
+        fn one(value: impl Hash) -> u64 {
+            let mut hasher = rustc_hash::FxHasher::default();
+            value.hash(&mut hasher);
+            hasher.finish()
         }
-        let mut evicting: Vec<&ProcessId> = self.evicting.keys().collect();
-        evicting.sort_unstable();
-        evicting.hash(&mut hasher);
-        let mut moving: Vec<&ProcessId> = self.parked_moving.iter().collect();
-        moving.sort_unstable();
-        moving.hash(&mut hasher);
-        let mut procs: Vec<_> = self
-            .procs
-            .iter()
-            .map(|(pid, proc)| {
-                (
-                    *pid,
-                    proc.state as u8,
-                    proc.fires,
-                    proc.fire_lapsed,
-                    proc.idle,
-                    proc.roles_short.map(|need| (need.run, need.pieces)),
-                    proc.bind_room.map(|need| (need.run, need.pieces)),
-                )
+        let mut print = one((self.next_id, self.accum.len(), self.bind_restoring));
+        for (key, waiter) in &self.queue {
+            print = print
+                .rotate_left(5)
+                ^ one((key, waiter.pid, waiter.is_unmet(), waiter.kind_name()));
+        }
+        let evicting = self.evicting.keys().fold(0u64, |sum, pid| sum.wrapping_add(one(pid)));
+        let moving = self.parked_moving.iter().fold(0u64, |sum, pid| sum.wrapping_add(one(pid)));
+        let procs = self.procs.iter().fold(0u64, |sum, (pid, proc)| {
+            sum.wrapping_add(one((
+                pid,
+                proc.state as u8,
+                proc.fires,
+                proc.fire_lapsed,
+                proc.idle,
+                proc.roles_short.map(|need| (need.run, need.pieces)),
+                proc.bind_room.map(|need| (need.run, need.pieces)),
+            )))
+        });
+        one((print, evicting, moving, procs))
+    }
+
+    /// [`Self::nothing_in_flight`] but for `pid`'s own move.
+    pub(super) fn nothing_in_flight_but(&self, pid: ProcessId) -> bool {
+        self.evicting.keys().all(|evicting| *evicting == pid)
+            && !self.kill_in_flight()
+            && self.procs.iter().all(|(at, proc)| {
+                *at == pid
+                    || (!proc.firing()
+                        && match proc.state {
+                            Residency::Evicting => false,
+                            Residency::Restoring => proc.rebind_waiting.is_some(),
+                            _ => true,
+                        })
             })
-            .collect();
-        procs.sort_unstable_by_key(|entry| entry.0);
-        procs.hash(&mut hasher);
-        hasher.finish()
     }
 
     pub(super) fn nothing_in_flight(&self) -> bool {

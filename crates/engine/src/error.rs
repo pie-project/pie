@@ -44,6 +44,13 @@ pub enum Error {
     #[error("engine disconnected: {0}")]
     Disconnected(String),
 
+    /// The tier below the device (the disk tier's slot file) is full: a
+    /// copy down to it failed writing there (`io::ErrorKind::StorageFull`).
+    /// Nothing on the device changed: what the copy would have moved lies
+    /// where it lay, and the runtime takes the move back.
+    #[error("the tier below is full: {0}")]
+    TierFull(String),
+
     /// The lanes a step refused for their own sake: a lane's word, mask,
     /// positions, adapter or payload this load does not serve as stated.
     /// Nothing of the frame ran; every other lane would have, and the

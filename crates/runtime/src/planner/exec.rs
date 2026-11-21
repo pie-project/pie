@@ -613,6 +613,9 @@ impl Drop for MovingOut<'_> {
 pub(super) struct CopyFailure {
     message: String,
     untouched: bool,
+    /// The tier it copied down to is full ([`crate::scheduler::TierBelowFull`]):
+    /// nothing on the device changed.
+    tier_full: bool,
 }
 
 impl CopyFailure {
@@ -622,6 +625,9 @@ impl CopyFailure {
             untouched: error
                 .chain()
                 .any(|cause| cause.downcast_ref::<crate::scheduler::RefusedUntouched>().is_some()),
+            tier_full: error
+                .chain()
+                .any(|cause| cause.downcast_ref::<crate::scheduler::TierBelowFull>().is_some()),
         }
     }
 }
@@ -837,7 +843,12 @@ pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     drop(reading);
     if let Err(error) = copied_out {
         tracing::warn!(pid = %pid, %error, "planner: eviction copy failed");
-        if error.untouched {
+        if error.tier_full {
+            // The tier below is full: nothing on the device changed, the
+            // move is taken back, the process stays resident.
+            drop(guard);
+            planner.eviction_tier_full(pid, &error.message);
+        } else if error.untouched {
             // Refused untouched: its state lies where it lay, and the move
             // is taken back; the process stays as it was.
             drop(guard);

@@ -4,6 +4,9 @@ use poem_exec::KernelError;
 
 #[derive(Debug)]
 pub enum Fault {
+    /// The disk tier's slot file is full ([`engine::Error::TierFull`]).
+    TierFull(String),
+
     Deviceless,
 
     /// The system would not back `bytes` more: memory it is short of, not a
@@ -251,6 +254,7 @@ impl fmt::Display for Fault {
                  device half is its refusing twin"
             ),
             Self::Device { call, why } => write!(f, "`{call}` refused: {why}"),
+            Self::TierFull(why) => write!(f, "the disk tier's slot file is full: {why}"),
             Self::Shader {
                 file,
                 entrypoint,

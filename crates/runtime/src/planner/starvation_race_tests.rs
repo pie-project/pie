@@ -7710,6 +7710,36 @@ fn bench_a_plan_pass_on_a_shared_store() {
     time("port.chunk_occupants(residents)", &|| {
         let _ = pool.chunk_occupants(&residents);
     });
+    // Inside chunk_occupants, part by part.
+    time("  kv_working_sets_for(residents)", &|| {
+        let _ = crate::inferlet::process::residency::kv_working_sets_for(&residents, model, 0);
+    });
+    let groups: Vec<HashSet<_>> = crate::inferlet::process::residency::kv_working_sets_for(&residents, model, 0)
+        .into_iter()
+        .flatten()
+        .collect();
+    time("  kv.movable_resident_pages_each(residents)", &|| {
+        crate::store::registry::with_kv_lock(&stores.kv, "bench", |kv| {
+            let _ = kv.movable_resident_pages_each(&groups);
+        });
+    });
+    time("  roles.guest_chunk_slots(residents)", &|| {
+        let _ = roles.lock().unwrap().guest_chunk_slots(&residents);
+    });
+    time("  rs private refs (residents)", &|| {
+        for &pid in &residents {
+            let sets = crate::inferlet::process::residency::rs_working_set_ids(pid, model, 0);
+            if !sets.is_empty() {
+                let _ = stores.rs.lock().unwrap().private_slot_refs(&sets);
+            }
+        }
+    });
+    time("planner.occupants(residents) (cached by generation)", &|| {
+        let _ = planner.occupants(&residents);
+    });
+    time("planner.generation", &|| {
+        let _ = planner.generation();
+    });
     time("port.restore_stands", &|| {
         let _ = pool.restore_stands(head, &super::pool::RunNeed::one(4, 2), RsUnits::default(), 0, None);
     });
@@ -9389,6 +9419,35 @@ fn an_eviction_copy_refused_untouched_keeps_its_process() {
     });
 }
 
+/// ENOSPC on an eviction's write (the disk tier's slot file full): nothing
+/// on the device changed. The eviction is taken back, the process kept
+/// resident and said by name, and it is no victim until the pool moves;
+/// once it has, it is a candidate again.
+#[test]
+fn an_eviction_to_a_full_tier_is_taken_back_and_its_process_kept() {
+    let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::with_swap(8, 64))));
+    let pid = ProcessId::new_v4();
+    planner.register(pid);
+    planner.note_admitted(pid);
+    planner.with_inner(|inner| {
+        let _ = inner.begin_eviction(pid, Reclaim::default());
+    });
+    planner.eviction_tier_full(pid, "kv to LocalDisk copy: the tier below is full: ...");
+    assert_eq!(planner.stats.eviction_tier_full.load(Ordering::Relaxed), 1, "said by name");
+    planner.with_inner(|inner| {
+        assert_eq!(inner.procs[&pid].state, Residency::Resident, "kept, resident");
+        assert!(!inner.killing.contains(&pid), "not failed");
+        assert!(inner.prepare_blocked.contains(&pid), "no victim until the pool moves");
+        assert!(inner.evicting.is_empty(), "its eviction is settled");
+    });
+    // The pool moves (a fire lands): the block lapses.
+    planner.stats.fires_landed.fetch_add(1, Ordering::Relaxed);
+    planner.lapse_blocks();
+    planner.with_inner(|inner| {
+        assert!(!inner.prepare_blocked.contains(&pid), "a candidate again once the pool moved");
+    });
+}
+
 /// Mac Pro at 2 GiB on 7e75af541: a 52k-line no-step spin, head dc373c1e
 /// a bind-suspended restore, free runs (7, 3) beside its need, refused each
 /// time by its own check (PendingBindShort, free runs after its own unpark
@@ -9761,4 +9820,80 @@ async fn a_restore_s_own_take_consumes_a_run_and_its_move_is_issued() {
         planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
         "the move is issued"
     );
+}
+
+/// A stall line names its own head's last end: another entry's end is not
+/// its, and its own end, recorded under the entry it was queued as before
+/// (a refused restore queued again), is still its own, named so.
+#[test]
+fn a_stall_line_names_its_own_head_s_last_end() {
+    let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::new(8))));
+    let (a, b) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [a, b] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    let restore = || WaitKind::Restore {
+        demand: Demand::default(),
+    };
+    let (key_a, key_b) = planner.with_inner(|inner| (inner.enqueue(a, restore()), inner.enqueue(b, restore())));
+    planner.plan_ended(key_a, "no pick: the policy is asked", false, &[]);
+    let (plan_b, _) = planner.with_inner(|inner| inner.plan_fields(key_b));
+    assert!(plan_b.starts_with("ended=none"), "another entry's end is not its: {plan_b}");
+    let (plan_a, _) = planner.with_inner(|inner| inner.plan_fields(key_a));
+    assert!(plan_a.contains("no pick"), "{plan_a}");
+    // Queued again under a new entry: its own end, named as its old entry's.
+    let again = planner.with_inner(|inner| {
+        inner.queue.remove(&key_a);
+        inner.enqueue(a, restore())
+    });
+    let (plan_again, _) = planner.with_inner(|inner| inner.plan_fields(again));
+    assert!(plan_again.contains("no pick") && plan_again.contains("as entry"), "{plan_again}");
+}
+
+/// The L40S at 3 GiB on c201812ea: a restore refused (PendingBindShort)
+/// while others' takes raced it, its placement standing in the room its
+/// refusal left, held "until more chunks stand free" with nothing in
+/// flight: 186 s, no pass, nothing to free a chunk. With nothing in flight
+/// no race comes again: it is sent. Refused with nothing else in flight,
+/// a placement standing there is the placement's own mismatch: held, and
+/// said as a planner bug.
+#[tokio::test(flavor = "current_thread")]
+async fn a_raced_refusal_standing_with_nothing_in_flight_is_sent_again() {
+    for quiet in [false, true] {
+        let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+        let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+        pool.free.lock().extend(0..8);
+        let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+        let head = ProcessId::new_v4();
+        planner.register(head);
+        planner.note_admitted(head);
+        let key = planner.with_inner(|inner| {
+            let proc = inner.procs.get_mut(&head).unwrap();
+            proc.state = Residency::Evicted;
+            proc.roles_short = Some(PendingBind {
+                run: 1,
+                pieces: 1,
+                pages: 1,
+            });
+            proc.bind_room = proc.roles_short;
+            proc.roles_short_free = Some(8);
+            proc.roles_short_quiet = quiet;
+            inner.enqueue(
+                head,
+                WaitKind::Restore {
+                    demand: Demand::default(),
+                },
+            )
+        });
+        assert!(planner.with_inner(|inner| inner.nothing_in_flight()));
+        assert_eq!(planner.no_more_room_than_refused(head), quiet);
+        planner.plan();
+        let (plan, _) = planner.with_inner(|inner| inner.plan_fields(key));
+        if quiet {
+            assert!(!plan.contains("restore sent"), "a quiet refusal's mismatch is held: {plan}");
+        } else {
+            assert!(plan.contains("restore sent"), "nothing in flight: sent again: {plan}");
+        }
+    }
 }

@@ -197,6 +197,17 @@ impl ResidencyPlanner {
         )
     }
 
+    /// Wakes skipped on a settled generation, and occupancy maps read from
+    /// the cache ([`super::stats::PlannerStats::skipped_wakes`],
+    /// [`super::stats::PlannerStats::map_cache_hits`]).
+    #[must_use]
+    pub fn edge_census(&self) -> (u64, u64) {
+        (
+            self.stats.skipped_wakes.load(Ordering::Relaxed),
+            self.stats.map_cache_hits.load(Ordering::Relaxed),
+        )
+    }
+
     /// A pass's time by phase, in total microseconds: its steps, the wants
     /// published after them, the rest ([`super::stats::PlannerStats::plan_phase_us`]).
     #[must_use]
@@ -448,22 +459,31 @@ impl ResidencyPlanner {
             // standing names the part or shape the map does not count.
             let refusal = inner.procs.get(&waiter.pid).map(|proc| {
                 format!(
-                    "refused_on_this_pool={} roles_short={:?} bind_room={:?} why={:?}",
+                    "refused_on_this_pool={} roles_short={:?} bind_room={:?} why={:?} \
+                     refusal_room=(run, free_runs)={:?} free_chunks={:?}",
                     proc.roles_short_gives == Some(gives),
                     proc.roles_short.map(|need| (need.run, need.pieces)),
                     proc.bind_room.map(|need| (need.run, need.pieces)),
                     proc.roles_short_why,
+                    proc.roles_short_runs,
+                    proc.roles_short_free,
                 )
             });
+            let refused_run = inner
+                .procs
+                .get(&waiter.pid)
+                .and_then(|proc| proc.roles_short_runs.map(|(run, _)| run));
             // Its kv pages still to gather: an allocation's need, and a
             // restore's beside its runs.
             let kv_missing = waiter.kv_need().saturating_sub(inner.accum.len() as u32);
             let again = inner.stall_dumped.is_some_and(|(at, seen, _)| (at, seen) == (key, gives));
             inner.stall_dumped = Some((key, gives, crate::rt::Instant::now()));
             let (plan, blocked) = inner.plan_fields(key);
-            Some((key, pid, kind, pids, again, refusal, kv_missing, plan, blocked))
+            Some((key, pid, kind, pids, again, refusal, kv_missing, plan, blocked, refused_run))
         });
-        let Some((key, pid, kind, pids, again, refusal, kv_missing, plan, blocked)) = stalled else {
+        let Some((key, pid, kind, pids, again, refusal, kv_missing, plan, blocked, refused_run)) =
+            stalled
+        else {
             return;
         };
         // What the head's step takes, read as the map and the step read it.
@@ -497,6 +517,10 @@ impl ResidencyPlanner {
         let need_moves = short
             .as_ref()
             .map(|short| map.cheapest_need(short).map(|pids| pids.len()));
+        // The map's figure for the room the refusal read, at its run: the
+        // map's free runs once the head's own takes are laid, and its free
+        // chunks, beside the refusal's own.
+        let map_room = refused_run.map(|run| (run, map.free_runs(run), map.free.len()));
         let held_by = self.held_by_state();
         let store = self.store_holders();
         let (map, census) = (map.explain(run), self.port.chunk_census(run));
@@ -515,6 +539,7 @@ impl ResidencyPlanner {
             kv_chunks = kv_missing.div_ceil(self.port.chunks_as_pages(1).max(1)),
             again,
             refusal = %refusal.unwrap_or_default(),
+            map_room_at_refused_run = ?map_room,
             ?need_moves,
             %plan,
             %blocked,
@@ -942,7 +967,10 @@ impl ResidencyPlanner {
                     });
                     // Never on the room its last refusal was taken in.
                     let _ = stood_at;
-                    let moved = free_left.is_none_or(|left| self.port.free_chunks() > left);
+                    let _ = free_left;
+                    let moved = self
+                        .with_inner(|inner| inner.unmet_head().map(|(_, waiter)| waiter.pid))
+                        .is_none_or(|pid| !self.no_more_room_than_refused(pid));
                     if !understated
                         && moved
                         && head_key.is_some_and(|key| {

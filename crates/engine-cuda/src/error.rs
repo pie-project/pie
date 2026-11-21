@@ -8,6 +8,9 @@ pub type Result<T> = std::result::Result<T, Fault>;
 pub enum Fault {
     Runtimeless,
 
+    /// The disk tier's slot file is full ([`engine::Error::TierFull`]).
+    TierFull(String),
+
     Device {
         call: &'static str,
         code: i32,
@@ -394,6 +397,7 @@ impl fmt::Display for Fault {
             ),
             Self::Program { at, why } => write!(f, "{at}: {why}"),
             Self::Integrity { at, why } => write!(f, "{at}: {why} (a fault in this engine)"),
+            Self::TierFull(why) => write!(f, "the disk tier's slot file is full: {why}"),
             Self::Interpret(error) => write!(f, "{error}"),
             Self::Unlowered { region, lowering } => write!(
                 f,

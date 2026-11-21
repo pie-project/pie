@@ -4,6 +4,9 @@ use poem_exec::KernelError;
 
 #[derive(Debug)]
 pub enum Fault {
+    /// The disk tier's slot file is full ([`engine::Error::TierFull`]).
+    TierFull(String),
+
     Deviceless,
 
     Device {
@@ -296,6 +299,7 @@ impl fmt::Display for Fault {
             ),
             Self::NoDevice { detail } => write!(f, "no GPU device to bind: {detail}"),
             Self::Device { call, why } => write!(f, "`{call}` refused: {why}"),
+            Self::TierFull(why) => write!(f, "the disk tier's slot file is full: {why}"),
             Self::Shader {
                 file,
                 entrypoint,

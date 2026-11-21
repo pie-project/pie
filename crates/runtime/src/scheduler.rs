@@ -32,7 +32,7 @@ pub(crate) struct ControlCompletion {
 }
 
 struct ControlCompletionState {
-    result: Mutex<Option<std::result::Result<(), (String, bool)>>>,
+    result: Mutex<Option<std::result::Result<(), (String, Refused)>>>,
     notify: tokio::sync::Notify,
 }
 
@@ -42,6 +42,24 @@ struct ControlCompletionState {
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub(crate) struct RefusedUntouched(pub String);
+
+/// A copy down a tier failed writing to that tier because it is full
+/// (`engine::Error::TierFull`): nothing on the device changed, so it is
+/// refused untouched too, and the waiter takes the move back by name.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct TierBelowFull(pub String);
+
+/// How an engine refused a control, read from its error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Refused {
+    /// It failed: what it moved may be partly written.
+    Failed,
+    /// Refused before reading or writing any of it.
+    Untouched,
+    /// The tier it copied down to is full; nothing on the device changed.
+    TierFull,
+}
 
 impl ControlCompletion {
     fn new() -> Self {
@@ -68,23 +86,27 @@ impl ControlCompletion {
         }
     }
 
-    fn error((message, untouched): (String, bool)) -> anyhow::Error {
-        if untouched {
-            anyhow::Error::new(RefusedUntouched(message))
-        } else {
-            anyhow::Error::msg(message)
+    fn error((message, refused): (String, Refused)) -> anyhow::Error {
+        match refused {
+            Refused::Untouched => anyhow::Error::new(RefusedUntouched(message)),
+            Refused::TierFull => anyhow::Error::new(TierBelowFull(message)),
+            Refused::Failed => anyhow::Error::msg(message),
         }
     }
 
     fn resolve(&self, result: &Result<()>) {
         let result = result.as_ref().map(|_| ()).map_err(|error| {
-            let untouched = error.chain().any(|cause| {
-                matches!(
-                    cause.downcast_ref::<::engine::Error>(),
-                    Some(::engine::Error::Impossible(_) | ::engine::Error::Placement { .. })
-                )
-            });
-            (format!("{error:#}"), untouched)
+            let refused = error
+                .chain()
+                .find_map(|cause| match cause.downcast_ref::<::engine::Error>() {
+                    Some(::engine::Error::TierFull(_)) => Some(Refused::TierFull),
+                    Some(::engine::Error::Impossible(_) | ::engine::Error::Placement { .. }) => {
+                        Some(Refused::Untouched)
+                    }
+                    _ => None,
+                })
+                .unwrap_or(Refused::Failed);
+            (format!("{error:#}"), refused)
         });
         *self.inner.result.lock().unwrap() = Some(result);
         self.inner.notify.notify_waiters();
@@ -620,6 +642,21 @@ mod refused_untouched_tests {
         let failed = ControlCompletion::new();
         failed.resolve(&Err(anyhow::anyhow!("device lost")));
         let error = failed.wait().await.expect_err("failed");
+        assert!(error.downcast_ref::<RefusedUntouched>().is_none(), "{error:#}");
+    }
+
+    /// A copy down to a full disk tier (the slot file's write failing
+    /// with `StorageFull`) is told as the tier below full, nothing on the
+    /// device changed: never a failed copy, never a string.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_copy_to_a_full_tier_is_told_as_the_tier_below_full() {
+        let full = ControlCompletion::new();
+        full.resolve(&Err(anyhow::Error::new(::engine::Error::TierFull(
+            "the disk tier's slot file is full: No space left on device".into(),
+        ))
+        .context("kv to LocalDisk copy")));
+        let error = full.wait().await.expect_err("refused");
+        assert!(error.downcast_ref::<TierBelowFull>().is_some(), "{error:#}");
         assert!(error.downcast_ref::<RefusedUntouched>().is_none(), "{error:#}");
     }
 }

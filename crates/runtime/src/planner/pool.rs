@@ -395,6 +395,28 @@ impl ChunkMap {
         )
     }
 
+    /// The disjoint free runs of `run` adjacent chunks it holds, each inside
+    /// one segment, no more than its headroom opens: the map's figure for
+    /// the room a refusal read at that run ([`super::ResidencyPlanner::dump_stall`]).
+    #[must_use]
+    pub fn free_runs(&self, run: u32) -> u32 {
+        let run = run.max(1);
+        let mut free = self.free.clone();
+        free.sort_unstable();
+        let (mut runs, mut stretch, mut last) = (0u32, 0u32, None::<u32>);
+        for chunk in free {
+            let same = self.segment_chunks == 0
+                || last.is_some_and(|last| last / self.segment_chunks == chunk / self.segment_chunks);
+            stretch = if last == Some(chunk.wrapping_sub(1)) && same { stretch + 1 } else { 1 };
+            if stretch == run {
+                runs += 1;
+                stretch = 0;
+            }
+            last = Some(chunk);
+        }
+        self.headroom.map_or(runs, |headroom| runs.min(headroom / run))
+    }
+
     /// The processes whose eviction empties the cheapest `pieces` disjoint
     /// runs of `run` adjacent chunks, each chunk free or emptiable
     /// ([`ChunkHeld::emptiable`]), cost the pages moved; `None` where no
@@ -1282,26 +1304,37 @@ impl PoolPort for RegistryPool {
                 std::collections::BTreeMap::new();
             // Every process's movable pages read in one walk of the
             // running sets' pages ([`crate::store::kv::KvStore::movable_resident_pages_each`]).
-            let named: Vec<(ProcessId, std::collections::HashSet<_>)> = pids
+            let (named, groups): (Vec<ProcessId>, Vec<std::collections::HashSet<_>>) = pids
                 .iter()
                 .zip(sets)
                 .filter_map(|(&pid, sets)| sets.map(|sets| (pid, sets)))
-                .collect();
-            let groups: Vec<_> = named.iter().map(|(_, sets)| sets.clone()).collect();
+                .unzip();
             let movable = kv.movable_resident_pages_each(&groups);
-            for ((pid, _), pages) in named.iter().zip(movable) {
-                let pid = *pid;
-                let mut counts: std::collections::BTreeMap<u32, u32> = Default::default();
+            // Counted by physical chunk in one table the pool's size, its
+            // touched chunks reset after each process: no map per page.
+            let total = pool.pool().total_chunks() as usize;
+            let mut counts = vec![0u32; total];
+            let mut used = vec![0u32; total];
+            let mut touched: Vec<u32> = Vec::new();
+            for (pid, pages) in named.iter().zip(movable) {
                 for page in pages {
                     let slot = pool.slot(list.pool, page.0);
                     if let Some(physical) = pool.pool().physical(slot.chunk) {
-                        *counts.entry(physical).or_default() += 1;
-                        by.entry(physical)
-                            .or_insert_with(|| (pool.pool().chunk_used(slot.chunk), Vec::new()));
+                        let at = physical as usize;
+                        if counts[at] == 0 {
+                            touched.push(physical);
+                            used[at] = pool.pool().chunk_used(slot.chunk);
+                        }
+                        counts[at] += 1;
                     }
                 }
-                for (physical, pages) in counts {
-                    by.get_mut(&physical).expect("entered").1.push((pid, pages));
+                for physical in touched.drain(..) {
+                    let at = physical as usize;
+                    by.entry(physical)
+                        .or_insert_with(|| (used[at], Vec::new()))
+                        .1
+                        .push((*pid, counts[at]));
+                    counts[at] = 0;
                 }
             }
             for (pid, refs) in &state {
@@ -1396,6 +1429,49 @@ impl PoolPort for RegistryPool {
         let Some(stores) = crate::store::registry::try_get(self.model, self.engine) else {
             return false;
         };
+        // Their kv left on the device first: a page every reader of which
+        // is evicted (a prompt prefix several forks share, held at each
+        // eviction by another reader or a key) is theirs together, counted
+        // in the map as theirs (`chunk_occupants` of the evicted), and goes
+        // down a tier once with their sets, every reader's refs pointing
+        // there. Passed over, it held its chunk for good, no process its
+        // holder (the L40S at 3 GiB disk-only: chunk 4, one slot, seven
+        // evicted forks' refs, a head short of it unserved).
+        let kv_sets: Vec<(crate::store::kv::page_table::WorkingSetId, u64)> = pids
+            .iter()
+            .flat_map(|&pid| {
+                crate::inferlet::process::residency::kv_working_set_ids(pid, self.model, self.engine)
+            })
+            .map(|ws| (ws, 0))
+            .collect();
+        if !kv_sets.is_empty() {
+            // What a restore under way reads stays: it would bring it back.
+            let keep: HashSet<crate::store::kv::page_table::WorkingSetId> = planner
+                .restoring_pids()
+                .into_iter()
+                .flat_map(|pid| {
+                    crate::inferlet::process::residency::kv_working_set_ids(pid, self.model, self.engine)
+                })
+                .collect();
+            let sweep = self.with_kv_tagged("planner-park-down", |kv| {
+                kv.prepare_sweep(&keep, usize::MAX, &kv_sets, usize::MAX)
+            });
+            match sweep {
+                Ok(Some(txn)) => {
+                    super::exec::spawn_move_out(
+                        planner.clone(),
+                        txn,
+                        "parked kv move down",
+                        super::ResidencyPlanner::parked_down_done,
+                    );
+                    return true;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "planner: parked kv's move down refused");
+                }
+            }
+        }
         // An evicted process's state left on the device at its eviction
         // (records and rs list slots its suspend found no row for, or still
         // settling then) goes down with its parked role slots: left there,

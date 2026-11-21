@@ -110,6 +110,10 @@ pub(super) struct Proc {
     /// its last unpark refusal left them: it goes again only once more
     /// stand, as well as more runs of the refused length.
     pub(super) roles_short_free: Option<u32>,
+    /// Its last refusal was taken with nothing else in flight: no take of
+    /// another's raced its restore, so a placement standing in that room
+    /// is the placement's own mismatch, not a race.
+    pub(super) roles_short_quiet: bool,
     /// Whether the store's own placement ([`super::pool::PoolPort::guest_need_free`],
     /// its serve's state laid first) stood its need as its last unpark
     /// refusal left the pool. Refused where it did not stand, it goes again
@@ -234,6 +238,7 @@ impl Proc {
             roles_short_gives: None,
             roles_short_runs: None,
             roles_short_free: None,
+            roles_short_quiet: false,
             roles_short_stood: None,
             roles_refused: None,
             evicted_queued: false,

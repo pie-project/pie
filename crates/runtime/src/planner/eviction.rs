@@ -553,11 +553,29 @@ impl ResidencyPlanner {
     pub(super) fn no_more_room_than_refused(&self, pid: ProcessId) -> bool {
         let free = self.port.free_chunks();
         self.with_inner(|inner| {
-            inner
-                .procs
-                .get(&pid)
-                .and_then(|proc| proc.roles_short_free)
-                .is_some_and(|left| free <= left)
+            let Some(proc) = inner.procs.get(&pid) else {
+                return false;
+            };
+            if !proc.roles_short_free.is_some_and(|left| free <= left) {
+                return false;
+            }
+            // Refused while another's take could race it, and nothing in
+            // flight now: no race can come again, the placement is exact,
+            // and it is sent. Held, it waited for room no event brings
+            // (the L40S at 3 GiB on c201812ea: 186 s, "sent again once more
+            // chunks stand free", nothing in flight). Refused with nothing
+            // else in flight, a placement standing in that room is the
+            // placement's mismatch: held, and said as a planner bug.
+            let quiet_now = inner.nothing_in_flight();
+            if quiet_now && proc.roles_short_quiet {
+                tracing::error!(
+                    %pid,
+                    free,
+                    "planner: a restore refused with nothing else in flight stands in the \
+                     placement in the same room (a planner bug: the placement and the takes differ)"
+                );
+            }
+            !quiet_now || proc.roles_short_quiet
         })
     }
 
@@ -604,12 +622,20 @@ impl ResidencyPlanner {
             );
         }
         self.with_inner(|inner| {
-            inner.last_plan = Some(super::victim::PlanEnd {
+            let end = super::victim::PlanEnd {
                 head,
                 ended,
                 host_short,
                 unhostable: unhostable.to_vec(),
-            });
+            };
+            if let Some(pid) = inner.queue.get(&inner.locate(head).unwrap_or(head)).map(|waiter| waiter.pid) {
+                // Only the queued keep an end: one gone leaves none behind.
+                let queued: std::collections::HashSet<ProcessId> =
+                    inner.queue.values().map(|waiter| waiter.pid).collect();
+                inner.ends.retain(|pid, _| queued.contains(pid));
+                inner.ends.insert(pid, end.clone());
+            }
+            inner.last_plan = Some(end);
         });
     }
 

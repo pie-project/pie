@@ -26,6 +26,9 @@ pub struct PlannerStats {
     pub eviction_deferrals: AtomicU64,
     pub evictions: AtomicU64,
     pub eviction_rollbacks: AtomicU64,
+    /// Evictions taken back because the tier below was full
+    /// ([`super::ResidencyPlanner::eviction_tier_full`]).
+    pub eviction_tier_full: AtomicU64,
     /// Evictions whose copy failed: each fails its process by name, never
     /// retried ([`super::ResidencyPlanner::eviction_copy_failed`]).
     pub eviction_faults: AtomicU64,

@@ -158,6 +158,7 @@ fn fault(fault: Fault) -> Error {
     }
     match fault {
         Fault::Deviceless | Fault::Device { .. } => Error::Device(fault.to_string()),
+        Fault::TierFull(_) => Error::TierFull(fault.to_string()),
         Fault::Refused { bytes } => Error::Exhausted {
             resource: "device memory",
             wanted: bytes,
