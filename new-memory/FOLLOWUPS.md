@@ -962,3 +962,11 @@ by name). engine-cuda nets the page cache in its own reader (`weights.rs` ~372-4
 `inactive_file + active_file`. Move engine-cuda onto the shared reader and settle one rule for both:
 inactive only (what the kernel reclaims first, before a charge fails: the conservative room) or
 inactive + active (all file cache, which reclaim reaches under pressure).
+
+## F45. General per-lane split of a pass whose whole demand exceeds the device
+
+A pass whose whole demand (every lane's kv and state) is past the device while each lane fits
+alone is refused today (only a unit past the whole device alone is refused at submit, bc9354e5a).
+The general split by lanes into sub-fires that each fit needs part outputs held and joined by the
+engine across backends, and per-set parking of finished groups in the planner. The beam example's
+per-copy prefill is fixed by forking instead; not a runtime gate.
