@@ -1234,9 +1234,11 @@ mod tests {
         }
     }
 
-    /// A KDA layer buffers three planes a token — the conv's rows, then the
-    /// forget and beta projections — laid page by page behind one another,
-    /// and its extended run stages those beside `mixed` and `y`.
+    /// A KDA layer buffers the conv's rows, then the forget and beta
+    /// projections, laid page by page behind one another, and after them its
+    /// keys and corrected values (`rs_corrected`: the rows its decode reads
+    /// as a linear attention); its extended run stages the first three
+    /// beside `mixed` and `y`.
     #[test]
     fn a_kda_recurrence_buffers_its_conv_rows_beside_its_two_projections() {
         let wide = HEADS * HEAD_DIM;
@@ -1258,7 +1260,7 @@ mod tests {
         let (planes, widths) = read(&trace, PAGE)
             .expect("the KDA pair reads clean")
             .expect("the KDA pair reserves buffered planes");
-        assert_eq!(widths, vec![3 * wide + wide + HEADS]);
+        assert_eq!(widths, vec![3 * wide + wide + HEADS + wide + 2 * wide]);
         assert_eq!(planes.len(), 3);
         let page = u64::from(PAGE);
         let plane = |at: u64, width: u64| {
@@ -1318,7 +1320,7 @@ mod tests {
         let (planes, widths) = read(&trace, PAGE)
             .expect("a KDA layer and a lone conv read clean")
             .expect("both buffer planes");
-        assert_eq!(widths, vec![3 * wide + wide + HEADS, 2 * wide]);
+        assert_eq!(widths, vec![3 * wide + wide + HEADS + wide + 2 * wide, 2 * wide]);
         assert_eq!(
             planes.of(ValueId(lone)),
             Some(Plane {
