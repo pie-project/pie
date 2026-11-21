@@ -878,3 +878,18 @@ by name). engine-cuda nets the page cache in its own reader (`weights.rs` ~372-4
 `inactive_file + active_file`. Move engine-cuda onto the shared reader and settle one rule for both:
 inactive only (what the kernel reclaims first, before a charge fails: the conservative room) or
 inactive + active (all file cache, which reclaim reaches under pressure).
+
+## F45. Remove the 600 s silence timeout
+
+The frame gate no longer drops a lane on a timer (the leash and `submit-deadline-us` are gone):
+a lane whose guest waits on outside input is parked by the host (`process::away_while`: session
+receives, `wasi:clocks` waits, an HTTP request until its response head), and a computing lane
+stays awaited. `runtime.silence_timeout` still terminates an awaited lane silent that long.
+Remove it once each case it still catches has its own mechanism:
+- (a) poll-mixed waits are classified: `wasi:io/poll` in componentize-js / py language
+  components (one poll can mix the guest's own pie futures with outside ones, so parking on
+  every poll would un-await own-fire waits), HTTP response-body streams after the head, and
+  sockets;
+- (b) a guest spinning in wasm without submitting;
+- (c) a completion that never arrives (a lane in flight for twice the timeout is terminated
+  through the same path today).
