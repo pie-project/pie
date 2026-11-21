@@ -1021,6 +1021,42 @@ impl Roles {
         }
     }
 
+    /// Every item `holder` moves with, for a quiet wait's census: its owner,
+    /// tier, whether shed, and each part's role, live or dead, and the
+    /// physical chunks its refs lie in where it is on the device.
+    #[must_use]
+    pub fn guest_items_census(&self, holder: Holder) -> String {
+        let device = self.device.lock().unwrap();
+        let mut out = Vec::new();
+        for (owner, item) in &self.items {
+            if !self.moves_with(*owner, item, holder) {
+                continue;
+            }
+            let parts: Vec<String> = item
+                .parts
+                .iter()
+                .map(|part| {
+                    let chunks: BTreeSet<u32> = match (item.tier == Tier::Device, self.shapes.of(part.role)) {
+                        (true, Some(shape)) => part
+                            .refs
+                            .iter()
+                            .filter_map(|&slot_ref| device.pool().physical(device.slot(shape.pool, slot_ref).chunk))
+                            .collect(),
+                        _ => BTreeSet::new(),
+                    };
+                    format!(
+                        "{:?} {} refs={} chunks={chunks:?}",
+                        part.role,
+                        if part.dead() { "dead" } else { "live" },
+                        part.refs.len()
+                    )
+                })
+                .collect();
+            out.push(format!("{owner:?} tier={:?} shed={} [{}]", item.tier, item.shed, parts.join("; ")));
+        }
+        out.join(" | ")
+    }
+
     /// Per logical chunk, the slots each of `holders` holds there in guest
     /// items bound on the device: dead parts (scratch and pair state, given
     /// back at a park whatever lies below) and live ones (tables, rings),

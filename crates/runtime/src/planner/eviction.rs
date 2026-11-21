@@ -500,10 +500,25 @@ impl ResidencyPlanner {
                             })
                             .collect()
                     });
+                    // Each named one's attribution by source beside the
+                    // map's per-chunk count (the L40S on a05b286be: every
+                    // named process evicted, holding nothing the warn said).
+                    let sources: Vec<String> = named
+                        .iter()
+                        .map(|pid| format!("{pid}: {}", self.port.occupancy_sources(*pid)))
+                        .collect();
+                    let chunks: Vec<String> = all
+                        .held
+                        .iter()
+                        .filter(|held| held.by.iter().any(|(pid, _)| named.contains(pid)))
+                        .map(|held| format!("chunk {} used {} by {:?}", held.chunk, held.used, held.by))
+                        .collect();
                     tracing::warn!(
                         head = %victims.head_pid,
                         ?need,
                         ?states,
+                        ?sources,
+                        ?chunks,
                         parked_down_refused_at_this_room = self.park_down_failed.load(Ordering::Acquire)
                             == self.port.room_gives(),
                         "planner: the policy asked with nothing in flight while the map names moves \

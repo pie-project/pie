@@ -606,6 +606,15 @@ pub trait PoolPort: Send + Sync + 'static {
         let _ = (pid, need);
         String::new()
     }
+    /// Where the occupancy map's attribution of `pid` comes from, by
+    /// source and physical chunk: its movable kv pages, its guest items
+    /// (each item's owner, tier, parts and the chunks they lie in), and
+    /// its state's private device slots with each chunk's slots in use.
+    /// What a quiet wait's warn sets beside the map's attribution.
+    fn occupancy_sources(&self, pid: ProcessId) -> String {
+        let _ = pid;
+        String::new()
+    }
     /// The device pages that, moved out whole, free `chunks` chunks for a
     /// guest's state, as [`Self::rs_as_pages`] for state.
     fn chunks_as_pages(&self, chunks: u32) -> u32 {
@@ -971,6 +980,46 @@ impl PoolPort for RegistryPool {
             Some(roles) => roles.lock().unwrap().fits_beside_unpark(pid, run, pieces),
             None => self.guest_room_free(run, pieces),
         }
+    }
+
+    fn occupancy_sources(&self, pid: ProcessId) -> String {
+        let Some(stores) = crate::store::registry::try_get(self.model, self.engine) else {
+            return String::new();
+        };
+        let Some(shared) = stores.shared.clone() else {
+            return String::new();
+        };
+        let kv_sets = crate::inferlet::process::residency::kv_working_sets_for(&[pid], self.model, self.engine);
+        let guest = stores
+            .roles
+            .as_ref()
+            .map(|roles| roles.lock().unwrap().guest_items_census(pid))
+            .unwrap_or_default();
+        let rs_sets = crate::inferlet::process::residency::rs_working_set_ids(pid, self.model, self.engine);
+        let rs = if rs_sets.is_empty() {
+            Vec::new()
+        } else {
+            stores.rs.lock().unwrap().private_slot_refs(&rs_sets)
+        };
+        let kv = crate::store::registry::with_kv_lock(&stores.kv, "planner-sources", |kv| {
+            let groups: Vec<_> = kv_sets.into_iter().flatten().collect();
+            kv.movable_resident_pages_each(&groups).into_iter().map(|pages| pages.len()).sum::<usize>()
+        });
+        let pool = shared.lock().unwrap();
+        let rs: Vec<String> = rs
+            .iter()
+            .flat_map(|(engine, refs)| {
+                let shape = pool.pool_shape(*engine);
+                let pool = &pool;
+                refs.iter().filter_map(move |&slot_ref| {
+                    let shape = shape?;
+                    let slot = pool.slot(shape, slot_ref);
+                    let physical = pool.pool().physical(slot.chunk)?;
+                    Some(format!("shape {engine:?} chunk {physical} (used {})", pool.pool().chunk_used(slot.chunk)))
+                })
+            })
+            .collect();
+        format!("kv_movable_pages={kv} rs_private=[{}] guest=[{guest}]", rs.join(", "))
     }
 
     fn unpark_census(&self, pid: ProcessId, need: Option<(u32, u32)>) -> String {
