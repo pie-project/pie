@@ -120,12 +120,21 @@ pub fn beam_stage() -> Vec<Case> {
 /// stretches and at one that is not, a stretch a block leaves unwritten
 /// lands among the top (the row's log-probabilities are all below zero), so
 /// the readers answer the interpreter's only where every element was
-/// written as the one-block region writes it.
+/// written as the one-block region writes it. The region ends in the row's
+/// copy a later region reads: a block that copies past its own stretch
+/// reads cells another block writes, a read before the write where it wins
+/// (a backend's runner fills the region's scratch with a value above every
+/// log-probability, so such a read lands among the top).
 #[must_use]
 pub fn split_stage() -> Vec<Case> {
     vec![
         split_case("split rows, whole stretches", 65_536),
         split_case("split rows, a ragged last stretch", 70_001),
+        // Qwen3.5's vocabulary over sixteen blocks: an exact share of the
+        // row's 16-byte quads cuts it off the 128-element stretches (block
+        // 0's share ends at 15520, its stretch at 15488), so a copy cut by
+        // shares reads cells another block writes.
+        split_case("split rows, shares off the stretches", QWEN35_VOCAB),
     ]
 }
 
