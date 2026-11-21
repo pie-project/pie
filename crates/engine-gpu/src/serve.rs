@@ -3883,7 +3883,7 @@ impl<B: Serve> Shell<B> {
                     held.age(now);
                     None
                 } else {
-                    held.landed(now, estimate.ns, ns, estimate.hz)
+                    held.landed(now, estimate.rows, estimate.ns, ns, estimate.hz)
                 };
                 // Each fire's device time against its estimate, at debug
                 // (its fields computed only where it is enabled).

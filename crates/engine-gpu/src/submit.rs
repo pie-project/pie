@@ -480,37 +480,61 @@ impl DeviceTime {
 /// the bound. The worst, not a mean: while the device slows, splitting only
 /// grows more conservative. Nothing landed within the span: the stored
 /// ratio alone.
+///
+/// Each ratio is kept with the rung its fire ran under
+/// ([`SubmitBound::rung_of`]): where a clock table's floor covers the
+/// clock, an estimate's error is its shape's (an Adreno 840's one-lane
+/// decode ran ~2.2x its estimate where two lanes ran ~1.0, a cost of width
+/// no clock scales), so a step is read at the worst of its own rung's
+/// fires; with no table, the worst of every fire's, which then carries the
+/// clock across shapes.
 #[derive(Debug, Clone, Default)]
 pub struct Measured {
-    landed: std::collections::VecDeque<(std::time::Instant, f64)>,
+    landed: std::collections::VecDeque<(std::time::Instant, u32, f64)>,
 }
 
 impl Measured {
-    /// A fire's measured ratio (at full clock where its clock is known)
-    /// landed at `at`.
-    pub fn landed(&mut self, at: std::time::Instant, ratio: f64) {
+    /// A fire under rung `rung` landed at `at`, its measured ratio `ratio`
+    /// (at full clock where its clock is known).
+    pub fn landed(&mut self, at: std::time::Instant, rung: u32, ratio: f64) {
         if ratio.is_finite() && ratio > 0.0 {
-            self.landed.push_back((at, ratio));
+            self.landed.push_back((at, rung, ratio));
         }
     }
 
     /// Drops what landed before `since`.
     pub fn since(&mut self, since: std::time::Instant) {
-        while self.landed.front().is_some_and(|&(at, _)| at < since) {
+        while self.landed.front().is_some_and(|&(at, ..)| at < since) {
             self.landed.pop_front();
         }
     }
 
-    /// The worst ratio kept, 0 where none is.
+    /// The worst ratio kept, of every rung, 0 where none is.
     #[must_use]
     pub fn worst(&self) -> f64 {
-        self.landed.iter().map(|&(_, r)| r).fold(0.0, f64::max)
+        self.landed.iter().map(|&(.., r)| r).fold(0.0, f64::max)
+    }
+
+    /// The worst ratio kept of `rung`'s fires, 0 where none is.
+    #[must_use]
+    pub fn worst_of(&self, rung: u32) -> f64 {
+        self.landed
+            .iter()
+            .filter(|&&(_, at, _)| at == rung)
+            .map(|&(.., r)| r)
+            .fold(0.0, f64::max)
     }
 
     /// The fires kept.
     #[must_use]
     pub fn len(&self) -> usize {
         self.landed.len()
+    }
+
+    /// The fires kept of `rung`.
+    #[must_use]
+    pub fn len_of(&self, rung: u32) -> usize {
+        self.landed.iter().filter(|&&(_, at, _)| at == rung).count()
     }
 
     #[must_use]
@@ -609,16 +633,45 @@ impl SubmitBound {
     /// estimate, both ways: the stored covers a cold start and the fires
     /// before any lands, the measured a device slowing past it. Never below
     /// 1.
+    /// Of every rung's fires: what a step of the widest rung is read at
+    /// with no table, the widest any is read at with one.
     #[must_use]
     pub fn ratio_now(&self) -> f64 {
         self.error_now() * self.floor_factor()
     }
 
-    /// The estimate's error now: the stored ratio, or the worst measured
-    /// where it passes that; at least 1.
+    /// The estimate's error now, of every rung's fires: the stored ratio,
+    /// or the worst measured where it passes that; at least 1.
     #[must_use]
     pub fn error_now(&self) -> f64 {
         self.stored_ratio().max(self.measured.worst())
+    }
+
+    /// The fires whose measured ratios read `step`'s error: its own rung's
+    /// where a clock table's floor covers the clock, `None` (every rung's)
+    /// where none does ([`Measured`]).
+    #[must_use]
+    pub fn measured_rung(&self, step: StepRows) -> Option<u32> {
+        self.clock.as_ref().map(|_| self.rung_of(step.rows))
+    }
+
+    /// `step`'s estimate error: the stored ratio, or the worst measured over
+    /// the fires that read it ([`SubmitBound::measured_rung`]) where it
+    /// passes that.
+    #[must_use]
+    pub fn error_for(&self, step: StepRows) -> f64 {
+        let measured = match self.measured_rung(step) {
+            Some(rung) => self.measured.worst_of(rung),
+            None => self.measured.worst(),
+        };
+        self.stored_ratio().max(measured)
+    }
+
+    /// The ratio `step` is read at: its error ([`SubmitBound::error_for`])
+    /// times the floor factor.
+    #[must_use]
+    pub fn ratio_for(&self, step: StepRows) -> f64 {
+        self.error_for(step) * self.floor_factor()
     }
 
     /// How much longer a fire timed at full clock runs at the GPU's least
@@ -639,12 +692,12 @@ impl SubmitBound {
         self.worst.max(1.0) * self.scale.max(1.0)
     }
 
-    /// The estimate of `step` at [`SubmitBound::ratio_now`], ns: `(whole,
+    /// The estimate of `step` at [`SubmitBound::ratio_for`], ns: `(whole,
     /// per layer)` ([`SubmitBound::raw_ns`]).
     #[must_use]
     pub fn step_ns(&self, step: StepRows) -> (f64, f64) {
         let (whole, per_layer) = self.raw_ns(step);
-        let ratio = self.ratio_now();
+        let ratio = self.ratio_for(step);
         (whole * ratio, per_layer * ratio)
     }
 
@@ -658,9 +711,11 @@ impl SubmitBound {
     /// full clock, the estimate's error, so the floor factor counts the
     /// clock once.
     /// Returns the ratio kept (at full clock where the clock is known).
+    /// It ran `rows` rows: kept under their rung ([`Measured`]).
     pub fn landed(
         &mut self,
         at: std::time::Instant,
+        rows: u32,
         estimate_ns: f64,
         device_ns: u64,
         hz: Option<u64>,
@@ -672,7 +727,8 @@ impl SubmitBound {
                 .clock
                 .as_ref()
                 .map_or(ratio, |clock| clock.at_full_clock(ratio, hz));
-            self.measured.landed(at, error);
+            let rung = self.rung_of(rows);
+            self.measured.landed(at, rung, error);
             kept = Some(error);
         }
         self.age(at);
@@ -766,13 +822,26 @@ impl SubmitBound {
             }
             Admitted::Whole { ns } => ns,
         };
+        let (measured, fires, of) = match self.measured_rung(step) {
+            Some(rung) => (
+                self.measured.worst_of(rung),
+                self.measured.len_of(rung),
+                format!("of its rung {rung}"),
+            ),
+            None => (
+                self.measured.worst(),
+                self.measured.len(),
+                "of every rung".to_string(),
+            ),
+        };
         format!(
             "a step of {} rows over {} lanes at {} keys is estimated at {:.0} ms whole and {:.0} \
              ms a layer at a time ({} layers, at the ratio {:.3} of a fire's time to its \
              estimate: the worst ratio {:.3} the rates step measured, `[rates] \
              submit_worst_ratio`, times the clock's scale {:.3} its last probe read, or the \
-             worst ratio {:.3} measured over the {} fires landed within the last bound where \
-             it passes that, times the floor factor {:.2} of the GPU's clock table {}), past \
+             worst ratio {:.3} measured over the {} fires {} landed within the last bound \
+             where it passes that, times the floor factor {:.2} of the GPU's clock table {}), \
+             past \
              the \
              platform's stated bound of {:.0} ms on one GPU submission \
              (engine_gpu::rates::stated_submit_bound); the widest prefill rung this load lays \
@@ -783,11 +852,12 @@ impl SubmitBound {
             admitted.ns() / 1e6,
             per / 1e6,
             self.layers,
-            self.ratio_now(),
+            self.ratio_for(step),
             self.worst,
             self.scale,
-            self.measured.worst(),
-            self.measured.len(),
+            measured,
+            fires,
+            of,
             self.floor_factor(),
             self.clock
                 .as_ref()
@@ -1337,7 +1407,7 @@ mod tests {
         let fire = 100.0 * MS;
         let mut read = Vec::new();
         for (at, ratio) in [1.5, 2.0, 2.1, 2.3, 2.6].into_iter().enumerate() {
-            b.landed(t0 + ms(at as u64 * 100), fire, (fire * ratio) as u64, None);
+            b.landed(t0 + ms(at as u64 * 100), 256, fire, (fire * ratio) as u64, None);
             read.push((b.ratio_now(), b.admit(step).split()));
         }
         // Under the stored ratio: read at it, whole (2.1 is past it but
@@ -1349,12 +1419,12 @@ mod tests {
         let (scaled, _) = b.step_ns(step);
         assert!((scaled - raw * 2.6).abs() < 1e-6 * scaled);
         // A fast fire after: the worst stands.
-        b.landed(t0 + ms(500), fire, fire as u64, None);
+        b.landed(t0 + ms(500), 256, fire, fire as u64, None);
         assert!(b.admit(step).split());
         assert!((b.ratio_now() - 2.6).abs() < 1e-6);
         let why = b.refusal(step, &b.admit(step));
         assert!(why.contains("at the ratio 2.600"), "{why}");
-        assert!(why.contains("worst ratio 2.600 measured over the 6 fires"), "{why}");
+        assert!(why.contains("worst ratio 2.600 measured over the 6 fires of every rung"), "{why}");
         // A bound past the slow fires: the stored ratio again.
         b.age(t0 + ms(501) + std::time::Duration::from_nanos(b.bound_ns as u64));
         assert!(b.measured.is_empty());
@@ -1362,7 +1432,7 @@ mod tests {
         assert!(matches!(b.admit(step), Admitted::Whole { .. }));
         // A probe's scale raises the stored ratio over a measured one it
         // passes: 2.062 x 1.2 = 2.474 over 2.3.
-        b.landed(t0 + ms(10_000), fire, (fire * 2.3) as u64, None);
+        b.landed(t0 + ms(10_000), 256, fire, (fire * 2.3) as u64, None);
         let probed = SubmitBound { scale: 1.2, ..b };
         assert!((probed.ratio_now() - worst * 1.2).abs() < 1e-6);
     }
@@ -1676,6 +1746,48 @@ mod tests {
         };
         let why = next_cut(&past, &step, &facts).unwrap_err();
         assert!(why.contains("one row of one layer"), "{why}");
+    }
+
+    /// Under a clock table's floor a fire's measured ratio reads its own
+    /// rung: a slow one-lane decode (the Adreno 840's ~2.2x) leaves a
+    /// 512-row prompt's admission at the stored ratio, the refusal naming
+    /// the rung; with no table it raises it, every rung's fires read.
+    #[test]
+    fn a_slow_decode_moves_its_own_rung_under_a_floor_and_every_rung_without() {
+        let base = bound(1.0);
+        let prompt512 = prompt(512, 512);
+        let decode = StepRows {
+            rows: 1,
+            lanes: 1,
+            keys: 600,
+            prompt: false,
+        };
+        let floored = SubmitBound {
+            clock: Some(crate::clock::ClockRange::stated(160_000_000, 1_300_000_000)),
+            ..base.clone()
+        };
+        let at = std::time::Instant::now();
+        for held in [floored, base] {
+            let floor = held.clock.is_some();
+            let mut held = held;
+            let before = held.step_ns(prompt512);
+            assert_eq!(held.ratio_for(prompt512), held.stored_ratio() * held.floor_factor());
+            // A decode of one row ran 2.2x its estimate at full clock.
+            held.landed(at, 1, 10.0 * MS, (22.0 * MS) as u64, None);
+            assert!((held.error_for(decode) - 2.2).abs() < 1e-9, "the decode's own rung");
+            assert_eq!(held.measured_rung(decode), floor.then_some(64));
+            let after = held.step_ns(prompt512);
+            if floor {
+                assert_eq!(after, before, "the prompt's rung measured nothing: the stored ratio");
+                assert_eq!(held.error_for(prompt512), held.stored_ratio());
+                let why = held.refusal(prompt512, &held.admit(prompt512));
+                assert!(why.contains("over the 0 fires of its rung 512"), "{why}");
+            } else {
+                assert!((after.0 / before.0 - 2.2).abs() < 1e-9, "every rung's fires read");
+                let why = held.refusal(prompt512, &held.admit(prompt512));
+                assert!(why.contains("over the 1 fires of every rung"), "{why}");
+            }
+        }
     }
 
     /// A fire's device time reads nothing until its backend fills it, then

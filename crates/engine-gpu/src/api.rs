@@ -298,12 +298,17 @@ impl<B: Host> Gpu<B> {
             per_layer_ms = per_layer / 1e6,
             worst = held.worst,
             probe_scale = held.scale,
-            measured_worst = held.measured.worst(),
-            measured_fires = held.measured.len(),
+            measured_worst = held
+                .measured_rung(rows)
+                .map_or_else(|| held.measured.worst(), |rung| held.measured.worst_of(rung)),
+            measured_fires = held
+                .measured_rung(rows)
+                .map_or_else(|| held.measured.len(), |rung| held.measured.len_of(rung)),
             stored_ratio = held.stored_ratio(),
-            error = held.error_now(),
+            measured_rung = ?held.measured_rung(rows),
+            error = held.error_for(rows),
             floor_factor = held.floor_factor(),
-            ratio = held.ratio_now(),
+            ratio = held.ratio_for(rows),
             bound_ms = held.bound_ns / 1e6,
             split = admitted.split(),
             refused = matches!(admitted, crate::submit::Admitted::Refused { .. }),
@@ -364,7 +369,7 @@ impl<B: Host> Gpu<B> {
                     lanes = rows.lanes,
                     keys = rows.keys,
                     piece_rows,
-                    ratio = held.ratio_now(),
+                    ratio = held.ratio_for(rows),
                     "submit bound: a step past the bound a layer at a time: a piece cut by rows"
                 );
                 Some((piece, rest))
