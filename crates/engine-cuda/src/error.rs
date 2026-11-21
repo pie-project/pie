@@ -145,6 +145,11 @@ pub enum Fault {
 
     Compile(eta_exec::Failure),
 
+    /// Two live guest holders' state would overlap, or a member alone would
+    /// move its group's pair: a bind or a rebind refused before it wrote
+    /// there ([`engine::guest_claims`]).
+    Claimed(engine::guest_claims::Refusal),
+
     Program {
         at: &'static str,
         why: String,
@@ -396,6 +401,7 @@ impl fmt::Display for Fault {
                 failure.reason()
             ),
             Self::Program { at, why } => write!(f, "{at}: {why}"),
+            Self::Claimed(refusal) => write!(f, "`guest::claims` refused: {refusal}"),
             Self::Integrity { at, why } => write!(f, "{at}: {why} (a fault in this engine)"),
             Self::TierFull(why) => write!(f, "the disk tier's slot file is full: {why}"),
             Self::Interpret(error) => write!(f, "{error}"),
@@ -498,5 +504,17 @@ pub fn kernel(error: kernels_cuda::Error) -> KernelError {
             KernelError::DtypeUnsupported { op, dtype }
         }
         kernels_cuda::Error::Backend { op, detail } => KernelError::Backend { op, detail },
+    }
+}
+
+impl From<engine::guest_claims::Overlap> for Fault {
+    fn from(overlap: engine::guest_claims::Overlap) -> Fault {
+        Fault::Claimed(overlap.into())
+    }
+}
+
+impl From<engine::guest_claims::Refusal> for Fault {
+    fn from(refusal: engine::guest_claims::Refusal) -> Fault {
+        Fault::Claimed(refusal)
     }
 }

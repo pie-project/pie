@@ -9,6 +9,7 @@ pub mod wave;
 use std::collections::BTreeMap;
 
 use engine::channel::ChannelId;
+use engine::guest_claims::{Claims, Holder, Joined, PairClaim, Run};
 use engine::ports::Envelope;
 use engine::program::{InstanceId, ProgramId, ProgramRegistration};
 use eta_exec::{Boundaries, ExecPlan, Extents, Versions, adopt_launch_package_with};
@@ -57,7 +58,13 @@ struct Batch {
     /// The state moved or came back since its stages last laid there: what
     /// a lay keeps between fires is staged again.
     stale: bool,
+    /// Its name as a group's claim on the pair's state
+    /// ([`engine::guest_claims::Claims::claim_with_pair`]).
+    claim: u64,
 }
+
+/// Names for the pairs' claims, one a batch made.
+static NEXT_PAIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Program {
     /// Whether it reads a capturing lane's rows (`crate::scores`).
@@ -99,6 +106,7 @@ impl Program {
             base: 0,
             generation: 0,
             stale: true,
+            claim: NEXT_PAIR.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         });
         Ok(self.batches.last_mut().expect("just pushed"))
     }
@@ -274,6 +282,10 @@ pub struct Plane {
     /// A capturing lane's rows, which a program reading them keeps in its
     /// instance's item (`crate::scores`); 0 where the load captures none.
     score_bytes: u64,
+    /// Where each live instance's own state lies, by device address: a
+    /// bind or a rebind over another's is refused by name before it writes
+    /// ([`engine::guest_claims`]).
+    claims: Claims,
 }
 
 /// What a flight of one program at one bind's extents lays: every stage's
@@ -415,6 +427,7 @@ impl Plane {
             fire_lanes: 0,
             arenas: launch::Arenas::default(),
             score_bytes: 0,
+            claims: Claims::default(),
         }
     }
 
@@ -651,6 +664,62 @@ impl Plane {
         span: Span<'_>,
         stream: *mut core::ffi::c_void,
     ) -> Result<InstanceId> {
+        // Where the instance's own state will lie, claimed before a byte of
+        // it, or of its pair's, is written: a placement over another live
+        // instance's is refused by name, and nothing changes.
+        let room = self.pair_room(program_id, extents)?;
+        let held = self.held(program_id)?;
+        let place = slots.place(&held, span)?;
+        let scratch_piece = piece_at(&slots.scratch, room.instance_bytes(), span)?;
+        let own = own_runs(&held, &place, &slots.scratch, scratch_piece, room.instance_bytes());
+        let id = InstanceId(self.next_instance);
+        // Its pair's state is its group's: joined as it stands, or laid where
+        // the binding names a new taking of it.
+        if slots.pair == engine::ScratchPlace::None {
+            self.claims.claim(id.0, &own)?;
+        } else {
+            let base = piece_at(&slots.pair, room.bytes(), span)?;
+            let program = self.programs.get_mut(&program_id).ok_or_else(|| {
+                Fault::program("program::plane", format!("no program {program_id}"))
+            })?;
+            let pair = program.batch(extents, room)?.claim;
+            self.claims.claim_with_pair(
+                id.0,
+                &own,
+                &PairClaim {
+                    pair,
+                    taking: slots.pair_generation,
+                    runs: vec![device_run(base, room.bytes())],
+                },
+            )?;
+        }
+        let bound = self.bind_claimed(
+            id, program_id, seeds, extents, geometry, device, buffers_rs, adopted, ids, slots,
+            span, stream,
+        );
+        if bound.is_err() {
+            self.claims.release(id.0);
+        }
+        bound
+    }
+
+    /// [`Plane::bind`] past the claim of `id`'s state.
+    #[allow(clippy::too_many_arguments)]
+    fn bind_claimed(
+        &mut self,
+        id: InstanceId,
+        program_id: ProgramId,
+        seeds: &[(u32, Vec<u8>)],
+        extents: Extents,
+        geometry: GeometryClass,
+        device: PortMask,
+        buffers_rs: bool,
+        adopted: &[Option<std::sync::Arc<Endpoint>>],
+        ids: &[ChannelId],
+        slots: Slots,
+        span: Span<'_>,
+        stream: *mut core::ffi::c_void,
+    ) -> Result<InstanceId> {
         let room = self.pair_room(program_id, extents)?;
         let program = self
             .programs
@@ -709,8 +778,7 @@ impl Plane {
             .expect("just bound")
             .bound_batch(extents)?
             .bound += 1;
-        let id = InstanceId(self.next_instance);
-        self.next_instance += 1;
+        self.next_instance = id.0 + 1;
         self.instances.insert(
             id,
             Bound {
@@ -738,6 +806,37 @@ impl Plane {
     /// Points every instance's rings at where their pool slots lie now:
     /// after an evacuation moved chunks, ahead of the next fire staged.
     pub fn rebase(&mut self, span: Span<'_>) -> Result<()> {
+        // Every live instance's state where the evacuation left it, claimed
+        // in one step before a ring is pointed there: one moved onto bytes
+        // another still holds is refused by name, every claim as it stood.
+        let mut moved = Vec::with_capacity(self.instances.len());
+        for (id, bound) in &self.instances {
+            if self.closing.contains(id) {
+                continue;
+            }
+            let Some(program) = self.programs.get(&bound.program_id) else {
+                continue;
+            };
+            let held = program.held(self.score_bytes);
+            let place = bound.slots.place(&held, span)?;
+            let room = program.bound_room(bound.session.extents())?;
+            let scratch = piece_at(&bound.slots.scratch, room.instance_bytes(), span)?;
+            moved.push((
+                Holder::Instance(id.0),
+                own_runs(&held, &place, &bound.slots.scratch, scratch, room.instance_bytes()),
+            ));
+        }
+        for program in self.programs.values() {
+            // A pair whose every member closed while a fire of it flew holds
+            // nothing any more.
+            for batch in program.batches.iter().filter(|batch| {
+                batch.bound > 0 && !self.claims.members(batch.claim).is_empty()
+            }) {
+                let base = piece_at(&batch.pair, batch.room.bytes(), span)?;
+                moved.push((Holder::Pair(batch.claim), vec![device_run(base, batch.room.bytes())]));
+            }
+        }
+        self.claims.claim_all(&moved)?;
         for bound in self.instances.values_mut() {
             let Some(program) = self.programs.get(&bound.program_id) else {
                 continue;
@@ -793,15 +892,52 @@ impl Plane {
         // or not where it lay before, since what another item wrote there
         // meanwhile is staged over.
         let pair_base = piece_at(&slots.pair, room.bytes(), span)?;
-        // Both are fresh room, another owner's bytes until cleared: on the
-        // stream, behind the fires before and ahead of every one after.
-        clear_state(
-            &[
-                (&slots.scratch, scratch_piece, room.instance_bytes()),
-                (&slots.pair, pair_base, room.bytes()),
-            ],
-            stream,
-        )?;
+        // The instance's own state claimed where the rebind names it, before
+        // a byte there is cleared or a ring pointed there: onto another live
+        // instance's is refused by name, the instance as it stood. Its pair's
+        // state is its group's: joined as it stands, laid anew at a new
+        // taking, and never moved by this member alone while another is
+        // bound on it. One closed while a fire of it flies holds nothing.
+        let own = own_runs(&held, &place, &slots.scratch, scratch_piece, room.instance_bytes());
+        let fresh_pair = if self.closing.contains(&id) {
+            false
+        } else if slots.pair == engine::ScratchPlace::None {
+            self.claims.claim(id.0, &own)?;
+            false
+        } else {
+            let pair = self
+                .programs
+                .get(&program_id)
+                .and_then(|program| {
+                    program.batches.iter().find(|batch| batch.extents == extents)
+                })
+                .map(|batch| batch.claim)
+                .ok_or_else(|| {
+                    Fault::program(
+                        "program::plane",
+                        format!("instance {id}'s pair at {extents:?} is gone"),
+                    )
+                })?;
+            let joined = self.claims.claim_with_pair(
+                id.0,
+                &own,
+                &PairClaim {
+                    pair,
+                    taking: slots.pair_generation,
+                    runs: vec![device_run(pair_base, room.bytes())],
+                },
+            )?;
+            joined == Joined::Fresh
+        };
+        // The scratch is fresh room, and the pair's where it is laid anew:
+        // another owner's bytes until cleared, on the stream, behind the
+        // fires before and ahead of every one after. The pair's state the
+        // group holds as it stands is not cleared under its other members.
+        let mut clears = vec![(&slots.scratch, scratch_piece, room.instance_bytes())];
+        if fresh_pair {
+            clears.push((&slots.pair, pair_base, room.bytes()));
+        }
+        clear_state(&clears, stream)?;
         // The rings move ring by ring: one refused partway leaves the
         // instance between its old slots and its new, and it is failed by
         // name, never fired so.
@@ -1326,6 +1462,10 @@ impl Plane {
             .instances
             .get(&id)
             .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
+        // Its slots are the runtime's again once this returns: a fire still
+        // airborne on them runs ahead, on the stream, of whatever is bound
+        // there next.
+        self.claims.release(id.0);
         if bound.session.airborne() {
             self.closing.insert(id);
             return Ok(());
@@ -1464,6 +1604,46 @@ fn piece_at(place: &engine::ScratchPlace, bytes: u64, span: Span<'_>) -> Result<
         },
     }
 }
+
+/// The device-address runs an instance's own state takes at `place`: its
+/// item, each ring of its own, and its lane scratch at `scratch` (none where
+/// its place is none). The pair's state is its group's, claimed apart
+/// ([`Claims::claim_with_pair`]), and an endpoint's ring its channel's, not
+/// claimed. One device address space: segment [`DEVICE`].
+fn own_runs(
+    held: &Held,
+    place: &Place,
+    scratch_place: &engine::ScratchPlace,
+    scratch: u64,
+    scratch_bytes: u64,
+) -> Vec<Run> {
+    let run = device_run;
+    let mut runs = vec![run(place.instance, held.instance_bytes)];
+    for (channel, &at) in place.rings.iter().enumerate() {
+        if let Some(Some(bytes)) = held.ring_bytes.get(channel)
+            && at != 0
+        {
+            runs.push(run(at, *bytes));
+        }
+    }
+    if *scratch_place != engine::ScratchPlace::None {
+        runs.push(run(scratch, scratch_bytes));
+    }
+    runs
+}
+
+/// `bytes` at device address `start`.
+fn device_run(start: u64, bytes: u64) -> Run {
+    Run {
+        segment: DEVICE,
+        start,
+        end: start.saturating_add(bytes),
+    }
+}
+
+/// The segment a CUDA or HIP plane claims guest state in: the device's
+/// one address space, every pool slot at its device address.
+const DEVICE: u64 = 0;
 
 impl Slots {
     /// Where the items of an instance that keeps `held` lie now.

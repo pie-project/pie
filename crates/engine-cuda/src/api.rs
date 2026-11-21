@@ -378,6 +378,7 @@ fn fault(fault: Fault) -> Error {
             wanted: 1,
             available: 0,
         },
+        Fault::Claimed(refusal) => Error::Claimed(refusal),
         Fault::Compile(_) | Fault::Program { .. } | Fault::Interpret(_) => {
             Error::Program(fault.to_string())
         }

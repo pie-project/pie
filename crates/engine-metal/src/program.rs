@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use engine::channel::ChannelId;
+use engine::guest_claims::{Claims, Holder, Joined, PairClaim, Run};
 use engine::ports::Envelope;
 use engine::program::{InstanceId, ProgramId, ProgramRegistration};
 use eta_exec::adopt_launch_package;
@@ -152,6 +153,10 @@ pub struct Plane {
     capture: u64,
     next_program: u64,
     next_instance: u64,
+    /// Where each live instance's own state lies in the pool: a bind or a
+    /// rebind over another's is refused by name before it writes
+    /// ([`engine::guest_claims`]).
+    claims: Claims,
 }
 
 impl Default for Plane {
@@ -180,6 +185,7 @@ impl Plane {
             capture: 0,
             next_program: 1,
             next_instance: 1,
+            claims: Claims::default(),
         }
     }
 
@@ -372,7 +378,42 @@ impl Plane {
             .programs
             .get(&program_id)
             .ok_or_else(|| Fault::program("program::plane", format!("no program {program_id}")))?;
-        let adopted = self.seats_for(&program.plan, channels)?;
+        // Where the instance's own state will lie, claimed before a table
+        // there is zeroed or a seed published: a placement over another
+        // live instance's is refused by name, and nothing changes.
+        let id = InstanceId(self.next_instance);
+        let held = OwnSlots {
+            instance: pooled.instance.to_vec(),
+            rings: pooled.rings.to_vec(),
+        };
+        let own = own_runs(pools, &held, scratch)?;
+        // Its pair's state is its group's: joined as it stands, or laid where
+        // the binding names a new taking of it ([`Plane::join_pair`] lays it).
+        if matches!(pair, engine::ScratchPlace::None) {
+            self.claims.claim(id.0, &own)?;
+        } else {
+            let group = self
+                .pairs
+                .iter()
+                .find(|held| held.program == program_id && held.extents == extents)
+                .map_or(self.next_pair, |held| held.id);
+            self.claims.claim_with_pair(
+                id.0,
+                &own,
+                &PairClaim {
+                    pair: group,
+                    taking: pair_generation,
+                    runs: pair_runs(pools, pair)?,
+                },
+            )?;
+        }
+        let adopted = match self.seats_for(&program.plan, channels) {
+            Ok(adopted) => adopted,
+            Err(why) => {
+                self.claims.release(id.0);
+                return Err(why);
+            }
+        };
         let capture = self.capture_of(program);
         let session = match Session::bind(
             &program.compiled,
@@ -401,14 +442,15 @@ impl Plane {
             }
             Err(why) => {
                 release_seats(&adopted);
+                self.claims.release(id.0);
                 return Err(why);
             }
         };
-        let id = InstanceId(self.next_instance);
-        self.next_instance += 1;
+        self.next_instance = id.0 + 1;
         self.instances.insert(
             id,
             Bound {
+                held,
                 pair: 0,
                 scratch_place: scratch.clone(),
                 scratch: Vec::new(),
@@ -868,6 +910,23 @@ impl Plane {
     /// Points every pooled table and ring at the chunks their slots sit in
     /// now: after an evacuation moved chunks under unchanged refs.
     pub fn rebind(&mut self, pools: &Pools) -> Result<()> {
+        // Every instance's state where the evacuation left it, claimed in
+        // one step before a table is pointed there: one moved onto bytes
+        // another still holds is refused by name, every claim as it stood.
+        let mut moved = self
+            .instances
+            .iter()
+            .map(|(id, bound)| {
+                Ok((
+                    Holder::Instance(id.0),
+                    own_runs(pools, &bound.held, &bound.scratch_place)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for held in self.pairs.iter().filter(|held| !self.claims.members(held.id).is_empty()) {
+            moved.push((Holder::Pair(held.id), pair_runs(pools, &held.place)?));
+        }
+        self.claims.claim_all(&moved)?;
         for bound in self.instances.values_mut() {
             bound.session.rebind(pools)?;
         }
@@ -904,7 +963,39 @@ impl Plane {
                     .instances
                     .get_mut(id)
                     .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
+                // Its own state claimed where the rebind names it, before a
+                // table is pointed or laid there: onto another live
+                // instance's is refused by name, the instance as it stood.
+                let held = OwnSlots {
+                    instance: instance.clone(),
+                    rings: rings.clone(),
+                };
+                let scratch_place = if matches!(scratch, engine::ScratchPlace::None) {
+                    &bound.scratch_place
+                } else {
+                    scratch
+                };
+                let own = own_runs(pools, &held, scratch_place)?;
+                // Its pair's state is its group's: joined as it stands, laid
+                // anew at a new taking, and never moved or laid again by this
+                // member alone while another is bound on it.
+                let fresh_pair = if matches!(pair, engine::ScratchPlace::None) {
+                    self.claims.claim(id.0, &own)?;
+                    false
+                } else {
+                    let joined = self.claims.claim_with_pair(
+                        id.0,
+                        &own,
+                        &PairClaim {
+                            pair: bound.pair,
+                            taking: *pair_generation,
+                            runs: pair_runs(pools, pair)?,
+                        },
+                    )?;
+                    joined == Joined::Fresh
+                };
                 bound.session.retarget(pools, instance, rings)?;
+                bound.held = held;
                 // Its state moved with it: its scratch, and its pair's sets
                 // where the pair's place moved too. Their contents are dead
                 // between fires; the tables are written again where laid.
@@ -913,7 +1004,7 @@ impl Plane {
                     bound.scratch_place = scratch.clone();
                     self.lay_scratch(pools, *id)?;
                 }
-                if !matches!(pair, engine::ScratchPlace::None) {
+                if fresh_pair {
                     if let Some(held) = self.pairs.iter_mut().find(|held| held.id == owner) {
                         held.place = pair.clone();
                         held.generation = *pair_generation;
@@ -1496,6 +1587,7 @@ impl Plane {
             .instances
             .remove(&id)
             .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
+        self.claims.release(id.0);
         release_seats(&bound.shared);
         // The pair's last instance gives its batch sets back with its state.
         if let Some(held) = self.pairs.iter_mut().find(|held| held.id == bound.pair) {
@@ -1554,6 +1646,8 @@ struct Pair {
 
 #[derive(Debug)]
 struct Bound {
+    /// The slots its own tables and rings lie in, as claimed.
+    held: OwnSlots,
     /// The pair whose batch sets its grouped stages fire with.
     pair: u64,
     /// Where its value scratch lies, one a frame in flight, for the stages
@@ -1572,6 +1666,65 @@ struct Bound {
     shared: Vec<Option<Arc<SharedRing>>>,
     ids: Vec<ChannelId>,
 }
+
+/// The pool slots an instance's own tables and rings lie in: its
+/// `Instance` slot refs and the `Channel` slots of each ring it holds
+/// itself.
+#[derive(Debug, Clone)]
+struct OwnSlots {
+    instance: Vec<u32>,
+    rings: Vec<engine::program::RingSlots>,
+}
+
+/// The pool-global byte runs an instance's own state takes: each of its
+/// `Instance` slots, each `Channel` slot of a ring it holds itself, and its
+/// scratch's pieces. The pair's state is its group's, claimed apart
+/// ([`Claims::claim_with_pair`]), and a registered channel's ring the
+/// channel's, not claimed. One pool byte space: segment [`POOL`].
+fn own_runs(
+    pools: &Pools,
+    held: &OwnSlots,
+    scratch: &engine::ScratchPlace,
+) -> Result<Vec<Run>> {
+    use crate::store::layout::{CHANNEL, INSTANCE};
+    let run = |start: u64, bytes: u64| Run {
+        segment: POOL,
+        start,
+        end: start.saturating_add(bytes),
+    };
+    let mut runs = Vec::new();
+    let instance_bytes = pools.slot_bytes(INSTANCE)?;
+    for &slot in &held.instance {
+        runs.push(run(pools.slot_offset(INSTANCE, slot)?, instance_bytes));
+    }
+    if held.rings.iter().any(|ring| !ring.slots.is_empty()) {
+        let channel_bytes = pools.slot_bytes(CHANNEL)?;
+        for &slot in held.rings.iter().flat_map(|ring| &ring.slots) {
+            runs.push(run(pools.slot_offset(CHANNEL, slot)?, channel_bytes));
+        }
+    }
+    for piece in pools.guest_pieces(scratch)? {
+        runs.push(run(piece.global, piece.bytes));
+    }
+    Ok(runs)
+}
+
+/// The pool-global byte runs a pair's state at `place` takes.
+fn pair_runs(pools: &Pools, place: &engine::ScratchPlace) -> Result<Vec<Run>> {
+    Ok(pools
+        .guest_pieces(place)?
+        .into_iter()
+        .map(|piece| Run {
+            segment: POOL,
+            start: piece.global,
+            end: piece.global.saturating_add(piece.bytes),
+        })
+        .collect())
+}
+
+/// The segment a Metal plane claims guest state in: the pool's one byte
+/// space, every chunk at its global offset.
+const POOL: u64 = 0;
 
 /// Whether `plan` reads a capturing lane's score rows out.
 fn reads_scores(plan: &ExecPlan) -> bool {

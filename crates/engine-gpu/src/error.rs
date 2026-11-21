@@ -182,6 +182,11 @@ pub enum Fault {
         runs_correction: bool,
     },
 
+    /// Two live guest holders' state would overlap, or a member alone would
+    /// move its group's pair: a bind or a rebind refused before it wrote
+    /// there ([`engine::guest_claims`]).
+    Claimed(engine::guest_claims::Refusal),
+
     Program {
         at: &'static str,
 
@@ -469,6 +474,7 @@ impl fmt::Display for Fault {
                  more"
             ),
             Self::Program { at, why } => write!(f, "`{at}` refused: {why}"),
+            Self::Claimed(refusal) => write!(f, "`guest::claims` refused: {refusal}"),
             Self::Unaffine {
                 slot,
                 point,
@@ -653,5 +659,17 @@ mod tests {
              its own and 4 pool segments) and this adapter binds a stage 10 \
              (`maxStorageBuffersPerShaderStage`)"
         );
+    }
+}
+
+impl From<engine::guest_claims::Overlap> for Fault {
+    fn from(overlap: engine::guest_claims::Overlap) -> Fault {
+        Fault::Claimed(overlap.into())
+    }
+}
+
+impl From<engine::guest_claims::Refusal> for Fault {
+    fn from(refusal: engine::guest_claims::Refusal) -> Fault {
+        Fault::Claimed(refusal)
     }
 }

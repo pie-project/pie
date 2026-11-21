@@ -37,6 +37,9 @@ pub enum Refusal {
     Closed { what: &'static str, id: u64 },
 
     Program(String),
+
+    /// A guest claims refusal ([`engine::guest_claims`]), by its own name.
+    Claimed(engine::guest_claims::Refusal),
 }
 
 impl std::fmt::Display for Refusal {
@@ -44,6 +47,19 @@ impl std::fmt::Display for Refusal {
         match self {
             Refusal::Closed { what, id } => write!(f, "{what} {id} is closed"),
             Refusal::Program(why) => f.write_str(why),
+            Refusal::Claimed(refusal) => write!(f, "`guest::claims` refused: {refusal}"),
+        }
+    }
+}
+
+impl Refusal {
+    /// A device fault as a refusal: a guest claims refusal by its own name,
+    /// any other as the program's.
+    #[must_use]
+    pub fn fault(fault: crate::error::Fault) -> Refusal {
+        match fault {
+            crate::error::Fault::Claimed(refusal) => Refusal::Claimed(refusal),
+            other => Refusal::Program(other.to_string()),
         }
     }
 }

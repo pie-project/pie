@@ -498,16 +498,25 @@ impl Plane {
         #[cfg(not(feature = "wgpu"))]
         let _ = (place, layout);
         #[cfg(feature = "wgpu")]
-        let session = self
+        let mut session = self
             .build_session(place, binding, &plan, layout)
             .map_err(|why| {
                 Refusal::Program(format!("program {} does not bind: {why}", binding.program))
             })?;
         // The instance's room is fresh, its pair's where none holds that
-        // taking: both are another owner's bytes until cleared.
+        // taking: both are another owner's bytes until cleared. The pair's
+        // state is claimed by the group bound on its taking, before it is.
         #[cfg(feature = "wgpu")]
         {
             let fresh_pair = self.takings.take(&binding.pair, binding.pair_generation);
+            let group = self
+                .takings
+                .group(&binding.pair, binding.pair_generation)
+                .map(|group| (group, binding.pair_generation));
+            if let Err(fault) = session.join_pair(group) {
+                self.takings.give(&binding.pair, binding.pair_generation);
+                return Err(Refusal::fault(fault));
+            }
             if let Err(fault) = session.clear(fresh_pair) {
                 self.takings.give(&binding.pair, binding.pair_generation);
                 return Err(Refusal::Program(format!(
@@ -1043,7 +1052,7 @@ impl Plane {
             &sizes,
             place.align,
         )
-        .map_err(|fault| Refusal::Program(fault.to_string()))?;
+        .map_err(Refusal::fault)?;
         Ok(ProgramFacts {
             instance,
             ..ProgramFacts::default()
@@ -1066,7 +1075,7 @@ impl Plane {
             let mut half = seat.half.lock().expect("half lock poisoned");
             half.session
                 .rebind(pools)
-                .map_err(|fault| Refusal::Program(fault.to_string()))?;
+                .map_err(Refusal::fault)?;
             seat.scores = half.session.scores();
         }
         #[cfg(not(feature = "wgpu"))]
@@ -1105,17 +1114,25 @@ impl Plane {
                     seat.gate.settle(*id)?;
                     let mut half = seat.half.lock().expect("half lock poisoned");
                     let was = (half.session.pair_place().clone(), half.pair_generation);
-                    half.session
-                        .retarget(pools, instance, scratch, pair)
-                        .map_err(|fault| Refusal::Program(fault.to_string()))?;
+                    // The pair's taking it binds on is claimed by the group
+                    // bound on it, this member joining it with its own runs.
+                    let fresh_pair = self.takings.take(pair, *pair_generation);
+                    let group = self
+                        .takings
+                        .group(pair, *pair_generation)
+                        .map(|group| (group, *pair_generation));
+                    if let Err(fault) = half.session.retarget(pools, instance, scratch, pair, group)
+                    {
+                        self.takings.give(pair, *pair_generation);
+                        return Err(Refusal::fault(fault));
+                    }
                     // The unpark's room is fresh; the pair's is cleared where
                     // this is the first instance on its new taking.
                     self.takings.give(&was.0, was.1);
-                    let fresh_pair = self.takings.take(pair, *pair_generation);
                     half.pair_generation = *pair_generation;
                     half.session
                         .clear(fresh_pair)
-                        .map_err(|fault| Refusal::Program(fault.to_string()))?;
+                        .map_err(Refusal::fault)?;
                     seat.scores = half.session.scores();
                 }
                 #[cfg(not(feature = "wgpu"))]
@@ -1328,7 +1345,7 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
                 |at, local| session.span(at, local).map(|(_, held)| held),
                 &seats,
             )
-            .map_err(|fault| Refusal::Program(fault.to_string()))?;
+            .map_err(Refusal::fault)?;
             if let Some((output, lane)) = unread {
                 return Err(engine_gpu::program::unread(instance, &output, lane));
             }
