@@ -205,6 +205,10 @@ pub struct Shell {
     /// never arms once lanes name slot refs (it is refused by name, or the
     /// bodies stay as recorded).
     arm_deferred: bool,
+    /// How the load seated its weights ahead of the runtime's first
+    /// residency (`filed`, `copied`; `Shell::preseat_weights`), for a
+    /// measuring load that seats them again in a range reserved anew.
+    preseated_as: Option<(bool, bool)>,
     segments: std::collections::HashMap<record::BodyKey, Segmented>,
     windows_memo: Vec<prepare::WindowsMemo>,
     cache: GraphCache,

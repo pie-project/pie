@@ -1619,6 +1619,7 @@ impl Shell {
             arm_cold: false,
             arm_rs: crate::record::RsBody::Folds,
             arm_deferred: false,
+            preseated_as: None,
             card: (0, 0),
             held_for_fires: 0,
             live: engine::live::Live::armed(),
@@ -2252,6 +2253,13 @@ impl Shell {
         let mut hold = self.bodies_took;
         let weighed = self.cache.body_stats().census.bytes as u64;
         self.cache.forget_bodies();
+        // A flat range was allocated at the least range the bodies armed
+        // over; where the card backs more, it is let go (the weights
+        // preseated in it with it) so the refit reserves it anew at what the
+        // card backs, and the weights are seated again in it below.
+        let preseated = self.pools.preseated();
+        self.device.synchronize()?;
+        let refilled = self.pools.free_for_refit()?;
         let resident = footprint(self, device_total, free_before);
         let fitted = match self
             .pools
@@ -2267,6 +2275,21 @@ impl Shell {
             }
             fitted => fitted?,
         };
+        if refilled && let (true, Some((filed, copied))) = (preseated, self.preseated_as) {
+            let began = std::time::Instant::now();
+            self.preseat_weights(filed, copied)?;
+            let chunks = self
+                .pools
+                .preseat_plan()
+                .map_or(0, |plan| self.pools.weight_chunks(&plan).len());
+            eprintln!(
+                "engine-cuda: a measuring boot's flat range held the least range the bodies \
+                 armed over; it was reserved anew at {} chunks, and the weights the pool holds \
+                 ({chunks} chunks) were seated in it again from their copy in {:.1} s",
+                fitted.chunks,
+                began.elapsed().as_secs_f64()
+            );
+        }
         self.lay_workspace()?;
         self.bodies_mem = usize::try_from(hold).unwrap_or(usize::MAX);
         self.rearming = true;

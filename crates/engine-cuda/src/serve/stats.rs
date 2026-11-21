@@ -194,6 +194,7 @@ impl Shell {
     /// cannot hold them), the runtime streams them from a pinned copy made
     /// of it, as from the file's.
     pub(crate) fn preseat_weights(&mut self, filed: bool, copied: bool) -> crate::Result<()> {
+        self.preseated_as = Some((filed, copied));
         if filed {
             self.pools.file_weights();
         }
