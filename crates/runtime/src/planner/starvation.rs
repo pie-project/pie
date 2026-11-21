@@ -131,11 +131,17 @@ impl ResidencyPlanner {
         // plan again; the stall is named meanwhile (`dump_stall`). Failed
         // here, a rise that fit was refused once its holders' moves found
         // nothing to move.
-        let head_fits_alone = self.with_inner(|inner| {
-            let (head_key, head) = inner.unmet_head()?;
-            Some(head_key == victim_key && head.kv_need() <= total)
+        // So too any other waiter picked: one that fits the pool alone is
+        // never failed for another's room (seed 3243: a decoder's one-page
+        // ask failed for a head behind a full disk, the pool able to serve
+        // both in turn).
+        let victim_fits_alone = self.with_inner(|inner| {
+            inner
+                .queue
+                .get(&victim_key)
+                .map(|victim| victim.kv_need() <= total)
         });
-        if cause != StarveCause::SoleHolder && head_fits_alone == Some(true) {
+        if cause != StarveCause::SoleHolder && victim_fits_alone == Some(true) {
             return;
         }
         let (rs_free, rs_total) = self.port.rs_stats();

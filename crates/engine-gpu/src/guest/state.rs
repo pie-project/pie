@@ -10,7 +10,7 @@
 //!
 //! - each stage's heap, the values its launches lay over their lifetimes
 //!   ([`eta_exec::tables::StageTables::scratch`]): the instance's own
-//!   (`resident`), in its own `Instance` slots or run of chunks, so the
+//!   (`scratch`, dead between fires), in its own `Instance` slots or run of chunks, so the
 //!   pool holds a heap for every bound instance and none more. Its stages
 //!   share one region as wide as the widest: a stage runs whole (staged
 //!   in, dispatched, read back, its kept puts copied to their channels'
@@ -402,7 +402,10 @@ impl<B: Backend> Placed<B> {
 /// be reading its score rows.
 #[derive(Debug, Default)]
 pub struct Takings {
-    live: Vec<(ScratchPlace, u64, u32)>,
+    /// Each live taking: its place, generation, instances bound and the
+    /// name its group claims its state by ([`engine::guest_claims`]).
+    live: Vec<(ScratchPlace, u64, u32, u64)>,
+    next: u64,
 }
 
 impl Takings {
@@ -415,17 +418,28 @@ impl Takings {
         match self
             .live
             .iter_mut()
-            .find(|(held, taken, _)| held == place && *taken == generation)
+            .find(|(held, taken, _, _)| held == place && *taken == generation)
         {
-            Some((_, _, bound)) => {
+            Some((_, _, bound, _)) => {
                 *bound += 1;
                 false
             }
             None => {
-                self.live.push((place.clone(), generation, 1));
+                self.next += 1;
+                self.live.push((place.clone(), generation, 1, self.next));
                 true
             }
         }
+    }
+
+    /// The name the instances bound on `place` at `generation` claim its
+    /// state by, as one group; `None` where none is.
+    #[must_use]
+    pub fn group(&self, place: &ScratchPlace, generation: u64) -> Option<u64> {
+        self.live
+            .iter()
+            .find(|(held, taken, _, _)| held == place && *taken == generation)
+            .map(|&(_, _, _, group)| group)
     }
 
     /// An instance bound on `place` at `generation` lets it go: closed, or
@@ -434,7 +448,7 @@ impl Takings {
         if let Some(at) = self
             .live
             .iter()
-            .position(|(held, taken, _)| held == place && *taken == generation)
+            .position(|(held, taken, _, _)| held == place && *taken == generation)
         {
             self.live[at].2 -= 1;
             if self.live[at].2 == 0 {
@@ -464,6 +478,11 @@ mod tests {
         takings.give(&place, 0);
         takings.give(&place, 0);
         assert!(takings.take(&place, 0), "taken again once every holder let go");
+        assert_ne!(
+            takings.group(&place, 0),
+            takings.group(&place, 1),
+            "each live taking is a group of its own"
+        );
         assert!(!takings.take(&ScratchPlace::None, 0), "no room, nothing to clear");
     }
     use engine::program::GuestState;

@@ -108,6 +108,23 @@ impl ResidencyPlanner {
         None
     }
 
+    /// The refusal of `alone`, the most one unit of a fire takes on the
+    /// device at once (one KV working set's lanes: every page they read
+    /// and write, what they share counted, and their state's ask), where
+    /// it is past the whole device pool: no split of the fire and no move
+    /// of any other process makes it fit
+    /// ([`PlannerError::PastDevice`]). `None` for every unit that fits
+    /// alone, however short the pool is now.
+    pub fn past_device(&self, alone: Demand) -> Option<PlannerError> {
+        let total = self.device_pages_most();
+        let need = alone.kv_pages.saturating_add(self.port.rs_as_pages(alone.rs));
+        (need > total).then_some(PlannerError::PastDevice {
+            need,
+            total,
+            runs: None,
+        })
+    }
+
     pub async fn acquire(
         self: &Arc<Self>,
         pid: ProcessId,
@@ -270,7 +287,7 @@ impl ResidencyPlanner {
                         // only a need past the whole device pool, which the
                         // pool shrinking under it can make, is refused.
                         Collect::Wait if self.returns.epoch() != seen => {
-                            self.poke();
+                            self.wake_planner();
                             continue;
                         }
                         Collect::Wait => {
@@ -282,6 +299,8 @@ impl ResidencyPlanner {
                             // and planned ten times a second, hundreds of
                             // them under pressure.
                             tokio::select! {
+                                // In order, never at random: a seeded run takes the same branch.
+                                biased;
                                 () = &mut notified => {}
                                 () = &mut returned => {}
                             }
@@ -290,7 +309,7 @@ impl ResidencyPlanner {
                             if self.returns.epoch() != seen
                                 || (self.returns.freed_since_plan() && self.wants_met_now())
                             {
-                                self.poke();
+                                self.wake_planner();
                             }
                             let Some(error) = self.never_fits(key) else {
                                 continue;
@@ -354,6 +373,8 @@ impl ResidencyPlanner {
             // check did (a grow, a commit or a move tried again), and
             // refuses nothing.
             tokio::select! {
+                // In order, never at random: a seeded run takes the same branch.
+                biased;
                 () = &mut notified => return,
                 () = &mut policy => answered(),
             }
@@ -512,7 +533,7 @@ impl ResidencyPlanner {
                 // shortfall again and drew the next such answer, a loop).
                 || {
                     if self.returns.freed_since_plan() {
-                        self.poke();
+                        self.wake_planner();
                     }
                 },
             )
@@ -566,6 +587,8 @@ impl ResidencyPlanner {
                 proc.roles_short_gives = None;
                 proc.roles_short_runs = None;
                 proc.roles_short_free = None;
+                proc.last_refusal = None;
+                proc.roles_short_stood = None;
                 proc.roles_refused = None;
                 proc.roles_short_mismatch = None;
                 return true;
@@ -613,7 +636,7 @@ impl ResidencyPlanner {
         let pages = self.port.chunks_as_pages(run.max(1).saturating_mul(pieces));
         // Runs past the whole device pool never stand: refused by name, at
         // once. Any other bind waits for its runs, however long.
-        let (_, total) = self.port.device_stats();
+        let total = self.device_pages_most();
         if pages > total {
             return Err(PlannerError::PastDevice {
                 need: pages,
@@ -685,9 +708,12 @@ impl ResidencyPlanner {
         let notify = Arc::new(Notify::new());
         let key = self
             .with_inner(|inner| {
-                // Evicting already, it waits for its restore instead.
+                // Evicting already, it waits for its restore instead. A
+                // rung raise for its capped frame waits on: its eviction
+                // waits on that frame, which goes only once raised.
                 let proc = inner.procs.get(&pid)?;
-                if proc.state != Residency::Resident {
+                let raising = rise.is_some() && proc.state == Residency::Evicting;
+                if proc.state != Residency::Resident && !raising {
                     return Some(None);
                 }
                 Some(Some({
@@ -739,7 +765,7 @@ impl ResidencyPlanner {
                 None => return Err(PlannerError::Cancelled),
                 Some((_, true)) => return Ok((BindRoomWait::Withdrawn, Some(registration))),
                 Some((true, false)) => return Ok((BindRoomWait::Served, Some(registration))),
-                Some((false, false)) if self.returns.epoch() != seen => self.poke(),
+                Some((false, false)) if self.returns.epoch() != seen => self.wake_planner(),
                 Some((false, false)) => {
                     // Room that comes free or moves (the rung lowered or
                     // raised, a segment committed, guest state given back)
@@ -757,10 +783,12 @@ impl ResidencyPlanner {
                         }
                     };
                     tokio::select! {
+                        // In order, never at random: a seeded run takes the same branch.
+                        biased;
                         () = notified => {}
-                        () = returned => self.poke(),
-                        () = rung => self.poke(),
-                        () = given => self.poke(),
+                        () = returned => self.wake_planner(),
+                        () = rung => self.wake_planner(),
+                        () = given => self.wake_planner(),
                     }
                 }
             }

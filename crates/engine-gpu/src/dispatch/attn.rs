@@ -151,8 +151,10 @@ impl<B: Backend> Run<'_, B> {
             return Ok(());
         }
         if tables.rows / self.requests().max(1) >= self.tuning().sdpa_tile_rows_per_request() {
+            self.pick(|| format!("prefill attention tiled: {tactic:?}"));
             tiled()
         } else {
+            self.pick(|| format!("prefill attention walked: {tactic:?}"));
             walked()
         }
     }

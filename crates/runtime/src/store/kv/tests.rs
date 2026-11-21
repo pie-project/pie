@@ -70,6 +70,7 @@ fn tests_every_case() {
     reclaim_spares_the_prefixes_a_live_working_set_kept();
     a_suspend_past_host_swap_spills_to_disk_and_restores_whole();
     a_suspend_takes_shared_pages_to_the_host_in_place();
+    a_prefix_page_every_reader_left_on_the_device_goes_down_with_them();
     an_entry_left_on_the_host_goes_when_swap_needs_room();
     a_move_under_way_keeps_only_the_pages_it_holds();
     a_page_seals_under_a_key_that_names_its_prefix();
@@ -614,6 +615,71 @@ fn a_suspend_takes_shared_pages_to_the_host_in_place() {
         .unwrap();
     assert_eq!(store.commit_restore(txn).unwrap(), 4);
     assert_eq!(swapped(&store, a), 1);
+}
+
+/// The L40S at 3 GiB (disk-only): a prompt-prefix page seven forks share
+/// stayed on the device after every one of them was evicted (each
+/// suspend left it, another reader or a key holding it then), and nothing
+/// moved it: its chunk held a head's need for good. Swept with its
+/// readers' sets, it goes down a tier once, every reader's refs pointing
+/// there, the chunk comes free, and a restore reads it back.
+fn a_prefix_page_every_reader_left_on_the_device_goes_down_with_them() {
+    let mut store = KvStore::new_with_swap(12, 0, 12, h(13));
+    let owner = ProcessId::from_u128(7);
+    let tokens = prompt(13, 1);
+    let first = store.create_working_set();
+    sealed(&mut store, first, &tokens);
+    store.keep_checkpoint(first, 1, Some(owner));
+    let mut forks = vec![first];
+    for _ in 1..7 {
+        forks.push(reader(&mut store, &tokens, 1));
+    }
+    // Every reader evicted with the page left where it lay (the field's
+    // state: each suspend found it held then, and moved nothing of it).
+    store.discard_cache(owner, crate::policy::By::Policy);
+    store.mark_suspended(&forks.iter().copied().collect());
+    store.retire_idle();
+    assert_eq!(on_device(&mut store, &tokens), 1, "left on the device, every reader evicted");
+    // The move down of its readers' parked state takes it.
+    let order: Vec<_> = forks.iter().map(|&ws| (ws, 0)).collect();
+    let sweep = store
+        .prepare_sweep(&HashSet::new(), usize::MAX, &order, usize::MAX)
+        .unwrap()
+        .expect("the shared page moves");
+    assert_eq!(store.commit_suspend(sweep).unwrap(), 1, "once, for every reader");
+    store.retire_idle();
+    assert_eq!(on_device(&mut store, &tokens), 0, "its chunk comes free");
+    assert_eq!(store.available_pages(), 12);
+    for &ws in &forks {
+        assert_eq!(store.swapped_page_count(&HashSet::from([ws])).unwrap(), 1, "refs intact");
+    }
+    let mut granted = store.reserve_device_pages(1).unwrap();
+    let txn = store.prepare_restore(&HashSet::from([forks[3]]), &mut granted).unwrap();
+    assert_eq!(store.commit_restore(txn).unwrap(), 1, "read back");
+    assert_eq!(on_device(&mut store, &tokens), 1);
+
+    // Evicted one at a time, each finding the page read by the others still
+    // running: the last one's suspend takes it down.
+    let mut store = KvStore::new_with_swap(12, 0, 12, h(14));
+    let tokens = prompt(14, 1);
+    let first = store.create_working_set();
+    sealed(&mut store, first, &tokens);
+    store.keep_checkpoint(first, 1, Some(owner));
+    let forks: Vec<_> = std::iter::once(first)
+        .chain((1..7).map(|_| reader(&mut store, &tokens, 1)))
+        .collect();
+    store.discard_cache(owner, crate::policy::By::Policy);
+    for &ws in &forks[..6] {
+        assert!(store.prepare_suspend(&HashSet::from([ws])).unwrap().is_none(), "read by the rest");
+        store.mark_suspended(&HashSet::from([ws]));
+    }
+    let last = store
+        .prepare_suspend(&HashSet::from([forks[6]]))
+        .unwrap()
+        .expect("the last reader's suspend takes the page");
+    assert_eq!(store.commit_suspend(last).unwrap(), 1);
+    store.retire_idle();
+    assert_eq!(on_device(&mut store, &tokens), 0, "never left on the device");
 }
 
 fn an_entry_left_on_the_host_goes_when_swap_needs_room() {

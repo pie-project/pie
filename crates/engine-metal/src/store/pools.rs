@@ -1285,8 +1285,9 @@ impl Pools {
         Ok(self.shape(id)?.slot_bytes)
     }
 
-    /// The byte offset of slot ref `slot` of shape `id`.
-    fn slot_offset(&self, id: ShapeId, slot: u32) -> Result<u64> {
+    /// The byte offset of slot ref `slot` of shape `id`: where its chunk
+    /// lies now in the pool's global byte space.
+    pub(crate) fn slot_offset(&self, id: ShapeId, slot: u32) -> Result<u64> {
         let shape = *self.shape(id)?;
         let (chunk, index) = self.place(&shape, slot)?;
         Ok(u64::from(chunk) * self.layout.chunk_bytes + u64::from(index) * shape.slot_bytes)
@@ -1668,6 +1669,14 @@ impl Pools {
     #[must_use]
     pub fn span_held_bytes(&self) -> u64 {
         self.pool.top_held_bytes()
+    }
+
+    /// The bytes of the heaps kept spare for the span: made at the load
+    /// (the whole top backed), so the device holds them beside its mapped
+    /// heaps.
+    #[must_use]
+    pub fn span_spare_bytes(&self) -> u64 {
+        self.pool.top_spare_bytes()
     }
 
     /// The span's bytes, backed or not, which the ledger holds reserved.

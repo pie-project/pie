@@ -72,6 +72,12 @@ pub trait Serve: Backend {
     /// recordings, so no serving fire of it is unrecorded.
     type Probed;
 
+    /// The timestamps a timed step writes ([`Serve::walk_frame`]): laid at
+    /// load, one an arm (the most steps in flight), where a bound is
+    /// stated, and written by the one step in flight on the arm, so no
+    /// serving step lays any.
+    type Stamps;
+
     /// The fusions the backend implements.
     const FUSIONS: &'static [poem_compiler::fuse::Rule];
 
@@ -122,6 +128,12 @@ pub trait Serve: Backend {
     /// The chunk size the pool's recipe aims at in place of the profile's.
     fn chunk_bytes(boot: &Self::DeviceBoot) -> Option<u64>;
 
+    /// The bound on one GPU submission a load of `boot` holds every serving
+    /// step to: the platform's (`crate::rates::stated_submit_bound`), or
+    /// the one a test's boot states in its place (`test-limits`); none
+    /// where neither states one.
+    fn submit_bound(boot: &Self::DeviceBoot) -> Option<std::time::Duration>;
+
     /// The highest tier the device runs.
     fn tier(device: &Self::Context) -> kernels_slang::Tier;
 
@@ -168,8 +180,26 @@ pub trait Serve: Backend {
         handles: &'f Handles<Self>,
     ) -> Self::Sink<'f>;
 
-    /// A frame a step walks into; `keep` where it is kept to replay.
-    fn walk_frame(device: &Self::Context, keep: bool) -> Result<Self::Frame>;
+    /// A frame a step walks into; `keep` where it is kept to replay;
+    /// `timed` (its arm's timestamps) where its device time is read once it
+    /// lands, as [`Serve::fire_timing`] states (under a stated submit
+    /// bound).
+    fn walk_frame(
+        device: &Self::Context,
+        keep: bool,
+        timed: Option<&Self::Stamps>,
+    ) -> Result<Self::Frame>;
+
+    /// One arm's timestamps ([`Serve::Stamps`]), laid at load: enough for
+    /// `pieces` timed frames whose times are still being read (the most
+    /// submissions one step splits into), where the backend reads a time
+    /// after the arm is free again; one where it reads it before.
+    fn lay_stamps(device: &Self::Context, pieces: u32) -> Result<Self::Stamps>;
+
+    /// Where a serving fire's device time is read from under a stated
+    /// submit bound (`crate::submit::Measured`), stated at load; a device
+    /// whose backend reads it nowhere is refused by name.
+    fn fire_timing(device: &Self::Context) -> Result<crate::submit::FireTiming>;
 
     /// The probe's work (`record`, its dispatches into a frame) laid for
     /// [`Serve::replay_probe`]: recorded once into a spanned frame kept to
@@ -779,6 +809,24 @@ pub struct Shell<B: Serve> {
     /// The next step walks a layer at a time: its estimate is past the
     /// bound whole (`crate::submit::Admitted::Layers`).
     split_next: bool,
+    /// The consecutive layers each submission of a split walk takes
+    /// (`crate::submit::pack_layers`), 1 where the backend splits it.
+    split_layers: u32,
+    /// Under a stated submit bound, the next step's estimate at a ratio of
+    /// 1 (`crate::submit::SubmitBound::raw_ns`), which its flight carries
+    /// to its landing.
+    estimate_next: Option<crate::submit::Estimated>,
+    /// The landed fires whose device time is not yet read, each with its
+    /// estimate ([`Shell::timed`]).
+    timing: Vec<(crate::submit::Estimated, crate::submit::DeviceTime)>,
+    /// The device time, ns, of the last fire whose time was read
+    /// ([`Shell::track`]).
+    last_landed: Option<u64>,
+    /// The kernels the last walked step picked, by class.
+    last_picks: Vec<String>,
+    /// Under a stated submit bound, each arm's timestamps, laid at load
+    /// ([`Serve::Stamps`]): the step in flight on an arm writes its own.
+    stamps: Vec<B::Stamps>,
 
     pub handles: Handles<B>,
     trace: Trace,
@@ -1676,7 +1724,7 @@ impl<B: Serve> Shell<B> {
         // Where the platform states a bound on one submission, every serving
         // step is held to it by the estimate (`crate::submit`), which must
         // then be stated: refused by its key otherwise.
-        let mut submit_bound = match crate::rates::stated_submit_bound() {
+        let mut submit_bound = match B::submit_bound(boot.device) {
             None => None,
             Some(bound) => {
                 let Some(estimate) = fire_estimate else {
@@ -1730,9 +1778,56 @@ impl<B: Serve> Shell<B> {
                     fire_lanes: budgets.tokens.max_lanes,
                     rungs: span.rungs().iter().map(|rung| rung.tokens).collect(),
                     scale: 1.0,
+                    measured: crate::submit::Measured::default(),
+                    clock: None,
                 };
+                // Each serving fire's device time, read once it lands, moves
+                // the scale its successors are read at
+                // (`crate::submit::Measured`): where it is read from is
+                // stated here, and a device it is read nowhere on is
+                // refused by name. A load that runs nothing on a device
+                // reads none.
+                let timing = if B::LANDS {
+                    Some(B::fire_timing(&device)?)
+                } else {
+                    None
+                };
+                // The GPU's clock table, where the platform states it: every
+                // estimate is read at its floor (`crate::clock`), read once,
+                // here. Where none is readable that is said, and the
+                // measured ratios alone hold a step.
+                let mut held = held;
+                match crate::clock::ClockRange::read() {
+                    Ok(range) => {
+                        let now = match &range.cur {
+                            Some((path, _)) => format!(
+                                "each fire's measured ratio read back to full clock at the \
+                                 clock {} states as it lands",
+                                path.display()
+                            ),
+                            None => "no current-clock node is readable: each fire's measured \
+                                     ratio is read as measured"
+                                .to_string(),
+                        };
+                        tracing::info!(
+                            "submit bound {} ms; GPU clock table {range} -> floor factor {:.2}; \
+                             {now}",
+                            bound.as_millis(),
+                            range.floor_factor()
+                        );
+                        held.clock = Some(range);
+                    }
+                    Err(why) => tracing::info!(
+                        "submit bound {} ms; {why}: no floor factor, each step held at the \
+                         measured ratios alone",
+                        bound.as_millis()
+                    ),
+                }
                 tracing::info!(
                     bound_ms = bound.as_millis() as u64,
+                    fire_timing = timing.map(|t| t.to_string()),
+                    clock = held.clock.as_ref().map(ToString::to_string),
+                    floor_factor = held.floor_factor(),
                     worst = held.worst,
                     worst_measured_this_load = device_profile.tuned().measured_this_load,
                     layers = held.layers,
@@ -1759,7 +1854,7 @@ impl<B: Serve> Shell<B> {
                     crate::submit::Clock::new(rates.gemm_compute_ns(m, n, k) + rates.launch_ns);
                 let probe = crate::submit::Probe::<B>::new(&device, tuning.gemm(tier, m))?;
                 clock.probed(probe.fire(&device)?);
-                held.scale = clock.scale();
+                held.probed(clock.ratio, held.clock_now());
                 tracing::info!(
                     curve_us = clock.curve_ns / 1e3,
                     ratio = clock.ratio,
@@ -1866,6 +1961,16 @@ impl<B: Serve> Shell<B> {
         let page_tables = rows.tables.len();
 
         let arms = boot.runahead.frames().max(1);
+        // Under a stated submit bound, each arm's timestamps, laid here
+        // (`Serve::Stamps`): a timed step writes its arm's, so serving lays
+        // none. A load that runs nothing on a device times nothing.
+        let stamps = if let Some(held) = submit_bound.as_ref().filter(|_| B::LANDS) {
+            (0..arms)
+                .map(|_| B::lay_stamps(&device, held.layers.max(1)))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
 
         let gathers_readout = boot
             .trace
@@ -2151,6 +2256,12 @@ impl<B: Serve> Shell<B> {
             probe,
             probed: 0,
             split_next: false,
+            split_layers: 1,
+            estimate_next: None,
+            timing: Vec::new(),
+            last_landed: None,
+            last_picks: Vec::new(),
+            stamps,
             pipelines,
             asks,
             handles,
@@ -2254,9 +2365,10 @@ impl<B: Serve> Shell<B> {
     /// The disk tier: a slot file of `budget` bytes in disk chunks, any
     /// state shape's slots in any chunk, as [`Pools::disk_chunk_bytes`] and
     /// [`Pools::disk_division`] lay them; stated at load. Unstated
-    /// `budget`: a disk chunk for each of the pool's chunks, and at least
-    /// the kv pages of `seats` sequences at `context`, within a quarter of
-    /// the free disk. The disk chunks it holds.
+    /// `budget`: the disk chunks `seats` sequences' kv pages at `context`
+    /// and their state take, within the free disk
+    /// ([`engine::disk::derived_budget`]). One that cannot be seated is
+    /// refused by name, stated or not. The disk chunks it holds.
     pub fn seat_disk_kv(
         &mut self,
         budget: Option<u64>,
@@ -2268,26 +2380,31 @@ impl<B: Serve> Shell<B> {
         let paging = self.pools.paging();
         let layout = *self.pools.layout();
         let chunk = self.pools.disk_chunk_bytes();
-        let unstated = budget.is_none();
         let budget = budget.unwrap_or_else(|| {
             let pages =
                 u64::from(seats) * u64::from(context).div_ceil(u64::from(paging.page_size.max(1)));
             let per_list = layout.list.map_or(1, |list| u64::from(list.per_chunk.max(1)));
-            engine::disk::unstated_budget(
+            let state = (u64::from(seats) * self.state_slot_bytes()).div_ceil(chunk.max(1));
+            // The guest state the device can hold live (the room a guest
+            // program binds within): evicted, it has a home.
+            let guest = self.pool_chunk_facts().guest_room_bytes();
+            let bytes = engine::disk::unstated_budget(
                 dir,
                 0,
                 0,
-                u64::from(layout.total_chunks),
-                pages.div_ceil(per_list),
+                pages.div_ceil(per_list) + state,
                 chunk,
-            )
+                guest,
+            );
+            // Its inputs, stated at load: what the field rules on.
+            eprintln!(
+                "engine-gpu: the unstated disk tier: {bytes} bytes = {seats} seats x {context}                  tokens: {pages} kv pages in {} chunks and {state} chunks of state ({} B a seat),                  and {guest} B of guest state the device holds live, chunks of {chunk} B",
+                pages.div_ceil(per_list),
+                self.state_slot_bytes(),
+            );
+            bytes
         });
-        if let Err(error) = self.pools.seat_disk(&self.device, dir, budget) {
-            if !unstated {
-                return Err(error);
-            }
-            self.pools.unseat_disk();
-        }
+        self.pools.seat_disk(&self.device, dir, budget)?;
         let chunks = self.pools.disk_chunks();
         if chunks > 0 {
             let division = self
@@ -3955,6 +4072,21 @@ impl<B: Serve> Shell<B> {
         self.submit_bound.as_ref()
     }
 
+    /// For a test: the stated bound restated at `bound_ns`, every estimate
+    /// read at the ratio the rates step measured alone from here (no probe
+    /// re-times the clock, nothing measured kept), so a test admits a step
+    /// at a ratio it knows. A load whose boot states no bound is left as it
+    /// is.
+    #[doc(hidden)]
+    pub fn hold_to(&mut self, bound_ns: f64) {
+        if let Some(held) = self.submit_bound.as_mut() {
+            held.bound_ns = bound_ns;
+            held.scale = 1.0;
+            held.measured = crate::submit::Measured::default();
+            self.probe = None;
+        }
+    }
+
     /// Under a stated submit bound, re-times the device's clock where frame
     /// `frame` follows an idle device: where the device's queue is empty as
     /// its first step goes out (every submission made on it so far landed,
@@ -3995,7 +4127,7 @@ impl<B: Serve> Shell<B> {
         let took = probe.fire(&self.device)?;
         self.probed += 1;
         clock.probed(took);
-        held.scale = clock.scale();
+        held.probed(clock.ratio, held.clock_now());
         tracing::debug!(
             frame = frame.0,
             took_us = took / 1e3,
@@ -4006,10 +4138,111 @@ impl<B: Serve> Shell<B> {
         Ok(())
     }
 
-    /// The next step this shell enqueues walks a layer at a time (or, at
-    /// `false`, as its backend plans it).
-    pub fn split_next(&mut self, split: bool) {
-        self.split_next = split;
+    /// The next step this shell enqueues walks in submissions of
+    /// `layers_a_piece` consecutive layers (or, at `None`, as its backend
+    /// plans it).
+    pub fn split_next(&mut self, layers_a_piece: Option<u32>) {
+        self.split_next = layers_a_piece.is_some();
+        self.split_layers = layers_a_piece.unwrap_or(1).max(1);
+    }
+
+    /// Under a stated submit bound, the next step this shell enqueues is
+    /// `next` (its estimate at a ratio of 1), admitted at the clock the GPU
+    /// runs at now where the platform states it; `None` clears it.
+    pub fn estimate_next(&mut self, next: Option<crate::submit::Estimated>) {
+        self.estimate_next = match (next, self.submit_bound.as_ref()) {
+            (Some(next), Some(held)) => Some(crate::submit::Estimated {
+                hz: held.clock_now(),
+                ..next
+            }),
+            _ => None,
+        };
+    }
+
+    /// A step estimated at `estimate` (its flight's) landed; its device
+    /// time is read from `time` once its backend fills it, without waiting
+    /// ([`Shell::track`]). The clock it ran at is the faster of the GPU's
+    /// as it was admitted and as its landing is seen here (a drop inside
+    /// it read at the clock before: its ratio only rises by that). Nothing
+    /// where the step carries no estimate (no bound is stated).
+    pub fn timed(
+        &mut self,
+        estimate: Option<crate::submit::Estimated>,
+        time: crate::submit::DeviceTime,
+    ) {
+        let (Some(estimate), Some(held)) = (estimate, self.submit_bound.as_ref()) else {
+            return;
+        };
+        let hz = match (estimate.hz, held.clock_now()) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        self.timing
+            .push((crate::submit::Estimated { hz, ..estimate }, time));
+    }
+
+    /// The kernels the last walked step picked, by class (a dense matmul at
+    /// its rows, attention tiled or walked).
+    #[must_use]
+    pub fn last_picks(&self) -> &[String] {
+        &self.last_picks
+    }
+
+    /// The device time, ns, of the last fire whose time [`Shell::track`]
+    /// read, under a stated bound.
+    #[must_use]
+    pub fn last_landed_ns(&self) -> Option<u64> {
+        self.last_landed
+    }
+
+    /// Under a stated submit bound, every landed fire's device time filled
+    /// so far is read against its estimate into the bound's measured ratios
+    /// (`crate::submit::Measured`), and what landed more than a bound ago
+    /// drops out: before a step is admitted. Reads only what the backends
+    /// filled where they saw the fires land; waits on nothing.
+    pub fn track(&mut self) {
+        let Some(held) = self.submit_bound.as_mut() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        let last = &mut self.last_landed;
+        self.timing.retain(|(estimate, time)| match time.get() {
+            None => true,
+            Some(None) => false,
+            Some(Some(ns)) => {
+                *last = Some(ns);
+                // A step that went out a layer at a time spans the host's
+                // encoding between its submissions too (a desktop GPU's
+                // 0.5 ms layers ran ~10x their estimate so): its time is
+                // said, its ratio not kept. A step in one submission, the
+                // decodes and every prompt piece that fits whole, keeps
+                // the device's own.
+                let ratio = if estimate.pieces > 1 {
+                    held.age(now);
+                    None
+                } else {
+                    held.landed(now, estimate.rows, estimate.ns, ns, estimate.hz)
+                };
+                // Each fire's device time against its estimate, at debug
+                // (its fields computed only where it is enabled).
+                tracing::debug!(
+                    frame = estimate.at.frame.0,
+                    step = estimate.at.step,
+                    rows = estimate.rows,
+                    lanes = estimate.lanes,
+                    pieces = estimate.pieces,
+                    estimate_ms = estimate.ns / 1e6,
+                    measured_ms = ns as f64 / 1e6,
+                    clock_mhz = %estimate
+                        .hz
+                        .map_or_else(|| "unknown".to_string(), |hz| (hz / 1_000_000).to_string()),
+                    ratio = ?ratio,
+                    "submit bound: a fire landed"
+                );
+                false
+            }
+        });
+        held.age(now);
     }
 
     pub fn harvest_through(&mut self, seq: u64) -> Result<()> {
@@ -5536,7 +5769,7 @@ impl<B: Serve> Shell<B> {
         let mut frame = Some(if bind_only {
             B::bind_frame(&self.device)?
         } else {
-            B::walk_frame(&self.device, keep)?
+            B::walk_frame(&self.device, keep, self.stamps.get(p.arm))?
         });
         self.land_merges(frame.as_mut().expect("just opened"), p)?;
         if !B::RECORDS
@@ -5582,7 +5815,7 @@ impl<B: Serve> Shell<B> {
                 self.pools.segments(&self.handles)?,
             );
             if split {
-                run.flush_between_layers(p.done.as_ref().map(|done| done.at));
+                run.flush_between_layers(p.done.as_ref().map(|done| done.at), self.split_layers);
             }
             walk(
                 &self.trace,
@@ -5592,8 +5825,9 @@ impl<B: Serve> Shell<B> {
                 cursor,
                 Filter::default(),
             )?;
-            run.take_cuts()
+            (run.take_cuts(), run.take_picks())
         };
+        let (cuts, picks) = cuts;
 
         let launches = (0..self.compiled.template().len() as u32)
             .map(|region| p.windows.runs(region).max(1))
@@ -5602,6 +5836,7 @@ impl<B: Serve> Shell<B> {
             frame,
             launches,
             cuts,
+            picks,
         })
     }
 
@@ -5632,6 +5867,9 @@ struct Walked<B: Serve> {
     cuts: Vec<crate::store::experts::Cut<B>>,
 
     launches: u32,
+
+    /// The kernels it picked, by class (`Run::take_picks`).
+    picks: Vec<String>,
 }
 
 /// One lane's VAE clips: each box `[t, h, w]` and the voxel rows they hold,
@@ -6041,6 +6279,10 @@ pub struct Flight<B: Serve> {
     pub rows: Vec<ReadSpan>,
     pub pixels: PixelSpans,
     pub api: B::Flight,
+    /// Under a stated submit bound, the step's estimate at a ratio of 1,
+    /// which its measured device time is read against once it lands
+    /// ([`Shell::timed`]).
+    pub estimate: Option<crate::submit::Estimated>,
 }
 
 impl<B: Serve> engine::frame::Shell for Shell<B> {
@@ -6122,6 +6364,23 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
         } else {
             B::plan(self, &mut prepared)?
         };
+        // How each step went to the device, where a bound is stated: the
+        // recording it replayed, or the walk it took (kept to replay, eager,
+        // or split in runs of `layers_a_piece` layers).
+        if self.submit_bound.is_some() {
+            tracing::debug!(
+                target: "engine_gpu::api",
+                rung = prepared.rung,
+                plan = match &plan {
+                    Plan::Replayed { .. } => "replayed",
+                    Plan::Walk { split: true, .. } => "walked split",
+                    Plan::Walk { keep: Some(_), .. } => "walked, kept to replay",
+                    Plan::Walk { keep: None, .. } => "walked eagerly",
+                },
+                layers_a_piece = self.split_layers,
+                "submit bound: a step goes to the device"
+            );
+        }
         let (keep, split) = match plan {
             Plan::Replayed {
                 pending,
@@ -6147,7 +6406,22 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
         };
         self.recorded += u64::from(keep.is_some());
         self.unkept += u64::from(keep.is_none());
-        let walked = self.walk_once(&prepared, keep.is_some(), split)?;
+        let walked = self.walk_once(&prepared, keep.is_some(), split);
+        self.split_layers = 1;
+        let walked = walked?;
+        // The kernels the walk picked, by class: what a split step ran
+        // against the whole step its rung records (its own line, kept).
+        if self.submit_bound.is_some() {
+            tracing::debug!(
+                target: "engine_gpu::api",
+                rung = prepared.rung,
+                split,
+                kept = keep.is_some(),
+                picks = ?walked.picks,
+                "submit bound: a walked step's kernel picks"
+            );
+        }
+        self.last_picks.clone_from(&walked.picks);
         let mut frame = walked.frame.expect("the walk opened a frame");
 
         // Each read plane's buffer (the span's, or a score room's) and every
@@ -6311,6 +6585,7 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
             rows,
             pixels,
             api: B::fly(pending, fed),
+            estimate: self.estimate_next.take(),
         });
         Ok(Landed {
             seq,
@@ -6909,7 +7184,7 @@ impl<B: Serve> Shell<B> {
         let classes: Vec<usize> = (0..self.compiled.classes.classes.len())
             .filter(|&class| !self.captures(class))
             .collect();
-        for class in classes {
+        for &class in &classes {
             // Every count of lanes with every power of two of rows they can
             // bring between them (a decode is rows = lanes, a prefill one
             // lane), the rows spread over the lanes: each rung's views are
@@ -6933,6 +7208,22 @@ impl<B: Serve> Shell<B> {
                     );
                     rows = rows.saturating_mul(2);
                 }
+            }
+            // A lane of the class with one row beside a lane of another class
+            // bringing the rest of each rung's rows: a class's region runs
+            // its own rows, and a fire of its lanes alone brings it few rows
+            // only at the smallest rungs, where a decode of few rows takes
+            // its own kernels (the attention's split over keys) at whatever
+            // rung its fire's other lanes choose.
+            let filler = classes
+                .iter()
+                .copied()
+                .find(|&other| other != class)
+                .unwrap_or(class);
+            let mut tokens = 2u32;
+            while tokens <= top {
+                shapes.push(vec![(filler, tokens - 1), (class, 1)]);
+                tokens = tokens.saturating_mul(2);
             }
         }
         // Where the trace buffers a recurrence, a lane buffering its rows at
@@ -6994,12 +7285,19 @@ impl<B: Serve> Shell<B> {
             "the bind walk's fire shapes"
         );
         let mut walked = 0u64;
+        let mut built_nothing = 0u64;
         for (at, lanes) in shapes.iter().enumerate() {
             // Every arm: each walk holds its arm until the shape has taken
-            // them all, then gives them back.
+            // them all, then gives them back. An arm's fire binds what the
+            // shape's fire on another arm does, its stage's buffers in place
+            // of that arm's: where the shape's first fire builds nothing,
+            // every view it binds was built by an earlier fire, whose shape
+            // was walked on every arm, so its fires on the others would
+            // build nothing either, and the walk leaves them.
             let mut taken = Vec::with_capacity(depth);
             let mut fault = None;
-            for _ in 0..depth {
+            for turn in 0..depth {
+                let before = B::bound(&self.pipelines);
                 match self.bind_fire(lanes, dress[at]) {
                     Ok(arm) => {
                         // A bind-only fire settles nothing, which is where
@@ -7008,6 +7306,10 @@ impl<B: Serve> Shell<B> {
                         self.arms.take(arm);
                         taken.push(arm);
                         walked += 1;
+                        if turn == 0 && B::bound(&self.pipelines) == before {
+                            built_nothing += 1;
+                            break;
+                        }
                     }
                     Err(why) => {
                         fault = Some(why);
@@ -7035,6 +7337,13 @@ impl<B: Serve> Shell<B> {
             self.handles.rewind();
             walked += 1;
         }
+        tracing::info!(
+            walked,
+            shapes = shapes.len(),
+            built_nothing,
+            arms = depth,
+            "the bind walk: a shape whose first fire built nothing is left on the other arms"
+        );
         Ok(walked)
     }
 

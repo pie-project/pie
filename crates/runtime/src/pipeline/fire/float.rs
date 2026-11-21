@@ -272,6 +272,7 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         quorum_pipeline_id,
         &pipeline_failure,
         &[],
+        &[],
         &rs_ids,
         || Ok(plan.clone()),
         false,

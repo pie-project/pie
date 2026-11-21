@@ -4,6 +4,9 @@ use poem_exec::KernelError;
 
 #[derive(Debug)]
 pub enum Fault {
+    /// The disk tier's slot file is full ([`engine::Error::TierFull`]).
+    TierFull(String),
+
     Deviceless,
 
     Device {
@@ -179,6 +182,11 @@ pub enum Fault {
         runs_correction: bool,
     },
 
+    /// Two live guest holders' state would overlap, or a member alone would
+    /// move its group's pair: a bind or a rebind refused before it wrote
+    /// there ([`engine::guest_claims`]).
+    Claimed(engine::guest_claims::Refusal),
+
     Program {
         at: &'static str,
 
@@ -296,6 +304,7 @@ impl fmt::Display for Fault {
             ),
             Self::NoDevice { detail } => write!(f, "no GPU device to bind: {detail}"),
             Self::Device { call, why } => write!(f, "`{call}` refused: {why}"),
+            Self::TierFull(why) => write!(f, "the disk tier's slot file is full: {why}"),
             Self::Shader {
                 file,
                 entrypoint,
@@ -465,6 +474,7 @@ impl fmt::Display for Fault {
                  more"
             ),
             Self::Program { at, why } => write!(f, "`{at}` refused: {why}"),
+            Self::Claimed(refusal) => write!(f, "`guest::claims` refused: {refusal}"),
             Self::Unaffine {
                 slot,
                 point,
@@ -649,5 +659,17 @@ mod tests {
              its own and 4 pool segments) and this adapter binds a stage 10 \
              (`maxStorageBuffersPerShaderStage`)"
         );
+    }
+}
+
+impl From<engine::guest_claims::Overlap> for Fault {
+    fn from(overlap: engine::guest_claims::Overlap) -> Fault {
+        Fault::Claimed(overlap.into())
+    }
+}
+
+impl From<engine::guest_claims::Refusal> for Fault {
+    fn from(refusal: engine::guest_claims::Refusal) -> Fault {
+        Fault::Claimed(refusal)
     }
 }

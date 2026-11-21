@@ -250,6 +250,14 @@ fn no_disk() -> Fault {
 }
 
 /// A fire the warm ladder traced and has not compiled yet.
+/// A warm program the load compiled and parked in the disk cache (the host
+/// held no more in memory): what the first fire of its shape loads it from.
+pub(crate) struct Parked {
+    text: String,
+    sig: crate::trace::Signature,
+    probed: Vec<ValueId>,
+}
+
 pub(crate) struct Deferred {
     key: [u8; 32],
     shape_key: Option<[u8; 32]>,
@@ -313,6 +321,8 @@ pub struct Shell {
     masked: poem_ir::ClassSet,
     wide: poem_ir::ClassSet,
     corrected: poem_ir::ClassSet,
+    /// The classes whose lanes read kv (`poem_ir::LaneClass::reads_kv`).
+    kv_classes: poem_ir::ClassSet,
     adapter_fact: Option<u32>,
     adapters: crate::adapter::Landings,
     held: Vec<u32>,
@@ -336,6 +346,14 @@ pub struct Shell {
     /// windows, lane counts and input shapes, not how its rows fall to its
     /// lanes, which reach the program only as input values.
     shaped: std::collections::HashMap<[u8; 32], std::sync::Arc<crate::device::Program>>,
+    /// The warm programs parked in the disk cache, by full key, and their
+    /// shape keys: a fire of a parked shape loads its program from the
+    /// disk (`Device::load_parked`), a load and not a build.
+    parked: std::collections::HashMap<[u8; 32], Parked>,
+    /// The host memory the load holds compiled programs in, where it states
+    /// one (`engine::Residency::host_programs`); `None` the host's free.
+    host_programs: Option<u64>,
+    parked_shapes: std::collections::HashMap<[u8; 32], [u8; 32]>,
     /// While the warm ladder traces (`warm.rs`): fires whose program is new
     /// are traced, kept here and not run, and compiled together after.
     deferred: Option<Vec<Deferred>>,
@@ -576,9 +594,11 @@ impl Shell {
             }
         }
         // Lane room for the padding lanes: a decode's up to its rung, and a
-        // prefill beside a decode's up to the mixed fire's host rung.
+        // prefill beside a decode's up to the mixed fire's host rung; never
+        // past the fire's rows (a lane carries one at least).
         budget.max_lanes = poem_exec::fire::rung_of(&budget.buckets, budget.max_lanes)
-            .saturating_add(pad.mixed_host_rung);
+            .saturating_add(pad.mixed_host_rung)
+            .min(budget.max_tokens);
         let budgets = match boot.patches.clone() {
             None => Budgets::of(budget),
             Some(ladder) => Budgets::of(budget).with_patches(ladder),
@@ -1109,6 +1129,17 @@ impl Shell {
             std::sync::Arc::new(crate::rows::readout_rowed(&boot.trace)),
             crate::rows::readout_probe(&boot.trace),
         );
+        // the classes whose lanes read kv: a lane of another (a float lane,
+        // an encoder's or a DiT's) reads its every row out through the
+        // readout planes, with no final hidden rows to read again
+        let kv_classes = poem_ir::ClassSet::of(
+            poem_exec::feeds::lane_classes(&boot.trace, &compiled, &exports)
+                .classes
+                .iter()
+                .enumerate()
+                .filter(|(_, class)| class.reads_kv)
+                .map(|(at, _)| at),
+        );
         Ok(Shell {
             tuning,
             pad,
@@ -1139,6 +1170,7 @@ impl Shell {
             masked,
             wide,
             corrected,
+            kv_classes,
             adapter_fact,
             adapters,
             held: vec![0; slots as usize],
@@ -1153,6 +1185,9 @@ impl Shell {
             probed: std::collections::HashMap::new(),
             traced: std::collections::HashMap::new(),
             shaped: std::collections::HashMap::new(),
+            parked: std::collections::HashMap::new(),
+            host_programs: None,
+            parked_shapes: std::collections::HashMap::new(),
             deferred: None,
             readouts: std::collections::BTreeSet::new(),
             laddered: false,
@@ -1715,6 +1750,43 @@ impl Shell {
         fired
     }
 
+    /// The program of a shape the warm ladder parked in the disk cache, by
+    /// the fire's shape key or full key, loaded and held as a laid one is;
+    /// `None` for a shape it did not park. Gone from the disk (the cache
+    /// cleared under the load), refused by name.
+    /// The host memory the warm ladder holds compiled programs in
+    /// (`engine::Residency::host_programs`), set before it runs.
+    pub fn set_host_programs(&mut self, bytes: Option<u64>) {
+        self.host_programs = bytes;
+    }
+
+    fn load_parked(
+        &mut self,
+        shape_key: Option<[u8; 32]>,
+        key: Option<[u8; 32]>,
+    ) -> Result<Option<std::sync::Arc<crate::device::Program>>> {
+        let at = shape_key
+            .and_then(|k| self.parked_shapes.get(&k).copied())
+            .or(key.filter(|k| self.parked.contains_key(k)));
+        let Some(at) = at else {
+            return Ok(None);
+        };
+        let Some(parked) = self.parked.remove(&at) else {
+            return Ok(None);
+        };
+        let Some(program) = self.device.load_parked(&parked.text, parked.sig)? else {
+            return Err(Fault::Program {
+                at: "serve::ladder",
+                why: "a program the warm ladder parked in the disk cache is gone from it: the \
+                      cache was cleared under the load"
+                    .to_string(),
+            });
+        };
+        self.probed.insert(at, parked.probed);
+        self.traced.insert(at, std::sync::Arc::clone(&program));
+        Ok(Some(program))
+    }
+
     pub fn fire_full(&mut self, lanes: &[Seated<'_>]) -> Result<Fired> {
         self.fire_full_with(lanes, &[])
     }
@@ -2063,12 +2135,18 @@ impl Shell {
         // program, and a readout program reads its readout rows again
         // from the final hidden rows the forward returns (`trace_readout`).
         let full: Vec<Seated<'_>> = lanes.to_vec();
-        let every_row = lanes.iter().any(|s| {
+        // A float lane (its class reads no kv: an encoder's, a DiT's) reads
+        // its every row out through the readout planes as it always did: it
+        // has no final hidden rows to read again.
+        let reads_again = |s: &Seated<'_>| {
             s.readout.is_some_and(|r| r.len() > 1)
                 && (self.compiled.classes)
                     .class_of(s.lane.word & self.compiled.classes.mask)
-                    .is_some_and(|class| !self.drafting.contains(&class))
-        });
+                    .is_some_and(|class| {
+                        !self.drafting.contains(&class) && self.kv_classes.contains(class)
+                    })
+        };
+        let every_row = lanes.iter().any(reads_again);
         if every_row && (self.readout_slice.1.is_empty() || self.readout_store_rows().is_none()) {
             return Err(Fault::Program {
                 at: "serve::readout_program",
@@ -2080,7 +2158,7 @@ impl Shell {
         let cut: Vec<Seated<'_>> = lanes
             .iter()
             .map(|s| match s.readout {
-                Some(r) if every_row && r.len() > 1 => Seated {
+                Some(r) if reads_again(s) => Seated {
                     readout: Some(&r[r.len() - 1..]),
                     ..*s
                 },
@@ -3092,6 +3170,11 @@ impl Shell {
                 ..Fired::default()
             });
         }
+        // a shape the ladder parked in the disk cache: loaded, not built
+        let found = match found {
+            Some(program) => Some(program),
+            None => self.load_parked(shape_key, key)?,
+        };
         let program = match found {
             Some(program) => program,
             None => {

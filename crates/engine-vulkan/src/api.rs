@@ -46,6 +46,14 @@ pub struct DeviceBoot {
     /// only (`test-limits`): no config or profile reaches it.
     #[cfg(feature = "test-limits")]
     pub max_buffer: Option<u64>,
+
+    /// A test's device whose platform states a bound on one GPU submission
+    /// (as Android's KGSL states 2 s): the bound every serving step is held
+    /// to, in place of the platform's (`engine_gpu::rates::
+    /// stated_submit_bound`). Test builds only (`test-limits`): no config
+    /// or profile reaches it.
+    #[cfg(feature = "test-limits")]
+    pub submit_bound: Option<std::time::Duration>,
 }
 
 pub type Vulkan = engine_gpu::api::Gpu<Api>;

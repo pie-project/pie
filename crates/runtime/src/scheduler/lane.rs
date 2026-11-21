@@ -16,7 +16,40 @@ use crate::store::roles::Pump;
 
 use super::worker::{BindRespond, HostKvOp, PoolOp, PreLaunchCopy, QueuedItem};
 
-pub(super) type LaunchResult = std::result::Result<SubmissionCompletion, String>;
+pub(super) type LaunchResult = std::result::Result<SubmissionCompletion, LaunchRefusal>;
+
+/// A launch the lane did not fire: why, and, where the engine refused it
+/// for where state lies (`engine::Error::Placement`), the logical chunks
+/// it named: nothing was read or written, the runtime moves that state and
+/// fires the launch again, failing no lane.
+#[derive(Debug, Clone)]
+pub(super) struct LaunchRefusal {
+    pub(super) message: String,
+    pub(super) placement: Vec<u32>,
+}
+
+impl std::fmt::Display for LaunchRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::ops::Deref for LaunchRefusal {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.message
+    }
+}
+
+impl From<String> for LaunchRefusal {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            placement: Vec::new(),
+        }
+    }
+}
 
 type LaunchReplyTx = tokio::sync::oneshot::Sender<LaunchResult>;
 
@@ -425,7 +458,7 @@ fn backend(engine: &mut Option<EngineBox>) -> Result<&mut EngineBox> {
 fn fail_request(request: LaneRequest, why: &str) {
     match request {
         LaneRequest::Launch { reply, .. } => {
-            let _ = reply.send(Err(why.to_string()));
+            let _ = reply.send(Err(why.to_string().into()));
         }
         LaneRequest::Control { item, reply } => {
             match &*item {
@@ -739,6 +772,7 @@ impl Lane {
                     ..
                 } => {
                     let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let mut placement = Vec::new();
                         let fault = past_rung(
                             crate::store::shared::engine_rows(engine_idx),
                             &frame,
@@ -748,7 +782,7 @@ impl Lane {
                             // A fire wider than the rung the engine holds,
                             // or naming a slot nobody was handed, is refused
                             // before the engine reads it.
-                            _ if fault.is_some() => Err(fault.unwrap_or_default()),
+                            _ if fault.is_some() => Err(fault.unwrap_or_default().into()),
                             Some(engine) => {
                                 crate::probe_fire!(stats.fire.execute.engine_fire_us, {
                                     Self::fire_frame(
@@ -763,12 +797,20 @@ impl Lane {
                                         &settlements,
                                         &inline_faults,
                                         &mut landed_instances,
+                                        &mut placement,
                                     )
                                 })
+                                .map_err(|message| LaunchRefusal {
+                                    message,
+                                    placement: std::mem::take(&mut placement),
+                                })
                             }
-                            None => Err(NO_BACKEND.to_string()),
+                            None => Err(NO_BACKEND.to_string().into()),
                         };
-                        if result.is_err() {
+                        // Refused for where state lies, nothing was read or
+                        // written: its fires are fired again once the state
+                        // moves, so none of their cells is failed.
+                        if result.as_ref().is_err_and(|refusal| refusal.placement.is_empty()) {
                             let cells: Vec<_> = frame.terminal_cells().collect();
                             crate::engine::completion::settle(
                                 &cells,
@@ -778,7 +820,7 @@ impl Lane {
                         result
                     }));
                     let panicked = served.is_err();
-                    let _ = reply.send(served.unwrap_or_else(|_| Err(LANE_PANICKED.to_string())));
+                    let _ = reply.send(served.unwrap_or_else(|_| Err(LANE_PANICKED.to_string().into())));
                     panicked
                 }
                 LaneRequest::Control { item, reply } => {
@@ -921,6 +963,7 @@ impl Lane {
         settlements: &std::sync::Arc<crate::engine::completion::FrameSettlements>,
         inline_faults: &InlineFaults,
         landed: &mut HashMap<::engine::FrameId, Vec<LandingReads>>,
+        placement: &mut Vec<u32>,
     ) -> std::result::Result<SubmissionCompletion, String> {
         use crate::engine::completion;
 
@@ -1017,8 +1060,14 @@ impl Lane {
                 }
                 Err(error) => {
                     let_go(&reads);
-                    if matches!(error, ::engine::Error::Impossible(_)) {
+                    if matches!(
+                        error,
+                        ::engine::Error::Impossible(_) | ::engine::Error::Placement { .. }
+                    ) {
                         crate::store::shared::programs::impossible_submission(engine_idx, &error);
+                    }
+                    if let ::engine::Error::Placement { chunks, .. } = &error {
+                        placement.extend_from_slice(chunks);
                     }
                     return Err(format!("{error}"));
                 }

@@ -467,11 +467,6 @@ def frame_size() -> int:
     return max(_wit_model.frame_size(), 1)
 
 
-@functools.cache
-def submit_deadline_us() -> int:
-    return _wit_model.submit_deadline_us()
-
-
 def channel_capacity() -> int:
     """Host-reader channel capacity that sustains run-ahead (not cached: the
     host does not promise it static)."""

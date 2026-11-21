@@ -35,6 +35,16 @@ pub(super) struct Proc {
     /// until room comes, its refused bind holds nothing, and parked it binds
     /// once restored, so it yields as an idle process does.
     pub(super) bind_waiting: bool,
+    /// Restoring, its state back and committed, it waits for instances its
+    /// rebinds cannot name yet (their pair parked with another process, or
+    /// their room not given back): the instances it waits on, said by the
+    /// stall dump. It moves no state and runs no fire meanwhile: nothing in
+    /// flight on its account ([`super::inner::Inner::nothing_in_flight`]),
+    /// or the restore that brings what it waits on, or the room, is never
+    /// planned (Mac Pro at 2 GiB on 1e87ab171: a restore waiting on
+    /// InstanceId(5) for good, the queue's head held behind it as a move
+    /// in flight).
+    pub(super) rebind_waiting: Option<String>,
     /// What an idle eviction freed; it asks for it back only once it wakes.
     pub(super) parked: Option<Demand>,
     /// Parked below the floor, it gave its execution seat back: it takes
@@ -100,6 +110,31 @@ pub(super) struct Proc {
     /// its last unpark refusal left them: it goes again only once more
     /// stand, as well as more runs of the refused length.
     pub(super) roles_short_free: Option<u32>,
+    /// Its last refusal was taken with nothing else in flight: no take of
+    /// another's raced its restore, so a placement standing in that room
+    /// is the placement's own mismatch, not a race.
+    pub(super) roles_short_quiet: bool,
+    /// Its last refusal and the room it left (free chunks, free runs of its
+    /// length): the same refusal again on the same room is a settled stall
+    /// ([`super::ResidencyPlanner::requeue_restore_roles`]).
+    pub(super) last_refusal: Option<((u32, u32), u32, u32)>,
+    /// The free chunks it was last sent on as a placement mismatch with no
+    /// move to make: sent once a room, never re-sent on the same one.
+    pub(super) mismatch_sent_at: Option<u32>,
+    /// Sent once on that room whatever its placement reads: the takes
+    /// decide ([`Self::mismatch_sent_at`]).
+    pub(super) send_regardless: bool,
+    /// Whether the store's own placement ([`super::pool::PoolPort::guest_need_free`],
+    /// its serve's state laid first) stood its need as its last unpark
+    /// refusal left the pool. Refused where it did not stand, it goes again
+    /// once it does: the placement decides, not a count of free chunks
+    /// beside it (Mac Pro at 5 GiB on 1e87ab171: 4 chunks free, the
+    /// refused restore held on "no more chunks free than it left", 18,973
+    /// no-step lines). Refused while it stood it, the placement read a
+    /// room the unpark did not, and it goes again only once more chunks
+    /// stand free than the refusal left ([`Self::roles_short_free`]): a
+    /// decoding fleet's takes and gives sent it again ~350 times a second.
+    pub(super) roles_short_stood: Option<bool>,
     /// The run its last unpark was refused, `(run, pieces)`, kept across a
     /// re-send until a restore serves it: its need always holds what the
     /// unpark asked. Cleared with the refusal at a re-send, the need fell
@@ -131,6 +166,14 @@ pub(super) struct Proc {
     /// served while that head waits unserved (the rule's second half),
     /// whatever key the head waits under now.
     pub(super) evicted_for: Option<ProcessId>,
+    /// The head this one was evicted for, its restore served ahead of it
+    /// while that head stood passed over with no move to make
+    /// ([`super::ResidencyPlanner::stuck_head`]): no victim for that
+    /// head until it has fired. Moved back first, it went round with the
+    /// head, restored past it and evicted for it again, its waits never
+    /// served (seed 3392: queued for a page behind the head, so the mark
+    /// alone did not hold it).
+    pub(super) restored_past: Option<ProcessId>,
 }
 
 /// The guest-state room a suspended process's pending bind asks:
@@ -193,6 +236,7 @@ impl Proc {
             holder: false,
             idle: false,
             bind_waiting: false,
+            rebind_waiting: None,
             roles_short_why: None,
             parked: None,
             seatless: false,
@@ -212,12 +256,18 @@ impl Proc {
             roles_short_gives: None,
             roles_short_runs: None,
             roles_short_free: None,
+            roles_short_quiet: false,
+            last_refusal: None,
+            mismatch_sent_at: None,
+            send_regardless: false,
+            roles_short_stood: None,
             roles_refused: None,
             evicted_queued: false,
             roles_short_mismatch: None,
             bind_room: None,
             unfired: false,
             evicted_for: None,
+            restored_past: None,
         }
     }
 }

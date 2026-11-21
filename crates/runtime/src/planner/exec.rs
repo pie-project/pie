@@ -117,6 +117,7 @@ pub(super) fn spawn_spill(
 /// evicted, so no fire reads them; a failure leaves them where they lie.
 pub(super) fn spawn_park_down(
     planner: Arc<ResidencyPlanner>,
+    pids: Vec<ProcessId>,
     roles: Option<RoleMove>,
     rs: Option<RsResidencyTxn>,
 ) {
@@ -135,7 +136,7 @@ pub(super) fn spawn_park_down(
     let task = {
         let planner = planner.clone();
         async move {
-            let moved = park_down(&planner, guard).await;
+            let moved = park_down(&planner, &pids, guard).await;
             if let Err(error) = &moved {
                 tracing::warn!(%error, "planner: parked role slots could not move down");
             }
@@ -154,8 +155,20 @@ pub(super) fn spawn_park_down(
     }
 }
 
-async fn park_down(planner: &ResidencyPlanner, mut guard: MoveGuard) -> Result<(), String> {
-    guard.copy(planner, ProcessId::nil()).await?;
+async fn park_down(
+    planner: &ResidencyPlanner,
+    pids: &[ProcessId],
+    mut guard: MoveGuard,
+) -> Result<(), String> {
+    // The chunks its copy reads, fenced from a raise until it lands, as an
+    // eviction's are ([`MovingOut`]).
+    let reading = MovingOut::of_all(planner, pids);
+    let copied = guard.copy(planner, ProcessId::nil()).await;
+    drop(reading);
+    copied?;
+    // Its instances' tables leave the device now: said parked again, kept
+    // nowhere, before the commit hands their slots to anyone else.
+    park(planner.locus().1, guard.parked()).await?;
     let Move::Suspend { roles, rs, .. } = guard.take() else {
         unreachable!("a park down is a move down")
     };
@@ -531,13 +544,40 @@ impl MoveGuard {
     }
 
     /// Submits every copy of the move, then waits for them all.
-    async fn copy(&mut self, planner: &ResidencyPlanner, pid: ProcessId) -> Result<(), String> {
+    async fn copy(&mut self, planner: &ResidencyPlanner, pid: ProcessId) -> Result<(), CopyFailure> {
+        // Every device chunk the copies read or write is fenced until they
+        // land: no evacuation moves it, no segment holding it is released,
+        // no compaction or raise takes it (the L40S at 3 GiB on a0bfb512f:
+        // CUDA 700 on an eviction's queued kv-to-disk copy).
+        let fenced: Vec<u32> = self
+            .txn
+            .as_ref()
+            .expect("move present")
+            .copies()
+            .iter()
+            .filter(|copy| copy.source.is_none())
+            .flat_map(|copy| match copy.kind {
+                crate::scheduler::dispatch::TierKind::KvSlots(shape)
+                | crate::scheduler::dispatch::TierKind::RsSlots(shape)
+                | crate::scheduler::dispatch::TierKind::RoleSlots(shape) => {
+                    planner.port.copy_chunks(shape, &copy.device)
+                }
+                crate::scheduler::dispatch::TierKind::Kv => Vec::new(),
+            })
+            .collect();
+        planner.port.moving_out(&fenced);
+        let copied = self.copy_fenced(planner, pid).await;
+        planner.port.moved_out(&fenced);
+        copied
+    }
+
+    async fn copy_fenced(&mut self, planner: &ResidencyPlanner, pid: ProcessId) -> Result<(), CopyFailure> {
         let mut waits = Vec::new();
         for copy in self.txn.as_ref().expect("move present").copies() {
             tracing::debug!(pid = %pid, copy = %copy.label(), count = copy.device.len(), "planner: residency copy");
             let started = Instant::now();
             let completion = crate::scheduler::copy_tier_tracked(self.engine, &copy)
-                .map_err(|error| format!("{} submit: {error:#}", copy.label()))?;
+                .map_err(|error| CopyFailure::of(&copy.label(), "submit", &error))?;
             self.submitted = true;
             self.in_flight.push(completion.clone());
             waits.push((copy, started, completion));
@@ -551,7 +591,7 @@ impl MoveGuard {
                 started.elapsed().as_millis()
             );
             planner.record_tier_copy(&copy, started.elapsed());
-            copied.map_err(|error| format!("{} copy: {error}", copy.label()))?;
+            copied.map_err(|error| CopyFailure::of(&copy.label(), "copy", &error))?;
         }
         self.in_flight.clear();
         Ok(())
@@ -559,6 +599,89 @@ impl MoveGuard {
 
     fn take(&mut self) -> Move {
         self.txn.take().expect("move present")
+    }
+
+    /// The instances its park moves down or leaves where they lie
+    /// ([`RoleMove::parked`]).
+    fn parked(&self) -> Vec<::engine::Rebind> {
+        match self.txn.as_ref() {
+            Some(Move::Suspend {
+                roles: Some(roles), ..
+            }) => roles.parked(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// The physical chunks a process's state holds, fenced against a raise's
+/// taking them back while a copy of the process reads them; let go when
+/// dropped ([`super::pool::PoolPort::moving_out`]).
+struct MovingOut<'a> {
+    planner: &'a ResidencyPlanner,
+    chunks: Vec<u32>,
+}
+
+impl<'a> MovingOut<'a> {
+    fn of(planner: &'a ResidencyPlanner, pid: ProcessId) -> Self {
+        Self::of_all(planner, &[pid])
+    }
+
+    fn of_all(planner: &'a ResidencyPlanner, pids: &[ProcessId]) -> Self {
+        let mut map = planner.port.chunk_occupants(pids);
+        map.merge(planner.port.parked_occupants(super::residency_planner::SWEEP));
+        let chunks: Vec<u32> = map
+            .held
+            .iter()
+            .filter(|held| held.by.iter().any(|(holder, _)| pids.contains(holder)))
+            .map(|held| held.chunk)
+            .collect();
+        planner.port.moving_out(&chunks);
+        Self { planner, chunks }
+    }
+}
+
+impl Drop for MovingOut<'_> {
+    fn drop(&mut self) {
+        self.planner.port.moved_out(&self.chunks);
+    }
+}
+
+/// A residency move's copy that did not land: what it says, and whether
+/// the engine refused it before reading or writing any of it (its state
+/// lies where it lay, untouched: a placement the engine will not copy,
+/// the runtime's own doing, never the process's fault).
+#[derive(Debug)]
+pub(super) struct CopyFailure {
+    message: String,
+    untouched: bool,
+    /// The tier it copied down to is full ([`crate::scheduler::TierBelowFull`]):
+    /// nothing on the device changed.
+    tier_full: bool,
+}
+
+impl CopyFailure {
+    fn of(label: &str, step: &str, error: &anyhow::Error) -> Self {
+        Self {
+            message: format!("{label} {step}: {error:#}"),
+            untouched: error
+                .chain()
+                .any(|cause| cause.downcast_ref::<crate::scheduler::RefusedUntouched>().is_some()),
+            tier_full: error
+                .chain()
+                .any(|cause| cause.downcast_ref::<crate::scheduler::TierBelowFull>().is_some()),
+        }
+    }
+}
+
+impl std::fmt::Display for CopyFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<CopyFailure> for String {
+    fn from(failure: CopyFailure) -> Self {
+        failure.message
     }
 }
 
@@ -617,6 +740,9 @@ async fn drain_detachable(pid: ProcessId) {
 }
 
 pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
+    // Evicted again before its bind took what its restore held: withdrawn,
+    // the reservation goes back.
+    planner.port.release_restore(pid);
     let (model, engine) = planner.locus();
     let handles = crate::inferlet::process::residency::kv_suspend_handles(pid, model, engine);
     let working_sets: HashSet<WorkingSetId> =
@@ -626,12 +752,13 @@ pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     // A process with no kv or state yet (a prompt not seated) may still hold
     // guest state on the device, the room a bind short of runs was chosen to
     // free (a chunk's occupant): it parks all the same, its guest scratch
-    // given back. Found nothing, the M1 stress froze with eleven binds short
-    // of runs and every chosen occupant "found no working set".
+    // given back and its tables and resident bytes copied down. Found
+    // nothing, the M1 stress froze with eleven binds short of runs and every
+    // chosen occupant "found no working set".
     let holds_guest = crate::store::registry::get(model, engine)
         .roles
         .as_ref()
-        .is_some_and(|roles| roles.lock().unwrap().holds_guest_state(pid));
+        .is_some_and(|roles| roles.lock().unwrap().holds_device_parts(pid));
     if working_sets.is_empty() && rs_working_sets.is_empty() && !holds_guest {
         // Nothing to move now is nothing to move on the next pass either:
         // it is no victim again until the room changes (a restore clears
@@ -649,7 +776,18 @@ pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     tracing::debug!(%pid, "planner: an eviction drains its detachable fires");
     drain_detachable(pid).await;
     let drained = began.elapsed();
-    tracing::debug!(%pid, sets = fence.handles.len(), "planner: an eviction waits for its sets' fires");
+    // What it waits on, said as it begins: the fires holding its sets'
+    // leases (submitted, or admitted and held in an unsealed frame), and the
+    // engine's capped frames with the raise they wait on (a capped frame of
+    // its own goes once raised: its raise stays queued through its
+    // eviction, [`super::inner::Inner::begin_eviction`]).
+    tracing::debug!(
+        %pid,
+        sets = fence.handles.len(),
+        leases = fence.handles.iter().map(KvSuspendHandle::active_leases).sum::<usize>(),
+        capped = %planner.capped_line(),
+        "planner: an eviction waits for its sets' fires"
+    );
     for handle in fence.handles.iter() {
         handle.quiesce().await;
     }
@@ -697,6 +835,17 @@ pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
         });
     let kv = match prepared {
         Ok(kv) => kv,
+        // No room below for its kv, but guest parts of its own on the
+        // device: its kv parks where it lies (marked suspended, as on a home
+        // with no tier below; moved down later as room comes) and the park
+        // goes on for what does move, its guest scratch given back and its
+        // tables copied down. Blocked whole, a waiter holding chunks only its
+        // guest parts filled kept them while every process waited (seed
+        // 3392: a full disk, every resident's kv past its free slots).
+        Err(KvStoreError::HostSwapFull { .. }) if holds_guest => {
+            tracing::debug!(%pid, "planner: an eviction's kv parks in place, no room below");
+            None
+        }
         Err(error @ KvStoreError::HostSwapFull { .. }) => {
             tracing::warn!(pid = %pid, %error, "planner: eviction blocked on swap room");
             planner.eviction_failed_host_swap_full(pid);
@@ -741,12 +890,43 @@ pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     }
     let prepared_at = began.elapsed();
     let mut guard = MoveGuard::new(model, engine, Move::Suspend { kv, rs, roles });
-    if let Err(error) = guard.copy(&planner, pid).await {
+    // The chunks its copy reads: no raise takes them back for its
+    // activation until the copy has landed or will not (Mac Pro at 5 GiB
+    // on 5aa45805b: an eviction's copy of a lent chunk refused inside the
+    // carve).
+    let reading = MovingOut::of(&planner, pid);
+    let copied_out = guard.copy(&planner, pid).await;
+    drop(reading);
+    if let Err(error) = copied_out {
         tracing::warn!(pid = %pid, %error, "planner: eviction copy failed");
-        planner.eviction_copy_failed(pid, &error);
+        if error.tier_full {
+            // The tier below is full: nothing on the device changed, the
+            // move is taken back, the process stays resident.
+            drop(guard);
+            planner.eviction_tier_full(pid, &error.message);
+        } else if error.untouched {
+            // Refused untouched: its state lies where it lay, and the move
+            // is taken back; the process stays as it was.
+            drop(guard);
+            planner.eviction_copy_refused(pid, &error.message);
+        } else {
+            planner.eviction_copy_failed(pid, &error.message);
+        }
         return;
     }
     let copied = began.elapsed();
+    // Its instances said parked on its lane before the commit hands their
+    // slots to anyone else: an engine still holding them at those slots
+    // refuses the next owner's bind there (Vulkan on a0bfb512f, long
+    // prompts: "Instance slots ... already hold instance N's run"), or
+    // lays a parked pair over it after an evacuation (Metal). One it
+    // refuses fails the process by name, its move taken back.
+    if let Err(error) = park(engine, guard.parked()).await {
+        tracing::warn!(pid = %pid, %error, "planner: eviction's park not taken by the engine");
+        drop(guard);
+        planner.eviction_copy_failed(pid, &error);
+        return;
+    }
     let Move::Suspend { kv, rs, roles } = guard.take() else {
         unreachable!("an eviction carries a suspend")
     };
@@ -813,6 +993,19 @@ async fn rebind(engine: usize, roles: &RolesHandle, pid: ProcessId) -> Result<()
         crate::scheduler::rebind_slots(engine, rebind)
             .await
             .map_err(|error| format!("rebind {owner:?}: {error:#}"))?;
+    }
+    Ok(())
+}
+
+/// Says each of a park's instances parked to the engine, on its lane
+/// ahead of any later bind or rebind ([`::engine::Rebind::Parked`]); one
+/// the lane closed since is not said ([`crate::store::roles::rebind`]).
+async fn park(engine: usize, parked: Vec<::engine::Rebind>) -> Result<(), String> {
+    for rebind in parked {
+        let owner = Owner::of(&rebind);
+        crate::scheduler::rebind_slots(engine, rebind)
+            .await
+            .map_err(|error| format!("park {owner:?}: {error:#}"))?;
     }
     Ok(())
 }
@@ -1003,19 +1196,76 @@ async fn restore(
             return;
         }
     };
+    // Every instance its rebinds name must be placed once this unpark
+    // commits: one left unbound (moving, parked apart, its pair away) is
+    // waited for here, nothing committed, its process waiting and not in
+    // flight; then it goes again, queued. Committed with one, it waited
+    // Restoring on a rebind nothing made (Mac Pro at 2 GiB on 1e87ab171).
+    if let Some(store) = stores.roles.as_ref() {
+        let watch = store.lock().unwrap().room_watch();
+        let unbound = store.lock().unwrap().unbound_after(pid, roles.as_ref());
+        if !unbound.is_empty() {
+            abort(model, engine, Move::Restore { kv, rs, roles });
+            tracing::debug!(%pid, ?unbound, "planner: a restore waits, uncommitted, for its rebinds' parts");
+            planner.rebind_waiting(pid, Some(format!("{unbound:?} (uncommitted)")));
+            watch.freed().await;
+            planner.rebind_waiting(pid, None);
+            planner.requeue_restore(pid);
+            return;
+        }
+    }
     // Suspended by a bind short of guest-state room, it comes back only
     // with room for that bind past what its own items took: else it would
     // bind short again at once. It waits, queued, as a restore short of
     // room for its roles.
+    // Refused so, it says why, and its need is the bind's runs beside what
+    // its own unpark lays at that length: read as the larger of the two
+    // (bind (7, 2), unpark (7, 2): (7, 2)), the planner's placement stood
+    // it while this check, after the unpark took its own, did not, and the
+    // head was refused with no reason and no plan, round after round (Mac
+    // Pro at 5 GiB on 4cef0c7d3: 40,098 no-step lines in 6 minutes, free
+    // runs (7, 3) to (7, 4), need [(7, 2), (2, 2)]).
+    // Read by the one placement, the takes' own, with what its serve held
+    // for it open to it: never a count of its own.
     if let Some(need) = planner.pending_bind(pid)
-        && stores
+        && let Some(free) = stores
             .roles
             .as_ref()
-            .is_some_and(|roles| roles.lock().unwrap().free_runs(need.run) < need.pieces)
+            .map(|roles| {
+                roles.lock().unwrap().place_claimed(
+                    pid,
+                    &[crate::store::slots::OwnPiece::Chunks {
+                        run: need.run,
+                        pieces: need.pieces,
+                    }],
+                )
+            })
+            .filter(|placement| !placement.stands())
+            .map(|placement| placement.free_runs(need.run))
     {
         abort(model, engine, Move::Restore { kv, rs, roles });
-        tracing::debug!(%pid, "planner: a restore waits for room for its pending bind");
-        planner.requeue_restore_roles(pid, (need.run, need.pieces), None);
+        let own = stores.roles.as_ref().map_or(0, |roles| {
+            roles
+                .lock()
+                .unwrap()
+                .unpark_need(pid)
+                .iter()
+                .filter(|&&(run, _)| run == need.run)
+                .map(|&(_, pieces)| pieces)
+                .sum::<u32>()
+        });
+        let why = format!(
+            "PendingBindShort {{ run: {}, pieces: {}, free_runs_after_own_unpark: {free}, own_unpark_pieces: {own} }}",
+            need.run, need.pieces
+        );
+        tracing::debug!(%pid, %why, "planner: a restore waits for room for its pending bind");
+        planner.note_roles_short_why(pid, why);
+        // The bind's own runs: its unpark's were placed first by the one
+        // placement, so they are never added again (added each refusal,
+        // the need grew 1, 3, 5, 7 until it fit nowhere: the simulation's
+        // seed 13, 455 of 5,000 seeds).
+        let _ = own;
+        planner.requeue_restore_roles(pid, (need.run, need.pieces), Some(free));
         return;
     }
     let mut guard = MoveGuard::new(model, engine, Move::Restore { kv, rs, roles });
@@ -1070,6 +1320,7 @@ async fn restore(
                 break;
             }
             tracing::debug!(%pid, ?unbound, "planner: a restore waits for its instances' rebinds");
+            planner.rebind_waiting(pid, Some(format!("{unbound:?}")));
             watch.freed().await;
             if let Err(error) = rebind(engine, store, pid).await {
                 planner.restore_failed(pid, &error);
@@ -1077,6 +1328,7 @@ async fn restore(
             }
         }
     }
+    planner.rebind_waiting(pid, None);
     ptrace!(
         "restore-done pid={} ms={}",
         pid,

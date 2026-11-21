@@ -95,8 +95,8 @@ const MEMORY: &str = r#"
 const RUNTIME: &str = r#"
 [runtime]
 # Batching and timeouts. Every default here is measured; `pie config list`
-# carries the reasoning.
-# submit_deadline          = "50ms"
+# carries the reasoning. `submit_deadline` was removed: a config that
+# still sets it is refused at load; delete the line.
 # silence_timeout          = "30s"
 "#;
 

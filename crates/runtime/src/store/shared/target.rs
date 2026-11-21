@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use tokio::sync::Notify;
 
-use super::{GrowFor, RungStep, RungWalk, SegmentMove, Shared, SharedPool};
+use super::{RungStep, RungWalk, SegmentMove, Shared, SharedPool};
 use crate::governor::{Growth, Mapped, PoolTarget, Retarget};
 use crate::scheduler::worker::PoolOp;
 use crate::store::registry;
@@ -582,20 +582,20 @@ impl SharedGrow {
     /// Whether the walk's next step for a live waiter maps a segment: the
     /// same step the walk takes ([`SharedPool::grow_step`] toward
     /// [`Self::goal`]), so a waiter told the pool grows never waits on a
-    /// grow the walk does not make. A span the lowered rung lends is no
-    /// such step (live state never opens in the top rung's span), nor a
-    /// segment the engine holds back, nor one past the goal.
+    /// grow the walk does not make. The span the rung lends is such a step
+    /// once the prefix is whole (span lending); a segment the engine holds
+    /// back, or one past the goal, is none.
     #[must_use]
     pub fn can_grow(&self) -> bool {
         let pool = self.shared.lock().unwrap();
-        pool.grow_step(self.goal_in(&pool), GrowFor::Live).is_some()
+        pool.grow_step(self.goal_in(&pool)).is_some()
     }
 
     /// The walk's next grow step for a live waiter; for a test.
     #[cfg(test)]
     pub(crate) fn live_step_for_test(&self) -> Option<super::GrowStep> {
         let pool = self.shared.lock().unwrap();
-        pool.grow_step(self.goal_in(&pool), GrowFor::Live)
+        pool.grow_step(self.goal_in(&pool))
     }
 
     /// Promises a waiter a grow where [`Self::can_grow`]: the walk is woken
@@ -808,6 +808,8 @@ impl SharedGrow {
                 // that), and the run they clear is room given back.
                 let (current, _) = self.epochs();
                 self.shared.lock().unwrap().compaction_copied(planned, current);
+                // Fires held for a refused chunk's move go again now.
+                crate::scheduler::nudge(self.engine);
             }
         }
     }

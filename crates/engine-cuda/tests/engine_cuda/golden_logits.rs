@@ -937,9 +937,13 @@ fn served_offloaded(fixture: &Fixture, cache: &Path, offload: bool) -> Vec<(u64,
         resident("before it is seated");
     }
     let host = Some(stated.map_or(1 << 30, |mib| mib << 20));
-    let ring = engine_cuda::store::staging_ring_for(shell.trace(), PAGE, CONTEXT, host, 1)
-        .and_then(|bytes| bytes.map(engine_cuda::store::Ring::pin).transpose())
-        .expect("the staging ring pins");
+    let ring = engine_cuda::store::staging_ring_for(
+        host,
+        1,
+        engine::runahead::Runahead::DEFAULT_FRAMES_IN_FLIGHT,
+    )
+    .and_then(|bytes| bytes.map(engine_cuda::store::Ring::pin).transpose())
+    .expect("the staging ring pins");
     shell
         .seat_host_kv(host, 1, CONTEXT, 1, ring)
         .expect("the host tier seats");
@@ -953,6 +957,8 @@ fn served_offloaded(fixture: &Fixture, cache: &Path, offload: bool) -> Vec<(u64,
             Some(256 << 20),
             Some(dir.path()),
             false,
+            1,
+            1,
             engine_cuda::World::default(),
         )
         .expect("the disk tier seats");
@@ -1151,9 +1157,13 @@ fn tier_round_trip(model: &str, cache: &Path) -> Vec<(String, u64)> {
     let fixture = fixture(model, cache);
     let mut shell = load(&fixture, cache);
     let host = Some(256 << 20);
-    let ring = engine_cuda::store::staging_ring_for(shell.trace(), PAGE, CONTEXT, host, 1)
-        .and_then(|bytes| bytes.map(engine_cuda::store::Ring::pin).transpose())
-        .expect("the staging ring pins");
+    let ring = engine_cuda::store::staging_ring_for(
+        host,
+        1,
+        engine::runahead::Runahead::DEFAULT_FRAMES_IN_FLIGHT,
+    )
+    .and_then(|bytes| bytes.map(engine_cuda::store::Ring::pin).transpose())
+    .expect("the staging ring pins");
     shell
         .seat_host_kv(host, 1, CONTEXT, 1, ring)
         .expect("the host tier seats");
@@ -1167,6 +1177,8 @@ fn tier_round_trip(model: &str, cache: &Path) -> Vec<(String, u64)> {
             Some(budget),
             Some(dir.path()),
             false,
+            1,
+            1,
             engine_cuda::World::default(),
         )
         .expect("the disk tier seats");

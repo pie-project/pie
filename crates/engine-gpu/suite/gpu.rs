@@ -281,6 +281,37 @@ impl Gpu {
         span.map_or(host, |ns| ns as f64)
     }
 
+    /// One arm's timestamps, laid as a load under a stated submit bound
+    /// lays them (`Serve::lay_stamps`).
+    pub fn stamps(&self) -> <crate::backend::Api as engine_gpu::serve::Serve>::Stamps {
+        <crate::backend::Api as engine_gpu::serve::Serve>::lay_stamps(&self.device, 1)
+            .expect("the timestamps lay")
+    }
+
+    /// `f` walked into a step's timed frame writing `stamps`, as a serving
+    /// step walks under a stated submit bound (`Serve::walk_frame`), kept
+    /// to replay where `keep`, committed as a step is, and its device time
+    /// as the backend reads it once it lands (`crate::backend::fired_time`),
+    /// ns: `None` where the backend reads none.
+    pub fn fired(
+        &self,
+        stamps: &<crate::backend::Api as engine_gpu::serve::Serve>::Stamps,
+        keep: bool,
+        f: impl FnOnce(&Sink<'_>) -> Result<(), kernels_slang::Error>,
+    ) -> Option<u64> {
+        let frame = <crate::backend::Api as engine_gpu::serve::Serve>::walk_frame(
+            &self.device,
+            keep,
+            Some(stamps),
+        )
+        .expect("a timed frame");
+        {
+            let sink = Sink::new(&self.device, &frame, &self.pipelines, &self.handles);
+            f(&sink).expect("the kernel fires");
+        }
+        crate::backend::fired_time(frame, keep)
+    }
+
     pub fn down(&self, handle: u32, n: usize) -> Vec<f32> {
         let bytes = self
             .handles

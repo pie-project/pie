@@ -2511,8 +2511,8 @@ impl Shell {
         Ok(())
     }
 
-    /// Unstated `budget`: `seats` sequences at `context` and at least the pool,
-    /// within a quarter of the free space.
+    /// Unstated `budget`: `seats` sequences' state and kv at `context`,
+    /// within the free space ([`engine::disk::derived_budget`]).
     pub fn seat_disk_kv(
         &mut self,
         budget: Option<u64>,
@@ -2528,14 +2528,31 @@ impl Shell {
             .map_or(0, crate::rs::Buffers::page_bytes);
         let budget = match budget {
             Some(bytes) => bytes,
-            None => engine::disk::unstated_budget(
-                dir,
-                u64::from(paging.slots),
-                self.pools.state_slot_bytes() + buffered,
-                paging.pages(),
-                u64::from(seats) * u64::from(context).div_ceil(u64::from(paging.page_size.max(1))),
-                self.pools.page_bytes()?,
-            ),
+            None => {
+                let state_bytes = self.pools.state_slot_bytes() + buffered;
+                let state_rows = if state_bytes > 0 { u64::from(seats) } else { 0 };
+                let pages =
+                    u64::from(seats) * u64::from(context).div_ceil(u64::from(paging.page_size.max(1)));
+                let page_bytes = self.pools.page_bytes()?;
+                let free = engine::disk::free_space(dir);
+                // The guest state the device can hold live (the room a
+                // guest program binds within): evicted, it has a home.
+                let guest = self.pools.chunk_facts().guest_room_bytes();
+                let bytes = engine::disk::derived_budget(
+                    state_rows,
+                    state_bytes,
+                    pages,
+                    page_bytes,
+                    guest,
+                    free,
+                );
+                // Its inputs, stated at load: what the field rules on.
+                eprintln!(
+                    "engine-metal: the unstated disk tier: {bytes} bytes = {seats} seats x                      (state {state_bytes} B + {context} tokens of kv in {} pages of {page_bytes} B)                      + {guest} B of guest state the device holds live, within {free} bytes free",
+                    context.div_ceil(paging.page_size.max(1)),
+                );
+                bytes
+            }
         };
         self.pools.seat_disk(dir, budget)
     }
@@ -2719,8 +2736,13 @@ impl Shell {
     #[must_use]
     pub fn audit(&self) -> engine::memory::Audit {
         // The span is entered whole, backed or not: the bytes it has not
-        // backed yet are the device's too, as far as the ledger counts.
-        let unbacked = self.pools.span_reserved_bytes() - self.pools.span_held_bytes();
+        // backed yet are the device's too, as far as the ledger counts. The
+        // heaps kept spare for it back it as much as its mapped ones (the
+        // device holds both); counted unbacked too, they were counted twice.
+        let unbacked = self
+            .pools
+            .span_reserved_bytes()
+            .saturating_sub(self.pools.span_held_bytes() + self.pools.span_spare_bytes());
         self.ledger().audit(self.device.allocated() + unbacked)
     }
 

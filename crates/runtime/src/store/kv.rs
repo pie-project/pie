@@ -23,6 +23,11 @@ use crate::inferlet::process::ProcessId;
 use crate::policy::retention::{self, Keys};
 use crate::policy::{By, Event};
 use crate::rt::Instant;
+
+#[cfg(test)]
+type CacheMap = std::collections::BTreeMap<u64, KeptEntry>;
+#[cfg(not(test))]
+type CacheMap = HashMap<u64, KeptEntry>;
 use crate::store::chunks::{ShapePool, ShapeRun};
 use crate::store::pool::Pool;
 use crate::store::slots::ShapeKind;
@@ -161,7 +166,9 @@ pub struct KvStore {
     /// `None` while some are off the device.
     flat: HashMap<WorkingSetId, Option<Vec<PhysicalKvPageId>>>,
     domain: Hash256,
-    cache: HashMap<u64, KeptEntry>,
+    /// By entry id. Under test in id order (the order entries were kept),
+    /// so a seeded simulation reclaims the same entries on each run.
+    cache: CacheMap,
     /// The cache's entries by the node their last pages are in: an attach
     /// ages the entries on its own path, not every entry.
     by_owner: HashMap<NodeId, Vec<u64>>,
@@ -419,7 +426,7 @@ impl KvStore {
             shape: None,
             flat: HashMap::new(),
             domain: hash::cache_domain(&seed),
-            cache: HashMap::new(),
+            cache: CacheMap::new(),
             by_owner: HashMap::new(),
             node_epochs: HashMap::new(),
             splits: HashSet::new(),
@@ -1005,9 +1012,14 @@ impl KvStore {
             group.0.push(id);
             group.1 = group.1.max(entry.last_use);
         }
+        // Ties (one key, one last use) go oldest entry first, never by the
+        // map's order.
         let mut order: Vec<_> = groups
             .into_iter()
-            .map(|((_, key, decoded), (ids, last_use))| ((key, !decoded, last_use), (key, ids)))
+            .map(|((_, key, decoded), (mut ids, last_use))| {
+                ids.sort_unstable();
+                ((key, !decoded, last_use, ids.first().copied()), (key, ids))
+            })
             .collect();
         order.sort_unstable_by_key(|(order, _)| *order);
         order.into_iter().map(|(_, group)| group).collect()
@@ -1939,17 +1951,19 @@ impl KvStore {
         self.note_change(terminal, true);
     }
 
-    /// The device pages of `working_sets` that would leave the device
-    /// with them: resident, read by none of the running working sets
-    /// outside them, pinned by nothing ([`KvPageTable::movable_resident_pages`]).
-    pub fn movable_resident_pages(
+    /// The device pages of each of `groups` that would leave the device
+    /// with it: resident, read by none of the running working sets outside
+    /// it, pinned by nothing, walked once for all the groups
+    /// ([`KvPageTable::movable_resident_pages_each`]).
+    pub fn movable_resident_pages_each(
         &self,
-        working_sets: &HashSet<WorkingSetId>,
-    ) -> Vec<PhysicalKvPageId> {
+        groups: &[HashSet<WorkingSetId>],
+    ) -> Vec<Vec<PhysicalKvPageId>> {
         self.table
-            .movable_resident_pages(working_sets)
+            .movable_resident_pages_each(groups)
+            .into_iter()
             .map(|pages| pages.into_iter().map(|(_, page)| page).collect())
-            .unwrap_or_default()
+            .collect()
     }
 
     pub fn owner_of(&self, ws: WorkingSetId) -> Option<ProcessId> {

@@ -56,6 +56,31 @@ struct RuntimeShutdown {
 
 impl RuntimeShutdown {
     async fn shutdown(self) -> Result<()> {
+        // Each planner's census once more at the end: a clean run shows
+        // its passes, the map's, and the wakes the edge-triggering skipped.
+        for planner in crate::planner::planners() {
+            let pass = planner.pass_census();
+            let map = planner.map_census();
+            let edge = planner.edge_census();
+            let stuck = planner.stuck_census();
+            println!(
+                "[planner-census] at shutdown: passes={} pass_ms={} pass_mean_us={} \
+                 map_passes={} map_pass_ms={} quiet_waits={} skipped_wakes={} map_cache_hits={} \
+                 stuck_settles={} forced_passes={} oldest_wait_ms={} refusal_repeats={}",
+                pass.0,
+                pass.1 / 1000,
+                pass.2,
+                map.0,
+                map.1 / 1000,
+                map.2,
+                edge.0,
+                edge.1,
+                stuck.0,
+                stuck.1,
+                stuck.2,
+                planner.refusal_repeats(),
+            );
+        }
         let scheduler_result = self.scheduler.shutdown().await;
         for engine_id in self.engine_ids {
             let _ = engine::backend::unregister_engine(engine_id);
@@ -258,7 +283,6 @@ pub struct KeptDisk {
 
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
-    pub submit_deadline_us: u64,
     pub silence_timeout_secs: u64,
     pub frame_size: u32,
     pub frame_dispatch_depth: u32,
@@ -795,6 +819,11 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             loop {
                 interval.tick().await;
                 let d = planner.diagnostics();
+                let pass = planner.pass_census();
+                let phases = planner.phase_census();
+                let map = planner.map_census();
+                let edge = planner.edge_census();
+                let stuck = planner.stuck_census();
                 let (lk_n, lk_wait, lk_hold, lk_wmax, lk_hmax) = planner.lock_census();
                 // Who holds the device pool's slots, whatever the queue.
                 if let Some(shared) = crate::store::registry::try_get(arena_model_idx, 0)
@@ -819,6 +848,10 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                      d2h_pages={} h2d_pages={} d2h_rs={} h2d_rs={} d2h_ms={} h2d_ms={} \
                      disk_free={}/{} disk_w_pages={} host_disk_pages={} disk_r_pages={} disk_w_ms={} disk_r_ms={} \
                      resident={} evicting={} evicted={} restoring={} admitted={} \
+                     passes={} pass_ms={} pass_mean_us={} pass_p99_under_us={} \
+                     pass_steps_ms={} pass_wants_ms={} pass_rest_ms={} \
+                     map_passes={} map_pass_ms={} quiet_waits={} skipped_wakes={} map_cache_hits={} \
+                     stuck_settles={} forced_passes={} oldest_wait_ms={} refusal_repeats={} \
                      runners=[{}]",
                     d.queue.len(),
                     d.unmet_queued,
@@ -881,6 +914,22 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     d.proc_states[2],
                     d.proc_states[3],
                     d.admitted_procs,
+                    pass.0,
+                    pass.1 / 1000,
+                    pass.2,
+                    pass.3,
+                    phases[0] / 1000,
+                    phases[1] / 1000,
+                    phases[2] / 1000,
+                    map.0,
+                    map.1 / 1000,
+                    map.2,
+                    edge.0,
+                    edge.1,
+                    stuck.0,
+                    stuck.1,
+                    stuck.2,
+                    planner.refusal_repeats(),
                     d.runners
                         .iter()
                         .map(|(seq, held, progressed)| format!("{seq}:h{held}:p{progressed}"))
@@ -891,9 +940,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         });
     }
 
-    crate::scheduler::set_submit_deadline(std::time::Duration::from_micros(
-        scheduler.submit_deadline_us,
-    ));
     crate::scheduler::set_silence_timeout(std::time::Duration::from_secs(
         scheduler.silence_timeout_secs,
     ));

@@ -347,7 +347,9 @@ pub trait Engine: Send {
     /// An instance's or a channel's pool slots moved: the runtime parked
     /// them on another tier and copied them back into the fresh refs
     /// `rebind` names, each shape apart. Called before the next fire that
-    /// reads them, which must address the new slots. A channel closed with
+    /// reads them, which must address the new slots. A park itself is said
+    /// too ([`Rebind::Parked`]): the instance's old slots are another
+    /// owner's from then on. A channel closed with
     /// an instance still bound on it is still registered
     /// ([`Engine::close_channel`]): its rebind is served like an open one's.
     /// The default does nothing: an engine that states no `Instance` or
