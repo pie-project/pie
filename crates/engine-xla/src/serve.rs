@@ -2491,7 +2491,7 @@ impl Shell {
                 }
                 rs_active = true;
             }
-            let mut rs_plan = engine::rs::LanePlan::of(
+            let rs_plan = engine::rs::LanePlan::of(
                 &lane_verbs[source],
                 row.rows,
                 seated.first.unwrap_or(have),
@@ -2502,29 +2502,6 @@ impl Shell {
                 at: "serve::rs",
                 why: format!("lane {}: {error}", row.source),
             })?;
-            // A single-token lane's decode step reads every carried row (no
-            // replay to save), so its plan keeps them all.
-            if rs_plan.commit == 0 && rs_plan.replay > 2 && row.rows != 1 {
-                let mut rem = 2u32;
-                let mut trimmed = Vec::new();
-                for run in rs_plan.gathers.into_iter().rev() {
-                    if rem == 0 {
-                        break;
-                    }
-                    let take = run.count.min(rem);
-                    let skip = run.count - take;
-                    trimmed.push(engine::rs::Run {
-                        pages: run.pages,
-                        from: run.from + skip,
-                        count: take,
-                    });
-                    rem -= take;
-                }
-                trimmed.reverse();
-                rs_plan.replay = 2 - rem;
-                rs_plan.gather = trimmed.first().cloned();
-                rs_plan.gathers = trimmed;
-            }
             rs_plans.push(rs_plan);
             lane_at.push(at_lane);
             for (r, &slot) in lane_records[source].iter().enumerate() {
