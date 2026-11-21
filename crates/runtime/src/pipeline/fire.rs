@@ -3887,12 +3887,16 @@ pub async fn submit_pass_stamped<C: FireContext>(
         {
             let lane = &full.lanes[0];
             // Pages another pass is computing now are waited for, not
-            // computed again.
+            // computed again. Waiting on that pass's fire, the process
+            // submits nothing: no frame waits on its lanes until its next
+            // submit (greedy decodes of one prompt arriving together held
+            // the claimant's first frame for the waiters' lanes for good).
             coalesced = crate::pipeline::coalesce::before_pass(
                 &stores,
                 ws.id,
                 u64::from(lane.kv.held),
                 slots,
+                || crate::scheduler::worker::notify_owner_waits(engine, pid),
             )
             .await;
             crate::offload::prefill::before_pass(
@@ -8078,7 +8082,7 @@ pub(crate) mod fold_tests {
                 let (ws, slots) = keyed_pass(stores, &tokens);
                 let stores = stores.clone();
                 let waiting = tokio::spawn(async move {
-                    crate::pipeline::coalesce::before_pass(&stores, ws, 0, &slots).await
+                    crate::pipeline::coalesce::before_pass(&stores, ws, 0, &slots, || {}).await
                 });
                 (ws, tokens, waiting)
             })
@@ -8102,13 +8106,13 @@ pub(crate) mod fold_tests {
         stores.kv.lock().set_keeps(true);
         let prompt = |tail: u32| -> Vec<u32> { (0..64).map(|t| 1300 + t).chain([tail]).collect() };
         let (first, slots) = keyed_pass(&stores, &prompt(1));
-        let claims = crate::pipeline::coalesce::before_pass(&stores, first, 0, &slots)
+        let claims = crate::pipeline::coalesce::before_pass(&stores, first, 0, &slots, || {})
             .await
             .expect("the first claims the pages it computes");
         let waiters = waiting_on(&stores, prompt);
         let other: Vec<u32> = (0..65).map(|t| 1500 + t).collect();
         let (ws, other_slots) = keyed_pass(&stores, &other);
-        let own = crate::pipeline::coalesce::before_pass(&stores, ws, 0, &other_slots).await;
+        let own = crate::pipeline::coalesce::before_pass(&stores, ws, 0, &other_slots, || {}).await;
         assert!(
             own.is_some(),
             "another prompt claims its own, waiting on nothing"
@@ -8160,7 +8164,7 @@ pub(crate) mod fold_tests {
                     .collect()
             };
             let (first, slots) = keyed_pass(&stores, &prompt(1));
-            let claims = crate::pipeline::coalesce::before_pass(&stores, first, 0, &slots)
+            let claims = crate::pipeline::coalesce::before_pass(&stores, first, 0, &slots, || {})
                 .await
                 .unwrap();
             let waiters = waiting_on(&stores, prompt);
@@ -8237,7 +8241,7 @@ pub(crate) mod fold_tests {
                     .collect()
             };
             let (first, slots) = keyed_pass(&stores, &prompt(1));
-            let claims = crate::pipeline::coalesce::before_pass(&stores, first, 0, &slots)
+            let claims = crate::pipeline::coalesce::before_pass(&stores, first, 0, &slots, || {})
                 .await
                 .unwrap();
             let waiters = waiting_on(&stores, prompt);
