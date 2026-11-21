@@ -819,6 +819,9 @@ pub struct Shell<B: Serve> {
     /// The landed fires whose device time is not yet read, each with its
     /// estimate ([`Shell::timed`]).
     timing: Vec<(crate::submit::Estimated, crate::submit::DeviceTime)>,
+    /// The device time, ns, of the last fire whose time was read
+    /// ([`Shell::track`]).
+    last_landed: Option<u64>,
     /// Under a stated submit bound, each arm's timestamps, laid at load
     /// ([`Serve::Stamps`]): the step in flight on an arm writes its own.
     stamps: Vec<B::Stamps>,
@@ -2191,6 +2194,7 @@ impl<B: Serve> Shell<B> {
             split_layers: 1,
             estimate_next: None,
             timing: Vec::new(),
+            last_landed: None,
             stamps,
             pipelines,
             asks,
@@ -3865,6 +3869,13 @@ impl<B: Serve> Shell<B> {
             .push((crate::submit::Estimated { hz, ..estimate }, time));
     }
 
+    /// The device time, ns, of the last fire whose time [`Shell::track`]
+    /// read, under a stated bound.
+    #[must_use]
+    pub fn last_landed_ns(&self) -> Option<u64> {
+        self.last_landed
+    }
+
     /// Under a stated submit bound, every landed fire's device time filled
     /// so far is read against its estimate into the bound's measured ratios
     /// (`crate::submit::Measured`), and what landed more than a bound ago
@@ -3875,10 +3886,12 @@ impl<B: Serve> Shell<B> {
             return;
         };
         let now = std::time::Instant::now();
+        let last = &mut self.last_landed;
         self.timing.retain(|(estimate, time)| match time.get() {
             None => true,
             Some(None) => false,
             Some(Some(ns)) => {
+                *last = Some(ns);
                 // A step that went out a layer at a time spans the host's
                 // encoding between its submissions too (a desktop GPU's
                 // 0.5 ms layers ran ~10x their estimate so): its time is
