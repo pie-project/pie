@@ -999,9 +999,10 @@ impl Metal {
 
         for (index, lane) in submission.lanes.iter().enumerate() {
             let listed = matches!(lane.readout, Readout::Rows(_));
-            let served = attached
-                .iter()
-                .any(|a| a.lane as usize == index && !a.adapter_only);
+            let served = attached.iter().any(|a| {
+                let first = a.lane as usize;
+                (first..first + a.lanes.max(1) as usize).contains(&index) && !a.adapter_only
+            });
             if listed && !served {
                 return Err(Error::unsupported("metal", "row-selected readout"));
             }
