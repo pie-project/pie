@@ -378,3 +378,213 @@ fn a_parent_past_the_beams_faults_its_lane_alone() {
         }
     }
 }
+
+/// The rs planes of a hybrid's page (§11.2's case): one of a word a row
+/// from word 0 and one of two words a row after the page's `T` rows of it,
+/// in a page of `4 T` words.
+fn rs_planes(tokens: u32) -> [[u32; 2]; 2] {
+    [[0, 1], [tokens, 2]]
+}
+
+/// A hybrid's beams (§9's hybrid case, §11): each beam's rs entries for
+/// slots `base..=slot` resolved slot by slot over its list, and its fork's
+/// rows copied plane by plane, against §11.1 and §11.2 over the replay's
+/// lists and copies. `tokens` rows an rs page from buffer base `base`.
+fn run_rs(gpu: &mut Gpu, lanes: u32, folded: u32, tokens: u32, base: u32, seed: u64) {
+    let fires = 3 * PAGE + 9;
+    let end = folded + fires;
+    let layout = BeamLayout::of(lanes, end, PAGE, FRAMES).expect("the layout");
+    let cap = layout.cap;
+    let state_words = kb::state_words(lanes, cap, FRAMES) as u32;
+    let f0 = folded / PAGE;
+    // The set's rs entries: every slot from the base through the pool's
+    // last page.
+    let set_len = ((f0 + cap) * PAGE - base).div_ceil(tokens);
+    let entries_most = (end - base) / tokens + 1;
+    let unit = 4 * tokens;
+    let planes = rs_planes(tokens);
+    let mut at = 0u32;
+    let mut take = |words: u32| {
+        let here = at;
+        at += words;
+        here
+    };
+    let steps = take(kb::STEP_WORDS);
+    let rs_lists = take(lanes * kb::RS_LIST_WORDS);
+    let rs_copies = take(lanes * kb::RS_COPY_WORDS);
+    let planes_at = take(2 * planes.len() as u32);
+    let trans = take(cap);
+    let parents_at = take(lanes);
+    let faults = take(lanes);
+    let bases = take(set_len);
+    let tables = take(lanes * entries_most);
+    let words = at;
+    // The pool: the state, then the rs pages, unit `u` at words `u * unit`.
+    let first_unit = state_words.div_ceil(unit) + 1;
+    let set: Vec<u32> = (0..set_len).map(|a| first_unit + a).collect();
+    let mut pool: Vec<u32> = vec![0; ((first_unit + set_len) * unit) as usize];
+    for (a, &u) in set.iter().enumerate() {
+        for w in 0..unit {
+            pool[(u * unit + w) as usize] = content(a as u32 + 1, w);
+        }
+    }
+    let pool_h = gpu.up_u32(&pool);
+    let store_h = gpu.up_u32(&vec![0u32; words as usize]);
+    let mut host = State::new(lanes, cap, FRAMES);
+    let mut rng = Rng(seed);
+    let mut parents: Vec<u32> = (0..lanes).collect();
+    let mut store = vec![0u32; words as usize];
+    for t in 0..fires {
+        let slot = folded + t;
+        let c = slot / PAGE - f0;
+        let reserve = (lanes * (c + 2) + lanes * FRAMES + 1).min(cap);
+        let backed = engine_gpu::beam::backed(lanes, slot, folded, PAGE, FRAMES, reserve);
+        let entries = (slot - base) / tokens + 1;
+        store.fill(0);
+        store[steps as usize..(steps + kb::STEP_WORDS) as usize].copy_from_slice(&[
+            0, parents_at, trans, 0, faults, lanes, cap, reserve, PAGE, folded, slot, 0, FRAMES,
+            backed, lanes, rs_lists,
+        ]);
+        for q in 0..backed {
+            store[(trans + q) as usize] = 1 + q;
+        }
+        store[bases as usize..(bases + set_len) as usize].copy_from_slice(&set);
+        for (k, plane) in planes.iter().enumerate() {
+            store[planes_at as usize + 2 * k] = plane[0];
+            store[planes_at as usize + 2 * k + 1] = plane[1];
+        }
+        for b in 0..lanes {
+            let table = tables + b * entries_most;
+            // Staged as the set's: every beam names its set's entries.
+            store[table as usize..(table + entries) as usize]
+                .copy_from_slice(&set[..entries as usize]);
+            let l = (rs_lists + b * kb::RS_LIST_WORDS) as usize;
+            store[l..l + 8].copy_from_slice(&[table, bases, b, entries, base, tokens, set_len, 0]);
+            let r = (rs_copies + b * kb::RS_COPY_WORDS) as usize;
+            store[r..r + 16].copy_from_slice(&[
+                kb::copies_word(lanes, cap, FRAMES) as u32 + 3 * b,
+                bases,
+                faults + b,
+                backed,
+                PAGE,
+                tokens,
+                base,
+                f0,
+                folded - f0 * PAGE,
+                unit,
+                planes.len() as u32,
+                set_len,
+                0,
+                0,
+                0,
+                0,
+            ]);
+            store[(parents_at + b) as usize] = parents[b as usize];
+        }
+        gpu.write_u32(store_h, &store);
+        let records = |runs: u32, count: u32| Records {
+            store: Tensor::new(store_h, 1, words, Dtype::U32),
+            pool: Segments::one(pool_h, pool.len() as u32),
+            runs,
+            count,
+            planes: planes_at,
+        };
+        gpu.run(|c| {
+            kb::step(c, records(steps, 1))?;
+            kb::copy_rs_rows(c, records(rs_copies, lanes), planes.len() as u32)
+        });
+        let want = step(
+            &mut host,
+            &parents,
+            Fire {
+                page: PAGE,
+                folded,
+                reserve,
+                slot,
+            },
+        );
+        // §11.2 on the host's mirror.
+        for (b, &[src, dst, n]) in want.copies.iter().enumerate() {
+            if n == 0 || src == dst || want.faults[b] == fault::COPY_BOUNDS {
+                continue;
+            }
+            for k in 0..n {
+                let from = (f0 + src) * PAGE + k;
+                let to = (f0 + dst) * PAGE + k;
+                if from < base || to < base {
+                    continue;
+                }
+                let (fe, te) = ((from - base) / tokens, (to - base) / tokens);
+                for plane in planes {
+                    for w in 0..plane[1] {
+                        let f = set[fe as usize] * unit + plane[0] + ((from - base) % tokens) * plane[1] + w;
+                        let d = set[te as usize] * unit + plane[0] + ((to - base) % tokens) * plane[1] + w;
+                        pool[d as usize] = pool[f as usize];
+                    }
+                }
+            }
+        }
+        let got_store = gpu.down_u32(store_h, words as usize);
+        let got_pool = gpu.down_u32(pool_h, pool.len());
+        let what = format!(
+            "width {lanes}, folded {folded}, {tokens} rows an rs page from {base}, fire {t} \
+             (slot {slot})"
+        );
+        assert_eq!(
+            &got_store[faults as usize..(faults + lanes) as usize],
+            want.faults.as_slice(),
+            "{what}: the faults"
+        );
+        assert_eq!(
+            &got_pool[(first_unit * unit) as usize..],
+            &pool[(first_unit * unit) as usize..],
+            "{what}: the rs rows its copies moved"
+        );
+        for b in 0..lanes as usize {
+            let table = (tables + b as u32 * entries_most) as usize;
+            // §11.1 over the replay's list.
+            let resolved: Vec<u32> = (0..entries)
+                .map(|e| {
+                    let at = base + e * tokens;
+                    if at < f0 * PAGE {
+                        return set[e as usize];
+                    }
+                    let q = want.lists[b][(at / PAGE - f0) as usize];
+                    let sigma = (f0 + q) * PAGE + at % PAGE;
+                    set[((sigma - base) / tokens) as usize]
+                })
+                .collect();
+            assert_eq!(
+                &got_store[table..table + entries as usize],
+                resolved.as_slice(),
+                "{what}: beam {b}'s rs entries"
+            );
+        }
+        parents = (0..lanes)
+            .map(|b| match rng.next() % 4 {
+                0 => 0,
+                1 => b,
+                _ => rng.next() % lanes,
+            })
+            .collect();
+    }
+    eprintln!("width {lanes}, folded {folded}, rs pages of {tokens} from {base}: {fires} fires equal §11");
+}
+
+#[test]
+fn a_hybrid_beams_rs_rows_follow_their_lists() {
+    let Some(mut gpu) = Gpu::open() else {
+        eprintln!("not asked: no device");
+        return;
+    };
+    for lanes in [2u32, 4, 8] {
+        for tokens in [1u32, 2, 4] {
+            // A frozen slot off a kv page (its buffer from the frozen slot,
+            // on a row page), and one on a page boundary.
+            for folded in [38u32, 48] {
+                let base = folded / tokens * tokens;
+                run_rs(&mut gpu, lanes, folded, tokens, base, 0x51 + u64::from(lanes * tokens + folded));
+            }
+        }
+    }
+}

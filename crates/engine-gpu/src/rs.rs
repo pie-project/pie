@@ -461,6 +461,18 @@ impl Buffers {
     pub fn page_tokens(&self) -> u32 {
         self.page_tokens
     }
+
+    /// Each plane's first byte in an rs page.
+    #[must_use]
+    pub fn plane_at(&self) -> Vec<u64> {
+        self.plane_at.clone()
+    }
+
+    /// The bytes an rs page id counts.
+    #[must_use]
+    pub fn stride(&self) -> u64 {
+        self.stride
+    }
 }
 
 pub struct Seat {

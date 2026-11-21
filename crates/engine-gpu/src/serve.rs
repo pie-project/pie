@@ -3425,13 +3425,18 @@ impl<B: Serve> Shell<B> {
 
     /// Plans the fire's beam groups over its staged tables
     /// ([`crate::beam::plan`]).
-    fn plan_beams<'a>(
+    fn plan_beams<'a, 'r>(
         &self,
         arm: usize,
         beams: &'a [crate::beam::Group<B>],
         geometries: &[poem_exec::store::kv::Geometry],
         seats: &[Seat],
         seat_of: &[Option<(usize, u32)>],
+        rs: Option<(
+            &'r [i32],
+            &'r dyn Fn(usize) -> Option<(usize, bool)>,
+            &'r dyn Fn(usize) -> Option<(u32, &'r [u32])>,
+        )>,
     ) -> Result<crate::beam::Planned<'a, B>> {
         let laid = self.inputs[arm].laid();
         let room = laid.beams().ok_or_else(|| {
@@ -3440,15 +3445,6 @@ impl<B: Serve> Shell<B> {
                 "a fire of beam groups on a load that laid no room for them".to_string(),
             )
         })?;
-        if self.pools.rs_rows().is_some() {
-            return Err(program(
-                "serve::beams",
-                "a beam group (parents) on a load that buffers recurrent rows: engine-gpu \
-                 pages a hybrid's beams' rs rows by their lists (BEAM-PAGE-LISTS.md §11) in \
-                 no kernel yet"
-                    .to_string(),
-            ));
-        }
         if self.pools.pages_hold_more_than_kv() || self.copies {
             return Err(program(
                 "serve::beams",
@@ -3487,9 +3483,63 @@ impl<B: Serve> Shell<B> {
                 rows: held.rows,
             })
         };
-        crate::beam::plan(beams, &staged, &seat, &mut |refs: &[u32]| {
-            self.pools.kv_pages(refs, None)
-        })
+        // A hybrid's beams page their rs rows by their lists (§11): where
+        // the load buffers rows, the fire's staged rs table, each rs plane
+        // and the words an rs unit counts.
+        let rs_staged = match (&self.rs_layout, &self.rs_buffers) {
+            (Some(layout), Some(buffers)) => {
+                let Some((table, header, set)) = rs else {
+                    return Err(program(
+                        "serve::beams",
+                        "a beam group (parents) on a hybrid whose fire buffers no recurrent \
+                         rows: its beams' rows stay in their set's buffer and its state is \
+                         never written while it searches (BEAM-PAGE-LISTS.md §11)"
+                            .to_string(),
+                    ));
+                };
+                let word = laid.rs_carry_word().ok_or_else(|| {
+                    program("serve::beams", "a load that laid no rs table".to_string())
+                })?;
+                let words = |bytes: u64, what: &str| {
+                    u32::try_from(bytes / 4)
+                        .ok()
+                        .filter(|_| bytes.is_multiple_of(4))
+                        .ok_or_else(|| {
+                            program(
+                                "serve::beams",
+                                format!(
+                                    "{what} of {bytes} bytes: a beam's rs copy moves whole words"
+                                ),
+                            )
+                        })
+                };
+                let planes = layout
+                    .planes
+                    .iter()
+                    .zip(&buffers.plane_at())
+                    .map(|(plane, &at)| {
+                        Ok([words(at, "an rs plane's offset")?, words(plane.row_bytes, "an rs row")?])
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Some(crate::beam::RsStaged {
+                    table,
+                    word,
+                    header,
+                    set,
+                    tokens: buffers.page_tokens(),
+                    planes,
+                    unit: words(buffers.stride(), "an rs unit")?,
+                })
+            }
+            _ => None,
+        };
+        crate::beam::plan(
+            beams,
+            &staged,
+            &seat,
+            &mut |refs: &[u32]| self.pools.kv_pages(refs, None),
+            rs_staged.as_ref(),
+        )
     }
 
     /// The fire's beam groups' step and page copies, ahead of its forward
@@ -3504,7 +3554,32 @@ impl<B: Serve> Shell<B> {
         for &(cell, word) in &planned.cells {
             frame.copy(&cell.buffer, cell.at, store, u64::from(word) * 4, cell.bytes)?;
         }
-        self.dispatch_beams(frame, arm, planned.steps, planned.copies, planned.planes)
+        self.dispatch_beams(frame, arm, planned.steps, planned.copies, planned.planes)?;
+        if planned.rs_copies > 0 {
+            let room = self.inputs[arm].laid().beams().ok_or_else(|| {
+                program("serve::beams", "a load that laid no room for beam groups".to_string())
+            })?;
+            let sink = B::sink(&self.device, frame, &self.pipelines, &self.handles);
+            let whole = self.handles.bind(store, 0, store.bytes())?;
+            kernels_slang::runtime::beam::copy_rs_rows(
+                &sink,
+                kernels_slang::runtime::beam::Records {
+                    store: kernels_slang::Tensor::new(
+                        whole,
+                        1,
+                        u32::try_from(store.bytes() / 4).unwrap_or(u32::MAX),
+                        Dtype::U32,
+                    ),
+                    pool: self.pools.segments(&self.handles)?,
+                    runs: room.rs_copies.0,
+                    count: planned.rs_copies,
+                    planes: room.planes.0 + 2 * planned.planes,
+                },
+                planned.rs_planes,
+            )
+            .map_err(crate::error::kernel)?;
+        }
+        Ok(())
     }
 
     /// The beam kernels over arm `arm`'s records: `steps` groups' steps,
@@ -4138,6 +4213,11 @@ impl<B: Serve> Shell<B> {
         let mut seats: Vec<Seat> = Vec::with_capacity(lanes.len());
         // Each lane's seat in the staged tables and its first row.
         let mut seat_of: Vec<Option<(usize, u32)>> = vec![None; lanes.len()];
+        // Each lane's header in the staged rs table, and its buffer's base
+        // and pages (units), where it buffers rows: a hybrid's beams read
+        // them (`crate::beam::RsStaged`).
+        let mut rs_header_of: Vec<Option<usize>> = vec![None; lanes.len()];
+        let mut rs_set_of: Vec<Option<(u32, Vec<u32>)>> = vec![None; lanes.len()];
         let mut kv_less: Vec<bool> = Vec::with_capacity(lanes.len());
 
         let mut tables: Vec<std::borrow::Cow<'_, [u32]>> = Vec::with_capacity(lanes.len());
@@ -4261,6 +4341,9 @@ impl<B: Serve> Shell<B> {
                 },
                 other => other.clone(),
             };
+            if let engine::fire::RsVerb::Buffer { pages, base, .. } = &verb {
+                rs_set_of[source] = Some((*base, pages.clone()));
+            }
             // The stated frozen length is a lower bound where the device
             // counts the fold: the lane replays from the further of it and
             // where the record's last fold left it. A record begun afresh
@@ -4475,6 +4558,7 @@ impl<B: Serve> Shell<B> {
                 }
                 rs_active = true;
             }
+            rs_header_of[source] = Some(rs_plans.len());
             rs_plans.push(plan);
             rs_carried.push(self.carrying.contains(row.class as usize));
 
@@ -4619,11 +4703,6 @@ impl<B: Serve> Shell<B> {
             }
         }
         let geometries = geometries;
-        let planned = if beams.is_empty() {
-            None
-        } else {
-            Some(self.plan_beams(arm, beams, &geometries, &seats, &seat_of)?)
-        };
         let pages = geometries
             .first()
             .map_or(0, |geometry| geometry.indices.len() as u32);
@@ -4766,9 +4845,32 @@ impl<B: Serve> Shell<B> {
                     have: u64::from(self.budget().max_tokens),
                 });
             }
-            Some(carry_table(&rs_plans)?)
+            let page_tokens = self.rs_buffers.as_ref().map_or(1, crate::rs::Buffers::page_tokens);
+            Some(carry_table(&rs_plans, page_tokens)?)
         } else {
             None
+        };
+        let planned = if beams.is_empty() {
+            None
+        } else {
+            let header = |lane: usize| {
+                let at = (*rs_header_of.get(lane)?)?;
+                Some((at, rs_carried.get(at).copied().unwrap_or(false)))
+            };
+            let set = |lane: usize| {
+                rs_set_of
+                    .get(lane)?
+                    .as_ref()
+                    .map(|(base, pages)| (*base, pages.as_slice()))
+            };
+            Some(self.plan_beams(
+                arm,
+                beams,
+                &geometries,
+                &seats,
+                &seat_of,
+                rs_carry.as_deref().map(|table| (table, &header as &dyn Fn(usize) -> _, &set as &dyn Fn(usize) -> _)),
+            )?)
         };
 
         let (group_of_lane, packings) = if self.feeds.selections.is_empty() {
@@ -5932,7 +6034,7 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
 /// carries; where its carried tokens and its pages start; its commit
 /// length), then each lane's carried tokens and its buffer pages (units of
 /// the pool's rs list).
-fn carry_table(plans: &[engine::rs::LanePlan]) -> Result<Vec<i32>> {
+fn carry_table(plans: &[engine::rs::LanePlan], page_tokens: u32) -> Result<Vec<i32>> {
     let header = kernels_slang::ssm::CARRY_HEADER as usize;
     let mut table = vec![0i32; plans.len() * header];
     let int = |n: u64| {
@@ -5961,7 +6063,18 @@ fn carry_table(plans: &[engine::rs::LanePlan]) -> Result<Vec<i32>> {
             .as_ref()
             .or(plan.gathers.first())
             .map_or(&[][..], |run| run.pages.as_slice());
-        for &page in pages {
+        // The pages the lane's rows touch this fire, from its buffer's base:
+        // its runs' last token's. A buffer's pages past them (a beam group's
+        // set holds its pool's whole) no kernel of this fire reads.
+        let end = plan
+            .gathers
+            .iter()
+            .chain(plan.scatter.as_ref())
+            .map(|run| run.from + run.count)
+            .max()
+            .unwrap_or(0);
+        let touched = (end.div_ceil(page_tokens.max(1)) as usize).min(pages.len());
+        for &page in &pages[..touched] {
             table.push(int(u64::from(page))?);
         }
         table[at + 4] = int(u64::from(plan.commit))?;
