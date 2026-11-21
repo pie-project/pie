@@ -43,6 +43,11 @@ interface forward {
     ///   (`new-memory/designs/BEAM-PAGE-LISTS.md`). Computed on the device by
     ///   the epilogue before; the first fire ignores it. A parent past the
     ///   lanes faults its lane. Default: none.
+    ///   A search owns its set's state: the rows every live beam shares
+    ///   (below the group's common ancestor) fold into the set as the search
+    ///   runs (`BEAM-PAGE-LISTS.md` §11.3), so a search left without adopting
+    ///   a beam leaves the set folded past its prompt. A guest that wants the
+    ///   prompt state back forks the set before the search.
     record state-geometry {
         positions: option<borrow<channel>>,
         slots:     option<borrow<channel>>,

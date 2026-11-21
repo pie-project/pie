@@ -247,6 +247,7 @@ fn a_bound_guest_holds_its_scratch_as_state() {
                     &[None],
                     &[engine::ChannelId(1)],
                     engine_cuda::program::Slots {
+                        resident: engine::ScratchPlace::None,
                         instance: slots.0,
                         rings: slots.1,
                         scratch,
@@ -387,6 +388,7 @@ fn a_pair_taken_again_at_the_same_refs_is_laid_again() {
                 &[None],
                 &[engine::ChannelId(1)],
                 engine_cuda::program::Slots {
+                    resident: engine::ScratchPlace::None,
                     instance: slots.0,
                     rings: slots.1,
                     scratch,
@@ -542,6 +544,7 @@ fn a_guests_state_reads_zero_when_its_slots_change_owner() {
                 &[None],
                 &[engine::ChannelId(1)],
                 engine_cuda::program::Slots {
+                    resident: engine::ScratchPlace::None,
                     instance: slots.0.clone(),
                     rings: slots.1.clone(),
                     scratch: scratch.clone(),
@@ -592,6 +595,7 @@ fn a_guests_state_reads_zero_when_its_slots_change_owner() {
         .rebind_program(
             b,
             engine_cuda::program::Slots {
+                resident: engine::ScratchPlace::None,
                 instance: b_slots.0,
                 rings: b_slots.1,
                 scratch: fresh.clone(),

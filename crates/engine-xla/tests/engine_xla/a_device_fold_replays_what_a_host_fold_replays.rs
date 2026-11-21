@@ -113,6 +113,7 @@ fn bind_fold(model: &mut Model) -> InstanceId {
     model
         .engine
         .bind_instance(&InstanceBinding {
+            resident: Default::default(),
             program,
             channels,
             seeds: Vec::new(),

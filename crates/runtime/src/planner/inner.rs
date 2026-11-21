@@ -13,11 +13,6 @@ use super::rank::Rank;
 use super::reclaim::Reclaim;
 use super::wait::{EntryKey, WaitKind, Waiter};
 
-/// The most of the window lists the seated lanes' growth holds back from a prompt
-/// waiting to be seated: a thirty-second, as a small pool seats few lanes
-/// and serves their growth from what the others let go.
-pub(super) const RESERVE_SHARE: u32 = 32;
-
 #[derive(Default)]
 pub(super) struct Inner {
     /// The process suspended for a bind whose restore was served and that
@@ -39,9 +34,32 @@ pub(super) struct Inner {
     pub(super) completion_credit: u32,
     pub(super) host_swap_blocked: HashSet<ProcessId>,
     pub(super) prepare_blocked: HashSet<ProcessId>,
+    /// The pool's room count and the swap tiers' free slots when the last
+    /// of those blocks was set ([`super::ResidencyPlanner::lapse_blocks`]):
+    /// a block holds only on the pool it was set on.
+    pub(super) blocked_at: Option<(u64, u32)>,
     pub(super) killing: HashSet<ProcessId>,
     pub(super) admitting: BTreeMap<(Rank, ProcessId), Arc<Notify>>,
     pub(super) to_end: super::to_end::ToEnd,
+    /// The evicted processes whose parked state is on its way down a tier
+    /// ([`super::ResidencyPlanner::park_down`]): none is restored until it
+    /// lands, so no restore misses an item moving under it.
+    pub(super) parked_moving: HashSet<ProcessId>,
+    /// The unservable head the last stall dump named, the pool's room
+    /// count then, and when ([`super::ResidencyPlanner::dump_stall`]): one
+    /// dump per head and room change, and again each
+    /// [`super::plan::STALL_SAYS_AGAIN`] while it stays unserved.
+    pub(super) stall_dumped: Option<(super::wait::EntryKey, u64, crate::rt::Instant)>,
+    /// The room a pass last planned a quiet head on (nothing in flight):
+    /// the head and the pool's counts ([`super::ResidencyPlanner::tick`]).
+    pub(super) quiet_planned: Option<(super::wait::EntryKey, [u64; 4])>,
+    /// Waits served this pass past [`super::wait::LONG_WAIT`]: the kind and
+    /// how long.
+    pub(super) long_waits: Vec<(&'static str, std::time::Duration)>,
+    /// The head held unserved on something in flight: since when, on what
+    /// room, and whether that was said ([`super::ResidencyPlanner::tick`]).
+    pub(super) held_in_flight:
+        Option<(super::wait::EntryKey, u64, crate::rt::Instant, bool)>,
 }
 
 impl Inner {
@@ -131,29 +149,43 @@ impl Inner {
         need: RsUnits,
         capacity: RsUnits,
     ) -> RsUnits {
+        // Nothing in flight: no seated lane grows before the claim.
         if need.is_zero()
             || growth.is_zero()
             || self.procs.get(&pid).is_none_or(|proc| proc.seated)
-            || self.fleet_stalled()
+            || self.nothing_in_flight()
         {
             return RsUnits::default();
         }
+        // The seated lanes whose next step needs room now: seated, running
+        // and resident, not waiting in the queue (one waiting asks for its
+        // room there, and grows before nothing). Counting every seated lane,
+        // or yielding only once the fleet read stalled by its waiters'
+        // kinds, held back the growth of lanes that were all blocked, and an
+        // allocation with 38 free runs was not granted (the M1).
+        let waiting: HashSet<ProcessId> = self
+            .queue
+            .values()
+            .filter(|waiter| waiter.is_unmet())
+            .map(|waiter| waiter.pid)
+            .collect();
         let seated = u32::try_from(
             self.procs
-                .values()
-                .filter(|proc| proc.seated && !proc.idle && proc.state == Residency::Resident)
+                .iter()
+                .filter(|(lane, proc)| {
+                    proc.seated
+                        && !proc.idle
+                        && proc.state == Residency::Resident
+                        && !waiting.contains(*lane)
+                })
                 .count(),
         )
         .unwrap_or(u32::MAX);
+        // One growth for each seated lane that needs room now (its next
+        // step's pages), never more than the pool.
         RsUnits {
-            slots: growth
-                .slots
-                .saturating_mul(seated)
-                .min(capacity.slots / RESERVE_SHARE),
-            pages: growth
-                .pages
-                .saturating_mul(seated)
-                .min(capacity.pages / RESERVE_SHARE),
+            slots: growth.slots.saturating_mul(seated).min(capacity.slots),
+            pages: growth.pages.saturating_mul(seated).min(capacity.pages),
             ..RsUnits::default()
         }
     }
@@ -186,7 +218,22 @@ impl Inner {
     pub(super) fn enqueue(&mut self, pid: ProcessId, kind: WaitKind) -> EntryKey {
         let key = (self.procs[&pid].rank(), self.next_id);
         self.next_id += 1;
-        self.queue.insert(key, Waiter { pid, kind });
+        // The one restored for its bind asks for pages: its bind went
+        // through, and the next suspended bind may come back. Held to its
+        // first fire, the hold outlived a grant it waited on behind the
+        // held restore (the M1 stress: 86 at the planner's grant, the
+        // restore head held, nothing moved).
+        if matches!(kind, WaitKind::Allocation { .. }) && self.bind_restoring == Some(pid) {
+            self.bind_restoring = None;
+        }
+        self.queue.insert(
+            key,
+            Waiter {
+                pid,
+                kind,
+                since: crate::rt::Instant::now(),
+            },
+        );
         key
     }
 
@@ -213,6 +260,7 @@ impl Inner {
             if let Some(Waiter {
                 pid,
                 kind: WaitKind::Restore { demand },
+                ..
             }) = self.queue.remove(&key)
                 && let Some(proc) = self.procs.get_mut(&pid)
             {
@@ -243,8 +291,67 @@ impl Inner {
     pub(super) fn unmet_head(&self) -> Option<(EntryKey, &Waiter)> {
         let mut oldest_restore: Option<EntryKey> = None;
         let mut allocation: Option<EntryKey> = None;
+        // A process evicted for a head that still waits unserved is not
+        // restored before it (the anti-thrash rule's second half): its
+        // restore is passed over, the queue not held, so the head it was
+        // evicted for is planned for. Restored first, the victim was
+        // evicted again for the same head every ~65 ms, the head never
+        // served.
+        // Read only where a restore of a victim is met (a process with an
+        // evicted-for head): built on every call it was a scan and a set of
+        // the whole queue each time, and this runs many times a pass.
+        let waiting = std::cell::OnceCell::<HashSet<ProcessId>>::new();
+        let waiting = || {
+            waiting.get_or_init(|| {
+                self.queue
+                    .values()
+                    .filter(|waiter| waiter.is_unmet())
+                    .map(|waiter| waiter.pid)
+                    .collect()
+            })
+        };
+        // Its head served: no unmet waiter of its, and resident. A restore
+        // head leaves the queue while its restore runs and comes back if
+        // its unpark is short: read by its queue alone, it looked served
+        // in that gap, and the victim's restore went first (the L40S: one
+        // victim evicted 5,894 times for one restore head, never served).
+        let unserved = |head: ProcessId| {
+            waiting().contains(&head)
+                || self
+                    .procs
+                    .get(&head)
+                    .is_some_and(|proc| proc.state != Residency::Resident)
+        };
+        let held_for_head = |pid: ProcessId| {
+            self.procs
+                .get(&pid)
+                .and_then(|proc| proc.evicted_for)
+                .is_some_and(|head| head != pid && unserved(head))
+        };
+        // Evicted while it waited in the queue: held while any process
+        // ahead of it (older) has an entry in the queue.
+        let behind_queue = |pid: ProcessId| {
+            let Some(seq) = self
+                .procs
+                .get(&pid)
+                .filter(|proc| proc.evicted_queued)
+                .map(|proc| proc.seq)
+            else {
+                return false;
+            };
+            self.queue.values().any(|other| {
+                other.pid != pid
+                    && !matches!(other.kind, WaitKind::Restore { .. })
+                    && self.procs.get(&other.pid).is_some_and(|proc| proc.seq < seq)
+            })
+        };
         for (&key, waiter) in &self.queue {
             if !waiter.is_unmet() {
+                continue;
+            }
+            if matches!(waiter.kind, WaitKind::Restore { .. })
+                && (held_for_head(waiter.pid) || behind_queue(waiter.pid))
+            {
                 continue;
             }
             match &waiter.kind {
@@ -304,12 +411,28 @@ impl Inner {
         self.evicting.insert(pid, expected);
         let mut wake = Vec::new();
         for waiter in self.queue.values_mut().filter(|w| w.pid == pid) {
-            if let WaitKind::Allocation {
-                notify, yielded, ..
-            } = &mut waiter.kind
-            {
-                *yielded = true;
-                wake.push(notify.clone());
+            match &mut waiter.kind {
+                WaitKind::Allocation {
+                    notify, yielded, ..
+                } => {
+                    *yielded = true;
+                    wake.push(notify.clone());
+                }
+                // Its own bind's wait for room ends: evicted, the bind
+                // waits for its restore, and nothing is funded for it
+                // meanwhile. Kept, the eviction waited on fires whose
+                // finalizer was that bind, and the bind on the eviction
+                // (Mac Pro's M5 soak: evicting=1 for good, pool free 0).
+                WaitKind::BindRoom {
+                    notify,
+                    served: false,
+                    withdrawn,
+                    ..
+                } => {
+                    *withdrawn = true;
+                    wake.push(notify.clone());
+                }
+                _ => {}
             }
         }
         wake
@@ -348,11 +471,17 @@ impl Inner {
         if !matches!(waiter.kind, WaitKind::Allocation { .. }) {
             return wake;
         }
-        let Inner { queue, accum, .. } = self;
+        let Inner {
+            queue,
+            accum,
+            long_waits,
+            ..
+        } = self;
         for (&key, waiter) in queue.range_mut(head..) {
             if !waiter.is_unmet() {
                 continue;
             }
+            let waited = waiter.since.elapsed();
             let WaitKind::Allocation {
                 demand,
                 notify,
@@ -372,57 +501,58 @@ impl Inner {
             let kv = accum.donate(demand.kv_pages);
             debug_assert!(outcome.is_none(), "an unmet waiter carries no outcome");
             *outcome = Some(Ok(AllocationGrant::new(kv, RsSlotReservation::empty())));
+            if waited > super::wait::LONG_WAIT {
+                long_waits.push(("allocation", waited));
+            }
             wake.push((key, demand.kv_pages, notify.clone()));
         }
         wake
     }
 
-    /// The pages the resident lanes' next steps take: one each process
-    /// running (admitted, resident, not idle). A restore leaves this much of
-    /// the device free, so bringing one back does not suspend another at
-    /// the next page boundary.
-    pub(super) fn growth_reserve(&self) -> u32 {
-        self.procs
-            .values()
-            .filter(|proc| proc.admitted && !proc.idle && proc.state == Residency::Resident)
-            .count() as u32
-    }
-
-    /// Whether the restore of `pid`, the head, goes now (`spare`: device
-    /// pages free past what the head gathered). A restore goes back once a
-    /// resident process has finished (its credit), or the fleet can do
-    /// nothing else, or the device has room for it and still a page for
-    /// each resident lane's next one: suspended processes come back as
-    /// soon as room appears, every one it holds at once, not one a
+    /// Whether the restore of `pid`, the head, goes now, its kv gathered:
+    /// suspended processes come back as soon as their room stands, fires
+    /// in flight or none, every one it holds at once, not one a
     /// completion. One whose role slots found no room last time
-    /// ([`super::proc::Proc::roles_short`]) waits while the fleet decodes
-    /// (a completion frees room; funding it then thrashed), and once the
-    /// fleet is stalled (a fleet waiting at binds included) has room made
-    /// for its runs: idle cache, a coming grow, then the occupants of the
-    /// chunks it could take.
-    pub(super) fn restore_gate(&mut self, pid: ProcessId, spare: u32) -> RestoreGate {
-        let roles_short = self.procs.get(&pid).and_then(|proc| proc.roles_short);
+    /// ([`super::proc::Proc::roles_short`]) goes again on the runs that
+    /// stand free, and has room made for its runs (idle cache, a coming
+    /// grow, then the occupants of the chunks it could take) only once
+    /// nothing in flight can free room, a fleet waiting at binds included:
+    /// funding it while the fleet decoded thrashed.
+    pub(super) fn restore_gate(&mut self, pid: ProcessId) -> RestoreGate {
+        let roles_short = self
+            .procs
+            .get(&pid)
+            .filter(|proc| proc.roles_short.is_some())
+            .and_then(super::proc::Proc::restore_need);
         if self.completion_credit > 0 {
             self.completion_credit -= 1;
             return RestoreGate::Serve;
         }
-        let stalled = self.fleet_stalled();
+        let stalled = self.nothing_in_flight();
         // Short of runs for its roles: it goes again on runs that stand
         // free whatever the fleet does (the plan looks, outside this lock);
-        // room is made for it by moving others only once the fleet is
-        // stalled or waits at binds. Waiting for a completion while its
-        // runs stood free, it waited on an event that need not come (Mac
-        // Pro's beam mix: 2 runs of 4 short, 440 such runs free, flat for
-        // 191 s with every thread parked).
+        // room is made for it by moving others only once nothing in flight
+        // can free room (a fleet waiting at binds included). Waiting for a
+        // completion while its runs stood free, it waited on an event that
+        // need not come (Mac Pro's beam mix: 2 runs of 4 short, 440 such
+        // runs free, flat for 191 s with every thread parked).
+        // Funded too while another process waits at a bind behind it: that
+        // bind goes only once the head is served, so the head's room comes
+        // from no completion of the waiter's, and a fleet whose decoders
+        // never stop firing is never stalled (a roles-short head starved
+        // behind a steady decoder with binds waiting on it).
         if let Some(need) = roles_short {
             return RestoreGate::Evict {
-                need: (need.run, need.pieces),
-                fund: stalled || self.fleet_waits_at_binds(),
+                need,
+                fund: stalled || self.bind_waits_behind(pid),
             };
         }
-        if spare < self.growth_reserve() && !stalled {
-            return RestoreGate::Wait;
-        }
+        // Its kv gathered (the step before), its rs and its bind's runs
+        // standing: it goes, fires in flight or none. Held for a page for
+        // each running lane past the pages it had already gathered, it held
+        // them idle while a fleet of 248 decoded, its need standing and
+        // never attempted (Mac Pro's 2 GiB mix); seated lanes' growth goes
+        // ahead of it anyway (`growth_first`).
         RestoreGate::Serve
     }
 
@@ -438,26 +568,69 @@ impl Inner {
         }
     }
 
-    /// No resident process makes progress save through room: each is
-    /// stalled as [`Self::fleet_stalled`] counts it, or waits at a bind for
-    /// room (AMD's 7-minute stall: 143 processes at a bind, the restore
-    /// head short of role slots never funded). Read only where a restore
-    /// short of role slots asks whether to wait for a completion: a bind
-    /// waiter is no wedge for the starvation verdict, which may still
-    /// move it.
-    pub(super) fn fleet_waits_at_binds(&self) -> bool {
+    /// Whether `pid`'s anti-thrash mark ([`super::proc::Proc::unfired`])
+    /// keeps it out of the victims: only while it can fire, by state, never
+    /// a clock. Waiting in the queue itself (its lanes blocked on the
+    /// planner, which serves the head first) or with nothing in flight
+    /// anywhere (nothing of it runs), it cannot, and protected it would hold
+    /// the head that waits on its room for good: it is a candidate.
+    pub(super) fn unfired_protects(&self, pid: ProcessId) -> bool {
+        self.procs.get(&pid).is_some_and(|proc| proc.unfired)
+            && !self
+                .queue
+                .values()
+                .any(|waiter| waiter.pid == pid && waiter.is_unmet())
+            && !self.nothing_in_flight()
+    }
+
+    /// Whether the one bind-suspended restore at a time
+    /// ([`Self::bind_restoring`]) no longer holds the next: its process
+    /// cannot fire (nothing in flight anywhere, or it waits in the queue on
+    /// something other than its bind) and its bind is not queued for room
+    /// (which the gate funds first). By state, never a clock: held while it
+    /// could not fire, every other bind-suspended restore waited for good
+    /// with its runs standing (Mac Pro's no-step lines with no refusal).
+    pub(super) fn bind_restoring_released(&self) -> bool {
+        let Some(restoring) = self.bind_restoring else {
+            return true;
+        };
+        let mut bind_queued = false;
+        let mut waits = false;
+        for waiter in self.queue.values().filter(|waiter| waiter.pid == restoring) {
+            if !waiter.is_unmet() {
+                continue;
+            }
+            match waiter.kind {
+                WaitKind::BindRoom { .. } => bind_queued = true,
+                _ => waits = true,
+            }
+        }
+        !bind_queued && (waits || self.nothing_in_flight())
+    }
+
+    /// Nothing in flight can free room: no fire submitted and not landed,
+    /// no eviction, restore or kill under way. What the others wait on
+    /// (grants, binds, gates, anything not yet named) does not matter:
+    /// with nothing moving, only the planner moving a resident makes room.
+    /// Counting waiter kinds instead missed one each time (stalled, then
+    /// waiting at binds, then one resident between steps), and the fleet
+    /// stood still with nothing coming.
+    pub(super) fn nothing_in_flight(&self) -> bool {
         self.evicting.is_empty()
-            && self.procs.values().any(|proc| proc.bind_waiting)
-            && self.procs.iter().all(|(pid, proc)| match proc.state {
-                Residency::Resident => {
-                    !proc.admitted
-                        || proc.idle
-                        || proc.bind_waiting
-                        || (self.queue.values().any(|waiter| waiter.pid == *pid) && !proc.firing())
-                }
-                Residency::Evicting | Residency::Restoring => false,
-                Residency::Evicted => true,
+            && !self.kill_in_flight()
+            && self.procs.values().all(|proc| {
+                !proc.firing()
+                    && !matches!(proc.state, Residency::Evicting | Residency::Restoring)
             })
+    }
+
+    /// Whether a process other than `head` waits at a bind for room
+    /// ([`super::proc::Proc::bind_waiting`]): read by each process's own
+    /// flag, never by counting the queue's waiter kinds.
+    pub(super) fn bind_waits_behind(&self, head: ProcessId) -> bool {
+        self.procs
+            .iter()
+            .any(|(pid, proc)| *pid != head && proc.bind_waiting)
     }
 
     pub(super) fn fleet_stalled(&self) -> bool {
@@ -491,7 +664,6 @@ impl Inner {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RestoreGate {
     Serve,
-    Wait,
     /// Its role slots are short of `need`, `(run, pieces)` runs of whole
     /// chunks: it goes again where they stand free, and (`fund`) room is
     /// made for it ([`Step::EvictForRoles`](super::plan)).

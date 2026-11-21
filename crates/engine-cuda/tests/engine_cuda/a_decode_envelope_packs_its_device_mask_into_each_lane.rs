@@ -278,6 +278,7 @@ fn bind_on(shell: &mut Shell, beams: u32, device: PortMask, shared: bool) -> eng
             &adopted,
             &ids,
             engine_cuda::program::Slots {
+                resident: engine::ScratchPlace::None,
                 instance: slots.0,
                 rings: slots.1,
                 scratch,

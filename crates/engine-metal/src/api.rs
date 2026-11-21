@@ -446,6 +446,7 @@ impl Engine for Metal {
         if ordinal > 0 {
             return Err(Error::unsupported("metal", "device ordinal selection"));
         }
+        no_host_tier(residency.host_kv_budget)?;
 
         let Checkpoint::Path(path) = checkpoint else {
             return Err(Error::Load(
@@ -624,11 +625,6 @@ impl Engine for Metal {
 
         told_within(&mut budgets, shell.budget());
         shell.mount_adapters(self.boot.adapter_dir.clone());
-        // The device pool already is host memory, so a host tier would only
-        // move kv and rs slots within the same DRAM: one is seated only
-        // where its budget is stated (it frees room in the pool's heap, not
-        // memory), and suspended slots otherwise go straight to disk.
-        shell.seat_tier(residency.host_kv_budget.unwrap_or(0));
         shell
             .seat_disk_kv(
                 residency.disk_kv_budget,
@@ -1659,5 +1655,35 @@ mod told {
         told_within(&mut told, &crate::top::bounded(&baked, asked.max_tokens));
         assert_eq!(told.max_tokens, asked.max_tokens);
         assert_eq!(told.max_lanes, asked.max_lanes);
+    }
+}
+
+/// The device's memory is the host's: a host tier would copy slots within
+/// the same DRAM, freeing nothing physical and only moving them between
+/// budgets. Suspended slots go to disk; a host budget stated for this
+/// device is refused by name, not ignored.
+fn no_host_tier(host_kv_budget: Option<u64>) -> EngineResult<()> {
+    match host_kv_budget.filter(|&budget| budget > 0) {
+        Some(budget) => Err(Error::Load(format!(
+            "budget_host ({budget} bytes) on Metal: the device's memory is the host's, so \
+             there is no host kv tier (a move there would copy within the same memory and \
+             free nothing); suspended state goes to the disk tier (budget_disk). Remove \
+             budget_host from [engine.memory]"
+        ))),
+        None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod no_host_tier_tests {
+    /// A host budget on a device whose memory is the host's is refused by
+    /// name; none stated (or zero) loads.
+    #[test]
+    fn a_host_budget_on_metal_is_refused_by_name() {
+        let refused = super::no_host_tier(Some(8 << 30)).expect_err("refused");
+        let text = refused.to_string();
+        assert!(text.contains("budget_host") && text.contains("the device's memory is the host's"), "{text}");
+        assert!(super::no_host_tier(None).is_ok());
+        assert!(super::no_host_tier(Some(0)).is_ok());
     }
 }

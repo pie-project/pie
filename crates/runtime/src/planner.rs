@@ -36,7 +36,7 @@ mod service_order_tests;
 #[cfg(test)]
 mod starvation_race_tests;
 
-pub use acquire::Acquired;
+pub use acquire::{Acquired, BindRoomWait};
 pub use departure::{Departure, DepartureWatch, follow_restart};
 pub use diagnostics::{PlannerDiagnostics, PlannerQueueEntry};
 pub use error::{PlannerError, StarveCause};
@@ -46,7 +46,7 @@ pub use global::{
 };
 pub use grant::{AllocationGrant, Demand};
 pub use in_flight::FireInFlight;
-pub use pool::{ChunkStats, PoolPort, RegistryPool};
+pub use pool::{ChunkMap, ChunkStats, PoolPort, RegistryPool, RiseRoom};
 pub use residency_planner::ResidencyPlanner;
 pub use short::WeightShed;
 pub use stats::PlannerStats;

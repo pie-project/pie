@@ -273,6 +273,7 @@ fn a_cell_table_reads_each_rows_patch_and_group() {
             .bind(
                 &mut engine,
                 InstanceBinding {
+                    resident: Default::default(),
                     program,
                     channels: vec![channel],
                     seeds: Vec::new(),

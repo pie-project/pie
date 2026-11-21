@@ -269,6 +269,12 @@ fn walk_segments(
                 let _ = engine.evacuate(&evacuation);
                 return Retarget::Reached;
             }
+            Some(SegmentMove::Compact {
+                evacuation, epoch, ..
+            }) => {
+                let _ = engine.evacuate(&evacuation);
+                pool.compaction_copied(epoch, epoch);
+            }
             Some(SegmentMove::Release { prefix }) => {
                 engine.release_segments(prefix).unwrap();
             }

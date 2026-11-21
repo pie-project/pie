@@ -88,6 +88,17 @@ struct RungGate {
     /// `u32::MAX` at the largest and where no pool steers the engine): no
     /// step wider reaches it ([`engine_rows`]).
     held: std::sync::atomic::AtomicU32,
+    /// The widest rung rows of a frame the scheduler holds out under the
+    /// cap ([`owe_cut_rows`]): fires cut under a wider cap before it came
+    /// down, queued and no longer cuttable. Admitted work, not throughput:
+    /// the walk holds the rung to it even while a process's demand waits,
+    /// or the frame waited on a raise nothing asked for, nothing in flight
+    /// to wake it. 0 where none is held.
+    owed: std::sync::atomic::AtomicU32,
+    /// The process whose lane holds that widest frame: the key the walk's
+    /// raise to it is funded under in the planner, short of room
+    /// ([`crate::planner::ResidencyPlanner::fund_rise`]).
+    owed_by: Mutex<Option<uuid::Uuid>>,
     /// The event every wait on the activation rung waits on: the fire cap
     /// moved, a raise was applied, copied or refused, the rung was lowered,
     /// segments were committed, or room was freed (a fire retired).
@@ -118,10 +129,44 @@ fn rung_gate(engine: usize) -> &'static RungGate {
                 cap: std::sync::atomic::AtomicU32::new(u32::MAX),
                 grant: std::sync::atomic::AtomicU32::new(u32::MAX),
                 held: std::sync::atomic::AtomicU32::new(u32::MAX),
+                owed: std::sync::atomic::AtomicU32::new(0),
+                owed_by: Mutex::new(None),
                 event: tokio::sync::Notify::new(),
                 walk: tokio::sync::Notify::new(),
             }))
         })
+}
+
+/// The scheduler of `engine` holds frames out under the cap whose widest
+/// fire takes `rows` rung rows (0: none), in the lane of process `by`:
+/// what the walk raises the rung to as admitted work ([`RungGate::owed`]),
+/// funded short of room under `by`'s key. A change asks the walk to look,
+/// so the raise is triggered by the hold itself, not by a fire that may
+/// never come.
+pub fn owe_cut_rows(engine: usize, rows: u32, by: Option<uuid::Uuid>) {
+    let gate = rung_gate(engine);
+    *gate.owed_by.lock().unwrap() = by.filter(|_| rows > 0);
+    let was = gate
+        .owed
+        .swap(rows, std::sync::atomic::Ordering::AcqRel);
+    if rows > 0 && rows != was {
+        ask_walk(engine);
+    }
+}
+
+/// The process whose held frame the walk's owed raise is for
+/// ([`owe_cut_rows`]); `None` where none is held.
+#[must_use]
+pub fn owed_by(engine: usize) -> Option<uuid::Uuid> {
+    *rung_gate(engine).owed_by.lock().unwrap()
+}
+
+/// See [`owe_cut_rows`].
+#[must_use]
+pub fn owed_cut_rows(engine: usize) -> u32 {
+    rung_gate(engine)
+        .owed
+        .load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Asks `engine`'s walker to look now: what waits on it (a bind whose term
@@ -189,10 +234,24 @@ pub(crate) fn set_engine_rows_for_test(engine: usize, rows: u32) {
 }
 
 fn set_fire_cap(engine: usize, tokens: u32) {
-    rung_gate(engine)
+    let was = rung_gate(engine)
         .cap
-        .store(tokens, std::sync::atomic::Ordering::Release);
+        .swap(tokens, std::sync::atomic::Ordering::AcqRel);
     rung_changed(engine);
+    // A cap risen: the scheduler looks again now, nothing in flight being
+    // sure to wake it, whether or not it has told the frames it holds out
+    // under the cap yet (its report may be on its way).
+    if tokens > was {
+        crate::scheduler::nudge(engine);
+    }
+}
+
+/// Whether `engine`'s fire cap is another than `used`, the one a scheduler
+/// turn sealed under: that turn's holds are planned again under the cap as
+/// it stands.
+#[must_use]
+pub fn cap_moved(engine: usize, used: u32) -> bool {
+    fire_cap(engine) != used
 }
 
 /// The rows a step on `engine` may take: the rung the engine holds
@@ -652,6 +711,9 @@ impl RoleShapes {
 pub struct Tiers {
     pub host: Option<Shared>,
     pub disk_slots: u32,
+    /// The kv list slots a disk chunk holds: a disk chunk is laid out as
+    /// the device's, a role shape's slots in a chunk of their own.
+    pub disk_chunk_slots: u32,
 }
 
 impl Tiers {
@@ -678,7 +740,12 @@ impl Tiers {
                     })?
             }
         };
-        Ok(Self { host, disk_slots })
+        let disk_chunk_slots = list.map_or(0, |list| list.slots_per_chunk);
+        Ok(Self {
+            host,
+            disk_slots,
+            disk_chunk_slots,
+        })
     }
 }
 
@@ -698,6 +765,16 @@ pub enum SegmentMove {
     /// Give back segments `prefix..` (`release_segments(prefix)`), released
     /// in the pool already.
     Release { prefix: u32 },
+    /// Copy `evacuation`, chunk moves that stand a free run for a bind
+    /// waiting on one (`applied` in the pool already, the chunks moved off
+    /// fenced until the fire at `epoch`): [`SharedPool::compaction_copied`]
+    /// once the engine took it, [`SharedPool::compaction_refused`] where it
+    /// refused it.
+    Compact {
+        evacuation: EngineEvacuation,
+        applied: Vec<super::segments::ChunkMove>,
+        epoch: u64,
+    },
     /// Back the top `n` span segments (`commit_span(n)`), where the span is
     /// backed on demand: the rung lends a chunk there no segment backs. The
     /// pool opens their chunks once the engine has, [`SharedPool::span_committed`].
@@ -797,6 +874,10 @@ pub struct SharedPool {
     /// commits while they do not stand free ([`Self::walk_goal`]), not only
     /// while their slot count is short.
     guest_head: Option<(u32, u32)>,
+    /// The runs a bind waiting in the planner asks, `(run, pieces)`, where
+    /// free chunks are enough but no run of them stands
+    /// ([`Self::compaction_comes`]): the walk moves chunks until they do.
+    compact_for: Option<(u32, u32)>,
     /// The governor's segment target the walk steers this pool to, shared
     /// with it ([`target::SharedGrow`]); `None` where no walk steers it.
     walk_target: Option<Arc<std::sync::atomic::AtomicU32>>,
@@ -1052,6 +1133,7 @@ impl SharedPool {
             lowering: None,
             span_commit_blocked: false,
             guest_head: None,
+            compact_for: None,
             walk_target: None,
             programs: programs::ProgramFires::default(),
             engine: None,
@@ -1851,6 +1933,26 @@ impl SharedPool {
         engine_moves(&evacuation.moves)
     }
 
+    /// Where a raise to `rung` stands for the planner
+    /// ([`crate::planner::PoolPort::rise_room`]): past the pool, short of
+    /// the chunks it lacks (its pieces those free now and those to empty),
+    /// or fitting, a raise's copy under way included (nothing to fund).
+    #[must_use]
+    pub fn rise_room(&self, rung: u32) -> crate::planner::RiseRoom {
+        if let Some((need, total)) = self.pool.rung_past(rung) {
+            return crate::planner::RiseRoom::Past { need, total };
+        }
+        if self.copying.is_some() {
+            return crate::planner::RiseRoom::Fits;
+        }
+        match self.pool.rung_short(rung) {
+            0 => crate::planner::RiseRoom::Fits,
+            short => crate::planner::RiseRoom::Short {
+                pieces: self.pool.free_chunk_runs(1).saturating_add(short),
+            },
+        }
+    }
+
     /// The chunks raising the activation to `rung` lacks now, and the kv
     /// pages that many chunks hold: what must be freed before it fits.
     #[must_use]
@@ -1896,8 +1998,10 @@ impl SharedPool {
         None
     }
 
-    /// The pool shape of engine shape `engine`, a state shape's.
-    fn pool_shape(&self, engine: EngineShape) -> Option<ShapeId> {
+    /// The pool shape of engine shape `engine`, a state shape's or a
+    /// role's: the inverse of [`Self::engine_shape`].
+    #[must_use]
+    pub fn pool_shape(&self, engine: EngineShape) -> Option<ShapeId> {
         self.list
             .iter()
             .chain(&self.rs_list)
@@ -1907,6 +2011,7 @@ impl SharedPool {
             .or_else(|| {
                 self.fixed
                     .iter()
+                    .chain(self.roles.iter())
                     .find(|shape| shape.id == engine)
                     .map(|shape| shape.pool)
             })
@@ -2115,11 +2220,15 @@ impl SharedPool {
         if let Some(step) = self.grow_step(target, self.grow_for()) {
             return Some(step.into());
         }
+        if let Some(step) = self.compact_step(epoch) {
+            return Some(step);
+        }
         let mapped = self.mapped_segments();
         if mapped <= target || prefix == 0 {
             return None;
         }
         let last = prefix - 1;
+        let segments = self.pool.segments();
         match segments.state(last) {
             SegmentState::Draining { .. } => Some(match self.pool.release_segment(last) {
                 Ok(()) => SegmentMove::Release { prefix: last },
@@ -2146,6 +2255,61 @@ impl SharedPool {
             }
             SegmentState::Uncommitted => None,
         }
+    }
+
+    /// A compaction for the bind waiting on runs that free chunks would
+    /// stand, if one is due: each step clears one run, the next planned
+    /// once its moves' fence lifts. Over once the runs stand.
+    fn compact_step(&mut self, epoch: u64) -> Option<SegmentMove> {
+        let (run, pieces) = self.compact_for?;
+        if self.pool.free_chunk_runs(run) >= pieces {
+            self.compact_for = None;
+            return None;
+        }
+        let moves = self.pool.plan_compaction(run)?;
+        self.pool
+            .apply_compaction(&moves, epoch)
+            .expect("a compaction planned under the lock applies");
+        Some(SegmentMove::Compact {
+            evacuation: engine_moves(&moves),
+            applied: moves,
+            epoch,
+        })
+    }
+
+    /// Whether moving chunks stands `pieces` free runs of `run` for a bind
+    /// waiting in the planner, where no run stands now: one planned (the
+    /// walk asked to make it), or one on its way. Where it is, the planner
+    /// moves no resident for the bind; where none can (free chunks too few
+    /// whatever moves, or no walk steers the pool), it is no answer, and
+    /// the planner goes on.
+    pub fn compaction_comes(&mut self, run: u32, pieces: u32) -> bool {
+        // No walk steers this pool: nothing would carry a compaction out.
+        if self.walk_target.is_none() || self.pool.free_chunk_runs(run) >= pieces {
+            return false;
+        }
+        if self.compact_for.is_some() && self.pool.compacting() {
+            return true;
+        }
+        if self.pool.plan_compaction(run).is_none() {
+            return false;
+        }
+        self.compact_for = Some((run, pieces));
+        true
+    }
+
+    /// The engine took a compaction's copy (planned to ride the fire at
+    /// `planned`) and waits it out: its chunks' fence lifts once the fires
+    /// handed out by `current` retire, at once on an idle pool.
+    pub fn compaction_copied(&mut self, planned: u64, current: u64) {
+        self.pool.compaction_copied(planned, current);
+    }
+
+    /// The engine refused a compaction before its copy: the pool takes it
+    /// back, and no other is planned for that bind.
+    pub fn compaction_refused(&mut self, moves: &[super::segments::ChunkMove]) {
+        self.pool.undo_compaction(moves);
+        self.compact_for = None;
     }
 
     /// Whom a grow is for now: a live waiter while any is parked short of

@@ -4,7 +4,6 @@ use std::sync::atomic::Ordering;
 use crate::store::kv::page_table::ReclaimQuote;
 
 use super::error::{PlannerError, StarveCause};
-use super::grant::Demand;
 use super::holdings::{held_page_count, held_rs_units};
 use super::proc::Residency;
 use super::wait::{EntryKey, WaitKind};
@@ -116,11 +115,6 @@ impl ResidencyPlanner {
         {
             return;
         }
-        // So does a process whose own pages and parked asks together are
-        // past the pool: a restart asks for the same again.
-        if self.check_overcommit() {
-            return;
-        }
         let Some(victim_key) = self.pick_starvation_victim(cause) else {
             return;
         };
@@ -130,6 +124,20 @@ impl ResidencyPlanner {
             Some(victim) if self.sole_holder(victim) => StarveCause::SoleHolder,
             _ => cause,
         };
+        // The head itself picked, short only of room others hold that no
+        // move frees now (no eligible victim), its need fitting the pool
+        // alone: it waits (the user's ruling: no waiter that fits alone
+        // gives up). The holders' completions, a room change or an arrival
+        // plan again; the stall is named meanwhile (`dump_stall`). Failed
+        // here, a rise that fit was refused once its holders' moves found
+        // nothing to move.
+        let head_fits_alone = self.with_inner(|inner| {
+            let (head_key, head) = inner.unmet_head()?;
+            Some(head_key == victim_key && head.kv_need() <= total)
+        });
+        if cause != StarveCause::SoleHolder && head_fits_alone == Some(true) {
+            return;
+        }
         let (rs_free, rs_total) = self.port.rs_stats();
         let notify = self.with_inner(|inner| {
             let (_, head) = inner.unmet_head()?;
@@ -195,7 +203,10 @@ impl ResidencyPlanner {
     }
 
     /// `pid` holds all that is held in the pool: no other process holds kv
-    /// pages or state, none is on its way back, and no idle cache could go.
+    /// pages or state or guest state on the device
+    /// ([`super::PoolPort::holds_device_room`]: its instances' scratch, its
+    /// parked role slots lying there), none is on its way back, and no idle
+    /// cache could go.
     /// Stalled (nothing of it in flight), it is stuck on what it holds
     /// itself, and a restart frees only that to ask for the same again.
     pub(super) fn sole_holder(&self, pid: ProcessId) -> bool {
@@ -214,6 +225,7 @@ impl ResidencyPlanner {
             && others.into_iter().all(|other| {
                 held_page_count(other, model, engine) == 0
                     && held_rs_units(other, model, engine).is_zero()
+                    && !self.port.holds_device_room(other)
             })
     }
 
@@ -273,113 +285,6 @@ impl ResidencyPlanner {
                     .values()
                     .any(|proc| proc.state == Residency::Restoring)
         })
-    }
-
-    /// [`Self::check_hog`] over a process's concurrent asks, not one: what
-    /// it holds and what all its parked asks want, past the pool, can be met
-    /// by no eviction of others (the pool is short even with them gone, as
-    /// [`PlannerError::PastPool`] is for one ask) and by no restart (it
-    /// replays the same asks into the same wall, forever). On a shared pool
-    /// its state counts in the kv pages its chunks would hold; on pools of
-    /// their own, state is weighed against the state pool. Its parked asks
-    /// fail, naming the numbers. Which of several processes yields where
-    /// one could fit stays the policy's: this fires only where none fits.
-    pub(super) fn check_overcommit(self: &Arc<Self>) -> bool {
-        if self.transfers_in_flight() {
-            return false;
-        }
-        let asking: Vec<(ProcessId, u32, Demand)> = self.with_inner(|inner| {
-            let mut asking: Vec<(ProcessId, u32, Demand)> = Vec::new();
-            for waiter in inner.queue.values() {
-                let WaitKind::Allocation {
-                    demand,
-                    outcome: None,
-                    yielded: false,
-                    rise,
-                    ..
-                } = &waiter.kind
-                else {
-                    continue;
-                };
-                // A rise's pages are given back at once: no ask it holds.
-                if demand.is_zero() || *rise {
-                    continue;
-                }
-                match asking.iter_mut().find(|(pid, ..)| *pid == waiter.pid) {
-                    Some((_, asks, sum)) => {
-                        *asks += 1;
-                        sum.kv_pages = sum.kv_pages.saturating_add(demand.kv_pages);
-                        sum.rs = sum.rs.add(demand.rs);
-                    }
-                    None => asking.push((waiter.pid, 1, *demand)),
-                }
-            }
-            asking
-        });
-        let (model, engine) = self.port.locus();
-        let (_, total) = self.port.device_stats();
-        let (_, rs_total) = self.port.rs_stats();
-        let shared = self.port.room().is_some();
-        let Some((pid, error)) = asking.into_iter().find_map(|(pid, asks, need)| {
-            let held = held_page_count(pid, model, engine);
-            let held_rs = held_rs_units(pid, model, engine);
-            let state = if shared {
-                self.port.rs_as_pages(held_rs.add(need.rs))
-            } else {
-                0
-            };
-            let pages = held.saturating_add(need.kv_pages).saturating_add(state);
-            if pages > total {
-                return Some((
-                    pid,
-                    PlannerError::Overcommit {
-                        asks,
-                        need: need.kv_pages,
-                        held,
-                        state,
-                        total,
-                    },
-                ));
-            }
-            (!shared && !need.rs.is_zero() && !rs_total.covers(held_rs.add(need.rs))).then_some((
-                pid,
-                PlannerError::RsHog {
-                    need: need.rs,
-                    held: held_rs,
-                    total: rs_total,
-                },
-            ))
-        }) else {
-            return false;
-        };
-        let notifies: Vec<_> = self.with_inner(|inner| {
-            inner
-                .queue
-                .values_mut()
-                .filter(|waiter| waiter.pid == pid)
-                .filter_map(|waiter| match &mut waiter.kind {
-                    WaitKind::Allocation {
-                        notify,
-                        outcome: outcome @ None,
-                        yielded: false,
-                        ..
-                    } => {
-                        *outcome = Some(Err(error));
-                        Some(notify.clone())
-                    }
-                    _ => None,
-                })
-                .collect()
-        });
-        if notifies.is_empty() {
-            return false;
-        }
-        self.stats.hog_failures.fetch_add(1, Ordering::Relaxed);
-        tracing::warn!(%pid, %error, "planner: a process's own asks are past the pool — failing them");
-        for notify in notifies {
-            notify.notify_waiters();
-        }
-        true
     }
 
     pub(super) fn check_hog(self: &Arc<Self>, head_key: EntryKey, head_pid: ProcessId) -> bool {

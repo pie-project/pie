@@ -33,6 +33,10 @@ pub struct SharedGrow {
     /// The last raise found no room: none is tried again until room is
     /// freed ([`Self::room_freed`]), the one event that can change that.
     raise_blocked: Arc<AtomicBool>,
+    /// A raise to the frames the scheduler holds out under the cap
+    /// ([`super::owed_cut_rows`]) short of room is being funded in the
+    /// planner ([`Self::fund_owed`]): one at a time.
+    funding: Arc<AtomicBool>,
     /// The planner waits on a grow this walk was told to make
     /// ([`Self::promise_grow`]): a walk that ends with the promise standing
     /// tells it no grow is coming ([`Self::no_grow`]).
@@ -86,6 +90,7 @@ impl SharedGrow {
                 u32::try_from(live).unwrap_or(u32::MAX)
             }),
             raise_blocked: Arc::new(AtomicBool::new(false)),
+            funding: Arc::new(AtomicBool::new(false)),
             grow_waiter: Arc::new(AtomicBool::new(false)),
             no_grow: Arc::new(move || {
                 if let Some(planner) = crate::planner::planner_for(model, engine) {
@@ -152,7 +157,9 @@ impl SharedGrow {
     /// where nothing moves. Not the engine's whole lane count: a pool with
     /// one live lane rests at a small rung.
     fn walk_rows(&self) -> u32 {
-        super::wanted_rows(self.engine).max((self.live_lanes)())
+        super::wanted_rows(self.engine)
+            .max((self.live_lanes)())
+            .max(super::owed_cut_rows(self.engine))
     }
 
     /// The rows the walk holds the rung to while a process's demand waits
@@ -160,7 +167,9 @@ impl SharedGrow {
     /// admitted work needs; a throughput ask (a cuttable pass's) waits
     /// behind every process demand.
     fn waiting_rows(&self) -> u32 {
-        (self.live_lanes)().max(1)
+        (self.live_lanes)()
+            .max(1)
+            .max(super::owed_cut_rows(self.engine))
     }
 
     pub(crate) async fn walk_rung(&self) {
@@ -238,11 +247,14 @@ impl SharedGrow {
                     }
                     Err(_) if blocked => Ok(RungStep::Wait),
                     // No throughput raise past what is set aside while a
-                    // process's demand waits.
+                    // process's demand waits; a raise to the frames held
+                    // out under the cap is admitted work, and goes.
                     Ok(RungStep::Raise { ref evacuation, .. })
                         if waits
                             && pool.pool().act_chunks(evacuation.rung)
-                                > pool.pool().act_reserved() =>
+                                > pool.pool().act_reserved()
+                            && pool.rung_for(super::owed_cut_rows(self.engine))
+                                < evacuation.rung =>
                     {
                         Ok(RungStep::Wait)
                     }
@@ -272,21 +284,30 @@ impl SharedGrow {
                 Ok(step) => step,
                 Err(error) => {
                     // The pass asking funds the room as a planner waiter
-                    // (`pipeline::fire`'s raise funding); the walk tries
+                    // (`pipeline::fire`'s raise funding); frames held out
+                    // under the cap have no pass asking, and the walk
+                    // funds their raise itself (`fund_owed`). It tries
                     // again once room is freed, not on its next wake.
                     self.raise_blocked.store(true, Ordering::Release);
                     tracing::debug!(engine = self.engine, %error, goal, "the activation rung waits");
+                    self.fund_owed();
                     return;
                 }
             };
 
             match step {
                 RungStep::Wait => {
+                    self.lift_to_owed();
                     // A lower waits on the scheduler's grant, which it
                     // publishes each turn: an idle scheduler takes none
                     // until woken.
                     if super::rung_granted(self.engine) > super::fire_cap(self.engine) {
                         crate::scheduler::nudge(self.engine);
+                    }
+                    // A raise to held frames waiting for room is funded,
+                    // never left to a room freed nothing is making.
+                    if self.raise_blocked.load(Ordering::Acquire) {
+                        self.fund_owed();
                     }
                     return;
                 }
@@ -370,10 +391,7 @@ impl SharedGrow {
                     // the raise moves; refused, the raise is taken back,
                     // fires stay cut to the rung in hand, and no raise is
                     // tried again until room is freed.
-                    let mover = super::programs::LaneMover {
-                        engine: self.engine,
-                        epoch_now: || self.epochs().0,
-                    };
+                    let mover = WalkMover(self);
                     if let Err(refused) =
                         super::programs::carry_raise(&self.shared, &evacuation, owed.0, &mover)
                             .await
@@ -381,10 +399,124 @@ impl SharedGrow {
                         tracing::debug!(engine = self.engine, %refused, "the walk's raise waits for room");
                         self.raise_blocked.store(true, Ordering::Release);
                         super::rung_changed(self.engine);
+                        // Taken back, the room it set aside is free again:
+                        // the planner quotes its head now.
+                        if let Some(planner) = crate::planner::planner_for(self.model, self.engine) {
+                            planner.pages_freed();
+                        }
                         return;
                     }
                     super::raise_said(self.engine, rung, evacuation.moves.len(), owed.1);
                     super::rung_changed(self.engine);
+                }
+            }
+        }
+    }
+
+    /// Lifts the fire cap to the frames the scheduler holds out under it
+    /// ([`super::owed_cut_rows`]) where the rung the engine holds covers
+    /// them now (a raise taken, by the walk or by a pass's or a bind's
+    /// funding): they seal at once. A cap under them with their rung held
+    /// waited on a wake nothing sent, nothing in flight (the soak's stall:
+    /// raised to 512, the cap left at 128). None while a raise's copy or a
+    /// lower's notice is under way.
+    fn lift_to_owed(&self) {
+        let owed = super::owed_cut_rows(self.engine);
+        if owed == 0 {
+            return;
+        }
+        let pool = self.shared.lock().unwrap();
+        if pool.copying().is_some() || pool.lowering() {
+            return;
+        }
+        let rung = pool.rung_for(owed);
+        if pool.raise_owed(rung) {
+            return;
+        }
+        let cap = pool.lifted(rung).min(pool.fit_cap());
+        if cap > super::fire_cap(self.engine) {
+            super::set_fire_cap(self.engine, cap);
+            tracing::debug!(engine = self.engine, cap, owed, "fires lifted to the frames held out");
+        }
+    }
+
+    /// Funds the raise to the frames the scheduler holds out under the cap
+    /// ([`super::owed_cut_rows`]) where it is short of room: admitted work
+    /// no pass asks for, so no pass funds it. Its room is asked of the
+    /// planner as a head keyed by the process whose frame it is
+    /// ([`crate::planner::ResidencyPlanner::fund_rise`]), funded exactly
+    /// as a bind's room, and once there the raise is taken with the queue
+    /// held behind it; the walk then lifts the cap (room freed wakes it).
+    /// One funding at a time; none where nothing is owed or no planner
+    /// steers the engine.
+    fn fund_owed(&self) {
+        if super::owed_cut_rows(self.engine) == 0 || super::owed_by(self.engine).is_none() {
+            return;
+        }
+        let Some(planner) = crate::planner::planner_for(self.model, self.engine) else {
+            return;
+        };
+        if self.funding.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let grow = self.clone();
+        crate::rt::spawn(async move {
+            grow.fund_owed_with(&planner).await;
+            grow.funding.store(false, Ordering::Release);
+        });
+    }
+
+    /// [`Self::fund_owed`]'s funding through `planner`, until the owed raise
+    /// is taken, nothing is owed, or the planner refuses it by name.
+    pub(crate) async fn fund_owed_with(&self, planner: &Arc<crate::planner::ResidencyPlanner>) {
+        let engine = self.engine;
+        loop {
+            let rows = super::owed_cut_rows(engine);
+            let Some(owner) = super::owed_by(engine).filter(|_| rows > 0) else {
+                return;
+            };
+            let rung = {
+                let pool = self.shared.lock().unwrap();
+                let Some(at) = pool.raise_at(pool.rung_for(rows)) else {
+                    // The engine comes down first: the walk's.
+                    drop(pool);
+                    super::ask_walk(engine);
+                    return;
+                };
+                if !pool.raise_owed(at) || pool.copying().is_some() {
+                    // Raised, or being raised: the walk lifts the cap.
+                    drop(pool);
+                    self.room_freed();
+                    return;
+                }
+                at
+            };
+            tracing::debug!(engine, rung, %owner, "a raise to held frames asks the planner for room");
+            let mover = WalkMover(self);
+            let taken = planner
+                .fund_rise(owner, rung, || {
+                    super::programs::take_raise(&self.shared, move |_| rung, &mover)
+                })
+                .await;
+            match taken {
+                // Taken: the walk lifts the cap to it.
+                Ok(Some(Ok(Some(_)))) => {
+                    self.room_freed();
+                    return;
+                }
+                // Short again (the pool moved since), or nothing left to
+                // raise: asked again as it stands.
+                Ok(Some(Ok(None))) => {}
+                Ok(Some(Err(refused))) => {
+                    tracing::warn!(engine, rung, %refused, "the engine refused a raise to held frames");
+                    return;
+                }
+                // Its process is being evicted: its frames go with it, and
+                // room freed brings the walk back.
+                Ok(None) => return,
+                Err(error) => {
+                    tracing::warn!(engine, rung, %owner, %error, "a raise to held frames is refused");
+                    return;
                 }
             }
         }
@@ -556,6 +688,7 @@ impl SharedGrow {
             let goal = self.goal();
             let (current, retired) = self.epochs();
             let mut evacuating = None;
+            let mut compacting = None;
             let step = {
                 let mut pool = self.shared.lock().unwrap();
                 pool.pool_mut().retire_through(retired);
@@ -583,6 +716,14 @@ impl SharedGrow {
                     applied,
                 }) => {
                     evacuating = Some(applied);
+                    PoolOp::Evacuate(evacuation)
+                }
+                Some(SegmentMove::Compact {
+                    evacuation,
+                    applied,
+                    epoch,
+                }) => {
+                    compacting = Some((applied, epoch));
                     PoolOp::Evacuate(evacuation)
                 }
                 Some(SegmentMove::Release { prefix }) => PoolOp::ReleaseSegments(prefix),
@@ -641,6 +782,15 @@ impl SharedGrow {
                         self.shared.lock().unwrap().evacuation_refused(applied);
                         self.no_room.store(true, Ordering::Release);
                     }
+                    // A refused compaction copied nothing either: the bind
+                    // it was for is funded as before, by the planner.
+                    if let Some((applied, _)) = &compacting {
+                        self.shared.lock().unwrap().compaction_refused(applied);
+                        if let Some(planner) = crate::planner::planner_for(self.model, self.engine)
+                        {
+                            planner.pages_freed();
+                        }
+                    }
                     return;
                 }
             }
@@ -650,6 +800,14 @@ impl SharedGrow {
                 // fires handed out by now retire, at once on an idle pool.
                 let (current, _) = self.epochs();
                 self.shared.lock().unwrap().evacuated(current);
+            }
+            if let Some((_, planned)) = compacting {
+                // The engine took the copy on its stream ahead of every
+                // later fire: the chunks moved off open once the fires
+                // handed out by now retire (the loop's next step reads
+                // that), and the run they clear is room given back.
+                let (current, _) = self.epochs();
+                self.shared.lock().unwrap().compaction_copied(planned, current);
             }
         }
     }
@@ -728,6 +886,32 @@ impl PoolTarget for SharedGrow {
     /// A governor tick: the walk looks again.
     fn ticked(&mut self) {
         self.wake.notify_one();
+    }
+}
+
+/// The engine's side of the walk's raise: its own lane (the scheduler's,
+/// or a test's engine), and its stores' fire epoch.
+struct WalkMover<'a>(&'a SharedGrow);
+
+impl super::programs::Mover for WalkMover<'_> {
+    fn engine(&self) -> usize {
+        self.0.engine
+    }
+
+    async fn evacuate(&self, evacuation: ::engine::chunk::Evacuation) -> Result<(), String> {
+        (self.0.lane)(self.0.engine, PoolOp::Evacuate(evacuation))
+            .await
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    async fn set_rung(&self, from: u32, to: u32) -> Result<(), String> {
+        (self.0.lane)(self.0.engine, PoolOp::Rung { from, to })
+            .await
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn epoch_now(&self) -> u64 {
+        self.0.epochs().0
     }
 }
 
@@ -1118,6 +1302,109 @@ mod tests {
         assert_eq!(answers.last(), Some(&Retarget::Reached), "{answers:?}");
         assert_eq!(grow.held(), least);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The soak's stall: the walk lowered the rung 512 -> 128 under
+    /// prompts cut at 512 (the scheduler holds them out, owed), then a
+    /// process demand waits for room and nothing is in flight. The walk
+    /// raises the rung back to what is owed (512, nothing moved) and the
+    /// fire cap rises with it in the same walk: the held frame seals at
+    /// once under the new cap, never on a later wake that does not come.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_raise_back_to_frames_held_under_a_lowered_cap_lifts_the_cap_at_once() {
+        for (at, on_demand) in [false, true].into_iter().enumerate() {
+            for waits in [false, true] {
+                let engine = 9300 + at * 2 + usize::from(waits);
+                let mut facts = super::super::tests::facts();
+                facts.act_chunks = vec![(16, 1), (128, 2), (512, 6), (2048, 12)];
+                facts.span_backed_on_demand = on_demand;
+                let mut pool = super::super::SharedPool::new(&facts, 256).unwrap();
+                let evacuation = pool.plan_raise(512).unwrap();
+                pool.raise_applied(&evacuation).unwrap();
+                pool.raise_copied(0);
+                // The walk lowered it to 128 under the prompts held out.
+                pool.lower_rung(128).unwrap();
+                if waits {
+                    pool.set_guest_head(Some((1, 1)));
+                }
+                let shared: Shared = Arc::new(std::sync::Mutex::new(pool));
+                let told = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let seen = told.clone();
+                let grow = SharedGrow::new(0, engine, shared.clone())
+                    .with_live_lanes(|| 1)
+                    .with_lane(move |op| {
+                        seen.lock().unwrap().push(format!("{op:?}"));
+                        Ok(())
+                    });
+                super::super::set_fire_cap_for_test(engine, 128);
+                super::super::grant_rung(engine, 128);
+                // The scheduler holds prompts cut at 512 out, owed.
+                super::super::owe_cut_rows(engine, 512, None);
+                grow.walk_rung().await;
+                let rung = shared.lock().unwrap().rung();
+                assert_eq!(rung, 512, "on_demand={on_demand} waits={waits}: raised to the owed");
+                assert!(
+                    super::super::fire_cap(engine) >= 512,
+                    "on_demand={on_demand} waits={waits}: the cap rises with the raise, \
+                     now {} (told {:?})",
+                    super::super::fire_cap(engine),
+                    told.lock().unwrap()
+                );
+                assert!(super::super::engine_rows(engine) >= 512, "the engine holds it");
+                super::super::owe_cut_rows(engine, 0, None);
+            }
+        }
+    }
+
+    /// The same stall with the rung raised back outside the walk (a pass's
+    /// or a bind's funding takes the raise, `take_raise`, and lifts no cap
+    /// to the frames held out): the raise asks the walk to look, and the
+    /// walk lifts the cap to what is owed at once, nothing in flight.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_raise_taken_outside_the_walk_lifts_the_cap_to_frames_held_out() {
+        for (at, on_demand) in [false, true].into_iter().enumerate() {
+            for waits in [false, true] {
+                let engine = 9310 + at * 2 + usize::from(waits);
+                let mut facts = super::super::tests::facts();
+                facts.act_chunks = vec![(16, 1), (128, 2), (512, 6), (2048, 12)];
+                facts.span_backed_on_demand = on_demand;
+                let mut pool = super::super::SharedPool::new(&facts, 256).unwrap();
+                let evacuation = pool.plan_raise(512).unwrap();
+                pool.raise_applied(&evacuation).unwrap();
+                pool.raise_copied(0);
+                pool.lower_rung(128).unwrap();
+                if waits {
+                    pool.set_guest_head(Some((1, 1)));
+                }
+                let shared: Shared = Arc::new(std::sync::Mutex::new(pool));
+                let grow = SharedGrow::new(0, engine, shared.clone())
+                    .with_live_lanes(|| 1)
+                    .with_lane(|_| Ok(()));
+                super::super::set_fire_cap_for_test(engine, 128);
+                super::super::grant_rung(engine, 128);
+                super::super::owe_cut_rows(engine, 512, None);
+                // Drain the ask the hold itself made.
+                let _ = futures::FutureExt::now_or_never(super::super::walk_asked(engine));
+                let taken =
+                    super::super::programs::take_raise(&shared, |_| 512, &WalkMover(&grow))
+                        .await
+                        .expect("taken");
+                assert!(taken.is_some(), "raised outside the walk");
+                assert_eq!(super::super::fire_cap(engine), 128, "no cap lifted by it");
+                assert!(
+                    futures::FutureExt::now_or_never(super::super::walk_asked(engine)).is_some(),
+                    "on_demand={on_demand} waits={waits}: the raise asks the walk to look"
+                );
+                grow.walk_rung().await;
+                assert!(
+                    super::super::fire_cap(engine) >= 512,
+                    "on_demand={on_demand} waits={waits}: the walk lifts the cap to the held \
+                     frames, now {}",
+                    super::super::fire_cap(engine)
+                );
+                super::super::owe_cut_rows(engine, 0, None);
+            }
+        }
     }
 
     /// The walk runs on its wakes only: an ask made while it sleeps waits

@@ -995,6 +995,7 @@ mod tests {
             .expect("the channel registers");
         let instance = plane
             .bind(&InstanceBinding {
+                resident: Default::default(),
                 program,
                 channels: vec![ChannelId(1)],
                 seeds: Vec::new(),

@@ -32,19 +32,40 @@ pub(super) enum WaitKind {
     /// first, then a resident parked by the planner's victim choice;
     /// `served` once the pool holds the runs free, the bind to take them.
     /// `pages`: the kv pages that, moved out whole, free its chunks.
+    /// `withdrawn` once an eviction of its own process began
+    /// ([`super::inner::Inner::begin_eviction`]): the room it waits for is
+    /// asked again after its restore, and nothing is funded for it
+    /// meanwhile.
     BindRoom {
         run: u32,
         pieces: u32,
         pages: u32,
         notify: Arc<Notify>,
         served: bool,
+        withdrawn: bool,
+        /// A rung raise short of room, its rung's tokens
+        /// ([`super::ResidencyPlanner::fund_rise`]): served once the raise
+        /// fits ([`super::PoolPort::rise_room`]), `pieces` (of a run of
+        /// one) the free chunks it takes, kept current by each plan, so
+        /// its victims are picked by the chunk map as a bind's are. Once
+        /// served it holds the queue until the raise is taken (its waiter
+        /// leaves): no head behind it is served into the room it was
+        /// funded.
+        rise: Option<u32>,
     },
 }
 
 pub(super) struct Waiter {
     pub(super) pid: ProcessId,
     pub(super) kind: WaitKind,
+    /// When it was queued: a wait past [`LONG_WAIT`] is said with what
+    /// woke the pass that served it.
+    pub(super) since: crate::rt::Instant,
 }
+
+/// A wait long enough that what finally served it is said: a field's gaps
+/// between dispatches past it were what one serve waited on.
+pub(super) const LONG_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
 
 impl Waiter {
     pub(super) fn is_unmet(&self) -> bool {
@@ -53,12 +74,28 @@ impl Waiter {
                 outcome, yielded, ..
             } => outcome.is_none() && !yielded,
             WaitKind::Restore { .. } => true,
-            WaitKind::BindRoom { served, .. } => !served,
+            WaitKind::BindRoom {
+                served, withdrawn, ..
+            } => !served && !withdrawn,
         }
     }
 
     /// The pages its own room stands for, beside its kv (a bind's runs of
     /// chunks, [`WaitKind::BindRoom`]).
+    /// A rung raise served and not yet taken: it holds the queue
+    /// ([`WaitKind::BindRoom::rise`]).
+    pub(super) fn rise_untaken(&self) -> bool {
+        matches!(
+            self.kind,
+            WaitKind::BindRoom {
+                rise: Some(_),
+                served: true,
+                withdrawn: false,
+                ..
+            }
+        )
+    }
+
     pub(super) fn room_pages(&self) -> u32 {
         match &self.kind {
             WaitKind::BindRoom { pages, .. } => *pages,
@@ -84,6 +121,7 @@ impl Waiter {
         match self.kind {
             WaitKind::Allocation { .. } => "allocation",
             WaitKind::Restore { .. } => "restore",
+            WaitKind::BindRoom { rise: Some(_), .. } => "rise room",
             WaitKind::BindRoom { .. } => "bind room",
         }
     }

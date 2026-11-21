@@ -2,6 +2,14 @@ use std::sync::atomic::AtomicU64;
 
 #[derive(Debug, Default)]
 pub struct PlannerStats {
+    /// Plan passes run (`ResidencyPlanner::plan`).
+    pub plan_passes: AtomicU64,
+    /// Fires landed: state settled, so a victim whose move found nothing
+    /// (its state still settling) may find something now.
+    pub fires_landed: AtomicU64,
+    /// Waits served past 100 ms, by what woke the pass that served them:
+    /// the room signal, a poke, the beat, a call.
+    pub long_waits: [AtomicU64; 4],
     pub parks: AtomicU64,
     pub serves: AtomicU64,
     pub evictions_started: AtomicU64,
@@ -19,6 +27,9 @@ pub struct PlannerStats {
     pub restore_failures: AtomicU64,
     /// Restores queued again for want of device room for their role slots.
     pub restore_roles_short: AtomicU64,
+    /// Role slots out of service for good: taken by moves whose copies an
+    /// engine could not settle ([`crate::store::roles::Roles::abandon`]).
+    pub leaked_role_slots: AtomicU64,
     pub gate_parks: AtomicU64,
     pub hog_failures: AtomicU64,
     pub starvations: AtomicU64,
@@ -28,9 +39,15 @@ pub struct PlannerStats {
     pub restore_absorb_short: AtomicU64,
     /// Plans that ended waiting on a grow the segment walk was promised.
     pub grow_waits: AtomicU64,
+    /// Plans that ended waiting on a compaction of scattered free chunks.
+    pub compaction_waits: AtomicU64,
     /// The unmet waiters behind the last plan's wait on a grow; 0 where it
     /// did not end on one.
     pub grow_parked: AtomicU64,
+    /// Plans that ended with the queue's head unserved and nothing in
+    /// flight to wake them, each named once per head and room change
+    /// ([`super::ResidencyPlanner::dump_stall`]).
+    pub stall_dumps: AtomicU64,
     /// Walks that ended without the grow they promised
     /// ([`super::ResidencyPlanner::no_grow`]).
     pub no_grows: AtomicU64,

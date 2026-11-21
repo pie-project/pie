@@ -71,6 +71,27 @@ pub(crate) fn notify_owner_waits(engine: usize, pid: ProcessId) {
     }
 }
 
+/// `pid` is blocked on the planner or a store (a grant, its restore, room
+/// for a bind, a segment, a fire span, a rung): until it is through it
+/// submits nothing, so no frame on any engine waits on its lanes, and its
+/// complete frames go at once ([`super::frame::FramePolicy::on_owner_waits`]).
+/// Its next submit brings its lanes back.
+pub(crate) fn notify_owner_blocked(pid: ProcessId) {
+    #[cfg(test)]
+    OWNERS_BLOCKED.lock().unwrap().push(pid);
+    broadcast(|| SchedulerItem::OwnerWaits(pid));
+}
+
+/// `pid`'s wait on the planner or a store ended (told before control goes
+/// back to its guest): its fires are awaited at boundaries again.
+pub(crate) fn notify_owner_unblocked(pid: ProcessId) {
+    broadcast(|| SchedulerItem::OwnerUnblocked(pid));
+}
+
+/// The owners told blocked, in order; for a test.
+#[cfg(test)]
+pub(crate) static OWNERS_BLOCKED: std::sync::Mutex<Vec<ProcessId>> = std::sync::Mutex::new(Vec::new());
+
 pub(crate) fn notify_process_resume(pid: ProcessId) {
     broadcast(|| SchedulerItem::ProcessResume(pid));
 }
@@ -295,6 +316,8 @@ enum SchedulerItem {
     /// raise of the activation rung): its lanes go out of the frame
     /// ([`super::frame::FramePolicy::on_owner_waits`]).
     OwnerWaits(ProcessId),
+    /// The owner's wait on the planner or a store ended.
+    OwnerUnblocked(ProcessId),
     FrameTruncate {
         lane: ProcessId,
         seq: u64,
@@ -1342,8 +1365,12 @@ impl SchedulerHandle {
                 planner.set_bind_waiting(pid, waits);
             }
         };
+        // Before it waits, what its process has in flight lands and gives
+        // its leases back: nothing else finalizes it while its guest is in
+        // this bind.
+        let settle = move || crate::pipeline::fire::settle_process_fires(pid);
         let (registered, _, bound) = crate::store::roles::bind_when_resident(
-            pid, lane_bind, resident, grown, room, fits, suspend, planned, leave, waiting,
+            pid, lane_bind, resident, grown, room, fits, suspend, planned, leave, waiting, settle,
         )
         .await?;
         Ok((registered, bound))
@@ -1586,6 +1613,20 @@ impl BatchScheduler {
                 &mut slot_buffer,
                 stopping,
             );
+            // Frames held out under the cap are owed a raise: the cap's
+            // owner is told, its walk raising the rung to them (a hold with
+            // nothing in flight waited on a raise nothing asked for).
+            let (owed, owed_by) = frame_policy.cut_owed_by();
+            crate::store::shared::owe_cut_rows(
+                engine_id,
+                u32::try_from(owed).unwrap_or(u32::MAX),
+                owed_by,
+            );
+            // The cap this turn sealed under is read again after the hold
+            // is told: a cap the walk moved meanwhile (raised back before
+            // the report it would have nudged on) is the next turn's at
+            // once, never a cached value the scheduler parks on.
+            progress |= crate::store::shared::cap_moved(engine_id, cap);
             progress |= dispatched;
             if stopping
                 && pending.is_empty()
@@ -2058,6 +2099,9 @@ impl BatchScheduler {
             }
             SchedulerItem::OwnerWaits(pid) => {
                 frame_policy.on_owner_waits(pid);
+            }
+            SchedulerItem::OwnerUnblocked(pid) => {
+                frame_policy.on_owner_unblocked(pid);
             }
             SchedulerItem::FrameTruncate {
                 lane,
@@ -3039,6 +3083,11 @@ impl BatchScheduler {
                     },
             } => {
                 frame_policy.on_bind_completed(pipeline_id);
+                // Bound: whatever wait its refusals marked it blocked for
+                // has ended.
+                if let Some(pid) = pipeline_id {
+                    frame_policy.on_owner_unblocked(pid);
+                }
                 if instances.contains_key(&bound.instance_id) {
                     tracing::error!(
                         instance_id = bound.instance_id.0,

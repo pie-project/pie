@@ -342,9 +342,10 @@ pub fn flight_lanes(members: u32) -> u32 {
 pub struct PairRoom {
     /// What a flight of the pair lays.
     pub flight: FireBytes,
-    /// A beam group's resident state (BEAM-PAGE-LISTS §4), past the lane's
-    /// scratch in the instance's: laid for the bind's depth, its offset
-    /// from the scratch's first aligned byte.
+    /// A beam group's state (BEAM-PAGE-LISTS §4), laid for the bind's
+    /// depth in the instance's resident run (`engine::GuestState::resident`,
+    /// live from the bind to the close): its offset from the run's first
+    /// aligned byte.
     pub beam: Option<launch::BeamLayout>,
     /// The lanes the tables are laid for: a flight's most, no more than a
     /// fire carries.
@@ -365,11 +366,19 @@ impl PairRoom {
     /// byte may take.
     #[must_use]
     pub fn instance_bytes(&self) -> u64 {
-        let scratch = launch::lane_scratch(self.flight.scratch);
-        launch::SPAN_ALIGN
-            + self.beam.map_or(scratch, |beam| {
-                beam.at + kernels_cuda::runtime::channel::beam_state_words(beam.lanes, beam.cap, beam.frames) * 4
-            })
+        launch::SPAN_ALIGN + launch::lane_scratch(self.flight.scratch)
+    }
+
+    /// An instance's resident bytes, what a later fire reads (a beam
+    /// group's state), and the alignment its first byte may take: none
+    /// where it keeps nothing past a fire.
+    #[must_use]
+    pub fn resident_bytes(&self) -> u64 {
+        self.beam.map_or(0, |beam| {
+            launch::SPAN_ALIGN
+                + beam.at
+                + kernels_cuda::runtime::channel::beam_state_words(beam.lanes, beam.cap, beam.frames) * 4
+        })
     }
 
     /// Where the wave's tables lie in a pair's state at `base`.
@@ -471,7 +480,7 @@ impl Plane {
     pub fn beam_state(&self, id: InstanceId) -> Option<(u64, super::program::launch::BeamLayout)> {
         let bound = self.instances.get(&id)?;
         let layout = bound.session.beam()?;
-        Some((bound.scratch + layout.at, layout))
+        Some((bound.resident + layout.at, layout))
     }
 
     /// Where instance `id`'s capturing lane's rows lie now, its key row
@@ -553,7 +562,7 @@ impl Plane {
                     .saturating_add(lanes.saturating_mul(frames + 1))
                     .saturating_add(1);
                 Some(launch::BeamLayout {
-                    at: launch::lane_scratch(flight.scratch).next_multiple_of(launch::BEAM_ALIGN),
+                    at: 0,
                     lanes,
                     cap,
                     frames,
@@ -569,11 +578,11 @@ impl Plane {
         })
     }
 
-    /// What [`Plane::pair_room`] holds: each instance's bytes and the
-    /// pair's.
-    pub fn state_bytes(&self, program_id: ProgramId, extents: Extents) -> Result<(u64, u64)> {
+    /// What [`Plane::pair_room`] holds: each instance's scratch, its
+    /// resident bytes and the pair's.
+    pub fn state_bytes(&self, program_id: ProgramId, extents: Extents) -> Result<(u64, u64, u64)> {
         self.pair_room(program_id, extents)
-            .map(|room| (room.instance_bytes(), room.bytes()))
+            .map(|room| (room.instance_bytes(), room.resident_bytes(), room.bytes()))
     }
 
     pub fn set_shadow(&mut self, shadow: bool) {
@@ -742,6 +751,16 @@ impl Plane {
         // A new taking of the pair's slots is another owner's bytes until
         // cleared, as the instance's own scratch always is at a bind.
         let mut clears = vec![(&slots.scratch, scratch_piece, room.instance_bytes())];
+        // Its resident run is fresh slots at the bind, another owner's bytes
+        // until cleared; a rebind moves it with its bytes and clears nothing.
+        let resident = match room.resident_bytes() {
+            0 => 0,
+            bytes => {
+                let piece = piece_at(&slots.resident, bytes, span)?;
+                clears.push((&slots.resident, piece, bytes));
+                piece.next_multiple_of(launch::SPAN_ALIGN)
+            }
+        };
         if batch.bound == 0
             || batch.pair != slots.pair
             || batch.generation != slots.pair_generation
@@ -779,9 +798,9 @@ impl Plane {
             }
         };
         session.resolve_on(&program.plan, geometry, device, buffers_rs);
-        // A beam group's state lies in the instance's scratch, laid for this
-        // bind's depth and cleared with it above: it stands from the bind to
-        // the search's finish.
+        // A beam group's state lies in the instance's resident run, laid for
+        // this bind's depth and cleared above: the runtime moves it with its
+        // bytes, so it stands from the bind to the search's finish.
         session.set_beam(room.beam);
         self.programs
             .get_mut(&program_id)
@@ -801,6 +820,7 @@ impl Plane {
                 slots,
                 scores,
                 scratch,
+                resident,
             },
         );
         Ok(id)
@@ -828,6 +848,11 @@ impl Plane {
             let room = program.bound_room(bound.session.extents())?;
             bound.scratch = piece_at(&bound.slots.scratch, room.instance_bytes(), span)?
                 .next_multiple_of(launch::SPAN_ALIGN);
+            bound.resident = match room.resident_bytes() {
+                0 => 0,
+                bytes => piece_at(&bound.slots.resident, bytes, span)?
+                    .next_multiple_of(launch::SPAN_ALIGN),
+            };
         }
         for program in self.programs.values_mut() {
             for batch in program.batches.iter_mut().filter(|batch| batch.bound > 0) {
@@ -868,6 +893,12 @@ impl Plane {
         let room = program.bound_room(extents)?;
         let scratch_piece = piece_at(&slots.scratch, room.instance_bytes(), span)?;
         let scratch = scratch_piece.next_multiple_of(launch::SPAN_ALIGN);
+        // Its resident run where the runtime copied it, its bytes with it:
+        // nothing cleared.
+        let resident = match room.resident_bytes() {
+            0 => 0,
+            bytes => piece_at(&slots.resident, bytes, span)?.next_multiple_of(launch::SPAN_ALIGN),
+        };
         // The pair's state where the rebind names it: fresh room, whether
         // or not where it lay before, since what another item wrote there
         // meanwhile is staged over.
@@ -897,6 +928,7 @@ impl Plane {
         }
         bound.scores = scores;
         bound.scratch = scratch;
+        bound.resident = resident;
         bound.slots = slots;
         let pair = bound.slots.pair.clone();
         let generation = bound.slots.pair_generation;
@@ -1484,6 +1516,9 @@ struct Bound {
     /// Where its lane's value scratch lies now
     /// (`engine::InstanceBinding::scratch`, [`PairRoom::instance_bytes`]).
     scratch: u64,
+    /// Where its resident run lies now (`engine::InstanceBinding::resident`,
+    /// [`PairRoom::resident_bytes`]): 0 where it keeps none.
+    resident: u64,
 }
 
 /// Where a guest item lies in the pool, as a binding names it.
@@ -1507,6 +1542,8 @@ pub struct Slots {
     pub rings: Vec<engine::program::RingSlots>,
     /// Where its lane's scratch lies (`engine::InstanceBinding::scratch`).
     pub scratch: engine::ScratchPlace,
+    /// Where its resident state lies (`engine::InstanceBinding::resident`).
+    pub resident: engine::ScratchPlace,
     /// Where its pair's state lies (`engine::InstanceBinding::pair`).
     pub pair: engine::ScratchPlace,
     /// Which taking of those slots (`engine::InstanceBinding::pair_generation`).

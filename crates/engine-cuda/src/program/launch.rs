@@ -327,10 +327,6 @@ pub struct BeamLayout {
 /// What every cell span in an item starts a whole number of.
 const CELL_ALIGN: u64 = 64;
 
-/// Where a beam group's state starts past the lane's scratch, a whole
-/// number of (BEAM-PAGE-LISTS §4).
-pub const BEAM_ALIGN: u64 = CELL_ALIGN;
-
 impl Held {
     #[must_use]
     pub fn of(channels: &[eta_compiler::codegen::launch::LaunchChannel]) -> Held {
