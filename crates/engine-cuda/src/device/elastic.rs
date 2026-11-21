@@ -578,6 +578,10 @@ impl Arena {
                 ))
             })?;
             self.base = base as u64;
+            // `unwritten-nan`: nothing has written any of it yet.
+            if crate::serve::diag::on().unwritten_nan {
+                crate::device::fill_span(self.base, self.virtual_bytes as usize, 0xFF)?;
+            }
             self.units.fill(Some(FLAT));
             self.mapped = self.units.len() as u64;
             self.high_water = self.high_water.max(self.committed_bytes());
@@ -1206,7 +1210,8 @@ impl Range {
             self.segment_high = self.segment_high.max(self.segment_bytes_committed());
             // `unwritten-nan`: what the segments back anew holds NaN until a
             // kernel writes it.
-            if crate::serve::diag::on().unwritten_nan {
+            // (A flat range's one allocation is filled whole as it is made.)
+            if crate::serve::diag::on().unwritten_nan && mapped_on_demand() {
                 let [low, high] = laid(after, self.parted);
                 let [was_low, was_high] = laid(before, self.parted);
                 // Each piece grows at its end, from what it held.

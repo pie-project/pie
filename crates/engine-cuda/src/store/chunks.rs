@@ -212,20 +212,8 @@ impl Chunks {
                 have: room,
             });
         }
-        let held = self.range.hold(pool, from, bytes, beside)?;
-        // `unwritten-nan`: the activation span holds NaN until written.
-        if held == Commit::Committed
-            && !crate::sizing::active()
-            && crate::serve::diag::on().unwritten_nan
-            && bytes > 0
-        {
-            crate::device::fill_span(
-                self.range.span(from, bytes)?,
-                usize::try_from(bytes).unwrap_or(0),
-                0xFF,
-            )?;
-        }
-        Ok(held)
+        // (`unwritten-nan` fills the span as the range backs it.)
+        self.range.hold(pool, from, bytes, beside)
     }
 
     /// Backs `bytes` of the activation's span from `offset` into it, and
