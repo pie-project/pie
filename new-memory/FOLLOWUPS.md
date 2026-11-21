@@ -869,7 +869,7 @@ and 0.032 s, 0 compiles after ready, and the beam fires themselves were on the l
 misses). The width is a constant of the inferlet's trace, so no ladder derives them; laying
 built-ins' guest programs before ready is GPU's queued item.
 
-## F44. An unplaced served load hangs the GPU (slang backends, 2026-11-21)
+## F?? An unplaced served load hangs the GPU (slang backends, 2026-11-21)
 A direct fire on a served load before the engine places its programs (`Programs::load`)
 hangs the device instead of being refused: found when the dense settle fired from inside
 `Shell::load` (rows 1, its first fire never landed; the same fire placed after
