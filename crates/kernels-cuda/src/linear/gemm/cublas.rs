@@ -390,6 +390,7 @@ fn gemm_ex(handle: cublasHandle_t, call: Call, algo: cublasGemmAlgo_t) -> cublas
     // tensors, or the arena's slabs allocated at those sizes.
     if crate::sizing::active() {
         // A size-only walk (`crate::sizing`) runs no product.
+        crate::sizing::counted();
         cublasStatus_t::CUBLAS_STATUS_SUCCESS
     } else {
         unsafe {
@@ -452,6 +453,7 @@ fn gemm_ex_f32(handle: cublasHandle_t, call: Call) -> cublasStatus_t {
     // the operands are device rows of the call's extents.
     if crate::sizing::active() {
         // A size-only walk (`crate::sizing`) runs no product.
+        crate::sizing::counted();
         cublasStatus_t::CUBLAS_STATUS_SUCCESS
     } else {
         unsafe {
@@ -728,6 +730,7 @@ fn run_lt(
     // hold. The operands are the caller's `call`, as for `gemm_ex`.
     let status = if crate::sizing::active() {
         // A size-only walk (`crate::sizing`) runs no product.
+        crate::sizing::counted();
         lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS
     } else {
         unsafe {
@@ -866,6 +869,7 @@ fn run_lt_epilogue(
     // bias, non-zero by the test above.
     let status = if crate::sizing::active() {
         // A size-only walk (`crate::sizing`) runs no product.
+        crate::sizing::counted();
         lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS
     } else {
         unsafe {

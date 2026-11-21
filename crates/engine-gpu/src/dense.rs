@@ -161,7 +161,7 @@ impl Dense {
 }
 
 /// The name a kernel is said by.
-fn name(tactic: &Tactic) -> String {
+pub(crate) fn name(tactic: &Tactic) -> String {
     match (tactic.vector, tactic.tier, tactic.wide) {
         (0, kernels_slang::Tier::Coopmat, _) => "coopmat".to_owned(),
         (0, _, false) => "tiled".to_owned(),

@@ -209,12 +209,14 @@ pub trait Frame<B: Backend>: 'static {
     /// Submits what the frame holds so far; it records on.
     fn flush(&self) -> Result<()>;
 
-    /// Submits what the frame holds so far without waiting for it to land;
-    /// it records on, queued behind it: a split step's segment (a layer),
-    /// which the platform's bound wants short, not waited on. The work
-    /// recorded next is ordered after it by the queue; the host writes
-    /// nothing it reads in between (no staging between a split step's
-    /// layers rides on it). Where the backend cannot, [`Frame::flush`].
+    /// Ends what the frame holds so far as a segment of its own submission:
+    /// a split step's (a run of layers), which the platform's bound wants
+    /// short. The segments go to the device with the frame, each its own
+    /// submission, back to back, so the device runs them without waiting
+    /// on the host's encoding between them; the work recorded next is
+    /// ordered after each. The host writes nothing a segment reads in
+    /// between (no staging between a split step's layers rides on it).
+    /// Where the backend cannot, [`Frame::flush`].
     fn submit_segment(&self) -> Result<()> {
         self.flush()
     }

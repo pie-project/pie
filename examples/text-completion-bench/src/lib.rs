@@ -22,6 +22,9 @@ struct Input {
     temperature: f32,
     #[serde(default = "default_top_p")]
     top_p: f32,
+    /// Top-k truncation where sampled (0: none), as compat's.
+    #[serde(default)]
+    top_k: u32,
     /// When true, drop the chat-template stop tokens so the generator runs to
     /// `max_tokens` regardless of model emit.
     #[serde(default)]
@@ -129,15 +132,17 @@ struct SampleKnobs {
     /// the stage reads, so every temperature runs one program.
     temperature: Option<Channel>,
     top_p: Option<Channel>,
+    top_k: Option<Channel>,
 }
 
 impl SampleKnobs {
-    fn new(temperature: f32, top_p: f32) -> Self {
+    fn new(temperature: f32, top_p: f32, top_k: u32) -> Self {
         let sampled = temperature > 0.0;
         Self {
             temperature: sampled
                 .then(|| Channel::from([sampler::inverse_temperature(temperature)])),
             top_p: (sampled && top_p < 1.0).then(|| Channel::from([top_p])),
+            top_k: (sampled && top_k > 0).then(|| Channel::from([top_k])),
         }
     }
 
@@ -146,7 +151,7 @@ impl SampleKnobs {
         sampler::Knobs {
             temperature: self.temperature.as_ref().map(|c| reshape(c.read(), [])),
             top_p: self.top_p.as_ref().map(|c| reshape(c.read(), [])),
-            top_k: None,
+            top_k: self.top_k.as_ref().map(|c| reshape(c.read(), [])),
             min_p: None,
             repetition: None,
             frequency: None,
@@ -323,7 +328,7 @@ async fn run_one(
     // A greedy pass steps its rng too, unread: the standard shape's.
     let sampled_rng = Channel::from([rng_seed, 0u32]);
     let prefill_rng = Channel::from([rng_seed ^ 0x9e37_79b9, 0u32]);
-    let (temperature, top_p) = (input.temperature, input.top_p);
+    let (temperature, top_p, top_k) = (input.temperature, input.top_p, input.top_k);
 
     let ws = WorkingSet::new();
     let n = prompt_vec.len() as u32;
@@ -369,7 +374,7 @@ async fn run_one(
     fwd_p
         .state(&[&ws], StateGeometry::folding())
         .context("bind prefill state")?;
-    let prefill_knobs = SampleKnobs::new(temperature, top_p);
+    let prefill_knobs = SampleKnobs::new(temperature, top_p, top_k);
     fwd_p.epilogue(move || {
         let carried_on = tok_in.map(|tok_in| (tok_in.traced(), None));
         sampler::prefill(
@@ -390,7 +395,7 @@ async fn run_one(
             fwd.embed(&tok_in, &embed_indptr)?;
             fwd.state(&[ws_ref], StateGeometry::folding())
                 .context("bind decode state")?;
-            let knobs = SampleKnobs::new(temperature, top_p);
+            let knobs = SampleKnobs::new(temperature, top_p, top_k);
             fwd.epilogue(move || {
                 sampler::decode(
                     vocab,

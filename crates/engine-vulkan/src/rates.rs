@@ -45,9 +45,10 @@ pub fn at_load(
         provenance: provenance(&measured.name),
         registry: crate::chip::registry(),
     });
+    let keys = engine_gpu::rates::keys_at(max_submit);
     let chip = engine::rates::rates_at_load(
         chip,
-        &engine_gpu::rates::keys_at(max_submit),
+        &keys,
         save,
         Some(device.left()),
         max_submit,
@@ -57,6 +58,19 @@ pub fn at_load(
         call: "rates at load",
         why,
     })?;
+    let resident = chip
+        .rates()
+        .resident_workgroups
+        .map(|workgroups| workgroups.round().clamp(1.0, f64::from(u32::MAX)) as u32)
+        .ok_or_else(|| engine_gpu::error::Fault::Device {
+            call: "rates at load",
+            why: "the profile states no [rates] resident_workgroups after the rates step".into(),
+        })?;
+    device.hold_resident(resident);
+    tracing::info!(
+        resident,
+        "the workgroups the device holds at once, as its profile states them"
+    );
     Ok(crate::tuning::Tuning::new(chip, device.limits()))
 }
 

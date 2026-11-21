@@ -97,6 +97,14 @@ pub struct Rates {
     /// only where the platform states such a bound (Android); not one of
     /// [`KEYS`], which the estimate weighs a fire by.
     pub submit_worst_ratio: Option<f64>,
+    /// The workgroups the device holds at once for a kernel's full rate,
+    /// the whole device's, as its rates step measured them: one workgroup
+    /// of a compute-bound kernel runs at `1 / S` of the kernel's full rate.
+    /// What a guest step's grid strides over, and where the device states
+    /// no count of its compute units (wgpu, a Vulkan driver that reports
+    /// none) what sizes a fire's work to it. Not one of [`KEYS`], which the
+    /// estimate weighs a fire by.
+    pub resident_workgroups: Option<f64>,
     /// Prefill attention TFLOP/s (the rectangle's flops, four a query
     /// element a key, as [`Rates::attn_tflops_by_keys`] counts them) of a
     /// step's rows against a longer prefix: `(rows, [(keys, TFLOP/s)])`, the
@@ -222,6 +230,10 @@ pub const SUBMIT_WORST_RATIO: &str = "submit_worst_ratio";
 /// [`SUBMIT_WORST_RATIO`] where the platform states a submit bound.
 pub const ATTN_BY_ROWS_KEYS: &str = "attn_tflops_by_rows_keys";
 
+/// The `[rates]` key of [`Rates::resident_workgroups`]: measured beside the
+/// estimate's [`KEYS`] on the slang backends.
+pub const RESIDENT_WORKGROUPS: &str = "resident_workgroups";
+
 impl Rates {
     /// `self` laid over `below`: each key `self` states replaces `below`'s.
     #[must_use]
@@ -237,6 +249,7 @@ impl Rates {
             few_row_tflops: self.few_row_tflops.or(below.few_row_tflops),
             workgroups_per_core: self.workgroups_per_core.or(below.workgroups_per_core),
             submit_worst_ratio: self.submit_worst_ratio.or(below.submit_worst_ratio),
+            resident_workgroups: self.resident_workgroups.or(below.resident_workgroups),
             attn_tflops_by_rows_keys: self
                 .attn_tflops_by_rows_keys
                 .or(below.attn_tflops_by_rows_keys),
@@ -302,6 +315,9 @@ impl Rates {
                 .workgroups_per_core
                 .filter(|_| has("workgroups_per_core")),
             submit_worst_ratio: self.submit_worst_ratio.filter(|_| has(SUBMIT_WORST_RATIO)),
+            resident_workgroups: self
+                .resident_workgroups
+                .filter(|_| has(RESIDENT_WORKGROUPS)),
             attn_tflops_by_rows_keys: self
                 .attn_tflops_by_rows_keys
                 .clone()
@@ -330,6 +346,7 @@ impl Rates {
             "few_row_tflops" => self.few_row_tflops.is_none(),
             "workgroups_per_core" => self.workgroups_per_core.is_none(),
             SUBMIT_WORST_RATIO => self.submit_worst_ratio.is_none(),
+            RESIDENT_WORKGROUPS => self.resident_workgroups.is_none(),
             ATTN_BY_ROWS_KEYS => self.attn_tflops_by_rows_keys.is_none(),
             "product_ns" => self.product_ns.is_none(),
             "kernel_tflops_by_shape" => self.kernel_tflops_by_shape.is_none(),
@@ -387,6 +404,7 @@ impl Rates {
         float("few_row_tflops", self.few_row_tflops);
         float("workgroups_per_core", self.workgroups_per_core);
         float(SUBMIT_WORST_RATIO, self.submit_worst_ratio);
+        float(RESIDENT_WORKGROUPS, self.resident_workgroups);
         if let Some(times) = &self.product_ns {
             let rows: Vec<String> = times
                 .iter()
@@ -587,6 +605,7 @@ mod tests {
             few_row_tflops: Some(4.2),
             workgroups_per_core: Some(3.3),
             submit_worst_ratio: None,
+            resident_workgroups: None,
             attn_tflops_by_rows_keys: None,
             product_ns: None,
             kernel_tflops_by_shape: Some(vec![KernelCurve {
@@ -653,6 +672,7 @@ mod tests {
         let measured = Rates {
             launch_ns: Some(904),
             submit_worst_ratio: Some(1.83),
+            resident_workgroups: None,
             attn_tflops_by_rows_keys: Some(vec![(512, vec![(1024, 0.35), (4096, 0.3)])]),
             ..Rates::default()
         };

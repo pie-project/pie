@@ -459,6 +459,9 @@ pub struct Context {
     pub(crate) dummy: Slab,
     pipeline_cache: Arc<PipelineCache>,
     device_index: u32,
+    /// The workgroups the device holds at once, as the load's rates step
+    /// measured them ([`Context::resident`]).
+    resident: std::sync::OnceLock<u32>,
 }
 
 /// The device's pipeline cache, which kernel and guest pipelines share. A
@@ -1108,6 +1111,7 @@ impl Context {
             dummy,
             pipeline_cache,
             device_index: boot.device_index,
+            resident: std::sync::OnceLock::new(),
         })
     }
 
@@ -1150,9 +1154,27 @@ impl Context {
         self.max_buffer
     }
 
+    /// What sizes work to the device, as its kernels count cores: the
+    /// compute units the driver reports, or where it reports none the
+    /// workgroups the device holds at once ([`Context::resident`]). `None`
+    /// before the load has measured them.
     #[must_use]
-    pub fn cores(&self) -> u32 {
-        self.core.cores.unwrap_or(crate::chip::UNREPORTED_CORES)
+    pub fn cores(&self) -> Option<u32> {
+        self.core.cores.or_else(|| self.resident.get().copied())
+    }
+
+    /// The workgroups the device holds at once, as the load's rates step
+    /// measured them on every device (`profile::fire::RESIDENT_WORKGROUPS`):
+    /// what a guest step's grid strides over. `None` before the load has.
+    #[must_use]
+    pub fn resident(&self) -> Option<u32> {
+        self.resident.get().copied()
+    }
+
+    /// Lays the workgroups the load's rates step measured
+    /// ([`Context::resident`]); the first holds.
+    pub(crate) fn hold_resident(&self, workgroups: u32) {
+        let _ = self.resident.set(workgroups);
     }
 
     /// The alignment a guest table takes in its pool slot: 16 at least, and
@@ -1180,7 +1202,11 @@ impl Context {
     #[must_use]
     pub fn limits(&self) -> crate::tuning::Limits {
         crate::tuning::Limits {
-            cores: self.cores(),
+            // Before the rates step has measured a device the driver reports
+            // no cores of, one: that step's own tuning, whose timed kernels
+            // read neither the qmm's fill nor a decode's split per core (a
+            // load's tuning states them, `crate::rates::at_load`).
+            cores: self.cores().unwrap_or(1),
             lanes: self.lanes(),
             shared_bytes: self.core.limits.max_compute_shared_memory_size,
             invocations: self.core.limits.max_compute_work_group_invocations,
@@ -1504,6 +1530,7 @@ impl Context {
                 cmd: std::sync::atomic::AtomicU64::new(vk::Handle::as_raw(cmd)),
                 cuts: Mutex::new(Vec::new()),
                 segments: Mutex::new(Vec::new()),
+                held: Mutex::new(Vec::new()),
                 segmented: std::sync::atomic::AtomicBool::new(false),
                 cmd_pool: pool,
                 fence,
@@ -1555,6 +1582,9 @@ pub(crate) struct Inner {
     /// whose last segment's fence lands after them (it begins with a barrier
     /// on every command before it on the queue).
     segments: Mutex<Vec<vk::CommandBuffer>>,
+    /// The segments ended and not yet submitted: submitted with the frame,
+    /// back to back ([`Frame::submit`]).
+    held: Mutex<Vec<vk::CommandBuffer>>,
     /// A segment was submitted: a frame dropped unsubmitted waits for the
     /// queue before it frees them.
     segmented: std::sync::atomic::AtomicBool,
@@ -2039,10 +2069,13 @@ impl Frame {
     }
 
     /// [`engine_gpu::backend::Frame::submit_segment`]: what the frame holds
-    /// submitted unawaited, recording on in a new buffer from the same
-    /// (this thread's) pool that begins with a barrier on every command
-    /// submitted before it, as every frame begins. A kept frame's segment is
-    /// a cut its replays wait on ([`Frame::flush`]).
+    /// ended as a segment of its own, recording on in a new buffer from the
+    /// same (this thread's) pool that begins with a barrier on every command
+    /// before it, as every frame begins. The segments are submitted with the
+    /// frame, each its own submission, back to back ([`Frame::submit`]): the
+    /// device runs them without waiting on the host's encoding between
+    /// them. A kept frame's segment is a cut its replays wait on
+    /// ([`Frame::flush`]).
     pub fn submit_segment(&self) -> Result<()> {
         if self.kept {
             return self.flush();
@@ -2053,20 +2086,15 @@ impl Frame {
         // SAFETY: as in `flush`: this frame's `cmd` is recording and only
         // `&self` records into it.
         unsafe { d.end_command_buffer(cmd) }.map_err(|e| core.fault("vkEndCommandBuffer", e))?;
-        {
-            let bufs = [cmd];
-            let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
-            let queue = core.queue.lock().expect("queue lock poisoned");
-            // SAFETY: `cmd` is executable and submitted once, with no
-            // fence; the queue is held under its lock.
-            unsafe { d.queue_submit(*queue, &submits, vk::Fence::null()) }
-                .map_err(|e| core.fault("vkQueueSubmit", e))?;
-        }
-        self.inner.segmented.store(true, Ordering::Release);
         self.inner
             .segments
             .lock()
             .expect("segments lock poisoned")
+            .push(cmd);
+        self.inner
+            .held
+            .lock()
+            .expect("held lock poisoned")
             .push(cmd);
         // SAFETY: `cmd_pool` is this frame's (this thread's) pool.
         let next = unsafe {
@@ -2120,6 +2148,17 @@ impl Frame {
             let bufs = [cmd];
             let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
             let queue = core.queue.lock().expect("queue lock poisoned");
+            // A split step's held segments go first, in order.
+            let held = std::mem::take(&mut *self.inner.held.lock().expect("held lock poisoned"));
+            for segment in held {
+                let bufs = [segment];
+                let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
+                // SAFETY: `segment` was ended and never submitted; it has no
+                // fence; the queue is held under its lock.
+                unsafe { d.queue_submit(*queue, &submits, vk::Fence::null()) }
+                    .map_err(|e| core.fault("vkQueueSubmit", e))?;
+                self.inner.segmented.store(true, Ordering::Release);
+            }
             // SAFETY: `cmd` is executable, the fence is unsignaled (reset after
             // each wait) and the queue is held under its lock.
             unsafe { d.queue_submit(*queue, &submits, self.inner.fence) }
@@ -2197,6 +2236,18 @@ impl Frame {
         let bufs = [self.inner.cmd()];
         let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
         let queue = core.queue.lock().expect("queue lock poisoned");
+        // A split step's segments first, each its own submission, back to
+        // back under the one hold of the queue.
+        let held = std::mem::take(&mut *self.inner.held.lock().expect("held lock poisoned"));
+        for segment in held {
+            let bufs = [segment];
+            let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
+            // SAFETY: `segment` was ended and never submitted; it has no
+            // fence; the queue is held under its lock.
+            unsafe { core.device.queue_submit(*queue, &submits, vk::Fence::null()) }
+                .map_err(|e| core.fault("vkQueueSubmit", e))?;
+            self.inner.segmented.store(true, Ordering::Release);
+        }
         // SAFETY: `cmd` was just ended and never submitted, the fence is the
         // frame's own unsignaled one, and the queue is held under its lock.
         unsafe { core.device.queue_submit(*queue, &submits, self.inner.fence) }

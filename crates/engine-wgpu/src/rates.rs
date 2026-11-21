@@ -50,9 +50,10 @@ pub fn at_load(
         provenance: provenance(&measured.name),
         registry: crate::chip::registry(),
     });
+    let keys = engine_gpu::rates::keys_at(max_submit);
     let chip = engine::rates::rates_at_load(
         chip,
-        &engine_gpu::rates::keys_at(max_submit),
+        &keys,
         save,
         Some(device.left()),
         max_submit,
@@ -62,8 +63,19 @@ pub fn at_load(
         call: "rates at load",
         why,
     })?;
-    Ok(crate::tuning::Tuning::new(chip, device.cores())
-        .with_workgroup_bytes(device.workgroup_bytes()))
+    let tuning = crate::tuning::Tuning::new(chip).with_workgroup_bytes(device.workgroup_bytes());
+    let resident = tuning
+        .resident()
+        .ok_or_else(|| engine_gpu::error::Fault::Device {
+            call: "rates at load",
+            why: "the profile states no [rates] resident_workgroups after the rates step".into(),
+        })?;
+    device.hold_resident(resident);
+    tracing::info!(
+        resident,
+        "the workgroups the device holds at once, as its profile states them"
+    );
+    Ok(tuning)
 }
 
 /// The rates of `device` that `stated` lacks (every one where it states
@@ -133,8 +145,7 @@ pub fn shapes_at_load(
     if !was {
         crate::encode::reset_kernel_profile();
     }
-    Ok(crate::tuning::Tuning::new(chip?, device.cores())
-        .with_workgroup_bytes(device.workgroup_bytes()))
+    Ok(crate::tuning::Tuning::new(chip?).with_workgroup_bytes(device.workgroup_bytes()))
 }
 
 /// How a rates frame is timed on wgpu: the device's span where it states

@@ -894,6 +894,35 @@ Remove it once each case it still catches has its own mechanism:
 - (c) a completion that never arrives (a lane in flight for twice the timeout is terminated
   through the same path today).
 
+## F46. Something writes into the guest lane arenas' split lines while a meeting runs, under overlap (ROCm, found 2026-11-20)
+
+While building self-resetting meet counters (each split row's meeting leaving its word's count
+zero, the split select's merge zeroing its count, so no memset before each split launch), the
+engine-cuda ROCm integration set (every_op / epilogue / suite / beam / guest, 18 tests) hung at
+every_op_agrees_with_the_host_interpreter when run in one process. It needed the accumulation
+of the earlier tests: each test alone, each paired with every_op, and either half of the set
+passed. The tip passes that point.
+
+The check: before every split row or split select launch, sync the stream, read every split
+lane line of the arenas (16 words each, `lane_span(1)` apart) and report any non-zero count,
+naming the launch before it. With it on, the whole set passes (152 s) and no count is ever
+found dirty. So no launch leaves a count behind. Something disturbs a meeting while it runs,
+and only when work overlaps: the sync before each split launch removes the overlap and the
+hang.
+
+Meeting groups are forked onto main (`fan.fork(&meet, main)`), so two meeting regions do not
+run side by side. The writer is not found. Candidates: a run-ahead frame's staging next to the
+arenas in the activation span, or another run of that span (`Shell::staged_runs`) laid over
+them.
+
+The tip's per-launch memset (`zero_barriers` before each split launch) re-zeroes the counters,
+so its meetings are immune. But a concurrent writer into the guest arenas could as well corrupt
+the partials and candidates the split regions publish there: silent wrong results, not a hang.
+
+Tool for whoever picks it up: the sync-and-read check above, on a build without the memset
+(the self-resetting branch, `sc/amd-meet-reset-dropped`, local on the MI300X host), plus the
+fire's stream map at the stalled launch.
+
 ## F?? An unplaced served load hangs the GPU (slang backends, 2026-11-21)
 A direct fire on a served load before the engine places its programs (`Programs::load`)
 hangs the device instead of being refused: found when the dense settle fired from inside

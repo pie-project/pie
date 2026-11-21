@@ -681,11 +681,17 @@ impl<B: Backend> Run<'_, B> {
         matmul: impl Fn(kernels_slang::linear::gemm::Tactic) -> Result<(), kernels_slang::Error>,
     ) -> Result<(), kernels_slang::Error> {
         let Some(names) = self.ctx.naming() else {
-            let plane = self.tensor(w);
-            return matmul(
-                self.dense()
-                    .at(self.tensor(act).rows, plane.rows, plane.width),
-            );
+            let (rows, plane) = (self.tensor(act).rows, self.tensor(w));
+            let tactic = self.dense().at(rows, plane.rows, plane.width);
+            self.pick(|| {
+                format!(
+                    "dense at {rows} rows of a {}x{} plane: {}",
+                    plane.rows,
+                    plane.width,
+                    crate::dense::name(&tactic)
+                )
+            });
+            return matmul(tactic);
         };
         // The walk fires at one rung; a fire of the load brings up to the
         // most rows its rungs hold.

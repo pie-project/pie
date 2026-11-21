@@ -487,6 +487,9 @@ pub struct Context {
     max_buffer: u64,
     pub(crate) dummy: Slab,
     device_index: u32,
+    /// The workgroups the device holds at once, as the load's rates step
+    /// measured them ([`Context::resident`]).
+    resident: std::sync::OnceLock<u32>,
 }
 
 impl std::fmt::Debug for Context {
@@ -736,6 +739,7 @@ impl Context {
             core,
             dummy,
             device_index: boot.adapter_index,
+            resident: std::sync::OnceLock::new(),
         };
 
         Ok(context)
@@ -788,9 +792,20 @@ impl Context {
         self.max_buffer
     }
 
+    /// The workgroups the device holds at once, which what sizes a fire's
+    /// work to the device reads: WebGPU reports no count of an adapter's
+    /// compute units, so the load's rates step measures this
+    /// (`profile::fire::RESIDENT_WORKGROUPS`) and lays it here. `None`
+    /// before the load has.
     #[must_use]
-    pub fn cores(&self) -> u32 {
-        crate::chip::UNREPORTED_CORES
+    pub fn resident(&self) -> Option<u32> {
+        self.resident.get().copied()
+    }
+
+    /// Lays the workgroups the load's rates step measured
+    /// ([`Context::resident`]); the first holds.
+    pub(crate) fn hold_resident(&self, workgroups: u32) {
+        let _ = self.resident.set(workgroups);
     }
 
     /// The workgroup memory the adapter states a kernel may take.
@@ -881,6 +896,7 @@ impl Context {
                 pass: Mutex::new(None),
                 time: engine_gpu::submit::DeviceTime::default(),
                 wall: AtomicBool::new(false),
+                held: Mutex::new(Vec::new()),
             }),
             open: true,
             dispatches: std::cell::Cell::new(0),
@@ -1033,6 +1049,9 @@ pub(crate) struct Inner {
     /// A timed frame on a device that writes no timestamps: its time is the
     /// host's clock from its submit to its work done.
     wall: AtomicBool,
+    /// A split step's segments, ended and not yet submitted: submitted with
+    /// the frame, back to back ([`Frame::submit_segment`]).
+    held: Mutex<Vec<wgpu::CommandBuffer>>,
 }
 
 impl Inner {
@@ -1379,9 +1398,11 @@ impl Frame {
     }
 
     /// [`engine_gpu::backend::Frame::submit_segment`]: the frame's encoder
-    /// submitted unawaited and a new one opened. WebGPU's queue orders the
-    /// next submission after it, and the frame's uniform region and scratch
-    /// chunk stay the frame's (given back at its commit).
+    /// finished and held, and a new one opened; the held ones are submitted
+    /// with the frame, in order, each its own submission. WebGPU's queue
+    /// orders each after the one before, and the frame's uniform region
+    /// (written only past what it holds) and scratch chunk stay the frame's
+    /// (given back at its commit).
     pub fn submit_segment(&self) -> Result<()> {
         self.close_pass();
         self.land_uniforms();
@@ -1399,8 +1420,14 @@ impl Frame {
                 why: "this frame was already submitted".to_string(),
             });
         };
-        core.submit(encoder.finish());
-        core.kick();
+        // Held, submitted with the frame, back to back, each its own
+        // submission: the device runs them without waiting on the host's
+        // encoding between them.
+        self.inner
+            .held
+            .lock()
+            .expect("held lock poisoned")
+            .push(encoder.finish());
         *self.inner.encoder.lock().expect("encoder lock poisoned") = Some(
             core.device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1427,6 +1454,7 @@ impl Frame {
                 why: "this frame was already submitted".to_string(),
             });
         };
+        self.submit_held();
         core.submit_once(encoder)?;
         *self.inner.encoder.lock().expect("encoder lock poisoned") = Some(
             core.device
@@ -1435,6 +1463,15 @@ impl Frame {
                 }),
         );
         Ok(())
+    }
+
+    /// A split step's held segments submitted, in order, each its own
+    /// submission ([`Frame::submit_segment`]).
+    fn submit_held(&self) {
+        let held = std::mem::take(&mut *self.inner.held.lock().expect("held lock poisoned"));
+        for segment in held {
+            self.inner.core.submit(segment);
+        }
     }
 
     fn submit(&mut self) -> Result<()> {
@@ -1493,6 +1530,7 @@ impl Frame {
         let started = Mark::now();
         let finished = encoder.finish();
         crate::encode::record_read_phase(0, started.ns());
+        self.submit_held();
         let index = core.submit(finished);
         crate::encode::record_submit(started.ns(), 0);
         // What the frame staged through goes back to the load's stock now,

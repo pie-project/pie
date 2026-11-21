@@ -19,7 +19,7 @@ use engine_gpu::guest::held::{self, TableLayout, consecutive};
 use engine_gpu::guest::ring::{Berth, PassLayout, pass_bytes};
 use engine_gpu::guest::session::{
     Bases, HEAP_BINDING, STATUS_BINDING, STATUS_SPAN, STEP_BINDING, StageTables, TABLES_BINDING,
-    groups_for, run_bases, stage_tables, step_records, step_stride,
+    run_bases, stage_tables, step_groups, step_records, step_stride,
 };
 use engine_gpu::guest::state::{GuestLayout, Side};
 
@@ -325,7 +325,8 @@ struct Stage {
     args: Held,
     stride: u64,
 
-    groups: u32,
+    /// Each step's workgroups ([`engine_gpu::guest::session::step_groups`]).
+    groups: Vec<u32>,
     set: vk::DescriptorSet,
 
     offsets: Vec<u64>,
@@ -680,8 +681,12 @@ impl Session {
             .next_back()
             .expect("the status word is the last table placed");
         let mut stages = Vec::with_capacity(plans.len());
-        for (((lowered, resolved), &heap), stated) in
-            code.iter().zip(resolved).zip(&layout.stages).zip(bases)
+        for ((((lowered, resolved), &heap), stated), plan) in code
+            .iter()
+            .zip(resolved)
+            .zip(&layout.stages)
+            .zip(bases)
+            .zip(plans.iter())
         {
             let tables = [(); 4].map(|()| placed.next().expect("four tables a stage"));
             let args = placed.next().expect("a stage's step records");
@@ -698,7 +703,7 @@ impl Session {
                 });
             }
             stages.push(build_stage(
-                device, lowered, resolved, tables, library, args, stride, heap,
+                device, plan, lowered, resolved, tables, library, args, stride, heap,
             )?);
         }
 
@@ -1236,11 +1241,18 @@ impl Session {
             at: "guest::session",
             why: format!("stage {at} is past this package's {}", self.stages.len()),
         })?;
-        let [groups, ..] = engine_gpu::workgroups(
-            "guest",
-            [stage.groups, 1, 1],
-            self.core.limits.max_compute_work_group_count,
-        )?;
+        let groups = stage
+            .groups
+            .iter()
+            .map(|&wanted| {
+                engine_gpu::workgroups(
+                    "guest",
+                    [wanted, 1, 1],
+                    self.core.limits.max_compute_work_group_count,
+                )
+                .map(|[groups, ..]| groups)
+            })
+            .collect::<Result<Vec<u32>>>()?;
         let d = &self.core.device;
         // SAFETY: `cmd` is the open frame's buffer, recorded only on this
         // thread (`Frame` is not `Sync`). The set, layout and pipelines are
@@ -1289,7 +1301,7 @@ impl Session {
                     &[offset],
                 );
                 d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
-                d.cmd_dispatch(cmd, groups, 1, 1);
+                d.cmd_dispatch(cmd, groups[step], 1, 1);
             }
 
             let after = vk::MemoryBarrier::default()
@@ -1337,6 +1349,7 @@ impl Drop for Session {
 #[allow(clippy::too_many_arguments)]
 fn build_stage(
     device: &Context,
+    plan: &eta_compiler::codegen::launch::LaunchStagePlan,
     lowered: &engine_gpu::guest::Lowered,
     resolved: StageTables,
     tables: [Held; 4],
@@ -1360,9 +1373,18 @@ fn build_stage(
         args,
         stride,
         groups: if lowered.strides_the_grid {
-            groups_for(&descriptors, device.cores())
+            step_groups(
+                plan,
+                &descriptors,
+                &lowered.steps,
+                device.resident().ok_or_else(|| Fault::Device {
+                    call: "guest stage",
+                    why: "a guest step strides the grid by the workgroups the device holds, which the load measures before it binds a guest"
+                        .into(),
+                })?,
+            )
         } else {
-            1
+            vec![1; lowered.steps.len()]
         },
         set: vk::DescriptorSet::null(),
         offsets,
