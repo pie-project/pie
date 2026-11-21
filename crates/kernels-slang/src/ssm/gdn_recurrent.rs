@@ -103,6 +103,26 @@ impl Heads {
     }
 }
 
+/// Refuses a pool a register-state kernel cannot read its state rows from
+/// four words a vector: its segments, the state's origin and its slot stride
+/// whole vectors.
+fn vectors(op: &'static str, state: &StatePool) -> Result<(), Error> {
+    if [state.pool.words, state.origin, state.slot_stride]
+        .iter()
+        .any(|words| !words.is_multiple_of(4))
+    {
+        return Err(refuse(
+            op,
+            format!(
+                "the state pool's segments of {} words, origin {} and slot stride {} are not \
+                 whole vectors of four words, which a register-state scan reads its state rows by",
+                state.pool.words, state.origin, state.slot_stride
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// One decode step a row, each value head's state in its slot.
 #[allow(clippy::too_many_arguments)]
 pub fn gated_delta(
@@ -123,6 +143,7 @@ pub fn gated_delta(
     let heads = Heads::of(OP, qkv, gates, y, k_heads, v_heads, k_dim, v_dim)?;
     let launched = span.rows(OP, &[qkv, gates, y, state.slots])?;
     let entry = if heads.registers() {
+        vectors(OP, state)?;
         "ssm_gdn_recurrent_r128_bf16"
     } else {
         "ssm_gdn_recurrent_bf16"
@@ -157,6 +178,9 @@ fn scan_kernel(
     registers: &'static str,
     memory: &'static str,
 ) -> Result<Fire, Error> {
+    if in_registers {
+        vectors(op, state)?;
+    }
     let entry = if in_registers { registers } else { memory };
     Ok(Fire::at(GDN_RECURRENT, state.entry(op, entry)?).tier(tactic.tier))
 }
@@ -339,21 +363,7 @@ pub fn gated_delta_carried(
             ),
         ));
     }
-    // The step reads a state row four words a load: the pool's segments,
-    // the state's origin and its slot stride are whole vectors.
-    if [state.pool.words, state.origin, state.slot_stride]
-        .iter()
-        .any(|words| !words.is_multiple_of(4))
-    {
-        return Err(refuse(
-            OP,
-            format!(
-                "the state pool's segments of {} words, origin {} and slot stride {} are not \
-                 whole vectors of four words, which the carried step reads its state rows by",
-                state.pool.words, state.origin, state.slot_stride
-            ),
-        ));
-    }
+    vectors(OP, state)?;
     let heads = Heads {
         k_heads,
         v_heads,
