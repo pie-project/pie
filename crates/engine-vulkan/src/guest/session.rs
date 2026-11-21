@@ -1360,7 +1360,13 @@ fn build_stage(
         args,
         stride,
         groups: if lowered.strides_the_grid {
-            groups_for(&descriptors, device.cores())
+            groups_for(
+                &descriptors,
+                device.resident().ok_or_else(|| Fault::Device {
+                    call: "guest stage",
+                    why: "a guest step strides the grid by the workgroups the device holds, which the load measures before it binds a guest".into(),
+                })?,
+            )
         } else {
             1
         },

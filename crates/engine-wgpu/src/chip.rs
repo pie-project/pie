@@ -26,9 +26,6 @@ pub static SHELF: Shelf = Shelf {
     derived: None,
 };
 
-/// The cores an adapter is sized by when it reports no count.
-pub const UNREPORTED_CORES: u32 = 16;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Device {
     pub name: String,
@@ -106,14 +103,29 @@ mod tests {
         };
         let (profile, report) = resolve(&d, None);
         assert_eq!(report.used, profile::Source::Defaults);
-        let t = crate::tuning::Tuning::new(profile, UNREPORTED_CORES);
+        let t = crate::tuning::Tuning::new(profile.clone());
+        // Before the rates step has measured the workgroups the device holds,
+        // the device is sized as one (that step's own tuning); a decode then
+        // splits to the workgroups its profile states it holds.
         assert_eq!(
             (
                 t.sdpa_tile_rows_per_request(),
                 t.sdpa_split_groups(),
                 t.sdpa_split_min_keys()
             ),
-            (32, 16, 256)
+            (32, 1, 256)
+        );
+        let measured = profile.with_tuned(profile::fire::Tuned {
+            rates: profile::fire::Rates {
+                resident_workgroups: Some(47.6),
+                ..profile.rates()
+            },
+            ..profile.tuned().clone()
+        });
+        let sized = crate::tuning::Tuning::new(measured);
+        assert_eq!(
+            (sized.resident(), sized.sdpa_split_groups()),
+            (Some(48), 48)
         );
         use crate::tuning::Qmm;
         for (rows, k, want) in [

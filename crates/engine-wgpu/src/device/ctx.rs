@@ -471,6 +471,9 @@ pub struct Context {
     max_buffer: u64,
     pub(crate) dummy: Slab,
     device_index: u32,
+    /// The workgroups the device holds at once, as the load's rates step
+    /// measured them ([`Context::resident`]).
+    resident: std::sync::OnceLock<u32>,
 }
 
 impl std::fmt::Debug for Context {
@@ -716,6 +719,7 @@ impl Context {
             core,
             dummy,
             device_index: boot.adapter_index,
+            resident: std::sync::OnceLock::new(),
         };
 
         Ok(context)
@@ -768,9 +772,20 @@ impl Context {
         self.max_buffer
     }
 
+    /// The workgroups the device holds at once, which what sizes a fire's
+    /// work to the device reads: WebGPU reports no count of an adapter's
+    /// compute units, so the load's rates step measures this
+    /// (`profile::fire::RESIDENT_WORKGROUPS`) and lays it here. `None`
+    /// before the load has.
     #[must_use]
-    pub fn cores(&self) -> u32 {
-        crate::chip::UNREPORTED_CORES
+    pub fn resident(&self) -> Option<u32> {
+        self.resident.get().copied()
+    }
+
+    /// Lays the workgroups the load's rates step measured
+    /// ([`Context::resident`]); the first holds.
+    pub(crate) fn hold_resident(&self, workgroups: u32) {
+        let _ = self.resident.set(workgroups);
     }
 
     /// The workgroup memory the adapter states a kernel may take.
