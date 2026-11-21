@@ -148,7 +148,39 @@ pub(crate) fn clear_scheduler_handle(engine_id: usize) {
     }
 }
 
+// A test's own scheduler for an engine, on its thread alone
+// ([`worker::test_lane::TestLane`]): the copies and pool requests its
+// planner and stores submit reach the test, never a lane of another test.
+#[cfg(test)]
+thread_local! {
+    static TEST_HANDLES: std::cell::RefCell<Vec<(usize, SchedulerHandle)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Puts `handle` (or, `None`, takes it off) as `engine_id`'s scheduler on
+/// this thread only.
+#[cfg(test)]
+pub(crate) fn set_test_handle(engine_id: usize, handle: Option<SchedulerHandle>) {
+    TEST_HANDLES.with(|handles| {
+        let mut handles = handles.borrow_mut();
+        handles.retain(|(engine, _)| *engine != engine_id);
+        if let Some(handle) = handle {
+            handles.push((engine_id, handle));
+        }
+    });
+}
+
 pub(crate) fn scheduler_handle(engine_id: usize) -> Result<SchedulerHandle> {
+    #[cfg(test)]
+    if let Some(handle) = TEST_HANDLES.with(|handles| {
+        handles
+            .borrow()
+            .iter()
+            .find(|(engine, _)| *engine == engine_id)
+            .map(|(_, handle)| handle.clone())
+    }) {
+        return Ok(handle);
+    }
     handle_registry()
         .read()
         .unwrap()
