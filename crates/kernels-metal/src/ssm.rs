@@ -1208,8 +1208,10 @@ pub struct Paged {
 /// per-head table's prepass. A load that buffers recurrent rows builds them
 /// before ready, a beam's long carry being one its warm walk does not reach.
 #[must_use]
-pub fn carried_pipelines() -> [Fire; 3] {
+pub fn carried_pipelines() -> [Fire; 5] {
     [
+        Fire::at(GDN_SCAN_FILE, "gated_delta_group_fold_bfloat16"),
+        Fire::at("ssm/conv1d.metal", "causal_conv1d_group_fold_bfloat16"),
         Fire::at(GDN_SCAN_FILE, "gated_delta_carried_bfloat16_s_8_v_2"),
         Fire::at(GDN_SCAN_FILE, "gated_delta_carried_bfloat16_s_8_v_16"),
         Fire::at(GDN_SCAN_FILE, "gated_delta_carried_dots_bfloat16"),
@@ -1594,6 +1596,139 @@ pub fn gated_delta_carried(
             ba_paged.page_ints.arg(),
             table.table.arg(),
             table.rows.arg(),
+        ],
+    )
+}
+
+/// A fire's beam groups' folds (BEAM-PAGE-LISTS §11.3): `[lane, n]` a group,
+/// `count` of them, each folding the `n` rows every live beam shares into
+/// its set's state from its first fire lane `lane`'s buffer before the
+/// layer's step. That lane's page table row starts `n` rows past them.
+#[derive(Clone, Copy, Debug)]
+pub struct GroupFolds {
+    pub table: Tensor,
+    pub count: u32,
+}
+
+/// The value rows a threadgroup of [`gated_delta_group_fold`] folds.
+const GDN_GROUP_FOLD_VROWS: u32 = 8;
+
+/// Each beam group's gated-delta fold before the layer's step
+/// (`gated_delta_group_fold`): the carried scan's commit of the rows every
+/// live beam shares, read through the group's first lane's page table row,
+/// for the groups whose lane lies in this window (`lane0`, `lanes`).
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_group_fold(
+    ctx: &Ctx<'_>,
+    folds: GroupFolds,
+    (lane0, lanes): (u32, u32),
+    slots: Tensor,
+    (a_log, dt_bias): (Tensor, Tensor),
+    ba_paged: Paged,
+    corrected: Corrected,
+    state: &RecurrentPool,
+    (k_heads, v_heads, k_dim, v_dim): (u32, u32, u32, u32),
+) -> Result<(), Error> {
+    const OP: &str = "ssm.gated_delta_group_fold";
+    if folds.count == 0 {
+        return Ok(());
+    }
+    nonzero(OP, "the key heads this statement states", k_heads)?;
+    nonzero(OP, "the value heads this statement states", v_heads)?;
+    if !v_heads.is_multiple_of(k_heads) || !gated_delta_verify_fits(k_dim, v_dim) {
+        return Err(refuse(
+            OP,
+            format!(
+                "the group fold reads {GDN_VERIFY_DIM}-wide heads, the value heads a whole \
+                 number of the key heads; these are {k_heads} key and {v_heads} value heads, \
+                 {k_dim} by {v_dim}"
+            ),
+        ));
+    }
+    let z = v_heads
+        .checked_mul(folds.count)
+        .ok_or_else(|| refuse(OP, "the value heads of every group overflow a launch"))?;
+    ctx.fire(
+        Fire::at(GDN_SCAN_FILE, "gated_delta_group_fold_bfloat16").apply(Grid::of(
+            [GDN_SCAN_LANES, v_dim / GDN_GROUP_FOLD_VROWS, z],
+            [GDN_SCAN_LANES, 1, 1],
+        )),
+        &[
+            folds.table.arg(),
+            stated(OP, lane0)?.arg(),
+            stated(OP, lanes)?.arg(),
+            slots.arg(),
+            a_log.arg(),
+            dt_bias.arg(),
+            state.state.arg_mut(),
+            stated(OP, k_heads)?.arg(),
+            stated(OP, v_heads)?.arg(),
+            ba_paged.slab.arg_mut(),
+            ba_paged.pages.arg(),
+            ba_paged.page_tokens.arg(),
+            ba_paged.page_bytes.arg(),
+            ba_paged.row_bytes.arg(),
+            corrected.keys.arg_mut(),
+            corrected.key_row_bytes.arg(),
+            corrected.u.arg_mut(),
+            corrected.u_row_bytes.arg(),
+            state.segments.arg(),
+            ba_paged.page_ints.arg(),
+        ],
+    )
+}
+
+/// Each beam group's conv fold before the layer's step
+/// (`causal_conv1d_group_fold`): its window moved on by the rows every live
+/// beam shares, read from its first lane's buffer, for the groups whose lane
+/// lies in this window (`lane0`, `lanes`).
+#[allow(clippy::too_many_arguments)]
+pub fn causal_conv1d_group_fold(
+    ctx: &Ctx<'_>,
+    folds: GroupFolds,
+    (lane0, lanes): (u32, u32),
+    slots: Tensor,
+    paged: Paged,
+    state: &RecurrentPool,
+    channels: u32,
+    conv_width: u32,
+    dilation: u32,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.causal_conv1d_group_fold";
+    if folds.count == 0 {
+        return Ok(());
+    }
+    if !causal_conv1d_verify_fits(channels, conv_width, dilation) {
+        return Err(refuse(
+            OP,
+            format!(
+                "the group fold runs four of a multiple of four channels, at most \
+                 {CONV_X4_TAPS} taps and {CONV_VERIFY_HIST} rows of history; this one is \
+                 {channels} channels, {conv_width} taps at dilation {dilation}"
+            ),
+        ));
+    }
+    ctx.fire(
+        Fire::at("ssm/conv1d.metal", "causal_conv1d_group_fold_bfloat16").apply(Grid::of(
+            [channels / 4, 1, folds.count],
+            [(channels / 4).min(CONV_VERIFY_CHANNELS * CONV_VERIFY_ROWS), 1, 1],
+        )),
+        &[
+            folds.table.arg(),
+            stated(OP, lane0)?.arg(),
+            stated(OP, lanes)?.arg(),
+            slots.arg(),
+            state.new_conv_state.arg_mut(),
+            stated(OP, channels)?.arg(),
+            stated(OP, conv_width)?.arg(),
+            stated(OP, dilation)?.arg(),
+            paged.slab.arg_mut(),
+            paged.pages.arg(),
+            paged.page_tokens.arg(),
+            paged.page_bytes.arg(),
+            paged.row_bytes.arg(),
+            paged.page_ints.arg(),
+            state.segments.arg(),
         ],
     )
 }

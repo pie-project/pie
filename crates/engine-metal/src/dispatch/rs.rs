@@ -319,6 +319,30 @@ impl Run<'_> {
         // page table reads and lands the buffer's too.
         let paged = seat.paged(self.handles(), conv.x);
         let fits = ssm::causal_conv1d_verify_fits(ext_y.width, conv.conv_width, conv.dilation);
+        // The beam groups' conv folds first (BEAM-PAGE-LISTS §11.3): each
+        // group's window moves on by the rows its beams share before any of
+        // its lanes reads it.
+        if let Some(folds) = seat.folds {
+            let Some(paged) = paged.filter(|_| fits) else {
+                return Err(Error::Backend {
+                    op: OP,
+                    detail: "a beam group folds its shared rows before the step, and the conv \
+                          reads its rows through no page table: a group fold reads them there"
+                        .to_string(),
+                });
+            };
+            ssm::causal_conv1d_group_fold(
+                self.ctx(),
+                folds,
+                self.window_lanes(),
+                self.rs_committed(seat, conv.state).slots,
+                paged,
+                &self.recurrent(conv.state),
+                ext_y.width,
+                conv.conv_width,
+                conv.dilation,
+            )?;
+        }
         if fits {
             let source = match paged {
                 Some(_) => self.tensor(conv.x),

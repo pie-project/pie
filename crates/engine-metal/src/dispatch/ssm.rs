@@ -198,6 +198,31 @@ impl Run<'_> {
                             u_row_bytes: plane_row_bytes(&seat, up, OP)?,
                         }),
                     };
+                    // The beam groups' folds first (BEAM-PAGE-LISTS §11.3):
+                    // each group's state takes the rows its beams share
+                    // before any of its lanes reads it.
+                    if let Some(folds) = seat.folds {
+                        let (Some(ba_paged), Some(corrected)) = (paged, corrected) else {
+                            return Err(kernels_metal::Error::Backend {
+                                op: OP,
+                                detail: "a beam group folds its shared rows before the step, and \
+                                      the scan reads its rows through no page table and \
+                                      corrected planes: a group fold reads them there"
+                                    .to_string(),
+                            });
+                        };
+                        ssm::gated_delta_group_fold(
+                            self.ctx(),
+                            folds,
+                            self.window_lanes(),
+                            self.rs_committed(&seat, *state).slots,
+                            (a_log, dt_bias),
+                            ba_paged,
+                            corrected,
+                            &self.recurrent(*state),
+                            (*k_heads, *v_heads, *k_dim, *v_dim),
+                        )?;
+                    }
                     // A decode window (a row of its own every lane, few
                     // carried) reads its carried rows as a linear attention.
                     if let (Some(ba_paged), Some(corrected)) = (paged, corrected)
@@ -574,6 +599,16 @@ impl crate::run::Run<'_> {
             rows,
             max_rep,
         })
+    }
+
+    /// This window's first lane and its lane count: the lanes its
+    /// recurrent ops run.
+    pub(crate) fn window_lanes(&self) -> (u32, u32) {
+        let lanes = self.qo_indptr_host().len().saturating_sub(1);
+        (
+            self.window().span.lane_offset,
+            u32::try_from(lanes).unwrap_or(u32::MAX),
+        )
     }
 
     pub(crate) fn carried_window(&self, seat: &crate::rs::Seat) -> bool {

@@ -419,6 +419,10 @@ inline device uchar* rs_buffered_row(
 // reading them to writing them back once its threadgroup has read them all.
 constant constexpr int kConvVerifyHeld = 4;
 
+// The rows of history a thread of the group fold holds: the verify conv's
+// most (`CONV_VERIFY_HIST`).
+constant constexpr int kConvFoldHeld = 16;
+
 // `causal_conv1d_committed`, four channels a thread as the prompt's
 // `causal_conv1d_chunked_x4`, with the rows of a lane spread over the
 // threadgroup's `rows` threads of those channels: a verify window's dozen
@@ -593,3 +597,67 @@ template <typename T>
       uint3, uint3, uint3);
 
 instantiate_causal_conv1d_verify(bfloat16, bfloat)
+
+// A beam group's conv fold (BEAM-PAGE-LISTS §11.3): before the layer's
+// step, each group's window moves on by the `n` rows every live beam shares,
+// read from its first lane's buffer. That lane's page table row starts `n`
+// rows past them (its replay starts at the fold), so row `t` of the fold is
+// its extended row `t - n`. `folds` holds `[lane, n]` a group; a group whose
+// lane lies outside this window's lanes is another window's. A thread holds
+// its four channels' whole history, read before any of it is written back.
+template <typename T>
+[[kernel]] void causal_conv1d_group_fold(
+    const device int* folds        [[buffer(0)]],
+    const constant int& lane0      [[buffer(1)]],
+    const constant int& lanes      [[buffer(2)]],
+    const device int* slots        [[buffer(3)]],
+    device float* conv_state       [[buffer(4)]],
+    const constant int& channels   [[buffer(5)]],
+    const constant int& conv_width [[buffer(6)]],
+    const constant int& dilation   [[buffer(7)]],
+    device uchar* slab             [[buffer(8)]],
+    const device int* page_table   [[buffer(9)]],
+    const constant uint& page_tokens [[buffer(10)]],
+    const constant uint& page_bytes [[buffer(11)]],
+    const constant uint& row_bytes [[buffer(12)]],
+    const constant uint& page_ints [[buffer(13)]],
+    const device ulong* map        [[buffer(14)]],
+    uint3 pos [[thread_position_in_grid]]) {
+  const int c = int(pos.x) * 4;
+  const int lane = folds[2 * pos.z];
+  const int n = folds[2 * pos.z + 1];
+  if (c >= channels || n <= 0 || lane < lane0 || lane >= lane0 + lanes) {
+    return;
+  }
+  const device int* ids = slots + size_t(lane) * pie_state_pieces(map);
+  if (ids[0] < 0) {
+    return;
+  }
+  const int hist = (conv_width - 1) * dilation + 1;
+  const pie_state_column piece = pie_state_inner(map, ids, uint(c), uint(channels));
+  const device int* pages = page_table + size_t(lane) * page_ints;
+  auto tap = [&](int src) -> float4 {
+    if (src < 0) {
+      return *reinterpret_cast<const device float4*>(conv_state + piece.base +
+                                                     size_t(hist + src) * piece.pitch + piece.col);
+    }
+    return float4(*reinterpret_cast<const device vec<T, 4>*>(
+        rs_buffered_row(slab, pages, src - n, page_tokens, page_bytes, row_bytes) +
+        size_t(c) * sizeof(T)));
+  };
+  float4 next[kConvFoldHeld];
+  for (int s = 0; s < hist; ++s) {
+    next[s] = tap(n - hist + s);
+  }
+  for (int s = 0; s < hist; ++s) {
+    *reinterpret_cast<device float4*>(conv_state + piece.base + size_t(s) * piece.pitch +
+                                      piece.col) = next[s];
+  }
+}
+
+template [[host_name("causal_conv1d_group_fold_bfloat16")]]
+[[kernel]] void causal_conv1d_group_fold<bfloat>(
+    const device int*, const constant int&, const constant int&, const device int*,
+    device float*, const constant int&, const constant int&, const constant int&,
+    device uchar*, const device int*, const constant uint&, const constant uint&,
+    const constant uint&, const constant uint&, const device ulong*, uint3);

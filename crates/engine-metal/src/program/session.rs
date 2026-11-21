@@ -317,6 +317,14 @@ impl Session {
         held.read(capture_pad(held) + at, into)
     }
 
+    /// The host address of the u32 at byte `at` of this instance's beam
+    /// group state ([`held::Held::host_word`]); `None` where it holds none.
+    #[must_use]
+    pub fn beam_word(&self, at: u64) -> Option<held::HostWord> {
+        let held = self.beam.as_ref()?;
+        held.host_word(capture_pad(held) + at)
+    }
+
     /// The GPU address of this instance's beam group state now, at
     /// [`CAPTURE_ALIGN`]; `None` where its program states no parents.
     #[must_use]

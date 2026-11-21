@@ -1225,3 +1225,103 @@ template <typename T, int SG, int VROWS>
 
 PIE_GDN_CARRIED(8, 2)
 PIE_GDN_CARRIED(8, 16)
+
+// A beam group's gated-delta fold (BEAM-PAGE-LISTS §11.3): before the
+// layer's step, each group's state takes the `n` rows every live beam
+// shares, from its first lane's buffered keys, `u` and `[b | a]`: the
+// carried scan's commit, S <- g S + k u^T a row in turn, with each key
+// normed and each gate made as that scan makes them. That lane's page table
+// row starts `n` rows past them, so row `t` is its extended row `t - n`.
+// `folds` holds `[lane, n]` a group; one simdgroup of `VROWS` value rows of
+// one value head a threadgroup.
+template <typename T, int VROWS>
+[[kernel]] void gated_delta_group_fold(
+    const device int* folds     [[buffer(0)]],
+    const constant int& lane0   [[buffer(1)]],
+    const constant int& lanes   [[buffer(2)]],
+    const device int* slots     [[buffer(3)]],
+    const device float* a_log   [[buffer(4)]],
+    const device T* dt_bias     [[buffer(5)]],
+    device float* rstate        [[buffer(6)]],
+    const constant int& k_heads [[buffer(7)]],
+    const constant int& v_heads [[buffer(8)]],
+    device uchar* ba_slab       [[buffer(9)]],
+    const device int* page_table [[buffer(10)]],
+    const constant uint& page_tokens [[buffer(11)]],
+    const constant uint& page_bytes [[buffer(12)]],
+    const constant uint& ba_row_bytes [[buffer(13)]],
+    device uchar* key_slab      [[buffer(14)]],
+    const constant uint& key_row_bytes [[buffer(15)]],
+    device uchar* u_slab        [[buffer(16)]],
+    const constant uint& u_row_bytes [[buffer(17)]],
+    const device ulong* map     [[buffer(18)]],
+    const constant uint& page_ints [[buffer(19)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint lane_u [[thread_index_in_simdgroup]]) {
+  constexpr int D = 128;
+  constexpr int PER = D / 32;
+  const int lane = int(lane_u);
+  const int hv = int(group.z) % v_heads;
+  const int f = int(group.z) / v_heads;
+  const int at_lane = folds[2 * f];
+  const int n = folds[2 * f + 1];
+  if (n <= 0 || at_lane < lane0 || at_lane >= lane0 + lanes) {
+    return;
+  }
+  const device int* ids = slots + size_t(at_lane) * pie_state_pieces(map);
+  if (ids[0] < 0) {
+    return;
+  }
+  const device int* pages = page_table + size_t(at_lane) * page_ints;
+  const int hk = hv / (v_heads / k_heads);
+  const int dv_base = int(group.y) * VROWS;
+  const size_t vh = size_t(v_heads);
+  const float a_scale = -metal::fast::exp(a_log[hv]);
+  const float bias = float(dt_bias[hv]);
+  device float* cells = gdn_cells<VROWS, PER>(rstate, map, ids, hv, v_heads, dv_base, D, D);
+  float st[VROWS][PER];
+  for (int v = 0; v < VROWS; ++v) {
+    const float4 s4 = *reinterpret_cast<const device float4*>(cells + size_t(v) * D + size_t(PER * lane));
+    for (int i = 0; i < PER; ++i) {
+      st[v][i] = s4[i];
+    }
+  }
+  for (int t = 0; t < n; ++t) {
+    const int e = t - n;
+    const device T* krow = reinterpret_cast<const device T*>(
+        gdn_buffered_row(key_slab, pages, e, page_tokens, page_bytes, key_row_bytes));
+    float kr[PER];
+    float rs = 0.0f;
+    for (int i = 0; i < PER; ++i) {
+      kr[i] = float(krow[size_t(hk) * D + size_t(PER * lane + i)]);
+      rs += kr[i] * kr[i];
+    }
+    const float kinv = metal::rsqrt(gdn_row_sum<32>(rs) + 1e-6f);
+    const device T* brow = reinterpret_cast<const device T*>(
+        gdn_buffered_row(ba_slab, pages, e, page_tokens, page_bytes, ba_row_bytes));
+    const float z = float(brow[vh + size_t(hv)]) + bias;
+    const float sp = (z > 20.0f) ? z : metal::log(1.0f + metal::fast::exp(z));
+    const float g = metal::exp(a_scale * sp);
+    const device float* urow = reinterpret_cast<const device float*>(
+        gdn_buffered_row(u_slab, pages, e, page_tokens, page_bytes, u_row_bytes));
+    for (int v = 0; v < VROWS; ++v) {
+      const float u = urow[size_t(hv) * D + size_t(dv_base + v)];
+      for (int i = 0; i < PER; ++i) {
+        st[v][i] = g * st[v][i] + kr[i] * kinv * u;
+      }
+    }
+  }
+  for (int v = 0; v < VROWS; ++v) {
+    *reinterpret_cast<device float4*>(cells + size_t(v) * D + size_t(PER * lane)) =
+        float4(st[v][0], st[v][1], st[v][2], st[v][3]);
+  }
+}
+
+template [[host_name("gated_delta_group_fold_bfloat16")]]
+[[kernel]] void gated_delta_group_fold<bfloat, 8>(
+    const device int*, const constant int&, const constant int&, const device int*,
+    const device float*, const device bfloat*, device float*, const constant int&,
+    const constant int&, device uchar*, const device int*, const constant uint&,
+    const constant uint&, const constant uint&, device uchar*, const constant uint&,
+    device uchar*, const constant uint&, const device ulong*, const constant uint&, uint3,
+    uint);

@@ -203,6 +203,9 @@ pub struct Handles {
     /// Each band's snapshot table, `[lanes, RS_SNAPSHOTS * (1 + width)]`.
     pub rs_snap_bands: Vec<Tensor>,
     pub rs_pages: Option<Tensor>,
+    /// The fire's beam groups' folds, `[seat, rows]` a group
+    /// (BEAM-PAGE-LISTS §11.3), and how many.
+    pub rs_folds: Option<(Tensor, u32)>,
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<PackingHandles>,
     pub inputs: Vec<(u32, Tensor)>,
@@ -263,6 +266,8 @@ pub struct Fire<'a> {
     pub rs_commit: Option<&'a [i32]>,
     pub rs_snaps: Option<&'a [i32]>,
     pub rs_pages: Option<&'a [i32]>,
+    /// The beam groups' folds, `[seat, rows]` a group (at most one a lane).
+    pub rs_folds: &'a [i32],
     pub group_of_lane: &'a [i32],
     pub packings: &'a [PackingFire<'a>],
 }
@@ -490,6 +495,7 @@ pub struct Inputs {
     rs_commit: u64,
     rs_snaps: u64,
     rs_pages: u64,
+    rs_folds: u64,
     /// The ints of a lane's rs page table row at this rung (`rs::page_ints`).
     rs_page_ints: u32,
     /// The group masks' room in the store, sized for the widest fire where
@@ -775,6 +781,7 @@ impl Inputs {
             u64::from(kernels_metal::ssm::RS_SNAPSHOTS) * (bands.len().max(1) as u64 + width);
         let rs_snaps = take(lanes * snap_ints.max(u64::from(SNAP_INTS)) * 4);
         let rs_pages = take(lanes * u64::from(rs_page_ints) * 4);
+        let rs_folds = take(lanes * 2 * 4);
         let mask_bytes = if ragged == 0 {
             0
         } else {
@@ -853,6 +860,7 @@ impl Inputs {
             rs_commit,
             rs_snaps,
             rs_pages,
+            rs_folds,
             rs_page_ints,
             group_masks,
             beam,
@@ -1066,6 +1074,16 @@ impl Inputs {
                 });
             }
             self.store.write(self.rs_pages, bytes_of(pages))?;
+        }
+        if fire.rs_folds.len() > lanes as usize * 2 || fire.rs_folds.len() % 2 != 0 {
+            return Err(Fault::Ceiling {
+                what: "beam group folds, a pair a group and at most a group a lane",
+                need: fire.rs_folds.len() as u64,
+                have: u64::from(lanes) * 2,
+            });
+        }
+        if !fire.rs_folds.is_empty() {
+            self.store.write(self.rs_folds, bytes_of(fire.rs_folds))?;
         }
 
         let adapter_routes = match fire.adapter_routes {
@@ -1638,6 +1656,19 @@ impl Inputs {
                 )?),
                 None => None,
             },
+            rs_folds: if fire.rs_folds.is_empty() {
+                None
+            } else {
+                Some((
+                    i32s(
+                        handles,
+                        self.store.view(),
+                        self.store.at(self.rs_folds),
+                        fire.rs_folds.len() as u32,
+                    )?,
+                    fire.rs_folds.len() as u32 / 2,
+                ))
+            },
         })
     }
 
@@ -1782,6 +1813,7 @@ mod rung_tests {
             rs_commit: None,
             rs_snaps: None,
             rs_pages: None,
+            rs_folds: &[],
             group_of_lane: &lane,
             packings: &[],
         };

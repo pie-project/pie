@@ -754,6 +754,10 @@ pub struct Seat {
     pub pages: Option<Tensor>,
     /// The ints of a lane's row of `pages` ([`page_ints`]).
     pub page_ints: u32,
+    /// The fire's beam groups' folds before each recurrent layer's step
+    /// (BEAM-PAGE-LISTS §11.3), read through `pages`; `None` where no group
+    /// folds this fire.
+    pub folds: Option<kernels_metal::ssm::GroupFolds>,
     pub ext: RefCell<HashMap<u32, Tensor>>,
     /// The gate preps whose gates the verify scan derives as it stages its
     /// rows, by the gates value: the `[b | a]` projection, `dt_bias` and
@@ -798,6 +802,7 @@ impl Seat {
         rows_ext: u32,
         pages: Option<Tensor>,
         page_ints: u32,
+        folds: Option<(Tensor, u32)>,
     ) -> Result<Seat> {
         let lane_count = u32::try_from(lanes.len()).unwrap_or(u32::MAX);
         let need = Seat::scratch_bytes(layout, rows_ext, lane_count);
@@ -864,6 +869,7 @@ impl Seat {
             rows_ext,
             pages,
             page_ints,
+            folds: folds.map(|(table, count)| kernels_metal::ssm::GroupFolds { table, count }),
             ext: RefCell::new(HashMap::new()),
             prepped: RefCell::new(HashMap::new()),
         })

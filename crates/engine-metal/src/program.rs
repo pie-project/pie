@@ -754,6 +754,15 @@ impl Plane {
             .collect())
     }
 
+    /// The host address of instance `id`'s beam group's common slot word
+    /// (BEAM-PAGE-LISTS §11.3): its header's fourth, below which every live
+    /// beam's rows are one, as its last head step left it. `None` where it
+    /// holds no beam state.
+    #[must_use]
+    pub fn beam_common_word(&self, id: InstanceId) -> Option<held::HostWord> {
+        self.instances.get(&id)?.session.beam_word(12)
+    }
+
     /// The cell instance `id`'s next pass reads its beams' parents from
     /// ([`Session::parents_cell`]).
     pub fn parents_cell(&self, id: InstanceId) -> Result<Option<(crate::device::Buffer, u64)>> {

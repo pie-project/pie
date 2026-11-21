@@ -4466,6 +4466,29 @@ impl Shell {
         let mut writes: Vec<Option<(i32, i32)>> = Vec::with_capacity(rows as usize);
         // What each lane writes and reads of its set (`engine::extent`).
         let mut extents = engine::extent::FireExtents::default();
+        // Each beam group's fold (`BEAM-PAGE-LISTS.md` §11.3): the slot its
+        // set's state is folded to before any of its lanes reads it, as its
+        // lanes state it (the runtime states it on the first); the fold the
+        // fire runs, `[seat, rows]` a group; and per seat the rows its page
+        // table row starts past its buffer's first (the group's fold).
+        let mut beam_to: Vec<Option<u32>> = vec![None; beam_groups.len()];
+        for (source, seated) in lanes.iter().enumerate() {
+            if let (
+                Some(group),
+                engine::fire::RsVerb::Buffer {
+                    folded,
+                    fold: engine::fire::FoldLen::Host(n),
+                    ..
+                },
+            ) = (group_of.get(source).copied().flatten(), seated.rs)
+            {
+                let to = folded.saturating_add(*n);
+                beam_to[group] = Some(beam_to[group].map_or(to, |at: u32| at.max(to)));
+            }
+        }
+        let mut beam_folded: Vec<bool> = vec![false; beam_groups.len()];
+        let mut group_folds: Vec<i32> = Vec::new();
+        let mut rs_skips: Vec<u32> = Vec::with_capacity(lanes.len());
         for row in composition.lanes() {
             let source = row.source as usize;
             let seated = &lanes[source];
@@ -4742,7 +4765,7 @@ impl Shell {
                 }
                 verb => verb.clone(),
             };
-            let plan = engine::rs::LanePlan::of(
+        let plan = engine::rs::LanePlan::of(
                 &rs,
                 row.rows,
                 first,
@@ -4750,6 +4773,52 @@ impl Shell {
                 ports.as_ref().and_then(engine::ports::LanePorts::fold),
             )
             .map_err(|error| Fault::program("serve::rs", format!("lane {source}: {error}")))?;
+            // A beam group's lanes share their set's state: what its lanes
+            // fold is folded once for all of them, from the first's buffered
+            // rows, before any reads it (§11.3). Each lane then replays only
+            // the rows past it, from its page table row started past them,
+            // and folds none itself.
+            let beam_group = group_of[source].filter(|_| {
+                matches!(rs, engine::fire::RsVerb::Buffer { .. })
+            });
+            let mut plan = plan;
+            let (skip, beam_fold_to) = match (beam_group, &rs) {
+                (Some(group), engine::fire::RsVerb::Buffer { folded, .. }) => {
+                    let to = beam_to[group].unwrap_or(*folded).min(first).max(*folded);
+                    let skip = to - folded;
+                    if beam_to[group].is_some_and(|stated| stated > first) {
+                        tracing::warn!(
+                            instance = %beam_groups[group].instance,
+                            lane = source,
+                            folded = *folded,
+                            stated = beam_to[group].unwrap_or(0),
+                            first,
+                            "a beam group's fold is stated past its lanes' first row (§11.3)"
+                        );
+                    }
+                    if skip > 0 && plan.gathers.len() != 1 {
+                        return Err(Fault::program(
+                            "serve::rs",
+                            format!(
+                                "lane {source} of a beam group folds {skip} shared row(s) before \
+                                 its step and replays {} run(s) of its buffer; a group fold \
+                                 reads one run from the set's fold (BEAM-PAGE-LISTS.md §11.3)",
+                                plan.gathers.len()
+                            ),
+                        ));
+                    }
+                    plan.replay = plan.replay.saturating_sub(skip);
+                    plan.commit = 0;
+                    if skip > 0 && !beam_folded[group] {
+                        beam_folded[group] = true;
+                        group_folds.push(rs_plans.len() as i32);
+                        group_folds.push(skip as i32);
+                    }
+                    (skip, Some(to))
+                }
+                _ => (0, None),
+            };
+            rs_skips.push(skip);
             // A reporting lane that buffers tells, where the fire settles,
             // how many slots past its state's frozen length this fire froze
             // (as `LanePlan::of` reckons it) and, where a port places its
@@ -4764,7 +4833,13 @@ impl Shell {
                                 .as_ref()
                                 .and_then(engine::ports::LanePorts::fold),
                         };
-                        fold.map(|n| folded.saturating_add(n).min(end) - folded)
+                        // A beam lane folds nothing itself: its group's fold
+                        // is the runtime's, applied to the set (§11.3).
+                        if beam_fold_to.is_some() {
+                            Some(0)
+                        } else {
+                            fold.map(|n| folded.saturating_add(n).min(end) - folded)
+                        }
                     }
                     // A lane with no recurrent state to buffer (a kv-only
                     // model's): its fold is what its program's `fold` port
@@ -4788,10 +4863,12 @@ impl Shell {
                         ports.as_ref().and_then(engine::ports::LanePorts::fold)
                     }
                 };
+                // A beam group's set is folded by the runtime as it prepares
+                // the fire (§11.3): nothing is frozen ahead of what it states.
                 let to = n.map_or(*folded, |n| {
                     folded.saturating_add(n).min(first.saturating_add(row.rows))
                 });
-                if to > *folded {
+                if beam_fold_to.is_none() && to > *folded {
                     self.frozen_ahead.insert(key, to);
                 }
             }
@@ -4805,8 +4882,12 @@ impl Shell {
             // writes, but a lane of a copy-on-write group that folds nothing
             // reads the run side, which no other lane writes this fire
             // (CONTRACT-BC 15); its buffered rows still land in `record`.
+            // A beam group's lanes read the record its fold, if any, has
+            // written before them (§11.3).
             let state = match seated.record_run {
-                Some(run) if plan.commit == 0 => self.pools.record(Some(run), lane.slot)?,
+                Some(run) if plan.commit == 0 && beam_fold_to.is_none() => {
+                    self.pools.record(Some(run), lane.slot)?
+                }
                 _ => record.clone(),
             };
             state_top = state
@@ -5289,6 +5370,29 @@ impl Shell {
             }
             _ => None,
         };
+        // A beam lane whose group folds first replays from the fold: its
+        // row starts that many rows on, the rows below it the group fold's
+        // (§11.3), which reads them through the same row.
+        let rs_pages = match rs_pages {
+            Some(mut table) => {
+                let ints = rs_page_ints as usize;
+                for (at, &skip) in rs_skips.iter().enumerate() {
+                    if skip > 0 && table[at * ints] >= 0 {
+                        table[at * ints] += skip as i32;
+                    }
+                }
+                Some(table)
+            }
+            None if !group_folds.is_empty() => {
+                return Err(Fault::program(
+                    "serve::rs",
+                    "a beam group folds its shared rows before its step, and its lanes' rows lie \
+                     in no one stretch of pages a lane: a group fold reads them through a page \
+                     table (BEAM-PAGE-LISTS.md §11.3); the fire is refused and writes nothing",
+                ));
+            }
+            None => None,
+        };
         // A hybrid's beams (BEAM-PAGE-LISTS §11): each beam's rs page table,
         // resolved over its list by the head step, and its rs copies over
         // every rs plane, through its set's rs entries.
@@ -5578,6 +5682,7 @@ impl Shell {
                 rs_commit: rs_active.then_some(rs_commit.as_slice()),
                 rs_snaps: (!rs_snaps.is_empty()).then_some(rs_snaps.as_slice()),
                 rs_pages: rs_pages.as_deref(),
+                rs_folds: &group_folds,
                 request_of_token: &request_of_token,
                 adapter_routes: any_adapter.then_some(adapter_routes.as_slice()),
                 page_tables: &geometries,
@@ -5751,6 +5856,7 @@ impl Shell {
                     rows_ext,
                     bound.rs_pages,
                     rs_page_ints,
+                    bound.rs_folds,
                 )?))
             } else {
                 None
@@ -6559,6 +6665,22 @@ impl engine::frame::Shell for Shell {
         let lanes = u32::try_from(prepared.lanes.len()).unwrap_or(u32::MAX);
         // What the fire tells its completion sink once its buffer completed:
         // its folds and ends, or why it failed.
+        // Each beam group's common slot word (§11.3), read once the buffer
+        // completed: what the runtime folds the group's set to.
+        let common_words: Vec<(engine::InstanceId, crate::program::held::HostWord)> = {
+            let mut words: Vec<(engine::InstanceId, crate::program::held::HostWord)> = Vec::new();
+            if let Some((_, lanes)) = prepared.beam_check.as_ref() {
+                for &(_, instance) in lanes {
+                    if words.iter().any(|&(at, _)| at == instance) {
+                        continue;
+                    }
+                    if let Some(word) = self.programs.beam_common_word(instance) {
+                        words.push((instance, word));
+                    }
+                }
+            }
+            words
+        };
         let tell: Told = Box::new(move |refused: Option<String>, faulted: &[Faulted]| {
             let refused = refused.or_else(|| verdict.as_ref().and_then(|verdict| verdict()));
             if let Some(done) = done.as_ref() {
@@ -6568,6 +6690,10 @@ impl engine::frame::Shell for Shell {
                         for (lanes, instance, why) in faulted {
                             outcome.fault_lanes(lanes.clone(), Some(*instance), why);
                         }
+                        outcome.beam_common = common_words
+                            .iter()
+                            .map(|&(instance, word)| (instance, word.read()))
+                            .collect();
                         outcome
                     }
                     Some(why) => engine::StepOutcome::lost(
