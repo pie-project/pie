@@ -96,6 +96,9 @@ impl WasiView for ProcessCtx {
 #[cfg(not(target_arch = "wasm32"))]
 pub struct PieHttpHooks {
     network_allowed: bool,
+    /// The process whose guest sends: it waits on the outside until the
+    /// response comes back ([`crate::inferlet::process::away_while`]).
+    pid: ProcessId,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -103,6 +106,40 @@ impl WasiHttpHooks for PieHttpHooks {
     fn is_supported_scheme(&mut self, scheme: &http::uri::Scheme) -> bool {
         self.network_allowed
             && (*scheme == http::uri::Scheme::HTTP || *scheme == http::uri::Scheme::HTTPS)
+    }
+
+    /// The default send, its response awaited as outside input: the
+    /// process's lanes leave the frame while the guest waits on it.
+    fn send_request(
+        &mut self,
+        request: http::Request<wasmtime_wasi_http::WasiBody>,
+        options: Option<wasmtime_wasi_http::RequestOptions>,
+        fut: Box<dyn Future<Output = Result<(), wasmtime_wasi_http::Error>> + Send>,
+    ) -> Box<
+        dyn Future<
+                Output = Result<
+                    (
+                        http::Response<wasmtime_wasi_http::WasiBody>,
+                        Box<dyn Future<Output = Result<(), wasmtime_wasi_http::Error>> + Send>,
+                    ),
+                    wasmtime_wasi_http::Error,
+                >,
+            > + Send,
+    > {
+        _ = fut;
+        let pid = self.pid;
+        Box::new(async move {
+            use http_body_util::BodyExt;
+            let (response, io) = crate::inferlet::process::away_while(
+                pid,
+                wasmtime_wasi_http::default_send_request(request, options),
+            )
+            .await?;
+            Ok((
+                response.map(BodyExt::boxed_unsync),
+                Box::new(io) as Box<dyn Future<Output = _> + Send>,
+            ))
+        })
     }
 }
 
@@ -194,6 +231,7 @@ impl ProcessCtx {
             #[cfg(not(target_arch = "wasm32"))]
             http_hooks: PieHttpHooks {
                 network_allowed: policy.network.allow,
+                pid: id,
             },
             scratch_dir,
             script,

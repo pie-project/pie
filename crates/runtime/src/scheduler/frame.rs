@@ -36,6 +36,28 @@ fn idle_dump_min_seats() -> usize {
     })
 }
 
+/// Whether a seal says what it sealed: the wave trace, or the scheduler's
+/// debug level. Off, nothing on the hot path reads a fire's program.
+pub(crate) fn seal_trace() -> bool {
+    super::worker::wave_trace() || tracing::enabled!(tracing::Level::DEBUG)
+}
+
+/// Says, on the seal trace, why `lane` stops being awaited: which
+/// mechanism took it out of the gate.
+fn trace_unawait(cause: &str, lane: ProcessId, owner: Option<ProcessId>) {
+    if !seal_trace() {
+        return;
+    }
+    let line = format!("unawait cause={cause} lane={lane} owner={owner:?}");
+    if super::worker::wave_trace() {
+        super::worker::wave_trace_emit(format!(
+            "[wave-trace] t={}us {line}",
+            super::worker::wave_trace_us()
+        ));
+    }
+    tracing::debug!("{line}");
+}
+
 pub(super) fn idle_dump_threshold_us() -> u64 {
     static THRESHOLD: OnceLock<u64> = OnceLock::new();
     *THRESHOLD.get_or_init(|| {
@@ -68,6 +90,9 @@ struct ArrivedFire {
     /// What the fire takes of its activation rung
     /// ([`crate::engine::FireRequest::rung_rows`]).
     rung_rows: usize,
+    /// The program its instance runs, as the seal trace names it; 0 where
+    /// the trace is off ([`seal_trace`]).
+    program: u64,
 }
 
 struct PlacedFire {
@@ -99,7 +124,6 @@ struct LaneState {
     served: bool,
     retired_at: Option<Instant>,
     parked: bool,
-    leashed: bool,
     clock_from: Option<Instant>,
     frames: VecDeque<PendingFrame>,
     fired_this_boundary: bool,
@@ -222,15 +246,13 @@ pub(crate) struct FramePolicy {
     /// The rung rows a fire sealed now may take: the activation rung's cap
     /// ([`Self::cap_fires`]).
     fire_cap: usize,
-    submit_deadline: Duration,
     silence_timeout: Duration,
     stats: Option<Arc<SchedulerStats>>,
 }
 
 impl FramePolicy {
     #[cfg(test)]
-    fn with_submit_deadline(mut self, deadline: Duration) -> Self {
-        self.submit_deadline = deadline;
+    fn with_silence_timeout_off(mut self) -> Self {
         self.silence_timeout = Duration::from_secs(86_400);
         self
     }
@@ -312,7 +334,6 @@ impl FramePolicy {
             in_flight_lanes: BTreeSet::new(),
             fire_cap: usize::MAX,
             in_flight_since: BTreeMap::new(),
-            submit_deadline: crate::scheduler::configured_submit_deadline(),
             silence_timeout: crate::scheduler::configured_silence_timeout(),
             stats,
         }
@@ -332,7 +353,7 @@ impl FramePolicy {
         tokens: usize,
         rows: usize,
     ) {
-        self.on_fire_reading(stamp, owner, fire_id, tokens, rows, rows, tokens);
+        self.on_fire_reading(stamp, owner, fire_id, tokens, rows, rows, tokens, 0);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -345,6 +366,7 @@ impl FramePolicy {
         rows: usize,
         readouts: usize,
         rung_rows: usize,
+        program: u64,
     ) {
         let accept_began = self.stats.is_some().then(Instant::now);
         self.record_arrival(
@@ -357,6 +379,7 @@ impl FramePolicy {
                 rows,
                 readouts,
                 rung_rows,
+                program,
             },
         );
         if let (Some(began), Some(stats)) = (accept_began, &self.stats) {
@@ -381,6 +404,7 @@ impl FramePolicy {
                 rows: 0,
                 readouts: 0,
                 rung_rows: 0,
+                program: 0,
             },
         );
     }
@@ -406,7 +430,6 @@ impl FramePolicy {
             served: false,
             retired_at: None,
             parked: suspended,
-            leashed: false,
             clock_from: None,
             frames: VecDeque::new(),
             fired_this_boundary: true,
@@ -419,7 +442,6 @@ impl FramePolicy {
             lane.parked = false;
             lane.awaited = true;
         }
-        lane.leashed = false;
         lane.clock_from = None;
         let for_front_frame = lane
             .frames
@@ -475,7 +497,6 @@ impl FramePolicy {
             served: false,
             retired_at: None,
             parked: suspended,
-            leashed: false,
             clock_from: None,
             frames: VecDeque::new(),
             fired_this_boundary: true,
@@ -522,10 +543,13 @@ impl FramePolicy {
     }
 
     fn retire_parks(&mut self) {
-        for state in self.lanes.values_mut() {
+        for (lane_id, state) in self.lanes.iter_mut() {
             while state.frames.front().is_some_and(|frame| frame.park) {
                 state.frames.pop_front();
                 if state.frames.is_empty() {
+                    if state.awaited {
+                        trace_unawait("park", *lane_id, state.owner);
+                    }
                     state.awaited = false;
                     state.parked = true;
                     state.clock_from = None;
@@ -624,6 +648,9 @@ impl FramePolicy {
             self.truncated_seqs.remove(&lane);
             self.in_flight_lanes.remove(&lane);
         } else if let Some(state) = self.lanes.get_mut(&lane) {
+            if state.awaited {
+                trace_unawait("close", lane, owner);
+            }
             state.awaited = false;
             state.parked = true;
             self.truncate_incomplete(lane);
@@ -663,7 +690,7 @@ impl FramePolicy {
     pub fn on_process_suspend(&mut self, owner: ProcessId) {
         self.suspended.insert(owner);
         self.pending_binds.remove(&owner);
-        self.park_owner(owner);
+        self.park_owner(owner, "suspend");
     }
 
     /// `owner` waits on something only the frame's firing frees: its bind
@@ -674,12 +701,22 @@ impl FramePolicy {
     /// they are parked as a suspension's are, and come back with its next
     /// submit ([`Self::record_arrival`]).
     pub fn on_owner_waits(&mut self, owner: ProcessId) {
-        self.park_owner(owner);
+        self.park_owner(owner, "owner-waits");
+    }
+
+    /// `owner`'s guest waits on input from outside the runtime: a session
+    /// receive, a timer, an HTTP response. Nothing the frame does brings
+    /// that input, so no frame waits on its lanes: they are parked, and
+    /// each comes back with its own next submit ([`Self::record_arrival`]).
+    /// A guest that computes, or waits on its own fires and channels, is
+    /// not away: its lanes stay awaited.
+    pub fn on_owner_away(&mut self, owner: ProcessId) {
+        self.park_owner(owner, "outside-wait");
     }
 
     /// Parks `owner`'s lanes: none is awaited, what arrived of an
     /// incomplete frame goes as it stands.
-    fn park_owner(&mut self, owner: ProcessId) {
+    fn park_owner(&mut self, owner: ProcessId, cause: &str) {
         let owned: Vec<ProcessId> = self
             .lanes
             .iter()
@@ -688,6 +725,9 @@ impl FramePolicy {
             .collect();
         for lane_id in owned {
             if let Some(lane) = self.lanes.get_mut(&lane_id) {
+                if lane.awaited {
+                    trace_unawait(cause, lane_id, Some(owner));
+                }
                 lane.awaited = false;
                 lane.parked = true;
             }
@@ -770,6 +810,7 @@ impl FramePolicy {
             return None;
         }
         let mid_boundary = self.boundary_open();
+        let trace = seal_trace();
 
         let k = self.k;
         let max_wave_rows = self.max_wave_rows;
@@ -866,6 +907,8 @@ impl FramePolicy {
             let mut members: HashSet<ProcessId> = HashSet::new();
             let mut sealed_widest = 0usize;
             let mut dropped_empty = false;
+            // The lanes of each program the frame carries (the trace's).
+            let mut by_program: BTreeMap<u64, usize> = BTreeMap::new();
             for lane_id in &order {
                 let Some(lane) = self.lanes.get_mut(lane_id) else {
                     continue;
@@ -952,6 +995,21 @@ impl FramePolicy {
                         stats.fire.quorum.turnaround_max_us.fetch_max(us, Relaxed);
                     }
                 }
+                if trace {
+                    let mut programs: Vec<u64> = lane
+                        .frames
+                        .front()
+                        .into_iter()
+                        .flat_map(|front| front.fires.iter())
+                        .filter(|fire| fire.fire_id.is_some())
+                        .map(|fire| fire.program)
+                        .collect();
+                    programs.sort_unstable();
+                    programs.dedup();
+                    for program in programs {
+                        *by_program.entry(program).or_default() += 1;
+                    }
+                }
                 lane.served = true;
                 lane.prompting = prompting;
                 lane.frames.pop_front();
@@ -961,19 +1019,19 @@ impl FramePolicy {
                     continue;
                 }
                 self.lanes
-                    .retain(|_, lane| lane.awaited || lane.leashed || !lane.frames.is_empty());
+                    .retain(|_, lane| lane.awaited || !lane.frames.is_empty());
                 return None;
             }
-            if super::worker::wave_trace() {
+            if trace {
                 let complete = self
                     .lanes
                     .values()
                     .filter(|lane| lane.frames.front().is_some_and(PendingFrame::is_complete))
                     .count();
                 let awaited = self.lanes.values().filter(|lane| lane.awaited).count();
-                super::worker::wave_trace_emit(format!(
-                    "[wave-trace] t={}us seal partition={} fresh={} continuing={} complete_left={} awaited={} lanes={} in_flight={} mid_boundary={mid_boundary} executing={} rows={wave_rows:?} tokens={wave_tokens:?}",
-                    super::worker::wave_trace_us(),
+                let parked = self.lanes.values().filter(|lane| lane.parked).count();
+                let line = format!(
+                    "seal partition={} fresh={} continuing={} complete_left={} awaited={} parked={parked} lanes={} in_flight={} mid_boundary={mid_boundary} prompts_only={} executing={} programs={} lanes_by_program={by_program:?} rows={wave_rows:?} tokens={wave_tokens:?}",
                     members.len(),
                     fresh.len(),
                     continuing.len(),
@@ -981,8 +1039,17 @@ impl FramePolicy {
                     awaited,
                     self.lanes.len(),
                     self.in_flight_lanes.len(),
-                    self.executing_now
-                ));
+                    self.prompts_only,
+                    self.executing_now,
+                    by_program.len(),
+                );
+                if super::worker::wave_trace() {
+                    super::worker::wave_trace_emit(format!(
+                        "[wave-trace] t={}us {line}",
+                        super::worker::wave_trace_us()
+                    ));
+                }
+                tracing::debug!("{line}");
             }
             if !mid_boundary && !self.prompts_only {
                 self.open_boundary();
@@ -1001,7 +1068,7 @@ impl FramePolicy {
                 widest: sealed_widest,
             });
             self.lanes
-                .retain(|_, lane| lane.awaited || lane.leashed || !lane.frames.is_empty());
+                .retain(|_, lane| lane.awaited || !lane.frames.is_empty());
             return Some(FramePlan::Dispatch(Vec::new()));
         }
     }
@@ -1191,7 +1258,6 @@ ready_age_newest={}us",
             let mut missing = 0;
             let mut blocking_lanes: Vec<(ProcessId, bool, bool)> = Vec::new();
             let mut expired: Vec<ProcessId> = Vec::new();
-            let leash = self.submit_deadline;
             let silence = self.silence_timeout;
             debug_assert!(
                 !self.boundary_open(),
@@ -1213,7 +1279,7 @@ ready_age_newest={}us",
                     GateVerdict::Blocking => true,
                     GateVerdict::SkippedOwed | GateVerdict::Satisfied => false,
                 };
-                if !blocking && !lane.leashed {
+                if !blocking {
                     lane.clock_from = None;
                     continue;
                 }
@@ -1225,16 +1291,10 @@ ready_age_newest={}us",
                     }
                     match lane.clock_from {
                         Some(from) if now.saturating_duration_since(from) >= silence => {
+                            trace_unawait("silence", *lane_id, lane.owner);
                             lane.awaited = false;
-                            lane.leashed = false;
                             lane.clock_from = None;
                             expired.push(lane.owner.unwrap_or(*lane_id));
-                            continue;
-                        }
-                        Some(from) if blocking && now.saturating_duration_since(from) >= leash => {
-                            lane.awaited = false;
-                            lane.parked = true;
-                            lane.leashed = true;
                             continue;
                         }
                         Some(_) => {}
@@ -1420,6 +1480,219 @@ mod tests {
         }
     }
 
+    /// Lanes of three kinds share frames of two steps under a dispatch
+    /// depth of two, each kind its own program (the epilogue lanes two, by
+    /// turns, as a beam step's).
+    ///
+    /// A constant lane's next frame needs nothing from its guest, so it
+    /// runs a frame ahead of the device. A channel lane's next frame reads
+    /// an input its guest writes each step into a ring of `capacity` cells,
+    /// and a put into a full ring waits until the device takes a cell: its
+    /// next submit waits on the retire of the frame that takes what it
+    /// wrote. An epilogue lane harvests its fire's result, then its guest
+    /// computes (wasm between fires, no channel wait, no park) across
+    /// several of the scheduler's passes, some while a frame executes and
+    /// some while none does, before it submits again.
+    ///
+    /// Nothing tells the scheduler a guest waits or computes: each lane is
+    /// expected this step like any other, so every frame seals with every
+    /// lane of every kind.
+    #[test]
+    fn a_lane_whose_guest_writes_its_input_or_computes_between_fires_is_awaited() {
+        const K: usize = 2;
+        const DEPTH: usize = 2;
+        const EACH: usize = 3;
+        /// The scheduler passes an epilogue spans after its harvest.
+        const EPILOGUE: usize = 3;
+        #[derive(Clone, Copy)]
+        enum Kind {
+            Constant,
+            /// The ring's tail (cells written) and head (cells taken).
+            Channel(usize, usize),
+            /// Passes left in its epilogue.
+            Epilogue(usize),
+        }
+        struct Lane {
+            id: ProcessId,
+            kind: Kind,
+            /// Frames submitted and not retired.
+            outstanding: usize,
+            seq: u64,
+        }
+        impl Lane {
+            fn index(&self) -> usize {
+                match self.kind {
+                    Kind::Constant => 0,
+                    Kind::Channel(..) => 1,
+                    Kind::Epilogue(_) => 2,
+                }
+            }
+        }
+        for capacity in [K, 2 * K] {
+            let mut policy = FramePolicy::new(K, 64, 4096, None);
+            let mut lanes: Vec<Lane> = (0..3 * EACH)
+                .map(|at| Lane {
+                    id: pid(),
+                    kind: match at / EACH {
+                        0 => Kind::Constant,
+                        1 => Kind::Channel(0, 0),
+                        _ => Kind::Epilogue(0),
+                    },
+                    outstanding: 0,
+                    seq: 0,
+                })
+                .collect();
+            let mut next_fire = 0u64;
+            let mut owner_of: HashMap<u64, ProcessId> = HashMap::new();
+            let mut queued: Vec<u64> = Vec::new();
+            let mut in_flight: VecDeque<BTreeSet<ProcessId>> = VecDeque::new();
+            let mut sealed: Vec<[usize; 3]> = Vec::new();
+
+            let submit = |lanes: &mut Vec<Lane>,
+                          policy: &mut FramePolicy,
+                          queued: &mut Vec<u64>,
+                          owner_of: &mut HashMap<u64, ProcessId>,
+                          next_fire: &mut u64| {
+                for lane in lanes.iter_mut() {
+                    loop {
+                        let room = match lane.kind {
+                            Kind::Constant => lane.outstanding < DEPTH,
+                            // The guest writes the frame's K cells first;
+                            // a full ring parks the put.
+                            Kind::Channel(tail, head) => tail - head + K <= capacity,
+                            // It submits once its harvest is through and
+                            // its guest has computed what comes next.
+                            Kind::Epilogue(left) => lane.outstanding == 0 && left == 0,
+                        };
+                        if !room {
+                            break;
+                        }
+                        if let Kind::Channel(tail, _) = &mut lane.kind {
+                            *tail += K;
+                        }
+                        let program = match lane.kind {
+                            Kind::Constant => 1,
+                            Kind::Channel(..) => 2,
+                            Kind::Epilogue(_) => 12 + 3 * (lane.seq % 2),
+                        };
+                        for slot in 0..K as u32 {
+                            let fire = *next_fire;
+                            *next_fire += 1;
+                            policy.on_fire_reading(
+                                stamp(lane.id, lane.seq, slot, K as u32),
+                                Some(lane.id),
+                                fire,
+                                1,
+                                1,
+                                1,
+                                1,
+                                program,
+                            );
+                            owner_of.insert(fire, lane.id);
+                            queued.push(fire);
+                        }
+                        lane.seq += 1;
+                        lane.outstanding += 1;
+                    }
+                }
+            };
+            let schedule = |policy: &mut FramePolicy,
+                            queued: &mut Vec<u64>,
+                            owner_of: &HashMap<u64, ProcessId>,
+                            in_flight: &mut VecDeque<BTreeSet<ProcessId>>,
+                            sealed: &mut Vec<[usize; 3]>,
+                            lanes: &Vec<Lane>| {
+                while in_flight.len() < DEPTH {
+                    let ids: QueuedFireIds = queued.iter().copied().collect();
+                    let plan = policy.plan_dispatch(
+                        &ids,
+                        &HashSet::new(),
+                        !in_flight.is_empty(),
+                        Instant::now(),
+                    );
+                    let FramePlan::Dispatch(waves) = plan else {
+                        break;
+                    };
+                    let fires: Vec<u64> = waves.into_iter().flatten().collect();
+                    queued.retain(|fire| !fires.contains(fire));
+                    let members: BTreeSet<ProcessId> =
+                        fires.iter().map(|fire| owner_of[fire]).collect();
+                    let mut kinds = [0usize; 3];
+                    for lane in lanes.iter().filter(|lane| members.contains(&lane.id)) {
+                        kinds[lane.index()] += 1;
+                    }
+                    sealed.push(kinds);
+                    policy.on_frame_posted(members.iter().copied(), Instant::now());
+                    in_flight.push_back(members);
+                }
+            };
+
+            for _ in 0..16 {
+                submit(
+                    &mut lanes,
+                    &mut policy,
+                    &mut queued,
+                    &mut owner_of,
+                    &mut next_fire,
+                );
+                schedule(
+                    &mut policy,
+                    &mut queued,
+                    &owner_of,
+                    &mut in_flight,
+                    &mut sealed,
+                    &lanes,
+                );
+                // The device runs the oldest frame: its takes free the
+                // channel lanes' cells, and the epilogue lanes harvest it.
+                let members = in_flight
+                    .pop_front()
+                    .expect("a frame is in flight: the gate never stalls every kind");
+                policy.on_frame_retired(members.iter().copied());
+                for lane in lanes.iter_mut().filter(|lane| members.contains(&lane.id)) {
+                    lane.outstanding -= 1;
+                    match &mut lane.kind {
+                        Kind::Channel(_, head) => *head += K,
+                        Kind::Epilogue(left) => *left = EPILOGUE,
+                        Kind::Constant => {}
+                    }
+                }
+                // The scheduler plans while the epilogues compute, the
+                // other kinds' next submits landing meanwhile.
+                for pass in 0..EPILOGUE {
+                    schedule(
+                        &mut policy,
+                        &mut queued,
+                        &owner_of,
+                        &mut in_flight,
+                        &mut sealed,
+                        &lanes,
+                    );
+                    for lane in lanes.iter_mut() {
+                        if let Kind::Epilogue(left) = &mut lane.kind {
+                            *left = left.saturating_sub(1);
+                        }
+                    }
+                    if pass == 0 {
+                        submit(
+                            &mut lanes,
+                            &mut policy,
+                            &mut queued,
+                            &mut owner_of,
+                            &mut next_fire,
+                        );
+                    }
+                }
+            }
+            assert!(sealed.len() >= 8, "capacity {capacity}: frames {sealed:?}");
+            assert!(
+                sealed.iter().all(|&kinds| kinds == [EACH; 3]),
+                "capacity {capacity}: every frame seals with every lane of every kind \
+                 (constant, channel, epilogue): {sealed:?}"
+            );
+        }
+    }
+
     #[test]
     fn frame_every_case() {
         seals_complete_lanes_and_orders_waves_by_slot();
@@ -1435,6 +1708,7 @@ mod tests {
         a_wave_reads_out_no_more_than_the_engine_carves();
         a_policys_bound_packs_prompts_into_a_frame_up_to_it_and_no_further();
         a_frame_goes_without_a_lane_whose_process_waits();
+        a_lane_whose_guest_waits_on_the_outside_holds_no_frame_and_rejoins_on_its_submit();
         a_prompt_piece_cut_under_a_cap_since_lowered_waits_whole_and_owes_nothing();
     }
 
@@ -1446,7 +1720,7 @@ mod tests {
     /// lowered under it until it has.
     fn a_prompt_piece_cut_under_a_cap_since_lowered_waits_whole_and_owes_nothing() {
         let mut policy =
-            FramePolicy::new(1, 64, 4096, None).with_submit_deadline(Duration::from_secs(86_400));
+            FramePolicy::new(1, 64, 4096, None).with_silence_timeout_off();
         let (prompt, decode) = (pid(), pid());
         policy.cap_fires(128);
         // The prompt's first piece (64 rows) and a decode, one frame.
@@ -1481,15 +1755,76 @@ mod tests {
         assert_eq!(fires(&plan(&mut policy, &queued, Instant::now())), vec![3]);
     }
 
+    /// A guest blocked on input from outside (a session receive, a timer,
+    /// an HTTP response) is parked by the host: the frames go without its
+    /// lane, a frame it submitted before it blocked still goes, and its
+    /// next submit brings the lane back, awaited like any other.
+    fn a_lane_whose_guest_waits_on_the_outside_holds_no_frame_and_rejoins_on_its_submit() {
+        let mut policy = FramePolicy::new(1, 64, 4096, None).with_silence_timeout_off();
+        let (runner, receiver) = (pid(), pid());
+        policy.on_fire_enqueued(stamp(runner, 0, 0, 1), Some(runner), 1, 1, 1);
+        policy.on_fire_enqueued(stamp(receiver, 0, 0, 1), Some(receiver), 2, 1, 1);
+        let queued: QueuedFireIds = [1, 2].into_iter().collect();
+        assert_eq!(fires(&plan(&mut policy, &queued, Instant::now())).len(), 2);
+        policy.on_frame_retired([runner, receiver]);
+
+        // The receiver runs a frame ahead, then its guest blocks on a
+        // session receive; the frame it submitted still goes.
+        policy.on_fire_enqueued(stamp(receiver, 1, 0, 1), Some(receiver), 3, 1, 1);
+        policy.on_owner_away(receiver);
+        policy.on_fire_enqueued(stamp(runner, 1, 0, 1), Some(runner), 4, 1, 1);
+        let queued: QueuedFireIds = [3, 4].into_iter().collect();
+        let mut both = fires(&plan(&mut policy, &queued, Instant::now()));
+        both.sort_unstable();
+        assert_eq!(both, vec![3, 4], "what it submitted before it blocked goes");
+        policy.on_frame_retired([runner, receiver]);
+
+        // The runner submits: the frame goes without the waiting receiver.
+        policy.on_fire_enqueued(stamp(runner, 2, 0, 1), Some(runner), 5, 1, 1);
+        let queued: QueuedFireIds = [5].into_iter().collect();
+        assert_eq!(
+            fires(&plan(&mut policy, &queued, Instant::now())),
+            vec![5],
+            "the frame goes without the lane whose guest waits on the outside"
+        );
+        policy.on_frame_retired([runner]);
+        // It stays out while it waits: the runner's frames go alone.
+        policy.on_fire_enqueued(stamp(runner, 3, 0, 1), Some(runner), 6, 1, 1);
+        let queued: QueuedFireIds = [6].into_iter().collect();
+        assert_eq!(fires(&plan(&mut policy, &queued, Instant::now())), vec![6]);
+        policy.on_frame_retired([runner]);
+
+        // The message comes; its guest submits: awaited again.
+        policy.on_fire_enqueued(stamp(receiver, 2, 0, 1), Some(receiver), 7, 1, 1);
+        let queued: QueuedFireIds = [7].into_iter().collect();
+        assert!(
+            matches!(plan(&mut policy, &queued, Instant::now()), FramePlan::Hold(_)),
+            "back, it waits for the runner, which is awaited"
+        );
+        policy.on_fire_enqueued(stamp(runner, 4, 0, 1), Some(runner), 8, 1, 1);
+        let queued: QueuedFireIds = [7, 8].into_iter().collect();
+        let mut both = fires(&plan(&mut policy, &queued, Instant::now()));
+        both.sort_unstable();
+        assert_eq!(both, vec![7, 8], "it rides the next frame");
+        policy.on_frame_retired([runner, receiver]);
+
+        // Computing again, it is awaited again.
+        policy.on_fire_enqueued(stamp(runner, 5, 0, 1), Some(runner), 9, 1, 1);
+        let queued: QueuedFireIds = [9].into_iter().collect();
+        assert!(
+            matches!(plan(&mut policy, &queued, Instant::now()), FramePlan::Hold(_)),
+            "its lane is awaited while its guest computes"
+        );
+    }
+
     /// A process whose bind found no room for its guest state (or whose
     /// pass waits for a raise of the activation rung) submits nothing
     /// until it is through: the frame its lane was awaited in
     /// goes without it (the soak's 56-lane frame held 6 minutes on one
-    /// process stuck at bind, its bind re-asked so often the leash never
-    /// ran out). Its next submit brings the lane back.
+    /// process stuck at bind). Its next submit brings the lane back.
     fn a_frame_goes_without_a_lane_whose_process_waits() {
         let mut policy =
-            FramePolicy::new(1, 64, 4096, None).with_submit_deadline(Duration::from_secs(86_400));
+            FramePolicy::new(1, 64, 4096, None).with_silence_timeout_off();
         let (runner, binder) = (pid(), pid());
         policy.on_fire_enqueued(stamp(runner, 0, 0, 1), Some(runner), 1, 1, 1);
         policy.on_fire_enqueued(stamp(binder, 0, 0, 1), Some(binder), 2, 1, 1);
@@ -1619,7 +1954,7 @@ mod tests {
         let mut policy = FramePolicy::new(1, 64, 4096, None).with_max_wave_readouts(8);
         let lanes: Vec<ProcessId> = (0..3).map(|_| pid()).collect();
         for (at, &lane) in lanes.iter().enumerate() {
-            policy.on_fire_reading(stamp(lane, 0, 0, 1), Some(lane), 10 + at as u64, 5, 1, 5, 5);
+            policy.on_fire_reading(stamp(lane, 0, 0, 1), Some(lane), 10 + at as u64, 5, 1, 5, 5, 0);
         }
         let mut sealed_ids = Vec::new();
         for _ in 0..3 {
@@ -1637,7 +1972,7 @@ mod tests {
         assert_eq!(sealed_ids, vec![10, 11, 12], "every lane seals in its turn");
 
         let lone = pid();
-        policy.on_fire_reading(stamp(lone, 0, 0, 1), Some(lone), 20, 12, 1, 12, 12);
+        policy.on_fire_reading(stamp(lone, 0, 0, 1), Some(lone), 20, 12, 1, 12, 12, 0);
         let queued: QueuedFireIds = [20].into_iter().collect();
         assert_eq!(
             fires(&plan(&mut policy, &queued, Instant::now())),
@@ -1735,7 +2070,7 @@ mod tests {
 
     fn incomplete_lane_holds_the_seal_until_it_completes() {
         let mut policy =
-            FramePolicy::new(2, 64, 4096, None).with_submit_deadline(Duration::from_secs(86_400));
+            FramePolicy::new(2, 64, 4096, None).with_silence_timeout_off();
         let (fast, slow) = (pid(), pid());
         policy.on_fire_enqueued(stamp(fast, 0, 0, 2), Some(fast), 1, 1, 1);
         policy.on_fire_enqueued(stamp(fast, 0, 1, 2), Some(fast), 2, 1, 1);

@@ -258,7 +258,6 @@ pub struct KeptDisk {
 
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
-    pub submit_deadline_us: u64,
     pub silence_timeout_secs: u64,
     pub frame_size: u32,
     pub frame_dispatch_depth: u32,
@@ -884,9 +883,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         });
     }
 
-    crate::scheduler::set_submit_deadline(std::time::Duration::from_micros(
-        scheduler.submit_deadline_us,
-    ));
     crate::scheduler::set_silence_timeout(std::time::Duration::from_secs(
         scheduler.silence_timeout_secs,
     ));

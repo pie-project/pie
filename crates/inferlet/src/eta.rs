@@ -1006,15 +1006,6 @@ pub fn frame_size() -> usize {
     FRAME_SIZE.with(|k| *k.get_or_init(|| crate::model::frame_size().max(1) as usize))
 }
 
-pub fn submit_deadline() -> std::time::Duration {
-    thread_local! {
-        static DEADLINE: std::cell::OnceCell<u64> = const { std::cell::OnceCell::new() };
-    }
-    std::time::Duration::from_micros(
-        DEADLINE.with(|d| *d.get_or_init(crate::model::submit_deadline_us)),
-    )
-}
-
 pub fn channel_capacity() -> usize {
     (crate::model::channel_capacity() as usize).max(2)
 }

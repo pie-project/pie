@@ -777,20 +777,19 @@ impl ModelConfig {
     }
 }
 
+/// `[runtime]`. `runtime.submit_deadline` was removed (no lane is dropped
+/// from a frame on a timer any more): a config that still carries it is
+/// refused at load as an unknown field. To migrate, delete the line.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
-    /// How long a pipeline hard-blocking a frame's seal may go without
-    /// submitting before the runtime stops waiting for it, in microseconds.
-    /// Does not fail the pipeline — the lane is dropped from the wait-set
-    /// (an involuntary `forward.park()`) so the boundary seals at once.
-    /// Exposed to guests verbatim as `model.submit-deadline-us()`.
-    #[serde(default = "default_submit_deadline")]
-    pub submit_deadline: Duration,
-    /// How long a lane may stay silent in total — through the leash above and
-    /// on past it — before the runtime terminates its process, in seconds.
-    /// A verdict, so it is generous: a lane that calls `forward.park()` is
-    /// never killed however long it stays away.
+    /// How long an awaited lane may stay silent before the runtime
+    /// terminates its process as abandoned, in seconds. A lane whose guest
+    /// waits on outside input (a session receive, a timer, an HTTP
+    /// response) is parked by the host, and one that calls
+    /// `forward.park()` parks itself: neither is ever killed however long
+    /// it stays away. (`runtime.submit_deadline` was removed: a config
+    /// carrying it is refused at load; delete the line.)
     #[serde(default = "default_silence_timeout")]
     pub silence_timeout: Duration,
     /// Waves per frame (*k*): how many token steps the wait-all quorum admits
@@ -824,7 +823,6 @@ fn default_snapshot_budget() -> ByteSize {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
-            submit_deadline: default_submit_deadline(),
             silence_timeout: default_silence_timeout(),
             frame_size: default_frame_size(),
             frame_dispatch_depth: default_frame_dispatch_depth(),
@@ -838,17 +836,8 @@ impl Default for RuntimeConfig {
 impl RuntimeConfig {
     fn validate(&self, max_frames: u8) -> Result<()> {
         ensure!(
-            self.submit_deadline.as_micros() > 0,
-            "runtime.submit_deadline must be > 0"
-        );
-        ensure!(
             self.silence_timeout.as_micros() > 0,
             "runtime.silence_timeout must be > 0"
-        );
-        ensure!(
-            self.silence_timeout >= self.submit_deadline,
-            "runtime.silence_timeout must not be shorter than submit_deadline: \
-             a kill that lands before the leash would fail guests the leash exists to spare"
         );
         ensure!(self.frame_size >= 1, "runtime.frame_size must be >= 1");
         ensure!(
@@ -880,10 +869,6 @@ impl RuntimeConfig {
         }
         Ok(())
     }
-}
-
-fn default_submit_deadline() -> Duration {
-    Duration::from_millis(150)
 }
 
 fn default_silence_timeout() -> Duration {
@@ -1226,7 +1211,7 @@ device = ["metal:0"]
     fn config_every_case() {
         an_unknown_key_is_refused();
         a_distributed_worker_states_no_cluster_policies();
-        a_silence_timeout_under_the_submit_deadline_is_refused();
+        a_submit_deadline_is_an_unknown_key();
         the_diag_flag_states_the_engines_diagnostics_key();
         an_engine_s_own_key_is_written_beside_the_common_ones();
         parses_minimal_metal_config();
@@ -1420,15 +1405,13 @@ device = ["metal:0"]
         Config::parse(&alone).expect("single-node runs them in its own controller");
     }
 
-    fn a_silence_timeout_under_the_submit_deadline_is_refused() {
-        let toml = format!(
-            "{MINIMAL_METAL}\n[runtime]\n\
-             submit_deadline = \"5s\"\nsilence_timeout = \"1s\"\n"
-        );
-        let cfg: Config = toml::from_str(&toml).unwrap();
-        let err = cfg.validate().unwrap_err().to_string();
+    /// The leash is gone, and its key with it: a config that sets it is
+    /// refused by name.
+    fn a_submit_deadline_is_an_unknown_key() {
+        let toml = format!("{MINIMAL_METAL}\n[runtime]\nsubmit_deadline = \"5s\"\n");
+        let err = toml::from_str::<Config>(&toml).unwrap_err().to_string();
         assert!(
-            err.contains("must not be shorter than submit_deadline"),
+            err.contains("unknown field `submit_deadline`"),
             "got: {err}"
         );
     }

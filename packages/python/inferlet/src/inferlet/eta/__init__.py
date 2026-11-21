@@ -34,7 +34,6 @@ from .bridge import (
     pad_tokens,
     readout_spans,
     scale,
-    submit_deadline_us,
     unpad_tokens,
 )
 from .ir import Dtype, Port, Stage, dtype
@@ -129,7 +128,6 @@ __all__ = [
     "pad_tokens",
     "readout_spans",
     "scale",
-    "submit_deadline_us",
     "unpad_tokens",
     # ir
     "Dtype",

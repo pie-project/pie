@@ -166,10 +166,6 @@ impl pie::inferlet::model::Host for ProcessCtx {
         Ok(crate::scheduler::configured_frame_size() as u32)
     }
 
-    async fn submit_deadline_us(&mut self) -> Result<u64> {
-        Ok(crate::scheduler::configured_submit_deadline().as_micros() as u64)
-    }
-
     async fn channel_capacity(&mut self) -> Result<u32> {
         Ok(crate::scheduler::channel_capacity() as u32)
     }

@@ -214,6 +214,22 @@ impl WaitEpisode {
 /// the wait ends, with its duration: what a stall on the way from a process
 /// to the lane is read from (seats, bind, plan, enqueue). Outside a runtime
 /// it only awaits.
+/// Awaits `wait`, input from outside the runtime that `pid`'s guest
+/// blocks on: a session receive, a timer, an HTTP response. Ready at once,
+/// it parks nothing. Pending, the process's lanes are parked first: no
+/// frame waits on a guest that waits on the outside, and each lane rejoins
+/// with its own next submit. A guest that computes, or waits on its own
+/// fires and channels, never comes here and stays awaited.
+pub(crate) async fn away_while<F: std::future::Future>(pid: ProcessId, wait: F) -> F::Output {
+    let mut wait = std::pin::pin!(wait);
+    let first = std::future::poll_fn(|cx| std::task::Poll::Ready(wait.as_mut().poll(cx))).await;
+    if let std::task::Poll::Ready(output) = first {
+        return output;
+    }
+    crate::scheduler::worker::notify_owner_away(pid);
+    wait.await
+}
+
 pub(crate) async fn said<F: std::future::Future>(
     stage: &'static str,
     pid: ProcessId,

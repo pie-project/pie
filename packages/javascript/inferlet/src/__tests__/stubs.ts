@@ -17,7 +17,6 @@ export const modelStub = {
   frameSize: () => 1,
   channelCapacity: () => 8,
   rsStateSize: () => 4096n,
-  submitDeadlineUs: () => 50_000n,
   runAheadWindow: () => 4,
   draftBlock: () => undefined,
   draftDepth: () => 0,

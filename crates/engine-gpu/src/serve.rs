@@ -6224,7 +6224,7 @@ impl<B: Serve> Shell<B> {
         let classes: Vec<usize> = (0..self.compiled.classes.classes.len())
             .filter(|&class| !self.captures(class))
             .collect();
-        for class in classes {
+        for &class in &classes {
             // Every count of lanes with every power of two of rows they can
             // bring between them (a decode is rows = lanes, a prefill one
             // lane), the rows spread over the lanes: each rung's views are
@@ -6248,6 +6248,22 @@ impl<B: Serve> Shell<B> {
                     );
                     rows = rows.saturating_mul(2);
                 }
+            }
+            // A lane of the class with one row beside a lane of another class
+            // bringing the rest of each rung's rows: a class's region runs
+            // its own rows, and a fire of its lanes alone brings it few rows
+            // only at the smallest rungs, where a decode of few rows takes
+            // its own kernels (the attention's split over keys) at whatever
+            // rung its fire's other lanes choose.
+            let filler = classes
+                .iter()
+                .copied()
+                .find(|&other| other != class)
+                .unwrap_or(class);
+            let mut tokens = 2u32;
+            while tokens <= top {
+                shapes.push(vec![(filler, tokens - 1), (class, 1)]);
+                tokens = tokens.saturating_mul(2);
             }
         }
         // Where the trace buffers a recurrence, a lane buffering its rows at
