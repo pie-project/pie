@@ -311,6 +311,7 @@ impl<B: Host> Gpu<B> {
             ratio = held.ratio_for(rows),
             bound_ms = held.bound_ns / 1e6,
             split = admitted.split(),
+            layers_a_piece = ?admitted.layers_a_piece(),
             refused = matches!(admitted, crate::submit::Admitted::Refused { .. }),
             "submit bound: a step admitted"
         );
@@ -336,7 +337,7 @@ impl<B: Host> Gpu<B> {
                     .collect(),
             ));
         }
-        shell.split_next(admitted.split());
+        shell.split_next(admitted.layers_a_piece());
         shell.estimate_next(Some(crate::submit::Estimated {
             ns: raw,
             at,
@@ -1572,7 +1573,7 @@ where
                 // A piece tells no completion: the step's last piece does.
                 let fired = self.fire_step(&piece, at, true, None);
                 if let Some(shell) = self.shell.as_mut() {
-                    shell.split_next(false);
+                    shell.split_next(None);
                     shell.estimate_next(None);
                 }
                 if let Err(error) = fired {
@@ -1602,7 +1603,7 @@ where
             }
             let fired = B::step(self, step, at);
             if let Some(shell) = self.shell.as_mut() {
-                shell.split_next(false);
+                shell.split_next(None);
                 shell.estimate_next(None);
             }
             match fired {

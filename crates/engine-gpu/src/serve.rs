@@ -809,6 +809,9 @@ pub struct Shell<B: Serve> {
     /// The next step walks a layer at a time: its estimate is past the
     /// bound whole (`crate::submit::Admitted::Layers`).
     split_next: bool,
+    /// The consecutive layers each submission of a split walk takes
+    /// (`crate::submit::pack_layers`), 1 where the backend splits it.
+    split_layers: u32,
     /// Under a stated submit bound, the next step's estimate at a ratio of
     /// 1 (`crate::submit::SubmitBound::raw_ns`), which its flight carries
     /// to its landing.
@@ -2185,6 +2188,7 @@ impl<B: Serve> Shell<B> {
             probe,
             probed: 0,
             split_next: false,
+            split_layers: 1,
             estimate_next: None,
             timing: Vec::new(),
             stamps,
@@ -3818,10 +3822,12 @@ impl<B: Serve> Shell<B> {
         Ok(())
     }
 
-    /// The next step this shell enqueues walks a layer at a time (or, at
-    /// `false`, as its backend plans it).
-    pub fn split_next(&mut self, split: bool) {
-        self.split_next = split;
+    /// The next step this shell enqueues walks in submissions of
+    /// `layers_a_piece` consecutive layers (or, at `None`, as its backend
+    /// plans it).
+    pub fn split_next(&mut self, layers_a_piece: Option<u32>) {
+        self.split_next = layers_a_piece.is_some();
+        self.split_layers = layers_a_piece.unwrap_or(1).max(1);
     }
 
     /// Under a stated submit bound, the next step this shell enqueues is
@@ -5180,7 +5186,7 @@ impl<B: Serve> Shell<B> {
                 self.pools.segments(&self.handles)?,
             );
             if split {
-                run.flush_between_layers(p.done.as_ref().map(|done| done.at));
+                run.flush_between_layers(p.done.as_ref().map(|done| done.at), self.split_layers);
             }
             walk(
                 &self.trace,
@@ -5682,7 +5688,9 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
         };
         self.recorded += u64::from(keep.is_some());
         self.unkept += u64::from(keep.is_none());
-        let walked = self.walk_once(&prepared, keep.is_some(), split)?;
+        let walked = self.walk_once(&prepared, keep.is_some(), split);
+        self.split_layers = 1;
+        let walked = walked?;
         let mut frame = walked.frame.expect("the walk opened a frame");
 
         // Each read plane's buffer (the span's, or a score room's) and every
