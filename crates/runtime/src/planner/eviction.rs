@@ -420,6 +420,33 @@ impl ResidencyPlanner {
                 victims.members.is_empty()
                     && !(inner.host_swap_blocked.is_empty() && inner.prepare_blocked.is_empty())
             });
+            // A restore head the planner reads as fitting is never the
+            // policy's to make room for (the M1 on ca5c710a7: need_moves 0,
+            // "no pick: the policy is asked" among 111 candidates): either
+            // the store's placement stands it, and it is sent again once
+            // more chunks stand free than its refusal left, or its own
+            // check refuses what the map stands, and that is said.
+            let fits = match (victims.restore, shape.as_ref(), map.as_ref()) {
+                (true, Some(need), Some(map)) => map
+                    .cheapest_need(need)
+                    .is_some_and(|moves| moves.is_empty())
+                    .then(|| self.store_stands(victims.head, victims.head_pid, need)),
+                _ => None,
+            };
+            if let Some(stands) = fits
+                && unhostable.is_empty()
+            {
+                // Its own check's refusal is the line's `why`
+                // (`roles_short_why`); a free chunk's event pokes the plan.
+                let end = if stands {
+                    "the head's placement stands: sent again once more chunks stand free than its refusal left"
+                } else {
+                    "the map stands the head and its own check refuses it (why=)"
+                };
+                self.plan_ended(victims.head, end, host_short, &unhostable);
+                self.note_short(victims.head, 0, 0);
+                return;
+            }
             self.plan_ended(
                 victims.head,
                 if !unhostable.is_empty() {
@@ -473,16 +500,7 @@ impl ResidencyPlanner {
         let Some((run, _)) = need.longest() else {
             return;
         };
-        let (state, bind) = self.with_inner(|inner| {
-            let state = inner.queue.get(&head).map(super::wait::Waiter::rs_need);
-            let bind = inner
-                .procs
-                .get(&pid)
-                .and_then(|proc| proc.bind_room)
-                .map(|need| (need.run, need.pieces));
-            (state.unwrap_or_default(), bind)
-        });
-        if self.port.restore_stands(pid, need, state, bind) {
+        if self.store_stands(head, pid, need) {
             return;
         }
         let most = u32::try_from(map.free.len()).unwrap_or(u32::MAX) / run.max(1) + 1;
@@ -492,6 +510,22 @@ impl ResidencyPlanner {
             }
             need.add(run, 1);
         }
+    }
+
+    /// Whether the store's placement of restore head `head`'s whole
+    /// restore stands `need` now: its serve's state, every piece of its
+    /// unpark, its pending bind's runs ([`PoolPort::restore_stands`]).
+    pub(super) fn store_stands(&self, head: EntryKey, pid: ProcessId, need: &RunNeed) -> bool {
+        let (state, bind) = self.with_inner(|inner| {
+            let state = inner.queue.get(&head).map(super::wait::Waiter::rs_need);
+            let bind = inner
+                .procs
+                .get(&pid)
+                .and_then(|proc| proc.bind_room)
+                .map(|need| (need.run, need.pieces));
+            (state.unwrap_or_default(), bind)
+        });
+        self.port.restore_stands(pid, need, state, bind)
     }
 
     /// Records where a plan pass stopped for the queue's head short of
