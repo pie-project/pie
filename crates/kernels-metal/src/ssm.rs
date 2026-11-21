@@ -1212,8 +1212,9 @@ pub struct Paged {
 /// per-head table's prepass. A load that buffers recurrent rows builds them
 /// before ready, a beam's long carry being one its warm walk does not reach.
 #[must_use]
-pub fn carried_pipelines() -> [Fire; 5] {
+pub fn carried_pipelines() -> [Fire; 6] {
     [
+        Fire::at("ssm/conv1d.metal", "causal_conv1d_carried_bfloat16"),
         Fire::at(GDN_SCAN_FILE, "gated_delta_group_fold_bfloat16"),
         Fire::at("ssm/conv1d.metal", "causal_conv1d_group_fold_bfloat16"),
         Fire::at(GDN_SCAN_FILE, "gated_delta_carried_bfloat16_s_8_v_2"),
@@ -1801,6 +1802,39 @@ pub fn causal_conv1d_verify(
         ));
     }
     let lanes = committed_lanes(OP, indptr)?;
+    // A decode window through a page table: a thread a channel, as the
+    // prompt conv (`causal_conv1d_carried`).
+    if let (true, Some(paged), None) = (own_only, paged, snapshots.as_ref()) {
+        return ctx.fire(
+            Fire::at("ssm/conv1d.metal", "causal_conv1d_carried_bfloat16").apply(Grid::of(
+                [channels, lanes, 1],
+                [channels.min(CONV_GROUP), 1, 1],
+            )),
+            &[
+                x.arg(),
+                indptr.arg(),
+                committed.replay.arg(),
+                committed.commit.arg(),
+                committed.slots.arg(),
+                stated(OP, committed.lane0)?.arg(),
+                weight.arg(),
+                state.new_conv_state.arg_mut(),
+                y.arg_mut(),
+                land.arg_mut(),
+                stated(OP, channels)?.arg(),
+                taps.arg(),
+                stated(OP, dilation)?.arg(),
+                paged.slab.arg_mut(),
+                paged.pages.arg(),
+                paged.page_tokens.arg(),
+                paged.page_bytes.arg(),
+                paged.row_bytes.arg(),
+                i32::try_from(paged.page_ints.max(1)).unwrap_or(i32::MAX).arg(),
+                state.segments.arg(),
+                committed.ext_replay.arg(),
+            ],
+        );
+    }
     let [snaps, lane0] = snapshot_args(ctx, OP, snapshots)?;
     let [slab, pages, page_tokens, page_bytes, row_bytes, is_paged] = paged_args(ctx, paged)?;
     // A decode window that makes its own row's output alone runs one row of

@@ -676,3 +676,104 @@ template [[host_name("causal_conv1d_group_fold_bfloat16")]]
     device float*, const constant int&, const constant int&, const constant int&,
     device uchar*, const device int*, const constant uint&, const constant uint&,
     const constant uint&, const constant uint&, const device ulong*, uint3);
+
+// `causal_conv1d_verify`'s decode window (a lane's one own row, its carried
+// rows read from its buffer), the prompt conv's shape: a thread a channel.
+// Its taps are the state's window where they fall before the carried rows,
+// the lane's buffered rows, then its own row; the own row's output lands in
+// the extended plane and the window's own rows, and its input in the
+// buffer. Where the lane commits, the thread moves its channel's window on
+// to the commit, every tap read before any is written.
+template <typename T>
+[[kernel]] void causal_conv1d_carried(
+    const device T* x              [[buffer(0)]],
+    const device int* indptr       [[buffer(1)]],
+    const device int* replay       [[buffer(2)]],
+    const device int* commit       [[buffer(3)]],
+    const device int* slots        [[buffer(4)]],
+    const constant int& lane0      [[buffer(5)]],
+    const device T* weight         [[buffer(6)]],
+    device float* conv_state       [[buffer(7)]],
+    device T* y                    [[buffer(8)]],
+    device T* land                 [[buffer(9)]],
+    const constant int& channels   [[buffer(10)]],
+    const constant int& conv_width [[buffer(11)]],
+    const constant int& dilation   [[buffer(12)]],
+    device uchar* slab             [[buffer(13)]],
+    const device int* page_table   [[buffer(14)]],
+    const constant uint& page_tokens [[buffer(15)]],
+    const constant uint& page_bytes [[buffer(16)]],
+    const constant uint& row_bytes [[buffer(17)]],
+    const constant int& page_ints  [[buffer(18)]],
+    const device ulong* map        [[buffer(19)]],
+    const device int* ext_replay   [[buffer(20)]],
+    uint2 pos [[thread_position_in_grid]]) {
+  const int c = int(pos.x);
+  const int r = int(pos.y);
+  if (c >= channels) {
+    return;
+  }
+  int begin = indptr[r];
+  for (int j = 0; j < r; ++j) {
+    begin += ext_replay[lane0 + j];
+  }
+  begin -= replay[lane0 + r] - ext_replay[lane0 + r];
+  const int rep = replay[lane0 + r];
+  const int span = (indptr[r + 1] - indptr[r]) + rep;
+  const device int* ids = slots + size_t(lane0 + r) * pie_state_pieces(map);
+  if (indptr[r + 1] - indptr[r] != 1 || ids[0] < 0) {
+    return;
+  }
+  const int width = conv_width;
+  const int dil = dilation;
+  const int hist = (width - 1) * dil + 1;
+  const size_t chans = size_t(channels);
+  const size_t col = size_t(c);
+  const pie_state_column piece = pie_state_inner(map, ids, uint(c), uint(channels));
+  const int own = indptr[r] - rep;
+  const device int* pages = page_table + size_t(lane0 + r) * uint(page_ints);
+  const bool buffers = pages[0] >= 0;
+  auto buffered = [&](int e) -> device T* {
+    return reinterpret_cast<device T*>(
+        rs_buffered_row(slab, pages, e, page_tokens, page_bytes, row_bytes) + col * sizeof(T));
+  };
+  auto tap = [&](int src) -> float {
+    if (src < 0) {
+      return conv_state[piece.base + size_t(hist + src) * piece.pitch + piece.col];
+    }
+    if (src < rep) {
+      return float(*buffered(src));
+    }
+    return float(x[size_t(own + src) * chans + col]);
+  };
+  const int t = rep;
+  float acc = 0.0f;
+  for (int k = 0; k < width; ++k) {
+    acc += tap(t - (width - 1 - k) * dil) * float(weight[col * size_t(width) + size_t(k)]);
+  }
+  const T out = T(causal_conv1d_silu(acc));
+  y[size_t(begin + t) * chans + col] = out;
+  land[size_t(own + t) * chans + col] = out;
+  if (buffers) {
+    *buffered(t) = x[size_t(own + t) * chans + col];
+  }
+  const int keep = min(commit[lane0 + r], span);
+  if (keep > 0) {
+    float next[kConvFoldHeld];
+    for (int s = 0; s < hist; ++s) {
+      next[s] = tap(keep - hist + s);
+    }
+    for (int s = 0; s < hist; ++s) {
+      conv_state[piece.base + size_t(s) * piece.pitch + piece.col] = next[s];
+    }
+  }
+}
+
+template [[host_name("causal_conv1d_carried_bfloat16")]]
+[[kernel]] void causal_conv1d_carried<bfloat>(
+    const device bfloat*, const device int*, const device int*, const device int*,
+    const device int*, const constant int&, const device bfloat*, device float*,
+    device bfloat*, device bfloat*, const constant int&, const constant int&,
+    const constant int&, device uchar*, const device int*, const constant uint&,
+    const constant uint&, const constant uint&, const constant int&, const device ulong*,
+    const device int*, uint2);
