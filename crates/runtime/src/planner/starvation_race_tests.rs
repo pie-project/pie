@@ -10264,3 +10264,35 @@ fn a_settled_head_with_nothing_in_flight_fails_a_strict_test() {
     });
     planner.plan();
 }
+
+/// The L40S at 3 GiB disk-only on bd4f4ffe7 (serve-B4_3s-1, 998 lines of
+/// it): a restore head (6ae0bc15) refused PendingBindShort (run 1) with
+/// nothing else in flight, one free run left, its placement standing in the
+/// same room ("a planner bug: the placement and the takes differ"): held,
+/// with nothing in flight.
+fn stall_bd4f4ffe7_quiet_mismatch() -> StallSnapshot {
+    StallSnapshot {
+        name: "bd4f4ffe7 serve-B4_3s-1",
+        chunks: 22,
+        free: vec![9],
+        headroom: Some(1),
+        host: 0,
+        disk_free: 4014,
+        procs: vec![SnapProc {
+            refused: Some((1, 1)),
+            refused_free: Some(1),
+            quiet: true,
+            ..SnapProc::evicted_restore()
+        }],
+        held: Vec::new(),
+        head: 0,
+        sweeps_shared: true,
+        own: Vec::new(),
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn replay_bd4f4ffe7_quiet_refusal_standing_in_its_placement() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    replay(&stall_bd4f4ffe7_quiet_mismatch()).await.unwrap();
+}
