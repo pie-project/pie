@@ -675,17 +675,22 @@ fn stage_pages(
         // SAFETY: `ptr` spans `len` bytes of plain `repr(C)` data.
         unsafe { core::slice::from_raw_parts(ptr, len) }
     };
-    store.stage(stream, at.trans, bytes_of(work.trans.as_ptr().cast(), work.trans.len() * 4))?;
-    store.stage(stream, at.bases, bytes_of(work.bases.as_ptr().cast(), work.bases.len() * 8))?;
-    store.stage(
-        stream,
-        at.planes,
-        bytes_of(
-            work.planes.as_ptr().cast(),
-            work.planes.len() * size_of::<PagePlane>(),
-        ),
-    )?;
-    store.stage(stream, faults, &vec![0u8; work.faults.len() * 4])?;
+    // The fire's tables packed in one image of the stretch from `trans`,
+    // staged in one copy: each piece where the image lays it (16-byte
+    // aligned), the runs naming the pieces before them by address.
+    let mut image: Vec<u8> = Vec::new();
+    let mut put = |bytes: &[u8]| -> u64 {
+        let at_byte = image.len().next_multiple_of(16);
+        image.resize(at_byte, 0);
+        image.extend_from_slice(bytes);
+        base + at.trans + at_byte as u64
+    };
+    let trans = put(bytes_of(work.trans.as_ptr().cast(), work.trans.len() * 4));
+    let bases = put(bytes_of(work.bases.as_ptr().cast(), work.bases.len() * 8));
+    let planes = put(bytes_of(
+        work.planes.as_ptr().cast(),
+        work.planes.len() * size_of::<PagePlane>(),
+    ));
     let mut lists: Vec<BeamListRun> = Vec::with_capacity(work.lists.len());
     for list in &work.lists {
         let table = tables.get(list.table as usize).ok_or_else(|| {
@@ -704,11 +709,7 @@ fn stage_pages(
             _pad: 0,
         });
     }
-    store.stage(
-        stream,
-        at.lists,
-        bytes_of(lists.as_ptr().cast(), lists.len() * size_of::<BeamListRun>()),
-    )?;
+    let lists_at = put(bytes_of(lists.as_ptr().cast(), lists.len() * size_of::<BeamListRun>()));
     // A hybrid's beams' rs page tables (§11): each beam's entries in the
     // fire's rs page table, over its group's rs pool pages.
     let rs_runs: Vec<BeamRsRun> = work
@@ -718,7 +719,7 @@ fn stage_pages(
             rs_pages
                 .map(|pages| BeamRsRun {
                     pages,
-                    bases: base + at.bases + u64::from(list.bases_at) * 8,
+                    bases: bases + u64::from(list.bases_at) * 8,
                     lane: list.lane,
                     from: list.from,
                     entries: list.entries,
@@ -734,19 +735,15 @@ fn stage_pages(
                 })
         })
         .collect::<crate::error::Result<_>>()?;
-    store.stage(
-        stream,
-        at.rs,
-        bytes_of(rs_runs.as_ptr().cast(), rs_runs.len() * size_of::<BeamRsRun>()),
-    )?;
+    let rs_at = put(bytes_of(rs_runs.as_ptr().cast(), rs_runs.len() * size_of::<BeamRsRun>()));
     let groups: Vec<BeamStepRun> = work
         .groups
         .iter()
         .map(|group| BeamStepRun {
             state: group.state,
             parents: group.parents,
-            trans: base + at.trans + u64::from(group.trans_at) * 4,
-            lists: base + at.lists + u64::from(group.lists_at) * size_of::<BeamListRun>() as u64,
+            trans: trans + u64::from(group.trans_at) * 4,
+            lists: lists_at + u64::from(group.lists_at) * size_of::<BeamListRun>() as u64,
             faults: base + faults + u64::from(group.fault_at) * 4,
             lanes: group.lanes,
             cap: group.cap,
@@ -758,21 +755,16 @@ fn stage_pages(
             frames: group.frames,
             backed: group.backed,
             rs_count: group.rs_count,
-            rs: base + at.rs + u64::from(group.rs_at) * size_of::<BeamRsRun>() as u64,
+            rs: rs_at + u64::from(group.rs_at) * size_of::<BeamRsRun>() as u64,
         })
         .collect();
-    store.stage(
-        stream,
-        at.groups,
-        bytes_of(groups.as_ptr().cast(), groups.len() * size_of::<BeamStepRun>()),
-    )?;
-    kernels_cuda::runtime::channel::beam_step(device.ctx(), base + at.groups, groups.len() as u32)?;
+    let groups_at = put(bytes_of(groups.as_ptr().cast(), groups.len() * size_of::<BeamStepRun>()));
     let copies: Vec<PageCopyRun> = work
         .copies
         .iter()
         .map(|copy| PageCopyRun {
             copy: copy.copy,
-            base: base + at.bases + u64::from(copy.bases_at) * 8,
+            base: bases + u64::from(copy.bases_at) * 8,
             fault: base + faults + u64::from(copy.fault) * 4,
             reserve: copy.reserve,
             page: copy.page,
@@ -782,25 +774,14 @@ fn stage_pages(
             _pad: 0,
         })
         .collect();
-    store.stage(
-        stream,
-        at.copies,
-        bytes_of(copies.as_ptr().cast(), copies.len() * size_of::<PageCopyRun>()),
-    )?;
-    kernels_cuda::runtime::channel::copy_pages(
-        device.ctx(),
-        base + at.copies,
-        base + at.planes,
-        copies.len() as u32,
-        work.copies.iter().map(|copy| copy.planes).max().unwrap_or(0),
-    )?;
+    let copies_at = put(bytes_of(copies.as_ptr().cast(), copies.len() * size_of::<PageCopyRun>()));
     // A hybrid's beams' rs copies (§6.4, §11): row by row of each rs plane.
     let rs_copies: Vec<RsCopyRun> = work
         .rs_copies
         .iter()
         .map(|copy| RsCopyRun {
             copy: copy.copy,
-            bases: base + at.bases + u64::from(copy.bases_at) * 8,
+            bases: bases + u64::from(copy.bases_at) * 8,
             fault: base + faults + u64::from(copy.fault) * 4,
             reserve: copy.reserve,
             page: copy.page,
@@ -814,15 +795,23 @@ fn stage_pages(
             _pad: 0,
         })
         .collect();
-    store.stage(
-        stream,
-        at.rs_copies,
-        bytes_of(rs_copies.as_ptr().cast(), rs_copies.len() * size_of::<RsCopyRun>()),
+    let rs_copies_at = put(bytes_of(rs_copies.as_ptr().cast(), rs_copies.len() * size_of::<RsCopyRun>()));
+    fits("bytes of a fire's beam tables", image.len(), at.end - at.trans)?;
+    store.stage(stream, at.trans, &image)?;
+    // The fire's lanes' fault words, zero before its kernels write them.
+    crate::device::zero_span_on(stream, base + faults, work.faults.len() * 4)?;
+    kernels_cuda::runtime::channel::beam_step(device.ctx(), groups_at, groups.len() as u32)?;
+    kernels_cuda::runtime::channel::copy_pages(
+        device.ctx(),
+        copies_at,
+        planes,
+        copies.len() as u32,
+        work.copies.iter().map(|copy| copy.planes).max().unwrap_or(0),
     )?;
     kernels_cuda::runtime::channel::copy_rs_rows(
         device.ctx(),
-        base + at.rs_copies,
-        base + at.planes,
+        rs_copies_at,
+        planes,
         rs_copies.len() as u32,
         work.rs_copies.iter().map(|copy| copy.planes).max().unwrap_or(0),
     )?;
@@ -890,30 +879,26 @@ pub struct Inputs {
     staged_mask_origin: Vec<u8>,
 }
 
-/// The slab's stretch for lanes' own page lists (`serve::pages`): the
-/// reserves' device ids and page addresses, the plane table, the runs and a
-/// fault word a lane, each up to its cap.
+/// The slab's stretch for lanes' own page lists (`serve::pages`): a fault
+/// word a lane, a set a fire in flight, then the stretch from `trans` to
+/// `end` a fire packs its tables in (the reserves' device ids and page
+/// addresses, the plane table and the runs, each up to its cap), staged in
+/// one copy.
 #[derive(Debug, Clone, Copy)]
 struct PagesAt {
-    trans: u64,
-    trans_cap: u64,
-    bases: u64,
-    bases_cap: u64,
-    planes: u64,
-    planes_cap: u64,
-    lists: u64,
-    lists_cap: u64,
-    groups: u64,
-    groups_cap: u64,
-    copies: u64,
-    copies_cap: u64,
     faults: u64,
     faults_cap: u64,
+    trans: u64,
+    trans_cap: u64,
+    bases_cap: u64,
+    planes_cap: u64,
+    lists_cap: u64,
+    groups_cap: u64,
+    copies_cap: u64,
     /// A hybrid's beams' rs page tables and rs copies
     /// (`BEAM-PAGE-LISTS.md` §11).
-    rs: u64,
     rs_cap: u64,
-    rs_copies: u64,
+    end: u64,
 }
 
 /// The kv planes a page holds that one copy run may span.
@@ -1022,24 +1007,34 @@ impl Inputs {
             // A fire's lanes' fault words, a set a fire in flight: the next
             // fire's step runs before this one's settle reads them.
             let in_flight = u64::from(runahead.staging_depth().max(1) as u32);
+            // The fault rings first: the rest is one stretch a fire packs.
+            let faults = take(lanes * 4 * in_flight);
+            let trans = take(reserve * 4);
+            let bases_cap = reserve + lanes * rs_side * rs_entries;
+            // The stretch holds every table at its cap.
+            for bytes in [
+                bases_cap * 8,
+                planes_cap * size_of::<PagePlane>() as u64,
+                lists_cap * size_of::<BeamListRun>() as u64,
+                lanes * size_of::<BeamStepRun>() as u64,
+                lanes * size_of::<PageCopyRun>() as u64,
+                lanes * rs_side * size_of::<BeamRsRun>() as u64,
+                lanes * rs_side * size_of::<RsCopyRun>() as u64,
+            ] {
+                take(bytes);
+            }
             PagesAt {
-                trans: take(reserve * 4),
-                trans_cap: reserve,
-                bases: take((reserve + lanes * rs_side * rs_entries) * 8),
-                bases_cap: reserve + lanes * rs_side * rs_entries,
-                planes: take(planes_cap * size_of::<PagePlane>() as u64),
-                planes_cap,
-                lists: take(lists_cap * size_of::<BeamListRun>() as u64),
-                lists_cap,
-                groups: take(lanes * size_of::<BeamStepRun>() as u64),
-                groups_cap: lanes,
-                copies: take(lanes * size_of::<PageCopyRun>() as u64),
-                copies_cap: lanes,
-                faults: take(lanes * 4 * in_flight),
+                faults,
                 faults_cap: lanes,
-                rs: take(lanes * rs_side * size_of::<BeamRsRun>() as u64),
+                trans,
+                trans_cap: reserve,
+                bases_cap,
+                planes_cap,
+                lists_cap,
+                groups_cap: lanes,
+                copies_cap: lanes,
                 rs_cap: lanes * rs_side,
-                rs_copies: take(lanes * rs_side * size_of::<RsCopyRun>() as u64),
+                end: take(0),
             }
         };
         let mask_indptr = take((lanes + 1) * 8);
