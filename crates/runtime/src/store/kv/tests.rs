@@ -1941,3 +1941,17 @@ fn a_prefix_computed_twice_maps_whole_from_either_copy() {
     let (again, _, _) = look(&mut store, 3);
     assert_eq!(store.flat_table(again).unwrap(), theirs.as_slice());
 }
+
+/// A working set released with no fire in flight frees its pages at
+/// once: no fire can read them, so none waits for a next fire's settle
+/// (with nothing firing, they held their chunks for the kv shape while a
+/// head short of whole chunks waited on them).
+#[test]
+fn a_release_with_nothing_in_flight_frees_its_pages_at_once() {
+    let mut store = KvStore::new(8, h(11));
+    let ws = store.create_working_set();
+    commit_opaque(&mut store, ws, 3);
+    let before = store.available_pages();
+    store.release_working_set(ws, store.current_epoch());
+    assert_eq!(store.available_pages(), before + 3, "free now, no retire asked");
+}

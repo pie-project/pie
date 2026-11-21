@@ -104,18 +104,24 @@ rs buffer, on the same pool pages as its kv slots.
     fired          u32   fires run; 0 until the first fire primes
     pool           u32   the pool's pages at the last fire
 
-It lives in the instance's **per-bind scratch**, sized by the engine's
-`guest_state(program, extents)` from the bind's `key_len` (`end`, §3), never
-in the per-program instance item (one program binds searches of many
-depths): `B*P*4 + (F + 1)*ceil(Q/32)*4 + 16` bytes, by the engine's bounds on
-`P` and `Q` (`Q <= B P + B (F + 1) + 1`; an engine may hold a word where a
-bit is stated, and may keep two copies of `map` to reorder in place). That
-scratch is priced in the ledger at the bind like any guest slot, is a
-declared part of the instance's state that the roles move (it parks and
-restores with the set), and stands from the bind to the search's finish:
-it is cleared once, at the bind, and no fire writes it but the head step.
-engine-cuda lays it past the lane's value scratch in the instance's scratch
-item; engine-gpu, Metal and XLA keep it in the same per-bind place. It is one copy, device-owned, changed
+It is the instance's **resident state** (`engine::GuestState::resident`),
+sized by the engine's `guest_state(program, extents)` from the bind's
+`key_len` (`end`, §3), never in the per-program instance item (one program
+binds searches of many depths): `B*P*4 + (F + 1)*ceil(Q/32)*4 + 16` bytes, by
+the engine's bounds on `P` and `Q` (`Q <= B P + B (F + 1) + 1`; an engine may
+hold a word where a bit is stated, and may keep two copies of `map` to
+reorder in place). The runtime takes it at the bind as a live part of the
+instance: one run of adjacent `Instance` slots, at most a chunk (past one the
+bind is refused by name), priced in the ledger at the bind like any guest
+slot and named to the engine as `InstanceBinding::resident`. It is not the
+guest's scratch, which is dead between fires and given back on a park. A
+park copies the resident run wherever the instance's tables go (the host,
+else the disk tier's slot file) and the unpark copies it back into fresh
+device slots, named in `Rebind::Instance::resident`; the engine clears it
+once, at the bind, follows it to wherever a rebind names, and clears nothing
+there. So it stands from the bind to the search's finish. engine-cuda lays
+the group's state at the start of that run; engine-gpu, Metal and XLA state
+the same bytes as resident and read them where the binding names. It is one copy, device-owned, changed
 only by head kernels in queue order: never part of what an engine
 double-buffers for fires in flight, and never touched by staging a later
 fire on the host. It is pool-relative: it never names a physical page, so
@@ -260,8 +266,19 @@ widths 2, 4, 8; at least `3S` steps from a `folded` with `tail > 0` and one
 with `tail == 0`; parents drawn with forks (repeated parents) and
 retirements (beams no child continues). After every step the device's
 `map` (columns `<= c`), `free`, `pending`, the copies it made and the
-resolved table entries equal the replay's; and a run suspended and restored
-mid-search continues with beams identical to an unsuspended run.
+resolved table entries equal the replay's.
+
+Parked mid-search: the runtime's roles take the resident run live (the
+roles test: with a host tier and with none, a parked instance's resident run
+is copied out whole, copied back from where it went into a fresh run that is
+neither its old one nor another instance's, the engine told that run, and
+nothing of the scratch copied). Served, the `test-pause` worker policy
+pauses a process from `pause-at-ms` after its arrival: beam `--verify` at
+width 4 over 256 steps, paused inside the search (MI300X Qwen3-0.6B: +200,
++300 and +450 ms; one process and four at once; a host tier, and a pool
+with none whose disk tier holds it) finishes verified, its resident run back
+in other slots each time. The same pause with the state in the scratch, or
+with its copy left out, faults the next fire by name (`Overreach`).
 
 A hybrid case runs beside it: widths 2, 4, 8 from a `folded` with
 `tail > 0` and one with `tail == 0`, rs pages of `T` = 1, 2 and 4 rows from
@@ -370,3 +387,65 @@ the bytes one row takes (row `r` of a plane at `set[a] + offset + r cell`).
 
 It runs after the head step and its kv copies, in the fire's stream, ahead
 of the fire's first append or read; its fault word is the lane's (§7).
+
+### 11.3 The common-ancestor fold
+
+A group's rows below its common ancestor are the same in every live beam, so
+they fold into the set's state once, and each beam carries only the rows after
+it: with one beam every row is common, and beam-1 carries the natural window a
+plain decode does.
+
+- Definition. After fire `t`'s head step has reordered the lists (`map'`,
+  §6.2), let `j*` be the first column at which the live beams' lists name
+  different pool pages (`cap` where every column agrees), and `end_t` the slot
+  past the fire's rows. The group's common slot is
+  `c_t = min((f0 + j*) S, end_t)`. Every slot below it lies, for every beam,
+  on the same pool page: one row, never a copy that could differ (a slot a
+  fork copied is not counted: whole shared pages only, at most `S - 1` rows
+  more carried). `c_t` never decreases: a child keeps its parent's columns
+  below `j*`, and `end_t` only grows.
+- Computed on the device, where the lists live: the head step writes `c_t` to
+  the group's state header (`header[3]`, beside `fired`). The host, which
+  does not know the lists under `Port::Parents`, reads it when it harvests the
+  fire, through the readback its outputs land by. Monotone, a value read late
+  (the lag `W`) is still common: nothing waits on it.
+- Stated to engines as a fold. The group's set keeps one committed length,
+  `folded_g`. The next fire the runtime stages on the group states
+  `fold = c - folded_g`, `c` the largest `c_t` harvested, by the verb every
+  decode folds by (`RsVerb::Buffer { folded, fold: FoldLen::Host(n) }`):
+  host-known, run-ahead safe. It folds the set's state `h`, which every lane of
+  the group reads, once a group and never once a lane: the engine folds rows
+  `[folded_g, folded_g + n)` into `h` before any lane of that fire reads it,
+  reading them through any beam's rs page table (below `c_t` every beam's
+  `sigma` names the same row, §11.1), by the rank-1 updates a decode's
+  committed rows take from the kept planes (gated delta `S <- g S + k u^T`,
+  Mamba-2 `S <- a S + (dt x) B^T`, KDA `M <- M diag(alpha) + u k^T`). An engine
+  may run it as one fold over the group's recurrent layers at the fire's
+  start, or inside each layer's step, so long as every lane's read of `h`
+  follows it. After it `folded_g = c`, each beam lane replays `[c, s_t]`, and
+  lanes still commit nothing (`commit_len` 0): `h` changes only by the group's
+  fold.
+- Pages below the fold point. kv: unchanged (attention reads every slot, and
+  the pages below `c` are already in every list; the lists, `f0`, `free` and
+  `pending` do not move). rs: no beam's replay reaches below `folded_g`, so the
+  set's rs buffer base moves to `floor(folded_g / T) T` and the rs pages wholly
+  below it go back to the rs store, the truncate from below a set's committed
+  length advancing takes. `sigma` (§11.1) and `copy_rs_rows` (§11.2) apply at
+  slots at or past the base; a copy's slot below it is skipped, as a prompt
+  tail's is.
+- A search owns its set's state. A parents pass used to leave the set's state
+  as the search found it; it now advances it to the common ancestor. §6.6's
+  adopt is unchanged (the chosen beam's list holds every common page, and the
+  set's committed length is already `folded_g`: the relist covers kv whole and
+  rs from the base). A retract of the set below `folded_g` is refused by name,
+  as any past a fold is. A search left without adopting a beam leaves `h` at
+  `folded_g`, not the prompt: a guest that wants the prompt state back forks
+  the set before the search (`forward.wit`, `state-geometry.parents`). The
+  common rows are in every hypothesis, so whichever beam finishes adopts them:
+  accepted history, never a speculative tail.
+- Tests, beside §9. `c_t` against the host replay's lists after every step
+  (forks, retirements, one beam); a search with folds verifies as one without
+  (`--verify` and the finish check, widths 1, 2, 4, 8, on a hybrid); the rs
+  pages below the base are given back; beam-1-parents' step cost and carried
+  rows equal a plain decode's at the same lag, and beam-4's step lies within
+  the user's rule of greedy's.

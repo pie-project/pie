@@ -19,6 +19,10 @@
 //! sequence, so width 1 is greedy decoding of the same prompt to the same
 //! length (the beam identity, checked under `verify` every step against the
 //! raw argmax).
+//!
+//! A fire refused after submit (a never-fits refusal, one through a restore
+//! wait) poisons its pass's host-reader channels: every take, read and host
+//! call here propagates its Err as the process's error, never a trap.
 
 use inferlet::beam::BeamGroup;
 use inferlet::chat;
@@ -58,7 +62,12 @@ struct Input {
     /// has each lane's mask inherit the next lane's ancestry (`(parent + 1)
     /// % beams`) while its hypothesis keeps its own, so its rows read
     /// another beam's cells; `score` moves lane 0's last step by 4.0 on the
-    /// host. Either must fail `verify`.
+    /// host. Either must fail `verify`. The finish's check has its own:
+    /// `finish` adopts another beam than the one checked; `finish-other` has
+    /// the finish fire read another sequence's set (the prompt's tokens
+    /// shifted, decoded as deep); `finish-stale` has it read only the set's
+    /// committed state, as a stale table or a short folded length would,
+    /// none of the search's buffered rows.
     #[serde(default)]
     corrupt: Option<String>,
 }
@@ -183,6 +192,9 @@ async fn main(input: Input) -> Result<String> {
     let mut hypotheses: Vec<Vec<u32>> = first.iter().map(|&token| vec![token as u32]).collect();
     // Each lane's score after each of its steps, its ancestry's first.
     let mut scored: Vec<Vec<f32>> = final_scores.iter().map(|&s| vec![s]).collect();
+    // Each step's best score, the one the next fire's candidates are taken
+    // relative to.
+    let mut bests: Vec<f32> = vec![best_of(&final_scores)];
 
     // Why the search stopped short of `max_tokens`, where it did: its beams'
     // pool outgrew the kv pool (refused by name; the columns before stand).
@@ -261,16 +273,12 @@ async fn main(input: Input) -> Result<String> {
             });
         let ckpt_sync = mode == "ckpt_sync";
         let stop_wait = mode == "stop_wait";
-        let mut held_ckpt = if ckpt_sync || stop_wait {
-            ws.fork(&pipeline).ok()
-        } else {
-            None
-        };
         if ckpt_sync || stop_wait {
             for _ in 0..decodes {
-                if let Ok(c) = ws.fork(&pipeline) {
-                    held_ckpt = Some(c);
-                }
+                // The step's checkpoint, forked before its fire.
+                let ckpt_ws = ws
+                    .fork(&pipeline)
+                    .with_context(|| format!("@{step}: checkpoint the pool"))?;
                 fwd.submit(&pipeline).with_context(|| format!("@{step}"))?;
                 let picked = out
                     .take_host::<Vec<i32>>()
@@ -292,29 +300,26 @@ async fn main(input: Input) -> Result<String> {
                     None => picked.clone(),
                 };
                 if stop_wait || parents.iter().enumerate().any(|(i, &p)| p as usize != i) {
-                    if let Some(ref ckpt_ws) = held_ckpt {
-                        if let Ok(restore_ws) = ckpt_ws.fork(&pipeline) {
-                            let toks_r = Channel::from(&picked[..1]);
-                            let ind_r = Channel::from([0u32, 1]);
-                            let out_r = Channel::new([1], dtype::i32);
-                            let fwd_r = ForwardPass::new();
-                            fwd_r.embed(&toks_r, &ind_r)?;
-                            fwd_r.state(&[&restore_ws], StateGeometry::folding())?;
-                            fwd_r.epilogue(move || {
-                                out_r.put(reshape(
-                                    reduce_argmax(intrinsics::output(0, "logits")),
-                                    [1],
-                                ));
-                            });
-                            fwd_r.submit(&pipeline)?;
-                            let _ = out_r.take_host::<Vec<i32>>().await?;
-                        }
-                    }
+                    let restore_ws = ckpt_ws
+                        .fork(&pipeline)
+                        .with_context(|| format!("@{step}: restore the checkpoint"))?;
+                    let toks_r = Channel::from(&picked[..1]);
+                    let ind_r = Channel::from([0u32, 1]);
+                    let out_r = Channel::new([1], dtype::i32);
+                    let fwd_r = ForwardPass::new();
+                    fwd_r.embed(&toks_r, &ind_r)?;
+                    fwd_r.state(&[&restore_ws], StateGeometry::folding())?;
+                    fwd_r.epilogue(move || {
+                        out_r.put(reshape(reduce_argmax(intrinsics::output(0, "logits")), [1]));
+                    });
+                    fwd_r.submit(&pipeline)?;
+                    let _ = out_r.take_host::<Vec<i32>>().await?;
                 }
                 greedy_mismatches += picked.iter().zip(&greedy).filter(|(p, g)| p != g).count();
                 hypotheses = advance_hypotheses(&hypotheses, &picked, &parents)?;
                 last_parents.clone_from(&parents);
                 scored = advance(&scored, &final_scores, &parents)?;
+                bests.push(best_of(&final_scores));
                 step += 1;
             }
         } else {
@@ -351,6 +356,7 @@ async fn main(input: Input) -> Result<String> {
                 hypotheses = advance_hypotheses(&hypotheses, &picked, &parents)?;
                 last_parents.clone_from(&parents);
                 scored = advance(&scored, &final_scores, &parents)?;
+                bests.push(best_of(&final_scores));
                 step += 1;
                 Ok(ControlFlow::Continue(()))
             })
@@ -409,7 +415,14 @@ async fn main(input: Input) -> Result<String> {
                 let device_beam = last_parents.get(adopted).copied().unwrap_or(0);
                 fwd.adopt_beam(device_beam, n + fired)
                     .context("finish the search")?;
-                finished = Some(finish_check(&ws, &prompt, &hypotheses[best], n + fired, b).await?);
+                let read = match input.corrupt.as_deref() {
+                    Some("finish-other") => FinishRead::Other,
+                    Some("finish-stale") => FinishRead::Committed(n),
+                    _ => FinishRead::Set,
+                };
+                finished = Some(
+                    finish_check(&ws, &prompt, &hypotheses[best], n + fired, b, read).await?,
+                );
             }
         }
     }
@@ -437,40 +450,44 @@ async fn main(input: Input) -> Result<String> {
     }
     let verified = if input.verify {
         let mut worst = 0f32;
-        // The most of its room any step came to (apart / room).
+        // The step that came closest to its room (apart / room), and what
+        // it was.
         let mut closest = 0f32;
+        let mut closest_at = String::new();
         // The most any step's log-probability moved between its 1-row and
         // its beam-width rescore (d_t).
         let mut drift = 0f32;
         for (lane, hypothesis) in hypotheses.iter().enumerate() {
             let alone = rescore(&prompt, hypothesis, b).await?;
             // Each step's log-probability as the beam took it (its score's
-            // step), against the hypothesis's own, within that step's room
-            // (`rescore`'s), and the quanta of the beam's scores either side
-            // of it.
+            // step), against the hypothesis's own, within its room.
             drift = drift.max(alone.iter().map(|s| s.drift).fold(0.0, f32::max));
             let mut before = 0f32;
-            for (at, (&after, &Rescored { step, room, .. })) in
-                scored[lane].iter().zip(&alone).enumerate()
-            {
+            for (at, (&after, rescored)) in scored[lane].iter().zip(&alone).enumerate() {
                 let took = after - before;
-                let room = room + quantum(after) + if at > 0 { quantum(before) } else { 0.0 };
+                let step = rescored.step;
+                let room = rescored.room(took, (at > 0).then(|| (before, after, bests[at - 1])));
                 let apart = (took - step).abs();
-                closest = closest.max(apart / room);
-                if apart > room {
-                    return Err(format!(
+                if apart / room.total() > closest {
+                    closest = apart / room.total();
+                    closest_at = format!(
                         "beam {lane} took {took:.4} at step {at}, and its hypothesis alone \
-                         {step:.4} there: {apart:.4} apart, past {room:.3}; its recurrence or \
-                         attention read another beam's cells",
-                    ));
+                         {step:.4} there: {apart:.4} apart, room {room}"
+                    );
                 }
                 before = after;
             }
             let total: f32 = alone.iter().map(|s| s.step).sum();
             worst = worst.max((total - final_scores[lane]).abs());
         }
+        if closest > 1.0 {
+            return Err(format!(
+                "{closest_at}: {closest:.2} times its room; its recurrence or attention read \
+                 another beam's cells",
+            ));
+        }
         format!(
-            " greedy_mismatches={greedy_mismatches} verified={} worst_apart={worst:.4} worst_step={closest:.3} max_drift={drift:.4}",
+            " greedy_mismatches={greedy_mismatches} verified={} worst_apart={worst:.4} worst_step={closest:.3} max_drift={drift:.4} closest: {closest_at}",
             hypotheses.len()
         )
     } else {
@@ -489,8 +506,10 @@ async fn main(input: Input) -> Result<String> {
 /// After a search's finish, one plain fire on its working set: the last
 /// token of `hypothesis` (the one the search fed no fire) at slot `slot`,
 /// folding, its second-ranked next token's log-probability against an
-/// unbranched decode of `prompt` and `hypothesis` and that token (`rescore`,
-/// `width` rows for the drift). How far apart, the room, and its score; past
+/// unbranched decode of `prompt` and `hypothesis` and that token
+/// ([`rescore`]: `width` rows run as the beam's fires run for the drift, as
+/// the set carries the search's unfolded rows into this fire), within a
+/// step's room ([`Rescored::room`]). How far apart, the room, and its score; past
 /// the room it fails by name.
 async fn finish_check(
     ws: &WorkingSet,
@@ -498,14 +517,42 @@ async fn finish_check(
     hypothesis: &[u32],
     slot: u32,
     width: u32,
+    read: FinishRead,
 ) -> Result<(f32, f32, f32)> {
     let v = model::output_vocab_size();
     let last = *hypothesis.last().ok_or("an empty hypothesis")?;
     let pipeline = Pipeline::new();
+    // `FinishRead::Other`: another sequence as deep, prefilled and folded on
+    // a set of its own: the prompt's tokens shifted by one, and the
+    // hypothesis's but its last.
+    let other = WorkingSet::new();
+    let ws = if let FinishRead::Other = read {
+        let fed: Vec<i32> = prompt
+            .iter()
+            .map(|&t| (t + 1) as i32)
+            .chain(hypothesis[..hypothesis.len() - 1].iter().map(|&t| (t + 1) as i32))
+            .collect();
+        let rows = u32::try_from(fed.len()).map_err(|_| "a sequence past u32 rows")?;
+        let toks = Channel::from(&fed[..]);
+        let indptr = Channel::from([0u32, rows]);
+        let fwd = ForwardPass::new();
+        fwd.embed(&toks, &indptr)?;
+        fwd.state(&[&other], StateGeometry::folding())
+            .context("bind the other sequence")?;
+        fwd.submit(&pipeline).context("other-sequence submit")?;
+        &other
+    } else {
+        ws
+    };
     let toks = Channel::from([last as i32]);
     let indptr = Channel::from([0u32, 1]);
     let positions = Channel::from([slot]);
-    let slots = Channel::from([slot]);
+    // `FinishRead::Committed(c)`: the row lands at slot `c`, so it reads the
+    // committed state alone and none of the buffered rows past it.
+    let slots = Channel::from([match read {
+        FinishRead::Committed(committed) => committed,
+        _ => slot,
+    }]);
     let out = Channel::new([1], dtype::f32);
     let next = Channel::new([1], dtype::i32);
     let fwd = ForwardPass::new();
@@ -540,16 +587,31 @@ async fn finish_check(
     forced.push(token);
     let rescored = rescore(prompt, &forced, width).await?;
     let want = rescored.last().ok_or("the unbranched decode returned nothing")?;
+    // The set's fire rounds its logits and log-probability as the beam's
+    // fires do, and takes no candidate: a step's room with nothing carried.
+    let room = want.room(got, None);
     let apart = (got - want.step).abs();
-    if apart > want.room {
+    if apart > room.total() {
         return Err(format!(
             "after its finish the set scored the next token {got:.4} and an unbranched decode \
-             {:.4}: {apart:.4} apart, past {:.3}; its pages are not its beam's",
-            want.step, want.room
+             {:.4}: {apart:.4} apart, room {room}: {:.2} times its room; its pages are not its \
+             beam's",
+            want.step,
+            apart / room.total()
         )
         .into());
     }
-    Ok((apart, want.room, got))
+    Ok((apart, room.total(), got))
+}
+
+/// What the finish's fire reads: the finished set as it stands, or (the
+/// finish's negative controls) another sequence's set, or only the set's
+/// first `c` slots, the committed state.
+#[derive(Clone, Copy)]
+enum FinishRead {
+    Set,
+    Other,
+    Committed(u32),
 }
 
 /// Whether a fire's refusal says the beams' pool outgrew what the kv pool
@@ -560,73 +622,152 @@ fn outgrown(why: &str) -> bool {
     why.contains("outgrows the kv pool") || why.contains("this process alone holds what the pool holds")
 }
 
-/// The quantum of `x` in the dtype it was stored in: the gap between it and
-/// the next value away from zero, of bf16 (8 significant bits) where `x` is
-/// a bf16 widened (its low 16 bits zero), else of f32 (24). The logits are
-/// bf16; the scores and log-probabilities come off f32 channels, f32 or bf16
-/// as the program computed them. An f32 that is a bf16 by chance (one in
-/// 65536) is given bf16's room.
-fn quantum(x: f32) -> f32 {
-    let bits = x.abs().to_bits();
-    let exponent = ((bits >> 23) & 0xff) as i32 - 127;
-    let significant = if bits & 0xffff == 0 { 7 } else { 23 };
-    2f32.powi(exponent.max(-126) - significant)
+/// The gap between `x` and the next value away from zero in bf16 (8
+/// significant bits): the most a value rounded to bf16 at `x`'s magnitude
+/// may sit from the value it stands for.
+fn ulp_bf16(x: f32) -> f32 {
+    ulp(x, 7)
 }
 
-/// One step of a hypothesis rescored alone: its log-probability, the room a
-/// beam's step has from it, and its drift between row counts.
+/// The same gap in f32 (24 significant bits).
+fn ulp_f32(x: f32) -> f32 {
+    ulp(x, 23)
+}
+
+fn ulp(x: f32, fraction_bits: i32) -> f32 {
+    let exponent = ((x.abs().to_bits() >> 23) & 0xff) as i32 - 127;
+    2f32.powi(exponent.max(-126) - fraction_bits)
+}
+
+fn best_of(scores: &[f32]) -> f32 {
+    scores.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+}
+
+/// One step of a hypothesis rescored alone: its log-probability, its target
+/// and largest logit, and its drift between row counts.
 struct Rescored {
     step: f32,
-    room: f32,
+    picked: f32,
+    largest: f32,
     drift: f32,
 }
 
+impl Rescored {
+    /// The room a beam's step `took` has from this rescore, each part a bf16
+    /// (or f32) gap at the magnitude of the value it rounds:
+    ///
+    /// - the log-probability and the logits are rounded to bf16 by both
+    ///   fires. Two roundings of values a drift apart land at most that
+    ///   drift and one gap apart: one gap at the larger log-probability, and
+    ///   one each at the target logit and the largest logit (which leads the
+    ///   log-sum-exp). The beam's logits are not drained; they are the
+    ///   rescore's within the drift, so the rescore's give the magnitudes;
+    /// - a decode step (`carried`: the beam's score `before` it, `after` it,
+    ///   and the best score `best` its fire took candidates relative to)
+    ///   also rounds, on the beam alone, the relative score and the
+    ///   candidate (relative plus log-probability) to bf16, and its scores
+    ///   either side to f32;
+    /// - a drift: the beam's fires run other kernels than a 1-row fire
+    ///   folding every step (other tiles, splits and reduction orders for
+    ///   their rows, a recurrence read through an unfolded run, compounding
+    ///   through every layer and the cache rows written), which the user
+    ///   allows (no batch invariance); `drift` is this step's own measure of
+    ///   it, the log-probability moved between that 1-row fire and the
+    ///   hypothesis run as the beam's fires run ([`rescore`]). Both sides may
+    ///   carry one: twice the drift.
+    fn room(&self, took: f32, carried: Option<(f32, f32, f32)>) -> Room {
+        let candidate = carried.map_or(0.0, |(before, after, best)| {
+            ulp_bf16(before - best) + ulp_bf16(after - best) + ulp_f32(before) + ulp_f32(after)
+        });
+        Room {
+            log_prob: ulp_bf16(took.abs().max(self.step.abs())),
+            logits: ulp_bf16(self.picked) + ulp_bf16(self.largest),
+            candidate,
+            drift: 2.0 * self.drift,
+        }
+    }
+}
+
+/// A step's room, by part ([`Rescored::room`]).
+#[derive(Clone, Copy, Default)]
+struct Room {
+    log_prob: f32,
+    logits: f32,
+    candidate: f32,
+    drift: f32,
+}
+
+impl Room {
+    fn total(&self) -> f32 {
+        self.log_prob + self.logits + self.candidate + self.drift
+    }
+}
+
+impl std::fmt::Display for Room {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:.3} (log-probability {:.4}, logits {:.4}, candidate {:.4}, twice the drift {:.4})",
+            self.total(),
+            self.log_prob,
+            self.logits,
+            self.candidate,
+            self.drift
+        )
+    }
+}
+
 /// Each step of `hypothesis` after `prompt`, teacher-forced one token a fire
-/// on working sets of its own ([`teacher_forced`]), as a 1-row fire and as a
-/// fire of `width` rows (the hypothesis and copies of itself: as many rows as
-/// the beam's own fires take): what a beam that read only its own ancestry
-/// takes there, and its room.
+/// on working sets of its own ([`teacher_forced`]): as a 1-row fire folding
+/// every step, what a beam that read only its own ancestry takes there; and
+/// as the beam's own fires run, `width` rows (the hypothesis and copies of
+/// itself) with nothing folded past the prompt, how far the beam's kernels
+/// drift from it. A recurrent layer read through a long unfolded run is
+/// another computation from one folded every step, and the gap grows with
+/// the run (Qwen3.5: up to 0.375 at log-probability -7 by step 255, with
+/// row counts alone drifting 0 there).
 async fn rescore(prompt: &[u32], hypothesis: &[u32], width: u32) -> Result<Vec<Rescored>> {
-    let one = teacher_forced(prompt, hypothesis, 1).await?;
-    let wide = teacher_forced(prompt, hypothesis, width).await?;
+    let one = teacher_forced(prompt, hypothesis, 1, Fold::All).await?;
+    let wide = teacher_forced(prompt, hypothesis, width, Fold::None).await?;
     Ok(one
         .iter()
         .zip(&wide)
-        .map(|(&(step, picked, largest), &(paired, ..))| {
-            // The beam's fire and the rescore are independent fires, each up
-            // to one drift and one rounding from the true value. A rounding:
-            // the logits are bf16, so each fire's target logit and largest
-            // logit (which leads the log-sum-exp) may sit one quantum from
-            // the true value, and the log-probability its own quantum. A
-            // drift: fires of other rows run other kernels (other tiles,
-            // splits and reduction orders, compounding through every layer
-            // and the cache rows written), which the user allows (no batch
-            // invariance); `drift` is this step's own measure of it, the
-            // log-probability moved between a 1-row fire and one of the
-            // beam's width (the row count its own fires take). Both
-            // sides of the comparison may carry one of each: twice the drift.
-            let drift = (step - paired).abs();
-            let room = quantum(step) + quantum(picked) + quantum(largest) + 2.0 * drift;
-            Rescored { step, room, drift }
+        .map(|(&(step, picked, largest), &(paired, ..))| Rescored {
+            step,
+            picked,
+            largest,
+            drift: (step - paired).abs(),
         })
         .collect())
 }
 
 /// Each step's log-probability of `hypothesis` after `prompt`, its target
 /// logit and its largest logit, teacher-forced one token a fire as `copies`
-/// rows (the hypothesis repeated, each copy on a working set of its own),
-/// read off the first.
+/// rows (the hypothesis repeated, each copy on a working set of its own,
+/// the prompt's fire the first copy's alone), read off the first. The prompt is folded; each step after it folds by
+/// `fold`.
 async fn teacher_forced(
     prompt: &[u32],
     hypothesis: &[u32],
     copies: u32,
+    fold: Fold<'static>,
 ) -> Result<Vec<(f32, f32, f32)>> {
     let v = model::output_vocab_size();
-    let sets: Vec<WorkingSet> = (0..copies).map(|_| WorkingSet::new()).collect();
-    let bound: Vec<&WorkingSet> = sets.iter().collect();
+    // The prompt is prefilled once, on the first set; the other copies are
+    // forks of it after that fire, sharing the prompt's pages, so the
+    // rescore needs one prompt and each copy's own tail.
+    let mut sets: Vec<WorkingSet> = vec![WorkingSet::new()];
     let pipeline = Pipeline::new();
     let mut steps = Vec::with_capacity(hypothesis.len());
     for (at, &target) in hypothesis.iter().enumerate() {
+        if at == 1 {
+            for _ in 1..copies {
+                let copy = sets[0].fork(&pipeline).context("fork the prompt's set")?;
+                sets.push(copy);
+            }
+        }
+        let bound: Vec<&WorkingSet> = sets.iter().collect();
+        let copies = u32::try_from(bound.len()).map_err(|_| "copies past u32")?;
         let fed: Vec<i32> = if at == 0 {
             prompt.iter().map(|&t| t as i32).collect()
         } else {
@@ -642,7 +783,11 @@ async fn teacher_forced(
         let largest = Channel::new([1], dtype::f32);
         let fwd = ForwardPass::new();
         fwd.embed(&toks, &indptr)?;
-        fwd.state(&bound, StateGeometry::folding())
+        let geometry = StateGeometry {
+            fold: if at == 0 { Fold::All } else { fold },
+            ..StateGeometry::default()
+        };
+        fwd.state(&bound, geometry)
             .context("bind the rescoring sets")?;
         fwd.epilogue(move || {
             // The first copy's row, at the sampler's bf16 grain.

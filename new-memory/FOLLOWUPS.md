@@ -361,6 +361,54 @@ pass), against native Vulkan's 22.5 ms recorded step. From 4 lanes the gate
 wait is 133–156 ms of GPU time (the bf16 GEMM's `VECTOR_MAX_ROWS = 4`
 boundary), not host time.
 
+## F29. A parked role slot rounds up to whole kv slots of the slot file
+
+Where the load states no host tier (unified memory), a parked process's
+role slots (Instance, Channel, Adapter) go down to the kv slot file, each
+whole in a run of `ceil(slot_bytes / kv slot_bytes)` adjacent file slots
+(`Roles::prepare_park_down`, `DiskSlots`, CONTRACT-BC 22 in
+`Engine::copy_slots`), counted against `budget_disk` with kv: exact, no
+file or budget of its own, any size. The cost is rounding: a 4 KiB
+Instance slot holds a whole kv page's slot (≈1–2 MiB), so 500 parked
+processes of 8 small role slots take 4000 of the file's slots, while a
+slot wider than a kv page wastes under one kv slot. Packing several small
+role slots into one file slot (an offset inside it, aligned for the
+file's direct I/O) would cut that; measure the file's room under the M1 /
+M5 loads first. With guest scratch held only while a fire is in flight,
+only the small resident part (tables, rings) parks at all.
+
+## F31. Metal syncs and drains the host waits on (audits on 5355faa9a)
+Each turns depth into depth 1 or adds host work per step; CUDA does the same in queue order.
+- A fresh recurrent-state record is zeroed after draining every frame in flight
+  (engine-metal serve.rs:4540-4544): every hybrid / SSM admission runs at depth 1, uncounted. Zero it in queue
+  order, as a fill in the next command buffer (CUDA: serve/enqueue.rs:447-448).
+- Tier moves drain on every `copy_slots` (serve.rs:2003) and `read_tier_slots` (serve.rs:2025). Copies go in
+  queue order and land through the command buffer's completion (with `copy_slots_landing`), no drain.
+- Device-geometry programs: `fence_instances` waits on the last fire, then reads each port per lane on the host
+  (serve.rs:3604, program/ports.rs:20). On unified memory they can be read in place, without the wait.
+- Each prologue region commits and calls waitUntilCompleted (program/launch.rs:2140), once per instance per
+  region: O(lanes) syncs a step.
+- `admit_list_page` for every page of every lane each step (serve.rs:4523): ~64k calls at 256 lanes x 256
+  pages, ~1-3 ms.
+- The walk re-encodes ~1700 launches a step with a SipHash lookup per launch (serve.rs:5474,
+  device/library.rs:151).
+- kernels-metal has the VECTOR_MAX_ROWS = 4 GEMM cliff (linear/gemm.rs:33), and the qmv fold only folds
+  divisors <= 8, so 11 rows take ~11 weight passes (linear/qmv/rows.rs:60).
+- Metal never counts the Refused tally.
+- Measured on the M1 (Qwen3-0.6B, 2026-11-19): no guest binds as device geometry today (a beam mix bound 2080
+  Host-class instances and 32 DecodeEnvelope, beam included, and none DeviceGeometry), so the port read above
+  does not run for them. But `fence_instances` (serve.rs ~3684) holds every attached instance, whatever its
+  class, to its last fire's landing before its next is staged (a session's one status word, the host reading
+  its cells between fires): every guest lane runs at depth 1. The GPU idles between frames 7.3% of its time at
+  1 lane, 9.5% at c16 and 15.1% at c64 (each frame's command-buffer start / end), the host's take, settle
+  and next stage+encode not overlapped. Two status words a session (the host's take deferred one step, as
+  CUDA's decode envelope does) is worth scoping after the scratch-in-flight split.
+- An instance's value scratch is held once, not a frame in flight each (no two of its fires overlap); its
+  pair's batch tables must stay a set a frame in flight: consecutive frames fire different instances of one
+  pair. Cutting both to one set broke beam --verify (62 / 57 / 38 of 64, "read another beam's cells");
+  cutting only the instance scratch kept 64 / 64 and halved it (11.4 -> 5.7 MB an instance, 45.6 -> 22.8 MB
+  a beam instance).
+
 ## F32. ROCm last-block (ticket) fusions: the split decode's fold and the norm epilogues, measured and dropped
 
 Tried on memory-redesign a34acca57 (local f3072dde9, not landed): the
@@ -402,6 +450,42 @@ partials summed by the last block). On MI300X a ticket tail (stores through
 the L2, the atomic's round trip, reads past the L2) costs more than the
 ~1.6 us node it removes. Fusions that cut nodes there want one block to own
 the whole row (no tail), not a last-block reduction.
+
+## F33. Metal's few-row dense matmul on the M1: 4 rows ≈ 1.38× one row
+The user's rule is that a beam-4 step costs about what a single greedy step costs. On the M1 Max
+(Qwen3-0.6B, home-carve), after `sc/mac-gemv-rows` (0bc7019c8, few-row forms that read each weight row
+once), a step costs: greedy ×1 5.96 ms, 4 parallel greedy 8.21 ms, beam-4 8.31 ms. The device profile of
+a 4-row decode fire is 8.1 ms (projections 5.7 ms, against 3.9 ms at 1 row); the rest is flat.
+Tried and dropped (each passed the few-row matmul test; device time of the wide projections at 4 rows,
+against 3.9 ms for 0bc7019c8):
+- weights converted once for all rows: 3.9 ms (conversion is not the bottleneck);
+- activation rows staged per threadgroup as floats, 8 columns, 64-group tiles: 4.5 ms; resized to 32 KiB
+  (16 columns, 1024/R groups): 4.7 ms (barriers, and one threadgroup a core);
+- 4 columns a simdgroup, an activation load shared by 4 weight rows: 4.2 ms (fewer simdgroups, register
+  pressure);
+- the 8×8 simdgroup matrix multiply, rows padded to 8, D^T = W x A^T with each lane's weight operand a
+  contiguous bf16 pair (patch kept in the Metal session's scratchpad): projections 7.5 / 7.8 / 8.4 ms at
+  2 / 4 / 8 rows, against 4.4 / 5.7 / 9.2 ms. Flat in the rows, as a weight-read-bound form should be,
+  but bound by its 4-byte weight loads: it beats 0bc7019c8 only at 8 rows (fire 12.1 -> 11.3 ms).
+What could still close it: the matrix form with wider weight loads (weights pre-packed so a lane's
+operand pairs come from one 16-byte load, or several 8×8 blocks a load), which needs a packed weight
+layout; or a kernel that is load-issue-bound at the M1's rate rather than per-lane. Measure on the M5
+(tensor ops) before choosing: the M1 is not where Apple's decode will be judged. Measured on the M5 at
+a34acca57 (Mac Pro, same method): greedy ×1 5.08 ms, 4 parallel 5.52 ms (1.09×), beam-4 6.09 ms (1.20×);
+the 4-row projections take the few-row vector forms there too (3.4 + 1.3 ms against 3.2 + 1.1 at one row),
+so the M5 meets the rule within ~20% and the gap is the M1's.
+Then tried at the user's ask, the packed form (prototype, not landed; patch in the Metal session's
+scratchpad, gemv-mma8-packed.patch): weights packed at load per 8-column block and 32-wide K group so a
+lane's four 8×8-block operands are one 16-byte load, K permuted inside a group so a lane's activations of
+a row are one 8-byte load, the contraction split across a threadgroup's 8 simdgroups (partial tiles summed
+in threadgroup memory). Device time of Qwen3-0.6B's four projection shapes, summed: routed (0bc7019c8)
+88–100 / 116–132 / 155–185 / 271–289 µs at 1 / 2 / 4 / 8 rows; packed 164 / 165 / 145 / 129 µs. Flat in
+the rows, but it floors at ~145–160 µs at 4 rows against ~90 µs for the routed one row (which runs near
+the M1's bandwidth): 1.6–1.8×, not the ≤1.05× asked. Each step removed what it targeted (split widths 4 /
+16 and four independent accumulators changed nothing), so the floor is the M1's simdgroup-matrix rate
+(Apple7 has no tensor units). Taking it would mean a second copy of every dense weight (one row stays on
+the routed forms): ~0.88 GB for Qwen3-0.6B, ~1.19 GB with the LM head, for −10–15% at 4 rows. Not taken;
+the M1's gap to the rule stays here.
 
 ## F34. Tensor-parallel score capture: the score row's reduce across ranks
 Since Dim::Capturing (9e78d2281) a capturing lane's key row is summed over the layers in place, so under tensor parallelism each rank holds a partial row and the shard pass emits one all_reduce on it, in place on the Capture-placed row (the arena's one exact Capture-to-Capture share; `sc/gpu-poem-suite-mask`). Guest epilogues read that row on the device (CUDA: the reading guest's instance slots, `engine-cuda/src/scores.rs`; engine-gpu: the pair's score room), so it can't be summed at host readout. The rows are scattered one per capturing lane, outside the arena, so engine-cuda (CUDA / ROCm) and engine-gpu (the band collective) refuse a tensor-parallel load that captures scores, by name, instead of reducing the wrong memory. Metal (collectives unsupported) and XLA (single replica) never see it; the CPU oracle sums correctly.

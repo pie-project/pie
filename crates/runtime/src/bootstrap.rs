@@ -658,7 +658,12 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 host_chunks = d.chunks.host_chunks,
                 disk_chunks = d.chunks.disk_chunks,
                 chunk_bytes = d.chunks.chunk_bytes,
-                "kv tiers: suspended kv goes to the host, then the disk"
+                "kv tiers: suspended kv goes to {}",
+                if d.chunks.host_chunks == 0 {
+                    "the disk (no host tier)"
+                } else {
+                    "the host, then the disk"
+                }
             );
         } else if kv_swap_capable {
             tracing::info!(
@@ -807,9 +812,9 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     "[planner-trace] queue={} unmet={} head_pages={} head_kind={} bypass={}/{} accum={} \
                      free={}/{} host_free={}/{} head_rs={} rs_free={}/{} \
                      parks={} serves={} evictions={} deferrals={} \
-                     evict_rollbacks={} evict_faults={} restore_faults={} restores={} restore_failures={} restore_roles_short={} gate_parks={} \
+                     evict_rollbacks={} evict_faults={} restore_faults={} restores={} restore_failures={} restore_roles_short={} leaked_role_slots={} gate_parks={} \
                      hogs={} starved={} restarted={} salvaged={} swapfull={}/{} e6_relax={} rshort={} \
-                     grow_waits={} grow_parked={} no_grows={} \
+                     grow_waits={} compaction_waits={} grow_parked={} no_grows={} \
                      lock_n={} lock_wait_ms={} lock_hold_ms={} lock_wmax_us={} lock_hmax_us={} \
                      d2h_pages={} h2d_pages={} d2h_rs={} h2d_rs={} d2h_ms={} h2d_ms={} \
                      disk_free={}/{} disk_w_pages={} host_disk_pages={} disk_r_pages={} disk_w_ms={} disk_r_ms={} \
@@ -839,6 +844,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     d.restores_total,
                     d.restore_failures_total,
                     d.restore_roles_short_total,
+                    d.leaked_role_slots_total,
                     d.gate_parks_total,
                     d.hog_failures_total,
                     d.starvations_total,
@@ -849,6 +855,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     d.e6_relaxations_total,
                     d.restore_absorb_short_total,
                     d.grow_waits_total,
+                    d.compaction_waits_total,
                     d.grow_parked,
                     d.no_grows_total,
                     lk_n,
