@@ -28,45 +28,142 @@ pub use plex::core::types as wit;
 /// The memory one policy instance may use.
 pub const MEMORY_BYTES: usize = 64 << 20;
 
-/// What one call reads: the host's state as of its start.
-#[derive(Default)]
+/// A process as the host keeps it: its record as of `since`, when it last
+/// changed state (`service` and `waited` are counted up to there).
+#[derive(Clone)]
+pub struct Proc {
+    pub rec: snap::Process,
+    pub since: u64,
+}
+
+impl Proc {
+    /// Its record as of `now`: the time since `since` added to `service`
+    /// (running) or `waited` (any other live state).
+    pub fn at(&self, now: u64) -> snap::Process {
+        let mut rec = self.rec.clone();
+        let spent = now.saturating_sub(self.since);
+        match rec.state {
+            wit::ProcessState::Running => rec.service += spent,
+            wit::ProcessState::Exited => {}
+            _ => rec.waited += spent,
+        }
+        rec
+    }
+}
+
+type Map<K, V> = imbl::HashMap<K, V>;
+type Named = Arc<HashMap<String, tables::Value>>;
+
+/// What one call reads: the host's state as of its start. It holds the
+/// host's persistent maps (an O(1) clone taken under the lock) and builds
+/// what a policy asks for when it asks: one process or worker by id from
+/// the map, the full sorted lists once per round (shared by every call of
+/// the round). A round no policy reads costs nothing per process.
 pub struct Snapshot {
-    pub processes: Vec<snap::Process>,
-    pub process_index: HashMap<String, usize>,
-    pub workers: Vec<snap::Worker>,
-    pub worker_index: HashMap<String, usize>,
-    pub working_sets: Vec<snap::WorkingSet>,
-    pub working_set_index: HashMap<String, usize>,
-    pub hints: HashMap<Subject, HashMap<String, tables::Value>>,
-    pub attrs: HashMap<Subject, HashMap<String, tables::Value>>,
+    now: u64,
+    procs: Map<String, Proc>,
+    workers: Map<String, snap::Worker>,
+    sets: Map<String, snap::WorkingSet>,
+    hints: Map<Subject, Named>,
+    attrs: Map<Subject, Named>,
+    processes: OnceLock<Vec<snap::Process>>,
+    worker_list: OnceLock<Vec<snap::Worker>>,
+    set_list: OnceLock<Vec<snap::WorkingSet>>,
+}
+
+impl Default for Snapshot {
+    fn default() -> Self {
+        Snapshot::new(
+            0,
+            Map::new(),
+            Map::new(),
+            Map::new(),
+            Map::new(),
+            Map::new(),
+        )
+    }
 }
 
 impl Snapshot {
-    pub fn index(&mut self) {
-        self.process_index = self
-            .processes
-            .iter()
-            .enumerate()
-            .map(|(i, p)| (p.id.clone(), i))
-            .collect();
-        self.worker_index = self
-            .workers
-            .iter()
-            .enumerate()
-            .map(|(i, w)| (w.id.clone(), i))
-            .collect();
-        self.working_set_index = self
-            .working_sets
-            .iter()
-            .enumerate()
-            .map(|(i, w)| (w.id.clone(), i))
-            .collect();
+    pub fn new(
+        now: u64,
+        procs: Map<String, Proc>,
+        workers: Map<String, snap::Worker>,
+        sets: Map<String, snap::WorkingSet>,
+        hints: Map<Subject, Named>,
+        attrs: Map<Subject, Named>,
+    ) -> Self {
+        Snapshot {
+            now,
+            procs,
+            workers,
+            sets,
+            hints,
+            attrs,
+            processes: OnceLock::new(),
+            worker_list: OnceLock::new(),
+            set_list: OnceLock::new(),
+        }
+    }
+
+    /// Every process, in a stable order (arrival, then id), so a policy
+    /// that breaks ties by position is deterministic.
+    pub fn processes(&self) -> &Vec<snap::Process> {
+        self.processes.get_or_init(|| {
+            let mut v: Vec<snap::Process> = self.procs.values().map(|p| p.at(self.now)).collect();
+            v.sort_by(|a, b| (a.arrival, &a.id).cmp(&(b.arrival, &b.id)));
+            v
+        })
+    }
+
+    pub fn workers(&self) -> &Vec<snap::Worker> {
+        self.worker_list.get_or_init(|| {
+            let mut v: Vec<snap::Worker> = self.workers.values().cloned().collect();
+            v.sort_by(|a, b| a.id.cmp(&b.id));
+            v
+        })
+    }
+
+    pub fn working_sets(&self) -> &Vec<snap::WorkingSet> {
+        self.set_list.get_or_init(|| {
+            let mut v: Vec<snap::WorkingSet> = self.sets.values().cloned().collect();
+            v.sort_by(|a, b| a.id.cmp(&b.id));
+            v
+        })
+    }
+
+    pub fn process(&self, id: &str) -> Option<snap::Process> {
+        self.procs.get(id).map(|p| p.at(self.now))
+    }
+
+    pub fn worker(&self, id: &str) -> Option<snap::Worker> {
+        self.workers.get(id).cloned()
+    }
+
+    pub fn working_set(&self, id: &str) -> Option<snap::WorkingSet> {
+        self.sets.get(id).cloned()
+    }
+
+    pub fn has_working_set(&self, id: &str) -> bool {
+        self.sets.contains_key(id)
+    }
+
+    pub fn has_worker(&self, id: &str) -> bool {
+        self.workers.contains_key(id)
+    }
+
+    pub fn hint(&self, of: &Subject, name: &str) -> Option<&tables::Value> {
+        self.hints.get(of)?.get(name)
+    }
+
+    pub fn attr(&self, of: &Subject, name: &str) -> Option<&tables::Value> {
+        self.attrs.get(of)?.get(name)
     }
 
     fn live_process(&self, id: &str) -> bool {
-        self.process_index
+        self.procs
             .get(id)
-            .is_some_and(|i| self.processes[*i].state != wit::ProcessState::Exited)
+            .is_some_and(|p| p.rec.state != wit::ProcessState::Exited)
     }
 }
 
@@ -170,9 +267,7 @@ fn wit_prefix(p: &Prefix) -> wit::Prefix {
 
 /// Whether every worker a row names is one the host knows.
 fn known_workers(snapshot: &Snapshot, workers: &[String]) -> bool {
-    workers
-        .iter()
-        .all(|w| snapshot.worker_index.contains_key(w))
+    workers.iter().all(|w| snapshot.has_worker(w))
 }
 
 /// A column's seven functions, over one field of the tables. `live` says
@@ -294,13 +389,13 @@ column!(plex::schedule::hold::Host, schedule_hold,
 
 column!(plex::retention::priority::Host, retention_priority,
     key: wit::Prefix => |k| prefix(k), back: |k| wit_prefix(k),
-    live: |s, k| s.working_set_index.contains_key(&k.0),
+    live: |s, k| s.has_working_set(&k.0),
     value: i64 => |v| v, back: |v| v,
     valid: |_s, _v| true);
 
 column!(plex::retention::tiers::Host, retention_tiers,
     key: wit::Prefix => |k| prefix(k), back: |k| wit_prefix(k),
-    live: |s, k| s.working_set_index.contains_key(&k.0),
+    live: |s, k| s.has_working_set(&k.0),
     value: Vec<wit::Tier> => |v| tier_set(v), back: |v| tier_list(v),
     valid: |_s, _v| true);
 
@@ -318,7 +413,7 @@ column!(plex::placement::helpers::Host, placement_helpers,
 
 column!(plex::replication::workers::Host, replication_workers,
     key: wit::Prefix => |k| prefix(k), back: |k| wit_prefix(k),
-    live: |s, k| s.working_set_index.contains_key(&k.0),
+    live: |s, k| s.has_working_set(&k.0),
     value: Vec<String> => |v| v, back: |v| v,
     valid: |s, v| known_workers(s, v));
 
@@ -328,52 +423,37 @@ impl plex::retention::types::Host for Ctx {}
 
 impl snap::Host for Ctx {
     fn get_processes(&mut self) -> Vec<snap::Process> {
-        self.call().snapshot.processes.clone()
+        self.call().snapshot.processes().clone()
     }
 
     fn get_workers(&mut self) -> Vec<snap::Worker> {
-        self.call().snapshot.workers.clone()
+        self.call().snapshot.workers().clone()
     }
 
     fn get_working_sets(&mut self) -> Vec<snap::WorkingSet> {
-        self.call().snapshot.working_sets.clone()
+        self.call().snapshot.working_sets().clone()
     }
 
     fn get_process(&mut self, id: String) -> Option<snap::Process> {
-        let s = &self.call().snapshot;
-        s.process_index.get(&id).map(|i| s.processes[*i].clone())
+        self.call().snapshot.process(&id)
     }
 
     fn get_worker(&mut self, id: String) -> Option<snap::Worker> {
-        let s = &self.call().snapshot;
-        s.worker_index.get(&id).map(|i| s.workers[*i].clone())
+        self.call().snapshot.worker(&id)
     }
 
     fn get_working_set(&mut self, id: String) -> Option<snap::WorkingSet> {
-        let s = &self.call().snapshot;
-        s.working_set_index
-            .get(&id)
-            .map(|i| s.working_sets[*i].clone())
+        self.call().snapshot.working_set(&id)
     }
 
     fn get_attr(&mut self, of: wit::Subject, name: String) -> Option<wit::Value> {
-        self.call()
-            .snapshot
-            .attrs
-            .get(&subject(of))?
-            .get(&name)
-            .map(value)
+        self.call().snapshot.attr(&subject(of), &name).map(value)
     }
 }
 
 impl plex::core::hints::Host for Ctx {
     fn get(&mut self, of: wit::Subject, name: String) -> Option<wit::Value> {
-        self.call()
-            .snapshot
-            .hints
-            .get(&subject(of))?
-            .get(&name)
-            .map(value)
+        self.call().snapshot.hint(&subject(of), &name).map(value)
     }
 }
 
