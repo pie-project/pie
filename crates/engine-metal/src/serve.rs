@@ -2018,11 +2018,34 @@ impl Shell {
             return Ok(());
         }
         self.drain()?;
+        // Where each moved chunk lies now: a move the guests' state cannot
+        // follow (a piece it would leave across a segment's end) is moved
+        // back before it is refused, so a refused evacuation moved nothing,
+        // as the runtime takes it (it undoes its own side of the move).
+        let back = engine::chunk::Evacuation {
+            moves: evacuation
+                .moves
+                .iter()
+                .map(|&(logical, _)| Ok((logical, self.pools.chunk_physical(logical)?)))
+                .collect::<Result<Vec<_>>>()?,
+        };
         let mut frame = self.device.frame()?;
         self.pools.evacuate(&mut frame, evacuation)?;
         frame.commit()?;
-        // Guest tables, rings and landed adapters in moved chunks: the refs
-        // stand, their addresses do not.
+        if let Err(refused) = self.follow_evacuation() {
+            let mut frame = self.device.frame()?;
+            self.pools.evacuate(&mut frame, &back)?;
+            frame.commit()?;
+            self.follow_evacuation()?;
+            return Err(refused);
+        }
+        Ok(())
+    }
+
+    /// Guest tables, rings, landed adapters and the guests' state in moved
+    /// chunks laid again where the chunks lie now: the refs stand, their
+    /// addresses do not.
+    fn follow_evacuation(&mut self) -> Result<()> {
         let landings: Vec<Landing> = self.landings.values().cloned().collect();
         for landing in &landings {
             self.point_landing(landing)?;

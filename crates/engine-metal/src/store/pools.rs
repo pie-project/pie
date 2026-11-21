@@ -2312,6 +2312,11 @@ impl Pools {
     /// done whatever follows: a weight cache that fails to restage is a
     /// fault of its own ([`Self::weights_ready`]), never a refusal, which
     /// would have the runtime roll back a move this engine made.
+    /// The physical chunk logical chunk `logical` lies on now.
+    pub fn chunk_physical(&self, logical: u32) -> Result<u32> {
+        self.pool.physical(logical)
+    }
+
     pub fn evacuate(&mut self, frame: &mut Frame, evacuation: &Evacuation) -> Result<()> {
         self.pool.evacuate(frame, evacuation)?;
         if let Err(fault) = self.restage_weights() {
