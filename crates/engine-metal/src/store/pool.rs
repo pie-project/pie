@@ -908,6 +908,22 @@ impl Pool {
                 have: u64::from(max),
             });
         }
+        // The bottom ends where the activation span starts (`top_first`, a
+        // segment's start): a prefix past it is not the bottom's to back.
+        // Answered Ok and capped, the runtime took the chunks between for
+        // state and its rows landed on memory nothing backed.
+        let seg = self.segment_chunks.max(1);
+        let bottom = self.top_first() / seg;
+        if segments > bottom {
+            return Err(Fault::Residency(format!(
+                "commit_segments({segments}) asks the bottom's first {} chunks, and the \
+                 bottom ends at chunk {} where this load's activation span starts \
+                 ({bottom} segment(s) of {seg} chunks): the chunks past it are the span's, \
+                 not state room",
+                u64::from(segments) * u64::from(seg),
+                self.top_first()
+            )));
+        }
         if segments <= self.committed {
             return Ok(());
         }
@@ -1203,8 +1219,10 @@ mod tests {
         assert!(pool.commit_span(2).is_err(), "the span has one segment");
         let mut seen = [7u8; 64];
         pool.write(10 * CHUNK + 4096, &[9u8; 64]).expect("a write");
-        // The bottom grows to the span and no further.
-        pool.commit_segments(3).expect("every segment");
+        // The bottom grows to the span and no further: a segment past it is
+        // refused by name.
+        assert!(pool.commit_segments(3).is_err(), "the third segment is the span's");
+        pool.commit_segments(2).expect("the bottom to the span");
         assert_eq!(pool.committed_chunks(), 8);
         assert_eq!(pool.held_bytes(), 12 * CHUNK);
         // SAFETY: nothing ran on this pool.
@@ -1246,7 +1264,7 @@ mod tests {
         pool.write(9 * small, &[5u8; 64]).expect("a write");
         pool.write(5 * small, &[5u8; 64])
             .expect_err("chunk 5's bottom half is unmapped");
-        pool.commit_segments(4).expect("every segment");
+        pool.commit_segments(2).expect("the bottom to the span");
         for chunk in 0..10 {
             pool.admit(chunk).expect("all of it is backed");
         }
@@ -1267,6 +1285,30 @@ mod tests {
     /// unmap gave that heap back before, under live state: the copy was
     /// refused ("mapped bytes of an elastic buffer's top") and a fire
     /// reading it read a tile with no memory behind it.
+    /// The bottom ends where the activation span starts: a commit asking
+    /// segments past it is refused by name, nothing backed, rather than
+    /// answered Ok and capped at the span's start (the runtime then took the
+    /// chunks between for state, and its rows landed on unbacked memory).
+    #[test]
+    fn a_commit_past_the_bottom_is_refused_by_name() {
+        let device = Context::bind().expect("a device");
+        // Chunks of 12 MiB, segments of 3, the top 2 the span: the span's
+        // segment starts at chunk 6, so the bottom holds 2 segments.
+        let mut pool = Pool::reserve(&device, 12 << 20, 10, 3, 2, u64::MAX).expect("a pool");
+        assert_eq!(pool.top_first(), 6);
+        let refused = format!(
+            "{}",
+            pool.commit_segments(3).expect_err("a third segment is the span's")
+        );
+        assert!(
+            refused.contains("commit_segments(3)") && refused.contains("ends at chunk 6"),
+            "the refusal names the ask and where the bottom ends: {refused}"
+        );
+        assert_eq!(pool.committed_segments(), 0, "nothing was backed");
+        pool.commit_segments(2).expect("the bottom to the span");
+        assert_eq!(pool.committed_chunks(), 6);
+    }
+
     #[test]
     fn a_committed_chunk_past_the_seam_outlives_the_tops_unmap() {
         let device = Context::bind().expect("a device");

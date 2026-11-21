@@ -2653,7 +2653,8 @@ impl Pools {
         // Backed through the chunks the load seats the weights in (the
         // runtime backs what else it seats beside them, `commit_segments`).
         let segment = self.layout.segment_chunks.max(1);
-        let segments = (last + 1).div_ceil(segment).min(self.pool.segments());
+        let bottom = self.pool.segments() - self.pool.span_segments();
+        let segments = (last + 1).div_ceil(segment).min(bottom);
         self.pool.commit_segments(segments)?;
         self.weight_residency(frame, plan)?;
         for cache in &mut self.weight_caches {
