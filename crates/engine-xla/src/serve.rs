@@ -2502,7 +2502,9 @@ impl Shell {
                 at: "serve::rs",
                 why: format!("lane {}: {error}", row.source),
             })?;
-            if rs_plan.commit == 0 && rs_plan.replay > 2 {
+            // A single-token lane's decode step reads every carried row (no
+            // replay to save), so its plan keeps them all.
+            if rs_plan.commit == 0 && rs_plan.replay > 2 && row.rows != 1 {
                 let mut rem = 2u32;
                 let mut trimmed = Vec::new();
                 for run in rs_plan.gathers.into_iter().rev() {

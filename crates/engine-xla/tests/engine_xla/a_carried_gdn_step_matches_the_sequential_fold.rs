@@ -50,7 +50,7 @@ fn a_carried_gdn_step_matches_the_sequential_fold() {
         .map(|x| -0.05 - 0.4 * x.abs())
         .collect();
     let count: Vec<i32> = vec![0, 2, 5, 3];
-    let commit: Vec<i32> = vec![0, 3, 2, 4];
+    let commit: Vec<i32> = vec![0, 3, 2, 0];
     let q = rng.vec(L * HK * K, 1.0);
     let k = rng.vec(L * HK * K, 1.0);
     let v = rng.vec(L * H * V, 1.0);

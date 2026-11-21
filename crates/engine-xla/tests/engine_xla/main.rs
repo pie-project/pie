@@ -14,6 +14,7 @@ mod a_context_input_merged_into_the_stream_lands_its_rows;
 mod a_conv_decoder_fires_over_a_voxel_input;
 mod a_device_geometry_beam_answers_the_host_path;
 mod a_device_fold_replays_what_a_host_fold_replays;
+mod a_lagged_decode_answers_the_folded_lane;
 mod a_double_block_fires_two_streams_through_the_engine;
 mod a_dry_load_traces_the_real_load_programs;
 mod a_maintenance_write_is_timed;

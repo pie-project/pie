@@ -25,7 +25,7 @@ fn a_carried_conv_step_matches_the_sequential_window() {
     let weight: Vec<f32> = (0..C * K).map(|i| val(i + 11000)).collect();
     let bias: Vec<f32> = (0..C).map(|i| val(i + 12000) * 0.1).collect();
     let count: Vec<i32> = vec![0, 2, 5, 4];
-    let commit: Vec<i32> = vec![0, 1, 5, 5];
+    let commit: Vec<i32> = vec![0, 1, 5, 0];
     // reference
     let mut want_y = vec![0f64; L * C];
     let mut want_w = vec![0f64; L * SPAN * C];
