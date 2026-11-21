@@ -1429,23 +1429,24 @@ impl Roles {
         let own = self.unpark_pieces(holder);
         let mut runs: BTreeMap<u32, u64> = BTreeMap::new();
         let mut whole = 0u32;
-        let mut rest = 0u32;
         for piece in &own {
             match *piece {
                 OwnPiece::Chunks { run, pieces } => {
                     *runs.entry(run).or_default() += u64::from(pieces);
                     whole = whole.saturating_add(run.saturating_mul(pieces));
                 }
-                OwnPiece::Slots { .. } | OwnPiece::Take { .. } => rest += 1,
+                OwnPiece::Slots { .. } | OwnPiece::Take { .. } => {}
             }
         }
-        let singles = self
-            .device
-            .lock()
-            .unwrap()
-            .pool()
+        // Where its placement does not stand now, its placement alone: a
+        // part each a whole chunk was no placement (`SlotPool::opens_alone`).
+        let device = self.device.lock().unwrap();
+        let pool = device.pool();
+        let singles = pool
             .opens_beside(&own)
-            .map_or(rest, |opened| opened.saturating_sub(whole));
+            .unwrap_or_else(|| pool.opens_alone(&own))
+            .saturating_sub(whole);
+        drop(device);
         if singles > 0 {
             *runs.entry(1).or_default() += u64::from(singles);
         }

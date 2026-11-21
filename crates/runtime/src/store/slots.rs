@@ -2201,6 +2201,44 @@ impl SlotPool {
 
     /// The chunks `own` opens placed in order as the takes would place it,
     /// and the headroom it leaves; `None` where it does not fit.
+    /// The chunks `own` opens placed alone, on a pool holding nothing
+    /// else, by the store's own placement: whole runs as they are, single
+    /// slots of a shape packed into its chunks, runs of slots of one length
+    /// and shape sharing chunks of their class (a chunk holds `spc / len`
+    /// of them). What a never-fits check reads: [`Self::opens_beside`] is
+    /// the room now, and a part placed alone in a chunk of its own each was
+    /// no placement (the L40S at 3 GiB on ba229ff25: a beam's 72 runs of
+    /// slots read as 72 whole chunks, 648 pages past a 189-page pool, and
+    /// beams the budget served were refused).
+    #[must_use]
+    pub fn opens_alone(&self, own: &[OwnPiece]) -> u32 {
+        use std::collections::BTreeMap;
+        let mut chunks = 0u64;
+        let mut takes: BTreeMap<ShapeId, u64> = BTreeMap::new();
+        let mut classes: BTreeMap<(ShapeId, u32), u64> = BTreeMap::new();
+        for piece in own {
+            match *piece {
+                OwnPiece::Chunks { run, pieces } => {
+                    chunks += u64::from(run.max(1)) * u64::from(pieces);
+                }
+                OwnPiece::Take { shape, slots } => *takes.entry(shape).or_default() += slots,
+                OwnPiece::Slots { shape, slots } if slots > 0 => {
+                    *classes.entry((shape, slots)).or_default() += 1;
+                }
+                OwnPiece::Slots { .. } => {}
+            }
+        }
+        let spc = |shape: ShapeId| self.shapes.get(shape as usize).map_or(1, |state| u64::from(state.spc().max(1)));
+        for (shape, slots) in takes {
+            chunks += slots.div_ceil(spc(shape));
+        }
+        for ((shape, len), runs) in classes {
+            let per = (spc(shape) / u64::from(len)).max(1);
+            chunks += runs.div_ceil(per);
+        }
+        u32::try_from(chunks).unwrap_or(u32::MAX)
+    }
+
     fn free_beside(&self, own: &[OwnPiece]) -> Option<(std::collections::BTreeSet<u32>, u32)> {
         use std::collections::{BTreeSet, HashMap};
         // Physical chunks the view has opened, and the slots it has placed
@@ -3634,6 +3672,25 @@ mod tests {
         pool.check();
     }
 
+    /// The L40S at 3 GiB on ba229ff25: a beam-4 process's 72 runs of slots
+    /// were priced a whole chunk each where its placement did not stand now
+    /// (648 pages past a 189-page pool), and beams the budget had served
+    /// were refused as never fitting. Placed alone, runs of one length
+    /// share chunks of their class: what held them once holds them again.
+    #[test]
+    fn small_slot_runs_placed_alone_share_chunks_of_their_class() {
+        let fixed = [(ShapeKind::Fixed, 4)];
+        let mut pool = SlotPool::new(facts_with(16, 4, 4, &fixed, &[(16, 2)]));
+        let spc = pool.shape(0).unwrap().slots_per_chunk;
+        let own = vec![OwnPiece::Slots { shape: 0, slots: 1 }; 72];
+        let alone = pool.opens_alone(&own);
+        assert_eq!(alone, 72u32.div_ceil(spc), "packed {spc} a chunk");
+        let all = pool.free_chunks();
+        let _held = pool.acquire_chunk_runs(Holder::WorkingSet(9), 0, 1, all).unwrap();
+        assert_eq!(pool.opens_beside(&own), None, "no room now");
+        assert_eq!(pool.opens_alone(&own), alone, "placed alone, the same");
+    }
+
     /// Whoever plans them, moves that would split a run are refused by
     /// name: one of its chunks without the rest, or the rest not following
     /// its first. A run moved whole is applied.
@@ -3697,6 +3754,13 @@ mod tests {
         let rest: Vec<Slot> = taken.iter().copied().filter(|slot| slot.chunk == high).collect();
         pool.release(holder, &rest, 0);
         assert!(!pool.open_chunks().contains(&to), "the copy's destination stays closed");
+        let from = moves[0].from;
+        assert!(!pool.open_chunks().contains(&from), "the copy's source stays closed");
+        assert!(pool.plan_moves_of(&[high]).is_empty(), "a chunk mid-copy is moved by no one");
+        assert_eq!(pool.plan_compaction(2), None, "nor compacted over");
+        let other = pool.acquire_chunk_runs(Holder::WorkingSet(2), 0, 1, 1).unwrap();
+        let got = pool.chunk_table()[other[0].chunk as usize];
+        assert!(got != to && got != from, "neither end is handed out: {got}");
         pool.retire_through(5);
         assert!(pool.open_chunks().contains(&to), "the copy landed: open again");
         pool.check();
