@@ -2578,6 +2578,7 @@ impl PoolPort for BindRoomPool {
         pid: ProcessId,
         need: &super::pool::RunNeed,
         state: RsUnits,
+        _kv_pages: u32,
         bind: Option<(u32, u32)>,
     ) -> bool {
         !self.store_refuses.load(Ordering::Relaxed)
@@ -9173,5 +9174,51 @@ async fn a_need_the_map_stands_twice_over_is_widened_until_moves_are_named() {
     assert!(
         planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
         "widened past what the map stands, the occupant is moved"
+    );
+}
+
+/// Mac Pro at 2 GiB on f623134fc: a restore head whose placement stands,
+/// held back until more chunks stand free than its last refusal left, with
+/// nothing in flight to free one: its end said "sent again once more chunks
+/// stand free" and the run stalled. With nothing in flight it is sent again
+/// now.
+#[tokio::test(flavor = "current_thread")]
+async fn a_standing_restore_with_nothing_in_flight_is_sent_again_now() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(6, 0..0, 64));
+    pool.free.lock().extend([0, 1, 2, 3]);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let head = ProcessId::new_v4();
+    planner.register(head);
+    planner.note_admitted(head);
+    let free = pool.free_chunks();
+    planner.with_inner(|inner| {
+        let proc = inner.procs.get_mut(&head).unwrap();
+        proc.state = Residency::Evicted;
+        proc.roles_short = Some(PendingBind {
+            run: 2,
+            pieces: 1,
+            pages: 2,
+        });
+        proc.roles_short_stood = Some(true);
+        proc.roles_short_free = Some(free);
+        inner.enqueue(
+            head,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        );
+    });
+    planner.poke();
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.with_inner(|inner| inner.procs[&head].roles_short_stood.is_none()) {
+            break;
+        }
+    }
+    let end = planner.with_inner(|inner| inner.last_plan.as_ref().map(|end| end.ended));
+    assert!(
+        planner.with_inner(|inner| inner.procs[&head].roles_short_stood.is_none()),
+        "nothing in flight: its wait for more room is lifted and it goes again ({end:?})"
     );
 }

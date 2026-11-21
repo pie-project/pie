@@ -532,14 +532,17 @@ pub trait PoolPort: Send + Sync + 'static {
     /// ([`crate::store::roles::Roles::unpark_stands`]): the one check a
     /// restore is sent on. Where the pool keeps no roles, `need` against
     /// the placement of [`Self::guest_need_free`].
+    /// `kv_pages`: the kv pages its restore gathers first, which take
+    /// chunks of the same pool before its unpark and bind lay their runs.
     fn restore_stands(
         &self,
         pid: ProcessId,
         need: &RunNeed,
         state: RsUnits,
+        kv_pages: u32,
         bind: Option<(u32, u32)>,
     ) -> bool {
-        let _ = (pid, bind);
+        let _ = (pid, bind, kv_pages);
         self.guest_need_free(need, state)
     }
     /// A residency move's copy reads `chunks` (physical) until
@@ -884,6 +887,7 @@ impl PoolPort for RegistryPool {
         pid: ProcessId,
         need: &RunNeed,
         state: RsUnits,
+        kv_pages: u32,
         bind: Option<(u32, u32)>,
     ) -> bool {
         let Some(stores) = crate::store::registry::try_get(self.model, self.engine) else {
@@ -894,7 +898,16 @@ impl PoolPort for RegistryPool {
         };
         // The state's takes, read under the pool's lock and let go: the
         // roles take the pool's lock themselves.
-        let takes = shared.lock().unwrap().state_takes(state);
+        // Its kv pages first, as the restore gathers them before its
+        // serve's state and its unpark (Mac Pro at 2 GiB on f623134fc: the
+        // placement stood a pending bind's run of 7 the restore, its pages
+        // gathered, then found none of).
+        let takes = {
+            let shared = shared.lock().unwrap();
+            let mut takes: Vec<_> = shared.kv_takes(kv_pages).into_iter().collect();
+            takes.extend(shared.state_takes(state));
+            takes
+        };
         roles.lock().unwrap().unpark_stands(pid, &takes, bind)
     }
 

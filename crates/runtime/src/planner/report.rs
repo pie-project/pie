@@ -399,13 +399,13 @@ impl ResidencyPlanner {
                 .map(|need| (need.run, need.pieces));
             inner.queue.iter().find_map(|(key, waiter)| {
                 (waiter.pid == pid && matches!(waiter.kind, WaitKind::Restore { .. }))
-                    .then(|| (*key, waiter.rs_need(), bind))
+                    .then(|| (*key, waiter.rs_need(), bind, inner.restore_kv_missing(*key)))
             })
         });
-        if let Some((key, state, bind)) = queued {
+        if let Some((key, state, bind, kv)) = queued {
             let stood = self
                 .head_room(key)
-                .is_some_and(|need| self.port.restore_stands(pid, &need, state, bind));
+                .is_some_and(|need| self.port.restore_stands(pid, &need, state, kv, bind));
             self.with_inner(|inner| {
                 if let Some(proc) = inner.procs.get_mut(&pid) {
                     proc.roles_short_stood = Some(stood);

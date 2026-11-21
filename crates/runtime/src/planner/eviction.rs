@@ -443,8 +443,34 @@ impl ResidencyPlanner {
                 } else {
                     "the map stands the head and its own check refuses it (why=)"
                 };
-                self.plan_ended(victims.head, end, host_short, &unhostable);
+                // A wait for more room holds only while something in flight
+                // gives room back: with nothing in flight it is sent again
+                // now, on the placement that stands (Mac Pro at 2 GiB on
+                // f623134fc: quiet, its end "sent again once more chunks
+                // stand free", nothing to free one, stalled).
+                let quiet = stands && self.with_inner(|inner| inner.nothing_in_flight());
+                if quiet {
+                    self.with_inner(|inner| {
+                        if let Some(proc) = inner.procs.get_mut(&victims.head_pid) {
+                            proc.roles_short_stood = None;
+                            proc.roles_short_free = None;
+                        }
+                    });
+                }
+                self.plan_ended(
+                    victims.head,
+                    if quiet {
+                        "the head's placement stands, nothing in flight: sent again now"
+                    } else {
+                        end
+                    },
+                    host_short,
+                    &unhostable,
+                );
                 self.note_short(victims.head, 0, 0);
+                if quiet {
+                    self.poke();
+                }
                 return;
             }
             self.plan_ended(
@@ -516,16 +542,16 @@ impl ResidencyPlanner {
     /// restore stands `need` now: its serve's state, every piece of its
     /// unpark, its pending bind's runs ([`PoolPort::restore_stands`]).
     pub(super) fn store_stands(&self, head: EntryKey, pid: ProcessId, need: &RunNeed) -> bool {
-        let (state, bind) = self.with_inner(|inner| {
+        let (state, bind, kv) = self.with_inner(|inner| {
             let state = inner.queue.get(&head).map(super::wait::Waiter::rs_need);
             let bind = inner
                 .procs
                 .get(&pid)
                 .and_then(|proc| proc.bind_room)
                 .map(|need| (need.run, need.pieces));
-            (state.unwrap_or_default(), bind)
+            (state.unwrap_or_default(), bind, inner.restore_kv_missing(head))
         });
-        self.port.restore_stands(pid, need, state, bind)
+        self.port.restore_stands(pid, need, state, kv, bind)
     }
 
     /// Records where a plan pass stopped for the queue's head short of

@@ -1247,6 +1247,14 @@ impl SharedPool {
         })
     }
 
+    /// The kv list slots `pages` kv pages take, as a restore gathers them:
+    /// `None` without a kv list or with no pages.
+    #[must_use]
+    pub fn kv_takes(&self, pages: u32) -> Option<(ShapeId, u64)> {
+        let list = self.list?;
+        (pages > 0).then_some((list.pool, u64::from(pages)))
+    }
+
     /// The single slots of each state shape `rs` takes: the rs list's
     /// (`pages`), each window list's (`windows`) and whole records'
     /// (`slots`, each fixed shape's pieces), as a restore's serve takes

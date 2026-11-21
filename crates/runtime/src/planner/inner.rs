@@ -718,6 +718,20 @@ impl Inner {
     /// Counting waiter kinds instead missed one each time (stalled, then
     /// waiting at binds, then one resident between steps), and the fleet
     /// stood still with nothing coming.
+    /// The kv pages restore `key` still gathers: its kv need less what the
+    /// head has gathered (`accum`, the head's alone).
+    pub(super) fn restore_kv_missing(&self, key: EntryKey) -> u32 {
+        let Some(waiter) = self.queue.get(&key) else {
+            return 0;
+        };
+        let gathered = if self.unmet_head().is_some_and(|(head, _)| head == key) {
+            u32::try_from(self.accum.len()).unwrap_or(u32::MAX)
+        } else {
+            0
+        };
+        waiter.kv_need().saturating_sub(gathered)
+    }
+
     pub(super) fn nothing_in_flight(&self) -> bool {
         self.evicting.is_empty()
             && !self.kill_in_flight()

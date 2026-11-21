@@ -769,12 +769,15 @@ impl ResidencyPlanner {
                     // parts and its runs of two, did not: sent, refused
                     // (PendingBindShort), sent again (Mac Pro at 2 GiB on
                     // 7e75af541: 52k no-step lines, free runs (7, 3)).
-                    let state = self.with_inner(|inner| {
-                        inner.queue.get(&key).map(super::wait::Waiter::rs_need).unwrap_or_default()
+                    let (state, kv) = self.with_inner(|inner| {
+                        (
+                            inner.queue.get(&key).map(super::wait::Waiter::rs_need).unwrap_or_default(),
+                            inner.restore_kv_missing(key),
+                        )
                     });
                     let bind = RunNeed::one(need.run, need.pieces);
                     if pid.is_some_and(|pid| {
-                        self.port.restore_stands(pid, &bind, state, Some((need.run, need.pieces)))
+                        self.port.restore_stands(pid, &bind, state, kv, Some((need.run, need.pieces)))
                     }) {
                         self.plan_stopped("bind-suspended restore sent: its placement stands");
                         room_stood = Some(key);
@@ -855,10 +858,10 @@ impl ResidencyPlanner {
                     // unpark did not): then only once more chunks stand
                     // free than the refusal left
                     // ([`super::proc::Proc::roles_short_stood`]).
-                    let (head_pid, state, stood_at, free_left, bind) = self.with_inner(|inner| {
+                    let (head_pid, state, stood_at, free_left, bind, kv) = self.with_inner(|inner| {
                         inner
                             .unmet_head()
-                            .map(|(_, waiter)| {
+                            .map(|(key, waiter)| {
                                 let proc = inner.procs.get(&waiter.pid);
                                 (
                                     Some(waiter.pid),
@@ -867,6 +870,7 @@ impl ResidencyPlanner {
                                     proc.and_then(|proc| proc.roles_short_free),
                                     proc.and_then(|proc| proc.bind_room)
                                         .map(|need| (need.run, need.pieces)),
+                                    inner.restore_kv_missing(key),
                                 )
                             })
                             .unwrap_or_default()
@@ -876,7 +880,7 @@ impl ResidencyPlanner {
                     });
                     if !understated
                         && moved
-                        && head_pid.is_some_and(|pid| self.port.restore_stands(pid, &room, state, bind))
+                        && head_pid.is_some_and(|pid| self.port.restore_stands(pid, &room, state, kv, bind))
                     {
                         self.plan_stopped("restore sent again: its placement stands");
                         self.with_inner(|inner| {
