@@ -25,7 +25,7 @@
 //! workgroups_per_core = 3.3 # workgroups a core holds for a kernel's full rate
 //! # each dense kernel's TFLOP/s by rows at each of a model's dense shapes:
 //! # [kind, key, n, k, stopped at rows, why, [[rows, TFLOP/s], ...]]
-//! kernel_tflops_by_shape = [[1, 4, 1024, 1024, 0, 0, [[1, 0.3], [256, 2.0]]]]
+//! kernel_tflops_by_shape_spanned = [[1, 4, 1024, 1024, 0, 0, [[1, 0.3], [256, 2.0]]]]
 //! ```
 //!
 //! Every key is a measurement of the device as serving runs it, but one:
@@ -221,6 +221,19 @@ pub const KEYS: [&str; 9] = [
     "workgroups_per_core",
 ];
 
+/// The `[rates]` key of the dense kernels' curves at a model's planes
+/// (`Rates::kernel_tflops_by_shape`), tagged with how they are measured:
+/// each point's frame timed by its two timestamps (`spanned`). Curves an
+/// older pie wrote under `kernel_tflops_by_shape` were timed with a
+/// timestamp pair around every dispatch, which on a tiler ran its few-row
+/// points ~10x long: that key is no longer read, so a user file stating it
+/// is measured again.
+pub const KERNEL_CURVES: &str = "kernel_tflops_by_shape_spanned";
+
+/// The key an older pie wrote its dense kernels' curves under, timed per
+/// dispatch ([`KERNEL_CURVES`]).
+pub const KERNEL_CURVES_PER_DISPATCH: &str = "kernel_tflops_by_shape";
+
 /// The `[rates]` key of [`Rates::submit_worst_ratio`]: what a load on a
 /// platform that states a bound on one submission measures beside the
 /// estimate's [`KEYS`].
@@ -326,7 +339,7 @@ impl Rates {
             kernel_tflops_by_shape: self
                 .kernel_tflops_by_shape
                 .clone()
-                .filter(|_| has("kernel_tflops_by_shape")),
+                .filter(|_| has(KERNEL_CURVES)),
         }
     }
 
@@ -349,7 +362,7 @@ impl Rates {
             RESIDENT_WORKGROUPS => self.resident_workgroups.is_none(),
             ATTN_BY_ROWS_KEYS => self.attn_tflops_by_rows_keys.is_none(),
             "product_ns" => self.product_ns.is_none(),
-            "kernel_tflops_by_shape" => self.kernel_tflops_by_shape.is_none(),
+            KERNEL_CURVES => self.kernel_tflops_by_shape.is_none(),
             _ => true,
         };
         keys.iter().copied().filter(|key| unstated(key)).collect()
@@ -448,7 +461,7 @@ impl Rates {
                     )
                 })
                 .collect();
-            let _ = writeln!(out, "kernel_tflops_by_shape = [\n{}]", rows.concat());
+            let _ = writeln!(out, "{KERNEL_CURVES} = [\n{}]", rows.concat());
         }
         out
     }
@@ -629,7 +642,7 @@ mod tests {
              150.0]]],\n  [4096, [[256, 90.5], [8192, 210.0]]],\n]\n\
              attn_tflops_by_keys = [[512, 60.0], [8192, 400.0]]\nhbm_gbps = 654.4\n\
              cached_gbps = 28800.0\nelementwise_gbps = 450.0\nscan_gelems = 2684.3\nfew_row_tflops = 4.2\n\
-             workgroups_per_core = 3.3\nkernel_tflops_by_shape = [\n  [1, 4, 1024, 2048, 512, 1, [[1, 0.5]]],\n]\n"
+             workgroups_per_core = 3.3\nkernel_tflops_by_shape_spanned = [\n  [1, 4, 1024, 2048, 512, 1, [[1, 0.5]]],\n]\n"
         );
     }
 
@@ -663,6 +676,27 @@ mod tests {
         let (kept, dropped) = registry.prune(text);
         assert!(!kept.contains("vector_tflops_by_rows"), "{kept}");
         assert_eq!(dropped.len(), 2, "{dropped:?}");
+    }
+
+    /// Curves an older pie timed per dispatch (`kernel_tflops_by_shape`)
+    /// are left unread in a user file, as any key this pie no longer reads:
+    /// the rates read hold no curves, so the next load measures them again
+    /// by frame spans and saves them under [`KERNEL_CURVES`], the old key
+    /// pruned.
+    #[test]
+    fn curves_timed_per_dispatch_are_measured_again() {
+        let text = "api = 1\n[rates]\nlaunch_ns = 904\n\
+                    kernel_tflops_by_shape = [[1, 4, 1024, 2048, 0, 0, [[1, 0.006], [256, 0.37]]]]\n";
+        let registry = crate::Registry::new("test", &[], &[]);
+        let file = registry
+            .parse(text, "user", crate::registry::Strict::User)
+            .unwrap();
+        assert_eq!(file.ignored_rates, [KERNEL_CURVES_PER_DISPATCH]);
+        let read = registry.load_user(text, "user").unwrap().rates();
+        assert_eq!(read.kernel_tflops_by_shape, None);
+        assert!(read.missing(&[KERNEL_CURVES]).contains(&KERNEL_CURVES));
+        let (kept, _) = registry.prune(text);
+        assert!(!kept.contains(KERNEL_CURVES_PER_DISPATCH), "{kept}");
     }
 
     /// The margin a load measures under a stated submit bound is saved with

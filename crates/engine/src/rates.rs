@@ -320,7 +320,7 @@ pub fn unmeasured(rates: &profile::fire::Rates) -> Option<(&'static str, String)
     }
     if let Some(curves) = &rates.kernel_tflops_by_shape {
         for c in curves {
-            if let Some((key, at)) = point("kernel_tflops_by_shape", "rows", &c.curve) {
+            if let Some((key, at)) = point(profile::fire::KERNEL_CURVES, "rows", &c.curve) {
                 return Some((
                     key,
                     format!("{at} (kernel {}/{} at {}x{})", c.kind, c.key, c.n, c.k),

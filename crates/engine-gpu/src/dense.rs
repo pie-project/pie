@@ -273,7 +273,7 @@ pub fn tiled_kernels(target: Target, base: Tactic) -> Vec<Tactic> {
 
 /// What a load is refused by where its profile states no kernel's curve at
 /// all: the key it lacks.
-pub const UNREACHED: &str = "kernel_tflops_by_shape";
+pub const UNREACHED: &str = profile::fire::KERNEL_CURVES;
 
 /// The `(n, k)` of every weight a dense matmul of `trace` multiplies by
 /// (`Linear::Matmul`, the output head's among them): the planes the dense
@@ -883,7 +883,7 @@ mod tests {
             true,
             None,
         );
-        assert_eq!(refused.unwrap_err(), "kernel_tflops_by_shape");
+        assert_eq!(refused.unwrap_err(), profile::fire::KERNEL_CURVES);
         let mut elsewhere = rates(Some(5.0), coopmat_tiles());
         for c in elsewhere.kernel_tflops_by_shape.iter_mut().flatten() {
             c.n = 1024;

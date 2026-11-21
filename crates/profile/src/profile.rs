@@ -707,6 +707,18 @@ impl Registry {
                     file.ignored_rates.join(", ")
                 );
             }
+            if file
+                .ignored_rates
+                .iter()
+                .any(|key| key == crate::fire::KERNEL_CURVES_PER_DISPATCH)
+            {
+                eprintln!(
+                    "{origin}: the dense kernels' curves it states were timed per dispatch (~10x \
+                     long at few rows on a tiler): measured again this load, by frame spans \
+                     (`[rates] {}`)",
+                    crate::fire::KERNEL_CURVES
+                );
+            }
             let spelled = match facts {
                 Some(facts) => match self.admits(&file, facts) {
                     Ok(spelled) => spelled,

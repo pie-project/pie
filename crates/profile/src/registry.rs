@@ -1146,7 +1146,7 @@ impl<'a> Walk<'a> {
                     rates.product_ns = self.product_times(v);
                     continue;
                 }
-                "kernel_tflops_by_shape" => {
+                crate::fire::KERNEL_CURVES => {
                     rates.kernel_tflops_by_shape = self.kernel_curves(v);
                     continue;
                 }
@@ -1190,7 +1190,7 @@ impl<'a> Walk<'a> {
                              `attn_tflops_by_keys`, `hbm_gbps`, `cached_gbps`, `elementwise_gbps`, \
                              `scan_gelems`, `few_row_tflops`, `workgroups_per_core`, \
                              `product_ns`, `submit_worst_ratio`, `attn_tflops_by_rows_keys`, \
-                             `resident_workgroups` and `kernel_tflops_by_shape`, not `{other}`"
+                             `resident_workgroups` and `kernel_tflops_by_shape_spanned`, not `{other}`"
                         ),
                     );
                     continue;
@@ -1292,7 +1292,7 @@ impl<'a> Walk<'a> {
         &mut self,
         value: &Spanned<DeValue<'_>>,
     ) -> Option<Vec<crate::fire::KernelCurve>> {
-        let what = "`rates.kernel_tflops_by_shape` is a list of [kind, key, n, k, stopped at \
+        let what = "`rates.kernel_tflops_by_shape_spanned` is a list of [kind, key, n, k, stopped at \
                     rows, why, [[rows, TFLOP/s], ...], optionally [[rows, spread], ...]], no \
                     kernel and shape twice";
         let DeValue::Array(entries) = value.get_ref() else {
@@ -1340,7 +1340,7 @@ impl<'a> Walk<'a> {
             let curve = if empty && stop.is_some() {
                 Vec::new()
             } else {
-                self.curve(points, "kernel_tflops_by_shape")?
+                self.curve(points, crate::fire::KERNEL_CURVES)?
             };
             // The points' spreads, `[rows, fraction at least zero]` each.
             let spread = match spread.map(|s| s.get_ref()) {
