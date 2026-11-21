@@ -940,6 +940,12 @@ impl Bodies {
         self.recorder.sealed_seen.retain(|key| key.bucket != bucket);
     }
 
+    /// Drops the one recorded body `key`: arming gives back the capture
+    /// that took the bodies past their allowance (`Shell::arm_target`).
+    pub fn forget_body(&mut self, key: &BodyKey) {
+        self.map.forget(key);
+    }
+
     #[must_use]
     pub fn body_refused(&self, key: &BodyKey) -> bool {
         self.map.refused(key)
@@ -1116,9 +1122,10 @@ impl Bodies {
                     "engine-cuda: body {key} declines to capture ({}), so this \
                      composition walks eagerly for good, each serving fire counted \
                      unrecorded. A prefill schedule that refused its graph form: \
-                     the prefill float grant is sized at the lattice's top rung in \
-                     `inputs::reserve` (`prefill_float_bytes`); a bucket that \
-                     outgrows it is this line.",
+                     the prefill float grant holds the most any bucket of the \
+                     lattice asks over the window's lanes \
+                     (`inputs::prefill_float_bytes`), so this body carved a shape \
+                     outside the lattice the load sized it for.",
                     run.uncapturable_why().join("; ")
                 );
             }
@@ -1293,6 +1300,12 @@ impl BodyMap {
         self.cold_refused.retain(|key| key.bucket != bucket);
         self.bodies_refused.retain(|key| key.bucket != bucket);
         self.sealed = false;
+    }
+
+    fn forget(&mut self, key: &BodyKey) {
+        self.bodies.remove(key);
+        self.body_order.retain(|held| held != key);
+        self.body_warm.remove(key);
     }
 
     fn holds(&self, key: &BodyKey) -> bool {

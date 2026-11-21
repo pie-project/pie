@@ -23,6 +23,11 @@ use crate::inferlet::process::ProcessId;
 use crate::policy::retention::{self, Keys};
 use crate::policy::{By, Event};
 use crate::rt::Instant;
+
+#[cfg(test)]
+type CacheMap = std::collections::BTreeMap<u64, KeptEntry>;
+#[cfg(not(test))]
+type CacheMap = HashMap<u64, KeptEntry>;
 use crate::store::chunks::{ShapePool, ShapeRun};
 use crate::store::pool::Pool;
 use crate::store::slots::ShapeKind;
@@ -161,7 +166,9 @@ pub struct KvStore {
     /// `None` while some are off the device.
     flat: HashMap<WorkingSetId, Option<Vec<PhysicalKvPageId>>>,
     domain: Hash256,
-    cache: HashMap<u64, KeptEntry>,
+    /// By entry id. Under test in id order (the order entries were kept),
+    /// so a seeded simulation reclaims the same entries on each run.
+    cache: CacheMap,
     /// The cache's entries by the node their last pages are in: an attach
     /// ages the entries on its own path, not every entry.
     by_owner: HashMap<NodeId, Vec<u64>>,
@@ -419,7 +426,7 @@ impl KvStore {
             shape: None,
             flat: HashMap::new(),
             domain: hash::cache_domain(&seed),
-            cache: HashMap::new(),
+            cache: CacheMap::new(),
             by_owner: HashMap::new(),
             node_epochs: HashMap::new(),
             splits: HashSet::new(),
@@ -457,6 +464,15 @@ impl KvStore {
             self.host_pool = host;
         }
         self.disk_pool = Pool::new(disk_slots);
+    }
+
+    /// Calls `signal` each time host or disk slots come free: room a
+    /// waiter blocked on swap room (a victim's move with no slot below)
+    /// waits on.
+    pub fn set_room_signal(&mut self, signal: super::slots::RoomSignal) {
+        self.host_pool
+            .set_room_signal(signal.clone(), super::slots::RoomTier::Swap);
+        self.disk_pool.set_room_signal(signal);
     }
 
     pub fn set_domain(&mut self, domain: Hash256) {
@@ -996,9 +1012,14 @@ impl KvStore {
             group.0.push(id);
             group.1 = group.1.max(entry.last_use);
         }
+        // Ties (one key, one last use) go oldest entry first, never by the
+        // map's order.
         let mut order: Vec<_> = groups
             .into_iter()
-            .map(|((_, key, decoded), (ids, last_use))| ((key, !decoded, last_use), (key, ids)))
+            .map(|((_, key, decoded), (mut ids, last_use))| {
+                ids.sort_unstable();
+                ((key, !decoded, last_use, ids.first().copied()), (key, ids))
+            })
             .collect();
         order.sort_unstable_by_key(|(order, _)| *order);
         order.into_iter().map(|(_, group)| group).collect()
@@ -1215,6 +1236,98 @@ impl KvStore {
                 .collect(),
             shape,
             records,
+        })
+    }
+
+    /// `n` whole disk chunks of the slot file for something other than kv
+    /// (a parked role's slots, laid out in a chunk of their own shape as on
+    /// the device, CONTRACT-BC 22, [`crate::store::roles::DiskSlots`]), a
+    /// disk chunk `per_chunk` kv slots, as chunk ids, all or none: counted
+    /// out of the disk's room as kv's are.
+    pub fn take_disk_chunks(&mut self, n: usize, per_chunk: u32) -> Option<Vec<u32>> {
+        let per_chunk = per_chunk.max(1);
+        let firsts = self.disk_pool.try_alloc_aligned_runs(n, per_chunk)?;
+        self.below_cached.set(None);
+        Some(firsts.into_iter().map(|slot| slot.0 / per_chunk).collect())
+    }
+
+    /// The disk tier's free slots, idle cache's not counted.
+    #[must_use]
+    pub fn disk_free_slots(&self) -> usize {
+        self.disk_pool.available()
+    }
+
+    /// Chunks [`Self::take_disk_chunks`] took, free again.
+    pub fn give_disk_chunks(&mut self, chunks: &[u32], per_chunk: u32) {
+        let per_chunk = per_chunk.max(1);
+        let firsts: Vec<DiskKvSlotId> = chunks
+            .iter()
+            .map(|&chunk| DiskKvSlotId(chunk * per_chunk))
+            .collect();
+        self.disk_pool.release_runs(&firsts, per_chunk);
+        self.below_cached.set(None);
+    }
+
+    /// Parked sets' pages on the host going on down to disk, the sets of
+    /// `order` first (the victim order: what would be evicted first), until
+    /// `wanted` pages go or the disk is full: host room for a parked
+    /// process's role slots, older parked kv going below the newer role
+    /// state. A page the disk tier keeps a copy of
+    /// settles on it, nothing copied; a page another move holds stays.
+    /// `None` when nothing goes.
+    pub fn prepare_parked_spill(
+        &mut self,
+        wanted: usize,
+        order: &[WorkingSetId],
+    ) -> Option<KvSpillTxn> {
+        let shape = self.shape?;
+        let mut room = self.disk_pool.available();
+        let mut pages: Vec<(TriePageLocation, HostKvSlotId)> = Vec::new();
+        let mut taken: HashSet<TriePageLocation> = HashSet::new();
+        for &ws in order {
+            if pages.len() >= wanted || room == 0 {
+                break;
+            }
+            let Ok(swapped) = self.table.swapped_pages(&HashSet::from([ws])) else {
+                continue;
+            };
+            let mut group: Vec<(TriePageLocation, HostKvSlotId)> = swapped
+                .into_iter()
+                .filter_map(|(location, backing)| match backing {
+                    KvPageBacking::Swapped(host) => Some((location, host)),
+                    _ => None,
+                })
+                .filter(|&(location, _)| {
+                    !taken.contains(&location) && !self.table.page_location_pinned(location)
+                })
+                .collect();
+            let before = group.len();
+            self.settle_host_on_disk(&mut group);
+            let settled = before - group.len();
+            group.truncate(room.min(wanted.saturating_sub(pages.len() + settled)));
+            room -= group.len();
+            taken.extend(group.iter().map(|&(at, _)| at));
+            pages.extend(group);
+        }
+        self.below_cached.set(None);
+        if pages.is_empty() {
+            return None;
+        }
+        let disk = self
+            .disk_pool
+            .try_alloc_n(pages.len())
+            .expect("counted above");
+        self.table
+            .pin_swap_locations(pages.iter().map(|&(location, _)| location));
+        tracing::debug!(target: "pie::kv", pages = pages.len(), "parked kv host to disk");
+        Some(KvSpillTxn {
+            pages: pages
+                .into_iter()
+                .zip(disk)
+                .map(|((location, host), disk)| (location, host, disk))
+                .collect(),
+            shape,
+            records: HashMap::new(),
         })
     }
 
@@ -1777,6 +1890,11 @@ impl KvStore {
             self.stamp_path(terminal, epoch);
         }
         if self.keeps {
+            // What its decodes folded seals as it goes, unless a prompt
+            // sealed it already.
+            if let Err(error) = self.seal_folded(ws, false) {
+                tracing::debug!(%error, "kv: sealing what a released set's decodes folded");
+            }
             self.keep_sealed_prefix(ws);
         }
         // A hint is for what its owner leaves in the cache: one that left
@@ -1788,6 +1906,8 @@ impl KvStore {
         }
         let freed = self.table.release_working_set_backings(ws);
         self.recycle_backings(freed, epoch);
+        // What no fire in flight reads is free now, not at a next fire.
+        self.retire_idle();
         self.flat.remove(&ws);
         self.note_cached();
     }
@@ -1831,17 +1951,19 @@ impl KvStore {
         self.note_change(terminal, true);
     }
 
-    /// The device pages of `working_sets` that would leave the device
-    /// with them: resident, read by none of the running working sets
-    /// outside them, pinned by nothing ([`KvPageTable::movable_resident_pages`]).
-    pub fn movable_resident_pages(
+    /// The device pages of each of `groups` that would leave the device
+    /// with it: resident, read by none of the running working sets outside
+    /// it, pinned by nothing, walked once for all the groups
+    /// ([`KvPageTable::movable_resident_pages_each`]).
+    pub fn movable_resident_pages_each(
         &self,
-        working_sets: &HashSet<WorkingSetId>,
-    ) -> Vec<PhysicalKvPageId> {
+        groups: &[HashSet<WorkingSetId>],
+    ) -> Vec<Vec<PhysicalKvPageId>> {
         self.table
-            .movable_resident_pages(working_sets)
+            .movable_resident_pages_each(groups)
+            .into_iter()
             .map(|pages| pages.into_iter().map(|(_, page)| page).collect())
-            .unwrap_or_default()
+            .collect()
     }
 
     pub fn owner_of(&self, ws: WorkingSetId) -> Option<ProcessId> {
@@ -1923,9 +2045,22 @@ impl KvStore {
     }
 
     /// `decoded` when a decode wrote them, which the cache lets go before a
-    /// prompt.
+    /// prompt. What a decode folds is frozen and not sealed: a decode runs
+    /// ahead of the program that reads its tokens, which may take back the
+    /// rows past where it stops ([`Self::truncate`]). Its rows seal with the
+    /// next prompt the set folds, or as the set is released.
     pub fn fold(&mut self, ws: WorkingSetId, to: u64, decoded: bool) -> Result<u64, KvStoreError> {
-        let folded = self.table.freeze(ws, to)?;
+        self.table.freeze(ws, to)?;
+        if decoded {
+            return Ok(0);
+        }
+        self.seal_folded(ws, true)
+    }
+
+    /// Seals the whole pages `ws` has folded and logged; `prompt` when they
+    /// reach its prompt.
+    fn seal_folded(&mut self, ws: WorkingSetId, prompt: bool) -> Result<u64, KvStoreError> {
+        let folded = self.table.folded(ws)?;
         let page = u64::from(self.page_size);
         if page == 0 {
             return Ok(0);
@@ -1946,11 +2081,23 @@ impl KvStore {
         let tokens = logged[start as usize..(full * page) as usize].to_vec();
         let slots = hash::chain_slots(&self.domain, prev, start, &tokens);
         self.seal_rows(ws, start, &slots, self.page_size)?;
-        if !decoded {
+        if prompt {
             self.table.reach_prompt(ws, full)?;
         }
-        tracing::debug!(target: "pie::kv", pages = full - sealed, decoded, "sealed at a fold");
+        tracing::debug!(target: "pie::kv", pages = full - sealed, prompt, "sealed");
         Ok(full - sealed)
+    }
+
+    /// `ws` ends at row `rows` ([`KvPageTable::truncate`]): what a program
+    /// that ran ahead of its stop takes back once its fires have landed.
+    /// Every fire of the set has settled, so what this frees waits on no
+    /// fire in flight.
+    pub fn truncate(&mut self, ws: WorkingSetId, rows: u64) -> Result<(), KvStoreError> {
+        let freed = self.table.truncate(ws, rows, self.page_size)?;
+        let epoch = self.retired_through();
+        self.recycle_backings(freed, epoch);
+        self.refresh_flat(ws);
+        Ok(())
     }
 
     pub fn folded(&self, ws: WorkingSetId) -> Result<u64, KvStoreError> {
@@ -2467,6 +2614,49 @@ impl KvStore {
     pub fn settle(&mut self, seq: u64) {
         self.outstanding.remove(&seq);
         self.retire_idle();
+    }
+
+    /// A beam search's finish (`BEAM-PAGE-LISTS.md` §6.6): the set's pages
+    /// from `f0` become its chosen beam's, page `f0 + j` the pool page
+    /// `order[j]` (pool page `q` is the set's page `f0 + q` now), for each
+    /// column `j` the search wrote; every other page past `f0` is let go
+    /// once the fires that may read it retire. The pages move, nothing is
+    /// copied.
+    pub fn relist_beam(
+        &mut self,
+        ws: WorkingSetId,
+        f0: u64,
+        order: &[u32],
+    ) -> Result<(), KvStoreError> {
+        let flat = self.table.flatten(ws)?;
+        let mut chosen = Vec::with_capacity(order.len());
+        for &q in order {
+            let index = f0 + u64::from(q);
+            let page = *flat.get(index as usize).ok_or(KvStoreError::BadWriteSet {
+                reason: "a chosen beam names a pool page past its set's backed pages",
+            })?;
+            if chosen.contains(&page) {
+                return Err(KvStoreError::BadWriteSet {
+                    reason: "a chosen beam names one pool page twice",
+                });
+            }
+            chosen.push(page);
+        }
+        let page_size = self.page_size as usize;
+        let pages = chosen
+            .iter()
+            .map(|&id| crate::store::kv::page_table::PublishedPage {
+                id,
+                token_hashes: vec![None; page_size],
+                page_hash: None,
+            })
+            .collect();
+        let mut freed = self.table.replace_tail(ws, f0, pages)?;
+        freed.retain(|backing| !matches!(backing, KvPageBacking::Resident(id) if chosen.contains(id)));
+        let epoch = self.current_epoch();
+        self.recycle_backings(freed, epoch);
+        self.refresh_flat(ws);
+        Ok(())
     }
 
     pub fn flat_table(&mut self, ws: WorkingSetId) -> Result<&[PhysicalKvPageId], KvStoreError> {

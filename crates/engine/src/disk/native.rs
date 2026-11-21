@@ -91,19 +91,12 @@ impl SlotFile {
         Ok(Some((file, stride, slots)))
     }
 
+    /// The file's length set, sparse: its budget is a ceiling, its blocks
+    /// written as slots are, never reserved up front (a tier derived to all
+    /// the free disk left none for logs or other processes). A write that
+    /// finds the disk full fails that copy by name.
     fn reserve(file: &File, slots: u32, stride: usize) -> io::Result<()> {
-        let len = u64::from(slots) * stride as u64;
-        file.set_len(len)?;
-        // APFS copies on write: a page written lands in new blocks and the
-        // preallocated ones stay reserved, so preallocating there doubles
-        // the file's footprint instead of guaranteeing it.
-        #[cfg(all(unix, not(target_vendor = "apple")))]
-        if let Err(error) = rustix::fs::fallocate(file, rustix::fs::FallocateFlags::empty(), 0, len)
-            && error != rustix::io::Errno::OPNOTSUPP
-        {
-            return Err(error.into());
-        }
-        Ok(())
+        file.set_len(u64::from(slots) * stride as u64)
     }
 }
 
@@ -204,6 +197,31 @@ mod tests {
         file.read(3, back.as_mut_slice()).unwrap();
         assert_eq!(back.as_slice(), stage.as_slice());
         assert!(file.read(4, back.as_mut_slice()).is_err());
+        drop(file);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_span_reads_back_what_was_written_and_stays_aligned_within_the_slots() {
+        let dir = std::env::temp_dir().join(format!("pie-slot-span-{}", std::process::id()));
+        let file = SlotFile::open(&dir, "r0.state", 3 * 4096, 2 * 3 * 4096)
+            .unwrap()
+            .unwrap();
+        let mut stage = Aligned::zeroed(2 * 4096);
+        stage
+            .as_mut_slice()
+            .iter_mut()
+            .enumerate()
+            .for_each(|(i, b)| *b = (i * 7) as u8);
+        // Across the boundary of slots 0 and 1.
+        file.write_span(2 * 4096, stage.as_slice()).unwrap();
+        let mut back = Aligned::zeroed(2 * 4096);
+        file.read_span(2 * 4096, back.as_mut_slice()).unwrap();
+        assert_eq!(back.as_slice(), stage.as_slice());
+        // Unaligned, short, or past the slots: refused.
+        assert!(file.read_span(100, back.as_mut_slice()).is_err());
+        assert!(file.read_span(0, &mut back.as_mut_slice()[..100]).is_err());
+        assert!(file.read_span(5 * 4096, back.as_mut_slice()).is_err());
         drop(file);
         std::fs::remove_dir_all(dir).unwrap();
     }

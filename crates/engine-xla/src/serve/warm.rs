@@ -220,30 +220,52 @@ impl Shell {
         let least = pad.prefill_floor;
         // (A fire that prefills pads its decodes to `pad.rung`: a half rung of
         // the ladder is a decode-only fire's.)
+        // (A fire of decodes beside prompts pads them to the decode lanes its
+        // prompts' rung leaves, `canonical_pads`: one decode count a row
+        // bucket and prompt rung.)
         for &d in buckets
             .iter()
             .filter(|&&d| d <= pad.rung(lanes_cap) && pad.rung(d) == d)
         {
             for &b in buckets.iter().filter(|&&b| b >= least && b >= 2 * d) {
+                // The bucket filled: decodes, prompt pad lanes, the rest. At
+                // the top also a full fire, the runtime's widest rows,
+                // decodes and all (where the profile keeps padding room past
+                // the widest rows, that one lands a bucket lower, and a fire
+                // its pads carry into the top found no program: every
+                // composition the load states laid, `Shell::mixed_lanes`,
+                // has one).
+                let filled = b.saturating_sub(d + host);
+                let mut totals = vec![filled];
+                if b == top && widest.saturating_sub(d) != filled {
+                    totals.push(widest.saturating_sub(d));
+                }
+                for rows in totals {
+                    if rows < 2 || d == 0 || d != self.mixed_decode_lanes(host) {
+                        continue;
+                    }
+                    let mut lanes = vec![fresh(decode, 1); d as usize];
+                    lanes.push(fresh(prefill, rows));
+                    shapes.push(lanes);
+                }
+                // (the wide fires below: the widest rows at the top, else
+                // the bucket filled)
                 let rows = if b == top {
-                    // A full fire: the runtime's widest rows, decodes and all.
                     widest.saturating_sub(d)
                 } else {
-                    b.saturating_sub(d + host)
+                    filled
                 };
-                if rows < 2 || (b != top && d + rows + host > b) {
-                    continue;
-                }
-                let mut lanes = vec![fresh(decode, 1); d as usize];
-                lanes.push(fresh(prefill, rows));
-                shapes.push(lanes);
                 let mut p = pad.next(host);
                 while p + d <= max_lanes {
+                    if d != self.mixed_decode_lanes(p) {
+                        p = pad.next(p);
+                        continue;
+                    }
                     let n = p / 2;
                     // the prompts' rows: the bucket, less the decodes, the
                     // one-row lanes their count pads with and the rest lane
                     let r = b.saturating_sub(d + p - n);
-                    if b != top && r >= 2 * n {
+                    if r >= 2 * n {
                         let mut lanes = vec![fresh(decode, 1); d as usize];
                         lanes.extend(std::iter::repeat_n(fresh(prefill, r / n), n as usize));
                         lanes[d as usize].rows += r % n;
@@ -261,7 +283,10 @@ impl Shell {
                 if b >= widest && widest >= 4096 {
                     for n in [17u32, 33] {
                         let each = rows / n;
-                        if each >= 2 && d + 2 * n <= self.budgets.tokens.max_lanes {
+                        if each >= 2
+                            && d + 2 * n <= self.budgets.tokens.max_lanes
+                            && d == self.mixed_decode_lanes(pad.rung(n + 1).max(host))
+                        {
                             let mut lanes = vec![fresh(decode, 1); d as usize];
                             lanes.extend(std::iter::repeat_n(fresh(prefill, each), n as usize));
                             // A full fire's prompts fill the widest rows, and the
@@ -472,7 +497,11 @@ impl Shell {
         // host by its end, its last compiles one at a time); those the free
         // memory holds load once the compiles are done.
         let parks = self.device.parks();
-        let budget = available_memory().map_or(u64::MAX, |b| b.saturating_sub(2 * need));
+        // the programs' room: what the load states (`Residency::host_programs`),
+        // else the host's free memory less two compiles'
+        let stated = self.host_programs;
+        let budget = stated
+            .unwrap_or_else(|| available_memory().map_or(u64::MAX, |b| b.saturating_sub(2 * need)));
         let held = std::sync::atomic::AtomicU64::new(0);
         let parked = std::sync::atomic::AtomicUsize::new(0);
         // The compiles' room, fixed here: what the held programs' budget
@@ -559,6 +588,7 @@ impl Shell {
             > = (0..texts.len())
                 .map(|_| std::sync::Mutex::new(None))
                 .collect();
+            let kept_bytes = held.load(SeqCst);
             let held = &programs;
             std::thread::scope(|scope| {
                 for _ in 0..threads {
@@ -578,7 +608,14 @@ impl Shell {
                             {
                                 let _turn = admit.lock().expect("the warm admission lock poisoned");
                                 let busy = loading.load(SeqCst);
-                                if available_memory().is_none_or(|b| b < hold + busy + 2 * need) {
+                                let room = match stated {
+                                    Some(stated) => stated
+                                        .checked_sub(kept_bytes)
+                                        .is_none_or(|b| b < hold + busy),
+                                    None => available_memory()
+                                        .is_none_or(|b| b < hold + busy + 2 * need),
+                                };
+                                if room {
                                     full.store(true, SeqCst);
                                     break;
                                 }
@@ -604,7 +641,7 @@ impl Shell {
             tracing::warn!(
                 parked,
                 held_gib = held.load(SeqCst) >> 30,
-                "xla warm ladder parked programs on disk: the host's memory holds no more"
+                "xla warm ladder parked programs on disk: the host's memory holds no more; the first fire of each one's shape loads it (`loaded_in_fire`)"
             );
         }
         // The compiles' scratch is freed by now: hand it back rather than
@@ -636,7 +673,22 @@ impl Shell {
                         why,
                     });
                 }
-                None => continue,
+                None => {
+                    // parked in the disk cache: the first fire of its shape
+                    // loads it (`Shell::load_parked`)
+                    if let Some(shape_key) = d.shape_key {
+                        self.parked_shapes.insert(shape_key, d.key);
+                    }
+                    self.parked.insert(
+                        d.key,
+                        super::Parked {
+                            text: d.text,
+                            sig: d.sig,
+                            probed: d.probed,
+                        },
+                    );
+                    continue;
+                }
             };
             self.probed.insert(d.key, d.probed);
             self.traced.insert(d.key, std::sync::Arc::clone(&program));

@@ -389,6 +389,39 @@ state out are eager. It is never a size constant. Step (c) builds it as an
 option behind that rule, off by default (record everything bounded),
 pending the user's confirmation of the line.
 
+## 9a. As built (sc/l40s-vkrec-bodykey)
+
+- **Recorded, not run.** The load records each body into its kept frame and
+  submits none of them: a recording's commands need no execution. The fire
+  block is written by the head of the first serving fire, and a head is
+  skipped only where the staged image's hash and bytes match, so a body
+  that never ran replays correctly. Arming took Qwen3-8B 40.9 s when the
+  bodies ran, and 1.5 to 2.9 s recorded only.
+- **The allowance is host memory.** A body costs what its command buffer
+  and descriptor sets take on the host (the driver holds nothing measurable
+  on the device for them). Each body is measured as the growth of the
+  process's resident memory across its recording. The allowance is the
+  host's available memory less the host tier the pool laid. On a device
+  that shares the host's memory it is what the device has left, so there
+  is one allowance. A body past it runs eager, named at load. On the L40S
+  the bodies take 0.75 to 1.5 GB and the dearest about 11 MB.
+- **Fed decodes are bodies of their own.** Where the weight cache streams
+  the token table by its rows, a decode fed its token on the device binds
+  the fire's own row stage, not the arm's ring (`FireBindings::row_ring`).
+  The load records every shape that carries decode lanes in that form too.
+- **Fixed bodies fill without a walk.** A body whose commands carry their
+  rows (the decode buckets, fires within the widest vector-GEMM row tile)
+  lays one image for all its fires. Its body key is the record key without
+  what the lanes read out, and it maps to the family. A fire of a known
+  body key whose readout copies move the regions the recording's do fills
+  from the body and its own readout layout (`Shell::readout_copies`). A
+  prefill wider than the tile still walks once for its fill (FOLLOWUPS F53).
+- **Buffering fires.** A fire whose lanes buffer their recurrent rows (a
+  beam's, a draft's) records through the state+buffer form of the
+  recurrent kernels (GPU's port, sc/gpu-beam-parents-6): one kernel over
+  the lane's carried rows. It does not use a table of per-page copies, and
+  the rs copy loop of §4 / §5 is not built here.
+
 ## 10. Steps and gates
 
 (a) On the reworked fireblock head: padding to the bucket, the explicit

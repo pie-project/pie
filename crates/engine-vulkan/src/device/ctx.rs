@@ -170,6 +170,9 @@ pub(crate) struct Core {
     /// The one thread that waits on every watched submission's fence, in
     /// the queue's order, started with the device ([`Watch`]).
     watcher: Mutex<Option<std::sync::mpsc::Sender<Watch>>>,
+    /// The submission that went to the queue last: the queue has emptied
+    /// once it landed ([`Context::idle`]).
+    last: Mutex<Last>,
 
     /// Command buffers whose frame was dropped off the thread that owns
     /// their pool, which a pool's own thread frees: a pool is not shared.
@@ -317,6 +320,22 @@ impl Core {
 const FENCE_TIMEOUT_NS: u64 = 120_000_000_000;
 
 impl Core {
+    /// The bits of a timestamp the queue's family writes: 0 where it writes
+    /// none (or the device states no `timestampPeriod`).
+    fn stamp_bits(&self) -> u32 {
+        if self.limits.timestamp_period <= 0.0 {
+            return 0;
+        }
+        // SAFETY: `physical` is the instance's live physical device.
+        let families = unsafe {
+            self.instance
+                .get_physical_device_queue_family_properties(self.physical)
+        };
+        families
+            .get(self.family as usize)
+            .map_or(0, |family| family.timestamp_valid_bits)
+    }
+
     fn lend_fence(&self) -> Result<vk::Fence> {
         if let Some(fence) = self
             .spare_fences
@@ -454,6 +473,9 @@ pub struct Context {
     /// Whether the next frame's rows are constants of its commands
     /// ([`Context::fixed_next`]).
     fixed_next: Mutex<Option<bool>>,
+    /// The workgroups the device holds at once, as the load's rates step
+    /// measured them ([`Context::resident`]).
+    resident: std::sync::OnceLock<u32>,
 }
 
 /// The kernel [`Frame::copy_rows`] dispatches.
@@ -461,14 +483,30 @@ const COPIER: (&str, &str) = ("gather/rows.slang", "gather_rows_copy_regions_wor
 
 /// The device's pipeline cache, which kernel and guest pipelines share. A
 /// build marks it changed, and it reaches its file shortly after rather
-/// than at shutdown: a phone kills an app's process more often than the app
-/// shuts down.
+/// than at shutdown (a phone kills an app's process more often than the app
+/// shuts down), written by a thread of its own once builds have paused: no
+/// submission waits on the driver's serialization of the cache or on the
+/// file.
 pub struct PipelineCache {
     core: Arc<Core>,
     cache: vk::PipelineCache,
     path: Option<std::path::PathBuf>,
-    changed: std::sync::atomic::AtomicBool,
-    written: Mutex<std::time::Instant>,
+    signal: Arc<CacheSignal>,
+    writer: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+/// What a build tells the cache's writer: when the cache last changed, and
+/// that it is to stop (writing what changed first).
+#[derive(Default)]
+struct CacheSignal {
+    state: Mutex<CacheState>,
+    wake: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct CacheState {
+    changed_at: Option<std::time::Instant>,
+    stop: bool,
 }
 
 /// How long a changed cache waits for more builds before it is written.
@@ -491,12 +529,20 @@ impl PipelineCache {
         let cache = make(&initial)
             .or_else(|_| make(&[]))
             .map_err(|e| core.fault("vkCreatePipelineCache", e))?;
+        let signal = Arc::new(CacheSignal::default());
+        let writer = path.clone().map(|path| {
+            let (core, signal) = (Arc::clone(core), Arc::clone(&signal));
+            std::thread::Builder::new()
+                .name("pipeline cache".into())
+                .spawn(move || write_settled(&core, cache, &path, &signal))
+                .expect("a pipeline cache writer thread")
+        });
         Ok(PipelineCache {
             core: Arc::clone(core),
             cache,
             path,
-            changed: std::sync::atomic::AtomicBool::new(false),
-            written: Mutex::new(std::time::Instant::now()),
+            signal,
+            writer: Mutex::new(writer),
         })
     }
 
@@ -510,59 +556,89 @@ impl PipelineCache {
         self.path.as_deref()
     }
 
-    /// Marks the cache changed by a build.
+    /// Marks the cache changed by a build: its writer writes it once builds
+    /// have paused for [`PIPELINE_CACHE_SETTLE`].
     pub fn built(&self) {
-        self.changed.store(true, Ordering::Release);
+        let mut state = self.signal.state.lock().expect("cache signal poisoned");
+        state.changed_at = Some(std::time::Instant::now());
+        self.signal.wake.notify_one();
     }
+}
 
-    /// Writes a changed cache once builds have paused for a moment.
-    pub fn settle(&self) {
-        let due = self.changed.load(Ordering::Acquire)
-            && self
-                .written
-                .lock()
-                .expect("written lock poisoned")
-                .elapsed()
-                >= PIPELINE_CACHE_SETTLE;
-        if due && let Err(fault) = self.persist() {
-            tracing::warn!(%fault, "writing the pipeline cache");
-        }
-    }
-
-    pub fn persist(&self) -> Result<()> {
-        if !self.changed.swap(false, Ordering::AcqRel) {
-            return Ok(());
-        }
-        *self.written.lock().expect("written lock poisoned") = std::time::Instant::now();
-        let Some(path) = &self.path else {
-            return Ok(());
-        };
-        // SAFETY: `self.cache` is a live cache of `self.core.device`; reading
-        // its data may race pipeline builds that use it, which Vulkan allows,
-        // as `vkGetPipelineCacheData` does not need it externally synchronized.
-        let bytes = unsafe { self.core.device.get_pipeline_cache_data(self.cache) }
-            .map_err(|e| self.core.fault("vkGetPipelineCacheData", e))?;
-        let io = |call: &'static str| {
-            move |e: std::io::Error| Fault::Device {
-                call,
-                why: e.to_string(),
+/// The cache's writer: waits for a change, then for builds to pause for
+/// [`PIPELINE_CACHE_SETTLE`], and writes the cache to `path`; on stop, writes
+/// what changed and returns.
+fn write_settled(
+    core: &Core,
+    cache: vk::PipelineCache,
+    path: &std::path::Path,
+    signal: &CacheSignal,
+) {
+    let mut state = signal.state.lock().expect("cache signal poisoned");
+    loop {
+        match state.changed_at {
+            None if state.stop => return,
+            None => {
+                state = signal.wake.wait(state).expect("cache signal poisoned");
             }
-        };
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(io("pipeline cache dir"))?;
+            Some(at) if !state.stop && at.elapsed() < PIPELINE_CACHE_SETTLE => {
+                let left = PIPELINE_CACHE_SETTLE - at.elapsed();
+                state = signal
+                    .wake
+                    .wait_timeout(state, left)
+                    .expect("cache signal poisoned")
+                    .0;
+            }
+            Some(_) => {
+                state.changed_at = None;
+                drop(state);
+                if let Err(fault) = write_cache(core, cache, path) {
+                    tracing::warn!(%fault, "writing the pipeline cache");
+                }
+                state = signal.state.lock().expect("cache signal poisoned");
+            }
         }
-        // Whole or not at all: a reader never meets a half-written file.
-        let partial = path.with_extension("partial");
-        std::fs::write(&partial, bytes).map_err(io("pipeline cache write"))?;
-        std::fs::rename(&partial, path).map_err(io("pipeline cache rename"))
     }
+}
+
+/// The cache's data, written whole to `path`.
+fn write_cache(core: &Core, cache: vk::PipelineCache, path: &std::path::Path) -> Result<()> {
+    // SAFETY: `cache` is a live cache of `core.device` (its owner joins this
+    // thread before destroying it); reading its data may race pipeline
+    // builds that use it, which Vulkan allows, as `vkGetPipelineCacheData`
+    // does not need it externally synchronized.
+    let bytes = unsafe { core.device.get_pipeline_cache_data(cache) }
+        .map_err(|e| core.fault("vkGetPipelineCacheData", e))?;
+    let io = |call: &'static str| {
+        move |e: std::io::Error| Fault::Device {
+            call,
+            why: e.to_string(),
+        }
+    };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(io("pipeline cache dir"))?;
+    }
+    // Whole or not at all: a reader never meets a half-written file.
+    let partial = path.with_extension("partial");
+    std::fs::write(&partial, bytes).map_err(io("pipeline cache write"))?;
+    std::fs::rename(&partial, path).map_err(io("pipeline cache rename"))
 }
 
 impl Drop for PipelineCache {
     fn drop(&mut self) {
-        let _ = self.persist();
-        // SAFETY: this is the last `Arc<PipelineCache>`, so no build is using
-        // the cache; pipelines made from it do not depend on it.
+        // The writer writes what changed and returns before the cache goes.
+        self.signal
+            .state
+            .lock()
+            .expect("cache signal poisoned")
+            .stop = true;
+        self.signal.wake.notify_one();
+        if let Some(writer) = self.writer.lock().expect("writer lock poisoned").take() {
+            let _ = writer.join();
+        }
+        // SAFETY: this is the last `Arc<PipelineCache>` and its writer has
+        // returned, so nothing uses the cache; pipelines made from it do not
+        // depend on it.
         unsafe { self.core.device.destroy_pipeline_cache(self.cache, None) };
     }
 }
@@ -636,11 +712,13 @@ fn host_ceiling(name: &str, shares_host: bool, memory_budget: bool) -> Result<Op
         device = name,
         available = room.available,
         defended = room.defended,
+        cgroup = ?room.cgroup,
         floor = engine_gpu::host_memory::SAFETY_FLOOR_BYTES,
         room = room.room,
         held,
         "read at bind: the device shares the host's memory, so the load takes what it has \
-         available, less what lmkd keeps free past it, less the floor"
+         available, less what lmkd keeps free past it, capped at what \
+         its cgroups leave, less the floor"
     );
     Ok(Some(room.room.saturating_add(held)))
 }
@@ -1016,6 +1094,7 @@ impl Context {
             )])),
             spare_fences: Mutex::new(Vec::new()),
             watcher: Mutex::new(None),
+            last: Mutex::new(Last::None),
             orphans: Mutex::new(Vec::new()),
             family,
             memory,
@@ -1086,6 +1165,7 @@ impl Context {
             indirect_next: Mutex::new(None),
             arm_next: Mutex::new(None),
             fixed_next: Mutex::new(None),
+            resident: std::sync::OnceLock::new(),
         })
     }
 
@@ -1128,9 +1208,27 @@ impl Context {
         self.max_buffer
     }
 
+    /// What sizes work to the device, as its kernels count cores: the
+    /// compute units the driver reports, or where it reports none the
+    /// workgroups the device holds at once ([`Context::resident`]). `None`
+    /// before the load has measured them.
     #[must_use]
-    pub fn cores(&self) -> u32 {
-        self.core.cores.unwrap_or(crate::chip::UNREPORTED_CORES)
+    pub fn cores(&self) -> Option<u32> {
+        self.core.cores.or_else(|| self.resident.get().copied())
+    }
+
+    /// The workgroups the device holds at once, as the load's rates step
+    /// measured them on every device (`profile::fire::RESIDENT_WORKGROUPS`):
+    /// what a guest step's grid strides over. `None` before the load has.
+    #[must_use]
+    pub fn resident(&self) -> Option<u32> {
+        self.resident.get().copied()
+    }
+
+    /// Lays the workgroups the load's rates step measured
+    /// ([`Context::resident`]); the first holds.
+    pub(crate) fn hold_resident(&self, workgroups: u32) {
+        let _ = self.resident.set(workgroups);
     }
 
     /// The alignment a guest table takes in its pool slot: 16 at least, and
@@ -1158,7 +1256,11 @@ impl Context {
     #[must_use]
     pub fn limits(&self) -> crate::tuning::Limits {
         crate::tuning::Limits {
-            cores: self.cores(),
+            // Before the rates step has measured a device the driver reports
+            // no cores of, one: that step's own tuning, whose timed kernels
+            // read neither the qmm's fill nor a decode's split per core (a
+            // load's tuning states them, `crate::rates::at_load`).
+            cores: self.cores().unwrap_or(1),
             lanes: self.lanes(),
             shared_bytes: self.core.limits.max_compute_shared_memory_size,
             invocations: self.core.limits.max_compute_work_group_invocations,
@@ -1281,6 +1383,14 @@ impl Context {
         Ok(())
     }
 
+    /// Lays the slab every host write to device memory stages through
+    /// (a guest bind's tables among them), where nothing has made it yet:
+    /// a load lays it, so serving reserves none.
+    pub fn lay_staging(&self) -> Result<()> {
+        let mut transfer = self.core.transfer.lock().expect("transfer lock poisoned");
+        self.core.staging(&mut transfer).map(|_| ())
+    }
+
     pub fn frame(&self) -> Result<Frame> {
         self.frame_with(true)
     }
@@ -1329,6 +1439,129 @@ impl Context {
 
     pub fn frame_kept(&self) -> Result<Frame> {
         self.frame_with(false)
+    }
+
+    /// Whether every submission made on the device so far has landed, read
+    /// now without waiting: the queue is empty. Frames run in queue order
+    /// (each begins with a barrier on all work before it), so the queue is
+    /// empty once the frame that submitted last has landed: dropped (a
+    /// submitted frame's drop waits its fence), seen landed by a wait, or
+    /// its fence signaled now.
+    #[must_use]
+    pub fn idle(&self) -> bool {
+        let last = match &*self.core.last.lock().expect("last lock poisoned") {
+            Last::None => return true,
+            Last::Frame(frame) => frame.upgrade().map(Ok),
+            Last::Replay(replay) => replay.upgrade().map(Err),
+        };
+        match last {
+            None => true,
+            Some(Ok(last)) => {
+                if last.landed.load(Ordering::Acquire) >= last.seq.load(Ordering::Acquire) {
+                    return true;
+                }
+                // SAFETY: the fence lives as long as `last`; querying it
+                // needs no external sync.
+                let signaled =
+                    unsafe { self.core.device.get_fence_status(last.fence) }.unwrap_or(false);
+                if signaled {
+                    last.landed_now();
+                }
+                signaled
+            }
+            // A replay's lent fence goes back once it landed, its
+            // submission's last holder gone with it.
+            Some(Err(replay)) => {
+                replay.landed.load(Ordering::Acquire)
+                    // SAFETY: the lent fence is the submission's until it
+                    // drops, which `replay` holds off.
+                    || unsafe { self.core.device.get_fence_status(replay.fence) }.unwrap_or(false)
+            }
+        }
+    }
+
+    /// A frame whose device time [`Frame::commit_spanned`] reads back: a
+    /// timestamp written at the top of the pipe before its work and one at
+    /// the bottom after it, where the queue writes timestamps (its family's
+    /// `timestampValidBits` nonzero, a nonzero `timestampPeriod`); a plain
+    /// frame where it writes none.
+    pub fn spanned(&self) -> Result<Frame> {
+        self.spanned_with(true)
+    }
+
+    /// [`Context::spanned`] kept to replay ([`Frame::into_kept_spanned`],
+    /// [`Kept::replay_spanned`]): its timestamps' reset and writes recorded
+    /// with its work, so each replay writes them anew.
+    pub fn spanned_kept(&self) -> Result<Frame> {
+        self.spanned_with(false)
+    }
+
+    /// Whether the queue writes timestamps (its family's
+    /// `timestampValidBits` nonzero, a nonzero `timestampPeriod`): a
+    /// spanned frame then reads its device time back.
+    #[must_use]
+    pub fn writes_timestamps(&self) -> bool {
+        self.core.stamp_bits() > 0
+    }
+
+    fn spanned_with(&self, one_time: bool) -> Result<Frame> {
+        if self.core.stamp_bits() == 0 {
+            return self.frame_with(one_time);
+        }
+        let stamps = self.stamps()?;
+        self.spanned_into(&stamps, !one_time)
+    }
+
+    /// Two timestamps' query pool, laid now, which a spanned frame writes
+    /// ([`Context::spanned_into`]): laid at load and written by one frame
+    /// in flight at a time, so no serving frame lays one.
+    pub fn stamps(&self) -> Result<Stamps> {
+        let core = &self.core;
+        if core.stamp_bits() == 0 {
+            return Err(Fault::Unbound {
+                what: format!(
+                    "timestamps on {}, whose queue family writes none (timestampValidBits 0, or \
+                     timestampPeriod 0)",
+                    core.name
+                ),
+            });
+        }
+        // SAFETY: `core.device` is live; the queue writes timestamps
+        // (checked above).
+        let pool = unsafe {
+            core.device.create_query_pool(
+                &vk::QueryPoolCreateInfo::default()
+                    .query_type(vk::QueryType::TIMESTAMP)
+                    .query_count(2),
+                None,
+            )
+        }
+        .map_err(|e| core.fault("vkCreateQueryPool", e))?;
+        Ok(Stamps(Arc::new(StampPool {
+            core: Arc::clone(core),
+            pool,
+        })))
+    }
+
+    /// A frame writing its two timestamps into `stamps` (laid before,
+    /// [`Context::stamps`]): their reset and the opening one recorded first,
+    /// the closing one as it is submitted or kept; kept to replay where
+    /// `keep`, each replay writing them anew. One frame in flight writes a
+    /// pool at a time: its device time is read ([`Pending::span_ns`])
+    /// before the next is submitted.
+    pub fn spanned_into(&self, stamps: &Stamps, keep: bool) -> Result<Frame> {
+        let frame = self.frame_with(!keep)?;
+        let d = &self.core.device;
+        let pool = stamps.0.pool;
+        let cmd = frame.inner.cmd();
+        // SAFETY: `cmd` is recording outside a render pass and only this
+        // frame records into it; the range is the pool's two queries.
+        unsafe {
+            d.cmd_reset_query_pool(cmd, pool, 0, 2);
+            d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, pool, 0);
+        }
+        *frame.inner.span.lock().expect("span lock poisoned") = Some(stamps.clone());
+        Ok(frame)
     }
 
     fn frame_with(&self, one_time: bool) -> Result<Frame> {
@@ -1408,6 +1641,7 @@ impl Context {
                 cuts: Mutex::new(Vec::new()),
                 heads: Mutex::new(Vec::new()),
                 segments: Mutex::new(Vec::new()),
+                held: Mutex::new(Vec::new()),
                 segmented: std::sync::atomic::AtomicBool::new(false),
                 cmd_pool: pool,
                 fence,
@@ -1415,7 +1649,10 @@ impl Context {
                 keep: Mutex::new(Vec::new()),
                 submitted: std::sync::atomic::AtomicBool::new(false),
                 timing: Mutex::new(timing),
+                span: Mutex::new(None),
                 spare: Mutex::new(std::collections::HashMap::new()),
+                seq: std::sync::atomic::AtomicU64::new(0),
+                landed: std::sync::atomic::AtomicU64::new(0),
                 waiters: std::sync::atomic::AtomicU32::new(0),
                 most_waiters: std::sync::atomic::AtomicU32::new(0),
             }),
@@ -1482,6 +1719,9 @@ pub(crate) struct Inner {
     /// whose last segment's fence lands after them (it begins with a barrier
     /// on every command before it on the queue).
     segments: Mutex<Vec<vk::CommandBuffer>>,
+    /// The segments ended and not yet submitted: submitted with the frame,
+    /// back to back ([`Frame::submit`]).
+    held: Mutex<Vec<vk::CommandBuffer>>,
     /// A segment was submitted: a frame dropped unsubmitted waits for the
     /// queue before it frees them.
     segmented: std::sync::atomic::AtomicBool,
@@ -1496,7 +1736,16 @@ pub(crate) struct Inner {
 
     pub(crate) timing: Mutex<Option<Timing>>,
 
+    /// A spanned frame's two timestamps, before its work and after it
+    /// ([`Context::spanned`]).
+    span: Mutex<Option<Stamps>>,
+
     spare: Mutex<std::collections::HashMap<u64, Vec<vk::DescriptorSet>>>,
+
+    /// The fenced submissions of this frame so far, and the most of them
+    /// seen landed ([`Context::idle`]).
+    seq: std::sync::atomic::AtomicU64,
+    landed: std::sync::atomic::AtomicU64,
 
     /// Threads blocked on `fence` now, and the most at once.
     waiters: std::sync::atomic::AtomicU32,
@@ -1506,6 +1755,31 @@ pub(crate) struct Inner {
 impl Inner {
     pub(crate) fn cmd(&self) -> vk::CommandBuffer {
         vk::Handle::from_raw(self.cmd.load(Ordering::Acquire))
+    }
+}
+
+/// Two timestamps' query pool a spanned frame writes
+/// ([`Context::stamps`]), shared by the frames that write it, one in flight
+/// at a time; destroyed with the last.
+#[derive(Clone)]
+pub struct Stamps(Arc<StampPool>);
+
+impl std::fmt::Debug for Stamps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Stamps").finish()
+    }
+}
+
+struct StampPool {
+    core: Arc<Core>,
+    pool: vk::QueryPool,
+}
+
+impl Drop for StampPool {
+    fn drop(&mut self) {
+        // SAFETY: the last frame holding the pool is gone, and a submitted
+        // frame waits its fence before it drops, so no submission names it.
+        unsafe { self.core.device.destroy_query_pool(self.pool, None) };
     }
 }
 
@@ -1569,6 +1843,41 @@ impl Drop for Inner {
             }
         }
         self.core.return_fence(self.fence);
+    }
+}
+
+impl Inner {
+    /// The device's time between a spanned frame's two timestamps, ns, once
+    /// it landed; `None` for a frame that writes none.
+    fn span_ns(&self) -> Result<Option<u64>> {
+        let Some(pool) = self
+            .span
+            .lock()
+            .expect("span lock poisoned")
+            .as_ref()
+            .map(|stamps| stamps.0.pool)
+        else {
+            return Ok(None);
+        };
+        let core = &self.core;
+        let mut ticks = [0u64; 2];
+        // SAFETY: the frame's fence was waited on, so both queries are
+        // written; `ticks` holds one u64 for each with `TYPE_64`.
+        unsafe {
+            core.device.get_query_pool_results(
+                pool,
+                0,
+                &mut ticks,
+                vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+            )
+        }
+        .map_err(|e| core.fault("vkGetQueryPoolResults", e))?;
+        let bits = core.stamp_bits();
+        let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+        let ticks = ticks[1].wrapping_sub(ticks[0]) & mask;
+        Ok(Some(
+            (ticks as f64 * f64::from(core.limits.timestamp_period)) as u64,
+        ))
     }
 }
 
@@ -2289,10 +2598,13 @@ impl Frame {
     }
 
     /// [`engine_gpu::backend::Frame::submit_segment`]: what the frame holds
-    /// submitted unawaited, recording on in a new buffer from the same
-    /// (this thread's) pool that begins with a barrier on every command
-    /// submitted before it, as every frame begins. A kept frame's segment is
-    /// a cut its replays wait on ([`Frame::flush`]).
+    /// ended as a segment of its own, recording on in a new buffer from the
+    /// same (this thread's) pool that begins with a barrier on every command
+    /// before it, as every frame begins. The segments are submitted with the
+    /// frame, each its own submission, back to back ([`Frame::submit`]): the
+    /// device runs them without waiting on the host's encoding between
+    /// them. A kept frame's segment is a cut its replays wait on
+    /// ([`Frame::flush`]).
     pub fn submit_segment(&self) -> Result<()> {
         if self.kept {
             return self.flush();
@@ -2307,20 +2619,19 @@ impl Frame {
         // SAFETY: as in `flush`: this frame's `cmd` is recording and only
         // `&self` records into it.
         unsafe { d.end_command_buffer(cmd) }.map_err(|e| core.fault("vkEndCommandBuffer", e))?;
-        {
-            let bufs: Vec<vk::CommandBuffer> = head.into_iter().chain([cmd]).collect();
-            let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
-            let queue = core.queue.lock().expect("queue lock poisoned");
-            // SAFETY: `cmd` is executable and submitted once, with no
-            // fence; the queue is held under its lock.
-            unsafe { d.queue_submit(*queue, &submits, vk::Fence::null()) }
-                .map_err(|e| core.fault("vkQueueSubmit", e))?;
+        // The segment's head runs before it, submitted with it.
+        if let Some(head) = head {
+            self.inner.held.lock().expect("held lock poisoned").push(head);
         }
-        self.inner.segmented.store(true, Ordering::Release);
         self.inner
             .segments
             .lock()
             .expect("segments lock poisoned")
+            .push(cmd);
+        self.inner
+            .held
+            .lock()
+            .expect("held lock poisoned")
             .push(cmd);
         // SAFETY: `cmd_pool` is this frame's (this thread's) pool.
         let next = unsafe {
@@ -2376,14 +2687,27 @@ impl Frame {
             let bufs: Vec<vk::CommandBuffer> = head.into_iter().chain([cmd]).collect();
             let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
             let queue = core.queue.lock().expect("queue lock poisoned");
+            // A split step's held segments go first, in order.
+            let held = std::mem::take(&mut *self.inner.held.lock().expect("held lock poisoned"));
+            for segment in held {
+                let bufs = [segment];
+                let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
+                // SAFETY: `segment` was ended and never submitted; it has no
+                // fence; the queue is held under its lock.
+                unsafe { d.queue_submit(*queue, &submits, vk::Fence::null()) }
+                    .map_err(|e| core.fault("vkQueueSubmit", e))?;
+                self.inner.segmented.store(true, Ordering::Release);
+            }
             // SAFETY: `cmd` is executable, the fence is unsignaled (reset after
             // each wait) and the queue is held under its lock.
             unsafe { d.queue_submit(*queue, &submits, self.inner.fence) }
                 .map_err(|e| core.fault("vkQueueSubmit", e))?;
+            self.inner.submitted_now();
         }
         // SAFETY: the fence is this frame's own, just submitted.
         unsafe { d.wait_for_fences(&[self.inner.fence], true, FENCE_TIMEOUT_NS) }
             .map_err(|e| core.fault("vkWaitForFences", e))?;
+        self.inner.landed_now();
         // SAFETY: the wait returned success, so no submission names the fence.
         unsafe { d.reset_fences(&[self.inner.fence]) }
             .map_err(|e| core.fault("vkResetFences", e))?;
@@ -2452,10 +2776,23 @@ impl Frame {
         let bufs: Vec<vk::CommandBuffer> = head.into_iter().chain([self.inner.cmd()]).collect();
         let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
         let queue = core.queue.lock().expect("queue lock poisoned");
+        // A split step's segments first, each its own submission, back to
+        // back under the one hold of the queue.
+        let held = std::mem::take(&mut *self.inner.held.lock().expect("held lock poisoned"));
+        for segment in held {
+            let bufs = [segment];
+            let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
+            // SAFETY: `segment` was ended and never submitted; it has no
+            // fence; the queue is held under its lock.
+            unsafe { core.device.queue_submit(*queue, &submits, vk::Fence::null()) }
+                .map_err(|e| core.fault("vkQueueSubmit", e))?;
+            self.inner.segmented.store(true, Ordering::Release);
+        }
         // SAFETY: `cmd` was just ended and never submitted, the fence is the
         // frame's own unsignaled one, and the queue is held under its lock.
         unsafe { core.device.queue_submit(*queue, &submits, self.inner.fence) }
             .map_err(|e| core.fault("vkQueueSubmit", e))?;
+        self.inner.submitted_now();
         self.inner.submitted.store(true, Ordering::Release);
         Ok(())
     }
@@ -2472,8 +2809,51 @@ impl Frame {
         Ok(started.elapsed().as_secs_f64())
     }
 
+    /// Submits and waits: the device's time between the two timestamps a
+    /// [`Context::spanned`] frame writes, ns; `None` for another frame.
+    pub fn commit_spanned(mut self) -> Result<Option<u64>> {
+        self.stamp_end();
+        self.submit()?;
+        Pending::watched(Pending::of_frame(&self.inner), None).wait()?;
+        self.inner.span_ns()
+    }
+
+    /// A spanned frame's closing timestamp, written while it is open.
+    fn stamp_end(&self) {
+        let span = self
+            .inner
+            .span
+            .lock()
+            .expect("span lock poisoned")
+            .as_ref()
+            .map(|stamps| stamps.0.pool);
+        if let Some(pool) = span
+            && self.open
+        {
+            // SAFETY: the frame is open, so `cmd` is recording; query 1 of
+            // the pool was reset when the frame opened.
+            unsafe {
+                self.inner.core.device.cmd_write_timestamp(
+                    self.inner.cmd(),
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    pool,
+                    1,
+                );
+            }
+        }
+    }
+
+    /// A [`Context::spanned_kept`] frame, its closing timestamp written,
+    /// kept to replay ([`Kept::replay_spanned`]).
+    pub fn into_kept_spanned(self) -> Result<Kept> {
+        self.into_kept()
+    }
+
+    /// Kept to replay; a spanned frame's closing timestamp written first,
+    /// so each replay writes both anew.
     pub fn into_kept(mut self) -> Result<Kept> {
         use std::hash::Hasher;
+        self.stamp_end();
         self.end()?;
         let head = self.head(false)?;
         Ok(Kept {
@@ -2489,7 +2869,11 @@ impl Frame {
         })
     }
 
+    /// Submits; `on_done` runs once it lands. A spanned frame's closing
+    /// timestamp is written first, so [`Pending::span_ns`] reads its device
+    /// time once it landed.
     pub fn commit_async(mut self, on_done: Option<engine_gpu::backend::OnDone>) -> Result<Pending> {
+        self.stamp_end();
         let at = crate::encode::profiling().then(std::time::Instant::now);
         self.submit()?;
         if let Some(at) = at {
@@ -2632,6 +3016,7 @@ impl Kept {
             // SAFETY: the fence is this kept frame's own.
             unsafe { d.wait_for_fences(&[self.inner.fence], true, FENCE_TIMEOUT_NS) }
                 .map_err(|e| core.fault("vkWaitForFences", e))?;
+            self.inner.landed_now();
         }
         // SAFETY: no pending submission names the fence (waited above, or
         // the last one was a segment, waited and reset below).
@@ -2648,12 +3033,21 @@ impl Kept {
             // the queue is held under its lock.
             unsafe { d.queue_submit(*queue, &submits, self.inner.fence) }
                 .map_err(|e| core.fault("vkQueueSubmit", e))?;
+            self.inner.submitted_now();
         }
         // SAFETY: the fence is this frame's own, just submitted.
         unsafe { d.wait_for_fences(&[self.inner.fence], true, FENCE_TIMEOUT_NS) }
             .map_err(|e| core.fault("vkWaitForFences", e))?;
+        self.inner.landed_now();
         // SAFETY: the wait returned, so no submission names the fence.
         unsafe { d.reset_fences(&[self.inner.fence]) }.map_err(|e| core.fault("vkResetFences", e))
+    }
+
+    /// Replays a [`Frame::into_kept_spanned`] frame and waits: the device's
+    /// time between its timestamps, ns (`None` where it writes none).
+    pub fn replay_spanned(&self) -> Result<Option<u64>> {
+        self.replay(None)?.wait()?;
+        self.inner.span_ns()
     }
 
     pub fn replay(
@@ -2696,11 +3090,20 @@ impl Kept {
             lent: true,
             landed: std::sync::atomic::AtomicBool::new(false),
         });
+        *core.last.lock().expect("last lock poisoned") = Last::Replay(Arc::downgrade(&submission));
         Ok(Pending::watched(
             submission,
             on_done.map(|f| -> engine_gpu::backend::OnDone { Box::new(move |refused| f(refused)) }),
         ))
     }
+}
+
+/// The submission that went to the queue last ([`Context::idle`]): a
+/// frame's, on its own fence, or a replay's, on a lent one.
+enum Last {
+    None,
+    Frame(std::sync::Weak<Inner>),
+    Replay(std::sync::Weak<Submission>),
 }
 
 /// What a frame's one fence waiter tells every other: the fence's wait
@@ -2880,6 +3283,13 @@ impl Pending {
         inner.harvest_timing();
         Ok(())
     }
+
+    /// The device's time between a spanned frame's two timestamps, ns, read
+    /// once it landed (its fence waited: the read waits on nothing more);
+    /// `None` for a frame that writes none.
+    pub fn span_ns(&self) -> Result<Option<u64>> {
+        self.submission.inner.span_ns()
+    }
 }
 
 impl Inner {
@@ -2897,7 +3307,24 @@ impl Inner {
                 .wait_for_fences(&[fence], true, FENCE_TIMEOUT_NS)
         };
         self.waiters.fetch_sub(1, Ordering::AcqRel);
+        if result.is_ok() {
+            self.landed_now();
+        }
         result
+    }
+
+    /// A fenced submission of this frame went to the queue: the device's
+    /// last ([`Context::idle`]).
+    fn submitted_now(self: &Arc<Self>) {
+        self.seq.fetch_add(1, Ordering::AcqRel);
+        *self.core.last.lock().expect("last lock poisoned") = Last::Frame(Arc::downgrade(self));
+    }
+
+    /// This frame's fence was seen signaled: every submission of it so far
+    /// has landed.
+    fn landed_now(&self) {
+        self.landed
+            .fetch_max(self.seq.load(Ordering::Acquire), Ordering::AcqRel);
     }
 
     fn harvest_timing(&self) {
@@ -2946,6 +3373,33 @@ mod tests {
     use std::time::Instant;
 
     use super::{Context, Ordering};
+
+    /// A build marks the cache changed and returns without writing it (no
+    /// submission or build waits on the file); the cache's writer writes it,
+    /// at the latest when the cache goes.
+    #[test]
+    fn a_built_cache_is_written_off_the_build_and_by_the_time_it_goes() {
+        let dir = std::env::temp_dir().join(format!("pie-vk-cache-{}", std::process::id()));
+        let path = dir.join("pipelines.bin");
+        let _ = std::fs::remove_file(&path);
+        let boot = crate::api::DeviceBoot {
+            pipeline_cache: Some(path.clone()),
+            ..crate::api::DeviceBoot::default()
+        };
+        let bound = Context::bind(&boot, engine::Allowance::WHOLE);
+        let Ok(context) = bound else {
+            eprintln!("not asked: {:?}", bound.err());
+            return;
+        };
+        context.pipeline_cache().built();
+        assert!(!path.exists(), "the build wrote the cache itself");
+        drop(context);
+        assert!(
+            path.exists(),
+            "the cache went without its writer writing it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A replayed frame's fence has one waiter, the watcher that runs its
     /// `on_done`; the caller's wait returns when that watcher releases it,

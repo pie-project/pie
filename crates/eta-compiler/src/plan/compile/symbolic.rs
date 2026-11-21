@@ -79,6 +79,13 @@ pub(crate) fn symbolic_result_type(
             ty.dtype = value_type.dtype;
             ty
         }
+        Op::GumbelArgmax { .. } => {
+            let logits = mapped_op.operands()[0];
+            let mut ty = normalized_types[logits as usize].clone();
+            ty.dims.pop();
+            ty.dtype = value_type.dtype;
+            ty
+        }
         Op::Transpose(value) => {
             let mapped = mapped_value(mapped_op, *value);
             let mut ty = normalized_types[mapped as usize].clone();
@@ -280,7 +287,9 @@ pub(crate) fn symbolic_port_type(port: Port, value_type: ValueType) -> SymbolicT
         Port::EmbedTokens | Port::Positions | Port::Slots => {
             set_first_symbolic(&mut ty, SymbolicExtent::TokenCount)
         }
-        Port::KvLen | Port::Fold => set_first_symbolic(&mut ty, SymbolicExtent::RowCount),
+        Port::KvLen | Port::Fold | Port::Parents => {
+            set_first_symbolic(&mut ty, SymbolicExtent::RowCount)
+        }
         Port::Readout => set_first_symbolic(&mut ty, SymbolicExtent::SampledRows),
         Port::AttnMask => {
             if !ty.dims.is_empty() {

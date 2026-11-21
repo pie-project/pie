@@ -831,24 +831,30 @@ fn golden_logits_by_refs() {
     probe(served_by_refs);
 }
 
-/// Host refs handed out as the runtime's host tier would (CONTRACT-BC 22):
-/// a fresh host chunk for a shape whose open one is full, host chunk ids
-/// their own places.
-struct HostRefs {
+/// Tier refs handed out as the runtime's host and disk tiers would
+/// (CONTRACT-BC 22): a fresh chunk of the tier's `chunks` for a shape whose
+/// open one is full, chunk ids their own places.
+struct TierRefs {
     next: u32,
+    chunks: u32,
     open: Vec<Option<(u32, u32)>>,
 }
 
-impl HostRefs {
+impl TierRefs {
+    fn of(facts: &engine::chunk::ChunkFacts, chunks: u32) -> TierRefs {
+        TierRefs {
+            next: 0,
+            chunks,
+            open: vec![None; facts.shapes.len()],
+        }
+    }
+
     fn take(&mut self, facts: &engine::chunk::ChunkFacts, shape: usize) -> u32 {
         let per_chunk = facts.shapes[shape].slots_per_chunk;
         let (chunk, index) = match self.open[shape] {
             Some((chunk, index)) if index < per_chunk => (chunk, index),
             _ => {
-                assert!(
-                    self.next < facts.host_chunks,
-                    "the host tier holds the lane"
-                );
+                assert!(self.next < self.chunks, "the tier holds the lane");
                 self.next += 1;
                 (self.next - 1, 0)
             }
@@ -859,12 +865,13 @@ impl HostRefs {
 }
 
 /// Every slot of `refs` (shape `shape`; ref 0, a trimmed window slot,
-/// stays) out to `tier` and back into fresh device slots, as a suspend and
-/// a restore move them: the refs the lane names from then on.
+/// stays) out to `tier` (its refs handed out by `parked`) and back into
+/// fresh device slots, as a suspend and a restore move them: the refs the
+/// lane names from then on.
 fn park(
     shell: &mut Shell,
     refs: &mut Refs,
-    host: &mut HostRefs,
+    parked: &mut TierRefs,
     tier: engine_cuda::store::Tier,
     shape: usize,
     slots: &[u32],
@@ -872,20 +879,10 @@ fn park(
     use engine_cuda::store::Tier;
     let id = refs.facts.shapes[shape].id;
     let facts = refs.facts.clone();
-    let mut disk = 0u32;
     let out: Vec<(u32, u32)> = slots
         .iter()
         .filter(|&&slot| slot != 0)
-        .map(|&slot| {
-            let parked = match tier {
-                Tier::Disk => {
-                    disk += 1;
-                    disk - 1
-                }
-                _ => host.take(&facts, shape),
-            };
-            (slot, parked)
-        })
+        .map(|&slot| (slot, parked.take(&facts, shape)))
         .collect();
     shell
         .copy_tier_slots(id, Tier::Device, tier, &out)
@@ -908,8 +905,7 @@ fn park(
 /// serves it but for evacuations; where `offload`, after steps 2 and 6
 /// every slot the lane holds (kv list pages, window list pages, the record's
 /// pieces) parks below the device and comes back to fresh slots in fresh
-/// chunks: the host tier the first time, the kv list pages through the slot
-/// file the second. The logits are the never-offloaded serving's, bit for
+/// chunks: the host tier the first time, the disk tier the second. The logits are the never-offloaded serving's, bit for
 /// bit.
 fn served_offloaded(fixture: &Fixture, cache: &Path, offload: bool) -> Vec<(u64, u32)> {
     use engine::chunk::SlotKind;
@@ -941,9 +937,13 @@ fn served_offloaded(fixture: &Fixture, cache: &Path, offload: bool) -> Vec<(u64,
         resident("before it is seated");
     }
     let host = Some(stated.map_or(1 << 30, |mib| mib << 20));
-    let ring = engine_cuda::store::staging_ring_for(shell.trace(), PAGE, CONTEXT, host, 1)
-        .and_then(|bytes| bytes.map(engine_cuda::store::Ring::pin).transpose())
-        .expect("the staging ring pins");
+    let ring = engine_cuda::store::staging_ring_for(
+        host,
+        1,
+        engine::runahead::Runahead::DEFAULT_FRAMES_IN_FLIGHT,
+    )
+    .and_then(|bytes| bytes.map(engine_cuda::store::Ring::pin).transpose())
+    .expect("the staging ring pins");
     shell
         .seat_host_kv(host, 1, CONTEXT, 1, ring)
         .expect("the host tier seats");
@@ -957,6 +957,8 @@ fn served_offloaded(fixture: &Fixture, cache: &Path, offload: bool) -> Vec<(u64,
             Some(256 << 20),
             Some(dir.path()),
             false,
+            1,
+            1,
             engine_cuda::World::default(),
         )
         .expect("the disk tier seats");
@@ -965,10 +967,8 @@ fn served_offloaded(fixture: &Fixture, cache: &Path, offload: bool) -> Vec<(u64,
     assert!(facts.host_chunks > 0, "a host tier is stated");
     assert!(facts.disk_chunks > 0, "a disk tier is stated");
     let mut refs = Refs::of(facts.clone(), 1);
-    let mut host = HostRefs {
-        next: 0,
-        open: vec![None; facts.shapes.len()],
-    };
+    let mut host = TierRefs::of(&facts, facts.host_chunks);
+    let mut disk = TierRefs::of(&facts, facts.disk_chunks);
     let list = refs.shape(|kind| matches!(kind, SlotKind::List { window: None, .. }));
     let window_list = refs.shape(|kind| kind.window().is_some());
     let fixed = refs.shape(|kind| matches!(kind, SlotKind::Fixed { .. }));
@@ -1068,15 +1068,19 @@ fn served_offloaded(fixture: &Fixture, cache: &Path, offload: bool) -> Vec<(u64,
         last = Some(top);
         steps.push((hash_logits(&logits), top));
         if offload && (at == 2 || at == 6) {
-            let kv_tier = if at == 2 { Tier::Host } else { Tier::Disk };
+            let (tier, parked) = if at == 2 {
+                (Tier::Host, &mut host)
+            } else {
+                (Tier::Disk, &mut disk)
+            };
             if let Some(shape) = list {
-                pages = park(&mut shell, &mut refs, &mut host, kv_tier, shape, &pages);
+                pages = park(&mut shell, &mut refs, parked, tier, shape, &pages);
             }
             if let Some(shape) = window_list {
-                window = park(&mut shell, &mut refs, &mut host, Tier::Host, shape, &window);
+                window = park(&mut shell, &mut refs, parked, tier, shape, &window);
             }
             if let Some(shape) = fixed {
-                pieces = park(&mut shell, &mut refs, &mut host, Tier::Host, shape, &pieces);
+                pieces = park(&mut shell, &mut refs, parked, tier, shape, &pieces);
                 record = Some(shell.name_record(&pieces).expect("the record is named"));
             }
         }
@@ -1085,7 +1089,7 @@ fn served_offloaded(fixture: &Fixture, cache: &Path, offload: bool) -> Vec<(u64,
 }
 
 /// CONTRACT-BC 22: a lane offloaded mid-decode (every slot it holds to the
-/// host tier and back, then its kv pages through the slot file) serves the
+/// host tier and back, then to the disk tier and back) serves the
 /// never-offloaded lane's logits bit for bit, in one process.
 #[test]
 #[ignore = "a probe run by hand: see the module's doc"]
@@ -1114,6 +1118,283 @@ fn golden_offload() {
         }
     }
     assert!(moved.is_empty(), "offloaded logits moved: {moved:?}");
+}
+
+/// A slot's words, every one's low half set: no bf16 (nor a narrowing of
+/// f32 to one) keeps them. Some are NaNs with payloads, some denormals.
+fn tier_pattern(seed: u32, bytes: u64) -> Vec<u8> {
+    (0..bytes / 4)
+        .flat_map(|at| {
+            let x = (at as u32 ^ seed.wrapping_mul(0x9e37_79b9)).wrapping_mul(0x85eb_ca6b);
+            let word = match at % 7 {
+                0 => 0x7fc0_0000 | (x & 0x003f_ffff) | 1,
+                1 => x & 0x007f_ffff | 1,
+                _ => x ^ (x >> 15) | 0x0001_0001,
+            };
+            word.to_le_bytes()
+        })
+        .collect()
+}
+
+fn tier_check(what: &str, got: &[u8], want: &[u8]) {
+    assert_eq!(got.len(), want.len(), "{what}: length");
+    if let Some(at) = got.iter().zip(want).position(|(a, b)| a != b) {
+        panic!(
+            "{what}: byte {at} of {} differs ({:#04x} for {:#04x}); {} bytes differ",
+            want.len(),
+            got[at],
+            want[at],
+            got.iter().zip(want).filter(|(a, b)| a != b).count()
+        );
+    }
+}
+
+/// Every parked shape of `model`'s load through the tiers below the device
+/// ([`a_tier_round_trip_is_bit_exact_for_every_parked_shape`]): each shape
+/// it moved, named by what it holds, and its slot's bytes.
+fn tier_round_trip(model: &str, cache: &Path) -> Vec<(String, u64)> {
+    use engine_cuda::store::Tier;
+    let fixture = fixture(model, cache);
+    let mut shell = load(&fixture, cache);
+    let host = Some(256 << 20);
+    let ring = engine_cuda::store::staging_ring_for(
+        host,
+        1,
+        engine::runahead::Runahead::DEFAULT_FRAMES_IN_FLIGHT,
+    )
+    .and_then(|bytes| bytes.map(engine_cuda::store::Ring::pin).transpose())
+    .expect("the staging ring pins");
+    shell
+        .seat_host_kv(host, 1, CONTEXT, 1, ring)
+        .expect("the host tier seats");
+    // Three disk chunks a parked shape, and a part chunk the tier leaves.
+    let stated = shell.chunk_facts().expect("the pool states its chunks");
+    let disk_chunk = stated.chunk_bytes.next_multiple_of(4096);
+    let budget = 3 * stated.shapes.len() as u64 * disk_chunk + disk_chunk / 2;
+    let dir = tempfile::tempdir().expect("a disk tier's dir");
+    let chunks = shell
+        .seat_disk_kv(
+            Some(budget),
+            Some(dir.path()),
+            false,
+            1,
+            1,
+            engine_cuda::World::default(),
+        )
+        .expect("the disk tier seats");
+    shell.take_refs();
+    let facts = shell.chunk_facts().expect("the pool states its chunks");
+    facts.validate().expect("the engine's chunk facts hold");
+    // The budget divides into disk chunks of a pool chunk each, on the
+    // direct I/O boundary, laid out as the device's.
+    assert_eq!(facts.disk_chunks, chunks, "{model}: the facts state the disk chunks");
+    assert_eq!(u64::from(chunks), budget / disk_chunk, "{model}: disk chunks of the budget");
+    let parked: Vec<engine::chunk::SlotShape> = facts
+        .shapes
+        .iter()
+        .filter(|shape| shape.role != engine::chunk::SlotRole::Adapter)
+        .cloned()
+        .collect();
+    // The null chunk and four device chunks a shape.
+    let segments = (1 + 4 * parked.len() as u32)
+        .div_ceil(facts.segment_chunks.max(1))
+        .min(facts.segments.max);
+    shell
+        .commit_segments(segments)
+        .expect("the segments commit");
+    let committed = segments * facts.segment_chunks;
+    assert!(
+        1 + 4 * parked.len() as u32 <= committed,
+        "{model}: four device chunks a shape in the {committed} committed"
+    );
+    assert!(
+        3 * parked.len() as u32 <= chunks && 2 * parked.len() as u32 <= facts.host_chunks,
+        "{model}: three disk chunks and two host chunks a shape"
+    );
+    let stream = shell.stream();
+    let write = |shell: &mut Shell, id, slot: u32, bytes: &[u8]| {
+        let at = shell.slot_span(id, slot).expect("a slot's place");
+        engine_cuda::device::alloc::stage_raw(stream, at, bytes).expect("the slot is written");
+    };
+    let read = |shell: &mut Shell, id, slot: u32, len: u64| -> Vec<u8> {
+        shell.settle_moves().expect("every move lands");
+        let at = shell.slot_span(id, slot).expect("a slot's place");
+        let mut out = vec![0u8; len as usize];
+        engine_cuda::device::alloc::copy_d2h_on(stream, at, &mut out).expect("the slot reads");
+        out
+    };
+    let zip = |a: &[u32], b: &[u32]| -> Vec<(u32, u32)> {
+        a.iter().copied().zip(b.iter().copied()).collect()
+    };
+    let mut moved = Vec::new();
+    for (k, shape) in parked.iter().enumerate() {
+        let k = k as u32;
+        let (id, per, bytes) = (shape.id, shape.slots_per_chunk, shape.slot_bytes);
+        assert!(
+            u64::from(per) * bytes <= facts.chunk_bytes,
+            "{model}: shape {id} packs a chunk as on the device"
+        );
+        // Device chunks `1 + 4k ..`, disk chunks `3k ..`, host chunks `2k ..`:
+        // each shape's own. Slots `n` adjacent ones of a chunk, from `first`.
+        let n = per.min(3);
+        let refs = |chunk: u32, first: u32| -> Vec<u32> {
+            (0..n).map(|i| chunk * per + (first + i) % per).collect()
+        };
+        let what = |how: &str| format!("{model} shape {id} ({bytes} bytes a slot) {how}");
+
+        // Device -> disk -> device: adjacent disk slots, out of order, in
+        // one copy; the device slots overwritten; restored into other
+        // slots in two copies back to back.
+        let (source, into) = (refs(1 + 4 * k, 0), refs(2 + 4 * k, 0));
+        let held: Vec<Vec<u8>> = source
+            .iter()
+            .enumerate()
+            .map(|(i, &slot)| {
+                let pattern = tier_pattern(100 * (k + 1) + i as u32, bytes);
+                write(&mut shell, id, slot, &pattern);
+                pattern
+            })
+            .collect();
+        let disk: Vec<u32> = refs(3 * k, 1).into_iter().rev().collect();
+        shell
+            .copy_tier_slots(id, Tier::Device, Tier::Disk, &zip(&source, &disk))
+            .expect("the slots park on disk");
+        for &slot in &source {
+            write(&mut shell, id, slot, &vec![0xa5; bytes as usize]);
+        }
+        let (disk_a, disk_b) = disk.split_at(1);
+        let (into_a, into_b) = into.split_at(1);
+        shell
+            .copy_tier_slots(id, Tier::Disk, Tier::Device, &zip(disk_a, into_a))
+            .expect("the first slot restores");
+        shell
+            .copy_tier_slots(id, Tier::Disk, Tier::Device, &zip(disk_b, into_b))
+            .expect("the rest restore");
+        for (i, &slot) in into.iter().enumerate() {
+            tier_check(
+                &what(&format!("slot {i} device -> disk -> device")),
+                &read(&mut shell, id, slot, bytes),
+                &held[i],
+            );
+        }
+        // The slot beside the parked ones in their disk chunk, written
+        // after them in a copy of its own (sharing a block with them where
+        // a slot is off the boundary), leaves them as they were.
+        if per > n + 1 {
+            let beside = 3 * k * per + n + 1;
+            let other = refs(3 + 4 * k, 0)[0];
+            write(&mut shell, id, other, &tier_pattern(7, bytes));
+            shell
+                .copy_tier_slots(id, Tier::Device, Tier::Disk, &[(other, beside)])
+                .expect("the slot beside parks");
+            shell
+                .copy_tier_slots(id, Tier::Disk, Tier::Device, &zip(&disk, &into))
+                .expect("the slots restore again");
+            for (i, &slot) in into.iter().enumerate() {
+                tier_check(
+                    &what(&format!("slot {i} beside a later neighbour")),
+                    &read(&mut shell, id, slot, bytes),
+                    &held[i],
+                );
+            }
+        }
+        // Negative control: a restore from a disk slot this shape never
+        // parked to does not read as the parked bytes.
+        let never = refs(3 * k + 2, 0)[0];
+        let blank = refs(3 + 4 * k, 1)[0];
+        write(&mut shell, id, blank, &vec![0x3c; bytes as usize]);
+        shell
+            .copy_tier_slots(id, Tier::Disk, Tier::Device, &[(never, blank)])
+            .expect("an unparked disk slot restores");
+        let got = read(&mut shell, id, blank, bytes);
+        assert!(
+            held.iter().all(|held| *held != got),
+            "{}",
+            what("restored from an unparked disk slot reads as a parked one")
+        );
+
+        // Host -> disk -> host, into other host slots; and the disk slots
+        // up to the device too.
+        let host_in = refs(2 * k, 0);
+        let host_back = refs(2 * k + 1, 0);
+        let seeded: Vec<u8> = (0..n)
+            .flat_map(|i| tier_pattern(100 * (k + 1) + 50 + i, bytes))
+            .collect();
+        shell
+            .write_tier_slots(&[(id, host_in.clone())], &seeded)
+            .expect("the host slots take the pattern");
+        let down: Vec<u32> = refs(3 * k + 1, 1).into_iter().rev().collect();
+        shell
+            .copy_tier_slots(id, Tier::Host, Tier::Disk, &zip(&host_in, &down))
+            .expect("the host slots go down to disk");
+        shell
+            .write_tier_slots(&[(id, host_in.clone())], &vec![0x5a; seeded.len()])
+            .expect("the host slots are written over");
+        shell
+            .copy_tier_slots(id, Tier::Disk, Tier::Host, &zip(&down, &host_back))
+            .expect("the disk slots come up to the host");
+        let got = shell
+            .read_tier_slots(&[(id, host_back)])
+            .expect("the host slots read");
+        tier_check(&what("host -> disk -> host"), &got, &seeded);
+        let up = refs(4 + 4 * k, 0);
+        shell
+            .copy_tier_slots(id, Tier::Disk, Tier::Device, &zip(&down, &up))
+            .expect("the disk slots come up to the device");
+        let row = bytes as usize;
+        for (i, &slot) in up.iter().enumerate() {
+            tier_check(
+                &what(&format!("slot {i} host -> disk -> device")),
+                &read(&mut shell, id, slot, bytes),
+                &seeded[i * row..(i + 1) * row],
+            );
+        }
+        println!("{}: every round trip bit-exact", what("parks"));
+        let held = match (shape.role, &shape.kind) {
+            (_, engine::chunk::SlotKind::List { window: Some(_), .. }) => "window".to_string(),
+            (engine::chunk::SlotRole::State, engine::chunk::SlotKind::List { .. }) => {
+                "kv".to_string()
+            }
+            (engine::chunk::SlotRole::State, engine::chunk::SlotKind::Fixed { .. }) => {
+                "record".to_string()
+            }
+            (role, _) => format!("{role:?}"),
+        };
+        moved.push((held, bytes));
+    }
+    moved
+}
+
+/// Every shape a parked set carries comes back bit for bit through the
+/// tiers below the device (CONTRACT-BC 22): the kv list, the window lists
+/// (Gemma's miniature), the hybrid's rs-list rows and records (Qwen3.5's),
+/// and the guests' instance and channel slots, device -> disk -> device
+/// and host -> disk -> host (and on up to the device), into other slots,
+/// the disk budget divided into disk chunks laid out as the device's.
+/// Words no bf16 holds; disk slots adjacent and out of order, restored in
+/// two copies back to back; a slot off the 4 KiB boundary written beside
+/// its parked neighbours without disturbing them; and a negative control,
+/// a restore from a disk slot never parked to, that reads as none of them.
+#[test]
+fn a_tier_round_trip_is_bit_exact_for_every_parked_shape() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    let cache = cache_dir();
+    let mut roles = std::collections::BTreeSet::new();
+    let mut unaligned = false;
+    for model in ["qwen35-tiny", "gemma4-e4b-mini-l6"] {
+        for (held, bytes) in tier_round_trip(model, &cache) {
+            roles.insert(held);
+            unaligned |= bytes % 4096 != 0;
+        }
+    }
+    println!("parked shapes: {roles:?}");
+    for want in ["kv", "window", "record", "RsBuffer", "Instance", "Channel"] {
+        assert!(roles.contains(want), "a {want} shape parked: {roles:?}");
+    }
+    assert!(unaligned, "a slot off the 4 KiB boundary parked");
 }
 
 fn probe(served: fn(&Fixture, &Path) -> Vec<(u64, u32)>) {
@@ -1487,6 +1768,302 @@ fn golden_buffered_carrying() {
         "the decode replaying {CARRIED} buffered rows replayed {hits} body(ies) and walked \
          {unbodied} fire(s) with none"
     );
+}
+
+/// Decode steps a lagged lane takes: a fold behind its rows by the lag.
+const LAGGED_STEPS: u32 = 30;
+
+/// A prefill folded as it lands, then [`LAGGED_STEPS`] decodes of a fixed
+/// script, each buffering its row and folding so that `lag` rows stay
+/// unfolded behind it (a run-ahead decode whose rows are folded once they
+/// are accepted): from the lag on, each decode carries `lag` rows into its
+/// step and commits the oldest of them, every `max(7, lag + 3)`-th step
+/// committing them all (so a lag of 20 is reached) and every fifth one
+/// none. `lag` 0 folds each row as it lands. Each step's logits, and the
+/// fires of the decodes walked with no body.
+fn served_lagged(fixture: &Fixture, cache: &Path, lag: u32) -> (Vec<Vec<f32>>, u64) {
+    use engine::fire::{FoldLen, RsVerb};
+    let mut shell = Shell::load(Boot {
+        trace: fixture.trace.clone(),
+        contract: &fixture.contract,
+        checkpoint: &fixture.container,
+        budget: Budget::new(1, TOKENS),
+        patches: None,
+        voxels: None,
+        page_size: PAGE,
+        context: CONTEXT,
+        slots: 4,
+        kv_budget: None,
+        allowance: engine::Allowance::WHOLE,
+        context_declared: false,
+        ordinal: 0,
+        knobs: buffering(knobs()),
+        cache_dir: Some(cache),
+        runahead: engine::runahead::Runahead::F1,
+        residency: engine_cuda::experts::Plan::default(),
+        world: engine_cuda::World::default(),
+        expert: engine_cuda::World::default(),
+        comm: core::ptr::null_mut(),
+    })
+    .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
+    shell.back_whole().expect("the fitted pool is backed whole");
+    let page = rs_page(&mut shell);
+    shell.open(0).expect("slot 0 opens");
+    let mut steps = Vec::new();
+    let mut step = |shell: &mut Shell, tokens: &[u32], rs: RsVerb| {
+        let word = fixture.trace.facts.word(&Request::new(
+            u32::try_from(tokens.len()).expect("a count"),
+            false,
+        ));
+        let seated = engine_cuda::Seated {
+            rs,
+            ..engine_cuda::Seated::of(Lane {
+                slot: 0,
+                word,
+                tokens,
+            })
+        };
+        let mut rows = shell
+            .fire_media(&[seated], &[], &[])
+            .expect("the step fires");
+        steps.push(rows.swap_remove(0));
+    };
+    let prompt: Vec<u32> = (0..37).map(|t| (t * 7 + 11) % 1000).collect();
+    let mut fed = prompt.len() as u32;
+    // A lagged lane's prompt leaves its last rows unfolded too, so its
+    // chunked fire lands what a decode reads them by.
+    let mut folded = fed - lag.min(4);
+    let rs = if lag == 0 {
+        RsVerb::Fold
+    } else {
+        RsVerb::Buffer {
+            pages: (0..fed.div_ceil(page)).collect(),
+            base: 0,
+            folded: 0,
+            fold: FoldLen::Host(folded),
+            lineage: engine::fire::Lineage::Set,
+        }
+    };
+    step(&mut shell, &prompt, rs);
+    let before = shell.body_stats().tally;
+    for at in 0..LAGGED_STEPS {
+        let token = (fed * 7 + 11) % 1000;
+        if lag == 0 {
+            step(&mut shell, &[token], RsVerb::Fold);
+            fed += 1;
+            folded += 1;
+            continue;
+        }
+        let end = fed + 1;
+        let base = folded / page * page;
+        let whole = 7.max(lag + 3);
+        let fold = match at {
+            _ if at % whole == whole - 1 => end - folded,
+            _ if at % 5 == 4 => 0,
+            _ => (end - folded).saturating_sub(lag),
+        };
+        step(
+            &mut shell,
+            &[token],
+            RsVerb::Buffer {
+                pages: (base / page..end.div_ceil(page)).collect(),
+                base,
+                folded,
+                fold: FoldLen::Host(fold),
+                lineage: engine::fire::Lineage::Set,
+            },
+        );
+        fed = end;
+        folded += fold;
+    }
+    let after = shell.body_stats().tally;
+    (steps, after.eager_unbodied - before.eager_unbodied)
+}
+
+/// A lane folding `lag` rows behind its decodes answers, step for step,
+/// what the lane folding each row as it lands answers, to the tolerance of
+/// the two forms of the recurrence: its decode step reads the buffered rows
+/// as a linear attention over their stored keys and corrected values from
+/// the committed state (rounded to bf16 only as a fold stores it), where
+/// the folding lane re-steps and stores the state a row. Its greedy tokens
+/// are the folding lane's but where the two lie within that tolerance.
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_lagged() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    let cache = cache_dir();
+    let model = buffered_model();
+    let fixture = fixture(&model, &cache);
+    let (folded, _) = served_lagged(&fixture, &cache, 0);
+    let lags: Vec<u32> = std::env::var("PIE_GOLDEN_LAGS").map_or_else(
+        |_| vec![1, 2, 3, 9],
+        |lags| lags.split(',').map(|lag| lag.parse().expect("a lag")).collect(),
+    );
+    for lag in lags {
+        let (lagged, unbodied) = served_lagged(&fixture, &cache, lag);
+        assert_eq!(lagged.len(), folded.len());
+        let mut worst = 0f32;
+        let mut moved = 0usize;
+        let mut flips = 0usize;
+        for (lagged, folded) in lagged.iter().zip(&folded) {
+            let scale = folded.iter().fold(0f32, |most, v| most.max(v.abs()));
+            let apart = lagged
+                .iter()
+                .zip(folded)
+                .fold(0f32, |most, (a, b)| most.max((a - b).abs()));
+            worst = worst.max(apart / scale.max(f32::MIN_POSITIVE));
+            moved += usize::from(lagged != folded);
+            let (a, b) = (argmax(lagged), argmax(folded));
+            if a != b {
+                let mut sorted = folded.clone();
+                sorted.sort_by(|x, y| y.total_cmp(x));
+                let gap = (sorted[0] - sorted[1]) / scale.max(f32::MIN_POSITIVE);
+                if gap > 0.02 {
+                    flips += 1;
+                }
+            }
+            if std::env::var_os("PIE_GOLDEN_LAG_STEPS").is_some() {
+                println!("lag {lag} step: apart {:e}", apart / scale.max(f32::MIN_POSITIVE));
+            }
+        }
+        println!(
+            "golden {model}-lagged lag {lag}: {} steps, {moved} differ, logits apart by \
+             {worst:e} of their scale, {flips} greedy token(s) flipped off a near tie, \
+             {unbodied} decode(s) walked with no body",
+            lagged.len()
+        );
+        // The two forms round apart: the folding lane's step rounds the
+        // decayed state to bf16 before its update and stores it a row, the
+        // lagged lane's sums in f32 and rounds as a fold stores. On this
+        // miniature they lie 0.012 to 0.023 of their scale apart, the own
+        // row's step alone as much as a lag of eleven (the chunked replay's
+        // band beside the scan's is 0.013 to 0.035, `golden_buffered_carrying`).
+        assert!(
+            worst < 0.05 && flips == 0,
+            "at a lag of {lag} the lagged lane's logits lie {worst:e} of their scale from the \
+             folded lane's, {flips} greedy token(s) flipped"
+        );
+        assert_eq!(unbodied, 0, "a lagged decode walked with no body");
+    }
+}
+
+/// Decode steps the pace probe times a schedule.
+const PACE_STEPS: u32 = 240;
+
+/// The median wall time of a one-lane decode step on `fixture` under each
+/// schedule of `PIE_GOLDEN_PACE` (a comma list; by default `0,1,11,w10`):
+/// a number keeps that many rows unfolded behind each decode, `w<n>` folds
+/// the accepted rows whole once they fill a window of `n` (the runtime's
+/// run-ahead lag), 0 folds each row as it lands. Each schedule is served by
+/// its own load after a warm pass.
+fn served_pace(fixture: &Fixture, cache: &Path, schedule: &str) -> f64 {
+    use engine::fire::{FoldLen, RsVerb};
+    let (lag, window) = match schedule.strip_prefix('w') {
+        Some(w) => (0, w.parse::<u32>().expect("a window")),
+        None => (schedule.parse::<u32>().expect("a lag"), 0),
+    };
+    let mut shell = Shell::load(Boot {
+        trace: fixture.trace.clone(),
+        contract: &fixture.contract,
+        checkpoint: &fixture.container,
+        budget: Budget::new(1, TOKENS),
+        patches: None,
+        voxels: None,
+        page_size: PAGE,
+        context: CONTEXT,
+        slots: 4,
+        kv_budget: None,
+        allowance: engine::Allowance::WHOLE,
+        context_declared: false,
+        ordinal: 0,
+        knobs: buffering(knobs()),
+        cache_dir: Some(cache),
+        runahead: engine::runahead::Runahead::F1,
+        residency: engine_cuda::experts::Plan::default(),
+        world: engine_cuda::World::default(),
+        expert: engine_cuda::World::default(),
+        comm: core::ptr::null_mut(),
+    })
+    .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
+    shell.back_whole().expect("the fitted pool is backed whole");
+    let page = rs_page(&mut shell);
+    let mut times = Vec::new();
+    for pass in 0..2 {
+        shell.open(pass).expect("the pass's slot opens");
+        let prompt: Vec<u32> = (0..37).map(|t| (t * 7 + 11) % 1000).collect();
+        let fire = |shell: &mut Shell, tokens: &[u32], rs: RsVerb| {
+            let word = fixture.trace.facts.word(&Request::new(
+                u32::try_from(tokens.len()).expect("a count"),
+                false,
+            ));
+            let seated = engine_cuda::Seated {
+                rs,
+                ..engine_cuda::Seated::of(Lane {
+                    slot: pass,
+                    word,
+                    tokens,
+                })
+            };
+            let at = std::time::Instant::now();
+            let rows = shell.fire_media(&[seated], &[], &[]).expect("the step fires");
+            (argmax(&rows[0]), at.elapsed().as_secs_f64())
+        };
+        let (mut last, _) = fire(&mut shell, &prompt, RsVerb::Fold);
+        let mut fed = prompt.len() as u32;
+        let mut folded = fed;
+        for _ in 0..PACE_STEPS {
+            let end = fed + 1;
+            let (top, secs) = if lag == 0 && window == 0 {
+                fire(&mut shell, &[last], RsVerb::Fold)
+            } else {
+                let unfolded = end - folded;
+                let fold = if window > 0 {
+                    if unfolded > window { unfolded - 1 } else { 0 }
+                } else {
+                    unfolded.saturating_sub(lag)
+                };
+                let base = folded / page * page;
+                let rs = RsVerb::Buffer {
+                    pages: (base / page..end.div_ceil(page)).collect(),
+                    base,
+                    folded,
+                    fold: FoldLen::Host(fold),
+                    lineage: engine::fire::Lineage::Set,
+                };
+                let out = fire(&mut shell, &[last], rs);
+                folded += fold;
+                out
+            };
+            last = top;
+            fed = end;
+            if pass == 1 {
+                times.push(secs);
+            }
+        }
+    }
+    times.sort_by(f64::total_cmp);
+    times[times.len() / 2]
+}
+
+/// The pace probe ([`served_pace`]): `pace <model> <schedule> <ms>` lines.
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_lagged_pace() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    let cache = cache_dir();
+    let model = buffered_model();
+    let fixture = fixture(&model, &cache);
+    let schedules = std::env::var("PIE_GOLDEN_PACE").unwrap_or_else(|_| "0,1,11,w10".to_string());
+    for schedule in schedules.split(',') {
+        let secs = served_pace(&fixture, &cache, schedule);
+        println!("pace {model} {schedule} {:.4} ms", secs * 1e3);
+    }
 }
 
 /// Two lanes of two seats that buffer their rows past the state in one fire

@@ -88,6 +88,17 @@ struct RungGate {
     /// `u32::MAX` at the largest and where no pool steers the engine): no
     /// step wider reaches it ([`engine_rows`]).
     held: std::sync::atomic::AtomicU32,
+    /// The widest rung rows of a frame the scheduler holds out under the
+    /// cap ([`owe_cut_rows`]): fires cut under a wider cap before it came
+    /// down, queued and no longer cuttable. Admitted work, not throughput:
+    /// the walk holds the rung to it even while a process's demand waits,
+    /// or the frame waited on a raise nothing asked for, nothing in flight
+    /// to wake it. 0 where none is held.
+    owed: std::sync::atomic::AtomicU32,
+    /// The process whose lane holds that widest frame: the key the walk's
+    /// raise to it is funded under in the planner, short of room
+    /// ([`crate::planner::ResidencyPlanner::fund_rise`]).
+    owed_by: Mutex<Option<uuid::Uuid>>,
     /// The event every wait on the activation rung waits on: the fire cap
     /// moved, a raise was applied, copied or refused, the rung was lowered,
     /// segments were committed, or room was freed (a fire retired).
@@ -118,10 +129,72 @@ fn rung_gate(engine: usize) -> &'static RungGate {
                 cap: std::sync::atomic::AtomicU32::new(u32::MAX),
                 grant: std::sync::atomic::AtomicU32::new(u32::MAX),
                 held: std::sync::atomic::AtomicU32::new(u32::MAX),
+                owed: std::sync::atomic::AtomicU32::new(0),
+                owed_by: Mutex::new(None),
                 event: tokio::sync::Notify::new(),
                 walk: tokio::sync::Notify::new(),
             }))
         })
+}
+
+/// The scheduler of `engine` holds frames out under the cap whose widest
+/// fire takes `rows` rung rows (0: none), in the lane of process `by`:
+/// what the walk raises the rung to as admitted work ([`RungGate::owed`]),
+/// funded short of room under `by`'s key. A change asks the walk to look,
+/// so the raise is triggered by the hold itself, not by a fire that may
+/// never come.
+pub fn owe_cut_rows(engine: usize, rows: u32, by: Option<uuid::Uuid>) {
+    let gate = rung_gate(engine);
+    *gate.owed_by.lock().unwrap() = by.filter(|_| rows > 0);
+    let was = gate
+        .owed
+        .swap(rows, std::sync::atomic::Ordering::AcqRel);
+    if rows > 0 && rows != was {
+        ask_walk(engine);
+    }
+}
+
+/// The process whose held frame the walk's owed raise is for
+/// ([`owe_cut_rows`]); `None` where none is held.
+#[must_use]
+pub fn owed_by(engine: usize) -> Option<uuid::Uuid> {
+    *rung_gate(engine).owed_by.lock().unwrap()
+}
+
+/// See [`owe_cut_rows`].
+#[must_use]
+pub fn owed_cut_rows(engine: usize) -> u32 {
+    rung_gate(engine)
+        .owed
+        .load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// The engine refused a fire for the state in logical chunks `chunks`
+/// (`engine::Error::Placement`): `engine`'s pool moves it down, its walk
+/// asked to look now. A pool that keeps no chunks moves nothing.
+pub fn evacuate_refused(engine: usize, chunks: &[u32]) {
+    if let Some(shared) = crate::store::registry::try_get(0, engine).and_then(|stores| stores.shared) {
+        shared.lock().unwrap().refuse_chunks(chunks);
+    }
+    ask_walk(engine);
+}
+
+/// How many of `chunks` `engine`'s pool found no free chunk below for
+/// ([`SharedPool::refusals_stuck`]).
+#[must_use]
+pub fn refusals_stuck(engine: usize, chunks: &[u32]) -> u32 {
+    crate::store::registry::try_get(0, engine)
+        .and_then(|stores| stores.shared)
+        .map_or(0, |shared| shared.lock().unwrap().refusals_stuck(chunks))
+}
+
+/// Whether any of `chunks` still waits for (or is in) its move down on
+/// `engine`'s pool ([`evacuate_refused`]).
+#[must_use]
+pub fn refusals_pending(engine: usize, chunks: &[u32]) -> bool {
+    crate::store::registry::try_get(0, engine)
+        .and_then(|stores| stores.shared)
+        .is_some_and(|shared| shared.lock().unwrap().refusals_pending(chunks))
 }
 
 /// Asks `engine`'s walker to look now: what waits on it (a bind whose term
@@ -189,10 +262,24 @@ pub(crate) fn set_engine_rows_for_test(engine: usize, rows: u32) {
 }
 
 fn set_fire_cap(engine: usize, tokens: u32) {
-    rung_gate(engine)
+    let was = rung_gate(engine)
         .cap
-        .store(tokens, std::sync::atomic::Ordering::Release);
+        .swap(tokens, std::sync::atomic::Ordering::AcqRel);
     rung_changed(engine);
+    // A cap risen: the scheduler looks again now, nothing in flight being
+    // sure to wake it, whether or not it has told the frames it holds out
+    // under the cap yet (its report may be on its way).
+    if tokens > was {
+        crate::scheduler::nudge(engine);
+    }
+}
+
+/// Whether `engine`'s fire cap is another than `used`, the one a scheduler
+/// turn sealed under: that turn's holds are planned again under the cap as
+/// it stands.
+#[must_use]
+pub fn cap_moved(engine: usize, used: u32) -> bool {
+    fire_cap(engine) != used
 }
 
 /// The rows a step on `engine` may take: the rung the engine holds
@@ -652,6 +739,9 @@ impl RoleShapes {
 pub struct Tiers {
     pub host: Option<Shared>,
     pub disk_slots: u32,
+    /// The kv list slots a disk chunk holds: a disk chunk is laid out as
+    /// the device's, a role shape's slots in a chunk of their own.
+    pub disk_chunk_slots: u32,
 }
 
 impl Tiers {
@@ -678,7 +768,12 @@ impl Tiers {
                     })?
             }
         };
-        Ok(Self { host, disk_slots })
+        let disk_chunk_slots = list.map_or(0, |list| list.slots_per_chunk);
+        Ok(Self {
+            host,
+            disk_slots,
+            disk_chunk_slots,
+        })
     }
 }
 
@@ -698,6 +793,16 @@ pub enum SegmentMove {
     /// Give back segments `prefix..` (`release_segments(prefix)`), released
     /// in the pool already.
     Release { prefix: u32 },
+    /// Copy `evacuation`, chunk moves that stand a free run for a bind
+    /// waiting on one (`applied` in the pool already, the chunks moved off
+    /// fenced until the fire at `epoch`): [`SharedPool::compaction_copied`]
+    /// once the engine took it, [`SharedPool::compaction_refused`] where it
+    /// refused it.
+    Compact {
+        evacuation: EngineEvacuation,
+        applied: Vec<super::segments::ChunkMove>,
+        epoch: u64,
+    },
     /// Back the top `n` span segments (`commit_span(n)`), where the span is
     /// backed on demand: the rung lends a chunk there no segment backs. The
     /// pool opens their chunks once the engine has, [`SharedPool::span_committed`].
@@ -710,18 +815,6 @@ pub enum SegmentMove {
     NoRoom,
     /// A drained segment waits for the fire carrying its copy.
     Wait,
-}
-
-/// Whom the walk grows for: what decides whether the span a lowered rung
-/// lends is a step at all ([`SharedPool::grow_step`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GrowFor {
-    /// A waiter short of room for live state. Live state never opens in
-    /// the top rung's span, so backing the span it lends funds no such
-    /// waiter: only the prefix grows for it.
-    Live,
-    /// No waiter: the governor's target alone (or its test pin).
-    Target,
 }
 
 /// A step of the walk that maps a segment.
@@ -797,6 +890,22 @@ pub struct SharedPool {
     /// commits while they do not stand free ([`Self::walk_goal`]), not only
     /// while their slot count is short.
     guest_head: Option<(u32, u32)>,
+    /// The runs a bind waiting in the planner asks, `(run, pieces)`, where
+    /// free chunks are enough but no run of them stands
+    /// ([`Self::compaction_comes`]): the walk moves chunks until they do.
+    compact_for: Option<(u32, u32)>,
+    /// Logical chunks the engine refused a fire for, their state where it
+    /// will not read or write it (`engine::Error::Placement`): the walk
+    /// moves them down ([`Self::refused_step`]); the scheduler holds the
+    /// refused fires until none of theirs is here or moving
+    /// ([`Self::refusals_pending`]).
+    refused: BTreeSet<u32>,
+    /// Of those, the ones a move planned for them carries now, until the
+    /// engine took its copy.
+    refused_moving: BTreeSet<u32>,
+    /// Of those, the ones the last step found no free chunk below for: room
+    /// the planner is asked to make ([`Self::refusals_stuck`]).
+    refused_stuck: BTreeSet<u32>,
     /// The governor's segment target the walk steers this pool to, shared
     /// with it ([`target::SharedGrow`]); `None` where no walk steers it.
     walk_target: Option<Arc<std::sync::atomic::AtomicU32>>,
@@ -1052,6 +1161,10 @@ impl SharedPool {
             lowering: None,
             span_commit_blocked: false,
             guest_head: None,
+            compact_for: None,
+            refused: BTreeSet::new(),
+            refused_moving: BTreeSet::new(),
+            refused_stuck: BTreeSet::new(),
             walk_target: None,
             programs: programs::ProgramFires::default(),
             engine: None,
@@ -1132,6 +1245,35 @@ impl SharedPool {
         self.list.map_or(0, |list| {
             u64::from(chunks) * u64::from(list.slots_per_chunk)
         })
+    }
+
+    /// The kv list slots `pages` kv pages take, as a restore gathers them:
+    /// `None` without a kv list or with no pages.
+    #[must_use]
+    pub fn kv_takes(&self, pages: u32) -> Option<(ShapeId, u64)> {
+        let list = self.list?;
+        (pages > 0).then_some((list.pool, u64::from(pages)))
+    }
+
+    /// The single slots of each state shape `rs` takes: the rs list's
+    /// (`pages`), each window list's (`windows`) and whole records'
+    /// (`slots`, each fixed shape's pieces), as a restore's serve takes
+    /// them before its unpark ([`SlotPool::opens_for`] places them).
+    #[must_use]
+    pub fn state_takes(&self, rs: crate::store::rs::RsUnits) -> Vec<(ShapeId, u64)> {
+        let mut takes = Vec::new();
+        if rs.windows.iter().any(|&n| n > 0) {
+            for (window, &n) in self.windows.iter().zip(&rs.windows) {
+                takes.push((window.pool, u64::from(n)));
+            }
+        } else if let Some(rs_list) = self.rs_list {
+            takes.push((rs_list.pool, u64::from(rs.pages)));
+        }
+        for shape in &self.fixed {
+            takes.push((shape.pool, u64::from(rs.slots) * u64::from(shape.pieces)));
+        }
+        takes.retain(|&(_, slots)| slots > 0);
+        takes
     }
 
     /// The kv list slots whose chunks, let go whole, hold `rs` of the state
@@ -1352,6 +1494,16 @@ impl SharedPool {
             .map_or(1, |s| s.slots_per_chunk.max(1))
     }
 
+    /// `f` run with `ticket`'s held chunks open to its takes
+    /// ([`SlotPool::claim_open`]): a served restore's unpark and bind take
+    /// what was reserved for them, and no one else's take can.
+    pub fn claiming<R>(&mut self, ticket: Option<u64>, f: impl FnOnce(&mut Self) -> R) -> R {
+        let opened = self.pool.claim_open(ticket);
+        let out = f(self);
+        self.pool.claim_close(opened);
+        out
+    }
+
     /// `n` fresh slots of `shape` for the store, as slot refs; none when
     /// they do not all fit.
     pub fn take_refs(&mut self, shape: ShapeId, n: u64) -> Option<Vec<u32>> {
@@ -1400,6 +1552,18 @@ impl SharedPool {
     #[must_use]
     pub fn records_most(&self) -> u32 {
         self.records_most
+    }
+
+    /// The device's room for state at its narrowest rung: every chunk but
+    /// the reserved and the smallest rung's activation, the span the rung
+    /// lends included. One figure, whatever the rung now: what a need past
+    /// it can never be held in (the never-fits check), on every path.
+    #[must_use]
+    pub fn state_chunks_most(&self) -> u32 {
+        self.pool
+            .total_chunks()
+            .saturating_sub(self.pool.reserved_chunks())
+            .saturating_sub(self.pool.act_chunks(0))
     }
 
     /// The chunks state may take under the current rung: every chunk but
@@ -1821,6 +1985,23 @@ impl SharedPool {
         self.publish_held();
     }
 
+    /// The engine took a raise's copy (the state moved down, its table
+    /// changed) and then refused the carve for the wider rung: the moved
+    /// chunks stay where they went (their fence lifts once the fire at
+    /// `epoch` retires), and the activation and the rung the engine holds
+    /// are the rung in hand's again. Fires stay cut to it.
+    pub fn raise_carve_refused(&mut self, epoch: u64) {
+        self.pool.refence(UNTIL_COPIED, epoch);
+        if let Some(act) = self.raise_from.take() {
+            self.pool.restore_act(act);
+        }
+        if let Some(told) = self.told_from.take() {
+            self.told = told;
+        }
+        self.copying = None;
+        self.publish_held();
+    }
+
     /// The engine has taken a raise's copy, carried by the fire at `epoch`
     /// (the next it is handed): its chunks moved off reopen once that fire
     /// retires, and fires may take the raised rung.
@@ -1849,6 +2030,26 @@ impl SharedPool {
     #[must_use]
     pub fn rung_moves(evacuation: &RungEvacuation) -> EngineEvacuation {
         engine_moves(&evacuation.moves)
+    }
+
+    /// Where a raise to `rung` stands for the planner
+    /// ([`crate::planner::PoolPort::rise_room`]): past the pool, short of
+    /// the chunks it lacks (its pieces those free now and those to empty),
+    /// or fitting, a raise's copy under way included (nothing to fund).
+    #[must_use]
+    pub fn rise_room(&self, rung: u32) -> crate::planner::RiseRoom {
+        if let Some((need, total)) = self.pool.rung_past(rung) {
+            return crate::planner::RiseRoom::Past { need, total };
+        }
+        if self.copying.is_some() {
+            return crate::planner::RiseRoom::Fits;
+        }
+        match self.pool.rung_short(rung) {
+            0 => crate::planner::RiseRoom::Fits,
+            short => crate::planner::RiseRoom::Short {
+                pieces: self.pool.free_chunk_runs(1).saturating_add(short),
+            },
+        }
     }
 
     /// The chunks raising the activation to `rung` lacks now, and the kv
@@ -1896,8 +2097,10 @@ impl SharedPool {
         None
     }
 
-    /// The pool shape of engine shape `engine`, a state shape's.
-    fn pool_shape(&self, engine: EngineShape) -> Option<ShapeId> {
+    /// The pool shape of engine shape `engine`, a state shape's or a
+    /// role's: the inverse of [`Self::engine_shape`].
+    #[must_use]
+    pub fn pool_shape(&self, engine: EngineShape) -> Option<ShapeId> {
         self.list
             .iter()
             .chain(&self.rs_list)
@@ -1907,6 +2110,7 @@ impl SharedPool {
             .or_else(|| {
                 self.fixed
                     .iter()
+                    .chain(self.roles.iter())
                     .find(|shape| shape.id == engine)
                     .map(|shape| shape.pool)
             })
@@ -2042,6 +2246,10 @@ impl SharedPool {
         let lowered = self.lower_rung(rung).map(|_| ());
         if lowered.is_err() {
             let _ = self.tell(rung);
+        } else {
+            // The engine gave back its carve above the rung it holds now:
+            // the span there is the state's to take.
+            self.pool.engine_narrowed();
         }
         lowered
     }
@@ -2067,7 +2275,16 @@ impl SharedPool {
             return Ok(self.tell(rung));
         }
         self.pool.set_rung(rung).map_err(RungError::Pool)?;
-        Ok(self.tell(rung))
+        let notice = self.tell(rung);
+        // Told the lower (its notice rides the engine's lane ahead of any
+        // copy or fire of state placed after it), the engine gives back its
+        // carve above the rung: the span there is lent. Not told (the rung
+        // standing, a guest term given back), its carve stays as wide, and
+        // no state opens in it ([`SlotPool::engine_narrowed`]).
+        if notice.is_some() {
+            self.pool.engine_narrowed();
+        }
+        Ok(notice)
     }
 
     // ---- segments ----
@@ -2112,14 +2329,21 @@ impl SharedPool {
             self.pool.release_span(n);
             return Some(SegmentMove::ReleaseSpan { n });
         }
-        if let Some(step) = self.grow_step(target, self.grow_for()) {
+        if let Some(step) = self.grow_step(target) {
             return Some(step.into());
+        }
+        if let Some(step) = self.refused_step(epoch) {
+            return Some(step);
+        }
+        if let Some(step) = self.compact_step(epoch) {
+            return Some(step);
         }
         let mapped = self.mapped_segments();
         if mapped <= target || prefix == 0 {
             return None;
         }
         let last = prefix - 1;
+        let segments = self.pool.segments();
         match segments.state(last) {
             SegmentState::Draining { .. } => Some(match self.pool.release_segment(last) {
                 Ok(()) => SegmentMove::Release { prefix: last },
@@ -2138,7 +2362,14 @@ impl SharedPool {
                 let Some(evacuation) = self.pool.plan_evacuation(last) else {
                     return Some(SegmentMove::NoRoom);
                 };
-                self.apply_evacuation(&evacuation, epoch);
+                // Refused by the pool's own check (stale, or a run it
+                // would split): said and not moved, never a panic (the M1
+                // on f623134fc: "an evacuation planned under the lock
+                // applies: Stale(11)", then a poisoned lock everywhere).
+                if let Err(error) = self.pool.apply_evacuation(&evacuation, epoch) {
+                    tracing::warn!(%error, segment = last, "store: a segment's evacuation refused by the pool's check");
+                    return Some(SegmentMove::NoRoom);
+                }
                 Some(SegmentMove::Evacuate {
                     evacuation: engine_moves(&evacuation.moves),
                     applied: evacuation,
@@ -2148,31 +2379,150 @@ impl SharedPool {
         }
     }
 
-    /// Whom a grow is for now: a live waiter while any is parked short of
-    /// a slot, else the target alone.
-    #[must_use]
-    pub fn grow_for(&self) -> GrowFor {
-        if self.pool.waiting() {
-            GrowFor::Live
-        } else {
-            GrowFor::Target
+    /// A compaction for the bind waiting on runs that free chunks would
+    /// stand, if one is due: each step clears one run, the next planned
+    /// once its moves' fence lifts. Over once the runs stand.
+    fn compact_step(&mut self, epoch: u64) -> Option<SegmentMove> {
+        let (run, pieces) = self.compact_for?;
+        if self.pool.free_chunk_runs(run) >= pieces {
+            self.compact_for = None;
+            return None;
         }
+        let moves = self.pool.plan_compaction_for(run, pieces)?;
+        self.pool
+            .apply_compaction(&moves, epoch)
+            .expect("a compaction planned under the lock applies");
+        Some(SegmentMove::Compact {
+            evacuation: engine_moves(&moves),
+            applied: moves,
+            epoch,
+        })
     }
 
-    /// The walk's next grow step toward `goal` mapped segments for `who`,
-    /// `None` where none maps a segment: the one place a grow is decided.
+    /// Whether moving chunks stands `pieces` free runs of `run` for a bind
+    /// waiting in the planner, where no run stands now: one planned (the
+    /// walk asked to make it), or one on its way. Where it is, the planner
+    /// moves no resident for the bind; where none can (free chunks too few
+    /// whatever moves, or no walk steers the pool), it is no answer, and
+    /// the planner goes on.
+    pub fn compaction_comes(&mut self, run: u32, pieces: u32) -> bool {
+        // No walk steers this pool: nothing would carry a compaction out.
+        if self.walk_target.is_none() || self.pool.free_chunk_runs(run) >= pieces {
+            return false;
+        }
+        if self.compact_for.is_some() && self.pool.compacting() {
+            return true;
+        }
+        if self.pool.plan_compaction_for(run, pieces).is_none() {
+            return false;
+        }
+        self.compact_for = Some((run, pieces));
+        true
+    }
+
+    /// Whether the compaction [`Self::compaction_comes`] asked is on its
+    /// way: its moves fenced, or its runs still short and a plan for them
+    /// there for the walk to make. One that no plan can make any more is
+    /// not (its ask stays, read again by the next).
+    #[must_use]
+    pub fn compaction_under_way(&self) -> bool {
+        let Some((run, pieces)) = self.compact_for else {
+            return false;
+        };
+        self.walk_target.is_some()
+            && self.pool.free_chunk_runs(run) < pieces
+            && (self.pool.compacting() || self.pool.plan_compaction_for(run, pieces).is_some())
+    }
+
+    /// The engine took a compaction's copy (planned to ride the fire at
+    /// `planned`) and waits it out: its chunks' fence lifts once the fires
+    /// handed out by `current` retire, at once on an idle pool.
+    pub fn compaction_copied(&mut self, planned: u64, current: u64) {
+        self.pool.compaction_copied(planned, current);
+        self.refused_moving.clear();
+    }
+
+    /// The engine refused a fire for the state in logical chunks `chunks`
+    /// (`engine::Error::Placement`): the walk moves it down.
+    pub fn refuse_chunks(&mut self, chunks: &[u32]) {
+        self.refused.extend(chunks.iter().copied());
+    }
+
+    /// How many of `chunks` the last step found no free chunk below for:
+    /// the free chunks the planner must make for them.
+    #[must_use]
+    pub fn refusals_stuck(&self, chunks: &[u32]) -> u32 {
+        u32::try_from(chunks.iter().filter(|chunk| self.refused_stuck.contains(chunk)).count())
+            .unwrap_or(u32::MAX)
+    }
+
+    /// Whether any of `chunks` still waits for its move down, or is being
+    /// moved: a fire refused for it is held until none is.
+    #[must_use]
+    pub fn refusals_pending(&self, chunks: &[u32]) -> bool {
+        chunks
+            .iter()
+            .any(|chunk| self.refused.contains(chunk) || self.refused_moving.contains(chunk))
+    }
+
+    /// A move of the refused chunks down below the state limit, applied
+    /// here as a compaction is, for the engine to copy before the next
+    /// fire (`SegmentMove::Compact`); `None` where none waits or another
+    /// compaction is under way.
+    fn refused_step(&mut self, epoch: u64) -> Option<SegmentMove> {
+        if self.refused.is_empty() || self.pool.compacting() {
+            return None;
+        }
+        let chunks: Vec<u32> = std::mem::take(&mut self.refused).into_iter().collect();
+        let moves = self.pool.plan_moves_of(&chunks);
+        // What found no free chunk below (and is still held) waits for the
+        // room the planner is asked to make ([`Self::refusals_stuck`]);
+        // what is no longer held is no longer waited for.
+        let moved: BTreeSet<u32> = moves.iter().map(|step| step.logical).collect();
+        let stuck: BTreeSet<u32> = chunks
+            .iter()
+            .copied()
+            .filter(|chunk| !moved.contains(chunk) && self.pool.holds_chunk(*chunk))
+            .collect();
+        self.refused.extend(stuck.iter().copied());
+        self.refused_stuck = stuck;
+        if moves.is_empty() {
+            return None;
+        }
+        self.pool
+            .apply_compaction(&moves, epoch)
+            .expect("a move planned under the lock applies");
+        self.refused_moving = moved;
+        Some(SegmentMove::Compact {
+            evacuation: engine_moves(&moves),
+            applied: moves,
+            epoch,
+        })
+    }
+
+    /// The engine refused a compaction before its copy: the pool takes it
+    /// back, and no other is planned for that bind.
+    pub fn compaction_refused(&mut self, moves: &[super::segments::ChunkMove]) {
+        self.pool.undo_compaction(moves);
+        self.compact_for = None;
+        // The engine refused the move of refused chunks: they wait for the
+        // next step, never dropped while a fire waits on them.
+        self.refused.extend(std::mem::take(&mut self.refused_moving));
+    }
+
+    /// The walk's next grow step toward `goal` mapped segments, `None`
+    /// where none maps a segment: the one place a grow is decided.
     /// [`Self::next_move`] takes it, and `SharedGrow::can_grow` tells a
-    /// waiter the pool grows exactly where it is `Some` for
-    /// [`GrowFor::Live`], so the planner never waits on a grow the walk
-    /// does not make.
+    /// waiter the pool grows exactly where it is `Some`, so the planner
+    /// never waits on a grow the walk does not make.
     ///
     /// The lowest uncommitted prefix segment the engine binds first. The
-    /// prefix whole, the span a lowered rung lends is backed next, before
-    /// state opens a chunk there, but never for a live waiter (live state
-    /// never opens in the top rung's span), and not while a refused commit
-    /// waits for room to be freed.
+    /// prefix whole, the span the rung lends is backed next (span lending,
+    /// [`SlotPool::span_lent`]), for a waiter short of live state as
+    /// for the target alone: a fire whose rung needs it takes it back
+    /// first. Not while a refused commit waits for room to be freed.
     #[must_use]
-    pub fn grow_step(&self, goal: u32, who: GrowFor) -> Option<GrowStep> {
+    pub fn grow_step(&self, goal: u32) -> Option<GrowStep> {
         if self.mapped_segments() >= goal {
             return None;
         }
@@ -2180,7 +2530,7 @@ impl SharedPool {
         if prefix < self.pool.top_segment() && self.pool.backs(prefix) {
             return Some(GrowStep::Commit { prefix: prefix + 1 });
         }
-        if who == GrowFor::Live || self.span_commit_blocked() {
+        if self.span_commit_blocked() {
             return None;
         }
         let n = self.pool.span_to_commit()?;
@@ -2240,12 +2590,6 @@ impl SharedPool {
     /// segment is committed and mapped again; nothing of it is released.
     pub fn evacuation_refused(&mut self, evacuation: &Evacuation) {
         self.pool.undo_evacuation(evacuation);
-    }
-
-    fn apply_evacuation(&mut self, evacuation: &Evacuation, epoch: u64) {
-        self.pool
-            .apply_evacuation(evacuation, epoch)
-            .expect("an evacuation planned under the lock applies");
     }
 
     /// A `commit_span` was refused (`true`): none is asked again until room

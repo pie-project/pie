@@ -54,6 +54,11 @@ fn shape(id: EngineShape, kind: SlotKind, slot_bytes: u64, role: SlotRole) -> Sl
 /// 4 KiB `Instance`, a 1 KiB `Channel` and a 64 KiB `Adapter` shape; 8
 /// host chunks.
 fn facts(roles: bool) -> ChunkFacts {
+    facts_with_list(roles, 64 * KIB)
+}
+
+/// [`facts`] with a kv list slot of `list` bytes.
+fn facts_with_list(roles: bool, list: u64) -> ChunkFacts {
     let mut shapes = vec![
         shape(
             LIST,
@@ -62,7 +67,7 @@ fn facts(roles: bool) -> ChunkFacts {
                 rate: 1,
                 window: None,
             },
-            64 * KIB,
+            list,
             SlotRole::State,
         ),
         shape(
@@ -542,6 +547,7 @@ fn a_park_and_unpark_moves_through_the_host_and_rebinds_the_new_refs() {
         }],
         adapter: Vec::new(),
         scratch: ::engine::ScratchPlace::None,
+        resident: ::engine::ScratchPlace::None,
         pair: ::engine::ScratchPlace::None,
         pair_generation: 0,
     }));
@@ -1193,6 +1199,55 @@ fn a_shared_adapter_is_one_set_of_slots_freed_at_the_last_close() {
     assert!(roles.lock().unwrap().slots(Owner::Adapter(7)).is_empty());
 }
 
+/// A shared adapter is its holders' while any of them may still fire: with
+/// one holder's park in flight, another's park leaves the adapter where it
+/// lies, so when the first park is taken back (the tier below full) its
+/// instance is resident on its adapter, never on slots given back (the
+/// pair's alias, the L40S's CUDA 700 on c8077be0f). Once every holder's
+/// park has landed, the adapter is parked where it lies, for a move down.
+#[test]
+fn a_shared_adapter_stays_while_a_holder_may_still_fire() {
+    let Pools { roles, .. } = pools();
+    let mut engine = adapting(7);
+    let _first = bind(&roles, &mut engine, Vec::new(), 1);
+    let _second = bind(&roles, &mut engine, Vec::new(), 2);
+    let was = engine.bindings[0].adapter_slots.clone();
+    let first = roles.lock().unwrap().prepare_park(holder(1)).unwrap();
+    let second = roles.lock().unwrap().prepare_park(holder(2)).unwrap();
+    assert!(
+        second.copies().iter().all(|copy| copy.shape != ADAPTER),
+        "a holder on its way keeps the adapter on the device"
+    );
+    roles.lock().unwrap().commit(second);
+    roles.lock().unwrap().abort(first);
+    assert_eq!(
+        roles.lock().unwrap().slots(Owner::Adapter(7)),
+        was,
+        "the resident holder's adapter where it lay"
+    );
+    // Both parks in flight at once, both landing: neither took the
+    // adapter, and once both have landed it is parked where it lies, live,
+    // room a move down takes.
+    let Pools { roles, .. } = pools();
+    let mut engine = adapting(7);
+    let _first = bind(&roles, &mut engine, Vec::new(), 1);
+    let _second = bind(&roles, &mut engine, Vec::new(), 2);
+    let was = engine.bindings[0].adapter_slots.clone();
+    let first = roles.lock().unwrap().prepare_park(holder(1)).unwrap();
+    let second = roles.lock().unwrap().prepare_park(holder(2)).unwrap();
+    roles.lock().unwrap().commit(first);
+    assert!(
+        roles.lock().unwrap().parked_chunk_slots(holder(3)).is_empty(),
+        "a holder still on its way: not parked yet"
+    );
+    roles.lock().unwrap().commit(second);
+    assert_eq!(roles.lock().unwrap().slots(Owner::Adapter(7)), was, "kept, live");
+    assert!(
+        !roles.lock().unwrap().parked_chunk_slots(holder(3)).is_empty(),
+        "parked where it lies: room a move down takes"
+    );
+}
+
 #[test]
 fn a_shared_adapter_parks_only_once_every_holder_has() {
     let Pools {
@@ -1446,6 +1501,7 @@ fn an_instance_closed_between_a_restore_and_its_rebind_is_not_rebound() {
             rings: Vec::new(),
             adapter: Vec::new(),
             scratch: ::engine::ScratchPlace::None,
+            resident: ::engine::ScratchPlace::None,
             pair: ::engine::ScratchPlace::None,
             pair_generation: 0,
         })
@@ -1530,4 +1586,233 @@ fn a_park_gives_an_instance_s_slots_back_at_once_to_the_next_owner() {
         "the parked instance's tables are another owner's at once"
     );
     device.lock().unwrap().give_refs(shape, &taken);
+}
+
+/// The disk tier's slot file as a fake: whole free chunks taken and given
+/// back.
+#[derive(Default)]
+pub(super) struct FakeDisk(Mutex<Vec<u32>>, std::sync::atomic::AtomicUsize);
+
+impl FakeDisk {
+    pub(super) fn with(chunks: u32) -> Arc<Self> {
+        Arc::new(Self(Mutex::new((0..chunks).collect()), Default::default()))
+    }
+
+    /// The chunks taken now.
+    fn taken(&self) -> usize {
+        self.1.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl super::DiskSlots for FakeDisk {
+    /// The lowest free chunks.
+    fn take_chunks(&self, n: usize) -> Option<Vec<u32>> {
+        let mut free = self.0.lock().unwrap();
+        if free.len() < n {
+            return None;
+        }
+        free.sort_unstable();
+        let taken: Vec<u32> = free.drain(..n).collect();
+        self.1.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        Some(taken)
+    }
+
+    fn give_chunks(&self, chunks: &[u32]) {
+        self.1
+            .fetch_sub(chunks.len(), std::sync::atomic::Ordering::Relaxed);
+        self.0.lock().unwrap().extend_from_slice(chunks);
+    }
+}
+
+/// The M1 shape, a load on unified memory: no host tier. A park sends an
+/// instance's tables and rings straight to the disk tier's slot file, a
+/// slot of it a role slot, freeing every device slot; the restore copies
+/// them back into fresh device slots and gives the file's slots back. Left
+/// on the device at the park (the M1 on 0d96fb179: 379 opened chunks of the
+/// Instance shape after 107 evictions, no move down ever asked), they held
+/// their chunks. With no slot file either, nothing below holds them: they
+/// stay, and are no movable room.
+#[test]
+fn with_no_host_tier_parked_role_slots_go_down_to_disk_and_come_back() {
+    let facts = facts(true);
+    let device = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
+    let roles: RolesHandle = Arc::new(Mutex::new(Roles::new(&device, None).unwrap()));
+    let disk = FakeDisk::with(64);
+    roles.lock().unwrap().set_disk(disk.clone());
+    let mut engine = FakeEngine::default();
+    let before = held(&device);
+    let channel = registered(&roles, &mut engine, 1, 1);
+    let instance = bind(&roles, &mut engine, vec![channel], 1);
+    let resident = held(&device);
+    let was = roles.lock().unwrap().slots(Owner::Instance(instance));
+
+    let park = roles.lock().unwrap().prepare_park(holder(1)).unwrap();
+    assert!(park.copies().iter().all(|copy| copy.disk), "to the slot file at the park");
+    assert_eq!(
+        park.copies().iter().map(|copy| copy.host.len()).sum::<usize>(),
+        3 + 3 + 2,
+        "the instance's tables and ring, and the channel's ring"
+    );
+    roles.lock().unwrap().commit(park);
+    assert_eq!(held(&device), before, "every device slot is free");
+    assert!(disk.taken() > 0, "disk chunks of the roles' own shapes hold them");
+    assert!(roles.lock().unwrap().parked_chunk_slots(holder(2)).is_empty());
+
+    let unpark = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(1))
+        .unwrap()
+        .expect("it comes back");
+    assert!(unpark.copies().iter().all(|copy| copy.disk), "from the slot file");
+    roles.lock().unwrap().commit(unpark);
+    assert_eq!(disk.taken(), 0, "the file's slots are back");
+    assert_eq!(held(&device), resident);
+    assert_eq!(roles.lock().unwrap().stale(holder(1)).len(), 2, "both rebound");
+    assert_eq!(roles.lock().unwrap().slots(Owner::Instance(instance)).len(), was.len());
+
+    // Parked again and closed while on disk: its file slots go back.
+    let park = roles.lock().unwrap().prepare_park(holder(1)).unwrap();
+    roles.lock().unwrap().commit(park);
+    roles.lock().unwrap().close_instance(instance);
+    roles.lock().unwrap().close_channel(channel);
+    assert_eq!(disk.taken(), 0);
+    assert_eq!(held(&device), before);
+
+    // No slot file either: nothing below holds them, no movable room.
+    let bare: RolesHandle = Arc::new(Mutex::new(Roles::new(&device, None).unwrap()));
+    let mut engine = FakeEngine::default();
+    bind(&bare, &mut engine, Vec::new(), 3);
+    let park = bare.lock().unwrap().prepare_park(holder(3)).unwrap();
+    bare.lock().unwrap().commit(park);
+    assert!(bare.lock().unwrap().parked_chunk_slots(holder(4)).is_empty());
+    assert!(bare.lock().unwrap().prepare_park_down(&[holder(3)], true).txn.is_none());
+}
+
+/// A discrete load whose host is full at the park (or a host tier of no
+/// room, as a budget of a few MiB seats): the live parts go to the disk
+/// tier's slot file rather than stay on the device, and come back from it.
+/// With host room, they go to the host.
+#[test]
+fn with_the_host_full_parked_role_slots_go_to_disk() {
+    let Pools {
+        device,
+        host,
+        roles,
+    } = pools();
+    let disk = FakeDisk::with(64);
+    roles.lock().unwrap().set_disk(disk.clone());
+    let mut engine = FakeEngine::default();
+    let before = held(&device);
+    let instance = bind(&roles, &mut engine, Vec::new(), 1);
+    let resident = held(&device);
+    // Host kv fills the host.
+    let list = host.lock().unwrap().list().unwrap().pool;
+    let free = host.lock().unwrap().pool().available(list);
+    let kv = host.lock().unwrap().take_refs(list, free).unwrap();
+
+    let park = roles.lock().unwrap().prepare_park(holder(1)).unwrap();
+    assert!(park.copies().iter().all(|copy| copy.disk), "no host room: to the slot file");
+    roles.lock().unwrap().commit(park);
+    assert_eq!(held(&device), before, "every device slot is free");
+    assert!(disk.taken() > 0);
+    let unpark = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(1))
+        .unwrap()
+        .unwrap();
+    roles.lock().unwrap().commit(unpark);
+    assert_eq!(disk.taken(), 0, "the file's slots are back");
+    assert_eq!(held(&device), resident);
+
+    // Host room: to the host.
+    host.lock().unwrap().give_refs(list, &kv);
+    let park = roles.lock().unwrap().prepare_park(holder(1)).unwrap();
+    assert!(park.copies().iter().all(|copy| !copy.disk), "to the host");
+    roles.lock().unwrap().commit(park);
+    assert!(held(&host) > 0);
+    let unpark = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(1))
+        .unwrap()
+        .unwrap();
+    roles.lock().unwrap().commit(unpark);
+    assert_eq!(held(&host), 0);
+    roles.lock().unwrap().close_instance(instance);
+    assert_eq!(held(&device), before);
+}
+
+/// A load with no host tier whose role slots are wider than a kv slot
+/// (Metal: an instance's state far past a kv page): each still parks to
+/// disk, whole, in a run of adjacent slots of the file its bytes take (a
+/// 4 KiB Instance slot in four 1 KiB kv slots), and restores whole; the
+/// file's slots all come back. Refused only where the file has no such
+/// runs left: it stays parked on the device.
+#[test]
+fn a_role_slot_wider_than_a_kv_slot_parks_to_disk_in_a_run_and_restores_whole() {
+    let facts = facts_with_list(true, KIB);
+    let device = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
+    let roles: RolesHandle = Arc::new(Mutex::new(Roles::new(&device, None).unwrap()));
+    let mut engine = FakeEngine::default();
+    let before = held(&device);
+    let instance = bind(&roles, &mut engine, Vec::new(), 1);
+    let resident = held(&device);
+    let park = roles.lock().unwrap().prepare_park(holder(1)).unwrap();
+    roles.lock().unwrap().commit(park);
+
+    // Too small a file: the move is refused whole, nothing taken.
+    let small = FakeDisk::with(0);
+    roles.lock().unwrap().set_disk(small.clone());
+    assert!(
+        roles.lock().unwrap().prepare_park_down(&[holder(1)], true).txn.is_none(),
+        "no file room for it: it stays"
+    );
+    assert_eq!(small.taken(), 0);
+
+    let disk = FakeDisk::with(64);
+    roles.lock().unwrap().set_disk(disk.clone());
+    let down = roles
+        .lock()
+        .unwrap()
+        .prepare_park_down(&[holder(1)], true)
+        .txn
+        .expect("wider slots go to disk too");
+    let tables = down
+        .copies()
+        .iter()
+        .find(|copy| copy.shape == INSTANCE)
+        .expect("the tables")
+        .clone();
+    assert!(tables.disk);
+    assert_eq!(tables.device.len(), 3, "a disk ref a role slot");
+    let mut refs = tables.host.clone();
+    refs.sort_unstable();
+    refs.dedup();
+    assert_eq!(refs.len(), 3, "each its own slot of an Instance disk chunk: {:?}", tables.host);
+    let rings: usize = down
+        .copies()
+        .iter()
+        .filter(|copy| copy.shape == CHANNEL)
+        .map(|copy| copy.host.len())
+        .sum();
+    assert!(rings > 0, "its own rings too");
+    roles.lock().unwrap().commit(down);
+    assert_eq!(held(&device), before);
+    // The tables in a disk chunk of the Instance shape, its own rings in
+    // one of the Channel shape: laid out as on the device.
+    assert_eq!(disk.taken(), 2, "a disk chunk for each role shape");
+
+    let unpark = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(1))
+        .unwrap()
+        .unwrap();
+    roles.lock().unwrap().commit(unpark);
+    assert_eq!(disk.taken(), 0, "every run back");
+    assert_eq!(held(&device), resident);
+    roles.lock().unwrap().close_instance(instance);
+    assert_eq!(held(&device), before);
 }

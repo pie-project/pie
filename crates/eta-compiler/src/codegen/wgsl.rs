@@ -22,8 +22,9 @@ pub const SELECT_WORDS: u32 = 10320;
 /// node of `tag` whose first argument holds `len` elements in `rows` rows,
 /// as its cells lay them: a sort, a top-k or a pivot two buffers of two
 /// words an element of that argument (`sort_cell`; a pivot's `pivot_*`
-/// lie within them), a reduction two buffers of two words a 32-element
-/// group of each row (`tmp_v`), any other node none. Saturates past a
+/// lie within them), a reduction two buffers of two words a group of each
+/// row its first level folds (`tmp_v`; 32 elements, a `gumbel_argmax`'s 8:
+/// `steps::first_fan`), any other node none. Saturates past a
 /// `u64`, which no scratch holds.
 #[must_use]
 pub const fn temporary_bytes(tag: u8, len: u64, rows: u64) -> u64 {
@@ -31,7 +32,7 @@ pub const fn temporary_bytes(tag: u8, len: u64, rows: u64) -> u64 {
         len.saturating_mul(16)
     } else if is_reduce(tag) {
         let rows = if rows == 0 { 1 } else { rows };
-        rows.saturating_mul((len / rows).div_ceil(32))
+        rows.saturating_mul((len / rows).div_ceil(steps::first_fan(tag)))
             .saturating_mul(16)
     } else {
         0
@@ -112,6 +113,7 @@ pub fn emits(tag: u8) -> bool {
             | tags::REDUCE_MAX
             | tags::REDUCE_MIN
             | tags::REDUCE_ARGMAX
+            | tags::GUMBEL_ARGMAX
             | tags::CUMSUM
             | tags::CUMPROD
             | tags::BROADCAST
@@ -208,6 +210,7 @@ fn reduce_kind(tag: u8) -> Option<&'static str> {
         tags::REDUCE_MAX => Some("RED_MAX"),
         tags::REDUCE_MIN => Some("RED_MIN"),
         tags::REDUCE_ARGMAX => Some("RED_ARGMAX"),
+        tags::GUMBEL_ARGMAX => Some("RED_GUMBEL"),
         _ => None,
     }
 }
@@ -400,7 +403,17 @@ pub struct Stepwise {
 /// area its config table named.
 /// 6: a reshape that covers its source is read as its source whatever the
 /// stage's channel slots number, and launches nothing.
-pub const WGSL_STEP_EMITTER_VERSION: u16 = 6;
+/// 7: `bf16` values (`DT_BF16`, wire tag 5): loaded a half of a word,
+/// computed in f32, and stored rounded to nearest even a word at a time,
+/// an invocation owning both elements of every word it writes.
+/// 8: `gumbel_argmax` (`RED_GUMBEL`): a reduce ladder whose first level
+/// makes each Gumbel-perturbed lane in f32 from the logits, the keep mask,
+/// the scale and the keyed rng, with no noise row.
+/// 9: a `gumbel_argmax`'s first level folds 8 lanes a job, not 32
+/// (`red_fan0`), so its hashes spread over four times the invocations.
+/// 10: a `gumbel_argmax` lane multiplies its logit by the op's `scale`
+/// (the temperature's reciprocal) where it divided by a divisor.
+pub const WGSL_STEP_EMITTER_VERSION: u16 = 10;
 
 /// The binding of the record a step module reads its node, rung, selector
 /// and bases from ([`StepUniform`]), beside the runtime's (0, 1 and 4): a
@@ -421,12 +434,48 @@ fn calls() -> Vec<Call> {
     steps::calls_of(stepped)
 }
 
+/// The jobs call `call` of [`step_calls`] runs at `rung` over its node's
+/// first operand (`len` elements in `rows` rows): its grid-stride loop's
+/// bound, where that is not the operand's length. A reduction's level runs
+/// a job a group of `fan` inputs it folds (`op_reduce_level`: `rows *
+/// n_out`), and its finish a job a row (`op_reduce_finish`). `None` for a
+/// call whose loop bound is its widest value's length, which a stage's grid
+/// is already sized by. The WGSL these mirror is pinned
+/// (`the_job_counts_mirror_the_runtime`): a change there fails that test.
+#[must_use]
+pub fn step_jobs(call: u32, rung: u32, len: u32, rows: u32) -> Option<u64> {
+    let rows = rows.max(1);
+    let row = len / rows;
+    match calls().get(call as usize)? {
+        Call::ReduceLevel(reduce) => {
+            // `red_n_in`: the row folded by each level below this one.
+            let fan0 = if matches!(reduce, Reduce::GumbelArgmax) {
+                8
+            } else {
+                32
+            };
+            let fan_at = |level: u32| if level == 0 { fan0 } else { 32 };
+            let mut n_in = row;
+            for level in 0..rung {
+                n_in = n_in.div_ceil(fan_at(level));
+            }
+            if n_in <= 1 {
+                return Some(0);
+            }
+            Some(u64::from(rows) * u64::from(n_in.div_ceil(fan_at(rung))))
+        }
+        Call::ReduceFinish(_) => Some(u64::from(rows)),
+        _ => None,
+    }
+}
+
 fn reduce_name(reduce: Reduce) -> &'static str {
     match reduce {
         Reduce::Sum => "RED_SUM",
         Reduce::Max => "RED_MAX",
         Reduce::Min => "RED_MIN",
         Reduce::Argmax => "RED_ARGMAX",
+        Reduce::GumbelArgmax => "RED_GUMBEL",
     }
 }
 
@@ -1074,6 +1123,9 @@ mod stepwise_tests {
             assert_eq!(temporary_bytes(tag, 4 * 151_936, 4), 4 * 4748 * 16);
             assert_eq!(temporary_bytes(tag, 5, 0), 16, "a row of one group");
         }
+        // A draw's first level folds 8 lanes a job.
+        assert_eq!(temporary_bytes(tags::GUMBEL_ARGMAX, 151_936, 1), 18_992 * 16);
+        assert_eq!(temporary_bytes(tags::GUMBEL_ARGMAX, 4 * 151_936, 4), 4 * 18_992 * 16);
         assert_eq!(temporary_bytes(tags::ADD, 151_936, 1), 0);
         assert_eq!(temporary_bytes(tags::SORT_DESC, u64::MAX, 1), u64::MAX);
         assert!(selects(tags::PIVOT_THRESHOLD));
@@ -1343,5 +1395,235 @@ mod select_tests {
         // State, a histogram per workgroup, a tally pair per workgroup, and
         // the candidates' keys and indices.
         assert_eq!(SELECT_WORDS, 16 + 32 * 256 + 32 * 2 + 1024 * 2);
+    }
+}
+
+/// The runtime's `bf16` stores, read from its text: no two invocations
+/// write one word, and every op whose result may be `bf16` stores it so.
+#[cfg(test)]
+mod bf16_store_tests {
+    use super::RUNTIME;
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    /// Each runtime function's name and body.
+    fn functions() -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut current: Option<(String, String)> = None;
+        for line in RUNTIME.lines() {
+            if let Some(rest) = line.strip_prefix("fn ") {
+                if let Some(done) = current.take() {
+                    out.push(done);
+                }
+                let name = rest.split('(').next().unwrap_or("").trim().into();
+                current = Some((name, String::new()));
+            } else if let Some((_, body)) = current.as_mut() {
+                body.push_str(line);
+                body.push('\n');
+            }
+        }
+        out.extend(current);
+        out
+    }
+
+    /// The ops whose result may be `bf16` (`eta_ir::infer`): every one
+    /// that stores a float result an element at a time, but a reduction's,
+    /// a product's, an rng's, a constant's and an iota's, which are never
+    /// `bf16`.
+    const NEVER_BF16: &[&str] = &[
+        "op_reduce_finish",
+        "op_matmul",
+        "op_rng",
+        "op_const",
+        "op_iota",
+    ];
+
+    #[test]
+    fn a_bf16_word_is_one_invocation_s() {
+        let functions = functions();
+        let mut storers = 0;
+        for (name, body) in &functions {
+            let stores_h = body.contains("st_h_word(");
+            if name == "st_h_word" {
+                // The one store: a whole word, both halves.
+                assert!(body.contains("hst(base(v) + w, packed)"), "{body}");
+                assert!(body.contains("w * 2u + 1u < n"), "the padding half is the value's");
+                continue;
+            }
+            if stores_h {
+                storers += 1;
+                // An invocation strides over words (or rows of whole words,
+                // the scan), never over elements.
+                let by_words = body.contains("< h_words(") && body.contains("= w + lanes")
+                    || body.contains("< h_words(") && body.contains("= w2 + lanes");
+                let by_groups = name == "op_cumulative" && body.contains("g < groups");
+                assert!(
+                    by_words || by_groups,
+                    "`{name}` stores bf16 words but does not hand an invocation whole words"
+                );
+                // A bf16 branch stores nothing an element at a time.
+                let branch = body
+                    .split("DT_BF16")
+                    .nth(1)
+                    .and_then(|rest| rest.split("return;").next())
+                    .unwrap_or("");
+                for single in ["st_f(o", "st_as_f(o", "st_raw(o", "st_i(o", "hst(base(o)"] {
+                    assert!(
+                        !branch.contains(single),
+                        "`{name}`'s bf16 branch stores an element alone (`{single}`)"
+                    );
+                }
+            } else if (body.contains("st_f(o,") || body.contains("st_as_f(o,"))
+                && !NEVER_BF16.contains(&name.as_str())
+            {
+                panic!("`{name}` stores a float result with no bf16 word store");
+            }
+        }
+        assert!(storers >= 12, "{storers} ops store bf16 words");
+    }
+
+    #[test]
+    fn the_runtime_rounds_as_the_ir_does() {
+        // The runtime's rounding, transcribed: it must be eta_ir's.
+        fn wgsl_round(x: f32) -> u32 {
+            let b = x.to_bits();
+            if (b & 0x7FFF_FFFF) > 0x7F80_0000 {
+                return ((b >> 16) | 0x40) & 0xFFFF;
+            }
+            b.wrapping_add(0x7FFF + ((b >> 16) & 1)) >> 16
+        }
+        assert!(RUNTIME.contains("return (b + 0x7FFFu + ((b >> 16u) & 1u)) >> 16u;"));
+        assert!(RUNTIME.contains("return ((b >> 16u) | 0x40u) & 0xFFFFu;"));
+        assert!(RUNTIME.contains("const DT_BF16 : u32 = 5u;"));
+        assert_eq!(u32::from(eta_ir::types::WIRE_BF16), 5);
+        let mut x = 0x0001_2345u32;
+        for _ in 0..100_000 {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            let f = f32::from_bits(x);
+            assert_eq!(
+                wgsl_round(f),
+                u32::from(eta_ir::types::bf16_bits(f)),
+                "{x:#010x}"
+            );
+        }
+    }
+
+    /// A word-pair store over a value of `n` elements, as the runtime's
+    /// loops run it with `lanes` invocations: every element stored once, by
+    /// the invocation that owns its word, and nothing past the value's words.
+    #[test]
+    fn word_pairs_cover_a_value_of_any_length_once() {
+        for n in [1u32, 2, 3, 7, 8, 151_935, 151_936] {
+            for lanes in [1u32, 3, 256] {
+                let words = n.div_ceil(2);
+                let mut owner = alloc::vec![u32::MAX; words as usize];
+                let mut stored = alloc::vec![0u8; n as usize];
+                for tid in 0..lanes.min(words) {
+                    let mut w = tid;
+                    while w < words {
+                        assert_eq!(owner[w as usize], u32::MAX, "word {w} written twice");
+                        owner[w as usize] = tid;
+                        stored[(w * 2) as usize] += 1;
+                        if w * 2 + 1 < n {
+                            stored[(w * 2 + 1) as usize] += 1;
+                        }
+                        w += lanes;
+                    }
+                }
+                assert!(stored.iter().all(|&c| c == 1), "n {n}, lanes {lanes}");
+                assert!(owner.iter().all(|&o| o != u32::MAX));
+            }
+        }
+    }
+
+    /// The scan's invocations: a row of whole words each, or two rows
+    /// where a row is an odd number of elements, so a word two rows share
+    /// is one invocation's.
+    #[test]
+    fn a_scan_s_groups_begin_and_end_on_a_word() {
+        for len in [1u32, 2, 3, 5, 8] {
+            for rows in [1u32, 2, 3, 7] {
+                let group = if len % 2 == 0 { 1 } else { 2 };
+                let total = rows * len;
+                let groups = rows.div_ceil(group);
+                let mut owner = alloc::vec![u32::MAX; total.div_ceil(2) as usize];
+                for g in 0..groups {
+                    let first = g * group * len;
+                    let last = (first + group * len).min(total);
+                    assert_eq!(first % 2, 0, "a group begins on a word");
+                    assert!(last % 2 == 0 || last == total, "a group ends on a word");
+                    for at in first..last {
+                        let w = (at / 2) as usize;
+                        assert!(owner[w] == u32::MAX || owner[w] == g, "word {w} shared");
+                        owner[w] = g;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod job_tests {
+    use super::{Call, RUNTIME, Reduce, calls, step_jobs};
+
+    fn index(call: Call) -> u32 {
+        u32::try_from(
+            calls()
+                .iter()
+                .position(|c| *c == call)
+                .expect("the call is in the closed set"),
+        )
+        .expect("a call index fits a u32")
+    }
+
+    /// A vocab-wide argmax row: level 0 folds 32 inputs a job, each level
+    /// above 32 of the last's outputs, down to one; its finish a job a row;
+    /// the Gumbel argmax folds 8 at level 0; a call sized by its operand
+    /// states none.
+    #[test]
+    fn a_reduction_runs_a_job_a_group_it_folds_and_its_finish_a_row() {
+        let level = index(Call::ReduceLevel(Reduce::Argmax));
+        let rows = 2;
+        let len = 248_320 * rows;
+        assert_eq!(step_jobs(level, 0, len, rows), Some(2 * 7760));
+        assert_eq!(step_jobs(level, 1, len, rows), Some(2 * 243));
+        assert_eq!(step_jobs(level, 2, len, rows), Some(2 * 8));
+        assert_eq!(step_jobs(level, 3, len, rows), Some(2));
+        assert_eq!(step_jobs(level, 4, len, rows), Some(0));
+        let gumbel = index(Call::ReduceLevel(Reduce::GumbelArgmax));
+        assert_eq!(step_jobs(gumbel, 0, len, rows), Some(2 * 31_040));
+        assert_eq!(step_jobs(gumbel, 1, len, rows), Some(2 * 970));
+        let finish = index(Call::ReduceFinish(Reduce::Argmax));
+        assert_eq!(step_jobs(finish, 0, len, rows), Some(2));
+        assert_eq!(step_jobs(index(Call::Arith), 0, len, rows), None);
+    }
+
+    /// The WGSL `step_jobs` mirrors, line for line: where the runtime's
+    /// loop bounds or fans change, this fails, and `step_jobs` follows.
+    #[test]
+    fn the_job_counts_mirror_the_runtime() {
+        for line in [
+            "fn red_fan0(kind : u32) -> u32 { return select(32u, 8u, kind == RED_GUMBEL); }",
+            "    let fan = select(32u, red_fan0(kind), l == 0u);",
+            "    n = (n + fan - 1u) / fan;",
+            "  let n_in = red_n_in(len, kind, level);",
+            "  if (n_in <= 1u) { return; }",
+            "  let fan = select(32u, red_fan0(kind), level == 0u);",
+            "  let n_out = (n_in + fan - 1u) / fan;",
+            "  let total = rows * n_out;",
+            "  for (var job : u32 = tid; job < total; job = job + lanes) {",
+            "  for (var row : u32 = tid; row < rows; row = row + lanes) {",
+            "  let len = d_len(a) / max(rows, 1u);",
+            "  if (rank < 2u) { return 1u; }",
+            "  for (var k : u32 = 0u; k + 1u < rank; k = k + 1u) { n = n * d_dim(v, k); }",
+        ] {
+            assert!(
+                RUNTIME.lines().any(|have| have == line),
+                "the runtime no longer reads `{line}`: step_jobs mirrors it"
+            );
+        }
     }
 }

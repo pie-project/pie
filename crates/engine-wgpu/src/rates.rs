@@ -23,10 +23,10 @@ pub fn provenance(device: &str) -> (&'static str, String) {
 }
 
 /// The bound the platform states on one GPU submission, the same the
-/// native Vulkan engine states ([`engine_gpu::rates::STATED_SUBMIT_BOUND`]):
+/// native Vulkan engine states ([`engine_gpu::rates::stated_submit_bound`]):
 /// wgpu submits through the same driver, whose watchdog loses the device
 /// past it.
-pub use engine_gpu::rates::STATED_SUBMIT_BOUND;
+pub use engine_gpu::rates::stated_submit_bound;
 
 /// `tuning` with every roofline constant stated
 /// (`engine::rates::rates_at_load`, every engine's rule): as its layers
@@ -50,9 +50,10 @@ pub fn at_load(
         provenance: provenance(&measured.name),
         registry: crate::chip::registry(),
     });
+    let keys = engine_gpu::rates::keys_at(max_submit);
     let chip = engine::rates::rates_at_load(
         chip,
-        &engine_gpu::rates::keys_at(max_submit),
+        &keys,
         save,
         Some(device.left()),
         max_submit,
@@ -62,8 +63,19 @@ pub fn at_load(
         call: "rates at load",
         why,
     })?;
-    Ok(crate::tuning::Tuning::new(chip, device.cores())
-        .with_workgroup_bytes(device.workgroup_bytes()))
+    let tuning = crate::tuning::Tuning::new(chip).with_workgroup_bytes(device.workgroup_bytes());
+    let resident = tuning
+        .resident()
+        .ok_or_else(|| engine_gpu::error::Fault::Device {
+            call: "rates at load",
+            why: "the profile states no [rates] resident_workgroups after the rates step".into(),
+        })?;
+    device.hold_resident(resident);
+    tracing::info!(
+        resident,
+        "the workgroups the device holds at once, as its profile states them"
+    );
+    Ok(tuning)
 }
 
 /// The rates of `device` that `stated` lacks (every one where it states
@@ -105,22 +117,28 @@ pub fn measure_saying(
 mod tests {
     use std::time::Duration;
 
-    use super::STATED_SUBMIT_BOUND;
+    use super::stated_submit_bound;
 
-    /// On Android a wgpu load's rates step measures under KGSL's stated 2 s
-    /// (the Rig's admission refuses a frame estimated past it); elsewhere no
-    /// bound is stated; and the load's bound is this platform's.
+    /// A load's rates step measures under the platform's stated bound (the
+    /// Rig's admission refuses a frame estimated past it): KGSL's 2 s on
+    /// Android; on Windows the timeout detection's `TdrDelay` (2 where the
+    /// registry states none, none where detection is off); none elsewhere.
     #[test]
-    fn an_android_device_measures_under_the_drivers_stated_bound() {
-        let android = engine_gpu::rates::stated_submit_bound(true);
-        assert_eq!(android, Some(Duration::from_secs(2)));
-        let admission = engine::rates::Admission::new(android);
+    fn a_load_measures_under_the_platforms_stated_bound() {
+        let two = Some(Duration::from_secs(2));
+        assert_eq!(engine_gpu::rates::tdr_bound(None, None), two);
+        assert_eq!(
+            engine_gpu::rates::tdr_bound(Some(3), Some(8)),
+            Some(Duration::from_secs(8))
+        );
+        assert_eq!(engine_gpu::rates::tdr_bound(Some(0), Some(8)), None);
+        let admission = engine::rates::Admission::new(two);
         assert!(admission.fits(Some(1.5e9)));
         assert!(!admission.fits(Some(2.5e9)));
-        assert_eq!(engine_gpu::rates::stated_submit_bound(false), None);
-        assert_eq!(
-            STATED_SUBMIT_BOUND,
-            engine_gpu::rates::stated_submit_bound(cfg!(target_os = "android"))
-        );
+        if cfg!(target_os = "android") {
+            assert_eq!(stated_submit_bound(), two);
+        } else if !cfg!(windows) {
+            assert_eq!(stated_submit_bound(), None);
+        }
     }
 }

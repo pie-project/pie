@@ -32,8 +32,33 @@ pub(crate) struct ControlCompletion {
 }
 
 struct ControlCompletionState {
-    result: Mutex<Option<std::result::Result<(), String>>>,
+    result: Mutex<Option<std::result::Result<(), (String, Refused)>>>,
     notify: tokio::sync::Notify,
+}
+
+/// An engine refused a control (a copy) before reading or writing any of
+/// it: its submission was impossible as stated (`engine::Error::Impossible`).
+/// What it would have moved lies where it lay.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct RefusedUntouched(pub String);
+
+/// A copy down a tier failed writing to that tier because it is full
+/// (`engine::Error::TierFull`): nothing on the device changed, so it is
+/// refused untouched too, and the waiter takes the move back by name.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct TierBelowFull(pub String);
+
+/// How an engine refused a control, read from its error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Refused {
+    /// It failed: what it moved may be partly written.
+    Failed,
+    /// Refused before reading or writing any of it.
+    Untouched,
+    /// The tier it copied down to is full; nothing on the device changed.
+    TierFull,
 }
 
 impl ControlCompletion {
@@ -49,23 +74,40 @@ impl ControlCompletion {
     pub(crate) async fn wait(&self) -> Result<()> {
         loop {
             if let Some(result) = self.inner.result.lock().unwrap().clone() {
-                return result.map_err(anyhow::Error::msg);
+                return result.map_err(Self::error);
             }
             let notified = self.inner.notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             if let Some(result) = self.inner.result.lock().unwrap().clone() {
-                return result.map_err(anyhow::Error::msg);
+                return result.map_err(Self::error);
             }
             notified.await;
         }
     }
 
+    fn error((message, refused): (String, Refused)) -> anyhow::Error {
+        match refused {
+            Refused::Untouched => anyhow::Error::new(RefusedUntouched(message)),
+            Refused::TierFull => anyhow::Error::new(TierBelowFull(message)),
+            Refused::Failed => anyhow::Error::msg(message),
+        }
+    }
+
     fn resolve(&self, result: &Result<()>) {
-        let result = result
-            .as_ref()
-            .map(|_| ())
-            .map_err(|error| format!("{error:#}"));
+        let result = result.as_ref().map(|_| ()).map_err(|error| {
+            let refused = error
+                .chain()
+                .find_map(|cause| match cause.downcast_ref::<::engine::Error>() {
+                    Some(::engine::Error::TierFull(_)) => Some(Refused::TierFull),
+                    Some(::engine::Error::Impossible(_) | ::engine::Error::Placement { .. }) => {
+                        Some(Refused::Untouched)
+                    }
+                    _ => None,
+                })
+                .unwrap_or(Refused::Failed);
+            (format!("{error:#}"), refused)
+        });
         *self.inner.result.lock().unwrap() = Some(result);
         self.inner.notify.notify_waiters();
     }
@@ -106,7 +148,39 @@ pub(crate) fn clear_scheduler_handle(engine_id: usize) {
     }
 }
 
+// A test's own scheduler for an engine, on its thread alone
+// ([`worker::test_lane::TestLane`]): the copies and pool requests its
+// planner and stores submit reach the test, never a lane of another test.
+#[cfg(test)]
+thread_local! {
+    static TEST_HANDLES: std::cell::RefCell<Vec<(usize, SchedulerHandle)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Puts `handle` (or, `None`, takes it off) as `engine_id`'s scheduler on
+/// this thread only.
+#[cfg(test)]
+pub(crate) fn set_test_handle(engine_id: usize, handle: Option<SchedulerHandle>) {
+    TEST_HANDLES.with(|handles| {
+        let mut handles = handles.borrow_mut();
+        handles.retain(|(engine, _)| *engine != engine_id);
+        if let Some(handle) = handle {
+            handles.push((engine_id, handle));
+        }
+    });
+}
+
 pub(crate) fn scheduler_handle(engine_id: usize) -> Result<SchedulerHandle> {
+    #[cfg(test)]
+    if let Some(handle) = TEST_HANDLES.with(|handles| {
+        handles
+            .borrow()
+            .iter()
+            .find(|(engine, _)| *engine == engine_id)
+            .map(|(_, handle)| handle.clone())
+    }) {
+        return Ok(handle);
+    }
     handle_registry()
         .read()
         .unwrap()
@@ -294,16 +368,6 @@ pub(crate) async fn tap_groups(engine_id: usize) -> Result<Option<::engine::TapG
     Ok(groups)
 }
 
-pub fn configured_submit_deadline() -> Duration {
-    *SUBMIT_DEADLINE.get_or_init(|| Duration::from_micros(100_000))
-}
-
-pub fn set_submit_deadline(deadline: Duration) {
-    let _ = SUBMIT_DEADLINE.set(deadline);
-}
-
-static SUBMIT_DEADLINE: OnceLock<Duration> = OnceLock::new();
-
 pub fn configured_silence_timeout() -> Duration {
     *SILENCE_TIMEOUT.get_or_init(|| Duration::from_secs(600))
 }
@@ -332,8 +396,28 @@ pub fn configured_submit_depth() -> usize {
     ::engine::runahead::Runahead::unstaged(
         u8::try_from(configured_dispatch_depth()).unwrap_or(u8::MAX),
     )
-    .submit_depth()
+    .submit_depth(host_cover())
 }
+
+/// The frames a lane's guest turnaround hides behind past the ones in
+/// flight, as measured at load: the turnaround (a frame's landing to the
+/// lane's next submit) over one frame's device time, rounded up, on a warm
+/// run of the standard sampler before ready (`bootstrap`). The frame seal
+/// waits for every lane, so too little cover idles the device: at one frame
+/// of cover, 256 requests of 1024 in / 256 out on Gemma-4-31B held 378 of
+/// 525 seals with the device idle; at three, 17. 0 until measured (the
+/// prewarm's registrations compile the same code at any capacity, and the
+/// warm run itself runs at depth 1).
+pub fn host_cover() -> usize {
+    HOST_COVER.load(Ordering::Relaxed)
+}
+
+/// Sets the measured cover (bootstrap, before ready).
+pub fn set_host_cover(cover: usize) {
+    HOST_COVER.store(cover, Ordering::Relaxed);
+}
+
+static HOST_COVER: AtomicUsize = AtomicUsize::new(0);
 
 pub fn set_dispatch_depth(depth: usize) {
     frame::set_dispatch_depth(depth);
@@ -346,6 +430,11 @@ pub fn configured_dispatch_depth() -> usize {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReconfigureRefused {
     Busy(usize),
+    /// A frame size past the load's (its run-ahead window was laid for it).
+    PastCeiling {
+        asked: usize,
+        ceiling: usize,
+    },
 }
 
 impl std::fmt::Display for ReconfigureRefused {
@@ -356,34 +445,65 @@ impl std::fmt::Display for ReconfigureRefused {
                 "{n} process(es) still live; these knobs can only change while \
                  the runtime is idle"
             ),
+            Self::PastCeiling { asked, ceiling } => write!(
+                f,
+                "a frame size of {asked} is past the load's {ceiling}, which its \
+                 run-ahead window was laid for; load at the larger frame size"
+            ),
         }
     }
 }
 
 impl std::error::Error for ReconfigureRefused {}
 
-pub fn reconfigure(frame_size: usize, dispatch_depth: usize) -> Result<(), ReconfigureRefused> {
+/// Sets the frame size while the runtime is idle. The dispatch depth is
+/// the engines' stated frames in flight
+/// ([`::engine::Capabilities::frames_in_flight`]) and changes only with a
+/// load: a sweep over it reloads the engine at each depth.
+pub fn reconfigure(frame_size: usize) -> Result<(), ReconfigureRefused> {
     let live = crate::inferlet::process::live_count();
     if live > 0 {
         return Err(ReconfigureRefused::Busy(live));
     }
+    let ceiling = frame_ceiling();
+    if frame_size > ceiling {
+        return Err(ReconfigureRefused::PastCeiling {
+            asked: frame_size,
+            ceiling,
+        });
+    }
     set_frame_size(frame_size);
-    set_dispatch_depth(dispatch_depth);
     Ok(())
 }
+
+/// The load's largest frame size: the frame size it boots at, which its
+/// run-ahead window is laid for; a reconfigure stays at or under it.
+pub fn frame_ceiling() -> usize {
+    match FRAME_CEILING.load(Ordering::Relaxed) {
+        0 => configured_frame_size(),
+        k => k,
+    }
+}
+
+/// Sets the load's largest frame size (bootstrap, before any program).
+pub fn set_frame_ceiling(frame_size: usize) {
+    FRAME_CEILING.store(frame_size, Ordering::Relaxed);
+}
+
+static FRAME_CEILING: AtomicUsize = AtomicUsize::new(0);
 
 pub fn channel_capacity() -> usize {
     ::engine::runahead::Runahead::unstaged(
         u8::try_from(configured_dispatch_depth()).unwrap_or(u8::MAX),
     )
-    .channel_capacity(configured_frame_size())
+    .channel_capacity(host_cover(), configured_frame_size())
 }
 
 pub fn run_ahead_window() -> usize {
     ::engine::runahead::Runahead::unstaged(
         u8::try_from(configured_dispatch_depth()).unwrap_or(u8::MAX),
     )
-    .submit_depth()
+    .submit_depth(host_cover())
         * configured_frame_size()
 }
 
@@ -419,6 +539,17 @@ pub async fn spawn(engine_indices: &[usize], page_size: u32) -> Result<Scheduler
 }
 
 pub(crate) fn device_domain(engine_idx: usize) -> ::engine::MemoryDomain {
+    // A test's own lane names its device ([`worker::test_lane::TestLane`]).
+    #[cfg(test)]
+    if let Some(domain) = TEST_HANDLES.with(|handles| {
+        handles
+            .borrow()
+            .iter()
+            .find(|(engine, _)| *engine == engine_idx)
+            .map(|(_, handle)| handle.device_domain())
+    }) {
+        return domain;
+    }
     crate::engine::get_spec(engine_idx)
         .map_or(::engine::MemoryDomain::HostPinned, |s| s.device_domain)
 }
@@ -578,5 +709,43 @@ mod abort_tests {
             !freed.load(Ordering::SeqCst),
             "copies that did not settle keep their slots out"
         );
+    }
+}
+
+#[cfg(test)]
+mod refused_untouched_tests {
+    use super::*;
+
+    /// An engine refusing a copy as impossible (before reading or writing
+    /// any of it) is told apart from a copy that failed: the waiter can
+    /// take the move back rather than fail the process.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_copy_refused_as_impossible_is_told_untouched() {
+        let refused = ControlCompletion::new();
+        refused.resolve(&Err(anyhow::Error::new(::engine::Error::Impossible(
+            "state chunk 1936 lies inside the carve".into(),
+        ))
+        .context("kv to LocalDisk copy")));
+        let error = refused.wait().await.expect_err("refused");
+        assert!(error.downcast_ref::<RefusedUntouched>().is_some(), "{error:#}");
+        let failed = ControlCompletion::new();
+        failed.resolve(&Err(anyhow::anyhow!("device lost")));
+        let error = failed.wait().await.expect_err("failed");
+        assert!(error.downcast_ref::<RefusedUntouched>().is_none(), "{error:#}");
+    }
+
+    /// A copy down to a full disk tier (the slot file's write failing
+    /// with `StorageFull`) is told as the tier below full, nothing on the
+    /// device changed: never a failed copy, never a string.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_copy_to_a_full_tier_is_told_as_the_tier_below_full() {
+        let full = ControlCompletion::new();
+        full.resolve(&Err(anyhow::Error::new(::engine::Error::TierFull(
+            "the disk tier's slot file is full: No space left on device".into(),
+        ))
+        .context("kv to LocalDisk copy")));
+        let error = full.wait().await.expect_err("refused");
+        assert!(error.downcast_ref::<TierBelowFull>().is_some(), "{error:#}");
+        assert!(error.downcast_ref::<RefusedUntouched>().is_none(), "{error:#}");
     }
 }

@@ -37,6 +37,9 @@ pub enum Refusal {
     Closed { what: &'static str, id: u64 },
 
     Program(String),
+
+    /// A guest claims refusal ([`engine::guest_claims`]), by its own name.
+    Claimed(engine::guest_claims::Refusal),
 }
 
 impl std::fmt::Display for Refusal {
@@ -44,6 +47,19 @@ impl std::fmt::Display for Refusal {
         match self {
             Refusal::Closed { what, id } => write!(f, "{what} {id} is closed"),
             Refusal::Program(why) => f.write_str(why),
+            Refusal::Claimed(refusal) => write!(f, "`guest::claims` refused: {refusal}"),
+        }
+    }
+}
+
+impl Refusal {
+    /// A device fault as a refusal: a guest claims refusal by its own name,
+    /// any other as the program's.
+    #[must_use]
+    pub fn fault(fault: crate::error::Fault) -> Refusal {
+        match fault {
+            crate::error::Fault::Claimed(refusal) => Refusal::Claimed(refusal),
+            other => Refusal::Program(other.to_string()),
         }
     }
 }
@@ -100,6 +116,93 @@ pub fn adopt(registration: &ProgramRegistration) -> Prepared {
     Ok(Adopted { plan, form })
 }
 
+/// What a load's prewarm of programs adopted ([`prewarm`]): every program
+/// lowered as its registration lowers it.
+pub struct Prewarmed {
+    pub programs: usize,
+
+    pub stages: usize,
+
+    /// The step calls their stages dispatch, each once: each a pipeline the
+    /// load must have built ([`Programs::unbuilt`]).
+    pub calls: std::collections::BTreeSet<u32>,
+
+    /// The longest one program's adopt took.
+    pub slowest: std::time::Duration,
+
+    /// A digest of the programs' hashes, and one of what their stages
+    /// dispatch (each step's call, node, rung and selector), in the
+    /// registrations' order. A program's hash covers its channels'
+    /// capacities, which the runtime's frame size sets; what its stages
+    /// dispatch does not, and nothing the plane builds is keyed on more.
+    pub hashes: u64,
+
+    pub forms: u64,
+}
+
+/// `registrations` each adopted as [`adopt`] does at its registration, over
+/// the host's cores: the runtime's prewarm of its standard samplers
+/// (`Engine::prewarm_programs`). A program that does not adopt refuses by
+/// its hash, as its registration would.
+pub fn prewarm(registrations: &[ProgramRegistration]) -> Result<Prewarmed, Refusal> {
+    use std::hash::{Hash, Hasher};
+
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let threads = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .clamp(1, registrations.len().max(1));
+    let mut adopted: Vec<(usize, Prepared, std::time::Duration)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut mine = Vec::new();
+                    loop {
+                        let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(registration) = registrations.get(at) else {
+                            return mine;
+                        };
+                        let started = std::time::Instant::now();
+                        let prepared = adopt(registration);
+                        mine.push((at, prepared, started.elapsed()));
+                    }
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| worker.join().expect("a program's adopt panicked"))
+            .collect()
+    });
+    adopted.sort_by_key(|(at, _, _)| *at);
+
+    let mut prewarmed = Prewarmed {
+        programs: registrations.len(),
+        stages: 0,
+        calls: std::collections::BTreeSet::new(),
+        slowest: std::time::Duration::ZERO,
+        hashes: 0,
+        forms: 0,
+    };
+    let mut hashes = std::collections::hash_map::DefaultHasher::new();
+    let mut forms = std::collections::hash_map::DefaultHasher::new();
+    for (at, prepared, took) in adopted {
+        let Adopted { form, .. } = prepared?;
+        registrations[at].program_hash.hash(&mut hashes);
+        prewarmed.stages += form.len();
+        prewarmed.slowest = prewarmed.slowest.max(took);
+        for stage in form.all() {
+            for step in &stage.steps {
+                prewarmed.calls.insert(step.call);
+                (step.call, step.node, step.rung, step.selector).hash(&mut forms);
+            }
+            stage.steps.len().hash(&mut forms);
+        }
+    }
+    prewarmed.hashes = hashes.finish();
+    prewarmed.forms = forms.finish();
+    Ok(prewarmed)
+}
+
 /// A backend's program plane.
 pub trait Programs<B: Serve>: Default {
     /// A registration's last step, on the engine's thread: the adopted
@@ -123,6 +226,11 @@ pub trait Programs<B: Serve>: Default {
     /// its config. Binding an instance, or registering a program, while
     /// serving then builds no pipeline.
     fn load(&mut self, place: &Place<'_, B>) -> Result<(), Refusal>;
+
+    /// Why guest step call `call` has no pipeline [`Programs::load`] built,
+    /// or `None` where it has one: a bind that dispatches it would build it
+    /// while serving.
+    fn unbuilt(&self, call: u32) -> Option<String>;
 
     /// The pipelines built after the load, at a bind: none, where
     /// [`Programs::load`] built every one a guest stage can dispatch.
@@ -194,6 +302,27 @@ pub trait Programs<B: Serve>: Default {
     fn rebind_slots(&mut self, pools: &Pools<B>, rebind: &Rebind) -> Result<(), Refusal>;
 
     fn close_instance(&mut self, id: InstanceId) -> Result<(), Refusal>;
+
+    /// `instance`'s beam group at a fire (`crate::beam`): its resident
+    /// state's first pool word, its layout, and where the parents its last
+    /// pass put come from; `None` for an instance whose program states no
+    /// parents.
+    fn beam_group(
+        &self,
+        instance: InstanceId,
+        pools: &Pools<B>,
+    ) -> Result<Option<(u32, crate::guest::state::BeamLayout, crate::beam::Parents<B>)>, Refusal>
+    {
+        let _ = (instance, pools);
+        Ok(None)
+    }
+
+    /// `instance`'s beam group's resident state, where its program states
+    /// each beam's parent.
+    fn beam_state(&self, instance: InstanceId) -> Option<&crate::beam::Resident<B>> {
+        let _ = instance;
+        None
+    }
 
     /// The ring ends `instance`'s stages move, as (channel, whether the end
     /// is the tail), each once; none for an instance the plane holds no
@@ -404,6 +533,14 @@ pub fn decode(
         Dtype::I32 => eta_exec::Value::I32(words().map(i32::from_le_bytes).collect()),
         Dtype::U32 => eta_exec::Value::U32(words().map(u32::from_le_bytes).collect()),
         Dtype::F32 => eta_exec::Value::F32(words().map(f32::from_le_bytes).collect()),
+        Dtype::Bf16 => eta_exec::Value::Bf16(
+            bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect(),
+        ),
         _ => return None,
     })
 }

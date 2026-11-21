@@ -494,6 +494,12 @@ async fn read_tier_state(
 ) -> Result<Vec<u8>, HandleError> {
     let (copies, refs, scratch) = {
         let mut store = stores.rs.lock().unwrap();
+        // Parked on the disk tier: read back with its process's restore.
+        if held.iter().chain(pages).any(|&id| store.on_disk(id)) {
+            return Err(HandleError::quota(
+                "this recurrent state is parked on disk; it is read once its process is restored",
+            ));
+        }
         let off = |ids: &[RsSlotId], store: &crate::store::rs::RsStore| {
             ids.iter().filter(|&&id| !store.on_host(id)).count()
         };
@@ -1034,6 +1040,7 @@ pub(super) async fn load(holder: ProcessId, tenant: &str, name: &str) -> Result<
         untold: false,
         staged: Vec::new(),
         spans: cursor.spans,
+        ..Cursor::default()
     };
     Ok(Held::park(holder, kv, rs, cursor))
 }

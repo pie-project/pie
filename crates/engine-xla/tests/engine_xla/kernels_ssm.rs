@@ -1020,6 +1020,109 @@ fn delta_token(s: &mut [f32], q: &[f32], k: &[f32], v: &[f32], a: &[f32], beta: 
     y
 }
 
+/// `delta_token` over magnitudes: the bound on each value's size that its
+/// products' roundings act on, `S`, `q`, `k`, `v` taken absolute (decays
+/// and `beta` are not negative), so the delta's is `beta (|v| + sum |S||k|)`.
+/// A delta rule's token step: `delta_token` or its magnitudes.
+type Step = fn(&mut [f32], &[f32], &[f32], &[f32], &[f32], f32) -> Vec<f32>;
+
+fn delta_token_mag(
+    s: &mut [f32],
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    a: &[f32],
+    beta: f32,
+) -> Vec<f32> {
+    let (dk, dv) = (k.len(), v.len());
+    let at = |i: usize, c: usize| i * dv + c;
+    let mut y = vec![0.0; dv];
+    for c in 0..dv {
+        let mut mem = 0.0;
+        for i in 0..dk {
+            s[at(i, c)] *= a[i];
+            mem += s[at(i, c)] * k[i].abs();
+        }
+        let delta = (v[c].abs() + mem) * beta;
+        let mut acc = 0.0;
+        for i in 0..dk {
+            s[at(i, c)] += k[i].abs() * delta;
+            acc += s[at(i, c)] * q[i].abs();
+        }
+        y[c] = acc;
+    }
+    y
+}
+
+/// bf16's unit roundoff: a value rounded to bf16 is within `U_BF16` of
+/// itself, relatively (8 significant bits).
+const U_BF16: f32 = 1.0 / 256.0;
+
+/// A kernel whose products round each operand to bf16 once (single-pass
+/// MXU products, `dot_general_at(.., false)`), checked against the f32
+/// reference: each element within `2 U_BF16 M` (`M` the magnitude its
+/// products sum, `delta_token_mag`) and the reference's own f32 rounding;
+/// and the whole output's RMS error within 4 standard deviations of what
+/// independent roundings of `terms` products an element give, `U_BF16
+/// RMS(M) / sqrt(terms)`, so an error every element shares (a bias, a
+/// decay applied wrong) does not hide under the worst case.
+struct Bf16Check {
+    what: &'static str,
+    terms: usize,
+    /// The single-pass products an element's value passes through in turn
+    /// (1 for a step; 2 for a chunked form, its scores then their product
+    /// with the values or the state), each rounding once.
+    stages: usize,
+    errs: Vec<f32>,
+    mags: Vec<f32>,
+}
+
+impl Bf16Check {
+    fn new(what: &'static str, terms: usize) -> Bf16Check {
+        Bf16Check {
+            what,
+            terms,
+            stages: 1,
+            errs: Vec::new(),
+            mags: Vec::new(),
+        }
+    }
+
+    /// A form whose products round `stages` times in turn.
+    fn chained(mut self, stages: usize) -> Bf16Check {
+        self.stages = stages;
+        self
+    }
+
+    fn add(&mut self, got: &[f32], want: &[f32], mag: &[f32]) {
+        assert_eq!(got.len(), want.len(), "{}: lengths differ", self.what);
+        for (i, ((&g, &w), &m)) in got.iter().zip(want).zip(mag).enumerate() {
+            let err = (g - w).abs();
+            let bound = 2.0 * U_BF16 * self.stages as f32 * m + 4.0 * f32::EPSILON * m.max(w.abs());
+            assert!(
+                err <= bound,
+                "{} element {i}: got {g}, want {w} (err {err} > {bound}, magnitude {m})",
+                self.what
+            );
+            self.errs.push(err);
+            self.mags.push(m);
+        }
+    }
+
+    fn finish(self) {
+        let n = self.errs.len().max(1) as f32;
+        let rms = |x: &[f32]| (x.iter().map(|v| v * v).sum::<f32>() / n).sqrt();
+        let (err, mag) = (rms(&self.errs), rms(&self.mags));
+        let expected =
+            U_BF16 * mag * (self.stages as f32).sqrt() / (self.terms.max(1) as f32).sqrt();
+        assert!(
+            err <= 4.0 * expected,
+            "{}: RMS error {err:e} past 4 sigma of independent bf16 roundings {expected:e}",
+            self.what
+        );
+    }
+}
+
 fn l2(x: &[f32], eps: f32, scale: f32) -> Vec<f32> {
     let s: f32 = x.iter().map(|v| v * v).sum();
     let inv = 1.0 / (s + eps).sqrt() * scale;
@@ -1042,6 +1145,22 @@ impl Gdn {
     }
     /// Row `t`'s tokens through the state of its slot.
     fn token(&self, qkv: &[f32], gates: &[f32], t: usize, state: &mut [f32]) -> Vec<f32> {
+        self.token_by(qkv, gates, t, state, delta_token)
+    }
+
+    /// The magnitudes `token`'s products sum, over a magnitude state.
+    fn token_mag(&self, qkv: &[f32], gates: &[f32], t: usize, mag: &mut [f32]) -> Vec<f32> {
+        self.token_by(qkv, gates, t, mag, delta_token_mag)
+    }
+
+    fn token_by(
+        &self,
+        qkv: &[f32],
+        gates: &[f32],
+        t: usize,
+        state: &mut [f32],
+        step: Step,
+    ) -> Vec<f32> {
         let (hk, hv, dk, dv) = (self.hk, self.hv, self.dk, self.dv);
         let row = &qkv[t * self.width()..(t + 1) * self.width()];
         let mut y = Vec::with_capacity(hv * dv);
@@ -1053,7 +1172,7 @@ impl Gdn {
             let a = vec![gates[t * 2 * hv + h].exp(); dk];
             let beta = gates[t * 2 * hv + hv + h];
             let s = &mut state[h * dv * dk..(h + 1) * dv * dk];
-            y.extend(delta_token(s, &q, &k, v, &a, beta));
+            y.extend(step(s, &q, &k, v, &a, beta));
         }
         y
     }
@@ -1110,22 +1229,24 @@ fn the_gated_delta_step_folds_one_token_per_lane() {
         return;
     }
     let mut want = bank0.clone();
+    let mut mag: Vec<f32> = bank0.iter().map(|v| v.abs()).collect();
     let got = b.read_f32(y);
     let w = g.hv * g.dv;
+    let mut ys = Bf16Check::new("the step's rows", g.dk);
     for t in 0..rows {
         if slot_of[t] == DROP {
             continue;
         }
         let s = slot_of[t] as usize;
-        let yr = g.token(
-            &qkv,
-            &gates,
-            t,
-            &mut want[s * g.stride()..(s + 1) * g.stride()],
-        );
-        assert_close(&got[t * w..(t + 1) * w], &yr, 1e-4, 1e-3);
+        let at = s * g.stride()..(s + 1) * g.stride();
+        let yr = g.token(&qkv, &gates, t, &mut want[at.clone()]);
+        let ym = g.token_mag(&qkv, &gates, t, &mut mag[at]);
+        ys.add(&got[t * w..(t + 1) * w], &yr, &ym);
     }
-    assert_close(&b.read_f32(bank), &want, 1e-5, 1e-4);
+    ys.finish();
+    let mut bs = Bf16Check::new("the bank", g.dk);
+    bs.add(&b.read_f32(bank), &want, &mag);
+    bs.finish();
 }
 
 /// A decode over a bank of wide slots (a slot's state is blocks of rows)
@@ -1174,19 +1295,21 @@ fn the_gated_delta_decode_in_rounds_folds_one_token_per_lane() {
         return;
     }
     let mut want = bank0.clone();
+    let mut mag: Vec<f32> = bank0.iter().map(|v| v.abs()).collect();
+    let mut ys = Bf16Check::new("the rows", g.dk);
     let got = b.read_f32(y);
     let w = g.hv * g.dv;
     for t in 0..rows {
         let s = slot_of[t] as usize;
-        let yr = g.token(
-            &qkv,
-            &gates,
-            t,
-            &mut want[s * g.stride()..(s + 1) * g.stride()],
-        );
-        assert_close(&got[t * w..(t + 1) * w], &yr, 1e-4, 1e-3);
+        let at = s * g.stride()..(s + 1) * g.stride();
+        let yr = g.token(&qkv, &gates, t, &mut want[at.clone()]);
+        let ym = g.token_mag(&qkv, &gates, t, &mut mag[at]);
+        ys.add(&got[t * w..(t + 1) * w], &yr, &ym);
     }
-    assert_close(&b.read_f32(bank), &want, 1e-5, 1e-4);
+    ys.finish();
+    let mut bs = Bf16Check::new("the bank", g.dk);
+    bs.add(&b.read_f32(bank), &want, &mag);
+    bs.finish();
 }
 
 /// `bank` (`slots` blocks of `block` elements) laid with slot `s` at block
@@ -1445,21 +1568,23 @@ fn the_chunked_gated_delta_matches_the_token_walk() {
             return;
         }
         let mut want = bank0.clone();
+        let mut mag: Vec<f32> = bank0.iter().map(|v| v.abs()).collect();
+        let mut ys = Bf16Check::new("the rows", g.dk).chained(2);
         let got = b.read_f32(y);
         let w = g.hv * g.dv;
         for l in 0..lanes {
             let s = lane_slot[l] as usize;
             for t in indptr[l] as usize..indptr[l + 1] as usize {
-                let yr = g.token(
-                    &qkv,
-                    &gates,
-                    t,
-                    &mut want[s * g.stride()..(s + 1) * g.stride()],
-                );
-                assert_close(&got[t * w..(t + 1) * w], &yr, 2e-4, 2e-3);
+                let at = s * g.stride()..(s + 1) * g.stride();
+                let yr = g.token(&qkv, &gates, t, &mut want[at.clone()]);
+                let ym = g.token_mag(&qkv, &gates, t, &mut mag[at]);
+                ys.add(&got[t * w..(t + 1) * w], &yr, &ym);
             }
         }
-        assert_close(&b.read_f32(bank), &want, 1e-4, 1e-3);
+        ys.finish();
+        let mut bs = Bf16Check::new("the bank", g.dk).chained(2);
+        bs.add(&b.read_f32(bank), &want, &mag);
+        bs.finish();
     }
 }
 
@@ -1520,6 +1645,8 @@ fn the_committed_gated_delta_lands_the_state_after_the_commit() {
         return;
     }
     let mut want_bank = bank0.clone();
+    let mut mag_bank: Vec<f32> = bank0.iter().map(|v| v.abs()).collect();
+    let mut ys = Bf16Check::new("the rows", g.dk).chained(2);
     let got = b.read_f32(y);
     let w = g.hv * g.dv;
     let mut begin = 0usize;
@@ -1530,19 +1657,25 @@ fn the_committed_gated_delta_lands_the_state_after_the_commit() {
         if slot >= 0 {
             let s = slot as usize;
             let mut st = bank0[s * g.stride()..(s + 1) * g.stride()].to_vec();
+            let mut sm: Vec<f32> = st.iter().map(|v| v.abs()).collect();
             let keep = (commit[gl].max(0) as usize).min(span);
             for t in 0..span {
                 let yr = g.token(&qkv, &gates, begin + t, &mut st);
+                let ym = g.token_mag(&qkv, &gates, begin + t, &mut sm);
                 let at = (begin + t) * w;
-                assert_close(&got[at..at + w], &yr, 2e-4, 2e-3);
+                ys.add(&got[at..at + w], &yr, &ym);
                 if t + 1 == keep {
                     want_bank[s * g.stride()..(s + 1) * g.stride()].copy_from_slice(&st);
+                    mag_bank[s * g.stride()..(s + 1) * g.stride()].copy_from_slice(&sm);
                 }
             }
         }
         begin += span;
     }
-    assert_close(&b.read_f32(bank), &want_bank, 1e-4, 1e-3);
+    ys.finish();
+    let mut bs = Bf16Check::new("the bank", g.dk).chained(2);
+    bs.add(&b.read_f32(bank), &want_bank, &mag_bank);
+    bs.finish();
 }
 
 // -------------------------------------------------------------------- KDA
@@ -1568,6 +1701,36 @@ impl Kda {
         alog: &[f32],
         t: usize,
         state: &mut [f32],
+    ) -> Vec<f32> {
+        self.token_by(mixed, f, bproj, dt, alog, t, state, delta_token)
+    }
+
+    /// The magnitudes `token`'s products sum, over a magnitude state.
+    #[allow(clippy::too_many_arguments)]
+    fn token_mag(
+        &self,
+        mixed: &[f32],
+        f: &[f32],
+        bproj: &[f32],
+        dt: &[f32],
+        alog: &[f32],
+        t: usize,
+        mag: &mut [f32],
+    ) -> Vec<f32> {
+        self.token_by(mixed, f, bproj, dt, alog, t, mag, delta_token_mag)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn token_by(
+        &self,
+        mixed: &[f32],
+        f: &[f32],
+        bproj: &[f32],
+        dt: &[f32],
+        alog: &[f32],
+        t: usize,
+        state: &mut [f32],
+        step: Step,
     ) -> Vec<f32> {
         let (h, d) = (self.heads, self.d);
         let wide = h * d;
@@ -1595,7 +1758,7 @@ impl Kda {
                 .collect();
             let beta = 1.0 / (1.0 + (-bproj[t * h + hh]).exp());
             let s = &mut state[hh * d * d..(hh + 1) * d * d];
-            y.extend(delta_token(s, &q, &k, v, &a, beta));
+            y.extend(step(s, &q, &k, v, &a, beta));
         }
         y
     }
@@ -1668,23 +1831,22 @@ fn kda_walks_per_channel_decay_in_step_chunked_and_committed_forms() {
             return;
         }
         let mut want = bank0.clone();
+        let mut mag: Vec<f32> = bank0.iter().map(|v| v.abs()).collect();
+        let mut ys = Bf16Check::new("the rows", kd.d).chained(2);
         let got = b.read_f32(y);
         for l in 0..3 {
             let s = lane_slot[l] as usize;
             for t in indptr[l] as usize..indptr[l + 1] as usize {
-                let yr = kd.token(
-                    &mixed,
-                    &fp,
-                    &bp,
-                    &dt,
-                    &alog,
-                    t,
-                    &mut want[s * kd.stride()..(s + 1) * kd.stride()],
-                );
-                assert_close(&got[t * wide..(t + 1) * wide], &yr, 2e-4, 2e-3);
+                let at = s * kd.stride()..(s + 1) * kd.stride();
+                let yr = kd.token(&mixed, &fp, &bp, &dt, &alog, t, &mut want[at.clone()]);
+                let ym = kd.token_mag(&mixed, &fp, &bp, &dt, &alog, t, &mut mag[at]);
+                ys.add(&got[t * wide..(t + 1) * wide], &yr, &ym);
             }
         }
-        assert_close(&b.read_f32(bank), &want, 1e-4, 1e-3);
+        ys.finish();
+        let mut bs = Bf16Check::new("the bank", kd.d).chained(2);
+        bs.add(&b.read_f32(bank), &want, &mag);
+        bs.finish();
 
         // Step: rows 0..4 as four lanes, one dropped.
         let step_slots = [1i32, DROP, 0, 2];
@@ -1716,24 +1878,23 @@ fn kda_walks_per_channel_decay_in_step_chunked_and_committed_forms() {
         })
         .unwrap();
         let mut want = bank0.clone();
+        let mut mag: Vec<f32> = bank0.iter().map(|v| v.abs()).collect();
+        let mut ys = Bf16Check::new("the rows", kd.d);
         let got = b.read_f32(y);
         for t in 0..4 {
             if step_slots[t] == DROP {
                 continue;
             }
             let s = step_slots[t] as usize;
-            let yr = kd.token(
-                &mixed,
-                &fp,
-                &bp,
-                &dt,
-                &alog,
-                t,
-                &mut want[s * kd.stride()..(s + 1) * kd.stride()],
-            );
-            assert_close(&got[t * wide..(t + 1) * wide], &yr, 1e-4, 1e-3);
+            let at = s * kd.stride()..(s + 1) * kd.stride();
+            let yr = kd.token(&mixed, &fp, &bp, &dt, &alog, t, &mut want[at.clone()]);
+            let ym = kd.token_mag(&mixed, &fp, &bp, &dt, &alog, t, &mut mag[at]);
+            ys.add(&got[t * wide..(t + 1) * wide], &yr, &ym);
         }
-        assert_close(&b.read_f32(bank), &want, 1e-5, 1e-4);
+        ys.finish();
+        let mut bs = Bf16Check::new("the bank", kd.d);
+        bs.add(&b.read_f32(bank), &want, &mag);
+        bs.finish();
 
         // Committed: lane 0 replays 2 and commits 9 of its 23; lane 1 commits none.
         let cindptr = [0i32, 21, 22];
@@ -1780,24 +1941,32 @@ fn kda_walks_per_channel_decay_in_step_chunked_and_committed_forms() {
         })
         .unwrap();
         let mut want_bank = bank0.clone();
+        let mut mag_bank: Vec<f32> = bank0.iter().map(|v| v.abs()).collect();
+        let mut ys = Bf16Check::new("the rows", kd.d).chained(2);
         let got = b.read_f32(y);
         let mut begin = 0usize;
         for r in 0..2 {
             let span = (cindptr[r + 1] - cindptr[r] + replay[r]) as usize;
             let s = seat_slots[r] as usize;
             let mut st = bank0[s * kd.stride()..(s + 1) * kd.stride()].to_vec();
+            let mut sm: Vec<f32> = st.iter().map(|v| v.abs()).collect();
             let keep = (commit[r] as usize).min(span);
             for t in 0..span {
                 let yr = kd.token(&mixed, &fp, &bp, &dt, &alog, begin + t, &mut st);
+                let ym = kd.token_mag(&mixed, &fp, &bp, &dt, &alog, begin + t, &mut sm);
                 let at = (begin + t) * wide;
-                assert_close(&got[at..at + wide], &yr, 2e-4, 2e-3);
+                ys.add(&got[at..at + wide], &yr, &ym);
                 if t + 1 == keep {
                     want_bank[s * kd.stride()..(s + 1) * kd.stride()].copy_from_slice(&st);
+                    mag_bank[s * kd.stride()..(s + 1) * kd.stride()].copy_from_slice(&sm);
                 }
             }
             begin += span;
         }
-        assert_close(&b.read_f32(bank), &want_bank, 1e-4, 1e-3);
+        ys.finish();
+        let mut bs = Bf16Check::new("the bank", kd.d).chained(2);
+        bs.add(&b.read_f32(bank), &want_bank, &mag_bank);
+        bs.finish();
     }
 }
 
@@ -1926,21 +2095,23 @@ fn a_slot_blocked_bank_steps_a_wide_decode_fire_in_rounds() {
         return;
     }
     let mut want = bank0.clone();
+    let mut mag: Vec<f32> = bank0.iter().map(|v| v.abs()).collect();
+    let mut ys = Bf16Check::new("the rows", g.dk);
     let got = b.read_f32(y);
     let w = g.hv * g.dv;
     for t in (0..rows).filter(|&t| real(t)) {
         let s = slot_of[t] as usize;
-        let yr = g.token(
-            &qkv,
-            &gates,
-            t,
-            &mut want[s * g.stride()..(s + 1) * g.stride()],
-        );
-        assert_close(&got[t * w..(t + 1) * w], &yr, 1e-4, 1e-3);
+        let at = s * g.stride()..(s + 1) * g.stride();
+        let yr = g.token(&qkv, &gates, t, &mut want[at.clone()]);
+        let ym = g.token_mag(&qkv, &gates, t, &mut mag[at]);
+        ys.add(&got[t * w..(t + 1) * w], &yr, &ym);
     }
-    // Every slot but the sink is exact; the sink holds garbage.
+    ys.finish();
+    // Every slot but the sink is the reference's; the sink holds garbage.
     let n = (slots - 1) * g.stride();
-    assert_close(&b.read_f32(bank)[..n], &want[..n], 1e-5, 1e-4);
+    let mut bs = Bf16Check::new("the bank", g.dk);
+    bs.add(&b.read_f32(bank)[..n], &want[..n], &mag[..n]);
+    bs.finish();
 }
 
 #[test]
@@ -1998,21 +2169,23 @@ fn slot_blocked_banks_serve_the_chunked_rule_kda_and_the_conv() {
         return;
     }
     let mut want = bank0.clone();
+    let mut mag: Vec<f32> = bank0.iter().map(|v| v.abs()).collect();
+    let mut ys = Bf16Check::new("the rows", g.dk).chained(2);
     let got = b.read_f32(y);
     let w = g.hv * g.dv;
     for l in 0..3 {
         let s = lane_slot[l] as usize;
         for t in indptr[l] as usize..indptr[l + 1] as usize {
-            let yr = g.token(
-                &qkv,
-                &gates,
-                t,
-                &mut want[s * g.stride()..(s + 1) * g.stride()],
-            );
-            assert_close(&got[t * w..(t + 1) * w], &yr, 2e-4, 2e-3);
+            let at = s * g.stride()..(s + 1) * g.stride();
+            let yr = g.token(&qkv, &gates, t, &mut want[at.clone()]);
+            let ym = g.token_mag(&qkv, &gates, t, &mut mag[at]);
+            ys.add(&got[t * w..(t + 1) * w], &yr, &ym);
         }
     }
-    assert_close(&b.read_f32(bank), &want, 1e-4, 1e-3);
+    ys.finish();
+    let mut bs = Bf16Check::new("the bank", g.dk).chained(2);
+    bs.add(&b.read_f32(bank), &want, &mag);
+    bs.finish();
 
     // One KDA step per lane, the last lane dropped.
     let kd = Kda {
@@ -2059,17 +2232,23 @@ fn slot_blocked_banks_serve_the_chunked_rule_kda_and_the_conv() {
     })
     .unwrap();
     let mut want = bank0.clone();
+    let mut mag: Vec<f32> = bank0.iter().map(|v| v.abs()).collect();
+    let mut ys = Bf16Check::new("the rows", kd.d).chained(2);
     let got = b.read_f32(y);
     for t in 0..rows {
         if slot_of[t] == DROP {
             continue;
         }
         let s = slot_of[t] as usize;
-        let st = &mut want[s * kd.stride()..(s + 1) * kd.stride()];
-        let yr = kd.token(&mixed, &fp, &bp, &dt, &alog, t, st);
-        assert_close(&got[t * wide..(t + 1) * wide], &yr, 1e-4, 1e-3);
+        let at = s * kd.stride()..(s + 1) * kd.stride();
+        let yr = kd.token(&mixed, &fp, &bp, &dt, &alog, t, &mut want[at.clone()]);
+        let ym = kd.token_mag(&mixed, &fp, &bp, &dt, &alog, t, &mut mag[at]);
+        ys.add(&got[t * wide..(t + 1) * wide], &yr, &ym);
     }
-    assert_close(&b.read_f32(bank), &want, 1e-5, 1e-4);
+    ys.finish();
+    let mut bs = Bf16Check::new("the bank", kd.d).chained(2);
+    bs.add(&b.read_f32(bank), &want, &mag);
+    bs.finish();
 
     // The decode conv over a bank of `hist` rows of channels per slot.
     let (rows, c, k, slots) = (4u32, 40usize, 4usize, 5usize);
@@ -2230,6 +2409,61 @@ impl M2 {
         }
         y
     }
+    /// `token` and, beside it, the magnitudes its products sum over a
+    /// magnitude state (`delta_token_mag`'s rule: the state's `|S| decay +
+    /// step |x| |b|`, a row's `sum |S| |c| + |D x|` gated by `|silu z|`,
+    /// then scaled by the group norm the reference applies, and the bf16
+    /// round the row takes, `U_BF16 |y|`).
+    fn token_and_mag(
+        &self,
+        i: &M2In,
+        t: usize,
+        state: &mut [f32],
+        mag: &mut [f32],
+    ) -> (Vec<f32>, Vec<f32>) {
+        let (h, g, p, n) = (self.heads, self.groups, self.p, self.n);
+        let inner = self.inner();
+        let row = &i.xbc[t * self.width()..(t + 1) * self.width()];
+        let mut y = vec![0.0f32; inner];
+        let mut ym = vec![0.0f32; inner];
+        for hd in 0..h {
+            let grp = hd / (h / g);
+            let b = &row[inner + grp * n..inner + (grp + 1) * n];
+            let c = &row[inner + (g + grp) * n..inner + (g + grp + 1) * n];
+            let raw = i.dt[t * h + hd] + i.dt_bias[hd];
+            let step = if raw > 20.0 { raw } else { raw.exp().ln_1p() };
+            let decay = (-i.a_log[hd].exp() * step).exp();
+            for pp in 0..p {
+                let x = row[hd * p + pp];
+                let at = |k: usize| (hd * n + k) * p + pp;
+                let (mut acc, mut acc_m) = (0.0, 0.0);
+                for k in 0..n {
+                    state[at(k)] = state[at(k)] * decay + step * x * b[k];
+                    mag[at(k)] = mag[at(k)] * decay + step * x.abs() * b[k].abs();
+                    acc += state[at(k)] * c[k];
+                    acc_m += mag[at(k)] * c[k].abs();
+                }
+                let o = hd * p + pp;
+                let gate = silu(i.z[t * inner + o]);
+                let pre = (acc + i.d[hd] * x) * gate;
+                y[o] = round_bf16(pre);
+                ym[o] = (acc_m + (i.d[hd] * x).abs()) * gate.abs() + U_BF16 * pre.abs();
+            }
+        }
+        let gw = inner / g;
+        for grp in 0..g {
+            let run = &mut y[grp * gw..(grp + 1) * gw];
+            let ms: f32 = run.iter().map(|v| v * v).sum::<f32>() / gw as f32;
+            let inv = 1.0 / (ms + M2_EPS).sqrt();
+            for e in 0..gw {
+                let scale = inv * i.norm[grp * gw + e];
+                run[e] *= scale;
+                ym[grp * gw + e] *= scale.abs();
+            }
+        }
+        (y, ym)
+    }
+
     fn banks(&self, b: &mut Bench, i: &M2In) -> ssm::Mamba2 {
         ssm::Mamba2 {
             a_log: b.f32(self.heads as u32, 1, &i.a_log),
@@ -2344,16 +2578,22 @@ fn the_chunked_mamba2_matches_the_token_walk() {
             return;
         }
         let mut want = bank0.clone();
+        let mut mag: Vec<f32> = bank0.iter().map(|v| v.abs()).collect();
         let got = b.read_f32(y);
         let w = m.inner();
+        let mut ys = Bf16Check::new("the rows", m.n).chained(2);
         for l in 0..lanes {
             let s = lane_slot[l] as usize;
             for t in indptr[l] as usize..indptr[l + 1] as usize {
-                let yr = m.token(&i, t, &mut want[s * m.stride()..(s + 1) * m.stride()]);
-                assert_close(&got[t * w..(t + 1) * w], &yr, 3e-2, 3e-2);
+                let at = s * m.stride()..(s + 1) * m.stride();
+                let (yr, ym) = m.token_and_mag(&i, t, &mut want[at.clone()], &mut mag[at]);
+                ys.add(&got[t * w..(t + 1) * w], &yr, &ym);
             }
         }
-        assert_close(&b.read_f32(bank), &want, 1e-3, 1e-3);
+        ys.finish();
+        let mut bs = Bf16Check::new("the bank", m.n).chained(2);
+        bs.add(&b.read_f32(bank), &want, &mag);
+        bs.finish();
     }
 }
 
@@ -2402,6 +2642,8 @@ fn the_committed_mamba2_lands_the_state_after_the_commit() {
         return;
     }
     let mut want_bank = bank0.clone();
+    let mut mag_bank: Vec<f32> = bank0.iter().map(|v| v.abs()).collect();
+    let mut ys = Bf16Check::new("the rows", m.n).chained(2);
     let got = b.read_f32(y);
     let w = m.inner();
     let mut begin = 0usize;
@@ -2412,19 +2654,24 @@ fn the_committed_mamba2_lands_the_state_after_the_commit() {
         if slot >= 0 {
             let s = slot as usize;
             let mut st = bank0[s * m.stride()..(s + 1) * m.stride()].to_vec();
+            let mut sm: Vec<f32> = st.iter().map(|v| v.abs()).collect();
             let keep = (commit[gl].max(0) as usize).min(span);
             for t in 0..span {
-                let yr = m.token(&i, begin + t, &mut st);
+                let (yr, ym) = m.token_and_mag(&i, begin + t, &mut st, &mut sm);
                 let at = (begin + t) * w;
-                assert_close(&got[at..at + w], &yr, 3e-2, 3e-2);
+                ys.add(&got[at..at + w], &yr, &ym);
                 if t + 1 == keep {
                     want_bank[s * m.stride()..(s + 1) * m.stride()].copy_from_slice(&st);
+                    mag_bank[s * m.stride()..(s + 1) * m.stride()].copy_from_slice(&sm);
                 }
             }
         }
         begin += span;
     }
-    assert_close(&b.read_f32(bank), &want_bank, 1e-4, 1e-3);
+    ys.finish();
+    let mut bs = Bf16Check::new("the bank", m.n).chained(2);
+    bs.add(&b.read_f32(bank), &want_bank, &mag_bank);
+    bs.finish();
 }
 
 /// The chunked rule over 128-wide heads and a slot-blocked bf16 bank takes

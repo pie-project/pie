@@ -338,6 +338,7 @@ fn an_instance_in_pool_slots_fires_through_moves() {
             ring_slots: Vec::new(),
             adapter_slots: Vec::new(),
             scratch: engine::ScratchPlace::None,
+            resident: ::engine::ScratchPlace::None,
             pair: engine::ScratchPlace::None,
             pair_generation: 0,
         },
@@ -461,6 +462,7 @@ fn an_instance_in_pool_slots_fires_through_moves() {
             rings: binding.ring_slots.clone(),
             adapter: Vec::new(),
             scratch: binding.scratch.clone(),
+            resident: ::engine::ScratchPlace::None,
             pair: binding.pair.clone(),
             pair_generation: binding.pair_generation,
         })
@@ -550,6 +552,7 @@ fn an_instance_in_pool_slots_fires_through_moves() {
             // The guest's state comes back where it lay: room the test's
             // chunks hold for it (`guest_state` moves it to fresh room).
             scratch: binding.scratch.clone(),
+            resident: ::engine::ScratchPlace::None,
             pair: binding.pair.clone(),
             pair_generation: binding.pair_generation,
         })

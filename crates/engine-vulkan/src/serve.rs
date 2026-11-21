@@ -22,7 +22,16 @@ pub struct Shelf {
     /// Bumped by every step: a landed seat a later step may have rewritten
     /// is read no more.
     generation: u64,
+
+    /// The host room every guest pass stages its host-held roots through
+    /// and reads its status and puts back into
+    /// ([`engine_gpu::guest::ring`]): laid here, before the pool is sized.
+    #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
+    pub(crate) guest: GuestRing,
 }
+
+/// The guest plane's ring of host room, a berth a pass in flight.
+pub type GuestRing = std::sync::Arc<engine_gpu::guest::ring::Ring<Buffer>>;
 
 struct LandedSeat {
     arm: usize,
@@ -55,6 +64,11 @@ impl Serve for Api {
     type Flight = Flight;
 
     type Keep = crate::record::Key;
+
+    /// The probe recorded at load into a spanned frame kept to replay.
+    type Probed = crate::device::Kept;
+
+    type Stamps = crate::device::Stamps;
 
     const FUSIONS: &'static [poem_compiler::fuse::Rule] = &crate::FUSIONS;
 
@@ -100,13 +114,22 @@ impl Serve for Api {
             &device,
             tuning,
             boot.profiles.as_deref(),
-            crate::rates::STATED_SUBMIT_BOUND,
+            <Self as Serve>::submit_bound(boot),
         )?;
         Ok((device, tuning))
     }
 
     fn chunk_bytes(boot: &crate::api::DeviceBoot) -> Option<u64> {
         boot.chunk_bytes
+    }
+
+    fn submit_bound(boot: &crate::api::DeviceBoot) -> Option<std::time::Duration> {
+        #[cfg(feature = "test-limits")]
+        if let Some(bound) = boot.submit_bound {
+            return Some(bound);
+        }
+        let _ = boot;
+        crate::rates::stated_submit_bound()
     }
 
     fn tier(_device: &Context) -> kernels_slang::Tier {
@@ -156,12 +179,60 @@ impl Serve for Api {
         0
     }
 
-    fn walk_frame(device: &Context, keep: bool) -> Result<Frame> {
-        if keep {
-            device.frame_kept()
-        } else {
-            device.frame()
+    fn walk_frame(
+        device: &Context,
+        keep: bool,
+        timed: Option<&crate::device::Stamps>,
+    ) -> Result<Frame> {
+        // A timed step is spanned into its arm's timestamps: their reset and
+        // writes recorded with its work, so a kept one (kept under its arm,
+        // `record_key`) writes them anew on each replay, and its device time
+        // is read at its harvest (`Pending::span_ns`), before the arm's next
+        // step goes out.
+        match (timed, keep) {
+            (Some(stamps), keep) => device.spanned_into(stamps, keep),
+            (None, true) => device.frame_kept(),
+            (None, false) => device.frame(),
         }
+    }
+
+    /// One pool an arm: a step's time is read at its harvest, before its
+    /// arm is free again, so no later frame finds it still being read.
+    fn lay_stamps(device: &Context, _pieces: u32) -> Result<crate::device::Stamps> {
+        device.stamps()
+    }
+
+    fn fire_timing(device: &Context) -> Result<engine_gpu::submit::FireTiming> {
+        if device.writes_timestamps() {
+            Ok(engine_gpu::submit::FireTiming::Timestamps)
+        } else {
+            Err(Fault::Unbound {
+                what: format!(
+                    "a serving fire's device time on {}, whose queue family writes no timestamps \
+                     (timestampValidBits 0, or timestampPeriod 0): under the platform's stated \
+                     bound on one GPU submission each fire's time moves the scale the next \
+                     fires are estimated at",
+                    engine_gpu::backend::Context::name(device)
+                ),
+            })
+        }
+    }
+
+    fn record_probe(
+        device: &Context,
+        record: &dyn Fn(&Frame) -> Result<()>,
+    ) -> Result<crate::device::Kept> {
+        let frame = device.spanned_kept()?;
+        record(&frame)?;
+        frame.into_kept_spanned()
+    }
+
+    fn replay_probe(
+        _device: &Context,
+        probed: &crate::device::Kept,
+        _record: &dyn Fn(&Frame) -> Result<()>,
+    ) -> Result<Option<u64>> {
+        probed.replay_spanned()
     }
 
     fn shelf(
@@ -170,7 +241,7 @@ impl Serve for Api {
         readout: &[Buffer],
         weights_stream: bool,
         fires: engine_gpu::serve::FireBound,
-        _guest: engine_gpu::serve::GuestRoom,
+        guest: engine_gpu::serve::GuestRoom,
     ) -> Result<Shelf> {
         // An arm's fire block holds what its widest fire lays: each dispatch's
         // group counts and its scalars at the uniform alignment, each with
@@ -182,6 +253,22 @@ impl Serve for Api {
         let arms = (0..readout.len())
             .map(|_| crate::device::ArmBlock::new(device, bytes))
             .collect::<Result<Vec<_>>>()?;
+        // A guest bind writes its tables through the device's staging slab,
+        // laid here where the load has not yet written through it.
+        device.lay_staging()?;
+        // Every guest pass stages and reads back through a berth of one
+        // ring of host room, laid for the frames in flight
+        // ([`engine_gpu::guest::ring::ring_bytes`]).
+        let ring = engine_gpu::guest::ring::ring_bytes(guest.chunk_bytes, guest.seats);
+        let guest = engine_gpu::guest::ring::Ring::new(
+            Buffer::with(
+                device,
+                ring,
+                engine_gpu::Memory::Host,
+                engine_gpu::books::owners::GUEST,
+            )?,
+            ring,
+        );
         // Every fire records whatever is resident: a row table's misses are
         // staged by the host before the fire, a routed expert's between the
         // segments of the recording its stage cut ([`Kept::replay_cut`]).
@@ -194,6 +281,7 @@ impl Serve for Api {
             arms,
             landed_seats: BTreeMap::new(),
             generation: 0,
+            guest,
         })
     }
 
@@ -549,6 +637,16 @@ impl Serve for Api {
             .map(|span| span.at + span.bytes())
             .max()
             .unwrap_or(0);
+        // Under a stated submit bound, the step's device time from its
+        // timestamps, read now its fence was waited (`Shell::timed`).
+        if flight.estimate.is_some() {
+            let time = engine_gpu::submit::DeviceTime::default();
+            match flight.api.pending.span_ns()? {
+                Some(ns) => time.set(ns),
+                None => time.unread(),
+            }
+            shell.timed(flight.estimate, time);
+        }
         let mut raw = vec![0u8; end as usize];
         shell.readout[flight.arm].read(0, &mut raw)?;
         let rows = rows_from(&raw, &flight.rows);
@@ -663,9 +761,11 @@ fn keyed(shell: &Shell<Api>, p: &Prepared<'_, Api>, reads: bool) -> crate::recor
         }
         // A score room is its pair's place in the pool, which an unpark
         // or an evacuation moves: a recording binds the one it was taken at.
-        key.hashed(&lane.scores.map(|room| {
-            (engine_gpu::backend::Buffer::slab_id(&room.buffer), room.at)
-        }));
+        key.hashed(
+            &lane
+                .scores
+                .map(|room| (engine_gpu::backend::Buffer::slab_id(&room.buffer), room.at)),
+        );
     }
 
     key.finish()

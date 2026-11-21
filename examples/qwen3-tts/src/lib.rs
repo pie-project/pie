@@ -410,6 +410,7 @@ impl Kv {
                 slots: Some(&slots),
                 kv_len: Some(&kv_len),
                 fold: Fold::All,
+                ..StateGeometry::default()
             },
         )?;
         pass.readout(&Channel::from_iter(0..count))?;
@@ -647,6 +648,7 @@ fn draw_books(
             slots: Some(&pos),
             kv_len: Some(&kv_len),
             fold: Fold::All,
+            ..StateGeometry::default()
         },
     )?;
     pass.epilogue(move || {

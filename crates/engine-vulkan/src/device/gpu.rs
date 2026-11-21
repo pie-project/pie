@@ -60,6 +60,14 @@ impl engine_gpu::backend::Context<Api> for Context {
         Context::frame(self)
     }
 
+    fn spanned(&self) -> Result<Frame> {
+        Context::spanned(self)
+    }
+
+    fn idle(&self) -> bool {
+        Context::idle(self)
+    }
+
     fn max_buffer(&self) -> u64 {
         Context::max_buffer(self)
     }
@@ -68,8 +76,11 @@ impl engine_gpu::backend::Context<Api> for Context {
         Context::name(self)
     }
 
+    /// The reported cores, or the workgroups the load measured the device
+    /// holds (`Context::cores`): every caller reads it past the load's
+    /// rates step, which refuses a load whose profile still lacks them.
     fn cores(&self) -> u32 {
-        Context::cores(self)
+        Context::cores(self).unwrap_or(1)
     }
 
     fn capacity(&self) -> u64 {
@@ -155,11 +166,19 @@ impl engine_gpu::backend::Frame<Api> for Frame {
     fn commit_async(self, on_done: Option<OnDone>) -> Result<Pending> {
         Frame::commit_async(self, on_done)
     }
+
+    fn commit_spanned(self) -> Result<Option<u64>> {
+        Frame::commit_spanned(self)
+    }
 }
 
 impl engine_gpu::backend::Pending for Pending {
     fn wait(&self) -> Result<()> {
         Pending::wait(self)
+    }
+
+    fn landed(&self) -> bool {
+        Pending::landed(self)
     }
 }
 

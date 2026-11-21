@@ -149,6 +149,52 @@ pub struct Committed {
     pub lane0: u32,
 }
 
+/// A buffering fire's staged rs table (`kernels/prim/carry.slang`), which
+/// its recurrent kernels read each lane's buffered rows through where they
+/// lie in the pool: lane `l` of the fire has [`CARRY_HEADER`] ints from int
+/// `l * CARRY_HEADER` (the buffer token its first own row lands at, or -1;
+/// the rows it carries ahead of its own; where its carried rows' tokens and
+/// its buffer pages start in the table; the rows of its run its state is
+/// committed at), its tokens and pages after. `slots` is the fire's lanes'
+/// records ([`Committed::slots`]); the window's lane `r` is the fire's
+/// `lane0 + r`. An rs page is a slot of the pool's rs list, `stride_words`
+/// words of the pool, `page_tokens` tokens of every plane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Carry {
+    pub table: Tensor,
+    pub slots: Tensor,
+    pub lane0: u32,
+    pub page_tokens: u32,
+    pub stride_words: u32,
+}
+
+/// The ints a lane's header takes in a [`Carry`] table.
+pub const CARRY_HEADER: u32 = 5;
+
+/// Where a buffered plane lies in an rs page: the word it starts at, and
+/// the words a token's row of it takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CarryPlane {
+    pub at: u32,
+    pub row: u32,
+}
+
+impl Carry {
+    /// The pages' scalars, refused where a page holds no token.
+    pub(crate) fn page_args(&self, op: &'static str) -> Result<[ArgValue; 2], Error> {
+        Ok([
+            nonzero(op, "the tokens an rs page holds", self.page_tokens)?.arg(),
+            self.stride_words.arg(),
+        ])
+    }
+}
+
+impl CarryPlane {
+    pub(crate) fn args(&self) -> [ArgValue; 2] {
+        [self.at.arg(), self.row.arg()]
+    }
+}
+
 /// The widest head a scan stages in workgroup memory.
 const HEAD_MAX: u32 = 256;
 
@@ -179,6 +225,60 @@ fn csr_lanes(op: &'static str, what: &str, indptr: Tensor) -> Result<u32, Error>
             op,
             format!("the {what} CSR this fire names spans no request"),
         )),
+    }
+}
+
+/// Refuses a committed dispatch of more lanes than its work plane holds:
+/// a fire's lanes take as many dispatches as the plane holds lanes.
+fn work_holds(op: &'static str, work: Tensor, csr: Csr) -> Result<(), Error> {
+    if csr.lanes > work.rows {
+        return Err(refuse(
+            op,
+            format!(
+                "a dispatch of {} lanes, and the work plane holds {}",
+                csr.lanes, work.rows
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// The rows a window's dispatch walks of the fire's whole row tensors: from
+/// fire row `row0`, `rows` of them. The tensors are bound whole, one view
+/// whatever window a fire cuts; the kernels add `row0` to each row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowSpan {
+    pub row0: u32,
+    pub rows: u32,
+}
+
+impl RowSpan {
+    /// Every row of `t`, from row 0.
+    #[must_use]
+    pub fn whole(t: Tensor) -> RowSpan {
+        RowSpan {
+            row0: 0,
+            rows: t.rows,
+        }
+    }
+
+    /// The span's rows, refused where they pass any of `held` (tensors
+    /// whose rows it indexes) or are none.
+    pub(crate) fn rows(&self, op: &'static str, held: &[Tensor]) -> Result<u32, Error> {
+        let rows = nonzero(op, "rows", self.rows)?;
+        let end = u64::from(self.row0) + u64::from(rows);
+        for t in held {
+            if end > u64::from(t.rows) {
+                return Err(refuse(
+                    op,
+                    format!(
+                        "the window's rows {}..{end} pass the {} rows bound",
+                        self.row0, t.rows
+                    ),
+                ));
+            }
+        }
+        Ok(rows)
     }
 }
 

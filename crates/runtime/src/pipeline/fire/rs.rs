@@ -61,6 +61,11 @@ pub struct GroupPlan {
     /// Rows of its one lane the fire lands the state as of, each in a slot
     /// of its own (`Lane::rs_snapshots`).
     pub snapshots: Vec<u32>,
+    /// Whether its lanes are a beam group's (`parents`): each beam replays
+    /// every buffered slot through its own page list, which the engine's
+    /// head step resolves (`BEAM-PAGE-LISTS.md` §11), not the slots a mask
+    /// admits of one shared list.
+    pub beams: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,6 +130,45 @@ pub fn demand(
         }
         RsPlan::Groups(groups) => {
             for group in groups {
+                let ws = working_sets[group.lanes[0]];
+                let (write_state, fresh, _, writes) = group.write(store, ws)?;
+                total = total.add(
+                    store
+                        .group_demand(ws, write_state, fresh, writes)
+                        .map_err(|e| e.to_string())?,
+                );
+                total.slots += group.snapshots.len() as u32;
+            }
+        }
+    }
+    Ok(total)
+}
+
+/// What `plan` asks of the state of the lanes `lanes` alone: the rows of a
+/// windowed plan they own, and the groups a plan of groups leads with one
+/// of them ([`demand`] of the lanes one KV working set carries).
+pub fn demand_of_lanes(
+    store: &RsStore,
+    working_sets: &[RsWorkingSetId],
+    plan: &RsPlan,
+    lanes: &[usize],
+) -> Result<RsUnits, String> {
+    let mut total = RsUnits::default();
+    match plan {
+        RsPlan::Window(rows) => {
+            for &lane in lanes {
+                let (Some(&ws), Some(row)) = (working_sets.get(lane), rows.get(lane)) else {
+                    continue;
+                };
+                total = total.add(
+                    store
+                        .window_demand(ws, row.writes.clone())
+                        .map_err(|e| e.to_string())?,
+                );
+            }
+        }
+        RsPlan::Groups(groups) => {
+            for group in groups.iter().filter(|group| lanes.contains(&group.lanes[0])) {
                 let ws = working_sets[group.lanes[0]];
                 let (write_state, fresh, _, writes) = group.write(store, ws)?;
                 total = total.add(
@@ -508,6 +552,12 @@ pub fn prepare_many(
         }
         RsPlan::Groups(groups) => groups,
     };
+    // The beam groups' sets: their folds keep their buffers (§11.3).
+    let beam_sets: Vec<RsWorkingSetId> = groups
+        .iter()
+        .filter(|group| group.beams)
+        .map(|group| working_sets[group.lanes[0]])
+        .collect();
     let lanes = working_sets.len();
     let mut out = PreparedRs {
         verbs: vec![engine::fire::RsVerb::Fold; lanes],
@@ -545,8 +595,8 @@ pub fn prepare_many(
         // The first lane writes the state; the others read what it held, or
         // the zeros it starts from. In a shared pool a group whose first
         // lane folds writes a fresh record, and every lane names it,
-        // `[run, cow]` as the first does (CONTRACT-BC 15); the buffered rows
-        // are rs list slots apart from the record.
+        // `[run, cow]` as the first does (CONTRACT-BC 15), as does a beam
+        // group's; the buffered rows are rs list slots apart from the record.
         for (at, &lane) in group.lanes.iter().enumerate() {
             out.bound[lane] = true;
             match (at, write.state(), held) {
@@ -554,7 +604,9 @@ pub fn prepare_many(
                     out.slot_ids[lane] = state.slot.0;
                     out.slot_flags[lane] = crate::engine::RS_FLAG_RESET;
                 }
-                (_, Some(state), Some(_)) if at > 0 && out.shared => {
+                // A beam group's lanes all read the state its fold wrote
+                // (`BEAM-PAGE-LISTS.md` §11.3), past which each replays.
+                (_, Some(state), Some(_)) if at > 0 && (out.shared || group.beams) => {
                     out.slot_ids[lane] = state.slot.0;
                 }
                 (0, Some(state), _) => {
@@ -601,7 +653,7 @@ pub fn prepare_many(
         let (pages, base, folded) = match read {
             Ok(read) => read,
             Err(error) => {
-                store.commit_folds(folds);
+                store.commit_folds_keeping(folds, &beam_sets);
                 store.settle(published);
                 return Err(error.to_string());
             }
@@ -609,7 +661,9 @@ pub fn prepare_many(
         // A lane alone on its set replays every buffered slot of it; lanes
         // sharing a set replay the slots their masks admit, the ancestry
         // they state.
-        let lineage = if group.lanes.len() > 1 {
+        // A beam group's lanes each replay every buffered slot of their own
+        // list (the head step resolves it per beam, §11).
+        let lineage = if group.lanes.len() > 1 && !group.beams {
             engine::fire::Lineage::Admitted
         } else {
             engine::fire::Lineage::Set
@@ -630,7 +684,7 @@ pub fn prepare_many(
         }
     }
     note_reads(store, &published, &out);
-    store.commit_folds(folds);
+    store.commit_folds_keeping(folds, &beam_sets);
     out.snapshots = published.snapshots().to_vec();
     out.txn = Some(RsTxn { published });
     Ok(out)
@@ -643,6 +697,7 @@ pub fn prepare(store: &mut RsStore, ws: RsWorkingSetId, rows: u32) -> Result<Pre
         writes: None,
         fold: GroupFold::Host(rows),
         snapshots: Vec::new(),
+        beams: false,
     }]);
     prepare_many(store, &[ws], &plan, None)
 }
@@ -681,6 +736,7 @@ mod tests {
             writes: Some(writes),
             fold,
             snapshots: Vec::new(),
+            beams: false,
         }])
     }
 

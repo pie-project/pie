@@ -80,10 +80,13 @@ pub fn guest_state(pair_sets: &[u64], instance_sets: &[u64], room: Room) -> Gues
     let (per_pair, pair_run) = state_of(pair_sets, room);
     let (per_instance, instance_run) = state_of(instance_sets, room);
     GuestState {
-        // Today's arms are folded into the instance's bytes: one arm, no
-        // scratch apart.
-        resident: per_instance,
-        scratch: 0,
+        // The instance's value scratch, dead between fires: a park gives it
+        // back and an unpark takes fresh room. Today's arms are folded into
+        // it: one arm. What a later fire reads (a beam group's lists, the
+        // score rows) lies in the instance's tables, which the runtime
+        // copies with the instance, so no resident part is stated apart.
+        resident: 0,
+        scratch: per_instance,
         scratch_arms: 1,
         per_pair,
         run: pair_run.max(instance_run),

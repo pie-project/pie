@@ -4,8 +4,8 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
 use engine::program::{
-    BoundInstance, Footprint, InstanceBinding, InstanceId, ProgramFacts, ProgramId,
-    Rebind, RingFacts,
+    BoundInstance, Footprint, InstanceBinding, InstanceId, ProgramFacts, ProgramId, Rebind,
+    RingFacts,
 };
 use engine_gpu::program::Place;
 use engine_gpu::store::Pools;
@@ -33,11 +33,20 @@ struct Instance {
     /// (`engine::InstanceBinding::pair_generation`).
     #[cfg(feature = "vulkan")]
     pair_generation: u64,
+    /// Its process parked (`engine::Rebind::Parked`): its slots are
+    /// another owner's until a rebind names where it lies, so nothing of
+    /// it is repointed, claimed or fired meanwhile.
+    #[cfg(feature = "vulkan")]
+    parked: bool,
 
     /// The channels whose device cells this instance holds itself (none
     /// registered covers them), in its `ring_slots`.
     #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
     own_cells: Vec<ChannelId>,
+
+    /// Its beam group's state, where its program states each beam's
+    /// parent (`engine_gpu::beam`).
+    beam: Option<engine_gpu::beam::Resident<crate::device::Api>>,
 
     /// Ring cells a pass on the queue has yet to land.
     landing: Arc<Owed>,
@@ -46,6 +55,16 @@ struct Instance {
 }
 
 use engine_gpu::serve::InputCell;
+
+/// A fire naming an instance whose process parked, before a rebind named
+/// where it lies (`engine::Rebind::Parked`): the runtime's ordering broke.
+#[cfg(feature = "vulkan")]
+fn parked_fire(instance: InstanceId) -> Refusal {
+    Refusal::Program(format!(
+        "instance {instance} is fired while parked: its slots are another owner's until a \
+         rebind names where it lies"
+    ))
+}
 
 /// Ring cells a pass on the queue has yet to land, as (channel, sequence):
 /// the ring holds a cell for each from the pass's submit, and its value only
@@ -146,6 +165,11 @@ pub struct Plane {
     #[cfg(feature = "vulkan")]
     library: Option<Arc<crate::guest::session::Library>>,
 
+    /// The ring of host room every pass takes its berth of, which the
+    /// load's shelf laid (`Programs::load`).
+    #[cfg(feature = "vulkan")]
+    ring: Option<crate::serve::GuestRing>,
+
     #[cfg(feature = "vulkan")]
     kept: crate::guest::session::Kept,
 
@@ -177,7 +201,11 @@ impl Plane {
     /// Releases `id`, which no instance binds (`Engine::close_program`):
     /// its id answers nothing after.
     pub fn close_program(&mut self, id: ProgramId) -> Result<(), Refusal> {
-        if self.instances.values().any(|instance| instance.program == id) {
+        if self
+            .instances
+            .values()
+            .any(|instance| instance.program == id)
+        {
             return Err(Refusal::Program(format!(
                 "program {id} still has an instance bound"
             )));
@@ -323,14 +351,25 @@ impl Plane {
         #[cfg(not(feature = "vulkan"))]
         let _ = layout;
         #[cfg(feature = "vulkan")]
-        let session = self.build_session(place, binding, &plan, layout).map_err(|why| {
-            Refusal::Program(format!("program {} does not bind: {why}", binding.program))
-        })?;
+        let mut session = self
+            .build_session(place, binding, &plan, layout)
+            .map_err(|why| {
+                Refusal::Program(format!("program {} does not bind: {why}", binding.program))
+            })?;
         // The instance's room is fresh, its pair's where none holds that
-        // taking: both are another owner's bytes until cleared.
+        // taking: both are another owner's bytes until cleared. The pair's
+        // state is claimed by the group bound on its taking, before it is.
         #[cfg(feature = "vulkan")]
         {
             let fresh_pair = self.takings.take(&binding.pair, binding.pair_generation);
+            let group = self
+                .takings
+                .group(&binding.pair, binding.pair_generation)
+                .map(|group| (group, binding.pair_generation));
+            if let Err(fault) = session.join_pair(group) {
+                self.takings.give(&binding.pair, binding.pair_generation);
+                return Err(Refusal::fault(fault));
+            }
             if let Err(fault) = session.clear(fresh_pair) {
                 self.takings.give(&binding.pair, binding.pair_generation);
                 return Err(Refusal::Program(format!(
@@ -339,6 +378,27 @@ impl Plane {
                 )));
             }
         }
+        // Its beam group's state, cleared: the first fire primes it.
+        let beam = match (layout.beam, place) {
+            (None, _) => None,
+            (Some(beam), Some(place)) => Some(
+                engine_gpu::beam::Resident::bind(place.pools, &binding.resident, beam).map_err(
+                    |fault| {
+                        Refusal::Program(format!(
+                            "program {} does not bind: its beam group's state: {fault}",
+                            binding.program
+                        ))
+                    },
+                )?,
+            ),
+            (Some(_), None) => {
+                return Err(Refusal::Program(format!(
+                    "program {} states each beam's parent, and this engine bound no device to \
+                     keep its beam group's state",
+                    binding.program
+                )));
+            }
+        };
         // The device cells of the channels this instance holds itself.
         #[cfg_attr(not(feature = "vulkan"), allow(unused_mut))]
         let mut own_cells = Vec::new();
@@ -382,7 +442,10 @@ impl Plane {
                 session,
                 #[cfg(feature = "vulkan")]
                 pair_generation: binding.pair_generation,
+                #[cfg(feature = "vulkan")]
+                parked: false,
                 own_cells,
+                beam,
                 landing: Arc::default(),
                 faulted: Arc::default(),
             },
@@ -412,8 +475,11 @@ impl Plane {
         // back to the runtime.
         #[cfg(feature = "vulkan")]
         {
-            self.takings
-                .give(seat.session.pair_place(), seat.pair_generation);
+            // A parked one left its taking at its park.
+            if !seat.parked {
+                self.takings
+                    .give(seat.session.pair_place(), seat.pair_generation);
+            }
             let mut kept = self.kept.lock().expect("kept cells lock poisoned");
             for channel in &seat.own_cells {
                 kept.remove(channel);
@@ -436,14 +502,19 @@ impl Plane {
             what: "program",
             id: program.0,
         })?;
-        if self.forms.get(program).is_none() {
-            // Registration refuses a program with no device form.
+        // Registration refuses a program with no device form.
+        let Some(compiled) = self.forms.get(program) else {
             return Ok(ProgramFacts::default());
-        }
-        let sizes = engine_gpu::guest::session::program_table_sizes(&plan.package.plans);
+        };
+        let stride = engine_gpu::guest::session::step_stride(place.device.table_align());
+        let sizes = engine_gpu::guest::session::instance_table_sizes(
+            &plan.package.plans,
+            compiled.all(),
+            stride,
+        );
         let instance =
             engine_gpu::guest::held::table_footprint(place.pools, INSTANCE, &sizes, place.align)
-                .map_err(|fault| Refusal::Program(fault.to_string()))?;
+                .map_err(Refusal::fault)?;
         let mut rings = Vec::new();
         for (dense, decl) in plan.package.channels.iter().enumerate() {
             let channel = dense as u32;
@@ -488,9 +559,14 @@ impl Plane {
     pub fn rebind(&mut self, pools: &Pools<crate::device::Api>) -> Result<(), Refusal> {
         #[cfg(feature = "vulkan")]
         {
-            let program = |fault: engine_gpu::error::Fault| Refusal::Program(fault.to_string());
-            for seat in self.instances.values_mut() {
+            let program = Refusal::fault;
+            // A parked instance's slots are another owner's: repointed and
+            // claimed at its rebind, not here.
+            for seat in self.instances.values_mut().filter(|seat| !seat.parked) {
                 seat.session.rebind(pools).map_err(program)?;
+                if let Some(beam) = seat.beam.as_mut() {
+                    beam.rebind(pools).map_err(program)?;
+                }
             }
             for cell in self
                 .kept
@@ -515,13 +591,14 @@ impl Plane {
     ) -> Result<(), Refusal> {
         #[cfg(feature = "vulkan")]
         {
-            let program = |fault: engine_gpu::error::Fault| Refusal::Program(fault.to_string());
+            let program = Refusal::fault;
             match rebind {
                 Rebind::Instance {
                     id,
                     instance,
                     rings,
                     scratch,
+                    resident,
                     pair,
                     pair_generation,
                     ..
@@ -530,15 +607,31 @@ impl Plane {
                         what: "instance",
                         id: id.0,
                     })?;
+                    // Its beam group's state moved with its bytes: the
+                    // runtime copied them into `resident`.
+                    if let Some(beam) = seat.beam.as_mut() {
+                        beam.retarget(pools, resident).map_err(program)?;
+                    }
                     let was = (seat.session.pair_place().clone(), seat.pair_generation);
-                    seat.session
-                        .retarget(pools, instance, scratch, pair)
-                        .map_err(program)?;
+                    // The pair's taking it binds on is claimed by the group
+                    // bound on it, this member joining it with its own runs.
+                    let fresh_pair = self.takings.take(pair, *pair_generation);
+                    let group = self
+                        .takings
+                        .group(pair, *pair_generation)
+                        .map(|group| (group, *pair_generation));
+                    if let Err(fault) = seat.session.retarget(pools, instance, scratch, pair, group) {
+                        self.takings.give(pair, *pair_generation);
+                        return Err(Refusal::fault(fault));
+                    }
                     // The unpark's room is fresh; the pair's is cleared where
                     // this is the first instance on its new taking.
-                    self.takings.give(&was.0, was.1);
-                    let fresh_pair = self.takings.take(pair, *pair_generation);
+                    // A parked one left its taking at its park.
+                    if !seat.parked {
+                        self.takings.give(&was.0, was.1);
+                    }
                     seat.pair_generation = *pair_generation;
+                    seat.parked = false;
                     seat.session.clear(fresh_pair).map_err(program)?;
                     let mut kept = self.kept.lock().expect("kept cells lock poisoned");
                     for ring in rings {
@@ -556,6 +649,20 @@ impl Plane {
                             })?
                             .retarget(pools, &ring.slots)
                             .map_err(program)?;
+                    }
+                }
+                Rebind::Parked { id, kept } => {
+                    let seat = self.instances.get_mut(id).ok_or(Refusal::Closed {
+                        what: "instance",
+                        id: id.0,
+                    })?;
+                    // Said again by a move down of its tables: kept nowhere now.
+                    seat.session.park(*kept).map_err(program)?;
+                    if !seat.parked {
+                        // It leaves its pair's taking as it leaves the group.
+                        self.takings
+                            .give(seat.session.pair_place(), seat.pair_generation);
+                        seat.parked = true;
                     }
                 }
                 Rebind::Channel { id, slots } => {
@@ -592,7 +699,7 @@ impl Plane {
         bytes: u64,
         slots: &[u32],
     ) -> Result<crate::guest::session::Cell, Refusal> {
-        let program = |fault: engine_gpu::error::Fault| Refusal::Program(fault.to_string());
+        let program = Refusal::fault;
         let slot_bytes = place.pools.slot_bytes(CHANNEL).map_err(program)?;
         let per_chunk = place.pools.slots_per_chunk(CHANNEL).map_err(program)?;
         match engine_gpu::guest::held::item_slots(bytes, slot_bytes, per_chunk) {
@@ -785,6 +892,68 @@ impl Plane {
             .map(Some)
     }
 
+    /// `instance`'s beam group at a fire: its state's first pool word, its
+    /// layout, and its parents: the device cell a pass still on the queue
+    /// keeps, which the fire copies in behind it, or else the cell the
+    /// ring holds once the pass that put it landed.
+    pub fn beam_group(
+        &self,
+        instance: InstanceId,
+        pools: &Pools<crate::device::Api>,
+    ) -> Result<
+        Option<(
+            u32,
+            engine_gpu::guest::state::BeamLayout,
+            engine_gpu::beam::Parents<crate::device::Api>,
+        )>,
+        Refusal,
+    > {
+        let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
+            what: "instance",
+            id: instance.0,
+        })?;
+        let Some(beam) = seat.beam.as_ref() else {
+            return Ok(None);
+        };
+        let state = beam
+            .word(pools)
+            .map_err(|fault| Refusal::Program(fault.to_string()))?;
+        let binding = seat
+            .plan
+            .package
+            .ports
+            .iter()
+            .find(|binding| binding.port == Port::Parents && !binding.is_const)
+            .ok_or_else(|| {
+                Refusal::Program(format!("instance {instance} keeps a beam group and binds no parents"))
+            })?;
+        #[cfg(feature = "vulkan")]
+        if let Some(cell) = seat.session.kept_cell(binding.channel) {
+            return Ok(Some((state, beam.layout(), engine_gpu::beam::Parents::Cell(cell))));
+        }
+        let ring = &seat.inst.channels[binding.channel as usize];
+        seat.landing.wait((binding.channel, ring.head()), &seat.faulted);
+        if seat.faulted.load(Ordering::Acquire) {
+            return Err(Refusal::Program(format!("instance {instance} is poisoned")));
+        }
+        if ring.is_empty() {
+            return Err(Refusal::Program(format!(
+                "instance {instance}: the `parents` ring is empty at the fire"
+            )));
+        }
+        let parents = match ring.front() {
+            Value::U32(cells) => cells,
+            Value::I32(cells) => cells.iter().map(|&p| p as u32).collect(),
+            other => {
+                return Err(Refusal::Program(format!(
+                    "instance {instance}: `parents` holds {:?}, not beams",
+                    other.dtype()
+                )));
+            }
+        };
+        Ok(Some((state, beam.layout(), engine_gpu::beam::Parents::Host(parents))))
+    }
+
     pub fn publish(
         &mut self,
         instance: InstanceId,
@@ -894,6 +1063,10 @@ impl Plane {
             what: "instance",
             id: instance.0,
         })?;
+        #[cfg(feature = "vulkan")]
+        if seat.parked {
+            return Err(parked_fire(instance));
+        }
         if seat.faulted.load(Ordering::Acquire) {
             return Err(Refusal::Program(format!("instance {instance} is poisoned")));
         }
@@ -1029,6 +1202,9 @@ impl Plane {
             what: "instance",
             id: instance.0,
         })?;
+        if seat.parked {
+            return Err(parked_fire(instance));
+        }
         let widen = widen.as_ref().ok_or_else(|| {
             Refusal::Program(format!(
                 "instance {instance} has a device half, but the plane built no readout widen"
@@ -1072,7 +1248,7 @@ impl Plane {
 
         let crate::guest::run::Deferral {
             frame,
-            landing,
+            pass,
             landings,
         } = deferral;
         let Some(frame) = frame else {
@@ -1102,9 +1278,7 @@ impl Plane {
             Arc::clone(&seat.faulted),
             owed.clone(),
         );
-        let status = seat.session.status_cell();
-        let spare = seat.session.landings();
-        let landing = Mutex::new(landing);
+        let pass = Mutex::new(pass);
         let owing = Arc::clone(&seat.landing);
         let faulted = Arc::clone(&seat.faulted);
         let on_done = move |refused: Option<String>| {
@@ -1113,18 +1287,21 @@ impl Plane {
             // and landing say is its lanes'.
             let lost = refused.clone();
             let mut fault = refused;
+            // The pass's berth goes back to the ring as this returns.
+            let lent = pass.lock().expect("pass lock poisoned").take();
             if fault.is_none() {
-                let mut word = [0u8; 4];
-                fault = match status.read(0, &mut word) {
-                    Ok(()) if word == [0; 4] => None,
-                    Ok(()) => Some(format!(
-                        "instance {instance} (program {program}) faulted on the device with                          code {}",
-                        u32::from_le_bytes(word)
+                fault = match lent.as_ref().map(crate::guest::session::Pass::status) {
+                    None => Some(format!(
+                        "instance {instance} (program {program}): a pass landed with no berth"
                     )),
-                    Err(why) => Some(why.to_string()),
+                    Some(Ok(None)) => None,
+                    Some(Ok(Some(code))) => Some(format!(
+                        "instance {instance} (program {program}) faulted on the device with \
+                         code {code}"
+                    )),
+                    Some(Err(why)) => Some(why.to_string()),
                 };
             }
-            let lent = landing.lock().expect("landing lock poisoned").take();
             if fault.is_none()
                 && let Some(lent) = lent.as_ref()
             {
@@ -1142,9 +1319,7 @@ impl Plane {
                 faulted.store(true, Ordering::Release);
             }
             owing.land(&owed);
-            if let Some(lent) = lent {
-                spare.lock().expect("spare lock poisoned").push(lent);
-            }
+            drop(lent);
             if let Some(done) = done.as_ref() {
                 if lost.is_some() {
                     done.tell(lost, "vulkan guest pass");
@@ -1203,6 +1378,10 @@ impl Plane {
             .library
             .clone()
             .ok_or_else(|| "the plane built no guest pipelines at the load".to_owned())?;
+        let ring = self
+            .ring
+            .clone()
+            .ok_or_else(|| "the load laid no guest ring".to_owned())?;
         let extents = engine_gpu::guest::state::extents_of(&binding.extents);
         // The instance's state and its pair's, at the places the runtime
         // took for them.
@@ -1213,7 +1392,7 @@ impl Plane {
             .map_err(|why| format!("its pair's state does not lie at {:?}: {why}", binding.pair))?;
         crate::guest::session::Session::new(
             device,
-            &plan.package.plans,
+            &plan.package,
             compiled.all(),
             &extents,
             &library,
@@ -1226,6 +1405,7 @@ impl Plane {
             },
             [instance, pair],
             layout,
+            ring,
         )
         .map_err(|why| format!("its device half did not build: {why}"))
     }
@@ -1269,6 +1449,7 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
                 "every guest step's pipeline is built"
             );
             self.library = Some(Arc::new(library));
+            self.ring = Some(Arc::clone(&place.shelf.guest));
             let widen = crate::guest::widen::Widen::new(place.device).map_err(|why| {
                 Refusal::Program(format!("the readout widen did not build: {why}"))
             })?;
@@ -1282,6 +1463,20 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
 
     fn package(&self, program: ProgramId) -> Option<&eta_compiler::codegen::launch::LaunchPackage> {
         Plane::package(self, program)
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn unbuilt(&self, call: u32) -> Option<String> {
+        match &self.library {
+            Some(library) => library.unbuilt(call),
+            None => Some("the plane built no guest pipelines: it is not loaded".to_owned()),
+        }
+    }
+
+    #[cfg(not(feature = "vulkan"))]
+    fn unbuilt(&self, call: u32) -> Option<String> {
+        let _ = call;
+        Some("this build has no device to build a guest pipeline on".to_owned())
     }
 
     #[cfg(feature = "vulkan")]
@@ -1366,6 +1561,28 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
 
     fn close_instance(&mut self, id: InstanceId) -> Result<(), Refusal> {
         Plane::close_instance(self, id)
+    }
+
+    fn beam_group(
+        &self,
+        instance: InstanceId,
+        pools: &Pools<crate::device::Api>,
+    ) -> Result<
+        Option<(
+            u32,
+            engine_gpu::guest::state::BeamLayout,
+            engine_gpu::beam::Parents<crate::device::Api>,
+        )>,
+        Refusal,
+    > {
+        Plane::beam_group(self, instance, pools)
+    }
+
+    fn beam_state(
+        &self,
+        instance: InstanceId,
+    ) -> Option<&engine_gpu::beam::Resident<crate::device::Api>> {
+        self.instances.get(&instance)?.beam.as_ref()
     }
 
     fn input_cell(
@@ -1463,7 +1680,7 @@ fn cell_facts(
     let Some(bytes) = device_cell_bytes(shape, dtype, host_role) else {
         return Ok(None);
     };
-    let program = |fault: engine_gpu::error::Fault| Refusal::Program(fault.to_string());
+    let program = Refusal::fault;
     let slot_bytes = pools.slot_bytes(CHANNEL).map_err(program)?;
     let per_chunk = pools.slots_per_chunk(CHANNEL).map_err(program)?;
     Ok(
@@ -1626,7 +1843,7 @@ fn offered_read(
         |at, local| session.span(at, local).map(|(_, held)| held),
         seats,
     )
-    .map_err(|fault| Refusal::Program(fault.to_string()))?;
+    .map_err(Refusal::fault)?;
     match unread {
         Some((output, lane)) => Err(engine_gpu::program::unread(instance, &output, lane)),
         None => Ok(()),

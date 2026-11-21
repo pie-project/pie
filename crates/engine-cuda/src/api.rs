@@ -361,6 +361,7 @@ fn fault(fault: Fault) -> Error {
             "this fire wants {need} {what} and the load reserved {have}"
         )),
         Fault::Fragmented { .. } | Fault::Integrity { .. } => Error::Device(fault.to_string()),
+        Fault::TierFull(_) => Error::TierFull(fault.to_string()),
         Fault::Overcarved { .. } => Error::Invalid(fault.to_string()),
         Fault::Straddled { .. } | Fault::Recipe(_) => Error::Load(fault.to_string()),
         Fault::Mask { .. }
@@ -377,6 +378,7 @@ fn fault(fault: Fault) -> Error {
             wanted: 1,
             available: 0,
         },
+        Fault::Claimed(refusal) => Error::Claimed(refusal),
         Fault::Compile(_) | Fault::Program { .. } | Fault::Interpret(_) => {
             Error::Program(fault.to_string())
         }
@@ -705,15 +707,20 @@ impl Engine for Cuda {
         // gone from the driver's free bytes and Windows' commit alike. A
         // ring that cannot be pinned refuses the load, here and not after
         // ready.
-        let ring = crate::store::staging_ring_for(
-            &trace,
-            budgets.page_size,
-            budgets.max_context,
-            residency.host_kv_budget,
-            ranks,
-        )
-        .and_then(|bytes| bytes.map(crate::store::Ring::pin).transpose())
-        .map_err(fault)?;
+        let frames = engine::runahead::Runahead::of(frames_in_flight).frames_in_flight;
+        let ring = crate::store::staging_ring_for(residency.host_kv_budget, ranks, frames)
+            .and_then(|size| size.map(crate::store::Ring::pin).transpose())
+            .map_err(fault)?;
+        if let Some(ring) = &ring {
+            let size = ring.size();
+            eprintln!(
+                "engine-cuda: the host tier's staging ring: {} MiB pinned, {} pieces of {} MiB (a \
+                 piece for each of 2 stages for each of {frames} frames in flight)",
+                size.bytes() >> 20,
+                size.pieces,
+                size.piece >> 20
+            );
+        }
         let mut budgets = budgets;
         if budgets.context_declared && kv_budget.is_none() {
             let fits = crate::store::declared_context_that_fits(
@@ -807,6 +814,8 @@ impl Engine for Cuda {
                 residency.disk_kv_budget,
                 residency.disk_kv_dir.as_deref(),
                 residency.disk_kv_persistent,
+                residency.kv_seats.unwrap_or(budgets.max_lanes),
+                budgets.max_context,
                 self.boot.world,
             )
             .map_err(fault)?;
@@ -844,6 +853,8 @@ impl Engine for Cuda {
                 storage_alignment: 256,
                 storage_max_tile_bytes: u64::MAX,
                 codegen_backend: Some(CODEGEN.to_string()),
+                // its CUDA / HIP emitters serve every form
+                library_forms: engine::LibraryForms::ALL,
             },
             pools: PoolFacts {
                 adapter_banks: shell
@@ -869,6 +880,8 @@ impl Engine for Cuda {
                 prefill_lanes: shell.prefill_lanes(),
                 max_readouts: u32::try_from(poem_compiler::arena::readouts_ceiling(shell.budget()))
                     .unwrap_or(u32::MAX),
+                // Each lane's rung bounds what it replays.
+                replayed_rows: 0,
             },
             has_lora: true,
             has_attn_page_mask: false,
@@ -877,7 +890,8 @@ impl Engine for Cuda {
             draft_proposals_from: drafter.map_or(1, |d| d.proposals_from),
             ports: PortMask::DEVICE_GEOMETRY
                 .with(Port::AttnMask)
-                .with(Port::Fold),
+                .with(Port::Fold)
+                .with(Port::Parents),
             geometry: GeometryClass::DeviceGeometry,
             kv_handle,
             media_encode: false,
@@ -895,6 +909,10 @@ impl Engine for Cuda {
             // CUDA states no bound on one submission (no watchdog on a
             // compute device).
             guest_cost: engine::GuestCost::default(),
+            mixed_lanes: engine::MixedLanes::Any,
+            frames_in_flight: u32::from(
+                engine::runahead::Runahead::of(frames_in_flight).frames_in_flight,
+            ),
         };
 
         // A fire's lanes, rows and readouts bound the scheduler's waves: a
@@ -1030,6 +1048,7 @@ impl Engine for Cuda {
                 instance,
                 rings,
                 scratch,
+                resident,
                 pair,
                 pair_generation,
                 ..
@@ -1041,11 +1060,15 @@ impl Engine for Cuda {
                         instance,
                         rings,
                         scratch,
+                        resident,
                         pair,
                         pair_generation,
                     },
                 )
                 .map_err(fault),
+            engine::program::Rebind::Parked { id, kept } => {
+                self.loaded_mut()?.park_program(id, kept).map_err(fault)
+            }
             engine::program::Rebind::Channel { id, slots } => {
                 let old = self.channels.get(&id).cloned().ok_or_else(|| {
                     Error::Program(format!("channel {id} is not registered on this engine"))
@@ -1389,6 +1412,7 @@ impl Engine for Cuda {
                     instance: binding.instance_slots.clone(),
                     rings: binding.ring_slots.clone(),
                     scratch: binding.scratch.clone(),
+                    resident: binding.resident.clone(),
                     pair: binding.pair.clone(),
                     pair_generation: binding.pair_generation,
                 },
@@ -1467,6 +1491,10 @@ impl Engine for Cuda {
         channel: u32,
     ) -> EngineResult<Option<Vec<u8>>> {
         self.instance(instance)?.take(channel).map_err(fault)
+    }
+
+    fn beam_list(&mut self, instance: InstanceId, beam: u32) -> EngineResult<Vec<u32>> {
+        self.loaded_mut()?.beam_list(instance, beam).map_err(fault)
     }
 
     fn host_kv_layout(&self) -> Option<state::PageLayout> {
@@ -1814,7 +1842,7 @@ impl Cuda {
                     translation: if placed[at] {
                         table(lane, LIST).unwrap_or(&[])
                     } else {
-                        &[]
+                        &lane.reserve
                     },
                     write_end: lane.kv.write_end,
                     window: table(lane, WINDOW).unwrap_or(&[]),

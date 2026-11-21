@@ -115,7 +115,6 @@ fn runtime_config(
 
 fn scheduler(runtime: &config::RuntimeConfig) -> runtime::bootstrap::SchedulerConfig {
     runtime::bootstrap::SchedulerConfig {
-        submit_deadline_us: runtime.submit_deadline.as_micros(),
         silence_timeout_secs: runtime.silence_timeout.as_secs(),
         frame_size: runtime.frame_size,
         frame_dispatch_depth: runtime.frame_dispatch_depth,
@@ -163,6 +162,7 @@ fn build_model(
                 adapter_attachments: g.caps.adapter_attachments,
                 rs_snapshots: g.caps.rs_snapshots,
                 guest_cost: g.caps.guest_cost,
+                frames_in_flight: g.caps.frames_in_flight,
                 device_geometry_port_mask: g.caps.ports,
                 facts: g.caps.facts.clone(),
                 inputs: g.caps.inputs.clone(),
@@ -175,6 +175,7 @@ fn build_model(
                     prefill_rows: g.caps.limits.prefill_rows as usize,
                     prefill_lanes: g.caps.limits.prefill_lanes as usize,
                     max_readouts: g.caps.limits.max_readouts as usize,
+                    max_replayed_rows: g.caps.limits.replayed_rows as usize,
                     readout_store: 0,
                 },
                 engine_backend: g.backend,

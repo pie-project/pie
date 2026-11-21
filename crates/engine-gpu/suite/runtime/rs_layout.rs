@@ -98,12 +98,11 @@ fn agrees(name: &str, trace: &Trace) -> usize {
         assert_eq!(row.planes.len(), 1, "{name}: lone conv {} buffers its input alone", conv.node);
         let plane = layout.planes[layout.in_of[&conv.x.0]];
         assert_eq!(recipe.rs.run(*id).unwrap().per_token, plane.row_bytes);
-        let lanes = 4;
         let rows_ext = 32;
+        let (_, _, planes) = layout.pack(rows_ext);
         assert!(
-            engine_gpu::rs::Seat::scratch_bytes(&layout, rows_ext, lanes)
-                >= u64::from(rows_ext) * plane.row_bytes,
-            "{name}: the seat's scratch extends the lone conv's rows"
+            planes >= u64::from(rows_ext) * plane.row_bytes,
+            "{name}: the seat's planes extend the lone conv's rows"
         );
     }
     let mut lone_states: Vec<u32> = lone.iter().map(|conv| conv.state.0).collect();
@@ -160,4 +159,16 @@ fn the_rs_layout_is_the_rule_and_the_recipe_for_the_qwen_4_package() {
 fn the_rs_layout_is_the_rule_and_the_recipe_for_qwen35() {
     let bf16 = poem_compiler::catalog::one_rank(poem::Dtype::Bf16, poem::Dtype::Bf16);
     assert_eq!(agrees("qwen35-tiny", &traced("qwen35-tiny", &bf16)), 0);
+}
+
+/// A KDA model (Kimi K3's four-layer miniature): its rows' keys and
+/// corrected values, which the recipe keeps (`ChunkProfile::rs_corrected`),
+/// land on the shell's planes too.
+#[test]
+fn the_rs_layout_is_the_rule_and_the_recipe_for_a_kda_model() {
+    let deployed = poem_compiler::catalog::deployments()
+        .find(|d| d.name.starts_with("kimik3-l4"))
+        .expect("the package deploys its four-layer miniature");
+    let name = deployed.name.clone();
+    agrees(&name, &deployed.trace(backend::PLATFORM));
 }

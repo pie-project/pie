@@ -34,6 +34,14 @@ pub struct DeviceBoot {
     /// only (`test-limits`): no config or profile reaches it.
     #[cfg(feature = "test-limits")]
     pub max_buffer: Option<u64>,
+
+    /// A test's device whose platform states a bound on one GPU submission
+    /// (as Android's KGSL states 2 s): the bound every serving step is held
+    /// to, in place of the platform's (`engine_gpu::rates::
+    /// stated_submit_bound`). Test builds only (`test-limits`): no config
+    /// or profile reaches it.
+    #[cfg(feature = "test-limits")]
+    pub submit_bound: Option<std::time::Duration>,
 }
 
 impl Default for DeviceBoot {
@@ -46,6 +54,8 @@ impl Default for DeviceBoot {
             chunk_bytes: None,
             #[cfg(feature = "test-limits")]
             max_buffer: None,
+            #[cfg(feature = "test-limits")]
+            submit_bound: None,
         }
     }
 }
@@ -66,6 +76,9 @@ impl Host for Api {
         PortMask::DECODE_ENVELOPE
             .with(eta_ir::registry::Port::Fold)
             .with(eta_ir::registry::Port::AttnMask)
+            // Each beam's parent: the engine keeps the beams' page lists
+            // (`engine_gpu::beam`).
+            .with(eta_ir::registry::Port::Parents)
     }
 
     fn settles_asynchronously(_gpu: &Wgpu) -> bool {
@@ -79,8 +92,6 @@ impl Host for Api {
     ) -> EngineResult<(FireTicket, PendingStep)> {
         gpu.fire_step(step, at, false, None)
     }
-
-    fn submitted(_gpu: &Wgpu) {}
 
     fn run_prologues(
         gpu: &mut Wgpu,

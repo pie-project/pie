@@ -912,6 +912,7 @@ mod tests {
                 spatial
                     .programs
                     .bind(&InstanceBinding {
+                        resident: Default::default(),
                         program,
                         channels: vec![channel],
                         seeds: Vec::new(),

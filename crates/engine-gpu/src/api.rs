@@ -76,9 +76,6 @@ pub trait Host: Serve {
         at: engine::StepDone,
     ) -> EngineResult<(FireTicket, PendingStep)>;
 
-    /// Every step of a frame is submitted.
-    fn submitted(gpu: &Gpu<Self>);
-
     /// Before `step` resolves its inputs: the passes whose cells its forward
     /// reads. A pass that refuses (its instance poisoned, a guard) faults
     /// its own attachment's lanes into `faulted`; the others' run on.
@@ -281,10 +278,14 @@ impl<B: Host> Gpu<B> {
     /// lane's where it carries no prompt). `None` where it is admitted.
     fn admit_step(&mut self, step: &Step, at: engine::StepDone) -> Option<Error> {
         let shell = self.shell.as_mut()?;
+        // The fires landed so far move the scale this step is read at
+        // (`crate::submit::Measured`).
+        shell.track();
         let held = shell.submit_bound()?;
         let rows = crate::submit::StepRows::of(step);
         let admitted = held.admit(rows);
         let (whole, per_layer) = held.step_ns(rows);
+        let raw = held.raw_ns(rows).0;
         tracing::debug!(
             frame = at.frame.0,
             step = at.step,
@@ -296,8 +297,21 @@ impl<B: Host> Gpu<B> {
             estimate_ms = whole / 1e6,
             per_layer_ms = per_layer / 1e6,
             worst = held.worst,
+            probe_scale = held.scale,
+            measured_worst = held
+                .measured_rung(rows)
+                .map_or_else(|| held.measured.worst(), |rung| held.measured.worst_of(rung)),
+            measured_fires = held
+                .measured_rung(rows)
+                .map_or_else(|| held.measured.len(), |rung| held.measured.len_of(rung)),
+            stored_ratio = held.stored_ratio(),
+            measured_rung = ?held.measured_rung(rows),
+            error = held.error_for(rows),
+            floor_factor = held.floor_factor(),
+            ratio = held.ratio_for(rows),
             bound_ms = held.bound_ns / 1e6,
             split = admitted.split(),
+            layers_a_piece = ?admitted.layers_a_piece(),
             refused = matches!(admitted, crate::submit::Admitted::Refused { .. }),
             "submit bound: a step admitted"
         );
@@ -323,8 +337,56 @@ impl<B: Host> Gpu<B> {
                     .collect(),
             ));
         }
-        shell.split_next(admitted.split());
+        shell.split_next(admitted.layers_a_piece());
+        shell.estimate_next(Some(crate::submit::Estimated {
+            ns: raw,
+            at,
+            rows: rows.rows,
+            lanes: rows.lanes,
+            pieces: match admitted {
+                crate::submit::Admitted::Layers { submissions, .. } => submissions,
+                _ => 1,
+            },
+            hz: None,
+        }));
         None
+    }
+
+    /// Under a stated submit bound, where `step` is past it even a layer at
+    /// a time: the piece to fire before it and the rest, cut at the ratio
+    /// read now (`crate::submit::next_cut`). `None` where it is admitted as
+    /// it is, where no bound is stated, or where it cannot be cut (then
+    /// refused by name as it is admitted, the reason said here).
+    fn next_piece(&mut self, step: &Step) -> Option<(Step, Step)> {
+        let shell = self.shell.as_mut()?;
+        shell.track();
+        let held = shell.submit_bound()?;
+        let rows = crate::submit::StepRows::of(step);
+        match crate::submit::next_cut(held, step, &shell.trace().facts) {
+            Ok(None) => None,
+            Ok(Some((piece, rest, piece_rows))) => {
+                tracing::debug!(
+                    rows = rows.rows,
+                    lanes = rows.lanes,
+                    keys = rows.keys,
+                    piece_rows,
+                    ratio = held.ratio_for(rows),
+                    "submit bound: a step past the bound a layer at a time: a piece cut by rows"
+                );
+                Some((piece, rest))
+            }
+            Err(why) => {
+                tracing::warn!(
+                    rows = rows.rows,
+                    lanes = rows.lanes,
+                    keys = rows.keys,
+                    %why,
+                    "submit bound: a step past the bound a layer at a time cannot be cut by rows; \
+                     refused by name"
+                );
+                None
+            }
+        }
     }
 
     #[must_use]
@@ -394,6 +456,12 @@ impl<B: Host> Gpu<B> {
         let eager = self.shell.as_mut().map_or(0, Shell::eager_serving);
         if eager > 0 {
             self.live.tally(engine::live::Tally::Eager, eager);
+        }
+        // The submit-bound probes, apart from the model's fires: recorded at
+        // load where the backend keeps recordings.
+        let probed = self.shell.as_mut().map_or(0, Shell::probed_serving);
+        if probed > 0 {
+            self.live.tally(engine::live::Tally::Probed, probed);
         }
         let unkept = self.shell.as_mut().map_or(0, Shell::unkept_serving);
         if unkept > 0 {
@@ -522,12 +590,26 @@ impl<B: Host> Gpu<B> {
                 .iter()
                 .filter_map(|value| Some((value.output.as_deref()?, value.lane))),
         );
+        // A beam group's state, laid for the search's depth (the bind's
+        // `key_len`, its end slot), the load's kv page and its frames in
+        // flight.
+        let beam = crate::beam::lanes_of(package)
+            .map(|lanes| {
+                crate::guest::state::BeamLayout::of(
+                    lanes,
+                    extents.key_len,
+                    shell.paging().page_size,
+                    u32::try_from(shell.frames_in_flight()).unwrap_or(u32::MAX),
+                )
+            })
+            .transpose()
+            .map_err(|why| Error::Program(format!("program {program}'s state: {why}")))?;
         crate::guest::state::GuestLayout::of_plans(
             &package.plans,
             &crate::guest::state::extents_of(extents),
             scores,
         )
-        .map(Some)
+        .map(|layout| Some(layout.with_beam(beam)))
         .map_err(|why| Error::Program(format!("program {program}'s state: {why}")))
     }
 
@@ -546,14 +628,19 @@ impl<B: Host> Gpu<B> {
         };
         for (step, pending) in steps.iter_mut().enumerate() {
             let mut outcome = engine::StepOutcome {
+                beam_common: Vec::new(),
                 wrote: std::mem::take(&mut pending.wrote),
                 faulted: std::mem::take(&mut pending.faulted),
             };
             // The frame settled: every step's forward landed.
             if let Some(fed) = pending.fed.take() {
                 outcome = crate::settle::merged(outcome, fed.faults());
+                outcome.beam_common = fed.commons();
             }
-            if !outcome.wrote.is_empty() || !outcome.faulted.is_empty() {
+            if !outcome.wrote.is_empty()
+                || !outcome.faulted.is_empty()
+                || !outcome.beam_common.is_empty()
+            {
                 let at = engine::StepDone {
                     frame: *frame,
                     step: step as u32,
@@ -604,6 +691,7 @@ pub fn refusal(refusal: Refusal) -> Error {
     match refusal {
         Refusal::Closed { what, id } => Error::Closed { what, id },
         Refusal::Program(why) => Error::Program(why),
+        Refusal::Claimed(refusal) => Error::Claimed(refusal),
     }
 }
 
@@ -616,6 +704,7 @@ pub fn fault(fault: Fault) -> Error {
     }
     match fault {
         Fault::Deviceless | Fault::Device { .. } => Error::Device(fault.to_string()),
+        Fault::TierFull(_) => Error::TierFull(fault.to_string()),
 
         Fault::PatchPayload { .. } => Error::Invalid(fault.to_string()),
 
@@ -652,6 +741,7 @@ pub fn fault(fault: Fault) -> Error {
 
         Fault::Adapter { .. } => Error::Load(fault.to_string()),
         Fault::Blob { .. } => Error::Load(fault.to_string()),
+        Fault::Claimed(refusal) => Error::Claimed(refusal),
         Fault::Program { .. } => Error::Program(fault.to_string()),
         Fault::Vulkan { .. }
         | Fault::Wgpu { .. }
@@ -947,6 +1037,12 @@ where
                 storage_max_tile_bytes: shell.max_buffer(),
 
                 codegen_backend: None,
+                // The WGSL emitter compiles a program's steps from its ops and
+                // has no library regions: no form is served as a library call.
+                library_forms: engine::LibraryForms {
+                    draw: false,
+                    bf16_cut: false,
+                },
             },
             pools,
             chunks,
@@ -964,6 +1060,10 @@ where
                     .unwrap_or(0),
                 prefill_lanes: 0,
                 max_readouts,
+                // A fire's staged rs table holds as many carried tokens as
+                // its widest bucket's rows, every lane's summed, a decode
+                // lane's included (`inputs::rs_carry_ints`).
+                replayed_rows: if shell.pools().rs_rows().is_some() { max_tokens } else { 0 },
             },
             has_lora: true,
             has_attn_page_mask: false,
@@ -990,12 +1090,13 @@ where
             guest_cost: {
                 let rates = crate::backend::Tactics::profile(shell.tuning()).rates();
                 engine::GuestCost {
-                    submit_bound_ns: crate::rates::STATED_SUBMIT_BOUND
-                        .map(|bound| u64::try_from(bound.as_nanos()).unwrap_or(u64::MAX)),
+                    submit_bound_ns: shell.submit_bound().map(|held| held.bound_ns as u64),
                     launch_ns: rates.launch_ns,
                     elementwise_gbps: rates.elementwise_gbps,
                 }
             },
+            mixed_lanes: engine::MixedLanes::Any,
+            frames_in_flight: engine::stated_frames(shell.frames_in_flight())?,
         };
 
         self.shell = Some(shell);
@@ -1192,6 +1293,46 @@ where
         self.refused(registered)
     }
 
+    /// The runtime's standard samplers, before ready: each adopted and its
+    /// stages lowered as its registration does them, and every step call
+    /// their stages dispatch held to a pipeline the load built
+    /// (`Programs::load`), so a request that registers one, or binds it,
+    /// builds nothing. A program that does not adopt, or that dispatches a
+    /// call the load could not build, fails the load by name. No stage holds
+    /// code of its own (`guest::Compiled`): nothing here is keyed on a
+    /// program's hash, which its channels' capacities enter.
+    fn prewarm_programs(&mut self, registrations: &[ProgramRegistration]) -> EngineResult<()> {
+        if self.shell.is_none() {
+            return Err(Error::Program(
+                "the standard samplers prewarmed before load".to_owned(),
+            ));
+        }
+        let started = std::time::Instant::now();
+        let prewarmed = crate::program::prewarm(registrations).map_err(refusal)?;
+        for &call in &prewarmed.calls {
+            if let Some(why) = self.programs.unbuilt(call) {
+                return Err(Error::Load(format!(
+                    "a standard sampler dispatches guest step call {call}, which the load did \
+                     not build: {why}"
+                )));
+            }
+        }
+        tracing::info!(
+            engine = B::KIND,
+            programs = prewarmed.programs,
+            stages = prewarmed.stages,
+            calls = prewarmed.calls.len(),
+            built_serving = self.programs.built_serving(),
+            slowest_ms = prewarmed.slowest.as_secs_f64() * 1e3,
+            ms = started.elapsed().as_secs_f64() * 1e3,
+            hashes = format_args!("{:016x}", prewarmed.hashes),
+            forms = format_args!("{:016x}", prewarmed.forms),
+            "the standard samplers adopted before ready; every step call they dispatch has its \
+             pipeline from the load"
+        );
+        Ok(())
+    }
+
     /// The program adopted and its stages lowered in the returned compile,
     /// off the engine's thread (`program::adopt`); nothing of the plane's
     /// is touched until the finish.
@@ -1342,6 +1483,18 @@ where
         self.programs.take(instance, channel).map_err(refusal)
     }
 
+    /// Beam `beam`'s page list of `instance`'s group as its last fire left
+    /// it (`BEAM-PAGE-LISTS.md` §6.6): every fire in flight lands first,
+    /// then the state's last list is read from the pool.
+    fn beam_list(&mut self, instance: InstanceId, beam: u32) -> EngineResult<Vec<u32>> {
+        let shell = self.shell.as_mut().ok_or_else(unloaded::<B>)?;
+        shell.drain().map_err(fault)?;
+        let resident = self.programs.beam_state(instance).ok_or_else(|| {
+            Error::Program(format!("instance {instance} binds no beam group (parents)"))
+        })?;
+        resident.list(shell.pools(), beam).map_err(fault)
+    }
+
     fn settles_asynchronously(&self) -> bool {
         B::settles_asynchronously(self)
     }
@@ -1467,6 +1620,10 @@ where
         // The frame before can no longer be asked for its rows.
         if let Some(shell) = self.shell.as_mut() {
             shell.open_frame();
+            // Under a stated submit bound, a frame that follows an idle
+            // device re-times its clock before its first step is admitted
+            // (`crate::submit`); nothing runs where no bound is stated.
+            shell.retime(id).map_err(fault)?;
         }
 
         let mut steps = Vec::with_capacity(frame.steps.len());
@@ -1489,8 +1646,48 @@ where
             };
             // Held to the platform's bound on one submission, where it
             // states one (`crate::submit`): a step past it whole walks a
-            // layer at a time; past it even so, its lanes are refused by
-            // name. Nothing is estimated where no bound is stated.
+            // layer at a time; past it even so, its prompt lane is cut by
+            // rows, its leading pieces fired first, each alone and held
+            // to the bound in turn; a step no row of which fits, or that
+            // cannot be cut, has its lanes refused by name. Nothing is
+            // estimated where no bound is stated.
+            let mut rest: Option<Step> = None;
+            let mut piece_failed = None;
+            loop {
+                let current = rest.as_ref().unwrap_or(step);
+                // The first piece at the ratio read now: the pieces landed
+                // before move it (`crate::submit::Measured`).
+                let Some((piece, after)) = self.next_piece(current) else {
+                    break;
+                };
+                if self.admit_step(&piece, at).is_some() {
+                    // Chosen to fit: refused only past what was weighed;
+                    // the step is refused as a whole, by name.
+                    piece_failed = self.admit_step(current, at);
+                    break;
+                }
+                // A piece tells no completion: the step's last piece does.
+                let fired = self.fire_step(&piece, at, true, None);
+                if let Some(shell) = self.shell.as_mut() {
+                    shell.split_next(None);
+                    shell.estimate_next(None);
+                }
+                if let Err(error) = fired {
+                    piece_failed = Some(error);
+                    break;
+                }
+                rest = Some(after);
+            }
+            if let Some(error) = piece_failed {
+                if error.stops_frame_at(index) {
+                    refused = Some(error);
+                    break;
+                }
+                self.pending = None;
+                self.count_built();
+                return Err(error);
+            }
+            let step = rest.as_ref().unwrap_or(step);
             if let Some(refused_lanes) = self.admit_step(step, at) {
                 if refused_lanes.stops_frame_at(index) {
                     refused = Some(refused_lanes);
@@ -1502,7 +1699,8 @@ where
             }
             let fired = B::step(self, step, at);
             if let Some(shell) = self.shell.as_mut() {
-                shell.split_next(false);
+                shell.split_next(None);
+                shell.estimate_next(None);
             }
             match fired {
                 Ok((ticket, step_pending)) => {
@@ -1522,7 +1720,6 @@ where
                 }
             }
         }
-        B::submitted(self);
         self.count_built();
         let mut ticket = FrameTicket::of(id, steps, refused);
         self.pending = Some((id, pending));
@@ -1663,6 +1860,56 @@ impl<B: Host> Gpu<B> {
                         &refused.to_string(),
                     ),
                 }
+            }
+        }
+
+        // Each beam group's state, layout and parents
+        // (`crate::beam`): its lanes reorder their page lists on the device
+        // ahead of the forward. An instance that refuses faults its own
+        // lanes, which then read their staged tables (their set's pages).
+        let mut beams: Vec<crate::beam::Group<B>> = Vec::new();
+        for attachment in program_attachments(submission) {
+            let lanes = attachment_lanes(attachment);
+            let group = self
+                .loaded()
+                .map_err(|error| Refusal::Program(error.to_string()))
+                .and_then(|shell| self.programs.beam_group(attachment.instance, shell.pools()));
+            let refused = match group {
+                Ok(None) => None,
+                Ok(Some((state, layout, parents))) => {
+                    let stated: Vec<&engine::fire::Lane> = lanes
+                        .clone()
+                        .filter_map(|at| submission.lanes.get(at as usize))
+                        .collect();
+                    match stated.first() {
+                        Some(first)
+                            if stated.iter().all(|lane| {
+                                lane.reserve == first.reserve && lane.kv.folded == first.kv.folded
+                            }) && !first.reserve.is_empty() =>
+                        {
+                            beams.push(crate::beam::Group {
+                                instance: attachment.instance,
+                                state,
+                                layout,
+                                parents,
+                                lanes: lanes.clone().map(|at| at as usize).collect(),
+                                reserve: first.reserve.clone(),
+                                folded: first.kv.folded,
+                            });
+                            None
+                        }
+                        _ => Some(format!(
+                            "instance {}'s beams state no working set's reserve, or not one \
+                             set's: a beam group's lanes name one set and its whole kv table \
+                             (BEAM-PAGE-LISTS.md §2, §6.5)",
+                            attachment.instance
+                        )),
+                    }
+                }
+                Err(refused) => Some(refused.to_string()),
+            };
+            if let Some(why) = refused {
+                faulted.fault_lanes(lanes, Some(attachment.instance), &why);
             }
         }
 
@@ -1957,6 +2204,7 @@ impl<B: Host> Gpu<B> {
                     folds: &folds,
                     done,
                     guests,
+                    beams: &beams,
                 },
                 None,
             )
@@ -1964,9 +2212,9 @@ impl<B: Host> Gpu<B> {
             wrote = std::mem::take(&mut prepared.wrote);
             // A lane fed its token on the device is checked once the
             // forward landed, from what the forward embedded.
-            if let Some(vocab) = vocab
-                && !prepared.fed_lanes.is_empty()
+            if !prepared.beam_faults.is_empty() || (vocab.is_some() && !prepared.fed_lanes.is_empty())
             {
+                let vocab = vocab.unwrap_or(u32::MAX);
                 let lanes = prepared
                     .fed_lanes
                     .iter()
@@ -1982,10 +2230,23 @@ impl<B: Host> Gpu<B> {
                         }
                     })
                     .collect();
-                let check = crate::settle::FedCheck::new(
+                let beams = prepared
+                    .beam_faults
+                    .iter()
+                    .map(|&(word, lane, instance)| crate::settle::BeamWord {
+                        word,
+                        lane: u32::try_from(lane).unwrap_or(u32::MAX),
+                        instance,
+                    })
+                    .collect();
+                let commons = prepared.beam_commons.clone();
+                let check = crate::settle::FedCheck::with_beams(
                     shell.token_row_reader(prepared.arm),
                     lanes,
                     vocab,
+                    shell.store_word_reader(prepared.arm),
+                    beams,
+                    commons,
                 );
                 prepared.fed_check = Some(check.clone());
                 match prepared.done.as_mut() {

@@ -361,6 +361,54 @@ pass), against native Vulkan's 22.5 ms recorded step. From 4 lanes the gate
 wait is 133–156 ms of GPU time (the bf16 GEMM's `VECTOR_MAX_ROWS = 4`
 boundary), not host time.
 
+## F29. A parked role slot rounds up to whole kv slots of the slot file
+
+Where the load states no host tier (unified memory), a parked process's
+role slots (Instance, Channel, Adapter) go down to the kv slot file, each
+whole in a run of `ceil(slot_bytes / kv slot_bytes)` adjacent file slots
+(`Roles::prepare_park_down`, `DiskSlots`, CONTRACT-BC 22 in
+`Engine::copy_slots`), counted against `budget_disk` with kv: exact, no
+file or budget of its own, any size. The cost is rounding: a 4 KiB
+Instance slot holds a whole kv page's slot (≈1–2 MiB), so 500 parked
+processes of 8 small role slots take 4000 of the file's slots, while a
+slot wider than a kv page wastes under one kv slot. Packing several small
+role slots into one file slot (an offset inside it, aligned for the
+file's direct I/O) would cut that; measure the file's room under the M1 /
+M5 loads first. With guest scratch held only while a fire is in flight,
+only the small resident part (tables, rings) parks at all.
+
+## F31. Metal syncs and drains the host waits on (audits on 5355faa9a)
+Each turns depth into depth 1 or adds host work per step; CUDA does the same in queue order.
+- A fresh recurrent-state record is zeroed after draining every frame in flight
+  (engine-metal serve.rs:4540-4544): every hybrid / SSM admission runs at depth 1, uncounted. Zero it in queue
+  order, as a fill in the next command buffer (CUDA: serve/enqueue.rs:447-448).
+- Tier moves drain on every `copy_slots` (serve.rs:2003) and `read_tier_slots` (serve.rs:2025). Copies go in
+  queue order and land through the command buffer's completion (with `copy_slots_landing`), no drain.
+- Device-geometry programs: `fence_instances` waits on the last fire, then reads each port per lane on the host
+  (serve.rs:3604, program/ports.rs:20). On unified memory they can be read in place, without the wait.
+- Each prologue region commits and calls waitUntilCompleted (program/launch.rs:2140), once per instance per
+  region: O(lanes) syncs a step.
+- `admit_list_page` for every page of every lane each step (serve.rs:4523): ~64k calls at 256 lanes x 256
+  pages, ~1-3 ms.
+- The walk re-encodes ~1700 launches a step with a SipHash lookup per launch (serve.rs:5474,
+  device/library.rs:151).
+- kernels-metal has the VECTOR_MAX_ROWS = 4 GEMM cliff (linear/gemm.rs:33), and the qmv fold only folds
+  divisors <= 8, so 11 rows take ~11 weight passes (linear/qmv/rows.rs:60).
+- Metal never counts the Refused tally.
+- Measured on the M1 (Qwen3-0.6B, 2026-11-19): no guest binds as device geometry today (a beam mix bound 2080
+  Host-class instances and 32 DecodeEnvelope, beam included, and none DeviceGeometry), so the port read above
+  does not run for them. But `fence_instances` (serve.rs ~3684) holds every attached instance, whatever its
+  class, to its last fire's landing before its next is staged (a session's one status word, the host reading
+  its cells between fires): every guest lane runs at depth 1. The GPU idles between frames 7.3% of its time at
+  1 lane, 9.5% at c16 and 15.1% at c64 (each frame's command-buffer start / end), the host's take, settle
+  and next stage+encode not overlapped. Two status words a session (the host's take deferred one step, as
+  CUDA's decode envelope does) is worth scoping after the scratch-in-flight split.
+- An instance's value scratch is held once, not a frame in flight each (no two of its fires overlap); its
+  pair's batch tables must stay a set a frame in flight: consecutive frames fire different instances of one
+  pair. Cutting both to one set broke beam --verify (62 / 57 / 38 of 64, "read another beam's cells");
+  cutting only the instance scratch kept 64 / 64 and halved it (11.4 -> 5.7 MB an instance, 45.6 -> 22.8 MB
+  a beam instance).
+
 ## F32. ROCm last-block (ticket) fusions: the split decode's fold and the norm epilogues, measured and dropped
 
 Tried on memory-redesign a34acca57 (local f3072dde9, not landed): the
@@ -402,6 +450,42 @@ partials summed by the last block). On MI300X a ticket tail (stores through
 the L2, the atomic's round trip, reads past the L2) costs more than the
 ~1.6 us node it removes. Fusions that cut nodes there want one block to own
 the whole row (no tail), not a last-block reduction.
+
+## F33. Metal's few-row dense matmul on the M1: 4 rows ≈ 1.38× one row
+The user's rule is that a beam-4 step costs about what a single greedy step costs. On the M1 Max
+(Qwen3-0.6B, home-carve), after `sc/mac-gemv-rows` (0bc7019c8, few-row forms that read each weight row
+once), a step costs: greedy ×1 5.96 ms, 4 parallel greedy 8.21 ms, beam-4 8.31 ms. The device profile of
+a 4-row decode fire is 8.1 ms (projections 5.7 ms, against 3.9 ms at 1 row); the rest is flat.
+Tried and dropped (each passed the few-row matmul test; device time of the wide projections at 4 rows,
+against 3.9 ms for 0bc7019c8):
+- weights converted once for all rows: 3.9 ms (conversion is not the bottleneck);
+- activation rows staged per threadgroup as floats, 8 columns, 64-group tiles: 4.5 ms; resized to 32 KiB
+  (16 columns, 1024/R groups): 4.7 ms (barriers, and one threadgroup a core);
+- 4 columns a simdgroup, an activation load shared by 4 weight rows: 4.2 ms (fewer simdgroups, register
+  pressure);
+- the 8×8 simdgroup matrix multiply, rows padded to 8, D^T = W x A^T with each lane's weight operand a
+  contiguous bf16 pair (patch kept in the Metal session's scratchpad): projections 7.5 / 7.8 / 8.4 ms at
+  2 / 4 / 8 rows, against 4.4 / 5.7 / 9.2 ms. Flat in the rows, as a weight-read-bound form should be,
+  but bound by its 4-byte weight loads: it beats 0bc7019c8 only at 8 rows (fire 12.1 -> 11.3 ms).
+What could still close it: the matrix form with wider weight loads (weights pre-packed so a lane's
+operand pairs come from one 16-byte load, or several 8×8 blocks a load), which needs a packed weight
+layout; or a kernel that is load-issue-bound at the M1's rate rather than per-lane. Measure on the M5
+(tensor ops) before choosing: the M1 is not where Apple's decode will be judged. Measured on the M5 at
+a34acca57 (Mac Pro, same method): greedy ×1 5.08 ms, 4 parallel 5.52 ms (1.09×), beam-4 6.09 ms (1.20×);
+the 4-row projections take the few-row vector forms there too (3.4 + 1.3 ms against 3.2 + 1.1 at one row),
+so the M5 meets the rule within ~20% and the gap is the M1's.
+Then tried at the user's ask, the packed form (prototype, not landed; patch in the Metal session's
+scratchpad, gemv-mma8-packed.patch): weights packed at load per 8-column block and 32-wide K group so a
+lane's four 8×8-block operands are one 16-byte load, K permuted inside a group so a lane's activations of
+a row are one 8-byte load, the contraction split across a threadgroup's 8 simdgroups (partial tiles summed
+in threadgroup memory). Device time of Qwen3-0.6B's four projection shapes, summed: routed (0bc7019c8)
+88–100 / 116–132 / 155–185 / 271–289 µs at 1 / 2 / 4 / 8 rows; packed 164 / 165 / 145 / 129 µs. Flat in
+the rows, but it floors at ~145–160 µs at 4 rows against ~90 µs for the routed one row (which runs near
+the M1's bandwidth): 1.6–1.8×, not the ≤1.05× asked. Each step removed what it targeted (split widths 4 /
+16 and four independent accumulators changed nothing), so the floor is the M1's simdgroup-matrix rate
+(Apple7 has no tensor units). Taking it would mean a second copy of every dense weight (one row stays on
+the routed forms): ~0.88 GB for Qwen3-0.6B, ~1.19 GB with the LM head, for −10–15% at 4 rows. Not taken;
+the M1's gap to the rule stays here.
 
 ## F34. Tensor-parallel score capture: the score row's reduce across ranks
 Since Dim::Capturing (9e78d2281) a capturing lane's key row is summed over the layers in place, so under tensor parallelism each rank holds a partial row and the shard pass emits one all_reduce on it, in place on the Capture-placed row (the arena's one exact Capture-to-Capture share; `sc/gpu-poem-suite-mask`). Guest epilogues read that row on the device (CUDA: the reading guest's instance slots, `engine-cuda/src/scores.rs`; engine-gpu: the pair's score room), so it can't be summed at host readout. The rows are scattered one per capturing lane, outside the arena, so engine-cuda (CUDA / ROCm) and engine-gpu (the band collective) refuse a tensor-parallel load that captures scores, by name, instead of reducing the wrong memory. Metal (collectives unsupported) and XLA (single replica) never see it; the CPU oracle sums correctly.
@@ -823,7 +907,166 @@ whichever submit is in flight; the test catches it when that submit overlaps the
 The test stays strict, known on this device. Owed: driver-level tracing on that box (not
 nsys, which bluescreens it), or a driver update that moves it.
 
-## F42. Vulkan: a fire's class windows bind at offsets the fire moves
+## F42. The first request after boot runs slow; the first served fire of each XLA shape too
+
+Two one-time costs after ready, measured on v6e qwen3-0.6b (census config), tip and the
+mixed decode capacity alike:
+
+- The server's first request of an inferlet: 117 ms against 22 ms for the next ones (a
+  12 ms install, guest registrations cache hits of ~1 ms). A burst that arrives first
+  piles up behind it: the first staggered load after boot runs 1508 tok/s against 2189 on
+  the next, and one tiny request beforehand brings the first staggered load to 2335
+  against 2345. It sits in the runtime's first launch of an inferlet program (not the
+  engine's programs); naming it is the runtime's.
+- XLA: the first served fire of each fire shape runs 2.5-6 ms longer on the device than
+  its median (PIE_XLA_TIMING: a 1536-row mixed fire 23.6 against 17.4 ms, an 8-lane
+  decode 5.6 against 2.2 ms; about 45-50 ms over the 20 shapes a first load touches; host
+  stage unchanged, nothing compiled or loaded after ready). Executing every laid program
+  once at load, on scratch, does not remove it (2.36 against 2.47 ms mean excess, at 17 s
+  of boot), so it is not an executable's first execution: something a served fire of a
+  shape first touches (its staged inputs' device buffers, its readout seats) that a
+  scratch fire does not. Unnamed; small next to the first item.
+
+## F43. A mixed fire with no canonical shape compiles after ready (the runtime composes it)
+
+`canonical_pads` (engine-xla serve) pads a fire that prefills to rungs so a laid program
+holds it, and returns None where no laid shape exists; the fire then goes out at its exact
+lane counts and compiles mid-run. One composition the runtime forms: 35 three-row prompts
+beside 17 decodes (128 rows, 53 lanes, v6e qwen3-0.6b c64). Its prompts pad to the 64-lane
+rung, which leaves 16 decode lanes within max_lanes (80); 17 decodes fit neither 16 nor
+their rung 32 (96 lanes). Base's rule has the same gap (the decodes' rung 32 > the 16 left
+and 17 > 16); with the mixed decode capacity (decodes beside prompts pad to the largest
+decode rung their prompts' rung leaves) it hit 2 of 4 serving runs (a c64 pass at 642
+tok/s), base 0 of ~10.
+
+A contract bug: a served fire with no laid shape is a compile after ready. Fix on the
+cutter (runtime, every backend): never compose a mixed fire the engine has no canonical
+shape for; seat the decodes and the prompts that fit beside them, and defer the rest to the
+next fire. The ladder stays as it is (no half rungs, no extra programs). Test case: the
+composition above.
+
+Also after ready, and not a fire's: a built-in inferlet's guest stages compile at its first
+registration on a machine (v6e, beam_search at widths 1, 4, 8: six guest programs, a prompt
+and a decode epilogue a width, x 8 batch rungs = 48 compiles of ~23 KB texts, ~20 s for each
+new width's first request). They persist: the next boots' same registrations took 0.017 s
+and 0.032 s, 0 compiles after ready, and the beam fires themselves were on the ladder (0
+misses). The width is a constant of the inferlet's trace, so no ladder derives them; laying
+built-ins' guest programs before ready is GPU's queued item.
+
+## F44. engine-cuda reads its cgroup room itself; move it onto engine::host_memory
+
+`engine::host_memory::available` now leaves a capped cgroup `memory.max` less `memory.current` less
+`memory.stat inactive_file` (v6e: 150 GiB user.slice, 115 GiB charged, 96 GiB of it file cache,
+read 2 GiB free before and ~95 GiB after; the XLA guest compile ledger had refused a 2.3 GiB stage
+by name). engine-cuda nets the page cache in its own reader (`weights.rs` ~372-407), counting
+`inactive_file + active_file`. Move engine-cuda onto the shared reader and settle one rule for both:
+inactive only (what the kernel reclaims first, before a charge fails: the conservative room) or
+inactive + active (all file cache, which reclaim reaches under pressure).
+
+## F47. General per-lane split of a pass whose whole demand exceeds the device
+
+A pass whose whole demand (every lane's kv and state) is past the device while each lane fits
+alone is refused today (only a unit past the whole device alone is refused at submit, bc9354e5a).
+The general split by lanes into sub-fires that each fit needs part outputs held and joined by the
+engine across backends, and per-set parking of finished groups in the planner. The beam example's
+per-copy prefill is fixed by forking instead; not a runtime gate.
+
+## F45. Remove the 600 s silence timeout
+
+The frame gate no longer drops a lane on a timer (the leash and `submit-deadline-us` are gone):
+a lane whose guest waits on outside input is parked by the host (`process::away_while`: session
+receives, `wasi:clocks` waits, an HTTP request until its response head), and a computing lane
+stays awaited. `runtime.silence_timeout` still terminates an awaited lane silent that long.
+Remove it once each case it still catches has its own mechanism:
+- (a) poll-mixed waits are classified: `wasi:io/poll` in componentize-js / py language
+  components (one poll can mix the guest's own pie futures with outside ones, so parking on
+  every poll would un-await own-fire waits), HTTP response-body streams after the head, and
+  sockets;
+- (b) a guest spinning in wasm without submitting;
+- (c) a completion that never arrives (a lane in flight for twice the timeout is terminated
+  through the same path today).
+
+## F46. Something writes into the guest lane arenas' split lines while a meeting runs, under overlap (ROCm, found 2026-11-20)
+
+While building self-resetting meet counters (each split row's meeting leaving its word's count
+zero, the split select's merge zeroing its count, so no memset before each split launch), the
+engine-cuda ROCm integration set (every_op / epilogue / suite / beam / guest, 18 tests) hung at
+every_op_agrees_with_the_host_interpreter when run in one process. It needed the accumulation
+of the earlier tests: each test alone, each paired with every_op, and either half of the set
+passed. The tip passes that point.
+
+The check: before every split row or split select launch, sync the stream, read every split
+lane line of the arenas (16 words each, `lane_span(1)` apart) and report any non-zero count,
+naming the launch before it. With it on, the whole set passes (152 s) and no count is ever
+found dirty. So no launch leaves a count behind. Something disturbs a meeting while it runs,
+and only when work overlaps: the sync before each split launch removes the overlap and the
+hang.
+
+Meeting groups are forked onto main (`fan.fork(&meet, main)`), so two meeting regions do not
+run side by side. The writer is not found. Candidates: a run-ahead frame's staging next to the
+arenas in the activation span, or another run of that span (`Shell::staged_runs`) laid over
+them.
+
+The tip's per-launch memset (`zero_barriers` before each split launch) re-zeroes the counters,
+so its meetings are immune. But a concurrent writer into the guest arenas could as well corrupt
+the partials and candidates the split regions publish there: silent wrong results, not a hang.
+
+Tool for whoever picks it up: the sync-and-read check above, on a build without the memset
+(the self-resetting branch, `sc/amd-meet-reset-dropped`, local on the MI300X host), plus the
+fire's stream map at the stalled launch.
+
+## F48. Beam page lists: per-group reserve terms against a pool-wide reserve by fires in flight
+
+A beam group's pool (`new-memory/designs/BEAM-PAGE-LISTS.md` §3) grows a
+column at a time to `B (c + 2) + B F + 1` pages: each live column's pages,
+plus `B` pages one fire may hand out and `B F` pages freed in the `F`
+frames in flight, terms every group carries whatever its length. At short
+lengths they are most of the reserve: 64 tokens, B = 4, F = 2 reserves up
+to 33 pages against the earlier shared pool's 18, and the 9 GiB-capped
+200-beam + 300-decode gate on MI300X ran 25-28 s against the tip's 21-22 s
+(uncapped 16 s both: speed parity, a capacity cost). Measure whether the
+`B` handed and `B F` pending terms can come from one pool-wide reserve
+sized by the fires in flight across groups (a fire hands out at most `B`
+pages per group it runs, and frees wait `F` fires whichever group freed
+them) without weakening the per-step guarantee that a fire never opens a
+column it cannot back: the capped gate's walls against the tip, the pages
+the planner counts per group, and the refusals under over-demand.
+
+## F49. The host tier takes a held guest part past a chunk only whole: it parks in place instead
+
+A held guest part (an instance's resident state, `GuestState::resident`, or a
+place the runtime holds whole) moves to the host tier through `take_parts`,
+which asks the host for one contiguous run of slots. A run of slots never
+spans chunks, so a held part larger than a chunk finds no host room even where
+the host has room for its bytes, and the park leaves it where it lies (shed):
+device room stays held that a move down would have freed, a cost under
+over-demand. Fix shape: the host take places a held part as several runs, the
+way the device's retake does (`pieces` runs of `chunks` whole chunks), the
+part's place stating its runs, and the copies and the unpark follow them.
+
+## F50. Hybrid beam replay grows with lineage divergence
+
+On a hybrid model each beam lane replays its buffered rows past its group's
+common ancestor every step (`new-memory/designs/BEAM-PAGE-LISTS.md` §11.3,
+`[c, s_t]`). Where two lineages stay apart, the rows grow with the steps
+since they parted: Vulkan Qwen3.5 beam-4 on one prompt carried 4 × 257 rows
+at step 257, past the 1024-row bound engine-gpu's staged rs table holds (the
+widest bucket's tokens), and is refused: over-demand that must be served.
+The table addresses each carried row's rs page (one rs row a page on
+engine-gpu's Qwen3.5 plan), so sizing it for each lane's rows to its context
+is about 1 GB at 256 lanes x 262k context; chunked passes do not help on
+engine-gpu, whose carried kernels fold uncommitted rows into sums over the
+own row's q and k inside each layer. A beam lane's row-to-page map is already
+on the device in its group's resident lists (§11.1), which a resolve through
+them would use with no context-sized table (Leader's call pending). Served
+or not, the cost per step grows with the divergence (O(steps) replay,
+O(steps²) over a search). CUDA (`serve/prepare.rs`), Metal and XLA keep a
+`max_tokens` bound today. A bound by design is a spec question for AMD / Leader: per-beam
+state checkpoints (each beam's recurrent state kept at page boundaries, so a
+beam replays at most a page past its last checkpoint) would bound the replay
+by a page at the cost of a state per beam per page.
+
+## F51. Vulkan: a fire's class windows bind at offsets the fire moves
 A fire that mixes classes (prefill rows with decode lanes) binds each class
 window's views at the window's row / lane offset, which moves with the rows of
 the classes before it, so those fires still record a family per prefill length
@@ -833,7 +1076,7 @@ since the lanebase merge: sdpa reads its planes and tables whole from `row0`,
 which the kernels read from the fire block (`PIE_FIRE(row0)`); the other
 kernels a window launches still bind at its offset.
 
-## F43. A buffering recurrent fire makes more dispatches than the load's bound
+## F52. A buffering recurrent fire makes more dispatches than the load's bound
 A fire whose lanes buffer their recurrent rows (`RsVerb::Buffer`: a beam's, a
 draft's) moves rows into and out of the rs buffer a page at a time
 (`engine-gpu dispatch/rs.rs` `rs_move` / `rs_copy`), so its dispatches grow
@@ -843,7 +1086,7 @@ fire block) is the folding fires'. The copies become one kernel over the
 lane's page table (the rs copy loop in VULKAN-RECORD-AT-LOAD §4), after
 which the buffering fire's count is rung-free and joins the bound.
 
-## F47. Vulkan: a first-seen prefill wider than the GEMV row tile walks once for its fill
+## F53. Vulkan: a first-seen prefill wider than the GEMV row tile walks once for its fill
 The load records every body (VULKAN-RECORD-AT-LOAD), and a fire of a fixed
 body (decode buckets, fires within the widest vector-GEMM row tile) fills
 from it without a walk (`fill_body`). A prefill wider than the tile runs an

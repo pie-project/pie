@@ -27,6 +27,21 @@ pub fn set_knob(name: &str, v: u32) {
     knobs.push((name.to_string(), v));
 }
 
+/// Drops what [`set_knob`] set `name` to.
+pub fn clear_knob(name: &str) {
+    KNOBS.lock().expect("the knobs").retain(|(n, _)| n != name);
+}
+
+/// What [`set_knob`] set `name` to, if anything.
+pub fn set_knob_of(name: &str) -> Option<u32> {
+    KNOBS
+        .lock()
+        .expect("the knobs")
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|&(_, v)| v)
+}
+
 /// A load budget: what [`set_knob`] set, else `PIE_XLA_TEST_<name>`, else
 /// `default`.
 fn knob(name: &str, default: u32) -> u32 {
@@ -217,6 +232,9 @@ impl Model {
             disk_kv_dir: disk.map(std::path::Path::to_path_buf),
             disk_kv_budget: disk.map(|_| 64 << 20),
             weights_held: held,
+            // `set_knob("HOST_PROGRAMS_MIB", n)`: the warm ladder holds
+            // n MiB of programs in host memory, parking the rest
+            host_programs: set_knob_of("HOST_PROGRAMS_MIB").map(|mib| u64::from(mib) << 20),
             ..Residency::default()
         };
         let loaded = engine

@@ -46,6 +46,14 @@ pub struct DeviceBoot {
     /// only (`test-limits`): no config or profile reaches it.
     #[cfg(feature = "test-limits")]
     pub max_buffer: Option<u64>,
+
+    /// A test's device whose platform states a bound on one GPU submission
+    /// (as Android's KGSL states 2 s): the bound every serving step is held
+    /// to, in place of the platform's (`engine_gpu::rates::
+    /// stated_submit_bound`). Test builds only (`test-limits`): no config
+    /// or profile reaches it.
+    #[cfg(feature = "test-limits")]
+    pub submit_bound: Option<std::time::Duration>,
 }
 
 pub type Vulkan = engine_gpu::api::Gpu<Api>;
@@ -64,6 +72,9 @@ impl Host for Api {
         PortMask::DECODE_ENVELOPE
             .with(eta_ir::registry::Port::Fold)
             .with(eta_ir::registry::Port::AttnMask)
+            // Each beam's parent: the engine keeps the beams' page lists
+            // (`engine_gpu::beam`).
+            .with(eta_ir::registry::Port::Parents)
     }
 
     fn settles_asynchronously(gpu: &Vulkan) -> bool {
@@ -121,32 +132,26 @@ impl Host for Api {
         } else if defers && let Some(sink) = gpu.sink.as_ref() {
             // The forward's own report was held for the sampler.
             let mut held = engine::StepOutcome {
+                beam_common: Vec::new(),
                 wrote: std::mem::take(&mut step_pending.wrote),
                 faulted: std::mem::take(&mut step_pending.faulted),
             };
             // Its rows are read: the forward landed.
             if let Some(fed) = step_pending.fed.take() {
                 held = merged(held, fed.faults());
+                held.beam_common = fed.commons();
             }
             (sink)(at, merged(held, faulted));
         } else {
             // Told with the frame's settle, inside the submit.
             let held = engine::StepOutcome {
+                beam_common: Vec::new(),
                 wrote: Vec::new(),
                 faulted: std::mem::take(&mut step_pending.faulted),
             };
             step_pending.faulted = merged(held, faulted).faulted;
         }
         Ok((ticket, step_pending))
-    }
-
-    fn submitted(gpu: &Vulkan) {
-        #[cfg(feature = "vulkan")]
-        if let Some(shell) = gpu.shell.as_ref() {
-            shell.device().pipeline_cache().settle();
-        }
-        #[cfg(not(feature = "vulkan"))]
-        let _ = gpu;
     }
 
     /// Before the step resolves its inputs: the forward reads the cells a

@@ -123,9 +123,14 @@ pub struct ChunkFacts {
     /// laid out as the same slot on the device, so a slot moves whole.
     #[serde(default)]
     pub host_chunks: u32,
-    /// Slot-file chunks below host memory: chunks of the kv list's slots
-    /// (refs `0..disk_chunks * slots_per_chunk`), each ref a slot of the
-    /// engine's kv slot file. Other shapes do not go to disk.
+    /// Disk chunks below host memory, one id space beside the host's: the
+    /// disk tier's byte budget covers every state shape, divided into
+    /// chunks of `chunk_bytes` (each on the slot file's direct I/O
+    /// boundary), ids from 0, none reserved, no table, any state shape
+    /// taking any chunk. A disk ref of shape s is `chunk * s.slots_per_chunk
+    /// + index`, laid out as the same slot on the device (and the host
+    /// tier): [`SlotShape::tier_offset`] of the engine's slot file with its
+    /// disk chunk's bytes. The engine states the division at load.
     #[serde(default)]
     pub disk_chunks: u32,
     /// The slot files are kept across runs.
@@ -468,6 +473,18 @@ impl ChunkFacts {
     #[must_use]
     pub fn act_chunks_max(&self) -> u32 {
         self.act_chunks.last().map_or(0, |&(_, chunks)| chunks)
+    }
+
+    /// The guest state the device can hold live: its state chunks' bytes
+    /// less what the engine holds back of them. The room a guest program's
+    /// registration binds within, and so the most guest state any seats
+    /// hold on the device, which a disk tier derived on its own gives a
+    /// home when they are evicted.
+    #[must_use]
+    pub fn guest_room_bytes(&self) -> u64 {
+        u64::from(self.state_chunks())
+            .saturating_mul(self.chunk_bytes)
+            .saturating_sub(self.held_bytes)
     }
 
     /// The chunks state may take beside the largest rung's activation.
@@ -892,7 +909,7 @@ pub struct Evacuation {
 ///
 /// Tiers (CONTRACT-BC 22): `src`/`dst` each the engine's device domain,
 /// [`MemoryDomain::HostPinned`] (refs of [`ChunkFacts::host_chunks`]) or
-/// [`MemoryDomain::LocalDisk`] (kv list refs of
+/// [`MemoryDomain::LocalDisk`] (refs of any state shape in
 /// [`ChunkFacts::disk_chunks`]). Device refs are logical, through the
 /// [`ChunkTable`]; host and disk refs name their place. Token runs are
 /// device to device only. The copy is ordered on the engine's stream after

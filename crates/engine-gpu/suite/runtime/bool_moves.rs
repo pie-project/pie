@@ -213,6 +213,7 @@ fn bool_outputs_are_written_by_every_op_that_moves_them() {
             ring_slots: Vec::new(),
             adapter_slots: Vec::new(),
             scratch: engine::ScratchPlace::None,
+            resident: ::engine::ScratchPlace::None,
             pair: engine::ScratchPlace::None,
             pair_generation: 0,
         },

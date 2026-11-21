@@ -337,6 +337,12 @@ class Pipeline:
         """End the stream; already-submitted fires still drain."""
         self.wit.close()
 
+    def retract(self, fires: int) -> None:
+        """Take back what the last `fires` fires submitted on this closed
+        pipeline wrote, once every fire on it has landed: the rows a program
+        ran ahead past its stop."""
+        _wit(self.wit.retract, fires, what="retract")
+
     def park(self) -> None:
         """Leave the frame wait-set until this pipeline submits again."""
         _wit_forward.park(self.wit)
@@ -407,7 +413,12 @@ class Pipeline:
             if cont is False:
                 if not ended:
                     self.close()
-                return consumed + 1
+                # The fire whose output broke the loop read a token the
+                # program took, so its rows stay; those past it are taken back.
+                kept = consumed + 1
+                if submitted > kept:
+                    self.retract(submitted - kept)
+                return kept
             consumed += 1
             if submitted < budget and submitted - consumed <= (window_frames - 1) * r:
                 submit_one_frame()
@@ -454,11 +465,6 @@ class StateGeometry:
 def frame_size() -> int:
     """Waves per frame (k) for this deployment (cached)."""
     return max(_wit_model.frame_size(), 1)
-
-
-@functools.cache
-def submit_deadline_us() -> int:
-    return _wit_model.submit_deadline_us()
 
 
 def channel_capacity() -> int:
@@ -607,7 +613,11 @@ class ForwardPass:
             self.wit.state,
             [lane.ws for lane in lanes],
             _wit_forward.StateGeometry(
-                positions=wits[0], slots=wits[1], kv_len=wits[2], fold=wits[3]
+                positions=wits[0],
+                slots=wits[1],
+                kv_len=wits[2],
+                fold=wits[3],
+                parents=None,
             ),
             what="state",
         )

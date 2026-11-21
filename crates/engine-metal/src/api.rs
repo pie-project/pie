@@ -158,6 +158,7 @@ fn fault(fault: Fault) -> Error {
     }
     match fault {
         Fault::Deviceless | Fault::Device { .. } => Error::Device(fault.to_string()),
+        Fault::TierFull(_) => Error::TierFull(fault.to_string()),
         Fault::Refused { bytes } => Error::Exhausted {
             resource: "device memory",
             wanted: bytes,
@@ -197,13 +198,16 @@ fn fault(fault: Fault) -> Error {
         },
         Fault::Adapter { .. } => Error::Load(fault.to_string()),
         Fault::Blob { .. } => Error::Load(fault.to_string()),
+        Fault::Claimed(refusal) => Error::Claimed(refusal),
         Fault::Compile(_) | Fault::Program { .. } | Fault::Interpret(_) => {
             Error::Program(fault.to_string())
         }
         Fault::Fire(_) => Error::Invalid(fault.to_string()),
-        Fault::Residency(_) | Fault::FitShort(_) | Fault::UnderCarve { .. } => {
-            Error::Impossible(fault.to_string())
-        }
+        Fault::UnderCarve { logical, .. } => Error::Placement {
+            chunks: vec![logical],
+            reason: fault.to_string(),
+        },
+        Fault::Residency(_) | Fault::FitShort(_) => Error::Impossible(fault.to_string()),
     }
 }
 
@@ -446,6 +450,7 @@ impl Engine for Metal {
         if ordinal > 0 {
             return Err(Error::unsupported("metal", "device ordinal selection"));
         }
+        no_host_tier(residency.host_kv_budget)?;
 
         let Checkpoint::Path(path) = checkpoint else {
             return Err(Error::Load(
@@ -624,11 +629,6 @@ impl Engine for Metal {
 
         told_within(&mut budgets, shell.budget());
         shell.mount_adapters(self.boot.adapter_dir.clone());
-        // The device pool already is host memory, so a host tier would only
-        // move kv and rs slots within the same DRAM: one is seated only
-        // where its budget is stated (it frees room in the pool's heap, not
-        // memory), and suspended slots otherwise go straight to disk.
-        shell.seat_tier(residency.host_kv_budget.unwrap_or(0));
         shell
             .seat_disk_kv(
                 residency.disk_kv_budget,
@@ -668,6 +668,7 @@ impl Engine for Metal {
                 storage_alignment: 256,
                 storage_max_tile_bytes: shell.max_buffer(),
                 codegen_backend: Some("metal".to_string()),
+                library_forms: eta_compiler::codegen::metal::LIBRARY_FORMS,
             },
             pools,
             chunks,
@@ -684,6 +685,8 @@ impl Engine for Metal {
                     &budgets, &trace,
                 )))
                 .unwrap_or(u32::MAX),
+                // Each lane's rung bounds what it replays.
+                replayed_rows: 0,
             },
             has_lora: true,
             has_attn_page_mask: false,
@@ -706,6 +709,8 @@ impl Engine for Metal {
             // Metal states no bound on one submission yet
             // (`crate::rates::at_load`).
             guest_cost: engine::GuestCost::default(),
+            mixed_lanes: engine::MixedLanes::Any,
+            frames_in_flight: engine::stated_frames(shell.frames_in_flight())?,
         };
 
         // Every pipeline the load's rungs dispatch is built now, before
@@ -1656,5 +1661,59 @@ mod told {
         told_within(&mut told, &crate::top::bounded(&baked, asked.max_tokens));
         assert_eq!(told.max_tokens, asked.max_tokens);
         assert_eq!(told.max_lanes, asked.max_lanes);
+    }
+}
+
+/// The device's memory is the host's: a host tier would copy slots within
+/// the same DRAM, freeing nothing physical and only moving them between
+/// budgets. Suspended slots go to disk; a host budget stated for this
+/// device is refused by name, not ignored.
+fn no_host_tier(host_kv_budget: Option<u64>) -> EngineResult<()> {
+    match host_kv_budget.filter(|&budget| budget > 0) {
+        Some(budget) => Err(Error::Load(format!(
+            "budget_host ({budget} bytes) on Metal: the device's memory is the host's, so \
+             there is no host kv tier (a move there would copy within the same memory and \
+             free nothing); suspended state goes to the disk tier (budget_disk). Remove \
+             budget_host from [engine.memory]"
+        ))),
+        None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod no_host_tier_tests {
+    /// A host budget on a device whose memory is the host's is refused by
+    /// name; none stated (or zero) loads.
+    #[test]
+    fn a_host_budget_on_metal_is_refused_by_name() {
+        let refused = super::no_host_tier(Some(8 << 30)).expect_err("refused");
+        let text = refused.to_string();
+        assert!(text.contains("budget_host") && text.contains("the device's memory is the host's"), "{text}");
+        assert!(super::no_host_tier(None).is_ok());
+        assert!(super::no_host_tier(Some(0)).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod placement {
+    use super::*;
+
+    /// A fire naming a state slot inside the activation's carve is refused
+    /// as a placement, naming the logical chunk: the runtime moves that
+    /// state down and submits again, failing no lane.
+    #[test]
+    fn a_slot_under_the_carve_is_refused_naming_its_chunk() {
+        let refused = fault(Fault::UnderCarve {
+            logical: 2057,
+            physical: 2057,
+            carve: 482_998_272,
+            range: 4_162_532_352,
+        });
+        let Error::Placement { chunks, reason } = &refused else {
+            panic!("a placement refusal: {refused:?}");
+        };
+        assert_eq!(chunks, &vec![2057]);
+        assert!(reason.contains("activation span's backed carve"), "{reason}");
+        assert!(refused.to_string().starts_with("impossible submission: "), "{refused}");
     }
 }

@@ -109,4 +109,5 @@ mod masked_axis;
 mod no_shell_reads_the_environment;
 mod routed_experts_stream;
 mod the_operators_fraction_sizes_the_pool;
+mod the_rates_step_gives_the_card_back;
 mod the_score_rows_are_the_oracles;

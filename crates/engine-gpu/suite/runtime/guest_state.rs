@@ -17,7 +17,7 @@ use eta_ir::types::Dtype as EtaDtype;
 use poem::Request;
 
 use super::outputs::{
-    LAYERS, Loaded, Outputs, ROWS, T, WIDTH, epilogue, loaded_lanes, output_decls,
+    LAYERS, Loaded, Outputs, ROWS, T, WIDTH, epilogue, loaded_bound, output_decls,
     registration_of,
 };
 use super::slots::Slots;
@@ -189,7 +189,17 @@ fn argmax(planes: &std::collections::BTreeMap<String, (Vec<u64>, Vec<f32>)>, tok
 /// The loaded miniature, its epilogue registered, and the slots a test's
 /// guests take.
 fn setup(tag: &str, lanes: u32) -> Option<(Loaded, engine::program::ProgramId, Slots, u32)> {
-    let mut loaded = loaded_lanes(tag, &Outputs, lanes)?;
+    setup_bound(tag, lanes, None)
+}
+
+/// [`setup`] on a device whose platform states `bound` on one GPU
+/// submission ([`loaded_bound`]).
+fn setup_bound(
+    tag: &str,
+    lanes: u32,
+    bound: Option<std::time::Duration>,
+) -> Option<(Loaded, engine::program::ProgramId, Slots, u32)> {
+    let mut loaded = loaded_bound(tag, &Outputs, lanes, bound)?;
     let decls = output_decls(&loaded.caps);
     let program = loaded
         .engine
@@ -211,12 +221,47 @@ fn setup(tag: &str, lanes: u32) -> Option<(Loaded, engine::program::ProgramId, S
 /// span's rungs read as before any bound, and one fire of 64 lanes, each
 /// its own instance's, serves every lane its own row: on Vulkan through
 /// the one heap the pair's passes share, on wgpu through each instance's.
+/// The binds and the passes reserve nothing on the device or the host: a
+/// session's status and step records lie in its slots, and a pass stages
+/// and reads back through room the load laid.
 #[test]
 fn a_bound_guest_states_no_fire_term_and_64_lanes_fire_in_the_rungs_span() {
+    guest_states_no_fire_term_and_64_lanes_fire_in_the_rungs_span("guest-state-64", None);
+}
+
+/// [`a_bound_guest_states_no_fire_term_and_64_lanes_fire_in_the_rungs_span`]
+/// on a device whose platform states a bound on one GPU submission (KGSL's
+/// 2 s on Android, Windows' TDR delay): every serving step is estimated,
+/// timed into its arm's timestamps, and a frame after an idle device
+/// re-times the clock by the probe first (`engine_gpu::submit`). Every one
+/// of them writes what the load laid: a fire reserves nothing still.
+#[test]
+fn under_a_stated_submit_bound_64_guest_lanes_fire_reserving_nothing() {
+    guest_states_no_fire_term_and_64_lanes_fire_in_the_rungs_span(
+        "guest-state-64-bound",
+        Some(std::time::Duration::from_secs(2)),
+    );
+}
+
+fn guest_states_no_fire_term_and_64_lanes_fire_in_the_rungs_span(
+    tag: &str,
+    submit_bound: Option<std::time::Duration>,
+) {
     const LANES: u32 = 64;
-    let Some((loaded, program, mut slots, t_input)) = setup("guest-state-64", LANES) else {
+    let Some((loaded, program, mut slots, t_input)) = setup_bound(tag, LANES, submit_bound) else {
         return;
     };
+    // The bound stated is the one the load holds its steps to.
+    assert_eq!(
+        loaded
+            .engine
+            .loaded()
+            .expect("loaded")
+            .submit_bound()
+            .map(|held| held.bound_ns),
+        submit_bound.map(|b| b.as_nanos() as f64),
+        "the load holds its steps to the bound its boot states"
+    );
     let Loaded {
         mut engine,
         trace,
@@ -248,6 +293,12 @@ fn a_bound_guest_states_no_fire_term_and_64_lanes_fire_in_the_rungs_span() {
             .act_chunks
     };
     let before = span(&engine);
+    // Every buffer a guest session uses was laid at the load: binding 64
+    // and firing them reserves nothing.
+    let takes = |engine: &backend::Engine| {
+        engine_gpu::backend::Context::books(engine.loaded().expect("loaded").device()).takes()
+    };
+    let loaded_takes = takes(&engine);
 
     let bound: Vec<(InstanceId, Vec<ChannelId>)> = (0..u64::from(LANES))
         .map(|k| {
@@ -256,15 +307,35 @@ fn a_bound_guest_states_no_fire_term_and_64_lanes_fire_in_the_rungs_span() {
         })
         .collect();
     assert_eq!(span(&engine), before, "64 bound guests leave the span's rungs as they were");
+    assert_eq!(takes(&engine), loaded_takes, "64 guest sessions bind with nothing reserved");
 
     let word = trace.facts.word(&Request::new(ROWS, false));
+    // The first fire of 64 lanes may grow the load's readout seat, which
+    // is not a guest's; the fire after it reserves nothing.
+    let mut fired_takes = loaded_takes;
     for round in 0..2u32 {
+        if round == 1 {
+            fired_takes = takes(&engine);
+        }
         let tokens: Vec<u32> = (0..LANES).map(|k| (k + round) % super::outputs::VOCAB).collect();
         let ids = fire(&mut engine, word, t_input, &bound, &tokens);
         let want: Vec<i32> = tokens.iter().map(|&token| argmax(&planes, token)).collect();
         assert_eq!(ids, want, "round {round}: each of 64 lanes reads its own row");
     }
     assert_eq!(span(&engine), before, "the fires leave the span's rungs as they were");
+    assert_eq!(
+        takes(&engine),
+        fired_takes,
+        "a fire of 64 guest sessions' passes reserves nothing"
+    );
+    // Under the bound, each frame here follows an idle device (each waited
+    // for), so the probe re-timed it: into what the load laid too.
+    let probed = engine.live().tallied(engine::live::Tally::Probed);
+    assert_eq!(
+        probed > 0,
+        submit_bound.is_some(),
+        "the probe re-times a frame after idle where a bound is stated, and only there: {probed}"
+    );
     drop(engine);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -326,6 +397,7 @@ fn an_unparked_guest_serves_on_from_fresh_room_with_nothing_copied() {
             rings: Vec::new(),
             adapter: Vec::new(),
             scratch: scratch.clone(),
+            resident: ::engine::ScratchPlace::None,
             pair: pair.clone(),
             pair_generation: 0,
         })
@@ -457,6 +529,7 @@ fn a_guests_state_reads_zero_when_its_slots_change_owner() {
             rings: Vec::new(),
             adapter: Vec::new(),
             scratch: scratch.clone(),
+            resident: ::engine::ScratchPlace::None,
             pair: pair.clone(),
             pair_generation: 1,
         })
@@ -512,6 +585,86 @@ fn guest_bind_close_rounds_timed() {
         state.instance_bytes(),
         state.per_pair
     );
+    drop(engine);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A beam group's state (`engine_gpu::beam::Resident`, the instance's
+/// resident run, `GuestState::resident`) follows a park into fresh slots:
+/// laid and cleared at the bind, a search's lists written there, the
+/// runtime's copy of its bytes into a fresh run and the old run handed on
+/// (overwritten), and the retarget the unpark's `Rebind::Instance` makes:
+/// it now reads its lists from the fresh run, the copied bytes standing
+/// (nothing cleared), and an evacuation's rebind writes nothing.
+#[test]
+fn a_beam_groups_resident_state_survives_a_park_into_fresh_slots() {
+    let Some((loaded, _program, mut slots, _)) = setup("beam-resident-park", 4) else {
+        return;
+    };
+    let Loaded { engine, dir, .. } = loaded;
+    let layout = engine_gpu::guest::state::BeamLayout::of(4, 300, 16, 2).expect("a depth");
+    let bytes = layout.bytes();
+    let parked = slots.state(bytes, 0);
+    let fresh = slots.state(bytes, 0);
+    assert_ne!(parked, fresh, "the unpark's run is another");
+    let pools = engine.loaded().expect("loaded").pools();
+    fill_room(&engine, &parked, bytes, 0x5a);
+    let mut resident =
+        engine_gpu::beam::Resident::bind(pools, &parked, layout).expect("the state binds");
+    assert!(
+        read_room(&engine, &parked, bytes).iter().all(|&b| b == 0),
+        "the bind clears its run"
+    );
+    // A search's state as five fires left it: primed, its last list at
+    // the fires' parity, beam `b`'s column `j` page `10 b + j`.
+    let words = (bytes / 4) as usize;
+    let mut state = vec![0u32; words];
+    state[..4].copy_from_slice(&[1, 5, 40, 32]);
+    let map = kernels_slang::runtime::beam::map_word(layout.lanes, layout.cap, 5) as usize;
+    for b in 0..layout.lanes as usize {
+        for j in 0..layout.cap as usize {
+            state[map + b * layout.cap as usize + j] = (10 * b + j) as u32;
+        }
+    }
+    let image: Vec<u8> = state.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let (buffer, at) = located(&engine, &parked).expect("the run lies in the pool");
+    buffer.write_shared(at, &image).expect("the state lands");
+    let want: Vec<u32> = (0..layout.cap).map(|j| 20 + j).collect();
+    assert_eq!(resident.list(pools, 2).expect("beam 2's list"), want);
+
+    // The park: the runtime copies the run's bytes wherever the instance
+    // goes and back into a fresh run at the unpark; the old run is another
+    // owner's.
+    fill_room(&engine, &fresh, bytes, 0x7f);
+    let copied = read_room(&engine, &parked, bytes);
+    let (buffer, at) = located(&engine, &fresh).expect("the fresh run lies in the pool");
+    buffer.write_shared(at, &copied).expect("the copy lands");
+    fill_room(&engine, &parked, bytes, 0x3c);
+    resident.retarget(pools, &fresh).expect("the unpark retargets");
+    let ScratchPlace::Run { first, .. } = fresh else {
+        panic!("a beam state lies in a run of slots");
+    };
+    assert_eq!(
+        resident.word(pools).expect("its word"),
+        pools
+            .slot_word(engine_gpu::store::layout::INSTANCE, first)
+            .expect("the fresh run's word"),
+        "the state's word is the fresh run's"
+    );
+    assert_eq!(
+        read_room(&engine, &fresh, bytes),
+        copied,
+        "the retarget clears nothing: the copied bytes stand"
+    );
+    assert_eq!(
+        resident.list(pools, 2).expect("beam 2's list"),
+        want,
+        "the lists read from the fresh run"
+    );
+    // An evacuation's rebind finds the run where it sits and writes nothing.
+    resident.rebind(pools).expect("the rebind");
+    assert_eq!(read_room(&engine, &fresh, bytes), copied, "a rebind writes nothing");
+    assert_eq!(resident.list(pools, 3).expect("beam 3's list")[0], 30);
     drop(engine);
     let _ = std::fs::remove_dir_all(&dir);
 }

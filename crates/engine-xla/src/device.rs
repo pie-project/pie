@@ -559,8 +559,60 @@ impl Device {
         self.disk.is_some()
     }
 
+    /// Whether `text`'s program is had without a compile: held
+    /// ([`Self::holds`]), or in the disk cache.
+    #[must_use]
+    pub fn has_without_compile(&self, text: &str) -> bool {
+        self.holds(text) || self.on_disk(text)
+    }
+
     /// Whether the disk cache holds the program compiled from `text`.
     #[must_use]
+    /// The program the load compiled from `text` and parked in the disk
+    /// cache (`serve::warm`), loaded for the first fire of its shape: from
+    /// memory where it is held, else from the disk, never built. `None`:
+    /// the disk holds it no more (the cache was cleared under the load).
+    pub fn load_parked(&self, text: &str, sig: Signature) -> Result<Option<Arc<Program>>> {
+        let key = *blake3::hash(text.as_bytes()).as_bytes();
+        if let Some(hit) = self.cache.lock().expect("cache lock poisoned").get(&key) {
+            return Ok(Some(Arc::clone(hit)));
+        }
+        let client = self.client()?;
+        let started = std::time::Instant::now();
+        let Some(file) = self.cache_file(client, text) else {
+            return Ok(None);
+        };
+        let Some(exe) = std::fs::read(&file)
+            .ok()
+            .and_then(unpacked)
+            .and_then(|bytes| client.deserialize(&bytes).ok())
+        else {
+            return Ok(None);
+        };
+        touch(&file);
+        self.keep(&file);
+        if let Some(live) = self.live.get() {
+            live.tally(engine::live::Tally::LoadedInFire, 1);
+        }
+        tracing::info!(
+            bytes = text.len(),
+            ms = started.elapsed().as_millis() as u64,
+            "xla loaded a parked program for the first fire of its shape"
+        );
+        let memory = exe.compiled_memory().unwrap_or_default();
+        let program = Arc::new(Program {
+            exe: Some(exe),
+            sig,
+            text_bytes: text.len(),
+            memory,
+        });
+        self.cache
+            .lock()
+            .expect("cache lock poisoned")
+            .insert(key, Arc::clone(&program));
+        Ok(Some(program))
+    }
+
     pub fn on_disk(&self, text: &str) -> bool {
         self.client()
             .ok()
@@ -898,13 +950,15 @@ fn free_bytes(dir: &std::path::Path) -> Option<u64> {
     Some((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
 }
 
-/// The host memory free for new allocations (`MemAvailable`), where the host
-/// says.
+/// The host memory free for new allocations, where the host says: the least
+/// of `MemAvailable` and what each capped cgroup ancestor of the process
+/// leaves ([`engine::host_memory`]). A cap the host's `MemAvailable` does
+/// not see OOM-kills a load or a registration whose compiles fit the host
+/// but not the cap.
 pub(crate) fn available_memory() -> Option<u64> {
-    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let line = info.lines().find(|l| l.starts_with("MemAvailable:"))?;
-    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-    Some(kib << 10)
+    engine::host_memory::available()
+        .ok()
+        .map(|available| available.bytes())
 }
 
 /// The host memory a compiled program holds: ~64 bytes a byte of its text,

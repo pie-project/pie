@@ -140,7 +140,13 @@ impl<B: Backend> Run<'_, B> {
                 seat.layout.planes.len()
             ),
         })?;
-        let ext = seat.ext_in[plane];
+        let ext = seat.ext_in[plane].ok_or_else(|| Error::Backend {
+            op,
+            detail: format!(
+                "value {} lies in a plane read where it lies, which no fire extends",
+                value.0
+            ),
+        })?;
         let own = self.tensor(value);
         let row_bytes = seat.layout.planes[plane].row_bytes;
         let indptr = self.qo_indptr_host();
@@ -190,7 +196,14 @@ impl<B: Backend> Run<'_, B> {
                     value.0
                 ),
             })?;
-        let ext = seat.ext_out[region];
+        let ext = *seat.ext_out.get(region).ok_or_else(|| Error::Backend {
+            op,
+            detail: format!(
+                "value {} lands extended in a fire whose lanes all carry their rows, which \
+                 extends none",
+                value.0
+            ),
+        })?;
         seat.ext.borrow_mut().insert(value.0, ext);
         Ok(ext)
     }

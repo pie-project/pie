@@ -248,7 +248,16 @@ pub fn measure(
     kernels_cuda::disk::install(cache);
     #[cfg(feature = "device")]
     {
-        on_device::measure(ordinal, chip)
+        let measured = on_device::measure(ordinal, chip);
+        // The step's buffers (laid apart from the device heap, whose chunks
+        // the process keeps) went to the idle store as they dropped; the
+        // load reads the card's room next (the top rung's fit), so they go
+        // back to the driver first. Kept, an L40S's first boot fit beside
+        // 7.5 GiB the step no longer held (4.6 GiB idle, 2.5 GiB of heap
+        // chunks): at a 40960 context every rung lacked room for one
+        // sequence, while the next boot, reading the saved rates, served.
+        crate::device::held::release_idle();
+        measured
     }
     #[cfg(not(feature = "device"))]
     {
@@ -280,7 +289,7 @@ mod on_device {
 
     impl Buffer {
         fn zeroed(bytes: usize) -> crate::error::Result<Buffer> {
-            let b = crate::device::Buffer::zeroed(bytes)?;
+            let b = crate::device::Buffer::zeroed_apart(bytes)?;
             let live = LIVE.fetch_add(b.bytes(), Ordering::Relaxed) + b.bytes();
             PEAK.fetch_max(live, Ordering::Relaxed);
             Ok(Buffer(b))
@@ -583,6 +592,7 @@ mod on_device {
                 few_row_tflops: Some(tenth(few_row / 1e3)),
                 workgroups_per_core: Some(f64::from(resident)),
                 submit_worst_ratio: None,
+                resident_workgroups: None,
                 attn_tflops_by_rows_keys: None,
                 tile_tflops_by_rows: None,
                 vector_tflops_by_rows: None,
@@ -1180,6 +1190,7 @@ mod ensure_tests {
             few_row_tflops: Some(20.0),
             workgroups_per_core: Some(4.0),
             submit_worst_ratio: None,
+            resident_workgroups: None,
             attn_tflops_by_rows_keys: None,
             tile_tflops_by_rows: None,
             vector_tflops_by_rows: None,

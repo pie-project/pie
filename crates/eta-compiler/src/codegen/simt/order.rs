@@ -76,6 +76,9 @@ const BODY: &str = r#"
   const M1ValueDesc order_input_desc = descriptors[kInput];
   const m1_u8* order_input = scratch + offsets[kInput];
   m1_u8* order_values = scratch + offsets[kValues];
+  // The values are copies of the row's elements, at its dtype: a bf16
+  // row's are exact.
+  const m1_u32 order_values_dtype = descriptors[kValues].dtype;
   m1_u8* order_indices = scratch + offsets[kIndices];
   const m1_u32 order_len = order_input_desc.last;
   const m1_u32 order_rows = order_input_desc.rows;
@@ -167,10 +170,11 @@ const BODY: &str = r#"
       }
       for (m1_u32 at = threadIdx.x; at < order_count; at += blockDim.x) {
         const m1_u32 index = order_in[at];
-        m1_store_f(
+        m1_store_fd(
             order_values,
             order_row * order_width + at,
-            m1_load_f(order_input, order_base + index, order_input_desc.dtype));
+            m1_load_f(order_input, order_base + index, order_input_desc.dtype),
+            order_values_dtype);
         m1_store_u(order_indices, order_row * order_width + at, index);
       }
       __syncthreads();
@@ -194,6 +198,9 @@ const BODY_SELECT: &str = r#"
   const M1ValueDesc order_input_desc = descriptors[kInput];
   const m1_u8* order_input = scratch + offsets[kInput];
   m1_u8* order_values = scratch + offsets[kValues];
+  // The values are copies of the row's elements, at its dtype: a bf16
+  // row's are exact.
+  const m1_u32 order_values_dtype = descriptors[kValues].dtype;
   m1_u8* order_indices = scratch + offsets[kIndices];
   const m1_u32 order_len = order_input_desc.last;
   const m1_u32 order_rows = order_input_desc.rows;
@@ -214,7 +221,9 @@ const BODY_SELECT: &str = r#"
       : 1.0f;
   auto order_value = [&](m1_u32 order_row, m1_u32 column) -> float {
     if (direct)
-      return m1_intrinsic_row_load(direct_base, direct_row0 + order_row, column, direct_stride, direct_mode, direct_rows) / direct_divisor;
+      return kDirectScales
+          ? m1_intrinsic_row_load(direct_base, direct_row0 + order_row, column, direct_stride, direct_mode, direct_rows) * direct_divisor
+          : m1_intrinsic_row_load(direct_base, direct_row0 + order_row, column, direct_stride, direct_mode, direct_rows) / direct_divisor;
     return m1_load_f(order_input, order_row * order_len + column, order_input_desc.dtype);
   };
   __shared__ m1_u32 sel_hist[256];
@@ -382,41 +391,97 @@ const BODY_SELECT: &str = r#"
       const m1_u64* sel_sorted = sel_cand;
       bool sel_lands = true;
       if (sel_split) {
-        // Each block's candidates, sorted, into its arena past its line;
-        // the last block to count itself in merges them all, in the same
-        // (key, index) order a one-block select keeps.
+        // Each block's candidates, sorted, into its arena past its line.
+        // Blocks count themselves in by groups (`sel_group`): a group's last
+        // merges its group's candidates into its first block's slot, and the
+        // last of the groups' mergers merges their winners, so each merge
+        // ranks about the root of what one merge of every block would. Where one
+        // group holds every block, or the winners would outgrow a block, the
+        // last block to count itself in merges them all. Either way the
+        // select's entries land in the (key, index) order a one-block
+        // select keeps.
         m1_u8* sel_span = lane_arenas + (m1_u64)dispatch_lane * M1_LANE_SPAN(1u);
-        m1_u64* sel_out = reinterpret_cast<m1_u64*>(sel_span + M1_LANE_HEAD) +
-            (m1_u64)lane_row * kSelectCap;
+        m1_u64* sel_base = reinterpret_cast<m1_u64*>(sel_span + M1_LANE_HEAD);
+        m1_u64* sel_out = sel_base + (m1_u64)lane_row * kSelectCap;
         for (m1_u32 at = threadIdx.x; at < kSelectCap; at += blockDim.x)
           M1_LANE_PUT64(sel_out + at, sel_cand[at]);
         M1_LANE_RELEASE();
         __syncthreads();
-        if (threadIdx.x == 0u) {
-          m1_u32* sel_counter = reinterpret_cast<m1_u32*>(sel_span);
-          sel_digit = atomicAdd(sel_counter, 1u) + 1u == lane_blocks ? 1u : 0u;
-        }
+        m1_u32* sel_counters = reinterpret_cast<m1_u32*>(sel_span);
+        // Groups of about the root of the blocks, so the two merges rank
+        // about as many entries each; no more groups than the lane's line
+        // holds words past the last merge's (15), and no group past what one
+        // rank merge holds.
+        m1_u32 sel_group = 1u;
+        while (sel_group * sel_group < lane_blocks) ++sel_group;
+        if (sel_group * 15u < lane_blocks) sel_group = (lane_blocks + 14u) / 15u;
+        const m1_u32 sel_groups = (lane_blocks + sel_group - 1u) / sel_group;
+        const bool sel_two = sel_groups > 1u && sel_group > 1u &&
+            sel_group * kSelectCap <= blockDim.x && sel_groups * kSelectCap <= blockDim.x;
+        // The `merged` entries of `sel_pool` ranked: their least `keep`, in
+        // order, into `sel_cand`. A thread an entry; no two are equal, their
+        // indices differ.
+        auto sel_rank = [&](m1_u32 merged, m1_u32 keep) {
+          if (threadIdx.x < merged) {
+            const m1_u64 entry = sel_pool[threadIdx.x];
+            m1_u32 rank = 0u;
+            for (m1_u32 j = 0u; j < merged; ++j) rank += sel_pool[j] < entry ? 1u : 0u;
+            if (rank < keep) sel_cand[rank] = entry;
+          }
+          __syncthreads();
+        };
+        if (sel_two) {
+          const m1_u32 sel_first = (lane_row / sel_group) * sel_group;
+          const m1_u32 sel_members =
+              lane_blocks - sel_first < sel_group ? lane_blocks - sel_first : sel_group;
+          if (threadIdx.x == 0u)
+            sel_digit = atomicAdd(sel_counters + 1u + lane_row / sel_group, 1u) + 1u ==
+                    sel_members ? 1u : 0u;
+          __syncthreads();
+          sel_lands = false;
+          if (sel_digit != 0u) {
+            // The group's last: its members' least, into its first's slot.
+            M1_LANE_ACQUIRE();
+            const m1_u32 merged = sel_members * kSelectCap;
+            m1_u64* sel_in = sel_base + (m1_u64)sel_first * kSelectCap;
+            for (m1_u32 at = threadIdx.x; at < merged; at += blockDim.x)
+              sel_pool[at] = M1_LANE_GET64(sel_in + at);
+            __syncthreads();
+            sel_rank(merged, kSelectCap);
+            for (m1_u32 at = threadIdx.x; at < kSelectCap; at += blockDim.x)
+              M1_LANE_PUT64(sel_in + at, at < merged ? sel_cand[at] : 0xFFFFFFFFFFFFFFFFull);
+            M1_LANE_RELEASE();
+            __syncthreads();
+            if (threadIdx.x == 0u)
+              sel_digit = atomicAdd(sel_counters, 1u) + 1u == sel_groups ? 1u : 0u;
+            __syncthreads();
+            sel_lands = sel_digit != 0u;
+            if (sel_lands) {
+              // The last group's merger: every group's winners.
+              M1_LANE_ACQUIRE();
+              const m1_u32 winners = sel_groups * kSelectCap;
+              for (m1_u32 at = threadIdx.x; at < winners; at += blockDim.x)
+                sel_pool[at] = M1_LANE_GET64(
+                    sel_base + (m1_u64)(at / kSelectCap) * sel_group * kSelectCap +
+                    at % kSelectCap);
+              __syncthreads();
+              sel_rank(winners, order_count);
+              sel_sorted = sel_cand;
+            }
+          }
+        } else {
+        if (threadIdx.x == 0u)
+          sel_digit = atomicAdd(sel_counters, 1u) + 1u == lane_blocks ? 1u : 0u;
         __syncthreads();
         sel_lands = sel_digit != 0u;
         if (sel_lands) {
           M1_LANE_ACQUIRE();
           const m1_u32 merged = lane_blocks * kSelectCap;
           for (m1_u32 at = threadIdx.x; at < kSelectPool; at += blockDim.x)
-            sel_pool[at] = at < merged
-                ? M1_LANE_GET64(reinterpret_cast<m1_u64*>(sel_span + M1_LANE_HEAD) + at)
-                : 0xFFFFFFFFFFFFFFFFull;
+            sel_pool[at] = at < merged ? M1_LANE_GET64(sel_base + at) : 0xFFFFFFFFFFFFFFFFull;
           __syncthreads();
           if (merged <= blockDim.x) {
-            // A thread an entry: its rank is how many entries come before
-            // it (no two are equal, their indices differ), and the first
-            // `order_count` ranks are the select's, in order.
-            if (threadIdx.x < merged) {
-              const m1_u64 entry = sel_pool[threadIdx.x];
-              m1_u32 rank = 0u;
-              for (m1_u32 j = 0u; j < merged; ++j) rank += sel_pool[j] < entry ? 1u : 0u;
-              if (rank < order_count) sel_cand[rank] = entry;
-            }
-            __syncthreads();
+            sel_rank(merged, order_count);
             sel_sorted = sel_cand;
           } else {
           m1_u32 sel_merge = 2u;
@@ -441,14 +506,16 @@ const BODY_SELECT: &str = r#"
           sel_sorted = sel_pool;
           }
         }
+        }
       }
       if (sel_lands) {
         for (m1_u32 at = threadIdx.x; at < order_count; at += blockDim.x) {
           const m1_u32 index = (m1_u32)(sel_sorted[at] & 0xFFFFFFFFull);
-          m1_store_f(
+          m1_store_fd(
               order_values,
               order_row * order_width + at,
-              order_value(order_row, index));
+              order_value(order_row, index),
+              order_values_dtype);
           m1_store_u(order_indices, order_row * order_width + at, index);
         }
       }
@@ -551,6 +618,9 @@ const BODY_SELECT_REGISTERS: &str = r#"
   const M1ValueDesc order_input_desc = descriptors[kInput];
   const m1_u8* order_input = scratch + offsets[kInput];
   m1_u8* order_values = scratch + offsets[kValues];
+  // The values are copies of the row's elements, at its dtype: a bf16
+  // row's are exact.
+  const m1_u32 order_values_dtype = descriptors[kValues].dtype;
   m1_u8* order_indices = scratch + offsets[kIndices];
   const m1_u32 order_len = order_input_desc.last;
   const m1_u32 order_rows = order_input_desc.rows;
@@ -571,7 +641,9 @@ const BODY_SELECT_REGISTERS: &str = r#"
       : 1.0f;
   auto order_value = [&](m1_u32 order_row, m1_u32 column) -> float {
     if (direct)
-      return m1_intrinsic_row_load(direct_base, direct_row0 + order_row, column, direct_stride, direct_mode, direct_rows) / direct_divisor;
+      return kDirectScales
+          ? m1_intrinsic_row_load(direct_base, direct_row0 + order_row, column, direct_stride, direct_mode, direct_rows) * direct_divisor
+          : m1_intrinsic_row_load(direct_base, direct_row0 + order_row, column, direct_stride, direct_mode, direct_rows) / direct_divisor;
     return m1_load_f(order_input, order_row * order_len + column, order_input_desc.dtype);
   };
   __shared__ m1_u64 sel_lists[32u * kSelectCap];
@@ -600,41 +672,97 @@ const BODY_SELECT_REGISTERS: &str = r#"
       const m1_u64* sel_sorted = sel_cand;
       bool sel_lands = true;
       if (sel_split) {
-        // Each block's candidates, sorted, into its arena past its line;
-        // the last block to count itself in merges them all, in the same
-        // (key, index) order a one-block select keeps.
+        // Each block's candidates, sorted, into its arena past its line.
+        // Blocks count themselves in by groups (`sel_group`): a group's last
+        // merges its group's candidates into its first block's slot, and the
+        // last of the groups' mergers merges their winners, so each merge
+        // ranks about the root of what one merge of every block would. Where one
+        // group holds every block, or the winners would outgrow a block, the
+        // last block to count itself in merges them all. Either way the
+        // select's entries land in the (key, index) order a one-block
+        // select keeps.
         m1_u8* sel_span = lane_arenas + (m1_u64)dispatch_lane * M1_LANE_SPAN(1u);
-        m1_u64* sel_out = reinterpret_cast<m1_u64*>(sel_span + M1_LANE_HEAD) +
-            (m1_u64)lane_row * kSelectCap;
+        m1_u64* sel_base = reinterpret_cast<m1_u64*>(sel_span + M1_LANE_HEAD);
+        m1_u64* sel_out = sel_base + (m1_u64)lane_row * kSelectCap;
         for (m1_u32 at = threadIdx.x; at < kSelectCap; at += blockDim.x)
           M1_LANE_PUT64(sel_out + at, sel_cand[at]);
         M1_LANE_RELEASE();
         __syncthreads();
-        if (threadIdx.x == 0u) {
-          m1_u32* sel_counter = reinterpret_cast<m1_u32*>(sel_span);
-          sel_digit = atomicAdd(sel_counter, 1u) + 1u == lane_blocks ? 1u : 0u;
-        }
+        m1_u32* sel_counters = reinterpret_cast<m1_u32*>(sel_span);
+        // Groups of about the root of the blocks, so the two merges rank
+        // about as many entries each; no more groups than the lane's line
+        // holds words past the last merge's (15), and no group past what one
+        // rank merge holds.
+        m1_u32 sel_group = 1u;
+        while (sel_group * sel_group < lane_blocks) ++sel_group;
+        if (sel_group * 15u < lane_blocks) sel_group = (lane_blocks + 14u) / 15u;
+        const m1_u32 sel_groups = (lane_blocks + sel_group - 1u) / sel_group;
+        const bool sel_two = sel_groups > 1u && sel_group > 1u &&
+            sel_group * kSelectCap <= blockDim.x && sel_groups * kSelectCap <= blockDim.x;
+        // The `merged` entries of `sel_pool` ranked: their least `keep`, in
+        // order, into `sel_cand`. A thread an entry; no two are equal, their
+        // indices differ.
+        auto sel_rank = [&](m1_u32 merged, m1_u32 keep) {
+          if (threadIdx.x < merged) {
+            const m1_u64 entry = sel_pool[threadIdx.x];
+            m1_u32 rank = 0u;
+            for (m1_u32 j = 0u; j < merged; ++j) rank += sel_pool[j] < entry ? 1u : 0u;
+            if (rank < keep) sel_cand[rank] = entry;
+          }
+          __syncthreads();
+        };
+        if (sel_two) {
+          const m1_u32 sel_first = (lane_row / sel_group) * sel_group;
+          const m1_u32 sel_members =
+              lane_blocks - sel_first < sel_group ? lane_blocks - sel_first : sel_group;
+          if (threadIdx.x == 0u)
+            sel_digit = atomicAdd(sel_counters + 1u + lane_row / sel_group, 1u) + 1u ==
+                    sel_members ? 1u : 0u;
+          __syncthreads();
+          sel_lands = false;
+          if (sel_digit != 0u) {
+            // The group's last: its members' least, into its first's slot.
+            M1_LANE_ACQUIRE();
+            const m1_u32 merged = sel_members * kSelectCap;
+            m1_u64* sel_in = sel_base + (m1_u64)sel_first * kSelectCap;
+            for (m1_u32 at = threadIdx.x; at < merged; at += blockDim.x)
+              sel_pool[at] = M1_LANE_GET64(sel_in + at);
+            __syncthreads();
+            sel_rank(merged, kSelectCap);
+            for (m1_u32 at = threadIdx.x; at < kSelectCap; at += blockDim.x)
+              M1_LANE_PUT64(sel_in + at, at < merged ? sel_cand[at] : 0xFFFFFFFFFFFFFFFFull);
+            M1_LANE_RELEASE();
+            __syncthreads();
+            if (threadIdx.x == 0u)
+              sel_digit = atomicAdd(sel_counters, 1u) + 1u == sel_groups ? 1u : 0u;
+            __syncthreads();
+            sel_lands = sel_digit != 0u;
+            if (sel_lands) {
+              // The last group's merger: every group's winners.
+              M1_LANE_ACQUIRE();
+              const m1_u32 winners = sel_groups * kSelectCap;
+              for (m1_u32 at = threadIdx.x; at < winners; at += blockDim.x)
+                sel_pool[at] = M1_LANE_GET64(
+                    sel_base + (m1_u64)(at / kSelectCap) * sel_group * kSelectCap +
+                    at % kSelectCap);
+              __syncthreads();
+              sel_rank(winners, order_count);
+              sel_sorted = sel_cand;
+            }
+          }
+        } else {
+        if (threadIdx.x == 0u)
+          sel_digit = atomicAdd(sel_counters, 1u) + 1u == lane_blocks ? 1u : 0u;
         __syncthreads();
         sel_lands = sel_digit != 0u;
         if (sel_lands) {
           M1_LANE_ACQUIRE();
           const m1_u32 merged = lane_blocks * kSelectCap;
           for (m1_u32 at = threadIdx.x; at < kSelectPool; at += blockDim.x)
-            sel_pool[at] = at < merged
-                ? M1_LANE_GET64(reinterpret_cast<m1_u64*>(sel_span + M1_LANE_HEAD) + at)
-                : 0xFFFFFFFFFFFFFFFFull;
+            sel_pool[at] = at < merged ? M1_LANE_GET64(sel_base + at) : 0xFFFFFFFFFFFFFFFFull;
           __syncthreads();
           if (merged <= blockDim.x) {
-            // A thread an entry: its rank is how many entries come before
-            // it (no two are equal, their indices differ), and the first
-            // `order_count` ranks are the select's, in order.
-            if (threadIdx.x < merged) {
-              const m1_u64 entry = sel_pool[threadIdx.x];
-              m1_u32 rank = 0u;
-              for (m1_u32 j = 0u; j < merged; ++j) rank += sel_pool[j] < entry ? 1u : 0u;
-              if (rank < order_count) sel_cand[rank] = entry;
-            }
-            __syncthreads();
+            sel_rank(merged, order_count);
             sel_sorted = sel_cand;
           } else {
           m1_u32 sel_merge = 2u;
@@ -659,14 +787,16 @@ const BODY_SELECT_REGISTERS: &str = r#"
           sel_sorted = sel_pool;
           }
         }
+        }
       }
       if (sel_lands) {
         for (m1_u32 at = threadIdx.x; at < order_count; at += blockDim.x) {
           const m1_u32 index = (m1_u32)(sel_sorted[at] & 0xFFFFFFFFull);
-          m1_store_f(
+          m1_store_fd(
               order_values,
               order_row * order_width + at,
-              order_value(order_row, index));
+              order_value(order_row, index),
+              order_values_dtype);
           m1_store_u(order_indices, order_row * order_width + at, index);
         }
       }
@@ -757,7 +887,11 @@ pub fn emit_order_region(
     if order.tag == tags::TOP_K && (1..=TOP_K_SELECT_MAX).contains(&width) {
         let cap = select_cap(width);
         let _ = writeln!(source, "  constexpr m1_u32 kSelectCap = {cap}u;");
-        let _ = writeln!(source, "  constexpr m1_u32 kSplit = {}u;", u32::from(top_k_splits(width)));
+        let _ = writeln!(
+            source,
+            "  constexpr m1_u32 kSplit = {}u;",
+            u32::from(top_k_splits(width))
+        );
         let _ = writeln!(
             source,
             "  constexpr m1_u32 kSelectPool = {TOP_K_SELECT_POOL}u;"
@@ -780,10 +914,19 @@ pub fn emit_order_region(
         );
         let _ = writeln!(
             source,
+            "  constexpr bool kDirectScales = {};",
+            direct.is_some_and(|d| d.scales)
+        );
+        let _ = writeln!(
+            source,
             "  constexpr m1_u32 kIntrinsicSlots = {}u;",
             super::fused::output_pitch(stage)
         );
-        source.push_str(if registers { BODY_SELECT_REGISTERS } else { BODY_SELECT });
+        source.push_str(if registers {
+            BODY_SELECT_REGISTERS
+        } else {
+            BODY_SELECT
+        });
     } else {
         source.push_str(BODY);
     }

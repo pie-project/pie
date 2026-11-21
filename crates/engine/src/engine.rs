@@ -39,6 +39,11 @@ pub struct StepOutcome {
     /// request by its reason, and poisons its instance; no other lane is
     /// touched.
     pub faulted: Vec<LaneFault>,
+    /// Each beam group's common slot as the step's head step left it
+    /// (`BEAM-PAGE-LISTS.md` §11.3): the slot below which every live beam's
+    /// rows lie on the same pages, by the group's instance. Monotone; the
+    /// runtime folds the group's set to the largest it has seen.
+    pub beam_common: Vec<(InstanceId, u32)>,
 }
 
 /// A lane of a step that faulted: lane `lane` of the step's
@@ -64,6 +69,7 @@ impl StepOutcome {
         StepOutcome {
             wrote,
             faulted: Vec::new(),
+            beam_common: Vec::new(),
         }
     }
 
@@ -75,6 +81,7 @@ impl StepOutcome {
         StepOutcome {
             wrote: Vec::new(),
             faulted: every_lane(lanes, reason.into()),
+            beam_common: Vec::new(),
         }
     }
 
@@ -340,7 +347,9 @@ pub trait Engine: Send {
     /// An instance's or a channel's pool slots moved: the runtime parked
     /// them on another tier and copied them back into the fresh refs
     /// `rebind` names, each shape apart. Called before the next fire that
-    /// reads them, which must address the new slots. A channel closed with
+    /// reads them, which must address the new slots. A park itself is said
+    /// too ([`Rebind::Parked`]): the instance's old slots are another
+    /// owner's from then on. A channel closed with
     /// an instance still bound on it is still registered
     /// ([`Engine::close_channel`]): its rebind is served like an open one's.
     /// The default does nothing: an engine that states no `Instance` or
@@ -397,6 +406,16 @@ pub trait Engine: Send {
     fn take_channel(&mut self, instance: InstanceId, channel: u32) -> Result<Option<Vec<u8>>> {
         let _ = (instance, channel);
         Err(self.unsupported("take_channel"))
+    }
+
+    /// Beam `beam`'s page list of instance `instance`'s beam group, as its
+    /// last fire left it (`BEAM-PAGE-LISTS.md` §6.6): the pool page of each
+    /// column, the group's list width of them (columns past the last fire's
+    /// unspecified). Read once a search ends, after its fires have landed;
+    /// an engine waits for them.
+    fn beam_list(&mut self, instance: InstanceId, beam: u32) -> Result<Vec<u32>> {
+        let _ = (instance, beam);
+        Err(self.unsupported("beam_list"))
     }
 
     fn register_adapter(&mut self, registration: &AdapterRegistration) -> Result<()> {
@@ -507,10 +526,10 @@ pub trait Engine: Send {
     /// [`crate::transfer::MemoryDomain::HostPinned`], a host ref `r` of
     /// shape `s` at [`crate::chunk::SlotShape::tier_offset`] of its host
     /// chunks, laid out as the device slot (one span a slot); one that
-    /// states [`crate::chunk::ChunkFacts::disk_chunks`] moves kv list slots
-    /// between the device (or the host tier) and
-    /// [`crate::transfer::MemoryDomain::LocalDisk`], disk ref `r` slot `r`
-    /// of its kv slot file. Token runs are device to device only. Each copy
+    /// states [`crate::chunk::ChunkFacts::disk_chunks`] moves whole slots
+    /// of every state shape between the device (or the host tier) and
+    /// [`crate::transfer::MemoryDomain::LocalDisk`], a disk ref laid out
+    /// in its disk chunks as a host ref is in its host chunks. Token runs are device to device only. Each copy
     /// is ordered after every fire submitted before it and before every one
     /// after (a stream-ordered copy, or a drain), and copies in submission
     /// order: the runtime names a destination again as soon as the call

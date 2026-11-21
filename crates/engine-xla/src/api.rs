@@ -517,6 +517,7 @@ impl Engine for Xla {
         )
         .map_err(fault)?;
         let mut shell = shell;
+        shell.set_host_programs(residency.host_programs);
         // Every maintenance program a fire, a fork or a park runs later, one
         // a slot size, compiled now whether or not the ladder runs: none is
         // built after the load.
@@ -549,6 +550,14 @@ impl Engine for Xla {
             .map_err(fault)?;
         let chunks = shell.tiered_facts();
         shell.log_chunk_recipe(&chunks);
+        if let engine::MixedLanes::Laid(rungs) = shell.mixed_lanes() {
+            tracing::info!(
+                pairs = ?rungs.iter().map(|r| (r.prompt_lanes, r.decode_lanes)).collect::<Vec<_>>(),
+                max_tokens = budgets.max_tokens,
+                max_lanes = budgets.max_lanes,
+                "xla mixed fires laid: prompt_lanes -> decode_lanes"
+            );
+        }
         let caps = Capabilities {
             device: DeviceFacts {
                 backend: "xla".to_string(),
@@ -560,6 +569,12 @@ impl Engine for Xla {
                 storage_alignment: 256,
                 storage_max_tile_bytes: u64::MAX,
                 codegen_backend: None,
+                // its guest lowering (`guest::lower`) lowers a draw over a
+                // top-p / top-k cut and a bf16 row's cut as one region each
+                library_forms: engine::LibraryForms {
+                    draw: true,
+                    bf16_cut: true,
+                },
             },
             pools,
             chunks,
@@ -574,6 +589,8 @@ impl Engine for Xla {
                     &budgets,
                 )))
                 .unwrap_or(u32::MAX),
+                // Each lane's rung bounds what it replays.
+                replayed_rows: 0,
             },
             has_lora: true,
             has_attn_page_mask: false,
@@ -595,6 +612,11 @@ impl Engine for Xla {
             classes: shell.classes(),
             // XLA states no bound on one submission.
             guest_cost: engine::GuestCost::default(),
+            mixed_lanes: shell.mixed_lanes(),
+            // the staging ring's slots less the one being written
+            frames_in_flight: engine::stated_frames(
+                (shell.staging_facts().ring_slots as usize).saturating_sub(1),
+            )?,
         };
         self.programs.seat(budgets.max_lanes);
         self.programs.seat_readouts(shell.readouts());
@@ -605,6 +627,7 @@ impl Engine for Xla {
         // is served worse than the load prepared: counted.
         shell.device().report_to(self.live.clone());
         self.programs.report_to(self.live.clone());
+        shell.state_limits(caps.limits);
         self.shell = Some(shell);
         self.caps = Some(caps.clone());
         Ok(Loaded {
@@ -690,6 +713,67 @@ impl Engine for Xla {
     /// The program checked and its stage shapes named here; its stages
     /// compile in the returned compile, off the engine's thread, while
     /// fires go on (`Plane::prepare`).
+    /// The runtime's standard samplers' guest stages, compiled before ready
+    /// at every batch rung exactly as their registrations compile them, so a
+    /// request that registers one finds every stage compiled (the device's
+    /// program cache holds them) and builds nothing after ready. The
+    /// programs compile side by side, each stage admitted by the guest
+    /// compile ledger (`guest::run`), so a cold boot is bounded by host
+    /// memory, not run in turn. A program that does not lower or compile
+    /// fails the load by name.
+    fn prewarm_programs(&mut self, registrations: &[ProgramRegistration]) -> EngineResult<()> {
+        let device = self
+            .shell
+            .as_ref()
+            .map(Shell::device_shared)
+            .ok_or_else(|| Error::Program("the standard samplers prewarmed before load".into()))?;
+        let started = std::time::Instant::now();
+        let mut pending = Vec::with_capacity(registrations.len());
+        for registration in registrations {
+            pending.push(self.programs.prepare(registration).map_err(refusal)?);
+        }
+        let compiled: Vec<Result<(usize, f64), String>> = std::thread::scope(|scope| {
+            let jobs: Vec<_> = pending
+                .iter()
+                .map(|program| {
+                    let device = &device;
+                    scope.spawn(move || {
+                        let at = std::time::Instant::now();
+                        program
+                            .compile(device)
+                            .map(|staged| (staged.len(), at.elapsed().as_secs_f64()))
+                    })
+                })
+                .collect();
+            jobs.into_iter()
+                .map(|job| {
+                    job.join()
+                        .unwrap_or_else(|_| Err("a standard sampler's compile panicked".into()))
+                })
+                .collect()
+        });
+        let mut stages = 0;
+        let mut slowest = 0f64;
+        for (registration, done) in registrations.iter().zip(compiled) {
+            let (count, seconds) = done.map_err(|why| {
+                Error::Load(format!(
+                    "the standard sampler program 0x{:016x}'s guest stages: {why}",
+                    registration.program_hash
+                ))
+            })?;
+            stages += count;
+            slowest = slowest.max(seconds);
+        }
+        tracing::info!(
+            programs = registrations.len(),
+            stages,
+            slowest_s = slowest,
+            s = started.elapsed().as_secs_f64(),
+            "xla standard samplers' guest stages compiled before ready"
+        );
+        Ok(())
+    }
+
     fn prepare_program(
         &mut self,
         registration: &ProgramRegistration,
@@ -855,6 +939,10 @@ impl Engine for Xla {
                 let cell_row = |slot: u32| shell.and_then(|shell| shell.channel_row(slot));
                 self.programs.rebind(id, &rings, &cell_row).map_err(refusal)
             }
+            // This engine claims nothing at an instance's slots and an
+            // evacuation repoints none of a guest's: its next rebind names
+            // where it lies, before any fire of it.
+            engine::program::Rebind::Parked { .. } => Ok(()),
             engine::program::Rebind::Channel { id, slots } => {
                 let shell = self.shell.as_ref();
                 let cell_row = |slot: u32| shell.and_then(|shell| shell.channel_row(slot));

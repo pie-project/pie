@@ -271,6 +271,16 @@ impl Engine {
             fire_lanes: profile.get::<FireLanes>().0,
         }
     }
+
+    /// The lanes one fire of a load seating `max_lanes` carries
+    /// (`Shell::fire_lanes`): every one, or `engine.fire_lanes` where fewer.
+    #[must_use]
+    pub fn fire_lanes_of(&self, max_lanes: u32) -> u32 {
+        match self.fire_lanes {
+            0 => max_lanes,
+            cap => max_lanes.min(cap),
+        }
+    }
 }
 
 /// The name and facts of GPU `ordinal`, read without opening a context:

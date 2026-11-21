@@ -166,12 +166,12 @@ impl pie::inferlet::model::Host for ProcessCtx {
         Ok(crate::scheduler::configured_frame_size() as u32)
     }
 
-    async fn submit_deadline_us(&mut self) -> Result<u64> {
-        Ok(crate::scheduler::configured_submit_deadline().as_micros() as u64)
-    }
-
     async fn channel_capacity(&mut self) -> Result<u32> {
         Ok(crate::scheduler::channel_capacity() as u32)
+    }
+
+    async fn frames_in_flight(&mut self) -> Result<u32> {
+        Ok(crate::scheduler::configured_dispatch_depth().max(1) as u32)
     }
 
     async fn run_ahead_window(&mut self) -> Result<u32> {
@@ -220,6 +220,7 @@ mod tests {
         let limits = |max_forward_tokens, prefill_rows| crate::engine::SchedulerLimits {
             max_readouts: 0,
             readout_store: 0,
+            max_replayed_rows: 0,
             max_forward_requests: 8,
             max_forward_tokens,
             max_page_refs: 64,
