@@ -84,7 +84,9 @@ impl Arenas {
 }
 
 /// The blocks each of `filled` lanes' samplers runs on: as many as the
-/// device holds at once with them, from one to [`LANE_SAMPLER_BLOCKS`].
+/// `units` this process runs on hold at once with them, a block a unit, from
+/// one to [`LANE_SAMPLER_BLOCKS`] (the launch checks the kernel's occupancy
+/// holds them).
 fn lane_blocks(units: u32, filled: u32) -> u32 {
     (units / filled.max(1)).clamp(1, LANE_SAMPLER_BLOCKS)
 }
@@ -1590,7 +1592,29 @@ impl Prepared {
             self.zero_barriers(arenas, lane_span(1), stream)?;
             (blocks, blocks)
         } else if sampler {
-            let rows = lane_blocks(device_units(), self.filled).min(rows);
+            // A sampler lane's blocks wait on one another at its barrier
+            // (`M1Lane::barrier`), so every block of the launch is resident
+            // at once: the lanes' blocks are never more than the units this
+            // process's queues run on ([`device_units`], a CU mask's and a
+            // partition's and MPS's count, not the device's) hold of this
+            // kernel at once. Nothing in the process spins waiting on a
+            // sampler, so another launch's blocks only delay its own; a lane
+            // on one block waits on no other.
+            let units = device_units();
+            let rows = lane_blocks(units, self.filled).min(rows);
+            let held = u64::from(units) * u64::from(region.module.resident());
+            if rows > 1 && u64::from(self.filled) * u64::from(rows) > held {
+                return Err(Fault::program(
+                    "cuLaunchKernel",
+                    format!(
+                        "`{}`: {} lanes' samplers on {rows} blocks each wait on one another, \
+                         and the {units} compute units this process runs on hold {held} of its \
+                         blocks at once",
+                        region.module.entry_name(),
+                        self.filled
+                    ),
+                ));
+            }
             let need = u64::from(self.filled) * lane_span(rows);
             if need > arenas.bytes {
                 return Err(Fault::Ceiling {
@@ -1846,8 +1870,12 @@ impl Prepared {
     }
 }
 
-/// The device's multiprocessors, which a sampler fire's blocks may fill
-/// and its lane arenas are sized by ([`Arenas::bytes_for`]).
+/// The device's multiprocessors this process's queues run on, which a
+/// sampler fire's blocks may fill and its lane arenas are sized by
+/// ([`Arenas::bytes_for`]): the device's count (a partition's own, and under
+/// CUDA's MPS the share it is limited to), less those a CU mask keeps its
+/// queues off on ROCm ([`queue_units`]). A sampler's blocks meet at a
+/// barrier, so it never runs on more than these hold at once.
 #[must_use]
 pub fn device_units() -> u32 {
     static UNITS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
@@ -1869,13 +1897,96 @@ pub fn device_units() -> u32 {
                     return 1;
                 }
             }
-            u32::try_from(count).unwrap_or(1).max(1)
+            let units = u32::try_from(count).unwrap_or(1).max(1);
+            #[cfg(feature = "rocm")]
+            {
+                let var = |name: &str| std::env::var(name).ok();
+                let ordinal = u32::try_from(device).unwrap_or(0);
+                // The HSA agent HIP's ordinal names: the ordinal's entry of a
+                // visible-devices list, where one is set.
+                let agent = var("HIP_VISIBLE_DEVICES")
+                    .or_else(|| var("CUDA_VISIBLE_DEVICES"))
+                    .and_then(|list| list.split(',').nth(ordinal as usize)?.trim().parse().ok())
+                    .unwrap_or(ordinal);
+                let held = queue_units(
+                    units,
+                    agent,
+                    var("HSA_CU_MASK").as_deref(),
+                    var("ROC_GLOBAL_CU_MASK").as_deref(),
+                );
+                if held != units {
+                    eprintln!(
+                        "engine-cuda: {held} of the device's {units} compute units are this \
+                         process's queues' (a CU mask); its samplers' blocks are laid over \
+                         those"
+                    );
+                }
+                held
+            }
+            #[cfg(not(feature = "rocm"))]
+            units
         }
         #[cfg(not(feature = "device"))]
         {
             1
         }
     })
+}
+
+/// Of a device's `units` compute units, those its queues run on under ROCm's
+/// CU masks: `hsa` (`HSA_CU_MASK`, `<agents>:<units>[;...]`, each list of
+/// indices and `a-b` ranges, naming HSA agent `agent` or not) and `global`
+/// (`ROC_GLOBAL_CU_MASK`, a hex mask HIP gives every queue it makes), both
+/// applying where both are set. A mask this cannot read answers one unit:
+/// blocks that wait on one another are then never more than it holds.
+#[must_use]
+pub fn queue_units(units: u32, agent: u32, hsa: Option<&str>, global: Option<&str>) -> u32 {
+    fn indices(list: &str) -> Option<Vec<u32>> {
+        let mut out = Vec::new();
+        for part in list.split(',').map(str::trim).filter(|part| !part.is_empty()) {
+            match part.split_once('-') {
+                Some((a, b)) => {
+                    let (a, b): (u32, u32) = (a.trim().parse().ok()?, b.trim().parse().ok()?);
+                    if a > b {
+                        return None;
+                    }
+                    out.extend(a..=b.min(a.saturating_add(4096)));
+                }
+                None => out.push(part.parse().ok()?),
+            }
+        }
+        Some(out)
+    }
+    let mut held: Vec<bool> = vec![true; units as usize];
+    if let Some(hsa) = hsa.map(str::trim).filter(|mask| !mask.is_empty()) {
+        for entry in hsa.split(';').map(str::trim).filter(|entry| !entry.is_empty()) {
+            let Some((agents, list)) = entry.split_once(':') else {
+                return 1;
+            };
+            let (Some(agents), Some(list)) = (indices(agents), indices(list)) else {
+                return 1;
+            };
+            if agents.contains(&agent) {
+                let named: std::collections::BTreeSet<u32> = list.into_iter().collect();
+                for (unit, on) in held.iter_mut().enumerate() {
+                    *on &= named.contains(&(unit as u32));
+                }
+            }
+        }
+    }
+    if let Some(global) = global.map(str::trim).filter(|mask| !mask.is_empty()) {
+        let hex = global.trim_start_matches("0x").trim_start_matches("0X");
+        if hex.is_empty() || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return 1;
+        }
+        // Its last digit names units 0-3.
+        let digits: Vec<u32> = hex.chars().rev().filter_map(|c| c.to_digit(16)).collect();
+        for (unit, on) in held.iter_mut().enumerate() {
+            let digit = digits.get(unit / 4).copied().unwrap_or(0);
+            *on &= digit >> (unit % 4) & 1 == 1;
+        }
+    }
+    u32::try_from(held.iter().filter(|&&on| on).count()).unwrap_or(1).max(1)
 }
 
 pub fn launch(
@@ -1945,6 +2056,25 @@ pub fn launch(
 
 #[cfg(test)]
 mod tests {
+    use super::queue_units;
+
+    #[test]
+    fn a_cu_mask_holds_a_process_s_queues_to_the_units_it_names() {
+        assert_eq!(queue_units(304, 0, None, None), 304);
+        assert_eq!(queue_units(304, 0, Some("0:0-3"), None), 4);
+        assert_eq!(queue_units(304, 0, Some("0:0-15,32,40-41"), None), 19);
+        // Another agent's mask leaves this one's units.
+        assert_eq!(queue_units(304, 1, Some("0:0-3"), None), 304);
+        assert_eq!(queue_units(304, 1, Some("0:0-3;1,2:0-7"), None), 8);
+        // Units past the device's are not its.
+        assert_eq!(queue_units(8, 0, Some("0:4-100"), None), 4);
+        assert_eq!(queue_units(304, 0, None, Some("0xff")), 8);
+        assert_eq!(queue_units(304, 0, Some("0:0-5"), Some("0xf0")), 2);
+        // What it cannot read holds blocks that meet to one unit.
+        assert_eq!(queue_units(304, 0, Some("0:zero"), None), 1);
+        assert_eq!(queue_units(304, 0, None, Some("0xfg")), 1);
+    }
+
     use super::*;
     use eta_ir::types::MAX_RANK;
 

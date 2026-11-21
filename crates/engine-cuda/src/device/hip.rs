@@ -701,6 +701,19 @@ pub mod dr {
         // `attr` is one of the enum's ids, which are HIP's.
         CUresult::of(unsafe { hip::hipFuncGetAttribute(value, attr as c_int, function) })
     }
+    pub unsafe fn cuOccupancyMaxActiveBlocksPerMultiprocessor(
+        blocks: *mut c_int,
+        function: CUfunction,
+        block: c_int,
+        shared_bytes: usize,
+    ) -> CUresult {
+        // SAFETY: `hipModuleOccupancyMaxActiveBlocksPerMultiprocessor` takes
+        // the same arguments with the same contract, which the caller of this
+        // fn upholds.
+        CUresult::of(unsafe {
+            hip::hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(blocks, function, block, shared_bytes)
+        })
+    }
     pub unsafe fn cuModuleLoadData(module: *mut CUmodule, image: *const c_void) -> CUresult {
         // SAFETY: `hipModuleLoadData` takes the same arguments with the same
         // contract, which the caller of this fn upholds.

@@ -350,6 +350,9 @@ pub struct Module {
     block_threads: u32,
     /// The dynamic shared memory each launch hands it.
     dynamic_shared: u32,
+    /// The blocks of it one multiprocessor holds at once (its registers and
+    /// shared memory's occupancy).
+    resident: u32,
     entry_name: String,
 }
 
@@ -424,11 +427,32 @@ impl Module {
                     });
                 }
             }
+            let block_threads = launch_width(function);
+            let mut resident: core::ffi::c_int = 0;
+            // SAFETY: `function` was just resolved out of the loaded module;
+            // `resident` is a live out-parameter.
+            let code = unsafe {
+                dr::cuOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &raw mut resident,
+                    function,
+                    i32::try_from(block_threads).unwrap_or(i32::MAX),
+                    dynamic_shared as usize,
+                )
+            };
+            if code != dr::CUresult::CUDA_SUCCESS {
+                // SAFETY: as above, no function of it is in flight.
+                unsafe { dr::cuModuleUnload(module) };
+                return Err(Fault::Device {
+                    call: "cuOccupancyMaxActiveBlocksPerMultiprocessor",
+                    code: code as i32,
+                });
+            }
             Ok(Module {
                 module,
                 function,
-                block_threads: launch_width(function),
+                block_threads,
                 dynamic_shared,
+                resident: u32::try_from(resident).unwrap_or(0),
                 entry_name: entry_name.to_string(),
             })
         }
@@ -453,6 +477,12 @@ impl Module {
     #[must_use]
     pub const fn block_threads(&self) -> u32 {
         self.block_threads
+    }
+
+    /// The blocks of it one multiprocessor holds at once.
+    #[must_use]
+    pub const fn resident(&self) -> u32 {
+        self.resident
     }
 
     #[must_use]
