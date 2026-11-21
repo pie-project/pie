@@ -2573,19 +2573,38 @@ impl BindRoomPool {
 }
 
 impl PoolPort for BindRoomPool {
-    fn restore_stands(
+    /// Its own retake (`own`, single chunks) takes its chunks first; what
+    /// is short is the rest of `need` (the head's need as the planner reads
+    /// it, its own retake's single chunks among them), laid in what that
+    /// leaves.
+    fn restore_placement(
         &self,
         pid: ProcessId,
         need: &super::pool::RunNeed,
         state: RsUnits,
         _kv_pages: u32,
         bind: Option<(u32, u32)>,
-    ) -> bool {
-        !self.store_refuses.load(Ordering::Relaxed)
-            && match bind {
-                Some((run, pieces)) => self.room_beside_own(pid, run, pieces),
-                None => self.guest_need_free(need, state),
-            }
+    ) -> super::pool::RestorePlacement {
+        let _ = (pid, state, bind);
+        let refuses = self.store_refuses.load(Ordering::Relaxed);
+        let free = self.free.lock().clone();
+        let opened: Vec<u32> = self.own.lock().iter().copied().filter(|c| free.contains(c)).collect();
+        let own = opened.len() as u32;
+        let rest = super::pool::RunNeed::of(need.entries().iter().map(|&(run, pieces)| {
+            (run, if run == 1 { pieces.saturating_sub(own) } else { pieces })
+        }));
+        let beside = super::pool::ChunkMap {
+            free: free.iter().copied().filter(|c| !opened.contains(c)).collect(),
+            headroom: self.headroom.lock().map(|room| room.saturating_sub(own)),
+            ..super::pool::ChunkMap::default()
+        };
+        let stands = !refuses && beside.cheapest_need(&rest).is_some_and(|moves| moves.is_empty());
+        super::pool::RestorePlacement {
+            opened,
+            room: None,
+            short: if stands { super::pool::RunNeed::default() } else { rest },
+            bind_free_runs: None,
+        }
     }
     fn chunk_stats(&self) -> ChunkStats {
         let rs = self.rs_free.load(Ordering::Relaxed);
@@ -7363,12 +7382,19 @@ fn bench_store_model() -> (usize, crate::store::roles::RolesHandle) {
         ChunkFacts, Growth, Reserved, ReservedRun, SegmentFacts, ShapeId, SlotKind, SlotRole,
         SlotShape,
     };
-    const CHUNK: u64 = 1 << 20;
+    // `PIE_BENCH_FCGATE=1`: the L40S's fcgate pair, a 6 GiB pool of CUDA's
+    // ~17 MiB chunks, nine kv pages a chunk.
+    let fcgate = std::env::var_os("PIE_BENCH_FCGATE").is_some();
+    let (chunk, total, page) = if fcgate {
+        (9 * (1980u64 << 10), 361u32, 1980u64 << 10)
+    } else {
+        (1u64 << 20, 480, 64 << 10)
+    };
     let shape = |id: u32, kind: SlotKind, slot_bytes: u64, role: SlotRole| SlotShape {
         id: ShapeId(id),
         kind,
         slot_bytes,
-        slots_per_chunk: u32::try_from(CHUNK / slot_bytes).unwrap(),
+        slots_per_chunk: u32::try_from(chunk / slot_bytes).unwrap(),
         sets_per_working_set: 1,
         rows: Vec::new(),
         pinned: None,
@@ -7381,9 +7407,9 @@ fn bench_store_model() -> (usize, crate::store::roles::RolesHandle) {
     };
     let fixed = SlotKind::Fixed { pieces: 1 };
     let facts = ChunkFacts {
-        chunk_bytes: CHUNK,
-        total_chunks: 480,
-        segment_chunks: 480,
+        chunk_bytes: chunk,
+        total_chunks: total,
+        segment_chunks: total,
         segments: SegmentFacts {
             committed: 1,
             max: 1,
@@ -7395,7 +7421,7 @@ fn bench_store_model() -> (usize, crate::store::roles::RolesHandle) {
             chunks: 1,
         }],
         shapes: vec![
-            shape(0, list, 64 << 10, SlotRole::State),
+            shape(0, list, page, SlotRole::State),
             shape(1, fixed, 256 << 10, SlotRole::State),
             shape(2, fixed, 4 << 10, SlotRole::Instance),
             shape(3, fixed, 1 << 10, SlotRole::Channel),
@@ -7465,8 +7491,10 @@ fn bench_a_plan_pass_on_a_shared_store() {
         model, 0, false,
     ))));
 
-    // 250 residents and the head, each bound to an instance.
-    let residents: Vec<ProcessId> = (0..250).map(|_| ProcessId::new_v4()).collect();
+    // 250 residents and the head, each bound to an instance (the fcgate
+    // pair: 8 beam-4 processes and 64 decodes, 72).
+    let count = if std::env::var_os("PIE_BENCH_FCGATE").is_some() { 72 } else { 250 };
+    let residents: Vec<ProcessId> = (0..count).map(|_| ProcessId::new_v4()).collect();
     let head = ProcessId::new_v4();
     let mut engine = FakeEngine::default();
     learn_program(&roles, &engine, PROGRAM).unwrap();
@@ -7574,7 +7602,7 @@ fn bench_a_plan_pass_on_a_shared_store() {
         }
         if !stalled {
             // A decoder's fire in flight, as long as the bench runs.
-            let proc = inner.procs.get_mut(&residents[200]).unwrap();
+            let proc = inner.procs.get_mut(&residents[residents.len() - 1]).unwrap();
             proc.fires = 1;
             proc.fired_at = crate::rt::Instant::now() + Duration::from_secs(3600);
         }
@@ -7598,11 +7626,22 @@ fn bench_a_plan_pass_on_a_shared_store() {
     );
     let passes_then = planner.pass_census();
     let phases_then = planner.phase_census();
+    // Each round a pass, as on an event: the settled generation cleared.
     let began = std::time::Instant::now();
     for _ in 0..rounds {
+        *planner.settled_at.lock() = None;
         planner.plan();
     }
     let per_pass = began.elapsed().as_secs_f64() * 1e6 / f64::from(rounds);
+    let woke = std::time::Instant::now();
+    for _ in 0..rounds {
+        planner.plan();
+    }
+    eprintln!(
+        "BENCH wake on a settled generation: {:.1} us; skipped={}",
+        woke.elapsed().as_secs_f64() * 1e6 / f64::from(rounds),
+        planner.stats.skipped_wakes.load(Ordering::Relaxed),
+    );
     let passes = planner.pass_census();
     let phases = planner.phase_census();
     eprintln!(
@@ -7830,6 +7869,53 @@ async fn a_stuck_head_costs_a_bounded_number_of_passes() {
     assert!(more <= 2, "a hundred answers of nothing freed planned {more} passes");
     assert!(!task.is_finished());
     task.abort();
+}
+
+/// Mac Pro's g2 spin (56,671 no-step lines, ~199 s of map passes in one
+/// run): a stuck head re-ran every pass on every wake. Edge-triggered, a
+/// stuck state is said once and costs no pass until an event moves the
+/// generation; its wakes are counted, and the next event plans again.
+#[tokio::test(flavor = "current_thread")]
+async fn a_stuck_state_is_said_once_and_costs_no_pass_until_an_event() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 0));
+    pool.free.lock().extend([0, 2, 4, 6]);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let head = ProcessId::new_v4();
+    planner.register(head);
+    planner.note_admitted(head);
+    planner.with_inner(|inner| {
+        inner.enqueue(
+            head,
+            WaitKind::BindRoom {
+                run: 2,
+                pieces: 1,
+                pages: 2,
+                notify: Arc::new(Notify::new()),
+                served: false,
+                withdrawn: false,
+                rise: None,
+            },
+        );
+    });
+    // Scattered free chunks, no one to move: stuck.
+    planner.plan();
+    planner.plan();
+    let passes = planner.stats.plan_passes.load(Ordering::Relaxed);
+    let dumps = planner.stats.stall_dumps.load(Ordering::Relaxed);
+    let maps = planner.stats.map_passes.load(Ordering::Relaxed);
+    for _ in 0..100 {
+        planner.plan();
+    }
+    assert_eq!(planner.stats.plan_passes.load(Ordering::Relaxed), passes, "no pass on no event");
+    assert_eq!(planner.stats.stall_dumps.load(Ordering::Relaxed), dumps, "said once");
+    assert_eq!(planner.stats.map_passes.load(Ordering::Relaxed), maps, "no map built");
+    assert!(planner.stats.skipped_wakes.load(Ordering::Relaxed) >= 100, "the wakes counted");
+    // An event: room given back. The next wake plans, and serves.
+    pool.free.lock().push(1);
+    pool.gives.fetch_add(1, Ordering::Relaxed);
+    planner.plan();
+    assert_eq!(planner.stats.plan_passes.load(Ordering::Relaxed), passes + 1, "planned on the event");
 }
 
 /// The M1's allocation head with 38 free runs not granted: only the seated
@@ -9189,6 +9275,8 @@ async fn a_capped_frame_s_raise_waits_through_its_owner_s_eviction_and_is_served
 fn the_census_counts_each_plan_pass_and_its_time() {
     let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::new(8))));
     for _ in 0..10 {
+        // Each on an event: unmoved, a wake runs no pass.
+        planner.events.fetch_add(1, Ordering::Relaxed);
         planner.plan();
     }
     let (passes, total, mean, p99) = planner.pass_census();
@@ -9237,54 +9325,6 @@ async fn a_pass_that_sends_a_refused_restore_again_says_so() {
     // Boarded, the pass's last end for it is the send itself.
     assert!(plan.contains("restore sent"), "{plan}");
     drop(fire);
-}
-
-/// The L40S on 4cef0c7d3: 1,195 of 1,199 no-step lines had free runs and
-/// emptiable chunks enough and no move planned: the map stood the head's
-/// need (nothing to move) while the store's placement of its whole restore
-/// did not. The map is then asked one more piece of the need's longest
-/// run, and names the occupants whose move makes it.
-#[tokio::test(flavor = "current_thread")]
-async fn room_there_only_by_emptying_is_made_by_the_map_s_moves() {
-    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
-    let pool = Arc::new(BindRoomPool::new(4, 0..0, 64));
-    pool.free.lock().extend([0, 1, 3]);
-    pool.store_refuses.store(true, Ordering::Relaxed);
-    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
-    let (head, resident) = (ProcessId::new_v4(), ProcessId::new_v4());
-    for pid in [head, resident] {
-        planner.register(pid);
-        planner.note_admitted(pid);
-    }
-    pool.kv.lock().push((2, resident));
-    planner.with_inner(|inner| {
-        inner.procs.get_mut(&resident).unwrap().idle = true;
-        let proc = inner.procs.get_mut(&head).unwrap();
-        proc.state = Residency::Evicted;
-        proc.roles_short = Some(PendingBind {
-            run: 2,
-            pieces: 1,
-            pages: 2,
-        });
-        proc.roles_short_stood = Some(false);
-        inner.enqueue(
-            head,
-            WaitKind::Restore {
-                demand: Demand::default(),
-            },
-        );
-    });
-    planner.poke();
-    for _ in 0..200 {
-        crate::rt::yield_now().await;
-        if planner.stats.evictions_started.load(Ordering::Relaxed) > 0 {
-            break;
-        }
-    }
-    assert!(
-        planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
-        "the occupant of the chunk that completes another run is moved"
-    );
 }
 
 /// The L40S at 3 GiB on 4cef0c7d3: 613 evictions within 200 ms of their
@@ -9502,110 +9542,6 @@ fn the_owner_of_a_capped_frame_is_no_victim() {
     assert!(with_capped.contains(&other));
 }
 
-/// The M1 on ca5c710a7: a restore head, the map standing its need [(3, 2),
-/// (2, 2)] (three free runs of three, need_moves 0), its own check after
-/// its unpark finding one run of three, and the pass asking the policy.
-/// One more piece was not enough: the need is widened until the map no
-/// longer stands it, and the map's moves for it are made.
-#[tokio::test(flavor = "current_thread")]
-async fn a_need_the_map_stands_twice_over_is_widened_until_moves_are_named() {
-    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
-    let pool = Arc::new(BindRoomPool::new(6, 0..0, 64));
-    pool.free.lock().extend([0, 1, 2, 3]);
-    pool.store_refuses.store(true, Ordering::Relaxed);
-    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
-    let (head, resident) = (ProcessId::new_v4(), ProcessId::new_v4());
-    for pid in [head, resident] {
-        planner.register(pid);
-        planner.note_admitted(pid);
-    }
-    pool.kv.lock().extend([(4, resident), (5, resident)]);
-    planner.with_inner(|inner| {
-        inner.procs.get_mut(&resident).unwrap().idle = true;
-        let proc = inner.procs.get_mut(&head).unwrap();
-        proc.state = Residency::Evicted;
-        proc.roles_short = Some(PendingBind {
-            run: 2,
-            pieces: 1,
-            pages: 2,
-        });
-        proc.roles_short_stood = Some(false);
-        inner.enqueue(
-            head,
-            WaitKind::Restore {
-                demand: Demand::default(),
-            },
-        );
-    });
-    planner.poke();
-    for _ in 0..200 {
-        crate::rt::yield_now().await;
-        if planner.stats.evictions_started.load(Ordering::Relaxed) > 0 {
-            break;
-        }
-    }
-    assert!(
-        planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
-        "widened past what the map stands, the occupant is moved"
-    );
-}
-
-/// Mac Pro at 2 GiB on f623134fc, twice: a restore head whose placement
-/// stands where its last refusal was taken in the same room, held until
-/// more chunks stand free, nothing in flight to free one, stalled. A head
-/// waits for room only while something in flight gives it back: here its
-/// moves are named and made (the idle resident evicted), and no wait is
-/// chosen with nothing in flight.
-#[tokio::test(flavor = "current_thread")]
-async fn a_standing_restore_refused_in_the_same_room_with_nothing_in_flight_is_planned_for() {
-    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
-    let pool = Arc::new(BindRoomPool::new(6, 0..0, 64));
-    pool.free.lock().extend([0, 1, 2, 3]);
-    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
-    let (head, resident) = (ProcessId::new_v4(), ProcessId::new_v4());
-    for pid in [head, resident] {
-        planner.register(pid);
-        planner.note_admitted(pid);
-    }
-    pool.kv.lock().extend([(4, resident), (5, resident)]);
-    let free = pool.free_chunks();
-    planner.with_inner(|inner| {
-        inner.procs.get_mut(&resident).unwrap().idle = true;
-        let proc = inner.procs.get_mut(&head).unwrap();
-        proc.state = Residency::Evicted;
-        proc.roles_short = Some(PendingBind {
-            run: 2,
-            pieces: 1,
-            pages: 2,
-        });
-        proc.roles_short_stood = Some(true);
-        proc.roles_short_free = Some(free);
-        inner.enqueue(
-            head,
-            WaitKind::Restore {
-                demand: Demand::default(),
-            },
-        );
-    });
-    planner.poke();
-    for _ in 0..200 {
-        crate::rt::yield_now().await;
-        if planner.stats.evictions_started.load(Ordering::Relaxed) > 0 {
-            break;
-        }
-    }
-    let end = planner.with_inner(|inner| inner.last_plan.as_ref().map(|end| end.ended));
-    assert!(
-        planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
-        "nothing in flight: the moves that form its room are made ({end:?})"
-    );
-    assert_eq!(
-        planner.stats.quiet_waits.load(Ordering::Relaxed),
-        0,
-        "no wait chosen with nothing in flight"
-    );
-}
-
 /// The L40S at 3 GiB on f623134fc: kv resident 0, the stall's map naming 7
 /// moves for a restore head, the pass ending "no pick: the policy is
 /// asked", nothing in flight, 185 s with no serve. Such an end is a quiet
@@ -9727,65 +9663,6 @@ async fn one_chunk_short_of_singles_evicts_its_parkable_occupants() {
     assert_eq!(planner.stats.quiet_waits.load(Ordering::Relaxed), 0);
 }
 
-/// The M1 at 2 GiB on 05c8624c5: 117,270 no-step lines, a bind-suspended
-/// restore refused PendingBindShort (no run of 7 after its own takes) and
-/// sent again every pass on a placement check that stood it in the same
-/// room. Whatever the refusal's kind, a check standing a restore in the
-/// room its last refusal was taken in is wrong: it is not sent again, and
-/// the room is made (the occupant evicted).
-#[tokio::test(flavor = "current_thread")]
-async fn a_restore_refused_in_this_room_is_never_sent_again_on_it_whatever_the_refusal() {
-    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
-    let pool = Arc::new(BindRoomPool::new(6, 0..0, 64));
-    pool.free.lock().extend([0, 1, 2, 3]);
-    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
-    let (head, resident) = (ProcessId::new_v4(), ProcessId::new_v4());
-    for pid in [head, resident] {
-        planner.register(pid);
-        planner.note_admitted(pid);
-    }
-    pool.kv.lock().extend([(4, resident), (5, resident)]);
-    let free = pool.free_chunks();
-    let restores = planner.stats.restores.load(Ordering::Relaxed);
-    planner.with_inner(|inner| {
-        inner.procs.get_mut(&resident).unwrap().idle = true;
-        let proc = inner.procs.get_mut(&head).unwrap();
-        proc.state = Residency::Evicted;
-        let bind = PendingBind {
-            run: 2,
-            pieces: 1,
-            pages: 2,
-        };
-        proc.bind_room = Some(bind);
-        proc.roles_short = Some(bind);
-        proc.roles_short_stood = Some(false);
-        proc.roles_short_free = Some(free);
-        inner.enqueue(
-            head,
-            WaitKind::Restore {
-                demand: Demand::default(),
-            },
-        );
-    });
-    planner.poke();
-    for _ in 0..200 {
-        crate::rt::yield_now().await;
-        if planner.stats.evictions_started.load(Ordering::Relaxed) > 0 {
-            break;
-        }
-    }
-    let end = planner.with_inner(|inner| inner.last_plan.as_ref().map(|end| end.ended));
-    assert_eq!(
-        planner.stats.restores.load(Ordering::Relaxed),
-        restores,
-        "not sent again on the room it was refused in ({end:?})"
-    );
-    assert!(
-        planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
-        "the room is made ({end:?})"
-    );
-}
-
 /// Mac Pro at 2 GiB on c10d7de5d: a restore with a bind's run of 7 and
 /// many kv pages to gather asked them as runs of 7 ((7, 1) grew to (7,
 /// 31), past the 30 free runs on a device 310 of 365 pages free), and the
@@ -9820,26 +9697,68 @@ fn a_restore_s_pages_to_gather_are_single_chunks_beside_its_runs() {
     assert_eq!(planner.head_room(key), Some(need));
 }
 
-/// Mac Pro at 2 GiB on acfd05fe1: the need widened for a refusal in this
-/// room one pass and narrowed the next ((3, 8) and (3, 3), 56,671 no-step
-/// lines) as the free count crossed the refusal's. Once read, the widening
-/// holds until a new refusal or the serve; a send still goes on more room.
-#[test]
-fn a_refusal_read_as_taken_in_this_room_holds_until_a_new_refusal() {
-    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
-    pool.free.lock().extend([0, 1]);
-    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
-    let pid = ProcessId::new_v4();
-    planner.register(pid);
-    planner.with_inner(|inner| inner.procs.get_mut(&pid).unwrap().roles_short_free = Some(2));
-    assert!(planner.refused_in_this_room(pid));
-    pool.free.lock().extend([2, 3]);
-    assert!(planner.refused_in_this_room(pid), "held, not reset by more room");
-    assert!(!planner.no_more_room_than_refused(pid), "a send reads the room anew");
-    planner.with_inner(|inner| {
-        let proc = inner.procs.get_mut(&pid).unwrap();
-        proc.roles_short_free = Some(1);
-        proc.refused_here = false;
+
+/// Mac Pro at 2 GiB (g2): free runs of three at 0-2 and 4-6, the
+/// restore's own take opening chunk 0, its pending bind asking two runs of
+/// three. Read as a mirror of the takes, the map laid the bind in both
+/// free runs, need_moves 0, while the restore's own take left one
+/// (PendingBindShort { run: 3, pieces: 2, free_runs_after_own_unpark: 1 }),
+/// and the head spun. Its own take placed first by the one placement, the
+/// map's need is the bind beside it: one move (the resident on chunk 3),
+/// and the move is issued.
+#[tokio::test(flavor = "current_thread")]
+async fn a_restore_s_own_take_consumes_a_run_and_its_move_is_issued() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let model = crate::store::registry::register_model(16, &[8], &[4]);
+    let pool = Arc::new(BindRoomPool {
+        model,
+        ..BindRoomPool::new(8, 0..0, 64)
     });
-    assert!(!planner.refused_in_this_room(pid), "a new refusal reads anew");
+    pool.free.lock().extend([0, 1, 2, 4, 5, 6]);
+    pool.own.lock().push(0);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (head, resident) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [head, resident] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    pool.kv.lock().extend([(3, resident), (7, resident)]);
+    let key = planner.with_inner(|inner| {
+        inner.procs.get_mut(&resident).unwrap().idle = true;
+        let proc = inner.procs.get_mut(&head).unwrap();
+        proc.state = Residency::Evicted;
+        proc.bind_room = Some(super::proc::PendingBind {
+            run: 3,
+            pieces: 2,
+            pages: 6,
+        });
+        inner.enqueue(
+            head,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        )
+    });
+    assert!(pool.guest_room_free(3, 2), "two free runs of three before its own take");
+    let need = planner.head_room(key).expect("a need of runs");
+    let placement = planner.head_placement(key, &need).expect("a restore head");
+    assert!(!placement.stands(), "its own take leaves one run of three");
+    let mut map = pool.chunk_occupants(&[resident]);
+    placement.lay(&mut map);
+    assert_eq!(
+        map.cheapest_need(&placement.short).map(|pids| pids.len()),
+        Some(1),
+        "need_moves 1: the resident on chunk 3"
+    );
+    planner.poke();
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.stats.evictions_started.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+    }
+    assert!(
+        planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
+        "the move is issued"
+    );
 }

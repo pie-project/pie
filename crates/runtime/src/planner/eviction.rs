@@ -260,21 +260,18 @@ impl ResidencyPlanner {
         // So is a restore whose role slots are short of runs of chunks
         // ([`super::proc::Proc::roles_short`]): its unpark retakes its dead
         // parts fresh, in their class.
+        // A restore head's own takes placed first by the store's takes
+        // ([`Self::head_placement`]): its runs are what does not stand once
+        // they are, laid in the room they leave. Read as a mirror of the
+        // takes, the map stood runs the restore's own takes then broke and
+        // planned no move (Mac Pro at 2 GiB: need_moves 0, PendingBindShort).
         let mut shape = self.head_room(victims.head);
-        // The map stands a restore's need while the store's placement of
-        // its whole restore does not (room there only by emptying, the
-        // map's free chunks laid otherwise than the takes lay them): one
-        // more piece of its longest run is asked, so the map names the
-        // occupants whose move makes it (the L40S on 4cef0c7d3: 1,195 of
-        // 1,199 lines with free runs and emptiable chunks enough and no
-        // move planned). Once the restore stands, it is sent again.
-        if victims.restore
-            && let Some(need) = shape.as_mut()
-        {
-            let mut map = self.port.chunk_occupants(&[]);
-            map.merge(self.parked_map(victims.head_pid));
-            self.lay_serve_state(victims.head, &mut map);
-            self.widen_to_store(victims.head, victims.head_pid, need, &map);
+        let placement = match (victims.restore, shape.as_ref()) {
+            (true, Some(need)) => self.head_placement(victims.head, need),
+            _ => None,
+        };
+        if let Some(placement) = &placement {
+            shape = Some(placement.short.clone());
         }
         // Kv the head lacks, with parked state lying on the device (role
         // slots its park found no room below for, as on a home with no host
@@ -304,7 +301,9 @@ impl ResidencyPlanner {
         let map = shape.as_ref().map(|_| {
             let mut map = self.occupants(&residents);
             map.merge(self.parked_map(victims.head_pid));
-            self.lay_serve_state(victims.head, &mut map);
+            if let Some(placement) = &placement {
+                placement.lay(&mut map);
+            }
             map
         });
         // No eviction forms the head's runs (a chunk in every window holds
@@ -434,11 +433,11 @@ impl ResidencyPlanner {
             // the store's placement stands it, and it is sent again once
             // more chunks stand free than its refusal left, or its own
             // check refuses what the map stands, and that is said.
-            let fits = match (victims.restore, shape.as_ref(), map.as_ref()) {
-                (true, Some(need), Some(map)) => map
+            let fits = match (placement.as_ref(), shape.as_ref(), map.as_ref()) {
+                (Some(placement), Some(need), Some(map)) => map
                     .cheapest_need(need)
                     .is_some_and(|moves| moves.is_empty())
-                    .then(|| self.store_stands(victims.head, victims.head_pid, need)),
+                    .then(|| placement.stands()),
                 _ => None,
             };
             if let Some(stands) = fits
@@ -548,65 +547,9 @@ impl ResidencyPlanner {
         }
     }
 
-    /// A restore head's `need` widened until the map no longer stands it
-    /// where the store's placement of its whole restore does not (its
-    /// serve's state, every piece of its unpark, its pending bind's runs):
-    /// one more piece of its longest run at a time, never past what the
-    /// map's free chunks could hold. The map then names the moves the
-    /// store's room needs: read as the map's alone, the M1 on ca5c710a7
-    /// read need_moves 0 while its own check found one run of three of the
-    /// three the map stood, and the pass asked the policy.
-    pub(super) fn widen_to_store(
-        &self,
-        head: EntryKey,
-        pid: ProcessId,
-        need: &mut RunNeed,
-        map: &super::pool::ChunkMap,
-    ) {
-        let Some((run, _)) = need.longest() else {
-            return;
-        };
-        // Standing where its last refusal was taken in this same room is
-        // no standing: the restore found otherwise there, and holding it
-        // for more room with nothing in flight lost its wake (Mac Pro at
-        // 2 GiB on f623134fc, twice). Its moves are named instead.
-        // Held once read (never reset by a pass): the need stays widened
-        // until a new refusal or its serve.
-        if !self.refused_in_this_room(pid) && self.store_stands(head, pid, need) {
-            return;
-        }
-        let most = u32::try_from(map.free.len()).unwrap_or(u32::MAX) / run.max(1) + 1;
-        for _ in 0..most {
-            if !map.cheapest_need(need).is_some_and(|moves| moves.is_empty()) {
-                break;
-            }
-            need.add(run, 1);
-        }
-    }
-
-    /// Whether `pid`'s last refusal (of any kind: its unpark short, its
-    /// pending bind short) was taken in the free room standing now, no
-    /// chunk more free than it left: then a placement check that stands it
-    /// is wrong, and the plan makes room instead of sending it again. The
-    /// backstop for any mismatch between the check and the restore's own
-    /// takes (the M1 at 2 GiB on 05c8624c5: 117,270 no-step lines, the check
-    /// standing a run of 7 the restore, its pages gathered, found none of).
-    pub(super) fn refused_in_this_room(&self, pid: ProcessId) -> bool {
-        let free = self.port.free_chunks();
-        self.with_inner(|inner| {
-            let Some(proc) = inner.procs.get_mut(&pid) else {
-                return false;
-            };
-            if !proc.refused_here && proc.roles_short_free.is_some_and(|left| free <= left) {
-                proc.refused_here = true;
-            }
-            proc.refused_here
-        })
-    }
-
     /// Whether `pid`'s last refusal was taken with no fewer chunks free than
     /// now, read anew: what a send reads (more room come, it goes again;
-    /// the need it plans on stays widened, [`Self::refused_in_this_room`]).
+    /// the moves it plans read the store's placement, [`Self::head_placement`]).
     pub(super) fn no_more_room_than_refused(&self, pid: ProcessId) -> bool {
         let free = self.port.free_chunks();
         self.with_inner(|inner| {
@@ -616,22 +559,6 @@ impl ResidencyPlanner {
                 .and_then(|proc| proc.roles_short_free)
                 .is_some_and(|left| free <= left)
         })
-    }
-
-    /// Whether the store's placement of restore head `head`'s whole
-    /// restore stands `need` now: its serve's state, every piece of its
-    /// unpark, its pending bind's runs ([`PoolPort::restore_stands`]).
-    pub(super) fn store_stands(&self, head: EntryKey, pid: ProcessId, need: &RunNeed) -> bool {
-        let (state, bind, kv) = self.with_inner(|inner| {
-            let state = inner.queue.get(&head).map(super::wait::Waiter::rs_need);
-            let bind = inner
-                .procs
-                .get(&pid)
-                .and_then(|proc| proc.bind_room)
-                .map(|need| (need.run, need.pieces));
-            (state.unwrap_or_default(), bind, inner.restore_kv_missing(head))
-        });
-        self.port.restore_stands(pid, need, state, kv, bind)
     }
 
     /// Records where a plan pass stopped for the queue's head short of
@@ -652,7 +579,15 @@ impl ResidencyPlanner {
         // gives room back (a fire, a copy, a restore landing): a wait so
         // chosen with nothing in flight is a planner bug, said as one. Mac
         // Pro at 2 GiB on f623134fc stalled twice on such an end.
+        // A fire that landed while the pass ran was in flight when the
+        // wait was chosen: its landing plans again, and the wait was no
+        // bug (the restored one's bind fired under the pass: Mac Pro's
+        // quiet waits, almost all "waits for the restored one's bind to
+        // fire").
+        let landed_since = self.stats.fires_landed.load(Ordering::Acquire)
+            != self.pass_landed.load(Ordering::Acquire);
         if WAITS_ON_FLIGHT.iter().any(|wait| ended.contains(wait))
+            && !landed_since
             && self.with_inner(|inner| inner.nothing_in_flight())
         {
             self.stats.quiet_waits.fetch_add(1, Ordering::Relaxed);

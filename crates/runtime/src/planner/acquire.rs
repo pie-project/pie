@@ -287,7 +287,7 @@ impl ResidencyPlanner {
                         // only a need past the whole device pool, which the
                         // pool shrinking under it can make, is refused.
                         Collect::Wait if self.returns.epoch() != seen => {
-                            self.poke();
+                            self.wake_planner();
                             continue;
                         }
                         Collect::Wait => {
@@ -307,7 +307,7 @@ impl ResidencyPlanner {
                             if self.returns.epoch() != seen
                                 || (self.returns.freed_since_plan() && self.wants_met_now())
                             {
-                                self.poke();
+                                self.wake_planner();
                             }
                             let Some(error) = self.never_fits(key) else {
                                 continue;
@@ -529,7 +529,7 @@ impl ResidencyPlanner {
                 // shortfall again and drew the next such answer, a loop).
                 || {
                     if self.returns.freed_since_plan() {
-                        self.poke();
+                        self.wake_planner();
                     }
                 },
             )
@@ -583,7 +583,6 @@ impl ResidencyPlanner {
                 proc.roles_short_gives = None;
                 proc.roles_short_runs = None;
                 proc.roles_short_free = None;
-                proc.refused_here = false;
                 proc.roles_short_stood = None;
                 proc.roles_refused = None;
                 proc.roles_short_mismatch = None;
@@ -761,7 +760,7 @@ impl ResidencyPlanner {
                 None => return Err(PlannerError::Cancelled),
                 Some((_, true)) => return Ok((BindRoomWait::Withdrawn, Some(registration))),
                 Some((true, false)) => return Ok((BindRoomWait::Served, Some(registration))),
-                Some((false, false)) if self.returns.epoch() != seen => self.poke(),
+                Some((false, false)) if self.returns.epoch() != seen => self.wake_planner(),
                 Some((false, false)) => {
                     // Room that comes free or moves (the rung lowered or
                     // raised, a segment committed, guest state given back)
@@ -780,9 +779,9 @@ impl ResidencyPlanner {
                     };
                     tokio::select! {
                         () = notified => {}
-                        () = returned => self.poke(),
-                        () = rung => self.poke(),
-                        () = given => self.poke(),
+                        () = returned => self.wake_planner(),
+                        () = rung => self.wake_planner(),
+                        () = given => self.wake_planner(),
                     }
                 }
             }

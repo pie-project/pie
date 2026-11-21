@@ -127,6 +127,11 @@ impl RoomReturns {
             .store(self.freed.load(Ordering::Acquire), Ordering::Release);
     }
 
+    /// Slots come free on any tier so far ([`Self::slots_freed`]).
+    pub(super) fn freed_count(&self) -> u64 {
+        self.freed.load(Ordering::Acquire)
+    }
+
     /// Slots came free since the last plan pass began.
     pub(super) fn freed_since_plan(&self) -> bool {
         self.freed.load(Ordering::Acquire) != self.freed_at_plan.load(Ordering::Acquire)

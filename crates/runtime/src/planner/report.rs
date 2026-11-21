@@ -199,7 +199,6 @@ impl ResidencyPlanner {
             proc.roles_short_gives = None;
             proc.roles_short_runs = None;
             proc.roles_short_free = None;
-            proc.refused_here = false;
             proc.roles_short_stood = None;
             proc.roles_refused = None;
             proc.evicted_queued = false;
@@ -370,7 +369,6 @@ impl ResidencyPlanner {
                 proc.roles_short_gives = Some(gives);
                 proc.roles_short_runs = Some((need.0, refused_room));
                 proc.roles_short_free = Some(free_chunks);
-                proc.refused_here = false;
                 // Read below, once it is queued again: until then, as if
                 // its placement stood it (the stricter key), so a pass the
                 // requeue runs sends it on no less.

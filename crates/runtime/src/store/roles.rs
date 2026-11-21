@@ -1408,21 +1408,17 @@ impl Roles {
     /// ([`Self::prepare_unpark`]).
     fn unpark_pieces(&self, holder: Holder) -> Vec<super::slots::OwnPiece> {
         use super::slots::OwnPiece;
-        let mut own: Vec<OwnPiece> = Vec::new();
-        for (owner, item) in &self.items {
-            let below = matches!(item.tier, Tier::Host | Tier::Disk);
-            if !(below || item.takes_fresh()) || !self.unparks_with(*owner, item, holder) {
-                continue;
-            }
-            for part in &item.parts {
-                let Some(shape) = self.shapes.of(part.role) else {
-                    continue;
-                };
-                if part.dead() {
-                    if !part.refs.is_empty() {
-                        continue;
-                    }
-                    own.push(if part.pieces > 0 {
+        let (groups, order) = self.unpark_order(holder);
+        order
+            .into_iter()
+            .filter_map(|(at, index)| {
+                let part = &groups[at].2[index];
+                let shape = self.shapes.of(part.role)?;
+                // As [`Self::take_parts`] takes it on the device: a dead
+                // part retaken fresh ([`Self::retake`]), a live one by
+                // [`Self::take`].
+                Some(if part.dead() {
+                    if part.pieces > 0 {
                         OwnPiece::Chunks {
                             run: part.chunks.max(1),
                             pieces: part.pieces,
@@ -1432,10 +1428,10 @@ impl Roles {
                             shape: shape.pool,
                             slots: part.run,
                         }
-                    });
-                } else if below && !part.refs.is_empty() {
+                    }
+                } else {
                     let slots = u32::try_from(part.refs.len()).unwrap_or(u32::MAX);
-                    own.push(if part.contiguous {
+                    if part.contiguous {
                         OwnPiece::Slots {
                             shape: shape.pool,
                             slots,
@@ -1445,15 +1441,64 @@ impl Roles {
                             shape: shape.pool,
                             slots: u64::from(slots),
                         }
-                    });
-                }
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// The items `holder`'s unpark brings back, each with whether it shed
+    /// its dead parts at its park (it takes those fresh, its live parts
+    /// where they lie), and the order its parts are taken in: its runs of
+    /// whole chunks first, the longest first, then its runs of slots and
+    /// its live parts, in the items' order. Taken in the items' order, a
+    /// single chunk opened for a table at the lowest free chunk split the
+    /// only stretch a run of two stood in, and the unpark was refused the
+    /// run its need counted on (the L40S). What the unpark takes
+    /// ([`Self::prepare_unpark`]) and what its placement reads
+    /// ([`Self::unpark_pieces`]): one order.
+    #[allow(clippy::type_complexity)]
+    fn unpark_order(&self, holder: Holder) -> (Vec<(Owner, bool, Vec<Part>)>, Vec<(usize, usize)>) {
+        // Items that shed their dead parts at the park take fresh ones in
+        // their class, their live parts where they lie: nothing is copied.
+        // So does one on the device with a dead part its rebind must name
+        // and no slots for it ([`Item::takes_fresh`]): the restore commits
+        // only with every part its rebinds name in place.
+        let groups: Vec<(Owner, bool, Vec<Part>)> = self
+            .items
+            .iter()
+            .filter(|(owner, item)| item.takes_fresh() && self.unparks_with(**owner, item, holder))
+            .map(|(owner, item)| (*owner, true, item.parts.clone()))
+            .chain(
+                self.items
+                    .iter()
+                    .filter(|(owner, item)| {
+                        matches!(item.tier, Tier::Host | Tier::Disk)
+                            && self.unparks_with(**owner, item, holder)
+                    })
+                    .map(|(owner, item)| (*owner, false, item.parts.clone())),
+            )
+            .collect();
+        let mut order: Vec<(usize, usize)> = groups
+            .iter()
+            .enumerate()
+            .flat_map(|(at, (_, shed, parts))| {
+                parts
+                    .iter()
+                    .enumerate()
+                    .filter(move |(_, part)| !*shed || (part.dead() && part.refs.is_empty()))
+                    .map(move |(index, _)| (at, index))
+            })
+            .collect();
+        order.sort_by_key(|&(at, index)| {
+            let part = &groups[at].2[index];
+            if part.dead() && part.pieces > 0 {
+                (0, std::cmp::Reverse(part.chunks))
+            } else {
+                (1, std::cmp::Reverse(0))
             }
-        }
-        own.sort_by_key(|piece| match *piece {
-            OwnPiece::Chunks { run, .. } => (0, std::cmp::Reverse(run)),
-            OwnPiece::Slots { .. } | OwnPiece::Take { .. } => (1, std::cmp::Reverse(0)),
         });
-        own
+        (groups, order)
     }
 
     /// The runs of adjacent chunks `holder`'s unpark lays fresh, one entry
@@ -1500,26 +1545,26 @@ impl Roles {
             .collect()
     }
 
-    /// Whether `holder`'s whole restore stands now: `state` (the single
-    /// slots its serve takes first, by shape), then every piece its unpark
-    /// takes, then `bind` (the runs a pending bind asks beside them), each
-    /// placed by the pool's own placement as the restore takes them, so
-    /// what stands here is what the restore finds.
+    /// `holder`'s whole restore placed by the takes themselves
+    /// ([`super::slots::SlotPool::place`]): `takes` (its kv pages still to
+    /// gather and the single slots its serve takes, by shape) first, then
+    /// every piece its unpark takes, in the unpark's order. The pieces it
+    /// asked, beside where they went: the one placement a restore is sent
+    /// on, its moves planned by, and its pending bind read against.
     #[must_use]
-    pub fn unpark_stands(
+    pub fn restore_placement(
         &self,
         holder: Holder,
-        state: &[(super::slots::ShapeId, u64)],
-        bind: Option<(u32, u32)>,
-    ) -> bool {
+        takes: &[(super::slots::ShapeId, u64)],
+    ) -> (Vec<super::slots::OwnPiece>, super::slots::Placement) {
         use super::slots::OwnPiece;
-        let own: Vec<OwnPiece> = state
+        let own: Vec<OwnPiece> = takes
             .iter()
             .map(|&(shape, slots)| OwnPiece::Take { shape, slots })
             .chain(self.unpark_pieces(holder))
-            .chain(bind.map(|(run, pieces)| OwnPiece::Chunks { run, pieces }))
             .collect();
-        self.device.lock().unwrap().pool().opens_beside(&own).is_some()
+        let placement = self.device.lock().unwrap().pool().place(&own);
+        (own, placement)
     }
 
     /// What `holder`'s restore would take back, in one line for a stall
@@ -2315,74 +2360,20 @@ impl Roles {
     /// Unparks `holder`'s parked items: device slots taken for each, all or
     /// none. `None` when nothing is parked.
     pub fn prepare_unpark(&mut self, holder: Holder) -> Result<Option<RoleMove>, RolesError> {
-        let owners: Vec<Owner> = self
-            .items
-            .iter()
-            .filter(|(owner, item)| {
-                matches!(item.tier, Tier::Host | Tier::Disk)
-                    && self.unparks_with(**owner, item, holder)
-            })
-            .map(|(owner, _)| *owner)
-            .collect();
-        // Items that shed their dead parts at the park take fresh ones in
-        // their class, their live parts where they lie: nothing is copied.
-        // So does one on the device with a dead part its rebind must name
-        // and no slots for it ([`Item::takes_fresh`]): the restore commits
-        // only with every part its rebinds name in place.
-        let shed_owners: Vec<Owner> = self
-            .items
-            .iter()
-            .filter(|(owner, item)| item.takes_fresh() && self.unparks_with(**owner, item, holder))
-            .map(|(owner, _)| *owner)
-            .collect();
+        let (groups, order) = self.unpark_order(holder);
         // An instance whose pair is on its way back with another process's
         // unpark is rebound once that lands: until then its restore is
         // queued again, never told no room for its pair. One parked where
         // it lies (no tier below, [`Item::shed`]) waits the same: let
         // through, it came back with its pair away, so its restore named it
         // no rebind and its next fire ran on the places it gave back.
-        if let Some(pair) = owners.iter().chain(&shed_owners).find_map(|owner| {
+        if let Some(pair) = groups.iter().find_map(|(owner, _, _)| {
             let key = self.items[owner].pair?;
             (self.items.get(&Owner::Pair(key))?.tier == Tier::Moving).then_some(key)
         }) {
             return Err(RolesError::PairParked(pair));
         }
         let device = Arc::clone(&self.device);
-        // Every part it takes, of every item: a shed item's dead parts (its
-        // live ones stay where they lie), a parked item's all. Its runs of
-        // whole chunks are laid first, the longest first, then its runs of
-        // slots and its live parts: taken in the items' order, a single
-        // chunk opened for a table at the lowest free chunk split the only
-        // stretch a run of two stood in, and the unpark was refused the
-        // run its need counted on (the L40S).
-        let groups: Vec<(Owner, bool, Vec<Part>)> = shed_owners
-            .iter()
-            .map(|owner| (*owner, true, self.items[owner].parts.clone()))
-            .chain(
-                owners
-                    .iter()
-                    .map(|owner| (*owner, false, self.items[owner].parts.clone())),
-            )
-            .collect();
-        let mut order: Vec<(usize, usize)> = groups
-            .iter()
-            .enumerate()
-            .flat_map(|(at, (_, shed, parts))| {
-                parts
-                    .iter()
-                    .enumerate()
-                    .filter(move |(_, part)| !*shed || (part.dead() && part.refs.is_empty()))
-                    .map(move |(index, _)| (at, index))
-            })
-            .collect();
-        order.sort_by_key(|&(at, index)| {
-            let part = &groups[at].2[index];
-            if part.dead() && part.pieces > 0 {
-                (0, std::cmp::Reverse(part.chunks))
-            } else {
-                (1, std::cmp::Reverse(0))
-            }
-        });
         let mut back: Vec<Vec<Option<Part>>> =
             groups.iter().map(|(_, _, parts)| vec![None; parts.len()]).collect();
         for (at, index) in order {

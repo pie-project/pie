@@ -3180,16 +3180,16 @@ fn a_restore_s_need_and_standing_are_the_placement_of_every_piece_it_takes() {
         vec![(1, 1)],
         "its run of slots asks the free chunk, whatever single slots stand free"
     );
-    assert!(roles.lock().unwrap().unpark_stands(holder(1), &[], None), "it stands");
+    let placed = |takes: &[(crate::store::slots::ShapeId, u64)]| {
+        roles.lock().unwrap().restore_placement(holder(1), takes).1
+    };
+    assert!(placed(&[]).stands(), "it stands");
     let chunk = u64::from(device.lock().unwrap().pool().shape(shape).unwrap().slots_per_chunk);
     assert!(
-        !roles.lock().unwrap().unpark_stands(holder(1), &[(shape, chunk)], None),
+        !placed(&[(shape, chunk)]).stands(),
         "its serve's state takes that chunk first: it does not stand"
     );
-    assert!(
-        !roles.lock().unwrap().unpark_stands(holder(1), &[], Some((1, 1))),
-        "nor with a pending bind's chunk beside it"
-    );
+    assert_eq!(placed(&[]).free_runs(1), 0, "nor with a pending bind's chunk beside it");
     drop(singles_part);
 }
 

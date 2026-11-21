@@ -61,6 +61,12 @@ pub struct PlannerStats {
     /// Passes that built the occupancy map, and their total microseconds:
     /// beside every pass's (`pass_census`).
     pub map_passes: AtomicU64,
+    /// Occupancy maps read from the cache, the pool and candidates
+    /// unchanged since they were built ([`super::ResidencyPlanner::occupants`]).
+    pub map_cache_hits: AtomicU64,
+    /// Wakes on a generation the last no-step pass ended on: skipped, no
+    /// pass run ([`super::ResidencyPlanner::settled_at`]).
+    pub skipped_wakes: AtomicU64,
     pub map_pass_us: AtomicU64,
     /// The unmet waiters behind the last plan's wait on a grow; 0 where it
     /// did not end on one.

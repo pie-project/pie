@@ -741,6 +741,46 @@ impl Inner {
         waiter.kv_need().saturating_sub(gathered)
     }
 
+    /// A print of the planner's own book a pass reads: the queue (each
+    /// entry and whether it is unmet), the pages gathered, the moves in
+    /// flight and parked state moving, and each process's residency,
+    /// fires, idleness and recorded needs. Part of the planner's generation
+    /// ([`super::ResidencyPlanner::generation`]).
+    pub(super) fn book_print(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.next_id.hash(&mut hasher);
+        self.accum.len().hash(&mut hasher);
+        self.bind_restoring.hash(&mut hasher);
+        for (key, waiter) in &self.queue {
+            (key, waiter.pid, waiter.is_unmet(), waiter.kind_name()).hash(&mut hasher);
+        }
+        let mut evicting: Vec<&ProcessId> = self.evicting.keys().collect();
+        evicting.sort_unstable();
+        evicting.hash(&mut hasher);
+        let mut moving: Vec<&ProcessId> = self.parked_moving.iter().collect();
+        moving.sort_unstable();
+        moving.hash(&mut hasher);
+        let mut procs: Vec<_> = self
+            .procs
+            .iter()
+            .map(|(pid, proc)| {
+                (
+                    *pid,
+                    proc.state as u8,
+                    proc.fires,
+                    proc.fire_lapsed,
+                    proc.idle,
+                    proc.roles_short.map(|need| (need.run, need.pieces)),
+                    proc.bind_room.map(|need| (need.run, need.pieces)),
+                )
+            })
+            .collect();
+        procs.sort_unstable_by_key(|entry| entry.0);
+        procs.hash(&mut hasher);
+        hasher.finish()
+    }
+
     pub(super) fn nothing_in_flight(&self) -> bool {
         self.evicting.is_empty()
             && !self.kill_in_flight()

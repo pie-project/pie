@@ -39,6 +39,20 @@ pub struct ResidencyPlanner {
     /// the head and the pages gathered: the step, the map, the wants and
     /// the stall line read it once a pass, not once each.
     pub(super) need_cache: parking_lot::Mutex<Option<(u64, EntryKey, u32, Option<RunNeed>)>>,
+    /// Events that can change a pass's answer the pool's own counts do not
+    /// show: an arrival, a departure, a landing, a policy answer, each a
+    /// poke ([`Self::poke`]). Part of [`Self::generation`].
+    pub(super) events: AtomicU64,
+    /// Fires landed as the running pass began: a wait it chose on
+    /// something in flight is no quiet wait where one landed meanwhile.
+    pub(super) pass_landed: AtomicU64,
+    /// The generation the last pass ended on where it took no step (it
+    /// ended where it began): a wake on that generation plans nothing new,
+    /// and is skipped, counted ([`super::stats::PlannerStats::skipped_wakes`]).
+    pub(super) settled_at: parking_lot::Mutex<Option<u64>>,
+    /// The occupancy map last built, by the generation and the candidates
+    /// it was built for: the same pool and candidates read the same map.
+    pub(super) map_cache: parking_lot::Mutex<Option<(u64, Vec<ProcessId>, super::pool::ChunkMap)>>,
     pub(super) pause_due: AtomicBool,
     pub(super) nonresident: AtomicUsize,
     /// Room grants give back as they drop, the queue's length and the drain
@@ -122,6 +136,10 @@ impl ResidencyPlanner {
         Self {
             inner: parking_lot::Mutex::new(Inner::default()),
             need_cache: parking_lot::Mutex::new(None),
+            events: AtomicU64::new(0),
+            pass_landed: AtomicU64::new(0),
+            settled_at: parking_lot::Mutex::new(None),
+            map_cache: parking_lot::Mutex::new(None),
             pause_due: AtomicBool::new(false),
             nonresident: AtomicUsize::new(0),
             returns,
@@ -298,7 +316,36 @@ impl ResidencyPlanner {
         if !pids.is_empty() {
             self.stats.map_built.store(true, Ordering::Relaxed);
         }
-        self.port.chunk_occupants(pids)
+        let generation = self.generation();
+        if let Some((at, of, map)) = self.map_cache.lock().as_ref()
+            && *at == generation
+            && of == pids
+        {
+            self.stats.map_cache_hits.fetch_add(1, Ordering::Relaxed);
+            return map.clone();
+        }
+        let map = self.port.chunk_occupants(pids);
+        *self.map_cache.lock() = Some((generation, pids.to_vec(), map.clone()));
+        map
+    }
+
+    /// One count of everything a pass reads that can change its answer:
+    /// the pool's changes (every take, give and move of slots, room given
+    /// back, [`PoolPort::room_changes`]), slots come free on any tier, grants
+    /// returned unspent, fires landed, the planner's events (each poke), and
+    /// the planner's own book: its queue, gathered pages, moves in flight,
+    /// and each process's residency and fires. Unmoved, a pass reads what
+    /// the last read, and its answer is the same.
+    pub(super) fn generation(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.port.room_changes().hash(&mut hasher);
+        self.returns.freed_count().hash(&mut hasher);
+        self.returns.epoch().hash(&mut hasher);
+        self.stats.fires_landed.load(Ordering::Acquire).hash(&mut hasher);
+        self.events.load(Ordering::Acquire).hash(&mut hasher);
+        self.with_inner(|inner| inner.book_print()).hash(&mut hasher);
+        hasher.finish()
     }
 
     pub(super) fn never_fits(&self, key: EntryKey) -> Option<super::PlannerError> {
@@ -709,6 +756,17 @@ impl ResidencyPlanner {
     }
 
     pub(super) fn poke(self: &Arc<Self>) {
+        self.events.fetch_add(1, Ordering::AcqRel);
+        self.wake_planner();
+    }
+
+    /// Wakes the planner on no event of its own: a parked waiter's wake on
+    /// room given back, a rung moved or guest state given back, whose
+    /// change the generation already reads (the pool's counts, the grant
+    /// returns). A wake whose generation the last no-step pass ended on
+    /// plans nothing ([`Self::settled_at`]): waking each parked KV-short
+    /// restore on every poke cost the L40S ~280 s of waits a run.
+    pub(super) fn wake_planner(self: &Arc<Self>) {
         self.returns
             .wake_cause
             .store(super::grant::WAKE_POKE, Ordering::Release);
@@ -911,8 +969,8 @@ impl ResidencyPlanner {
         // c10d7de5d: (7, 1) grew to (7, 31), 217 chunks against 30 free runs
         // of 7, on a device 310 of 365 pages free, and nothing was moved).
         // Where its gathered pages break runs the map stood, the store's
-        // placement (its kv taken first) refuses it, and the room is made
-        // ([`Self::refused_in_this_room`]).
+        // placement (its kv taken first) places them first, and the map
+        // lays its runs in what they leave ([`Self::head_placement`]).
         if per_chunk > 0 && pages > 0 {
             room.add(1, pages.div_ceil(per_chunk));
         }

@@ -100,7 +100,23 @@ impl ResidencyPlanner {
         // may have read before it came: the pass runs again on the pool as
         // it stands ([`super::grant::RoomReturns`]), so the drop, which
         // cannot plan itself, wakes the head within this step.
+        // Edge-triggered: a wake on the generation the last no-step pass
+        // ended on reads what that pass read, and plans nothing new. A
+        // stuck head is said once and costs no pass until an event (the
+        // Mac Pro's g2 spin: 56,671 no-step lines, ~199 s of map passes).
+        let generation = self.generation();
+        if *self.settled_at.lock() == Some(generation) {
+            self.stats.skipped_wakes.fetch_add(1, Ordering::Relaxed);
+            self.returns
+                .wake_cause
+                .store(super::grant::WAKE_CALL, Ordering::Release);
+            return;
+        }
         self.stats.plan_passes.fetch_add(1, Ordering::Relaxed);
+        self.pass_landed.store(
+            self.stats.fires_landed.load(Ordering::Acquire),
+            Ordering::Release,
+        );
         let began = crate::rt::Instant::now();
         struct Timed<'a>(&'a super::stats::PlannerStats, crate::rt::Instant);
         impl Drop for Timed<'_> {
@@ -156,6 +172,9 @@ impl ResidencyPlanner {
         self.report_short();
         self.say_long_waits(cause);
         self.phase_took(2, rest);
+        // Ended where it began, it took no step: settled until an event.
+        let ended = self.generation();
+        *self.settled_at.lock() = (ended == generation).then_some(ended);
     }
 
     fn phase_took(&self, phase: usize, since: crate::rt::Instant) {
@@ -279,26 +298,28 @@ impl ResidencyPlanner {
         )
     }
 
-    /// A restore head's serve takes its state before its unpark: the free
-    /// chunks the store would open for it ([`super::pool::PoolPort::serve_opens`], the
-    /// store's own placement) are no room for its runs, and leave the map,
-    /// so the map lays the head's runs in the room its unpark finds.
-    pub(super) fn lay_serve_state(&self, head: EntryKey, map: &mut super::pool::ChunkMap) {
-        let state = self.with_inner(|inner| {
-            inner
+    /// A restore head's whole restore placed by the store's takes
+    /// ([`super::pool::PoolPort::restore_placement`]): its kv pages still to
+    /// gather, its serve's state and its unpark's pieces taken first, its
+    /// pending bind's runs in what they leave. `None` for any other head.
+    pub(super) fn head_placement(
+        &self,
+        head: EntryKey,
+        need: &RunNeed,
+    ) -> Option<super::pool::RestorePlacement> {
+        let (pid, state, bind, kv) = self.with_inner(|inner| {
+            let waiter = inner
                 .queue
                 .get(&head)
-                .filter(|waiter| matches!(waiter.kind, WaitKind::Restore { .. }))
-                .map(Waiter::rs_need)
-        });
-        let Some(state) = state.filter(|state| !state.is_zero()) else {
-            return;
-        };
-        let opened = self.port.serve_opens(state);
-        map.free.retain(|chunk| !opened.contains(chunk));
-        map.headroom = map
-            .headroom
-            .map(|room| room.saturating_sub(u32::try_from(opened.len()).unwrap_or(u32::MAX)));
+                .filter(|waiter| matches!(waiter.kind, WaitKind::Restore { .. }))?;
+            let bind = inner
+                .procs
+                .get(&waiter.pid)
+                .and_then(|proc| proc.bind_room)
+                .map(|need| (need.run, need.pieces));
+            Some((waiter.pid, waiter.rs_need(), bind, inner.restore_kv_missing(head)))
+        })?;
+        Some(self.port.restore_placement(pid, need, state, kv, bind))
     }
 
     /// Whose the device's kv pages and state units are: every process the
@@ -461,20 +482,21 @@ impl ResidencyPlanner {
             .unwrap_or(pids);
         let mut map = self.occupants(&pids);
         map.merge(self.parked_map(pid));
-        self.lay_serve_state(key, &mut map);
         // The moves the whole need takes, every length laid together (the
-        // map's own line reads one run of the longest length alone).
-        // Read from the store's placement of its whole restore, as the
-        // eviction plan reads it ([`Self::widen_to_store`]).
-        let need = need.map(|mut need| {
-            if kind == "restore" {
-                self.widen_to_store(key, pid, &mut need, &map);
-            }
-            need
-        });
-        let need_moves = need
+        // map's own line reads one run of the longest length alone), a
+        // restore's own takes placed first by the store's takes, as the
+        // eviction plan reads it ([`Self::head_placement`]).
+        let placement = need.as_ref().and_then(|need| self.head_placement(key, need));
+        if let Some(placement) = &placement {
+            placement.lay(&mut map);
+        }
+        let short = match (&placement, &need) {
+            (Some(placement), _) => Some(placement.short.clone()),
+            (None, need) => need.clone(),
+        };
+        let need_moves = short
             .as_ref()
-            .map(|need| map.cheapest_need(need).map(|pids| pids.len()));
+            .map(|short| map.cheapest_need(short).map(|pids| pids.len()));
         let held_by = self.held_by_state();
         let store = self.store_holders();
         let (map, census) = (map.explain(run), self.port.chunk_census(run));
@@ -486,6 +508,9 @@ impl ResidencyPlanner {
             %pid,
             kind,
             need = ?need,
+            short = ?short,
+            own_opened = ?placement.as_ref().map(|placement| placement.opened.len()),
+            bind_free_runs_after_own = ?placement.as_ref().and_then(|placement| placement.bind_free_runs),
             kv_missing,
             kv_chunks = kv_missing.div_ceil(self.port.chunks_as_pages(1).max(1)),
             again,
@@ -495,6 +520,8 @@ impl ResidencyPlanner {
             %blocked,
             capped = %self.capped_line(),
             passes = ?self.pass_census(),
+            skipped_wakes = self.stats.skipped_wakes.load(Ordering::Relaxed),
+            map_cache_hits = self.stats.map_cache_hits.load(Ordering::Relaxed),
             swap = ?self.swap_stats(),
             %held_by,
             %store,
@@ -674,6 +701,11 @@ impl ResidencyPlanner {
                                             Step::Done("the restored one's bind is served and not yet taken")
                                         }
                                         Some((_, true)) => Step::RestoreBindRoom { key, need },
+                                        // Nothing in flight to fire it: its
+                                        // room is planned, never waited on.
+                                        _ if inner.nothing_in_flight() => {
+                                            Step::RestoreBindRoom { key, need }
+                                        }
                                         _ => Step::Done("waits for the restored one's bind to fire"),
                                     }
                                 })
@@ -807,16 +839,14 @@ impl ResidencyPlanner {
                     // parts and its runs of two, did not: sent, refused
                     // (PendingBindShort), sent again (Mac Pro at 2 GiB on
                     // 7e75af541: 52k no-step lines, free runs (7, 3)).
-                    let (state, kv) = self.with_inner(|inner| {
-                        (
-                            inner.queue.get(&key).map(super::wait::Waiter::rs_need).unwrap_or_default(),
-                            inner.restore_kv_missing(key),
-                        )
-                    });
-                    let bind = RunNeed::one(need.run, need.pieces);
+                    let whole = self
+                        .head_room(key)
+                        .unwrap_or_else(|| RunNeed::one(need.run, need.pieces));
                     if pid.is_some_and(|pid| {
                         !self.no_more_room_than_refused(pid)
-                            && self.port.restore_stands(pid, &bind, state, kv, Some((need.run, need.pieces)))
+                            && self
+                                .head_placement(key, &whole)
+                                .is_some_and(|placement| placement.stands())
                     }) {
                         self.plan_stopped("bind-suspended restore sent: its placement stands");
                         room_stood = Some(key);
@@ -897,30 +927,28 @@ impl ResidencyPlanner {
                     // unpark did not): then only once more chunks stand
                     // free than the refusal left
                     // ([`super::proc::Proc::roles_short_stood`]).
-                    let (head_pid, state, stood_at, free_left, bind, kv) = self.with_inner(|inner| {
+                    let (head_key, stood_at, free_left) = self.with_inner(|inner| {
                         inner
                             .unmet_head()
                             .map(|(key, waiter)| {
                                 let proc = inner.procs.get(&waiter.pid);
                                 (
-                                    Some(waiter.pid),
-                                    waiter.rs_need(),
+                                    Some(key),
                                     proc.and_then(|proc| proc.roles_short_stood),
                                     proc.and_then(|proc| proc.roles_short_free),
-                                    proc.and_then(|proc| proc.bind_room)
-                                        .map(|need| (need.run, need.pieces)),
-                                    inner.restore_kv_missing(key),
                                 )
                             })
                             .unwrap_or_default()
                     });
-                    // Never on the room its last refusal was taken in, of any
-                    // kind ([`Self::refused_in_this_room`]).
+                    // Never on the room its last refusal was taken in.
                     let _ = stood_at;
                     let moved = free_left.is_none_or(|left| self.port.free_chunks() > left);
                     if !understated
                         && moved
-                        && head_pid.is_some_and(|pid| self.port.restore_stands(pid, &room, state, kv, bind))
+                        && head_key.is_some_and(|key| {
+                            self.head_placement(key, &room)
+                                .is_some_and(|placement| placement.stands())
+                        })
                     {
                         self.plan_stopped("restore sent again: its placement stands");
                         self.with_inner(|inner| {
