@@ -58,7 +58,12 @@ struct Input {
     /// has each lane's mask inherit the next lane's ancestry (`(parent + 1)
     /// % beams`) while its hypothesis keeps its own, so its rows read
     /// another beam's cells; `score` moves lane 0's last step by 4.0 on the
-    /// host. Either must fail `verify`.
+    /// host. Either must fail `verify`. The finish's check has its own:
+    /// `finish` adopts another beam than the one checked; `finish-other` has
+    /// the finish fire read another sequence's set (the prompt's tokens
+    /// shifted, decoded as deep); `finish-stale` has it read only the set's
+    /// committed state, as a stale table or a short folded length would,
+    /// none of the search's buffered rows.
     #[serde(default)]
     corrupt: Option<String>,
 }
@@ -414,7 +419,14 @@ async fn main(input: Input) -> Result<String> {
                 let device_beam = last_parents.get(adopted).copied().unwrap_or(0);
                 fwd.adopt_beam(device_beam, n + fired)
                     .context("finish the search")?;
-                finished = Some(finish_check(&ws, &prompt, &hypotheses[best], n + fired, b).await?);
+                let read = match input.corrupt.as_deref() {
+                    Some("finish-other") => FinishRead::Other,
+                    Some("finish-stale") => FinishRead::Committed(n),
+                    _ => FinishRead::Set,
+                };
+                finished = Some(
+                    finish_check(&ws, &prompt, &hypotheses[best], n + fired, b, read).await?,
+                );
             }
         }
     }
@@ -509,14 +521,42 @@ async fn finish_check(
     hypothesis: &[u32],
     slot: u32,
     width: u32,
+    read: FinishRead,
 ) -> Result<(f32, f32, f32)> {
     let v = model::output_vocab_size();
     let last = *hypothesis.last().ok_or("an empty hypothesis")?;
     let pipeline = Pipeline::new();
+    // `FinishRead::Other`: another sequence as deep, prefilled and folded on
+    // a set of its own: the prompt's tokens shifted by one, and the
+    // hypothesis's but its last.
+    let other = WorkingSet::new();
+    let ws = if let FinishRead::Other = read {
+        let fed: Vec<i32> = prompt
+            .iter()
+            .map(|&t| (t + 1) as i32)
+            .chain(hypothesis[..hypothesis.len() - 1].iter().map(|&t| (t + 1) as i32))
+            .collect();
+        let rows = u32::try_from(fed.len()).map_err(|_| "a sequence past u32 rows")?;
+        let toks = Channel::from(&fed[..]);
+        let indptr = Channel::from([0u32, rows]);
+        let fwd = ForwardPass::new();
+        fwd.embed(&toks, &indptr)?;
+        fwd.state(&[&other], StateGeometry::folding())
+            .context("bind the other sequence")?;
+        fwd.submit(&pipeline).context("other-sequence submit")?;
+        &other
+    } else {
+        ws
+    };
     let toks = Channel::from([last as i32]);
     let indptr = Channel::from([0u32, 1]);
     let positions = Channel::from([slot]);
-    let slots = Channel::from([slot]);
+    // `FinishRead::Committed(c)`: the row lands at slot `c`, so it reads the
+    // committed state alone and none of the buffered rows past it.
+    let slots = Channel::from([match read {
+        FinishRead::Committed(committed) => committed,
+        _ => slot,
+    }]);
     let out = Channel::new([1], dtype::f32);
     let next = Channel::new([1], dtype::i32);
     let fwd = ForwardPass::new();
@@ -566,6 +606,16 @@ async fn finish_check(
         .into());
     }
     Ok((apart, room.total(), got))
+}
+
+/// What the finish's fire reads: the finished set as it stands, or (the
+/// finish's negative controls) another sequence's set, or only the set's
+/// first `c` slots, the committed state.
+#[derive(Clone, Copy)]
+enum FinishRead {
+    Set,
+    Other,
+    Committed(u32),
 }
 
 /// Whether a fire's refusal says the beams' pool outgrew what the kv pool
