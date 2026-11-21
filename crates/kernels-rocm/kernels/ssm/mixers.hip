@@ -1863,7 +1863,12 @@ __global__ __launch_bounds__(BLOCK) void ssm_gdn_step_fused_carried(
     const CarryLane cl = step.lane(rl);
     const CarryLane xl = conv.lane(rl);
     const int n = step.carried(cl);
-    const int commit = step.commit(rl, n + 1);
+    // A lane that writes no state (a beam lane, its write masked off)
+    // commits none of its carried rows: it reads them all as the linear
+    // attention from its state, as CUDA's carried step does, not as folds
+    // into registers it then drops. A lane that writes folds its committed
+    // rows as the reference does.
+    const int commit = folds_uniform(write_state, mask, rl) ? step.commit(rl, n + 1) : 0;
     const int c = min(commit, n);
 
     const int base = max(0, n - RCH);
