@@ -44,9 +44,11 @@ fn the_rates_step_stays_under_a_simulated_bound() {
         Ok((None, ns))
     };
     // The device's rates the shapes' step reads (its launch and bandwidth
-    // a desktop GPU's), the attention prefix curve measured under the bound.
+    // a desktop GPU's: a launch short of the L40S's smallest fire, so no
+    // timed point lands below it), the attention prefix curve measured
+    // under the bound.
     let stated = Rates {
-        launch_ns: Some(4000),
+        launch_ns: Some(1000),
         gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 10.0), (8192, 30.0)])]),
         attn_tflops_by_keys: Some(vec![(512, 5.0), (8192, 10.0)]),
         hbm_gbps: Some(600.0),
@@ -213,4 +215,58 @@ fn a_bound_no_cube_fits_stops_the_curves_not_the_load() {
         Some(TOP),
     )
     .expect("the dense kernel is chosen whatever the curves reached");
+}
+
+/// An output head (151936 x 1024) under a bound its whole fire's estimate
+/// at a row passes (10 ms: grown from the probe's first, cold fire, the
+/// head's 311 MB are estimated far past it), as on the Adreno, where every
+/// head curve stopped at 1 row: its fires are timed on slices of its
+/// columns the bound admits, their times carried to the whole plane, so
+/// the head's curves hold points instead.
+#[test]
+fn a_head_past_the_bound_is_timed_on_slices_of_its_columns() {
+    let Ok(device) = Context::bind(&crate::gpu::device_boot(), engine::Allowance::WHOLE) else {
+        eprintln!("not asked: no device");
+        return;
+    };
+    let bound = std::time::Duration::from_millis(10);
+    let (chip, _) = engine_vulkan::chip::resolve(&device.chip(), None);
+    let tuning = engine_vulkan::tuning::Tuning::new(chip, device.limits());
+    let tier = <Api as engine_gpu::serve::Serve>::tier(&device);
+    let timer = |frame: Frame| Ok((None, (frame.commit_timed()? * 1e9) as u64));
+    let stated = Rates {
+        launch_ns: Some(4000),
+        hbm_gbps: Some(600.0),
+        ..Rates::default()
+    };
+    let top = 4;
+    let shapes = [(151_936, 1024)];
+    let kernels =
+        engine_gpu::rates::dense_kernels(kernels_slang::Target::Spirv, &tuning, tier, top);
+    let wanted = engine_gpu::rates::lacking(
+        kernels_slang::Target::Spirv,
+        &kernels,
+        &stated,
+        &shapes,
+        top,
+    );
+    let curves = engine_gpu::rates::measure_shapes::<Api, _>(
+        &device,
+        &tuning,
+        tier,
+        &timer,
+        Some(bound),
+        &stated,
+        &wanted,
+        top,
+        &mut |line| eprintln!("{line}"),
+    )
+    .expect("the head's step lands under the bound");
+    let timed = curves
+        .iter()
+        .filter(|c| c.curve.first().is_some_and(|&(rows, _)| rows == 1));
+    assert!(
+        timed.count() > 0,
+        "no head curve timed at one row: {curves:?}"
+    );
 }

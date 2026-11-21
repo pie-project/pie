@@ -1202,6 +1202,9 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
             name: String,
             points: Vec<(u32, f64, f64)>,
             stop: Option<(u32, u32)>,
+            /// The parts of the plane's columns a fire covers one of: 1, else
+            /// the slice the bound admitted, its time carried to all.
+            split: u32,
         }
         let mut timed: Vec<Timed> = wanted
             .iter()
@@ -1221,9 +1224,18 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
                     name,
                     points: Vec::new(),
                     stop: None,
+                    split: 1,
                 }
             })
             .collect();
+        // A slice of the plane is a whole number of the widest column tile
+        // among its kernels (so of every kernel's), and no narrower.
+        let floor = timed
+            .iter()
+            .map(|t| kernels_slang::linear::gemm::tile_for(B::TARGET, t.tactic, n, k).col_tile())
+            .max()
+            .unwrap_or(1);
+        let slice = |split: u32| n.div_ceil(floor).div_ceil(split) * floor;
         let fits = |m: u32| operands_fit(m, n, k, largest);
         let laid = match rows.iter().rev().copied().find(|&m| fits(m)) {
             Some(most) => {
@@ -1254,36 +1266,104 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
             // device's clock drifts over each alike; a kernel the bound
             // refuses stops there.
             let mut samples: Vec<Vec<f64>> = vec![Vec::new(); timed.len()];
-            for _ in 0..REPEATS {
+            // One interleaved round over every live kernel. A fire the bound
+            // refuses is timed on a slice of the plane's columns instead
+            // (halved until admitted, no narrower than the widest kernel's
+            // column tile):
+            // its work and its reads are the columns', so its time carried
+            // to them all is the kernel's at the plane. Refused at every
+            // slice, its curve stops there.
+            let mut round = |rig: &mut Rig<'_, B>,
+                             timed: &mut Vec<Timed>,
+                             samples: &mut Vec<Vec<f64>>|
+             -> Result<()> {
                 for &t in &live {
-                    if timed[t].stop.is_some() {
-                        continue;
-                    }
-                    let rate = matmul_on(
-                        &mut rig,
-                        timed[t].tactic,
-                        timer,
-                        (
-                            Tensor { rows: m, ..*act },
-                            weights,
-                            Tensor { rows: m, ..*y },
-                        ),
-                        Some(&touched),
-                        launch,
-                    );
-                    match dropped(&rig, rate, say)? {
-                        Some(rate) => samples[t].push(gemm_flops(m, n, k) / rate + launch),
-                        None => {
-                            tracing::info!(
-                                kernel = timed[t].name.as_str(),
-                                rows = m,
-                                n,
-                                k,
-                                "rates point: past the bound, the curve stops"
-                            );
-                            timed[t].stop = Some((m, profile::fire::KernelCurve::BOUND));
+                    // A slice's time, carried, while a wider one is tried.
+                    let mut held: Option<f64> = None;
+                    while timed[t].stop.is_none() {
+                        let cols = slice(timed[t].split).min(n);
+                        let plane: Vec<Tensor> = weights
+                            .iter()
+                            .map(|w| Tensor { rows: cols, ..*w })
+                            .collect();
+                        let rate = matmul_on(
+                            rig,
+                            timed[t].tactic,
+                            timer,
+                            (
+                                Tensor { rows: m, ..*act },
+                                &plane,
+                                Tensor {
+                                    rows: m,
+                                    width: cols,
+                                    ..*y
+                                },
+                            ),
+                            Some(&touched),
+                            launch,
+                        );
+                        match dropped(rig, rate, say)? {
+                            // Timed on a slice, the next fire tries one twice
+                            // as wide, its estimate grown from this one: the
+                            // widest slice the bound admits is timed, the
+                            // fewest fixed costs carried to the plane.
+                            Some(rate) => {
+                                let ns = gemm_flops(m, cols, k) / rate;
+                                let carried = ns * f64::from(n) / f64::from(cols) + launch;
+                                if timed[t].split > 1 {
+                                    held = Some(carried);
+                                    timed[t].split /= 2;
+                                    continue;
+                                }
+                                samples[t].push(carried);
+                                break;
+                            }
+                            None if held.is_some() => {
+                                timed[t].split *= 2;
+                                samples[t].extend(held);
+                                break;
+                            }
+                            None if cols > floor => timed[t].split *= 2,
+                            None => {
+                                tracing::info!(
+                                    kernel = timed[t].name.as_str(),
+                                    rows = m,
+                                    n,
+                                    k,
+                                    "rates point: past the bound, the curve stops"
+                                );
+                                timed[t].stop = Some((m, profile::fire::KernelCurve::BOUND));
+                            }
                         }
                     }
+                }
+                Ok(())
+            };
+            for _ in 0..REPEATS {
+                round(&mut rig, &mut timed, &mut samples)?;
+            }
+            // Where a leading kernel's repeats spread wider than the gap
+            // between the two leading kernels, the point takes more repeats
+            // (as many again, but one), interleaved as before: the data says
+            // the median of three cannot tell them apart.
+            let leading = |samples: &Vec<Vec<f64>>, timed: &Vec<Timed>| {
+                let mut ranked: Vec<(f64, f64)> = live
+                    .iter()
+                    .filter(|&&t| timed[t].stop.is_none() && !samples[t].is_empty())
+                    .map(|&t| median_spread(&samples[t]))
+                    .collect();
+                ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
+                match ranked.as_slice() {
+                    [first, second, ..] => {
+                        let gap = (second.0 - first.0) / first.0.max(f64::MIN_POSITIVE);
+                        first.1.max(second.1) > gap
+                    }
+                    _ => false,
+                }
+            };
+            if leading(&samples, &timed) {
+                for _ in 0..REPEATS - 1 {
+                    round(&mut rig, &mut timed, &mut samples)?;
                 }
             }
             for &t in &live {
