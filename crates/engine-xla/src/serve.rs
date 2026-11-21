@@ -321,6 +321,8 @@ pub struct Shell {
     masked: poem_ir::ClassSet,
     wide: poem_ir::ClassSet,
     corrected: poem_ir::ClassSet,
+    /// The classes whose lanes read kv (`poem_ir::LaneClass::reads_kv`).
+    kv_classes: poem_ir::ClassSet,
     adapter_fact: Option<u32>,
     adapters: crate::adapter::Landings,
     held: Vec<u32>,
@@ -1125,6 +1127,17 @@ impl Shell {
             std::sync::Arc::new(crate::rows::readout_rowed(&boot.trace)),
             crate::rows::readout_probe(&boot.trace),
         );
+        // the classes whose lanes read kv: a lane of another (a float lane,
+        // an encoder's or a DiT's) reads its every row out through the
+        // readout planes, with no final hidden rows to read again
+        let kv_classes = poem_ir::ClassSet::of(
+            poem_exec::feeds::lane_classes(&boot.trace, &compiled, &exports)
+                .classes
+                .iter()
+                .enumerate()
+                .filter(|(_, class)| class.reads_kv)
+                .map(|(at, _)| at),
+        );
         Ok(Shell {
             tuning,
             pad,
@@ -1155,6 +1168,7 @@ impl Shell {
             masked,
             wide,
             corrected,
+            kv_classes,
             adapter_fact,
             adapters,
             held: vec![0; slots as usize],
@@ -2119,12 +2133,18 @@ impl Shell {
         // program, and a readout program reads its readout rows again
         // from the final hidden rows the forward returns (`trace_readout`).
         let full: Vec<Seated<'_>> = lanes.to_vec();
-        let every_row = lanes.iter().any(|s| {
+        // A float lane (its class reads no kv: an encoder's, a DiT's) reads
+        // its every row out through the readout planes as it always did: it
+        // has no final hidden rows to read again.
+        let reads_again = |s: &Seated<'_>| {
             s.readout.is_some_and(|r| r.len() > 1)
                 && (self.compiled.classes)
                     .class_of(s.lane.word & self.compiled.classes.mask)
-                    .is_some_and(|class| !self.drafting.contains(&class))
-        });
+                    .is_some_and(|class| {
+                        !self.drafting.contains(&class) && self.kv_classes.contains(class)
+                    })
+        };
+        let every_row = lanes.iter().any(reads_again);
         if every_row && (self.readout_slice.1.is_empty() || self.readout_store_rows().is_none()) {
             return Err(Fault::Program {
                 at: "serve::readout_program",
@@ -2136,7 +2156,7 @@ impl Shell {
         let cut: Vec<Seated<'_>> = lanes
             .iter()
             .map(|s| match s.readout {
-                Some(r) if every_row && r.len() > 1 => Seated {
+                Some(r) if reads_again(s) => Seated {
                     readout: Some(&r[r.len() - 1..]),
                     ..*s
                 },
