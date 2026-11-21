@@ -1246,6 +1246,24 @@ impl Pools {
                 .iter()
                 .map(|&logical| {
                     let physical = self.pool.physical(logical)?;
+                    // A piece is addressed from its first chunk and read on
+                    // through the next physical chunks: each of its logical
+                    // chunks must lie on the physical chunk after the one
+                    // before, or its bytes past the first are another
+                    // owner's (a move that split the run).
+                    for at in 1..*run {
+                        let next = self.pool.physical(logical + at)?;
+                        if next != physical + at {
+                            return Err(Fault::Residency(format!(
+                                "a guest piece of {run} chunk(s) from logical chunk {logical} lies \
+                                 on physical chunk {physical}, but its logical chunk {} lies on \
+                                 physical chunk {next}, not {}: its bytes past the first chunk \
+                                 would be another owner's",
+                                logical + at,
+                                physical + at
+                            )));
+                        }
+                    }
                     for at in 0..*run {
                         self.pool.admit(physical + at)?;
                     }
@@ -2886,5 +2904,41 @@ mod copy_landing_tests {
             }
             assert!(held == pattern, "round {round}: the destination holds what the source held");
         }
+    }
+}
+
+#[cfg(all(test, target_vendor = "apple"))]
+mod run_tests {
+    use super::Pools;
+    use crate::device::Context;
+    use engine::chunk::Evacuation;
+
+    /// A guest piece of several chunks is read on from its first chunk's
+    /// physical chunk: a move that splits its logical run across physical
+    /// chunks that are not adjacent is refused by name, naming the chunks,
+    /// rather than read as another owner's bytes.
+    #[test]
+    fn a_split_guest_run_is_refused_naming_its_chunks() {
+        let Ok(context) = Context::bind() else {
+            eprintln!("no device: skipping");
+            return;
+        };
+        let mut pools = Pools::guests_only(&context, 16 << 20, 24).expect("a pool");
+        let place = engine::ScratchPlace::Chunks { run: 2, pieces: vec![4] };
+        assert_eq!(pools.guest_pieces(&place).expect("an adjacent run reads").len(), 1);
+        let mut frame = context.frame().expect("a frame");
+        pools
+            .evacuate(&mut frame, &Evacuation { moves: vec![(5, 10)] })
+            .expect("the evacuation");
+        frame.commit().expect("the copy lands");
+        let refused = format!(
+            "{}",
+            pools.guest_pieces(&place).expect_err("a split run is refused")
+        );
+        assert!(
+            refused.contains("logical chunk 4") && refused.contains("logical chunk 5")
+                && refused.contains("physical chunk 10"),
+            "the refusal names the chunks: {refused}"
+        );
     }
 }
