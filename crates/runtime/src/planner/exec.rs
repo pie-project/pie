@@ -1147,12 +1147,23 @@ async fn restore(
     // head was refused with no reason and no plan, round after round (Mac
     // Pro at 5 GiB on 4cef0c7d3: 40,098 no-step lines in 6 minutes, free
     // runs (7, 3) to (7, 4), need [(7, 2), (2, 2)]).
+    // Read by the one placement, the takes' own, with what its serve held
+    // for it open to it: never a count of its own.
     if let Some(need) = planner.pending_bind(pid)
         && let Some(free) = stores
             .roles
             .as_ref()
-            .map(|roles| roles.lock().unwrap().free_runs(need.run))
-            .filter(|&free| free < need.pieces)
+            .map(|roles| {
+                roles.lock().unwrap().place_claimed(
+                    pid,
+                    &[crate::store::slots::OwnPiece::Chunks {
+                        run: need.run,
+                        pieces: need.pieces,
+                    }],
+                )
+            })
+            .filter(|placement| !placement.stands())
+            .map(|placement| placement.free_runs(need.run))
     {
         abort(model, engine, Move::Restore { kv, rs, roles });
         let own = stores.roles.as_ref().map_or(0, |roles| {

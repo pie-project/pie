@@ -1603,6 +1603,23 @@ impl Roles {
         true
     }
 
+    /// `own` placed for `holder` by the takes themselves
+    /// ([`super::slots::SlotPool::place`]), what is held for its served
+    /// restore open to them: the one placement its pending bind is checked
+    /// by once its unpark has taken its own. Read as a count of free runs
+    /// without its own reservation, a restore whose bind runs were held for
+    /// it found none of them, every serve (Mac Pro g2 on bd4f4ffe7:
+    /// PendingBindShort, 0 free runs of 7 where 5 stood).
+    #[must_use]
+    pub fn place_claimed(&self, holder: Holder, own: &[super::slots::OwnPiece]) -> super::slots::Placement {
+        let ticket = self.claims.get(&holder).copied();
+        self.device
+            .lock()
+            .unwrap()
+            .pool_mut()
+            .with_claim(ticket, |pool| pool.place(own))
+    }
+
     /// `holder`'s reservation, its chunks not yet taken, goes back.
     pub fn release_claim(&mut self, holder: Holder) {
         if let Some(ticket) = self.claims.remove(&holder) {

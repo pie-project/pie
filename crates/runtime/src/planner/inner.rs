@@ -790,7 +790,7 @@ impl Inner {
             && !self.kill_in_flight()
             && self.procs.iter().all(|(at, proc)| {
                 *at == pid
-                    || (!proc.firing()
+                    || ((!proc.firing() || proc.bind_waiting)
                         && match proc.state {
                             Residency::Evicting => false,
                             Residency::Restoring => proc.rebind_waiting.is_some(),
@@ -803,7 +803,9 @@ impl Inner {
         self.evicting.is_empty()
             && !self.kill_in_flight()
             && self.procs.values().all(|proc| {
-                !proc.firing()
+                // A fire held at a bind the store has not served is no fire
+                // submitted: nothing it waits on comes from it.
+                (!proc.firing() || proc.bind_waiting)
                     && match proc.state {
                         Residency::Evicting => false,
                         // Waiting on its rebinds, it moves nothing: it is

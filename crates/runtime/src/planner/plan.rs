@@ -217,6 +217,27 @@ impl ResidencyPlanner {
         )
     }
 
+    /// Settled passes that found a head stuck (each repeat), passes forced
+    /// for one, and how long the oldest waiting head has waited (ms): a run
+    /// that ends stuck reads so, never clean.
+    #[must_use]
+    pub fn stuck_census(&self) -> (u64, u64, u64) {
+        let oldest = self.with_inner(|inner| {
+            inner
+                .queue
+                .values()
+                .filter(|waiter| waiter.is_unmet())
+                .map(|waiter| waiter.since.elapsed())
+                .max()
+                .unwrap_or_default()
+        });
+        (
+            self.stats.stuck_settles.load(Ordering::Relaxed),
+            self.stats.forced_passes.load(Ordering::Relaxed),
+            u64::try_from(oldest.as_millis()).unwrap_or(u64::MAX),
+        )
+    }
+
     /// A pass's time by phase, in total microseconds: its steps, the wants
     /// published after them, the rest ([`super::stats::PlannerStats::plan_phase_us`]).
     #[must_use]
@@ -455,6 +476,8 @@ impl ResidencyPlanner {
             {
                 return None;
             }
+            // Found again: counted each time, said once a head and room.
+            self.stats.stuck_settles.fetch_add(1, Ordering::Relaxed);
             if let Some((at, seen, said)) = inner.stall_dumped
                 && (at, seen) == (key, gives)
                 && said.elapsed() < STALL_SAYS_AGAIN
@@ -1253,6 +1276,13 @@ impl ResidencyPlanner {
                             return Board::Replan;
                         };
                         if proc.state != Residency::Evicted {
+                            return Board::Replan;
+                        }
+                        // Held below the policy's floor: never restored, on
+                        // any path, forced or not, until the policy lifts it
+                        // (its restore is queued again then).
+                        if proc.held {
+                            inner.queue.remove(&key);
                             return Board::Replan;
                         }
                         proc.state = Residency::Restoring;

@@ -114,6 +114,10 @@ pub(super) struct Proc {
     /// another's raced its restore, so a placement standing in that room
     /// is the placement's own mismatch, not a race.
     pub(super) roles_short_quiet: bool,
+    /// Its last refusal and the room it left (free chunks, free runs of its
+    /// length): the same refusal again on the same room is a settled stall
+    /// ([`super::ResidencyPlanner::requeue_restore_roles`]).
+    pub(super) last_refusal: Option<((u32, u32), u32, u32)>,
     /// Whether the store's own placement ([`super::pool::PoolPort::guest_need_free`],
     /// its serve's state laid first) stood its need as its last unpark
     /// refusal left the pool. Refused where it did not stand, it goes again
@@ -239,6 +243,7 @@ impl Proc {
             roles_short_runs: None,
             roles_short_free: None,
             roles_short_quiet: false,
+            last_refusal: None,
             roles_short_stood: None,
             roles_refused: None,
             evicted_queued: false,

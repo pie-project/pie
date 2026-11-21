@@ -58,6 +58,16 @@ pub struct PlannerStats {
     /// nothing in flight: each a planner bug, said as one
     /// ([`super::ResidencyPlanner::plan_ended`]).
     pub quiet_waits: AtomicU64,
+    /// Settled passes that found a head waiting with nothing in flight,
+    /// each time it was found again, said or not
+    /// ([`super::ResidencyPlanner::dump_stall`]).
+    pub stuck_settles: AtomicU64,
+    /// Passes forced to plan a stuck head's whole need on the map
+    /// ([`super::ResidencyPlanner::force_moves`]).
+    pub forced_passes: AtomicU64,
+    /// Restores refused again on the room their last refusal left
+    /// ([`super::ResidencyPlanner::requeue_restore_roles`]).
+    pub refusal_repeats: AtomicU64,
     /// Set while a pass builds the occupancy map of named processes
     /// (`chunk_occupants`); the pass is then counted among `map_passes`.
     pub map_built: std::sync::atomic::AtomicBool,

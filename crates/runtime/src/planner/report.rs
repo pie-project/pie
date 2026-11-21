@@ -222,6 +222,7 @@ impl ResidencyPlanner {
             proc.roles_short_gives = None;
             proc.roles_short_runs = None;
             proc.roles_short_free = None;
+            proc.last_refusal = None;
             proc.roles_short_stood = None;
             proc.roles_refused = None;
             proc.evicted_queued = false;
@@ -384,8 +385,31 @@ impl ResidencyPlanner {
         self.stats
             .restore_roles_short
             .fetch_add(1, Ordering::Relaxed);
+        // The same refusal again on the same room: each send re-ran the
+        // pass (the head's own re-send moved the generation), so no pass
+        // ever settled and the invariant never saw it (Mac Pro g2 on
+        // bd4f4ffe7: 394k passes). A repeat is a settled stall: counted, a
+        // strict test fails, and it is read as the placement's mismatch
+        // (no race refused it twice on one room): held from a send until
+        // the room moves, its need planned on chunks only moves empty.
+        let room = ((run, pieces), free_chunks, refused_room);
+        let repeat = self.with_inner(|inner| {
+            inner.procs.get_mut(&pid).is_some_and(|proc| proc.last_refusal.replace(room) == Some(room))
+        });
+        if repeat {
+            self.stats.stuck_settles.fetch_add(1, Ordering::Relaxed);
+            self.stats.refusal_repeats.fetch_add(1, Ordering::Relaxed);
+            #[cfg(test)]
+            if super::plan::PROGRESS_STRICT.with(std::cell::Cell::get) {
+                panic!(
+                    "progress invariant: restore {pid} refused again on the same room \
+                     (need {:?}, free chunks {free_chunks}, free runs {refused_room})",
+                    (run, pieces)
+                );
+            }
+        }
         self.with_inner(|inner| {
-            let quiet = inner.nothing_in_flight_but(pid);
+            let quiet = repeat || inner.nothing_in_flight_but(pid);
             if let Some(proc) = inner.procs.get_mut(&pid) {
                 proc.roles_short = Some(updated);
                 if proc.bind_room.is_some_and(|bind| bind.run == run) {

@@ -1448,10 +1448,15 @@ impl SlotPool {
                 at..at + len
             })
             .collect();
+        // Never a chunk a residency move's copy still reads (an eviction's,
+        // parked state's moving down): moved under it, the copy read a chunk
+        // handed on. Reserved chunks are free and closed: neither a source
+        // (not held) nor a destination (not open).
         let movable = |chunk: u32| {
             chunk >= self.reserved
                 && !self.free.get(chunk)
                 && !in_runs.contains(&chunk)
+                && !self.moving_out.contains_key(&chunk)
                 && self.chunks[self.physical_to_logical[chunk as usize] as usize].shape != NO_SHAPE
         };
         let limit = self.state_limit().min(self.ceiling);
@@ -4149,6 +4154,73 @@ mod tests {
     /// name, and too few free runs are refused naming what was free. An
     /// evacuation moves a run whole onto adjacent free chunks of one lower
     /// segment, its chunks in order.
+    /// Mac Pro's mx and g2 stalls on c201812ea: an unpark's two runs of two
+    /// beside a bind's run of three, the two-stretches lowest. The placement
+    /// is the takes' own: the runs of three it leaves are those the real
+    /// takes leave (the field's disagreement was a refusal taken on another
+    /// pool, refused_on_this_pool=false, not a placement unlike the takes).
+    #[test]
+    fn a_placement_of_runs_leaves_what_the_real_takes_leave() {
+        let fixed = [(ShapeKind::Fixed, 4)];
+        let mut pool = SlotPool::new(facts_with(32, 4, 8, &fixed, &[(16, 4)]));
+        let holder = Holder::WorkingSet(1);
+        let held = pool.acquire_chunk_runs(holder, 0, 1, pool.free_chunk_runs(1)).unwrap();
+        let freed: Vec<Slot> = held
+            .iter()
+            .copied()
+            .filter(|slot| matches!(pool.physical(slot.chunk).unwrap(), 1 | 2 | 5 | 6 | 8..=11 | 13..=15))
+            .collect();
+        pool.release(holder, &freed, 0);
+        let own = [OwnPiece::Chunks { run: 2, pieces: 2 }];
+        let placement = pool.place(&own);
+        assert!(placement.stands());
+        let placed_runs = placement.free_runs(3);
+        pool.acquire_chunk_runs(holder, 0, 2, 2).unwrap();
+        assert_eq!(pool.free_chunk_runs(3), placed_runs, "what the real takes leave");
+        assert_eq!(placed_runs, 2, "the lowest two-stretches taken, both runs of three left");
+        pool.check();
+    }
+
+    /// The L40S at 3 GiB on bd4f4ffe7 (CUDA 700 under compaction): a
+    /// compaction never moves a chunk an eviction's copy still reads, and a
+    /// chunk held for a served restore is never its source or destination.
+    #[test]
+    fn a_compaction_moves_no_chunk_a_copy_reads_and_no_reserved_chunk() {
+        let fixed = [(ShapeKind::Fixed, 4)];
+        let build = || {
+            let mut pool = SlotPool::new(facts_with(16, 4, 4, &fixed, &[(16, 4)]));
+            let resident = Holder::WorkingSet(1);
+            let singles: Vec<Vec<Slot>> = (0..11)
+                .map(|_| pool.acquire_chunk_runs(resident, 0, 1, 1).unwrap())
+                .collect();
+            for slots in singles {
+                if [2, 4, 6, 8, 10].contains(&pool.physical(slots[0].chunk).unwrap()) {
+                    pool.release(resident, &slots, 0);
+                }
+            }
+            pool
+        };
+        // Unfenced, the cheapest window is 4..7, its chunk 5 moved.
+        let moves = build().plan_compaction(3).expect("a run of three is made");
+        assert_eq!(moves.iter().map(|step| step.from).collect::<Vec<_>>(), vec![5]);
+        // An eviction's copy reads chunk 5: it is moved by no compaction.
+        let mut pool = build();
+        pool.moving_out(&[5]);
+        let moves = pool.plan_compaction(3).unwrap_or_default();
+        assert!(moves.iter().all(|step| step.from != 5 && step.to != 5), "{moves:?}");
+        // Chunks 2 and 4 held for a served restore: never a destination,
+        // never inside a window cleared for another.
+        let mut pool = build();
+        let ticket = pool.reserve_chunks([2, 4]);
+        let moves = pool.plan_compaction(3).unwrap_or_default();
+        assert!(
+            moves.iter().all(|step| ![2, 4].contains(&step.to) && ![2, 4].contains(&step.from)),
+            "{moves:?}"
+        );
+        assert_eq!(pool.reserved(ticket), vec![2, 4], "still held");
+        pool.check();
+    }
+
     #[test]
     fn chunk_runs_lie_inside_a_segment_and_move_whole() {
         let fixed = [(ShapeKind::Fixed, 4)];

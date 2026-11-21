@@ -10264,3 +10264,187 @@ fn a_settled_head_with_nothing_in_flight_fails_a_strict_test() {
     });
     planner.plan();
 }
+
+/// A process the policy holds below its floor is never restored, nor any
+/// room held for it, on any path: a forced pass (the progress invariant's)
+/// plans moves only, through the victim set in the policy's order.
+#[tokio::test(flavor = "current_thread")]
+async fn a_forced_pass_never_restores_or_reserves_for_a_held_process() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    pool.free.lock().extend(0..8);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let held = ProcessId::new_v4();
+    planner.register(held);
+    planner.note_admitted(held);
+    planner.with_inner(|inner| {
+        let proc = inner.procs.get_mut(&held).unwrap();
+        proc.state = Residency::Evicted;
+        proc.held = true;
+        inner.enqueue(
+            held,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        );
+    });
+    planner.force_moves.store(true, Ordering::Release);
+    planner.plan();
+    assert_eq!(planner.stats.restores.load(Ordering::Relaxed), 0, "never restored");
+    assert_eq!(
+        planner.with_inner(|inner| inner.procs[&held].state),
+        Residency::Evicted,
+        "still held, evicted"
+    );
+}
+
+/// Mac Pro at 2 GiB (g2) on c201812ea, serves 10,594 (scratchpad
+/// stalls/macpro-c2018-g2.txt): a restore head, need [(7, 2), (2, 2)], its
+/// own takes opening four chunks (its two runs of two), the placement
+/// standing two runs of seven after them while its refusal found one
+/// (PendingBindShort { run: 7, pieces: 2, free_runs_after_own_unpark: 1 }),
+/// held "until more chunks stand free" with nothing in flight; eighteen
+/// residents' chunks emptiable around. The line carries no per-chunk
+/// layout: three free runs of seven, the head's own four in the first, the
+/// rest held whole by residents. `quiet`: refused with nothing else in
+/// flight (the placement's own mismatch) or raced (another head's take
+/// between its serve and its unpark, which the reservation now prevents).
+fn stall_macpro_c2018_g2(quiet: bool) -> StallSnapshot {
+    let residents = 18usize;
+    let mut procs = vec![SnapProc {
+        refused: Some((7, 2)),
+        refused_free: Some(21),
+        quiet,
+        ..SnapProc::evicted_restore()
+    }];
+    procs.extend(std::iter::repeat_n(SnapProc::resident(), residents));
+    let free: Vec<u32> = (0..7).chain(10..17).chain(20..27).collect();
+    let held: Vec<(u32, u32, Vec<(usize, u32)>)> = (0..54u32)
+        .filter(|chunk| !free.contains(chunk))
+        .enumerate()
+        .map(|(at, chunk)| (chunk, 9, vec![(1 + at % residents, 9)]))
+        .collect();
+    StallSnapshot {
+        name: "c201812ea Mac Pro g2",
+        chunks: 54,
+        free,
+        headroom: Some(21),
+        host: 0,
+        disk_free: 4000,
+        held,
+        procs,
+        head: 0,
+        sweeps_shared: true,
+        own: vec![0, 1, 2, 3],
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn replay_macpro_c2018_g2_raced_refusal() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    replay(&stall_macpro_c2018_g2(false)).await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn replay_macpro_c2018_g2_quiet_mismatch() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    replay(&stall_macpro_c2018_g2(true)).await.unwrap();
+}
+
+/// Mac Pro at 5 GiB (mx) on c201812ea, serves 1,307 (scratchpad
+/// stalls/macpro-c2018-mx.txt): a restore head, need [(3, 1), (2, 2)], its
+/// own two runs of two in the lowest two-stretches (segments 2 and 4), the
+/// two runs of three (a four-stretch, a three-stretch) left standing, and
+/// its refusal's PendingBindShort { run: 3, pieces: 1, free_runs: 0 } taken
+/// on another pool (refused_on_this_pool=false): held with nothing in
+/// flight. As the line lays it out, scaled to sixty chunks.
+fn stall_macpro_c2018_mx(quiet: bool) -> StallSnapshot {
+    let residents = 12usize;
+    let mut procs = vec![SnapProc {
+        refused: Some((3, 1)),
+        refused_free: Some(11),
+        quiet,
+        ..SnapProc::evicted_restore()
+    }];
+    procs.extend(std::iter::repeat_n(SnapProc::resident(), residents));
+    let free: Vec<u32> = vec![4, 5, 8, 9, 20, 21, 22, 23, 40, 41, 42];
+    let held: Vec<(u32, u32, Vec<(usize, u32)>)> = (0..60u32)
+        .filter(|chunk| !free.contains(chunk))
+        .enumerate()
+        .map(|(at, chunk)| (chunk, 9, vec![(1 + at % residents, 9)]))
+        .collect();
+    StallSnapshot {
+        name: "c201812ea Mac Pro mx",
+        chunks: 60,
+        free,
+        headroom: Some(11),
+        host: 0,
+        disk_free: 4000,
+        held,
+        procs,
+        head: 0,
+        sweeps_shared: true,
+        own: vec![4, 5, 8, 9],
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn replay_macpro_c2018_mx_raced_refusal() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    replay(&stall_macpro_c2018_mx(false)).await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn replay_macpro_c2018_mx_quiet_mismatch() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    replay(&stall_macpro_c2018_mx(true)).await.unwrap();
+}
+
+/// Mac Pro g2 on bd4f4ffe7 (scratchpad stalls/macpro-bd4f-g2.txt): a restore
+/// refused (PendingBindShort) on every serve with the room unchanged, its
+/// own re-send moving the generation, so no pass settled: 394k passes, no
+/// forced pass, no strict failure. The same refusal again on the same room
+/// is a settled stall: a strict test fails by name; in service it is read
+/// as the placement's mismatch, not sent again until the room moves, its
+/// need planned on chunks only moves empty.
+#[test]
+fn a_restore_refused_again_on_the_same_room_is_a_settled_stall() {
+    let pool = Arc::new(BindRoomPool::new(16, 0..0, 64));
+    pool.free.lock().extend(0..10);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let head = ProcessId::new_v4();
+    planner.register(head);
+    planner.note_admitted(head);
+    planner.with_inner(|inner| inner.procs.get_mut(&head).unwrap().state = Residency::Restoring);
+    planner.requeue_restore_roles(head, (7, 2), Some(0));
+    assert_eq!(planner.stats.refusal_repeats.load(Ordering::Relaxed), 0, "a first refusal is no stall");
+    planner.with_inner(|inner| inner.procs.get_mut(&head).unwrap().state = Residency::Restoring);
+    planner.requeue_restore_roles(head, (7, 2), Some(0));
+    assert_eq!(planner.stats.refusal_repeats.load(Ordering::Relaxed), 1, "the same again on the same room is");
+    assert!(
+        planner.with_inner(|inner| inner.procs[&head].roles_short_quiet),
+        "read as the placement's mismatch: held from a send until the room moves"
+    );
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        super::plan::PROGRESS_STRICT.with(|strict| strict.set(true));
+        planner.with_inner(|inner| inner.procs.get_mut(&head).unwrap().state = Residency::Restoring);
+        planner.requeue_restore_roles(head, (7, 2), Some(0));
+    }));
+    super::plan::PROGRESS_STRICT.with(|strict| strict.set(false));
+    assert!(caught.is_err(), "a strict test fails on it");
+}
+
+/// A fire held at a bind the store has not served is no fire in flight:
+/// a head waiting behind it with nothing else under way is a stall the
+/// invariant sees, never "waits for the restored one's bind to fire".
+#[test]
+fn a_fire_held_at_its_bind_is_not_in_flight() {
+    let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::new(8))));
+    let pid = ProcessId::new_v4();
+    planner.register(pid);
+    planner.note_admitted(pid);
+    let _fire = planner.fire_in_flight(pid);
+    assert!(!planner.with_inner(|inner| inner.nothing_in_flight()), "a fire submitted is");
+    planner.with_inner(|inner| inner.procs.get_mut(&pid).unwrap().bind_waiting = true);
+    assert!(planner.with_inner(|inner| inner.nothing_in_flight()), "one held at its bind is not");
+}

@@ -1552,12 +1552,18 @@ impl KvPageTable {
             One(WorkingSetId),
             Many(Vec<WorkingSetId>),
         }
+        // Each running set's locations, walked once: the readers counted
+        // from them, and a group of running sets read from them again
+        // rather than resolved a second time.
         let mut readers: FxHashMap<TriePageLocation, Readers> = FxHashMap::default();
+        let mut walked: FxHashMap<WorkingSetId, Vec<TriePageLocation>> = FxHashMap::default();
         for (ws, entry) in self.working_sets.iter() {
             if entry.suspended {
                 continue;
             }
+            let mut locations = Vec::new();
             let _ = self.visit_working_set_locations(ws, |location| {
+                locations.push(location);
                 match readers.entry(location) {
                     std::collections::hash_map::Entry::Vacant(slot) => {
                         slot.insert(Readers::One(ws));
@@ -1571,6 +1577,7 @@ impl KvPageTable {
                     }
                 }
             });
+            walked.insert(ws, locations);
         }
         let mut pinned: FxHashSet<TriePageLocation> = FxHashSet::default();
         for &terminal in self.pins.keys() {
@@ -1581,23 +1588,42 @@ impl KvPageTable {
         groups
             .iter()
             .map(|sets| {
-                let Ok(target) = self.locations(sets) else {
-                    return Vec::new();
-                };
-                target
-                    .into_iter()
-                    .filter(|location| {
-                        !pinned.contains(location)
-                            && !readers.get(location).is_some_and(|by| match by {
-                                Readers::One(ws) => !sets.contains(ws),
-                                Readers::Many(list) => list.iter().any(|ws| !sets.contains(ws)),
+                let mut seen: FxHashSet<TriePageLocation> = FxHashSet::default();
+                let mut out = Vec::new();
+                for &ws in sets {
+                    let fresh;
+                    let locations: &[TriePageLocation] = match walked.get(&ws) {
+                        Some(locations) => locations,
+                        None => {
+                            let mut locations = Vec::new();
+                            if self
+                                .visit_working_set_locations(ws, |location| locations.push(location))
+                                .is_err()
+                            {
+                                // A set the table no longer knows: as a
+                                // group it names nothing movable.
+                                return Vec::new();
+                            }
+                            fresh = locations;
+                            &fresh
+                        }
+                    };
+                    for &location in locations {
+                        if (sets.len() > 1 && !seen.insert(location))
+                            || pinned.contains(&location)
+                            || readers.get(&location).is_some_and(|by| match by {
+                                Readers::One(reader) => !sets.contains(reader),
+                                Readers::Many(list) => list.iter().any(|reader| !sets.contains(reader)),
                             })
-                    })
-                    .filter_map(|location| match self.backing_at(&location).ok()? {
-                        KvPageBacking::Resident(id) => Some((location, id)),
-                        KvPageBacking::Swapped(_) | KvPageBacking::OnDisk(_) => None,
-                    })
-                    .collect()
+                        {
+                            continue;
+                        }
+                        if let Ok(KvPageBacking::Resident(id)) = self.backing_at(&location) {
+                            out.push((location, id));
+                        }
+                    }
+                }
+                out
             })
             .collect()
     }

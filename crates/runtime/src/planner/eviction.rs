@@ -281,6 +281,9 @@ impl ResidencyPlanner {
         // There its whole need is planned on the map as it stands, the
         // placement's reading of the room set aside.
         let forced = self.force_moves.swap(false, Ordering::AcqRel);
+        if forced {
+            self.stats.forced_passes.fetch_add(1, Ordering::Relaxed);
+        }
         let mismatch = placement.as_ref().is_some_and(super::pool::RestorePlacement::stands)
             && self.no_more_room_than_refused(victims.head_pid);
         if let (true, true, Some(head)) =

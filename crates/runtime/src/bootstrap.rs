@@ -62,9 +62,11 @@ impl RuntimeShutdown {
             let pass = planner.pass_census();
             let map = planner.map_census();
             let edge = planner.edge_census();
+            let stuck = planner.stuck_census();
             println!(
                 "[planner-census] at shutdown: passes={} pass_ms={} pass_mean_us={} \
-                 map_passes={} map_pass_ms={} quiet_waits={} skipped_wakes={} map_cache_hits={}",
+                 map_passes={} map_pass_ms={} quiet_waits={} skipped_wakes={} map_cache_hits={} \
+                 stuck_settles={} forced_passes={} oldest_wait_ms={}",
                 pass.0,
                 pass.1 / 1000,
                 pass.2,
@@ -73,6 +75,9 @@ impl RuntimeShutdown {
                 map.2,
                 edge.0,
                 edge.1,
+                stuck.0,
+                stuck.1,
+                stuck.2,
             );
         }
         let scheduler_result = self.scheduler.shutdown().await;
@@ -777,6 +782,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 let phases = planner.phase_census();
                 let map = planner.map_census();
                 let edge = planner.edge_census();
+                let stuck = planner.stuck_census();
                 let (lk_n, lk_wait, lk_hold, lk_wmax, lk_hmax) = planner.lock_census();
                 // Who holds the device pool's slots, whatever the queue.
                 if let Some(shared) = crate::store::registry::try_get(arena_model_idx, 0)
@@ -804,6 +810,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                      passes={} pass_ms={} pass_mean_us={} pass_p99_under_us={} \
                      pass_steps_ms={} pass_wants_ms={} pass_rest_ms={} \
                      map_passes={} map_pass_ms={} quiet_waits={} skipped_wakes={} map_cache_hits={} \
+                     stuck_settles={} forced_passes={} oldest_wait_ms={} \
                      runners=[{}]",
                     d.queue.len(),
                     d.unmet_queued,
@@ -878,6 +885,9 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     map.2,
                     edge.0,
                     edge.1,
+                    stuck.0,
+                    stuck.1,
+                    stuck.2,
                     d.runners
                         .iter()
                         .map(|(seq, held, progressed)| format!("{seq}:h{held}:p{progressed}"))

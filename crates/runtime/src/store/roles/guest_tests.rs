@@ -3274,3 +3274,33 @@ fn a_served_restore_s_reserved_chunks_are_its_own_until_it_binds() {
     assert!(roles.lock().unwrap().claimed(holder(1)).is_empty(), "released once it bound");
     let _ = device;
 }
+
+/// Mac Pro g2 on bd4f4ffe7: a served restore's bind runs were held for it,
+/// and its pending-bind check, a count of free runs that left them out,
+/// found none (0 of 7 where 5 stood) every serve. Checked by the one
+/// placement with its own reservation open to it, its bind stands; to any
+/// other take those chunks are not there.
+#[test]
+fn a_restore_whose_bind_runs_are_held_for_it_finds_them() {
+    use crate::store::slots::OwnPiece;
+    let Pools { device, roles } = pools(64);
+    let mut engine = GuestEngine::new(2 * CHUNK, PAIR);
+    bind(&roles, &mut engine, 1).unwrap();
+    let park = roles.lock().unwrap().prepare_park(holder(1)).expect("it parks");
+    roles.lock().unwrap().commit(park);
+    assert!(roles.lock().unwrap().reserve_restore(holder(1), Some((1, 1))));
+    let unpark = roles.lock().unwrap().prepare_unpark(holder(1)).unwrap().expect("it unparks");
+    roles.lock().unwrap().commit(unpark);
+    // Every chunk free to others, and one more: only its own held chunk
+    // makes the last.
+    let others = device.lock().unwrap().pool().free_chunks();
+    let bind_all = [OwnPiece::Chunks { run: 1, pieces: others + 1 }];
+    assert!(
+        !device.lock().unwrap().pool().place(&bind_all).stands(),
+        "to any other take the held chunk is not there"
+    );
+    assert!(
+        roles.lock().unwrap().place_claimed(holder(1), &bind_all).stands(),
+        "to its own, it is"
+    );
+}

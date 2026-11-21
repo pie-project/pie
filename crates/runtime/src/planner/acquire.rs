@@ -583,6 +583,7 @@ impl ResidencyPlanner {
                 proc.roles_short_gives = None;
                 proc.roles_short_runs = None;
                 proc.roles_short_free = None;
+                proc.last_refusal = None;
                 proc.roles_short_stood = None;
                 proc.roles_refused = None;
                 proc.roles_short_mismatch = None;
