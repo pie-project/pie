@@ -7609,12 +7609,21 @@ impl<B: Serve> Shell<B> {
         // reads the fire's own (`FireBindings::row_ring`): another body.
         // Each shape carrying decode lanes is recorded so too.
         let fed_too = !self.row_caches.is_empty() && self.row_caches.by_tokens();
-        let shapes: Vec<(Vec<(usize, u32)>, bool)> = shapes
+        // Where the trace buffers a recurrence, a decode lane carries the
+        // rows it has not folded (the lagged fold): its scans are the
+        // carried forms, another body. Each shape carrying decode lanes is
+        // recorded so too.
+        let carried_too = self.rs_buffers.is_some() && self.rs_layout.is_some();
+        let shapes: Vec<(Vec<(usize, u32)>, bool, bool)> = shapes
             .into_iter()
             .flat_map(|lanes| {
-                let fed = fed_too && lanes.iter().any(|&(class, rows)| rows == 1 && decoding[class]);
-                let both = std::iter::once((lanes.clone(), false));
-                both.chain(fed.then_some((lanes, true)))
+                let decodes = lanes.iter().any(|&(class, rows)| rows == 1 && decoding[class]);
+                let fed = fed_too && decodes;
+                let carried = carried_too && decodes;
+                std::iter::once((lanes.clone(), false, false))
+                    .chain(fed.then(|| (lanes.clone(), true, false)))
+                    .chain(carried.then(|| (lanes.clone(), false, true)))
+                    .chain((fed && carried).then_some((lanes, true, true)))
             })
             .collect();
         let cell = {
@@ -7667,13 +7676,13 @@ impl<B: Serve> Shell<B> {
         };
         let before = rss();
         let mut dearest = 0u64;
-        for (at, (lanes, fed)) in shapes.iter().enumerate() {
+        for (at, (lanes, fed, carried)) in shapes.iter().enumerate() {
             let used = rss().saturating_sub(before);
             if used.saturating_add(dearest.saturating_mul(depth as u64)) > allowance {
                 let from = lanes.iter().map(|&(_, rows)| rows).sum::<u32>();
                 let eager: Vec<String> = shapes[at..]
                     .iter()
-                    .map(|(lanes, _)| {
+                    .map(|(lanes, _, _)| {
                         format!(
                             "{} lane(s) of classes {:?}, {} rows",
                             lanes.len(),
@@ -7699,6 +7708,9 @@ impl<B: Serve> Shell<B> {
                     .map(|&(class, rows)| {
                         let mut lane = self.naming_lane(class, rows)?;
                         lane.by_ref = Some(self.pools.walk_refs(rows.div_ceil(page).max(1))?);
+                        if *carried && rows == 1 && decoding[class] {
+                            self.rs_walk_lane(&mut lane, rows, 1)?;
+                        }
                         Ok(lane)
                     })
                     .collect::<Result<Vec<NamingLane<B>>>>()?;
