@@ -279,3 +279,95 @@ fn a_parent_past_the_group_faults_its_lane() {
     }
     assert_eq!(replay.fired, 2);
 }
+
+/// A fork's rs copy on a hybrid (`BEAM-PAGE-LISTS.md` §6.4, §11): rows of
+/// 2 a page from slot 38, kv pages of 16 (the live Qwen3.5 frozen slot),
+/// two planes of other row bytes. A copy of 5 slots from pool page 1 to 3
+/// ends mid rs page; one from the prompt's own page 0 skips its tail's
+/// slots below the buffer (they are in the state); each destination row
+/// equals its source row, every other byte stays.
+#[test]
+fn a_fork_copies_its_rs_rows_slot_by_slot() {
+    use kernels_cuda::runtime::channel::{PagePlane, RsCopyRun};
+    let mut gpu = Gpu::open();
+    let ctx = gpu.ctx();
+    const T: u32 = 2;
+    const BASE: u32 = 38;
+    let f0 = BASE / PAGE;
+    let planes = [PagePlane { offset: 0, cell: 8 }, PagePlane { offset: 16, cell: 12 }];
+    let entry_bytes = 16 + 2 * 12;
+    let entries: u32 = 64;
+    let pattern: Vec<u8> = (0..entries as usize * entry_bytes)
+        .map(|i| (i * 31 % 251) as u8)
+        .collect();
+    for (src, dst, tokens) in [(1u32, 3u32, 5u32), (0, 2, 9)] {
+        let mem = gpu.up(&pattern);
+        let bases: Vec<u64> = (0..u64::from(entries)).map(|e| mem + e * entry_bytes as u64).collect();
+        let bases_at = gpu.up(&bases);
+        let planes_at = gpu.up(&planes);
+        let copy_at = gpu.up(&[src, dst, tokens]);
+        let fault_at = gpu.up(&[0u32]);
+        let run = RsCopyRun {
+            copy: copy_at,
+            bases: bases_at,
+            fault: fault_at,
+            reserve: 8,
+            page: PAGE,
+            tokens: T,
+            base: BASE,
+            f0,
+            floor_rel: BASE - f0 * PAGE,
+            plane_at: 0,
+            planes: 2,
+            bases_len: entries,
+            _pad: 0,
+        };
+        let run_at = gpu.up(&[run]);
+        channel::copy_rs_rows(&ctx, run_at, planes_at, 1, 2).expect("copy_rs_rows launches");
+        gpu.sync();
+        let after: Vec<u8> = gpu.down(mem, pattern.len());
+        let fault: Vec<u32> = gpu.down(fault_at, 1);
+        assert_eq!(fault, [0], "copy {src} -> {dst} x {tokens}: no fault");
+        let row = |slot: u32, plane: &PagePlane| -> std::ops::Range<usize> {
+            let (e, r) = ((slot - BASE) / T, (slot - BASE) % T);
+            let at = e as usize * entry_bytes + plane.offset as usize + r as usize * plane.cell as usize;
+            at..at + plane.cell as usize
+        };
+        let mut want = pattern.clone();
+        for k in 0..tokens {
+            let (from, to) = ((f0 + src) * PAGE + k, (f0 + dst) * PAGE + k);
+            if from < BASE || to < BASE {
+                continue;
+            }
+            for plane in &planes {
+                let bytes = pattern[row(from, plane)].to_vec();
+                want[row(to, plane)].copy_from_slice(&bytes);
+            }
+        }
+        assert_eq!(after, want, "copy {src} -> {dst} x {tokens}: rows moved, nothing else");
+    }
+    // A copy past the pool faults and moves nothing.
+    let mem = gpu.up(&pattern);
+    let bases: Vec<u64> = (0..u64::from(entries)).map(|e| mem + e * entry_bytes as u64).collect();
+    let run = RsCopyRun {
+        copy: gpu.up(&[1u32, 9, 4]),
+        bases: gpu.up(&bases),
+        fault: gpu.up(&[0u32]),
+        reserve: 8,
+        page: PAGE,
+        tokens: T,
+        base: BASE,
+        f0,
+        floor_rel: BASE - f0 * PAGE,
+        plane_at: 0,
+        planes: 2,
+        bases_len: entries,
+        _pad: 0,
+    };
+    let fault_at = run.fault;
+    let run_at = gpu.up(&[run]);
+    channel::copy_rs_rows(&ctx, run_at, gpu.up(&planes), 1, 2).expect("copy_rs_rows launches");
+    gpu.sync();
+    assert_eq!(gpu.down::<u32>(fault_at, 1), [channel::PAGES_COPY_BOUNDS]);
+    assert_eq!(gpu.down::<u8>(mem, pattern.len()), pattern, "a refused copy moves nothing");
+}
