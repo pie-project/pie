@@ -295,9 +295,13 @@ fn migrate_case(rig: &mut Rig, head_dim: usize) {
         before.iter().any(|&b| b != 0),
         "head_dim {head_dim}: the source slot should hold the quantized codes"
     );
-    assert!(
-        read_slot(&pools, dst).iter().all(|&b| b == 0),
-        "head_dim {head_dim}: the destination slot should start zeroed"
+    // The destination holds none of the source's bytes before the copy (zeros,
+    // or under `test-slot-fill` the pool's poison), so a byte-exact match after
+    // it is the copy's doing.
+    assert_ne!(
+        read_slot(&pools, dst),
+        before,
+        "head_dim {head_dim}: the destination slot should not start as the source"
     );
 
     let moves = [KvRun {

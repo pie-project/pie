@@ -139,7 +139,7 @@ q8_mpp(const device bfloat *q [[buffer(0)]], const device KV *keys [[buffer(1)]]
         const float factor = totals[r] > 0 ? fast::exp(maxima[r] - newmax) : 0;
         const float e = keep ? fast::exp(s - newmax) : 0;
         const float total = simd_sum(e);
-        probs[r * N + lane] = Prob(e * vs);
+        probs[r * N + lane] = Prob(keep ? e * vs : 0.0f);
         if (lane == 0) {
           maxima[r] = newmax;
           totals[r] = totals[r] * factor + total;
@@ -147,7 +147,17 @@ q8_mpp(const device bfloat *q [[buffer(0)]], const device KV *keys [[buffer(1)]]
         }
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
-      auto v = tensor(const_cast<device KV *>(vplane) + v_at[0], dextents<int, 2>{D, N},
+      // The tile's keys a row may read end at `last`: the V cells past it were never
+      // written, and a zero probability times what they hold is not zero when that is a
+      // NaN, so the matmul's key extent stops there (cells past an extent read as zero).
+      // A wide row (`enabled & 3 == 2`) sets `last` to its pages' end and keeps its
+      // unwritten tail out by its mask bytes alone, which this extent does not cover. This
+      // kernel runs only causal (`attn::q8::attention` and `mpp_fits` both require it), and
+      // a served model stages wide rows only for a class that attends both ways
+      // (`serve::load`), so none reaches it there; a caller that passes a wide row to a
+      // causal op over pages with unwritten tails would read them.
+      const int held = min(N, last + 1 - base);
+      auto v = tensor(const_cast<device KV *>(vplane) + v_at[0], dextents<int, 2>{D, held},
                       array<int, 2>{1, kv_heads * W});
       auto partial =
           pvop.template get_destination_cooperative_tensor<decltype(p), decltype(v), float>();
@@ -156,10 +166,10 @@ q8_mpp(const device bfloat *q [[buffer(0)]], const device KV *keys [[buffer(1)]]
       } else {
         auto p0 = tensor(probs, extents<int, P, M>{}, array<int, 2>{1, N});
         auto p1 = tensor(probs + P, extents<int, P, M>{}, array<int, 2>{1, N});
-        auto v0h = tensor(const_cast<device KV *>(vplane) + v_at[0], dextents<int, 2>{D, P},
-                          array<int, 2>{1, kv_heads * W});
-        auto v1h = tensor(const_cast<device KV *>(vplane) + v_at[1], dextents<int, 2>{D, P},
-                          array<int, 2>{1, kv_heads * W});
+        auto v0h = tensor(const_cast<device KV *>(vplane) + v_at[0],
+                          dextents<int, 2>{D, min(P, held)}, array<int, 2>{1, kv_heads * W});
+        auto v1h = tensor(const_cast<device KV *>(vplane) + v_at[1],
+                          dextents<int, 2>{D, clamp(held - P, 1, P)}, array<int, 2>{1, kv_heads * W});
         pvhop.run(p0, v0h, partial);
         pvhaccop.run(p1, v1h, partial);
       }
