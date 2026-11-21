@@ -426,20 +426,25 @@ fn rs_planes(tokens: u32) -> [[u32; 2]; 2] {
     [[0, 1], [tokens, 2]]
 }
 
-/// A hybrid's beams (§9's hybrid case, §11): each beam's rs entries for
-/// slots `base..=slot` resolved slot by slot over its list, and its fork's
-/// rows copied plane by plane, against §11.1 and §11.2 over the replay's
-/// lists and copies. `tokens` rows an rs page from buffer base `base`.
+/// A hybrid's beams (§9's hybrid case, §11): the set's rs entries appended
+/// into the group's state, each beam's resolve record naming its list
+/// there, its entries for slots `base..=slot` resolving slot by slot over
+/// that list (as `prim/carry.slang` resolves them), and its fork's rows
+/// copied plane by plane, against §11.1 and §11.2 over the replay's lists
+/// and copies. `tokens` rows an rs page from buffer base `base`.
 fn run_rs(gpu: &mut Gpu, lanes: u32, folded: u32, tokens: u32, base: u32, seed: u64) {
     let fires = 3 * PAGE + 9;
     let end = folded + fires;
+    let f0 = folded / PAGE;
     let layout = BeamLayout::of(lanes, end, PAGE, FRAMES).expect("the layout");
     let cap = layout.cap;
-    let state_words = kb::state_words(lanes, cap, FRAMES) as u32;
-    let f0 = folded / PAGE;
     // The set's rs entries: every slot from the base through the pool's
-    // last page.
+    // last page, held past the rest of the state.
     let set_len = ((f0 + cap) * PAGE - base).div_ceil(tokens);
+    let layout = layout.buffering((f0 + cap) * PAGE, tokens);
+    assert!(layout.bases >= set_len);
+    let bases_pool = layout.bases_word() as u32;
+    let state_words = (layout.bytes() / 4) as u32;
     let entries_most = (end - base) / tokens + 1;
     let unit = 4 * tokens;
     let planes = rs_planes(tokens);
@@ -457,7 +462,8 @@ fn run_rs(gpu: &mut Gpu, lanes: u32, folded: u32, tokens: u32, base: u32, seed: 
     let parents_at = take(lanes);
     let faults = take(lanes);
     let bases = take(set_len);
-    let tables = take(lanes * entries_most);
+    let resolves = take(lanes * 6);
+    let _ = entries_most;
     let common = take(1);
     let words = at;
     // The pool: the state, then the rs pages, unit `u` at words `u * unit`.
@@ -484,7 +490,7 @@ fn run_rs(gpu: &mut Gpu, lanes: u32, folded: u32, tokens: u32, base: u32, seed: 
         store.fill(0);
         store[steps as usize..(steps + kb::STEP_WORDS) as usize].copy_from_slice(&[
             0, parents_at, trans, 0, faults, lanes, cap, reserve, PAGE, folded, slot, 0, FRAMES,
-            backed, lanes, rs_lists, common, 0, 0, 0,
+            backed, lanes, rs_lists, common, bases, bases_pool, set_len,
         ]);
         for q in 0..backed {
             store[(trans + q) as usize] = 1 + q;
@@ -495,16 +501,12 @@ fn run_rs(gpu: &mut Gpu, lanes: u32, folded: u32, tokens: u32, base: u32, seed: 
             store[planes_at as usize + 2 * k + 1] = plane[1];
         }
         for b in 0..lanes {
-            let table = tables + b * entries_most;
-            // Staged as the set's: every beam names its set's entries.
-            store[table as usize..(table + entries) as usize]
-                .copy_from_slice(&set[..entries as usize]);
             let l = (rs_lists + b * kb::RS_LIST_WORDS) as usize;
-            store[l..l + 8].copy_from_slice(&[table, bases, b, entries, base, tokens, set_len, 0]);
+            store[l..l + 8].copy_from_slice(&[resolves + 6 * b, bases_pool, b, entries, base, tokens, set_len, 0]);
             let r = (rs_copies + b * kb::RS_COPY_WORDS) as usize;
             store[r..r + 16].copy_from_slice(&[
                 kb::copies_word(lanes, cap, FRAMES) as u32 + 3 * b,
-                bases,
+                bases_pool,
                 faults + b,
                 backed,
                 PAGE,
@@ -581,25 +583,34 @@ fn run_rs(gpu: &mut Gpu, lanes: u32, folded: u32, tokens: u32, base: u32, seed: 
             &pool[(first_unit * unit) as usize..],
             "{what}: the rs rows its copies moved"
         );
+        assert_eq!(
+            &got_pool[bases_pool as usize..(bases_pool + set_len) as usize],
+            set.as_slice(),
+            "{what}: the set's entries appended into the state"
+        );
         for b in 0..lanes as usize {
-            let table = (tables + b as u32 * entries_most) as usize;
-            // §11.1 over the replay's list.
-            let resolved: Vec<u32> = (0..entries)
-                .map(|e| {
-                    let at = base + e * tokens;
-                    if at < f0 * PAGE {
-                        return set[e as usize];
-                    }
-                    let q = want.lists[b][(at / PAGE - f0) as usize];
-                    let sigma = (f0 + q) * PAGE + at % PAGE;
-                    set[((sigma - base) / tokens) as usize]
-                })
-                .collect();
+            let r = (resolves + 6 * b as u32) as usize;
+            let record = &got_store[r..r + 6];
             assert_eq!(
-                &got_store[table..table + entries as usize],
-                resolved.as_slice(),
-                "{what}: beam {b}'s rs entries"
+                &record[1..],
+                &[f0, PAGE, base, bases_pool, set_len],
+                "{what}: beam {b}'s resolve record"
             );
+            // §11.1 over the replay's list, and as `prim/carry.slang`
+            // resolves it over the list its record names.
+            let resolve = |list: &dyn Fn(u32) -> u32, e: u32| {
+                let at = base + e * tokens;
+                if at < f0 * PAGE {
+                    return set[e as usize];
+                }
+                let sigma = (f0 + list(at / PAGE - f0)) * PAGE + at % PAGE;
+                set[((sigma - base) / tokens) as usize]
+            };
+            for e in 0..entries {
+                let want_page = resolve(&|j| want.lists[b][j as usize], e);
+                let got_page = resolve(&|j| got_pool[(record[0] + j) as usize], e);
+                assert_eq!(got_page, want_page, "{what}: beam {b}'s rs entry {e}");
+            }
         }
         parents = (0..lanes)
             .map(|b| match rng.next() % 4 {
@@ -653,20 +664,20 @@ fn a_fork_copies_its_rs_rows_slot_by_slot() {
     // rows of it; an entry (an rs unit) of 10 words.
     let planes: [[u32; 2]; 2] = [[0, 2], [4, 3]];
     let unit = 10u32;
-    let first_unit = 4u32;
+    // The pool: the copy word, the set's entries (as its group's state
+    // holds them) from word 8, then the rs units.
+    let first_unit = 8u32;
+    let bases_pool = 8u32;
     let run_case = |gpu: &mut Gpu, src: u32, dst: u32, tokens: u32, entries: u32| {
         let pool: Vec<u32> = (0..(first_unit + 64) * unit).map(|w| w.wrapping_mul(2_654_435_761)).collect();
         let pool_h = gpu.up_u32(&pool);
-        // The store: the record, the plane table, the bases, the fault word.
+        // The store: the record, the plane table, the fault word.
         let mut store = vec![0u32; 128];
-        let (record, planes_at, bases_at, fault_at) = (0usize, 16usize, 32usize, 120usize);
+        let (record, planes_at, fault_at) = (0usize, 16usize, 120usize);
         store[planes_at..planes_at + 4].copy_from_slice(&[planes[0][0], planes[0][1], planes[1][0], planes[1][1]]);
-        for e in 0..entries.min(64) {
-            store[bases_at + e as usize] = first_unit + e;
-        }
         store[record..record + 16].copy_from_slice(&[
             0,
-            bases_at as u32,
+            bases_pool,
             fault_at as u32,
             8,
             PAGE,
@@ -682,9 +693,13 @@ fn a_fork_copies_its_rs_rows_slot_by_slot() {
             0,
             0,
         ]);
-        // The copy word lies in the pool's first words (the state's place).
+        // The copy word lies in the pool's first words (the state's place),
+        // the set's entries after it.
         let mut pool = pool;
         pool[..3].copy_from_slice(&[src, dst, tokens]);
+        for e in 0..entries.min(64) {
+            pool[(bases_pool + e) as usize] = first_unit + e;
+        }
         gpu.write_u32(pool_h, &pool);
         let store_h = gpu.up_u32(&store);
         gpu.run(|c| {

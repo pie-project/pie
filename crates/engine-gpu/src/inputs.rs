@@ -509,8 +509,13 @@ impl Laid {
             let tables = page_tables.len() as u64;
             let frames = u64::from(facts.frames.max(1));
             let columns = u64::from(paging.pages_per_slot.max(table_pages)) + 2;
-            let rs_entries = rs_page_tokens.map_or(0, |tokens| {
-                (columns * u64::from(paging.page_size)).div_ceil(u64::from(tokens.max(1))) + 1
+            // The set's rs entries a fire appends to its group's state
+            // (§11.1, the state holds the rest): those of the pool pages its
+            // step may hand out past what the state holds, a group's at most
+            // a page a beam and the frames' and a fire's rows' worth.
+            let rs_appends = rs_page_tokens.map_or(0, |tokens| {
+                let per_page = u64::from(paging.page_size).div_ceil(u64::from(tokens.max(1)));
+                lanes * (frames + 2) * (per_page + 1) + rows.div_ceil(u64::from(tokens.max(1)))
             });
             let mut word = |words: u64| {
                 let at = take(words.max(1) * 4);
@@ -541,7 +546,7 @@ impl Laid {
                 }),
                 planes: word(2 * u64::from(facts.planes + facts.rs_planes)),
                 trans: word(lanes * (columns + frames) + lanes),
-                rs_bases: word(lanes * rs_entries),
+                rs_bases: word(rs_appends),
             }
         });
         let total = at;

@@ -95,6 +95,11 @@ pub struct BeamLayout {
     pub lanes: u32,
     pub cap: u32,
     pub frames: u32,
+    /// On a hybrid, the set's rs entries its resident state holds past the
+    /// rest (`BEAM-PAGE-LISTS.md` §11.1): the pool's rs slots holding its
+    /// buffer's rows from its base, an entry a rs page, as many as the
+    /// search's depth takes; appended as the set grows. 0: none.
+    pub bases: u32,
 }
 
 impl BeamLayout {
@@ -117,13 +122,32 @@ impl BeamLayout {
             .and_then(|held| held.checked_add(lanes.checked_mul(frames + 1)?))
             .and_then(|held| held.checked_add(1))
             .ok_or_else(|| format!("a beam group of {lanes} beams to slot {end} passes u32 pages"))?;
-        Ok(BeamLayout { lanes, cap, frames })
+        Ok(BeamLayout {
+            lanes,
+            cap,
+            frames,
+            bases: 0,
+        })
+    }
+
+    /// This layout on a hybrid buffering `rs_tokens` rows an rs page: its
+    /// set's rs entries to `end` held in the state (§11.1).
+    #[must_use]
+    pub fn buffering(mut self, end: u32, rs_tokens: u32) -> BeamLayout {
+        self.bases = end.div_ceil(rs_tokens.max(1)).saturating_add(1);
+        self
+    }
+
+    /// Where the set's rs entries start in the state, in words.
+    #[must_use]
+    pub fn bases_word(&self) -> u64 {
+        kernels_slang::runtime::beam::state_words(self.lanes, self.cap, self.frames)
     }
 
     /// The state's bytes.
     #[must_use]
     pub fn bytes(&self) -> u64 {
-        kernels_slang::runtime::beam::state_words(self.lanes, self.cap, self.frames) * 4
+        (self.bases_word() + u64::from(self.bases)) * 4
     }
 }
 

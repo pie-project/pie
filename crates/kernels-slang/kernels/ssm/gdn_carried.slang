@@ -87,6 +87,7 @@ void pool_set_word(uint v, uint x) {
     PIE_POOL_BRANCH(seg, GDN_WORD_SET)
 }
 
+#define PIE_CARRY_POOL_WORD(v) pool_word(v)
 #include "prim/carry.slang"
 
 // The own row's raw q and k.
@@ -165,7 +166,7 @@ struct Staged {
 void resolve(CarryLane cl, uint base, uint rows, uint tid) {
     if (tid < rows) {
         uint t = carry_tok(cl, base + tid);
-        spage[tid] = uint(carry[cl.page + t / params.page_tokens]) * params.stride_words;
+        spage[tid] = carry_page(cl, t) * params.stride_words;
         stok[tid] = t % params.page_tokens;
     }
 }

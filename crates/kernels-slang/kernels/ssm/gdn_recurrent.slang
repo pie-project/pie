@@ -152,6 +152,9 @@ static rstate_pool_view rstate;
 
 PIE_STATE_PIECES
 #if defined(PIE_COMMITTED)
+#if defined(PIE_DK_REG)
+#define PIE_CARRY_POOL_WORD(v) (pie_pool_get((v) >> 2)[(v) & 3u])
+#endif
 #include "prim/carry.slang"
 // The virtual word the token's `u` lands at (its head's), `CARRY_NONE`
 // where it lands none.

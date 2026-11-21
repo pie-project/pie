@@ -597,6 +597,11 @@ impl<B: Host> Gpu<B> {
                     shell.paging().page_size,
                     u32::try_from(shell.frames_in_flight()).unwrap_or(u32::MAX),
                 )
+                .map(|layout| match shell.pools().rs_rows() {
+                    // On a hybrid its set's rs entries are held with it.
+                    Some(rows) => layout.buffering(extents.key_len, rows.tokens),
+                    None => layout,
+                })
             })
             .transpose()
             .map_err(|why| Error::Program(format!("program {program}'s state: {why}")))?;
@@ -1426,6 +1431,9 @@ where
         // A guest's tables lie in its slots and its scratch in a buffer of
         // its own: nothing standing in the span.
         self.programs.close_instance(id).map_err(refusal)?;
+        if let Some(shell) = self.shell.as_ref() {
+            shell.beam_forget(id);
+        }
         Ok(0)
     }
 
@@ -1878,6 +1886,9 @@ impl<B: Host> Gpu<B> {
                                 lanes: lanes.clone().map(|at| at as usize).collect(),
                                 reserve: first.reserve.clone(),
                                 folded: first.kv.folded,
+                                appended: self
+                                    .loaded()
+                                    .map_or((u32::MAX, 0), |shell| shell.beam_appended(attachment.instance)),
                             });
                             None
                         }

@@ -52,9 +52,11 @@ PIE_POOL_WRITE(uint, params.seg_words)
 // word, 8 words each: the staged indices' word at entry f0, the rows' write
 // pages' and write offsets' words, the beam, the entries, the rows), its
 // lanes' fault words (store word), the numbers of §3, its rs list records
-// (store word, 8 words each: the rs table's first entry word, the set's rs
-// entries' word, the beam, the entries, the buffer's base slot, its rows a
-// page, the set's entries), and its common slot's word (store word, §11.3).
+// (store word, 8 words each: its resolve record's word in the rs table, the
+// set's rs entries' word (pool word: the group's resident state), the beam,
+// the entries, the buffer's base slot, its rows a page, the set's entries),
+// its common slot's word (store word, §11.3), and the set's rs entries this
+// fire appends: their store word, the pool word they land at and how many.
 #define REC 20u
 
 groupshared uint g_rec[REC];
@@ -112,6 +114,9 @@ void main(uint3 local : SV_GroupThreadID, uint3 group : SV_GroupID) {
     const uint rs_count = g_rec[14];
     const uint rs = g_rec[15];
     const uint common = g_rec[16];
+    const uint append_from = g_rec[17];
+    const uint append_to = g_rec[18];
+    const uint append_count = g_rec[19];
     const bool ok = live_group && B > 0u && B <= PIE_BEAM_MAX_LANES && Q <= cap;
     // The pool pages the fire stages (`reserve` is the pool's whole): the
     // lowest-free rule keeps every page the step names below them.
@@ -135,6 +140,15 @@ void main(uint3 local : SV_GroupThreadID, uint3 group : SV_GroupID) {
     const bool stepping = ok && primed != 0u;
     if (t == 0u) {
         g_apart.store(slot + 1u);
+    }
+    // The set's rs entries this fire's rows add (§11.1), into the group's
+    // resident copy, where its kernels and its copies read them: a set's
+    // pages stay while its search runs, so each fire appends only its new
+    // ones.
+    if (ok) {
+        for (uint e = t; e < append_count; e += T) {
+            pie_pool_set(append_to + e, store[append_from + e]);
+        }
     }
 
     if (priming) {
@@ -346,13 +360,15 @@ void main(uint3 local : SV_GroupThreadID, uint3 group : SV_GroupID) {
                 store[write_page + row] = store[trans + q];
             }
         }
-        // §6.5 on a hybrid (§11): each lane's rs page table over the same
-        // list, slot by slot: entry e (slot `base + e T`) holds the rows of
-        // the set's slot (f0 + list[j]) S + (slot mod S), j its column; its
-        // write page among them.
+        // §6.5 on a hybrid (§11): each lane's rs pages resolve over the
+        // same list, slot by slot: entry e (slot `base + e T`) holds the rows
+        // of the set's slot (f0 + list[j]) S + (slot mod S), j its column.
+        // The step checks every entry the lane reads lies in the set's
+        // buffer and writes the lane's resolve record; its kernels resolve
+        // each row as they read it (`prim/carry.slang`).
         for (uint i = 0u; i < rs_count; ++i) {
             const uint l = rs + i * 8u;
-            const uint pages = store[l + 0u];
+            const uint record = store[l + 0u];
             const uint bases = store[l + 1u];
             const uint lane = store[l + 2u];
             const uint entries = store[l + 3u];
@@ -360,6 +376,14 @@ void main(uint3 local : SV_GroupThreadID, uint3 group : SV_GroupID) {
             const uint rows_a_page = max(store[l + 5u], 1u);
             const uint bases_len = store[l + 6u];
             const uint list = map_new + lane * cap;
+            if (t == 0u) {
+                store[record + 0u] = list;
+                store[record + 1u] = f0;
+                store[record + 2u] = S;
+                store[record + 3u] = base;
+                store[record + 4u] = bases;
+                store[record + 5u] = bases_len;
+            }
             for (uint e = t; e < entries; e += T) {
                 const uint at_slot = base + e * rows_a_page;
                 if (at_slot < f0 * S) {
@@ -378,9 +402,7 @@ void main(uint3 local : SV_GroupThreadID, uint3 group : SV_GroupID) {
                 const uint sigma = (f0 + q) * S + at_slot % S;
                 if (sigma < base || (sigma - base) / rows_a_page >= bases_len) {
                     raise(lane, PIE_PAGES_PAST_RESERVE);
-                    continue;
                 }
-                store[pages + e] = store[bases + (sigma - base) / rows_a_page];
             }
         }
     }
@@ -561,8 +583,8 @@ void main(uint3 local : SV_GroupThreadID, uint3 group : SV_GroupID) {
     const uint cell = store[params.planes + 2u * group.y + 1u];
     const uint fe = (from_slot - base) / rows_a_page;
     const uint te = (to_slot - base) / rows_a_page;
-    const uint from = store[bases + fe] * unit + offset + ((from_slot - base) % rows_a_page) * cell;
-    const uint to = store[bases + te] * unit + offset + ((to_slot - base) % rows_a_page) * cell;
+    const uint from = pie_pool_get(bases + fe) * unit + offset + ((from_slot - base) % rows_a_page) * cell;
+    const uint to = pie_pool_get(bases + te) * unit + offset + ((to_slot - base) % rows_a_page) * cell;
     for (uint at = local.x; at < cell; at += PIE_GROUP_X) {
         pie_pool_set(to + at, pie_pool_get(from + at));
     }

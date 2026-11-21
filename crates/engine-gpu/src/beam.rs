@@ -168,6 +168,10 @@ pub struct Group<B: Backend> {
     /// and its frozen slots, as its lanes state them.
     pub reserve: Vec<u32>,
     pub folded: u32,
+    /// The set's rs entries its state holds already (§11.1): the buffer's
+    /// base slot they count from and how many, as the fires planned before
+    /// this one appended them.
+    pub appended: (u32, u32),
 }
 
 /// A beam's lane as the fire stages it: its seat in the staged tables, its
@@ -237,6 +241,9 @@ pub struct Planned<'a, B: Backend> {
     /// Per group: its common slot's word in the store (§11.3) and its
     /// instance.
     pub commons: Vec<(u32, engine::InstanceId)>,
+    /// Each hybrid group's set's rs entries its state holds once this fire
+    /// lands: its base slot and how many (`Group::appended` for the next).
+    pub appended: Vec<(engine::InstanceId, u32, u32)>,
     /// The highest pool page id the groups stage.
     pub top_page: Option<u32>,
 }
@@ -351,6 +358,7 @@ pub fn plan<'a, B: Backend>(
         rs_planes: rs.map_or(0, |rs| u32::try_from(rs.planes.len()).unwrap_or(u32::MAX)),
         faults: Vec::new(),
         commons: Vec::new(),
+        appended: Vec::new(),
         top_page: None,
     };
     if groups.is_empty() {
@@ -484,6 +492,7 @@ pub fn plan<'a, B: Backend>(
         // whole rs translation staged once a group.
         let rs_at = rs_lists.next();
         let mut rs_set = None;
+        let mut append = (0u32, 0u32, 0u32);
         if let Some(rs) = rs {
             let first = group.lanes[0];
             let (base, set) = (rs.set)(first).ok_or_else(|| {
@@ -518,7 +527,34 @@ pub fn plan<'a, B: Backend>(
                     group.instance
                 )));
             }
-            let bases_at = rs_bases.push(set)?;
+            // The set's entries live in the group's state; this fire stages
+            // only those past what its state holds, which its step appends.
+            let held = layout.bases;
+            if bases_len > held {
+                return Err(refused(format!(
+                    "instance {}'s set buffers {bases_len} rs entries, past the {held} its \
+                     state holds for the search's depth (state-geometry parents-end)",
+                    group.instance
+                )));
+            }
+            let bases_word = u64::from(group.state) + layout.bases_word();
+            let bases_at = u32::try_from(bases_word).map_err(|_| Fault::Ceiling {
+                what: "pool words a beam group's rs entries lie at",
+                need: bases_word,
+                have: u64::from(u32::MAX),
+            })?;
+            // The entries a row this fire may resolve to: every slot of the
+            // pool pages below the most the step hands out (`backed`).
+            let reach = (u64::from(f0) + u64::from(backed) + 1) * u64::from(page);
+            let needed = u32::try_from(
+                reach.saturating_sub(u64::from(base)).div_ceil(u64::from(tokens)),
+            )
+            .unwrap_or(u32::MAX)
+            .min(bases_len);
+            let from = if group.appended.0 == base { group.appended.1.min(needed) } else { 0 };
+            let new = &set[from as usize..needed as usize];
+            append = (rs_bases.push(new)?, bases_at + from, u32::try_from(new.len()).unwrap_or(u32::MAX));
+            planned.appended.push((group.instance, base, needed.max(from)));
             for (beam, &lane) in group.lanes.iter().enumerate() {
                 if (rs.set)(lane).map(|(at, _)| at) != Some(base) {
                     return Err(refused(format!(
@@ -537,16 +573,22 @@ pub fn plan<'a, B: Backend>(
                         group.instance
                     )));
                 }
-                let pages = rs
+                // Its resolve record (`prim/carry.slang`), which its step writes.
+                let record = rs
                     .table
                     .get(header * kb_carry_header() + 3)
                     .copied()
-                    .and_then(|at| u32::try_from(at).ok())
+                    .filter(|&at| at < 0)
+                    .and_then(|at| u32::try_from(-(at + 1)).ok())
                     .ok_or_else(|| {
-                        refused(format!("instance {}'s beam {beam}'s rs header", group.instance))
+                        refused(format!(
+                            "instance {}'s beam {beam}'s rs header names no resolve record: \
+                             its buffered rows are not one run",
+                            group.instance
+                        ))
                     })?;
                 rs_lists.push(&[
-                    rs.word + pages,
+                    rs.word + record,
                     bases_at,
                     u32::try_from(beam).unwrap_or(u32::MAX),
                     entries,
@@ -596,9 +638,9 @@ pub fn plan<'a, B: Backend>(
             rs_count,
             rs_at,
             common_at,
-            0,
-            0,
-            0,
+            append.0,
+            append.1,
+            append.2,
         ])?;
         planned.steps += 1;
         let copy_word = kb::copies_word(lanes, layout.cap, layout.frames);

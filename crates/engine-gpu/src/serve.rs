@@ -752,6 +752,10 @@ pub struct PixelSpans {
 }
 
 pub struct Shell<B: Serve> {
+    /// Each hybrid beam group's set's rs entries its state holds (§11.1),
+    /// by instance: the buffer's base slot they count from and how many, as
+    /// the fires planned so far appended them (`beam::Group::appended`).
+    beam_appended: std::sync::Mutex<std::collections::HashMap<engine::InstanceId, (u32, u32)>>,
     /// Where a load told its weights are held seated each weight shape's
     /// atoms itself (`WeightShape::seated`: its first slot ref), until the
     /// runtime's first residency names its own.
@@ -2298,6 +2302,7 @@ impl<B: Serve> Shell<B> {
             adapter_fact,
             adapters: adapter_slots,
 
+            beam_appended: std::sync::Mutex::new(std::collections::HashMap::new()),
             blobs: crate::blob::Store::new(),
             held: vec![0; slots as usize],
             bound: 0,
@@ -2784,6 +2789,27 @@ impl<B: Serve> Shell<B> {
     #[must_use]
     pub fn trace(&self) -> &Trace {
         &self.trace
+    }
+
+    /// The set's rs entries instance `instance`'s beam group's state holds
+    /// (`beam::Group::appended`): none before its first fire.
+    #[must_use]
+    pub fn beam_appended(&self, instance: engine::InstanceId) -> (u32, u32) {
+        self.beam_appended
+            .lock()
+            .expect("beam appends lock poisoned")
+            .get(&instance)
+            .copied()
+            .unwrap_or((u32::MAX, 0))
+    }
+
+    /// Instance `instance`'s beam group's state is laid afresh (a bind) or
+    /// gone: it holds none of its set's entries.
+    pub fn beam_forget(&self, instance: engine::InstanceId) {
+        self.beam_appended
+            .lock()
+            .expect("beam appends lock poisoned")
+            .remove(&instance);
     }
 
     #[must_use]
@@ -3664,13 +3690,19 @@ impl<B: Serve> Shell<B> {
             }
             _ => None,
         };
-        crate::beam::plan(
+        let planned = crate::beam::plan(
             beams,
             &staged,
             &seat,
             &mut |refs: &[u32]| self.pools.kv_pages(refs, None),
             rs_staged.as_ref(),
-        )
+        )?;
+        let mut appended = self.beam_appended.lock().expect("beam appends lock poisoned");
+        for &(instance, base, count) in &planned.appended {
+            appended.insert(instance, (base, count));
+        }
+        drop(appended);
+        Ok(planned)
     }
 
     /// The fire's beam groups' step and page copies, ahead of its forward
@@ -5190,8 +5222,41 @@ impl<B: Serve> Shell<B> {
         // The staged rs table: every lane's header, then its carried
         // tokens and its buffer pages. A fire carries no more rows than the
         // widest bucket's tokens, the most the runtime lets one carry.
+        // A beam lane's rows the table neither lists nor pages (a span its
+        // list resolves): every other lane's carried rows, the most the
+        // runtime lets one carry, are no more than the widest bucket's.
+        let rs_beam: Vec<bool> = {
+            let mut beamed = vec![false; rs_plans.len()];
+            for (source, group) in beam_of.iter().enumerate() {
+                if group.is_some()
+                    && let Some(Some(at)) = rs_header_of.get(source)
+                    && let Some(flag) = beamed.get_mut(*at)
+                {
+                    *flag = true;
+                }
+            }
+            beamed
+        };
         let rs_carry = if rs_active {
-            let carried: u32 = rs_plans.iter().map(|plan| plan.replay).sum();
+            let carried: u32 = rs_plans
+                .iter()
+                .zip(&rs_beam)
+                .filter(|(plan, beamed)| !**beamed || plan.gathers.len() > 1)
+                .map(|(plan, _)| plan.replay)
+                .sum();
+            let beamed: u32 = rs_plans
+                .iter()
+                .zip(&rs_beam)
+                .filter(|(plan, beamed)| **beamed && plan.gathers.len() <= 1)
+                .map(|(plan, _)| plan.replay)
+                .sum();
+            if beamed > self.budget().max_tokens {
+                tracing::debug!(
+                    replayed = beamed,
+                    widest = self.budget().max_tokens,
+                    "beam lanes replay past the widest bucket's rows, resolved through their lists"
+                );
+            }
             if carried > self.budget().max_tokens {
                 return Err(Fault::Ceiling {
                     what: "buffered recurrent rows a fire carries ahead of its own",
@@ -5200,7 +5265,7 @@ impl<B: Serve> Shell<B> {
                 });
             }
             let page_tokens = self.rs_buffers.as_ref().map_or(1, crate::rs::Buffers::page_tokens);
-            Some(carry_table(&rs_plans, page_tokens)?)
+            Some(carry_table(&rs_plans, page_tokens, &rs_beam)?)
         } else {
             None
         };
@@ -5249,10 +5314,9 @@ impl<B: Serve> Shell<B> {
                 let h = at * header;
                 fold_table[h] = -1;
                 fold_table[h + 1] = int(u64::from(to - from))?;
-                fold_table[h + 2] = int(fold_table.len() as u64)?;
-                for token in from..to {
-                    fold_table.push(int(u64::from(token))?);
-                }
+                // Its rows one run of the set's buffer, resolved over beam 0's
+                // list from its record (`prim/carry.slang`).
+                fold_table[h + 2] = -int(u64::from(from))? - 1;
                 let entries = to.div_ceil(tokens);
                 let pages = fold.pages.get(..entries as usize).ok_or_else(|| {
                     program(
@@ -5266,13 +5330,12 @@ impl<B: Serve> Shell<B> {
                         ),
                     )
                 })?;
-                fold_table[h + 3] = int(fold_table.len() as u64)?;
+                let _ = pages;
+                fold_table[h + 3] = -int(fold_table.len() as u64)? - 1;
                 if let Some(group) = beam_of.get(fold.lane).copied().flatten() {
                     fold_pages[group] = Some((u32::try_from(fold_table.len()).unwrap_or(u32::MAX), entries));
                 }
-                for &page in pages {
-                    fold_table.push(int(u64::from(page))?);
-                }
+                fold_table.extend([0i32; RESOLVE_INTS]);
                 fold_table[h + 4] = int(u64::from(to - from))?;
                 if fold.record.len() != self.pools.pieces() as usize {
                     return Err(program(
@@ -6600,7 +6663,11 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
 /// carries; where its carried tokens and its pages start; its commit
 /// length), then each lane's carried tokens and its buffer pages (units of
 /// the pool's rs list).
-fn carry_table(plans: &[engine::rs::LanePlan], page_tokens: u32) -> Result<Vec<i32>> {
+fn carry_table(
+    plans: &[engine::rs::LanePlan],
+    page_tokens: u32,
+    beam: &[bool],
+) -> Result<Vec<i32>> {
     let header = kernels_slang::ssm::CARRY_HEADER as usize;
     let mut table = vec![0i32; plans.len() * header];
     let int = |n: u64| {
@@ -6617,6 +6684,20 @@ fn carry_table(plans: &[engine::rs::LanePlan], page_tokens: u32) -> Result<Vec<i
             None => -1,
         };
         table[at + 1] = int(u64::from(plan.replay))?;
+        // A beam lane's carried rows are one run of its buffer from its
+        // group's fold point, however far its lineage ran: a span, and its
+        // pages resolved through its list from the record its head step
+        // writes (`prim/carry.slang`), so the table holds neither, whatever
+        // the rows.
+        let beamed = beam.get(lane).copied().unwrap_or(false) && plan.gathers.len() <= 1;
+        if beamed {
+            let from = plan.gathers.first().map_or(0, |run| run.from);
+            table[at + 2] = -int(u64::from(from))? - 1;
+            table[at + 3] = -int(table.len() as u64)? - 1;
+            table.extend([0i32; RESOLVE_INTS]);
+            table[at + 4] = int(u64::from(plan.commit))?;
+            continue;
+        }
         table[at + 2] = int(table.len() as u64)?;
         for run in &plan.gathers {
             for token in run.from..run.from + run.count {
@@ -6630,8 +6711,7 @@ fn carry_table(plans: &[engine::rs::LanePlan], page_tokens: u32) -> Result<Vec<i
             .or(plan.gathers.first())
             .map_or(&[][..], |run| run.pages.as_slice());
         // The pages the lane's rows touch this fire, from its buffer's base:
-        // its runs' last token's. A buffer's pages past them (a beam group's
-        // set holds its pool's whole) no kernel of this fire reads.
+        // its runs' last token's.
         let end = plan
             .gathers
             .iter()
@@ -6647,6 +6727,12 @@ fn carry_table(plans: &[engine::rs::LanePlan], page_tokens: u32) -> Result<Vec<i
     }
     Ok(table)
 }
+
+/// The ints a beam lane's resolve record takes in an rs table: its list's
+/// first pool word, the group's `f0`, the kv page's slots, the buffer's
+/// base slot, the pool word of the set's rs entries and how many
+/// (`prim/carry.slang`), which its head step writes.
+pub const RESOLVE_INTS: usize = 6;
 
 /// The walk's sink: a kernel's fire, its absent argument, the target and
 /// whether it names, and nothing else of the backend's sink.
