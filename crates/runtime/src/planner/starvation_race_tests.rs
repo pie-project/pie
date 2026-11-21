@@ -1465,12 +1465,14 @@ fn a_seated_lane_grows_before_a_prompt_waiting_to_be_seated() {
         inner.procs.get_mut(&older).unwrap().seated = false;
     });
 
-    // The prompt is short of pages: it suspends no decoding lane, only an
-    // idle one.
+    // The prompt is short of pages: the lane with a fire in flight is
+    // spared; one between fires is a candidate (the one rule: any resident
+    // not in a fire in flight), idle or not.
     let victims = planner.victim_set().expect("the prompt is short");
-    assert!(
-        victims.members.is_empty(),
-        "no lane is suspended mid-decode"
+    assert_eq!(
+        victims.members.iter().map(|v| v.pid).collect::<Vec<_>>(),
+        [younger],
+        "no lane is suspended mid-fire"
     );
     planner.with_inner(|inner| inner.procs.get_mut(&younger).unwrap().idle = true);
     let victims = planner.victim_set().expect("the prompt is short");
@@ -7820,8 +7822,10 @@ fn with_nothing_in_flight_a_queued_process_s_slots_are_a_victim_s() {
     let other = ProcessId::new_v4();
     planner.register(other);
     planner.note_admitted(other);
+    // One rule: not in a fire in flight, it is a candidate, whatever is
+    // in flight elsewhere.
     let fire = planner.fire_in_flight(other);
-    assert!(!members(&planner).contains(&waiting), "a fire in flight: it is spared");
+    assert!(members(&planner).contains(&waiting), "a fire in flight elsewhere: a candidate");
     drop(fire);
     planner.with_inner(|inner| inner.procs.get_mut(&other).unwrap().idle = true);
     assert!(
@@ -9070,13 +9074,13 @@ fn with_nothing_in_flight_a_process_not_yet_admitted_is_a_victim() {
             .map(|set| set.members.iter().map(|v| v.pid).collect::<Vec<_>>())
             .unwrap_or_default()
     };
+    // One rule: a resident not in a fire in flight is a candidate, with
+    // something in flight elsewhere or not, admitted or not.
     let fire = planner.fire_in_flight(other);
-    assert!(!members(&planner).contains(&seated_later), "something in flight: spared");
+    assert!(members(&planner).contains(&seated_later), "something in flight elsewhere: a candidate");
+    assert!(!members(&planner).contains(&other), "the one firing is not");
     drop(fire);
-    assert!(
-        members(&planner).contains(&seated_later),
-        "nothing in flight: a victim, admitted or not"
-    );
+    assert!(members(&planner).contains(&seated_later), "nothing in flight: a candidate");
 }
 
 /// Mac Pro at 2 GiB on dc1414ae8: "an eviction waits for its sets' fires

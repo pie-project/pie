@@ -75,7 +75,10 @@ impl Inner {
     pub(super) fn plan_fields(&self, head: super::wait::EntryKey) -> (String, String) {
         use super::plan::some_pids;
         let plan = match self.last_plan.as_ref() {
-            Some(end) if end.head == head => format!(
+            // By the entry's id: a reschedule re-ranks its key, and a plan's
+            // end recorded under the old rank read "ended=none" (Mac Pro at
+            // 2 GiB on ca5c710a7, 68,866 such lines).
+            Some(end) if end.head.1 == head.1 => format!(
                 "ended={:?} host_short={} unhostable={}",
                 end.ended,
                 end.host_short,

@@ -570,16 +570,6 @@ impl ResidencyPlanner {
             if deficit == Reclaim::default() {
                 return None;
             }
-            let head_rank = head.0;
-            // A prompt not yet seated waits for a lane to finish rather than
-            // suspending one mid-decode: only an idle or held process yields
-            // to it.
-            let seating = self.seated_first
-                && matches!(waiter.kind, WaitKind::Allocation { .. })
-                && inner
-                    .procs
-                    .get(&waiter.pid)
-                    .is_some_and(|proc| !proc.seated);
             // With nothing in flight, a process waiting in the queue runs
             // nothing: its resident slots are a victim's like any other's,
             // whatever its rank or the head's seating (the M1 on 3b45462d4:
@@ -625,25 +615,18 @@ impl ResidencyPlanner {
                     // candidate (candidates=0, "no pick").
                     **pid != waiter.pid
                         && Some(**pid) != capped_owner
-                        && (proc.admitted || quiet())
+                        // One rule: any resident process not in a fire in
+                        // flight is a candidate for the victim order (rank
+                        // first) to choose from, whatever its admission,
+                        // its queue or its seat. Read by admission, rank and
+                        // seating, 102 residents between fires fell in no
+                        // set while one restore was in flight (Mac Pro at
+                        // 2 GiB on ca5c710a7), and 342 on the M1 before.
+                        // Waiting at a bind, held or idle, it makes no
+                        // progress whatever is in flight of its own.
+                        && (!proc.firing() || proc.bind_waiting || proc.idle || proc.held)
                         // On its way into a process: it was asked back.
                         && (!proc.holder || proc.idle)
-                        // Waiting at a bind for room, it makes no progress
-                        // until room comes: it yields as an idle one does,
-                        // to a prompt not yet seated too.
-                        // With nothing in flight no resident runs: any is a
-                        // victim, queued or not (the L40S on 22b0a3e83:
-                        // "running" processes holding chunks, none firing).
-                        && if quiet() {
-                            true
-                        } else if seating {
-                            proc.idle || proc.held || proc.bind_waiting
-                        } else {
-                            proc.rank() > head_rank
-                                || proc.idle
-                                || proc.held
-                                || proc.bind_waiting
-                        }
                         && proc.state == Residency::Resident
                         // Restored or bound for a waiting head and not
                         // fired since: never moved back before it runs,
@@ -734,7 +717,10 @@ impl ResidencyPlanner {
                 // (the victim set's rule; dropped here, the queued-victim
                 // change never took: the L40S on 22b0a3e83).
                 let waits = queued.contains(&pid);
-                let yields = proc.idle || proc.held || proc.bind_waiting || quiet;
+                // Not in a fire in flight, it runs nothing now: it yields as
+                // the victim set chose it (the one rule there).
+                let yields =
+                    proc.idle || proc.held || proc.bind_waiting || quiet || !proc.firing();
                 if proc.state != Residency::Resident
                     || inner.unfired_protects(pid)
                     || (proc.rank() <= head_rank && !yields)
