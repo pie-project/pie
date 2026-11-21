@@ -440,6 +440,13 @@ impl Shell {
             for (at, shape) in shapes.iter().enumerate() {
                 let before = self.deferred.as_ref().map_or(0, Vec::len);
                 let fired_part = warm_part(&parts, at);
+                // A lane buffers where its rows do not all fold in the fire
+                // (the runtime's `RsVerb::Buffer`): a decode's sampled row,
+                // and so a mixed fire, whose verb is the fire's; a prompt's
+                // and a draft's rows fold. The buffering pass lays those.
+                if self.warm_buffers && !matches!(fired_part, "decode" | "mixed") {
+                    continue;
+                }
                 let r = self.warm_fire(shape);
                 if pass == 0 {
                     let new = self.deferred.as_ref().map_or(0, Vec::len) - before;

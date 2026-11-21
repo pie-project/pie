@@ -2252,7 +2252,7 @@ impl Shell {
                 // a decode lane's carried rows are its step's input, no rows
                 // of the fire (`engine::fire::lane_carried`)
                 carried += engine::fire::lane_carried(
-                    seated.positions.len() as u32,
+                    seated.lane.tokens.len() as u32,
                     reads.iter().map(|r| r.len() as u32).sum::<u32>(),
                 );
             }
