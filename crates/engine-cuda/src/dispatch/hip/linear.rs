@@ -1281,9 +1281,17 @@ impl Run<'_> {
         let x = self.tensor(x);
         let (codes, scales, biases) = self.planes(bank);
         let routes = self.tensor(routes);
-        let (codes, scales, routes) = match self.staged_experts(codes, scales, biases, routes)? {
-            Some((codes, scales, _, routes)) => (codes, scales, routes),
-            None => (codes, scales, routes),
+        // A bank the weight cache streams reads its experts through the
+        // cache's table; a bank on the expert tier's host copy is staged a
+        // call at a time.
+        let experts = self.bank_table(bank);
+        let (codes, scales, routes) = if experts.tabled() {
+            (codes, scales, routes)
+        } else {
+            match self.staged_experts(codes, scales, biases, routes)? {
+                Some((codes, scales, _, routes)) => (codes, scales, routes),
+                None => (codes, scales, routes),
+            }
         };
         linear::moe::matmul_select_fp8_quantized(
             self.ctx(),
@@ -1294,7 +1302,7 @@ impl Run<'_> {
             scales,
             routes,
             &mut self.tensor(y),
-            linear::moe::ExpertTable::RESIDENT,
+            experts,
         )
     }
 
