@@ -910,10 +910,12 @@ template <typename T, int SG, int VROWS>
   if (sg_u == 0) {
     float q[PER], k[PER];
     float qs = 0.0f, ks = 0.0f;
+    // Four of a lane's values a load (PER is four).
+    const float4 q4 = float4(*reinterpret_cast<const device vec<T, 4>*>(qkv + qbase + size_t(PER * lane)));
+    const float4 k4 = float4(*reinterpret_cast<const device vec<T, 4>*>(qkv + kbase + size_t(PER * lane)));
     for (int i = 0; i < PER; ++i) {
-      const int d = PER * lane + i;
-      q[i] = float(qkv[qbase + size_t(d)]);
-      k[i] = float(qkv[kbase + size_t(d)]);
+      q[i] = q4[i];
+      k[i] = k4[i];
       qs += q[i] * q[i];
       ks += k[i] * k[i];
     }
@@ -974,7 +976,12 @@ template <typename T, int SG, int VROWS>
   // The committed state's reads of the own q and k, before any fold.
   device float* cells = gdn_cells<VROWS, PER>(rstate, map, ids, hv, v_heads, dv_base, D, D);
   float st[VROWS][PER];
-  gdn_load<VROWS, PER>(st, cells, lane, D);
+  for (int v = 0; v < VROWS; ++v) {
+    const float4 s4 = *reinterpret_cast<const device float4*>(cells + size_t(v) * D + size_t(PER * lane));
+    for (int i = 0; i < PER; ++i) {
+      st[v][i] = s4[i];
+    }
+  }
   float qn[PER], kn[PER];
   for (int i = 0; i < PER; ++i) {
     qn[i] = q_s[PER * lane + i];
@@ -1006,8 +1013,10 @@ template <typename T, int SG, int VROWS>
           key_slab, pages, c0 + j, page_tokens, page_bytes, key_row_bytes));
       float kr[PER];
       float ks = 0.0f;
+      const float4 kr4 = float4(*reinterpret_cast<const device vec<T, 4>*>(
+          krow + size_t(hk) * D + size_t(PER * lane)));
       for (int i = 0; i < PER; ++i) {
-        kr[i] = float(krow[size_t(hk) * D + size_t(PER * lane + i)]);
+        kr[i] = kr4[i];
         ks += kr[i] * kr[i];
       }
       const float kinv = metal::rsqrt(gdn_row_sum<32>(ks) + 1e-6f);
@@ -1025,12 +1034,18 @@ template <typename T, int SG, int VROWS>
         dk_s[j] = dk;
       }
     }
-    for (int at = tid; at < rows * GROUP_ROWS; at += SG * 32) {
-      const int j = at / GROUP_ROWS;
-      const int v = at % GROUP_ROWS;
+    // Four of a row's values a thread, one load (GROUP_ROWS is a multiple
+    // of four).
+    for (int at = tid; at < rows * (GROUP_ROWS / 4); at += SG * 32) {
+      const int j = at / (GROUP_ROWS / 4);
+      const int v = (at % (GROUP_ROWS / 4)) * 4;
       const device float* urow = reinterpret_cast<const device float*>(gdn_buffered_row(
           u_slab, pages, c0 + j, page_tokens, page_bytes, u_row_bytes));
-      u_s[j][v] = urow[size_t(hv) * D + size_t(group_base + v)];
+      const float4 u4 = *reinterpret_cast<const device float4*>(urow + size_t(hv) * D +
+                                                               size_t(group_base + v));
+      for (int i = 0; i < 4; ++i) {
+        u_s[j][v + i] = u4[i];
+      }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (int j = 0; j < rows; ++j) {
@@ -1081,7 +1096,10 @@ template <typename T, int SG, int VROWS>
     }
   }
   if (keep > 0) {
-    gdn_store<VROWS, PER>(cells, st, lane, D);
+    for (int v = 0; v < VROWS; ++v) {
+      *reinterpret_cast<device float4*>(cells + size_t(v) * D + size_t(PER * lane)) =
+          float4(st[v][0], st[v][1], st[v][2], st[v][3]);
+    }
   }
 }
 
