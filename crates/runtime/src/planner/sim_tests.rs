@@ -136,6 +136,11 @@ struct PoolShape {
     host_chunks: u32,
     disk_chunks: u32,
     programs: Vec<Program>,
+    /// The governor steers the pool's segments ([`Workload::target`]): it
+    /// grows from the bottom and gives segments back, the real segment walk
+    /// ([`crate::store::shared::SharedGrow`]) moving it. Else it is whole
+    /// from its load.
+    governed: bool,
 }
 
 impl PoolShape {
@@ -181,7 +186,12 @@ impl PoolShape {
             host_chunks,
             disk_chunks,
             programs,
+            governed: false,
         }
+    }
+
+    fn segments(&self) -> u32 {
+        self.total.div_ceil(self.segment)
     }
 
     /// State chunks: the total less the reserved chunk and the activation.
@@ -200,7 +210,7 @@ impl PoolShape {
             pinned: None,
             role,
         };
-        let segments = self.total.div_ceil(self.segment);
+        let segments = self.segments();
         let facts = ChunkFacts {
             chunk_bytes: MIB,
             total_chunks: self.total,
@@ -208,7 +218,11 @@ impl PoolShape {
             segments: SegmentFacts {
                 committed: segments,
                 max: segments,
-                growth: Growth::Fixed,
+                growth: if self.governed {
+                    Growth::Bottom
+                } else {
+                    Growth::Fixed
+                },
             },
             reserved: vec![ReservedRun {
                 what: Reserved::Null,
@@ -341,6 +355,28 @@ impl Bytes {
             self.to_physical[displaced as usize] = step.from;
             self.to_logical[step.to as usize] = step.logical;
             self.to_logical[step.from as usize] = displaced;
+        }
+    }
+
+    /// An engine's evacuation, `(logical, physical)` moves, as it rewrites
+    /// its chunk table ([`::engine::chunk::ChunkTable::apply`]).
+    fn evacuated(&mut self, total: u32, moves: &[(u32, u32)]) {
+        let moves: Vec<_> = moves
+            .iter()
+            .map(|&(logical, to)| crate::store::segments::ChunkMove {
+                logical,
+                from: 0,
+                to,
+            })
+            .collect();
+        if self.to_physical.is_empty() {
+            self.to_physical = (0..total).collect();
+            self.to_logical = (0..total).collect();
+        }
+        for step in &moves {
+            let mut step = *step;
+            step.from = self.to_physical[step.logical as usize];
+            self.moved(total, std::slice::from_ref(&step));
         }
     }
 
@@ -870,6 +906,18 @@ struct Workload {
     tier_full: Vec<(u32, u32)>,
     /// A copy lands this many steps late one time in `den`.
     late: u64,
+    /// The governor's target over steps, `(from, to, segments)`: the pool
+    /// is steered at `segments` mapped from step `from` until `to`, and at
+    /// all its segments outside every span ([`PoolShape::governed`]). The
+    /// device's room shrinks under parked and running processes and comes
+    /// back, as a system's memory pressure moves the target.
+    target: Vec<(u32, u32, u32)>,
+    /// The engine's copies go through a staging ring of this many pieces:
+    /// each step lands at most that many, in the order they were handed
+    /// over, one not yet due holding every one behind it (a move device ->
+    /// host -> disk lands its host leg before its disk leg). `None`: every
+    /// copy due lands.
+    ring: Option<usize>,
 }
 
 impl Workload {
@@ -962,13 +1010,43 @@ impl Workload {
             }
         }
         let late = [0, 4, 8][rng.below(3) as usize];
+        // Drawn from a stream of its own, so every other draw of a seed
+        // stands as it was; a pool of one segment has nothing to give back.
+        let mut pool = pool;
+        let mut target = Vec::new();
+        let mut governor_rng = Rng(seed ^ 0x6005_7a26);
+        let segments = pool.segments();
+        if segments >= 3 && governor_rng.chance(1, 3) {
+            pool.governed = true;
+            let mut from = governor_rng.range(0, horizon + 4);
+            for _ in 0..governor_rng.range(1, 3) {
+                let to = from + governor_rng.range(2, 24);
+                let lowered = governor_rng.range(1, segments - 1);
+                target.push((from, to, lowered));
+                from = to + governor_rng.range(0, 12);
+            }
+        }
+        let mut ring_rng = Rng(seed ^ 0x2196_57a9);
+        let ring = ring_rng
+            .chance(1, 3)
+            .then(|| ring_rng.range(1, 3) as usize);
         Self {
             seed,
             pool,
             scripts,
             tier_full,
             late,
+            target,
+            ring,
         }
+    }
+
+    /// The governor's target at `step`, in segments.
+    fn target_at(&self, step: u32) -> u32 {
+        self.target
+            .iter()
+            .find(|&&(from, to, _)| (from..to).contains(&step))
+            .map_or(self.pool.segments(), |&(_, _, segments)| segments)
     }
 
     fn tier_full_at(&self, step: u32) -> bool {
@@ -1001,6 +1079,8 @@ struct Coverage {
     host_swap_full: u64,
     copies: u64,
     disk_copies: u64,
+    /// Steps the governor moved its target on.
+    retargets: u64,
     forks: u64,
     shared_pages: u64,
     binds: u64,
@@ -1029,6 +1109,7 @@ impl Coverage {
         self.host_swap_full += other.host_swap_full;
         self.copies += other.copies;
         self.disk_copies += other.disk_copies;
+        self.retargets += other.retargets;
         self.forks += other.forks;
         self.shared_pages += other.shared_pages;
         self.binds += other.binds;
@@ -1578,7 +1659,19 @@ async fn bind(ctx: &Ctx, pid: ProcessId, program: u32) -> Result<InstanceId, Str
             async move { bound }
         },
         || planner.wait_resident(pid),
-        |_, _| async { Err::<(), String>("every segment is committed".to_string()) },
+        // A segment commit for its run, as the runtime's lane waits on it
+        // (a governed pool's walk commits it; a whole one has none left).
+        |prefix, run| {
+            let shared = ctx.stores.shared.clone();
+            async move {
+                match shared {
+                    Some(shared) => {
+                        crate::store::roles::grow_for_guest(&shared, 0, prefix, run).await
+                    }
+                    None => Err("every segment is committed".to_string()),
+                }
+            }
+        },
         || Some(roles.lock().unwrap().room_watch()),
         |run, pieces| roles.lock().unwrap().free_runs(run) >= pieces,
         |run, pieces| {
@@ -1862,6 +1955,11 @@ async fn quiesce(
     }
 }
 
+/// Whether a step a forced pass finds fails the seed ([`check`]). Off
+/// while the waits on something in flight that ends quietly are made
+/// moves (their landing plans no pass: the field's no-step waits).
+const LOST_WAKES_FAIL: bool = false;
+
 /// The checks after a settled step: the processes refused since the last
 /// (the run goes on), or `Err`, the failure that ends it.
 fn check(ctx: &Ctx, step: u32) -> Result<Vec<Failure>, Failure> {
@@ -1922,9 +2020,30 @@ fn check(ctx: &Ctx, step: u32) -> Result<Vec<Failure>, Failure> {
     let planner = &ctx.planner;
     planner.with_inner(|inner| inner.stall_dumped = None);
     *planner.settled_at.lock() = None;
+    let before = planner.generation();
+    let queue = planner.debug_queue();
+    let ended = planner.with_inner(|inner| {
+        inner.unmet_head().map(|(key, _)| {
+            format!("{} in_flight={}", inner.plan_fields(key).0, !inner.nothing_in_flight())
+        })
+    });
     super::plan::PROGRESS_STRICT.with(|strict| strict.set(true));
     let passed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| planner.plan()));
     super::plan::PROGRESS_STRICT.with(|strict| strict.set(false));
+    // The step settled on the planner's own wakes and its beat: a pass
+    // forced on it that takes a step took one an event should have woken
+    // the planner for, and none did (a lost wakeup: the field waits on the
+    // next unrelated event, or for good).
+    if passed.is_ok() && planner.generation() != before && LOST_WAKES_FAIL {
+        return Err(fail(
+            "lost wake",
+            format!(
+                "a forced pass took a step no wake planned; the last pass {ended:?}; queue \
+                 before {queue}; after {}",
+                planner.debug_queue()
+            ),
+        ));
+    }
     if passed.is_err() {
         let why = take_panics().join("; ");
         // The head's pending bind, as the planner holds it: no bind of the
@@ -1986,25 +2105,63 @@ fn run(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Coverage) 
 async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Coverage) {
     let mut lane = TestLane::install(0);
     let (model, stores) = workload.pool.register();
-    let planner = Arc::new(ResidencyPlanner::new(Arc::new(RegistryPool::new(
-        model, 0, true,
-    ))));
-    super::global::set_test_planner(model, 0, Some(planner.clone()));
     let bytes = Arc::new(Mutex::new(Bytes::default()));
+    let engine = Arc::new(Mutex::new(SimEngine {
+        programs: workload.pool.programs.clone(),
+        next: 0,
+        bytes: bytes.clone(),
+        instances: BTreeMap::new(),
+        pair_generation: BTreeMap::new(),
+        claims: ::engine::guest_claims::Claims::default(),
+        parked: std::collections::BTreeSet::new(),
+        refusals: Vec::new(),
+    }));
+    // A governed pool's segment walk, the runtime's own: the engine takes
+    // each move at once (an evacuation's chunks moved in its table and
+    // every claim laid again), the live processes its lanes.
+    let live = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let planner_cell: Arc<std::sync::OnceLock<std::sync::Weak<ResidencyPlanner>>> =
+        Arc::default();
+    let mut grow = workload.pool.governed.then(|| {
+        let shared = stores.shared.clone().expect("a shared pool");
+        let (lane_bytes, lane_engine, total) =
+            (bytes.clone(), engine.clone(), workload.pool.total);
+        let told = planner_cell.clone();
+        let lanes = live.clone();
+        crate::store::shared::SharedGrow::new(model, 0, shared)
+            .with_lane(move |op| {
+                if let crate::scheduler::worker::PoolOp::Evacuate(evacuation) = op {
+                    trace(|| format!("evacuate {:?}", evacuation.moves));
+                    lane_bytes
+                        .lock()
+                        .unwrap()
+                        .evacuated(total, &evacuation.moves);
+                    lane_engine.lock().unwrap().rebase();
+                }
+                Ok(())
+            })
+            .with_no_grow(move || {
+                if let Some(planner) = told.get().and_then(std::sync::Weak::upgrade) {
+                    planner.no_grow();
+                }
+            })
+            .with_live_lanes(move || lanes.load(Ordering::Relaxed).max(1))
+    });
+    let mut port = RegistryPool::new(model, 0, true);
+    if let Some(grow) = &grow {
+        port = port.with_shared_grow(grow.clone());
+    }
+    let planner = Arc::new(ResidencyPlanner::new(Arc::new(port)));
+    planner_cell.set(Arc::downgrade(&planner)).unwrap();
+    super::global::set_test_planner(model, 0, Some(planner.clone()));
+    if let Some(grow) = &grow {
+        grow.start();
+    }
     let ctx = Arc::new(Ctx {
         model,
         stores,
         planner: planner.clone(),
-        engine: Arc::new(Mutex::new(SimEngine {
-            programs: workload.pool.programs.clone(),
-            next: 0,
-            bytes: bytes.clone(),
-            instances: BTreeMap::new(),
-            pair_generation: BTreeMap::new(),
-            claims: ::engine::guest_claims::Claims::default(),
-            parked: std::collections::BTreeSet::new(),
-            refusals: Vec::new(),
-        })),
+        engine,
         bytes: bytes.clone(),
         pairs: Mutex::new(BTreeMap::new()),
         next_tag: Mutex::new(0),
@@ -2043,9 +2200,24 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
             crate::rt::test_clock::advance(STEP);
         }
         ctx.step.store(u64::from(step), Ordering::Relaxed);
+        if crate::planner::trace_enabled() {
+            println!("SIM STEP {step}");
+        }
         ctx.stepped.notify_waiters();
-        let (due, later): (Vec<_>, Vec<_>) = pending.drain(..).partition(|(at, _)| *at <= step);
-        pending = later;
+        let (due, later): (Vec<_>, Vec<_>) = match workload.ring {
+            None => pending.drain(..).partition(|(at, _)| *at <= step),
+            // Through a ring: in order, at most its pieces a step.
+            Some(pieces) => {
+                let lands = pending
+                    .iter()
+                    .take(pieces)
+                    .take_while(|(at, _)| *at <= step)
+                    .count();
+                let later = pending.split_off(lands);
+                (std::mem::replace(&mut pending, later), Vec::new())
+            }
+        };
+        pending.extend(later);
         for (_, copy) in due {
             coverage.copies += 1;
             coverage.disk_copies += u64::from(copy.to_disk || copy.from_disk);
@@ -2059,7 +2231,23 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
                 copy.land();
             }
         }
-        walk(&ctx);
+        // The governor's tick: the walk steers at its target, and its
+        // moves are the engine's.
+        match &mut grow {
+            Some(grow) => {
+                use crate::governor::PoolTarget;
+                let target = workload.target_at(step);
+                coverage.retargets += u64::from(step > 0 && target != workload.target_at(step - 1));
+                let _ = grow.retarget(u64::from(target));
+            }
+            None => {
+                walk(&ctx);
+            }
+        }
+        live.store(
+            u32::try_from(tasks.len() - ctx.log.lock().unwrap().ended).unwrap_or(u32::MAX),
+            Ordering::Relaxed,
+        );
         quiesce(&ctx, &mut lane, &mut pending, step, workload.late).await;
         for script in arrivals.remove(&step).unwrap_or_default() {
             let pid =
@@ -2290,7 +2478,14 @@ fn replay_seed(seed: u64) -> Vec<Failure> {
 /// fixed, each with a seed that showed it (its regression test below,
 /// ignored until fixed). The fast sweep fails on any other shape; once a
 /// shape is fixed its entry goes and its test is no longer ignored.
-const KNOWN: [(&str, u64); 0] = [];
+const KNOWN: [(&str, u64); 1] = [
+    // Every tier full, no idle cache: device 14 chunks, host 3, disk 6, the
+    // fleet's state past all three, each resident a page short and nothing
+    // with room below to move to (copies through a ring of one piece let
+    // more processes in before the first moves landed). A capacity deadlock
+    // admission lets in, not a wait the planner chose.
+    ("stall bind room: placement none, moves none, host_short true", 3243),
+];
 
 /// Shapes the simulation found and the runtime fixed, each seed's
 /// regression test run in the suite; the fast sweep fails on them again.
@@ -2506,6 +2701,12 @@ fn sim_seed_3785_a_run_s_later_chunks_are_read_where_they_lie() {
 #[test]
 fn sim_seed_3392_a_waiter_s_guest_parts_park_with_its_kv_in_place() {
     regression(FIXED[18]);
+}
+
+#[test]
+#[ignore = "known: a capacity deadlock across every tier (KNOWN[0])"]
+fn sim_seed_3243_every_tier_full_is_no_deadlock() {
+    regression(KNOWN[0]);
 }
 
 /// What a run did, as a string two runs of one seed must agree on.

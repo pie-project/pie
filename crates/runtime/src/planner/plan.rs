@@ -114,6 +114,7 @@ impl ResidencyPlanner {
         // stuck head is said once and costs no pass until an event (the
         // Mac Pro's g2 spin: 56,671 no-step lines, ~199 s of map passes).
         let generation = self.generation();
+        ptrace!("plan pass settled={}", *self.settled_at.lock() == Some(generation));
         if *self.settled_at.lock() == Some(generation) {
             self.stats.skipped_wakes.fetch_add(1, Ordering::Relaxed);
             self.returns
@@ -492,6 +493,33 @@ impl ResidencyPlanner {
     /// chunks, the pool's own census and the planner's map over every
     /// process, so a silent scheduler names the head that holds it.
     pub(super) fn dump_stall(self: &Arc<Self>) {
+        // Room the governor's target holds back is what the head waits on:
+        // the target's rise, an outside event, plans again
+        // ([`Self::target_raised`]). No bug, and no stall.
+        let held_back = self.port.held_back();
+        if held_back > 0 {
+            self.with_inner(|inner| {
+                let Some((key, pid, kind)) = inner
+                    .unmet_head()
+                    .map(|(key, waiter)| (key, waiter.pid, waiter.kind_name()))
+                else {
+                    return;
+                };
+                if inner.nothing_in_flight()
+                    && inner.stall_dumped.is_none_or(|(at, _, _)| at != key)
+                {
+                    inner.stall_dumped = Some((key, 0, crate::rt::Instant::now()));
+                    tracing::info!(
+                        ?key,
+                        %pid,
+                        kind,
+                        held_back,
+                        "planner: the queue's head waits on the governor's target (room it holds back)"
+                    );
+                }
+            });
+            return;
+        }
         let gives = self.port.room_gives();
         let stalled = self.with_inner(|inner| {
             let Some((key, waiter)) = inner.unmet_head() else {
@@ -648,6 +676,18 @@ impl ResidencyPlanner {
         self.events.fetch_add(1, Ordering::AcqRel);
         if let Some(notify) = self.returns.drain.get() {
             notify.notify_one();
+        }
+    }
+
+    /// The governor's target rose past what the pool maps: a commit can
+    /// come where none could, room no event of the pool's own has told
+    /// yet. Waiters plan again on it (the Mac's verified beam mix beside
+    /// another suite: the target swung 693 to 779 MiB for 25 minutes,
+    /// processes parked as "plan: resident again" and none planned).
+    pub fn target_raised(self: &Arc<Self>) {
+        if self.returns.waiters.load(Ordering::Acquire) != 0 {
+            ptrace!("target raised: a commit can come");
+            self.poke();
         }
     }
 

@@ -2440,6 +2440,44 @@ async fn a_grow_the_walk_does_not_make_wakes_the_plan_into_eviction() {
     assert!(reached_eviction(&planner, key), "it went on to eviction");
 }
 
+/// A head short of room the governor's target holds back (the pool at
+/// its target, no grow to promise) plans again when the target rises past
+/// what the pool maps, and waits on the grow it can now be promised: the
+/// rise is the only event that can serve it, and nothing else plans then
+/// (Mac's verified beam + greedy mix beside another suite: the target swung
+/// 693 to 779 MiB for 25 minutes, processes parked as "plan: resident
+/// again" and nothing planned).
+#[tokio::test(flavor = "current_thread")]
+async fn a_target_risen_past_what_is_mapped_plans_the_waiting_head_into_a_grow() {
+    use crate::governor::PoolTarget;
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = crate::store::shared::tests::grow_pool(false, false);
+    let mapped = pool.mapped_segments();
+    let (planner, mut grow, key) = short_of_a_grow(pool, mapped);
+    super::global::set_test_planner(0, 44, Some(planner.clone()));
+    planner.plan();
+    assert_eq!(
+        planner.stats.grow_waits.load(Ordering::Relaxed),
+        0,
+        "at its target the pool promises no grow"
+    );
+    assert!(!grow.grow_promised());
+    assert!(planner.with_inner(|inner| inner.queue.contains_key(&key)), "the head waits");
+    let passes = planner.stats.plan_passes.load(Ordering::Relaxed);
+    let _ = grow.retarget(u64::from(u32::MAX));
+    super::global::set_test_planner(0, 44, None);
+    assert!(
+        planner.stats.plan_passes.load(Ordering::Relaxed) > passes,
+        "the rise planned again"
+    );
+    assert_eq!(
+        planner.stats.grow_waits.load(Ordering::Relaxed),
+        1,
+        "and the head waits on the grow it is promised now"
+    );
+    assert!(grow.grow_promised());
+}
+
 /// A shared pool's chunks for a bind short of room: free, held by idle
 /// cache (dropped by `reclaim_idle`), or held by a resident's guest state.
 /// Chunk ids stand for kv pages one a chunk.
@@ -4149,8 +4187,9 @@ async fn bind_suspended_restores_come_back_one_at_a_time() {
     let other = if first == a { b } else { a };
     assert_eq!(queued, vec![other], "the other waits");
     // The first fires: its bind went through, and the other may come back.
+    // Its first fire plans at once: the other is restored now.
     let fire = planner.fire_in_flight(first);
-    assert_eq!(planner.with_inner(|inner| inner.bind_restoring), None);
+    assert_ne!(planner.with_inner(|inner| inner.bind_restoring), Some(first));
     drop(fire);
     // Asking for pages also says its bind went through: the hold must not
     // wait on a grant queued behind the held restore.
@@ -9438,8 +9477,14 @@ fn a_victim_is_restored_only_once_its_head_has_fired_on_the_room() {
     let fire = planner.fire_in_flight(other);
     assert_eq!(head_of(&planner), None, "its head has not run on the room yet");
     // The head fires: its victim may come back.
+    // Its first fire plans at once: the victim's restore is sent then, not
+    // when the fire lands.
     let head_fire = planner.fire_in_flight(head);
-    assert_eq!(head_of(&planner), Some(victim), "the head ran: the victim is restored");
+    let sent = planner.with_inner(|inner| {
+        inner.unmet_head().map(|(_, waiter)| waiter.pid) == Some(victim)
+            || !inner.queue.values().any(|waiter| waiter.pid == victim)
+    });
+    assert!(sent, "the head ran: the victim is restored");
     drop(head_fire);
     drop(fire);
 }

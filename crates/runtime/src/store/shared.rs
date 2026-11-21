@@ -2625,6 +2625,31 @@ impl SharedPool {
         goal > self.mapped_segments()
     }
 
+    /// The chunks the governor's target holds back from state: segments
+    /// below the activation the engine backs and the pool could map, left
+    /// unmapped while the walk commits nothing at the target
+    /// ([`Self::commit_can_come`]). 0 where a commit can come, or every
+    /// such segment is mapped. A waiter short of room these would give
+    /// waits on the target, an outside event as a policy's answer is: the
+    /// target's rise wakes the planner ([`target::SharedGrow`]'s retarget).
+    #[must_use]
+    pub fn held_back_chunks(&self) -> u32 {
+        if self.commit_can_come() {
+            return 0;
+        }
+        let pool = &self.pool;
+        let segments = pool.segments();
+        (0..pool.top_segment())
+            .filter(|&segment| {
+                segments.state(segment) == SegmentState::Uncommitted && pool.backs(segment)
+            })
+            .map(|segment| {
+                let range = segments.range(segment);
+                range.end - range.start
+            })
+            .sum()
+    }
+
     /// The head guest bind's need, `(run, pieces)`, where one waits.
     #[must_use]
     pub fn guest_head(&self) -> Option<(u32, u32)> {

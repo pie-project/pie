@@ -869,6 +869,12 @@ pub trait PoolPort: Send + Sync + 'static {
     fn state_chunks_most(&self) -> u32 {
         u32::MAX
     }
+    /// The chunks the governor's target holds back from state
+    /// ([`crate::store::shared::SharedPool::held_back_chunks`]): room only
+    /// the target's rise gives. 0 where none is held back.
+    fn held_back(&self) -> u32 {
+        0
+    }
     /// The device pool's count of room given back (a chunk opened for
     /// state, [`crate::store::slots::SlotPool::room_gives`]): moved since
     /// a read, room has come free since.
@@ -1331,6 +1337,12 @@ impl PoolPort for RegistryPool {
         crate::store::registry::try_get(self.model, self.engine)
             .and_then(|stores| stores.shared)
             .map_or(u32::MAX, |shared| shared.lock().unwrap().state_chunks_most())
+    }
+
+    fn held_back(&self) -> u32 {
+        crate::store::registry::try_get(self.model, self.engine)
+            .and_then(|stores| stores.shared)
+            .map_or(0, |shared| shared.lock().unwrap().held_back_chunks())
     }
 
     fn room_gives(&self) -> u64 {

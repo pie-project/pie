@@ -58,6 +58,10 @@ pub struct PlannerStats {
     /// nothing in flight: each a planner bug, said as one
     /// ([`super::ResidencyPlanner::plan_ended`]).
     pub quiet_waits: AtomicU64,
+    /// Passes that left the head waiting on the governor's target: short
+    /// of room only the target's rise gives back
+    /// ([`super::PoolPort::held_back`]), the policy asked meanwhile.
+    pub target_waits: AtomicU64,
     /// Processes moved out while restored (or bound) for a head and not
     /// fired since: each a restore the planner made for nothing, the
     /// churn a victim chosen before it ran makes

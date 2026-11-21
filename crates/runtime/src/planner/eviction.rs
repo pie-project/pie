@@ -574,10 +574,21 @@ impl ResidencyPlanner {
                 self.note_short(victims.head, 0, 0);
                 return;
             }
+            // Room the governor's target holds back (segments it keeps
+            // unmapped) is room no move here makes: the head waits on the
+            // target's rise, an outside event as the policy's answer is,
+            // and is never failed for it (over-demand waits and is served
+            // slower). The rise wakes the planner.
+            let held_back = self.port.held_back();
+            if held_back > 0 {
+                self.stats.target_waits.fetch_add(1, Ordering::Relaxed);
+            }
             self.plan_ended(
                 victims.head,
                 if !unhostable.is_empty() {
                     "every pick unhostable: the policy is asked"
+                } else if held_back > 0 {
+                    "waits on the governor's target: room it holds back, the policy asked"
                 } else if blocked {
                     "every candidate blocked: its move found no room below or nothing to move"
                 } else {
@@ -690,6 +701,9 @@ impl ResidencyPlanner {
                     );
                 }
             }
+            if held_back > 0 {
+                return;
+            }
             if victims.deficit.pages == 0 {
                 self.check_rs_starvation(victims.head);
             } else if !unhostable.is_empty() {
@@ -767,6 +781,7 @@ impl ResidencyPlanner {
         // bug (the restored one's bind fired under the pass: Mac Pro's
         // quiet waits, almost all "waits for the restored one's bind to
         // fire").
+        ptrace!("plan ended head={head:?} ended={ended}");
         let landed_since = self.stats.fires_landed.load(Ordering::Acquire)
             != self.pass_landed.load(Ordering::Acquire);
         if WAITS_ON_FLIGHT.iter().any(|wait| ended.contains(wait))

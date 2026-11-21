@@ -866,11 +866,21 @@ impl PoolTarget for SharedGrow {
     /// move into, [`Retarget::NoRoom`], so the policy's tier pressure sheds
     /// idle cache for the difference.
     fn retarget(&mut self, segments: u64) -> Retarget {
+        let could = self.shared.lock().unwrap().commit_can_come();
         self.target.store(
             u32::try_from(segments).unwrap_or(u32::MAX),
             Ordering::Release,
         );
         self.wake.notify_one();
+        // Risen past what the pool maps: room the target held back can come.
+        // A head that waits on it (short of room no move makes) has no
+        // other event to plan again on.
+        if !could
+            && self.shared.lock().unwrap().commit_can_come()
+            && let Some(planner) = crate::planner::planner_for(self.model, self.engine)
+        {
+            planner.target_raised();
+        }
         let held = u64::from(self.shared.lock().unwrap().mapped_segments());
         if held <= segments {
             Retarget::Reached
