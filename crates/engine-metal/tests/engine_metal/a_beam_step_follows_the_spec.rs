@@ -253,6 +253,16 @@ fn search(dev: &Dev, lanes: u32, folded: u32, steps: u32, seed: u64, rs_t: u32) 
         assert_eq!(held[0], 1, "{at}: primed");
         assert_eq!(held[1], replay.fired, "{at}: fires run");
         assert_eq!(held[2], replay.pool, "{at}: the pool's pages");
+        // §11.3: the common slot, from the replay's lists: the first column
+        // at most this fire's where a beam's list differs from beam 0's.
+        let apart = (0..=c as usize)
+            .find(|&j| want.lists.iter().any(|list| list[j] != want.lists[0][j]))
+            .map_or(c + 1, |j| j as u32);
+        assert_eq!(
+            held[3],
+            ((f0 + apart) * PAGE).min(slot + 1),
+            "{at}: the group's common slot"
+        );
         let map = 4 + (replay.fired as usize & 1) * (lanes * cap) as usize;
         for b in 0..lanes as usize {
             let row = &held[map + b * cap as usize..map + b * cap as usize + c as usize + 1];
@@ -507,7 +517,7 @@ fn a_beam_step_follows_the_spec() {
         eprintln!("not asked: no Metal device");
         return;
     };
-    for lanes in [2, 4, 8] {
+    for lanes in [1, 2, 4, 8] {
         for folded in [37, 32] {
             for seed in 0..3 {
                 search(&dev, lanes, folded, 3 * PAGE + 9, seed, 0);

@@ -262,6 +262,21 @@ kernel void beam_step(
         }
     }
     threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    // §11.3: the group's common slot. j* is the first column, at most the
+    // fire's, at which any beam's reordered list names another page than
+    // beam 0's (c + 1 where every column agrees); every slot below
+    // (f0 + j*) S lies on the same pool page in every beam.
+    threadgroup atomic_uint apart_s;
+    if (tid == 0u) atomic_store_explicit(&apart_s, c + 1u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint j = tid; j <= c; j += threads_in) {
+        for (uint b = 1u; b < B; ++b) {
+            if (map_new[b * cap + j] != map_new[j]) {
+                atomic_fetch_min_explicit(&apart_s, j, memory_order_relaxed);
+                break;
+            }
+        }
+    }
     // §6.5: each lane's staged entries past `f0` and its rows' write pages.
     for (uint i = 0u; i < r.list_count; ++i) {
         const BeamListRun l = lists[i];
@@ -329,11 +344,14 @@ kernel void beam_step(
             pages[e - l.first] = bases[(sigma - l.base) / T];
         }
     }
-    threadgroup_barrier(mem_flags::mem_device);
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
     if (tid == 0u) {
         header[0] = 1u;
         header[1] = fired + 1u;
         header[2] = Q;
+        // c_t = min((f0 + j*) S, end_t), end_t the slot past the fire's row.
+        const ulong common = (ulong(f0) + atomic_load_explicit(&apart_s, memory_order_relaxed)) * S;
+        header[3] = uint(min(common, ulong(r.slot) + 1u));
     }
 }
 
