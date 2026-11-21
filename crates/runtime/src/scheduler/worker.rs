@@ -63,14 +63,6 @@ pub(crate) fn notify_process_suspend(pid: ProcessId) {
     broadcast(|| SchedulerItem::PipelineLeave(pid, Some(pid), LeaveKind::Suspend, None));
 }
 
-/// `pid` waits on something the frame's firing would free: no frame on
-/// `engine` waits on its lanes until its next submit.
-pub(crate) fn notify_owner_waits(engine: usize, pid: ProcessId) {
-    if let Ok(handle) = crate::scheduler::scheduler_handle(engine) {
-        let _ = handle.send(SchedulerItem::OwnerWaits(pid));
-    }
-}
-
 /// `pid` is blocked on the planner or a store (a grant, its restore, room
 /// for a bind, a segment, a fire span, a rung): until it is through it
 /// submits nothing, so no frame on any engine waits on its lanes, and its

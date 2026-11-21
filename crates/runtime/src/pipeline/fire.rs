@@ -1154,8 +1154,10 @@ impl RungAsk {
         }
         // Until the raise, the process submits nothing: no frame waits on
         // its lanes (the frame's firing frees what the raise is funded
-        // with; the frame is not what funds it).
-        crate::scheduler::worker::notify_owner_waits(engine, self.pid);
+        // with; the frame is not what funds it). Its owner is told blocked
+        // where the funding or the watch below parks it (`parks_here`), and
+        // unblocked as that park ends: a raise funded at once blocks
+        // nothing, and no owner is left blocked with no unblock to come.
         let funder = crate::store::shared::programs::Planner {
             pid: self.pid,
             quorum: self.quorum,

@@ -131,8 +131,9 @@ struct LaneState {
     /// host from what that prompt answers, so only decodes wait for it.
     prompting: bool,
     /// It comes back only by a submit of its own: its pipeline closed
-    /// ([`FramePolicy::on_lane_leave`]), or its guest waits on outside input
-    /// ([`FramePolicy::on_owner_away`]). Kept only while frames it submitted
+    /// ([`FramePolicy::on_lane_leave`]), its guest parked it
+    /// (`forward.park()`, [`FramePolicy::on_lane_park`]), or its guest waits
+    /// on outside input ([`FramePolicy::on_owner_away`]). Kept only while frames it submitted
     /// wait to go, and never expected again by its owner's unblock or
     /// resume. Kept parked as any other, an unblock expected it again, and a
     /// frame waited for good on a lane that would not submit (a verified
@@ -684,6 +685,9 @@ impl FramePolicy {
                     }
                     state.awaited = false;
                     state.parked = true;
+                    // Parked by its own guest: it comes back by its own
+                    // next submit, never by its owner's unblock or resume.
+                    state.own_submit = true;
                     state.clock_from = None;
                 }
             }
@@ -822,6 +826,7 @@ impl FramePolicy {
         self.lanes.retain(|_, lane| lane.owner != Some(owner));
         self.pending_binds.remove(&owner);
         self.suspended.remove(&owner);
+        self.blocked.remove(&owner);
         self.forget_staged(owner);
         self.maybe_reset_episode();
     }
@@ -2032,6 +2037,7 @@ mod tests {
         a_frame_goes_without_a_lane_whose_process_waits();
         a_pipelines_fire_posted_behind_a_later_one_is_refused_by_name();
         a_closed_lane_is_never_expected_again_by_its_owner_s_unblock();
+        a_lane_its_guest_parked_is_never_expected_again_by_its_owner_s_unblock();
         a_lane_whose_guest_waits_on_the_outside_holds_no_frame_and_rejoins_on_its_submit();
         a_prompt_piece_cut_under_a_cap_since_lowered_waits_whole_and_owes_nothing();
         a_parked_owner_s_complete_frame_goes_without_waiting_on_the_boundary();
@@ -3140,6 +3146,44 @@ mod tests {
             fires(&plan(&mut policy, &queued, Instant::now())),
             vec![3],
             "the live lane's frame goes: the closed lane is not waited for"
+        );
+    }
+
+    /// A lane whose guest parked it (`forward.park()`) comes back only by
+    /// its own submit: its owner blocking on the planner and unblocked
+    /// again does not make it expected, and the owner's other lane's next
+    /// frame goes without it.
+    fn a_lane_its_guest_parked_is_never_expected_again_by_its_owner_s_unblock() {
+        let mut policy = FramePolicy::new(1, 64, 4096, None).with_silence_timeout_off();
+        let (owner, parking, live) = (pid(), pid(), pid());
+        policy.on_fire_enqueued(stamp(parking, 0, 0, 1), Some(owner), 1, 1, 1);
+        policy.on_fire_enqueued(stamp(live, 0, 0, 1), Some(owner), 2, 1, 1);
+        let queued: QueuedFireIds = [1, 2].into_iter().collect();
+        assert_eq!(fires(&plan(&mut policy, &queued, Instant::now())).len(), 2);
+        policy.on_frame_retired([parking, live]);
+        // Its guest parks the lane after its frame 0.
+        policy.on_lane_park(parking, 0);
+        policy.on_fire_enqueued(stamp(live, 1, 0, 1), Some(owner), 3, 1, 1);
+        let queued: QueuedFireIds = [3].into_iter().collect();
+        assert_eq!(fires(&plan(&mut policy, &queued, Instant::now())), vec![3]);
+        policy.on_frame_retired([live]);
+        // The owner blocks on the planner and is unblocked.
+        policy.on_owner_waits(owner);
+        policy.on_owner_unblocked(owner);
+        policy.on_fire_enqueued(stamp(live, 2, 0, 1), Some(owner), 4, 1, 1);
+        let queued: QueuedFireIds = [4].into_iter().collect();
+        assert_eq!(
+            fires(&plan(&mut policy, &queued, Instant::now())),
+            vec![4],
+            "the live lane's frame goes: the parked lane is not waited for"
+        );
+        policy.on_frame_retired([live]);
+        // Its own submit brings it back, expected like any other.
+        policy.on_fire_enqueued(stamp(parking, 1, 0, 1), Some(owner), 5, 1, 1);
+        let queued: QueuedFireIds = [5].into_iter().collect();
+        assert!(
+            matches!(plan(&mut policy, &queued, Instant::now()), FramePlan::Hold(_)),
+            "back, it waits for the live lane, which is expected"
         );
     }
 
