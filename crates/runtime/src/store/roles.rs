@@ -224,17 +224,6 @@ pub enum RolesError {
         slot_bytes: u64,
         per_chunk: u32,
     },
-    /// The engine states guest state a later fire reads beside the
-    /// instance's tables (`GuestState::resident`): a park would give it
-    /// back uncopied, every part of the guest state being dead between
-    /// fires. What a later fire reads lies in the tables
-    /// (`ProgramFacts::instance`), which a park copies byte for byte.
-    #[error(
-        "{pair} states {bytes} resident bytes of guest state beside its tables; the runtime \
-         copies only an instance's tables (ProgramFacts::instance) across a park, and its \
-         guest state is dead between fires: state them as tables, or as scratch"
-    )]
-    ResidentState { pair: FireKey, bytes: u64 },
 }
 
 /// Whether `error` is a bind waiting for room for its guest state
@@ -507,7 +496,9 @@ enum Tier {
 /// contents are dead between fires, is never copied and holds nothing off
 /// the device (`refs` empty there), fresh room taken when it comes back:
 /// `pieces` runs of `chunks` adjacent whole chunks, or (`run`) one run of
-/// that many slots.
+/// that many slots. A guest part holding resident bytes (`held`,
+/// `engine::GuestState::resident`) is laid the same way and copied as a
+/// live part is: down a tier at a park, back into fresh runs at an unpark.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Part {
     role: SlotRole,
@@ -516,11 +507,19 @@ struct Part {
     pieces: u32,
     chunks: u32,
     run: u32,
+    held: bool,
 }
 
 impl Part {
-    /// Guest scratch, dead between fires.
+    /// Guest scratch, dead between fires: given back at a park, never
+    /// copied.
     fn dead(&self) -> bool {
+        self.shaped() && !self.held
+    }
+
+    /// A guest part, laid on the device as runs of whole chunks or a run
+    /// of slots ([`Roles::retake`]), dead or held.
+    fn shaped(&self) -> bool {
         self.pieces > 0 || self.run > 0
     }
 
@@ -746,7 +745,7 @@ impl Taken {
 
 /// An instance's scratch: its dead part.
 fn scratch(parts: &[Part]) -> Option<&Part> {
-    parts.iter().find(|part| part.dead())
+    parts.iter().find(|part| part.shaped())
 }
 
 /// Where a dead part lies: its run's first slot ref and slots, or each of
@@ -1301,6 +1300,7 @@ impl Roles {
             pieces: 0,
             chunks: 0,
             run: 0,
+            held: false,
         };
         if slots == 0 {
             return Ok(part(Vec::new()));
@@ -1356,6 +1356,7 @@ impl Roles {
             pieces,
             chunks: if pieces > 0 { run } else { 0 },
             run: slots,
+            held: false,
         })
     }
 
@@ -1512,7 +1513,14 @@ impl Roles {
             if !parked || !self.unparks_with(*owner, item, holder) {
                 continue;
             }
-            for part in item.parts.iter().filter(|part| part.dead() && part.refs.is_empty()) {
+            let below = matches!(item.tier, Tier::Host | Tier::Disk);
+            // Its guest parts laid fresh: the dead ones given back, and a
+            // held one coming up from a tier below.
+            for part in item
+                .parts
+                .iter()
+                .filter(|part| (part.dead() && part.refs.is_empty()) || (part.held && below))
+            {
                 own.push(if part.pieces > 0 {
                     OwnPiece::Chunks {
                         run: part.chunks,
@@ -1559,7 +1567,7 @@ impl Roles {
                 // As [`Self::take_parts`] takes it on the device: a dead
                 // part retaken fresh ([`Self::retake`]), a live one by
                 // [`Self::take`].
-                Some(if part.dead() {
+                Some(if part.shaped() {
                     if part.pieces > 0 {
                         OwnPiece::Chunks {
                             run: part.chunks.max(1),
@@ -1634,7 +1642,7 @@ impl Roles {
             .collect();
         order.sort_by_key(|&(at, index)| {
             let part = &groups[at].2[index];
-            if part.dead() && part.pieces > 0 {
+            if part.shaped() && part.pieces > 0 {
                 (0, std::cmp::Reverse(part.chunks))
             } else {
                 (1, std::cmp::Reverse(0))
@@ -1919,9 +1927,10 @@ impl Roles {
     ) -> Result<Vec<Part>, RolesError> {
         let mut taken = Vec::with_capacity(like.len());
         for part in like {
-            let took = match (part.dead(), device) {
-                (false, _) => self.take(on, part.role, part.refs.len() as u32, part.contiguous),
-                (true, true) => self.retake(part).map_err(|room| {
+            let took = if device && part.shaped() {
+                // Laid as runs on the device, dead or held: its fresh runs,
+                // a held part's bytes copied into them.
+                self.retake(part).map_err(|room| {
                     let (run, _) = part.chunk_runs();
                     let committable = self.device.lock().unwrap().pool().committable_runs(run);
                     RolesError::GuestShort {
@@ -1929,11 +1938,14 @@ impl Roles {
                         bytes: self.dead_bytes(part),
                         room: room.with_committable(committable),
                     }
-                }),
-                (true, false) => Ok(Part {
+                })
+            } else if part.dead() {
+                Ok(Part {
                     refs: Vec::new(),
                     ..part.clone()
-                }),
+                })
+            } else {
+                self.take(on, part.role, part.refs.len() as u32, part.contiguous)
             };
             match took {
                 Ok(part) => taken.push(part),
@@ -2158,16 +2170,6 @@ impl Roles {
                 });
             }
         }
-        // Every guest part is dead between fires, given back at a park:
-        // bytes a later fire reads belong in the tables, copied with the
-        // instance (the simulation's data check on f152f9631: resident
-        // bytes lost at every park).
-        if state.resident > 0 {
-            return Err(RolesError::ResidentState {
-                pair,
-                bytes: state.resident,
-            });
-        }
         let mut taken = GuestTaken::default();
         let run = state.chunks_a_piece();
         // The instance's own bytes: its resident part and every scratch arm
@@ -2206,7 +2208,14 @@ impl Roles {
                 || format!("an instance of {pair}'s scratch"),
                 heads,
             ) {
-                Ok(part) => taken.scratch = Some(part),
+                // Resident bytes beside the scratch: the part is held,
+                // copied at a park and back at an unpark, never dead.
+                Ok(part) => {
+                    taken.scratch = Some(Part {
+                        held: state.resident > 0,
+                        ..part
+                    });
+                }
                 Err(error) => {
                     self.untake_guest(taken);
                     return Err(error.asking(whole));
@@ -2392,6 +2401,9 @@ impl Roles {
                 adapter
             });
             shared.attached.insert(id);
+            // A live member again: no longer parked where it lies, so no
+            // move down takes it from under this instance.
+            shared.shed = false;
             item.adapter = Some(key);
         }
         if let Some((key, part, _, generation)) = taken.pair {
@@ -2543,12 +2555,12 @@ impl Roles {
                         // on the device for good (the L40S at 3 GiB on
                         // c10d7de5d: chunk 17, a pair of 73 dead refs, its
                         // evicted holder no candidate, the head one chunk short).
+                        // Parked already and settled, as a pair's: a member
+                        // on its way holds it (its park may yet be taken
+                        // back), and a member's landing park parks it where
+                        // it lies ([`Self::release_unheld_pairs`]).
                         instance(id).is_none_or(|instance| {
-                            // Parked already: off the device, or parked
-                            // where it lies (no room below, [`Item::shed`]).
-                            instance.holder == Some(holder)
-                                || instance.tier != Tier::Device
-                                || instance.shed
+                            instance.holder == Some(holder) || Self::settled_parked(instance)
                         })
                     })
             }
@@ -2568,6 +2580,29 @@ impl Roles {
     /// ([`Self::moves_with`]). Its state is dead between fires; it parks
     /// as one with no slots below, and a member's restore takes it fresh.
     fn release_unheld_pairs(&mut self) {
+        let settled = |item: &Item| {
+            item.tier == Tier::Device
+                && !item.shed
+                && item.reads == 0
+                && !item.attached.is_empty()
+                && item.attached.iter().all(|id| {
+                    self.items
+                        .get(&Owner::Instance(*id))
+                        .is_none_or(Self::settled_parked)
+                })
+        };
+        // An adapter holds live parts: parked where it lies, its room a
+        // move down a tier takes ([`Self::prepare_park_down`]), its rebind
+        // at its first member's unpark.
+        let adapters: Vec<Owner> = self
+            .items
+            .iter()
+            .filter(|(owner, item)| matches!(owner, Owner::Adapter(_)) && settled(item))
+            .map(|(owner, _)| *owner)
+            .collect();
+        for owner in adapters {
+            self.items.get_mut(&owner).expect("present").shed = true;
+        }
         let unheld: Vec<Owner> = self
             .items
             .iter()
@@ -2926,7 +2961,7 @@ impl Roles {
         let mut chunks = 0u64;
         for owner in owners {
             for part in &self.items[owner].parts {
-                chunks += if part.dead() {
+                chunks += if part.shaped() {
                     let (run, pieces) = part.chunk_runs();
                     u64::from(run) * u64::from(pieces)
                 } else {

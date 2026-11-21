@@ -119,9 +119,9 @@ pub struct InstanceBinding {
 /// nothing copied, the engine told where ([`Rebind::Instance`]).
 ///
 /// A guest pair holds no GPU-written state across fires: anything a fire
-/// writes that a later fire reads lives in the instance's tables
-/// ([`InstanceBinding::instance_slots`], [`ProgramFacts::instance`]), its
-/// rings or channel cells, all moved byte for byte by a park. A pair may
+/// writes that a later fire reads lives in resident ([`GuestState::resident`]),
+/// the instance's tables ([`InstanceBinding::instance_slots`]), its rings
+/// or channel cells, all moved byte for byte by a park. A pair may
 /// hold host-laid constant tables (descriptors, params, bindings,
 /// offsets, lane indices, layout words) laid when the pair lands and read
 /// by later fires without restaging. So a pair's bytes may be dropped on
@@ -135,11 +135,12 @@ pub struct InstanceBinding {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuestState {
     /// Bytes an instance holds from bind to unbind that a later fire reads
-    /// as a fire left them. None today: the runtime refuses a bind stating
-    /// any by name (`ResidentState`), as a park would give them back
-    /// uncopied; such bytes are stated as the instance's tables
-    /// ([`ProgramFacts::instance`]), copied with it. Every engine states 0
-    /// and its value scratch as [`Self::scratch`].
+    /// as a fire left them (a beam group's state, capture rows): laid with
+    /// the scratch at [`InstanceBinding::scratch`], copied down a tier at a
+    /// park and back into fresh room at an unpark byte for byte, the engine
+    /// told where ([`Rebind::Instance`]). Where it is stated, the whole
+    /// place is copied, its scratch with it. Per-fire bytes are stated as
+    /// [`Self::scratch`], never here.
     #[serde(default)]
     pub resident: u64,
     /// Bytes ONE fire of the instance needs for its value scratch: dead outside that

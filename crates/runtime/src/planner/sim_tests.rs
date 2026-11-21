@@ -118,6 +118,9 @@ impl Rng {
 struct Program {
     run: u32,
     scratch: u64,
+    /// Bytes a later fire reads as a fire left them
+    /// (`GuestState::resident`), laid with the scratch and copied at a park.
+    resident: u64,
     per_pair: u64,
 }
 
@@ -143,16 +146,20 @@ impl PoolShape {
             Program {
                 run: 1,
                 scratch: 96 * SLOT,
+                resident: 0,
                 per_pair: 64 * SLOT,
             },
             Program {
                 run: 1,
-                scratch: MIB,
+                // A beam group's state: resident, held across parks.
+                scratch: 0,
+                resident: MIB,
                 per_pair: MIB,
             },
             Program {
                 run: 2,
                 scratch: 2 * MIB,
+                resident: 0,
                 per_pair: 0,
             },
         ];
@@ -160,6 +167,7 @@ impl PoolShape {
             programs.push(Program {
                 run: 3,
                 scratch: 3 * MIB,
+                resident: 0,
                 per_pair: 3 * MIB,
             });
         }
@@ -390,6 +398,9 @@ struct Places {
     scratch: ::engine::ScratchPlace,
     pair: ::engine::ScratchPlace,
     pair_generation: u64,
+    /// Its program states resident bytes: its scratch place holds them,
+    /// laid at the bind and read by every fire.
+    resident: bool,
 }
 
 /// States each program's guest state, tables and rings; binds and rebinds
@@ -504,7 +515,7 @@ impl Engine for SimEngine {
     ) -> ::engine::Result<GuestState> {
         let p = self.programs[program.0 as usize];
         Ok(GuestState {
-            resident: 0,
+            resident: p.resident,
             scratch: p.scratch,
             scratch_arms: 1,
             per_pair: p.per_pair,
@@ -522,6 +533,7 @@ impl Engine for SimEngine {
             scratch: binding.scratch.clone(),
             pair: binding.pair.clone(),
             pair_generation: binding.pair_generation,
+            resident: self.programs[binding.program.0 as usize].resident > 0,
         };
         {
             let mut bytes = self.bytes.lock().unwrap();
@@ -567,10 +579,12 @@ impl Engine for SimEngine {
 
 const PART_TABLE: u8 = 0;
 const PART_RING: u8 = 1;
+const PART_RESIDENT: u8 = 2;
 
 /// An instance's own live parts at `places`, each slot with the pattern its
-/// bind laid: (part, shape, slot, pattern). Its scratch is dead between
-/// fires and holds nothing to check.
+/// bind laid: (part, shape, slot, pattern). Its scratch place holds its
+/// resident bytes where its program states any, read by every fire; else
+/// it is dead between fires and holds nothing to check.
 fn instance_parts(id: u64, places: &Places) -> Vec<(u8, u32, u32, u64)> {
     let mut parts = Vec::new();
     for (at, &slot) in places.instance.iter().enumerate() {
@@ -580,6 +594,11 @@ fn instance_parts(id: u64, places: &Places) -> Vec<(u8, u32, u32, u64)> {
         for (at, &slot) in ring.slots.iter().enumerate() {
             let at = u64::from(ring.channel) << 32 | at as u64;
             parts.push((PART_RING, CHANNEL, slot, pattern(2, id, at)));
+        }
+    }
+    if places.resident {
+        for (at, slot) in place_slots(&places.scratch).into_iter().enumerate() {
+            parts.push((PART_RESIDENT, INSTANCE, slot, pattern(3, id, at as u64)));
         }
     }
     parts
@@ -1073,7 +1092,8 @@ fn verify(ctx: &Ctx, sets: &[Set], instances: &[InstanceId]) -> Result<(), Strin
             if got != Some(want) {
                 let part = match kind {
                     PART_TABLE => "launch tables",
-                    _ => "ring",
+                    PART_RING => "ring",
+                    _ => "resident bytes (its scratch place)",
                 };
                 return Err(format!(
                     "instance {id} of program {}: its {part} slot {slot}: {}",
@@ -1944,11 +1964,15 @@ fn replay_seed(seed: u64) -> Vec<Failure> {
 /// fixed, each with a seed that showed it (its regression test below,
 /// ignored until fixed). The fast sweep fails on any other shape; once a
 /// shape is fixed its entry goes and its test is no longer ignored.
-const KNOWN: [(&str, u64); 2] = [
+const KNOWN: [(&str, u64); 3] = [
     // A restore short of runs, no move named: every candidate blocked, or
     // no pick, the policy asked with nothing in flight (seeds 111, 93,
     // 3822).
     ("stall restore: placement short", 111),
+    // A bind short of room with no pick or every pick unhostable, often
+    // with the host short now that resident bytes are copied down at a
+    // park (seeds 134, 136; the L40S's line 3 is of this family).
+    ("stall bind room", 134),
     // Processes left waiting long after the last arrival: a restore
     // waiting on its instances' rebinds while another process parks and
     // unparks, one stuck Evicting (seeds 774, 2315, 2964, 3754, 3853).
@@ -1971,8 +1995,9 @@ const FIXED: [(&str, u64); 9] = [
     // A bind short of a run of two, no placement and no pick.
     ("stall bind room", 188),
     // Resident bytes lost at a park: every engine states its value
-    // scratch as scratch, dead between fires, and a bind stating resident
-    // bytes is refused by name (`RolesError::ResidentState`).
+    // scratch as scratch, dead between fires, and resident bytes are a
+    // held part, copied down at a park and back at an unpark (program 1
+    // states a chunk of them).
     ("corrupt instance # of program #: its resident bytes", 1),
     // A pair taken anew at an unpark is laid fresh: right by the pair
     // contract (`engine::GuestState`), the check now reads the pair at the
@@ -2086,6 +2111,12 @@ fn sim_seed_111_a_restore_short_of_runs_is_funded() {
 #[test]
 #[ignore = "pending: processes left waiting long after the last arrival"]
 fn sim_seed_774_every_process_ends() {
+    regression(KNOWN[2]);
+}
+
+#[test]
+#[ignore = "pending: a bind short of room, no pick or every pick unhostable"]
+fn sim_seed_134_a_bind_short_of_room_is_served() {
     regression(KNOWN[1]);
 }
 
