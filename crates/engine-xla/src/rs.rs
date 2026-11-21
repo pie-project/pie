@@ -378,6 +378,20 @@ pub fn carried_room(rung: u32) -> u32 {
     rung
 }
 
+/// The most rows a lane carries unfolded that a load of `page_tokens`-row
+/// rs pages lays grids for: one page of them (`Shell::carried_rows`).
+#[must_use]
+pub fn carried_rows(page_tokens: u32) -> u32 {
+    page_tokens.max(1)
+}
+
+/// The rs pages a lane's carried rows lie in at most: a span of
+/// [`carried_rows`] from a page-aligned base.
+#[must_use]
+pub fn carried_pages(page_tokens: u32) -> u32 {
+    carried_rows(page_tokens).div_ceil(page_tokens.max(1)) + 1
+}
+
 /// A decode fire's carried rows as the state + buffer step reads them
 /// (`kernels_xla::ssm::carried`): each lane's buffered rows' rs list rows in
 /// a `[lanes, rows]` grid (`DROP` past its own), how many it carries, and
@@ -410,7 +424,8 @@ impl CarriedMap {
         page_tokens: u32,
         rows: u32,
     ) -> Result<CarriedMap> {
-        // a lane's `rows` carried rows lie in at most this many grains
+        // a lane's `rows` carried rows from a page-aligned base lie in at
+        // most this many grains
         let pages = rows.div_ceil(page_tokens.max(1)) + 1;
         let mut map = CarriedMap {
             rows,

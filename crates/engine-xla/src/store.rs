@@ -347,9 +347,13 @@ fn lanes(width: u64) -> u64 {
     }
 }
 
-/// The rows of a recurrent-verb buffer plane: a page of rows per slot.
+/// The rows of a recurrent-verb buffer plane: the pages a slot's carried
+/// rows lie in.
 fn rs_rows(paging: Paging) -> u64 {
-    u64::from(paging.slots.max(1)) * u64::from(paging.page_size.max(1))
+    // a buffering lane's carried rows lie in `rs::carried_pages` pages
+    let page = u64::from(paging.page_size.max(1));
+    let pages = u64::from(crate::rs::carried_pages(paging.page_size));
+    u64::from(paging.slots.max(1)) * page * pages
 }
 
 /// The planes every cache row lays, as the layout reads them.
@@ -527,7 +531,10 @@ impl Pools {
         };
         // `bytes` buys pages and state slots; the null and sink chunks lie
         // past them ([`reserved_bytes`]).
-        let least = RESERVED_CHUNKS + narrow(layout.shapes.len() as u64);
+        // every shape the facts state holds whole chunks: the layout's, the
+        // channels' and, where the trace adapts, the adapters'
+        let stated = layout.shapes.len() as u64 + 1 + u64::from(adapter_slot_bytes(trace) > 0);
+        let least = RESERVED_CHUNKS + narrow(stated);
         let chunks = (RESERVED_CHUNKS + narrow(bytes / layout.chunk_bytes.max(1))).max(least);
         // The staging slab: the top of the stated range, just below the
         // sink, where the runtime keeps a fire's activation span. Counted

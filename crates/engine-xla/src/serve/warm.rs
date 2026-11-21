@@ -50,7 +50,7 @@ impl Shell {
     /// in one block. The runtime runs ahead no further than it allows.
     #[must_use]
     pub fn carried_rows(&self) -> u32 {
-        self.paging().page_size.max(1)
+        crate::rs::carried_rows(self.paging().page_size)
     }
 
     /// Fires the warm ladder; answers how many fires ran. A load whose
