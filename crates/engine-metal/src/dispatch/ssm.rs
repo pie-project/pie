@@ -277,7 +277,36 @@ impl Run<'_> {
                         self.rs_scatter(OP, &seat, kp, seat.ext_in[kp])?;
                         self.rs_scatter(OP, &seat, up, seat.ext_in[up])?;
                     }
-                    return landed;
+                    landed?;
+                    // A compact fire's decode lanes beside wider ones read
+                    // their carried rows from their buffers as a decode
+                    // window's do (the verify scan passed them over).
+                    if let (Some(ba_paged), Some(corrected)) = (paged, corrected)
+                        && self.window_has_compact_decode(&seat)
+                    {
+                        ssm::gated_delta_carried(
+                            self.ctx(),
+                            ext_qkv,
+                            self.qo_indptr(),
+                            &self.rs_committed(&seat, *state),
+                            &ssm::VerifyGates {
+                                ba,
+                                dt_bias,
+                                a_log,
+                                gates: self.tensor(*gates),
+                            },
+                            ba_paged,
+                            corrected,
+                            &self.recurrent(*state),
+                            *k_heads,
+                            *v_heads,
+                            *k_dim,
+                            *v_dim,
+                            self.tensor(*y),
+                            self.dots_table(&seat, *k_heads)?,
+                        )?;
+                    }
+                    return Ok(());
                 }
                 // Heads the verify scan does not stage take the gate prep
                 // the verify scan would have folded in.
@@ -598,6 +627,19 @@ impl crate::run::Run<'_> {
             table: seat.work,
             rows,
             max_rep,
+        })
+    }
+
+    /// Whether a lane of this window takes fewer extended rows than it
+    /// carries: a compact fire's decode lane, which the carried scan reads.
+    pub(crate) fn window_has_compact_decode(&self, seat: &crate::rs::Seat) -> bool {
+        let (lane0, lanes) = self.window_lanes();
+        (lane0..lane0.saturating_add(lanes)).any(|lane| {
+            let lane = lane as usize;
+            match (seat.ext_replay.get(lane), seat.lanes.get(lane)) {
+                (Some(&ext), Some(plan)) => ext < plan.replay,
+                _ => false,
+            }
         })
     }
 

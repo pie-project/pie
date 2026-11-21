@@ -609,6 +609,7 @@ template <typename T, int LANES, int SG, int VROWS>
     device uchar* u_slab        [[buffer(25)]],
     const constant uint& u_row_bytes [[buffer(26)]],
     const constant int& corrected [[buffer(27)]],
+    const device int* ext_replay [[buffer(28)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint lane_u [[thread_index_in_simdgroup]],
     uint sg_u [[simdgroup_index_in_threadgroup]]) {
@@ -634,8 +635,17 @@ template <typename T, int LANES, int SG, int VROWS>
   threadgroup float beta_s[kVerifyChunk];
 
   int begin = indptr[r];
+  // A lane's extended rows: its carried rows where it takes them
+  // (`ext_replay`; a compact decode lane takes none, reading them from its
+  // buffer), then its own. `begin + t` is row `t` of them.
   for (int j = 0; j < r; ++j) {
-    begin += replay[lane0 + j];
+    begin += ext_replay[lane0 + j];
+  }
+  begin -= replay[lane0 + r] - ext_replay[lane0 + r];
+  // A compact decode lane is the carried scan's, dispatched beside this
+  // one: it re-steps nothing here. Uniform over the threadgroup.
+  if (ext_replay[lane0 + r] < replay[lane0 + r]) {
+    return;
   }
   const int rep = replay[lane0 + r];
   const int span = (indptr[r + 1] - indptr[r]) + rep;
@@ -808,7 +818,7 @@ template <typename T, int LANES, int SG, int VROWS>
       const constant uint&, const constant uint&, const constant uint&,        \
       const constant int&, const device ulong*, device uchar*,                 \
       const constant uint&, device uchar*, const constant uint&,               \
-      const constant int&, uint3, uint, uint);
+      const constant int&, const device int*, uint3, uint, uint);
 
 PIE_GDN_VERIFY(32, 8, 2)
 PIE_GDN_VERIFY(32, 4, 4)
@@ -850,6 +860,7 @@ template <typename T>
     const constant int& v_heads [[buffer(11)]],
     device float4* table        [[buffer(12)]],
     const constant uint& table_rows [[buffer(13)]],
+    const device int* ext_replay [[buffer(14)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint lane_u [[thread_index_in_simdgroup]]) {
   constexpr int D = 128;
@@ -863,9 +874,13 @@ template <typename T>
     return;
   }
   int begin = indptr[r];
+  // A lane's extended rows: its carried rows where it takes them
+  // (`ext_replay`; a compact decode lane takes none, reading them from its
+  // buffer), then its own. `begin + t` is row `t` of them.
   for (int j = 0; j < r; ++j) {
-    begin += replay[lane0 + j];
+    begin += ext_replay[lane0 + j];
   }
+  begin -= replay[lane0 + r] - ext_replay[lane0 + r];
   const device int* pages = page_table + size_t(lane0 + r) * page_ints;
   const size_t keys = size_t(k_heads) * D;
   const size_t pitch = 2 * keys + size_t(v_heads) * D;
@@ -907,7 +922,7 @@ template [[host_name("gated_delta_carried_dots_bfloat16")]]
     const device bfloat*, const device int*, const device int*, const constant int&,
     device uchar*, const device int*, const constant uint&, const constant uint&,
     const constant uint&, const constant uint&, const constant int&, const constant int&,
-    device float4*, const constant uint&, uint3, uint);
+    device float4*, const constant uint&, const device int*, uint3, uint);
 
 template <typename T, int SG, int VROWS>
 [[kernel]] void gated_delta_carried(
@@ -938,6 +953,7 @@ template <typename T, int SG, int VROWS>
     const constant uint& page_ints [[buffer(24)]],
     const device float4* table  [[buffer(25)]],
     const constant uint& table_rows [[buffer(26)]],
+    const device int* ext_replay [[buffer(27)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint lane_u [[thread_index_in_simdgroup]],
     uint sg_u [[simdgroup_index_in_threadgroup]]) {
@@ -970,9 +986,13 @@ template <typename T, int SG, int VROWS>
   threadgroup float own_s[4];
 
   int begin = indptr[r];
+  // A lane's extended rows: its carried rows where it takes them
+  // (`ext_replay`; a compact decode lane takes none, reading them from its
+  // buffer), then its own. `begin + t` is row `t` of them.
   for (int j = 0; j < r; ++j) {
-    begin += replay[lane0 + j];
+    begin += ext_replay[lane0 + j];
   }
+  begin -= replay[lane0 + r] - ext_replay[lane0 + r];
   const int rep = replay[lane0 + r];
   const device int* ids = slots + size_t(lane0 + r) * pie_state_pieces(map);
   // One own row a lane (the dispatch's rule); uniform over the threadgroup.
@@ -1221,7 +1241,7 @@ template <typename T, int SG, int VROWS>
       const constant uint&, device uchar*, const constant uint&,               \
       device uchar*, const constant uint&, const device ulong*,                \
       const constant uint&, const device float4*, const constant uint&,        \
-      uint3, uint, uint);
+      const device int*, uint3, uint, uint);
 
 PIE_GDN_CARRIED(8, 2)
 PIE_GDN_CARRIED(8, 16)

@@ -1187,7 +1187,13 @@ impl PreparedLoad<'_> {
                 (Some(layout), Some(_)) => {
                     let lanes = (*tokens).min(boot.budget.max_lanes).max(1);
                     let own = (*tokens).min(boot.budget.max_tokens);
-                    crate::rs::Seat::scratch_bytes(layout, own.saturating_add(*tokens), lanes)
+                    // Its own rows and, counted toward the rung, as many
+                    // carried in: what every fire of it is checked against.
+                    crate::rs::Seat::scratch_bytes(
+                        layout,
+                        crate::rs::scratch_rows(own, *tokens),
+                        lanes,
+                    )
                 }
                 _ => 0,
             })
@@ -5347,7 +5353,6 @@ impl Shell {
 
         let rs_replay: Vec<i32> = rs_plans.iter().map(|plan| plan.replay as i32).collect();
         let rs_commit: Vec<i32> = rs_plans.iter().map(|plan| plan.commit as i32).collect();
-        let carried = rs_plans.iter().map(|plan| plan.replay).sum::<u32>();
         // The rows the lanes carry in, counted as the runtime counts them
         // toward the rung (`engine::fire::lane_carried`: a decode lane's
         // none, its step reading them in place through its page table; a
@@ -5372,7 +5377,6 @@ impl Shell {
                 ),
             ));
         }
-        let rows_ext = rows.saturating_add(carried);
         let rs_page_ints = self.inputs[self.arena.current()][0].rs_page_ints();
         let rs_pages = match (rs_active, self.rs_buffers.as_ref()) {
             (true, Some(buffers)) => {
@@ -5380,6 +5384,28 @@ impl Shell {
             }
             _ => None,
         };
+        // A compact fire (every recurrent op on the paged forms, a page
+        // table, no snapshots): a decode lane reads its carried rows from
+        // its buffer wherever it lies, and takes no extended rows; the rows
+        // each lane takes are what it counts toward the rung
+        // (`engine::fire::lane_carried`). Else every carried row is
+        // re-stepped through the extended rows.
+        let compact = rs_pages.is_some()
+            && rs_snaps.is_empty()
+            && self.rs_layout.as_ref().is_some_and(|layout| layout.compact);
+        let rs_ext_replay: Vec<u32> = rs_plans
+            .iter()
+            .zip(&rs_own)
+            .map(|(plan, &own)| {
+                if compact {
+                    engine::fire::lane_carried(own, plan.replay)
+                } else {
+                    plan.replay
+                }
+            })
+            .collect();
+        let rows_ext = crate::rs::scratch_rows(rows, rs_ext_replay.iter().sum::<u32>());
+        let rs_ext_replay_i32: Vec<i32> = rs_ext_replay.iter().map(|&n| n as i32).collect();
         // A beam lane whose group folds first replays from the fold: its
         // row starts that many rows on, the rows below it the group fold's
         // (§11.3), which reads them through the same row.
@@ -5689,6 +5715,7 @@ impl Shell {
                 slot_ids: &slot_ids,
                 slot_of_row: &slot_of_row,
                 rs_replay: rs_active.then_some(rs_replay.as_slice()),
+                rs_ext_replay: rs_active.then_some(rs_ext_replay_i32.as_slice()),
                 rs_commit: rs_active.then_some(rs_commit.as_slice()),
                 rs_snaps: (!rs_snaps.is_empty()).then_some(rs_snaps.as_slice()),
                 rs_pages: rs_pages.as_deref(),
@@ -5849,7 +5876,9 @@ impl Shell {
                         what: "the recurrent seat of a fire whose plan buffers nothing".to_string(),
                     });
                 };
-                let (Some(replay), Some(commit)) = (bound.rs_replay, bound.rs_commit) else {
+                let (Some(replay), Some(commit), Some(ext_table)) =
+                    (bound.rs_replay, bound.rs_commit, bound.rs_ext_replay)
+                else {
                     return Err(Fault::Unbound {
                         what: "the recurrent seat's per-lane tables".to_string(),
                     });
@@ -5860,6 +5889,7 @@ impl Shell {
                     buffers,
                     (self.arena.store(), self.arena.rs_region()),
                     rs_plans,
+                    (rs_ext_replay, ext_table),
                     replay,
                     commit,
                     bound.slot_ids,

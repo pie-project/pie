@@ -60,6 +60,72 @@ pub struct Layout {
     pub out_of: HashMap<u32, usize>,
     pub token_bytes: u64,
     pub work_elems: u64,
+    /// Whether every op that reads a state slot runs the paged forms (the
+    /// verify conv and the gated-delta verify and carried scans): then a
+    /// decode lane reads its carried rows from its buffer pages wherever it
+    /// lies, and takes no extended rows ([`compact`], [`scratch_rows`]).
+    pub compact: bool,
+}
+
+/// The extended rows a fire's rs scratch holds: its own rows and the rows
+/// its lanes carry in, as each counts toward the rung
+/// ([`engine::fire::lane_carried`] where the fire is compact: a decode
+/// lane's none; else every carried row). What the load reserves for each
+/// rung, at the rung's bound, and what each fire is checked against.
+#[must_use]
+pub fn scratch_rows(own: u32, carried: u32) -> u32 {
+    own.saturating_add(carried)
+}
+
+/// Whether every op of `trace` that reads a state slot is a conv or a
+/// gated-delta scan the paged forms run: a conv of a multiple of four
+/// channels within the verify conv's taps and history, no bias; a scan of
+/// the verify scan's heads.
+#[must_use]
+pub fn compact(trace: &Trace) -> bool {
+    use poem_ir::Operands;
+    let state = |id: &ValueId| {
+        matches!(
+            trace.values.get(id.0 as usize).map(|value| &value.def),
+            Some(Def::Cache(row))
+                if matches!(trace.caches.get(*row as usize), Some(poem_ir::CacheRow::State { .. }))
+        )
+    };
+    let mut reads = Vec::new();
+    let mut any = false;
+    let paged = trace.nodes.iter().all(|node| {
+        reads.clear();
+        node.op.inputs(&mut reads);
+        if !reads.iter().any(state) {
+            return true;
+        }
+        any = true;
+        match &node.op {
+            Operation::Ssm(
+                Ssm::CausalConv1d {
+                    x,
+                    bias: None,
+                    conv_width,
+                    dilation,
+                    ..
+                }
+                | Ssm::CausalConv1dChunked {
+                    x,
+                    bias: None,
+                    conv_width,
+                    dilation,
+                    ..
+                },
+            ) => row_of(trace, *x).is_ok_and(|(width, _, _)| {
+                kernels_metal::ssm::causal_conv1d_verify_fits(width, *conv_width, *dilation)
+            }),
+            Operation::Ssm(
+                Ssm::GatedDelta { k_dim, v_dim, .. } | Ssm::GatedDeltaChunked { k_dim, v_dim, .. },
+            ) => kernels_metal::ssm::gated_delta_verify_fits(*k_dim, *v_dim),
+            _ => false,
+        }
+    });
+    paged && any
 }
 
 /// The snapshot rows one lane lands in a fire (`Lane::rs_snapshots`):
@@ -398,6 +464,7 @@ impl Layout {
         }
         layout.token_bytes = layout.planes.iter().map(|plane| plane.row_bytes).sum();
         layout.share(trace);
+        layout.compact = compact(trace);
         Ok(Some(layout))
     }
 
@@ -730,6 +797,10 @@ pub fn page_table(lanes: &[LanePlan], page_tokens: u32, ints: u32) -> Result<Opt
 #[derive(Debug)]
 pub struct Seat {
     pub lanes: Vec<LanePlan>,
+    /// Each lane's carried rows among the extended rows: its replay, or
+    /// none for a decode lane of a compact fire ([`scratch_rows`]).
+    pub ext_replay: Vec<u32>,
+    pub ext_replay_table: Tensor,
     pub replay: Tensor,
     pub commit: Tensor,
     pub slots: Tensor,
@@ -796,6 +867,7 @@ impl Seat {
         buffers: &Buffers,
         (scratch, (base, have)): (&Buffer, (u64, u64)),
         lanes: Vec<LanePlan>,
+        (ext_replay, ext_replay_table): (Vec<u32>, Tensor),
         replay: Tensor,
         commit: Tensor,
         slots: Tensor,
@@ -852,6 +924,8 @@ impl Seat {
         );
         Ok(Seat {
             lanes,
+            ext_replay,
+            ext_replay_table,
             replay,
             commit,
             slots,

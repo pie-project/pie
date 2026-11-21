@@ -198,6 +198,9 @@ pub struct Handles {
     pub patches: Option<PatchHandles>,
     pub mrope_positions: Option<Tensor>,
     pub rs_replay: Option<Tensor>,
+    /// Each lane's carried rows among the extended rows
+    /// (`kernels_metal::ssm::Committed::ext_replay`).
+    pub rs_ext_replay: Option<Tensor>,
     pub rs_commit: Option<Tensor>,
     pub rs_snaps: Option<Tensor>,
     /// Each band's snapshot table, `[lanes, RS_SNAPSHOTS * (1 + width)]`.
@@ -263,6 +266,7 @@ pub struct Fire<'a> {
     pub voxels: Option<VoxelFire<'a>>,
     pub mrope_positions: Option<&'a [i32]>,
     pub rs_replay: Option<&'a [i32]>,
+    pub rs_ext_replay: Option<&'a [i32]>,
     pub rs_commit: Option<&'a [i32]>,
     pub rs_snaps: Option<&'a [i32]>,
     pub rs_pages: Option<&'a [i32]>,
@@ -492,6 +496,7 @@ pub struct Inputs {
     patch: Option<PatchAt>,
     mrope: Option<u64>,
     rs_replay: u64,
+    rs_ext_replay: u64,
     rs_commit: u64,
     rs_snaps: u64,
     rs_pages: u64,
@@ -776,6 +781,7 @@ impl Inputs {
         });
         let mrope = mrope.then(|| take(rows * AXES * 4));
         let rs_replay = take(lanes * 4);
+        let rs_ext_replay = take(lanes * 4);
         let rs_commit = take(lanes * 4);
         let snap_ints =
             u64::from(kernels_metal::ssm::RS_SNAPSHOTS) * (bands.len().max(1) as u64 + width);
@@ -857,6 +863,7 @@ impl Inputs {
             patch,
             mrope,
             rs_replay,
+            rs_ext_replay,
             rs_commit,
             rs_snaps,
             rs_pages,
@@ -1042,7 +1049,10 @@ impl Inputs {
             .write(self.slot_of_row, bytes_of(fire.slot_of_row))?;
         let rs_tables = match (fire.rs_replay, fire.rs_commit) {
             (Some(replay), Some(commit)) => {
-                if replay.len() != lanes as usize || commit.len() != lanes as usize {
+                if replay.len() != lanes as usize
+                    || commit.len() != lanes as usize
+                    || fire.rs_ext_replay.is_some_and(|ext| ext.len() != lanes as usize)
+                {
                     return Err(Fault::Ceiling {
                         what: "recurrent seat tables, one entry per lane",
                         need: replay.len().max(commit.len()) as u64,
@@ -1050,6 +1060,8 @@ impl Inputs {
                     });
                 }
                 self.store.write(self.rs_replay, bytes_of(replay))?;
+                self.store
+                    .write(self.rs_ext_replay, bytes_of(fire.rs_ext_replay.unwrap_or(replay)))?;
                 self.store.write(self.rs_commit, bytes_of(commit))?;
                 true
             }
@@ -1609,6 +1621,16 @@ impl Inputs {
             } else {
                 None
             },
+            rs_ext_replay: if rs_tables {
+                Some(i32s(
+                    handles,
+                    self.store.view(),
+                    self.store.at(self.rs_ext_replay),
+                    lanes,
+                )?)
+            } else {
+                None
+            },
             rs_commit: if rs_tables {
                 Some(i32s(
                     handles,
@@ -1813,6 +1835,7 @@ mod rung_tests {
             voxels: None,
             mrope_positions: None,
             rs_replay: None,
+            rs_ext_replay: None,
             rs_commit: None,
             rs_snaps: None,
             rs_pages: None,

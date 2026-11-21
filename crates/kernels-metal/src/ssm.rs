@@ -988,6 +988,10 @@ pub struct Committed {
     pub commit: Tensor,
     pub slots: Tensor,
     pub lane0: u32,
+    /// Each lane's carried rows among the extended rows: its replay, or
+    /// none for a compact decode lane, which reads them from its buffer
+    /// (the verify conv, the verify and carried scans).
+    pub ext_replay: Tensor,
 }
 
 fn committed_lanes(op: &'static str, indptr: Tensor) -> Result<u32, Error> {
@@ -1475,6 +1479,7 @@ fn gated_delta_verify_at(
             u_slab,
             u_row_bytes,
             is_corrected,
+            committed.ext_replay.arg(),
         ],
     )
 }
@@ -1562,6 +1567,7 @@ pub fn gated_delta_carried(
                 stated(OP, v_heads)?.arg(),
                 table.table.arg_mut(),
                 table.rows.arg(),
+                committed.ext_replay.arg(),
             ],
         )?;
     }
@@ -1596,6 +1602,7 @@ pub fn gated_delta_carried(
             ba_paged.page_ints.arg(),
             table.table.arg(),
             table.rows.arg(),
+            committed.ext_replay.arg(),
         ],
     )
 }
@@ -1838,6 +1845,7 @@ pub fn causal_conv1d_verify(
             is_paged,
             state.segments.arg(),
             i32::from(own_only).arg(),
+            committed.ext_replay.arg(),
         ],
     )
 }

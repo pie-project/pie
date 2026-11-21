@@ -461,6 +461,7 @@ template <typename T>
     // A carried decode window reads no carried row's output (the carried
     // scan reads its own row alone): only the own rows' outputs are made.
     const constant int& own_only   [[buffer(23)]],
+    const device int* ext_replay   [[buffer(24)]],
     uint3 pos [[thread_position_in_grid]],
     uint3 at [[thread_position_in_threadgroup]],
     uint3 shape [[threads_per_threadgroup]]) {
@@ -470,9 +471,13 @@ template <typename T>
   const int r = int(pos.z);
   const bool live = c < channels;
   int begin = indptr[r];
+  // A lane's extended rows: its carried rows where it takes them
+  // (`ext_replay`; a compact decode lane takes none, reading them from its
+  // buffer), then its own. `begin + t` is row `t` of them.
   for (int j = 0; j < r; ++j) {
-    begin += replay[lane0 + j];
+    begin += ext_replay[lane0 + j];
   }
+  begin -= replay[lane0 + r] - ext_replay[lane0 + r];
   const int rep = replay[lane0 + r];
   const int span = (indptr[r + 1] - indptr[r]) + rep;
   const device int* ids = slots + size_t(lane0 + r) * pie_state_pieces(map);
@@ -532,7 +537,10 @@ template <typename T>
                       float(weight[(col + 3) * size_t(width) + size_t(k)]));
       }
     }
-    for (int t = (own_only != 0 ? rep : 0) + first; t < span; t += rows) {
+    // A lane that takes no extended carried rows (a compact decode lane)
+    // makes its own rows' outputs alone, as a carried window's do.
+    const bool own_rows = own_only != 0 || ext_replay[lane0 + r] < rep;
+    for (int t = (own_rows ? rep : 0) + first; t < span; t += rows) {
       float4 acc = 0.0f;
       for (int k = 0; k < width; ++k) {
         const float4 in = tap(t - (width - 1 - k) * dil);
@@ -594,7 +602,7 @@ template <typename T>
       const constant int&, device uchar*, const device int*,            \
       const constant uint&, const constant uint&, const constant uint&, \
       const constant int&, const device ulong*, const constant int&,    \
-      uint3, uint3, uint3);
+      const device int*, uint3, uint3, uint3);
 
 instantiate_causal_conv1d_verify(bfloat16, bfloat)
 

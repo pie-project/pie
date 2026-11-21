@@ -7,17 +7,15 @@ use poem_ir::{Operation, Ssm, ValueId};
 use crate::rs::{Convolved, Seat};
 use crate::run::Run;
 
-fn extended_origin(
-    indptr: &[i32],
-    lanes: &[engine::rs::LanePlan],
-    lane0: u32,
-    r: usize,
-) -> (u32, u32) {
+/// Lane `r`'s first extended row and its carried rows among them
+/// (`Seat::ext_replay`: a compact decode lane takes none), as the kernels
+/// lay them.
+fn extended_origin(indptr: &[i32], ext_replay: &[u32], lane0: u32, r: usize) -> (u32, u32) {
     let mut begin = indptr[r].max(0) as u32;
     for j in 0..r {
-        begin += lanes.get(lane0 as usize + j).map_or(0, |plan| plan.replay);
+        begin += ext_replay.get(lane0 as usize + j).copied().unwrap_or(0);
     }
-    let replay = lanes.get(lane0 as usize + r).map_or(0, |plan| plan.replay);
+    let replay = ext_replay.get(lane0 as usize + r).copied().unwrap_or(0);
     (begin, replay)
 }
 
@@ -37,6 +35,7 @@ impl Run<'_> {
             commit: seat.commit,
             slots: self.lane_slots(state).unwrap_or(seat.slots),
             lane0: self.window().span.lane_offset,
+            ext_replay: seat.ext_replay_table,
         }
     }
 
@@ -132,15 +131,17 @@ impl Run<'_> {
         let mut copies = Vec::new();
         for r in 0..indptr.len().saturating_sub(1) {
             let rows = (indptr[r + 1] - indptr[r]).max(0) as u32;
-            let (begin, replay) = extended_origin(indptr, &seat.lanes, lane0, r);
+            let (begin, replay) = extended_origin(indptr, &seat.ext_replay, lane0, r);
             let Some(plan) = seat.lanes.get(lane0 as usize + r) else {
                 continue;
             };
             // Every run the lane replays, one after another: a lane sharing
             // its set replays the slots its mask admits (its ancestry), which
             // its siblings' slots interleave, so not one run from its first.
+            // A lane that takes no extended carried rows reads them from its
+            // buffer: none are gathered.
             let mut at = begin;
-            for run in &plan.gathers {
+            for run in plan.gathers.iter().filter(|_| replay == plan.replay) {
                 self.rs_move(op, &mut copies, seat, plane, run, ext, at, false)?;
                 at += run.count;
             }
@@ -267,7 +268,7 @@ impl Run<'_> {
         let mut copies = Vec::new();
         for r in 0..indptr.len().saturating_sub(1) {
             let rows = (indptr[r + 1] - indptr[r]).max(0) as u32;
-            let (begin, replay) = extended_origin(indptr, &seat.lanes, lane0, r);
+            let (begin, replay) = extended_origin(indptr, &seat.ext_replay, lane0, r);
             self.rs_copy(
                 op,
                 &mut copies,

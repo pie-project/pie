@@ -352,6 +352,7 @@ fn walks_agree(bench: &Bench, lanes: &Lanes, snaps: Option<(&[i32], &[i32])>) {
         commit: bench.i32s(&lanes.commit),
         slots: bench.i32s(slots),
         lane0: 0,
+        ext_replay: bench.i32s(&lanes.replay),
     };
     let ext_gates = bench.zeroed(ext, BA_WIDTH, Dtype::F32);
     let ext_y = bench.zeroed(ext, Y_WIDTH, Dtype::F32);
@@ -495,6 +496,7 @@ fn convs_agree(bench: &Bench, lanes: &Lanes, snaps: Option<(&[i32], &[i32])>) {
         commit: bench.i32s(&lanes.commit),
         slots: bench.i32s(slots),
         lane0: 0,
+        ext_replay: bench.i32s(&lanes.replay),
     };
     let old_y = bench.zeroed(ext, QKV_WIDTH, Dtype::Bf16);
     let new_y = bench.zeroed(ext, QKV_WIDTH, Dtype::Bf16);
