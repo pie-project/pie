@@ -25,6 +25,14 @@ const WAITS_ON_FLIGHT: &[&str] = &[
     "waits for the restored one's bind to fire",
 ];
 
+// The ends of the quiet waits said on this thread, for the simulation to
+// fail by name.
+#[cfg(test)]
+thread_local! {
+    pub(super) static QUIET_WAITS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 impl ResidencyPlanner {
     pub(super) fn quote_and_pick(
         &self,
@@ -589,23 +597,68 @@ impl ResidencyPlanner {
                 && let Some(need) = shape.as_ref()
                 && self.with_inner(|inner| inner.nothing_in_flight())
             {
-                let everyone: Vec<ProcessId> = self.with_inner(|inner| inner.procs.keys().copied().collect());
+                // Every process but the head: its own parts are no move
+                // made for it.
+                let everyone: Vec<ProcessId> = self.with_inner(|inner| {
+                    inner
+                        .procs
+                        .keys()
+                        .copied()
+                        .filter(|pid| *pid != victims.head_pid)
+                        .collect()
+                });
                 let mut all = self.occupants(&everyone);
                 all.merge(self.parked_map(victims.head_pid));
-                if let Some(named) = all.cheapest_need(need).filter(|named| !named.is_empty()) {
+                // A named one whose move found no room below (or nothing to
+                // move) waits on the room the policy is asked for here: the
+                // ask is the step, and the block lifts as that room comes
+                // ([`Self::lapse_blocks`]). One restored for a head and not
+                // fired since, able to fire, is spared by the anti-thrash
+                // rule and fires next: its fire landing plans again. A
+                // parked one whose state's move down was refused at this
+                // room (the tier below full) waits on the room below the
+                // policy is asked for, as a blocked resident does. Only a
+                // named one none of these holds back is a move this pass
+                // missed.
+                let parked_down_refused =
+                    self.park_down_failed.load(Ordering::Acquire) == self.park_down_room();
+                let movable = |named: &Vec<ProcessId>| {
+                    self.with_inner(|inner| {
+                        named.iter().any(|pid| {
+                            let parked = inner
+                                .procs
+                                .get(pid)
+                                .is_some_and(|proc| proc.state != Residency::Resident);
+                            !inner.host_swap_blocked.contains(pid)
+                                && !inner.prepare_blocked.contains(pid)
+                                && !inner.unfired_protects(*pid)
+                                && !(parked && parked_down_refused)
+                        })
+                    })
+                };
+                if let Some(named) = all
+                    .cheapest_need(need)
+                    .filter(|named| !named.is_empty() && movable(named))
+                {
                     self.stats.quiet_waits.fetch_add(1, Ordering::Relaxed);
                     let states: Vec<String> = self.with_inner(|inner| {
                         named
                             .iter()
                             .map(|pid| match inner.procs.get(pid) {
                                 Some(proc) => format!(
-                                    "{pid}: {:?} queued={} idle={} held={} holder={} candidate={}",
+                                    "{pid}: {:?} queued={} idle={} held={} holder={} candidate={} \
+                                     unfired={} firing={} bind_waiting={} restored_past={} blocked={}",
                                     proc.state,
                                     inner.queue.values().any(|w| w.pid == *pid && w.is_unmet()),
                                     proc.idle,
                                     proc.held,
                                     proc.holder,
                                     victims.members.iter().any(|v| v.pid == *pid),
+                                    proc.unfired,
+                                    proc.firing(),
+                                    proc.bind_waiting,
+                                    proc.restored_past.is_some(),
+                                    inner.host_swap_blocked.contains(pid) || inner.prepare_blocked.contains(pid),
                                 ),
                                 None => format!("{pid}: gone"),
                             })
@@ -721,6 +774,8 @@ impl ResidencyPlanner {
             && self.with_inner(|inner| inner.nothing_in_flight())
         {
             self.stats.quiet_waits.fetch_add(1, Ordering::Relaxed);
+            #[cfg(test)]
+            QUIET_WAITS.with(|waits| waits.borrow_mut().push(ended.to_string()));
             // Planned again at once: a completion that raced this pass is
             // seen and funded; a wait that stands with nothing in flight is
             // said again, never silent.

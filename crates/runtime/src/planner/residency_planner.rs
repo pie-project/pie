@@ -1994,6 +1994,12 @@ impl ResidencyPlanner {
         for notify in wake {
             notify.notify_waiters();
         }
+        let unfired = self.with_inner(|inner| {
+            pids.iter()
+                .filter(|pid| inner.procs.get(pid).is_some_and(|proc| proc.unfired))
+                .count() as u64
+        });
+        self.stats.evicted_unfired.fetch_add(unfired, Ordering::Relaxed);
         for pid in pids {
             self.stats.evictions_started.fetch_add(1, Ordering::Relaxed);
             exec::spawn_evict(self.clone(), pid);

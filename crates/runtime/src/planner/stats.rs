@@ -58,6 +58,11 @@ pub struct PlannerStats {
     /// nothing in flight: each a planner bug, said as one
     /// ([`super::ResidencyPlanner::plan_ended`]).
     pub quiet_waits: AtomicU64,
+    /// Processes moved out while restored (or bound) for a head and not
+    /// fired since: each a restore the planner made for nothing, the
+    /// churn a victim chosen before it ran makes
+    /// ([`super::proc::Proc::unfired`]).
+    pub evicted_unfired: AtomicU64,
     /// Settled passes that found a head waiting with nothing in flight,
     /// each time it was found again, said or not
     /// ([`super::ResidencyPlanner::dump_stall`]).
