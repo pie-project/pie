@@ -845,32 +845,9 @@ impl Engine for Xla {
             }
             _ => engine::program::Footprint::default(),
         };
-        // A beam group's state (BEAM-PAGE-LISTS §4): one run of `Instance`
-        // slots, laid from the load's paging and frames in flight.
-        let instance = match (
-            self.programs
-                .package(program)
-                .and_then(crate::beam::group_of),
-            self.shell.as_ref(),
-        ) {
-            (Some(group), Some(shell)) => {
-                let paging = shell.paging();
-                let frames = self.caps.as_ref().map_or(1, |caps| caps.frames_in_flight);
-                let layout =
-                    crate::beam::layout(group, paging.page_size, paging.pages_per_slot, frames);
-                let (bytes, slots) = crate::beam::state_slots(layout, crate::guest::CHANNEL_SLOT);
-                engine::program::Footprint {
-                    bytes,
-                    slots,
-                    contiguous: true,
-                }
-            }
-            _ => engine::program::Footprint::default(),
-        };
         Ok(engine::program::ProgramFacts {
             rings: self.programs.compiled_form(program).map_or_else(Vec::new, |c| c.rings()),
             adapter,
-            instance,
             ..Default::default()
         })
     }
@@ -941,6 +918,38 @@ impl Engine for Xla {
         Ok(self.programs.fire_facts(program, load_temp))
     }
 
+    /// A beam group's state (BEAM-PAGE-LISTS §4) is the instance's resident
+    /// state: one run of `Instance` slots the runtime takes at the bind,
+    /// live to the close, moved whole by a park (`Rebind::Instance::resident`),
+    /// laid from the load's paging and frames in flight.
+    fn guest_state(
+        &self,
+        program: ProgramId,
+        extents: &engine::program::BindExtents,
+        class: eta_ir::registry::GeometryClass,
+    ) -> EngineResult<engine::program::GuestState> {
+        let _ = (extents, class);
+        let resident = match (
+            self.programs
+                .package(program)
+                .and_then(crate::beam::group_of),
+            self.shell.as_ref(),
+        ) {
+            (Some(group), Some(shell)) => {
+                let paging = shell.paging();
+                let frames = self.caps.as_ref().map_or(1, |caps| caps.frames_in_flight);
+                let layout =
+                    crate::beam::layout(group, paging.page_size, paging.pages_per_slot, frames);
+                crate::beam::state_slots(layout, crate::guest::CHANNEL_SLOT).0
+            }
+            _ => 0,
+        };
+        Ok(engine::program::GuestState {
+            resident,
+            ..engine::program::GuestState::default()
+        })
+    }
+
     /// An instance's carried rings, or a registered channel's ring, moved to
     /// fresh `Channel` slots (a park and its return): the cells are read and
     /// written there from now on, by every instance bound to them.
@@ -950,16 +959,14 @@ impl Engine for Xla {
                 id,
                 rings,
                 adapter,
-                instance,
+                resident,
                 ..
             } => {
-                // a beam group's state: the runtime copied it into the run
-                // `instance` names
-                if let (Some(_), Some(&first), Some(shell)) = (
-                    self.programs.beam_seat(id),
-                    instance.first(),
-                    self.shell.as_ref(),
-                ) {
+                // a beam group's state: the runtime copied the resident run
+                // to the slots `resident` names
+                if let (Some(_), engine::ScratchPlace::Run { first, .. }, Some(shell)) =
+                    (self.programs.beam_seat(id), resident, self.shell.as_ref())
+                {
                     let row = shell.pools().instance_row(first).ok_or_else(|| {
                         Error::Program(format!(
                             "instance {id:?}'s beam state moved to Instance slot {first}, past \
@@ -1005,8 +1012,8 @@ impl Engine for Xla {
         }
         let shell = self.shell.as_ref();
         let cell_row = |slot: u32| shell.and_then(|shell| shell.channel_row(slot));
-        // A beam group's state (BEAM-PAGE-LISTS §4) in the `Instance` run
-        // the runtime took for it, zeroed so its first fire primes it.
+        // A beam group's state (BEAM-PAGE-LISTS §4) in the resident run the
+        // runtime took for it, zeroed so its first fire primes it.
         let beam = match (
             self.programs
                 .package(binding.program)
@@ -1022,15 +1029,16 @@ impl Engine for Xla {
                     caps.frames_in_flight,
                 );
                 let (_, slots) = crate::beam::state_slots(layout, crate::guest::CHANNEL_SLOT);
-                if binding.instance_slots.len() != slots as usize {
-                    return Err(Error::Program(format!(
-                        "a beam group of {} lanes keeps its state in {slots} Instance slot(s); \
-                         the bind names {}",
-                        group.lanes,
-                        binding.instance_slots.len()
-                    )));
-                }
-                let first = binding.instance_slots[0];
+                let first = match &binding.resident {
+                    &engine::ScratchPlace::Run { first, slots: held } if held >= slots => first,
+                    other => {
+                        return Err(Error::Program(format!(
+                            "a beam group of {} lanes keeps its state in a resident run of \
+                             {slots} Instance slot(s); the bind names {other:?}",
+                            group.lanes
+                        )));
+                    }
+                };
                 let row = shell.pools().instance_row(first).ok_or_else(|| {
                     Error::Program(format!("Instance slot {first} lies past the pool"))
                 })?;
@@ -1050,13 +1058,13 @@ impl Engine for Xla {
             .programs
             .bind(binding, &cell_row, beam)
             .map_err(refusal)?;
+        // the resident run cleared once, at the bind (§4)
         if beam.is_some()
             && let Some(shell) = self.shell.as_mut()
+            && let &engine::ScratchPlace::Run { first, slots } = &binding.resident
         {
-            let slots: Vec<(engine::chunk::ShapeId, u32)> = binding
-                .instance_slots
-                .iter()
-                .map(|&slot| (crate::store::layout::INSTANCE, slot))
+            let slots: Vec<(engine::chunk::ShapeId, u32)> = (first..first + slots)
+                .map(|slot| (crate::store::layout::INSTANCE, slot))
                 .collect();
             let zeros = vec![0u8; slots.len() * crate::guest::CHANNEL_SLOT as usize];
             if let Err(why) = shell.write_slot_bytes(&slots, &zeros) {
