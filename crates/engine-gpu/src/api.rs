@@ -391,6 +391,10 @@ impl<B: Host> Gpu<B> {
             self.live.tally(engine::live::Tally::BuiltInFire, guest);
             self.warn_in_fire("a guest step's pipeline");
         }
+        let eager = self.shell.as_mut().map_or(0, Shell::eager_serving);
+        if eager > 0 {
+            self.live.tally(engine::live::Tally::Eager, eager);
+        }
         let unkept = self.shell.as_mut().map_or(0, Shell::unkept_serving);
         if unkept > 0 {
             let tally = if B::RECORDS {
@@ -902,6 +906,7 @@ where
         }
         // What the load itself walked is the load's: serving counts from here.
         shell.recorded_serving();
+        shell.eager_serving();
         shell.unkept_serving();
         shell.bound_serving();
         // The fire the shell took, which a binding may have bounded below

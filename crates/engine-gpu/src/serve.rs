@@ -741,6 +741,11 @@ pub struct Shell<B: Serve> {
     /// The steps walked and not kept since the last count: each ran its
     /// regions eagerly, with no recording to replay.
     unkept: u64,
+    /// Fires of at least these rows run eager, as the load stated: the
+    /// bodies past the allowance it recorded smallest first.
+    eager_rows: Option<u32>,
+    /// The fires since the last count that ran eager as stated.
+    eager: u64,
     /// The tier moves through the host since the last count that found
     /// frames in flight and waited for them ([`Shell::drained_serving`]).
     drained: u64,
@@ -2026,6 +2031,8 @@ impl<B: Serve> Shell<B> {
             built: B::compiled(&pipelines),
             recorded: 0,
             unkept: 0,
+            eager_rows: None,
+            eager: 0,
             drained: 0,
             walked: (0, 0),
             walk_only: false,
@@ -2683,6 +2690,11 @@ impl<B: Serve> Shell<B> {
     /// served with no recording, which no later fire replays either.
     pub fn unkept_serving(&mut self) -> u64 {
         std::mem::take(&mut self.unkept)
+    }
+
+    /// The fires since the last count that ran eager, as the load stated.
+    pub fn eager_serving(&mut self) -> u64 {
+        std::mem::take(&mut self.eager)
     }
 
     /// The tier moves through the host since the last count that waited
@@ -5421,8 +5433,14 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
             }
             Plan::Walk { keep, split } => (keep, split),
         };
+        // A fire the load stated eager walks unrecorded, and is counted so.
+        let stated_eager = self.eager_rows.is_some_and(|eager| {
+            prepared.seats.iter().map(|seat| seat.rows).sum::<u32>() >= eager
+        });
+        let keep = keep.filter(|_| !stated_eager);
         self.recorded += u64::from(keep.is_some());
-        self.unkept += u64::from(keep.is_none());
+        self.eager += u64::from(stated_eager);
+        self.unkept += u64::from(keep.is_none() && !stated_eager);
         let walked = self.walk_once(&prepared, keep.is_some(), split)?;
         let mut frame = walked.frame.expect("the walk opened a frame");
 
@@ -6181,11 +6199,13 @@ impl<B: Serve> Shell<B> {
     /// across kinds (within one count of rows, more lanes first): for each
     /// class a plain one-row request lands in, a decode of each decode
     /// bucket's lanes ([`Shell::decode_buckets`]); for each class a plain
-    /// longer request lands in, a prefill of one lane of every count of rows
-    /// up to the vector GEMM's widest row tile (rows its commands carry),
-    /// then of each power of two past it up to the top rung (rows read from
-    /// the fire block, one body for every count of rows the power of two
-    /// holds); each on every arm. Their lanes pad (they read the pool's walk
+    /// longer request lands in, a prefill of every count of rows up to the
+    /// vector GEMM's widest row tile (rows its commands carry), then of each
+    /// power of two past it up to the top rung (rows read from the fire
+    /// block, one body for every count of rows the power of two holds), over
+    /// each power of two of lanes up to the lane cap; and a prompt of each
+    /// such count of rows beside each power of two of decode lanes; each on
+    /// every arm. Their lanes pad (they read the pool's walk
     /// refs and write nothing), so a fire runs as a serving one of its shape
     /// does and is recorded. The bodies recorded.
     pub fn record_bodies(&mut self) -> Result<u64> {
@@ -6221,28 +6241,100 @@ impl<B: Serve> Shell<B> {
             })
             .take_while(|&rows| rows <= top),
         );
-        // (class, lanes, rows a lane)
-        let mut shapes: Vec<(usize, u32, u32)> = Vec::new();
-        for class in (0..decoding.len()).filter(|&class| !self.captures(class)) {
+        let cap = self.budget().max_lanes.max(1);
+        // Each lane's (class, rows).
+        let mut shapes: Vec<Vec<(usize, u32)>> = Vec::new();
+        let classes: Vec<usize> = (0..decoding.len()).filter(|&class| !self.captures(class)).collect();
+        let pow2_lanes = |most: u32| {
+            std::iter::successors(Some(1u32), |lanes| lanes.checked_mul(2))
+                .take_while(move |&lanes| lanes <= most && lanes <= cap)
+        };
+        for &class in &classes {
             if decoding[class] {
                 for bucket in self.decode_buckets() {
-                    shapes.push((class, u32::try_from(bucket).unwrap_or(u32::MAX), 1));
+                    shapes.push(vec![(class, 1); bucket]);
                 }
             }
             if prefilling[class] {
+                // Each count of rows over each power of two of lanes that
+                // holds a row each: a prefill's lanes set its readout's rows
+                // (the logits' M, by their power of two) and its attention's
+                // form (tiled or walked, by the rows a lane).
                 for &rows in &prefill_rows {
-                    shapes.push((class, 1, rows));
+                    for lanes in pow2_lanes(rows) {
+                        let each = rows / lanes;
+                        let more = rows % lanes;
+                        shapes.push((0..lanes).map(|at| (class, each + u32::from(at < more))).collect());
+                    }
                 }
             }
         }
-        shapes.sort_by_key(|&(_, lanes, rows)| (lanes * rows, std::cmp::Reverse(lanes)));
+        // A prompt beside decodes: one prefill lane and each power of two of
+        // decode lanes, at each count of rows the prefills take.
+        for &prefill in classes.iter().filter(|&&class| prefilling[class]) {
+            for &decode in classes.iter().filter(|&&class| decoding[class] && class != prefill) {
+                for &rows in &prefill_rows {
+                    // The prompt's own lane counts against the cap.
+                    for decodes in pow2_lanes(rows.saturating_sub(1).min(cap.saturating_sub(1))) {
+                        let mut lanes = vec![(prefill, rows - decodes)];
+                        lanes.extend(std::iter::repeat_n((decode, 1), decodes as usize));
+                        shapes.push(lanes);
+                    }
+                }
+            }
+        }
+        shapes.sort_by_key(|lanes| {
+            (lanes.iter().map(|&(_, rows)| rows).sum::<u32>(), std::cmp::Reverse(lanes.len()))
+        });
+        shapes.dedup();
         let page = self.pools.paging().page_size.max(1);
         let depth = self.arms.depth();
         let mut recorded = 0u64;
-        for &(class, lanes, rows) in &shapes {
+        // The allowance: what the device has left past the weights, the
+        // fire workspaces and the pool the load laid. A body takes what the
+        // driver holds for it (its command buffer and descriptor sets),
+        // measured as it is recorded; the next is recorded only while the
+        // allowance holds what the dearest so far took.
+        let allowance = self.device.left();
+        let before = self.device.outside();
+        let rss = || {
+            std::fs::read_to_string("/proc/self/statm")
+                .ok()
+                .and_then(|statm| statm.split_whitespace().nth(1)?.parse::<u64>().ok())
+                .map_or(0, |pages| pages * 4096)
+        };
+        let host_before = rss();
+        let mut dearest = 0u64;
+        for (at, lanes) in shapes.iter().enumerate() {
+            let used = self.device.outside().saturating_sub(before);
+            if used.saturating_add(dearest.saturating_mul(depth as u64)) > allowance {
+                let from = lanes.iter().map(|&(_, rows)| rows).sum::<u32>();
+                let eager: Vec<String> = shapes[at..]
+                    .iter()
+                    .map(|lanes| {
+                        format!(
+                            "{} lane(s) of classes {:?}, {} rows",
+                            lanes.len(),
+                            lanes.iter().map(|&(class, _)| class).collect::<std::collections::BTreeSet<_>>(),
+                            lanes.iter().map(|&(_, rows)| rows).sum::<u32>()
+                        )
+                    })
+                    .collect();
+                tracing::info!(
+                    allowance,
+                    used,
+                    from_rows = from,
+                    eager = ?eager,
+                    "the bodies past the allowance run eager: every fire of at least these rows"
+                );
+                self.eager_rows = Some(from);
+                break;
+            }
             for arm in 0..depth {
-                let owned = (0..lanes)
-                    .map(|_| {
+                let ahead = self.device.outside();
+                let owned = lanes
+                    .iter()
+                    .map(|&(class, rows)| {
                         let mut lane = self.naming_lane(class, rows)?;
                         lane.by_ref = Some(self.pools.walk_refs(rows.div_ceil(page).max(1))?);
                         Ok(lane)
@@ -6263,9 +6355,18 @@ impl<B: Serve> Shell<B> {
                     self.arms.give(before);
                 }
                 fired?;
+                dearest = dearest.max(self.device.outside().saturating_sub(ahead));
                 recorded += 1;
             }
         }
+        tracing::info!(
+            allowance,
+            bodies = recorded,
+            bytes = self.device.outside().saturating_sub(before),
+            host_bytes = rss().saturating_sub(host_before),
+            dearest,
+            "the recorded bodies' driver memory against the allowance"
+        );
         Ok(recorded)
     }
 
