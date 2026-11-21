@@ -284,13 +284,18 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // bodies and the guests' programs have the other half; the token budget
     // halves toward its floor until they do, and the lattice follows.
     let (free, total) = crate::store::device_memory()?;
-    let after_weights = crate::device::elastic::room_under(ceiling, free, total).saturating_sub(
-        crate::store::weight_tier_bytes(
-            &boot.trace,
-            boot.residency.resident_bytes(&boot.trace)?,
-            0,
-        )?,
-    );
+    let weight_tier = crate::store::weight_tier_bytes(
+        &boot.trace,
+        boot.residency.resident_bytes(&boot.trace)?,
+        0,
+    )?;
+    let after_weights =
+        crate::device::elastic::room_under(ceiling, free, total).saturating_sub(weight_tier);
+    // Each byte charged once: what the card holds now (this process's
+    // context and kernel modules among it; no weight has landed yet), the
+    // weight tier to come, and the driver's floor.
+    let room_line = room_line(boot.allowance, ceiling, total - free, weight_tier, after_weights);
+    eprintln!("engine-cuda: {room_line}");
     let after_weights = held_beside(boot, after_weights)?;
     let facts = kv::probe(&boot.trace)?;
     let derive_voxels = boot
@@ -409,6 +414,8 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             |rows| rows,
         );
         let counts = crate::top::counts(&boot.trace)?;
+        // A card on which no rung fits beside one sequence is refused by
+        // name, with the room it had: too small for this load as stated.
         let (top, estimate) = crate::top::choose(
             &rungs,
             after_weights,
@@ -417,7 +424,15 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             crate::top::shape(&chip)?,
             device.name(),
             &counts,
-        )?;
+        )
+        .map_err(|fault| match fault {
+            Fault::Card(why) => Fault::Card(format!(
+                "{room_line}; one sequence at {} tokens takes {} MiB beside a fire: {why}",
+                boot.context,
+                candidates.first().map_or(0, |c| c.beside) >> 20,
+            )),
+            fault => fault,
+        })?;
         // Which pricing the estimate gave the dense matmuls, said once: the
         // waves of the kernels hipBLASLt states, or the measured curve as
         // timed and why its solutions went unread.
@@ -687,6 +702,39 @@ fn host_copy(boot: &Boot<'_>, params: &[usize]) -> Result<HostCopy> {
         )));
     }
     Ok(HostCopy::Pinned)
+}
+
+/// The load's room as the fit reads it, each byte once: the ceiling the
+/// allowance sets, what the card holds now (this process's context and
+/// kernel modules, and any other process's, before a weight lands), the
+/// weight tier to come and the driver's floor, and what is left live.
+fn room_line(
+    allowance: engine::Allowance,
+    ceiling: u64,
+    in_use: u64,
+    weights: u64,
+    live: u64,
+) -> String {
+    let mib = |bytes: u64| bytes >> 20;
+    let held = match allowance.budget {
+        // The ceiling is what other holders held at the load's start plus
+        // the budget: past that, the card's bytes in use are this load's.
+        Some(budget) => format!(
+            "{} MiB of it this process's context and modules, charged to the {} MiB budget",
+            mib(in_use.saturating_sub(ceiling.saturating_sub(budget))),
+            mib(budget)
+        ),
+        None => "no budget stated".to_owned(),
+    };
+    format!(
+        "the load's room: ceiling {} MiB; the card holds {} MiB before the weights land ({held}); \
+         weight tier {} MiB; driver floor {} MiB; {} MiB live past the weights",
+        mib(ceiling),
+        mib(in_use),
+        mib(weights),
+        mib(crate::device::elastic::safety_floor_bytes()),
+        mib(live),
+    )
 }
 
 /// `room` less the banks the weight cache takes, where the card holds them
