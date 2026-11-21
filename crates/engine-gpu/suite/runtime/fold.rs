@@ -144,6 +144,7 @@ fn bind_fold(engine: &mut backend::Engine, slots: &mut Slots) -> InstanceId {
                 ..engine::program::BindExtents::default()
             },
             scratch: engine::ScratchPlace::None,
+            resident: ::engine::ScratchPlace::None,
             pair: engine::ScratchPlace::None,
             pair_generation: 0,
         },

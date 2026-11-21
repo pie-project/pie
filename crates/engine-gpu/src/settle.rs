@@ -193,10 +193,22 @@ pub struct FedLane {
 /// Reads the id at token seat row `row`.
 pub type ReadRow = Box<dyn Fn(u32) -> Option<u32> + Send + Sync>;
 
+/// A beam's fault word (`crate::beam`): its u32 word in the fire's input
+/// store, the lane it faults and its instance.
+#[derive(Debug, Clone)]
+pub struct BeamWord {
+    pub word: u32,
+    pub lane: u32,
+    pub instance: engine::InstanceId,
+}
+
 struct Fed {
     read: ReadRow,
     lanes: Vec<FedLane>,
     vocab: u32,
+    /// Reads the store's u32 word, and each beam's fault word.
+    read_word: Option<ReadRow>,
+    beams: Vec<BeamWord>,
     faults: std::sync::Mutex<Option<Vec<engine::LaneFault>>>,
     ready: std::sync::Condvar,
 }
@@ -209,6 +221,32 @@ impl FedCheck {
                 read,
                 lanes,
                 vocab,
+                read_word: None,
+                beams: Vec::new(),
+                faults: std::sync::Mutex::new(None),
+                ready: std::sync::Condvar::new(),
+            }),
+        }
+    }
+
+    /// A check of `lanes`' fed ids, as [`FedCheck::new`], and of each of
+    /// `beams`' fault words, read by `read_word`: a nonzero word faults its
+    /// lane by name (`crate::beam::fault_reason`).
+    #[must_use]
+    pub fn with_beams(
+        read: ReadRow,
+        lanes: Vec<FedLane>,
+        vocab: u32,
+        read_word: ReadRow,
+        beams: Vec<BeamWord>,
+    ) -> FedCheck {
+        FedCheck {
+            inner: Arc::new(Fed {
+                read,
+                lanes,
+                vocab,
+                read_word: Some(read_word),
+                beams,
                 faults: std::sync::Mutex::new(None),
                 ready: std::sync::Condvar::new(),
             }),
@@ -241,6 +279,17 @@ impl FedCheck {
                 };
                 tracing::warn!(row = lane.row, %why, "a device-fed token is out of range; its lanes fault");
                 outcome.fault_lanes(lane.lanes.clone(), lane.instance, &why);
+            }
+        }
+        if let Some(read_word) = fed.read_word.as_ref().filter(|_| whole) {
+            for beam in &fed.beams {
+                let code = read_word(beam.word).unwrap_or(0);
+                if code == 0 {
+                    continue;
+                }
+                let why = crate::beam::fault_reason(code, beam.lane as usize);
+                tracing::warn!(lane = beam.lane, instance = beam.instance.0, %why, "a beam lane faults");
+                outcome.fault_lanes(beam.lane..beam.lane + 1, Some(beam.instance), &why);
             }
         }
         *faults = Some(outcome.faulted);

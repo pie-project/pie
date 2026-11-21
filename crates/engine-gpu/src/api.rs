@@ -522,12 +522,26 @@ impl<B: Host> Gpu<B> {
                 .iter()
                 .filter_map(|value| Some((value.output.as_deref()?, value.lane))),
         );
+        // A beam group's state, laid for the search's depth (the bind's
+        // `key_len`, its end slot), the load's kv page and its frames in
+        // flight.
+        let beam = crate::beam::lanes_of(package)
+            .map(|lanes| {
+                crate::guest::state::BeamLayout::of(
+                    lanes,
+                    extents.key_len,
+                    shell.paging().page_size,
+                    u32::try_from(shell.frames_in_flight()).unwrap_or(u32::MAX),
+                )
+            })
+            .transpose()
+            .map_err(|why| Error::Program(format!("program {program}'s state: {why}")))?;
         crate::guest::state::GuestLayout::of_plans(
             &package.plans,
             &crate::guest::state::extents_of(extents),
             scores,
         )
-        .map(Some)
+        .map(|layout| Some(layout.with_beam(beam)))
         .map_err(|why| Error::Program(format!("program {program}'s state: {why}")))
     }
 
@@ -1377,6 +1391,18 @@ where
         self.programs.take(instance, channel).map_err(refusal)
     }
 
+    /// Beam `beam`'s page list of `instance`'s group as its last fire left
+    /// it (`BEAM-PAGE-LISTS.md` §6.6): every fire in flight lands first,
+    /// then the state's last list is read from the pool.
+    fn beam_list(&mut self, instance: InstanceId, beam: u32) -> EngineResult<Vec<u32>> {
+        let shell = self.shell.as_mut().ok_or_else(unloaded::<B>)?;
+        shell.drain().map_err(fault)?;
+        let resident = self.programs.beam_state(instance).ok_or_else(|| {
+            Error::Program(format!("instance {instance} binds no beam group (parents)"))
+        })?;
+        resident.list(shell.pools(), beam).map_err(fault)
+    }
+
     fn settles_asynchronously(&self) -> bool {
         B::settles_asynchronously(self)
     }
@@ -1704,6 +1730,56 @@ impl<B: Host> Gpu<B> {
             }
         }
 
+        // Each beam group's state, layout and parents
+        // (`crate::beam`): its lanes reorder their page lists on the device
+        // ahead of the forward. An instance that refuses faults its own
+        // lanes, which then read their staged tables (their set's pages).
+        let mut beams: Vec<crate::beam::Group<B>> = Vec::new();
+        for attachment in program_attachments(submission) {
+            let lanes = attachment_lanes(attachment);
+            let group = self
+                .loaded()
+                .map_err(|error| Refusal::Program(error.to_string()))
+                .and_then(|shell| self.programs.beam_group(attachment.instance, shell.pools()));
+            let refused = match group {
+                Ok(None) => None,
+                Ok(Some((state, layout, parents))) => {
+                    let stated: Vec<&engine::fire::Lane> = lanes
+                        .clone()
+                        .filter_map(|at| submission.lanes.get(at as usize))
+                        .collect();
+                    match stated.first() {
+                        Some(first)
+                            if stated.iter().all(|lane| {
+                                lane.reserve == first.reserve && lane.kv.folded == first.kv.folded
+                            }) && !first.reserve.is_empty() =>
+                        {
+                            beams.push(crate::beam::Group {
+                                instance: attachment.instance,
+                                state,
+                                layout,
+                                parents,
+                                lanes: lanes.clone().map(|at| at as usize).collect(),
+                                reserve: first.reserve.clone(),
+                                folded: first.kv.folded,
+                            });
+                            None
+                        }
+                        _ => Some(format!(
+                            "instance {}'s beams state no working set's reserve, or not one \
+                             set's: a beam group's lanes name one set and its whole kv table \
+                             (BEAM-PAGE-LISTS.md §2, §6.5)",
+                            attachment.instance
+                        )),
+                    }
+                }
+                Err(refused) => Some(refused.to_string()),
+            };
+            if let Some(why) = refused {
+                faulted.fault_lanes(lanes, Some(attachment.instance), &why);
+            }
+        }
+
         let mut input_cells: Vec<Vec<(engine::fire::InputFeed, crate::serve::InputCell<B>)>> =
             vec![Vec::new(); submission.lanes.len()];
         for (at, lane) in submission.lanes.iter().enumerate() {
@@ -1960,6 +2036,7 @@ impl<B: Host> Gpu<B> {
                     folds: &folds,
                     done,
                     guests,
+                    beams: &beams,
                 },
                 None,
             )
@@ -1967,9 +2044,9 @@ impl<B: Host> Gpu<B> {
             wrote = std::mem::take(&mut prepared.wrote);
             // A lane fed its token on the device is checked once the
             // forward landed, from what the forward embedded.
-            if let Some(vocab) = vocab
-                && !prepared.fed_lanes.is_empty()
+            if !prepared.beam_faults.is_empty() || (vocab.is_some() && !prepared.fed_lanes.is_empty())
             {
+                let vocab = vocab.unwrap_or(u32::MAX);
                 let lanes = prepared
                     .fed_lanes
                     .iter()
@@ -1985,10 +2062,21 @@ impl<B: Host> Gpu<B> {
                         }
                     })
                     .collect();
-                let check = crate::settle::FedCheck::new(
+                let beams = prepared
+                    .beam_faults
+                    .iter()
+                    .map(|&(word, lane, instance)| crate::settle::BeamWord {
+                        word,
+                        lane: u32::try_from(lane).unwrap_or(u32::MAX),
+                        instance,
+                    })
+                    .collect();
+                let check = crate::settle::FedCheck::with_beams(
                     shell.token_row_reader(prepared.arm),
                     lanes,
                     vocab,
+                    shell.store_word_reader(prepared.arm),
+                    beams,
                 );
                 prepared.fed_check = Some(check.clone());
                 match prepared.done.as_mut() {

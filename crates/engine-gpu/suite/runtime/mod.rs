@@ -1,4 +1,5 @@
 mod beam_stage;
+mod beam_step;
 mod bf16_values;
 mod bool_gather;
 mod bool_moves;
