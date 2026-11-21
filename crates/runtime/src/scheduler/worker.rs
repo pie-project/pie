@@ -71,6 +71,13 @@ pub(crate) fn notify_owner_waits(engine: usize, pid: ProcessId) {
     }
 }
 
+/// `pid`'s guest waits on input from outside the runtime (a session
+/// receive, a timer, an HTTP response): no frame on any engine waits on its
+/// lanes until each submits again.
+pub(crate) fn notify_owner_away(pid: ProcessId) {
+    broadcast(|| SchedulerItem::OwnerAway(pid));
+}
+
 pub(crate) fn notify_process_resume(pid: ProcessId) {
     broadcast(|| SchedulerItem::ProcessResume(pid));
 }
@@ -295,6 +302,10 @@ enum SchedulerItem {
     /// raise of the activation rung): its lanes go out of the frame
     /// ([`super::frame::FramePolicy::on_owner_waits`]).
     OwnerWaits(ProcessId),
+    /// The process's guest waits on outside input: its lanes go out of the
+    /// frame until each submits again
+    /// ([`super::frame::FramePolicy::on_owner_away`]).
+    OwnerAway(ProcessId),
     FrameTruncate {
         lane: ProcessId,
         seq: u64,
@@ -2064,6 +2075,9 @@ impl BatchScheduler {
             }
             SchedulerItem::OwnerWaits(pid) => {
                 frame_policy.on_owner_waits(pid);
+            }
+            SchedulerItem::OwnerAway(pid) => {
+                frame_policy.on_owner_away(pid);
             }
             SchedulerItem::FrameTruncate {
                 lane,

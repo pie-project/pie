@@ -124,7 +124,6 @@ struct LaneState {
     served: bool,
     retired_at: Option<Instant>,
     parked: bool,
-    leashed: bool,
     clock_from: Option<Instant>,
     frames: VecDeque<PendingFrame>,
     fired_this_boundary: bool,
@@ -247,15 +246,13 @@ pub(crate) struct FramePolicy {
     /// The rung rows a fire sealed now may take: the activation rung's cap
     /// ([`Self::cap_fires`]).
     fire_cap: usize,
-    submit_deadline: Duration,
     silence_timeout: Duration,
     stats: Option<Arc<SchedulerStats>>,
 }
 
 impl FramePolicy {
     #[cfg(test)]
-    fn with_submit_deadline(mut self, deadline: Duration) -> Self {
-        self.submit_deadline = deadline;
+    fn with_silence_timeout_off(mut self) -> Self {
         self.silence_timeout = Duration::from_secs(86_400);
         self
     }
@@ -337,7 +334,6 @@ impl FramePolicy {
             in_flight_lanes: BTreeSet::new(),
             fire_cap: usize::MAX,
             in_flight_since: BTreeMap::new(),
-            submit_deadline: crate::scheduler::configured_submit_deadline(),
             silence_timeout: crate::scheduler::configured_silence_timeout(),
             stats,
         }
@@ -434,7 +430,6 @@ impl FramePolicy {
             served: false,
             retired_at: None,
             parked: suspended,
-            leashed: false,
             clock_from: None,
             frames: VecDeque::new(),
             fired_this_boundary: true,
@@ -447,7 +442,6 @@ impl FramePolicy {
             lane.parked = false;
             lane.awaited = true;
         }
-        lane.leashed = false;
         lane.clock_from = None;
         let for_front_frame = lane
             .frames
@@ -503,7 +497,6 @@ impl FramePolicy {
             served: false,
             retired_at: None,
             parked: suspended,
-            leashed: false,
             clock_from: None,
             frames: VecDeque::new(),
             fired_this_boundary: true,
@@ -709,6 +702,16 @@ impl FramePolicy {
     /// submit ([`Self::record_arrival`]).
     pub fn on_owner_waits(&mut self, owner: ProcessId) {
         self.park_owner(owner, "owner-waits");
+    }
+
+    /// `owner`'s guest waits on input from outside the runtime: a session
+    /// receive, a timer, an HTTP response. Nothing the frame does brings
+    /// that input, so no frame waits on its lanes: they are parked, and
+    /// each comes back with its own next submit ([`Self::record_arrival`]).
+    /// A guest that computes, or waits on its own fires and channels, is
+    /// not away: its lanes stay awaited.
+    pub fn on_owner_away(&mut self, owner: ProcessId) {
+        self.park_owner(owner, "outside-wait");
     }
 
     /// Parks `owner`'s lanes: none is awaited, what arrived of an
@@ -1016,7 +1019,7 @@ impl FramePolicy {
                     continue;
                 }
                 self.lanes
-                    .retain(|_, lane| lane.awaited || lane.leashed || !lane.frames.is_empty());
+                    .retain(|_, lane| lane.awaited || !lane.frames.is_empty());
                 return None;
             }
             if trace {
@@ -1027,9 +1030,8 @@ impl FramePolicy {
                     .count();
                 let awaited = self.lanes.values().filter(|lane| lane.awaited).count();
                 let parked = self.lanes.values().filter(|lane| lane.parked).count();
-                let leashed = self.lanes.values().filter(|lane| lane.leashed).count();
                 let line = format!(
-                    "seal partition={} fresh={} continuing={} complete_left={} awaited={} parked={parked} leashed={leashed} lanes={} in_flight={} mid_boundary={mid_boundary} prompts_only={} executing={} programs={} lanes_by_program={by_program:?} rows={wave_rows:?} tokens={wave_tokens:?}",
+                    "seal partition={} fresh={} continuing={} complete_left={} awaited={} parked={parked} lanes={} in_flight={} mid_boundary={mid_boundary} prompts_only={} executing={} programs={} lanes_by_program={by_program:?} rows={wave_rows:?} tokens={wave_tokens:?}",
                     members.len(),
                     fresh.len(),
                     continuing.len(),
@@ -1066,7 +1068,7 @@ impl FramePolicy {
                 widest: sealed_widest,
             });
             self.lanes
-                .retain(|_, lane| lane.awaited || lane.leashed || !lane.frames.is_empty());
+                .retain(|_, lane| lane.awaited || !lane.frames.is_empty());
             return Some(FramePlan::Dispatch(Vec::new()));
         }
     }
@@ -1256,7 +1258,6 @@ ready_age_newest={}us",
             let mut missing = 0;
             let mut blocking_lanes: Vec<(ProcessId, bool, bool)> = Vec::new();
             let mut expired: Vec<ProcessId> = Vec::new();
-            let leash = self.submit_deadline;
             let silence = self.silence_timeout;
             debug_assert!(
                 !self.boundary_open(),
@@ -1278,7 +1279,7 @@ ready_age_newest={}us",
                     GateVerdict::Blocking => true,
                     GateVerdict::SkippedOwed | GateVerdict::Satisfied => false,
                 };
-                if !blocking && !lane.leashed {
+                if !blocking {
                     lane.clock_from = None;
                     continue;
                 }
@@ -1292,16 +1293,8 @@ ready_age_newest={}us",
                         Some(from) if now.saturating_duration_since(from) >= silence => {
                             trace_unawait("silence", *lane_id, lane.owner);
                             lane.awaited = false;
-                            lane.leashed = false;
                             lane.clock_from = None;
                             expired.push(lane.owner.unwrap_or(*lane_id));
-                            continue;
-                        }
-                        Some(from) if blocking && now.saturating_duration_since(from) >= leash => {
-                            trace_unawait("leash", *lane_id, lane.owner);
-                            lane.awaited = false;
-                            lane.parked = true;
-                            lane.leashed = true;
                             continue;
                         }
                         Some(_) => {}
@@ -1715,6 +1708,7 @@ mod tests {
         a_wave_reads_out_no_more_than_the_engine_carves();
         a_policys_bound_packs_prompts_into_a_frame_up_to_it_and_no_further();
         a_frame_goes_without_a_lane_whose_process_waits();
+        a_lane_whose_guest_waits_on_the_outside_holds_no_frame_and_rejoins_on_its_submit();
         a_prompt_piece_cut_under_a_cap_since_lowered_waits_whole_and_owes_nothing();
     }
 
@@ -1726,7 +1720,7 @@ mod tests {
     /// lowered under it until it has.
     fn a_prompt_piece_cut_under_a_cap_since_lowered_waits_whole_and_owes_nothing() {
         let mut policy =
-            FramePolicy::new(1, 64, 4096, None).with_submit_deadline(Duration::from_secs(86_400));
+            FramePolicy::new(1, 64, 4096, None).with_silence_timeout_off();
         let (prompt, decode) = (pid(), pid());
         policy.cap_fires(128);
         // The prompt's first piece (64 rows) and a decode, one frame.
@@ -1761,15 +1755,76 @@ mod tests {
         assert_eq!(fires(&plan(&mut policy, &queued, Instant::now())), vec![3]);
     }
 
+    /// A guest blocked on input from outside (a session receive, a timer,
+    /// an HTTP response) is parked by the host: the frames go without its
+    /// lane, a frame it submitted before it blocked still goes, and its
+    /// next submit brings the lane back, awaited like any other.
+    fn a_lane_whose_guest_waits_on_the_outside_holds_no_frame_and_rejoins_on_its_submit() {
+        let mut policy = FramePolicy::new(1, 64, 4096, None).with_silence_timeout_off();
+        let (runner, receiver) = (pid(), pid());
+        policy.on_fire_enqueued(stamp(runner, 0, 0, 1), Some(runner), 1, 1, 1);
+        policy.on_fire_enqueued(stamp(receiver, 0, 0, 1), Some(receiver), 2, 1, 1);
+        let queued: QueuedFireIds = [1, 2].into_iter().collect();
+        assert_eq!(fires(&plan(&mut policy, &queued, Instant::now())).len(), 2);
+        policy.on_frame_retired([runner, receiver]);
+
+        // The receiver runs a frame ahead, then its guest blocks on a
+        // session receive; the frame it submitted still goes.
+        policy.on_fire_enqueued(stamp(receiver, 1, 0, 1), Some(receiver), 3, 1, 1);
+        policy.on_owner_away(receiver);
+        policy.on_fire_enqueued(stamp(runner, 1, 0, 1), Some(runner), 4, 1, 1);
+        let queued: QueuedFireIds = [3, 4].into_iter().collect();
+        let mut both = fires(&plan(&mut policy, &queued, Instant::now()));
+        both.sort_unstable();
+        assert_eq!(both, vec![3, 4], "what it submitted before it blocked goes");
+        policy.on_frame_retired([runner, receiver]);
+
+        // The runner submits: the frame goes without the waiting receiver.
+        policy.on_fire_enqueued(stamp(runner, 2, 0, 1), Some(runner), 5, 1, 1);
+        let queued: QueuedFireIds = [5].into_iter().collect();
+        assert_eq!(
+            fires(&plan(&mut policy, &queued, Instant::now())),
+            vec![5],
+            "the frame goes without the lane whose guest waits on the outside"
+        );
+        policy.on_frame_retired([runner]);
+        // It stays out while it waits: the runner's frames go alone.
+        policy.on_fire_enqueued(stamp(runner, 3, 0, 1), Some(runner), 6, 1, 1);
+        let queued: QueuedFireIds = [6].into_iter().collect();
+        assert_eq!(fires(&plan(&mut policy, &queued, Instant::now())), vec![6]);
+        policy.on_frame_retired([runner]);
+
+        // The message comes; its guest submits: awaited again.
+        policy.on_fire_enqueued(stamp(receiver, 2, 0, 1), Some(receiver), 7, 1, 1);
+        let queued: QueuedFireIds = [7].into_iter().collect();
+        assert!(
+            matches!(plan(&mut policy, &queued, Instant::now()), FramePlan::Hold(_)),
+            "back, it waits for the runner, which is awaited"
+        );
+        policy.on_fire_enqueued(stamp(runner, 4, 0, 1), Some(runner), 8, 1, 1);
+        let queued: QueuedFireIds = [7, 8].into_iter().collect();
+        let mut both = fires(&plan(&mut policy, &queued, Instant::now()));
+        both.sort_unstable();
+        assert_eq!(both, vec![7, 8], "it rides the next frame");
+        policy.on_frame_retired([runner, receiver]);
+
+        // Computing again, it is awaited again.
+        policy.on_fire_enqueued(stamp(runner, 5, 0, 1), Some(runner), 9, 1, 1);
+        let queued: QueuedFireIds = [9].into_iter().collect();
+        assert!(
+            matches!(plan(&mut policy, &queued, Instant::now()), FramePlan::Hold(_)),
+            "its lane is awaited while its guest computes"
+        );
+    }
+
     /// A process whose bind found no room for its guest state (or whose
     /// pass waits for a raise of the activation rung) submits nothing
     /// until it is through: the frame its lane was awaited in
     /// goes without it (the soak's 56-lane frame held 6 minutes on one
-    /// process stuck at bind, its bind re-asked so often the leash never
-    /// ran out). Its next submit brings the lane back.
+    /// process stuck at bind). Its next submit brings the lane back.
     fn a_frame_goes_without_a_lane_whose_process_waits() {
         let mut policy =
-            FramePolicy::new(1, 64, 4096, None).with_submit_deadline(Duration::from_secs(86_400));
+            FramePolicy::new(1, 64, 4096, None).with_silence_timeout_off();
         let (runner, binder) = (pid(), pid());
         policy.on_fire_enqueued(stamp(runner, 0, 0, 1), Some(runner), 1, 1, 1);
         policy.on_fire_enqueued(stamp(binder, 0, 0, 1), Some(binder), 2, 1, 1);
@@ -2015,7 +2070,7 @@ mod tests {
 
     fn incomplete_lane_holds_the_seal_until_it_completes() {
         let mut policy =
-            FramePolicy::new(2, 64, 4096, None).with_submit_deadline(Duration::from_secs(86_400));
+            FramePolicy::new(2, 64, 4096, None).with_silence_timeout_off();
         let (fast, slow) = (pid(), pid());
         policy.on_fire_enqueued(stamp(fast, 0, 0, 2), Some(fast), 1, 1, 1);
         policy.on_fire_enqueued(stamp(fast, 0, 1, 2), Some(fast), 2, 1, 1);

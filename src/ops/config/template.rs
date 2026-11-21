@@ -96,7 +96,6 @@ const RUNTIME: &str = r#"
 [runtime]
 # Batching and timeouts. Every default here is measured; `pie config list`
 # carries the reasoning.
-# submit_deadline          = "50ms"
 # silence_timeout          = "30s"
 "#;
 
