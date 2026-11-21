@@ -91,19 +91,12 @@ impl SlotFile {
         Ok(Some((file, stride, slots)))
     }
 
+    /// The file's length set, sparse: its budget is a ceiling, its blocks
+    /// written as slots are, never reserved up front (a tier derived to all
+    /// the free disk left none for logs or other processes). A write that
+    /// finds the disk full fails that copy by name.
     fn reserve(file: &File, slots: u32, stride: usize) -> io::Result<()> {
-        let len = u64::from(slots) * stride as u64;
-        file.set_len(len)?;
-        // APFS copies on write: a page written lands in new blocks and the
-        // preallocated ones stay reserved, so preallocating there doubles
-        // the file's footprint instead of guaranteeing it.
-        #[cfg(all(unix, not(target_vendor = "apple")))]
-        if let Err(error) = rustix::fs::fallocate(file, rustix::fs::FallocateFlags::empty(), 0, len)
-            && error != rustix::io::Errno::OPNOTSUPP
-        {
-            return Err(error.into());
-        }
-        Ok(())
+        file.set_len(u64::from(slots) * stride as u64)
     }
 }
 

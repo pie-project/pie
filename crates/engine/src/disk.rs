@@ -165,6 +165,14 @@ pub fn derived_budget(
         .saturating_mul(slot(state_bytes))
         .saturating_add(seat_pages.saturating_mul(slot(page_bytes)))
         .saturating_add(slot(guest_bytes));
+    if wanted > free {
+        // A capacity fact, said at load: what can be parked needs more disk
+        // than is free; the tier is seated to the free space, sparse.
+        eprintln!(
+            "engine: the disk tier's parkable need, {wanted} bytes, is past the {free} bytes free \
+             on its disk: seated at {free} bytes, written as it is used"
+        );
+    }
     wanted.min(free)
 }
 
