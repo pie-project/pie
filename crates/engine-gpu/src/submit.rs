@@ -30,8 +30,9 @@
 //!   over its next rows, the most a piece is admitted at
 //!   ([`SubmitBound::rows_a_piece`]), each split by layer in turn; only a
 //!   step one row of one layer of which is past the bound, or one that
-//!   cannot be cut (a mask, media, recurrent state, more than one prompt
-//!   lane), is refused by name, naming the bound and the estimate. The load lowers the rows a prefill fire takes
+//!   cannot be cut (a mask, media, guest inputs, a device-counted fold,
+//!   more than one prompt lane), is refused by name, naming the bound and
+//!   the estimate. A recurrent lane's state carries piece to piece. The load lowers the rows a prefill fire takes
 //!   (`FireLimits::prefill_rows`) to the widest laid rung whose prompt step at
 //!   the load's context is admitted ([`SubmitBound::prefill_rows`]), so a
 //!   prompt is cut to steps that fit; a step refused past that is one no rung
@@ -839,19 +840,36 @@ impl SubmitBound {
 /// a piece would not carry as the whole lane does. `None` where it can be.
 fn uncuttable(lane: &engine::fire::Lane, facts: &poem_ir::Facts) -> Option<&'static str> {
     use poem_ir::Builtin;
-    let checks: [(bool, &'static str); 12] = [
+    let device_fold = matches!(
+        lane.rs,
+        engine::fire::RsVerb::Buffer {
+            fold: engine::fire::FoldLen::Device,
+            ..
+        }
+    );
+    let admitted = matches!(
+        lane.rs,
+        engine::fire::RsVerb::Buffer {
+            lineage: engine::fire::Lineage::Admitted,
+            ..
+        }
+    );
+    let checks: [(bool, &'static str); 9] = [
         (lane.kv_less, "it holds no kv slots"),
         (lane.mask.is_some(), "it states a mask"),
         (!lane.inputs.is_empty(), "it feeds guest inputs"),
         (lane.tap.is_some(), "it taps its rows"),
-        (lane.rs != engine::fire::RsVerb::default(), "it carries a recurrent verb"),
-        (lane.rs_reset != engine::fire::RsReset::default(), "it resets recurrent state"),
-        (!lane.rs_snapshots.is_empty(), "it snapshots recurrent state"),
-        (lane.reports != 0, "it asks fold reports"),
-        (!lane.slot_copies.is_empty(), "it copies slots"),
+        (lane.reports != 0, "it asks its fold reported"),
         (
-            lane.list != engine::fire::ListKind::default()
-                || lane.record != engine::fire::LaneRecord::default(),
+            device_fold,
+            "its recurrent buffer folds as far as its program says, which no piece knows",
+        ),
+        (
+            admitted,
+            "its recurrence replays the slots its mask admits, shared with other lanes",
+        ),
+        (
+            lane.list != engine::fire::ListKind::default(),
             "its program places its rows",
         ),
         (
@@ -860,22 +878,50 @@ fn uncuttable(lane: &engine::fire::Lane, facts: &poem_ir::Facts) -> Option<&'sta
                 .any(|&b| facts.holds(lane.word, b)),
             "its class reads its whole rows (a mask, media, drafts, scores or an encoder)",
         ),
-        (facts.holds(lane.word, Builtin::Fresh), "it starts recurrent state"),
     ];
     checks.iter().find(|(holds, _)| *holds).map(|&(_, why)| why)
 }
 
 /// `step` cut so its one prompt lane runs at most `rows` rows a piece: the
-/// leading pieces, each that lane alone over its next `rows` rows (no
-/// attachment, nothing read out: a piece's keys land and its successor
-/// reads them), in order, and `step` with that lane's last piece in its
-/// place, its attachments and readout as stated (a readout row shifted to
-/// the piece). `Err` names why it cannot be cut.
+/// leading pieces, each that lane alone over its next `rows` rows, and the
+/// step with that lane's last piece in its place ([`split_rows`], over and
+/// over). `Err` names why it cannot be cut.
 pub fn row_pieces(
     step: &engine::fire::Step,
     facts: &poem_ir::Facts,
     rows: u32,
 ) -> Result<(Vec<engine::fire::Step>, engine::fire::Step), String> {
+    let mut leading = Vec::new();
+    let mut rest = step.clone();
+    while prompt_rows(&rest) > rows.max(1) {
+        let (piece, after) = split_rows(&rest, facts, rows)?;
+        leading.push(piece);
+        rest = after;
+    }
+    Ok((leading, rest))
+}
+
+/// The rows of `step`'s widest lane: its one prompt lane's where it has one.
+#[must_use]
+pub fn prompt_rows(step: &engine::fire::Step) -> u32 {
+    step.lanes.iter().map(engine::fire::Lane::rows).max().unwrap_or(0)
+}
+
+/// `step`'s one prompt lane's first `rows` rows split off: that lane alone
+/// over them (no attachment, nothing read out: its keys land and the rest
+/// reads them), and `step` with the lane's rows past them in its place, its
+/// attachments and readout as stated (a readout row shifted). A recurrent
+/// lane's state carries on, as a prompt chunked across fires carries it:
+/// the first piece starts it as stated, the rest from what the first
+/// folded (`RsReset::Held`, no fresh class bit, no slot copy again, a
+/// forked record its own); a recurrent buffer's host fold is cut where the
+/// first piece's rows reach it, and each snapshot lands in the piece that
+/// reaches its row. `Err` names why it cannot be split there.
+pub fn split_rows(
+    step: &engine::fire::Step,
+    facts: &poem_ir::Facts,
+    rows: u32,
+) -> Result<(engine::fire::Step, engine::fire::Step), String> {
     use engine::fire::Readout;
     let prompts: Vec<usize> = (0..step.lanes.len())
         .filter(|&at| step.lanes[at].rows() > 1)
@@ -894,20 +940,29 @@ pub fn row_pieces(
         return Err(format!("its prompt lane cannot be cut by rows: {why}"));
     }
     let total = lane.rows();
-    let rows = rows.clamp(1, total);
-    let pieces = total.div_ceil(rows);
-    let last_at = (pieces - 1) * rows;
+    let rows = rows.clamp(1, total - 1);
     let readout = match &lane.readout {
         Readout::Last => Readout::Last,
         Readout::None => Readout::None,
         Readout::Rows(read) => {
-            if read.iter().any(|&row| row < last_at) {
+            if read.iter().any(|&row| row < rows) {
                 return Err(format!(
-                    "its prompt lane reads out a row before its last piece's (from row {last_at})"
+                    "its prompt lane reads out a row before its last piece's (from row {rows})"
                 ));
             }
-            Readout::Rows(read.iter().map(|&row| row - last_at).collect())
+            Readout::Rows(read.iter().map(|&row| row - rows).collect())
         }
+    };
+    // A recurrent buffer folding `fold` slots past where its record stands
+    // (`folded`): the first piece folds what of that its rows reach, so the
+    // rest replays no more than the whole fire would have left buffered.
+    let target = match &lane.rs {
+        engine::fire::RsVerb::Buffer {
+            folded,
+            fold: engine::fire::FoldLen::Host(fold),
+            ..
+        } => Some((*folded, folded + fold)),
+        _ => None,
     };
     let piece = |from: u32, to: u32, readout: Readout| {
         let mut piece = lane.clone();
@@ -917,23 +972,57 @@ pub fn row_pieces(
             piece.positions = lane.positions[a..b].to_vec();
         }
         piece.kv.held = lane.kv.held + from;
-        // What the pieces before wrote is written as this one stages.
+        // What the piece before wrote is written as this one stages.
         piece.kv.readable = lane.kv.readable.max(lane.kv.held + from);
         piece.readout = readout;
         piece.word = facts.with(lane.word, poem_ir::Builtin::SingleToken, to - from == 1);
+        if from > 0 {
+            // The recurrent state the piece before folded carries on: this
+            // one starts from it, not from zeros, and copies nothing more
+            // into it.
+            piece.rs_reset = engine::fire::RsReset::Held;
+            piece.word = facts.with(piece.word, poem_ir::Builtin::Fresh, false);
+            piece.slot_copies = Vec::new();
+            // A record the first piece copied onto its own (`cow != run`, a
+            // fork) is that one from there on.
+            if let engine::fire::LaneRecord::Pieces(pieces) = &mut piece.record {
+                for (_, refs) in pieces.iter_mut() {
+                    for pair in refs.iter_mut() {
+                        pair[0] = pair[1];
+                    }
+                }
+            }
+        }
+        // Each snapshot in the piece whose rows reach it, at its row there.
+        piece.rs_snapshots = lane
+            .rs_snapshots
+            .iter()
+            .filter(|snap| (snap.row > from || (from == 0 && snap.row == 0)) && snap.row <= to)
+            .map(|snap| engine::fire::RsSnapshot {
+                row: snap.row - from,
+                ..snap.clone()
+            })
+            .collect();
+        if let (Some((stands, target)), engine::fire::RsVerb::Buffer { folded, fold, .. }) =
+            (target, &mut piece.rs)
+        {
+            // Where the first piece leaves the record standing.
+            let first = target.min(lane.kv.held + rows).max(stands);
+            let (from_row, to_row) = if from == 0 { (stands, first) } else { (first, target) };
+            *folded = from_row;
+            *fold = engine::fire::FoldLen::Host(to_row.saturating_sub(from_row));
+        }
         piece
     };
-    let leading = (0..pieces - 1)
-        .map(|k| engine::fire::Step {
-            lanes: vec![piece(k * rows, (k + 1) * rows, Readout::None)],
-            attachments: Vec::new(),
-            media: Vec::new(),
-            voxels: Vec::new(),
-        })
-        .collect();
-    let mut last = step.clone();
-    last.lanes[at] = piece(last_at, total, readout);
-    Ok((leading, last))
+    let first = engine::fire::Step {
+        lanes: vec![piece(0, rows, Readout::None)],
+        attachments: Vec::new(),
+        media: Vec::new(),
+        voxels: Vec::new(),
+    };
+    let mut rest = step.clone();
+    rest.lanes[at] = piece(rows, total, readout);
+    Ok((first, rest))
 }
 
 /// The model's layers: the distinct layers its nodes state.
@@ -1368,6 +1457,97 @@ mod tests {
         let mut masked = step.clone();
         masked.lanes[1].word = facts.with(0, poem_ir::Builtin::Masked, true);
         assert!(row_pieces(&masked, &facts, 4).unwrap_err().contains("cannot be cut"));
+    }
+
+    /// A recurrent lane cut into pieces carries its state piece to piece:
+    /// the first piece starts it as stated (fresh, its slot copy), each
+    /// after from what the pieces before folded; each snapshot lands in the
+    /// piece that reaches its row; a recurrent buffer's host fold is cut
+    /// where each piece's rows reach it; a record the first piece copies
+    /// (a fork) is its own after. A device-counted fold, or a recurrence
+    /// shared with other lanes, is not cut.
+    #[test]
+    fn a_recurrent_lane_cut_into_pieces_carries_its_state() {
+        use engine::fire::{FoldLen, Lane, Lineage, Readout, RsReset, RsSnapshot, RsVerb, Step};
+        let mut facts = poem_ir::Facts::default();
+        let _ = facts.builtin(poem_ir::Builtin::SingleToken);
+        let _ = facts.builtin(poem_ir::Builtin::Fresh);
+        let snap = |row: u32, slot: u32| RsSnapshot {
+            row,
+            slot,
+            pieces: Vec::new(),
+            fixed: Vec::new(),
+        };
+        let lane = Lane {
+            slot: 0,
+            word: facts.with(0, poem_ir::Builtin::Fresh, true),
+            tokens: (0..10).collect(),
+            readout: Readout::Last,
+            rs_reset: RsReset::Fresh,
+            rs_snapshots: vec![snap(3, 7), snap(9, 8)],
+            slot_copies: vec![(engine::chunk::ShapeId(1), vec![[1, 2]])],
+            record: engine::fire::LaneRecord::Pieces(vec![(
+                engine::chunk::ShapeId(2),
+                vec![[30, 31], [32, 32]],
+            )]),
+            ..Lane::default()
+        };
+        let step = |lane: Lane| Step {
+            lanes: vec![lane],
+            attachments: Vec::new(),
+            media: Vec::new(),
+            voxels: Vec::new(),
+        };
+        let (leading, last) = row_pieces(&step(lane.clone()), &facts, 4).expect("cut");
+        let pieces: Vec<&Lane> = leading.iter().map(|s| &s.lanes[0]).chain([&last.lanes[0]]).collect();
+        assert_eq!(pieces.len(), 3);
+        assert_eq!(pieces[0].rs_reset, RsReset::Fresh);
+        assert!(facts.holds(pieces[0].word, poem_ir::Builtin::Fresh));
+        assert_eq!(pieces[0].slot_copies, lane.slot_copies);
+        assert_eq!(pieces[0].rs_snapshots, vec![snap(3, 7)]);
+        for piece in &pieces[1..] {
+            assert_eq!(piece.rs_reset, RsReset::Held);
+            assert!(!facts.holds(piece.word, poem_ir::Builtin::Fresh));
+            assert!(piece.slot_copies.is_empty());
+        }
+        assert!(pieces[1].rs_snapshots.is_empty());
+        // The fork's copy at the first piece; its own record after.
+        assert_eq!(pieces[0].record, lane.record);
+        let own = engine::fire::LaneRecord::Pieces(vec![(
+            engine::chunk::ShapeId(2),
+            vec![[31, 31], [32, 32]],
+        )]);
+        assert!(pieces[1..].iter().all(|piece| piece.record == own));
+        assert_eq!(pieces[2].rs_snapshots, vec![snap(1, 8)]);
+        // A buffer standing at 2 that folds 8: 2..6, 6..10, nothing after.
+        let buffer = |fold: FoldLen, lineage: Lineage| RsVerb::Buffer {
+            pages: vec![3, 4],
+            base: 0,
+            folded: 2,
+            fold,
+            lineage,
+        };
+        let mut buffered = lane.clone();
+        buffered.kv.held = 2;
+        buffered.rs = buffer(FoldLen::Host(8), Lineage::Set);
+        let (leading, last) = row_pieces(&step(buffered.clone()), &facts, 4).expect("cut");
+        let folds: Vec<(u32, FoldLen)> = leading
+            .iter()
+            .map(|s| &s.lanes[0])
+            .chain([&last.lanes[0]])
+            .map(|piece| match &piece.rs {
+                RsVerb::Buffer { folded, fold, .. } => (*folded, *fold),
+                RsVerb::Fold => panic!("a buffer stays a buffer"),
+            })
+            .collect();
+        assert_eq!(
+            folds,
+            vec![(2, FoldLen::Host(4)), (6, FoldLen::Host(4)), (10, FoldLen::Host(0))]
+        );
+        buffered.rs = buffer(FoldLen::Device, Lineage::Set);
+        assert!(row_pieces(&step(buffered.clone()), &facts, 4).unwrap_err().contains("program says"));
+        buffered.rs = buffer(FoldLen::Host(8), Lineage::Admitted);
+        assert!(row_pieces(&step(buffered), &facts, 4).unwrap_err().contains("shared"));
     }
 
     /// A fire's device time reads nothing until its backend fills it, then

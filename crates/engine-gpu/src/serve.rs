@@ -3752,6 +3752,21 @@ impl<B: Serve> Shell<B> {
         self.submit_bound.as_ref()
     }
 
+    /// For a test: the stated bound restated at `bound_ns`, every estimate
+    /// read at the ratio the rates step measured alone from here (no probe
+    /// re-times the clock, nothing measured kept), so a test admits a step
+    /// at a ratio it knows. A load whose boot states no bound is left as it
+    /// is.
+    #[doc(hidden)]
+    pub fn hold_to(&mut self, bound_ns: f64) {
+        if let Some(held) = self.submit_bound.as_mut() {
+            held.bound_ns = bound_ns;
+            held.scale = 1.0;
+            held.measured = crate::submit::Measured::default();
+            self.probe = None;
+        }
+    }
+
     /// Under a stated submit bound, re-times the device's clock where frame
     /// `frame` follows an idle device: where the device's queue is empty as
     /// its first step goes out (every submission made on it so far landed,
@@ -3858,7 +3873,18 @@ impl<B: Serve> Shell<B> {
             None => true,
             Some(None) => false,
             Some(Some(ns)) => {
-                let ratio = held.landed(now, estimate.ns, ns, estimate.hz);
+                // A step that went out a layer at a time spans the host's
+                // encoding between its submissions too (a desktop GPU's
+                // 0.5 ms layers ran ~10x their estimate so): its time is
+                // said, its ratio not kept. A step in one submission, the
+                // decodes and every prompt piece that fits whole, keeps
+                // the device's own.
+                let ratio = if estimate.pieces > 1 {
+                    held.age(now);
+                    None
+                } else {
+                    held.landed(now, estimate.ns, ns, estimate.hz)
+                };
                 // Each fire's device time against its estimate, at debug
                 // (its fields computed only where it is enabled).
                 tracing::debug!(
