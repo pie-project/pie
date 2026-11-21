@@ -274,7 +274,17 @@ pub fn gated_delta_carried(
             ),
         ));
     }
-    let blocks = tiles.div_ceil(warps).min(sms * per_sm);
+    // A splitting fire (room given: some lane carries more than a chunk)
+    // launches every block the device seats with the carried step's shared
+    // memory, so a unit whose rows run long takes the blocks the units
+    // leave idle; any other fire a block a unit at most.
+    let carried_smem = fused_smem(warps) + CARRIED_ROWS_SMEM + BLOCK_RESERVED;
+    let resident = ctx
+        .smem_per_sm()
+        .map_or(per_sm, |bytes| (bytes / carried_smem).clamp(1, per_sm));
+    let seats = sms * resident;
+    let split_room = carry.split != 0 && u64::from(seats) * CARRY_SPLIT_BYTES_PER_BLOCK <= carry_split_bytes(sms);
+    let blocks = if split_room { seats } else { tiles.div_ceil(warps).min(seats) };
     let entrypoint = if warps == FUSED_WARPS_WIDE {
         "::pie::ssm::gdn_step_carried<8>"
     } else {
@@ -456,4 +466,12 @@ pub fn gated_delta_fold(
             stated(OP, groups)?.arg(),
         ],
     )
+}
+
+/// The bytes the room to split a decode step's carried rows takes on a
+/// device of `sms` multiprocessors: [`CARRY_SPLIT_BYTES_PER_BLOCK`] a block of
+/// a grid of every block it seats, at most eight a multiprocessor.
+#[must_use]
+pub fn carry_split_bytes(sms: u32) -> u64 {
+    u64::from(sms) * 8 * CARRY_SPLIT_BYTES_PER_BLOCK
 }

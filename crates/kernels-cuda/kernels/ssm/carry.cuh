@@ -46,6 +46,10 @@ struct Carry {
     u64 plane_stride[4];
     u32 page_tokens;
     u32 pad_;
+    // A decode step's room to split a lane's carried rows across blocks:
+    // a counter a unit, then each part's partial sums (`gdn_step_carried`);
+    // null where the step splits none.
+    unsigned char* split;
 
     __device__ __forceinline__ CarryLane lane(int rl) const {
         if (lanes == nullptr) return CarryLane{CARRY_NONE, 0u, 0u, 0u, 0u};

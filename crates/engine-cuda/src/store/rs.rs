@@ -141,6 +141,10 @@ pub struct Buffers {
     /// Where each buffered layer's run starts in a page's slot.
     rows: Vec<u64>,
     ext_row_bytes: u64,
+    /// The room a gated-delta decode step splits a lane's carried rows in
+    /// (`kernels_cuda::ssm::carry_split_bytes`), zeroed at the load: its
+    /// counters return to zero after each step.
+    split: Option<crate::device::Buffer>,
 }
 
 impl Buffers {
@@ -208,6 +212,12 @@ impl Buffers {
         }
         let ext_row_bytes = ext_row_bytes(trace)?;
         let reach = RsScratch::need(Self::rows_ext(max_rows), ext_row_bytes);
+        #[cfg(feature = "cuda")]
+        let split = kernels_cuda::linear::gemm::multiprocessors()
+            .map(|sms| crate::device::Buffer::zeroed(kernels_cuda::ssm::carry_split_bytes(sms) as usize))
+            .transpose()?;
+        #[cfg(not(feature = "cuda"))]
+        let split = None;
         Ok(Some(Buffers {
             scratch: Scratch {
                 at: 0,
@@ -218,6 +228,7 @@ impl Buffers {
             tokens,
             rows,
             ext_row_bytes,
+            split,
         }))
     }
 }
@@ -803,6 +814,12 @@ impl Buffers {
     #[must_use]
     pub fn ext_row_bytes(&self) -> u64 {
         self.ext_row_bytes
+    }
+
+    /// Where a decode step splits a lane's carried rows (0: it splits none).
+    #[must_use]
+    pub fn split_room(&self) -> u64 {
+        self.split.as_ref().map_or(0, crate::device::Buffer::ptr)
     }
 
     /// The rows an rs buffer page holds.

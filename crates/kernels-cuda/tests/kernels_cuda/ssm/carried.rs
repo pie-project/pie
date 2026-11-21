@@ -18,18 +18,24 @@ struct Page {
     base: u64,
     offs: Vec<u64>,
     strides: Vec<u64>,
+    tokens: u32,
 }
 
 impl Page {
     /// The page, plane `fill.0`'s rows from `fill.1` (bf16 words, a row
     /// after another), the rest zero.
     fn new(gpu: &mut Gpu, bytes: &[u64], fill: Option<(usize, &[u16])>) -> Self {
+        Self::of(gpu, bytes, fill, PAGE)
+    }
+
+    /// [`Page::new`] of `tokens` rows.
+    fn of(gpu: &mut Gpu, bytes: &[u64], fill: Option<(usize, &[u16])>, tokens: u32) -> Self {
         let strides: Vec<u64> = bytes.iter().map(|b| b.next_multiple_of(16)).collect();
         let mut offs = Vec::new();
         let mut at = 0u64;
         for s in &strides {
             offs.push(at);
-            at += s * u64::from(PAGE);
+            at += s * u64::from(tokens);
         }
         let mut words = vec![0u16; at as usize / 2];
         if let Some((plane, rows)) = fill {
@@ -43,6 +49,7 @@ impl Page {
             base: gpu.up(&words),
             offs,
             strides,
+            tokens,
         }
     }
 
@@ -58,7 +65,7 @@ impl Page {
             pages: gpu.up(&[self.base]),
             replay_tok: gpu.up(&(0..replay.max(1)).collect::<Vec<u32>>()),
             commit_len: gpu.up(&[commit]),
-            page_tokens: PAGE,
+            page_tokens: self.tokens,
             ..Carry::NONE
         };
         for (p, (&off, &stride)) in self.offs.iter().zip(&self.strides).enumerate() {
@@ -536,4 +543,97 @@ fn a_gated_delta_group_fold_leaves_the_plain_decodes_state() {
     .expect("an empty fold fires");
     gpu.sync();
     assert_eq!(gpu.down::<u16>(slab, stride), seed, "an empty table folds nothing");
+}
+
+/// A gated-delta decode carrying rows that span several chunks, on a grid
+/// with idle blocks (one lane), splits its carried rows across them
+/// (`Carry::split`): each row's output and landed `u` answer the unsplit
+/// step's within f32 rounding of the reordered sums, and the state it
+/// commits is the unsplit step's.
+#[test]
+fn a_gated_delta_decode_splitting_its_carried_rows_answers_the_whole_one() {
+    const KH: u32 = 2;
+    const VH: u32 = 4;
+    const KD: u32 = 128;
+    const VD: u32 = 128;
+    const T: usize = 72;
+    let conv_dim = (2 * KH * KD + VH * VD) as usize;
+    let stride = (VH * KD * VD) as usize;
+    let mut gpu = Gpu::open();
+    let mut lcg = Lcg::seeded(0x5911);
+    let (qkv_raw, _) = lcg.row(T * conv_dim);
+    let qkv = gpu.up(&qkv_raw);
+    let (ba_raw, _) = lcg.row(T * 2 * VH as usize);
+    let ba = gpu.up(&ba_raw);
+    let dt_bias: Vec<u16> = (0..VH).map(|_| to_bf16(0.1 * lcg.unit())).collect();
+    let a_log: Vec<f32> = (0..VH).map(|_| -0.5 + 0.2 * lcg.unit()).collect();
+    let (dt_bias, a_log) = (gpu.up(&dt_bias), gpu.up(&a_log));
+    let dt_t = Tensor::new(dt_bias, 1, VH, Dtype::Bf16);
+    let a_t = Tensor::new(a_log, 1, VH, Dtype::F32);
+    let seed: Vec<u16> = (0..stride).map(|_| to_bf16(0.05 * lcg.unit())).collect();
+    let slots = gpu.up(&[0i32]);
+    let bf16_pool = |slab: u64| RecurrentPool {
+        slab: Tensor::new(slab, 1, stride as u32, Dtype::Bf16),
+        ..pool(slab, stride, slots)
+    };
+    let row = |base: u64, j: usize, width: usize, elem: usize| base + (j * width * elem) as u64;
+    let gates = gpu.zeros(T * 2 * VH as usize * 4);
+    for j in 0..T {
+        ssm::gdn_gates(
+            &gpu.ctx(),
+            Tensor::new(row(ba, j, 2 * VH as usize, 2), 1, 2 * VH, Dtype::Bf16),
+            dt_t,
+            a_t,
+            &mut Tensor::new(row(gates, j, 2 * VH as usize, 4), 1, 2 * VH, Dtype::F32),
+        )
+        .expect("the gates fire");
+    }
+    let width = (KH * KD) as usize;
+    let keys: Vec<u16> = (0..T)
+        .flat_map(|j| qkv_raw[j * conv_dim + width..j * conv_dim + 2 * width].to_vec())
+        .collect();
+    let planes = [2 * u64::from(VH) * 2, width as u64 * 2, u64::from(VH * VD) * 4];
+    let sms = gpu.ctx().multiprocessors().unwrap_or(1);
+    let room = gpu.zeros(ssm::carry_split_bytes(sms) as usize);
+    let run = |gpu: &mut Gpu, split: u64| {
+        let page = Page::of(gpu, &planes, Some((1, &keys)), T as u32);
+        let slab = gpu.up(&seed);
+        let y = gpu.zeros(T * (VH * VD) as usize * 4);
+        for j in 0..T {
+            let c = if j + 1 == T { T as i32 - 3 } else { 0 };
+            let mut carry = page.carry(gpu, j as u32, j as u32, c);
+            carry.split = split;
+            ssm::gated_delta_carried(
+                &gpu.ctx(),
+                Tensor::new(row(qkv, j, conv_dim, 2), 1, conv_dim as u32, Dtype::Bf16),
+                Tensor::new(row(gates, j, 2 * VH as usize, 4), 1, 2 * VH, Dtype::F32),
+                &bf16_pool(slab),
+                KH,
+                VH,
+                KD,
+                VD,
+                &mut Tensor::new(row(y, j, (VH * VD) as usize, 4), 1, VH * VD, Dtype::F32),
+                ssm::GdnGated {
+                    ba: Tensor::new(row(ba, j, 2 * VH as usize, 2), 1, 2 * VH, Dtype::Bf16),
+                    dt_bias: dt_t,
+                    a_log: a_t,
+                },
+                &carry,
+            )
+            .expect("the carried gated-delta step fires");
+            gpu.sync();
+        }
+        let us: Vec<f32> = (0..T as u32)
+            .flat_map(|j| gpu.down::<f32>(page.row(2, j), (VH * VD) as usize))
+            .collect();
+        (gpu.down::<f32>(y, T * (VH * VD) as usize), us, gpu.down::<u16>(slab, stride))
+    };
+    let (want_y, want_u, want_slab) = run(&mut gpu, 0);
+    let (got_y, got_u, got_slab) = run(&mut gpu, room);
+    near(&got_y, &want_y, 1e-4, "the split decodes' rows");
+    near(&got_u, &want_u, 1e-4, "the split decodes' corrected values");
+    let got: Vec<f32> = got_slab.into_iter().map(from_bf16).collect();
+    let want: Vec<f32> = want_slab.into_iter().map(from_bf16).collect();
+    near(&got, &want, 2e-2, "the state the split decode commits");
+    assert_eq!(gpu.down::<u32>(room, sms as usize), vec![0u32; sms as usize], "every unit's counter back at zero");
 }

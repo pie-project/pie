@@ -662,8 +662,42 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
         }
     };
 
+    // A lane's carried rows split across blocks. A unit is a block's W
+    // tiles of one (lane, head); where the grid holds more blocks than there
+    // are units, the device sits under-occupied, and a unit whose rows run
+    // longer than a chunk splits its chunks over `parts` blocks: block `u`
+    // (part 0) keeps the latest chunks, the own row and everything after;
+    // each other part streams an earlier range of chunks. Every part sums
+    // its range relative to the range's end, publishes `a`, `o` and the
+    // range's log-gate total, and counts itself in; the last to arrive
+    // decays and adds them all and finishes the tile. No block waits on
+    // another. A unit of one chunk, or a grid with no spare block (every
+    // fire but a splitting one, `Carry::split` null), runs whole.
+    const int units = tiles / W;
+    const bool can_split = carry.split != nullptr && units > 0 && static_cast<int>(gridDim.x) > units;
+    const int parts_max = can_split ? static_cast<int>(gridDim.x) / units : 1;
+    u32* split_count = can_split ? reinterpret_cast<u32*>(carry.split) : nullptr;
+    float* split_part = can_split ? reinterpret_cast<float*>(carry.split + 4ull * gridDim.x) : nullptr;
+    auto parts_of = [&](int n) { return max(1, min(parts_max, (n + CH - 1) / CH)); };
+    // Chunk `j * chunks / parts`: where part boundaries fall.
+    auto bound = [&](int chunks, int parts, int j) { return chunks * j / parts; };
+    // This block's unit and part: block `u < units` is unit `u`'s part 0;
+    // a block past them a later part of unit `(b - units) mod units`.
+    int unit = static_cast<int>(blockIdx.x);
+    int kpart = 0;
+    if (unit >= units) {
+        if (!can_split) return;
+        const int q = unit - units;
+        unit = q % units;
+        kpart = q / units + 1;
+        if (kpart >= parts_max) return;
+    }
+    // A part's slot of partial sums: `a`, `o` (V_d each) and its range's
+    // log-gate total.
+    const int slot_floats = 2 * V_d + 4;
+
     const int stride = gridDim.x * W;
-    int t = blockIdx.x * W + warp;
+    int t = (kpart == 0 ? static_cast<int>(blockIdx.x) : unit) * W + warp;
     Tile cur = plan(t);
     issue(cur, 0);
     issue_last(cur, 0);
@@ -742,10 +776,29 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
             float after = glog_n;
             const float dtb = Elem<bf16>::to_f32(dt_bias[cur.h]);
             const float ea = __expf(a_log[cur.h]);
-            for (int c = chunks - 1; c >= 0; --c) {
+            // Split: part 0 keeps the latest chunks, from `lo0`; a later part
+            // streams its range alone, its decay relative to its range's end.
+            const int parts = can_split ? parts_of(n) : 1;
+            const bool idle = kpart >= parts;
+            const int lo0 = kpart == 0 ? (parts > 1 ? bound(chunks, parts, parts - 1) : 0)
+                                       : bound(chunks, parts, max(0, parts - 1 - kpart));
+            const int hi0 = kpart == 0 ? chunks : bound(chunks, parts, max(0, parts - kpart));
+            // Split, every part's decay is relative to its range's end; the
+            // part that comes in last adds the own row's.
+            if (parts > 1) after = 0.f;
+            if (kpart > 0) {
+                if (!idle) {
+                    // Its first chunk, in place of the last the prefetch staged.
+                    issue_rows(cur, cl, CH * (hi0 - 1), cbuf);
+                    gdn_cp_commit();
+                    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+                }
+                __syncthreads();
+            }
+            for (int c = idle ? -1 : hi0 - 1; c >= lo0; --c) {
                 const int base = CH * c;
                 // The chunk before this one streams into the other stage.
-                if (c > 0) {
+                if (c > lo0) {
                     issue_rows(cur, cl, CH * (c - 1), cbuf ^ 1);
                     gdn_cp_commit();
                 }
@@ -851,12 +904,67 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
                         o[u] += coe * uu[u];
                     }
                 }
-                if (c > 0) {
+                if (c > lo0) {
                     asm volatile("cp.async.wait_group 0;\n" ::: "memory");
                     __syncthreads();
                     cbuf ^= 1;
                 }
             }
+            // Split: each part lands its partial sums and its range's
+            // log-gate total and counts itself in; the one that comes in last
+            // (no block waits on another) adds every part's sums, each decayed
+            // from its range's end to the own row (the log-gates of the rows
+            // after it, the own row's among them), and finishes the tile.
+            bool finish = !idle;
+            if (parts > 1) {
+                __shared__ int s_last;
+                if (!idle) {
+                    float* pa = split_part + (long long)(kpart * units + unit) * slot_floats;
+                    if (lane < 2) {
+                        #pragma unroll
+                        for (int u = 0; u < VEC; ++u) {
+                            pa[cur.j0 + u] = a[u];
+                            pa[V_d + cur.j0 + u] = o[u];
+                        }
+                    }
+                    if (threadIdx.x == 0) pa[2 * V_d] = after;
+                    __threadfence();
+                }
+                __syncthreads();
+                if (threadIdx.x == 0) {
+                    s_last = 0;
+                    if (!idle) {
+                        const u32 before = atomicAdd(split_count + unit, 1u);
+                        if (before == static_cast<u32>(parts - 1)) {
+                            split_count[unit] = 0u;
+                            __threadfence();
+                            s_last = 1;
+                        }
+                    }
+                }
+                __syncthreads();
+                finish = s_last != 0;
+                if (finish) {
+                    float off = glog_n;
+                    #pragma unroll
+                    for (int u = 0; u < VEC; ++u) {
+                        a[u] = 0.f;
+                        o[u] = 0.f;
+                    }
+                    for (int k = 0; k < parts; ++k) {
+                        const float* pk = split_part + (long long)(k * units + unit) * slot_floats;
+                        const float decay = __expf(off);
+                        #pragma unroll
+                        for (int u = 0; u < VEC; ++u) {
+                            a[u] += decay * __ldcg(pk + cur.j0 + u);
+                            o[u] += decay * __ldcg(pk + V_d + cur.j0 + u);
+                        }
+                        off += __ldcg(pk + 2 * V_d);
+                    }
+                    after = off;
+                }
+            }
+            if (finish) {
             const float g0 = __expf(after);
             // The state's part: S^T k and S^T q over the tile, decayed to the
             // own row.
@@ -944,6 +1052,7 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
                     const int at = lane * V_h + cur.h;
                     dst[at] = ba[(long long)cur.r_row * 2 * V_h + at];
                 }
+            }
             }
         }
         // The next tile's last chunk, into the stage the streamed chunks

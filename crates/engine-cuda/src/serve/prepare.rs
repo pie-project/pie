@@ -1758,9 +1758,20 @@ impl Shell {
                 *replay > 0
                     && !self.decoding.contains(row.class as usize)
             });
+        // A decoding lane carrying more than a chunk of rows (a beam lane's
+        // run-ahead) splits its carried reads, in a body of its own: a
+        // fire at the natural lag keeps the plain grid.
+        let rs_splits = self
+            .buffers
+            .as_ref()
+            .is_some_and(|buffers| buffers.split_room() != 0)
+            && rs_replays
+                .iter()
+                .any(|&replay| replay > kernels_cuda::ssm::CARRY_CHUNK);
         let rs_body = match self.arm_rs {
             armed if arming && armed.buffers() => armed,
             _ if rs_extends => record::RsBody::Replays,
+            _ if rs_lands && rs_splits => record::RsBody::Splits,
             _ if rs_lands => record::RsBody::Buffers,
             _ => record::RsBody::Folds,
         };

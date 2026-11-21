@@ -934,6 +934,7 @@ impl FireCtx<'_> {
                     page_tokens: buffers.page_tokens(),
                 },
                 extended: p.rs.body == record::RsBody::Replays,
+                splits: p.rs.body == record::RsBody::Splits,
                 scratch: rs_scratch.as_ref(),
                 folds: p.rs.group_folds.then_some((tables.folds, tables.fold_entries)),
             });
