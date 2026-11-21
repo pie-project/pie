@@ -374,6 +374,22 @@ pub(crate) enum PoolOp {
     SettleCopies,
 }
 
+impl PoolOp {
+    /// Its name, as a stall dump says the call a lane is in.
+    pub(crate) const fn name(&self) -> &'static str {
+        match self {
+            Self::CommitSegments(_) => "commit segments",
+            Self::ReleaseSegments(_) => "release segments",
+            Self::Rung { .. } => "set rung",
+            Self::CommitSpan(_) => "commit span",
+            Self::ReleaseSpan(_) => "release span",
+            Self::Evacuate(_) => "evacuate",
+            Self::Rebind(_) => "rebind",
+            Self::SettleCopies => "settle copies (waits every copy landed)",
+        }
+    }
+}
+
 /// A read or write of host kv slots' bytes, behind every copy queued before
 /// it.
 #[derive(Debug)]
@@ -488,6 +504,28 @@ pub(crate) enum PreLaunchCopy {
 }
 
 impl PreLaunchCopy {
+    /// What the copy moves, between which tiers: what a stall dump names
+    /// an unsettled copy by.
+    pub(super) fn describe(&self) -> String {
+        match self {
+            Self::Kv(copy) => format!(
+                "kv {:?}->{:?} {} pages",
+                copy.src,
+                copy.dst,
+                copy.src_page_ids.len().max(copy.moves.len())
+            ),
+            Self::State(_) => "recurrent state".to_string(),
+            Self::Slots(copy) => format!(
+                "shape {} {:?}->{:?} {} slots {} runs",
+                copy.shape.0,
+                copy.src,
+                copy.dst,
+                copy.slots.len(),
+                copy.runs.len()
+            ),
+        }
+    }
+
     pub(super) fn label(&self) -> &'static str {
         match self {
             Self::Kv(_) => "KV copy",
@@ -737,6 +775,10 @@ struct PendingControl {
     operation: &'static str,
     holds_launches: bool,
     prelaunch: bool,
+    /// What it moves, said by a stall dump (a copy's tiers and slots).
+    what: String,
+    /// When it was posted to the lane: how long a dump finds it unsettled.
+    since: crate::rt::Instant,
 }
 
 #[derive(Default)]
@@ -1888,6 +1930,7 @@ impl BatchScheduler {
                                 "[pie-sched] engine {engine_id} stalled for {stalled_for:?} \
                                  (no progress, work queued or in flight); state:\n{}",
                                 Self::render_debug_dump(
+                                    engine_id,
                                     &pending,
                                     &in_flight_launches,
                                     &in_flight_control,
@@ -1924,6 +1967,7 @@ impl BatchScheduler {
 
     #[allow(clippy::too_many_arguments)]
     fn render_debug_dump(
+        engine_id: usize,
         pending: &VecDeque<QueuedItem>,
         in_flight_launches: &VecDeque<PendingLaunchBatch>,
         in_flight_control: &InFlightControls,
@@ -1982,17 +2026,28 @@ impl BatchScheduler {
         if in_flight_control.is_empty() {
             let _ = writeln!(out, "in_flight_control: none");
         }
+        // Where each control stands, by whose move it waits on: posted and
+        // unanswered, the lane has not taken it (it is in another call,
+        // said below); accepted and unsettled, the engine owes its landing
+        // (its copy pipeline: a staging ring, a tier write, an event).
         for control in in_flight_control.iter() {
+            let age = control.since.elapsed();
             let state = match &control.state {
-                ControlSlotState::Posted { id } => format!("posted(id={id})"),
-                ControlSlotState::Ready(c) => format!("settled={}", c.is_settled()),
+                ControlSlotState::Posted { id } => {
+                    format!("posted(id={id}) {age:?} ago, unanswered: the lane has not taken it")
+                }
+                ControlSlotState::Ready(c) if c.is_settled() => format!("settled {age:?} after posting"),
+                ControlSlotState::Ready(_) => {
+                    format!("accepted, unsettled {age:?} after posting: the engine owes its landing")
+                }
             };
             let _ = writeln!(
                 out,
-                "in_flight_control: {} pipeline {:?} {state}",
-                control.operation, control.pipeline_id,
+                "in_flight_control: {} ({}) pipeline {:?} {state}",
+                control.operation, control.what, control.pipeline_id,
             );
         }
+        let _ = writeln!(out, "{}", super::lane::lane_now(engine_id));
         let _ = write!(out, "{}", frame_policy.debug_summary());
         out
     }
@@ -2572,9 +2627,11 @@ impl BatchScheduler {
                     operation: plan.label(),
                     holds_launches,
                     prelaunch: true,
+                    what: plan.describe(),
+                    since: crate::rt::Instant::now(),
                 });
             }
-            QueuedItem::CopyTracked { completion, .. } => {
+            QueuedItem::CopyTracked { completion, plan } => {
                 in_flight_control.push(PendingControl {
                     state: ControlSlotState::Posted { id },
                     logical_completion: None,
@@ -2584,6 +2641,8 @@ impl BatchScheduler {
                     operation: "tracked KV copy",
                     holds_launches,
                     prelaunch: false,
+                    what: plan.describe(),
+                    since: crate::rt::Instant::now(),
                 });
             }
             _ => {}
@@ -3627,6 +3686,8 @@ mod tests {
             operation: "tracked roles copy",
             holds_launches: false,
             prelaunch: false,
+            what: String::new(),
+            since: crate::rt::Instant::now(),
         });
         let (rollback, _rx) = tokio::sync::mpsc::unbounded_channel();
         BatchScheduler::apply_control_commit(

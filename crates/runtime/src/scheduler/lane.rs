@@ -451,6 +451,51 @@ fn strip_members(
     fire.instances = instances;
 }
 
+/// What each engine's lane is in now, and since when: a stall dump names
+/// the call a lane is held in (its controls posted and unanswered behind
+/// it), never only that they are unanswered.
+static LANE_NOW: std::sync::Mutex<
+    std::collections::BTreeMap<usize, (std::borrow::Cow<'static, str>, Instant)>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// The call engine `engine`'s lane is in, said.
+pub(super) fn lane_now(engine: usize) -> String {
+    match LANE_NOW.lock().unwrap().get(&engine) {
+        Some((what, since)) => format!("lane: in {what} for {:?}", since.elapsed()),
+        None => "lane: waiting for work".to_string(),
+    }
+}
+
+/// The lane is in `what` until this drops.
+struct InCall(usize);
+
+impl InCall {
+    fn new(engine: usize, what: std::borrow::Cow<'static, str>) -> Self {
+        LANE_NOW
+            .lock()
+            .unwrap()
+            .insert(engine, (what, Instant::now()));
+        Self(engine)
+    }
+}
+
+impl Drop for InCall {
+    fn drop(&mut self) {
+        LANE_NOW.lock().unwrap().remove(&self.0);
+    }
+}
+
+/// A control item's call, said.
+fn control_call(item: &QueuedItem) -> std::borrow::Cow<'static, str> {
+    match item {
+        QueuedItem::CopyTracked { plan, .. } | QueuedItem::PreLaunchCopy { plan, .. } => {
+            format!("{} ({})", plan.label(), plan.describe()).into()
+        }
+        QueuedItem::Pool { op, .. } => format!("a pool op {}", op.name()).into(),
+        _ => "a control".into(),
+    }
+}
+
 fn backend(engine: &mut Option<EngineBox>) -> Result<&mut EngineBox> {
     engine.as_mut().ok_or_else(|| anyhow!(NO_BACKEND))
 }
@@ -767,6 +812,7 @@ impl Lane {
                     reply,
                     ..
                 } => {
+                    let _in = InCall::new(engine_idx, "a frame's fire".into());
                     let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let mut placement = Vec::new();
                         let fault = past_rung(
@@ -820,6 +866,7 @@ impl Lane {
                     panicked
                 }
                 LaneRequest::Control { item, reply } => {
+                    let _in = InCall::new(engine_idx, control_call(&item));
                     let on_panic = Self::commit_on_failure(&item, LANE_PANICKED);
                     let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         Self::execute_control(
