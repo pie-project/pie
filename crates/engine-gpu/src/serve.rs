@@ -819,6 +819,11 @@ pub struct Shell<B: Serve> {
     /// The landed fires whose device time is not yet read, each with its
     /// estimate ([`Shell::timed`]).
     timing: Vec<(crate::submit::Estimated, crate::submit::DeviceTime)>,
+    /// The device time, ns, of the last fire whose time was read
+    /// ([`Shell::track`]).
+    last_landed: Option<u64>,
+    /// The kernels the last walked step picked, by class.
+    last_picks: Vec<String>,
     /// Under a stated submit bound, each arm's timestamps, laid at load
     /// ([`Serve::Stamps`]): the step in flight on an arm writes its own.
     stamps: Vec<B::Stamps>,
@@ -2217,6 +2222,8 @@ impl<B: Serve> Shell<B> {
             split_layers: 1,
             estimate_next: None,
             timing: Vec::new(),
+            last_landed: None,
+            last_picks: Vec::new(),
             stamps,
             pipelines,
             asks,
@@ -3891,6 +3898,20 @@ impl<B: Serve> Shell<B> {
             .push((crate::submit::Estimated { hz, ..estimate }, time));
     }
 
+    /// The kernels the last walked step picked, by class (a dense matmul at
+    /// its rows, attention tiled or walked).
+    #[must_use]
+    pub fn last_picks(&self) -> &[String] {
+        &self.last_picks
+    }
+
+    /// The device time, ns, of the last fire whose time [`Shell::track`]
+    /// read, under a stated bound.
+    #[must_use]
+    pub fn last_landed_ns(&self) -> Option<u64> {
+        self.last_landed
+    }
+
     /// Under a stated submit bound, every landed fire's device time filled
     /// so far is read against its estimate into the bound's measured ratios
     /// (`crate::submit::Measured`), and what landed more than a bound ago
@@ -3901,10 +3922,12 @@ impl<B: Serve> Shell<B> {
             return;
         };
         let now = std::time::Instant::now();
+        let last = &mut self.last_landed;
         self.timing.retain(|(estimate, time)| match time.get() {
             None => true,
             Some(None) => false,
             Some(Some(ns)) => {
+                *last = Some(ns);
                 // A step that went out a layer at a time spans the host's
                 // encoding between its submissions too (a desktop GPU's
                 // 0.5 ms layers ran ~10x their estimate so): its time is
@@ -5231,8 +5254,9 @@ impl<B: Serve> Shell<B> {
                 cursor,
                 Filter::default(),
             )?;
-            run.take_cuts()
+            (run.take_cuts(), run.take_picks())
         };
+        let (cuts, picks) = cuts;
 
         let launches = (0..self.compiled.template().len() as u32)
             .map(|region| p.windows.runs(region).max(1))
@@ -5241,6 +5265,7 @@ impl<B: Serve> Shell<B> {
             frame,
             launches,
             cuts,
+            picks,
         })
     }
 
@@ -5271,6 +5296,9 @@ struct Walked<B: Serve> {
     cuts: Vec<crate::store::experts::Cut<B>>,
 
     launches: u32,
+
+    /// The kernels it picked, by class (`Run::take_picks`).
+    picks: Vec<String>,
 }
 
 /// One lane's VAE clips: each box `[t, h, w]` and the voxel rows they hold,
@@ -5743,6 +5771,19 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
         let walked = self.walk_once(&prepared, keep.is_some(), split);
         self.split_layers = 1;
         let walked = walked?;
+        // The kernels the walk picked, by class: what a split step ran
+        // against the whole step its rung records (its own line, kept).
+        if self.submit_bound.is_some() {
+            tracing::debug!(
+                target: "engine_gpu::api",
+                rung = prepared.rung,
+                split,
+                kept = keep.is_some(),
+                picks = ?walked.picks,
+                "submit bound: a walked step's kernel picks"
+            );
+        }
+        self.last_picks.clone_from(&walked.picks);
         let mut frame = walked.frame.expect("the walk opened a frame");
 
         // Each read plane's buffer (the span's, or a score room's) and every
