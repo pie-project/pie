@@ -201,9 +201,11 @@ fn fault(fault: Fault) -> Error {
             Error::Program(fault.to_string())
         }
         Fault::Fire(_) => Error::Invalid(fault.to_string()),
-        Fault::Residency(_) | Fault::FitShort(_) | Fault::UnderCarve { .. } => {
-            Error::Impossible(fault.to_string())
-        }
+        Fault::UnderCarve { logical, .. } => Error::Placement {
+            chunks: vec![logical],
+            reason: fault.to_string(),
+        },
+        Fault::Residency(_) | Fault::FitShort(_) => Error::Impossible(fault.to_string()),
     }
 }
 
@@ -1684,5 +1686,29 @@ mod no_host_tier_tests {
         assert!(text.contains("budget_host") && text.contains("the device's memory is the host's"), "{text}");
         assert!(super::no_host_tier(None).is_ok());
         assert!(super::no_host_tier(Some(0)).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod placement {
+    use super::*;
+
+    /// A fire naming a state slot inside the activation's carve is refused
+    /// as a placement, naming the logical chunk: the runtime moves that
+    /// state down and submits again, failing no lane.
+    #[test]
+    fn a_slot_under_the_carve_is_refused_naming_its_chunk() {
+        let refused = fault(Fault::UnderCarve {
+            logical: 2057,
+            physical: 2057,
+            carve: 482_998_272,
+            range: 4_162_532_352,
+        });
+        let Error::Placement { chunks, reason } = &refused else {
+            panic!("a placement refusal: {refused:?}");
+        };
+        assert_eq!(chunks, &vec![2057]);
+        assert!(reason.contains("activation span's backed carve"), "{reason}");
+        assert!(refused.to_string().starts_with("impossible submission: "), "{refused}");
     }
 }

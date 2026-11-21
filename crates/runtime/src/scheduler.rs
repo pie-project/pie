@@ -81,7 +81,7 @@ impl ControlCompletion {
             let untouched = error.chain().any(|cause| {
                 matches!(
                     cause.downcast_ref::<::engine::Error>(),
-                    Some(::engine::Error::Impossible(_))
+                    Some(::engine::Error::Impossible(_) | ::engine::Error::Placement { .. })
                 )
             });
             (format!("{error:#}"), untouched)

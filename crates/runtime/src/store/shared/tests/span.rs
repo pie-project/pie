@@ -973,3 +973,46 @@ async fn a_raise_moves_the_state_down_before_the_engine_backs_its_carve() {
         "moved down, then the carve: {calls:?}"
     );
 }
+
+/// A fire refused for the state in a chunk (`engine::Error::Placement`):
+/// the walk's next step moves that chunk down to the lowest free chunk
+/// below the state limit, as a compaction is carried, and its fires wait
+/// until the engine has taken that copy.
+#[test]
+fn a_refused_chunk_moves_down_and_its_fires_wait_for_the_copy() {
+    let mut pool = grow_pool(true, true);
+    while let Some(n) = pool.pool().span_to_commit() {
+        pool.span_committed(n);
+    }
+    let lent = pool.take_records(pool.records_available() as usize).unwrap();
+    let below: Vec<u32> = (0..u32::try_from(lent.len()).unwrap()).collect();
+    pool.give_records(&below);
+    pool.pool_mut().retire_through(u64::MAX);
+    let physical = state_chunks(&pool, &lent);
+    let logical: Vec<u32> = physical
+        .iter()
+        .map(|&chunk| pool.pool().chunk_table().iter().position(|&p| p == chunk).unwrap() as u32)
+        .collect();
+    pool.refuse_chunks(&logical);
+    assert!(pool.refusals_pending(&logical), "waits for its move");
+    let step = pool.next_move(pool.mapped_segments(), 1);
+    let Some(SegmentMove::Compact { applied, epoch, .. }) = step else {
+        panic!("the refused chunks move down: {step:?}");
+    };
+    assert!(!applied.is_empty(), "the refused chunks move");
+    assert!(
+        applied.iter().all(|step| step.to < step.from),
+        "down: {applied:?}"
+    );
+    let moved: Vec<u32> = applied.iter().map(|step| step.logical).collect();
+    let unmoved: Vec<u32> = logical.iter().copied().filter(|chunk| !moved.contains(chunk)).collect();
+    assert!(pool.refusals_pending(&moved), "until the engine took the copy");
+    pool.compaction_copied(epoch, 2);
+    assert!(!pool.refusals_pending(&moved), "the copy taken: their fires go");
+    assert_eq!(
+        pool.refusals_pending(&unmoved),
+        !unmoved.is_empty(),
+        "those with no free chunk below wait for room"
+    );
+    pool.pool().check();
+}

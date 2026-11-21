@@ -808,6 +808,8 @@ impl SharedGrow {
                 // that), and the run they clear is room given back.
                 let (current, _) = self.epochs();
                 self.shared.lock().unwrap().compaction_copied(planned, current);
+                // Fires held for a refused chunk's move go again now.
+                crate::scheduler::nudge(self.engine);
             }
         }
     }

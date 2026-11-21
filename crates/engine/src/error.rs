@@ -25,6 +25,13 @@ pub enum Error {
     #[error("impossible submission: {0}")]
     Impossible(String),
 
+    /// An impossible submission for where state lies: `chunks` (logical
+    /// chunk ids) hold state where the engine will not read or write it
+    /// (inside the activation's carve). Refused before anything was read
+    /// or written: the runtime moves that state and submits again.
+    #[error("impossible submission: {reason}")]
+    Placement { chunks: Vec<u32>, reason: String },
+
     #[error("load failed: {0}")]
     Load(String),
 

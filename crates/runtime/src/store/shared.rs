@@ -169,6 +169,25 @@ pub fn owed_cut_rows(engine: usize) -> u32 {
         .load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// The engine refused a fire for the state in logical chunks `chunks`
+/// (`engine::Error::Placement`): `engine`'s pool moves it down, its walk
+/// asked to look now. A pool that keeps no chunks moves nothing.
+pub fn evacuate_refused(engine: usize, chunks: &[u32]) {
+    if let Some(shared) = crate::store::registry::try_get(0, engine).and_then(|stores| stores.shared) {
+        shared.lock().unwrap().refuse_chunks(chunks);
+    }
+    ask_walk(engine);
+}
+
+/// Whether any of `chunks` still waits for (or is in) its move down on
+/// `engine`'s pool ([`evacuate_refused`]).
+#[must_use]
+pub fn refusals_pending(engine: usize, chunks: &[u32]) -> bool {
+    crate::store::registry::try_get(0, engine)
+        .and_then(|stores| stores.shared)
+        .is_some_and(|shared| shared.lock().unwrap().refusals_pending(chunks))
+}
+
 /// Asks `engine`'s walker to look now: what waits on it (a bind whose term
 /// the engine's rung no longer fits, fires cut wider than the widest rung
 /// that fits) waits on its next step, not on the governor's next tick. Kept
@@ -866,6 +885,15 @@ pub struct SharedPool {
     /// free chunks are enough but no run of them stands
     /// ([`Self::compaction_comes`]): the walk moves chunks until they do.
     compact_for: Option<(u32, u32)>,
+    /// Logical chunks the engine refused a fire for, their state where it
+    /// will not read or write it (`engine::Error::Placement`): the walk
+    /// moves them down ([`Self::refused_step`]); the scheduler holds the
+    /// refused fires until none of theirs is here or moving
+    /// ([`Self::refusals_pending`]).
+    refused: BTreeSet<u32>,
+    /// Of those, the ones a move planned for them carries now, until the
+    /// engine took its copy.
+    refused_moving: BTreeSet<u32>,
     /// The governor's segment target the walk steers this pool to, shared
     /// with it ([`target::SharedGrow`]); `None` where no walk steers it.
     walk_target: Option<Arc<std::sync::atomic::AtomicU32>>,
@@ -1122,6 +1150,8 @@ impl SharedPool {
             span_commit_blocked: false,
             guest_head: None,
             compact_for: None,
+            refused: BTreeSet::new(),
+            refused_moving: BTreeSet::new(),
             walk_target: None,
             programs: programs::ProgramFires::default(),
             engine: None,
@@ -2259,6 +2289,9 @@ impl SharedPool {
         if let Some(step) = self.grow_step(target) {
             return Some(step.into());
         }
+        if let Some(step) = self.refused_step(epoch) {
+            return Some(step);
+        }
         if let Some(step) = self.compact_step(epoch) {
             return Some(step);
         }
@@ -2342,6 +2375,58 @@ impl SharedPool {
     /// handed out by `current` retire, at once on an idle pool.
     pub fn compaction_copied(&mut self, planned: u64, current: u64) {
         self.pool.compaction_copied(planned, current);
+        self.refused_moving.clear();
+    }
+
+    /// The engine refused a fire for the state in logical chunks `chunks`
+    /// (`engine::Error::Placement`): the walk moves it down.
+    pub fn refuse_chunks(&mut self, chunks: &[u32]) {
+        self.refused.extend(chunks.iter().copied());
+    }
+
+    /// Whether any of `chunks` still waits for its move down, or is being
+    /// moved: a fire refused for it is held until none is.
+    #[must_use]
+    pub fn refusals_pending(&self, chunks: &[u32]) -> bool {
+        chunks
+            .iter()
+            .any(|chunk| self.refused.contains(chunk) || self.refused_moving.contains(chunk))
+    }
+
+    /// A move of the refused chunks down below the state limit, applied
+    /// here as a compaction is, for the engine to copy before the next
+    /// fire (`SegmentMove::Compact`); `None` where none waits or another
+    /// compaction is under way.
+    fn refused_step(&mut self, epoch: u64) -> Option<SegmentMove> {
+        if self.refused.is_empty() || self.pool.compacting() {
+            return None;
+        }
+        let chunks: Vec<u32> = std::mem::take(&mut self.refused).into_iter().collect();
+        let moves = self.pool.plan_moves_of(&chunks);
+        if moves.is_empty() {
+            // Nothing of them held now, or no free chunk below: what moved
+            // nothing is no longer waited for if no longer held; else it
+            // waits for room.
+            let held: Vec<u32> = chunks
+                .into_iter()
+                .filter(|&chunk| self.pool.holds_chunk(chunk))
+                .collect();
+            self.refused.extend(held);
+            return None;
+        }
+        // What found no free chunk below waits for the next step.
+        let moved: BTreeSet<u32> = moves.iter().map(|step| step.logical).collect();
+        self.refused
+            .extend(chunks.iter().copied().filter(|chunk| !moved.contains(chunk) && self.pool.holds_chunk(*chunk)));
+        self.pool
+            .apply_compaction(&moves, epoch)
+            .expect("a move planned under the lock applies");
+        self.refused_moving = moved;
+        Some(SegmentMove::Compact {
+            evacuation: engine_moves(&moves),
+            applied: moves,
+            epoch,
+        })
     }
 
     /// The engine refused a compaction before its copy: the pool takes it
@@ -2349,6 +2434,9 @@ impl SharedPool {
     pub fn compaction_refused(&mut self, moves: &[super::segments::ChunkMove]) {
         self.pool.undo_compaction(moves);
         self.compact_for = None;
+        // The engine refused the move of refused chunks: they wait for the
+        // next step, never dropped while a fire waits on them.
+        self.refused.extend(std::mem::take(&mut self.refused_moving));
     }
 
     /// The walk's next grow step toward `goal` mapped segments, `None`

@@ -1372,6 +1372,42 @@ impl SlotPool {
         Ok(())
     }
 
+    /// Whether logical chunk `logical` is open for a shape: it holds state.
+    #[must_use]
+    pub fn holds_chunk(&self, logical: u32) -> bool {
+        self.chunks
+            .get(logical as usize)
+            .is_some_and(|meta| meta.shape != NO_SHAPE)
+    }
+
+    /// The moves that take the state in logical chunks `logicals` down to
+    /// the lowest free chunks below the state limit: chunks the engine
+    /// refused a fire for, its state lying where it will not read or write
+    /// it (`engine::Error::Placement`). Chunks no longer held, or already
+    /// below the limit and below every chunk free there, move nothing.
+    #[must_use]
+    pub fn plan_moves_of(&self, logicals: &[u32]) -> Vec<ChunkMove> {
+        let limit = self.state_limit().min(self.ceiling);
+        let mut targets = self.open.iter_in(0, limit);
+        let mut moves = Vec::new();
+        for &logical in logicals {
+            let Some(&from) = self.logical_to_physical.get(logical as usize) else {
+                continue;
+            };
+            if self.chunks[logical as usize].shape == NO_SHAPE
+                || self.free.get(from)
+                || self.fenced.get(from)
+            {
+                continue;
+            }
+            let Some(to) = targets.next() else {
+                break;
+            };
+            moves.push(ChunkMove { logical, from, to });
+        }
+        moves
+    }
+
     /// Takes back `moves`, applied with [`Self::apply_compaction`] and
     /// refused by the engine before its copy: each chunk goes back to where
     /// it lay, and its fence lifts.
