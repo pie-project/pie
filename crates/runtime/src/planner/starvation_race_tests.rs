@@ -9643,3 +9643,29 @@ async fn the_policy_asked_with_nothing_in_flight_and_moves_named_is_a_quiet_wait
         "counted and said as a quiet wait ({end:?})"
     );
 }
+
+/// Mac Pro at 2 GiB on 3e0f0f18f: 4,435 no-step lines for a restore head,
+/// need_moves 1 and "ended=none": a pass that found nothing to do returned
+/// without saying where it stopped. Every such pass records its end.
+#[tokio::test(flavor = "current_thread")]
+async fn a_pass_with_nothing_to_do_says_where_it_stopped() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(6, 0..0, 64));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let head = ProcessId::new_v4();
+    planner.register(head);
+    planner.note_admitted(head);
+    planner.with_inner(|inner| {
+        inner.procs.get_mut(&head).unwrap().state = Residency::Evicted;
+        inner.parked_moving.insert(head);
+        inner.enqueue(
+            head,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        );
+    });
+    planner.plan();
+    let end = planner.with_inner(|inner| inner.last_plan.as_ref().map(|end| end.ended));
+    assert_eq!(end, Some("its parked state moves down a tier: restored once it lands"));
+}

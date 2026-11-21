@@ -64,7 +64,8 @@ enum Step {
         rise: Option<u32>,
     },
     Release(DevicePageReservation),
-    Done,
+    /// Nothing to do this pass, and why (recorded as the pass's end).
+    Done(&'static str),
 }
 
 pub(super) enum ServeOutcome {
@@ -557,14 +558,14 @@ impl ResidencyPlanner {
                 // the room it was funded is its, and its leaving plans
                 // again.
                 if inner.queue.values().any(Waiter::rise_untaken) {
-                    return Step::Done;
+                    return Step::Done("a rung raise served and not yet taken holds the queue");
                 }
                 let Some((key, waiter)) = inner.unmet_head() else {
                     if inner.accum.len() > 0 && inner.queue.is_empty() {
                         let stranded = std::mem::take(&mut inner.accum);
                         return Step::Release(stranded);
                     }
-                    return Step::Done;
+                    return Step::Done("no unmet head");
                 };
                 if let WaitKind::BindRoom {
                     run, pieces, rise, ..
@@ -592,7 +593,7 @@ impl ResidencyPlanner {
                 // Its parked state is on its way down a tier: restored now,
                 // it would miss the items moving. The landing pokes.
                 if is_restore && inner.parked_moving.contains(&pid) {
-                    return Step::Done;
+                    return Step::Done("its parked state moves down a tier: restored once it lands");
                 }
                 let demand = match &waiter.kind {
                     WaitKind::Allocation { demand, .. } => Some(*demand),
@@ -655,7 +656,7 @@ impl ResidencyPlanner {
                                     }),
                                     _ => None,
                                 })
-                                .unwrap_or(Step::Done)
+                                .unwrap_or(Step::Done("waits for the restored one's bind to fire"))
                         }
                         // Its whole need: the room its bind asks too.
                         Some(need) if room_stood != Some(key) => {
@@ -671,7 +672,13 @@ impl ResidencyPlanner {
                 }
             });
             let fund_by_eviction = match step {
-                Step::Done => return false,
+                // Every pass that stops says where, for the stall line
+                // (Mac Pro at 2 GiB on 3e0f0f18f: need_moves 1, ended=none,
+                // 4,435 no-step lines).
+                Step::Done(ended) => {
+                    self.plan_stopped(ended);
+                    return false;
+                }
                 Step::BindRoom {
                     key,
                     run,

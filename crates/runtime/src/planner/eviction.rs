@@ -19,7 +19,11 @@ use super::{ProcessId, ResidencyPlanner};
 
 /// Plan ends that wait for room something in flight gives back: chosen
 /// with nothing in flight, each is a planner bug ([`ResidencyPlanner::plan_ended`]).
-const WAITS_ON_FLIGHT: &[&str] = &["something in flight", "once more chunks stand free"];
+const WAITS_ON_FLIGHT: &[&str] = &[
+    "something in flight",
+    "once more chunks stand free",
+    "waits for the restored one's bind to fire",
+];
 
 impl ResidencyPlanner {
     pub(super) fn quote_and_pick(
@@ -607,6 +611,12 @@ impl ResidencyPlanner {
             && self.with_inner(|inner| inner.nothing_in_flight())
         {
             self.stats.quiet_waits.fetch_add(1, Ordering::Relaxed);
+            // Planned again at once: a completion that raced this pass is
+            // seen and funded; a wait that stands with nothing in flight is
+            // said again, never silent.
+            if let Some(notify) = self.returns.drain.get() {
+                notify.notify_one();
+            }
             tracing::warn!(
                 ended,
                 "planner: a wait only something in flight could end, chosen with nothing in \

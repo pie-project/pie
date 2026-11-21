@@ -212,6 +212,8 @@ pub enum SlotError {
     /// Moves that would leave a run of chunks split: one of its chunks
     /// moved without the rest, or not to the next physical chunk after its
     /// first's destination. Refused whoever planned them.
+    #[error("a run of {run} chunk(s) from physical chunk {first} would lie across a segment's end")]
+    RunAcrossSegment { first: u32, run: u32 },
     #[error("chunk moves would split the run of {run} chunk(s) from logical chunk {head} at its chunk {at}")]
     SplitsRun { head: u32, run: u32, at: u32 },
     /// A claim named a chunk that cannot be taken whole as it stands.
@@ -2400,6 +2402,16 @@ impl SlotPool {
                 free_runs: u32::try_from(firsts.len()).unwrap_or(u32::MAX),
                 free_chunks: self.free_chunks(),
             });
+        }
+        // Each piece inside one segment, whatever found it: on Metal a
+        // segment is a buffer of its own, and a piece across its end reads
+        // past it (the M1 on f623134fc: "a guest piece of 3 chunk(s) ... lies
+        // on physical chunks 419..=421, across the end of its segment").
+        if let Some(&first) = firsts[..pieces as usize]
+            .iter()
+            .find(|&&first| self.segments.of(first) != self.segments.of(first + run - 1))
+        {
+            return Err(SlotError::RunAcrossSegment { first, run });
         }
         let mut taken = Vec::with_capacity((pieces * run * spc) as usize);
         for &first in &firsts[..pieces as usize] {

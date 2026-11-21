@@ -2352,7 +2352,14 @@ impl SharedPool {
                 let Some(evacuation) = self.pool.plan_evacuation(last) else {
                     return Some(SegmentMove::NoRoom);
                 };
-                self.apply_evacuation(&evacuation, epoch);
+                // Refused by the pool's own check (stale, or a run it
+                // would split): said and not moved, never a panic (the M1
+                // on f623134fc: "an evacuation planned under the lock
+                // applies: Stale(11)", then a poisoned lock everywhere).
+                if let Err(error) = self.pool.apply_evacuation(&evacuation, epoch) {
+                    tracing::warn!(%error, segment = last, "store: a segment's evacuation refused by the pool's check");
+                    return Some(SegmentMove::NoRoom);
+                }
                 Some(SegmentMove::Evacuate {
                     evacuation: engine_moves(&evacuation.moves),
                     applied: evacuation,
@@ -2559,12 +2566,6 @@ impl SharedPool {
     /// segment is committed and mapped again; nothing of it is released.
     pub fn evacuation_refused(&mut self, evacuation: &Evacuation) {
         self.pool.undo_evacuation(evacuation);
-    }
-
-    fn apply_evacuation(&mut self, evacuation: &Evacuation, epoch: u64) {
-        self.pool
-            .apply_evacuation(evacuation, epoch)
-            .expect("an evacuation planned under the lock applies");
     }
 
     /// A `commit_span` was refused (`true`): none is asked again until room
