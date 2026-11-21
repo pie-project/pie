@@ -84,7 +84,16 @@ impl Inner {
                 end.host_short,
                 some_pids(end.unhostable.iter())
             ),
-            _ => "ended=none host_short=false unhostable=0[]".to_owned(),
+            // Recorded for another entry (this one queued since, as a
+            // refused restore is again): what that end said, named so.
+            Some(end) => format!(
+                "ended=none (last {:?} for entry {}) host_short={} unhostable={}",
+                end.ended,
+                end.head.1,
+                end.host_short,
+                some_pids(end.unhostable.iter())
+            ),
+            None => "ended=none host_short=false unhostable=0[]".to_owned(),
         };
         let rebinding: Vec<String> = self
             .procs

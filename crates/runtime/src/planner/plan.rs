@@ -815,7 +815,8 @@ impl ResidencyPlanner {
                     });
                     let bind = RunNeed::one(need.run, need.pieces);
                     if pid.is_some_and(|pid| {
-                        self.port.restore_stands(pid, &bind, state, kv, Some((need.run, need.pieces)))
+                        !self.refused_in_this_room(pid)
+                            && self.port.restore_stands(pid, &bind, state, kv, Some((need.run, need.pieces)))
                     }) {
                         self.plan_stopped("bind-suspended restore sent: its placement stands");
                         room_stood = Some(key);
@@ -913,9 +914,10 @@ impl ResidencyPlanner {
                             })
                             .unwrap_or_default()
                     });
-                    let moved = stood_at.is_none_or(|stood| {
-                        !stood || free_left.is_none_or(|left| self.port.free_chunks() > left)
-                    });
+                    // Never on the room its last refusal was taken in, of any
+                    // kind ([`Self::refused_in_this_room`]).
+                    let _ = stood_at;
+                    let moved = free_left.is_none_or(|left| self.port.free_chunks() > left);
                     if !understated
                         && moved
                         && head_pid.is_some_and(|pid| self.port.restore_stands(pid, &room, state, kv, bind))
@@ -1187,6 +1189,9 @@ impl ResidencyPlanner {
                     });
                     match boarded {
                         Board::Go(pages) => {
+                            // Said as the pass's end for this head: a restore
+                            // refused and queued again showed "ended=none".
+                            self.plan_ended(key, "restore sent", false, &[]);
                             exec::spawn_restore(self.clone(), pid, pages, slots);
                             continue;
                         }

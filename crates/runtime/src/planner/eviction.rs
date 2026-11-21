@@ -570,13 +570,7 @@ impl ResidencyPlanner {
         // no standing: the restore found otherwise there, and holding it
         // for more room with nothing in flight lost its wake (Mac Pro at
         // 2 GiB on f623134fc, twice). Its moves are named instead.
-        let refused_here = self.with_inner(|inner| {
-            inner.procs.get(&pid).is_some_and(|proc| {
-                proc.roles_short_stood == Some(true)
-                    && proc.roles_short_free.is_some_and(|left| self.port.free_chunks() <= left)
-            })
-        });
-        if !refused_here && self.store_stands(head, pid, need) {
+        if !self.refused_in_this_room(pid) && self.store_stands(head, pid, need) {
             return;
         }
         let most = u32::try_from(map.free.len()).unwrap_or(u32::MAX) / run.max(1) + 1;
@@ -586,6 +580,24 @@ impl ResidencyPlanner {
             }
             need.add(run, 1);
         }
+    }
+
+    /// Whether `pid`'s last refusal (of any kind: its unpark short, its
+    /// pending bind short) was taken in the free room standing now, no
+    /// chunk more free than it left: then a placement check that stands it
+    /// is wrong, and the plan makes room instead of sending it again. The
+    /// backstop for any mismatch between the check and the restore's own
+    /// takes (the M1 at 2 GiB on 05c8624c5: 117,270 no-step lines, the check
+    /// standing a run of 7 the restore, its pages gathered, found none of).
+    pub(super) fn refused_in_this_room(&self, pid: ProcessId) -> bool {
+        let free = self.port.free_chunks();
+        self.with_inner(|inner| {
+            inner
+                .procs
+                .get(&pid)
+                .and_then(|proc| proc.roles_short_free)
+                .is_some_and(|left| free <= left)
+        })
     }
 
     /// Whether the store's placement of restore head `head`'s whole
