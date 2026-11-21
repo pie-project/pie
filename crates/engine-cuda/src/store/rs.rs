@@ -41,11 +41,16 @@ pub struct StepGates {
 /// (`ChunkProfile::rs_corrected`): each buffered row's keys (the conv
 /// output's key heads, bf16) and its corrected values (`u = beta (v - g
 /// S^T k)`, the value its delta rule writes, f32: `width` counts bf16
-/// elements, two a value).
+/// elements, two a value). A gated-delta layer's rows then keep their
+/// per-head scalars (`scalars`, `poem_compiler::rs::gdn_scalars_bytes`:
+/// each value head's log-gate, then its key norm's inverse, f32), which
+/// this engine's kernels do not yet write or read: a fork copies the plane
+/// with the rest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Corrected {
     pub k: Plane,
     pub u: Plane,
+    pub scalars: Option<Plane>,
 }
 
 impl Planes {
@@ -63,7 +68,7 @@ impl Planes {
             .0
             .values()
             .copied()
-            .chain(self.3.values().flat_map(|c| [c.k, c.u]))
+            .chain(self.3.values().flat_map(|c| [c.k, c.u].into_iter().chain(c.scalars)))
             .chain(self.4.values().map(|(k, ..)| *k))
             .collect();
         planes.sort_by_key(|plane| (plane.layer, plane.at, plane.width));
@@ -141,6 +146,10 @@ pub struct Buffers {
     /// Where each buffered layer's run starts in a page's slot.
     rows: Vec<u64>,
     ext_row_bytes: u64,
+    /// The room a gated-delta decode step splits a lane's carried rows in
+    /// (`kernels_cuda::ssm::carry_split_bytes`), zeroed at the load: its
+    /// counters return to zero after each step.
+    split: Option<crate::device::Buffer>,
 }
 
 impl Buffers {
@@ -208,6 +217,12 @@ impl Buffers {
         }
         let ext_row_bytes = ext_row_bytes(trace)?;
         let reach = RsScratch::need(Self::rows_ext(max_rows), ext_row_bytes);
+        #[cfg(feature = "cuda")]
+        let split = kernels_cuda::linear::gemm::multiprocessors()
+            .map(|sms| crate::device::Buffer::zeroed(kernels_cuda::ssm::carry_split_bytes(sms) as usize))
+            .transpose()?;
+        #[cfg(not(feature = "cuda"))]
+        let split = None;
         Ok(Some(Buffers {
             scratch: Scratch {
                 at: 0,
@@ -218,6 +233,7 @@ impl Buffers {
             tokens,
             rows,
             ext_row_bytes,
+            split,
         }))
     }
 }
@@ -343,6 +359,7 @@ enum Reads {
         keys: u64,
         values: u64,
         key_head: u32,
+        v_heads: u32,
     },
     Kda {
         mixed: ValueId,
@@ -456,7 +473,20 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, Vec<u64>)
                     width: 2 * values,
                 };
                 here += 2 * values;
-                corrected.insert(y.0, Corrected { k, u });
+                let scalars = Plane {
+                    layer: decode_layers,
+                    at: page * here,
+                    width: poem_compiler::rs::gdn_scalars_bytes(*v_heads) / ELEMENT,
+                };
+                here += scalars.width;
+                corrected.insert(
+                    y.0,
+                    Corrected {
+                        k,
+                        u,
+                        scalars: Some(scalars),
+                    },
+                );
                 let count = u32::try_from(keys).unwrap_or(u32::MAX);
                 keys_of.insert(conv.0, (k, count, count));
                 step_gates.insert(
@@ -489,6 +519,7 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, Vec<u64>)
                         keys: u64::from(k_heads * k_dim),
                         values: u64::from(v_heads * v_dim),
                         key_head: *k_dim,
+                        v_heads: *v_heads,
                     },
                     true,
                 ),
@@ -509,6 +540,7 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, Vec<u64>)
                         keys: u64::from(k_heads * k_dim),
                         values: u64::from(v_heads * v_dim),
                         key_head: *k_dim,
+                        v_heads: *v_heads,
                     },
                     false,
                 ),
@@ -676,18 +708,19 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, Vec<u64>)
             // with the conv output they are read from, the channel they
             // start at in it, and their count.
             let narrow = |n: u64| u32::try_from(n).unwrap_or(u32::MAX);
-            let (conv_y, keys, values, k_off) = match reads {
+            let (conv_y, keys, values, k_off, scalar_heads) = match reads {
                 Reads::GatedDelta {
                     qkv,
                     keys,
                     values,
                     y,
+                    v_heads,
                     ..
-                } => (qkv, keys, Some((y, values)), keys),
+                } => (qkv, keys, Some((y, values)), keys, Some(v_heads)),
                 Reads::Kda {
                     mixed, width, y, ..
-                } => (mixed, width, Some((y, width)), width),
-                Reads::Mamba2 { xbc, xb, .. } => (xbc, xb, None, 0),
+                } => (mixed, width, Some((y, width)), width, None),
+                Reads::Mamba2 { xbc, xb, .. } => (xbc, xb, None, 0, None),
             };
             let k = Plane {
                 layer,
@@ -703,7 +736,13 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, Vec<u64>)
                     width: 2 * values,
                 };
                 here += 2 * values;
-                corrected.insert(y.0, Corrected { k, u });
+                let scalars = scalar_heads.map(|heads| Plane {
+                    layer,
+                    at: page * here,
+                    width: poem_compiler::rs::gdn_scalars_bytes(heads) / ELEMENT,
+                });
+                here += scalars.map_or(0, |plane| plane.width);
+                corrected.insert(y.0, Corrected { k, u, scalars });
             }
             if chunked {
                 widths.push(here);
@@ -803,6 +842,12 @@ impl Buffers {
     #[must_use]
     pub fn ext_row_bytes(&self) -> u64 {
         self.ext_row_bytes
+    }
+
+    /// Where a decode step splits a lane's carried rows (0: it splits none).
+    #[must_use]
+    pub fn split_room(&self) -> u64 {
+        self.split.as_ref().map_or(0, crate::device::Buffer::ptr)
     }
 
     /// The rows an rs buffer page holds.

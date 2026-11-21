@@ -346,6 +346,9 @@ pub struct RsSeat<'a> {
     pub buffers: &'a crate::store::rs::Buffers,
     pub tables: kernels_cuda::runtime::channel::RsTables,
     pub extended: bool,
+    /// Whether its decode steps split their carried rows over the spare
+    /// blocks (`record::RsBody::Splits`).
+    pub splits: bool,
     pub scratch: Option<&'a RsScratch>,
     /// The beam groups' fold table and its entries, where the fire stages
     /// folds (§11.3): every recurrent layer folds them ahead of the body.
@@ -1427,6 +1430,8 @@ impl<'c> Run<'c> {
             replay_tok: tables.replay_tok,
             commit_len: pool.commit_len.ptr,
             page_tokens: tables.page_tokens.max(1),
+            #[cfg(not(feature = "rocm"))]
+            split: if seat.splits { seat.buffers.split_room() } else { 0 },
             ..kernels_cuda::ssm::Carry::NONE
         };
         for (at, &plane) in planes.iter().enumerate() {

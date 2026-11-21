@@ -6309,12 +6309,19 @@ impl<B: Serve> Shell<B> {
             "the bind walk's fire shapes"
         );
         let mut walked = 0u64;
+        let mut built_nothing = 0u64;
         for (at, lanes) in shapes.iter().enumerate() {
             // Every arm: each walk holds its arm until the shape has taken
-            // them all, then gives them back.
+            // them all, then gives them back. An arm's fire binds what the
+            // shape's fire on another arm does, its stage's buffers in place
+            // of that arm's: where the shape's first fire builds nothing,
+            // every view it binds was built by an earlier fire, whose shape
+            // was walked on every arm, so its fires on the others would
+            // build nothing either, and the walk leaves them.
             let mut taken = Vec::with_capacity(depth);
             let mut fault = None;
-            for _ in 0..depth {
+            for turn in 0..depth {
+                let before = B::bound(&self.pipelines);
                 match self.bind_fire(lanes, dress[at]) {
                     Ok(arm) => {
                         // A bind-only fire settles nothing, which is where
@@ -6323,6 +6330,10 @@ impl<B: Serve> Shell<B> {
                         self.arms.take(arm);
                         taken.push(arm);
                         walked += 1;
+                        if turn == 0 && B::bound(&self.pipelines) == before {
+                            built_nothing += 1;
+                            break;
+                        }
                     }
                     Err(why) => {
                         fault = Some(why);
@@ -6337,6 +6348,13 @@ impl<B: Serve> Shell<B> {
                 return Err(why);
             }
         }
+        tracing::info!(
+            walked,
+            shapes = shapes.len(),
+            built_nothing,
+            arms = depth,
+            "the bind walk: a shape whose first fire built nothing is left on the other arms"
+        );
         Ok(walked)
     }
 

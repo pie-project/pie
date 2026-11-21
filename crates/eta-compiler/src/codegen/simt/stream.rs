@@ -190,16 +190,30 @@ impl<'a> Streams<'a> {
         }
         let ty = &self.stage.normalized.value_types[out as usize];
         let last = *ty.dims.last()?;
-        let readers = self.readers.get(out as usize)?;
-        let viewed = !readers.is_empty()
-            && readers.iter().all(|&reader| {
+        // Every reader a view, and every view a stream reads (past views of
+        // views) a whole row of the output's width.
+        let mut pending = vec![out];
+        let mut any = false;
+        while let Some(at) = pending.pop() {
+            let readers = self.readers.get(at as usize)?;
+            for &reader in readers {
                 let view = self.bases[reader];
-                self.ops[reader].tag == tags::RESHAPE
+                let is_view = self.ops[reader].tag == tags::RESHAPE
                     && self.output_source(view) == Some(out)
-                    && self.class(view) == RowClass::Full(last)
-                    && matches!(last, Dimension::Static(_))
-            });
-        viewed.then_some(last)
+                    && crate::codegen::alias::covers(&self.stage.normalized.value_types, at, view);
+                if is_view {
+                    pending.push(view);
+                } else if at == out
+                    || self.class(at) != RowClass::Full(last)
+                    || !matches!(last, Dimension::Static(_))
+                {
+                    return None;
+                } else {
+                    any = true;
+                }
+            }
+        }
+        any.then_some(last)
     }
 
     /// The nodes past `value`'s views that read it: a view of an output is
@@ -214,7 +228,9 @@ impl<'a> Streams<'a> {
                 .map_or(&[][..], Vec::as_slice)
             {
                 let view = self.bases[reader];
-                if self.ops[reader].tag == tags::RESHAPE && self.output_source(view) == Some(value)
+                if self.ops[reader].tag == tags::RESHAPE
+                    && self.output_source(view).is_some()
+                    && crate::codegen::alias::covers(&self.stage.normalized.value_types, value, view)
                 {
                     pending.push(view);
                 } else {
@@ -493,11 +509,12 @@ impl<'a> Streams<'a> {
         let members = self.plan(at)?;
         let safe = members.iter().all(|member| match member.role {
             Role::Map | Role::Broadcast => true,
-            // An output read in place through its views (one row of no row
-            // geometry of its own) keeps its region whole, as a copied one
-            // did.
+            // An output whole rows of its region read, or one read in place
+            // through views a stream reads as whole rows of its width: each
+            // block reads its stretch of the model's row.
             Role::Intrinsic => {
-                matches!(self.class(self.bases[member.node]), RowClass::Full(_))
+                let out = self.bases[member.node];
+                matches!(self.class(out), RowClass::Full(_)) || self.output_row(out).is_some()
             }
             // A draw's lanes run on from its block's row whole.
             Role::Argmax if self.ops[member.node].tag == tags::GUMBEL_ARGMAX => false,
@@ -558,7 +575,12 @@ impl<'a> Streams<'a> {
                 {
                     let view = self.bases[reader];
                     if self.ops[reader].tag == tags::RESHAPE
-                        && self.output_source(view) == Some(views[at])
+                        && self.output_source(view).is_some()
+                        && crate::codegen::alias::covers(
+                            &self.stage.normalized.value_types,
+                            views[at],
+                            view,
+                        )
                     {
                         views.push(view);
                     }
@@ -725,7 +747,8 @@ pub(super) fn read_in_place_beyond(stage: &CompiledStage, region: &Region, value
         for &reader in &readers[at as usize] {
             let view = bases[reader];
             if ops[reader].tag == tags::RESHAPE
-                && output_source(stage, &ops, &producers, view) == Some(at)
+                && output_source(stage, &ops, &producers, view).is_some()
+                && crate::codegen::alias::covers(&stage.normalized.value_types, at, view)
             {
                 pending.push(view);
             } else if !region.nodes.iter().any(|n| n.index() == reader) {
@@ -776,8 +799,8 @@ pub(super) fn read_in_place_beyond(stage: &CompiledStage, region: &Region, value
 }
 
 /// The model output `value` is a view of: `value` itself where an output
-/// produces it, or the output a reshape covering it (the same elements in
-/// the same order) reads, in any region of the stage. The row is the
+/// produces it, or the output a chain of reshapes covering it (the same
+/// elements in the same order) reads, in any region of the stage. The row is the
 /// model's for the whole stage, so any region may read it where it lies.
 pub(super) fn output_source(
     stage: &CompiledStage,
@@ -792,13 +815,14 @@ pub(super) fn output_source(
     let op = &ops[node as usize];
     match op.tag {
         tags::OUTPUT => Some(value),
+        // A reshape covering its source, itself an output or a view of one
+        // (a one-row fire's squeezed `[v]` reshaped to `[1, v]`, then again).
         tags::RESHAPE if !op.args.is_empty() => {
             let source = op.args[0];
-            let producer = *producers.get(source as usize)?;
-            (producer != u32::MAX
-                && ops[producer as usize].tag == tags::OUTPUT
-                && crate::codegen::alias::covers(&stage.normalized.value_types, source, value))
-            .then_some(source)
+            if !crate::codegen::alias::covers(&stage.normalized.value_types, source, value) {
+                return None;
+            }
+            output_source(stage, ops, producers, source)
         }
         _ => None,
     }
@@ -1328,9 +1352,11 @@ pub(super) fn emit_stream(
     let reduces = members.iter().any(|m| m.role == Role::Reduce);
     if streams.split && reduces {
         // The row's reductions' first levels lie in its work, every block's
-        // partials at their chunks; each block folds them in its own area.
+        // partials at their chunks; each block folds them in its own shared
+        // memory, so a block keeps nothing of its own in the temporary area
+        // and the row's area is the row's, however many blocks it splits
+        // across.
         s.push_str("    float* stream_work = reinterpret_cast<float*>(ptir_row_work);\n");
-        s.push_str("    float* stream_own = reinterpret_cast<float*>(temporary);\n");
     } else if reduces {
         s.push_str("    float* stream_work = reinterpret_cast<float*>(temporary);\n");
     }
@@ -1507,11 +1533,17 @@ pub(super) fn emit_stream(
                         epilogue,
                         "      ptir_meet(ptir_meet_word, {meet}u * ptir_split);"
                     );
+                    // The levels above the first: a value a run of 32 of the
+                    // level below, folded by `ptir_canonical_reduce` in place.
+                    let upper = chunks.div_ceil(32);
                     let _ = writeln!(
                         epilogue,
-                        "      const float total = ptir_canonical_reduce_met({tag}u, stream_work + {slot}u, {chunks}u, stream_own + {}u, stream_own + {}u);",
-                        slot + chunks,
-                        slot + chunks + chunks.div_ceil(32)
+                        "      __shared__ float stream_fold{meet}[{}u];",
+                        upper + upper.div_ceil(32)
+                    );
+                    let _ = writeln!(
+                        epilogue,
+                        "      const float total = ptir_canonical_reduce_met({tag}u, stream_work + {slot}u, {chunks}u, stream_fold{meet}, stream_fold{meet} + {upper}u);"
                     );
                 } else {
                     let _ = writeln!(

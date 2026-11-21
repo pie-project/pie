@@ -25,7 +25,9 @@ pub use conv1d::{
 pub use dyn_conv::dyn_conv;
 pub use gdn_chunk::{gated_delta_chunked, gated_delta_chunked_serial, gdn_lands_snapshots};
 pub use gdn_prep::gdn_gates;
-pub use gdn_recurrent::{GdnGated, gated_delta, gated_delta_carried, gated_delta_fold, gated_delta_tail};
+pub use gdn_recurrent::{
+    GdnGated, carry_split_bytes, gated_delta, gated_delta_carried, gated_delta_fold, gated_delta_tail,
+};
 pub use kda::{kda, kda_carried, kda_chunked, kda_fold, kda_tail};
 pub use mamba2::{Mamba2, mamba2, mamba2_carried, mamba2_chunked, mamba2_fold, mamba2_tail};
 
@@ -48,9 +50,23 @@ pub struct Carry {
     pub plane_stride: [u64; 4],
     pub page_tokens: u32,
     pub pad: u32,
+    /// Where a gated-delta decode step may split a lane's carried rows
+    /// across blocks ([`gated_delta_carried`]): a counter a unit, then each
+    /// part's partial sums, [`CARRY_SPLIT_BYTES_PER_BLOCK`] bytes a block of
+    /// its grid; 0 where it splits none.
+    pub split: u64,
 }
 
-const _: () = assert!(size_of::<Carry>() == 104);
+const _: () = assert!(size_of::<Carry>() == 112);
+
+/// The carried rows a decode step stages at once: a lane carrying more
+/// spans chunks, which a split shares out.
+pub const CARRY_CHUNK: u32 = 16;
+
+/// The bytes a gated-delta decode step's split takes a block of its grid:
+/// its unit's counter and its part's partial sums (`a` and `o`, 128 values
+/// each, f32).
+pub const CARRY_SPLIT_BYTES_PER_BLOCK: u64 = 4 + (2 * 128 + 4) * 4;
 
 impl Carry {
     pub const NONE: Carry = Carry {
@@ -62,6 +78,7 @@ impl Carry {
         plane_stride: [0; 4],
         page_tokens: 1,
         pad: 0,
+        split: 0,
     };
 
     /// The kernels' argument.

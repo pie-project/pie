@@ -1391,6 +1391,10 @@ impl Shell {
         // with no drafts output the load can see) verifies on the plain
         // classes, and it registers after the load arms.
         let buffering = self.buffers.is_some();
+        let splits = self
+            .buffers
+            .as_ref()
+            .is_some_and(|buffers| buffers.split_room() != 0);
         let rungs = self.rs_rungs();
         let targets: Vec<(u32, BodySynth, Treatment)> = targets
             .into_iter()
@@ -1405,7 +1409,14 @@ impl Shell {
                 // A decoding class replays its carried rows in the body that
                 // buffers (`dispatch::ssm`): it records no replaying body.
                 let decodes = class.is_some_and(|class| self.decoding.contains(class as usize));
+                // One that can split a long carry records the splitting
+                // body too: a beam lane's carry runs past a chunk.
                 let treatments: &[record::RsBody] = match (buffers, decodes) {
+                    (true, true) if splits => &[
+                        record::RsBody::Folds,
+                        record::RsBody::Buffers,
+                        record::RsBody::Splits,
+                    ],
                     (true, true) => &[record::RsBody::Folds, record::RsBody::Buffers],
                     (true, false) => &[
                         record::RsBody::Folds,

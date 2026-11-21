@@ -26,7 +26,7 @@ const DEFAULT_BLOCK_THREADS: u32 = 256;
 const WARP: u32 = 32;
 
 #[cfg_attr(not(feature = "device"), allow(dead_code))]
-const MAX_BLOCK_THREADS: u32 = 1024;
+pub(crate) const MAX_BLOCK_THREADS: u32 = 1024;
 
 /// The narrowest block a region is emitted for on ROCm: one wavefront.
 #[cfg(feature = "rocm")]

@@ -759,6 +759,9 @@ pub struct Prepared {
     /// The rows of each region whose rows split across blocks
     /// ([`splits_rows`]).
     row_splits: Vec<Option<u32>>,
+    /// The most blocks each such region's rows split across
+    /// ([`row_split_max`]), a region each.
+    row_split_most: Vec<u32>,
     lanes: u32,
     filled: u32,
     bindings: Vec<u32>,
@@ -802,10 +805,10 @@ fn region_blocks(plan: &LaunchStagePlan, descriptors: &[ValueDesc]) -> Vec<u32> 
         .iter()
         .zip(region_rows(plan, descriptors))
         .map(|(region, rows)| match region.kind {
-            // A row of a region that splits its rows runs on up to a
-            // sampler's blocks: its temporary area is laid for them all.
+            // A row of a region that splits its rows runs on up to
+            // [`row_split_max`] blocks.
             RegionKind::Generated if splits_rows(region, rows) => {
-                rows.saturating_mul(LANE_SAMPLER_BLOCKS)
+                rows.saturating_mul(row_split_max(plan, descriptors, region, rows))
             }
             RegionKind::Generated => rows,
             kind if lane_sampler(kind) => LANE_SAMPLER_BLOCKS,
@@ -815,6 +818,50 @@ fn region_blocks(plan: &LaunchStagePlan, descriptors: &[ValueDesc]) -> Vec<u32> 
             RegionKind::Library(_) => 1,
         })
         .collect()
+}
+
+/// The most blocks a row of a region that splits its `rows` runs across, a
+/// power of two: as many as the device holds at once with them, and no more
+/// than its row's vector passes (a block of
+/// [`super::compile::MAX_BLOCK_THREADS`] threads, four elements a thread),
+/// rounded up to a power of two: more blocks would stream with idle threads
+/// and still pay every meet. A
+/// region whose rows argmax in place keeps its parts' candidates in the lane
+/// arena's sixteen slots a row, so it splits across [`LANE_SAMPLER_BLOCKS`]
+/// at most.
+fn row_split_max(
+    plan: &LaunchStagePlan,
+    descriptors: &[ValueDesc],
+    region: &LaunchRegion,
+    rows: u32,
+) -> u32 {
+    let argmaxes = region.nodes.iter().any(|&node| {
+        plan.ops
+            .get(node as usize)
+            .is_some_and(|op| matches!(op.tag, tags::REDUCE_ARGMAX | tags::GUMBEL_ARGMAX))
+    });
+    // The widest row it streams: its reductions' inputs', its own inputs'
+    // and outputs'.
+    let reduced = region
+        .nodes
+        .iter()
+        .filter_map(|&node| plan.ops.get(node as usize))
+        .filter(|op| matches!(op.tag, tags::REDUCE_SUM | tags::REDUCE_MAX | tags::REDUCE_MIN))
+        .filter_map(|op| op.args.first().copied());
+    let width = reduced
+        .chain(region.inputs.iter().copied())
+        .chain(region.outputs.iter().copied())
+        .filter_map(|value| descriptors.get(value as usize))
+        .map(|row| row.last)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let passes = width
+        .div_ceil(super::compile::MAX_BLOCK_THREADS * 4)
+        .next_power_of_two();
+    let held = (device_units() / rows.max(1)).clamp(1, passes);
+    let most = if argmaxes { held.min(LANE_SAMPLER_BLOCKS) } else { held };
+    1u32 << (31 - most.leading_zeros())
 }
 
 /// Whether `region`'s kernel runs each of its `rows` across several blocks
@@ -857,9 +904,19 @@ fn temporary_bytes(plan: &LaunchStagePlan, descriptors: &[ValueDesc], blocks: &[
     plan.fused
         .iter()
         .zip(blocks)
-        .map(|(region, &blocks)| {
-            block_temporary(plan, descriptors, region)
-                .checked_next_multiple_of(SCRATCH_ALIGN)
+        .zip(region_rows(plan, descriptors))
+        .map(|((region, &blocks), rows)| {
+            let need = block_temporary(plan, descriptors, region);
+            if region.kind == RegionKind::Generated && splits_rows(region, rows) {
+                // A split row's blocks fold in shared memory: only the row's
+                // first level of partials lies here, a row's area each,
+                // whatever its split (its kernel strides the area by row).
+                return need
+                    .checked_next_multiple_of(SCRATCH_ALIGN)
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(u64::from(rows.max(1)));
+            }
+            need.checked_next_multiple_of(SCRATCH_ALIGN)
                 .unwrap_or(u64::MAX)
                 .saturating_mul(u64::from(blocks.max(1)))
         })
@@ -1021,6 +1078,12 @@ impl Prepared {
             .zip(&rows_of)
             .map(|(region, &rows)| splits_rows(region, rows).then_some(rows))
             .collect();
+        let row_split_most = plan
+            .fused
+            .iter()
+            .zip(&rows_of)
+            .map(|(region, &rows)| row_split_max(plan, &descriptors, region, rows))
+            .collect();
 
         let mut records = Vec::with_capacity(plan.ops.len());
         let mut result_base = 0u32;
@@ -1122,6 +1185,7 @@ impl Prepared {
             samplers,
             splits,
             row_splits,
+            row_split_most,
             lanes: 0,
             filled: 0,
             bindings: plan.channel_bindings.clone(),
@@ -1557,7 +1621,7 @@ impl Prepared {
         // with the fire's lanes (its blocks wait on one another), in its own
         // span of the engine's lane arenas: its blocks' arenas and its
         // gather buffers; the lanes' barrier words start at zero.
-        let rows = if let Some(Some(most)) = self.splits.get(at).copied() {
+        let (rows, strided) = if let Some(Some(most)) = self.splits.get(at).copied() {
             // A split select's lane runs on as many blocks as the device
             // holds with the fire's lanes, its candidates and its count in
             // its first arena; its last block merges (none waits).
@@ -1571,7 +1635,7 @@ impl Prepared {
                 });
             }
             self.zero_barriers(arenas, lane_span(1), stream)?;
-            blocks
+            (blocks, blocks)
         } else if sampler {
             let rows = lane_blocks(device_units(), self.filled).min(rows);
             let need = u64::from(self.filled) * lane_span(rows);
@@ -1583,13 +1647,14 @@ impl Prepared {
                 });
             }
             self.zero_barriers(arenas, lane_span(rows), stream)?;
-            rows
+            (rows, rows)
         } else if let Some(Some(region_rows)) = self.row_splits.get(at).copied() {
             // Each row on as many blocks as the device holds at once with
             // the fire's lanes' rows (they wait on one another), meeting at
             // its word of its lane's barrier line.
-            let split =
-                (device_units() / self.filled.saturating_mul(region_rows).max(1)).clamp(1, LANE_SAMPLER_BLOCKS);
+            let most = self.row_split_most.get(at).copied().unwrap_or(1).max(1);
+            let held = (device_units() / self.filled.saturating_mul(region_rows).max(1)).clamp(1, most);
+            let split = 1u32 << (31 - held.leading_zeros());
             if split > 1 {
                 let need = u64::from(self.filled) * lane_span(1);
                 if need > arenas.bytes {
@@ -1601,11 +1666,13 @@ impl Prepared {
                 }
                 self.zero_barriers(arenas, lane_span(1), stream)?;
             }
-            region_rows * split
+            (region_rows * split, region_rows)
         } else {
-            rows
+            (rows, rows)
         };
-        let stride = (self.temporary_bytes / rows) & !(SCRATCH_ALIGN as u32 - 1);
+        // A split row's temporary area is its row's (its blocks fold in
+        // shared memory), strided by row; every other block's is its own.
+        let stride = (self.temporary_bytes / strided) & !(SCRATCH_ALIGN as u32 - 1);
         args.u32(rows).u32(stride).ptr(arenas.at);
         // A value stated to take no bytes lies on the lane's dummy bytes: a
         // build with `test-slot-fill` poisons them before every launch, so a
@@ -2451,6 +2518,7 @@ mod tests {
             let laid = lay_out(plan, &descriptors)
                 .unwrap_or_else(|why| panic!("{name} over {vocab}: {why}"));
             let blocks = region_blocks(plan, &descriptors);
+            let rows_of = region_rows(plan, &descriptors);
             assert_eq!(stage.fused.regions.len(), plan.fused.len());
             for (index, (region, lowered)) in
                 stage.fused.regions.iter().zip(&plan.fused).enumerate()
@@ -2484,8 +2552,16 @@ mod tests {
                     lowered.kind
                 );
                 // Each of the region's blocks is handed at least what it
-                // keeps: the stride `launch_region` cuts the area into.
-                let rows = u64::from(blocks[index].max(1));
+                // keeps: the stride `launch_region` cuts the area into (a
+                // split row's area is its row's, strided by row).
+                let region_rows = rows_of[index];
+                let rows = if lowered.kind == RegionKind::Generated
+                    && splits_rows(lowered, region_rows)
+                {
+                    u64::from(region_rows.max(1))
+                } else {
+                    u64::from(blocks[index].max(1))
+                };
                 let stride = (laid.temporary_bytes / rows) & !(SCRATCH_ALIGN - 1);
                 assert!(
                     stride >= stated,

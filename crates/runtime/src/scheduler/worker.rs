@@ -2080,6 +2080,14 @@ impl BatchScheduler {
                         ));
                     }
                     if let Some(stamp) = launch.frame {
+                        // Read only for the seal trace: off, no lookup.
+                        let program = if frame::seal_trace() {
+                            instances
+                                .get(&launch.instance_id)
+                                .map_or(0, |instance| instance.program_id.0)
+                        } else {
+                            0
+                        };
                         frame_policy.on_fire_reading(
                             stamp,
                             launch.process_id,
@@ -2088,6 +2096,7 @@ impl BatchScheduler {
                             launch.wire_row_count(),
                             launch.request.sequence_readouts(),
                             launch.request.rung_rows(),
+                            program,
                         );
                     }
                     Self::queue_attempt(pending, launch);
@@ -3226,6 +3235,8 @@ impl Drop for BatchScheduler {
 }
 
 struct TrackedInstance {
+    /// The program it runs, as the seal trace names a fire's.
+    program_id: ::engine::ProgramId,
     pacing_wait_id: u64,
     wait_slots: Arc<crate::engine::BoundWaitSlots>,
     in_flight: usize,
@@ -3235,6 +3246,7 @@ struct TrackedInstance {
 impl TrackedInstance {
     fn from_bound(bound: &BoundInstance) -> Self {
         Self {
+            program_id: bound.program_id,
             pacing_wait_id: bound.pacing_wait_id,
             wait_slots: bound.wait_slots(),
             in_flight: 0,
