@@ -546,6 +546,7 @@ impl<B: Host> Gpu<B> {
         };
         for (step, pending) in steps.iter_mut().enumerate() {
             let mut outcome = engine::StepOutcome {
+                beam_common: Vec::new(),
                 wrote: std::mem::take(&mut pending.wrote),
                 faulted: std::mem::take(&mut pending.faulted),
             };
@@ -1185,6 +1186,46 @@ where
         let registered = self.programs.register(registration).map_err(refusal);
         self.count_registered();
         self.refused(registered)
+    }
+
+    /// The runtime's standard samplers, before ready: each adopted and its
+    /// stages lowered as its registration does them, and every step call
+    /// their stages dispatch held to a pipeline the load built
+    /// (`Programs::load`), so a request that registers one, or binds it,
+    /// builds nothing. A program that does not adopt, or that dispatches a
+    /// call the load could not build, fails the load by name. No stage holds
+    /// code of its own (`guest::Compiled`): nothing here is keyed on a
+    /// program's hash, which its channels' capacities enter.
+    fn prewarm_programs(&mut self, registrations: &[ProgramRegistration]) -> EngineResult<()> {
+        if self.shell.is_none() {
+            return Err(Error::Program(
+                "the standard samplers prewarmed before load".to_owned(),
+            ));
+        }
+        let started = std::time::Instant::now();
+        let prewarmed = crate::program::prewarm(registrations).map_err(refusal)?;
+        for &call in &prewarmed.calls {
+            if let Some(why) = self.programs.unbuilt(call) {
+                return Err(Error::Load(format!(
+                    "a standard sampler dispatches guest step call {call}, which the load did \
+                     not build: {why}"
+                )));
+            }
+        }
+        tracing::info!(
+            engine = B::KIND,
+            programs = prewarmed.programs,
+            stages = prewarmed.stages,
+            calls = prewarmed.calls.len(),
+            built_serving = self.programs.built_serving(),
+            slowest_ms = prewarmed.slowest.as_secs_f64() * 1e3,
+            ms = started.elapsed().as_secs_f64() * 1e3,
+            hashes = format_args!("{:016x}", prewarmed.hashes),
+            forms = format_args!("{:016x}", prewarmed.forms),
+            "the standard samplers adopted before ready; every step call they dispatch has its \
+             pipeline from the load"
+        );
+        Ok(())
     }
 
     /// The program adopted and its stages lowered in the returned compile,

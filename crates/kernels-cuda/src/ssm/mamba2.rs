@@ -109,11 +109,11 @@ pub fn mamba2(
     m.norm(ctx, OP, y)
 }
 
-/// [`mamba2`] over each lane's carried rows then its own ([`Carry`]): each
-/// head's state steps the carried rows (their convolved `xbc` from the
-/// carried scratch, their step sizes from their buffered rows, plane 0)
-/// then the own row, and is stored at the lane's commit length; the own
-/// row's step size lands in the lane's buffer.
+/// [`mamba2`] over each lane's carried rows then its own ([`Carry`]), the
+/// carried rows read as a linear attention from the committed state: their
+/// step sizes (plane 0) and convolved `x | B` (plane 1) as one dot and one
+/// decay a row; each head's state folded through the lane's commit length.
+/// The own row's step size lands in the lane's buffer.
 #[allow(clippy::too_many_arguments)]
 pub fn mamba2_carried(
     ctx: &Ctx,
@@ -154,6 +154,54 @@ pub fn mamba2_carried(
         ],
     )?;
     m.norm(ctx, OP, y)
+}
+
+/// The rows a chunked Mamba-2 fire's lanes land in their buffer past their
+/// commit, made ready for a later decode ([`mamba2_carried`]): each row's
+/// convolved `x | B` (plane 1; its step size, plane 0, the fire lands).
+/// `xbc` is the fire's own rows by `qo_indptr`, or with `ext` its extended
+/// rows (row `RsLane::ext + j`).
+#[allow(clippy::too_many_arguments)]
+pub fn mamba2_tail(
+    ctx: &Ctx,
+    xbc: Tensor,
+    m: Mamba2,
+    state: &RecurrentPool,
+    qo_indptr: Tensor,
+    ext: bool,
+    state_dim: u32,
+    carry: &Carry,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.mamba2_chunked";
+    if !carry.buffers() {
+        return Ok(());
+    }
+    dtype_dispatch!(OP, xbc.dtype, { Bf16 => () });
+    let lanes = qo_indptr.rows.saturating_sub(1);
+    if lanes == 0 {
+        return Ok(());
+    }
+    let xb = xbc.width - m.groups * state_dim;
+    if !xb.is_multiple_of(8) {
+        return Err(refuse(OP, format!("a {xb}-wide `x | B` row the tail copies in 16-byte runs")));
+    }
+    ctx.fire(
+        OP,
+        Fire::at(kernel(MAMBA2, "::pie::ssm::mamba2_tail_rows"))
+            .apply(Launch::grid([lanes, 1, 1], [BLOCK, 1, 1])),
+        &[
+            xbc.arg(),
+            qo_indptr.arg(),
+            ext.arg(),
+            stated(OP, xbc.width)?.arg(),
+            stated(OP, xb)?.arg(),
+            state.write_state.arg(),
+            state.write_state_mask.arg(),
+            stated(OP, lanes)?.arg(),
+            carry.arg(),
+            ctx.stage(),
+        ],
+    )
 }
 
 /// A prompt's Mamba-2 walk in sixteen-token chunks: a block a (request,

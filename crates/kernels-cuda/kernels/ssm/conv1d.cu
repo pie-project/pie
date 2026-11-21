@@ -736,13 +736,12 @@ __global__ void conv1d_update_vec8(
 // the lane's run is a carried row (t < n, its input read from the lane's rs
 // buffer pages, plane 0) or its own (t = n), and positions below 0 are the
 // committed window's cells. The own row's output is the sum over its window,
-// `conv1d_update`'s in its order, from at most `K - 1` carried rows; where a
-// recurrence re-steps the carried rows (`carry.scratch`), their outputs land
-// there too. The window is stored as it stands after `commit` rows of the
-// run, never past a row the lane has not committed. The own row's input
-// lands in its buffer (plane 0), and the channels `[k_off, k_off + k_len)`
-// of its output in plane 1 (a gated-delta layer's keys). A thread a channel,
-// any dilation.
+// `conv1d_update`'s in its order, from at most `K - 1` carried rows. The
+// window is stored as it stands after `commit` rows of the run, never past
+// a row the lane has not committed. The own row's input lands in its buffer
+// (plane 0), and the channels `[k_off, k_off + k_len)` of its output in
+// plane 1 (what its recurrence reads its buffered rows by). A thread a
+// channel, any dilation.
 template <class T, bool SILU = true, bool RESIDUAL = false>
 __global__ void conv1d_carried(
     const T* __restrict__ x,
@@ -778,25 +777,17 @@ __global__ void conv1d_carried(
         if (t < n) return Elem<T>::to_f32(carry.carried_row<T>(lane, t, 0)[c]);
         return Elem<T>::to_f32(x_own);
     };
-    const float bias_v = bias ? Elem<T>::to_f32(bias[c]) : 0.f;
-    const u64 row_bytes = static_cast<u64>(C) * sizeof(T);
-    for (int t = carry.scratch != nullptr ? 0 : n; t <= n; ++t) {
-        float acc = bias_v;
-        #pragma unroll
-        for (int k = 0; k < 8; ++k) {
-            if (k >= K) break;
-            const float wv = Elem<T>::to_f32(weight[c * K + k]);
-            acc += wv * at(t - (K - 1 - k) * dil);
-        }
-        const T out = Elem<T>::from_f32(conv_out<SILU, RESIDUAL>(acc, at(t)));
-        if (t == n) {
-            y[(long long)r_row * C + c] = out;
-            if (c >= k_off && c < k_off + k_len) {
-                if (T* dst = carry.own_row<T>(lane, 0, 1)) dst[c - k_off] = out;
-            }
-        } else {
-            carry.scratch_row<T>(lane, t, row_bytes)[c] = out;
-        }
+    float acc = bias ? Elem<T>::to_f32(bias[c]) : 0.f;
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        if (k >= K) break;
+        const float wv = Elem<T>::to_f32(weight[c * K + k]);
+        acc += wv * at(n - (K - 1 - k) * dil);
+    }
+    const T out = Elem<T>::from_f32(conv_out<SILU, RESIDUAL>(acc, at(n)));
+    y[(long long)r_row * C + c] = out;
+    if (c >= k_off && c < k_off + k_len) {
+        if (T* dst = carry.own_row<T>(lane, 0, 1)) dst[c - k_off] = out;
     }
     const int commit = carry.commit(rl, n + 1);
     if (!folds(write_state, write_state_mask, rl) || commit <= 0) return;
@@ -853,7 +844,6 @@ __global__ void conv1d_carried_vec8(
     const int n = carry.carried(lane);
     const int commit = carry.commit(rl, n + 1);
     const bool fold = folds(write_state, write_state_mask, rl) && commit > 0;
-    const u64 row_bytes = static_cast<u64>(C) * sizeof(T);
     // Run position t's input: a committed cell, a carried row or the own row.
     auto cell = [&](int t) {
         Vec v;
@@ -902,12 +892,6 @@ __global__ void conv1d_carried_vec8(
         }
         return yv;
     };
-    if (carry.scratch != nullptr) {
-        for (int j = 0; j < n; ++j) {
-            const Vec yj = step(j);
-            *reinterpret_cast<uint4*>(carry.scratch_row<T>(lane, j, row_bytes) + c0) = yj.raw;
-        }
-    }
     const Vec yo = step(n);
     *reinterpret_cast<uint4*>(y + (long long)r_row * C + c0) = yo.raw;
     if (c0 >= k_off && c0 < k_off + k_len) {

@@ -110,12 +110,18 @@ fn heavier_epilogue(rounds: u32) -> eta_ir::container::TraceContainer {
 /// thread (`Engine::prepare_program`): its fires keep landing, none waiting
 /// out the compile, and the program registers at the finish.
 ///
+/// The test holds the device alone (`gpu::alone`): a model test beside it
+/// (the score oracles' loads and fires) keeps the device busy for tens of
+/// milliseconds, and the lane's fence wait across it reads as a stall behind
+/// the compile, which is host work alone (`program::adopt`).
+///
 /// Known to fail on the RTX Spark (Windows NVIDIA driver): a one-time submit stall early in
 /// the engine's life lands inside the compile window in about half the runs, with no pie lock
 /// involved (`new-memory/FOLLOWUPS.md` F41). The measurement stays strict.
 #[test]
 fn a_cold_registration_compiles_while_a_lane_fires() {
     use engine::fire::{Attachment, FrameSubmission, InputFeed, Lane, Readout, Step};
+    crate::gpu::alone();
     let Some(super::outputs::Bound {
         mut engine,
         instance,
@@ -204,4 +210,65 @@ fn a_cold_registration_compiles_while_a_lane_fires() {
     fire(&mut engine);
     drop(engine);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The load's prewarm of a program (`Engine::prewarm_programs`) adopts it as
+/// its registration does and holds every step call its stages dispatch to a
+/// pipeline the load built: a registration after it builds nothing. What
+/// the prewarm lowers is keyed on the stages' code, not the program's hash:
+/// the program at another channel capacity (the runtime's frame size sets
+/// it) has another hash and lowers to the same dispatches. The negative
+/// control: a call the load's pipeline was taken out of refuses the
+/// prewarm, by the call.
+#[test]
+fn a_prewarm_holds_a_programs_calls_to_the_loads_pipelines() {
+    use engine::live::Tally;
+    use engine_gpu::program::Programs as _;
+    let Some(mut loaded) = loaded("prewarm", &Outputs) else {
+        return;
+    };
+    let decls = super::outputs::output_decls(&loaded.caps);
+    let registration = epilogue_registration(&loaded.caps);
+    let mut wider = super::outputs::epilogue();
+    for channel in &mut wider.channels {
+        channel.capacity = 5;
+    }
+    let wider = super::outputs::registration_of(&decls, wider, 0x0e8);
+    assert_ne!(
+        registration.launch, wider.launch,
+        "the capacity is in the program"
+    );
+    let narrow = engine_gpu::program::prewarm(std::slice::from_ref(&registration))
+        .expect("the program adopts");
+    let wide =
+        engine_gpu::program::prewarm(std::slice::from_ref(&wider)).expect("the program adopts");
+    assert_ne!(narrow.hashes, wide.hashes, "another hash");
+    assert_eq!(narrow.forms, wide.forms, "the same dispatches");
+    assert_eq!(narrow.calls, wide.calls, "the same pipelines");
+
+    loaded
+        .engine
+        .prewarm_programs(&[registration.clone(), wider.clone()])
+        .expect("the prewarm finds every call built");
+    let live = loaded.engine.live();
+    for program in [&registration, &wider] {
+        loaded
+            .engine
+            .register_program(program)
+            .expect("the program registers");
+    }
+    assert_eq!(live.tallied(Tally::BuiltAtRegister), 0, "a registration built nothing");
+    assert_eq!(live.tallied(Tally::BuiltInFire), 0);
+
+    let call = *narrow.calls.first().expect("the program dispatches a call");
+    loaded.engine.programs.forget_step(call);
+    let refused = loaded
+        .engine
+        .prewarm_programs(std::slice::from_ref(&registration))
+        .expect_err("a call with no pipeline from the load refuses the prewarm");
+    assert!(
+        refused.to_string().contains(&format!("guest step call {call}")),
+        "the refusal names the call: {refused}"
+    );
+    let _ = std::fs::remove_dir_all(&loaded.dir);
 }

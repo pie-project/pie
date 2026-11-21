@@ -22,7 +22,6 @@ impl Run<'_> {
                 dilation,
                 y,
             } => {
-                #[cfg(not(feature = "rocm"))]
                 if self.rs_buffered(*x) {
                     return self.conv1d_carried(
                         *x,
@@ -33,23 +32,6 @@ impl Run<'_> {
                         *dilation,
                         *y,
                     );
-                }
-                // ROCm replays a decode step's carried rows extended.
-                #[cfg(feature = "rocm")]
-                {
-                    if self.rs_extended() {
-                        return self.conv1d_extended(
-                            "ssm.causal_conv1d",
-                            *x,
-                            *weight,
-                            *bias,
-                            *state,
-                            *conv_width,
-                            *dilation,
-                            *y,
-                        );
-                    }
-                    self.rs_move("ssm.causal_conv1d", *x, self.tensor(*x))?;
                 }
                 kernels_cuda::ssm::causal_conv1d(
                     self.ctx(),
@@ -193,27 +175,25 @@ impl Run<'_> {
                 v_dim,
                 y,
             } => {
-                #[cfg(not(feature = "rocm"))]
-                if self.rs_step_gates(*gates)
-                    && let Some(gated) = self.gdn_gated(*gates)
-                {
+                // A buffering fire's decode step reads its lanes' carried
+                // rows, through the gate prep whose `[b | a]` it lands: one
+                // whose gates no buffered gate prep forms is refused by name,
+                // never run as the plain step over the state alone.
+                if self.rs_buffering() {
+                    let gated = self
+                        .rs_step_gates(*gates)
+                        .then(|| self.gdn_gated(*gates))
+                        .flatten()
+                        .ok_or_else(|| kernels_cuda::Error::Backend {
+                            op: "ssm.gated_delta",
+                            detail: format!(
+                                "a buffering fire's decode step whose gates (value {}) no \
+                                 buffered gate prep forms: its carried rows would go unread",
+                                gates.0
+                            ),
+                        })?;
                     return self.gated_delta_carried(
                         *qkv, *gates, gated, *state, *k_heads, *v_heads, *k_dim, *v_dim, *y,
-                    );
-                }
-                #[cfg(feature = "rocm")]
-                if self.rs_extended() {
-                    return self.gated_delta_extended(
-                        "ssm.gated_delta",
-                        *qkv,
-                        *z,
-                        *gates,
-                        *state,
-                        *k_heads,
-                        *v_heads,
-                        *k_dim,
-                        *v_dim,
-                        *y,
                     );
                 }
                 kernels_cuda::ssm::gated_delta(
@@ -281,7 +261,6 @@ impl Run<'_> {
                         &mut self.tensor(*y),
                     )?;
                 }
-                #[cfg(not(feature = "rocm"))]
                 self.gated_delta_tail(
                     self.tensor(*qkv),
                     self.tensor(*gates),
@@ -306,7 +285,6 @@ impl Run<'_> {
                 gate_floor,
                 y,
             } => {
-                #[cfg(not(feature = "rocm"))]
                 if self.rs_buffered(*f) {
                     return self.kda_carried(
                         *mixed,
@@ -320,27 +298,6 @@ impl Run<'_> {
                         *gate_floor,
                         *y,
                     );
-                }
-                #[cfg(feature = "rocm")]
-                {
-                    if self.rs_extended() {
-                        return self.kda_extended(
-                            "ssm.kda",
-                            *mixed,
-                            *f,
-                            *b,
-                            *dt_bias,
-                            *a_log,
-                            *state,
-                            *heads,
-                            *head_dim,
-                            *norm_eps,
-                            *gate_floor,
-                            *y,
-                        );
-                    }
-                    self.rs_move("ssm.kda", *f, self.tensor(*f))?;
-                    self.rs_move("ssm.kda", *b, self.tensor(*b))?;
                 }
                 kernels_cuda::ssm::kda(
                     self.ctx(),
@@ -397,11 +354,10 @@ impl Run<'_> {
                     heads: *heads,
                     groups: *groups,
                 };
-                #[cfg(not(feature = "rocm"))]
                 if !chunked && self.rs_buffered(*dt) {
                     return self.mamba2_carried(*xbc, *dt, *z, m, *state, *state_dim, *y);
                 }
-                if (chunked || cfg!(feature = "rocm")) && self.rs_extended() {
+                if chunked && self.rs_extended() {
                     return self.mamba2_extended(
                         "ssm.mamba2",
                         *xbc,
@@ -414,6 +370,7 @@ impl Run<'_> {
                     );
                 }
                 self.rs_move("ssm.mamba2", *dt, self.tensor(*dt))?;
+                let dt_id = *dt;
                 let (dt, z) = (self.tensor(*dt), self.tensor(*z));
                 if !chunked {
                     return kernels_cuda::ssm::mamba2(
@@ -437,7 +394,9 @@ impl Run<'_> {
                     self.recurrent_tail_absolute(*state).as_ref(),
                     *state_dim,
                     &mut self.tensor(*y),
-                )
+                )?;
+                self.mamba2_tail(self.tensor(*xbc), false, [*xbc, dt_id], m, *state, *state_dim)?;
+                Ok(())
             }
             Ssm::KdaChunked {
                 mixed,
@@ -485,21 +444,32 @@ impl Run<'_> {
                     *gate_floor,
                     &mut self.tensor(*y),
                 )?;
-                let Some(tail) = tail else { return Ok(()) };
-                kernels_cuda::ssm::kda_chunked(
-                    self.ctx(),
-                    self.ragged_lanes(*mixed),
-                    self.tensor(*f),
-                    self.tensor(*b),
-                    self.tensor(*dt_bias),
-                    self.tensor(*a_log),
-                    &tail,
-                    *heads,
-                    *head_dim,
-                    *norm_eps,
-                    *gate_floor,
-                    &mut self.tensor(*y),
-                )
+                if let Some(tail) = tail {
+                    kernels_cuda::ssm::kda_chunked(
+                        self.ctx(),
+                        self.ragged_lanes(*mixed),
+                        self.tensor(*f),
+                        self.tensor(*b),
+                        self.tensor(*dt_bias),
+                        self.tensor(*a_log),
+                        &tail,
+                        *heads,
+                        *head_dim,
+                        *norm_eps,
+                        *gate_floor,
+                        &mut self.tensor(*y),
+                    )?;
+                }
+                self.kda_tail(
+                    [self.tensor(*mixed), self.tensor(*f), self.tensor(*b)],
+                    false,
+                    [*mixed, *f, *b, *y],
+                    *dt_bias,
+                    *a_log,
+                    *state,
+                    (*heads, *head_dim, *norm_eps, *gate_floor),
+                )?;
+                Ok(())
             }
             Ssm::DynConv {
                 x,
@@ -526,13 +496,16 @@ impl Run<'_> {
 impl Run<'_> {
     /// The gate prep `gates` comes from: its `[b | a]`, `dt_bias` and
     /// `A_log`.
-    #[cfg(not(feature = "rocm"))]
     fn gdn_gated(&self, gates: ValueId) -> Option<(ValueId, ValueId, ValueId)> {
         let poem_ir::Def::Op(node) = self.values().get(gates.0 as usize)?.def else {
             return None;
         };
         match &self.nodes().get(node as usize)?.op {
             poem_ir::Operation::Ssm(Ssm::GdnGates {
+                ba, dt_bias, a_log, ..
+            })
+            // The fused decode step's gate prep, run as its primitives.
+            | poem_ir::Operation::Fused(poem_ir::Fused::GdnStep {
                 ba, dt_bias, a_log, ..
             }) => Some((*ba, *dt_bias, *a_log)),
             _ => None,
@@ -541,8 +514,7 @@ impl Run<'_> {
 
     /// A gated-delta layer's buffered planes, as its kernels read them: the
     /// rows' `[b | a]`, keys and corrected values.
-    #[cfg(not(feature = "rocm"))]
-    fn gdn_planes(
+    pub(crate) fn gdn_planes(
         &self,
         op: &'static str,
         ba: ValueId,
@@ -566,7 +538,6 @@ impl Run<'_> {
     /// lanes' commits, made ready for a later decode: their corrected values
     /// and keys into their buffer, from `qkv` and `gates` (the fire's own
     /// rows, or with `ext` its extended run's).
-    #[cfg(not(feature = "rocm"))]
     #[allow(clippy::too_many_arguments)]
     fn gated_delta_tail(
         &self,
@@ -590,7 +561,7 @@ impl Run<'_> {
             });
         };
         let pool = self.recurrent_absolute(state);
-        let carry = self.rs_carry(OP, &self.gdn_planes(OP, ba, y)?, 0, &pool)?;
+        let carry = self.rs_carry(OP, &self.gdn_planes(OP, ba, y)?, &pool)?;
         kernels_cuda::ssm::gated_delta_tail(
             self.ctx(),
             qkv,
@@ -608,14 +579,67 @@ impl Run<'_> {
         )
     }
 
+    /// The beam groups' conv window folds before the layer's step (§11.3).
+    pub(crate) fn conv1d_group_fold(
+        &self,
+        x: ValueId,
+        state: ValueId,
+        conv_width: u32,
+        dilation: u32,
+    ) -> Result<(), kernels_cuda::Error> {
+        const OP: &str = "ssm.causal_conv1d";
+        let Some((carry, folds, groups)) = self.rs_group_folds(OP, &[self.rs_plane(OP, x)?])?
+        else {
+            return Ok(());
+        };
+        kernels_cuda::ssm::conv1d_fold(
+            self.ctx(),
+            &one_token(self.recurrent_absolute(state)),
+            self.tensor(x).width,
+            conv_width,
+            dilation,
+            &carry,
+            folds,
+            groups,
+        )
+    }
+
+    /// The beam groups' gated-delta folds before the layer's step (§11.3).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn gated_delta_group_fold(
+        &self,
+        (ba, dt_bias, a_log): (ValueId, ValueId, ValueId),
+        state: ValueId,
+        (k_heads, v_heads, k_dim, v_dim): (u32, u32, u32, u32),
+        y: ValueId,
+    ) -> Result<(), kernels_cuda::Error> {
+        const OP: &str = "ssm.gated_delta";
+        let Some((carry, folds, groups)) =
+            self.rs_group_folds(OP, &self.gdn_planes(OP, ba, y)?)?
+        else {
+            return Ok(());
+        };
+        kernels_cuda::ssm::gated_delta_fold(
+            self.ctx(),
+            &one_token(self.recurrent_absolute(state)),
+            k_heads,
+            v_heads,
+            k_dim,
+            v_dim,
+            self.tensor(dt_bias),
+            self.tensor(a_log),
+            &carry,
+            folds,
+            groups,
+        )
+    }
+
     /// A decode conv of a buffering fire: each lane's own row reads its
     /// window from the committed cells and its last carried rows
-    /// ([`kernels_cuda::ssm::Carry`]). A gated-delta layer's conv lands the
-    /// row's keys in its buffer for the step's linear attention; a KDA or
-    /// Mamba-2 layer's lands its carried rows' outputs in the carried
-    /// scratch for the step that re-steps them; a lone conv's outputs
-    /// nothing reads.
-    #[cfg(not(feature = "rocm"))]
+    /// ([`kernels_cuda::ssm::Carry`]), and lands in its buffer the channels
+    /// its recurrence reads a buffered row by (a gated-delta or KDA layer's
+    /// keys, a Mamba-2 layer's `x | B`); a lone conv's outputs nothing
+    /// reads.
     #[allow(clippy::too_many_arguments)]
     fn conv1d_carried(
         &self,
@@ -628,19 +652,24 @@ impl Run<'_> {
         y: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
         const OP: &str = "ssm.causal_conv1d";
+        self.conv1d_group_fold(x, state, conv_width, dilation)?;
         let pool = self.recurrent_absolute(state);
         let x_plane = self.rs_plane(OP, x)?;
-        let keys = self.rs_planes().and_then(|planes| planes.keys_of(y));
-        let (scratch, planes, keys) = match keys {
-            Some((k_plane, k_off, _)) => (
-                0,
-                vec![x_plane, k_plane],
-                Some((k_off, u32::try_from(k_plane.width).unwrap_or(u32::MAX))),
-            ),
-            None if self.rs_lone(x) => (0, vec![x_plane], None),
-            None => (self.rs_carried_out(OP, y)?, vec![x_plane], None),
+        let (planes, keys) = match self.rs_planes().and_then(|planes| planes.keys_of(y)) {
+            Some((k_plane, k_off, k_len)) => (vec![x_plane, k_plane], Some((k_off, k_len))),
+            None if self.rs_lone(x) => (vec![x_plane], None),
+            None => {
+                return Err(kernels_cuda::Error::Backend {
+                    op: OP,
+                    detail: format!(
+                        "the decode conv landing value {} feeds a recurrence that keeps none \
+                         of its channels in its buffer, so a later step cannot read the row",
+                        y.0
+                    ),
+                });
+            }
         };
-        let carry = self.rs_carry(OP, &planes, scratch, &pool)?;
+        let carry = self.rs_carry(OP, &planes, &pool)?;
         kernels_cuda::ssm::causal_conv1d_carried(
             self.ctx(),
             self.tensor(x),
@@ -658,7 +687,6 @@ impl Run<'_> {
     /// A gated-delta decode step of a buffering fire, over each lane's
     /// buffered rows then its own: the rows' gates, keys and corrected values
     /// from their buffer, read as a linear attention.
-    #[cfg(not(feature = "rocm"))]
     #[allow(clippy::too_many_arguments)]
     fn gated_delta_carried(
         &self,
@@ -673,9 +701,15 @@ impl Run<'_> {
         y: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
         const OP: &str = "ssm.gated_delta";
+        self.gated_delta_group_fold(
+            (ba, dt_bias, a_log),
+            state,
+            (k_heads, v_heads, k_dim, v_dim),
+            y,
+        )?;
         let pool = self.recurrent_absolute(state);
         let _ = qkv;
-        let carry = self.rs_carry(OP, &self.gdn_planes(OP, ba, y)?, 0, &pool)?;
+        let carry = self.rs_carry(OP, &self.gdn_planes(OP, ba, y)?, &pool)?;
         kernels_cuda::ssm::gated_delta_carried(
             self.ctx(),
             self.tensor(qkv),
@@ -695,10 +729,47 @@ impl Run<'_> {
         )
     }
 
+    /// The buffered planes a KDA or Mamba-2 layer's kernels read: the
+    /// planes of `reads` (its read values), then the conv output `conv_y`'s
+    /// kept channels and, where the recurrence landing `y` keeps them, its
+    /// corrected values.
+    fn rs_step_planes(
+        &self,
+        op: &'static str,
+        reads: &[ValueId],
+        conv_y: ValueId,
+        y: Option<ValueId>,
+    ) -> Result<Vec<crate::store::rs::Plane>, kernels_cuda::Error> {
+        let missing = |what: &str, id: ValueId| kernels_cuda::Error::Backend {
+            op,
+            detail: format!(
+                "value {} keeps no {what} in its buffer, so a buffered row's step cannot be \
+                 read back",
+                id.0
+            ),
+        };
+        let mut planes = reads
+            .iter()
+            .map(|&id| self.rs_plane(op, id))
+            .collect::<Result<Vec<_>, _>>()?;
+        let kept = self
+            .rs_planes()
+            .and_then(|planes| planes.keys_of(conv_y))
+            .ok_or_else(|| missing("convolved channels", conv_y))?;
+        planes.push(kept.0);
+        if let Some(y) = y {
+            let corrected = self
+                .rs_planes()
+                .and_then(|planes| planes.corrected(y))
+                .ok_or_else(|| missing("corrected values", y))?;
+            planes.push(corrected.u);
+        }
+        Ok(planes)
+    }
+
     /// A KDA decode step of a buffering fire, over each lane's carried rows
-    /// then its own: their `[q | k | v]` from the carried scratch, their
-    /// forget and beta rows from their buffer.
-    #[cfg(not(feature = "rocm"))]
+    /// then its own: their forget and beta rows, keys and corrected values
+    /// from their buffer, read as a linear attention.
     #[allow(clippy::too_many_arguments)]
     fn kda_carried(
         &self,
@@ -715,8 +786,24 @@ impl Run<'_> {
     ) -> Result<(), kernels_cuda::Error> {
         const OP: &str = "ssm.kda";
         let pool = self.recurrent_absolute(state);
-        let scratch = self.rs_carried_of(OP, mixed)?;
-        let carry = self.rs_carry(OP, &[self.rs_plane(OP, f)?, self.rs_plane(OP, b)?], scratch, &pool)?;
+        let planes = self.rs_step_planes(OP, &[f, b], mixed, Some(y))?;
+        // The beam groups' folds first (§11.3).
+        if let Some((carry, folds, groups)) = self.rs_group_folds(OP, &planes)? {
+            kernels_cuda::ssm::kda_fold(
+                self.ctx(),
+                &one_token(pool),
+                heads,
+                head_dim,
+                norm_eps,
+                gate_floor,
+                self.tensor(dt_bias),
+                self.tensor(a_log),
+                &carry,
+                folds,
+                groups,
+            )?;
+        }
+        let carry = self.rs_carry(OP, &planes, &pool)?;
         kernels_cuda::ssm::kda_carried(
             self.ctx(),
             self.tensor(mixed),
@@ -734,10 +821,49 @@ impl Run<'_> {
         )
     }
 
+    /// The rows a chunked KDA step of a buffering fire lands past its lanes'
+    /// commits, made ready for a later decode: their keys and corrected
+    /// values into their buffer, from `mixed`, `f` and `b` (the fire's own
+    /// rows, or with `ext` its extended run's).
+    #[allow(clippy::too_many_arguments)]
+    fn kda_tail(
+        &self,
+        rows: [kernels_cuda::Tensor; 3],
+        ext: bool,
+        [mixed, f, b, y]: [ValueId; 4],
+        dt_bias: ValueId,
+        a_log: ValueId,
+        state: ValueId,
+        (heads, head_dim, norm_eps, gate_floor): (u32, u32, f32, f32),
+    ) -> Result<(), kernels_cuda::Error> {
+        const OP: &str = "ssm.kda_chunked";
+        if self.rs_planes().is_none() {
+            return Ok(());
+        }
+        let pool = self.recurrent_absolute(state);
+        let carry = self.rs_carry(OP, &self.rs_step_planes(OP, &[f, b], mixed, Some(y))?, &pool)?;
+        let [mixed_rows, f_rows, b_rows] = rows;
+        kernels_cuda::ssm::kda_tail(
+            self.ctx(),
+            mixed_rows,
+            f_rows,
+            b_rows,
+            self.tensor(dt_bias),
+            self.tensor(a_log),
+            &pool,
+            self.rs_qo_indptr(),
+            ext,
+            heads,
+            head_dim,
+            norm_eps,
+            gate_floor,
+            &carry,
+        )
+    }
+
     /// A Mamba-2 decode step of a buffering fire, over each lane's carried
-    /// rows then its own: their convolved `xbc` from the carried scratch,
-    /// their step sizes from their buffer.
-    #[cfg(not(feature = "rocm"))]
+    /// rows then its own: their step sizes and convolved `x | B` from their
+    /// buffer, read as a linear attention.
     #[allow(clippy::too_many_arguments)]
     fn mamba2_carried(
         &self,
@@ -751,8 +877,12 @@ impl Run<'_> {
     ) -> Result<(), kernels_cuda::Error> {
         const OP: &str = "ssm.mamba2";
         let pool = self.recurrent_absolute(state);
-        let scratch = self.rs_carried_of(OP, xbc)?;
-        let carry = self.rs_carry(OP, &[self.rs_plane(OP, dt)?], scratch, &pool)?;
+        let planes = self.rs_step_planes(OP, &[dt], xbc, None)?;
+        // The beam groups' folds first (§11.3).
+        if let Some((carry, folds, groups)) = self.rs_group_folds(OP, &planes)? {
+            kernels_cuda::ssm::mamba2_fold(self.ctx(), &one_token(pool), m, &carry, folds, groups)?;
+        }
+        let carry = self.rs_carry(OP, &planes, &pool)?;
         kernels_cuda::ssm::mamba2_carried(
             self.ctx(),
             self.tensor(xbc),
@@ -765,6 +895,43 @@ impl Run<'_> {
             &carry,
         )
     }
+
+    /// The rows a chunked Mamba-2 step of a buffering fire lands past its
+    /// lanes' commits, made ready for a later decode: their convolved
+    /// `x | B` into their buffer, from `xbc_rows` (the fire's own rows, or
+    /// with `ext` its extended run's).
+    fn mamba2_tail(
+        &self,
+        xbc_rows: kernels_cuda::Tensor,
+        ext: bool,
+        [xbc, dt]: [ValueId; 2],
+        m: kernels_cuda::ssm::Mamba2,
+        state: ValueId,
+        state_dim: u32,
+    ) -> Result<(), kernels_cuda::Error> {
+        const OP: &str = "ssm.mamba2_chunked";
+        if self.rs_planes().is_none() {
+            return Ok(());
+        }
+        let pool = self.recurrent_absolute(state);
+        let carry = self.rs_carry(OP, &self.rs_step_planes(OP, &[dt], xbc, None)?, &pool)?;
+        kernels_cuda::ssm::mamba2_tail(
+            self.ctx(),
+            xbc_rows,
+            m,
+            &pool,
+            self.rs_qo_indptr(),
+            ext,
+            state_dim,
+            &carry,
+        )
+    }
+
+    /// ROCm's KDA decode step reads no buffered rows as a linear attention
+    /// yet (its kernels re-step them from a carried scratch the buffer no
+    /// longer lays): a buffering fire over a KDA layer is refused by name.
+
+    /// ROCm's Mamba-2 decode step, as [`Run::kda_carried`]'s: unported.
 
     #[allow(clippy::too_many_arguments)]
     fn conv1d_extended(
@@ -877,8 +1044,7 @@ impl Run<'_> {
                 &mut y_ext,
             )?;
         }
-        #[cfg(not(feature = "rocm"))]
-        self.gated_delta_tail(
+            self.gated_delta_tail(
             qkv_ext,
             gates_ext,
             gates,
@@ -927,6 +1093,7 @@ impl Run<'_> {
             state_dim,
             &mut y_ext,
         )?;
+            self.mamba2_tail(xbc_ext, true, [xbc, dt], m, state, state_dim)?;
         self.rs_land(op, y_ext, y)?;
         self.rs_layer_done();
         Ok(())
@@ -991,8 +1158,18 @@ impl Run<'_> {
                 &mut y_ext,
             )?;
         }
+            self.kda_tail(
+            [mixed_ext, f_ext, b_ext],
+            true,
+            [mixed, f, b, y],
+            dt_bias,
+            a_log,
+            state,
+            (heads, head_dim, norm_eps, gate_floor),
+        )?;
         self.rs_land(op, y_ext, y)?;
         self.rs_layer_done();
         Ok(())
     }
 }
+

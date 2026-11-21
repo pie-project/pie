@@ -1,3 +1,4 @@
+mod carried;
 mod conv1d;
 mod conv1d_chunked;
 mod dyn_conv;

@@ -1404,8 +1404,7 @@ impl Shell {
                 let buffers = buffering && rungs.contains(&bucket) && class.is_some();
                 // A decoding class replays its carried rows in the body that
                 // buffers (`dispatch::ssm`): it records no replaying body.
-                let decodes = !cfg!(feature = "rocm")
-                    && class.is_some_and(|class| self.decoding.contains(class as usize));
+                let decodes = class.is_some_and(|class| self.decoding.contains(class as usize));
                 let treatments: &[record::RsBody] = match (buffers, decodes) {
                     (true, true) => &[record::RsBody::Folds, record::RsBody::Buffers],
                     (true, false) => &[

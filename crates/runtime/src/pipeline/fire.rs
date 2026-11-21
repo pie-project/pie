@@ -528,6 +528,7 @@ fn host_rs_plan(
     fold: &geometry::Fold,
     snapshots: &[u32],
     beam_ends: Option<&[u32]>,
+    beam_commons: Option<&[u32]>,
 ) -> Result<rs::RsPlan, String> {
     if ids.is_empty() {
         return Ok(rs::RsPlan::Groups(Vec::new()));
@@ -571,6 +572,14 @@ fn host_rs_plan(
         // slot by slot on its pages (§11): its buffer is backed from the
         // state's end to the pool's.
         let beam_end = beam_ends.and_then(|ends| ends.get(at).copied());
+        // A beam group folds the rows every live beam shares into its set
+        // once (§11.3): to its common slot, never past the rows it has.
+        let fold = match (beam_end, beam_commons.and_then(|commons| commons.get(at).copied())) {
+            (Some(_), Some(common)) if common > frozen => {
+                rs::GroupFold::Host(common.min(end).saturating_sub(frozen))
+            }
+            _ => fold,
+        };
         let writes = match beam_end {
             Some(end) => {
                 let high = writes.as_ref().map_or(end, |writes| writes.end);
@@ -2439,6 +2448,29 @@ static KV_WRITES: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<u64, ::engine::KvWrites>>,
 > = std::sync::LazyLock::new(Default::default);
 
+/// Each beam group's common slot, by its instance (`BEAM-PAGE-LISTS.md`
+/// §11.3): the largest any landed step reported. Monotone, so a later report
+/// never lowers it.
+static BEAM_COMMON: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<::engine::InstanceId, u32>>,
+> = std::sync::LazyLock::new(Default::default);
+
+pub(crate) fn record_beam_common(commons: Vec<(::engine::InstanceId, u32)>) {
+    if commons.is_empty() {
+        return;
+    }
+    let mut held = BEAM_COMMON.lock().unwrap();
+    for (instance, common) in commons {
+        let at = held.entry(instance).or_insert(0);
+        *at = (*at).max(common);
+    }
+}
+
+/// The largest common slot instance `instance`'s beam group has reported.
+fn beam_common_of(instance: ::engine::InstanceId) -> u32 {
+    BEAM_COMMON.lock().unwrap().get(&instance).copied().unwrap_or(0)
+}
+
 pub(crate) fn record_kv_writes(writes: Vec<::engine::KvWrites>) {
     let mut held = KV_WRITES.lock().unwrap();
     for written in writes {
@@ -3948,6 +3980,10 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // Each beam group's pool end (a slot), which its rs buffer is backed
         // to as well (`BEAM-PAGE-LISTS.md` §11).
         let mut beam_ends: Vec<u32> = Vec::new();
+        // Each beam group's common slot, as its last harvested steps left it
+        // (§11.3): one pass, one group, one instance.
+        let beam_common = beam_common_of(instance_id);
+        let mut beam_commons: Vec<u32> = Vec::new();
         let paged_reserve: Option<Vec<Vec<u64>>> = if binds_pages(ctx, &fwd)? {
             let page = u64::from(page_size.max(1));
             let mut reserves = Vec::with_capacity(groups.len());
@@ -3994,6 +4030,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     cursor.reserved = cursor.reserved.max(end_slot);
                 }
                 beam_ends.push(end_slot);
+                beam_commons.push(beam_common);
                 // Only the pages the column adds are backed here: the pool's
                 // pages are the group's alone and the device keeps what they
                 // hold, so a page an earlier fire still in flight writes is
@@ -4601,6 +4638,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                         &fold,
                         &inside,
                         (!beam_ends.is_empty()).then_some(beam_ends.as_slice()),
+                        (!beam_ends.is_empty()).then_some(beam_commons.as_slice()),
                     )
                 }
             };
@@ -8403,7 +8441,7 @@ pub(crate) mod fold_tests {
         let ids = [rs, rs];
         let groups = lane_groups(&[ws, ws]);
         assert_eq!(groups.len(), 1);
-        let plan = host_rs_plan(&stores, &ids, &groups, &req, &all(), &[], None).unwrap();
+        let plan = host_rs_plan(&stores, &ids, &groups, &req, &all(), &[], None, None).unwrap();
         let rs::RsPlan::Groups(plan) = plan else {
             panic!("a plain recurrent model plans groups");
         };
@@ -8605,7 +8643,7 @@ pub(crate) mod fold_tests {
         };
         if let Some(rs) = rs {
             let groups = lane_groups(&[ws]);
-            let plan = host_rs_plan(stores, &[rs], &groups, &req, fold, &[], None).unwrap();
+            let plan = host_rs_plan(stores, &[rs], &groups, &req, fold, &[], None, None).unwrap();
             let rs::RsPlan::Groups(plan) = plan else {
                 panic!("a plain recurrent model plans groups");
             };
@@ -11017,7 +11055,7 @@ mod unfolded_tests {
             let plan = if device_places {
                 device_rs_plan(&stores, &ids, &groups_of, &pass, &[0, 4], fold, false)
             } else {
-                host_rs_plan(&stores, &ids, &groups_of, &req, fold, &[], None)
+                host_rs_plan(&stores, &ids, &groups_of, &req, fold, &[], None, None)
             }
             .expect(&what);
             let prepared =
@@ -11094,6 +11132,7 @@ mod unfolded_tests {
                 &lane(held, rows),
                 &geometry::Fold::Host(fold),
                 &[],
+                None,
                 None,
             )
         };

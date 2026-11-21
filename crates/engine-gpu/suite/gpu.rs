@@ -54,24 +54,76 @@ pub fn device_boot() -> DeviceBoot {
 /// device has left when it loads (which a load beside it then takes).
 pub const SHARES: u64 = 4;
 
-/// The tests holding a share now, and the signal one gave its share back.
-static HOLDERS: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+/// The tests holding a share now, whether one of them holds the device
+/// alone ([`alone`]), and the signal one gave its share back.
+struct Holders {
+    count: u64,
+    alone: bool,
+}
+
+static HOLDERS: std::sync::Mutex<Holders> = std::sync::Mutex::new(Holders {
+    count: 0,
+    alone: false,
+});
 static FREED: std::sync::Condvar = std::sync::Condvar::new();
 
-/// A test's share, held by its thread until the test ends.
-struct Held;
+/// A test's share, held by its thread until the test ends; `alone` where
+/// the test holds the whole device.
+struct Held {
+    alone: bool,
+}
 
 impl Drop for Held {
     fn drop(&mut self) {
-        *HOLDERS
+        let mut holders = HOLDERS
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) -= 1;
-        FREED.notify_one();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        holders.count -= 1;
+        holders.alone &= !self.alone;
+        // Waiters wait on different conditions (a free share, an empty
+        // device): each looks again.
+        FREED.notify_all();
     }
 }
 
 thread_local! {
     static HELD: std::cell::RefCell<Option<Held>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Takes the calling test's share, once `free` says the holders leave room
+/// for it, unless it holds one already.
+fn take(alone: bool, free: impl Fn(&Holders) -> bool) {
+    HELD.with(|held| {
+        let mut held = held.borrow_mut();
+        if let Some(held) = held.as_ref() {
+            assert!(
+                held.alone || !alone,
+                "a test takes the device alone before any load takes its share"
+            );
+            return;
+        }
+        let mut holders = HOLDERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !free(&holders) {
+            holders = FREED
+                .wait(holders)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        holders.count += 1;
+        holders.alone = alone;
+        *held = Some(Held { alone });
+    });
+}
+
+/// The calling test holds the device alone until it ends: it waits until no
+/// other test holds a share, and no test takes one meanwhile. For a test
+/// that times the device's answers against its own host work (a lane's
+/// fires against a compile on another thread), which a model test beside it
+/// would stretch by its own fires and loads. The test's loads still take
+/// its share ([`share`]); call this before them.
+pub fn alone() {
+    take(true, |holders| holders.count == 0);
 }
 
 /// The bytes of one share: a [`SHARES`]th of what the device states it has
@@ -93,25 +145,11 @@ fn share_bytes() -> Option<u64> {
 
 /// The device allowance of a load of the calling test: its share of the
 /// device. The test takes its share (waiting while `SHARES - 1` other tests
-/// hold theirs) where it holds none yet, and holds it until it ends; every
+/// hold theirs, or one holds the device [`alone`]) where it holds none yet, and holds it until it ends; every
 /// load it makes then takes the same share. Take it before
 /// `model_logits::loading`, which a test holding a share waits on.
 pub fn share() -> engine::Allowance {
-    HELD.with(|held| {
-        let mut held = held.borrow_mut();
-        if held.is_none() {
-            let mut holders = HOLDERS
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            while *holders >= SHARES - 1 {
-                holders = FREED
-                    .wait(holders)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-            }
-            *holders += 1;
-            *held = Some(Held);
-        }
-    });
+    take(false, |holders| !holders.alone && holders.count < SHARES - 1);
     engine::Allowance {
         budget: share_bytes(),
     }
