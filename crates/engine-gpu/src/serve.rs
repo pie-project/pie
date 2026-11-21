@@ -1050,6 +1050,7 @@ impl<B: Serve> Shell<B> {
     /// the model serves from, in the one order, on whatever backend `B` is.
     /// A naming load ([`Named`]) runs this same code and reserves nothing.
     fn raise(boot: Boot<'_, B>, fitted: Fitted<B>) -> Result<Shell<B>> {
+        let checking = boot.check.is_some();
         let Fitted {
             device,
             tuning,
@@ -2231,7 +2232,171 @@ impl<B: Serve> Shell<B> {
         if weights_held {
             shell.preseat_weights()?;
         }
+        if !checking {
+            shell.settle_dense()?;
+        }
         Ok(shell)
+    }
+
+    /// The dense matmul's kernel at each rung checked on the served step
+    /// itself: a kernel timed alone at a plane (the shape step's curves, which
+    /// only name the candidates) need not be the faster one in the step,
+    /// among the other work around each matmul. Over each power of two of
+    /// rows to the load's chunk (a recording backend's rungs; an eager one's
+    /// row counts, taken by the same ranges), a fire of those rows (as many
+    /// decode lanes where the load's lanes reach, else one lane's prompt of
+    /// them) is fired under the choice as it stands and under each kernel
+    /// the choice takes there or a vector kernel it takes anywhere, taken by
+    /// every plane over the range, where that kernel pads no more rows than
+    /// the choice does. Rounds are interleaved, each fire on fresh seats and
+    /// timed to its landing, walked so no option replays another's
+    /// recording; an option replaces the choice over a range only where its
+    /// median beats the choice's by more than their spreads. The seats are
+    /// opened fresh again after.
+    pub fn settle_dense(&mut self) -> Result<()> {
+        let lanes = self
+            .budgets
+            .tokens
+            .max_lanes
+            .min(u32::try_from(self.held.len()).unwrap_or(u32::MAX));
+        if lanes == 0 {
+            return Ok(());
+        }
+        let walk_only = std::mem::replace(&mut self.walk_only, true);
+        let settled = self.settle_dense_to(lanes);
+        self.walk_only = walk_only;
+        self.recorded_serving();
+        self.unkept_serving();
+        self.walked_serving();
+        for slot in 0..lanes {
+            self.open(slot)?;
+        }
+        // The kernels the options built are the load's, not a fire's.
+        self.built = B::compiled(&self.pipelines);
+        settled
+    }
+
+    fn settle_dense_to(&mut self, lanes: u32) -> Result<()> {
+        use kernels_slang::linear::gemm::{Tactic, tile_for};
+        // Rounds a range's fires take, interleaved: the shape step's.
+        const ROUNDS: usize = crate::rates::REPEATS;
+        let tile = |t: Tactic| tile_for(B::TARGET, t, 4096, 4096).row_tile();
+        let chunk = self.budgets.tokens.max_tokens.max(1);
+        let vectors = self.dense.vector_kernels();
+        let entries = self.dense.entries();
+        let decode = self.trace.facts.word(&poem_ir::Request::new(1, false));
+        let mut bottom = 1;
+        let mut rows = 1u32;
+        while bottom <= chunk {
+            let top = rows.min(chunk);
+            if entries.iter().any(|&at| (bottom..=top).contains(&at)) {
+                let standing = self.dense.clone();
+                // The most rows any plane's kernel pads a fire to, over the
+                // range: no option pads past it.
+                let widest = (bottom..=top)
+                    .flat_map(|r| standing.tactics_at(r))
+                    .map(tile)
+                    .max()
+                    .unwrap_or(1);
+                let mut kernels: Vec<Tactic> = Vec::new();
+                for t in (bottom..=top)
+                    .flat_map(|r| standing.tactics_at(r))
+                    .chain(vectors.iter().copied())
+                {
+                    if !kernels.contains(&t) && tile(t) <= widest {
+                        kernels.push(t);
+                    }
+                }
+                let mut options = vec![standing.clone()];
+                for t in kernels {
+                    let option = standing.with_rows(bottom, top, t);
+                    if !options.contains(&option) {
+                        options.push(option);
+                    }
+                }
+                if options.len() > 1 {
+                    // As many decode lanes, else one lane's prompt.
+                    let (fire_lanes, per_lane) = if top <= lanes { (top, 1) } else { (1, top) };
+                    let word = if per_lane == 1 {
+                        decode
+                    } else {
+                        self.trace
+                            .facts
+                            .word(&poem_ir::Request::new(per_lane, false))
+                    };
+                    let tokens: Vec<u32> = (0..per_lane).map(|i| 100 + (i * 7919) % 5000).collect();
+                    let mut samples: Vec<Vec<f64>> = vec![Vec::new(); options.len()];
+                    // A first round warms each option, untimed.
+                    for round in 0..=ROUNDS {
+                        for (i, option) in options.iter().enumerate() {
+                            self.dense = option.clone();
+                            let fired = (|| -> Result<f64> {
+                                for slot in 0..fire_lanes {
+                                    self.open(slot)?;
+                                }
+                                let seated: Vec<Seated<'_, B>> = (0..fire_lanes)
+                                    .map(|slot| Seated {
+                                        hosts: false,
+                                        ..Seated::of(Lane {
+                                            slot,
+                                            word,
+                                            tokens: &tokens,
+                                        })
+                                    })
+                                    .collect();
+                                self.drain()?;
+                                let began = std::time::Instant::now();
+                                self.fire_seated(&seated)?;
+                                Ok(began.elapsed().as_secs_f64() * 1e9)
+                            })();
+                            match fired {
+                                Ok(ns) if round > 0 => samples[i].push(ns),
+                                Ok(_) => {}
+                                Err(e) => {
+                                    self.dense = standing;
+                                    return Err(e);
+                                }
+                            }
+                        }
+                    }
+                    let (kept_ns, kept_spread) = crate::rates::median_spread(&samples[0]);
+                    let mut taken = 0;
+                    let mut best = kept_ns;
+                    for (i, s) in samples.iter().enumerate().skip(1) {
+                        let (ns, spread) = crate::rates::median_spread(s);
+                        if ns < best
+                            && (kept_ns - ns) / kept_ns.max(f64::MIN_POSITIVE)
+                                > kept_spread + spread
+                        {
+                            taken = i;
+                            best = ns;
+                        }
+                    }
+                    let weighed: Vec<String> = options
+                        .iter()
+                        .zip(&samples)
+                        .map(|(o, s)| {
+                            let (ns, spread) = crate::rates::median_spread(s);
+                            format!(
+                                "{} {:.1} µs ({:.0}%)",
+                                o.runs_at(top).join(" / "),
+                                ns / 1e3,
+                                spread * 100.0
+                            )
+                        })
+                        .collect();
+                    tracing::info!(
+                        "dense matmul in the served step, {bottom}-{top} rows: {} ({})",
+                        if taken == 0 { "kept" } else { "replaced" },
+                        weighed.join(" vs ")
+                    );
+                    self.dense = options.swap_remove(taken);
+                }
+            }
+            bottom = top + 1;
+            rows = rows.saturating_mul(2);
+        }
+        Ok(())
     }
 
     /// Opens seat `slot` for a direct fire: its record zeroed on the queue,

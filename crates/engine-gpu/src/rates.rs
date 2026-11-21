@@ -354,10 +354,10 @@ fn operands_fit(m: u32, n: u32, k: u32, largest: u64) -> bool {
 /// The timings a point of a kernel's curve at a shape takes, interleaved
 /// with the other kernels' at the shape: its median the point, their spread
 /// what a choice between two kernels may call a difference.
-const REPEATS: usize = 3;
+pub(crate) const REPEATS: usize = 3;
 
 /// The median of `samples` and their spread, `(max - min) / median`.
-fn median_spread(samples: &[f64]) -> (f64, f64) {
+pub(crate) fn median_spread(samples: &[f64]) -> (f64, f64) {
     let mut sorted = samples.to_vec();
     sorted.sort_by(f64::total_cmp);
     let median = sorted[sorted.len() / 2];
@@ -1352,30 +1352,6 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
             };
             for _ in 0..REPEATS {
                 round(&mut rig, &mut timed, &mut samples)?;
-            }
-            // Where a leading kernel's repeats spread wider than the gap
-            // between the two leading kernels, the point takes more repeats
-            // (as many again, but one), interleaved as before: the data says
-            // the median of three cannot tell them apart.
-            let leading = |samples: &Vec<Vec<f64>>, timed: &Vec<Timed>| {
-                let mut ranked: Vec<(f64, f64)> = live
-                    .iter()
-                    .filter(|&&t| timed[t].stop.is_none() && !samples[t].is_empty())
-                    .map(|&t| median_spread(&samples[t]))
-                    .collect();
-                ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
-                match ranked.as_slice() {
-                    [first, second, ..] => {
-                        let gap = (second.0 - first.0) / first.0.max(f64::MIN_POSITIVE);
-                        first.1.max(second.1) > gap
-                    }
-                    _ => false,
-                }
-            };
-            if leading(&samples, &timed) {
-                for _ in 0..REPEATS - 1 {
-                    round(&mut rig, &mut timed, &mut samples)?;
-                }
             }
             for &t in &live {
                 if timed[t].stop.is_some() {

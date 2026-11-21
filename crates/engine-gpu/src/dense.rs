@@ -81,6 +81,70 @@ impl Dense {
         }
     }
 
+    /// This choice with `tactic` taken by every plane over rows `bottom..=
+    /// top` (a rung's rows, or a row count's on an eager backend).
+    #[must_use]
+    pub fn with_rows(&self, bottom: u32, top: u32, tactic: Tactic) -> Dense {
+        let set = |by_rows: &[(u32, Tactic)]| -> Vec<(u32, Tactic)> {
+            by_rows
+                .iter()
+                .map(|&(at, t)| {
+                    (
+                        at,
+                        if (bottom..=top).contains(&at) {
+                            tactic
+                        } else {
+                            t
+                        },
+                    )
+                })
+                .collect()
+        };
+        Dense {
+            by_rows: set(&self.by_rows),
+            planes: self.planes.iter().map(|(at, by)| (*at, set(by))).collect(),
+        }
+    }
+
+    /// The kernel each plane takes at `rows`, named.
+    #[must_use]
+    pub fn runs_at(&self, rows: u32) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for (_, by) in &self.planes {
+            let n = name(&at_rows(by, rows));
+            if !out.contains(&n) {
+                out.push(n);
+            }
+        }
+        if out.is_empty() {
+            out.push(name(&at_rows(&self.by_rows, rows)));
+        }
+        out
+    }
+
+    /// Every vector kernel this choice takes at any rows, over every plane.
+    #[must_use]
+    pub fn vector_kernels(&self) -> Vec<Tactic> {
+        let mut all: Vec<Tactic> = Vec::new();
+        let every = self
+            .by_rows
+            .iter()
+            .chain(self.planes.iter().flat_map(|(_, by)| by.iter()));
+        for &(_, t) in every {
+            if t.vector > 0 && !all.contains(&t) {
+                all.push(t);
+            }
+        }
+        all
+    }
+
+    /// The rows the choice has an entry at: a recording backend's rung tops,
+    /// an eager one's row counts.
+    #[must_use]
+    pub fn entries(&self) -> Vec<u32> {
+        self.by_rows.iter().map(|&(at, _)| at).collect()
+    }
+
     /// Every tactic a fire of `rows` runs at some plane: what its rows are
     /// padded for (the most any of them pads).
     #[must_use]
