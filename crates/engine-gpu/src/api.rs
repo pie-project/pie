@@ -347,47 +347,32 @@ impl<B: Host> Gpu<B> {
     }
 
     /// Under a stated submit bound, where `step` is past it even a layer at
-    /// a time: its one prompt lane's first piece, of the most rows a piece
-    /// is admitted at now ([`SubmitBound::rows_a_piece`]), and the rest
-    /// (`crate::submit::split_rows`). `None` where it is admitted as it is,
-    /// where no bound is stated, or where it cannot be cut (then refused by
-    /// name as it is admitted, the reason said here).
-    ///
-    /// [`SubmitBound::rows_a_piece`]: crate::submit::SubmitBound::rows_a_piece
+    /// a time: the piece to fire before it and the rest, cut at the ratio
+    /// read now (`crate::submit::next_cut`). `None` where it is admitted as
+    /// it is, where no bound is stated, or where it cannot be cut (then
+    /// refused by name as it is admitted, the reason said here).
     fn next_piece(&mut self, step: &Step) -> Option<(Step, Step)> {
         let shell = self.shell.as_mut()?;
         shell.track();
         let held = shell.submit_bound()?;
         let rows = crate::submit::StepRows::of(step);
-        if !matches!(held.admit(rows), crate::submit::Admitted::Refused { .. }) {
-            return None;
-        }
-        let prompt_rows = crate::submit::prompt_rows(step);
-        if prompt_rows < 2 {
-            return None;
-        }
-        let Some(piece_rows) = held.rows_a_piece(rows, prompt_rows) else {
-            tracing::warn!(
-                rows = rows.rows,
-                keys = rows.keys,
-                "submit bound: one row of one layer of a step is past the bound; refused by name"
-            );
-            return None;
-        };
-        match crate::submit::split_rows(step, &shell.trace().facts, piece_rows) {
-            Ok(split) => {
+        match crate::submit::next_cut(held, step, &shell.trace().facts) {
+            Ok(None) => None,
+            Ok(Some((piece, rest, piece_rows))) => {
                 tracing::debug!(
                     rows = rows.rows,
+                    lanes = rows.lanes,
                     keys = rows.keys,
                     piece_rows,
                     ratio = held.ratio_now(),
                     "submit bound: a step past the bound a layer at a time: a piece cut by rows"
                 );
-                Some(split)
+                Some((piece, rest))
             }
             Err(why) => {
                 tracing::warn!(
                     rows = rows.rows,
+                    lanes = rows.lanes,
                     keys = rows.keys,
                     %why,
                     "submit bound: a step past the bound a layer at a time cannot be cut by rows; \

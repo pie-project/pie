@@ -836,6 +836,48 @@ impl SubmitBound {
     }
 }
 
+/// Under `held`, where `step` is past the bound even a layer at a time:
+/// the piece to fire before it and the rest, `Ok(None)` where it is
+/// admitted as it is. Its widest prompt lane gives the piece: that lane
+/// alone over the most of its rows a step of them alone is admitted at,
+/// all but its last row at most (so each prompt lane runs as its own
+/// sequence of pieces, and the rest keeps every lane, the decode lanes and
+/// each prompt lane's last rows); called again on the rest at the ratio
+/// read then. `Err` names why it is refused: no prompt lane to cut, one
+/// row of one layer past the bound, or a lane a piece cannot carry.
+pub fn next_cut(
+    held: &SubmitBound,
+    step: &engine::fire::Step,
+    facts: &poem_ir::Facts,
+) -> Result<Option<(engine::fire::Step, engine::fire::Step, u32)>, String> {
+    if !matches!(held.admit(StepRows::of(step)), Admitted::Refused { .. }) {
+        return Ok(None);
+    }
+    let Some(at) = (0..step.lanes.len())
+        .filter(|&at| step.lanes[at].rows() > 1)
+        .max_by_key(|&at| step.lanes[at].rows())
+    else {
+        return Err("it carries no prompt lane to cut by rows".into());
+    };
+    let lane = &step.lanes[at];
+    let rows = lane.rows();
+    let alone = StepRows {
+        rows,
+        lanes: 1,
+        keys: lane.kv.held.saturating_add(rows),
+        prompt: true,
+    };
+    let Some(fit) = held.rows_a_piece(alone, rows) else {
+        return Err(format!(
+            "one row of one layer of its lane {at} ({rows} rows at {} keys) is past the bound",
+            alone.keys
+        ));
+    };
+    let piece_rows = fit.min(rows - 1);
+    let (piece, rest) = split_lane(step, at, facts, piece_rows)?;
+    Ok(Some((piece, rest, piece_rows)))
+}
+
 /// Why `lane` cannot be cut into pieces of fewer rows: what it states that
 /// a piece would not carry as the whole lane does. `None` where it can be.
 fn uncuttable(lane: &engine::fire::Lane, facts: &poem_ir::Facts) -> Option<&'static str> {
@@ -922,16 +964,31 @@ pub fn split_rows(
     facts: &poem_ir::Facts,
     rows: u32,
 ) -> Result<(engine::fire::Step, engine::fire::Step), String> {
-    use engine::fire::Readout;
     let prompts: Vec<usize> = (0..step.lanes.len())
         .filter(|&at| step.lanes[at].rows() > 1)
         .collect();
     let [at] = prompts[..] else {
         return Err(format!(
-            "it carries {} prompt lanes; a step is cut by the rows of its one prompt lane",
+            "it carries {} prompt lanes, not one",
             prompts.len()
         ));
     };
+    split_lane(step, at, facts, rows)
+}
+
+/// [`split_rows`] of lane `at` of `step`, whatever other prompt lanes it
+/// carries: that lane alone over its first `rows` rows, and `step` with the
+/// lane's rows past them in its place, the other lanes as stated.
+pub fn split_lane(
+    step: &engine::fire::Step,
+    at: usize,
+    facts: &poem_ir::Facts,
+    rows: u32,
+) -> Result<(engine::fire::Step, engine::fire::Step), String> {
+    use engine::fire::Readout;
+    if step.lanes.get(at).is_none_or(|lane| lane.rows() < 2) {
+        return Err(format!("its lane {at} holds no rows to cut"));
+    }
     if !step.media.is_empty() || !step.voxels.is_empty() {
         return Err("it carries media or clips, which its rows read whole".into());
     }
@@ -1548,6 +1605,77 @@ mod tests {
         assert!(row_pieces(&step(buffered.clone()), &facts, 4).unwrap_err().contains("program says"));
         buffered.rs = buffer(FoldLen::Host(8), Lineage::Admitted);
         assert!(row_pieces(&step(buffered), &facts, 4).unwrap_err().contains("shared"));
+    }
+
+    /// A step of two prompt lanes and a decode lane, past the bound even a
+    /// layer at a time, is cut lane by lane, then by rows: each piece one
+    /// prompt lane alone and admitted, every prompt lane's rows in order
+    /// and whole across its pieces and the rest, the decode lane riding the
+    /// rest, which is admitted.
+    #[test]
+    fn a_step_of_two_prompt_lanes_past_the_bound_is_cut_lane_by_lane() {
+        use engine::fire::{Lane, Readout, Step};
+        let facts = poem_ir::Facts::default();
+        let prompt_lane = |slot: u32, base: u32| Lane {
+            slot,
+            tokens: (base..base + 256).collect(),
+            readout: Readout::Last,
+            ..Lane::default()
+        };
+        let mut decode = Lane {
+            slot: 2,
+            tokens: vec![9],
+            readout: Readout::Last,
+            ..Lane::default()
+        };
+        decode.kv.held = 700;
+        let step = Step {
+            lanes: vec![prompt_lane(0, 0), prompt_lane(1, 1000), decode.clone()],
+            attachments: Vec::new(),
+            media: Vec::new(),
+            voxels: Vec::new(),
+        };
+        let b = bound(1.0);
+        let (_, per_layer) = b.step_ns(StepRows::of(&step));
+        let held = SubmitBound {
+            bound_ns: per_layer * 0.4,
+            ..b
+        };
+        assert!(matches!(held.admit(StepRows::of(&step)), Admitted::Refused { .. }));
+        let mut pieces = Vec::new();
+        let mut rest = step.clone();
+        while let Some((piece, after, rows)) = next_cut(&held, &rest, &facts).expect("cut") {
+            assert_eq!(piece.lanes.len(), 1, "a piece is one prompt lane alone");
+            assert_eq!(piece.lanes[0].rows(), rows);
+            assert!(!matches!(held.admit(StepRows::of(&piece)), Admitted::Refused { .. }));
+            pieces.push(piece);
+            rest = after;
+        }
+        assert!(!matches!(held.admit(StepRows::of(&rest)), Admitted::Refused { .. }));
+        assert!(pieces.iter().any(|p| p.lanes[0].slot == 0));
+        assert!(pieces.iter().any(|p| p.lanes[0].slot == 1));
+        assert_eq!(rest.lanes.len(), 3, "the rest keeps every lane");
+        assert_eq!(rest.lanes[2], decode, "the decode lane rides the rest as stated");
+        for (slot, base) in [(0u32, 0u32), (1, 1000)] {
+            let tokens: Vec<u32> = pieces
+                .iter()
+                .filter(|p| p.lanes[0].slot == slot)
+                .flat_map(|p| p.lanes[0].tokens.clone())
+                .chain(rest.lanes[slot as usize].tokens.clone())
+                .collect();
+            assert_eq!(tokens, (base..base + 256).collect::<Vec<_>>(), "lane {slot} whole, in order");
+            let last = &rest.lanes[slot as usize];
+            assert_eq!(last.kv.held + last.rows(), 256);
+            assert_eq!(last.readout, Readout::Last);
+        }
+        // One row of one layer past the bound: refused, by name.
+        let one = held.step_ns(StepRows { rows: 1, lanes: 1, keys: 256, prompt: true }).1;
+        let past = SubmitBound {
+            bound_ns: one * 0.5,
+            ..held
+        };
+        let why = next_cut(&past, &step, &facts).unwrap_err();
+        assert!(why.contains("one row of one layer"), "{why}");
     }
 
     /// A fire's device time reads nothing until its backend fills it, then
