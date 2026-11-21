@@ -395,6 +395,16 @@ impl Shell {
         self.pools.settle_swaps()
     }
 
+    /// Where the next move between the host tier and the slot file is told
+    /// how it ended ([`crate::store::Pools::defer_disk_tell`]); returns a
+    /// tell no such move took.
+    pub fn defer_disk_tell(
+        &mut self,
+        told: Option<super::landing::Told>,
+    ) -> Option<super::landing::Told> {
+        self.pools.defer_disk_tell(told)
+    }
+
     /// Tells `landed` how every move between the device and the host tier
     /// enqueued so far ended (landed, or failed with its fault), from a
     /// waiter of its own: nothing is enqueued on the swap stream for it, so

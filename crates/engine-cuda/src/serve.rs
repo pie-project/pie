@@ -3,7 +3,7 @@ mod boot;
 pub(crate) mod btrace;
 pub mod diag;
 mod enqueue;
-mod landing;
+pub(crate) mod landing;
 mod lanes;
 mod load;
 mod measured;

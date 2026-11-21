@@ -773,6 +773,9 @@ pub struct Pools {
     airborne: Option<Airborne>,
     host: Option<HostKv>,
     disk: Option<DiskTier>,
+    /// Where the next host<->disk move is told how it ended
+    /// ([`Pools::defer_disk_tell`]); taken by the move.
+    disk_told: DiskTell,
     /// The shared pool's host tier (CONTRACT-BC 22): chunks of the state
     /// pool's size, a slot of any shape at the place its host ref names, in
     /// pageable memory behind a page-locked staging ring ([`host`]).
@@ -814,8 +817,21 @@ struct Swap {
 /// aligned blocks it lies in) moves through.
 #[derive(Debug)]
 struct DiskTier {
-    file: engine::disk::SlotFile,
+    file: std::sync::Arc<engine::disk::SlotFile>,
+    /// Held across a slot cover's read-modify-write, here and on the host
+    /// tier's landing thread ([`host::DiskMove`]).
+    io: std::sync::Arc<std::sync::Mutex<()>>,
     stage: DiskStage,
+}
+
+/// A tell handed to the next host<->disk move ([`Pools::defer_disk_tell`]).
+#[derive(Default)]
+struct DiskTell(Option<crate::serve::landing::Told>);
+
+impl std::fmt::Debug for DiskTell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() { "DiskTell(pending)" } else { "DiskTell(none)" })
+    }
 }
 
 /// The pinned stage of the disk tier.
@@ -1276,6 +1292,7 @@ impl Pools {
             airborne: None,
             host: None,
             disk: None,
+            disk_told: DiskTell::default(),
             tier: None,
             whole: false,
             swaps: Vec::new(),
@@ -4465,50 +4482,44 @@ impl Pools {
                 self.through_disk(stream, to_disk, &slots, bytes)
             }
             (Tier::Host, Tier::Disk) | (Tier::Disk, Tier::Host) => {
+                // On the host tier's landing thread, behind every move it
+                // holds (a move into or out of these host slots lands before
+                // it): the engine thread only enqueues. Told later where a
+                // tell was handed in ([`Pools::defer_disk_tell`]); waited out
+                // here otherwise, as a copy that answers its sources read.
                 let to_disk = to == Tier::Disk;
-                // A copy still on a stream may read or write a host slot.
-                self.settle_swaps()?;
-                crate::device::ctx::sync(stream)?;
+                let len = usize::try_from(bytes).unwrap_or(usize::MAX);
                 let mut slots = Vec::with_capacity(pairs.len());
                 for &(src, dst) in pairs {
                     let (on_host, on_disk) = if to_disk { (src, dst) } else { (dst, src) };
                     slots.push((
                         self.tier_offset(kind, on_host)?,
                         self.disk_place(kind, on_disk)?,
+                        len,
                     ));
                 }
-                self.host_through_disk(to_disk, &slots, bytes)
+                let told = self.disk_told.0.take();
+                let (Some(spill), Some(tier)) = (self.disk.as_ref(), self.tier.as_mut()) else {
+                    if let Some(told) = told {
+                        told(engine::Landing::Landed);
+                    }
+                    return Ok(());
+                };
+                let waited = told.is_none();
+                let id = tier.disk(host::DiskMove {
+                    to_disk,
+                    file: std::sync::Arc::clone(&spill.file),
+                    io: std::sync::Arc::clone(&spill.io),
+                    slots,
+                    told,
+                })?;
+                if waited {
+                    tier.wait_job(id)?;
+                }
+                Ok(())
             }
             _ => Ok(()),
         }
-    }
-
-    /// Moves whole slots of `bytes` between the host tier and the disk
-    /// tier, `(host, disk)` byte places each, through the stage: a slot's
-    /// cover read whole, and written keeping its neighbours' bytes.
-    fn host_through_disk(&mut self, to_disk: bool, slots: &[(u64, u64)], bytes: u64) -> Result<()> {
-        let (Some(spill), Some(tier)) = (self.disk.as_mut(), self.tier.as_ref()) else {
-            return Ok(());
-        };
-        // The caller has synced the stream: no h2d out of the stage is in
-        // flight.
-        spill.stage.landing = false;
-        let len = usize::try_from(bytes).unwrap_or(usize::MAX);
-        let mut edge = engine::disk::Aligned::zeroed(engine::disk::ALIGN);
-        for &(host, disk) in slots {
-            let (start, span, lead) = cover(disk, bytes);
-            let staged = spill.stage.staged(span)?;
-            let place = tier.slice(host, len)?;
-            if to_disk {
-                staged[lead..lead + len].copy_from_slice(place);
-                keep_edges(&spill.file, start, staged, lead, len, &mut edge)?;
-                spill.file.write_span(start, staged).map_err(slot_file)?;
-            } else {
-                spill.file.read_span(start, staged).map_err(slot_file)?;
-                place.copy_from_slice(&staged[lead..lead + len]);
-            }
-        }
-        Ok(())
     }
 
     /// Moves whole slots of `bytes` between the device and the disk tier,
@@ -4522,12 +4533,19 @@ impl Pools {
         slots: &[(u64, u64)],
         bytes: u64,
     ) -> Result<()> {
+        // Behind every move between the host tier and these bytes of the
+        // file, done on the tier's landing thread.
+        if let Some(tier) = self.tier.as_ref() {
+            tier.wait_disk(slots.iter().map(|&(_, disk)| (disk, bytes)))?;
+        }
         let Some(spill) = self.disk.as_mut() else {
             return Ok(());
         };
         let len = usize::try_from(bytes).unwrap_or(usize::MAX);
         let mut edge = engine::disk::Aligned::zeroed(engine::disk::ALIGN);
+        let io = std::sync::Arc::clone(&spill.io);
         for &(device, disk) in slots {
+            let _io = io.lock().expect("the slot file's I/O");
             if spill.stage.landing {
                 crate::device::ctx::sync(stream)?;
                 spill.stage.landing = false;
@@ -4602,7 +4620,8 @@ impl Pools {
         self.disk = file
             .map(|file| {
                 crate::device::Pinned::mapped_uninit(room).map(|pinned| DiskTier {
-                    file,
+                    file: std::sync::Arc::new(file),
+                    io: std::sync::Arc::default(),
                     stage: DiskStage {
                         pinned,
                         room,
@@ -4735,6 +4754,16 @@ impl Pools {
             }
         }
         Ok(())
+    }
+
+    /// Where the next move between the host tier and the slot file is told
+    /// how it ended, on the tier's landing thread, instead of waited out by
+    /// the caller. Returns any tell no such move took since.
+    pub fn defer_disk_tell(
+        &mut self,
+        told: Option<crate::serve::landing::Told>,
+    ) -> Option<crate::serve::landing::Told> {
+        std::mem::replace(&mut self.disk_told.0, told)
     }
 
     /// Waits, on the host, for every move still landing.

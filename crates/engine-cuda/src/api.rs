@@ -1103,9 +1103,25 @@ impl Engine for Cuda {
         copy: &engine::chunk::SlotCopy,
         token: u64,
     ) -> EngineResult<bool> {
-        self.copy_slots(copy)?;
         let host = |domain| matches!(domain, MemoryDomain::HostPinned);
         let device = |domain| matches!(domain, MemoryDomain::CudaDevice(_));
+        let disk = |domain| matches!(domain, MemoryDomain::LocalDisk);
+        // A move between the host tier and the slot file runs on the tier's
+        // landing thread and is told how it ended: the engine thread only
+        // enqueues it.
+        let host_disk = (host(copy.src) && disk(copy.dst)) || (disk(copy.src) && host(copy.dst));
+        if host_disk && let Some(sink) = self.landed.clone() {
+            let told: crate::serve::landing::Told =
+                Box::new(move |landing| sink(token, landing));
+            self.loaded_mut()?.defer_disk_tell(Some(told));
+            let copied = self.copy_slots(copy);
+            // Not taken (nothing to move, or refused before enqueueing):
+            // answered in the call.
+            let untaken = self.loaded_mut()?.defer_disk_tell(None).is_some();
+            copied?;
+            return Ok(untaken);
+        }
+        self.copy_slots(copy)?;
         let parked = device(copy.src) && host(copy.dst);
         let Some(sink) = self.landed.clone().filter(|_| parked) else {
             return Ok(true);
