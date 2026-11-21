@@ -4107,6 +4107,24 @@ impl Shell {
             self.fence_instances(&instances, true)?;
             for attached in attachments {
                 let Some(mut envelope) = self.programs.envelope(attached.instance)? else {
+                    // A host-class instance has no device envelope, and a beam
+                    // step remaps the device-placed geometry its envelope
+                    // lays: one that states parents would run its beams as
+                    // plain lanes on one working set, each beam's rows
+                    // written over another's. Refused by name, never run.
+                    if self.programs.parents_cell(attached.instance)?.is_some() {
+                        return Err(Fault::program(
+                            "serve::prepare",
+                            format!(
+                                "instance {} states parents (a beam group) and its geometry \
+                                 is host-class: a beam step remaps device-placed geometry \
+                                 only, so its beams would run as plain lanes on one working \
+                                 set; put the pass's tokens and positions from the device \
+                                 (an epilogue's put), as a beam search does",
+                                attached.instance
+                            ),
+                        ));
+                    }
                     continue;
                 };
                 let first = attached.lane as usize;
