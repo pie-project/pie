@@ -299,6 +299,8 @@ impl ResidencyPlanner {
                             // and planned ten times a second, hundreds of
                             // them under pressure.
                             tokio::select! {
+                                // In order, never at random: a seeded run takes the same branch.
+                                biased;
                                 () = &mut notified => {}
                                 () = &mut returned => {}
                             }
@@ -371,6 +373,8 @@ impl ResidencyPlanner {
             // check did (a grow, a commit or a move tried again), and
             // refuses nothing.
             tokio::select! {
+                // In order, never at random: a seeded run takes the same branch.
+                biased;
                 () = &mut notified => return,
                 () = &mut policy => answered(),
             }
@@ -779,6 +783,8 @@ impl ResidencyPlanner {
                         }
                     };
                     tokio::select! {
+                        // In order, never at random: a seeded run takes the same branch.
+                        biased;
                         () = notified => {}
                         () = returned => self.wake_planner(),
                         () = rung => self.wake_planner(),

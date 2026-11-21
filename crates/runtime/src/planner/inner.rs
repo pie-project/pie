@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -24,27 +24,27 @@ pub(super) struct Inner {
     pub(super) bind_restoring: Option<ProcessId>,
     pub(super) next_seq: u64,
     next_id: u64,
-    pub(super) procs: HashMap<ProcessId, Proc>,
+    pub(super) procs: super::PidMap<Proc>,
     pub(super) queue: BTreeMap<EntryKey, Waiter>,
     pub(super) accum: DevicePageReservation,
     /// Pages on their way back: a suspend's in flight, keyed by its process,
     /// or a departed process's still held by its working sets, keyed by the
     /// process gone, until its last [`super::Departure`] hold drops.
-    pub(super) evicting: HashMap<ProcessId, Reclaim>,
+    pub(super) evicting: super::PidMap<Reclaim>,
     pub(super) completion_credit: u32,
-    pub(super) host_swap_blocked: HashSet<ProcessId>,
-    pub(super) prepare_blocked: HashSet<ProcessId>,
+    pub(super) host_swap_blocked: super::PidSet,
+    pub(super) prepare_blocked: super::PidSet,
     /// The pool's room count and the swap tiers' free slots when the last
     /// of those blocks was set ([`super::ResidencyPlanner::lapse_blocks`]):
     /// a block holds only on the pool it was set on.
     pub(super) blocked_at: Option<(u64, u32)>,
-    pub(super) killing: HashSet<ProcessId>,
+    pub(super) killing: super::PidSet,
     pub(super) admitting: BTreeMap<(Rank, ProcessId), Arc<Notify>>,
     pub(super) to_end: super::to_end::ToEnd,
     /// The evicted processes whose parked state is on its way down a tier
     /// ([`super::ResidencyPlanner::park_down`]): none is restored until it
     /// lands, so no restore misses an item moving under it.
-    pub(super) parked_moving: HashSet<ProcessId>,
+    pub(super) parked_moving: super::PidSet,
     /// The unservable head the last stall dump named, the pool's room
     /// count then, and when ([`super::ResidencyPlanner::dump_stall`]): one
     /// dump per head and room change, and again each
@@ -66,7 +66,7 @@ pub(super) struct Inner {
     pub(super) last_plan: Option<super::victim::PlanEnd>,
     /// Each queued process's own last plan end: a stall line names its own
     /// head's, never another entry's ([`Self::plan_fields`]).
-    pub(super) ends: HashMap<ProcessId, super::victim::PlanEnd>,
+    pub(super) ends: super::PidMap<super::victim::PlanEnd>,
 }
 
 impl Inner {

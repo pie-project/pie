@@ -5216,6 +5216,8 @@ pub(crate) mod test_lane {
         pub(crate) to_disk: bool,
         /// Up from the disk tier.
         pub(crate) from_disk: bool,
+        /// The slots it copies, shape by shape (a shared pool's every copy).
+        pub(crate) slots: Option<::engine::chunk::SlotCopy>,
         completion: ControlCompletion,
     }
 
@@ -5272,9 +5274,14 @@ pub(crate) mod test_lane {
                             PreLaunchCopy::Kv(copy) => (copy.dst == disk, copy.src == disk),
                             PreLaunchCopy::State(_) => (false, false),
                         };
+                        let slots = match &plan {
+                            PreLaunchCopy::Slots(copy) => Some(copy.clone()),
+                            _ => None,
+                        };
                         copies.push(LaneCopy {
                             to_disk,
                             from_disk,
+                            slots,
                             completion,
                         });
                     }

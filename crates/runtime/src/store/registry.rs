@@ -197,6 +197,29 @@ pub fn register_model_with_chunks(kv_page_size: u32, engines: &[EngineStores]) -
     REGISTRY.push(RwLock::new(stores))
 }
 
+// A test's own kv seed for the shared stores it registers on its thread
+// ([`set_test_kv_seed`]): a seeded simulation's page keys, and every order
+// read from them, the same on each run.
+#[cfg(test)]
+thread_local! {
+    static TEST_KV_SEED: std::cell::Cell<Option<[u8; 32]>> = const { std::cell::Cell::new(None) };
+}
+
+/// Seeds the kv stores this thread registers next with `seed` (`None`:
+/// random again).
+#[cfg(test)]
+pub fn set_test_kv_seed(seed: Option<[u8; 32]>) {
+    TEST_KV_SEED.with(|cell| cell.set(seed));
+}
+
+fn kv_seed() -> [u8; 32] {
+    #[cfg(test)]
+    if let Some(seed) = TEST_KV_SEED.with(std::cell::Cell::get) {
+        return seed;
+    }
+    rand::random::<[u8; 32]>()
+}
+
 /// The stores of an engine whose pool is `shared`: kv pages are the list
 /// shape's slot refs, the rs store's state slots its records (or its
 /// window lists' pages each list's refs), as many seats as records. Below
@@ -217,7 +240,7 @@ pub fn shared_stores(
         || ShapePool::new(ShapeKind::List, 0, 0, 0),
         |list| ShapePool::shared(shared, list),
     );
-    let mut kv = KvStore::with_pool(pages, 0, 0, rand::random::<[u8; 32]>());
+    let mut kv = KvStore::with_pool(pages, 0, 0, kv_seed());
     if let Some(list) = list {
         let host = tiers
             .host

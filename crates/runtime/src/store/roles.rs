@@ -90,6 +90,45 @@ pub enum Owner {
 }
 
 impl Owner {
+    /// Its place in an order of owners: kind, then id.
+    fn order(&self) -> (u8, u128, [u32; 5]) {
+        match self {
+            Owner::Instance(id) => (0, u128::from(id.0), [0; 5]),
+            Owner::Channel(id) => (1, u128::from(id.0), [0; 5]),
+            Owner::Adapter(key) => (2, *key, [0; 5]),
+            Owner::Pair(key) => {
+                let at = key.extents;
+                (
+                    3,
+                    u128::from(key.program.0),
+                    [at.row_count, at.token_count, at.sampled_rows, at.query_len, at.key_len],
+                )
+            }
+        }
+    }
+}
+
+impl PartialOrd for Owner {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Owner {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.order().cmp(&other.order())
+    }
+}
+
+// The items by owner: under test in owner order, so a seeded simulation's
+// parks and unparks lay their slots the same on each run; in service they
+// hash.
+#[cfg(test)]
+type Items = std::collections::BTreeMap<Owner, Item>;
+#[cfg(not(test))]
+type Items = HashMap<Owner, Item>;
+
+impl Owner {
     /// Whose slots `rebind` moves.
     #[must_use]
     pub fn of(rebind: &Rebind) -> Self {
@@ -843,7 +882,7 @@ pub struct Roles {
     disk: Option<Disk>,
     shapes: RoleShapes,
     programs: HashMap<ProgramId, ProgramFacts>,
-    items: HashMap<Owner, Item>,
+    items: Items,
     /// The host writes held while their instance's slots are parked or
     /// not yet rebound, in the order they were asked.
     held: Vec<(InstanceId, Pump)>,
@@ -928,7 +967,7 @@ impl Roles {
             disk: None,
             shapes,
             programs: HashMap::new(),
-            items: HashMap::new(),
+            items: Items::new(),
             held: Vec::new(),
             chunk_slots,
             stated: std::collections::HashSet::new(),
@@ -3649,6 +3688,8 @@ where
                 }
             };
             tokio::select! {
+                // In order, never at random: a seeded run takes the same branch.
+                biased;
                 () = freed => {}
                 made = planned(run, pieces) => match made {
                     Err(why) => {
@@ -3691,6 +3732,8 @@ where
                 }
             };
             tokio::select! {
+                // In order, never at random: a seeded run takes the same branch.
+                biased;
                 // No segment left to commit within the budget by the time
                 // it looked (the room the refusal counted was committed
                 // for others, or the target came down): the room is the
