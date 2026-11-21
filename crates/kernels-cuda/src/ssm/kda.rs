@@ -538,3 +538,64 @@ pub fn kda_chunked(
         ],
     )
 }
+
+/// Folds each beam group's fold rows (`BEAM-PAGE-LISTS.md` §11.3, `carry`'s
+/// planes forget, beta, keys, `u`) into its KDA state, as a decode step
+/// folds a committed row, the rows stored once.
+/// The groups that fold lead `folds` (`groups` entries at most, the first of
+/// no rows ending them); a block folds each in turn, so a fire none of whose
+/// groups folds costs one read a block.
+#[allow(clippy::too_many_arguments)]
+pub fn kda_fold(
+    ctx: &Ctx,
+    state: &RecurrentPool,
+    heads: u32,
+    head_dim: u32,
+    norm_eps: f32,
+    gate_floor: f32,
+    dt_bias: Tensor,
+    a_log: Tensor,
+    carry: &Carry,
+    folds: Tensor,
+    groups: u32,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.kda group fold";
+    const BLOCK: u32 = 256;
+    const BLOCK_ROWS: u32 = 32;
+    if groups == 0 {
+        return Ok(());
+    }
+    debug_assert_eq!(dt_bias.dtype, Dtype::F32, "`{OP}` reads an f32 decay bias");
+    debug_assert_eq!(a_log.dtype, Dtype::F32, "`{OP}` reads an f32 decay bank");
+    f32_state(OP, state)?;
+    if !matches!(head_dim, 32 | 64 | 128) {
+        return Err(refuse(
+            OP,
+            format!("a fold holds 32-, 64- or 128-wide heads in registers, not {head_dim}"),
+        ));
+    }
+    let rows = state.rows(OP, state.slab, state.slot_stride_elems, heads)?;
+    ctx.fire(
+        OP,
+        Fire::at(kernel(
+            KDA,
+            &format!("::pie::ssm::kda_fold<::pie::bf16, {}>", head_dim / WARP),
+        ))
+        .apply(Launch::grid(
+            [heads, 1, head_dim.div_ceil(BLOCK_ROWS)],
+            [BLOCK, 1, 1],
+        )),
+        &[
+            rows.arg(),
+            a_log.arg(),
+            dt_bias.arg(),
+            gate_floor.arg(),
+            norm_eps.arg(),
+            stated(OP, heads)?.arg(),
+            stated(OP, head_dim)?.arg(),
+            carry.arg(),
+            folds.arg(),
+            stated(OP, groups)?.arg(),
+        ],
+    )
+}

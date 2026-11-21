@@ -17,6 +17,7 @@ mod kda;
 mod kda_chunk;
 mod mamba2;
 
+pub use conv1d::conv1d_fold;
 pub use conv1d::{
     causal_conv1d, causal_conv1d_carried, causal_conv1d_chunked, short_conv, short_conv_carried,
     short_conv_chunked,
@@ -24,9 +25,9 @@ pub use conv1d::{
 pub use dyn_conv::dyn_conv;
 pub use gdn_chunk::{gated_delta_chunked, gated_delta_chunked_serial, gdn_lands_snapshots};
 pub use gdn_prep::gdn_gates;
-pub use gdn_recurrent::{GdnGated, gated_delta, gated_delta_carried, gated_delta_tail};
-pub use kda::{kda, kda_carried, kda_chunked, kda_tail};
-pub use mamba2::{Mamba2, mamba2, mamba2_carried, mamba2_chunked, mamba2_tail};
+pub use gdn_recurrent::{GdnGated, gated_delta, gated_delta_carried, gated_delta_fold, gated_delta_tail};
+pub use kda::{kda, kda_carried, kda_chunked, kda_fold, kda_tail};
+pub use mamba2::{Mamba2, mamba2, mamba2_carried, mamba2_chunked, mamba2_fold, mamba2_tail};
 
 const BLOCK: u32 = 256;
 
@@ -217,3 +218,19 @@ fn f32_state(op: &'static str, state: &RecurrentPool) -> Result<(), Error> {
     }
     Ok(())
 }
+
+/// A beam group's fold (`BEAM-PAGE-LISTS.md` §11.3, as `kernels-rocm`'s
+/// `ssm::GroupFold`): its representative lane (any of its lanes; they share
+/// the set's state), where its fold rows start in the replay table, and how
+/// many. The fold kernels read a device table of them: the groups that fold
+/// lead it, and the first entry of no rows ends it (a block folds each group
+/// in turn, so an empty table costs a read, not a block a group).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GroupFold {
+    pub lane: u32,
+    pub fold_off: u32,
+    pub rows: u32,
+}
+
+const _: () = assert!(size_of::<GroupFold>() == 12);

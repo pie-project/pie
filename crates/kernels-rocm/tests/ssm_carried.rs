@@ -191,6 +191,36 @@ fn a_kda_decode_reads_its_buffered_rows_as_the_step_folds_them() {
                 "the state folded through the commit",
             );
 
+            // A beam group's fold (§11.3) of the first rows, from the kept
+            // planes, leaves the plain step's state there; a group folding
+            // none beside it touches nothing.
+            for n in [5u32, T as u32] {
+                let slab = gpu.up(&seed);
+                let carry = page.carry(&mut gpu, 0, n, 0);
+                let folds = gpu.up(&[0u32, 0, n, 0, 0, 0]);
+                ssm::kda_fold(
+                    &gpu.ctx(),
+                    &pool(slab, stride, slots),
+                    H,
+                    D,
+                    1e-6,
+                    floor,
+                    dt_t,
+                    a_t,
+                    &carry,
+                    Tensor::new(folds, 2, 3, Dtype::U32),
+                    2,
+                )
+                .expect("the KDA group fold fires");
+                gpu.sync();
+                near(
+                    &gpu.down::<f32>(slab, stride),
+                    &want_slabs[n as usize - 1],
+                    2e-3,
+                    &format!("the state a group folds through {n} rows"),
+                );
+            }
+
             // The chunked tail from the state folded through `c` rows lands
             // the keys and corrected values the decodes landed.
             let c = 5usize;
@@ -340,6 +370,31 @@ fn a_mamba2_decode_reads_its_buffered_rows_as_the_step_folds_them() {
             1e-4,
             "the state folded through the commit",
         );
+
+        // A beam group's fold (§11.3) of the first rows, from the kept
+        // planes, leaves the plain step's state there; a group folding none
+        // beside it touches nothing.
+        for n in [5u32, T as u32] {
+            let slab = gpu.up(&seed);
+            let carry = page.carry(&mut gpu, 0, n, 0);
+            let folds = gpu.up(&[0u32, 0, n, 0, 0, 0]);
+            ssm::mamba2_fold(
+                &gpu.ctx(),
+                &pool(slab, STRIDE, slots),
+                m,
+                &carry,
+                Tensor::new(folds, 2, 3, Dtype::U32),
+                2,
+            )
+            .expect("the Mamba-2 group fold fires");
+            gpu.sync();
+            near(
+                &gpu.down::<f32>(slab, STRIDE),
+                &want_slabs[n as usize - 1],
+                1e-4,
+                &format!("the state a group folds through {n} rows"),
+            );
+        }
     }
 }
 

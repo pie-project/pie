@@ -122,6 +122,13 @@ impl Shell {
         } else {
             Vec::new()
         };
+        // Each beam group's common slot (§11.3), read after the fault words.
+        let commons: Vec<(u64, engine::InstanceId)> =
+            if done.is_some() && prepared.page_faults.is_some() {
+                prepared.page_work.commons.clone()
+            } else {
+                Vec::new()
+            };
         // The lanes whose own page lists the device resolved: a fault word
         // each, read with the commit words.
         let page_faults: Vec<(u64, usize, engine::InstanceId)> = match prepared.page_faults {
@@ -181,6 +188,7 @@ impl Shell {
             .iter()
             .map(|flying| flying.commit)
             .chain(page_faults.iter().map(|&(word, _, _)| word))
+            .chain(commons.iter().map(|&(word, _)| word))
             .collect();
         let at = self.settlement.claim()?;
         let tap = match self.tap_tokens(at, &reports, &commits) {
@@ -238,6 +246,14 @@ impl Shell {
                                 .expect("a declined pass faults");
                         outcome.fault_lanes(flying.lanes.clone(), Some(flying.instance), &reason);
                     }
+                }
+                for (index, &(_, instance)) in commons.iter().enumerate() {
+                    // SAFETY: as above; the common slot words follow the
+                    // fault words.
+                    let word = unsafe {
+                        *host.add(commits_from + flying.len() + page_faults.len() + index)
+                    };
+                    outcome.beam_common.push((instance, word));
                 }
                 for (index, &(_, lane, instance)) in page_faults.iter().enumerate() {
                     // SAFETY: as above; the page-list fault words follow the

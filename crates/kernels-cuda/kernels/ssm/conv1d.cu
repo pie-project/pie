@@ -909,4 +909,50 @@ __global__ void conv1d_carried_vec8(
     }
 }
 
+// A beam group's fold of its conv window (BEAM-PAGE-LISTS §11.3): the window
+// stored as it stands after the group's fold rows (the committed cells, then
+// the rows' inputs, plane 0, through the representative lane's pages), so the
+// committed point moves with the set's recurrent state. A thread a channel,
+// folding the groups in turn (the folding ones lead the table; the first of no
+// rows ends it); grid ceil(C / block). `span` is the window's cells,
+// `(K - 1) dil + 1`, at most 8.
+template <class T>
+__global__ void conv1d_fold(StateRows rows, int C, int span, Carry carry,
+                            const GroupFold* __restrict__ folds, int groups)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    for (int g = 0; g < groups; ++g) {
+    const GroupFold f = folds[g];
+    const int n = static_cast<int>(f.rows);
+    if (n <= 0) break;
+    const int rl = static_cast<int>(f.lane);
+    const i32* rid = rows.row(rl);
+    if (rid[0] < 0) continue;
+    const CarryLane cl = carry.lane(rl);
+    const int cs = rows.atoms;
+    const int ci = c % cs;
+    T* state = rows.piece<T>(rid, c / cs);
+    T cells[8];
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        if (k >= span) break;
+        const int t = n - span + k;
+        if (t < 0) {
+            cells[k] = state[(long long)(span + t) * cs + ci];
+        } else {
+            u64 slot;
+            u32 tok;
+            carry.fold_at(cl, f.fold_off, t, slot, tok);
+            cells[k] = carry.plane_at<const T>(slot, tok, 0)[c];
+        }
+    }
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        if (k >= span) break;
+        state[(long long)k * cs + ci] = cells[k];
+    }
+    }
+}
+
 }

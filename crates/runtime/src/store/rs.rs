@@ -2200,8 +2200,22 @@ impl RsStore {
     }
 
     pub fn commit_folds(&mut self, folds: RsPendingFolds) {
+        self.commit_folds_keeping(folds, &[]);
+    }
+
+    /// [`RsStore::commit_folds`], the sets of `keep` folding their state
+    /// only: a beam group's buffer backs its pool page by page
+    /// (`BEAM-PAGE-LISTS.md` §11), whatever slots its state has folded
+    /// (§11.3), so none of it goes back while the group runs.
+    pub fn commit_folds_keeping(&mut self, folds: RsPendingFolds, keep: &[RsWorkingSetId]) {
         for RsPendingFold { ws, tokens } in folds.0 {
-            self.fold(ws, tokens);
+            if keep.contains(&ws) {
+                if let Ok(entry) = self.entry_mut(ws) {
+                    entry.frozen = entry.frozen.saturating_add(tokens);
+                }
+            } else {
+                self.fold(ws, tokens);
+            }
         }
     }
 

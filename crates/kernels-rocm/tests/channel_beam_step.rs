@@ -34,7 +34,11 @@ impl Lcg {
             return (0..lanes).collect();
         }
         let mut parents: Vec<u32> = (0..lanes).map(|_| self.next() % lanes).collect();
-        parents.sort_unstable();
+        // Most fires take their parents in order, as a top-k by score need
+        // not: every third keeps the draw's order.
+        if self.next() % 3 != 0 {
+            parents.sort_unstable();
+        }
         parents
     }
 }
@@ -85,6 +89,9 @@ fn search_rs(gpu: &Gpu, lanes: u32, folded: u32, steps: u32, seed: u64, rs_token
     let rs_bases_at = gpu.up(&rs_bases);
     let mut replay = State::new(lanes, cap, FRAMES);
     let mut rng = Lcg(seed);
+    // Each live beam's history, a token a fire unique to (fire, beam): a
+    // child's is its parent's and its own, so siblings part at their row.
+    let mut histories: Vec<Vec<(u32, u32)>> = Vec::new();
     for t in 0..steps {
         if t == steps / 2 {
             // Suspend and restore: the state's bytes at another address.
@@ -169,6 +176,25 @@ fn search_rs(gpu: &Gpu, lanes: u32, folded: u32, steps: u32, seed: u64, rs_token
             let row = &held[map + b * cap as usize..map + b * cap as usize + c as usize + 1];
             assert_eq!(row, &want.lists[b][..], "{at}: beam {b}'s list");
         }
+        // The common slot (§11.3, §11.4): the live beams' longest common
+        // history past the prompt, by brute force over their histories,
+        // capped at the slot past the fire's row.
+        histories = (0..lanes)
+            .map(|b| {
+                let mut history = if t == 0 {
+                    Vec::new()
+                } else {
+                    histories[parents[b as usize].min(lanes - 1) as usize].clone()
+                };
+                history.push((t, b));
+                history
+            })
+            .collect();
+        let common_len = (0..=t as usize)
+            .take_while(|&k| histories.iter().all(|h| h.get(k) == histories[0].get(k)))
+            .count() as u32;
+        let common = (folded + common_len).min(slot + 1);
+        assert_eq!(held[3], common, "{at}: the common slot");
         let free = 4 + 2 * (lanes * cap) as usize;
         let device_free: Vec<bool> = held[free..free + cap as usize].iter().map(|&w| w != 0).collect();
         assert_eq!(device_free, replay.free, "{at}: free pages");
@@ -218,7 +244,7 @@ fn search_rs(gpu: &Gpu, lanes: u32, folded: u32, steps: u32, seed: u64, rs_token
 #[test]
 fn the_beam_step_follows_the_spec() {
     let Some(gpu) = Gpu::open() else { return };
-    for lanes in [2, 4, 8] {
+    for lanes in [1, 2, 4, 8] {
         for folded in [37, 32] {
             for seed in 0..3 {
                 search(&gpu, lanes, folded, 3 * PAGE + 9, seed);

@@ -276,3 +276,40 @@ fn mamba2_scan(
         ],
     )
 }
+
+/// Folds each beam group's fold rows (`BEAM-PAGE-LISTS.md` §11.3, `carry`'s
+/// planes step size and `x | B`) into its Mamba-2 state, as a decode step
+/// folds a committed row, the state stored once.
+/// The groups that fold lead `folds` (`groups` entries at most, the first of
+/// no rows ending them); a block folds each in turn, so a fire none of whose
+/// groups folds costs one read a block.
+pub fn mamba2_fold(
+    ctx: &Ctx,
+    state: &RecurrentPool,
+    m: Mamba2,
+    carry: &Carry,
+    folds: Tensor,
+    groups: u32,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.mamba2 group fold";
+    const BLOCK: u32 = 256;
+    if groups == 0 {
+        return Ok(());
+    }
+    let rows = state.rows(OP, state.slab, state.slot_stride_elems, m.heads)?;
+    ctx.fire(
+        OP,
+        Fire::at(kernel(MAMBA2, "::pie::ssm::mamba2_fold"))
+            .apply(Launch::grid([m.heads, 1, 1], [BLOCK, 1, 1])),
+        &[
+            rows.arg(),
+            m.a_log.arg(),
+            m.dt_bias.arg(),
+            stated(OP, m.heads)?.arg(),
+            stated(OP, m.groups)?.arg(),
+            carry.arg(),
+            folds.arg(),
+            stated(OP, groups)?.arg(),
+        ],
+    )
+}

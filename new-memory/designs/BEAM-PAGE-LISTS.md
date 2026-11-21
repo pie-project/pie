@@ -103,11 +103,13 @@ rs buffer, on the same pool pages as its kv slots.
     pending[F][Q]  bit   a ring: slot `t mod F` holds the pages fire `t` freed
     fired          u32   fires run; 0 until the first fire primes
     pool           u32   the pool's pages at the last fire
+    common         u32   the group's common slot (§11.3), header[3]
+    lca[B][B]      u32   each pair of live beams' common depth (§11.4)
 
 It is the instance's **resident state** (`engine::GuestState::resident`),
 sized by the engine's `guest_state(program, extents)` from the bind's
 `key_len` (`end`, §3), never in the per-program instance item (one program
-binds searches of many depths): `B*P*4 + (F + 1)*ceil(Q/32)*4 + 16` bytes, by
+binds searches of many depths): `B*P*4 + (F + 1)*ceil(Q/32)*4 + B*B*4 + 16` bytes, by
 the engine's bounds on `P` and `Q` (`Q <= B P + B (F + 1) + 1`; an engine may
 hold a word where a bit is stated, and may keep two copies of `map` to
 reorder in place). The runtime takes it at the bind as a live part of the
@@ -395,11 +397,12 @@ they fold into the set's state once, and each beam carries only the rows after
 it: with one beam every row is common, and beam-1 carries the natural window a
 plain decode does.
 
-- Definition. After fire `t`'s head step has reordered the lists (`map'`,
-  §6.2), let `j*` be the first column at which the live beams' lists name
-  different pool pages (`cap` where every column agrees), and `end_t` the slot
-  past the fire's rows. The group's common slot is
-  `c_t = min((f0 + j*) S, end_t)`. Every slot below it lies, for every beam,
+- Definition. The group's common slot `c_t` is the depth of the live beams'
+  most recent common ancestor after fire `t`, capped at `end_t`, the slot
+  past the fire's rows, and never below the folded slot (§11.4 tracks it to
+  the row). It is at least the page-granular `min((f0 + j*) S, end_t)`, `j*`
+  the first column at which the live beams' lists (`map'`, §6.2) name
+  different pool pages, which this section first stated. Every slot below it lies, for every beam,
   on the same pool page: one row, never a copy that could differ (a slot a
   fork copied is not counted: whole shared pages only, at most `S - 1` rows
   more carried). `c_t` never decreases: a child keeps its parent's columns
@@ -427,12 +430,13 @@ plain decode does.
   fold.
 - Pages below the fold point. kv: unchanged (attention reads every slot, and
   the pages below `c` are already in every list; the lists, `f0`, `free` and
-  `pending` do not move). rs: no beam's replay reaches below `folded_g`, so the
-  set's rs buffer base moves to `floor(folded_g / T) T` and the rs pages wholly
-  below it go back to the rs store, the truncate from below a set's committed
-  length advancing takes. `sigma` (§11.1) and `copy_rs_rows` (§11.2) apply at
-  slots at or past the base; a copy's slot below it is skipped, as a prompt
-  tail's is.
+  `pending` do not move). rs: the group's fold moves the set's state only. A
+  beam set's rs buffer is laid by pool page (§11.1: slot `s` of a beam lies at
+  `(f0 + q) S + s mod S`, `q` any pool page), so a page below `folded_g` in
+  column order may back a pool page a beam still writes: the buffer's base and
+  its pages stay while the search runs, and go back at the finish's relist and
+  the set's next plain fold, as before. A beam lane reports no kv fold either:
+  the kv folded point anchors the pool (`f0`).
 - A search owns its set's state. A parents pass used to leave the set's state
   as the search found it; it now advances it to the common ancestor. §6.6's
   adopt is unchanged (the chosen beam's list holds every common page, and the
@@ -449,3 +453,47 @@ plain decode does.
   pages below the base are given back; beam-1-parents' step cost and carried
   rows equal a plain decode's at the same lag, and beam-4's step lies within
   the user's rule of greedy's.
+
+### 11.4 The common slot to the row (adopted)
+
+A property of any group bound through `Port::Parents` (§2), whatever the
+guest forks its lanes for: the depth of its live lanes' most recent common
+ancestor. Nothing here knows why a guest picks the parents it picks (a beam
+search, a tree of drafts, parallel samples of one prompt); it reads only
+the parents the group's head step already reads. §11.3's page-granular slot
+stopped at whole shared pages, so each lane carried up to `S - 1` rows past
+the common ancestor, plus the harvest lag.
+
+- What is common. Rows a lane holds below its group's common depth were each
+  written once, by one lane, before the lanes parted, and reached the others
+  only by `copy_rs_rows` (§11.2) of the page holding them: the same bytes in
+  every lane, on whichever page. So the exact common slot is that depth,
+  whatever pages the rows lie on.
+- Tracked on the device, in the head step. The group's resident state holds
+  `lca[B][B]` (u32, slots): for live lanes `i != j`, the slot below which
+  their rows agree. Fire `t`'s head step, after it reads the parents `p`,
+  sets for every pair `lca'(i, j) = s_t` where `p_i == p_j` (lanes forked
+  from one parent agree below this fire's row; counting them as parting at
+  it is a lower bound, exact when their inputs at the row differ), and
+  `lca(p_i, p_j)` otherwise; then `c_t = min over i < j of lca'(i, j)`,
+  capped at `end_t` (one lane: every row is common) and never below the
+  folded slot. Priming sets every pair to the fire's slot (the lanes share
+  the prompt). `c_t` never decreases: a pair's common depth only grows as
+  their parents' did.
+- Contract: unchanged past the head step. `c_t` is still `header[3]`, read at
+  harvest and stated as a host fold to it (§11.3); the fold reads its rows
+  through the representative lane's rs table, which names, below `c_t`, a
+  row equal in every lane. Prepare, the fold kernels, the runtime and every
+  engine's fold path stay as they are; only each backend's head step
+  changes, and its resident state grows by `4 B^2` bytes (64 at `B = 4`,
+  1 KiB at 16).
+- Cost: `B^2` words a fire in one block of the head step. Saving: each lane
+  carries `s_t - c_t` rows plus the lag instead of up to `S - 1` more. Rows
+  the lanes genuinely differ by stay carried, as they must. Measured
+  (MI300X, Qwen3.5-0.8B, a 4-lane group): 2.82 to 2.58 ms a step; one-lane
+  groups and plain decode unchanged.
+- Tests: `c_t` against the longest common prefix of the live lanes'
+  histories (a token a fire unique to its lane, so forks part at their row)
+  after every fire, at `B` = 1, 2, 4, 8, parents in and out of order, lanes
+  dying; a group with row-granular folds verifies as §11.3's (`--verify` and
+  the finish check, widths 1, 2, 4, 8, on a hybrid).

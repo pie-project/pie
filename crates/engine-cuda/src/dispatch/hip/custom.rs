@@ -687,10 +687,8 @@ impl Run<'_> {
     /// The gated-delta decode step whole where the kernel covers it, else
     /// its primitives over the values the fused op keeps.
     fn gdn_step(&mut self, op: &Fused) -> Result<(), KernelError> {
-        use poem_exec::{DispatchGather, DispatchSsm};
         let Fused::GdnStep {
             qkvz,
-            width,
             qkv,
             z,
             conv_weight,
@@ -701,13 +699,13 @@ impl Run<'_> {
             ba,
             dt_bias,
             a_log,
-            gates,
             state,
             k_heads,
             v_heads,
             k_dim,
             v_dim,
             y,
+            ..
         } = *op
         else {
             unreachable!("only the gated-delta step comes here");
@@ -757,6 +755,7 @@ impl Run<'_> {
                 if done {
                     return Ok(());
                 }
+                return self.gdn_step_primitives(op);
             }
         }
         if !self.rs_extended() && !self.rs_buffered(qkv) {
@@ -788,6 +787,37 @@ impl Run<'_> {
                     .map_err(crate::error::kernel);
             }
         }
+        self.gdn_step_primitives(op)
+    }
+
+    /// The gated-delta decode step as its primitives, over the values the
+    /// fused op keeps.
+    fn gdn_step_primitives(&mut self, op: &Fused) -> Result<(), KernelError> {
+        use poem_exec::{DispatchGather, DispatchSsm};
+        let Fused::GdnStep {
+            qkvz,
+            width,
+            qkv,
+            z,
+            conv_weight,
+            conv_state,
+            conv_width,
+            dilation,
+            conv,
+            ba,
+            dt_bias,
+            a_log,
+            gates,
+            state,
+            k_heads,
+            v_heads,
+            k_dim,
+            v_dim,
+            y,
+        } = *op
+        else {
+            unreachable!("only the gated-delta step comes here");
+        };
         DispatchGather::dispatch(
             self,
             &poem_ir::Gather::SplitRows {

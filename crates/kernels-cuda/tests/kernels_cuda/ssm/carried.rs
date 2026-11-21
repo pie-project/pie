@@ -189,6 +189,36 @@ fn a_kda_decode_reads_its_buffered_rows_as_the_step_folds_them() {
                 "the state folded through the commit",
             );
 
+            // A beam group's fold (§11.3) of the first rows, from the kept
+            // planes, leaves the plain step's state there; the entry of no
+            // rows after it ends the table.
+            for n in [5u32, T as u32] {
+                let slab = gpu.up(&seed);
+                let carry = page.carry(&mut gpu, 0, n, 0);
+                let folds = gpu.up(&[0u32, 0, n, 0, 0, 0]);
+                ssm::kda_fold(
+                    &gpu.ctx(),
+                    &pool(slab, stride, slots),
+                    H,
+                    D,
+                    1e-6,
+                    floor,
+                    dt_t,
+                    a_t,
+                    &carry,
+                    Tensor::new(folds, 2, 3, Dtype::U32),
+                    2,
+                )
+                .expect("the KDA group fold fires");
+                gpu.sync();
+                near(
+                    &gpu.down::<f32>(slab, stride),
+                    &want_slabs[n as usize - 1],
+                    2e-3,
+                    &format!("the state a group folds through {n} rows"),
+                );
+            }
+
             // The chunked tail from the state folded through `c` rows lands
             // the keys and corrected values the decodes landed.
             let c = 5usize;
@@ -338,5 +368,172 @@ fn a_mamba2_decode_reads_its_buffered_rows_as_the_step_folds_them() {
             1e-4,
             "the state folded through the commit",
         );
+
+        // A beam group's fold (§11.3) of the first rows, from the kept
+        // planes, leaves the plain step's state there; the entry of no rows
+        // after it ends the table.
+        for n in [5u32, T as u32] {
+            let slab = gpu.up(&seed);
+            let carry = page.carry(&mut gpu, 0, n, 0);
+            let folds = gpu.up(&[0u32, 0, n, 0, 0, 0]);
+            ssm::mamba2_fold(
+                &gpu.ctx(),
+                &pool(slab, STRIDE, slots),
+                m,
+                &carry,
+                Tensor::new(folds, 2, 3, Dtype::U32),
+                2,
+            )
+            .expect("the Mamba-2 group fold fires");
+            gpu.sync();
+            near(
+                &gpu.down::<f32>(slab, STRIDE),
+                &want_slabs[n as usize - 1],
+                1e-4,
+                &format!("the state a group folds through {n} rows"),
+            );
+        }
     }
+}
+
+/// Gated delta: twelve plain decodes of one lane, each folding its row,
+/// against a carried run landing its rows' `[b | a]` and `u` (the keys laid
+/// as the conv lands them): a beam group's fold (§11.3) of the first `n`
+/// kept rows from the committed state leaves the plain decodes' state
+/// there, each row rounded as a decode stores it.
+#[test]
+fn a_gated_delta_group_fold_leaves_the_plain_decodes_state() {
+    const KH: u32 = 2;
+    const VH: u32 = 4;
+    const KD: u32 = 128;
+    const VD: u32 = 128;
+    const T: usize = 12;
+    let conv_dim = (2 * KH * KD + VH * VD) as usize;
+    let stride = (VH * KD * VD) as usize;
+    let mut gpu = Gpu::open();
+    let mut lcg = Lcg::seeded(0x9d17);
+    let (qkv_raw, _) = lcg.row(T * conv_dim);
+    let qkv = gpu.up(&qkv_raw);
+    let (ba_raw, _) = lcg.row(T * 2 * VH as usize);
+    let ba = gpu.up(&ba_raw);
+    let dt_bias: Vec<u16> = (0..VH).map(|_| to_bf16(0.1 * lcg.unit())).collect();
+    let a_log: Vec<f32> = (0..VH).map(|_| -0.5 + 0.2 * lcg.unit()).collect();
+    let (dt_bias, a_log) = (gpu.up(&dt_bias), gpu.up(&a_log));
+    let dt_t = Tensor::new(dt_bias, 1, VH, Dtype::Bf16);
+    let a_t = Tensor::new(a_log, 1, VH, Dtype::F32);
+    let seed: Vec<u16> = (0..stride).map(|_| to_bf16(0.05 * lcg.unit())).collect();
+    let slots = gpu.up(&[0i32]);
+    let bf16_pool = |slab: u64| RecurrentPool {
+        slab: Tensor::new(slab, 1, stride as u32, Dtype::Bf16),
+        ..pool(slab, stride, slots)
+    };
+    let row = |base: u64, j: usize, width: usize, elem: usize| base + (j * width * elem) as u64;
+    let gates = gpu.zeros(T * 2 * VH as usize * 4);
+    for j in 0..T {
+        ssm::gdn_gates(
+            &gpu.ctx(),
+            Tensor::new(row(ba, j, 2 * VH as usize, 2), 1, 2 * VH, Dtype::Bf16),
+            dt_t,
+            a_t,
+            &mut Tensor::new(row(gates, j, 2 * VH as usize, 4), 1, 2 * VH, Dtype::F32),
+        )
+        .expect("the gates fire");
+    }
+    // The plain step, a row a fire, folding each.
+    let slab = gpu.up(&seed);
+    let y = gpu.zeros(T * (VH * VD) as usize * 4);
+    let mut want_slabs = Vec::new();
+    for j in 0..T {
+        ssm::gated_delta(
+            &gpu.ctx(),
+            Tensor::new(row(qkv, j, conv_dim, 2), 1, conv_dim as u32, Dtype::Bf16),
+            Tensor::ABSENT,
+            Tensor::new(row(gates, j, 2 * VH as usize, 4), 1, 2 * VH, Dtype::F32),
+            &bf16_pool(slab),
+            KH,
+            VH,
+            KD,
+            VD,
+            &mut Tensor::new(row(y, j, (VH * VD) as usize, 4), 1, VH * VD, Dtype::F32),
+        )
+        .expect("the gated-delta step fires");
+        gpu.sync();
+        want_slabs.push(gpu.down::<u16>(slab, stride));
+    }
+    // The carried run lands each row's `[b | a]` and `u`; its keys lie as
+    // the conv lands them.
+    let width = (KH * KD) as usize;
+    let keys: Vec<u16> = (0..T)
+        .flat_map(|j| qkv_raw[j * conv_dim + width..j * conv_dim + 2 * width].to_vec())
+        .collect();
+    let planes = [2 * u64::from(VH) * 2, width as u64 * 2, u64::from(VH * VD) * 4];
+    let page = Page::new(&mut gpu, &planes, Some((1, &keys)));
+    let slab = gpu.up(&seed);
+    let y = gpu.zeros(T * (VH * VD) as usize * 4);
+    for j in 0..T {
+        let carry = page.carry(&mut gpu, j as u32, j as u32, 0);
+        ssm::gated_delta_carried(
+            &gpu.ctx(),
+            Tensor::new(row(qkv, j, conv_dim, 2), 1, conv_dim as u32, Dtype::Bf16),
+            Tensor::new(row(gates, j, 2 * VH as usize, 4), 1, 2 * VH, Dtype::F32),
+            &bf16_pool(slab),
+            KH,
+            VH,
+            KD,
+            VD,
+            &mut Tensor::new(row(y, j, (VH * VD) as usize, 4), 1, VH * VD, Dtype::F32),
+            ssm::GdnGated {
+                ba: Tensor::new(row(ba, j, 2 * VH as usize, 2), 1, 2 * VH, Dtype::Bf16),
+                dt_bias: dt_t,
+                a_log: a_t,
+            },
+            &carry,
+        )
+        .expect("the carried gated-delta step fires");
+        gpu.sync();
+    }
+    assert_eq!(gpu.down::<u16>(slab, stride), seed, "decodes committing nothing keep the state");
+    for n in [5u32, T as u32] {
+        let slab = gpu.up(&seed);
+        let carry = page.carry(&mut gpu, 0, n, 0);
+        let folds = gpu.up(&[0u32, 0, n, 0, 0, 0]);
+        ssm::gated_delta_fold(
+            &gpu.ctx(),
+            &bf16_pool(slab),
+            KH,
+            VH,
+            KD,
+            VD,
+            dt_t,
+            a_t,
+            &carry,
+            Tensor::new(folds, 2, 3, Dtype::U32),
+            2,
+        )
+        .expect("the gated-delta group fold fires");
+        gpu.sync();
+        let got: Vec<f32> = gpu.down::<u16>(slab, stride).into_iter().map(from_bf16).collect();
+        let want: Vec<f32> = want_slabs[n as usize - 1].iter().copied().map(from_bf16).collect();
+        near(&got, &want, 2e-2, &format!("the state a group folds through {n} rows"));
+    }
+    // An empty table folds nothing.
+    let slab = gpu.up(&seed);
+    let carry = page.carry(&mut gpu, 0, 0, 0);
+    let folds = gpu.up(&[0u32, 0, 0, 0, 0, 0]);
+    ssm::gated_delta_fold(
+        &gpu.ctx(),
+        &bf16_pool(slab),
+        KH,
+        VH,
+        KD,
+        VD,
+        dt_t,
+        a_t,
+        &carry,
+        Tensor::new(folds, 2, 3, Dtype::U32),
+        2,
+    )
+    .expect("an empty fold fires");
+    gpu.sync();
+    assert_eq!(gpu.down::<u16>(slab, stride), seed, "an empty table folds nothing");
 }

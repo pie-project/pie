@@ -704,7 +704,7 @@ struct RsCopyRun {
 
 static_assert(sizeof(RsCopyRun) == 64, "RsCopyRun: the Rust `channel::RsCopyRun` mirrors this layout");
 
-// Copies each run's rows, a block a (run, plane), a slot's row a step.
+// Copies each run's rows, a block a (run, plane), its threads over the rows' bytes.
 __global__ void copy_rs_rows(
     const RsCopyRun* __restrict__ runs,
     const PagePlane* __restrict__ planes,
@@ -725,19 +725,30 @@ __global__ void copy_rs_rows(
     }
     const PagePlane plane = planes[r.plane_at + blockIdx.y];
     const u64 T = r.tokens == 0u ? 1u : r.tokens;
-    for (u32 k = 0u; k < tokens; ++k) {
+    // The block's threads spread over every (row, sixteen bytes) of the
+    // run's rows at once: a row's cell is a layer's whole row of a plane
+    // (kilobytes), copied sixteen bytes a thread where both ends align.
+    const u64 cell = plane.cell;
+    const u64 quads = (cell + 15u) / 16u;
+    for (u64 unit = threadIdx.x; unit < static_cast<u64>(tokens) * quads; unit += blockDim.x) {
+        const u64 k = unit / quads;
+        const u64 at = (unit % quads) * 16u;
         const u64 from_slot = (static_cast<u64>(r.f0) + src) * r.page + k;
         const u64 to_slot = (static_cast<u64>(r.f0) + dst) * r.page + k;
         if (from_slot < r.base || to_slot < r.base) continue;
         const u64 fe = (from_slot - r.base) / T, te = (to_slot - r.base) / T;
         if (fe >= r.bases_len || te >= r.bases_len) {
-            if (threadIdx.x == 0) atomicMax(r.fault, PIE_PAGES_COPY_BOUNDS);
-            return;
+            atomicMax(r.fault, PIE_PAGES_COPY_BOUNDS);
+            continue;
         }
         const u8* from = reinterpret_cast<const u8*>(
-            r.bases[fe] + plane.offset + ((from_slot - r.base) % T) * plane.cell);
-        u8* to = reinterpret_cast<u8*>(r.bases[te] + plane.offset + ((to_slot - r.base) % T) * plane.cell);
-        for (u64 at = threadIdx.x; at < plane.cell; at += blockDim.x) to[at] = from[at];
+            r.bases[fe] + plane.offset + ((from_slot - r.base) % T) * cell) + at;
+        u8* to = reinterpret_cast<u8*>(r.bases[te] + plane.offset + ((to_slot - r.base) % T) * cell) + at;
+        if (at + 16u <= cell && ((reinterpret_cast<u64>(from) | reinterpret_cast<u64>(to)) & 15u) == 0u) {
+            *reinterpret_cast<uint4*>(to) = *reinterpret_cast<const uint4*>(from);
+        } else {
+            for (u64 b = 0u; b < 16u && at + b < cell; ++b) to[b] = from[b];
+        }
     }
 }
 
@@ -989,11 +1000,42 @@ __global__ void beam_step(const BeamStepRun* __restrict__ runs, u32 run_count)
             l.pages[l.from + e] = l.bases[at];
         }
     }
+    // The group's common slot (BEAM-PAGE-LISTS §11.3, §11.4): the depth of
+    // its live lanes' most recent common ancestor, whatever the guest forks
+    // them for. `lca[i][j]` holds, for lanes i != j, the slot below which
+    // their rows agree: lanes forked from one parent agree below this fire's
+    // row (counted as parting there: a lower bound, exact when their inputs
+    // differ); others agree as far as their parents did. Every row below the
+    // least of them was written once and reached the other lanes only by
+    // copies: the same bytes in every lane. Capped at the slot past this
+    // fire's rows (with one lane every row is common), never below the
+    // folded slot; monotone, read by the host at harvest.
+    u32* lca = copies + 3u * B;
+    __shared__ u32 lca_new[PIE_BEAM_MAX_LANES * PIE_BEAM_MAX_LANES];
+    __shared__ u32 common;
+    if (threadIdx.x == 0u) common = r.slot + 1u;
     __syncthreads();
+    for (u32 x = threadIdx.x; x < B * B; x += blockDim.x) {
+        const u32 i = x / B, j = x % B;
+        u32 depth = 0xffffffffu;
+        if (i != j) {
+            if (primed == 0u) {
+                depth = r.slot;
+            } else {
+                const u32 pi = parent_of[i], pj = parent_of[j];
+                depth = pi == pj ? r.slot : lca[pi * B + pj];
+            }
+            atomicMin(&common, depth);
+        }
+        lca_new[x] = depth;
+    }
+    __syncthreads();
+    for (u32 x = threadIdx.x; x < B * B; x += blockDim.x) lca[x] = lca_new[x];
     if (threadIdx.x == 0u) {
         header[0] = 1u;
         header[1] = fired + 1u;
         header[2] = Q;
+        header[3] = common > r.folded ? common : r.folded;
     }
 }
 

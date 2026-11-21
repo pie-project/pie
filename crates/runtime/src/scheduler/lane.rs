@@ -669,6 +669,9 @@ impl Lane {
                         if !writes.is_empty() {
                             crate::pipeline::fire::record_kv_writes(writes);
                         }
+                        crate::pipeline::fire::record_beam_common(std::mem::take(
+                            &mut outcome.beam_common,
+                        ));
                         let _ = landed_tx.send(LaneRequest::Landed {
                             frame: at.frame,
                             step: at.step,
@@ -684,6 +687,7 @@ impl Lane {
                 let faulted = Arc::clone(&inline_faults);
                 engine.on_complete(std::sync::Arc::new(
                     move |at: engine::StepDone, outcome: engine::StepOutcome| {
+                        crate::pipeline::fire::record_beam_common(outcome.beam_common);
                         if !outcome.wrote.is_empty() {
                             crate::pipeline::fire::record_kv_writes(outcome.wrote);
                         }

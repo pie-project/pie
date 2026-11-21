@@ -513,6 +513,12 @@ pub fn prepare_many(
         }
         RsPlan::Groups(groups) => groups,
     };
+    // The beam groups' sets: their folds keep their buffers (§11.3).
+    let beam_sets: Vec<RsWorkingSetId> = groups
+        .iter()
+        .filter(|group| group.beams)
+        .map(|group| working_sets[group.lanes[0]])
+        .collect();
     let lanes = working_sets.len();
     let mut out = PreparedRs {
         verbs: vec![engine::fire::RsVerb::Fold; lanes],
@@ -550,8 +556,8 @@ pub fn prepare_many(
         // The first lane writes the state; the others read what it held, or
         // the zeros it starts from. In a shared pool a group whose first
         // lane folds writes a fresh record, and every lane names it,
-        // `[run, cow]` as the first does (CONTRACT-BC 15); the buffered rows
-        // are rs list slots apart from the record.
+        // `[run, cow]` as the first does (CONTRACT-BC 15), as does a beam
+        // group's; the buffered rows are rs list slots apart from the record.
         for (at, &lane) in group.lanes.iter().enumerate() {
             out.bound[lane] = true;
             match (at, write.state(), held) {
@@ -559,7 +565,9 @@ pub fn prepare_many(
                     out.slot_ids[lane] = state.slot.0;
                     out.slot_flags[lane] = crate::engine::RS_FLAG_RESET;
                 }
-                (_, Some(state), Some(_)) if at > 0 && out.shared => {
+                // A beam group's lanes all read the state its fold wrote
+                // (`BEAM-PAGE-LISTS.md` §11.3), past which each replays.
+                (_, Some(state), Some(_)) if at > 0 && (out.shared || group.beams) => {
                     out.slot_ids[lane] = state.slot.0;
                 }
                 (0, Some(state), _) => {
@@ -606,7 +614,7 @@ pub fn prepare_many(
         let (pages, base, folded) = match read {
             Ok(read) => read,
             Err(error) => {
-                store.commit_folds(folds);
+                store.commit_folds_keeping(folds, &beam_sets);
                 store.settle(published);
                 return Err(error.to_string());
             }
@@ -637,7 +645,7 @@ pub fn prepare_many(
         }
     }
     note_reads(store, &published, &out);
-    store.commit_folds(folds);
+    store.commit_folds_keeping(folds, &beam_sets);
     out.snapshots = published.snapshots().to_vec();
     out.txn = Some(RsTxn { published });
     Ok(out)

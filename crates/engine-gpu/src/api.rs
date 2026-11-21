@@ -546,6 +546,7 @@ impl<B: Host> Gpu<B> {
         };
         for (step, pending) in steps.iter_mut().enumerate() {
             let mut outcome = engine::StepOutcome {
+                beam_common: Vec::new(),
                 wrote: std::mem::take(&mut pending.wrote),
                 faulted: std::mem::take(&mut pending.faulted),
             };
