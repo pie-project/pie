@@ -517,6 +517,7 @@ impl Engine for Xla {
         )
         .map_err(fault)?;
         let mut shell = shell;
+        shell.set_host_programs(residency.host_programs);
         // Every maintenance program a fire, a fork or a park runs later, one
         // a slot size, compiled now whether or not the ladder runs: none is
         // built after the load.
