@@ -9124,3 +9124,51 @@ fn the_owner_of_a_capped_frame_is_no_victim() {
     assert!(!with_capped.contains(&capped), "its frame waits on a raise: no victim");
     assert!(with_capped.contains(&other));
 }
+
+/// The M1 on ca5c710a7: a restore head, the map standing its need [(3, 2),
+/// (2, 2)] (three free runs of three, need_moves 0), its own check after
+/// its unpark finding one run of three, and the pass asking the policy.
+/// One more piece was not enough: the need is widened until the map no
+/// longer stands it, and the map's moves for it are made.
+#[tokio::test(flavor = "current_thread")]
+async fn a_need_the_map_stands_twice_over_is_widened_until_moves_are_named() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(6, 0..0, 64));
+    pool.free.lock().extend([0, 1, 2, 3]);
+    pool.store_refuses.store(true, Ordering::Relaxed);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (head, resident) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [head, resident] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    pool.kv.lock().extend([(4, resident), (5, resident)]);
+    planner.with_inner(|inner| {
+        inner.procs.get_mut(&resident).unwrap().idle = true;
+        let proc = inner.procs.get_mut(&head).unwrap();
+        proc.state = Residency::Evicted;
+        proc.roles_short = Some(PendingBind {
+            run: 2,
+            pieces: 1,
+            pages: 2,
+        });
+        proc.roles_short_stood = Some(false);
+        inner.enqueue(
+            head,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        );
+    });
+    planner.poke();
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.stats.evictions_started.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+    }
+    assert!(
+        planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
+        "widened past what the map stands, the occupant is moved"
+    );
+}

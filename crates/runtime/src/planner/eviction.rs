@@ -262,25 +262,11 @@ impl ResidencyPlanner {
         // move planned). Once the restore stands, it is sent again.
         if victims.restore
             && let Some(need) = shape.as_mut()
-            && let Some((run, _)) = need.longest()
         {
-            let (state, bind) = self.with_inner(|inner| {
-                let state = inner.queue.get(&victims.head).map(super::wait::Waiter::rs_need);
-                let bind = inner
-                    .procs
-                    .get(&victims.head_pid)
-                    .and_then(|proc| proc.bind_room)
-                    .map(|need| (need.run, need.pieces));
-                (state.unwrap_or_default(), bind)
-            });
             let mut map = self.port.chunk_occupants(&[]);
             map.merge(self.parked_map(victims.head_pid));
             self.lay_serve_state(victims.head, &mut map);
-            if map.cheapest_need(need).is_some_and(|moves| moves.is_empty())
-                && !self.port.restore_stands(victims.head_pid, need, state, bind)
-            {
-                need.add(run, 1);
-            }
+            self.widen_to_store(victims.head, victims.head_pid, need, &map);
         }
         // Kv the head lacks, with parked state lying on the device (role
         // slots its park found no room below for, as on a home with no host
@@ -466,6 +452,45 @@ impl ResidencyPlanner {
             tracing::debug!(head = ?victims.head_pid, "planner: no pick could start its move");
             self.plan_ended(victims.head, "no pick could start its move", host_short, &unhostable);
             self.note_short(victims.head, deficit, if host_short { deficit } else { 0 });
+        }
+    }
+
+    /// A restore head's `need` widened until the map no longer stands it
+    /// where the store's placement of its whole restore does not (its
+    /// serve's state, every piece of its unpark, its pending bind's runs):
+    /// one more piece of its longest run at a time, never past what the
+    /// map's free chunks could hold. The map then names the moves the
+    /// store's room needs: read as the map's alone, the M1 on ca5c710a7
+    /// read need_moves 0 while its own check found one run of three of the
+    /// three the map stood, and the pass asked the policy.
+    pub(super) fn widen_to_store(
+        &self,
+        head: EntryKey,
+        pid: ProcessId,
+        need: &mut RunNeed,
+        map: &super::pool::ChunkMap,
+    ) {
+        let Some((run, _)) = need.longest() else {
+            return;
+        };
+        let (state, bind) = self.with_inner(|inner| {
+            let state = inner.queue.get(&head).map(super::wait::Waiter::rs_need);
+            let bind = inner
+                .procs
+                .get(&pid)
+                .and_then(|proc| proc.bind_room)
+                .map(|need| (need.run, need.pieces));
+            (state.unwrap_or_default(), bind)
+        });
+        if self.port.restore_stands(pid, need, state, bind) {
+            return;
+        }
+        let most = u32::try_from(map.free.len()).unwrap_or(u32::MAX) / run.max(1) + 1;
+        for _ in 0..most {
+            if !map.cheapest_need(need).is_some_and(|moves| moves.is_empty()) {
+                break;
+            }
+            need.add(run, 1);
         }
     }
 

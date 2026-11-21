@@ -452,6 +452,14 @@ impl ResidencyPlanner {
         self.lay_serve_state(key, &mut map);
         // The moves the whole need takes, every length laid together (the
         // map's own line reads one run of the longest length alone).
+        // Read from the store's placement of its whole restore, as the
+        // eviction plan reads it ([`Self::widen_to_store`]).
+        let need = need.map(|mut need| {
+            if kind == "restore" {
+                self.widen_to_store(key, pid, &mut need, &map);
+            }
+            need
+        });
         let need_moves = need
             .as_ref()
             .map(|need| map.cheapest_need(need).map(|pids| pids.len()));
