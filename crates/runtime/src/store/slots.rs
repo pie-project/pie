@@ -1166,21 +1166,19 @@ impl SlotPool {
             });
         }
         let sources = self.held_in(limit, self.state_limit());
-        let moves: Vec<ChunkMove> = sources
-            .iter()
-            .zip(self.open.iter_in(0, limit))
-            .map(|(&from, to)| ChunkMove {
-                logical: self.physical_to_logical[from as usize],
-                from,
-                to,
-            })
-            .collect();
-        if moves.len() < sources.len() {
+        // A run of chunks moves whole, to a free run below (its first chunk
+        // and every chunk after it at the next physical ones): moved chunk
+        // by chunk, a run in the span came back split, its first logical
+        // chunk's run ending past a gap (the L40S at 3 GiB on ca5c710a7:
+        // "a guest item ... lies in a run of 2 chunk(s) ... ends past a
+        // gap"; the M1's corrupted reads).
+        let targets: BTreeSet<u32> = self.open.iter_in(0, limit).collect();
+        let Some(moves) = self.moves_keeping_runs(&sources, targets, false) else {
             return Err(SlotError::NoRoom {
                 rung,
                 chunks: sources.len() as u32,
             });
-        }
+        };
         Ok(RungEvacuation {
             rung,
             from: self.rung(),
@@ -1217,17 +1215,19 @@ impl SlotPool {
         let act = self.act_chunks(evacuation.rung);
         self.rung_budget(act)?;
         let limit = self.total - act;
-        if act != evacuation.act
-            || evacuation.moves.len() != self.held_in(limit, self.state_limit()).len()
-        {
+        if act != evacuation.act {
             return Err(SlotError::StaleRung);
         }
         let mut targets = BTreeSet::new();
+        let froms: BTreeSet<u32> = evacuation.moves.iter().map(|step| step.from).collect();
+        if !self.held_in(limit, self.state_limit()).iter().all(|chunk| froms.contains(chunk)) {
+            return Err(SlotError::StaleRung);
+        }
         for step in &evacuation.moves {
+            // A run's chunks below the limit move with it (`plan_rung`).
             let fits = (step.logical as usize) < self.logical_to_physical.len()
                 && self.chunks[step.logical as usize].shape != NO_SHAPE
                 && self.logical_to_physical[step.logical as usize] == step.from
-                && step.from >= limit
                 && step.to < limit
                 && self.open.get(step.to)
                 && targets.insert(step.to);
@@ -1238,12 +1238,17 @@ impl SlotPool {
         for step in &evacuation.moves {
             self.move_chunk(*step);
             self.fenced.set(step.from);
+            // Its destination too, until the copy into it has landed: let
+            // go meanwhile, it would reopen and be handed to another owner
+            // whose data the copy then overwrote (the M1 on ca5c710a7:
+            // "the kernel wrote no status at all", rows read apart by 410).
+            self.fenced.set(step.to);
         }
         if !evacuation.moves.is_empty() {
             self.fences
                 .entry(epoch)
                 .or_default()
-                .extend(evacuation.moves.iter().map(|step| step.from));
+                .extend(evacuation.moves.iter().flat_map(|step| [step.from, step.to]));
         }
         self.set_act(act);
         Ok(())
@@ -1361,12 +1366,15 @@ impl SlotPool {
             // Fenced before the move reopens it: closed until the copy.
             self.fenced.set(step.from);
             self.move_chunk(*step);
+            // Its destination too, until the copy into it has landed (see
+            // `apply_rung`): never handed to another owner meanwhile.
+            self.fenced.set(step.to);
         }
         if !moves.is_empty() {
             self.fences
                 .entry(epoch)
                 .or_default()
-                .extend(moves.iter().map(|step| step.from));
+                .extend(moves.iter().flat_map(|step| [step.from, step.to]));
         }
         self.compacted = moves.iter().map(|step| step.from).collect();
         Ok(())
@@ -1388,24 +1396,82 @@ impl SlotPool {
     #[must_use]
     pub fn plan_moves_of(&self, logicals: &[u32]) -> Vec<ChunkMove> {
         let limit = self.state_limit().min(self.ceiling);
-        let mut targets = self.open.iter_in(0, limit);
-        let mut moves = Vec::new();
-        for &logical in logicals {
-            let Some(&from) = self.logical_to_physical.get(logical as usize) else {
+        let sources: Vec<u32> = logicals
+            .iter()
+            .filter_map(|&logical| {
+                let from = *self.logical_to_physical.get(logical as usize)?;
+                (self.chunks[logical as usize].shape != NO_SHAPE
+                    && !self.free.get(from)
+                    && !self.fenced.get(from))
+                .then_some(from)
+            })
+            .collect();
+        let targets: BTreeSet<u32> = self.open.iter_in(0, limit).collect();
+        self.moves_keeping_runs(&sources, targets, true).unwrap_or_default()
+    }
+
+    /// Moves of the chunks at physical `sources` to `targets` (free
+    /// chunks), each run of chunks ([`Self::runs`]) moved whole to a free
+    /// run of its length, its first chunk first: a member named moves its
+    /// whole run with it, never alone. `partial`: what finds no room stays
+    /// and the rest moves; else `None` unless all fit.
+    fn moves_keeping_runs(
+        &self,
+        sources: &[u32],
+        mut targets: BTreeSet<u32>,
+        partial: bool,
+    ) -> Option<Vec<ChunkMove>> {
+        // Each run's chunks by physical chunk: its first and its length.
+        let mut member_of: HashMap<u32, (u32, u32)> = HashMap::new();
+        for (&head, &run) in &self.runs {
+            let Some(&start) = self.logical_to_physical.get(head as usize) else {
                 continue;
             };
-            if self.chunks[logical as usize].shape == NO_SHAPE
-                || self.free.get(from)
-                || self.fenced.get(from)
-            {
-                continue;
+            for k in 0..run {
+                member_of.insert(start + k, (start, run));
             }
-            let Some(to) = targets.next() else {
-                break;
-            };
-            moves.push(ChunkMove { logical, from, to });
         }
-        moves
+        let mut runs: BTreeSet<(u32, u32)> = BTreeSet::new();
+        let mut singles: Vec<u32> = Vec::new();
+        for &from in sources {
+            match member_of.get(&from) {
+                Some(&run) => {
+                    runs.insert(run);
+                }
+                None => singles.push(from),
+            }
+        }
+        let mut moves = Vec::new();
+        for (start, run) in runs {
+            let Some(to) = self.free_run_in(&targets, run) else {
+                if partial {
+                    continue;
+                }
+                return None;
+            };
+            for k in 0..run {
+                targets.remove(&(to + k));
+                moves.push(ChunkMove {
+                    logical: self.physical_to_logical[(start + k) as usize],
+                    from: start + k,
+                    to: to + k,
+                });
+            }
+        }
+        for from in singles {
+            let Some(to) = targets.pop_first() else {
+                if partial {
+                    break;
+                }
+                return None;
+            };
+            moves.push(ChunkMove {
+                logical: self.physical_to_logical[from as usize],
+                from,
+                to,
+            });
+        }
+        Some(moves)
     }
 
     /// Takes back `moves`, applied with [`Self::apply_compaction`] and
@@ -1414,9 +1480,10 @@ impl SlotPool {
     pub fn undo_compaction(&mut self, moves: &[ChunkMove]) {
         for step in moves.iter().rev() {
             for chunks in self.fences.values_mut() {
-                chunks.retain(|&chunk| chunk != step.from);
+                chunks.retain(|&chunk| chunk != step.from && chunk != step.to);
             }
             self.fenced.clear(step.from);
+            self.fenced.clear(step.to);
             self.move_chunk(ChunkMove {
                 logical: step.logical,
                 from: step.to,
@@ -1556,9 +1623,10 @@ impl SlotPool {
     pub fn undo_rung(&mut self, evacuation: &RungEvacuation, act: u32) {
         for step in evacuation.moves.iter().rev() {
             for chunks in self.fences.values_mut() {
-                chunks.retain(|&chunk| chunk != step.from);
+                chunks.retain(|&chunk| chunk != step.from && chunk != step.to);
             }
             self.fenced.clear(step.from);
+            self.fenced.clear(step.to);
             self.move_chunk(ChunkMove {
                 logical: step.logical,
                 from: step.to,
@@ -3464,6 +3532,74 @@ mod tests {
                 ],
             );
         }
+    }
+
+    /// The L40S at 3 GiB on ca5c710a7: "a guest item ... lies in a run of
+    /// 2 chunk(s) ... from logical chunk 11, which lies at range chunk 21
+    /// and ends past a gap": a raise moved a run's chunks one by one, each
+    /// to the lowest free chunk, and split it. A run moves whole, to a free
+    /// run of its length below, or the raise waits for one.
+    #[test]
+    fn a_raise_moves_a_run_whole_or_waits() {
+        let fixed = [(ShapeKind::Fixed, 4)];
+        let mut pool = SlotPool::new(facts_with(16, 4, 4, &fixed, &[(16, 2), (256, 6)]));
+        let holder = Holder::WorkingSet(1);
+        pool.set_rung(16).unwrap();
+        let low = pool.acquire_chunk_runs(holder, 0, 1, 9).unwrap();
+        let at = |pool: &SlotPool, slot: &Slot| pool.chunk_table()[slot.chunk as usize];
+        let free_of = |pool: &mut SlotPool, chunks: &[u32]| {
+            let slots: Vec<Slot> =
+                low.iter().copied().filter(|slot| chunks.contains(&at(pool, slot))).collect();
+            pool.release(holder, &slots, 0);
+            pool.retire_through(u64::MAX);
+        };
+        free_of(&mut pool, &[3, 5]);
+        let run = pool.acquire_chunk_runs(holder, 0, 2, 1).unwrap();
+        let firsts: BTreeSet<u32> = run.iter().map(|slot| at(&pool, slot)).collect();
+        assert_eq!(firsts, BTreeSet::from([10, 11]), "the run lies in the span the raise takes");
+        assert!(
+            matches!(pool.plan_rung(256), Err(SlotError::NoRoom { .. })),
+            "free chunks 3 and 5 hold no run of two: never split, it waits"
+        );
+        free_of(&mut pool, &[6]);
+        let evacuation = pool.plan_rung(256).expect("a free run of two below");
+        let moved: BTreeSet<(u32, u32)> =
+            evacuation.moves.iter().map(|step| (step.from, step.to)).collect();
+        assert!(moved.contains(&(10, 5)) && moved.contains(&(11, 6)), "whole: {moved:?}");
+        pool.apply_rung(&evacuation, 7).unwrap();
+        pool.check();
+    }
+
+    /// The M1 on ca5c710a7: guest epilogues found "no status at all" and
+    /// rows read apart by 410 under park and restore churn. A move's
+    /// destination is fenced with its source until the copy lands: a chunk
+    /// let go meanwhile is handed to no other owner the copy would then
+    /// overwrite.
+    #[test]
+    fn a_move_s_destination_is_handed_to_no_one_until_its_copy_lands() {
+        let fixed = [(ShapeKind::Fixed, 4)];
+        let mut pool = SlotPool::new(facts_with(16, 4, 4, &fixed, &[(16, 2)]));
+        let holder = Holder::WorkingSet(1);
+        let taken = pool.acquire_chunk_runs(holder, 0, 1, 6).unwrap();
+        let low: Vec<Slot> =
+            taken.iter().copied().filter(|slot| pool.chunk_table()[slot.chunk as usize] < 3).collect();
+        pool.release(holder, &low, 0);
+        pool.retire_through(u64::MAX);
+        let high = taken
+            .iter()
+            .map(|slot| slot.chunk)
+            .max_by_key(|&chunk| pool.chunk_table()[chunk as usize])
+            .unwrap();
+        let moves = pool.plan_moves_of(&[high]);
+        pool.apply_compaction(&moves, 5).unwrap();
+        let to = moves[0].to;
+        // Its owner lets it go before the copy lands.
+        let rest: Vec<Slot> = taken.iter().copied().filter(|slot| slot.chunk == high).collect();
+        pool.release(holder, &rest, 0);
+        assert!(!pool.open_chunks().contains(&to), "the copy's destination stays closed");
+        pool.retire_through(5);
+        assert!(pool.open_chunks().contains(&to), "the copy landed: open again");
+        pool.check();
     }
 
     /// Mac Pro at 2 GiB on dc1414ae8 panicked on SIGTERM ("index out of
