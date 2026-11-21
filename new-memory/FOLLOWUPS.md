@@ -1031,3 +1031,37 @@ pages per group it runs, and frees wait `F` fires whichever group freed
 them) without weakening the per-step guarantee that a fire never opens a
 column it cannot back: the capped gate's walls against the tip, the pages
 the planner counts per group, and the refusals under over-demand.
+
+## F49. The host tier takes a held guest part past a chunk only whole: it parks in place instead
+
+A held guest part (an instance's resident state, `GuestState::resident`, or a
+place the runtime holds whole) moves to the host tier through `take_parts`,
+which asks the host for one contiguous run of slots. A run of slots never
+spans chunks, so a held part larger than a chunk finds no host room even where
+the host has room for its bytes, and the park leaves it where it lies (shed):
+device room stays held that a move down would have freed, a cost under
+over-demand. Fix shape: the host take places a held part as several runs, the
+way the device's retake does (`pieces` runs of `chunks` whole chunks), the
+part's place stating its runs, and the copies and the unpark follow them.
+
+## F50. Hybrid beam replay grows with lineage divergence
+
+On a hybrid model each beam lane replays its buffered rows past its group's
+common ancestor every step (`new-memory/designs/BEAM-PAGE-LISTS.md` §11.3,
+`[c, s_t]`). Where two lineages stay apart, the rows grow with the steps
+since they parted: Vulkan Qwen3.5 beam-4 on one prompt carried 4 × 257 rows
+at step 257, past the 1024-row bound engine-gpu's staged rs table holds (the
+widest bucket's tokens), and is refused: over-demand that must be served.
+The table addresses each carried row's rs page (one rs row a page on
+engine-gpu's Qwen3.5 plan), so sizing it for each lane's rows to its context
+is about 1 GB at 256 lanes x 262k context; chunked passes do not help on
+engine-gpu, whose carried kernels fold uncommitted rows into sums over the
+own row's q and k inside each layer. A beam lane's row-to-page map is already
+on the device in its group's resident lists (§11.1), which a resolve through
+them would use with no context-sized table (Leader's call pending). Served
+or not, the cost per step grows with the divergence (O(steps) replay,
+O(steps²) over a search). CUDA (`serve/prepare.rs`), Metal and XLA keep a
+`max_tokens` bound today. A bound by design is a spec question for AMD / Leader: per-beam
+state checkpoints (each beam's recurrent state kept at page boundaries, so a
+beam replays at most a page past its last checkpoint) would bound the replay
+by a page at the cost of a state per beam per page.
