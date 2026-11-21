@@ -971,7 +971,24 @@ pub struct Shell<B: Serve> {
 impl<B: Serve> Shell<B> {
     pub fn load(boot: Boot<'_, B>) -> Result<Shell<B>> {
         let (boot, mut fitted) = Shell::fit(boot)?;
-        let asks = Shell::name(&boot, &fitted, None)?;
+        let mut asks = Shell::name(&boot, &fitted, None)?;
+        // Each dense kernel's curve at the model's own planes, to the widest
+        // fire the load lays (the top the naming raise picked, with the
+        // profile path's kernels where no curve was timed yet): rows past it
+        // are never served. Timed, the load is named again with the
+        // kernels the curves pick.
+        let top = asks.rungs.iter().copied().max().unwrap_or(1);
+        if Shell::rate_shapes(&boot, &mut fitted, top)? {
+            let started = std::time::Instant::now();
+            asks = Shell::name(&boot, &fitted, None)?;
+            tracing::info!(
+                top,
+                kernels = asks.kernels.len(),
+                ms = started.elapsed().as_millis() as u64,
+                "the dense kernels' curves timed to the load's top: the load named again with \
+                 the kernels they pick"
+            );
+        }
         let device = &fitted.device;
 
         // Each is held to what the device binds a stage, by name, and then
@@ -1007,6 +1024,36 @@ impl<B: Serve> Shell<B> {
         Shell::name(&boot, &fitted, rung)
     }
 
+    /// Each dense kernel's curve at the model's own planes timed to `top`
+    /// rows where the profile lacks it (`crate::rates::shapes_at_load`),
+    /// into `fitted`'s tuning; whether any was timed.
+    fn rate_shapes(boot: &Boot<'_, B>, fitted: &mut Fitted<B>, top: u32) -> Result<bool> {
+        if !fitted
+            .tuning
+            .profile()
+            .rates()
+            .complete(&crate::rates::KEYS)
+        {
+            return Ok(false);
+        }
+        let multiplied = crate::dense::multiplied(&boot.trace);
+        let counts = crate::top::counts(&boot.trace)?;
+        let shapes: Vec<(u32, u32)> = crate::dense::planes(&counts, Some(&multiplied))
+            .into_iter()
+            .map(|(n, k, ..)| (n, k))
+            .collect();
+        let before = fitted.tuning.profile().rates().kernel_tflops_by_shape;
+        fitted.tuning = B::rate_shapes(
+            &fitted.device,
+            boot.device,
+            fitted.tuning.clone(),
+            &shapes,
+            counts.weight_bytes,
+            top.max(1),
+        )?;
+        Ok(fitted.tuning.profile().rates().kernel_tflops_by_shape != before)
+    }
+
     /// Opens the device `boot` names and fits the load to it: the trace
     /// fused for the device, admitted, its budgets and slots fitted. Nothing
     /// is compiled, built or reserved: each raise compiles at the top its
@@ -1023,27 +1070,6 @@ impl<B: Serve> Shell<B> {
             ..boot
         };
         B::admit(&device, &mut tuning, tier, &boot.trace)?;
-        // Each dense kernel's curve at the model's own planes, to the most
-        // rows a fire of the load brings: what its dense kernel at each rung
-        // is chosen by (`crate::dense`), for the naming walk and the load
-        // alike.
-        if tuning.profile().rates().complete(&crate::rates::KEYS) {
-            let multiplied = crate::dense::multiplied(&boot.trace);
-            let counts = crate::top::counts(&boot.trace)?;
-            let shapes: Vec<(u32, u32)> = crate::dense::planes(&counts, Some(&multiplied))
-                .into_iter()
-                .map(|(n, k, ..)| (n, k))
-                .collect();
-            tuning = B::rate_shapes(
-                &device,
-                boot.device,
-                tuning,
-                &shapes,
-                counts.weight_bytes,
-                boot.budget.max_tokens.max(1),
-            )?;
-        }
-
         let profile = boot
             .profile
             .take()
@@ -1385,7 +1411,7 @@ impl<B: Serve> Shell<B> {
             if rungs.last() != Some(&top) {
                 rungs.push(top);
             }
-            crate::dense::choose(
+            match crate::dense::choose(
                 B::TARGET,
                 &rungs,
                 |rows| tuning.gemm(tier, rows),
@@ -1393,13 +1419,19 @@ impl<B: Serve> Shell<B> {
                 &dense_planes,
                 B::RECORDS,
                 Some(top),
-            )
-            .map_err(|key| {
-                Fault::Residency(format!(
+            ) {
+                // No curve timed yet (the naming raise, before the load
+                // times them to its top): the profile path's kernel a rung.
+                Err(crate::dense::UNREACHED) => Ok((
+                    crate::dense::Dense::path(&rungs, |rows| tuning.gemm(tier, rows)),
+                    Vec::new(),
+                )),
+                Err(key) => Err(Fault::Residency(format!(
                     "the profile states no `[rates] {key}`, which the dense matmul's kernel at \
                      each rung is chosen by"
-                ))
-            })
+                ))),
+                Ok(chosen) => Ok(chosen),
+            }
         };
         let asked_chunk = budgets.tokens.max_tokens.max(1);
         let (dense, mut weighed_dense) = choose_dense(asked_chunk)?;
@@ -2504,9 +2536,20 @@ impl<B: Serve> Shell<B> {
                     .max()
                     .unwrap_or(1);
                 let mut kernels: Vec<Tactic> = Vec::new();
+                // Every kernel the choice weighs at these rows (each vector
+                // kernel, the path's tiles: the one a load picked a whole
+                // step by before planes picked their own among them), and
+                // every kernel the choice takes here or a vector one it takes
+                // anywhere; each where it pads no more rows than the choice.
+                let base = self.tuning.gemm(self.tier, top);
+                let weighed = kernels_slang::linear::gemm::VECTOR_ROWS
+                    .iter()
+                    .map(|&vector| Tactic { vector, ..base })
+                    .chain(crate::dense::tiled_kernels(B::TARGET, base));
                 for t in (bottom..=top)
                     .flat_map(|r| standing.tactics_at(r))
                     .chain(vectors.iter().copied())
+                    .chain(weighed)
                 {
                     if !kernels.contains(&t) && tile(t) <= widest {
                         kernels.push(t);

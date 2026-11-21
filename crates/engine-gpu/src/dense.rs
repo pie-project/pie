@@ -61,6 +61,16 @@ fn runs_of(by_rows: &[(u32, Tactic)]) -> String {
 }
 
 impl Dense {
+    /// The profile path's kernel at each of `rungs` (`tiled`), every plane
+    /// alike: what a load picks before its curves are timed.
+    #[must_use]
+    pub fn path(rungs: &[u32], tiled: impl Fn(u32) -> Tactic) -> Dense {
+        Dense {
+            by_rows: rungs.iter().map(|&rows| (rows, tiled(rows))).collect(),
+            planes: Vec::new(),
+        }
+    }
+
     /// The tactic each run of row counts takes at each plane, a line a
     /// plane: `n x k: rows-rows name, ...`.
     #[must_use]
