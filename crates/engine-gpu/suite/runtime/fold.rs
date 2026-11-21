@@ -834,10 +834,14 @@ fn a_hybrid_prompt_past_the_bound_a_layer_at_a_time_is_cut_by_rows_and_serves_al
     let Some((mut cut, _)) = load_under(1, Some(Duration::from_secs(2)), LONG) else {
         return;
     };
-    // A bound between one row's layer and the whole step's at the ratio
-    // the rates step measured: a layer of the step past it, a row's within.
+    // A bound between one row's layer and the whole step's as `admit` reads
+    // them once held (at the ratio the rates step measured alone: the
+    // load's probe read the clock of a device idle since its boot, an L40S
+    // at ~210 MHz, and a hold drops that scale): a layer of the step past
+    // it, a row's within.
+    cut.engine.loaded_mut().expect("loaded").hold_to(2e9);
     let held = held_of(&cut);
-    let layer = |rows: u32| held.raw_ns(StepRows { rows, ..step }).1 * held.stored_ratio();
+    let layer = |rows: u32| held.step_ns(StepRows { rows, ..step }).1;
     let tight = (layer(1) * layer(LONG)).sqrt();
     eprintln!(
         "a layer of 1 row {:.3} ms, of {LONG} rows {:.3} ms; the bound {:.3} ms",
@@ -986,11 +990,13 @@ fn a_step_of_two_hybrid_prompts_past_the_bound_is_cut_lane_by_lane_and_serves_al
     let Some((mut cut, _)) = load_under(1, Some(Duration::from_secs(2)), 2 * EACH) else {
         return;
     };
-    // A bound between one row's layer and the two-prompt step's at the
-    // ratio the rates step measured: a layer of the step past it, a row's
-    // within it.
+    // A bound between one row's layer and the two-prompt step's as `admit`
+    // reads them once held (at the ratio the rates step measured alone: a
+    // hold drops the scale the load's probe read off a device idle since
+    // its boot): a layer of the step past it, a row's within it.
+    cut.engine.loaded_mut().expect("loaded").hold_to(2e9);
     let held = held_of(&cut);
-    let layer = |s: StepRows| held.raw_ns(s).1 * held.stored_ratio();
+    let layer = |s: StepRows| held.step_ns(s).1;
     let one = StepRows {
         rows: 1,
         lanes: 1,
