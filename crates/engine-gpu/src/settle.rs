@@ -81,6 +81,7 @@ impl Done {
     #[must_use]
     pub fn settled(&self) -> engine::StepOutcome {
         let outcome = engine::StepOutcome {
+            beam_common: Vec::new(),
             wrote: self.wrote.clone(),
             faulted: self.faulted.clone(),
         };

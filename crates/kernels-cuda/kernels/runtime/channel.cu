@@ -1051,11 +1051,29 @@ __global__ void beam_step(const BeamStepRun* __restrict__ runs, u32 run_count)
             l.pages[l.from + e] = l.bases[at];
         }
     }
+    // §11.3: the group's common slot, the first column its live beams' lists
+    // name different pages at (whole shared pages only), capped at the slot
+    // past this fire's rows; monotone, read by the host at harvest.
+    __shared__ u32 first_apart;
+    if (threadIdx.x == 0u) first_apart = c + 1u;
+    __syncthreads();
+    for (u32 j = threadIdx.x; j <= c && j < cap; j += blockDim.x) {
+        const u32 page = map_new[j];
+        for (u32 b = 1u; b < B; ++b) {
+            if (map_new[b * cap + j] != page) {
+                atomicMin(&first_apart, j);
+                break;
+            }
+        }
+    }
     __syncthreads();
     if (threadIdx.x == 0u) {
         header[0] = 1u;
         header[1] = fired + 1u;
         header[2] = Q;
+        const u64 shared_end = (static_cast<u64>(f0) + first_apart) * S;
+        const u64 end = static_cast<u64>(r.slot) + 1u;
+        header[3] = static_cast<u32>(shared_end < end ? shared_end : end);
     }
 }
 

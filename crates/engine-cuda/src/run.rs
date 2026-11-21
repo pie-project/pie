@@ -347,6 +347,9 @@ pub struct RsSeat<'a> {
     pub tables: kernels_cuda::runtime::channel::RsTables,
     pub extended: bool,
     pub scratch: Option<&'a RsScratch>,
+    /// The beam groups' fold table and its entries, where the fire stages
+    /// folds (§11.3): every recurrent layer folds them ahead of the body.
+    pub folds: Option<(u64, u32)>,
 }
 
 /// A recurrent pool as a one-token arm reads it: a lane of one row folds it
@@ -1373,6 +1376,41 @@ impl<'c> Run<'c> {
     /// The carried rows a decode step of this window reads: the staged
     /// tables, the commit lengths of `pool` and the places of the step's
     /// buffered `planes` (in the order its kernel reads them).
+    /// The beam groups' folds a recurrent layer runs before its step
+    /// (`BEAM-PAGE-LISTS.md` §11.3): a carry over the fire's whole lane table
+    /// (a fold names its representative by its fire lane) placing `planes`,
+    /// the fold table, and its entries. `None`: the fire's body folds none.
+    pub(crate) fn rs_group_folds(
+        &self,
+        op: &'static str,
+        planes: &[crate::store::rs::Plane],
+    ) -> Result<Option<(kernels_cuda::ssm::Carry, Tensor, u32)>, kernels_cuda::Error> {
+        let Some(seat) = self.rs.as_ref() else {
+            return Ok(None);
+        };
+        let Some((folds, entries)) = seat.folds else {
+            return Ok(None);
+        };
+        let tables = seat.tables;
+        let mut carry = kernels_cuda::ssm::Carry {
+            lanes: tables.lanes,
+            pages: tables.pages,
+            replay_tok: tables.replay_tok,
+            page_tokens: tables.page_tokens.max(1),
+            ..kernels_cuda::ssm::Carry::NONE
+        };
+        for (at, &plane) in planes.iter().enumerate() {
+            let place = seat
+                .buffers
+                .place(plane)
+                .map_err(|fault| Self::rs_fault(op, fault))?;
+            carry.plane_off[at] = place.off;
+            carry.plane_stride[at] = place.stride;
+        }
+        let table = Tensor::new(folds, entries, 3, poem_ir::Dtype::U32);
+        Ok(Some((carry, table, entries)))
+    }
+
     pub(crate) fn rs_carry(
         &self,
         op: &'static str,

@@ -24,6 +24,18 @@ struct CarryLane {
 
 static_assert(sizeof(CarryLane) == 20, "CarryLane: `channel::RsLane` mirrors this layout");
 
+// A beam group's fold (BEAM-PAGE-LISTS §11.3): its representative lane (any
+// of its lanes; they share the set's state), where its fold rows start in
+// the replay table, and how many. The table's folding groups lead it; the
+// first entry of no rows ends it.
+struct GroupFold {
+    u32 lane;
+    u32 fold_off;
+    u32 rows;
+};
+
+static_assert(sizeof(GroupFold) == 12, "GroupFold: the Rust `ssm::GroupFold` mirrors this layout");
+
 constexpr u32 CARRY_NONE = 0xffffffffu;
 
 // The Rust `ssm::Carry`, passed by value. `lanes` null: the fire buffers
@@ -71,6 +83,12 @@ struct Carry {
     // The page slot and row of the lane's j-th carried row.
     __device__ __forceinline__ void carried_at(const CarryLane& l, int j, u64& slot, u32& row) const {
         slot_of(l, replay_tok[l.replay_off + j], slot, row);
+    }
+
+    // The page slot and row of a group fold's j-th row (§11.3): token
+    // `replay_tok[fold_off + j]` through the representative lane's pages.
+    __device__ __forceinline__ void fold_at(const CarryLane& l, u32 fold_off, int j, u64& slot, u32& row) const {
+        slot_of(l, replay_tok[fold_off + j], slot, row);
     }
 
     // Plane `p` of the lane's j-th carried row.

@@ -121,6 +121,7 @@ impl Host for Api {
         } else if defers && let Some(sink) = gpu.sink.as_ref() {
             // The forward's own report was held for the sampler.
             let mut held = engine::StepOutcome {
+                beam_common: Vec::new(),
                 wrote: std::mem::take(&mut step_pending.wrote),
                 faulted: std::mem::take(&mut step_pending.faulted),
             };
@@ -132,6 +133,7 @@ impl Host for Api {
         } else {
             // Told with the frame's settle, inside the submit.
             let held = engine::StepOutcome {
+                beam_common: Vec::new(),
                 wrote: Vec::new(),
                 faulted: std::mem::take(&mut step_pending.faulted),
             };

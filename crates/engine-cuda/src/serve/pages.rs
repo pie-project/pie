@@ -174,6 +174,9 @@ pub struct PageWork {
     pub planes: Vec<PagePlane>,
     /// Per fault word, the lane it faults.
     pub faults: Vec<(usize, engine::InstanceId)>,
+    /// Each group's common slot word (its state's `header[3]`, §11.3) and its
+    /// instance: read with the fault words when the fire lands.
+    pub commons: Vec<(u64, engine::InstanceId)>,
 }
 
 impl PageWork {
@@ -331,6 +334,9 @@ pub fn plan(
             rs_bases_at = rs_lists(&mut work, rs, group, f0, page, slot, backed)?;
         }
         let rs_count = work.rs.len() as u32 - rs_at;
+        // The head step leaves the group's common slot in its header's fourth
+        // word (§11.3).
+        work.commons.push((group.state + 12, group.instance));
         work.groups.push(GroupPlan {
             state: group.state,
             parents: group.parents,
