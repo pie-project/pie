@@ -214,7 +214,10 @@ pub(crate) fn slot_rows(
     stride: u64,
 ) -> Result<i64, Error> {
     let width = u64::from(bank.width());
-    if width == stride {
+    // one row a slot, padded to whole pool rows past a small state's stride
+    // (the state laid as `engine-xla`'s store lays it): its live stride at
+    // the row's front (`live`)
+    if width >= stride {
         return Ok(1);
     }
     if width != 0 && stride.is_multiple_of(width) {
@@ -232,6 +235,16 @@ pub(crate) fn slot_rows(
             bank.width()
         ),
     ))
+}
+
+/// A slot's live `stride` elements out of the rows `take_slots` read (each
+/// lane's slot, padded past a small state's stride to whole pool rows).
+pub(crate) fn live(f: &mut Func, rows: Val, stride: i64) -> Built<Val> {
+    if f.dims(rows)[1] == stride {
+        Ok(rows)
+    } else {
+        f.slice_axis(rows, 1, 0, stride)
+    }
 }
 
 /// The most lanes `take_slots` slices out of a one-row-per-slot bank row by
@@ -331,6 +344,15 @@ pub(crate) fn land_slots(
     rows: Val,
     per: i64,
 ) -> Built<Val> {
+    // a slot padded past its live stride lands zeros there
+    let full = per * f.dims(slab)[1];
+    let have = f.dims(rows)[1];
+    let rows = if have < full {
+        let zero = f.const_f(f.elem(rows), 0.0, &[]);
+        f.pad(rows, zero, &[0, 0], &[0, full - have], &[0, 0])?
+    } else {
+        rows
+    };
     if per == 1 {
         return land_rows(f, slab, slot, write, rows);
     }
