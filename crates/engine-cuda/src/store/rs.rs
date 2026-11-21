@@ -822,6 +822,22 @@ impl Buffers {
         self.split.as_ref().map_or(0, crate::device::Buffer::ptr)
     }
 
+    /// Whether a decode step carrying `carried` rows splits them over the
+    /// spare blocks: it spans more than one of the carried step's chunks,
+    /// on a load with room to split (CUDA's; elsewhere none splits).
+    #[must_use]
+    pub fn splits(&self, carried: u32) -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            self.split.is_some() && carried > kernels_cuda::ssm::CARRY_CHUNK
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = carried;
+            false
+        }
+    }
+
     /// The rows an rs buffer page holds.
     #[must_use]
     pub fn page_tokens(&self) -> u32 {

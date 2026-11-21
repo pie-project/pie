@@ -1764,10 +1764,7 @@ impl Shell {
         let rs_splits = self
             .buffers
             .as_ref()
-            .is_some_and(|buffers| buffers.split_room() != 0)
-            && rs_replays
-                .iter()
-                .any(|&replay| replay > kernels_cuda::ssm::CARRY_CHUNK);
+            .is_some_and(|buffers| rs_replays.iter().any(|&replay| buffers.splits(replay)));
         let rs_body = match self.arm_rs {
             armed if arming && armed.buffers() => armed,
             _ if rs_extends => record::RsBody::Replays,
