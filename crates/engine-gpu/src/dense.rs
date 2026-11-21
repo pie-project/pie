@@ -523,10 +523,26 @@ fn pick(
                         .or(fastest.map(|(t, _)| t)),
                     (None, Some(&(path, _))) => Some(path),
                 };
-                let pick = pick
-                    .or(path)
-                    .or_else(|| by_rows.last().map(|&(_, t)| t))
-                    .unwrap_or_else(|| tiled(rows));
+                // The kernel the rows below took keeps these unless the pick
+                // beats it by more than their spreads: one fire's noise
+                // does not flip the kernel row to row.
+                let before = by_rows.last().map(|&(_, t)| t);
+                let pick = match (pick, before) {
+                    (Some(t), Some(before)) if t != before => {
+                        let ns = |of: Tactic| priced.iter().find(|p| p.0 == of).map(|p| p.1);
+                        match (ns(t), ns(before)) {
+                            (Some(ns), Some(before_ns))
+                                if (before_ns - ns) / before_ns.max(f64::MIN_POSITIVE)
+                                    <= noise(&among, t, rows) + noise(&among, before, rows) =>
+                            {
+                                Some(before)
+                            }
+                            _ => Some(t),
+                        }
+                    }
+                    (pick, _) => pick,
+                };
+                let pick = pick.or(path).or(before).unwrap_or_else(|| tiled(rows));
                 by_rows.push((rows, pick));
             }
         }
@@ -1160,6 +1176,56 @@ mod tests {
             };
             assert!(wide(0.01), "records {records}");
             assert!(!wide(0.10), "records {records}");
+        }
+    }
+
+    /// Eager (a pick each row count), two vector kernels a few percent
+    /// apart, trading the lead row to row inside their 5% spread, take one
+    /// kernel over every row: noise does not flip the kernel.
+    #[test]
+    fn an_eager_pick_does_not_alternate_inside_the_spread() {
+        let tiled = |_| Tactic {
+            tier: Tier::Subgroup,
+            vector: 0,
+            wide: false,
+        };
+        let rows: Vec<u32> = (0..7).map(|i| 1 << i).collect();
+        let curve = |key: u32, lead: bool| profile::fire::KernelCurve {
+            kind: profile::fire::KernelCurve::VECTOR,
+            key,
+            n: 4096,
+            k: 4096,
+            curve: rows
+                .iter()
+                .enumerate()
+                .map(|(i, &r)| {
+                    let up = (i % 2 == 0) == lead;
+                    (r, f64::from(r) * if up { 0.102 } else { 0.1 })
+                })
+                .collect(),
+            stop: None,
+            spread: rows.iter().map(|&r| (r, 0.05)).collect(),
+        };
+        let mut curves = vec![curve(4, true), curve(8, false)];
+        curves.sort_by_key(profile::fire::KernelCurve::id);
+        let r = profile::fire::Rates {
+            kernel_tflops_by_shape: Some(curves),
+            ..rates(None, Vec::new())
+        };
+        let (dense, _) = choose(
+            Target::Wgsl,
+            &[64],
+            tiled,
+            &r,
+            &planes(&counts(), None),
+            false,
+            None,
+        )
+        .unwrap();
+        let first = dense.at(1, 4096, 4096);
+        assert!(first.vector > 0, "{:?}", dense.runs());
+        for rows in 2..=64 {
+            assert_eq!(dense.at(rows, 4096, 4096), first, "{:?}", dense.runs());
         }
     }
 

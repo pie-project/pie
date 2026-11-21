@@ -1307,7 +1307,18 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
                             // as wide, its estimate grown from this one: the
                             // widest slice the bound admits is timed, the
                             // fewest fixed costs carried to the plane.
-                            Some(rate) => {
+                            // A fire timed below its launches is no
+                            // measurement: the sample is dropped, never the
+                            // step (a narrower slice's held time stands).
+                            Some(Err(why)) => {
+                                say(&format!(
+                                    "[rates]: {}: a sample dropped ({why})",
+                                    timed[t].name
+                                ));
+                                samples[t].extend(held);
+                                break;
+                            }
+                            Some(Ok(rate)) => {
                                 let ns = gemm_flops(m, cols, k) / rate;
                                 let carried = ns * f64::from(n) / f64::from(cols) + launch;
                                 if timed[t].split > 1 {
@@ -1368,6 +1379,10 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
             }
             for &t in &live {
                 if timed[t].stop.is_some() {
+                    continue;
+                }
+                if samples[t].is_empty() {
+                    // Every sample dropped: no point here, the curve goes on.
                     continue;
                 }
                 let (ns, spread) = median_spread(&samples[t]);
@@ -2180,12 +2195,15 @@ fn matmul<B: Serve>(
         .map(|_| rig.operand(n, k, Dtype::Bf16))
         .collect::<Result<Vec<Tensor>>>()?;
     let y = rig.zeros(m, n, Dtype::Bf16)?;
-    matmul_on(rig, tactic, timer, (act, &weights, y), None, launch)
+    matmul_on(rig, tactic, timer, (act, &weights, y), None, launch)?
+        .map_err(|why| Fault::Device { call: "rates", why })
 }
 
 /// [`matmul`] over operands laid already: `act` (its rows the matmul's),
 /// the weight planes its fires rotate through, `y`; `touched` the planes'
-/// one untimed read, shared by every point over them.
+/// one untimed read, shared by every point over them. A fire timed below
+/// its launches comes back as the inner error: no measurement, though the
+/// device did nothing wrong.
 fn matmul_on<B: Serve>(
     rig: &mut Rig<'_, B>,
     tactic: kernels_slang::linear::gemm::Tactic,
@@ -2193,7 +2211,7 @@ fn matmul_on<B: Serve>(
     (act, weights, y): (Tensor, &[Tensor], Tensor),
     touched: Option<&Touched>,
     launch: f64,
-) -> Result<f64> {
+) -> Result<std::result::Result<f64, String>> {
     let (m, n, k) = (act.rows, y.width, act.width);
     let next = std::cell::Cell::new(0usize);
     rig.step(format!("matmul {m}x{n}x{k}"), Work::matmul(m, n, k));
@@ -2208,14 +2226,13 @@ fn matmul_on<B: Serve>(
         Some(touched) => rig.budgeted(timer, touched, weights.len(), &fire)?,
         None => rig.each(timer, &Touched::default(), weights.len(), &fire)?,
     };
-    engine::rates::rate_from(
+    Ok(engine::rates::rate_from(
         &format!("matmul {m}x{n}x{k}"),
         ns as f64,
         engine::rates::GEMM_DISPATCHES,
         launch,
         gemm_flops(m, n, k),
-    )
-    .map_err(|why| Fault::Device { call: "rates", why })
+    ))
 }
 
 /// The prefill attention's rate at `s`: one sequence of `s.rows` rows
