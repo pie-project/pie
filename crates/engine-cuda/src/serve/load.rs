@@ -643,6 +643,17 @@ fn host_copy(boot: &Boot<'_>, params: &[usize]) -> Result<HostCopy> {
         .flat_map(|&codes| crate::store::layout::packed_planes(&boot.trace, codes))
         .flatten()
         .map(|plane| plane as usize)
+        // And an fp8 bank's codes ROCm puts in the FP8 matrix core's order
+        // (`store::layout::fp8_ordered`), laid alike: in a copy where one is
+        // read, in its slots once filled under a load told its weights are
+        // held. Its factors lie as the file holds them.
+        .chain(
+            params
+                .iter()
+                .filter(|_| !boot.knobs.weights_held)
+                .filter(|&&codes| crate::store::layout::fp8_ordered(&boot.trace, codes))
+                .copied(),
+        )
         .collect();
     let relaid = |param: usize| {
         lanes.contains(&param)
@@ -1328,6 +1339,24 @@ impl Shell {
                         scales,
                         rows: shape[1],
                         k: 2 * shape[2..].iter().product::<u64>(),
+                    })
+                })
+                .collect(),
+        );
+        // The fp8 banks put in the FP8 matrix core's order, which a slot
+        // filled from the file (or a copy pinned from it) is put in once
+        // filled.
+        pools.fp8_banks(
+            pools
+                .expert_params()
+                .into_iter()
+                .filter(|&param| crate::store::layout::fp8_ordered(&boot.trace, param as usize))
+                .filter_map(|param| {
+                    let shape = &boot.trace.params[param as usize].shape;
+                    Some(crate::store::Fp8Bank {
+                        codes: param,
+                        rows: *shape.get(1)?,
+                        k: shape[2..].iter().product::<u64>(),
                     })
                 })
                 .collect(),
