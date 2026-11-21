@@ -414,7 +414,7 @@ pub struct Stepwise {
 /// 10: a `gumbel_argmax` lane multiplies its logit by the op's `scale`
 /// (the temperature's reciprocal) where it divided by a divisor.
 /// 11: a one-row `top_k` takes the select ladder (`sel_top_k`), and every
-/// NaN test reads the value's bits (`f_nan`): the compiler took `x != x`
+/// NaN test reads the value's bits (`f32_is_nan`): the compiler took `x != x`
 /// as false, so the sort keyed NaN first.
 pub const WGSL_STEP_EMITTER_VERSION: u16 = 11;
 
