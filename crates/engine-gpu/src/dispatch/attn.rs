@@ -150,15 +150,7 @@ impl<B: Backend> Run<'_, B> {
             names.join();
             return Ok(());
         }
-        // A body whose rows vary picks by the power of two that holds its
-        // rows a request, so every fire of the body takes one form.
-        let per_request = tables.rows / self.requests().max(1);
-        let per_request = if self.ctx.fixed_rows() {
-            per_request
-        } else {
-            per_request.next_power_of_two()
-        };
-        if per_request >= self.tuning().sdpa_tile_rows_per_request() {
+        if tables.rows / self.requests().max(1) >= self.tuning().sdpa_tile_rows_per_request() {
             tiled()
         } else {
             walked()

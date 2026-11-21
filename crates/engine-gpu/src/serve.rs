@@ -6242,6 +6242,10 @@ impl<B: Serve> Shell<B> {
             .take_while(|&rows| rows <= top),
         );
         let cap = self.budget().max_lanes.max(1);
+        // The rows a lane from which prefill attention tiles
+        // (`kernel.sdpa.tile_rows_per_request`); short of it a lane's rows
+        // are walked as decode rows: another body.
+        let tile_from = self.tuning.sdpa_tile_rows_per_request();
         // Each lane's (class, rows).
         let mut shapes: Vec<Vec<(usize, u32)>> = Vec::new();
         let classes: Vec<usize> = (0..decoding.len()).filter(|&class| !self.captures(class)).collect();
@@ -6265,6 +6269,14 @@ impl<B: Serve> Shell<B> {
                         let each = rows / lanes;
                         let more = rows % lanes;
                         shapes.push((0..lanes).map(|at| (class, each + u32::from(at < more))).collect());
+                        // Where the class's fires a lane may fall either
+                        // side of the rows a lane attention tiles from,
+                        // the walked form too: as many lanes, each just
+                        // short of it, within the class.
+                        let short = tile_from.saturating_sub(1);
+                        if each >= tile_from && short > 0 && short * lanes > rows / 2 {
+                            shapes.push(vec![(class, short); lanes as usize]);
+                        }
                     }
                 }
             }
@@ -6279,6 +6291,13 @@ impl<B: Serve> Shell<B> {
                         let mut lanes = vec![(prefill, rows - decodes)];
                         lanes.extend(std::iter::repeat_n((decode, 1), decodes as usize));
                         shapes.push(lanes);
+                        // The prompt short of the rows attention tiles from.
+                        let short = tile_from.saturating_sub(1);
+                        if rows - decodes >= tile_from && short > 0 && short + decodes > rows / 2 {
+                            let mut lanes = vec![(prefill, short)];
+                            lanes.extend(std::iter::repeat_n((decode, 1), decodes as usize));
+                            shapes.push(lanes);
+                        }
                     }
                 }
             }
