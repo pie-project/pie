@@ -441,3 +441,6 @@ impl Pipelines {
 pub fn bind_traffic() -> (u64, u64) {
     (0, 0)
 }
+
+/// No device, so no frame timed.
+pub fn harvest_landed() {}

@@ -25,7 +25,7 @@ mod stub;
 #[cfg(not(feature = "wgpu"))]
 pub mod ctx {
     pub use super::stub::{
-        Context, Enabled, Frame, Handed, OnDone, Pending, present, reservations,
+        Context, Enabled, Frame, Handed, OnDone, Pending, harvest_landed, present, reservations,
     };
 }
 #[cfg(not(feature = "wgpu"))]
