@@ -2494,6 +2494,14 @@ struct BindRoomPool {
     /// The store's placement refuses a restore its map stands
     /// (`PoolPort::restore_stands`).
     store_refuses: std::sync::atomic::AtomicBool,
+    /// Chunks several processes' slots share (a forked prompt's prefix
+    /// pages, a shared guest item): each chunk, the slots it holds, and
+    /// each holder's share ([`PoolPort::chunk_occupants`]).
+    shared: parking_lot::Mutex<Vec<super::pool::ChunkHeld>>,
+    /// Whether a move down of parked state takes the shared slots every
+    /// holder of which it moves (the store's sweep of evicted processes'
+    /// kv left on the device), or leaves them on the device.
+    sweeps_shared: std::sync::atomic::AtomicBool,
 }
 
 impl BindRoomPool {
@@ -2521,6 +2529,8 @@ impl BindRoomPool {
             rs_pages: AtomicU32::new(0),
             rs_free: AtomicU32::new(0),
             store_refuses: std::sync::atomic::AtomicBool::new(false),
+            shared: parking_lot::Mutex::new(Vec::new()),
+            sweeps_shared: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
@@ -2644,6 +2654,10 @@ impl PoolPort for BindRoomPool {
                     used: 1,
                     by: vec![(pid, 1)],
                 })
+                .chain(self.shared.lock().iter().filter_map(|held| {
+                    let by: Vec<_> = held.by.iter().copied().filter(|&(pid, _)| pid != except).collect();
+                    (!by.is_empty()).then(|| super::pool::ChunkHeld { by, ..held.clone() })
+                }))
                 .collect(),
             free: self.free.lock().clone(),
             ..Default::default()
@@ -2658,6 +2672,26 @@ impl PoolPort for BindRoomPool {
         pids: &[ProcessId],
         _order: &[ProcessId],
     ) -> bool {
+        // Shared slots every holder of which moves down go with them, as
+        // the store's sweep takes evicted processes' kv left on the device.
+        if self.sweeps_shared.load(Ordering::Relaxed) {
+            let swept: Vec<u32> = self
+                .shared
+                .lock()
+                .iter()
+                .filter(|held| held.by.iter().all(|(pid, _)| pids.contains(pid)))
+                .map(|held| held.chunk)
+                .collect();
+            if !swept.is_empty() {
+                self.shared.lock().retain(|held| !swept.contains(&held.chunk));
+                self.free.lock().extend(&swept);
+                self.gives.fetch_add(swept.len() as u64, Ordering::Relaxed);
+                self.moved.lock().push("sweep");
+                let planner = planner.clone();
+                crate::rt::spawn(async move { planner.parked_down_done(true) });
+                return true;
+            }
+        }
         let chunks: Vec<u32> = self
             .parked
             .lock()
@@ -2790,6 +2824,7 @@ impl PoolPort for BindRoomPool {
         self.kv.lock().iter().any(|&(_, holder)| holder == pid)
             || self.parked.lock().iter().any(|&(_, holder)| holder == pid)
             || *self.occupant.lock() == Some(pid)
+            || self.shared.lock().iter().any(|held| held.by.iter().any(|&(holder, _)| holder == pid))
     }
     fn room_beside_own(&self, _pid: ProcessId, run: u32, pieces: u32) -> bool {
         let own = self.own.lock().clone();
@@ -2810,6 +2845,10 @@ impl PoolPort for BindRoomPool {
                 used: 1,
                 by: vec![(pid, 1)],
             })
+            .chain(self.shared.lock().iter().filter_map(|held| {
+                let by: Vec<_> = held.by.iter().copied().filter(|(pid, _)| pids.contains(pid)).collect();
+                (!by.is_empty()).then(|| super::pool::ChunkHeld { by, ..held.clone() })
+            }))
             .collect();
         if !kv.is_empty() {
             return super::pool::ChunkMap {
@@ -9896,4 +9935,288 @@ async fn a_raced_refusal_standing_with_nothing_in_flight_is_sent_again() {
             assert!(plan.contains("restore sent"), "nothing in flight: sent again: {plan}");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Replays of field stalls.
+//
+// A stall's state as its stall line records it (the head and its need, its
+// refusal, the free chunks, which processes' slots hold which chunks, who is
+// resident and who evicted, the queue) is rebuilt here as a pool and a
+// planner, and the planner's passes are run to a fixpoint. The progress
+// invariant: once the passes settle, the head is served or something is in
+// flight (an eviction, a move, a restore) that will change the generation. A
+// settled state with the head waiting and nothing in flight fails, naming
+// the head and its need. A new field stall is added as one more snapshot.
+// ---------------------------------------------------------------------------
+
+/// What a process was doing in the stall's state.
+#[derive(Clone, Copy)]
+enum SnapWait {
+    /// Queued as a restore.
+    Restore,
+}
+
+/// A process of the stall's state, by its place in [`StallSnapshot::procs`].
+#[derive(Clone)]
+struct SnapProc {
+    state: Residency,
+    queued: Option<SnapWait>,
+    /// Its last refusal (`roles_short` / `bind_room`): run and pieces.
+    refused: Option<(u32, u32)>,
+    /// The free runs of the refusal's length its refusal left
+    /// (`roles_short_free`), and whether it was refused with nothing else
+    /// in flight (`roles_short_quiet`).
+    refused_free: Option<u32>,
+    quiet: bool,
+}
+
+impl SnapProc {
+    fn resident() -> Self {
+        Self {
+            state: Residency::Resident,
+            queued: None,
+            refused: None,
+            refused_free: None,
+            quiet: false,
+        }
+    }
+
+    fn evicted_restore() -> Self {
+        Self {
+            state: Residency::Evicted,
+            queued: Some(SnapWait::Restore),
+            ..Self::resident()
+        }
+    }
+}
+
+/// A stall's state, as its stall line records it.
+struct StallSnapshot {
+    /// The run that stalled, for the failure message.
+    name: &'static str,
+    /// The state chunks the pool holds (`state_limit`).
+    chunks: u32,
+    /// The chunks free now, and the budget's headroom.
+    free: Vec<u32>,
+    headroom: Option<u32>,
+    /// Host slots (0: no host tier) and disk slots free.
+    host: u32,
+    disk_free: u32,
+    procs: Vec<SnapProc>,
+    /// Chunks held: the chunk, the slots it holds, and each holder's share
+    /// (by its place in `procs`). One resident holding a chunk whole is its
+    /// kv; anything else is shared slots.
+    held: Vec<(u32, u32, Vec<(usize, u32)>)>,
+    /// The queue's head, by its place in `procs`.
+    head: usize,
+    /// Whether a move down of evicted processes' state takes the kv they
+    /// left on the device (the store's sweep).
+    sweeps_shared: bool,
+    /// The chunks the head's own restore retakes, single chunks (its
+    /// unpark need, `RunNeed([(1, own.len())])`): those free it takes first.
+    own: Vec<u32>,
+}
+
+/// Rebuilds `snap` as a pool and a planner and runs the planner's passes to
+/// a fixpoint; `Err` names the head and its need where the state settles
+/// with the head waiting and nothing in flight.
+async fn replay(snap: &StallSnapshot) -> Result<(), String> {
+    let model = crate::store::registry::register_model(16, &[8], &[4]);
+    let pool = Arc::new(BindRoomPool {
+        model,
+        ..BindRoomPool::new(snap.chunks, 0..0, snap.host)
+    });
+    pool.free.lock().extend(snap.free.iter().copied());
+    *pool.headroom.lock() = snap.headroom;
+    pool.disk_free.store(snap.disk_free, Ordering::Relaxed);
+    pool.sweeps_shared.store(snap.sweeps_shared, Ordering::Relaxed);
+    pool.own.lock().extend(snap.own.iter().copied());
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let pids: Vec<ProcessId> = snap.procs.iter().map(|_| ProcessId::new_v4()).collect();
+    for &pid in &pids {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    for (chunk, used, holders) in &snap.held {
+        let whole_resident = matches!(holders.as_slice(), [(at, slots)]
+            if *slots >= *used && snap.procs[*at].state == Residency::Resident);
+        let by: Vec<(ProcessId, u32)> = holders.iter().map(|&(at, slots)| (pids[at], slots)).collect();
+        if whole_resident {
+            pool.kv.lock().push((*chunk, by[0].0));
+        } else {
+            pool.shared.lock().push(super::pool::ChunkHeld {
+                chunk: *chunk,
+                used: *used,
+                by,
+            });
+        }
+    }
+    let keys: Vec<Option<EntryKey>> = planner.with_inner(|inner| {
+        snap.procs
+            .iter()
+            .zip(&pids)
+            .map(|(snap_proc, &pid)| {
+                let proc = inner.procs.get_mut(&pid).unwrap();
+                proc.state = snap_proc.state;
+                proc.roles_short = snap_proc.refused.map(|(run, pieces)| PendingBind {
+                    run,
+                    pieces,
+                    pages: run * pieces,
+                });
+                proc.bind_room = proc.roles_short;
+                proc.roles_short_free = snap_proc.refused_free;
+                proc.roles_short_quiet = snap_proc.quiet;
+                snap_proc.queued.map(|wait| {
+                    inner.enqueue(
+                        pid,
+                        match wait {
+                            SnapWait::Restore => WaitKind::Restore {
+                                demand: Demand::default(),
+                            },
+                        },
+                    )
+                })
+            })
+            .collect()
+    });
+    let head = pids[snap.head];
+    let head_key = keys[snap.head];
+    // The passes, to a fixpoint: an unmoved generation for a while, with
+    // whatever moves the pool's moves land landed.
+    let (mut last, mut steady) = (0u64, 0u32);
+    for _ in 0..5000 {
+        planner.plan();
+        crate::rt::yield_now().await;
+        pool.land_moves(&planner);
+        let generation = planner.generation();
+        if generation == last {
+            steady += 1;
+            if steady >= 200 {
+                break;
+            }
+        } else {
+            (last, steady) = (generation, 0);
+        }
+    }
+    planner.with_inner(|inner| {
+        let served = inner.procs.get(&head).is_none_or(|proc| proc.state == Residency::Resident)
+            || head_key.is_some_and(|key| !inner.queue.contains_key(&key));
+        if served || !inner.nothing_in_flight() {
+            return Ok(());
+        }
+        let proc = &inner.procs[&head];
+        let (plan, _) = head_key.map_or_else(|| (String::new(), String::new()), |key| inner.plan_fields(key));
+        Err(format!(
+            "{}: the head {head} waits with nothing in flight: state {:?}, refused {:?} \
+             (free runs it left {:?}), plan {plan}; free chunks {:?}, moved {:?}",
+            snap.name,
+            proc.state,
+            proc.roles_short.map(|need| (need.run, need.pieces)),
+            proc.roles_short_free,
+            pool.free.lock(),
+            pool.moved.lock(),
+        ))
+    })
+}
+
+/// The L40S at 3 GiB disk-only on d41e15f24 (serve-Y3_3s-1): a prompt-prefix
+/// page seven evicted forks shared stayed on the device (chunk 4, one slot,
+/// two refs each), the restore head among them short of a thirteenth
+/// single chunk with twelve free. The map named the forks for the chunk,
+/// none a candidate; the policy was asked with nothing in flight.
+fn stall_d41e15f24() -> StallSnapshot {
+    let mut procs = vec![SnapProc::evicted_restore(); 7];
+    procs[0].refused = Some((1, 1));
+    procs[0].refused_free = Some(12);
+    StallSnapshot {
+        name: "d41e15f24 serve-Y3_3s-1",
+        chunks: 22,
+        free: (5..17).collect(),
+        headroom: Some(12),
+        host: 0,
+        disk_free: 4014,
+        held: vec![(4, 1, (0..7).map(|at| (at, 2)).collect())],
+        procs,
+        head: 0,
+        sweeps_shared: true,
+        own: (5..17).chain([4]).collect(),
+    }
+}
+
+/// The L40S at 3 GiB disk-only on c201812ea (serve-Z3_3s-1): the restore
+/// head (26e5834e) refused PendingBindShort (run 1) while others' takes raced
+/// it, one free run left and its placement standing in that room; held
+/// "until more chunks stand free than its refusal left" with nothing in
+/// flight, no event coming to end it. Beside it a resident candidate
+/// (37b23987) holding slots across fifteen chunks, ten processes' prompt
+/// prefix sharing chunk 1.
+fn stall_c201812ea() -> StallSnapshot {
+    // 0: 37b23987 (resident, the candidate); 1: 26e5834e (the head);
+    // 2: 66751556; 3..=9: the prefix's other sharers.
+    let mut procs = vec![SnapProc::resident()];
+    procs.push(SnapProc {
+        refused: Some((1, 1)),
+        refused_free: Some(1),
+        ..SnapProc::evicted_restore()
+    });
+    procs.extend(std::iter::repeat_n(SnapProc::evicted_restore(), 8));
+    let all: Vec<(usize, u32)> = (0..10).map(|at| (at, 168)).collect();
+    let mut chunk3: Vec<(usize, u32)> = (0..10).map(|at| (at, 1)).collect();
+    chunk3[1].1 = 2;
+    StallSnapshot {
+        name: "c201812ea serve-Z3_3s-1",
+        chunks: 22,
+        free: vec![19],
+        headroom: Some(1),
+        host: 0,
+        disk_free: 4014,
+        held: vec![
+            (1, 1680, all),
+            (3, 11, chunk3),
+            (6, 9, vec![(0, 1), (2, 8)]),
+            (7, 599, vec![(0, 96), (1, 262), (2, 241)]),
+            (8, 6, vec![(0, 2), (1, 2), (2, 2)]),
+            (10, 9, vec![(0, 2), (1, 4)]),
+            (11, 8, vec![(0, 3)]),
+            (12, 9, vec![(0, 5), (2, 4)]),
+            (13, 9, vec![(0, 2), (2, 4)]),
+            (15, 3, vec![(0, 3)]),
+            (16, 9, vec![(0, 1), (1, 4), (2, 1)]),
+            (17, 9, vec![(0, 1), (2, 8)]),
+            (18, 9, vec![(0, 1), (2, 8)]),
+            (20, 9, vec![(0, 9)]),
+            (21, 9, vec![(0, 5), (2, 4)]),
+        ],
+        procs,
+        head: 1,
+        sweeps_shared: true,
+        own: Vec::new(),
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn replay_d41e15f24_shared_prefix_page_left_by_evicted_forks() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    replay(&stall_d41e15f24()).await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn replay_c201812ea_head_beside_a_resident_candidate() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    replay(&stall_c201812ea()).await.unwrap();
+}
+
+/// The store as it was on d41e15f24 (a move down of evicted processes'
+/// state left their kv on the device): the same state settles with the head
+/// waiting and nothing in flight, which the invariant names.
+#[tokio::test(flavor = "current_thread")]
+async fn replay_names_a_head_left_waiting_when_shared_kv_is_not_swept() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let snap = StallSnapshot {
+        sweeps_shared: false,
+        ..stall_d41e15f24()
+    };
+    let err = replay(&snap).await.expect_err("the head waits with nothing in flight");
+    assert!(err.contains("waits with nothing in flight"), "{err}");
 }
