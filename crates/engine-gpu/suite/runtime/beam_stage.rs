@@ -217,6 +217,263 @@ fn fired(
     got
 }
 
+/// A one-row top-k program over the logits: the row's top `k` (cast to
+/// bf16 first where `bf16`), its values and indices put on two channels.
+fn top_k_case(name: &'static str, k: u32, bf16: bool) -> Case {
+    use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
+    use eta_ir::op::Op;
+    use eta_ir::registry::{Axis, EngineCaps, OutputDecl, Stage};
+    use eta_ir::types::{Dtype as EtaDtype, Shape};
+    let value = if bf16 { EtaDtype::Bf16 } else { EtaDtype::F32 };
+    let decl = |dtype: EtaDtype| ChannelDecl {
+        shape: Shape::vector(k),
+        dtype: ChanDType::Concrete(dtype),
+        capacity: 2,
+        host_role: HostRole::Reader,
+        seeded: false,
+    };
+    let mut ops = vec![Op::Output {
+        index: 0,
+        lane: 0,
+        shape: Shape::matrix(1, VOCAB),
+        dtype: EtaDtype::F32,
+    }];
+    let row = if bf16 {
+        ops.push(Op::Cast {
+            value: 0,
+            dtype: EtaDtype::Bf16,
+        });
+        1
+    } else {
+        0
+    };
+    // Flattened, as the beam step lays its candidates: a one-row top-k
+    // (`steps::one_row`), where the readout's rows are a dynamic axis.
+    ops.push(Op::Reshape {
+        value: row,
+        shape: Shape::vector(VOCAB),
+    });
+    let input = row + 1;
+    ops.push(Op::TopK { input, k });
+    ops.push(Op::ChanPut {
+        chan: 0,
+        value: input + 1,
+    });
+    ops.push(Op::ChanPut {
+        chan: 1,
+        value: input + 2,
+    });
+    let container = TraceContainer {
+        names: vec!["logits".to_string()],
+        channels: vec![decl(value), decl(EtaDtype::U32)],
+        ports: Vec::new(),
+        stages: vec![StageProgram {
+            stage: Stage::Epilogue,
+            ops,
+        }],
+        externs: Vec::new(),
+        inputs: Vec::new(),
+    };
+    let logits = OutputDecl {
+        name: "logits".into(),
+        axis: Axis::Row,
+        width: VOCAB,
+        dtype: EtaDtype::F32,
+        layers: 0,
+        readout: true,
+    };
+    let bound = eta_ir::validate::bind(container, vec![vec![logits]], EngineCaps::default())
+        .expect("the top-k program binds");
+    Case {
+        name,
+        binding: Binding::OneLane,
+        bound,
+        rows: 1,
+        vocab: VOCAB,
+        seeds: Vec::new(),
+        logits: Vec::new(),
+        readers: vec![0, 1],
+    }
+}
+
+/// The row's top `k` as the sort orders them: keys descending (the
+/// runtime's `sort_key`: NaN last, -0 as 0), ties by index.
+fn sorted_top(row: &[f32], k: usize) -> Vec<usize> {
+    let key = |x: f32| -> (u8, f32) {
+        if x.is_nan() {
+            (1, 0.0)
+        } else {
+            (0, -(x + 0.0))
+        }
+    };
+    let mut order: Vec<usize> = (0..row.len()).collect();
+    order.sort_by(|&a, &b| {
+        key(row[a])
+            .partial_cmp(&key(row[b]))
+            .expect("keys order")
+            .then(a.cmp(&b))
+    });
+    order.truncate(k);
+    order
+}
+
+/// Whether the `k`-th key's ties straddle the cut: some of them in the top
+/// `k`, some not, so only the index order decides which.
+fn ties_straddle(row: &[f32], k: usize) -> bool {
+    let top = sorted_top(row, k);
+    let Some(&last) = top.last() else {
+        return false;
+    };
+    let at = row[last];
+    let tied = |x: f32| x == at || (x.is_nan() && at.is_nan());
+    let inside = top.iter().filter(|&&i| tied(row[i])).count();
+    let all = row.iter().filter(|&&x| tied(x)).count();
+    inside > 0 && all > inside
+}
+
+/// Rows a one-row top-k selects over, each with its `k`, every one with
+/// ties straddling the cut: heavy ties at and around the `k`-th key,
+/// `-inf`s among NaNs, a few NaNs, a bf16 row; and the rows the select
+/// hands to the sort: `k` reaching into the NaNs, ties past its
+/// candidates, `k` past its candidates.
+fn top_k_cases() -> Vec<Case> {
+    let width = VOCAB as usize;
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut place = |row: &mut Vec<f32>, count: usize, value: f32| {
+        let mut put = 0;
+        while put < count {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let at = (state % width as u64) as usize;
+            if row[at] == -5.0 {
+                row[at] = value;
+                put += 1;
+            }
+        }
+    };
+    // 30 keys tied at the top, 40 tied below them, the rest lower still.
+    let mut tied = vec![-5.0f32; width];
+    place(&mut tied, 30, 3.0);
+    place(&mut tied, 40, 2.0);
+    // 10 finite keys, then 60 tied at -inf, the rest NaN.
+    let mut infs = vec![-5.0f32; width];
+    place(&mut infs, 10, 1.0);
+    place(&mut infs, 60, f32::NEG_INFINITY);
+    for x in &mut infs {
+        if *x == -5.0 {
+            *x = f32::NAN;
+        }
+    }
+    // The tied row with 20 NaN among its lowest keys.
+    let mut nans = tied.clone();
+    for x in nans.iter_mut().filter(|x| **x == -5.0).take(20) {
+        *x = f32::NAN;
+    }
+    // 10 keys, the rest NaN.
+    let mut mostly_nan = vec![f32::NAN; width];
+    for (at, x) in mostly_nan.iter_mut().enumerate().skip(100).take(10) {
+        *x = (at % 3) as f32;
+    }
+    // 2000 keys tied at the top: more than the select's candidates.
+    let mut crowd = vec![-5.0f32; width];
+    place(&mut crowd, 2000, 4.0);
+    let with = |mut case: Case, row: Vec<f32>| {
+        case.logits = row;
+        case
+    };
+    vec![
+        with(top_k_case("top 1 of 30 tied", 1, false), tied.clone()),
+        with(top_k_case("top 4 of 30 tied", 4, false), tied.clone()),
+        with(
+            top_k_case("top 50 across two tie groups", 50, false),
+            tied.clone(),
+        ),
+        with(top_k_case("top 4 of 30 tied, bf16", 4, true), tied.clone()),
+        with(top_k_case("top 40 into the -inf ties", 40, false), infs),
+        with(top_k_case("top 50 beside NaN", 50, false), nans),
+        with(
+            top_k_case("top 20 reaching into NaN", 20, false),
+            mostly_nan,
+        ),
+        with(
+            top_k_case("top 4 of 2000 tied, past the candidates", 4, false),
+            crowd,
+        ),
+        with(
+            top_k_case("top width-1, past the candidates", VOCAB - 1, false),
+            tied,
+        ),
+    ]
+}
+
+/// A one-row top-k selects its `k`-th key and sorts its candidates
+/// (`steps::Ladder::Select`), and answers what the sort answers: the
+/// interpreter's top-k, values and indices, where ties straddle the cut,
+/// beside NaN and `-inf`, and where it hands the row to the sort.
+#[test]
+fn a_top_k_by_select_answers_what_the_sort_answers() {
+    let boot = crate::gpu::device_boot();
+    if backend::Context::bind(&boot, backend::ALLOWANCE).is_err() {
+        eprintln!("not asked: no device");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "pie-{}-top-k-select-{}",
+        backend::NAME,
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a scratch directory");
+    let path = dir.join(format!("{}-{NAME}.zt", backend::NAME));
+    write(&path, &table());
+    let trace = poem::trace_hybrid(NAME, &Logits, backend::PLATFORM);
+    let mut engine = backend::Engine::new(boot, contract_for);
+    let loaded = engine
+        .load(LoadRequest {
+            trace,
+            checkpoint: Checkpoint::Path(path),
+            budgets: Budgets {
+                max_lanes: 4,
+                max_tokens: 16,
+                buckets: vec![16],
+                max_adapters: 0,
+                page_size: 16,
+                max_context: 64,
+                context_declared: false,
+                slots: 4,
+                max_patches: None,
+                max_images: None,
+                max_voxels: None,
+                max_clips: None,
+            },
+            residency: Residency {
+                device: crate::gpu::share(),
+                ..Residency::default()
+            },
+            ordinal: 0,
+            frames_in_flight: 1,
+        })
+        .expect("the miniature loads");
+    for case in top_k_cases() {
+        let k = case.bound.container.channels[0].shape.dims()[0] as usize;
+        assert!(
+            ties_straddle(&case.logits, k),
+            "{}: the k-th key's ties straddle the cut",
+            case.name
+        );
+        let want = case.expected();
+        let got = fired(&mut engine, &loaded, &case, &case.seats())
+            .unwrap_or_else(|why| panic!("{}: {why}", case.name));
+        for ((channel, got), want) in case.readers.iter().zip(&got).zip(&want) {
+            assert_eq!(got, want, "{}: channel {channel}", case.name);
+        }
+        eprintln!("{}: the sort's values and indices", case.name);
+    }
+    drop(engine);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_beam_step_answers_what_the_interpreter_answers() {
     let boot = crate::gpu::device_boot();

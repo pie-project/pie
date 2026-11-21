@@ -922,3 +922,29 @@ the partials and candidates the split regions publish there: silent wrong result
 Tool for whoever picks it up: the sync-and-read check above, on a build without the memset
 (the self-resetting branch, `sc/amd-meet-reset-dropped`, local on the MI300X host), plus the
 fire's stream map at the stalled launch.
+
+## F47. `resident_workgroups` is not reproducible across boots: its consumers must tolerate +-40%
+
+The load's rates step measures the workgroups a device holds at once (`[rates]
+resident_workgroups`, `engine_gpu::rates::resident_workgroups`): one workgroup of the matmul's
+peak kernel timed against the peak of the curve. Across boots of one device it moves
+20-40% (RTX Spark, 2026-11-21: wgpu 154, 156, 196, and a saved 299; native Vulkan 30, 45, 28;
+Android Adreno homes 8.8-9.0 and 10.9). Timing the peak shape and the one workgroup back
+to back over 5 rounds, median, floored, did not settle it: wgpu 319, 262, 271; Vulkan 109,
+114, 136. That spreads ~20%, adds 35-75 s to each boot, and moves Vulkan ~3x, so it changes
+what is measured instead of fixing it (the patch is not kept).
+
+So whatever reads it must give the same answer for a value 40% off: a guest step's grid
+(`step_jobs`), Vulkan's `cores` where the driver reports none (the qmm ladder's `fill`, the
+decode split per core). Or derive it from device facts instead of a timing. Note that the
+measured count is saved at a home's first boot and kept, so two homes of one device can
+size differently forever.
+
+## F48. A batched top-k (more than one row) still sorts each row whole
+
+A one-row `top_k` (a flattened beam's candidates) selects its `k`-th key and sorts only
+what lies past it (`steps::Ladder::Select`, `sel_top_k`): on wgpu Qwen3 the beam-4 step
+went from 1.11-1.20x a greedy-4 step to 1.08-1.15x. A `top_k` over `[rows, vocab]` (a batched
+top-k sampler, a per-beam pre-cut) takes the full merge sort per row (~43 us a merge round,
+~780 us a step at Qwen3's vocab). If a guest program uses one on the hot path, carry the
+select per row: its state (`SELECT_WORDS`) is one row's today.
