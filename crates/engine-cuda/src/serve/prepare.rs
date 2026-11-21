@@ -1430,7 +1430,9 @@ impl Shell {
                         None => (reads, to, false),
                     };
                     let replay = crate::run::replayed(&reads);
-                    rs_folded[source] = Some(to - folded);
+                    // A beam group's fold moves its set's state and buffer, never its
+                    // kv working set's folded point, which anchors its pool (§11.3).
+                    rs_folded[source] = Some(if beam { 0 } else { to - folded });
                     rs_ends[source] = Some(first + row.rows);
                     if *fold == FoldLen::Device {
                         self.rs_ahead.insert(slot, to);

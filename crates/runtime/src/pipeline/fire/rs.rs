@@ -513,6 +513,12 @@ pub fn prepare_many(
         }
         RsPlan::Groups(groups) => groups,
     };
+    // The beam groups' sets: their folds keep their buffers (§11.3).
+    let beam_sets: Vec<RsWorkingSetId> = groups
+        .iter()
+        .filter(|group| group.beams)
+        .map(|group| working_sets[group.lanes[0]])
+        .collect();
     let lanes = working_sets.len();
     let mut out = PreparedRs {
         verbs: vec![engine::fire::RsVerb::Fold; lanes],
@@ -606,7 +612,7 @@ pub fn prepare_many(
         let (pages, base, folded) = match read {
             Ok(read) => read,
             Err(error) => {
-                store.commit_folds(folds);
+                store.commit_folds_keeping(folds, &beam_sets);
                 store.settle(published);
                 return Err(error.to_string());
             }
@@ -637,7 +643,7 @@ pub fn prepare_many(
         }
     }
     note_reads(store, &published, &out);
-    store.commit_folds(folds);
+    store.commit_folds_keeping(folds, &beam_sets);
     out.snapshots = published.snapshots().to_vec();
     out.txn = Some(RsTxn { published });
     Ok(out)
