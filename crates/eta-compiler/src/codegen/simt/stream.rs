@@ -1352,9 +1352,11 @@ pub(super) fn emit_stream(
     let reduces = members.iter().any(|m| m.role == Role::Reduce);
     if streams.split && reduces {
         // The row's reductions' first levels lie in its work, every block's
-        // partials at their chunks; each block folds them in its own area.
+        // partials at their chunks; each block folds them in its own shared
+        // memory, so a block keeps nothing of its own in the temporary area
+        // and the row's area is the row's, however many blocks it splits
+        // across.
         s.push_str("    float* stream_work = reinterpret_cast<float*>(ptir_row_work);\n");
-        s.push_str("    float* stream_own = reinterpret_cast<float*>(temporary);\n");
     } else if reduces {
         s.push_str("    float* stream_work = reinterpret_cast<float*>(temporary);\n");
     }
@@ -1531,11 +1533,17 @@ pub(super) fn emit_stream(
                         epilogue,
                         "      ptir_meet(ptir_meet_word, {meet}u * ptir_split);"
                     );
+                    // The levels above the first: a value a run of 32 of the
+                    // level below, folded by `ptir_canonical_reduce` in place.
+                    let upper = chunks.div_ceil(32);
                     let _ = writeln!(
                         epilogue,
-                        "      const float total = ptir_canonical_reduce_met({tag}u, stream_work + {slot}u, {chunks}u, stream_own + {}u, stream_own + {}u);",
-                        slot + chunks,
-                        slot + chunks + chunks.div_ceil(32)
+                        "      __shared__ float stream_fold{meet}[{}u];",
+                        upper + upper.div_ceil(32)
+                    );
+                    let _ = writeln!(
+                        epilogue,
+                        "      const float total = ptir_canonical_reduce_met({tag}u, stream_work + {slot}u, {chunks}u, stream_fold{meet}, stream_fold{meet} + {upper}u);"
                     );
                 } else {
                     let _ = writeln!(
