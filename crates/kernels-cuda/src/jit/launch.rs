@@ -72,6 +72,7 @@ pub(crate) unsafe fn issue(
 
     // A size-only walk (`crate::sizing`) launches nothing.
     if crate::sizing::active() {
+        crate::sizing::counted();
         return Ok(());
     }
     // SAFETY: `config` and the `n` attributes it points at are locals that
