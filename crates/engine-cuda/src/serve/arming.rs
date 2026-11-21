@@ -114,6 +114,10 @@ pub(super) struct Arming {
     /// The compositions given back for the allowance: stated eager after
     /// arming, by name.
     given_back: Vec<(u32, BodySynth, Treatment)>,
+    /// The bytes of the captures given back: room the pool's spare does not
+    /// show again (the driver keeps what it backed), which the next capture
+    /// takes.
+    freed: u64,
     peer_stopped: bool,
     unit_margin: u64,
     /// The bodies' allowance is a record's measurement
@@ -1508,6 +1512,7 @@ impl Shell {
             starved: None,
             held: Vec::new(),
             given_back: Vec::new(),
+            freed: 0,
             peer_stopped: false,
             unit_margin: self.pools.arming_margin_bytes(),
             from_record: self.bodies_from_record || self.rearming,
@@ -1519,10 +1524,74 @@ impl Shell {
         })
     }
 
+    /// Selects before anything captures: a composition's fire backs the
+    /// activation span to its rung's carve (its synthetic lanes' pages lie in
+    /// the state pool's chunks, backed whole before arming), so priced by
+    /// that growth from the load's own rungs, the compositions whose growth
+    /// the pool's spare holds are the ones captured, in base order, and the
+    /// rest are stated eager untouched. The rung grows with the bucket the
+    /// user's rule ranks by, so what is selected is its best-ranked prefix,
+    /// and one left out is never warmed, so it never backs a span the
+    /// better-ranked ones then find no room beside. Where the spare holds
+    /// every carve (or the allowance is a measurement), all are selected and
+    /// base order is unchanged; the bodies themselves are weighed as they
+    /// capture ([`Shell::arm_target`]).
+    fn select_within_headroom(&mut self, st: &mut Arming) {
+        if st.verify || st.group || self.ep.is_some() || st.from_record {
+            return;
+        }
+        let mut spare = self
+            .pools
+            .spare_bytes_for_bodies(self.bodies_mem as u64)
+            .unwrap_or(u64::MAX);
+        let committed = self.arena.bytes();
+        let forked = self.compiled.arena_forked.as_ref();
+        let targets: Vec<(u32, BodySynth, Treatment)> = st.targets.drain(..).collect();
+        let growth = |target: &BodySynth| {
+            let (lanes, _) = target.lanes();
+            let tokens: u64 = lanes.iter().map(|(_, rows)| u64::from(*rows)).sum();
+            self.arena
+                .carve_of(forked, tokens, lanes.len() as u64)
+                .saturating_sub(committed)
+        };
+        // By the user's rule, best first: each priced by what it backs past
+        // the compositions already selected.
+        let mut order: Vec<usize> = (0..targets.len()).collect();
+        order.sort_by_key(|&at| self.rule_rank(targets[at].0, &targets[at].1));
+        let mut selected = vec![false; targets.len()];
+        let mut backed = 0u64;
+        for at in order {
+            let carve = growth(&targets[at].1);
+            let grows = carve.saturating_sub(backed);
+            if grows <= spare {
+                selected[at] = true;
+                spare -= grows;
+                backed = backed.max(carve);
+            }
+        }
+        let total = targets.len();
+        let mut kept = 0usize;
+        for (at, target) in targets.into_iter().enumerate() {
+            if selected[at] {
+                kept += 1;
+                st.targets.push_back(target);
+            } else {
+                st.given_back.push(target);
+            }
+        }
+        if kept < total {
+            eprintln!(
+                "engine-cuda: arming selects {kept} of {total} compositions by the user's rule: \
+                 the rest would back more of the activation span than the pool's spare holds"
+            );
+        }
+    }
+
     fn arm_lattice_fenced(&mut self, verify: bool) -> Result<()> {
         let Some(mut st) = self.arm_begin(verify) else {
             return Ok(());
         };
+        self.select_within_headroom(&mut st);
         while let Some((bucket, target, treatment)) = st.targets.pop_front() {
             self.arm_target(&mut st, bucket, target, treatment)?;
         }
@@ -1606,12 +1675,26 @@ impl Shell {
         if !st.verify && !st.group && self.ep.is_none() {
             let rank = self.rule_rank(bucket, &target);
             loop {
+                // The room a capture has is the allowance net of what is
+                // held: a body given back frees its bytes for the next one.
+                // The pool's spare under its ceiling does not rise when one
+                // is given back (the driver keeps what it backed), so judged
+                // by it every better-ranked capture gave back every worse one
+                // and still found none, and even a one-lane decode walked
+                // eager at a tight budget.
+                // A body lies outside the pool, in the device's free memory:
+                // its room is what the device holds free, and a body given
+                // back frees its bytes for the next capture though the device
+                // does not show them free again (the driver keeps what it
+                // backed), so they count beside it. Short where that has no
+                // room for a body at the price the held ones set, or where
+                // the allowance net of what is held is spent.
                 let spent = self.cache.body_stats();
-                let room = (self.bodies_mem as u64).saturating_sub(spent.census.bytes as u64);
-                let spare = self.pools.spare_bytes_for_bodies(room).unwrap_or(u64::MAX);
+                let free = crate::device::free_bytes()
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(st.freed);
                 let price = (2 * spent.census.bytes / spent.census.bodies.max(1)) as u64;
-                let margin = price.max(st.unit_margin.min(self.bodies_mem as u64 / 4));
-                let short = (!st.from_record && spare < margin)
+                let short = (!st.from_record && free < price)
                     || (st.capped && allowance_spent(spent.census.bytes, self.bodies_mem));
                 if !short || spent.census.bodies >= record::MAX_BODIES {
                     break;
@@ -1629,6 +1712,7 @@ impl Shell {
                 };
                 let given = st.held.remove(worst);
                 self.cache.forget_body(&given.key);
+                st.freed = st.freed.saturating_add(given.weight);
                 st.took = st.took.map(|took| took.saturating_sub(given.weight));
                 st.armed -= 1;
                 st.tally[given.at].0 -= 1;
@@ -1787,6 +1871,8 @@ impl Shell {
                     at,
                 });
             }
+            // A capture takes the room given-back ones freed first.
+            st.freed = st.freed.saturating_sub(weight);
             // Past the allowance (a capped single-rank arming): the capture
             // the user's rule ranks last among those held (this one or an
             // earlier) is given back, its weight off what the bodies took,
