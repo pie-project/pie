@@ -140,6 +140,10 @@ impl Context {
         match self.never {}
     }
 
+    pub fn stock_descriptor_pools(&self, _pools: usize) -> Result<()> {
+        match self.never {}
+    }
+
     pub fn frame(&self) -> Result<Frame> {
         match self.never {}
     }

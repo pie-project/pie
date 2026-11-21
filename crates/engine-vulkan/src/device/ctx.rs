@@ -167,6 +167,11 @@ pub(crate) struct Core {
 
     spare_fences: Mutex<Vec<vk::Fence>>,
 
+    /// Descriptor pools no frame holds, each reset: a frame takes its pools
+    /// from here and gives them back as it drops, so serving frames make
+    /// none (the load stocks them, [`Context::stock_descriptor_pools`]).
+    spare_pools: Mutex<Vec<vk::DescriptorPool>>,
+
     /// The frame whose fenced submission went to the queue last: the
     /// queue has emptied once it landed ([`Context::idle`]).
     last: Mutex<std::sync::Weak<Inner>>,
@@ -404,6 +409,38 @@ impl Core {
     }
 }
 
+impl Core {
+    /// A reset descriptor pool for a frame: a spare, or, where the load
+    /// stocked too few, a new one.
+    fn descriptor_pool(&self) -> Result<vk::DescriptorPool> {
+        if let Some(pool) = self
+            .spare_pools
+            .lock()
+            .expect("spare pools lock poisoned")
+            .pop()
+        {
+            return Ok(pool);
+        }
+        self.new_descriptor_pool()
+    }
+
+    fn new_descriptor_pool(&self) -> Result<vk::DescriptorPool> {
+        let sizes = [vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(BUFFERS_PER_POOL)];
+        // SAFETY: `device` is live and the create info is complete.
+        unsafe {
+            self.device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(SETS_PER_POOL)
+                    .pool_sizes(&sizes),
+                None,
+            )
+        }
+        .map_err(|e| self.fault("vkCreateDescriptorPool", e))
+    }
+}
+
 impl Drop for Core {
     fn drop(&mut self) {
         // SAFETY: this is the last `Arc<Core>`, so every slab, frame, cache and
@@ -426,6 +463,13 @@ impl Drop for Core {
             let pools = std::mem::take(self.pools.get_mut().expect("pools lock poisoned"));
             for pool in pools.into_values() {
                 self.device.destroy_command_pool(pool, None);
+            }
+            for pool in std::mem::take(
+                self.spare_pools
+                    .get_mut()
+                    .expect("spare pools lock poisoned"),
+            ) {
+                self.device.destroy_descriptor_pool(pool, None);
             }
             // The instance is the process's (`shared_instance`).
             self.device.destroy_device(None);
@@ -1076,6 +1120,7 @@ impl Context {
                 pool,
             )])),
             spare_fences: Mutex::new(Vec::new()),
+            spare_pools: Mutex::new(Vec::new()),
             last: Mutex::new(std::sync::Weak::new()),
             orphans: Mutex::new(Vec::new()),
             family,
@@ -1335,6 +1380,21 @@ impl Context {
     pub fn lay_staging(&self) -> Result<()> {
         let mut transfer = self.core.transfer.lock().expect("transfer lock poisoned");
         self.core.staging(&mut transfer).map(|_| ())
+    }
+
+    /// Stocks `pools` reset descriptor pools at load, which the serving
+    /// frames take and give back: a frame takes one before it binds a
+    /// kernel and returns it as it drops.
+    pub fn stock_descriptor_pools(&self, pools: usize) -> Result<()> {
+        let made = (0..pools)
+            .map(|_| self.core.new_descriptor_pool())
+            .collect::<Result<Vec<_>>>()?;
+        self.core
+            .spare_pools
+            .lock()
+            .expect("spare pools lock poisoned")
+            .extend(made);
+        Ok(())
     }
 
     pub fn frame(&self) -> Result<Frame> {
@@ -1671,9 +1731,22 @@ impl Drop for Inner {
                 let queue = self.core.queue.lock().expect("queue lock poisoned");
                 let _ = d.queue_wait_idle(*queue);
             }
-            for pool in self.pools.get_mut().expect("pools lock poisoned").drain(..) {
-                d.destroy_descriptor_pool(pool, None);
+            // Its descriptor pools go back to the device's spares, reset:
+            // the next frame takes them rather than making its own.
+            let pools: Vec<vk::DescriptorPool> = self
+                .pools
+                .get_mut()
+                .expect("pools lock poisoned")
+                .drain(..)
+                .collect();
+            for &pool in &pools {
+                let _ = d.reset_descriptor_pool(pool, vk::DescriptorPoolResetFlags::empty());
             }
+            self.core
+                .spare_pools
+                .lock()
+                .expect("spare pools lock poisoned")
+                .extend(pools);
             if let Some(timing) = self.timing.get_mut().expect("timing lock poisoned").take() {
                 d.destroy_query_pool(timing.pool, None);
             }
@@ -1882,19 +1955,7 @@ impl Frame {
         let mut sets = match got {
             Some(sets) => sets,
             None => {
-                let sizes = [vk::DescriptorPoolSize::default()
-                    .ty(vk::DescriptorType::STORAGE_BUFFER)
-                    .descriptor_count(BUFFERS_PER_POOL)];
-                // SAFETY: `d` is live and the create info is complete.
-                let pool = unsafe {
-                    d.create_descriptor_pool(
-                        &vk::DescriptorPoolCreateInfo::default()
-                            .max_sets(SETS_PER_POOL)
-                            .pool_sizes(&sizes),
-                        None,
-                    )
-                }
-                .map_err(|e| core.fault("vkCreateDescriptorPool", e))?;
+                let pool = core.descriptor_pool()?;
                 pools.push(pool);
                 let info = vk::DescriptorSetAllocateInfo::default()
                     .descriptor_pool(pool)
