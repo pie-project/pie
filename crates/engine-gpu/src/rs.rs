@@ -377,6 +377,14 @@ impl Layout {
                     plane(&mut layout, cache, Role::KdaF, *f, at, None)?;
                     plane(&mut layout, cache, Role::KdaB, *b, at, None)?;
                     region(&mut layout, cache, "scan", *y, at)?;
+                    // The prompt form's rows keep their keys and corrected
+                    // values too (the recipe lays them by its `mixed` and its
+                    // output). This shell's KDA decode step has no carried
+                    // form: it replays its rows extended and reads neither.
+                    if let Operation::Ssm(Ssm::KdaChunked { mixed, .. }) = &node.op {
+                        plane(&mut layout, cache, Role::Keys, *mixed, at, Some((heads * head_dim, Dtype::Bf16)))?;
+                        plane(&mut layout, cache, Role::U, *y, at, Some((heads * head_dim, Dtype::F32)))?;
+                    }
                     let elems = u64::from(*heads) * u64::from(*head_dim) * u64::from(*head_dim);
                     if elems > layout.work_elems {
                         layout.work_elems = elems;

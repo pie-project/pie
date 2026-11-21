@@ -160,3 +160,15 @@ fn the_rs_layout_is_the_rule_and_the_recipe_for_qwen35() {
     let bf16 = poem_compiler::catalog::one_rank(poem::Dtype::Bf16, poem::Dtype::Bf16);
     assert_eq!(agrees("qwen35-tiny", &traced("qwen35-tiny", &bf16)), 0);
 }
+
+/// A KDA model (Kimi K3's four-layer miniature): its rows' keys and
+/// corrected values, which the recipe keeps (`ChunkProfile::rs_corrected`),
+/// land on the shell's planes too.
+#[test]
+fn the_rs_layout_is_the_rule_and_the_recipe_for_a_kda_model() {
+    let deployed = poem_compiler::catalog::deployments()
+        .find(|d| d.name.starts_with("kimik3-l4"))
+        .expect("the package deploys its four-layer miniature");
+    let name = deployed.name.clone();
+    agrees(&name, &deployed.trace(backend::PLATFORM));
+}
