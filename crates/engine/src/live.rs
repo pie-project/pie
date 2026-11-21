@@ -77,10 +77,15 @@ pub enum Tally {
     /// to depth one for it. Counted while such a move is not yet on the
     /// queue, so a backend's remaining drains are seen.
     Drained,
+    /// A program the load compiled and parked in its disk cache (the host
+    /// held no more in memory), loaded on the first fire of its shape: a
+    /// load from disk, never a build, so neither [`Tally::Compiled`] nor
+    /// [`Tally::BuiltInFire`]; counted so the stall it costs is seen.
+    LoadedInFire,
 }
 
 impl Tally {
-    pub const ALL: [Tally; 9] = [
+    pub const ALL: [Tally; 10] = [
         Tally::Compiled,
         Tally::Fallback,
         Tally::Unrecorded,
@@ -90,6 +95,7 @@ impl Tally {
         Tally::BuiltInFire,
         Tally::BoundInFire,
         Tally::Drained,
+        Tally::LoadedInFire,
     ];
 
     /// Its name in the model status.
@@ -105,6 +111,7 @@ impl Tally {
             Tally::BuiltInFire => "built_in_fire",
             Tally::BoundInFire => "bound_in_fire",
             Tally::Drained => "drained",
+            Tally::LoadedInFire => "loaded_in_fire",
         }
     }
 }

@@ -536,7 +536,11 @@ impl Shell {
         // host by its end, its last compiles one at a time); those the free
         // memory holds load once the compiles are done.
         let parks = self.device.parks();
-        let budget = available_memory().map_or(u64::MAX, |b| b.saturating_sub(2 * need));
+        // the programs' room: what the load states (`Residency::host_programs`),
+        // else the host's free memory less two compiles'
+        let stated = self.host_programs;
+        let budget = stated
+            .unwrap_or_else(|| available_memory().map_or(u64::MAX, |b| b.saturating_sub(2 * need)));
         let held = std::sync::atomic::AtomicU64::new(0);
         let parked = std::sync::atomic::AtomicUsize::new(0);
         // The compiles' room, fixed here: what the held programs' budget
@@ -623,6 +627,7 @@ impl Shell {
             > = (0..texts.len())
                 .map(|_| std::sync::Mutex::new(None))
                 .collect();
+            let kept_bytes = held.load(SeqCst);
             let held = &programs;
             std::thread::scope(|scope| {
                 for _ in 0..threads {
@@ -642,7 +647,14 @@ impl Shell {
                             {
                                 let _turn = admit.lock().expect("the warm admission lock poisoned");
                                 let busy = loading.load(SeqCst);
-                                if available_memory().is_none_or(|b| b < hold + busy + 2 * need) {
+                                let room = match stated {
+                                    Some(stated) => stated
+                                        .checked_sub(kept_bytes)
+                                        .is_none_or(|b| b < hold + busy),
+                                    None => available_memory()
+                                        .is_none_or(|b| b < hold + busy + 2 * need),
+                                };
+                                if room {
                                     full.store(true, SeqCst);
                                     break;
                                 }
@@ -668,7 +680,7 @@ impl Shell {
             tracing::warn!(
                 parked,
                 held_gib = held.load(SeqCst) >> 30,
-                "xla warm ladder parked programs on disk: the host's memory holds no more"
+                "xla warm ladder parked programs on disk: the host's memory holds no more; the first fire of each one's shape loads it (`loaded_in_fire`)"
             );
         }
         // The compiles' scratch is freed by now: hand it back rather than
@@ -700,7 +712,22 @@ impl Shell {
                         why,
                     });
                 }
-                None => continue,
+                None => {
+                    // parked in the disk cache: the first fire of its shape
+                    // loads it (`Shell::load_parked`)
+                    if let Some(shape_key) = d.shape_key {
+                        self.parked_shapes.insert(shape_key, d.key);
+                    }
+                    self.parked.insert(
+                        d.key,
+                        super::Parked {
+                            text: d.text,
+                            sig: d.sig,
+                            probed: d.probed,
+                        },
+                    );
+                    continue;
+                }
             };
             self.probed.insert(d.key, d.probed);
             self.traced.insert(d.key, std::sync::Arc::clone(&program));

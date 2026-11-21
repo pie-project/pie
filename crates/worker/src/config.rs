@@ -1030,6 +1030,7 @@ impl MemoryConfig {
             disk_kv_dir: self.disk_path.clone(),
             disk_kv_persistent: self.disk_persistent,
             kv_export: false,
+            host_programs: None,
             weights_held: true,
         }
     }
