@@ -149,8 +149,21 @@ pub fn gdn_step_carried(f: &mut Func, c: &Carried, q_scale: f32) -> Built<Steppe
     let big_g = f.exp(after);
     let big_g = f.select(valid_h, big_g, zero_g)?; // [L, R, H]
     // S^T k and S^T q: [L, H, V]
+    // a bf16 bank's state is read as it lies (no f32 copy of it): the
+    // product rounds the other operand to bf16 once, f32 accumulation
+    let se = f.elem(c.state);
     let st = |f: &mut Func, x: Val| -> Built<Val> {
-        f.dot_general_at(c.state, x, &[0, 1], &[0, 1], &[2], &[2], Elem::F32, true)
+        let x = f.convert(x, se);
+        f.dot_general_at(
+            c.state,
+            x,
+            &[0, 1],
+            &[0, 1],
+            &[2],
+            &[2],
+            Elem::F32,
+            se == Elem::F32,
+        )
     };
     let stk = st(f, k)?;
     let stq = st(f, q)?;
@@ -227,8 +240,11 @@ pub fn gdn_step_carried(f: &mut Func, c: &Carried, q_scale: f32) -> Built<Steppe
     let rank = f.dot_general_at(wk_all, all_u, &[0, 2], &[0, 2], &[1], &[1], Elem::F32, true)?;
     let decayed = f.exp(lam);
     let decayed = f.broadcast(decayed, &[lanes, heads, k_dim, v_dim], &[0, 1])?;
-    let s0 = f.mul(decayed, c.state)?;
+    let s = f.convert(c.state, Elem::F32);
+    let s0 = f.mul(decayed, s)?;
     let state = f.add(s0, rank)?; // [L, H, K, V]
+    // in the bank's own element: the fold fuses into its store
+    let state = f.convert(state, se);
     Ok(Stepped { y, u, state })
 }
 
@@ -265,7 +281,9 @@ pub fn gdn_tail_corrected(f: &mut Func, t: &Tail) -> Built<Val> {
     let u0 = f.const_f(Elem::F32, 0.0, &[lanes, rows, heads, vd]);
     let (keys, values, decays, betas, count) = (keys, t.values, t.decays, t.betas, t.count);
     let out = f.for_loop(rows, &[t.state, u0], |f, j, a| {
-        let (s, u_acc) = (a[0], a[1]);
+        let (s_held, u_acc) = (a[0], a[1]);
+        let held = f.elem(s_held);
+        let s = f.convert(s_held, Elem::F32);
         let z = f.const_i(Elem::I32, 0, &[]);
         let row = |f: &mut Func, x: Val| -> Built<Val> {
             let mut d = f.dims(x).to_vec();
@@ -303,6 +321,8 @@ pub fn gdn_tail_corrected(f: &mut Func, t: &Tail) -> Built<Val> {
         let next = f.add(decayed, outer)?;
         let live_s = f.broadcast(live, &[lanes, heads, kd, vd], &[0])?;
         let s = f.select(live_s, next, s)?;
+        // rounded to the bank's element each row, as a store and a reload
+        let s = f.convert(s, held);
         let u1 = f.reshape(u, &[lanes, 1, heads, vd])?;
         let u_acc = f.dynamic_update_slice(u_acc, u1, &[z, j, z, z])?;
         Ok(vec![s, u_acc])

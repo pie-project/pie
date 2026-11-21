@@ -89,20 +89,62 @@ impl Run<'_> {
                 op,
                 detail: format!("no layout plane {plane}"),
             })?;
-        let n = self.window().span.lanes * carried.rows.max(1);
+        let lanes = self.window().span.lanes;
+        let n = lanes * carried.rows.max(1);
         let out = self.rs_temp(n, spec.width, spec.dtype);
         let (buffer, at) = seat.buffers[plane];
         let tokens = i64::from(seat.page_tokens.max(1));
-        let rows = carried.buffer_rows;
+        let (grains, cells) = (carried.grains, carried.cells);
+        let blocks_n = i64::from(lanes) * i64::from(carried.pages);
+        let span = i64::from(carried.pages) * tokens;
+        let rows_n = i64::from(n);
+        let r = i64::from(carried.rows.max(1));
+        // Whole grains, a block each, then the rows out of them: a gather
+        // of rows out of the plane makes XLA re-lay the whole plane first
+        // (a copy of it per plane per layer, past the device at 8 lanes).
         self.ctx().emit(&mut |cx| {
             let buf = cx.read(buffer)?;
-            let r = cx.read(rows)?;
-            let all = cx.ty(r).elements();
-            let r = cx.reshape(r, &[all])?;
-            let r = cx.slice_axis(r, 0, 0, i64::from(n))?;
-            let r = plane_rows(cx, r, at, tokens)?;
-            let got = cx.take_rows(buf, r)?;
-            cx.write(out, got)
+            let (all, width) = (cx.dims(buf)[0], cx.dims(buf)[1]);
+            let blocks = cx.reshape(buf, &[all / tokens, tokens, width])?;
+            let g = cx.read(grains)?;
+            let ge = cx.ty(g).elements();
+            let g = cx.reshape(g, &[ge])?;
+            let g = cx.slice_axis(g, 0, 0, blocks_n)?;
+            let g = if at.stride == 1 && at.offset == 0 {
+                g
+            } else {
+                let stride = cx.like_i(g, at.stride);
+                let offset = cx.like_i(g, at.offset);
+                let g = cx.mul(g, stride)?;
+                cx.add(g, offset)?
+            };
+            let ids = cx.reshape(g, &[blocks_n, 1])?;
+            let got = cx.gather(
+                blocks,
+                ids,
+                &kernels_xla::hlo::GatherDims {
+                    offset_dims: vec![1, 2],
+                    collapsed_slice_dims: vec![0],
+                    start_index_map: vec![0],
+                    index_vector_dim: 1,
+                    ..kernels_xla::hlo::GatherDims::default()
+                },
+                &[1, tokens, width],
+            )?; // [lanes · pages, tokens, width]
+            let flat = cx.reshape(got, &[blocks_n * tokens, width])?;
+            let c = cx.read(cells)?;
+            let ce = cx.ty(c).elements();
+            let c = cx.reshape(c, &[ce])?;
+            let c = cx.slice_axis(c, 0, 0, rows_n)?;
+            // each row's lane's first cell
+            let lane = cx.iota(kernels_xla::hlo::Elem::I32, &[rows_n], 0);
+            let per = cx.like_i(lane, r);
+            let lane = cx.div(lane, per)?;
+            let width_l = cx.like_i(lane, span);
+            let base = cx.mul(lane, width_l)?;
+            let idx = cx.add(base, c)?;
+            let rows = cx.take_rows(flat, idx)?;
+            cx.write(out, rows)
         })?;
         Ok(out)
     }

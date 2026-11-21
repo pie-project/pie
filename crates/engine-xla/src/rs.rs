@@ -389,6 +389,14 @@ pub struct CarriedMap {
     pub buffer_rows: Vec<i32>,
     pub count: Vec<i32>,
     pub commit: Vec<i32>,
+    /// The rs list grains each lane's carried rows lie in, `pages` a lane
+    /// (`[lanes, pages]`, 0 past its own), and each carried row's cell in
+    /// them (`[lanes, rows]`: grain `cell / page_tokens` of the lane's,
+    /// token `cell % page_tokens`): the step reads whole grains, a block
+    /// each, then its rows out of them.
+    pub pages: u32,
+    pub grains: Vec<i32>,
+    pub cells: Vec<i32>,
 }
 
 impl CarriedMap {
@@ -402,17 +410,23 @@ impl CarriedMap {
         page_tokens: u32,
         rows: u32,
     ) -> Result<CarriedMap> {
+        // a lane's `rows` carried rows lie in at most this many grains
+        let pages = rows.div_ceil(page_tokens.max(1)) + 1;
         let mut map = CarriedMap {
             rows,
             buffer_rows: vec![DROP; (lanes * rows) as usize],
             count: vec![0; lanes as usize],
             commit: vec![0; lanes as usize],
+            pages,
+            grains: vec![0; (lanes * pages) as usize],
+            cells: vec![0; (lanes * rows) as usize],
         };
         for r in 0..lanes {
             let Some(plan) = plans.get((lane0 + r) as usize) else {
                 continue;
             };
             let mut at = 0u32;
+            let mut held: Vec<u32> = Vec::new();
             for run in &plan.gathers {
                 for t in 0..run.count {
                     if at >= rows {
@@ -429,6 +443,24 @@ impl CarriedMap {
                         need: u64::from(page) + 1,
                         have: run.pages.len() as u64,
                     })?;
+                    let p = match held.iter().position(|&g| g == slot) {
+                        Some(p) => p as u32,
+                        None => {
+                            if held.len() as u32 == pages {
+                                return Err(Fault::Ceiling {
+                                    what: "rs list grains a decode lane's carried rows lie in",
+                                    need: u64::from(pages) + 1,
+                                    have: u64::from(pages),
+                                });
+                            }
+                            map.grains[(r * pages) as usize + held.len()] =
+                                i32::try_from(slot).unwrap_or(i32::MAX);
+                            held.push(slot);
+                            held.len() as u32 - 1
+                        }
+                    };
+                    map.cells[(r * rows + at) as usize] =
+                        (p * page_tokens + token % page_tokens) as i32;
                     let row =
                         u64::from(slot) * u64::from(page_tokens) + u64::from(token % page_tokens);
                     map.buffer_rows[(r * rows + at) as usize] = i32::try_from(row)
@@ -618,6 +650,9 @@ pub struct TailInputs {
 #[derive(Clone, Copy, Debug)]
 pub struct CarriedInputs {
     pub rows: u32,
+    pub pages: u32,
+    pub grains: crate::handle::Tensor,
+    pub cells: crate::handle::Tensor,
     pub buffer_rows: crate::handle::Tensor,
     pub count: crate::handle::Tensor,
     pub commit: crate::handle::Tensor,
@@ -673,6 +708,10 @@ mod carried_map {
             &map.buffer_rows[4..],
             &[7 * 16 + 14, 7 * 16 + 15, 9 * 16, DROP]
         );
+        // grains 7 and 9 of lane 1, its rows' cells in them
+        assert_eq!(map.pages, 2);
+        assert_eq!(&map.grains[2..], &[7, 9]);
+        assert_eq!(&map.cells[4..7], &[14, 15, 16]);
         assert!(map.buffer_rows[..4].iter().all(|&r| r == DROP));
         // a lane carrying past the grid is refused
         assert!(CarriedMap::of(&plans, 2, 0, 16, 2).is_err());

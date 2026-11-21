@@ -352,6 +352,9 @@ pub struct Shell {
     /// one (`engine::Residency::host_programs`); `None` the host's free.
     host_programs: Option<u64>,
     parked_shapes: std::collections::HashMap<[u8; 32], [u8; 32]>,
+    /// The warm shapes whose programs do not fit HBM, by shape key and full
+    /// key: a fire of one is refused naming that, not as off the ladder.
+    left_out: std::collections::HashSet<[u8; 32]>,
     /// While the warm ladder traces (`warm.rs`): fires whose program is new
     /// are traced, kept here and not run, and compiled together after.
     deferred: Option<Vec<Deferred>>,
@@ -1175,6 +1178,7 @@ impl Shell {
             parked: std::collections::HashMap::new(),
             host_programs: None,
             parked_shapes: std::collections::HashMap::new(),
+            left_out: std::collections::HashSet::new(),
             deferred: None,
             readouts: std::collections::BTreeSet::new(),
             laddered: false,
@@ -2987,6 +2991,9 @@ impl Shell {
                             key,
                             crate::rs::CarriedInputs {
                                 rows: step.rows,
+                                pages: step.pages,
+                                grains: inputs.i32s(handles, &step.grains, 1),
+                                cells: inputs.i32s(handles, &step.cells, 1),
                                 buffer_rows: inputs.i32s(handles, &rows, 1),
                                 count: inputs.i32s(handles, &step.count, 1),
                                 commit: inputs.i32s(handles, &step.commit, 1),
@@ -3213,6 +3220,21 @@ impl Shell {
                 // built and counted.)
                 if self.laddered && self.device.is_sealed() && self.ladder_lays(lanes) {
                     let lane_rows: Vec<u32> = descriptor.lanes.iter().map(|l| l.rows).collect();
+                    let hbm = shape_key.is_some_and(|k| self.left_out.contains(&k))
+                        || key.is_some_and(|k| self.left_out.contains(&k));
+                    if hbm {
+                        return Err(Fault::Program {
+                            at: "serve::ladder",
+                            why: format!(
+                                "a fire of {} rows (bucket {}) over {} lanes, lane rows \
+                                 {lane_rows:?}, page bound {max_pages}: its program was left \
+                                 out of the warm ladder, its temporaries past the device's HBM",
+                                descriptor.rows,
+                                descriptor.bucket,
+                                descriptor.lanes.len()
+                            ),
+                        });
+                    }
                     return Err(Fault::Program {
                         at: "serve::ladder",
                         why: format!(

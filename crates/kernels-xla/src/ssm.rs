@@ -2142,8 +2142,8 @@ pub fn gated_delta_carried(
     }
     let r = f.dims(keys)[1];
     let slab = state.val;
+    // the state as the bank holds it (bf16 on a TPU): no f32 copy
     let s0 = take_slots(f, slab, lanes.slot, per)?;
-    let s0 = f.convert(s0, Elem::F32);
     let s0 = f.reshape(s0, &[l, hv, dk, dv])?;
     let row = qkv.f32(f);
     let row = f.slice_axis(row, 0, 0, l)?;
@@ -2249,7 +2249,6 @@ pub fn gated_delta_tail(
     }
     let t = cells / l;
     let s0 = take_slots(f, slab, lanes.slot, per)?;
-    let s0 = f.convert(s0, Elem::F32);
     let s0 = f.reshape(s0, &[l, hv, dk, dv])?;
     let ext = i64::from(qkv.rows);
     let grid = f.reshape(grid, &[cells])?;

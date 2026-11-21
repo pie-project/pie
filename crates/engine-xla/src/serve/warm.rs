@@ -702,6 +702,10 @@ impl Shell {
                 Some(Err(fault)) => {
                     let why = fault.to_string();
                     if why.contains(&exhausted) {
+                        self.left_out.insert(d.key);
+                        if let Some(shape_key) = d.shape_key {
+                            self.left_out.insert(shape_key);
+                        }
                         if left_out.insert(at) {
                             tracing::warn!(%why, "xla warm shape left out: its program does not fit HBM");
                         }
