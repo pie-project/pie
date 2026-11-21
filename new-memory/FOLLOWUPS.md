@@ -1032,18 +1032,6 @@ them) without weakening the per-step guarantee that a fire never opens a
 column it cannot back: the capped gate's walls against the tip, the pages
 the planner counts per group, and the refusals under over-demand.
 
-## F49. The host tier takes a held guest part past a chunk only whole: it parks in place instead
-
-A held guest part (an instance's resident state, `GuestState::resident`, or a
-place the runtime holds whole) moves to the host tier through `take_parts`,
-which asks the host for one contiguous run of slots. A run of slots never
-spans chunks, so a held part larger than a chunk finds no host room even where
-the host has room for its bytes, and the park leaves it where it lies (shed):
-device room stays held that a move down would have freed, a cost under
-over-demand. Fix shape: the host take places a held part as several runs, the
-way the device's retake does (`pieces` runs of `chunks` whole chunks), the
-part's place stating its runs, and the copies and the unpark follow them.
-
 ## F50. Hybrid beam replay grows with lineage divergence
 
 On a hybrid model each beam lane replays its buffered rows past its group's

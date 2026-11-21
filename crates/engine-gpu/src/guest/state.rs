@@ -250,11 +250,12 @@ impl GuestLayout {
             )));
         }
         let resident = self.resident();
-        if resident > facts.chunk {
+        // Past a chunk it lies in one run of whole chunks of a segment.
+        if resident.div_ceil(facts.chunk.max(1)) > u64::from(facts.segment_chunks) {
             return Err(refused(format!(
-                "a beam group's state of {resident} bytes is past a chunk of {}, and an \
-                 instance's resident run lies in one chunk's slots",
-                facts.chunk
+                "a beam group's state of {resident} bytes is past a segment of {} chunks of {}, \
+                 and it lies in one run of a segment's chunks",
+                facts.segment_chunks, facts.chunk
             )));
         }
         Ok(GuestState {

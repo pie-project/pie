@@ -1415,17 +1415,25 @@ impl Roles {
     }
 
     /// The part `bytes` of a guest's resident state take: one run of
-    /// adjacent `Instance` slots in a chunk, held (copied at a park, back
-    /// into fresh room at an unpark, never dead).
+    /// adjacent `Instance` slots in a chunk, or past a chunk one run of
+    /// adjacent whole chunks in a segment; held (copied at a park, back into
+    /// fresh room at an unpark, never dead).
     fn resident_part(&self, bytes: u64) -> Result<Part, RolesError> {
         let shape = self.shape(SlotRole::Instance)?;
         let slots = bytes.div_ceil(shape.slot_bytes.max(1));
         if slots > u64::from(self.chunk_slots) {
-            return Err(RolesError::PastChunk {
+            // Past a chunk: one run of adjacent whole chunks in a segment,
+            // its words one span as the engine addresses them.
+            let chunk = self.device.lock().unwrap().pool().chunk_bytes().max(1);
+            return Ok(Part {
                 role: SlotRole::Instance,
-                slots: u32::try_from(slots).unwrap_or(u32::MAX),
-                slot_bytes: shape.slot_bytes,
-                per_chunk: self.chunk_slots,
+                refs: Vec::new(),
+                contiguous: true,
+                pieces: 1,
+                chunks: u32::try_from(bytes.div_ceil(chunk)).unwrap_or(u32::MAX),
+                run: 0,
+                held: true,
+                resident: true,
             });
         }
         Ok(Part {
@@ -2018,9 +2026,11 @@ impl Roles {
                     ..part.clone()
                 })
             } else {
-                // Below the device, its slots anywhere; what it is (held,
-                // resident, its runs' shape for the way back) goes with it.
-                self.take(on, part.role, part.refs.len() as u32, part.contiguous)
+                // Below the device, its slots anywhere (a copy goes slot by
+                // slot: a run of slots or of chunks there is the device's
+                // alone); what it is (held, resident, its runs' shape for
+                // the way back) goes with it.
+                self.take(on, part.role, part.refs.len() as u32, part.contiguous && !part.shaped())
                     .map(|taken| Part {
                         refs: taken.refs,
                         ..part.clone()

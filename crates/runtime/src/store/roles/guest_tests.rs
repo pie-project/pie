@@ -3612,3 +3612,80 @@ fn parked_where_it_lies_a_resident_run_stays_its_own_and_is_named_again() {
     assert_eq!(resident, was, "the run it kept, named again");
     assert_ne!(scratch, ScratchPlace::None, "fresh scratch beside it");
 }
+
+/// A resident part past a chunk (a deep beam group's state): one run of
+/// adjacent whole chunks on the device, parked slot by slot into whatever
+/// the tier below holds, and laid again as a run of as many chunks at the
+/// unpark, the engine told that run (`Rebind::Instance::resident`), its
+/// bytes the copies brought back. Returns whether they went to disk.
+fn a_multi_chunk_resident_moves(roles: &RolesHandle) -> bool {
+    const RESIDENT: u64 = 2 * CHUNK + 5 * SLOT;
+    let mut engine = GuestEngine::new(SLOT, 0);
+    engine.state.resident = RESIDENT;
+    let id = bind(roles, &mut engine, 1).unwrap();
+    let bound = engine.bindings[0].resident.clone();
+    let ScratchPlace::Chunks { run, pieces } = &bound else {
+        panic!("a resident part past a chunk lies in whole chunks: {bound:?}");
+    };
+    assert_eq!((*run, pieces.len()), (3, 1), "one run of three chunks: {bound:?}");
+    let was = refs_of(&bound);
+
+    let park = roles.lock().unwrap().prepare_park(holder(1)).expect("it parks");
+    let out: Vec<u32> = park.copies().iter().flat_map(|copy| copy.device.clone()).collect();
+    let below: Vec<u32> = park.copies().iter().flat_map(|copy| copy.host.clone()).collect();
+    let disk = !park.copies().is_empty() && park.copies().iter().all(|copy| copy.disk);
+    assert!(was.iter().all(|slot| out.contains(slot)), "its run copied out whole");
+    roles.lock().unwrap().commit(park);
+
+    // Its chunks are another's meanwhile: it must come back elsewhere.
+    let mut other = GuestEngine::new(SLOT, 0);
+    other.state.resident = RESIDENT;
+    other.next = 100;
+    bind(roles, &mut other, 2).unwrap();
+    let others = refs_of(&other.bindings[0].resident);
+
+    let unpark = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(1))
+        .unwrap()
+        .expect("it unparks");
+    let back: Vec<u32> = unpark.copies().iter().flat_map(|copy| copy.device.clone()).collect();
+    let from: Vec<u32> = unpark.copies().iter().flat_map(|copy| copy.host.clone()).collect();
+    assert_eq!(from, below, "copied back from where the park put it");
+    roles.lock().unwrap().commit(unpark);
+    let stale = roles.lock().unwrap().stale(holder(1));
+    let Some(Rebind::Instance { id: rebound, resident, .. }) = stale
+        .iter()
+        .find(|rebind| matches!(rebind, Rebind::Instance { .. }))
+        .cloned()
+    else {
+        panic!("its instance is rebound: {stale:?}");
+    };
+    assert_eq!(rebound, id);
+    let ScratchPlace::Chunks { run, pieces } = &resident else {
+        panic!("it comes back in whole chunks: {resident:?}");
+    };
+    assert_eq!((*run, pieces.len()), (3, 1), "one run of three chunks again");
+    let now = refs_of(&resident);
+    assert!(now.iter().all(|slot| back.contains(slot)), "the run its bytes were copied into");
+    assert!(now.iter().all(|slot| !others.contains(slot)), "not the other's");
+    disk
+}
+
+/// [`a_multi_chunk_resident_moves`] with a host tier below.
+#[test]
+fn a_resident_part_of_three_chunks_parks_on_the_host_and_comes_back_a_run() {
+    let Pools { roles, .. } = pools(64);
+    assert!(!a_multi_chunk_resident_moves(&roles), "the host holds it");
+}
+
+/// [`a_multi_chunk_resident_moves`] with the disk tier alone below.
+#[test]
+fn a_resident_part_of_three_chunks_goes_to_disk_and_comes_back_a_run() {
+    let facts = facts(64);
+    let device = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
+    let roles: RolesHandle = Arc::new(Mutex::new(Roles::new(&device, None).unwrap()));
+    roles.lock().unwrap().set_disk(super::tests::FakeDisk::with(64));
+    assert!(a_multi_chunk_resident_moves(&roles), "the disk holds it");
+}

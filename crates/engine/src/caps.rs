@@ -44,12 +44,16 @@ pub struct FireLimits {
     /// 0: as many as `max_tokens`.
     #[serde(default)]
     pub max_readouts: u32,
-    /// The most buffered recurrent rows one fire's lanes replay, summed over
-    /// every lane, a decode lane's (`lane_carried`'s none) included: what
-    /// the engine's staged replay table holds a fire (0: no bound past each
-    /// lane's rung, [`crate::fire::rung_rows`]). The runtime steps no more
-    /// replayed rows than this together, a fire that would carry more
-    /// going in the steps after.
+    /// The buffered recurrent rows the requests of one step replay together,
+    /// summed over every lane, a decode lane's (`lane_carried`'s none)
+    /// included (0: no bound past each lane's rung,
+    /// [`crate::fire::rung_rows`]). The runtime steps no more replayed rows
+    /// than this across requests, a request that would carry more going in
+    /// a step after; a step's first request goes whatever it replays. It is
+    /// a pacing bound, never a refusal: an engine serves a fire whose rows
+    /// its staged tables hold, and a beam group's lanes (`Port::Parents`)
+    /// replay past it whatever their lineages' divergence, their rows
+    /// resolved through the group's own state, not listed a fire.
     #[serde(default)]
     pub replayed_rows: u32,
 }

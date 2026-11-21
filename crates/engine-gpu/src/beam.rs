@@ -67,18 +67,26 @@ pub struct Resident<B: Backend> {
     layout: BeamLayout,
 }
 
+/// A beam group's state lies in one span of the pool its kernels address
+/// word by word: a run of `Instance` slots, or one run of whole chunks.
+fn one_span(place: &ScratchPlace, what: &str) -> Result<()> {
+    match place {
+        ScratchPlace::Run { .. } => Ok(()),
+        ScratchPlace::Chunks { pieces, .. } if pieces.len() == 1 => Ok(()),
+        other => Err(refused(format!(
+            "a beam group's state lies in one run of Instance slots or of whole chunks, and \
+             the {what} names {other:?}"
+        ))),
+    }
+}
+
 impl<B: Backend> Resident<B> {
     /// The state of `layout` at `place` (the binding's resident run),
     /// cleared: room another owner left until then, and the first fire
     /// primes a state of zeros.
     pub fn bind(pools: &Pools<B>, place: &ScratchPlace, layout: BeamLayout) -> Result<Resident<B>> {
+        one_span(place, "binding")?;
         let placed = Placed::at(pools, place, layout.bytes())?;
-        if !matches!(place, ScratchPlace::Run { .. }) {
-            return Err(refused(format!(
-                "a beam group's state lies in one run of Instance slots, and the binding \
-                 names {place:?}"
-            )));
-        }
         placed.clear()?;
         Ok(Resident { placed, layout })
     }
@@ -96,21 +104,19 @@ impl<B: Backend> Resident<B> {
     /// Moves the state to `place`, the run the runtime copied its bytes
     /// into at an unpark: nothing is cleared.
     pub fn retarget(&mut self, pools: &Pools<B>, place: &ScratchPlace) -> Result<()> {
-        if !matches!(place, ScratchPlace::Run { .. }) {
-            return Err(refused(format!(
-                "a beam group's state lies in one run of Instance slots, and the rebind names \
-                 {place:?}"
-            )));
-        }
+        one_span(place, "rebind")?;
         self.placed.retarget(pools, place)
     }
 
-    /// The state's first word in the pool, as a kernel addresses it.
+    /// The state's first word in the pool, as a kernel addresses it: its
+    /// run of slots' first, or its run of whole chunks' first (the next
+    /// physical chunks of one segment, one span of words).
     pub fn word(&self, pools: &Pools<B>) -> Result<u32> {
         match self.placed.place() {
             &ScratchPlace::Run { first, .. } => pools.slot_word(INSTANCE, first),
+            ScratchPlace::Chunks { pieces, .. } if pieces.len() == 1 => pools.chunk_word(pieces[0]),
             other => Err(refused(format!(
-                "a beam group's state at {other:?}, not a run of Instance slots"
+                "a beam group's state at {other:?}, not one span of the pool"
             ))),
         }
     }

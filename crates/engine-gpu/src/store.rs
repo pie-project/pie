@@ -821,6 +821,28 @@ impl<B: Backend> Pools<B> {
             .locate(u64::from(physical) * self.layout.chunk_bytes)
     }
 
+    /// Logical chunk `chunk`'s first u32 word in the pool, as a kernel
+    /// binding the segments addresses it ([`Pools::chunk_place`]'s byte;
+    /// a run of chunks from it lies at the next physical chunks of the
+    /// same segment, its words one span).
+    pub fn chunk_word(&self, chunk: u32) -> Result<u32> {
+        if chunk == 0 || chunk >= self.layout.total_chunks {
+            return Err(Fault::Ceiling {
+                what: "chunks a guest's state may name (past the null chunk)",
+                need: u64::from(chunk) + 1,
+                have: u64::from(self.layout.total_chunks),
+            });
+        }
+        let physical = self.pool.physical(chunk)?;
+        self.pool.admit(physical)?;
+        let at = u64::from(physical) * self.layout.chunk_bytes;
+        u32::try_from(at / 4).map_err(|_| Fault::Ceiling {
+            what: "pool words a kernel indexes",
+            need: at / 4,
+            have: u64::from(u32::MAX),
+        })
+    }
+
     /// The bytes one slot of shape `id` holds.
     pub fn slot_bytes(&self, id: ShapeId) -> Result<u64> {
         Ok(self.shape(id)?.slot_bytes)

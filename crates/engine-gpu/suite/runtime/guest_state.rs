@@ -603,9 +603,31 @@ fn a_beam_groups_resident_state_survives_a_park_into_fresh_slots() {
     };
     let Loaded { engine, dir, .. } = loaded;
     let layout = engine_gpu::guest::state::BeamLayout::of(4, 300, 16, 2).expect("a depth");
+    resident_survives_a_park(&engine, &mut slots, layout);
+    // A search deep enough that its state passes a chunk: one run of whole
+    // chunks, addressed as one span.
+    let chunk = engine.loaded().expect("loaded").pools().layout().chunk_bytes;
+    let mut end = 1024u32;
+    let deep = loop {
+        let layout = engine_gpu::guest::state::BeamLayout::of(4, end, 16, 2).expect("a depth");
+        if layout.bytes() > chunk {
+            break layout;
+        }
+        end *= 2;
+    };
+    resident_survives_a_park(&engine, &mut slots, deep);
+    drop(engine);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// One group's state of `layout` through a park into fresh room
+/// ([`a_beam_groups_resident_state_survives_a_park_into_fresh_slots`]).
+fn resident_survives_a_park(engine: &backend::Engine, slots: &mut Slots, layout: engine_gpu::guest::state::BeamLayout) {
     let bytes = layout.bytes();
-    let parked = slots.state(bytes, 0);
-    let fresh = slots.state(bytes, 0);
+    let chunk = engine.loaded().expect("loaded").pools().layout().chunk_bytes;
+    let run = u32::try_from(bytes.div_ceil(chunk)).expect("chunks");
+    let parked = slots.state(bytes, run);
+    let fresh = slots.state(bytes, run);
     assert_ne!(parked, fresh, "the unpark's run is another");
     let pools = engine.loaded().expect("loaded").pools();
     fill_room(&engine, &parked, bytes, 0x5a);
@@ -641,14 +663,16 @@ fn a_beam_groups_resident_state_survives_a_park_into_fresh_slots() {
     buffer.write_shared(at, &copied).expect("the copy lands");
     fill_room(&engine, &parked, bytes, 0x3c);
     resident.retarget(pools, &fresh).expect("the unpark retargets");
-    let ScratchPlace::Run { first, .. } = fresh else {
-        panic!("a beam state lies in a run of slots");
+    let first_word = match &fresh {
+        &ScratchPlace::Run { first, .. } => pools
+            .slot_word(engine_gpu::store::layout::INSTANCE, first)
+            .expect("the fresh run's word"),
+        ScratchPlace::Chunks { pieces, .. } => pools.chunk_word(pieces[0]).expect("the fresh run's word"),
+        other => panic!("a beam state lies in one span: {other:?}"),
     };
     assert_eq!(
         resident.word(pools).expect("its word"),
-        pools
-            .slot_word(engine_gpu::store::layout::INSTANCE, first)
-            .expect("the fresh run's word"),
+        first_word,
         "the state's word is the fresh run's"
     );
     assert_eq!(
@@ -665,6 +689,4 @@ fn a_beam_groups_resident_state_survives_a_park_into_fresh_slots() {
     resident.rebind(pools).expect("the rebind");
     assert_eq!(read_room(&engine, &fresh, bytes), copied, "a rebind writes nothing");
     assert_eq!(resident.list(pools, 3).expect("beam 3's list")[0], 30);
-    drop(engine);
-    let _ = std::fs::remove_dir_all(&dir);
 }
