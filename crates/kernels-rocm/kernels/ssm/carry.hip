@@ -26,7 +26,8 @@ static_assert(sizeof(CarryLane) == 20, "CarryLane: `channel::RsLane` mirrors thi
 
 // A beam group's fold (BEAM-PAGE-LISTS §11.3): its representative lane (any
 // of its lanes; they share the set's state), where its fold rows start in
-// the replay table, and how many.
+// the replay table, and how many. The table's folding groups lead it; the
+// first entry of no rows ends it.
 struct GroupFold {
     u32 lane;
     u32 fold_off;

@@ -62,7 +62,9 @@ impl Carry {
 /// A beam group's fold (`BEAM-PAGE-LISTS.md` §11.3, `ssm/carry.hip`'s
 /// `GroupFold`): its representative lane (any of its lanes; they share the
 /// set's state), where its fold rows start in the replay table, and how
-/// many. The fold kernels read a device table of them, one a group.
+/// many. The fold kernels read a device table of them: the groups that fold
+/// lead it, and the first entry of no rows ends it (a block folds each group
+/// in turn, so an empty table costs a read, not a block a group).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GroupFold {
@@ -101,7 +103,7 @@ pub fn conv1d_fold(
     ctx.fire(
         OP,
         Fire::at(kernel(FILE, "::pie::attn::ssm_conv1d_fold<::pie::bf16>"))
-            .apply(Launch::grid([channels.div_ceil(FOLD_CONV_BLOCK), groups, 1], [FOLD_CONV_BLOCK, 1, 1])),
+            .apply(Launch::grid([channels.div_ceil(FOLD_CONV_BLOCK), 1, 1], [FOLD_CONV_BLOCK, 1, 1])),
         &[
             rows.arg(),
             stated(OP, channels)?.arg(),
@@ -146,7 +148,7 @@ pub fn gated_delta_fold(
     ctx.fire(
         OP,
         Fire::at(kernel(FILE, "::pie::attn::ssm_gdn_fold<16>"))
-            .apply(Launch::grid([v_dim / CARRIED_BV, groups, v_heads], [BLOCK, 1, 1])),
+            .apply(Launch::grid([v_dim / CARRIED_BV, v_heads, 1], [BLOCK, 1, 1])),
         &[
             rows.arg(),
             dt_bias.arg(),
@@ -2114,7 +2116,7 @@ pub fn kda_fold(
     ctx.fire(
         OP,
         Fire::at(kernel(FILE, &format!("::pie::attn::ssm_kda_fold<{head_dim}, {rows}>")))
-            .apply(Launch::grid([heads, groups, head_dim / rows], [STEP_BLOCK, 1, 1])),
+            .apply(Launch::grid([heads, head_dim / rows, 1], [STEP_BLOCK, 1, 1])),
         &[
             state_rows.arg(),
             a_log.arg(),
@@ -2544,7 +2546,7 @@ pub fn mamba2_fold(
     ctx.fire(
         OP,
         Fire::at(kernel(FILE, "::pie::attn::ssm_mamba2_fold"))
-            .apply(Launch::grid([groups, m.heads, 1], [BLOCK, 1, 1])),
+            .apply(Launch::grid([m.heads, 1, 1], [BLOCK, 1, 1])),
         &[
             rows.arg(),
             m.a_log.arg(),
