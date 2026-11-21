@@ -1710,6 +1710,192 @@ mod tests {
         a_frame_goes_without_a_lane_whose_process_waits();
         a_lane_whose_guest_waits_on_the_outside_holds_no_frame_and_rejoins_on_its_submit();
         a_prompt_piece_cut_under_a_cap_since_lowered_waits_whole_and_owes_nothing();
+        processes_over_the_execution_permits_joining_together_all_finish();
+        joiners_waiting_on_a_claimant_s_prefix_hold_no_frame();
+    }
+
+    /// More processes than execution permits arrive together (gemma-4-E2B
+    /// decode c256 on 43b4fa5ba: 37 lanes missing from the first frame, 37
+    /// waiters at the execution gate with no permit left). A lane is
+    /// expected from its opening, so it opens only once its process is
+    /// admitted past the bind and execution gates (`Pipeline::new` admits
+    /// first). Opened while its process waited at a gate, the frame waited
+    /// on lanes that could not submit, and the admitted processes, their
+    /// frames queued in it, never finished to give their permits back.
+    /// Modelled as the host drives the frame: admitted processes open their
+    /// lane and submit a step at a time, gated ones only queue, and one
+    /// finishing hands its permit to the next. Every process finishes; with
+    /// lanes opened at the gate instead, the first frame is held for good.
+    fn processes_over_the_execution_permits_joining_together_all_finish() {
+        const PROCESSES: usize = 8;
+        const PERMITS: usize = 2;
+        const STEPS: u64 = 3;
+        for open_at_the_gate in [false, true] {
+            let mut policy = FramePolicy::new(1, 64, 4096, None).with_silence_timeout_off();
+            policy.preload_free_slots(PERMITS);
+            let owners: Vec<ProcessId> = (0..PROCESSES).map(|_| pid()).collect();
+            let lanes: Vec<ProcessId> = (0..PROCESSES).map(|_| pid()).collect();
+            let mut admitted = vec![false; PROCESSES];
+            let mut opened = vec![false; PROCESSES];
+            let mut done = vec![false; PROCESSES];
+            let mut submitted = vec![0u64; PROCESSES];
+            let mut retired = vec![0u64; PROCESSES];
+            let mut fire_of: HashMap<u64, usize> = HashMap::new();
+            let mut queued: Vec<u64> = Vec::new();
+            let mut next_id = 1u64;
+            let mut free = PERMITS;
+            let mut now = Instant::now();
+            // All arrive together and queue at the gate.
+            for at in 0..PROCESSES {
+                policy.on_admission_queued(owners[at]);
+                if open_at_the_gate {
+                    // Its guest opens its pipeline before its first submit
+                    // meets the gate: expected from here.
+                    policy.on_lane_open(lanes[at], owners[at]);
+                    opened[at] = true;
+                }
+            }
+            let mut stalled = 0;
+            for _round in 0..PROCESSES * STEPS as usize * 8 {
+                if done.iter().all(|d| *d) || stalled > 8 {
+                    break;
+                }
+                // The gate grants in arrival order while permits are free.
+                for at in 0..PROCESSES {
+                    if free > 0 && !admitted[at] && !done[at] {
+                        free -= 1;
+                        admitted[at] = true;
+                        policy.on_execution_slot_consumed(owners[at]);
+                        if !opened[at] {
+                            policy.on_lane_open(lanes[at], owners[at]);
+                            opened[at] = true;
+                        }
+                    }
+                }
+                // Each admitted process submits its next step once its last
+                // landed (its guest reads the token first).
+                for at in 0..PROCESSES {
+                    if admitted[at]
+                        && !done[at]
+                        && submitted[at] == retired[at]
+                        && submitted[at] < STEPS
+                    {
+                        policy.on_fire_enqueued(
+                            stamp(lanes[at], submitted[at], 0, 1),
+                            Some(owners[at]),
+                            next_id,
+                            1,
+                            1,
+                        );
+                        fire_of.insert(next_id, at);
+                        queued.push(next_id);
+                        next_id += 1;
+                        submitted[at] += 1;
+                    }
+                }
+                now += Duration::from_millis(5);
+                let ids: QueuedFireIds = queued.iter().copied().collect();
+                let mut progressed = false;
+                if let FramePlan::Dispatch(waves) = plan(&mut policy, &ids, now) {
+                    let posted: Vec<u64> = waves.iter().flatten().copied().collect();
+                    queued.retain(|id| !posted.contains(id));
+                    let members: Vec<ProcessId> =
+                        posted.iter().map(|id| lanes[fire_of[id]]).collect();
+                    policy.on_frame_posted(members.clone(), now);
+                    policy.on_frame_retired(members);
+                    for id in &posted {
+                        retired[fire_of[id]] += 1;
+                    }
+                    progressed = !posted.is_empty();
+                }
+                // A process whose last step landed ends: its lane closes and
+                // its permit goes to the next at the gate.
+                for at in 0..PROCESSES {
+                    if admitted[at] && !done[at] && retired[at] == STEPS {
+                        done[at] = true;
+                        policy.on_lane_leave(lanes[at], Some(owners[at]), false);
+                        policy.on_slotted_terminate(owners[at]);
+                        policy.on_process_leave(owners[at]);
+                        policy.on_execution_slot_released(owners[at]);
+                        free += 1;
+                        progressed = true;
+                    }
+                }
+                stalled = if progressed { 0 } else { stalled + 1 };
+            }
+            let finished = done.iter().filter(|d| **d).count();
+            if open_at_the_gate {
+                assert_eq!(
+                    finished, 0,
+                    "control: lanes expected while their processes wait at the gate hold the first frame"
+                );
+                let ids: QueuedFireIds = queued.iter().copied().collect();
+                assert!(
+                    matches!(plan(&mut policy, &ids, now), FramePlan::Hold(_)),
+                    "control: held for the gated lanes: {}",
+                    policy.debug_summary()
+                );
+            } else {
+                assert_eq!(
+                    finished,
+                    PROCESSES,
+                    "every process over the permits finishes: {}",
+                    policy.debug_summary()
+                );
+            }
+        }
+    }
+
+    /// Greedy decodes of one prompt arriving together, the prefix cache
+    /// cold (16 on Vulkan: 15 of 16 lanes missing from the first frame,
+    /// for good): the first pass claims the prefix pages, and each other
+    /// process's first pass waits for them to seal
+    /// (`coalesce::before_pass`) before it submits, its lane open.
+    /// Expected, the frame held the claimant's prefill, whose pages they
+    /// wait on. Waiting on another pass's fire, a process is told waiting
+    /// (no frame waits on its lanes): the claimant's frame goes alone, and
+    /// each waiter, its pages sealed, comes back with its own submit.
+    fn joiners_waiting_on_a_claimant_s_prefix_hold_no_frame() {
+        // Four greedy decodes (the Mac's greedy4 on 43b4fa5ba) and sixteen.
+        for count in [3usize, 15] {
+            let mut policy = FramePolicy::new(1, 64, 4096, None).with_silence_timeout_off();
+            let claimant = pid();
+            let joiners: Vec<ProcessId> = (0..count).map(|_| pid()).collect();
+            for &owner in std::iter::once(&claimant).chain(&joiners) {
+                policy.on_lane_open(owner, owner);
+            }
+            policy.on_fire_enqueued(stamp(claimant, 0, 0, 1), Some(claimant), 1, 16, 1);
+            let queued: QueuedFireIds = [1].into_iter().collect();
+            assert!(
+                matches!(plan(&mut policy, &queued, Instant::now()), FramePlan::Hold(_)),
+                "control: the joiners' open lanes are expected"
+            );
+            // Each joiner's pass finds the prefix claimed and waits.
+            for &owner in &joiners {
+                policy.on_owner_waits(owner);
+            }
+            assert_eq!(
+                fires(&plan(&mut policy, &queued, Instant::now())),
+                vec![1],
+                "the claimant's prefill goes without the waiting joiners"
+            );
+            policy.on_frame_posted([claimant], Instant::now());
+            policy.on_frame_retired([claimant]);
+            // Its pages seal: each joiner submits its first pass, the claimant
+            // its first decode; they ride one frame.
+            let mut queued: Vec<u64> = vec![100];
+            policy.on_fire_enqueued(stamp(claimant, 1, 0, 1), Some(claimant), 100, 1, 1);
+            for (at, &owner) in joiners.iter().enumerate() {
+                let id = 2 + at as u64;
+                policy.on_fire_enqueued(stamp(owner, 0, 0, 1), Some(owner), id, 4, 1);
+                queued.push(id);
+            }
+            let ids: QueuedFireIds = queued.iter().copied().collect();
+            let mut sent = fires(&plan(&mut policy, &ids, Instant::now()));
+            sent.sort_unstable();
+            queued.sort_unstable();
+            assert_eq!(sent, queued, "every joiner rides the next frame with the claimant");
+        }
     }
 
     /// A prompt split across a lower: its last piece, cut under the cap
