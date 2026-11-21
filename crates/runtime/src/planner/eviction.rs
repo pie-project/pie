@@ -276,9 +276,19 @@ impl ResidencyPlanner {
         // planned as if the placement did not stand, in chunks only moves
         // empty (the free ones its takes refused are no room), the map's
         // candidates moved in the policy's order.
+        // So too after a pass settled with the head waiting and nothing in
+        // flight (the progress invariant, [`Self::dump_stall`]).
+        // There its whole need is planned on the map as it stands, the
+        // placement's reading of the room set aside.
+        let forced = self.force_moves.swap(false, Ordering::AcqRel);
         let mismatch = placement.as_ref().is_some_and(super::pool::RestorePlacement::stands)
             && self.no_more_room_than_refused(victims.head_pid);
-        let placement = placement.filter(|_| !mismatch);
+        if let (true, true, Some(head)) =
+            (forced || mismatch, victims.restore, self.head_room(victims.head))
+        {
+            shape = Some(head);
+        }
+        let placement = placement.filter(|_| !(mismatch || forced));
         if let Some(placement) = &placement {
             shape = Some(placement.short.clone());
         }

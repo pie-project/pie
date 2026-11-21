@@ -94,6 +94,15 @@ pub(super) fn some_pids<'a>(pids: impl ExactSizeIterator<Item = &'a ProcessId>) 
     format!("{count}{:?}", shown)
 }
 
+// Tests that hold the planner to the progress invariant panic where a settled
+// pass leaves a head waiting with nothing in flight (`dump_stall`). Per
+// thread: a test's passes run on its own thread, and tests run side
+// by side.
+#[cfg(test)]
+thread_local! {
+    pub(super) static PROGRESS_STRICT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl ResidencyPlanner {
     pub fn plan(self: &Arc<Self>) {
         // A grant dropped unspent during the pass gave back room the pass
@@ -563,6 +572,23 @@ impl ResidencyPlanner {
             "planner: the queue's head fits the pool alone and is unserved with nothing in \
              flight (a planner bug: no step found)"
         );
+        // The progress invariant: a settled pass leaves every waiting head
+        // served or something in flight that moves the generation. Broken,
+        // tests fail by name; served, the next pass plans the head's need
+        // as if its placement did not stand, and never waits.
+        #[cfg(test)]
+        if PROGRESS_STRICT.with(std::cell::Cell::get) {
+            panic!(
+                "progress invariant: head {key:?} ({kind}, pid {pid}) waits with nothing in \
+                 flight; need {need:?}, short {short:?}, need_moves {need_moves:?}, placement \
+                 {placement:?}, plan {plan}"
+            );
+        }
+        self.force_moves.store(true, Ordering::Release);
+        self.events.fetch_add(1, Ordering::AcqRel);
+        if let Some(notify) = self.returns.drain.get() {
+            notify.notify_one();
+        }
     }
 
     /// The segment walk made no grow it promised: the plan this wakes goes

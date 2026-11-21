@@ -10233,3 +10233,34 @@ async fn replay_names_a_head_left_waiting_when_shared_kv_is_not_swept() {
     let err = replay(&snap).await.expect_err("the head waits with nothing in flight");
     assert!(err.contains("waits with nothing in flight"), "{err}");
 }
+
+/// The progress invariant, enforced: a settled pass that leaves a head
+/// waiting with nothing in flight fails a strict test by name (here a bind
+/// short of a run of two on scattered free chunks, no one to move and no
+/// compaction to ask).
+#[test]
+#[should_panic(expected = "progress invariant")]
+fn a_settled_head_with_nothing_in_flight_fails_a_strict_test() {
+    super::plan::PROGRESS_STRICT.with(|strict| strict.set(true));
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 0));
+    pool.free.lock().extend([0, 2, 4, 6]);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let head = ProcessId::new_v4();
+    planner.register(head);
+    planner.note_admitted(head);
+    planner.with_inner(|inner| {
+        inner.enqueue(
+            head,
+            WaitKind::BindRoom {
+                run: 2,
+                pieces: 1,
+                pages: 2,
+                notify: Arc::new(Notify::new()),
+                served: false,
+                withdrawn: false,
+                rise: None,
+            },
+        );
+    });
+    planner.plan();
+}

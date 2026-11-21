@@ -43,6 +43,11 @@ pub struct ResidencyPlanner {
     /// show: an arrival, a departure, a landing, a policy answer, each a
     /// poke ([`Self::poke`]). Part of [`Self::generation`].
     pub(super) events: AtomicU64,
+    /// The last pass settled with a waiting head and nothing in flight
+    /// (the progress invariant broken, [`Self::dump_stall`]): the next
+    /// pass plans the head's need as if its placement did not stand, in
+    /// chunks only moves empty, never a wait.
+    pub(super) force_moves: AtomicBool,
     /// Fires landed as the running pass began: a wait it chose on
     /// something in flight is no quiet wait where one landed meanwhile.
     pub(super) pass_landed: AtomicU64,
@@ -137,6 +142,7 @@ impl ResidencyPlanner {
             inner: parking_lot::Mutex::new(Inner::default()),
             need_cache: parking_lot::Mutex::new(None),
             events: AtomicU64::new(0),
+            force_moves: AtomicBool::new(false),
             pass_landed: AtomicU64::new(0),
             settled_at: parking_lot::Mutex::new(None),
             map_cache: parking_lot::Mutex::new(None),
