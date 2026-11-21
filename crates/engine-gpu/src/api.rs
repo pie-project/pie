@@ -1027,9 +1027,18 @@ where
         } = self;
         let shell = shell.as_mut().ok_or_else(unloaded::<B>)?;
         programs.quiesce().map_err(refusal)?;
+        let undo = shell.pools().undo_of(evacuation).map_err(fault)?;
         shell.evacuate(evacuation).map_err(fault)?;
-        // Guest tables and cells bind their slots' chunks by place.
-        programs.rebind(shell.pools()).map_err(refusal)
+        // Guest tables and cells bind their slots' chunks by place; a
+        // placement they cannot be laid on is refused with the chunks moved
+        // back, so a refused evacuation moves nothing (the runtime undoes
+        // it as such).
+        if let Err(why) = programs.rebind(shell.pools()) {
+            shell.evacuate(&undo).map_err(fault)?;
+            programs.rebind(shell.pools()).map_err(refusal)?;
+            return Err(refusal(why));
+        }
+        Ok(())
     }
 
     fn program_facts(&self, program: ProgramId) -> EngineResult<engine::program::ProgramFacts> {

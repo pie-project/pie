@@ -763,6 +763,19 @@ impl<B: Backend> Pools<B> {
     /// every one of those physical chunks is backed and in the first one's
     /// segment, so a run never reads past its segment or into memory the
     /// pool does not hold.
+    /// The evacuation that takes `evacuation`'s logical chunks back to the
+    /// physical chunks they lie on now: applied after `evacuation` when the
+    /// guests cannot be re-laid on its placement, so a refused evacuation
+    /// moves nothing.
+    pub fn undo_of(&self, evacuation: &Evacuation) -> Result<Evacuation> {
+        let moves = evacuation
+            .moves
+            .iter()
+            .map(|&(logical, _)| Ok((logical, self.pool.physical(logical)?)))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Evacuation { moves })
+    }
+
     pub fn run_place(&self, first: u32, run: u32) -> Result<(&B::Buffer, u64)> {
         let place = self.chunk_place(first)?;
         let base = self.pool.physical(first)?;
