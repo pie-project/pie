@@ -190,16 +190,30 @@ impl<'a> Streams<'a> {
         }
         let ty = &self.stage.normalized.value_types[out as usize];
         let last = *ty.dims.last()?;
-        let readers = self.readers.get(out as usize)?;
-        let viewed = !readers.is_empty()
-            && readers.iter().all(|&reader| {
+        // Every reader a view, and every view a stream reads (past views of
+        // views) a whole row of the output's width.
+        let mut pending = vec![out];
+        let mut any = false;
+        while let Some(at) = pending.pop() {
+            let readers = self.readers.get(at as usize)?;
+            for &reader in readers {
                 let view = self.bases[reader];
-                self.ops[reader].tag == tags::RESHAPE
+                let is_view = self.ops[reader].tag == tags::RESHAPE
                     && self.output_source(view) == Some(out)
-                    && self.class(view) == RowClass::Full(last)
-                    && matches!(last, Dimension::Static(_))
-            });
-        viewed.then_some(last)
+                    && crate::codegen::alias::covers(&self.stage.normalized.value_types, at, view);
+                if is_view {
+                    pending.push(view);
+                } else if at == out
+                    || self.class(at) != RowClass::Full(last)
+                    || !matches!(last, Dimension::Static(_))
+                {
+                    return None;
+                } else {
+                    any = true;
+                }
+            }
+        }
+        any.then_some(last)
     }
 
     /// The nodes past `value`'s views that read it: a view of an output is
@@ -214,7 +228,9 @@ impl<'a> Streams<'a> {
                 .map_or(&[][..], Vec::as_slice)
             {
                 let view = self.bases[reader];
-                if self.ops[reader].tag == tags::RESHAPE && self.output_source(view) == Some(value)
+                if self.ops[reader].tag == tags::RESHAPE
+                    && self.output_source(view).is_some()
+                    && crate::codegen::alias::covers(&self.stage.normalized.value_types, value, view)
                 {
                     pending.push(view);
                 } else {
@@ -493,11 +509,12 @@ impl<'a> Streams<'a> {
         let members = self.plan(at)?;
         let safe = members.iter().all(|member| match member.role {
             Role::Map | Role::Broadcast => true,
-            // An output read in place through its views (one row of no row
-            // geometry of its own) keeps its region whole, as a copied one
-            // did.
+            // An output whole rows of its region read, or one read in place
+            // through views a stream reads as whole rows of its width: each
+            // block reads its stretch of the model's row.
             Role::Intrinsic => {
-                matches!(self.class(self.bases[member.node]), RowClass::Full(_))
+                let out = self.bases[member.node];
+                matches!(self.class(out), RowClass::Full(_)) || self.output_row(out).is_some()
             }
             // A draw's lanes run on from its block's row whole.
             Role::Argmax if self.ops[member.node].tag == tags::GUMBEL_ARGMAX => false,
@@ -510,6 +527,16 @@ impl<'a> Streams<'a> {
             Role::Rng => false,
         });
         Some((members.len(), safe))
+    }
+
+    /// The ops the stream at `at` covers, and whether it reduces or argmaxes
+    /// (in a split row, a phase boundary after it).
+    pub(super) fn meets_after(&self, at: usize) -> Option<(usize, bool)> {
+        let members = self.plan(at)?;
+        let meets = members
+            .iter()
+            .any(|member| matches!(member.role, Role::Reduce | Role::Argmax));
+        Some((members.len(), meets))
     }
 
     fn plan(&self, at: usize) -> Option<Vec<Member>> {
@@ -558,7 +585,12 @@ impl<'a> Streams<'a> {
                 {
                     let view = self.bases[reader];
                     if self.ops[reader].tag == tags::RESHAPE
-                        && self.output_source(view) == Some(views[at])
+                        && self.output_source(view).is_some()
+                        && crate::codegen::alias::covers(
+                            &self.stage.normalized.value_types,
+                            views[at],
+                            view,
+                        )
                     {
                         views.push(view);
                     }
@@ -725,7 +757,8 @@ pub(super) fn read_in_place_beyond(stage: &CompiledStage, region: &Region, value
         for &reader in &readers[at as usize] {
             let view = bases[reader];
             if ops[reader].tag == tags::RESHAPE
-                && output_source(stage, &ops, &producers, view) == Some(at)
+                && output_source(stage, &ops, &producers, view).is_some()
+                && crate::codegen::alias::covers(&stage.normalized.value_types, at, view)
             {
                 pending.push(view);
             } else if !region.nodes.iter().any(|n| n.index() == reader) {
@@ -776,8 +809,8 @@ pub(super) fn read_in_place_beyond(stage: &CompiledStage, region: &Region, value
 }
 
 /// The model output `value` is a view of: `value` itself where an output
-/// produces it, or the output a reshape covering it (the same elements in
-/// the same order) reads, in any region of the stage. The row is the
+/// produces it, or the output a chain of reshapes covering it (the same
+/// elements in the same order) reads, in any region of the stage. The row is the
 /// model's for the whole stage, so any region may read it where it lies.
 pub(super) fn output_source(
     stage: &CompiledStage,
@@ -792,13 +825,14 @@ pub(super) fn output_source(
     let op = &ops[node as usize];
     match op.tag {
         tags::OUTPUT => Some(value),
+        // A reshape covering its source, itself an output or a view of one
+        // (a one-row fire's squeezed `[v]` reshaped to `[1, v]`, then again).
         tags::RESHAPE if !op.args.is_empty() => {
             let source = op.args[0];
-            let producer = *producers.get(source as usize)?;
-            (producer != u32::MAX
-                && ops[producer as usize].tag == tags::OUTPUT
-                && crate::codegen::alias::covers(&stage.normalized.value_types, source, value))
-            .then_some(source)
+            if !crate::codegen::alias::covers(&stage.normalized.value_types, source, value) {
+                return None;
+            }
+            output_source(stage, ops, producers, source)
         }
         _ => None,
     }
@@ -1328,9 +1362,11 @@ pub(super) fn emit_stream(
     let reduces = members.iter().any(|m| m.role == Role::Reduce);
     if streams.split && reduces {
         // The row's reductions' first levels lie in its work, every block's
-        // partials at their chunks; each block folds them in its own area.
+        // partials at their chunks; each block folds them in its own shared
+        // memory, so a block keeps nothing of its own in the temporary area
+        // and the row's area is the row's, however many blocks it splits
+        // across.
         s.push_str("    float* stream_work = reinterpret_cast<float*>(ptir_row_work);\n");
-        s.push_str("    float* stream_own = reinterpret_cast<float*>(temporary);\n");
     } else if reduces {
         s.push_str("    float* stream_work = reinterpret_cast<float*>(temporary);\n");
     }
@@ -1378,6 +1414,10 @@ pub(super) fn emit_stream(
         pointer,
     };
     let mut epilogue = String::new();
+    // A split row's work after its blocks' partials are all in: run in the
+    // region's next phase (a launch of its own, so every block's partials
+    // are written before any block folds them; no block waits on another).
+    let mut post = String::new();
     let mut float_reductions = 0u32;
     let mut argmaxes = 0u32;
 
@@ -1427,8 +1467,18 @@ pub(super) fn emit_stream(
                 let identity = format!("m1_reduce_identity({tag}u)");
                 let combine = |a: &str, b: &str| format!("m1_reduce_combine({tag}u, {a}, {b})");
                 let width = u64::from(stream_width.expect("a reducing stream's row is static"));
-                let slot = u64::from(float_reductions) * reduction_floats(width);
                 let chunks = reduction_chunks(width);
+                // A split row's partials alternate between the slot's halves
+                // by phase: the next phase folds this phase's half while its
+                // own streams write the other, so no block overwrites a
+                // partial another block has yet to fold. (Its fold's levels
+                // above the first are in shared memory, so the half is free.)
+                let bank = if streams.split {
+                    u64::from(streams.meets.get() % 2) * chunks
+                } else {
+                    0
+                };
+                let slot = u64::from(float_reductions) * reduction_floats(width) + bank;
                 float_reductions += 1;
                 // As in the reference, a level folds only while more than one
                 // value is left: a one-element row is its own reduction.
@@ -1496,35 +1546,39 @@ pub(super) fn emit_stream(
                 let _ = writeln!(f, "        }}");
                 let ptr = (pass.pointer)(out);
                 let _ = writeln!(epilogue, "    __syncthreads();");
-                let _ = writeln!(epilogue, "    {{");
                 if streams.split {
-                    // Every block's partials are in: each folds them all in
-                    // the reference's order, so every block holds the
-                    // one-block answer.
-                    let meet = streams.meets.get() + 1;
-                    streams.meets.set(meet);
+                    // In the next phase every block's partials are in: each
+                    // folds them all in the reference's order, so every block
+                    // holds the one-block answer. The levels above the first:
+                    // a value a run of 32 of the level below, folded by
+                    // `ptir_canonical_reduce` in place.
+                    let upper = chunks.div_ceil(32);
+                    let _ = writeln!(post, "    {{");
                     let _ = writeln!(
-                        epilogue,
-                        "      ptir_meet(ptir_meet_word, {meet}u * ptir_split);"
+                        post,
+                        "      __shared__ float stream_fold{node}[{}u];",
+                        upper + upper.div_ceil(32)
                     );
                     let _ = writeln!(
-                        epilogue,
-                        "      const float total = ptir_canonical_reduce_met({tag}u, stream_work + {slot}u, {chunks}u, stream_own + {}u, stream_own + {}u);",
-                        slot + chunks,
-                        slot + chunks + chunks.div_ceil(32)
+                        post,
+                        "      const float total = ptir_canonical_reduce_met({tag}u, stream_work + {slot}u, {chunks}u, stream_fold{node}, stream_fold{node} + {upper}u);"
                     );
+                    let _ = writeln!(post, "      if (threadIdx.x == 0u) m1_store_f({ptr}, 0u, total);");
+                    let _ = writeln!(post, "    }}");
+                    let _ = writeln!(post, "    __syncthreads();");
                 } else {
+                    let _ = writeln!(epilogue, "    {{");
                     let _ = writeln!(
                         epilogue,
                         "      const float total = ptir_canonical_reduce({tag}u, stream_work + {slot}u, {chunks}u, stream_work + {}u, stream_work + {slot}u);",
                         slot + chunks
                     );
+                    let _ = writeln!(
+                        epilogue,
+                        "      if (threadIdx.x == 0u) m1_store_f({ptr}, 0u, total);"
+                    );
+                    let _ = writeln!(epilogue, "    }}");
                 }
-                let _ = writeln!(
-                    epilogue,
-                    "      if (threadIdx.x == 0u) m1_store_f({ptr}, 0u, total);"
-                );
-                let _ = writeln!(epilogue, "    }}");
             }
             Role::Argmax => {
                 let x = if tag == tags::GUMBEL_ARGMAX {
@@ -1560,35 +1614,39 @@ pub(super) fn emit_stream(
                 );
                 let ptr = (pass.pointer)(out);
                 if streams.split {
-                    // Each part's candidate to the lane arena; after the
-                    // meeting every block takes the row's best of them, the
-                    // one a block's scan picks (the order is total).
-                    let meet = streams.meets.get() + 1;
-                    streams.meets.set(meet);
+                    // The candidates' bank alternates by phase, as a
+                    // reduction's partials do.
+                    let bank = streams.meets.get() % 2;
+                    // Each part's candidate to the lane arena; in the next
+                    // phase every block takes the row's best of them, the one
+                    // a block's scan picks (the order is total).
                     let _ = writeln!(
                         epilogue,
-                        "      if (stream_lane == 0u) ptir_put_candidate(ptir_meet_word, ptir_row, ptir_part, cand{node});"
+                        "      if (stream_lane == 0u) ptir_put_candidate(ptir_meet_word, {bank}u, ptir_row, ptir_part, cand{node});"
                     );
                     let _ = writeln!(epilogue, "    }}");
+                    let _ = writeln!(post, "    if (stream_warp == 0u) {{");
                     let _ = writeln!(
-                        epilogue,
-                        "    ptir_meet(ptir_meet_word, {meet}u * ptir_split);"
-                    );
-                    let _ = writeln!(epilogue, "    if (stream_warp == 0u) {{");
-                    let _ = writeln!(
-                        epilogue,
-                        "      cand{node} = stream_lane < ptir_split ? ptir_get_candidate(ptir_meet_word, ptir_row, stream_lane) : M1ArgmaxCandidate{{m1_neg_inf(), 0u, 0u, 0u}};"
+                        post,
+                        "      cand{node} = stream_lane < ptir_split ? ptir_get_candidate(ptir_meet_word, {bank}u, ptir_row, stream_lane) : M1ArgmaxCandidate{{m1_neg_inf(), 0u, 0u, 0u}};"
                     );
                     let _ = writeln!(
-                        epilogue,
+                        post,
                         "      cand{node} = m1_argmax_warp_reduce(cand{node}, stream_lane);"
                     );
+                    let _ = writeln!(
+                        post,
+                        "      if (stream_lane == 0u) m1_store_i({ptr}, 0u, (int)cand{node}.index);"
+                    );
+                    let _ = writeln!(post, "    }}");
+                    let _ = writeln!(post, "    __syncthreads();");
+                } else {
+                    let _ = writeln!(
+                        epilogue,
+                        "      if (stream_lane == 0u) m1_store_i({ptr}, 0u, (int)cand{node}.index);"
+                    );
+                    let _ = writeln!(epilogue, "    }}");
                 }
-                let _ = writeln!(
-                    epilogue,
-                    "      if (stream_lane == 0u) m1_store_i({ptr}, 0u, (int)cand{node}.index);"
-                );
-                let _ = writeln!(epilogue, "    }}");
             }
         }
         if matches!(member.role, Role::Reduce | Role::Argmax) {
@@ -1601,6 +1659,12 @@ pub(super) fn emit_stream(
     }
     let Pass { prologue, body, .. } = pass;
     s.push_str(&prologue);
+    // A split row's stream runs in its region's current phase; its work after
+    // the blocks' partials are in, in the next.
+    let phase = streams.meets.get();
+    if streams.split {
+        let _ = writeln!(s, "    if (ptir_phase == {phase}u) {{");
+    }
     let mut conds: Vec<String> = vec!["(stream_width & 3u) == 0u".into()];
     conds.extend(body.ptrs.iter().map(|p| format!("m1_aligned16({p})")));
     conds.extend(body.conds.iter().cloned());
@@ -1652,6 +1716,15 @@ pub(super) fn emit_stream(
     s.push_str("    }\n");
     s.push_str("    }\n");
     s.push_str(&epilogue);
+    if streams.split {
+        s.push_str("    }\n");
+        if !post.is_empty() {
+            streams.meets.set(phase + 1);
+            let _ = writeln!(s, "    if (ptir_phase == {}u) {{", phase + 1);
+            s.push_str(&post);
+            s.push_str("    }\n");
+        }
+    }
     s.push_str(tail);
     s.push_str("  }\n");
     source.push_str(&s);

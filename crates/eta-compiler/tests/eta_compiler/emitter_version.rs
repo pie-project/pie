@@ -6,9 +6,9 @@ use eta_compiler::codegen::program::{Backend, emit_program};
 use eta_compiler::codegen::wgsl::{WGSL_STEP_EMITTER_VERSION, step_calls, step_module};
 
 const PINNED: &[(&str, u16, u64)] = &[
-    ("cuda", 87, 0xf934_f331_2676_7fe3),
-    ("hip", 47, 0x8ddd_73d3_2b69_d7ed),
-    ("metal", 76, 0x3f1b_da25_e649_6779),
+    ("cuda", 90, 0xda5b_c598_f0c7_bf3f),
+    ("hip", 50, 0xcf15_9ee1_387b_8aa7),
+    ("metal", 76, 0xef69_37f6_0fc0_b32d),
 ];
 
 /// The stepwise WGSL emitter's version and the fingerprint of what it

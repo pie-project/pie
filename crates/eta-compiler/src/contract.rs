@@ -5,6 +5,9 @@
 //! [`Case::buffer`] seated at [`Case::seats`] and reads [`Case::readers`]:
 //! each channel's bytes are [`Case::expected`]'s, exactly.
 //!
+//! The split cases ([`split_stage`]) are that step's width-1 candidates
+//! over one row a backend splits across its lane's blocks.
+//!
 //! The beam cases are beam_search's step on Qwen3.5-0.8B (a 248,320-token
 //! vocabulary): the beams' logits, their log-softmax plus the beams'
 //! scores, flattened and cut to the top `width`, split into parent and
@@ -106,6 +109,135 @@ pub fn beam_stage() -> Vec<Case> {
         case("beam w2, a lane a row", w2, QWEN35_VOCAB, Binding::LaneARow),
         case("beam w4, a lane a row", w4, QWEN35_VOCAB, Binding::LaneARow),
     ]
+}
+
+/// The split-row cases: a width-1 beam step's candidates (its carried score
+/// relative to the best, broadcast over the row, plus the row's bf16
+/// log-softmax), read off the model's row through views (squeezed to `[v]`,
+/// then back to `[1, v]`) and cut to its top eight, values and ids: the
+/// region a backend runs across its lane's blocks, each block a stretch of
+/// the row. At a width that is a whole number of every split's 128-element
+/// stretches and at one that is not, a stretch a block leaves unwritten
+/// lands among the top (the row's log-probabilities are all below zero), so
+/// the readers answer the interpreter's only where every element was
+/// written as the one-block region writes it. The region ends in the row's
+/// copy a later region reads: a block that copies past its own stretch
+/// reads cells another block writes, a read before the write where it wins
+/// (a backend's runner fills the region's scratch with a value above every
+/// log-probability, so such a read lands among the top).
+#[must_use]
+pub fn split_stage() -> Vec<Case> {
+    vec![
+        split_case("split rows, whole stretches", 65_536),
+        split_case("split rows, a ragged last stretch", 70_001),
+        // Qwen3.5's vocabulary over sixteen blocks: an exact share of the
+        // row's 16-byte quads cuts it off the 128-element stretches (block
+        // 0's share ends at 15520, its stretch at 15488), so a copy cut by
+        // shares reads cells another block writes.
+        split_case("split rows, shares off the stretches", QWEN35_VOCAB),
+    ]
+}
+
+fn split_case(name: &'static str, vocab: u32) -> Case {
+    use eta_ir::container::{ChannelDecl, StageProgram, TraceContainer};
+    use eta_ir::op::Op;
+    use eta_ir::registry::Stage;
+    use eta_ir::types::Shape;
+    let row = Shape::matrix(1, vocab);
+    let cell = |len: u32, dtype: Dtype, host_role: HostRole, seeded: bool| ChannelDecl {
+        shape: Shape::vector(len),
+        dtype: ChanDType::Concrete(dtype),
+        capacity: 2,
+        host_role,
+        seeded,
+    };
+    let ops = vec![
+        Op::ChanTake(0),
+        Op::Output {
+            index: 0,
+            lane: 0,
+            shape: row,
+            dtype: Dtype::F32,
+        },
+        Op::Reshape {
+            value: 1,
+            shape: Shape::vector(vocab),
+        },
+        Op::Reshape { value: 2, shape: row },
+        Op::Cast {
+            value: 3,
+            dtype: Dtype::Bf16,
+        },
+        Op::ReduceMax(0),
+        Op::Broadcast {
+            value: 5,
+            shape: Shape::vector(1),
+        },
+        Op::Sub(0, 6),
+        Op::Cast {
+            value: 7,
+            dtype: Dtype::Bf16,
+        },
+        Op::Broadcast { value: 8, shape: row },
+        Op::ReduceMax(4),
+        Op::Broadcast { value: 10, shape: row },
+        Op::Sub(4, 11),
+        Op::Exp(12),
+        Op::ReduceSum(13),
+        Op::Log(14),
+        Op::Broadcast { value: 15, shape: row },
+        Op::Sub(12, 16),
+        Op::Add(9, 17),
+        Op::Reshape {
+            value: 18,
+            shape: Shape::vector(vocab),
+        },
+        Op::TopK { input: 19, k: 8 },
+        Op::Cast {
+            value: 20,
+            dtype: Dtype::F32,
+        },
+        Op::ChanPut { chan: 1, value: 22 },
+        Op::ChanPut { chan: 2, value: 21 },
+    ];
+    let container = TraceContainer {
+        names: vec!["logits".into()],
+        channels: vec![
+            cell(1, Dtype::F32, HostRole::Writer, true),
+            cell(8, Dtype::F32, HostRole::Reader, false),
+            cell(8, Dtype::U32, HostRole::Reader, false),
+        ],
+        ports: Vec::new(),
+        stages: vec![StageProgram {
+            stage: Stage::Epilogue,
+            ops,
+        }],
+        externs: Vec::new(),
+        inputs: Vec::new(),
+    };
+    let logits = OutputDecl {
+        name: "logits".into(),
+        axis: Axis::Row,
+        width: vocab,
+        dtype: Dtype::F32,
+        layers: 0,
+        readout: true,
+    };
+    let caps = EngineCaps {
+        lora: true,
+        attn_page_mask: true,
+    };
+    let bound = bind(container, vec![vec![logits]], caps).expect("the split case binds");
+    Case {
+        name,
+        binding: Binding::OneLane,
+        bound,
+        rows: 1,
+        vocab,
+        seeds: vec![(0, Value::F32(vec![-1.5]))],
+        logits: plane(vocab as usize),
+        readers: vec![1, 2],
+    }
 }
 
 fn case(name: &'static str, bytes: &[u8], vocab: u32, binding: Binding) -> Case {
