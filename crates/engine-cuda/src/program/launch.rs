@@ -21,7 +21,7 @@ use crate::error::{Fault, Result};
 use super::compile::{Module, Region};
 use super::endpoint::Endpoint;
 
-const FUSED_ARITY: usize = 19;
+const FUSED_ARITY: usize = 20;
 
 /// The spans of a stage's cells ([`Prepared::cells`]): five intrinsic
 /// tables, the pending flags, the row tables, the lane scratch table and
@@ -723,6 +723,9 @@ pub struct Prepared {
     /// The most blocks each such region's rows split across
     /// ([`row_split_max`]), a region each.
     row_split_most: Vec<u32>,
+    /// The launches (phases) each region runs in ([`LaunchRegion::phases`]):
+    /// a region whose rows split, once a phase; every other region once.
+    phases: Vec<u32>,
     lanes: u32,
     filled: u32,
     bindings: Vec<u32>,
@@ -1027,6 +1030,12 @@ impl Prepared {
             .zip(&rows_of)
             .map(|(region, &rows)| row_split_max(plan, &descriptors, region, rows))
             .collect();
+        let phases = plan
+            .fused
+            .iter()
+            .zip(&rows_of)
+            .map(|(region, &rows)| if splits_rows(region, rows) { region.phases.max(1) } else { 1 })
+            .collect();
 
         let mut records = Vec::with_capacity(plan.ops.len());
         let mut result_base = 0u32;
@@ -1129,6 +1138,7 @@ impl Prepared {
             splits,
             row_splits,
             row_split_most,
+            phases,
             lanes: 0,
             filled: 0,
             bindings: plan.channel_bindings.clone(),
@@ -1616,7 +1626,7 @@ impl Prepared {
         // A split row's temporary area is its row's (its blocks fold in
         // shared memory), strided by row; every other block's is its own.
         let stride = (self.temporary_bytes / strided) & !(SCRATCH_ALIGN as u32 - 1);
-        args.u32(rows).u32(stride).ptr(arenas.at);
+        args.u32(rows).u32(stride).ptr(arenas.at).u32(0);
         // A value stated to take no bytes lies on the lane's dummy bytes: a
         // build with `test-slot-fill` poisons them before every launch, so a
         // kernel that reads one answers wrongly where a golden sees it.
@@ -1624,14 +1634,24 @@ impl Prepared {
         if cfg!(feature = "test-slot-fill") {
             self.poison_dummy(stream)?;
         }
-        launch(
-            &region.module,
-            self.filled.saturating_mul(rows),
-            region.module.block_threads(),
-            &mut args,
-            FUSED_ARITY,
-            stream,
-        )
+        // A region whose rows split runs a launch a phase: every block's
+        // partials are written by a launch's end, and the next folds them, so
+        // no block of it waits on another (its grid need not be resident at
+        // once).
+        let phases = self.phases.get(at).copied().unwrap_or(1).max(1);
+        let phase_at = args.len() - 1;
+        for phase in 0..phases {
+            args.set(phase_at, u64::from(phase));
+            launch(
+                &region.module,
+                self.filled.saturating_mul(rows),
+                region.module.block_threads(),
+                &mut args,
+                FUSED_ARITY,
+                stream,
+            )?;
+        }
+        Ok(())
     }
 
     /// Whether a region of this stage meets across its lane's blocks in the
@@ -1726,6 +1746,13 @@ impl Args {
 
     pub fn u32(&mut self, value: u32) -> &mut Args {
         self.scalar(u64::from(value))
+    }
+
+    /// Rebinds the scalar at `at` (a bound argument) to `value`.
+    pub fn set(&mut self, at: usize, value: u64) {
+        if let Some(cell) = self.storage.get_mut(at) {
+            **cell = value;
+        }
     }
 
     fn scalar(&mut self, value: u64) -> &mut Args {
