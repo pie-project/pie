@@ -130,6 +130,15 @@ struct LaneState {
     /// Its last sealed frame carried a prompt: its next pass is built on the
     /// host from what that prompt answers, so only decodes wait for it.
     prompting: bool,
+    /// It comes back only by a submit of its own: its pipeline closed
+    /// ([`FramePolicy::on_lane_leave`]), or its guest waits on outside input
+    /// ([`FramePolicy::on_owner_away`]). Kept only while frames it submitted
+    /// wait to go, and never expected again by its owner's unblock or
+    /// resume. Kept parked as any other, an unblock expected it again, and a
+    /// frame waited for good on a lane that would not submit (a verified
+    /// beam's rescoring pipelines, closed mid-run: the L40S's and the Mac's
+    /// beamx8 on de4712551, once no leash parked a silent lane).
+    own_submit: bool,
 }
 
 pub(super) const ABANDONED: &str = "pipeline abandoned: silent past the silence timeout without \
@@ -553,6 +562,7 @@ impl FramePolicy {
             frames: VecDeque::new(),
             fired_this_boundary: true,
             prompting: false,
+            own_submit: false,
         });
         if lane.owner.is_none() {
             lane.owner = owner;
@@ -560,6 +570,7 @@ impl FramePolicy {
         if lane.parked && !suspended {
             lane.parked = false;
             lane.awaited = true;
+            lane.own_submit = false;
         }
         lane.clock_from = None;
         let for_front_frame = lane
@@ -620,6 +631,7 @@ impl FramePolicy {
             frames: VecDeque::new(),
             fired_this_boundary: true,
             prompting: false,
+            own_submit: false,
         });
     }
 
@@ -776,6 +788,7 @@ impl FramePolicy {
             }
             state.awaited = false;
             state.parked = true;
+            state.own_submit = true;
             self.truncate_incomplete(lane);
             let drained = self
                 .lanes
@@ -906,6 +919,13 @@ impl FramePolicy {
     /// not away: its lanes stay awaited.
     pub fn on_owner_away(&mut self, owner: ProcessId) {
         self.park_owner(owner, "outside-wait");
+        for lane in self.lanes.values_mut() {
+            if lane.owner == Some(owner) {
+                lane.own_submit = true;
+            }
+        }
+        self.lanes
+            .retain(|_, lane| lane.awaited || (lane.parked && !lane.own_submit) || !lane.frames.is_empty());
     }
 
     /// Parks `owner`'s lanes: none is awaited, what arrived of an
@@ -955,7 +975,7 @@ impl FramePolicy {
             return;
         }
         for lane in self.lanes.values_mut() {
-            if lane.owner == Some(owner) && lane.parked {
+            if lane.owner == Some(owner) && lane.parked && !lane.own_submit {
                 lane.parked = false;
                 lane.awaited = true;
             }
@@ -1247,7 +1267,7 @@ impl FramePolicy {
                 self.seal_skips = skipped;
                 self.lanes
                     .retain(|_, lane| {
-                        lane.awaited || lane.parked || !lane.frames.is_empty()
+                        lane.awaited || (lane.parked && !lane.own_submit) || !lane.frames.is_empty()
                     });
                 return None;
             }
@@ -1299,7 +1319,7 @@ impl FramePolicy {
             });
             self.lanes
                 .retain(|_, lane| {
-                        lane.awaited || lane.parked || !lane.frames.is_empty()
+                        lane.awaited || (lane.parked && !lane.own_submit) || !lane.frames.is_empty()
                     });
             return Some(FramePlan::Dispatch(Vec::new()));
         }
@@ -2011,6 +2031,7 @@ mod tests {
         a_policys_bound_packs_prompts_into_a_frame_up_to_it_and_no_further();
         a_frame_goes_without_a_lane_whose_process_waits();
         a_pipelines_fire_posted_behind_a_later_one_is_refused_by_name();
+        a_closed_lane_is_never_expected_again_by_its_owner_s_unblock();
         a_lane_whose_guest_waits_on_the_outside_holds_no_frame_and_rejoins_on_its_submit();
         a_prompt_piece_cut_under_a_cap_since_lowered_waits_whole_and_owes_nothing();
         a_parked_owner_s_complete_frame_goes_without_waiting_on_the_boundary();
@@ -2893,6 +2914,37 @@ mod tests {
         assert!(reason.contains("fire 6") && reason.contains("later fire 7"), "{reason}");
         policy.on_lane_leave(a, None, true);
         assert_eq!(policy.admit_post(a, 1), Ok(()), "a pipeline that left is forgotten");
+    }
+
+    /// A joining frame with lanes in a mixed state (the L40S's and the
+    /// Mac's beamx8 stall on de4712551): an owner's lane closes with a frame
+    /// still queued, so it is kept until that frame goes; the owner blocks
+    /// on the planner and is unblocked again. Its closed lane is never
+    /// expected again: the owner's live lane's next frame goes, never held
+    /// for a lane that will not submit.
+    fn a_closed_lane_is_never_expected_again_by_its_owner_s_unblock() {
+        let mut policy = FramePolicy::new(1, 64, 4096, None).with_silence_timeout_off();
+        let (owner, closing, live) = (pid(), pid(), pid());
+        // Both lanes submit; the closing one's frame waits behind a held
+        // device (nothing planned yet) as its pipeline closes.
+        policy.on_fire_enqueued(stamp(closing, 0, 0, 1), Some(owner), 1, 1, 1);
+        policy.on_fire_enqueued(stamp(live, 0, 0, 1), Some(owner), 2, 1, 1);
+        policy.on_lane_leave(closing, Some(owner), false);
+        let queued: QueuedFireIds = [1, 2].into_iter().collect();
+        let mut both = fires(&plan(&mut policy, &queued, Instant::now()));
+        both.sort_unstable();
+        assert_eq!(both, vec![1, 2], "the closed lane's last frame still goes");
+        policy.on_frame_retired([closing, live]);
+        // The owner blocks on the planner and is unblocked.
+        policy.on_owner_waits(owner);
+        policy.on_owner_unblocked(owner);
+        policy.on_fire_enqueued(stamp(live, 1, 0, 1), Some(owner), 3, 1, 1);
+        let queued: QueuedFireIds = [3].into_iter().collect();
+        assert_eq!(
+            fires(&plan(&mut policy, &queued, Instant::now())),
+            vec![3],
+            "the live lane's frame goes: the closed lane is not waited for"
+        );
     }
 
     /// A guest blocked on input from outside (a session receive, a timer,
