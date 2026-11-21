@@ -1037,6 +1037,7 @@ impl Engine for Cuda {
                 instance,
                 rings,
                 scratch,
+                resident,
                 pair,
                 pair_generation,
                 ..
@@ -1048,6 +1049,7 @@ impl Engine for Cuda {
                         instance,
                         rings,
                         scratch,
+                        resident,
                         pair,
                         pair_generation,
                     },
@@ -1396,6 +1398,7 @@ impl Engine for Cuda {
                     instance: binding.instance_slots.clone(),
                     rings: binding.ring_slots.clone(),
                     scratch: binding.scratch.clone(),
+                    resident: binding.resident.clone(),
                     pair: binding.pair.clone(),
                     pair_generation: binding.pair_generation,
                 },
@@ -1474,6 +1477,10 @@ impl Engine for Cuda {
         channel: u32,
     ) -> EngineResult<Option<Vec<u8>>> {
         self.instance(instance)?.take(channel).map_err(fault)
+    }
+
+    fn beam_list(&mut self, instance: InstanceId, beam: u32) -> EngineResult<Vec<u32>> {
+        self.loaded_mut()?.beam_list(instance, beam).map_err(fault)
     }
 
     fn host_kv_layout(&self) -> Option<state::PageLayout> {

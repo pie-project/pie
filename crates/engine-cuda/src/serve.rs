@@ -885,6 +885,44 @@ impl Shell {
         self.programs.finish(pending)
     }
 
+    /// Beam `beam`'s page list of instance `id`'s beam group as its last
+    /// fire left it (`BEAM-PAGE-LISTS.md` §6.6): its state's lists are kept
+    /// twice by the fire count's parity (`channel.hip`), the last fire's at
+    /// `4 + (fired mod 2) * lanes * cap` words, `cap` columns a beam. Every
+    /// fire in flight lands first.
+    pub fn beam_list(&mut self, id: engine::InstanceId, beam: u32) -> Result<Vec<u32>> {
+        let (at, layout) = self.programs.beam_state(id).ok_or_else(|| {
+            crate::error::Fault::program(
+                "serve::beam_list",
+                format!("instance {id} binds no beam group (parents)"),
+            )
+        })?;
+        if beam >= layout.lanes {
+            return Err(crate::error::Fault::program(
+                "serve::beam_list",
+                format!("beam {beam} of a group of {}", layout.lanes),
+            ));
+        }
+        self.device.synchronize()?;
+        let mut header = [0u8; 16];
+        crate::device::copy_d2h(at, &mut header)?;
+        let fired = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+        if header[0] == 0 {
+            return Err(crate::error::Fault::program(
+                "serve::beam_list",
+                format!("instance {id}'s beam group has fired no step yet"),
+            ));
+        }
+        let (lanes, cap) = (u64::from(layout.lanes), u64::from(layout.cap));
+        let row = (4 + u64::from(fired & 1) * lanes * cap + u64::from(beam) * cap) * 4;
+        let mut bytes = vec![0u8; cap as usize * 4];
+        crate::device::copy_d2h(at + row, &mut bytes)?;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+            .collect())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn bind_program(
         &mut self,
@@ -951,8 +989,8 @@ impl Shell {
         program: engine::ProgramId,
         extents: eta_exec::Extents,
     ) -> Result<engine::GuestState> {
-        let (per_instance, per_pair) = self.programs.state_bytes(program, extents)?;
-        self.pools.guest_state(per_instance, per_pair)
+        let (per_instance, resident, per_pair) = self.programs.state_bytes(program, extents)?;
+        self.pools.guest_state(per_instance, resident, per_pair)
     }
 
     /// What an instance of `program` keeps in the pool's `Instance` and

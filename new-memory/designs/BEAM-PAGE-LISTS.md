@@ -65,8 +65,17 @@ rs buffer, on the same pool pages as its kv slots.
 - `s_t`: the slot every beam writes at fire `t` (`s_0 = folded`). Column
   `c_t = s_t / S - f0`, offset `o_t = s_t % S`. Entry `j` of a list covers
   slots `[(f0 + j) S, (f0 + j + 1) S)`.
-- `P` (list width): columns a list may hold, `P = ceil(reserved / S) - f0`
-  bounds it; an engine may size by its context pages (`pages_per_slot`).
+- `end`: the slot past the search's last row (`folded` plus its fires), the
+  depth the guest states at the bind (`state-geometry.parents-end`, required
+  with `parents`, refused by name without it; the SDK's `BeamGroup::geometry`
+  states `folded + steps`). It reaches the engine as the bind's `key_len`
+  (the most keys a lane reads).
+- Readout rows: one figure, the instance's. A group's instance reads its `B`
+  beams' rows (the bind's per-instance readout rows, `b` for the group), one
+  a lane; every engine checks its readout seats against that figure.
+- `P` (list width): columns a list may hold, `ceil(end / S)` pages a beam,
+  laid for the bind's depth, never the context's. A search whose rows pass
+  `end` faults `SHORT` by name (§6.5).
 - A pool page `q` is the set's page `f0 + q` of every paged plane the set
   holds: its kv pages and, on a hybrid (§11), its rs buffer pages, one
   reservation for both. `Q_t` below counts pool pages, each priced at the
@@ -95,11 +104,24 @@ rs buffer, on the same pool pages as its kv slots.
     fired          u32   fires run; 0 until the first fire primes
     pool           u32   the pool's pages at the last fire
 
-Stated in `engine::GuestState::resident`, part of the instance's bytes at
-its bind extents (bind to unbind; `scratch` and `scratch_arms` unchanged):
-`B*P*4 + (F + 1)*ceil(Q/32)*4 + 16` bytes, by the engine's bounds on `P`
-and `Q` (an engine may hold a word where a bit is stated, and may keep two
-copies of `map` to reorder in place). It is one copy, device-owned, changed
+It is the instance's **resident state** (`engine::GuestState::resident`),
+sized by the engine's `guest_state(program, extents)` from the bind's
+`key_len` (`end`, §3), never in the per-program instance item (one program
+binds searches of many depths): `B*P*4 + (F + 1)*ceil(Q/32)*4 + 16` bytes, by
+the engine's bounds on `P` and `Q` (`Q <= B P + B (F + 1) + 1`; an engine may
+hold a word where a bit is stated, and may keep two copies of `map` to
+reorder in place). The runtime takes it at the bind as a live part of the
+instance: one run of adjacent `Instance` slots, at most a chunk (past one the
+bind is refused by name), priced in the ledger at the bind like any guest
+slot and named to the engine as `InstanceBinding::resident`. It is not the
+guest's scratch, which is dead between fires and given back on a park. A
+park copies the resident run wherever the instance's tables go (the host,
+else the disk tier's slot file) and the unpark copies it back into fresh
+device slots, named in `Rebind::Instance::resident`; the engine clears it
+once, at the bind, follows it to wherever a rebind names, and clears nothing
+there. So it stands from the bind to the search's finish. engine-cuda lays
+the group's state at the start of that run; engine-gpu, Metal and XLA state
+the same bytes as resident and read them where the binding names. It is one copy, device-owned, changed
 only by head kernels in queue order: never part of what an engine
 double-buffers for fires in flight, and never touched by staging a later
 fire on the host. It is pool-relative: it never names a physical page, so
@@ -188,12 +210,21 @@ every lane, faulted or not. A faulted lane fails its fire by name
 (`Overreach: lane b's page list ...`); the others proceed.
 
 **6.6 Finish.** A search ends when the guest names its chosen beam `b*`
-(`group.finish(b*)`) after its last fire lands: the runtime reads
-`map[b*][0..=c]` once (the search's one host read, off the per-fire path)
-and re-lists the set, its page `f0 + j` becoming pool page `map[b*][j]` of
-every plane for `j <= c`; every other pool page is released. The set then
-holds the chosen hypothesis at slots `[folded, s_T + 1)` in its own order,
-and later passes bind it as any set (no `parents`).
+(`forward-pass.adopt-beam(b*, end)`, `group.finish`) after its last fire
+lands: the runtime reads `map[b*][0..=c]` once (the search's one host read,
+off the per-fire path, behind the pass's fires on the engine's lane) and
+re-lists the set, its page `f0 + j` becoming pool page `map[b*][j]` of every
+plane for `j <= c` (on a hybrid, its rs entries slot by slot through
+`σ_{b*}`, §11); every other pool page is let go once the fires that may read
+it retire. Nothing is copied. The set then holds the chosen hypothesis at
+slots `[folded, end)` in its own order, and later passes bind it as any set
+(no `parents`; a hybrid folds the rows by an ordinary pass that folds them).
+
+`map` is the last fire's: its beams are those the last fire read, before its
+epilogue picked the next parents. A guest whose final pick is beam `l` of
+that epilogue (its hypothesis the parent's plus one token no fire fed)
+adopts `b* = parent[l]`, whose pages hold every row of that hypothesis.
+`end = folded + fires` (each fire writes one slot a beam).
 
 ## 7. Faults (one word a lane, read at settle)
 
@@ -235,8 +266,19 @@ widths 2, 4, 8; at least `3S` steps from a `folded` with `tail > 0` and one
 with `tail == 0`; parents drawn with forks (repeated parents) and
 retirements (beams no child continues). After every step the device's
 `map` (columns `<= c`), `free`, `pending`, the copies it made and the
-resolved table entries equal the replay's; and a run suspended and restored
-mid-search continues with beams identical to an unsuspended run.
+resolved table entries equal the replay's.
+
+Parked mid-search: the runtime's roles take the resident run live (the
+roles test: with a host tier and with none, a parked instance's resident run
+is copied out whole, copied back from where it went into a fresh run that is
+neither its old one nor another instance's, the engine told that run, and
+nothing of the scratch copied). Served, the `test-pause` worker policy
+pauses a process from `pause-at-ms` after its arrival: beam `--verify` at
+width 4 over 256 steps, paused inside the search (MI300X Qwen3-0.6B: +200,
++300 and +450 ms; one process and four at once; a host tier, and a pool
+with none whose disk tier holds it) finishes verified, its resident run back
+in other slots each time. The same pause with the state in the scratch, or
+with its copy left out, faults the next fire by name (`Overreach`).
 
 A hybrid case runs beside it: widths 2, 4, 8 from a `folded` with
 `tail > 0` and one with `tail == 0`, rs pages of `T` = 1, 2 and 4 rows from

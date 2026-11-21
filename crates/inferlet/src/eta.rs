@@ -477,6 +477,9 @@ pub struct StateGeometry<'a> {
     /// `[lanes]` u32: per lane, the beam of the fire before it continues; the
     /// engine keeps the beams' own page lists (`forward.wit`, `crate::beam`).
     pub parents: Option<&'a Channel>,
+    /// With `parents`, the slot past the search's last row: the depth its
+    /// page lists are laid for (`crate::beam::BeamGroup::geometry`).
+    pub parents_end: Option<u32>,
 }
 
 impl StateGeometry<'_> {
@@ -655,6 +658,14 @@ impl ForwardPass {
     }
 
     /// Puts lane `lane` in attention group `id`.
+    /// A beam search's finish: once this pass's last fire has landed, its
+    /// working set holds beam `beam`'s hypothesis at its slots
+    /// `[folded, end)`, in its own order, and the other beams' pages are let
+    /// go (`BEAM-PAGE-LISTS.md` §6.6; [`crate::beam::BeamGroup::finish`]).
+    pub fn adopt_beam(&self, beam: u32, end: u32) -> Result<(), String> {
+        self.wit.adopt_beam(beam, end)
+    }
+
     pub fn group(&self, lane: u32, id: u32) -> Result<(), String> {
         if self.inner.borrow().program_attached {
             return Err("forward pass program is already attached".to_string());
@@ -750,6 +761,7 @@ impl ForwardPass {
                 kv_len: wits[2].as_deref(),
                 fold: wits[3].as_deref(),
                 parents: wits[4].as_deref(),
+                parents_end: geom.parents_end,
             },
         )?;
         let mut inner = self.inner.borrow_mut();

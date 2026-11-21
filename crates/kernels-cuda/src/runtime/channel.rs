@@ -871,3 +871,38 @@ pub fn beam_step(ctx: &Ctx, runs: DevicePtr, run_count: u32) -> Result<(), Error
         &[ArgValue::Ptr(runs), ArgValue::U32(run_count)],
     )
 }
+
+#[cfg(test)]
+mod kernel_names {
+    /// Every kernel a host wrapper here fires lies under the kernel file's
+    /// namespace and is defined there: a name the file does not hold builds
+    /// only where it is first fired (NVRTC / comgr at run time), so no check
+    /// catches it ("copy_rs_rows" was fired outside the CUDA file's
+    /// namespace and NVRTC refused it on the first hybrid beam).
+    #[test]
+    fn every_fired_kernel_is_defined_in_its_namespace() {
+        let wrappers = include_str!("channel.rs");
+        let kernels = include_str!("../../kernels/runtime/channel.cu");
+        let namespace = "::pie::runtime::channel::";
+        assert!(
+            kernels.contains("namespace pie::runtime::channel {"),
+            "the kernel file states namespace pie::runtime::channel"
+        );
+        let fired: Vec<&str> = wrappers
+            .split("kernel(FILE, \"")
+            .skip(1)
+            .filter_map(|rest| rest.split('"').next())
+            .collect();
+        assert!(!fired.is_empty(), "the wrappers fire kernels");
+        for name in fired {
+            let short = name.strip_prefix(namespace).unwrap_or_else(|| {
+                panic!("{name} is fired outside the kernel file's namespace {namespace}")
+            });
+            let entry = short.split('<').next().unwrap_or(short);
+            assert!(
+                kernels.contains(&format!("void {entry}(")),
+                "{name} is fired and the kernel file defines no {entry}"
+            );
+        }
+    }
+}

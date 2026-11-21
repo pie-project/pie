@@ -307,6 +307,7 @@ fn four_ranks_land_what_one_rank_lands() {
             .bind(
                 &mut group,
                 InstanceBinding {
+                    resident: Default::default(),
                     program,
                     channels: vec![latent, out],
                     seeds: Vec::new(),
@@ -316,7 +317,6 @@ fn four_ranks_land_what_one_rank_lands() {
                         row_count: n,
                         token_count: n,
                         sampled_rows: n,
-                        rows_per_lane: n,
                         query_len: n,
                         ..BindExtents::default()
                     },

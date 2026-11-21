@@ -64,6 +64,84 @@ struct PatchAt {
     seat: PatchSeat,
 }
 
+/// Where a fire's beam head step stages its records, and how many fit.
+#[derive(Debug, Clone, Copy, Default)]
+struct BeamAt {
+    groups: u64,
+    lists: u64,
+    copies: u64,
+    planes: u64,
+    trans: u64,
+    bases: u64,
+    faults: u64,
+    lanes: u64,
+    lists_cap: u64,
+    planes_cap: u64,
+    pages_cap: u64,
+}
+
+/// What a fire's beam groups stage ([`Inputs::stage_beam`]): every record
+/// laid by the caller with the addresses [`Inputs::beam_addresses`] gives.
+#[derive(Debug, Clone, Default)]
+pub struct BeamRecords {
+    pub groups: Vec<kernels_metal::runtime::beam::BeamStepRun>,
+    pub lists: Vec<kernels_metal::runtime::beam::BeamListRun>,
+    pub copies: Vec<kernels_metal::runtime::beam::PageCopyRun>,
+    pub planes: Vec<kernels_metal::runtime::beam::PagePlane>,
+    pub trans: Vec<i32>,
+    pub bases: Vec<u64>,
+    pub lanes: u32,
+}
+
+/// The GPU addresses a fire's beam records point into.
+#[derive(Debug, Clone, Copy)]
+pub struct BeamAddresses {
+    pub lists: u64,
+    pub trans: u64,
+    pub bases: u64,
+    pub faults: u64,
+}
+
+/// The staged records, as the head step's kernels bind them.
+#[derive(Debug, Clone, Copy)]
+pub struct BeamStaged {
+    pub groups: Tensor,
+    pub group_count: u32,
+    pub copies: Tensor,
+    pub planes: Tensor,
+    pub copy_count: u32,
+    pub plane_count: u32,
+}
+
+/// A fire's beam fault words, read once its command buffer completes
+/// (on the completion handler's thread): their host address in this arm's
+/// inputs, which no later fire writes before the flight is harvested.
+#[derive(Debug, Clone, Copy)]
+pub struct FaultReader {
+    at: usize,
+    words: usize,
+}
+
+// SAFETY: a shared heap's host alias, read only after the GPU completed the
+// fire that wrote it, and written again only by a fire staged on this arm
+// after the flight is harvested.
+unsafe impl Send for FaultReader {}
+unsafe impl Sync for FaultReader {}
+
+impl FaultReader {
+    /// The words, as the GPU left them.
+    #[must_use]
+    pub fn read(&self) -> Vec<u32> {
+        (0..self.words)
+            .map(|word| {
+                // SAFETY: `words` u32s lie at `at`, 4-aligned, mapped for the
+                // flight's life (see the `Send` impl).
+                unsafe { std::ptr::read_volatile((self.at as *const u32).add(word)) }
+            })
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct TableAt {
     indptr: u64,
@@ -401,6 +479,9 @@ pub struct Inputs {
     /// The group masks' room in the store, sized for the widest fire where
     /// the model packs attention groups ([`group_mask_bytes`]).
     group_masks: (u64, u64),
+    /// A fire's beam groups' head step (BEAM-PAGE-LISTS): its records and
+    /// arrays, and its fault words read at settle.
+    beam: BeamAt,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -434,6 +515,117 @@ impl Inputs {
     #[must_use]
     pub fn rs_page_ints(&self) -> u32 {
         self.rs_page_ints
+    }
+
+    /// The GPU addresses of table `table`'s staged indices, write pages
+    /// and write offsets: what a beam group's head step overwrites.
+    #[must_use]
+    pub fn table_addresses(&self, table: usize) -> Option<(u64, u64, u64)> {
+        let at = self.page_tables.get(table)?;
+        let view = self.store.view();
+        Some((
+            view.address_at(self.store.at(at.indices))?,
+            view.address_at(self.store.at(at.write_page))?,
+            view.address_at(self.store.at(at.write_offset))?,
+        ))
+    }
+
+    /// Where a fire's beam records point: its list runs, pool page ids,
+    /// page base addresses and fault words.
+    #[must_use]
+    pub fn beam_addresses(&self) -> Option<BeamAddresses> {
+        let view = self.store.view();
+        let at = |offset: u64| view.address_at(self.store.at(offset));
+        Some(BeamAddresses {
+            lists: at(self.beam.lists)?,
+            trans: at(self.beam.trans)?,
+            bases: at(self.beam.bases)?,
+            faults: at(self.beam.faults)?,
+        })
+    }
+
+    /// Stages a fire's beam records, its fault words zeroed; `None` where
+    /// it has no group. A fire past the area is refused by name.
+    pub fn stage_beam(
+        &mut self,
+        handles: &crate::device::Handles,
+        records: &BeamRecords,
+    ) -> Result<Option<BeamStaged>> {
+        use kernels_metal::runtime::beam::bytes;
+        if records.groups.is_empty() {
+            return Ok(None);
+        }
+        let b = self.beam;
+        let fits = |what: &'static str, need: usize, have: u64| -> Result<()> {
+            if need as u64 > have {
+                return Err(Fault::Ceiling {
+                    what,
+                    need: need as u64,
+                    have,
+                });
+            }
+            Ok(())
+        };
+        fits("beam groups in one fire", records.groups.len(), b.lanes)?;
+        fits("beam lanes in one fire", records.lanes as usize, b.lanes)?;
+        fits("beam copies in one fire", records.copies.len(), b.lanes)?;
+        fits("beam list runs in one fire", records.lists.len(), b.lists_cap)?;
+        fits("kv planes a beam page copy spans", records.planes.len(), b.planes_cap)?;
+        fits("beam pool pages in one fire", records.trans.len(), b.pages_cap)?;
+        fits("beam pool pages copied in one fire", records.bases.len(), b.pages_cap)?;
+        self.store.write(b.groups, &bytes(&records.groups))?;
+        self.store.write(b.lists, &bytes(&records.lists))?;
+        self.store.write(b.copies, &bytes(&records.copies))?;
+        self.store.write(b.planes, &bytes(&records.planes))?;
+        self.store.write(b.trans, &bytes(&records.trans))?;
+        self.store.write(b.bases, &bytes(&records.bases))?;
+        self.store.write(b.faults, &vec![0u8; records.lanes as usize * 4])?;
+        let view = self.store.view();
+        let bind = |offset: u64, count: usize, size: usize| -> Result<Tensor> {
+            let len = (count.max(1) * size) as u64;
+            let handle = handles.bind(view, self.store.at(offset), len)?;
+            Ok(Tensor::new(handle, count.max(1) as u32, size as u32, Dtype::U8))
+        };
+        use kernels_metal::runtime::beam::{BeamStepRun, PageCopyRun, PagePlane};
+        Ok(Some(BeamStaged {
+            groups: bind(b.groups, records.groups.len(), std::mem::size_of::<BeamStepRun>())?,
+            group_count: records.groups.len() as u32,
+            copies: bind(b.copies, records.copies.len(), std::mem::size_of::<PageCopyRun>())?,
+            planes: bind(b.planes, records.planes.len(), std::mem::size_of::<PagePlane>())?,
+            copy_count: records.copies.len() as u32,
+            plane_count: records.planes.len() as u32,
+        }))
+    }
+
+    /// A reader of the fire's `lanes` beam fault words, for its completion
+    /// handler. The words lie in one host run (they are taken together).
+    pub fn beam_fault_reader(&self, lanes: u32) -> Result<FaultReader> {
+        let mut at = None;
+        let len = u64::from(lanes) * 4;
+        self.store.walk(self.beam.faults, len, |address, done, take| {
+            if done == 0 && take == len {
+                at = Some(address.as_ptr() as usize);
+            }
+        })?;
+        let at = at.ok_or(Fault::Ceiling {
+            what: "one host run holding a fire's beam fault words",
+            need: len,
+            have: 0,
+        })?;
+        Ok(FaultReader {
+            at,
+            words: lanes as usize,
+        })
+    }
+
+    /// The fire's `lanes` beam fault words, after it lands.
+    pub fn beam_faults(&self, lanes: u32) -> Result<Vec<u32>> {
+        let mut raw = vec![0u8; lanes as usize * 4];
+        self.store.read(self.beam.faults, &mut raw)?;
+        Ok(raw
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -555,6 +747,28 @@ impl Inputs {
             group_mask_bytes(ragged, budget.max_tokens, budget.max_lanes)
         };
         let group_masks = (take(mask_bytes), mask_bytes);
+        // The beam head step: a group, a copy and a fault word at most a
+        // lane; a list a lane a table; a page a lane's table holds plus
+        // the pages a fire hands out and holds pending (BEAM-PAGE-LISTS §3).
+        let beam = {
+            use kernels_metal::runtime::beam::{BeamListRun, BeamStepRun, PageCopyRun, PagePlane};
+            let lists_cap = lanes * page_tables.len().max(1) as u64;
+            let planes_cap = 1024u64;
+            let pages_cap = pages + lanes * 16 + 64;
+            BeamAt {
+                groups: take(lanes * std::mem::size_of::<BeamStepRun>() as u64),
+                lists: take(lists_cap * std::mem::size_of::<BeamListRun>() as u64),
+                copies: take(lanes * std::mem::size_of::<PageCopyRun>() as u64),
+                planes: take(planes_cap * std::mem::size_of::<PagePlane>() as u64),
+                trans: take(pages_cap * 4),
+                bases: take(pages_cap * 8),
+                faults: take(lanes * 4),
+                lanes,
+                lists_cap,
+                planes_cap,
+                pages_cap,
+            }
+        };
         let total = at;
 
         // Laid in the activation span with the fire's other staged regions
@@ -599,6 +813,7 @@ impl Inputs {
             rs_pages,
             rs_page_ints,
             group_masks,
+            beam,
         })
     }
 
@@ -689,6 +904,11 @@ impl Inputs {
     #[must_use]
     pub fn tokens_seat(&self) -> (&Buffer, u64) {
         (self.store.view(), self.store.at(self.tokens))
+    }
+
+    /// Where the staged rotations (each row's RoPE position) lie.
+    pub fn rotations_seat(&self) -> (&Buffer, u64) {
+        (self.store.view(), self.store.at(self.rotations))
     }
 
     pub fn store_mut(&mut self) -> &mut Region {

@@ -124,6 +124,9 @@ pub struct StateBinding {
     pub fold: Option<u32>,
     /// Per lane, the beam it continues (`forward.wit` `state-geometry.parents`).
     pub parents: Option<u32>,
+    /// With `parents`, the slot past the search's last row: its depth, which
+    /// the bind lays its group's page lists for (`state-geometry.parents-end`).
+    pub parents_end: Option<u32>,
 }
 
 #[derive(Default)]

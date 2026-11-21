@@ -1673,6 +1673,17 @@ impl PreparedLoad<'_> {
                         .unwrap_or(u32::MAX),
                 );
                 plane.set_capture(capture_bytes);
+                // A beam group's lists span at most a sequence's pages, and
+                // a page it frees waits out the frames in flight.
+                plane.set_beam_bounds(
+                    paging.pages_per_slot,
+                    u32::try_from(arms).unwrap_or(u32::MAX),
+                );
+                // A decode envelope's positions ride the device where its
+                // rows rotate by them alone (no host-built mrope table): a
+                // pass whose epilogue advances them (a beam group's) stages
+                // ahead like any decode.
+                plane.set_device_positions(!states_mrope);
                 plane
             },
             written: engine::extent::Written::default(),
@@ -2273,8 +2284,15 @@ impl Shell {
         self.pipelines.save_archive(path)
     }
 
-    /// Seals the pipelines built ([`Shell::warm_pipelines`]).
+    /// Seals the pipelines built ([`Shell::warm_pipelines`]), the beam
+    /// head step's with them: any decode envelope may state parents
+    /// (BEAM-PAGE-LISTS), and no fire builds a pipeline after ready.
     pub fn seal_pipelines(&self) {
+        for fire in kernels_metal::runtime::beam::pipelines() {
+            if let Err(fault) = self.pipelines.warm(&self.device, fire) {
+                tracing::warn!(%fault, "metal: the beam head step's pipeline did not build");
+            }
+        }
         self.pipelines.seal();
     }
 
@@ -3287,6 +3305,13 @@ impl Shell {
         answer
     }
 
+    /// Beam `beam`'s page list of instance `id`'s beam group, as its last
+    /// fire left it (`Engine::beam_list`): every fire in flight lands first.
+    pub fn beam_list(&mut self, id: engine::InstanceId, beam: u32) -> Result<Vec<u32>> {
+        self.drain()?;
+        self.programs.beam_list(id, beam)
+    }
+
     pub fn drain(&mut self) -> Result<()> {
         while !self.inflight.is_empty() {
             self.harvest_one()?;
@@ -3400,6 +3425,11 @@ impl Shell {
                     faulted.push((lanes.clone(), *instance, fault.to_string()));
                 }
             }
+        }
+        if waited.is_ok()
+            && let Some(check) = flight.beam_check.as_ref()
+        {
+            faulted.extend(beam_faulted(check));
         }
         // The sink hears the fire here, the buffer complete and its
         // epilogues settled, before the harvest returns.
@@ -4049,6 +4079,10 @@ impl Shell {
         // Each resolved envelope's instance, by the same index.
         let mut resolved_of: Vec<engine::InstanceId> = Vec::new();
         let mut envelope_of: Vec<Option<(usize, usize)>> = vec![None; lanes.len()];
+        // A decode envelope's beam groups (`crate::beam`): each one's
+        // parents cell, state and lanes; and each lane's group.
+        let mut beam_groups: Vec<crate::beam::Group> = Vec::new();
+        let mut group_of: Vec<Option<usize>> = vec![None; lanes.len()];
         if !attachments.is_empty() {
             let instances: Vec<engine::InstanceId> =
                 attachments.iter().map(|a| a.instance).collect();
@@ -4104,6 +4138,42 @@ impl Shell {
                         ));
                     }
                     envelope_of[first + lane] = Some((held, lane));
+                }
+                if let Some((cell, at)) = self.programs.parents_cell(attached.instance)? {
+                    let Some((state, layout)) = self.programs.beam_state(attached.instance)? else {
+                        return Err(Fault::program(
+                            "serve::prepare",
+                            format!(
+                                "instance {} states parents and holds no beam state",
+                                attached.instance
+                            ),
+                        ));
+                    };
+                    let parents = cell.address_at(at).ok_or_else(|| {
+                        Fault::program(
+                            "serve::prepare",
+                            format!("instance {}'s parents cell has no address", attached.instance),
+                        )
+                    })?;
+                    if carried as u32 != layout.lanes {
+                        return Err(Fault::program(
+                            "serve::prepare",
+                            format!(
+                                "instance {} states parents for {} beam(s) and runs {carried}                                  lane(s); every beam runs every fire",
+                                attached.instance, layout.lanes
+                            ),
+                        ));
+                    }
+                    for lane in 0..carried {
+                        group_of[first + lane] = Some(beam_groups.len());
+                    }
+                    beam_groups.push(crate::beam::Group {
+                        instance: attached.instance,
+                        parents,
+                        state,
+                        layout,
+                        lanes: Vec::new(),
+                    });
                 }
                 resolved.push(envelope);
                 resolved_of.push(attached.instance);
@@ -4344,6 +4414,9 @@ impl Shell {
         // Token rows copied from a cell on the device before the forward:
         // the row, and the cell's buffer and byte offset.
         let mut token_feeds: Vec<(u32, crate::device::Buffer, u64)> = Vec::new();
+        // Rotation rows copied from a positions cell on the device before
+        // the forward: the row, and the cell's buffer and byte offset.
+        let mut position_feeds: Vec<(u32, crate::device::Buffer, u64)> = Vec::new();
         let mut positions: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut rotations: Vec<i32> = Vec::with_capacity(rows as usize);
         // Each row's stated position, the mrope table's fill where a row
@@ -4454,6 +4527,15 @@ impl Shell {
             state_ids.extend_from_slice(&record);
             if fresh {
                 beginning.push(record.clone());
+            }
+            if let Some(group) = group_of[source] {
+                beam_groups[group].lanes.push(crate::beam::GroupLane {
+                    source,
+                    seat: seats.len(),
+                    row_offset: row.row_offset,
+                    have,
+                    rows: row.rows,
+                });
             }
             seats.push(Seat {
                 slot: lane.slot,
@@ -4763,7 +4845,31 @@ impl Shell {
                     let rows: Vec<i32> = (0..rows_here)
                         .map(|at| narrow(u64::from(have) + at as u64))
                         .collect();
-                    let stated: Vec<i32> = match ports.positions_for(have, rows_here)? {
+                    // Positions its program computes in a channel: copied
+                    // from the cell on the device, never read here.
+                    let position_cell = match envelope_of[source] {
+                        Some((held, at)) => resolved_of
+                            .get(held)
+                            .and_then(|&instance| self.programs.positions_cell(instance).transpose())
+                            .transpose()?
+                            .map(|(buffer, cell)| (buffer, cell + 4 * at as u64)),
+                        None => None,
+                    };
+                    if position_cell.is_some() && rows_here != 1 {
+                        return Err(Fault::program(
+                            "serve::prepare",
+                            format!(
+                                "lane {source} carries its positions on the device and {rows_here} \
+                                 rows; a decode envelope's lane states one position a row, one row"
+                            ),
+                        ));
+                    }
+                    let stated: Vec<i32> = match position_cell
+                        .is_none()
+                        .then(|| ports.positions_for(have, rows_here))
+                        .transpose()?
+                        .flatten()
+                    {
                         Some(stated) => stated.iter().map(|&at| narrow(u64::from(at))).collect(),
                         None if !seated.positions.is_empty() => seated
                             .positions
@@ -4775,6 +4881,9 @@ impl Shell {
                     // The causal bound is the row order, the cache row; a
                     // stated position rotates the row and bounds nothing.
                     positions.extend(&rows);
+                    if let Some((buffer, cell)) = position_cell {
+                        position_feeds.push((rotations.len() as u32, buffer, cell));
+                    }
                     rotations.extend(if self.states_mrope { &rows } else { &stated });
                     stated_rows.extend(&stated);
                     match &device_writes[source] {
@@ -4965,6 +5074,54 @@ impl Shell {
             }
         }
         let geometries = geometries;
+        // The beam groups' head step, planned over the tables as staged
+        // (BEAM-PAGE-LISTS §6): its records point into this arm's inputs.
+        let (beam_records, beam_faults) = if beam_groups.is_empty() || self.warming {
+            (crate::inputs::BeamRecords::default(), Vec::new())
+        } else {
+            for group in &mut beam_groups {
+                group.lanes.sort_by_key(|lane| lane.source);
+            }
+            let inputs = &self.inputs[self.arena.current()][arm];
+            let addresses = inputs.beam_addresses().ok_or_else(|| {
+                Fault::program("serve::prepare", "the beam step's inputs have no address")
+            })?;
+            let tables = (0..geometries.len())
+                .map(|table| {
+                    inputs.table_addresses(table).ok_or_else(|| {
+                        Fault::program(
+                            "serve::prepare",
+                            format!("page table {table} has no staged address"),
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let staged = crate::beam::Staged {
+                indptr: geometries.iter().map(|geometry| geometry.indptr.as_slice()).collect(),
+                tables,
+                windowed: self
+                    .pools
+                    .tables()
+                    .iter()
+                    .any(|paging_of| *paging_of != crate::store::TablePaging::List),
+                page: self.pools.paging().page_size,
+                addresses,
+                planes: self.pools.kv_page_planes(),
+            };
+            let pools = &self.pools;
+            crate::beam::plan(
+                &beam_groups,
+                &staged,
+                &|source| lanes[source].translation.to_vec(),
+                &|source| lanes[source].folded,
+                &mut |refs| {
+                    for &page in refs {
+                        pools.admit_list_page(page)?;
+                    }
+                    Ok((pools.kv_pages(refs, None)?, pools.kv_page_addresses(refs)?))
+                },
+            )?
+        };
         let pages = geometries
             .first()
             .map_or(0, |geometry| geometry.indices.len() as u32);
@@ -5375,6 +5532,14 @@ impl Shell {
             },
         )?;
         windows.bind(&self.handles, bound.windows)?;
+        let (beam, beam_check) = if beam_records.groups.is_empty() {
+            (None, None)
+        } else {
+            let inputs = &mut self.inputs[self.arena.current()][arm];
+            let staged = inputs.stage_beam(&self.handles, &beam_records)?;
+            let reader = inputs.beam_fault_reader(beam_records.lanes)?;
+            (staged, Some((reader, beam_faults)))
+        };
         let group_masks = self.inputs[self.arena.current()][arm]
             .stage_group_masks(&self.handles, &group_masks)?;
 
@@ -5524,12 +5689,15 @@ impl Shell {
         };
 
         Ok(Prepared {
+            beam,
+            beam_check,
             zeroed,
             capture_rows,
             ends,
             lanes,
             input_feeds,
             token_feeds,
+            position_feeds,
             merge_lands,
             attachments,
             done,
@@ -5694,6 +5862,18 @@ impl Shell {
     /// Copies each token row a pass in flight put into the fire's token
     /// seat, on the device, ahead of the forward: the queue runs it after
     /// that pass, so the cell holds its token by then.
+    fn feed_positions(&self, frame: &mut Frame, p: &Prepared<'_>) -> Result<()> {
+        if p.position_feeds.is_empty() {
+            return Ok(());
+        }
+        let (seat, base) = self.inputs[self.arena.current()][p.arm].rotations_seat();
+        for (row, buffer, cell) in &p.position_feeds {
+            frame.copy_span(buffer, *cell, seat, base + 4 * u64::from(*row), 4)?;
+        }
+        frame.next_pass()?;
+        Ok(())
+    }
+
     fn feed_tokens(&self, frame: &mut Frame, p: &Prepared<'_>) -> Result<()> {
         if p.token_feeds.is_empty() {
             return Ok(());
@@ -5877,7 +6057,35 @@ impl Shell {
         }
         self.feed_inputs(&mut frame, p)?;
         self.feed_tokens(&mut frame, p)?;
+        self.feed_positions(&mut frame, p)?;
         self.land_merges(&mut frame, p)?;
+        if !dry && let Some(beam) = p.beam {
+            // The beam groups' head step (BEAM-PAGE-LISTS §6): reorder and
+            // resolve, then the forks' tail copies, ahead of every append
+            // and read of the fire, in its own command buffer.
+            #[cfg(target_vendor = "apple")]
+            frame.next_pass()?;
+            {
+                let sink = Sink::new(&self.device, &frame, &self.pipelines, &self.handles);
+                kernels_metal::runtime::beam::beam_step(&sink, beam.groups, beam.group_count)
+                    .map_err(crate::error::kernel)?;
+            }
+            #[cfg(target_vendor = "apple")]
+            frame.next_pass()?;
+            {
+                let sink = Sink::new(&self.device, &frame, &self.pipelines, &self.handles);
+                kernels_metal::runtime::beam::beam_copy_pages(
+                    &sink,
+                    beam.copies,
+                    beam.planes,
+                    beam.copy_count,
+                    beam.plane_count,
+                )
+                .map_err(crate::error::kernel)?;
+            }
+            #[cfg(target_vendor = "apple")]
+            frame.next_pass()?;
+        }
         {
             let sink = Sink::new(&self.device, &frame, &self.pipelines, &self.handles);
             #[cfg(target_vendor = "apple")]
@@ -6021,6 +6229,12 @@ impl CaptureLayout {
 pub struct CaptureRows(Vec<(u32, engine::InstanceId)>);
 
 pub struct Prepared<'a> {
+    /// The fire's beam groups' head step, staged in its arm's inputs
+    /// (`crate::beam`); `None` where it has none.
+    beam: Option<crate::inputs::BeamStaged>,
+    /// Its fault words' reader and, a word each, the lane and instance it
+    /// faults.
+    beam_check: Option<(crate::inputs::FaultReader, Vec<(usize, engine::InstanceId)>)>,
     /// Where this fire's capturing lanes' score rows lie.
     capture_rows: CaptureRows,
     /// The fresh state records its lanes begin, zeroed at the head of its
@@ -6034,6 +6248,8 @@ pub struct Prepared<'a> {
     /// Token rows a pass in flight puts: the row, and its cell
     /// ([`Shell::feed_tokens`]).
     token_feeds: Vec<(u32, crate::device::Buffer, u64)>,
+    /// Rotation rows copied from a positions cell before the forward.
+    position_feeds: Vec<(u32, crate::device::Buffer, u64)>,
     merge_lands: Vec<MergeLand>,
     attachments: &'a [Attached],
     done: Option<Done>,
@@ -6071,6 +6287,8 @@ pub struct Enqueued<'a> {
     /// What the harvest tells the completion sink, where the engine settles
     /// inside submit.
     told: Option<Told>,
+    /// The beam fault words the harvest reads, where it tells the sink.
+    beam_check: Option<(crate::inputs::FaultReader, Vec<(usize, engine::InstanceId)>)>,
     step: PhantomData<&'a ()>,
 }
 
@@ -6115,6 +6333,24 @@ struct Flight {
     attached: Vec<(engine::InstanceId, std::ops::Range<u32>)>,
     readbacks: Vec<Option<(String, u32, u64)>>,
     told: Option<Told>,
+    beam_check: Option<(crate::inputs::FaultReader, Vec<(usize, engine::InstanceId)>)>,
+}
+
+/// The lanes a fire's beam fault words fault (BEAM-PAGE-LISTS §7).
+fn beam_faulted(
+    check: &(crate::inputs::FaultReader, Vec<(usize, engine::InstanceId)>),
+) -> Vec<Faulted> {
+    let (reader, lanes) = check;
+    reader
+        .read()
+        .into_iter()
+        .zip(lanes)
+        .filter(|(word, _)| *word != 0)
+        .map(|(word, &(lane, instance))| {
+            let at = u32::try_from(lane).unwrap_or(u32::MAX);
+            (at..at + 1, instance, crate::beam::fault_reason(word, lane))
+        })
+        .collect()
 }
 
 /// A fire's word to its completion sink, given why its buffer failed, or
@@ -6270,8 +6506,9 @@ impl engine::frame::Shell for Shell {
         // (one pass airborne an instance, so nothing commits between); the
         // harvest commits it on this thread when the runtime publishes the
         // landed step (`Engine::publish_landed`).
-        let (in_handler, at_harvest) = if self.arms.depth() == 1 {
-            (None, Some(tell))
+        let beam_check = prepared.beam_check.take();
+        let (in_handler, at_harvest, beam_at_harvest, beam_in_handler) = if self.arms.depth() == 1 {
+            (None, Some(tell), beam_check, None)
         } else {
             let checks: Vec<(std::ops::Range<u32>, engine::InstanceId, Option<_>)> = attached
                 .iter()
@@ -6279,7 +6516,7 @@ impl engine::frame::Shell for Shell {
                     (lanes.clone(), *instance, self.programs.epilogue_check(*instance))
                 })
                 .collect();
-            (Some((tell, checks)), None)
+            (Some((tell, checks)), None, None, beam_check)
         };
         let pending = frame.commit_async(Some(Box::new(move |refused: Option<String>| {
             counts.leave();
@@ -6301,6 +6538,11 @@ impl engine::frame::Shell for Shell {
                     {
                         faulted.push((lanes.clone(), *instance, why));
                     }
+                }
+                if refused.is_none()
+                    && let Some(check) = beam_in_handler.as_ref()
+                {
+                    faulted.extend(beam_faulted(check));
                 }
                 tell(refused, &faulted);
             }
@@ -6325,6 +6567,7 @@ impl engine::frame::Shell for Shell {
             attached,
             readbacks,
             told: at_harvest,
+            beam_check: beam_at_harvest,
             step: PhantomData,
         })
     }
@@ -6342,6 +6585,7 @@ impl engine::frame::Shell for Shell {
             attached,
             readbacks,
             told,
+            beam_check,
             step: _,
         } = enqueued;
         self.arms.take(arm);
@@ -6354,6 +6598,7 @@ impl engine::frame::Shell for Shell {
             attached,
             readbacks,
             told,
+            beam_check,
         });
         Ok(Landed {
             seq,
