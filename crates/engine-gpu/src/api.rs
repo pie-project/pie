@@ -278,10 +278,14 @@ impl<B: Host> Gpu<B> {
     /// lane's where it carries no prompt). `None` where it is admitted.
     fn admit_step(&mut self, step: &Step, at: engine::StepDone) -> Option<Error> {
         let shell = self.shell.as_mut()?;
+        // The fires landed so far move the scale this step is read at
+        // (`crate::submit::Measured`).
+        shell.track();
         let held = shell.submit_bound()?;
         let rows = crate::submit::StepRows::of(step);
         let admitted = held.admit(rows);
         let (whole, per_layer) = held.step_ns(rows);
+        let raw = held.raw_ns(rows).0;
         tracing::debug!(
             frame = at.frame.0,
             step = at.step,
@@ -293,7 +297,13 @@ impl<B: Host> Gpu<B> {
             estimate_ms = whole / 1e6,
             per_layer_ms = per_layer / 1e6,
             worst = held.worst,
-            scale = held.scale,
+            probe_scale = held.scale,
+            measured_worst = held.measured.worst(),
+            measured_fires = held.measured.len(),
+            stored_ratio = held.stored_ratio(),
+            error = held.error_now(),
+            floor_factor = held.floor_factor(),
+            ratio = held.ratio_now(),
             bound_ms = held.bound_ns / 1e6,
             split = admitted.split(),
             refused = matches!(admitted, crate::submit::Admitted::Refused { .. }),
@@ -322,7 +332,73 @@ impl<B: Host> Gpu<B> {
             ));
         }
         shell.split_next(admitted.split());
+        shell.estimate_next(Some(crate::submit::Estimated {
+            ns: raw,
+            at,
+            rows: rows.rows,
+            lanes: rows.lanes,
+            pieces: match admitted {
+                crate::submit::Admitted::Layers { submissions, .. } => submissions,
+                _ => 1,
+            },
+            hz: None,
+        }));
         None
+    }
+
+    /// Under a stated submit bound, `step` cut by the rows of its one
+    /// prompt lane where it is past the bound even a layer at a time
+    /// (`crate::submit::row_pieces`): its leading pieces and its last, each
+    /// admitted ([`SubmitBound::rows_a_piece`]). `None` where it is
+    /// admitted as it is, where no bound is stated, or where it cannot be
+    /// cut (then refused by name as it is admitted, the reason said here).
+    ///
+    /// [`SubmitBound::rows_a_piece`]: crate::submit::SubmitBound::rows_a_piece
+    fn cut_by_rows(&mut self, step: &Step) -> Option<(Vec<Step>, Step)> {
+        let shell = self.shell.as_mut()?;
+        shell.track();
+        let held = shell.submit_bound()?;
+        let rows = crate::submit::StepRows::of(step);
+        if !matches!(held.admit(rows), crate::submit::Admitted::Refused { .. }) {
+            return None;
+        }
+        let prompt_rows = step
+            .lanes
+            .iter()
+            .map(engine::fire::Lane::rows)
+            .filter(|&rows| rows > 1)
+            .max()?;
+        let Some(piece_rows) = held.rows_a_piece(rows, prompt_rows) else {
+            tracing::warn!(
+                rows = rows.rows,
+                keys = rows.keys,
+                "submit bound: one row of one layer of a step is past the bound; refused by name"
+            );
+            return None;
+        };
+        match crate::submit::row_pieces(step, &shell.trace().facts, piece_rows) {
+            Ok(cut) => {
+                tracing::debug!(
+                    rows = rows.rows,
+                    keys = rows.keys,
+                    piece_rows,
+                    pieces = cut.0.len() + 1,
+                    ratio = held.ratio_now(),
+                    "submit bound: a step past the bound a layer at a time cut by rows"
+                );
+                Some(cut)
+            }
+            Err(why) => {
+                tracing::warn!(
+                    rows = rows.rows,
+                    keys = rows.keys,
+                    %why,
+                    "submit bound: a step past the bound a layer at a time cannot be cut by rows; \
+                     refused by name"
+                );
+                None
+            }
+        }
     }
 
     #[must_use]
@@ -983,8 +1059,7 @@ where
             guest_cost: {
                 let rates = crate::backend::Tactics::profile(shell.tuning()).rates();
                 engine::GuestCost {
-                    submit_bound_ns: crate::rates::stated_submit_bound()
-                        .map(|bound| u64::try_from(bound.as_nanos()).unwrap_or(u64::MAX)),
+                    submit_bound_ns: shell.submit_bound().map(|held| held.bound_ns as u64),
                     launch_ns: rates.launch_ns,
                     elementwise_gbps: rates.elementwise_gbps,
                 }
@@ -1528,8 +1603,41 @@ where
             };
             // Held to the platform's bound on one submission, where it
             // states one (`crate::submit`): a step past it whole walks a
-            // layer at a time; past it even so, its lanes are refused by
-            // name. Nothing is estimated where no bound is stated.
+            // layer at a time; past it even so, its prompt lane is cut by
+            // rows, its leading pieces fired first, each alone and held
+            // to the bound in turn; a step no row of which fits, or that
+            // cannot be cut, has its lanes refused by name. Nothing is
+            // estimated where no bound is stated.
+            let cut = self.cut_by_rows(step);
+            let mut piece_failed = None;
+            for piece in cut.iter().flat_map(|(leading, _)| leading) {
+                if self.admit_step(piece, at).is_some() {
+                    // Chosen to fit: refused only past what was weighed;
+                    // the step is refused as a whole, by name.
+                    piece_failed = self.admit_step(step, at);
+                    break;
+                }
+                // A piece tells no completion: the step's last piece does.
+                let fired = self.fire_step(piece, at, true, None);
+                if let Some(shell) = self.shell.as_mut() {
+                    shell.split_next(false);
+                    shell.estimate_next(None);
+                }
+                if let Err(error) = fired {
+                    piece_failed = Some(error);
+                    break;
+                }
+            }
+            if let Some(error) = piece_failed {
+                if error.stops_frame_at(index) {
+                    refused = Some(error);
+                    break;
+                }
+                self.pending = None;
+                self.count_built();
+                return Err(error);
+            }
+            let step = cut.as_ref().map_or(step, |(_, last)| last);
             if let Some(refused_lanes) = self.admit_step(step, at) {
                 if refused_lanes.stops_frame_at(index) {
                     refused = Some(refused_lanes);
@@ -1542,6 +1650,7 @@ where
             let fired = B::step(self, step, at);
             if let Some(shell) = self.shell.as_mut() {
                 shell.split_next(false);
+                shell.estimate_next(None);
             }
             match fired {
                 Ok((ticket, step_pending)) => {

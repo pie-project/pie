@@ -142,6 +142,18 @@ impl Context {
         match self.never {}
     }
 
+    pub fn timed_frame(&self, _stamps: &Stamps) -> Result<Frame> {
+        match self.never {}
+    }
+
+    pub fn stamps(&self, _sets: u32) -> Result<Stamps> {
+        match self.never {}
+    }
+
+    pub fn spanned_into(&self, _stamps: &Stamps) -> Result<Frame> {
+        match self.never {}
+    }
+
     #[must_use]
     pub fn idle(&self) -> bool {
         match self.never {}
@@ -212,6 +224,9 @@ impl Frame {
 
 pub use engine_gpu::backend::OnDone;
 
+#[derive(Clone, Debug)]
+pub enum Stamps {}
+
 #[derive(Debug)]
 pub struct Pending {
     never: std::convert::Infallible,
@@ -220,6 +235,11 @@ pub struct Pending {
 impl Pending {
     #[must_use]
     pub fn landed(&self) -> bool {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn device_time(&self) -> engine_gpu::submit::DeviceTime {
         match self.never {}
     }
 

@@ -17,6 +17,22 @@ mod backend {
     /// The backend's engine.
     pub type Engine = engine_gpu::api::Gpu<Api>;
 
+    /// A timed step's frame committed as a serving step is (kept and
+    /// replayed where `keep`), and its device time read as the harvest reads
+    /// it, from its timestamps once its fence was waited.
+    pub fn fired_time(frame: engine_vulkan::device::Frame, keep: bool) -> Option<u64> {
+        let pending = if keep {
+            frame
+                .into_kept()
+                .and_then(|kept| kept.replay(None))
+                .expect("the kept frame replays")
+        } else {
+            frame.commit_async(None).expect("the frame is submitted")
+        };
+        pending.wait().expect("the frame lands");
+        pending.span_ns().expect("its timestamps read")
+    }
+
     pub const NAME: &str = "vulkan";
     pub const PLATFORM: poem::Platform = poem::Platform::Vulkan;
     /// Kernels compile to SPIR-V: the register-tiled and cooperative-matrix
