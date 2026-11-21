@@ -1180,9 +1180,10 @@ pub fn rates_at_load(
             let existing = std::fs::read_to_string(&save.path).ok().map(|text| {
                 let (kept, dropped) = save.registry.prune(&text);
                 for key in dropped {
-                    eprintln!(
-                        "user profile {}: dropped `{key}`, no longer read",
-                        save.path.display()
+                    tracing::warn!(
+                        profile = %save.path.display(),
+                        key = %key,
+                        "user profile: dropped a key this pie no longer reads"
                     );
                 }
                 kept
