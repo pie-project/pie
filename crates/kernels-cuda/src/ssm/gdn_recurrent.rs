@@ -400,3 +400,60 @@ mod tests {
         assert_eq!(fused_seats(Some(167_936), 2), (4, 2));
     }
 }
+
+/// Folds each beam group's fold rows (`BEAM-PAGE-LISTS.md` §11.3, `carry`'s
+/// planes `[b | a]`, keys, `u`) into its gated-delta state, as a decode step
+/// folds a token and stores it, the state stored once.
+/// The groups that fold lead `folds` (`groups` entries at most, the first of
+/// no rows ending them); a block folds each in turn, so a fire none of whose
+/// groups folds costs one read a block.
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_fold(
+    ctx: &Ctx,
+    state: &RecurrentPool,
+    k_heads: u32,
+    v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    dt_bias: Tensor,
+    a_log: Tensor,
+    carry: &Carry,
+    folds: Tensor,
+    groups: u32,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.gated_delta group fold";
+    const BLOCK: u32 = 256;
+    if groups == 0 {
+        return Ok(());
+    }
+    dtype_dispatch!(OP, dt_bias.dtype, { Bf16 => () });
+    debug_assert_eq!(a_log.dtype, Dtype::F32, "`{OP}` reads an f32 decay bank");
+    if k_dim > 128 || !k_dim.is_multiple_of(16) || !v_dim.is_multiple_of(16) || v_heads % k_heads.max(1) != 0 {
+        return Err(refuse(
+            OP,
+            format!(
+                "a fold holds a value tile of a head's {k_dim} key rows (at most 128, in 16s) \
+                 and {v_dim}-wide values in 16-column tiles, over {v_heads} value heads \
+                 sharing {k_heads} key heads"
+            ),
+        ));
+    }
+    let rows = state.rows(OP, state.slab, state.slot_stride_elems, v_heads)?;
+    ctx.fire(
+        OP,
+        Fire::at(kernel(GDN_RECURRENT, "::pie::ssm::gdn_fold"))
+            .apply(Launch::grid([v_heads, 1, 1], [BLOCK, 1, 1])),
+        &[
+            rows.arg(),
+            dt_bias.arg(),
+            a_log.arg(),
+            stated(OP, k_heads)?.arg(),
+            stated(OP, v_heads)?.arg(),
+            stated(OP, k_dim)?.arg(),
+            stated(OP, v_dim)?.arg(),
+            carry.arg(),
+            folds.arg(),
+            stated(OP, groups)?.arg(),
+        ],
+    )
+}

@@ -1080,4 +1080,80 @@ __global__ void kda_chunked(
     }
 }
 
+// A beam group's fold of its KDA state (BEAM-PAGE-LISTS §11.3): its fold rows
+// (forget rows, keys and `u`: planes 0, 2 and 3, through the representative
+// lane's pages) folded in order, `M <- M diag(alpha) + u k^T` as a decode
+// step folds a committed row, and the rows stored once. A block a (head,
+// slice `blockIdx.z` of value rows), folding the groups in turn (the folding
+// ones lead the table; the first of no rows ends it), a warp four
+// value rows in registers as `kda_step_carried` holds them.
+template <class ElemT, int kPer>
+__global__ void kda_fold(
+    StateRows rows,
+    const float* __restrict__ A_log,
+    const float* __restrict__ dt_bias,
+    float lower_bound,
+    float eps,
+    int H, int D,
+    Carry carry,
+    const GroupFold* __restrict__ folds,
+    int groups)
+{
+    constexpr int kRows = 4;
+    using Vec = Packed<kPer>;
+    const int h = blockIdx.x;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int per = (D + gridDim.z - 1) / gridDim.z;
+    const int v0 = blockIdx.z * per;
+    const int v1 = min(D, v0 + per);
+    const int k0 = lane * kPer;
+    const int base = v0 + warp * kRows;
+    if (base >= v1) return;
+    const float a = __expf(A_log[h]);
+    for (int g = 0; g < groups; ++g) {
+        const GroupFold f = folds[g];
+        const int n = static_cast<int>(f.rows);
+        if (n <= 0) break;
+        const int rl = static_cast<int>(f.lane);
+        const i32* rid = rows.row(rl);
+        if (rid[0] < 0) continue;
+        const CarryLane cl = carry.lane(rl);
+        float* st = rows.atom<float>(rid, h, (long long)D * D);
+        float s[kRows][kPer];
+        #pragma unroll
+        for (int j = 0; j < kRows; ++j) {
+            if (base + j < v1) Vec::load(s[j], st + (long long)(base + j) * D + k0);
+        }
+        for (int t = 0; t < n; ++t) {
+            u64 slot;
+            u32 tok;
+            carry.fold_at(cl, f.fold_off, t, slot, tok);
+            const ElemT* kr = carry.plane_at<const ElemT>(slot, tok, 2) + (long long)h * D;
+            const ElemT* fr = carry.plane_at<const ElemT>(slot, tok, 0) + (long long)h * D;
+            const float* ur = carry.plane_at<const float>(slot, tok, 3) + (long long)h * D + base;
+            float kk[kPer], al[kPer];
+            float ss = 0.f;
+            #pragma unroll
+            for (int i = 0; i < kPer; ++i) {
+                kk[i] = Elem<ElemT>::to_f32(kr[k0 + i]);
+                ss += kk[i] * kk[i];
+                al[i] = __expf(kda_log_gate(
+                    Elem<ElemT>::to_f32(fr[k0 + i]) + dt_bias[(long long)h * D + k0 + i], a, lower_bound));
+            }
+            const float inv = rsqrtf(::pie::warp_sum(ss) + eps);
+            #pragma unroll
+            for (int j = 0; j < kRows; ++j) {
+                const float uj = base + j < v1 ? ur[j] : 0.f;
+                #pragma unroll
+                for (int i = 0; i < kPer; ++i) s[j][i] = s[j][i] * al[i] + uj * kk[i] * inv;
+            }
+        }
+        #pragma unroll
+        for (int j = 0; j < kRows; ++j) {
+            if (base + j < v1) Vec::store(st + (long long)(base + j) * D + k0, s[j]);
+        }
+    }
+}
+
 }

@@ -581,4 +581,64 @@ __global__ void __launch_bounds__(128) mamba2_scan(
     }
 }
 
+// A beam group's fold of its Mamba-2 state (BEAM-PAGE-LISTS §11.3): its fold
+// rows (step sizes and `x | B`: planes 0 and 1, through the representative
+// lane's pages) folded in order, `S <- a S + (dt x) B^T`, `a = exp(-exp(A_log)
+// dt)`, as a decode step folds a committed row, and the state stored once. A
+// block a head, folding the groups in turn (the folding ones lead the table;
+// the first of no rows ends it), `mamba2_step_carried`'s layout.
+__global__ void __launch_bounds__(256) mamba2_fold(
+    StateRows rows,
+    const float* __restrict__ A_log,
+    const float* __restrict__ dt_bias,
+    int H, int G,
+    Carry carry,
+    const GroupFold* __restrict__ folds,
+    int groups)
+{
+    constexpr int ROWS = M2_P / 8;
+    const int h = blockIdx.x;
+    const int inner = H * M2_P;
+    const int gi = h / (H / G);
+    const int warp = threadIdx.x >> 5;
+    const int l = threadIdx.x & 31;
+    const float ea = __expf(A_log[h]);
+    const float bias = dt_bias[h];
+    for (int g = 0; g < groups; ++g) {
+        const GroupFold f = folds[g];
+        const int n = static_cast<int>(f.rows);
+        if (n <= 0) break;
+        const int rl = static_cast<int>(f.lane);
+        const i32* rid = rows.row(rl);
+        if (rid[0] < 0) continue;
+        const CarryLane cl = carry.lane(rl);
+        float4* st = reinterpret_cast<float4*>(
+            rows.atom<float>(rid, h, static_cast<long long>(M2_P) * M2_N)) + threadIdx.x;
+        float4 s[ROWS];
+        #pragma unroll
+        for (int q = 0; q < ROWS; ++q) s[q] = __ldcs(st + q * 256);
+        for (int j = 0; j < n; ++j) {
+            u64 slot;
+            u32 tok;
+            carry.fold_at(cl, f.fold_off, j, slot, tok);
+            const bf16* xb = carry.plane_at<const bf16>(slot, tok, 1);
+            const uint2 bj = *reinterpret_cast<const uint2*>(xb + inner + gi * M2_N + 4 * l);
+            const float xj = l < ROWS ? __bfloat162float(xb[h * M2_P + l * 8 + warp]) : 0.f;
+            const float sj = m2_dt(__bfloat162float(carry.plane_at<const bf16>(slot, tok, 0)[h]), bias);
+            const float decay = __expf(-ea * sj);
+            const float2 j01 = gdn_unpack(bj.x), j23 = gdn_unpack(bj.y);
+            #pragma unroll
+            for (int q = 0; q < ROWS; ++q) {
+                const float dx = sj * __shfl_sync(0xffffffffu, xj, q);
+                s[q].x = s[q].x * decay + dx * j01.x;
+                s[q].y = s[q].y * decay + dx * j01.y;
+                s[q].z = s[q].z * decay + dx * j23.x;
+                s[q].w = s[q].w * decay + dx * j23.y;
+            }
+        }
+        #pragma unroll
+        for (int q = 0; q < ROWS; ++q) __stcs(st + q * 256, s[q]);
+    }
+}
+
 }

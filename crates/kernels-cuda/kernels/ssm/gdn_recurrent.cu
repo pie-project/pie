@@ -1091,4 +1091,88 @@ __global__ void __launch_bounds__(W * 32) gdn_tail_corrected(
     }
 }
 
+// A beam group's fold of its gated-delta state (BEAM-PAGE-LISTS §11.3): its
+// fold rows (gates from `[b | a]`, keys and `u`: planes 0, 1 and 2, through
+// the representative lane's pages) folded in order as a decode step folds a
+// token and stores it, `S <- bf16(bf16(g S) + k^ u^T)`, and the state stored
+// once. A block a head, folding the groups in turn (the folding ones lead the
+// table; the first of no rows ends it), a warp a value tile (sixteen columns,
+// `gdn_step_fused`'s layout).
+__global__ void __launch_bounds__(256) gdn_fold(
+    StateRows rows,
+    const bf16* __restrict__ dt_bias,
+    const float* __restrict__ a_log,
+    int K_h, int V_h, int K_d, int V_d,
+    Carry carry,
+    const GroupFold* __restrict__ folds,
+    int groups)
+{
+    constexpr int MR = 8;
+    constexpr int VEC = 8;
+    const int h = blockIdx.x;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = blockDim.x >> 5;
+    const int i0 = lane >> 1;
+    const int vts = V_d / 16;
+    const int h_k = h / (V_h / K_h);
+    for (int g = 0; g < groups; ++g) {
+        const GroupFold f = folds[g];
+        const int n = static_cast<int>(f.rows);
+        if (n <= 0) break;
+        const int rl = static_cast<int>(f.lane);
+        const i32* rid = rows.row(rl);
+        if (rid[0] < 0) continue;
+        const CarryLane cl = carry.lane(rl);
+        for (int vt = warp; vt < vts; vt += warps) {
+            const int j0 = vt * 16 + (lane & 1) * VEC;
+            __nv_bfloat16* cell = rows.atom<__nv_bfloat16>(rid, h, (long long)K_d * V_d) + j0;
+            float s[MR][VEC];
+            #pragma unroll
+            for (int m = 0; m < MR; ++m) {
+                if (16 * m < K_d) {
+                    const uint4 raw = *reinterpret_cast<const uint4*>(cell + (long long)(i0 + 16 * m) * V_d);
+                    const unsigned* w32 = reinterpret_cast<const unsigned*>(&raw);
+                    #pragma unroll
+                    for (int u = 0; u < 4; ++u) {
+                        const float2 p2 = gdn_unpack(w32[u]);
+                        s[m][2 * u] = p2.x;
+                        s[m][2 * u + 1] = p2.y;
+                    }
+                } else {
+                    #pragma unroll
+                    for (int u = 0; u < VEC; ++u) s[m][u] = 0.f;
+                }
+            }
+            for (int j = 0; j < n; ++j) {
+                u64 slot;
+                u32 tok;
+                carry.fold_at(cl, f.fold_off, j, slot, tok);
+                float ki[MR];
+                gdn_keys(carry.plane_at<const bf16>(slot, tok, 1) + (long long)h_k * K_d, i0, K_d, 1.f, ki);
+                const float gj = __expf(gdn_log_gate(carry.plane_at<const bf16>(slot, tok, 0), h, V_h, dt_bias, a_log));
+                float uu[VEC];
+                gdn_u8(carry.plane_at<const float>(slot, tok, 2) + (long long)h * V_d + j0, uu);
+                #pragma unroll
+                for (int m = 0; m < MR; ++m) {
+                    #pragma unroll
+                    for (int u = 0; u < VEC; ++u) {
+                        const float sg = __bfloat162float(__float2bfloat16(s[m][u] * gj));
+                        s[m][u] = __bfloat162float(__float2bfloat16(sg + ki[m] * uu[u]));
+                    }
+                }
+            }
+            #pragma unroll
+            for (int m = 0; m < MR; ++m) {
+                if (16 * m >= K_d) break;
+                uint4 packed;
+                unsigned* w32 = reinterpret_cast<unsigned*>(&packed);
+                #pragma unroll
+                for (int u = 0; u < 4; ++u) w32[u] = pack_bf16x2(s[m][2 * u], s[m][2 * u + 1]);
+                *reinterpret_cast<uint4*>(cell + (long long)(i0 + 16 * m) * V_d) = packed;
+            }
+        }
+    }
+}
+
 }
