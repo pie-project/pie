@@ -1076,6 +1076,26 @@ impl<'a, B: Serve> Rig<'a, B> {
     }
 }
 
+/// The call a rate's reading names where it is impossible: a frame timed
+/// below its own dispatches' measured launches ([`engine::rates::rate_from`]).
+/// No measurement, and no fault of the device: the sample is repeated
+/// ([`repeated`]), and where every repeat is so, a curve's point is left
+/// unmeasured ([`dropped`]) and a single rate refused by name.
+const IMPLAUSIBLE: &str = "rates: a reading below its launches";
+
+/// `measure` repeated while its reading is impossible ([`IMPLAUSIBLE`]): the
+/// same sample, up to [`REPEATS`] times; the last reading kept.
+fn repeated<T>(mut measure: impl FnMut() -> Result<T>) -> Result<T> {
+    let mut last = measure();
+    for _ in 1..REPEATS {
+        match &last {
+            Err(Fault::Device { call, .. }) if *call == IMPLAUSIBLE => last = measure(),
+            _ => break,
+        }
+    }
+    last
+}
+
 /// `measured` where its step measured; `None` where a single fire of its
 /// shape was past the device's bound on one submission: that frame was
 /// refused by name (never submitted), and the step drops the shape, as the
@@ -1087,6 +1107,11 @@ fn dropped<B: Serve, T>(
 ) -> Result<Option<T>> {
     match measured {
         Ok(v) => Ok(Some(v)),
+        Err(Fault::Device { call, why }) if call == IMPLAUSIBLE => {
+            tracing::info!(why = %why, "rates: every repeat of a point read below its launches; the point is left unmeasured");
+            say(&format!("[rates]: unmeasured ({why}, every repeat)"));
+            Ok(None)
+        }
         Err(e) => match rig.past_bound.borrow_mut().take() {
             Some(step) => {
                 tracing::debug!(step = %step, why = %e, "dropped: past the bound");
@@ -1688,11 +1713,11 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     // The launch first: every rate below takes its dispatches' launches off.
     let (bytes_per_ns, launch_ns) = match (want.launch, stated.hbm_gbps, stated.launch_ns) {
         (false, Some(bytes), Some(launch)) => (bytes, launch),
-        _ => {
-            let measured = copy_and_launch(&mut rig, tactics.gemm(tier, LAUNCH), timer, say)?;
+        _ => repeated(|| {
+            let measured = copy_and_launch(&mut rig, tactics.gemm(tier, LAUNCH), timer, say);
             rig.release();
             measured
-        }
+        })?,
     };
     let launch = launch_ns as f64;
     let (side, warmed, walk_worst) = warm(&mut rig, &|rows| tactics.gemm(tier, rows), timer)?;
@@ -1710,8 +1735,11 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     for w in engine::rates::GEMM_WIDTHS.into_iter().filter(|_| want.gemm) {
         let mut curve = Vec::new();
         for m in engine::rates::GEMM_ROWS {
-            let rate = matmul(&mut rig, tactics.gemm(tier, m), timer, (m, w, w), launch);
-            rig.release();
+            let rate = repeated(|| {
+                let rate = matmul(&mut rig, tactics.gemm(tier, m), timer, (m, w, w), launch);
+                rig.release();
+                rate
+            });
             let Some(rate) = dropped(&rig, rate, say)? else {
                 continue;
             };
@@ -1779,16 +1807,19 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     };
     for keys in attn_keys {
         let shape = engine::rates::ATTN_SHAPE.at(keys);
-        let rate = attention(
-            &mut rig,
-            tactics,
-            tier,
-            timer,
-            shape,
-            launch,
-            Kind::Attention,
-        );
-        rig.release();
+        let rate = repeated(|| {
+            let rate = attention(
+                &mut rig,
+                tactics,
+                tier,
+                timer,
+                shape,
+                launch,
+                Kind::Attention,
+            );
+            rig.release();
+            rate
+        });
         let Some(rate) = dropped(&rig, rate, say)? else {
             continue;
         };
@@ -1806,16 +1837,19 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         .filter(|&d| want.attn && d != 128)
     {
         let shape = engine::rates::ATTN_SHAPE.at(longest).with_dim(d);
-        let rate = attention(
-            &mut rig,
-            tactics,
-            tier,
-            timer,
-            shape,
-            launch,
-            Kind::Attention,
-        );
-        rig.release();
+        let rate = repeated(|| {
+            let rate = attention(
+                &mut rig,
+                tactics,
+                tier,
+                timer,
+                shape,
+                launch,
+                Kind::Attention,
+            );
+            rig.release();
+            rate
+        });
         let Some(rate) = dropped(&rig, rate, say)? else {
             continue;
         };
@@ -1852,16 +1886,19 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
                     keys,
                     ..engine::rates::ATTN_SHAPE
                 };
-                let rate = attention(
-                    &mut rig,
-                    tactics,
-                    tier,
-                    timer,
-                    shape,
-                    launch,
-                    Kind::Prefixed,
-                );
-                rig.release();
+                let rate = repeated(|| {
+                    let rate = attention(
+                        &mut rig,
+                        tactics,
+                        tier,
+                        timer,
+                        shape,
+                        launch,
+                        Kind::Prefixed,
+                    );
+                    rig.release();
+                    rate
+                });
                 let Some(rate) = dropped(&rig, rate, say)? else {
                     break;
                 };
@@ -1877,16 +1914,22 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         }
     }
     let elementwise = if want.elementwise {
-        let gbps = elementwise(&mut rig, timer, launch)?;
-        rig.release();
+        let gbps = repeated(|| {
+            let gbps = elementwise(&mut rig, timer, launch);
+            rig.release();
+            gbps
+        })?;
         say(&format!("[rates]: per-row ops: {gbps:.0} GB/s"));
         Some(gbps)
     } else {
         None
     };
     let scan = if want.scan {
-        let gelems = scan(&mut rig, tactics.recurrent(), timer, SCAN_SHAPE, launch)?;
-        rig.release();
+        let gelems = repeated(|| {
+            let gelems = scan(&mut rig, tactics.recurrent(), timer, SCAN_SHAPE, launch);
+            rig.release();
+            gelems
+        })?;
         Some(gelems)
     } else {
         None
@@ -2041,7 +2084,10 @@ fn elementwise<B: Serve>(rig: &mut Rig<'_, B>, timer: Timer<'_, B>, launch: f64)
         launch,
         engine::rates::elementwise_bytes(),
     )
-    .map_err(|why| Fault::Device { call: "rates", why })
+    .map_err(|why| Fault::Device {
+        call: IMPLAUSIBLE,
+        why,
+    })
 }
 
 /// The device warmed ([`engine::rates::warm_up`]): rotations of a cube
@@ -2275,8 +2321,10 @@ fn matmul<B: Serve>(
         .map(|_| rig.operand(n, k, Dtype::Bf16))
         .collect::<Result<Vec<Tensor>>>()?;
     let y = rig.zeros(m, n, Dtype::Bf16)?;
-    matmul_on(rig, tactic, timer, (act, &weights, y), None, launch)?
-        .map_err(|why| Fault::Device { call: "rates", why })
+    matmul_on(rig, tactic, timer, (act, &weights, y), None, launch)?.map_err(|why| Fault::Device {
+        call: IMPLAUSIBLE,
+        why,
+    })
 }
 
 /// [`matmul`] over operands laid already: `act` (its rows the matmul's),
@@ -2453,7 +2501,10 @@ fn attention<B: Serve, T: Tactics + ?Sized>(
         launch,
         attn_flops(s),
     )
-    .map_err(|why| Fault::Device { call: "rates", why })
+    .map_err(|why| Fault::Device {
+        call: IMPLAUSIBLE,
+        why,
+    })
 }
 
 /// The recurrent rate at [`SCAN_SHAPE`]: the causal conv over the scan's
@@ -2543,7 +2594,10 @@ fn scan<B: Serve>(
         launch,
         scan_elements(s),
     )
-    .map_err(|why| Fault::Device { call: "rates", why })
+    .map_err(|why| Fault::Device {
+        call: IMPLAUSIBLE,
+        why,
+    })
 }
 
 /// `(bytes a ns, a dispatch's ns)`: a copy of device memory, and the
@@ -2675,7 +2729,10 @@ fn copy_and_launch<B: Serve>(
         launch as f64,
         2.0 * copy as f64,
     )
-    .map_err(|why| Fault::Device { call: "rates", why })?;
+    .map_err(|why| Fault::Device {
+        call: IMPLAUSIBLE,
+        why,
+    })?;
     Ok((bytes, launch))
 }
 
