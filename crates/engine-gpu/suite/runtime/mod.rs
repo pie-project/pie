@@ -3,6 +3,7 @@ mod bf16_values;
 mod bool_gather;
 mod bool_moves;
 mod fold;
+mod folded_roots;
 mod guest_state;
 mod hosted;
 mod lane_refusal;
