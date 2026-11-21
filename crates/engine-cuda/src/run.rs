@@ -1424,11 +1424,13 @@ impl<'c> Run<'c> {
 
     /// Holds the fire's group folds back while a fused step's primitives
     /// run its layer, the fused step having folded them already.
+    #[cfg(feature = "rocm")]
     pub(crate) fn suspend_group_folds(&mut self) -> Option<(u64, u32)> {
         self.rs.as_mut().and_then(|seat| seat.folds.take())
     }
 
     /// Restores what [`Run::suspend_group_folds`] held back.
+    #[cfg(feature = "rocm")]
     pub(crate) fn resume_group_folds(&mut self, folds: Option<(u64, u32)>) {
         if let (Some(seat), Some(folds)) = (self.rs.as_mut(), folds) {
             seat.folds = Some(folds);

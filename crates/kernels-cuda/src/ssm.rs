@@ -217,3 +217,84 @@ fn f32_state(op: &'static str, state: &RecurrentPool) -> Result<(), Error> {
     }
     Ok(())
 }
+
+/// A beam group's fold (`BEAM-PAGE-LISTS.md` §11.3, as `kernels-rocm`'s
+/// `ssm::GroupFold`): its representative lane (any of its lanes; they share
+/// the set's state), where its fold rows start in the replay table, and how
+/// many. The fold kernels read a device table of them, one a group; a group
+/// of no rows folds nothing.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GroupFold {
+    pub lane: u32,
+    pub fold_off: u32,
+    pub rows: u32,
+}
+
+const _: () = assert!(size_of::<GroupFold>() == 12);
+
+// WIP (§11.3): the group folds' CUDA launches are the L40S's to write; until
+// they land each refuses by name, never a fold skipped.
+
+/// Folds each group's rows into its conv window (§11.3).
+#[allow(clippy::too_many_arguments)]
+pub fn conv1d_fold(
+    _ctx: &Ctx,
+    _state: &RecurrentPool,
+    _channels: u32,
+    _conv_width: u32,
+    _dilation: u32,
+    _carry: &Carry,
+    _folds: Tensor,
+    _groups: u32,
+) -> Result<(), Error> {
+    Err(Error::Unsupported { op: "ssm.causal_conv1d group fold" })
+}
+
+/// Folds each group's rows into its gated-delta state (§11.3).
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_fold(
+    _ctx: &Ctx,
+    _state: &RecurrentPool,
+    _k_heads: u32,
+    _v_heads: u32,
+    _k_dim: u32,
+    _v_dim: u32,
+    _dt_bias: Tensor,
+    _a_log: Tensor,
+    _carry: &Carry,
+    _folds: Tensor,
+    _groups: u32,
+) -> Result<(), Error> {
+    Err(Error::Unsupported { op: "ssm.gated_delta group fold" })
+}
+
+/// Folds each group's rows into its KDA state (§11.3).
+#[allow(clippy::too_many_arguments)]
+pub fn kda_fold(
+    _ctx: &Ctx,
+    _state: &RecurrentPool,
+    _heads: u32,
+    _head_dim: u32,
+    _norm_eps: f32,
+    _gate_floor: f32,
+    _dt_bias: Tensor,
+    _a_log: Tensor,
+    _carry: &Carry,
+    _folds: Tensor,
+    _groups: u32,
+) -> Result<(), Error> {
+    Err(Error::Unsupported { op: "ssm.kda group fold" })
+}
+
+/// Folds each group's rows into its Mamba-2 state (§11.3).
+pub fn mamba2_fold(
+    _ctx: &Ctx,
+    _state: &RecurrentPool,
+    _m: Mamba2,
+    _carry: &Carry,
+    _folds: Tensor,
+    _groups: u32,
+) -> Result<(), Error> {
+    Err(Error::Unsupported { op: "ssm.mamba2 group fold" })
+}
