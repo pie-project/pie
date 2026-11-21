@@ -484,8 +484,11 @@ async fn main(input: Input) -> Result<String> {
         let mut worst = 0f32;
         // The most of its room any step came to, by check.
         let (mut closest_own, mut closest) = (0f32, 0f32);
-        // The widest composition spread any step's rescore measured.
+        // The widest composition spread any step's rescore measured, the
+        // shape that measured it, and the widest the other shapes measured.
         let mut widest = 0f32;
+        let mut widest_by = "none";
+        let mut unshaped = 0f32;
         let shaped = replay_beam(&prompt, &first, &trail, b, pool_len).await?;
         for (lane, hypothesis) in hypotheses.iter().enumerate() {
             let alone = rescore(&prompt, hypothesis, b, &shaped[lane]).await?;
@@ -534,15 +537,20 @@ async fn main(input: Input) -> Result<String> {
                     + ulp_bf16(r.picked)
                     + ulp_bf16(r.largest)
                     + r.spread;
-                widest = widest.max(r.spread);
+                if r.spread > widest {
+                    widest = r.spread;
+                    widest_by = r.by;
+                }
+                unshaped = unshaped.max(r.unshaped);
                 let apart = (mine - r.step).abs();
                 closest = closest.max(apart / room);
                 if apart > room {
                     return Err(format!(
                         "beam {lane}'s fire took {mine:.4} at step {at}, and its hypothesis alone \
                          {:.4} there: {apart:.4} apart, past {room:.3} (composition spread \
-                         {:.4}); its recurrence or attention read another beam's cells",
-                        r.step, r.spread,
+                         {:.4}, widest from the {}, {:.4} without the beam-shaped replay); its \
+                         recurrence or attention read another beam's cells",
+                        r.step, r.spread, r.by, r.unshaped,
                     ));
                 }
                 before = after;
@@ -551,7 +559,7 @@ async fn main(input: Input) -> Result<String> {
             worst = worst.max((total - final_scores[lane]).abs());
         }
         format!(
-            " greedy_mismatches={greedy_mismatches} verified={} worst_apart={worst:.4} worst_own={closest_own:.3} worst_step={closest:.3} max_spread={widest:.4}",
+            " greedy_mismatches={greedy_mismatches} verified={} worst_apart={worst:.4} worst_own={closest_own:.3} worst_step={closest:.3} max_spread={widest:.4} spread_by={widest_by} unshaped_spread={unshaped:.4}",
             hypotheses.len()
         )
     } else {
@@ -591,12 +599,16 @@ fn best_of(scores: &[f32]) -> f32 {
 
 /// One step of a hypothesis rescored alone: its log-probability, target and
 /// largest logit as a 1-row fire, and how far its log-probability moved
-/// across the compositions a beam's fire may run in.
+/// across the compositions a beam's fire may run in: the widest, the shape
+/// that measured it, and the widest the shapes other than the search's own
+/// ([`replay_beam`]) measured.
 struct Rescored {
     step: f32,
     picked: f32,
     largest: f32,
     spread: f32,
+    by: &'static str,
+    unshaped: f32,
 }
 
 /// Each step of `hypothesis` after `prompt`, teacher-forced one token a fire
@@ -616,6 +628,16 @@ struct Rescored {
 /// else the server runs then, as the beam's fires did with theirs, and the
 /// two need not have met the same neighbours, so a composition the rescore
 /// did not meet can still move the beam's candidate past it.
+///
+/// The beam-shaped spread is measured on the search's own fire shapes, so
+/// it absorbs whatever those shapes compute deterministically: a kernel
+/// fault that a W-wide fire reproduces on every run widens the room by
+/// exactly what it moves, and passes as composition. The host-built mask
+/// catches parent and bookkeeping faults, not those; a W-shape kernel fault
+/// shows only against the width copies and the width-1 replay. The report
+/// names the shape that set the widest spread (`spread_by`) and the widest
+/// the other shapes measured (`unshaped_spread`), so a room held open by
+/// the beam-shaped replay alone is visible.
 async fn rescore(
     prompt: &[u32],
     hypothesis: &[u32],
@@ -635,11 +657,12 @@ async fn rescore(
             one.len()
         ));
     }
+    const SHAPES: [&str; 3] = ["width-copies", "width-1-replay", "beam-shaped-replay"];
     for (name, pass) in [
         ("1-row", &one),
-        ("width", &others[0]),
-        ("replay", &others[1]),
-        ("beam-shaped", &others[2]),
+        (SHAPES[0], &others[0]),
+        (SHAPES[1], &others[1]),
+        (SHAPES[2], &others[2]),
     ] {
         for (at, &(step, picked, largest)) in pass.iter().enumerate() {
             for value in [step, picked, largest] {
@@ -650,14 +673,28 @@ async fn rescore(
     Ok(one
         .iter()
         .enumerate()
-        .map(|(at, &(step, picked, largest))| Rescored {
-            step,
-            picked,
-            largest,
-            spread: others
+        .map(|(at, &(step, picked, largest))| {
+            let moved: Vec<f32> = others
                 .iter()
                 .map(|other| (other[at].0 - step).abs())
-                .fold(0.0, f32::max),
+                .collect();
+            // The first shape to reach the widest, the others before the
+            // search's own.
+            let (by, spread) =
+                SHAPES
+                    .iter()
+                    .zip(&moved)
+                    .fold(("none", 0f32), |(by, widest), (&shape, &m)| {
+                        if m > widest { (shape, m) } else { (by, widest) }
+                    });
+            Rescored {
+                step,
+                picked,
+                largest,
+                spread,
+                by,
+                unshaped: moved[0].max(moved[1]),
+            }
         })
         .collect())
 }
