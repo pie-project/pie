@@ -1152,6 +1152,7 @@ impl<'a> Walk<'a> {
                 "few_row_tflops" => &mut rates.few_row_tflops,
                 "workgroups_per_core" => &mut rates.workgroups_per_core,
                 crate::fire::SUBMIT_WORST_RATIO => &mut rates.submit_worst_ratio,
+                crate::fire::RESIDENT_WORKGROUPS => &mut rates.resident_workgroups,
                 "launch_ns" => {
                     match int(v.get_ref()).and_then(|i| u64::try_from(i).ok()) {
                         Some(ns) => rates.launch_ns = Some(ns),
@@ -1176,7 +1177,7 @@ impl<'a> Walk<'a> {
                              `attn_tflops_by_keys`, `hbm_gbps`, `cached_gbps`, `elementwise_gbps`, \
                              `scan_gelems`, `few_row_tflops`, `workgroups_per_core`, \
                              `tile_tflops_by_rows`, `vector_tflops_by_rows`, `product_ns`, \
-                             `submit_worst_ratio` and `attn_tflops_by_rows_keys`, not `{other}`"
+                             `submit_worst_ratio`, `attn_tflops_by_rows_keys` and `resident_workgroups`, not `{other}`"
                         ),
                     );
                     continue;

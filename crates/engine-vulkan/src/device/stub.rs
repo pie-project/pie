@@ -70,7 +70,15 @@ impl Context {
     }
 
     #[must_use]
-    pub fn cores(&self) -> u32 {
+    pub fn cores(&self) -> Option<u32> {
+        match self.never {}
+    }
+
+    pub fn resident(&self) -> Option<u32> {
+        match self.never {}
+    }
+
+    pub(crate) fn hold_resident(&self, _workgroups: u32) {
         match self.never {}
     }
 

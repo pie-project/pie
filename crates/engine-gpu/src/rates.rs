@@ -199,9 +199,12 @@ pub const KEYS: [&str; 8] = [
 ];
 
 /// The `[rates]` keys a load measures where its profile lacks one: the
-/// estimate's [`KEYS`], and where the platform states a bound on one
+/// estimate's [`KEYS`]; where the platform states a bound on one
 /// submission (`max_submit`) the margin a serving step is held to it at
-/// (`profile::fire::SUBMIT_WORST_RATIO`, `crate::submit`).
+/// (`profile::fire::SUBMIT_WORST_RATIO`, `crate::submit`); and the
+/// workgroups the device holds at once, which a guest step's grid strides
+/// over and, where the device states no count of its compute units, what
+/// sizes a fire's work to it (`profile::fire::RESIDENT_WORKGROUPS`).
 #[must_use]
 pub fn keys_at(max_submit: Option<std::time::Duration>) -> Vec<&'static str> {
     let mut keys = KEYS.to_vec();
@@ -209,6 +212,7 @@ pub fn keys_at(max_submit: Option<std::time::Duration>) -> Vec<&'static str> {
         keys.push(profile::fire::SUBMIT_WORST_RATIO);
         keys.push(profile::fire::ATTN_BY_ROWS_KEYS);
     }
+    keys.push(profile::fire::RESIDENT_WORKGROUPS);
     keys
 }
 
@@ -918,13 +922,15 @@ struct Wanted {
     attn: bool,
     elementwise: bool,
     scan: bool,
+    resident: bool,
 }
 
 impl Wanted {
-    fn of(stated: &Rates) -> Wanted {
-        let lacked = stated.missing(&KEYS);
+    fn of(stated: &Rates, keys: &[&'static str]) -> Wanted {
+        let lacked = stated.missing(keys);
         let lacks = |key: &str| lacked.contains(&key);
         Wanted {
+            resident: lacks(profile::fire::RESIDENT_WORKGROUPS),
             launch: lacks("launch_ns") || lacks("hbm_gbps"),
             gemm: lacks("gemm_tflops_by_rows"),
             vectors: lacks("vector_tflops_by_rows"),
@@ -948,7 +954,9 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
 ) -> Result<engine::rates::Measured> {
     // Only what `stated` lacks is timed; what it states stands in for the
     // rates the timed ones read (the launch, the bandwidth, the curve's peak).
-    let want = Wanted::of(stated);
+    // The keys a load asks for at this bound ([`keys_at`]), those `stated`
+    // lacks.
+    let want = Wanted::of(stated, &keys_at(max_submit));
     let mut rig = Rig::<B>::new(device, max_submit);
     // Under a stated bound, the probe first: every estimate grows from it.
     rig.lay_probe(tactics.gemm(tier, crate::submit::PROBE.0))?;
@@ -1061,6 +1069,38 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         }
     }
     tile_curves.sort_by_key(|(tile, _)| *tile);
+    // `resident_workgroups`: the workgroups the device holds at once, from
+    // the matmul curve's peak (its kernel compute-bound there) and one
+    // workgroup of the same kernel over the same depth.
+    let resident = if want.resident {
+        let w = engine::rates::GEMM_WIDTH;
+        let curve = gemm
+            .iter()
+            .find(|(width, _)| *width == w)
+            .map(|(_, curve)| curve.clone())
+            .or_else(|| {
+                stated
+                    .gemm_tflops_by_rows
+                    .iter()
+                    .flatten()
+                    .find(|(width, _)| *width == w)
+                    .map(|(_, curve)| curve.iter().map(|&(m, t)| (m, t * 1e3)).collect())
+            })
+            .ok_or_else(|| Fault::Device {
+                call: "rates",
+                why: format!(
+                    "no matmul curve at width {w} to measure the resident workgroups against"
+                ),
+            })?;
+        let measured = resident_workgroups(&mut rig, tactics, tier, timer, &curve, w, launch)?;
+        rig.release();
+        say(&format!(
+            "[rates]: resident workgroups: {measured:.1} (one workgroup of the matmul's peak kernel against its full rate)"
+        ));
+        Some(measured)
+    } else {
+        None
+    };
     // The attention curve at its own keys: from the narrowest whose shape
     // is compute-bound on this device (its matmul peak over its bandwidth),
     // whatever rows the matmul curve reached.
@@ -1249,6 +1289,7 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         vector_tflops_by_rows: (!vector_curves.is_empty()).then_some(vector_curves),
         product_ns: None,
         workgroups_per_core: None,
+        resident_workgroups: resident,
         // How much slower the device ran than its own measurements said:
         // like frames' drift, the clock's swing and its sustained drop
         // (`Rig::drift`, `sustained`): the margin a serving step's estimate
@@ -1556,6 +1597,53 @@ fn matmul<B: Serve>(
         gemm_flops(m, n, k),
     )
     .map_err(|why| Fault::Device { call: "rates", why })
+}
+
+/// The workgroups the device holds at once: the matmul `curve`'s peak
+/// rows (its kernel compute-bound there, at width `w`), the same kernel
+/// shrunk to one workgroup over the same depth, its time against the same
+/// work at the peak's rate. One workgroup runs at `1 / S` of the kernel's
+/// full rate (`engine::rates::workgroups_per_core`, the device as one).
+fn resident_workgroups<B: Serve, T: Tactics + ?Sized>(
+    rig: &mut Rig<'_, B>,
+    tactics: &T,
+    tier: kernels_slang::Tier,
+    timer: Timer<'_, B>,
+    curve: &[(u32, f64)],
+    w: u32,
+    launch: f64,
+) -> Result<f64> {
+    let refused = |why: String| Fault::Device { call: "rates", why };
+    let &(peak_rows, peak) = curve
+        .iter()
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .ok_or_else(|| refused("the matmul curve has no point".into()))?;
+    let tactic = tactics.gemm(tier, peak_rows);
+    let groups = |m: u32, n: u32| {
+        kernels_slang::linear::gemm::workgroups(B::TARGET, tactic, m, n, w)
+            .map_err(fault("rates: resident workgroups"))
+    };
+    let (mut m, mut n) = (peak_rows, w);
+    while groups(m, n)? > 1 {
+        let (wide, tall) = (groups(m, n.div_ceil(2))?, groups(m.div_ceil(2), n)?);
+        if n > 1 && wide < groups(m, n)? {
+            n = n.div_ceil(2);
+        } else if m > 1 && tall < groups(m, n)? {
+            m = m.div_ceil(2);
+        } else {
+            return Err(refused(format!(
+                "the {peak_rows}-row matmul's kernel launches {} workgroups at {m} x {n} x {w}, and no narrower shape of it launches fewer",
+                groups(m, n)?
+            )));
+        }
+    }
+    let one = matmul(rig, tactic, timer, (m, n, w), launch)?;
+    let flops = gemm_flops(m, n, w);
+    engine::rates::workgroups_per_core(1, 1, flops / one, flops / peak).ok_or_else(|| {
+        refused(format!(
+            "one workgroup of the {peak_rows}-row matmul ({m} x {n} x {w}) ran at {one} against {peak} at full width: no count of workgroups is made of it"
+        ))
+    })
 }
 
 /// The prefill attention's rate at `s`: one sequence of `s.rows` rows
@@ -1948,6 +2036,7 @@ mod wanted_tests {
             tile_tflops_by_rows: Some(vec![(32, vec![(4, 1.0)])]),
             vector_tflops_by_rows: Some(vec![(4, vec![(1, 0.5)])]),
             submit_worst_ratio: None,
+            resident_workgroups: None,
             attn_tflops_by_rows_keys: None,
             product_ns: None,
         };
@@ -1959,14 +2048,15 @@ mod wanted_tests {
             attn: false,
             elementwise: false,
             scan: false,
+            resident: false,
         };
-        assert_eq!(Wanted::of(&all), none);
+        assert_eq!(Wanted::of(&all, &KEYS), none);
         let few = Rates {
             vector_tflops_by_rows: None,
             ..all.clone()
         };
         assert_eq!(
-            Wanted::of(&few),
+            Wanted::of(&few, &KEYS),
             Wanted {
                 vectors: true,
                 ..none
@@ -1978,13 +2068,13 @@ mod wanted_tests {
             ..all.clone()
         };
         assert_eq!(
-            Wanted::of(&copy),
+            Wanted::of(&copy, &KEYS),
             Wanted {
                 launch: true,
                 ..none
             }
         );
-        let every = Wanted::of(&Rates::default());
+        let every = Wanted::of(&Rates::default(), &KEYS);
         assert!(
             every.launch
                 && every.gemm
@@ -1993,6 +2083,21 @@ mod wanted_tests {
                 && every.attn
                 && every.elementwise
                 && every.scan
+                && !every.resident
+        );
+        // The workgroups the device holds are measured where the profile
+        // lacks them, and only then.
+        let keys = keys_at(None);
+        assert!(Wanted::of(&all, &keys).resident);
+        assert_eq!(
+            Wanted::of(
+                &Rates {
+                    resident_workgroups: Some(48.0),
+                    ..all.clone()
+                },
+                &keys
+            ),
+            none
         );
     }
 }
