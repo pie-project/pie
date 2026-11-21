@@ -897,7 +897,7 @@ impl<'a, B: Serve> Rig<'a, B> {
                 }
                 pending.push_back(crate::backend::Frame::commit_async(f, None)?);
             }
-            let mut f = self.device.frame()?;
+            let mut f = self.device.spanned()?;
             {
                 let sink = B::sink(self.device, &f, &self.pipelines, &self.handles);
                 fire(&sink)?;
@@ -920,7 +920,10 @@ impl<'a, B: Serve> Rig<'a, B> {
                     ),
                 });
             }
-            let mut f = self.device.frame()?;
+            // Spanned: the device's two timestamps around the frame's work,
+            // none between its dispatches (a timestamp a dispatch serialises
+            // a tiler's work and ran a phone's one-row fires ~10x long).
+            let mut f = self.device.spanned()?;
             {
                 let sink = B::sink(self.device, &f, &self.pipelines, &self.handles);
                 for _ in 0..count {

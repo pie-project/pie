@@ -118,11 +118,15 @@ pub fn shapes_at_load(
     top_rows: u32,
 ) -> Result<crate::tuning::Tuning> {
     let tier = <Api as engine_gpu::serve::Serve>::tier(device);
-    let timer = timer();
-    // Each point timed by the device's timestamps where it has them: the
-    // host's wait swings a frame more than the kernels it weighs apart.
-    let was = crate::encode::timing_on();
-    crate::encode::profile_timing(true);
+    // Each point timed by the device's two timestamps around its frame (a
+    // spanned frame, written between passes, where the device enabled
+    // timestamps): the host's wait swings a frame more than the kernels it
+    // weighs apart.
+    let timer = |frame: Frame| {
+        let started = std::time::Instant::now();
+        let span = frame.commit_spanned()?;
+        Ok((span.filter(|&ns| ns > 0), started.elapsed().as_nanos() as u64))
+    };
     let measured = device.chip();
     let save = profiles.map(|profiles| engine::rates::SaveTo {
         path: crate::chip::SHELF.user_path(profiles, &measured.name),
@@ -141,10 +145,6 @@ pub fn shapes_at_load(
         Some(model_bytes),
         top_rows,
     );
-    crate::encode::profile_timing(was);
-    if !was {
-        crate::encode::reset_kernel_profile();
-    }
     Ok(crate::tuning::Tuning::new(chip?).with_workgroup_bytes(device.workgroup_bytes()))
 }
 

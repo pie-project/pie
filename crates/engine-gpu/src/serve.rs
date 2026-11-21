@@ -193,16 +193,6 @@ pub trait Serve: Backend {
         handles: &'f Handles<Self>,
     ) -> Self::Sink<'f>;
 
-    /// The device's own timing of the frames submitted from here switched
-    /// on or off; what it was. Where the device writes timestamps, each
-    /// frame's span (its first dispatch to its last) is read by
-    /// [`Serve::take_span_ns`].
-    fn span_timing(on: bool) -> bool;
-
-    /// The device's span of the frames submitted since the last take, ns
-    /// (the longest frame's; `None` where the device times none).
-    fn take_span_ns() -> Option<u64>;
-
     /// A frame a step walks into; `keep` where it is kept to replay;
     /// `timed` (its arm's timestamps) where its device time is read once it
     /// lands, as [`Serve::fire_timing`] states (under a stated submit
@@ -870,6 +860,9 @@ pub struct Shell<B: Serve> {
     /// The landed fires whose device time is not yet read, each with its
     /// estimate ([`Shell::timed`]).
     timing: Vec<(crate::submit::Estimated, crate::submit::DeviceTime)>,
+    /// While the dense settle times its fires: the device time of each step
+    /// that landed, read from its arm's timestamps ([`Shell::timed`]).
+    spans: Option<Vec<crate::submit::DeviceTime>>,
     /// The device time, ns, of the last fire whose time was read
     /// ([`Shell::track`]).
     last_landed: Option<u64>,
@@ -2347,6 +2340,7 @@ impl<B: Serve> Shell<B> {
             split_layers: 1,
             estimate_next: None,
             timing: Vec::new(),
+            spans: None,
             last_landed: None,
             last_picks: Vec::new(),
             stamps,
@@ -2445,9 +2439,20 @@ impl<B: Serve> Shell<B> {
         // Each fire in one submission, as a step admitted whole goes out.
         self.split_next(None);
         let walk_only = std::mem::replace(&mut self.walk_only, true);
-        let timed = B::span_timing(true);
+        // Each fire timed by its arm's two timestamps around its frames, as
+        // a served step is under a stated bound (laid for the settle where
+        // none is stated): none between its dispatches.
+        let laid = self.stamps.is_empty();
+        if laid {
+            self.stamps = (0..self.inputs.len())
+                .map(|_| B::lay_stamps(&self.device, 1))
+                .collect::<Result<Vec<_>>>()?;
+        }
         let settled = self.settle_dense_to(lanes);
-        B::span_timing(timed);
+        if laid {
+            self.stamps.clear();
+        }
+        self.spans = None;
         self.walk_only = walk_only;
         self.recorded_serving();
         self.unkept_serving();
@@ -2618,18 +2623,38 @@ impl<B: Serve> Shell<B> {
                                     })
                                     .collect();
                                 self.drain()?;
-                                let _ = B::take_span_ns();
+                                self.spans = Some(Vec::new());
                                 let began = std::time::Instant::now();
                                 self.fire_seated(&seated)?;
+                                let host = began.elapsed().as_secs_f64() * 1e9;
+                                let spans = self.spans.take().unwrap_or_default();
+                                // The device's times, filled once its steps
+                                // landed (a backend may fill one a moment
+                                // after it saw the landing).
+                                let read = std::time::Instant::now();
+                                while spans.iter().any(|time| time.get().is_none())
+                                    && read.elapsed() < std::time::Duration::from_secs(1)
+                                {
+                                    self.reap()?;
+                                    std::thread::yield_now();
+                                }
+                                let device: Option<u64> = (!spans.is_empty())
+                                    .then(|| {
+                                        spans
+                                            .iter()
+                                            .map(|time| time.get().flatten())
+                                            .sum::<Option<u64>>()
+                                    })
+                                    .flatten();
                                 // The device's span of the fire's frames: a
                                 // walk's host encode is not the served
                                 // step's, which replays its recording. The
                                 // host's clock only where the device times
                                 // nothing.
-                                Ok(B::take_span_ns().map_or_else(
+                                Ok(device.map_or_else(
                                     || {
                                         host_clock.set(true);
-                                        began.elapsed().as_secs_f64() * 1e9
+                                        host
                                     },
                                     |ns| ns as f64,
                                 ))
@@ -2693,6 +2718,14 @@ impl<B: Serve> Shell<B> {
             rows = rows.saturating_mul(2);
         }
         Ok(())
+    }
+
+    /// Whether the dense settle reads the device time of each step that
+    /// lands ([`Shell::timed`]): a backend reads it then, a bound stated or
+    /// not.
+    #[must_use]
+    pub fn spans_wanted(&self) -> bool {
+        self.spans.is_some()
     }
 
     /// What the dense settle did at each range, in order.
@@ -4318,6 +4351,9 @@ impl<B: Serve> Shell<B> {
         estimate: Option<crate::submit::Estimated>,
         time: crate::submit::DeviceTime,
     ) {
+        if let Some(spans) = self.spans.as_mut() {
+            spans.push(time.clone());
+        }
         let (Some(estimate), Some(held)) = (estimate, self.submit_bound.as_ref()) else {
             return;
         };

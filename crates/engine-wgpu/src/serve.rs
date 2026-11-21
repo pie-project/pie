@@ -232,23 +232,6 @@ impl Serve for Api {
 
     const BINDS_AT_LOAD: bool = true;
 
-    fn span_timing(on: bool) -> bool {
-        let was = crate::encode::timing_on();
-        crate::encode::profile_timing(on);
-        crate::encode::reset_kernel_profile();
-        was
-    }
-
-    fn take_span_ns() -> Option<u64> {
-        let span = crate::encode::kernel_profile()
-            .into_iter()
-            .find(|(name, ..)| name == "frame.span")
-            .map(|(_, ns, _)| ns)
-            .filter(|&ns| ns > 0);
-        crate::encode::reset_kernel_profile();
-        span
-    }
-
     fn bind_frame(device: &Context) -> Result<Frame> {
         device.bind_frame()
     }
