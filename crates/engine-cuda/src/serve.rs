@@ -1382,7 +1382,7 @@ struct RsFire<'a> {
     truncates: bool,
     /// How its lanes treat their recurrent rows.
     body: record::RsBody,
-    /// Whether its beam groups fold their sets (§11.3).
+    /// Whether its beam groups fold their sets (§11.3): it stages a fold.
     group_folds: bool,
     rows_ext: u32,
     snapshots: crate::store::rs::SnapTable,

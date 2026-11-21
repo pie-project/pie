@@ -347,8 +347,8 @@ pub struct RsSeat<'a> {
     pub tables: kernels_cuda::runtime::channel::RsTables,
     pub extended: bool,
     pub scratch: Option<&'a RsScratch>,
-    /// The beam groups' fold table and its entries, where the fire's body
-    /// folds them (§11.3): each recurrent layer folds them before its step.
+    /// The beam groups' fold table and its entries, where the fire stages
+    /// folds (§11.3): every recurrent layer folds them ahead of the body.
     pub folds: Option<(u64, u32)>,
 }
 
@@ -1391,17 +1391,6 @@ impl<'c> Run<'c> {
         let Some((folds, entries)) = seat.folds else {
             return Ok(None);
         };
-        // A layer's step runs once a window run; its groups fold once.
-        let runs = self.windows.runs(self.place.region.get());
-        if runs > 1 {
-            return Err(kernels_cuda::Error::Backend {
-                op,
-                detail: format!(
-                    "a beam group's fold in a region its fire walks in {runs} window runs; a \
-                     layer's groups fold once, before its step, so its region runs whole"
-                ),
-            });
-        }
         let tables = seat.tables;
         let mut carry = kernels_cuda::ssm::Carry {
             lanes: tables.lanes,
@@ -1420,21 +1409,6 @@ impl<'c> Run<'c> {
         }
         let table = Tensor::new(folds, entries, 3, poem_ir::Dtype::U32);
         Ok(Some((carry, table, entries)))
-    }
-
-    /// Holds the fire's group folds back while a fused step's primitives
-    /// run its layer, the fused step having folded them already.
-    #[cfg(feature = "rocm")]
-    pub(crate) fn suspend_group_folds(&mut self) -> Option<(u64, u32)> {
-        self.rs.as_mut().and_then(|seat| seat.folds.take())
-    }
-
-    /// Restores what [`Run::suspend_group_folds`] held back.
-    #[cfg(feature = "rocm")]
-    pub(crate) fn resume_group_folds(&mut self, folds: Option<(u64, u32)>) {
-        if let (Some(seat), Some(folds)) = (self.rs.as_mut(), folds) {
-            seat.folds = Some(folds);
-        }
     }
 
     pub(crate) fn rs_carry(

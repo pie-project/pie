@@ -2007,8 +2007,7 @@ impl Shell {
             &self.tiers,
             self.towered.then_some((&patches.classes, patches.bucket)),
         )
-        .with_rs(rs_body)
-        .with_group_folds(rs_body.buffers() && !page_groups.is_empty());
+        .with_rs(rs_body);
         let copies_here = copies
             && key.classes.rungs().iter().all(|(class, _)| {
                 !self.wide.contains(*class as usize)
@@ -2399,7 +2398,7 @@ impl Shell {
                     }),
                 truncates: rs_body.buffers(),
                 body: rs_body,
-                group_folds: rs_body.buffers() && !page_groups.is_empty(),
+                group_folds: !rs_folds.is_empty(),
                 moves: rs_moves,
                 lens: rs_lens,
                 order: rs_order,
