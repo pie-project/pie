@@ -566,7 +566,9 @@ fn copies_apart(
 /// streams its rows, every stream split-safe ([`super::stream::Streams::split_safe`]:
 /// maps, broadcasts, model-row reads and reductions of wide static rows),
 /// and its other ops read and write no row (scalars a block computes alike
-/// in every block), none a channel, an output, a random draw or a scatter.
+/// in every block: a take or read of a channel's cell among them, a copy of
+/// the cell every block makes alike), none a put, an output, a random draw
+/// or a scatter.
 #[must_use]
 pub fn splits_rows(stage: &CompiledStage, region: &Region) -> bool {
     if region.kind != crate::plan::RegionKind::Generated
@@ -625,9 +627,7 @@ pub fn splits_rows(stage: &CompiledStage, region: &Region) -> bool {
         if touches_row
             || matches!(
                 op.tag,
-                tags::CHAN_TAKE
-                    | tags::CHAN_READ
-                    | tags::CHAN_PUT
+                tags::CHAN_PUT
                     | tags::OUTPUT
                     | tags::RNG
                     | tags::RNG_KEYED
