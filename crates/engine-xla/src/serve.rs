@@ -594,9 +594,11 @@ impl Shell {
             }
         }
         // Lane room for the padding lanes: a decode's up to its rung, and a
-        // prefill beside a decode's up to the mixed fire's host rung.
+        // prefill beside a decode's up to the mixed fire's host rung; never
+        // past the fire's rows (a lane carries one at least).
         budget.max_lanes = poem_exec::fire::rung_of(&budget.buckets, budget.max_lanes)
-            .saturating_add(pad.mixed_host_rung);
+            .saturating_add(pad.mixed_host_rung)
+            .min(budget.max_tokens);
         let budgets = match boot.patches.clone() {
             None => Budgets::of(budget),
             Some(ladder) => Budgets::of(budget).with_patches(ladder),
