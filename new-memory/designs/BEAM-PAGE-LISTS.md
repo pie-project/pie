@@ -427,12 +427,13 @@ plain decode does.
   fold.
 - Pages below the fold point. kv: unchanged (attention reads every slot, and
   the pages below `c` are already in every list; the lists, `f0`, `free` and
-  `pending` do not move). rs: no beam's replay reaches below `folded_g`, so the
-  set's rs buffer base moves to `floor(folded_g / T) T` and the rs pages wholly
-  below it go back to the rs store, the truncate from below a set's committed
-  length advancing takes. `sigma` (§11.1) and `copy_rs_rows` (§11.2) apply at
-  slots at or past the base; a copy's slot below it is skipped, as a prompt
-  tail's is.
+  `pending` do not move). rs: the group's fold moves the set's state only. A
+  beam set's rs buffer is laid by pool page (§11.1: slot `s` of a beam lies at
+  `(f0 + q) S + s mod S`, `q` any pool page), so a page below `folded_g` in
+  column order may back a pool page a beam still writes: the buffer's base and
+  its pages stay while the search runs, and go back at the finish's relist and
+  the set's next plain fold, as before. A beam lane reports no kv fold either:
+  the kv folded point anchors the pool (`f0`).
 - A search owns its set's state. A parents pass used to leave the set's state
   as the search found it; it now advances it to the common ancestor. §6.6's
   adopt is unchanged (the chosen beam's list holds every common page, and the
@@ -449,3 +450,47 @@ plain decode does.
   pages below the base are given back; beam-1-parents' step cost and carried
   rows equal a plain decode's at the same lag, and beam-4's step lies within
   the user's rule of greedy's.
+
+### 11.4 Proposal (for review): the common slot to the row
+
+§11.3 stops `c_t` at whole shared pages, so each beam carries up to `S - 1`
+rows past the true common ancestor, plus the harvest lag. Measured on
+MI300X (Qwen3.5-0.8B, beam-4, ec181ab5c): the carried gated-delta step costs
+704 µs a step against 410 for four greedy lanes, the largest device item
+between beam-4 and greedy.
+
+- What is common. Rows a beam holds below the depth of the live beams' most
+  recent common ancestor were each written once, by one lane, before the
+  beams parted, and reached the others only by `copy_rs_rows` (§11.2) of the
+  page holding them: the same bytes in every beam, on whichever page.
+  So the exact common slot is that depth, whatever pages the rows lie on.
+- Tracked on the device, in the head step. The group's resident state gains
+  `lca[B][B]` (u32, slots): for live beams `i != j`, the depth below which
+  their histories agree. Fire `t`'s head step, after it reads the parents
+  `p` and before it reorders the lists, sets for every pair
+  `lca'(i, j) = s_t` where `p_i == p_j` (siblings part at this fire's row:
+  their tokens differ, a top-k's candidates being distinct), and
+  `lca(p_i, p_j)` otherwise; then `c_t = min over i < j of lca'(i, j)`, and
+  `end_t` with one beam. Priming sets every pair to the prompt's end (the
+  beams share the prompt). `c_t` never decreases: a pair's common depth only
+  grows as their parents' did.
+- Contract: unchanged past the head step. `c_t` is still `header[3]`, read at
+  harvest and stated as a host fold to it (§11.3); the fold reads its rows
+  through the representative lane's rs table, which names, below `c_t`, a row
+  equal in every beam (on that lane's own page where the page was copied).
+  Prepare, the fold kernels, the runtime and every engine's fold path stay as
+  they are; only each backend's head step changes, and its resident state
+  grows by `4 B^2` bytes (64 at `B = 4`, 1 KiB at 16).
+- Cost: the update is `B^2` words a fire in one block of the head step (a few
+  hundred ns at `B <= 16`), and nothing else moves. Saving: each beam carries
+  `s_t - LCA` rows plus the lag instead of up to `S - 1` more, so the carried
+  step's extra cost over greedy falls by the share of carried rows that are
+  page rounding (up to `(S - 1)` of `S - 1 + W + (s_t - LCA)` rows a beam).
+  The search's own divergence, `s_t - LCA`, remains: beams that genuinely
+  differ carry their differing rows, as they must.
+- Tests: `lca` and `c_t` against the host replay (§9) with its ancestry
+  tracked alongside, after every step (siblings, cousins, one beam,
+  retirements); `c_t` at least §11.3's page-granular value at every step; a
+  search with row-granular folds verifies as §11.3's (`--verify` and the
+  finish check, widths 1, 2, 4, 8, on a hybrid); beam-4's carried rows a step
+  measured against §11.3's.
