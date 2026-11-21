@@ -180,6 +180,16 @@ pub trait Serve: Backend {
         handles: &'f Handles<Self>,
     ) -> Self::Sink<'f>;
 
+    /// The device's own timing of the frames submitted from here switched
+    /// on or off; what it was. Where the device writes timestamps, each
+    /// frame's span (its first dispatch to its last) is read by
+    /// [`Serve::take_span_ns`].
+    fn span_timing(on: bool) -> bool;
+
+    /// The device's span of the frames submitted since the last take, ns
+    /// (the longest frame's; `None` where the device times none).
+    fn take_span_ns() -> Option<u64>;
+
     /// A frame a step walks into; `keep` where it is kept to replay.
     fn walk_frame(device: &Self::Context, keep: bool) -> Result<Self::Frame>;
 
@@ -367,6 +377,11 @@ pub struct Boot<'a, B: Serve> {
     /// fire bound, and what the estimate weighed them by kept
     /// ([`Shell::weighed`]).
     pub check: Option<CheckRungs>,
+    /// A served load, whose programs the engine places once the shell is
+    /// raised (`Programs::load`): it fires nothing until it is told they
+    /// are ([`Shell::programs_placed`]). A suite's or a check's load places
+    /// none and fires from the start.
+    pub places_programs: bool,
 }
 
 /// How far a check's load lays its rungs.
@@ -746,6 +761,8 @@ pub struct Shell<B: Serve> {
 
     /// The dense matmul's tactic at each rung ([`crate::dense`]).
     dense: crate::dense::Dense,
+    /// A served load whose programs are not placed yet: a fire is refused.
+    unplaced: bool,
 
     pipelines: B::Pipelines,
 
@@ -1032,6 +1049,7 @@ impl<B: Serve> Shell<B> {
                 residency: boot.residency.clone(),
                 handed: None,
                 check: boot.check,
+                places_programs: boot.places_programs,
             },
             Fitted {
                 device: crate::named::Facts::of::<B>(device),
@@ -1050,7 +1068,7 @@ impl<B: Serve> Shell<B> {
     /// the model serves from, in the one order, on whatever backend `B` is.
     /// A naming load ([`Named`]) runs this same code and reserves nothing.
     fn raise(boot: Boot<'_, B>, fitted: Fitted<B>) -> Result<Shell<B>> {
-        let checking = boot.check.is_some();
+        let unplaced = boot.places_programs;
         let Fitted {
             device,
             tuning,
@@ -2162,6 +2180,7 @@ impl<B: Serve> Shell<B> {
             drained: 0,
             walked: (0, 0),
             walk_only: false,
+            unplaced,
             readout_tally: (0, 0),
             weighed,
             submit_bound,
@@ -2232,9 +2251,6 @@ impl<B: Serve> Shell<B> {
         if weights_held {
             shell.preseat_weights()?;
         }
-        if !checking {
-            shell.settle_dense()?;
-        }
         Ok(shell)
     }
 
@@ -2263,7 +2279,9 @@ impl<B: Serve> Shell<B> {
             return Ok(());
         }
         let walk_only = std::mem::replace(&mut self.walk_only, true);
+        let timed = B::span_timing(true);
         let settled = self.settle_dense_to(lanes);
+        B::span_timing(timed);
         self.walk_only = walk_only;
         self.recorded_serving();
         self.unkept_serving();
@@ -2345,9 +2363,18 @@ impl<B: Serve> Shell<B> {
                                     })
                                     .collect();
                                 self.drain()?;
+                                let _ = B::take_span_ns();
                                 let began = std::time::Instant::now();
                                 self.fire_seated(&seated)?;
-                                Ok(began.elapsed().as_secs_f64() * 1e9)
+                                // The device's span of the fire's frames: a
+                                // walk's host encode is not the served
+                                // step's, which replays its recording. The
+                                // host's clock only where the device times
+                                // nothing.
+                                Ok(B::take_span_ns().map_or_else(
+                                    || began.elapsed().as_secs_f64() * 1e9,
+                                    |ns| ns as f64,
+                                ))
                             })();
                             match fired {
                                 Ok(ns) if round > 0 => samples[i].push(ns),
@@ -2397,6 +2424,11 @@ impl<B: Serve> Shell<B> {
             rows = rows.saturating_mul(2);
         }
         Ok(())
+    }
+
+    /// The engine placed the load's programs: the shell fires from here.
+    pub fn programs_placed(&mut self) {
+        self.unplaced = false;
     }
 
     /// Opens seat `slot` for a direct fire: its record zeroed on the queue,
@@ -3137,6 +3169,15 @@ impl<B: Serve> Shell<B> {
 
     pub fn fire_seated(&mut self, lanes: &[Seated<'_, B>]) -> Result<Vec<Vec<f32>>> {
         use engine::frame::Shell as FrameShell;
+        // A served load fired before the engine placed its programs hangs
+        // the device on what placing them sets up: refused, by name.
+        if self.unplaced {
+            return Err(Fault::Unbound {
+                what: "the load's programs, which the engine places once the shell is raised \
+                       (`Programs::load`): a served load fires nothing before"
+                    .to_string(),
+            });
+        }
         // A direct fire's seat-addressed lanes read the seats' runs: back
         // their segments first, off the fire's path.
         if lanes.iter().any(|lane| !lane.refs) {

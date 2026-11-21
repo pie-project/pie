@@ -868,3 +868,13 @@ new width's first request). They persist: the next boots' same registrations too
 and 0.032 s, 0 compiles after ready, and the beam fires themselves were on the ladder (0
 misses). The width is a constant of the inferlet's trace, so no ladder derives them; laying
 built-ins' guest programs before ready is GPU's queued item.
+
+## F44. An unplaced served load hangs the GPU (slang backends, 2026-11-21)
+A direct fire on a served load before the engine places its programs (`Programs::load`)
+hangs the device instead of being refused: found when the dense settle fired from inside
+`Shell::load` (rows 1, its first fire never landed; the same fire placed after
+`Programs::load` lands in 6 ms). Suite and check loads place no programs and fire fine, so
+it is something a served load expects `Programs::load` to have set up (its readout / shelf
+placement, a table it writes, or a submit it makes), not yet pinned. Today a served load is
+guarded by phase (`Boot::places_programs`, refused by name until `Shell::programs_placed`).
+Find the resource and guard on it instead.

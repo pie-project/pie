@@ -492,6 +492,14 @@ impl<B: Serve> Serve for Named<B> {
 
     const BINDS_AT_LOAD: bool = false;
 
+    fn span_timing(on: bool) -> bool {
+        B::span_timing(on)
+    }
+
+    fn take_span_ns() -> Option<u64> {
+        B::take_span_ns()
+    }
+
     fn bind_frame(_device: &Facts) -> Result<NoFrame> {
         Err(Fault::Unbound {
             what: "a bind walk on the naming load, which keeps nothing a dispatch binds".into(),
@@ -507,10 +515,7 @@ impl<B: Serve> Serve for Named<B> {
     }
 
     /// A naming load runs nothing on a device: no probe to lay.
-    fn record_probe(
-        _device: &Facts,
-        _record: &dyn Fn(&NoFrame) -> Result<()>,
-    ) -> Result<()> {
+    fn record_probe(_device: &Facts, _record: &dyn Fn(&NoFrame) -> Result<()>) -> Result<()> {
         Ok(())
     }
 

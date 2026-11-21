@@ -305,7 +305,13 @@ fn loading() -> std::sync::MutexGuard<'static, ()> {
 
 /// [`load_paged`] for fires of up to `lanes` lanes and `tokens` tokens, a
 /// seat a lane.
-pub fn load_lanes(fixture: &Fixture, page: u32, context: u32, lanes: u32, tokens: u32) -> Option<Shell> {
+pub fn load_lanes(
+    fixture: &Fixture,
+    page: u32,
+    context: u32,
+    lanes: u32,
+    tokens: u32,
+) -> Option<Shell> {
     let _alone = loading();
     let device = crate::gpu::device_boot();
     let residency = allowed(&device, engine::load::Residency::default())?;
@@ -327,6 +333,22 @@ pub fn load_with(
 ) -> Option<Shell> {
     let _alone = loading();
     load_alone(fixture, page, context, chunk, residency)
+}
+
+/// [`load`] as the engine raises a served load: one whose programs it
+/// places once the shell is raised, so the shell fires nothing before
+/// (`Boot::places_programs`).
+pub fn load_served(fixture: &Fixture, context: u32) -> Option<Shell> {
+    let _alone = loading();
+    let device = crate::gpu::device_boot();
+    let residency = allowed(&device, engine::load::Residency::default())?;
+    Some(
+        Shell::load(Boot {
+            places_programs: true,
+            ..boot(fixture, PAGE, context, &device, residency)
+        })
+        .unwrap_or_else(|why| panic!("the shell loads: {why}")),
+    )
 }
 
 /// [`load_with`], [`LOADING`] held by the caller.
@@ -402,6 +424,7 @@ fn boot<'a>(
         residency,
         handed: None,
         check: None,
+        places_programs: false,
     }
 }
 
@@ -548,7 +571,9 @@ fn seats_lie_in_state(shell: &Shell) {
         1 + layout.seat_chunks()
     );
     for shape in layout.shapes().filter(|shape| shape.seat_slots > 0) {
-        let last = shape.seat_ref(shape.seat_slots - 1).expect("the last seat's ref");
+        let last = shape
+            .seat_ref(shape.seat_slots - 1)
+            .expect("the last seat's ref");
         assert!(
             shape.split(last).0 < state,
             "shape {} names chunk {} past the {state} state chunks",
@@ -921,7 +946,10 @@ fn a_mixed_fire_that_cuts_a_region_fires_from_what_the_load_built() {
                 && region.mask.contains(class(c))
                 && !region.mask.contains(class(b))
         });
-        assert!(cut, "no region holds the adapted lanes and not the plain decode");
+        assert!(
+            cut,
+            "no region holds the adapted lanes and not the plain decode"
+        );
     }
 
     // Three plain prompts seat their rows: no region is cut.
@@ -1011,8 +1039,8 @@ fn a_mixed_fire_that_cuts_a_region_fires_from_what_the_load_built() {
 /// A's near-tie), which hides keys (it answers otherwise unmasked).
 #[test]
 fn a_masked_lane_in_a_mixed_fire_launches_and_answers_as_unmasked_lanes_do() {
-    use eta_compiler::contract::{Drift, near_tie};
     use engine::fire::{Mask, Masking};
+    use eta_compiler::contract::{Drift, near_tie};
 
     let fixture = fixture("qwen3-micro-text", None);
     let Some(mut shell) = load(&fixture, CONTEXT) else {
@@ -1070,7 +1098,9 @@ fn a_masked_lane_in_a_mixed_fire_launches_and_answers_as_unmasked_lanes_do() {
         ]
     };
     shell.walked_serving();
-    let unmasked = shell.fire_seated(&mixed(false)).expect("the mixed fire fires");
+    let unmasked = shell
+        .fire_seated(&mixed(false))
+        .expect("the mixed fire fires");
     let (_, plain_launches) = shell.walked_serving();
     let got = shell
         .fire_seated(&mixed(true))
@@ -1106,7 +1136,10 @@ fn a_masked_lane_in_a_mixed_fire_launches_and_answers_as_unmasked_lanes_do() {
             }
         }
         let parting = near_tie(top[0] - top[1], &[ta, tb], Drift::Rows { a, b }, None);
-        assert!(parting.tie, "the masked lane parts from itself alone on no near-tie: {parting:?}");
+        assert!(
+            parting.tie,
+            "the masked lane parts from itself alone on no near-tie: {parting:?}"
+        );
     }
     eprintln!(
         "mixed fire with a masked lane: {launches} launches ({plain_launches} unmasked), \
@@ -1511,8 +1544,8 @@ fn a_masked_fire_after_a_partial_fold_admits_the_committed_keys() {
 /// near-tie). The beam's mask is read: it answers otherwise unmasked.
 #[test]
 fn a_masked_beam_beside_plain_decodes_answers_as_each_alone() {
-    use eta_compiler::contract::{Drift, near_tie};
     use engine::fire::{Mask, Masking};
+    use eta_compiler::contract::{Drift, near_tie};
 
     const PLAIN: u32 = 3;
     const LANES: u32 = PLAIN + 1;
@@ -1527,9 +1560,8 @@ fn a_masked_beam_beside_plain_decodes_answers_as_each_alone() {
     let beam = PLAIN as usize;
     // Every key but a stretch of the prompt (`8..16`), so a lane reading no
     // mask answers otherwise.
-    let beam_mask = |columns: u32| {
-        Masking::Extent(Mask::new(vec![0, 8, 8, columns - 16], u64::from(columns)))
-    };
+    let beam_mask =
+        |columns: u32| Masking::Extent(Mask::new(vec![0, 8, 8, columns - 16], u64::from(columns)));
     // `(slot, tokens, held, mask)` a lane.
     type Row<'a> = (u32, &'a [u32], u32, Option<&'a Masking>);
     let fire = |shell: &mut Shell, lanes: &[Row<'_>]| -> Vec<Vec<f32>> {

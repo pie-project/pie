@@ -172,6 +172,19 @@ impl Serve for Api {
 
     const BINDS_AT_LOAD: bool = false;
 
+    fn span_timing(on: bool) -> bool {
+        let was = crate::encode::profiling();
+        crate::encode::profile_kernels(on);
+        if !on {
+            crate::encode::reset_kernel_profile();
+        }
+        was
+    }
+
+    fn take_span_ns() -> Option<u64> {
+        Some(crate::encode::take_longest_frame_span_ns()).filter(|&ns| ns > 0)
+    }
+
     fn bind_frame(_device: &Context) -> Result<Frame> {
         Err(engine_gpu::error::Fault::Unbound {
             what: "a bind walk on Vulkan, which keeps no descriptor set per set of views".into(),

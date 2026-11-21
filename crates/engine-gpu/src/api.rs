@@ -851,11 +851,7 @@ where
         // A served lane names its slots by ref: the only seat-addressed
         // fires of a served load are its own naming walk's, the widest a
         // cut's lanes, and those are the seats it is asked to lay.
-        let slots = poem_compiler::state_slots(
-            budgets.slots,
-            &trace,
-            crate::serve::naming_lanes(),
-        );
+        let slots = poem_compiler::state_slots(budgets.slots, &trace, crate::serve::naming_lanes());
         let (disk_kv_budget, disk_kv_dir, seats) = (
             residency.disk_kv_budget,
             residency.disk_kv_dir.clone(),
@@ -880,9 +876,11 @@ where
             device: &self.boot,
             handed: self.handed.take(),
             check: None,
+            places_programs: true,
         })
         .map_err(fault)?;
         self.programs.load(&place(&shell)).map_err(refusal)?;
+        shell.programs_placed();
         let started = std::time::Instant::now();
         let walked = shell.walk_binds().map_err(fault)?;
         if walked > 0 {
@@ -909,6 +907,14 @@ where
                 budgets.max_context,
             )
             .map_err(fault)?;
+        // The dense kernel at each rung settled on the served step, once the
+        // load is whole (its programs placed, its kv seated); what a newly
+        // taken kernel binds is built by a second bind walk, and what either
+        // walked is the load's.
+        shell.settle_dense().map_err(fault)?;
+        shell.walk_binds().map_err(fault)?;
+        shell.unkept_serving();
+        shell.bound_serving();
 
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, arena_bytes, pool_bytes, input_bytes) = shell.footprint();
@@ -2046,7 +2052,12 @@ mod tests {
             [(4, Some(InstanceId(102))), (5, Some(InstanceId(102)))],
             "the refusing instance's two lanes, and no other"
         );
-        assert!(faulted.faulted.iter().all(|f| f.reason.contains("poisoned")));
+        assert!(
+            faulted
+                .faulted
+                .iter()
+                .all(|f| f.reason.contains("poisoned"))
+        );
         assert!(faulted.wrote.is_empty());
     }
 }

@@ -1302,6 +1302,15 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
                             Some(&touched),
                             launch,
                         );
+                        // A frame the device's room refuses (a ceiling, not a
+                        // fault of the device) is no measurement either:
+                        // its sample is dropped, never the step.
+                        let rate = match rate {
+                            Err(Fault::Ceiling { what, need, have }) => Ok(Err(format!(
+                                "the frame needs {need} {what}, past the {have} the device holds"
+                            ))),
+                            rate => rate,
+                        };
                         match dropped(rig, rate, say)? {
                             // Timed on a slice, the next fire tries one twice
                             // as wide, its estimate grown from this one: the
