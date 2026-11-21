@@ -279,14 +279,29 @@ impl ResidencyPlanner {
     /// victim choice and the chunk map, and room given back, an eviction
     /// landed or a completion wakes it. Over-demand is served slower, never
     /// failed; no clock and no answer of the policy refuses a need that fits.
+    /// The device's room for state as pages, one figure for every
+    /// never-fits check (restores, binds, a fire's unit alone): the state
+    /// room at the narrowest rung, the lent span included
+    /// ([`super::pool::PoolPort::state_chunks_most`]); the kv pool's pages
+    /// where the kv pages are a pool of their own.
+    pub(super) fn device_pages_most(&self) -> u32 {
+        match self.port.state_chunks_most() {
+            u32::MAX => self.port.device_stats().1,
+            most => self.port.chunks_as_pages(most),
+        }
+    }
+
     pub(super) fn never_fits(&self, key: EntryKey) -> Option<super::PlannerError> {
-        let (_, total) = self.port.device_stats();
+        // One device figure on every path: the state room at the narrowest
+        // rung, lent span included (Mac Pro on ba229ff25 read 365 pages on
+        // one path and 428 on the other, the 63 lent chunks apart).
+        let most = self.port.state_chunks_most();
+        let total = self.device_pages_most();
         // Its runs, its unpark's and its state's chunks together past every
         // chunk state may take: with every other process evicted and all
         // parked state moved down it still would not fit, and it is refused
         // by name, never waited on (the L40S on 3b45462d4: a restore's 1,058
         // slots of guest state against what the state limit leaves).
-        let most = self.port.state_chunks();
         if most != u32::MAX
             && let Some(room) = self.head_room_within(key, false)
             && room.chunks() > u64::from(most)
@@ -297,7 +312,7 @@ impl ResidencyPlanner {
             };
             return Some(super::PlannerError::PastDevice {
                 need: pages(room.chunks()),
-                total: pages(u64::from(most)),
+                total,
                 runs: room.longest(),
             });
         }

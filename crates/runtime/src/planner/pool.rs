@@ -673,6 +673,12 @@ pub trait PoolPort: Send + Sync + 'static {
     fn state_chunks(&self) -> u32 {
         u32::MAX
     }
+    /// [`crate::store::shared::SharedPool::state_chunks_most`]: the one
+    /// device figure a never-fits check reads. `u32::MAX` where the kv
+    /// pages are a pool of their own.
+    fn state_chunks_most(&self) -> u32 {
+        u32::MAX
+    }
     /// The device pool's count of room given back (a chunk opened for
     /// state, [`crate::store::slots::SlotPool::room_gives`]): moved since
     /// a read, room has come free since.
@@ -1024,6 +1030,12 @@ impl PoolPort for RegistryPool {
         crate::store::registry::try_get(self.model, self.engine)
             .and_then(|stores| stores.shared)
             .map_or(u32::MAX, |shared| shared.lock().unwrap().state_chunks_now())
+    }
+
+    fn state_chunks_most(&self) -> u32 {
+        crate::store::registry::try_get(self.model, self.engine)
+            .and_then(|stores| stores.shared)
+            .map_or(u32::MAX, |shared| shared.lock().unwrap().state_chunks_most())
     }
 
     fn room_gives(&self) -> u64 {

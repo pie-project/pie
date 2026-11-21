@@ -1536,6 +1536,18 @@ impl SharedPool {
         self.records_most
     }
 
+    /// The device's room for state at its narrowest rung: every chunk but
+    /// the reserved and the smallest rung's activation, the span the rung
+    /// lends included. One figure, whatever the rung now: what a need past
+    /// it can never be held in (the never-fits check), on every path.
+    #[must_use]
+    pub fn state_chunks_most(&self) -> u32 {
+        self.pool
+            .total_chunks()
+            .saturating_sub(self.pool.reserved_chunks())
+            .saturating_sub(self.pool.act_chunks(0))
+    }
+
     /// The chunks state may take under the current rung: every chunk but
     /// the reserved ones and the activation set aside now.
     #[must_use]

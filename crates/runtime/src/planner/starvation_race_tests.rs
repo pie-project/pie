@@ -2758,6 +2758,9 @@ impl PoolPort for BindRoomPool {
     fn state_chunks(&self) -> u32 {
         self.total
     }
+    fn state_chunks_most(&self) -> u32 {
+        self.total
+    }
     fn room_gives(&self) -> u64 {
         self.gives.load(Ordering::Relaxed)
     }

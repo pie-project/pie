@@ -116,7 +116,7 @@ impl ResidencyPlanner {
     /// ([`PlannerError::PastDevice`]). `None` for every unit that fits
     /// alone, however short the pool is now.
     pub fn past_device(&self, alone: Demand) -> Option<PlannerError> {
-        let (_, total) = self.port.device_stats();
+        let total = self.device_pages_most();
         let need = alone.kv_pages.saturating_add(self.port.rs_as_pages(alone.rs));
         (need > total).then_some(PlannerError::PastDevice {
             need,
@@ -631,7 +631,7 @@ impl ResidencyPlanner {
         let pages = self.port.chunks_as_pages(run.max(1).saturating_mul(pieces));
         // Runs past the whole device pool never stand: refused by name, at
         // once. Any other bind waits for its runs, however long.
-        let (_, total) = self.port.device_stats();
+        let total = self.device_pages_most();
         if pages > total {
             return Err(PlannerError::PastDevice {
                 need: pages,
