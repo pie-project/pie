@@ -890,14 +890,14 @@ where
             );
         }
         let started = std::time::Instant::now();
-        let bodies = shell.record_decodes().map_err(fault)?;
+        let bodies = shell.record_bodies().map_err(fault)?;
         if bodies > 0 {
             tracing::info!(
                 engine = B::KIND,
                 bodies,
                 recorded = shell.recorded_serving(),
                 ms = started.elapsed().as_millis() as u64,
-                "every decode bucket the load serves recorded at load, on every arm"
+                "every decode bucket and prefill row class the load serves recorded at load, on every arm, smallest first"
             );
         }
         // What the load itself walked is the load's: serving counts from here.

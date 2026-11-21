@@ -6176,62 +6176,94 @@ impl<B: Serve> Shell<B> {
         Ok(walked)
     }
 
-    /// Records, on a backend that keeps recordings, the body of every
-    /// decode the load serves before it serves: for each class a plain
-    /// one-row request lands in, a decode of each decode bucket's lanes
-    /// ([`Shell::decode_buckets`]), smallest first, on every arm. Its lanes
-    /// pad (they read the pool's walk refs and write nothing), so the fire
-    /// runs as a decode of the bucket does and is recorded, and the first
-    /// serving decode of the bucket replays it. The bodies recorded.
-    pub fn record_decodes(&mut self) -> Result<u64> {
+    /// Records, on a backend that keeps recordings, the bodies of the
+    /// load's decodes and prefills before it serves, smallest rows first
+    /// across kinds (within one count of rows, more lanes first): for each
+    /// class a plain one-row request lands in, a decode of each decode
+    /// bucket's lanes ([`Shell::decode_buckets`]); for each class a plain
+    /// longer request lands in, a prefill of one lane of every count of rows
+    /// up to the vector GEMM's widest row tile (rows its commands carry),
+    /// then of each power of two past it up to the top rung (rows read from
+    /// the fire block, one body for every count of rows the power of two
+    /// holds); each on every arm. Their lanes pad (they read the pool's walk
+    /// refs and write nothing), so a fire runs as a serving one of its shape
+    /// does and is recorded. The bodies recorded.
+    pub fn record_bodies(&mut self) -> Result<u64> {
         if !B::RECORDS {
             return Ok(0);
         }
         let facts = &self.trace.facts;
         let table = &self.compiled.classes;
         let mut decoding = vec![false; table.classes.len()];
+        let mut prefilling = vec![false; table.classes.len()];
         for request in facts.requests() {
             if let Some(class) = table.class_of(facts.word(&request) & table.mask)
                 && request.plain()
-                && request.query_len() == 1
             {
-                decoding[class] = true;
+                if request.query_len() == 1 {
+                    decoding[class] = true;
+                } else {
+                    prefilling[class] = true;
+                }
             }
         }
-        let classes: Vec<usize> = (0..decoding.len())
-            .filter(|&class| decoding[class] && !self.captures(class))
-            .collect();
-        let buckets = self.decode_buckets();
+        let tile = *kernels_slang::linear::gemm::VECTOR_ROWS
+            .last()
+            .expect("the vector GEMM states its row tiles");
+        let top = (self.span.rungs().iter())
+            .map(|rung| rung.tokens)
+            .max()
+            .unwrap_or(1);
+        let mut prefill_rows: Vec<u32> = (2..=tile.min(top)).collect();
+        prefill_rows.extend(
+            std::iter::successors(Some(tile.saturating_add(1).next_power_of_two()), |rows| {
+                rows.checked_mul(2)
+            })
+            .take_while(|&rows| rows <= top),
+        );
+        // (class, lanes, rows a lane)
+        let mut shapes: Vec<(usize, u32, u32)> = Vec::new();
+        for class in (0..decoding.len()).filter(|&class| !self.captures(class)) {
+            if decoding[class] {
+                for bucket in self.decode_buckets() {
+                    shapes.push((class, u32::try_from(bucket).unwrap_or(u32::MAX), 1));
+                }
+            }
+            if prefilling[class] {
+                for &rows in &prefill_rows {
+                    shapes.push((class, 1, rows));
+                }
+            }
+        }
+        shapes.sort_by_key(|&(_, lanes, rows)| (lanes * rows, std::cmp::Reverse(lanes)));
         let page = self.pools.paging().page_size.max(1);
         let depth = self.arms.depth();
         let mut recorded = 0u64;
-        for &bucket in &buckets {
-            for &class in &classes {
-                for arm in 0..depth {
-                    let owned = (0..bucket)
-                        .map(|_| {
-                            let mut lane = self.naming_lane(class, 1)?;
-                            lane.by_ref = Some(self.pools.walk_refs(1u32.div_ceil(page).max(1))?);
-                            Ok(lane)
-                        })
-                        .collect::<Result<Vec<NamingLane<B>>>>()?;
-                    let (mut seated, _, _) = lane_views(&owned);
-                    for lane in &mut seated {
-                        lane.pad = true;
-                        lane.hosts = false;
-                    }
-                    // The fire stages on the first free arm: the ones before
-                    // `arm` are held while it fires.
-                    for before in 0..arm {
-                        self.arms.take(before);
-                    }
-                    let fired = self.fire_seated(&seated);
-                    for before in 0..arm {
-                        self.arms.give(before);
-                    }
-                    fired?;
-                    recorded += 1;
+        for &(class, lanes, rows) in &shapes {
+            for arm in 0..depth {
+                let owned = (0..lanes)
+                    .map(|_| {
+                        let mut lane = self.naming_lane(class, rows)?;
+                        lane.by_ref = Some(self.pools.walk_refs(rows.div_ceil(page).max(1))?);
+                        Ok(lane)
+                    })
+                    .collect::<Result<Vec<NamingLane<B>>>>()?;
+                let (mut seated, _, _) = lane_views(&owned);
+                for lane in &mut seated {
+                    lane.pad = true;
+                    lane.hosts = false;
                 }
+                // The fire stages on the first free arm: the ones before
+                // `arm` are held while it fires.
+                for before in 0..arm {
+                    self.arms.take(before);
+                }
+                let fired = self.fire_seated(&seated);
+                for before in 0..arm {
+                    self.arms.give(before);
+                }
+                fired?;
+                recorded += 1;
             }
         }
         Ok(recorded)
