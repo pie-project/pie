@@ -2542,16 +2542,22 @@ impl<B: Serve> Shell<B> {
                 // every kernel the choice takes here or a vector one it takes
                 // anywhere; each where it pads no more rows than the choice.
                 let base = self.tuning.gemm(self.tier, top);
+                let paths = crate::dense::tiled_kernels(B::TARGET, base);
                 let weighed = kernels_slang::linear::gemm::VECTOR_ROWS
                     .iter()
                     .map(|&vector| Tactic { vector, ..base })
-                    .chain(crate::dense::tiled_kernels(B::TARGET, base));
+                    .chain(paths.iter().copied());
                 for t in (bottom..=top)
                     .flat_map(|r| standing.tactics_at(r))
                     .chain(vectors.iter().copied())
                     .chain(weighed)
                 {
-                    if !kernels.contains(&t) && tile(t) <= widest {
+                    // The path's own tiles at the rung (what a load ran a
+                    // whole step by, its fires laid at the rung already) are
+                    // weighed whatever they pad to: every matmul kernel
+                    // guards the rows it is given, so a tile past a fire's
+                    // rows reads and writes none of them.
+                    if !kernels.contains(&t) && (tile(t) <= widest || paths.contains(&t)) {
                         kernels.push(t);
                     }
                 }
