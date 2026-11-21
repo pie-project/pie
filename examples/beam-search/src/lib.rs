@@ -187,6 +187,13 @@ async fn main(input: Input) -> Result<String> {
     // Why the search stopped short of `max_tokens`, where it did: its beams'
     // pool outgrew the kv pool (refused by name; the columns before stand).
     let mut stopped: Option<String> = None;
+    // The finish's check (`verify`): how far the adopted set's next-token
+    // score lay from an unbranched decode's, and its room.
+    let mut finished: Option<(f32, f32, f32)> = None;
+    // The parents the last fire's epilogue picked: the device's lists are
+    // the last fire's beams', so the final beam `l` lies on beam
+    // `last_parents[l]`'s pages (its last token on none).
+    let mut last_parents: Vec<u32> = (0..b).collect();
     if decodes > 0 {
         let scores = Channel::from(&final_scores[..]);
         let toks = Channel::from(&first[..]);
@@ -306,6 +313,7 @@ async fn main(input: Input) -> Result<String> {
                 }
                 greedy_mismatches += picked.iter().zip(&greedy).filter(|(p, g)| p != g).count();
                 hypotheses = advance_hypotheses(&hypotheses, &picked, &parents)?;
+                last_parents.clone_from(&parents);
                 scored = advance(&scored, &final_scores, &parents)?;
                 step += 1;
             }
@@ -341,6 +349,7 @@ async fn main(input: Input) -> Result<String> {
                 };
                 greedy_mismatches += picked.iter().zip(&greedy).filter(|(p, g)| p != g).count();
                 hypotheses = advance_hypotheses(&hypotheses, &picked, &parents)?;
+                last_parents.clone_from(&parents);
                 scored = advance(&scored, &final_scores, &parents)?;
                 step += 1;
                 Ok(ControlFlow::Continue(()))
@@ -353,6 +362,54 @@ async fn main(input: Input) -> Result<String> {
                 } else {
                     return Err(e);
                 }
+            }
+            // The search's finish (BEAM-PAGE-LISTS.md §6.6), checked under
+            // `verify`: the set holds the best beam's hypothesis in its own
+            // order, and a plain fire on it scores the next token as an
+            // unbranched decode of the same tokens does.
+            if verify && stopped.is_none() && step > 0 {
+                let best = final_scores
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, x)| a.total_cmp(x))
+                    .map_or(0, |(index, _)| index);
+                let fired = u32::try_from(step).map_err(|_| "steps past u32")?;
+                // `BeamGroup::finish`, its group moved into the epilogue: the
+                // set's slots `[n, n + fired)`.
+                // `--corrupt finish`: the set adopts another beam than the one
+                // checked, the control the finish's check must catch.
+                // The final beam adopted (its parent's pages, the last fire's
+                // beam); under the control, the one whose hypothesis parts
+                // from the checked one's earliest.
+                let adopted = if input.corrupt.as_deref() == Some("finish") {
+                    let shared = |lane: usize| {
+                        hypotheses[lane]
+                            .iter()
+                            .zip(&hypotheses[best])
+                            .take_while(|(x, y)| x == y)
+                            .count()
+                    };
+                    let lane = (0..b as usize)
+                        .filter(|&lane| lane != best)
+                        .min_by_key(|&lane| shared(lane))
+                        .unwrap_or(best);
+                    // A beam that parts from the checked one only at its last
+                    // token (which no fire fed, so no row holds) holds the
+                    // same rows: no control.
+                    if shared(lane) + 1 >= hypotheses[best].len() {
+                        return Err("the finish's control: every beam holds the checked \
+                                    hypothesis's rows (they part at the last token at most), \
+                                    so adopting another proves nothing"
+                            .into());
+                    }
+                    lane
+                } else {
+                    best
+                };
+                let device_beam = last_parents.get(adopted).copied().unwrap_or(0);
+                fwd.adopt_beam(device_beam, n + fired)
+                    .context("finish the search")?;
+                finished = Some(finish_check(&ws, &prompt, &hypotheses[best], n + fired, b).await?);
             }
         }
     }
@@ -420,10 +477,79 @@ async fn main(input: Input) -> Result<String> {
         String::new()
     };
     Ok(format!(
-        "{text}\n[beam] width={b} steps={max_steps} best_score={:.4}{verified}{}",
+        "{text}\n[beam] width={b} steps={max_steps} best_score={:.4}{verified}{}{}",
         final_scores[best_lane],
+        finished.map_or(String::new(), |(apart, room, got)| format!(
+            " finished_apart={apart:.6} finished_room={room:.3} finished_got={got:.6}"
+        )),
         stopped.map_or(String::new(), |why| format!(" stopped {why}"))
     ))
+}
+
+/// After a search's finish, one plain fire on its working set: the last
+/// token of `hypothesis` (the one the search fed no fire) at slot `slot`,
+/// folding, its second-ranked next token's log-probability against an
+/// unbranched decode of `prompt` and `hypothesis` and that token (`rescore`,
+/// `width` rows for the drift). How far apart, the room, and its score; past
+/// the room it fails by name.
+async fn finish_check(
+    ws: &WorkingSet,
+    prompt: &[u32],
+    hypothesis: &[u32],
+    slot: u32,
+    width: u32,
+) -> Result<(f32, f32, f32)> {
+    let v = model::output_vocab_size();
+    let last = *hypothesis.last().ok_or("an empty hypothesis")?;
+    let pipeline = Pipeline::new();
+    let toks = Channel::from([last as i32]);
+    let indptr = Channel::from([0u32, 1]);
+    let positions = Channel::from([slot]);
+    let slots = Channel::from([slot]);
+    let out = Channel::new([1], dtype::f32);
+    let next = Channel::new([1], dtype::i32);
+    let fwd = ForwardPass::new();
+    fwd.embed(&toks, &indptr)?;
+    fwd.state(
+        &[ws],
+        StateGeometry {
+            positions: Some(&positions),
+            slots: Some(&slots),
+            ..StateGeometry::folding()
+        },
+    )
+    .context("bind the finished set")?;
+    fwd.epilogue(move || {
+        // The second-ranked token: its log-probability moves with the context
+        // even where the first is near certain (log-probability near 0 under
+        // any context, which no check could tell apart).
+        let logits = cast(reshape(intrinsics::output(0, "logits"), [v]), dtype::bf16);
+        let (s, i) = top_k(log_softmax(&logits), 2);
+        out.put(cast(gather(&s, iota(1) + 1u32), dtype::f32));
+        next.put(cast(gather(&i, iota(1) + 1u32), dtype::i32));
+    });
+    fwd.submit(&pipeline).context("finished-set submit")?;
+    let got = out.take_host::<Vec<f32>>().await.context("finished-set drain")?;
+    let token = next.take_host::<Vec<i32>>().await.context("finished-set drain")?;
+    pipeline.close();
+    let (got, token) = match (got.first(), token.first()) {
+        (Some(&got), Some(&token)) => (got, token as u32),
+        _ => return Err("the finished set's fire returned nothing".into()),
+    };
+    let mut forced = hypothesis.to_vec();
+    forced.push(token);
+    let rescored = rescore(prompt, &forced, width).await?;
+    let want = rescored.last().ok_or("the unbranched decode returned nothing")?;
+    let apart = (got - want.step).abs();
+    if apart > want.room {
+        return Err(format!(
+            "after its finish the set scored the next token {got:.4} and an unbranched decode \
+             {:.4}: {apart:.4} apart, past {:.3}; its pages are not its beam's",
+            want.step, want.room
+        )
+        .into());
+    }
+    Ok((apart, want.room, got))
 }
 
 /// Whether a fire's refusal says the beams' pool outgrew what the kv pool

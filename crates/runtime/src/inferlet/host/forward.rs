@@ -511,6 +511,7 @@ impl ProcessCtx {
             kv_len,
             fold,
             parents,
+            parents_end,
         } = geom;
         if lanes.is_empty() {
             return Ok(Err(
@@ -535,6 +536,19 @@ impl ProcessCtx {
                         .to_string(),
                 ));
             }
+            if parents_end.is_none_or(|end| end == 0) {
+                return Ok(Err(
+                    "forward pass state binds parents with no parents-end; a beam group states \
+                     the slot past its search's last row, which its page lists are laid for"
+                        .to_string(),
+                ));
+            }
+        } else if parents_end.is_some() {
+            return Ok(Err(
+                "forward pass state states a parents-end with no parents; only a beam group \
+                 has a search's depth"
+                    .to_string(),
+            ));
         }
         for channel in [&positions, &slots, &kv_len, &fold, &parents]
             .into_iter()
@@ -558,6 +572,7 @@ impl ProcessCtx {
             kv_len: kv_len.map(|resource| resource.rep()),
             fold: fold.map(|resource| resource.rep()),
             parents: parents.map(|resource| resource.rep()),
+            parents_end,
         };
         let pass = self.ctx().table.get(&this)?;
         if pass.is_bound() {
@@ -1356,6 +1371,16 @@ impl ProcessCtx {
                 seeds: instance_seeds,
             };
             let process_id = self.id();
+            // A beam group's depth (`parents-end`): its page lists are laid
+            // for it at the bind, as the most keys a lane reads.
+            let beam_end = self
+                .ctx()
+                .table
+                .get(&this)?
+                .bindings
+                .state
+                .as_ref()
+                .and_then(|state| state.parents_end);
             let (registered, bound_instance, scheduler) = match crate::inferlet::process::said(
                 "bind",
                 process_id,
@@ -1368,8 +1393,10 @@ impl ProcessCtx {
                     seed_values,
                     geometry_class,
                     ::engine::BindExtents {
-                        sampled_rows: bind_rows(decode_envelope, pricing_rows).0,
-                        rows_per_lane: bind_rows(decode_envelope, pricing_rows).1,
+                        // The rows the instance reads: a beam group's
+                        // instance reads its beams' rows, one a lane.
+                        sampled_rows: pricing_rows.max(1),
+                        key_len: beam_end.unwrap_or(::engine::BindExtents::default().key_len),
                         ..::engine::BindExtents::default()
                     },
                     // The ports the program computes on the device: the
@@ -1496,6 +1523,96 @@ impl pie::inferlet::forward::Host for ProcessCtx {
     }
 }
 
+impl ProcessCtx {
+    /// A beam search's finish (`forward.wit` `adopt-beam`,
+    /// `BEAM-PAGE-LISTS.md` §6.6): beam `beam`'s page list read from the
+    /// pass's instance (behind its fires, on the engine's lane), then its
+    /// working set's pages past `f0` re-listed to it, kv and (on a hybrid)
+    /// recurrent rows alike, up to slot `end`.
+    async fn core_adopt_beam(
+        &mut self,
+        this: Resource<ForwardPass>,
+        beam: u32,
+        end: u32,
+    ) -> Anyhow<Result<(), String>> {
+        let (instance, scheduler, kv_rep, rs_rep) = {
+            let pass = self.ctx().table.get(&this)?;
+            if pass.bindings.state.as_ref().and_then(|state| state.parents).is_none() {
+                return Ok(Err(
+                    "adopt-beam: the pass binds no parents (it runs no beam group)".to_string(),
+                ));
+            }
+            let bound = match pass.bound() {
+                Ok(bound) => bound,
+                Err(error) => return Ok(Err(format!("adopt-beam: {error}"))),
+            };
+            (
+                bound.bound_instance.instance_id,
+                bound.scheduler.clone(),
+                bound.kv_lanes.first().copied(),
+                bound.rs_ws.first().copied(),
+            )
+        };
+        let Some(kv_rep) = kv_rep else {
+            return Ok(Err("adopt-beam: the pass's lanes name no working set".to_string()));
+        };
+        let kv: crate::store::kv::working_set::KvWorkingSet =
+            self.ctx()
+                .table
+                .get(&Resource::<crate::store::kv::working_set::KvWorkingSet>::new_borrow(kv_rep))?
+                .clone();
+        let bytes = match scheduler
+            .host_kv(crate::scheduler::worker::HostKvOp::BeamList(instance, beam))
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(error) => return Ok(Err(format!("adopt-beam: beam {beam}'s page list: {error}"))),
+        };
+        let list: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+            .collect();
+        let stores = crate::store::registry::get(kv.model, kv.engine);
+        let page = stores.kv_page_size.max(1);
+        let folded = match crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |s| {
+            s.folded(kv.id)
+        }) {
+            Ok(folded) => u32::try_from(folded).unwrap_or(u32::MAX),
+            Err(error) => return Ok(Err(format!("adopt-beam: {error}"))),
+        };
+        let f0 = folded / page;
+        if end <= f0 * page {
+            return Ok(Err(format!(
+                "adopt-beam: the search ends at slot {end}, below its first page's {}",
+                f0 * page
+            )));
+        }
+        let columns = ((end - 1) / page - f0 + 1) as usize;
+        let Some(order) = list.get(..columns) else {
+            return Ok(Err(format!(
+                "adopt-beam: the search's {columns} column(s) pass beam {beam}'s list of {}",
+                list.len()
+            )));
+        };
+        if let Err(error) = crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |s| {
+            s.relist_beam(kv.id, u64::from(f0), order)
+        }) {
+            return Ok(Err(format!("adopt-beam: kv: {error}")));
+        }
+        if let Some(rs_rep) = rs_rep {
+            let rs: crate::store::rs::working_set::RsWorkingSet =
+                self.ctx()
+                    .table
+                    .get(&Resource::<crate::store::rs::working_set::RsWorkingSet>::new_borrow(rs_rep))?
+                    .clone();
+            if let Err(error) = stores.rs.lock().unwrap().relist_beam(rs.id, f0, page, order, end) {
+                return Ok(Err(format!("adopt-beam: recurrent rows: {error}")));
+            }
+        }
+        Ok(Ok(()))
+    }
+}
+
 impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
     async fn new(&mut self) -> Anyhow<Resource<ForwardPass>> {
         self.core_new().await
@@ -1584,6 +1701,15 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
         id: u32,
     ) -> Anyhow<Result<(), String>> {
         self.core_group(this, lane, id).await
+    }
+
+    async fn adopt_beam(
+        &mut self,
+        this: Resource<ForwardPass>,
+        beam: u32,
+        end: u32,
+    ) -> Anyhow<Result<(), String>> {
+        self.core_adopt_beam(this, beam, end).await
     }
 
     async fn mask(
@@ -1830,6 +1956,7 @@ mod tests {
             kv_len: Some(4),
             fold: Some(6),
             parents: None,
+            parents_end: None,
         };
         let forks = StateBinding {
             lanes: vec![7, 8],
@@ -1841,36 +1968,5 @@ mod tests {
             ..forks
         };
         assert_eq!(state_rebind_diff(&bound, &moved), Some("positions"));
-    }
-}
-
-/// The readout rows a pass's bind states, by instance and by lane: an
-/// instance reads the rows its program prices; a beam group's (`parents`)
-/// beams are each a lane reading one row of them, any other pass's lanes
-/// read what the instance does. An engine checks the figure its readout
-/// seats are laid by (engine-cuda the instance's, engine-metal the lane's).
-fn bind_rows(envelope: Option<PortMask>, pricing_rows: u32) -> (u32, u32) {
-    let instance = pricing_rows.max(1);
-    if envelope.is_some_and(|ports| ports.contains(eta_ir::registry::Port::Parents)) {
-        (instance, 1)
-    } else {
-        (instance, instance)
-    }
-}
-
-#[cfg(test)]
-mod bind_rows_tests {
-    use super::{PortMask, bind_rows};
-
-    #[test]
-    fn a_beam_group_of_eight_reads_eight_rows_an_instance_and_one_a_lane() {
-        let parents = PortMask::NONE.with(eta_ir::registry::Port::Parents);
-        // Eight beams: the instance reads all eight rows (engine-cuda's
-        // seats), each beam's lane one (a load laying fewer rows a lane than
-        // the beams, Metal's 5, binds them).
-        assert_eq!(bind_rows(Some(parents), 8), (8, 1));
-        // A pass of no beam group: its lanes read what its instance does.
-        assert_eq!(bind_rows(Some(PortMask::NONE), 8), (8, 8));
-        assert_eq!(bind_rows(None, 0), (1, 1));
     }
 }

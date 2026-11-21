@@ -27,7 +27,6 @@ const EXTENTS: BindExtents = BindExtents {
     row_count: 1,
     token_count: ROWS,
     sampled_rows: 1,
-    rows_per_lane: 1,
     query_len: ROWS,
     key_len: 1,
 };

@@ -29,6 +29,7 @@ members = [
     "test-route",
     "test-share",
     "test-pressure",
+    "test-pause",
 ]
 
 [profile.release]

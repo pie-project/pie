@@ -2403,9 +2403,24 @@ impl Pools {
     /// the bytes, each a run of `Instance` slots where the runtime lays it
     /// so, else one run of the adjacent chunks that hold the larger, which
     /// a segment must hold.
-    pub fn guest_state(&self, per_instance: u64, per_pair: u64) -> Result<engine::GuestState> {
+    pub fn guest_state(
+        &self,
+        per_instance: u64,
+        resident: u64,
+        per_pair: u64,
+    ) -> Result<engine::GuestState> {
         let layout = self.chunks.layout();
         let chunk = layout.chunk_bytes.max(1);
+        // The resident state is one run of slots in a chunk, moved as the
+        // instance's tables are.
+        if resident > chunk {
+            return Err(Fault::Ceiling {
+                what: "bytes of a guest's resident state (a beam group's page lists for its \
+                       depth), which lie in one chunk",
+                need: resident,
+                have: chunk,
+            });
+        }
         let run =
             u32::try_from(per_instance.max(per_pair).div_ceil(chunk)).unwrap_or(u32::MAX);
         if run > layout.segment_chunks {
@@ -2416,10 +2431,10 @@ impl Pools {
             });
         }
         Ok(engine::GuestState {
-            // Today's arms are folded into the instance's bytes: one arm, no
-            // scratch apart.
-            resident: per_instance,
-            scratch: 0,
+            // The lane's scratch is dead between fires (one arm); what a later
+            // fire reads is resident.
+            resident,
+            scratch: per_instance,
             scratch_arms: 1,
             per_pair,
             run,

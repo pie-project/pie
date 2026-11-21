@@ -126,7 +126,7 @@ fn a_restore_short_of_room_for_its_roles_waits_then_evicts_once_stalled() {
     ]);
     park_restore(&mut inner, pids[0], 4);
     assert_eq!(
-        inner.restore_gate(pids[0], 64),
+        inner.restore_gate(pids[0]),
         RestoreGate::Serve,
         "control"
     );
@@ -135,9 +135,15 @@ fn a_restore_short_of_room_for_its_roles_waits_then_evicts_once_stalled() {
         pieces: 1,
         pages: 3,
     });
-    assert!(!inner.fleet_stalled());
+    // The resident decodes: a fire of its in flight.
+    {
+        let proc = inner.procs.get_mut(&pids[1]).unwrap();
+        proc.fires = 1;
+        proc.fired_at = crate::rt::Instant::now();
+    }
+    assert!(!inner.nothing_in_flight());
     assert_eq!(
-        inner.restore_gate(pids[0], 64),
+        inner.restore_gate(pids[0]),
         RestoreGate::Evict {
             need: (3, 1),
             fund: false
@@ -147,17 +153,21 @@ fn a_restore_short_of_room_for_its_roles_waits_then_evicts_once_stalled() {
     );
     inner.completion_credit = 1;
     assert_eq!(
-        inner.restore_gate(pids[0], 64),
+        inner.restore_gate(pids[0]),
         RestoreGate::Serve,
         "a completion's credit"
     );
     assert_eq!(inner.completion_credit, 0);
-    // The resident waits at a bind for room: it makes no progress, so the
-    // fleet is stalled and the restore's runs are funded.
-    inner.procs.get_mut(&pids[1]).unwrap().bind_waiting = true;
-    assert!(inner.fleet_waits_at_binds(), "the fleet waits at binds");
+    // Its fire landed and it waits at a bind for room: nothing in flight
+    // frees room, and the restore's runs are funded.
+    {
+        let proc = inner.procs.get_mut(&pids[1]).unwrap();
+        proc.fires = 0;
+        proc.bind_waiting = true;
+    }
+    assert!(inner.nothing_in_flight(), "nothing in flight frees room");
     assert_eq!(
-        inner.restore_gate(pids[0], 0),
+        inner.restore_gate(pids[0]),
         RestoreGate::Evict {
             need: (3, 1),
             fund: true
@@ -367,5 +377,63 @@ fn a_preempted_process_holds_back_only_what_it_outranks() {
     assert!(
         inner.procs[&newcomer].rank() <= floor,
         "a higher key starts ahead of a lower-keyed preempted process"
+    );
+}
+
+/// A roles-short restore at the head behind which another process waits at
+/// a bind is funded while a steady decoder keeps firing: that bind goes only
+/// once the head is served, so nothing the fleet does frees the head's room,
+/// and a decoder that never stops firing never stalls the fleet. Funded only
+/// once nothing was in flight, the head starved behind the decoder. Without
+/// a bind waiting behind it, a firing fleet still leaves it unfunded.
+#[test]
+fn a_roles_short_head_with_a_bind_waiting_behind_it_is_funded_while_a_decoder_fires() {
+    let (mut inner, pids) = fleet(&[
+        (1, Residency::Evicted, true),
+        (2, Residency::Resident, true),
+        (3, Residency::Resident, true),
+    ]);
+    let (head, decoder, binder) = (pids[0], pids[1], pids[2]);
+    park_restore(&mut inner, head, 4);
+    inner.procs.get_mut(&head).unwrap().roles_short = Some(super::proc::PendingBind {
+        run: 3,
+        pieces: 1,
+        pages: 3,
+    });
+    // The decoder fires, and keeps firing.
+    {
+        let proc = inner.procs.get_mut(&decoder).unwrap();
+        proc.fires = 1;
+        proc.fired_at = crate::rt::Instant::now();
+    }
+    assert!(!inner.nothing_in_flight());
+    assert_eq!(
+        inner.restore_gate(head),
+        RestoreGate::Evict {
+            need: (3, 1),
+            fund: false
+        },
+        "control: nothing waits behind it, and the fleet decodes"
+    );
+    // A process waits at a bind behind it.
+    inner.procs.get_mut(&binder).unwrap().bind_waiting = true;
+    assert!(!inner.nothing_in_flight(), "the decoder has not stopped");
+    assert_eq!(
+        inner.restore_gate(head),
+        RestoreGate::Evict {
+            need: (3, 1),
+            fund: true
+        },
+        "a bind behind it: room is made for it while the decoder fires"
+    );
+    // The head's own bind wait is no reason: only another's.
+    inner.procs.get_mut(&binder).unwrap().bind_waiting = false;
+    inner.procs.get_mut(&head).unwrap().bind_waiting = true;
+    assert_eq!(
+        inner.restore_gate(head),
+        RestoreGate::Evict {
+            need: (3, 1),
+            fund: false
+        }
     );
 }
