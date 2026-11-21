@@ -38,6 +38,8 @@ pub struct Fire<'a> {
     pub islands: &'a [u8],
     /// [`BodyKey::rs`] as prepared for this fire.
     pub rs: RsBody,
+    /// [`BodyKey::group_folds`] as prepared for this fire.
+    pub group_folds: bool,
 }
 #[derive(Default)]
 pub struct Bodies {
@@ -990,6 +992,7 @@ impl Bodies {
         );
         key.islands = at.islands.into();
         key.rs = at.rs;
+        key.group_folds = at.group_folds;
 
         crate::serve::btrace::mark("key");
         let at_seq = self.recorder.at_seq;
