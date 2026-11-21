@@ -232,6 +232,12 @@ pub(crate) struct FramePolicy {
     slotted: BTreeSet<ProcessId>,
     departing: BTreeSet<ProcessId>,
     suspended: BTreeSet<ProcessId>,
+    /// Lanes whose pipeline closed, by lane, with their owner: kept until
+    /// the owner leaves, so a fire that raced the close rides the next seal
+    /// as a straggler and never makes the lane expected again (a closed
+    /// lane re-expected by such a fire held every later frame for good:
+    /// the Mac's verified beamx8 on 30de3bee6).
+    closed: BTreeMap<ProcessId, Option<ProcessId>>,
     truncated_seqs: BTreeMap<ProcessId, u64>,
     strict_watchdog_deadline: Option<Instant>,
     /// When a held frame last said which lanes it waits on.
@@ -325,6 +331,7 @@ impl FramePolicy {
             slotted: BTreeSet::new(),
             departing: BTreeSet::new(),
             suspended: BTreeSet::new(),
+            closed: BTreeMap::new(),
             truncated_seqs: BTreeMap::new(),
             strict_watchdog_deadline: None,
             hold_said: None,
@@ -415,7 +422,11 @@ impl FramePolicy {
             self.joins_in_flight.remove(&owner);
         }
         let lane_owner = owner.or_else(|| self.lanes.get(&stamp.lane).and_then(|lane| lane.owner));
-        let suspended = lane_owner.is_some_and(|owner| self.suspended.contains(&owner));
+        // An owner suspended is not waited for, nor a lane whose pipeline
+        // closed: a fire of theirs that raced the park or the close rides
+        // the next seal, the lane not expected.
+        let suspended = lane_owner.is_some_and(|owner| self.suspended.contains(&owner))
+            || self.closed.contains_key(&stamp.lane);
         let late = match self.truncated_seqs.get(&stamp.lane).copied() {
             Some(seq) if seq == stamp.seq => true,
             Some(seq) if seq < stamp.seq => {
@@ -647,19 +658,22 @@ impl FramePolicy {
             self.lanes.remove(&lane);
             self.truncated_seqs.remove(&lane);
             self.in_flight_lanes.remove(&lane);
-        } else if let Some(state) = self.lanes.get_mut(&lane) {
-            if state.awaited {
-                trace_unawait("close", lane, owner);
-            }
-            state.awaited = false;
-            state.parked = true;
-            self.truncate_incomplete(lane);
-            let drained = self
-                .lanes
-                .get(&lane)
-                .is_some_and(|state| state.frames.is_empty());
-            if drained {
-                self.lanes.remove(&lane);
+        } else {
+            self.closed.insert(lane, owner);
+            if let Some(state) = self.lanes.get_mut(&lane) {
+                if state.awaited {
+                    trace_unawait("close", lane, owner);
+                }
+                state.awaited = false;
+                state.parked = true;
+                self.truncate_incomplete(lane);
+                let drained = self
+                    .lanes
+                    .get(&lane)
+                    .is_some_and(|state| state.frames.is_empty());
+                if drained {
+                    self.lanes.remove(&lane);
+                }
             }
         }
         if let Some(owner) = owner {
@@ -683,6 +697,7 @@ impl FramePolicy {
         self.lanes.retain(|_, lane| lane.owner != Some(owner));
         self.pending_binds.remove(&owner);
         self.suspended.remove(&owner);
+        self.closed.retain(|_, by| *by != Some(owner));
         self.forget_staged(owner);
         self.maybe_reset_episode();
     }
@@ -1712,6 +1727,76 @@ mod tests {
         a_prompt_piece_cut_under_a_cap_since_lowered_waits_whole_and_owes_nothing();
         processes_over_the_execution_permits_joining_together_all_finish();
         joiners_waiting_on_a_claimant_s_prefix_hold_no_frame();
+        a_lane_closing_after_its_owner_s_wait_has_its_queued_frame_sealed();
+    }
+
+    /// The Mac's verified beamx8 on 30de3bee6: a verify beam's lane is
+    /// unawaited as its owner waits, rides a seal, submits a frame of two
+    /// fires and closes, a fire of its racing the close; the other lanes
+    /// close or leave. Its queued frame is complete and nothing else is
+    /// expected: it seals, and the closed lane is never expected again.
+    fn a_lane_closing_after_its_owner_s_wait_has_its_queued_frame_sealed() {
+        for late_after_close in [false, true] {
+            let mut policy = FramePolicy::new(2, 64, 4096, None).with_silence_timeout_off();
+            let (owner, other) = (pid(), pid());
+            let (lane, beside) = (pid(), pid());
+            let mut next = 1u64;
+            let mut submit = |policy: &mut FramePolicy, at: ProcessId, by: ProcessId, seq: u64, slots: std::ops::Range<u32>| {
+                let mut ids = Vec::new();
+                for slot in slots {
+                    policy.on_fire_enqueued(stamp(at, seq, slot, 2), Some(by), next, 1, 1);
+                    ids.push(next);
+                    next += 1;
+                }
+                ids
+            };
+            let mut queued = submit(&mut policy, lane, owner, 0, 0..2);
+            queued.extend(submit(&mut policy, beside, other, 0, 0..2));
+            let ids: QueuedFireIds = queued.iter().copied().collect();
+            assert_eq!(fires(&plan(&mut policy, &ids, Instant::now())).len(), 4);
+            policy.on_frame_posted([lane, beside], Instant::now());
+            policy.on_frame_retired([lane, beside]);
+            // Its owner waits (a rescore's bind): unawaited; the other lane's
+            // frame goes.
+            policy.on_owner_waits(owner);
+            let queued = submit(&mut policy, beside, other, 1, 0..2);
+            let ids: QueuedFireIds = queued.iter().copied().collect();
+            assert_eq!(fires(&plan(&mut policy, &ids, Instant::now())).len(), 2);
+            policy.on_frame_posted([beside], Instant::now());
+            policy.on_frame_retired([beside]);
+            // The other process ends.
+            policy.on_lane_leave(beside, Some(other), false);
+            policy.on_process_leave(other);
+            // Back, its lane submits a frame of two and closes; one fire
+            // races the close.
+            let mut queued = submit(&mut policy, lane, owner, 1, 0..1);
+            if late_after_close {
+                policy.on_lane_leave(lane, Some(owner), false);
+                queued.extend(submit(&mut policy, lane, owner, 1, 1..2));
+            } else {
+                queued.extend(submit(&mut policy, lane, owner, 1, 1..2));
+                policy.on_lane_leave(lane, Some(owner), false);
+            }
+            let ids: QueuedFireIds = queued.iter().copied().collect();
+            let mut sent = Vec::new();
+            for _ in 0..4 {
+                match plan(&mut policy, &ids, Instant::now()) {
+                    FramePlan::Dispatch(waves) => sent.extend(waves.into_iter().flatten()),
+                    _ => break,
+                }
+            }
+            sent.sort_unstable();
+            assert_eq!(
+                sent, queued,
+                "late_after_close={late_after_close}: the closed lane's queued frame goes: {}",
+                policy.debug_summary()
+            );
+            assert!(
+                policy.lanes.values().all(|lane| !lane.awaited),
+                "late_after_close={late_after_close}: a closed lane is not expected again: {}",
+                policy.debug_summary()
+            );
+        }
     }
 
     /// More processes than execution permits arrive together (gemma-4-E2B
