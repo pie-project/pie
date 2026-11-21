@@ -156,6 +156,10 @@ async fn main(input: Input) -> Result<String> {
     // `verify`: serving reads no argmax it does not use.
     let verify = input.verify;
     let greedy_p = verify.then(|| Channel::new([1], dtype::i32));
+    // Beside it, the raw row's two largest logits: a width-1 pick that parts
+    // from the argmax is a near tie where their gap is within the numeric
+    // room (the identity's check, `identity_room`).
+    let top2_p = verify.then(|| Channel::new([2], dtype::f32));
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
     fwd_p
@@ -171,6 +175,10 @@ async fn main(input: Input) -> Result<String> {
         if let Some(greedy_p) = greedy_p {
             greedy_p.put(reshape(reduce_argmax(&logits), [1]));
         }
+        if let Some(top2_p) = top2_p {
+            let (two, _) = top_k(&logits, 2);
+            top2_p.put(cast(reshape(two, [2]), dtype::f32));
+        }
     });
     fwd_p.submit(&pipeline).context("prefill submit")?;
     let first = out_p
@@ -182,12 +190,20 @@ async fn main(input: Input) -> Result<String> {
         .await
         .context("prefill drain")?;
     let mut greedy_mismatches = 0;
+    let mut identity = Identity::default();
     if let Some(greedy_p) = greedy_p {
         let greedy = greedy_p
             .take_host::<Vec<i32>>()
             .await
             .context("prefill drain")?;
-        greedy_mismatches += usize::from(first.first() != greedy.first());
+        let two = match top2_p {
+            Some(top2_p) => top2_p.take_host::<Vec<f32>>().await.context("prefill drain")?,
+            None => Vec::new(),
+        };
+        if first.first() != greedy.first() {
+            greedy_mismatches += 1;
+            identity.part(0, &two);
+        }
     }
     let mut hypotheses: Vec<Vec<u32>> = first.iter().map(|&token| vec![token as u32]).collect();
     // Each lane's score after each of its steps, its ancestry's first.
@@ -201,6 +217,8 @@ async fn main(input: Input) -> Result<String> {
         let out_scr = Channel::new([b], dtype::f32).capacity(channel_capacity() as u32);
         let out_greedy =
             verify.then(|| Channel::new([b], dtype::i32).capacity(channel_capacity() as u32));
+        let out_top2 = (verify && b == 1)
+            .then(|| Channel::new([2], dtype::f32).capacity(channel_capacity() as u32));
         let lanes_b = Channel::from_iter(0u32..=b);
 
         let corrupt_parent = input.corrupt.as_deref() == Some("parent");
@@ -259,6 +277,10 @@ async fn main(input: Input) -> Result<String> {
             // Cross-check: at `beams == 1` the raw-logit argmax must equal the beam pick every step.
             if let Some(out_greedy) = out_greedy {
                 out_greedy.put(reshape(reduce_argmax(&logits), [b]));
+            }
+            if let Some(out_top2) = out_top2 {
+                let (two, _) = top_k(reshape(&logits, [v]), 2);
+                out_top2.put(cast(reshape(two, [2]), dtype::f32));
             }
 
             let base = fill.take(); // [1]
@@ -345,7 +367,18 @@ async fn main(input: Input) -> Result<String> {
                         }
                     }
                 }
-                greedy_mismatches += picked.iter().zip(&greedy).filter(|(p, g)| p != g).count();
+                let two = match out_top2 {
+                    Some(out_top2) => out_top2
+                        .take_host::<Vec<f32>>()
+                        .await
+                        .with_context(|| format!("@{step}"))?,
+                    None => Vec::new(),
+                };
+                let parted = picked.iter().zip(&greedy).filter(|(p, g)| p != g).count();
+                if parted > 0 && b == 1 {
+                    identity.part(step + 1, &two);
+                }
+                greedy_mismatches += parted;
                 hypotheses = advance_hypotheses(&hypotheses, &picked, &parents)?;
                 scored = advance(&scored, &final_scores, &parents)?;
                 step += 1;
@@ -371,7 +404,18 @@ async fn main(input: Input) -> Result<String> {
                         .with_context(|| format!("@{step}"))?,
                     None => picked.clone(),
                 };
-                greedy_mismatches += picked.iter().zip(&greedy).filter(|(p, g)| p != g).count();
+                let two = match out_top2 {
+                    Some(out_top2) => out_top2
+                        .take_host::<Vec<f32>>()
+                        .await
+                        .with_context(|| format!("@{step}"))?,
+                    None => Vec::new(),
+                };
+                let parted = picked.iter().zip(&greedy).filter(|(p, g)| p != g).count();
+                if parted > 0 && b == 1 {
+                    identity.part(step + 1, &two);
+                }
+                greedy_mismatches += parted;
                 hypotheses = advance_hypotheses(&hypotheses, &picked, &parents)?;
                 scored = advance(&scored, &final_scores, &parents)?;
                 step += 1;
@@ -390,10 +434,13 @@ async fn main(input: Input) -> Result<String> {
         .ok_or("beam search produced no hypotheses")?;
     // The beam identity is only an identity at width 1; at B > 1 the top-B
     // block legitimately picks non-argmax continuations for the lower lanes.
-    if b == 1 && greedy_mismatches != 0 {
+    if b == 1
+        && let Some((at, gap, room)) = identity.fault
+    {
         return Err(format!(
-            "beam identity violated: width-1 beam search disagreed with greedy \
-                 argmax on {greedy_mismatches} of {max_steps} steps"
+            "beam identity violated: width-1 beam search disagreed with greedy argmax on \
+             {greedy_mismatches} of {max_steps} steps, at step {at} with the raw logits' top two \
+             {gap:.4} apart, past the {room:.4} a rounding near tie spans"
         ));
     }
     let text = model::decode(&hypotheses[best_lane])?;
@@ -437,8 +484,9 @@ async fn main(input: Input) -> Result<String> {
             worst = worst.max((total - final_scores[lane]).abs());
         }
         format!(
-            " greedy_mismatches={greedy_mismatches} verified={} worst_apart={worst:.4} worst_step={closest:.3} max_drift={drift:.4}",
-            hypotheses.len()
+            " greedy_mismatches={greedy_mismatches} verified={} worst_apart={worst:.4} worst_step={closest:.3} max_drift={drift:.4}{}",
+            hypotheses.len(),
+            identity.ties()
         )
     } else {
         String::new()
@@ -447,6 +495,47 @@ async fn main(input: Input) -> Result<String> {
         "{text}\n[beam] width={b} steps={max_steps} best_score={:.4}{verified}",
         final_scores[best_lane]
     ))
+}
+
+/// Width 1's identity: each step its pick parted from the raw argmax, and the
+/// raw logits' top-two gap there. The pick reads the bf16 log-softmax, `x -
+/// lse` rounded once more at the log-probability's quantum, so two logits
+/// within a quantum of the larger apart may round to one value and the pick
+/// take either: a near tie, as the other checks allow. One farther apart is
+/// a fault.
+#[derive(Default)]
+struct Identity {
+    ties: Vec<(usize, f32)>,
+    fault: Option<(usize, f32, f32)>,
+}
+
+impl Identity {
+    fn part(&mut self, step: usize, two: &[f32]) {
+        let (gap, room) = match two {
+            [a, b, ..] => (a - b, identity_room(*a)),
+            _ => (f32::INFINITY, 0.0),
+        };
+        if gap <= room {
+            self.ties.push((step, gap));
+        } else if self.fault.is_none() {
+            self.fault = Some((step, gap, room));
+        }
+    }
+
+    fn ties(&self) -> String {
+        if self.ties.is_empty() {
+            return String::new();
+        }
+        let parts: Vec<String> = self.ties.iter().map(|(at, gap)| format!("{at}:{gap:.4}")).collect();
+        format!(" identity_ties={}", parts.join(","))
+    }
+}
+
+/// The room a raw top-two gap may be within and still part a width-1 pick
+/// from the argmax: the larger logit's quantum and the log-probability's,
+/// which is no wider (`|x - lse| <= |x|` past a near-certain token).
+fn identity_room(top: f32) -> f32 {
+    2.0 * quantum(top)
 }
 
 /// The quantum of `x` in the dtype it was stored in: the gap between it and
