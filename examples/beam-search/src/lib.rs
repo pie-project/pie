@@ -156,6 +156,16 @@ async fn main(input: Input) -> Result<String> {
     // `verify`: serving reads no argmax it does not use.
     let verify = input.verify;
     let greedy_p = verify.then(|| Channel::new([1], dtype::i32));
+    // Under `verify`, each pick's own log-probability, target logit and
+    // largest logit, as this fire computed them: the beam's record of its
+    // candidates, which its scores must carry exactly.
+    let record_p = verify.then(|| {
+        (
+            Channel::new([b], dtype::f32),
+            Channel::new([b], dtype::f32),
+            Channel::new([b], dtype::f32),
+        )
+    });
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
     fwd_p
@@ -170,6 +180,14 @@ async fn main(input: Input) -> Result<String> {
         scr_p.put(cast(&s, dtype::f32));
         if let Some(greedy_p) = greedy_p {
             greedy_p.put(reshape(reduce_argmax(&logits), [1]));
+        }
+        if let Some((own, picked, largest)) = record_p {
+            own.put(cast(&s, dtype::f32));
+            picked.put(cast(gather(&logits, &i), dtype::f32));
+            largest.put(broadcast(
+                reshape(cast(reduce_max(&logits), dtype::f32), [1]),
+                [b],
+            ));
         }
     });
     fwd_p.submit(&pipeline).context("prefill submit")?;
@@ -195,6 +213,19 @@ async fn main(input: Input) -> Result<String> {
     // Each step's best score, the one the next fire's candidates are taken
     // relative to.
     let mut bests: Vec<f32> = vec![best_of(&final_scores)];
+    // Under `verify`, each lane's own candidates along its ancestry
+    // (log-probability, target logit, largest logit), as its fires computed
+    // them.
+    let mut record: [Vec<Vec<f32>>; 3] = Default::default();
+    if let Some((own, picked, largest)) = record_p {
+        for (slot, channel) in record.iter_mut().zip([own, picked, largest]) {
+            let got = channel
+                .take_host::<Vec<f32>>()
+                .await
+                .context("prefill drain")?;
+            *slot = got.iter().map(|&x| vec![x]).collect();
+        }
+    }
 
     // Why the search stopped short of `max_tokens`, where it did: its beams'
     // pool outgrew the kv pool (refused by name; the columns before stand).
@@ -214,6 +245,10 @@ async fn main(input: Input) -> Result<String> {
         let out_scr = Channel::new([b], dtype::f32).capacity(channel_capacity() as u32);
         let out_greedy =
             verify.then(|| Channel::new([b], dtype::i32).capacity(channel_capacity() as u32));
+        let out_record = verify.then(|| {
+            let ring = || Channel::new([b], dtype::f32).capacity(channel_capacity() as u32);
+            (ring(), ring(), ring())
+        });
         let lanes_b = Channel::from_iter(0u32..=b);
 
         let corrupt_parent = input.corrupt.as_deref() == Some("parent");
@@ -240,7 +275,8 @@ async fn main(input: Input) -> Result<String> {
             let carried = scores.take();
             let best = reduce_max(&carried);
             let relative = cast(&carried - &best, dtype::bf16);
-            let cand = broadcast(reshape(relative, [b, 1]), [b, v]) + log_softmax(&logits);
+            let lsm = log_softmax(&logits);
+            let cand = broadcast(reshape(relative, [b, 1]), [b, v]) + &lsm;
             let (s, i) = top_k(reshape(cand, [b * v]), b);
             let s = cast(&s, dtype::f32) + &best;
             let parent = &i / v;
@@ -255,10 +291,24 @@ async fn main(input: Input) -> Result<String> {
             if let Some(out_greedy) = out_greedy {
                 out_greedy.put(reshape(reduce_argmax(&logits), [b]));
             }
+            // Each pick's own log-probability, its target logit, and its
+            // parent row's largest logit.
+            if let Some((own, picked, largest)) = out_record {
+                let flat = reshape(&logits, [b * v]);
+                own.put(cast(gather(reshape(&lsm, [b * v]), &i), dtype::f32));
+                picked.put(cast(gather(&flat, &i), dtype::f32));
+                let top = cast(reduce_argmax(&logits), dtype::u32);
+                let rows = gather(&flat, iota(b) * v + &top);
+                largest.put(cast(gather(&rows, &parent), dtype::f32));
+            }
 
             // `--corrupt parent`: each beam continues the next beam's
             // hypothesis, the control the verifier must catch.
-            let parent = if corrupt_parent { (&parent + 1u32) % b } else { parent };
+            let parent = if corrupt_parent {
+                (&parent + 1u32) % b
+            } else {
+                parent
+            };
             group.reorder(&cast(&parent, dtype::u32));
         });
 
@@ -315,6 +365,15 @@ async fn main(input: Input) -> Result<String> {
                     fwd_r.submit(&pipeline)?;
                     let _ = out_r.take_host::<Vec<i32>>().await?;
                 }
+                if let Some((own, picked, largest)) = out_record {
+                    for (slot, channel) in record.iter_mut().zip([own, picked, largest]) {
+                        let got = channel
+                            .take_host::<Vec<f32>>()
+                            .await
+                            .with_context(|| format!("@{step}"))?;
+                        *slot = advance(slot, &got, &parents)?;
+                    }
+                }
                 greedy_mismatches += picked.iter().zip(&greedy).filter(|(p, g)| p != g).count();
                 hypotheses = advance_hypotheses(&hypotheses, &picked, &parents)?;
                 last_parents.clone_from(&parents);
@@ -352,6 +411,15 @@ async fn main(input: Input) -> Result<String> {
                         .with_context(|| format!("@{step}"))?,
                     None => picked.clone(),
                 };
+                if let Some((own, picked, largest)) = out_record {
+                    for (slot, channel) in record.iter_mut().zip([own, picked, largest]) {
+                        let got = channel
+                            .take_host::<Vec<f32>>()
+                            .await
+                            .with_context(|| format!("@{step}"))?;
+                        *slot = advance(slot, &got, &parents)?;
+                    }
+                }
                 greedy_mismatches += picked.iter().zip(&greedy).filter(|(p, g)| p != g).count();
                 hypotheses = advance_hypotheses(&hypotheses, &picked, &parents)?;
                 last_parents.clone_from(&parents);
@@ -420,9 +488,8 @@ async fn main(input: Input) -> Result<String> {
                     Some("finish-stale") => FinishRead::Committed(n),
                     _ => FinishRead::Set,
                 };
-                finished = Some(
-                    finish_check(&ws, &prompt, &hypotheses[best], n + fired, b, read).await?,
-                );
+                finished =
+                    Some(finish_check(&ws, &prompt, &hypotheses[best], n + fired, b, read).await?);
             }
         }
     }
@@ -450,6 +517,8 @@ async fn main(input: Input) -> Result<String> {
     }
     let verified = if input.verify {
         let mut worst = 0f32;
+        // The most of its room any step's bookkeeping came to.
+        let mut closest_own = 0f32;
         // The step that came closest to its room (apart / room), and what
         // it was.
         let mut closest = 0f32;
@@ -459,20 +528,38 @@ async fn main(input: Input) -> Result<String> {
         let mut drift = 0f32;
         for (lane, hypothesis) in hypotheses.iter().enumerate() {
             let alone = rescore(&prompt, hypothesis, b).await?;
-            // Each step's log-probability as the beam took it (its score's
-            // step), against the hypothesis's own, within its room.
             drift = drift.max(alone.iter().map(|s| s.drift).fold(0.0, f32::max));
             let mut before = 0f32;
             for (at, (&after, rescored)) in scored[lane].iter().zip(&alone).enumerate() {
+                // Bookkeeping, exact: the step a lane's score took is the
+                // candidate its own fire computed, within that candidate's
+                // own rounding ([`candidate_rounding`]). A score, token or
+                // parent cell read from another lane misses it.
                 let took = after - before;
+                let mine = record[0][lane][at];
+                let rounding =
+                    candidate_rounding(mine, (at > 0).then(|| (before, after, bests[at - 1])));
+                let gap = (took - mine).abs();
+                closest_own = closest_own.max(gap / rounding);
+                if gap > rounding {
+                    return Err(format!(
+                        "beam {lane} took {took:.4} at step {at}, and its own fire's candidate \
+                         {mine:.4} there: {gap:.4} apart, past its rounding {rounding:.4}; a \
+                         score, token or parent cell read from another lane",
+                    ));
+                }
+                // Numerics: that candidate against the hypothesis's own,
+                // within its room. A recurrence or attention that read
+                // another beam's cells moves the beam's candidate, not the
+                // hypothesis's rescores.
                 let step = rescored.step;
-                let room = rescored.room(took, (at > 0).then(|| (before, after, bests[at - 1])));
-                let apart = (took - step).abs();
+                let room = rescored.room(mine, None);
+                let apart = (mine - step).abs();
                 if apart / room.total() > closest {
                     closest = apart / room.total();
                     closest_at = format!(
-                        "beam {lane} took {took:.4} at step {at}, and its hypothesis alone \
-                         {step:.4} there: {apart:.4} apart, room {room}"
+                        "beam {lane}'s fire took {mine:.4} at step {at}, and its hypothesis \
+                         alone {step:.4} there: {apart:.4} apart, room {room}"
                     );
                 }
                 before = after;
@@ -487,7 +574,7 @@ async fn main(input: Input) -> Result<String> {
             ));
         }
         format!(
-            " greedy_mismatches={greedy_mismatches} verified={} worst_apart={worst:.4} worst_step={closest:.3} max_drift={drift:.4} closest: {closest_at}",
+            " greedy_mismatches={greedy_mismatches} verified={} worst_apart={worst:.4} worst_own={closest_own:.3} worst_step={closest:.3} max_drift={drift:.4} closest: {closest_at}",
             hypotheses.len()
         )
     } else {
@@ -530,7 +617,11 @@ async fn finish_check(
         let fed: Vec<i32> = prompt
             .iter()
             .map(|&t| (t + 1) as i32)
-            .chain(hypothesis[..hypothesis.len() - 1].iter().map(|&t| (t + 1) as i32))
+            .chain(
+                hypothesis[..hypothesis.len() - 1]
+                    .iter()
+                    .map(|&t| (t + 1) as i32),
+            )
             .collect();
         let rows = u32::try_from(fed.len()).map_err(|_| "a sequence past u32 rows")?;
         let toks = Channel::from(&fed[..]);
@@ -576,8 +667,14 @@ async fn finish_check(
         next.put(cast(gather(&i, iota(1) + 1u32), dtype::i32));
     });
     fwd.submit(&pipeline).context("finished-set submit")?;
-    let got = out.take_host::<Vec<f32>>().await.context("finished-set drain")?;
-    let token = next.take_host::<Vec<i32>>().await.context("finished-set drain")?;
+    let got = out
+        .take_host::<Vec<f32>>()
+        .await
+        .context("finished-set drain")?;
+    let token = next
+        .take_host::<Vec<i32>>()
+        .await
+        .context("finished-set drain")?;
     pipeline.close();
     let (got, token) = match (got.first(), token.first()) {
         (Some(&got), Some(&token)) => (got, token as u32),
@@ -586,7 +683,9 @@ async fn finish_check(
     let mut forced = hypothesis.to_vec();
     forced.push(token);
     let rescored = rescore(prompt, &forced, width).await?;
-    let want = rescored.last().ok_or("the unbranched decode returned nothing")?;
+    let want = rescored
+        .last()
+        .ok_or("the unbranched decode returned nothing")?;
     // The set's fire rounds its logits and log-probability as the beam's
     // fires do, and takes no candidate: a step's room with nothing carried.
     let room = want.room(got, None);
@@ -619,7 +718,8 @@ enum FinishRead {
 /// pool has nothing left beside what it holds. The columns searched before
 /// stand as the output.
 fn outgrown(why: &str) -> bool {
-    why.contains("outgrows the kv pool") || why.contains("this process alone holds what the pool holds")
+    why.contains("outgrows the kv pool")
+        || why.contains("this process alone holds what the pool holds")
 }
 
 /// The gap between `x` and the next value away from zero in bf16 (8
@@ -652,6 +752,22 @@ struct Rescored {
     drift: f32,
 }
 
+/// The rounding a decode step's score carries over its own candidate's
+/// log-probability `own` (`carried`: the beam's score `before` it, `after`
+/// it, and the best score `best` its fire took candidates relative to): the
+/// relative score and the candidate (relative plus log-probability) rounded
+/// to bf16, its scores either side to f32. The prompt's step carries its
+/// candidate as its score: one f32 rounding.
+fn candidate_rounding(own: f32, carried: Option<(f32, f32, f32)>) -> f32 {
+    match carried {
+        None => ulp_f32(own),
+        Some((before, after, best)) => {
+            let relative = before - best;
+            ulp_bf16(relative) + ulp_bf16(relative + own) + ulp_f32(before) + ulp_f32(after)
+        }
+    }
+}
+
 impl Rescored {
     /// The room a beam's step `took` has from this rescore, each part a bf16
     /// (or f32) gap at the magnitude of the value it rounds:
@@ -660,13 +776,10 @@ impl Rescored {
     ///   fires. Two roundings of values a drift apart land at most that
     ///   drift and one gap apart: one gap at the larger log-probability, and
     ///   one each at the target logit and the largest logit (which leads the
-    ///   log-sum-exp). The beam's logits are not drained; they are the
-    ///   rescore's within the drift, so the rescore's give the magnitudes;
-    /// - a decode step (`carried`: the beam's score `before` it, `after` it,
-    ///   and the best score `best` its fire took candidates relative to)
-    ///   also rounds, on the beam alone, the relative score and the
-    ///   candidate (relative plus log-probability) to bf16, and its scores
-    ///   either side to f32;
+    ///   log-sum-exp). The beam's logits are the rescore's within the drift,
+    ///   so the rescore's give the magnitudes;
+    /// - a decode step's scores (`carried`, [`candidate_rounding`]), where
+    ///   `took` is a score's step rather than the fire's own candidate;
     /// - a drift: the beam's fires run other kernels than a 1-row fire
     ///   folding every step (other tiles, splits and reduction orders for
     ///   their rows, a recurrence read through an unfolded run, compounding
@@ -674,7 +787,10 @@ impl Rescored {
     ///   allows (no batch invariance); `drift` is this step's own measure of
     ///   it, the log-probability moved between that 1-row fire and the
     ///   hypothesis run as the beam's fires run ([`rescore`]). Both sides may
-    ///   carry one: twice the drift.
+    ///   carry one: twice the drift. It is one sample of that variance:
+    ///   these fires share their frames with whatever else the server runs
+    ///   then, as the beam's fires did with theirs, and the two need not
+    ///   have met the same neighbours.
     fn room(&self, took: f32, carried: Option<(f32, f32, f32)>) -> Room {
         let candidate = carried.map_or(0.0, |(before, after, best)| {
             ulp_bf16(before - best) + ulp_bf16(after - best) + ulp_f32(before) + ulp_f32(after)
@@ -793,7 +909,10 @@ async fn teacher_forced(
             // The first copy's row, at the sampler's bf16 grain.
             let logits = cast(
                 reshape(
-                    gather(reshape(intrinsics::output(0, "logits"), [copies, v]), iota(1)),
+                    gather(
+                        reshape(intrinsics::output(0, "logits"), [copies, v]),
+                        iota(1),
+                    ),
                     [v],
                 ),
                 dtype::bf16,
@@ -805,10 +924,23 @@ async fn teacher_forced(
         });
         fwd.submit(&pipeline).context("rescore submit")?;
         let got = out.take_host::<Vec<f32>>().await.context("rescore drain")?;
-        let step = got.first().copied().ok_or("the rescoring fire returned nothing")?;
-        let picked = picked.take_host::<Vec<f32>>().await.context("rescore drain")?;
-        let largest = largest.take_host::<Vec<f32>>().await.context("rescore drain")?;
-        let first = |of: &[f32]| of.first().copied().ok_or("the rescoring fire returned nothing");
+        let step = got
+            .first()
+            .copied()
+            .ok_or("the rescoring fire returned nothing")?;
+        let picked = picked
+            .take_host::<Vec<f32>>()
+            .await
+            .context("rescore drain")?;
+        let largest = largest
+            .take_host::<Vec<f32>>()
+            .await
+            .context("rescore drain")?;
+        let first = |of: &[f32]| {
+            of.first()
+                .copied()
+                .ok_or("the rescoring fire returned nothing")
+        };
         steps.push((step, first(&picked)?, first(&largest)?));
     }
     pipeline.close();
