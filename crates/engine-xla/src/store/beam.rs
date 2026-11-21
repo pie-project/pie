@@ -11,7 +11,7 @@ use crate::device::Device;
 use crate::trace::Handles;
 use crate::trace::Tracer;
 use kernels_xla::beam::{At, Layout};
-use kernels_xla::hlo::{Cmp, Combine, Elem};
+use kernels_xla::hlo::{Cmp, Elem};
 
 /// Words a pool row holds.
 const ROW_WORDS: i64 = 128;
@@ -184,18 +184,16 @@ impl Pools {
                 let translation = cx.read(pool_t)?;
                 let translation = cx.reshape(translation, &[cap])?;
                 // the state's rows and the parents cell's row
-                let rows_at = |cx: &mut crate::emit::Cx<'_>, first, n: i64| {
-                    let io = cx.iota(Elem::I32, &[n], 0);
-                    let first = cx.splat(first, &[n])?;
-                    cx.add(io, first)
-                };
-                let s_rows = rows_at(cx, state_row, state_rows)?;
-                let state = cx.take_rows(whole, s_rows)?;
+                // a run of pool rows moves by a slice, not a gather of its
+                // rows' indices (a gather or scatter over the whole pool a
+                // run: ~30 us each on v6e)
+                let lane0 = cx.const_i(Elem::I32, 0, &[]);
+                let state =
+                    cx.dynamic_slice(whole, &[state_row, lane0], &[state_rows, ROW_WORDS])?;
                 let state = cx.bitcast(state, Elem::I32)?;
                 let state = cx.reshape(state, &[state_rows * ROW_WORDS])?;
                 let state = cx.slice_axis(state, 0, 0, words)?;
-                let p_rows = rows_at(cx, parents_row, 1)?;
-                let parents = cx.take_rows(whole, p_rows)?;
+                let parents = cx.dynamic_slice(whole, &[parents_row, lane0], &[1, ROW_WORDS])?;
                 let parents = cx.bitcast(parents, Elem::I32)?;
                 let parents = cx.reshape(parents, &[ROW_WORDS])?;
                 let parents = cx.slice_axis(parents, 0, 0, b_n)?;
@@ -276,15 +274,15 @@ impl Pools {
                     let v = cx.pad(v, pad, &[0], &[rows * ROW_WORDS - n], &[0])?;
                     let v = cx.reshape(v, &[rows, ROW_WORDS])?;
                     let v = cx.bitcast(v, Elem::U32)?;
-                    let at = rows_at(cx, first, rows)?;
-                    cx.put_rows(whole, at, v, Combine::Set)
+                    let lane0 = cx.const_i(Elem::I32, 0, &[]);
+                    cx.dynamic_update_slice(whole, v, &[first, lane0])
                 };
                 let whole = land(cx, whole, step.state, state_row, state_rows)?;
                 let rows = cx.const_i(Elem::I32, state_rows, &[]);
                 let out_row = cx.add(state_row, rows)?;
                 // the fault sets of fires still in flight stay as they are
-                let r_rows = rows_at(cx, out_row, result_rows)?;
-                let kept = cx.take_rows(whole, r_rows)?;
+                let lane0 = cx.const_i(Elem::I32, 0, &[]);
+                let kept = cx.dynamic_slice(whole, &[out_row, lane0], &[result_rows, ROW_WORDS])?;
                 let kept = cx.bitcast(kept, Elem::I32)?;
                 let kept = cx.reshape(kept, &[result_rows * ROW_WORDS])?;
                 let sets = fault_sets(layout) * b_n;
