@@ -958,6 +958,10 @@ where
                     .unwrap_or(0),
                 prefill_lanes: 0,
                 max_readouts,
+                // A fire's staged rs table holds as many carried tokens as
+                // its widest bucket's rows, every lane's summed, a decode
+                // lane's included (`inputs::rs_carry_ints`).
+                replayed_rows: if shell.pools().rs_rows().is_some() { max_tokens } else { 0 },
             },
             has_lora: true,
             has_attn_page_mask: false,

@@ -791,6 +791,30 @@ fn piece_rows(
     )
 }
 
+/// The buffered recurrent rows one piece of a host pass replays, summed
+/// over every lane, a decode lane's included (what
+/// [`::engine::FireLimits::replayed_rows`] bounds a step by): each lane's
+/// rows between its state and its first, as [`piece_rows`] counts them
+/// before [`::engine::fire::lane_carried`] drops a decode lane's.
+fn piece_replayed(
+    full: &crate::engine::FireRequest,
+    piece: &[Option<(u32, u32)>],
+    frozen: &[Option<u32>],
+    folded_behind: bool,
+) -> u32 {
+    full.lanes
+        .iter()
+        .zip(piece)
+        .enumerate()
+        .filter_map(|(lane, (rows, cut))| {
+            let (from, _) = (*cut)?;
+            let start = rows.kv.held.saturating_add(from);
+            let frozen = frozen.get(lane).copied().flatten()?;
+            Some(if folded_behind { 0 } else { start.saturating_sub(frozen) })
+        })
+        .fold(0u32, u32::saturating_add)
+}
+
 /// The most carried rows a fire holds on `engine`: the tokens of the
 /// largest activation rung fires may take, whose replay scratch holds as
 /// many; what one fire holds where the pool states no rung.
@@ -4545,6 +4569,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             };
             // What the scheduler steps and holds the fire by.
             req.carried = counted.carried;
+            req.replayed = piece_replayed(&full, piece, &frozen, folds_each && at > 0);
             // A piece's request keeps only the lanes with rows in it,
             // renumbered; `groups` holds the pass's lane indices. What reads
             // the piece's request (its written spans, its page tables) needs
@@ -5991,6 +6016,17 @@ async fn fire_device_geometry<C: FireContext>(
         Ok(frozen) => frozen,
         Err(error) => return Ok(Err(error)),
     };
+    // Each group's bound on what its lanes replay, every lane's, a decode
+    // lane's included (what a step is held to by the engine's stated
+    // replayed rows).
+    let replayed = groups
+        .iter()
+        .map(|(_, lanes)| {
+            let cursor = pass_lanes.cursors[lanes[0]].lock().unwrap();
+            let carried = device_lane_rows(0, &cursor, frozen[lanes[0]]).carried;
+            carried.saturating_mul(u32::try_from(lanes.len()).unwrap_or(u32::MAX))
+        })
+        .fold(0u32, u32::saturating_add);
     let counted = FireRows::of(groups.iter().flat_map(|(_, lanes)| {
         let carried = {
             let cursor = pass_lanes.cursors[lanes[0]].lock().unwrap();
@@ -6167,6 +6203,7 @@ async fn fire_device_geometry<C: FireContext>(
             })
             .collect(),
         carried: counted.carried,
+        replayed,
         ..crate::engine::FireRequest::default()
     };
     rs_prepared.apply_to(&mut req);
@@ -7290,6 +7327,7 @@ mod static_admission_tests {
             prefill_lanes: 0,
             max_readouts: 0,
             readout_store: 0,
+            max_replayed_rows: 0,
         };
         for (case, submissions) in cases {
             let ring = channel(HostRole::None, 4, false);
