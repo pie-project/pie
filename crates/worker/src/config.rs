@@ -777,6 +777,9 @@ impl ModelConfig {
     }
 }
 
+/// `[runtime]`. `runtime.submit_deadline` was removed (no lane is dropped
+/// from a frame on a timer any more): a config that still carries it is
+/// refused at load as an unknown field. To migrate, delete the line.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
@@ -785,7 +788,8 @@ pub struct RuntimeConfig {
     /// waits on outside input (a session receive, a timer, an HTTP
     /// response) is parked by the host, and one that calls
     /// `forward.park()` parks itself: neither is ever killed however long
-    /// it stays away.
+    /// it stays away. (`runtime.submit_deadline` was removed: a config
+    /// carrying it is refused at load; delete the line.)
     #[serde(default = "default_silence_timeout")]
     pub silence_timeout: Duration,
     /// Waves per frame (*k*): how many token steps the wait-all quorum admits
