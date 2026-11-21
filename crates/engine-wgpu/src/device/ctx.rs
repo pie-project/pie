@@ -1035,6 +1035,27 @@ pub(crate) struct Inner {
     wall: AtomicBool,
 }
 
+/// Submitted frames whose dispatches wrote timestamps: a served frame lands
+/// by callback and is never waited on, so its times are read here, off the
+/// callback, once its work is done ([`harvest_landed`]).
+static TIMED: Mutex<Vec<Arc<Inner>>> = Mutex::new(Vec::new());
+
+/// Reads the times of every timed frame whose work has landed into the
+/// kernel profile; the rest stay for a later call.
+pub(crate) fn harvest_landed() {
+    let landed: Vec<Arc<Inner>> = {
+        let mut timed = TIMED.lock().expect("timed frames lock poisoned");
+        let (landed, pending): (Vec<_>, Vec<_>) = timed
+            .drain(..)
+            .partition(|inner| inner.done.load(Ordering::Acquire));
+        *timed = pending;
+        landed
+    };
+    for inner in landed {
+        inner.harvest();
+    }
+}
+
 impl Inner {
     fn harvest(&self) {
         let planes = std::mem::take(&mut *self.timing.lock().expect("timing lock poisoned"));
@@ -1497,6 +1518,18 @@ impl Frame {
         // a step's copies (a same-buffer copy stages through scratch) and
         // its walk, each submitted before the next is opened.
         self.inner.release();
+        if !self
+            .inner
+            .timing
+            .lock()
+            .expect("timing lock poisoned")
+            .is_empty()
+        {
+            TIMED
+                .lock()
+                .expect("timed frames lock poisoned")
+                .push(Arc::clone(&self.inner));
+        }
         let inner = Arc::clone(&self.inner);
         core.queue.on_submitted_work_done(move || {
             inner.done.store(true, Ordering::Release);

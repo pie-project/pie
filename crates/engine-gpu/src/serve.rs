@@ -255,6 +255,16 @@ pub trait Serve: Backend {
     /// Arm `arm`'s readout seat grew to `bytes`.
     fn grown(shell: &mut Shell<Self>, arm: usize, bytes: u64) -> Result<()>;
 
+    /// Times each dispatch encoded from now (`on`) or no longer
+    /// ([`FireTimes`]). A backend that times no dispatch does nothing.
+    fn time_dispatches(_device: &Self::Context, _on: bool) {}
+
+    /// Each timed dispatch's kernel, device nanoseconds and count, as they
+    /// landed since the last call, which takes them; empty until they land.
+    fn dispatch_times(_device: &Self::Context) -> Vec<(String, u64, u64)> {
+        Vec::new()
+    }
+
     /// Replays `prepared` where a kept step answers it, else how it walks.
     fn plan(shell: &mut Shell<Self>, prepared: &mut Prepared<'_, Self>) -> Result<Plan<Self>>;
 
@@ -899,6 +909,8 @@ pub struct Shell<B: Serve> {
     rs_layout: Option<std::sync::Arc<crate::rs::Layout>>,
     /// The snapshot table a fire whose lanes snapshot binds (CONTRACT-BC 16).
     snaps: Option<B::Buffer>,
+    /// The decode fires timed a dispatch at a time ([`FireTimes`]).
+    fire_times: FireTimes,
     /// The last staged fire's capturing lanes' rows ([`Shell::score_rows`]):
     /// the segment buffer of the score room they lie in, and each one's
     /// source lane and the bytes its key row, and its page row where it has
@@ -2258,6 +2270,7 @@ impl<B: Serve> Shell<B> {
             bound: 0,
             rs_layout,
             snaps,
+            fire_times: FireTimes::default(),
             last_capture: None,
             rs_buffers,
             rs_held,
@@ -5670,6 +5683,7 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
     where
         Self: 'a,
     {
+        self.fire_times.said::<B>(&self.device);
         let fed = self.feed(&prepared)?;
         let need = prepared
             .readout_layout
@@ -5723,8 +5737,15 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
         };
         self.recorded += u64::from(keep.is_some());
         self.unkept += u64::from(keep.is_none());
+        let timed = self.fire_times.times(&prepared.rows);
+        if timed {
+            B::time_dispatches(&self.device, true);
+        }
         let walked = self.walk_once(&prepared, keep.is_some(), split);
         self.split_layers = 1;
+        if timed {
+            B::time_dispatches(&self.device, false);
+        }
         let walked = walked?;
         let mut frame = walked.frame.expect("the walk opened a frame");
 
@@ -6256,6 +6277,77 @@ type Cut = [usize; 3];
 #[must_use]
 pub fn naming_lanes() -> u32 {
     u32::try_from(std::mem::size_of::<Cut>() / std::mem::size_of::<usize>()).unwrap_or(u32::MAX)
+}
+
+/// Where `engine_gpu::fire_times` logs at trace: a decode fire (a row a
+/// lane) timed a dispatch at a time, at the first, second, fourth, ... fire
+/// of each width, its kernels' device times said once they land. A width's
+/// cost (its kernels, not the whole run's) without timing every fire: the
+/// timestamps a fire writes are a pass a dispatch.
+#[derive(Debug, Default)]
+struct FireTimes {
+    /// The lanes of the decode fires counted, and how many of them so far.
+    width: u32,
+    fires: u32,
+    /// A timed fire's lanes and count at that width, its times not yet said.
+    pending: Option<(u32, u32)>,
+}
+
+impl FireTimes {
+    /// Whether the fire of `rows` (each lane's) is timed: a decode fire at a
+    /// power-of-two count of its width's, where trace logging asks, none
+    /// pending.
+    fn times(&mut self, rows: &[poem_exec::fire::compose::LaneRow]) -> bool {
+        if !tracing::enabled!(target: "engine_gpu::fire_times", tracing::Level::TRACE) {
+            return false;
+        }
+        if rows.is_empty() || rows.iter().any(|row| row.rows != 1) {
+            return false;
+        }
+        let lanes = u32::try_from(rows.len()).unwrap_or(u32::MAX);
+        if lanes != self.width {
+            self.width = lanes;
+            self.fires = 0;
+        }
+        self.fires = self.fires.saturating_add(1);
+        if self.pending.is_some() || !self.fires.is_power_of_two() {
+            return false;
+        }
+        self.pending = Some((lanes, self.fires));
+        true
+    }
+
+    /// Says a timed fire's kernels where they have landed.
+    fn said<B: Serve>(&mut self, device: &B::Context) {
+        let Some((lanes, fire)) = self.pending else {
+            return;
+        };
+        let rows = B::dispatch_times(device);
+        if rows.is_empty() {
+            return;
+        }
+        self.pending = None;
+        // The frame's own span, where the backend times one, is the fire's
+        // device time; its kernels are each dispatch's.
+        let (spans, kernels): (Vec<_>, Vec<_>) = rows
+            .iter()
+            .partition(|(name, ..)| name.as_str() == "frame.span");
+        let dispatched: u64 = kernels.iter().map(|(_, ns, _)| ns).sum();
+        let span = spans.iter().map(|(_, ns, _)| ns).sum::<u64>();
+        let listed = kernels
+            .iter()
+            .map(|(name, ns, n)| format!("{name}={:.1}us/{n}", *ns as f64 / 1e3))
+            .collect::<Vec<_>>()
+            .join(" ");
+        tracing::trace!(
+            target: "engine_gpu::fire_times",
+            lanes,
+            fire,
+            span_ms = span as f64 / 1e6,
+            dispatched_ms = dispatched as f64 / 1e6,
+            "a decode fire's dispatches: {listed}"
+        );
+    }
 }
 
 /// One lane of a naming fire: what its class has a lane carry, all zeros.

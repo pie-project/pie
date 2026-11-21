@@ -283,6 +283,27 @@ impl Serve for Api {
 
     fn forget(_shelf: &mut Shelf) {}
 
+    /// Each dispatch encoded while `on` writes its timestamps
+    /// (`crate::encode::profile_timing`), its times landing in the kernel
+    /// profile; turned on from an empty one.
+    fn time_dispatches(_device: &Context, on: bool) {
+        if on {
+            crate::encode::reset_kernel_profile();
+        }
+        crate::encode::profile_timing(on);
+    }
+
+    /// The kernel profile, taken once its times have landed.
+    fn dispatch_times(_device: &Context) -> Vec<(String, u64, u64)> {
+        crate::device::ctx::harvest_landed();
+        let rows = crate::encode::kernel_profile();
+        if rows.iter().all(|(_, ns, _)| *ns == 0) {
+            return Vec::new();
+        }
+        crate::encode::reset_kernel_profile();
+        rows
+    }
+
     fn grown(shell: &mut Shell<Api>, arm: usize, bytes: u64) -> Result<()> {
         shell.shelf.mirror[arm] = Buffer::with(
             &shell.device,
