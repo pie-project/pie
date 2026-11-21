@@ -757,32 +757,29 @@ impl<B: Backend> Pools<B> {
     /// (`guest::state`): the segment buffer its physical chunk sits in now
     /// and its offset there, its segment committed. A run of chunks from it
     /// lies at the next physical chunks of the same segment.
-    /// Where a run of `run` chunks from logical chunk `first` lies, refused
-    /// by name unless every chunk of it lies on the physical chunk after
-    /// the one before: a run is addressed from its first chunk, so a run
-    /// a move split would read its later chunks from another owner.
+    /// Where a run of `run` chunks from logical chunk `first` lies: the
+    /// engine contract addresses a run from its first chunk, the chunks
+    /// after it lying at the next physical chunks. Refused by name unless
+    /// every one of those physical chunks is backed and in the first one's
+    /// segment, so a run never reads past its segment or into memory the
+    /// pool does not hold.
     pub fn run_place(&self, first: u32, run: u32) -> Result<(&B::Buffer, u64)> {
         let place = self.chunk_place(first)?;
         let base = self.pool.physical(first)?;
+        let segment = self.layout.segment_chunks.max(1);
         for k in 1..run {
-            let logical = first.checked_add(k).ok_or_else(|| Fault::Ceiling {
-                what: "chunks a guest's state may name (past the null chunk)",
-                need: u64::from(first) + u64::from(k) + 1,
-                have: u64::from(self.layout.total_chunks),
-            })?;
-            let _ = self.chunk_place(logical)?;
-            let physical = self.pool.physical(logical)?;
-            if physical != base + k {
+            let physical = base.checked_add(k).filter(|p| p / segment == base / segment);
+            let Some(physical) = physical else {
                 return Err(Fault::Program {
                     at: "store::run_place",
                     why: format!(
-                    "a run of {run} chunk(s) from logical chunk {first} (physical {base}) is \
-                     split: logical chunk {logical} lies on physical {physical}, not {}; \
-                     refused, not read or written",
-                        base + k
+                        "a run of {run} chunk(s) from logical chunk {first} (physical {base}) \
+                         crosses its segment of {segment} at chunk {k}; refused, not read or \
+                         written"
                     ),
                 });
-            }
+            };
+            self.pool.admit(physical)?;
         }
         Ok(place)
     }
