@@ -196,35 +196,36 @@ __global__ void ssm_conv1d_carried(const T* __restrict__ x, const T* __restrict_
 // stored as it stands after the group's fold rows (the committed cells, then
 // the rows' inputs, plane 0, through the representative lane's pages), so the
 // committed point moves with the set's recurrent state. A thread a channel;
-// grid (⌈C / block⌉, groups).
+// grid ⌈C / block⌉; a block folds each group in turn.
 template <class T>
 __global__ void ssm_conv1d_fold(StateRows rows, int C, int K, int dil, Carry carry,
                                 const GroupFold* __restrict__ folds, int groups) {
-    const int g = blockIdx.y;
-    if (g >= groups) return;
-    const GroupFold f = folds[g];
-    const int n = static_cast<int>(f.rows);
-    if (n <= 0) return;
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
-    const int rl = static_cast<int>(f.lane);
-    const i32* rid = rows.row(rl);
-    if (rid[0] < 0) return;
-    const CarryLane cl = carry.lane(rl);
-    const int cs = rows.atoms;
-    const int ci = c % cs;
-    T* state = rows.piece<T>(rid, c / cs);
-    const int span = (K - 1) * dil + 1;
-    auto at = [&](int t) -> T {
-        if (t < 0) return state[(span + t) * cs + ci];
-        u64 slot;
-        u32 pos;
-        carry.fold_at(cl, f.fold_off, t, slot, pos);
-        return carry.plane_at<const T>(slot, pos, 0)[c];
-    };
-    T cells[8];
-    for (int k = 0; k < span && k < 8; ++k) cells[k] = at(n - span + k);
-    for (int k = 0; k < span && k < 8; ++k) state[k * cs + ci] = cells[k];
+    // The groups that fold lead the table; the first that folds none ends it.
+    for (int g = 0; g < groups; ++g) {
+        const GroupFold f = folds[g];
+        const int n = static_cast<int>(f.rows);
+        if (n <= 0) break;
+        const int rl = static_cast<int>(f.lane);
+        const i32* rid = rows.row(rl);
+        if (rid[0] < 0) continue;
+        const CarryLane cl = carry.lane(rl);
+        const int cs = rows.atoms;
+        const int ci = c % cs;
+        T* state = rows.piece<T>(rid, c / cs);
+        const int span = (K - 1) * dil + 1;
+        auto at = [&](int t) -> T {
+            if (t < 0) return state[(span + t) * cs + ci];
+            u64 slot;
+            u32 pos;
+            carry.fold_at(cl, f.fold_off, t, slot, pos);
+            return carry.plane_at<const T>(slot, pos, 0)[c];
+        };
+        T cells[8];
+        for (int k = 0; k < span && k < 8; ++k) cells[k] = at(n - span + k);
+        for (int k = 0; k < span && k < 8; ++k) state[k * cs + ci] = cells[k];
+    }
 }
 
 constexpr int kConvRows = 32;
@@ -994,7 +995,7 @@ __global__ __launch_bounds__(256) void ssm_gdn_tail_corrected(
 // fold rows (keys, corrected values and gates from the kept planes `[b | a]`,
 // keys, u, through the representative lane's pages) folded in order, rounded
 // as a token's step stores them, and the state stored once. Grid (V_d / BV,
-// groups, V_h), block 256.
+// V_h), block 256; a block folds each group in turn.
 template <int BV>
 __global__ __launch_bounds__(256) void ssm_gdn_fold(
     StateRows rows, const bf16* __restrict__ dt_bias, const float* __restrict__ a_log, int K_h, int V_h, int K_d,
@@ -1002,56 +1003,58 @@ __global__ __launch_bounds__(256) void ssm_gdn_fold(
     constexpr int BLOCK = 256, VEC = 8, TPR = BV / VEC, WAVES = BLOCK / kWave, NI = BLOCK / TPR;
     __shared__ float sk[NI];
     __shared__ float part[WAVES];
-    const int g = blockIdx.y, h = blockIdx.z;
-    if (g >= groups) return;
-    const GroupFold f = folds[g];
-    const int n = static_cast<int>(f.rows);
-    if (n <= 0) return;
-    const int rl = static_cast<int>(f.lane);
-    const i32* rid = rows.row(rl);
-    if (rid[0] < 0) return;
-    const CarryLane cl = carry.lane(rl);
-    const int tid = threadIdx.x, wave = tid / kWave, ln = lane();
-    const int h_k = h / (V_h / K_h);
-    const int i = tid / TPR;
-    const int j0 = blockIdx.x * BV + (tid % TPR) * VEC;
-    const bool live = i < K_d;
-    bf16* cell = rows.atom<bf16>(rid, h, static_cast<long long>(K_d) * V_d) + static_cast<long long>(i) * V_d + j0;
-    float s[VEC];
-    {
-        Pack8<bf16> sp{};
-        if (live) sp = *reinterpret_cast<const Pack8<bf16>*>(cell);
-#pragma unroll
-        for (int u = 0; u < VEC; ++u) s[u] = to_f32(sp.v[u]);
+    const int h = blockIdx.y;
+    // The groups that fold lead the table; the first that folds none ends it.
+    for (int g = 0; g < groups; ++g) {
+        const GroupFold f = folds[g];
+        const int n = static_cast<int>(f.rows);
+        if (n <= 0) break;
+        const int rl = static_cast<int>(f.lane);
+        const i32* rid = rows.row(rl);
+        if (rid[0] < 0) continue;
+        const CarryLane cl = carry.lane(rl);
+        const int tid = threadIdx.x, wave = tid / kWave, ln = lane();
+        const int h_k = h / (V_h / K_h);
+        const int i = tid / TPR;
+        const int j0 = blockIdx.x * BV + (tid % TPR) * VEC;
+        const bool live = i < K_d;
+        bf16* cell = rows.atom<bf16>(rid, h, static_cast<long long>(K_d) * V_d) + static_cast<long long>(i) * V_d + j0;
+        float s[VEC];
+        {
+            Pack8<bf16> sp{};
+            if (live) sp = *reinterpret_cast<const Pack8<bf16>*>(cell);
+    #pragma unroll
+            for (int u = 0; u < VEC; ++u) s[u] = to_f32(sp.v[u]);
+        }
+        for (int j = 0; j < n; ++j) {
+            u64 slot;
+            u32 pos;
+            carry.fold_at(cl, f.fold_off, j, slot, pos);
+            const bf16* krow = carry.plane_at<const bf16>(slot, pos, 1) + static_cast<long long>(h_k) * K_d;
+            lds_barrier();
+            const float kv = tid < K_d ? to_f32(krow[tid]) : 0.f;
+            const float kw = wave_sum(kv * kv);
+            if (ln == 0) part[wave] = kw;
+            lds_barrier();
+            float kn = 0.f;
+    #pragma unroll
+            for (int w = 0; w < WAVES; ++w) kn += part[w];
+            if (tid < K_d) sk[tid] = kv * rsqrtf(kn + 1e-6f);
+            lds_barrier();
+            const float ki = live ? sk[i] : 0.f;
+            const float gj = __expf(gdn_log_gate(carry.plane_at<const bf16>(slot, pos, 0), h, V_h, dt_bias, a_log));
+            const float* u = carry.plane_at<const float>(slot, pos, 2) + static_cast<long long>(h) * V_d + j0;
+            float uu[VEC];
+    #pragma unroll
+            for (int x = 0; x < VEC; ++x) uu[x] = u[x];
+            gdn_fold8(s, gj, ki, uu);
+        }
+        if (!live) continue;
+        Pack8<bf16> st;
+    #pragma unroll
+        for (int u = 0; u < VEC; ++u) st.v[u] = from_f32<bf16>(s[u]);
+        *reinterpret_cast<Pack8<bf16>*>(cell) = st;
     }
-    for (int j = 0; j < n; ++j) {
-        u64 slot;
-        u32 pos;
-        carry.fold_at(cl, f.fold_off, j, slot, pos);
-        const bf16* krow = carry.plane_at<const bf16>(slot, pos, 1) + static_cast<long long>(h_k) * K_d;
-        lds_barrier();
-        const float kv = tid < K_d ? to_f32(krow[tid]) : 0.f;
-        const float kw = wave_sum(kv * kv);
-        if (ln == 0) part[wave] = kw;
-        lds_barrier();
-        float kn = 0.f;
-#pragma unroll
-        for (int w = 0; w < WAVES; ++w) kn += part[w];
-        if (tid < K_d) sk[tid] = kv * rsqrtf(kn + 1e-6f);
-        lds_barrier();
-        const float ki = live ? sk[i] : 0.f;
-        const float gj = __expf(gdn_log_gate(carry.plane_at<const bf16>(slot, pos, 0), h, V_h, dt_bias, a_log));
-        const float* u = carry.plane_at<const float>(slot, pos, 2) + static_cast<long long>(h) * V_d + j0;
-        float uu[VEC];
-#pragma unroll
-        for (int x = 0; x < VEC; ++x) uu[x] = u[x];
-        gdn_fold8(s, gj, ki, uu);
-    }
-    if (!live) return;
-    Pack8<bf16> st;
-#pragma unroll
-    for (int u = 0; u < VEC; ++u) st.v[u] = from_f32<bf16>(s[u]);
-    *reinterpret_cast<Pack8<bf16>*>(cell) = st;
 }
 
 // The decode steps' state traffic: read once and written once a step, and
@@ -3581,7 +3584,7 @@ __global__ __launch_bounds__(256) void ssm_kda_tail_corrected(
 
 // A beam group's fold of its KDA state (BEAM-PAGE-LISTS §11.3): its fold rows
 // (forget rows, keys and u from the kept planes 0, 2 and 3) folded in order,
-// M <- M diag(a) + u k̂^T, and the rows stored once. Grid (H, groups,
+// M <- M diag(a) + u k̂^T, and the rows stored once. Grid (H,
 // D / ROWS), block 256.
 template <int D, int ROWS>
 __global__ __launch_bounds__(256) void ssm_kda_fold(
@@ -3590,60 +3593,62 @@ __global__ __launch_bounds__(256) void ssm_kda_fold(
     constexpr int E = D / 32, RPP = 256 / kKdaRowLanes, R = ROWS / RPP, WAVES = 256 / kWave;
     __shared__ alignas(16) float sk[D], sa[D];
     __shared__ float part[WAVES];
-    const int h = blockIdx.x, g = blockIdx.y;
-    if (g >= groups) return;
-    const GroupFold f = folds[g];
-    const int n = static_cast<int>(f.rows);
-    if (n <= 0) return;
-    const int rl = static_cast<int>(f.lane);
-    const i32* rid = rows.row(rl);
-    if (rid[0] < 0) return;
-    const CarryLane cl = carry.lane(rl);
-    const int tid = threadIdx.x, wave = tid / kWave, l = lane();
-    const int c = tid % kKdaRowLanes;
-    const int v0 = blockIdx.z * ROWS + tid / kKdaRowLanes;
-    float* head = rows.atom<float>(rid, h, static_cast<long long>(D) * D);
-    f32x4 s[R][E];
-#pragma unroll
-    for (int p = 0; p < R; ++p)
-#pragma unroll
-        for (int e = 0; e < E; ++e)
-            s[p][e] = state_load(reinterpret_cast<const f32x4*>(head + static_cast<long long>(v0 + RPP * p) * D + 4 * c + 32 * e));
-    const float a = __expf(a_log[h]);
-    for (int j = 0; j < n; ++j) {
-        u64 slot;
-        u32 pos;
-        carry.fold_at(cl, f.fold_off, j, slot, pos);
-        lds_barrier();
-        const float kx = tid < D ? to_f32(carry.plane_at<const bf16>(slot, pos, 2)[static_cast<long long>(h) * D + tid]) : 0.f;
-        const float ws = wave_sum(kx * kx);
-        if (l == 0) part[wave] = ws;
-        if (tid < D)
-            sa[tid] = __expf(kda_gate(to_f32(carry.plane_at<const bf16>(slot, pos, 0)[static_cast<long long>(h) * D + tid]) +
-                                          dt_bias[h * D + tid], a, floor));
-        lds_barrier();
-        float kn = 0.f;
-#pragma unroll
-        for (int w = 0; w < WAVES; ++w) kn += part[w];
-        if (tid < D) sk[tid] = kx * rsqrtf(kn + eps);
-        lds_barrier();
-        const float* ur = carry.plane_at<const float>(slot, pos, 3) + static_cast<long long>(h) * D;
-#pragma unroll
-        for (int p = 0; p < R; ++p) {
-            const float u = ur[v0 + RPP * p];
-#pragma unroll
-            for (int e = 0; e < E; ++e) {
-                const int at = 4 * c + 32 * e;
-#pragma unroll
-                for (int x = 0; x < 4; ++x) s[p][e][x] = s[p][e][x] * sa[at + x] + u * sk[at + x];
+    const int h = blockIdx.x;
+    // The groups that fold lead the table; the first that folds none ends it.
+    for (int g = 0; g < groups; ++g) {
+        const GroupFold f = folds[g];
+        const int n = static_cast<int>(f.rows);
+        if (n <= 0) break;
+        const int rl = static_cast<int>(f.lane);
+        const i32* rid = rows.row(rl);
+        if (rid[0] < 0) continue;
+        const CarryLane cl = carry.lane(rl);
+        const int tid = threadIdx.x, wave = tid / kWave, l = lane();
+        const int c = tid % kKdaRowLanes;
+        const int v0 = blockIdx.y * ROWS + tid / kKdaRowLanes;
+        float* head = rows.atom<float>(rid, h, static_cast<long long>(D) * D);
+        f32x4 s[R][E];
+    #pragma unroll
+        for (int p = 0; p < R; ++p)
+    #pragma unroll
+            for (int e = 0; e < E; ++e)
+                s[p][e] = state_load(reinterpret_cast<const f32x4*>(head + static_cast<long long>(v0 + RPP * p) * D + 4 * c + 32 * e));
+        const float a = __expf(a_log[h]);
+        for (int j = 0; j < n; ++j) {
+            u64 slot;
+            u32 pos;
+            carry.fold_at(cl, f.fold_off, j, slot, pos);
+            lds_barrier();
+            const float kx = tid < D ? to_f32(carry.plane_at<const bf16>(slot, pos, 2)[static_cast<long long>(h) * D + tid]) : 0.f;
+            const float ws = wave_sum(kx * kx);
+            if (l == 0) part[wave] = ws;
+            if (tid < D)
+                sa[tid] = __expf(kda_gate(to_f32(carry.plane_at<const bf16>(slot, pos, 0)[static_cast<long long>(h) * D + tid]) +
+                                              dt_bias[h * D + tid], a, floor));
+            lds_barrier();
+            float kn = 0.f;
+    #pragma unroll
+            for (int w = 0; w < WAVES; ++w) kn += part[w];
+            if (tid < D) sk[tid] = kx * rsqrtf(kn + eps);
+            lds_barrier();
+            const float* ur = carry.plane_at<const float>(slot, pos, 3) + static_cast<long long>(h) * D;
+    #pragma unroll
+            for (int p = 0; p < R; ++p) {
+                const float u = ur[v0 + RPP * p];
+    #pragma unroll
+                for (int e = 0; e < E; ++e) {
+                    const int at = 4 * c + 32 * e;
+    #pragma unroll
+                    for (int x = 0; x < 4; ++x) s[p][e][x] = s[p][e][x] * sa[at + x] + u * sk[at + x];
+                }
             }
         }
+    #pragma unroll
+        for (int p = 0; p < R; ++p)
+    #pragma unroll
+            for (int e = 0; e < E; ++e)
+                state_store(reinterpret_cast<f32x4*>(head + static_cast<long long>(v0 + RPP * p) * D + 4 * c + 32 * e), s[p][e]);
     }
-#pragma unroll
-    for (int p = 0; p < R; ++p)
-#pragma unroll
-        for (int e = 0; e < E; ++e)
-            state_store(reinterpret_cast<f32x4*>(head + static_cast<long long>(v0 + RPP * p) * D + 4 * c + 32 * e), s[p][e]);
 }
 
 // Prefill, token by token: grid (lanes, H), block 8·D, the head's state in
@@ -4422,42 +4427,44 @@ __global__ void ssm_mamba2_tail_rows(const bf16* __restrict__ xbc, const u32* __
 
 // A beam group's fold of its Mamba-2 state (BEAM-PAGE-LISTS §11.3): its fold
 // rows (step sizes and convolved x | B from the kept planes 0 and 1) folded in
-// order, S <- a S + (dt x) B^T, and the state stored once. Grid (groups, H),
+// order, S <- a S + (dt x) B^T, and the state stored once. Grid H, a block folding each group in turn,
 // block 256.
 __global__ __launch_bounds__(256) void ssm_mamba2_fold(StateRows rows, const float* __restrict__ a_log,
                                                        const float* __restrict__ dt_bias, int H, int G, Carry carry,
                                                        const GroupFold* __restrict__ folds, int groups) {
-    const int g = blockIdx.x, h = blockIdx.y;
-    if (g >= groups) return;
-    const GroupFold f = folds[g];
-    const int n = static_cast<int>(f.rows);
-    if (n <= 0) return;
-    const int rl = static_cast<int>(f.lane);
-    const i32* rid = rows.row(rl);
-    if (rid[0] < 0) return;
-    const CarryLane cl = carry.lane(rl);
-    const int inner = H * M2_P;
-    const int gg = h / (H / G);
-    f32x4* st = reinterpret_cast<f32x4*>(rows.atom<float>(rid, h, static_cast<long long>(M2_P) * M2_N));
-    f32x4 s[M2_Q];
-#pragma unroll
-    for (int q = 0; q < M2_Q; ++q) s[q] = st[m2_run(q)];
-    const float a = __expf(a_log[h]), bias = dt_bias[h];
-    const int cc = 4 * (lane() & 31);
-    for (int j = 0; j < n; ++j) {
-        u64 slot;
-        u32 pos;
-        carry.fold_at(cl, f.fold_off, j, slot, pos);
-        const bf16* xb = carry.plane_at<const bf16>(slot, pos, 1);
-        const bf16* bp = xb + inner + gg * M2_N + cc;
-        const f32x4 bj = {to_f32(bp[0]), to_f32(bp[1]), to_f32(bp[2]), to_f32(bp[3])};
-        const float sj = m2_dt(to_f32(carry.plane_at<const bf16>(slot, pos, 0)[h]), bias);
-        const float decay = __expf(-a * sj);
-#pragma unroll
-        for (int q = 0; q < M2_Q; ++q) s[q] = s[q] * decay + (sj * to_f32(xb[h * M2_P + m2_row(q)])) * bj;
+    const int h = blockIdx.x;
+    // The groups that fold lead the table; the first that folds none ends it.
+    for (int g = 0; g < groups; ++g) {
+        const GroupFold f = folds[g];
+        const int n = static_cast<int>(f.rows);
+        if (n <= 0) break;
+        const int rl = static_cast<int>(f.lane);
+        const i32* rid = rows.row(rl);
+        if (rid[0] < 0) continue;
+        const CarryLane cl = carry.lane(rl);
+        const int inner = H * M2_P;
+        const int gg = h / (H / G);
+        f32x4* st = reinterpret_cast<f32x4*>(rows.atom<float>(rid, h, static_cast<long long>(M2_P) * M2_N));
+        f32x4 s[M2_Q];
+    #pragma unroll
+        for (int q = 0; q < M2_Q; ++q) s[q] = st[m2_run(q)];
+        const float a = __expf(a_log[h]), bias = dt_bias[h];
+        const int cc = 4 * (lane() & 31);
+        for (int j = 0; j < n; ++j) {
+            u64 slot;
+            u32 pos;
+            carry.fold_at(cl, f.fold_off, j, slot, pos);
+            const bf16* xb = carry.plane_at<const bf16>(slot, pos, 1);
+            const bf16* bp = xb + inner + gg * M2_N + cc;
+            const f32x4 bj = {to_f32(bp[0]), to_f32(bp[1]), to_f32(bp[2]), to_f32(bp[3])};
+            const float sj = m2_dt(to_f32(carry.plane_at<const bf16>(slot, pos, 0)[h]), bias);
+            const float decay = __expf(-a * sj);
+    #pragma unroll
+            for (int q = 0; q < M2_Q; ++q) s[q] = s[q] * decay + (sj * to_f32(xb[h * M2_P + m2_row(q)])) * bj;
+        }
+    #pragma unroll
+        for (int q = 0; q < M2_Q; ++q) st[m2_run(q)] = s[q];
     }
-#pragma unroll
-    for (int q = 0; q < M2_Q; ++q) st[m2_run(q)] = s[q];
 }
 
 // Prefill, token by token: grid (lanes, H), the head's state in registers

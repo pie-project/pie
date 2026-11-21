@@ -221,8 +221,9 @@ fn f32_state(op: &'static str, state: &RecurrentPool) -> Result<(), Error> {
 /// A beam group's fold (`BEAM-PAGE-LISTS.md` §11.3, as `kernels-rocm`'s
 /// `ssm::GroupFold`): its representative lane (any of its lanes; they share
 /// the set's state), where its fold rows start in the replay table, and how
-/// many. The fold kernels read a device table of them, one a group; a group
-/// of no rows folds nothing.
+/// many. The fold kernels read a device table of them: the groups that fold
+/// lead it, and the first entry of no rows ends it (a block folds each group
+/// in turn, so an empty table costs a read, not a block a group).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GroupFold {
