@@ -579,6 +579,61 @@ impl Run<'_> {
         )
     }
 
+    /// The beam groups' conv window folds before the layer's step (§11.3).
+    pub(crate) fn conv1d_group_fold(
+        &self,
+        x: ValueId,
+        state: ValueId,
+        conv_width: u32,
+        dilation: u32,
+    ) -> Result<(), kernels_cuda::Error> {
+        const OP: &str = "ssm.causal_conv1d";
+        let Some((carry, folds, groups)) = self.rs_group_folds(OP, &[self.rs_plane(OP, x)?])?
+        else {
+            return Ok(());
+        };
+        kernels_cuda::ssm::conv1d_fold(
+            self.ctx(),
+            &one_token(self.recurrent_absolute(state)),
+            self.tensor(x).width,
+            conv_width,
+            dilation,
+            &carry,
+            folds,
+            groups,
+        )
+    }
+
+    /// The beam groups' gated-delta folds before the layer's step (§11.3).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn gated_delta_group_fold(
+        &self,
+        (ba, dt_bias, a_log): (ValueId, ValueId, ValueId),
+        state: ValueId,
+        (k_heads, v_heads, k_dim, v_dim): (u32, u32, u32, u32),
+        y: ValueId,
+    ) -> Result<(), kernels_cuda::Error> {
+        const OP: &str = "ssm.gated_delta";
+        let Some((carry, folds, groups)) =
+            self.rs_group_folds(OP, &self.gdn_planes(OP, ba, y)?)?
+        else {
+            return Ok(());
+        };
+        kernels_cuda::ssm::gated_delta_fold(
+            self.ctx(),
+            &one_token(self.recurrent_absolute(state)),
+            k_heads,
+            v_heads,
+            k_dim,
+            v_dim,
+            self.tensor(dt_bias),
+            self.tensor(a_log),
+            &carry,
+            folds,
+            groups,
+        )
+    }
+
     /// A decode conv of a buffering fire: each lane's own row reads its
     /// window from the committed cells and its last carried rows
     /// ([`kernels_cuda::ssm::Carry`]), and lands in its buffer the channels
@@ -597,6 +652,7 @@ impl Run<'_> {
         y: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
         const OP: &str = "ssm.causal_conv1d";
+        self.conv1d_group_fold(x, state, conv_width, dilation)?;
         let pool = self.recurrent_absolute(state);
         let x_plane = self.rs_plane(OP, x)?;
         let (planes, keys) = match self.rs_planes().and_then(|planes| planes.keys_of(y)) {
@@ -645,6 +701,12 @@ impl Run<'_> {
         y: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
         const OP: &str = "ssm.gated_delta";
+        self.gated_delta_group_fold(
+            (ba, dt_bias, a_log),
+            state,
+            (k_heads, v_heads, k_dim, v_dim),
+            y,
+        )?;
         let pool = self.recurrent_absolute(state);
         let _ = qkv;
         let carry = self.rs_carry(OP, &self.gdn_planes(OP, ba, y)?, &pool)?;
@@ -724,7 +786,24 @@ impl Run<'_> {
     ) -> Result<(), kernels_cuda::Error> {
         const OP: &str = "ssm.kda";
         let pool = self.recurrent_absolute(state);
-        let carry = self.rs_carry(OP, &self.rs_step_planes(OP, &[f, b], mixed, Some(y))?, &pool)?;
+        let planes = self.rs_step_planes(OP, &[f, b], mixed, Some(y))?;
+        // The beam groups' folds first (§11.3).
+        if let Some((carry, folds, groups)) = self.rs_group_folds(OP, &planes)? {
+            kernels_cuda::ssm::kda_fold(
+                self.ctx(),
+                &one_token(pool),
+                heads,
+                head_dim,
+                norm_eps,
+                gate_floor,
+                self.tensor(dt_bias),
+                self.tensor(a_log),
+                &carry,
+                folds,
+                groups,
+            )?;
+        }
+        let carry = self.rs_carry(OP, &planes, &pool)?;
         kernels_cuda::ssm::kda_carried(
             self.ctx(),
             self.tensor(mixed),
@@ -798,7 +877,12 @@ impl Run<'_> {
     ) -> Result<(), kernels_cuda::Error> {
         const OP: &str = "ssm.mamba2";
         let pool = self.recurrent_absolute(state);
-        let carry = self.rs_carry(OP, &self.rs_step_planes(OP, &[dt], xbc, None)?, &pool)?;
+        let planes = self.rs_step_planes(OP, &[dt], xbc, None)?;
+        // The beam groups' folds first (§11.3).
+        if let Some((carry, folds, groups)) = self.rs_group_folds(OP, &planes)? {
+            kernels_cuda::ssm::mamba2_fold(self.ctx(), &one_token(pool), m, &carry, folds, groups)?;
+        }
+        let carry = self.rs_carry(OP, &planes, &pool)?;
         kernels_cuda::ssm::mamba2_carried(
             self.ctx(),
             self.tensor(xbc),

@@ -450,6 +450,10 @@ pub struct BodyKey {
     /// mask, a group's too, is no part of the key: it is data each fire
     /// stages and one body reads.)
     pub rs: RsBody,
+    /// Whether the fire's beam groups fold their sets (`BEAM-PAGE-LISTS.md`
+    /// §11.3): its body launches each recurrent layer's group fold before
+    /// the layer's step, folding whatever rows the fire stages (none too).
+    pub group_folds: bool,
 }
 
 impl BodyKey {
@@ -468,6 +472,7 @@ impl BodyKey {
             patch: None,
             islands: Box::default(),
             rs: RsBody::Folds,
+            group_folds: false,
         }
     }
 
@@ -486,6 +491,7 @@ impl BodyKey {
             patch: patch.map(|(classes, bucket)| AxisKey::of(classes, bucket)),
             islands: Box::default(),
             rs: RsBody::Folds,
+            group_folds: false,
         }
     }
 
@@ -493,6 +499,13 @@ impl BodyKey {
     #[must_use]
     pub fn with_rs(mut self, rs: RsBody) -> BodyKey {
         self.rs = rs;
+        self
+    }
+
+    /// The same key, its beam groups folding their sets or not (§11.3).
+    #[must_use]
+    pub fn with_group_folds(mut self, group_folds: bool) -> BodyKey {
+        self.group_folds = group_folds;
         self
     }
 
@@ -1610,6 +1623,7 @@ mod tests {
             patch: None,
             islands: Box::default(),
             rs: RsBody::Folds,
+            group_folds: false,
         };
         assert_eq!(armed, fired, "the armed key must be the fired key");
     }
@@ -1621,6 +1635,7 @@ mod tests {
             patch: None,
             islands: Box::default(),
             rs: RsBody::Folds,
+            group_folds: false,
         }
     }
 

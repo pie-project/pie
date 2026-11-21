@@ -935,6 +935,7 @@ impl FireCtx<'_> {
                 },
                 extended: p.rs.body == record::RsBody::Replays,
                 scratch: rs_scratch.as_ref(),
+                folds: p.rs.group_folds.then_some((tables.folds, tables.fold_entries)),
             });
         }
         super::btrace::mark("run_new");

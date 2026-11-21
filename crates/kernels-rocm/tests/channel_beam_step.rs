@@ -169,6 +169,13 @@ fn search_rs(gpu: &Gpu, lanes: u32, folded: u32, steps: u32, seed: u64, rs_token
             let row = &held[map + b * cap as usize..map + b * cap as usize + c as usize + 1];
             assert_eq!(row, &want.lists[b][..], "{at}: beam {b}'s list");
         }
+        // The common slot (§11.3): below the first column where the beams'
+        // lists part, never past the fire's own slot.
+        let apart = (0..=c as usize)
+            .find(|&j| want.lists.iter().any(|list| list[j] != want.lists[0][j]))
+            .map_or(c + 1, |j| j as u32);
+        let common = ((f0 + apart) * PAGE).min(slot + 1);
+        assert_eq!(held[3], common, "{at}: the common slot");
         let free = 4 + 2 * (lanes * cap) as usize;
         let device_free: Vec<bool> = held[free..free + cap as usize].iter().map(|&w| w != 0).collect();
         assert_eq!(device_free, replay.free, "{at}: free pages");

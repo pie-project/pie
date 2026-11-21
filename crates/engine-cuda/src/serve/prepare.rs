@@ -1127,6 +1127,12 @@ impl Shell {
         let mut rs_pages: Vec<u32> = Vec::new();
         let mut rs_reads: Vec<Vec<std::ops::Range<u32>>> = vec![Vec::new(); lanes.len()];
         let mut rs_folded: Vec<Option<u32>> = vec![None; lanes.len()];
+        // Each beam group's fold (`BEAM-PAGE-LISTS.md` §11.3): the slot its
+        // set's state is folded to before any of its lanes reads it, as its
+        // first lane states it; and the folds the fire runs, a representative
+        // fire lane and its rows (buffer tokens) each.
+        let mut beam_to: Vec<Option<u32>> = vec![None; page_groups.len()];
+        let mut group_folds: Vec<(usize, std::ops::Range<u32>)> = Vec::new();
         // Per lane, one past the last slot its rows land at, where a port
         // says where they land: what its report tells the runtime.
         let mut rs_ends: Vec<Option<u32>> = vec![None; lanes.len()];
@@ -1391,11 +1397,39 @@ impl Shell {
                         .map_err(|error| {
                             Fault::program("serve::rs", format!("lane {}: {error}", row.source))
                         })?;
-                    let replay = crate::run::replayed(&reads);
                     let cell = envelope_of[source].map_or(fire_lane, |(_, at)| at);
                     let to = folded
                         .saturating_add(stated_fold(*fold, cell, port)?)
                         .min(first + row.rows);
+                    // A beam group's lanes share their set's state: what its
+                    // first lane folds is folded once for all of them, from
+                    // its buffered rows, before any reads (§11.3). Each lane
+                    // then replays only the rows past it and folds none
+                    // itself.
+                    let (reads, to, beam) = match group_of[source] {
+                        Some(group) => {
+                            let group_to = match beam_to[group] {
+                                Some(group_to) => group_to,
+                                None => {
+                                    let group_to = to.min(first);
+                                    if group_to > *folded {
+                                        group_folds
+                                            .push((fire_lane, *folded - base..group_to - base));
+                                    }
+                                    beam_to[group] = Some(group_to);
+                                    group_to
+                                }
+                            };
+                            let reads: Vec<std::ops::Range<u32>> = reads
+                                .iter()
+                                .filter(|span| span.end > group_to)
+                                .map(|span| span.start.max(group_to)..span.end)
+                                .collect();
+                            (reads, to, true)
+                        }
+                        None => (reads, to, false),
+                    };
+                    let replay = crate::run::replayed(&reads);
                     rs_folded[source] = Some(to - folded);
                     rs_ends[source] = Some(first + row.rows);
                     if *fold == FoldLen::Device {
@@ -1405,7 +1439,11 @@ impl Shell {
                         .iter()
                         .map(|span| span.end.min(to).saturating_sub(span.start))
                         .sum();
-                    let fold = below + to.saturating_sub(first).min(row.rows);
+                    let fold = if beam {
+                        0
+                    } else {
+                        below + to.saturating_sub(first).min(row.rows)
+                    };
                     rs_reads[fire_lane] = reads
                         .iter()
                         .map(|span| span.start - base..span.end - base)
@@ -1432,7 +1470,10 @@ impl Shell {
             // A lane that folds nothing reads the state as it stood before
             // the fire, while the lane beside it folds into the record the
             // fire writes: the two never meet in one row.
+            // A beam group's lanes read the record the fire writes, which
+            // its fold (§11.3), if any, has written before them.
             if matches!(verb, RsMove::Scatter { fold: 0, .. })
+                && group_of[source].is_none()
                 && let Some(read) = seated.rs_read
                 && let Some(named) = slot_ids.last_mut()
             {
@@ -1724,6 +1765,7 @@ impl Shell {
         let mut rs_lanes: Vec<kernels_cuda::runtime::channel::RsLane> = Vec::new();
         let mut rs_slots: Vec<u64> = Vec::new();
         let mut rs_tokens: Vec<u32> = Vec::new();
+        let mut rs_folds: Vec<kernels_cuda::ssm::GroupFold> = Vec::new();
         if rs_body.buffers() {
             let buffers = self.buffers.as_ref().ok_or_else(|| Fault::Unbound {
                 what: "the rs buffer of a fire whose lanes buffer recurrent rows, against a \
@@ -1769,6 +1811,16 @@ impl Shell {
                     page_off: page_off as u32,
                     ext: begin,
                 });
+            }
+            // Each beam group's fold rows (§11.3), past every lane's replayed
+            // ones, read through its representative lane's pages.
+            for (lane, rows) in &group_folds {
+                rs_folds.push(kernels_cuda::ssm::GroupFold {
+                    lane: *lane as u32,
+                    fold_off: rs_tokens.len() as u32,
+                    rows: rows.len() as u32,
+                });
+                rs_tokens.extend(rows.clone());
             }
         }
         // The records as the kernels read them: each row's pieces by the
@@ -1953,7 +2005,8 @@ impl Shell {
             &self.tiers,
             self.towered.then_some((&patches.classes, patches.bucket)),
         )
-        .with_rs(rs_body);
+        .with_rs(rs_body)
+        .with_group_folds(rs_body.buffers() && !page_groups.is_empty());
         let copies_here = copies
             && key.classes.rungs().iter().all(|(class, _)| {
                 !self.wide.contains(*class as usize)
@@ -2231,6 +2284,7 @@ impl Shell {
                     lanes: &rs_lanes,
                     pages: &rs_slots,
                     replay_tok: &rs_tokens,
+                    folds: &rs_folds,
                 }),
             },
         )?;
@@ -2343,6 +2397,7 @@ impl Shell {
                     }),
                 truncates: rs_body.buffers(),
                 body: rs_body,
+                group_folds: rs_body.buffers() && !page_groups.is_empty(),
                 moves: rs_moves,
                 lens: rs_lens,
                 order: rs_order,

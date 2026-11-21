@@ -249,9 +249,15 @@ pub struct RsHandles {
     pub lanes: u64,
     pub pages: u64,
     pub replay_tok: u64,
+    /// The beam groups' folds (§11.3), [`RsHandles::fold_entries`] of them,
+    /// those past the fire's folding none.
+    pub folds: u64,
+    pub fold_entries: u32,
 }
 
 const RS_LANE_BYTES: u64 = size_of::<kernels_cuda::runtime::channel::RsLane>() as u64;
+
+const FOLD_BYTES: u64 = size_of::<kernels_cuda::ssm::GroupFold>() as u64;
 
 /// The bytes the staged rs lane table of `lanes` lanes takes: what the slab
 /// lays, what a fire writes and what it copies to the device, one figure.
@@ -265,6 +271,8 @@ pub struct RsFire<'a> {
     pub lanes: &'a [kernels_cuda::runtime::channel::RsLane],
     pub pages: &'a [u64],
     pub replay_tok: &'a [u32],
+    /// The fire's beam group folds (§11.3).
+    pub folds: &'a [kernels_cuda::ssm::GroupFold],
 }
 
 /// The rs section's offsets and capacities.
@@ -275,6 +283,9 @@ struct RsAt {
     pages_cap: u64,
     replay_tok: u64,
     replay_cap: u64,
+    /// A group fold a lane at most: a group holds a lane or more.
+    folds: u64,
+    folds_cap: u64,
 }
 
 const AXES: u64 = 3;
@@ -1055,11 +1066,13 @@ impl Inputs {
         // A fire replays through the run no more rows than the widest
         // bucket's tokens (`engine::fire::rung_rows`); a decoding lane's
         // carried rows are a kernel input and no rows of the run, so the
-        // tables hold four buckets' tokens of carried rows, and the pages
-        // they and its own rows lie in. A fire naming more is refused by
-        // name where the tables are staged.
+        // tables hold four buckets' tokens of carried rows, the beam groups'
+        // fold rows past them, and the pages they and its own rows lie in. A
+        // fire naming more is refused by name where the tables are staged.
         let rs = rs_page_tokens.map(|tokens| {
-            let replay_cap = 4 * rows;
+            // A group's fold rows are rows of its buffer it would otherwise
+            // replay, past its lanes' replays: as many again at most.
+            let replay_cap = 8 * rows;
             let pages_cap = (replay_cap + rows).div_ceil(u64::from(tokens.max(1))) + 2 * lanes;
             RsAt {
                 lanes: take(rs_lane_table_bytes(lanes)),
@@ -1067,6 +1080,8 @@ impl Inputs {
                 pages_cap,
                 replay_tok: take(replay_cap * 4),
                 replay_cap,
+                folds: take(lanes * FOLD_BYTES),
+                folds_cap: lanes,
             }
         });
         // A group's mask is a bit a (query, key) pair of its rows, from a
@@ -1565,6 +1580,25 @@ impl Inputs {
                     u32_bytes_of(tables.replay_tok),
                     "staged rs replay rows",
                 )?;
+                // Every entry, those past the fire's folds folding none: a
+                // recorded body's folds read the whole table.
+                if tables.folds.len() as u64 > at.folds_cap {
+                    return Err(crate::error::Fault::Ceiling {
+                        what: "beam group folds staged",
+                        need: tables.folds.len() as u64,
+                        have: at.folds_cap,
+                    });
+                }
+                let mut folds = tables.folds.to_vec();
+                folds.resize(at.folds_cap as usize, kernels_cuda::ssm::GroupFold::default());
+                // SAFETY: `GroupFold` is plain `repr(C)` data, read as its bytes.
+                let raw = unsafe {
+                    core::slice::from_raw_parts(
+                        folds.as_ptr().cast::<u8>(),
+                        folds.len() * FOLD_BYTES as usize,
+                    )
+                };
+                put(at.folds, raw, "staged beam group folds")?;
                 Some((tables.pages.len() as u32, tables.replay_tok.len() as u32))
             }
         };
@@ -1893,10 +1927,13 @@ impl Inputs {
                 )?;
                 copy(at.pages, *pages as usize * 8)?;
                 copy(at.replay_tok, *toks as usize * 4)?;
+                copy(at.folds, (at.folds_cap * FOLD_BYTES) as usize)?;
                 Some(RsHandles {
                     lanes: base + at.lanes,
                     pages: base + at.pages,
                     replay_tok: base + at.replay_tok,
+                    folds: base + at.folds,
+                    fold_entries: at.folds_cap as u32,
                 })
             }
             _ => None,
