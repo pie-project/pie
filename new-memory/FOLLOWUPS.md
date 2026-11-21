@@ -922,3 +922,17 @@ the partials and candidates the split regions publish there: silent wrong result
 Tool for whoever picks it up: the sync-and-read check above, on a build without the memset
 (the self-resetting branch, `sc/amd-meet-reset-dropped`, local on the MI300X host), plus the
 fire's stream map at the stalled launch.
+
+## F47. XLA's in-place write fence costs hybrid decode 2.6–4.3% (v6e, found 2026-11-21)
+
+`kernels_xla::hlo::Func::fence` puts an `optimization_barrier` over a parameter's buffer and
+every read of the version an in-place write overwrites, so XLA cannot schedule a read after the
+write and keep the old version as a copy (a second 22 GiB pool left 15 Qwen3.5-0.8B hybrid warm
+shapes out of HBM). It costs hybrid decode: v6e Qwen3.5-0.8B c1 251 → 244 tok/s (−2.6%), c4
+756 → 723 (−4.3%), the decode fire's device time +4.6%; dense Qwen3-0.6B is flat. A decode fire
+has ~6 barriers holding ~16 small pool reads (i32 scalars and small tiles), all on the pool:
+not bytes, but those reads taken out of the consumers they were fused into and run before the
+write. Measured alternatives that did not help: fencing only the reads the write is not computed
+from (c1 244.4, c4 723), and passing the barrier through the write's update instead of the pool
+(c1 243, c4 723). To revisit with an ordering that keeps the reads fused: the pre-write values
+read inside the fused op that writes, or a fence on only the overwritten version's last read.
