@@ -6280,10 +6280,13 @@ pub fn naming_lanes() -> u32 {
 }
 
 /// Where `engine_gpu::fire_times` logs at trace: a decode fire (a row a
-/// lane) timed a dispatch at a time, at the first, second, fourth, ... fire
-/// of each width, its kernels' device times said once they land. A width's
-/// cost (its kernels, not the whole run's) without timing every fire: the
-/// timestamps a fire writes are a pass a dispatch.
+/// lane) timed a dispatch at a time, its kernels' device times said once
+/// they land. A width's cost (its kernels, not the whole run's) without
+/// timing every fire: the timestamps a fire writes are a pass a dispatch,
+/// which a phone's driver held badly over a whole run. A diagnostic, so
+/// held to what was asked of it on such a phone: decode fires of at most
+/// [`FireTimes::LANES`] lanes (not the load's wide warm runs), the first,
+/// second and fourth of each width.
 #[derive(Debug, Default)]
 struct FireTimes {
     /// The lanes of the decode fires counted, and how many of them so far.
@@ -6294,9 +6297,15 @@ struct FireTimes {
 }
 
 impl FireTimes {
-    /// Whether the fire of `rows` (each lane's) is timed: a decode fire at a
-    /// power-of-two count of its width's, where trace logging asks, none
-    /// pending.
+    /// The widest decode fire timed.
+    const LANES: u32 = 8;
+
+    /// The most fires of one width timed: its first, second and fourth.
+    const FIRES: u32 = 4;
+
+    /// Whether the fire of `rows` (each lane's) is timed: a decode fire of
+    /// at most [`Self::LANES`] lanes at its width's first, second or fourth,
+    /// where trace logging asks, none pending.
     fn times(&mut self, rows: &[poem_exec::fire::compose::LaneRow]) -> bool {
         if !tracing::enabled!(target: "engine_gpu::fire_times", tracing::Level::TRACE) {
             return false;
@@ -6305,12 +6314,15 @@ impl FireTimes {
             return false;
         }
         let lanes = u32::try_from(rows.len()).unwrap_or(u32::MAX);
+        if lanes > Self::LANES {
+            return false;
+        }
         if lanes != self.width {
             self.width = lanes;
             self.fires = 0;
         }
         self.fires = self.fires.saturating_add(1);
-        if self.pending.is_some() || !self.fires.is_power_of_two() {
+        if self.pending.is_some() || !self.fires.is_power_of_two() || self.fires > Self::FIRES {
             return false;
         }
         self.pending = Some((lanes, self.fires));
