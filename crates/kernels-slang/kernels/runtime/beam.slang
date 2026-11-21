@@ -498,8 +498,8 @@ void main(uint3 local : SV_GroupThreadID, uint3 group : SV_GroupID) {
 //
 // Copies each run's rows, a workgroup a (run, plane, slot): a slot below the
 // buffer (the prompt's tail, in the state) has no row and is skipped. A
-// copy any of whose rows lies past the set's entries copies nothing and
-// states the lane's fault.
+// copy reaching a row past the set's entries copies the rows before it,
+// none from it on, and states the lane's fault (§11.2's stop).
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 local : SV_GroupThreadID, uint3 group : SV_GroupID) {
@@ -537,15 +537,19 @@ void main(uint3 local : SV_GroupThreadID, uint3 group : SV_GroupID) {
         }
         return;
     }
-    // The copy's last rows lie furthest: past the set's entries there, it
-    // copies none.
-    const uint last_from = (f0 + src) * page + tokens - 1u;
-    const uint last_to = (f0 + dst) * page + tokens - 1u;
-    if ((last_from >= base && (last_from - base) / rows_a_page >= bases_len)
-        || (last_to >= base && (last_to - base) / rows_a_page >= bases_len)) {
-        if (first) {
-            store[fault] = max(store[fault], PIE_PAGES_COPY_BOUNDS);
-        }
+    // §11.2's walk, a slot a workgroup: the rows before the first slot past
+    // the set's entries (on either side) are copied, that one faults the
+    // lane, and none from it on is copied.
+    const uint end_slot = base + bases_len * rows_a_page;
+    const uint from_page = (f0 + src) * page;
+    const uint to_page = (f0 + dst) * page;
+    const uint within = min(
+        end_slot > from_page ? end_slot - from_page : 0u,
+        end_slot > to_page ? end_slot - to_page : 0u);
+    if (within < tokens && first) {
+        store[fault] = max(store[fault], PIE_PAGES_COPY_BOUNDS);
+    }
+    if (k >= within) {
         return;
     }
     const uint from_slot = (f0 + src) * page + k;

@@ -629,3 +629,113 @@ fn a_hybrid_beams_rs_rows_follow_their_lists() {
         }
     }
 }
+
+/// A fork's rs copy on a hybrid (§6.4, §11.2), engine-cuda's and
+/// kernels-rocm's `a_fork_copies_its_rs_rows_slot_by_slot` on this
+/// engine's kernel: rows of 2 a page from slot 38, kv pages of 16 (the live
+/// Qwen3.5 frozen slot), two planes of other row words. A copy of 5 slots
+/// from pool page 1 to 3 ends mid rs page; one from the prompt's own page 0
+/// skips its tail's slots below the buffer (they are in the state); each
+/// destination row equals its source row, every other word stays. A copy
+/// past the pool faults and moves nothing; one reaching a slot past the
+/// set's entries copies the rows before it, faults, and moves none from it
+/// on (§11.2's stop).
+#[test]
+fn a_fork_copies_its_rs_rows_slot_by_slot() {
+    let Some(mut gpu) = Gpu::open() else {
+        eprintln!("not asked: no device");
+        return;
+    };
+    const T: u32 = 2;
+    const BASE: u32 = 38;
+    let f0 = BASE / PAGE;
+    // Planes: 2 words a row from word 0, 3 words a row after the page's two
+    // rows of it; an entry (an rs unit) of 10 words.
+    let planes: [[u32; 2]; 2] = [[0, 2], [4, 3]];
+    let unit = 10u32;
+    let first_unit = 4u32;
+    let run_case = |gpu: &mut Gpu, src: u32, dst: u32, tokens: u32, entries: u32| {
+        let pool: Vec<u32> = (0..(first_unit + 64) * unit).map(|w| w.wrapping_mul(2_654_435_761)).collect();
+        let pool_h = gpu.up_u32(&pool);
+        // The store: the record, the plane table, the bases, the fault word.
+        let mut store = vec![0u32; 128];
+        let (record, planes_at, bases_at, fault_at) = (0usize, 16usize, 32usize, 120usize);
+        store[planes_at..planes_at + 4].copy_from_slice(&[planes[0][0], planes[0][1], planes[1][0], planes[1][1]]);
+        for e in 0..entries.min(64) {
+            store[bases_at + e as usize] = first_unit + e;
+        }
+        store[record..record + 16].copy_from_slice(&[
+            0,
+            bases_at as u32,
+            fault_at as u32,
+            8,
+            PAGE,
+            T,
+            BASE,
+            f0,
+            BASE - f0 * PAGE,
+            unit,
+            2,
+            entries,
+            0,
+            0,
+            0,
+            0,
+        ]);
+        // The copy word lies in the pool's first words (the state's place).
+        let mut pool = pool;
+        pool[..3].copy_from_slice(&[src, dst, tokens]);
+        gpu.write_u32(pool_h, &pool);
+        let store_h = gpu.up_u32(&store);
+        gpu.run(|c| {
+            kb::copy_rs_rows(
+                c,
+                Records {
+                    store: Tensor::new(store_h, 1, 128, Dtype::U32),
+                    pool: Segments::one(pool_h, pool.len() as u32),
+                    runs: record as u32,
+                    count: 1,
+                    planes: planes_at as u32,
+                },
+                2,
+                PAGE,
+            )
+        });
+        let after = gpu.down_u32(pool_h, pool.len());
+        let fault = gpu.down_u32(store_h, 128)[fault_at];
+        (pool, after, fault)
+    };
+    let row = |slot: u32, plane: [u32; 2]| -> std::ops::Range<usize> {
+        let (e, r) = ((slot - BASE) / T, (slot - BASE) % T);
+        let at = ((first_unit + e) * unit + plane[0] + r * plane[1]) as usize;
+        at..at + plane[1] as usize
+    };
+    // The copy word lies at pool words 0..3, where the record names it.
+    for (src, dst, tokens, entries) in [(1u32, 3u32, 5u32, 64u32), (0, 2, 9, 64), (1, 3, 9, 23)] {
+        let (before, after, fault) = run_case(&mut gpu, src, dst, tokens, entries);
+        let mut want = before.clone();
+        let end = BASE + entries * T;
+        let mut stopped = false;
+        for k in 0..tokens {
+            let (from, to) = ((f0 + src) * PAGE + k, (f0 + dst) * PAGE + k);
+            if from >= end || to >= end {
+                stopped = true;
+                break;
+            }
+            if from < BASE || to < BASE {
+                continue;
+            }
+            for plane in planes {
+                let words = before[row(from, plane)].to_vec();
+                want[row(to, plane)].copy_from_slice(&words);
+            }
+        }
+        let what = format!("copy {src} -> {dst} x {tokens} over {entries} entries");
+        assert_eq!(fault, if stopped { kb::PAGES_COPY_BOUNDS } else { 0 }, "{what}: its fault");
+        assert_eq!(after, want, "{what}: rows moved, nothing else");
+    }
+    // A copy past the pool faults and moves nothing.
+    let (before, after, fault) = run_case(&mut gpu, 1, 9, 4, 64);
+    assert_eq!(fault, kb::PAGES_COPY_BOUNDS);
+    assert_eq!(after, before, "a refused copy moves nothing");
+}
