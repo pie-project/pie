@@ -295,6 +295,28 @@ impl Session {
         Some((held.buffer(), held.offset() + capture_pad(held)))
     }
 
+    /// Bytes `[at, at + into.len())` of this instance's beam group state,
+    /// read on the host through the pool's heaps; refused by name
+    /// where its program states no parents.
+    pub fn read_beam(&self, at: u64, into: &mut [u8]) -> Result<()> {
+        let held = self.beam.as_ref().ok_or_else(|| {
+            Fault::program("program::session", "an instance holding no beam state read as one")
+        })?;
+        if at.checked_add(into.len() as u64).is_none_or(|end| end > held.bytes()) {
+            return Err(Fault::program(
+                "program::session",
+                format!(
+                    "a read of {} bytes at {at} of a beam state of {}",
+                    into.len(),
+                    held.bytes()
+                ),
+            ));
+        }
+        // Through the heaps the region's bytes lie in (a placement buffer
+        // has no host contents of its own).
+        held.read(capture_pad(held) + at, into)
+    }
+
     /// The GPU address of this instance's beam group state now, at
     /// [`CAPTURE_ALIGN`]; `None` where its program states no parents.
     #[must_use]
@@ -508,6 +530,15 @@ impl Session {
             && let Some(slot) = capture.slot()
         {
             capture.retarget(pools, to(slot)?)?;
+        }
+        // A beam group's lists lie in the tables too (BEAM-PAGE-LISTS §4):
+        // the runtime copied them with the tables, so the group's state
+        // follows its slot, as the score rows do; left behind, the next
+        // step read the slot's next owner's bytes as its map.
+        if let Some(beam) = self.beam.as_mut()
+            && let Some(slot) = beam.slot()
+        {
+            beam.retarget(pools, to(slot)?)?;
         }
         self.rings.retarget(pools, rings)?;
         self.instance_slots = instance.to_vec();

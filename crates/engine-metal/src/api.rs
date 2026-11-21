@@ -1221,6 +1221,10 @@ impl Engine for Metal {
             .map_err(fault)
     }
 
+    fn beam_list(&mut self, instance: InstanceId, beam: u32) -> EngineResult<Vec<u32>> {
+        self.loaded_mut()?.beam_list(instance, beam).map_err(fault)
+    }
+
     fn take_channel(
         &mut self,
         instance: InstanceId,

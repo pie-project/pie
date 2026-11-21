@@ -3294,6 +3294,13 @@ impl Shell {
         answer
     }
 
+    /// Beam `beam`'s page list of instance `id`'s beam group, as its last
+    /// fire left it (`Engine::beam_list`): every fire in flight lands first.
+    pub fn beam_list(&mut self, id: engine::InstanceId, beam: u32) -> Result<Vec<u32>> {
+        self.drain()?;
+        self.programs.beam_list(id, beam)
+    }
+
     pub fn drain(&mut self) -> Result<()> {
         while !self.inflight.is_empty() {
             self.harvest_one()?;
