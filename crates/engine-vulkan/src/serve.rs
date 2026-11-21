@@ -4,7 +4,6 @@
 use std::collections::BTreeMap;
 
 use engine_gpu::serve::{Landed, Launch, Plan, Prepared, ReadSpan, Serve, Shell, rows_from};
-use poem_ir::Dtype;
 
 use crate::device::{Api, Buffer, Context, Frame, Pending, Pipelines};
 use engine_gpu::error::{Fault, Result};
@@ -602,7 +601,7 @@ fn record_key(shell: &Shell<Api>, p: &Prepared<'_, Api>) -> crate::record::Key {
 }
 
 /// An output a lane read out: its seat, offset, element count, dtype and name.
-pub type ReadSeat<'a> = (&'a Buffer, u64, u32, Dtype, &'a str);
+pub type ReadSeat<'a> = engine_gpu::serve::ReadSeat<'a, Api>;
 
 /// What a step read out, for readers on the device behind it.
 pub trait Seats {
@@ -614,42 +613,13 @@ pub trait Seats {
 
 impl Seats for Shell<Api> {
     fn readout_seats(&self, landed: &Landed, lane: u32) -> Option<Vec<ReadSeat<'_>>> {
-        let (arm, rows) = match self.shelf.landed_seats.get(&landed.seq) {
-            Some(seat) if seat.generation == self.shelf.generation => (seat.arm, &seat.rows),
-            Some(_) => return None,
-            // Still in flight: its arm stays taken until the harvest, and a
-            // reader submitted behind it on the queue sees its readout.
-            None => {
-                let flight = self.inflight.iter().find(|f| f.seq == landed.seq)?;
-                (flight.arm, &flight.rows)
+        match self.shelf.landed_seats.get(&landed.seq) {
+            Some(seat) if seat.generation == self.shelf.generation => {
+                self.seats_of(seat.arm, &seat.rows, landed, lane)
             }
-        };
-        let seat = self.readout.get(arm)?;
-        // A spanned read's rows lie in the fire's span: read only while no
-        // later fire was submitted to carve over them.
-        let span = self.span_buffer().ok()?;
-        let last = landed.seq + 1 == self.airborne.entered();
-        let reads: Vec<&ReadSpan> = (rows.iter())
-            .filter(|read| read.lane == lane && read.rows > 0)
-            .filter(|read| read.seated || read.spanned)
-            .collect();
-        if !last && reads.iter().any(|read| read.spanned) {
-            return None;
+            Some(_) => None,
+            None => self.flight_seats(landed, lane),
         }
-        Some(
-            reads
-                .into_iter()
-                .map(|read| {
-                    (
-                        if read.spanned { span } else { seat },
-                        read.at,
-                        read.values(),
-                        read.dtype,
-                        self.output_name(read.plane),
-                    )
-                })
-                .collect(),
-        )
     }
 
     fn forget_seat(&mut self, landed: &Landed) {

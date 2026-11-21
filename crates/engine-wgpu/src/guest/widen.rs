@@ -54,18 +54,18 @@ fn key(buffer: &Buffer) -> usize {
 }
 
 impl Widen {
-    /// The bytes of the table a widen over `seats` seats takes, with
-    /// `regions` regions of `entries` rows each and the one beside them.
-    pub fn table_bytes(device: &Context, seats: usize, regions: u32, entries: u64) -> u64 {
-        Self::region_bytes(device, seats, entries) * (u64::from(regions) + 1)
+    /// The bytes of the table a widen takes, with `regions` regions of
+    /// `entries` rows each and the one beside them.
+    pub fn table_bytes(device: &Context, regions: u32, entries: u64) -> u64 {
+        Self::region_bytes(device, entries) * (u64::from(regions) + 1)
     }
 
-    /// A table region's bytes: a stage's rows lie in at most one group per
-    /// seat (one destination segment, its heap's), each group's rows from an
-    /// aligned start.
-    fn region_bytes(device: &Context, seats: usize, entries: u64) -> u64 {
+    /// A table region's bytes: the rows of a frame's widens (every pass it
+    /// carries, its lanes' together at most `entries`), each group of rows
+    /// from an aligned start, and a group as few as one row.
+    fn region_bytes(device: &Context, entries: u64) -> u64 {
         let align = u64::from(device.core().limits.min_storage_buffer_offset_alignment).max(16);
-        (entries * size_of::<Cfg>() as u64).next_multiple_of(align) + seats as u64 * align
+        entries * (size_of::<Cfg>() as u64).next_multiple_of(align)
     }
 
     /// The widen over `seats` (each arm's readout and pixel seats) into
@@ -82,8 +82,8 @@ impl Widen {
     ) -> Result<Widen> {
         let core = device.core().clone();
         let align = u64::from(core.limits.min_storage_buffer_offset_alignment).max(16);
-        let region = Self::region_bytes(device, seats.len(), entries);
-        let need = Self::table_bytes(device, seats.len(), regions, entries);
+        let region = Self::region_bytes(device, entries);
+        let need = Self::table_bytes(device, regions, entries);
         if table.bytes() < need {
             return Err(Fault::Ceiling {
                 what: "bytes of the readout widen's table",
@@ -217,6 +217,33 @@ impl Widen {
             });
         }
         let base = u64::from(self.region()?) * self.region;
+        // Past the rows the frame's earlier widens wrote: each widen's rows
+        // stay its own until the frame runs.
+        let mut need = 0u64;
+        {
+            let mut seen: Vec<(usize, usize)> = Vec::new();
+            for row in rows {
+                let pair = (key(row.src), key(row.dst));
+                if !seen.contains(&pair) {
+                    seen.push(pair);
+                }
+            }
+            for pair in &seen {
+                let members = rows
+                    .iter()
+                    .filter(|row| (key(row.src), key(row.dst)) == *pair)
+                    .count() as u64;
+                need += (members * size_of::<Cfg>() as u64).next_multiple_of(self.align);
+            }
+        }
+        let from = frame.widen_rows(need);
+        if from + need > self.region {
+            return Err(Fault::Ceiling {
+                what: "bytes of one frame's widen rows (a widen table region)",
+                need: from + need,
+                have: self.region,
+            });
+        }
         let mut order: Vec<(usize, usize)> = Vec::new();
         let mut grouped: HashMap<(usize, usize), Vec<&Row<'_>>> = HashMap::new();
         for row in rows {
@@ -239,7 +266,7 @@ impl Widen {
                 })
                 .push(row);
         }
-        let mut cursor = 0u64;
+        let mut cursor = from;
         for pair in order {
             let group = self.groups.get(&pair).ok_or_else(|| Fault::Program {
                 at: "guest::widen",
@@ -328,7 +355,7 @@ mod tests {
         b.write(0, &bf16(&third)).unwrap();
         let table = Buffer::with(
             &device,
-            Widen::table_bytes(&device, 2, 1, 3),
+            Widen::table_bytes(&device, 1, 3),
             Memory::Device,
             owner,
         )
@@ -382,7 +409,7 @@ mod tests {
         let dst = Buffer::zeroed(&device, 64, owner).unwrap();
         let table = Buffer::with(
             &device,
-            Widen::table_bytes(&device, 1, 1, 1),
+            Widen::table_bytes(&device, 1, 1),
             Memory::Device,
             owner,
         )

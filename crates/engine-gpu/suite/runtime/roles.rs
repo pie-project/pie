@@ -251,10 +251,9 @@ fn an_instance_in_pool_slots_fires_through_moves() {
     let mut slots = Slots::of(&chunks, tables, cells);
     let instance_shape = slots.instance.expect("an Instance shape");
     let channel_shape = slots.channel;
-    assert_eq!(
+    assert!(
         channel_shape.is_some(),
-        backend::NAME == "vulkan",
-        "Vulkan keeps cells on the device; wgpu keeps every cell on the host"
+        "every backend keeps a channel's cells on the device (`engine_gpu::guest::defer`)"
     );
 
     let mut decls: Vec<OutputDecl> = Vec::new();

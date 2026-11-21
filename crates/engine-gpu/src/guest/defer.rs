@@ -485,13 +485,23 @@ pub struct Landing {
     pub held: u64,
 }
 
+/// The passes of one frame, landed: `Some(why)` where they cannot be read.
+pub type Then<P> = Box<dyn FnOnce(Vec<Recorded<P>>, Option<String>) + Send>;
+
 /// A pass that landed, as its backend reads it.
-pub trait LandedPass: Send + 'static {
+pub trait LandedPass: Send + Sized + 'static {
     /// The fault code the pass's stage wrote, if any.
     fn status(&self) -> Result<Option<u32>>;
 
     /// The value the pass read back for `landing`.
     fn value(&self, landing: &Landing) -> Result<Value>;
+
+    /// Makes what a landed frame's `passes` read back readable, then hands
+    /// them to `then`: at once where the backend reads its berths in place,
+    /// once mapped where it maps them first.
+    fn readable(passes: Vec<Recorded<Self>>, then: Then<Self>) {
+        then(passes, None);
+    }
 }
 
 /// One attachment's pass the step's deferred frame carries: its instance,
@@ -513,6 +523,14 @@ pub struct Recorded<P> {
     owed: Vec<(u32, u64)>,
     owing: Arc<Owed>,
     faulted: Arc<AtomicBool>,
+}
+
+impl<P> Recorded<P> {
+    /// The backend's pass.
+    #[must_use]
+    pub fn pass(&self) -> &P {
+        &self.pass
+    }
 }
 
 impl<P: LandedPass> Recorded<P> {
@@ -680,27 +698,41 @@ where
     let held = Arc::new(Mutex::new(recorded));
     let landing = Arc::clone(&held);
     let on_done = move |refused: Option<String>| {
+        let passes: Vec<Recorded<P>> = landing
+            .lock()
+            .expect("passes lock poisoned")
+            .drain(..)
+            .collect();
         // The queue refusing the buffer the step's forward and these passes
         // rode is the step lost whole; what each pass's own status and
         // landing say is its lanes'.
         let lost = refused.clone();
-        let mut faults = faults;
-        for pass in landing.lock().expect("passes lock poisoned").drain(..) {
-            let (lanes, instance) = (pass.lanes.clone(), pass.instance);
-            if let Some(why) = pass.land(refused.clone()) {
-                faults.push((lanes, instance, why));
+        let refused_now = lost.is_some();
+        let report = move |passes: Vec<Recorded<P>>, unread: Option<String>| {
+            let mut faults = faults;
+            let why = refused.or(unread);
+            for pass in passes {
+                let (lanes, instance) = (pass.lanes.clone(), pass.instance);
+                if let Some(why) = pass.land(why.clone()) {
+                    faults.push((lanes, instance, why));
+                }
             }
-        }
-        if let Some(done) = done.as_ref() {
-            if lost.is_some() {
-                done.tell(lost, "guest pass");
-                return;
+            if let Some(done) = done.as_ref() {
+                if lost.is_some() {
+                    done.tell(lost, "guest pass");
+                    return;
+                }
+                let mut outcome = done.settled();
+                for (lanes, instance, why) in &faults {
+                    outcome.fault_lanes(lanes.clone(), Some(*instance), why);
+                }
+                (done.sink)(done.at, outcome);
             }
-            let mut outcome = done.settled();
-            for (lanes, instance, why) in &faults {
-                outcome.fault_lanes(lanes.clone(), Some(*instance), why);
-            }
-            (done.sink)(done.at, outcome);
+        };
+        if refused_now {
+            report(passes, None);
+        } else {
+            P::readable(passes, Box::new(report));
         }
     };
     let pending = match frame.commit_async(Some(Box::new(on_done))) {
