@@ -316,6 +316,8 @@ pub struct Built {
     stages: std::result::Result<Vec<Stage>, Failure>,
     compilations: u64,
     memory_hits: u64,
+    /// The wall time its region compiles took, in nanoseconds.
+    compile_nanos: u64,
     /// The region modules the job built, by text, for the cache.
     made: std::collections::HashMap<u64, Arc<Module>>,
 }
@@ -342,6 +344,7 @@ impl Job {
             made: std::collections::HashMap::new(),
             compilations: 0,
             memory_hits: 0,
+            compile_nanos: 0,
         };
         let stages = (|| {
             let index = Emitted::index(&self.kernels).map_err(|duplicate| Failure::Deterministic {
@@ -367,6 +370,7 @@ impl Job {
         let Builder {
             compilations,
             memory_hits,
+            compile_nanos,
             made,
             ..
         } = builder;
@@ -375,6 +379,7 @@ impl Job {
             stages,
             compilations,
             memory_hits,
+            compile_nanos,
             made,
         }
     }
@@ -388,6 +393,7 @@ struct Builder<'a> {
     made: std::collections::HashMap<u64, Arc<Module>>,
     compilations: u64,
     memory_hits: u64,
+    compile_nanos: u64,
 }
 
 enum GroupedAnswer {
@@ -428,6 +434,9 @@ pub struct Cache {
     /// prewarm of its standard samplers counts on (regions keyed by text).
     modules: std::collections::HashMap<u64, Arc<Module>>,
     stats: CacheStats,
+    /// The wall time every region compile since load took, in nanoseconds:
+    /// a compile the OS's shader cache serves reads apart from a cold one.
+    compile_nanos: u64,
 }
 
 impl Default for Cache {
@@ -445,12 +454,19 @@ impl Cache {
             negative: Bounded::new(MAX_NEGATIVE_ENTRIES),
             modules: std::collections::HashMap::new(),
             stats: CacheStats::default(),
+            compile_nanos: 0,
         }
     }
 
     #[must_use]
     pub const fn stats(&self) -> CacheStats {
         self.stats
+    }
+
+    /// The wall time every region compile since load took, in nanoseconds.
+    #[must_use]
+    pub const fn compile_nanos(&self) -> u64 {
+        self.compile_nanos
     }
 
     pub fn compile(
@@ -537,6 +553,7 @@ impl Cache {
     pub fn finish(&mut self, built: Built) -> std::result::Result<Compiled, Failure> {
         self.stats.compilations += built.compilations;
         self.stats.memory_hits += built.memory_hits;
+        self.compile_nanos = self.compile_nanos.saturating_add(built.compile_nanos);
         self.modules.extend(built.made);
         let job = built.job;
         match built.stages {
@@ -867,7 +884,9 @@ impl Builder<'_> {
         }
         #[cfg(target_vendor = "apple")]
         {
+            let began = std::time::Instant::now();
             let module = Arc::new(Module::build(&self.device.device, &expanded, entry)?);
+            self.compile_nanos += u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
             self.compilations += 1;
             self.made.insert(key, module.clone());
             Ok(module)

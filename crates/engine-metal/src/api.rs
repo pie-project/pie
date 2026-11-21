@@ -1017,17 +1017,21 @@ impl Engine for Metal {
 
     fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
         let shell = self.loaded_mut()?;
-        let before = shell.program_compilations();
+        let before = (shell.program_compilations(), shell.program_compile_nanos());
         let id = shell.register_program(registration).map_err(fault)?;
         // A registration after ready that compiled guest code is one the
         // load's prewarm did not prepare: built at its registration, before
-        // its first fire (no fire waits on it).
-        let built = shell.program_compilations() - before;
+        // its first fire (no fire waits on it). Its compile's wall time
+        // reads an OS shader-cache hit apart from a cold compile.
+        let built = shell.program_compilations() - before.0;
         if built > 0 {
+            let ms = (shell.program_compile_nanos() - before.1) / 1_000_000;
             self.live.tally(engine::live::Tally::BuiltAtRegister, built);
+            self.live.tally(engine::live::Tally::BuiltAtRegisterMs, ms);
             tracing::warn!(
                 program = registration.program_hash,
                 regions = built,
+                ms,
                 "metal: a registration after ready compiled guest code the prewarm did not"
             );
         }
@@ -1063,17 +1067,22 @@ impl Engine for Metal {
                 engine::Error::Program("a prepared program this engine did not prepare".into())
             })?;
         let shell = self.loaded_mut()?;
-        let before = shell.program_compilations();
+        let before = (shell.program_compilations(), shell.program_compile_nanos());
         let id = shell.finish_program(*registered).map_err(fault)?;
         // The compile's regions count at the finish: a registration after
         // ready that compiled guest code is one the prewarm did not prepare,
-        // built at its registration (no fire waits on it).
-        let built = shell.program_compilations() - before;
+        // built at its registration (no fire waits on it). Its compile's
+        // wall time, off this thread, reads a cache hit apart from a cold
+        // compile.
+        let built = shell.program_compilations() - before.0;
         if built > 0 {
+            let ms = (shell.program_compile_nanos() - before.1) / 1_000_000;
             self.live.tally(engine::live::Tally::BuiltAtRegister, built);
+            self.live.tally(engine::live::Tally::BuiltAtRegisterMs, ms);
             tracing::warn!(
                 program = id.0,
                 regions = built,
+                ms,
                 "metal: a registration after ready compiled guest code the prewarm did not"
             );
         }

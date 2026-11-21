@@ -59,6 +59,10 @@ pub enum Tally {
     /// fire waits on it, so it breaks no rule; read beside
     /// [`Tally::BuiltInFire`], and never gated on.
     BuiltAtRegister,
+    /// The wall time [`Tally::BuiltAtRegister`]'s builds took, in
+    /// milliseconds, where the backend times them: a build an OS cache
+    /// serves (tens of ms) reads apart from a cold compile (seconds).
+    BuiltAtRegisterMs,
     /// A pipeline, module or program built after ready on a fire's path:
     /// one a serving fire or a bind reached that the load did not build,
     /// whatever the backend (a kernel pipeline, a JIT instantiation, a
@@ -85,13 +89,14 @@ pub enum Tally {
 }
 
 impl Tally {
-    pub const ALL: [Tally; 10] = [
+    pub const ALL: [Tally; 11] = [
         Tally::Compiled,
         Tally::Fallback,
         Tally::Unrecorded,
         Tally::Refused,
         Tally::Eager,
         Tally::BuiltAtRegister,
+        Tally::BuiltAtRegisterMs,
         Tally::BuiltInFire,
         Tally::BoundInFire,
         Tally::Drained,
@@ -108,6 +113,7 @@ impl Tally {
             Tally::Refused => "refused",
             Tally::Eager => "eager",
             Tally::BuiltAtRegister => "built_at_register",
+            Tally::BuiltAtRegisterMs => "built_at_register_ms",
             Tally::BuiltInFire => "built_in_fire",
             Tally::BoundInFire => "bound_in_fire",
             Tally::Drained => "drained",

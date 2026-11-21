@@ -242,6 +242,12 @@ impl Plane {
         self.cache.stats()
     }
 
+    /// The wall time every region compile since load took, in nanoseconds.
+    #[must_use]
+    pub const fn compile_nanos(&self) -> u64 {
+        self.cache.compile_nanos()
+    }
+
     /// Compiles each of `registrations` into the cache without registering
     /// it (the runtime's prewarm of its standard samplers, before ready): a
     /// later registration of one, its knob values in its channels, finds

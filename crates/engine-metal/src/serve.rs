@@ -2869,6 +2869,13 @@ impl Shell {
         self.programs.stats().compilations
     }
 
+    /// The wall time every guest region compile since load took, in
+    /// nanoseconds: an OS shader-cache hit reads apart from a cold compile.
+    #[must_use]
+    pub fn program_compile_nanos(&self) -> u64 {
+        self.programs.compile_nanos()
+    }
+
     /// See `Engine::prepare_program`: the registration's plan, on this
     /// thread; [`crate::program::Registering::compile`] builds its libraries
     /// and pipelines on any thread, while this shell fires on.
