@@ -330,24 +330,32 @@ pub fn lacking(
 /// `engine::rates::weights_at`'s (past the last-level cache), but one where
 /// the plane alone passes every last-level cache served (a third of
 /// `engine::rates::WEIGHT_BYTES`): read cold every fire by itself, as an
-/// output head is.
-fn shape_planes(n: u32, k: u32) -> usize {
+/// output head is. Never more than the model's weights hold of the plane
+/// (`model`, its weight bytes, where stated): a served fire's plane is read
+/// again after every other weight the model reads, so a model whose
+/// weights sit in a cache reads its planes warm in serving too (the
+/// rotation past the cache would lay millions of a 1 x 64 plane).
+fn shape_planes(n: u32, k: u32, model: Option<u64>) -> usize {
     let plane = 2 * n as usize * k as usize;
-    if plane > engine::rates::WEIGHT_BYTES / 3 {
+    let planes = if plane > engine::rates::WEIGHT_BYTES / 3 {
         1
     } else {
         weights_at(n, k)
-    }
+    };
+    model.map_or(planes, |bytes| {
+        let held = usize::try_from(bytes.div_ceil(plane.max(1) as u64)).unwrap_or(usize::MAX);
+        planes.min(held.max(1))
+    })
 }
 
 /// Whether a rates matmul at `m x n x k` may be laid: no operand past the
 /// device's `largest` buffer, and the set (its activation, the weight planes
 /// it rotates through, [`shape_planes`]; its result; bf16) within the room
 /// the load admitted the rates step to lay (`engine::rates::step_bytes`).
-fn operands_fit(m: u32, n: u32, k: u32, largest: u64) -> bool {
+fn operands_fit(m: u32, n: u32, k: u32, model: Option<u64>, largest: u64) -> bool {
     let (m64, n64, k64) = (u64::from(m), u64::from(n), u64::from(k));
     let (act, plane, y) = (2 * m64 * k64, 2 * n64 * k64, 2 * m64 * n64);
-    let set = act + shape_planes(n, k) as u64 * plane + y;
+    let set = act + shape_planes(n, k, model) as u64 * plane + y;
     act.max(plane).max(y) <= largest && set <= engine::rates::step_bytes()
 }
 
@@ -536,6 +544,9 @@ struct Rig<'a, B: Serve> {
     /// carried up from a frame of no more fires (one carried down holds the
     /// frame's own submit, and only overestimates).
     admission: std::cell::Cell<engine::rates::Admission>,
+    /// The admission's worst ratio held where the caller gave it
+    /// ([`measure_shapes`]'s `worst`): no landing moves it.
+    worst_held: std::cell::Cell<bool>,
     /// The step whose fire, at one a frame, was past the bound: refused by
     /// name, and the step drops that shape ([`dropped`]).
     past_bound: std::cell::RefCell<Option<String>>,
@@ -589,6 +600,7 @@ impl<'a, B: Serve> Rig<'a, B> {
             probe: None,
             retimed: std::cell::Cell::new(false),
             admission: std::cell::Cell::new(engine::rates::Admission::new(max_submit)),
+            worst_held: std::cell::Cell::new(false),
             past_bound: std::cell::RefCell::new(None),
             swing: std::cell::Cell::new(1.0),
             uniforms: std::cell::Cell::new(None),
@@ -923,9 +935,11 @@ impl<'a, B: Serve> Rig<'a, B> {
             timer(f)?
         };
         let took = timed.0.unwrap_or(timed.1) as f64;
-        let mut admission = self.admission.get();
-        admission.landed(estimate, took, count >= self.basis.get());
-        self.admission.set(admission);
+        if !self.worst_held.get() {
+            let mut admission = self.admission.get();
+            admission.landed(estimate, took, count >= self.basis.get());
+            self.admission.set(admission);
+        }
         // Kept at the clock the first probe read.
         let per_fire = took / f64::from(count.max(1)) / ratio;
         self.per_fire.set(Some(per_fire));
@@ -1093,14 +1107,25 @@ fn median(mut v: Vec<u64>) -> u64 {
 /// (`curve_of`); where and why is recorded with it, so no load times it
 /// again. `stated` holds the device's rates, the launch and the bandwidth
 /// among them (a load measures these first, `engine::rates::rates_at_load`).
+///
+/// `model` states the model's weight bytes: no curve rotates through more
+/// of a plane than they hold ([`shape_planes`]); `None` rotates past the
+/// cache.
+///
+/// `worst` holds the admission's worst ratio of a fire's time to its
+/// estimate where given (a test pins it so a point's admission does not
+/// follow the box's clock); a load passes `None`, the ratio its fires
+/// measure as they land.
 pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
     device: &B::Context,
     tactics: &T,
     tier: kernels_slang::Tier,
     timer: Timer<'_, B>,
     max_submit: Option<std::time::Duration>,
+    worst: Option<f64>,
     stated: &Rates,
     wanted: &[(kernels_slang::linear::gemm::Tactic, u32, u32)],
+    model: Option<u64>,
     top: u32,
     say: &mut dyn FnMut(&str),
 ) -> Result<Vec<profile::fire::KernelCurve>> {
@@ -1163,6 +1188,15 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
             }
         }
         Err(why) => return Err(why),
+    }
+    // The worst ratio of a fire's time to its estimate the points are
+    // admitted at: the one measured as they land, or `worst` where given
+    // (held there, every landing aside).
+    if let Some(worst) = worst {
+        let mut admission = rig.admission.get();
+        admission.worst = worst.max(1.0);
+        rig.admission.set(admission);
+        rig.worst_held.set(true);
     }
     let rows = timed_rows(top);
     let largest = rig.device.max_buffer();
@@ -1236,11 +1270,11 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
             .max()
             .unwrap_or(1);
         let slice = |split: u32| n.div_ceil(floor).div_ceil(split) * floor;
-        let fits = |m: u32| operands_fit(m, n, k, largest);
+        let fits = |m: u32| operands_fit(m, n, k, model, largest);
         let laid = match rows.iter().rev().copied().find(|&m| fits(m)) {
             Some(most) => {
                 let act = rig.operand(most, k, Dtype::Bf16)?;
-                let weights = (0..shape_planes(n, k))
+                let weights = (0..shape_planes(n, k, model))
                     .map(|_| rig.operand(n, k, Dtype::Bf16))
                     .collect::<Result<Vec<Tensor>>>()?;
                 let y = rig.zeros(most, n, Dtype::Bf16)?;
@@ -1367,7 +1401,10 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
                     continue;
                 }
                 if samples[t].is_empty() {
-                    // Every sample dropped: no point here, the curve goes on.
+                    // Every sample dropped: no measurement here, the curve
+                    // stops (a curve of no point and no stop would not
+                    // read back).
+                    timed[t].stop = Some((m, profile::fire::KernelCurve::UNTIMED));
                     continue;
                 }
                 let (ns, spread) = median_spread(&samples[t]);
@@ -1472,6 +1509,7 @@ pub fn shapes_at_load<B: Serve, T: Tactics + ?Sized>(
     chip: profile::Profile,
     save: Option<engine::rates::SaveTo<'_>>,
     shapes: &[(u32, u32)],
+    model: Option<u64>,
     top: u32,
 ) -> Result<profile::Profile> {
     let stated = chip.rates();
@@ -1492,8 +1530,10 @@ pub fn shapes_at_load<B: Serve, T: Tactics + ?Sized>(
         tier,
         timer,
         max_submit,
+        None,
         &stated,
         &wanted,
+        model,
         top,
         &mut |_| {},
     )?;

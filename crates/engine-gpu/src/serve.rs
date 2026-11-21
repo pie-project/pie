@@ -134,6 +134,7 @@ pub trait Serve: Backend {
         boot: &Self::DeviceBoot,
         tuning: Self::Tuning,
         shapes: &[(u32, u32)],
+        model_bytes: u64,
         top_rows: u32,
     ) -> Result<Self::Tuning>;
 
@@ -1038,6 +1039,7 @@ impl<B: Serve> Shell<B> {
                 boot.device,
                 tuning,
                 &shapes,
+                counts.weight_bytes,
                 boot.budget.max_tokens.max(1),
             )?;
         }

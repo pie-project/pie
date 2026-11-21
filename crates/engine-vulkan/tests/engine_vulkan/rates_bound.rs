@@ -84,8 +84,10 @@ fn the_rates_step_stays_under_a_simulated_bound() {
         tier,
         &timer,
         Some(BOUND),
+        None,
         &stated,
         &wanted,
+        None,
         TOP,
         say,
     )
@@ -170,8 +172,10 @@ fn a_bound_no_cube_fits_stops_the_curves_not_the_load() {
         tier,
         &timer,
         Some(tight),
+        None,
         &stated,
         &wanted,
+        None,
         TOP,
         &mut |line| eprintln!("{line}"),
     )
@@ -222,7 +226,9 @@ fn a_bound_no_cube_fits_stops_the_curves_not_the_load() {
 /// head's 311 MB are estimated far past it), as on the Adreno, where every
 /// head curve stopped at 1 row: its fires are timed on slices of its
 /// columns the bound admits, their times carried to the whole plane, so
-/// the head's curves hold points instead.
+/// the head's curves hold points instead. The admission's worst ratio is
+/// pinned (`measure_shapes`'s `worst`), so the slices admitted follow the
+/// slicing, not the box's clock.
 #[test]
 fn a_head_past_the_bound_is_timed_on_slices_of_its_columns() {
     let Ok(device) = Context::bind(&crate::gpu::device_boot(), engine::Allowance::WHOLE) else {
@@ -256,8 +262,10 @@ fn a_head_past_the_bound_is_timed_on_slices_of_its_columns() {
         tier,
         &timer,
         Some(bound),
+        Some(1.0),
         &stated,
         &wanted,
+        None,
         top,
         &mut |line| eprintln!("{line}"),
     )

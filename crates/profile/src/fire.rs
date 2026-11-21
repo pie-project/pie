@@ -157,6 +157,9 @@ impl KernelCurve {
     pub const BOUND: u32 = 1;
     pub const BUFFER: u32 = 2;
     pub const BEATEN: u32 = 3;
+    /// Every sample at the rows was dropped (a fire timed below its
+    /// launches): no measurement there, and nothing past it.
+    pub const UNTIMED: u32 = 4;
 
     /// What the curve measures: its kernel and shape.
     #[must_use]

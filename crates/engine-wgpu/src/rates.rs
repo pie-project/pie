@@ -102,6 +102,7 @@ pub fn shapes_at_load(
     profiles: Option<&std::path::Path>,
     max_submit: Option<std::time::Duration>,
     shapes: &[(u32, u32)],
+    model_bytes: u64,
     top_rows: u32,
 ) -> Result<crate::tuning::Tuning> {
     let tier = <Api as engine_gpu::serve::Serve>::tier(device);
@@ -125,6 +126,7 @@ pub fn shapes_at_load(
         tuning.profile().clone(),
         save,
         shapes,
+        Some(model_bytes),
         top_rows,
     );
     crate::encode::profile_timing(was);

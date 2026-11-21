@@ -446,6 +446,7 @@ impl<B: Serve> Serve for Named<B> {
         _boot: &B::DeviceBoot,
         tuning: B::Tuning,
         _shapes: &[(u32, u32)],
+        _model_bytes: u64,
         _top_rows: u32,
     ) -> Result<B::Tuning> {
         Ok(tuning)

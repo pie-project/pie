@@ -99,6 +99,7 @@ impl Serve for Api {
         boot: &crate::api::DeviceBoot,
         tuning: crate::tuning::Tuning,
         shapes: &[(u32, u32)],
+        model_bytes: u64,
         top_rows: u32,
     ) -> Result<crate::tuning::Tuning> {
         crate::rates::shapes_at_load(
@@ -107,6 +108,7 @@ impl Serve for Api {
             boot.profiles.as_deref(),
             crate::rates::stated_submit_bound(),
             shapes,
+            model_bytes,
             top_rows,
         )
     }
