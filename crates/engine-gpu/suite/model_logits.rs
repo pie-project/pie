@@ -2499,3 +2499,229 @@ fn a_tier_round_trip_is_bit_exact_for_every_parked_shape() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+
+/// A never-written cell of the pool reads back as NaN: bf16 `0x7fc0` in each
+/// half of a word, itself an f32 NaN. A kernel that reads such a cell and
+/// weighs it by a zero (`0 * NaN` is NaN) answers NaN; one that leaves it out
+/// by its bound answers as over the zeroes a fresh pool holds.
+const POISON: u32 = 0x7fc0_7fc0;
+
+/// Every byte of `shell`'s pool, all its segments committed, set to
+/// `pattern` a word ([`POISON`], or 0): the kv pages past the rows a lane
+/// writes, the recurrent state, a fire's arena and its kernels' scratch, as
+/// recycled memory may hold anything.
+fn fill(shell: &mut Shell, pattern: u32) {
+    use engine_gpu::backend::Buffer as _;
+    shell.drain().expect("every frame lands first");
+    let facts = shell.pool_chunk_facts();
+    shell
+        .commit_segments(facts.segments.max)
+        .expect("the segments commit");
+    const STRIPE: usize = 8 << 20;
+    let stripe: Vec<u8> = std::iter::repeat_n(pattern.to_le_bytes(), STRIPE / 4)
+        .flatten()
+        .collect();
+    for buffer in shell.pools().segment_buffers() {
+        let bytes = buffer.bytes();
+        let mut at = 0;
+        while at < bytes {
+            let len = (bytes - at).min(STRIPE as u64);
+            buffer
+                .write_shared(at, &stripe[..len as usize])
+                .expect("the fill lands");
+            at += len;
+        }
+        // The fill reads back at the segment's ends.
+        for at in [0, bytes - 4] {
+            let mut word = [0u8; 4];
+            buffer.read(at, &mut word).expect("the fill reads back");
+            assert_eq!(u32::from_le_bytes(word), pattern, "the fill lands at byte {at}");
+        }
+    }
+}
+
+/// Whether two logit rows of one prompt agree: the same argmax, and every
+/// logit within a hair of the row's scale (lanes at other offsets of a fire
+/// may round apart, none may read another's cells).
+fn agree(a: &[f32], b: &[f32]) -> bool {
+    let scale = a.iter().fold(0f32, |top, v| top.max(v.abs())).max(1.0);
+    a.len() == b.len()
+        && argmax(a) == argmax(b)
+        && a.iter().zip(b).all(|(x, y)| (x - y).abs() <= 1e-2 * scale)
+}
+
+/// The seats a poisoned load holds: the widest case's six lanes, and two
+/// more each round's lanes move onto.
+const POISON_SEATS: usize = 8;
+
+/// A prefill over a pool whose every never-written cell is NaN, for each
+/// prompt length (none a whole page or tile of keys: 33 and 65 one key
+/// past one, 31 one short) on one lane and on four lanes of one prompt, and
+/// four lanes of a 35-row prompt beside two other prompts; each then
+/// decodes. Every lane's logits finite, the lanes of one prompt alike, and
+/// alike to the same fire over a pool of zeroes. A round runs over the
+/// pool poisoned afresh with its seats opened, the first on seats `0..`,
+/// the second each lane moved onto a seat another held, so its pages and
+/// state are recycled ones holding NaN wherever nothing is written.
+fn poisoned(model: &str) {
+    let fixture = fixture(model, None);
+    let Some(mut shell) = load_lanes(&fixture, PAGE, CONTEXT, POISON_SEATS as u32, 256) else {
+        return;
+    };
+    // Four lanes a prompt where a fire holds their rows (three of 65).
+    let most = shell.budget().max_tokens as usize;
+    for len in [1u32, 31, 33, 35, 47, 65] {
+        for same in [1usize, 4.min(most / len as usize)] {
+            poisoned_case(&mut shell, &fixture.trace, model, len, same, 0);
+        }
+    }
+    poisoned_case(&mut shell, &fixture.trace, model, 35, 4, 2);
+    // The poison reaches what a fire reads: a decode over a lane's held
+    // keys answers otherwise once they are poisoned under it (NaN, or the
+    // splits whose keys it poisoned left out of the fold).
+    fill(&mut shell, 0);
+    shell.open(0).expect("the seat opens");
+    let prompt: Vec<u32> = (0..33u32).map(|at| (at * 37 + 11) % 256).collect();
+    let lane = |tokens, held| Seated {
+        held: Some(held),
+        ..Seated::of(Lane {
+            slot: 0,
+            word: word(&fixture.trace, 1),
+            tokens,
+        })
+    };
+    shell
+        .fire_seated(&[Seated {
+            held: Some(0),
+            ..Seated::of(Lane {
+                slot: 0,
+                word: word(&fixture.trace, 33),
+                tokens: &prompt,
+            })
+        }])
+        .expect("the prefill lands");
+    let token = [1u32];
+    let held = shell
+        .fire_seated(&[lane(&token[..], 33)])
+        .expect("the decode lands")
+        .swap_remove(0);
+    fill(&mut shell, POISON);
+    let poisoned = shell
+        .fire_seated(&[lane(&token[..], 33)])
+        .expect("the decode over poisoned keys lands")
+        .swap_remove(0);
+    assert!(
+        held.iter().zip(&poisoned).any(|(a, b)| a.to_bits() != b.to_bits()),
+        "{model}: a decode over poisoned held keys answers as over its own: the poison missed \
+         the pool"
+    );
+}
+
+/// [`poisoned`]'s rounds of `same` lanes of one `len`-row prompt and
+/// `others` lanes of other prompts.
+fn poisoned_case(shell: &mut Shell, trace: &Trace, model: &str, len: u32, same: usize, others: usize) {
+    const STEPS: usize = 3;
+    let lanes = same + others;
+    let case = format!("{model} {same}x{len}+{others}");
+    let shared: Vec<u32> = (0..len).map(|at| (at * 37 + 11) % 256).collect();
+    let prompts: Vec<Vec<u32>> = (0..lanes)
+        .map(|lane| match lane - same.min(lane) {
+            _ if lane < same => shared.clone(),
+            0 => (0..61u32).map(|at| (at * 53 + 5) % 256).collect(),
+            _ => (0..23u32).map(|at| (at * 29 + 3) % 256).collect(),
+        })
+        .collect();
+    let check = |what: &str, rows: &[Vec<f32>]| {
+        for (lane, row) in rows.iter().enumerate() {
+            let bad = row.iter().filter(|v| !v.is_finite()).count();
+            assert!(
+                bad == 0,
+                "{case} {what}: lane {lane} has {bad} of {} logits not finite",
+                row.len()
+            );
+        }
+        for lane in 1..same {
+            assert!(
+                agree(&rows[0], &rows[lane]),
+                "{case} {what}: lane {lane} answers otherwise than lane 0 on the same prompt \
+                 (argmax {} against {})",
+                argmax(&rows[lane]),
+                argmax(&rows[0])
+            );
+        }
+    };
+    let round = |shell: &mut Shell, pattern: u32, seat: &dyn Fn(usize) -> u32| -> Vec<Vec<f32>> {
+        fill(shell, pattern);
+        for lane in 0..lanes {
+            shell.open(seat(lane)).expect("the seat opens");
+        }
+        let seated: Vec<Seated<'_>> = (0..lanes)
+            .map(|lane| Seated {
+                held: Some(0),
+                ..Seated::of(Lane {
+                    slot: seat(lane),
+                    word: word(trace, prompts[lane].len() as u32),
+                    tokens: &prompts[lane],
+                })
+            })
+            .collect();
+        let got = shell.fire_seated(&seated).expect("the prefill lands");
+        check("prefill", &got);
+        let mut held: Vec<u32> = prompts.iter().map(|p| p.len() as u32).collect();
+        let mut fed: Vec<Vec<u32>> = got.iter().map(|row| vec![argmax(row)]).collect();
+        let mut rows = got;
+        for step in 0..STEPS {
+            let seated: Vec<Seated<'_>> = (0..lanes)
+                .map(|lane| Seated {
+                    held: Some(held[lane]),
+                    ..Seated::of(Lane {
+                        slot: seat(lane),
+                        word: word(trace, 1),
+                        tokens: &fed[lane],
+                    })
+                })
+                .collect();
+            let got = shell.fire_seated(&seated).expect("the decode lands");
+            check(&format!("decode {step}"), &got);
+            for lane in 0..lanes {
+                held[lane] += 1;
+                fed[lane] = vec![argmax(&got[lane])];
+            }
+            rows.extend(got);
+        }
+        rows
+    };
+    let zeroes = round(shell, 0, &|lane| lane as u32);
+    let fresh = round(shell, POISON, &|lane| lane as u32);
+    // Each lane on a seat another lane (or none) held.
+    let moved = |lane: usize| ((lane + 2) % POISON_SEATS) as u32;
+    let recycled = round(shell, POISON, &moved);
+    for (what, rows) in [("fresh", &fresh), ("recycled", &recycled)] {
+        for (at, (a, b)) in zeroes.iter().zip(rows).enumerate() {
+            assert!(
+                a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()),
+                "{case}: row {at} over a poisoned pool ({what} seats) answers otherwise than \
+                 over zeroes (argmax {} against {})",
+                argmax(b),
+                argmax(a)
+            );
+        }
+    }
+    eprintln!("{case}: every lane finite and as over zeroes, fresh and recycled");
+}
+
+#[test]
+fn a_dense_miniature_over_a_poisoned_pool_answers_finite() {
+    poisoned("qwen3-micro-text");
+}
+
+#[test]
+fn a_hybrid_miniature_over_a_poisoned_pool_answers_finite() {
+    poisoned("qwen35-tiny");
+}
+
+#[test]
+fn a_windowed_miniature_over_a_poisoned_pool_answers_finite() {
+    poisoned("gemma4-e4b-mini-l1");
+}
+

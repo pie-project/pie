@@ -6,6 +6,7 @@ mod fold;
 mod guest_state;
 mod hosted;
 mod lane_refusal;
+mod nan_guards;
 mod outputs;
 mod port;
 mod readout_rows;
