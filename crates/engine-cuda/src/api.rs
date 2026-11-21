@@ -1112,7 +1112,7 @@ impl Engine for Cuda {
         };
         let told = self
             .loaded_mut()?
-            .tell_swaps_landed(Box::new(move || sink(token)))
+            .tell_swaps_landed(Box::new(move |landing| sink(token, landing)))
             .map_err(fault)?;
         Ok(!told)
     }

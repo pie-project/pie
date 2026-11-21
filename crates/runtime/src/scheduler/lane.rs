@@ -729,7 +729,13 @@ impl Lane {
             // A copy still landing settles its tracked completion here: the
             // runtime gives its source slots back only then.
             let landed = broker.clone();
-            engine.on_landed(std::sync::Arc::new(move |token: u64| {
+            engine.on_landed(std::sync::Arc::new(move |token: u64, landing: ::engine::Landing| {
+                // A copy that failed leaves its data at its source: named
+                // here until the runtime retries it from the source or fails
+                // its owner (the rework line's handling).
+                if let ::engine::Landing::Failed(why) = &landing {
+                    tracing::error!(engine_idx, token, %why, "a tier copy failed to land");
+                }
                 landed.notify(token, waker::FIRST_COMPLETION_EPOCH);
                 // The scheduler retires the copy's completion on its next
                 // turn: woken now, not at its idle backstop, so the move
@@ -1878,7 +1884,7 @@ mod landing_tests {
             tokens: Arc::clone(&tokens),
         };
         let told = broker.clone();
-        engine.on_landed(Arc::new(move |token| {
+        engine.on_landed(Arc::new(move |token, _landing| {
             told.notify(token, waker::FIRST_COMPLETION_EPOCH);
         }));
         (Box::new(engine), tokens, sink)
@@ -1900,7 +1906,7 @@ mod landing_tests {
         let token = tokens.lock().unwrap()[0];
         let sink = sink.lock().unwrap().clone().expect("the lane gave a sink");
         assert!(!completion.is_settled());
-        sink(token);
+        sink(token, ::engine::Landing::Landed);
         assert!(
             completion.is_settled(),
             "told landed, the copy's sources may go back"

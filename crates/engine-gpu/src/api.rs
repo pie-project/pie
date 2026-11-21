@@ -1177,7 +1177,7 @@ where
         let landed = self
             .landed
             .clone()
-            .map(|sink| -> Box<dyn FnOnce() + Send> { Box::new(move || sink(token)) });
+            .map(|sink| -> Box<dyn FnOnce() + Send> { Box::new(move || sink(token, engine::Landing::Landed)) });
         let copied = self
             .loaded_mut()?
             .copy_slots_landing(copy, landed)

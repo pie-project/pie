@@ -2123,7 +2123,7 @@ impl Shell {
         // Told once the buffer retires, faulted or not: a faulted copy has
         // stopped reading its sources too, and its fault reaches the next
         // drain.
-        self.grafted = Some(frame.commit_async(Some(Box::new(move |_| sink(token))))?);
+        self.grafted = Some(frame.commit_async(Some(Box::new(move |_| sink(token, engine::Landing::Landed))))?);
         Ok(false)
     }
 
