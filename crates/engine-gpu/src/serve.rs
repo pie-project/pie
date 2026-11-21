@@ -744,6 +744,8 @@ pub struct Shell<B: Serve> {
     /// Fires of at least these rows run eager, as the load stated: the
     /// bodies past the allowance it recorded smallest first.
     eager_rows: Option<u32>,
+    /// The load records its bodies: a kept walk is recorded and not run.
+    pub arming: bool,
     /// The fires since the last count that ran eager as stated.
     eager: u64,
     /// The tier moves through the host since the last count that found
@@ -2032,6 +2034,7 @@ impl<B: Serve> Shell<B> {
             recorded: 0,
             unkept: 0,
             eager_rows: None,
+            arming: false,
             eager: 0,
             drained: 0,
             walked: (0, 0),
@@ -6309,23 +6312,47 @@ impl<B: Serve> Shell<B> {
         let page = self.pools.paging().page_size.max(1);
         let depth = self.arms.depth();
         let mut recorded = 0u64;
-        // The allowance: what the device has left past the weights, the
-        // fire workspaces and the pool the load laid. A body takes what the
-        // driver holds for it (its command buffer and descriptor sets),
-        // measured as it is recorded; the next is recorded only while the
-        // allowance holds what the dearest so far took.
-        let allowance = self.device.left();
-        let before = self.device.outside();
+        // Bodies are recorded, not run: a recording's commands need no
+        // execution, and the widest prefills would take the load seconds.
+        self.arming = true;
+        // A body's cost is the host memory its command buffer and
+        // descriptor sets take (the driver holds them there: what it holds
+        // on the device for them measures nothing), measured as it is
+        // recorded. The allowance is the host memory the load has: what the
+        // host has available, less the host tier the pool laid (pageable,
+        // taken as it fills). On a device that shares the host's memory it
+        // is the one allowance the device has left. The next body is
+        // recorded only while the allowance holds what the dearest so far
+        // took.
         let rss = || {
             std::fs::read_to_string("/proc/self/statm")
                 .ok()
                 .and_then(|statm| statm.split_whitespace().nth(1)?.parse::<u64>().ok())
                 .map_or(0, |pages| pages * 4096)
         };
-        let host_before = rss();
+        let available = || {
+            std::fs::read_to_string("/proc/meminfo")
+                .ok()
+                .and_then(|meminfo| {
+                    meminfo
+                        .lines()
+                        .find(|line| line.starts_with("MemAvailable:"))?
+                        .split_whitespace()
+                        .nth(1)?
+                        .parse::<u64>()
+                        .ok()
+                })
+                .map_or(0, |kib| kib * 1024)
+        };
+        let allowance = if self.device.host_room().is_some() {
+            self.device.left()
+        } else {
+            available().saturating_sub(self.pools.host_tier_bytes())
+        };
+        let before = rss();
         let mut dearest = 0u64;
         for (at, lanes) in shapes.iter().enumerate() {
-            let used = self.device.outside().saturating_sub(before);
+            let used = rss().saturating_sub(before);
             if used.saturating_add(dearest.saturating_mul(depth as u64)) > allowance {
                 let from = lanes.iter().map(|&(_, rows)| rows).sum::<u32>();
                 let eager: Vec<String> = shapes[at..]
@@ -6350,7 +6377,7 @@ impl<B: Serve> Shell<B> {
                 break;
             }
             for arm in 0..depth {
-                let ahead = self.device.outside();
+                let ahead = rss();
                 let owned = lanes
                     .iter()
                     .map(|&(class, rows)| {
@@ -6373,18 +6400,21 @@ impl<B: Serve> Shell<B> {
                 for before in 0..arm {
                     self.arms.give(before);
                 }
-                fired?;
-                dearest = dearest.max(self.device.outside().saturating_sub(ahead));
+                if let Err(fault) = fired {
+                    self.arming = false;
+                    return Err(fault);
+                }
+                dearest = dearest.max(rss().saturating_sub(ahead));
                 recorded += 1;
             }
         }
+        self.arming = false;
         tracing::info!(
             allowance,
             bodies = recorded,
-            bytes = self.device.outside().saturating_sub(before),
-            host_bytes = rss().saturating_sub(host_before),
+            host_bytes = rss().saturating_sub(before),
             dearest,
-            "the recorded bodies' driver memory against the allowance"
+            "the recorded bodies' host memory against the allowance"
         );
         Ok(recorded)
     }

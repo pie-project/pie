@@ -677,6 +677,12 @@ impl<B: Backend> Pools<B> {
         &self.layout
     }
 
+    /// The bytes of the host tier's chunks.
+    #[must_use]
+    pub fn host_tier_bytes(&self) -> u64 {
+        u64::from(self.host_chunks) * self.chunk_bytes()
+    }
+
     /// The pool as the runtime counts it.
     #[must_use]
     pub fn chunk_facts(&self) -> ChunkFacts {

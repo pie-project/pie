@@ -404,7 +404,23 @@ impl Serve for Api {
                         (0..groups.len()).map(|at| kept.indirect(at)).collect(),
                     )),
                 };
+                // A load recording its bodies runs none of them: the fire
+                // lands on an empty submission, and its block is written by
+                // the first serving fire's head.
+                let arming = shell.arming;
                 let pending = match act {
+                    _ if arming => {
+                        if let Act::Record(varying) = act {
+                            shell.shelf.recorder.insert(
+                                family,
+                                crate::record::Recording::new(kept, cuts),
+                                varying,
+                            );
+                        } else {
+                            shell.kept_none();
+                        }
+                        shell.device.frame()?.commit_async(Some(on_done))?
+                    }
                     Act::Fill => {
                         shell.kept_none();
                         let held = shell
