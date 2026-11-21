@@ -251,7 +251,10 @@ fn guest_states_no_fire_term_and_64_lanes_fire_in_the_rungs_span(
     let Some((loaded, program, mut slots, t_input)) = setup_bound(tag, LANES, submit_bound) else {
         return;
     };
-    // The bound stated is the one the load holds its steps to.
+    // The bound stated is the one the load holds its steps to: the boot's
+    // where it states one, else the platform's own (Windows' TDR, Android's
+    // driver timeout; none elsewhere).
+    let stated = submit_bound.or_else(engine_gpu::rates::stated_submit_bound);
     assert_eq!(
         loaded
             .engine
@@ -259,7 +262,7 @@ fn guest_states_no_fire_term_and_64_lanes_fire_in_the_rungs_span(
             .expect("loaded")
             .submit_bound()
             .map(|held| held.bound_ns),
-        submit_bound.map(|b| b.as_nanos() as f64),
+        stated.map(|b| b.as_nanos() as f64),
         "the load holds its steps to the bound its boot states"
     );
     let Loaded {
