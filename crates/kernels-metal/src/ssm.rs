@@ -1242,6 +1242,16 @@ pub struct DotsTable {
     pub max_rep: u32,
 }
 
+impl DotsTable {
+    /// Whether every lane's carried rows fit the table: else the scan makes
+    /// each chunk's reductions itself, whatever a lane carries, and no table
+    /// is launched (a carry is served up to its context, never refused).
+    #[must_use]
+    pub fn fits(&self) -> bool {
+        self.max_rep <= self.rows
+    }
+}
+
 /// A buffer's corrected planes (`rs_corrected`), as a verify or carried
 /// scan lands and reads them through the fire's page table: each row's raw
 /// keys (bf16, `k_heads * k_dim`) and corrected value `u` (f32, `v_heads *
@@ -1594,7 +1604,7 @@ pub fn gated_delta_carried(
     // every value head and row group of the scan reads. A carry of one
     // chunk (a decode at its lag) makes them in the scan itself, a
     // simdgroup a row, and launches no table (its rows stated 0).
-    let short = table.max_rep <= GDN_CARRIED_INLINE;
+    let short = table.max_rep <= GDN_CARRIED_INLINE || !table.fits();
     let table_rows = if short { 0 } else { table.rows };
     if table.max_rep > 0 && !short {
         let zk = k_heads

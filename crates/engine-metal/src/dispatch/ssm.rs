@@ -612,17 +612,12 @@ impl crate::run::Run<'_> {
             .map(|plan| plan.replay)
             .max()
             .unwrap_or(0);
+        // The table holds as many rows as the seat's work area gives a lane
+        // and key head; a lane carrying more (a beam whose lineages stay
+        // apart, a long run-ahead) is served all the same: the scan makes
+        // each chunk's reductions itself (`ssm::DotsTable::fits`).
         let rows = u32::try_from(seat.layout.work_elems * 4 / 16 / u64::from(k_heads.max(1)))
             .unwrap_or(u32::MAX);
-        if max_rep > rows {
-            return Err(kernels_metal::Error::Backend {
-                op: "ssm.gated_delta_carried",
-                detail: format!(
-                    "a lane carries {max_rep} recurrent rows and the carried scan's table holds \
-                     {rows} a lane and key head in the seat's work area"
-                ),
-            });
-        }
         Ok(ssm::DotsTable {
             table: seat.work,
             rows,

@@ -104,4 +104,45 @@ fn the_carried_scan_times_as_the_step() {
             .expect("carried");
         });
     }
+
+    // The conv: the prompt conv a decode row takes on the tip, beside the
+    // decode window's conv over a lane carrying 0 / 3 / 7 rows.
+    let channels = width;
+    let taps = 4u32;
+    let weight = upload(&bf((channels * taps) as usize), channels, taps, Dtype::Bf16);
+    let window = (taps * channels) as usize;
+    let conv_bank = upload(&small(window), taps, channels, Dtype::F32);
+    let conv_map = StateMap::whole(window as u64);
+    let conv_segments = upload(&conv_map.bytes(), 1, conv_map.words().len() as u32, Dtype::U64);
+    let conv_pool = RecurrentPool {
+        state: conv_bank,
+        slots: ints(&[0]),
+        conv_state: conv_bank,
+        new_conv_state: conv_bank,
+        segments: conv_segments,
+    };
+    let x = upload(&bf(channels as usize), 1, channels, Dtype::Bf16);
+    let conv_y = zeros((channels * 2) as usize, 1, channels, Dtype::Bf16);
+    let land = zeros((channels * 2) as usize, 1, channels, Dtype::Bf16);
+    time("prompt conv", &|sink| {
+        ssm::causal_conv1d(sink, x, weight, None, &conv_pool, taps, 1, conv_y).expect("conv");
+    });
+    let x_page = 4 * channels * 2;
+    let x_slab = zeros(x_page as usize * 4, 4, x_page, Dtype::U8);
+    let x_paged = Paged { slab: x_slab, pages: ints(&table), page_tokens: 4, page_bytes: x_page, row_bytes: channels * 2, page_ints: 11 };
+    for rep in [0i32, 3, 7] {
+        let committed = Committed {
+            replay: ints(&[rep]),
+            commit: ints(&[1]),
+            slots: ints(&[0]),
+            lane0: 0,
+            ext_replay: ints(&[0]),
+        };
+        time(&format!("decode conv, {rep} carried"), &|sink| {
+            ssm::causal_conv1d_verify(
+                sink, x, Some(x_paged), indptr, &committed, weight, &conv_pool, taps, 1, conv_y, land, None, true,
+            )
+            .expect("decode conv");
+        });
+    }
 }
