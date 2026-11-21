@@ -26,14 +26,13 @@ pub struct Carry {
     pub pages: u64,
     pub replay_tok: u64,
     pub commit_len: u64,
-    pub scratch: u64,
-    pub plane_off: [u64; 3],
-    pub plane_stride: [u64; 3],
+    pub plane_off: [u64; 4],
+    pub plane_stride: [u64; 4],
     pub page_tokens: u32,
     pub pad: u32,
 }
 
-const _: () = assert!(size_of::<Carry>() == 96);
+const _: () = assert!(size_of::<Carry>() == 104);
 
 impl Carry {
     pub const NONE: Carry = Carry {
@@ -41,9 +40,8 @@ impl Carry {
         pages: 0,
         replay_tok: 0,
         commit_len: 0,
-        scratch: 0,
-        plane_off: [0; 3],
-        plane_stride: [0; 3],
+        plane_off: [0; 4],
+        plane_stride: [0; 4],
         page_tokens: 1,
         pad: 0,
     };
@@ -1919,6 +1917,71 @@ pub fn kda_carried(
     )
 }
 
+/// The rows a chunked KDA fire's lanes land in their buffer past their
+/// commit, made ready for a later decode ([`kda_carried`]): each row's keys
+/// and corrected value (planes 2 and 3; its forget and beta rows, planes 0
+/// and 1, the fire lands), stepped in order from the state the fire left.
+/// The own rows are the fire's by `qo_indptr`, or with `ext` its extended
+/// rows (row `RsLane::ext + j`) (`ssm_kda_tail_corrected`).
+#[allow(clippy::too_many_arguments)]
+pub fn kda_tail(
+    ctx: &Ctx,
+    mixed: Tensor,
+    f: Tensor,
+    b: Tensor,
+    dt_bias: Tensor,
+    a_log: Tensor,
+    state: &RecurrentPool,
+    qo_indptr: Tensor,
+    ext: bool,
+    heads: u32,
+    head_dim: u32,
+    norm_eps: f32,
+    gate_floor: f32,
+    carry: &Carry,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.kda_chunked";
+    const STEP_BLOCK: u32 = 256;
+    if !carry.buffers() {
+        return Ok(());
+    }
+    dtype_dispatch!(OP, mixed.dtype, { Bf16 => () });
+    let lanes = qo_indptr.rows.saturating_sub(1);
+    if lanes == 0 {
+        return Ok(());
+    }
+    f32_state(OP, state)?;
+    kda_head(OP, head_dim)?;
+    let state_rows = state.rows(OP, state.slab, state.slot_stride_elems, heads)?;
+    let rows = KDA_TILE_ROWS;
+    ctx.fire(
+        OP,
+        Fire::at(kernel(
+            FILE,
+            &format!("::pie::attn::ssm_kda_tail_corrected<{head_dim}, {rows}>"),
+        ))
+        .apply(Launch::grid([heads, lanes, head_dim / rows], [STEP_BLOCK, 1, 1])),
+        &[
+            mixed.arg(),
+            f.arg(),
+            b.arg(),
+            a_log.arg(),
+            dt_bias.arg(),
+            state_rows.arg(),
+            qo_indptr.arg(),
+            ext.arg(),
+            stated(OP, heads)?.arg(),
+            norm_eps.arg(),
+            gate_floor.arg(),
+            state.write_state.arg(),
+            state.write_state_mask.arg(),
+            stated(OP, lanes)?.arg(),
+            carry.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
 /// `kda_chunked` through the token-by-token scan whatever the head: the
 /// reference the chunk-parallel passes answer to.
 #[allow(clippy::too_many_arguments)]
@@ -2265,6 +2328,53 @@ pub fn mamba2_carried(
         ],
     )?;
     m.norm(ctx, OP, y)
+}
+
+/// The rows a chunked Mamba-2 fire's lanes land in their buffer past their
+/// commit, made ready for a later decode ([`mamba2_carried`]): each row's
+/// convolved `x | B` (plane 1; its step size, plane 0, the fire lands). The
+/// own rows are the fire's by `qo_indptr`, or with `ext` its extended rows
+/// (`ssm_mamba2_tail_rows`).
+#[allow(clippy::too_many_arguments)]
+pub fn mamba2_tail(
+    ctx: &Ctx,
+    xbc: Tensor,
+    m: Mamba2,
+    state: &RecurrentPool,
+    qo_indptr: Tensor,
+    ext: bool,
+    state_dim: u32,
+    carry: &Carry,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.mamba2_chunked";
+    const TAIL_BLOCK: u32 = 256;
+    if !carry.buffers() {
+        return Ok(());
+    }
+    dtype_dispatch!(OP, xbc.dtype, { Bf16 => () });
+    let lanes = qo_indptr.rows.saturating_sub(1);
+    if lanes == 0 {
+        return Ok(());
+    }
+    let inner = m.heads * (xbc.width.saturating_sub(2 * m.groups * state_dim) / m.heads.max(1));
+    let xb = inner + m.groups * state_dim;
+    ctx.fire(
+        OP,
+        Fire::at(kernel(FILE, "::pie::attn::ssm_mamba2_tail_rows"))
+            .apply(Launch::grid([lanes, 1, 1], [TAIL_BLOCK, 1, 1])),
+        &[
+            xbc.arg(),
+            qo_indptr.arg(),
+            ext.arg(),
+            stated(OP, xbc.width)?.arg(),
+            stated(OP, xb)?.arg(),
+            state.write_state.arg(),
+            state.write_state_mask.arg(),
+            stated(OP, lanes)?.arg(),
+            carry.arg(),
+            ctx.stage(),
+        ],
+    )
 }
 
 /// A prompt's Mamba-2 walk, token by token: a block a (request, head) lands

@@ -174,23 +174,16 @@ __global__ void ssm_conv1d_carried(const T* __restrict__ x, const T* __restrict_
     float wk[KMAX];
 #pragma unroll
     for (int k = 0; k < KMAX; ++k) wk[k] = k < K ? to_f32(weight[c * K + k]) : 0.f;
-    const u64 row_bytes = static_cast<u64>(C) * sizeof(T);
-    for (int t = carry.scratch != nullptr ? 0 : n; t <= n; ++t) {
-        float acc = bias_v;
+    float acc = bias_v;
 #pragma unroll
-        for (int k = 0; k < KMAX; ++k) {
-            if (k >= K) break;
-            acc += wk[k] * at(t - (K - 1 - k) * dil);
-        }
-        const T out = from_f32<T>(conv_out<SILU, RESIDUAL>(acc, at(t)));
-        if (t == n) {
-            y[row * C + c] = out;
-            if (c >= k_off && c < k_off + k_len) {
-                if (T* dst = carry.own_row<T>(lane_, 0, 1)) dst[c - k_off] = out;
-            }
-        } else {
-            carry.scratch_row<T>(lane_, t, row_bytes)[c] = out;
-        }
+    for (int k = 0; k < KMAX; ++k) {
+        if (k >= K) break;
+        acc += wk[k] * at(n - (K - 1 - k) * dil);
+    }
+    const T out = from_f32<T>(conv_out<SILU, RESIDUAL>(acc, at(n)));
+    y[row * C + c] = out;
+    if (c >= k_off && c < k_off + k_len) {
+        if (T* dst = carry.own_row<T>(lane_, 0, 1)) dst[c - k_off] = out;
     }
     const int commit = carry.commit(rl, n + 1);
     if (!folds(write_state, mask, rl) || commit <= 0) return;
@@ -3146,23 +3139,30 @@ __global__ __launch_bounds__(256) void ssm_kda_step_batched(
     }
 }
 
-// `ssm_kda_step_batched` over a lane's carried rows then its own (`Carry`):
-// the block holds its rows of the head's state in registers, steps each row
-// the lane buffered past its committed state (its `[q | k | v]` from the
-// carried scratch, its forget and beta rows from its rs buffer pages:
-// planes 0 and 1), then its own, and stores the rows as they stand after
-// `commit` rows of the run. The state is f32, so each step is the bits a
-// fold a row gives. Carried rows land no output; the own row's forget and
-// beta rows land in its buffer.
+// `ssm_kda_step_batched` over a lane's buffered rows then its own, the
+// buffered rows read as a linear attention over the committed state (each
+// keeps its forget and beta rows, convolved keys and corrected value u:
+// planes 0 to 3): M_t diag(a_{t+1}) = M0 diag(G_{0,t+1}) + sum_s u_s
+// (k_s . G_{s,t+1})^T, so the own row's u and output read the state once,
+// its q and k decayed to it, and each buffered row as two decay-weighted
+// dots. The per-channel decays are suffix sums of f32 log-gates down the
+// buffered rows, a thread a channel, a chunk of rows staged at a time. A
+// fold applies M <- M diag(a) + u k^T a committed row, then the own row's
+// where it commits that too; the rows are stored once. The own row's forget
+// and beta rows and its u land in its buffer.
 template <int D, int ROWS>
 __global__ __launch_bounds__(256) void ssm_kda_step_carried(
     const bf16* __restrict__ mixed, const bf16* __restrict__ f, const bf16* __restrict__ b,
     const float* __restrict__ a_log, const float* __restrict__ dt_bias, StateRows rows,
     float* __restrict__ out, int H, float eps, float floor,
     bool write_state, const u8* __restrict__ mask, Carry carry, const u32* __restrict__ win) {
-    constexpr int E = D / 32, RPP = 256 / kKdaRowLanes, R = ROWS / RPP, WAVES = 256 / kWave;
+    constexpr int E = D / 32, RPP = 256 / kKdaRowLanes, R = ROWS / RPP, WAVES = 256 / kWave, CH = 16;
     static_assert(D % 32 == 0 && D <= 2 * kWave && ROWS % RPP == 0 && D % ROWS == 0,
                   "whole pieces, two channels a lane, whole passes");
+    __shared__ alignas(16) float sq[D], sk[D], sgl[D], sg0[D];
+    __shared__ alignas(16) float ck[CH][D], cg[CH][D];
+    __shared__ float cdq[CH], cdk[CH];
+    __shared__ float part[3][WAVES];
     const int h = blockIdx.x, r = blockIdx.y;
     if (win != nullptr && r >= static_cast<int>(win[0])) return;
     const long long row = win != nullptr ? r + static_cast<long long>(win[1]) : r;
@@ -3172,7 +3172,7 @@ __global__ __launch_bounds__(256) void ssm_kda_step_carried(
     const CarryLane cl = carry.lane(rl);
     if (blockIdx.z == 0) {
         if (bf16* dst = carry.own_row<bf16>(cl, 0, 0)) {
-            for (int d = tid; d < D; d += blockDim.x) dst[static_cast<long long>(h) * D + d] = f[row * width + static_cast<long long>(h) * D + d];
+            for (int d = tid; d < D; d += 256) dst[static_cast<long long>(h) * D + d] = f[row * width + static_cast<long long>(h) * D + d];
         }
         if (tid == 0) {
             if (bf16* dst = carry.own_row<bf16>(cl, 0, 1)) dst[h] = b[row * H + h];
@@ -3189,57 +3189,294 @@ __global__ __launch_bounds__(256) void ssm_kda_step_carried(
 #pragma unroll
         for (int e = 0; e < E; ++e)
             s[p][e] = state_load(reinterpret_cast<const f32x4*>(head + static_cast<long long>(v0 + RPP * p) * D + 4 * c + 32 * e));
+    const bf16* q = mixed + row * 3 * width + static_cast<long long>(h) * D;
+    float vv[R];
+#pragma unroll
+    for (int p = 0; p < R; ++p) vv[p] = to_f32(q[2 * width + v0 + RPP * p]);
+    const float a = __expf(a_log[h]);
+    const float beta = sigmoid(to_f32(b[row * H + h]));
+    // The own row's q̂, k̂ and log-gates, and k̂·q̂.
+    const float qv = tid < D ? to_f32(q[tid]) : 0.f, kv = tid < D ? to_f32(q[width + tid]) : 0.f;
+    const float w0 = wave_sum(qv * qv), w1 = wave_sum(kv * kv), w2 = wave_sum(qv * kv);
+    if (l == 0) {
+        part[0][wave] = w0;
+        part[1][wave] = w1;
+        part[2][wave] = w2;
+    }
+    lds_barrier();
+    float qn = 0.f, kn = 0.f, qkn = 0.f;
+#pragma unroll
+    for (int w = 0; w < WAVES; ++w) {
+        qn += part[0][w];
+        kn += part[1][w];
+        qkn += part[2][w];
+    }
+    const float rq = rsqrtf(qn + eps) * rsqrtf(static_cast<float>(D)), rk = rsqrtf(kn + eps);
+    if (tid < D) {
+        sq[tid] = qv * rq;
+        sk[tid] = kv * rk;
+        sgl[tid] = kda_gate(to_f32(f[row * width + static_cast<long long>(h) * D + tid]) + dt_bias[h * D + tid], a, floor);
+    }
+    lds_barrier();
+    float after = tid < D ? sgl[tid] : 0.f;
+    float pq[R], pk[R];
+#pragma unroll
+    for (int p = 0; p < R; ++p) {
+        pq[p] = 0.f;
+        pk[p] = 0.f;
+    }
     const int n = carry.carried(cl);
-    const int commit = carry.commit(rl, n + 1);
-    const bool fold = folds_uniform(write_state, mask, rl) && commit > 0;
-    const bool mine = 2 * l < D;
-    const int ch = mine ? 2 * l : 0;
-    const float al = a_log[h], a = __expf(al), rd = rsqrtf(static_cast<float>(D));
-    const float2 dt = *reinterpret_cast<const float2*>(dt_bias + h * D + ch);
-    const u64 mixed_bytes = static_cast<u64>(3 * width) * sizeof(bf16);
-    __shared__ alignas(16) float tq[WAVES][D], tk[WAVES][D], ta[WAVES][D];
-    float* o = out + (row * H + h) * D;
-    for (int t = 0; t <= n; ++t) {
-        const bool own = t == n;
-        const bf16* q = own ? mixed + row * 3 * width + static_cast<long long>(h) * D
-                            : carry.scratch_row<bf16>(cl, t, mixed_bytes) + static_cast<long long>(h) * D;
-        const bf16* fr = own ? f + row * width + static_cast<long long>(h) * D
-                             : carry.carried_row<bf16>(cl, t, 0) + static_cast<long long>(h) * D;
-        const float braw = to_f32(own ? b[row * H + h] : carry.carried_row<bf16>(cl, t, 1)[h]);
-        const u32 qw = *reinterpret_cast<const u32*>(q + ch), kw = *reinterpret_cast<const u32*>(q + width + ch);
-        const u32 fw = *reinterpret_cast<const u32*>(fr + ch);
-        float vv[R];
-#pragma unroll
-        for (int p = 0; p < R; ++p) vv[p] = to_f32(q[2 * width + v0 + RPP * p]);
-        const float q0 = mine ? bf16_lo(qw) : 0.f, q1 = mine ? bf16_hi(qw) : 0.f;
-        const float k0 = mine ? bf16_lo(kw) : 0.f, k1 = mine ? bf16_hi(kw) : 0.f;
-        const float rq = rsqrtf(wave_sum(q0 * q0 + q1 * q1) + eps), rk = rsqrtf(wave_sum(k0 * k0 + k1 * k1) + eps);
-        if (mine) {
-            *reinterpret_cast<float2*>(&tq[wave][ch]) = float2{q0 * rq * rd, q1 * rq * rd};
-            *reinterpret_cast<float2*>(&tk[wave][ch]) = float2{k0 * rk, k1 * rk};
-            *reinterpret_cast<float2*>(&ta[wave][ch]) = float2{__expf(kda_gate(bf16_lo(fw) + dt.x, a, floor)),
-                                                              __expf(kda_gate(bf16_hi(fw) + dt.y, a, floor))};
+    for (int cb = ((n + CH - 1) / CH - 1) * CH; cb >= 0; cb -= CH) {
+        const int m = min(CH, n - cb);
+        // The chunk's keys and log-gates staged, then each row's keys normed.
+        for (int x = tid; x < m * D; x += 256) {
+            const int e = x / D, d = x % D;
+            u64 slot;
+            u32 pos;
+            carry.carried_at(cl, cb + e, slot, pos);
+            ck[e][d] = to_f32(carry.plane_at<const bf16>(slot, pos, 2)[static_cast<long long>(h) * D + d]);
+            cg[e][d] = kda_gate(to_f32(carry.plane_at<const bf16>(slot, pos, 0)[static_cast<long long>(h) * D + d]) +
+                                    dt_bias[h * D + d], a, floor);
         }
-        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront", "local");
-        __builtin_amdgcn_wave_barrier();
-        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront", "local");
-        const KdaToken<E> tok = kda_token<E>(tq[wave], tk[wave], ta[wave], c, false);
-        const float beta = sigmoid(braw);
-        float y[R];
-        kda_rows_step<R, E>(s, tok.q, tok.k, tok.a, vv, beta, y);
-#pragma unroll
-        for (int p = 0; p < R; ++p) {
-            if (own && c == 0) o[v0 + RPP * p] = y[p];
-            if (fold && t + 1 == commit) {
-#pragma unroll
-                for (int e = 0; e < E; ++e)
-                    state_store(reinterpret_cast<f32x4*>(head + static_cast<long long>(v0 + RPP * p) * D + 4 * c + 32 * e), s[p][e]);
+        lds_barrier();
+        for (int e = wave; e < m; e += WAVES) {
+            float ss = 0.f;
+            for (int d = l; d < D; d += kWave) ss += ck[e][d] * ck[e][d];
+            const float inv = rsqrtf(wave_sum(ss) + eps);
+            for (int d = l; d < D; d += kWave) ck[e][d] *= inv;
+        }
+        lds_barrier();
+        // A thread a channel decays each row's key to the own row.
+        if (tid < D) {
+            float run = after;
+            for (int e = m - 1; e >= 0; --e) {
+                ck[e][tid] *= __expf(run);
+                run += cg[e][tid];
+            }
+            after = run;
+        }
+        lds_barrier();
+        // A wavefront a row: its decayed keys' dots with the own q̂ and k̂.
+        for (int e = wave; e < m; e += WAVES) {
+            float dq = 0.f, dk = 0.f;
+            for (int d = l; d < D; d += kWave) {
+                dq += ck[e][d] * sq[d];
+                dk += ck[e][d] * sk[d];
+            }
+            dq = wave_sum(dq);
+            dk = wave_sum(dk);
+            if (l == 0) {
+                cdq[e] = dq;
+                cdk[e] = dk;
             }
         }
-        // Every lane is done reading this row's slice before the next's lands.
-        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront", "local");
-        __builtin_amdgcn_wave_barrier();
-        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront", "local");
+        lds_barrier();
+        // A row's lane 0 weighs each buffered row's u on its value rows.
+        if (c == 0) {
+            for (int e = 0; e < m; ++e) {
+                u64 slot;
+                u32 pos;
+                carry.carried_at(cl, cb + e, slot, pos);
+                const float* ur = carry.plane_at<const float>(slot, pos, 3) + static_cast<long long>(h) * D;
+                const float dq = cdq[e], dk = cdk[e];
+#pragma unroll
+                for (int p = 0; p < R; ++p) {
+                    const float u = ur[v0 + RPP * p];
+                    pq[p] += dq * u;
+                    pk[p] += dk * u;
+                }
+            }
+        }
+        lds_barrier();
+    }
+    if (tid < D) sg0[tid] = __expf(after);
+    lds_barrier();
+    // The committed state's part, decayed to the own row.
+    float mem[R], acc[R];
+#pragma unroll
+    for (int p = 0; p < R; ++p) {
+        float km = 0.f, qm = 0.f;
+#pragma unroll
+        for (int e = 0; e < E; ++e) {
+            const int at = 4 * c + 32 * e;
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                const float sd = s[p][e][u] * sg0[at + u];
+                km += sd * sk[at + u];
+                qm += sd * sq[at + u];
+            }
+        }
+        mem[p] = row8_sum(km + pk[p]);
+        acc[p] = row8_sum(qm + pq[p]);
+    }
+    const float kq = qkn * rq * rk;
+    float un[R];
+    float* o = out + (row * H + h) * D;
+    float* own_u = carry.own_row<float>(cl, 0, 3);
+#pragma unroll
+    for (int p = 0; p < R; ++p) {
+        un[p] = (vv[p] - mem[p]) * beta;
+        if (c == 0) {
+            o[v0 + RPP * p] = acc[p] + kq * un[p];
+            if (own_u != nullptr) own_u[static_cast<long long>(h) * D + v0 + RPP * p] = un[p];
+        }
+    }
+    const int commit = carry.commit(rl, n + 1);
+    if (!folds_uniform(write_state, mask, rl) || commit <= 0) return;
+    // The rows the lane commits fold into the state: its buffered ones, then
+    // its own where it commits that too.
+    const int folded = min(commit, n);
+    for (int t = 0; t < folded; ++t) {
+        u64 slot;
+        u32 pos;
+        carry.carried_at(cl, t, slot, pos);
+        lds_barrier();
+        const float kx = tid < D ? to_f32(carry.plane_at<const bf16>(slot, pos, 2)[static_cast<long long>(h) * D + tid]) : 0.f;
+        const float ws = wave_sum(kx * kx);
+        if (l == 0) part[0][wave] = ws;
+        if (tid < D)
+            cg[0][tid] = __expf(kda_gate(to_f32(carry.plane_at<const bf16>(slot, pos, 0)[static_cast<long long>(h) * D + tid]) +
+                                             dt_bias[h * D + tid], a, floor));
+        lds_barrier();
+        float kn2 = 0.f;
+#pragma unroll
+        for (int w = 0; w < WAVES; ++w) kn2 += part[0][w];
+        if (tid < D) ck[0][tid] = kx * rsqrtf(kn2 + eps);
+        lds_barrier();
+        const float* ur = carry.plane_at<const float>(slot, pos, 3) + static_cast<long long>(h) * D;
+#pragma unroll
+        for (int p = 0; p < R; ++p) {
+            const float u = ur[v0 + RPP * p];
+#pragma unroll
+            for (int e = 0; e < E; ++e) {
+                const int at = 4 * c + 32 * e;
+#pragma unroll
+                for (int x = 0; x < 4; ++x) s[p][e][x] = s[p][e][x] * cg[0][at + x] + u * ck[0][at + x];
+            }
+        }
+    }
+    if (commit == n + 1) {
+#pragma unroll
+        for (int p = 0; p < R; ++p) {
+#pragma unroll
+            for (int e = 0; e < E; ++e) {
+                const int at = 4 * c + 32 * e;
+#pragma unroll
+                for (int x = 0; x < 4; ++x) s[p][e][x] = s[p][e][x] * __expf(sgl[at + x]) + un[p] * sk[at + x];
+            }
+        }
+    }
+#pragma unroll
+    for (int p = 0; p < R; ++p)
+#pragma unroll
+        for (int e = 0; e < E; ++e)
+            state_store(reinterpret_cast<f32x4*>(head + static_cast<long long>(v0 + RPP * p) * D + 4 * c + 32 * e), s[p][e]);
+}
+
+// The buffered rows a chunked KDA fire's lanes land past their commit,
+// made ready for a later decode's linear attention: each row's convolved
+// keys (plane 2) and corrected value u (plane 3), from the state as the
+// fire left it (folded through the lane's commit, or as it stood where the
+// lane folds nothing), stepping the lane's rows past the commit in order (a
+// buffered one by its stored keys and u, an own one forming its u). The
+// state stays as it was. The own rows' [q | k | v], forget and beta rows are
+// read where the fire lays them: the lane's extended rows (`ext`: row
+// `RsLane::ext + j`) or its own (`qo_indptr`, the window's row offset
+// `win[1]`). Grid (H, lanes, D / ROWS), block 256.
+template <int D, int ROWS>
+__global__ __launch_bounds__(256) void ssm_kda_tail_corrected(
+    const bf16* __restrict__ mixed, const bf16* __restrict__ f, const bf16* __restrict__ b,
+    const float* __restrict__ a_log, const float* __restrict__ dt_bias, StateRows rows,
+    const u32* __restrict__ qo_indptr, bool ext, int H, float eps, float floor,
+    bool write_state, const u8* __restrict__ mask, int lanes_stated, Carry carry, const u32* __restrict__ win) {
+    constexpr int E = D / 32, RPP = 256 / kKdaRowLanes, R = ROWS / RPP, WAVES = 256 / kWave;
+    __shared__ alignas(16) float sk[D], sa[D];
+    __shared__ float part[WAVES];
+    const int lanes = win != nullptr ? static_cast<int>(win[2]) : lanes_stated;
+    const int h = blockIdx.x, r = blockIdx.y;
+    if (r >= lanes) return;
+    const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+    const long long row0 = win != nullptr ? static_cast<long long>(win[1]) : 0;
+    const CarryLane cl = carry.lane(rl);
+    if (cl.at == CARRY_NONE) return;
+    const i32* rid = rows.row(rl);
+    if (rid[0] < 0) return;
+    const int n = carry.carried(cl);
+    const int own = static_cast<int>(qo_indptr[r + 1] - qo_indptr[r]);
+    const int run = n + own;
+    const int start = folds(write_state, mask, rl) ? carry.commit(rl, run) : 0;
+    if (start >= run) return;
+    const int tid = threadIdx.x, wave = tid / kWave, l = lane();
+    const int c = tid % kKdaRowLanes;
+    const int v0 = blockIdx.z * ROWS + tid / kKdaRowLanes;
+    const long long width = static_cast<long long>(H) * D;
+    const float* head = rows.atom<float>(rid, h, static_cast<long long>(D) * D);
+    f32x4 s[R][E];
+#pragma unroll
+    for (int p = 0; p < R; ++p)
+#pragma unroll
+        for (int e = 0; e < E; ++e)
+            s[p][e] = *reinterpret_cast<const f32x4*>(head + static_cast<long long>(v0 + RPP * p) * D + 4 * c + 32 * e);
+    const float a = __expf(a_log[h]);
+    for (int j = start; j < run; ++j) {
+        const bool carried = j < n;
+        const int e_own = j - n;
+        const long long at = ext ? static_cast<long long>(cl.ext) + j : row0 + qo_indptr[r] + e_own;
+        const bf16* krow;
+        const bf16* frow;
+        const float* urow = nullptr;
+        const bf16* qrow = nullptr;
+        if (carried) {
+            u64 slot;
+            u32 pos;
+            carry.carried_at(cl, j, slot, pos);
+            krow = carry.plane_at<const bf16>(slot, pos, 2) + static_cast<long long>(h) * D;
+            frow = carry.plane_at<const bf16>(slot, pos, 0) + static_cast<long long>(h) * D;
+            urow = carry.plane_at<const float>(slot, pos, 3) + static_cast<long long>(h) * D;
+        } else {
+            qrow = mixed + at * 3 * width + static_cast<long long>(h) * D;
+            krow = qrow + width;
+            frow = f + at * width + static_cast<long long>(h) * D;
+        }
+        lds_barrier();
+        const float kx = tid < D ? to_f32(krow[tid]) : 0.f;
+        const float ws = wave_sum(kx * kx);
+        if (l == 0) part[wave] = ws;
+        if (tid < D) sa[tid] = __expf(kda_gate(to_f32(frow[tid]) + dt_bias[h * D + tid], a, floor));
+        // The own row's keys land in its buffer, a head's from its first slice.
+        if (!carried && blockIdx.z == 0 && tid < D) {
+            if (bf16* dst = carry.own_row<bf16>(cl, e_own, 2)) dst[static_cast<long long>(h) * D + tid] = krow[tid];
+        }
+        lds_barrier();
+        float kn = 0.f;
+#pragma unroll
+        for (int w = 0; w < WAVES; ++w) kn += part[w];
+        if (tid < D) sk[tid] = kx * rsqrtf(kn + eps);
+        lds_barrier();
+        const float beta = carried ? 0.f : sigmoid(to_f32(b[at * H + h]));
+        float* own_u = carried ? nullptr : carry.own_row<float>(cl, e_own, 3);
+#pragma unroll
+        for (int p = 0; p < R; ++p) {
+            float km = 0.f;
+#pragma unroll
+            for (int e = 0; e < E; ++e) {
+                const int at4 = 4 * c + 32 * e;
+#pragma unroll
+                for (int x = 0; x < 4; ++x) {
+                    s[p][e][x] *= sa[at4 + x];
+                    km += s[p][e][x] * sk[at4 + x];
+                }
+            }
+            const int v = v0 + RPP * p;
+            const float u = carried ? urow[v] : (to_f32(qrow[2 * width + v]) - row8_sum(km)) * beta;
+#pragma unroll
+            for (int e = 0; e < E; ++e) {
+                const int at4 = 4 * c + 32 * e;
+#pragma unroll
+                for (int x = 0; x < 4; ++x) s[p][e][x] += sk[at4 + x] * u;
+            }
+            if (c == 0 && own_u != nullptr) own_u[static_cast<long long>(h) * D + v] = u;
+        }
     }
 }
 
@@ -3888,13 +4125,16 @@ __global__ __launch_bounds__(256) void ssm_mamba2_step(
     for (int q = 0; q < M2_Q; ++q) st[m2_run(q)] = s[q];
 }
 
-// `ssm_mamba2_step` over a lane's carried rows then its own (`Carry`): the
-// block loads its head's state once, steps each row the lane buffered past
-// its committed state (its convolved `xbc` from the carried scratch, its
-// step size from its rs buffer pages, plane 0), then its own row, and stores
-// the state as it stands after `commit` rows of the run. The state is f32,
-// so each step is the bits a fold a row gives. Carried rows land no output;
-// the own row's step size lands in its buffer.
+// `ssm_mamba2_step` over a lane's buffered rows then its own, the buffered
+// rows read as a linear attention over the committed state (a row keeps its
+// step size and its convolved x | B: planes 0 and 1):
+//   y_t = A_{0,t} C_t S + sum_s A_{s,t} dt_s (B_s . C_t) x_s + D x_t,
+// A_{s,t} = prod_{s<i<=t} a_i, so a buffered row is one dot B_s . C_t (every
+// half-wave forms it over its 128 columns, no barrier) and its x_s, weighed
+// by the decays after it as the rows are walked from the last. A fold
+// applies S <- a S + (dt x) B^T a committed row, then the own row's where it
+// commits that too; the state is stored once. The own row's step size lands
+// in its buffer (its x | B lands with the conv's output).
 __global__ __launch_bounds__(256) void ssm_mamba2_step_carried(
     const bf16* __restrict__ xbc, const bf16* __restrict__ dt, const bf16* __restrict__ z,
     const float* __restrict__ a_log, const float* __restrict__ dt_bias, const float* __restrict__ D,
@@ -3917,29 +4157,101 @@ __global__ __launch_bounds__(256) void ssm_mamba2_step_carried(
     f32x4 s[M2_Q];
 #pragma unroll
     for (int q = 0; q < M2_Q; ++q) s[q] = st[m2_run(q)];
-    const int n = carry.carried(cl);
-    const int commit = carry.commit(rl, n + 1);
-    const bool fold = folds(write_state, mask, rl) && commit > 0;
-    auto store = [&]() {
-#pragma unroll
-        for (int q = 0; q < M2_Q; ++q) st[m2_run(q)] = s[q];
-    };
-    const float a = __expf(a_log[h]);
-    const u64 row_bytes = static_cast<u64>(width) * sizeof(bf16);
     const int cc = 4 * (lane() & 31);
-    for (int j = 0; j < n; ++j) {
-        const bf16* at = carry.scratch_row<bf16>(cl, j, row_bytes);
-        const float step = m2_dt(to_f32(carry.carried_row<bf16>(cl, j, 0)[h]), dt_bias[h]);
-        const float decay = __expf(-a * step);
-        const bf16* bp = at + inner + g * M2_N + cc;
-        const f32x4 bv = {to_f32(bp[0]), to_f32(bp[1]), to_f32(bp[2]), to_f32(bp[3])};
+    auto half = [](float v) {
 #pragma unroll
-        for (int q = 0; q < M2_Q; ++q) s[q] = s[q] * decay + (step * to_f32(at[h * M2_P + m2_row(q)])) * bv;
-        if (fold && j + 1 == commit) store();
+        for (int off = 16; off > 0; off >>= 1) v += __shfl_xor(v, off, kWave);
+        return v;
+    };
+    auto four = [](const bf16* p) { return f32x4{to_f32(p[0]), to_f32(p[1]), to_f32(p[2]), to_f32(p[3])}; };
+    const bf16* at = xbc + row * width;
+    const f32x4 bo = four(at + inner + g * M2_N + cc), co = four(at + inner + (G + g) * M2_N + cc);
+    float xo[M2_Q];
+#pragma unroll
+    for (int q = 0; q < M2_Q; ++q) xo[q] = to_f32(at[h * M2_P + m2_row(q)]);
+    const float a = __expf(a_log[h]), bias = dt_bias[h];
+    const float step = m2_dt(to_f32(dt[row * H + h]), bias);
+    const float la_n = -a * step;
+    const float bc_n = half(bo[0] * co[0] + bo[1] * co[1] + bo[2] * co[2] + bo[3] * co[3]);
+    const int n = carry.carried(cl);
+    float ya[M2_Q];
+#pragma unroll
+    for (int q = 0; q < M2_Q; ++q) ya[q] = 0.f;
+    float after = la_n;
+    for (int j = n - 1; j >= 0; --j) {
+        u64 slot;
+        u32 pos;
+        carry.carried_at(cl, j, slot, pos);
+        const bf16* xb = carry.plane_at<const bf16>(slot, pos, 1);
+        const f32x4 bj = four(xb + inner + g * M2_N + cc);
+        const float dot = half(bj[0] * co[0] + bj[1] * co[1] + bj[2] * co[2] + bj[3] * co[3]);
+        const float sj = m2_dt(to_f32(carry.plane_at<const bf16>(slot, pos, 0)[h]), bias);
+        const float w = __expf(after) * sj * dot;
+#pragma unroll
+        for (int q = 0; q < M2_Q; ++q) ya[q] += w * to_f32(xb[h * M2_P + m2_row(q)]);
+        after += -a * sj;
     }
-    const float step = m2_dt(to_f32(dt[row * H + h]), dt_bias[h]);
-    m2_token(s, xbc + row * width, z + row * inner, y + row * inner, step, __expf(-a * step), D[h], h, inner, g, G);
-    if (fold && commit == n + 1) store();
+    const float g0 = __expf(after);
+#pragma unroll
+    for (int q = 0; q < M2_Q; ++q) {
+        const float acc = half(s[q][0] * co[0] + s[q][1] * co[1] + s[q][2] * co[2] + s[q][3] * co[3]);
+        if ((lane() & 31) == 0) {
+            const long long o = row * inner + h * M2_P + m2_row(q);
+            const float yo = g0 * acc + ya[q] + step * bc_n * xo[q] + D[h] * xo[q];
+            y[o] = from_f32<bf16>(yo * silu(to_f32(z[o])));
+        }
+    }
+    const int commit = carry.commit(rl, n + 1);
+    if (!folds(write_state, mask, rl) || commit <= 0) return;
+    const int folded = min(commit, n);
+    for (int j = 0; j < folded; ++j) {
+        u64 slot;
+        u32 pos;
+        carry.carried_at(cl, j, slot, pos);
+        const bf16* xb = carry.plane_at<const bf16>(slot, pos, 1);
+        const f32x4 bj = four(xb + inner + g * M2_N + cc);
+        const float sj = m2_dt(to_f32(carry.plane_at<const bf16>(slot, pos, 0)[h]), bias);
+        const float decay = __expf(-a * sj);
+#pragma unroll
+        for (int q = 0; q < M2_Q; ++q) s[q] = s[q] * decay + (sj * to_f32(xb[h * M2_P + m2_row(q)])) * bj;
+    }
+    if (commit == n + 1) {
+        const float decay = __expf(la_n);
+#pragma unroll
+        for (int q = 0; q < M2_Q; ++q) s[q] = s[q] * decay + (step * xo[q]) * bo;
+    }
+#pragma unroll
+    for (int q = 0; q < M2_Q; ++q) st[m2_run(q)] = s[q];
+}
+
+// The rows a chunked Mamba-2 fire's lanes land past their commit, made
+// ready for a later decode's linear attention: each row's convolved x | B
+// (the first `xb` channels of its xbc row) into plane 1 of the lane's
+// buffer (its step size, plane 0, the fire lands). A block a lane; the rows
+// read where the fire lays them: the lane's extended rows (`ext`: row
+// `RsLane::ext + j`) or its own (`qo_indptr`, the window's row offset
+// `win[1]`).
+__global__ void ssm_mamba2_tail_rows(const bf16* __restrict__ xbc, const u32* __restrict__ qo_indptr, bool ext,
+                                     int width, int xb, bool write_state, const u8* __restrict__ mask,
+                                     int lanes_stated, Carry carry, const u32* __restrict__ win) {
+    const int lanes = win != nullptr ? static_cast<int>(win[2]) : lanes_stated;
+    const int r = blockIdx.x;
+    if (r >= lanes) return;
+    const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+    const long long row0 = win != nullptr ? static_cast<long long>(win[1]) : 0;
+    const CarryLane cl = carry.lane(rl);
+    if (cl.at == CARRY_NONE) return;
+    const int n = carry.carried(cl);
+    const int own = static_cast<int>(qo_indptr[r + 1] - qo_indptr[r]);
+    const int run = n + own;
+    const int start = folds(write_state, mask, rl) ? carry.commit(rl, run) : 0;
+    for (int e = max(start - n, 0); e < own; ++e) {
+        const long long at = ext ? static_cast<long long>(cl.ext) + n + e : row0 + qo_indptr[r] + e;
+        const bf16* src = xbc + at * width;
+        bf16* dst = carry.own_row<bf16>(cl, e, 1);
+        if (dst == nullptr) continue;
+        for (int i = threadIdx.x; i < xb; i += blockDim.x) dst[i] = src[i];
+    }
 }
 
 // Prefill, token by token: grid (lanes, H), the head's state in registers

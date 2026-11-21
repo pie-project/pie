@@ -370,7 +370,6 @@ impl Run<'_> {
                     );
                 }
                 self.rs_move("ssm.mamba2", *dt, self.tensor(*dt))?;
-                #[cfg(not(feature = "rocm"))]
                 let dt_id = *dt;
                 let (dt, z) = (self.tensor(*dt), self.tensor(*z));
                 if !chunked {
@@ -396,7 +395,6 @@ impl Run<'_> {
                     *state_dim,
                     &mut self.tensor(*y),
                 )?;
-                #[cfg(not(feature = "rocm"))]
                 self.mamba2_tail(self.tensor(*xbc), false, [*xbc, dt_id], m, *state, *state_dim)?;
                 Ok(())
             }
@@ -462,7 +460,6 @@ impl Run<'_> {
                         &mut self.tensor(*y),
                     )?;
                 }
-                #[cfg(not(feature = "rocm"))]
                 self.kda_tail(
                     [self.tensor(*mixed), self.tensor(*f), self.tensor(*b)],
                     false,
@@ -674,7 +671,6 @@ impl Run<'_> {
     /// planes of `reads` (its read values), then the conv output `conv_y`'s
     /// kept channels and, where the recurrence landing `y` keeps them, its
     /// corrected values.
-    #[cfg(not(feature = "rocm"))]
     fn rs_step_planes(
         &self,
         op: &'static str,
@@ -712,7 +708,6 @@ impl Run<'_> {
     /// A KDA decode step of a buffering fire, over each lane's carried rows
     /// then its own: their forget and beta rows, keys and corrected values
     /// from their buffer, read as a linear attention.
-    #[cfg(not(feature = "rocm"))]
     #[allow(clippy::too_many_arguments)]
     fn kda_carried(
         &self,
@@ -751,7 +746,6 @@ impl Run<'_> {
     /// commits, made ready for a later decode: their keys and corrected
     /// values into their buffer, from `mixed`, `f` and `b` (the fire's own
     /// rows, or with `ext` its extended run's).
-    #[cfg(not(feature = "rocm"))]
     #[allow(clippy::too_many_arguments)]
     fn kda_tail(
         &self,
@@ -791,7 +785,6 @@ impl Run<'_> {
     /// A Mamba-2 decode step of a buffering fire, over each lane's carried
     /// rows then its own: their step sizes and convolved `x | B` from their
     /// buffer, read as a linear attention.
-    #[cfg(not(feature = "rocm"))]
     #[allow(clippy::too_many_arguments)]
     fn mamba2_carried(
         &self,
@@ -823,7 +816,6 @@ impl Run<'_> {
     /// lanes' commits, made ready for a later decode: their convolved
     /// `x | B` into their buffer, from `xbc_rows` (the fire's own rows, or
     /// with `ext` its extended run's).
-    #[cfg(not(feature = "rocm"))]
     fn mamba2_tail(
         &self,
         xbc_rows: kernels_cuda::Tensor,
@@ -854,39 +846,8 @@ impl Run<'_> {
     /// ROCm's KDA decode step reads no buffered rows as a linear attention
     /// yet (its kernels re-step them from a carried scratch the buffer no
     /// longer lays): a buffering fire over a KDA layer is refused by name.
-    #[cfg(feature = "rocm")]
-    #[allow(clippy::too_many_arguments, clippy::unused_self)]
-    fn kda_carried(
-        &self,
-        _mixed: ValueId,
-        _fb: [ValueId; 2],
-        _dt_bias: ValueId,
-        _a_log: ValueId,
-        _state: ValueId,
-        _heads: u32,
-        _head_dim: u32,
-        _norm_eps: f32,
-        _gate_floor: f32,
-        _y: ValueId,
-    ) -> Result<(), kernels_cuda::Error> {
-        Err(rocm_unported("ssm.kda", "KDA"))
-    }
 
     /// ROCm's Mamba-2 decode step, as [`Run::kda_carried`]'s: unported.
-    #[cfg(feature = "rocm")]
-    #[allow(clippy::too_many_arguments, clippy::unused_self)]
-    fn mamba2_carried(
-        &self,
-        _xbc: ValueId,
-        _dt: ValueId,
-        _z: ValueId,
-        _m: kernels_cuda::ssm::Mamba2,
-        _state: ValueId,
-        _state_dim: u32,
-        _y: ValueId,
-    ) -> Result<(), kernels_cuda::Error> {
-        Err(rocm_unported("ssm.mamba2", "Mamba-2"))
-    }
 
     #[allow(clippy::too_many_arguments)]
     fn conv1d_extended(
@@ -1048,8 +1009,7 @@ impl Run<'_> {
             state_dim,
             &mut y_ext,
         )?;
-        #[cfg(not(feature = "rocm"))]
-        self.mamba2_tail(xbc_ext, true, [xbc, dt], m, state, state_dim)?;
+            self.mamba2_tail(xbc_ext, true, [xbc, dt], m, state, state_dim)?;
         self.rs_land(op, y_ext, y)?;
         self.rs_layer_done();
         Ok(())
@@ -1114,8 +1074,7 @@ impl Run<'_> {
                 &mut y_ext,
             )?;
         }
-        #[cfg(not(feature = "rocm"))]
-        self.kda_tail(
+            self.kda_tail(
             [mixed_ext, f_ext, b_ext],
             true,
             [mixed, f, b, y],
@@ -1130,16 +1089,3 @@ impl Run<'_> {
     }
 }
 
-/// The refusal of a decode step whose state + buffer form ROCm has not
-/// ported.
-#[cfg(feature = "rocm")]
-fn rocm_unported(op: &'static str, what: &str) -> kernels_cuda::Error {
-    kernels_cuda::Error::Backend {
-        op,
-        detail: format!(
-            "a {what} layer's decode step reads its buffered rows as a linear attention over \
-             their kept planes, which ROCm's kernels do not yet: a fire buffering such a layer \
-             is not served on ROCm"
-        ),
-    }
-}

@@ -29,17 +29,15 @@ constexpr u32 CARRY_NONE = 0xffffffffu;
 // The Rust `ssm::Carry`, passed by value. `lanes` null: the fire buffers
 // nothing, every lane carries none and commits all it runs. `plane_off[i]`
 // and `plane_stride[i]` place the op's i-th buffered plane in a page's slot;
-// `scratch` holds the carried rows' conv outputs, row `lane.ext + j` the
-// lane's j-th carried row (the conv writes them, a re-stepping recurrence
-// reads them).
+// Four planes at most: a KDA layer reads its forget and beta rows, keys
+// and corrected values.
 struct Carry {
     const CarryLane* lanes;
     const u64* pages;
     const u32* replay_tok;
     const int* commit_len;
-    u8* scratch;
-    u64 plane_off[3];
-    u64 plane_stride[3];
+    u64 plane_off[4];
+    u64 plane_stride[4];
     u32 page_tokens;
     u32 pad_;
 
@@ -95,11 +93,6 @@ struct Carry {
         return plane_at<T>(slot, row, p);
     }
 
-    // The scratch row of the lane's j-th carried row, `row_bytes` a row.
-    template <class T>
-    __device__ __forceinline__ T* scratch_row(const CarryLane& l, int j, u64 row_bytes) const {
-        return reinterpret_cast<T*>(scratch + static_cast<u64>(l.ext + j) * row_bytes);
-    }
 };
 
 }  // namespace pie::attn

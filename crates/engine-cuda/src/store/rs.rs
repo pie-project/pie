@@ -160,8 +160,6 @@ impl Buffers {
         let Some((planes, widths)) = read(trace, tokens)? else {
             return Ok(None);
         };
-        #[cfg(feature = "rocm")]
-        refuse_unported(trace, &planes)?;
         // The list's runs, a buffered layer's each, in the layers' order;
         // the runs after them buffer what this engine does not (an n-gram
         // window's ids).
@@ -222,31 +220,6 @@ impl Buffers {
             ext_row_bytes,
         }))
     }
-}
-
-/// ROCm's KDA and Mamba-2 decode steps do not yet read their buffered rows
-/// as a linear attention over the kept planes (`dispatch::ssm`): a load
-/// whose step form buffers such a layer is refused by name.
-#[cfg(feature = "rocm")]
-fn refuse_unported(trace: &Trace, planes: &Planes) -> Result<()> {
-    for (at, node) in trace.nodes.iter().enumerate() {
-        let (what, read) = match &node.op {
-            Operation::Ssm(Ssm::Kda { f, .. }) => ("KDA", *f),
-            Operation::Ssm(Ssm::Mamba2 { dt, .. }) => ("Mamba-2", *dt),
-            _ => continue,
-        };
-        if planes.of(read).is_some() {
-            return Err(Fault::program(
-                "store::rs",
-                format!(
-                    "the {what} decode step at node {at} buffers its rows, and ROCm's kernels \
-                     do not yet read buffered {what} rows as a linear attention over their kept \
-                     planes (the state + buffer form CUDA runs)"
-                ),
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn ext_row_bytes(trace: &Trace) -> Result<u64> {
