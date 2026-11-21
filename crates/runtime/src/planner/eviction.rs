@@ -270,6 +270,15 @@ impl ResidencyPlanner {
             (true, Some(need)) => self.head_placement(victims.head, need),
             _ => None,
         };
+        // Its placement stands where a refusal taken with nothing else in
+        // flight left the room (the placement and the takes differ, said
+        // as a planner bug): the head never waits on it. Its need is
+        // planned as if the placement did not stand, in chunks only moves
+        // empty (the free ones its takes refused are no room), the map's
+        // candidates moved in the policy's order.
+        let mismatch = placement.as_ref().is_some_and(super::pool::RestorePlacement::stands)
+            && self.no_more_room_than_refused(victims.head_pid);
+        let placement = placement.filter(|_| !mismatch);
         if let Some(placement) = &placement {
             shape = Some(placement.short.clone());
         }
@@ -303,6 +312,9 @@ impl ResidencyPlanner {
             map.merge(self.parked_map(victims.head_pid));
             if let Some(placement) = &placement {
                 placement.lay(&mut map);
+            }
+            if mismatch {
+                map.free.clear();
             }
             map
         });

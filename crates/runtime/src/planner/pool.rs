@@ -667,6 +667,21 @@ pub trait PoolPort: Send + Sync + 'static {
     ) -> bool {
         self.restore_placement(pid, need, state, kv_pages, bind).stands()
     }
+    /// Holds for `pid`'s served restore what its placement chose: the free
+    /// chunks its unpark's pieces and then `bind`'s runs open
+    /// ([`crate::store::roles::Roles::reserve_restore`]), closed to every
+    /// other take until its unpark and bind take them or
+    /// [`Self::release_restore`]. Whether it was held (its placement
+    /// stands). Where the pool keeps no roles, nothing is held.
+    fn reserve_restore(&self, pid: ProcessId, bind: Option<(u32, u32)>) -> bool {
+        let _ = (pid, bind);
+        false
+    }
+    /// `pid`'s reservation goes back: its restore failed, was queued again,
+    /// was withdrawn, landed with no bind pending, or its process is gone.
+    fn release_restore(&self, pid: ProcessId) {
+        let _ = pid;
+    }
     /// A residency move's copy reads `chunks` (physical) until
     /// [`Self::moved_out`]: no raise takes them back for its activation
     /// meanwhile ([`crate::store::slots::SlotPool::moving_out`]).
@@ -1056,6 +1071,20 @@ impl PoolPort for RegistryPool {
             shared.lock().unwrap().pool().opens_alone(rest)
         };
         RestorePlacement::of(&own, &placement, bind, pool_alone)
+    }
+
+    fn reserve_restore(&self, pid: ProcessId, bind: Option<(u32, u32)>) -> bool {
+        crate::store::registry::try_get(self.model, self.engine)
+            .and_then(|stores| stores.roles)
+            .is_some_and(|roles| roles.lock().unwrap().reserve_restore(pid, bind))
+    }
+
+    fn release_restore(&self, pid: ProcessId) {
+        if let Some(roles) =
+            crate::store::registry::try_get(self.model, self.engine).and_then(|stores| stores.roles)
+        {
+            roles.lock().unwrap().release_claim(pid);
+        }
     }
 
     fn moving_out(&self, chunks: &[u32]) {

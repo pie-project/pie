@@ -1494,6 +1494,16 @@ impl SharedPool {
             .map_or(1, |s| s.slots_per_chunk.max(1))
     }
 
+    /// `f` run with `ticket`'s held chunks open to its takes
+    /// ([`SlotPool::claim_open`]): a served restore's unpark and bind take
+    /// what was reserved for them, and no one else's take can.
+    pub fn claiming<R>(&mut self, ticket: Option<u64>, f: impl FnOnce(&mut Self) -> R) -> R {
+        let opened = self.pool.claim_open(ticket);
+        let out = f(self);
+        self.pool.claim_close(opened);
+        out
+    }
+
     /// `n` fresh slots of `shape` for the store, as slot refs; none when
     /// they do not all fit.
     pub fn take_refs(&mut self, shape: ShapeId, n: u64) -> Option<Vec<u32>> {
@@ -2378,7 +2388,7 @@ impl SharedPool {
             self.compact_for = None;
             return None;
         }
-        let moves = self.pool.plan_compaction(run)?;
+        let moves = self.pool.plan_compaction_for(run, pieces)?;
         self.pool
             .apply_compaction(&moves, epoch)
             .expect("a compaction planned under the lock applies");
@@ -2403,7 +2413,7 @@ impl SharedPool {
         if self.compact_for.is_some() && self.pool.compacting() {
             return true;
         }
-        if self.pool.plan_compaction(run).is_none() {
+        if self.pool.plan_compaction_for(run, pieces).is_none() {
             return false;
         }
         self.compact_for = Some((run, pieces));

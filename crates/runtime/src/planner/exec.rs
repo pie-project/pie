@@ -699,6 +699,9 @@ async fn drain_detachable(pid: ProcessId) {
 }
 
 pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
+    // Evicted again before its bind took what its restore held: withdrawn,
+    // the reservation goes back.
+    planner.port.release_restore(pid);
     let (model, engine) = planner.locus();
     let handles = crate::inferlet::process::residency::kv_suspend_handles(pid, model, engine);
     let working_sets: HashSet<WorkingSetId> =

@@ -1245,6 +1245,16 @@ impl ResidencyPlanner {
                     });
                     match boarded {
                         Board::Go(pages) => {
+                            // What its placement chose (its unpark's pieces,
+                            // then its pending bind's runs) is held for it
+                            // until its unpark and bind land: no head served
+                            // meanwhile takes it (the L40S at 3 GiB on
+                            // c201812ea: PendingBindShort, its run-1 bind's
+                            // chunk taken between its serve and its unpark).
+                            let bind = self.with_inner(|inner| {
+                                inner.procs.get(&pid).and_then(|proc| proc.bind_room).map(|need| (need.run, need.pieces))
+                            });
+                            self.port.reserve_restore(pid, bind);
                             // Said as the pass's end for this head: a restore
                             // refused and queued again showed "ended=none".
                             self.plan_ended(key, "restore sent", false, &[]);

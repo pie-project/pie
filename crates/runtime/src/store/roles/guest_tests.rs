@@ -3221,3 +3221,56 @@ fn a_pair_left_behind_by_a_parked_holder_goes_with_its_move_down() {
         held(&device) - before
     );
 }
+
+/// The L40S at 3 GiB on c201812ea: a served restore's bind room was taken
+/// by another head between its serve and its unpark (PendingBindShort,
+/// run 1, none after its own unpark). What its placement chose is held for
+/// it: another holder's bind cannot take those chunks, its unpark takes
+/// them, and its pending bind's run, held beside them, is its own bind's.
+#[test]
+fn a_served_restore_s_reserved_chunks_are_its_own_until_it_binds() {
+    let Pools { device, roles } = pools(64);
+    let mut engine = GuestEngine::new(2 * CHUNK, PAIR);
+    bind(&roles, &mut engine, 1).unwrap();
+    let park = roles.lock().unwrap().prepare_park(holder(1)).expect("it parks");
+    roles.lock().unwrap().commit(park);
+    // Held for its restore: its unpark's pieces and a pending bind's run
+    // of one chunk.
+    assert!(roles.lock().unwrap().reserve_restore(holder(1), Some((1, 1))));
+    let held_for = roles.lock().unwrap().claimed(holder(1));
+    assert!(!held_for.is_empty(), "its chunks are held");
+    // Another holder binds meanwhile: none of the held chunks are its.
+    let mut other = GuestEngine::new(2 * CHUNK, 0);
+    other.next = 100;
+    learn_program(&roles, &mut other, ProgramId(8)).unwrap();
+    bind_instance(
+        Some(&roles),
+        &mut other,
+        &InstanceBinding {
+            program: ProgramId(8),
+            ..InstanceBinding::default()
+        },
+        Some(holder(2)),
+        |_| false,
+    )
+    .unwrap();
+    let theirs = chunks(&other.bindings[0].scratch);
+    assert!(
+        theirs.iter().all(|chunk| !held_for.contains(chunk)),
+        "another's bind took none of them: {theirs:?} vs {held_for:?}"
+    );
+    // Its unpark takes from what was held; the bind's chunk stays held.
+    let unpark = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(1))
+        .unwrap()
+        .expect("it unparks");
+    roles.lock().unwrap().commit(unpark);
+    let left = roles.lock().unwrap().claimed(holder(1));
+    assert_eq!(left.len(), 1, "its pending bind's chunk still held: {left:?}");
+    // Its bind takes it, and the reservation is gone.
+    bind(&roles, &mut engine, 1).unwrap();
+    assert!(roles.lock().unwrap().claimed(holder(1)).is_empty(), "released once it bound");
+    let _ = device;
+}

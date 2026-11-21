@@ -200,6 +200,12 @@ impl ResidencyPlanner {
 
     pub(super) fn report_restored(self: &Arc<Self>, pid: ProcessId) {
         self.clear_host_swap_blocks();
+        // With no bind pending, its unpark took what was held for it: the
+        // rest goes back. A pending bind takes its runs from it, and its
+        // take gives back the rest.
+        if self.with_inner(|inner| inner.procs.get(&pid).is_none_or(|proc| proc.bind_room.is_none())) {
+            self.port.release_restore(pid);
+        }
         let signal = self.with_inner(|inner| {
             let proc = inner.procs.get_mut(&pid)?;
             debug_assert_eq!(proc.state, Residency::Restoring);
@@ -251,6 +257,7 @@ impl ResidencyPlanner {
     }
 
     pub(super) fn restore_failed(self: &Arc<Self>, pid: ProcessId, reason: &str) {
+        self.port.release_restore(pid);
         let live = self.with_inner(|inner| {
             let Some(proc) = inner.procs.get_mut(&pid) else {
                 return false;
@@ -310,6 +317,7 @@ impl ResidencyPlanner {
         need: (u32, u32),
         refused_free_runs: Option<u32>,
     ) {
+        self.port.release_restore(pid);
         let recorded = self.with_inner(|inner| {
             inner
                 .procs
@@ -452,6 +460,7 @@ impl ResidencyPlanner {
     /// More of `pid`'s pages were swapped out since its restore was quoted:
     /// it is queued again, to be quoted anew when served. No failure.
     pub(super) fn requeue_restore(self: &Arc<Self>, pid: ProcessId) {
+        self.port.release_restore(pid);
         // Queued at what it has off the device, read now: its kv pages and
         // its state. Queued at nothing, the planner's need and placement
         // read no state for it until its next serve re-quoted it, stood a

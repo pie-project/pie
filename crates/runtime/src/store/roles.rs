@@ -769,6 +769,13 @@ impl RoleMove {
 /// See the module docs.
 #[derive(Debug)]
 pub struct Roles {
+    /// Each served restore's reservation on the device pool, by holder
+    /// ([`super::slots::SlotPool::reserve_chunks`]): its unpark and bind
+    /// take from it, until it is released.
+    claims: HashMap<Holder, u64>,
+    /// The reservation the takes under way may take from: its holder's,
+    /// set for the length of its unpark or bind.
+    claim: Option<u64>,
     device: Shared,
     host: Option<Shared>,
     /// The disk tier, where the load keeps one ([`Self::set_disk`]).
@@ -853,6 +860,8 @@ impl Roles {
             return None;
         }
         Some(Self {
+            claims: HashMap::new(),
+            claim: None,
             device: Arc::clone(device),
             host: host.cloned(),
             disk: None,
@@ -1168,13 +1177,14 @@ impl Roles {
         }
         let shape = self.shape(role)?;
         let mut pool = on.lock().unwrap();
+        let claim = if Arc::ptr_eq(on, &self.device) { self.claim } else { None };
         if !contiguous {
             return pool
-                .take_refs(shape.pool, u64::from(slots))
+                .claiming(claim, |pool| pool.take_refs(shape.pool, u64::from(slots)))
                 .map(part)
                 .ok_or(RolesError::Short { role, slots });
         }
-        match pool.take_run(shape.pool, u64::from(slots)) {
+        match pool.claiming(claim, |pool| pool.take_run(shape.pool, u64::from(slots))) {
             Ok(refs) => Ok(part(refs)),
             Err(SlotError::RunPastChunk { per_chunk, .. }) => Err(RolesError::PastChunk {
                 role,
@@ -1303,11 +1313,13 @@ impl Roles {
     fn retake(&self, like: &Part) -> Result<Part, GuestRoom> {
         let shape = self.shape(SlotRole::Instance).map_err(|_| like.room())?;
         let mut pool = self.device.lock().unwrap();
-        let taken = if like.pieces > 0 {
-            pool.take_chunk_runs(shape.pool, like.chunks, like.pieces)
-        } else {
-            pool.take_run(shape.pool, u64::from(like.run))
-        };
+        let taken = pool.claiming(self.claim, |pool| {
+            if like.pieces > 0 {
+                pool.take_chunk_runs(shape.pool, like.chunks, like.pieces)
+            } else {
+                pool.take_run(shape.pool, u64::from(like.run))
+            }
+        });
         match taken {
             Ok(refs) => Ok(Part {
                 refs,
@@ -1565,6 +1577,47 @@ impl Roles {
             .collect();
         let placement = self.device.lock().unwrap().pool().place(&own);
         (own, placement)
+    }
+
+    /// Holds for `holder`'s served restore the free chunks its unpark's
+    /// pieces and then `bind` (a pending bind's runs) open as the takes
+    /// place them ([`super::slots::SlotPool::place`]): no other take opens
+    /// them until its unpark and bind have taken them or it is released.
+    /// Whether its whole placement stands; held only where it does.
+    pub fn reserve_restore(&mut self, holder: Holder, bind: Option<(u32, u32)>) -> bool {
+        use super::slots::OwnPiece;
+        self.release_claim(holder);
+        let own: Vec<OwnPiece> = self
+            .unpark_pieces(holder)
+            .into_iter()
+            .chain(bind.map(|(run, pieces)| OwnPiece::Chunks { run, pieces }))
+            .collect();
+        let mut device = self.device.lock().unwrap();
+        let placement = device.pool().place(&own);
+        if !placement.stands() {
+            return false;
+        }
+        let ticket = device.pool_mut().reserve_chunks(placement.opened.iter().copied());
+        drop(device);
+        self.claims.insert(holder, ticket);
+        true
+    }
+
+    /// `holder`'s reservation, its chunks not yet taken, goes back.
+    pub fn release_claim(&mut self, holder: Holder) {
+        if let Some(ticket) = self.claims.remove(&holder) {
+            self.device.lock().unwrap().pool_mut().release_reservation(ticket);
+        }
+    }
+
+    /// The chunks held for `holder`'s served restore.
+    #[cfg(test)]
+    #[must_use]
+    pub fn claimed(&self, holder: Holder) -> Vec<u32> {
+        self.claims
+            .get(&holder)
+            .map(|&ticket| self.device.lock().unwrap().pool().reserved(ticket))
+            .unwrap_or_default()
     }
 
     /// What `holder`'s restore would take back, in one line for a stall
@@ -1884,6 +1937,24 @@ impl Roles {
     /// meanwhile leaves that need as it is, and waits on the commit and the
     /// planner as it does (the planner asks the walk for its need too).
     pub fn take_guest(
+        &mut self,
+        channels: &[ChannelId],
+        (pair, state): (FireKey, GuestState),
+        holder: Option<Holder>,
+    ) -> Result<GuestTaken, RolesError> {
+        self.claim = holder.and_then(|holder| self.claims.get(&holder).copied());
+        let taken = self.take_guest_claimed(channels, (pair, state), holder);
+        self.claim = None;
+        // Its bind took what was held for it: the rest goes back.
+        if taken.is_ok()
+            && let Some(holder) = holder
+        {
+            self.release_claim(holder);
+        }
+        taken
+    }
+
+    fn take_guest_claimed(
         &mut self,
         channels: &[ChannelId],
         (pair, state): (FireKey, GuestState),
@@ -2360,6 +2431,13 @@ impl Roles {
     /// Unparks `holder`'s parked items: device slots taken for each, all or
     /// none. `None` when nothing is parked.
     pub fn prepare_unpark(&mut self, holder: Holder) -> Result<Option<RoleMove>, RolesError> {
+        self.claim = self.claims.get(&holder).copied();
+        let unparked = self.prepare_unpark_claimed(holder);
+        self.claim = None;
+        unparked
+    }
+
+    fn prepare_unpark_claimed(&mut self, holder: Holder) -> Result<Option<RoleMove>, RolesError> {
         let (groups, order) = self.unpark_order(holder);
         // An instance whose pair is on its way back with another process's
         // unpark is rebound once that lands: until then its restore is

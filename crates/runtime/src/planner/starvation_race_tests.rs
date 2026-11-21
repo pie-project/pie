@@ -9856,19 +9856,28 @@ fn a_stall_line_names_its_own_head_s_last_end() {
 /// refusal left, held "until more chunks stand free" with nothing in
 /// flight: 186 s, no pass, nothing to free a chunk. With nothing in flight
 /// no race comes again: it is sent. Refused with nothing else in flight,
-/// a placement standing there is the placement's own mismatch: held, and
-/// said as a planner bug.
+/// a placement standing there is the placement's own mismatch: said as a
+/// planner bug, and the head never waits on it: its need is planned as if
+/// the placement did not stand, and the resident the map names is moved.
 #[tokio::test(flavor = "current_thread")]
 async fn a_raced_refusal_standing_with_nothing_in_flight_is_sent_again() {
     for quiet in [false, true] {
         let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
-        let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
-        pool.free.lock().extend(0..8);
+        let model = crate::store::registry::register_model(16, &[8], &[4]);
+        let pool = Arc::new(BindRoomPool {
+            model,
+            ..BindRoomPool::new(8, 0..0, 64)
+        });
+        pool.free.lock().extend(0..6);
         let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
-        let head = ProcessId::new_v4();
-        planner.register(head);
-        planner.note_admitted(head);
+        let (head, resident) = (ProcessId::new_v4(), ProcessId::new_v4());
+        for pid in [head, resident] {
+            planner.register(pid);
+            planner.note_admitted(pid);
+        }
+        pool.kv.lock().extend([(6, resident), (7, resident)]);
         let key = planner.with_inner(|inner| {
+            inner.procs.get_mut(&resident).unwrap().idle = true;
             let proc = inner.procs.get_mut(&head).unwrap();
             proc.state = Residency::Evicted;
             proc.roles_short = Some(PendingBind {
@@ -9877,7 +9886,7 @@ async fn a_raced_refusal_standing_with_nothing_in_flight_is_sent_again() {
                 pages: 1,
             });
             proc.bind_room = proc.roles_short;
-            proc.roles_short_free = Some(8);
+            proc.roles_short_free = Some(6);
             proc.roles_short_quiet = quiet;
             inner.enqueue(
                 head,
@@ -9891,7 +9900,11 @@ async fn a_raced_refusal_standing_with_nothing_in_flight_is_sent_again() {
         planner.plan();
         let (plan, _) = planner.with_inner(|inner| inner.plan_fields(key));
         if quiet {
-            assert!(!plan.contains("restore sent"), "a quiet refusal's mismatch is held: {plan}");
+            assert!(!plan.contains("restore sent"), "not sent on the mismatch: {plan}");
+            assert!(
+                planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
+                "never a wait: the map's candidate is moved ({plan})"
+            );
         } else {
             assert!(plan.contains("restore sent"), "nothing in flight: sent again: {plan}");
         }

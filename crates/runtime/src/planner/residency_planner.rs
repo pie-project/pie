@@ -1976,6 +1976,8 @@ impl ResidencyPlanner {
     /// wedged for pages no one registered holds.
     pub fn unregister(self: &Arc<Self>, pid: ProcessId) {
         crate::store::shared::forget_process(pid);
+        // What was held for its restore goes back with it.
+        self.port.release_restore(pid);
         let (model, engine) = self.port.locus();
         let held = held_page_count(pid, model, engine);
         let held_rs = held_rs_units(pid, model, engine);
