@@ -1,4 +1,5 @@
 pub mod attn;
+pub mod beam;
 pub mod blocks;
 pub mod check;
 pub mod collective;

@@ -112,6 +112,13 @@ pub struct FireBindings {
     /// of the same shape are one program.
     pub token_words: (Tensor, Tensor),
 
+    /// Each entry of the first page table's indices and each row's write
+    /// page: the pool row and lane where a beam group's head resolved it
+    /// (row `-1`: as staged), gathered at the fire's start. Staged at every
+    /// fire, all `-1` where no lane is a beam, so a beam fire is the plain
+    /// fire's program.
+    pub beam_words: (Tensor, Tensor, Tensor, Tensor),
+
     /// Each row's stated position: what the rotary ops read.
     pub positions: Tensor,
 

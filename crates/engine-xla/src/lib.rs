@@ -1,5 +1,6 @@
 pub mod adapter;
 pub mod api;
+pub mod beam;
 pub mod bench;
 pub mod boot;
 pub mod chip;
