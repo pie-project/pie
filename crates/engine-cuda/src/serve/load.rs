@@ -2192,10 +2192,18 @@ impl Shell {
             return Ok(());
         };
         let wanted = routes.wanted();
+        if wanted.is_empty() {
+            return Ok(());
+        }
         // A load that records no bodies serves every fire as an eager walk:
         // there is no body to time a product's kernel by, so it keeps the
-        // routes it has and saves no choice to the profile.
-        if wanted.is_empty() || !self.records_bodies() {
+        // routes it has, saves no choice to the profile, and says so.
+        if !self.records_bodies() {
+            eprintln!(
+                "engine-cuda: card: routes unmeasured, no recorded bodies: {} decode product \
+                 shape(s) keep their routes as they stand, and none is saved",
+                wanted.len()
+            );
             return Ok(());
         }
         let started = std::time::Instant::now();
