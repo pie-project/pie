@@ -115,7 +115,6 @@ fn runtime_config(
 
 fn scheduler(runtime: &config::RuntimeConfig) -> runtime::bootstrap::SchedulerConfig {
     runtime::bootstrap::SchedulerConfig {
-        submit_deadline_us: runtime.submit_deadline.as_micros(),
         silence_timeout_secs: runtime.silence_timeout.as_secs(),
         frame_size: runtime.frame_size,
         frame_dispatch_depth: runtime.frame_dispatch_depth,

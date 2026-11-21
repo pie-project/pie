@@ -55,6 +55,8 @@ fn device_boot(doc: &toml::Table) -> Result<DeviceBoot, String> {
         chunk_bytes: None,
         #[cfg(feature = "test-limits")]
         max_buffer: None,
+        #[cfg(feature = "test-limits")]
+        submit_bound: None,
     })
 }
 

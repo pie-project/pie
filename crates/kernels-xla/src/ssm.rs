@@ -29,7 +29,7 @@ use crate::error::{Error, refuse};
 use crate::hlo::{Built, Cmp, Elem, Fold, Func, Val};
 use crate::lanes::{
     Committed, LaneTables, Lanes, ci, clamp_i, cmp_i, committed_lanes, count_le, decode_lanes,
-    flat_f32, flat_i32, full_i, interleave, iota, land_slots, loop_upto, nonzero, put_at,
+    flat_f32, flat_i32, full_i, interleave, iota, land_slots, live, loop_upto, nonzero, put_at,
     ragged_lanes, row_at, slot_rows, take, take_slots,
 };
 use crate::tensor::{Landing, Operand, RaggedTensor, Stored};
@@ -456,9 +456,12 @@ fn conv(
     let bias = bias.map(|b| flat_f32(f, b)).transpose()?;
     let slab = conv_state.val;
     let lanes = lanes.lanes(f, op, t)?;
+    // a slot padded past its stride (a small state) is read at its front
+    let exact = per as u64 * u64::from(conv_state.width) == hist * u64::from(channels);
     // A decode over the chunk pool: one Mosaic kernel takes each lane's
     // window out of the pool, weighs it and lands it rolled.
     if is_decode
+        && exact
         && let Some((acc, slab)) = conv_step::conv_step(
             f,
             x.val,
@@ -479,6 +482,7 @@ fn conv(
         return Ok((yv, slab));
     }
     let past = take_slots(f, slab, lanes.slot, per)?;
+    let past = live(f, past, hist as i64 * c)?;
     let (yv, next) = if is_decode {
         conv_step(
             f,
@@ -1168,6 +1172,7 @@ fn delta_single_chunk(
     let do_cap = f.and(has_ch, lanes.write)?;
 
     let init = take_slots(f, slab, lanes.slot, per)?;
+    let init = live(f, init, hh * dk * dv)?;
     let init = f.reshape(init, &[s, hh, dk, dv])?;
 
     let ic = f.iota(Elem::I32, &[s, c], 1);
@@ -1662,6 +1667,8 @@ fn delta(
         stride as u64,
     )?;
     lanes.check(op, rows)?;
+    // a slot padded past its stride (a small state) is read at its front
+    let exact = per as u64 * u64::from(state.width) == stride as u64;
     let lanes_n = match lanes {
         LaneTables::Decode { .. } => i64::from(rows),
         LaneTables::Ragged { indptr, .. } | LaneTables::Committed { indptr, .. } => {
@@ -1682,6 +1689,7 @@ fn delta(
             let heads = input.heads_from(fq, &raw.rows, &raw.fixed)?;
             if matches!(input, DeltaIn::Gdn { .. })
                 && input.rule()
+                && exact
                 && step_kernel_on()
                 && let Some(out) =
                     step::gdn_step(fq, &heads, lanes.slot, slab, per, tuning.ssm.step_mxu)?
@@ -1739,6 +1747,7 @@ fn delta(
                 // is its own, and reading the bank as it came in would keep
                 // it whole beside the one landed into (a copy of every slot).
                 let s = take_slots(fq, slab, slot, per)?;
+                let s = live(fq, s, stride)?;
                 let s = fq.reshape(s, &[hi - lo, hh, dk, dv])?;
                 let (yv, s) = delta_step(fq, &part, s, input.rule())?;
                 let s = fq.reshape(s, &[hi - lo, stride])?;
@@ -1773,7 +1782,7 @@ fn delta(
             };
             let fq = &mut *f;
             let l = lanes.count(fq);
-            let kernel = ragged && t > chunk && fused_chunks_on();
+            let kernel = ragged && exact && t > chunk && fused_chunks_on();
             let fused = if kernel {
                 chunk::gdn_chunks(
                     fq,
@@ -1797,6 +1806,7 @@ fn delta(
                 delta_single_chunk(fq, &input, &raw, &lanes, slab, per, stride, chunk)?
             } else {
                 let init = take_slots(fq, slab, lanes.slot, per)?;
+                let init = live(fq, init, stride)?;
                 let init = fq.convert(init, Elem::F32);
                 let init = fq.reshape(init, &[l, hh, dk, dv])?;
                 let (yv, fin) = delta_chunked(fq, &input, &raw, &segs, init, chunk)?;
@@ -1844,6 +1854,7 @@ fn decode_rounds(
         };
         let (slot, write) = (cut(f, a[6])?, cut(f, a[7])?);
         let s = take_slots(f, a[0], slot, per)?;
+        let s = live(f, s, hh * dk * dv)?;
         let s = f.reshape(s, &[round, hh, dk, dv])?;
         let (yv, s) = delta_step(f, &part, s, rule)?;
         let s = f.reshape(s, &[round, hh * dk * dv])?;

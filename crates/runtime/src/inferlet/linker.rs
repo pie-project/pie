@@ -89,7 +89,52 @@ impl Linker {
         #[cfg(not(target_arch = "wasm32"))]
         wasmtime_wasi_http::p3::add_to_linker(&mut linker).expect("Failed to link WASI HTTP");
         host::add_to_linker(&mut linker)?;
+        #[cfg(not(target_arch = "wasm32"))]
+        Self::timers_wait_outside(&mut linker)?;
         Ok(linker)
+    }
+
+    /// A guest's timer is input from outside: `wasi:clocks`' waits run as
+    /// WASI runs them, the process's lanes parked while one is pending
+    /// ([`crate::inferlet::process::away_while`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn timers_wait_outside(linker: &mut WasmLinker<ProcessCtx>) -> Result<()> {
+        use wasmtime_wasi::clocks::WasiClocksView;
+        use wasmtime_wasi::p3::bindings::clocks::monotonic_clock::Host as _;
+        linker.allow_shadowing(true);
+        let mut clock = linker.instance("wasi:clocks/monotonic-clock@0.3.0")?;
+        clock.func_wrap_concurrent("wait-until", |store, (when,): (u64,)| {
+            Box::pin(async move {
+                let (pid, now) = store.with(|mut access| {
+                    let ctx = access.get();
+                    let pid = ctx.id();
+                    ctx.clocks().now().map(|now| (pid, now))
+                })?;
+                if when > now {
+                    crate::inferlet::process::away_while(
+                        pid,
+                        tokio::time::sleep(std::time::Duration::from_nanos(when - now)),
+                    )
+                    .await;
+                }
+                Ok(())
+            })
+        })?;
+        clock.func_wrap_concurrent("wait-for", |store, (how_long,): (u64,)| {
+            Box::pin(async move {
+                if how_long > 0 {
+                    let pid = store.with(|mut access| access.get().id());
+                    crate::inferlet::process::away_while(
+                        pid,
+                        tokio::time::sleep(std::time::Duration::from_nanos(how_long)),
+                    )
+                    .await;
+                }
+                Ok(())
+            })
+        })?;
+        linker.allow_shadowing(false);
+        Ok(())
     }
 
     async fn base_linker(

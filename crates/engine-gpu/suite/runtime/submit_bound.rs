@@ -210,3 +210,49 @@ fn a_frame_after_the_device_idled_is_re_timed_and_stays_under_the_bound() {
             .collect::<Vec<_>>()
     );
 }
+
+/// Under a stated submit bound every serving step walks into a timed frame
+/// (`Serve::walk_frame`), and its device time is read once it lands, where
+/// its landing is already seen (`engine_gpu::submit::Measured`): the
+/// backend's timestamps around its work, or (wgpu on an adapter without
+/// timestamp queries) the host's clock from its submit to its work done.
+/// A fire of a cube four times the probe's work reads a time past half
+/// the probe's and within the host's clock around it, walked once or kept
+/// and replayed, each fire writing the one arm's timestamps laid before.
+#[test]
+fn a_timed_step_reads_its_device_time_once_it_lands() {
+    let Some(mut gpu) = Gpu::open() else {
+        return;
+    };
+    let tactic = Tactic {
+        tier: kernels_slang::Tier::Baseline,
+        vector: 0,
+        wide: false,
+    };
+    // 1024^3: four times the probe's 256 x 1024 x 1024.
+    let side = 1024;
+    let t = |gpu: &mut Gpu| {
+        Tensor::new(gpu.zeros((side * side) as usize), side, side, Dtype::Bf16)
+    };
+    let (act, w, y) = (t(&mut gpu), t(&mut gpu), t(&mut gpu));
+    let probe = Probe::<Api>::new(&gpu.device, tactic).expect("the probe lays");
+    let probed = probe.fire(&gpu.device).expect("the probe fires");
+    // Warmed: the cube's pipeline built and its operands touched.
+    gpu.run(|c| gemm::matmul(c, tactic, act, w, y));
+    // One arm's timestamps, laid once and written by every fire after,
+    // walked and kept alike, one in flight at a time.
+    let stamps = gpu.stamps();
+    for keep in [false, true, false, true] {
+        let started = std::time::Instant::now();
+        let ns = gpu.fired(&stamps, keep, |c| gemm::matmul(c, tactic, act, w, y));
+        let host = started.elapsed().as_nanos() as u64;
+        let ns = ns.unwrap_or_else(|| panic!("a timed step's device time is read (keep {keep})"));
+        assert!(ns > 0 && ns <= host, "keep {keep}: {ns} ns on the device, {host} ns on the host");
+        // Four times the probe's work: read under half its time, the read
+        // is not the cube's.
+        assert!(
+            ns as f64 >= probed * 0.5,
+            "keep {keep}: the cube read {ns} ns, the probe {probed} ns"
+        );
+    }
+}

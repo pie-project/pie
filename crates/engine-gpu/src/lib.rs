@@ -10,6 +10,7 @@ pub mod backend;
 pub mod blob;
 pub mod books;
 pub mod chunks;
+pub mod clock;
 pub mod decoded;
 pub mod dense;
 mod dispatch;

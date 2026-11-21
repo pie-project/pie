@@ -412,6 +412,8 @@ impl<B: Serve> Serve for Named<B> {
 
     type Probed = ();
 
+    type Stamps = ();
+
     const FUSIONS: &'static [poem_compiler::fuse::Rule] = B::FUSIONS;
 
     const MAX_BUFFER_SOURCE: &'static str = B::MAX_BUFFER_SOURCE;
@@ -441,6 +443,10 @@ impl<B: Serve> Serve for Named<B> {
 
     fn chunk_bytes(boot: &B::DeviceBoot) -> Option<u64> {
         B::chunk_bytes(boot)
+    }
+
+    fn submit_bound(boot: &Self::DeviceBoot) -> Option<std::time::Duration> {
+        B::submit_bound(boot)
     }
 
     fn tier(device: &Facts) -> kernels_slang::Tier {
@@ -492,8 +498,20 @@ impl<B: Serve> Serve for Named<B> {
         0
     }
 
-    fn walk_frame(_device: &Facts, _keep: bool) -> Result<NoFrame> {
+    fn walk_frame(_device: &Facts, _keep: bool, _timed: Option<&()>) -> Result<NoFrame> {
         Ok(NoFrame)
+    }
+
+    /// A naming load runs nothing on a device: no timestamps to lay.
+    fn lay_stamps(_device: &Facts, _pieces: u32) -> Result<()> {
+        Ok(())
+    }
+
+    /// A naming load runs nothing on a device: no fire to time.
+    fn fire_timing(_device: &Facts) -> Result<crate::submit::FireTiming> {
+        Err(crate::error::Fault::Unbound {
+            what: "a fire's device time on a naming load, which runs nothing on a device".into(),
+        })
     }
 
     /// A naming load runs nothing on a device: no probe to lay.

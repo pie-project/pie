@@ -76,7 +76,11 @@ impl Context {
     }
 
     #[must_use]
-    pub fn cores(&self) -> u32 {
+    pub fn resident(&self) -> Option<u32> {
+        match self.never {}
+    }
+
+    pub(crate) fn hold_resident(&self, _workgroups: u32) {
         match self.never {}
     }
 
@@ -139,6 +143,18 @@ impl Context {
     }
 
     pub fn spanned(&self) -> Result<Frame> {
+        match self.never {}
+    }
+
+    pub fn timed_frame(&self, _stamps: &Stamps) -> Result<Frame> {
+        match self.never {}
+    }
+
+    pub fn stamps(&self, _sets: u32) -> Result<Stamps> {
+        match self.never {}
+    }
+
+    pub fn spanned_into(&self, _stamps: &Stamps) -> Result<Frame> {
         match self.never {}
     }
 
@@ -212,6 +228,9 @@ impl Frame {
 
 pub use engine_gpu::backend::OnDone;
 
+#[derive(Clone, Debug)]
+pub enum Stamps {}
+
 #[derive(Debug)]
 pub struct Pending {
     never: std::convert::Infallible,
@@ -220,6 +239,11 @@ pub struct Pending {
 impl Pending {
     #[must_use]
     pub fn landed(&self) -> bool {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn device_time(&self) -> engine_gpu::submit::DeviceTime {
         match self.never {}
     }
 

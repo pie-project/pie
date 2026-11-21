@@ -434,6 +434,41 @@ fn calls() -> Vec<Call> {
     steps::calls_of(stepped)
 }
 
+/// The jobs call `call` of [`step_calls`] runs at `rung` over its node's
+/// first operand (`len` elements in `rows` rows): its grid-stride loop's
+/// bound, where that is not the operand's length. A reduction's level runs
+/// a job a group of `fan` inputs it folds (`op_reduce_level`: `rows *
+/// n_out`), and its finish a job a row (`op_reduce_finish`). `None` for a
+/// call whose loop bound is its widest value's length, which a stage's grid
+/// is already sized by. The WGSL these mirror is pinned
+/// (`the_job_counts_mirror_the_runtime`): a change there fails that test.
+#[must_use]
+pub fn step_jobs(call: u32, rung: u32, len: u32, rows: u32) -> Option<u64> {
+    let rows = rows.max(1);
+    let row = len / rows;
+    match calls().get(call as usize)? {
+        Call::ReduceLevel(reduce) => {
+            // `red_n_in`: the row folded by each level below this one.
+            let fan0 = if matches!(reduce, Reduce::GumbelArgmax) {
+                8
+            } else {
+                32
+            };
+            let fan_at = |level: u32| if level == 0 { fan0 } else { 32 };
+            let mut n_in = row;
+            for level in 0..rung {
+                n_in = n_in.div_ceil(fan_at(level));
+            }
+            if n_in <= 1 {
+                return Some(0);
+            }
+            Some(u64::from(rows) * u64::from(n_in.div_ceil(fan_at(rung))))
+        }
+        Call::ReduceFinish(_) => Some(u64::from(rows)),
+        _ => None,
+    }
+}
+
 fn reduce_name(reduce: Reduce) -> &'static str {
     match reduce {
         Reduce::Sum => "RED_SUM",
@@ -1526,6 +1561,69 @@ mod bf16_store_tests {
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod job_tests {
+    use super::{Call, RUNTIME, Reduce, calls, step_jobs};
+
+    fn index(call: Call) -> u32 {
+        u32::try_from(
+            calls()
+                .iter()
+                .position(|c| *c == call)
+                .expect("the call is in the closed set"),
+        )
+        .expect("a call index fits a u32")
+    }
+
+    /// A vocab-wide argmax row: level 0 folds 32 inputs a job, each level
+    /// above 32 of the last's outputs, down to one; its finish a job a row;
+    /// the Gumbel argmax folds 8 at level 0; a call sized by its operand
+    /// states none.
+    #[test]
+    fn a_reduction_runs_a_job_a_group_it_folds_and_its_finish_a_row() {
+        let level = index(Call::ReduceLevel(Reduce::Argmax));
+        let rows = 2;
+        let len = 248_320 * rows;
+        assert_eq!(step_jobs(level, 0, len, rows), Some(2 * 7760));
+        assert_eq!(step_jobs(level, 1, len, rows), Some(2 * 243));
+        assert_eq!(step_jobs(level, 2, len, rows), Some(2 * 8));
+        assert_eq!(step_jobs(level, 3, len, rows), Some(2));
+        assert_eq!(step_jobs(level, 4, len, rows), Some(0));
+        let gumbel = index(Call::ReduceLevel(Reduce::GumbelArgmax));
+        assert_eq!(step_jobs(gumbel, 0, len, rows), Some(2 * 31_040));
+        assert_eq!(step_jobs(gumbel, 1, len, rows), Some(2 * 970));
+        let finish = index(Call::ReduceFinish(Reduce::Argmax));
+        assert_eq!(step_jobs(finish, 0, len, rows), Some(2));
+        assert_eq!(step_jobs(index(Call::Arith), 0, len, rows), None);
+    }
+
+    /// The WGSL `step_jobs` mirrors, line for line: where the runtime's
+    /// loop bounds or fans change, this fails, and `step_jobs` follows.
+    #[test]
+    fn the_job_counts_mirror_the_runtime() {
+        for line in [
+            "fn red_fan0(kind : u32) -> u32 { return select(32u, 8u, kind == RED_GUMBEL); }",
+            "    let fan = select(32u, red_fan0(kind), l == 0u);",
+            "    n = (n + fan - 1u) / fan;",
+            "  let n_in = red_n_in(len, kind, level);",
+            "  if (n_in <= 1u) { return; }",
+            "  let fan = select(32u, red_fan0(kind), level == 0u);",
+            "  let n_out = (n_in + fan - 1u) / fan;",
+            "  let total = rows * n_out;",
+            "  for (var job : u32 = tid; job < total; job = job + lanes) {",
+            "  for (var row : u32 = tid; row < rows; row = row + lanes) {",
+            "  let len = d_len(a) / max(rows, 1u);",
+            "  if (rank < 2u) { return 1u; }",
+            "  for (var k : u32 = 0u; k + 1u < rank; k = k + 1u) { n = n * d_dim(v, k); }",
+        ] {
+            assert!(
+                RUNTIME.lines().any(|have| have == line),
+                "the runtime no longer reads `{line}`: step_jobs mirrors it"
+            );
         }
     }
 }
