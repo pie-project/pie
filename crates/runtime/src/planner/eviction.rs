@@ -298,7 +298,7 @@ impl ResidencyPlanner {
         // shares with residents empties once both move, it down a tier and
         // they off the device.
         let map = shape.as_ref().map(|_| {
-            let mut map = self.port.chunk_occupants(&residents);
+            let mut map = self.occupants(&residents);
             map.merge(self.parked_map(victims.head_pid));
             self.lay_serve_state(victims.head, &mut map);
             map
@@ -464,6 +464,49 @@ impl ResidencyPlanner {
                 &unhostable,
             );
             self.note_short(victims.head, deficit, host);
+            // The policy asked with nothing in flight while the map of every
+            // process names moves for the head: a quiet wait too, said with
+            // who those moves name and why this pass moved none of them
+            // (the L40S at 3 GiB on f623134fc: kv resident 0, need_moves 7,
+            // "no pick: the policy is asked", 185 s with no serve).
+            if unhostable.is_empty()
+                && !blocked
+                && let Some(need) = shape.as_ref()
+                && self.with_inner(|inner| inner.nothing_in_flight())
+            {
+                let everyone: Vec<ProcessId> = self.with_inner(|inner| inner.procs.keys().copied().collect());
+                let mut all = self.occupants(&everyone);
+                all.merge(self.parked_map(victims.head_pid));
+                if let Some(named) = all.cheapest_need(need).filter(|named| !named.is_empty()) {
+                    self.stats.quiet_waits.fetch_add(1, Ordering::Relaxed);
+                    let states: Vec<String> = self.with_inner(|inner| {
+                        named
+                            .iter()
+                            .map(|pid| match inner.procs.get(pid) {
+                                Some(proc) => format!(
+                                    "{pid}: {:?} queued={} idle={} held={} holder={} candidate={}",
+                                    proc.state,
+                                    inner.queue.values().any(|w| w.pid == *pid && w.is_unmet()),
+                                    proc.idle,
+                                    proc.held,
+                                    proc.holder,
+                                    victims.members.iter().any(|v| v.pid == *pid),
+                                ),
+                                None => format!("{pid}: gone"),
+                            })
+                            .collect()
+                    });
+                    tracing::warn!(
+                        head = %victims.head_pid,
+                        ?need,
+                        ?states,
+                        parked_down_refused_at_this_room = self.park_down_failed.load(Ordering::Acquire)
+                            == self.port.room_gives(),
+                        "planner: the policy asked with nothing in flight while the map names moves \
+                         for the head (a planner bug: no step found)"
+                    );
+                }
+            }
             if victims.deficit.pages == 0 {
                 self.check_rs_starvation(victims.head);
             } else if !unhostable.is_empty() {

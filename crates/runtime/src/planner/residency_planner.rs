@@ -58,7 +58,7 @@ pub struct ResidencyPlanner {
     /// again once the pool has moved past it, never on the same map twice:
     /// latched for good, one failure left every parked-in-place process's
     /// state holding the device while their owners waited to be served.
-    park_down_failed: AtomicU64,
+    pub(super) park_down_failed: AtomicU64,
     /// The segment walk made no grow it promised: the next pass goes on
     /// past its grow steps ([`Self::no_grow`]).
     pub(super) no_grow: AtomicBool,
@@ -289,6 +289,16 @@ impl ResidencyPlanner {
             u32::MAX => self.port.device_stats().1,
             most => self.port.chunks_as_pages(most),
         }
+    }
+
+    /// [`super::pool::PoolPort::chunk_occupants`] of `pids`, the pass
+    /// counted as one that built the occupancy map
+    /// ([`super::stats::PlannerStats::map_passes`]).
+    pub(super) fn occupants(&self, pids: &[ProcessId]) -> super::pool::ChunkMap {
+        if !pids.is_empty() {
+            self.stats.map_built.store(true, Ordering::Relaxed);
+        }
+        self.port.chunk_occupants(pids)
     }
 
     pub(super) fn never_fits(&self, key: EntryKey) -> Option<super::PlannerError> {
@@ -953,7 +963,7 @@ impl ResidencyPlanner {
         });
         let mut map = self.port.parked_occupants(except);
         if !evicted.is_empty() {
-            map.merge(self.port.chunk_occupants(&evicted));
+            map.merge(self.occupants(&evicted));
         }
         map
     }

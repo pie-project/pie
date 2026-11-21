@@ -55,6 +55,13 @@ pub struct PlannerStats {
     /// nothing in flight: each a planner bug, said as one
     /// ([`super::ResidencyPlanner::plan_ended`]).
     pub quiet_waits: AtomicU64,
+    /// Set while a pass builds the occupancy map of named processes
+    /// (`chunk_occupants`); the pass is then counted among `map_passes`.
+    pub map_built: std::sync::atomic::AtomicBool,
+    /// Passes that built the occupancy map, and their total microseconds:
+    /// beside every pass's (`pass_census`).
+    pub map_passes: AtomicU64,
+    pub map_pass_us: AtomicU64,
     /// The unmet waiters behind the last plan's wait on a grow; 0 where it
     /// did not end on one.
     pub grow_parked: AtomicU64,
@@ -86,6 +93,10 @@ impl PlannerStats {
     pub(super) fn pass_took(&self, us: u64) {
         use std::sync::atomic::Ordering::Relaxed;
         self.plan_pass_us.fetch_add(us, Relaxed);
+        if self.map_built.swap(false, Relaxed) {
+            self.map_passes.fetch_add(1, Relaxed);
+            self.map_pass_us.fetch_add(us, Relaxed);
+        }
         let bucket = (u64::BITS - us.leading_zeros()) as usize;
         if let Some(count) = self.plan_pass_buckets.get(bucket.min(self.plan_pass_buckets.len() - 1)) {
             count.fetch_add(1, Relaxed);

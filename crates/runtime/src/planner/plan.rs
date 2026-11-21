@@ -166,6 +166,17 @@ impl ResidencyPlanner {
         }
     }
 
+    /// Passes that built the occupancy map, their total microseconds, and
+    /// the quiet waits ([`super::stats::PlannerStats::quiet_waits`]).
+    #[must_use]
+    pub fn map_census(&self) -> (u64, u64, u64) {
+        (
+            self.stats.map_passes.load(Ordering::Relaxed),
+            self.stats.map_pass_us.load(Ordering::Relaxed),
+            self.stats.quiet_waits.load(Ordering::Relaxed),
+        )
+    }
+
     /// A pass's time by phase, in total microseconds: its steps, the wants
     /// published after them, the rest ([`super::stats::PlannerStats::plan_phase_us`]).
     #[must_use]
@@ -208,7 +219,7 @@ impl ResidencyPlanner {
                 .collect();
             (inner.procs.keys().copied().collect::<Vec<_>>(), class)
         });
-        let mut map = self.port.chunk_occupants(&all);
+        let mut map = self.occupants(&all);
         map.merge(self.port.parked_occupants(super::residency_planner::SWEEP));
         let bucket = |slots: u32| match slots {
             0 => "0",
@@ -447,7 +458,7 @@ impl ResidencyPlanner {
             .victim_set()
             .map(|set| set.candidates(true).into_iter().map(|(pid, _)| pid).collect())
             .unwrap_or(pids);
-        let mut map = self.port.chunk_occupants(&pids);
+        let mut map = self.occupants(&pids);
         map.merge(self.parked_map(pid));
         self.lay_serve_state(key, &mut map);
         // The moves the whole need takes, every length laid together (the

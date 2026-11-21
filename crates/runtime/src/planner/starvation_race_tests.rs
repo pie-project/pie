@@ -7351,6 +7351,369 @@ fn bench_the_pieces_of_a_plan_pass() {
     });
 }
 
+/// A real shared store for [`bench_a_plan_pass_on_a_shared_store`]: 480
+/// chunks of 1 MiB, a kv list (16 slots a chunk), a one-piece state record
+/// and the role shapes (instance, channel, adapter), 64 host chunks.
+fn bench_store_model() -> (usize, crate::store::roles::RolesHandle) {
+    use ::engine::chunk::{
+        ChunkFacts, Growth, Reserved, ReservedRun, SegmentFacts, ShapeId, SlotKind, SlotRole,
+        SlotShape,
+    };
+    const CHUNK: u64 = 1 << 20;
+    let shape = |id: u32, kind: SlotKind, slot_bytes: u64, role: SlotRole| SlotShape {
+        id: ShapeId(id),
+        kind,
+        slot_bytes,
+        slots_per_chunk: u32::try_from(CHUNK / slot_bytes).unwrap(),
+        sets_per_working_set: 1,
+        rows: Vec::new(),
+        pinned: None,
+        role,
+    };
+    let list = SlotKind::List {
+        tokens: 16,
+        rate: 1,
+        window: None,
+    };
+    let fixed = SlotKind::Fixed { pieces: 1 };
+    let facts = ChunkFacts {
+        chunk_bytes: CHUNK,
+        total_chunks: 480,
+        segment_chunks: 480,
+        segments: SegmentFacts {
+            committed: 1,
+            max: 1,
+            growth: Growth::Fixed,
+        },
+        reserved: vec![ReservedRun {
+            what: Reserved::Null,
+            first: 0,
+            chunks: 1,
+        }],
+        shapes: vec![
+            shape(0, list, 64 << 10, SlotRole::State),
+            shape(1, fixed, 256 << 10, SlotRole::State),
+            shape(2, fixed, 4 << 10, SlotRole::Instance),
+            shape(3, fixed, 1 << 10, SlotRole::Channel),
+            shape(4, fixed, 64 << 10, SlotRole::Adapter),
+        ],
+        act_chunks: vec![(16, 1), (256, 4)],
+        host_chunks: 64,
+        ..ChunkFacts::default()
+    };
+    facts.validate().unwrap();
+    let device = Arc::new(std::sync::Mutex::new(
+        crate::store::shared::SharedPool::new(&facts, 256).unwrap(),
+    ));
+    let host = Arc::new(std::sync::Mutex::new(
+        crate::store::shared::SharedPool::tier(&facts, facts.host_chunks)
+            .unwrap()
+            .unwrap(),
+    ));
+    let model = crate::store::registry::register_model_with_chunks(
+        16,
+        &[crate::store::registry::EngineStores {
+            pools: crate::store::chunks::StorePools::of(&facts).expect("shared facts"),
+            max_context: 256,
+            shared: Some(device),
+            tiers: crate::store::shared::Tiers {
+                host: Some(host),
+                disk_slots: 0,
+                disk_chunk_slots: 0,
+            },
+        }],
+    );
+    let roles = crate::store::registry::get(model, 0).roles.expect("roles");
+    (model, roles)
+}
+
+/// A plan pass against a real shared store (the `RegistryPool` through the
+/// shared pool, the roles and the kv store) in the state of
+/// `bench_a_plan_pass_with_nothing_to_do`: 250 residents each bound to an
+/// instance and holding kv pages interleaved over every chunk, the device
+/// near full; an evicted head with parked roles short of runs (two of
+/// four), and 100 allocation waiters behind it. Run with `--ignored
+/// --nocapture`. `PIE_BENCH_STALLED=1` leaves nothing in flight (the head
+/// funded: the stalled path, dump_stall's whole census); by default one
+/// resident is firing, as a decoding fleet holds the head unfunded.
+#[test]
+#[ignore]
+fn bench_a_plan_pass_on_a_shared_store() {
+    use crate::inferlet::process::residency::{ProcessResidency, register_residency};
+    use crate::store::roles::tests::{FakeEngine, PROGRAM};
+    use crate::store::roles::{bind_instance, learn_program};
+
+    // Moves a stalled pass issues are spawned and never polled.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _entered = runtime.enter();
+    let stalled = std::env::var_os("PIE_BENCH_STALLED").is_some();
+    let rounds: u32 = std::env::var("PIE_BENCH_ROUNDS")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(2_000);
+    let (model, roles) = bench_store_model();
+    let stores = crate::store::registry::get(model, 0);
+    let pool = RegistryPool::new(model, 0, false);
+    let planner = Arc::new(ResidencyPlanner::new(Arc::new(RegistryPool::new(
+        model, 0, false,
+    ))));
+
+    // 250 residents and the head, each bound to an instance.
+    let residents: Vec<ProcessId> = (0..250).map(|_| ProcessId::new_v4()).collect();
+    let head = ProcessId::new_v4();
+    let mut engine = FakeEngine::default();
+    learn_program(&roles, &engine, PROGRAM).unwrap();
+    for &pid in residents.iter().chain([&head]) {
+        let binding = ::engine::InstanceBinding {
+            program: PROGRAM,
+            ..::engine::InstanceBinding::default()
+        };
+        bind_instance(Some(&roles), &mut engine, &binding, Some(pid), |_| false).unwrap();
+    }
+    // The head's roles parked (on the host): its restore unparks them.
+    let park = roles.lock().unwrap().prepare_park(head).expect("it parks");
+    roles.lock().unwrap().commit(park);
+
+    // Each resident's kv working set, one page a round across every
+    // resident, so each chunk holds sixteen residents' pages; filled until
+    // a few chunks stand free.
+    const MOST: u64 = 64;
+    let mut residencies = Vec::new();
+    let mut sets = Vec::new();
+    for &pid in &residents {
+        let ws = crate::store::registry::with_kv_lock(&stores.kv, "bench", |kv| {
+            let ws = kv.create_working_set();
+            kv.reserve(ws, MOST).unwrap();
+            ws
+        });
+        let handle = crate::store::kv::working_set::KvWorkingSet::new(model, 0, ws, 16);
+        let residency = Arc::new(std::sync::Mutex::new(ProcessResidency::default()));
+        residency
+            .lock()
+            .unwrap()
+            .kv_working_sets
+            .insert((model, 0, ws), handle.suspend_handle());
+        register_residency(pid, Arc::downgrade(&residency));
+        residencies.push(residency);
+        sets.push((ws, handle));
+    }
+    let leave_free: u32 = std::env::var("PIE_BENCH_FREE")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(1);
+    let mut written = 0u64;
+    'fill: for round in 0..MOST {
+        for (ws, _) in &sets {
+            if pool.free_chunks() <= leave_free {
+                break 'fill;
+            }
+            let done = crate::store::registry::with_kv_lock(&stores.kv, "bench", |kv| {
+                let need = kv.write_demand(*ws, &[round]).unwrap();
+                let Some(mut granted) = kv.reserve_device_pages(need) else {
+                    return false;
+                };
+                let prepared = kv.prepare_write_reserved(*ws, &[round], &mut granted).unwrap();
+                let seq = kv
+                    .publish_prepared(
+                        prepared,
+                        &[crate::store::kv::write::PageCommit {
+                            token_hashes: Vec::new(),
+                            page_hash: None,
+                        }],
+                    )
+                    .unwrap();
+                kv.settle(seq);
+                true
+            });
+            if !done {
+                break 'fill;
+            }
+            written += 1;
+        }
+    }
+
+    for &pid in residents.iter().chain([&head]) {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    let key = planner.with_inner(|inner| {
+        let proc = inner.procs.get_mut(&head).unwrap();
+        proc.state = Residency::Evicted;
+        proc.roles_short = Some(PendingBind {
+            run: 4,
+            pieces: 2,
+            pages: 8,
+        });
+        // `PIE_BENCH_BIND=1`: a bind of two runs of four suspended it too,
+        // so its placement (the bind's runs beside its unpark) does not
+        // stand on the one free chunk.
+        if std::env::var_os("PIE_BENCH_BIND").is_some() {
+            proc.bind_room = proc.roles_short;
+        }
+        let key = inner.enqueue(
+            head,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        );
+        for &pid in residents.iter().take(100) {
+            inner.enqueue(
+                pid,
+                allocation(Demand {
+                    kv_pages: 1,
+                    rs: RsUnits::default(),
+                }),
+            );
+        }
+        if !stalled {
+            // A decoder's fire in flight, as long as the bench runs.
+            let proc = inner.procs.get_mut(&residents[200]).unwrap();
+            proc.fires = 1;
+            proc.fired_at = crate::rt::Instant::now() + Duration::from_secs(3600);
+        }
+        key
+    });
+    let (free, total) = pool.device_stats();
+    eprintln!(
+        "BENCH store: pages written={written} device pages free/total={free}/{total} \
+         free_chunks={} free runs of 4={} restore_stands={} stalled={stalled}",
+        pool.free_chunks(),
+        pool.guest_free_runs(4),
+        pool.restore_stands(head, &super::pool::RunNeed::one(4, 2), RsUnits::default(), 0, None),
+    );
+
+    let first = std::time::Instant::now();
+    planner.plan();
+    eprintln!(
+        "BENCH first plan pass: {:.1} us; head unmet after={:?}",
+        first.elapsed().as_secs_f64() * 1e6,
+        planner.with_inner(|inner| inner.unmet_head().map(|(key, _)| key)),
+    );
+    let passes_then = planner.pass_census();
+    let phases_then = planner.phase_census();
+    let began = std::time::Instant::now();
+    for _ in 0..rounds {
+        planner.plan();
+    }
+    let per_pass = began.elapsed().as_secs_f64() * 1e6 / f64::from(rounds);
+    let passes = planner.pass_census();
+    let phases = planner.phase_census();
+    eprintln!(
+        "BENCH plan pass (shared store): {per_pass:.1} us; pass census {:?} -> {:?}; \
+         phases us/pass steps={:.1} wants={:.1} rest={:.1}",
+        passes_then,
+        passes,
+        (phases[0] - phases_then[0]) as f64 / f64::from(rounds),
+        (phases[1] - phases_then[1]) as f64 / f64::from(rounds),
+        (phases[2] - phases_then[2]) as f64 / f64::from(rounds),
+    );
+    eprintln!(
+        "BENCH queue after: head unmet={:?} queued={} head state={:?} evicting={} diag={:?}",
+        planner.with_inner(|inner| inner.unmet_head().map(|(key, _)| key)),
+        planner.with_inner(|inner| inner.queue.len()),
+        planner.with_inner(|inner| inner.procs[&head].state),
+        planner.with_inner(|inner| inner.evicting.len()),
+        planner.stats.restores.load(Ordering::Relaxed),
+    );
+
+    let time = |name: &str, f: &dyn Fn()| {
+        let began = std::time::Instant::now();
+        for _ in 0..rounds {
+            f();
+        }
+        eprintln!(
+            "BENCH {name}: {:.1} us",
+            began.elapsed().as_secs_f64() * 1e6 / f64::from(rounds)
+        );
+    };
+    time("unmet_head", &|| {
+        planner.with_inner(|inner| {
+            let _ = inner.unmet_head().map(|(key, _)| key);
+        })
+    });
+    time("head_room", &|| {
+        *planner.need_cache.lock() = None;
+        let _ = planner.head_room(key);
+    });
+    time("publish_wants", &|| planner.publish_wants());
+    time("wants_met_now", &|| {
+        let _ = planner.wants_met_now();
+    });
+    time("dump_stall (as a pass finds it)", &|| planner.dump_stall());
+    time("dump_stall (forced: said again each call)", &|| {
+        planner.with_inner(|inner| inner.stall_dumped = None);
+        planner.dump_stall();
+    });
+    time("report_short", &|| planner.report_short());
+    time("plan_once", &|| {
+        let _ = planner.plan_once();
+    });
+    time("victim_set", &|| {
+        let _ = planner.victim_set();
+    });
+    time("held_by_state", &|| {
+        let _ = planner.held_by_state();
+    });
+    time("store_holders", &|| {
+        let _ = planner.store_holders();
+    });
+    // The port's calls, on the same store.
+    time("port.chunk_occupants(&[])", &|| {
+        let _ = pool.chunk_occupants(&[]);
+    });
+    time("port.chunk_occupants(residents)", &|| {
+        let _ = pool.chunk_occupants(&residents);
+    });
+    time("port.restore_stands", &|| {
+        let _ = pool.restore_stands(head, &super::pool::RunNeed::one(4, 2), RsUnits::default(), 0, None);
+    });
+    time("port.restore_stands(bind 4x2)", &|| {
+        let _ = pool.restore_stands(head, &super::pool::RunNeed::one(4, 2), RsUnits::default(), 0, Some((4, 2)));
+    });
+    time("port.chunk_census(4)", &|| {
+        let _ = pool.chunk_census(4);
+    });
+    time("port.unpark_census", &|| {
+        let _ = pool.unpark_census(head, Some((4, 2)));
+    });
+    time("port.unpark_need", &|| {
+        let _ = pool.unpark_need(head);
+    });
+    time("port.device_stats", &|| {
+        let _ = pool.device_stats();
+    });
+    time("port.free_chunks", &|| {
+        let _ = pool.free_chunks();
+    });
+    time("port.guest_free_runs(4)", &|| {
+        let _ = pool.guest_free_runs(4);
+    });
+    time("port.room_gives", &|| {
+        let _ = pool.room_gives();
+    });
+    time("port.rs_stats", &|| {
+        let _ = pool.rs_stats();
+    });
+    time("port.state_chunks", &|| {
+        let _ = pool.state_chunks();
+    });
+    // Inside chunk_occupants: one resident's movable pages (its own sets'
+    // locations, then every other running set's pages scanned for sharing).
+    let one: HashSet<_> = [sets[0].0].into_iter().collect();
+    time("kv.movable_resident_pages(one resident)", &|| {
+        crate::store::registry::with_kv_lock(&stores.kv, "bench", |kv| {
+            let _ = kv.movable_resident_pages(&one);
+        });
+    });
+    time("kv_working_sets_for(residents)", &|| {
+        let _ = crate::inferlet::process::residency::kv_working_sets_for(&residents, model, 0);
+    });
+    drop(residencies);
+}
+
 /// Mac Pro's 2 GiB spin and the L40S's (139,315 and 132,792 refusals, the
 /// free room no different): refused restores sent one another again, each
 /// refusal's own return of what its unpark took counted as room moved. A
@@ -9230,5 +9593,53 @@ async fn a_standing_restore_refused_in_the_same_room_with_nothing_in_flight_is_p
         planner.stats.quiet_waits.load(Ordering::Relaxed),
         0,
         "no wait chosen with nothing in flight"
+    );
+}
+
+/// The L40S at 3 GiB on f623134fc: kv resident 0, the stall's map naming 7
+/// moves for a restore head, the pass ending "no pick: the policy is
+/// asked", nothing in flight, 185 s with no serve. Such an end is a quiet
+/// wait and is counted and said with who the moves name (here a holder no
+/// rule lets the pass move).
+#[tokio::test(flavor = "current_thread")]
+async fn the_policy_asked_with_nothing_in_flight_and_moves_named_is_a_quiet_wait() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(6, 0..0, 64));
+    pool.free.lock().extend([0, 1, 2, 3]);
+    pool.store_refuses.store(true, Ordering::Relaxed);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (head, holder) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [head, holder] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    pool.kv.lock().extend([(4, holder), (5, holder)]);
+    planner.with_inner(|inner| {
+        inner.procs.get_mut(&holder).unwrap().holder = true;
+        let proc = inner.procs.get_mut(&head).unwrap();
+        proc.state = Residency::Evicted;
+        proc.roles_short = Some(PendingBind {
+            run: 1,
+            pieces: 5,
+            pages: 5,
+        });
+        inner.enqueue(
+            head,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        );
+    });
+    planner.poke();
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.stats.quiet_waits.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+    }
+    let end = planner.with_inner(|inner| inner.last_plan.as_ref().map(|end| end.ended));
+    assert!(
+        planner.stats.quiet_waits.load(Ordering::Relaxed) > 0,
+        "counted and said as a quiet wait ({end:?})"
     );
 }
