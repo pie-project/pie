@@ -107,6 +107,13 @@ impl Shell {
         self.weighed.as_ref()
     }
 
+    /// What the device's free bytes paid for the bodies the load armed,
+    /// the figure a load with no record measures (0 where none armed).
+    #[must_use]
+    pub const fn bodies_took(&self) -> u64 {
+        self.bodies_took
+    }
+
     #[must_use]
     pub fn body_stats(&self) -> record::BodyStats {
         self.cache.body_stats()

@@ -2641,6 +2641,57 @@ fn golden_held_small() {
     }
 }
 
+/// A measuring load ends with the pool a recorded one has: `PIE_GOLDEN_MODELS`
+/// (MoE miniatures the pool seats whole), each loaded told its weights are
+/// held (the load seats them in the pool ahead of the runtime) twice
+/// against a cache of its own, first with no record of what its bodies take
+/// (it arms them over the least range, measures them, and fits again: on a
+/// flat range, one allocation, it reserves the range anew where the card
+/// backs more), then from the record that load saved. The first's pool
+/// holds every chunk the second's does, less the chunks its first arming's
+/// bodies took (the runtime's graph memory may hold them still).
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_measuring_refit() {
+    let cache = cache_dir();
+    let models = std::env::var("PIE_GOLDEN_MODELS")
+        .expect("PIE_GOLDEN_MODELS names the MoE miniatures to load");
+    for model in models.split(',').map(str::trim).filter(|m| !m.is_empty()) {
+        let fixture = fixture(model, &cache);
+        // A cache of its own: no record of the bodies; the profiles shared.
+        let own = cache.join(format!("measuring-{}-{model}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&own);
+        std::fs::create_dir_all(&own).unwrap_or_else(|why| panic!("{}: {why}", own.display()));
+        let told = || {
+            let mut knobs = knobs();
+            knobs.dense_weights = false;
+            knobs.weights_held = true;
+            knobs
+        };
+        let (measured, took, chunk) = {
+            let mut shell = load_with(&fixture, &own, told());
+            let facts = shell.chunk_facts().expect("the pool states its chunks");
+            (facts.total_chunks, shell.bodies_took(), facts.chunk_bytes)
+        };
+        let recorded = {
+            let mut shell = load_with(&fixture, &own, told());
+            shell.chunk_facts().expect("the pool states its chunks").total_chunks
+        };
+        let _ = std::fs::remove_dir_all(&own);
+        let slack = u32::try_from(took.div_ceil(chunk.max(1))).unwrap_or(u32::MAX);
+        println!(
+            "measuring {model}: {measured} chunks measuring, {recorded} from the record \
+             (its bodies took {} MiB, {slack} chunk(s))",
+            took >> 20
+        );
+        assert!(
+            measured.saturating_add(slack) >= recorded,
+            "{model}: a measuring load's pool holds {measured} chunks and a recorded one's \
+             {recorded}, more apart than the {slack} chunk(s) its first arming's bodies took"
+        );
+    }
+}
+
 /// The expert-cache probe: `PIE_GOLDEN_MODELS` (the MoE miniatures whose
 /// banks stream; Nemotron's by default) served with every routed expert
 /// cached in the pool, read from the host copy, and half and half. The
