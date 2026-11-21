@@ -1129,6 +1129,41 @@ impl Engine for Xla {
             .map_err(refusal)
     }
 
+    /// Beam `beam`'s page list as the group's last fire left it
+    /// (`BEAM-PAGE-LISTS.md` §6.6): row `beam` of the state's `map` (one
+    /// copy, words `2 + beam · cap`, `cap` columns), read out of the pool,
+    /// which every fire that wrote it lands before.
+    fn beam_list(&mut self, instance: InstanceId, beam: u32) -> EngineResult<Vec<u32>> {
+        let seat = self.programs.beam_seat(instance).ok_or_else(|| {
+            Error::Program(format!("instance {instance} binds no beam group (parents)"))
+        })?;
+        let (lanes, cap) = (seat.layout.lanes, seat.layout.cap);
+        if i64::from(beam) >= lanes {
+            return Err(Error::Program(format!("beam {beam} of a group of {lanes}")));
+        }
+        let shell = self.loaded_mut()?;
+        let pool = shell.pools().buffer().ok_or_else(|| {
+            Error::Program("a beam group's state on an unbacked pool".to_string())
+        })?;
+        // the plugin reads from 32-byte-aligned offsets: the row's start (a
+        // pool row is 512 bytes) through the beam's list, sliced here
+        let at = i64::from(seat.row) * crate::store::layout::ROW_BYTES as i64;
+        let end = (2 + (i64::from(beam) + 1) * cap) * 4;
+        let state = pool
+            .read_raw(at, (end + 31) / 32 * 32)
+            .map_err(|e| Error::Program(e.to_string()))?;
+        if u32::from_le_bytes([state[0], state[1], state[2], state[3]]) == 0 {
+            return Err(Error::Program(format!(
+                "instance {instance}'s beam group has fired no step yet"
+            )));
+        }
+        let from = ((2 + i64::from(beam) * cap) * 4) as usize;
+        Ok(state[from..from + cap as usize * 4]
+            .chunks_exact(4)
+            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+            .collect())
+    }
+
     fn take_channel(
         &mut self,
         instance: InstanceId,
