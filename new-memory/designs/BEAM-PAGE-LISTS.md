@@ -387,3 +387,65 @@ the bytes one row takes (row `r` of a plane at `set[a] + offset + r cell`).
 
 It runs after the head step and its kv copies, in the fire's stream, ahead
 of the fire's first append or read; its fault word is the lane's (§7).
+
+### 11.3 The common-ancestor fold
+
+A group's rows below its common ancestor are the same in every live beam, so
+they fold into the set's state once, and each beam carries only the rows after
+it: with one beam every row is common, and beam-1 carries the natural window a
+plain decode does.
+
+- Definition. After fire `t`'s head step has reordered the lists (`map'`,
+  §6.2), let `j*` be the first column at which the live beams' lists name
+  different pool pages (`cap` where every column agrees), and `end_t` the slot
+  past the fire's rows. The group's common slot is
+  `c_t = min((f0 + j*) S, end_t)`. Every slot below it lies, for every beam,
+  on the same pool page: one row, never a copy that could differ (a slot a
+  fork copied is not counted: whole shared pages only, at most `S - 1` rows
+  more carried). `c_t` never decreases: a child keeps its parent's columns
+  below `j*`, and `end_t` only grows.
+- Computed on the device, where the lists live: the head step writes `c_t` to
+  the group's state header (`header[3]`, beside `fired`). The host, which
+  does not know the lists under `Port::Parents`, reads it when it harvests the
+  fire, through the readback its outputs land by. Monotone, a value read late
+  (the lag `W`) is still common: nothing waits on it.
+- Stated to engines as a fold. The group's set keeps one committed length,
+  `folded_g`. The next fire the runtime stages on the group states
+  `fold = c - folded_g`, `c` the largest `c_t` harvested, by the verb every
+  decode folds by (`RsVerb::Buffer { folded, fold: FoldLen::Host(n) }`):
+  host-known, run-ahead safe. It folds the set's state `h`, which every lane of
+  the group reads, once a group and never once a lane: the engine folds rows
+  `[folded_g, folded_g + n)` into `h` before any lane of that fire reads it,
+  reading them through any beam's rs page table (below `c_t` every beam's
+  `sigma` names the same row, §11.1), by the rank-1 updates a decode's
+  committed rows take from the kept planes (gated delta `S <- g S + k u^T`,
+  Mamba-2 `S <- a S + (dt x) B^T`, KDA `M <- M diag(alpha) + u k^T`). An engine
+  may run it as one fold over the group's recurrent layers at the fire's
+  start, or inside each layer's step, so long as every lane's read of `h`
+  follows it. After it `folded_g = c`, each beam lane replays `[c, s_t]`, and
+  lanes still commit nothing (`commit_len` 0): `h` changes only by the group's
+  fold.
+- Pages below the fold point. kv: unchanged (attention reads every slot, and
+  the pages below `c` are already in every list; the lists, `f0`, `free` and
+  `pending` do not move). rs: no beam's replay reaches below `folded_g`, so the
+  set's rs buffer base moves to `floor(folded_g / T) T` and the rs pages wholly
+  below it go back to the rs store, the truncate from below a set's committed
+  length advancing takes. `sigma` (§11.1) and `copy_rs_rows` (§11.2) apply at
+  slots at or past the base; a copy's slot below it is skipped, as a prompt
+  tail's is.
+- A search owns its set's state. A parents pass used to leave the set's state
+  as the search found it; it now advances it to the common ancestor. §6.6's
+  adopt is unchanged (the chosen beam's list holds every common page, and the
+  set's committed length is already `folded_g`: the relist covers kv whole and
+  rs from the base). A retract of the set below `folded_g` is refused by name,
+  as any past a fold is. A search left without adopting a beam leaves `h` at
+  `folded_g`, not the prompt: a guest that wants the prompt state back forks
+  the set before the search (`forward.wit`, `state-geometry.parents`). The
+  common rows are in every hypothesis, so whichever beam finishes adopts them:
+  accepted history, never a speculative tail.
+- Tests, beside §9. `c_t` against the host replay's lists after every step
+  (forks, retirements, one beam); a search with folds verifies as one without
+  (`--verify` and the finish check, widths 1, 2, 4, 8, on a hybrid); the rs
+  pages below the base are given back; beam-1-parents' step cost and carried
+  rows equal a plain decode's at the same lag, and beam-4's step lies within
+  the user's rule of greedy's.
