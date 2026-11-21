@@ -5,9 +5,10 @@
 //! rows a lag behind its depth, its later rows buffered and read each fire
 //! as a linear attention over the committed state (the carried scan),
 //! answers each step what the same tokens folded every step answer. On
-//! qwen35-tiny, a 37-token prompt then 30 decodes, at lags 1, 11 and 20,
-//! every 5th step folding none and step 27 all (so a lag of 20 carries
-//! 20 rows): each step's
+//! qwen35-tiny, a 37-token prompt then 45 decodes, at lags 11, 20 and 45,
+//! every 5th step folding none and step 38 all (so a lag of 45 carries
+//! past 32 rows, where the carried scan runs a head's value rows a
+//! threadgroup): each step's
 //! logits within 5% of their scale of the unlagged walk's, and no greedy
 //! token moved where the unlagged walk's top two stand 0.02 apart.
 
@@ -19,8 +20,8 @@ use poem::Request;
 use super::a_scattered_pool_serves_the_same_logits::{fixture_of, load_with};
 
 const PROMPT: u32 = 37;
-const STEPS: u32 = 30;
-const LAGS: [u32; 3] = [1, 11, 20];
+const STEPS: u32 = 45;
+const LAGS: [u32; 3] = [11, 20, 45];
 
 fn spread(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
@@ -38,7 +39,7 @@ fn a_lagged_decode_answers_the_unlagged() {
         return;
     }
     let fixture = fixture_of("qwen35-tiny", None);
-    let mut shell = load_with(&fixture, 1024);
+    let mut shell = load_with(&fixture, 2048);
     assert!(shell.serves_rs_verbs(), "a hybrid model");
     let word = |n: u32| fixture.trace.facts.word(&Request::new(n, false));
     let prompt: Vec<u32> = (0..PROMPT).map(|at| (11 + at * 37) % 256).collect();
@@ -85,7 +86,7 @@ fn a_lagged_decode_answers_the_unlagged() {
             // runtime's accepted length; every 5th step none, step 27 all.
             let through = held + 1;
             let carried = held - folded_at[at];
-            let target = if k == 27 {
+            let target = if k == 38 {
                 through
             } else if k % 5 == 4 {
                 folded_at[at]

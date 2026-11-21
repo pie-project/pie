@@ -1203,6 +1203,33 @@ pub struct Paged {
     pub page_ints: u32,
 }
 
+/// The pipelines [`gated_delta_carried`] dispatches whatever its lanes
+/// carry: both forms (16 value rows a threadgroup, a head's 128) and the
+/// per-head table's prepass. A load that buffers recurrent rows builds them
+/// before ready, a beam's long carry being one its warm walk does not reach.
+#[must_use]
+pub fn carried_pipelines() -> [Fire; 3] {
+    [
+        Fire::at(GDN_SCAN_FILE, "gated_delta_carried_bfloat16_s_8_v_2"),
+        Fire::at(GDN_SCAN_FILE, "gated_delta_carried_bfloat16_s_8_v_16"),
+        Fire::at(GDN_SCAN_FILE, "gated_delta_carried_dots_bfloat16"),
+    ]
+}
+
+/// The carried rows past which [`gated_delta_carried`] runs a head's value
+/// rows a threadgroup (each row's work read once a head) rather than 16.
+pub const GDN_CARRIED_WIDE: u32 = 32;
+
+/// The per-head table [`gated_delta_carried`] reads each carried row's
+/// reductions from (`gated_delta_carried_dots`): `rows` entries a (lane, key
+/// head), at least the window's most carried rows (`max_rep`), in `table`.
+#[derive(Clone, Copy, Debug)]
+pub struct DotsTable {
+    pub table: Tensor,
+    pub rows: u32,
+    pub max_rep: u32,
+}
+
 /// A buffer's corrected planes (`rs_corrected`), as a verify or carried
 /// scan lands and reads them through the fire's page table: each row's raw
 /// keys (bf16, `k_heads * k_dim`) and corrected value `u` (f32, `v_heads *
@@ -1474,6 +1501,7 @@ pub fn gated_delta_carried(
     k_dim: u32,
     v_dim: u32,
     y: Tensor,
+    table: DotsTable,
 ) -> Result<(), Error> {
     const OP: &str = "ssm.gated_delta_carried";
     let _ = dtype_dispatch!(OP, qkv.dtype, { Bf16 => "gated_delta_carried_bfloat16" });
@@ -1491,13 +1519,52 @@ pub fn gated_delta_carried(
             format!("the carried step reads {GDN_VERIFY_DIM}-wide heads, and these are {k_dim} by {v_dim}"),
         ));
     }
-    let (groups, vrows) = GDN_VERIFY_GROUP;
+    // A short carry (a decode at its run-ahead lag) runs 16 value rows a
+    // threadgroup; a long one (a beam in a parents pass carries every row
+    // since its fold) a head's 128 a threadgroup, so each carried row's
+    // gates, weights and values are read once a head, not once a group of
+    // rows. On Qwen3.5-0.8B beam-4 over 256 steps the wide form takes the
+    // step's growth from 58 to 24 us a step.
+    let (groups, vrows, name): (u32, u32, &'static str) = if table.max_rep >= GDN_CARRIED_WIDE {
+        (8, 16, "gated_delta_carried_bfloat16_s_8_v_16")
+    } else {
+        (8, 2, "gated_delta_carried_bfloat16_s_8_v_2")
+    };
     let lanes = committed_lanes(OP, indptr)?;
     let z = v_heads
         .checked_mul(lanes)
         .ok_or_else(|| refuse(OP, "the value heads of every lane overflow a launch"))?;
+    // Each carried row's reductions, once a (lane, key head): the table
+    // every value head and row group of the scan reads.
+    if table.max_rep > 0 {
+        let zk = k_heads
+            .checked_mul(lanes)
+            .ok_or_else(|| refuse(OP, "the key heads of every lane overflow a launch"))?;
+        ctx.fire(
+            Fire::at(GDN_SCAN_FILE, "gated_delta_carried_dots_bfloat16").apply(Grid::of(
+                [GDN_SCAN_LANES, table.max_rep, zk],
+                [GDN_SCAN_LANES, 1, 1],
+            )),
+            &[
+                qkv.arg(),
+                indptr.arg(),
+                committed.replay.arg(),
+                stated(OP, committed.lane0)?.arg(),
+                corrected.keys.arg_mut(),
+                ba_paged.pages.arg(),
+                ba_paged.page_tokens.arg(),
+                ba_paged.page_bytes.arg(),
+                corrected.key_row_bytes.arg(),
+                ba_paged.page_ints.arg(),
+                stated(OP, k_heads)?.arg(),
+                stated(OP, v_heads)?.arg(),
+                table.table.arg_mut(),
+                table.rows.arg(),
+            ],
+        )?;
+    }
     ctx.fire(
-        Fire::at(GDN_SCAN_FILE, "gated_delta_carried_bfloat16_s_8_v_2")
+        Fire::at(GDN_SCAN_FILE, name)
             .apply(gated_delta_verify_grid(groups, vrows, z)),
         &[
             qkv.arg(),
@@ -1525,6 +1592,8 @@ pub fn gated_delta_carried(
             corrected.u_row_bytes.arg(),
             state.segments.arg(),
             ba_paged.page_ints.arg(),
+            table.table.arg(),
+            table.rows.arg(),
         ],
     )
 }

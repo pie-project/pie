@@ -2293,6 +2293,15 @@ impl Shell {
                 tracing::warn!(%fault, "metal: the beam head step's pipeline did not build");
             }
         }
+        // A load that buffers recurrent rows: the carried scan's forms, a
+        // long carry (a beam's) being one the warm walk does not reach.
+        if self.rs_layout.is_some() {
+            for fire in kernels_metal::ssm::carried_pipelines() {
+                if let Err(fault) = self.pipelines.warm(&self.device, fire) {
+                    tracing::warn!(%fault, "metal: a carried scan's pipeline did not build");
+                }
+            }
+        }
         self.pipelines.seal();
     }
 

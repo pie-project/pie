@@ -223,6 +223,7 @@ impl Run<'_> {
                             *k_dim,
                             *v_dim,
                             self.tensor(*y),
+                            self.dots_table(&seat, *k_heads)?,
                         );
                     }
                     let scattered = planes.filter(|_| paged.is_none());
@@ -542,6 +543,39 @@ impl crate::run::Run<'_> {
     /// Whether this window's lanes each run one row of their own over their
     /// carried rows (any number of them): a decode step the carried scan
     /// serves.
+    /// The per-head table a carried window's scan reads (`ssm::DotsTable`),
+    /// in the seat's work area (the verify path's, unused by the carried
+    /// scan): refused by name where the window's lanes carry more rows than
+    /// it holds for each lane and key head.
+    pub(crate) fn dots_table(&self, seat: &crate::rs::Seat, k_heads: u32) -> Result<ssm::DotsTable, kernels_metal::Error> {
+        let lane0 = self.window().span.lane_offset as usize;
+        let lanes = self.qo_indptr_host().len().saturating_sub(1);
+        let max_rep = seat
+            .lanes
+            .iter()
+            .skip(lane0)
+            .take(lanes)
+            .map(|plan| plan.replay)
+            .max()
+            .unwrap_or(0);
+        let rows = u32::try_from(seat.layout.work_elems * 4 / 16 / u64::from(k_heads.max(1)))
+            .unwrap_or(u32::MAX);
+        if max_rep > rows {
+            return Err(kernels_metal::Error::Backend {
+                op: "ssm.gated_delta_carried",
+                detail: format!(
+                    "a lane carries {max_rep} recurrent rows and the carried scan's table holds \
+                     {rows} a lane and key head in the seat's work area"
+                ),
+            });
+        }
+        Ok(ssm::DotsTable {
+            table: seat.work,
+            rows,
+            max_rep,
+        })
+    }
+
     pub(crate) fn carried_window(&self, seat: &crate::rs::Seat) -> bool {
         let indptr = self.qo_indptr_host();
         let lane0 = self.window().span.lane_offset as usize;
