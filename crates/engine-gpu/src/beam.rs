@@ -12,7 +12,11 @@
 //! first fire) and overwrites each beam's entries past `f0` and its rows'
 //! write pages in the arm's input store with the pages its list names,
 //! bounds-checked against the group's pool and frozen slots; the copies it
-//! leaves in its state run next. A lane out of bounds keeps the staged
+//! leaves in its state run next. On a hybrid (§11) the same lists page each
+//! beam's buffered recurrent rows: the step resolves each beam's entries of
+//! the fire's staged rs table slot by slot over its list (the set's whole rs
+//! translation staged once a group), and a fork's rows are copied plane by
+//! plane; the set's state is never written while the group searches. A lane out of bounds keeps the staged
 //! words (its own set's pages) and is faulted by name once the fire lands
 //! (`crate::settle::FedCheck`). The port of engine-cuda's `serve::pages`.
 //!
@@ -33,6 +37,11 @@ use crate::inputs::BeamRoom;
 use crate::serve::DeviceCell;
 use crate::store::Pools;
 use crate::store::layout::INSTANCE;
+
+/// The ints a lane's header takes in the staged rs table.
+fn kb_carry_header() -> usize {
+    kernels_slang::ssm::CARRY_HEADER as usize
+}
 
 fn refused(why: String) -> Fault {
     Fault::Program { at: "beam", why }
@@ -186,6 +195,22 @@ pub struct Staged<'a> {
     pub unit: u32,
 }
 
+/// What a hybrid's fire stages that a plan reads (§11): the staged rs
+/// table (`kernels_slang::ssm::Carry`) and its first word in the store, each
+/// lane's header in it and whether its decode steps carry its rows, each
+/// lane's buffer base and its set's rs pages (units), the rows an rs page
+/// holds, the rs planes (first word in a page, words a row) and the pool
+/// words an rs unit counts.
+pub struct RsStaged<'a> {
+    pub table: &'a [i32],
+    pub word: u32,
+    pub header: &'a dyn Fn(usize) -> Option<(usize, bool)>,
+    pub set: &'a dyn Fn(usize) -> Option<(u32, &'a [u32])>,
+    pub tokens: u32,
+    pub planes: Vec<[u32; 2]>,
+    pub unit: u32,
+}
+
 /// What a fire's beam groups have the device run, and the store words the
 /// host writes for them.
 #[derive(Debug)]
@@ -198,6 +223,10 @@ pub struct Planned<'a, B: Backend> {
     pub steps: u32,
     pub copies: u32,
     pub planes: u32,
+    /// A hybrid's beams' rs copies and the rs planes (after the kv planes
+    /// in the plane table).
+    pub rs_copies: u32,
+    pub rs_planes: u32,
     /// Per fault word: its word in the store, the lane it faults and its
     /// instance.
     pub faults: Vec<(u32, usize, engine::InstanceId)>,
@@ -303,6 +332,7 @@ pub fn plan<'a, B: Backend>(
     staged: &Staged<'_>,
     seat: &dyn Fn(usize) -> Option<Seat>,
     translation: &mut dyn FnMut(&[u32]) -> Result<Vec<u32>>,
+    rs: Option<&RsStaged<'_>>,
 ) -> Result<Planned<'a, B>> {
     let mut planned = Planned {
         writes: Vec::new(),
@@ -310,6 +340,8 @@ pub fn plan<'a, B: Backend>(
         steps: 0,
         copies: 0,
         planes: u32::try_from(staged.planes.len()).unwrap_or(u32::MAX),
+        rs_copies: 0,
+        rs_planes: rs.map_or(0, |rs| u32::try_from(rs.planes.len()).unwrap_or(u32::MAX)),
         faults: Vec::new(),
         top_page: None,
     };
@@ -331,7 +363,10 @@ pub fn plan<'a, B: Backend>(
     let mut copies = Part::of("beam lanes' page copies in one fire", room.copies);
     let mut planes = Part::of("kv planes a beam copy moves", room.planes);
     let mut trans = Part::of("pool pages beam groups stage in one fire", room.trans);
-    for plane in &staged.planes {
+    let mut rs_lists = Part::of("beam lanes' rs page table runs in one fire", room.rs_lists);
+    let mut rs_copies = Part::of("beam lanes' rs copies in one fire", room.rs_copies);
+    let mut rs_bases = Part::of("rs entries beam groups' sets hold in one fire", room.rs_bases);
+    for plane in staged.planes.iter().chain(rs.iter().flat_map(|rs| rs.planes.iter())) {
         planes.push(plane)?;
     }
     for group in groups {
@@ -434,6 +469,87 @@ pub fn plan<'a, B: Backend>(
             }
         }
         let list_count = (lists.next() - lists_at) / kb::LIST_WORDS;
+        // A hybrid's beams (§11): each beam's rs page table, entry `e` the
+        // rows of slot `base + e T`, resolved slot by slot over its list to
+        // the set's entry holding the same rows of its own pages; the set's
+        // whole rs translation staged once a group.
+        let rs_at = rs_lists.next();
+        let mut rs_set = None;
+        if let Some(rs) = rs {
+            let first = group.lanes[0];
+            let (base, set) = (rs.set)(first).ok_or_else(|| {
+                refused(format!(
+                    "instance {}'s beams buffer no recurrent rows on a hybrid: a beam group's \
+                     rows stay in its set's buffer and its state is never written while it \
+                     searches (BEAM-PAGE-LISTS.md §11)",
+                    group.instance
+                ))
+            })?;
+            let tokens = rs.tokens.max(1);
+            if page % tokens != 0 || base % tokens != 0 {
+                return Err(refused(format!(
+                    "instance {}'s beams buffer recurrent rows {tokens} a page from slot {base}, \
+                     and their page lists page kv slots {page} a page: a hybrid's beams need \
+                     the rs page's rows to divide the kv page's and its buffer to start on a \
+                     row page (BEAM-PAGE-LISTS.md §11)",
+                    group.instance
+                )));
+            }
+            if slot < base {
+                return Err(refused(format!(
+                    "instance {}'s beams write slot {slot}, below their buffer's base {base}",
+                    group.instance
+                )));
+            }
+            let entries = (slot - base) / tokens + 1;
+            let bases_len = u32::try_from(set.len()).unwrap_or(u32::MAX);
+            if entries > bases_len {
+                return Err(refused(format!(
+                    "instance {}'s beams read {entries} rs entries of a buffer of {bases_len}",
+                    group.instance
+                )));
+            }
+            let bases_at = rs_bases.push(set)?;
+            for (beam, &lane) in group.lanes.iter().enumerate() {
+                if (rs.set)(lane).map(|(at, _)| at) != Some(base) {
+                    return Err(refused(format!(
+                        "instance {}'s beam {beam} buffers its rows apart from beam 0's",
+                        group.instance
+                    )));
+                }
+                let (header, carried) = (rs.header)(lane).ok_or_else(|| {
+                    refused(format!("instance {}'s beam {beam} has no rs table", group.instance))
+                })?;
+                if !carried {
+                    return Err(refused(format!(
+                        "instance {}'s beam {beam} has its buffered rows moved by the host, \
+                         through pages its list does not name: a beam's decode carries its \
+                         rows in its own kernels",
+                        group.instance
+                    )));
+                }
+                let pages = rs
+                    .table
+                    .get(header * kb_carry_header() + 3)
+                    .copied()
+                    .and_then(|at| u32::try_from(at).ok())
+                    .ok_or_else(|| {
+                        refused(format!("instance {}'s beam {beam}'s rs header", group.instance))
+                    })?;
+                rs_lists.push(&[
+                    rs.word + pages,
+                    bases_at,
+                    u32::try_from(beam).unwrap_or(u32::MAX),
+                    entries,
+                    base,
+                    tokens,
+                    bases_len,
+                    0,
+                ])?;
+            }
+            rs_set = Some((bases_at, bases_len, base, tokens));
+        }
+        let rs_count = (rs_lists.next() - rs_at) / kb::RS_LIST_WORDS;
         steps.push(&[
             group.state,
             parents_at,
@@ -449,8 +565,8 @@ pub fn plan<'a, B: Backend>(
             list_count,
             layout.frames,
             backed,
-            0,
-            0,
+            rs_count,
+            rs_at,
         ])?;
         planned.steps += 1;
         let copy_word = kb::copies_word(lanes, layout.cap, layout.frames);
@@ -471,9 +587,30 @@ pub fn plan<'a, B: Backend>(
                 planned.planes,
             ])?;
             planned.copies += 1;
+            if let (Some(rs), Some((bases_at, bases_len, base, tokens))) = (rs, rs_set) {
+                rs_copies.push(&[
+                    u32::try_from(copy).unwrap_or(u32::MAX),
+                    bases_at,
+                    faults_at + beam,
+                    backed,
+                    page,
+                    tokens,
+                    base,
+                    f0,
+                    folded - f0 * page,
+                    rs.unit,
+                    planned.rs_planes,
+                    bases_len,
+                    0,
+                    0,
+                    0,
+                    0,
+                ])?;
+                planned.rs_copies += 1;
+            }
         }
     }
-    for part in [parents, steps, lists, copies, planes, trans] {
+    for part in [parents, steps, lists, copies, planes, trans, rs_lists, rs_copies, rs_bases] {
         if !part.words.is_empty() {
             planned.writes.push((part.at, part.words));
         }
