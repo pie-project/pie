@@ -696,10 +696,19 @@ impl SlotPool {
         let mut segments = Segments::new(total, facts.segment_chunks, facts.committed_segments);
         // The largest rung's activation is backed from the load, unless the
         // span is backed on demand.
-        let top_segment = if act_max == 0 {
+        // The span starts where the engine pins it: the segment its widest
+        // carve with its guests' terms starts in (`act_span_chunks`), when
+        // that is wider than the largest rung's activation. Read from the
+        // rungs alone, the M1 at 2 GiB on ba229ff25 counted segment 11
+        // (chunks 385..420) a bottom segment: `commit_segments(12)` backed
+        // Metal's bottom to its span's first chunk, 385, the runtime opened
+        // 385..420 for state, and restores wanting chunks 390-398 were
+        // refused ("the load reserved 385").
+        let span = act_max.max(facts.act_span.unwrap_or(0)).min(total);
+        let top_segment = if span == 0 {
             segments.count()
         } else {
-            segments.of(total - act_max)
+            segments.of(total - span)
         };
         for segment in top_segment..segments.count() {
             if !facts.span_on_demand && segments.state(segment) == SegmentState::Uncommitted {
@@ -3670,6 +3679,24 @@ mod tests {
         assert!(moved.contains(&(10, 5)) && moved.contains(&(11, 6)), "whole: {moved:?}");
         pool.apply_rung(&evacuation, 7).unwrap();
         pool.check();
+    }
+
+    /// The M1 at 2 GiB on ba229ff25: Metal pins its span's bottom at the
+    /// segment its widest carve with its guests' terms starts in
+    /// (`act_span_chunks`, 110 chunks: chunk 385), wider than the largest
+    /// rung's activation (65: segment 12, chunk 420). The pool's span
+    /// starts at the engine's: no state opens in 385..420 as a bottom
+    /// segment Metal never backs.
+    #[test]
+    fn the_span_starts_where_the_engine_pins_it() {
+        let mut facts = facts_with(16, 4, 2, &[(ShapeKind::Fixed, 4)], &[(16, 2)]);
+        facts.span_on_demand = true;
+        let rungs = SlotPool::new(facts.clone());
+        assert_eq!(rungs.top_segment(), 3, "the rung's two chunks: the last segment");
+        facts.act_span = Some(6);
+        let pinned = SlotPool::new(facts);
+        assert_eq!(pinned.top_segment(), 2, "six chunks from the end: segment 2 on");
+        pinned.check();
     }
 
     /// The L40S at 3 GiB on ba229ff25: a beam-4 process's 72 runs of slots
