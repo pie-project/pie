@@ -59,6 +59,110 @@ impl Carry {
     }
 }
 
+/// A beam group's fold (`BEAM-PAGE-LISTS.md` §11.3, `ssm/carry.hip`'s
+/// `GroupFold`): its representative lane (any of its lanes; they share the
+/// set's state), where its fold rows start in the replay table, and how
+/// many. The fold kernels read a device table of them, one a group.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GroupFold {
+    pub lane: u32,
+    pub fold_off: u32,
+    pub rows: u32,
+}
+
+const _: () = assert!(size_of::<GroupFold>() == 12);
+
+/// A thread a channel for the group folds of the conv window.
+const FOLD_CONV_BLOCK: u32 = 256;
+
+/// Folds each group's rows into its conv window (§11.3): the window stored as
+/// it stands after them, from the committed cells and the rows' inputs
+/// (`carry`'s plane 0) (`ssm_conv1d_fold`).
+#[allow(clippy::too_many_arguments)]
+pub fn conv1d_fold(
+    ctx: &Ctx,
+    state: &RecurrentPool,
+    channels: u32,
+    conv_width: u32,
+    dilation: u32,
+    carry: &Carry,
+    folds: Tensor,
+    groups: u32,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.causal_conv1d";
+    if groups == 0 {
+        return Ok(());
+    }
+    if (conv_width.saturating_sub(1)) * dilation + 1 > 8 {
+        return Err(refuse(OP, format!("a {conv_width}-tap window of dilation {dilation}, past the 8 cells a fold stores")));
+    }
+    let rows = state.rows(OP, state.conv_slab, state.conv_stride, channels)?;
+    ctx.fire(
+        OP,
+        Fire::at(kernel(FILE, "::pie::attn::ssm_conv1d_fold<::pie::bf16>"))
+            .apply(Launch::grid([channels.div_ceil(FOLD_CONV_BLOCK), groups, 1], [FOLD_CONV_BLOCK, 1, 1])),
+        &[
+            rows.arg(),
+            stated(OP, channels)?.arg(),
+            stated(OP, conv_width)?.arg(),
+            stated(OP, dilation)?.arg(),
+            carry.arg(),
+            folds.arg(),
+            stated(OP, groups)?.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
+/// Folds each group's rows into its gated-delta state (§11.3), from the kept
+/// planes (`carry`: `[b | a]`, keys, corrected values), rounded as a token's
+/// step stores them (`ssm_gdn_fold`).
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_fold(
+    ctx: &Ctx,
+    state: &RecurrentPool,
+    k_heads: u32,
+    v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    dt_bias: Tensor,
+    a_log: Tensor,
+    carry: &Carry,
+    folds: Tensor,
+    groups: u32,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.gated_delta";
+    if groups == 0 {
+        return Ok(());
+    }
+    if !(k_dim <= BLOCK * 8 / CARRIED_BV && v_dim.is_multiple_of(CARRIED_BV)) {
+        return Err(refuse(
+            OP,
+            format!("a group's fold steps in the carried tile only: key heads of {k_dim} and value heads of {v_dim} do not lie in it"),
+        ));
+    }
+    let rows = state.rows(OP, state.slab, state.slot_stride_elems, v_heads)?;
+    ctx.fire(
+        OP,
+        Fire::at(kernel(FILE, "::pie::attn::ssm_gdn_fold<16>"))
+            .apply(Launch::grid([v_dim / CARRIED_BV, groups, v_heads], [BLOCK, 1, 1])),
+        &[
+            rows.arg(),
+            dt_bias.arg(),
+            a_log.arg(),
+            stated(OP, k_heads)?.arg(),
+            stated(OP, v_heads)?.arg(),
+            stated(OP, k_dim)?.arg(),
+            stated(OP, v_dim)?.arg(),
+            carry.arg(),
+            folds.arg(),
+            stated(OP, groups)?.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
 /// The gate prep a gated-delta step's `gates` come from: its `[b | a]` rows
 /// and its banks, which a carried row's gates are derived from as
 /// `gdn_gates` derives them.
@@ -1982,6 +2086,50 @@ pub fn kda_tail(
     )
 }
 
+/// Folds each group's rows into its KDA state (§11.3), from the kept planes
+/// (`carry`: forget rows, beta, keys, corrected values) (`ssm_kda_fold`).
+#[allow(clippy::too_many_arguments)]
+pub fn kda_fold(
+    ctx: &Ctx,
+    state: &RecurrentPool,
+    heads: u32,
+    head_dim: u32,
+    norm_eps: f32,
+    gate_floor: f32,
+    dt_bias: Tensor,
+    a_log: Tensor,
+    carry: &Carry,
+    folds: Tensor,
+    groups: u32,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.kda";
+    const STEP_BLOCK: u32 = 256;
+    if groups == 0 {
+        return Ok(());
+    }
+    f32_state(OP, state)?;
+    kda_head(OP, head_dim)?;
+    let state_rows = state.rows(OP, state.slab, state.slot_stride_elems, heads)?;
+    let rows = KDA_TILE_ROWS;
+    ctx.fire(
+        OP,
+        Fire::at(kernel(FILE, &format!("::pie::attn::ssm_kda_fold<{head_dim}, {rows}>")))
+            .apply(Launch::grid([heads, groups, head_dim / rows], [STEP_BLOCK, 1, 1])),
+        &[
+            state_rows.arg(),
+            a_log.arg(),
+            dt_bias.arg(),
+            stated(OP, heads)?.arg(),
+            norm_eps.arg(),
+            gate_floor.arg(),
+            carry.arg(),
+            folds.arg(),
+            stated(OP, groups)?.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
 /// `kda_chunked` through the token-by-token scan whatever the head: the
 /// reference the chunk-parallel passes answer to.
 #[allow(clippy::too_many_arguments)]
@@ -2372,6 +2520,40 @@ pub fn mamba2_tail(
             state.write_state_mask.arg(),
             stated(OP, lanes)?.arg(),
             carry.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
+/// Folds each group's rows into its Mamba-2 state (§11.3), from the kept
+/// planes (`carry`: step sizes, convolved `x | B`) (`ssm_mamba2_fold`).
+pub fn mamba2_fold(
+    ctx: &Ctx,
+    state: &RecurrentPool,
+    m: Mamba2,
+    carry: &Carry,
+    folds: Tensor,
+    groups: u32,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.mamba2";
+    if groups == 0 {
+        return Ok(());
+    }
+    f32_state(OP, state)?;
+    let rows = state.rows(OP, state.slab, state.slot_stride_elems, m.heads)?;
+    ctx.fire(
+        OP,
+        Fire::at(kernel(FILE, "::pie::attn::ssm_mamba2_fold"))
+            .apply(Launch::grid([groups, m.heads, 1], [BLOCK, 1, 1])),
+        &[
+            rows.arg(),
+            m.a_log.arg(),
+            m.dt_bias.arg(),
+            stated(OP, m.heads)?.arg(),
+            stated(OP, m.groups)?.arg(),
+            carry.arg(),
+            folds.arg(),
+            stated(OP, groups)?.arg(),
             ctx.stage(),
         ],
     )
