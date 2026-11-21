@@ -53,8 +53,12 @@ written, is slower than the staged one: c1 / c4 / c64 351 / 1385 / 9564
 tok/s against 355 / 1400 / 10008. Without the stage, each row's keys and
 `u` load after the state instead of being prefetched with it a tile ahead,
 which is what made the staged form fast; folding the committed rows from
-the staged chunk changed nothing. Keep the stage prefetch; measure on each
-engine before porting the no-stage part. On CUDA about half the c1 gap to
+the staged chunk changed nothing. Metal measured the opposite: the no-stage
+form wins there (one lane 19.5 / 23.4 / 24.8 µs at 0 / 3 / 7 rows against
+staged 23 / 34 / 36; a c4 step 1.420 against 1.684 ms): the M1 has no
+async copy to prefetch with, and its barriers cost more. The stage is
+per-engine: kept where an async prefetch exists (CUDA's cp.async), dropped
+where it does not (Metal); ROCm measures before choosing. On CUDA about half the c1 gap to
 the plain step is host-side (per-step prepare and rs staging), not the
 kernel's shape.
 
