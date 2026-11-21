@@ -602,9 +602,11 @@ instantiate_causal_conv1d_verify(bfloat16, bfloat)
 // step, each group's window moves on by the `n` rows every live beam shares,
 // read from its first lane's buffer. That lane's page table row starts `n`
 // rows past them (its replay starts at the fold), so row `t` of the fold is
-// its extended row `t - n`. `folds` holds `[lane, n]` a group; a group whose
-// lane lies outside this window's lanes is another window's. A thread holds
-// its four channels' whole history, read before any of it is written back.
+// its extended row `t - n`. `folds` holds `[lane, n]` a group: the folding
+// groups lead it and the first entry of no rows ends it, each thread folding
+// every group in turn; a group whose lane lies outside this window's lanes
+// is another window's. A thread holds its four channels' whole history, read
+// before any of it is written back.
 template <typename T>
 [[kernel]] void causal_conv1d_group_fold(
     const device int* folds        [[buffer(0)]],
@@ -624,14 +626,18 @@ template <typename T>
     const device ulong* map        [[buffer(14)]],
     uint3 pos [[thread_position_in_grid]]) {
   const int c = int(pos.x) * 4;
-  const int lane = folds[2 * pos.z];
-  const int n = folds[2 * pos.z + 1];
-  if (c >= channels || n <= 0 || lane < lane0 || lane >= lane0 + lanes) {
+  if (c >= channels) {
     return;
+  }
+  for (int f = 0; folds[2 * f + 1] > 0; ++f) {
+  const int lane = folds[2 * f];
+  const int n = folds[2 * f + 1];
+  if (lane < lane0 || lane >= lane0 + lanes) {
+    continue;
   }
   const device int* ids = slots + size_t(lane) * pie_state_pieces(map);
   if (ids[0] < 0) {
-    return;
+    continue;
   }
   const int hist = (conv_width - 1) * dilation + 1;
   const pie_state_column piece = pie_state_inner(map, ids, uint(c), uint(channels));
@@ -652,6 +658,7 @@ template <typename T>
   for (int s = 0; s < hist; ++s) {
     *reinterpret_cast<device float4*>(conv_state + piece.base + size_t(s) * piece.pitch +
                                       piece.col) = next[s];
+  }
   }
 }
 

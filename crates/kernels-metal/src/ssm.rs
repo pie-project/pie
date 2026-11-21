@@ -1601,9 +1601,11 @@ pub fn gated_delta_carried(
 }
 
 /// A fire's beam groups' folds (BEAM-PAGE-LISTS §11.3): `[lane, n]` a group,
-/// `count` of them, each folding the `n` rows every live beam shares into
-/// its set's state from its first fire lane `lane`'s buffer before the
-/// layer's step. That lane's page table row starts `n` rows past them.
+/// each folding the `n` rows every live beam shares into its set's state
+/// from its first fire lane `lane`'s buffer before the layer's step (that
+/// lane's page table row starts `n` rows past them). The folding groups lead
+/// the table and the first entry of no rows ends it: the kernels fold each
+/// in turn, so a fire with none launches nothing. `count` is how many fold.
 #[derive(Clone, Copy, Debug)]
 pub struct GroupFolds {
     pub table: Tensor,
@@ -1645,12 +1647,9 @@ pub fn gated_delta_group_fold(
             ),
         ));
     }
-    let z = v_heads
-        .checked_mul(folds.count)
-        .ok_or_else(|| refuse(OP, "the value heads of every group overflow a launch"))?;
     ctx.fire(
         Fire::at(GDN_SCAN_FILE, "gated_delta_group_fold_bfloat16").apply(Grid::of(
-            [GDN_SCAN_LANES, v_dim / GDN_GROUP_FOLD_VROWS, z],
+            [GDN_SCAN_LANES, v_dim / GDN_GROUP_FOLD_VROWS, v_heads],
             [GDN_SCAN_LANES, 1, 1],
         )),
         &[
@@ -1710,7 +1709,7 @@ pub fn causal_conv1d_group_fold(
     }
     ctx.fire(
         Fire::at("ssm/conv1d.metal", "causal_conv1d_group_fold_bfloat16").apply(Grid::of(
-            [channels / 4, 1, folds.count],
+            [channels / 4, 1, 1],
             [(channels / 4).min(CONV_VERIFY_CHANNELS * CONV_VERIFY_ROWS), 1, 1],
         )),
         &[

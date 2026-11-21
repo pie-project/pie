@@ -4743,7 +4743,17 @@ impl Shell {
                     fold,
                     lineage,
                 } => {
-                    let ahead = held_key.and_then(|key| self.frozen_ahead.get(&key).copied());
+                    // A beam group's set is folded by the runtime alone
+                    // (§11.3): its lanes read the length it states, and an
+                    // entry left on the record's slot by an earlier set
+                    // (a fold writes a fresh record) is dropped.
+                    let beam_lane = group_of[source].is_some();
+                    if beam_lane && let Some(key) = held_key {
+                        self.frozen_ahead.remove(&key);
+                    }
+                    let ahead = held_key
+                        .filter(|_| !beam_lane)
+                        .and_then(|key| self.frozen_ahead.get(&key).copied());
                     let folded = match ahead {
                         Some(ahead) if ahead > *folded => ahead,
                         _ => {

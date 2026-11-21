@@ -1232,8 +1232,10 @@ PIE_GDN_CARRIED(8, 16)
 // carried scan's commit, S <- g S + k u^T a row in turn, with each key
 // normed and each gate made as that scan makes them. That lane's page table
 // row starts `n` rows past them, so row `t` is its extended row `t - n`.
-// `folds` holds `[lane, n]` a group; one simdgroup of `VROWS` value rows of
-// one value head a threadgroup.
+// `folds` holds `[lane, n]` a group: the folding groups lead it and the
+// first entry of no rows ends it, each threadgroup folding every group in
+// turn. One simdgroup of `VROWS` value rows of one value head a
+// threadgroup.
 template <typename T, int VROWS>
 [[kernel]] void gated_delta_group_fold(
     const device int* folds     [[buffer(0)]],
@@ -1261,16 +1263,16 @@ template <typename T, int VROWS>
   constexpr int D = 128;
   constexpr int PER = D / 32;
   const int lane = int(lane_u);
-  const int hv = int(group.z) % v_heads;
-  const int f = int(group.z) / v_heads;
+  const int hv = int(group.z);
+  for (int f = 0; folds[2 * f + 1] > 0; ++f) {
   const int at_lane = folds[2 * f];
   const int n = folds[2 * f + 1];
-  if (n <= 0 || at_lane < lane0 || at_lane >= lane0 + lanes) {
-    return;
+  if (at_lane < lane0 || at_lane >= lane0 + lanes) {
+    continue;
   }
   const device int* ids = slots + size_t(at_lane) * pie_state_pieces(map);
   if (ids[0] < 0) {
-    return;
+    continue;
   }
   const device int* pages = page_table + size_t(at_lane) * page_ints;
   const int hk = hv / (v_heads / k_heads);
@@ -1314,6 +1316,7 @@ template <typename T, int VROWS>
   for (int v = 0; v < VROWS; ++v) {
     *reinterpret_cast<device float4*>(cells + size_t(v) * D + size_t(PER * lane)) =
         float4(st[v][0], st[v][1], st[v][2], st[v][3]);
+  }
   }
 }
 

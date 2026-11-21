@@ -781,7 +781,7 @@ impl Inputs {
             u64::from(kernels_metal::ssm::RS_SNAPSHOTS) * (bands.len().max(1) as u64 + width);
         let rs_snaps = take(lanes * snap_ints.max(u64::from(SNAP_INTS)) * 4);
         let rs_pages = take(lanes * u64::from(rs_page_ints) * 4);
-        let rs_folds = take(lanes * 2 * 4);
+        let rs_folds = take((lanes + 1) * 2 * 4);
         let mask_bytes = if ragged == 0 {
             0
         } else {
@@ -1083,7 +1083,10 @@ impl Inputs {
             });
         }
         if !fire.rs_folds.is_empty() {
-            self.store.write(self.rs_folds, bytes_of(fire.rs_folds))?;
+            // The folding groups, then the entry of no rows that ends them.
+            let mut table = fire.rs_folds.to_vec();
+            table.extend([0, 0]);
+            self.store.write(self.rs_folds, bytes_of(&table))?;
         }
 
         let adapter_routes = match fire.adapter_routes {
@@ -1664,7 +1667,7 @@ impl Inputs {
                         handles,
                         self.store.view(),
                         self.store.at(self.rs_folds),
-                        fire.rs_folds.len() as u32,
+                        fire.rs_folds.len() as u32 + 2,
                     )?,
                     fire.rs_folds.len() as u32 / 2,
                 ))
