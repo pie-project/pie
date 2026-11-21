@@ -108,6 +108,23 @@ impl ResidencyPlanner {
         None
     }
 
+    /// The refusal of `alone`, the most one unit of a fire takes on the
+    /// device at once (one KV working set's lanes: every page they read
+    /// and write, what they share counted, and their state's ask), where
+    /// it is past the whole device pool: no split of the fire and no move
+    /// of any other process makes it fit
+    /// ([`PlannerError::PastDevice`]). `None` for every unit that fits
+    /// alone, however short the pool is now.
+    pub fn past_device(&self, alone: Demand) -> Option<PlannerError> {
+        let (_, total) = self.port.device_stats();
+        let need = alone.kv_pages.saturating_add(self.port.rs_as_pages(alone.rs));
+        (need > total).then_some(PlannerError::PastDevice {
+            need,
+            total,
+            runs: None,
+        })
+    }
+
     pub async fn acquire(
         self: &Arc<Self>,
         pid: ProcessId,
