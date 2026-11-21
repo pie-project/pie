@@ -259,6 +259,9 @@ async fn main(input: Input) -> Result<String> {
     // (log-probability, target logit, largest logit), as its fires computed
     // them.
     let mut record: [Vec<Vec<f32>>; 3] = Default::default();
+    // Under `verify`, each decode fire's picks (tokens, parents), from which
+    // the search's own fires are replayed ([`replay_beam`]).
+    let mut trail: Vec<(Vec<i32>, Vec<u32>)> = Vec::new();
     if let Some((own, picked, largest)) = record_p {
         for (slot, channel) in record.iter_mut().zip([own, picked, largest]) {
             let got = channel
@@ -413,6 +416,9 @@ async fn main(input: Input) -> Result<String> {
                     fwd_r.submit(&pipeline)?;
                     let _ = out_r.take_host::<Vec<i32>>().await?;
                 }
+                if verify {
+                    trail.push((picked.clone(), parents.clone()));
+                }
                 if let Some((own, picked, largest)) = out_record {
                     for (slot, channel) in record.iter_mut().zip([own, picked, largest]) {
                         let got = channel
@@ -470,6 +476,9 @@ async fn main(input: Input) -> Result<String> {
                         .with_context(|| format!("@{step}"))?,
                     None => picked.clone(),
                 };
+                if verify {
+                    trail.push((picked.clone(), parents.clone()));
+                }
                 if let Some((own, picked, largest)) = out_record {
                     for (slot, channel) in record.iter_mut().zip([own, picked, largest]) {
                         let got = channel
@@ -599,9 +608,22 @@ async fn main(input: Input) -> Result<String> {
         // The most any step's log-probability moved between its 1-row and
         // its beam-width rescore (d_t).
         let mut drift = 0f32;
+        // The shape that measured the widest drift, and the widest the
+        // shapes other than the search's own measured.
+        let mut drift_by = "none";
+        let mut unshaped = 0f32;
+        let shaped = replay_beam(&prompt, &first, &trail, b).await?;
         for (lane, hypothesis) in hypotheses.iter().enumerate() {
-            let alone = rescore(&prompt, hypothesis, b).await?;
-            drift = drift.max(alone.iter().map(|s| s.drift).fold(0.0, f32::max));
+            // A search stopped short holds fewer steps than its hypotheses'
+            // last token (which no fire fed): the replay covers the fires.
+            let alone = rescore(&prompt, hypothesis, b, Some(&shaped[lane])).await?;
+            for s in &alone {
+                if s.drift > drift {
+                    drift = s.drift;
+                    drift_by = s.by;
+                }
+                unshaped = unshaped.max(s.unshaped);
+            }
             let mut before = 0f32;
             for (at, (&after, rescored)) in scored[lane].iter().zip(&alone).enumerate() {
                 // Bookkeeping, exact: the step a lane's score took is the
@@ -653,7 +675,7 @@ async fn main(input: Input) -> Result<String> {
             ));
         }
         format!(
-            " greedy_mismatches={greedy_mismatches} verified={} worst_apart={worst:.4} worst_own={closest_own:.3} worst_step={closest:.3} max_drift={drift:.4} closest: {closest_at}{}",
+            " greedy_mismatches={greedy_mismatches} verified={} worst_apart={worst:.4} worst_own={closest_own:.3} worst_step={closest:.3} max_drift={drift:.4} drift_by={drift_by} unshaped_drift={unshaped:.4} closest: {closest_at}{}",
             hypotheses.len(),
             identity.ties()
         )
@@ -762,14 +784,14 @@ async fn finish_check(
     };
     let mut forced = hypothesis.to_vec();
     forced.push(token);
-    let rescored = rescore(prompt, &forced, width).await?;
+    let rescored = rescore(prompt, &forced, width, None).await?;
     let want = rescored
         .last()
         .ok_or("the unbranched decode returned nothing")?;
     // The set's fire rounds its logits and log-probability as the beam's
     // fires do, and takes no candidate: a step's room with nothing carried.
-    let got = finite("the finished set's next-token score", got)?;
     let room = want.room(got, None);
+    let got = finite("the finished set's next-token score", got)?;
     let apart = (got - want.step).abs();
     if apart > room.total() {
         return Err(format!(
@@ -893,12 +915,16 @@ fn best_of(scores: &[f32]) -> f32 {
 }
 
 /// One step of a hypothesis rescored alone: its log-probability, its target
-/// and largest logit, and its drift between row counts.
+/// and largest logit, and its drift between compositions: the widest, the
+/// shape that measured it, and the widest the shapes other than the
+/// search's own ([`replay_beam`]) measured.
 struct Rescored {
     step: f32,
     picked: f32,
     largest: f32,
     drift: f32,
+    by: &'static str,
+    unshaped: f32,
 }
 
 /// The rounding a decode step's score carries over its own candidate's
@@ -949,17 +975,19 @@ impl Rescored {
             logits: ulp_bf16(self.picked) + ulp_bf16(self.largest),
             candidate,
             drift: 2.0 * self.drift,
+            by: self.by,
         }
     }
 }
 
 /// A step's room, by part ([`Rescored::room`]).
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct Room {
     log_prob: f32,
     logits: f32,
     candidate: f32,
     drift: f32,
+    by: &'static str,
 }
 
 impl Room {
@@ -972,12 +1000,14 @@ impl std::fmt::Display for Room {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{:.3} (log-probability {:.4}, logits {:.4}, candidate {:.4}, twice the drift {:.4})",
+            "{:.3} (log-probability {:.4}, logits {:.4}, candidate {:.4}, twice the drift {:.4}, \
+             by the {} shape)",
             self.total(),
             self.log_prob,
             self.logits,
             self.candidate,
-            self.drift
+            self.drift,
+            self.by
         )
     }
 }
@@ -1107,7 +1137,7 @@ async fn check_groups(prompt: &[u32], b: u32, groups: u32, device: bool) -> Resu
 
         for beam in 0..lanes {
             let token = u32::try_from(first[beam]).map_err(|_| "a negative token")?;
-            let alone = rescore(prompt, &[token, tops[beam]], b).await?;
+            let alone = rescore(prompt, &[token, tops[beam]], b, None).await?;
             let want = &alone[1];
             for (what, got, from) in [
                 ("log-probability", own[beam], want.step),
@@ -1145,11 +1175,41 @@ async fn check_groups(prompt: &[u32], b: u32, groups: u32, device: bool) -> Resu
 /// drift from it. A recurrent layer read through a long unfolded run is
 /// another computation from one folded every step, and the gap grows with
 /// the run (Qwen3.5: up to 0.375 at log-probability -7 by step 255, with
-/// row counts alone drifting 0 there).
-async fn rescore(prompt: &[u32], hypothesis: &[u32], width: u32) -> Result<Vec<Rescored>> {
+/// row counts alone drifting 0 there). Where the search's own fires were
+/// replayed (`shaped`, from [`replay_beam`]: every lane of every fire at its
+/// width and parents, reordered by the parents the search reported), the
+/// drift is the wider of the two.
+///
+/// The beam-shaped drift is measured on the search's own fire shapes, so it
+/// absorbs whatever those shapes compute deterministically: a kernel fault
+/// that a W-wide fire reproduces on every run widens the room by what it
+/// moves, and passes as composition. The host-stated parents catch parent
+/// and bookkeeping faults, not those; a W-shape kernel fault shows only
+/// against the width copies. The report names the shape that set the widest
+/// drift (`drift_by`) and the widest the width copies measured
+/// (`unshaped_drift`), so a room held open by the beam-shaped replay alone
+/// is visible.
+async fn rescore(
+    prompt: &[u32],
+    hypothesis: &[u32],
+    width: u32,
+    shaped: Option<&[(f32, f32, f32)]>,
+) -> Result<Vec<Rescored>> {
     let one = teacher_forced(prompt, hypothesis, 1, Fold::All).await?;
     let wide = teacher_forced(prompt, hypothesis, width, Fold::None).await?;
-    for (name, pass) in [("1-row", &one), ("width", &wide)] {
+    let shaped = shaped.unwrap_or(&[]);
+    if shaped.len() > one.len() {
+        return Err(format!(
+            "the beam-shaped replay holds {} steps of a {}-step hypothesis",
+            shaped.len(),
+            one.len()
+        ));
+    }
+    for (name, pass) in [
+        ("1-row", &one[..]),
+        ("width-copies", &wide[..]),
+        ("beam-shaped", shaped),
+    ] {
         for (at, &(step, picked, largest)) in pass.iter().enumerate() {
             for value in [step, picked, largest] {
                 finite(&format!("the {name} rescore at step {at}"), value)?;
@@ -1159,13 +1219,187 @@ async fn rescore(prompt: &[u32], hypothesis: &[u32], width: u32) -> Result<Vec<R
     Ok(one
         .iter()
         .zip(&wide)
-        .map(|(&(step, picked, largest), &(paired, ..))| Rescored {
-            step,
-            picked,
-            largest,
-            drift: (step - paired).abs(),
+        .enumerate()
+        .map(|(at, (&(step, picked, largest), &(paired, ..)))| {
+            let unshaped = (step - paired).abs();
+            let (drift, by) = match shaped.get(at) {
+                Some(&(own, ..)) if (step - own).abs() > unshaped => {
+                    ((step - own).abs(), "beam-shaped")
+                }
+                _ => (unshaped, "width-copies"),
+            };
+            Rescored {
+                step,
+                picked,
+                largest,
+                drift,
+                by,
+                unshaped,
+            }
         })
         .collect())
+}
+
+/// The search's own fires again, teacher-forced from the picks it reported:
+/// the prompt prefilled folding on a working set of its own, then each
+/// decode fire as the search ran it (one pass over a [`BeamGroup`] of its
+/// width, so the engine keeps its page lists as the search's did), each
+/// fire reordered by the parents the search reported rather than the ones
+/// its epilogue picked. Each pick's log-probability, target logit and parent
+/// row's largest logit, followed along each final lane's ancestry as the
+/// search's record is. A fire whose rows moved only with its composition
+/// (its width, row count and kernels) moves here alike; a lane that read
+/// pages outside its ancestry does not, as these lists hold none of them.
+async fn replay_beam(
+    prompt: &[u32],
+    first: &[i32],
+    trail: &[(Vec<i32>, Vec<u32>)],
+    b: u32,
+) -> Result<Vec<Vec<(f32, f32, f32)>>> {
+    let v = model::output_vocab_size();
+    let n = u32::try_from(prompt.len()).map_err(|_| "a prompt past u32 rows")?;
+    let lanes = b as usize;
+    let fires = u32::try_from(trail.len()).map_err(|_| "a search past u32 fires")?;
+    for (fire, (tokens, parents)) in trail.iter().enumerate() {
+        if tokens.len() != lanes || parents.len() != lanes {
+            return Err(format!(
+                "fire {fire} reported {} picks of width {b}",
+                tokens.len()
+            ));
+        }
+        if let Some(&bad) = parents.iter().find(|&&p| p >= b) {
+            return Err(format!("fire {fire} reported parent {bad} at width {b}"));
+        }
+    }
+    let ws = WorkingSet::new();
+    let pipeline = Pipeline::new();
+    let drain = async |c: Channel| -> Result<Vec<f32>> {
+        let got = c
+            .take_host::<Vec<f32>>()
+            .await
+            .context("beam replay drain")?;
+        if got.len() == lanes {
+            Ok(got)
+        } else {
+            Err(format!(
+                "the beam replay returned {} of {lanes} rows",
+                got.len()
+            ))
+        }
+    };
+
+    let fed: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
+    let wanted = Channel::from(first);
+    let (own, picked, largest) = (
+        Channel::new([b], dtype::f32),
+        Channel::new([b], dtype::f32),
+        Channel::new([b], dtype::f32),
+    );
+    let fwd_p = ForwardPass::new();
+    fwd_p.embed(&Channel::from(&fed[..]), &Channel::from([0u32, n]))?;
+    fwd_p
+        .state(&[&ws], StateGeometry::folding())
+        .context("bind the beam replay's prefill")?;
+    fwd_p.epilogue(move || {
+        let logits = cast(reshape(intrinsics::output(0, "logits"), [v]), dtype::bf16);
+        let wanted = wanted.take();
+        own.put(cast(gather(log_softmax(&logits), &wanted), dtype::f32));
+        picked.put(cast(gather(&logits, &wanted), dtype::f32));
+        largest.put(broadcast(
+            reshape(cast(reduce_max(&logits), dtype::f32), [1]),
+            [b],
+        ));
+    });
+    fwd_p.submit(&pipeline).context("beam replay submit")?;
+    let (o, p, l) = (
+        drain(own).await?,
+        drain(picked).await?,
+        drain(largest).await?,
+    );
+    let mut rows: Vec<Vec<(f32, f32, f32)>> =
+        (0..lanes).map(|j| vec![(o[j], p[j], l[j])]).collect();
+    if fires == 0 {
+        pipeline.close();
+        return Ok(rows);
+    }
+
+    // Every fire's reported picks, laid out a row a fire for the epilogue to
+    // read its own by the fire count: the flat pick (parent row, token) it
+    // reads its values at, the parents it reorders by, and the next fire's
+    // tokens.
+    let at: Vec<u32> = trail
+        .iter()
+        .flat_map(|(tokens, parents)| {
+            parents
+                .iter()
+                .zip(tokens)
+                .map(|(&p, &t)| p * v + t as u32)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let all_parents: Vec<u32> = trail.iter().flat_map(|(_, p)| p.iter().copied()).collect();
+    let all_tokens: Vec<i32> = trail.iter().flat_map(|(t, _)| t.iter().copied()).collect();
+    let at = Channel::from(at);
+    let all_parents = Channel::from(all_parents);
+    let all_tokens = Channel::from(all_tokens);
+    let count = Channel::from([0u32]);
+    let toks = Channel::from(first);
+    // Rings, as the search's own: the fires run ahead of the host's drains.
+    let ring = || Channel::new([b], dtype::f32).capacity(channel_capacity() as u32);
+    let (own, picked, largest) = (ring(), ring(), ring());
+    let group = BeamGroup::new(&ws, b, n, fires).context("reserve the beam replay's pages")?;
+    let fwd = ForwardPass::new();
+    fwd.embed(&toks, &Channel::from_iter(0u32..=b))?;
+    fwd.state(&vec![&ws; lanes], group.geometry())
+        .context("bind the beam replay's page lists")?;
+    fwd.epilogue(move || {
+        let logits = cast(
+            reshape(intrinsics::output(0, "logits"), [b, v]),
+            dtype::bf16,
+        );
+        let lsm = log_softmax(&logits);
+        let flat = reshape(&logits, [b * v]);
+        let fire = count.take();
+        let mine = broadcast(reshape(&fire, [1]), [b]) * b + iota(b);
+        let top = cast(reduce_argmax(&logits), dtype::u32);
+        // Zero, read off this fire's own rows: the next fire's tokens and
+        // parents depend on the fire as the search's do, so the replay's
+        // geometry is the search's class (device-resolved, run ahead), not
+        // one the host derives from the tables and resolves fire by fire.
+        // (an argmax is below the vocabulary).
+        let zero = &top / v;
+        let wanted = gather(at.read(), &mine);
+        let parent = gather(all_parents.read(), &mine) + &zero;
+        own.put(cast(gather(reshape(&lsm, [b * v]), &wanted), dtype::f32));
+        picked.put(cast(gather(&flat, &wanted), dtype::f32));
+        let tops = gather(&flat, iota(b) * v + &top);
+        largest.put(cast(gather(&tops, &parent), dtype::f32));
+        // The next fire's tokens are this fire's reported picks; past the
+        // last fire none is read.
+        toks.put(gather(all_tokens.read(), &mine) + cast(&zero, dtype::i32));
+        count.put(&fire + 1u32);
+        group.reorder(&parent);
+    });
+    let mut fire = 0usize;
+    run_ahead(&pipeline, &fwd, trail.len(), async || {
+        let (o, p, l) = (
+            drain(own).await?,
+            drain(picked).await?,
+            drain(largest).await?,
+        );
+        let step: Vec<(f32, f32, f32)> = (0..lanes).map(|j| (o[j], p[j], l[j])).collect();
+        rows = advance(&rows, &step, &trail[fire].1)?;
+        fire += 1;
+        Ok(ControlFlow::Continue(()))
+    })
+    .await
+    .context("the beam replay's fires")?;
+    // Its finish reads the lists its group's steps left: a group whose
+    // fires ran without its steps (its lanes as plain lanes on one set) is
+    // refused here by name, not measured.
+    fwd.adopt_beam(0, n + fires)
+        .context("the beam replay's group ran no step of its own")?;
+    Ok(rows)
 }
 
 /// Each step's log-probability of `hypothesis` after `prompt`, its target
