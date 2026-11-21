@@ -18,6 +18,16 @@ struct CarryLane {
 
 static_assert(sizeof(CarryLane) == 20, "CarryLane: `channel::RsLane` mirrors this layout");
 
+// A beam group's fold (BEAM-PAGE-LISTS §11.3): its representative lane, where
+// its fold rows start in the replay table, and how many (none folds nothing).
+struct GroupFold {
+    u32 lane;
+    u32 fold_off;
+    u32 rows;
+};
+
+static_assert(sizeof(GroupFold) == 12, "GroupFold: `ssm::GroupFold` mirrors this layout");
+
 constexpr u32 CARRY_NONE = 0xffffffffu;
 
 // A decode step's carried rows (the Rust `ssm::Carry`): the rows a lane
@@ -81,6 +91,15 @@ struct Carry {
     // what `plane_at` reads any plane of the row from.
     __device__ __forceinline__ void carried_at(const CarryLane& l, int j, u64& slot, u32& tok) const {
         const u32 t = replay_tok[l.replay_off + j];
+        slot = pages[l.page_off + t / page_tokens];
+        tok = t % page_tokens;
+    }
+
+    // The page slot of a beam group's j-th fold row (BEAM-PAGE-LISTS §11.3)
+    // and its token in it: its slot `replay_tok[fold_off + j]`, read through
+    // the group's representative lane's rs pages as a carried row is.
+    __device__ __forceinline__ void fold_at(const CarryLane& l, u32 fold_off, int j, u64& slot, u32& tok) const {
+        const u32 t = replay_tok[fold_off + static_cast<u32>(j)];
         slot = pages[l.page_off + t / page_tokens];
         tok = t % page_tokens;
     }

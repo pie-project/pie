@@ -505,3 +505,56 @@ fn conv1d_carried(
         &args,
     )
 }
+
+/// Folds each beam group's fold rows (`BEAM-PAGE-LISTS.md` §11.3, plane 0 of
+/// `carry`: the rows' conv inputs, through the group's representative lane's
+/// pages) into its conv window: the window stored as it stands after them.
+/// The groups that fold lead `folds` (`groups` entries at most, the first of
+/// no rows ending them); a block folds each in turn, so a fire none of whose
+/// groups folds costs one read a block.
+#[allow(clippy::too_many_arguments)]
+pub fn conv1d_fold(
+    ctx: &Ctx,
+    state: &RecurrentPool,
+    channels: u32,
+    conv_width: u32,
+    dilation: u32,
+    carry: &Carry,
+    folds: Tensor,
+    groups: u32,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.causal_conv1d group fold";
+    const BLOCK: u32 = 256;
+    if groups == 0 {
+        return Ok(());
+    }
+    let span = conv_width
+        .checked_sub(1)
+        .and_then(|k| k.checked_mul(dilation))
+        .and_then(|cells| cells.checked_add(1))
+        .unwrap_or(u32::MAX);
+    if span > CONV_K_MAX {
+        return Err(refuse(
+            OP,
+            format!(
+                "a {conv_width}-tap conv dilated {dilation} keeps {span} cells, past the \
+                 {CONV_K_MAX} a fold holds"
+            ),
+        ));
+    }
+    let channels = nonzero(OP, "the conv's channel count", channels)?;
+    let rows = state.rows(OP, state.conv_slab, state.conv_stride, channels)?;
+    ctx.fire(
+        OP,
+        Fire::at(kernel(CONV1D, "::pie::ssm::conv1d_fold<::pie::bf16>"))
+            .apply(Launch::grid([channels.div_ceil(BLOCK), 1, 1], [BLOCK, 1, 1])),
+        &[
+            rows.arg(),
+            stated(OP, channels)?.arg(),
+            stated(OP, span)?.arg(),
+            carry.arg(),
+            folds.arg(),
+            stated(OP, groups)?.arg(),
+        ],
+    )
+}

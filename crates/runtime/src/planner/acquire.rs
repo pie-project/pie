@@ -474,7 +474,12 @@ impl ResidencyPlanner {
                 // Left parked, nothing queues it, and the wait never ends
                 // (the M1 / M5 stress: the earliest admitted sat evicted
                 // with no restore queued once the rest drained).
-                let demand = (proc.state == Residency::Evicted)
+                // Held below the schedule's floor (or seatless, its seat
+                // vacated for one the schedule chose), it stays parked
+                // until the policy lifts it ([`super::inner::Inner::reschedule`] queues
+                // its restore then): its own lanes waiting to run are no
+                // lift, nor is room standing free.
+                let demand = (proc.state == Residency::Evicted && !proc.held && !proc.seatless)
                     .then(|| proc.parked.take())
                     .flatten();
                 let signal = proc.signal.clone();
