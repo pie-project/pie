@@ -136,6 +136,32 @@ impl Context {
         match self.never {}
     }
 
+    pub fn spanned(&self) -> Result<Frame> {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn idle(&self) -> bool {
+        match self.never {}
+    }
+
+    pub fn spanned_kept(&self) -> Result<Frame> {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn writes_timestamps(&self) -> bool {
+        match self.never {}
+    }
+
+    pub fn stamps(&self) -> Result<Stamps> {
+        match self.never {}
+    }
+
+    pub fn spanned_into(&self, _stamps: &Stamps, _keep: bool) -> Result<Frame> {
+        match self.never {}
+    }
+
     pub fn frame_kept(&self) -> Result<Frame> {
         match self.never {}
     }
@@ -144,6 +170,9 @@ impl Context {
 pub struct Frame {
     never: std::convert::Infallible,
 }
+
+#[derive(Clone, Debug)]
+pub enum Stamps {}
 
 impl Frame {
     pub fn flush_settled(&self) -> Result<()> {
@@ -173,6 +202,10 @@ impl Frame {
     }
 
     pub fn commit_timed(self) -> Result<f64> {
+        match self.never {}
+    }
+
+    pub fn commit_spanned(self) -> Result<Option<u64>> {
         match self.never {}
     }
 
@@ -207,6 +240,10 @@ impl Frame {
     pub fn into_kept(self) -> Result<Kept> {
         match self.never {}
     }
+
+    pub fn into_kept_spanned(self) -> Result<Kept> {
+        match self.never {}
+    }
 }
 
 #[derive(Debug)]
@@ -217,6 +254,10 @@ pub struct Kept {
 impl Kept {
     #[must_use]
     pub fn cuts(&self) -> usize {
+        match self.never {}
+    }
+
+    pub fn replay_spanned(&self) -> Result<Option<u64>> {
         match self.never {}
     }
 
@@ -244,6 +285,10 @@ impl Pending {
     }
 
     pub fn wait(&self) -> Result<()> {
+        match self.never {}
+    }
+
+    pub fn span_ns(&self) -> Result<Option<u64>> {
         match self.never {}
     }
 }

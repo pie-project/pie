@@ -79,6 +79,13 @@ pub(crate) fn symbolic_result_type(
             ty.dtype = value_type.dtype;
             ty
         }
+        Op::GumbelArgmax { .. } => {
+            let logits = mapped_op.operands()[0];
+            let mut ty = normalized_types[logits as usize].clone();
+            ty.dims.pop();
+            ty.dtype = value_type.dtype;
+            ty
+        }
         Op::Transpose(value) => {
             let mapped = mapped_value(mapped_op, *value);
             let mut ty = normalized_types[mapped as usize].clone();

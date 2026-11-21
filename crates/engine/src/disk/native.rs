@@ -209,6 +209,31 @@ mod tests {
     }
 
     #[test]
+    fn a_span_reads_back_what_was_written_and_stays_aligned_within_the_slots() {
+        let dir = std::env::temp_dir().join(format!("pie-slot-span-{}", std::process::id()));
+        let file = SlotFile::open(&dir, "r0.state", 3 * 4096, 2 * 3 * 4096)
+            .unwrap()
+            .unwrap();
+        let mut stage = Aligned::zeroed(2 * 4096);
+        stage
+            .as_mut_slice()
+            .iter_mut()
+            .enumerate()
+            .for_each(|(i, b)| *b = (i * 7) as u8);
+        // Across the boundary of slots 0 and 1.
+        file.write_span(2 * 4096, stage.as_slice()).unwrap();
+        let mut back = Aligned::zeroed(2 * 4096);
+        file.read_span(2 * 4096, back.as_mut_slice()).unwrap();
+        assert_eq!(back.as_slice(), stage.as_slice());
+        // Unaligned, short, or past the slots: refused.
+        assert!(file.read_span(100, back.as_mut_slice()).is_err());
+        assert!(file.read_span(0, &mut back.as_mut_slice()[..100]).is_err());
+        assert!(file.read_span(5 * 4096, back.as_mut_slice()).is_err());
+        drop(file);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn a_kept_file_holds_its_slots_across_opens_until_its_layout_or_size_changes() {
         let dir = std::env::temp_dir().join(format!("pie-slot-kept-{}", std::process::id()));
         let mut stage = Aligned::zeroed(8192);

@@ -98,12 +98,11 @@ fn agrees(name: &str, trace: &Trace) -> usize {
         assert_eq!(row.planes.len(), 1, "{name}: lone conv {} buffers its input alone", conv.node);
         let plane = layout.planes[layout.in_of[&conv.x.0]];
         assert_eq!(recipe.rs.run(*id).unwrap().per_token, plane.row_bytes);
-        let lanes = 4;
         let rows_ext = 32;
+        let (_, _, planes) = layout.pack(rows_ext);
         assert!(
-            engine_gpu::rs::Seat::scratch_bytes(&layout, rows_ext, lanes)
-                >= u64::from(rows_ext) * plane.row_bytes,
-            "{name}: the seat's scratch extends the lone conv's rows"
+            planes >= u64::from(rows_ext) * plane.row_bytes,
+            "{name}: the seat's planes extend the lone conv's rows"
         );
     }
     let mut lone_states: Vec<u32> = lone.iter().map(|conv| conv.state.0).collect();

@@ -250,6 +250,14 @@ fn no_disk() -> Fault {
 }
 
 /// A fire the warm ladder traced and has not compiled yet.
+/// A warm program the load compiled and parked in the disk cache (the host
+/// held no more in memory): what the first fire of its shape loads it from.
+pub(crate) struct Parked {
+    text: String,
+    sig: crate::trace::Signature,
+    probed: Vec<ValueId>,
+}
+
 pub(crate) struct Deferred {
     key: [u8; 32],
     shape_key: Option<[u8; 32]>,
@@ -283,6 +291,13 @@ pub struct Shell {
     /// A fire on scratch slots every lane shares (the warm ladder's): what it
     /// writes is never read back, so its rows may lay a page in two runs.
     pub(crate) scratch_fire: bool,
+    /// The fire being traced is a mixed one the load states laid
+    /// (`Shell::mixed_lanes`): a program missing for it after the ladder
+    /// fails the fire by name, never compiles on its path.
+    laid_mixed: bool,
+    /// The fire limits the load stated beside its mixed lanes
+    /// (`Capabilities::limits`), as the runtime's cutter reads them.
+    stated_limits: Option<engine::FireLimits>,
     /// The stage-only pass (`size`): a fire stops once its inputs are
     /// staged, before anything is traced, leaving their rows here.
     sizing: Option<u32>,
@@ -295,6 +310,11 @@ pub struct Shell {
     /// The outputs the plan's classes write, and per class the one its
     /// lanes read back to the host: the last float row or voxel output.
     exports: Vec<poem_exec::feeds::ClassOutput>,
+    /// Per export, whether a matmul writes every value of it: v6e's matmul
+    /// flushes denormal results, so such a plane holds none, and a guest
+    /// stage reading it rounds it to bf16 without the denormal form
+    /// (`readout::Plane::normal`, `guest::lower::Lower::denormal`).
+    normal_exports: Vec<bool>,
     readback: Vec<Option<usize>>,
     dit: crate::dit::Dit,
     rs_layout: Option<std::sync::Arc<crate::rs::Layout>>,
@@ -324,6 +344,14 @@ pub struct Shell {
     /// windows, lane counts and input shapes, not how its rows fall to its
     /// lanes, which reach the program only as input values.
     shaped: std::collections::HashMap<[u8; 32], std::sync::Arc<crate::device::Program>>,
+    /// The warm programs parked in the disk cache, by full key, and their
+    /// shape keys: a fire of a parked shape loads its program from the
+    /// disk (`Device::load_parked`), a load and not a build.
+    parked: std::collections::HashMap<[u8; 32], Parked>,
+    /// The host memory the load holds compiled programs in, where it states
+    /// one (`engine::Residency::host_programs`); `None` the host's free.
+    host_programs: Option<u64>,
+    parked_shapes: std::collections::HashMap<[u8; 32], [u8; 32]>,
     /// While the warm ladder traces (`warm.rs`): fires whose program is new
     /// are traced, kept here and not run, and compiled together after.
     deferred: Option<Vec<Deferred>>,
@@ -426,7 +454,7 @@ impl Shell {
     /// program's registration compiles each stage for them
     /// (`Stages::compile_all`). An output no ring holds lands no plane.
     #[must_use]
-    pub fn guest_planes(&self) -> Vec<(String, u32, u32, u32, bool, Dtype)> {
+    pub fn guest_planes(&self) -> Vec<(String, u32, u32, u32, bool, Dtype, bool)> {
         (self.readout_specs.iter())
             .flat_map(|spec| {
                 spec.exports.iter().map(|&export| {
@@ -438,6 +466,7 @@ impl Shell {
                         decl.layers,
                         decl.readout,
                         spec.dtype,
+                        self.normal_exports[export],
                     )
                 })
             })
@@ -983,6 +1012,14 @@ impl Shell {
 
         let exports = poem_exec::feeds::class_outputs(&boot.trace, &compiled, boot.context, boot.page_size)
             .map_err(|why| Fault::Unbound { what: why })?;
+        let normal_exports = normal_exports(&boot.trace, &exports);
+        tracing::info!(
+            planes = ?(exports.iter().zip(&normal_exports))
+                .filter(|(_, n)| **n)
+                .map(|(e, _)| e.decl.name.as_str())
+                .collect::<Vec<_>>(),
+            "xla readout planes a matmul writes, free of denormals"
+        );
         if exports.is_empty() {
             return Err(Fault::Unbound {
                 what: "no output, so a fire would compute nothing a reader can take".to_string(),
@@ -1104,10 +1141,13 @@ impl Shell {
             fire_streamed: None,
             stage_all: false,
             scratch_fire: false,
+            laid_mixed: false,
+            stated_limits: None,
             sizing: None,
             staging_facts: staging_facts.clone(),
             host: crate::store::tier::Host::default(),
             disk: None,
+            normal_exports,
             exports,
             readback,
             dit,
@@ -1129,6 +1169,9 @@ impl Shell {
             probed: std::collections::HashMap::new(),
             traced: std::collections::HashMap::new(),
             shaped: std::collections::HashMap::new(),
+            parked: std::collections::HashMap::new(),
+            host_programs: None,
+            parked_shapes: std::collections::HashMap::new(),
             deferred: None,
             readouts: std::collections::BTreeSet::new(),
             laddered: false,
@@ -1691,6 +1734,43 @@ impl Shell {
         fired
     }
 
+    /// The program of a shape the warm ladder parked in the disk cache, by
+    /// the fire's shape key or full key, loaded and held as a laid one is;
+    /// `None` for a shape it did not park. Gone from the disk (the cache
+    /// cleared under the load), refused by name.
+    /// The host memory the warm ladder holds compiled programs in
+    /// (`engine::Residency::host_programs`), set before it runs.
+    pub fn set_host_programs(&mut self, bytes: Option<u64>) {
+        self.host_programs = bytes;
+    }
+
+    fn load_parked(
+        &mut self,
+        shape_key: Option<[u8; 32]>,
+        key: Option<[u8; 32]>,
+    ) -> Result<Option<std::sync::Arc<crate::device::Program>>> {
+        let at = shape_key
+            .and_then(|k| self.parked_shapes.get(&k).copied())
+            .or(key.filter(|k| self.parked.contains_key(k)));
+        let Some(at) = at else {
+            return Ok(None);
+        };
+        let Some(parked) = self.parked.remove(&at) else {
+            return Ok(None);
+        };
+        let Some(program) = self.device.load_parked(&parked.text, parked.sig)? else {
+            return Err(Fault::Program {
+                at: "serve::ladder",
+                why: "a program the warm ladder parked in the disk cache is gone from it: the \
+                      cache was cleared under the load"
+                    .to_string(),
+            });
+        };
+        self.probed.insert(at, parked.probed);
+        self.traced.insert(at, std::sync::Arc::clone(&program));
+        Ok(Some(program))
+    }
+
     pub fn fire_full(&mut self, lanes: &[Seated<'_>]) -> Result<Fired> {
         self.fire_full_with(lanes, &[])
     }
@@ -1724,6 +1804,22 @@ impl Shell {
             return Ok(Fired::default());
         }
         let real_rows: u32 = lanes.iter().map(|s| s.lane.tokens.len() as u32).sum();
+        // A mixed fire the load states laid, counted as the runtime's cutter
+        // counts it (a prompt a lane of more than one row, a decode one).
+        let (prompts, prompt_rows) = lanes
+            .iter()
+            .filter(|s| s.lane.tokens.len() > 1)
+            .fold((0u32, 0u32), |(n, r), s| {
+                (n + 1, r + s.lane.tokens.len() as u32)
+            });
+        let decodes = lanes.iter().filter(|s| s.lane.tokens.len() == 1).count() as u32;
+        self.laid_mixed = prompts > 0
+            && decodes > 0
+            && clips.is_empty()
+            && self.stated_limits.is_some_and(|limits| {
+                self.mixed_lanes()
+                    .fits(&limits, prompts, prompt_rows, decodes)
+            });
         let decode = lanes.iter().all(|s| s.lane.tokens.len() == 1);
         if !decode
             && clips.is_empty()
@@ -1824,6 +1920,36 @@ impl Shell {
             .filter(|&d| d <= top && pad.rung(d) == d)
             .max()
             .unwrap_or(1)
+    }
+
+    /// The mixed fires the load lays, as the runtime's cutter reads them
+    /// (`engine::MixedLanes`): each prompt lane rung from the mixed host rung
+    /// up, with the decode lanes beside it (`mixed_decode_lanes`), the
+    /// pairs the warm ladder lays.
+    pub fn mixed_lanes(&self) -> engine::MixedLanes {
+        let pad = self.pad;
+        let max = self.budgets.tokens.max_lanes;
+        let mut rungs = Vec::new();
+        let mut p = pad.mixed_host_rung;
+        while p < max {
+            let d = self.mixed_decode_lanes(p);
+            if d == 0 {
+                break;
+            }
+            rungs.push(engine::MixedRung {
+                prompt_lanes: p,
+                decode_lanes: d,
+            });
+            p = pad.next(p);
+        }
+        engine::MixedLanes::Laid(rungs)
+    }
+
+    /// Holds the fire limits the load stated (`Capabilities::limits`): a
+    /// mixed fire within them and [`Self::mixed_lanes`] is one the load
+    /// states laid.
+    pub fn state_limits(&mut self, limits: engine::FireLimits) {
+        self.stated_limits = Some(limits);
     }
 
     /// The decode lanes beside `prompt_lanes` prompt lanes (their rung, the
@@ -3022,6 +3148,11 @@ impl Shell {
                 ..Fired::default()
             });
         }
+        // a shape the ladder parked in the disk cache: loaded, not built
+        let found = match found {
+            Some(program) => Some(program),
+            None => self.load_parked(shape_key, key)?,
+        };
         let program = match found {
             Some(program) => program,
             None => {
@@ -3568,6 +3699,7 @@ impl Shell {
                     out.decl.layers,
                     plane.dtype,
                 )
+                .with_normal(self.normal_exports[plane.export])
             })
             .collect();
         Some(std::sync::Arc::new(crate::readout::Kept {
@@ -3793,6 +3925,15 @@ impl Shell {
                 descriptor.lanes.len()
             )
         };
+        if self.laddered && self.laid_mixed && !self.device.holds(&text) {
+            return Err(Fault::Program {
+                at: "serve::mixed_lanes",
+                why: format!(
+                    "a mixed fire the load states laid ({}) has no program from the warm ladder",
+                    fire()
+                ),
+            });
+        }
         Ok((self.device.program_for(&text, sig, &fire)?, probed))
     }
 
@@ -4524,4 +4665,25 @@ mod append_runs_tests {
             .to_string();
         assert!(why.contains("not the next offset"), "{why}");
     }
+}
+
+/// Per export, whether every value of it is a matmul's result
+/// (`Operation::Linear`): v6e's matmul flushes denormal results to zero,
+/// so such a plane holds no denormal. Any other writer (an elementwise
+/// op, a gather, a transcendental) leaves it as one that may.
+fn normal_exports(trace: &poem_ir::Trace, exports: &[poem_exec::feeds::ClassOutput]) -> Vec<bool> {
+    use poem_ir::Operands;
+    let mut linear = std::collections::HashSet::new();
+    let mut outs = Vec::new();
+    for node in &trace.nodes {
+        if matches!(node.op, poem_ir::Operation::Linear(_)) {
+            outs.clear();
+            node.op.outputs(&mut outs);
+            linear.extend(outs.iter().copied());
+        }
+    }
+    exports
+        .iter()
+        .map(|e| !e.values.is_empty() && e.values.iter().all(|v| linear.contains(v)))
+        .collect()
 }

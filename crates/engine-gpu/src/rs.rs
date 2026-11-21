@@ -6,7 +6,7 @@ use engine::rs::{LanePlan, Run};
 use kernels_slang::{Segments, Tensor};
 use poem_ir::{Def, Dim, Dtype, Gather, Operation, Ssm, Trace, Ty, ValueId};
 
-use crate::backend::Backend;
+use crate::backend::{Backend, Buffer as _};
 use crate::error::{Fault, Result};
 use crate::handles::Handles;
 
@@ -53,6 +53,10 @@ pub struct Layout {
 
     pub work_elems: u64,
 
+    /// The heads of the scan whose work is widest: a committed dispatch's
+    /// workgroups are its lanes times these.
+    pub work_heads: u32,
+
     /// Each plane's life over the trace's nodes, first and last: a plane is
     /// read only by the ops that extend its value.
     pub plane_life: Vec<(usize, usize)>,
@@ -61,9 +65,68 @@ pub struct Layout {
     pub region_life: Vec<(usize, usize)>,
 }
 
-/// A rung's room for a seat's planes ([`crate::arena::Span::rs_room`]):
-/// the span's buffer, the room's first byte in it, and its rows and lanes.
-pub type Room<'a, B> = (&'a <B as Backend>::Buffer, u64, u32, u32);
+/// A load's recurrent planes and work plane: per-fire temporaries, laid
+/// once at load in reservations of their own, not in the activation span.
+/// The span is one binding's range, which a phone holds to as little as
+/// 1 GiB; the planes (for the top rung's tokens of own rows and as many
+/// carried, `engine::fire::ActivationRows`) and the work plane (a state a
+/// lane, for the top rung's lanes) beside its carve would push the top rung
+/// past it. Each is a binding of its own; one past a binding is refused by
+/// name at load.
+pub struct Reservation<B: Backend> {
+    planes: B::Buffer,
+    rows: u32,
+    work: B::Buffer,
+    lanes: u32,
+}
+
+impl<B: Backend> Reservation<B> {
+    /// The planes for `rows` extended rows, packed by their lives, and the
+    /// work plane for `lanes` lanes, each within `binding` bytes.
+    pub fn lay(
+        device: &B::Context,
+        layout: &Layout,
+        rows: u32,
+        lanes: u32,
+        binding: u64,
+    ) -> Result<Reservation<B>> {
+        let (_, _, planes) = layout.pack(rows);
+        let work = (u64::from(lanes.max(1)) * layout.work_elems * 4)
+            .max(4)
+            .next_multiple_of(256);
+        for (what, need) in [
+            (
+                "bytes of the recurrent planes for the top rung's rows",
+                planes,
+            ),
+            (
+                "bytes of the recurrent work plane for the top rung's lanes",
+                work,
+            ),
+        ] {
+            if need > binding {
+                return Err(Fault::Ceiling {
+                    what,
+                    need,
+                    have: binding,
+                });
+            }
+        }
+        tracing::info!(
+            planes_bytes = planes,
+            rows,
+            work_bytes = work,
+            work_lanes = lanes.max(1),
+            "the recurrent planes and work plane, each a reservation of its own"
+        );
+        Ok(Reservation {
+            planes: B::Buffer::zeroed(device, planes.max(256), crate::books::owners::RS_WORK)?,
+            rows,
+            work: B::Buffer::zeroed(device, work, crate::books::owners::RS_WORK)?,
+            lanes: lanes.max(1),
+        })
+    }
+}
 
 /// `life` widened to hold `node`.
 fn live(life: &mut (usize, usize), node: usize) {
@@ -226,9 +289,11 @@ impl Layout {
                     let _ = k_heads;
                     gates_cache.insert(gates.0, cache);
                     region(&mut layout, cache, "scan", *y, at)?;
-                    layout.work_elems = layout
-                        .work_elems
-                        .max(u64::from(*v_heads) * u64::from(*v_dim) * u64::from(*k_dim));
+                    let elems = u64::from(*v_heads) * u64::from(*v_dim) * u64::from(*k_dim);
+                    if elems > layout.work_elems {
+                        layout.work_elems = elems;
+                        layout.work_heads = *v_heads;
+                    }
                 }
                 Operation::Ssm(
                     Ssm::Kda {
@@ -254,9 +319,11 @@ impl Layout {
                     plane(&mut layout, cache, Role::KdaF, *f, at)?;
                     plane(&mut layout, cache, Role::KdaB, *b, at)?;
                     region(&mut layout, cache, "scan", *y, at)?;
-                    layout.work_elems = layout
-                        .work_elems
-                        .max(u64::from(*heads) * u64::from(*head_dim) * u64::from(*head_dim));
+                    let elems = u64::from(*heads) * u64::from(*head_dim) * u64::from(*head_dim);
+                    if elems > layout.work_elems {
+                        layout.work_elems = elems;
+                        layout.work_heads = *heads;
+                    }
                 }
                 Operation::Gather(
                     Gather::NgramIds { ids, state, .. } | Gather::NgramIdsChunked { ids, state, .. },
@@ -409,52 +476,35 @@ impl Layout {
 }
 
 impl Seat {
-    #[must_use]
-    pub fn scratch_bytes(layout: &Layout, rows_ext: u32, lanes: u32) -> u64 {
-        let (_, _, planes) = layout.pack(rows_ext);
-        let work = (u64::from(lanes.max(1)) * layout.work_elems * 4)
-            .max(4)
-            .next_multiple_of(256);
-        (planes + work).max(256)
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn mint<B: Backend>(
         handles: &Handles<B>,
         layout: &Arc<Layout>,
         buffers: &Buffers,
         pool: Segments,
-        room: Room<'_, B>,
+        held: &Reservation<B>,
         lanes: Vec<LanePlan>,
         replay: Tensor,
         commit: Tensor,
         slots: Tensor,
         rows_ext: u32,
     ) -> Result<Seat> {
-        let lane_count = u32::try_from(lanes.len()).unwrap_or(u32::MAX);
-        // The planes lie where the rung's room lays them for its rows and
-        // lanes, bound at that room: one view whatever rows the fire brings.
-        let (buffer, base, room_rows, room_lanes) = room;
+        // The planes lie where the load's reservation lays them for the top
+        // rung's rows, bound at their room: one view whatever the fire.
+        let (buffer, room_rows) = (&held.planes, held.rows);
         if rows_ext > room_rows {
             return Err(Fault::Ceiling {
-                what: "extended rows of the recurrent planes a fire's rung lays",
+                what: "extended rows of the recurrent planes the load lays",
                 need: u64::from(rows_ext),
                 have: u64::from(room_rows),
             });
         }
-        if lane_count > room_lanes {
-            return Err(Fault::Ceiling {
-                what: "lanes of the recurrent work plane a fire's rung lays",
-                need: u64::from(lane_count),
-                have: u64::from(room_lanes),
-            });
-        }
         // Each plane and region where the room packs them by their lives.
         let rows = u64::from(room_rows.max(1));
-        let (plane_at, region_at, planes) = layout.pack(room_rows);
+        let (plane_at, region_at, _) = layout.pack(room_rows);
         let take = |offset: u64, row_bytes: u64, width: u32, dtype: Dtype| -> Result<Tensor> {
             Ok(Tensor::new(
-                handles.bind(buffer, base + offset, (rows * row_bytes).max(4))?,
+                handles.bind(buffer, offset, (rows * row_bytes).max(4))?,
                 rows_ext.max(1),
                 width,
                 dtype,
@@ -468,11 +518,11 @@ impl Seat {
         for (region, &offset) in layout.regions.iter().zip(&region_at) {
             ext_out.push(take(offset, region.row_bytes, region.width, region.dtype)?);
         }
-        let at = base + planes.next_multiple_of(256);
-        let work_bytes = u64::from(room_lanes.max(1)) * layout.work_elems * 4;
+        // The work plane holds a committed dispatch's lanes: a window of more
+        // takes as many dispatches (`dispatch::ssm`).
         let work = Tensor::new(
-            handles.bind(buffer, at, work_bytes.max(4))?,
-            lane_count.max(1),
+            handles.bind(&held.work, 0, held.work.bytes())?,
+            held.lanes,
             u32::try_from(layout.work_elems).unwrap_or(u32::MAX),
             Dtype::F32,
         );

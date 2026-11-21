@@ -204,10 +204,13 @@ fn a_guest_slot_parks_on_the_host_and_comes_back() {
         "{refused}"
     );
 
-    let ring =
-        engine_cuda::store::staging_ring_for(shell.trace(), PAGE, 256, Some(crate::POOL), 1)
-            .and_then(|bytes| bytes.map(engine_cuda::store::Ring::pin).transpose())
-            .expect("the staging ring pins");
+    let ring = engine_cuda::store::staging_ring_for(
+        Some(crate::POOL),
+        1,
+        engine::runahead::Runahead::DEFAULT_FRAMES_IN_FLIGHT,
+    )
+    .and_then(|bytes| bytes.map(engine_cuda::store::Ring::pin).transpose())
+    .expect("the staging ring pins");
     shell
         .seat_host_kv(Some(crate::POOL), 1, 256, 1, ring)
         .expect("the host tier seats");
@@ -356,10 +359,13 @@ fn a_park_is_told_landed_once_it_has_read_its_slots() {
     shell
         .commit_segments(facts.segments.max.min(4))
         .expect("the segments commit");
-    let ring =
-        engine_cuda::store::staging_ring_for(shell.trace(), PAGE, 256, Some(crate::POOL), 1)
-            .and_then(|bytes| bytes.map(engine_cuda::store::Ring::pin).transpose())
-            .expect("the staging ring pins");
+    let ring = engine_cuda::store::staging_ring_for(
+        Some(crate::POOL),
+        1,
+        engine::runahead::Runahead::DEFAULT_FRAMES_IN_FLIGHT,
+    )
+    .and_then(|bytes| bytes.map(engine_cuda::store::Ring::pin).transpose())
+    .expect("the staging ring pins");
     shell
         .seat_host_kv(Some(crate::POOL), 1, 256, 1, ring)
         .expect("the host tier seats");

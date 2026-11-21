@@ -545,7 +545,10 @@ impl Plane {
     /// Every plane a fire of the load can return (`Shell::guest_planes`):
     /// what a registration checks every output its program reads against
     /// and compiles each stage for.
-    pub fn seat_planes(&mut self, planes: Vec<(String, u32, u32, u32, bool, poem_ir::Dtype)>) {
+    pub fn seat_planes(
+        &mut self,
+        planes: Vec<(String, u32, u32, u32, bool, poem_ir::Dtype, bool)>,
+    ) {
         self.stages.planes = planes;
     }
 

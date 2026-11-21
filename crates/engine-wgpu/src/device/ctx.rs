@@ -140,6 +140,34 @@ impl Timing {
     }
 }
 
+/// A spanned frame's two timestamps ([`Context::spanned`]): the set they
+/// are written to, the buffer it resolves into, and the host's copy;
+/// `busy` from the frame that writes them opening until their readback is
+/// read and unmapped, so one frame writes them at a time.
+pub(crate) struct Span {
+    set: wgpu::QuerySet,
+    resolve: Held,
+    readback: wgpu::Buffer,
+    busy: AtomicBool,
+}
+
+/// The timestamps timed frames write ([`Context::stamps`]), laid at load:
+/// sets, each with its resolve and readback, each written by one frame at a
+/// time, where the device enabled timestamp queries; none where it did not
+/// (a timed frame is then timed by the host's clock).
+#[derive(Clone)]
+pub struct Stamps(Vec<Arc<Span>>);
+
+impl std::fmt::Debug for Stamps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Stamps").field(&self.0.len()).finish()
+    }
+}
+
+/// The bytes a span's buffers take: two timestamps, at the resolve's
+/// alignment.
+const SPAN_BYTES: u64 = wgpu::QUERY_RESOLVE_BUFFER_ALIGNMENT;
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Enabled {
     pub subgroups: bool,
@@ -157,6 +185,8 @@ pub(crate) struct Core {
     pub(crate) spent: Mutex<Vec<wgpu::Buffer>>,
 
     poller: host::Poller,
+    /// The submissions on the queue not yet seen done ([`Core::submit`]).
+    in_flight: Arc<std::sync::atomic::AtomicU64>,
 
     /// The uniform buffer frames write their dispatches' scalars to, made
     /// at load, a region of it each frame in flight; and the regions free.
@@ -264,6 +294,26 @@ impl Core {
         self.poller.kick();
     }
 
+    /// `buffer` submitted, counted on the queue until its work is done (the
+    /// poller polls the device from the kick until its queue is empty).
+    pub(crate) fn submit(&self, buffer: wgpu::CommandBuffer) -> wgpu::SubmissionIndex {
+        self.in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let index = self.queue.submit(std::iter::once(buffer));
+        let in_flight = Arc::clone(&self.in_flight);
+        self.queue.on_submitted_work_done(move || {
+            in_flight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        });
+        self.kick();
+        index
+    }
+
+    /// Whether every submission on the queue is done, read now without
+    /// waiting.
+    pub(crate) fn idle(&self) -> bool {
+        self.in_flight.load(std::sync::atomic::Ordering::Acquire) == 0
+    }
+
     pub(crate) fn wait_for(&self, _index: &wgpu::SubmissionIndex) -> Result<()> {
         let done = Signal::new();
         let landed = done.clone();
@@ -285,7 +335,7 @@ impl Core {
     }
 
     pub(crate) fn submit_once(&self, encoder: wgpu::CommandEncoder) -> Result<()> {
-        let index = self.queue.submit(std::iter::once(encoder.finish()));
+        let index = self.submit(encoder.finish());
         self.wait_for(&index)
     }
 
@@ -630,7 +680,11 @@ impl Context {
         let enabled = Enabled {
             subgroups: features.contains(wgpu::Features::SUBGROUP),
             f16: features.contains(wgpu::Features::SHADER_F16),
-            timestamps: features.contains(wgpu::Features::TIMESTAMP_QUERY),
+            // Every timestamp this backend writes is written into an
+            // encoder: both features, or none is written.
+            timestamps: features.contains(
+                wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS,
+            ),
         };
         // A slab is bound whole, so no larger than one storage binding takes
         // (past it a fire refuses the view rather than reading a cut slab),
@@ -654,6 +708,7 @@ impl Context {
             enabled,
             spent: Mutex::new(Vec::new()),
             poller,
+            in_flight: Arc::default(),
             uniform_buffer: std::sync::OnceLock::new(),
             uniforms: Mutex::new(Vec::new()),
             scratch: Mutex::new(Vec::new()),
@@ -822,12 +877,112 @@ impl Context {
                 index: Mutex::new(None),
                 done: AtomicBool::new(false),
                 timing: Mutex::new(Vec::new()),
+                span: Mutex::new(None),
                 pass: Mutex::new(None),
+                time: engine_gpu::submit::DeviceTime::default(),
+                wall: AtomicBool::new(false),
             }),
             open: true,
             dispatches: std::cell::Cell::new(0),
             bind_only: false,
         })
+    }
+
+    /// A frame whose device time [`Frame::commit_spanned`] reads back: a
+    /// timestamp written into its encoder before its work and one after it,
+    /// where the device enabled timestamp queries; a plain frame elsewhere.
+    pub fn spanned(&self) -> Result<Frame> {
+        let stamps = self.stamps(1)?;
+        self.spanned_into(&stamps)
+    }
+
+    /// The timestamps timed frames write, laid now ([`Stamps`]): `sets`
+    /// sets of two, each with its resolve and its readback, where the
+    /// device enabled timestamp queries, else none.
+    pub fn stamps(&self, sets: u32) -> Result<Stamps> {
+        let core = &self.core;
+        core.alive()?;
+        if !core.enabled.timestamps {
+            return Ok(Stamps(Vec::new()));
+        }
+        Ok(Stamps((0..sets.max(1)).map(|_| self.span()).collect()))
+    }
+
+    /// One set of two timestamps, its resolve and its readback.
+    fn span(&self) -> Arc<Span> {
+        let core = &self.core;
+        Arc::new(Span {
+            set: core.device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("pie span"),
+                ty: wgpu::QueryType::Timestamp,
+                count: 2,
+            }),
+            resolve: core.held(
+                &wgpu::BufferDescriptor {
+                    label: Some("pie span resolve"),
+                    size: SPAN_BYTES,
+                    usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                },
+                engine_gpu::books::owners::TIMESTAMPS,
+            ),
+            readback: core.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("pie span readback"),
+                size: SPAN_BYTES,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            busy: AtomicBool::new(false),
+        })
+    }
+
+    /// A frame writing its two timestamps into a set of `stamps` (laid
+    /// before, [`Context::stamps`]) no frame before still reads (its
+    /// readback not yet unmapped); a plain frame where they hold none.
+    /// Where every set is still read the frame goes out unspanned and says
+    /// so, its time told unread.
+    pub fn spanned_into(&self, stamps: &Stamps) -> Result<Frame> {
+        let frame = self.frame()?;
+        if stamps.0.is_empty() {
+            return Ok(frame);
+        }
+        let Some(span) = stamps.0.iter().find(|span| {
+            span.busy
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        }) else {
+            tracing::warn!(
+                sets = stamps.0.len(),
+                "timestamps: every laid set is still read for the frames before; this frame \
+                 goes out untimed"
+            );
+            frame.inner.time.unread();
+            return Ok(frame);
+        };
+        frame.encode(|encoder| encoder.write_timestamp(&span.set, 0))?;
+        *frame.inner.span.lock().expect("span lock poisoned") = Some(Arc::clone(span));
+        Ok(frame)
+    }
+
+    /// Whether every submission made on the device so far is done, read now
+    /// without waiting: the queue is empty.
+    #[must_use]
+    pub fn idle(&self) -> bool {
+        self.core.idle()
+    }
+
+    /// A frame whose device time [`Pending::device_time`] reads once its
+    /// work is done, filled where that is seen (its work-done callback),
+    /// never by a wait of its own: spanned ([`Context::spanned`]) where the
+    /// device enabled timestamp queries, else timed by the host's clock
+    /// from its submit to its work done.
+    pub fn timed_frame(&self, stamps: &Stamps) -> Result<Frame> {
+        if !stamps.0.is_empty() {
+            return self.spanned_into(stamps);
+        }
+        let frame = self.frame()?;
+        frame.inner.wall.store(true, Ordering::Release);
+        Ok(frame)
     }
 
     /// A frame a load's bind walk walks into ([`Frame::bind_only`]).
@@ -868,8 +1023,16 @@ pub(crate) struct Inner {
     index: Mutex<Option<wgpu::SubmissionIndex>>,
     done: AtomicBool,
     timing: Mutex<Vec<Timing>>,
+    span: Mutex<Option<Arc<Span>>>,
 
     pass: Mutex<Option<wgpu::ComputePass<'static>>>,
+
+    /// A timed frame's device time, filled once its work is done
+    /// ([`Context::timed_frame`]).
+    time: engine_gpu::submit::DeviceTime,
+    /// A timed frame on a device that writes no timestamps: its time is the
+    /// host's clock from its submit to its work done.
+    wall: AtomicBool,
 }
 
 impl Inner {
@@ -896,6 +1059,11 @@ impl Inner {
 impl Drop for Inner {
     fn drop(&mut self) {
         self.release();
+        // Timestamps a frame dropped unsubmitted held are free again: a
+        // submitted frame took them, and frees them once read.
+        if let Some(span) = self.span.get_mut().expect("span lock poisoned").take() {
+            span.busy.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -1219,7 +1387,7 @@ impl Frame {
                 why: "this frame was already submitted".to_string(),
             });
         };
-        core.queue.submit(std::iter::once(encoder.finish()));
+        core.submit(encoder.finish());
         core.kick();
         *self.inner.encoder.lock().expect("encoder lock poisoned") = Some(
             core.device
@@ -1313,7 +1481,7 @@ impl Frame {
         let started = Mark::now();
         let finished = encoder.finish();
         crate::encode::record_read_phase(0, started.ns());
-        let index = core.queue.submit(std::iter::once(finished));
+        let index = core.submit(finished);
         crate::encode::record_submit(started.ns(), 0);
         // What the frame staged through goes back to the load's stock now,
         // submitted, not when its work completes: the queue runs what any
@@ -1356,8 +1524,87 @@ impl Frame {
         Ok(started.secs())
     }
 
-    pub fn commit_async(mut self, on_done: Option<OnDone>) -> Result<Pending> {
+    /// Submits and waits: the device's time between the two timestamps a
+    /// [`Context::spanned`] frame writes, ns; `None` for another frame.
+    pub fn commit_spanned(mut self) -> Result<Option<u64>> {
+        let span = self.inner.span.lock().expect("span lock poisoned").take();
+        if let Some(span) = &span
+            && self.open
+        {
+            self.encode(|encoder| {
+                encoder.write_timestamp(&span.set, 1);
+                encoder.resolve_query_set(&span.set, 0..2, &span.resolve, 0);
+                encoder.copy_buffer_to_buffer(&span.resolve, 0, &span.readback, 0, Some(16));
+            })?;
+        }
         self.submit()?;
+        Pending {
+            inner: Arc::clone(&self.inner),
+        }
+        .wait()?;
+        let Some(span) = span else {
+            return Ok(None);
+        };
+        let core = &self.inner.core;
+        let slice = span.readback.slice(0..16);
+        let mapped = Signal::new();
+        let deliver = mapped.clone();
+        slice.map_async(wgpu::MapMode::Read, move |r| deliver.notify(r));
+        core.kick();
+        mapped
+            .park("span readback")?
+            .map_err(|e| Fault::Device {
+                call: "span readback",
+                why: e.to_string(),
+            })?;
+        let ticks = {
+            let view = slice.get_mapped_range().map_err(|e| Fault::Device {
+                call: "span readback",
+                why: e.to_string(),
+            })?;
+            let word = |i: usize| {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&view[i * 8..i * 8 + 8]);
+                u64::from_le_bytes(b)
+            };
+            word(1).saturating_sub(word(0))
+        };
+        span.readback.unmap();
+        span.busy.store(false, Ordering::Release);
+        let period = f64::from(core.queue.get_timestamp_period());
+        Ok(Some((ticks as f64 * period) as u64))
+    }
+
+    pub fn commit_async(mut self, on_done: Option<OnDone>) -> Result<Pending> {
+        // A timed frame ([`Context::timed_frame`]): its closing timestamp
+        // resolved into its readback before the submit, the readback mapped
+        // once the work is done; or the host's clock across the submit.
+        let span = self.inner.span.lock().expect("span lock poisoned").take();
+        if let Some(span) = &span
+            && self.open
+        {
+            self.encode(|encoder| {
+                encoder.write_timestamp(&span.set, 1);
+                encoder.resolve_query_set(&span.set, 0..2, &span.resolve, 0);
+                encoder.copy_buffer_to_buffer(&span.resolve, 0, &span.readback, 0, Some(16));
+            })?;
+        }
+        let wall = self.inner.wall.load(Ordering::Acquire);
+        let submitted = std::time::Instant::now();
+        self.submit()?;
+        if let Some(span) = span {
+            let (core, time) = (Arc::clone(&self.inner.core), self.inner.time.clone());
+            self.inner.core.queue.on_submitted_work_done(move || {
+                read_span(core, span, time);
+            });
+            self.inner.core.kick();
+        } else if wall {
+            let time = self.inner.time.clone();
+            self.inner.core.queue.on_submitted_work_done(move || {
+                time.set(submitted.elapsed().as_nanos() as u64);
+            });
+            self.inner.core.kick();
+        }
         let pending = Pending {
             inner: Arc::clone(&self.inner),
         };
@@ -1379,6 +1626,40 @@ impl Frame {
 
 pub use engine_gpu::backend::OnDone;
 
+/// A timed frame's span read once its work is done: its readback mapped
+/// and its two timestamps' distance filled into `time`, or `time` told
+/// unread where the map failed.
+fn read_span(core: Arc<Core>, span: Arc<Span>, time: engine_gpu::submit::DeviceTime) {
+    let period = f64::from(core.queue.get_timestamp_period());
+    let readback = span.readback.clone();
+    readback.slice(0..16).map_async(wgpu::MapMode::Read, move |mapped| {
+        if mapped.is_err() {
+            span.busy.store(false, Ordering::Release);
+            time.unread();
+            return;
+        }
+        let slice = span.readback.slice(0..16);
+        let ticks = match slice.get_mapped_range() {
+            Ok(view) => {
+                let word = |i: usize| {
+                    let mut b = [0u8; 8];
+                    b.copy_from_slice(&view[i * 8..i * 8 + 8]);
+                    u64::from_le_bytes(b)
+                };
+                Some(word(1).saturating_sub(word(0)))
+            }
+            Err(_) => None,
+        };
+        span.readback.unmap();
+        span.busy.store(false, Ordering::Release);
+        match ticks {
+            Some(ticks) => time.set((ticks as f64 * period) as u64),
+            None => time.unread(),
+        }
+    });
+    core.kick();
+}
+
 impl Drop for Frame {
     fn drop(&mut self) {
         self.open = false;
@@ -1396,6 +1677,21 @@ impl std::fmt::Debug for Pending {
 }
 
 impl Pending {
+    /// The frame's device time, filled once its work is done where it was
+    /// opened timed ([`Context::timed_frame`]); never filled otherwise.
+    #[must_use]
+    pub fn device_time(&self) -> engine_gpu::submit::DeviceTime {
+        self.inner.time.clone()
+    }
+
+    /// Whether the frame has landed, read now without waiting: its
+    /// submitted-work-done callback has run (the poller polls the device
+    /// from the submit until its queue is empty).
+    #[must_use]
+    pub fn landed(&self) -> bool {
+        self.inner.done.load(Ordering::Acquire)
+    }
+
     pub fn wait(&self) -> Result<()> {
         if !self.inner.done.load(Ordering::Acquire) {
             let done = Signal::new();

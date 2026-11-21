@@ -71,6 +71,13 @@ pub(crate) fn notify_owner_waits(engine: usize, pid: ProcessId) {
     }
 }
 
+/// `pid`'s guest waits on input from outside the runtime (a session
+/// receive, a timer, an HTTP response): no frame on any engine waits on its
+/// lanes until each submits again.
+pub(crate) fn notify_owner_away(pid: ProcessId) {
+    broadcast(|| SchedulerItem::OwnerAway(pid));
+}
+
 pub(crate) fn notify_process_resume(pid: ProcessId) {
     broadcast(|| SchedulerItem::ProcessResume(pid));
 }
@@ -295,6 +302,10 @@ enum SchedulerItem {
     /// raise of the activation rung): its lanes go out of the frame
     /// ([`super::frame::FramePolicy::on_owner_waits`]).
     OwnerWaits(ProcessId),
+    /// The process's guest waits on outside input: its lanes go out of the
+    /// frame until each submits again
+    /// ([`super::frame::FramePolicy::on_owner_away`]).
+    OwnerAway(ProcessId),
     FrameTruncate {
         lane: ProcessId,
         seq: u64,
@@ -2036,6 +2047,14 @@ impl BatchScheduler {
                         ));
                     }
                     if let Some(stamp) = launch.frame {
+                        // Read only for the seal trace: off, no lookup.
+                        let program = if frame::seal_trace() {
+                            instances
+                                .get(&launch.instance_id)
+                                .map_or(0, |instance| instance.program_id.0)
+                        } else {
+                            0
+                        };
                         frame_policy.on_fire_reading(
                             stamp,
                             launch.process_id,
@@ -2044,6 +2063,7 @@ impl BatchScheduler {
                             launch.wire_row_count(),
                             launch.request.sequence_readouts(),
                             launch.request.rung_rows(),
+                            program,
                         );
                     }
                     Self::queue_attempt(pending, launch);
@@ -2055,6 +2075,9 @@ impl BatchScheduler {
             }
             SchedulerItem::OwnerWaits(pid) => {
                 frame_policy.on_owner_waits(pid);
+            }
+            SchedulerItem::OwnerAway(pid) => {
+                frame_policy.on_owner_away(pid);
             }
             SchedulerItem::FrameTruncate {
                 lane,
@@ -3174,6 +3197,8 @@ impl Drop for BatchScheduler {
 }
 
 struct TrackedInstance {
+    /// The program it runs, as the seal trace names a fire's.
+    program_id: ::engine::ProgramId,
     pacing_wait_id: u64,
     wait_slots: Arc<crate::engine::BoundWaitSlots>,
     in_flight: usize,
@@ -3183,6 +3208,7 @@ struct TrackedInstance {
 impl TrackedInstance {
     fn from_bound(bound: &BoundInstance) -> Self {
         Self {
+            program_id: bound.program_id,
             pacing_wait_id: bound.pacing_wait_id,
             wait_slots: bound.wait_slots(),
             in_flight: 0,

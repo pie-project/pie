@@ -1306,6 +1306,20 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
     }
 
     #[cfg(feature = "vulkan")]
+    fn unbuilt(&self, call: u32) -> Option<String> {
+        match &self.library {
+            Some(library) => library.unbuilt(call),
+            None => Some("the plane built no guest pipelines: it is not loaded".to_owned()),
+        }
+    }
+
+    #[cfg(not(feature = "vulkan"))]
+    fn unbuilt(&self, call: u32) -> Option<String> {
+        let _ = call;
+        Some("this build has no device to build a guest pipeline on".to_owned())
+    }
+
+    #[cfg(feature = "vulkan")]
     fn built_serving(&self) -> u64 {
         self.library
             .as_ref()

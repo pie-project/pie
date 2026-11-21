@@ -70,6 +70,8 @@ pub mod owners {
     pub const TEST: Owner = Owner::fire("test operands");
     pub const INPUTS: Owner = Owner::fire("inputs");
     pub const READOUT: Owner = Owner::fire("readout");
+    /// The recurrent planes and work plane ([`crate::rs::Reservation`]).
+    pub const RS_WORK: Owner = Owner::fire("rs planes");
     pub const SNAPSHOTS: Owner = Owner::fire("snapshot table");
     pub const EXPERT_SEATS: Owner = Owner::fire("expert seats");
     pub const STAGING: Owner = Owner::fire("staging");

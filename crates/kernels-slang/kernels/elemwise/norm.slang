@@ -107,6 +107,9 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 struct Params {
     float eps;
     int vd;
+    // The element a window's first row starts at: the rows are the fire's
+    // whole, bound once whatever window a fire cuts.
+    uint first;
 };
 PIE_PARAMS(4, Params, params);
 
@@ -124,7 +127,7 @@ float gate(float zr) {
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     uint vd = uint(max(params.vd, 0));
-    uint base = group.x * vd;
+    uint base = params.first + group.x * vd;
     uint lid = local.x;
     float acc = 0.0;
     for (uint i = lid; i < vd; i += uint(PIE_GROUP_X)) {

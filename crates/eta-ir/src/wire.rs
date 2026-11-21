@@ -262,6 +262,12 @@ impl OpWire {
             tags::REDUCE_MAX => Op::ReduceMax(a0()?),
             tags::REDUCE_MIN => Op::ReduceMin(a0()?),
             tags::REDUCE_ARGMAX => Op::ReduceArgmax(a0()?),
+            tags::GUMBEL_ARGMAX => Op::GumbelArgmax {
+                logits: a0()?,
+                keep: a1()?,
+                scale: a2()?,
+                state: self.arg(3)?,
+            },
             tags::BROADCAST => Op::Broadcast {
                 value: a0()?,
                 shape: self.shape()?,

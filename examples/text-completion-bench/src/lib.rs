@@ -30,8 +30,12 @@ struct Input {
     /// for `enable_thinking: false`.
     #[serde(default)]
     no_think: bool,
-    /// Busy-wait inside WASM for this many microseconds per drained token —
-    /// simulates per-token inferlet work.
+    /// Per-token inferlet compute, in microseconds: after each drained token
+    /// the guest spins on the monotonic clock this long (it reads the clock;
+    /// it never waits on a timer, which the host would read as outside input
+    /// and park the lane for). The lane stays awaited throughout, as a guest
+    /// computing between fires does. Off by default (0): each delayed lane
+    /// burns one CPU while it spins.
     #[serde(default)]
     wasm_delay_us: u64,
     /// Decode and return generated text (the throughput benchmark only needs
@@ -121,7 +125,9 @@ struct Output {
 /// `top_p < 1` (`top_p >= 1` keeps every token, so it is no knob). The same
 /// shapes the runtime's prewarm builds, so a request builds nothing.
 struct SampleKnobs {
-    temperature: Option<f32>,
+    /// The temperature's reciprocal (`sampler::inverse_temperature`), data
+    /// the stage reads, so every temperature runs one program.
+    temperature: Option<Channel>,
     top_p: Option<Channel>,
 }
 
@@ -129,7 +135,8 @@ impl SampleKnobs {
     fn new(temperature: f32, top_p: f32) -> Self {
         let sampled = temperature > 0.0;
         Self {
-            temperature: sampled.then_some(temperature),
+            temperature: sampled
+                .then(|| Channel::from([sampler::inverse_temperature(temperature)])),
             top_p: (sampled && top_p < 1.0).then(|| Channel::from([top_p])),
         }
     }
@@ -137,7 +144,7 @@ impl SampleKnobs {
     /// Read without consuming: the seeded value stays for every fire.
     fn read(&self) -> sampler::Knobs {
         sampler::Knobs {
-            temperature: self.temperature,
+            temperature: self.temperature.as_ref().map(|c| reshape(c.read(), [])),
             top_p: self.top_p.as_ref().map(|c| reshape(c.read(), [])),
             top_k: None,
             min_p: None,
@@ -565,7 +572,10 @@ async fn run_one(
             last_tick = now;
         }
         if input.wasm_delay_us > 0 {
-            std::thread::sleep(wasm_delay);
+            let until = std::time::Instant::now() + wasm_delay;
+            while std::time::Instant::now() < until {
+                std::hint::spin_loop();
+            }
         }
         // Refill the window after draining an accepted token. A stopped lane
         // `continue`s above and never reaches here, so it never submits more.

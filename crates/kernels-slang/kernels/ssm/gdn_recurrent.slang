@@ -83,6 +83,10 @@ struct Params {
     int v_heads;
     int k_dim;
     int v_dim;
+    // The fire row a window's row 0 is: `qkv`, `gates`, `y` and the slots
+    // table are the fire's whole, bound once whatever window a fire cuts
+    // (0 for the committed form, whose extended planes are the window's).
+    uint row0;
 #if defined(PIE_CHUNKED) || defined(PIE_COMMITTED)
     // The window's CSR lies at int `indptr_at` of the fire's packed windows
     // table, which is bound whole: one view whatever window a fire cuts.
@@ -125,7 +129,8 @@ static float st[PIE_DK_REG];
 #endif
 
 // Token `t` of value head `hv` (key head `hk`), its state at `state_base`.
-void token(uint tid, uint t, uint hv, uint hk, uint state_base) {
+void token(uint tid, uint window_t, uint hv, uint hk, uint state_base) {
+    uint t = params.row0 + window_t;
     uint dk = uint(params.k_dim);
     uint dv = uint(params.v_dim);
     uint keys = uint(params.k_heads) * dk;
@@ -311,7 +316,9 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 #endif
     }
 #else
-    uint state_base = (lane * uint(params.v_heads) + hv) * head;
+    // The work plane holds the dispatch's lanes, the lane's at its own `r`:
+    // a fire's lanes take as many dispatches as the plane holds lanes.
+    uint state_base = (r * uint(params.v_heads) + hv) * head;
     // A row of the head's state lies in one segment: found once a row.
     for (uint c = tid; c < dv; c += uint(PIE_GROUP_X)) {
         uint seg, at;
@@ -357,7 +364,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     if (end <= begin) {
         return;
     }
-    uint state_base = state_at(uint(begin), hv, head);
+    uint state_base = state_at(params.row0 + uint(begin), hv, head);
 #if defined(PIE_SNAPS)
     int snap = pie_snap_lane(r);
     uint snapped = 0u;
@@ -384,7 +391,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     reg_store(tid, state_base);
 #endif
 #else
-    uint state_base = state_at(r, hv, head);
+    uint state_base = state_at(params.row0 + r, hv, head);
 #if defined(PIE_DK_REG)
     reg_load(tid, state_base);
 #endif

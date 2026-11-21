@@ -61,7 +61,7 @@ __device__ __forceinline__ float ptir_canonical_reduce_met(
 __device__ __forceinline__ void ptir_split_copy(
     const m1_u8* input, m1_u8* output, m1_u32 len, m1_u32 dtype, m1_u32 part, m1_u32 split) {
   if (input == output) return;
-  const m1_u32 bytes = dtype == 3u ? len : len * 4u;
+  const m1_u32 bytes = len * m1_elem_bytes(dtype);
   m1_u32 head = 0u;
   if (((reinterpret_cast<m1_u64>(input) | reinterpret_cast<m1_u64>(output)) & 15ull) == 0ull) {
     const m1_u32 quads = bytes >> 4;

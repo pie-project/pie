@@ -5,7 +5,7 @@
 use kernels_slang::Tensor;
 use poem_ir::Dtype;
 
-use crate::gpu::{Gpu, landed, noise};
+use crate::gpu::{Gpu, landed, noise, row_cuts};
 
 #[test]
 fn the_gdn_gates_answer_the_reference() {
@@ -37,21 +37,27 @@ fn the_gdn_gates_answer_the_reference() {
     let dtt = t(dtb, 1, heads, Dtype::Bf16);
     let alt = t(alb, 1, heads, Dtype::F32);
     let n = rows * 2 * heads;
-    landed(
-        &mut gpu,
-        "gdn gates",
-        &|g| vec![(g.up_f32(&vec![0.0; n]), n, true)],
-        &[want],
-        &|g, o| {
-            g.run(|c| {
-                kernels_slang::ssm::gdn_prep::gdn_prep(
-                    c,
-                    bat,
-                    dtt,
-                    alt,
-                    t(o[0].0, rows, 2 * heads, Dtype::F32),
-                )
-            })
-        },
-    );
+    for spans in row_cuts(rows as u32) {
+        landed(
+            &mut gpu,
+            &format!("gdn gates, {} window(s)", spans.len()),
+            &|g| vec![(g.up_f32(&vec![0.0; n]), n, true)],
+            std::slice::from_ref(&want),
+            &|g, o| {
+                g.run(|c| {
+                    for &span in &spans {
+                        kernels_slang::ssm::gdn_prep::gdn_prep(
+                            c,
+                            bat,
+                            dtt,
+                            alt,
+                            t(o[0].0, rows, 2 * heads, Dtype::F32),
+                            span,
+                        )?;
+                    }
+                    Ok(())
+                })
+            },
+        );
+    }
 }

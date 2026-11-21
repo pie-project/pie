@@ -1057,9 +1057,10 @@ impl Shell {
         >,
     ) -> Result<crate::rates::ProductTimes> {
         use kernels_cuda::linear::routes::Kernel;
-        let Some(class) = self.decoding.iter().next() else {
+        // A load that decodes nothing chooses no decode product's kernel.
+        if self.decoding.iter().next().is_none() {
             return Ok(Vec::new());
-        };
+        }
         let mut shapes: Vec<_> = wanted.keys().copied().collect();
         shapes.sort_by_key(|s| (s.m, s.rows, s.k));
         let mut decided = base;
@@ -1072,7 +1073,7 @@ impl Shell {
                 // A product's rows in a body are its bucket's: only that
                 // bucket's bodies change with its kernel.
                 self.rearm_bucket(shape.m)?;
-                let (ns, spread) = self.time_decode_body(class, shape.m)?;
+                let (ns, spread) = self.time_decode_body(shape.m)?;
                 times.push((kernel, ns, spread));
             }
             let entries: Vec<_> = times.iter().map(|&(kernel, ns, spread)| (shape, kernel, ns, spread)).collect();
@@ -1088,12 +1089,31 @@ impl Shell {
         Ok(measured)
     }
 
-    /// The decode body of `m` one-row lanes of `class`, replayed: its median
-    /// ns a fire over [`BODY_ROUNDS`] rounds and their interquartile spread.
-    /// Every timed fire must replay the body (none walks eagerly).
+    /// The body the lattice armed at bucket `m` that carries `m` rows
+    /// ([`timing_target`]: the decode step's `m` one-row lanes where it
+    /// armed one), replayed: its median ns a fire over [`BODY_ROUNDS`]
+    /// rounds and their interquartile spread. Every timed fire must replay
+    /// the body (none walks eagerly).
     #[cfg(feature = "rocm")]
-    fn time_decode_body(&mut self, class: usize, m: u32) -> Result<(f64, f64)> {
-        let owned = self.synthetic_lanes(&vec![(class, 1u32); m as usize]);
+    fn time_decode_body(&mut self, m: u32) -> Result<(f64, f64)> {
+        let targets = self
+            .lattice_targets()
+            .map_or_else(Vec::new, |lattice| lattice.targets);
+        let (target, treatment) = timing_target(
+            targets
+                .iter()
+                .map(|(bucket, target, treatment)| (*bucket, target, treatment.rs)),
+            m,
+        )
+        .ok_or_else(|| {
+            Fault::Card(format!(
+                "timing a product of {m} rows: no body the lattice arms at bucket {m} \
+                 carries them"
+            ))
+        })?;
+        self.arm_rs = treatment;
+        let (lanes, media) = target.lanes();
+        let owned = self.synthetic_lanes_with(&lanes, &media);
         for _ in 0..BODY_FIRES {
             self.fire_synthetic(&owned)?;
             self.device.synchronize()?;
@@ -2444,6 +2464,30 @@ struct LatticeTargets {
     unfireable: Vec<String>,
 }
 
+/// The composition a product of `m` rows is timed in
+/// (`Shell::routes_by_body`), with what rides it (its recurrent rows'
+/// treatment): a body the lattice armed at bucket `m` that carries `m`
+/// rows, the decode step's (`m` one-row lanes) where the lattice armed one,
+/// else the first that does (where a fire carries fewer lanes than `m`, an
+/// artifact baked for fewer, its rows are a prompt's). `None` where no
+/// armed body carries them.
+#[cfg_attr(not(feature = "rocm"), allow(dead_code))]
+fn timing_target<'a, R: Copy>(
+    targets: impl IntoIterator<Item = (u32, &'a BodySynth, R)>,
+    m: u32,
+) -> Option<(&'a BodySynth, R)> {
+    let rows = |target: &BodySynth| target.lanes().0.iter().map(|&(_, rows)| rows).sum::<u32>();
+    let at: Vec<(&BodySynth, R)> = targets
+        .into_iter()
+        .filter(|&(bucket, target, _)| bucket == m && rows(target) == m)
+        .map(|(_, target, ride)| (target, ride))
+        .collect();
+    at.iter()
+        .copied()
+        .find(|(target, _)| matches!(target, BodySynth::Decode { .. }))
+        .or_else(|| at.first().copied())
+}
+
 /// Rounds a decode body is timed in (`Shell::routes_by_body`): the median
 /// kept, the interquartile range the spread a choice must clear.
 #[cfg(feature = "rocm")]
@@ -2476,5 +2520,30 @@ mod allowance_tests {
         assert!(!allowance_spent(took, took));
         assert!(allowance_spent(took + 1, took));
         assert!(!allowance_spent(took - 1, took));
+    }
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::{BodySynth, timing_target};
+
+    #[test]
+    fn a_product_is_timed_in_a_body_the_lattice_armed() {
+        let decode = BodySynth::Decode { lanes: 4, class: 0 };
+        let prompt = BodySynth::Prefill {
+            class: 0,
+            rows: vec![4],
+        };
+        let decoded = |found: Option<(&BodySynth, ())>| found.map(|(target, ())| target.lanes().0);
+        // A lattice that arms the decode step at bucket 4: its body.
+        let both = [(4, &prompt, ()), (4, &decode, ()), (8, &decode, ())];
+        assert_eq!(decoded(timing_target(both, 4)), Some(vec![(0, 1); 4]));
+        // An artifact baked for one lane arms no four-lane decode step
+        // (golden_offload's micro model on ROCm): the prompt's body of 4.
+        let one = BodySynth::Decode { lanes: 1, class: 0 };
+        let one_lane = [(4, &prompt, ()), (4, &one, ())];
+        assert_eq!(decoded(timing_target(one_lane, 4)), Some(vec![(0, 4)]));
+        // Nothing armed at the bucket carries its rows.
+        assert_eq!(decoded(timing_target([(2, &prompt, ())], 4)), None);
     }
 }

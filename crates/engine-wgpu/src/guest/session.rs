@@ -113,6 +113,7 @@ pub fn stage_read_bytes(package: &LaunchPackage) -> std::result::Result<Vec<u64>
                     .product::<u64>();
                 let bytes = match channel.dtype {
                     eta_ir::container::ChanDType::Concrete(eta_ir::Dtype::Bool) => len,
+                    eta_ir::container::ChanDType::Concrete(eta_ir::Dtype::Bf16) => len * 2,
                     _ => len * 4,
                 };
                 Ok(sum + bytes.max(4).next_multiple_of(4))
@@ -316,6 +317,20 @@ impl Library {
             need: u64::from(at) + 1,
             have: self.outboxes.len() as u64,
         })
+    }
+
+    /// Why call `call` has no pipeline built, or `None` where it has one.
+    #[must_use]
+    pub fn unbuilt(&self, call: u32) -> Option<String> {
+        let pipelines = self.pipelines.lock().expect("library lock poisoned");
+        match pipelines.get(call as usize) {
+            Some(Ok(_)) => None,
+            Some(Err(why)) => Some(why.clone()),
+            None => Some(format!(
+                "call {call} is past the {} the library holds",
+                pipelines.len()
+            )),
+        }
     }
 
     /// The pipelines built after the load, each at a bind that found its

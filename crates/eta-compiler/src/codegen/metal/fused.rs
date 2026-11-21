@@ -141,6 +141,12 @@ pub fn emit_fused_region(
             return Err(EmitError::RegionNodeOutOfRange(RegionForm::Fused));
         };
         let mut slots = Slots::of(op, bases[node], value_ptr);
+        if op.tag == tags::GUMBEL_ARGMAX
+            && let Some(&state) = op.args.get(3)
+        {
+            // The rng state, the fourth operand, rides in `o1`.
+            slots.o1 = value_ptr(state);
+        }
         if op.tag == tags::CHAN_TAKE || op.tag == tags::CHAN_READ {
             if op.chan < 0 || op.chan as usize >= channel_bindings.len() {
                 return Err(EmitError::ChannelRootBindingOutOfRange);
@@ -366,6 +372,12 @@ pub fn emit_grouped_fused_region(
             continue;
         }
         let mut slots = Slots::of(op, base, |value| value_ptr(alias.resolve(value)));
+        if op.tag == tags::GUMBEL_ARGMAX
+            && let Some(&state) = op.args.get(3)
+        {
+            // The rng state, the fourth operand, rides in `o1`.
+            slots.o1 = value_ptr(alias.resolve(state));
+        }
         if op.tag == tags::OUTPUT
             && let Some(slot) = addressed_slot(stage, op, base)
         {
@@ -530,7 +542,7 @@ pub(super) fn emit_addressed_gather(
     } else {
         let _ = writeln!(
             source,
-            "      reinterpret_cast<device float*>({o0})[i] = addressed_seat.storage >= 3u \
+            "      m1_store_fd({o0}, i, addressed_seat.storage >= 3u \
              ? (addressed_seat.storage == 4u \
                 ? reinterpret_cast<const device float*>(reinterpret_cast<const device ulong*>(\
                     addressed_seat.at)[i / addressed_width])[i % addressed_width] \
@@ -538,7 +550,8 @@ pub(super) fn emit_addressed_gather(
                     addressed_seat.at)[i / addressed_width])[i % addressed_width])) \
              : addressed_seat.storage == 0u \
              ? reinterpret_cast<const device float*>(addressed_seat.at)[from] \
-             : float(reinterpret_cast<const device bfloat*>(addressed_seat.at)[from]);"
+             : float(reinterpret_cast<const device bfloat*>(addressed_seat.at)[from]), \
+             addressed_desc.dtype);"
         );
     }
     source.push_str("    }\n");
@@ -575,22 +588,23 @@ pub(super) fn emit_logits_gather(
          intrinsic_desc.len / gather_width > row_meta.count - intrinsic_row_base) \
          {{ m1_fault(status, {FUSED_GEOMETRY_MISMATCH:#X}u); return; }}"
     );
-    let _ = writeln!(
-        source,
-        "    device float* intrinsic_out = reinterpret_cast<device float*>({o0});"
-    );
+    let _ = writeln!(source, "    device uchar* intrinsic_out = {o0};");
     source.push_str("    const uint gather_rows = intrinsic_desc.len / gather_width;\n");
     source.push_str("    const uint gather_row_base = row_meta.offset + intrinsic_row_base;\n");
     source.push_str("    for (uint gr = 0u; gr < gather_rows; ++gr) {\n");
     source.push_str(
         "      const device bfloat* gather_src = logits + ulong(row_indices[gather_row_base + gr]);\n",
     );
-    source.push_str("      device float* gather_dst = intrinsic_out + ulong(gr) * gather_width;\n");
+    source.push_str("      const uint gather_dst = gr * gather_width;\n");
     source.push_str(
         "      for (uint column = gather_begin; column < gather_width; \
          column += gather_step) {\n",
     );
-    source.push_str("        gather_dst[column] = float(gather_src[column]);\n");
+    // Stored at the intrinsic's dtype: a bf16 output keeps the plane's
+    // element exactly.
+    source.push_str(
+        "        m1_store_fd(intrinsic_out, gather_dst + column, float(gather_src[column]), intrinsic_desc.dtype);\n",
+    );
     source.push_str("      }\n");
     source.push_str("    }\n");
     source.push_str("  }\n");

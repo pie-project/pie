@@ -58,7 +58,7 @@ struct Input {
     /// A negative control of `verify`, a beam broken on purpose: `parent`
     /// has each lane's mask inherit the next lane's ancestry (`(parent + 1)
     /// % beams`) while its hypothesis keeps its own, so its rows read
-    /// another beam's cells; `score` moves lane 0's last step by 1.0 on the
+    /// another beam's cells; `score` moves lane 0's last step by 4.0 on the
     /// host. Either must fail `verify`.
     #[serde(default)]
     corrupt: Option<String>,
@@ -162,10 +162,12 @@ async fn main(input: Input) -> Result<String> {
         .state(&[&ws], StateGeometry::folding())
         .context("bind the prompt prefill")?;
     fwd_p.epilogue(move || {
-        let logits = reshape(intrinsics::output(0, "logits"), [v]);
+        // The vocabulary-sized rows are bf16; the scores the host and the
+        // next fire read are f32.
+        let logits = cast(reshape(intrinsics::output(0, "logits"), [v]), dtype::bf16);
         let (s, i) = top_k(log_softmax(&logits), b);
         out_p.put(cast(&i, dtype::i32));
-        scr_p.put(&s);
+        scr_p.put(cast(&s, dtype::f32));
         if let Some(greedy_p) = greedy_p {
             greedy_p.put(reshape(reduce_argmax(&logits), [1]));
         }
@@ -232,9 +234,20 @@ async fn main(input: Input) -> Result<String> {
         .context("bind the beam pool")?;
         fwd.epilogue(move || {
             // `logits()` squeezes a one-row fire to `[v]`: reshape so `beams == 1` meets `[B, 1]` scores.
-            let logits = reshape(intrinsics::output(0, "logits"), [b, v]);
-            let cand = broadcast(reshape(scores.take(), [b, 1]), [b, v]) + log_softmax(&logits);
+            let logits = cast(
+                reshape(intrinsics::output(0, "logits"), [b, v]),
+                dtype::bf16,
+            );
+            // The candidates are bf16, each beam's score taken relative to
+            // the best (whose rows then round no score at all): a bf16
+            // absolute score would round a long hypothesis's sum by more
+            // than a step's log-probability.
+            let carried = scores.take();
+            let best = reduce_max(&carried);
+            let relative = cast(&carried - &best, dtype::bf16);
+            let cand = broadcast(reshape(relative, [b, 1]), [b, v]) + log_softmax(&logits);
             let (s, i) = top_k(reshape(cand, [b * v]), b);
+            let s = cast(&s, dtype::f32) + &best;
             let parent = &i / v;
             let tok_i = cast(&i % v, dtype::i32);
 
@@ -387,20 +400,26 @@ async fn main(input: Input) -> Result<String> {
     if input.corrupt.as_deref() == Some("score")
         && let Some(last) = scored.first_mut().and_then(|lane| lane.last_mut())
     {
-        *last += 1.0;
+        *last += 4.0;
     }
     let verified = if input.verify {
         let mut worst = 0f32;
         // The most of its room any step came to (apart / room).
         let mut closest = 0f32;
+        // The most any step's log-probability moved between its 1-row and
+        // its beam-width rescore (d_t).
+        let mut drift = 0f32;
         for (lane, hypothesis) in hypotheses.iter().enumerate() {
-            let alone = rescore(&prompt, hypothesis).await?;
+            let alone = rescore(&prompt, hypothesis, b).await?;
             // Each step's log-probability as the beam took it (its score's
-            // step), against the hypothesis's own, within that step's room:
-            // the quanta its log-probability and logits round to, and the
-            // quanta of the beam's scores either side of it.
+            // step), against the hypothesis's own, within that step's room
+            // (`rescore`'s), and the quanta of the beam's scores either side
+            // of it.
+            drift = drift.max(alone.iter().map(|s| s.drift).fold(0.0, f32::max));
             let mut before = 0f32;
-            for (at, (&after, &(step, room))) in scored[lane].iter().zip(&alone).enumerate() {
+            for (at, (&after, &Rescored { step, room, .. })) in
+                scored[lane].iter().zip(&alone).enumerate()
+            {
                 let took = after - before;
                 let room = room + quantum(after) + if at > 0 { quantum(before) } else { 0.0 };
                 let apart = (took - step).abs();
@@ -414,11 +433,11 @@ async fn main(input: Input) -> Result<String> {
                 }
                 before = after;
             }
-            let total: f32 = alone.iter().map(|&(step, _)| step).sum();
+            let total: f32 = alone.iter().map(|s| s.step).sum();
             worst = worst.max((total - final_scores[lane]).abs());
         }
         format!(
-            " greedy_mismatches={greedy_mismatches} verified={} worst_apart={worst:.4} worst_step={closest:.3}",
+            " greedy_mismatches={greedy_mismatches} verified={} worst_apart={worst:.4} worst_step={closest:.3} max_drift={drift:.4}",
             hypotheses.len()
         )
     } else {
@@ -443,18 +462,57 @@ fn quantum(x: f32) -> f32 {
     2f32.powi(exponent.max(-126) - significant)
 }
 
-/// Each step's log-probability of `hypothesis` after `prompt`, teacher-forced
-/// one token a fire on a working set of its own: what a beam that read only
-/// its own ancestry takes; and the room a beam's step has from it. The
-/// logits are bf16, and the beam's fires run other kernels than these
-/// (more rows), which round their sums elsewhere: a
-/// logit may land a bf16 quantum apart (0.125 at a logit of 16 to 32), so
-/// a step's log-probability may move by the target's logit's quantum and
-/// the largest logit's (the log-sum-exp moves with it), and by its own
-/// quantum; past those a beam read what its ancestry did not hold.
-async fn rescore(prompt: &[u32], hypothesis: &[u32]) -> Result<Vec<(f32, f32)>> {
+/// One step of a hypothesis rescored alone: its log-probability, the room a
+/// beam's step has from it, and its drift between row counts.
+struct Rescored {
+    step: f32,
+    room: f32,
+    drift: f32,
+}
+
+/// Each step of `hypothesis` after `prompt`, teacher-forced one token a fire
+/// on working sets of its own ([`teacher_forced`]), as a 1-row fire and as a
+/// fire of `width` rows (the hypothesis and copies of itself: as many rows as
+/// the beam's own fires take): what a beam that read only its own ancestry
+/// takes there, and its room.
+async fn rescore(prompt: &[u32], hypothesis: &[u32], width: u32) -> Result<Vec<Rescored>> {
+    let one = teacher_forced(prompt, hypothesis, 1).await?;
+    let wide = teacher_forced(prompt, hypothesis, width).await?;
+    Ok(one
+        .iter()
+        .zip(&wide)
+        .map(|(&(step, picked, largest), &(paired, ..))| {
+            // The beam's fire and the rescore are independent fires, each up
+            // to one drift and one rounding from the true value. A rounding:
+            // the logits are bf16, so each fire's target logit and largest
+            // logit (which leads the log-sum-exp) may sit one quantum from
+            // the true value, and the log-probability its own quantum. A
+            // drift: fires of other rows run other kernels (other tiles,
+            // splits and reduction orders, compounding through every layer
+            // and the cache rows written), which the user allows (no batch
+            // invariance); `drift` is this step's own measure of it, the
+            // log-probability moved between a 1-row fire and one of the
+            // beam's width (the row count its own fires take). Both
+            // sides of the comparison may carry one of each: twice the drift.
+            let drift = (step - paired).abs();
+            let room = quantum(step) + quantum(picked) + quantum(largest) + 2.0 * drift;
+            Rescored { step, room, drift }
+        })
+        .collect())
+}
+
+/// Each step's log-probability of `hypothesis` after `prompt`, its target
+/// logit and its largest logit, teacher-forced one token a fire as `copies`
+/// rows (the hypothesis repeated, each copy on a working set of its own),
+/// read off the first.
+async fn teacher_forced(
+    prompt: &[u32],
+    hypothesis: &[u32],
+    copies: u32,
+) -> Result<Vec<(f32, f32, f32)>> {
     let v = model::output_vocab_size();
-    let ws = WorkingSet::new();
+    let sets: Vec<WorkingSet> = (0..copies).map(|_| WorkingSet::new()).collect();
+    let bound: Vec<&WorkingSet> = sets.iter().collect();
     let pipeline = Pipeline::new();
     let mut steps = Vec::with_capacity(hypothesis.len());
     for (at, &target) in hypothesis.iter().enumerate() {
@@ -464,37 +522,38 @@ async fn rescore(prompt: &[u32], hypothesis: &[u32]) -> Result<Vec<(f32, f32)>> 
             vec![hypothesis[at - 1] as i32]
         };
         let rows = u32::try_from(fed.len()).map_err(|_| "a prompt past u32 rows")?;
-        let toks = Channel::from(&fed[..]);
-        let indptr = Channel::from([0u32, rows]);
+        let all: Vec<i32> = (0..copies).flat_map(|_| fed.iter().copied()).collect();
+        let toks = Channel::from(&all[..]);
+        let indptr = Channel::from_iter((0..=copies).map(|c| c * rows));
         let wanted = Channel::from([target]);
         let out = Channel::new([1], dtype::f32);
         let picked = Channel::new([1], dtype::f32);
         let largest = Channel::new([1], dtype::f32);
         let fwd = ForwardPass::new();
         fwd.embed(&toks, &indptr)?;
-        fwd.state(&[&ws], StateGeometry::folding())
-            .context("bind the rescoring set")?;
+        fwd.state(&bound, StateGeometry::folding())
+            .context("bind the rescoring sets")?;
         fwd.epilogue(move || {
-            let logits = reshape(intrinsics::output(0, "logits"), [v]);
+            // The first copy's row, at the sampler's bf16 grain.
+            let logits = cast(
+                reshape(
+                    gather(reshape(intrinsics::output(0, "logits"), [copies, v]), iota(1)),
+                    [v],
+                ),
+                dtype::bf16,
+            );
             let wanted = wanted.take();
             picked.put(cast(&gather(&logits, &wanted), dtype::f32));
             largest.put(cast(&reshape(reduce_max(&logits), [1]), dtype::f32));
-            out.put(gather(log_softmax(&logits), &wanted));
+            out.put(cast(gather(log_softmax(&logits), &wanted), dtype::f32));
         });
         fwd.submit(&pipeline).context("rescore submit")?;
         let got = out.take_host::<Vec<f32>>().await.context("rescore drain")?;
         let step = got.first().copied().ok_or("the rescoring fire returned nothing")?;
         let picked = picked.take_host::<Vec<f32>>().await.context("rescore drain")?;
         let largest = largest.take_host::<Vec<f32>>().await.context("rescore drain")?;
-        // The beam's fire and the rescore round each logit independently, so
-        // each may sit one quantum from the true value on either side: the
-        // step's log-probability (target logit less the log-sum-exp, which
-        // the largest logit leads) may move by the target's quantum and the
-        // largest logit's, two quanta where they share a binade (the CUDA
-        // beam-4 run's 0.227 step against 0.25), and by its own quantum.
-        let room =
-            quantum(step) + picked.iter().chain(&largest).map(|&l| quantum(l)).sum::<f32>();
-        steps.push((step, room));
+        let first = |of: &[f32]| of.first().copied().ok_or("the rescoring fire returned nothing");
+        steps.push((step, first(&picked)?, first(&largest)?));
     }
     pipeline.close();
     Ok(steps)

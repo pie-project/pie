@@ -358,13 +358,18 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         let bytes = compiled
             .arena
             .bytes
-            .saturating_add(crate::inputs::attention_workspace_bytes(
-                &budget,
-                &facts,
-                &device.device(),
-                device.toggles(),
-                &crate::exports::schedule_streams(&boot.trace, &compiled),
-            ))
+            .saturating_add(
+                crate::inputs::attention_workspace_bytes(
+                    &budget,
+                    engine.fire_lanes_of(budget.max_lanes),
+                    boot.page_size,
+                    &facts,
+                    &device.device(),
+                    device.toggles(),
+                    &crate::exports::schedule_streams(&boot.trace, &compiled),
+                )
+                .map_err(|e| e.to_string())?,
+            )
             .saturating_add(windowed);
         let launches = u32::try_from(compiled.template().len()).unwrap_or(u32::MAX);
         Ok((bytes, launches))
@@ -395,10 +400,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         // The lanes one fire carries (`Shell::fire_lanes`): the runtime
         // fires a wider wave as fires of this many, and a rung's check fire
         // (`RungFacts::check_fire`) lays its rows over them.
-        let fire_lanes = match engine.fire_lanes {
-            0 => boot.budget.max_lanes,
-            cap => boot.budget.max_lanes.min(cap),
-        };
+        let fire_lanes = engine.fire_lanes_of(boot.budget.max_lanes);
         let rungs = crate::top::rung_facts(
             &candidates,
             boot.budget.max_lanes,
@@ -758,12 +760,14 @@ fn refit(
             })
             .collect()
     };
-    let working_at = |lanes: u32, tokens: u32, scoped: bool| -> u64 {
+    // A workspace the plan refuses fails the refit by name; a budget that
+    // does not compile is no fit.
+    let working_at = |lanes: u32, tokens: u32, scoped: bool| -> Result<u64> {
         let budget = budget_at(lanes, tokens);
         let lanes = budget.max_lanes;
         let Ok(compiled) = poem_compiler::compile_axes(&boot.trace, &budgets_at(&budget), profile)
         else {
-            return u64::MAX;
+            return Ok(u64::MAX);
         };
         let tiles: u64 = tiles_of(
             &decoded_weight_planes(&boot.trace, &compiled, table),
@@ -772,22 +776,24 @@ fn refit(
         .iter()
         .map(|plane| crate::store::decoded_weight_reserve(*plane, 1))
         .fold(0u64, u64::saturating_add);
-        compiled
+        Ok(compiled
             .arena
             .bytes
             .saturating_add(crate::inputs::attention_workspace_bytes(
                 &budget,
+                engine.fire_lanes_of(budget.max_lanes),
+                boot.page_size,
                 &facts,
                 &device.device(),
                 device.toggles(),
                 &schedule_streams(&boot.trace, &compiled),
-            ))
+            )?)
             .saturating_add(tiles)
             .saturating_add(
                 u64::from(lanes)
                     .saturating_mul(u64::from(tokens))
                     .saturating_mul(8),
-            )
+            ))
     };
     // What one sequence leaves a fire, and within it the
     // half the cache rows are owed when the floors can still reach it.
@@ -804,12 +810,14 @@ fn refit(
     let floor = TOKENS_FLOOR.min(asked_tokens);
     let fit = |owed: bool, scoped: bool| -> Result<Option<(u32, u32)>> {
         let mut tokens = asked_tokens;
-        while tokens > floor && working_at(asked_lanes, tokens, scoped) > room_at(tokens, owed)? {
+        while tokens > floor && working_at(asked_lanes, tokens, scoped)? > room_at(tokens, owed)? {
             tokens = crate::api::on_lattice(&engine, asked.max_tokens, tokens / 2).max(floor);
         }
         let room = room_at(tokens, owed)?;
+        // At these rows the workspace planned at every lane count already
+        // (the loop above), so a refusal here has surfaced.
         let lanes = crate::store::tokens_within(asked_lanes.min(tokens), 1, room, |lanes| {
-            working_at(lanes, tokens, scoped)
+            working_at(lanes, tokens, scoped).unwrap_or(u64::MAX)
         });
         // A 1024-lane boot of MiniMax-M3.1-Flash mini60 on an H100 cut its fires to
         // 1024 rows at 1024 lanes, then the lanes to 512: one 717-token prompt a fire.
@@ -824,16 +832,16 @@ fn refit(
                 tokens,
                 asked_tokens,
                 |rows| crate::api::on_lattice(&engine, asked.max_tokens, rows),
-                |wider| Ok(working_at(lanes, wider, scoped) <= room_at(wider, owed)?),
+                |wider| Ok(working_at(lanes, wider, scoped)? <= room_at(wider, owed)?),
             )?
         } else {
             tokens
         };
         let room = room_at(tokens, owed)?;
-        Ok((working_at(lanes, tokens, scoped) <= room).then_some((tokens, lanes)))
+        Ok((working_at(lanes, tokens, scoped)? <= room).then_some((tokens, lanes)))
     };
     let planes = decoded_weight_planes(&boot.trace, &compiled, table);
-    if working_at(asked_lanes, asked_tokens, false) <= room_at(asked_tokens, true)? {
+    if working_at(asked_lanes, asked_tokens, false)? <= room_at(asked_tokens, true)? {
         return Ok((compiled, budgets, tiles_of(&planes, false)));
     }
     // The tile stays whole while the half can be met with it; only one
@@ -869,7 +877,7 @@ fn refit(
          card has after the weight tier under the load's allowance, past the half the cache \
          rows are owed and what one sequence at the declared context needs.",
         asked_tokens,
-        working_at(asked_lanes, asked_tokens, scoped) >> 20,
+        working_at(asked_lanes, asked_tokens, scoped)? >> 20,
         live >> 20,
     );
     boot.budget = budget_at(lanes, tokens);
@@ -1443,6 +1451,7 @@ impl Shell {
         }
         let inputs = Inputs::reserve(
             &boot.budget,
+            engine.fire_lanes_of(boot.budget.max_lanes),
             paging,
             page_tables,
             &facts,

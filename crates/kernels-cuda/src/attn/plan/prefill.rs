@@ -109,23 +109,6 @@ pub fn partial_rows(tile: u32, num_qo_heads: u32, num_kv_heads: u32) -> u64 {
     u64::from(tile.div_ceil(group))
 }
 
-#[must_use]
-pub fn graph_padding(
-    rows: u32,
-    lanes: u32,
-    num_qo_heads: u32,
-    num_kv_heads: u32,
-    head_dim: u32,
-    device: &Device,
-    ctas_per_sm: u32,
-) -> (u32, u64) {
-    let kv_heads = num_kv_heads.max(1);
-    let group = u64::from((num_qo_heads / kv_heads).max(1));
-    let (tile, tiles) = graph_tiles(rows, lanes, group, head_dim);
-    let floor = u64::from(ctas_per_sm.max(1) * device.num_sm.max(1)) / u64::from(kv_heads);
-    (tile, floor.max(tiles))
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Schedule {
     pub split_kv: bool,

@@ -491,6 +491,22 @@ pub unsafe fn hipLaunchHostFunc(stream: Stream, func: HostFn, data: *mut c_void)
     }
 }
 
+/// Holds `stream` until the 32-bit word at `ptr` (device-visible) meets
+/// `value` under `flags` and `mask`.
+pub unsafe fn hipStreamWaitValue32(
+    stream: Stream,
+    ptr: *mut c_void,
+    value: u32,
+    flags: c_uint,
+    mask: u32,
+) -> HipError {
+    match sys::api() {
+        // SAFETY: forwarded unchanged; the caller holds HIP's contract.
+        Ok(api) => unsafe { (api.hip.hipStreamWaitValue32)(stream, ptr, value, flags, mask) },
+        Err(_) => hipErrorNotInitialized,
+    }
+}
+
 pub unsafe fn hipStreamBeginCapture(stream: Stream, mode: c_int) -> HipError {
     match sys::api() {
         // SAFETY: forwarded unchanged; the caller holds HIP's contract.
