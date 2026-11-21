@@ -535,8 +535,14 @@ async fn main(input: Input) -> Result<String> {
                 // candidate its own fire computed, within that candidate's
                 // own rounding ([`candidate_rounding`]). A score, token or
                 // parent cell read from another lane misses it.
-                let took = after - before;
-                let mine = record[0][lane][at];
+                let took = finite(
+                    &format!("beam {lane}'s score step at step {at}"),
+                    after - before,
+                )?;
+                let mine = finite(
+                    &format!("beam {lane}'s own candidate at step {at}"),
+                    record[0][lane][at],
+                )?;
                 let rounding =
                     candidate_rounding(mine, (at > 0).then(|| (before, after, bests[at - 1])));
                 let gap = (took - mine).abs();
@@ -688,6 +694,7 @@ async fn finish_check(
         .ok_or("the unbranched decode returned nothing")?;
     // The set's fire rounds its logits and log-probability as the beam's
     // fires do, and takes no candidate: a step's room with nothing carried.
+    let got = finite("the finished set's next-token score", got)?;
     let room = want.room(got, None);
     let apart = (got - want.step).abs();
     if apart > room.total() {
@@ -737,6 +744,16 @@ fn ulp_f32(x: f32) -> f32 {
 fn ulp(x: f32, fraction_bits: i32) -> f32 {
     let exponent = ((x.abs().to_bits() >> 23) & 0xff) as i32 - 127;
     2f32.powi(exponent.max(-126) - fraction_bits)
+}
+
+/// A value the verifier compares, refused by name where it is not finite: a
+/// NaN fails no `>` test, so it would pass every room unseen.
+fn finite(what: &str, x: f32) -> Result<f32> {
+    if x.is_finite() {
+        Ok(x)
+    } else {
+        Err(format!("{what} came out {x}: not a finite number"))
+    }
 }
 
 fn best_of(scores: &[f32]) -> f32 {
@@ -845,6 +862,13 @@ impl std::fmt::Display for Room {
 async fn rescore(prompt: &[u32], hypothesis: &[u32], width: u32) -> Result<Vec<Rescored>> {
     let one = teacher_forced(prompt, hypothesis, 1, Fold::All).await?;
     let wide = teacher_forced(prompt, hypothesis, width, Fold::None).await?;
+    for (name, pass) in [("1-row", &one), ("width", &wide)] {
+        for (at, &(step, picked, largest)) in pass.iter().enumerate() {
+            for value in [step, picked, largest] {
+                finite(&format!("the {name} rescore at step {at}"), value)?;
+            }
+        }
+    }
     Ok(one
         .iter()
         .zip(&wide)
