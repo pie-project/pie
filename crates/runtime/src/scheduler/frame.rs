@@ -42,6 +42,22 @@ pub(crate) fn seal_trace() -> bool {
     super::worker::wave_trace() || tracing::enabled!(tracing::Level::DEBUG)
 }
 
+/// Says, on the seal trace, why `lane` stops being awaited: which
+/// mechanism took it out of the gate.
+fn trace_unawait(cause: &str, lane: ProcessId, owner: Option<ProcessId>) {
+    if !seal_trace() {
+        return;
+    }
+    let line = format!("unawait cause={cause} lane={lane} owner={owner:?}");
+    if super::worker::wave_trace() {
+        super::worker::wave_trace_emit(format!(
+            "[wave-trace] t={}us {line}",
+            super::worker::wave_trace_us()
+        ));
+    }
+    tracing::debug!("{line}");
+}
+
 pub(super) fn idle_dump_threshold_us() -> u64 {
     static THRESHOLD: OnceLock<u64> = OnceLock::new();
     *THRESHOLD.get_or_init(|| {
@@ -534,10 +550,13 @@ impl FramePolicy {
     }
 
     fn retire_parks(&mut self) {
-        for state in self.lanes.values_mut() {
+        for (lane_id, state) in self.lanes.iter_mut() {
             while state.frames.front().is_some_and(|frame| frame.park) {
                 state.frames.pop_front();
                 if state.frames.is_empty() {
+                    if state.awaited {
+                        trace_unawait("park", *lane_id, state.owner);
+                    }
                     state.awaited = false;
                     state.parked = true;
                     state.clock_from = None;
@@ -636,6 +655,9 @@ impl FramePolicy {
             self.truncated_seqs.remove(&lane);
             self.in_flight_lanes.remove(&lane);
         } else if let Some(state) = self.lanes.get_mut(&lane) {
+            if state.awaited {
+                trace_unawait("close", lane, owner);
+            }
             state.awaited = false;
             state.parked = true;
             self.truncate_incomplete(lane);
@@ -675,7 +697,7 @@ impl FramePolicy {
     pub fn on_process_suspend(&mut self, owner: ProcessId) {
         self.suspended.insert(owner);
         self.pending_binds.remove(&owner);
-        self.park_owner(owner);
+        self.park_owner(owner, "suspend");
     }
 
     /// `owner` waits on something only the frame's firing frees: its bind
@@ -686,12 +708,12 @@ impl FramePolicy {
     /// they are parked as a suspension's are, and come back with its next
     /// submit ([`Self::record_arrival`]).
     pub fn on_owner_waits(&mut self, owner: ProcessId) {
-        self.park_owner(owner);
+        self.park_owner(owner, "owner-waits");
     }
 
     /// Parks `owner`'s lanes: none is awaited, what arrived of an
     /// incomplete frame goes as it stands.
-    fn park_owner(&mut self, owner: ProcessId) {
+    fn park_owner(&mut self, owner: ProcessId, cause: &str) {
         let owned: Vec<ProcessId> = self
             .lanes
             .iter()
@@ -700,6 +722,9 @@ impl FramePolicy {
             .collect();
         for lane_id in owned {
             if let Some(lane) = self.lanes.get_mut(&lane_id) {
+                if lane.awaited {
+                    trace_unawait(cause, lane_id, Some(owner));
+                }
                 lane.awaited = false;
                 lane.parked = true;
             }
@@ -1001,8 +1026,10 @@ impl FramePolicy {
                     .filter(|lane| lane.frames.front().is_some_and(PendingFrame::is_complete))
                     .count();
                 let awaited = self.lanes.values().filter(|lane| lane.awaited).count();
+                let parked = self.lanes.values().filter(|lane| lane.parked).count();
+                let leashed = self.lanes.values().filter(|lane| lane.leashed).count();
                 let line = format!(
-                    "seal partition={} fresh={} continuing={} complete_left={} awaited={} lanes={} in_flight={} mid_boundary={mid_boundary} prompts_only={} executing={} programs={} lanes_by_program={by_program:?} rows={wave_rows:?} tokens={wave_tokens:?}",
+                    "seal partition={} fresh={} continuing={} complete_left={} awaited={} parked={parked} leashed={leashed} lanes={} in_flight={} mid_boundary={mid_boundary} prompts_only={} executing={} programs={} lanes_by_program={by_program:?} rows={wave_rows:?} tokens={wave_tokens:?}",
                     members.len(),
                     fresh.len(),
                     continuing.len(),
@@ -1263,6 +1290,7 @@ ready_age_newest={}us",
                     }
                     match lane.clock_from {
                         Some(from) if now.saturating_duration_since(from) >= silence => {
+                            trace_unawait("silence", *lane_id, lane.owner);
                             lane.awaited = false;
                             lane.leashed = false;
                             lane.clock_from = None;
@@ -1270,6 +1298,7 @@ ready_age_newest={}us",
                             continue;
                         }
                         Some(from) if blocking && now.saturating_duration_since(from) >= leash => {
+                            trace_unawait("leash", *lane_id, lane.owner);
                             lane.awaited = false;
                             lane.parked = true;
                             lane.leashed = true;
@@ -1458,37 +1487,64 @@ mod tests {
         }
     }
 
-    /// Lanes of two kinds share frames of two steps under a dispatch depth
-    /// of two. A constant lane's next frame needs nothing from its guest,
-    /// so it runs a frame ahead of the device. A channel lane's next frame
-    /// reads an input its guest writes each step into a ring of `capacity`
-    /// cells, and a put into a full ring waits until the device takes a
-    /// cell: the guest's next submit waits on the retire of the frame that
-    /// takes what it wrote. Nothing tells the scheduler the guest waits;
-    /// the lane is expected this step like any other, so every frame
-    /// seals with every lane, whichever ring it reads.
+    /// Lanes of three kinds share frames of two steps under a dispatch
+    /// depth of two, each kind its own program (the epilogue lanes two, by
+    /// turns, as a beam step's).
+    ///
+    /// A constant lane's next frame needs nothing from its guest, so it
+    /// runs a frame ahead of the device. A channel lane's next frame reads
+    /// an input its guest writes each step into a ring of `capacity` cells,
+    /// and a put into a full ring waits until the device takes a cell: its
+    /// next submit waits on the retire of the frame that takes what it
+    /// wrote. An epilogue lane harvests its fire's result, then its guest
+    /// computes (wasm between fires, no channel wait, no park) across
+    /// several of the scheduler's passes, some while a frame executes and
+    /// some while none does, before it submits again.
+    ///
+    /// Nothing tells the scheduler a guest waits or computes: each lane is
+    /// expected this step like any other, so every frame seals with every
+    /// lane of every kind.
     #[test]
-    fn a_lane_whose_guest_writes_its_input_each_step_is_awaited_like_a_constant_one() {
+    fn a_lane_whose_guest_writes_its_input_or_computes_between_fires_is_awaited() {
         const K: usize = 2;
         const DEPTH: usize = 2;
-        const KINDS: usize = 3;
-        for capacity in [K, 2 * K] {
-            let mut policy = FramePolicy::new(K, 64, 4096, None)
-                .with_submit_deadline(Duration::from_secs(86_400));
-            struct Lane {
-                id: ProcessId,
-                program: u64,
-                /// The ring its guest writes, `None` for a constant input.
-                ring: Option<(usize, usize)>,
-                /// Frames submitted and not retired.
-                outstanding: usize,
-                seq: u64,
+        const EACH: usize = 3;
+        /// The scheduler passes an epilogue spans after its harvest.
+        const EPILOGUE: usize = 3;
+        #[derive(Clone, Copy)]
+        enum Kind {
+            Constant,
+            /// The ring's tail (cells written) and head (cells taken).
+            Channel(usize, usize),
+            /// Passes left in its epilogue.
+            Epilogue(usize),
+        }
+        struct Lane {
+            id: ProcessId,
+            kind: Kind,
+            /// Frames submitted and not retired.
+            outstanding: usize,
+            seq: u64,
+        }
+        impl Lane {
+            fn index(&self) -> usize {
+                match self.kind {
+                    Kind::Constant => 0,
+                    Kind::Channel(..) => 1,
+                    Kind::Epilogue(_) => 2,
+                }
             }
-            let mut lanes: Vec<Lane> = (0..2 * KINDS)
+        }
+        for capacity in [K, 2 * K] {
+            let mut policy = FramePolicy::new(K, 64, 4096, None);
+            let mut lanes: Vec<Lane> = (0..3 * EACH)
                 .map(|at| Lane {
                     id: pid(),
-                    program: if at < KINDS { 1 } else { 2 },
-                    ring: (at >= KINDS).then_some((0, 0)),
+                    kind: match at / EACH {
+                        0 => Kind::Constant,
+                        1 => Kind::Channel(0, 0),
+                        _ => Kind::Epilogue(0),
+                    },
                     outstanding: 0,
                     seq: 0,
                 })
@@ -1497,7 +1553,7 @@ mod tests {
             let mut owner_of: HashMap<u64, ProcessId> = HashMap::new();
             let mut queued: Vec<u64> = Vec::new();
             let mut in_flight: VecDeque<BTreeSet<ProcessId>> = VecDeque::new();
-            let mut sealed: Vec<(usize, usize)> = Vec::new();
+            let mut sealed: Vec<[usize; 3]> = Vec::new();
 
             let submit = |lanes: &mut Vec<Lane>,
                           policy: &mut FramePolicy,
@@ -1506,18 +1562,26 @@ mod tests {
                           next_fire: &mut u64| {
                 for lane in lanes.iter_mut() {
                     loop {
-                        let room = match lane.ring {
+                        let room = match lane.kind {
+                            Kind::Constant => lane.outstanding < DEPTH,
                             // The guest writes the frame's K cells first;
                             // a full ring parks the put.
-                            Some((tail, head)) => tail - head + K <= capacity,
-                            None => lane.outstanding < DEPTH,
+                            Kind::Channel(tail, head) => tail - head + K <= capacity,
+                            // It submits once its harvest is through and
+                            // its guest has computed what comes next.
+                            Kind::Epilogue(left) => lane.outstanding == 0 && left == 0,
                         };
                         if !room {
                             break;
                         }
-                        if let Some((tail, _)) = lane.ring.as_mut() {
+                        if let Kind::Channel(tail, _) = &mut lane.kind {
                             *tail += K;
                         }
+                        let program = match lane.kind {
+                            Kind::Constant => 1,
+                            Kind::Channel(..) => 2,
+                            Kind::Epilogue(_) => 12 + 3 * (lane.seq % 2),
+                        };
                         for slot in 0..K as u32 {
                             let fire = *next_fire;
                             *next_fire += 1;
@@ -1529,7 +1593,7 @@ mod tests {
                                 1,
                                 1,
                                 1,
-                                lane.program,
+                                program,
                             );
                             owner_of.insert(fire, lane.id);
                             queued.push(fire);
@@ -1543,7 +1607,7 @@ mod tests {
                             queued: &mut Vec<u64>,
                             owner_of: &HashMap<u64, ProcessId>,
                             in_flight: &mut VecDeque<BTreeSet<ProcessId>>,
-                            sealed: &mut Vec<(usize, usize)>,
+                            sealed: &mut Vec<[usize; 3]>,
                             lanes: &Vec<Lane>| {
                 while in_flight.len() < DEPTH {
                     let ids: QueuedFireIds = queued.iter().copied().collect();
@@ -1560,11 +1624,11 @@ mod tests {
                     queued.retain(|fire| !fires.contains(fire));
                     let members: BTreeSet<ProcessId> =
                         fires.iter().map(|fire| owner_of[fire]).collect();
-                    let channel = lanes
-                        .iter()
-                        .filter(|lane| lane.ring.is_some() && members.contains(&lane.id))
-                        .count();
-                    sealed.push((members.len() - channel, channel));
+                    let mut kinds = [0usize; 3];
+                    for lane in lanes.iter().filter(|lane| members.contains(&lane.id)) {
+                        kinds[lane.index()] += 1;
+                    }
+                    sealed.push(kinds);
                     policy.on_frame_posted(members.iter().copied(), Instant::now());
                     in_flight.push_back(members);
                 }
@@ -1587,32 +1651,51 @@ mod tests {
                     &lanes,
                 );
                 // The device runs the oldest frame: its takes free the
-                // channel lanes' cells, and its lanes may submit again.
+                // channel lanes' cells, and the epilogue lanes harvest it.
                 let members = in_flight
                     .pop_front()
-                    .expect("a frame is in flight: the gate never stalls both kinds");
+                    .expect("a frame is in flight: the gate never stalls every kind");
                 policy.on_frame_retired(members.iter().copied());
                 for lane in lanes.iter_mut().filter(|lane| members.contains(&lane.id)) {
                     lane.outstanding -= 1;
-                    if let Some((_, head)) = lane.ring.as_mut() {
-                        *head += K;
+                    match &mut lane.kind {
+                        Kind::Channel(_, head) => *head += K,
+                        Kind::Epilogue(left) => *left = EPILOGUE,
+                        Kind::Constant => {}
                     }
                 }
-                // The scheduler plans before the guests' next submits land.
-                schedule(
-                    &mut policy,
-                    &mut queued,
-                    &owner_of,
-                    &mut in_flight,
-                    &mut sealed,
-                    &lanes,
-                );
+                // The scheduler plans while the epilogues compute, the
+                // other kinds' next submits landing meanwhile.
+                for pass in 0..EPILOGUE {
+                    schedule(
+                        &mut policy,
+                        &mut queued,
+                        &owner_of,
+                        &mut in_flight,
+                        &mut sealed,
+                        &lanes,
+                    );
+                    for lane in lanes.iter_mut() {
+                        if let Kind::Epilogue(left) = &mut lane.kind {
+                            *left = left.saturating_sub(1);
+                        }
+                    }
+                    if pass == 0 {
+                        submit(
+                            &mut lanes,
+                            &mut policy,
+                            &mut queued,
+                            &mut owner_of,
+                            &mut next_fire,
+                        );
+                    }
+                }
             }
             assert!(sealed.len() >= 8, "capacity {capacity}: frames {sealed:?}");
             assert!(
-                sealed.iter().all(|&lanes| lanes == (KINDS, KINDS)),
-                "capacity {capacity}: every frame seals with every lane of both kinds \
-                 (constant, channel): {sealed:?}"
+                sealed.iter().all(|&kinds| kinds == [EACH; 3]),
+                "capacity {capacity}: every frame seals with every lane of every kind \
+                 (constant, channel, epilogue): {sealed:?}"
             );
         }
     }
