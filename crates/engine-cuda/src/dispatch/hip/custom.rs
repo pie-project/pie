@@ -723,17 +723,6 @@ impl Run<'_> {
                 .and_then(|planes| planes.keys_of(conv))
                 .map(|(plane, _, _)| plane);
             if let Some(k_plane) = k_plane {
-                // The beam groups' folds first (§11.3); the primitives below,
-                // where the fused step declines, fold none again.
-                self.conv1d_group_fold(qkv, conv_state, conv_width, dilation)
-                    .map_err(crate::error::kernel)?;
-                self.gated_delta_group_fold(
-                    (ba, dt_bias, a_log),
-                    state,
-                    (k_heads, v_heads, k_dim, v_dim),
-                    y,
-                )
-                .map_err(crate::error::kernel)?;
                 let conv_carry = self
                     .rs_carry(OP, &[x_plane, k_plane], &conv_pool)
                     .map_err(crate::error::kernel)?;
@@ -766,10 +755,7 @@ impl Run<'_> {
                 if done {
                     return Ok(());
                 }
-                let held = self.suspend_group_folds();
-                let primitives = self.gdn_step_primitives(op);
-                self.resume_group_folds(held);
-                return primitives;
+                return self.gdn_step_primitives(op);
             }
         }
         if !self.rs_extended() && !self.rs_buffered(qkv) {

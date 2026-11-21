@@ -579,6 +579,153 @@ impl Run<'_> {
         )
     }
 
+    /// The fire's beam group folds (`BEAM-PAGE-LISTS.md` §11.3), every
+    /// recurrent layer's, launched on the fire's stream ahead of its body: a
+    /// fold reads only the rows earlier fires kept in their buffer, never
+    /// this fire's, so each layer's state is folded before any of the
+    /// fire's steps reads it, by stream order alone. Each layer's state once,
+    /// whichever of its decode ops names it.
+    pub(crate) fn fold_groups_ahead(&self) -> Result<(), kernels_cuda::Error> {
+        use poem_ir::{Fused, Operation};
+        let mut folded: Vec<ValueId> = Vec::new();
+        let mut first = |state: ValueId| {
+            let new = !folded.contains(&state);
+            if new {
+                folded.push(state);
+            }
+            new
+        };
+        for node in self.nodes() {
+            match &node.op {
+                Operation::Ssm(Ssm::CausalConv1d {
+                    x,
+                    state,
+                    conv_width,
+                    dilation,
+                    ..
+                }) if first(*state) => {
+                    self.conv1d_group_fold(*x, *state, *conv_width, *dilation)?;
+                }
+                Operation::Ssm(Ssm::GatedDelta {
+                    gates,
+                    state,
+                    k_heads,
+                    v_heads,
+                    k_dim,
+                    v_dim,
+                    y,
+                    ..
+                }) if first(*state) => {
+                    let gated = self.gdn_gated(*gates).ok_or_else(|| kernels_cuda::Error::Backend {
+                        op: "ssm.gated_delta",
+                        detail: format!(
+                            "a beam group's fold over a step whose gates (value {}) no gate \
+                             prep forms, so its rows' gates cannot be read back",
+                            gates.0
+                        ),
+                    })?;
+                    self.gated_delta_group_fold(gated, *state, (*k_heads, *v_heads, *k_dim, *v_dim), *y)?;
+                }
+                Operation::Fused(Fused::GdnStep {
+                    qkv,
+                    conv_state,
+                    conv_width,
+                    dilation,
+                    ba,
+                    dt_bias,
+                    a_log,
+                    state,
+                    k_heads,
+                    v_heads,
+                    k_dim,
+                    v_dim,
+                    y,
+                    ..
+                }) => {
+                    if first(*conv_state) {
+                        self.conv1d_group_fold(*qkv, *conv_state, *conv_width, *dilation)?;
+                    }
+                    if first(*state) {
+                        self.gated_delta_group_fold(
+                            (*ba, *dt_bias, *a_log),
+                            *state,
+                            (*k_heads, *v_heads, *k_dim, *v_dim),
+                            *y,
+                        )?;
+                    }
+                }
+                Operation::Ssm(Ssm::Kda {
+                    mixed,
+                    f,
+                    b,
+                    dt_bias,
+                    a_log,
+                    state,
+                    heads,
+                    head_dim,
+                    norm_eps,
+                    gate_floor,
+                    y,
+                }) if first(*state) => {
+                    const OP: &str = "ssm.kda";
+                    let planes = self.rs_step_planes(OP, &[*f, *b], *mixed, Some(*y))?;
+                    if let Some((carry, folds, groups)) = self.rs_group_folds(OP, &planes)? {
+                        kernels_cuda::ssm::kda_fold(
+                            self.ctx(),
+                            &one_token(self.recurrent_absolute(*state)),
+                            *heads,
+                            *head_dim,
+                            *norm_eps,
+                            *gate_floor,
+                            self.tensor(*dt_bias),
+                            self.tensor(*a_log),
+                            &carry,
+                            folds,
+                            groups,
+                        )?;
+                    }
+                }
+                Operation::Ssm(Ssm::Mamba2 {
+                    xbc,
+                    dt,
+                    a_log,
+                    dt_bias,
+                    d,
+                    norm,
+                    eps,
+                    state,
+                    heads,
+                    groups,
+                    ..
+                }) if first(*state) => {
+                    const OP: &str = "ssm.mamba2";
+                    let m = kernels_cuda::ssm::Mamba2 {
+                        a_log: self.tensor(*a_log),
+                        dt_bias: self.tensor(*dt_bias),
+                        d: self.tensor(*d),
+                        norm: self.tensor(*norm),
+                        eps: *eps,
+                        heads: *heads,
+                        groups: *groups,
+                    };
+                    let planes = self.rs_step_planes(OP, &[*dt], *xbc, None)?;
+                    if let Some((carry, folds, count)) = self.rs_group_folds(OP, &planes)? {
+                        kernels_cuda::ssm::mamba2_fold(
+                            self.ctx(),
+                            &one_token(self.recurrent_absolute(*state)),
+                            m,
+                            &carry,
+                            folds,
+                            count,
+                        )?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     /// The beam groups' conv window folds before the layer's step (§11.3).
     pub(crate) fn conv1d_group_fold(
         &self,
@@ -652,7 +799,6 @@ impl Run<'_> {
         y: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
         const OP: &str = "ssm.causal_conv1d";
-        self.conv1d_group_fold(x, state, conv_width, dilation)?;
         let pool = self.recurrent_absolute(state);
         let x_plane = self.rs_plane(OP, x)?;
         let (planes, keys) = match self.rs_planes().and_then(|planes| planes.keys_of(y)) {
@@ -701,12 +847,7 @@ impl Run<'_> {
         y: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
         const OP: &str = "ssm.gated_delta";
-        self.gated_delta_group_fold(
-            (ba, dt_bias, a_log),
-            state,
-            (k_heads, v_heads, k_dim, v_dim),
-            y,
-        )?;
+        let _ = (dt_bias, a_log);
         let pool = self.recurrent_absolute(state);
         let _ = qkv;
         let carry = self.rs_carry(OP, &self.gdn_planes(OP, ba, y)?, &pool)?;
@@ -787,22 +928,6 @@ impl Run<'_> {
         const OP: &str = "ssm.kda";
         let pool = self.recurrent_absolute(state);
         let planes = self.rs_step_planes(OP, &[f, b], mixed, Some(y))?;
-        // The beam groups' folds first (§11.3).
-        if let Some((carry, folds, groups)) = self.rs_group_folds(OP, &planes)? {
-            kernels_cuda::ssm::kda_fold(
-                self.ctx(),
-                &one_token(pool),
-                heads,
-                head_dim,
-                norm_eps,
-                gate_floor,
-                self.tensor(dt_bias),
-                self.tensor(a_log),
-                &carry,
-                folds,
-                groups,
-            )?;
-        }
         let carry = self.rs_carry(OP, &planes, &pool)?;
         kernels_cuda::ssm::kda_carried(
             self.ctx(),
@@ -878,10 +1003,6 @@ impl Run<'_> {
         const OP: &str = "ssm.mamba2";
         let pool = self.recurrent_absolute(state);
         let planes = self.rs_step_planes(OP, &[dt], xbc, None)?;
-        // The beam groups' folds first (§11.3).
-        if let Some((carry, folds, groups)) = self.rs_group_folds(OP, &planes)? {
-            kernels_cuda::ssm::mamba2_fold(self.ctx(), &one_token(pool), m, &carry, folds, groups)?;
-        }
         let carry = self.rs_carry(OP, &planes, &pool)?;
         kernels_cuda::ssm::mamba2_carried(
             self.ctx(),

@@ -938,6 +938,13 @@ impl FireCtx<'_> {
                 folds: p.rs.group_folds.then_some((tables.folds, tables.fold_entries)),
             });
         }
+        // The fire's beam group folds, every layer's, on its stream ahead of
+        // its body (§11.3): no step of the fire reads a state before its
+        // fold.
+        if p.rs.group_folds {
+            run.fold_groups_ahead()
+                .map_err(|error| Fault::from(crate::error::kernel(error)))?;
+        }
         super::btrace::mark("run_new");
         let records = self.graphs.records();
         // A size-only walk (`crate::sizing`) walks what arming would capture,
@@ -994,7 +1001,6 @@ impl FireCtx<'_> {
                     ceilings,
                     islands: &p.islands,
                     rs: p.rs.body,
-                    group_folds: p.rs.group_folds,
                 };
 
                 // A serving fire replays a body or is counted: one that
