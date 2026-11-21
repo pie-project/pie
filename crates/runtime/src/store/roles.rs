@@ -664,6 +664,36 @@ pub struct Taken {
 pub struct GuestTaken {
     scratch: Option<Part>,
     pair: Option<(FireKey, Part, bool, u64)>,
+    /// Its pair came back from a park for this bind: fresh room, kept on
+    /// the device whatever the bind's fate (the pair item's own).
+    pair_retaken: bool,
+}
+
+impl GuestTaken {
+    /// The runs of chunks its fresh parts took, `(run, pieces)` summed at
+    /// the longest run: what a bind short of room for its tables beside
+    /// them asks with its own chunk ([`Roles::bind_short`]).
+    fn fresh_runs(&self) -> Option<(u32, u32)> {
+        let parts: Vec<(u32, u32)> = self
+            .scratch
+            .iter()
+            .chain(
+                self.pair
+                    .iter()
+                    .filter(|(_, _, fresh, _)| *fresh || self.pair_retaken)
+                    .map(|(_, part, ..)| part),
+            )
+            .map(Part::chunk_runs)
+            .collect();
+        let longest = parts.iter().map(|&(run, _)| run).max()?;
+        Some((
+            longest,
+            parts
+                .iter()
+                .map(|&(run, pieces)| run.div_ceil(longest).saturating_mul(pieces))
+                .sum(),
+        ))
+    }
 }
 
 impl Taken {
@@ -1945,10 +1975,10 @@ impl Roles {
         registered: impl Fn(ChannelId) -> bool,
         adapter: Option<u128>,
         guest: GuestTaken,
-    ) -> Result<Taken, RolesError> {
+    ) -> Result<Taken, (RolesError, u32)> {
         let Some(facts) = self.programs.get(&program).cloned() else {
             self.untake_guest(guest);
-            return Err(RolesError::Program(program));
+            return Err((RolesError::Program(program), 0));
         };
         let mut shared = Vec::new();
         for &id in channels {
@@ -1956,10 +1986,13 @@ impl Roles {
                 if item.tier != Tier::Device {
                     let holder = item.holder;
                     self.untake_guest(guest);
-                    return Err(RolesError::Parked {
-                        channel: id,
-                        holder,
-                    });
+                    return Err((
+                        RolesError::Parked {
+                            channel: id,
+                            holder,
+                        },
+                        0,
+                    ));
                 }
                 shared.push(id);
             }
@@ -1980,7 +2013,7 @@ impl Roles {
             Ok(part) => taken.parts.push(part),
             Err(error) => {
                 self.untake_guest(guest);
-                return Err(error);
+                return Err((error, 0));
             }
         }
         for ring in &facts.rings {
@@ -2002,9 +2035,10 @@ impl Roles {
                     taken.rings.push(ring.channel);
                 }
                 Err(error) => {
+                    let opened = u32::try_from(taken.parts.len()).unwrap_or(u32::MAX);
                     self.give(&device, &taken.parts);
                     self.untake_guest(guest);
-                    return Err(error);
+                    return Err((error, opened));
                 }
             }
         }
@@ -2017,7 +2051,7 @@ impl Roles {
                 Some(_) => {
                     self.give(&device, &taken.parts);
                     self.untake_guest(guest);
-                    return Err(RolesError::AdapterParked);
+                    return Err((RolesError::AdapterParked, 0));
                 }
                 None => match self.take(
                     &device,
@@ -2027,9 +2061,10 @@ impl Roles {
                 ) {
                     Ok(part) => Some((key, part, true)),
                     Err(error) => {
+                        let opened = u32::try_from(taken.parts.len()).unwrap_or(u32::MAX);
                         self.give(&device, &taken.parts);
                         self.untake_guest(guest);
-                        return Err(error);
+                        return Err((error, opened));
                     }
                 },
             };
@@ -2202,6 +2237,7 @@ impl Roles {
                             item.tier = Tier::Device;
                             item.shed = false;
                             item.generation = generation;
+                            taken.pair_retaken = true;
                             Some((pair, part, false, generation))
                         }
                         Err(room) => {
@@ -2281,12 +2317,47 @@ impl Roles {
     /// a free chunk of the budget holds any one item (a run past a chunk is
     /// `PastChunk`), so it waits for room as a guest state does
     /// ([`RolesError::BindShort`]). Anything else stands as it is.
-    fn bind_short(&self, error: RolesError) -> RolesError {
+    /// `guest`: the runs its guest state's fresh parts took; `opened`: the
+    /// parts of its own (tables, rings, adapter) taken before the one
+    /// short, each of which may have opened a chunk.
+    fn bind_short(&self, error: RolesError, guest: Option<(u32, u32)>, opened: u32) -> RolesError {
         match error {
             RolesError::Short { .. } | RolesError::NoRun { .. }
                 if self.device.lock().unwrap().state_chunks_now() > 0 =>
             {
-                RolesError::BindShort(Box::new(error))
+                // Short of its tables' chunk beside the fresh chunks its guest
+                // state took (and gave back): the room asked is all of them,
+                // never the tables' one chunk alone (seed 46 of the
+                // simulation on f152f9631: a scratch chunk and a pair chunk
+                // taken, the tables short of a third, one chunk served, short
+                // again, a spin). Runs of more than one chunk ask one more
+                // run of their length for the tables: over, never under.
+                let short = match guest.or((opened > 0).then_some((1, 0))) {
+                    Some((run, pieces)) => RolesError::GuestShort {
+                        what: format!(
+                            "its tables, rings and adapter beside its guest state's {pieces} fresh \
+                             runs ({error})"
+                        ),
+                        bytes: 0,
+                        room: if run <= 1 {
+                            GuestRoom::Slots {
+                                slots: 0,
+                                committable: 0,
+                                chunks: pieces + opened + 1,
+                            }
+                        } else {
+                            GuestRoom::Runs {
+                                run,
+                                pieces: pieces + opened + 1,
+                                free_runs: 0,
+                                free_chunks: 0,
+                                committable: 0,
+                            }
+                        },
+                    },
+                    None => error,
+                };
+                RolesError::BindShort(Box::new(short))
             }
             error => error,
         }
@@ -3354,7 +3425,7 @@ pub fn take_ring(
     Ok(Some(
         roles
             .take_channel(&facts)
-            .map_err(|error| roles.bind_short(error))?,
+            .map_err(|error| roles.bind_short(error, None, 0))?,
     ))
 }
 
@@ -3482,6 +3553,7 @@ pub fn take_bind(
     };
     let mut roles = roles.lock().unwrap();
     let guest = roles.take_guest(&binding.channels, (pair, state), holder)?;
+    let fresh = guest.fresh_runs();
     let taken = roles
         .take_instance(
             binding.program,
@@ -3490,7 +3562,7 @@ pub fn take_bind(
             adapter,
             guest,
         )
-        .map_err(|error| roles.bind_short(error))?;
+        .map_err(|(error, opened)| roles.bind_short(error, fresh, opened))?;
     Ok(Some(taken))
 }
 

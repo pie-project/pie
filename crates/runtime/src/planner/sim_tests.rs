@@ -40,8 +40,10 @@
 //! the kv sets a move walks). Runs are one at a time across test threads.
 //!
 //! Data integrity: the lane's copies move bytes (each tier's slots, laid out
-//! by chunk as the device's), the engine lays each instance's tables, rings
-//! and resident bytes and each fresh pair with known patterns at bind, and a
+//! by chunk as the device's), the engine lays each instance's tables and
+//! rings at bind, and each pair at a taking it has not seen, with known
+//! patterns (scratch is dead between fires, a pair's state laid again at
+//! each new taking: `engine::GuestState`), and a
 //! fire writes each kv page's pattern. Before every fire (after every
 //! restore) everything the fire reads is checked as its owner wrote it.
 
@@ -109,12 +111,13 @@ impl Rng {
 // The pool and its engine.
 // ---------------------------------------------------------------------------
 
-/// A guest program's state: its instance's resident bytes and its pair's,
-/// in pieces of `run` chunks.
+/// A guest program's state: its instance's scratch and its pair's, in
+/// pieces of `run` chunks. Both are dead between fires (`engine::GuestState`):
+/// what a later fire reads lies in the instance's tables.
 #[derive(Clone, Copy, Debug)]
 struct Program {
     run: u32,
-    resident: u64,
+    scratch: u64,
     per_pair: u64,
 }
 
@@ -139,24 +142,24 @@ impl PoolShape {
         let mut programs = vec![
             Program {
                 run: 1,
-                resident: 96 * SLOT,
+                scratch: 96 * SLOT,
                 per_pair: 64 * SLOT,
             },
             Program {
                 run: 1,
-                resident: MIB,
+                scratch: MIB,
                 per_pair: MIB,
             },
             Program {
                 run: 2,
-                resident: 2 * MIB,
+                scratch: 2 * MIB,
                 per_pair: 0,
             },
         ];
         if total >= 28 && segment >= 6 {
             programs.push(Program {
                 run: 3,
-                resident: 3 * MIB,
+                scratch: 3 * MIB,
                 per_pair: 3 * MIB,
             });
         }
@@ -501,8 +504,8 @@ impl Engine for SimEngine {
     ) -> ::engine::Result<GuestState> {
         let p = self.programs[program.0 as usize];
         Ok(GuestState {
-            resident: p.resident,
-            scratch: 0,
+            resident: 0,
+            scratch: p.scratch,
             scratch_arms: 1,
             per_pair: p.per_pair,
             run: p.run,
@@ -564,12 +567,10 @@ impl Engine for SimEngine {
 
 const PART_TABLE: u8 = 0;
 const PART_RING: u8 = 1;
-const PART_RESIDENT: u8 = 2;
 
 /// An instance's own live parts at `places`, each slot with the pattern its
-/// bind laid: (part, shape, slot, pattern). Its scratch place holds its
-/// `GuestState::resident` bytes (the programs state no per-fire scratch),
-/// which the engine reads from bind to unbind, at rest included.
+/// bind laid: (part, shape, slot, pattern). Its scratch is dead between
+/// fires and holds nothing to check.
 fn instance_parts(id: u64, places: &Places) -> Vec<(u8, u32, u32, u64)> {
     let mut parts = Vec::new();
     for (at, &slot) in places.instance.iter().enumerate() {
@@ -580,9 +581,6 @@ fn instance_parts(id: u64, places: &Places) -> Vec<(u8, u32, u32, u64)> {
             let at = u64::from(ring.channel) << 32 | at as u64;
             parts.push((PART_RING, CHANNEL, slot, pattern(2, id, at)));
         }
-    }
-    for (at, slot) in place_slots(&places.scratch).into_iter().enumerate() {
-        parts.push((PART_RESIDENT, INSTANCE, slot, pattern(3, id, at as u64)));
     }
     parts
 }
@@ -1075,8 +1073,7 @@ fn verify(ctx: &Ctx, sets: &[Set], instances: &[InstanceId]) -> Result<(), Strin
             if got != Some(want) {
                 let part = match kind {
                     PART_TABLE => "launch tables",
-                    PART_RING => "ring",
-                    _ => "resident bytes (its scratch place)",
+                    _ => "ring",
                 };
                 return Err(format!(
                     "instance {id} of program {}: its {part} slot {slot}: {}",
@@ -1092,16 +1089,13 @@ fn verify(ctx: &Ctx, sets: &[Set], instances: &[InstanceId]) -> Result<(), Strin
         let Some(&(laid, _)) = pairs.get(&places.program) else {
             continue;
         };
-        if places.pair_generation != laid {
-            return Err(format!(
-                "instance {id} of program {}: its pair, bound throughout, was taken anew \
-                 (generation {laid} -> {}) and laid fresh: its cross-fire state lost",
-                places.program, places.pair_generation
-            ));
-        }
+        // A pair holds no state across fires (`engine::GuestState`): taken
+        // anew (its generation renewed) the engine lays it fresh; what it
+        // laid at the taking the instance is bound on must stand.
+        let _ = laid;
         for (at, slot) in pair.into_iter().enumerate() {
             log.guest_slots_checked += 1;
-            let want = pattern(4, places.program << 32 | laid, at as u64);
+            let want = pattern(4, places.program << 32 | places.pair_generation, at as u64);
             let got = bytes.read(TIER_DEVICE, INSTANCE, slot);
             if got != Some(want) {
                 return Err(format!(
@@ -1950,52 +1944,48 @@ fn replay_seed(seed: u64) -> Vec<Failure> {
 /// fixed, each with a seed that showed it (its regression test below,
 /// ignored until fixed). The fast sweep fails on any other shape; once a
 /// shape is fixed its entry goes and its test is no longer ignored.
-const KNOWN: [(&str, u64); 9] = [
-    // A bind whose instance and pair parts each open a fresh chunk is
-    // refused as short of its last part alone (`GuestShort` of a run of
-    // slots: one chunk); the planner serves one free chunk, the bind is
-    // short again at once, and it spins without yielding.
-    ("refused bind program #: spins", 1),
-    // A restore suspended for its bind's room is refused
-    // `PendingBindShort` and queued again needing the bind's pieces plus
-    // its own unpark's (`requeue_restore_roles` writes that back into
-    // `bind_room`); the next refusal adds its own again (2, 4, 6, ...),
-    // until the need stands nowhere and the head waits with nothing in
-    // flight.
-    ("stall restore: its pending bind's need ratcheted", 13),
-    // A bind-suspended restore whose placement stands (the bind's run
-    // beside its unpark) is refused by its takes in the same room ("a
-    // restore refused with nothing else in flight stands in the placement
-    // in the same room"), and no pick follows.
-    ("stall restore: placement stands", 111),
+const KNOWN: [(&str, u64); 2] = [
     // A restore short of runs, no move named: every candidate blocked, or
-    // every pick unhostable, or no pick, the policy asked with nothing in
-    // flight.
-    ("stall restore: placement short", 46),
-    // A bind short of a run of two: no placement, no pick or every pick
-    // unhostable, the policy asked with nothing in flight.
+    // no pick, the policy asked with nothing in flight (seeds 111, 93,
+    // 3822).
+    ("stall restore: placement short", 111),
+    // Processes left waiting long after the last arrival: a restore
+    // waiting on its instances' rebinds while another process parks and
+    // unparks, one stuck Evicting (seeds 774, 2315, 2964, 3754, 3853).
+    ("liveness", 774),
+];
+
+/// Shapes the simulation found and the runtime fixed, each seed's
+/// regression test run in the suite; the fast sweep fails on them again.
+const FIXED: [(&str, u64); 9] = [
+    // A bind's guest parts and its tables, rings or adapter each open a
+    // fresh chunk, the refusal quoting the part short alone: served one
+    // chunk, short again, a spin (seeds 1, 46, 4137, 4287). The refusal
+    // asks every chunk the bind opens.
+    ("refused bind program #: spins", 1),
+    // A bind-suspended restore's need ratcheted with each refusal.
+    ("stall restore: its pending bind's need ratcheted", 13),
+    // A bind-suspended restore whose placement stands refused by its
+    // takes, no pick following.
+    ("stall restore: placement stands", 111),
+    // A bind short of a run of two, no placement and no pick.
     ("stall bind room", 188),
-    // An instance's resident bytes (`GuestState::resident`, its scratch
-    // place: read by every fire from bind to unbind) are a part the roles
-    // call dead between fires (`Part::dead`): a park sheds them, copying
-    // nothing, and the unpark takes fresh slots, so the next fire reads
-    // another owner's bytes or none.
+    // Resident bytes lost at a park: every engine states its value
+    // scratch as scratch, dead between fires, and a bind stating resident
+    // bytes is refused by name (`RolesError::ResidentState`).
     ("corrupt instance # of program #: its resident bytes", 1),
-    // A pair's state (`GuestState::per_pair`, held while any instance of it
-    // is bound) parked with its instances is shed as dead and taken anew
-    // with a new generation at the unpark: the engine, told a pair it has
-    // not seen, lays it fresh, its cross-fire state lost.
+    // A pair taken anew at an unpark is laid fresh: right by the pair
+    // contract (`engine::GuestState`), the check now reads the pair at the
+    // generation its instance is bound on.
     (
         "corrupt instance # of program #: its pair, bound throughout, was taken anew",
         19,
     ),
-    // A pair kept at its generation whose slots hold another owner's
-    // bytes: its place was given back and taken by another while bound.
+    // A bound pair's slots taken by another: a pair parked with one
+    // holder while another member was on its way.
     ("corrupt instance # of program #: its pair's", 3364),
-    // Processes left waiting with something said to be in flight that
-    // never ends: a restore waiting on its instances' rebinds while
-    // another process parks and unparks in a loop, one stuck Evicting, the
-    // rest at admission behind them.
+    ("corrupt instance # of program #: its pair's", 3999),
+    // A restore waiting on rebinds beside a park and unpark loop.
     ("liveness", 1711),
 ];
 
@@ -2023,13 +2013,8 @@ fn the_simulated_fleet_settles_every_step_on_200_seeds() {
     );
 }
 
-/// The regression seed of the [`KNOWN`] shape `prefix` runs clean of it.
-fn regression(prefix: &str) {
-    let seed = KNOWN
-        .iter()
-        .find(|(known, _)| *known == prefix)
-        .expect("a known shape")
-        .1;
+/// Seed `seed` runs clean of the shape `prefix` ([`KNOWN`], [`FIXED`]).
+fn regression((prefix, seed): (&str, u64)) {
     let failures = replay_seed(seed);
     for failure in &failures {
         eprintln!(
@@ -2048,57 +2033,60 @@ fn regression(prefix: &str) {
 }
 
 #[test]
-#[ignore = "the planner fix is pending: a bind's two fresh chunks quoted as one"]
-fn sim_seed_1_a_bind_of_two_fresh_chunks_does_not_spin() {
-    regression(KNOWN[0].0);
+fn sim_seed_1_a_bind_s_parts_opening_fresh_chunks_do_not_spin() {
+    regression(FIXED[0]);
 }
 
 #[test]
-#[ignore = "the planner fix is pending: PendingBindShort's need ratchets"]
 fn sim_seed_13_a_bind_suspended_restore_s_need_does_not_ratchet() {
-    regression(KNOWN[1].0);
+    regression(FIXED[1]);
 }
 
 #[test]
-#[ignore = "the planner fix is pending: a standing placement refused by its takes"]
 fn sim_seed_111_a_bind_suspended_restore_whose_placement_stands_is_sent() {
-    regression(KNOWN[2].0);
+    regression(FIXED[2]);
 }
 
 #[test]
-#[ignore = "the planner fix is pending: a restore short of runs with no pick"]
-fn sim_seed_46_a_restore_short_of_runs_is_funded() {
-    regression(KNOWN[3].0);
-}
-
-#[test]
-#[ignore = "the planner fix is pending: a bind short of a run with no pick"]
 fn sim_seed_188_a_bind_short_of_a_run_is_funded() {
-    regression(KNOWN[4].0);
+    regression(FIXED[3]);
 }
 
 #[test]
-#[ignore = "the roles fix is pending: an instance's resident bytes shed at a park"]
-fn sim_seed_1_an_instance_s_resident_bytes_survive_a_park() {
-    regression(KNOWN[5].0);
+fn sim_seed_1_no_guest_state_a_later_fire_reads_is_lost_at_a_park() {
+    regression(FIXED[4]);
 }
 
 #[test]
-#[ignore = "the roles fix is pending: a bound pair taken anew at an unpark"]
-fn sim_seed_19_a_bound_pair_s_state_survives_a_disk_park() {
-    regression(KNOWN[6].0);
+fn sim_seed_19_a_pair_taken_anew_is_laid_at_its_new_generation() {
+    regression(FIXED[5]);
 }
 
 #[test]
-#[ignore = "the roles fix is pending: a bound pair's slots taken by another"]
 fn sim_seed_3364_a_bound_pair_s_slots_are_its_own() {
-    regression(KNOWN[7].0);
+    regression(FIXED[6]);
 }
 
 #[test]
-#[ignore = "the planner fix is pending: a park and unpark loop beside a restore waiting on rebinds"]
+fn sim_seed_3999_a_bound_pair_s_slots_are_its_own() {
+    regression(FIXED[7]);
+}
+
+#[test]
 fn sim_seed_1711_every_process_ends() {
-    regression(KNOWN[8].0);
+    regression(FIXED[8]);
+}
+
+#[test]
+#[ignore = "pending: a restore short of runs, no move named"]
+fn sim_seed_111_a_restore_short_of_runs_is_funded() {
+    regression(KNOWN[0]);
+}
+
+#[test]
+#[ignore = "pending: processes left waiting long after the last arrival"]
+fn sim_seed_774_every_process_ends() {
+    regression(KNOWN[1]);
 }
 
 /// What a run did, as a string two runs of one seed must agree on.

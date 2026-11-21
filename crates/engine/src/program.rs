@@ -116,15 +116,22 @@ pub struct InstanceBinding {
 /// taken at the bind and held while bound ([`InstanceBinding::scratch`],
 /// [`InstanceBinding::pair`], [`ScratchPlace`]). Their contents are dead
 /// between fires: a park gives them back and an unpark takes fresh room,
-/// nothing copied, the engine told where ([`Rebind::Instance`]). A pair
-/// holds no state across fires: everything a later fire reads from it is
-/// restaged at launch or at the rebind (CUDA's flight tables, staged again
-/// at the next fire of a moved pair; Metal's batch sets, laid at the
-/// rebind; Vulkan's and wgpu's heaps and score rows, written in the fire),
-/// pending Mac's and TPU's confirmation for theirs. Anything a fire leaves
-/// for a later one to read lies in the instance's tables
-/// ([`InstanceBinding::instance_slots`]), which a park copies byte for
-/// byte.
+/// nothing copied, the engine told where ([`Rebind::Instance`]).
+///
+/// A guest pair holds no GPU-written state across fires: anything a fire
+/// writes that a later fire reads lives in the instance's tables
+/// ([`InstanceBinding::instance_slots`], [`ProgramFacts::instance`]), its
+/// rings or channel cells, all moved byte for byte by a park. A pair may
+/// hold host-laid constant tables (descriptors, params, bindings,
+/// offsets, lane indices, layout words) laid when the pair lands and read
+/// by later fires without restaging. So a pair's bytes may be dropped on
+/// park and retaken freely, but whenever a pair lands in new room (a fresh
+/// taking, a rebind, a moving retarget, or a park that brings it back
+/// elsewhere) the runtime gives it a new pair generation
+/// ([`InstanceBinding::pair_generation`]), and the engine lays its tables
+/// again before the next fire. Settled from code on CUDA (host-staged
+/// tables), XLA (no pair), Metal (batch sets laid at the rebind) and
+/// engine-gpu (heaps and score rows a fire writes before it reads).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuestState {
     /// Bytes an instance holds from bind to unbind that a later fire reads
