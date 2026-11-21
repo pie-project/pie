@@ -301,6 +301,10 @@ pub const SOURCES: &[(&str, &str)] = &[
         include_str!(concat!(source_root!(), "/runtime/keepalive.metal")),
     ),
     (
+        "runtime/resident.metal",
+        include_str!(concat!(source_root!(), "/runtime/resident.metal")),
+    ),
+    (
         "runtime/nan_check.metal",
         include_str!(concat!(source_root!(), "/runtime/nan_check.metal")),
     ),

@@ -6,6 +6,7 @@ mod a_bound_guest_leaves_the_span_as_it_was;
 mod a_cold_registration_compiles_while_lanes_fire;
 mod a_group_fold_is_the_sequential_fold;
 mod a_lagged_decode_answers_the_unlagged;
+mod the_resident_probe_counts_the_cores;
 mod a_mixed_fires_last_rows_are_each_lanes_own;
 mod a_prewarmed_program_registers_off_thread_without_compiling;
 mod a_faulted_epilogue_fails_its_own_lanes_alone;
