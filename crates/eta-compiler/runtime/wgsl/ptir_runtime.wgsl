@@ -623,8 +623,8 @@ var<private> pie_neg_zero_bits : u32 = 0x80000000u;
 fn NEG_ZERO() -> f32 { return bitcast<f32>(pie_neg_zero_bits); }
 
 fn cmax(l : f32, r : f32) -> f32 {
-  let ln = l != l;
-  let rn = r != r;
+  let ln = f32_is_nan(l);
+  let rn = f32_is_nan(r);
   if (ln && rn) { return NEG_INF(); }
   if (ln) { return r; }
   if (rn) { return l; }
@@ -637,8 +637,8 @@ fn cmax(l : f32, r : f32) -> f32 {
 }
 
 fn cmin(l : f32, r : f32) -> f32 {
-  let ln = l != l;
-  let rn = r != r;
+  let ln = f32_is_nan(l);
+  let rn = f32_is_nan(r);
   if (ln && rn) { return POS_INF(); }
   if (ln) { return r; }
   if (rn) { return l; }
@@ -651,6 +651,13 @@ fn cmin(l : f32, r : f32) -> f32 {
 }
 
 fn sign_bit(x : f32) -> bool { return (bitcast<u32>(x) & 0x80000000u) != 0u; }
+
+// A NaN read off its bits: WGSL compilers fold a self-compare (`x != x`)
+// to false, so a NaN test written as one never fires.
+fn f32_is_nan(x : f32) -> bool {
+  let b = bitcast<u32>(x);
+  return (b & 0x7F800000u) == 0x7F800000u && (b & 0x007FFFFFu) != 0u;
+}
 
 fn red_identity(kind : u32) -> f32 {
   if (kind == RED_SUM) { return 0.0; }
@@ -753,8 +760,8 @@ fn op_reduce_level(p : u32, kind : u32, level : u32) {
 
 fn arg_takes(lv : f32, li : u32, rv : f32, ri : u32, level : u32, count : u32, lane : u32, off : u32) -> bool {
   if (lane + off >= count) { return false; }
-  let lnan = lv != lv;
-  let rnan = rv != rv;
+  let lnan = f32_is_nan(lv);
+  let rnan = f32_is_nan(rv);
   if (rnan) { return false; }
   if (lnan) { return true; }
   return rv > lv || (rv == lv && ri < li);
@@ -1375,7 +1382,7 @@ fn op_rng(p : u32, keyed : bool) {
 const SORT_ROUNDS : u32 = 28u;
 
 fn sort_key(x : f32) -> u32 {
-  if (x != x) { return 0xFFFFFFFFu; }
+  if (f32_is_nan(x)) { return 0xFFFFFFFFu; }
 
   let b = select(bitcast<u32>(x), 0u, x == 0.0);
   var asc : u32;
@@ -1609,7 +1616,7 @@ fn op_pivot_finish(p : u32) {
       let flags = pivot_flag(n, rowb);
 
       let last = bitcast<f32>(hld(vals + len - 1u));
-      let monotone = !(last < 0.0) && last == last;
+      let monotone = !(last < 0.0) && !f32_is_nan(last);
       var excl : f32 = 0.0;
       var t : u32 = 0u;
       loop {
@@ -1740,7 +1747,7 @@ fn op_pivot_finish(p : u32) {
         if (pred == 0u) {
           let want = clamp(ld_i(payload, pick(np, row)), 0, i32(len));
 
-          if (!(x != x)) {
+          if (!f32_is_nan(x)) {
             on = i32(count_key_below(n, rowb, len, sort_key(x))) < want;
           }
         } else {
@@ -1841,7 +1848,7 @@ fn sel_hist(p : u32, sweep : u32) {
   workgroupBarrier();
   for (var i : u32 = span.x + sel_lt; i < span.y; i = i + PTIR_WG) {
     let x = ld_f(a, i);
-    if (x != x) { continue; }
+    if (f32_is_nan(x)) { continue; }
     let key = sort_key(x);
     if (sweep == 0u || (key >> (shift + 8u)) == (prefix >> (shift + 8u))) {
       atomicAdd(&sel_wg_hist[(key >> shift) & 255u], 1u);
@@ -1929,7 +1936,7 @@ fn sel_rank_mask(p : u32) {
       var on = false;
       if (i < n && keep != SEL_KEEP_NONE) {
         let x = ld_f(a, i);
-        on = !(x != x) && (keep == SEL_KEEP_ALL || sort_key(x) <= cut);
+        on = !f32_is_nan(x) && (keep == SEL_KEEP_ALL || sort_key(x) <= cut);
       }
       b[k] = on;
     }
