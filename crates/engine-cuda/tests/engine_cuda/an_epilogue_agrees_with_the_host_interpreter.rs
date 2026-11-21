@@ -312,6 +312,7 @@ fn an_epilogue_agrees_with_the_host_interpreter_every_case() {
     the_acceptance_rule_agrees_with_the_interpreter();
     the_gaussian_draw_and_the_transcendentals_agree_with_the_interpreter();
     a_frame_gathers_out_of_one_frame();
+    a_split_row_writes_every_cell_of_its_row();
 }
 
 fn the_device_answers_what_the_interpreter_answers() {
@@ -815,4 +816,105 @@ fn a_frame_gathers_out_of_one_frame() {
     let seeds = vec![(0, Value::F32(x.clone())), (1, Value::U32(vec![0]))];
     let got = device_outputs(&bound, &seeds, ROWS, None, &[2]);
     assert_eq!(wire_f32(&got[0]), x, "the one frame");
+}
+
+/// A row no whole number of a split's 128-element stretches wide: 121.25 of
+/// them a block at sixteen blocks.
+const SPLIT_VOCAB: u32 = 248_320;
+
+/// A width-1 beam step's candidates (its carried score relative to the best,
+/// broadcast over the row, plus the row's log-softmax), read off the model's
+/// row through views, the whole row put out beside its top one.
+fn split_candidates() -> TraceContainer {
+    let row = Shape::matrix(1, SPLIT_VOCAB);
+    let ops = vec![
+        Op::ChanTake(0),
+        Op::Output {
+            index: 0,
+            lane: 0,
+            shape: row,
+            dtype: Dtype::F32,
+        },
+        Op::Reshape { value: 1, shape: Shape::vector(SPLIT_VOCAB) },
+        Op::Reshape { value: 2, shape: row },
+        Op::ReduceMax(0),
+        Op::Broadcast { value: 4, shape: Shape::vector(1) },
+        Op::Sub(0, 5),
+        Op::Broadcast { value: 6, shape: row },
+        Op::ReduceMax(3),
+        Op::Broadcast { value: 8, shape: row },
+        Op::Sub(3, 9),
+        Op::Exp(10),
+        Op::ReduceSum(11),
+        Op::Log(12),
+        Op::Broadcast { value: 13, shape: row },
+        Op::Sub(10, 14),
+        Op::Add(7, 15),
+        Op::Reshape { value: 16, shape: Shape::vector(SPLIT_VOCAB) },
+        Op::TopK { input: 17, k: 1 },
+        Op::ChanPut { chan: 1, value: 18 },
+        Op::ChanPut { chan: 2, value: 17 },
+    ];
+    TraceContainer {
+        names: vec!["logits".into()],
+        channels: vec![
+            seeded(Shape::vector(1), Dtype::F32),
+            reader(Shape::vector(1), Dtype::F32),
+            reader(Shape::vector(SPLIT_VOCAB), Dtype::F32),
+        ],
+        ports: Vec::new(),
+        stages: vec![StageProgram {
+            stage: Stage::Epilogue,
+            ops,
+        }],
+        externs: Vec::new(),
+        inputs: Vec::new(),
+    }
+}
+
+/// A region whose one row runs across its lane's blocks writes every cell of
+/// its row: each block copies on only the stretch it wrote itself, so no
+/// cell is read before the block that owns it writes it. Every cell of the
+/// row agrees with the interpreter's (an unwritten one reads as the zeros
+/// the scratch held, which no log-softmax below its peak can be).
+fn a_split_row_writes_every_cell_of_its_row() {
+    if !engine_cuda::device::present() {
+        eprintln!("no CUDA device: skipping");
+        return;
+    }
+    let bound = crate::bound::logits(split_candidates(), SPLIT_VOCAB).expect("the candidates bind");
+    let stages = compile_bound(&bound);
+    let package = eta_compiler::codegen::launch::build(&bound, &stages);
+    let plan = package.plans.first().expect("one plan");
+    assert!(
+        plan.fused.iter().any(|region| region.splits_rows),
+        "the candidates' region runs its row across blocks"
+    );
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let plane: Vec<f32> = (0..SPLIT_VOCAB)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            ((state >> 11) as f64 / (1u64 << 53) as f64) as f32 * 16.0 - 8.0
+        })
+        .collect();
+    let seeds = vec![(0, Value::F32(vec![0.0]))];
+    let want = host_outputs(&bound, &seeds, Some(&plane), &[2]);
+    let got = device_outputs(&bound, &seeds, 1, Some(&plane), &[2]);
+    let got = wire_f32(&got[0]);
+    let want = f32s(&want[0]);
+    let unwritten: Vec<usize> = got
+        .iter()
+        .enumerate()
+        .filter(|&(_, &x)| x == 0.0)
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        unwritten.is_empty(),
+        "{} cell(s) of the split row hold the scratch's zeros, the first at {:?}",
+        unwritten.len(),
+        unwritten.first()
+    );
+    close(&got, &want, 1e-5, "the split row's candidates");
 }
