@@ -1577,6 +1577,21 @@ impl SlotPool {
     fn move_chunk(&mut self, step: ChunkMove) {
         let meta = self.chunks[step.logical as usize];
         let displaced = self.physical_to_logical[step.to as usize];
+        // A chunk let go while its move was under way (its process ended,
+        // or was torn down, before the engine took or refused the copy):
+        // its logical id goes back as the engine's table has it, both
+        // physical chunks free, no shape to keep count of. Read as a shape,
+        // its free id (`NO_SHAPE`) indexed past the shapes and panicked on
+        // a SIGTERM's teardown (Mac Pro at 2 GiB on dc1414ae8).
+        if meta.shape == NO_SHAPE {
+            self.logical_to_physical[step.logical as usize] = step.to;
+            self.logical_to_physical[displaced as usize] = step.from;
+            self.physical_to_logical[step.to as usize] = step.logical;
+            self.physical_to_logical[step.from as usize] = displaced;
+            self.reopen(step.from);
+            self.reopen(step.to);
+            return;
+        }
         self.open.clear(step.to);
         self.free.clear(step.to);
         self.free.set(step.from);
@@ -3449,6 +3464,42 @@ mod tests {
                 ],
             );
         }
+    }
+
+    /// Mac Pro at 2 GiB on dc1414ae8 panicked on SIGTERM ("index out of
+    /// bounds: the len is 4 but the index is 65535"): a chunk moved for a
+    /// compaction was let go before the engine took or refused the copy,
+    /// and taking the move back read its free id as a shape. Taken back, a
+    /// chunk let go meanwhile returns to where the engine's table has it,
+    /// free, and the pool stays whole.
+    #[test]
+    fn a_move_taken_back_after_its_chunk_was_let_go_leaves_the_pool_whole() {
+        let fixed = [(ShapeKind::Fixed, 4)];
+        let mut pool = SlotPool::new(facts_with(16, 4, 4, &fixed, &[(16, 2)]));
+        let holder = Holder::WorkingSet(1);
+        let taken = pool.acquire_chunk_runs(holder, 0, 1, 6).unwrap();
+        // Free the lowest chunks, then move the highest held one down.
+        let low: Vec<Slot> = taken
+            .iter()
+            .copied()
+            .filter(|slot| pool.chunk_table()[slot.chunk as usize] < 3)
+            .collect();
+        pool.release(holder, &low, 0);
+        let high = taken
+            .iter()
+            .map(|slot| slot.chunk)
+            .max_by_key(|&chunk| pool.chunk_table()[chunk as usize])
+            .unwrap();
+        let moves = pool.plan_moves_of(&[high]);
+        assert_eq!(moves.len(), 1, "one move down");
+        pool.apply_compaction(&moves, 5).unwrap();
+        // Its process ends before the copy is taken or refused.
+        let rest: Vec<Slot> = taken.iter().copied().filter(|slot| slot.chunk == high).collect();
+        pool.release(holder, &rest, 0);
+        pool.retire_through(u64::MAX);
+        pool.undo_compaction(&moves);
+        pool.check();
+        assert_eq!(pool.chunk_table()[high as usize], moves[0].from, "where the engine's table has it");
     }
 
     /// Mac Pro at 5 GiB on 5aa45805b: an eviction's copy of state in chunk
