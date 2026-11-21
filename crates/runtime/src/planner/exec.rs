@@ -1208,7 +1208,27 @@ async fn restore(
             abort(model, engine, Move::Restore { kv, rs, roles });
             tracing::debug!(%pid, ?unbound, "planner: a restore waits, uncommitted, for its rebinds' parts");
             planner.rebind_waiting(pid, Some(format!("{unbound:?} (uncommitted)")));
-            watch.freed().await;
+            // Its pair on its way with another holder's move: woken by that
+            // move's end alone, as a restore refused for it is. Woken by
+            // room given back, two restores waiting on one pair woke each
+            // other with their own aborts, round after round, as long as
+            // the move took (the simulation with a bind's take and its engine
+            // bind apart, seed 33: 43,051 rounds in one step).
+            let moving = store.lock().unwrap().moving_pair_of(&unbound);
+            match moving {
+                Some(pair) => {
+                    let mut watch = watch;
+                    loop {
+                        let next = store.lock().unwrap().room_watch();
+                        if store.lock().unwrap().pair_moving(pair).is_none() {
+                            break;
+                        }
+                        watch.freed().await;
+                        watch = next;
+                    }
+                }
+                None => watch.freed().await,
+            }
             planner.rebind_waiting(pid, None);
             planner.requeue_restore(pid);
             return;

@@ -1358,7 +1358,7 @@ fn processes_cycling_through_park_restore_and_finish_all_finish_and_give_back_al
             program: ProgramId(program),
             ..InstanceBinding::default()
         };
-        let taken = take_bind(Some(roles), engine, &binding, |_| false, Some(holder(by)))?;
+        let taken = take_bind(Some(roles), engine, &binding, |_| false, Some(holder(by)), |_| true)?;
         registrations.set(registrations.get() + 1);
         bind_taken(Some(roles), engine, &binding, Some(holder(by)), taken)
             .map(|bound| bound.id)
@@ -3510,4 +3510,73 @@ fn a_held_part_round_trips_through_the_host_with_its_place_named() {
     let now = refs_of(&scratch);
     assert!(now.iter().all(|slot| back.contains(slot)), "the place its bytes were copied into");
     assert!(now.iter().all(|slot| !others.contains(slot)), "not the other's");
+}
+
+/// A bind taken on a pair its other members hold, whose last member parks
+/// before the bind lands (the planner's moves run on other threads than
+/// the lane's take and bind): the pair stays the bind's. Given back with
+/// that park, its run went to another program's bind while the new member
+/// was bound on it (the L40S at 3 GiB on df488038b: `guest::claims`
+/// refused a rescore's bind over a live pair's run).
+#[test]
+fn a_pair_a_bind_has_taken_stays_while_its_last_member_parks() {
+    let Pools { device: _, roles } = pools(64);
+    let mut engine = GuestEngine::new(2 * CHUNK, PAIR);
+    bind(&roles, &mut engine, 1).unwrap();
+    let pair_at = engine.bindings[0].pair.clone();
+    learn_program(&roles, &mut engine, PROGRAM).unwrap();
+    let binding = InstanceBinding {
+        program: PROGRAM,
+        ..InstanceBinding::default()
+    };
+    let taken = take_bind(Some(&roles), &mut engine, &binding, |_| false, Some(holder(2)), |_| true)
+        .unwrap()
+        .expect("slots taken");
+    // The only member parks while the bind is on its way.
+    park(&roles, 1);
+    // Another program binds meanwhile: none of its room is the pair's.
+    let mut other = GuestEngine::new(2 * CHUNK, PAIR);
+    other.next = 100;
+    learn_program(&roles, &mut other, ProgramId(8)).unwrap();
+    bind_instance(
+        Some(&roles),
+        &mut other,
+        &InstanceBinding {
+            program: ProgramId(8),
+            ..InstanceBinding::default()
+        },
+        Some(holder(3)),
+        |_| false,
+    )
+    .unwrap();
+    let theirs = &other.bindings[0];
+    disjoint(&[&pair_at, &theirs.pair, &theirs.scratch])
+        .expect("the pair the bind took is no other program's room");
+    // The bind lands on the pair as it stands.
+    bind_taken(Some(&roles), &mut engine, &binding, Some(holder(2)), Some(taken)).unwrap();
+    assert_eq!(engine.bindings.last().unwrap().pair, pair_at, "bound on the pair it took");
+}
+
+/// A bind of a process that is not resident is refused before it takes
+/// anything, by name, as one on a channel parked with it is: its bind
+/// waits for its restore. Taken, its instance stood bound on the device
+/// outside its process's park (the simulation's rescore on a process
+/// evicted with its first program closed).
+#[test]
+fn a_bind_of_a_process_not_resident_waits_for_its_restore() {
+    let Pools { device, roles } = pools(64);
+    let mut engine = GuestEngine::new(2 * CHUNK, PAIR);
+    learn_program(&roles, &mut engine, PROGRAM).unwrap();
+    let before = held(&device);
+    let binding = InstanceBinding {
+        program: PROGRAM,
+        ..InstanceBinding::default()
+    };
+    let error = take_bind(Some(&roles), &mut engine, &binding, |_| false, Some(holder(4)), |_| false)
+        .expect_err("not resident: no take");
+    assert!(
+        matches!(short_of_wait(&error), Some(RolesError::HolderParked(by)) if *by == holder(4)),
+        "{error:#}"
+    );
+    assert_eq!(held(&device), before, "nothing taken");
 }

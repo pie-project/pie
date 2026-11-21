@@ -1325,6 +1325,10 @@ impl Lane {
                     &bind.binding,
                     |id| channels.engine_registered(id) || held.contains(&id),
                     pipeline_id,
+                    |pid| {
+                        crate::planner::planner_for(0, engine_idx)
+                            .is_none_or(|planner| planner.is_resident(pid))
+                    },
                 )
                 .and_then(|taken| {
                     match crate::store::roles::take_rings(roles.as_ref(), &mut **engine, &plans) {

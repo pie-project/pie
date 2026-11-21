@@ -1052,6 +1052,7 @@ fn bind_registering(engine: &mut FakeEngine) -> (InstanceBinding, u64) {
         &binding,
         |id| held_ids.contains(&id),
         None,
+        |_| true,
     )
     .unwrap();
     let mut rings = super::take_rings(Some(&roles), engine, &plans)

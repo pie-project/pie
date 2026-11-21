@@ -170,6 +170,17 @@ pub enum RolesError {
         channel: ChannelId,
         holder: Option<Holder>,
     },
+    /// The process binding is not resident (evicted, or on its way off or
+    /// back onto the device): a bind of it waits for it to be resident
+    /// again ([`bind_when_resident`]), as one on a channel parked with it
+    /// does. Bound meanwhile, its instance stood on the device outside its
+    /// process's park, never said parked to the engine, while the pair it
+    /// joined went down with a later move of that process's and its run was
+    /// taken by another (the simulation's seed 1116: a rescore's bind on a
+    /// process evicted with its first program closed, holding no item the
+    /// park could take).
+    #[error("its process is parked or moving")]
+    HolderParked(Holder),
     #[error("the adapter this binding lands is parked with the instances that hold it")]
     AdapterParked,
     /// The pair's state is on its way to or from the host with the
@@ -586,6 +597,15 @@ struct Item {
     /// let go meanwhile, it is given back only once the last of them has
     /// landed ([`Roles::landed`]), never under a fire still reading it.
     reads: u32,
+    /// A pair or an adapter: binds taken on it and not yet bound or given
+    /// back ([`Roles::take_instance`] to [`Roles::bound`] or
+    /// [`Roles::untake`]). The taker is no member yet, so it is in no
+    /// `attached`: held only by this, the item went with its last member's
+    /// park (or was given back as unheld) while the bind was on its way,
+    /// and the bind named slots another owner took next (the L40S at
+    /// 3 GiB on df488038b: a rescore's instance bound over a live pair's
+    /// run, `guest::claims` refused).
+    binds: u32,
     /// Which taking of its slots it lies in: a new one each time it is
     /// given fresh slots ([`Roles::next_generation`]). A pair's is the
     /// engine's to compare ([`::engine::InstanceBinding::pair_generation`]):
@@ -609,6 +629,7 @@ impl Item {
             stale: false,
             shed: false,
             reads: 0,
+            binds: 0,
             generation: 0,
         }
     }
@@ -1284,6 +1305,17 @@ impl Roles {
                     (*id, holder)
                 })
                 .collect()
+        })
+    }
+
+    /// The pair of one of `instances` on its way to or from the device
+    /// (another holder's park or restore moving it): what an unpark that
+    /// would leave them unbound waits to see end ([`Self::pair_moving`]).
+    #[must_use]
+    pub fn moving_pair_of(&self, instances: &[InstanceId]) -> Option<FireKey> {
+        instances.iter().find_map(|id| {
+            let key = self.items.get(&Owner::Instance(*id))?.pair?;
+            (self.items.get(&Owner::Pair(key))?.tier == Tier::Moving).then_some(key)
         })
     }
 
@@ -2105,7 +2137,26 @@ impl Roles {
         }
         taken.parts.extend(guest.scratch);
         taken.pair = guest.pair;
+        self.pin_shared(&taken, true);
         Ok(taken)
+    }
+
+    /// The pair and the adapter `taken` names that are items already: held
+    /// by its bind (`pin`), or let go of at its bind or its give back.
+    fn pin_shared(&mut self, taken: &Taken, pin: bool) {
+        let owners = [
+            taken.adapter.as_ref().map(|(key, ..)| Owner::Adapter(*key)),
+            taken.pair.as_ref().map(|(key, ..)| Owner::Pair(*key)),
+        ];
+        for owner in owners.into_iter().flatten() {
+            if let Some(item) = self.items.get_mut(&owner) {
+                item.binds = if pin {
+                    item.binds + 1
+                } else {
+                    item.binds.saturating_sub(1)
+                };
+            }
+        }
     }
 
     /// A guest program's state for a bind of an instance on `channels`
@@ -2335,6 +2386,11 @@ impl Roles {
 
     /// The bind of `taken` failed: its slots go back.
     pub fn untake(&mut self, taken: Taken) {
+        self.pin_shared(&taken, false);
+        let shared = [
+            taken.adapter.as_ref().map(|(key, ..)| Owner::Adapter(*key)),
+            taken.pair.as_ref().map(|(key, ..)| Owner::Pair(*key)),
+        ];
         self.give(&self.device, &taken.parts);
         if let Some((_, part, true)) = taken.adapter {
             self.give(&self.device, &[part]);
@@ -2342,6 +2398,13 @@ impl Roles {
         if let Some((_, part, true, _)) = taken.pair {
             self.give(&self.device, &[part]);
         }
+        // What the bind held and no one else holds goes now: a pair whose
+        // members all parked while the bind was on its way, an adapter or
+        // pair with none attached.
+        for owner in shared.into_iter().flatten() {
+            self.free_if_done(owner);
+        }
+        self.release_unheld_pairs();
     }
 
     /// A bind's or a registration's take short of slots (`Short`, `NoRun`):
@@ -2407,6 +2470,7 @@ impl Roles {
 
     /// The engine bound `taken` as instance `id`, for `holder`.
     pub fn bound(&mut self, id: InstanceId, holder: Option<Holder>, taken: Taken) {
+        self.pin_shared(&taken, false);
         for &channel in &taken.channels {
             if let Some(item) = self.items.get_mut(&Owner::Channel(channel)) {
                 item.attached.insert(id);
@@ -2523,7 +2587,12 @@ impl Roles {
         let Some(item) = self.items.get(&owner) else {
             return;
         };
-        if item.open || !item.attached.is_empty() || item.tier == Tier::Moving || item.reads > 0 {
+        if item.open
+            || !item.attached.is_empty()
+            || item.tier == Tier::Moving
+            || item.reads > 0
+            || item.binds > 0
+        {
             return;
         }
         let item = self.items.remove(&owner).expect("present");
@@ -2556,6 +2625,9 @@ impl Roles {
             // bound by 372-374 of another program, CUDA 700 on its next
             // fire). The member's park landing gives it back
             // ([`Self::release_unheld_pairs`]).
+            // A bind on its way holds it as a member does.
+            Owner::Pair(_) if item.binds > 0 => false,
+            Owner::Adapter(_) if item.binds > 0 => false,
             Owner::Pair(_) => {
                 item.attached
                     .iter()
@@ -2606,6 +2678,7 @@ impl Roles {
             item.tier == Tier::Device
                 && !item.shed
                 && item.reads == 0
+                && item.binds == 0
                 && !item.attached.is_empty()
                 && item.attached.iter().all(|id| {
                     self.items
@@ -2633,6 +2706,7 @@ impl Roles {
                     && item.tier == Tier::Device
                     && !item.shed
                     && item.reads == 0
+                    && item.binds == 0
                     && item.parts.iter().all(Part::dead)
                     && !item.attached.is_empty()
                     && item.attached.iter().all(|id| {
@@ -3579,7 +3653,7 @@ pub fn bind_instance(
     holder: Option<Holder>,
     registered: impl Fn(ChannelId) -> bool,
 ) -> anyhow::Result<BoundInstance> {
-    let taken = take_bind(roles, engine, binding, registered, holder)?;
+    let taken = take_bind(roles, engine, binding, registered, holder, |_| true)?;
     bind_taken(roles, engine, binding, holder, taken)
 }
 
@@ -3597,10 +3671,14 @@ pub fn take_bind(
     binding: &InstanceBinding,
     registered: impl Fn(ChannelId) -> bool,
     holder: Option<Holder>,
+    resident: impl Fn(Holder) -> bool,
 ) -> anyhow::Result<Option<Taken>> {
     let Some(roles) = roles else {
         return Ok(None);
     };
+    if let Some(holder) = holder.filter(|&holder| !resident(holder)) {
+        return Err(RolesError::HolderParked(holder).into());
+    }
     learn_program(roles, engine, binding.program)?;
     let state = engine.guest_state(binding.program, &binding.extents, binding.geometry)?;
     let adapter = engine.adapter_key(binding)?;
@@ -3753,6 +3831,7 @@ where
                 RolesError::PairParked(_) | RolesError::GuestGrow { .. }
             ) || error.room_runs().is_some()
                 || matches!(error, RolesError::Parked { holder: Some(holder), .. } if *holder == pid)
+                || matches!(error, RolesError::HolderParked(holder) if *holder == pid)
         });
         if waits_on {
             settle().await;
@@ -3899,7 +3978,8 @@ where
         }
         let parked_with_it = matches!(
             error.downcast_ref::<RolesError>(),
-            Some(RolesError::Parked { holder: Some(holder), .. }) if *holder == pid
+            Some(RolesError::Parked { holder: Some(holder), .. } | RolesError::HolderParked(holder))
+                if *holder == pid
         );
         if !parked_with_it {
             return Err(error);
