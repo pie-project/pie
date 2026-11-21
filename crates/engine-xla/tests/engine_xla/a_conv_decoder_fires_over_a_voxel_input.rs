@@ -751,12 +751,16 @@ fn a_causal_conv_carries_its_frames_across_fires_in_the_lanes_slot() {
     );
 
     let tokens = [0u32];
+    // each lane's own record (the frame cache's slot), the same at every fire
+    let records = [shell.pools().scratch(0, 1), shell.pools().scratch(1, 1)];
     let lane = |slot: u32| {
-        Seated::of(Lane {
+        let mut seated = Seated::of(Lane {
             slot,
             word: 0,
             tokens: &tokens,
-        })
+        });
+        seated.fixed = &records[slot as usize].fixed;
+        seated
     };
     let boxed = |b: [usize; 3]| [[b[0] as u32, b[1] as u32, b[2] as u32]];
     let tile_box = boxed(tile);
