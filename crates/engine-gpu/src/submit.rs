@@ -20,9 +20,10 @@
 //!   whole estimate is under the bound by at least one layer's: the layer is
 //!   the split's own granularity, and a device warmer than any boot measured
 //!   (an Adreno 840 ran ~1.25x slower warm) eats into a margin measured
-//!   cool; else it is submitted a layer at a time
-//!   (`Run::flush_between_layers`), which costs a native Vulkan step nothing
-//!   measurable;
+//!   cool; else it is submitted in runs of consecutive layers, as few as
+//!   each fit the bound ([`pack_layers`], `Run::flush_between_layers`): each
+//!   submission costs a launch's worth (an Adreno 840's 472-row step ran
+//!   ~24% longer as 28 submissions than whole, where 5 would fit);
 //! - a decode step (one row a lane, tiny) is kept whole where its estimate
 //!   fits the bound;
 //! - a step no layer of which fits has its one prompt lane cut by rows
@@ -116,22 +117,33 @@ impl StepRows {
 pub enum Admitted {
     /// In one submission, estimated at `ns` (times the worst ratio).
     Whole { ns: f64 },
-    /// A layer at a time: `ns` whole, `per_submission` the most one
+    /// In submissions of consecutive layers, `layers_a_piece` of them each
+    /// (the last the rest): `ns` whole, `per_submission` the most one
     /// submission is estimated at, `submissions` of them.
     Layers {
         ns: f64,
         per_submission: f64,
         submissions: u32,
+        layers_a_piece: u32,
     },
     /// Past the bound even a layer at a time.
     Refused { ns: f64, per_submission: f64 },
 }
 
 impl Admitted {
-    /// Whether the step is submitted a layer at a time.
+    /// Whether the step is submitted in more than one submission.
     #[must_use]
     pub fn split(&self) -> bool {
         matches!(self, Admitted::Layers { .. })
+    }
+
+    /// The layers each submission takes where the step is split.
+    #[must_use]
+    pub fn layers_a_piece(&self) -> Option<u32> {
+        match *self {
+            Admitted::Layers { layers_a_piece, .. } => Some(layers_a_piece),
+            _ => None,
+        }
     }
 
     /// The step's estimate, ns, at the worst ratio.
@@ -147,17 +159,20 @@ impl Admitted {
 /// ns, `per_layer` its widest submission a layer at a time over `layers`.
 /// A prompt step is whole only where `whole` is under `bound_ns` by at least
 /// `per_layer` (the split's granularity), a decode step where `whole` fits;
-/// else in layers where `per_layer` fits; else refused.
+/// else in submissions of consecutive layers where `per_layer` fits, as
+/// few as each fit the bound ([`pack_layers`]); else refused.
 #[must_use]
 pub fn admit_ns(whole: f64, per_layer: f64, layers: u32, bound_ns: f64, prompt: bool) -> Admitted {
     let headroom = if prompt && layers > 1 { per_layer } else { 0.0 };
     if whole + headroom <= bound_ns {
         Admitted::Whole { ns: whole }
     } else if layers > 1 && per_layer <= bound_ns {
+        let (layers_a_piece, per_submission) = pack_layers(whole, per_layer, layers, bound_ns);
         Admitted::Layers {
             ns: whole,
-            per_submission: per_layer,
-            submissions: layers,
+            per_submission,
+            submissions: layers.div_ceil(layers_a_piece),
+            layers_a_piece,
         }
     } else {
         Admitted::Refused {
@@ -165,6 +180,32 @@ pub fn admit_ns(whole: f64, per_layer: f64, layers: u32, bound_ns: f64, prompt: 
             per_submission: per_layer,
         }
     }
+}
+
+/// The layers a submission of a split step takes, and its estimate: a step
+/// of `whole` ns over `layers`, `per_layer` a layer's submission (its
+/// share of the dispatches and the readout's, which the last carries),
+/// packed from its first layer while a submission's estimate fits
+/// `bound_ns`, into the fewest submissions, then evened over them (the
+/// same count, each at most as wide). At least one layer a submission,
+/// fewer than all.
+#[must_use]
+pub fn pack_layers(whole: f64, per_layer: f64, layers: u32, bound_ns: f64) -> (u32, f64) {
+    if layers < 2 {
+        return (1, per_layer);
+    }
+    // whole = layers x a layer's own + the readout's; per_layer = a
+    // layer's own + the readout's.
+    let own = ((whole - per_layer) / f64::from(layers - 1)).max(0.0);
+    let readout = (per_layer - own).max(0.0);
+    let fit = if own > 0.0 {
+        (((bound_ns - readout) / own).floor() as u32).clamp(1, layers - 1)
+    } else {
+        layers - 1
+    };
+    let submissions = layers.div_ceil(fit);
+    let each = layers.div_ceil(submissions);
+    (each, f64::from(each) * own + readout)
 }
 
 /// The submissions a frame of `steps` (each `(whole, per_layer, prompt)`,
@@ -1250,9 +1291,45 @@ mod tests {
         let long = shaped(&b, prompt(512, 3800));
         assert!(long.0 > BOUND, "{long:?}");
         let subs = frame_submissions(&[steps[0], long], b.layers, BOUND).unwrap();
-        assert_eq!(subs.len(), 1 + 28);
+        let Admitted::Layers { submissions, .. } = b.admit(prompt(512, 3800)) else {
+            panic!("split: {:?}", b.admit(prompt(512, 3800)));
+        };
+        assert!(submissions < 28, "layers packed: {submissions}");
+        assert_eq!(subs.len(), 1 + submissions as usize);
         assert!(subs.iter().all(|&(_, ns)| ns <= BOUND));
-        assert!(b.admit(prompt(512, 3800)).split());
+    }
+
+    /// A step past the bound whole goes out in the fewest submissions of
+    /// consecutive layers that each fit it, not a layer at a time: 4.6
+    /// bounds' worth over 28 layers takes 5 submissions of 6 layers (the
+    /// last 4), each within the bound.
+    #[test]
+    fn a_split_step_packs_its_layers_into_the_fewest_submissions_that_fit() {
+        let b = bound(1.0);
+        let step = prompt(256, 1024);
+        let (whole, per_layer) = b.step_ns(step);
+        let held = SubmitBound {
+            bound_ns: whole / 4.6,
+            ..b
+        };
+        let Admitted::Layers {
+            per_submission,
+            submissions,
+            layers_a_piece,
+            ..
+        } = held.admit(step)
+        else {
+            panic!("split: {:?}", held.admit(step));
+        };
+        assert_eq!((submissions, layers_a_piece), (5, 6));
+        assert!(per_submission <= held.bound_ns);
+        // Packing by the bound alone: one layer more a submission is past it.
+        let (each, ns) = pack_layers(whole, per_layer, 28, held.bound_ns);
+        assert_eq!((each, ns), (layers_a_piece, per_submission));
+        let (wider, _) = pack_layers(whole, per_layer, 28, 2.0 * held.bound_ns);
+        assert!(wider > each);
+        // A layer's own estimate the bound: a layer a submission.
+        assert_eq!(pack_layers(whole, per_layer, 28, per_layer).0, 1);
     }
 
     /// A prompt step whose whole estimate fits the bound but not by one
@@ -1468,12 +1545,15 @@ mod tests {
         let Admitted::Layers {
             per_submission,
             submissions,
+            layers_a_piece,
             ..
         } = clocked.admit(step)
         else {
-            panic!("split a layer at a time: {:?}", clocked.admit(step));
+            panic!("split: {:?}", clocked.admit(step));
         };
-        assert_eq!(submissions, clocked.layers);
+        // 0.8215 of the bound at full clock, x8.125 at the floor: 6.7
+        // bounds' worth, in 7 submissions of 4 layers.
+        assert_eq!((submissions, layers_a_piece), (7, 4));
         assert!(per_submission <= clocked.bound_ns, "{per_submission} past the bound");
         let subs = frame_submissions(&[shaped(&clocked, step)], clocked.layers, clocked.bound_ns)
             .expect("every submission fits");
