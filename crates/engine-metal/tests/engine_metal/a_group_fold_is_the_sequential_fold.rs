@@ -225,6 +225,9 @@ fn gated_delta(bench: &Bench, n: u32) {
                 key_row_bytes: keys_w as u32 * 2,
                 u: u_slab,
                 u_row_bytes: u_w as u32 * 4,
+                // The folds read no scalars.
+                scalars: u_slab,
+                scalars_row_bytes: u_w as u32 * 4,
             },
             &pool,
             (K_HEADS, V_HEADS, DIM, DIM),

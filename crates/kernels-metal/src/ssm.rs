@@ -1262,12 +1262,17 @@ pub struct Corrected {
     pub key_row_bytes: u32,
     pub u: Tensor,
     pub u_row_bytes: u32,
+    /// The rows' per-head scalars (`v_heads` log-gates, then `v_heads` key
+    /// norm inverses, f32): landed with the keys and `u`, read by the
+    /// carried scan in place of recomputing them.
+    pub scalars: Tensor,
+    pub scalars_row_bytes: u32,
 }
 
 fn corrected_args(
     ctx: &Ctx<'_>,
     corrected: Option<Corrected>,
-) -> Result<[crate::encode::ArgValue; 5], Error> {
+) -> Result<[crate::encode::ArgValue; 7], Error> {
     Ok(match corrected {
         Some(c) => [
             c.keys.arg_mut(),
@@ -1275,8 +1280,18 @@ fn corrected_args(
             c.u.arg_mut(),
             c.u_row_bytes.arg(),
             1i32.arg(),
+            c.scalars.arg_mut(),
+            c.scalars_row_bytes.arg(),
         ],
-        None => [ctx.absent()?, 0u32.arg(), ctx.absent()?, 0u32.arg(), 0i32.arg()],
+        None => [
+            ctx.absent()?,
+            0u32.arg(),
+            ctx.absent()?,
+            0u32.arg(),
+            0i32.arg(),
+            ctx.absent()?,
+            0u32.arg(),
+        ],
     })
 }
 
@@ -1459,7 +1474,7 @@ fn gated_delta_verify_at(
     let lanes = committed_lanes(OP, indptr)?;
     let [snaps, lane0] = snapshot_args(ctx, OP, snapshots)?;
     let [slab, pages, page_tokens, page_bytes, row_bytes, is_paged] = paged_args(ctx, paged)?;
-    let [key_slab, key_row_bytes, u_slab, u_row_bytes, is_corrected] =
+    let [key_slab, key_row_bytes, u_slab, u_row_bytes, is_corrected, scalar_slab, scalar_row_bytes] =
         corrected_args(ctx, corrected)?;
     let z = v_heads
         .checked_mul(lanes)
@@ -1496,6 +1511,8 @@ fn gated_delta_verify_at(
             u_row_bytes,
             is_corrected,
             committed.ext_replay.arg(),
+            scalar_slab,
+            scalar_row_bytes,
         ],
     )
 }
@@ -1597,6 +1614,8 @@ pub fn gated_delta_carried(
                 table.table.arg(),
                 0u32.arg(),
                 committed.ext_replay.arg(),
+                corrected.scalars.arg_mut(),
+                corrected.scalars_row_bytes.arg(),
             ],
         );
     }
@@ -1666,6 +1685,8 @@ pub fn gated_delta_carried(
             table.table.arg(),
             table_rows.arg(),
             committed.ext_replay.arg(),
+            corrected.scalars.arg_mut(),
+            corrected.scalars_row_bytes.arg(),
         ],
     )
 }

@@ -20,6 +20,11 @@ pub enum Role {
     /// A gated-delta row's corrected value `u` (f32): the value its delta
     /// rule writes, which a decode step reads as a linear attention.
     U,
+    /// A gated-delta row's per-head scalars (f32, `v_heads` log-gates then
+    /// `v_heads` key-norm inverses, `poem_compiler::rs::gdn_scalars_bytes`):
+    /// written by the step that lands the row, read by a later decode step
+    /// in place of the row's `[b | a]` softplus and its key norm.
+    Scalars,
     Ids,
     KdaF,
     KdaB,
@@ -437,6 +442,17 @@ impl Layout {
                     *y,
                     Some((values, Dtype::F32, u64::from(values) * 4)),
                 )?;
+                plane(
+                    &mut layout,
+                    cache,
+                    Role::Scalars,
+                    *gates,
+                    Some((
+                        2 * v_heads,
+                        Dtype::F32,
+                        poem_compiler::rs::gdn_scalars_bytes(*v_heads),
+                    )),
+                )?;
             }
             // The decode form (`GatedDelta`) of a layer reads the planes its
             // prompt form lays, by its own values: the same state's.
@@ -447,15 +463,25 @@ impl Layout {
                     .position(|plane| plane.cache == cache && plane.role == role)
             };
             for node in &trace.nodes {
-                let Operation::Ssm(Ssm::GatedDelta { qkv, state, y, .. }) = &node.op else {
+                let Operation::Ssm(Ssm::GatedDelta {
+                    qkv,
+                    gates,
+                    state,
+                    y,
+                    ..
+                }) = &node.op
+                else {
                     continue;
                 };
                 let cache = cache_of(trace, *state)?;
-                if let (Some(keys), Some(u)) =
-                    (of(&layout, cache, Role::Keys), of(&layout, cache, Role::U))
-                {
+                if let (Some(keys), Some(u), Some(scalars)) = (
+                    of(&layout, cache, Role::Keys),
+                    of(&layout, cache, Role::U),
+                    of(&layout, cache, Role::Scalars),
+                ) {
                     layout.in_of.insert(qkv.0, keys);
                     layout.in_of.insert(y.0, u);
+                    layout.in_of.insert(gates.0, scalars);
                 }
             }
         }

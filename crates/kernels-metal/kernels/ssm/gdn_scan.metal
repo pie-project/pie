@@ -610,6 +610,10 @@ template <typename T, int LANES, int SG, int VROWS>
     const constant uint& u_row_bytes [[buffer(26)]],
     const constant int& corrected [[buffer(27)]],
     const device int* ext_replay [[buffer(28)]],
+    // Each own row's per-head scalars (f32): `v_heads` log-gates, then
+    // `v_heads` key-norm inverses, as the scan below derives them.
+    device uchar* scalar_slab   [[buffer(29)]],
+    const constant uint& scalar_row_bytes [[buffer(30)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint lane_u [[thread_index_in_simdgroup]],
     uint sg_u [[simdgroup_index_in_threadgroup]]) {
@@ -701,6 +705,11 @@ template <typename T, int LANES, int SG, int VROWS>
         q_s[j][NORM_PER * int(lane_u) + i] = q[i] * qinv;
         k_s[j][NORM_PER * int(lane_u) + i] = k[i] * kinv;
       }
+      if (lands_corrected && group.y == 0 && lane_u == 0 && c0 + j >= rep) {
+        reinterpret_cast<device float*>(gdn_corrected_row(
+            scalar_slab, pages, c0 + j, own + c0 + j, page_tokens, page_bytes,
+            scalar_row_bytes))[size_t(v_heads) + size_t(hv)] = kinv;
+      }
       if (lands_keys && c0 + j >= rep) {
         device T* row = reinterpret_cast<device T*>(gdn_corrected_row(
             key_slab, pages, c0 + j, own + c0 + j, page_tokens, page_bytes, key_row_bytes));
@@ -729,6 +738,10 @@ template <typename T, int LANES, int SG, int VROWS>
         const size_t at = size_t(own + t) * 2 * size_t(v_heads) + size_t(hv);
         gates[at] = g.x;
         gates[at + size_t(v_heads)] = g.y;
+        if (lands_corrected) {
+          reinterpret_cast<device float*>(gdn_corrected_row(
+              scalar_slab, pages, t, own + t, page_tokens, page_bytes, scalar_row_bytes))[hv] = g.x;
+        }
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -818,7 +831,8 @@ template <typename T, int LANES, int SG, int VROWS>
       const constant uint&, const constant uint&, const constant uint&,        \
       const constant int&, const device ulong*, device uchar*,                 \
       const constant uint&, device uchar*, const constant uint&,               \
-      const constant int&, const device int*, uint3, uint, uint);
+      const constant int&, const device int*, device uchar*, const constant uint&, uint3, uint, \
+      uint);
 
 PIE_GDN_VERIFY(32, 8, 2)
 PIE_GDN_VERIFY(32, 4, 4)
@@ -954,6 +968,11 @@ template <typename T, int SG, int VROWS>
     const device float4* table  [[buffer(25)]],
     const constant uint& table_rows [[buffer(26)]],
     const device int* ext_replay [[buffer(27)]],
+    // The rows' per-head scalars (f32): `v_heads` log-gates, then `v_heads`
+    // key-norm inverses. The own row lands its; a short carry reads its
+    // carried rows' in place of their `[b | a]` softplus and key norm.
+    device uchar* scalar_slab   [[buffer(28)]],
+    const constant uint& scalar_row_bytes [[buffer(29)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint lane_u [[thread_index_in_simdgroup]],
     uint sg_u [[simdgroup_index_in_threadgroup]]) {
@@ -1041,6 +1060,11 @@ template <typename T, int SG, int VROWS>
     kq = gdn_row_sum<32>(kq);
     if (lane == 0) {
       own_s[0] = kq;
+      if (lands && group.y == 0) {
+        reinterpret_cast<device float*>(gdn_buffered_row(
+            scalar_slab, pages, t_own, page_tokens, page_bytes, scalar_row_bytes))[vh + size_t(hv)] =
+            kinv;
+      }
     }
     // A key head's raw keys land once: by its first value head's first group.
     if (lands && group.y == 0 && hv % (v_heads / k_heads) == 0) {
@@ -1061,6 +1085,10 @@ template <typename T, int SG, int VROWS>
       const size_t at = size_t(own + t_own) * 2 * vh + size_t(hv);
       gates[at] = g.x;
       gates[at + vh] = g.y;
+      if (lands) {
+        reinterpret_cast<device float*>(gdn_buffered_row(
+            scalar_slab, pages, t_own, page_tokens, page_bytes, scalar_row_bytes))[hv] = g.x;
+      }
     }
   }
   // A carried row's log-gate, from its buffered `[b | a]`.
@@ -1278,7 +1306,7 @@ template <typename T, int SG, int VROWS>
       const constant uint&, device uchar*, const constant uint&,               \
       device uchar*, const constant uint&, const device ulong*,                \
       const constant uint&, const device float4*, const constant uint&,        \
-      const device int*, uint3, uint, uint);
+      const device int*, device uchar*, const constant uint&, uint3, uint, uint);
 
 PIE_GDN_CARRIED(8, 2)
 PIE_GDN_CARRIED(8, 16)
@@ -1426,6 +1454,11 @@ template <typename T, int SG, int VROWS>
     const device float4* table  [[buffer(25)]],
     const constant uint& table_rows [[buffer(26)]],
     const device int* ext_replay [[buffer(27)]],
+    // The rows' per-head scalars (f32): `v_heads` log-gates, then `v_heads`
+    // key-norm inverses. The own row lands its; a short carry reads its
+    // carried rows' in place of their `[b | a]` softplus and key norm.
+    device uchar* scalar_slab   [[buffer(28)]],
+    const constant uint& scalar_row_bytes [[buffer(29)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint lane_u [[thread_index_in_simdgroup]],
     uint sg_u [[simdgroup_index_in_threadgroup]]) {
@@ -1473,6 +1506,7 @@ template <typename T, int SG, int VROWS>
   const size_t qbase = row + size_t(hk) * D;
   const size_t kbase = qbase + keys;
   float qn[PER], kn[PER];
+  float own_kinv;
   {
     const float4 q4 = float4(*reinterpret_cast<const device vec<T, 4>*>(qkv + qbase + size_t(PER * lane)));
     const float4 k4 = float4(*reinterpret_cast<const device vec<T, 4>*>(qkv + kbase + size_t(PER * lane)));
@@ -1483,6 +1517,7 @@ template <typename T, int SG, int VROWS>
     }
     const float qinv = metal::rsqrt(gdn_row_sum<32>(qs) + 1e-6f) * scale;
     const float kinv = metal::rsqrt(gdn_row_sum<32>(ks) + 1e-6f);
+    own_kinv = kinv;
     for (int i = 0; i < PER; ++i) {
       qn[i] = q4[i] * qinv;
       kn[i] = k4[i] * kinv;
@@ -1493,6 +1528,11 @@ template <typename T, int SG, int VROWS>
     kq += qn[i] * kn[i];
   }
   kq = gdn_row_sum<32>(kq);
+  if (lands && group.y == 0 && tid == 0) {
+    reinterpret_cast<device float*>(gdn_buffered_row(
+        scalar_slab, pages, t_own, page_tokens, page_bytes, scalar_row_bytes))[vh + size_t(hv)] =
+        own_kinv;
+  }
   if (lands && group.y == 0 && sg == 0 && hv % (v_heads / k_heads) == 0) {
     device T* krow = reinterpret_cast<device T*>(
         gdn_buffered_row(key_slab, pages, t_own, page_tokens, page_bytes, key_row_bytes));
@@ -1508,21 +1548,22 @@ template <typename T, int SG, int VROWS>
     const size_t at = size_t(own + t_own) * 2 * vh + size_t(hv);
     gates[at] = own_g.x;
     gates[at + vh] = own_g.y;
+    if (lands) {
+      reinterpret_cast<device float*>(gdn_buffered_row(
+          scalar_slab, pages, t_own, page_tokens, page_bytes, scalar_row_bytes))[hv] = own_g.x;
+    }
   }
 
   // Each carried row's scalars, once a threadgroup: row s on simdgroup
-  // s mod SG.
-  const float a_scale = -metal::fast::exp(a_log[hv]);
-  const float bias = float(dt_bias[hv]);
+  // s mod SG. Its log-gate and key-norm inverse are the ones its landing
+  // stored; its keys' dots with the own row's q and k are made here.
   for (int s = sg; s < rep; s += SG) {
     const device T* krow = reinterpret_cast<const device T*>(
         gdn_buffered_row(key_slab, pages, s, page_tokens, page_bytes, key_row_bytes));
+    const device float* srow = reinterpret_cast<const device float*>(
+        gdn_buffered_row(scalar_slab, pages, s, page_tokens, page_bytes, scalar_row_bytes));
     const float4 kr4 = float4(*reinterpret_cast<const device vec<T, 4>*>(krow + size_t(hk) * D + size_t(PER * lane)));
-    float rs = 0.0f;
-    for (int i = 0; i < PER; ++i) {
-      rs += kr4[i] * kr4[i];
-    }
-    const float rinv = metal::rsqrt(gdn_row_sum<32>(rs) + 1e-6f);
+    const float rinv = srow[vh + size_t(hv)];
     float dq = 0.0f, dk = 0.0f;
     for (int i = 0; i < PER; ++i) {
       const float k = kr4[i] * rinv;
@@ -1537,11 +1578,7 @@ template <typename T, int SG, int VROWS>
     if (lane == 0) {
       dq_s[s] = dq;
       dk_s[s] = dk;
-      const device T* brow = reinterpret_cast<const device T*>(
-          gdn_buffered_row(ba_slab, pages, s, page_tokens, page_bytes, ba_row_bytes));
-      const float z = float(brow[vh + size_t(hv)]) + bias;
-      const float sp = (z > 20.0f) ? z : metal::log(1.0f + metal::fast::exp(z));
-      glog_s[s] = a_scale * sp;
+      glog_s[s] = srow[hv];
       u_at_s[s] = ulong(gdn_buffered_row(u_slab, pages, s, page_tokens, page_bytes, u_row_bytes) - u_slab);
     }
   }
@@ -1634,6 +1671,6 @@ template <typename T, int SG, int VROWS>
       const constant uint&, device uchar*, const constant uint&,              \
       device uchar*, const constant uint&, const device ulong*,               \
       const constant uint&, const device float4*, const constant uint&,       \
-      const device int*, uint3, uint, uint);
+      const device int*, device uchar*, const constant uint&, uint3, uint, uint);
 
 PIE_GDN_CARRIED_SHORT(8, 4)

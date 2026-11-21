@@ -93,7 +93,17 @@ fn a_carry_past_the_table_is_served() {
         gates: upload(&vec![0u8; (2 * V_HEADS * 4) as usize], 1, 2 * V_HEADS, Dtype::F32),
     };
     let ba_paged = Paged { slab: ba_slab, pages, page_tokens: PAGE, page_bytes, row_bytes: ba_row as u32, page_ints: ints_a_row };
-    let corrected = Corrected { keys: key_slab, key_row_bytes: key_row as u32, u: u_slab, u_row_bytes: u_row as u32 };
+    // A long carry takes the staged scan, which derives its rows' scalars:
+    // the own row lands its in a plane of its own.
+    let scalars = upload(&vec![0u8; (PAGES * page_bytes) as usize], PAGES, page_bytes, Dtype::U8);
+    let corrected = Corrected {
+        keys: key_slab,
+        key_row_bytes: key_row as u32,
+        u: u_slab,
+        u_row_bytes: u_row as u32,
+        scalars,
+        scalars_row_bytes: 2 * V_HEADS * 4,
+    };
     let work = upload(&vec![0u8; 64 * 1024], 1, 4, Dtype::F32);
     // The scan through a table that holds the carry, then through one that
     // does not: each from the same state.

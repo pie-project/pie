@@ -174,28 +174,29 @@ impl Run<'_> {
                     // The corrected planes (keys, u) each own row lands:
                     // through the page table, or into the planes' scratch at
                     // its own row and scattered into the buffer after.
-                    let planes = seat
-                        .layout
-                        .in_of
-                        .get(&qkv.0)
-                        .copied()
-                        .zip(seat.layout.in_of.get(&y.0).copied());
+                    let in_of = |id: poem_ir::ValueId| seat.layout.in_of.get(&id.0).copied();
+                    let planes = in_of(*qkv).zip(in_of(*y)).zip(in_of(*gates));
                     let corrected = match (planes, paged) {
                         (None, _) => None,
                         (Some(_), Some(_)) => seat
                             .paged(self.handles(), *qkv)
                             .zip(seat.paged(self.handles(), *y))
-                            .map(|(keys, u)| ssm::Corrected {
+                            .zip(seat.paged(self.handles(), *gates))
+                            .map(|((keys, u), scalars)| ssm::Corrected {
                                 keys: keys.slab,
                                 key_row_bytes: keys.row_bytes,
                                 u: u.slab,
                                 u_row_bytes: u.row_bytes,
+                                scalars: scalars.slab,
+                                scalars_row_bytes: scalars.row_bytes,
                             }),
-                        (Some((kp, up)), None) => Some(ssm::Corrected {
+                        (Some(((kp, up), sp)), None) => Some(ssm::Corrected {
                             keys: seat.ext_in[kp],
                             key_row_bytes: plane_row_bytes(&seat, kp, OP)?,
                             u: seat.ext_in[up],
                             u_row_bytes: plane_row_bytes(&seat, up, OP)?,
+                            scalars: seat.ext_in[sp],
+                            scalars_row_bytes: plane_row_bytes(&seat, sp, OP)?,
                         }),
                     };
                     // The beam groups' folds first (BEAM-PAGE-LISTS §11.3):
@@ -273,9 +274,10 @@ impl Run<'_> {
                         self.tensor(*y),
                         self.rs_snapshots(*state),
                     );
-                    if let (Ok(()), Some((kp, up))) = (&landed, scattered) {
+                    if let (Ok(()), Some(((kp, up), sp))) = (&landed, scattered) {
                         self.rs_scatter(OP, &seat, kp, seat.ext_in[kp])?;
                         self.rs_scatter(OP, &seat, up, seat.ext_in[up])?;
+                        self.rs_scatter(OP, &seat, sp, seat.ext_in[sp])?;
                     }
                     landed?;
                     // A compact fire's decode lanes beside wider ones read

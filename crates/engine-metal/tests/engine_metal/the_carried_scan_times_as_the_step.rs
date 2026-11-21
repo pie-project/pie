@@ -83,7 +83,15 @@ fn the_carried_scan_times_as_the_step() {
         gates: zeros((2 * V_HEADS * 4) as usize, 1, 2 * V_HEADS, Dtype::F32),
     };
     let ba_paged = Paged { slab: ba_slab, pages, page_tokens: 4, page_bytes, row_bytes: 2 * V_HEADS * 2, page_ints: 11 };
-    let corrected = Corrected { keys, key_row_bytes: K_HEADS * D * 2, u, u_row_bytes: V_HEADS * D * 4 };
+    // The rows' scalars in the `u` slab's pages (their values only time).
+    let corrected = Corrected {
+        keys,
+        key_row_bytes: K_HEADS * D * 2,
+        u,
+        u_row_bytes: V_HEADS * D * 4,
+        scalars: u,
+        scalars_row_bytes: 2 * V_HEADS * 4,
+    };
     for rep in [0i32, 3, 7] {
         let committed = Committed {
             replay: ints(&[rep]),

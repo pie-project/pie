@@ -211,7 +211,9 @@ fn assert_old_tuning(
     assert_eq!(
         poem_compiler::DeviceProfile::of(&profile, chip::pricing_cores(&profile, cores), &[], &[]),
         poem_compiler::DeviceProfile {
-            sms: cores.unwrap_or(32),
+            // A device that states no cores is measured as it opens
+            // (`CoresFrom::Probe`); unmeasured, it prices at one.
+            sms: cores.unwrap_or(1),
             side_streams: 0,
             ..poem_compiler::DeviceProfile::default()
         },
