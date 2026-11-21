@@ -1050,18 +1050,12 @@ On a hybrid model each beam lane replays its buffered rows past its group's
 common ancestor every step (`new-memory/designs/BEAM-PAGE-LISTS.md` §11.3,
 `[c, s_t]`). Where two lineages stay apart, the rows grow with the steps
 since they parted: Vulkan Qwen3.5 beam-4 on one prompt carried 4 × 257 rows
-at step 257, past the 1024-row bound engine-gpu's staged rs table holds (the
-widest bucket's tokens), and is refused: over-demand that must be served.
-The table addresses each carried row's rs page (one rs row a page on
-engine-gpu's Qwen3.5 plan), so sizing it for each lane's rows to its context
-is about 1 GB at 256 lanes x 262k context; chunked passes do not help on
-engine-gpu, whose carried kernels fold uncommitted rows into sums over the
-own row's q and k inside each layer. A beam lane's row-to-page map is already
-on the device in its group's resident lists (§11.1), which a resolve through
-them would use with no context-sized table (Leader's call pending). Served
-or not, the cost per step grows with the divergence (O(steps) replay,
-O(steps²) over a search). CUDA (`serve/prepare.rs`), Metal and XLA keep a
-`max_tokens` bound today. A bound by design is a spec question for AMD / Leader: per-beam
+at step 257 and up to 4 × 1018 rows later in the search. engine-gpu serves
+it (a beam lane's carried rows are a span whose pages resolve through its
+list, its set's rs entries in its group's state; the per-fire tables stay
+O(lanes + widest bucket)), but the cost per step grows with the divergence
+(O(steps) replay, O(steps²) over a search). CUDA, Metal and XLA move to the
+same shape. A bound by design is a spec question for AMD / Leader: per-beam
 state checkpoints (each beam's recurrent state kept at page boundaries, so a
 beam replays at most a page past its last checkpoint) would bound the replay
 by a page at the cost of a state per beam per page.
