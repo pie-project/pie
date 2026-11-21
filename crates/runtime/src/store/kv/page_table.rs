@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{SmallVec, smallvec};
 
 use super::hash::Hash256;
@@ -1532,6 +1532,74 @@ impl KvPageTable {
                 KvPageBacking::Swapped(_) | KvPageBacking::OnDisk(_) => None,
             })
             .collect())
+    }
+
+    /// [`Self::movable_resident_pages`] of each of `groups`, the running
+    /// working sets' and the pins' locations walked once for all of them:
+    /// asked one group at a time, every group walked every running set's
+    /// every page (O(groups x pages): ~32 us a process, ~9 ms a map of 250
+    /// on a realistic store, every pass that built the occupancy map).
+    pub fn movable_resident_pages_each(
+        &self,
+        groups: &[HashSet<WorkingSetId>],
+    ) -> Vec<Vec<(TriePageLocation, PhysicalKvPageId)>> {
+        if groups.is_empty() {
+            return Vec::new();
+        }
+        // The running sets reading each location (one inline, more in a
+        // list: most pages have one reader), and the pinned ones.
+        enum Readers {
+            One(WorkingSetId),
+            Many(Vec<WorkingSetId>),
+        }
+        let mut readers: FxHashMap<TriePageLocation, Readers> = FxHashMap::default();
+        for (ws, entry) in self.working_sets.iter() {
+            if entry.suspended {
+                continue;
+            }
+            let _ = self.visit_working_set_locations(ws, |location| {
+                match readers.entry(location) {
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(Readers::One(ws));
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut slot) => {
+                        let by = slot.get_mut();
+                        match by {
+                            Readers::One(first) => *by = Readers::Many(vec![*first, ws]),
+                            Readers::Many(list) => list.push(ws),
+                        }
+                    }
+                }
+            });
+        }
+        let mut pinned: FxHashSet<TriePageLocation> = FxHashSet::default();
+        for &terminal in self.pins.keys() {
+            self.visit_anchor_locations(terminal, |location| {
+                pinned.insert(location);
+            });
+        }
+        groups
+            .iter()
+            .map(|sets| {
+                let Ok(target) = self.locations(sets) else {
+                    return Vec::new();
+                };
+                target
+                    .into_iter()
+                    .filter(|location| {
+                        !pinned.contains(location)
+                            && !readers.get(location).is_some_and(|by| match by {
+                                Readers::One(ws) => !sets.contains(ws),
+                                Readers::Many(list) => list.iter().any(|ws| !sets.contains(ws)),
+                            })
+                    })
+                    .filter_map(|location| match self.backing_at(&location).ok()? {
+                        KvPageBacking::Resident(id) => Some((location, id)),
+                        KvPageBacking::Swapped(_) | KvPageBacking::OnDisk(_) => None,
+                    })
+                    .collect()
+            })
+            .collect()
     }
 
     /// Only those pages stay; the rest of `working_sets` can still go.

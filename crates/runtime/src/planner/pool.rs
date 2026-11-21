@@ -1101,12 +1101,19 @@ impl PoolPort for RegistryPool {
             };
             let mut by: std::collections::BTreeMap<u32, (u32, Vec<(ProcessId, u32)>)> =
                 std::collections::BTreeMap::new();
-            for (&pid, sets) in pids.iter().zip(sets) {
-                let Some(sets) = sets else {
-                    continue;
-                };
+            // Every process's movable pages read in one walk of the
+            // running sets' pages ([`crate::store::kv::KvStore::movable_resident_pages_each`]).
+            let named: Vec<(ProcessId, std::collections::HashSet<_>)> = pids
+                .iter()
+                .zip(sets)
+                .filter_map(|(&pid, sets)| sets.map(|sets| (pid, sets)))
+                .collect();
+            let groups: Vec<_> = named.iter().map(|(_, sets)| sets.clone()).collect();
+            let movable = kv.movable_resident_pages_each(&groups);
+            for ((pid, _), pages) in named.iter().zip(movable) {
+                let pid = *pid;
                 let mut counts: std::collections::BTreeMap<u32, u32> = Default::default();
-                for page in kv.movable_resident_pages(&sets) {
+                for page in pages {
                     let slot = pool.slot(list.pool, page.0);
                     if let Some(physical) = pool.pool().physical(slot.chunk) {
                         *counts.entry(physical).or_default() += 1;

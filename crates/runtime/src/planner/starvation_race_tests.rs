@@ -7705,7 +7705,7 @@ fn bench_a_plan_pass_on_a_shared_store() {
     let one: HashSet<_> = [sets[0].0].into_iter().collect();
     time("kv.movable_resident_pages(one resident)", &|| {
         crate::store::registry::with_kv_lock(&stores.kv, "bench", |kv| {
-            let _ = kv.movable_resident_pages(&one);
+            let _ = kv.movable_resident_pages_each(std::slice::from_ref(&one));
         });
     });
     time("kv_working_sets_for(residents)", &|| {
@@ -9668,4 +9668,51 @@ async fn a_pass_with_nothing_to_do_says_where_it_stopped() {
     planner.plan();
     let end = planner.with_inner(|inner| inner.last_plan.as_ref().map(|end| end.ended));
     assert_eq!(end, Some("its parked state moves down a tier: restored once it lands"));
+}
+
+/// The L40S at 3 GiB on f623134fc: a restore head needing 13 single chunks
+/// with 12 free, one chunk holding residents whose state can park. No
+/// chunk-level compaction makes a free chunk; the eviction of that chunk's
+/// occupants does, and it is made, never a quiet wait.
+#[tokio::test(flavor = "current_thread")]
+async fn one_chunk_short_of_singles_evicts_its_parkable_occupants() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(14, 0..0, 64));
+    pool.free.lock().extend(0..12);
+    pool.store_refuses.store(true, Ordering::Relaxed);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (head, a, b) = (ProcessId::new_v4(), ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [head, a, b] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    pool.kv.lock().extend([(12, a), (12, b), (13, a)]);
+    planner.with_inner(|inner| {
+        let proc = inner.procs.get_mut(&head).unwrap();
+        proc.state = Residency::Evicted;
+        proc.roles_short = Some(PendingBind {
+            run: 1,
+            pieces: 13,
+            pages: 13,
+        });
+        inner.enqueue(
+            head,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        );
+    });
+    planner.poke();
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.stats.evictions_started.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+    }
+    let end = planner.with_inner(|inner| inner.last_plan.as_ref().map(|end| end.ended));
+    assert!(
+        planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
+        "the one chunk's occupants are evicted ({end:?})"
+    );
+    assert_eq!(planner.stats.quiet_waits.load(Ordering::Relaxed), 0);
 }
