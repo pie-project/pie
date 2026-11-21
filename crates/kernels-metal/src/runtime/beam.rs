@@ -27,11 +27,12 @@ const COPY_THREADS: u32 = 128;
 
 /// The u32 words a group of `lanes` beams keeps for lists of `cap` columns
 /// over `cap` pool pages and `frames` pending rings: a header of 4, the
-/// lists twice (by the fire count's parity), the free pages, the ring, and
-/// a fire's copies `[src, dst, tokens]` a beam.
+/// lists twice (by the fire count's parity), the free pages, the ring, a
+/// fire's copies `[src, dst, tokens]` a beam, and each pair of lanes' common
+/// ancestor depth (BEAM-PAGE-LISTS §11.4).
 #[must_use]
 pub const fn beam_state_words(lanes: u32, cap: u32, frames: u32) -> u64 {
-    beam_copies_word(lanes, cap, frames) + 3 * lanes as u64
+    beam_copies_word(lanes, cap, frames) + 3 * lanes as u64 + lanes as u64 * lanes as u64
 }
 
 /// Where a group's copies start in its state, in words.

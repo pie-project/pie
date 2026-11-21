@@ -157,6 +157,9 @@ fn search(dev: &Dev, lanes: u32, folded: u32, steps: u32, seed: u64, rs_t: u32) 
     let mut replay = State::new(lanes, cap, FRAMES);
     let mut rng = Lcg(seed);
     let runs = dev.handles.bind(&buffer, 0, buffer.bytes()).expect("the runs");
+    // Each pair of lanes' common-ancestor depth (§11.4), as the head step
+    // keeps it.
+    let mut lca: Vec<u32> = vec![0; (lanes * lanes) as usize];
     for t in 0..steps {
         if t == steps / 2 {
             // A suspend and restore: the state out to the host and back.
@@ -238,6 +241,27 @@ fn search(dev: &Dev, lanes: u32, folded: u32, steps: u32, seed: u64, rs_t: u32) 
             let width = std::mem::size_of::<BeamStepRun>() as u32;
             kbeam::beam_step(sink, Tensor::new(runs, 1, width, Dtype::U8), 1).expect("beam_step encodes");
         });
+        // §11.4 on the host: siblings part at this fire's row, other pairs
+        // agree as far as their parents did; priming, every pair shares the
+        // prompt to here.
+        let primed = replay.fired > 0;
+        let next: Vec<u32> = (0..lanes * lanes)
+            .map(|x| {
+                let (i, j) = ((x / lanes) as usize, (x % lanes) as usize);
+                if i == j {
+                    u32::MAX
+                } else if !primed {
+                    slot
+                } else {
+                    // A parent past the lanes continues itself, as the device's.
+                    let of = |b: usize| if parents[b] < lanes { parents[b] } else { b as u32 };
+                    let (pi, pj) = (of(i), of(j));
+                    if pi == pj { slot } else { lca[(pi * lanes + pj) as usize] }
+                }
+            })
+            .collect();
+        lca = next;
+        let common = lca.iter().copied().min().filter(|&d| d != u32::MAX).unwrap_or(slot + 1).min(slot + 1);
         let want = beam::step(
             &mut replay,
             &parents,
@@ -253,16 +277,9 @@ fn search(dev: &Dev, lanes: u32, folded: u32, steps: u32, seed: u64, rs_t: u32) 
         assert_eq!(held[0], 1, "{at}: primed");
         assert_eq!(held[1], replay.fired, "{at}: fires run");
         assert_eq!(held[2], replay.pool, "{at}: the pool's pages");
-        // §11.3: the common slot, from the replay's lists: the first column
-        // at most this fire's where a beam's list differs from beam 0's.
-        let apart = (0..=c as usize)
-            .find(|&j| want.lists.iter().any(|list| list[j] != want.lists[0][j]))
-            .map_or(c + 1, |j| j as u32);
-        assert_eq!(
-            held[3],
-            ((f0 + apart) * PAGE).min(slot + 1),
-            "{at}: the group's common slot"
-        );
+        // §11.4: the common slot, the least pair's common-ancestor depth,
+        // capped at the slot past this fire's row, never below the folded.
+        assert_eq!(held[3], common.max(folded), "{at}: the group's common slot");
         let map = 4 + (replay.fired as usize & 1) * (lanes * cap) as usize;
         for b in 0..lanes as usize {
             let row = &held[map + b * cap as usize..map + b * cap as usize + c as usize + 1];

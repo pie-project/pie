@@ -262,21 +262,37 @@ kernel void beam_step(
         }
     }
     threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-    // §11.3: the group's common slot. j* is the first column, at most the
-    // fire's, at which any beam's reordered list names another page than
-    // beam 0's (c + 1 where every column agrees); every slot below
-    // (f0 + j*) S lies on the same pool page in every beam.
-    threadgroup atomic_uint apart_s;
-    if (tid == 0u) atomic_store_explicit(&apart_s, c + 1u, memory_order_relaxed);
+    // The group's common slot (BEAM-PAGE-LISTS §11.3, §11.4): the depth of
+    // its live lanes' most recent common ancestor, whatever the guest forks
+    // them for. `lca[i][j]` holds, for lanes i != j, the slot below which
+    // their rows agree: lanes forked from one parent agree below this fire's
+    // row (counted as parting there: a lower bound, exact where their inputs
+    // differ); others agree as far as their parents did. Every row below the
+    // least of them was written once and reached the other lanes only by
+    // copies: the same bytes in every lane. Capped at the slot past this
+    // fire's rows (with one lane every row is common), never below the
+    // folded slot; monotone, read by the host at harvest.
+    device uint* lca = copies + 3u * B;
+    threadgroup uint lca_new[PIE_BEAM_MAX_LANES * PIE_BEAM_MAX_LANES];
+    threadgroup atomic_uint common_s;
+    if (tid == 0u) atomic_store_explicit(&common_s, r.slot + 1u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint j = tid; j <= c; j += threads_in) {
-        for (uint b = 1u; b < B; ++b) {
-            if (map_new[b * cap + j] != map_new[j]) {
-                atomic_fetch_min_explicit(&apart_s, j, memory_order_relaxed);
-                break;
+    for (uint x = tid; x < B * B; x += threads_in) {
+        const uint i = x / B, j = x % B;
+        uint depth = 0xFFFFFFFFu;
+        if (i != j) {
+            if (primed == 0u) {
+                depth = r.slot;
+            } else {
+                const uint pi = parent_of[i], pj = parent_of[j];
+                depth = pi == pj ? r.slot : lca[pi * B + pj];
             }
+            atomic_fetch_min_explicit(&common_s, depth, memory_order_relaxed);
         }
+        lca_new[x] = depth;
     }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    for (uint x = tid; x < B * B; x += threads_in) lca[x] = lca_new[x];
     // §6.5: each lane's staged entries past `f0` and its rows' write pages.
     for (uint i = 0u; i < r.list_count; ++i) {
         const BeamListRun l = lists[i];
@@ -349,9 +365,9 @@ kernel void beam_step(
         header[0] = 1u;
         header[1] = fired + 1u;
         header[2] = Q;
-        // c_t = min((f0 + j*) S, end_t), end_t the slot past the fire's row.
-        const ulong common = (ulong(f0) + atomic_load_explicit(&apart_s, memory_order_relaxed)) * S;
-        header[3] = uint(min(common, ulong(r.slot) + 1u));
+        // c_t, never below the folded slot.
+        const uint common = atomic_load_explicit(&common_s, memory_order_relaxed);
+        header[3] = common > r.folded ? common : r.folded;
     }
 }
 
