@@ -1429,10 +1429,12 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
                             .iter()
                             .map(|w| Tensor { rows: cols, ..*w })
                             .collect();
-                        // Each fire its own output (as many as the room laid
-                        // for the most rows holds, to one a plane), so no
-                        // fire waits on the one before for writing the same.
-                        let outs = rig.views(ys, plane.len(), m, cols, Dtype::Bf16)?;
+                        // One output every fire writes, as each matmul of a
+                        // served step waits on the one before it: fires to
+                        // outputs of their own ran side by side (a 64-row
+                        // tile's one-row fire, latency-bound, read 15x fast),
+                        // which no served step's matmuls do.
+                        let outs = rig.views(ys, 1, m, cols, Dtype::Bf16)?;
                         let rate = matmul_on(
                             rig,
                             timed[t].tactic,
@@ -1459,6 +1461,14 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
                             // measurement: the sample is dropped, never the
                             // step (a narrower slice's held time stands).
                             Some(Err(why)) => {
+                                tracing::debug!(
+                                    kernel = timed[t].name.as_str(),
+                                    rows = m,
+                                    n,
+                                    k,
+                                    why = %why,
+                                    "rates point: a sample dropped"
+                                );
                                 say(&format!(
                                     "[rates]: {}: a sample dropped ({why})",
                                     timed[t].name

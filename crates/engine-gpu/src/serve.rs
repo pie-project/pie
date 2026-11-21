@@ -2735,15 +2735,18 @@ impl<B: Serve> Shell<B> {
                             }
                         }
                     }
-                    let (kept_ns, kept_spread) = crate::rates::median_spread(&samples[0]);
+                    // An option replaces the choice where every fire of it ran
+                    // faster than every fire of the choice (their ranges
+                    // apart: no repeat's noise could turn them around); of
+                    // those, the fastest by its median.
+                    let fastest = |s: &[f64]| s.iter().copied().fold(f64::INFINITY, f64::min);
+                    let slowest = |s: &[f64]| s.iter().copied().fold(0.0, f64::max);
+                    let kept_best = fastest(&samples[0]);
                     let mut taken = 0;
-                    let mut best = kept_ns;
+                    let mut best = f64::INFINITY;
                     for (i, s) in samples.iter().enumerate().skip(1) {
-                        let (ns, spread) = crate::rates::median_spread(s);
-                        if ns < best
-                            && (kept_ns - ns) / kept_ns.max(f64::MIN_POSITIVE)
-                                > kept_spread + spread
-                        {
+                        let (ns, _) = crate::rates::median_spread(s);
+                        if slowest(s) < kept_best && ns < best {
                             taken = i;
                             best = ns;
                         }
