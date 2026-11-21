@@ -55,3 +55,15 @@ pub use stats::PlannerStats;
 pub use trace::trace_enabled;
 
 pub type ProcessId = uuid::Uuid;
+
+// The planner's maps and sets by process: under test they iterate in pid
+// order, so a seeded simulation's victim picks, ties and every order read
+// from them are the same on each run ([`sim_tests`]); in service they hash.
+#[cfg(test)]
+pub(crate) type PidMap<V> = std::collections::BTreeMap<ProcessId, V>;
+#[cfg(not(test))]
+pub(crate) type PidMap<V> = std::collections::HashMap<ProcessId, V>;
+#[cfg(test)]
+pub(crate) type PidSet = std::collections::BTreeSet<ProcessId>;
+#[cfg(not(test))]
+pub(crate) type PidSet = std::collections::HashSet<ProcessId>;

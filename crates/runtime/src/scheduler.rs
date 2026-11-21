@@ -493,6 +493,17 @@ pub async fn spawn(engine_indices: &[usize], page_size: u32) -> Result<Scheduler
 }
 
 pub(crate) fn device_domain(engine_idx: usize) -> ::engine::MemoryDomain {
+    // A test's own lane names its device ([`worker::test_lane::TestLane`]).
+    #[cfg(test)]
+    if let Some(domain) = TEST_HANDLES.with(|handles| {
+        handles
+            .borrow()
+            .iter()
+            .find(|(engine, _)| *engine == engine_idx)
+            .map(|(_, handle)| handle.device_domain())
+    }) {
+        return domain;
+    }
     crate::engine::get_spec(engine_idx)
         .map_or(::engine::MemoryDomain::HostPinned, |s| s.device_domain)
 }
