@@ -297,7 +297,7 @@ impl Engine for GuestEngine {
     fn rebind_slots(&mut self, rebind: Rebind) -> ::engine::Result<()> {
         match &rebind {
             Rebind::Instance { id, scratch, .. } => self.claim(*id, scratch)?,
-            Rebind::Parked { id } => {
+            Rebind::Parked { id, .. } => {
                 if let Some(claims) = self.claims.as_mut() {
                     claims.remove(id);
                 }
@@ -561,7 +561,7 @@ fn a_park_is_said_to_the_engine_before_its_slots_are_another_s() {
             .unwrap()
             .prepare_park(holder(1))
             .expect("the instance parks");
-        assert_eq!(park.parked(), vec![Rebind::Parked { id }], "the park names it");
+        assert_eq!(park.parked(), vec![Rebind::Parked { id, kept: false }], "the park names it");
         if told {
             for rebind in park.parked() {
                 super::rebind(Some(&roles), &mut engine, rebind, |_, _, _| Ok(())).unwrap();

@@ -347,16 +347,25 @@ impl Plane {
         #[cfg(not(feature = "vulkan"))]
         let _ = layout;
         #[cfg(feature = "vulkan")]
-        let session = self
+        let mut session = self
             .build_session(place, binding, &plan, layout)
             .map_err(|why| {
                 Refusal::Program(format!("program {} does not bind: {why}", binding.program))
             })?;
         // The instance's room is fresh, its pair's where none holds that
-        // taking: both are another owner's bytes until cleared.
+        // taking: both are another owner's bytes until cleared. The pair's
+        // state is claimed by the group bound on its taking, before it is.
         #[cfg(feature = "vulkan")]
         {
             let fresh_pair = self.takings.take(&binding.pair, binding.pair_generation);
+            let group = self
+                .takings
+                .group(&binding.pair, binding.pair_generation)
+                .map(|group| (group, binding.pair_generation));
+            if let Err(fault) = session.join_pair(group) {
+                self.takings.give(&binding.pair, binding.pair_generation);
+                return Err(Refusal::fault(fault));
+            }
             if let Err(fault) = session.clear(fresh_pair) {
                 self.takings.give(&binding.pair, binding.pair_generation);
                 return Err(Refusal::Program(format!(
@@ -440,8 +449,11 @@ impl Plane {
         // back to the runtime.
         #[cfg(feature = "vulkan")]
         {
-            self.takings
-                .give(seat.session.pair_place(), seat.pair_generation);
+            // A parked one left its taking at its park.
+            if !seat.parked {
+                self.takings
+                    .give(seat.session.pair_place(), seat.pair_generation);
+            }
             let mut kept = self.kept.lock().expect("kept cells lock poisoned");
             for channel in &seat.own_cells {
                 kept.remove(channel);
@@ -476,7 +488,7 @@ impl Plane {
         );
         let instance =
             engine_gpu::guest::held::table_footprint(place.pools, INSTANCE, &sizes, place.align)
-                .map_err(|fault| Refusal::Program(fault.to_string()))?;
+                .map_err(Refusal::fault)?;
         let mut rings = Vec::new();
         for (dense, decl) in plan.package.channels.iter().enumerate() {
             let channel = dense as u32;
@@ -521,7 +533,7 @@ impl Plane {
     pub fn rebind(&mut self, pools: &Pools<crate::device::Api>) -> Result<(), Refusal> {
         #[cfg(feature = "vulkan")]
         {
-            let program = |fault: engine_gpu::error::Fault| Refusal::Program(fault.to_string());
+            let program = Refusal::fault;
             // A parked instance's slots are another owner's: repointed and
             // claimed at its rebind, not here.
             for seat in self.instances.values_mut().filter(|seat| !seat.parked) {
@@ -550,7 +562,7 @@ impl Plane {
     ) -> Result<(), Refusal> {
         #[cfg(feature = "vulkan")]
         {
-            let program = |fault: engine_gpu::error::Fault| Refusal::Program(fault.to_string());
+            let program = Refusal::fault;
             match rebind {
                 Rebind::Instance {
                     id,
@@ -566,13 +578,23 @@ impl Plane {
                         id: id.0,
                     })?;
                     let was = (seat.session.pair_place().clone(), seat.pair_generation);
-                    seat.session
-                        .retarget(pools, instance, scratch, pair)
-                        .map_err(program)?;
+                    // The pair's taking it binds on is claimed by the group
+                    // bound on it, this member joining it with its own runs.
+                    let fresh_pair = self.takings.take(pair, *pair_generation);
+                    let group = self
+                        .takings
+                        .group(pair, *pair_generation)
+                        .map(|group| (group, *pair_generation));
+                    if let Err(fault) = seat.session.retarget(pools, instance, scratch, pair, group) {
+                        self.takings.give(pair, *pair_generation);
+                        return Err(Refusal::fault(fault));
+                    }
                     // The unpark's room is fresh; the pair's is cleared where
                     // this is the first instance on its new taking.
-                    self.takings.give(&was.0, was.1);
-                    let fresh_pair = self.takings.take(pair, *pair_generation);
+                    // A parked one left its taking at its park.
+                    if !seat.parked {
+                        self.takings.give(&was.0, was.1);
+                    }
                     seat.pair_generation = *pair_generation;
                     seat.parked = false;
                     seat.session.clear(fresh_pair).map_err(program)?;
@@ -594,13 +616,18 @@ impl Plane {
                             .map_err(program)?;
                     }
                 }
-                Rebind::Parked { id } => {
+                Rebind::Parked { id, kept } => {
                     let seat = self.instances.get_mut(id).ok_or(Refusal::Closed {
                         what: "instance",
                         id: id.0,
                     })?;
-                    seat.session.park().map_err(program)?;
-                    seat.parked = true;
+                    if !seat.parked {
+                        seat.session.park(*kept).map_err(program)?;
+                        // It leaves its pair's taking as it leaves the group.
+                        self.takings
+                            .give(seat.session.pair_place(), seat.pair_generation);
+                        seat.parked = true;
+                    }
                 }
                 Rebind::Channel { id, slots } => {
                     // The passes reading it land first.
@@ -636,7 +663,7 @@ impl Plane {
         bytes: u64,
         slots: &[u32],
     ) -> Result<crate::guest::session::Cell, Refusal> {
-        let program = |fault: engine_gpu::error::Fault| Refusal::Program(fault.to_string());
+        let program = Refusal::fault;
         let slot_bytes = place.pools.slot_bytes(CHANNEL).map_err(program)?;
         let per_chunk = place.pools.slots_per_chunk(CHANNEL).map_err(program)?;
         match engine_gpu::guest::held::item_slots(bytes, slot_bytes, per_chunk) {
@@ -1519,7 +1546,7 @@ fn cell_facts(
     let Some(bytes) = device_cell_bytes(shape, dtype, host_role) else {
         return Ok(None);
     };
-    let program = |fault: engine_gpu::error::Fault| Refusal::Program(fault.to_string());
+    let program = Refusal::fault;
     let slot_bytes = pools.slot_bytes(CHANNEL).map_err(program)?;
     let per_chunk = pools.slots_per_chunk(CHANNEL).map_err(program)?;
     Ok(
@@ -1682,7 +1709,7 @@ fn offered_read(
         |at, local| session.span(at, local).map(|(_, held)| held),
         seats,
     )
-    .map_err(|fault| Refusal::Program(fault.to_string()))?;
+    .map_err(Refusal::fault)?;
     match unread {
         Some((output, lane)) => Err(engine_gpu::program::unread(instance, &output, lane)),
         None => Ok(()),

@@ -57,6 +57,15 @@ pub enum Error {
     /// runtime fails these lanes' fires alone ([`crate::Engine::submit`]).
     #[error("{}", refused_lanes(.0))]
     Lanes(Vec<crate::LaneFault>),
+
+    /// A bind or a rebind would lay a guest instance's state over bytes
+    /// another live instance's or pair's state holds (two holders handed
+    /// overlapping slots), or would move its pair's state alone while other
+    /// instances are bound on it: a placement slip of the runtime's.
+    /// Refused before any table or descriptor was written there: every
+    /// holder stands as it stood ([`crate::guest_claims`]).
+    #[error("`guest::claims` refused: {0}")]
+    Claimed(crate::guest_claims::Refusal),
 }
 
 fn refused_lanes(lanes: &[crate::LaneFault]) -> String {

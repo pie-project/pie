@@ -378,6 +378,7 @@ fn fault(fault: Fault) -> Error {
             wanted: 1,
             available: 0,
         },
+        Fault::Claimed(refusal) => Error::Claimed(refusal),
         Fault::Compile(_) | Fault::Program { .. } | Fault::Interpret(_) => {
             Error::Program(fault.to_string())
         }
@@ -1052,8 +1053,8 @@ impl Engine for Cuda {
                     },
                 )
                 .map_err(fault),
-            engine::program::Rebind::Parked { id } => {
-                self.loaded_mut()?.park_program(id).map_err(fault)
+            engine::program::Rebind::Parked { id, kept } => {
+                self.loaded_mut()?.park_program(id, kept).map_err(fault)
             }
             engine::program::Rebind::Channel { id, slots } => {
                 let old = self.channels.get(&id).cloned().ok_or_else(|| {

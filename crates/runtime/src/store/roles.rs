@@ -94,7 +94,7 @@ impl Owner {
     #[must_use]
     pub fn of(rebind: &Rebind) -> Self {
         match rebind {
-            Rebind::Instance { id, .. } | Rebind::Parked { id } => Owner::Instance(*id),
+            Rebind::Instance { id, .. } | Rebind::Parked { id, .. } => Owner::Instance(*id),
             Rebind::Channel { id, .. } => Owner::Channel(*id),
         }
     }
@@ -774,13 +774,16 @@ impl RoleMove {
         if !self.out {
             return Vec::new();
         }
+        let parked = |kept: bool| {
+            move |(owner, _): &(Owner, Vec<Part>)| match *owner {
+                Owner::Instance(id) => Some(Rebind::Parked { id, kept }),
+                _ => None,
+            }
+        };
         self.items
             .iter()
-            .chain(&self.shed)
-            .filter_map(|(owner, _)| match *owner {
-                Owner::Instance(id) => Some(Rebind::Parked { id }),
-                _ => None,
-            })
+            .filter_map(parked(false))
+            .chain(self.shed.iter().filter_map(parked(true)))
             .collect()
     }
 }

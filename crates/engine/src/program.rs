@@ -460,8 +460,11 @@ pub enum Rebind {
     /// and the engine holds and writes nothing at its old slots: no claim
     /// on them, nothing laid there (an evacuation repoints none of it, and
     /// a pair none of whose instances is bound is laid by none), nothing
-    /// read.
-    Parked { id: InstanceId },
+    /// read. `kept`: its tables and rings stayed where they lie (no tier
+    /// below took them; only its scratch and its share of its pair were
+    /// given back), still its own, which the rebind names again; else
+    /// they went down a tier with the rest.
+    Parked { id: InstanceId, kept: bool },
 }
 
 /// The `Channel` slots the runtime took for one of an instance's rings.

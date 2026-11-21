@@ -1045,8 +1045,10 @@ impl Shell {
     }
 
     /// Instance `id`'s process parked (`engine::Rebind::Parked`).
-    pub fn park_program(&mut self, id: engine::InstanceId) -> Result<()> {
-        self.programs.park(id)
+    pub fn park_program(&mut self, id: engine::InstanceId, kept: bool) -> Result<()> {
+        let pools = &self.pools;
+        self.programs
+            .park(id, kept, &|item, bytes| pools.guest_item(item, bytes))
     }
 
     /// Instance `id`'s items lie in `slots` now.
