@@ -176,8 +176,11 @@ impl Serve for Api {
         }
     }
 
-    fn lay_stamps(device: &Context) -> Result<crate::device::Stamps> {
-        device.stamps()
+    /// `pieces` sets an arm: a frame's readback is mapped from its
+    /// work-done callback, which may run after its arm is free again, so
+    /// the arm's next frames take a set not still being read.
+    fn lay_stamps(device: &Context, pieces: u32) -> Result<crate::device::Stamps> {
+        device.stamps(pieces)
     }
 
     fn fire_timing(device: &Context) -> Result<engine_gpu::submit::FireTiming> {
@@ -194,7 +197,7 @@ impl Serve for Api {
         device: &Context,
         _record: &dyn Fn(&Frame) -> Result<()>,
     ) -> Result<crate::device::Stamps> {
-        device.stamps()
+        device.stamps(1)
     }
 
     fn replay_probe(

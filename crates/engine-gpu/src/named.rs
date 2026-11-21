@@ -503,7 +503,7 @@ impl<B: Serve> Serve for Named<B> {
     }
 
     /// A naming load runs nothing on a device: no timestamps to lay.
-    fn lay_stamps(_device: &Facts) -> Result<()> {
+    fn lay_stamps(_device: &Facts, _pieces: u32) -> Result<()> {
         Ok(())
     }
 

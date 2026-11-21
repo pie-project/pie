@@ -146,7 +146,7 @@ impl Context {
         match self.never {}
     }
 
-    pub fn stamps(&self) -> Result<Stamps> {
+    pub fn stamps(&self, _sets: u32) -> Result<Stamps> {
         match self.never {}
     }
 

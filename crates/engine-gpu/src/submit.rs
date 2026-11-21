@@ -25,8 +25,13 @@
 //!   measurable;
 //! - a decode step (one row a lane, tiny) is kept whole where its estimate
 //!   fits the bound;
-//! - a step no layer of which fits is refused by name, naming the bound and
-//!   the estimate. The load lowers the rows a prefill fire takes
+//! - a step no layer of which fits has its one prompt lane cut by rows
+//!   ([`row_pieces`]): its leading pieces fired first, each that lane alone
+//!   over its next rows, the most a piece is admitted at
+//!   ([`SubmitBound::rows_a_piece`]), each split by layer in turn; only a
+//!   step one row of one layer of which is past the bound, or one that
+//!   cannot be cut (a mask, media, recurrent state, more than one prompt
+//!   lane), is refused by name, naming the bound and the estimate. The load lowers the rows a prefill fire takes
 //!   (`FireLimits::prefill_rows`) to the widest laid rung whose prompt step at
 //!   the load's context is admitted ([`SubmitBound::prefill_rows`]), so a
 //!   prompt is cut to steps that fit; a step refused past that is one no rung
@@ -389,6 +394,20 @@ pub struct SubmitBound {
     pub clock: Option<crate::clock::ClockRange>,
 }
 
+/// A serving step's estimate at a ratio of 1, ns, what it was (its frame
+/// and step, rows, lanes, and the submissions it went out in) and the clock
+/// the GPU ran at as it was admitted, where the platform states it:
+/// carried by its flight to its landing ([`crate::serve::Shell::timed`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Estimated {
+    pub ns: f64,
+    pub at: engine::StepDone,
+    pub rows: u32,
+    pub lanes: u32,
+    pub pieces: u32,
+    pub hz: Option<u64>,
+}
+
 /// Where a serving fire's device time is read from under a stated submit
 /// bound, stated at load ([`crate::serve::Serve::fire_timing`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -466,10 +485,11 @@ pub struct Measured {
 }
 
 impl Measured {
-    /// A fire estimated at `estimate_ns` landed at `at`, taking `device_ns`.
-    pub fn landed(&mut self, at: std::time::Instant, estimate_ns: f64, device_ns: u64) {
-        if estimate_ns > 0.0 && device_ns > 0 {
-            self.landed.push_back((at, device_ns as f64 / estimate_ns));
+    /// A fire's measured ratio (at full clock where its clock is known)
+    /// landed at `at`.
+    pub fn landed(&mut self, at: std::time::Instant, ratio: f64) {
+        if ratio.is_finite() && ratio > 0.0 {
+            self.landed.push_back((at, ratio));
         }
     }
 
@@ -632,9 +652,47 @@ impl SubmitBound {
     /// than one bound before it is dropped.
     ///
     /// [`raw_ns`]: SubmitBound::raw_ns
-    pub fn landed(&mut self, at: std::time::Instant, estimate_ns: f64, device_ns: u64) {
-        self.measured.landed(at, estimate_ns, device_ns);
+    /// The GPU ran it at `hz` where its clock is known
+    /// ([`crate::clock::ClockRange::now_hz`]): its ratio is read back to
+    /// full clock, the estimate's error, so the floor factor counts the
+    /// clock once.
+    /// Returns the ratio kept (at full clock where the clock is known).
+    pub fn landed(
+        &mut self,
+        at: std::time::Instant,
+        estimate_ns: f64,
+        device_ns: u64,
+        hz: Option<u64>,
+    ) -> Option<f64> {
+        let mut kept = None;
+        if estimate_ns > 0.0 && device_ns > 0 {
+            let ratio = device_ns as f64 / estimate_ns;
+            let error = self
+                .clock
+                .as_ref()
+                .map_or(ratio, |clock| clock.at_full_clock(ratio, hz));
+            self.measured.landed(at, error);
+            kept = Some(error);
+        }
         self.age(at);
+        kept
+    }
+
+    /// The probe read `ratio` (its time over its curve time) at `hz`: the
+    /// scale estimates are read at from here, read back to full clock
+    /// where its clock is known, never below 1.
+    pub fn probed(&mut self, ratio: f64, hz: Option<u64>) {
+        let at_full = self
+            .clock
+            .as_ref()
+            .map_or(ratio, |clock| clock.at_full_clock(ratio, hz));
+        self.scale = at_full.max(1.0);
+    }
+
+    /// The clock the GPU runs at now, where the platform states it.
+    #[must_use]
+    pub fn clock_now(&self) -> Option<u64> {
+        self.clock.as_ref().and_then(crate::clock::ClockRange::now_hz)
     }
 
     /// Drops the measured fires that landed more than one bound before
@@ -737,6 +795,145 @@ impl SubmitBound {
             self.rungs.last().copied().unwrap_or(0),
         )
     }
+}
+
+impl SubmitBound {
+    /// The rows a piece of `step`'s one prompt lane (of `prompt_rows` rows)
+    /// takes where `step` is past the bound even a layer at a time: the
+    /// most rows of it a step of the other lanes' rows and those is
+    /// admitted at, every piece attending the step's longest keys (its last
+    /// piece's); `None` where even one row's piece is past the bound a
+    /// layer at a time (refused by name).
+    #[must_use]
+    pub fn rows_a_piece(&self, step: StepRows, prompt_rows: u32) -> Option<u32> {
+        let other = step.rows.saturating_sub(prompt_rows);
+        let fits = |rows: u32| {
+            !matches!(
+                self.admit(StepRows {
+                    rows: other + rows,
+                    lanes: step.lanes,
+                    keys: step.keys,
+                    prompt: true,
+                }),
+                Admitted::Refused { .. }
+            )
+        };
+        if !fits(1) {
+            return None;
+        }
+        // Admitted rows fall as rows rise: the most that fit, by halves.
+        let (mut fit, mut past) = (1u32, prompt_rows.max(1));
+        while past - fit > 1 {
+            let mid = fit + (past - fit) / 2;
+            if fits(mid) {
+                fit = mid;
+            } else {
+                past = mid;
+            }
+        }
+        Some(fit)
+    }
+}
+
+/// Why `lane` cannot be cut into pieces of fewer rows: what it states that
+/// a piece would not carry as the whole lane does. `None` where it can be.
+fn uncuttable(lane: &engine::fire::Lane, facts: &poem_ir::Facts) -> Option<&'static str> {
+    use poem_ir::Builtin;
+    let checks: [(bool, &'static str); 12] = [
+        (lane.kv_less, "it holds no kv slots"),
+        (lane.mask.is_some(), "it states a mask"),
+        (!lane.inputs.is_empty(), "it feeds guest inputs"),
+        (lane.tap.is_some(), "it taps its rows"),
+        (lane.rs != engine::fire::RsVerb::default(), "it carries a recurrent verb"),
+        (lane.rs_reset != engine::fire::RsReset::default(), "it resets recurrent state"),
+        (!lane.rs_snapshots.is_empty(), "it snapshots recurrent state"),
+        (lane.reports != 0, "it asks fold reports"),
+        (!lane.slot_copies.is_empty(), "it copies slots"),
+        (
+            lane.list != engine::fire::ListKind::default()
+                || lane.record != engine::fire::LaneRecord::default(),
+            "its program places its rows",
+        ),
+        (
+            [Builtin::Masked, Builtin::Media, Builtin::Drafts, Builtin::Scores, Builtin::Encode]
+                .iter()
+                .any(|&b| facts.holds(lane.word, b)),
+            "its class reads its whole rows (a mask, media, drafts, scores or an encoder)",
+        ),
+        (facts.holds(lane.word, Builtin::Fresh), "it starts recurrent state"),
+    ];
+    checks.iter().find(|(holds, _)| *holds).map(|&(_, why)| why)
+}
+
+/// `step` cut so its one prompt lane runs at most `rows` rows a piece: the
+/// leading pieces, each that lane alone over its next `rows` rows (no
+/// attachment, nothing read out: a piece's keys land and its successor
+/// reads them), in order, and `step` with that lane's last piece in its
+/// place, its attachments and readout as stated (a readout row shifted to
+/// the piece). `Err` names why it cannot be cut.
+pub fn row_pieces(
+    step: &engine::fire::Step,
+    facts: &poem_ir::Facts,
+    rows: u32,
+) -> Result<(Vec<engine::fire::Step>, engine::fire::Step), String> {
+    use engine::fire::Readout;
+    let prompts: Vec<usize> = (0..step.lanes.len())
+        .filter(|&at| step.lanes[at].rows() > 1)
+        .collect();
+    let [at] = prompts[..] else {
+        return Err(format!(
+            "it carries {} prompt lanes; a step is cut by the rows of its one prompt lane",
+            prompts.len()
+        ));
+    };
+    if !step.media.is_empty() || !step.voxels.is_empty() {
+        return Err("it carries media or clips, which its rows read whole".into());
+    }
+    let lane = &step.lanes[at];
+    if let Some(why) = uncuttable(lane, facts) {
+        return Err(format!("its prompt lane cannot be cut by rows: {why}"));
+    }
+    let total = lane.rows();
+    let rows = rows.clamp(1, total);
+    let pieces = total.div_ceil(rows);
+    let last_at = (pieces - 1) * rows;
+    let readout = match &lane.readout {
+        Readout::Last => Readout::Last,
+        Readout::None => Readout::None,
+        Readout::Rows(read) => {
+            if read.iter().any(|&row| row < last_at) {
+                return Err(format!(
+                    "its prompt lane reads out a row before its last piece's (from row {last_at})"
+                ));
+            }
+            Readout::Rows(read.iter().map(|&row| row - last_at).collect())
+        }
+    };
+    let piece = |from: u32, to: u32, readout: Readout| {
+        let mut piece = lane.clone();
+        let (a, b) = (from as usize, to as usize);
+        piece.tokens = lane.tokens[a..b].to_vec();
+        if !lane.positions.is_empty() {
+            piece.positions = lane.positions[a..b].to_vec();
+        }
+        piece.kv.held = lane.kv.held + from;
+        // What the pieces before wrote is written as this one stages.
+        piece.kv.readable = lane.kv.readable.max(lane.kv.held + from);
+        piece.readout = readout;
+        piece.word = facts.with(lane.word, poem_ir::Builtin::SingleToken, to - from == 1);
+        piece
+    };
+    let leading = (0..pieces - 1)
+        .map(|k| engine::fire::Step {
+            lanes: vec![piece(k * rows, (k + 1) * rows, Readout::None)],
+            attachments: Vec::new(),
+            media: Vec::new(),
+            voxels: Vec::new(),
+        })
+        .collect();
+    let mut last = step.clone();
+    last.lanes[at] = piece(last_at, total, readout);
+    Ok((leading, last))
 }
 
 /// The model's layers: the distinct layers its nodes state.
@@ -994,7 +1191,7 @@ mod tests {
         let fire = 100.0 * MS;
         let mut read = Vec::new();
         for (at, ratio) in [1.5, 2.0, 2.1, 2.3, 2.6].into_iter().enumerate() {
-            b.landed(t0 + ms(at as u64 * 100), fire, (fire * ratio) as u64);
+            b.landed(t0 + ms(at as u64 * 100), fire, (fire * ratio) as u64, None);
             read.push((b.ratio_now(), b.admit(step).split()));
         }
         // Under the stored ratio: read at it, whole (2.1 is past it but
@@ -1006,7 +1203,7 @@ mod tests {
         let (scaled, _) = b.step_ns(step);
         assert!((scaled - raw * 2.6).abs() < 1e-6 * scaled);
         // A fast fire after: the worst stands.
-        b.landed(t0 + ms(500), fire, fire as u64);
+        b.landed(t0 + ms(500), fire, fire as u64, None);
         assert!(b.admit(step).split());
         assert!((b.ratio_now() - 2.6).abs() < 1e-6);
         let why = b.refusal(step, &b.admit(step));
@@ -1019,7 +1216,7 @@ mod tests {
         assert!(matches!(b.admit(step), Admitted::Whole { .. }));
         // A probe's scale raises the stored ratio over a measured one it
         // passes: 2.062 x 1.2 = 2.474 over 2.3.
-        b.landed(t0 + ms(10_000), fire, (fire * 2.3) as u64);
+        b.landed(t0 + ms(10_000), fire, (fire * 2.3) as u64, None);
         let probed = SubmitBound { scale: 1.2, ..b };
         assert!((probed.ratio_now() - worst * 1.2).abs() < 1e-6);
     }
@@ -1075,6 +1272,102 @@ mod tests {
             prompt: false,
         };
         assert!(matches!(clocked.admit(decode), Admitted::Whole { .. }));
+    }
+
+    /// A step past the bound even a layer at a time (a 512-row prompt at
+    /// 4096 keys, a layer of it past the bound) is cut by rows: the most
+    /// rows a piece is admitted at, the next row past it refused; a bound
+    /// one row of one layer is past: none, refused by name.
+    #[test]
+    fn a_step_past_the_bound_a_layer_at_a_time_is_cut_by_rows() {
+        let b = bound(1.0);
+        let step = prompt(512, 4096);
+        let (_, per_layer) = b.step_ns(step);
+        let tight = SubmitBound {
+            bound_ns: per_layer * 0.6,
+            ..b.clone()
+        };
+        assert!(matches!(tight.admit(step), Admitted::Refused { .. }));
+        let rows = tight.rows_a_piece(step, 512).expect("a piece of fewer rows fits");
+        assert!(rows > 1 && rows < 512, "{rows}");
+        let piece = |rows: u32| StepRows {
+            rows,
+            lanes: 1,
+            keys: 4096,
+            prompt: true,
+        };
+        assert!(!matches!(tight.admit(piece(rows)), Admitted::Refused { .. }));
+        assert!(matches!(tight.admit(piece(rows + 1)), Admitted::Refused { .. }));
+        // One row of one layer past the bound: none.
+        let one = tight.step_ns(piece(1)).1;
+        let past = SubmitBound {
+            bound_ns: one * 0.5,
+            ..b
+        };
+        assert_eq!(past.rows_a_piece(step, 512), None);
+    }
+
+    /// A step's one prompt lane cut into pieces of `rows`: the leading
+    /// pieces that lane alone, in order, each over its next rows at the
+    /// slots its predecessors wrote, nothing read out; the step's last
+    /// piece in its place with the readout; a one-row piece's class word
+    /// single-token. A lane whose class reads its whole rows is not cut.
+    #[test]
+    fn a_prompt_lane_cuts_into_pieces_its_successors_read() {
+        use engine::fire::{Lane, Readout, Step};
+        let mut facts = poem_ir::Facts::default();
+        let _ = facts.builtin(poem_ir::Builtin::SingleToken);
+        let _ = facts.builtin(poem_ir::Builtin::Masked);
+        let mut prompt_lane = Lane {
+            slot: 2,
+            tokens: (100..110).collect(),
+            positions: (5..15).collect(),
+            readout: Readout::Last,
+            ..Lane::default()
+        };
+        prompt_lane.kv.held = 5;
+        prompt_lane.kv.readable = 5;
+        let decode = Lane {
+            slot: 1,
+            tokens: vec![7],
+            positions: vec![40],
+            ..Lane::default()
+        };
+        let step = Step {
+            lanes: vec![decode.clone(), prompt_lane.clone()],
+            attachments: Vec::new(),
+            media: Vec::new(),
+            voxels: Vec::new(),
+        };
+        let (leading, last) = row_pieces(&step, &facts, 4).expect("cut");
+        assert_eq!(leading.len(), 2);
+        for (k, piece) in leading.iter().enumerate() {
+            let k = k as u32;
+            assert!(piece.attachments.is_empty());
+            let [lane] = &piece.lanes[..] else { panic!("one lane a piece") };
+            assert_eq!(lane.tokens, (100 + 4 * k..104 + 4 * k).collect::<Vec<_>>());
+            assert_eq!(lane.positions, (5 + 4 * k..9 + 4 * k).collect::<Vec<_>>());
+            assert_eq!((lane.kv.held, lane.kv.readable), (5 + 4 * k, 5 + 4 * k));
+            assert_eq!(lane.readout, Readout::None);
+            assert!(!facts.holds(lane.word, poem_ir::Builtin::SingleToken));
+        }
+        assert_eq!(last.lanes[0], decode, "the other lanes as stated");
+        assert_eq!(last.lanes[1].tokens, vec![108, 109]);
+        assert_eq!(last.lanes[1].kv.held, 13);
+        assert_eq!(last.lanes[1].readout, Readout::Last);
+        // Pieces of one row: single-token words; a readout row shifts.
+        let mut rows_read = step.clone();
+        rows_read.lanes[1].readout = Readout::Rows(vec![9]);
+        let (leading, last) = row_pieces(&rows_read, &facts, 1).expect("cut by rows of one");
+        assert_eq!(leading.len(), 9);
+        assert!(facts.holds(leading[0].lanes[0].word, poem_ir::Builtin::SingleToken));
+        assert_eq!(last.lanes[1].readout, Readout::Rows(vec![0]));
+        rows_read.lanes[1].readout = Readout::Rows(vec![2, 9]);
+        assert!(row_pieces(&rows_read, &facts, 4).unwrap_err().contains("reads out a row"));
+        // A masked class reads its whole rows: not cut, by name.
+        let mut masked = step.clone();
+        masked.lanes[1].word = facts.with(0, poem_ir::Builtin::Masked, true);
+        assert!(row_pieces(&masked, &facts, 4).unwrap_err().contains("cannot be cut"));
     }
 
     /// A fire's device time reads nothing until its backend fills it, then

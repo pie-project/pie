@@ -8,7 +8,11 @@
 //! fire sees a drop inside it. So an admitted fire is held to the bound at
 //! the lowest clock the device's own table states: its estimate (timed at
 //! full clock at load) times the table's greatest over its least
-//! ([`ClockRange::floor_factor`]). Read once, at load.
+//! ([`ClockRange::floor_factor`]). Read once, at load. A ratio measured
+//! against an estimate is read back to full clock at the clock the GPU
+//! states as the fire lands (KGSL's `clock_mhz`, a devfreq node's
+//! `cur_freq`: [`ClockRange::now_hz`]), so the floor counts a clock drop
+//! once; where no such node is readable the load says so.
 //!
 //! Read where the platform states it, unprivileged:
 //!
@@ -35,6 +39,10 @@ pub struct ClockRange {
     pub max_hz: u64,
     /// Where the table was read.
     pub source: PathBuf,
+    /// Where the clock the GPU runs at now is read, and its unit in Hz
+    /// (KGSL's `clock_mhz`, else a devfreq node's `cur_freq`); `None` where
+    /// the platform states none readable.
+    pub cur: Option<(PathBuf, u64)>,
 }
 
 impl std::fmt::Display for ClockRange {
@@ -57,6 +65,7 @@ impl ClockRange {
             min_hz,
             max_hz,
             source: PathBuf::from("stated"),
+            cur: None,
         }
     }
 
@@ -73,12 +82,17 @@ impl ClockRange {
             (kgsl.join("devfreq/available_frequencies"), 1),
             (kgsl.join("freq_table_mhz"), 1_000_000),
         ];
+        let kgsl_cur = [
+            (kgsl.join("clock_mhz"), 1_000_000),
+            (kgsl.join("devfreq/cur_freq"), 1),
+        ];
         for (path, unit) in &kgsl_lists {
             if let Some((min, max)) = read_list(path, *unit) {
                 return Ok(ClockRange {
                     min_hz: min,
                     max_hz: max,
                     source: path.clone(),
+                    cur: readable(&kgsl_cur),
                 });
             }
         }
@@ -96,11 +110,13 @@ impl ClockRange {
             .unwrap_or_default();
         gpus.sort();
         for dir in &gpus {
+            let cur = readable(&[(dir.join("cur_freq"), 1)]);
             if let Some((min, max)) = read_list(&dir.join("available_frequencies"), 1) {
                 return Ok(ClockRange {
                     min_hz: min,
                     max_hz: max,
                     source: dir.join("available_frequencies"),
+                    cur,
                 });
             }
             if let (Some(min), Some(max)) =
@@ -111,6 +127,7 @@ impl ClockRange {
                     min_hz: min,
                     max_hz: max,
                     source: dir.clone(),
+                    cur,
                 });
             }
         }
@@ -128,6 +145,36 @@ impl ClockRange {
     pub fn floor_factor(&self) -> f64 {
         self.max_hz as f64 / self.min_hz.max(1) as f64
     }
+
+    /// The clock the GPU runs at now, Hz, where the platform states it
+    /// readable ([`ClockRange::cur`]): one read of its node.
+    #[must_use]
+    pub fn now_hz(&self) -> Option<u64> {
+        let (path, unit) = self.cur.as_ref()?;
+        read_hz(path).map(|v| v.saturating_mul(*unit))
+    }
+
+    /// `ratio` (a time over its full-clock estimate) measured at `hz`,
+    /// read back to full clock: divided by the table's greatest over `hz`,
+    /// the estimate's own error. As measured where the clock is unknown.
+    #[must_use]
+    pub fn at_full_clock(&self, ratio: f64, hz: Option<u64>) -> f64 {
+        match hz {
+            Some(hz) if hz > 0 && self.max_hz > 0 => {
+                ratio * hz.min(self.max_hz) as f64 / self.max_hz as f64
+            }
+            _ => ratio,
+        }
+    }
+}
+
+/// The first of `nodes` (each a path and its unit in Hz) that reads a
+/// clock now.
+fn readable(nodes: &[(PathBuf, u64)]) -> Option<(PathBuf, u64)> {
+    nodes
+        .iter()
+        .find(|(path, _)| read_hz(path).is_some())
+        .cloned()
 }
 
 /// Whether a devfreq device's name says it is a GPU.
@@ -198,6 +245,9 @@ mod tests {
         let range = ClockRange::read_under(&root).unwrap();
         assert_eq!((range.min_hz, range.max_hz), (200_000_000, 800_000_000));
         assert_eq!(range.floor_factor(), 4.0);
+        assert_eq!(range.now_hz(), None, "no cur_freq: the clock now is not read");
+        write(&root.join("devfreq/fb000000.gpu/cur_freq"), "400000000\n");
+        assert_eq!(ClockRange::read_under(&root).unwrap().now_hz(), Some(400_000_000));
         // KGSL's MHz table over it, and its Hz table over that.
         write(&root.join("kgsl/kgsl-3d0/freq_table_mhz"), "1300 578 160");
         assert_eq!(ClockRange::read_under(&root).unwrap().min_hz, 160_000_000);
@@ -209,6 +259,19 @@ mod tests {
         assert_eq!((range.min_hz, range.max_hz), (160_000_000, 1_300_000_000));
         assert!(range.source.ends_with("gpu_available_frequencies"));
         assert!((range.floor_factor() - 8.125).abs() < 1e-9);
+        // KGSL's clock now, in MHz.
+        write(&root.join("kgsl/kgsl-3d0/clock_mhz"), "578\n");
+        assert_eq!(ClockRange::read_under(&root).unwrap().now_hz(), Some(578_000_000));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A ratio measured at a known clock reads back to full clock; at an
+    /// unknown one it stands as measured.
+    #[test]
+    fn a_ratio_at_a_known_clock_reads_back_to_full_clock() {
+        let range = ClockRange::stated(160_000_000, 1_300_000_000);
+        assert!((range.at_full_clock(2.25, Some(578_000_000)) - 1.0003).abs() < 1e-3);
+        assert_eq!(range.at_full_clock(2.0, None), 2.0);
+        assert_eq!(range.at_full_clock(1.2, Some(1_300_000_000)), 1.2);
     }
 }

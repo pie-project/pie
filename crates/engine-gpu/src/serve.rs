@@ -190,8 +190,11 @@ pub trait Serve: Backend {
         timed: Option<&Self::Stamps>,
     ) -> Result<Self::Frame>;
 
-    /// One arm's timestamps ([`Serve::Stamps`]), laid at load.
-    fn lay_stamps(device: &Self::Context) -> Result<Self::Stamps>;
+    /// One arm's timestamps ([`Serve::Stamps`]), laid at load: enough for
+    /// `pieces` timed frames whose times are still being read (the most
+    /// submissions one step splits into), where the backend reads a time
+    /// after the arm is free again; one where it reads it before.
+    fn lay_stamps(device: &Self::Context, pieces: u32) -> Result<Self::Stamps>;
 
     /// Where a serving fire's device time is read from under a stated
     /// submit bound (`crate::submit::Measured`), stated at load; a device
@@ -809,10 +812,10 @@ pub struct Shell<B: Serve> {
     /// Under a stated submit bound, the next step's estimate at a ratio of
     /// 1 (`crate::submit::SubmitBound::raw_ns`), which its flight carries
     /// to its landing.
-    estimate_next: Option<f64>,
+    estimate_next: Option<crate::submit::Estimated>,
     /// The landed fires whose device time is not yet read, each with its
     /// estimate ([`Shell::timed`]).
-    timing: Vec<(f64, crate::submit::DeviceTime)>,
+    timing: Vec<(crate::submit::Estimated, crate::submit::DeviceTime)>,
     /// Under a stated submit bound, each arm's timestamps, laid at load
     /// ([`Serve::Stamps`]): the step in flight on an arm writes its own.
     stamps: Vec<B::Stamps>,
@@ -1769,8 +1772,19 @@ impl<B: Serve> Shell<B> {
                 let mut held = held;
                 match crate::clock::ClockRange::read() {
                     Ok(range) => {
+                        let now = match &range.cur {
+                            Some((path, _)) => format!(
+                                "each fire's measured ratio read back to full clock at the \
+                                 clock {} states as it lands",
+                                path.display()
+                            ),
+                            None => "no current-clock node is readable: each fire's measured \
+                                     ratio is read as measured"
+                                .to_string(),
+                        };
                         tracing::info!(
-                            "submit bound {} ms; GPU clock table {range} -> floor factor {:.2}",
+                            "submit bound {} ms; GPU clock table {range} -> floor factor {:.2}; \
+                             {now}",
                             bound.as_millis(),
                             range.floor_factor()
                         );
@@ -1813,7 +1827,7 @@ impl<B: Serve> Shell<B> {
                     crate::submit::Clock::new(rates.gemm_compute_ns(m, n, k) + rates.launch_ns);
                 let probe = crate::submit::Probe::<B>::new(&device, tuning.gemm(tier, m))?;
                 clock.probed(probe.fire(&device)?);
-                held.scale = clock.scale();
+                held.probed(clock.ratio, held.clock_now());
                 tracing::info!(
                     curve_us = clock.curve_ns / 1e3,
                     ratio = clock.ratio,
@@ -1905,9 +1919,9 @@ impl<B: Serve> Shell<B> {
         // Under a stated submit bound, each arm's timestamps, laid here
         // (`Serve::Stamps`): a timed step writes its arm's, so serving lays
         // none. A load that runs nothing on a device times nothing.
-        let stamps = if submit_bound.is_some() && B::LANDS {
+        let stamps = if let Some(held) = submit_bound.as_ref().filter(|_| B::LANDS) {
             (0..arms)
-                .map(|_| B::lay_stamps(&device))
+                .map(|_| B::lay_stamps(&device, held.layers.max(1)))
                 .collect::<Result<Vec<_>>>()?
         } else {
             Vec::new()
@@ -3778,7 +3792,7 @@ impl<B: Serve> Shell<B> {
         let took = probe.fire(&self.device)?;
         self.probed += 1;
         clock.probed(took);
-        held.scale = clock.scale();
+        held.probed(clock.ratio, held.clock_now());
         tracing::debug!(
             frame = frame.0,
             took_us = took / 1e3,
@@ -3796,19 +3810,38 @@ impl<B: Serve> Shell<B> {
     }
 
     /// Under a stated submit bound, the next step this shell enqueues is
-    /// estimated at `ns` at a ratio of 1; `None` clears it.
-    pub fn estimate_next(&mut self, ns: Option<f64>) {
-        self.estimate_next = ns.filter(|_| self.submit_bound.is_some());
+    /// `next` (its estimate at a ratio of 1), admitted at the clock the GPU
+    /// runs at now where the platform states it; `None` clears it.
+    pub fn estimate_next(&mut self, next: Option<crate::submit::Estimated>) {
+        self.estimate_next = match (next, self.submit_bound.as_ref()) {
+            (Some(next), Some(held)) => Some(crate::submit::Estimated {
+                hz: held.clock_now(),
+                ..next
+            }),
+            _ => None,
+        };
     }
 
     /// A step estimated at `estimate` (its flight's) landed; its device
     /// time is read from `time` once its backend fills it, without waiting
-    /// ([`Shell::track`]). Nothing where the step carries no estimate (no
-    /// bound is stated).
-    pub fn timed(&mut self, estimate: Option<f64>, time: crate::submit::DeviceTime) {
-        if let Some(estimate) = estimate {
-            self.timing.push((estimate, time));
-        }
+    /// ([`Shell::track`]). The clock it ran at is the faster of the GPU's
+    /// as it was admitted and as its landing is seen here (a drop inside
+    /// it read at the clock before: its ratio only rises by that). Nothing
+    /// where the step carries no estimate (no bound is stated).
+    pub fn timed(
+        &mut self,
+        estimate: Option<crate::submit::Estimated>,
+        time: crate::submit::DeviceTime,
+    ) {
+        let (Some(estimate), Some(held)) = (estimate, self.submit_bound.as_ref()) else {
+            return;
+        };
+        let hz = match (estimate.hz, held.clock_now()) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        self.timing
+            .push((crate::submit::Estimated { hz, ..estimate }, time));
     }
 
     /// Under a stated submit bound, every landed fire's device time filled
@@ -3825,7 +3858,23 @@ impl<B: Serve> Shell<B> {
             None => true,
             Some(None) => false,
             Some(Some(ns)) => {
-                held.measured.landed(now, *estimate, ns);
+                let ratio = held.landed(now, estimate.ns, ns, estimate.hz);
+                // Each fire's device time against its estimate, at debug
+                // (its fields computed only where it is enabled).
+                tracing::debug!(
+                    frame = estimate.at.frame.0,
+                    step = estimate.at.step,
+                    rows = estimate.rows,
+                    lanes = estimate.lanes,
+                    pieces = estimate.pieces,
+                    estimate_ms = estimate.ns / 1e6,
+                    measured_ms = ns as f64 / 1e6,
+                    clock_mhz = %estimate
+                        .hz
+                        .map_or_else(|| "unknown".to_string(), |hz| (hz / 1_000_000).to_string()),
+                    ratio = ?ratio,
+                    "submit bound: a fire landed"
+                );
                 false
             }
         });
@@ -5528,7 +5577,7 @@ pub struct Flight<B: Serve> {
     /// Under a stated submit bound, the step's estimate at a ratio of 1,
     /// which its measured device time is read against once it lands
     /// ([`Shell::timed`]).
-    pub estimate: Option<f64>,
+    pub estimate: Option<crate::submit::Estimated>,
 }
 
 impl<B: Serve> engine::frame::Shell for Shell<B> {

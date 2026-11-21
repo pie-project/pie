@@ -246,7 +246,7 @@ impl Gpu {
     /// One arm's timestamps, laid as a load under a stated submit bound
     /// lays them (`Serve::lay_stamps`).
     pub fn stamps(&self) -> <crate::backend::Api as engine_gpu::serve::Serve>::Stamps {
-        <crate::backend::Api as engine_gpu::serve::Serve>::lay_stamps(&self.device)
+        <crate::backend::Api as engine_gpu::serve::Serve>::lay_stamps(&self.device, 1)
             .expect("the timestamps lay")
     }
 

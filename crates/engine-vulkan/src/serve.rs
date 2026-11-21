@@ -193,7 +193,9 @@ impl Serve for Api {
         }
     }
 
-    fn lay_stamps(device: &Context) -> Result<crate::device::Stamps> {
+    /// One pool an arm: a step's time is read at its harvest, before its
+    /// arm is free again, so no later frame finds it still being read.
+    fn lay_stamps(device: &Context, _pieces: u32) -> Result<crate::device::Stamps> {
         device.stamps()
     }
 

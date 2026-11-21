@@ -151,16 +151,16 @@ pub(crate) struct Span {
     busy: AtomicBool,
 }
 
-/// The timestamps a timed frame writes ([`Context::stamps`]), laid at load
-/// and written by one frame at a time: a set, its resolve and readback
-/// where the device enabled timestamp queries; nothing where it did not
+/// The timestamps timed frames write ([`Context::stamps`]), laid at load:
+/// sets, each with its resolve and readback, each written by one frame at a
+/// time, where the device enabled timestamp queries; none where it did not
 /// (a timed frame is then timed by the host's clock).
 #[derive(Clone)]
-pub struct Stamps(Option<Arc<Span>>);
+pub struct Stamps(Vec<Arc<Span>>);
 
 impl std::fmt::Debug for Stamps {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("Stamps").field(&self.0.is_some()).finish()
+        f.debug_tuple("Stamps").field(&self.0.len()).finish()
     }
 }
 
@@ -892,20 +892,26 @@ impl Context {
     /// timestamp written into its encoder before its work and one after it,
     /// where the device enabled timestamp queries; a plain frame elsewhere.
     pub fn spanned(&self) -> Result<Frame> {
-        let stamps = self.stamps()?;
+        let stamps = self.stamps(1)?;
         self.spanned_into(&stamps)
     }
 
-    /// The timestamps a timed frame writes, laid now ([`Stamps`]): a set of
-    /// two, its resolve and its readback where the device enabled
-    /// timestamp queries, else none.
-    pub fn stamps(&self) -> Result<Stamps> {
+    /// The timestamps timed frames write, laid now ([`Stamps`]): `sets`
+    /// sets of two, each with its resolve and its readback, where the
+    /// device enabled timestamp queries, else none.
+    pub fn stamps(&self, sets: u32) -> Result<Stamps> {
         let core = &self.core;
         core.alive()?;
         if !core.enabled.timestamps {
-            return Ok(Stamps(None));
+            return Ok(Stamps(Vec::new()));
         }
-        Ok(Stamps(Some(Arc::new(Span {
+        Ok(Stamps((0..sets.max(1)).map(|_| self.span()).collect()))
+    }
+
+    /// One set of two timestamps, its resolve and its readback.
+    fn span(&self) -> Arc<Span> {
+        let core = &self.core;
+        Arc::new(Span {
             set: core.device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("pie span"),
                 ty: wgpu::QueryType::Timestamp,
@@ -927,27 +933,32 @@ impl Context {
                 mapped_at_creation: false,
             }),
             busy: AtomicBool::new(false),
-        }))))
+        })
     }
 
-    /// A frame writing its two timestamps into `stamps` (laid before,
-    /// [`Context::stamps`]); a plain frame where they hold none. Stamps a
-    /// frame before still reads (its readback not yet unmapped, which the
-    /// one frame in flight on an arm never leaves) are not written over:
-    /// the frame goes out unspanned and says so, its time told unread.
+    /// A frame writing its two timestamps into a set of `stamps` (laid
+    /// before, [`Context::stamps`]) no frame before still reads (its
+    /// readback not yet unmapped); a plain frame where they hold none.
+    /// Where every set is still read the frame goes out unspanned and says
+    /// so, its time told unread.
     pub fn spanned_into(&self, stamps: &Stamps) -> Result<Frame> {
         let frame = self.frame()?;
-        let Some(span) = &stamps.0 else {
+        if stamps.0.is_empty() {
             return Ok(frame);
-        };
-        if span.busy.swap(true, Ordering::AcqRel) {
+        }
+        let Some(span) = stamps.0.iter().find(|span| {
+            span.busy
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        }) else {
             tracing::warn!(
-                "timestamps: a frame's laid timestamps are still read for the frame before; \
-                 this frame goes out untimed"
+                sets = stamps.0.len(),
+                "timestamps: every laid set is still read for the frames before; this frame \
+                 goes out untimed"
             );
             frame.inner.time.unread();
             return Ok(frame);
-        }
+        };
         frame.encode(|encoder| encoder.write_timestamp(&span.set, 0))?;
         *frame.inner.span.lock().expect("span lock poisoned") = Some(Arc::clone(span));
         Ok(frame)
@@ -966,7 +977,7 @@ impl Context {
     /// device enabled timestamp queries, else timed by the host's clock
     /// from its submit to its work done.
     pub fn timed_frame(&self, stamps: &Stamps) -> Result<Frame> {
-        if stamps.0.is_some() {
+        if !stamps.0.is_empty() {
             return self.spanned_into(stamps);
         }
         let frame = self.frame()?;
