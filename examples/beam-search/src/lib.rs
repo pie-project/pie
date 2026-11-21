@@ -273,17 +273,12 @@ async fn main(input: Input) -> Result<String> {
             });
         let ckpt_sync = mode == "ckpt_sync";
         let stop_wait = mode == "stop_wait";
-        let mut held_ckpt = if ckpt_sync || stop_wait {
-            Some(ws.fork(&pipeline).context("checkpoint the pool")?)
-        } else {
-            None
-        };
         if ckpt_sync || stop_wait {
             for _ in 0..decodes {
-                held_ckpt = Some(
-                    ws.fork(&pipeline)
-                        .with_context(|| format!("@{step}: checkpoint the pool"))?,
-                );
+                // The step's checkpoint, forked before its fire.
+                let ckpt_ws = ws
+                    .fork(&pipeline)
+                    .with_context(|| format!("@{step}: checkpoint the pool"))?;
                 fwd.submit(&pipeline).with_context(|| format!("@{step}"))?;
                 let picked = out
                     .take_host::<Vec<i32>>()
@@ -305,22 +300,20 @@ async fn main(input: Input) -> Result<String> {
                     None => picked.clone(),
                 };
                 if stop_wait || parents.iter().enumerate().any(|(i, &p)| p as usize != i) {
-                    if let Some(ref ckpt_ws) = held_ckpt {
-                        let restore_ws = ckpt_ws
-                            .fork(&pipeline)
-                            .with_context(|| format!("@{step}: restore the checkpoint"))?;
-                        let toks_r = Channel::from(&picked[..1]);
-                        let ind_r = Channel::from([0u32, 1]);
-                        let out_r = Channel::new([1], dtype::i32);
-                        let fwd_r = ForwardPass::new();
-                        fwd_r.embed(&toks_r, &ind_r)?;
-                        fwd_r.state(&[&restore_ws], StateGeometry::folding())?;
-                        fwd_r.epilogue(move || {
-                            out_r.put(reshape(reduce_argmax(intrinsics::output(0, "logits")), [1]));
-                        });
-                        fwd_r.submit(&pipeline)?;
-                        let _ = out_r.take_host::<Vec<i32>>().await?;
-                    }
+                    let restore_ws = ckpt_ws
+                        .fork(&pipeline)
+                        .with_context(|| format!("@{step}: restore the checkpoint"))?;
+                    let toks_r = Channel::from(&picked[..1]);
+                    let ind_r = Channel::from([0u32, 1]);
+                    let out_r = Channel::new([1], dtype::i32);
+                    let fwd_r = ForwardPass::new();
+                    fwd_r.embed(&toks_r, &ind_r)?;
+                    fwd_r.state(&[&restore_ws], StateGeometry::folding())?;
+                    fwd_r.epilogue(move || {
+                        out_r.put(reshape(reduce_argmax(intrinsics::output(0, "logits")), [1]));
+                    });
+                    fwd_r.submit(&pipeline)?;
+                    let _ = out_r.take_host::<Vec<i32>>().await?;
                 }
                 greedy_mismatches += picked.iter().zip(&greedy).filter(|(p, g)| p != g).count();
                 hypotheses = advance_hypotheses(&hypotheses, &picked, &parents)?;
@@ -750,8 +743,8 @@ async fn rescore(prompt: &[u32], hypothesis: &[u32], width: u32) -> Result<Vec<R
 
 /// Each step's log-probability of `hypothesis` after `prompt`, its target
 /// logit and its largest logit, teacher-forced one token a fire as `copies`
-/// rows (the hypothesis repeated, each copy on a working set of its own),
-/// read off the first. The prompt is folded; each step after it folds by
+/// rows (the hypothesis repeated, each copy on a working set of its own,
+/// the prompt's fire the first copy's alone), read off the first. The prompt is folded; each step after it folds by
 /// `fold`.
 async fn teacher_forced(
     prompt: &[u32],
@@ -760,11 +753,21 @@ async fn teacher_forced(
     fold: Fold<'static>,
 ) -> Result<Vec<(f32, f32, f32)>> {
     let v = model::output_vocab_size();
-    let sets: Vec<WorkingSet> = (0..copies).map(|_| WorkingSet::new()).collect();
-    let bound: Vec<&WorkingSet> = sets.iter().collect();
+    // The prompt is prefilled once, on the first set; the other copies are
+    // forks of it after that fire, sharing the prompt's pages, so the
+    // rescore needs one prompt and each copy's own tail.
+    let mut sets: Vec<WorkingSet> = vec![WorkingSet::new()];
     let pipeline = Pipeline::new();
     let mut steps = Vec::with_capacity(hypothesis.len());
     for (at, &target) in hypothesis.iter().enumerate() {
+        if at == 1 {
+            for _ in 1..copies {
+                let copy = sets[0].fork(&pipeline).context("fork the prompt's set")?;
+                sets.push(copy);
+            }
+        }
+        let bound: Vec<&WorkingSet> = sets.iter().collect();
+        let copies = u32::try_from(bound.len()).map_err(|_| "copies past u32")?;
         let fed: Vec<i32> = if at == 0 {
             prompt.iter().map(|&t| t as i32).collect()
         } else {
