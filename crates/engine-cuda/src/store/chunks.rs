@@ -212,7 +212,16 @@ impl Chunks {
                 have: room,
             });
         }
-        self.range.hold(pool, from, bytes, beside)
+        let held = self.range.hold(pool, from, bytes, beside)?;
+        // `unwritten-nan`: the activation span holds NaN until written.
+        if held == Commit::Committed && crate::serve::diag::on().unwritten_nan && bytes > 0 {
+            crate::device::fill_span(
+                self.range.span(from, bytes)?,
+                usize::try_from(bytes).unwrap_or(0),
+                0xFF,
+            )?;
+        }
+        Ok(held)
     }
 
     /// Backs `bytes` of the activation's span from `offset` into it, and
@@ -596,7 +605,26 @@ impl Chunks {
         if crate::sizing::active() {
             return Ok(Commit::Committed);
         }
+        let before = self.range.committed_segments();
         let outcome = self.range.commit_segments(pool, segments)?;
+        // `unwritten-nan`: the segments just backed hold NaN until written
+        // (the null chunk is zeroed after, below).
+        if outcome == Commit::Committed && crate::serve::diag::on().unwritten_nan {
+            let after = self.range.committed_segments();
+            if after > before {
+                let segment = u64::from(self.layout.segment_chunks) * self.layout.chunk_bytes;
+                let from = u64::from(before) * segment;
+                let bytes = u64::from(after - before) * segment;
+                crate::device::fill_span(
+                    self.range.span(from, bytes)?,
+                    usize::try_from(bytes).unwrap_or(0),
+                    0xFF,
+                )?;
+                if before == 0 {
+                    self.null_zeroed = false;
+                }
+            }
+        }
         if outcome == Commit::Committed && !self.null_zeroed && self.range.committed_segments() > 0
         {
             let bytes = self.layout.chunk_bytes;
