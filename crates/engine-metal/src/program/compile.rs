@@ -937,7 +937,7 @@ impl Builder<'_> {
         }
         #[cfg(not(target_vendor = "apple"))]
         {
-            let _ = (entry, expanded);
+            let _ = (entry, expanded, steps);
             Err(Failure::Retryable {
                 reason: "this build has no Metal in it: the target is not an Apple one".into(),
             })
