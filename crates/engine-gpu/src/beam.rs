@@ -209,6 +209,10 @@ pub struct RsStaged<'a> {
     pub tokens: u32,
     pub planes: Vec<[u32; 2]>,
     pub unit: u32,
+    /// Per group (in the fire's order), its fold's pages: their first word
+    /// in the store and how many (§11.3), resolved over its beam 0's list
+    /// as its beams' own; `None` where it folds nothing this fire.
+    pub folds: Vec<Option<(u32, u32)>>,
 }
 
 /// What a fire's beam groups have the device run, and the store words the
@@ -230,6 +234,9 @@ pub struct Planned<'a, B: Backend> {
     /// Per fault word: its word in the store, the lane it faults and its
     /// instance.
     pub faults: Vec<(u32, usize, engine::InstanceId)>,
+    /// Per group: its common slot's word in the store (§11.3) and its
+    /// instance.
+    pub commons: Vec<(u32, engine::InstanceId)>,
     /// The highest pool page id the groups stage.
     pub top_page: Option<u32>,
 }
@@ -343,6 +350,7 @@ pub fn plan<'a, B: Backend>(
         rs_copies: 0,
         rs_planes: rs.map_or(0, |rs| u32::try_from(rs.planes.len()).unwrap_or(u32::MAX)),
         faults: Vec::new(),
+        commons: Vec::new(),
         top_page: None,
     };
     if groups.is_empty() {
@@ -366,6 +374,7 @@ pub fn plan<'a, B: Backend>(
     let mut rs_lists = Part::of("beam lanes' rs page table runs in one fire", room.rs_lists);
     let mut rs_copies = Part::of("beam lanes' rs copies in one fire", room.rs_copies);
     let mut rs_bases = Part::of("rs entries beam groups' sets hold in one fire", room.rs_bases);
+    let mut commons = Part::of("beam groups' common slots in one fire", room.commons);
     for plane in staged.planes.iter().chain(rs.iter().flat_map(|rs| rs.planes.iter())) {
         planes.push(plane)?;
     }
@@ -547,9 +556,28 @@ pub fn plan<'a, B: Backend>(
                     0,
                 ])?;
             }
+            // The group's fold's pages (§11.3): the shared rows' entries,
+            // resolved over beam 0's list (every live beam's names the same
+            // pages below the common slot).
+            let group_at = groups
+                .iter()
+                .position(|held| std::ptr::eq(held, group))
+                .unwrap_or(usize::MAX);
+            if let Some(&Some((pages, entries))) = rs.folds.get(group_at) {
+                if entries > bases_len {
+                    return Err(refused(format!(
+                        "instance {}'s fold reads {entries} rs entries of a buffer of \
+                         {bases_len}",
+                        group.instance
+                    )));
+                }
+                rs_lists.push(&[pages, bases_at, 0, entries, base, tokens, bases_len, 0])?;
+            }
             rs_set = Some((bases_at, bases_len, base, tokens));
         }
         let rs_count = (rs_lists.next() - rs_at) / kb::RS_LIST_WORDS;
+        let common_at = commons.push(&[0])?;
+        planned.commons.push((common_at, group.instance));
         steps.push(&[
             group.state,
             parents_at,
@@ -567,6 +595,10 @@ pub fn plan<'a, B: Backend>(
             backed,
             rs_count,
             rs_at,
+            common_at,
+            0,
+            0,
+            0,
         ])?;
         planned.steps += 1;
         let copy_word = kb::copies_word(lanes, layout.cap, layout.frames);
@@ -610,7 +642,9 @@ pub fn plan<'a, B: Backend>(
             }
         }
     }
-    for part in [parents, steps, lists, copies, planes, trans, rs_lists, rs_copies, rs_bases] {
+    for part in [
+        parents, steps, lists, copies, planes, trans, rs_lists, rs_copies, rs_bases, commons,
+    ] {
         if !part.words.is_empty() {
             planned.writes.push((part.at, part.words));
         }

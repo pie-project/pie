@@ -538,3 +538,83 @@ fn guest_bind_close_rounds_timed() {
     drop(engine);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A beam group's state (`engine_gpu::beam::Resident`, the instance's
+/// resident run, `GuestState::resident`) follows a park into fresh slots:
+/// laid and cleared at the bind, a search's lists written there, the
+/// runtime's copy of its bytes into a fresh run and the old run handed on
+/// (overwritten), and the retarget the unpark's `Rebind::Instance` makes:
+/// it now reads its lists from the fresh run, the copied bytes standing
+/// (nothing cleared), and an evacuation's rebind writes nothing.
+#[test]
+fn a_beam_groups_resident_state_survives_a_park_into_fresh_slots() {
+    let Some((loaded, _program, mut slots, _)) = setup("beam-resident-park", 4) else {
+        return;
+    };
+    let Loaded { engine, dir, .. } = loaded;
+    let layout = engine_gpu::guest::state::BeamLayout::of(4, 300, 16, 2).expect("a depth");
+    let bytes = layout.bytes();
+    let parked = slots.state(bytes, 0);
+    let fresh = slots.state(bytes, 0);
+    assert_ne!(parked, fresh, "the unpark's run is another");
+    let pools = engine.loaded().expect("loaded").pools();
+    fill_room(&engine, &parked, bytes, 0x5a);
+    let mut resident =
+        engine_gpu::beam::Resident::bind(pools, &parked, layout).expect("the state binds");
+    assert!(
+        read_room(&engine, &parked, bytes).iter().all(|&b| b == 0),
+        "the bind clears its run"
+    );
+    // A search's state as five fires left it: primed, its last list at
+    // the fires' parity, beam `b`'s column `j` page `10 b + j`.
+    let words = (bytes / 4) as usize;
+    let mut state = vec![0u32; words];
+    state[..4].copy_from_slice(&[1, 5, 40, 32]);
+    let map = kernels_slang::runtime::beam::map_word(layout.lanes, layout.cap, 5) as usize;
+    for b in 0..layout.lanes as usize {
+        for j in 0..layout.cap as usize {
+            state[map + b * layout.cap as usize + j] = (10 * b + j) as u32;
+        }
+    }
+    let image: Vec<u8> = state.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let (buffer, at) = located(&engine, &parked).expect("the run lies in the pool");
+    buffer.write_shared(at, &image).expect("the state lands");
+    let want: Vec<u32> = (0..layout.cap).map(|j| 20 + j).collect();
+    assert_eq!(resident.list(pools, 2).expect("beam 2's list"), want);
+
+    // The park: the runtime copies the run's bytes wherever the instance
+    // goes and back into a fresh run at the unpark; the old run is another
+    // owner's.
+    fill_room(&engine, &fresh, bytes, 0x7f);
+    let copied = read_room(&engine, &parked, bytes);
+    let (buffer, at) = located(&engine, &fresh).expect("the fresh run lies in the pool");
+    buffer.write_shared(at, &copied).expect("the copy lands");
+    fill_room(&engine, &parked, bytes, 0x3c);
+    resident.retarget(pools, &fresh).expect("the unpark retargets");
+    let ScratchPlace::Run { first, .. } = fresh else {
+        panic!("a beam state lies in a run of slots");
+    };
+    assert_eq!(
+        resident.word(pools).expect("its word"),
+        pools
+            .slot_word(engine_gpu::store::layout::INSTANCE, first)
+            .expect("the fresh run's word"),
+        "the state's word is the fresh run's"
+    );
+    assert_eq!(
+        read_room(&engine, &fresh, bytes),
+        copied,
+        "the retarget clears nothing: the copied bytes stand"
+    );
+    assert_eq!(
+        resident.list(pools, 2).expect("beam 2's list"),
+        want,
+        "the lists read from the fresh run"
+    );
+    // An evacuation's rebind finds the run where it sits and writes nothing.
+    resident.rebind(pools).expect("the rebind");
+    assert_eq!(read_room(&engine, &fresh, bytes), copied, "a rebind writes nothing");
+    assert_eq!(resident.list(pools, 3).expect("beam 3's list")[0], 30);
+    drop(engine);
+    let _ = std::fs::remove_dir_all(&dir);
+}

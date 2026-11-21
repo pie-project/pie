@@ -117,6 +117,15 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 local : SV_GroupThreadID) {
     if (!active) {
         return;
     }
+#if defined(PIE_FOLD_ONLY)
+    // A group's fold (BEAM-PAGE-LISTS §11.3): the lane is a beam group's
+    // set, its carried rows the ones every live beam shares, all committed;
+    // it has no own row, reads no input and writes no output.
+    if (none) {
+        return;
+    }
+    float2 own = float2(0.0);
+#else
     uint own_word = x[(row * chans + c) >> 1];
     if (cl.at >= 0) {
         pie_pool_set(carry_word(cl, uint(cl.at), params.x_at, params.x_row) + (c >> 1), own_word);
@@ -125,6 +134,7 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 local : SV_GroupThreadID) {
         return;
     }
     float2 own = pair(own_word);
+#endif
 
     // Run position `t`'s input pair: a resolved carried row in one load, an
     // earlier one through the lane's tables.
@@ -143,6 +153,7 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 local : SV_GroupThreadID) {
         } \
     }
 
+#if !defined(PIE_FOLD_ONLY)
     uint tap0 = c * uint(width);
     uint tap1 = tap0 + uint(width);
     float2 acc = float2(0.0);
@@ -153,6 +164,7 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 local : SV_GroupThreadID) {
         acc += tap * w;
     }
     y[(row * chans + c) >> 1] = pack_bf16(silu(acc.x), silu(acc.y));
+#endif
     if (commit <= 0) {
         return;
     }
@@ -171,3 +183,4 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 local : SV_GroupThreadID) {
 }
 
 // pie:instantiate ssm_conv1d_carried_bf16 PIE_GROUP_X=128
+// pie:instantiate ssm_conv1d_carried_fold_bf16 PIE_GROUP_X=128 PIE_FOLD_ONLY=1

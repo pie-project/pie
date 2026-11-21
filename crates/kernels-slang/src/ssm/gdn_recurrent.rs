@@ -343,6 +343,68 @@ pub fn gated_delta_carried(
     y: Tensor,
     span: RowSpan,
 ) -> Result<(), Error> {
+    gated_delta_carried_as(
+        "ssm_gdn_carried_r128_bf16",
+        ctx, tactic, qkv, gated, state, carry, planes, k_heads, v_heads, k_dim, v_dim, y, span,
+    )
+}
+
+/// A beam group's fold (`BEAM-PAGE-LISTS.md` §11.3): each of `carry`'s
+/// `folds` lanes from its `lane0` is a group's set, its carried rows the
+/// ones every live beam shares, folded into its state ahead of the step
+/// that reads it; no own row, no input read, no output written. `qkv`, the
+/// gates and `y` are the step's, bound as it binds them.
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_carried_fold(
+    ctx: &Ctx<'_>,
+    tactic: Tactic,
+    qkv: Tensor,
+    gated: Gated,
+    state: &StatePool,
+    carry: &Carry,
+    planes: [CarryPlane; 3],
+    k_heads: u32,
+    v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    y: Tensor,
+    folds: u32,
+) -> Result<(), Error> {
+    gated_delta_carried_as(
+        "ssm_gdn_carried_fold_r128_bf16",
+        ctx,
+        tactic,
+        qkv,
+        gated,
+        state,
+        carry,
+        planes,
+        k_heads,
+        v_heads,
+        k_dim,
+        v_dim,
+        y,
+        RowSpan { row0: 0, rows: folds },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gated_delta_carried_as(
+    entry: &'static str,
+    ctx: &Ctx<'_>,
+    tactic: Tactic,
+    qkv: Tensor,
+    gated: Gated,
+    state: &StatePool,
+    carry: &Carry,
+    planes: [CarryPlane; 3],
+    k_heads: u32,
+    v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    y: Tensor,
+    span: RowSpan,
+) -> Result<(), Error> {
     const OP: &str = "ssm.gated_delta_carried";
     dtype_dispatch!(OP, qkv.dtype, { Bf16 => () });
     nonzero(OP, "the key heads this statement states", k_heads)?;
@@ -374,7 +436,7 @@ pub fn gated_delta_carried(
     let [kh, vh, kd, vd] = heads.args(OP)?;
     let [ba_plane, k_plane, u_plane] = planes;
     ctx.fire(
-        Fire::at(GDN_CARRIED, "ssm_gdn_carried_r128_bf16")
+        Fire::at(GDN_CARRIED, entry)
             .tier(tactic.tier)
             .apply(heads.grid(launched)),
         &[

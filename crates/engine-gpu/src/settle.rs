@@ -86,7 +86,10 @@ impl Done {
             faulted: self.faulted.clone(),
         };
         match &self.fed {
-            Some(fed) => merged(outcome, fed.faults()),
+            Some(fed) => engine::StepOutcome {
+                beam_common: fed.commons(),
+                ..merged(outcome, fed.faults())
+            },
             None => outcome,
         }
     }
@@ -210,6 +213,13 @@ struct Fed {
     /// Reads the store's u32 word, and each beam's fault word.
     read_word: Option<ReadRow>,
     beams: Vec<BeamWord>,
+    /// Each beam group's common slot word (§11.3) and its instance.
+    commons: Vec<(u32, engine::InstanceId)>,
+    /// The store's words from a first one as the fire's readout brought
+    /// them back ([`FedCheck::supply`]): read in place of the store.
+    supplied: std::sync::Mutex<Option<(u32, Vec<u32>)>>,
+    /// The groups' common slots the landing read.
+    read_commons: std::sync::Mutex<Vec<(engine::InstanceId, u32)>>,
     faults: std::sync::Mutex<Option<Vec<engine::LaneFault>>>,
     ready: std::sync::Condvar,
 }
@@ -224,6 +234,9 @@ impl FedCheck {
                 vocab,
                 read_word: None,
                 beams: Vec::new(),
+                commons: Vec::new(),
+                supplied: std::sync::Mutex::new(None),
+                read_commons: std::sync::Mutex::new(Vec::new()),
                 faults: std::sync::Mutex::new(None),
                 ready: std::sync::Condvar::new(),
             }),
@@ -240,6 +253,7 @@ impl FedCheck {
         vocab: u32,
         read_word: ReadRow,
         beams: Vec<BeamWord>,
+        commons: Vec<(u32, engine::InstanceId)>,
     ) -> FedCheck {
         FedCheck {
             inner: Arc::new(Fed {
@@ -248,6 +262,9 @@ impl FedCheck {
                 vocab,
                 read_word: Some(read_word),
                 beams,
+                commons,
+                supplied: std::sync::Mutex::new(None),
+                read_commons: std::sync::Mutex::new(Vec::new()),
                 faults: std::sync::Mutex::new(None),
                 ready: std::sync::Condvar::new(),
             }),
@@ -282,9 +299,21 @@ impl FedCheck {
                 outcome.fault_lanes(lane.lanes.clone(), lane.instance, &why);
             }
         }
+        let supplied = fed.supplied.lock().expect("fed lock poisoned").take();
         if let Some(read_word) = fed.read_word.as_ref().filter(|_| whole) {
+            let word = |at: u32| match &supplied {
+                Some((first, words)) => at
+                    .checked_sub(*first)
+                    .and_then(|k| words.get(k as usize).copied()),
+                None => read_word(at),
+            };
+            *fed.read_commons.lock().expect("fed lock poisoned") = fed
+                .commons
+                .iter()
+                .filter_map(|&(at, instance)| Some((instance, word(at)?)))
+                .collect();
             for beam in &fed.beams {
-                let code = read_word(beam.word).unwrap_or(0);
+                let code = word(beam.word).unwrap_or(0);
                 if code == 0 {
                     continue;
                 }
@@ -295,6 +324,31 @@ impl FedCheck {
         }
         *faults = Some(outcome.faulted);
         fed.ready.notify_all();
+    }
+
+    /// The store's words from `first` as the fire's readout brought them
+    /// back: [`FedCheck::landed`] reads the beams' words there in place of
+    /// the store.
+    pub fn supply(&self, first: u32, words: Vec<u32>) {
+        *self.inner.supplied.lock().expect("fed lock poisoned") = Some((first, words));
+    }
+
+    /// Each beam group's common slot (§11.3) as the landing read it, once
+    /// the forward landed.
+    #[must_use]
+    pub fn commons(&self) -> Vec<(engine::InstanceId, u32)> {
+        let _ = self.faults();
+        self.inner
+            .read_commons
+            .lock()
+            .expect("fed lock poisoned")
+            .clone()
+    }
+
+    /// Whether the check reads beams' fault words.
+    #[must_use]
+    pub fn reads_beams(&self) -> bool {
+        !self.inner.beams.is_empty()
     }
 
     /// The lanes the fed ids faulted, once the forward landed.

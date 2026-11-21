@@ -271,6 +271,16 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         PIE_POOL_BRANCH(seg, GDN_CARRIED_LOAD)
     }
 
+#if defined(PIE_FOLD_ONLY)
+    // A group's fold (BEAM-PAGE-LISTS §11.3): the lane is a beam group's
+    // set, its carried rows the ones every live beam shares, all committed;
+    // it has no own row, reads no input and writes no output.
+    sq[tid] = 0.0;
+    sk[tid] = 0.0;
+    float qinv = 0.0;
+    float kinv = 0.0;
+    land(first, uint(min(int(CH), n)), tid, hv, vh, dv);
+#else
     // The own row: raw q and k, their norms and their dot in one sum.
     uint keys = kh * dk;
     uint pitch = 2u * keys + vh * dv;
@@ -289,6 +299,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     uint ba_row = row * 2u * vh;
     float glog_own = log_gate(bf16_at(ba, ba_row + vh + hv), hv);
     float beta = 1.0 / (1.0 + exp(-bf16_at(ba, ba_row + hv)));
+#endif
 
 
     // The buffered rows, a chunk at a time: each row's norm and dots with
@@ -355,6 +366,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         }
     }
 
+#if !defined(PIE_FOLD_ONLY)
     if (tid < dv) {
         float xk = 0.0;
         float xq = 0.0;
@@ -375,6 +387,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
             pool_set_word(carry_word(cl, uint(cl.at), params.u_at, params.u_row) + hv * dv + tid, asuint(u));
         }
     }
+#endif
     // The state as of the commit, a vector a store.
     if (commit > 0 && tid < dv) {
 #define GDN_CARRIED_STORE(buf_) \
@@ -386,6 +399,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     }
     // The own row's keys (its key head's first value head lands them) and
     // its `[b | a]` (the first value head's), raw, a word at a time.
+#if !defined(PIE_FOLD_ONLY)
     if (cl.at >= 0) {
         uint at = uint(cl.at);
         if (hv % per_key == 0u) {
@@ -401,7 +415,10 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
             }
         }
     }
+#endif
 }
 
 // pie:instantiate ssm_gdn_carried_r128_bf16 PIE_GROUP_X=128 PIE_DK=128
 // pie:instantiate ssm_gdn_carried_r128_bf16 PIE_GROUP_X=128 PIE_DK=128 PIE_TIER=subgroup PIE_TARGET=spirv
+// pie:instantiate ssm_gdn_carried_fold_r128_bf16 PIE_GROUP_X=128 PIE_DK=128 PIE_FOLD_ONLY=1
+// pie:instantiate ssm_gdn_carried_fold_r128_bf16 PIE_GROUP_X=128 PIE_DK=128 PIE_FOLD_ONLY=1 PIE_TIER=subgroup PIE_TARGET=spirv

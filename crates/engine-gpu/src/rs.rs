@@ -509,6 +509,24 @@ pub struct Seat {
     pub rows_ext: u32,
 
     pub ext: RefCell<HashMap<u32, Tensor>>,
+
+    /// The fire's beam groups' folds (`BEAM-PAGE-LISTS.md` §11.3): their
+    /// staged table and records, a lane a fold, and how many. Each
+    /// recurrent layer's folds run ahead of its decode step.
+    pub folds: Option<Folds>,
+    /// Each fold's group's first lane in the fire (its rs table header),
+    /// ascending: a window's folds are those of its lanes.
+    pub fold_lanes: Vec<u32>,
+}
+
+/// A fire's beam groups' folds as a carried step's fold twin reads them:
+/// a rs table (`kernels_slang::ssm::Carry`) and slot table of their own,
+/// a lane a group's set, and their count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Folds {
+    pub table: Tensor,
+    pub slots: Tensor,
+    pub count: u32,
 }
 
 /// What a fire's recording is keyed by: everything its kernels bind and every
@@ -539,6 +557,8 @@ impl std::fmt::Debug for Seat {
             .field("plane_at", &self.plane_at)
             .field("page_tokens", &self.page_tokens)
             .field("stride", &self.stride)
+            .field("folds", &self.folds)
+            .field("fold_lanes", &self.fold_lanes)
             .field("ext_in", &self.ext_in)
             .field("ext_out", &self.ext_out)
             .field("work", &self.work)
@@ -618,6 +638,8 @@ impl Seat {
         carry: Tensor,
         slots: Tensor,
         rows_ext: u32,
+        folds: Option<Folds>,
+        fold_lanes: Vec<u32>,
     ) -> Result<Seat> {
         // The planes lie where the load's reservation lays them for the top
         // rung's rows, bound at their room: one view whatever the fire.
@@ -682,6 +704,8 @@ impl Seat {
             work,
             rows_ext,
             ext: RefCell::new(HashMap::new()),
+            folds,
+            fold_lanes,
         })
     }
 
@@ -713,6 +737,23 @@ impl Seat {
 
     /// Where plane `role` of the recurrence keeping state cache row `cache`
     /// lies in an rs page, in words.
+    /// The beam groups' folds' rs table from fold `lane0`, as their fold
+    /// twins read it.
+    pub fn fold_carry(&self, folds: &Folds, lane0: u32) -> Result<kernels_slang::ssm::Carry> {
+        let stride_words = u32::try_from(self.stride / 4).map_err(|_| Fault::Ceiling {
+            what: "words an rs page id counts",
+            need: self.stride / 4,
+            have: u64::from(u32::MAX),
+        })?;
+        Ok(kernels_slang::ssm::Carry {
+            table: folds.table,
+            slots: folds.slots,
+            lane0,
+            page_tokens: self.page_tokens,
+            stride_words,
+        })
+    }
+
     pub fn carry_plane(&self, cache: u32, role: Role) -> Result<kernels_slang::ssm::CarryPlane> {
         let plane = *self.layout.by_role.get(&(cache, role)).ok_or_else(|| Fault::Unbound {
             what: format!(

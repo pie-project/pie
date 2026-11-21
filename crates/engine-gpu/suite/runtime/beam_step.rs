@@ -49,6 +49,7 @@ struct Lay {
     tables: u32,
     writes: u32,
     offsets: u32,
+    common: u32,
     words: u32,
 }
 
@@ -70,6 +71,7 @@ impl Lay {
         let tables = take(lanes * columns);
         let writes = take(lanes);
         let offsets = take(lanes);
+        let common = take(1);
         Lay {
             steps,
             lists,
@@ -81,6 +83,7 @@ impl Lay {
             tables,
             writes,
             offsets,
+            common,
             words: at,
         }
     }
@@ -115,6 +118,7 @@ fn run(gpu: &mut Gpu, lanes: u32, folded: u32, seed: u64) {
     let mut host = State::new(lanes, cap, FRAMES);
     let mut rng = Rng(seed);
     let mut parents: Vec<u32> = (0..lanes).collect();
+    let mut histories: Vec<Vec<u32>> = vec![Vec::new(); lanes as usize];
     let mut state = states[0];
     let mut store = vec![0u32; lay.words as usize];
     for t in 0..fires {
@@ -153,6 +157,10 @@ fn run(gpu: &mut Gpu, lanes: u32, folded: u32, seed: u64) {
             lanes,
             FRAMES,
             backed,
+            0,
+            0,
+            lay.common,
+            0,
             0,
             0,
         ]);
@@ -202,7 +210,7 @@ fn run(gpu: &mut Gpu, lanes: u32, folded: u32, seed: u64) {
         };
         gpu.run(|c| {
             kb::step(c, records(lay.steps, 1))?;
-            kb::copy_pages(c, records(lay.copies, lanes), PLANES.len() as u32)
+            kb::copy_pages(c, records(lay.copies, lanes), PLANES.len() as u32, PAGE)
         });
 
         let want = step(
@@ -267,6 +275,34 @@ fn run(gpu: &mut Gpu, lanes: u32, folded: u32, seed: u64) {
                 "{what}: beam {b}'s write page"
             );
         }
+        // §11.4: the common slot, the longest common prefix of the live
+        // beams' histories (a token a fire unique to its beam), capped at
+        // the slot past this fire's rows and never below the folded slot.
+        histories = (0..lanes as usize)
+            .map(|b| {
+                let mut kept = if t == 0 {
+                    Vec::new()
+                } else {
+                    histories[parents[b] as usize].clone()
+                };
+                kept.push(t * 64 + b as u32);
+                kept
+            })
+            .collect();
+        let mut lcp = slot + 1 - folded;
+        for i in 0..lanes as usize {
+            for j in i + 1..lanes as usize {
+                let common = histories[i]
+                    .iter()
+                    .zip(&histories[j])
+                    .take_while(|(a, b)| a == b)
+                    .count() as u32;
+                lcp = lcp.min(common);
+            }
+        }
+        let common = (folded + lcp).min(slot + 1).max(folded);
+        assert_eq!(got_pool[s + 3], common, "{what}: the common slot in the header");
+        assert_eq!(got_store[lay.common as usize], common, "{what}: the common slot");
         let free_at = s + kb::HEADER as usize + 2 * (lanes * cap) as usize;
         let free: Vec<bool> = got_pool[free_at..free_at + cap as usize]
             .iter()
@@ -340,6 +376,10 @@ fn a_parent_past_the_beams_faults_its_lane_alone() {
             0,
             FRAMES,
             backed,
+            0,
+            0,
+            lay.common,
+            0,
             0,
             0,
         ]);
@@ -418,6 +458,7 @@ fn run_rs(gpu: &mut Gpu, lanes: u32, folded: u32, tokens: u32, base: u32, seed: 
     let faults = take(lanes);
     let bases = take(set_len);
     let tables = take(lanes * entries_most);
+    let common = take(1);
     let words = at;
     // The pool: the state, then the rs pages, unit `u` at words `u * unit`.
     let first_unit = state_words.div_ceil(unit) + 1;
@@ -443,7 +484,7 @@ fn run_rs(gpu: &mut Gpu, lanes: u32, folded: u32, tokens: u32, base: u32, seed: 
         store.fill(0);
         store[steps as usize..(steps + kb::STEP_WORDS) as usize].copy_from_slice(&[
             0, parents_at, trans, 0, faults, lanes, cap, reserve, PAGE, folded, slot, 0, FRAMES,
-            backed, lanes, rs_lists,
+            backed, lanes, rs_lists, common, 0, 0, 0,
         ]);
         for q in 0..backed {
             store[(trans + q) as usize] = 1 + q;
@@ -491,7 +532,7 @@ fn run_rs(gpu: &mut Gpu, lanes: u32, folded: u32, tokens: u32, base: u32, seed: 
         };
         gpu.run(|c| {
             kb::step(c, records(steps, 1))?;
-            kb::copy_rs_rows(c, records(rs_copies, lanes), planes.len() as u32)
+            kb::copy_rs_rows(c, records(rs_copies, lanes), planes.len() as u32, PAGE)
         });
         let want = step(
             &mut host,

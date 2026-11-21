@@ -16,8 +16,9 @@
 // pool's pages at the last fire, one free word), its lists twice (the
 // fire's and the one before, by the fire count's parity), its free pages, a
 // ring of `frames` pending pages (a page freed by fire t joins the free ones
-// at fire t + frames + 1), and this fire's copies, `[src, dst, tokens]` a
-// beam.
+// at fire t + frames + 1), this fire's copies, `[src, dst, tokens]` a
+// beam, and its lanes' pairwise common depths twice (§11.4), by the fire
+// count's parity.
 
 [[vk::binding(0)]] RWStructuredBuffer<uint> store;
 PIE_POOL_SEGMENTS(RWStructuredBuffer, uint, 1)
@@ -46,15 +47,15 @@ PIE_POOL_WRITE(uint, params.seg_words)
 
 #if defined(PIE_BEAM_STEP)
 
-// A group's step record, 16 words: its state (pool word), its parents
+// A group's step record, 20 words: its state (pool word), its parents
 // (store word), its pool's page ids (store word), its list records (store
 // word, 8 words each: the staged indices' word at entry f0, the rows' write
 // pages' and write offsets' words, the beam, the entries, the rows), its
-// lanes' fault words (store word), the numbers of §3, and its rs list
-// records (store word, 8 words each: the rs table's first entry word, the
-// set's rs entries' word, the beam, the entries, the buffer's base slot,
-// its rows a page, the set's entries).
-#define REC 16u
+// lanes' fault words (store word), the numbers of §3, its rs list records
+// (store word, 8 words each: the rs table's first entry word, the set's rs
+// entries' word, the beam, the entries, the buffer's base slot, its rows a
+// page, the set's entries), and its common slot's word (store word, §11.3).
+#define REC 20u
 
 groupshared uint g_rec[REC];
 groupshared uint parent_of[PIE_BEAM_MAX_LANES];
@@ -66,6 +67,7 @@ groupshared uint counts[PIE_GROUP_X];
 groupshared uint g_needed;
 groupshared uint g_handed;
 groupshared Atomic<uint> g_fault[PIE_BEAM_MAX_LANES];
+groupshared Atomic<uint> g_apart;
 
 void raise(uint b, uint code) {
     if (b < PIE_BEAM_MAX_LANES) {
@@ -109,6 +111,7 @@ void main(uint3 local : SV_GroupThreadID, uint3 group : SV_GroupID) {
     const uint backed = g_rec[13];
     const uint rs_count = g_rec[14];
     const uint rs = g_rec[15];
+    const uint common = g_rec[16];
     const bool ok = live_group && B > 0u && B <= PIE_BEAM_MAX_LANES && Q <= cap;
     // The pool pages the fire stages (`reserve` is the pool's whole): the
     // lowest-free rule keeps every page the step names below them.
@@ -130,6 +133,9 @@ void main(uint3 local : SV_GroupThreadID, uint3 group : SV_GroupID) {
     const uint cp = slot == 0u ? 0u : (slot - 1u) / S - f0;
     const bool priming = ok && primed == 0u;
     const bool stepping = ok && primed != 0u;
+    if (t == 0u) {
+        g_apart.store(slot + 1u);
+    }
 
     if (priming) {
         // §5: beam b on pool page b; page 0 is the prompt's where it ends
@@ -378,11 +384,43 @@ void main(uint3 local : SV_GroupThreadID, uint3 group : SV_GroupID) {
             }
         }
     }
+    pie_storage_barrier();
+    // The group's common slot (§11.3, §11.4): the depth of its live lanes'
+    // most recent common ancestor, whatever the guest forks them for.
+    // `lca[i][j]` holds, for lanes i != j, the slot below which their rows
+    // agree: lanes forked from one parent agree below this fire's row
+    // (counted as parting there: a lower bound, exact when their inputs
+    // differ); others agree as far as their parents did. Kept twice, by the
+    // fire count's parity. Every row below the least of them was written
+    // once and reached the other lanes only by copies: the same bytes in
+    // every lane. Capped at the slot past this fire's rows (one lane: every
+    // row is common), never below the folded slot.
+    const uint lca_old = copies + 3u * B + parity * B * B;
+    const uint lca_new = copies + 3u * B + (parity ^ 1u) * B * B;
+    if (ok) {
+        for (uint x = t; x < B * B; x += T) {
+            const uint i = x / B;
+            const uint j = x % B;
+            uint depth = PIE_BEAM_NONE;
+            if (i != j) {
+                if (priming || parent_of[i] == parent_of[j]) {
+                    depth = slot;
+                } else {
+                    depth = pie_pool_get(lca_old + parent_of[i] * B + parent_of[j]);
+                }
+                g_apart.min(depth);
+            }
+            pie_pool_set(lca_new + x, depth);
+        }
+    }
     GroupMemoryBarrierWithGroupSync();
     if (ok && t == 0u) {
         pie_pool_set(state + 0u, 1u);
         pie_pool_set(state + 1u, fired + 1u);
         pie_pool_set(state + 2u, Q);
+        const uint at = max(g_apart.load(), folded);
+        pie_pool_set(state + 3u, at);
+        store[common] = at;
     }
     if (ok && t < B) {
         store[faults + t] = g_fault[t].load();
@@ -401,10 +439,10 @@ void main(uint3 local : SV_GroupThreadID, uint3 group : SV_GroupID) {
 // word in a page and the words a slot holds there.
 //
 // Copies each run's first `tokens` slots of pool page `src` to `dst`, a
-// workgroup a (run, plane): ahead of the fire's appends and reads, in queue
-// order. A copy out of its bounds (a page past the staged ones, more slots
-// than a page, a destination slot below the frozen ones) copies nothing and
-// states the lane's fault.
+// workgroup a (run, plane, slot): ahead of the fire's appends and reads, in
+// queue order. A copy out of its bounds (a page past the staged ones, more
+// slots than a page, a destination slot below the frozen ones) copies
+// nothing and states the lane's fault.
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 local : SV_GroupThreadID, uint3 group : SV_GroupID) {
@@ -427,20 +465,21 @@ void main(uint3 local : SV_GroupThreadID, uint3 group : SV_GroupID) {
     const uint src = pie_pool_get(copy + 0u);
     const uint dst = pie_pool_get(copy + 1u);
     const uint tokens = pie_pool_get(copy + 2u);
-    if (tokens == 0u || src == dst) {
+    const uint k = group.z;
+    if (tokens == 0u || src == dst || k >= tokens) {
         return;
     }
     if (src >= reserve || dst >= reserve || tokens > page || dst * page < floor_rel) {
-        if (group.y == 0u && local.x == 0u) {
+        if (group.y == 0u && k == 0u && local.x == 0u) {
             store[fault] = max(store[fault], PIE_PAGES_COPY_BOUNDS);
         }
         return;
     }
     const uint offset = store[params.planes + 2u * group.y];
     const uint cell = store[params.planes + 2u * group.y + 1u];
-    const uint from = store[ids + src] * unit + offset;
-    const uint to = store[ids + dst] * unit + offset;
-    for (uint at = local.x; at < tokens * cell; at += PIE_GROUP_X) {
+    const uint from = store[ids + src] * unit + offset + k * cell;
+    const uint to = store[ids + dst] * unit + offset + k * cell;
+    for (uint at = local.x; at < cell; at += PIE_GROUP_X) {
         pie_pool_set(to + at, pie_pool_get(from + at));
     }
 }
@@ -457,9 +496,10 @@ void main(uint3 local : SV_GroupThreadID, uint3 group : SV_GroupID) {
 // A plane, 2 words in the plane table: its first word in an rs page and the
 // words a row holds there.
 //
-// Copies each run's rows, a workgroup a (run, plane), a slot's row a step: a
-// slot below the buffer (the prompt's tail, in the state) has no row and is
-// skipped.
+// Copies each run's rows, a workgroup a (run, plane, slot): a slot below the
+// buffer (the prompt's tail, in the state) has no row and is skipped. A
+// copy any of whose rows lies past the set's entries copies nothing and
+// states the lane's fault.
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 local : SV_GroupThreadID, uint3 group : SV_GroupID) {
@@ -486,39 +526,44 @@ void main(uint3 local : SV_GroupThreadID, uint3 group : SV_GroupID) {
     const uint src = pie_pool_get(copy + 0u);
     const uint dst = pie_pool_get(copy + 1u);
     const uint tokens = pie_pool_get(copy + 2u);
-    if (tokens == 0u || src == dst) {
+    const uint k = group.z;
+    if (tokens == 0u || src == dst || k >= tokens) {
         return;
     }
+    const bool first = group.y == 0u && k == 0u && local.x == 0u;
     if (src >= reserve || dst >= reserve || tokens > page || dst * page < floor_rel) {
-        if (group.y == 0u && local.x == 0u) {
+        if (first) {
             store[fault] = max(store[fault], PIE_PAGES_COPY_BOUNDS);
         }
         return;
     }
+    // The copy's last rows lie furthest: past the set's entries there, it
+    // copies none.
+    const uint last_from = (f0 + src) * page + tokens - 1u;
+    const uint last_to = (f0 + dst) * page + tokens - 1u;
+    if ((last_from >= base && (last_from - base) / rows_a_page >= bases_len)
+        || (last_to >= base && (last_to - base) / rows_a_page >= bases_len)) {
+        if (first) {
+            store[fault] = max(store[fault], PIE_PAGES_COPY_BOUNDS);
+        }
+        return;
+    }
+    const uint from_slot = (f0 + src) * page + k;
+    const uint to_slot = (f0 + dst) * page + k;
+    if (from_slot < base || to_slot < base) {
+        return;
+    }
     const uint offset = store[params.planes + 2u * group.y];
     const uint cell = store[params.planes + 2u * group.y + 1u];
-    for (uint k = 0u; k < tokens; ++k) {
-        const uint from_slot = (f0 + src) * page + k;
-        const uint to_slot = (f0 + dst) * page + k;
-        if (from_slot < base || to_slot < base) {
-            continue;
-        }
-        const uint fe = (from_slot - base) / rows_a_page;
-        const uint te = (to_slot - base) / rows_a_page;
-        if (fe >= bases_len || te >= bases_len) {
-            if (group.y == 0u && local.x == 0u) {
-                store[fault] = max(store[fault], PIE_PAGES_COPY_BOUNDS);
-            }
-            return;
-        }
-        const uint from = store[bases + fe] * unit + offset + ((from_slot - base) % rows_a_page) * cell;
-        const uint to = store[bases + te] * unit + offset + ((to_slot - base) % rows_a_page) * cell;
-        for (uint at = local.x; at < cell; at += PIE_GROUP_X) {
-            pie_pool_set(to + at, pie_pool_get(from + at));
-        }
+    const uint fe = (from_slot - base) / rows_a_page;
+    const uint te = (to_slot - base) / rows_a_page;
+    const uint from = store[bases + fe] * unit + offset + ((from_slot - base) % rows_a_page) * cell;
+    const uint to = store[bases + te] * unit + offset + ((to_slot - base) % rows_a_page) * cell;
+    for (uint at = local.x; at < cell; at += PIE_GROUP_X) {
+        pie_pool_set(to + at, pie_pool_get(from + at));
     }
 }
 
-// pie:instantiate runtime_beam_copy_rs_rows PIE_BEAM_RS=1 PIE_GROUP_X=64
+// pie:instantiate runtime_beam_copy_rs_rows PIE_BEAM_RS=1 PIE_GROUP_X=256
 
 #endif

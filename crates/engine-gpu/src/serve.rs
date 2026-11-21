@@ -3367,7 +3367,13 @@ impl<B: Serve> Shell<B> {
     }
 
     fn feed(&self, p: &Prepared<'_, B>) -> Result<Option<B::Pending>> {
-        let beams = p.beams.as_ref().filter(|planned| !planned.is_empty());
+        // A backend that keeps recordings runs a fire's beam groups here,
+        // ahead of the body it replays; one that keeps none encodes them in
+        // the walk's own frame, one submission (`Shell::walk_with`).
+        let beams = p
+            .beams
+            .as_ref()
+            .filter(|planned| B::RECORDS && !planned.is_empty());
         if p.feeds.is_empty()
             && p.input_copies.is_empty()
             && p.beginning.is_empty()
@@ -3437,6 +3443,7 @@ impl<B: Serve> Shell<B> {
             &'r dyn Fn(usize) -> Option<(usize, bool)>,
             &'r dyn Fn(usize) -> Option<(u32, &'r [u32])>,
         )>,
+        fold_pages: &[Option<(u32, u32)>],
     ) -> Result<crate::beam::Planned<'a, B>> {
         let laid = self.inputs[arm].laid();
         let room = laid.beams().ok_or_else(|| {
@@ -3521,11 +3528,18 @@ impl<B: Serve> Shell<B> {
                         Ok([words(at, "an rs plane's offset")?, words(plane.row_bytes, "an rs row")?])
                     })
                     .collect::<Result<Vec<_>>>()?;
+                let folds_word = laid.rs_folds_word();
                 Some(crate::beam::RsStaged {
                     table,
                     word,
                     header,
                     set,
+                    folds: fold_pages
+                        .iter()
+                        .map(|fold| {
+                            fold.and_then(|(at, entries)| Some((folds_word? + at, entries)))
+                        })
+                        .collect(),
                     tokens: buffers.page_tokens(),
                     planes,
                     unit: words(buffers.stride(), "an rs unit")?,
@@ -3556,6 +3570,23 @@ impl<B: Serve> Shell<B> {
         }
         self.dispatch_beams(frame, arm, planned.steps, planned.copies, planned.planes)?;
         if planned.rs_copies > 0 {
+            self.dispatch_rs_copies(frame, arm, planned.rs_copies, planned.rs_planes)?;
+        }
+        Ok(())
+    }
+
+    /// The rs copies over arm `arm`'s records (§11.2): `copies` beams' over
+    /// `planes` rs planes, after the kv planes in the plane table.
+    fn dispatch_rs_copies(
+        &self,
+        frame: &B::Frame,
+        arm: usize,
+        copies: u32,
+        planes: u32,
+    ) -> Result<()> {
+        let store = self.inputs[arm].store();
+        let kv_planes = self.pools.kv_planes().map_or(0, |(_, planes)| planes.len() as u32);
+        {
             let room = self.inputs[arm].laid().beams().ok_or_else(|| {
                 program("serve::beams", "a load that laid no room for beam groups".to_string())
             })?;
@@ -3572,10 +3603,11 @@ impl<B: Serve> Shell<B> {
                     ),
                     pool: self.pools.segments(&self.handles)?,
                     runs: room.rs_copies.0,
-                    count: planned.rs_copies,
-                    planes: room.planes.0 + 2 * planned.planes,
+                    count: copies,
+                    planes: room.planes.0 + 2 * kv_planes,
                 },
-                planned.rs_planes,
+                planes,
+                self.pools.paging().page_size,
             )
             .map_err(crate::error::kernel)?;
         }
@@ -3609,8 +3641,13 @@ impl<B: Serve> Shell<B> {
         };
         kernels_slang::runtime::beam::step(&sink, records(room.steps.0, steps))
             .map_err(crate::error::kernel)?;
-        kernels_slang::runtime::beam::copy_pages(&sink, records(room.copies.0, copies), planes)
-            .map_err(crate::error::kernel)?;
+        kernels_slang::runtime::beam::copy_pages(
+            &sink,
+            records(room.copies.0, copies),
+            planes,
+            self.pools.paging().page_size,
+        )
+        .map_err(crate::error::kernel)?;
         Ok(())
     }
 
@@ -4005,6 +4042,12 @@ impl<B: Serve> Shell<B> {
         })
     }
 
+    /// Arm `arm`'s input store.
+    #[must_use]
+    pub fn inputs_store(&self, arm: usize) -> &B::Buffer {
+        self.inputs[arm].store()
+    }
+
     /// Reads u32 word `word` of arm `arm`'s input store.
     pub fn store_word_reader(&self, arm: usize) -> crate::settle::ReadRow {
         let store = self.inputs[arm].store().clone();
@@ -4218,6 +4261,19 @@ impl<B: Serve> Shell<B> {
         // them (`crate::beam::RsStaged`).
         let mut rs_header_of: Vec<Option<usize>> = vec![None; lanes.len()];
         let mut rs_set_of: Vec<Option<(u32, Vec<u32>)>> = vec![None; lanes.len()];
+        // Each lane's beam group, the slot each group's set's state is
+        // folded to this fire, and the folds the fire runs (§11.3).
+        let mut beam_of: Vec<Option<usize>> = vec![None; lanes.len()];
+        for (at, group) in beams.iter().enumerate() {
+            for &lane in &group.lanes {
+                if let Some(of) = beam_of.get_mut(lane) {
+                    *of = Some(at);
+                }
+            }
+        }
+        let mut beam_to: Vec<Option<u32>> = vec![None; beams.len()];
+        let mut beam_folds: Vec<bool> = vec![false; beams.len()];
+        let mut group_folds: Vec<GroupFold> = Vec::new();
         let mut kv_less: Vec<bool> = Vec::with_capacity(lanes.len());
 
         let mut tables: Vec<std::borrow::Cow<'_, [u32]>> = Vec::with_capacity(lanes.len());
@@ -4353,15 +4409,75 @@ impl<B: Serve> Shell<B> {
                 .as_deref()
                 .filter(|_| !fresh)
                 .and_then(|pieces| self.pools.frozen_at(pieces));
-            let fold = LaneFold::of(
-                &verb,
-                row.rows,
-                have,
-                seated.mask.filter(|_| !seated.kv_less),
-                device.count,
-                held,
-            )
-            .map_err(|error| program("serve::rs", format!("lane {}: {error}", row.source)))?;
+            // A beam group's lanes share their set's state: the fold their
+            // verb states runs once for all of them, ahead of any step that
+            // reads the state (§11.3, `GroupFold`), and each lane replays
+            // only the rows past it, folds none itself and reports none.
+            let group = beam_of.get(source).copied().flatten();
+            let fold = match (group, &verb) {
+                (
+                    Some(group),
+                    engine::fire::RsVerb::Buffer {
+                        pages,
+                        base,
+                        folded,
+                        fold: engine::fire::FoldLen::Host(count),
+                        lineage,
+                    },
+                ) => {
+                    let from = held.map_or(*folded, |held| held.max(*folded));
+                    let to = match beam_to[group] {
+                        Some(to) => to,
+                        None => {
+                            let to = folded.saturating_add(*count).min(have).max(from);
+                            beam_to[group] = Some(to);
+                            if to > from {
+                                // A copy-on-write pair's written side (the
+                                // run side copied into it ahead of the
+                                // fire) is what the fold folds, and what
+                                // the group's lanes read after it.
+                                beam_folds[group] = true;
+                                group_folds.push(GroupFold {
+                                    lane: source,
+                                    from,
+                                    to,
+                                    base: *base,
+                                    pages: pages.clone(),
+                                    record: crate::store::slot_entries(&record)?,
+                                });
+                            }
+                            to
+                        }
+                    };
+                    let mut lane_fold = LaneFold::of(
+                        &engine::fire::RsVerb::Buffer {
+                            pages: pages.clone(),
+                            base: *base,
+                            folded: to,
+                            fold: engine::fire::FoldLen::Host(0),
+                            lineage: *lineage,
+                        },
+                        row.rows,
+                        have,
+                        None,
+                        device.count,
+                        Some(to),
+                    )
+                    .map_err(|error| program("serve::rs", format!("lane {}: {error}", row.source)))?;
+                    // The record holds the rows below the group's fold now.
+                    lane_fold.left = (to > from || held.is_some()).then_some(to);
+                    lane_fold
+                }
+                _ => LaneFold::of(
+                    &verb,
+                    row.rows,
+                    have,
+                    seated.mask.filter(|_| !seated.kv_less),
+                    device.count,
+                    held,
+                )
+                .map_err(|error| program("serve::rs", format!("lane {}: {error}", row.source)))?,
+            };
             let report = crate::store::frozen::lane_report(&verb, &fold, device, device_fire);
             if let Some(report) = report {
                 wrote.push(report);
@@ -4372,8 +4488,13 @@ impl<B: Serve> Shell<B> {
             let plan = fold.plan;
             // A lane of a copy-on-write group that folds nothing reads the
             // run side, which no lane writes this fire (CONTRACT-BC 15).
+            // A beam group whose set's state is folded this fire reads the
+            // side the fold writes (§11.3).
+            let folded_group = group.is_some_and(|group| beam_folds[group]);
             let state = match seated.record_run {
-                Some(run) if plan.commit == 0 => self.pools.record(Some(run), seat_slot)?,
+                Some(run) if plan.commit == 0 && !folded_group => {
+                    self.pools.record(Some(run), seat_slot)?
+                }
                 _ => record.clone(),
             };
             // The record as the slot tables state it, once a lane.
@@ -4850,6 +4971,98 @@ impl<B: Serve> Shell<B> {
         } else {
             None
         };
+        // The beam groups' folds (§11.3): a lane each of a table of their
+        // own, ordered by their group's first lane in the fire: its rows the
+        // shared ones (`from..to`, buffer tokens), its pages its set's from
+        // the buffer's base (resolved over beam 0's list by the head step),
+        // all committed, no own row; and each one's record.
+        group_folds.sort_by_key(|fold| rs_header_of.get(fold.lane).copied().flatten());
+        let mut fold_table: Vec<i32> = Vec::new();
+        let mut fold_slots: Vec<i32> = Vec::new();
+        let mut fold_lanes: Vec<u32> = Vec::with_capacity(group_folds.len());
+        // Per group: where its fold's pages lie in the table, and how many.
+        let mut fold_pages: Vec<Option<(u32, u32)>> = vec![None; beams.len()];
+        for fold in &group_folds {
+            tracing::debug!(
+                lane = fold.lane,
+                from = fold.from,
+                to = fold.to,
+                "a beam group's set folds the rows its live beams share (§11.3)"
+            );
+        }
+        if !group_folds.is_empty() {
+            let tokens = self
+                .rs_buffers
+                .as_ref()
+                .map(crate::rs::Buffers::page_tokens)
+                .ok_or_else(|| {
+                    program(
+                        "serve::beams",
+                        "a beam group folds its set on a load that buffers no rs rows".to_string(),
+                    )
+                })?
+                .max(1);
+            let header = crate::inputs::FOLD_HEADER as usize;
+            fold_table.resize(group_folds.len() * header, 0);
+            let int = |n: u64| {
+                i32::try_from(n).map_err(|_| Fault::Ceiling {
+                    what: "an entry of a beam fold's table",
+                    need: n,
+                    have: i32::MAX as u64,
+                })
+            };
+            for (at, fold) in group_folds.iter().enumerate() {
+                let (from, to) = (fold.from - fold.base, fold.to - fold.base);
+                let h = at * header;
+                fold_table[h] = -1;
+                fold_table[h + 1] = int(u64::from(to - from))?;
+                fold_table[h + 2] = int(fold_table.len() as u64)?;
+                for token in from..to {
+                    fold_table.push(int(u64::from(token))?);
+                }
+                let entries = to.div_ceil(tokens);
+                let pages = fold.pages.get(..entries as usize).ok_or_else(|| {
+                    program(
+                        "serve::beams",
+                        format!(
+                            "lane {}'s beam group folds its set to slot {} past its buffer's {} \
+                             pages",
+                            fold.lane,
+                            fold.to,
+                            fold.pages.len()
+                        ),
+                    )
+                })?;
+                fold_table[h + 3] = int(fold_table.len() as u64)?;
+                if let Some(group) = beam_of.get(fold.lane).copied().flatten() {
+                    fold_pages[group] = Some((u32::try_from(fold_table.len()).unwrap_or(u32::MAX), entries));
+                }
+                for &page in pages {
+                    fold_table.push(int(u64::from(page))?);
+                }
+                fold_table[h + 4] = int(u64::from(to - from))?;
+                if fold.record.len() != self.pools.pieces() as usize {
+                    return Err(program(
+                        "serve::beams",
+                        format!(
+                            "lane {}'s beam group's record holds {} piece(s) of the load's {}",
+                            fold.lane,
+                            fold.record.len(),
+                            self.pools.pieces()
+                        ),
+                    ));
+                }
+                fold_slots.extend_from_slice(&fold.record);
+                fold_lanes.push(
+                    rs_header_of
+                        .get(fold.lane)
+                        .copied()
+                        .flatten()
+                        .and_then(|lane| u32::try_from(lane).ok())
+                        .unwrap_or(u32::MAX),
+                );
+            }
+        }
         let planned = if beams.is_empty() {
             None
         } else {
@@ -4869,7 +5082,10 @@ impl<B: Serve> Shell<B> {
                 &geometries,
                 &seats,
                 &seat_of,
-                rs_carry.as_deref().map(|table| (table, &header as &dyn Fn(usize) -> _, &set as &dyn Fn(usize) -> _)),
+                rs_carry.as_deref().map(|table| {
+                    (table, &header as &dyn Fn(usize) -> _, &set as &dyn Fn(usize) -> _)
+                }),
+                &fold_pages,
             )?)
         };
 
@@ -4990,6 +5206,8 @@ impl<B: Serve> Shell<B> {
                 rs_replay: rs_active.then_some(rs_replay.as_slice()),
                 rs_commit: rs_active.then_some(rs_commit.as_slice()),
                 rs_carry: rs_carry.as_deref(),
+                rs_folds: (!fold_lanes.is_empty())
+                    .then_some((fold_table.as_slice(), fold_slots.as_slice())),
                 request_of_token: &request_of_token,
                 adapter_routes: any_adapter.then_some(adapter_routes.as_slice()),
                 page_tables: &geometries,
@@ -5234,6 +5452,12 @@ impl<B: Serve> Shell<B> {
                     carry,
                     bound.slot_ids,
                     rows_ext,
+                    bound.rs_folds.map(|(table, slots)| crate::rs::Folds {
+                        table,
+                        slots,
+                        count: u32::try_from(fold_lanes.len()).unwrap_or(u32::MAX),
+                    }),
+                    fold_lanes,
                 )?);
                 Some(seat)
             } else {
@@ -5285,7 +5509,11 @@ impl<B: Serve> Shell<B> {
             beam_faults: planned
                 .as_ref()
                 .map_or_else(Vec::new, |planned| planned.faults.clone()),
+            beam_commons: planned
+                .as_ref()
+                .map_or_else(Vec::new, |planned| planned.commons.clone()),
             beams: planned,
+            beam_tail: None,
         })
     }
 
@@ -5311,6 +5539,12 @@ impl<B: Serve> Shell<B> {
             B::walk_frame(&self.device, keep)?
         });
         self.land_merges(frame.as_mut().expect("just opened"), p)?;
+        if !B::RECORDS
+            && !bind_only
+            && let Some(planned) = p.beams.as_ref().filter(|planned| !planned.is_empty())
+        {
+            self.run_beams(frame.as_mut().expect("just opened"), p.arm, planned)?;
+        }
         // The sink borrows the frame, which leaves in `Walked`, so it ends
         // with this block.
         let cuts = {
@@ -5477,6 +5711,35 @@ pub struct Prepared<'a, B: Serve> {
     /// instance, read once the fire lands.
     beams: Option<crate::beam::Planned<'a, B>>,
     pub beam_faults: Vec<(u32, usize, engine::InstanceId)>,
+    /// Each beam group's common slot word (§11.3) and its instance.
+    pub beam_commons: Vec<(u32, engine::InstanceId)>,
+    /// Where the fire's beam fault words land in its readout seat, past its
+    /// rows, as the enqueue lays them.
+    pub beam_tail: Option<BeamTail>,
+}
+
+/// A beam group's fold of one fire (`BEAM-PAGE-LISTS.md` §11.3): its first
+/// lane, the slots its set's state is folded over (`from..to`, the rows
+/// every live beam shares), its buffer's base and pages (units), and its
+/// record as the slot tables state it.
+#[derive(Debug, Clone)]
+struct GroupFold {
+    lane: usize,
+    from: u32,
+    to: u32,
+    base: u32,
+    pages: Vec<u32>,
+    record: Vec<i32>,
+}
+
+/// A fire's beam fault words and common slots in its readout seat, one run
+/// of the arm's input store: its first byte there, its first word in the
+/// store, and its words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BeamTail {
+    pub at: u64,
+    pub word: u32,
+    pub words: u32,
 }
 
 impl<B: Serve> PreparedPhase for Prepared<'_, B> {
@@ -5804,13 +6067,41 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
         Self: 'a,
     {
         let fed = self.feed(&prepared)?;
-        let need = prepared
+        let mut need = prepared
             .readout_layout
             .iter()
             .filter(|span| span.seated)
             .map(|span| span.at + span.bytes())
             .max()
             .unwrap_or(0);
+        // A fire's beam fault words ride its readout back, past its rows: a
+        // backend that reads its seat back through a copy lands them with
+        // the rows, no read of the store apart ([`Prepared::beam_tail`]).
+        prepared.beam_tail = match self.inputs[prepared.arm].laid().beams() {
+            Some(room) if !prepared.beam_faults.is_empty() => {
+                // The fault words, then the common slots right past them.
+                let words = room.faults.1 + u32::try_from(prepared.beam_commons.len()).unwrap_or(u32::MAX);
+                let within = |word: u32| word >= room.faults.0 && word - room.faults.0 < words;
+                if !(prepared.beam_faults.iter().all(|&(word, _, _)| within(word))
+                    && prepared.beam_commons.iter().all(|&(word, _)| within(word)))
+                {
+                    return Err(program(
+                        "serve::beams",
+                        "a fire's beam fault words and common slots lie apart in its store, \
+                         and its readout carries them as one run"
+                            .to_string(),
+                    ));
+                }
+                let at = need.next_multiple_of(4);
+                need = at + u64::from(words) * 4;
+                Some(BeamTail {
+                    at,
+                    word: room.faults.0,
+                    words,
+                })
+            }
+            _ => None,
+        };
         if need > self.readout[prepared.arm].bytes() {
             self.readout[prepared.arm] =
                 B::Buffer::host(&self.device, need, crate::books::owners::READOUT)?;
@@ -6738,6 +7029,9 @@ impl<B: Serve> Shell<B> {
             let frame = B::bind_frame(&self.device)?;
             let planes = self.pools.kv_planes().map_or(0, |(_, planes)| planes.len() as u32);
             self.dispatch_beams(&frame, arm, 1, 1, planes.max(1))?;
+            if self.rs_buffers.is_some() {
+                self.dispatch_rs_copies(&frame, arm, 1, 1)?;
+            }
             self.handles.rewind();
             walked += 1;
         }

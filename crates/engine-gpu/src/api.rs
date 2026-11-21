@@ -567,8 +567,12 @@ impl<B: Host> Gpu<B> {
             // The frame settled: every step's forward landed.
             if let Some(fed) = pending.fed.take() {
                 outcome = crate::settle::merged(outcome, fed.faults());
+                outcome.beam_common = fed.commons();
             }
-            if !outcome.wrote.is_empty() || !outcome.faulted.is_empty() {
+            if !outcome.wrote.is_empty()
+                || !outcome.faulted.is_empty()
+                || !outcome.beam_common.is_empty()
+            {
                 let at = engine::StepDone {
                     frame: *frame,
                     step: step as u32,
@@ -2072,12 +2076,14 @@ impl<B: Host> Gpu<B> {
                         instance,
                     })
                     .collect();
+                let commons = prepared.beam_commons.clone();
                 let check = crate::settle::FedCheck::with_beams(
                     shell.token_row_reader(prepared.arm),
                     lanes,
                     vocab,
                     shell.store_word_reader(prepared.arm),
                     beams,
+                    commons,
                 );
                 prepared.fed_check = Some(check.clone());
                 match prepared.done.as_mut() {

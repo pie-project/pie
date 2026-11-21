@@ -131,6 +131,7 @@ impl Host for Api {
             // Its rows are read: the forward landed.
             if let Some(fed) = step_pending.fed.take() {
                 held = merged(held, fed.faults());
+                held.beam_common = fed.commons();
             }
             (sink)(at, merged(held, faulted));
         } else {

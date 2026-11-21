@@ -233,6 +233,59 @@ pub fn conv1d_carried(
 ) -> Result<(), Error> {
     const OP: &str = "ssm.causal_conv1d_carried";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "ssm_conv1d_carried_bf16" });
+    conv1d_carried_as(entry, ctx, x, weight, state, carry, x_plane, conv_width, dilation, y, span)
+}
+
+/// A beam group's fold (`BEAM-PAGE-LISTS.md` §11.3): each of `carry`'s
+/// `folds` lanes from its `lane0` is a group's set, its carried rows the
+/// ones every live beam shares, folded into its history ahead of the step
+/// that reads it; no own row, no input read, no output written. `x` and `y`
+/// are the step's, bound as it binds them.
+#[allow(clippy::too_many_arguments)]
+pub fn conv1d_carried_fold(
+    ctx: &Ctx<'_>,
+    x: Tensor,
+    weight: Tensor,
+    state: &StatePool,
+    carry: &Carry,
+    x_plane: CarryPlane,
+    conv_width: u32,
+    dilation: u32,
+    y: Tensor,
+    folds: u32,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.causal_conv1d_carried_fold";
+    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "ssm_conv1d_carried_fold_bf16" });
+    conv1d_carried_as(
+        entry,
+        ctx,
+        x,
+        weight,
+        state,
+        carry,
+        x_plane,
+        conv_width,
+        dilation,
+        y,
+        RowSpan { row0: 0, rows: folds },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn conv1d_carried_as(
+    entry: &'static str,
+    ctx: &Ctx<'_>,
+    x: Tensor,
+    weight: Tensor,
+    state: &StatePool,
+    carry: &Carry,
+    x_plane: CarryPlane,
+    conv_width: u32,
+    dilation: u32,
+    y: Tensor,
+    span: RowSpan,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.causal_conv1d_carried";
     let shape = Shape::of(OP, x, weight, state, conv_width, dilation, y)?;
     let launched = span.rows(OP, &[x, y])?;
     ctx.fire(

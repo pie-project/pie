@@ -16,7 +16,7 @@ const BEAM: &str = "runtime/beam.slang";
 /// over it.
 const STEP_GROUP: u32 = 256;
 const COPY_GROUP: u32 = 256;
-const RS_GROUP: u32 = 64;
+const RS_GROUP: u32 = 256;
 
 /// The beams one group's step holds at most (its workgroup's tables).
 pub const MAX_LANES: u32 = 64;
@@ -34,14 +34,15 @@ pub const HEADER: u64 = 4;
 
 /// The words in a step record, a list record, an rs list record, a copy
 /// record and an rs copy record.
-pub const STEP_WORDS: u32 = 16;
+pub const STEP_WORDS: u32 = 20;
 pub const LIST_WORDS: u32 = 8;
 pub const RS_LIST_WORDS: u32 = 8;
 pub const COPY_WORDS: u32 = 8;
 pub const RS_COPY_WORDS: u32 = 16;
 
 /// A group's state words: its header, its lists twice, its free pages, its
-/// ring of pending pages a frame in flight, and a copy a beam.
+/// ring of pending pages a frame in flight, a copy a beam, and its lanes'
+/// pairwise common depths twice (§11.4).
 #[must_use]
 pub const fn state_words(lanes: u32, cap: u32, frames: u32) -> u64 {
     HEADER
@@ -49,6 +50,7 @@ pub const fn state_words(lanes: u32, cap: u32, frames: u32) -> u64 {
         + cap as u64
         + frames as u64 * cap as u64
         + 3 * lanes as u64
+        + 2 * lanes as u64 * lanes as u64
 }
 
 /// The state word a group's copies for this fire start at.
@@ -107,28 +109,33 @@ pub fn step(ctx: &Ctx<'_>, records: Records) -> Result<(), Error> {
 }
 
 /// Runs each of `records.count` beams' kv copies over `planes` planes, a
-/// workgroup a (copy, plane).
-pub fn copy_pages(ctx: &Ctx<'_>, records: Records, planes: u32) -> Result<(), Error> {
-    if records.count == 0 || planes == 0 {
+/// workgroup a (copy, plane, slot), `page` slots a page.
+pub fn copy_pages(ctx: &Ctx<'_>, records: Records, planes: u32, page: u32) -> Result<(), Error> {
+    if records.count == 0 || planes == 0 || page == 0 {
         return Ok(());
     }
     ctx.fire(
         Fire::at(BEAM, "runtime_beam_copy_pages")
-            .groups([records.count, planes, 1])
+            .groups([records.count, planes, page])
             .group([COPY_GROUP, 1, 1]),
         &records.args(),
     )
 }
 
 /// Runs each of `records.count` beams' rs copies over `planes` planes, a
-/// workgroup a (copy, plane).
-pub fn copy_rs_rows(ctx: &Ctx<'_>, records: Records, planes: u32) -> Result<(), Error> {
-    if records.count == 0 || planes == 0 {
+/// workgroup a (copy, plane, slot), `page` slots a kv page.
+pub fn copy_rs_rows(
+    ctx: &Ctx<'_>,
+    records: Records,
+    planes: u32,
+    page: u32,
+) -> Result<(), Error> {
+    if records.count == 0 || planes == 0 || page == 0 {
         return Ok(());
     }
     ctx.fire(
         Fire::at(BEAM, "runtime_beam_copy_rs_rows")
-            .groups([records.count, planes, 1])
+            .groups([records.count, planes, page])
             .group([RS_GROUP, 1, 1]),
         &records.args(),
     )
