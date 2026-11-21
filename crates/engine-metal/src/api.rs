@@ -1001,7 +1001,8 @@ impl Metal {
             let listed = matches!(lane.readout, Readout::Rows(_));
             let served = attached.iter().any(|a| {
                 let first = a.lane as usize;
-                (first..first + a.lanes.max(1) as usize).contains(&index) && !a.adapter_only
+                let count = a.lanes.max(1) as usize; // an attachment covers at least its first lane
+                index >= first && index < first + count && !a.adapter_only
             });
             if listed && !served {
                 return Err(Error::unsupported("metal", "row-selected readout"));
