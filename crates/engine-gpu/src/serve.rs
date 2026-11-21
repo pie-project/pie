@@ -5698,6 +5698,23 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
         } else {
             B::plan(self, &mut prepared)?
         };
+        // How each step went to the device, where a bound is stated: the
+        // recording it replayed, or the walk it took (kept to replay, eager,
+        // or split in runs of `layers_a_piece` layers).
+        if self.submit_bound.is_some() {
+            tracing::debug!(
+                target: "engine_gpu::api",
+                rung = prepared.rung,
+                plan = match &plan {
+                    Plan::Replayed { .. } => "replayed",
+                    Plan::Walk { split: true, .. } => "walked split",
+                    Plan::Walk { keep: Some(_), .. } => "walked, kept to replay",
+                    Plan::Walk { keep: None, .. } => "walked eagerly",
+                },
+                layers_a_piece = self.split_layers,
+                "submit bound: a step goes to the device"
+            );
+        }
         let (keep, split) = match plan {
             Plan::Replayed {
                 pending,

@@ -94,6 +94,7 @@ mod gpu;
 #[path = "../../../engine-gpu/suite/linear/mod.rs"]
 mod linear;
 mod replay;
+mod split_cost;
 #[path = "../../../engine-gpu/suite/model_logits.rs"]
 mod model_logits;
 #[path = "../../../engine-gpu/suite/runtime/mod.rs"]
