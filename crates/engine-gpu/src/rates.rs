@@ -387,6 +387,10 @@ const POINT_NS: f64 = 4e6;
 /// The matmul a launch is timed with: its work is nothing beside a launch.
 pub const LAUNCH: u32 = 16;
 
+/// The offset every view a rates step binds into a shared buffer starts at
+/// a multiple of: every backend's storage-binding alignment at most.
+const VIEW_ALIGN: u64 = 256;
+
 /// Timed frames of each kind; the median is kept.
 pub const ROUNDS: usize = 5;
 
@@ -812,6 +816,72 @@ impl<'a, B: Serve> Rig<'a, B> {
         let handle = self.handles.bind(&buf, 0, buf.bytes())?;
         self.held.push(buf);
         Ok(Tensor::new(handle, rows, width, dtype))
+    }
+
+    /// `bytes` laid over as few buffers as the device's largest holds,
+    /// each a whole number of `stride`s, held: filled with
+    /// `engine::rates::operand_pattern` where `filled`, else zeroed.
+    fn slab(&mut self, bytes: u64, stride: u64, filled: bool) -> Result<Vec<B::Buffer>> {
+        let largest = (self.device.max_buffer() / stride).max(1) * stride;
+        let mut out = Vec::new();
+        let mut left = bytes.max(stride);
+        while left > 0 {
+            let size = left.min(largest);
+            let mut buf = B::Buffer::zeroed(self.device, size, crate::books::owners::TUNING)?;
+            if filled {
+                let pattern = self
+                    .pattern
+                    .get_or_insert_with(engine::rates::operand_pattern);
+                let mut at = 0u64;
+                while at < size {
+                    let n = (pattern.len() as u64).min(size - at);
+                    buf.write(at, &pattern[..n as usize])?;
+                    at += n;
+                }
+            }
+            self.held.push(buf.clone());
+            out.push(buf);
+            left -= size;
+        }
+        Ok(out)
+    }
+
+    /// Up to `count` views of `rows x width` of `dtype` into `bufs`, one a
+    /// stride of [`VIEW_ALIGN`]-aligned bytes, bound: as a served fire reads
+    /// its weights from views into a few large segments, not from buffers
+    /// of their own. As many as the buffers hold, one at least.
+    fn views(
+        &mut self,
+        bufs: &[B::Buffer],
+        count: usize,
+        rows: u32,
+        width: u32,
+        dtype: Dtype,
+    ) -> Result<Vec<Tensor>> {
+        let bytes = (u64::from(rows) * u64::from(width) * dtype.bits())
+            .div_ceil(8)
+            .max(4);
+        let stride = bytes.next_multiple_of(VIEW_ALIGN);
+        let mut out = Vec::with_capacity(count);
+        'bufs: for buf in bufs {
+            let mut at = 0u64;
+            while at + bytes <= buf.bytes() {
+                if out.len() == count {
+                    break 'bufs;
+                }
+                let handle = self.handles.bind(buf, at, bytes)?;
+                out.push(Tensor::new(handle, rows, width, dtype));
+                at += stride;
+            }
+        }
+        if out.is_empty() {
+            return Err(Fault::Ceiling {
+                what: "bytes of a rates operand's views",
+                need: bytes,
+                have: bufs.iter().map(|b| b.bytes()).max().unwrap_or(0),
+            });
+        }
+        Ok(out)
     }
 
     /// A zeroed buffer of `rows x width` of `dtype`, bound.
@@ -1306,11 +1376,18 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
         let laid = match rows.iter().rev().copied().find(|&m| fits(m)) {
             Some(most) => {
                 let act = rig.operand(most, k, Dtype::Bf16)?;
-                let weights = (0..shape_planes(n, k, model))
-                    .map(|_| rig.operand(n, k, Dtype::Bf16))
-                    .collect::<Result<Vec<Tensor>>>()?;
-                let y = rig.zeros(most, n, Dtype::Bf16)?;
-                Some((act, weights, y))
+                // The planes as views into a few large buffers, the way a
+                // served fire reads its weights from the pool's segments.
+                let planes = shape_planes(n, k, model);
+                let plane = (2 * u64::from(n) * u64::from(k)).next_multiple_of(VIEW_ALIGN);
+                let slab = rig.slab(planes as u64 * plane, plane, true)?;
+                let weights = rig.views(&slab, planes, n, k, Dtype::Bf16)?;
+                // The outputs: room for one at the most rows, each fire at
+                // fewer writing its own view of it (`ys`), as a served
+                // step's matmuls write their own outputs.
+                let y = (2 * u64::from(most) * u64::from(n)).next_multiple_of(VIEW_ALIGN);
+                let ys = rig.slab(y, y, false)?;
+                Some((act, weights, ys))
             }
             None => None,
         };
@@ -1322,7 +1399,7 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
             if live.is_empty() {
                 break;
             }
-            let Some((act, weights, y)) = laid.as_ref().filter(|_| fits(m)) else {
+            let Some((act, weights, ys)) = laid.as_ref().filter(|_| fits(m)) else {
                 for &t in &live {
                     timed[t].stop = Some((m, profile::fire::KernelCurve::BUFFER));
                 }
@@ -1352,19 +1429,15 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
                             .iter()
                             .map(|w| Tensor { rows: cols, ..*w })
                             .collect();
+                        // Each fire its own output (as many as the room laid
+                        // for the most rows holds, to one a plane), so no
+                        // fire waits on the one before for writing the same.
+                        let outs = rig.views(ys, plane.len(), m, cols, Dtype::Bf16)?;
                         let rate = matmul_on(
                             rig,
                             timed[t].tactic,
                             timer,
-                            (
-                                Tensor { rows: m, ..*act },
-                                &plane,
-                                Tensor {
-                                    rows: m,
-                                    width: cols,
-                                    ..*y
-                                },
-                            ),
+                            (Tensor { rows: m, ..*act }, &plane, &outs),
                             Some(&touched),
                             launch,
                         );
@@ -2321,9 +2394,11 @@ fn matmul<B: Serve>(
         .map(|_| rig.operand(n, k, Dtype::Bf16))
         .collect::<Result<Vec<Tensor>>>()?;
     let y = rig.zeros(m, n, Dtype::Bf16)?;
-    matmul_on(rig, tactic, timer, (act, &weights, y), None, launch)?.map_err(|why| Fault::Device {
-        call: IMPLAUSIBLE,
-        why,
+    matmul_on(rig, tactic, timer, (act, &weights, &[y]), None, launch)?.map_err(|why| {
+        Fault::Device {
+            call: IMPLAUSIBLE,
+            why,
+        }
     })
 }
 
@@ -2336,16 +2411,17 @@ fn matmul_on<B: Serve>(
     rig: &mut Rig<'_, B>,
     tactic: kernels_slang::linear::gemm::Tactic,
     timer: Timer<'_, B>,
-    (act, weights, y): (Tensor, &[Tensor], Tensor),
+    (act, weights, ys): (Tensor, &[Tensor], &[Tensor]),
     touched: Option<&Touched>,
     launch: f64,
 ) -> Result<std::result::Result<f64, String>> {
-    let (m, n, k) = (act.rows, y.width, act.width);
+    let (m, n, k) = (act.rows, ys[0].width, act.width);
     let next = std::cell::Cell::new(0usize);
     rig.step(format!("matmul {m}x{n}x{k}"), Work::matmul(m, n, k));
     let fire = |sink: &kernels_slang::Ctx<'_>| {
-        let w = weights[next.get() % weights.len()];
-        next.set(next.get() + 1);
+        let at = next.get();
+        next.set(at + 1);
+        let (w, y) = (weights[at % weights.len()], ys[at % ys.len()]);
         kernels_slang::linear::gemm::matmul(sink, tactic, act, w, y).map_err(fault("rates: matmul"))
     };
     // A curve's point (its planes' touch shared) to a small device budget;
