@@ -1043,7 +1043,12 @@ it (a beam lane's carried rows are a span whose pages resolve through its
 list, its set's rs entries in its group's state; the per-fire tables stay
 O(lanes + widest bucket)), but the cost per step grows with the divergence
 (O(steps) replay, O(steps²) over a search). CUDA, Metal and XLA move to the
-same shape. A bound by design is a spec question for AMD / Leader: per-beam
+same shape. A deep group's resident state (its lists and set entries) passes a
+chunk and lies in one run of adjacent whole chunks on the device (9e121216d):
+binding or restoring it relies on the planner naming a compaction for a run
+the free chunks' total covers (the rework's fix for 217 free chunks holding
+no run of 7), else it waits on scattered room that never forms a run. A bound
+by design is a spec question for AMD / Leader: per-beam
 state checkpoints (each beam's recurrent state kept at page boundaries, so a
 beam replays at most a page past its last checkpoint) would bound the replay
 by a page at the cost of a state per beam per page.
