@@ -40,6 +40,7 @@ mod a_ternary_decode_in_dot_answers_the_host_decoder;
 mod a_tier_round_trip_is_bit_exact_for_every_parked_shape;
 mod a_tower_region_reads_the_patch_window;
 mod a_verify_walk_is_the_committed_walk;
+mod a_wide_row_reads_no_kv_cell_past_its_keys;
 mod an_adapter_in_slots_is_one_landing_through_the_table;
 mod an_envelope_keeps_two_passes_in_flight;
 mod an_idle_lane_reports_its_last_landing;

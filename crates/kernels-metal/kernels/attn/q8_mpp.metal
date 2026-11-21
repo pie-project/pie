@@ -151,10 +151,11 @@ q8_mpp(const device bfloat *q [[buffer(0)]], const device KV *keys [[buffer(1)]]
       // written, and a zero probability times what they hold is not zero when that is a
       // NaN, so the matmul's key extent stops there (cells past an extent read as zero).
       // A wide row (`enabled & 3 == 2`) sets `last` to its pages' end and keeps its
-      // unwritten tail out by its mask bytes alone, which this extent does not cover; no
-      // wide row reaches this kernel, which runs only causal (`attn::q8::attention` and
-      // `mpp_fits` both require it), and wide rows are staged only for a class that
-      // attends both ways (`serve::load`).
+      // unwritten tail out by its mask bytes alone, which this extent does not cover. This
+      // kernel runs only causal (`attn::q8::attention` and `mpp_fits` both require it), and
+      // a served model stages wide rows only for a class that attends both ways
+      // (`serve::load`), so none reaches it there; a caller that passes a wide row to a
+      // causal op over pages with unwritten tails would read them.
       const int held = min(N, last + 1 - base);
       auto v = tensor(const_cast<device KV *>(vplane) + v_at[0], dextents<int, 2>{D, held},
                       array<int, 2>{1, kv_heads * W});
