@@ -293,6 +293,9 @@ impl Host {
     fn stats(&self) -> String {
         let s = self.inner.stats();
         serde_json::json!({
+            // Which host built these numbers: "lazy-snapshot" since the
+            // round stopped rebuilding the snapshot (2026-11-20).
+            "host_build": crate::host::HOST_BUILD,
             "rounds": s.rounds, "calls": s.calls, "traps": s.traps, "deadlines": s.deadlines,
             "withdrawn": s.withdrawn, "call_ns": s.call_ns, "max_call_ns": s.max_call_ns,
             "commits": s.commits, "last_fault": s.last_fault,

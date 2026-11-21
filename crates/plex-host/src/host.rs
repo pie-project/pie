@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value as Json, json};
 
-use crate::runtime::{Call, Fault, Program, Snapshot, snap, wit, wit_subject};
+use crate::runtime::{Call, Fault, Proc, Program, Snapshot, snap, wit, wit_subject};
 use crate::tables::{self, COLUMNS, Column, Prefix, Refusal, Subject, Tables, TierSet, Value};
 
 /// How long the policy thread waits for the engine's counters before it
@@ -53,17 +53,14 @@ impl Default for Config {
     }
 }
 
-#[derive(Clone)]
-struct Proc {
-    rec: snap::Process,
-    /// When it last changed state: `service` and `waited` are up to here.
-    since: u64,
-}
-
 /// What a snapshot is built from. The maps are persistent (`imbl`): a
 /// round clones them under the lock in O(1) and builds its snapshot after
 /// the lock is released, so the engine's appends never wait on it.
 type Map<K, V> = imbl::HashMap<K, V>;
+
+/// Names this host's round implementation in its stats, so results from
+/// before and after a change to it are told apart.
+pub const HOST_BUILD: &str = "lazy-snapshot";
 /// A subject's hints or attributes: small, shared with a snapshot until the
 /// next change copies them.
 type Named = Arc<HashMap<String, Value>>;
@@ -90,6 +87,9 @@ struct State {
     /// Sessions closed since the last round: their notes go after the
     /// round that hears `closed`.
     closed: Vec<String>,
+    /// Processes that exited since the last round: that round sees them
+    /// and reaps them, so it needs no scan of every process.
+    exited: Vec<String>,
     kicked: bool,
     stop: bool,
     /// The sequence number of the last event reported (`Host::reported`).
@@ -251,41 +251,16 @@ impl Shared {
         }
     }
 
-    /// Builds a round's snapshot from `parts`, outside the lock.
-    fn snapshot(parts: &Parts, now: u64) -> Snapshot {
-        let plain = |m: &Map<Subject, Named>| -> HashMap<Subject, HashMap<String, Value>> {
-            m.iter().map(|(k, v)| (k.clone(), (**v).clone())).collect()
-        };
-        let mut snapshot = Snapshot {
-            processes: parts
-                .procs
-                .values()
-                .map(|p| {
-                    let mut rec = p.rec.clone();
-                    let spent = now.saturating_sub(p.since);
-                    match rec.state {
-                        wit::ProcessState::Running => rec.service += spent,
-                        wit::ProcessState::Exited => {}
-                        _ => rec.waited += spent,
-                    }
-                    rec
-                })
-                .collect(),
-            workers: parts.workers.values().cloned().collect(),
-            working_sets: parts.sets.values().cloned().collect(),
-            hints: plain(&parts.hints),
-            attrs: plain(&parts.attrs),
-            ..Default::default()
-        };
-        // A stable order, so a policy that breaks ties by position is
-        // deterministic.
-        snapshot
-            .processes
-            .sort_by(|a, b| (a.arrival, &a.id).cmp(&(b.arrival, &b.id)));
-        snapshot.workers.sort_by(|a, b| a.id.cmp(&b.id));
-        snapshot.working_sets.sort_by(|a, b| a.id.cmp(&b.id));
-        snapshot.index();
-        snapshot
+    /// A round's snapshot: the maps as `parts` took them, read lazily.
+    fn snapshot(parts: Parts, now: u64) -> Snapshot {
+        Snapshot::new(
+            now,
+            parts.procs,
+            parts.workers,
+            parts.sets,
+            parts.hints,
+            parts.attrs,
+        )
     }
 
     /// One round: every policy that has something to hear is called once,
@@ -300,12 +275,16 @@ impl Shared {
             let events = std::mem::take(&mut state.events);
             let refused = std::mem::take(&mut state.refused);
             let parts = Self::parts(&state);
-            // An exited process is seen by this round and no other.
-            let exited: Vec<String> = state
-                .procs
-                .values()
-                .filter(|p| p.rec.state == wit::ProcessState::Exited)
-                .map(|p| p.rec.id.clone())
+            // An exited process is seen by this round and no other (one
+            // that arrived again under the same id since is live).
+            let exited: Vec<String> = std::mem::take(&mut state.exited)
+                .into_iter()
+                .filter(|id| {
+                    state
+                        .procs
+                        .get(id)
+                        .is_some_and(|p| p.rec.state == wit::ProcessState::Exited)
+                })
                 .collect();
             for id in &exited {
                 state.procs.remove(id);
@@ -315,8 +294,7 @@ impl Shared {
             let closed = std::mem::take(&mut state.closed);
             (events, parts, refused, exited, closed, upto)
         };
-        let snapshot = Arc::new(Self::snapshot(&parts, now));
-        drop(parts);
+        let snapshot = Arc::new(Self::snapshot(parts, now));
         let carried = std::mem::take(&mut *self.carry.lock().unwrap());
         let mut programs = self.programs.lock().unwrap();
         let mut changed = false;
@@ -786,6 +764,10 @@ impl Host {
             return;
         }
         self.shared.move_to(proc, wit::ProcessState::Exited, now);
+        state.exited.push(id.to_string());
+        let Some(proc) = state.procs.get_mut(id) else {
+            return;
+        };
         proc.rec.prompt_tokens = prompt_tokens.or(proc.rec.prompt_tokens);
         proc.rec.cached_tokens = cached_tokens.or(proc.rec.cached_tokens);
         proc.rec.generated_tokens = generated_tokens.max(proc.rec.generated_tokens);
@@ -1317,7 +1299,9 @@ mod lock_time {
                 drop(state);
                 held += t.elapsed().as_secs_f64();
                 let t = Instant::now();
-                std::hint::black_box(Shared::snapshot(&parts, 1));
+                // The lazy snapshot, then a policy reading every process.
+                let snapshot = Shared::snapshot(parts.clone(), 1);
+                std::hint::black_box(snapshot.processes().len());
                 built += t.elapsed().as_secs_f64();
             }
             println!(
