@@ -138,8 +138,9 @@ pub fn unstated_budget(
     state_bytes: u64,
     seat_pages: u64,
     page_bytes: u64,
+    guest_bytes: u64,
 ) -> u64 {
-    derived_budget(seats, state_bytes, seat_pages, page_bytes, free_space(dir))
+    derived_budget(seats, state_bytes, seat_pages, page_bytes, guest_bytes, free_space(dir))
 }
 
 /// The disk tier's bytes derived on their own, from what can be parked:
@@ -156,12 +157,14 @@ pub fn derived_budget(
     state_bytes: u64,
     seat_pages: u64,
     page_bytes: u64,
+    guest_bytes: u64,
     free: u64,
 ) -> u64 {
     let slot = |bytes: u64| bytes.next_multiple_of(ALIGN as u64);
     let wanted = seats
         .saturating_mul(slot(state_bytes))
-        .saturating_add(seat_pages.saturating_mul(slot(page_bytes)));
+        .saturating_add(seat_pages.saturating_mul(slot(page_bytes)))
+        .saturating_add(slot(guest_bytes));
     wanted.min(free)
 }
 
@@ -175,10 +178,15 @@ mod budget_tests {
     #[test]
     fn the_unstated_disk_tier_is_derived_from_the_load_within_the_free_space() {
         let page = ALIGN as u64;
-        assert_eq!(derived_budget(2, page, 10, page, u64::MAX), 12 * page);
-        assert_eq!(derived_budget(0, 0, 40, page, u64::MAX), 40 * page);
+        assert_eq!(derived_budget(2, page, 10, page, 0, u64::MAX), 12 * page);
+        assert_eq!(derived_budget(0, 0, 40, page, 0, u64::MAX), 40 * page);
         assert_eq!(
-            derived_budget(0, 0, 40, page, 20 * page),
+            derived_budget(0, 0, 40, page, 3 * page, u64::MAX),
+            43 * page,
+            "the guest state the device holds live has a home too"
+        );
+        assert_eq!(
+            derived_budget(0, 0, 40, page, 0, 20 * page),
             20 * page,
             "the free space whole, not a quarter of it"
         );

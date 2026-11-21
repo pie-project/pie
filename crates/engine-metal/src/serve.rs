@@ -2535,11 +2535,20 @@ impl Shell {
                     u64::from(seats) * u64::from(context).div_ceil(u64::from(paging.page_size.max(1)));
                 let page_bytes = self.pools.page_bytes()?;
                 let free = engine::disk::free_space(dir);
-                let bytes =
-                    engine::disk::derived_budget(state_rows, state_bytes, pages, page_bytes, free);
+                // The guest state the device can hold live (the room a
+                // guest program binds within): evicted, it has a home.
+                let guest = self.pools.chunk_facts().guest_room_bytes();
+                let bytes = engine::disk::derived_budget(
+                    state_rows,
+                    state_bytes,
+                    pages,
+                    page_bytes,
+                    guest,
+                    free,
+                );
                 // Its inputs, stated at load: what the field rules on.
                 eprintln!(
-                    "engine-metal: the unstated disk tier: {bytes} bytes = {seats} seats x                      (state {state_bytes} B + {context} tokens of kv in {} pages of {page_bytes} B),                      within {free} bytes free",
+                    "engine-metal: the unstated disk tier: {bytes} bytes = {seats} seats x                      (state {state_bytes} B + {context} tokens of kv in {} pages of {page_bytes} B)                      + {guest} B of guest state the device holds live, within {free} bytes free",
                     context.div_ceil(paging.page_size.max(1)),
                 );
                 bytes

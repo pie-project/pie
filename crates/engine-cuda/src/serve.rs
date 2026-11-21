@@ -672,16 +672,20 @@ impl Shell {
                     .map_or(1, |list| u64::from(list.per_chunk.max(1)));
                 let chunk = self.pools.disk_chunk_bytes();
                 let state = (u64::from(seats) * self.state_row_bytes()).div_ceil(chunk.max(1));
+                // The guest state the device can hold live (the room a
+                // guest program binds within): evicted, it has a home.
+                let guest = self.chunk_facts()?.guest_room_bytes();
                 let bytes = engine::disk::derived_budget(
                     0,
                     0,
                     pages.div_ceil(per_chunk) + state,
                     chunk,
+                    guest,
                     free / ranks,
                 );
                 // Its inputs, stated at load: what the field rules on.
                 eprintln!(
-                    "engine-cuda: the unstated disk tier: {bytes} bytes = {seats} seats x                      {context} tokens: {pages} kv pages in {} chunks and {state} chunks of state                      ({} B a seat), chunks of {chunk} B, within {} bytes free a rank",
+                    "engine-cuda: the unstated disk tier: {bytes} bytes = {seats} seats x                      {context} tokens: {pages} kv pages in {} chunks and {state} chunks of state                      ({} B a seat), and {guest} B of guest state the device holds live, chunks of {chunk} B, within {} bytes free a rank",
                     pages.div_ceil(per_chunk),
                     self.state_row_bytes(),
                     free / ranks,
