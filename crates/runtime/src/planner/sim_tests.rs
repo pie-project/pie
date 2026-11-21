@@ -481,9 +481,142 @@ struct SimEngine {
     bytes: Arc<Mutex<Bytes>>,
     instances: BTreeMap<u64, Places>,
     pair_generation: BTreeMap<u64, u64>,
+    /// Where each live instance's state and each pair's lie, as an engine
+    /// claims them (`engine::guest_claims`): a bind or rebind onto bytes
+    /// another live holder holds is refused by name, as the engine refuses
+    /// it, and said as a failure of its own ([`Log::claims`]).
+    claims: ::engine::guest_claims::Claims,
+    /// Instances parked (`Rebind::Parked`): they hold only their kept runs.
+    parked: std::collections::BTreeSet<u64>,
+    /// Refusals the claims made, said by the next check.
+    refusals: Vec<String>,
+}
+
+/// The bytes `slot` of `shape` takes, as a claim's run: a slot ref's
+/// logical chunk and its offset there (a compaction moves runs whole, and
+/// every claim is laid again after one: [`SimEngine::rebase`]).
+fn slot_run(shape: u32, slot: u32) -> ::engine::guest_claims::Run {
+    let (chunk, off, len) = Bytes::place(shape, slot);
+    let start = u64::from(chunk) * MIB + off;
+    ::engine::guest_claims::Run {
+        segment: 0,
+        start,
+        end: start + len,
+    }
 }
 
 impl SimEngine {
+    /// An instance's own runs at `places`: its tables and rings, and its
+    /// scratch unless parked (`kept` only: its tables and rings where they
+    /// stayed in place).
+    fn own_runs(places: &Places, bytes: &Bytes, scratch: bool) -> Vec<::engine::guest_claims::Run> {
+        let mut runs: Vec<_> = places
+            .instance
+            .iter()
+            .map(|&slot| slot_run(INSTANCE, slot))
+            .chain(
+                places
+                    .rings
+                    .iter()
+                    .flat_map(|ring| ring.slots.iter().map(|&slot| slot_run(CHANNEL, slot))),
+            )
+            .collect();
+        if scratch {
+            runs.extend(
+                place_slots(&places.scratch, bytes)
+                    .into_iter()
+                    .map(|slot| slot_run(INSTANCE, slot)),
+            );
+        }
+        runs
+    }
+
+    fn pair_claim(places: &Places, bytes: &Bytes) -> Option<::engine::guest_claims::PairClaim> {
+        place_holds(&places.pair).then(|| ::engine::guest_claims::PairClaim {
+            pair: places.program,
+            taking: places.pair_generation,
+            runs: place_slots(&places.pair, bytes)
+                .into_iter()
+                .map(|slot| slot_run(INSTANCE, slot))
+                .collect(),
+        })
+    }
+
+    /// Claims `id`'s state at `places`, as an engine's bind or rebind does
+    /// before it writes a byte there.
+    fn claim(&mut self, id: u64, places: &Places, what: &str) -> ::engine::Result<()> {
+        let claimed = {
+            let bytes = self.bytes.lock().unwrap();
+            let own = Self::own_runs(places, &bytes, true);
+            match Self::pair_claim(places, &bytes) {
+                Some(pair) => self.claims.claim_with_pair(id, &own, &pair).map(|_| ()),
+                None => self.claims.claim(id, &own).map_err(Into::into),
+            }
+        };
+        claimed.map_err(|refusal| {
+            let members = match &refusal {
+                ::engine::guest_claims::Refusal::Overlap(overlap) => match overlap.holder {
+                    ::engine::guest_claims::Holder::Pair(pair) => format!(
+                        "; pair {pair}'s members {:?}",
+                        self.claims
+                            .members(pair)
+                            .into_iter()
+                            .map(|member| (member, self.parked.contains(&member)))
+                            .collect::<Vec<_>>()
+                    ),
+                    ::engine::guest_claims::Holder::Instance(_) => String::new(),
+                },
+                ::engine::guest_claims::Refusal::Pinned(_) => String::new(),
+            };
+            let line = format!(
+                "{what} of instance {id} (program {}): {refusal}{members}",
+                places.program
+            );
+            self.refusals.push(line);
+            refusal.into()
+        })
+    }
+
+    /// Every live claim laid again where a compaction left it, in one step
+    /// (an engine's evacuation rebase): a parked instance holds only what
+    /// it kept, in single slots a compaction leaves where they are.
+    fn rebase(&mut self) {
+        let bytes = self.bytes.lock().unwrap();
+        let mut moved = Vec::new();
+        let mut pairs = BTreeMap::new();
+        for (&id, places) in &self.instances {
+            if self.parked.contains(&id) {
+                continue;
+            }
+            moved.push((
+                ::engine::guest_claims::Holder::Instance(id),
+                Self::own_runs(places, &bytes, true),
+            ));
+            if let Some(pair) = Self::pair_claim(places, &bytes)
+                && !self.claims.members(pair.pair).is_empty()
+            {
+                pairs.insert(pair.pair, pair.runs);
+            }
+        }
+        moved.extend(
+            pairs
+                .into_iter()
+                .map(|(pair, runs)| (::engine::guest_claims::Holder::Pair(pair), runs)),
+        );
+        drop(bytes);
+        if let Err(overlap) = self.claims.claim_all(&moved) {
+            self.refusals.push(format!("a compaction's rebase: {overlap}"));
+        }
+    }
+
+    /// Instance `id` closed: its claims go, and its pair's with its last
+    /// member.
+    fn close(&mut self, id: u64) -> Option<Places> {
+        self.claims.release(id);
+        self.parked.remove(&id);
+        self.instances.remove(&id)
+    }
+
     fn lay_pair(&mut self, program: u64, generation: u64, place: &::engine::ScratchPlace) {
         if self.pair_generation.get(&program) == Some(&generation) {
             return;
@@ -600,6 +733,7 @@ impl Engine for SimEngine {
             pair_generation: binding.pair_generation,
             resident: self.programs[binding.program.0 as usize].resident > 0,
         };
+        self.claim(id, &places, "a bind")?;
         {
             let mut bytes = self.bytes.lock().unwrap();
             for (_, shape, slot, value) in instance_parts(id, &places, &bytes) {
@@ -618,25 +752,47 @@ impl Engine for SimEngine {
     }
 
     fn rebind_slots(&mut self, rebind: Rebind) -> ::engine::Result<()> {
-        if let Rebind::Instance {
-            id,
-            instance,
-            rings,
-            scratch,
-            pair,
-            pair_generation,
-            ..
-        } = rebind
-            && let Some(places) = self.instances.get_mut(&id.0)
-        {
-            places.instance = instance;
-            places.rings = rings;
-            places.scratch = scratch;
-            places.pair = pair;
-            places.pair_generation = pair_generation;
-            trace(|| format!("rebind {} {places:?}", id.0));
-            let (program, place) = (places.program, places.pair.clone());
-            self.lay_pair(program, pair_generation, &place);
+        match rebind {
+            Rebind::Instance {
+                id,
+                instance,
+                rings,
+                scratch,
+                pair,
+                pair_generation,
+                ..
+            } => {
+                let Some(was) = self.instances.get(&id.0) else {
+                    return Ok(());
+                };
+                let places = Places {
+                    instance,
+                    rings,
+                    scratch,
+                    pair,
+                    pair_generation,
+                    ..was.clone()
+                };
+                self.claim(id.0, &places, "a rebind")?;
+                self.parked.remove(&id.0);
+                trace(|| format!("rebind {} {places:?}", id.0));
+                let (program, place) = (places.program, places.pair.clone());
+                self.instances.insert(id.0, places);
+                self.lay_pair(program, pair_generation, &place);
+            }
+            Rebind::Parked { id, kept } => {
+                if let Some(places) = self.instances.get(&id.0) {
+                    let runs = if kept {
+                        Self::own_runs(places, &self.bytes.lock().unwrap(), false)
+                    } else {
+                        Vec::new()
+                    };
+                    self.claims.park(id.0, &runs);
+                    self.parked.insert(id.0);
+                    trace(|| format!("parked {} kept={kept}", id.0));
+                }
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -689,6 +845,10 @@ struct Script {
     bind: Vec<(u32, bool)>,
     /// After this many decode fires it goes idle for that many steps.
     idle: Option<(u32, u32)>,
+    /// After this many decode fires it closes every instance it holds and
+    /// binds this program in their place, as a beam's verifier opens a
+    /// rescore's pipeline of a second program once the first is closed.
+    rescore: Option<(u32, u32)>,
 }
 
 impl Script {
@@ -721,6 +881,7 @@ impl Workload {
         // program's largest run, so it always fits the pool alone.
         let largest_run = pool.programs.iter().map(|p| p.run * 2).max().unwrap_or(0);
         let most = (state * 3 / 5).saturating_sub(largest_run).max(2) * PAGES_PER_CHUNK;
+        let mut rescore_rng = Rng(seed ^ 0x7e5c_07e5);
         let count = rng.range(6, 32);
         let horizon = rng.range(4, 40);
         let mut scripts = Vec::new();
@@ -735,6 +896,7 @@ impl Workload {
                 beams: 1,
                 bind: Vec::new(),
                 idle: None,
+                rescore: None,
             };
             match kind {
                 // A plain decode: a short prompt, long growth.
@@ -772,6 +934,14 @@ impl Workload {
             }
             if script.decode > 2 && rng.chance(1, 4) {
                 script.idle = Some((rng.range(0, script.decode - 1), rng.range(1, 8)));
+            }
+            // Drawn from a stream of its own, so every other draw of a seed
+            // stands as it was.
+            if !script.bind.is_empty() && script.decode > 1 && rescore_rng.chance(1, 3) {
+                script.rescore = Some((
+                    rescore_rng.range(0, script.decode - 1),
+                    rescore_rng.below(pool.programs.len() as u64) as u32,
+                ));
             }
             while script.pages() > most && script.decode > 0 {
                 script.decode -= 1;
@@ -820,6 +990,11 @@ struct Coverage {
     processes: u64,
     fires: u64,
     evictions: u64,
+    evicted_unfired: u64,
+    /// Passes said as no step found with nothing in flight (the policy
+    /// asked while the map named moves among them): counted, the waits on
+    /// something in flight among them failed by name.
+    quiet_waits: u64,
     restores: u64,
     eviction_tier_full: u64,
     tier_full_refused: u64,
@@ -832,6 +1007,7 @@ struct Coverage {
     bind_waits: u64,
     bind_suspends: u64,
     idles: u64,
+    rescores: u64,
     cache_left: u64,
     integrity_checks: u64,
     pages_checked: u64,
@@ -845,6 +1021,8 @@ impl Coverage {
         self.processes += other.processes;
         self.fires += other.fires;
         self.evictions += other.evictions;
+        self.evicted_unfired += other.evicted_unfired;
+        self.quiet_waits += other.quiet_waits;
         self.restores += other.restores;
         self.eviction_tier_full += other.eviction_tier_full;
         self.tier_full_refused += other.tier_full_refused;
@@ -857,6 +1035,7 @@ impl Coverage {
         self.bind_waits += other.bind_waits;
         self.bind_suspends += other.bind_suspends;
         self.idles += other.idles;
+        self.rescores += other.rescores;
         self.cache_left += other.cache_left;
         self.integrity_checks += other.integrity_checks;
         self.pages_checked += other.pages_checked;
@@ -1035,6 +1214,7 @@ struct Log {
     bind_waits: u64,
     bind_suspends: u64,
     idles: u64,
+    rescores: u64,
     /// Bytes found not as written: (process, what).
     corrupt: Vec<(ProcessId, String)>,
     checks: u64,
@@ -1385,6 +1565,7 @@ async fn bind(ctx: &Ctx, pid: ProcessId, program: u32) -> Result<InstanceId, Str
                     &binding,
                     |_| false,
                     Some(pid),
+                    |pid| ctx.planner.is_resident(pid),
                 )?;
                 crate::store::roles::bind_taken(
                     Some(&roles),
@@ -1458,7 +1639,7 @@ fn take_bind_error(
 ) -> String {
     let mut engine = engine.lock().unwrap();
     let free_chunks = roles.lock().unwrap().free_runs(1);
-    match crate::store::roles::take_bind(Some(roles), &mut *engine, binding, |_| false, Some(pid)) {
+    match crate::store::roles::take_bind(Some(roles), &mut *engine, binding, |_| false, Some(pid), |_| true) {
         Ok(taken) => {
             if let Some(taken) = taken {
                 roles.lock().unwrap().untake(taken);
@@ -1550,6 +1731,15 @@ async fn run_process(ctx: Arc<Ctx>, pid: ProcessId, script: Script) {
                 planner.set_idle(pid, false);
                 ctx.act();
             }
+            if let Some((when, program)) = script.rescore
+                && when == at
+            {
+                ctx.log.lock().unwrap().rescores += 1;
+                for id in std::mem::take(&mut instances) {
+                    close(&ctx, id);
+                }
+                instances.push(bind(&ctx, pid, program).await?);
+            }
             let pages = u64::from((at + 1) % script.grow_every == 0);
             fire(&ctx, pid, &mut sets, &instances, pages).await?;
         }
@@ -1559,22 +1749,11 @@ async fn run_process(ctx: Arc<Ctx>, pid: ProcessId, script: Script) {
     if let Err(why) = lived {
         ctx.refused(pid, why);
     }
-    // Its end, as the runtime's: its instances close, its sets go back, it
+    // Its end, as the runtime's: its instances close (the engine's close
+    // first, then the roles give their slots back), its sets go back, it
     // leaves the planner, then its hold.
-    if let Some(roles) = &ctx.stores.roles {
-        let mut roles = roles.lock().unwrap();
-        for &id in &instances {
-            roles.close_instance(id);
-        }
-    }
     for id in instances {
-        let places = ctx.engine.lock().unwrap().instances.remove(&id.0);
-        if let Some(places) = places
-            && let Some(entry) = ctx.pairs.lock().unwrap().get_mut(&places.program)
-            && place_holds(&places.pair)
-        {
-            entry.1 = entry.1.saturating_sub(1);
-        }
+        close(&ctx, id);
     }
     for set in &sets {
         set.handle.release();
@@ -1587,6 +1766,21 @@ async fn run_process(ctx: Arc<Ctx>, pid: ProcessId, script: Script) {
     log.stages.remove(&pid);
     log.ended += 1;
     log.acts += 1;
+}
+
+/// Closes instance `id` as the runtime's lane does: the engine's close,
+/// then the roles' (its slots given back once the engine let them go).
+fn close(ctx: &Ctx, id: InstanceId) {
+    let places = ctx.engine.lock().unwrap().close(id.0);
+    if let Some(roles) = &ctx.stores.roles {
+        roles.lock().unwrap().close_instance(id);
+    }
+    if let Some(places) = places
+        && let Some(entry) = ctx.pairs.lock().unwrap().get_mut(&places.program)
+        && place_holds(&places.pair)
+    {
+        entry.1 = entry.1.saturating_sub(1);
+    }
 }
 
 /// The engine's segment walk, one step a simulated step: fences retired
@@ -1617,6 +1811,7 @@ fn walk(ctx: &Ctx) -> bool {
             trace(|| format!("compact {applied:?}"));
             let total = shared.lock().unwrap().pool().total_chunks();
             ctx.bytes.lock().unwrap().moved(total, &applied);
+            ctx.engine.lock().unwrap().rebase();
             shared.lock().unwrap().compaction_copied(epoch, current);
             true
         }
@@ -1682,6 +1877,22 @@ fn check(ctx: &Ctx, step: u32) -> Result<Vec<Failure>, Failure> {
         .into_iter()
         .map(|(pid, why)| fail("refused", format!("process {pid}: {why}")))
         .collect();
+    // A wait only something in flight could end, chosen with nothing in
+    // flight: the planner found no step (said in the field as a warning,
+    // the L40S at 3 GiB on df488038b: 111 of them).
+    if let Some(ended) = super::eviction::QUIET_WAITS
+        .with(|waits| std::mem::take(&mut *waits.borrow_mut()))
+        .into_iter()
+        .next()
+    {
+        return Err(fail("quiet", format!("a wait chosen with nothing in flight: {ended}")));
+    }
+    if let Some(refusal) = std::mem::take(&mut ctx.engine.lock().unwrap().refusals)
+        .into_iter()
+        .next()
+    {
+        return Err(fail("claims", refusal));
+    }
     refused.extend(
         std::mem::take(&mut ctx.log.lock().unwrap().corrupt)
             .into_iter()
@@ -1753,6 +1964,7 @@ fn run(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Coverage) 
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     SIM_PANICS.with(|panics| *panics.borrow_mut() = Some(Vec::new()));
+    super::eviction::QUIET_WAITS.with(|waits| waits.borrow_mut().clear());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1789,6 +2001,9 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
             bytes: bytes.clone(),
             instances: BTreeMap::new(),
             pair_generation: BTreeMap::new(),
+            claims: ::engine::guest_claims::Claims::default(),
+            parked: std::collections::BTreeSet::new(),
+            refusals: Vec::new(),
         })),
         bytes: bytes.clone(),
         pairs: Mutex::new(BTreeMap::new()),
@@ -1920,6 +2135,8 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
     coverage.steps = u64::from(step) + 1;
     let stats = &planner.stats;
     coverage.evictions = stats.evictions.load(Ordering::Relaxed);
+    coverage.evicted_unfired = stats.evicted_unfired.load(Ordering::Relaxed);
+    coverage.quiet_waits = stats.quiet_waits.load(Ordering::Relaxed);
     coverage.restores = stats.restores.load(Ordering::Relaxed);
     coverage.eviction_tier_full = stats.eviction_tier_full.load(Ordering::Relaxed);
     coverage.host_swap_full = stats.host_swap_exhaustions.load(Ordering::Relaxed);
@@ -1932,6 +2149,7 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
         coverage.bind_waits = log.bind_waits;
         coverage.bind_suspends = log.bind_suspends;
         coverage.idles = log.idles;
+        coverage.rescores = log.rescores;
         coverage.integrity_checks = log.checks;
         coverage.pages_checked = log.pages_checked;
         coverage.guest_slots_checked = log.guest_slots_checked;
