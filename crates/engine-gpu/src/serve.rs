@@ -536,6 +536,8 @@ pub struct Settled {
     /// Whether the range was checked on the served step (else its kernel
     /// is the curves').
     pub checked: bool,
+    /// Whether the check replaced the range's kernel.
+    pub replaced: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2462,6 +2464,20 @@ impl<B: Serve> Shell<B> {
         }
         // The kernels the options built are the load's, not a fire's.
         self.built = B::compiled(&self.pipelines);
+        // Every settle fire walked unkept, and a load records no body before
+        // its first served fire: none recorded stands on a kernel the
+        // settle replaced, so none is recorded again (each served shape
+        // records its body at its first fire, with the settled kernels).
+        let replaced = self.settled.iter().filter(|range| range.replaced).count();
+        tracing::info!(
+            ranges = self.settled.len(),
+            replaced,
+            recorded_before = 0,
+            "dense settle done: {replaced} of {} ranges replaced; no body was recorded before \
+             it, so none is recorded again (each served shape records its body at its first \
+             fire, with the settled kernels)",
+            self.settled.len()
+        );
         settled
     }
 
@@ -2590,6 +2606,7 @@ impl<B: Serve> Shell<B> {
                     },
                     bound_ns,
                     checked: options.len() > 1,
+                    replaced: false,
                 });
                 if options.len() > 1 {
                     let word = if per_lane == 1 {
@@ -2706,6 +2723,9 @@ impl<B: Serve> Shell<B> {
                             "device's spans"
                         }
                     );
+                    if let Some(range) = self.settled.last_mut() {
+                        range.replaced = taken != 0;
+                    }
                     self.dense = options.swap_remove(taken);
                 }
             } else {
