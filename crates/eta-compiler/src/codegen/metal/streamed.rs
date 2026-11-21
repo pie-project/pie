@@ -560,8 +560,18 @@ fn direct_wide(
     })
 }
 
-pub const STEP_STRUCT: &str =
-    "struct M4Step {\n  uint index;\n  uint level;\n  uint groups;\n  uint reserved;\n};\n";
+pub const STEP_STRUCT: &str = "struct M4Step {\n  uint index;\n  uint level;\n  uint groups;\n  uint reserved;\n};\n\
+// A pipeline built for one step states its index (M4_STEP_CONSTANT): its\n\
+// switch keeps that case alone, and so do its registers and threadgroup\n\
+// memory; a pipeline built for all reads the dispatch's step word.\n\
+constant uint m4_fixed_step [[function_constant(20)]];\n\
+inline uint m4_step_index(uint dispatched) {\n\
+  return is_function_constant_defined(m4_fixed_step) ? m4_fixed_step : dispatched;\n\
+}\n";
+
+/// The function constant index a streamed kernel reads its step from where
+/// its pipeline is built for one step (`m4_fixed_step`).
+pub const M4_STEP_CONSTANT: usize = 20;
 
 const BROADCAST_INDEX: &str = r"
 inline uint m4_broadcast_index(const M1ValueDesc bd0, const M1ValueDesc bo0, uint i) {
@@ -1821,7 +1831,7 @@ pub fn emit_streamed_region(
     }
     sched.flush_pending();
 
-    source.push_str("  switch (step.index) {\n");
+    source.push_str("  switch (m4_step_index(step.index)) {\n");
     source.push_str(&sched.cases);
     source.push_str("  default: return;\n  }\n}\n");
     let mut table = sched.steps;

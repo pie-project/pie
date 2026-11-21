@@ -2886,11 +2886,14 @@ impl Shell {
         registrations: &[engine::program::ProgramRegistration],
     ) -> Result<()> {
         let started = std::time::Instant::now();
+        let steps_before = crate::program::compile::step_pipelines_built();
         let compiled = self.programs.prewarm(&self.device, registrations)?;
         eprintln!(
-            "engine-metal: guest regions prewarmed for {} standard program(s): {} compiled, in {} ms",
+            "engine-metal: guest regions prewarmed for {} standard program(s): {} compiled \
+             ({} step pipeline(s)), in {} ms",
             registrations.len(),
             compiled,
+            crate::program::compile::step_pipelines_built().saturating_sub(steps_before),
             started.elapsed().as_millis()
         );
         Ok(())

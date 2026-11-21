@@ -1587,7 +1587,7 @@ impl Plane {
                                         let (dispatches, threads) =
                                             prepared.bind_streamed(&encoder, region)?;
                                         if let Some(&word) = dispatches.get(step) {
-                                            launch::dispatch_streamed_step(&encoder, word, threads);
+                                            launch::dispatch_streamed_step(&encoder, word, threads, region);
                                         }
                                     }
                                     frame.level();
