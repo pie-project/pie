@@ -9819,3 +9819,27 @@ fn a_restore_s_pages_to_gather_are_single_chunks_beside_its_runs() {
     need.add(1, 30);
     assert_eq!(planner.head_room(key), Some(need));
 }
+
+/// Mac Pro at 2 GiB on acfd05fe1: the need widened for a refusal in this
+/// room one pass and narrowed the next ((3, 8) and (3, 3), 56,671 no-step
+/// lines) as the free count crossed the refusal's. Once read, the widening
+/// holds until a new refusal or the serve; a send still goes on more room.
+#[test]
+fn a_refusal_read_as_taken_in_this_room_holds_until_a_new_refusal() {
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    pool.free.lock().extend([0, 1]);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let pid = ProcessId::new_v4();
+    planner.register(pid);
+    planner.with_inner(|inner| inner.procs.get_mut(&pid).unwrap().roles_short_free = Some(2));
+    assert!(planner.refused_in_this_room(pid));
+    pool.free.lock().extend([2, 3]);
+    assert!(planner.refused_in_this_room(pid), "held, not reset by more room");
+    assert!(!planner.no_more_room_than_refused(pid), "a send reads the room anew");
+    planner.with_inner(|inner| {
+        let proc = inner.procs.get_mut(&pid).unwrap();
+        proc.roles_short_free = Some(1);
+        proc.refused_here = false;
+    });
+    assert!(!planner.refused_in_this_room(pid), "a new refusal reads anew");
+}

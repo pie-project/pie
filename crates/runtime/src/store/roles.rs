@@ -1325,7 +1325,15 @@ impl Roles {
                 free_chunks,
                 committable: 0,
             }),
-            Err(_) => Err(like.room()),
+            // Any other refusal (the budget, a run across a segment's end)
+            // is said by name: read as the part's ask alone, its room's
+            // zeros looked like a full device (Mac Pro at 2 GiB on
+            // c10d7de5d: "free_runs: 0, free_chunks: 0, committable: 0" on a
+            // device 310 of 365 pages free).
+            Err(error) => {
+                tracing::warn!(%error, run = like.chunks, pieces = like.pieces, "roles: a guest part's fresh room refused by the pool");
+                Err(like.room())
+            }
         }
     }
 

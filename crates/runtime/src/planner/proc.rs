@@ -110,6 +110,13 @@ pub(super) struct Proc {
     /// its last unpark refusal left them: it goes again only once more
     /// stand, as well as more runs of the refused length.
     pub(super) roles_short_free: Option<u32>,
+    /// Its last refusal was once read as taken in the room standing then
+    /// ([`super::ResidencyPlanner::refused_in_this_room`]): held so until a
+    /// new refusal or its serve, never reset by a pass. Read anew each pass,
+    /// a fleet's takes and gives moved the free count across the refusal's
+    /// and the need widened and narrowed every other pass (Mac Pro at 2 GiB
+    /// on acfd05fe1: (3, 8) and (3, 3) alternating, 56,671 no-step lines).
+    pub(super) refused_here: bool,
     /// Whether the store's own placement ([`super::pool::PoolPort::guest_need_free`],
     /// its serve's state laid first) stood its need as its last unpark
     /// refusal left the pool. Refused where it did not stand, it goes again
@@ -234,6 +241,7 @@ impl Proc {
             roles_short_gives: None,
             roles_short_runs: None,
             roles_short_free: None,
+            refused_here: false,
             roles_short_stood: None,
             roles_refused: None,
             evicted_queued: false,

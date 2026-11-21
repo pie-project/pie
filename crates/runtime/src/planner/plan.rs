@@ -815,7 +815,7 @@ impl ResidencyPlanner {
                     });
                     let bind = RunNeed::one(need.run, need.pieces);
                     if pid.is_some_and(|pid| {
-                        !self.refused_in_this_room(pid)
+                        !self.no_more_room_than_refused(pid)
                             && self.port.restore_stands(pid, &bind, state, kv, Some((need.run, need.pieces)))
                     }) {
                         self.plan_stopped("bind-suspended restore sent: its placement stands");

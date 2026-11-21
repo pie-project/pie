@@ -570,6 +570,8 @@ impl ResidencyPlanner {
         // no standing: the restore found otherwise there, and holding it
         // for more room with nothing in flight lost its wake (Mac Pro at
         // 2 GiB on f623134fc, twice). Its moves are named instead.
+        // Held once read (never reset by a pass): the need stays widened
+        // until a new refusal or its serve.
         if !self.refused_in_this_room(pid) && self.store_stands(head, pid, need) {
             return;
         }
@@ -590,6 +592,22 @@ impl ResidencyPlanner {
     /// takes (the M1 at 2 GiB on 05c8624c5: 117,270 no-step lines, the check
     /// standing a run of 7 the restore, its pages gathered, found none of).
     pub(super) fn refused_in_this_room(&self, pid: ProcessId) -> bool {
+        let free = self.port.free_chunks();
+        self.with_inner(|inner| {
+            let Some(proc) = inner.procs.get_mut(&pid) else {
+                return false;
+            };
+            if !proc.refused_here && proc.roles_short_free.is_some_and(|left| free <= left) {
+                proc.refused_here = true;
+            }
+            proc.refused_here
+        })
+    }
+
+    /// Whether `pid`'s last refusal was taken with no fewer chunks free than
+    /// now, read anew: what a send reads (more room come, it goes again;
+    /// the need it plans on stays widened, [`Self::refused_in_this_room`]).
+    pub(super) fn no_more_room_than_refused(&self, pid: ProcessId) -> bool {
         let free = self.port.free_chunks();
         self.with_inner(|inner| {
             inner
