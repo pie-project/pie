@@ -261,6 +261,8 @@ pub(crate) struct Parked {
 pub(crate) struct Deferred {
     key: [u8; 32],
     shape_key: Option<[u8; 32]>,
+    /// The fire's shape, as a warning that leaves it out names it.
+    shape: String,
     text: String,
     sig: crate::trace::Signature,
     probed: Vec<ValueId>,
@@ -3166,6 +3168,13 @@ impl Shell {
                 deferred.push(Deferred {
                     key: missed(key),
                     shape_key,
+                    shape: format!(
+                        "rows {} bucket {} lanes {} rs {rs_active} inputs {}",
+                        descriptor.rows,
+                        descriptor.bucket,
+                        descriptor.lanes.len(),
+                        inputs.shapes(),
+                    ),
                     text,
                     sig,
                     probed,

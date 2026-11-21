@@ -707,7 +707,7 @@ impl Shell {
                             self.left_out.insert(shape_key);
                         }
                         if left_out.insert(at) {
-                            tracing::warn!(%why, "xla warm shape left out: its program does not fit HBM");
+                            tracing::warn!(shape = %d.shape, %why, "xla warm shape left out: its program does not fit HBM");
                         }
                         continue;
                     }
