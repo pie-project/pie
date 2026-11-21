@@ -1227,6 +1227,10 @@ pub fn carried_pipelines() -> [Fire; 6] {
 /// rows a threadgroup (each row's work read once a head) rather than 16.
 pub const GDN_CARRIED_WIDE: u32 = 32;
 
+/// The most carried rows [`gated_delta_carried`] reduces in the scan itself
+/// (a chunk's, `kVerifyChunk`), with no per-head table launched.
+pub const GDN_CARRIED_INLINE: u32 = 16;
+
 /// The per-head table [`gated_delta_carried`] reads each carried row's
 /// reductions from (`gated_delta_carried_dots`): `rows` entries a (lane, key
 /// head), at least the window's most carried rows (`max_rep`), in `table`.
@@ -1543,8 +1547,12 @@ pub fn gated_delta_carried(
         .checked_mul(lanes)
         .ok_or_else(|| refuse(OP, "the value heads of every lane overflow a launch"))?;
     // Each carried row's reductions, once a (lane, key head): the table
-    // every value head and row group of the scan reads.
-    if table.max_rep > 0 {
+    // every value head and row group of the scan reads. A carry of one
+    // chunk (a decode at its lag) makes them in the scan itself, a
+    // simdgroup a row, and launches no table (its rows stated 0).
+    let short = table.max_rep <= GDN_CARRIED_INLINE;
+    let table_rows = if short { 0 } else { table.rows };
+    if table.max_rep > 0 && !short {
         let zk = k_heads
             .checked_mul(lanes)
             .ok_or_else(|| refuse(OP, "the key heads of every lane overflow a launch"))?;
@@ -1602,7 +1610,7 @@ pub fn gated_delta_carried(
             state.segments.arg(),
             ba_paged.page_ints.arg(),
             table.table.arg(),
-            table.rows.arg(),
+            table_rows.arg(),
             committed.ext_replay.arg(),
         ],
     )

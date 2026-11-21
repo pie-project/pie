@@ -732,7 +732,10 @@ template <typename T>
   const pie_state_column piece = pie_state_inner(map, ids, uint(c), uint(channels));
   const int own = indptr[r] - rep;
   const device int* pages = page_table + size_t(lane0 + r) * uint(page_ints);
-  const bool buffers = pages[0] >= 0;
+  const int keep = min(commit[lane0 + r], span);
+  // Its own input lands for the fires after this one, unless this fire
+  // folds it into the window.
+  const bool buffers = pages[0] >= 0 && keep < span;
   auto buffered = [&](int e) -> device T* {
     return reinterpret_cast<device T*>(
         rs_buffered_row(slab, pages, e, page_tokens, page_bytes, row_bytes) + col * sizeof(T));
@@ -757,7 +760,6 @@ template <typename T>
   if (buffers) {
     *buffered(t) = x[size_t(own + t) * chans + col];
   }
-  const int keep = min(commit[lane0 + r], span);
   if (keep > 0) {
     float next[kConvFoldHeld];
     for (int s = 0; s < hist; ++s) {

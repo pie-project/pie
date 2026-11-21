@@ -1003,7 +1003,11 @@ template <typename T, int SG, int VROWS>
   const int t_own = rep;
   const int keep = min(commit[lane0 + r], rep + 1);
   const device int* pages = page_table + size_t(lane0 + r) * page_ints;
-  const bool lands = pages[0] >= 0;
+  // The own row lands in the buffer for the fires after this one, unless
+  // this fire folds it: a fold the runtime states advances the set as it
+  // prepares the fire, and one the device places is frozen ahead
+  // (`frozen_ahead`), so no later fire replays it.
+  const bool lands = pages[0] >= 0 && keep < rep + 1;
   const int hk = hv / (v_heads / k_heads);
   const size_t keys = size_t(k_heads) * D;
   const size_t pitch = 2 * keys + size_t(v_heads) * D;
@@ -1049,8 +1053,8 @@ template <typename T, int SG, int VROWS>
     }
   } else if (tid == 32) {
     const float2 g = gdn_verify_gates<T>(ba, a_log, dt_bias, hv, v_heads, t_own, begin, own, rep,
-                                         group.y == 0, ba_slab, pages, page_tokens, page_bytes,
-                                         ba_row_bytes);
+                                         group.y == 0 && lands, ba_slab, pages, page_tokens,
+                                         page_bytes, ba_row_bytes);
     own_s[1] = g.x;
     own_s[2] = g.y;
     if (group.y == 0) {
@@ -1129,23 +1133,56 @@ template <typename T, int SG, int VROWS>
     if (tid < rows) {
       glog_c[tid] = log_gate(c0 + tid);
     }
-    // Each row's reductions from the per-head table (made once a lane and
-    // key head); a row that folds stages its normed key.
-    const device float4* dots = table + (size_t(lane0 + r) * size_t(k_heads) + size_t(hk)) * table_rows;
-    if (tid < rows) {
-      const float4 kd = dots[c0 + tid];
-      kinv_c[tid] = kd.x;
-      dq_s[tid] = kd.y;
-      dk_s[tid] = kd.z;
-    }
-    for (int j = int(sg_u); j < rows && c0 + j < keep; j += SG) {
-      const device T* krow = reinterpret_cast<const device T*>(gdn_buffered_row(
-          key_slab, pages, c0 + j, page_tokens, page_bytes, key_row_bytes));
-      const float kinv = dots[c0 + j].x;
-      const float4 kr4 = float4(*reinterpret_cast<const device vec<T, 4>*>(
-          krow + size_t(hk) * D + size_t(PER * lane)));
-      for (int i = 0; i < PER; ++i) {
-        kn_s[j][PER * lane + i] = kr4[i] * kinv;
+    if (table_rows == 0u) {
+      // A short carry (no table made): each row's reductions here, a
+      // simdgroup a row side by side, from the own row's staged normed q
+      // and k; a row that folds stages its normed key.
+      for (int j = int(sg_u); j < rows; j += SG) {
+        const device T* krow = reinterpret_cast<const device T*>(gdn_buffered_row(
+            key_slab, pages, c0 + j, page_tokens, page_bytes, key_row_bytes));
+        const float4 kr4 = float4(*reinterpret_cast<const device vec<T, 4>*>(
+            krow + size_t(hk) * D + size_t(PER * lane)));
+        float rs = 0.0f;
+        for (int i = 0; i < PER; ++i) {
+          rs += kr4[i] * kr4[i];
+        }
+        const float rinv = metal::rsqrt(gdn_row_sum<32>(rs) + 1e-6f);
+        float dq = 0.0f, dk = 0.0f;
+        for (int i = 0; i < PER; ++i) {
+          const float k = kr4[i] * rinv;
+          dq += k * q_s[PER * lane + i];
+          dk += k * k_s[PER * lane + i];
+          if (c0 + j < keep) {
+            kn_s[j][PER * lane + i] = k;
+          }
+        }
+        dq = gdn_row_sum<32>(dq);
+        dk = gdn_row_sum<32>(dk);
+        if (lane == 0) {
+          kinv_c[j] = rinv;
+          dq_s[j] = dq;
+          dk_s[j] = dk;
+        }
+      }
+    } else {
+      // Each row's reductions from the per-head table (made once a lane
+      // and key head); a row that folds stages its normed key.
+      const device float4* dots = table + (size_t(lane0 + r) * size_t(k_heads) + size_t(hk)) * table_rows;
+      if (tid < rows) {
+        const float4 kd = dots[c0 + tid];
+        kinv_c[tid] = kd.x;
+        dq_s[tid] = kd.y;
+        dk_s[tid] = kd.z;
+      }
+      for (int j = int(sg_u); j < rows && c0 + j < keep; j += SG) {
+        const device T* krow = reinterpret_cast<const device T*>(gdn_buffered_row(
+            key_slab, pages, c0 + j, page_tokens, page_bytes, key_row_bytes));
+        const float kinv = dots[c0 + j].x;
+        const float4 kr4 = float4(*reinterpret_cast<const device vec<T, 4>*>(
+            krow + size_t(hk) * D + size_t(PER * lane)));
+        for (int i = 0; i < PER; ++i) {
+          kn_s[j][PER * lane + i] = kr4[i] * kinv;
+        }
       }
     }
     // Four of a row's values a thread, one load (GROUP_ROWS is a multiple
