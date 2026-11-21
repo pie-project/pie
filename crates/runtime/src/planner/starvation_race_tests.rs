@@ -9033,3 +9033,90 @@ async fn a_bind_suspended_restore_is_sent_only_where_its_whole_placement_stands(
         planner.debug_queue()
     );
 }
+
+/// The M1 on 7e75af541 hung 9 s after ready: a bind head short of two runs
+/// of nine, 342 processes resident between fires holding 356 chunks, and
+/// the map's candidates 0, "no pick: the policy is asked", nothing in
+/// flight. Those processes had bound (their guest state on the device)
+/// and waited for an execution seat: not admitted, they were never
+/// victims. With nothing in flight such a process runs nothing: it is a
+/// victim like any other; with something in flight it is still spared.
+#[test]
+fn with_nothing_in_flight_a_process_not_yet_admitted_is_a_victim() {
+    let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::new(8))));
+    let (head, seated_later, other) = (ProcessId::new_v4(), ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [head, seated_later, other] {
+        planner.register(pid);
+    }
+    planner.note_admitted(head);
+    planner.note_admitted(other);
+    planner.with_inner(|inner| {
+        inner.enqueue(
+            head,
+            WaitKind::BindRoom {
+                run: 9,
+                pieces: 2,
+                pages: 18,
+                notify: Arc::new(Notify::new()),
+                served: false,
+                withdrawn: false,
+                rise: None,
+            },
+        );
+    });
+    let members = |planner: &ResidencyPlanner| {
+        planner
+            .victim_set()
+            .map(|set| set.members.iter().map(|v| v.pid).collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+    let fire = planner.fire_in_flight(other);
+    assert!(!members(&planner).contains(&seated_later), "something in flight: spared");
+    drop(fire);
+    assert!(
+        members(&planner).contains(&seated_later),
+        "nothing in flight: a victim, admitted or not"
+    );
+}
+
+/// Mac Pro at 2 GiB on dc1414ae8: "an eviction waits for its sets' fires
+/// pid=8d961f69 ... capped=rows=112 owner=Some(8d961f69)": the owner of
+/// a frame cut wider than the cap was evicted, and its eviction waited on
+/// that frame, which goes only once raised. Such a process is no victim
+/// while its frame waits.
+#[test]
+fn the_owner_of_a_capped_frame_is_no_victim() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_write();
+    let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::new(8))));
+    let (head, capped, other) = (ProcessId::new_v4(), ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [head, capped, other] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    planner.with_inner(|inner| {
+        inner.enqueue(
+            head,
+            WaitKind::BindRoom {
+                run: 2,
+                pieces: 1,
+                pages: 2,
+                notify: Arc::new(Notify::new()),
+                served: false,
+                withdrawn: false,
+                rise: None,
+            },
+        );
+    });
+    let members = |planner: &ResidencyPlanner| {
+        planner
+            .victim_set()
+            .map(|set| set.members.iter().map(|v| v.pid).collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+    assert!(members(&planner).contains(&capped), "a victim like any other");
+    crate::store::shared::owe_cut_rows(0, 112, Some(capped));
+    let with_capped = members(&planner);
+    crate::store::shared::owe_cut_rows(0, 0, None);
+    assert!(!with_capped.contains(&capped), "its frame waits on a raise: no victim");
+    assert!(with_capped.contains(&other));
+}

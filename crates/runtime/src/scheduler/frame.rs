@@ -323,6 +323,22 @@ impl FramePolicy {
             .map_or((0, None), |(rows, pid)| (rows, Some(pid)))
     }
 
+    /// The widest rung rows any fire queued in a lane's frames takes,
+    /// complete or still gathering: the rung is not lowered under them
+    /// (a frame still gathering when the lower was granted completed wider
+    /// than the cap, capped, and waited on a raise: Mac Pro at 2 GiB on
+    /// dc1414ae8, rows 112 under a cap of 64).
+    #[must_use]
+    pub fn queued_widest(&self) -> usize {
+        self.lanes
+            .values()
+            .flat_map(|lane| lane.frames.iter())
+            .flat_map(|frame| frame.fires.iter())
+            .map(|fire| fire.rung_rows)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// The widest rung rows a sealed frame still to go takes; 0 where none
     /// waits. The rung is not lowered under it until it has gone.
     #[must_use]
@@ -1758,6 +1774,21 @@ mod tests {
         policy.cap_fires(128);
         policy.on_fire_reading(stamp(lane, 0, 0, 1), Some(owner), 1, 1, 1, 1, 256);
         assert_eq!(policy.cut_owed_by(), (256, Some(owner)), "the owner, not the lane");
+    }
+
+    /// Mac Pro at 2 GiB on dc1414ae8: a frame still gathering when the
+    /// lower was granted completed 112 rows wide under a cap of 64. The
+    /// widest queued fire counts whether its frame is complete or not.
+    #[test]
+    fn a_frame_still_gathering_counts_toward_the_widest_queued() {
+        let mut policy =
+            FramePolicy::new(1, 64, 4096, None).with_submit_deadline(Duration::from_secs(86_400));
+        let (lane, owner) = (pid(), pid());
+        policy.cap_fires(64);
+        // One fire of two in: the frame is not complete.
+        policy.on_fire_reading(stamp(lane, 0, 0, 2), Some(owner), 1, 1, 1, 1, 112);
+        assert_eq!(policy.cut_owed_by().0, 0, "not complete: owes no raise yet");
+        assert_eq!(policy.queued_widest(), 112, "but the rung is not lowered under it");
     }
 
     /// The frame / eviction cycle (a process waited at admission behind a

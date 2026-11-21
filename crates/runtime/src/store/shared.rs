@@ -179,6 +179,15 @@ pub fn evacuate_refused(engine: usize, chunks: &[u32]) {
     ask_walk(engine);
 }
 
+/// How many of `chunks` `engine`'s pool found no free chunk below for
+/// ([`SharedPool::refusals_stuck`]).
+#[must_use]
+pub fn refusals_stuck(engine: usize, chunks: &[u32]) -> u32 {
+    crate::store::registry::try_get(0, engine)
+        .and_then(|stores| stores.shared)
+        .map_or(0, |shared| shared.lock().unwrap().refusals_stuck(chunks))
+}
+
 /// Whether any of `chunks` still waits for (or is in) its move down on
 /// `engine`'s pool ([`evacuate_refused`]).
 #[must_use]
@@ -894,6 +903,9 @@ pub struct SharedPool {
     /// Of those, the ones a move planned for them carries now, until the
     /// engine took its copy.
     refused_moving: BTreeSet<u32>,
+    /// Of those, the ones the last step found no free chunk below for: room
+    /// the planner is asked to make ([`Self::refusals_stuck`]).
+    refused_stuck: BTreeSet<u32>,
     /// The governor's segment target the walk steers this pool to, shared
     /// with it ([`target::SharedGrow`]); `None` where no walk steers it.
     walk_target: Option<Arc<std::sync::atomic::AtomicU32>>,
@@ -1152,6 +1164,7 @@ impl SharedPool {
             compact_for: None,
             refused: BTreeSet::new(),
             refused_moving: BTreeSet::new(),
+            refused_stuck: BTreeSet::new(),
             walk_target: None,
             programs: programs::ProgramFires::default(),
             engine: None,
@@ -2384,6 +2397,14 @@ impl SharedPool {
         self.refused.extend(chunks.iter().copied());
     }
 
+    /// How many of `chunks` the last step found no free chunk below for:
+    /// the free chunks the planner must make for them.
+    #[must_use]
+    pub fn refusals_stuck(&self, chunks: &[u32]) -> u32 {
+        u32::try_from(chunks.iter().filter(|chunk| self.refused_stuck.contains(chunk)).count())
+            .unwrap_or(u32::MAX)
+    }
+
     /// Whether any of `chunks` still waits for its move down, or is being
     /// moved: a fire refused for it is held until none is.
     #[must_use]
@@ -2403,21 +2424,20 @@ impl SharedPool {
         }
         let chunks: Vec<u32> = std::mem::take(&mut self.refused).into_iter().collect();
         let moves = self.pool.plan_moves_of(&chunks);
+        // What found no free chunk below (and is still held) waits for the
+        // room the planner is asked to make ([`Self::refusals_stuck`]);
+        // what is no longer held is no longer waited for.
+        let moved: BTreeSet<u32> = moves.iter().map(|step| step.logical).collect();
+        let stuck: BTreeSet<u32> = chunks
+            .iter()
+            .copied()
+            .filter(|chunk| !moved.contains(chunk) && self.pool.holds_chunk(*chunk))
+            .collect();
+        self.refused.extend(stuck.iter().copied());
+        self.refused_stuck = stuck;
         if moves.is_empty() {
-            // Nothing of them held now, or no free chunk below: what moved
-            // nothing is no longer waited for if no longer held; else it
-            // waits for room.
-            let held: Vec<u32> = chunks
-                .into_iter()
-                .filter(|&chunk| self.pool.holds_chunk(chunk))
-                .collect();
-            self.refused.extend(held);
             return None;
         }
-        // What found no free chunk below waits for the next step.
-        let moved: BTreeSet<u32> = moves.iter().map(|step| step.logical).collect();
-        self.refused
-            .extend(chunks.iter().copied().filter(|chunk| !moved.contains(chunk) && self.pool.holds_chunk(*chunk)));
         self.pool
             .apply_compaction(&moves, epoch)
             .expect("a move planned under the lock applies");

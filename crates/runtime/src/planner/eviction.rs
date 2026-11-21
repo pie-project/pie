@@ -426,12 +426,22 @@ impl ResidencyPlanner {
             } else {
                 0
             };
+            // Every resident left out for a block its move set (room
+            // below short, or nothing found to move) is said as the end,
+            // not as the policy's: lifted by the event that ends its cause
+            // ([`Self::lapse_blocks`]).
+            let blocked = self.with_inner(|inner| {
+                victims.members.is_empty()
+                    && !(inner.host_swap_blocked.is_empty() && inner.prepare_blocked.is_empty())
+            });
             self.plan_ended(
                 victims.head,
-                if unhostable.is_empty() {
-                    "no pick: the policy is asked"
-                } else {
+                if !unhostable.is_empty() {
                     "every pick unhostable: the policy is asked"
+                } else if blocked {
+                    "every candidate blocked: its move found no room below or nothing to move"
+                } else {
+                    "no pick: the policy is asked"
                 },
                 host_short,
                 &unhostable,
@@ -577,6 +587,13 @@ impl ResidencyPlanner {
             // Read once for every member, each only where some member
             // needs it: per member, the anti-thrash rule's own reads (the
             // queue, then every process) cost a pass tenfold.
+            // A process whose frame waits for a raise (cut wider than the
+            // cap) is no victim: its eviction waits on that frame, which
+            // goes only once raised (Mac Pro at 2 GiB on dc1414ae8: the
+            // capped frame's owner evicted, its eviction waiting on its own
+            // frame for good).
+            let capped_owner = crate::store::shared::owed_by(self.port.locus().1)
+                .filter(|_| crate::store::shared::owed_cut_rows(self.port.locus().1) > 0);
             let quiet_cell = std::cell::OnceCell::new();
             let quiet = || *quiet_cell.get_or_init(|| inner.nothing_in_flight());
             let waiting_cell = std::cell::OnceCell::<HashSet<ProcessId>>::new();
@@ -600,8 +617,15 @@ impl ResidencyPlanner {
                     // waiting is "bind waiting" as its victims are, and
                     // picked, it evicted itself, came back, and was evicted
                     // again (the M1: three times over, itself first).
+                    // Not admitted to run yet (waiting for its execution
+                    // seat after its bind): with nothing in flight it runs
+                    // nothing and holds what its bind took, a victim like
+                    // any other. Left out, the M1 on 7e75af541 stalled with
+                    // 342 such processes holding 356 chunks and no
+                    // candidate (candidates=0, "no pick").
                     **pid != waiter.pid
-                        && proc.admitted
+                        && Some(**pid) != capped_owner
+                        && (proc.admitted || quiet())
                         // On its way into a process: it was asked back.
                         && (!proc.holder || proc.idle)
                         // Waiting at a bind for room, it makes no progress

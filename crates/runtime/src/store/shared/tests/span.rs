@@ -1016,3 +1016,28 @@ fn a_refused_chunk_moves_down_and_its_fires_wait_for_the_copy() {
     );
     pool.pool().check();
 }
+
+/// A refused chunk with no free chunk below for it: its move waits, and
+/// the pool says how many free chunks it lacks, which the scheduler asks
+/// the planner to make (a need like any other, never a silent wait).
+#[test]
+fn a_refused_chunk_with_no_room_below_says_the_chunks_it_lacks() {
+    let mut pool = grow_pool(true, false);
+    assert!(pool.pool().open_chunks().is_empty(), "no free chunk open for state");
+    let records = state_chunks(&pool, &[0]);
+    let logical: Vec<u32> = records
+        .iter()
+        .map(|&chunk| pool.pool().chunk_table().iter().position(|&p| p == chunk).unwrap() as u32)
+        .collect();
+    pool.refuse_chunks(&logical);
+    assert!(
+        !matches!(pool.next_move(pool.mapped_segments(), 1), Some(SegmentMove::Compact { .. })),
+        "no move without a free chunk below"
+    );
+    assert!(pool.refusals_pending(&logical), "it still waits");
+    assert_eq!(
+        pool.refusals_stuck(&logical),
+        u32::try_from(logical.len()).unwrap(),
+        "the chunks it lacks"
+    );
+}

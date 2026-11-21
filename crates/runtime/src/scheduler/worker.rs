@@ -716,6 +716,8 @@ struct HeldForPlacement {
     /// Fired again one by one: refused again after the move landed, so
     /// only the fires the engine still refuses alone fail.
     solo: bool,
+    /// The planner was asked for the free chunks its move lacks.
+    funding: bool,
 }
 
 enum ControlSlotState {
@@ -1625,7 +1627,7 @@ impl BatchScheduler {
                 .iter()
                 .all(|batch| batch.rung_rows <= cap as usize)
                 && frame_policy.sealed_widest() <= cap as usize
-                && frame_policy.cut_owed_by().0 <= cap as usize
+                && frame_policy.queued_widest() <= cap as usize
             {
                 crate::store::shared::grant_rung(engine_id, cap);
             }
@@ -2926,9 +2928,39 @@ impl BatchScheduler {
         pending: &mut PendingQueue,
         engine_id: EngineId,
     ) -> bool {
-        let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(held)
+        let (ready, mut waiting): (Vec<_>, Vec<_>) = std::mem::take(held)
             .into_iter()
             .partition(|batch| !crate::store::shared::refusals_pending(engine_id, &batch.chunks));
+        // A move that found no free chunk below for some of its chunks is a
+        // need like any other: the planner is asked for that many free
+        // chunks, funded as a bind's room (idle cache, parked state down,
+        // residents moved), never a silent wait.
+        for batch in waiting.iter_mut().filter(|batch| !batch.funding) {
+            let stuck = crate::store::shared::refusals_stuck(engine_id, &batch.chunks);
+            let owner = batch.requests.iter().find_map(|request| request.process_id);
+            if stuck == 0 {
+                continue;
+            }
+            let Some(owner) = owner else {
+                continue;
+            };
+            let Some(planner) = crate::planner::planner_for(0, engine_id) else {
+                continue;
+            };
+            batch.funding = true;
+            tracing::debug!(
+                engine_id,
+                %owner,
+                stuck,
+                "scheduler: a refused chunk's move lacks free chunks below: the planner makes them"
+            );
+            crate::rt::spawn(async move {
+                if let Err(error) = planner.wait_bind_room(owner, 1, stuck).await {
+                    tracing::warn!(%owner, %error, "scheduler: the room for a refused chunk's move was refused");
+                }
+                crate::store::shared::ask_walk(engine_id);
+            });
+        }
         *held = waiting;
         if ready.is_empty() {
             return false;
@@ -3018,6 +3050,7 @@ impl BatchScheduler {
                             chunks: retired.placement,
                             requests: retired.requests,
                             solo: repeat,
+                            funding: false,
                         });
                         progress = true;
                         continue;
