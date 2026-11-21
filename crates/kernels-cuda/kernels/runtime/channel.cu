@@ -1062,29 +1062,42 @@ __global__ void beam_step(const BeamStepRun* __restrict__ runs, u32 run_count)
             l.pages[l.from + e] = l.bases[at];
         }
     }
-    // §11.3: the group's common slot, the first column its live beams' lists
-    // name different pages at (whole shared pages only), capped at the slot
-    // past this fire's rows; monotone, read by the host at harvest.
-    __shared__ u32 first_apart;
-    if (threadIdx.x == 0u) first_apart = c + 1u;
+    // The group's common slot (BEAM-PAGE-LISTS §11.3, §11.4): the depth of
+    // its live lanes' most recent common ancestor, whatever the guest forks
+    // them for. `lca[i][j]` holds, for lanes i != j, the slot below which
+    // their rows agree: lanes forked from one parent agree below this fire's
+    // row (counted as parting there: a lower bound, exact when their inputs
+    // differ); others agree as far as their parents did. Every row below the
+    // least of them was written once and reached the other lanes only by
+    // copies: the same bytes in every lane. Capped at the slot past this
+    // fire's rows (with one lane every row is common), never below the
+    // folded slot; monotone, read by the host at harvest.
+    u32* lca = copies + 3u * B;
+    __shared__ u32 lca_new[PIE_BEAM_MAX_LANES * PIE_BEAM_MAX_LANES];
+    __shared__ u32 common;
+    if (threadIdx.x == 0u) common = r.slot + 1u;
     __syncthreads();
-    for (u32 j = threadIdx.x; j <= c && j < cap; j += blockDim.x) {
-        const u32 page = map_new[j];
-        for (u32 b = 1u; b < B; ++b) {
-            if (map_new[b * cap + j] != page) {
-                atomicMin(&first_apart, j);
-                break;
+    for (u32 x = threadIdx.x; x < B * B; x += blockDim.x) {
+        const u32 i = x / B, j = x % B;
+        u32 depth = 0xffffffffu;
+        if (i != j) {
+            if (primed == 0u) {
+                depth = r.slot;
+            } else {
+                const u32 pi = parent_of[i], pj = parent_of[j];
+                depth = pi == pj ? r.slot : lca[pi * B + pj];
             }
+            atomicMin(&common, depth);
         }
+        lca_new[x] = depth;
     }
     __syncthreads();
+    for (u32 x = threadIdx.x; x < B * B; x += blockDim.x) lca[x] = lca_new[x];
     if (threadIdx.x == 0u) {
         header[0] = 1u;
         header[1] = fired + 1u;
         header[2] = Q;
-        const u64 shared_end = (static_cast<u64>(f0) + first_apart) * S;
-        const u64 end = static_cast<u64>(r.slot) + 1u;
-        header[3] = static_cast<u32>(shared_end < end ? shared_end : end);
+        header[3] = common > r.folded ? common : r.folded;
     }
 }
 
