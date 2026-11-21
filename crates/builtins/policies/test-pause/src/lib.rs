@@ -17,9 +17,9 @@ impl worker::Policy for Pause {
             .into_iter()
             .map(|p| {
                 let process = Subject::Process(p.clone());
-                let window = prop(&process, "pause-at-ms").int().and_then(|at| {
+                let window = whole(&process, "pause-at-ms").and_then(|at| {
                     let from = attr(&process, "arrival-ms").int()?.saturating_add(at);
-                    let length = prop(&process, "pause-for-ms").int().unwrap_or(1000);
+                    let length = whole(&process, "pause-for-ms").unwrap_or(1000);
                     Some((from, from.saturating_add(length)))
                 });
                 let paused = match window {
@@ -42,6 +42,20 @@ impl worker::Policy for Pause {
         if let Some(at) = next {
             set_alarm(u64::try_from(at).unwrap_or(0));
         }
+    }
+}
+
+/// The integer prop `name` of `process`: none where it states none; one it
+/// states as anything but an integer (a string `"300"`, a float) is refused
+/// by name, a trap the host reports, never a pause silently skipped.
+fn whole(process: &Subject, name: &str) -> Option<i64> {
+    let stated = prop(process, name);
+    if !stated.is_some() {
+        return None;
+    }
+    match stated.int() {
+        Some(ms) => Some(ms),
+        None => panic!("test-pause: the prop {name} must be an integer (ms), as `{name}: 300`"),
     }
 }
 
