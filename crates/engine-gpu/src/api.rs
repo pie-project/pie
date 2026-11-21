@@ -298,12 +298,17 @@ impl<B: Host> Gpu<B> {
             per_layer_ms = per_layer / 1e6,
             worst = held.worst,
             probe_scale = held.scale,
-            measured_worst = held.measured.worst(),
-            measured_fires = held.measured.len(),
+            measured_worst = held
+                .measured_rung(rows)
+                .map_or_else(|| held.measured.worst(), |rung| held.measured.worst_of(rung)),
+            measured_fires = held
+                .measured_rung(rows)
+                .map_or_else(|| held.measured.len(), |rung| held.measured.len_of(rung)),
             stored_ratio = held.stored_ratio(),
-            error = held.error_now(),
+            measured_rung = ?held.measured_rung(rows),
+            error = held.error_for(rows),
             floor_factor = held.floor_factor(),
-            ratio = held.ratio_now(),
+            ratio = held.ratio_for(rows),
             bound_ms = held.bound_ns / 1e6,
             split = admitted.split(),
             refused = matches!(admitted, crate::submit::Admitted::Refused { .. }),
@@ -346,51 +351,33 @@ impl<B: Host> Gpu<B> {
         None
     }
 
-    /// Under a stated submit bound, `step` cut by the rows of its one
-    /// prompt lane where it is past the bound even a layer at a time
-    /// (`crate::submit::row_pieces`): its leading pieces and its last, each
-    /// admitted ([`SubmitBound::rows_a_piece`]). `None` where it is
-    /// admitted as it is, where no bound is stated, or where it cannot be
-    /// cut (then refused by name as it is admitted, the reason said here).
-    ///
-    /// [`SubmitBound::rows_a_piece`]: crate::submit::SubmitBound::rows_a_piece
-    fn cut_by_rows(&mut self, step: &Step) -> Option<(Vec<Step>, Step)> {
+    /// Under a stated submit bound, where `step` is past it even a layer at
+    /// a time: the piece to fire before it and the rest, cut at the ratio
+    /// read now (`crate::submit::next_cut`). `None` where it is admitted as
+    /// it is, where no bound is stated, or where it cannot be cut (then
+    /// refused by name as it is admitted, the reason said here).
+    fn next_piece(&mut self, step: &Step) -> Option<(Step, Step)> {
         let shell = self.shell.as_mut()?;
         shell.track();
         let held = shell.submit_bound()?;
         let rows = crate::submit::StepRows::of(step);
-        if !matches!(held.admit(rows), crate::submit::Admitted::Refused { .. }) {
-            return None;
-        }
-        let prompt_rows = step
-            .lanes
-            .iter()
-            .map(engine::fire::Lane::rows)
-            .filter(|&rows| rows > 1)
-            .max()?;
-        let Some(piece_rows) = held.rows_a_piece(rows, prompt_rows) else {
-            tracing::warn!(
-                rows = rows.rows,
-                keys = rows.keys,
-                "submit bound: one row of one layer of a step is past the bound; refused by name"
-            );
-            return None;
-        };
-        match crate::submit::row_pieces(step, &shell.trace().facts, piece_rows) {
-            Ok(cut) => {
+        match crate::submit::next_cut(held, step, &shell.trace().facts) {
+            Ok(None) => None,
+            Ok(Some((piece, rest, piece_rows))) => {
                 tracing::debug!(
                     rows = rows.rows,
+                    lanes = rows.lanes,
                     keys = rows.keys,
                     piece_rows,
-                    pieces = cut.0.len() + 1,
-                    ratio = held.ratio_now(),
-                    "submit bound: a step past the bound a layer at a time cut by rows"
+                    ratio = held.ratio_for(rows),
+                    "submit bound: a step past the bound a layer at a time: a piece cut by rows"
                 );
-                Some(cut)
+                Some((piece, rest))
             }
             Err(why) => {
                 tracing::warn!(
                     rows = rows.rows,
+                    lanes = rows.lanes,
                     keys = rows.keys,
                     %why,
                     "submit bound: a step past the bound a layer at a time cannot be cut by rows; \
@@ -1608,17 +1595,23 @@ where
             // to the bound in turn; a step no row of which fits, or that
             // cannot be cut, has its lanes refused by name. Nothing is
             // estimated where no bound is stated.
-            let cut = self.cut_by_rows(step);
+            let mut rest: Option<Step> = None;
             let mut piece_failed = None;
-            for piece in cut.iter().flat_map(|(leading, _)| leading) {
-                if self.admit_step(piece, at).is_some() {
+            loop {
+                let current = rest.as_ref().unwrap_or(step);
+                // The first piece at the ratio read now: the pieces landed
+                // before move it (`crate::submit::Measured`).
+                let Some((piece, after)) = self.next_piece(current) else {
+                    break;
+                };
+                if self.admit_step(&piece, at).is_some() {
                     // Chosen to fit: refused only past what was weighed;
                     // the step is refused as a whole, by name.
-                    piece_failed = self.admit_step(step, at);
+                    piece_failed = self.admit_step(current, at);
                     break;
                 }
                 // A piece tells no completion: the step's last piece does.
-                let fired = self.fire_step(piece, at, true, None);
+                let fired = self.fire_step(&piece, at, true, None);
                 if let Some(shell) = self.shell.as_mut() {
                     shell.split_next(false);
                     shell.estimate_next(None);
@@ -1627,6 +1620,7 @@ where
                     piece_failed = Some(error);
                     break;
                 }
+                rest = Some(after);
             }
             if let Some(error) = piece_failed {
                 if error.stops_frame_at(index) {
@@ -1637,7 +1631,7 @@ where
                 self.count_built();
                 return Err(error);
             }
-            let step = cut.as_ref().map_or(step, |(_, last)| last);
+            let step = rest.as_ref().unwrap_or(step);
             if let Some(refused_lanes) = self.admit_step(step, at) {
                 if refused_lanes.stops_frame_at(index) {
                     refused = Some(refused_lanes);
