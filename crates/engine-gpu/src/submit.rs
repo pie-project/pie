@@ -382,6 +382,11 @@ pub struct SubmitBound {
     /// ([`Measured`]): an estimate is read at the worst of them where it
     /// passes the worst ratio times the scale ([`SubmitBound::ratio_now`]).
     pub measured: Measured,
+    /// The GPU's clock table, where the platform states it
+    /// ([`crate::clock`]): every estimate (timed at full clock) is read at
+    /// its floor ([`SubmitBound::floor_factor`]), so a fire fits the bound
+    /// even where the clock drops to its least inside it.
+    pub clock: Option<crate::clock::ClockRange>,
 }
 
 /// Where a serving fire's device time is read from under a stated submit
@@ -585,7 +590,25 @@ impl SubmitBound {
     /// 1.
     #[must_use]
     pub fn ratio_now(&self) -> f64 {
+        self.error_now() * self.floor_factor()
+    }
+
+    /// The estimate's error now: the stored ratio, or the worst measured
+    /// where it passes that; at least 1.
+    #[must_use]
+    pub fn error_now(&self) -> f64 {
         self.stored_ratio().max(self.measured.worst())
+    }
+
+    /// How much longer a fire timed at full clock runs at the GPU's least
+    /// clock, its table's greatest over its least ([`crate::clock`]); 1
+    /// where the platform states no table.
+    #[must_use]
+    pub fn floor_factor(&self) -> f64 {
+        self.clock
+            .as_ref()
+            .map_or(1.0, crate::clock::ClockRange::floor_factor)
+            .max(1.0)
     }
 
     /// The stored ratio: the worst ratio the rates step measured times the
@@ -690,7 +713,8 @@ impl SubmitBound {
              estimate: the worst ratio {:.3} the rates step measured, `[rates] \
              submit_worst_ratio`, times the clock's scale {:.3} its last probe read, or the \
              worst ratio {:.3} measured over the {} fires landed within the last bound where \
-             it passes that), past the \
+             it passes that, times the floor factor {:.2} of the GPU's clock table {}), past \
+             the \
              platform's stated bound of {:.0} ms on one GPU submission \
              (engine_gpu::rates::stated_submit_bound); the widest prefill rung this load lays \
              is {} rows",
@@ -705,6 +729,10 @@ impl SubmitBound {
             self.scale,
             self.measured.worst(),
             self.measured.len(),
+            self.floor_factor(),
+            self.clock
+                .as_ref()
+                .map_or_else(|| "(none read)".to_string(), ToString::to_string),
             self.bound_ns / 1e6,
             self.rungs.last().copied().unwrap_or(0),
         )
@@ -775,6 +803,7 @@ mod tests {
             prefixed: Vec::new(),
             scale: 1.0,
             measured: Measured::default(),
+            clock: None,
         }
     }
 
@@ -993,6 +1022,59 @@ mod tests {
         b.landed(t0 + ms(10_000), fire, (fire * 2.3) as u64);
         let probed = SubmitBound { scale: 1.2, ..b };
         assert!((probed.ratio_now() - worst * 1.2).abs() < 1e-6);
+    }
+
+    /// The field's lost fire: a prompt step estimated at ~1643 ms at the
+    /// worst ratio (82% of KGSL's 2 s, a layer to spare) went out whole and
+    /// the GPU's cap fell 1300 to 578 MHz inside it. With the Adreno 840's
+    /// clock table (160 to 1300 MHz) stated, every estimate is read at its
+    /// floor: the step splits a layer at a time, each submission within the
+    /// bound even at 160 MHz; a decode step stays whole.
+    #[test]
+    fn a_clock_table_holds_each_submission_to_the_bound_at_its_floor() {
+        let at_one = bound(1.0);
+        let step = prompt(256, 1024);
+        let (raw, _) = at_one.raw_ns(step);
+        let worst = 2.062;
+        let unclocked = SubmitBound {
+            worst,
+            bound_ns: raw * worst / 0.8215,
+            ..at_one
+        };
+        let (whole, _) = unclocked.step_ns(step);
+        assert!((whole / unclocked.bound_ns - 0.8215).abs() < 1e-9);
+        assert!(matches!(unclocked.admit(step), Admitted::Whole { .. }));
+        assert_eq!(unclocked.floor_factor(), 1.0);
+        let table = crate::clock::ClockRange::stated(160_000_000, 1_300_000_000);
+        let clocked = SubmitBound {
+            clock: Some(table),
+            ..unclocked.clone()
+        };
+        assert!((clocked.floor_factor() - 8.125).abs() < 1e-9);
+        assert!((clocked.ratio_now() - worst * 8.125).abs() < 1e-9);
+        let Admitted::Layers {
+            per_submission,
+            submissions,
+            ..
+        } = clocked.admit(step)
+        else {
+            panic!("split a layer at a time: {:?}", clocked.admit(step));
+        };
+        assert_eq!(submissions, clocked.layers);
+        assert!(per_submission <= clocked.bound_ns, "{per_submission} past the bound");
+        let subs = frame_submissions(&[shaped(&clocked, step)], clocked.layers, clocked.bound_ns)
+            .expect("every submission fits");
+        assert!(subs.iter().all(|&(_, ns)| ns <= clocked.bound_ns));
+        let why = clocked.refusal(step, &clocked.admit(step));
+        assert!(why.contains("floor factor 8.12"), "{why}");
+        // A decode step, tiny, stays whole at the floor.
+        let decode = StepRows {
+            rows: 1,
+            lanes: 1,
+            keys: 1024,
+            prompt: false,
+        };
+        assert!(matches!(clocked.admit(decode), Admitted::Whole { .. }));
     }
 
     /// A fire's device time reads nothing until its backend fills it, then

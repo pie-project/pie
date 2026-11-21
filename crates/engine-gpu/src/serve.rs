@@ -1749,6 +1749,7 @@ impl<B: Serve> Shell<B> {
                     rungs: span.rungs().iter().map(|rung| rung.tokens).collect(),
                     scale: 1.0,
                     measured: crate::submit::Measured::default(),
+                    clock: None,
                 };
                 // Each serving fire's device time, read once it lands, moves
                 // the scale its successors are read at
@@ -1761,9 +1762,31 @@ impl<B: Serve> Shell<B> {
                 } else {
                     None
                 };
+                // The GPU's clock table, where the platform states it: every
+                // estimate is read at its floor (`crate::clock`), read once,
+                // here. Where none is readable that is said, and the
+                // measured ratios alone hold a step.
+                let mut held = held;
+                match crate::clock::ClockRange::read() {
+                    Ok(range) => {
+                        tracing::info!(
+                            "submit bound {} ms; GPU clock table {range} -> floor factor {:.2}",
+                            bound.as_millis(),
+                            range.floor_factor()
+                        );
+                        held.clock = Some(range);
+                    }
+                    Err(why) => tracing::info!(
+                        "submit bound {} ms; {why}: no floor factor, each step held at the \
+                         measured ratios alone",
+                        bound.as_millis()
+                    ),
+                }
                 tracing::info!(
                     bound_ms = bound.as_millis() as u64,
                     fire_timing = timing.map(|t| t.to_string()),
+                    clock = held.clock.as_ref().map(ToString::to_string),
+                    floor_factor = held.floor_factor(),
                     worst = held.worst,
                     worst_measured_this_load = device_profile.tuned().measured_this_load,
                     layers = held.layers,

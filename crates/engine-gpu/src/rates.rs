@@ -1173,8 +1173,19 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     // timed (the device loaded for the whole step, past the drop a phone's
     // clock takes some seconds in), its settled rate against the warm-up's.
     // The margin a serving step is held to carries the drop as measured
-    // (an Adreno 840 halved its clock ~10 s into load).
-    let sustained = if max_submit.is_some() {
+    // (an Adreno 840 halved its clock ~10 s into load). Where the platform
+    // states the GPU's clock table, a serving step is held at its floor
+    // (`crate::clock`), which covers any drop: the margin is the estimate's
+    // error alone, and the sustained drop is not measured.
+    let clock_table = crate::clock::ClockRange::read().ok();
+    if let (Some(_), Some(range)) = (max_submit, &clock_table) {
+        say(&format!(
+            "[rates]: sustained: not measured; a serving step is held at the floor of the GPU's \
+             clock table {range} (x{:.2})",
+            range.floor_factor()
+        ));
+    }
+    let sustained = if max_submit.is_some() && clock_table.is_none() {
         // Rotated as the warm-up rotated it: each fire its own submission,
         // admitted at the worst ratio the warm-up's walk measured (not at
         // the step's own worst since, which its micro-shapes' host latency

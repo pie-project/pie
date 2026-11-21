@@ -301,6 +301,8 @@ impl<B: Host> Gpu<B> {
             measured_worst = held.measured.worst(),
             measured_fires = held.measured.len(),
             stored_ratio = held.stored_ratio(),
+            error = held.error_now(),
+            floor_factor = held.floor_factor(),
             ratio = held.ratio_now(),
             bound_ms = held.bound_ns / 1e6,
             split = admitted.split(),
