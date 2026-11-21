@@ -3454,3 +3454,60 @@ fn a_restore_whose_bind_runs_are_held_for_it_finds_them() {
         "to its own, it is"
     );
 }
+
+/// A held part (an instance stating resident bytes, its place held whole)
+/// parks on the host tier and comes back as it left: copied out and back,
+/// into a fresh run of the same shape on the device, and the rebind names
+/// that place. The host's slots are only where it lies meanwhile: its
+/// holding and its shape go with it, or it came back as plain slots and
+/// the rebind named no place.
+#[test]
+fn a_held_part_round_trips_through_the_host_with_its_place_named() {
+    let Pools { roles, .. } = pools(64);
+    let mut engine = GuestEngine::new(40 * SLOT, 0);
+    engine.state.resident = 5 * SLOT;
+    let id = bind(&roles, &mut engine, 1).unwrap();
+    let bound = engine.bindings[0].scratch.clone();
+    let ScratchPlace::Run { slots, .. } = bound else {
+        panic!("a place two of which share a chunk lies in a run of slots: {bound:?}");
+    };
+    assert_eq!(slots, 45);
+    let was = refs_of(&bound);
+
+    let park = roles.lock().unwrap().prepare_park(holder(1)).expect("it parks");
+    let out: Vec<u32> = park.copies().iter().flat_map(|copy| copy.device.clone()).collect();
+    assert!(!park.copies().is_empty() && park.copies().iter().all(|copy| !copy.disk), "the host tier holds it");
+    assert!(was.iter().all(|slot| out.contains(slot)), "the held place copied out whole");
+    roles.lock().unwrap().commit(park);
+
+    // Its room is another's meanwhile: it must come back elsewhere.
+    let mut other = GuestEngine::new(4000 * SLOT, 0);
+    other.next = 100;
+    bind(&roles, &mut other, 2).unwrap();
+    let others = refs_of(&other.bindings[0].scratch);
+
+    let unpark = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(1))
+        .unwrap()
+        .expect("it unparks");
+    let back: Vec<u32> = unpark.copies().iter().flat_map(|copy| copy.device.clone()).collect();
+    roles.lock().unwrap().commit(unpark);
+    let stale = roles.lock().unwrap().stale(holder(1));
+    let Some(Rebind::Instance { id: rebound, scratch, .. }) = stale
+        .iter()
+        .find(|rebind| matches!(rebind, Rebind::Instance { .. }))
+        .cloned()
+    else {
+        panic!("its instance is rebound: {stale:?}");
+    };
+    assert_eq!(rebound, id);
+    assert!(
+        matches!(scratch, ScratchPlace::Run { slots: 45, .. }),
+        "it comes back a run of the same slots: {scratch:?}"
+    );
+    let now = refs_of(&scratch);
+    assert!(now.iter().all(|slot| back.contains(slot)), "the place its bytes were copied into");
+    assert!(now.iter().all(|slot| !others.contains(slot)), "not the other's");
+}

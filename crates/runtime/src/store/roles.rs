@@ -1961,7 +1961,13 @@ impl Roles {
                     ..part.clone()
                 })
             } else {
+                // Below the device, its slots anywhere; what it is (held,
+                // its runs' shape for the way back) goes with it.
                 self.take(on, part.role, part.refs.len() as u32, part.contiguous)
+                    .map(|taken| Part {
+                        refs: taken.refs,
+                        ..part.clone()
+                    })
             };
             match took {
                 Ok(part) => taken.push(part),
