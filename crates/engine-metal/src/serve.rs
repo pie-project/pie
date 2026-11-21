@@ -2719,8 +2719,13 @@ impl Shell {
     #[must_use]
     pub fn audit(&self) -> engine::memory::Audit {
         // The span is entered whole, backed or not: the bytes it has not
-        // backed yet are the device's too, as far as the ledger counts.
-        let unbacked = self.pools.span_reserved_bytes() - self.pools.span_held_bytes();
+        // backed yet are the device's too, as far as the ledger counts. The
+        // heaps kept spare for it back it as much as its mapped ones (the
+        // device holds both); counted unbacked too, they were counted twice.
+        let unbacked = self
+            .pools
+            .span_reserved_bytes()
+            .saturating_sub(self.pools.span_held_bytes() + self.pools.span_spare_bytes());
         self.ledger().audit(self.device.allocated() + unbacked)
     }
 
