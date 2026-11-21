@@ -1212,8 +1212,9 @@ pub struct Paged {
 /// per-head table's prepass. A load that buffers recurrent rows builds them
 /// before ready, a beam's long carry being one its warm walk does not reach.
 #[must_use]
-pub fn carried_pipelines() -> [Fire; 6] {
+pub fn carried_pipelines() -> [Fire; 7] {
     [
+        Fire::at(GDN_SCAN_FILE, "gated_delta_carried_short_bfloat16_s_8_v_4"),
         Fire::at("ssm/conv1d.metal", "causal_conv1d_carried_bfloat16"),
         Fire::at(GDN_SCAN_FILE, "gated_delta_group_fold_bfloat16"),
         Fire::at("ssm/conv1d.metal", "causal_conv1d_group_fold_bfloat16"),
@@ -1546,6 +1547,49 @@ pub fn gated_delta_carried(
     let z = v_heads
         .checked_mul(lanes)
         .ok_or_else(|| refuse(OP, "the value heads of every lane overflow a launch"))?;
+    // A carry of one chunk (a decode at its run-ahead lag): the fused
+    // step's tiling, each row's scalars once a threadgroup
+    // (new-memory/designs/carried-kernel.md §1), a head's value tiles over
+    // as many threadgroups as the lanes and heads leave room for.
+    if table.max_rep <= GDN_CARRIED_INLINE {
+        // Four value rows a simdgroup, as the scan step's, eight simdgroups
+        // a threadgroup: a head over four threadgroups. On the M1 at c1 / c4
+        // it beat 4 x 4, 8 x 2, 8 x 8, 8 x 16 and 2 x 16.
+        let (sg, vrows, name) = (8, 4, "gated_delta_carried_short_bfloat16_s_8_v_4");
+        return ctx.fire(
+            Fire::at(GDN_SCAN_FILE, name).apply(gated_delta_verify_grid(sg, vrows, z)),
+            &[
+                qkv.arg(),
+                indptr.arg(),
+                committed.replay.arg(),
+                committed.commit.arg(),
+                committed.slots.arg(),
+                stated(OP, committed.lane0)?.arg(),
+                gates.ba.arg(),
+                gates.a_log.arg(),
+                gates.dt_bias.arg(),
+                state.state.arg_mut(),
+                y.arg_mut(),
+                gates.gates.arg_mut(),
+                stated(OP, k_heads)?.arg(),
+                stated(OP, v_heads)?.arg(),
+                ba_paged.slab.arg_mut(),
+                ba_paged.pages.arg(),
+                ba_paged.page_tokens.arg(),
+                ba_paged.page_bytes.arg(),
+                ba_paged.row_bytes.arg(),
+                corrected.keys.arg_mut(),
+                corrected.key_row_bytes.arg(),
+                corrected.u.arg_mut(),
+                corrected.u_row_bytes.arg(),
+                state.segments.arg(),
+                ba_paged.page_ints.arg(),
+                table.table.arg(),
+                0u32.arg(),
+                committed.ext_replay.arg(),
+            ],
+        );
+    }
     // Each carried row's reductions, once a (lane, key head): the table
     // every value head and row group of the scan reads. A carry of one
     // chunk (a decode at its lag) makes them in the scan itself, a
