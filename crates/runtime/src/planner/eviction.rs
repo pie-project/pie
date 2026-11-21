@@ -17,6 +17,10 @@ use super::victim::{Victim, VictimSet};
 use super::wait::{EntryKey, WaitKind};
 use super::{ProcessId, ResidencyPlanner};
 
+/// Plan ends that wait for room something in flight gives back: chosen
+/// with nothing in flight, each is a planner bug ([`ResidencyPlanner::plan_ended`]).
+const WAITS_ON_FLIGHT: &[&str] = &["something in flight", "once more chunks stand free"];
+
 impl ResidencyPlanner {
     pub(super) fn quote_and_pick(
         &self,
@@ -443,34 +447,8 @@ impl ResidencyPlanner {
                 } else {
                     "the map stands the head and its own check refuses it (why=)"
                 };
-                // A wait for more room holds only while something in flight
-                // gives room back: with nothing in flight it is sent again
-                // now, on the placement that stands (Mac Pro at 2 GiB on
-                // f623134fc: quiet, its end "sent again once more chunks
-                // stand free", nothing to free one, stalled).
-                let quiet = stands && self.with_inner(|inner| inner.nothing_in_flight());
-                if quiet {
-                    self.with_inner(|inner| {
-                        if let Some(proc) = inner.procs.get_mut(&victims.head_pid) {
-                            proc.roles_short_stood = None;
-                            proc.roles_short_free = None;
-                        }
-                    });
-                }
-                self.plan_ended(
-                    victims.head,
-                    if quiet {
-                        "the head's placement stands, nothing in flight: sent again now"
-                    } else {
-                        end
-                    },
-                    host_short,
-                    &unhostable,
-                );
+                self.plan_ended(victims.head, end, host_short, &unhostable);
                 self.note_short(victims.head, 0, 0);
-                if quiet {
-                    self.poke();
-                }
                 return;
             }
             self.plan_ended(
@@ -526,7 +504,17 @@ impl ResidencyPlanner {
         let Some((run, _)) = need.longest() else {
             return;
         };
-        if self.store_stands(head, pid, need) {
+        // Standing where its last refusal was taken in this same room is
+        // no standing: the restore found otherwise there, and holding it
+        // for more room with nothing in flight lost its wake (Mac Pro at
+        // 2 GiB on f623134fc, twice). Its moves are named instead.
+        let refused_here = self.with_inner(|inner| {
+            inner.procs.get(&pid).is_some_and(|proc| {
+                proc.roles_short_stood == Some(true)
+                    && proc.roles_short_free.is_some_and(|left| self.port.free_chunks() <= left)
+            })
+        });
+        if !refused_here && self.store_stands(head, pid, need) {
             return;
         }
         let most = u32::try_from(map.free.len()).unwrap_or(u32::MAX) / run.max(1) + 1;
@@ -568,6 +556,20 @@ impl ResidencyPlanner {
     /// Records where the eviction plan for `head` stopped, for the stall
     /// dump ([`super::victim::PlanEnd`]).
     pub(super) fn plan_ended(&self, head: EntryKey, ended: &'static str, host_short: bool, unhostable: &[ProcessId]) {
+        // A head waits for room only while something in flight or moving
+        // gives room back (a fire, a copy, a restore landing): a wait so
+        // chosen with nothing in flight is a planner bug, said as one. Mac
+        // Pro at 2 GiB on f623134fc stalled twice on such an end.
+        if WAITS_ON_FLIGHT.iter().any(|wait| ended.contains(wait))
+            && self.with_inner(|inner| inner.nothing_in_flight())
+        {
+            self.stats.quiet_waits.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                ended,
+                "planner: a wait only something in flight could end, chosen with nothing in \
+                 flight (a planner bug: no step found)"
+            );
+        }
         self.with_inner(|inner| {
             inner.last_plan = Some(super::victim::PlanEnd {
                 head,

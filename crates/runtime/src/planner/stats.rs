@@ -51,6 +51,10 @@ pub struct PlannerStats {
     pub grow_waits: AtomicU64,
     /// Plans that ended waiting on a compaction of scattered free chunks.
     pub compaction_waits: AtomicU64,
+    /// Passes that chose a wait only something in flight could end, with
+    /// nothing in flight: each a planner bug, said as one
+    /// ([`super::ResidencyPlanner::plan_ended`]).
+    pub quiet_waits: AtomicU64,
     /// The unmet waiters behind the last plan's wait on a grow; 0 where it
     /// did not end on one.
     pub grow_parked: AtomicU64,

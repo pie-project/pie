@@ -9177,22 +9177,27 @@ async fn a_need_the_map_stands_twice_over_is_widened_until_moves_are_named() {
     );
 }
 
-/// Mac Pro at 2 GiB on f623134fc: a restore head whose placement stands,
-/// held back until more chunks stand free than its last refusal left, with
-/// nothing in flight to free one: its end said "sent again once more chunks
-/// stand free" and the run stalled. With nothing in flight it is sent again
-/// now.
+/// Mac Pro at 2 GiB on f623134fc, twice: a restore head whose placement
+/// stands where its last refusal was taken in the same room, held until
+/// more chunks stand free, nothing in flight to free one, stalled. A head
+/// waits for room only while something in flight gives it back: here its
+/// moves are named and made (the idle resident evicted), and no wait is
+/// chosen with nothing in flight.
 #[tokio::test(flavor = "current_thread")]
-async fn a_standing_restore_with_nothing_in_flight_is_sent_again_now() {
+async fn a_standing_restore_refused_in_the_same_room_with_nothing_in_flight_is_planned_for() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
     let pool = Arc::new(BindRoomPool::new(6, 0..0, 64));
     pool.free.lock().extend([0, 1, 2, 3]);
     let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
-    let head = ProcessId::new_v4();
-    planner.register(head);
-    planner.note_admitted(head);
+    let (head, resident) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [head, resident] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    pool.kv.lock().extend([(4, resident), (5, resident)]);
     let free = pool.free_chunks();
     planner.with_inner(|inner| {
+        inner.procs.get_mut(&resident).unwrap().idle = true;
         let proc = inner.procs.get_mut(&head).unwrap();
         proc.state = Residency::Evicted;
         proc.roles_short = Some(PendingBind {
@@ -9212,13 +9217,18 @@ async fn a_standing_restore_with_nothing_in_flight_is_sent_again_now() {
     planner.poke();
     for _ in 0..200 {
         crate::rt::yield_now().await;
-        if planner.with_inner(|inner| inner.procs[&head].roles_short_stood.is_none()) {
+        if planner.stats.evictions_started.load(Ordering::Relaxed) > 0 {
             break;
         }
     }
     let end = planner.with_inner(|inner| inner.last_plan.as_ref().map(|end| end.ended));
     assert!(
-        planner.with_inner(|inner| inner.procs[&head].roles_short_stood.is_none()),
-        "nothing in flight: its wait for more room is lifted and it goes again ({end:?})"
+        planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
+        "nothing in flight: the moves that form its room are made ({end:?})"
+    );
+    assert_eq!(
+        planner.stats.quiet_waits.load(Ordering::Relaxed),
+        0,
+        "no wait chosen with nothing in flight"
     );
 }
