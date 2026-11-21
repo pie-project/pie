@@ -790,6 +790,8 @@ struct Scheduler<'a> {
     /// Each value's readers in the region, and the values read past it.
     consumers: &'a BTreeMap<u32, usize>,
     escapes: &'a BTreeSet<u32>,
+    /// The broadcasts computed in each reader's own pass, never written.
+    sunk: BTreeSet<u32>,
 }
 
 /// Whether `op` reads each operand at its own element's index through the
@@ -867,7 +869,8 @@ impl Scheduler<'_> {
             };
             let uses = self.consumers.get(&base).copied().unwrap_or(0);
             let forwarded = forwards(at);
-            let dead = forwarded > 0 && forwarded == uses && !self.escapes.contains(&base);
+            let dead = self.sunk.contains(&base)
+                || (forwarded > 0 && forwarded == uses && !self.escapes.contains(&base));
             let output = format!("po0_{node} ");
             let forwarded_reader = reads_at_own_index(&self.ops[node as usize]);
             for line in code.pre.lines() {
@@ -1273,7 +1276,49 @@ pub fn emit_streamed_region(
             .and_then(|&arg| value_types.get(alias.resolve(arg) as usize))
             .is_some_and(|ty| ty.dtype == eta_ir::Dtype::F32)
     };
-    let key_of = |value: u32| length_key(value_types, value);
+    // Lengths one same-index op ties: its operands that are not one element
+    // are read at its own element, so each is as long as its result,
+    // whatever dims spell it (a symbolic row count beside a static one). The
+    // passes compare a length's class, its first spelling.
+    let mut classes: Vec<Vec<Vec<Dimension>>> = Vec::new();
+    for &node in &region.nodes {
+        let node = node.index();
+        let (Some(op), Some(&base)) = (ops.get(node), bases.get(node)) else { continue };
+        if !reads_at_own_index(op) {
+            continue;
+        }
+        let out = length_key(value_types, alias.resolve(base));
+        if out.is_empty() {
+            continue;
+        }
+        for arg in op.reads() {
+            let key = length_key(value_types, alias.resolve(arg));
+            if key.is_empty() || key == out || key.len() != out.len() {
+                continue;
+            }
+            let at = |classes: &Vec<Vec<Vec<Dimension>>>, key: &Vec<Dimension>| {
+                classes.iter().position(|class| class.contains(key))
+            };
+            match (at(&classes, &out), at(&classes, &key)) {
+                (Some(a), Some(b)) if a != b => {
+                    let (keep, fold) = (a.min(b), a.max(b));
+                    let folded = classes.remove(fold);
+                    classes[keep].extend(folded);
+                }
+                (Some(_), Some(_)) => {}
+                (Some(a), None) => classes[a].push(key),
+                (None, Some(b)) => classes[b].push(out.clone()),
+                (None, None) => classes.push(vec![out.clone(), key]),
+            }
+        }
+    }
+    let key_of = |value: u32| {
+        let key = length_key(value_types, value);
+        classes
+            .iter()
+            .find(|class| class.contains(&key))
+            .map_or(key, |class| class[0].clone())
+    };
 
     let mut planned: Vec<(u32, Plan)> = Vec::new();
     let mut planned_slots: BTreeMap<u32, Slots> = BTreeMap::new();
@@ -1566,7 +1611,40 @@ pub fn emit_streamed_region(
         step_folds: Vec::new(),
         consumers: &consumers,
         escapes: &escapes,
+        sunk: BTreeSet::new(),
     };
+    // A broadcast whose every reader is a same-index member of its length,
+    // and read past none of the region, is computed in each reader's own
+    // pass from its source, handed over in a register and never written:
+    // its readers' passes, not a pass of its own, bear it.
+    let mut sunk: BTreeMap<u32, (u32, u32, Vec<u32>)> = BTreeMap::new();
+    for (node, plan) in &planned {
+        let Plan::Direct { base, scalar: false, len, reads, .. } = plan else { continue };
+        if ops.get(*node as usize).is_none_or(|op| op.tag != tags::BROADCAST) || escapes.contains(base) {
+            continue;
+        }
+        let mut readers = 0usize;
+        let mut all_fit = true;
+        for (reader, reader_plan) in &planned {
+            let Some(op) = ops.get(*reader as usize) else { continue };
+            let reads_it = op.reads().into_iter().filter(|&arg| alias.resolve(arg) == *base).count();
+            if reads_it == 0 {
+                continue;
+            }
+            match reader_plan {
+                Plan::Direct { scalar: false, len: reader_len, .. }
+                    if reads_at_own_index(op) && reader_len == len =>
+                {
+                    readers += reads_it;
+                }
+                _ => all_fit = false,
+            }
+        }
+        if all_fit && readers > 0 && consumers.get(base).copied().unwrap_or(0) == readers {
+            sunk.insert(*base, (*node, *base, reads.clone()));
+        }
+    }
+    sched.sunk = sunk.keys().copied().collect();
     let mut planes_used = 0usize;
     let mut select_used = 0usize;
     for (node, plan) in &planned {
@@ -1606,12 +1684,31 @@ pub fn emit_streamed_region(
                 cross,
                 ..
             } => {
+                if sunk.contains_key(base) {
+                    continue;
+                }
+                // The broadcasts it reads that its pass computes: each one's
+                // source is read at another element, so it must not be one
+                // this pass writes.
+                let carried: Vec<(u32, u32, Vec<u32>)> = ops[node as usize]
+                    .reads()
+                    .into_iter()
+                    .map(|arg| alias.resolve(arg))
+                    .filter_map(|value| sunk.get(&value).cloned())
+                    .fold(Vec::new(), |mut held, one| {
+                        if !held.iter().any(|h: &(u32, u32, Vec<u32>)| h.0 == one.0) {
+                            held.push(one);
+                        }
+                        held
+                    });
+                let sources: Vec<u32> = carried.iter().flat_map(|c| c.2.iter().copied()).collect();
                 let regs = sched.regs.clone();
                 sched.ensure_open(*base, StepKind::Wide, len, |o| {
                     o.len.as_ref().is_none_or(|l| l == len)
-                        && !cross.iter().any(|v| o.writes.contains(v))
+                        && !cross.iter().chain(&sources).any(|v| o.writes.contains(v))
                         && !reads
                             .iter()
+                            .chain(&sources)
                             .any(|v| o.prologue_writes.contains(v) && !regs.contains_key(v))
                 });
                 if sched
@@ -1624,6 +1721,12 @@ pub fn emit_streamed_region(
                 let o = sched.open.as_mut().expect("opened");
                 if o.loop_len.is_none() {
                     o.loop_len = Some(len.clone());
+                }
+                for (b_node, b_base, _) in &carried {
+                    if !o.loop_members.iter().any(|&(member, _)| member == *b_node) {
+                        o.loop_members.push((*b_node, *b_base));
+                        o.nodes.push(*b_node);
+                    }
                 }
                 o.loop_members.push((node, *base));
                 o.writes.insert(*base);
