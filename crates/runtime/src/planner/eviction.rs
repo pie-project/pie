@@ -380,7 +380,19 @@ impl ResidencyPlanner {
             (shape.as_ref().and_then(RunNeed::longest), shape.as_ref(), map.as_ref())
             && map.cheapest_need(need).is_none()
             && self.with_inner(|inner| inner.nothing_in_flight())
-            && self.port.compaction_comes(run, pieces)
+            && self.port.compaction_comes(
+                run,
+                // A restore's short is what its own takes leave short: the
+                // runs that stand now go to its own pieces first, so the
+                // compaction stands that many more (seed 111: free runs of
+                // two its unpark takes, one more short, no compaction asked
+                // as runs stood).
+                if placement.is_some() {
+                    self.port.guest_free_runs(run).saturating_add(pieces)
+                } else {
+                    pieces
+                },
+            )
         {
             self.stats.compaction_waits.fetch_add(1, Ordering::Relaxed);
             self.plan_ended(victims.head, "compaction asked", host_short, &[]);
@@ -457,10 +469,10 @@ impl ResidencyPlanner {
             self.swap_bound.store(true, Ordering::Release);
             let pool_now = self.pool_now();
             self.with_inner(|inner| {
+                inner.block_on(pool_now);
                 for pid in &unhostable {
                     inner.host_swap_blocked.insert(*pid);
                 }
-                inner.blocked_at = Some(pool_now);
             });
             self.record_host_swap_exhaustion();
         }
@@ -619,7 +631,7 @@ impl ResidencyPlanner {
                         ?sources,
                         ?chunks,
                         parked_down_refused_at_this_room = self.park_down_failed.load(Ordering::Acquire)
-                            == self.port.room_gives(),
+                            == self.park_down_room(),
                         "planner: the policy asked with nothing in flight while the map names moves \
                          for the head (a planner bug: no step found)"
                     );
@@ -878,7 +890,10 @@ impl ResidencyPlanner {
                         // fired since: never moved back before it runs,
                         // while it can run.
                         // ([`Inner::unfired_protects`], its reads shared.)
-                        && !(proc.unfired && !queued(*pid) && !quiet())
+                        && !(proc.unfired && !proc.bind_waiting && !queued(*pid))
+                        // Restored past this head while it stood passed
+                        // over: it fires before this head moves it again.
+                        && proc.restored_past != Some(waiter.pid)
                         && !inner.host_swap_blocked.contains(*pid)
                         && !inner.prepare_blocked.contains(*pid)
                         // Being failed: it frees its pages as it ends.
@@ -969,6 +984,7 @@ impl ResidencyPlanner {
                     proc.idle || proc.held || proc.bind_waiting || quiet || !proc.firing();
                 if proc.state != Residency::Resident
                     || inner.unfired_protects(pid)
+                    || proc.restored_past == Some(head_pid)
                     || (proc.rank() <= head_rank && !yields)
                     || (!proc.progressed && !yields && !e6_relaxed)
                 {
@@ -983,6 +999,16 @@ impl ResidencyPlanner {
                     proc.evicted_queued = waits;
                 }
                 spawned.push(pid);
+            }
+            // A head moves are made for is held for no one: what it was
+            // evicted for is past. Kept, two restores each evicted for the
+            // other were each held behind the other, the older restored
+            // first every time, evicted again for the younger, and round
+            // (seed 774: one process evicted and restored 290 times).
+            if !spawned.is_empty()
+                && let Some(proc) = inner.procs.get_mut(&head_pid)
+            {
+                proc.evicted_for = None;
             }
             (wake, spawned)
         });

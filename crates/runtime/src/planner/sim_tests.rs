@@ -8,7 +8,11 @@
 //! for the engine's scheduler: every copy an eviction, a restore, a spill or
 //! a park down submits through `copy_tier_tracked` lands on the next
 //! simulated step (a seeded few a step later), and a copy down to the disk
-//! tier is refused as the tier full now and then.
+//! tier is refused as the tier full now and then. A walk steers the pool
+//! at the segments it has, one step a simulated step, carrying out the
+//! compactions the planner asks for runs of chunks (the engine's chunk
+//! table moved with them: a run's later chunks lie at the physical chunks
+//! after its first's).
 //!
 //! A seeded workload of processes runs on it as tasks, each through the
 //! calls the runtime's own process makes: admission, kv working sets
@@ -240,6 +244,12 @@ impl PoolShape {
         let device = Arc::new(Mutex::new(
             crate::store::shared::SharedPool::new(&facts, 256).unwrap(),
         ));
+        device
+            .lock()
+            .unwrap()
+            .walked_to(Arc::new(std::sync::atomic::AtomicU32::new(
+                self.total.div_ceil(self.segment),
+            )));
         let tiers = crate::store::shared::Tiers::of(&facts).unwrap();
         let engines = [crate::store::registry::EngineStores {
             pools: crate::store::chunks::StorePools::of(&facts).expect("shared facts"),
@@ -293,9 +303,47 @@ fn pattern(tag: u64, of: u64, at: u64) -> u64 {
 #[derive(Default)]
 struct Bytes {
     at: BTreeMap<(u8, u32, u64), (u64, u64)>,
+    /// The device's chunk table as the engine keeps it: where each logical
+    /// chunk lies, and which logical chunk each physical one holds, moved
+    /// as a compaction moves chunks ([`walk`]). Empty: every chunk where
+    /// its id says. A slot ref names a logical chunk; a run's later chunks
+    /// lie at the physical chunks after its first's ([`place_slots`]).
+    to_physical: Vec<u32>,
+    to_logical: Vec<u32>,
 }
 
 impl Bytes {
+    /// Logical chunk `chunk`'s physical place.
+    fn physical(&self, chunk: u32) -> u32 {
+        self.to_physical
+            .get(chunk as usize)
+            .copied()
+            .unwrap_or(chunk)
+    }
+
+    /// The logical chunk physical chunk `chunk` holds.
+    fn logical(&self, chunk: u32) -> u32 {
+        self.to_logical
+            .get(chunk as usize)
+            .copied()
+            .unwrap_or(chunk)
+    }
+
+    /// A compaction's moves, as the engine rewrites its chunk table.
+    fn moved(&mut self, total: u32, moves: &[crate::store::segments::ChunkMove]) {
+        if self.to_physical.is_empty() {
+            self.to_physical = (0..total).collect();
+            self.to_logical = (0..total).collect();
+        }
+        for step in moves {
+            let displaced = self.to_logical[step.to as usize];
+            self.to_physical[step.logical as usize] = step.to;
+            self.to_physical[displaced as usize] = step.from;
+            self.to_logical[step.to as usize] = step.logical;
+            self.to_logical[step.from as usize] = displaced;
+        }
+    }
+
     fn place(shape: u32, slot: u32) -> (u32, u64, u64) {
         let (spc, bytes) = geometry(shape);
         (slot / spc, u64::from(slot % spc) * bytes, bytes)
@@ -375,17 +423,34 @@ fn trace(line: impl FnOnce() -> String) {
     }
 }
 
-/// The `Instance` slot refs `place` covers.
-fn place_slots(place: &::engine::ScratchPlace) -> Vec<u32> {
+/// The `Instance` slot refs `place` covers. A piece of whole chunks is
+/// named by its first chunk's logical id; its later chunks lie at the
+/// physical chunks after the first's (`engine::ScratchPlace::Chunks`),
+/// whatever logical ids they hold, read through the chunk table `bytes`
+/// keeps.
+fn place_slots(place: &::engine::ScratchPlace, bytes: &Bytes) -> Vec<u32> {
     let spc = geometry(INSTANCE).0;
     match place {
         ::engine::ScratchPlace::None => Vec::new(),
         ::engine::ScratchPlace::Run { first, slots } => (*first..first + slots).collect(),
         ::engine::ScratchPlace::Chunks { run, pieces } => pieces
             .iter()
-            .flat_map(|&first| first * spc..(first + run) * spc)
+            .flat_map(|&first| {
+                let at = bytes.physical(first);
+                (0..*run).flat_map(move |k| {
+                    let chunk = bytes.logical(at + k);
+                    chunk * spc..(chunk + 1) * spc
+                })
+            })
             .collect(),
     }
+}
+
+/// Whether `place` holds any slot.
+fn place_holds(place: &::engine::ScratchPlace) -> bool {
+    !matches!(place, ::engine::ScratchPlace::None)
+        && !matches!(place, ::engine::ScratchPlace::Run { slots: 0, .. })
+        && !matches!(place, ::engine::ScratchPlace::Chunks { pieces, .. } if pieces.is_empty())
 }
 
 /// Where the engine holds an instance's live parts: its tables, its own
@@ -425,7 +490,7 @@ impl SimEngine {
         }
         self.pair_generation.insert(program, generation);
         let mut bytes = self.bytes.lock().unwrap();
-        for (at, slot) in place_slots(place).into_iter().enumerate() {
+        for (at, slot) in place_slots(place, &bytes).into_iter().enumerate() {
             bytes.write(
                 TIER_DEVICE,
                 INSTANCE,
@@ -537,7 +602,7 @@ impl Engine for SimEngine {
         };
         {
             let mut bytes = self.bytes.lock().unwrap();
-            for (_, shape, slot, value) in instance_parts(id, &places) {
+            for (_, shape, slot, value) in instance_parts(id, &places, &bytes) {
                 bytes.write(TIER_DEVICE, shape, slot, value);
             }
         }
@@ -585,7 +650,7 @@ const PART_RESIDENT: u8 = 2;
 /// bind laid: (part, shape, slot, pattern). Its scratch place holds its
 /// resident bytes where its program states any, read by every fire; else
 /// it is dead between fires and holds nothing to check.
-fn instance_parts(id: u64, places: &Places) -> Vec<(u8, u32, u32, u64)> {
+fn instance_parts(id: u64, places: &Places, bytes: &Bytes) -> Vec<(u8, u32, u32, u64)> {
     let mut parts = Vec::new();
     for (at, &slot) in places.instance.iter().enumerate() {
         parts.push((PART_TABLE, INSTANCE, slot, pattern(1, id, at as u64)));
@@ -597,7 +662,7 @@ fn instance_parts(id: u64, places: &Places) -> Vec<(u8, u32, u32, u64)> {
         }
     }
     if places.resident {
-        for (at, slot) in place_slots(&places.scratch).into_iter().enumerate() {
+        for (at, slot) in place_slots(&places.scratch, bytes).into_iter().enumerate() {
             parts.push((PART_RESIDENT, INSTANCE, slot, pattern(3, id, at as u64)));
         }
     }
@@ -1086,7 +1151,7 @@ fn verify(ctx: &Ctx, sets: &[Set], instances: &[InstanceId]) -> Result<(), Strin
         let Some(places) = places else {
             return Err(format!("instance {id}: the engine holds no places for it"));
         };
-        for (kind, shape, slot, want) in instance_parts(id, &places) {
+        for (kind, shape, slot, want) in instance_parts(id, &places, &bytes) {
             log.guest_slots_checked += 1;
             let got = bytes.read(TIER_DEVICE, shape, slot);
             if got != Some(want) {
@@ -1102,7 +1167,7 @@ fn verify(ctx: &Ctx, sets: &[Set], instances: &[InstanceId]) -> Result<(), Strin
                 ));
             }
         }
-        let pair = place_slots(&places.pair);
+        let pair = place_slots(&places.pair, &bytes);
         if pair.is_empty() {
             continue;
         }
@@ -1251,6 +1316,7 @@ async fn fire(
             let mut bytes = ctx.bytes.lock().unwrap();
             for (set, pages) in sets.iter().zip(written) {
                 for (index, page) in pages {
+                    trace(|| format!("write set {} index {index} page {page}", set.tag));
                     bytes.write(TIER_DEVICE, LIST, page, pattern(5, set.tag, index));
                 }
             }
@@ -1366,7 +1432,7 @@ async fn bind(ctx: &Ctx, pid: ProcessId, program: u32) -> Result<InstanceId, Str
         .get(&bound.id.0)
         .cloned();
     if let Some(places) = places
-        && !place_slots(&places.pair).is_empty()
+        && place_holds(&places.pair)
     {
         let mut pairs = ctx.pairs.lock().unwrap();
         let entry = pairs
@@ -1505,7 +1571,7 @@ async fn run_process(ctx: Arc<Ctx>, pid: ProcessId, script: Script) {
         let places = ctx.engine.lock().unwrap().instances.remove(&id.0);
         if let Some(places) = places
             && let Some(entry) = ctx.pairs.lock().unwrap().get_mut(&places.program)
-            && !place_slots(&places.pair).is_empty()
+            && place_holds(&places.pair)
         {
             entry.1 = entry.1.saturating_sub(1);
         }
@@ -1521,6 +1587,47 @@ async fn run_process(ctx: Arc<Ctx>, pid: ProcessId, script: Script) {
     log.stages.remove(&pid);
     log.ended += 1;
     log.acts += 1;
+}
+
+/// The engine's segment walk, one step a simulated step: fences retired
+/// through what the kv store retired, then the pool's next move at the
+/// segments it has. Only a compaction comes there (growth is fixed): the
+/// engine copies each moved chunk to its new place and rewrites its chunk
+/// table, so a slot ref (a logical chunk's) reads what it read, and the
+/// bytes stand as they lie. Whether it moved chunks.
+fn walk(ctx: &Ctx) -> bool {
+    if std::env::var_os("PIE_SIM_NOWALK").is_some() {
+        return false;
+    }
+    let Some(shared) = &ctx.stores.shared else {
+        return false;
+    };
+    let (current, retired) = with_kv_lock(&ctx.stores.kv, "sim-walk", |kv| {
+        (kv.current_epoch(), kv.retired_through())
+    });
+    let (step, was) = {
+        let mut pool = shared.lock().unwrap();
+        let was = pool.pool().compacting();
+        pool.pool_mut().retire_through(retired);
+        let goal = pool.mapped_segments();
+        (pool.next_move(goal, current.saturating_add(1)), was)
+    };
+    let moved = match step {
+        Some(crate::store::shared::SegmentMove::Compact { applied, epoch, .. }) => {
+            trace(|| format!("compact {applied:?}"));
+            let total = shared.lock().unwrap().pool().total_chunks();
+            ctx.bytes.lock().unwrap().moved(total, &applied);
+            shared.lock().unwrap().compaction_copied(epoch, current);
+            true
+        }
+        None => false,
+        Some(other) => panic!("the walk at the segments it has moved {other:?}"),
+    };
+    // The run a compaction clears is room given back once its fence lifts.
+    if moved || (was && !shared.lock().unwrap().pool().compacting()) {
+        ctx.planner.pages_freed();
+    }
+    moved
 }
 
 /// Lets every task run until nothing moves: no act, no copy submitted, the
@@ -1737,6 +1844,7 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
                 copy.land();
             }
         }
+        walk(&ctx);
         quiesce(&ctx, &mut lane, &mut pending, step, workload.late).await;
         for script in arrivals.remove(&step).unwrap_or_default() {
             let pid =
@@ -1964,24 +2072,11 @@ fn replay_seed(seed: u64) -> Vec<Failure> {
 /// fixed, each with a seed that showed it (its regression test below,
 /// ignored until fixed). The fast sweep fails on any other shape; once a
 /// shape is fixed its entry goes and its test is no longer ignored.
-const KNOWN: [(&str, u64); 3] = [
-    // A restore short of runs, no move named: every candidate blocked, or
-    // no pick, the policy asked with nothing in flight (seeds 111, 93,
-    // 3822).
-    ("stall restore: placement short", 111),
-    // A bind short of room with no pick or every pick unhostable, often
-    // with the host short now that resident bytes are copied down at a
-    // park (seeds 134, 136; the L40S's line 3 is of this family).
-    ("stall bind room", 134),
-    // Processes left waiting long after the last arrival: a restore
-    // waiting on its instances' rebinds while another process parks and
-    // unparks, one stuck Evicting (seeds 774, 2315, 2964, 3754, 3853).
-    ("liveness", 774),
-];
+const KNOWN: [(&str, u64); 0] = [];
 
 /// Shapes the simulation found and the runtime fixed, each seed's
 /// regression test run in the suite; the fast sweep fails on them again.
-const FIXED: [(&str, u64); 9] = [
+const FIXED: [(&str, u64); 20] = [
     // A bind's guest parts and its tables, rings or adapter each open a
     // fresh chunk, the refusal quoting the part short alone: served one
     // chunk, short again, a spin (seeds 1, 46, 4137, 4287). The refusal
@@ -2012,6 +2107,44 @@ const FIXED: [(&str, u64); 9] = [
     ("corrupt instance # of program #: its pair's", 3999),
     // A restore waiting on rebinds beside a park and unpark loop.
     ("liveness", 1711),
+    // A restore short of runs its own unpark takes: the compaction asked
+    // stands that many more runs than stand now (seeds 111, 93, 3822).
+    ("stall restore: placement short", 111),
+    // A head no move serves (a bind short of chunks only a full disk could
+    // empty, every resident a waiter) held the queue with nothing in
+    // flight: it is passed over for the pass, and a waiter behind it that
+    // can go does (seeds 134, 136, 624, 2235).
+    ("stall bind room", 134),
+    ("stall bind room", 624),
+    // A lone process whose own scattered pages break its bind's run: a
+    // compaction stands it.
+    ("stall bind room", 971),
+    // Two restores each evicted for the other, each held behind the
+    // other, the older restored and evicted again for the younger: a
+    // head moves are made for is held for no one (seeds 774, 155, 213).
+    ("liveness", 774),
+    // A victim's restore went while the bind it was evicted for was
+    // served and not yet taken, took its room, and was evicted again.
+    ("liveness", 361),
+    // ... or while that bind was between its asks, out of the queue.
+    ("liveness", 1610),
+    // A victim restored past a head passed over, evicted for it again
+    // before it fired: restored and able to fire, it is no victim.
+    ("liveness", 4139),
+    // A decoder's one-page ask failed for another's room: no waiter that
+    // fits the pool alone is failed for another.
+    ("refused acquire # pages: KV pool starved", 3243),
+    // Every resident's kv past the room below, the chunks the waiters
+    // need held by guest parts: a victim blocked on one room is blocked on
+    // no other, an eviction whose kv has no room below parks it where it
+    // lies and gives its guest parts back, and a move of parked state down
+    // refused is not tried again on the same room (its take and give-back
+    // ran the pass again for good).
+    ("stall restore", 3392),
+    // The simulation's own: a run of chunks laid at its first chunk's
+    // physical place, its later chunks read by logical id after a
+    // compaction moved chunks.
+    ("corrupt", 3785),
 ];
 
 fn known(shape: &str) -> bool {
@@ -2103,21 +2236,58 @@ fn sim_seed_1711_every_process_ends() {
 }
 
 #[test]
-#[ignore = "pending: a restore short of runs, no move named"]
-fn sim_seed_111_a_restore_short_of_runs_is_funded() {
-    regression(KNOWN[0]);
+fn sim_seed_111_a_restore_short_of_runs_its_unpark_takes_is_compacted_for() {
+    regression(FIXED[9]);
 }
 
 #[test]
-#[ignore = "pending: processes left waiting long after the last arrival"]
-fn sim_seed_774_every_process_ends() {
-    regression(KNOWN[2]);
+fn sim_seed_134_a_head_no_move_serves_is_passed_over() {
+    regression(FIXED[10]);
 }
 
 #[test]
-#[ignore = "pending: a bind short of room, no pick or every pick unhostable"]
-fn sim_seed_134_a_bind_short_of_room_is_served() {
-    regression(KNOWN[1]);
+fn sim_seed_624_a_head_no_move_serves_is_passed_over() {
+    regression(FIXED[11]);
+}
+
+#[test]
+fn sim_seed_971_a_lone_bind_s_run_is_compacted_for() {
+    regression(FIXED[12]);
+}
+
+#[test]
+fn sim_seed_774_two_restores_evicted_for_each_other_end() {
+    regression(FIXED[13]);
+}
+
+#[test]
+fn sim_seed_361_a_served_bind_holds_its_victim_s_restore() {
+    regression(FIXED[14]);
+}
+
+#[test]
+fn sim_seed_1610_a_bind_between_its_asks_holds_its_victim_s_restore() {
+    regression(FIXED[15]);
+}
+
+#[test]
+fn sim_seed_4139_a_victim_restored_past_a_passed_head_fires_first() {
+    regression(FIXED[16]);
+}
+
+#[test]
+fn sim_seed_3243_no_waiter_that_fits_is_failed_for_another() {
+    regression(FIXED[17]);
+}
+
+#[test]
+fn sim_seed_3785_a_run_s_later_chunks_are_read_where_they_lie() {
+    regression(FIXED[19]);
+}
+
+#[test]
+fn sim_seed_3392_a_waiter_s_guest_parts_park_with_its_kv_in_place() {
+    regression(FIXED[18]);
 }
 
 /// What a run did, as a string two runs of one seed must agree on.

@@ -6612,11 +6612,14 @@ fn a_victim_is_not_restored_before_its_head_nor_evicted_again_before_it_fires() 
     planner.with_inner(|inner| {
         inner.queue.remove(&own);
     });
-    // Nothing in flight anywhere: nothing of it runs either.
+    // Nothing in flight anywhere: it still fires as soon as its lanes
+    // wake, so the mark still holds it (moved back first, it went round
+    // with the head it made room for: seed 4139); a head no move serves
+    // meanwhile is passed over, no stall.
     drop(running);
     assert!(
-        members(&planner).contains(&victim),
-        "nothing in flight: a candidate, no stall"
+        !members(&planner).contains(&victim),
+        "nothing in flight: still able to run, not moved back before it runs"
     );
     // Able to run again, then fired once: a candidate for good.
     let running = planner.fire_in_flight(head);

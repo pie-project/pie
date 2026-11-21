@@ -1161,7 +1161,7 @@ impl ResidencyPlanner {
 
     pub(super) fn park_down(self: &Arc<Self>, head: ProcessId, pids: Vec<ProcessId>) -> bool {
         let failed_at = self.park_down_failed.load(Ordering::Acquire);
-        if failed_at != u64::MAX && failed_at == self.port.room_gives() {
+        if failed_at != u64::MAX && failed_at == self.park_down_room() {
             return false;
         }
         if self.parking_down.swap(true, Ordering::AcqRel) {
@@ -1206,6 +1206,13 @@ impl ResidencyPlanner {
             (pids, order)
         });
         if pids.is_empty() || !self.port.move_parked_down(self, &pids, &order) {
+            // Refused here as at its landing: not tried again on this room
+            // (its take and give-back of the slots below counted room freed,
+            // and the pass ran again on it, for good: seed 3392).
+            if !pids.is_empty() {
+                self.park_down_failed
+                    .store(self.park_down_room(), Ordering::Release);
+            }
             self.with_inner(|inner| inner.parked_moving.clear());
             self.parking_down.store(false, Ordering::Release);
             return false;
@@ -1213,12 +1220,23 @@ impl ResidencyPlanner {
         true
     }
 
+    /// The room a move of parked state down a tier reads: the device's
+    /// room given back and the free slots below. One refused is tried again
+    /// once either moves.
+    pub(super) fn park_down_room(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = rustc_hash::FxHasher::default();
+        self.port.room_gives().hash(&mut hasher);
+        self.raw_swap_free().hash(&mut hasher);
+        hasher.finish()
+    }
+
     /// A move of parked state down a tier ended: its processes may be
     /// restored again, and the plan looks at the room it made. One that
     /// failed is not tried again on the same map: it would fail the same
     /// way until room moves (`park_down_failed`).
     pub(super) fn parked_down_done(self: &Arc<Self>, moved: bool) {
-        let failed_at = if moved { u64::MAX } else { self.port.room_gives() };
+        let failed_at = if moved { u64::MAX } else { self.park_down_room() };
         self.park_down_failed.store(failed_at, Ordering::Release);
         self.with_inner(|inner| inner.parked_moving.clear());
         self.parking_down.store(false, Ordering::Release);

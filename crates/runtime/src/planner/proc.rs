@@ -166,6 +166,14 @@ pub(super) struct Proc {
     /// served while that head waits unserved (the rule's second half),
     /// whatever key the head waits under now.
     pub(super) evicted_for: Option<ProcessId>,
+    /// The head this one was evicted for, its restore served ahead of it
+    /// while that head stood passed over with no move to make
+    /// ([`super::ResidencyPlanner::pass_over_stuck`]): no victim for that
+    /// head until it has fired. Moved back first, it went round with the
+    /// head, restored past it and evicted for it again, its waits never
+    /// served (seed 3392: queued for a page behind the head, so the mark
+    /// alone did not hold it).
+    pub(super) restored_past: Option<ProcessId>,
 }
 
 /// The guest-state room a suspended process's pending bind asks:
@@ -259,6 +267,7 @@ impl Proc {
             bind_room: None,
             unfired: false,
             evicted_for: None,
+            restored_past: None,
         }
     }
 }

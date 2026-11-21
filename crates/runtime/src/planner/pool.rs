@@ -763,6 +763,13 @@ pub trait PoolPort: Send + Sync + 'static {
         let _ = (run, pieces);
         false
     }
+    /// Whether a compaction asked for a head is on its way: its moves
+    /// fenced, or planned and still plannable for runs that do not stand
+    /// yet ([`crate::store::shared::SharedPool::compaction_under_way`]).
+    /// It moves the head's room as an eviction in flight does.
+    fn compaction_under_way(&self) -> bool {
+        false
+    }
     /// The pool's census for a head short of runs of `run` chunks
     /// ([`crate::store::slots::SlotPool::census`]); empty where the pool
     /// keeps no guest state.
@@ -1257,6 +1264,12 @@ impl PoolPort for RegistryPool {
                 format!("{} {}", shared.pool().census(run), shared.pool().budget_line())
             })
             .unwrap_or_default()
+    }
+
+    fn compaction_under_way(&self) -> bool {
+        crate::store::registry::try_get(self.model, self.engine)
+            .and_then(|stores| stores.shared)
+            .is_some_and(|shared| shared.lock().unwrap().compaction_under_way())
     }
 
     fn compaction_comes(&self, run: u32, pieces: u32) -> bool {

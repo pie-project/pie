@@ -752,12 +752,13 @@ pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     // A process with no kv or state yet (a prompt not seated) may still hold
     // guest state on the device, the room a bind short of runs was chosen to
     // free (a chunk's occupant): it parks all the same, its guest scratch
-    // given back. Found nothing, the M1 stress froze with eleven binds short
-    // of runs and every chosen occupant "found no working set".
+    // given back and its tables and resident bytes copied down. Found
+    // nothing, the M1 stress froze with eleven binds short of runs and every
+    // chosen occupant "found no working set".
     let holds_guest = crate::store::registry::get(model, engine)
         .roles
         .as_ref()
-        .is_some_and(|roles| roles.lock().unwrap().holds_guest_state(pid));
+        .is_some_and(|roles| roles.lock().unwrap().holds_device_parts(pid));
     if working_sets.is_empty() && rs_working_sets.is_empty() && !holds_guest {
         // Nothing to move now is nothing to move on the next pass either:
         // it is no victim again until the room changes (a restore clears
@@ -834,6 +835,17 @@ pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
         });
     let kv = match prepared {
         Ok(kv) => kv,
+        // No room below for its kv, but guest parts of its own on the
+        // device: its kv parks where it lies (marked suspended, as on a home
+        // with no tier below; moved down later as room comes) and the park
+        // goes on for what does move, its guest scratch given back and its
+        // tables copied down. Blocked whole, a waiter holding chunks only its
+        // guest parts filled kept them while every process waited (seed
+        // 3392: a full disk, every resident's kv past its free slots).
+        Err(KvStoreError::HostSwapFull { .. }) if holds_guest => {
+            tracing::debug!(%pid, "planner: an eviction's kv parks in place, no room below");
+            None
+        }
         Err(error @ KvStoreError::HostSwapFull { .. }) => {
             tracing::warn!(pid = %pid, %error, "planner: eviction blocked on swap room");
             planner.eviction_failed_host_swap_full(pid);

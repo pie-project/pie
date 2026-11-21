@@ -105,6 +105,20 @@ impl Waiter {
     /// chunks, [`WaitKind::BindRoom`]).
     /// A rung raise served and not yet taken: it holds the queue
     /// ([`WaitKind::BindRoom::rise`]).
+    /// Served and not yet taken: an allocation's grant waiting for its
+    /// waiter, a bind's room served and not taken.
+    pub(super) fn untaken(&self) -> bool {
+        match &self.kind {
+            WaitKind::Allocation {
+                outcome, yielded, ..
+            } => outcome.is_some() && !yielded,
+            WaitKind::Restore { .. } => false,
+            WaitKind::BindRoom {
+                served, withdrawn, ..
+            } => *served && !withdrawn,
+        }
+    }
+
     pub(super) fn rise_untaken(&self) -> bool {
         matches!(
             self.kind,

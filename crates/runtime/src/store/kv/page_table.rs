@@ -2204,10 +2204,15 @@ impl KvPageTable {
         // Under test the sets are walked in id order, whatever order the
         // caller's set holds them in: the locations' order (and every move
         // laid from it) is then the same on each run of a seeded simulation.
-        #[cfg_attr(not(test), allow(unused_mut))]
-        let mut order: Vec<WorkingSetId> = working_sets.iter().copied().collect();
+        // In service they are walked as the set holds them, nothing built.
         #[cfg(test)]
-        order.sort_unstable_by_key(|ws| ws.to_bits());
+        let order = {
+            let mut order: Vec<WorkingSetId> = working_sets.iter().copied().collect();
+            order.sort_unstable_by_key(|ws| ws.to_bits());
+            order
+        };
+        #[cfg(not(test))]
+        let order = working_sets.iter().copied();
         for ws in order {
             self.visit_working_set_locations(ws, |location| {
                 locations.insert(location);

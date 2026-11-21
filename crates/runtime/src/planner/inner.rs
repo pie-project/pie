@@ -67,6 +67,14 @@ pub(super) struct Inner {
     /// Each queued process's own last plan end: a stall line names its own
     /// head's, never another entry's ([`Self::plan_fields`]).
     pub(super) ends: super::PidMap<super::victim::PlanEnd>,
+    /// Heads this pass planned and left stuck, and their processes: no
+    /// move named for them and nothing in flight
+    /// ([`super::ResidencyPlanner::pass_over_stuck`]). Passed over for the
+    /// rest of the pass, so a waiter behind that can go does, and holding
+    /// no victim's restore behind them meanwhile (no move is there for
+    /// them to keep room for); cleared as the pass ends, each heading the
+    /// next pass again.
+    pub(super) passed: Vec<(super::wait::EntryKey, ProcessId)>,
 }
 
 impl Inner {
@@ -377,11 +385,7 @@ impl Inner {
         let waiting = std::cell::OnceCell::<HashSet<ProcessId>>::new();
         let waiting = || {
             waiting.get_or_init(|| {
-                self.queue
-                    .values()
-                    .filter(|waiter| waiter.is_unmet())
-                    .map(|waiter| waiter.pid)
-                    .collect()
+                self.queue.values().map(|waiter| waiter.pid).collect()
             })
         };
         // Its head served: no unmet waiter of its, and resident. A restore
@@ -395,20 +399,37 @@ impl Inner {
         // it again, and the two went round (the L40S at 3 GiB on 4cef0c7d3:
         // 613 evictions within 200 ms of their process's restore, about one
         // eviction a serve).
+        // Served and not yet taken (a bind's room served, an allocation's
+        // grant not yet taken) is unserved still: the room it was served
+        // is its until it takes it. Read as served, the victim's restore
+        // went first and took that room, the bind came back short, asked
+        // again and evicted the victim again, and round (seed 361: one
+        // process evicted and restored for one bind for good).
         let unserved = |head: ProcessId| {
             waiting().contains(&head)
                 || self
                     .procs
                     .get(&head)
                     .is_some_and(|proc| {
-                        proc.state != Residency::Resident || (proc.unfired && !proc.idle)
+                        proc.state != Residency::Resident
+                            || (proc.unfired && !proc.idle)
+                            || proc.bind_waiting
                     })
         };
+        let passed = |head: ProcessId| self.passed.iter().any(|&(_, pid)| pid == head);
         let held_for_head = |pid: ProcessId| {
             self.procs
                 .get(&pid)
                 .and_then(|proc| proc.evicted_for)
-                .is_some_and(|head| head != pid && unserved(head))
+                .is_some_and(|head| head != pid && unserved(head) && !passed(head))
+        };
+        let head_at_bind = |pid: ProcessId| {
+            self.procs
+                .get(&pid)
+                .and_then(|proc| proc.evicted_for)
+                .filter(|&head| !passed(head))
+                .and_then(|head| self.procs.get(&head))
+                .is_some_and(|head| head.state == Residency::Resident && head.bind_waiting)
         };
         // Evicted while it waited in the queue: held while any process
         // ahead of it (older) has an entry in the queue.
@@ -435,13 +456,21 @@ impl Inner {
         // planned, and even the beat named none.
         let mut held_restore: Option<EntryKey> = None;
         for (&key, waiter) in &self.queue {
-            if !waiter.is_unmet() {
+            if !waiter.is_unmet() || self.passed.iter().any(|&(passed, _)| passed == key) {
                 continue;
             }
             if matches!(waiter.kind, WaitKind::Restore { .. })
                 && (held_for_head(waiter.pid) || behind_queue(waiter.pid))
             {
-                held_restore.get_or_insert(key);
+                // Held for a process at a bind, between its asks (out of
+                // the queue a moment as it takes again what it was
+                // served, or asks again): never the one that goes for want
+                // of a head. Gone then, the victim's restore went, took the
+                // room the bind was made, and the bind evicted it again
+                // (seed 1610).
+                if !head_at_bind(waiter.pid) {
+                    held_restore.get_or_insert(key);
+                }
                 continue;
             }
             match &waiter.kind {
@@ -687,19 +716,39 @@ impl Inner {
         }
     }
 
+    /// Sets the room the victims blocked now are blocked on: those blocked
+    /// on another room go back among the candidates first. One stamp for
+    /// every block, refreshed by a later block on more room, held an
+    /// earlier victim out on room it fits (seed 3392: a victim of seven
+    /// pages blocked at six free below, kept out at nineteen, every waiter
+    /// left with nothing in flight).
+    pub(super) fn block_on(&mut self, room: (u64, u32)) {
+        if self.blocked_at != Some(room) {
+            self.host_swap_blocked.clear();
+            self.prepare_blocked.clear();
+        }
+        self.blocked_at = Some(room);
+    }
+
     /// Whether `pid`'s anti-thrash mark ([`super::proc::Proc::unfired`])
     /// keeps it out of the victims: only while it can fire, by state, never
     /// a clock. Waiting in the queue itself (its lanes blocked on the
-    /// planner, which serves the head first) or with nothing in flight
-    /// anywhere (nothing of it runs), it cannot, and protected it would hold
-    /// the head that waits on its room for good: it is a candidate.
+    /// planner, which serves the head first) or at a bind for room, it
+    /// cannot, and protected it would hold the head that waits on its
+    /// room for good: it is a candidate. Nothing in flight is no such
+    /// state: restored a moment ago it fires as soon as its lanes wake, and
+    /// moved back first, it went round with the head it made room for,
+    /// restored ahead of it and evicted for it again without a fire between
+    /// (seed 4139). A head no move serves while such a one holds its room
+    /// is passed over ([`super::ResidencyPlanner::pass_over_stuck`]).
     pub(super) fn unfired_protects(&self, pid: ProcessId) -> bool {
-        self.procs.get(&pid).is_some_and(|proc| proc.unfired)
+        self.procs
+            .get(&pid)
+            .is_some_and(|proc| proc.unfired && !proc.bind_waiting)
             && !self
                 .queue
                 .values()
                 .any(|waiter| waiter.pid == pid && waiter.is_unmet())
-            && !self.nothing_in_flight()
     }
 
     /// Whether the one bind-suspended restore at a time

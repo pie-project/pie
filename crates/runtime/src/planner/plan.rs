@@ -476,15 +476,23 @@ impl ResidencyPlanner {
     /// process, so a silent scheduler names the head that holds it.
     pub(super) fn dump_stall(self: &Arc<Self>) {
         let gives = self.port.room_gives();
+        // A compaction on its way moves the head's room as a move does.
+        if self.port.compaction_under_way() {
+            return;
+        }
         let stalled = self.with_inner(|inner| {
             let Some((key, waiter)) = inner.unmet_head() else {
                 inner.stall_dumped = None;
                 return None;
             };
             // A rung raise taking the room it was served is in flight.
+            // So is a grant or a bind's room served and not yet taken:
+            // its waiter takes it and fires (a head passed over for it,
+            // [`Self::pass_over_stuck`]).
             if !inner.nothing_in_flight()
                 || !inner.parked_moving.is_empty()
                 || inner.queue.values().any(Waiter::rise_untaken)
+                || inner.queue.values().any(Waiter::untaken)
             {
                 return None;
             }
@@ -647,8 +655,48 @@ impl ResidencyPlanner {
         true
     }
 
-    /// One pass; true where it ends waiting on a grow.
+    /// One pass; true where it ends waiting on a grow. The heads it
+    /// passed over are heads again for the next.
     pub(super) fn plan_once(self: &Arc<Self>) -> bool {
+        let on_grow = self.plan_heads();
+        self.with_inner(|inner| inner.passed.clear());
+        on_grow
+    }
+
+    /// Whether the head this pass just planned is left stuck (no move named
+    /// for it, nothing in flight, no parked state or idle cache moving down,
+    /// no tails being swept, no grant or raise served and not yet taken, no
+    /// compaction on its way): then it is passed over for the rest of the
+    /// pass and the next waiter planned, so one behind it that can go does (a
+    /// decoder's page served from pages free, a restore served whose room
+    /// below the head's moves need). Held at the stuck head, nothing moved
+    /// and nothing came that could move it (seeds 134, 624: a bind short of
+    /// chunks only a full disk could empty, decoders behind it that free
+    /// pages would serve, nothing in flight). Each heads the next pass
+    /// again, planned first on whatever came back.
+    fn pass_over_stuck(&self) -> bool {
+        if self.demoting.load(Ordering::Acquire)
+            || self.sweeping.load(Ordering::Acquire)
+            || self.port.compaction_under_way()
+        {
+            return false;
+        }
+        self.with_inner(|inner| {
+            let Some((key, pid)) = inner.unmet_head().map(|(key, waiter)| (key, waiter.pid)) else {
+                return false;
+            };
+            if !inner.nothing_in_flight()
+                || !inner.parked_moving.is_empty()
+                || inner.queue.values().any(Waiter::untaken)
+            {
+                return false;
+            }
+            inner.passed.push((key, pid));
+            true
+        })
+    }
+
+    fn plan_heads(self: &Arc<Self>) -> bool {
         if self.pause_due.swap(false, Ordering::AcqRel) {
             self.pause_held();
         }
@@ -698,7 +746,14 @@ impl ResidencyPlanner {
                 // (the L40S: 8 of 9 opened chunks held by no candidate and
                 // nothing parked, nothing in flight). They go back. An
                 // allocation's surplus stays: a burst serves several from it.
-                if is_restore && inner.accum.len() as u32 > waiter.kv_need() {
+                // Not while a head this pass passed over holds them: given
+                // back, they were gathered again for it on the next pass,
+                // and given back again, a pass that never settled (seed
+                // 3392).
+                if is_restore
+                    && inner.passed.is_empty()
+                    && inner.accum.len() as u32 > waiter.kv_need()
+                {
                     let spare = inner.accum.len() as u32 - waiter.kv_need();
                     return Step::Release(inner.accum.donate(spare));
                 }
@@ -815,6 +870,9 @@ impl ResidencyPlanner {
                 // 4,435 no-step lines).
                 Step::Done(ended) => {
                     self.plan_stopped(ended);
+                    if self.pass_over_stuck() {
+                        continue;
+                    }
                     return false;
                 }
                 Step::BindRoom {
@@ -888,6 +946,9 @@ impl ResidencyPlanner {
                     // before any resident does.
                     if self.park_down_for(&RunNeed::one(run, pieces)) {
                         self.plan_stopped("bind room: parked state moves down");
+                        if self.pass_over_stuck() {
+                            continue;
+                        }
                         return false;
                     }
                     true
@@ -954,12 +1015,18 @@ impl ResidencyPlanner {
                     .within(self.port.state_chunks(), Some((need.run, need.pieces)));
                     if self.park_down_for(&room) {
                         self.plan_stopped("bind-suspended restore: parked state moves down");
+                        if self.pass_over_stuck() {
+                            continue;
+                        }
                         return false;
                     }
                     // Funded once nothing in flight can free room
                     // ([`Inner::nothing_in_flight`]).
                     if !self.with_inner(|inner| inner.nothing_in_flight()) {
                         self.plan_stopped("bind-suspended restore: something in flight, not funded");
+                        if self.pass_over_stuck() {
+                            continue;
+                        }
                         return false;
                     }
                     true
@@ -1057,6 +1124,9 @@ impl ResidencyPlanner {
                     // frees room pokes the plan, which looks again here).
                     if !fund {
                         self.plan_stopped("restore short of runs: something in flight, not funded");
+                        if self.pass_over_stuck() {
+                            continue;
+                        }
                         return false;
                     }
                     // Idle cache holds chunks too: one set goes, and the
@@ -1085,6 +1155,9 @@ impl ResidencyPlanner {
                     // runs held by parked role slots, nothing to evict).
                     if self.park_down_for(&room) {
                         self.plan_stopped("restore short of runs: parked state moves down");
+                        if self.pass_over_stuck() {
+                            continue;
+                        }
                         return false;
                     }
                     // Else the occupants of the chunks it could take move
@@ -1118,6 +1191,9 @@ impl ResidencyPlanner {
                     // a tier before any is dropped; the rest is dropped.
                     if self.demote_idle(count) {
                         self.plan_stopped("short of kv: idle cache moves down");
+                        if self.pass_over_stuck() {
+                            continue;
+                        }
                         return false;
                     }
                     if self.reclaim_idle_once() {
@@ -1125,6 +1201,9 @@ impl ResidencyPlanner {
                     }
                     if self.sweep_stranded(count, false) {
                         self.plan_stopped("short of kv: stranded tails swept");
+                        if self.pass_over_stuck() {
+                            continue;
+                        }
                         return false;
                     }
                     fund_by_eviction
@@ -1140,7 +1219,10 @@ impl ResidencyPlanner {
                     // state could take: they go back before anything moves.
                     // Kept, they starved every replay of a restarted process
                     // of the state slot its lanes asked for.
-                    if surplus > 0 && self.port.rs_as_pages(need) > 0 {
+                    if surplus > 0
+                        && self.port.rs_as_pages(need) > 0
+                        && self.with_inner(|inner| inner.passed.is_empty())
+                    {
                         let spare = self.with_inner(|inner| {
                             let keep = inner.unmet_head().map_or(0, |(_, head)| head.kv_need());
                             let spare = (inner.accum.len() as u32).saturating_sub(keep);
@@ -1167,6 +1249,9 @@ impl ResidencyPlanner {
                     let as_pages = self.port.rs_as_pages(need);
                     if as_pages > 0 && self.demote_idle(as_pages) {
                         self.plan_stopped("short of state: idle cache moves down");
+                        if self.pass_over_stuck() {
+                            continue;
+                        }
                         return false;
                     }
                     if self.reclaim_idle_once() || self.reclaim_head_sharing() {
@@ -1177,6 +1262,9 @@ impl ResidencyPlanner {
                     // (its state with it).
                     if as_pages > 0 && self.sweep_stranded(as_pages, true) {
                         self.plan_stopped("short of state: stranded tails swept");
+                        if self.pass_over_stuck() {
+                            continue;
+                        }
                         return false;
                     }
                     fund_by_eviction
@@ -1301,6 +1389,12 @@ impl ResidencyPlanner {
                             inner.queue.remove(&key);
                             return Board::Replan;
                         }
+                        // Restored past the head it was evicted for, that
+                        // head passed over: no victim for it until it fires.
+                        proc.restored_past = proc.evicted_for.filter(|head| {
+                            inner.passed.iter().any(|&(_, passed)| passed == *head)
+                        });
+                        let proc = inner.procs.get_mut(&pid).expect("read above");
                         proc.state = Residency::Restoring;
                         if let Some(waiter) = inner.queue.remove(&key) {
                             let waited = waiter.since.elapsed();
@@ -1347,6 +1441,9 @@ impl ResidencyPlanner {
                 self.stats
                     .restore_absorb_short
                     .fetch_add(1, Ordering::Relaxed);
+            }
+            if self.pass_over_stuck() {
+                continue;
             }
             return false;
         }

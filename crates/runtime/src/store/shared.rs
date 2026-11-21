@@ -2420,6 +2420,20 @@ impl SharedPool {
         true
     }
 
+    /// Whether the compaction [`Self::compaction_comes`] asked is on its
+    /// way: its moves fenced, or its runs still short and a plan for them
+    /// there for the walk to make. One that no plan can make any more is
+    /// not (its ask stays, read again by the next).
+    #[must_use]
+    pub fn compaction_under_way(&self) -> bool {
+        let Some((run, pieces)) = self.compact_for else {
+            return false;
+        };
+        self.walk_target.is_some()
+            && self.pool.free_chunk_runs(run) < pieces
+            && (self.pool.compacting() || self.pool.plan_compaction_for(run, pieces).is_some())
+    }
+
     /// The engine took a compaction's copy (planned to ride the fire at
     /// `planned`) and waits it out: its chunks' fence lifts once the fires
     /// handed out by `current` retire, at once on an idle pool.

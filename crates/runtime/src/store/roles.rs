@@ -1251,6 +1251,22 @@ impl Roles {
         })
     }
 
+    /// Whether `holder` holds any part of a guest's state on the device,
+    /// live, held or dead: what a park of it moves down a tier or gives
+    /// back. A process with no kv or state of its own (a prompt not
+    /// seated) holding only such parts is a victim whose eviction parks
+    /// them ([`crate::planner`]'s eviction): read by dead parts alone, one
+    /// holding resident bytes (a held part) "found nothing to move", its
+    /// chunks never emptied (seed 3392).
+    #[must_use]
+    pub fn holds_device_parts(&self, holder: Holder) -> bool {
+        self.items.values().any(|item| {
+            item.holder == Some(holder)
+                && item.tier == Tier::Device
+                && item.parts.iter().any(|part| !part.refs.is_empty())
+        })
+    }
+
     /// Whether `pair`'s state is on its way to or from the host with the
     /// instances that hold it, and those instances with their holders: what
     /// a restore short of it ([`RolesError::PairParked`]) waits to see end.
