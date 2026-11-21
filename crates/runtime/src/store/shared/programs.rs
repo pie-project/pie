@@ -741,6 +741,11 @@ pub async fn take_raise(
         evacuation.moves.len(),
         stood,
     );
+    // Frames held out under the cap the raise may now cover: the walk
+    // lifts the cap to them (no fire in flight wakes it otherwise).
+    if super::owed_cut_rows(mover.engine()) > 0 {
+        super::ask_walk(mover.engine());
+    }
     Ok(Some(evacuation))
 }
 

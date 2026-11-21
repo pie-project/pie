@@ -230,6 +230,7 @@ fn a_device_resolved_beam_answers_what_the_host_path_answers() {
     let instance = rig
         .engine
         .bind_instance(&engine::program::InstanceBinding {
+            resident: Default::default(),
             program,
             channels,
             seeds: Vec::new(),
@@ -462,6 +463,7 @@ fn device_fed_tokens_reach_the_next_fire() {
     let instance = rig
         .engine
         .bind_instance(&engine::program::InstanceBinding {
+            resident: Default::default(),
             program,
             channels,
             seeds: vec![engine::channel::ChannelSeed {
