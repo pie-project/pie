@@ -152,6 +152,7 @@ impl Shell {
         // The rung's carried room, spread over the lanes.
         let room = crate::rs::carried_room(rung);
         let carried_of = |at: u32| room / lanes + u32::from(at < room % lanes);
+        let tail_rows = self.carried_rows();
         let verbs: Vec<RsVerb> = owned
             .iter()
             .enumerate()
@@ -159,11 +160,16 @@ impl Shell {
                 let first = context - tokens.len() as u32;
                 let carried = carried_of(at as u32);
                 if replays {
+                    // it folds its carried rows and its own but the most a
+                    // lane leaves unfolded (`Shell::carried_rows`): the
+                    // tail a served fire leaves at most
+                    let own = tokens.len() as u32;
+                    let left = own.min(tail_rows);
                     RsVerb::Buffer {
                         pages: scratch.rs.clone(),
                         base: 0,
                         folded: first.saturating_sub(carried),
-                        fold: FoldLen::Host(carried),
+                        fold: FoldLen::Host(carried + own - left),
                         lineage: engine::fire::Lineage::Set,
                     }
                 } else {

@@ -608,6 +608,16 @@ pub fn causal_conv1d_committed(
     )
 }
 
+/// `x` (`[l, w]`) with zero rows after it to `rows`.
+fn pad_rows(f: &mut Func, x: Val, rows: i64) -> Built<Val> {
+    let l = f.dims(x)[0];
+    if l == rows {
+        return Ok(x);
+    }
+    let zero = f.const_f(f.elem(x), 0.0, &[]);
+    f.pad(x, zero, &[0, 0], &[rows - l, 0], &[0, 0])
+}
+
 /// The conv's decode step over each lane's committed window (its slot of
 /// `conv_state`) and its carried rows (`carried`, `[lanes, rows, channels]`,
 /// gathered from the rs buffer), then its own row (`x`, one a lane): the
@@ -644,7 +654,9 @@ pub fn causal_conv1d_carried(
     let per = slot_rows(OP, "conv", conv_state, hist * u64::from(channels))?;
     let lanes = LaneTables::Committed { indptr, seat }.lanes(f, OP, i64::from(x.rows))?;
     let l = f.dims(lanes.slot)[0];
-    if l != i64::from(x.rows) {
+    // a decode window replays nothing: its first rows are its lanes' own,
+    // one each, the rest padding
+    if l > i64::from(x.rows) {
         return Err(refuse(OP, "a decode step's lanes are its rows, one each"));
     }
     let (c, k, h) = (i64::from(channels), i64::from(taps), hist as i64);
@@ -654,6 +666,7 @@ pub fn causal_conv1d_carried(
     let window = f.reshape(past, &[l, h, c])?;
     let carried = f.convert(carried, Elem::F32);
     let own = x.f32(f);
+    let own = f.slice_axis(own, 0, 0, l)?;
     let w = weight.f32(f);
     let w = f.reshape(w, &[c, k])?;
     let bias = bias.map(|b| flat_f32(f, b)).transpose()?;
@@ -676,7 +689,7 @@ pub fn causal_conv1d_carried(
     let next = f.reshape(stepped.window, &[l, h * c])?;
     let next = f.convert(next, f.elem(slab));
     let slab = land_slots(f, slab, lanes.slot, lanes.write, next, per)?;
-    Ok((stepped.y, slab))
+    Ok((pad_rows(f, stepped.y, i64::from(x.rows))?, slab))
 }
 
 /// `y = conv(state ++ x) + x`, one row per lane.
@@ -2123,7 +2136,8 @@ pub fn gated_delta_carried(
     )?;
     let lanes = LaneTables::Committed { indptr, seat }.lanes(f, OP, i64::from(qkv.rows))?;
     let l = f.dims(lanes.slot)[0];
-    if l != i64::from(qkv.rows) {
+    // a decode window replays nothing: its first rows are its lanes' own
+    if l > i64::from(qkv.rows) {
         return Err(refuse(OP, "a decode step's lanes are its rows, one each"));
     }
     let r = f.dims(keys)[1];
@@ -2132,6 +2146,7 @@ pub fn gated_delta_carried(
     let s0 = f.convert(s0, Elem::F32);
     let s0 = f.reshape(s0, &[l, hv, dk, dv])?;
     let row = qkv.f32(f);
+    let row = f.slice_axis(row, 0, 0, l)?;
     let q = f.slice_axis(row, 1, 0, hk * dk)?;
     let q = f.reshape(q, &[l, hk, dk])?;
     let k = f.slice_axis(row, 1, hk * dk, 2 * hk * dk)?;
@@ -2139,6 +2154,7 @@ pub fn gated_delta_carried(
     let v = f.slice_axis(row, 1, 2 * hk * dk, 2 * hk * dk + hv * dv)?;
     let v = f.reshape(v, &[l, hv, dv])?;
     let g = gates.f32(f);
+    let g = f.slice_axis(g, 0, 0, l)?;
     let decay = f.slice_axis(g, 1, 0, hv)?;
     let beta = f.slice_axis(g, 1, hv, 2 * hv)?;
     let keys = f.convert(keys, Elem::F32);
@@ -2182,7 +2198,7 @@ pub fn gated_delta_carried(
     let next = f.reshape(stepped.state, &[l, hv * dk * dv])?;
     let next = f.convert(next, f.elem(slab));
     let slab = land_slots(f, slab, lanes.slot, lanes.write, next, per)?;
-    Ok((y, u, slab))
+    Ok((pad_rows(f, y, i64::from(qkv.rows))?, u, slab))
 }
 
 /// The corrected values of the rows a buffering fire's lanes leave past
