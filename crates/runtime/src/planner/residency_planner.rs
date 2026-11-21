@@ -905,9 +905,16 @@ impl ResidencyPlanner {
         let (kv_missing, rs) = kv_missing;
         let pages = kv_missing.saturating_add(self.port.rs_as_pages(rs));
         let per_chunk = self.port.chunks_as_pages(1);
+        // As single chunks beside its runs, never runs of their own: asked
+        // as runs of the longest length, a restore with many pages to
+        // gather asked runs no pool of this size held (Mac Pro at 2 GiB on
+        // c10d7de5d: (7, 1) grew to (7, 31), 217 chunks against 30 free runs
+        // of 7, on a device 310 of 365 pages free, and nothing was moved).
+        // Where its gathered pages break runs the map stood, the store's
+        // placement (its kv taken first) refuses it, and the room is made
+        // ([`Self::refused_in_this_room`]).
         if per_chunk > 0 && pages > 0 {
-            let (run, _) = room.longest().unwrap_or(need);
-            room.add(run, pages.div_ceil(per_chunk).div_ceil(run.max(1)));
+            room.add(1, pages.div_ceil(per_chunk));
         }
         if !capped {
             return Some(room);

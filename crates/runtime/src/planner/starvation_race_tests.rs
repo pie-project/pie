@@ -6969,7 +6969,11 @@ async fn a_restore_is_funded_for_its_runs_and_its_kv_pages_together() {
             },
         )
     });
-    assert_eq!(planner.head_room(key), Some(super::pool::RunNeed::one(2, 2)), "its run and its pages' chunks");
+    // Its run, and its two pages' chunks beside it as single chunks (not
+    // a run of their own): four chunks against three free.
+    let mut need = super::pool::RunNeed::one(2, 1);
+    need.add(1, 2);
+    assert_eq!(planner.head_room(key), Some(need), "its run and its pages' chunks");
     assert!(pool.guest_room_free(2, 1), "the run alone stands");
     planner.poke();
     for _ in 0..200 {
@@ -8256,10 +8260,15 @@ async fn a_restore_refused_in_its_unpark_s_room_goes_again_only_on_more_room() {
         Some((4, 1)),
         "not grown on runs only the map shows"
     );
+    // Its state's chunks are single chunks beside its run, not runs of
+    // four (asked so, a restore with much to gather asked runs no pool
+    // held: Mac Pro at 2 GiB on c10d7de5d).
+    let mut need = super::pool::RunNeed::one(4, 1);
+    need.add(1, 8);
     assert_eq!(
         planner.head_room(key),
-        Some(super::pool::RunNeed::one(4, 3)),
-        "its run of four, and its state's eight chunks in runs of four"
+        Some(need),
+        "its run of four, and its state's eight chunks beside it"
     );
     // (The pool here holds no state slots: the rest asks none.)
     planner.with_inner(|inner| {
@@ -9775,4 +9784,38 @@ async fn a_restore_refused_in_this_room_is_never_sent_again_on_it_whatever_the_r
         planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
         "the room is made ({end:?})"
     );
+}
+
+/// Mac Pro at 2 GiB on c10d7de5d: a restore with a bind's run of 7 and
+/// many kv pages to gather asked them as runs of 7 ((7, 1) grew to (7,
+/// 31), past the 30 free runs on a device 310 of 365 pages free), and the
+/// pass ended "no pick". Its pages are single chunks beside its run.
+#[test]
+fn a_restore_s_pages_to_gather_are_single_chunks_beside_its_runs() {
+    let pool = Arc::new(BindRoomPool::new(64, 0..0, 64));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let head = ProcessId::new_v4();
+    planner.register(head);
+    planner.note_admitted(head);
+    let key = planner.with_inner(|inner| {
+        let proc = inner.procs.get_mut(&head).unwrap();
+        proc.state = Residency::Evicted;
+        proc.roles_short = Some(PendingBind {
+            run: 7,
+            pieces: 1,
+            pages: 7,
+        });
+        inner.enqueue(
+            head,
+            WaitKind::Restore {
+                demand: Demand {
+                    kv_pages: 30,
+                    rs: RsUnits::default(),
+                },
+            },
+        )
+    });
+    let mut need = super::pool::RunNeed::one(7, 1);
+    need.add(1, 30);
+    assert_eq!(planner.head_room(key), Some(need));
 }
