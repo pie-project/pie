@@ -108,6 +108,17 @@ impl Session {
                     );
 
                     let inf = crate::scheduler::get_stats().await;
+                    // How often the engine lanes slept between requests,
+                    // and stayed awake for work owed them instead.
+                    let (sleeps, awaits) = crate::scheduler::lane_waits();
+                    stats.insert(
+                        format!("{}.engine_lane_sleeps", model_name),
+                        serde_json::Value::from(sleeps),
+                    );
+                    stats.insert(
+                        format!("{}.engine_lane_awaits", model_name),
+                        serde_json::Value::from(awaits),
+                    );
                     stats.insert(
                         format!("{}.total_batches", model_name),
                         serde_json::Value::from(inf.total_batches),

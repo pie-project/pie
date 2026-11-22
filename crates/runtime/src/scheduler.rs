@@ -608,6 +608,14 @@ pub(crate) fn submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
     )
 }
 
+/// The times the engine lanes slept on their queues (nothing queued, nothing
+/// of their own owed) and stayed awake for work owed them (a landing, or the
+/// launch their scheduler posts from fires they settled), every lane summed.
+pub fn lane_waits() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (lane::LANE_SLEEPS.load(Relaxed), lane::LANE_AWAITS.load(Relaxed))
+}
+
 pub async fn get_stats() -> AggregateStats {
     let scheduler_stats: Vec<Arc<stats::SchedulerStats>> = handle_registry()
         .read()
