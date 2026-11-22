@@ -1041,7 +1041,7 @@ repro. What closes it:
 - `blocks_that_meet_run_on_a_few_units` runs the epilogue's cases (split rows) and the lane
   sampler's in a process `HSA_CU_MASK` keeps to four units; both hung there before.
 
-## F47. `resident_workgroups` is not reproducible across boots: its consumers must tolerate +-40%
+## F51. `resident_workgroups` is not reproducible across boots: its consumers must tolerate +-40%
 
 The load's rates step measures the workgroups a device holds at once (`[rates]
 resident_workgroups`, `engine_gpu::rates::resident_workgroups`): one workgroup of the matmul's
@@ -1094,7 +1094,7 @@ expert DMA's overlap with neighbouring ops in the fire (the held up call's 59 us
 wait on its weight copy that the pooled form spreads), or reads off the 4.5M-row pool. Next: a
 profile of the pooled call's DMA waits in the fire, and the same fire's schedule held vs pooled.
 
-## F48. The declared-context cut's "one sequence at most half the room" is a tuned constant
+## F52. The declared-context cut's "one sequence at most half the room" is a tuned constant
 
 `store::declared_context_within` (engine-cuda) serves a declared context at
 the longest one sequence of which takes no more than half the live room past
