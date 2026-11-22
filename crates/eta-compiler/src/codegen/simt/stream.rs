@@ -1619,13 +1619,20 @@ pub(super) fn emit_stream(
                     let bank = streams.meets.get() % 2;
                     // Each part's candidate to the lane arena; in the next
                     // phase every block takes the row's best of them, the one
-                    // a block's scan picks (the order is total).
+                    // a block's scan picks (the order is total). A row on
+                    // one block (its launch did not split it: more rows than
+                    // the arena's lines hold) has its answer here, and its
+                    // phases run one after another all the same.
                     let _ = writeln!(
                         epilogue,
-                        "      if (stream_lane == 0u) ptir_put_candidate(ptir_meet_word, {bank}u, ptir_row, ptir_part, cand{node});"
+                        "      if (stream_lane == 0u && ptir_split == 1u) m1_store_i({ptr}, 0u, (int)cand{node}.index);"
+                    );
+                    let _ = writeln!(
+                        epilogue,
+                        "      else if (stream_lane == 0u) ptir_put_candidate(ptir_meet_word, {bank}u, ptir_row, ptir_part, cand{node});"
                     );
                     let _ = writeln!(epilogue, "    }}");
-                    let _ = writeln!(post, "    if (stream_warp == 0u) {{");
+                    let _ = writeln!(post, "    if (stream_warp == 0u && ptir_split != 1u) {{");
                     let _ = writeln!(
                         post,
                         "      cand{node} = stream_lane < ptir_split ? ptir_get_candidate(ptir_meet_word, {bank}u, ptir_row, stream_lane) : M1ArgmaxCandidate{{m1_neg_inf(), 0u, 0u, 0u}};"

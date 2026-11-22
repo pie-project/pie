@@ -998,7 +998,9 @@ fn bf16_suites() -> Vec<Suite> {
             .map(|(name, shape)| standard(name, shape)),
     );
     suites.push(standard("penalized min-p + top-p", &penalized));
-    suites.extend([beam_bf16(1), beam_bf16(4)]);
+    // Seventeen beams: more rows than a split row's launch splits
+    // (`LANE_SAMPLER_BLOCKS`), each row on one block through every phase.
+    suites.extend([beam_bf16(1), beam_bf16(4), beam_bf16(17)]);
     suites
 }
 
