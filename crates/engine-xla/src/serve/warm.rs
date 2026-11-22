@@ -397,6 +397,7 @@ impl Shell {
         let started = std::time::Instant::now();
         // Trace every shape (nothing runs), then compile the new programs
         // side by side: a compile is host work, one core each.
+        self.trace_scope = Some(self.trace_scope());
         self.deferred = Some(Vec::new());
         let mut fired = 0;
         let mut failed = None;
@@ -462,13 +463,12 @@ impl Shell {
     /// Next's mini on a v5e refused its whole load over one, "Ran out of
     /// memory on HBM" at m=9772). Any other compile failure fails the load.
     fn compile_deferred(&mut self, deferred: Vec<super::Deferred>) -> Result<usize> {
-        let mut texts: Vec<(&str, &crate::trace::Signature)> = Vec::new();
+        let mut texts: Vec<(&crate::device::Code, &crate::trace::Signature)> = Vec::new();
         let mut index: Vec<usize> = Vec::with_capacity(deferred.len());
         let mut seen: std::collections::HashMap<[u8; 32], usize> = std::collections::HashMap::new();
         for d in &deferred {
-            let hash = *blake3::hash(d.text.as_bytes()).as_bytes();
-            let at = *seen.entry(hash).or_insert_with(|| {
-                texts.push((d.text.as_str(), &d.sig));
+            let at = *seen.entry(d.code.hash()).or_insert_with(|| {
+                texts.push((&d.code, &d.sig));
                 texts.len() - 1
             });
             index.push(at);
@@ -482,8 +482,16 @@ impl Shell {
         // 168-program ladder one compile at a time, 73 compile-minutes past
         // the hour a round has). A v5e host's 47 GB stopped answering at four
         // started together.
-        let need = texts.iter().map(|(t, _)| compile_need(t)).max().unwrap_or(0);
-        let least = texts.iter().map(|(t, _)| compile_need(t)).min().unwrap_or(0);
+        let need = texts
+            .iter()
+            .filter_map(|(c, _)| c.text().map(compile_need))
+            .max()
+            .unwrap_or(0);
+        let least = texts
+            .iter()
+            .filter_map(|(c, _)| c.text().map(compile_need))
+            .min()
+            .unwrap_or(0);
         // A compiled program held in host memory takes what its load is
         // measured to take ([`HostRoom`]), and libtpu's allocator keeps what
         // a dropped one freed for its own next use, giving the host none
@@ -533,21 +541,22 @@ impl Shell {
                         let Some((text, sig)) = texts.get(at) else {
                             break;
                         };
-                        let reserved = if !parks || device.on_disk(text) {
-                            host_room.take(text)
+                        let reserved = if !parks || device.code_on_disk(text) {
+                            host_room.take(text.len())
                         } else {
                             None
                         };
                         let kept = reserved.is_some();
                         if !kept {
                             parked.fetch_add(1, SeqCst);
-                            if device.on_disk(text) {
+                            if device.code_on_disk(text) {
                                 continue;
                             }
                         }
                         let program = {
-                            let _admitted = admission.admit(text);
-                            device.prepare(text, (*sig).clone())
+                            // a cached program loads, never compiled
+                            let _admitted = text.text().map(|t| admission.admit(t));
+                            prepared(device, text, (*sig).clone())
                         };
                         if let Some(r) = reserved {
                             host_room.done(r, program.is_ok());
@@ -558,7 +567,7 @@ impl Shell {
                             }
                         } else {
                             drop(program);
-                            device.forget(text);
+                            device.forget_code(text);
                         }
                         #[cfg(target_os = "linux")]
                         // SAFETY: `malloc_trim` only releases free heap pages.
@@ -600,14 +609,14 @@ impl Shell {
                             if full.load(SeqCst) {
                                 break;
                             }
-                            if held[at].is_some() || !device.on_disk(text) {
+                            if held[at].is_some() || !device.code_on_disk(text) {
                                 continue;
                             }
-                            let Some(reserved) = host_room.take(text) else {
+                            let Some(reserved) = host_room.take(text.len()) else {
                                 full.store(true, SeqCst);
                                 break;
                             };
-                            let program = device.prepare(text, (*sig).clone());
+                            let program = prepared(device, text, (*sig).clone());
                             host_room.done(reserved, program.is_ok());
                             if let Ok(mut slot) = loads[at].lock() {
                                 *slot = Some(program);
@@ -668,7 +677,7 @@ impl Shell {
                     self.parked.insert(
                         d.key,
                         super::Parked {
-                            text: d.text,
+                            code: d.code,
                             sig: d.sig,
                             probed: d.probed,
                         },
@@ -775,4 +784,21 @@ fn lane_counts(p: u32) -> Vec<u32> {
     ns.sort_unstable();
     ns.dedup();
     ns
+}
+
+/// `code`'s program, from the disk cache where it is a cached one (whose
+/// file a later clear of the cache may have taken: refused by name).
+fn prepared(
+    device: &crate::device::Device,
+    code: &crate::device::Code,
+    sig: crate::trace::Signature,
+) -> Result<std::sync::Arc<crate::device::Program>> {
+    device
+        .prepare_code(code, sig)?
+        .ok_or_else(|| crate::error::Fault::Program {
+            at: "serve::warm",
+            why: "a program a traced fire's record names is gone from the disk cache: the \
+              cache was cleared under the load"
+                .to_string(),
+        })
 }
