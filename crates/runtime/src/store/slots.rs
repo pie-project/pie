@@ -1977,6 +1977,20 @@ impl SlotPool {
         Some(self.chunks[chunk as usize].shape).filter(|&shape| shape != NO_SHAPE)
     }
 
+    /// The bytes the chunks opened now for any of `shapes` hold free: their
+    /// unused slots, room no other shape takes until a chunk empties.
+    #[must_use]
+    pub fn slack_of(&self, shapes: &[ShapeId]) -> u64 {
+        self.chunks
+            .iter()
+            .filter(|meta| meta.shape != NO_SHAPE && shapes.contains(&meta.shape))
+            .map(|meta| {
+                let shape = &self.shapes[meta.shape as usize].shape;
+                u64::from(shape.slots_per_chunk.saturating_sub(meta.used)) * shape.slot_bytes
+            })
+            .sum()
+    }
+
     /// Slots `holder` holds references on.
     pub fn held_by(&self, holder: &Holder) -> u64 {
         self.holders.get(holder).copied().unwrap_or(0)

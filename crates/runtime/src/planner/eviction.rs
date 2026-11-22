@@ -975,6 +975,8 @@ impl ResidencyPlanner {
                         && !inner.prepare_blocked.contains(*pid)
                         // Being failed: it frees its pages as it ends.
                         && !inner.killing.contains(*pid)
+                        // The finisher is no victim ([`super::inner::CapacityGate`]).
+                        && !inner.is_finisher(**pid)
                 })
                 .map(|(pid, proc)| Victim {
                     pid: *pid,
@@ -1059,7 +1061,13 @@ impl ResidencyPlanner {
                 // the victim set chose it (the one rule there).
                 let yields =
                     proc.idle || proc.held || proc.bind_waiting || quiet || !proc.firing();
+                // The finisher is no victim while it is the finisher
+                // ([`super::inner::CapacityGate`]): parked, the tiers'
+                // headroom kept for it served no one (the simulation's seed
+                // 72: the finisher evicted, every other ask held at the
+                // gate). The policy picks among the others.
                 if proc.state != Residency::Resident
+                    || inner.is_finisher(pid)
                     || inner.unfired_protects(pid)
                     || proc.restored_past == Some(head_pid)
                     || (proc.rank() <= head_rank && !yields)
@@ -1276,6 +1284,11 @@ impl ResidencyPlanner {
             let hoard = inner.accum.len() as u32;
             inner.queue.iter().find_map(|(&key, waiter)| {
                 if key == head_key || !waiter.is_unmet() {
+                    return None;
+                }
+                // Past what every tier keeps for the finisher: it waits
+                // on the gate ([`super::inner::CapacityGate`]).
+                if inner.capacity.is_some_and(|gate| gate.holds_waiter(waiter)) {
                     return None;
                 }
                 match &waiter.kind {

@@ -1901,6 +1901,11 @@ impl KvPageTable {
             .count() as u32
     }
 
+    /// The pages a move between tiers holds a slot of on both sides.
+    pub fn moving_pages(&self) -> usize {
+        self.swap_locations.len()
+    }
+
     /// Dropping what holds it would change pages under the move.
     pub fn in_move_at(&self, root: NodeId) -> bool {
         if self.swap_locations.is_empty() {

@@ -194,6 +194,15 @@ impl PoolShape {
         self.total.div_ceil(self.segment)
     }
 
+    /// What one process may hold at most, in kv pages: half the state
+    /// chunks and a tenth less a program's largest run, so it always fits
+    /// the pool alone. The pool's declared context (the capacity gate's end
+    /// for a process: none states its own).
+    fn most_pages(&self) -> u32 {
+        let largest_run = self.programs.iter().map(|p| p.run * 2).max().unwrap_or(0);
+        (self.state_chunks() * 3 / 5).saturating_sub(largest_run).max(2) * PAGES_PER_CHUNK
+    }
+
     /// State chunks: the total less the reserved chunk and the activation.
     fn state_chunks(&self) -> u32 {
         self.total - 1 - 2
@@ -267,7 +276,7 @@ impl PoolShape {
         let tiers = crate::store::shared::Tiers::of(&facts).unwrap();
         let engines = [crate::store::registry::EngineStores {
             pools: crate::store::chunks::StorePools::of(&facts).expect("shared facts"),
-            max_context: 4096,
+            max_context: self.most_pages() as usize * 16,
             shared: Some(device),
             tiers,
         }];
@@ -931,8 +940,8 @@ impl Workload {
         let state = pool.state_chunks();
         // What one process may hold at most: half the state chunks less a
         // program's largest run, so it always fits the pool alone.
-        let largest_run = pool.programs.iter().map(|p| p.run * 2).max().unwrap_or(0);
-        let most = (state * 3 / 5).saturating_sub(largest_run).max(2) * PAGES_PER_CHUNK;
+        let _ = state;
+        let most = pool.most_pages();
         let mut rescore_rng = Rng(seed ^ 0x7e5c_07e5);
         let count = rng.range(6, 32);
         let horizon = rng.range(4, 40);
@@ -1340,6 +1349,9 @@ struct Log {
     checks: u64,
     pages_checked: u64,
     guest_slots_checked: u64,
+    /// The capacity gate's figures as the last step with nothing moving
+    /// between tiers read them.
+    capacity: Option<super::inner::CapacityRead>,
 }
 
 impl Ctx {
@@ -1686,6 +1698,7 @@ async fn bind(ctx: &Ctx, pid: ProcessId, program: u32) -> Result<InstanceId, Str
                     |_| false,
                     Some(pid),
                     |pid| ctx.planner.is_resident(pid),
+                    |pid, chunks| ctx.planner.capacity_holds_chunks(pid, chunks),
                 )
             })();
             let (roles, engine, binding) = (roles.clone(), engine.clone(), binding.clone());
@@ -1720,7 +1733,10 @@ async fn bind(ctx: &Ctx, pid: ProcessId, program: u32) -> Result<InstanceId, Str
             }
         },
         || Some(roles.lock().unwrap().room_watch()),
-        |run, pieces| roles.lock().unwrap().free_runs(run) >= pieces,
+        |run, pieces| {
+            roles.lock().unwrap().free_runs(run) >= pieces
+                && !planner.capacity_would_hold(pid, run.max(1).saturating_mul(pieces))
+        },
         |run, pieces| {
             let suspended = roles.lock().unwrap().holds_guest_state(pid)
                 && planner.suspend_for_room(pid, run, pieces);
@@ -1779,7 +1795,7 @@ fn take_bind_error(
 ) -> String {
     let mut engine = engine.lock().unwrap();
     let free_chunks = roles.lock().unwrap().free_runs(1);
-    match crate::store::roles::take_bind(Some(roles), &mut *engine, binding, |_| false, Some(pid), |_| true) {
+    match crate::store::roles::take_bind(Some(roles), &mut *engine, binding, |_| false, Some(pid), |_| true, |_, _| false) {
         Ok(taken) => {
             if let Some(taken) = taken {
                 roles.lock().unwrap().untake(taken);
@@ -2009,7 +2025,7 @@ const LOST_WAKES_FAIL: bool = false;
 
 /// The checks after a settled step: the processes refused since the last
 /// (the run goes on), or `Err`, the failure that ends it.
-fn check(ctx: &Ctx, step: u32) -> Result<Vec<Failure>, Failure> {
+fn check(ctx: &Ctx, step: u32, moving: bool) -> Result<Vec<Failure>, Failure> {
     let fail = |kind: &str, line: String| Failure {
         step,
         kind: kind.to_string(),
@@ -2031,6 +2047,44 @@ fn check(ctx: &Ctx, step: u32) -> Result<Vec<Failure>, Failure> {
         .next()
     {
         return Err(fail("quiet", format!("a wait chosen with nothing in flight: {ended}")));
+    }
+    // The capacity gate's invariant: every path that adds state goes
+    // through it, so every tier together keeps the finisher's headroom.
+    // The capacity gate's invariant: every path that adds state goes
+    // through it, so between two steps with nothing moving between tiers
+    // (a move holds its slots on both while its copies land), the same
+    // finisher and the same capacity, the tiers' free pages never fall
+    // further short of the finisher's headroom. A breach is named at the
+    // step it happens.
+    let moving = moving
+        || ctx.planner.with_inner(|inner| {
+            !inner.evicting.is_empty()
+                || inner.procs.values().any(|proc| {
+                    matches!(
+                        proc.state,
+                        super::proc::Residency::Evicting | super::proc::Residency::Restoring
+                    )
+                })
+        });
+    if !moving && let Some(read) = ctx.planner.capacity_read() {
+        let before = ctx.log.lock().unwrap().capacity.replace(read);
+        let short = read.others_short();
+        if let Some(before) = before
+            && before.finisher == read.finisher
+            && before.whole == read.whole
+            && short > before.others_short()
+        {
+            return Err(fail(
+                "capacity",
+                format!(
+                    "every tier together holds {} pages free, {short} short of the finisher \
+                     {}'s headroom, {} short the step before: {read:?}; before {before:?}",
+                    read.gate().free,
+                    read.finisher,
+                    before.others_short()
+                ),
+            ));
+        }
     }
     if let Some(refusal) = std::mem::take(&mut ctx.engine.lock().unwrap().refusals)
         .into_iter()
@@ -2345,7 +2399,7 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
         // The drain task's beat.
         planner.tick();
         quiesce(&ctx, &mut lane, &mut pending, step, workload.late).await;
-        match check(&ctx, step) {
+        match check(&ctx, step, !pending.is_empty()) {
             Ok(refused) => {
                 for failed in refused {
                     if !failures
@@ -2393,9 +2447,18 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
                 kind: "liveness".to_string(),
                 line: format!(
                     "{} of {total} processes still running {} steps after the last arrival; \
-                     stuck {stuck:?}; queue {}; evicting/in flight {}; copies pending {}; free chunks {}",
+                     stuck {stuck:?}; capacity gate {:?}; queue {}; evicting/in flight {}; copies \
+                     pending {}; free chunks {}",
                     total - ended,
                     step - last_arrival,
+                    planner.capacity_gate().map(|gate| {
+                        let state = planner.with_inner(|inner| {
+                            inner.procs.get(&gate.finisher).map(|proc| {
+                                format!("{:?} unfired={} bind_waiting={}", proc.state, proc.unfired, proc.bind_waiting)
+                            })
+                        });
+                        (gate, state)
+                    }),
                     planner.debug_queue(),
                     planner.with_inner(|inner| inner.evicting.len()),
                     pending.len(),
