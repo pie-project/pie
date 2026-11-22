@@ -902,7 +902,7 @@ pub fn element_type(elem: kernels_xla::hlo::Elem) -> ElementType {
 /// The environment the plugin's compiler reads its flags from: part of a
 /// cached program's key, so a program compiled under other flags is not
 /// loaded in its place.
-const COMPILER_ENV: [&str; 2] = ["LIBTPU_INIT_ARGS", "XLA_FLAGS"];
+pub(crate) const COMPILER_ENV: [&str; 2] = ["LIBTPU_INIT_ARGS", "XLA_FLAGS"];
 
 fn disk_cache() -> Option<PathBuf> {
     match std::env::var_os("PIE_XLA_CACHE") {
