@@ -777,21 +777,13 @@ impl ModelConfig {
     }
 }
 
-/// `[runtime]`. `runtime.submit_deadline` was removed (no lane is dropped
-/// from a frame on a timer any more): a config that still carries it is
-/// refused at load as an unknown field. To migrate, delete the line.
+/// `[runtime]`. `runtime.submit_deadline` and `runtime.silence_timeout` were
+/// removed (no lane is dropped from a frame, and no process terminated, on
+/// a timer any more): a config that still carries either is refused at load
+/// as an unknown field. To migrate, delete the line.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
-    /// How long an awaited lane may stay silent before the runtime
-    /// terminates its process as abandoned, in seconds. A lane whose guest
-    /// waits on outside input (a session receive, a timer, an HTTP
-    /// response) is parked by the host, and one that calls
-    /// `forward.park()` parks itself: neither is ever killed however long
-    /// it stays away. (`runtime.submit_deadline` was removed: a config
-    /// carrying it is refused at load; delete the line.)
-    #[serde(default = "default_silence_timeout")]
-    pub silence_timeout: Duration,
     /// Waves per frame (*k*): how many token steps the wait-all quorum admits
     /// before it runs. A deployment constant, fixed at runtime start like the
     /// KV page size. Bounded above by the CUDA engine — see [`Self::validate`].
@@ -823,7 +815,6 @@ fn default_snapshot_budget() -> ByteSize {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
-            silence_timeout: default_silence_timeout(),
             frame_size: default_frame_size(),
             frame_dispatch_depth: default_frame_dispatch_depth(),
             max_concurrent_processes: None,
@@ -835,10 +826,6 @@ impl Default for RuntimeConfig {
 
 impl RuntimeConfig {
     fn validate(&self, max_frames: u8) -> Result<()> {
-        ensure!(
-            self.silence_timeout.as_micros() > 0,
-            "runtime.silence_timeout must be > 0"
-        );
         ensure!(self.frame_size >= 1, "runtime.frame_size must be >= 1");
         ensure!(
             self.frame_dispatch_depth >= 1,
@@ -869,10 +856,6 @@ impl RuntimeConfig {
         }
         Ok(())
     }
-}
-
-fn default_silence_timeout() -> Duration {
-    Duration::from_secs(600)
 }
 
 fn default_frame_size() -> u32 {

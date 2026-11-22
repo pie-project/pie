@@ -158,9 +158,11 @@ interface forward {
     /// While its guest waits on input from outside (a session receive, a
     /// timer, an HTTP response), the host parks it, and its next submit
     /// rejoins. `park` is how a pipeline that stops for any other reason
-    /// says so: it leaves the wait-set for as long as you like. An awaited
-    /// pipeline silent past the runtime's silence timeout reads as
-    /// abandoned, and its instance is terminated.
+    /// says so: it leaves the wait-set for as long as you like. A pipeline
+    /// whose guest computes without submitting is held for only while
+    /// another frame covers the device: once holding for it would leave the
+    /// device idle, the frame seals past it and its next submit rejoins. No
+    /// pipeline is terminated for being silent.
     ///
     /// Ordered against this pipeline's own submits, not against the call: it
     /// takes effect once every frame submitted before it has sealed, so it is
