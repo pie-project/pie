@@ -986,6 +986,16 @@ Remove it once each case it still catches has its own mechanism:
 - (c) a completion that never arrives (a lane in flight for twice the timeout is terminated
   through the same path today).
 
+Resolved on sc/mac-no-silence: the timeout, its clock, `owes_forever`, `FramePlan::Terminate`
+and `runtime.silence_timeout` are gone (an old config naming the key is refused as an unknown
+field). A blocking lane whose guest computes, (a) and (b) alike, is held while a frame is in
+flight, or until every other member has submitted since the last retire; past that, with the
+device idle, the frame seals past it and its next submit rejoins: never held for good, never
+terminated. (c) is a named wait ("its fire in flight" / "its bind"); a completion lost is the
+engine's or the store's to refuse by name where it is lost. The stall dump names each lane's
+wait. Metal Qwen3-0.6B, M1, ABBA vs 0b2bd5386: c1 180.1 → 182.9, c8 668.0 → 669.4, c64
+1745.4 → 1744.0, c8 at frame_size 1 683.9 → 683.3 tok/s.
+
 ## F46. Something writes into the guest lane arenas' split lines while a meeting runs, under overlap (ROCm, found 2026-11-20)
 
 While building self-resetting meet counters (each split row's meeting leaving its word's count

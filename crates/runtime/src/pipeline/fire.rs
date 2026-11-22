@@ -9688,7 +9688,6 @@ pub(crate) mod fold_tests {
             ) {
                 FramePlan::Dispatch(waves) => waves,
                 FramePlan::Hold(_) | FramePlan::Park => Vec::new(),
-                FramePlan::Terminate(lanes) => panic!("the scheduler gave up on {lanes:?}"),
             }
         }
     }

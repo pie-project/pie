@@ -283,7 +283,6 @@ pub struct KeptDisk {
 
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
-    pub silence_timeout_secs: u64,
     pub frame_size: u32,
     pub frame_dispatch_depth: u32,
 }
@@ -961,9 +960,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         });
     }
 
-    crate::scheduler::set_silence_timeout(std::time::Duration::from_secs(
-        scheduler.silence_timeout_secs,
-    ));
     let scheduler_shutdown = crate::scheduler::spawn(&engines, kv_page_size as u32).await?;
     // Each engine takes the weight residency it starts with before the load
     // returns, so before any fire is submitted: none reads from the host a

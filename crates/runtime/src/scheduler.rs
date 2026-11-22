@@ -10,8 +10,7 @@ pub mod worker;
 pub use frame::FrameStamp;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::{Result, anyhow};
 
@@ -386,16 +385,6 @@ pub(crate) async fn tap_groups(engine_id: usize) -> Result<Option<::engine::TapG
     known[engine_id] = Some(groups.clone());
     Ok(groups)
 }
-
-pub fn configured_silence_timeout() -> Duration {
-    *SILENCE_TIMEOUT.get_or_init(|| Duration::from_secs(600))
-}
-
-pub fn set_silence_timeout(timeout: Duration) {
-    let _ = SILENCE_TIMEOUT.set(timeout);
-}
-
-static SILENCE_TIMEOUT: OnceLock<Duration> = OnceLock::new();
 
 pub fn configured_frame_size() -> usize {
     match FRAME_SIZE.load(Ordering::Relaxed) {
