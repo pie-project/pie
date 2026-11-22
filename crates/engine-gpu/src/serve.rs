@@ -292,6 +292,12 @@ pub trait Serve: Backend {
     /// Arm `arm`'s readout seat grew to `bytes`.
     fn grown(shell: &mut Shell<Self>, arm: usize, bytes: u64) -> Result<()>;
 
+    /// The load is done and serving starts: what the backend lays for the
+    /// frames serving holds, and makes no more of after.
+    fn serving(_shell: &mut Shell<Self>) -> Result<()> {
+        Ok(())
+    }
+
     /// Replays `prepared` where a kept step answers it, else how it walks.
     fn plan(shell: &mut Shell<Self>, prepared: &mut Prepared<'_, Self>) -> Result<Plan<Self>>;
 
