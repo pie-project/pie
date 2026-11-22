@@ -221,6 +221,9 @@ impl<T: Decision> Ladder<T> {
     /// stops holding, ascending: past each, the pick along `var` may change,
     /// so a walk that must meet every pick a range of `var` reaches visits
     /// each one inside it.
+    /// Along the other variables the pick may change too; a walk covers
+    /// them by visiting each of their values it serves at every value of
+    /// `var` it walks.
     #[must_use]
     pub fn starts(&self, var: usize) -> Vec<i64> {
         let mut out: Vec<i64> = self

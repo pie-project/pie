@@ -606,6 +606,15 @@ impl Shell {
                 call: "rates at load",
                 why,
             })?;
+        // An Apple10 device whose profile states no `kernel.dense` measures
+        // it here over the model's shapes, once: kept under the profiles and
+        // read back by later loads of the same shapes on the same kernels.
+        let chip =
+            crate::tune::dense::at_load(&device, chip, boot.profiles.as_deref(), boot.contract)
+                .map_err(|why| Fault::Device {
+                    call: "kernel.dense at load",
+                    why,
+                })?;
         if chip
             .ladder::<kernels_metal::tuning::Qmm>()
             .values()

@@ -60,14 +60,14 @@ fn rows(depth: Depth) -> Vec<u32> {
 
 /// How much a point counts: half the mix on decode-sized rows (2 to 8), a
 /// fifth on 9 to 64, the rest on prompt-sized rows; every shape alike.
-fn weight(rows_grid: &[u32], rows: u32) -> f64 {
+fn weight(rows_grid: &[u32], shapes: usize, rows: u32) -> f64 {
     let band = |lo: u32, hi: u32| rows_grid.iter().filter(|&&r| lo <= r && r <= hi).count();
     let per_rows = match rows {
         0..=8 => 0.5 / band(0, 8) as f64,
         9..=64 => 0.2 / band(9, 64) as f64,
         _ => 0.3 / band(65, u32::MAX) as f64,
     };
-    per_rows / SHAPES.len() as f64
+    per_rows / shapes.max(1) as f64
 }
 
 fn candidates(family: u32) -> Vec<Dense> {
@@ -209,6 +209,18 @@ pub(super) fn measure(
     depth: Depth,
     say: &mut dyn FnMut(&str),
 ) -> Result<Measured, String> {
+    measure_at(device, base, cores, SHAPES, &rows(depth), say)
+}
+
+/// [`measure`] over `shapes` at the row counts `grid`.
+fn measure_at(
+    device: &Context,
+    base: &Profile,
+    cores: Option<u32>,
+    shapes: &[(u32, u32)],
+    grid: &[u32],
+    say: &mut dyn FnMut(&str),
+) -> Result<Measured, String> {
     let family = device.family();
     let candidates = candidates(family);
     let tuning = |overrides: &str| -> Result<Tuning, String> {
@@ -233,15 +245,14 @@ pub(super) fn measure(
         })
         .collect::<Result<_, _>>()?;
     let today = tuning("")?;
-    let grid = rows(depth);
-    let widest = *grid.iter().max().expect("rows");
+    let widest = *grid.iter().max().ok_or("no rows to measure at")?;
     let handles = Handles::new();
     let pipelines = Pipelines::new();
     let mut out = Measured {
         candidates: candidates.clone(),
         ..Measured::default()
     };
-    for (at, &(n, k)) in SHAPES.iter().enumerate() {
+    for (at, &(n, k)) in shapes.iter().enumerate() {
         let (nn, kk) = (n as usize, k as usize);
         let weight_bytes = u64::from(n) * u64::from(k) * 2;
         if weight_bytes > SHAPE_BYTES / 2 {
@@ -281,7 +292,7 @@ pub(super) fn measure(
         drop(w_bytes);
         let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).map_err(|e| e.to_string());
         let (ha, ho) = (bind(&act_b)?, bind(&out_b)?);
-        for &m in &grid {
+        for &m in grid {
             let launch = |sink: &dyn Encode, tuning: &Tuning, copy: usize| {
                 gemm::matmul(
                     sink,
@@ -344,7 +355,7 @@ pub(super) fn measure(
         say(&format!(
             "  kernel.dense: {}/{} shapes ({n} x {k})",
             at + 1,
-            SHAPES.len()
+            shapes.len()
         ));
     }
     Ok(out)
@@ -385,8 +396,16 @@ fn wrong(handles: &Handles, ho: u32, m: u32, n: u32, k: u32, act: &[f64]) -> Opt
 
 /// The fitted `kernel.dense` ladder and its report line.
 pub(super) fn fit(measured: &Measured, depth: Depth) -> Result<((String, String), Line), String> {
+    fit_at(measured, &rows(depth), SHAPES.len())
+}
+
+/// [`fit`] for measurements over `shapes` shapes at the row counts `grid`.
+fn fit_at(
+    measured: &Measured,
+    grid: &[u32],
+    shapes: usize,
+) -> Result<((String, String), Line), String> {
     let spec = Dense::spec();
-    let grid = rows(depth);
     let candidates: Vec<Candidate> = measured
         .candidates
         .iter()
@@ -401,7 +420,7 @@ pub(super) fn fit(measured: &Measured, depth: Depth) -> Result<((String, String)
         .iter()
         .map(|p| Sample {
             at: vec![i64::from(p.rows), i64::from(p.n), i64::from(p.k)],
-            weight: weight(&grid, p.rows),
+            weight: weight(grid, shapes, p.rows),
             times: p.times.clone(),
         })
         .collect();
@@ -425,4 +444,151 @@ pub(super) fn fit(measured: &Measured, depth: Depth) -> Result<((String, String)
             measured: true,
         },
     ))
+}
+
+/// The bf16 matrices a model's contract holds, `(n, k)` as a matmul reads
+/// them (rows of the weight, the contraction), each once, ascending.
+fn shapes_of(contract: &checkpoint::contract::ModelContract) -> Vec<(u32, u32)> {
+    let mut out: Vec<(u32, u32)> = contract
+        .tensors
+        .iter()
+        .chain(contract.groups.iter().flat_map(|g| g.tensors.iter()))
+        .filter(|t| t.encoding == checkpoint::types::Encoding::Raw(checkpoint::types::DType::Bf16))
+        .filter_map(|t| match t.shape.as_deref() {
+            Some(&[n, k]) => Some((u32::try_from(n).ok()?, u32::try_from(k).ok()?)),
+            _ => None,
+        })
+        .filter(|&(n, k)| n > 1 && k > 1)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// FNV-1a over `bytes`, continuing from `hash`: a key that reads the same
+/// on every build, unlike the standard library's hasher.
+fn fnv(mut hash: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
+/// What a measured `kernel.dense` stands on: the device, the kernels it
+/// timed (their Metal sources) and the shapes. Not the pie version: a build
+/// that changes neither kernel keeps the measurement.
+fn load_key(device: &str, shapes: &[(u32, u32)]) -> u64 {
+    let mut hash = fnv(0xcbf2_9ce4_8422_2325, device.as_bytes());
+    for file in ["linear/gemm.metal", "linear/gemm_mpp.metal"] {
+        hash = fnv(hash, file.as_bytes());
+        hash = fnv(hash, kernels_metal::sources::source(file).unwrap_or("").as_bytes());
+    }
+    for &(n, k) in shapes {
+        hash = fnv(hash, &n.to_le_bytes());
+        hash = fnv(hash, &k.to_le_bytes());
+    }
+    hash
+}
+
+/// The row counts a load measures at: the decode and verify rows one by one
+/// to 8, where the kernels cross, then the prompt rows a few at a time.
+const LOAD_ROWS: [u32; 15] = [2, 3, 4, 5, 6, 8, 10, 12, 16, 24, 32, 48, 64, 128, 512];
+
+/// `chip` with `kernel.dense` measured on this device, where its profile
+/// states none and the GPU has the tensor-op tile, so the tile is not taken
+/// where it loses (a fixed rule cost an M5 Pro's 8-row decode 16-19%). The
+/// ladder is fitted over the model's own bf16 shapes at the rows a load
+/// serves and kept under `profiles` (`metal/dense/<device>-<key>.toml`,
+/// keyed on the device, the two kernels' sources and the shapes), so a
+/// later load of the same shapes on the same kernels reads it back instead
+/// of measuring. A profile that states `kernel.dense` (a checked-in device
+/// file, or the user's) and a GPU without tensor ops keep theirs.
+pub(crate) fn at_load(
+    device: &Context,
+    chip: Profile,
+    profiles: Option<&std::path::Path>,
+    contract: &checkpoint::contract::ModelContract,
+) -> Result<Profile, String> {
+    let spec = Dense::spec();
+    let stated = chip
+        .entries()
+        .any(|(s, _, defaulted)| s.id == spec.id && !defaulted);
+    if stated || !kernels_metal::tuning::apple10(device.family()) {
+        return Ok(chip);
+    }
+    let shapes = shapes_of(contract);
+    if shapes.is_empty() {
+        return Ok(chip);
+    }
+    let name = device.name().to_string();
+    let key = load_key(&name, &shapes);
+    let path = profiles.map(|p| {
+        p.join("metal")
+            .join("dense")
+            .join(format!("{}-{key:016x}.toml", profile::id_of(&name)))
+    });
+    let kept = path
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|text| {
+            text.split_once("dense = ")
+                .map(|(_, ladder)| ladder.trim().to_string())
+        });
+    let ladder = match kept {
+        Some(ladder) => ladder,
+        None => {
+            let began = std::time::Instant::now();
+            let measured =
+                measure_at(device, &chip, device.cores(), &shapes, &LOAD_ROWS, &mut |_| {})?;
+            if let Some((body, n, first)) = measured.wrong.first() {
+                return Err(format!(
+                    "kernel.dense at load: `{body}` answered wrongly at {n} points; first at {first}"
+                ));
+            }
+            let ((_, ladder), line) = fit_at(&measured, &LOAD_ROWS, shapes.len())?;
+            eprintln!(
+                "{name}: the profile states no kernel.dense; measured it over the model's {} bf16 \
+                 shapes in {:.1} s: {}",
+                shapes.len(),
+                began.elapsed().as_secs_f64(),
+                line.text
+            );
+            if let Some(path) = &path {
+                let text = format!(
+                    "# kernel.dense measured at load on {name}, over {} bf16 shapes \
+                     ({}) at rows {LOAD_ROWS:?}; key {key:016x}: the device, \
+                     linear/gemm.metal and linear/gemm_mpp.metal, the shapes. {}\n\
+                     dense = {}\n",
+                    shapes.len(),
+                    shapes
+                        .iter()
+                        .map(|(n, k)| format!("{n}x{k}"))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    line.text,
+                    ladder.trim()
+                );
+                if let Some(dir) = path.parent() {
+                    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+                }
+                std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))?;
+            }
+            ladder
+        }
+    };
+    crate::chip::registry()
+        .overlay(
+            &chip,
+            &format!("[kernel]\ndense = {ladder}\n"),
+            chip.target().clone(),
+            chip.source().clone(),
+        )
+        .map_err(|e| {
+            format!(
+                "kernel.dense measured at load{}: {e}",
+                path.map(|p| format!(" ({})", p.display()))
+                    .unwrap_or_default()
+            )
+        })
 }

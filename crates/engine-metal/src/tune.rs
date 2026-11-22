@@ -2,7 +2,7 @@
 //! and `kernel.dense` ([`dense`]); the other searchable decisions are
 //! searched end to end on the served models.
 
-mod dense;
+pub(crate) mod dense;
 
 use std::cell::RefCell;
 use std::fmt::Write as _;
