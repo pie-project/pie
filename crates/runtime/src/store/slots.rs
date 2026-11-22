@@ -564,9 +564,35 @@ impl ShapeState {
     }
 }
 
+/// Test builds: the queue a pool's given-back slots go to
+/// ([`SlotPool::poison_into`]). A clone of the pool (a planner's or a test's
+/// copy to try a placement on) taps nothing: what it gives back it gives
+/// back in its copy alone, and the slots are still the live pool's.
+#[cfg(feature = "test-slot-fill")]
+#[derive(Default)]
+struct PoisonTap(Option<::engine::chunk::PoisonQueue>);
+
+#[cfg(feature = "test-slot-fill")]
+impl Clone for PoisonTap {
+    fn clone(&self) -> Self {
+        PoisonTap(None)
+    }
+}
+
+#[cfg(feature = "test-slot-fill")]
+impl std::fmt::Debug for PoisonTap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() { "PoisonTap(tapped)" } else { "PoisonTap(none)" })
+    }
+}
+
 /// See the module docs.
 #[derive(Clone, Debug)]
 pub struct SlotPool {
+    /// Test builds: where a slot given back goes to be poisoned
+    /// ([`PoisonTap`]).
+    #[cfg(feature = "test-slot-fill")]
+    poison: PoisonTap,
     chunk_bytes: u64,
     total: u32,
     reserved: u32,
@@ -811,6 +837,8 @@ impl SlotPool {
             changes: 0,
             held_for: BTreeMap::new(),
             next_ticket: 0,
+            #[cfg(feature = "test-slot-fill")]
+            poison: PoisonTap::default(),
         };
         pool.act = pool.act_chunks(0);
         assert!(
@@ -2592,6 +2620,9 @@ impl SlotPool {
             changes: 0,
             held_for: self.held_for.clone(),
             next_ticket: self.next_ticket,
+            // A placement's scratch gives nothing back for real.
+            #[cfg(feature = "test-slot-fill")]
+            poison: PoisonTap::default(),
         }
     }
 
@@ -2914,6 +2945,14 @@ impl SlotPool {
         let _ = self.given.signal.set((signal, tier, counts));
     }
 
+    /// Test builds: each slot given back from here on is pushed to `queue`
+    /// as its physical byte range, for the engine that backs this pool to
+    /// poison before its next verb ([`::engine::chunk::PoisonQueue`]).
+    #[cfg(feature = "test-slot-fill")]
+    pub fn poison_into(&mut self, queue: ::engine::chunk::PoisonQueue) {
+        self.poison = PoisonTap(Some(queue));
+    }
+
     fn slots_freed(&self) {
         if let Some((signal, tier, counts)) = self.given.signal.get() {
             (signal.0)(RoomCount {
@@ -3085,6 +3124,15 @@ impl SlotPool {
         self.changes += 1;
         let meta = self.chunks[slot.chunk as usize];
         let physical = self.logical_to_physical[slot.chunk as usize];
+        #[cfg(feature = "test-slot-fill")]
+        if let Some(queue) = &self.poison.0 {
+            let bytes = self.shapes[meta.shape as usize].shape.slot_bytes;
+            let offset = u64::from(physical) * self.chunk_bytes + u64::from(slot.index) * bytes;
+            queue
+                .lock()
+                .expect("the poison queue's lock is never poisoned")
+                .push((offset, bytes));
+        }
         let state = &mut self.shapes[meta.shape as usize];
         let (word, bit) = Bits::locate(slot.index);
         let at = meta.frame as usize * state.words + word;
@@ -3937,6 +3985,40 @@ mod tests {
                 ],
             );
         }
+    }
+
+    /// Test builds: a slot given back reaches the poison queue as its
+    /// physical byte range once its epoch retires, not before; a clone of
+    /// the pool (a placement tried on a copy) taps nothing.
+    #[cfg(feature = "test-slot-fill")]
+    #[test]
+    fn a_slot_given_back_is_queued_for_poison_by_its_physical_bytes() {
+        let fixed = [(ShapeKind::Fixed, 4)];
+        let mut pool = SlotPool::new(facts_with(16, 4, 4, &fixed, &[(16, 2)]));
+        let queue = ::engine::chunk::PoisonQueue::default();
+        pool.poison_into(queue.clone());
+        let holder = Holder::WorkingSet(1);
+        let slots = pool.acquire(holder, 0, 2).unwrap();
+        let physical = pool.chunk_table()[slots[0].chunk as usize];
+        let slot_bytes = (1u64 << 20) / 4;
+        let mut copy = pool.clone();
+        copy.release(holder, &slots, 0);
+        copy.retire_through(u64::MAX);
+        assert!(queue.lock().unwrap().is_empty(), "a clone's give-back is its own");
+        pool.touch(&slots, 5);
+        pool.release(holder, &slots, 0);
+        assert!(queue.lock().unwrap().is_empty(), "held for the fire that touched them");
+        pool.retire_through(5);
+        let mut due = std::mem::take(&mut *queue.lock().unwrap());
+        due.sort_unstable();
+        let mut want: Vec<(u64, u64)> = slots
+            .iter()
+            .map(|slot| {
+                (u64::from(physical) * (1 << 20) + u64::from(slot.index) * slot_bytes, slot_bytes)
+            })
+            .collect();
+        want.sort_unstable();
+        assert_eq!(due, want);
     }
 
     /// The L40S at 3 GiB on ca5c710a7: "a guest item ... lies in a run of

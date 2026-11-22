@@ -39,6 +39,15 @@ pub use weight::{
 #[serde(transparent)]
 pub struct ShapeId(pub u32);
 
+/// Test builds (`test-slot-fill`): byte ranges `(offset, len)` of the pool
+/// the runtime gave back, a slot no holder keeps any more once the last fire
+/// that touched it retired. An engine that takes the queue
+/// ([`crate::Engine::poison_queue`]) fills each with a pattern every float
+/// width reads as NaN before its next verb runs: ordered after the slot's
+/// last owner and before anything its next owner writes or reads there, so
+/// a fire that reads a cell no one wrote since gets NaN, not a stale value.
+pub type PoisonQueue = std::sync::Arc<std::sync::Mutex<Vec<(u64, u64)>>>;
+
 impl std::fmt::Display for ShapeId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
