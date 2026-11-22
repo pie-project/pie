@@ -1016,3 +1016,121 @@ fn a_pair_whose_members_are_all_parked_is_laid_again_where_a_move_left_it() {
             .expect("the instance closes");
     }
 }
+
+/// An evacuation is all or nothing (`Engine::evacuate`): one whose last
+/// check fails moves nothing. Instance A's state chunk is evacuated, and
+/// the evacuation also names a channel whose slots cannot be spanned, the
+/// check that once ran after the copy and the table change. It is refused,
+/// and A's state lies where it lay, its bytes as they were; the same moves
+/// with no such channel then go through, the bytes with them, and A fires
+/// where they went.
+#[test]
+fn an_evacuation_refused_late_moves_nothing() {
+    if !engine_cuda::device::present() {
+        eprintln!("no CUDA device: skipping");
+        return;
+    }
+    let trace = poem::trace_hybrid("guest-evacuation-atomic", &Micro, Platform::Cuda);
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let path = Weights::random(&trace, 4257).write(dir.path());
+    let word = trace.facts.word(&Request::new(ROWS, false));
+    let tokens: Vec<Vec<u32>> = vec![vec![7]];
+
+    let mut shell = shell(trace, &path);
+    let facts = shell.chunk_facts().expect("the chunk facts");
+    let segments = facts.segments.committed.max(1);
+    shell
+        .commit_segments(segments)
+        .expect("the first segment commits");
+    let committed = (segments * facts.segment_chunks).min(facts.state_chunks() + 1);
+    let mut guest = crate::guest::Guest::of(&facts, segments * facts.segment_chunks);
+    let program = register(&mut shell);
+    let extents = Extents {
+        row_count: 1,
+        sampled_rows: 1,
+        query_len: 1,
+        ..Extents::default()
+    };
+    let state = shell
+        .guest_state(program, extents)
+        .expect("the program's guest state");
+    let (scratch, pair) = guest.places((program, extents), &state);
+    let engine::ScratchPlace::Run { first, slots } = scratch else {
+        panic!("a small guest's state lies in a run of Instance slots: {scratch:?}");
+    };
+    let refs: Vec<u32> = (first..first + slots).collect();
+    let bytes = state.instance_bytes();
+    let span = |shell: &Shell| {
+        shell
+            .guest_span(engine::chunk::SlotRole::Instance, &refs, bytes)
+            .expect("A's scratch spans")
+    };
+    let read = |shell: &mut Shell| {
+        shell.drain().expect("the device drains");
+        let mut out = vec![0u8; usize::try_from(bytes).expect("bytes")];
+        engine_cuda::device::alloc::copy_d2h(span(shell), &mut out).expect("the scratch reads");
+        out
+    };
+
+    let (instance, rings) = guest.slots(
+        &shell.program_facts(program).expect("the program's facts"),
+        |_| false,
+    );
+    let a = shell
+        .bind_program(
+            program,
+            &[],
+            extents,
+            GeometryClass::Host,
+            PortMask::NONE,
+            &[None],
+            &[engine::ChannelId(1)],
+            engine_cuda::program::Slots {
+                instance,
+                rings,
+                scratch: scratch.clone(),
+                pair,
+                pair_generation: 1,
+            },
+        )
+        .expect("A binds");
+    let attach = [Attached {
+        lane: 0,
+        lanes: 1,
+        instance: a,
+        adapter_only: false,
+    }];
+    fire(&mut shell, word, &tokens, &attach);
+    shell.drain().expect("the device drains");
+    // A's state, marked: what an evacuation copies, or leaves.
+    let marked: Vec<u8> = (0..bytes).map(|at| (at % 251) as u8 ^ 0x3C).collect();
+    engine_cuda::device::alloc::stage_raw(shell.stream(), span(&shell), &marked)
+        .expect("A's state is marked");
+
+    let per_chunk = facts
+        .shapes
+        .iter()
+        .find(|shape| shape.role == engine::chunk::SlotRole::Instance)
+        .expect("an Instance shape")
+        .slots_per_chunk;
+    let held = first / per_chunk;
+    let free = committed - 1;
+    assert_ne!(held, free, "A's chunk and the free one differ");
+    let evacuation = engine::chunk::Evacuation {
+        moves: vec![(held, free)],
+    };
+    let before = span(&shell);
+    let refused = shell.evacuate_with(&evacuation, &[(vec![u32::MAX - 1], 64)]);
+    assert!(refused.is_err(), "a channel with no span refuses the evacuation");
+    assert_eq!(span(&shell), before, "the refused evacuation left the table");
+    assert_eq!(read(&mut shell), marked, "and A's bytes where they lay");
+
+    shell
+        .evacuate_with(&evacuation, &[])
+        .expect("the same moves go through alone");
+    assert_ne!(span(&shell), before, "A's state chunk moved");
+    assert_eq!(read(&mut shell), marked, "its bytes with it");
+    fire(&mut shell, word, &tokens, &attach);
+    shell.drain().expect("A fires where its state went");
+    shell.close_program_instance(a).expect("A closes");
+}
