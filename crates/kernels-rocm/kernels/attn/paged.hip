@@ -1126,9 +1126,12 @@ __global__ __launch_bounds__(512) void paged_prefill_selected(const Paged p, con
     paged_prefill_body<D, HND, true, true, false, false>(p, sel, PrefillMask{});
 }
 
-template <int D, bool HND>
+// `CAUSAL`: the plan's (as the unmasked prefill's): its block order, the
+// causal tiles' longest first. Each request is still cut at its rows'
+// positions, or not, by its mask word's wide bit.
+template <int D, bool HND, bool CAUSAL>
 __global__ __launch_bounds__(512) void paged_prefill_masked(const Paged p, const PrefillMask mask) {
-    paged_prefill_body<D, HND, false, false, true, false>(p, PrefillSel{}, mask);
+    paged_prefill_body<D, HND, CAUSAL, false, true, false>(p, PrefillSel{}, mask);
 }
 
 // ----------------------------------------------------------------- merge --
