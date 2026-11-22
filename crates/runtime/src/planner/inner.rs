@@ -745,10 +745,11 @@ impl Inner {
         self.procs
             .get(&pid)
             .is_some_and(|proc| proc.unfired && !proc.bind_waiting)
-            && !self
+            && (!self
                 .queue
                 .values()
                 .any(|waiter| waiter.pid == pid && waiter.is_unmet())
+                || !self.nothing_in_flight())
     }
 
     /// Whether the one bind-suspended restore at a time

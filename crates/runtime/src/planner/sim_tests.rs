@@ -1006,6 +1006,30 @@ impl Workload {
             }
             scripts.push(script);
         }
+        // A crowd of plain decodes beside the rest (beams, binds, rescores)
+        // on the same small pool, drawn from a stream of its own: each must
+        // finish within the run's bound, never starved by the others'
+        // restores and binds (the L40S at 3 GiB: 0 of 150 decodes done in
+        // 553 s while beams verified).
+        let mut crowd_rng = Rng(seed ^ 0xc0_7d_de_c0);
+        if crowd_rng.chance(1, 4) {
+            for _ in 0..crowd_rng.range(12, 24) {
+                let mut script = Script {
+                    at: crowd_rng.range(0, horizon),
+                    prompt: crowd_rng.range(1, 4),
+                    decode: crowd_rng.range(20, 60),
+                    grow_every: crowd_rng.range(1, 3),
+                    beams: 1,
+                    bind: Vec::new(),
+                    idle: None,
+                    rescore: None,
+                };
+                while script.pages() > most && script.decode > 0 {
+                    script.decode -= 1;
+                }
+                scripts.push(script);
+            }
+        }
         let mut tier_full = Vec::new();
         if rng.chance(1, 4) {
             for _ in 0..rng.range(1, 3) {

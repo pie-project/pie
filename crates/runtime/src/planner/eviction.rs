@@ -960,7 +960,14 @@ impl ResidencyPlanner {
                         // fired since: never moved back before it runs,
                         // while it can run.
                         // ([`Inner::unfired_protects`], its reads shared.)
-                        && !(proc.unfired && !proc.bind_waiting && !queued(*pid))
+                        // Asking for its first fire's room is part of
+                        // that fire: while anything is in flight it is
+                        // spared queued too, else a restore's first ask
+                        // left it a victim for the next head and it went
+                        // back down before it ran (the L40S at 3 GiB:
+                        // evictions 4017, restores 4012). With nothing in
+                        // flight it runs nothing, a victim like any other.
+                        && !(proc.unfired && !proc.bind_waiting && (!queued(*pid) || !quiet()))
                         // Restored past this head while it stood passed
                         // over: it fires before this head moves it again.
                         && proc.restored_past != Some(waiter.pid)
