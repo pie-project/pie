@@ -202,19 +202,35 @@ impl Root {
     }
 
     /// The disk cache's name for `instantiation` of this unit on `arch`:
-    /// everything the compiled image depends on.
+    /// everything the compiled image depends on, the NVRTC that compiles
+    /// it by its exact version (another NVRTC builds another image, so an
+    /// upgrade compiles again, never reuses what the last one built).
     #[must_use]
     pub fn key(&self, instantiation: &str, arch: &str) -> String {
         format!(
-            "jit/{}/{arch}/{FLOAT_CONTRACT}/{}/nvrtc>={}/r{:016x}/h{:016x}/i{:016x}",
+            "jit/{}/{arch}/{FLOAT_CONTRACT}/{}/nvrtc>={}/nvrtc{}/r{:016x}/h{:016x}/i{:016x}",
             self.name,
             self.options.join(","),
             self.floor,
+            compiler(),
             source::fnv1a64(self.text.as_bytes()),
             source::digest(self.header_set()),
             source::fnv1a64(instantiation.as_bytes()),
         )
     }
+}
+
+/// The NVRTC this process compiles with, by its exact version, read once;
+/// `?` where it does not load (nothing is compiled then).
+fn compiler() -> &'static str {
+    static COMPILER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    COMPILER.get_or_init(|| {
+        #[cfg(feature = "cuda")]
+        if let Ok(version) = crate::jit::nvrtc::version() {
+            return format!("{}.{}", version.major, version.minor);
+        }
+        "?".to_owned()
+    })
 }
 
 const FLOAT_CONTRACT: &str = "fmad=false,prec-div=true,prec-sqrt=true";
@@ -304,5 +320,19 @@ mod tests {
         assert_ne!(a, b, "an sm_100a cubin must not answer for an sm_100 one");
         assert!(b.contains("/sm_100a/"), "{b}");
         assert_eq!(specific.target("sm_89", false), None);
+    }
+
+    /// A unit's cache name holds the exact NVRTC that compiles it, not only
+    /// the floor it asks: an NVRTC upgrade compiles again.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_unit_keys_by_the_exact_nvrtc_that_compiles_it() {
+        let unit = Root::of("linear/gemv.cu").expect("a carried unit");
+        let key = unit.key("x", "sm_89");
+        let nvrtc = crate::jit::nvrtc::version().expect("NVRTC loads");
+        assert!(
+            key.contains(&format!("/nvrtc{}.{}/", nvrtc.major, nvrtc.minor)),
+            "{key}"
+        );
     }
 }
