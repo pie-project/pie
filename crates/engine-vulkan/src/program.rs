@@ -250,6 +250,16 @@ fn fold_count(
         .ok_or_else(|| Refusal::Program(format!("instance {instance}: `fold` holds an empty cell")))
 }
 
+/// Where an evacuation leaves each bound instance's session and each kept
+/// cell in the pool ([`Plane::resolve_rebind`]).
+#[cfg(feature = "vulkan")]
+pub struct Rebound {
+    sessions: Vec<(InstanceId, crate::guest::session::Rebound)>,
+    cells: Vec<(ChannelId, engine_gpu::guest::held::Held<crate::device::Api>)>,
+}
+#[cfg(not(feature = "vulkan"))]
+pub struct Rebound;
+
 #[derive(Default)]
 pub struct Plane {
     programs: BTreeMap<ProgramId, Arc<ExecPlan>>,
@@ -636,27 +646,79 @@ impl Plane {
         )
     }
 
-    /// Points every table and cell at the chunk its slot sits in now.
-    pub fn rebind(&mut self, pools: &Pools<crate::device::Api>) -> Result<(), Refusal> {
+    /// Before an evacuation: every pass a bound instance has on the queue
+    /// has landed, so none reads a set the evacuation's rebind points anew.
+    pub fn quiesce(&mut self) -> Result<(), Refusal> {
+        #[cfg(feature = "vulkan")]
+        for seat in self.instances.values_mut().filter(|seat| !seat.parked) {
+            seat.session.settle().map_err(Refusal::fault)?;
+        }
+        Ok(())
+    }
+
+    /// Where an evacuation leaves every table and cell
+    /// ([`engine_gpu::program::Programs::resolve_rebind`]): each resolved
+    /// against `pools`' moved table, then every moved session's runs
+    /// claimed as one. Refused with nothing changed.
+    pub fn resolve_rebind(&mut self, pools: &Pools<crate::device::Api>) -> Result<Rebound, Refusal> {
         #[cfg(feature = "vulkan")]
         {
             let program = Refusal::fault;
+            let mut sessions = Vec::with_capacity(self.instances.len());
+            let mut moved: Vec<(engine::guest_claims::Holder, Vec<engine::guest_claims::Run>)> =
+                Vec::new();
             // A parked instance's slots are another owner's: repointed and
             // claimed at its rebind, not here.
-            for seat in self.instances.values_mut().filter(|seat| !seat.parked) {
-                seat.session.rebind(pools).map_err(program)?;
+            for (&id, seat) in self.instances.iter_mut().filter(|(_, seat)| !seat.parked) {
+                let session = seat.session.resolve(pools).map_err(program)?;
+                moved.push(session.own.clone());
+                if let Some(pair) = &session.pair_runs
+                    && !moved.iter().any(|(holder, _)| *holder == pair.0)
+                {
+                    moved.push(pair.clone());
+                }
+                sessions.push((id, session));
             }
-            for cell in self
-                .kept
-                .lock()
-                .expect("kept cells lock poisoned")
-                .values_mut()
-            {
-                cell.rebind(pools).map_err(program)?;
+            let mut cells = Vec::new();
+            for (&id, cell) in self.kept.lock().expect("kept cells lock poisoned").iter() {
+                if let Some(held) = cell.resolve(pools).map_err(program)? {
+                    cells.push((id, held));
+                }
+            }
+            if let Some(library) = &self.library {
+                library
+                    .claims()
+                    .claim_all(&moved)
+                    .map_err(|overlap| Refusal::Claimed(overlap.into()))?;
+            }
+            Ok(Rebound { sessions, cells })
+        }
+        #[cfg(not(feature = "vulkan"))]
+        {
+            let _ = pools;
+            Ok(Rebound)
+        }
+    }
+
+    /// Points every table and cell where [`Self::resolve_rebind`] resolved
+    /// it, the evacuation's copies committed.
+    pub fn install_rebind(&mut self, rebound: Rebound) -> Result<(), Refusal> {
+        #[cfg(feature = "vulkan")]
+        {
+            for (id, session) in rebound.sessions {
+                if let Some(seat) = self.instances.get_mut(&id) {
+                    seat.session.install(session);
+                }
+            }
+            let mut kept = self.kept.lock().expect("kept cells lock poisoned");
+            for (id, held) in rebound.cells {
+                if let Some(cell) = kept.get_mut(&id) {
+                    cell.install(held);
+                }
             }
         }
         #[cfg(not(feature = "vulkan"))]
-        let _ = pools;
+        let Rebound = rebound;
         Ok(())
     }
 
@@ -1546,8 +1608,18 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
         Plane::register_channel(self, registration, place)
     }
 
-    fn rebind(&mut self, pools: &Pools<crate::device::Api>) -> Result<(), Refusal> {
-        Plane::rebind(self, pools)
+    fn quiesce(&mut self) -> Result<(), Refusal> {
+        Plane::quiesce(self)
+    }
+
+    type Rebound = Rebound;
+
+    fn resolve_rebind(&mut self, pools: &Pools<crate::device::Api>) -> Result<Rebound, Refusal> {
+        Plane::resolve_rebind(self, pools)
+    }
+
+    fn install_rebind(&mut self, rebound: Rebound) -> Result<(), Refusal> {
+        Plane::install_rebind(self, rebound)
     }
 
     fn rebind_slots(

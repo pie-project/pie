@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use crate::adapter::AdapterRegistration;
 use crate::caps::DeviceFacts;
 use crate::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
-use crate::chunk::{Evacuation, SlotCopy, WeightResidency, WeightUses};
+use crate::chunk::{ChunkTable, Evacuation, SlotCopy, WeightResidency, WeightUses};
 use crate::error::{Error, Result};
 use crate::fire::{FrameId, FrameSubmission, FrameTicket, MediaEncode, Step};
 use crate::load::{LoadRequest, Loaded};
@@ -518,10 +518,27 @@ pub trait Engine: Send {
     /// copy has a completion of its own, which [`Self::release_segments`]
     /// waits on before the evacuated segment goes: the runtime waits on no
     /// later fire for it, so an idle engine's segment goes too.
+    ///
+    /// All or nothing. `Err` means nothing moved: the engine's chunk table,
+    /// claims, program bindings and device bytes are as before the call
+    /// (the runtime takes the move back on that word). An engine resolves
+    /// everything the move needs (its rebind of every table, cell and
+    /// state the moved chunks hold included) against the moved table
+    /// before it commits any copy; a failure after it committed is a bug
+    /// (a fault, not a refusal).
     fn evacuate(&mut self, evacuation: &Evacuation) -> Result<()> {
         let _ = evacuation;
         Err(self.unsupported("evacuate"))
     }
+
+    /// The engine's chunk table as it holds it now ([`ChunkTable`], the
+    /// identity until an evacuation moves chunks): a plain read, no fire
+    /// waited on, which the runtime checks its own logical to physical map
+    /// against where an evacuation was refused ([`Self::evacuate`]). One
+    /// table, the state pool's; an engine whose pool moves no chunk answers
+    /// its identity, one that keeps no pool `Error::Unsupported`. Stated by
+    /// every engine: no default.
+    fn chunk_table(&self) -> Result<ChunkTable>;
 
     /// Copies slots of one shape between tiers or within one; replaces
     /// [`Engine::copy_kv`] and [`Engine::copy_state`] once every backend

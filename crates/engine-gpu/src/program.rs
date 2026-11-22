@@ -292,9 +292,23 @@ pub trait Programs<B: Serve>: Default {
         Ok(())
     }
 
-    /// Points every table and cell the plane holds in the pool at the
-    /// chunk its slot ref sits in now, after an evacuation moved chunks.
-    fn rebind(&mut self, pools: &Pools<B>) -> Result<(), Refusal>;
+    /// Where an evacuation leaves the plane's tables and cells
+    /// ([`Programs::resolve_rebind`]), to point them at once its copies
+    /// are committed ([`Programs::install_rebind`]).
+    type Rebound;
+
+    /// Resolves where every table and cell the plane holds in the pool lies
+    /// under `pools`' chunk table: an evacuation's, in place, its copies
+    /// not yet committed (`Engine::evacuate` is all or nothing). Every
+    /// moved run is claimed as one ([`engine::guest_claims::Claims::claim_all`]),
+    /// the last step. Refused with nothing changed: no table or cell
+    /// pointed anew, no claim moved.
+    fn resolve_rebind(&mut self, pools: &Pools<B>) -> Result<Self::Rebound, Refusal>;
+
+    /// Points every table and cell at where [`Programs::resolve_rebind`]
+    /// resolved it, the evacuation's copies committed. Nothing is left to
+    /// refuse: an `Err` is a fault.
+    fn install_rebind(&mut self, rebound: Self::Rebound) -> Result<(), Refusal>;
 
     /// Moves an instance's or a channel's tables and cells to the slot
     /// refs `rebind` names, whose bytes the runtime copied there

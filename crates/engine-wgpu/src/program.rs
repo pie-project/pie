@@ -322,6 +322,13 @@ impl Guests {
     }
 }
 
+/// Where an evacuation leaves each bound instance's session
+/// ([`Plane::resolve_rebind`]).
+#[cfg(feature = "wgpu")]
+pub type Rebound = Vec<(InstanceId, crate::guest::session::Rebound)>;
+#[cfg(not(feature = "wgpu"))]
+pub type Rebound = ();
+
 #[derive(Default)]
 pub struct Plane {
     programs: BTreeMap<ProgramId, Arc<ExecPlan>>,
@@ -1082,23 +1089,61 @@ impl Plane {
         Ok(())
     }
 
-    /// Points every instance's tables at the chunks their slots sit in now.
-    pub fn rebind(&mut self, pools: &Pools<crate::device::Api>) -> Result<(), Refusal> {
+    /// Where an evacuation leaves every bound instance's tables
+    /// ([`engine_gpu::program::Programs::resolve_rebind`]): each resolved
+    /// against `pools`' moved table, then every moved run claimed as one.
+    /// Refused with nothing changed.
+    pub fn resolve_rebind(&mut self, pools: &Pools<crate::device::Api>) -> Result<Rebound, Refusal> {
         #[cfg(feature = "wgpu")]
-        for seat in self.instances.values_mut() {
-            let mut half = seat.half.lock().expect("half lock poisoned");
-            // A parked instance's slots are another owner's: repointed and
-            // claimed at its rebind, not here.
-            if half.parked {
-                continue;
+        {
+            let mut rebound = Vec::with_capacity(self.instances.len());
+            let mut moved: Vec<(engine::guest_claims::Holder, Vec<engine::guest_claims::Run>)> =
+                Vec::new();
+            for (&id, seat) in &self.instances {
+                let mut half = seat.half.lock().expect("half lock poisoned");
+                // A parked instance's slots are another owner's: repointed
+                // and claimed at its rebind, not here.
+                if half.parked {
+                    continue;
+                }
+                let session = half.session.resolve(pools).map_err(Refusal::fault)?;
+                moved.push(session.own.clone());
+                if let Some(pair) = &session.pair_runs
+                    && !moved.iter().any(|(holder, _)| *holder == pair.0)
+                {
+                    moved.push(pair.clone());
+                }
+                rebound.push((id, session));
             }
-            half.session
-                .rebind(pools)
-                .map_err(Refusal::fault)?;
+            if let Some(library) = &self.library {
+                library
+                    .claims()
+                    .claim_all(&moved)
+                    .map_err(|overlap| Refusal::Claimed(overlap.into()))?;
+            }
+            Ok(rebound)
+        }
+        #[cfg(not(feature = "wgpu"))]
+        {
+            let _ = pools;
+            Ok(())
+        }
+    }
+
+    /// Points every instance's tables where [`Self::resolve_rebind`]
+    /// resolved them, the evacuation's copies committed.
+    pub fn install_rebind(&mut self, rebound: Rebound) -> Result<(), Refusal> {
+        #[cfg(feature = "wgpu")]
+        for (id, session) in rebound {
+            let Some(seat) = self.instances.get_mut(&id) else {
+                continue;
+            };
+            let mut half = seat.half.lock().expect("half lock poisoned");
+            half.session.install(session).map_err(Refusal::fault)?;
             seat.scores = half.session.scores();
         }
         #[cfg(not(feature = "wgpu"))]
-        let _ = pools;
+        let () = rebound;
         Ok(())
     }
 
@@ -1304,8 +1349,14 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
         Plane::quiesce(self)
     }
 
-    fn rebind(&mut self, pools: &Pools<crate::device::Api>) -> Result<(), Refusal> {
-        Plane::rebind(self, pools)
+    type Rebound = Rebound;
+
+    fn resolve_rebind(&mut self, pools: &Pools<crate::device::Api>) -> Result<Rebound, Refusal> {
+        Plane::resolve_rebind(self, pools)
+    }
+
+    fn install_rebind(&mut self, rebound: Rebound) -> Result<(), Refusal> {
+        Plane::install_rebind(self, rebound)
     }
 
     fn rebind_slots(

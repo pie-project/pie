@@ -168,6 +168,14 @@ impl Mover for Lane {
     fn epoch_now(&self) -> u64 {
         0
     }
+
+    async fn check_table(&self, runtime: Vec<u32>) -> Result<(), String> {
+        let engine = self.0.lock().unwrap();
+        match crate::store::shared::programs::table_apart(engine.table.as_slice(), &runtime) {
+            Some(apart) => Err(apart),
+            None => Ok(()),
+        }
+    }
 }
 
 /// With no fire term, a program registered and bound leaves every rung's
@@ -565,6 +573,10 @@ async fn a_bind_whose_room_is_refused_fails_its_wait() {
         }
         fn epoch_now(&self) -> u64 {
             0
+        }
+        // It keeps no table, and moves nothing.
+        async fn check_table(&self, _runtime: Vec<u32>) -> Result<(), String> {
+            Ok(())
         }
     }
     struct Granting;
@@ -1752,6 +1764,10 @@ impl ::engine::Engine for SetEngine {
 
     fn kind(&self) -> &'static str {
         "fake-sets"
+    }
+
+    fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+        Err(self.unsupported("chunk_table"))
     }
 
     fn prepare_program(

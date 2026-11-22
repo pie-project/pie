@@ -175,6 +175,12 @@ impl Shell {
         self.rebase_programs()
     }
 
+    /// The state pool's chunk table as it stands (`Engine::chunk_table`).
+    #[must_use]
+    pub fn chunk_table(&self) -> &engine::chunk::ChunkTable {
+        self.pools.chunk_table()
+    }
+
     /// The state pool as the runtime counts it
     /// ([`crate::store::Pools::chunk_facts`]).
     pub fn chunk_facts(&mut self) -> crate::Result<engine::chunk::ChunkFacts> {

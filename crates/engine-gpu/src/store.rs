@@ -9,7 +9,7 @@ pub mod layout;
 pub mod pool;
 pub mod rows;
 
-use engine::chunk::{ChunkFacts, Evacuation, ShapeId, SlotCopy};
+use engine::chunk::{ChunkFacts, ChunkTable, Evacuation, ShapeId, SlotCopy};
 use engine::transfer::{KvRun, MemoryDomain};
 use kernels_slang::{KvPool, Segments, Tensor};
 use poem_compiler::chunk::{ChunkRecipe, RowId, SlotLayout};
@@ -1846,13 +1846,24 @@ impl<B: Backend> Pools<B> {
         self.pool.release_segments(segments);
     }
 
-    /// Moves each evacuated chunk onto its new physical chunk in `frame`
-    /// and takes the moves into the chunk table.
-    /// Returns each move as `(from, to)` physical list pages: the first
-    /// page of each chunk moved and the pages a chunk holds.
-    pub fn evacuate(&mut self, frame: &mut B::Frame, evacuation: &Evacuation) -> Result<()> {
-        self.pool.evacuate(frame, evacuation)?;
-        Ok(())
+    /// Records each evacuated chunk's copy onto its new physical chunk in
+    /// `frame` and takes the moves into the chunk table, handing back the
+    /// table as it stood ([`pool::Pool::evacuate`]): nothing is committed
+    /// until the caller commits `frame`, and [`Pools::restore_table`] puts
+    /// the old table back where it drops `frame` instead.
+    pub fn evacuate(&mut self, frame: &mut B::Frame, evacuation: &Evacuation) -> Result<ChunkTable> {
+        self.pool.evacuate(frame, evacuation)
+    }
+
+    /// Puts back the table an uncommitted evacuation replaced.
+    pub fn restore_table(&mut self, table: ChunkTable) {
+        self.pool.restore(table);
+    }
+
+    /// The chunk table as it stands (`Engine::chunk_table`).
+    #[must_use]
+    pub fn chunk_table(&self) -> &ChunkTable {
+        self.pool.table()
     }
 }
 

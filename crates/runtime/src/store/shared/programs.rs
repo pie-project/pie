@@ -689,6 +689,57 @@ pub trait Mover {
     /// The engine whose rung events ([`super::rung_changed`]) a wait on
     /// this raise waits on.
     fn engine(&self) -> usize;
+
+    /// The engine's chunk table (`Engine::chunk_table`) checked against
+    /// `runtime`, the runtime's logical to physical map, through the
+    /// engine's lane: `Err` names the first chunk they place apart
+    /// ([`table_apart`]).
+    fn check_table(
+        &self,
+        runtime: Vec<u32>,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send;
+}
+
+/// Where the engine's chunk table (`engine`, physical by logical chunk)
+/// and the runtime's map (`runtime`) place a chunk apart: the first logical
+/// chunk they differ on, or `None` where they agree. An engine may keep
+/// chunks past those it states, which the runtime never names; one short
+/// of them is apart.
+#[must_use]
+pub fn table_apart(engine: &[u32], runtime: &[u32]) -> Option<String> {
+    if let Some(logical) = runtime
+        .iter()
+        .zip(engine)
+        .position(|(runtime, engine)| runtime != engine)
+    {
+        return Some(format!(
+            "logical chunk {logical} lies on physical {} in the engine's chunk table and on {} \
+             in the runtime's",
+            engine[logical], runtime[logical]
+        ));
+    }
+    (engine.len() < runtime.len()).then(|| {
+        format!(
+            "the engine's chunk table holds {} chunks and the runtime names {}",
+            engine.len(),
+            runtime.len()
+        )
+    })
+}
+
+/// After a refused raise: the engine's chunk table checked against the
+/// runtime's map as the refusal left it, never assumed (debug builds).
+async fn check_refused(shared: &Shared, mover: &impl Mover) {
+    if cfg!(debug_assertions) {
+        let runtime = shared.lock().unwrap().pool().chunk_table().to_vec();
+        if let Err(apart) = mover.check_table(runtime).await {
+            panic!(
+                "engine {}: a refused raise left the engine's chunk table apart from the \
+                 runtime's: {apart}",
+                mover.engine()
+            );
+        }
+    }
 }
 
 /// Raises `shared`'s activation to `goal`'s (a rung's tokens, given the
@@ -779,6 +830,9 @@ pub async fn carry_raise(
     {
         tracing::warn!(%error, "a raise's copy was refused; fires stay at the rung in hand");
         shared.lock().unwrap().raise_refused(evacuation);
+        // Refused means nothing moved (`Engine::evacuate`): the map taken
+        // back is the engine's table still.
+        check_refused(shared, mover).await;
         return Err(format!("the engine refused a raise's copy: {error}"));
     }
     if let Some((from, to)) = notice
@@ -786,14 +840,18 @@ pub async fn carry_raise(
     {
         tracing::warn!(%error, from, to, "a raise's carve was refused; fires stay at the rung in hand");
         let next = mover.epoch_now().saturating_add(1);
-        let mut pool = shared.lock().unwrap();
-        if evacuation.moves.is_empty() {
-            pool.raise_refused(evacuation);
-        } else {
-            // Its copy landed: the state stays where it moved, and the
-            // activation is the rung in hand's again.
-            pool.raise_carve_refused(next);
+        {
+            let mut pool = shared.lock().unwrap();
+            if evacuation.moves.is_empty() {
+                pool.raise_refused(evacuation);
+            } else {
+                // Its copy landed: the state stays where it moved, and the
+                // activation is the rung in hand's again.
+                pool.raise_carve_refused(next);
+            }
         }
+        // The copy stands: the map keeps the moves, as the engine's table.
+        check_refused(shared, mover).await;
         return Err(format!(
             "the engine refused the carve for rung {to}: {error}"
         ));
@@ -985,6 +1043,15 @@ impl<F: Fn() -> u64 + Sync> Mover for LaneMover<F> {
 
     fn epoch_now(&self) -> u64 {
         (self.epoch_now)()
+    }
+
+    async fn check_table(&self, runtime: Vec<u32>) -> Result<(), String> {
+        crate::scheduler::pool(
+            self.engine,
+            crate::scheduler::worker::PoolOp::CheckTable(runtime),
+        )
+        .await
+        .map_err(|error| format!("{error:#}"))
     }
 }
 

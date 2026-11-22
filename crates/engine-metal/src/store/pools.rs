@@ -2296,6 +2296,12 @@ impl Pools {
         unsafe { self.pool.release_segments(segments) }
     }
 
+    /// The chunk table as it stands (`Engine::chunk_table`).
+    #[must_use]
+    pub fn chunk_table(&self) -> &engine::chunk::ChunkTable {
+        self.pool.table()
+    }
+
     /// Moves each evacuated chunk onto its new physical chunk in `frame`
     /// and takes the moves into the chunk table; the weight cache's address
     /// tables follow (no frame is in flight: the caller drained them).

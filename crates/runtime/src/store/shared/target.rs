@@ -925,6 +925,12 @@ impl super::programs::Mover for WalkMover<'_> {
     fn epoch_now(&self) -> u64 {
         self.0.epochs().0
     }
+
+    async fn check_table(&self, runtime: Vec<u32>) -> Result<(), String> {
+        (self.0.lane)(self.0.engine, PoolOp::CheckTable(runtime))
+            .await
+            .map_err(|error| format!("{error:#}"))
+    }
 }
 
 #[cfg(test)]

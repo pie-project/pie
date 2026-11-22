@@ -8,6 +8,7 @@
 use engine::ChannelId;
 use engine::Engine;
 use engine::channel::ChannelRegistration;
+use engine::chunk::Evacuation;
 use engine::fire::{Attachment, FrameSubmission, InputFeed, Lane, Readout, Step};
 use engine::program::{BindExtents, InstanceBinding, InstanceId, Rebind, ScratchPlace};
 use engine_gpu::backend::Buffer as _;
@@ -549,6 +550,139 @@ fn a_guests_state_reads_zero_when_its_slots_change_owner() {
     );
     let ids = fire(&mut engine, word, t_input, &[(b, b_channels)], &[2]);
     assert_eq!(ids, [argmax(&planes, 2)], "B serves on after the unpark");
+    drop(engine);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Logical chunk `chunk`'s bytes as they stand, read through the chunk
+/// table.
+fn read_chunk(engine: &backend::Engine, chunk: u32) -> Vec<u8> {
+    let pools = engine.loaded().expect("loaded").pools();
+    let mut out = vec![0u8; pools.chunk_facts().chunk_bytes as usize];
+    let (buffer, at) = pools.chunk_place(chunk).expect("the chunk's place");
+    buffer.read(at, &mut out).expect("the chunk reads");
+    out
+}
+
+/// `Engine::evacuate` is all or nothing. Instance A parks keeping its
+/// tables where they lie (`Rebind::Parked { kept: true }`), and an
+/// evacuation moves instance B's tables' chunk onto the physical chunk A's
+/// lie on: B's tables resolve over A's kept run, and the claims refuse the
+/// move by name at the rebind, after the pool took it. Nothing moved: the
+/// chunk table, and the bytes of A's chunk and B's, are as they stood; B
+/// fires on from where it lay; and A's claim stands (its unpark onto its
+/// own slots lays it again beside B's), after which both fire.
+#[test]
+fn an_evacuation_refused_at_its_rebind_moves_nothing() {
+    let Some((loaded, program, mut slots, t_input)) = setup("guest-state-evacuate-refused", 4)
+    else {
+        return;
+    };
+    let Loaded {
+        mut engine,
+        trace,
+        planes,
+        dir,
+        ..
+    } = loaded;
+    let state = engine
+        .guest_state(program, &EXTENTS, GeometryClass::Host)
+        .expect("the program's guest state");
+    let word = trace.facts.word(&Request::new(ROWS, false));
+    let top = engine
+        .loaded()
+        .expect("loaded")
+        .pools()
+        .chunk_facts()
+        .segment_chunks;
+    assert!(top >= 32, "segment 0 holds the test's chunks: {top}");
+    let per = slots.instance.expect("an Instance shape").per_chunk;
+    // A's tables lie in the slots' own chunk, at its first slots; B's at
+    // the same slots of a chunk well under every state's run.
+    let a_chunk = top - 1;
+    let b_chunk = top - 24;
+
+    let (a, a_channels, a_binding) = bind(&mut engine, &mut slots, program, 1);
+    assert!(
+        a_binding.instance_slots.iter().all(|&slot| slot / per == a_chunk),
+        "A's tables lie in chunk {a_chunk}: {:?}",
+        a_binding.instance_slots
+    );
+    let b_room = InstanceBinding {
+        instance_slots: a_binding
+            .instance_slots
+            .iter()
+            .map(|&slot| b_chunk * per + slot % per)
+            .collect(),
+        scratch: slots.state(state.instance_bytes(), state.run),
+        ..a_binding.clone()
+    };
+    let (b, b_channels, b_binding) = bind_in(&mut engine, &mut slots, program, 4, Some(&b_room));
+    for place in [&a_binding.scratch, &a_binding.pair, &b_binding.scratch] {
+        if let ScratchPlace::Chunks { pieces, .. } = place {
+            assert!(pieces[0] > b_chunk, "a state's run above chunk {b_chunk}: {place:?}");
+        }
+    }
+    let both = [(a, a_channels.clone()), (b, b_channels.clone())];
+    let ids = fire(&mut engine, word, t_input, &both, &[5, 9]);
+    assert_eq!(ids, [argmax(&planes, 5), argmax(&planes, 9)], "A and B read their rows");
+
+    engine
+        .rebind_slots(Rebind::Parked { id: a, kept: true })
+        .expect("A parks, its tables kept in place");
+    let b_alone = [(b, b_channels.clone())];
+    let ids = fire(&mut engine, word, t_input, &b_alone, &[7]);
+    assert_eq!(ids, [argmax(&planes, 7)], "B reads its row with A parked");
+
+    let table = engine.chunk_table().expect("the engine's chunk table");
+    let a_bytes = read_chunk(&engine, a_chunk);
+    let b_bytes = read_chunk(&engine, b_chunk);
+    let onto = table.physical(a_chunk).expect("A's chunk lies somewhere");
+    let refused = engine
+        .evacuate(&Evacuation {
+            moves: vec![(b_chunk, onto)],
+        })
+        .expect_err("B's tables would lie over A's kept ones");
+    eprintln!("refused: {refused}");
+    assert!(
+        matches!(refused, engine::Error::Claimed(_)),
+        "refused by the claims, at the rebind: {refused}"
+    );
+    assert_eq!(
+        engine.chunk_table().expect("the engine's chunk table"),
+        table,
+        "a refused evacuation leaves the chunk table as it stood"
+    );
+    assert!(
+        read_chunk(&engine, a_chunk) == a_bytes,
+        "a refused evacuation copies nothing over A's kept tables"
+    );
+    assert!(
+        read_chunk(&engine, b_chunk) == b_bytes,
+        "a refused evacuation leaves B's tables as they stood"
+    );
+    let ids = fire(&mut engine, word, t_input, &b_alone, &[2]);
+    assert_eq!(ids, [argmax(&planes, 2)], "B fires on from where it lay");
+
+    // A's claim stood: its unpark onto its own slots claims them again
+    // beside B's, whose claim stood too.
+    engine
+        .rebind_slots(Rebind::Instance {
+            id: a,
+            instance: a_binding.instance_slots.clone(),
+            rings: Vec::new(),
+            adapter: Vec::new(),
+            scratch: a_binding.scratch.clone(),
+            pair: a_binding.pair.clone(),
+            pair_generation: a_binding.pair_generation,
+        })
+        .expect("A unparks onto its own slots");
+    let ids = fire(&mut engine, word, t_input, &both, &[3, 6]);
+    assert_eq!(
+        ids,
+        [argmax(&planes, 3), argmax(&planes, 6)],
+        "A and B fire on after the refused evacuation"
+    );
     drop(engine);
     let _ = std::fs::remove_dir_all(&dir);
 }

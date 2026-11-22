@@ -103,6 +103,12 @@ impl Engine for Spatial {
         "cerebras-spatial"
     }
 
+    /// Its pool is degenerate and no evacuation moves a chunk of it: it
+    /// states no table.
+    fn chunk_table(&self) -> engine::Result<engine::chunk::ChunkTable> {
+        Err(self.unsupported("chunk_table"))
+    }
+
     fn live(&self) -> engine::live::Live {
         self.programs.live()
     }

@@ -966,6 +966,13 @@ impl Engine for Cuda {
         self.rebase_channels()
     }
 
+    fn chunk_table(&self) -> EngineResult<engine::chunk::ChunkTable> {
+        self.shell
+            .as_ref()
+            .map(|shell| shell.chunk_table().clone())
+            .ok_or_else(|| Error::Load("the cuda engine has no model loaded".into()))
+    }
+
     fn program_facts(&self, program: ProgramId) -> EngineResult<engine::program::ProgramFacts> {
         match self.shell.as_ref() {
             Some(shell) => shell.program_facts(program).map_err(fault),
