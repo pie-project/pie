@@ -13,7 +13,7 @@ use profile::search::Line;
 use profile::tune::{Candidate, Options, Sample};
 use profile::{Decision, Profile, Source};
 
-use super::{Depth, Watch, bf16, noise, seen, time, to_f32};
+use super::{Depth, Watch, bf16, noise, seen, time_spread, to_f32};
 use crate::device::{Buffer, Context, Handles, Pipelines};
 use crate::encode::Sink;
 
@@ -102,6 +102,9 @@ struct Point {
     k: u32,
     /// Seconds per launch for each candidate; `None` where it did not run.
     times: Vec<Option<f64>>,
+    /// Each candidate's spread over its timed rounds, `(slowest - fastest)
+    /// / median` (not kept in the measurements' text).
+    spread: Vec<Option<f64>>,
     /// The candidate today's profile runs here.
     baseline: Option<usize>,
 }
@@ -176,6 +179,7 @@ impl Measured {
                     n: num(1)?,
                     k: num(2)?,
                     baseline: f.get(3).and_then(|b| b.parse().ok()),
+                    spread: Vec::new(),
                     times: f
                         .get(4)
                         .ok_or("times")?
@@ -332,12 +336,14 @@ fn measure_at(
                 }
                 live.push(c);
             }
-            let times = time(device, &pipelines, &handles, &live, |sink, c, copy| {
+            let times = time_spread(device, &pipelines, &handles, &live, |sink, c, copy| {
                 launch(sink, &forced[c], copy)
             })?;
             let mut row = vec![None; candidates.len()];
-            for (c, t) in live.iter().zip(times) {
+            let mut spread = vec![None; candidates.len()];
+            for (c, (t, lo, hi)) in live.iter().zip(times) {
                 row[*c] = Some(t);
+                spread[*c] = Some((hi - lo) / t.max(1e-12));
             }
             let baseline = candidates
                 .iter()
@@ -348,6 +354,7 @@ fn measure_at(
                 n,
                 k,
                 times: row,
+                spread,
                 baseline,
             });
         }
@@ -465,48 +472,6 @@ fn shapes_of(contract: &checkpoint::contract::ModelContract) -> Vec<(u32, u32)> 
     out
 }
 
-/// FNV-1a over `bytes`, continuing from `hash`: a key that reads the same
-/// on every build, unlike the standard library's hasher.
-fn fnv(mut hash: u64, bytes: &[u8]) -> u64 {
-    for &b in bytes {
-        hash ^= u64::from(b);
-        hash = hash.wrapping_mul(0x0100_0000_01b3);
-    }
-    hash
-}
-
-/// The OS build: the kernels compile with its Metal compiler, so an update
-/// can move where they cross.
-fn os_build() -> String {
-    #[cfg(target_vendor = "apple")]
-    {
-        objc2_foundation::NSProcessInfo::processInfo()
-            .operatingSystemVersionString()
-            .to_string()
-    }
-    #[cfg(not(target_vendor = "apple"))]
-    {
-        String::new()
-    }
-}
-
-/// What a measured `kernel.dense` stands on: the device, the OS build, the
-/// kernels it timed (their Metal sources) and the shapes. Not the pie
-/// version: a build that changes neither kernel keeps the measurement.
-fn load_key(device: &str, os: &str, shapes: &[(u32, u32)]) -> u64 {
-    let mut hash = fnv(0xcbf2_9ce4_8422_2325, device.as_bytes());
-    hash = fnv(hash, os.as_bytes());
-    for file in ["linear/gemm.metal", "linear/gemm_mpp.metal"] {
-        hash = fnv(hash, file.as_bytes());
-        hash = fnv(hash, kernels_metal::sources::source(file).unwrap_or("").as_bytes());
-    }
-    for &(n, k) in shapes {
-        hash = fnv(hash, &n.to_le_bytes());
-        hash = fnv(hash, &k.to_le_bytes());
-    }
-    hash
-}
-
 /// The row counts a load measures at: the decode and verify rows one by one
 /// to 8, where the kernels cross, then the prompt rows a few at a time.
 const LOAD_ROWS: [u32; 15] = [2, 3, 4, 5, 6, 8, 10, 12, 16, 24, 32, 48, 64, 128, 512];
@@ -553,100 +518,263 @@ fn composed(measured: &str, shapes: &[(u32, u32)], base: &str) -> String {
     out
 }
 
-/// `chip` with `kernel.dense` measured over this model's own bf16 shapes:
-/// where the kernels cross (the tensor-op tile, the few-row vector forms
-/// and the simdgroup row tiles on Apple10; the vector forms and the tiles
-/// on every other GPU) the shapes decide with the rows, and a fixed rule
-/// cost an M5 Pro's 8-row decode 16-19% (the tile from 8 rows) and an M1
-/// Max's Gemma 4 E4B 29% (the vector forms to 8 rows). The ladder is fitted at the rows a load serves and kept under
-/// `profiles` (`metal/dense/<device>-<key>.toml`, keyed on the device, the
-/// OS build, the two kernels' sources and the shapes), so a later load of
-/// the same shapes reads it back and measures nothing. The profile's own
-/// `kernel.dense` (a checked-in device file's, the user's, or the default)
-/// stays the route before a measurement and for every shape not measured.
-/// A GPU without tensor ops never times the tensor-op tile. A kernel that
-/// answers wrongly refuses the load; a measurement that fails otherwise
-/// (memory refused at boot) leaves the profile's route serving, said.
+/// The curve `d` is stored as (`profile::fire::KernelCurve` kind and key):
+/// the few-row vector forms as a vector kernel of 8 rows, the simdgroup
+/// row tiles as a tile (key 0: its row tile follows the rows), the
+/// tensor-op tile as an MPP tile of 32 rows.
+fn curve_id(d: Dense) -> (u32, u32) {
+    use profile::fire::KernelCurve;
+    match d {
+        Dense::Rows => (KernelCurve::VECTOR, Dense::ROWS_MAX),
+        Dense::Tile => (KernelCurve::TILE, 0),
+        Dense::Mpp => (KernelCurve::MPP, 32),
+    }
+}
+
+/// Whether `d` can run `n x k` at all (the tensor-op tile only on whole
+/// 64-wide column and contraction steps): a shape it cannot run needs no
+/// curve of it.
+fn runs_shape(d: Dense, n: u32, k: u32) -> bool {
+    !matches!(d, Dense::Mpp) || (n % Dense::MPP_STEP == 0 && k % Dense::MPP_STEP == 0)
+}
+
+/// The source file `d`'s kernels are built from: its curve's key.
+fn curve_file(d: Dense) -> &'static str {
+    match d {
+        Dense::Mpp => "linear/gemm_mpp.metal",
+        Dense::Rows | Dense::Tile => "linear/gemm.metal",
+    }
+}
+
+/// `measured`'s points as curves, one a shape and candidate: TFLOP/s by
+/// rows with each point's spread, keyed by the candidate's kernel source.
+/// The vector forms end at 8 rows, the most they take: their curve stops
+/// there, as one beaten past it.
+fn curves_of(measured: &Measured) -> Vec<profile::fire::KernelCurve> {
+    use profile::fire::KernelCurve;
+    let mut out: Vec<KernelCurve> = Vec::new();
+    for p in &measured.points {
+        for (c, d) in measured.candidates.iter().enumerate() {
+            let Some(t) = p.times.get(c).copied().flatten() else {
+                continue;
+            };
+            let (kind, key) = curve_id(*d);
+            let flops = 2.0 * f64::from(p.rows) * f64::from(p.n) * f64::from(p.k);
+            let tflops = flops / t.max(1e-12) / 1e12;
+            let spread = p.spread.get(c).copied().flatten().unwrap_or(0.0);
+            match out
+                .iter_mut()
+                .find(|curve| curve.id() == (kind, key, p.n, p.k))
+            {
+                Some(curve) => {
+                    curve.curve.push((p.rows, tflops));
+                    curve.spread.push((p.rows, spread));
+                }
+                None => out.push(KernelCurve {
+                    kind,
+                    key,
+                    n: p.n,
+                    k: p.k,
+                    curve: vec![(p.rows, tflops)],
+                    stop: None,
+                    spread: vec![(p.rows, spread)],
+                    by: crate::stored::by(profile::fire::KERNEL_CURVES, &[curve_file(*d)]),
+                }),
+            }
+        }
+    }
+    let past = |rows: u32| LOAD_ROWS.iter().copied().find(|&r| r > rows);
+    for curve in &mut out {
+        curve.curve.sort_by_key(|(rows, _)| *rows);
+        curve.spread.sort_by_key(|(rows, _)| *rows);
+        if curve.kind == KernelCurve::VECTOR {
+            curve.stop = past(Dense::ROWS_MAX).map(|rows| (rows, KernelCurve::BEATEN));
+        }
+    }
+    out
+}
+
+/// The points `curves` state for `shapes`, one a shape and row count, in
+/// [`Measured`]'s form for the fit: each candidate's time from its TFLOP/s;
+/// `today` the route the load would take without them.
+fn points_of(
+    curves: &[profile::fire::KernelCurve],
+    candidates: &[Dense],
+    shapes: &[(u32, u32)],
+    today: &kernels_metal::Tuning,
+) -> Measured {
+    let mut points = Vec::new();
+    for &(n, k) in shapes {
+        for &rows in &LOAD_ROWS {
+            let times: Vec<Option<f64>> = candidates
+                .iter()
+                .map(|d| {
+                    let (kind, key) = curve_id(*d);
+                    curves
+                        .iter()
+                        .find(|c| c.id() == (kind, key, n, k))
+                        .and_then(|c| c.curve.iter().find(|(r, _)| *r == rows))
+                        .map(|(_, tflops)| {
+                            2.0 * f64::from(rows) * f64::from(n) * f64::from(k)
+                                / (tflops.max(1e-9) * 1e12)
+                        })
+                })
+                .collect();
+            if times.iter().all(Option::is_none) {
+                continue;
+            }
+            let baseline = candidates
+                .iter()
+                .position(|d| *d == today.dense(rows, n, k))
+                .filter(|&c| times[c].is_some());
+            points.push(Point {
+                rows,
+                n,
+                k,
+                times,
+                spread: Vec::new(),
+                baseline,
+            });
+        }
+    }
+    Measured {
+        candidates: candidates.to_vec(),
+        points,
+        wrong: Vec::new(),
+    }
+}
+
+/// `chip` with `kernel.dense` fitted over this model's own bf16 shapes,
+/// from each shape's curves (`[rates] kernel_tflops_by_shape_keyed`, one a
+/// candidate kernel): taken where the user's file or the device's committed
+/// measured profile states them under a matching key (`crate::stored`: the
+/// device, its OS release, the kernel's source), else measured here before
+/// ready and stored to the user's file. Under `measure = false` a shape no
+/// layer states is not measured: it keeps the profile's route, named. The
+/// fitted ladder is held to the shapes it was fitted over, the profile's
+/// own ladder after it for every other shape (a head past the measurement's
+/// weight budget). A kernel that answers wrongly refuses the load; a
+/// measurement that fails otherwise (memory refused at boot) leaves the
+/// profile's route serving, said.
 pub(crate) fn at_load(
     device: &Context,
     chip: Profile,
     profiles: Option<&std::path::Path>,
     contract: &checkpoint::contract::ModelContract,
+    measuring: engine::rates::Measuring,
 ) -> Result<Profile, String> {
     let shapes = shapes_of(contract);
     if shapes.is_empty() {
         return Ok(chip);
     }
     let name = device.name().to_string();
-    let key = load_key(&name, &os_build(), &shapes);
-    let path = profiles.map(|p| {
-        p.join("metal")
-            .join("dense")
-            .join(format!("{}-{key:016x}.toml", profile::id_of(&name)))
-    });
-    let kept = path
-        .as_ref()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|text| {
-            text.split_once("dense = ")
-                .map(|(_, ladder)| ladder.trim().to_string())
-        });
-    let ladder = match kept {
-        Some(ladder) => ladder,
-        None => {
-            let began = std::time::Instant::now();
-            let measured =
-                match measure_at(device, &chip, device.cores(), &shapes, &LOAD_ROWS, &mut |_| {}) {
-                    Ok(m) => m,
-                    Err(why) => {
-                        eprintln!("{name}: kernel.dense not measured: {why}; the profile's route serves");
-                        return Ok(chip);
-                    }
-                };
-            if let Some((body, n, first)) = measured.wrong.first() {
-                return Err(format!(
-                    "kernel.dense at load: `{body}` answered wrongly at {n} points; first at {first}"
-                ));
-            }
-            let ((_, ladder), line) = match fit_at(&measured, &LOAD_ROWS, shapes.len()) {
-                Ok(fitted) => fitted,
+    let family = device.family();
+    let candidates = candidates(family);
+    let stated: Vec<profile::fire::KernelCurve> = chip
+        .rates()
+        .kernel_tflops_by_shape
+        .clone()
+        .unwrap_or_default();
+    let top = *LOAD_ROWS.last().expect("rows");
+    let lacking: Vec<(u32, u32)> = shapes
+        .iter()
+        .copied()
+        .filter(|&(n, k)| u64::from(n) * u64::from(k) * 2 <= SHAPE_BYTES / 2)
+        .filter(|&(n, k)| {
+            candidates.iter().filter(|d| runs_shape(**d, n, k)).any(|d| {
+                let (kind, key) = curve_id(*d);
+                !stated
+                    .iter()
+                    .any(|c| c.id() == (kind, key, n, k) && c.serves(top))
+            })
+        })
+        .collect();
+    let mut chip = chip;
+    let mut curves = stated;
+    if !lacking.is_empty() && measuring == engine::rates::Measuring::Skip {
+        let mut tuned = chip.tuned().clone();
+        for &(n, k) in &lacking {
+            tracing::info!(
+                "kernel.dense: skipped: {n}x{k}: nothing timed (`[engine] measure = false`) and no \
+                 layer states its curves under a matching key; the profile's route serves it"
+            );
+            tuned.skipped.push(format!("dense curves at {n}x{k}"));
+        }
+        chip = chip.with_tuned(tuned);
+    } else if !lacking.is_empty() {
+        let began = std::time::Instant::now();
+        let measured =
+            match measure_at(device, &chip, device.cores(), &lacking, &LOAD_ROWS, &mut |_| {}) {
+                Ok(m) => m,
                 Err(why) => {
                     eprintln!("{name}: kernel.dense not measured: {why}; the profile's route serves");
                     return Ok(chip);
                 }
             };
-            eprintln!(
-                "{name}: measured kernel.dense over the model's {} bf16 shapes in {:.1} s: {}",
-                shapes.len(),
-                began.elapsed().as_secs_f64(),
-                line.text
-            );
-            if let Some(path) = &path {
-                let text = format!(
-                    "# kernel.dense measured at load on {name}, over {} bf16 shapes \
-                     ({}) at rows {LOAD_ROWS:?}; key {key:016x}: the device, the OS build, \
-                     linear/gemm.metal and linear/gemm_mpp.metal, the shapes. {}\n\
-                     dense = {}\n",
-                    shapes.len(),
-                    shapes
-                        .iter()
-                        .map(|(n, k)| format!("{n}x{k}"))
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                    line.text,
-                    ladder.trim()
-                );
-                let written = path
-                    .parent()
-                    .map_or(Ok(()), std::fs::create_dir_all)
-                    .and_then(|()| std::fs::write(path, text));
-                if let Err(e) = written {
-                    eprintln!("{name}: kernel.dense not kept at {}: {e}", path.display());
-                }
+        if let Some((body, n, first)) = measured.wrong.first() {
+            return Err(format!(
+                "kernel.dense at load: `{body}` answered wrongly at {n} points; first at {first}"
+            ));
+        }
+        let fresh = curves_of(&measured);
+        tracing::info!(
+            "kernel.dense: measured {} curves over {} of the model's bf16 shapes in {:.1} s, \
+             stored under their keys",
+            fresh.len(),
+            lacking.len(),
+            began.elapsed().as_secs_f64()
+        );
+        if let Some(profiles) = profiles {
+            let save = engine::rates::SaveTo {
+                path: crate::chip::SHELF.user_path(profiles, &name),
+                provenance: crate::rates::provenance(&name),
+                registry: crate::chip::registry(),
+            };
+            let stored = profile::fire::Rates {
+                kernel_tflops_by_shape: Some(fresh.clone()),
+                measured_on: Some(crate::stored::measured_on(&name)),
+                ..profile::fire::Rates::default()
+            };
+            if let Err(why) = engine::rates::save_rates(&save, &stored) {
+                eprintln!("{name}: kernel.dense curves not stored: {why}");
             }
-            ladder
+        }
+        curves.retain(|c| !fresh.iter().any(|f| f.id() == c.id()));
+        curves.extend(fresh);
+    } else {
+        tracing::info!(
+            "kernel.dense: every curve of the model's {} bf16 shapes stored or committed under a \
+             matching key; none timed",
+            shapes.len()
+        );
+    }
+    let fitted: Vec<(u32, u32)> = shapes
+        .iter()
+        .copied()
+        .filter(|&(n, k)| {
+            candidates.iter().filter(|d| runs_shape(**d, n, k)).all(|d| {
+                let (kind, key) = curve_id(*d);
+                curves.iter().any(|c| c.id() == (kind, key, n, k))
+            })
+        })
+        .collect();
+    if fitted.is_empty() {
+        return Ok(chip);
+    }
+    let today = kernels_metal::Tuning::new(chip.clone(), false, device.cores()).with_family(family);
+    let points = points_of(&curves, &candidates, &fitted, &today);
+    let ((_, ladder), line) = match fit_at(&points, &LOAD_ROWS, fitted.len()) {
+        Ok(fit) => fit,
+        Err(why) => {
+            eprintln!("{name}: kernel.dense not fitted: {why}; the profile's route serves");
+            return Ok(chip);
         }
     };
+    tracing::info!(
+        "kernel.dense: fitted over the model's {} measured shapes: {}",
+        fitted.len(),
+        line.text
+    );
     let spec = Dense::spec();
     let base = chip
         .entries()
@@ -661,16 +789,10 @@ pub(crate) fn at_load(
             chip.source().clone(),
         )
     };
-    match over(&composed(&ladder, &shapes, &base)) {
+    match over(&composed(&ladder, &fitted, &base)) {
         Ok(p) => Ok(p),
         // A composition the registry refuses (a profile rung the measured
         // ones leave unreachable): the measured ladder alone serves.
-        Err(_) => over(&ladder).map_err(|e| {
-            format!(
-                "kernel.dense measured at load{}: {e}",
-                path.map(|p| format!(" ({})", p.display()))
-                    .unwrap_or_default()
-            )
-        }),
+        Err(_) => over(&ladder).map_err(|e| format!("kernel.dense fitted at load: {e}")),
     }
 }

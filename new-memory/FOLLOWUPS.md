@@ -1156,13 +1156,16 @@ What each still times at load or boot, for its owner (paths under `crates/`):
   - Graph bodies' memory record (bytes, not time): `measured::conclude` `serve/measured.rs:117`, its own file
     `<cache>/bodies/<hash>` (`measured.rs:47`), keyed by a `DefaultHasher` of the crate version, exe size and mtime:
     a version bump re-measures; not under `[rates]`.
-- **engine-metal**
-  - Roofline `[rates]`: `rates::at_load` `engine-metal/src/rates.rs:587` -> `rates_at_load` (timing `measure`
-    :611). Unkeyed as CUDA's (`measured_on` / `measured_by` None), resolved by `SHELF.resolve` (`chip.rs:231`).
-  - `kernel.dense` crossover per model: `tune::dense::at_load` `engine-metal/src/tune/dense.rs:570` (timing
-    `measure_at` :216, fit `fit_at` :403), its own file `<profiles>/metal/dense/<device>-<key>.toml`, keyed by its
-    own FNV `load_key` :496 (device name, OS build, gemm sources, the model's shapes; no method version). The
-    engine-gpu counterparts are `kernel_tflops_by_shape_keyed` + `dense_settled_keyed`: port it to those keys.
+- **engine-metal**: ported (sc/macpro-committed-profiles). `chip::resolve_keyed` resolves through
+  `Shelf::resolve_keyed` under `stored::Keys` (`on` = `metal <device> macOS <major>`; each `[rates]` key and dense curve
+  keyed by its method and the resolved Metal source of every file its measurement fired, recorded by
+  `encode::record_fired`); `rates::at_load` takes `Measuring` through `resolve_at_load`; `tune::dense::at_load` keeps
+  the per-model crossover as `kernel_tflops_by_shape_keyed` curves (vector forms `1/8`, simdgroup tiles `2/0`,
+  tensor-op tile `3/32`, `KernelCurve::MPP`) in the user file, the ladder fitted from them each load (no
+  `dense_settled`: the fit is the settle, recomputed from the curves); `[metal] measure = false` skips both (the fire
+  top a decode fire of the lanes where no roofline is stated); `cover_fingerprint` keys on `on` and every decision's
+  resolved rungs. Committed: `apple-m5-pro.measured.toml` (Qwen3-0.6B, Qwen3.5-0.8B, Gemma 4 E4B shapes). Still
+  outside: the runtime host cover (below), measured on a clean home as on every engine.
 - **engine-xla**: nothing timed at load and stored (the guest compile ledger `guest/run.rs:198` is in-process RSS).
   No `cover_fingerprint`, so the runtime re-times its host cover every boot (below).
 - **runtime host cover**: `host_cover` `runtime/src/bootstrap.rs:1062` (called :1021), timing `measure_host_cover`

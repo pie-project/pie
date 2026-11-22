@@ -590,6 +590,7 @@ pub fn at_load(
     _facts: &profile::Facts,
     profiles: Option<&std::path::Path>,
     max_submit: Option<std::time::Duration>,
+    measuring: engine::rates::Measuring,
 ) -> Result<profile::Profile, String> {
     let name = device.name().to_string();
     let save = profiles.map(|profiles| engine::rates::SaveTo {
@@ -598,7 +599,7 @@ pub fn at_load(
         registry: crate::chip::registry(),
     });
     let measure_chip = chip.clone();
-    engine::rates::rates_at_load(chip, &KEYS, save, None, max_submit, |_max_submit| {
+    engine::rates::resolve_at_load(chip, &KEYS, save, None, max_submit, measuring, |_max_submit| {
         Ok(engine::rates::Measured {
             rates: measure(device, measure_chip, &mut |_| {})?,
             unsettled: false,
@@ -623,7 +624,11 @@ pub fn measure(
     };
     // The launch first: every rate below takes its dispatches' launches off
     // (engine::rates::rate_from).
+    // Each rate's key names the kernels its measurement fired
+    // (`crate::stored::by`), recorded phase by phase.
+    let _ = crate::encode::record_fired(true);
     let (launch, gaps) = bench.launch_ns()?;
+    let fired_launch = crate::encode::record_fired(true);
     say(&format!(
         "  launch: {}",
         gaps.iter()
@@ -743,6 +748,7 @@ pub fn measure(
         gemm.push((w, curve));
     }
     // The attention curve at d 128; the other widths at the longest keys.
+    let fired_gemm = crate::encode::record_fired(true);
     let mut attn = Vec::new();
     for keys in engine::rates::ATTN_KEYS {
         bench.handles = Handles::new();
@@ -762,15 +768,19 @@ pub fn measure(
             rate / 1e3
         ));
     }
+    let fired_attn = crate::encode::record_fired(true);
     bench.handles = Handles::new();
     let elementwise = bench.elementwise_bytes(gap)?;
+    let fired_elementwise = crate::encode::record_fired(true);
     say(&format!("  rmsnorm and swiglu: {elementwise:.1} GB/s"));
     bench.handles = Handles::new();
     let scan = bench.scan_elements(SCAN_SHAPE.tokens, gap)?;
+    let fired_scan = crate::encode::record_fired(true);
     say(&format!(
         "  gated-delta scan and its conv: {scan:.1} state elements a ns"
     ));
     let bytes = bench.bytes_per_ns(gap)?;
+    let fired_blit = crate::encode::record_fired(false);
     say(&format!("  256 MiB blit: {bytes:.1} GB/s read and write"));
     Ok(Rates {
         launch_ns: Some(launch),
@@ -788,8 +798,22 @@ pub fn measure(
         product_ns: None,
         kernel_tflops_by_shape: None,
         dense_settled: None,
-        measured_on: None,
-        measured_by: None,
+        measured_on: Some(crate::stored::measured_on(device.name())),
+        measured_by: Some(
+            [
+                ("launch_ns", &fired_launch),
+                ("gemm_tflops_by_rows", &fired_gemm),
+                ("few_row_tflops", &fired_gemm),
+                ("workgroups_per_core", &fired_gemm),
+                ("attn_tflops_by_keys", &fired_attn),
+                ("elementwise_gbps", &fired_elementwise),
+                ("scan_gelems", &fired_scan),
+                ("hbm_gbps", &fired_blit),
+            ]
+            .into_iter()
+            .map(|(what, fired)| (what.to_string(), crate::stored::by(what, fired)))
+            .collect(),
+        ),
     })
 }
 

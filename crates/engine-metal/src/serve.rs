@@ -57,6 +57,11 @@ pub struct Boot<'a> {
     pub profiles: Option<std::path::PathBuf>,
     /// How the top rung is chosen.
     pub top: Top,
+    /// Whether the load times what no stored or committed profile states
+    /// under a matching key (`[engine] measure`, `pie serve --no-measure`):
+    /// skipped, each rate and dense curve is served by the estimate and the
+    /// profile's own ladder, named.
+    pub measure: engine::rates::Measuring,
 }
 
 /// How a load chooses the top rung of its fires.
@@ -597,11 +602,18 @@ impl Shell {
         let perf_cores = crate::chip::perf_cores();
         let measured = crate::chip::measured(&device, perf_cores);
         let (chip, chip_report) =
-            crate::chip::resolve(device.name(), &measured, boot.profiles.as_deref());
+            crate::chip::resolve_keyed(device.name(), &measured, boot.profiles.as_deref());
         crate::chip::tell_untuned(device.name(), &chip_report);
         // A device whose profile lacks the roofline's constants measures
         // them here, before ready, and keeps them in the user's profile.
-        let chip = crate::rates::at_load(&device, chip, &measured, boot.profiles.as_deref(), None)
+        let chip = crate::rates::at_load(
+            &device,
+            chip,
+            &measured,
+            boot.profiles.as_deref(),
+            None,
+            boot.measure,
+        )
             .map_err(|why| Fault::Device {
                 call: "rates at load",
                 why,
@@ -610,7 +622,13 @@ impl Shell {
         // once: kept under the profiles and read back by later loads of the
         // same shapes on the same kernels, over the profile's own ladder.
         let chip =
-            crate::tune::dense::at_load(&device, chip, boot.profiles.as_deref(), boot.contract)
+            crate::tune::dense::at_load(
+                &device,
+                chip,
+                boot.profiles.as_deref(),
+                boot.contract,
+                boot.measure,
+            )
                 .map_err(|why| Fault::Device {
                     call: "kernel.dense at load",
                     why,
@@ -1297,16 +1315,51 @@ impl PreparedLoad<'_> {
         } else {
             None
         };
+        // A load that skips measuring (`[engine] measure = false`) with no
+        // roofline stated serves by the estimate's static half: no rate
+        // weighs the rungs, so the fire top is the narrowest feasible rung a
+        // decode fire of the load's lanes takes (one row a lane), a prompt
+        // chunked to it; said by name.
+        let unweighed = boot.measure == engine::rates::Measuring::Skip
+            && !chip.rates().complete(&crate::rates::KEYS);
         if let Some((counts, rungs, live, _)) = weighed.as_ref().filter(|_| boot.top == Top::Ruled) {
             let (live, rungs) = (*live, rungs.clone());
-            let pick = crate::top::choose(
-                &rungs,
-                live,
-                boot.context,
-                &chip.tuned().rates,
-                device.name(),
-                &counts,
-            )?;
+            let pick = if unweighed {
+                let lanes = budgets.tokens.max_lanes.max(1);
+                let feasible = || rungs.iter().filter(|r| r.infeasible.is_none());
+                let rung = feasible()
+                    .filter(|r| r.tokens >= lanes)
+                    .min_by_key(|r| r.tokens)
+                    .or_else(|| feasible().max_by_key(|r| r.tokens))
+                    .ok_or_else(|| Fault::Param {
+                        name: "rungs".to_string(),
+                        why: "no rung of this load is feasible on this device",
+                    })?;
+                tracing::info!(
+                    lanes,
+                    tokens = rung.tokens,
+                    missing = ?chip.rates().missing(&crate::rates::KEYS),
+                    "skipped: the roofline `[rates]` (`[engine] measure = false`, no layer states \
+                     them), served by the estimate: the fire top is the narrowest rung a decode \
+                     fire of the load's lanes takes, a prompt chunked to it (no rate weighs the \
+                     rungs)"
+                );
+                engine::load::TopRung {
+                    tokens: rung.tokens,
+                    lanes: rung.lanes,
+                    span_bytes: rung.span_bytes,
+                    why: engine::load::TopWhy::OnlyFeasible,
+                }
+            } else {
+                crate::top::choose(
+                    &rungs,
+                    live,
+                    boot.context,
+                    &chip.tuned().rates,
+                    device.name(),
+                    &counts,
+                )?
+            };
             let asked = budgets.tokens.max_tokens;
             tracing::info!(
                 "{}: {}",
@@ -2214,11 +2267,22 @@ impl Shell {
                     .fold(h, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
             },
         );
+        // Every decision as the load resolved it, rung by rung (the dense
+        // ladder measured or taken at load among them): the tuning's own
+        // Debug names the profile's source alone, so a pick that changed
+        // under one source kept the cover an earlier pick was timed under.
+        let decisions: String = self
+            .tuning
+            .profile()
+            .entries()
+            .map(|(spec, rungs, _)| format!("{}={rungs:?};", spec.id))
+            .collect();
         format!(
-            "metal|{}|{os}|emitter {}|kernels {kernels:016x}|tuning {:016x}",
-            self.device.name(),
+            "metal|{}|{os}|emitter {}|kernels {kernels:016x}|tuning {:016x}|picks {:016x}",
+            crate::stored::measured_on(self.device.name()),
             eta_compiler::codegen::metal::METAL_M1_EMITTER_VERSION,
             fnv(format!("{:?}", self.tuning).as_bytes()),
+            fnv(decisions.as_bytes()),
         )
     }
 

@@ -541,6 +541,8 @@ pub(crate) fn create_engine_backend(
     opened: Option<runtime::engine::EngineBox>,
 ) -> Result<GroupEngine> {
     let cache_dir = &crate::disk::engine_cache_dir(home);
+    // Vulkan, wgpu and Metal write it into their boot documents; the other
+    // engines' configs refuse `measure = false` before here.
     let _ = measure;
     let _ = (group_id, adapter_dir, &opened);
     validate_snapshot_dir(snapshot_dir)?;
@@ -589,6 +591,7 @@ pub(crate) fn create_engine_backend(
                 "profiles = {}\n",
                 toml::Value::String(home.join("profiles").display().to_string())
             ));
+            boot_doc.push_str(&format!("measure = {measure}\n"));
             if let Some(mount) = adapter_dir {
                 boot_doc.push_str(&format!(
                     "\n[model]\nadapter_dir = {}\n",

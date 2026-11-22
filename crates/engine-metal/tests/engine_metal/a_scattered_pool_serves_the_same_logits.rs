@@ -354,6 +354,7 @@ pub(super) fn load_ahead(
         },
         profiles: None,
         top: engine_metal::Top::EveryRung,
+        measure: engine::rates::Measuring::Time,
     })
     .and_then(|mut shell| shell.raise_whole().map(|()| shell))
     .unwrap_or_else(|why| panic!("the shell loads: {why}"))
