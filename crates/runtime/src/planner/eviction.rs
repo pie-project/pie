@@ -431,6 +431,26 @@ impl ResidencyPlanner {
             && self.with_inner(|inner| inner.nothing_in_flight());
         let mismatch = placement.as_ref().is_some_and(super::pool::RestorePlacement::stands)
             && self.no_more_room_than_refused(victims.head_pid);
+        // Said only where the placement was read and stands: a refusal in
+        // the same room read with no placement (a send held until more
+        // chunks stand free) is a wait, not this mismatch, and said as one
+        // it was most of the field's "placement and takes differ" lines.
+        if mismatch
+            && self.with_inner(|inner| {
+                inner.nothing_in_flight()
+                    && inner
+                        .procs
+                        .get(&victims.head_pid)
+                        .is_some_and(|proc| proc.roles_short_quiet)
+            })
+        {
+            tracing::error!(
+                pid = %victims.head_pid,
+                free = self.port.free_chunks(),
+                "planner: a restore refused with nothing else in flight stands in the \
+                 placement in the same room (a planner bug: the placement and the takes differ)"
+            );
+        }
         if forced {
             self.stats.forced_passes.fetch_add(1, Ordering::Relaxed);
             // Each forced pass is a placement disagreement still in the
@@ -955,17 +975,9 @@ impl ResidencyPlanner {
             // and it is sent. Held, it waited for room no event brings
             // (the L40S at 3 GiB on c201812ea: 186 s, "sent again once more
             // chunks stand free", nothing in flight). Refused with nothing
-            // else in flight, a placement standing in that room is the
-            // placement's mismatch: held, and said as a planner bug.
+            // else in flight, it is held in that room; where its placement
+            // stands there, the eviction plan says the mismatch.
             let quiet_now = inner.nothing_in_flight();
-            if quiet_now && proc.roles_short_quiet {
-                tracing::error!(
-                    %pid,
-                    free,
-                    "planner: a restore refused with nothing else in flight stands in the \
-                     placement in the same room (a planner bug: the placement and the takes differ)"
-                );
-            }
             !quiet_now || proc.roles_short_quiet
         })
     }
