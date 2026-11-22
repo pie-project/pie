@@ -918,6 +918,10 @@ struct Workload {
     /// host -> disk lands its host leg before its disk leg). `None`: every
     /// copy due lands.
     ring: Option<usize>,
+    /// A copy due fails to land one time in this many
+    /// (`engine::Landing::Failed`): its destination written with garbage,
+    /// its sources left as they were. `None`: every copy lands.
+    landing_fails: Option<u64>,
 }
 
 impl Workload {
@@ -1030,6 +1034,10 @@ impl Workload {
         let ring = ring_rng
             .chance(1, 3)
             .then(|| ring_rng.range(1, 3) as usize);
+        let mut fail_rng = Rng(seed ^ 0xfa11_ed00);
+        let landing_fails = fail_rng
+            .chance(1, 4)
+            .then(|| u64::from(fail_rng.range(3, 12)));
         Self {
             seed,
             pool,
@@ -1038,6 +1046,7 @@ impl Workload {
             late,
             target,
             ring,
+            landing_fails,
         }
     }
 
@@ -1083,6 +1092,8 @@ struct Coverage {
     disk_copies: u64,
     /// Steps the governor moved its target on.
     retargets: u64,
+    /// Copies that failed to land, taken back from their sources.
+    landing_failed: u64,
     forks: u64,
     shared_pages: u64,
     binds: u64,
@@ -1113,6 +1124,7 @@ impl Coverage {
         self.copies += other.copies;
         self.disk_copies += other.disk_copies;
         self.retargets += other.retargets;
+        self.landing_failed += other.landing_failed;
         self.forks += other.forks;
         self.shared_pages += other.shared_pages;
         self.binds += other.binds;
@@ -2261,6 +2273,19 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
             if copy.to_disk && workload.tier_full_at(step) {
                 coverage.tier_full_refused += 1;
                 copy.refuse_tier_full();
+            } else if let Some(den) = workload.landing_fails
+                && ctx.rng.lock().unwrap().chance(1, den)
+            {
+                // Failed: what it wrote is garbage, its sources untouched.
+                coverage.landing_failed += 1;
+                if let Some(slots) = &copy.slots {
+                    let mut bytes = ctx.bytes.lock().unwrap();
+                    let dst = Bytes::tier(slots.dst);
+                    for &(_, to) in &slots.slots {
+                        bytes.write(dst, slots.shape.0, to, 0xdead_beef);
+                    }
+                }
+                copy.fail_landing("the device event faulted (simulated)");
             } else {
                 if let Some(slots) = &copy.slots {
                     land_bytes(&ctx.bytes, slots);
@@ -2516,7 +2541,7 @@ fn replay_seed(seed: u64) -> Vec<Failure> {
 /// fixed, each with a seed that showed it (its regression test below,
 /// ignored until fixed). The fast sweep fails on any other shape; once a
 /// shape is fixed its entry goes and its test is no longer ignored.
-const KNOWN: [(&str, u64); 3] = [
+const KNOWN: [(&str, u64); 4] = [
     // Every tier full, no idle cache: the device's chunks, the host's and
     // the disk's all held, the fleet's state past all three, each resident
     // a page short, every one's kv past the few swap slots left, the rest
@@ -2534,6 +2559,12 @@ const KNOWN: [(&str, u64); 3] = [
     (
         "stall bind room: placement none, moves none, host_short true",
         3243,
+    ),
+    // The same class: the swap tiers all but full (3 of 96 slots), ten
+    // residents blocked on room below, the device full of their kv.
+    (
+        "stall allocation: placement none, moves some, host_short false, ended \"no pick: the policy is asked",
+        2547,
     ),
 ];
 

@@ -165,7 +165,12 @@ async fn park_down(
     let reading = MovingOut::of_all(planner, pids);
     let copied = guard.copy(planner, ProcessId::nil()).await;
     drop(reading);
-    copied?;
+    if let Err(error) = copied {
+        // Taken back from its sources, which still hold it (a copy that
+        // did not land among them): it is tried again as room is asked.
+        guard.take_back().await;
+        return Err(error.into());
+    }
     // Its instances' tables leave the device now: said parked again, kept
     // nowhere, before the commit hands their slots to anyone else.
     park(planner.locus().1, guard.parked()).await?;
@@ -657,6 +662,10 @@ pub(super) struct CopyFailure {
     /// The tier it copied down to is full ([`crate::scheduler::TierBelowFull`]):
     /// nothing on the device changed.
     tier_full: bool,
+    /// A copy did not land ([`crate::scheduler::LandingFailed`]): its
+    /// destination is not to be trusted, its sources hold what they held,
+    /// and the move is taken back from them and tried again.
+    landing_failed: bool,
 }
 
 impl CopyFailure {
@@ -669,6 +678,9 @@ impl CopyFailure {
             tier_full: error
                 .chain()
                 .any(|cause| cause.downcast_ref::<crate::scheduler::TierBelowFull>().is_some()),
+            landing_failed: error
+                .chain()
+                .any(|cause| cause.downcast_ref::<crate::scheduler::LandingFailed>().is_some()),
         }
     }
 }
@@ -951,6 +963,13 @@ pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
             // is taken back; the process stays as it was.
             guard.take_back().await;
             planner.eviction_copy_refused(pid, &error.message);
+        } else if error.landing_failed {
+            // A copy did not land: its state is still on the device, where
+            // it was copied from. The move is taken back and the process
+            // stays resident, its eviction tried again from there once the
+            // pool moves.
+            guard.take_back().await;
+            planner.eviction_landing_failed(pid, &error.message);
         } else {
             guard.take_back().await;
             planner.eviction_copy_failed(pid, &error.message);
@@ -1345,6 +1364,17 @@ async fn restore(
     }
     let mut guard = MoveGuard::new(model, engine, Move::Restore { kv, rs, roles });
     if let Err(error) = guard.copy(&planner, pid).await {
+        // Taken back before anything reads where it was: its state is
+        // still below, where the copy read it from.
+        guard.take_back().await;
+        if error.landing_failed {
+            // A copy did not land: what it wrote is not to be trusted, and
+            // its sources still hold the state. The restore goes again
+            // from them.
+            tracing::warn!(pid = %pid, %error, "planner: a restore's copy did not land: tried again from its source");
+            planner.requeue_restore(pid);
+            return;
+        }
         planner.restore_faulted(
             pid,
             &format!("its state could not be copied back to the device: {error}"),

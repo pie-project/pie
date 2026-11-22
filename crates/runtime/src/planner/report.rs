@@ -118,6 +118,20 @@ impl ResidencyPlanner {
         self.eviction_failed_inner(pid, false, true);
     }
 
+    /// An eviction's copy did not land ([`::engine::Landing::Failed`]): its
+    /// state is still on the device, its move taken back, and the process
+    /// kept resident, a victim again at once: the copy goes again from
+    /// where its state lies. Blocked until the pool moved (as a full tier
+    /// is), a fleet with nothing else in flight waited on it for good.
+    pub(super) fn eviction_landing_failed(self: &Arc<Self>, pid: ProcessId, error: &str) {
+        tracing::warn!(
+            pid = %pid,
+            %error,
+            "planner: an eviction's copy did not land: taken back, the process kept resident"
+        );
+        self.eviction_failed_inner(pid, false, false);
+    }
+
     pub(super) fn eviction_found_nothing(self: &Arc<Self>, pid: ProcessId) {
         self.eviction_failed_inner(pid, false, true);
     }

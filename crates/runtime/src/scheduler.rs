@@ -50,6 +50,14 @@ pub(crate) struct RefusedUntouched(pub String);
 #[error("{0}")]
 pub(crate) struct TierBelowFull(pub String);
 
+/// A copy the engine answered as still landing did not land
+/// ([`::engine::Landing::Failed`]): its destination is not to be trusted
+/// and its sources hold what they held, so the move is taken back from
+/// them, never committed.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct LandingFailed(pub String);
+
 /// How an engine refused a control, read from its error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Refused {
@@ -59,6 +67,8 @@ enum Refused {
     Untouched,
     /// The tier it copied down to is full; nothing on the device changed.
     TierFull,
+    /// It did not land: its sources hold what they held.
+    LandingFailed,
 }
 
 impl ControlCompletion {
@@ -90,6 +100,7 @@ impl ControlCompletion {
         match refused {
             Refused::Untouched => anyhow::Error::new(RefusedUntouched(message)),
             Refused::TierFull => anyhow::Error::new(TierBelowFull(message)),
+            Refused::LandingFailed => anyhow::Error::new(LandingFailed(message)),
             Refused::Failed => anyhow::Error::msg(message),
         }
     }
@@ -98,12 +109,20 @@ impl ControlCompletion {
         let result = result.as_ref().map(|_| ()).map_err(|error| {
             let refused = error
                 .chain()
-                .find_map(|cause| match cause.downcast_ref::<::engine::Error>() {
-                    Some(::engine::Error::TierFull(_)) => Some(Refused::TierFull),
-                    Some(::engine::Error::Impossible(_) | ::engine::Error::Placement { .. }) => {
-                        Some(Refused::Untouched)
+                .find_map(|cause| {
+                    if cause
+                        .downcast_ref::<crate::engine::completion::CopyLandingFailed>()
+                        .is_some()
+                    {
+                        return Some(Refused::LandingFailed);
                     }
-                    _ => None,
+                    match cause.downcast_ref::<::engine::Error>() {
+                        Some(::engine::Error::TierFull(_)) => Some(Refused::TierFull),
+                        Some(
+                            ::engine::Error::Impossible(_) | ::engine::Error::Placement { .. },
+                        ) => Some(Refused::Untouched),
+                        _ => None,
+                    }
                 })
                 .unwrap_or(Refused::Failed);
             (format!("{error:#}"), refused)

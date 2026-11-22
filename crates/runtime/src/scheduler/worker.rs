@@ -5369,6 +5369,15 @@ pub(crate) mod test_lane {
             self.completion.resolve(&Ok(()));
         }
 
+        /// The copy did not land (`engine::Landing::Failed`): its
+        /// destination is not to be trusted, its sources hold what they
+        /// held.
+        pub(crate) fn fail_landing(self, why: &str) {
+            self.completion.resolve(&Err(anyhow::Error::new(
+                crate::engine::completion::CopyLandingFailed(why.to_string()),
+            )));
+        }
+
         /// The tier it copies down to is full (`engine::Error::TierFull`):
         /// nothing on the device changed.
         pub(crate) fn refuse_tier_full(self) {

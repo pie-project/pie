@@ -496,6 +496,24 @@ fn control_call(item: &QueuedItem) -> std::borrow::Cow<'static, str> {
     }
 }
 
+/// Settles the completion of copy `token` as the engine told it ended:
+/// landed, or failed, never counted as landed (its destination is not to
+/// be trusted, its sources hold what they held).
+fn tell_landing(
+    broker: &crate::engine::CompletionBroker,
+    engine_idx: usize,
+    token: u64,
+    landing: ::engine::Landing,
+) {
+    match landing {
+        ::engine::Landing::Landed => broker.notify(token, waker::FIRST_COMPLETION_EPOCH),
+        ::engine::Landing::Failed(why) => {
+            tracing::warn!(engine_idx, token, %why, "a tier copy failed to land");
+            broker.fail(token, waker::FIRST_COMPLETION_EPOCH, why);
+        }
+    }
+}
+
 fn backend(engine: &mut Option<EngineBox>) -> Result<&mut EngineBox> {
     engine.as_mut().ok_or_else(|| anyhow!(NO_BACKEND))
 }
@@ -730,13 +748,10 @@ impl Lane {
             // runtime gives its source slots back only then.
             let landed = broker.clone();
             engine.on_landed(std::sync::Arc::new(move |token: u64, landing: ::engine::Landing| {
-                // A copy that failed leaves its data at its source: named
-                // here until the runtime retries it from the source or fails
-                // its owner (the rework line's handling).
-                if let ::engine::Landing::Failed(why) = &landing {
-                    tracing::error!(engine_idx, token, %why, "a tier copy failed to land");
-                }
-                landed.notify(token, waker::FIRST_COMPLETION_EPOCH);
+                // A copy that failed leaves its data at its source: its
+                // completion settles failed, never landed, and the move
+                // waiting on it is taken back (`planner::exec`).
+                tell_landing(&landed, engine_idx, token, landing);
                 // The scheduler retires the copy's completion on its next
                 // turn: woken now, not at its idle backstop, so the move
                 // waiting on it commits (and its pages come back) at once.
@@ -1884,8 +1899,8 @@ mod landing_tests {
             tokens: Arc::clone(&tokens),
         };
         let told = broker.clone();
-        engine.on_landed(Arc::new(move |token, _landing| {
-            told.notify(token, waker::FIRST_COMPLETION_EPOCH);
+        engine.on_landed(Arc::new(move |token, landing| {
+            tell_landing(&told, 0, token, landing);
         }));
         (Box::new(engine), tokens, sink)
     }
@@ -1912,6 +1927,28 @@ mod landing_tests {
             "told landed, the copy's sources may go back"
         );
         assert!(completion.check().is_some_and(|settled| settled.is_ok()));
+    }
+
+    /// A copy told failed (`engine::Landing::Failed`) settles failed by
+    /// name, never as landed: what waits on it takes its move back from the
+    /// sources, which hold what they held.
+    #[test]
+    fn a_copy_told_failed_never_settles_as_landed() {
+        let broker = crate::engine::CompletionBroker::new();
+        let (mut late, tokens, sink) = engine(false, &broker);
+        let completion =
+            copy_settled_on_landing(&mut late, &broker, park()).expect("the copy is taken");
+        let token = tokens.lock().unwrap()[0];
+        let sink = sink.lock().unwrap().clone().expect("the lane gave a sink");
+        sink(token, ::engine::Landing::Failed("event faulted".into()));
+        let settled = completion.check().expect("settled");
+        let error = settled.expect_err("failed, not landed");
+        assert!(
+            error
+                .downcast_ref::<crate::engine::completion::CopyLandingFailed>()
+                .is_some(),
+            "{error:#}"
+        );
     }
 
     /// An engine whose copies land inside the call settles at once, as
