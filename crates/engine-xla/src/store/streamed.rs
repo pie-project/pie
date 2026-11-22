@@ -346,8 +346,14 @@ impl Streamed {
             let vocab = u32::try_from(param.shape[0]).unwrap_or(u32::MAX);
             let width = u32::try_from(param.shape[1]).unwrap_or(u32::MAX);
             let row = u64::from(width) * 2;
-            // Whole pool rows a block, near `ROW_BLOCK`.
-            let step = ROW_BYTES / gcd(ROW_BYTES, row);
+            // A block of whole `(8, 128)` u32 tiles of the pool, near
+            // `ROW_BLOCK`: its seat lands by a dynamic slice of the bulk
+            // ring, which the device cuts in whole tiles (v6e: a Nemotron-3
+            // Nano miniature's 126-row seats refused to compile their
+            // landing). A seat is then whole tiles and whole table rows at
+            // once, so a row's place in the weight view is its seat's offset
+            // over the row and its rank in the block (`serve::stream`).
+            let step = PANEL_ALIGN / gcd(PANEL_ALIGN, row);
             let block = align_up((ROW_BLOCK / row).max(1), step);
             let block = u32::try_from(block).unwrap_or(u32::MAX);
             let plane = Plane {
@@ -357,6 +363,18 @@ impl Streamed {
                 view: width,
             };
             let slot_bytes = plane.bytes();
+            // A seat is whole table rows (a row's place in the view is its
+            // seat's offset over the row) and whole tiles (a seat lands by a
+            // tile-cut slice): a seat of either part would read its rows
+            // from another seat's.
+            if !slot_bytes.is_multiple_of(row) || !slot_bytes.is_multiple_of(PANEL_ALIGN) {
+                return Err(Fault::Unbound {
+                    what: format!(
+                        "a {slot_bytes}-byte seat of `{}`, not whole {row}-byte rows and whole {PANEL_ALIGN}-byte tiles",
+                        param.name
+                    ),
+                });
+            }
             unit = lcm(unit, row);
             least = least.max(slot_bytes);
             let count = vocab.div_ceil(block);

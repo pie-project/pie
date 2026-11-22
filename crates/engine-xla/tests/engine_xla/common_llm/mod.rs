@@ -153,13 +153,29 @@ impl Model {
         seed: u64,
         disk: Option<&std::path::Path>,
     ) -> Model {
-        Model::load_full(name, layers, context, seed, disk, false, 0)
+        Model::load_full(
+            name,
+            layers,
+            context,
+            &|p, t| write_checkpoint(p, t, seed),
+            disk,
+            false,
+            0,
+        )
     }
 
     /// [`Model::load`] told whether its weights are held
     /// (`Residency::weights_held`: held, nothing streams).
     pub fn load_held(name: &str, layers: Option<u32>, context: u32, seed: u64) -> Model {
-        Model::load_full(name, layers, context, seed, None, true, 0)
+        Model::load_full(
+            name,
+            layers,
+            context,
+            &|p, t| write_checkpoint(p, t, seed),
+            None,
+            true,
+            0,
+        )
     }
 
     /// [`Model::load_held`] with `extra` chunks more in its pool: the pool
@@ -171,14 +187,34 @@ impl Model {
         seed: u64,
         extra: u32,
     ) -> Model {
-        Model::load_full(name, layers, context, seed, None, true, extra)
+        Model::load_full(
+            name,
+            layers,
+            context,
+            &|p, t| write_checkpoint(p, t, seed),
+            None,
+            true,
+            extra,
+        )
+    }
+
+    /// The model (cut to `layers` where given), its checkpoint the planes
+    /// `write` lays: another backend's seeding, to compare served logits
+    /// across backends.
+    pub fn load_written(
+        name: &str,
+        layers: Option<u32>,
+        context: u32,
+        write: &dyn Fn(&std::path::Path, &poem_ir::Trace),
+    ) -> Model {
+        Model::load_full(name, layers, context, write, None, false, 0)
     }
 
     fn load_full(
         name: &str,
         layers: Option<u32>,
         context: u32,
-        seed: u64,
+        write: &dyn Fn(&std::path::Path, &poem_ir::Trace),
         disk: Option<&std::path::Path>,
         held: bool,
         extra: u32,
@@ -200,7 +236,7 @@ impl Model {
         ));
         std::fs::create_dir_all(&dir).expect("a scratch directory");
         let path = dir.join("weights.zt");
-        write_checkpoint(&path, &trace, seed);
+        write(&path, &trace);
         let vocab = trace
             .params
             .iter()
