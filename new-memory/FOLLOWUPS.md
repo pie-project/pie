@@ -1014,3 +1014,14 @@ the partials and candidates the split regions publish there: silent wrong result
 Tool for whoever picks it up: the sync-and-read check above, on a build without the memset
 (the self-resetting branch, `sc/amd-meet-reset-dropped`, local on the MI300X host), plus the
 fire's stream map at the stalled launch.
+
+## F48. The declared-context cut's "one sequence at most half the room" is a tuned constant
+
+`store::declared_context_within` (engine-cuda) serves a declared context at
+the longest one sequence of which takes no more than half the live room past
+the weights, "the activations and a second sequence having the other half".
+The half was moved from the old pre-stage cut, not set by any ruling. Derive
+it (the lanes the load promises must seat at the cut context, beside one
+rung's activation span) or drop it in favour of the capacity gate's finisher
+guarantee; the fit's own shortening (`Pools::declare_context`) already
+derives what one working set needs.
