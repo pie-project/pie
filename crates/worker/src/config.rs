@@ -1087,11 +1087,11 @@ impl EngineConfig {
         self.memory.validate()?;
         ensure!(
             self.measure
-                || matches!(self.kind, EngineKind::Vulkan | EngineKind::Wgpu)
+                || matches!(self.kind, EngineKind::Vulkan | EngineKind::Wgpu | EngineKind::Metal)
                 || (self.kind == EngineKind::Cuda && self.device.len() == 1),
-            "engine.measure = false skips the measurements a load takes on the vulkan and wgpu \
-             engines and a one-device cuda engine; the {} engine{} still measures outside that \
-             path (new-memory/FOLLOWUPS.md), so omit the key",
+            "engine.measure = false skips the measurements a load takes on the vulkan, wgpu and \
+             metal engines and a one-device cuda engine; the {} engine{} still measures outside \
+             that path (new-memory/FOLLOWUPS.md), so omit the key",
             self.kind.as_str(),
             if self.kind == EngineKind::Cuda {
                 " across devices"
@@ -1495,11 +1495,17 @@ device = ["metal:0"]
         cfg.skip_measuring().expect("vulkan skips");
         assert!(!cfg.engine.measure);
         let mut cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
+        cfg.skip_measuring().expect("metal skips");
+        assert!(!cfg.engine.measure);
+        let cuda = MINIMAL_METAL
+            .replace("type = \"metal\"", "type = \"cuda\"")
+            .replace("metal:0", "cuda:0");
+        let mut cfg: Config = toml::from_str(&cuda).unwrap();
         let why = cfg
             .skip_measuring()
-            .expect_err("metal measures outside the skip path yet");
+            .expect_err("cuda measures outside the skip path yet");
         assert!(
-            why.to_string().contains("the metal engine still measures"),
+            why.to_string().contains("the cuda engine still measures"),
             "{why}"
         );
     }

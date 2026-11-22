@@ -1474,7 +1474,7 @@ mod tests {
             attn_tflops_by_rows_keys: None,
             product_ns: None,
             kernel_tflops_by_shape: None,
-            dense_settled: None,
+            dense_settled: Vec::new(),
             measured_on: None,
             measured_by: None,
         }
@@ -1909,12 +1909,20 @@ mod tests {
                 },
             },
         ]);
-        rates.dense_settled = Some(profile::fire::DenseSettled {
-            method: 1,
-            of: 5,
-            code: 6,
-            ranges: vec![[1, 1, 0, 0, 0, 0]],
-        });
+        rates.dense_settled = vec![
+            profile::fire::DenseSettled {
+                method: 1,
+                of: 5,
+                code: 6,
+                ranges: vec![[1, 1, 0, 0, 0, 0]],
+            },
+            profile::fire::DenseSettled {
+                method: 1,
+                of: 9,
+                code: 6,
+                ranges: vec![[1, 1, 1, 4, 0, 1]],
+            },
+        ];
         let user = saved_text(None, &rates, &provenance("toy", "a test"));
         let text = profile::export(&registry, "Card X", &user, "user.toml").unwrap();
         let read = registry
@@ -2844,7 +2852,7 @@ mod tests {
             attn_tflops_by_rows_keys: None,
             product_ns: None,
             kernel_tflops_by_shape: None,
-            dense_settled: None,
+            dense_settled: Vec::new(),
             measured_on: None,
             measured_by: None,
         };

@@ -9,8 +9,9 @@
 //!
 //! The device and the kernels' codes are the backend's ([`backend`]): on
 //! ROCm the device's arch and HIP driver and runtime, the carried kernel
-//! library's text and hipBLASLt's version; on CUDA, until its keys are
-//! stated, the device's name alone, every measurement keyed by its method.
+//! library's text and hipBLASLt's version; on CUDA the device's compute
+//! capability and driver, the carried library's text with the NVRTC that
+//! compiles it, and cuBLASLt's version.
 
 use profile::fire::{KEYED, MeasuredBy, Now, Rates};
 
@@ -130,17 +131,35 @@ mod backend {
     }
 }
 
-/// CUDA's keys are its backend's to state (the device's driver and
-/// cuBLASLt version, each kernel's cubin): until they are, a measurement is
-/// keyed by the device's name and its method alone.
 #[cfg(not(feature = "rocm"))]
 mod backend {
-    pub(super) fn keys(_ordinal: i32, device: &str) -> (String, Vec<(&'static str, u32)>) {
-        (format!("{device} cuda"), Vec::new())
+    use kernels_cuda::stored::{BLASLT, LIBRARY_KERNELS};
+
+    /// The device as its measurements depend on it, and the code of each
+    /// kernel a measurement names: the carried library, and cuBLASLt.
+    pub(super) fn keys(ordinal: i32, device: &str) -> (String, Vec<(&'static str, u32)>) {
+        let blaslt = kernels_cuda::stored::blaslt_code();
+        let on = match kernels_cuda::stored::on(ordinal) {
+            Some(on) => format!("{device} {on}"),
+            None => format!("{device} cuda (no driver version)"),
+        };
+        let mut codes = vec![(LIBRARY_KERNELS, kernels_cuda::stored::library_code())];
+        if let Some(code) = blaslt {
+            codes.push((BLASLT, code));
+        }
+        (on, codes)
     }
 
-    pub(super) fn fired(_what: &str) -> &'static [&'static str] {
-        &[]
+    /// What measuring `what` fires: the matmul rate cuBLASLt alone, the
+    /// copy rate the runtime's copy alone, a decode step both libraries,
+    /// every other rate this crate's kernels.
+    pub(super) fn fired(what: &str) -> &'static [&'static str] {
+        match what {
+            "gemm_tflops_by_rows" => &[BLASLT],
+            "hbm_gbps" => &[],
+            super::PRODUCT_NS => &[LIBRARY_KERNELS, BLASLT],
+            _ => &[LIBRARY_KERNELS],
+        }
     }
 }
 

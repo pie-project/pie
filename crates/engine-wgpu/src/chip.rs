@@ -35,6 +35,12 @@ macro_rules! seeded {
 
 seeded!();
 
+/// The host covers committed for the adapters native wgpu serves
+/// (`profiles/<device>.covers.json`, `pie tune export --engine wgpu`), each
+/// listed here: the runtime takes a cover whose key matches where the
+/// home's own cache holds none (`engine::Engine::committed_covers`).
+pub const COVERS: &[&str] = &[];
+
 pub static SHELF: Shelf = Shelf {
     backend: "wgpu",
     seeded: SEEDED,
