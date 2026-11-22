@@ -393,7 +393,14 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             .device_facts()
             .is_some_and(|facts| facts.unified_memory)
     });
-    let (memory_yield, stated) = crate::governor::yield_for(memory_yield, unified_memory);
+    // Where an engine reads the host's room itself, the yield reacts only to
+    // the rest of the system (`governor::yield_for`).
+    let room = crate::governor::Room::of(
+        engine_configs
+            .iter()
+            .any(|d| d.engine_backend.host_room().is_some()),
+    );
+    let (memory_yield, stated) = crate::governor::yield_for(memory_yield, unified_memory, room);
     tracing::info!("{stated}");
 
     // Each engine's readouts, a fire bound (`Engine::readout_facts`): a
@@ -994,7 +1001,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     // read.
     let moves = governed.iter().any(crate::governor::run::yield_applies);
     let source = if moves {
-        crate::governor::source_for(memory_yield, ::engine::pressure::Source::of_this_system)
+        crate::governor::source_for(memory_yield, || room.source())
     } else {
         Ok(None)
     };

@@ -95,6 +95,14 @@ pub enum Source {
     /// unprivileged on every macOS pie supports. The reading is
     /// `1 - level / 100` ([`macos_available`]).
     MacosAvailable,
+    /// macOS, beside this process: `kern.memorystatus_level` with this
+    /// process's own physical footprint counted as available (its pool,
+    /// weights and guests), so the reading is the pressure the rest of the
+    /// system puts on the machine ([`macos_available_beside`]). For a load
+    /// whose engine already holds its pool within the room its own host
+    /// side leaves (`Engine::host_room`): the pool yields to other
+    /// processes, never to its own load.
+    MacosBesideOwn,
     /// A test hook: the file `PIE_PRESSURE_FILE` names holds the reading,
     /// a number in `0..=1`, so a test can induce pressure mid-run.
     File(PathBuf),
@@ -127,6 +135,29 @@ impl Source {
         source.checked()
     }
 
+    /// This system's source with this process's own memory discounted
+    /// ([`Source::MacosBesideOwn`]), where the OS's signal allows it (a
+    /// level of available memory, which a footprint can be added back to);
+    /// the test hook where `PIE_PRESSURE_FILE` is set.
+    ///
+    /// # Errors
+    ///
+    /// This system's signal cannot discount the process (Linux PSI is a
+    /// share of stalled time, not a level), or it does not read.
+    pub fn of_this_system_beside_own() -> Result<Source, String> {
+        let source = if let Some(path) = std::env::var_os("PIE_PRESSURE_FILE") {
+            Source::File(path.into())
+        } else if cfg!(target_os = "macos") {
+            Source::MacosBesideOwn
+        } else {
+            return Err(format!(
+                "this system's memory pressure cannot discount the process's own memory ({})",
+                std::env::consts::OS
+            ));
+        };
+        source.checked()
+    }
+
     /// This source if it reads now; else `"<source> reads <error>"`.
     ///
     /// # Errors
@@ -145,6 +176,10 @@ impl Source {
         match self {
             Source::Psi => "Linux PSI /proc/pressure/memory, some avg10",
             Source::MacosAvailable => "macOS kern.memorystatus_level, 1 - available / 100",
+            Source::MacosBesideOwn => {
+                "macOS kern.memorystatus_level beside this process: 1 - (available + its \
+                 footprint) / 100"
+            }
             Source::File(_) => "PIE_PRESSURE_FILE",
         }
     }
@@ -162,7 +197,7 @@ impl Source {
     pub const fn period(&self) -> Option<Duration> {
         match self {
             Source::Psi => Some(Duration::from_secs(2)),
-            Source::MacosAvailable | Source::File(_) => None,
+            Source::MacosAvailable | Source::MacosBesideOwn | Source::File(_) => None,
         }
     }
 
@@ -198,6 +233,18 @@ impl Source {
             Source::MacosAvailable => {
                 let level = macos::sysctl_u32(macos::AVAILABLE)?;
                 let pressure = macos_available(level).ok_or_else(|| {
+                    format!("kern.memorystatus_level is {level}, not a percentage")
+                })?;
+                Ok(Sample {
+                    raw: f64::from(level),
+                    pressure,
+                })
+            }
+            Source::MacosBesideOwn => {
+                let level = macos::sysctl_u32(macos::AVAILABLE)?;
+                let total = macos::physical_memory()?;
+                let own = macos::footprint()?;
+                let pressure = macos_available_beside(level, own, total).ok_or_else(|| {
                     format!("kern.memorystatus_level is {level}, not a percentage")
                 })?;
                 Ok(Sample {
@@ -254,6 +301,37 @@ pub fn macos_available(level: u32) -> Option<f64> {
     (level <= 100).then(|| 1.0 - f64::from(level) / 100.0)
 }
 
+/// [`macos_available`] with `own` bytes of a `total`-byte machine counted as
+/// available too (this process's footprint): `1 - min(100, level + own /
+/// total * 100) / 100`; `None` past 100 or with no total.
+#[must_use]
+pub fn macos_available_beside(level: u32, own: u64, total: u64) -> Option<f64> {
+    if level > 100 || total == 0 {
+        return None;
+    }
+    let available = f64::from(level) + own as f64 / total as f64 * 100.0;
+    Some(1.0 - available.min(100.0) / 100.0)
+}
+
+#[cfg(test)]
+mod beside_tests {
+    use super::macos_available_beside;
+
+    /// The process's own footprint counts as available: 29% available
+    /// with a 14 GiB process on a 32 GiB machine reads as 72.75% available,
+    /// a pressure of 0.2725 where the whole-system reading was 0.71.
+    #[test]
+    fn the_process_s_own_footprint_reads_as_available() {
+        let gib = 1u64 << 30;
+        let p = macos_available_beside(29, 14 * gib, 32 * gib).expect("a reading");
+        assert!((p - 0.2725).abs() < 1e-9, "{p}");
+        assert_eq!(macos_available_beside(29, 0, 32 * gib), Some(0.71));
+        assert_eq!(macos_available_beside(90, 32 * gib, 32 * gib), Some(0.0), "capped at 100%");
+        assert_eq!(macos_available_beside(101, 0, 32 * gib), None);
+        assert_eq!(macos_available_beside(50, 0, 0), None);
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 mod macos {
@@ -289,6 +367,42 @@ mod macos {
         }
         Ok(value)
     }
+
+    /// The machine's physical memory (`hw.memsize`).
+    pub(super) fn physical_memory() -> Result<u64, String> {
+        let mut value: u64 = 0;
+        let mut size = std::mem::size_of::<u64>();
+        // SAFETY: as `sysctl_u32`, for the u64 `hw.memsize`.
+        let status = unsafe {
+            libc::sysctlbyname(
+                c"hw.memsize".as_ptr(),
+                (&raw mut value).cast(),
+                &raw mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if status != 0 || size != std::mem::size_of::<u64>() {
+            return Err(format!("hw.memsize: {}", std::io::Error::last_os_error()));
+        }
+        Ok(value)
+    }
+
+    /// This process's physical footprint (`proc_pid_rusage`,
+    /// `ri_phys_footprint`): what the kernel charges it, its GPU memory
+    /// included on unified memory.
+    pub(super) fn footprint() -> Result<u64, String> {
+        // SAFETY: `info` is the `rusage_info_v2` the RUSAGE_INFO_V2 flavor
+        // writes, owned here for the call.
+        let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+        let status = unsafe {
+            libc::proc_pid_rusage(libc::getpid(), libc::RUSAGE_INFO_V2, (&raw mut info).cast())
+        };
+        if status != 0 {
+            return Err(format!("proc_pid_rusage: {}", std::io::Error::last_os_error()));
+        }
+        Ok(info.ri_phys_footprint)
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -297,6 +411,14 @@ mod macos {
 
     pub(super) fn sysctl_u32(name: &str) -> Result<u32, String> {
         Err(format!("{name} is macOS's"))
+    }
+
+    pub(super) fn physical_memory() -> Result<u64, String> {
+        Err("hw.memsize is macOS's".to_string())
+    }
+
+    pub(super) fn footprint() -> Result<u64, String> {
+        Err("a process footprint is read on macOS only".to_string())
     }
 }
 
