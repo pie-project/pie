@@ -93,6 +93,7 @@ mod gather;
 mod gpu;
 #[path = "../../../engine-gpu/suite/linear/mod.rs"]
 mod linear;
+mod rates_bound;
 mod replay;
 mod split_cost;
 #[path = "../../../engine-gpu/suite/model_logits.rs"]

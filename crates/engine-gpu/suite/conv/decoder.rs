@@ -422,6 +422,7 @@ fn a_conv_decoder_fires_over_a_voxel_input() {
         },
         handed: None,
         check: None,
+        places_programs: false,
     })
     .expect("the decoder loads");
     let built = shell.compiled();

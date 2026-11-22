@@ -17,6 +17,8 @@ mod roles;
 mod scores;
 mod shared;
 mod slots;
+mod settle_bound;
 mod submit_bound;
+mod unplaced;
 mod rs_layout;
 mod buffered_fold;

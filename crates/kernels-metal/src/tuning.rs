@@ -127,6 +127,65 @@ impl Qmm {
     }
 }
 
+/// The kernel a bf16 dense matmul (`act x W^T`, bf16 columns) of two or
+/// more rows runs: the first rung whose shape it fits. One row always takes
+/// the vector kernels. Where the tensor-op tile wins over the simdgroup
+/// kernels depends on the chip, the rows and the weight's shape (on an M5
+/// Pro, Qwen3-0.6B's 8-row decode matmuls take 6.9 ms on the tile where the
+/// 8-row simdgroup kernels take 5.6), so `pie tune metal` measures it; the
+/// default is the route before it was measured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(
+    id = "kernel.dense",
+    shape(rows; n, k),
+    tune = search,
+    default = r#"[{ when = "rows >= 8", use = "mpp" }, { use = "rows" }, { use = "tile" }]"#,
+    fits = Dense::fits_shape
+)]
+pub enum Dense {
+    /// The Metal 4 tensor-op tile, on a GPU with tensor ops: from 8 rows,
+    /// the contraction whole 64-wide steps and the columns whole 64-wide
+    /// tiles.
+    #[partial]
+    Mpp,
+    /// The few-row vector forms, each weight row read once for every row:
+    /// up to 8 rows.
+    #[partial]
+    Rows,
+    /// The simdgroup-matrix row tiles: an 8-row tile below 32 rows, a
+    /// 32-row tile from there.
+    Tile,
+}
+
+impl Dense {
+    /// The most rows the few-row vector forms take.
+    pub const ROWS_MAX: u32 = 8;
+    /// The fewest rows the tensor-op tile lands: its smallest row tile.
+    pub const MPP_MIN_ROWS: u32 = 8;
+    /// The contraction the tensor-op tile walks per multiply, and its
+    /// narrowest column tile.
+    pub const MPP_STEP: u32 = 64;
+
+    fn fits_shape(&self, at: &DenseAt) -> bool {
+        match self {
+            Dense::Mpp => {
+                at.rows >= i64::from(Dense::MPP_MIN_ROWS)
+                    && at.n % i64::from(Dense::MPP_STEP) == 0
+                    && at.k % i64::from(Dense::MPP_STEP) == 0
+            }
+            Dense::Rows => at.rows >= 2 && at.rows <= i64::from(Dense::ROWS_MAX),
+            Dense::Tile => true,
+        }
+    }
+
+    /// Whether this kernel runs on a GPU of `family`: the tensor-op tile
+    /// needs the tensor ops ([`apple10`]).
+    #[must_use]
+    pub fn runs_on(&self, family: u32) -> bool {
+        !matches!(self, Dense::Mpp) || apple10(family)
+    }
+}
+
 /// Whether 4-bit, 64-group weights take the fp16 GEMM format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.qmm_fp16", flag, default = true, tune = search)]
@@ -314,6 +373,7 @@ pub enum GdnScan {
 pub fn register(registry: &mut Registry) {
     registry
         .add::<Qmm>()
+        .add::<Dense>()
         .add::<QmmFp16>()
         .add::<QmmSplitK>()
         .add::<QmmPrecastMinBm>()
@@ -389,6 +449,38 @@ impl Tuning {
                 "emulated"
             },
         }
+    }
+
+    /// The kernel a bf16 dense matmul of `rows` rows (two or more) into `n`
+    /// columns over `k` runs: the first rung of `kernel.dense` that fits
+    /// and that this GPU runs, else the simdgroup tiles.
+    #[must_use]
+    pub fn dense(&self, rows: u32, n: u32, k: u32) -> Dense {
+        let at = DenseAt {
+            rows: i64::from(rows),
+            n: i64::from(n),
+            k: i64::from(k),
+        };
+        self.profile
+            .ladder::<Dense>()
+            .candidates(&at)
+            .find(|d| d.runs_on(self.family))
+            .copied()
+            .unwrap_or(Dense::Tile)
+    }
+
+    /// The row counts at which `kernel.dense`'s pick may change, past one:
+    /// what a load's walk visits beside its rungs so it builds every
+    /// matmul kernel a fire's rows can be routed to.
+    #[must_use]
+    pub fn dense_row_starts(&self) -> Vec<u32> {
+        self.profile
+            .ladder::<Dense>()
+            .starts(0)
+            .into_iter()
+            .filter_map(|r| u32::try_from(r).ok())
+            .filter(|&r| r > 1)
+            .collect()
     }
 
     /// The GPU's cores, where the device says.

@@ -37,6 +37,13 @@ pub struct Diagnostics {
     /// ahead of every fire after them, not the swap stream beside those
     /// fires: to weigh the overlap.
     pub tier_inline: bool,
+    /// Fills device memory no kernel has written yet with 0xFF bytes (a NaN
+    /// in f32, bf16 and f16): every pool segment as it is backed (kv pages,
+    /// state records; the null chunk and a fresh state's records are still
+    /// zeroed after, as their readers are owed) and the activation span. A
+    /// kernel that reads a cell nothing wrote, under a zero weight or a
+    /// mask, then answers NaN where it read.
+    pub unwritten_nan: bool,
 }
 
 /// The sync guard's answer to a fire that waited for the device.
@@ -71,6 +78,7 @@ impl Default for Diagnostics {
             untabled_experts: false,
             one_window: false,
             tier_inline: false,
+            unwritten_nan: false,
         }
     }
 }
@@ -134,6 +142,9 @@ impl Diagnostics {
         if self.tier_inline {
             words.push("tier-inline".to_string());
         }
+        if self.unwritten_nan {
+            words.push("unwritten-nan".to_string());
+        }
         (!words.is_empty()).then(|| words.join(","))
     }
 }
@@ -153,7 +164,7 @@ const WORDS: &str = "`golden-probe`, `arm-trace`, \
      `plan-trace=<rows|all>`, `arm-bench=<key>`, `capture-serial`, `boundary-trace`, `reap-trace`, \
      `trace-census`, `nan-check`, `fuse-chains=off`, \
      `sync-guard[=panic]`, `chunk-bytes=<bytes>`, \
-     `dense-experts`, `untabled-experts`, `one-window`, `tier-inline`";
+     `dense-experts`, `untabled-experts`, `one-window`, `tier-inline`, `unwritten-nan`";
 
 impl std::str::FromStr for Diagnostics {
     type Err = String;
@@ -181,6 +192,7 @@ impl std::str::FromStr for Diagnostics {
                 "untabled-experts" => diag.untabled_experts = switch(word, value)?,
                 "one-window" => diag.one_window = switch(word, value)?,
                 "tier-inline" => diag.tier_inline = switch(word, value)?,
+                "unwritten-nan" => diag.unwritten_nan = switch(word, value)?,
                 "fuse-chains" => diag.fuse_chains = switch(word, value)?,
                 "sync-guard" => {
                     diag.sync_guard = match value {

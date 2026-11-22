@@ -131,6 +131,10 @@ impl engine_gpu::backend::Frame<Api> for Frame {
         Frame::dispatches(self)
     }
 
+    fn uniform_room(&self) -> Option<(u64, u64)> {
+        Some(Frame::uniform_room(self))
+    }
+
     fn flush(&self) -> Result<()> {
         Frame::flush(self)
     }

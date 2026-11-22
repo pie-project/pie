@@ -1,7 +1,6 @@
 use crate::rt::Instant;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use ::engine::ChannelRegistration;
 
@@ -671,12 +670,6 @@ impl Lane {
         turn: &mut LaneTurn,
     ) -> std::result::Result<LaneRequest, ()> {
         use crate::rt::channel::TryRecvError;
-        #[cfg(target_arch = "wasm32")]
-        const ENGINE_LANE_HOT_US: u64 = 0;
-        #[cfg(not(target_arch = "wasm32"))]
-        const ENGINE_LANE_HOT_US: u64 = 1_000_000;
-        let hot_window = Duration::from_micros(ENGINE_LANE_HOT_US);
-        let mut spin_until = Instant::now() + hot_window;
         loop {
             if turn.control_due() {
                 match control_rx.try_recv() {
@@ -710,15 +703,12 @@ impl Lane {
                 }
                 Err(TryRecvError::Empty) => {}
             }
-            if Instant::now() < spin_until {
-                std::hint::spin_loop();
-                continue;
-            }
+            // Both queues are empty: the lane sleeps until either has a
+            // request (or hangs up), then takes it in the turn's order above.
             let mut select = crate::rt::channel::Select::new();
             select.recv(launch_rx);
             select.recv(control_rx);
             select.ready();
-            spin_until = Instant::now() + hot_window;
         }
     }
 

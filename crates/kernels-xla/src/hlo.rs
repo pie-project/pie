@@ -296,6 +296,19 @@ pub struct Func {
     /// text with the names they mint made canonical (`Func::shared`): an op
     /// emitted again with the same operands is the value it already is.
     shared: std::collections::HashMap<String, Vec<Val>>,
+    /// The in-place chains ([`Func::fence`]): each value descended from a
+    /// parameter by in-place writes and views, by the version it is of (the
+    /// parameter or the write that made it).
+    chain_of: std::collections::HashMap<u32, u32>,
+    /// Each version's top-level reads since it was made: the values of ops
+    /// that read it.
+    chain_reads: std::collections::HashMap<u32, Vec<Val>>,
+    /// The `(operand, result)` pairs the next `op_named` writes in place
+    /// (`custom_call_aliased`).
+    pending_writes: Vec<(usize, usize)>,
+    /// The versions ops inside a region read: reads of the top-level op the
+    /// region is in, credited when it is done.
+    region_reads: Vec<u32>,
 }
 
 /// `text` (an op the body emitted, `first` its own id) with every name it
@@ -463,6 +476,10 @@ impl Func {
             xla_reads: false,
             dot_barrier_rows: 0,
             shared: std::collections::HashMap::new(),
+            chain_of: std::collections::HashMap::new(),
+            chain_reads: std::collections::HashMap::new(),
+            pending_writes: Vec::new(),
+            region_reads: Vec::new(),
         }
     }
 
@@ -570,7 +587,112 @@ impl Func {
         let name = format!("%arg{}", self.params.len());
         let v = self.fresh(name, ty);
         self.params.push((v, alias));
+        self.chain_of.insert(v.0, v.0);
+        self.chain_reads.insert(v.0, Vec::new());
         v
+    }
+
+    /// Before an op writes `operands[w]` in place (each `(w, _)` of
+    /// `writes`), at the top level: when that operand is a version of a
+    /// parameter some op has read, an `optimization_barrier` over it and
+    /// every such read, and the write takes the operand from the barrier. A
+    /// write of a buffer is then after every read of it the program made
+    /// before, in any schedule: XLA updates it in place rather than keeping
+    /// the version read later as a copy (v6e Qwen3.5-0.8B, 64 lanes of 1024
+    /// rows: a schedule reading the pool after a kernel wrote it kept a
+    /// second 22 GiB pool, 46.4 GB of temporaries for 31.2).
+    fn fence(&mut self, operands: &mut [Val], writes: &[(usize, usize)]) {
+        if self.depth != 1 {
+            return;
+        }
+        for &(w, _) in writes {
+            let Some(&x) = operands.get(w) else { continue };
+            let Some(&k) = self.chain_of.get(&x.0) else {
+                continue;
+            };
+            let reads = self
+                .chain_reads
+                .get_mut(&k)
+                .map(std::mem::take)
+                .unwrap_or_default();
+            if reads.is_empty() {
+                continue;
+            }
+            let mut ins = vec![x];
+            ins.extend(reads);
+            let id = self.next;
+            self.next += 1;
+            let tys: Vec<Ty> = ins.iter().map(|&v| self.ty(v).clone()).collect();
+            let text = format!(
+                "%{id}:{} = \"stablehlo.optimization_barrier\"({}) : ({}) -> ({})",
+                ins.len(),
+                self.names_of(&ins),
+                self.tys_of(&ins),
+                list(&tys)
+            );
+            self.line(&text);
+            let mut first = None;
+            for (i, ty) in tys.into_iter().enumerate() {
+                let v = self.fresh(format!("%{id}#{i}"), ty);
+                first.get_or_insert(v);
+            }
+            let fenced = first.expect("a barrier's first value");
+            self.chain_of.insert(fenced.0, k);
+            for o in operands.iter_mut() {
+                if *o == x {
+                    *o = fenced;
+                }
+            }
+        }
+    }
+
+    /// After a top-level op over `operands` made `results`: a write's
+    /// result starts a version of its own, a view of a version is that
+    /// version, and any other op over a version is a read of it.
+    fn chain_note(
+        &mut self,
+        op: &str,
+        operands: &[Val],
+        writes: &[(usize, usize)],
+        results: &[Val],
+    ) {
+        if self.depth != 1 {
+            for x in operands {
+                if let Some(&k) = self.chain_of.get(&x.0) {
+                    self.region_reads.push(k);
+                }
+            }
+            return;
+        }
+        for k in std::mem::take(&mut self.region_reads) {
+            if let Some(reads) = self.chain_reads.get_mut(&k) {
+                reads.extend_from_slice(results);
+            }
+        }
+        let mut written = Vec::new();
+        for &(w, r) in writes {
+            if let (Some(x), Some(&v)) = (operands.get(w), results.get(r))
+                && self.chain_of.contains_key(&x.0)
+            {
+                self.chain_of.insert(v.0, v.0);
+                self.chain_reads.insert(v.0, Vec::new());
+                written.push(w);
+            }
+        }
+        let view = matches!(op, "stablehlo.reshape" | "stablehlo.bitcast_convert");
+        for (i, x) in operands.iter().enumerate() {
+            if written.contains(&i) {
+                continue;
+            }
+            let Some(&k) = self.chain_of.get(&x.0) else {
+                continue;
+            };
+            if view && let [v] = results {
+                self.chain_of.insert(v.0, k);
+            } else if let Some(reads) = self.chain_reads.get_mut(&k) {
+                reads.extend_from_slice(results);
+            }
+        }
     }
 
     /// Lays parameter `v` out row-major, and the result it is donated to:
@@ -618,7 +740,19 @@ impl Func {
 
     /// Emits `op` with generic syntax; one result.
     fn op(&mut self, op: &str, operands: &[Val], attrs: &str, out: Ty) -> Val {
-        let operands = &self.solid(operands, op);
+        let mut operands = self.solid(operands, op);
+        let writes: &[(usize, usize)] = if op == "dynamic_update_slice" {
+            &[(0, 0)]
+        } else {
+            &[]
+        };
+        self.fence(&mut operands, writes);
+        let v = self.op_solid(op, &operands, attrs, out);
+        self.chain_note(&format!("stablehlo.{op}"), &operands, writes, &[v]);
+        v
+    }
+
+    fn op_solid(&mut self, op: &str, operands: &[Val], attrs: &str, out: Ty) -> Val {
         let attrs = if attrs.is_empty() {
             String::new()
         } else {
@@ -656,7 +790,21 @@ impl Func {
         attrs: &str,
         outs: Vec<Ty>,
     ) -> Vec<Val> {
-        let operands = &self.solid(operands, name);
+        let writes = std::mem::take(&mut self.pending_writes);
+        let mut operands = self.solid(operands, name);
+        self.fence(&mut operands, &writes);
+        let vs = self.op_named_solid(name, &operands, attrs, outs);
+        self.chain_note(name, &operands, &writes, &vs);
+        vs
+    }
+
+    fn op_named_solid(
+        &mut self,
+        name: &str,
+        operands: &[Val],
+        attrs: &str,
+        outs: Vec<Ty>,
+    ) -> Vec<Val> {
         let id = self.next;
         self.next += 1;
         let attrs = if attrs.is_empty() {
@@ -778,6 +926,10 @@ impl Func {
                 .collect();
             attrs.push_str(&format!(", output_operand_aliases = [{}]", list.join(", ")));
         }
+        self.pending_writes = aliases
+            .iter()
+            .map(|&(out, operand)| (operand, out))
+            .collect();
         self.op_named("stablehlo.custom_call", operands, &attrs, outs)
     }
 
@@ -790,7 +942,13 @@ impl Func {
                 .unwrap_or_else(|| Ty::scalar(Elem::F32));
             return vec![self.op(op, operands, attrs, out)];
         }
-        let operands = &self.solid(operands, op);
+        let operands = self.solid(operands, op);
+        let vs = self.op_n_solid(op, &operands, attrs, outs);
+        self.chain_note(&format!("stablehlo.{op}"), &operands, &[], &vs);
+        vs
+    }
+
+    fn op_n_solid(&mut self, op: &str, operands: &[Val], attrs: &str, outs: Vec<Ty>) -> Vec<Val> {
         let id = self.next;
         self.next += 1;
         let attrs = if attrs.is_empty() {
@@ -832,7 +990,23 @@ impl Func {
         attrs: &str,
         outs: Vec<Ty>,
     ) -> Built<Vec<Val>> {
-        let operands = &self.solid(operands, op);
+        let mut operands = self.solid(operands, op);
+        let writes: &[(usize, usize)] = if op == "scatter" { &[(0, 0)] } else { &[] };
+        self.fence(&mut operands, writes);
+        let vs = self.op_region_solid(op, &operands, block, region, attrs, outs)?;
+        self.chain_note(&format!("stablehlo.{op}"), &operands, writes, &vs);
+        Ok(vs)
+    }
+
+    fn op_region_solid(
+        &mut self,
+        op: &str,
+        operands: &[Val],
+        block: &[Ty],
+        region: impl FnOnce(&mut Self, &[Val]) -> Built<Vec<Val>>,
+        attrs: &str,
+        outs: Vec<Ty>,
+    ) -> Built<Vec<Val>> {
         let id = self.next;
         self.next += 1;
         let top = self.depth == 1;
@@ -2075,6 +2249,24 @@ impl Func {
         cond: Box<dyn FnOnce(&mut Self, &[Val]) -> Built<Val> + '_>,
         body: Box<dyn FnOnce(&mut Self, &[Val]) -> Built<Vec<Val>> + '_>,
     ) -> Built<Vec<Val>> {
+        // a carried version is written: the loop yields its next one
+        let writes: Vec<(usize, usize)> = (0..inits.len())
+            .filter(|&i| self.chain_of.contains_key(&inits[i].0))
+            .map(|i| (i, i))
+            .collect();
+        let mut inits = inits.to_vec();
+        self.fence(&mut inits, &writes);
+        let vs = self.emit_while_solid(&inits, cond, body)?;
+        self.chain_note("stablehlo.while", &inits, &writes, &vs);
+        Ok(vs)
+    }
+
+    fn emit_while_solid(
+        &mut self,
+        inits: &[Val],
+        cond: Box<dyn FnOnce(&mut Self, &[Val]) -> Built<Val> + '_>,
+        body: Box<dyn FnOnce(&mut Self, &[Val]) -> Built<Vec<Val>> + '_>,
+    ) -> Built<Vec<Val>> {
         let tys: Vec<Ty> = inits.iter().map(|&v| self.ty(v).clone()).collect();
         let id = self.next;
         self.next += 1;
@@ -2191,6 +2383,7 @@ impl Func {
                 self.fresh(name, ty.clone())
             })
             .collect();
+        self.chain_note("stablehlo.case", &[index], &[], &out);
         self.review(&out, &kinds)
     }
 

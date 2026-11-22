@@ -68,6 +68,10 @@ impl Host for Api {
         MemoryDomain::VulkanDevice(boot.device_index)
     }
 
+    fn measured_on(device: &crate::device::Context) -> String {
+        device.measured_on()
+    }
+
     fn ports() -> PortMask {
         PortMask::DECODE_ENVELOPE
             .with(eta_ir::registry::Port::Fold)

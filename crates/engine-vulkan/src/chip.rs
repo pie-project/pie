@@ -77,6 +77,24 @@ pub fn resolve(device: &Device, profiles: Option<&Path>) -> (Profile, Report) {
     SHELF.resolve(registry(), &device.name, &device.facts(), profiles)
 }
 
+/// [`resolve`] for a load on the device `on` names (its vendor, device id
+/// and driver): the measurements the user's file stores kept where their
+/// keys match this build on this device, the rest dropped to be measured
+/// again ([`profile::fire::Rates::sift`]), each said in the load log.
+#[must_use]
+pub fn resolve_stored(device: &Device, on: &str, profiles: Option<&Path>) -> (Profile, Report) {
+    let keys = engine_gpu::stored::Keys::new(
+        on.to_string(),
+        <crate::device::Api as engine_gpu::serve::Serve>::TARGET,
+    );
+    let (profile, report) =
+        SHELF.resolve_keyed(registry(), &device.name, &device.facts(), profiles, &keys);
+    for line in &report.stored {
+        tracing::info!("{line}");
+    }
+    (profile, report)
+}
+
 #[must_use]
 pub fn probe() -> Option<(String, Facts)> {
     let context =

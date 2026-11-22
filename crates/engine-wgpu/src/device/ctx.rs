@@ -842,6 +842,19 @@ impl Context {
         self.core.enabled
     }
 
+    /// The device as a measurement stored in the user's profile is keyed
+    /// by (`engine_gpu::stored`): the adapter's backend, its vendor and
+    /// device ids and its driver as the adapter states them. Another driver
+    /// measures again.
+    #[must_use]
+    pub fn measured_on(&self) -> String {
+        let info = &self.core.info;
+        format!(
+            "wgpu {:?} {:04x}:{:04x} driver {} {}",
+            info.backend, info.vendor, info.device, info.driver, info.driver_info
+        )
+    }
+
     #[must_use]
     pub fn chip(&self) -> crate::chip::Device {
         crate::chip::Device {
@@ -1146,6 +1159,18 @@ impl Frame {
             why: "this frame was already submitted".to_string(),
         })?;
         Ok(f(encoder))
+    }
+
+    /// The bytes this frame's dispatches have taken of its uniform region,
+    /// and the region's bytes.
+    pub(crate) fn uniform_room(&self) -> (u64, u64) {
+        // Taken to the next slot's alignment: each slot starts aligned, so
+        // a frame's last slot holds its padding too (one fire's 16 bytes
+        // take a whole aligned slot of the region).
+        let align = u64::from(self.inner.core.limits.min_uniform_buffer_offset_alignment).max(16);
+        let ring = self.inner.uniforms.lock().expect("uniforms lock poisoned");
+        let used = if ring.region.is_some() { ring.used } else { 0 };
+        (used.next_multiple_of(align), UNIFORM_CHUNK)
     }
 
     /// `bytes` of this frame's region of the uniform buffer: the buffer and
@@ -1589,12 +1614,10 @@ impl Frame {
         let deliver = mapped.clone();
         slice.map_async(wgpu::MapMode::Read, move |r| deliver.notify(r));
         core.kick();
-        mapped
-            .park("span readback")?
-            .map_err(|e| Fault::Device {
-                call: "span readback",
-                why: e.to_string(),
-            })?;
+        mapped.park("span readback")?.map_err(|e| Fault::Device {
+            call: "span readback",
+            why: e.to_string(),
+        })?;
         let ticks = {
             let view = slice.get_mapped_range().map_err(|e| Fault::Device {
                 call: "span readback",

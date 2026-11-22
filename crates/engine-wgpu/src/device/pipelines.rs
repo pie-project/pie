@@ -425,7 +425,11 @@ fn bind_layout(
             .map(|at| {
                 (
                     at,
-                    declared.read_only.get(at as usize).copied().unwrap_or(false),
+                    declared
+                        .read_only
+                        .get(at as usize)
+                        .copied()
+                        .unwrap_or(false),
                 )
             })
             .collect(),

@@ -115,6 +115,11 @@ impl Context {
     }
 
     #[must_use]
+    pub fn measured_on(&self) -> String {
+        match self.never {}
+    }
+
+    #[must_use]
     pub fn chip(&self) -> crate::chip::Device {
         match self.never {}
     }
@@ -191,6 +196,10 @@ impl Frame {
 
     #[must_use]
     pub fn dispatches(&self) -> u64 {
+        match self.never {}
+    }
+
+    pub(crate) fn uniform_room(&self) -> (u64, u64) {
         match self.never {}
     }
 

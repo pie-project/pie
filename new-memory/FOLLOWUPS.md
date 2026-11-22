@@ -986,6 +986,16 @@ Remove it once each case it still catches has its own mechanism:
 - (c) a completion that never arrives (a lane in flight for twice the timeout is terminated
   through the same path today).
 
+Resolved on sc/mac-no-silence: the timeout, its clock, `owes_forever`, `FramePlan::Terminate`
+and `runtime.silence_timeout` are gone (an old config naming the key is refused as an unknown
+field). A blocking lane whose guest computes, (a) and (b) alike, is held while a frame is in
+flight, or until every other member has submitted since the last retire; past that, with the
+device idle, the frame seals past it and its next submit rejoins: never held for good, never
+terminated. (c) is a named wait ("its fire in flight" / "its bind"); a completion lost is the
+engine's or the store's to refuse by name where it is lost. The stall dump names each lane's
+wait. Metal Qwen3-0.6B, M1, ABBA vs 0b2bd5386: c1 180.1 → 182.9, c8 668.0 → 669.4, c64
+1745.4 → 1744.0, c8 at frame_size 1 683.9 → 683.3 tok/s.
+
 ## F46. Something writes into the guest lane arenas' split lines while a meeting runs, under overlap (ROCm, found 2026-11-20)
 
 While building self-resetting meet counters (each split row's meeting leaving its word's count
@@ -1031,7 +1041,7 @@ repro. What closes it:
 - `blocks_that_meet_run_on_a_few_units` runs the epilogue's cases (split rows) and the lane
   sampler's in a process `HSA_CU_MASK` keeps to four units; both hung there before.
 
-## F47. `resident_workgroups` is not reproducible across boots: its consumers must tolerate +-40%
+## F51. `resident_workgroups` is not reproducible across boots: its consumers must tolerate +-40%
 
 The load's rates step measures the workgroups a device holds at once (`[rates]
 resident_workgroups`, `engine_gpu::rates::resident_workgroups`): one workgroup of the matmul's
@@ -1056,3 +1066,69 @@ went from 1.11-1.20x a greedy-4 step to 1.08-1.15x. A `top_k` over `[rows, vocab
 top-k sampler, a per-beam pre-cut) takes the full merge sort per row (~43 us a merge round,
 ~780 us a step at Qwen3's vocab). If a guest program uses one on the hot path, carry the
 select per row: its state (`SELECT_WORDS`) is one row's today.
+
+## F49. XLA's in-place write fence costs hybrid decode 2.6–4.3% (v6e, found 2026-11-21)
+
+`kernels_xla::hlo::Func::fence` puts an `optimization_barrier` over a parameter's buffer and
+every read of the version an in-place write overwrites, so XLA cannot schedule a read after the
+write and keep the old version as a copy (a second 22 GiB pool left 15 Qwen3.5-0.8B hybrid warm
+shapes out of HBM). It costs hybrid decode: v6e Qwen3.5-0.8B c1 251 → 244 tok/s (−2.6%), c4
+756 → 723 (−4.3%), the decode fire's device time +4.6%; dense Qwen3-0.6B is flat. A decode fire
+has ~6 barriers holding ~16 small pool reads (i32 scalars and small tiles), all on the pool:
+not bytes, but those reads taken out of the consumers they were fused into and run before the
+write. Measured alternatives that did not help: fencing only the reads the write is not computed
+from (c1 244.4, c4 723), and passing the barrier through the write's update instead of the pool
+(c1 243, c4 723). To revisit with an ordering that keeps the reads fused: the pre-write values
+read inside the fused op that writes, or a fence on only the overwritten version's last read.
+
+## F50. XLA's pooled expert matmul runs 1.5–3% slower in a MoE decode fire than held banks, though at parity alone (v6e, found 2026-11-22)
+
+With streamed expert banks the grouped matmul reads each expert from the pool (`Gmm::pooled`, a
+table of expert rows and the pool in the bank's place). Alone (`time_a_pooled_select`, the MoE
+mini's shapes: 16 experts, n 768 k 2048 and n 2048 k 768, 512 and 2048 routed rows) it is at
+parity with the dense bank (e.g. 95.2 vs 94.5 us). In the served decode fire it is not:
+qwen3-30b-a3b-mini decode, held vs streamed, c64 42.9k vs 41.7k tok/s (−2.8%), c256 107.5k vs
+106.0k (−1.6%); vs main (which holds them) c64 −1.3%, c256 −3.1%. xprof at c256: held calls run
+gate ~29, up ~59, down ~28 us; pooled calls a uniform ~45 us (+75 us a step). Suspected: the
+expert DMA's overlap with neighbouring ops in the fire (the held up call's 59 us looks like a
+wait on its weight copy that the pooled form spreads), or reads off the 4.5M-row pool. Next: a
+profile of the pooled call's DMA waits in the fire, and the same fire's schedule held vs pooled.
+
+## F52. The declared-context cut's "one sequence at most half the room" is a tuned constant
+
+`store::declared_context_within` (engine-cuda) serves a declared context at
+the longest one sequence of which takes no more than half the live room past
+the weights, "the activations and a second sequence having the other half".
+The half was moved from the old pre-stage cut, not set by any ruling. Derive
+it (the lanes the load promises must seat at the cut context, beside one
+rung's activation span) or drop it in favour of the capacity gate's finisher
+guarantee; the fit's own shortening (`Pools::declare_context`) already
+derives what one working set needs.
+
+## F53. An unplaced served load hangs the GPU (slang backends, 2026-11-21)
+A direct fire on a served load before the engine places its programs (`Programs::load`)
+hangs the device instead of being refused: found when the dense settle fired from inside
+`Shell::load` (rows 1, its first fire never landed; the same fire placed after
+`Programs::load` lands in 6 ms). Suite and check loads place no programs and fire fine, so
+it is something a served load expects `Programs::load` to have set up (its readout / shelf
+placement, a table it writes, or a submit it makes), not yet pinned. Today a served load is
+guarded by phase (`Boot::places_programs`, refused by name until `Shell::programs_placed`).
+Find the resource and guard on it instead.
+
+## F54. Every consumer of a device's scalar rates handles an unmeasured one (slang backends, 2026-11-21)
+A device rate read below its own launches (a physically impossible frame) is repeated
+(`engine_gpu::rates::repeated`, REPEATS times); a curve point every repeat of which reads so is
+left unmeasured and the load goes on, but a single rate (the copy and launch, the per-row ops, the
+scan) every repeat of which reads so still refuses the load by name. A load measures a rate only
+where its profile lacks it, so no saved value stands behind it then. Make every consumer of those
+rates (the estimate's roofline, the top rung, the submit bound's step estimate, the dense choice's
+launch) handle an unmeasured rate, stated at load, so a load never refuses on timing.
+
+## F55. The dense settle skips a model whose classes read a guest input (slang backends, 2026-11-22)
+A settle fire seats plain lanes; on a model whose served classes read a guest input channel,
+`serve::feed_inputs` refuses them ("feeds no channel for it"), and the settle now stops there,
+said, the curves' kernels serving every range it did not reach. Such a model gets no settle at
+all, so a wrong or stale curve can still serve a kernel several times slower on it: the case the
+settle exists for. Fix: stage a feed for those channels in the settle's fires (zeros of the
+declared shape; the settle only times), or settle through a class that reads none, instead of
+stopping.

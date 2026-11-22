@@ -54,6 +54,31 @@ impl Shelf {
         facts: &Facts,
         profiles: Option<&Path>,
     ) -> (Profile, Report) {
+        self.resolve_with(registry, device, facts, profiles, None)
+    }
+
+    /// [`Shelf::resolve`], the user's file's measurements sifted by their
+    /// keys against `now` ([`Registry::resolve_keyed`]).
+    #[must_use]
+    pub fn resolve_keyed(
+        &self,
+        registry: &Registry,
+        device: &str,
+        facts: &Facts,
+        profiles: Option<&Path>,
+        now: &dyn crate::fire::Now,
+    ) -> (Profile, Report) {
+        self.resolve_with(registry, device, facts, profiles, Some(now))
+    }
+
+    fn resolve_with(
+        &self,
+        registry: &Registry,
+        device: &str,
+        facts: &Facts,
+        profiles: Option<&Path>,
+        now: Option<&dyn crate::fire::Now>,
+    ) -> (Profile, Report) {
         let mut layers = Vec::new();
         let family = self
             .families()
@@ -90,7 +115,10 @@ impl Shelf {
             }
         }
         layers.extend(self.user(device, profiles));
-        registry.resolve(&layers, facts)
+        match now {
+            Some(now) => registry.resolve_keyed(&layers, facts, now),
+            None => registry.resolve(&layers, facts),
+        }
     }
 
     /// The profile `device` would resolve to without facts to check: the

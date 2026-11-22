@@ -196,6 +196,11 @@ pub(crate) struct Core {
     /// The largest device-local heap, which device reservations take.
     heap: usize,
     pub(crate) vendor_id: u32,
+    /// The device's PCI id and its driver's version, as the physical
+    /// device states them: with the vendor, what a stored measurement is
+    /// keyed by ([`Context::measured_on`]).
+    pub(crate) device_id: u32,
+    pub(crate) driver_version: u32,
     pub(crate) discrete: bool,
     pub(crate) api_version: u32,
     pub(crate) features: Enabled,
@@ -1092,6 +1097,8 @@ impl Context {
             ceiling,
             heap,
             vendor_id: props.vendor_id,
+            device_id: props.device_id,
+            driver_version: props.driver_version,
             discrete: props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU,
             api_version: props.api_version,
             features: enabled,
@@ -1236,6 +1243,17 @@ impl Context {
     #[must_use]
     pub fn enabled(&self) -> Enabled {
         self.core.features
+    }
+
+    /// The device as a measurement stored in the user's profile is keyed
+    /// by (`engine_gpu::stored`): its vendor and device ids and its
+    /// driver's version. Another driver measures again.
+    #[must_use]
+    pub fn measured_on(&self) -> String {
+        format!(
+            "vulkan {:04x}:{:04x} driver {:#x}",
+            self.core.vendor_id, self.core.device_id, self.core.driver_version
+        )
     }
 
     #[must_use]

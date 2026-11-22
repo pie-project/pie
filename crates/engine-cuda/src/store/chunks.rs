@@ -212,6 +212,7 @@ impl Chunks {
                 have: room,
             });
         }
+        // (`unwritten-nan` fills the span as the range backs it.)
         self.range.hold(pool, from, bytes, beside)
     }
 
@@ -596,6 +597,8 @@ impl Chunks {
         if crate::sizing::active() {
             return Ok(Commit::Committed);
         }
+        // (`unwritten-nan` fills what the range backs anew: the null chunk
+        // is zeroed after it, below.)
         let outcome = self.range.commit_segments(pool, segments)?;
         if outcome == Commit::Committed && !self.null_zeroed && self.range.committed_segments() > 0
         {

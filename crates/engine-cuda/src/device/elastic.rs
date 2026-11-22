@@ -578,6 +578,19 @@ impl Arena {
                 ))
             })?;
             self.base = base as u64;
+            // `unwritten-nan`: nothing has written any of it yet.
+            if crate::serve::diag::on().unwritten_nan {
+                crate::device::fill_span(self.base, self.virtual_bytes as usize, 0xFF)?;
+                let mut head = [0u8; 4];
+                let mut tail = [0u8; 4];
+                crate::device::copy_d2h(self.base, &mut head)?;
+                crate::device::copy_d2h(self.base + self.virtual_bytes - 4, &mut tail)?;
+                eprintln!(
+                    "engine-cuda: unwritten-nan: the flat range's {} bytes filled (reads {head:02x?} \
+                     at its start, {tail:02x?} at its end)",
+                    self.virtual_bytes
+                );
+            }
             self.units.fill(Some(FLAT));
             self.mapped = self.units.len() as u64;
             self.high_water = self.high_water.max(self.committed_bytes());
@@ -1195,8 +1208,32 @@ impl Range {
         }];
         let outcome = commit_atomically(pool, &mut targets)?;
         if outcome == Commit::Committed {
+            let bottom = |segments: u32| {
+                (u64::from(segments) * self.segment_bytes)
+                    .min(self.arena.max_bytes)
+                    .min(self.limit)
+            };
+            let before = bottom(self.committed);
+            let after = bottom(segments);
             self.committed = segments;
             self.segment_high = self.segment_high.max(self.segment_bytes_committed());
+            // `unwritten-nan`: what the segments back anew holds NaN until a
+            // kernel writes it.
+            // (A flat range's one allocation is filled whole as it is made.)
+            if crate::serve::diag::on().unwritten_nan && mapped_on_demand() {
+                let [low, high] = laid(after, self.parted);
+                let [was_low, was_high] = laid(before, self.parted);
+                // Each piece grows at its end, from what it held.
+                for ((at, len), (_, was)) in [(low, was_low), (high, was_high)] {
+                    if len > was {
+                        crate::device::fill_span(
+                            self.span(at + was, len - was)?,
+                            usize::try_from(len - was).unwrap_or(0),
+                            0xFF,
+                        )?;
+                    }
+                }
+            }
         }
         Ok(outcome)
     }

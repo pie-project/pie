@@ -1496,8 +1496,13 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - MI300X speed table (AMD), main 30abc9d5 vs tip+parity (= M119), all bodies armed: Qwen3-8B / gemma-4-E4B /
   Qwen3-30B-A3B / Qwen3.5-9B decode c1..c256 and prefill 512 / 2048 at parity or better; boot faster on every model
   (8B 19.5 vs 26.4 s, gemma 18.8 vs 20.6, 30B 21.2 vs 24.8, Qwen3.5 21.3 vs 36.5). c256 ~510 tok/s stall is
-  intermittent on main too. Open: ROCm capacity -4.6% (M118's bodies stretch is held out of a flat range for good;
-  fix sc/rocm-flat-fit in test).
+  intermittent on main too. ROCm capacity: the -4.6% closed with sc/rocm-flat-fit (e6dae80b7). MI300X kv
+  device_pages vs main 236982f97, same config (16-token pages on both): Qwen3-8B 75984 vs 60496 (+25.6%),
+  Qwen3.5-9B 301415 vs 248370 (+21%), Qwen3-30B-A3B 125712 vs 66312 (+90%) on a boot holding its bodies' record.
+  A measuring boot (no record) kept the least range its bodies armed over for its life on a flat range whose
+  weights it preseats (30B first boot 37170 pages, -44% vs main): sc/amd-measuring-refit reserves the range anew
+  at the refit and seats the weights again (30B: 125676 measuring vs 125712 recorded; 2048 weight chunks reseated
+  in 5.8 s); golden_measuring_refit gates it (glm53-mini u4g64 9104 = 9104, base 91).
 - A4 step 1 (813def0b, AMD): ROCm streams affine expert banks through the weight cache (layout, ranking, bank_table,
   HIP biased / quantized selects read the table). MXFP4 (lane-ordered banks, bias_sum) and block FP8 stayed resident
   as main served them then (both stream since: the MXFP4 and block-FP8 entries below). MI300X glm53-mini u4g64: cached / told held / moved = resident bitwise; host / mixed differ

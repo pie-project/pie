@@ -369,7 +369,7 @@ pub struct Shell {
     draft_depth: u32,
     /// The programs that gather a readout plane's host-read rows apart, by
     /// the plane's rows and width, and every such plane the ladder traced.
-    gathers: std::collections::HashMap<(u32, u32), std::sync::Arc<crate::device::Program>>,
+    gathers: std::collections::HashMap<(u32, u32, u32), std::sync::Arc<crate::device::Program>>,
     gather_shapes: std::collections::BTreeSet<(u32, u32)>,
     /// The readout rings the load laid (`fixed_readouts`), by ring index.
     readout_specs: Vec<FixedReadout>,
@@ -3015,8 +3015,8 @@ impl Shell {
         let slots = self.slots(fire_rows);
         let planes = self.planes(&composition, &slots, plane_rows)?;
         // The host readers' readout rows, gathered apart after the fire.
-        let host = self.host_table(&composition, &planes, &plane_layout, lanes, real);
-        if let Some(table) = &host {
+        let host = self.host_tables(&composition, &planes, &plane_layout, lanes, real);
+        for table in &host {
             let plane = &planes[table.plane];
             self.gather_shapes.insert((plane.rows, plane.width));
         }
@@ -3396,11 +3396,12 @@ impl Shell {
                 what: format!("readout ring {ring}'s plane, which the fire did not write"),
             })?);
         }
-        let host = match host
-            .filter(|table| table.at.iter().any(Option::is_some) && full_table.is_none())
-        {
-            Some(table) => Some(self.host_rows(table, &planes, &buffers)?),
-            None => None,
+        let host = if full_table.is_none() {
+            host.into_iter()
+                .map(|table| self.host_rows(table, &planes, &buffers))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
         };
         let kept = match &full_table {
             Some((full_rows, full_layout, placed, _)) => self.kept(
@@ -3410,7 +3411,7 @@ impl Shell {
                 (full_rows, full_layout, placed),
                 &pixels,
                 real,
-                None,
+                Vec::new(),
             ),
             None => self.kept(
                 &composition,
@@ -3523,60 +3524,67 @@ impl Shell {
         Ok(planes)
     }
 
-    /// The readout rows this fire's host-reading lanes read, when its planes
-    /// hold one readout plane of one layer deeper than the short plane
-    /// (`HOST_ROWS`): every lane's start there, all `None` when the readers'
-    /// rows do not fit.
-    fn host_table(
+    /// The readout rows this fire's host-reading lanes read, per readout
+    /// plane of one layer they read back fewer rows of than it has: every
+    /// reader's start among them. The rows are padded to a power of two (one
+    /// gather program a count of each plane shape), and a plane's short
+    /// plane is laid only when that is still fewer rows than the plane's (a
+    /// prefill lane reading 1 of a 32-row plane of 151936 logits: 0.6 MB
+    /// copied out in place of 19.4 MB).
+    fn host_tables(
         &self,
         composition: &poem_exec::fire::Composition,
         planes: &[PlaneShape],
         readout_layout: &[(u32, u32)],
         lanes: &[Seated<'_>],
         real: usize,
-    ) -> Option<HostTable> {
-        let mut readout = planes.iter().enumerate().filter(|(_, plane)| {
+    ) -> Vec<HostTable> {
+        let readouts = planes.iter().enumerate().filter(|(_, plane)| {
             let decl = &self.exports[plane.export].decl;
             decl.readout && decl.layers <= 1 && plane.dtype == Dtype::F32
         });
-        let (plane, shape) = readout.next()?;
-        if readout.next().is_some() || i64::from(shape.rows) <= HOST_ROWS {
-            return None;
-        }
-        let mut table: Vec<i32> = Vec::new();
-        let mut at = vec![None; real];
-        for row in composition.lanes() {
-            let source = row.source as usize;
-            if source >= real || lanes.get(source).is_none_or(|seated| seated.quiet) {
+        let mut tables = Vec::new();
+        for (plane, shape) in readouts {
+            let mut table: Vec<i32> = Vec::new();
+            let mut at = vec![None; real];
+            for row in composition.lanes() {
+                let source = row.source as usize;
+                if source >= real || lanes.get(source).is_none_or(|seated| seated.quiet) {
+                    continue;
+                }
+                let class = row.class as usize;
+                let reads = self.readback.get(class).copied().flatten() == Some(shape.export)
+                    && self.exports[shape.export].classes.contains(class);
+                if !reads || at[source].is_some() {
+                    continue;
+                }
+                let (first, count) = readout_layout[source];
+                at[source] = Some(table.len() as u32);
+                table.extend((first..first + count).map(|r| r as i32));
+            }
+            if at.iter().all(Option::is_none) {
                 continue;
             }
-            let class = row.class as usize;
-            let reads = self.readback.get(class).copied().flatten() == Some(shape.export)
-                && self.exports[shape.export].classes.contains(class);
-            if !reads || at[source].is_some() {
+            let count = table.len().next_power_of_two();
+            if count >= shape.rows as usize {
                 continue;
             }
-            let (first, count) = readout_layout[source];
-            at[source] = Some(table.len() as u32);
-            table.extend((first..first + count).map(|r| r as i32));
+            table.resize(count, 0);
+            tables.push(HostTable { plane, table, at });
         }
-        if table.len() as i64 > HOST_ROWS {
-            table.clear();
-            at.iter_mut().for_each(|a| *a = None);
-        }
-        table.resize(HOST_ROWS as usize, 0);
-        Some(HostTable { plane, table, at })
+        tables
     }
 
-    /// The program that gathers `HOST_ROWS` rows of a `[rows, width]` f32
+    /// The program that gathers `count` rows of a `[rows, width]` f32
     /// plane: built while the warm ladder runs (`gather_shapes`), else
     /// where a fire first needs it.
     pub(crate) fn gather_program(
         &mut self,
         rows: u32,
         width: u32,
+        count: u32,
     ) -> Result<std::sync::Arc<crate::device::Program>> {
-        if let Some(program) = self.gathers.get(&(rows, width)) {
+        if let Some(program) = self.gathers.get(&(rows, width, count)) {
             return Ok(std::sync::Arc::clone(program));
         }
         use kernels_xla::hlo::{Elem, Func, Ty};
@@ -3585,7 +3593,7 @@ impl Shell {
             Ty::new(Elem::F32, &[i64::from(rows), i64::from(width)]),
             None,
         );
-        let ids = f.param(Ty::new(Elem::I32, &[HOST_ROWS]), None);
+        let ids = f.param(Ty::new(Elem::I32, &[i64::from(count)]), None);
         let picked = f.take_rows(plane, ids).map_err(|e| Fault::Program {
             at: "serve::gather_program",
             why: e.to_string(),
@@ -3598,15 +3606,20 @@ impl Shell {
             },
         )?;
         self.gathers
-            .insert((rows, width), std::sync::Arc::clone(&program));
+            .insert((rows, width, count), std::sync::Arc::clone(&program));
         Ok(program)
     }
 
-    /// Compiles the gather program of every readout plane the ladder traced.
+    /// Compiles the gather programs of every readout plane the ladder
+    /// traced: one a power of two of rows short of the plane's.
     pub(crate) fn warm_gathers(&mut self) -> Result<()> {
         let shapes: Vec<(u32, u32)> = self.gather_shapes.iter().copied().collect();
         for (rows, width) in shapes {
-            self.gather_program(rows, width)?;
+            let mut count = 1;
+            while count < rows {
+                self.gather_program(rows, width, count)?;
+                count *= 2;
+            }
         }
         Ok(())
     }
@@ -3621,11 +3634,12 @@ impl Shell {
         outs: &[std::sync::Arc<crate::pjrt::Buffer>],
     ) -> Result<(HostTable, crate::pjrt::Buffer)> {
         let shape = &planes[table.plane];
-        let program = self.gather_program(shape.rows, shape.width)?;
+        let count = u32::try_from(table.table.len()).unwrap_or(u32::MAX);
+        let program = self.gather_program(shape.rows, shape.width, count)?;
         let bytes: Vec<u8> = table.table.iter().flat_map(|v| v.to_le_bytes()).collect();
         let ids = self
             .device
-            .upload_flat(crate::pjrt::ElementType::S32, &bytes, HOST_ROWS)?;
+            .upload_flat(crate::pjrt::ElementType::S32, &bytes, i64::from(count))?;
         let plane = outs.get(table.plane).ok_or_else(|| Fault::Unbound {
             what: "the readout plane, which the program did not return".to_string(),
         })?;
@@ -3650,7 +3664,7 @@ impl Shell {
         (readout_rows, readout_layout, plane_layout): (&[i32], &[(u32, u32)], &[(u32, u32)]),
         pixels: &[Pixels],
         real: usize,
-        host: Option<(HostTable, crate::pjrt::Buffer)>,
+        host: Vec<(HostTable, crate::pjrt::Buffer)>,
     ) -> Option<std::sync::Arc<crate::readout::Kept>> {
         use crate::readout::{Plane, Seat};
         use poem_ir::InputAxis;
@@ -3732,9 +3746,10 @@ impl Shell {
                 self.pixels_name(),
                 pixels.iter().map(|(values, _)| values.clone()).collect(),
             ),
-            host: host.map(|(table, buffer)| {
-                crate::readout::HostRows::new(table.plane, buffer, table.at)
-            }),
+            host: host
+                .into_iter()
+                .map(|(table, buffer)| crate::readout::HostRows::new(table.plane, buffer, table.at))
+                .collect(),
         }))
     }
 
@@ -4419,13 +4434,9 @@ fn fixed_readouts(
 
 type ReadoutTable = (Vec<i32>, Vec<(u32, u32)>, Vec<u32>);
 
-/// The most readout rows a fire's host readers have gathered apart, into a
-/// plane of their own (past them, the whole readout plane comes back).
-const HOST_ROWS: i64 = 8;
-
 /// A fire's host readers' readout rows: the readout plane's index among its
-/// planes, the plane's rows they read (padded with row 0) and per real lane
-/// where its rows start among them.
+/// planes, the plane's rows they read (padded with row 0 to a power of two)
+/// and per real lane where its rows start among them.
 struct HostTable {
     plane: usize,
     table: Vec<i32>,

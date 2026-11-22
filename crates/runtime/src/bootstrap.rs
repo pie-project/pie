@@ -142,8 +142,10 @@ pub struct RuntimeConfig {
 
 pub struct ModelConfig {
     /// How much of the device budget this load gives back to the system's
-    /// memory pressure (`[engine.memory] yield`).
-    pub memory_yield: crate::governor::Yield,
+    /// memory pressure (`[engine.memory] yield`); `None` where the
+    /// deployment states none, resolved at load by the engines' memory
+    /// ([`crate::governor::yield_for`]).
+    pub memory_yield: Option<crate::governor::Yield>,
     pub name: String,
     pub model_id: String,
     pub kv_page_size: usize,
@@ -283,7 +285,6 @@ pub struct KeptDisk {
 
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
-    pub silence_timeout_secs: u64,
     pub frame_size: u32,
     pub frame_dispatch_depth: u32,
 }
@@ -385,6 +386,15 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         })?;
         crate::pipeline::program::serve_forms(&facts.backend, facts.library_forms);
     }
+    // An unset yield follows the engines' memory: unified memory (the pool
+    // and the host share one RAM) yields fully, separate memory holds.
+    let unified_memory = engine_configs.iter().any(|d| {
+        d.engine_backend
+            .device_facts()
+            .is_some_and(|facts| facts.unified_memory)
+    });
+    let (memory_yield, stated) = crate::governor::yield_for(memory_yield, unified_memory);
+    tracing::info!("{stated}");
 
     // Each engine's readouts, a fire bound (`Engine::readout_facts`): a
     // fixed store's rows bound the rows one fire reads out, which the
@@ -713,6 +723,27 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     // this process is on one host, so they share one ledger of its room (the
     // first reader stated reads it for all), and each pool's grant is
     // debited before the next reads: N pools are granted the room once.
+    // Where the host cover is kept between boots, keyed by every engine's
+    // fingerprint (`host_cover`): none where an engine states none.
+    let cover_cache = engine_configs
+        .iter()
+        .map(|d| d.engine_backend.cover_fingerprint())
+        .collect::<Option<Vec<String>>>()
+        .filter(|prints| !prints.is_empty())
+        .zip(
+            // The home's cache: where wasmtime's compile cache lies in it.
+            config
+                .runtime
+                .compile_cache_dir
+                .as_ref()
+                .and_then(|wasmtime| wasmtime.parent())
+                .map(Path::to_path_buf),
+        )
+        .map(|(prints, dir)| CoverCache {
+            dir,
+            engines: prints.join(";"),
+            deployment: model_id.clone(),
+        });
     let readers: Vec<Option<::engine::HostRoom>> = engine_configs
         .iter()
         .map(|d| d.engine_backend.host_room())
@@ -940,9 +971,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         });
     }
 
-    crate::scheduler::set_silence_timeout(std::time::Duration::from_secs(
-        scheduler.silence_timeout_secs,
-    ));
     let scheduler_shutdown = crate::scheduler::spawn(&engines, kv_page_size as u32).await?;
     // Each engine takes the weight residency it starts with before the load
     // returns, so before any fire is submitted: none reads from the host a
@@ -988,8 +1016,9 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         scheduler_shutdown.shutdown().await.ok();
         return Err(error);
     }
-    // The host cover, measured through the ordinary pipeline before ready.
-    match measure_host_cover(&name, warm_context).await {
+    // The host cover, measured through the ordinary pipeline before ready,
+    // or read where an earlier boot measured it under the same key.
+    match host_cover(&name, warm_context, cover_cache.as_ref()).await {
         Ok(cover) => crate::scheduler::set_host_cover(cover),
         Err(error) => {
             tracing::error!(%error, "measuring the host cover at load");
@@ -1021,7 +1050,79 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
 /// difference spanning few frames swings with the turnaround's noise, and a
 /// cover too small leaves the device idle where one too large costs only
 /// window.
-async fn measure_host_cover(model: &str, context: usize) -> Result<usize> {
+/// The host cover: read from `cache` (`<cache>/cover/<key>.json`) where an
+/// earlier boot measured it under the same key, else measured
+/// ([`measure_host_cover`]) and written there. The key names what the cover
+/// depends on: each engine's [`::engine::Engine::cover_fingerprint`] (its
+/// device, driver, kernels and guest code), the deployment, the sampler
+/// program's own hash, the frame size, the frames in flight and the warm
+/// runs' context. Not the runtime's build: a build that changes none of
+/// those reuses the cover. `cache` is `None` where an engine states no
+/// fingerprint: the cover is measured.
+async fn host_cover(model: &str, context: usize, cache: Option<&CoverCache>) -> Result<usize> {
+    let Some(cache) = cache else {
+        return measure_host_cover(model, context).await.map(|(cover, ..)| cover);
+    };
+    let reference = program::ProgramRef::parse("compat-openai")?;
+    let built = program::resolve(None, &reference).await?;
+    let key = format!(
+        "{}|{}|sampler {}|frame {}|depth {}|context {context}",
+        cache.engines,
+        cache.deployment,
+        built.hash,
+        crate::scheduler::configured_frame_size().max(1),
+        crate::scheduler::configured_dispatch_depth(),
+    );
+    let name = key
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3));
+    let path = cache.dir.join("cover").join(format!("{name:016x}.json"));
+    let read = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .filter(|held| held.get("key").and_then(serde_json::Value::as_str) == Some(key.as_str()));
+    if let Some(held) = read {
+        let field = |name: &str| held.get(name).and_then(serde_json::Value::as_f64);
+        if let (Some(cover), Some(frame_us), Some(turnaround_us)) =
+            (field("cover"), field("frame_us"), field("turnaround_us"))
+        {
+            let cover = cover as usize;
+            tracing::info!(
+                cover,
+                frame_us,
+                turnaround_us,
+                path = %path.display(),
+                "the host cover, read where an earlier boot measured it under this key"
+            );
+            return Ok(cover);
+        }
+    }
+    let (cover, frame_us, turnaround_us) = measure_host_cover(model, context).await?;
+    let held = serde_json::json!({
+        "key": key,
+        "cover": cover,
+        "frame_us": frame_us,
+        "turnaround_us": turnaround_us,
+    });
+    if let Err(why) = std::fs::create_dir_all(path.parent().unwrap_or(&cache.dir))
+        .and_then(|()| std::fs::write(&path, held.to_string()))
+    {
+        tracing::warn!(%why, path = %path.display(), "the host cover is not kept for the next boot");
+    }
+    Ok(cover)
+}
+
+/// Where the host cover is kept between boots, and what of the load its key
+/// names ([`host_cover`]).
+struct CoverCache {
+    dir: PathBuf,
+    /// Each engine's `cover_fingerprint`, in order.
+    engines: String,
+    /// The model the cover's warm runs serve.
+    deployment: String,
+}
+
+async fn measure_host_cover(model: &str, context: usize) -> Result<(usize, f64, f64)> {
     let depth = crate::scheduler::configured_dispatch_depth();
     crate::scheduler::set_dispatch_depth(1);
     let reference = program::ProgramRef::parse("compat-openai")?;
@@ -1133,7 +1234,7 @@ async fn measure_host_cover(model: &str, context: usize) -> Result<usize> {
         frames_in_flight = depth,
         "the host cover, measured at load: a guest turnaround over one frame's device time"
     );
-    Ok(cover)
+    Ok((cover, frame_us, turnaround_us))
 }
 
 /// What each built-in's name runs for the system (the operator's install of

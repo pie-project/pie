@@ -15,9 +15,9 @@ rates = "pie tune vulkan --rates on 2026-11-19 (pie 0.6.0): NVIDIA RTX PRO 4500 
 # The fitted path runs at 1.011x the per-point best, coopmat everywhere 1.164x.
 gemm.path = [{ when = "rows < 96", use = "tiled" }, "coopmat"]
 
-# Measured on the device at a load (GPU, 2026-11-19). `tile_tflops_by_rows`
-# is left to the device's own first load: it times the 32x32 and register
-# tiles the path takes below 96 rows besides the cooperative-matrix one.
+# Measured on the device at a load (GPU, 2026-11-19). The dense kernels'
+# curves (`kernel_tflops_by_shape_keyed`) are left to the device's own first load
+# of each model: they are timed at the model's own planes.
 [rates]
 launch_ns = 5755
 gemm_tflops_by_rows = [
@@ -29,9 +29,3 @@ attn_tflops_by_keys = [[512, 4.7962417011544565], [1024, 5.986275777768796], [20
 hbm_gbps = 788.6021962784303
 elementwise_gbps = 884.7809302816158
 scan_gelems = 137.28256117830568
-vector_tflops_by_rows = [
-  [1, [[1, 0.913841494634784], [2, 1.4824791022355748], [4, 2.123832647635926], [8, 2.728473984326561], [16, 3.1641132282304407], [32, 3.453256695911699], [64, 3.5878878799472713], [128, 3.691642209673122], [256, 3.491797908319892]]],
-  [4, [[1, 0.9419845596698576], [2, 1.8530681761700953], [4, 3.5196341322704146], [8, 5.258079134999608], [16, 6.612199325073282], [32, 7.590158866150637], [64, 8.225070466122794], [128, 8.543900058484883], [256, 8.714446605093578]]],
-  [8, [[1, 0.913518063760856], [2, 1.7371764644974244], [4, 3.367566439181052], [8, 6.1719232060331555], [16, 7.287609605125629], [32, 8.194500763172355], [64, 8.615574541836505], [128, 8.81592193487868], [256, 8.860142353350119]]],
-  [16, [[1, 0.8270138269292386], [2, 1.6099043780736477], [4, 2.986797694550148], [8, 4.87355584604212], [16, 6.895425217380136], [32, 8.19856776134446], [64, 8.682068705098505], [128, 8.779860535095178], [256, 8.622449850385804]]],
-]

@@ -417,6 +417,17 @@ fn adapter_of(
 }
 
 impl Engine for Metal {
+    /// The device shares the host's memory: the governor holds the pool
+    /// within what the GPU can still be given (`Context::host_room`), read
+    /// on its tick, so the host side growing beside the pool shrinks it.
+    fn host_room(&self) -> Option<engine::HostRoom> {
+        Some(std::sync::Arc::new(crate::device::Context::host_room))
+    }
+
+    fn cover_fingerprint(&self) -> Option<String> {
+        self.shell.as_ref().map(crate::serve::Shell::cover_fingerprint)
+    }
+
     fn kind(&self) -> &'static str {
         "metal"
     }

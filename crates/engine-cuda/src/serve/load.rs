@@ -86,7 +86,6 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // The product times the device's profile holds choose between the
     // kernels that can serve a decode product; arming notes the shapes it
     // lacks, measured once it has armed (`Staged::finish`).
-    #[cfg(feature = "rocm")]
     device.set_routes(std::sync::Arc::new(kernels_cuda::linear::routes::Routes::of(
         chip.rates().product_ns.as_deref().unwrap_or_default(),
     )));
@@ -297,6 +296,28 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     let room_line = room_line(boot.allowance, ceiling, total - free, weight_tier, after_weights);
     eprintln!("engine-cuda: {room_line}");
     let after_weights = held_beside(boot, after_weights)?;
+    // A declared context is the model's, not the operator's: it is served at
+    // the longest one sequence of which takes half the room this line leaves
+    // (this process's context and modules already out of it), and the fit
+    // shortens it further where the load does not seat it
+    // (`Pools::declare_context`); a card that seats none is refused by name.
+    if boot.context_declared {
+        let fits = crate::store::declared_context_within(
+            &boot.trace,
+            boot.page_size,
+            boot.context,
+            after_weights,
+        )?;
+        if fits < boot.context {
+            eprintln!(
+                "engine-cuda: the model declares a {}-token context and one sequence at it \
+                 takes more than half of the room the load has past the weights; serving \
+                 {fits} tokens. State `[engine] max_context` to choose.",
+                boot.context
+            );
+            boot.context = fits;
+        }
+    }
     let facts = kv::probe(&boot.trace)?;
     let derive_voxels = boot
         .voxels
@@ -1696,6 +1717,7 @@ impl Shell {
             arm_cold: false,
             arm_rs: crate::record::RsBody::Folds,
             arm_deferred: false,
+            preseated_as: None,
             card: (0, 0),
             held_for_fires: 0,
             live: engine::live::Live::armed(),
@@ -2053,8 +2075,6 @@ impl Staged {
             free_before,
             profiles,
         } = self;
-        #[cfg(not(feature = "rocm"))]
-        let _ = &profiles;
         if arm_trace {
             eprintln!(
                 "[arm-trace] device free {} MiB before arming",
@@ -2096,7 +2116,6 @@ impl Staged {
             let armed = shell.arm_bodies();
             shell.arming_at_load = false;
             armed?;
-            #[cfg(feature = "rocm")]
             shell.routes_measured(profiles.as_deref())?;
             if shell.measuring {
                 shell.measured_refit(device_total, free_before)?;
@@ -2263,13 +2282,16 @@ impl Shell {
     /// time under each kernel (`Shell::routes_by_body`), saved in the
     /// device's user profile, and the lattice left armed under the choices.
     /// A load whose profile holds every shape measures nothing.
-    #[cfg(feature = "rocm")]
     fn routes_measured(&mut self, profiles: Option<&std::path::Path>) -> Result<()> {
         let Some(routes) = self.device.ctx().routes().cloned() else {
             return Ok(());
         };
         let wanted = routes.wanted();
         if wanted.is_empty() {
+            eprintln!(
+                "engine-cuda: decode products' kernels from the profile: every shape the bodies \
+                 hold reused, 0 measured"
+            );
             return Ok(());
         }
         // A load that records no bodies serves every fire as an eager walk:
@@ -2285,28 +2307,46 @@ impl Shell {
         }
         let started = std::time::Instant::now();
         let measured = self.routes_by_body(routes, &wanted)?;
+        if measured.is_empty() {
+            // Every shape a decode body times is the profile's: nothing is
+            // measured or saved; the rest (rows no decode body carries) keep
+            // their stated kernel.
+            eprintln!(
+                "engine-cuda: decode products' kernels from the profile: 0 measured; {} shape(s) \
+                 at rows no decode body carries keep their stated kernel",
+                wanted.len()
+            );
+            return Ok(());
+        }
         let saved = crate::rates::save_product_times(profiles, self.device.name(), &measured)
             .map_err(Fault::Card)?;
         let chosen = self.device.ctx().routes().cloned();
         let said: Vec<String> = wanted
-            .keys()
-            .map(|s| {
+            .iter()
+            .map(|(s, noted)| {
                 let us = |kernel| {
                     measured
                         .iter()
                         .find(|(shape, k, ..)| shape == s && *k == kernel)
                         .map_or(f64::NAN, |&(.., ns, _)| ns / 1e3)
                 };
-                let pick = chosen.as_ref().map(|c| c.pick(*s, 0));
+                let pick = chosen
+                    .as_ref()
+                    .map_or(noted.candidates.first().copied().unwrap_or(0), |c| {
+                        c.pick(*s, 0, &noted.candidates)
+                    });
+                let times: Vec<String> = noted
+                    .candidates
+                    .iter()
+                    .map(|&kernel| format!("{kernel:08x} {:.1} us", us(kernel)))
+                    .collect();
                 format!(
-                    "{:?} {}x{} m{}: step {:.1} us skinny / {:.1} us turned -> {:?}",
+                    "{:?} {}x{} m{}: step {} -> {pick:08x}",
                     s.kind,
                     s.rows,
                     s.k,
                     s.m,
-                    us(kernels_cuda::linear::routes::Kernel::Skinny),
-                    us(kernels_cuda::linear::routes::Kernel::Turned),
-                    pick.unwrap_or(kernels_cuda::linear::routes::Kernel::Skinny),
+                    times.join(" / "),
                 )
             })
             .collect();
@@ -2329,6 +2369,13 @@ impl Shell {
         let mut hold = self.bodies_took;
         let weighed = self.cache.body_stats().census.bytes as u64;
         self.cache.forget_bodies();
+        // A flat range was allocated at the least range the bodies armed
+        // over; where the card backs more, it is let go (the weights
+        // preseated in it with it) so the refit reserves it anew at what the
+        // card backs, and the weights are seated again in it below.
+        let preseated = self.pools.preseated();
+        self.device.synchronize()?;
+        let refilled = self.pools.free_for_refit()?;
         let resident = footprint(self, device_total, free_before);
         let fitted = match self
             .pools
@@ -2344,6 +2391,21 @@ impl Shell {
             }
             fitted => fitted?,
         };
+        if refilled && let (true, Some((filed, copied))) = (preseated, self.preseated_as) {
+            let began = std::time::Instant::now();
+            self.preseat_weights(filed, copied)?;
+            let chunks = self
+                .pools
+                .preseat_plan()
+                .map_or(0, |plan| self.pools.weight_chunks(&plan).len());
+            eprintln!(
+                "engine-cuda: a measuring boot's flat range held the least range the bodies \
+                 armed over; it was reserved anew at {} chunks, and the weights the pool holds \
+                 ({chunks} chunks) were seated in it again from their copy in {:.1} s",
+                fitted.chunks,
+                began.elapsed().as_secs_f64()
+            );
+        }
         self.lay_workspace()?;
         self.bodies_mem = usize::try_from(hold).unwrap_or(usize::MAX);
         self.rearming = true;

@@ -606,6 +606,15 @@ impl Shell {
                 call: "rates at load",
                 why,
             })?;
+        // An Apple10 device whose profile states no `kernel.dense` measures
+        // it here over the model's shapes, once: kept under the profiles and
+        // read back by later loads of the same shapes on the same kernels.
+        let chip =
+            crate::tune::dense::at_load(&device, chip, boot.profiles.as_deref(), boot.contract)
+                .map_err(|why| Fault::Device {
+                    call: "kernel.dense at load",
+                    why,
+                })?;
         if chip
             .ladder::<kernels_metal::tuning::Qmm>()
             .values()
@@ -2179,6 +2188,40 @@ impl Shell {
         self.pools.write_tier_slots(slots, bytes)
     }
 
+    /// What the runtime's host cover depends on here
+    /// (`engine::Engine::cover_fingerprint`): the device and its OS, the
+    /// guest emitter's version, the kernel sources a fire dispatches, and
+    /// the tuning that routes among them. Not the binary: a build that
+    /// changes none of these reuses an earlier boot's cover.
+    #[must_use]
+    pub fn cover_fingerprint(&self) -> String {
+        let fnv = |bytes: &[u8]| {
+            bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
+        };
+        #[cfg(target_vendor = "apple")]
+        let os = objc2_foundation::NSProcessInfo::processInfo()
+            .operatingSystemVersionString()
+            .to_string();
+        #[cfg(not(target_vendor = "apple"))]
+        let os = String::new();
+        let kernels = kernels_metal::sources::SOURCES.iter().fold(
+            0xcbf2_9ce4_8422_2325u64,
+            |h, (name, text)| {
+                name.bytes()
+                    .chain([0u8])
+                    .chain(text.bytes())
+                    .chain([0u8])
+                    .fold(h, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
+            },
+        );
+        format!(
+            "metal|{}|{os}|emitter {}|kernels {kernels:016x}|tuning {:016x}",
+            self.device.name(),
+            eta_compiler::codegen::metal::METAL_M1_EMITTER_VERSION,
+            fnv(format!("{:?}", self.tuning).as_bytes()),
+        )
+    }
+
     /// Builds, before ready, every compute pipeline a fire of this load
     /// can meet: at each rung, a prefill fire of the rung's rows (one lane)
     /// and a decode fire of as many one-row lanes as the rung and the seats
@@ -2383,16 +2426,18 @@ impl Shell {
         let octaves = engine::load::armed::scored_buckets(&rungs);
         // Beside each rung's own rows, every band start of the matmul
         // routing below it and above the rung before
-        // (`kernels_metal::linear::gemm::ROW_BANDS`), walked at that rung:
-        // a fire's rows reach every band its rungs span, and each band's
-        // kernel is built here, not refused while serving.
+        // (`kernels_metal::linear::gemm::row_bands`: the fixed bands and
+        // where the profile's `kernel.dense` changes its pick), walked at
+        // that rung: a fire's rows reach every band its rungs span, and each
+        // band's kernel is built here, not refused while serving.
+        let bands = kernels_metal::linear::gemm::row_bands(&self.tuning);
         let mut below = 0u32;
         let sized: Vec<(u32, Vec<u32>)> = rungs
             .iter()
             .map(|&rung| {
                 let mut sizes = vec![rung];
                 sizes.extend(
-                    kernels_metal::linear::gemm::ROW_BANDS
+                    bands
                         .iter()
                         .copied()
                         .filter(|&band| band > below && band < rung),

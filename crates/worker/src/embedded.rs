@@ -26,7 +26,7 @@ pub struct Settings {
     pub budget_device: Option<ByteSize>,
     /// See [`crate::config::MemoryConfig::yield_share`]: `yield`.
     #[serde(rename = "yield")]
-    pub yield_share: f64,
+    pub yield_share: Option<f64>,
     pub sandbox_memory_mb: u64,
     pub max_concurrent_processes: Option<usize>,
     /// See [`crate::config::RuntimeConfig::frame_size`]. An app serves few
@@ -44,7 +44,7 @@ impl Default for Settings {
             engine: true,
             max_context: 4096,
             budget_device: None,
-            yield_share: 0.0,
+            yield_share: None,
             sandbox_memory_mb: 512,
             max_concurrent_processes: None,
             frame_size: u32::from(Runahead::STEPS_MAX),

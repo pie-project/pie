@@ -777,21 +777,13 @@ impl ModelConfig {
     }
 }
 
-/// `[runtime]`. `runtime.submit_deadline` was removed (no lane is dropped
-/// from a frame on a timer any more): a config that still carries it is
-/// refused at load as an unknown field. To migrate, delete the line.
+/// `[runtime]`. `runtime.submit_deadline` and `runtime.silence_timeout` were
+/// removed (no lane is dropped from a frame, and no process terminated, on
+/// a timer any more): a config that still carries either is refused at load
+/// as an unknown field. To migrate, delete the line.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
-    /// How long an awaited lane may stay silent before the runtime
-    /// terminates its process as abandoned, in seconds. A lane whose guest
-    /// waits on outside input (a session receive, a timer, an HTTP
-    /// response) is parked by the host, and one that calls
-    /// `forward.park()` parks itself: neither is ever killed however long
-    /// it stays away. (`runtime.submit_deadline` was removed: a config
-    /// carrying it is refused at load; delete the line.)
-    #[serde(default = "default_silence_timeout")]
-    pub silence_timeout: Duration,
     /// Waves per frame (*k*): how many token steps the wait-all quorum admits
     /// before it runs. A deployment constant, fixed at runtime start like the
     /// KV page size. Bounded above by the CUDA engine — see [`Self::validate`].
@@ -823,7 +815,6 @@ fn default_snapshot_budget() -> ByteSize {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
-            silence_timeout: default_silence_timeout(),
             frame_size: default_frame_size(),
             frame_dispatch_depth: default_frame_dispatch_depth(),
             max_concurrent_processes: None,
@@ -835,10 +826,6 @@ impl Default for RuntimeConfig {
 
 impl RuntimeConfig {
     fn validate(&self, max_frames: u8) -> Result<()> {
-        ensure!(
-            self.silence_timeout.as_micros() > 0,
-            "runtime.silence_timeout must be > 0"
-        );
         ensure!(self.frame_size >= 1, "runtime.frame_size must be >= 1");
         ensure!(
             self.frame_dispatch_depth >= 1,
@@ -869,10 +856,6 @@ impl RuntimeConfig {
         }
         Ok(())
     }
-}
-
-fn default_silence_timeout() -> Duration {
-    Duration::from_secs(600)
 }
 
 fn default_frame_size() -> u32 {
@@ -971,7 +954,9 @@ pub struct MemoryConfig {
     /// and with it lowers how far yield can press. Once pressure goes, the
     /// pool grows back only on demand, up to the target: nothing is
     /// allocated for nobody. At `1` the pool trims under moderate pressure
-    /// too, by design; `0`, the default, never trims.
+    /// too, by design; `0` never trims. Omitted, it is `1` where the engine
+    /// states unified memory (Metal, phones, DGX Spark: the pool and the
+    /// host share one RAM) and `0` on separate device memory.
     ///
     /// Idle cache is not timed out by the runtime: with no worker policy
     /// installed it stays until a demand needs its room, and is then
@@ -979,7 +964,7 @@ pub struct MemoryConfig {
     /// long it is kept past that is the policy's to state, with its
     /// retention keys.
     #[serde(rename = "yield")]
-    pub yield_share: f64,
+    pub yield_share: Option<f64>,
 }
 
 impl Default for MemoryConfig {
@@ -991,7 +976,7 @@ impl Default for MemoryConfig {
             budget_disk: None,
             disk_path: None,
             disk_persistent: false,
-            yield_share: 0.0,
+            yield_share: None,
         }
     }
 }
@@ -1021,13 +1006,17 @@ impl MemoryConfig {
     }
 
     /// How much of the device budget this load gives back to the system's
-    /// memory pressure.
+    /// memory pressure; `None` where the deployment states none, for the
+    /// load to resolve by the engines' memory.
     ///
     /// # Errors
     ///
     /// `yield` is outside `[0, 1]`, refused by name.
-    pub fn yields(&self) -> Result<runtime::governor::Yield> {
-        Ok(runtime::governor::Yield::new(self.yield_share)?)
+    pub fn yields(&self) -> Result<Option<runtime::governor::Yield>> {
+        Ok(self
+            .yield_share
+            .map(runtime::governor::Yield::new)
+            .transpose()?)
     }
 
     fn validate(&self) -> Result<()> {
@@ -1231,7 +1220,14 @@ device = ["metal:0"]
         assert_eq!(cfg.engine.memory, MemoryConfig::default());
         assert_eq!(
             cfg.engine.memory.yields().unwrap(),
-            runtime::governor::Yield::NONE
+            None,
+            "unset: the load resolves it by the engines' memory"
+        );
+        let zero = format!("{MINIMAL_METAL}\n[engine.memory]\nyield = 0\n");
+        assert_eq!(
+            Config::parse(&zero).unwrap().engine.memory.yields().unwrap(),
+            Some(runtime::governor::Yield::NONE),
+            "a configured 0 is not unset"
         );
         let residency = cfg.engine.memory.residency();
         assert_eq!(residency.device, engine::Allowance::WHOLE);
@@ -1248,7 +1244,7 @@ device = ["metal:0"]
             "budget_device caps the device"
         );
         assert_eq!(cfg.engine.memory.residency().host_kv_budget, Some(8 << 30));
-        assert_eq!(cfg.engine.memory.yields().unwrap().share(), 0.5);
+        assert_eq!(cfg.engine.memory.yields().unwrap().map(|y| y.share()), Some(0.5));
 
         for bad in ["yield = -0.1", "yield = 1.5", "yield = nan"] {
             let toml = format!("{MINIMAL_METAL}\n[engine.memory]\n{bad}\n");

@@ -142,6 +142,10 @@ pub struct Report {
     /// layer stating them says (`[provenance] rates`); `None` where no layer
     /// states rates measured on it.
     pub rates_measured: Option<String>,
+    /// What a keyed resolve ([`Registry::resolve_keyed`]) said of the
+    /// user's file's measurements: each kept (its key matches this build on
+    /// this device) or dropped to be measured again, and why, a line each.
+    pub stored: Vec<String>,
 }
 
 impl Report {
@@ -650,7 +654,20 @@ impl Registry {
     /// reported, and the layers below it stand.
     #[must_use]
     pub fn resolve(&self, layers: &[Candidate], facts: &Facts) -> (Profile, Report) {
-        self.resolve_with(layers, Some(facts))
+        self.resolve_with(layers, Some(facts), None)
+    }
+
+    /// [`Registry::resolve`], the user's file's measurements sifted by their
+    /// keys against `now` first ([`crate::fire::Rates::sift`]): one whose
+    /// key no longer matches is dropped, so the load measures it again.
+    #[must_use]
+    pub fn resolve_keyed(
+        &self,
+        layers: &[Candidate],
+        facts: &Facts,
+        now: &dyn crate::fire::Now,
+    ) -> (Profile, Report) {
+        self.resolve_with(layers, Some(facts), Some(now))
     }
 
     /// Resolve without a device to check facts against: every layer that
@@ -658,10 +675,16 @@ impl Registry {
     /// device name.
     #[must_use]
     pub fn read(&self, layers: &[Candidate]) -> (Profile, Report) {
-        self.resolve_with(layers, None)
+        self.resolve_with(layers, None, None)
     }
 
-    fn resolve_with(&self, layers: &[Candidate], facts: Option<&Facts>) -> (Profile, Report) {
+    fn resolve_with(
+        &self,
+        layers: &[Candidate],
+        facts: Option<&Facts>,
+        now: Option<&dyn crate::fire::Now>,
+    ) -> (Profile, Report) {
+        let mut stored: Vec<String> = Vec::new();
         let mut entries: BTreeMap<&'static str, Vec<Rung>> = BTreeMap::new();
         let mut tuned = crate::fire::Tuned::default();
         // The user's layer's rates (a load's measurement saved, or a `pie
@@ -686,7 +709,7 @@ impl Registry {
             };
             let origin = layer.source.to_string();
             let below: &[(usize, i64)] = if seeded { &inherited } else { &[] };
-            let file = match self.parse_over(&layer.text, &origin, strict, &entries, below) {
+            let mut file = match self.parse_over(&layer.text, &origin, strict, &entries, below) {
                 Ok(file) => file,
                 Err(refusal) => {
                     // A checked-in file stating a rate this pie does not
@@ -700,6 +723,25 @@ impl Registry {
                     continue;
                 }
             };
+            if !file.ignored_rates.is_empty() {
+                eprintln!(
+                    "{origin}: ignored `[rates]` {}, which this pie no longer reads; the rest is \
+                     read and what it lacks is measured",
+                    file.ignored_rates.join(", ")
+                );
+            }
+            if file
+                .ignored_rates
+                .iter()
+                .any(|key| key == crate::fire::KERNEL_CURVES_PER_DISPATCH)
+            {
+                eprintln!(
+                    "{origin}: the dense kernels' curves it states were timed per dispatch (~10x \
+                     long at few rows on a tiler): measured again this load, by frame spans \
+                     (`[rates] {}`)",
+                    crate::fire::KERNEL_CURVES
+                );
+            }
             let spelled = match facts {
                 Some(facts) => match self.admits(&file, facts) {
                     Ok(spelled) => spelled,
@@ -744,6 +786,15 @@ impl Registry {
                     rates_measured = how;
                 }
             } else {
+                if let Some(now) = now {
+                    stored.extend(
+                        file.tuned
+                            .rates
+                            .sift(now)
+                            .into_iter()
+                            .map(|line| format!("{origin}: {line}")),
+                    );
+                }
                 user_tuned.lay(&file.tuned);
                 if let Some(how) = how {
                     user_rates_measured = how;
@@ -753,6 +804,15 @@ impl Registry {
         }
         // The checked-in rates over the user's: theirs stand only where no
         // checked-in layer states one.
+        if let Some(now) = now
+            && !layers.iter().any(|l| matches!(l.source, Source::User(_)))
+        {
+            stored.push(format!(
+                "stored measurements: no user file for `{}`; whatever no checked-in layer \
+                 states is measured",
+                now.on()
+            ));
+        }
         rates_measured = rates_measured.or(user_rates_measured);
         user_tuned.lay(&tuned);
         let tuned = user_tuned;
@@ -767,6 +827,7 @@ impl Registry {
                 .map(|(id, _)| id)
                 .collect(),
             rates_measured,
+            stored,
         };
         (
             self.assemble(&entries, target, top).with_tuned(tuned),
