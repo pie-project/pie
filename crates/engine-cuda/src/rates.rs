@@ -1254,7 +1254,7 @@ mod ensure_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 mod kept_routes_tests {
     use kernels_cuda::linear::routes::{Kind, Routes, Shape, code};
 
