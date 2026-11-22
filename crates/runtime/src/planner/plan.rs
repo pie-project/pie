@@ -767,8 +767,8 @@ impl ResidencyPlanner {
         loop {
             // The capacity gate as this step reads it: a waiter it holds is
             // no head ([`super::inner::CapacityGate`]).
-            let gate = self.capacity_gate();
-            self.with_inner(|inner| inner.capacity = gate);
+            let order = self.capacity_order();
+            self.with_inner(|inner| inner.set_capacity(order));
             // Each step reads the head's need afresh (the cache spans one
             // step's reads: its own, the map's, the eviction's).
             *self.need_cache.lock() = None;

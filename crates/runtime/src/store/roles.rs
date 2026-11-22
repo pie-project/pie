@@ -2367,7 +2367,27 @@ impl Roles {
                         || format!("{pair}'s state"),
                         heads,
                     ) {
-                        Ok(part) => Some((pair, part, true, self.next_generation())),
+                        // Its item from the take on, held by the binds on
+                        // their way ([`Self::pin_shared`]) and then by its
+                        // instances: a second bind of the pair taken before
+                        // this one bound joins it. Taken fresh again, two
+                        // binds of one pair each named a taking of its own,
+                        // the engine laid the group at one under the other's
+                        // member, and the first bound left the other's chunk
+                        // held by no item for good (the simulation's field
+                        // mix, seed 20: pair 3 at chunk 6 for instance 16, at
+                        // chunk 19 for 15 and 17, at one generation; seed
+                        // 115: a beam pair's chunk out of service from step 0).
+                        Ok(part) => {
+                            let generation = self.next_generation();
+                            let mut item = Item::new(None, vec![part.clone()]);
+                            // Held by its instances alone: freed at the last
+                            // close, or with its last bind given back.
+                            item.open = false;
+                            item.generation = generation;
+                            self.items.insert(Owner::Pair(pair), item);
+                            Some((pair, part, true, generation))
+                        }
                         Err(error) => {
                             self.untake_guest(taken);
                             return Err(error.asking(whole));
@@ -2456,9 +2476,8 @@ impl Roles {
         if let Some((_, part, true)) = taken.adapter {
             self.give(&self.device, &[part]);
         }
-        if let Some((_, part, true, _)) = taken.pair {
-            self.give(&self.device, &[part]);
-        }
+        // A pair taken fresh is an item from its take ([`Self::take_guest`]):
+        // it goes below with its last bind, unless another joined it.
         // What the bind held and no one else holds goes now: a pair whose
         // members all parked while the bind was on its way, an adapter or
         // pair with none attached.
@@ -2524,8 +2543,10 @@ impl Roles {
         if let Some(part) = &guest.scratch {
             self.give(&self.device, std::slice::from_ref(part));
         }
-        if let Some((_, part, true, _)) = guest.pair {
-            self.give(&self.device, &[part]);
+        // A pair it took fresh is an item from its take: gone with it
+        // unless another bind joined it meanwhile.
+        if let Some((key, _, true, _)) = guest.pair {
+            self.free_if_done(Owner::Pair(key));
         }
     }
 
@@ -3217,7 +3238,7 @@ impl Roles {
             .map(|part| self.part_bytes(&device, part))
             .sum::<u64>()
             + taken.adapter.as_ref().map_or(0, |(_, part, own)| fresh(part, *own))
-            + taken.pair.as_ref().map_or(0, |(_, part, own, _)| fresh(part, *own))
+            // A pair taken fresh is an item from its take: counted there.
     }
 
     /// `taken` is on its way: its bytes are counted until it is bound or
@@ -3476,7 +3497,53 @@ impl Roles {
                 }
             }
         }
+        drop(device);
+        // Nothing moving and no bind on its way: every slot the pool holds
+        // out of a role's shape is one an item names (a fresh pair taken by
+        // a bind no item recorded held its chunk for good).
+        let settled = self.on_way.1 == 0
+            && self.binding.is_empty()
+            && self.items.values().all(|item| item.tier != Tier::Moving);
+        if settled {
+            for (role, used, named) in self.audit_held() {
+                if used != named {
+                    said.push(format!(
+                        "{role:?}: the pool holds {used} slots out, the items name {named}"
+                    ));
+                }
+            }
+        }
         said
+    }
+
+    /// The device slots of each role's shape the pool holds out, beside the
+    /// slots the items on the device (and moving) name: `(role, pool,
+    /// items)`. Equal, nothing is held that no item names.
+    #[cfg(test)]
+    #[must_use]
+    pub fn audit_held(&self) -> Vec<(SlotRole, u64, u64)> {
+        let device = self.device.lock().unwrap();
+        let pool = device.pool();
+        let mut out = Vec::new();
+        for role in [SlotRole::Instance, SlotRole::Channel, SlotRole::Adapter] {
+            let Some(shape) = self.shapes.of(role) else {
+                continue;
+            };
+            let used: u64 = (0..pool.total_chunks())
+                .filter(|&chunk| pool.chunk_shape(chunk) == Some(shape.pool))
+                .map(|chunk| u64::from(pool.chunk_used(chunk)))
+                .sum();
+            let named: u64 = self
+                .items
+                .values()
+                .filter(|item| matches!(item.tier, Tier::Device | Tier::Moving))
+                .flat_map(|item| &item.parts)
+                .filter(|part| part.role == role)
+                .map(|part| part.refs.len() as u64)
+                .sum();
+            out.push((role, used, named));
+        }
+        out
     }
 
     /// Role slots out of service for good: taken by moves whose copies an

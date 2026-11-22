@@ -1467,7 +1467,9 @@ impl ResidencyPlanner {
                 }
                 // Past what every tier keeps for the finisher: it waits
                 // on the gate ([`super::inner::CapacityGate`]).
-                if inner.capacity.is_some_and(|gate| gate.holds_waiter(waiter)) {
+                if inner.capacity.is_some_and(|gate| {
+                    gate.holds_waiter(waiter, inner.capacity_allow.get(&waiter.pid).copied())
+                }) {
                     return None;
                 }
                 match &waiter.kind {

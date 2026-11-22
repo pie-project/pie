@@ -2135,7 +2135,10 @@ const LOST_WAKES_FAIL: bool = false;
 fn check(ctx: &Ctx, step: u32, moving: bool) -> Result<Vec<Failure>, Failure> {
     if std::env::var_os("PIE_SIM_CAP").is_some() {
         eprintln!(
-            "SIMCAP step {step} read {:?} census {:?} device {:?} disk {:?} roles {:?}",
+            "SIMCAP step {step} held {:?} pending {:?} kv {:?} read {:?} census {:?} device {:?} disk {:?} roles {:?}",
+            ctx.stores.roles.as_ref().map(|roles| roles.lock().unwrap().audit_held()),
+            ctx.stores.shared.as_ref().map(|shared| { let shared = shared.lock().unwrap(); (shared.pool().pending_slots(), shared.pool().budget_line(), shared.pool().census(1), shared.pool().held_census()) }),
+            with_kv_lock(&ctx.stores.kv, "sim-cap", |kv| kv.census()),
             ctx.planner.capacity_read(),
             ctx.planner.port.capacity_census(),
             ctx.planner.port.device_stats(),
@@ -2444,8 +2447,16 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
     };
     let mut tasks = Vec::new();
     let mut failures: Vec<Failure> = Vec::new();
-    // A process ends within this many steps of the last arrival.
-    let bound = last_arrival + 600;
+    // A process ends within this many steps of the last arrival: the
+    // fleet's whole work done one fire a step, past a fixed allowance for
+    // its moves. A heavy mix on a small device (the field's) runs nearly
+    // one process at a time, and its last process ends that late without
+    // anyone starving.
+    let work: u32 = scripts
+        .iter()
+        .map(|(_, script)| 1 + script.decode)
+        .sum();
+    let bound = last_arrival + 600 + work;
     let mut step = 0u32;
     loop {
         // The engine's side: what was submitted last step lands now.

@@ -79,6 +79,10 @@ pub(super) struct Inner {
     /// allocation of any process but the finisher's waits while it would
     /// leave less free on every tier together than the finisher's headroom.
     pub(super) capacity: Option<CapacityGate>,
+    /// Each process's place in the gate's order ([`CapacityGate`]): what it
+    /// may take before the ones ahead of it could no longer finish in turn.
+    /// One not named takes what the last may.
+    pub(super) capacity_allow: std::collections::HashMap<ProcessId, u64>,
     /// A list compaction on its way ([`super::ResidencyPlanner::compact_lists`]):
     /// the processes whose sets it fenced (resident, but not so for their
     /// fires until it lands), or `Some` of none for one that fenced no one.
@@ -100,6 +104,19 @@ pub(super) struct Inner {
 /// that, every resident a page short with nothing anywhere to move into
 /// deadlocked the fleet (the simulation's seeds 2547, 3243, 3591; the
 /// L40S's 3 GiB disk-only stress, 0 of 150 decodes done in 553 s).
+///
+/// An eviction moves a process whole, so the headroom also covers the
+/// largest other resident's unit less a page ([`CapacityRead::margin`]):
+/// the room the finisher's deficit is made in on the device overshoots it
+/// by up to one move, and that move must find room below. Counted as
+/// fungible pages alone, the free room lay below in pieces smaller than
+/// every resident, and nobody could move (the field mix's stalls).
+///
+/// The finisher is the oldest admitted process whose need fits, resident
+/// or not: preferred resident, an evicted old process never became the
+/// finisher while any resident fitted, and its restore waited behind every
+/// younger one (the field mix: a decode evicted at step 131 restored at
+/// 607, the L40S's decodes unfinished while beams verified).
 #[derive(Clone, Copy, Debug)]
 pub(super) struct CapacityGate {
     pub(super) finisher: ProcessId,
@@ -107,9 +124,15 @@ pub(super) struct CapacityGate {
     pub(super) spare: u64,
     /// Pages free on every tier together.
     pub(super) free: u64,
-    /// What the free pages fall short of the headroom: 0 while the gate's
-    /// invariant holds.
-    pub(super) short: u64,
+    /// Taken past the order since it was read, by every ask but the
+    /// finisher's: each such ask leaves every place after the finisher that
+    /// much less ([`Self::allowance`]).
+    pub(super) used: u64,
+    /// The largest move another process makes ([`CapacityRead::unit`]),
+    /// the process that makes it, and the second largest: an ask of the
+    /// largest raises the margin by its pages, any other's by no more
+    /// than it takes the second past the largest.
+    pub(super) unit: (u64, Option<ProcessId>, u64),
 }
 
 /// What the capacity gate is read from, in kv pages
@@ -146,17 +169,39 @@ pub(super) struct CapacityRead {
     /// taken, gathering for a head held it at the gate, given back it went
     /// again, a pass that never ended).
     pub(super) gathered: u64,
+    /// The largest state one other process holds on the device, the
+    /// process, and the second largest: what one eviction moves below
+    /// whole ([`CapacityRead::margin`]).
+    pub(super) unit: (u64, Option<ProcessId>, u64),
 }
 
 impl CapacityRead {
     /// The finisher's headroom: its kv growth to its end, its restore's
     /// state, and its binds' room.
+    /// What it needs to finish ([`Self::headroom`]): its place in the
+    /// gate's order.
+    pub(super) fn need(&self) -> u64 {
+        self.headroom()
+    }
+
     fn headroom(&self) -> u64 {
-        self.end.saturating_sub(self.kv) + self.below + self.binding
+        self.end.saturating_sub(self.kv) + self.below + self.binding + self.margin()
+    }
+
+    /// What the finisher's room on the device costs below past its own
+    /// pages: an eviction moves a process's state whole, so the pages that
+    /// make the finisher's room overshoot its deficit by up to one move
+    /// less a page. Free pages counted on every tier together, a room below
+    /// smaller than every resident's state moved nobody: the finisher a
+    /// page short on a full device with free pages left only below, every
+    /// other resident too large for them (the simulation's field mix, seed
+    /// 641: four pages free on the disk, residents of five, six and nine).
+    fn margin(&self) -> u64 {
+        self.unit.0.saturating_sub(1)
     }
 
     /// Every tier's room past what is held and the slack held open.
-    fn free(&self) -> u64 {
+    pub(super) fn free(&self) -> u64 {
         self.free_of_state().saturating_sub(self.slack)
     }
 
@@ -179,23 +224,11 @@ impl CapacityRead {
             finisher: self.finisher,
             spare: free.saturating_sub(headroom),
             free,
-            short: headroom.saturating_sub(free),
+            unit: self.unit,
+            used: 0,
         }
     }
 
-    /// Whether the finisher's need fits every tier's room as it stands
-    /// once the moves under way land: its pick reads past them, so a move
-    /// in flight (both its slots taken) passes it to no other for the
-    /// move's while ([`super::ResidencyPlanner::capacity_read`]).
-    pub(super) fn fits_landed(&self) -> bool {
-        Self {
-            held: self.held.saturating_sub(self.moving),
-            ..*self
-        }
-        .gate()
-        .short
-            == 0
-    }
 
     /// What the room the state leaves falls short of the finisher's growth
     /// to its end by, the finisher's own guest state counted free (its
@@ -213,18 +246,42 @@ impl CapacityRead {
 
 impl CapacityGate {
     /// Whether an allocation of `pages` for `pid` waits on the gate.
-    pub(super) fn holds(&self, pid: ProcessId, pages: u32) -> bool {
-        pid != self.finisher && pages > 0 && u64::from(pages) > self.spare
+    pub(super) fn holds(&self, pid: ProcessId, pages: u32, place: Option<u64>) -> bool {
+        pid != self.finisher && pages > 0 && self.cost(pid, pages) > self.allowance(place)
+    }
+
+    /// What an ask may take at `place` in the order (its allowance as read,
+    /// none: the last's), less what asks took since.
+    pub(super) fn allowance(&self, place: Option<u64>) -> u64 {
+        place.unwrap_or(self.spare).saturating_sub(self.used)
+    }
+
+    /// What `pages` asked for `pid` take of the spare: the pages, and what
+    /// they raise the largest move by (its own growth for the largest; past
+    /// the largest, no more than the second's growth would take it).
+    pub(super) fn cost(&self, pid: ProcessId, pages: u32) -> u64 {
+        let pages = u64::from(pages);
+        let (largest, of, second) = self.unit;
+        let raised = if Some(pid) == of {
+            pages
+        } else {
+            (second + pages).saturating_sub(largest)
+        };
+        pages + raised
     }
 
     /// Whether `waiter` waits on the gate: an allocation's pages, or a
     /// bind's room (its guest state's fresh chunks), new state either way;
     /// a restore brings back what is held already, and a rung raise moves
     /// the requester's own.
-    pub(super) fn holds_waiter(&self, waiter: &Waiter) -> bool {
+    pub(super) fn holds_waiter(&self, waiter: &Waiter, place: Option<u64>) -> bool {
         match waiter.kind {
-            WaitKind::Allocation { rise: false, .. } => self.holds(waiter.pid, waiter.kv_need()),
-            WaitKind::BindRoom { rise: None, .. } => self.holds(waiter.pid, waiter.room_pages()),
+            WaitKind::Allocation { rise: false, .. } => {
+                self.holds(waiter.pid, waiter.kv_need(), place)
+            }
+            WaitKind::BindRoom { rise: None, .. } => {
+                self.holds(waiter.pid, waiter.room_pages(), place)
+            }
             _ => false,
         }
     }
@@ -632,7 +689,9 @@ impl Inner {
             }
             // An allocation past what every tier keeps for the finisher
             // waits on the gate: no head ([`CapacityGate`]).
-            if self.capacity.is_some_and(|gate| gate.holds_waiter(waiter)) {
+            if self.capacity.is_some_and(|gate| {
+                gate.holds_waiter(waiter, self.capacity_allow.get(&waiter.pid).copied())
+            }) {
                 continue;
             }
             match &waiter.kind {
@@ -753,6 +812,17 @@ impl Inner {
     /// ([`CapacityGate`]): its restore and its growth go first and are
     /// funded whatever is in flight, so the one process the tiers keep
     /// room for finishes while younger work runs on.
+    /// The gate and its order as a pass reads them
+    /// ([`super::ResidencyPlanner::capacity_order`]).
+    pub(super) fn set_capacity(
+        &mut self,
+        order: Option<(CapacityGate, std::collections::HashMap<ProcessId, u64>)>,
+    ) {
+        let (gate, places) = order.unzip();
+        self.capacity = gate;
+        self.capacity_allow = places.unwrap_or_default();
+    }
+
     pub(super) fn is_finisher(&self, pid: ProcessId) -> bool {
         self.capacity.is_some_and(|gate| gate.finisher == pid)
     }
@@ -795,9 +865,10 @@ impl Inner {
             accum,
             long_waits,
             capacity,
+            capacity_allow,
             ..
         } = self;
-        let mut spare = capacity.map(|gate| gate.spare);
+        let mut used = capacity.map(|gate| gate.used);
         for (&key, waiter) in queue.range_mut(head..) {
             if !waiter.is_unmet() {
                 continue;
@@ -805,14 +876,15 @@ impl Inner {
             // Past the finisher's headroom: it waits on the gate.
             let pid = waiter.pid;
             let pages = waiter.kv_need();
-            if let (Some(gate), Some(left)) = (capacity.as_ref(), spare.as_mut())
+            if let (Some(gate), Some(used)) = (capacity.as_ref(), used.as_mut())
                 && matches!(waiter.kind, WaitKind::Allocation { rise: false, .. })
             {
-                if (CapacityGate { spare: *left, ..*gate }).holds(pid, pages) {
+                let gate = CapacityGate { used: *used, ..*gate };
+                if gate.holds(pid, pages, capacity_allow.get(&pid).copied()) {
                     continue;
                 }
                 if pid != gate.finisher {
-                    *left = left.saturating_sub(u64::from(pages));
+                    *used = used.saturating_add(gate.cost(pid, pages));
                 }
             }
             let waited = waiter.since.elapsed();
