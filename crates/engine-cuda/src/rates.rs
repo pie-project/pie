@@ -606,6 +606,8 @@ mod on_device {
                 product_ns: None,
                 kernel_tflops_by_shape: None,
                 dense_settled: None,
+                measured_on: None,
+                measured_by: None,
             },
             attn_by_dim,
         })
