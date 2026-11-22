@@ -200,6 +200,32 @@ impl<I: PoolId> ShapePool<I> {
         self.ids_end
     }
 
+    /// The shared pool and its shape these ids are slot refs of; `None`
+    /// for a pinned run or the records.
+    pub fn shared_shape(&self) -> Option<(Shared, ShapeId)> {
+        match &self.slots {
+            Backing::Shape(shared, shape) => Some((Arc::clone(shared), *shape)),
+            Backing::Own(_) | Backing::Records(_) => None,
+        }
+    }
+
+    /// `n` ids from the partly filled chunks outside logical chunks
+    /// `outside`, opening none ([`super::shared::SharedPool::take_refs_outside`]);
+    /// `None` for a pool of no shared shape, or short of them.
+    pub fn try_alloc_outside(
+        &mut self,
+        n: usize,
+        outside: &std::collections::BTreeSet<u32>,
+    ) -> Option<Vec<I>> {
+        let (shared, shape) = self.shared_shape()?;
+        let refs = shared.lock().unwrap().take_refs_outside(shape, n as u64, outside)?;
+        Some(
+            refs.into_iter()
+                .map(|r| I::from_index(self.base + r))
+                .collect(),
+        )
+    }
+
     /// Whether the ids are an engine's shared pool's.
     pub fn is_shared(&self) -> bool {
         !matches!(self.slots, Backing::Own(_))

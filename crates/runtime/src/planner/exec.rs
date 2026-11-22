@@ -155,6 +155,115 @@ pub(super) fn spawn_park_down(
     }
 }
 
+/// A list compaction ([`crate::store::kv::ListCompaction`]): the pages of
+/// the device's emptiest list chunks move to free slots of the others, each
+/// reader's sets fenced meanwhile, so whole chunks stand free; a failure
+/// leaves every page where it lay.
+pub(super) fn spawn_compact_lists(
+    planner: Arc<ResidencyPlanner>,
+    plan: crate::store::kv::ListCompaction,
+) {
+    let task = {
+        let planner = planner.clone();
+        async move {
+            let moved = compact_lists(&planner, &plan).await;
+            planner.list_compaction_done(moved);
+        }
+    };
+    let spawned = spawn_watched(
+        planner.clone(),
+        ProcessId::nil(),
+        "list-compaction",
+        task,
+        |planner, _| planner.list_compaction_done(Err("its task died".into())),
+    );
+    if !spawned {
+        planner.list_compaction_done(Err("no runtime for its task".into()));
+    }
+}
+
+/// Moves `plan`'s pages; the pages moved, or why none did. A reader with a
+/// fire in flight (a lease held) is not waited for: its fence comes down
+/// at once and the chunks its pages lie in stay, so no page a fire in flight
+/// reads ever moves, and no wait here hangs on a fire that waits on room.
+async fn compact_lists(
+    planner: &ResidencyPlanner,
+    plan: &crate::store::kv::ListCompaction,
+) -> Result<usize, String> {
+    let (model, engine) = planner.locus();
+    // Only the running readers are fenced: a parked one's sets are fenced
+    // already, and stay so (its restore waits for this to land).
+    let mut fences = Vec::new();
+    let mut fenced = HashSet::new();
+    for &pid in &plan.readers {
+        let handles = crate::inferlet::process::residency::kv_suspend_handles(pid, model, engine);
+        let fence = FenceGuard::raise(handles, pid, (model, engine));
+        if fence.handles.iter().all(|handle| handle.active_leases() == 0) {
+            fenced.insert(pid);
+            fences.push(fence);
+        }
+    }
+    let stores = crate::store::registry::get(model, engine);
+    let prepared = crate::store::registry::with_kv_lock(&stores.kv, "planner-compact", |kv| {
+        kv.prepare_relocate(plan, &fenced)
+    });
+    let Some(txn) = prepared else {
+        return Err("no chunk of the plan empties now".into());
+    };
+    let (from, to) = txn.copy_plan();
+    let copy = TierMove {
+        kind: TierKind::kv(txn.shape()),
+        tier: crate::scheduler::device_domain(engine),
+        out: true,
+        device: from,
+        slots: to,
+        source: None,
+    };
+    // The chunks the copy reads and writes: no chunk move takes them while
+    // it does.
+    let chunks: Vec<u32> = match copy.kind {
+        TierKind::KvSlots(shape) => {
+            let mut chunks = planner.port.copy_chunks(shape, &copy.device);
+            chunks.extend(planner.port.copy_chunks(shape, &copy.slots));
+            chunks
+        }
+        _ => Vec::new(),
+    };
+    planner.port.moving_out(&chunks);
+    let started = Instant::now();
+    let copied = match crate::scheduler::copy_tier_tracked(engine, &copy) {
+        Ok(completion) => completion
+            .wait()
+            .await
+            .map_err(|error| CopyFailure::of(&copy.label(), "copy", &error)),
+        Err(error) => Err(CopyFailure::of(&copy.label(), "submit", &error)),
+    };
+    planner.port.moved_out(&chunks);
+    planner.record_tier_copy(&copy, started.elapsed());
+    let result = match copied {
+        Ok(()) => crate::store::registry::with_kv_lock(&stores.kv, "planner-compact", |kv| {
+            kv.commit_relocate(txn)
+        })
+        .map_err(|error| format!("its commit: {error}")),
+        Err(failure) => {
+            // Whatever of the copy the engine took has landed before the
+            // slots it wrote go back.
+            if !failure.untouched
+                && let Err(error) = crate::scheduler::settle_copies(engine).await
+            {
+                tracing::error!(%error, "planner: a list compaction's copy did not settle; its slots stay out of use");
+                return Err(failure.message);
+            }
+            crate::store::registry::with_kv_lock(&stores.kv, "planner-compact", |kv| {
+                kv.abort_relocate(txn)
+            });
+            Err(failure.message)
+        }
+    };
+    drop(fences);
+    result
+}
+
 async fn park_down(
     planner: &ResidencyPlanner,
     pids: &[ProcessId],

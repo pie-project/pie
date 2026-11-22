@@ -3131,23 +3131,28 @@ impl Roles {
         slots as u64 * slot_bytes
     }
 
-    /// The bytes every item holds together, wherever each lies
-    /// ([`Self::part_bytes`]), and those the binds on their way took: what
-    /// the capacity gate counts guest state and tables by
-    /// (`planner::PoolPort::capacity_census`).
+    /// The chunks the roles' shapes hold open on the device and on the
+    /// host tier, whatever share of them is used: a chunk of small slots
+    /// (tables, rings) or of runs of a class is room no other shape takes
+    /// until it empties, so the capacity gate counts it whole
+    /// (`planner::PoolPort::capacity_census`). Parked parts on the disk
+    /// tier lie in whole disk chunks the kv store counts.
     #[must_use]
-    pub fn footprint(&self) -> u64 {
-        let device = self.device.lock().unwrap();
-        self.items
-            .values()
-            .flat_map(|item| &item.parts)
-            .map(|part| self.part_bytes(&device, part))
-            .sum::<u64>()
-            + self.on_way.1
+    pub fn chunks_held(&self) -> u64 {
+        let shapes: Vec<_> = [SlotRole::Instance, SlotRole::Channel, SlotRole::Adapter]
+            .into_iter()
+            .filter_map(|role| self.shapes.of(role).map(|shape| shape.pool))
+            .collect();
+        let device = u64::from(self.device.lock().unwrap().pool().opened_of(&shapes));
+        let host = self
+            .host
+            .as_ref()
+            .map_or(0, |host| u64::from(host.lock().unwrap().pool().opened_of(&shapes)));
+        device + host
     }
 
-    /// [`Self::footprint`] of what `holder`'s binds took: its items, and
-    /// its binds on their way.
+    /// The bytes what `holder`'s binds took holds, wherever each lies
+    /// ([`Self::part_bytes`]): its items, and its binds on their way.
     #[must_use]
     pub fn footprint_of(&self, holder: Holder) -> u64 {
         let device = self.device.lock().unwrap();

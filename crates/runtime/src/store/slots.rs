@@ -394,6 +394,17 @@ struct ChunkMeta {
     class: u32,
 }
 
+/// A chunk of a shape's single slots, as [`SlotPool::single_chunks`] reads
+/// it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SingleChunk {
+    pub logical: u32,
+    /// The slots it holds or keeps for an epoch.
+    pub used: u32,
+    /// No chunk move or residency copy holds it.
+    pub settled: bool,
+}
+
 /// The class of a chunk of single slots ([`SlotPool::acquire`]): a run of
 /// one is a single slot too.
 pub const SINGLE: u32 = 1;
@@ -1793,6 +1804,16 @@ impl SlotPool {
         stretches.sort_unstable_by(|a, b| b.cmp(a));
         stretches.truncate(5);
         let compaction = self.plan_compaction(run).map(|moves| moves.len());
+        let dbg_chunks: Vec<String> = self
+            .chunks
+            .iter()
+            .enumerate()
+            .filter(|(_, meta)| meta.shape != NO_SHAPE)
+            .map(|(logical, meta)| {
+                format!("{}:s{}c{}u{}", self.logical_to_physical[logical], meta.shape, meta.class, meta.used)
+            })
+            .collect();
+        eprintln!("DBGCHUNKS {dbg_chunks:?}");
         format!(
             "pool (scope: every chunk): run={run} committed={} reserved={} opened={} act={} \
              headroom={} free_any={free} free_open_for_state={open} \
@@ -1975,6 +1996,15 @@ impl SlotPool {
     /// The shape logical chunk `chunk` is open for.
     pub fn chunk_shape(&self, chunk: u32) -> Option<ShapeId> {
         Some(self.chunks[chunk as usize].shape).filter(|&shape| shape != NO_SHAPE)
+    }
+
+    /// The chunks opened now for any of `shapes`, whatever they hold.
+    #[must_use]
+    pub fn opened_of(&self, shapes: &[ShapeId]) -> u32 {
+        self.chunks
+            .iter()
+            .filter(|meta| meta.shape != NO_SHAPE && shapes.contains(&meta.shape))
+            .count() as u32
     }
 
     /// Slots `holder` holds references on.
@@ -2215,6 +2245,71 @@ impl SlotPool {
             *self.holders.entry(holder).or_default() += n;
         }
         Ok(taken)
+    }
+
+    /// The chunks of `shape`'s single slots ([`SINGLE`]), each with the
+    /// slots it holds or keeps for an epoch: what a list compaction reads
+    /// its sources and destinations from. `settled` is false for one a
+    /// chunk move or a residency copy holds (fenced, or moving out): its
+    /// slots stay where they lie meanwhile, neither a source nor a
+    /// destination.
+    #[must_use]
+    pub fn single_chunks(&self, shape: ShapeId) -> Vec<SingleChunk> {
+        self.chunks
+            .iter()
+            .enumerate()
+            .filter(|(_, meta)| meta.shape == shape && meta.class == SINGLE)
+            .map(|(logical, meta)| {
+                let physical = self.logical_to_physical[logical];
+                SingleChunk {
+                    logical: logical as u32,
+                    used: meta.used,
+                    settled: !self.fenced.get(physical)
+                        && !self.moving_out.contains_key(&physical),
+                }
+            })
+            .collect()
+    }
+
+    /// `n` fresh slots of `shape` for `holder` from the partly filled
+    /// chunks of its single slots outside `outside` (logical), fullest
+    /// first, opening none: a list compaction's destinations. All or
+    /// nothing.
+    pub fn acquire_outside(
+        &mut self,
+        holder: Holder,
+        shape: ShapeId,
+        n: u64,
+        outside: &BTreeSet<u32>,
+    ) -> Option<Vec<Slot>> {
+        let state = self.shapes.get(shape as usize)?;
+        let order: Vec<u32> = state
+            .partial
+            .get(&SINGLE)
+            .into_iter()
+            .flatten()
+            .map(|&(_, _, logical)| logical)
+            .filter(|logical| !outside.contains(logical))
+            .collect();
+        let spc = u64::from(state.spc());
+        let room: u64 = order
+            .iter()
+            .map(|&logical| spc - u64::from(self.chunks[logical as usize].used))
+            .sum();
+        if room < n {
+            return None;
+        }
+        let mut taken = Vec::with_capacity(n as usize);
+        for logical in order {
+            if taken.len() as u64 == n {
+                break;
+            }
+            self.fill(logical, holder.is_live(), n - taken.len() as u64, &mut taken);
+        }
+        if n > 0 {
+            *self.holders.entry(holder).or_default() += n;
+        }
+        Some(taken)
     }
 
     /// `n` adjacent slots of `shape` for `holder`, in index order, in one

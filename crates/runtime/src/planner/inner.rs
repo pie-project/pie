@@ -79,6 +79,11 @@ pub(super) struct Inner {
     /// allocation of any process but the finisher's waits while it would
     /// leave less free on every tier together than the finisher's headroom.
     pub(super) capacity: Option<CapacityGate>,
+    /// A list compaction on its way ([`super::ResidencyPlanner::compact_lists`]):
+    /// the processes whose sets it fenced (resident, but not so for their
+    /// fires until it lands), or `Some` of none for one that fenced no one.
+    /// One at a time, and in flight as a move is.
+    pub(super) relocating: Option<super::PidSet>,
 }
 
 /// The capacity gate (the mechanism; who parks for whom stays the
@@ -1013,7 +1018,8 @@ impl Inner {
 
     /// [`Self::nothing_in_flight`] but for `pid`'s own move.
     pub(super) fn nothing_in_flight_but(&self, pid: ProcessId) -> bool {
-        self.evicting.keys().all(|evicting| *evicting == pid)
+        self.relocating.is_none()
+            && self.evicting.keys().all(|evicting| *evicting == pid)
             && !self.kill_in_flight()
             && self.procs.iter().all(|(at, proc)| {
                 *at == pid
@@ -1026,8 +1032,21 @@ impl Inner {
             })
     }
 
+    /// Whether `pid` is resident and none of its pages move under a list
+    /// compaction: its fires may run.
+    pub(super) fn settled_resident(&self, pid: ProcessId) -> bool {
+        self.procs
+            .get(&pid)
+            .is_none_or(|proc| proc.state == Residency::Resident)
+            && !self
+                .relocating
+                .as_ref()
+                .is_some_and(|fenced| fenced.contains(&pid))
+    }
+
     pub(super) fn nothing_in_flight(&self) -> bool {
-        self.evicting.is_empty()
+        self.relocating.is_none()
+            && self.evicting.is_empty()
             && !self.kill_in_flight()
             && self.procs.values().all(|proc| {
                 // A fire held at a bind the store has not served is no fire
