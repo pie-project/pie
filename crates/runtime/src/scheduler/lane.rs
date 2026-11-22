@@ -21,11 +21,23 @@ pub(super) type LaunchResult = std::result::Result<SubmissionCompletion, LaunchR
 /// A launch the lane did not fire: why, and, where the engine refused it
 /// for where state lies (`engine::Error::Placement`), the logical chunks
 /// it named: nothing was read or written, the runtime moves that state and
-/// fires the launch again, failing no lane.
-#[derive(Debug, Clone)]
+/// fires the launch again, failing no lane. Its steps then come back in
+/// `unfired`, each holding the lanes its fires were built with: a fire is
+/// fired again by them, never by the request its lanes were moved out of.
 pub(super) struct LaunchRefusal {
     pub(super) message: String,
     pub(super) placement: Vec<u32>,
+    pub(super) unfired: Vec<crate::engine::StepFire>,
+}
+
+impl std::fmt::Debug for LaunchRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LaunchRefusal")
+            .field("message", &self.message)
+            .field("placement", &self.placement)
+            .field("unfired", &self.unfired.len())
+            .finish()
+    }
 }
 
 impl std::fmt::Display for LaunchRefusal {
@@ -47,6 +59,7 @@ impl From<String> for LaunchRefusal {
         Self {
             message,
             placement: Vec::new(),
+            unfired: Vec::new(),
         }
     }
 }
@@ -863,9 +876,22 @@ impl Lane {
                                         &mut placement,
                                     )
                                 })
-                                .map_err(|message| LaunchRefusal {
-                                    message,
-                                    placement: std::mem::take(&mut placement),
+                                .map_err(|message| {
+                                    let placement = std::mem::take(&mut placement);
+                                    // Refused for placement, the frame's
+                                    // steps hold their lanes again: they go
+                                    // back with the refusal, the fires'
+                                    // lanes to fire them again by.
+                                    let unfired = if placement.is_empty() {
+                                        Vec::new()
+                                    } else {
+                                        std::mem::take(&mut frame.steps)
+                                    };
+                                    LaunchRefusal {
+                                        message,
+                                        placement,
+                                        unfired,
+                                    }
                                 })
                             }
                             None => Err(NO_BACKEND.to_string().into()),
@@ -1130,8 +1156,19 @@ impl Lane {
                     ) {
                         crate::store::shared::programs::impossible_submission(engine_idx, &error);
                     }
-                    if let ::engine::Error::Placement { chunks, .. } = &error {
+                    // Refused for where state lies before any step of the
+                    // frame ran: the steps go back into `frame`, lanes and
+                    // all, so their fires go again whole once the state
+                    // moves. Past a step that ran, the refusal fails what is
+                    // left like any other: going again would fire the ran
+                    // steps twice.
+                    if let ::engine::Error::Placement { chunks, .. } = &error
+                        && at == 0
+                    {
                         placement.extend_from_slice(chunks);
+                        for (fire, step) in frame.steps.iter_mut().zip(submitted.steps) {
+                            fire.submission = step;
+                        }
                     }
                     return Err(format!("{error}"));
                 }
