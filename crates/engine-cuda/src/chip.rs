@@ -213,6 +213,8 @@ shelved!(
         "sm120/nvidia-rtx-pro-4500-blackwell.toml",
         "sm120/nvidia-rtx-pro-6000-blackwell-server-edition.toml",
         "sm121.toml",
+        // Committed measured profiles (`pie tune export --engine cuda`).
+        "nvidia-l40s.measured.toml",
     ],
     rocm: [
         "gfx94.toml",
