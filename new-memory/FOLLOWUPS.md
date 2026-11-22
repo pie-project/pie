@@ -965,7 +965,7 @@ top-k sampler, a per-beam pre-cut) takes the full merge sort per row (~43 us a m
 ~780 us a step at Qwen3's vocab). If a guest program uses one on the hot path, carry the
 select per row: its state (`SELECT_WORDS`) is one row's today.
 
-## F48. XLA's pooled expert matmul runs 1.5–3% slower in a MoE decode fire than held banks, though at parity alone (v6e, found 2026-11-22)
+## F50. XLA's pooled expert matmul runs 1.5–3% slower in a MoE decode fire than held banks, though at parity alone (v6e, found 2026-11-22)
 
 With streamed expert banks the grouped matmul reads each expert from the pool (`Gmm::pooled`, a
 table of expert rows and the pool in the bank's place). Alone (`time_a_pooled_select`, the MoE
