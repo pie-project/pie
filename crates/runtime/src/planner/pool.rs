@@ -869,6 +869,14 @@ pub trait PoolPort: Send + Sync + 'static {
     fn state_chunks_most(&self) -> u32 {
         u32::MAX
     }
+    /// The kv pages one process may hold at most: the declared context
+    /// served ([`crate::store::registry::Stores::context_pages`]), the
+    /// capacity gate's end for a process that states none
+    /// ([`super::inner::CapacityGate`]). `None`: no gate (a pool of no
+    /// tiers' facts, as the tests' own).
+    fn context_pages(&self) -> Option<u32> {
+        None
+    }
     /// The chunks the governor's target holds back from state
     /// ([`crate::store::shared::SharedPool::held_back_chunks`]): room only
     /// the target's rise gives. 0 where none is held back.
@@ -1337,6 +1345,12 @@ impl PoolPort for RegistryPool {
         crate::store::registry::try_get(self.model, self.engine)
             .and_then(|stores| stores.shared)
             .map_or(u32::MAX, |shared| shared.lock().unwrap().state_chunks_most())
+    }
+
+    fn context_pages(&self) -> Option<u32> {
+        crate::store::registry::try_get(self.model, self.engine)
+            .map(|stores| u32::try_from(stores.context_pages).unwrap_or(u32::MAX))
+            .filter(|&pages| pages > 0)
     }
 
     fn held_back(&self) -> u32 {

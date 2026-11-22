@@ -194,6 +194,15 @@ impl PoolShape {
         self.total.div_ceil(self.segment)
     }
 
+    /// What one process may hold at most, in kv pages: half the state
+    /// chunks and a tenth less a program's largest run, so it always fits
+    /// the pool alone. The pool's declared context (the capacity gate's end
+    /// for a process: none states its own).
+    fn most_pages(&self) -> u32 {
+        let largest_run = self.programs.iter().map(|p| p.run * 2).max().unwrap_or(0);
+        (self.state_chunks() * 3 / 5).saturating_sub(largest_run).max(2) * PAGES_PER_CHUNK
+    }
+
     /// State chunks: the total less the reserved chunk and the activation.
     fn state_chunks(&self) -> u32 {
         self.total - 1 - 2
@@ -267,7 +276,7 @@ impl PoolShape {
         let tiers = crate::store::shared::Tiers::of(&facts).unwrap();
         let engines = [crate::store::registry::EngineStores {
             pools: crate::store::chunks::StorePools::of(&facts).expect("shared facts"),
-            max_context: 4096,
+            max_context: self.most_pages() as usize * 16,
             shared: Some(device),
             tiers,
         }];
@@ -931,8 +940,8 @@ impl Workload {
         let state = pool.state_chunks();
         // What one process may hold at most: half the state chunks less a
         // program's largest run, so it always fits the pool alone.
-        let largest_run = pool.programs.iter().map(|p| p.run * 2).max().unwrap_or(0);
-        let most = (state * 3 / 5).saturating_sub(largest_run).max(2) * PAGES_PER_CHUNK;
+        let _ = state;
+        let most = pool.most_pages();
         let mut rescore_rng = Rng(seed ^ 0x7e5c_07e5);
         let count = rng.range(6, 32);
         let horizon = rng.range(4, 40);
@@ -2393,9 +2402,18 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
                 kind: "liveness".to_string(),
                 line: format!(
                     "{} of {total} processes still running {} steps after the last arrival; \
-                     stuck {stuck:?}; queue {}; evicting/in flight {}; copies pending {}; free chunks {}",
+                     stuck {stuck:?}; capacity gate {:?}; queue {}; evicting/in flight {}; copies \
+                     pending {}; free chunks {}",
                     total - ended,
                     step - last_arrival,
+                    planner.capacity_gate().map(|gate| {
+                        let state = planner.with_inner(|inner| {
+                            inner.procs.get(&gate.finisher).map(|proc| {
+                                format!("{:?} unfired={} bind_waiting={}", proc.state, proc.unfired, proc.bind_waiting)
+                            })
+                        });
+                        (gate, state)
+                    }),
                     planner.debug_queue(),
                     planner.with_inner(|inner| inner.evicting.len()),
                     pending.len(),

@@ -75,6 +75,38 @@ pub(super) struct Inner {
     /// them to keep room for); cleared as the pass ends, each heading the
     /// next pass again.
     pub(super) passed: Vec<(super::wait::EntryKey, ProcessId)>,
+    /// The capacity gate as the pass reads it ([`CapacityGate`]): an
+    /// allocation of any process but the finisher's waits while it would
+    /// leave less free on every tier together than the finisher's headroom.
+    pub(super) capacity: Option<CapacityGate>,
+}
+
+/// The capacity gate (the mechanism; who parks for whom stays the
+/// policy's): state let in must always leave one process able to finish.
+/// The finisher is the oldest admitted process not idle, picked by its
+/// admission order alone; its headroom is its end (the declared context,
+/// in pages) less what it holds on every tier. Every other process's
+/// allocation, a new one's first included, waits while granting it would
+/// leave the device, the host and the disk together with less free than
+/// that headroom ("waits for the finisher's headroom on all tiers"); the
+/// finisher's own never waits on it, and its eviction plan parks the others
+/// below, where the gate kept room for them. As the finisher ends, the next
+/// oldest inherits the headroom (its departure plans again). Let in past
+/// that, every resident a page short with nothing anywhere to move into
+/// deadlocked the fleet (the simulation's seeds 2547, 3243, 3591; the
+/// L40S's 3 GiB disk-only stress, 0 of 150 decodes done in 553 s).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct CapacityGate {
+    pub(super) finisher: ProcessId,
+    /// Pages free on every tier together past the finisher's headroom.
+    pub(super) spare: u64,
+}
+
+impl CapacityGate {
+    /// Whether an allocation of `pages` for `pid` waits on the gate.
+    pub(super) fn holds(&self, pid: ProcessId, pages: u32) -> bool {
+        pid != self.finisher && pages > 0 && u64::from(pages) > self.spare
+    }
 }
 
 impl Inner {
@@ -473,6 +505,15 @@ impl Inner {
                 }
                 continue;
             }
+            // An allocation past what every tier keeps for the finisher
+            // waits on the gate: no head ([`CapacityGate`]).
+            if let WaitKind::Allocation { rise: false, .. } = waiter.kind
+                && self
+                    .capacity
+                    .is_some_and(|gate| gate.holds(waiter.pid, waiter.kv_need()))
+            {
+                continue;
+            }
             match &waiter.kind {
                 // A bind short of room asks as an admission does.
                 WaitKind::Allocation { .. } | WaitKind::BindRoom { .. } => {
@@ -497,8 +538,15 @@ impl Inner {
                     .get(&allocation)
                     .and_then(|waiter| self.procs.get(&waiter.pid))
                     .is_some_and(|proc| !proc.seated);
+                let finisher_restore = self
+                    .queue
+                    .get(&restore)
+                    .is_some_and(|waiter| self.is_finisher(waiter.pid));
                 if restore < allocation
-                    && (admits_new || self.fleet_stalled() || self.eviction_unfundable())
+                    && (admits_new
+                        || finisher_restore
+                        || self.fleet_stalled()
+                        || self.eviction_unfundable())
                 {
                     restore
                 } else {
@@ -580,6 +628,14 @@ impl Inner {
         wake
     }
 
+    /// Whether `pid` is the capacity gate's finisher
+    /// ([`CapacityGate`]): its restore and its growth go first and are
+    /// funded whatever is in flight, so the one process the tiers keep
+    /// room for finishes while younger work runs on.
+    pub(super) fn is_finisher(&self, pid: ProcessId) -> bool {
+        self.capacity.is_some_and(|gate| gate.finisher == pid)
+    }
+
     pub(super) fn eviction_unfundable(&self) -> bool {
         !self.host_swap_blocked.is_empty()
     }
@@ -617,11 +673,26 @@ impl Inner {
             queue,
             accum,
             long_waits,
+            capacity,
             ..
         } = self;
+        let mut spare = capacity.map(|gate| gate.spare);
         for (&key, waiter) in queue.range_mut(head..) {
             if !waiter.is_unmet() {
                 continue;
+            }
+            // Past the finisher's headroom: it waits on the gate.
+            let pid = waiter.pid;
+            let pages = waiter.kv_need();
+            if let (Some(gate), Some(left)) = (capacity.as_ref(), spare.as_mut())
+                && matches!(waiter.kind, WaitKind::Allocation { rise: false, .. })
+            {
+                if (CapacityGate { spare: *left, ..*gate }).holds(pid, pages) {
+                    continue;
+                }
+                if pid != gate.finisher {
+                    *left = left.saturating_sub(u64::from(pages));
+                }
             }
             let waited = waiter.since.elapsed();
             let (lacked, wanted) = (waiter.lacked, waiter.wanted);
@@ -692,7 +763,7 @@ impl Inner {
         if let Some(need) = roles_short {
             return RestoreGate::Evict {
                 need,
-                fund: stalled || self.bind_waits_behind(pid),
+                fund: stalled || self.bind_waits_behind(pid) || self.is_finisher(pid),
             };
         }
         // Its kv gathered (the step before), its rs and its bind's runs

@@ -312,6 +312,71 @@ impl ResidencyPlanner {
     /// room at the narrowest rung, the lent span included
     /// ([`super::pool::PoolPort::state_chunks_most`]); the kv pool's pages
     /// where the kv pages are a pool of their own.
+    /// The capacity gate as it stands ([`super::inner::CapacityGate`]): the
+    /// finisher, the oldest admitted process not idle, and the pages every
+    /// tier has free together (idle cache counted free: the policy lets it
+    /// go) past the finisher's headroom, its end less what it holds on every
+    /// tier. `None` where the pool states no end, or nothing is admitted.
+    pub(super) fn capacity_gate(&self) -> Option<super::inner::CapacityGate> {
+        let end = self.port.context_pages()?;
+        // Pages the planner gathered and holds for its heads are free too:
+        // counted taken, gathering for a head held it at the gate, given
+        // back it went again, a pass that never ended.
+        let (finisher, gathered) = self.with_inner(|inner| {
+            let finisher = inner
+                .procs
+                .iter()
+                .filter(|(_, proc)| proc.admitted && !proc.idle && !proc.held)
+                .min_by_key(|(_, proc)| proc.seq)
+                .map(|(pid, _)| *pid);
+            (finisher, inner.accum.len() as u64)
+        });
+        let finisher = finisher?;
+        let (model, engine) = self.port.locus();
+        let holds = u64::from(super::holdings::held_page_count(finisher, model, engine))
+            + u64::from(super::holdings::swapped_page_count(finisher, model, engine));
+        let headroom = u64::from(end).saturating_sub(holds);
+        let free = u64::from(self.port.device_stats().0)
+            + gathered
+            + u64::from(self.raw_swap_free())
+            + u64::from(self.port.reclaimable_idle());
+        Some(super::inner::CapacityGate {
+            finisher,
+            spare: free.saturating_sub(headroom),
+        })
+    }
+
+    /// Whether an allocation of `pages` for `pid` waits on the capacity
+    /// gate now, said at debug with the finisher and the bound its end came
+    /// from, and counted.
+    /// Read off the gate the last pass left ([`super::inner::Inner::capacity`]),
+    /// each grant taken past it out of its spare: a fire's grant pays one
+    /// lock, never a read of every tier.
+    pub(super) fn capacity_holds(&self, pid: ProcessId, pages: u32) -> bool {
+        let Some((gate, holds)) = self.with_counts(|inner| {
+            let gate = inner.capacity.as_mut()?;
+            let holds = gate.holds(pid, pages);
+            if !holds && pid != gate.finisher {
+                gate.spare = gate.spare.saturating_sub(u64::from(pages));
+            }
+            Some((*gate, holds))
+        }) else {
+            return false;
+        };
+        if holds {
+            self.stats.capacity_waits.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                %pid,
+                pages,
+                finisher = %gate.finisher,
+                spare = gate.spare,
+                end = "the declared context",
+                "planner: an allocation waits for the finisher's headroom on all tiers"
+            );
+        }
+        holds
+    }
+
     pub(super) fn device_pages_most(&self) -> u32 {
         match self.port.state_chunks_most() {
             u32::MAX => self.port.device_stats().1,

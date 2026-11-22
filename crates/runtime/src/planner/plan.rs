@@ -765,6 +765,10 @@ impl ResidencyPlanner {
         // pass: what it asks past its kv stands.
         let mut room_stood: Option<EntryKey> = None;
         loop {
+            // The capacity gate as this step reads it: a waiter it holds is
+            // no head ([`super::inner::CapacityGate`]).
+            let gate = self.capacity_gate();
+            self.with_inner(|inner| inner.capacity = gate);
             // Each step reads the head's need afresh (the cache spans one
             // step's reads: its own, the map's, the eviction's).
             *self.need_cache.lock() = None;
@@ -829,7 +833,9 @@ impl ResidencyPlanner {
                 if missing > 0 {
                     return Step::Absorb {
                         count: missing,
-                        fund_by_eviction: !is_restore || inner.nothing_in_flight(),
+                        fund_by_eviction: !is_restore
+                            || inner.nothing_in_flight()
+                            || inner.is_finisher(pid),
                     };
                 }
                 // rs slots are taken whole when the head is served; a short
@@ -840,7 +846,9 @@ impl ResidencyPlanner {
                     return Step::ShortRs {
                         need: seated.sub(rs_free),
                         ask: seated,
-                        fund_by_eviction: !is_restore || inner.nothing_in_flight(),
+                        fund_by_eviction: !is_restore
+                            || inner.nothing_in_flight()
+                            || inner.is_finisher(pid),
                         surplus: (inner.accum.len() as u32).saturating_sub(waiter.kv_need()),
                     };
                 }

@@ -62,6 +62,9 @@ pub struct PlannerStats {
     /// of room only the target's rise gives back
     /// ([`super::PoolPort::held_back`]), the policy asked meanwhile.
     pub target_waits: AtomicU64,
+    /// Allocations held at the capacity gate: past what every tier keeps
+    /// for the finisher ([`super::inner::CapacityGate`]).
+    pub capacity_waits: AtomicU64,
     /// Steps a pass forced by the simulation's check took on a settled
     /// step: a wake the planner was never given.
     #[cfg(test)]

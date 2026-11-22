@@ -63,6 +63,11 @@ impl ResidencyPlanner {
             }
             return Some(AllocationGrant::empty());
         }
+        // Past what every tier keeps for the finisher, it queues and waits
+        // there, named ([`super::inner::CapacityGate`]).
+        if self.capacity_holds(pid, demand.kv_pages) {
+            return None;
+        }
         let uncontended = self.returns.waiters.load(Ordering::Acquire) == 0
             && self.nonresident.load(Ordering::Acquire) == 0;
         if !self.seated_first {
@@ -170,6 +175,16 @@ impl ResidencyPlanner {
             return Ok(Acquired::Granted(grant));
         }
         let (_, kv_total) = self.port.device_stats();
+        // The finisher grows on the device alone: an end past the device
+        // never finishes, and is refused by name at its first ask, the
+        // bound named (the declared context: a process states no end).
+        if !rise
+            && let Some(end) = self.port.context_pages()
+            && end > self.device_pages_most()
+            && let Some(room) = self.port.room()
+        {
+            return Err(PlannerError::EndPastDevice { end, room });
+        }
         if demand.kv_pages > kv_total && !rise {
             if let Some(room) = self.port.room() {
                 return Err(PlannerError::PastPool {
