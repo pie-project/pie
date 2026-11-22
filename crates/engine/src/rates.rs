@@ -1057,6 +1057,20 @@ pub fn saved_text(
         }
         lines.drain(at..end);
     }
+    // Keyed measurements ([`profile::fire::Rates::measured_on`]) are kept
+    // only beside those of the same device, each keyed: what another device
+    // measured, or a rate stored without a key, is no measurement of this
+    // one.
+    if let Some(on) = &measured.measured_on {
+        if kept.measured_on.as_ref() != Some(on) {
+            kept = profile::fire::Rates::default();
+        }
+        for key in profile::fire::KEYED {
+            if kept.states(key) && kept.key_of(key).is_none() {
+                kept.unstate(key);
+            }
+        }
+    }
     let table: Vec<String> = measured
         .clone()
         .over(kept)
@@ -1397,6 +1411,8 @@ mod tests {
             product_ns: None,
             kernel_tflops_by_shape: None,
             dense_settled: None,
+            measured_on: None,
+            measured_by: None,
         }
     }
 
@@ -1509,6 +1525,148 @@ mod tests {
         )
         .unwrap();
         assert!(!second.tuned().measured_this_load);
+    }
+
+    /// This build on a device, as a keyed load checks a stored measurement
+    /// against (`profile::fire::Now`): each kernel's code, each method one.
+    struct Build {
+        on: &'static str,
+        code: Vec<(&'static str, u32)>,
+    }
+
+    impl profile::fire::Now for Build {
+        fn on(&self) -> String {
+            self.on.to_string()
+        }
+        fn method(&self, _: &str) -> Option<u32> {
+            Some(1)
+        }
+        fn code(&self, kernel: &str) -> Option<u32> {
+            self.code
+                .iter()
+                .find(|(k, _)| *k == kernel)
+                .map(|&(_, c)| c)
+        }
+    }
+
+    /// What a rates step measures under `build`, keyed: `gemm_tflops_by_rows`
+    /// fires the `gemm` kernel, every other rate the `copy` kernel.
+    fn keyed(build: &Build) -> profile::fire::Rates {
+        use profile::fire::Now as _;
+        let by = |kernel: &str| profile::fire::MeasuredBy {
+            method: 1,
+            kernels: vec![(kernel.to_string(), build.code(kernel).unwrap())],
+        };
+        profile::fire::Rates {
+            measured_on: Some(build.on()),
+            measured_by: Some(
+                profile::fire::KEYS
+                    .iter()
+                    .map(|&key| {
+                        let kernel = if key == "gemm_tflops_by_rows" {
+                            "gemm"
+                        } else {
+                            "copy"
+                        };
+                        (key.to_string(), by(kernel))
+                    })
+                    .collect(),
+            ),
+            ..all()
+        }
+    }
+
+    /// Loads of one home under keyed measurements: a second load of another
+    /// pie version (another provenance, the same kernels) measures nothing;
+    /// a load whose `gemm` kernel changed measures that rate alone; a load
+    /// on another device measures every one.
+    #[test]
+    fn keyed_loads_measure_only_what_their_keys_no_longer_match() {
+        static SHELF: profile::Shelf = profile::Shelf {
+            backend: "toy",
+            seeded: &[],
+            derived: None,
+        };
+        let registry = profile::Registry::new("toy", &[], &[]);
+        let facts = profile::Facts::of(&registry);
+        let dir = std::env::temp_dir().join(format!("pie-rates-keyed-{}", std::process::id()));
+        let path = SHELF.user_path(&dir, "Card X");
+        let save = |version: &str| SaveTo {
+            path: path.clone(),
+            provenance: ("rates", format!("\"pie {version}: a test\"")),
+            registry: &registry,
+        };
+        let build = Build {
+            on: "toy 10de:2c31 driver 1",
+            code: vec![("gemm", 7), ("copy", 9)],
+        };
+        // Each load: the keys it measured (none where it measured nothing).
+        let load = |build: &Build, version: &str| -> Vec<&'static str> {
+            let (chip, report) =
+                SHELF.resolve_keyed(&registry, "Card X", &facts, Some(&dir), build);
+            assert!(
+                !report.stored.is_empty(),
+                "every keyed load says what it found"
+            );
+            let lacked = chip.rates().missing(&profile::fire::KEYS);
+            let measures = std::cell::Cell::new(0);
+            rates_at_load(
+                chip,
+                &profile::fire::KEYS,
+                Some(save(version)),
+                None,
+                None,
+                |_| {
+                    measures.set(measures.get() + 1);
+                    Ok(Measured {
+                        rates: keyed(build).only(&lacked),
+                        unsettled: false,
+                    })
+                },
+            )
+            .unwrap();
+            assert_eq!(measures.get(), usize::from(!lacked.is_empty()));
+            lacked
+        };
+        assert_eq!(
+            load(&build, "0.6.0"),
+            profile::fire::KEYS,
+            "a first load measures all"
+        );
+        assert_eq!(
+            load(&build, "0.7.0"),
+            Vec::<&str>::new(),
+            "a version bump measures nothing"
+        );
+        let changed = Build {
+            code: vec![("gemm", 8), ("copy", 9)],
+            ..build
+        };
+        assert_eq!(
+            load(&changed, "0.7.1"),
+            ["gemm_tflops_by_rows"],
+            "a changed kernel measures its rates alone"
+        );
+        assert_eq!(load(&changed, "0.7.2"), Vec::<&str>::new());
+        let other = Build {
+            on: "toy 10de:2c32 driver 1",
+            ..changed
+        };
+        assert_eq!(
+            load(&other, "0.7.2"),
+            profile::fire::KEYS,
+            "another device measures all"
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            text.contains("measured_on = \"toy 10de:2c32 driver 1\""),
+            "{text}"
+        );
+        assert!(
+            !text.contains("2c31"),
+            "nothing of the other device stays: {text}"
+        );
     }
 
     /// A saved profile lacking one key a newer pie reads: the load asks for
@@ -2252,6 +2410,8 @@ mod tests {
             product_ns: None,
             kernel_tflops_by_shape: None,
             dense_settled: None,
+            measured_on: None,
+            measured_by: None,
         };
         assert_eq!(tuned(&rates), rates.toml());
         let (key, text) = provenance("vulkan", "the matmul through Coopmat");

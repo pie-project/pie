@@ -563,6 +563,31 @@ fn parse_consistent(rule: &str) -> Result<(&str, &str), String> {
     Ok((id.trim(), alt.trim()))
 }
 
+/// A stored key's `method, [[kernel, code], ...]` ([`crate::fire::MeasuredBy`]).
+fn by_of(
+    method: &Spanned<DeValue<'_>>,
+    kernels: &Spanned<DeValue<'_>>,
+) -> Option<crate::fire::MeasuredBy> {
+    let whole = |v: &DeValue<'_>| int(v).and_then(|x| u32::try_from(x).ok());
+    let method = whole(method.get_ref())?;
+    let DeValue::Array(items) = kernels.get_ref() else {
+        return None;
+    };
+    let kernels = items
+        .iter()
+        .map(|item| match item.get_ref() {
+            DeValue::Array(p) if p.len() == 2 => match p[0].get_ref() {
+                DeValue::String(kernel) if !kernel.is_empty() => {
+                    whole(p[1].get_ref()).map(|code| (kernel.to_string(), code))
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(crate::fire::MeasuredBy { method, kernels })
+}
+
 fn int(v: &DeValue<'_>) -> Option<i64> {
     match v {
         DeValue::Integer(i) => {
@@ -1154,6 +1179,37 @@ impl<'a> Walk<'a> {
                     rates.dense_settled = self.dense_settled(v);
                     continue;
                 }
+                key @ (crate::fire::MEASURED_ON | crate::fire::MEASURED_BY)
+                    if self.strict == Strict::CheckedIn =>
+                {
+                    self.err(
+                        k.span().start,
+                        format!(
+                            "`rates.{key}` keys a user's file's measurements: a checked-in \
+                             profile states its rates as decisions, unkeyed"
+                        ),
+                    );
+                    continue;
+                }
+                crate::fire::MEASURED_ON => {
+                    match v.get_ref() {
+                        DeValue::String(on) if !on.trim().is_empty() => {
+                            rates.measured_on = Some(on.to_string());
+                        }
+                        other => self.err(
+                            v.span().start,
+                            format!(
+                                "`rates.measured_on` names the device measured on, not {}",
+                                found(other)
+                            ),
+                        ),
+                    }
+                    continue;
+                }
+                crate::fire::MEASURED_BY => {
+                    rates.measured_by = self.measured_by(v);
+                    continue;
+                }
                 "elementwise_gbps" => &mut rates.elementwise_gbps,
                 "hbm_gbps" => &mut rates.hbm_gbps,
                 "cached_gbps" => &mut rates.cached_gbps,
@@ -1194,7 +1250,8 @@ impl<'a> Walk<'a> {
                              `attn_tflops_by_keys`, `hbm_gbps`, `cached_gbps`, `elementwise_gbps`, \
                              `scan_gelems`, `few_row_tflops`, `workgroups_per_core`, \
                              `product_ns`, `submit_worst_ratio`, `attn_tflops_by_rows_keys`, \
-                             `resident_workgroups`, `kernel_tflops_by_shape_spanned` and `dense_settled`, not `{other}`"
+                             `resident_workgroups`, `kernel_tflops_by_shape_keyed`, \
+                             `dense_settled_keyed`, `measured_on` and `measured_by`, not `{other}`"
                         ),
                     );
                     continue;
@@ -1289,17 +1346,61 @@ impl<'a> Walk<'a> {
         Some(out)
     }
 
-    /// `rates.dense_settled`: `[of, [[bottom, top, replaced, vector, wide,
-    /// tier], ...]]`, whole numbers.
+    /// `rates.measured_by`: `[[rate, method, [[kernel, code], ...]], ...]`,
+    /// each rate of [`crate::fire::KEYED`] once.
+    fn measured_by(
+        &mut self,
+        v: &Spanned<DeValue<'_>>,
+    ) -> Option<Vec<(String, crate::fire::MeasuredBy)>> {
+        let what = "`rates.measured_by` is a list of [rate, method, [[kernel, code], ...]], each \
+                    rate `[rates]` keys once";
+        let DeValue::Array(entries) = v.get_ref() else {
+            self.err(
+                v.span().start,
+                format!("{what}, not {}", found(v.get_ref())),
+            );
+            return None;
+        };
+        let mut out: Vec<(String, crate::fire::MeasuredBy)> = Vec::with_capacity(entries.len());
+        for entry in entries.iter() {
+            let parsed = match entry.get_ref() {
+                DeValue::Array(f) if f.len() == 3 => match f[0].get_ref() {
+                    DeValue::String(rate)
+                        if crate::fire::KEYED.contains(&rate.as_ref())
+                            && out.iter().all(|(r, _)| r != rate.as_ref()) =>
+                    {
+                        by_of(&f[1], &f[2]).map(|by| (rate.to_string(), by))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            match parsed {
+                Some(keyed) => out.push(keyed),
+                None => {
+                    self.err(
+                        entry.span().start,
+                        format!("{what}, not {}", found(entry.get_ref())),
+                    );
+                    return None;
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// `rates.dense_settled_keyed`: `[method, of, code, [[bottom, top,
+    /// replaced, vector, wide, tier], ...]]`, whole numbers.
     fn dense_settled(&mut self, v: &Spanned<DeValue<'_>>) -> Option<crate::fire::DenseSettled> {
-        let what = "`rates.dense_settled` is [of, [[bottom, top, replaced, vector, wide, tier], \
-                    ...]], whole \
-                    numbers";
+        let what = "`rates.dense_settled_keyed` is [method, of, code, [[bottom, top, replaced, \
+                    vector, wide, tier], ...]], whole numbers";
         let whole = |v: &DeValue<'_>| int(v).and_then(|x| u32::try_from(x).ok());
         let parsed = match v.get_ref() {
-            DeValue::Array(f) if f.len() == 2 => {
-                let of = whole(f[0].get_ref());
-                let ranges = match f[1].get_ref() {
+            DeValue::Array(f) if f.len() == 4 => {
+                let head = whole(f[0].get_ref())
+                    .zip(whole(f[1].get_ref()))
+                    .zip(whole(f[2].get_ref()));
+                let ranges = match f[3].get_ref() {
                     DeValue::Array(rs) => rs
                         .iter()
                         .map(|r| match r.get_ref() {
@@ -1315,12 +1416,17 @@ impl<'a> Walk<'a> {
                         .collect::<Option<Vec<[u32; 6]>>>(),
                     _ => None,
                 };
-                of.zip(ranges)
+                head.zip(ranges)
             }
             _ => None,
         };
         match parsed {
-            Some((of, ranges)) => Some(crate::fire::DenseSettled { of, ranges }),
+            Some((((method, of), code), ranges)) => Some(crate::fire::DenseSettled {
+                method,
+                of,
+                code,
+                ranges,
+            }),
             None => {
                 self.err(
                     v.span().start,
@@ -1331,16 +1437,18 @@ impl<'a> Walk<'a> {
         }
     }
 
-    /// `rates.kernel_tflops_by_shape`: a list of `[kind, key, n, k, stopped
-    /// at rows, why, curve]`, whole numbers then a curve of `[rows, TFLOP/s]`
-    /// ascending in rows; no kernel and shape twice; a stop of `0, 0` is none.
+    /// `rates.kernel_tflops_by_shape_keyed`: a list of `[kind, key, n, k,
+    /// stopped at rows, why, method, [[kernel, code], ...], curve, spreads]`,
+    /// whole numbers, the curve's key, then a curve of `[rows, TFLOP/s]`
+    /// ascending in rows and its points' spreads; no kernel and shape twice;
+    /// a stop of `0, 0` is none.
     fn kernel_curves(
         &mut self,
         value: &Spanned<DeValue<'_>>,
     ) -> Option<Vec<crate::fire::KernelCurve>> {
-        let what = "`rates.kernel_tflops_by_shape_spanned` is a list of [kind, key, n, k, stopped at \
-                    rows, why, [[rows, TFLOP/s], ...], optionally [[rows, spread], ...]], no \
-                    kernel and shape twice";
+        let what = "`rates.kernel_tflops_by_shape_keyed` is a list of [kind, key, n, k, stopped \
+                    at rows, why, method, [[kernel, code], ...], [[rows, TFLOP/s], ...], [[rows, \
+                    spread], ...]], no kernel and shape twice";
         let DeValue::Array(entries) = value.get_ref() else {
             self.err(
                 value.span().start,
@@ -1351,28 +1459,41 @@ impl<'a> Walk<'a> {
         let mut out: Vec<crate::fire::KernelCurve> = Vec::with_capacity(entries.len());
         for entry in entries.iter() {
             let fields = match entry.get_ref() {
-                DeValue::Array(f) if f.len() == 7 || f.len() == 8 => {
+                DeValue::Array(f) if f.len() == 10 => {
                     let whole = |i: usize| int(f[i].get_ref()).and_then(|v| u32::try_from(v).ok());
-                    match (whole(0), whole(1), whole(2), whole(3), whole(4), whole(5)) {
-                        (Some(kind), Some(key), Some(n), Some(k), Some(at), Some(why))
-                            if n > 0 && k > 0 && (at == 0) == (why == 0) =>
-                        {
-                            Some((
-                                kind,
-                                key,
-                                n,
-                                k,
-                                (at > 0).then_some((at, why)),
-                                &f[6],
-                                f.get(7),
-                            ))
-                        }
+                    match (
+                        whole(0),
+                        whole(1),
+                        whole(2),
+                        whole(3),
+                        whole(4),
+                        whole(5),
+                        by_of(&f[6], &f[7]),
+                    ) {
+                        (
+                            Some(kind),
+                            Some(key),
+                            Some(n),
+                            Some(k),
+                            Some(at),
+                            Some(why),
+                            Some(by),
+                        ) if n > 0 && k > 0 && (at == 0) == (why == 0) => Some((
+                            kind,
+                            key,
+                            n,
+                            k,
+                            (at > 0).then_some((at, why)),
+                            by,
+                            &f[8],
+                            Some(&f[9]),
+                        )),
                         _ => None,
                     }
                 }
                 _ => None,
             };
-            let Some((kind, key, n, k, stop, points, spread)) = fields
+            let Some((kind, key, n, k, stop, by, points, spread)) = fields
                 .filter(|&(kind, key, n, k, ..)| out.iter().all(|c| c.id() != (kind, key, n, k)))
             else {
                 self.err(
@@ -1436,6 +1557,7 @@ impl<'a> Walk<'a> {
                 curve,
                 stop,
                 spread,
+                by,
             });
         }
         Some(out)

@@ -588,9 +588,61 @@ struct Rig<'a, B: Serve> {
     /// fire's frame ran 0.3 to 2.4 ms on an RTX under wgpu) and the
     /// estimate's scaling between shapes, not the device.
     drift: std::cell::Cell<f64>,
+    /// Every kernel the rig's frames fired since [`Rig::take_fired`] last
+    /// took them: what a measurement's stored key names
+    /// (`crate::stored`).
+    fired: std::cell::RefCell<std::collections::BTreeSet<crate::naming::Kernel>>,
+}
+
+/// A sink that fires through `inner` and keeps each kernel it fires: a
+/// measurement's kernels, as it fired them.
+struct Recording<'s, 'c> {
+    inner: &'s kernels_slang::Ctx<'c>,
+    fired: &'s std::cell::RefCell<std::collections::BTreeSet<crate::naming::Kernel>>,
+}
+
+impl kernels_slang::Encode for Recording<'_, '_> {
+    fn fire(
+        &self,
+        fire: kernels_slang::Fire,
+        args: &[kernels_slang::ArgValue],
+    ) -> std::result::Result<(), kernels_slang::Error> {
+        self.fired
+            .borrow_mut()
+            .insert(crate::naming::Kernel::of(fire)?);
+        self.inner.fire(fire, args)
+    }
+
+    fn absent(&self) -> std::result::Result<kernels_slang::ArgValue, kernels_slang::Error> {
+        self.inner.absent()
+    }
+
+    fn target(&self) -> kernels_slang::Target {
+        self.inner.target()
+    }
+
+    fn comm(
+        &self,
+        op: &'static str,
+    ) -> std::result::Result<kernels_slang::Comm, kernels_slang::Error> {
+        self.inner.comm(op)
+    }
+
+    fn rendezvous(&self, op: &'static str) -> std::result::Result<(), kernels_slang::Error> {
+        self.inner.rendezvous(op)
+    }
+
+    fn naming(&self) -> Option<&dyn kernels_slang::Naming> {
+        self.inner.naming()
+    }
 }
 
 impl<'a, B: Serve> Rig<'a, B> {
+    /// The kernels fired since the last take.
+    fn take_fired(&self) -> std::collections::BTreeSet<crate::naming::Kernel> {
+        std::mem::take(&mut *self.fired.borrow_mut())
+    }
+
     fn new(device: &'a B::Context, max_submit: Option<std::time::Duration>) -> Self {
         Rig {
             device,
@@ -615,6 +667,7 @@ impl<'a, B: Serve> Rig<'a, B> {
             bounds_uniforms: std::cell::Cell::new(true),
             queue: std::cell::Cell::new(max_submit.is_some()),
             drift: std::cell::Cell::new(1.0),
+            fired: std::cell::RefCell::new(std::collections::BTreeSet::new()),
         }
     }
 
@@ -963,14 +1016,20 @@ impl<'a, B: Serve> Rig<'a, B> {
                 let f = self.device.frame()?;
                 {
                     let sink = B::sink(self.device, &f, &self.pipelines, &self.handles);
-                    fire(&sink)?;
+                    fire(&Recording {
+                        inner: &sink,
+                        fired: &self.fired,
+                    })?;
                 }
                 pending.push_back(crate::backend::Frame::commit_async(f, None)?);
             }
             let mut f = self.device.spanned()?;
             {
                 let sink = B::sink(self.device, &f, &self.pipelines, &self.handles);
-                fire(&sink)?;
+                fire(&Recording {
+                    inner: &sink,
+                    fired: &self.fired,
+                })?;
             }
             then(&mut f)?;
             timer(f)?;
@@ -996,6 +1055,10 @@ impl<'a, B: Serve> Rig<'a, B> {
             let mut f = self.device.spanned()?;
             {
                 let sink = B::sink(self.device, &f, &self.pipelines, &self.handles);
+                let sink = Recording {
+                    inner: &sink,
+                    fired: &self.fired,
+                };
                 for _ in 0..count {
                     fire(&sink)?;
                 }
@@ -1343,6 +1406,11 @@ pub fn time_kernels<B: Serve, T: Tactics + ?Sized>(
     }
     Ok(samples)
 }
+
+/// The version of [`measure_shapes`]' method (each dense kernel's curve's
+/// stored key, `profile::fire::KernelCurve::by`): bumped only when how a
+/// curve is measured changes.
+pub const CURVE_METHOD: u32 = 1;
 
 /// Each of `wanted` (`(kernel, n, k)`, [`lacking`]) timed at the load's
 /// rows to `top` (`profile::fire::Rates::kernel_tflops_by_shape`): a matmul
@@ -1736,7 +1804,19 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
                     "rates curve stops short of the load's rows"
                 );
             }
+            // Keyed by its method and its kernel's code (`crate::stored`).
+            let kernel = kernels_slang::linear::gemm::entry(B::TARGET, c.tactic, n, k)
+                .and_then(crate::naming::Kernel::of)
+                .map_err(fault("rates: a curve's kernel"))?;
+            let by = crate::stored::by(B::TARGET, profile::fire::KERNEL_CURVES, [&kernel])?;
+            tracing::info!(
+                "rates: curve {}/{} at {n}x{k} measured, stored under its key: {}",
+                c.kind,
+                c.key,
+                by.said()
+            );
             curves.push(profile::fire::KernelCurve {
+                by,
                 kind: c.kind,
                 key: c.key,
                 n,
@@ -1769,6 +1849,7 @@ pub fn shapes_at_load<B: Serve, T: Tactics + ?Sized>(
     max_submit: Option<std::time::Duration>,
     chip: profile::Profile,
     save: Option<engine::rates::SaveTo<'_>>,
+    on: &str,
     shapes: &[(u32, u32)],
     model: Option<u64>,
     top: u32,
@@ -1776,14 +1857,26 @@ pub fn shapes_at_load<B: Serve, T: Tactics + ?Sized>(
     let stated = chip.rates();
     let kernels = dense_kernels(B::TARGET, tactics, tier, top);
     let wanted = lacking(B::TARGET, &kernels, &stated, shapes, top);
+    let name = |&(tactic, n, k): &(kernels_slang::linear::gemm::Tactic, u32, u32)| {
+        let (kind, key) = curve_key(B::TARGET, tactic, n, k);
+        format!("{kind}/{key} at {n}x{k}")
+    };
     if wanted.is_empty() {
+        tracing::info!(
+            shapes = shapes.len(),
+            top,
+            "rates: every dense kernel's curve at the model's planes is stored under a matching \
+             key; none timed"
+        );
         return Ok(chip);
     }
     tracing::info!(
         curves = wanted.len(),
         shapes = shapes.len(),
         top,
-        "rates: timing the dense kernels at the model's planes"
+        "rates: timing the dense kernels at the model's planes, each stored under no matching \
+         key or short of {top} rows: {}",
+        wanted.iter().map(name).collect::<Vec<_>>().join(", ")
     );
     let curves = measure_shapes::<B, T>(
         device,
@@ -1805,6 +1898,7 @@ pub fn shapes_at_load<B: Serve, T: Tactics + ?Sized>(
     .over(stated.clone());
     let joined = Rates {
         kernel_tflops_by_shape: measured.kernel_tflops_by_shape.clone(),
+        measured_on: Some(on.to_string()),
         ..Rates::default()
     };
     let saved_to = save
@@ -1948,8 +2042,14 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
             measured
         })?,
     };
+    // Each measurement's kernels, as its frames fired them: what its stored
+    // key names (`crate::stored`); every kernel the step fired keys the
+    // margin it measures over the whole step.
+    let launch_fired = rig.take_fired();
+    let mut step_fired = launch_fired.clone();
     let launch = launch_ns as f64;
     let (side, warmed, walk_worst) = warm(&mut rig, &|rows| tactics.gemm(tier, rows), timer)?;
+    step_fired.extend(rig.take_fired());
     say(&format!(
         "[rates]: warm-up: {} rotations of the {side}^3 matmul, settled at {:.1} TFLOP/s",
         warmed.rotations,
@@ -1983,6 +2083,8 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
             gemm.push((w, curve));
         }
     }
+    let gemm_fired = rig.take_fired();
+    step_fired.extend(gemm_fired.iter().copied());
     // `resident_workgroups`: the workgroups the device holds at once, from
     // the matmul curve's peak (its kernel compute-bound there) and one
     // workgroup of the same kernel over the same depth.
@@ -2015,6 +2117,8 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     } else {
         None
     };
+    let resident_fired = rig.take_fired();
+    step_fired.extend(resident_fired.iter().copied());
     // The attention curve at its own keys: from the narrowest whose shape
     // is compute-bound on this device (its matmul peak over its bandwidth),
     // whatever rows the matmul curve reached.
@@ -2087,6 +2191,8 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
             rate / 1e3
         ));
     }
+    let attn_fired = rig.take_fired();
+    step_fired.extend(attn_fired.iter().copied());
     // Under a stated submit bound, the attention of a prompt step's rows
     // against a longer prefix, at each of [`PREFIX_ROWS`] against each of
     // `engine::rates::ATTN_KEYS` past them: the shapes the steps that near
@@ -2142,6 +2248,8 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
             }
         }
     }
+    let prefixed_fired = rig.take_fired();
+    step_fired.extend(prefixed_fired.iter().copied());
     let elementwise = if want.elementwise {
         let gbps = repeated(|| {
             let gbps = elementwise(&mut rig, timer, launch);
@@ -2153,6 +2261,8 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     } else {
         None
     };
+    let elementwise_fired = rig.take_fired();
+    step_fired.extend(elementwise_fired.iter().copied());
     let scan = if want.scan {
         let gelems = repeated(|| {
             let gelems = scan(&mut rig, tactics.recurrent(), timer, SCAN_SHAPE, launch);
@@ -2172,6 +2282,8 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     // states the GPU's clock table, a serving step is held at its floor
     // (`crate::clock`), which covers any drop: the margin is the estimate's
     // error alone, and the sustained drop is not measured.
+    let scan_fired = rig.take_fired();
+    step_fired.extend(scan_fired.iter().copied());
     let clock_table = crate::clock::ClockRange::read().ok();
     if let (Some(_), Some(range)) = (max_submit, &clock_table) {
         say(&format!(
@@ -2228,10 +2340,11 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     } else {
         1.0
     };
+    step_fired.extend(rig.take_fired());
     let tflops = |curve: Vec<(u32, f64)>| -> Vec<(u32, f64)> {
         curve.into_iter().map(|(x, r)| (x, r / 1e3)).collect()
     };
-    let rates = Rates {
+    let mut rates = Rates {
         launch_ns: want.launch.then_some(launch_ns),
         // A curve with no point measured is stated as none: the load is
         // refused by its key (`rates_at_load`), never weighed by nothing.
@@ -2259,7 +2372,31 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         submit_worst_ratio: max_submit
             .map(|_| rig.drift.get().max(rig.swing.get()).max(sustained).max(1.0)),
         attn_tflops_by_rows_keys: (!prefixed.is_empty()).then_some(prefixed),
+        measured_on: None,
+        measured_by: None,
     };
+    // Each rate measured, keyed by its method and the kernels it fired
+    // (`crate::stored`); the device it was measured on is the backend's to
+    // state.
+    let mut keyed = Vec::new();
+    for (key, fired) in [
+        ("launch_ns", &launch_fired),
+        ("hbm_gbps", &launch_fired),
+        ("gemm_tflops_by_rows", &gemm_fired),
+        ("attn_tflops_by_keys", &attn_fired),
+        ("elementwise_gbps", &elementwise_fired),
+        ("scan_gelems", &scan_fired),
+        (profile::fire::RESIDENT_WORKGROUPS, &resident_fired),
+        (profile::fire::ATTN_BY_ROWS_KEYS, &prefixed_fired),
+        (profile::fire::SUBMIT_WORST_RATIO, &step_fired),
+    ] {
+        if rates.states(key) {
+            let by = crate::stored::by(B::TARGET, key, fired)?;
+            tracing::info!("rates: measured `{key}`, stored under its key: {}", by.said());
+            keyed.push((key.to_string(), by));
+        }
+    }
+    rates.measured_by = (!keyed.is_empty()).then_some(keyed);
     // A rate that settled at nothing is refused by name, never saved or
     // divided by.
     if let Some((key, why)) = engine::rates::unmeasured(&rates) {
@@ -2273,6 +2410,10 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         unsettled: rig.unsettled.get(),
     })
 }
+
+/// The version of [`elementwise`]'s method (`[rates] elementwise_gbps`'s
+/// stored key, `crate::stored`): bumped only when how it measures changes.
+pub const ELEMENTWISE_METHOD: u32 = 1;
 
 /// The per-row ops' bandwidth: the backend's rmsnorm, then its swiglu, at
 /// `engine::rates::ELEMENTWISE_SHAPE`, each fire the next of
@@ -2319,6 +2460,12 @@ fn elementwise<B: Serve>(rig: &mut Rig<'_, B>, timer: Timer<'_, B>, launch: f64)
         why,
     })
 }
+
+/// The version of the method `[rates] submit_worst_ratio` is measured by
+/// (the warm-up's rotations, [`warm`], the step's drift and the sustained
+/// rotation after it; its stored key, `crate::stored`): bumped only when
+/// how it measures changes.
+pub const SUBMIT_METHOD: u32 = 1;
 
 /// The device warmed ([`engine::rates::warm_up`]): rotations of a cube
 /// matmul over its planes, each one frame timed by the host's clock around
@@ -2537,6 +2684,11 @@ fn warm_at<B: Serve>(
     }
 }
 
+/// The version of [`matmul`]'s method as `[rates] gemm_tflops_by_rows`
+/// measures it (its stored key, `crate::stored`): bumped only when how it
+/// measures changes.
+pub const GEMM_METHOD: u32 = 1;
+
 /// The matmul rate at `(m, n, k)`, each fire reading the next of its
 /// weight planes, past the last-level cache.
 fn matmul<B: Serve>(
@@ -2596,6 +2748,10 @@ fn matmul_on<B: Serve>(
     ))
 }
 
+/// The version of [`resident_workgroups`]'s method (its stored key,
+/// `crate::stored`): bumped only when how it measures changes.
+pub const RESIDENT_METHOD: u32 = 1;
+
 /// The workgroups the device holds at once: the matmul `curve`'s peak
 /// rows (its kernel compute-bound there, at width `w`), the same kernel
 /// shrunk to one workgroup over the same depth, its time against the same
@@ -2642,6 +2798,11 @@ fn resident_workgroups<B: Serve, T: Tactics + ?Sized>(
         ))
     })
 }
+
+/// The version of [`attention`]'s method (`[rates] attn_tflops_by_keys`'
+/// and `attn_tflops_by_rows_keys`' stored key, `crate::stored`): bumped
+/// only when how it measures changes.
+pub const ATTN_METHOD: u32 = 1;
 
 /// The prefill attention's rate at `s`: one sequence of `s.rows` rows
 /// attending itself, causal, its kv laid in pages of [`PAGE`], through the
@@ -2740,6 +2901,10 @@ fn attention<B: Serve, T: Tactics + ?Sized>(
     })
 }
 
+/// The version of [`scan`]'s method (`[rates] scan_gelems`' stored key,
+/// `crate::stored`): bumped only when how it measures changes.
+pub const SCAN_METHOD: u32 = 1;
+
 /// The recurrent rate at [`SCAN_SHAPE`]: the causal conv over the scan's
 /// `qkv` channels, then the chunked gated-delta scan, one sequence on one
 /// state slot.
@@ -2832,6 +2997,11 @@ fn scan<B: Serve>(
         why,
     })
 }
+
+/// The version of [`copy_and_launch`]'s method (`[rates] launch_ns`' and
+/// `hbm_gbps`' stored key, `crate::stored`): bumped only when how it
+/// measures changes.
+pub const LAUNCH_METHOD: u32 = 1;
 
 /// `(bytes a ns, a dispatch's ns)`: a copy of device memory, and the
 /// narrowest matmul back to back in one frame against one alone.
@@ -3065,6 +3235,7 @@ mod curve_tests {
         };
         let kernels = [vector(1), vector(4), vector(4)];
         let curve = |key, n, k, to, stop| profile::fire::KernelCurve {
+            by: profile::fire::MeasuredBy::default(),
             kind: profile::fire::KernelCurve::VECTOR,
             key,
             n,
@@ -3119,6 +3290,97 @@ mod curve_tests {
             .rates();
         assert_eq!(read.kernel_tflops_by_shape, rates.kernel_tflops_by_shape);
     }
+
+    /// Stored curves sifted by their keys (`crate::stored`): under the same
+    /// kernels (a pie version bump) the load times none; one kernel's code
+    /// changed, it times that kernel's curves alone; on another device,
+    /// every one.
+    #[test]
+    fn a_curve_is_timed_again_only_where_its_kernel_changed() {
+        struct Build {
+            on: &'static str,
+            code: [(&'static str, u32); 2],
+        }
+        impl profile::fire::Now for Build {
+            fn on(&self) -> String {
+                self.on.to_string()
+            }
+            fn method(&self, what: &str) -> Option<u32> {
+                crate::stored::method(what)
+            }
+            fn code(&self, kernel: &str) -> Option<u32> {
+                self.code
+                    .iter()
+                    .find(|(k, _)| *k == kernel)
+                    .map(|&(_, c)| c)
+            }
+        }
+        let target = kernels_slang::Target::Spirv;
+        let vector = kernels_slang::linear::gemm::Tactic {
+            tier: kernels_slang::Tier::Subgroup,
+            vector: 4,
+            wide: false,
+        };
+        let tiled = kernels_slang::linear::gemm::Tactic {
+            vector: 0,
+            ..vector
+        };
+        let kernels = [vector, tiled];
+        let build = Build {
+            on: "vulkan 10de:2c31 driver 0x1",
+            code: [("gemv", 1), ("tiled", 2)],
+        };
+        let curve = |kind, key, n, kernel: &str| profile::fire::KernelCurve {
+            by: profile::fire::MeasuredBy {
+                method: CURVE_METHOD,
+                kernels: vec![(
+                    kernel.to_string(),
+                    profile::fire::Now::code(&build, kernel).unwrap(),
+                )],
+            },
+            kind,
+            key,
+            n,
+            k: 1024,
+            curve: vec![(1, 0.5), (4096, 4.0)],
+            stop: None,
+            spread: Vec::new(),
+        };
+        let stored = profile::fire::Rates {
+            kernel_tflops_by_shape: Some(vec![
+                curve(profile::fire::KernelCurve::VECTOR, 4, 1024, "gemv"),
+                curve(profile::fire::KernelCurve::TILE, 32, 1024, "tiled"),
+                curve(profile::fire::KernelCurve::VECTOR, 4, 2048, "gemv"),
+                curve(profile::fire::KernelCurve::TILE, 32, 2048, "tiled"),
+            ]),
+            measured_on: Some(build.on.to_string()),
+            ..Default::default()
+        };
+        let shapes = [(1024, 1024), (2048, 1024)];
+        let wanted = |now: &Build| {
+            let mut rates = stored.clone();
+            rates.sift(now);
+            lacking(target, &kernels, &rates, &shapes, 4096)
+                .into_iter()
+                .map(|(t, n, _)| (t.vector, n))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(wanted(&build), [], "the same kernels: none timed");
+        let changed = Build {
+            code: [("gemv", 1), ("tiled", 3)],
+            ..build
+        };
+        assert_eq!(
+            wanted(&changed),
+            [(0, 1024), (0, 2048)],
+            "the tiled kernel's alone"
+        );
+        let other = Build {
+            on: "vulkan 10de:2c32 driver 0x1",
+            ..changed
+        };
+        assert_eq!(wanted(&other).len(), 4, "another device: every one");
+    }
 }
 
 #[cfg(test)]
@@ -3145,6 +3407,8 @@ mod wanted_tests {
             product_ns: None,
             kernel_tflops_by_shape: None,
             dense_settled: None,
+            measured_on: None,
+            measured_by: None,
         };
         let none = Wanted {
             launch: false,

@@ -101,7 +101,8 @@ impl Serve for Api {
         }
         let device = Context::bind(boot, allowance)?;
         let measured = device.chip();
-        let (chip, report) = crate::chip::resolve(&measured, boot.profiles.as_deref());
+        let (chip, report) =
+            crate::chip::resolve_stored(&measured, &device.measured_on(), boot.profiles.as_deref());
         crate::chip::SHELF.tell_untuned(&measured.name, &report);
         let tuning = crate::tuning::Tuning::new(chip, device.limits());
         // A device whose profile lacks the roofline's constants measures

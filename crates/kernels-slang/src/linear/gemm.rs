@@ -237,6 +237,12 @@ pub fn kernels(
     Ok(all)
 }
 
+/// The kernel a projection of `n` columns over a contraction of `k` fires
+/// under `tactic`, at any rows: what a measurement of it is keyed by.
+pub fn entry(target: Target, tactic: Tactic, n: u32, k: u32) -> Result<Fire, Error> {
+    kernel(target, tactic, "linear.entry", 1, n, k)
+}
+
 /// The workgroups a projection of `m` rows over `n` columns and a
 /// contraction of `k` launches under `tactic`: its kernel's grid.
 pub fn workgroups(target: Target, tactic: Tactic, m: u32, n: u32, k: u32) -> Result<u64, Error> {

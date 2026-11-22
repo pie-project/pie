@@ -569,6 +569,13 @@ pub struct Settled {
     pub decided: bool,
 }
 
+/// The version of the dense settle's method ([`Shell::settle_dense`]: how
+/// it weighs each range in whole served steps, or on its widest plane
+/// alone), its stored settle's key beside what it weighed and the kernels'
+/// code (`profile::fire::DenseSettled`): bumped only when how it weighs
+/// changes.
+pub const SETTLE_METHOD: u32 = 1;
+
 /// `tier` as the number a stored settle names it by.
 fn tier_number(tier: kernels_slang::Tier) -> u32 {
     match tier {
@@ -2526,17 +2533,66 @@ impl<B: Serve> Shell<B> {
             return Ok(());
         }
         self.settled.clear();
-        // The ranges a settle of the same curves, model, rungs and build
-        // stored as decided are taken again without firing; the rest are
-        // settled (again) this load.
-        let of = self.settle_key(lanes);
-        let stored: Vec<[u32; 6]> = self
-            .dense_rates
-            .dense_settled
-            .clone()
-            .filter(|stored| stored.of == of)
-            .map(|stored| stored.ranges)
-            .unwrap_or_default();
+        // The ranges a settle stored as decided under the same key (its
+        // method, what it weighed, the code of the kernels its steps fire;
+        // the device is the user's file's, `crate::stored`) are taken again
+        // without firing; the rest are settled (again) this load.
+        let (of, code) = self.settle_key(lanes)?;
+        let stored: Vec<[u32; 6]> = match self.dense_rates.dense_settled.clone() {
+            None => {
+                tracing::info!(
+                    method = SETTLE_METHOD,
+                    of = format_args!("{of:#010x}"),
+                    code = format_args!("{code:#010x}"),
+                    "dense settle: none stored; every range is settled this load"
+                );
+                Vec::new()
+            }
+            Some(stored) => {
+                let why = if stored.method != SETTLE_METHOD {
+                    Some(format!(
+                        "its method is version {SETTLE_METHOD} now, {} when stored",
+                        stored.method
+                    ))
+                } else if stored.of != of {
+                    Some(format!(
+                        "what it weighed changed (the curves, the model's planes, the rungs, \
+                         lanes or kernel choice: {:#010x} stored, {of:#010x} now)",
+                        stored.of
+                    ))
+                } else if stored.code != code {
+                    Some(format!(
+                        "the code of the kernels its steps fire changed ({:#010x} stored, \
+                         {code:#010x} now)",
+                        stored.code
+                    ))
+                } else {
+                    None
+                };
+                match why {
+                    None => {
+                        tracing::info!(
+                            method = SETTLE_METHOD,
+                            of = format_args!("{of:#010x}"),
+                            code = format_args!("{code:#010x}"),
+                            "dense settle: stored under a matching key; its {} decided ranges \
+                             reused",
+                            stored.ranges.len()
+                        );
+                        stored.ranges
+                    }
+                    Some(why) => {
+                        tracing::info!(
+                            method = SETTLE_METHOD,
+                            of = format_args!("{of:#010x}"),
+                            code = format_args!("{code:#010x}"),
+                            "dense settle: the stored settle is settled again: {why}"
+                        );
+                        Vec::new()
+                    }
+                }
+            }
+        };
         for &[bottom, top, replaced, vector, wide, tier] in &stored {
             if replaced != 0 {
                 let tactic = kernels_slang::linear::gemm::Tactic {
@@ -2624,7 +2680,12 @@ impl<B: Serve> Shell<B> {
             .collect();
         tracing::info!("dense settle ranges: {}", status.join(", "));
         if ranges.len() > stored.len() {
-            let keep = profile::fire::DenseSettled { of, ranges };
+            let keep = profile::fire::DenseSettled {
+                method: SETTLE_METHOD,
+                of,
+                code,
+                ranges,
+            };
             self.dense_rates.dense_settled = Some(keep.clone());
             self.to_store = Some(keep);
         }
@@ -2810,23 +2871,28 @@ impl<B: Serve> Shell<B> {
         Ok(())
     }
 
-    /// A fingerprint of what the settle weighs: the curves, the model's
-    /// planes, the kernels the choice took by them, the rungs and lanes it
-    /// fires, the backend and the build.
-    fn settle_key(&self, lanes: u32) -> u32 {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        format!(
-            "{:?}|{:?}|{:?}|{lanes}|{}|{:?}|{}",
-            self.dense_rates.kernel_tflops_by_shape,
-            self.dense_planes,
-            self.dense,
-            self.budgets.tokens.max_tokens,
-            B::TARGET,
-            env!("CARGO_PKG_VERSION"),
-        )
-        .hash(&mut h);
-        (h.finish() & u64::from(u32::MAX)) as u32
+    /// The settle's key beside its method ([`SETTLE_METHOD`]): `of`, a
+    /// fingerprint of what it weighs (the curves, the model's planes, the
+    /// kernels the choice took by them, the rungs and lanes it fires, the
+    /// backend); and `code`, a fingerprint of the code of every kernel the
+    /// load's fires can ask for (`crate::stored::code_of_all`), which each
+    /// weighed step ran. Nothing of the build but its kernels keys it.
+    fn settle_key(&self, lanes: u32) -> Result<(u32, u32)> {
+        let of = profile::fire::fingerprint(
+            format!(
+                "{:?}|{:?}|{:?}|{lanes}|{}|{:?}",
+                self.dense_rates.kernel_tflops_by_shape,
+                self.dense_planes,
+                self.dense,
+                self.budgets.tokens.max_tokens,
+                B::TARGET,
+            )
+            .as_bytes(),
+        );
+        let kernels: std::collections::BTreeSet<crate::naming::Kernel> =
+            self.asks.kernels.iter().copied().collect();
+        let code = crate::stored::code_of_all(B::TARGET, &kernels)?;
+        Ok((of, code))
     }
 
     /// The kernel each plane serves at each row range now, said once the
