@@ -1312,7 +1312,19 @@ fn time_spread(
     live: &[usize],
     launch: impl Fn(&dyn Encode, usize, usize) -> Result<(), Error>,
 ) -> Result<Vec<(f64, f64, f64)>, String> {
-    const ROUNDS: usize = 7;
+    time_rounds(device, pipelines, handles, live, 7, launch)
+}
+
+/// [`time_spread`] over `rounds` timed rounds (at least 3).
+fn time_rounds(
+    device: &Context,
+    pipelines: &Pipelines,
+    handles: &Handles,
+    live: &[usize],
+    rounds: usize,
+    launch: impl Fn(&dyn Encode, usize, usize) -> Result<(), Error>,
+) -> Result<Vec<(f64, f64, f64)>, String> {
+    let rounds = rounds.max(3);
     const FRAME_S: f64 = 0.002;
     const SLOWER: f64 = 3.0;
     let frame = |c: usize, batch: usize| -> Result<f64, String> {
@@ -1339,7 +1351,7 @@ fn time_spread(
     let mut seen: Vec<Vec<f64>> = (0..live.len())
         .map(|i| if timed[i] { Vec::new() } else { vec![once[i]] })
         .collect();
-    for _ in 0..ROUNDS {
+    for _ in 0..rounds {
         for (i, &c) in live.iter().enumerate() {
             if timed[i] {
                 seen[i].push(frame(c, batch[i])? / batch[i] as f64);

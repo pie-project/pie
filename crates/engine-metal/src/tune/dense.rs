@@ -13,7 +13,7 @@ use profile::search::Line;
 use profile::tune::{Candidate, Options, Sample};
 use profile::{Decision, Profile, Source};
 
-use super::{Depth, Watch, bf16, noise, seen, time_spread, to_f32};
+use super::{Depth, Watch, bf16, noise, seen, time_rounds, to_f32};
 use crate::device::{Buffer, Context, Handles, Pipelines};
 use crate::encode::Sink;
 
@@ -199,6 +199,11 @@ impl Measured {
     }
 }
 
+/// The timed rounds a curve's point takes, and a point slower than both its
+/// neighbours takes again.
+const ROUNDS: usize = 7;
+const RETIME_ROUNDS: usize = 21;
+
 /// More than any Apple GPU's system-level cache.
 const STREAM_BYTES: u64 = 256 << 20;
 /// The most one shape's weight copies take.
@@ -296,8 +301,9 @@ fn measure_at(
         drop(w_bytes);
         let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).map_err(|e| e.to_string());
         let (ha, ho) = (bind(&act_b)?, bind(&out_b)?);
-        for &m in grid {
-            let launch = |sink: &dyn Encode, tuning: &Tuning, copy: usize| {
+        let launch_at = |m: u32| {
+            let weights = &weights;
+            move |sink: &dyn Encode, tuning: &Tuning, copy: usize| {
                 gemm::matmul(
                     sink,
                     tuning,
@@ -305,7 +311,11 @@ fn measure_at(
                     Tensor::new(weights[copy % weights.len()], n, k, Dtype::Bf16),
                     Tensor::new(ho, m, n, Dtype::Bf16),
                 )
-            };
+            }
+        };
+        let first = out.points.len();
+        for &m in grid {
+            let launch = launch_at(m);
             let mut live: Vec<usize> = Vec::new();
             for (c, d) in candidates.iter().enumerate() {
                 if forced[c].dense(m, n, k) != *d {
@@ -336,13 +346,17 @@ fn measure_at(
                 }
                 live.push(c);
             }
-            let times = time_spread(device, &pipelines, &handles, &live, |sink, c, copy| {
+            // Each point the fastest of its rounds: noise only slows a
+            // launch, so the fastest is the kernel's, and two measuring
+            // boots agree on it where a median moves with the device's
+            // state (engine-gpu's curve rule).
+            let times = time_rounds(device, &pipelines, &handles, &live, ROUNDS, |sink, c, copy| {
                 launch(sink, &forced[c], copy)
             })?;
             let mut row = vec![None; candidates.len()];
             let mut spread = vec![None; candidates.len()];
             for (c, (t, lo, hi)) in live.iter().zip(times) {
-                row[*c] = Some(t);
+                row[*c] = Some(lo);
                 spread[*c] = Some((hi - lo) / t.max(1e-12));
             }
             let baseline = candidates
@@ -357,6 +371,32 @@ fn measure_at(
                 spread,
                 baseline,
             });
+        }
+        // A point slower than both its neighbours along the rows (in
+        // TFLOP/s) is timed again over more rounds, its fastest kept where
+        // faster: re-measured, never overridden from its neighbours.
+        for c in 0..candidates.len() {
+            let along: Vec<usize> = (first..out.points.len())
+                .filter(|&i| out.points[i].times[c].is_some())
+                .collect();
+            for w in along.windows(3) {
+                let (before, at, after) = (w[0], w[1], w[2]);
+                let rate = |i: usize| {
+                    let p = &out.points[i];
+                    f64::from(p.rows) / p.times[c].unwrap_or(f64::INFINITY)
+                };
+                if rate(at) >= rate(before) || rate(at) >= rate(after) {
+                    continue;
+                }
+                let m = out.points[at].rows;
+                let launch = launch_at(m);
+                let again = time_rounds(device, &pipelines, &handles, &[c], RETIME_ROUNDS, |sink, c, copy| {
+                    launch(sink, &forced[c], copy)
+                })?;
+                if let (Some(&(_, lo, _)), Some(old)) = (again.first(), out.points[at].times[c]) {
+                    out.points[at].times[c] = Some(old.min(lo));
+                }
+            }
         }
         drop(buffers);
         say(&format!(

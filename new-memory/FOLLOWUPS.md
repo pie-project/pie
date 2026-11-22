@@ -1186,3 +1186,16 @@ What each still times at load or boot, for its owner (paths under `crates/`):
   (`engine_gpu::dense::by_shape`; by the roofline where one is stated); with curves but no roofline, the curves
   weigh it (`dense::choose_unrated`). Still open: the Adreno 840's committed profile (`adreno-tm-840`, a
   commented slot in each backend's `SEEDED`) awaits the phone's export.
+
+## F57. Metal's kernel.dense fit turns agreeing curves into different ladders (found 2026-11-22)
+The load's ladder is `tune::dense::fit_at` over the per-shape curves (`profile::tune::fit`, `Options::default()`:
+`min_gain` 1% of the floor, up to 8 rungs). A rung that fixes the 8-row pick alone saves under 1% (one row count of
+six in the decode band), so whether it is kept turns on noise. Two clean measuring boots of Gemma 4 E4B on an M5 Pro
+(sc/macpro-metal-covers, each point the fastest of 7 rounds, a point slower than both neighbours re-timed over 21)
+measured curves that agree (153 points at rows 6-12: median 0.25%, max 1.88% apart; no row count where the fastest
+kernel differs) and fitted a 4-rung ladder serving c8 at 177.8 tok/s and a 5-rung one serving 199.8. A committed
+profile exported from either freezes its ladder. `min_gain` is a chosen threshold, and a fit that serves c8 slower
+than another candidate ladder must never be picked. sc/macpro-dense-fit (held) replaces the fit with the curves'
+per-point winners (no threshold, no cap; ties settled by the neighbouring row count, else the profile's pick): on
+the M5 it served Gemma c8 at 200.0 / 199.9 / 200.1 over three fresh measurements; on an M1 Max it served c8 7.5%
+under 8ed8f8679 with its 8-row fires faster on the device (the loss off the device, unexplained).
