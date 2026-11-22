@@ -345,6 +345,19 @@ enum SchedulerItem {
     Stop,
 }
 
+/// The rows a frame may seal at: the fire cap, or, until the scheduler has
+/// granted the walk that cap (`granted`), the rung the engine still holds
+/// (`held`) where frames queued wider (`queued`) were cut under it. Frames
+/// cut before the cap came down go; the grant, and the rung's lower after
+/// it, wait for them.
+pub(super) fn seal_rows(cap: u32, held: u32, granted: Option<u32>, queued: usize) -> usize {
+    let cap = cap as usize;
+    if granted == Some(cap as u32) || queued <= cap {
+        return cap;
+    }
+    queued.min(held as usize).max(cap)
+}
+
 /// A change to how much of the pool has memory under it.
 #[derive(Debug, Clone)]
 pub(crate) enum PoolOp {
@@ -1595,6 +1608,12 @@ impl BatchScheduler {
             .preload_free_slots(crate::inferlet::process::execution_slot_capacity().unwrap_or(0));
         let mut stall_since: Option<crate::rt::Instant> = None;
         let mut stall_dumps: u32 = 0;
+        // The cap the scheduler last told the walk it holds nothing wider
+        // than ([`crate::store::shared::grant_rung`]), and what was said of
+        // frames held under the cap.
+        let mut granted_cap: Option<u32> = None;
+        let mut held_cap_said: Option<u32> = None;
+        let mut owed_said = 0usize;
 
         loop {
             let mut progress = false;
@@ -1658,8 +1677,38 @@ impl BatchScheduler {
                 limits.max_forward_tokens,
             );
             let cap = crate::store::shared::fire_cap(engine_id);
+            // A grant is of one cap: moved since, it is granted again.
+            if granted_cap.is_some_and(|granted| granted != cap) {
+                granted_cap = None;
+            }
             let mut stepped = limits;
-            stepped.max_forward_tokens = stepped.max_forward_tokens.min(cap as usize).max(1);
+            // Frames queued before the cap came down were cut at the rung
+            // the engine still holds: they seal under it, and the rung
+            // comes down once they have gone (the grant below waits on
+            // them). Capped there, a complete frame sat unsealed on a raise
+            // the pressure that lowered the cap could not fund (Mac's beam
+            // mix: the rung raised to 64, the cap lowered to 16 under frames
+            // cut at 64, nothing submitted for 25 minutes). Past the grant
+            // (none wider queued then), nothing wider seals: the rung may
+            // be coming down.
+            let seal = seal_rows(
+                cap,
+                crate::store::shared::engine_rows(engine_id),
+                granted_cap,
+                frame_policy.queued_widest(),
+            );
+            if seal > cap as usize && held_cap_said != Some(cap) {
+                held_cap_said = Some(cap);
+                tracing::info!(
+                    engine_id,
+                    cap,
+                    queued = frame_policy.queued_widest(),
+                    "the activation rung's cap came down under frames already cut wider: they \
+                     seal under the rung the engine holds, and the rung comes down once they \
+                     have gone"
+                );
+            }
+            stepped.max_forward_tokens = stepped.max_forward_tokens.min(seal).max(1);
             // No frame past the cap is sealed from here, and no unframed
             // launch past it posted (`post_frame` holds it): once none in
             // flight is either, nor a frame sealed before still to go, the
@@ -1679,6 +1728,7 @@ impl BatchScheduler {
                 && frame_policy.queued_widest() <= cap as usize
             {
                 crate::store::shared::grant_rung(engine_id, cap);
+                granted_cap = Some(cap);
             }
             let (dispatched, wait_hint) = Self::dispatch_ready_items(
                 &lane,
@@ -1699,6 +1749,19 @@ impl BatchScheduler {
             // owner is told, its walk raising the rung to them (a hold with
             // nothing in flight waited on a raise nothing asked for).
             let (owed, owed_by) = frame_policy.cut_owed_by();
+            // A frame queued wider after the lower was granted waits on a
+            // raise to it: said once a width, never silent.
+            if owed > 0 && owed_said != owed {
+                tracing::info!(
+                    engine_id,
+                    owed,
+                    cap,
+                    owner = ?owed_by,
+                    "a frame cut wider than the activation rung's cap waits unsealed for a raise \
+                     to it, asked of the cap's owner"
+                );
+            }
+            owed_said = owed;
             crate::store::shared::owe_cut_rows(
                 engine_id,
                 u32::try_from(owed).unwrap_or(u32::MAX),

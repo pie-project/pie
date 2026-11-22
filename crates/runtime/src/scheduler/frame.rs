@@ -2828,6 +2828,50 @@ mod tests {
         assert_eq!(policy.cut_owed(), 0);
     }
 
+    /// Mac's verified beam mix under pressure: frames cut at a rung of 64
+    /// queued, then the cap lowered to 16 while the engine still held 64.
+    /// Capped at 16 they sat unsealed on a raise the pressure could not
+    /// fund, nothing submitted for 25 minutes. They seal under the rung the
+    /// engine holds; once they are gone the cap is granted, and from then
+    /// nothing wider seals.
+    #[test]
+    fn frames_queued_at_a_rung_the_cap_came_down_under_seal_under_the_rung_held() {
+        use crate::scheduler::worker::seal_rows;
+        fn settled(policy: &mut FramePolicy, ids: &QueuedFireIds) -> FramePlan {
+            let mut now = Instant::now();
+            for _ in 0..100 {
+                match plan(policy, ids, now) {
+                    FramePlan::Hold(wait) => now += wait.max(Duration::from_millis(1)),
+                    plan => return plan,
+                }
+            }
+            panic!("held for good: {}", policy.debug_summary());
+        }
+        let mut policy = FramePolicy::new(1, 4096, 1 << 20, None).with_silence_timeout_off();
+        let lanes: Vec<ProcessId> = (0..4).map(|_| pid()).collect();
+        policy.cap_fires(64);
+        let mut ids = Vec::new();
+        for (at, &lane) in lanes.iter().enumerate() {
+            let id = at as u64 + 1;
+            policy.on_fire_enqueued(stamp(lane, 0, 0, 1), Some(lane), id, 64, 1);
+            ids.push(id);
+        }
+        // The cap comes down to 16; the engine holds 64, nothing granted.
+        let seal = seal_rows(16, 64, None, policy.queued_widest());
+        assert_eq!(seal, 64, "they seal under the rung held");
+        policy.cap_fires(seal);
+        let queued: QueuedFireIds = ids.iter().copied().collect();
+        let mut sent = fires(&settled(&mut policy, &queued));
+        sent.sort_unstable();
+        assert_eq!(sent, ids, "every lane serves");
+        assert_eq!(policy.cut_owed(), 0, "no raise owed");
+        policy.on_frame_posted(lanes.clone(), Instant::now());
+        policy.on_frame_retired(lanes.clone());
+        // Gone, the cap is the seal, and once granted nothing wider seals.
+        assert_eq!(seal_rows(16, 64, None, policy.queued_widest()), 16);
+        assert_eq!(seal_rows(16, 64, Some(16), 64), 16, "past the grant");
+    }
+
     /// The soak's stall as the scheduler's turns meet the walk: the cap
     /// lowered 512 -> 256 -> 128 fast, a prompt cut at 512 queued; a turn
     /// reads 128 and holds the prompt out, and before its report of the
