@@ -86,7 +86,6 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // The product times the device's profile holds choose between the
     // kernels that can serve a decode product; arming notes the shapes it
     // lacks, measured once it has armed (`Staged::finish`).
-    #[cfg(feature = "rocm")]
     device.set_routes(std::sync::Arc::new(kernels_cuda::linear::routes::Routes::of(
         chip.rates().product_ns.as_deref().unwrap_or_default(),
     )));
@@ -1976,8 +1975,6 @@ impl Staged {
             free_before,
             profiles,
         } = self;
-        #[cfg(not(feature = "rocm"))]
-        let _ = &profiles;
         if arm_trace {
             eprintln!(
                 "[arm-trace] device free {} MiB before arming",
@@ -2019,7 +2016,6 @@ impl Staged {
             let armed = shell.arm_bodies();
             shell.arming_at_load = false;
             armed?;
-            #[cfg(feature = "rocm")]
             shell.routes_measured(profiles.as_deref())?;
             if shell.measuring {
                 shell.measured_refit(device_total, free_before)?;
@@ -2186,13 +2182,16 @@ impl Shell {
     /// time under each kernel (`Shell::routes_by_body`), saved in the
     /// device's user profile, and the lattice left armed under the choices.
     /// A load whose profile holds every shape measures nothing.
-    #[cfg(feature = "rocm")]
     fn routes_measured(&mut self, profiles: Option<&std::path::Path>) -> Result<()> {
         let Some(routes) = self.device.ctx().routes().cloned() else {
             return Ok(());
         };
         let wanted = routes.wanted();
         if wanted.is_empty() {
+            eprintln!(
+                "engine-cuda: decode products' kernels from the profile: every shape the bodies \
+                 hold reused, 0 measured"
+            );
             return Ok(());
         }
         // A load that records no bodies serves every fire as an eager walk:
@@ -2208,28 +2207,46 @@ impl Shell {
         }
         let started = std::time::Instant::now();
         let measured = self.routes_by_body(routes, &wanted)?;
+        if measured.is_empty() {
+            // Every shape a decode body times is the profile's: nothing is
+            // measured or saved; the rest (rows no decode body carries) keep
+            // their stated kernel.
+            eprintln!(
+                "engine-cuda: decode products' kernels from the profile: 0 measured; {} shape(s) \
+                 at rows no decode body carries keep their stated kernel",
+                wanted.len()
+            );
+            return Ok(());
+        }
         let saved = crate::rates::save_product_times(profiles, self.device.name(), &measured)
             .map_err(Fault::Card)?;
         let chosen = self.device.ctx().routes().cloned();
         let said: Vec<String> = wanted
-            .keys()
-            .map(|s| {
+            .iter()
+            .map(|(s, noted)| {
                 let us = |kernel| {
                     measured
                         .iter()
                         .find(|(shape, k, ..)| shape == s && *k == kernel)
                         .map_or(f64::NAN, |&(.., ns, _)| ns / 1e3)
                 };
-                let pick = chosen.as_ref().map(|c| c.pick(*s, 0));
+                let pick = chosen
+                    .as_ref()
+                    .map_or(noted.candidates.first().copied().unwrap_or(0), |c| {
+                        c.pick(*s, 0, &noted.candidates)
+                    });
+                let times: Vec<String> = noted
+                    .candidates
+                    .iter()
+                    .map(|&kernel| format!("{kernel:08x} {:.1} us", us(kernel)))
+                    .collect();
                 format!(
-                    "{:?} {}x{} m{}: step {:.1} us skinny / {:.1} us turned -> {:?}",
+                    "{:?} {}x{} m{}: step {} -> {pick:08x}",
                     s.kind,
                     s.rows,
                     s.k,
                     s.m,
-                    us(kernels_cuda::linear::routes::Kernel::Skinny),
-                    us(kernels_cuda::linear::routes::Kernel::Turned),
-                    pick.unwrap_or(kernels_cuda::linear::routes::Kernel::Skinny),
+                    times.join(" / "),
                 )
             })
             .collect();

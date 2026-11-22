@@ -1038,16 +1038,15 @@ impl Shell {
 
     /// The decode products `wanted` names, each timed in its real
     /// neighbourhood: for each shape (by rows, ascending), its bucket's
-    /// bodies armed with that bank on the skinny kernel and then on the
-    /// turned kernel (the other buckets' kept armed)
+    /// bodies armed with that bank on each of its candidate kernels in turn
+    /// (the other buckets' kept armed)
     /// (every bank decided before it as decided), and the decode body of its
     /// rows (that many one-row lanes) replayed [`BODY_ROUNDS`] rounds of
-    /// [`BODY_FIRES`] fires under each. The faster past the rounds'
+    /// [`BODY_FIRES`] fires under each. The fastest past the rounds'
     /// interquartile spread is kept for the shapes after it; equal within
-    /// it, the skinny kernel. The table the bodies end armed under is laid
+    /// it, the stated candidate (`profile::routes`). The table the bodies end armed under is laid
     /// on the context. What it measured: each shape under each kernel, the
     /// step's median ns and spread.
-    #[cfg(feature = "rocm")]
     pub(super) fn routes_by_body(
         &mut self,
         base: std::sync::Arc<kernels_cuda::linear::routes::Routes>,
@@ -1056,18 +1055,32 @@ impl Shell {
             kernels_cuda::linear::routes::Wanted,
         >,
     ) -> Result<crate::rates::ProductTimes> {
-        use kernels_cuda::linear::routes::Kernel;
         // A load that decodes nothing chooses no decode product's kernel.
         if self.decoding.iter().next().is_none() {
             return Ok(Vec::new());
         }
-        let mut shapes: Vec<_> = wanted.keys().copied().collect();
+        // A shape is timed by the decode body of its rows: one at rows no
+        // decode body carries (a prefill's or a mixed fire's) keeps its
+        // stated kernel, unmeasured.
+        let targets = self
+            .lattice_targets()
+            .map_or_else(Vec::new, |lattice| lattice.targets);
+        let timable = |m: u32| {
+            timing_target(
+                targets
+                    .iter()
+                    .map(|(bucket, target, treatment)| (*bucket, target, treatment.rs)),
+                m,
+            )
+            .is_some()
+        };
+        let mut shapes: Vec<_> = wanted.keys().copied().filter(|s| timable(s.m)).collect();
         shapes.sort_by_key(|s| (s.m, s.rows, s.k));
         let mut decided = base;
         let mut measured = Vec::new();
         for shape in shapes {
             let mut times = Vec::new();
-            for kernel in [Kernel::Skinny, Kernel::Turned] {
+            for &kernel in &wanted[&shape].candidates {
                 self.device
                     .set_routes(std::sync::Arc::new(decided.forcing(shape, kernel)));
                 // A product's rows in a body are its bucket's: only that
@@ -1081,7 +1094,7 @@ impl Shell {
             measured.extend(entries);
         }
         self.device.set_routes(decided);
-        let mut buckets: Vec<u32> = wanted.keys().map(|s| s.m).collect();
+        let mut buckets: Vec<u32> = wanted.keys().map(|s| s.m).filter(|&m| timable(m)).collect();
         buckets.dedup();
         for bucket in buckets {
             self.rearm_bucket(bucket)?;
@@ -1094,7 +1107,6 @@ impl Shell {
     /// armed one), replayed: its median ns a fire over [`BODY_ROUNDS`]
     /// rounds and their interquartile spread. Every timed fire must replay
     /// the body (none walks eagerly).
-    #[cfg(feature = "rocm")]
     fn time_decode_body(&mut self, m: u32) -> Result<(f64, f64)> {
         let targets = self
             .lattice_targets()
@@ -1145,7 +1157,6 @@ impl Shell {
 
     /// Bucket `bucket`'s bodies forgotten and armed again, the other
     /// buckets' kept: a re-arm allowed what the load's own arming took.
-    #[cfg(feature = "rocm")]
     fn rearm_bucket(&mut self, bucket: u32) -> Result<()> {
         self.cache.forget_bodies_at(bucket);
         self.arm_only = Some(bucket);
@@ -2490,13 +2501,11 @@ fn timing_target<'a, R: Copy>(
 
 /// Rounds a decode body is timed in (`Shell::routes_by_body`): the median
 /// kept, the interquartile range the spread a choice must clear.
-#[cfg(feature = "rocm")]
-const BODY_ROUNDS: usize = 9;
+const BODY_ROUNDS: usize = if cfg!(feature = "rocm") { 9 } else { 5 };
 
 /// Fires a round of a decode body's timing: each replayed and waited on, as
 /// a serving step is.
-#[cfg(feature = "rocm")]
-const BODY_FIRES: usize = 20;
+const BODY_FIRES: usize = if cfg!(feature = "rocm") { 20 } else { 10 };
 
 /// Whether bodies weighing `bytes` have spent an allowance of `allowance`:
 /// past it, not at it. A re-arm is allowed exactly what the arming before it
