@@ -62,6 +62,10 @@ pub struct PlannerStats {
     /// of room only the target's rise gives back
     /// ([`super::PoolPort::held_back`]), the policy asked meanwhile.
     pub target_waits: AtomicU64,
+    /// Steps a pass forced by the simulation's check took on a settled
+    /// step: a wake the planner was never given.
+    #[cfg(test)]
+    pub lost_wakes: AtomicU64,
     /// Processes moved out while restored (or bound) for a head and not
     /// fired since: each a restore the planner made for nothing, the
     /// churn a victim chosen before it ran makes

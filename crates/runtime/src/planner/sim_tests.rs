@@ -1073,6 +1073,8 @@ struct Coverage {
     /// asked while the map named moves among them): counted, the waits on
     /// something in flight among them failed by name.
     quiet_waits: u64,
+    /// Steps a pass forced on a settled step took that no wake had planned.
+    lost_wakes: u64,
     restores: u64,
     eviction_tier_full: u64,
     tier_full_refused: u64,
@@ -1103,6 +1105,7 @@ impl Coverage {
         self.evictions += other.evictions;
         self.evicted_unfired += other.evicted_unfired;
         self.quiet_waits += other.quiet_waits;
+        self.lost_wakes += other.lost_wakes;
         self.restores += other.restores;
         self.eviction_tier_full += other.eviction_tier_full;
         self.tier_full_refused += other.tier_full_refused;
@@ -2028,7 +2031,24 @@ fn check(ctx: &Ctx, step: u32) -> Result<Vec<Failure>, Failure> {
     let planner = &ctx.planner;
     planner.with_inner(|inner| inner.stall_dumped = None);
     *planner.settled_at.lock() = None;
-    let before = planner.generation();
+    // A step the planner takes: a serve, an eviction or a compaction
+    // begun, a restore sent.
+    let moves = || {
+        let stats = &planner.stats;
+        (
+            stats.serves.load(Ordering::Relaxed),
+            stats.evictions_started.load(Ordering::Relaxed),
+            stats.compaction_waits.load(Ordering::Relaxed),
+            planner.with_inner(|inner| {
+                inner
+                    .procs
+                    .values()
+                    .filter(|proc| proc.state == super::proc::Residency::Restoring)
+                    .count()
+            }),
+        )
+    };
+    let before = moves();
     let queue = planner.debug_queue();
     let ended = planner.with_inner(|inner| {
         inner.unmet_head().map(|(key, _)| {
@@ -2042,7 +2062,11 @@ fn check(ctx: &Ctx, step: u32) -> Result<Vec<Failure>, Failure> {
     // forced on it that takes a step took one an event should have woken
     // the planner for, and none did (a lost wakeup: the field waits on the
     // next unrelated event, or for good).
-    if passed.is_ok() && planner.generation() != before && LOST_WAKES_FAIL {
+    let lost = passed.is_ok() && moves() != before;
+    if lost {
+        planner.stats.lost_wakes.fetch_add(1, Ordering::Relaxed);
+    }
+    if lost && LOST_WAKES_FAIL {
         return Err(fail(
             "lost wake",
             format!(
@@ -2333,6 +2357,7 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
     coverage.evictions = stats.evictions.load(Ordering::Relaxed);
     coverage.evicted_unfired = stats.evicted_unfired.load(Ordering::Relaxed);
     coverage.quiet_waits = stats.quiet_waits.load(Ordering::Relaxed);
+    coverage.lost_wakes = stats.lost_wakes.load(Ordering::Relaxed);
     coverage.restores = stats.restores.load(Ordering::Relaxed);
     coverage.eviction_tier_full = stats.eviction_tier_full.load(Ordering::Relaxed);
     coverage.host_swap_full = stats.host_swap_exhaustions.load(Ordering::Relaxed);
