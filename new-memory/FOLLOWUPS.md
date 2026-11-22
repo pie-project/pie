@@ -1070,3 +1070,16 @@ write. Measured alternatives that did not help: fencing only the reads the write
 from (c1 244.4, c4 723), and passing the barrier through the write's update instead of the pool
 (c1 243, c4 723). To revisit with an ordering that keeps the reads fused: the pre-write values
 read inside the fused op that writes, or a fence on only the overwritten version's last read.
+
+## F50. XLA's pooled expert matmul runs 1.5–3% slower in a MoE decode fire than held banks, though at parity alone (v6e, found 2026-11-22)
+
+With streamed expert banks the grouped matmul reads each expert from the pool (`Gmm::pooled`, a
+table of expert rows and the pool in the bank's place). Alone (`time_a_pooled_select`, the MoE
+mini's shapes: 16 experts, n 768 k 2048 and n 2048 k 768, 512 and 2048 routed rows) it is at
+parity with the dense bank (e.g. 95.2 vs 94.5 us). In the served decode fire it is not:
+qwen3-30b-a3b-mini decode, held vs streamed, c64 42.9k vs 41.7k tok/s (−2.8%), c256 107.5k vs
+106.0k (−1.6%); vs main (which holds them) c64 −1.3%, c256 −3.1%. xprof at c256: held calls run
+gate ~29, up ~59, down ~28 us; pooled calls a uniform ~45 us (+75 us a step). Suspected: the
+expert DMA's overlap with neighbouring ops in the fire (the held up call's 59 us looks like a
+wait on its weight copy that the pooled form spreads), or reads off the 4.5M-row pool. Next: a
+profile of the pooled call's DMA waits in the fire, and the same fire's schedule held vs pooled.
