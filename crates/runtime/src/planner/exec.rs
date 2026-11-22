@@ -210,6 +210,12 @@ async fn compact_lists(
     let Some(txn) = prepared else {
         return Err("no chunk of the plan empties now".into());
     };
+    tracing::debug!(
+        pages = txn.page_count(),
+        chunks = ?txn.chunks(),
+        fenced = fenced.len(),
+        "planner: a list compaction copies its pages device to device"
+    );
     let (from, to) = txn.copy_plan();
     let copy = TierMove {
         kind: TierKind::kv(txn.shape()),

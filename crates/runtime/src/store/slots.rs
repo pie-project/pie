@@ -1804,16 +1804,6 @@ impl SlotPool {
         stretches.sort_unstable_by(|a, b| b.cmp(a));
         stretches.truncate(5);
         let compaction = self.plan_compaction(run).map(|moves| moves.len());
-        let dbg_chunks: Vec<String> = self
-            .chunks
-            .iter()
-            .enumerate()
-            .filter(|(_, meta)| meta.shape != NO_SHAPE)
-            .map(|(logical, meta)| {
-                format!("{}:s{}c{}u{}", self.logical_to_physical[logical], meta.shape, meta.class, meta.used)
-            })
-            .collect();
-        eprintln!("DBGCHUNKS {dbg_chunks:?}");
         format!(
             "pool (scope: every chunk): run={run} committed={} reserved={} opened={} act={} \
              headroom={} free_any={free} free_open_for_state={open} \
@@ -1998,13 +1988,18 @@ impl SlotPool {
         Some(self.chunks[chunk as usize].shape).filter(|&shape| shape != NO_SHAPE)
     }
 
-    /// The chunks opened now for any of `shapes`, whatever they hold.
+    /// The bytes the chunks opened now for any of `shapes` hold free: their
+    /// unused slots, room no other shape takes until a chunk empties.
     #[must_use]
-    pub fn opened_of(&self, shapes: &[ShapeId]) -> u32 {
+    pub fn slack_of(&self, shapes: &[ShapeId]) -> u64 {
         self.chunks
             .iter()
             .filter(|meta| meta.shape != NO_SHAPE && shapes.contains(&meta.shape))
-            .count() as u32
+            .map(|meta| {
+                let shape = &self.shapes[meta.shape as usize].shape;
+                u64::from(shape.slots_per_chunk.saturating_sub(meta.used)) * shape.slot_bytes
+            })
+            .sum()
     }
 
     /// Slots `holder` holds references on.

@@ -135,6 +135,8 @@ pub(super) struct CapacityRead {
     pub(super) whole: u64,
     /// What every tier holds, each item once wherever it lies.
     pub(super) held: u64,
+    /// The room the guest shapes hold open that no state fills: not free.
+    pub(super) slack: u64,
     /// Of `held`, what only idle cache holds: free to the gate.
     pub(super) idle: u64,
     /// Of `held`, the second slots moves under way hold.
@@ -153,8 +155,14 @@ impl CapacityRead {
         self.end.saturating_sub(self.kv) + self.below + self.binding
     }
 
-    /// Every tier's room past what is held.
+    /// Every tier's room past what is held and the slack held open.
     fn free(&self) -> u64 {
+        self.free_of_state().saturating_sub(self.slack)
+    }
+
+    /// Every tier's room past what is held: the room the state leaves,
+    /// slack not counted.
+    fn free_of_state(&self) -> u64 {
         let taken = self
             .held
             .saturating_sub(self.idle)
@@ -189,15 +197,17 @@ impl CapacityRead {
             == 0
     }
 
-    /// What the free room falls short of the finisher's growth to its end
-    /// by, the finisher's own guest state counted free (its binds, its own
-    /// asks, take what they take; its moves change nothing): what no ask
-    /// but the finisher's may raise.
+    /// What the room the state leaves falls short of the finisher's growth
+    /// to its end by, the finisher's own guest state counted free (its
+    /// binds, its own asks, take what they take; its moves change nothing):
+    /// what no ask but the finisher's may raise. Read past the slack, which
+    /// a move may change (a park opening a chunk below): the gate holds
+    /// asks on the room past it, so no ask raises this.
     #[cfg(test)]
     pub(super) fn others_short(&self) -> u64 {
         self.end
             .saturating_sub(self.kv)
-            .saturating_sub(self.free() + self.guest)
+            .saturating_sub(self.free_of_state() + self.guest)
     }
 }
 

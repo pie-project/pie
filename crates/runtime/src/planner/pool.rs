@@ -547,13 +547,17 @@ pub enum RiseRoom {
 }
 
 /// Every tier's room and what is held in it, in one unit, kv pages
-/// ([`PoolPort::capacity_census`]). A kv page counts one slot wherever it
-/// lies (a move between tiers changes no count, and the free slots of
-/// partly used list chunks are room: a list compaction frees them whole,
-/// [`crate::store::kv::KvStore::plan_list_compaction`]); recurrent state
-/// its units as pages; guest state and tables the chunks their shapes hold
-/// open ([`crate::store::roles::Roles::chunks_held`]) and the disk chunks
-/// they park in, whole: room no other shape takes until it empties.
+/// ([`PoolPort::capacity_census`]). Each item of state counts one figure
+/// wherever it lies: a kv page one (the free slots of partly used list
+/// chunks are room: a list compaction frees them whole,
+/// [`crate::store::kv::KvStore::plan_list_compaction`]), guest state and
+/// tables their bytes as pages ([`crate::store::roles::Roles::footprint`]),
+/// recurrent state its units as pages. So a move between tiers changes no
+/// count of state; only new state raises `held`, and only state given back
+/// lowers it. Beside it, `slack`: the room the guest shapes hold open that
+/// no state fills (their chunks' unused slots, the disk chunks parked parts
+/// take past their bytes), room no other shape takes until it empties, so
+/// not free.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CapacityCensus {
     /// Every tier's chunks for state, as pages: the device's under its
@@ -561,6 +565,8 @@ pub struct CapacityCensus {
     pub whole: u64,
     /// What every tier holds, each item once.
     pub held: u64,
+    /// Room held open that no state fills: not free, and no state.
+    pub slack: u64,
     /// Of `held`, what only idle cache holds: free to the gate (the
     /// policy lets it go under pressure).
     pub idle: u64,
@@ -1408,9 +1414,13 @@ impl PoolPort for RegistryPool {
 
     fn capacity_census(&self) -> Option<CapacityCensus> {
         let stores = crate::store::registry::try_get(self.model, self.engine)?;
-        let (state_chunks, per_chunk) = {
+        let (state_chunks, per_chunk, chunk_bytes) = {
             let shared = stores.shared.as_ref()?.lock().unwrap();
-            (shared.state_chunks_now(), shared.list_slots_for_chunks(1))
+            (
+                shared.state_chunks_now(),
+                shared.list_slots_for_chunks(1),
+                shared.pool().chunk_bytes(),
+            )
         };
         if per_chunk == 0 {
             return None;
@@ -1421,14 +1431,18 @@ impl PoolPort for RegistryPool {
         });
         let kv = self.with_kv_tagged("planner-capacity-census", |kv| kv.census());
         let disk_chunks = u64::from(kv.disk_slots) / per_chunk;
-        let roles = stores
-            .roles
-            .as_ref()
-            .map_or(0, |roles| roles.lock().unwrap().chunks_held());
+        let (footprint, on_disk, slack) = stores.roles.as_ref().map_or((0, 0, 0), |roles| {
+            let roles = roles.lock().unwrap();
+            (roles.footprint(), roles.footprint_on_disk(), roles.slack())
+        });
+        let pages = |bytes: u64| (bytes * per_chunk).div_ceil(chunk_bytes.max(1));
+        // The disk chunks parked parts take, past their bytes.
+        let disk_slack = (kv.guest_disk * chunk_bytes / per_chunk).saturating_sub(on_disk);
         let rs = self.rs_as_pages(self.with_rs(|rs| rs.census_units()));
         Some(CapacityCensus {
             whole: (u64::from(state_chunks) + u64::from(host_chunks) + disk_chunks) * per_chunk,
-            held: kv.held + roles * per_chunk + u64::from(rs),
+            held: kv.held + pages(footprint) + u64::from(rs),
+            slack: (slack + disk_slack) * per_chunk / chunk_bytes.max(1),
             idle: kv.idle,
             moving: kv.moving,
         })

@@ -211,7 +211,9 @@ impl ResidencyPlanner {
     /// emptiest, and sent where it empties what is still wanted. True
     /// where room came or a compaction is on its way.
     pub(super) fn compact_lists(self: &Arc<Self>, head: ProcessId, wanted: u32) -> bool {
-        if self.with_inner(|inner| inner.relocating.is_some()) {
+        if self.with_inner(|inner| inner.relocating.is_some())
+            || self.list_compaction_failed.load(Ordering::Acquire) == self.compaction_room()
+        {
             return false;
         }
         let before = self.port.free_chunks();
@@ -308,8 +310,15 @@ impl ResidencyPlanner {
             signal.notify_waiters();
         }
         match moved {
-            Ok(pages) => tracing::debug!(pages, "planner: a list compaction landed"),
-            Err(why) => tracing::debug!(%why, "planner: a list compaction moved nothing"),
+            Ok(pages) => {
+                self.list_compaction_failed.store(u64::MAX, Ordering::Release);
+                tracing::debug!(pages, "planner: a list compaction landed");
+            }
+            Err(why) => {
+                self.list_compaction_failed
+                    .store(self.compaction_room(), Ordering::Release);
+                tracing::debug!(%why, "planner: a list compaction moved nothing");
+            }
         }
         self.events.fetch_add(1, Ordering::AcqRel);
         self.pages_freed();
@@ -452,15 +461,22 @@ impl ResidencyPlanner {
         {
             shape = Some(head);
         }
-        // The whole chunks its placement leaves short, read before a forced
-        // pass sets the placement aside: what a list compaction frees.
+        // The whole chunks its placement lacks, read before a forced pass
+        // sets the placement aside: what it leaves short past the free
+        // chunks its own takes leave (those stand short as runs only, which
+        // a chunk compaction lays), what a list compaction frees.
         let placed_short: Option<u32> = placement.as_ref().map(|placement| {
-            placement
+            let short: u32 = placement
                 .short
                 .entries()
                 .iter()
                 .map(|&(run, pieces)| run.saturating_mul(pieces))
-                .sum()
+                .sum();
+            let left = self
+                .port
+                .free_chunks()
+                .saturating_sub(u32::try_from(placement.opened.len()).unwrap_or(u32::MAX));
+            short.saturating_sub(left)
         });
         let placement = placement.filter(|_| !(mismatch || forced));
         if let Some(placement) = &placement {
@@ -512,7 +528,6 @@ impl ResidencyPlanner {
         if let Some(need) = shape.as_ref()
             && self.with_inner(|inner| inner.nothing_in_flight())
         {
-            // A restore's short is what its own takes leave short already.
             let wanted = placed_short.unwrap_or_else(|| {
                 need.entries()
                     .iter()
@@ -520,7 +535,6 @@ impl ResidencyPlanner {
                     .sum::<u32>()
                     .saturating_sub(self.port.free_chunks())
             });
-            eprintln!("DBGWANT wanted={wanted} placed_short={placed_short:?} need={need:?} free={} accum={}", self.port.free_chunks(), self.with_inner(|i| i.accum.len()));
             if wanted > 0 && self.compact_lists(victims.head_pid, wanted) {
                 self.plan_ended(victims.head, "a list compaction frees whole chunks", host_short, &[]);
                 self.note_short(victims.head, 0, 0);

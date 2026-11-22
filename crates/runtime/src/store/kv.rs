@@ -216,12 +216,14 @@ impl KvRelocateTxn {
 /// The kv pages held on every tier ([`KvStore::census`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct KvCensus {
-    /// Slots held anywhere: the device's list slots out, the host tier's,
-    /// and the disk's, the whole disk chunks parked guest parts take
-    /// among them ([`KvStore::take_disk_chunks`]). A page a move holds on
-    /// two tiers counts twice while the move is under way: both slots are
-    /// taken.
+    /// Pages held anywhere: the device's list slots out, the host tier's,
+    /// and the disk's slots less the whole disk chunks other state holds
+    /// (`guest_disk`). A page a move holds on two tiers counts twice while
+    /// the move is under way: both slots are taken.
     pub held: u64,
+    /// The disk slots whole disk chunks hold for parked guest parts
+    /// ([`KvStore::take_disk_chunks`]).
+    pub guest_disk: u64,
     /// Of `held`, the second slots of the pages moves hold on two tiers.
     pub moving: u64,
     /// Of those, the pages only idle cache holds, on every tier.
@@ -231,6 +233,9 @@ pub struct KvCensus {
 }
 
 pub struct KvStore {
+    /// The disk slots whole disk chunks hold for state other than kv
+    /// ([`Self::take_disk_chunks`]): a parked guest part's.
+    guest_disk_slots: u32,
     table: KvPageTable,
     /// The list shape's slots, one a page.
     pool: ShapePool<PhysicalKvPageId>,
@@ -526,6 +531,7 @@ impl KvStore {
             hints: HashMap::new(),
             reclaimable: std::cell::Cell::new(None),
             below_cached: std::cell::Cell::new(None),
+            guest_disk_slots: 0,
         }
     }
 
@@ -1328,6 +1334,7 @@ impl KvStore {
         let per_chunk = per_chunk.max(1);
         let firsts = self.disk_pool.try_alloc_aligned_runs(n, per_chunk)?;
         self.below_cached.set(None);
+        self.guest_disk_slots += firsts.len() as u32 * per_chunk;
         Some(firsts.into_iter().map(|slot| slot.0 / per_chunk).collect())
     }
 
@@ -1350,7 +1357,8 @@ impl KvStore {
         KvCensus {
             held: u64::from(self.pool.out())
                 + u64::from(self.host_pool.out())
-                + u64::from(disk_out),
+                + u64::from(disk_out.saturating_sub(self.guest_disk_slots)),
+            guest_disk: u64::from(self.guest_disk_slots),
             moving: self.table.moving_pages() as u64,
             idle: u64::from(self.table.device_pages_freed(&roots))
                 + u64::from(idle_host)
@@ -1403,11 +1411,6 @@ impl KvStore {
             if movable {
                 pages.push((location, id));
             } else {
-                if std::env::var_os("DBGLC").is_some() {
-                    let readers = self.table.device_pages_by_reader().into_iter().find(|(l, ..)| *l == location).map(|(.., r)| r);
-                    let owners: Option<Vec<_>> = readers.clone().flatten().map(|r| r.iter().map(|(ws, s)| (self.table.owner(*ws).ok().flatten(), *s)).collect());
-                    eprintln!("DBGLC chunk {chunk} page {id:?} unmovable readers={readers:?} owners={owners:?}");
-                }
                 *entry = None;
             }
         }
@@ -1593,6 +1596,9 @@ impl KvStore {
             .collect();
         self.disk_pool.release_runs(&firsts, per_chunk);
         self.below_cached.set(None);
+        self.guest_disk_slots = self
+            .guest_disk_slots
+            .saturating_sub(firsts.len() as u32 * per_chunk);
     }
 
     /// Parked sets' pages on the host going on down to disk, the sets of
@@ -2976,16 +2982,47 @@ impl KvStore {
     /// Reserved device pages no fire has touched, given back and taken
     /// again at once: the fullest partly filled list chunks first, so the
     /// chunks only they held stand free whole, with no copy. As many come
-    /// back as went.
+    /// back as went. Only where that frees more chunks than the take opens
+    /// again: else they stay as they are (taken again, they would free and
+    /// fill the same room on every ask).
     pub fn repack_reserved(&mut self, pages: Vec<PhysicalKvPageId>) -> Vec<PhysicalKvPageId> {
         let n = pages.len();
-        if n == 0 {
+        if n == 0 || self.repack_frees(&pages) == 0 {
             return pages;
         }
         self.pool.release_reserved(pages);
         self.pool
             .try_alloc_n(n)
             .expect("the slots just given back stand free")
+    }
+
+    /// The chunks [`Self::repack_reserved`] would free past those its take
+    /// opens again: the chunks only `pages` hold, less the fresh chunks the
+    /// pages need past the free slots of the chunks left.
+    fn repack_frees(&self, pages: &[PhysicalKvPageId]) -> u32 {
+        let Some((shared, shape)) = self.pool.shared_shape() else {
+            return 0;
+        };
+        let (spc, chunks) = shared.lock().unwrap().single_chunks(shape);
+        if spc == 0 {
+            return 0;
+        }
+        let base = self.pool.base();
+        let mut mine: HashMap<u32, u32> = HashMap::new();
+        for page in pages {
+            *mine.entry(page.0.saturating_sub(base) / spc).or_default() += 1;
+        }
+        let (mut emptied, mut room) = (0u32, 0u64);
+        for chunk in &chunks {
+            let held = mine.get(&chunk.logical).copied().unwrap_or(0);
+            if held == chunk.used {
+                emptied += 1;
+            } else {
+                room += u64::from(spc - chunk.used + held);
+            }
+        }
+        let opened = (pages.len() as u64).saturating_sub(room).div_ceil(u64::from(spc));
+        emptied.saturating_sub(u32::try_from(opened).unwrap_or(u32::MAX))
     }
 
     pub fn prepare_suspend(

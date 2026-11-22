@@ -2627,37 +2627,13 @@ fn replay_seed(seed: u64) -> Vec<Failure> {
 /// The failure shapes the simulation has found and the planner has not yet
 /// fixed, each with a seed that showed it (its regression test below,
 /// ignored until fixed). The fast sweep fails on any other shape; once a
-/// shape is fixed its entry goes and its test is no longer ignored.
-const KNOWN: [(&str, u64); 4] = [
-    // Every tier full, no idle cache: the device's chunks, the host's and
-    // the disk's all held, the fleet's state past all three, each resident
-    // a page short, every one's kv past the few swap slots left, the rest
-    // evicted and queued. A capacity deadlock admission lets in, not a wait
-    // the planner chose (seeds 3243, 93; 134 before the drain task ran the
-    // simulation's passes).
-    (
-        "stall allocation: placement none, moves some, host_short true, ended \"no room below for the head's own kv",
-        3243,
-    ),
-    (
-        "stall bind room: placement none, moves none, host_short false, ended \"every candidate blocked",
-        3591,
-    ),
-    (
-        "stall bind room: placement none, moves none, host_short true",
-        3243,
-    ),
-    // The same class: the swap tiers all but full (3 of 96 slots), ten
-    // residents blocked on room below, the device full of their kv.
-    (
-        "stall allocation: placement none, moves some, host_short false, ended \"no pick: the policy is asked",
-        2547,
-    ),
-];
+/// shape is fixed its entry goes and its test is no longer ignored. None
+/// now.
+const KNOWN: [(&str, u64); 0] = [];
 
 /// Shapes the simulation found and the runtime fixed, each seed's
 /// regression test run in the suite; the fast sweep fails on them again.
-const FIXED: [(&str, u64); 21] = [
+const FIXED: [(&str, u64); 34] = [
     // A bind's guest parts and its tables, rings or adapter each open a
     // fresh chunk, the refusal quoting the part short alone: served one
     // chunk, short again, a spin (seeds 1, 46, 4137, 4287). The refusal
@@ -2733,6 +2709,43 @@ const FIXED: [(&str, u64); 21] = [
     // beside a process said evicted, and its pair was taken anew under it
     // at the restore: another program's bind landed on the pair's old run.
     ("claims a bind of instance # (program #): Instance slots", 1348),
+    // Every tier full, no idle cache, the fleet's state past all three:
+    // a capacity deadlock admission let in. The gate keeps the finisher's
+    // headroom free on every tier together, counting held state once
+    // wherever it lies and the room the guest shapes hold open that no
+    // state fills (small slots' chunks, whole disk chunks of parked parts)
+    // as not free; a bind is weighed by the fresh chunks it opens (seeds
+    // 3243, 3591, 2547, 2771, 2292, 2144).
+    (
+        "stall allocation: placement none, moves some, host_short true, ended \"no room below for the head's own kv",
+        3243,
+    ),
+    (
+        "stall bind room: placement none, moves none, host_short false, ended \"every candidate blocked",
+        3591,
+    ),
+    ("stall bind room: placement none, moves none, host_short true", 3243),
+    (
+        "stall allocation: placement none, moves some, host_short false, ended \"no pick: the policy is asked",
+        2547,
+    ),
+    ("stall allocation", 2771),
+    ("stall restore", 2292),
+    ("liveness", 2144),
+    // Free list slots scattered across partly used list chunks, no whole
+    // chunk free for a bind's or a restore's runs: a list compaction moves
+    // the emptiest chunks' pages into the free slots of the rest, device to
+    // device, its readers fenced, and the chunks stand free whole (a bind
+    // of two single chunks, 4670; a restore of five, 2945; a restore of a
+    // run of two and four singles, its own gathered pages scattered and
+    // taken again the fullest chunks first, 2200; runs of two laid by the
+    // chunk compaction once the chunks stand free, 1610).
+    ("stall bind room", 4670),
+    ("stall restore", 2945),
+    ("stall restore", 2200),
+    ("stall bind room", 1610),
+    ("liveness", 731),
+    ("liveness", 4641),
 ];
 
 fn known(shape: &str) -> bool {
@@ -2879,15 +2892,64 @@ fn sim_seed_3392_a_waiter_s_guest_parts_park_with_its_kv_in_place() {
 }
 
 #[test]
-#[ignore = "known: a capacity deadlock across every tier (KNOWN[0])"]
 fn sim_seed_3243_every_tier_full_is_no_deadlock() {
-    regression(KNOWN[0]);
+    regression(FIXED[21]);
+    regression(FIXED[23]);
 }
 
 #[test]
-#[ignore = "known: a capacity deadlock across every tier (KNOWN[1])"]
 fn sim_seed_3591_residents_past_the_swap_left_are_no_deadlock() {
-    regression(KNOWN[1]);
+    regression(FIXED[22]);
+}
+
+#[test]
+fn sim_seed_2547_residents_a_page_short_are_no_deadlock() {
+    regression(FIXED[24]);
+}
+
+#[test]
+fn sim_seed_2771_guest_chunks_held_open_are_no_free_room() {
+    regression(FIXED[25]);
+}
+
+#[test]
+fn sim_seed_2292_a_restore_beside_full_tiers_is_served() {
+    regression(FIXED[26]);
+}
+
+#[test]
+fn sim_seed_2144_every_process_ends() {
+    regression(FIXED[27]);
+}
+
+#[test]
+fn sim_seed_4670_a_bind_of_whole_chunks_among_scattered_pages_is_compacted_for() {
+    regression(FIXED[28]);
+}
+
+#[test]
+fn sim_seed_2945_a_restore_of_whole_chunks_among_scattered_pages_is_compacted_for() {
+    regression(FIXED[29]);
+}
+
+#[test]
+fn sim_seed_2200_a_restore_s_run_among_scattered_gathered_pages_is_compacted_for() {
+    regression(FIXED[30]);
+}
+
+#[test]
+fn sim_seed_1610_a_bind_s_runs_of_two_are_laid_once_chunks_stand_free() {
+    regression(FIXED[31]);
+}
+
+#[test]
+fn sim_seed_731_every_process_ends() {
+    regression(FIXED[32]);
+}
+
+#[test]
+fn sim_seed_4641_every_process_ends() {
+    regression(FIXED[33]);
 }
 
 #[test]

@@ -570,3 +570,125 @@ fn rs_and_role_disk_takes_and_kv_run_together_without_deadlock() {
         }
     });
 }
+
+/// A list compaction: kv pages scattered across partly used list chunks
+/// (free list slots enough, no chunk free of them) move into the free slots
+/// of the fullest chunk, device to device, and the chunks they leave stand
+/// free whole; every page reads its new slot with its bytes, and a page a
+/// move holds stays where it lies.
+#[test]
+fn a_list_compaction_frees_whole_chunks_of_scattered_pages() {
+    use crate::store::chunks::ShapePool;
+    use crate::store::kv::hash::{Hash256, chain_slots, page_hash};
+    let facts = fixed_facts();
+    let seed: Hash256 = [7; 32];
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
+    let list = shared.lock().unwrap().list().unwrap();
+    let spc = list.slots_per_chunk as usize;
+    assert!(spc >= 4, "a list chunk holds a few pages");
+    let mut kv = KvStore::with_pool(ShapePool::shared(&shared, list), 0, 0, seed);
+    kv.set_tiers(list.id, None, 0);
+    kv.set_page_size(16);
+    // Three chunks filled, then all but a few pages of each given back:
+    // one page in the first, two in the second, three in the third.
+    let mut pages = kv.reserve_device_pages(3 * spc).unwrap();
+    let mut kept = Vec::new();
+    for at in 0..3 {
+        let rest: Vec<_> = pages.drain(..spc).collect();
+        let (keep, give): (Vec<_>, Vec<_>) =
+            rest.into_iter().enumerate().partition(|&(i, _)| i <= at);
+        kv.release_device_reservation(give.into_iter().map(|(_, page)| page).collect());
+        kept.extend(keep.into_iter().map(|(_, page)| page));
+    }
+    let spread: HashSet<usize> = kept.iter().map(|page| page.0 as usize / spc).collect();
+    assert_eq!(spread.len(), 3, "pages in each of three chunks");
+    let free_before = shared.lock().unwrap().pool().free_chunks();
+    let tokens: Vec<Vec<Option<Hash256>>> = chain_slots(&seed, None, 0, &(0..96).collect::<Vec<_>>())
+        .chunks(16)
+        .map(|page| page.iter().map(|h| Some(*h)).collect())
+        .collect();
+    let keys: Vec<Hash256> = tokens.iter().map(|page| page_hash(page)).collect();
+    let mut bytes = Bytes::default();
+    for (at, page) in kept.iter().enumerate() {
+        bytes.set(LIST, page.0, 900 + at as u64);
+    }
+    assert!(kv.import_cached_at(
+        &[],
+        tokens,
+        keys.clone(),
+        kept.iter().copied().map(KvPageBacking::Resident).collect(),
+    ));
+
+    // Two chunks wanted: the emptiest two empty into the third.
+    let plan = kv.plan_list_compaction(2, &|_, _| true).expect("a plan");
+    assert_eq!((plan.chunks.len(), plan.pages), (2, 3), "{plan:?}");
+    assert!(plan.readers.is_empty() && plan.parked.is_empty(), "idle cache: no reader");
+    // Not more than the free slots elsewhere take.
+    assert!(kv.plan_list_compaction(3, &|_, _| true).unwrap().chunks.len() == 2);
+    let txn = kv.prepare_relocate(&plan, &HashSet::new()).expect("a move");
+    // Pinned as a move's: a second plan finds nothing more to move.
+    assert!(kv.plan_list_compaction(1, &|_, _| true).is_none());
+    let (from, to) = txn.copy_plan();
+    let copy = TierMove {
+        kind: TierKind::kv(txn.shape()),
+        tier: DEVICE,
+        out: true,
+        device: from.clone(),
+        slots: to.clone(),
+        source: None,
+    }
+    .slot_copy(DEVICE)
+    .expect("a slot move");
+    assert_eq!((copy.src, copy.dst, copy.shape), (DEVICE, DEVICE, LIST));
+    for &(src, dst) in &copy.slots {
+        let value = bytes.device(LIST, src).expect("a page's bytes");
+        bytes.set(LIST, dst, value);
+    }
+    assert_eq!(kv.commit_relocate(txn).unwrap(), 3);
+    assert_eq!(
+        shared.lock().unwrap().pool().free_chunks(),
+        free_before + 2,
+        "the chunks emptied stand free whole"
+    );
+    let run = kv.cached_run(&keys);
+    assert_eq!(run.len(), 6);
+    let mut chunks_now = HashSet::new();
+    for (at, location) in run.iter().enumerate() {
+        let KvPageBacking::Resident(page) = kv.table().backing_at(location).unwrap() else {
+            panic!("resident");
+        };
+        chunks_now.insert(page.0 as usize / spc);
+        assert_eq!(bytes.device(LIST, page.0), Some(900 + at as u64), "page {at}");
+    }
+    assert_eq!(chunks_now.len(), 1, "every page in one chunk");
+}
+
+/// Pages gathered unwritten for a head, scattered across chunks, are taken
+/// again the fullest chunk first: the chunks only they held stand free, and
+/// as many pages come back.
+#[test]
+fn reserved_pages_repacked_free_the_chunks_only_they_held() {
+    use crate::store::chunks::ShapePool;
+    let facts = fixed_facts();
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
+    let list = shared.lock().unwrap().list().unwrap();
+    let spc = list.slots_per_chunk as usize;
+    let mut kv = KvStore::with_pool(ShapePool::shared(&shared, list), 0, 0, [3; 32]);
+    kv.set_tiers(list.id, None, 0);
+    // Three chunks filled at once, one page of each kept.
+    let pages = kv.reserve_device_pages(3 * spc).unwrap();
+    let (held, rest): (Vec<_>, Vec<_>) = pages
+        .into_iter()
+        .enumerate()
+        .partition(|(at, _)| at % spc == 0);
+    kv.release_device_reservation(rest.into_iter().map(|(_, page)| page).collect());
+    let held: Vec<PhysicalKvPageId> = held.into_iter().map(|(_, page)| page).collect();
+    let spread: HashSet<usize> = held.iter().map(|page| page.0 as usize / spc).collect();
+    assert_eq!(spread.len(), 3, "one page in each of three chunks");
+    let free_before = shared.lock().unwrap().pool().free_chunks();
+    let packed = kv.repack_reserved(held);
+    assert_eq!(packed.len(), 3);
+    assert_eq!(shared.lock().unwrap().pool().free_chunks(), free_before + 2);
+    let chunks: HashSet<usize> = packed.iter().map(|page| page.0 as usize / spc).collect();
+    assert_eq!(chunks.len(), 1);
+}

@@ -3131,28 +3131,57 @@ impl Roles {
         slots as u64 * slot_bytes
     }
 
-    /// The chunks the roles' shapes hold open on the device and on the
-    /// host tier, whatever share of them is used: a chunk of small slots
-    /// (tables, rings) or of runs of a class is room no other shape takes
-    /// until it empties, so the capacity gate counts it whole
-    /// (`planner::PoolPort::capacity_census`). Parked parts on the disk
-    /// tier lie in whole disk chunks the kv store counts.
+    /// The bytes every item holds together, wherever each lies
+    /// ([`Self::part_bytes`]), and those the binds on their way took: what
+    /// the capacity gate counts guest state and tables by
+    /// (`planner::PoolPort::capacity_census`). One figure on every tier: a
+    /// move of an item changes no count.
     #[must_use]
-    pub fn chunks_held(&self) -> u64 {
+    pub fn footprint(&self) -> u64 {
+        let device = self.device.lock().unwrap();
+        self.items
+            .values()
+            .flat_map(|item| &item.parts)
+            .map(|part| self.part_bytes(&device, part))
+            .sum::<u64>()
+            + self.on_way.1
+    }
+
+    /// The bytes the items parked on the disk tier hold
+    /// ([`Self::footprint`]'s share of them): what of the disk chunks they
+    /// take is theirs.
+    #[must_use]
+    pub fn footprint_on_disk(&self) -> u64 {
+        let device = self.device.lock().unwrap();
+        self.items
+            .values()
+            .filter(|item| matches!(item.tier, Tier::Disk))
+            .flat_map(|item| &item.parts)
+            .map(|part| self.part_bytes(&device, part))
+            .sum()
+    }
+
+    /// The bytes the roles' shapes hold open on the device and on the host
+    /// tier that no slot uses: a chunk of small slots (tables, rings) or of
+    /// runs of one class is room no other shape takes until it empties.
+    /// No item's state: the capacity gate counts it beside the state it
+    /// holds, as room that is not free (`planner::PoolPort::capacity_census`).
+    #[must_use]
+    pub fn slack(&self) -> u64 {
         let shapes: Vec<_> = [SlotRole::Instance, SlotRole::Channel, SlotRole::Adapter]
             .into_iter()
             .filter_map(|role| self.shapes.of(role).map(|shape| shape.pool))
             .collect();
-        let device = u64::from(self.device.lock().unwrap().pool().opened_of(&shapes));
+        let device = self.device.lock().unwrap().pool().slack_of(&shapes);
         let host = self
             .host
             .as_ref()
-            .map_or(0, |host| u64::from(host.lock().unwrap().pool().opened_of(&shapes)));
+            .map_or(0, |host| host.lock().unwrap().pool().slack_of(&shapes));
         device + host
     }
 
-    /// The bytes what `holder`'s binds took holds, wherever each lies
-    /// ([`Self::part_bytes`]): its items, and its binds on their way.
+    /// [`Self::footprint`] of what `holder`'s binds took: its items, and
+    /// its binds on their way.
     #[must_use]
     pub fn footprint_of(&self, holder: Holder) -> u64 {
         let device = self.device.lock().unwrap();
@@ -3192,14 +3221,11 @@ impl Roles {
     }
 
     /// `taken` is on its way: its bytes are counted until it is bound or
-    /// given back. The whole chunks they come to: what the capacity gate
-    /// weighs it by.
-    fn on_way_take(&mut self, taken: &mut Taken) -> u32 {
+    /// given back.
+    fn on_way_take(&mut self, taken: &mut Taken) {
         taken.bytes = self.taken_bytes(taken);
         *self.on_way.0.entry(taken.holder).or_default() += taken.bytes;
         self.on_way.1 += taken.bytes;
-        let chunk = self.device.lock().unwrap().pool().chunk_bytes().max(1);
-        u32::try_from(taken.bytes.div_ceil(chunk)).unwrap_or(u32::MAX)
     }
 
     /// The whole chunks of `on` the live parts of `parts` take.
@@ -3848,6 +3874,7 @@ pub fn take_bind(
         extents: binding.extents,
     };
     let mut roles = roles.lock().unwrap();
+    let free_before = roles.device.lock().unwrap().pool().free_chunks();
     let guest = roles.take_guest(&binding.channels, (pair, state), holder)?;
     let fresh = guest.fresh_runs();
     let mut taken = roles
@@ -3861,12 +3888,16 @@ pub fn take_bind(
         .map_err(|(error, opened)| roles.bind_short(error, fresh, opened))?;
     taken.holder = holder;
     roles.bind_taken_for(holder);
-    let added = roles.on_way_take(&mut taken);
+    roles.on_way_take(&mut taken);
+    let added = free_before.saturating_sub(roles.device.lock().unwrap().pool().free_chunks());
     drop(roles);
-    // What it added is new state ([`Roles::footprint`]), weighed in whole
-    // chunks: past what every tier keeps for the finisher
-    // (`gated`), the take goes back and the bind waits in the planner for
-    // the gate ([`crate::planner::ResidencyPlanner::capacity_holds_chunks`]).
+    // What it added: the fresh chunks it opened, its new state
+    // ([`Roles::footprint`]) and the room those chunks hold open past it
+    // ([`Roles::slack`]); slots it took in chunks open already add state
+    // and take as much slack, so none. Past what every tier keeps for the
+    // finisher (`gated`), the take goes back and the bind waits in the
+    // planner for the gate
+    // ([`crate::planner::ResidencyPlanner::capacity_holds_chunks`]).
     if let Some(holder) = holder
         && added > 0
         && gated(holder, added)
