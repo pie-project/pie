@@ -202,7 +202,134 @@ impl ResidencyPlanner {
         }
     }
 
+    /// A list compaction for `head`'s `wanted` whole chunks
+    /// ([`crate::store::kv::KvStore::plan_list_compaction`]): the pages the
+    /// planner gathered for its heads, unwritten, are taken again first,
+    /// the fullest chunks first (no copy: the chunks only they held stand
+    /// free at once); then one is planned over the pages of every resident
+    /// process with no fire in flight and every parked one, its chunks the
+    /// emptiest, and sent where it empties what is still wanted. True
+    /// where room came or a compaction is on its way.
+    pub(super) fn compact_lists(self: &Arc<Self>, head: ProcessId, wanted: u32) -> bool {
+        if self.with_inner(|inner| inner.relocating.is_some())
+            || self.list_compaction_failed.load(Ordering::Acquire) == self.compaction_room()
+        {
+            return false;
+        }
+        let before = self.port.free_chunks();
+        let gathered = self.with_inner(|inner| std::mem::take(inner.accum.lend()));
+        let wanted = if gathered.is_empty() {
+            wanted
+        } else {
+            let packed = self.port.repack_device(gathered);
+            self.with_inner(|inner| inner.accum.lend().extend(packed));
+            let freed = self.port.free_chunks().saturating_sub(before);
+            if freed > 0 {
+                tracing::debug!(
+                    %head,
+                    freed,
+                    "planner: the pages gathered for the heads are taken again, the fullest chunks first"
+                );
+                self.returns.given();
+                return true;
+            }
+            wanted
+        };
+        // Running ones with no fire in flight are fenced for it; parked
+        // ones, their state not moving, wait for it to restore.
+        let Some((running, parked)) = self.with_inner(|inner| {
+            inner.relocating.is_none().then(|| {
+                let mut running = super::PidSet::default();
+                let mut parked = super::PidSet::default();
+                for (pid, proc) in inner.procs.iter() {
+                    if inner.killing.contains(pid) || inner.evicting.contains_key(pid) {
+                        continue;
+                    }
+                    match proc.state {
+                        Residency::Resident if !proc.firing() || proc.bind_waiting => {
+                            running.insert(*pid);
+                        }
+                        Residency::Evicted if !inner.parked_moving.contains(pid) => {
+                            parked.insert(*pid);
+                        }
+                        _ => {}
+                    }
+                }
+                (running, parked)
+            })
+        }) else {
+            return false;
+        };
+        let may_move = |pid: ProcessId, suspended: bool| {
+            if suspended {
+                parked.contains(&pid)
+            } else {
+                running.contains(&pid)
+            }
+        };
+        let Some(plan) = self.port.plan_list_compaction(wanted, &may_move) else {
+            return false;
+        };
+        if (plan.chunks.len() as u32) < wanted {
+            tracing::debug!(
+                %head,
+                wanted,
+                emptiable = plan.chunks.len(),
+                "planner: a list compaction would empty too few chunks for the head"
+            );
+            return false;
+        }
+        self.with_inner(|inner| {
+            inner.relocating = Some(plan.readers.iter().chain(&plan.parked).copied().collect());
+        });
+        self.stats.list_compactions.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(
+            %head,
+            wanted,
+            chunks = ?plan.chunks,
+            pages = plan.pages,
+            readers = ?plan.readers,
+            parked = ?plan.parked,
+            "planner: a list compaction moves the emptiest list chunks' pages to free whole chunks"
+        );
+        super::exec::spawn_compact_lists(self.clone(), plan);
+        true
+    }
+
+    /// A list compaction ended, its pages moved or why none did: its
+    /// readers' fires run again, and the room it made is planned on.
+    pub(super) fn list_compaction_done(self: &Arc<Self>, moved: Result<usize, String>) {
+        let signals: Vec<_> = self.with_inner(|inner| {
+            let fenced = inner.relocating.take().unwrap_or_default();
+            fenced
+                .iter()
+                .filter_map(|pid| inner.procs.get(pid).map(|proc| proc.signal.clone()))
+                .collect()
+        });
+        for signal in signals {
+            signal.notify_waiters();
+        }
+        match moved {
+            Ok(pages) => {
+                self.list_compaction_failed.store(u64::MAX, Ordering::Release);
+                tracing::debug!(pages, "planner: a list compaction landed");
+            }
+            Err(why) => {
+                self.list_compaction_failed
+                    .store(self.compaction_room(), Ordering::Release);
+                tracing::debug!(%why, "planner: a list compaction moved nothing");
+            }
+        }
+        self.events.fetch_add(1, Ordering::AcqRel);
+        self.pages_freed();
+    }
+
     pub(super) fn plan_eviction(self: &Arc<Self>) {
+        // A list compaction on its way fences its readers: no eviction
+        // plans until it lands (it is in flight, and its room comes).
+        if self.with_inner(|inner| inner.relocating.is_some()) {
+            return;
+        }
         let Some(victims) = self.victim_set() else {
             return;
         };
@@ -334,6 +461,23 @@ impl ResidencyPlanner {
         {
             shape = Some(head);
         }
+        // The whole chunks its placement lacks, read before a forced pass
+        // sets the placement aside: what it leaves short past the free
+        // chunks its own takes leave (those stand short as runs only, which
+        // a chunk compaction lays), what a list compaction frees.
+        let placed_short: Option<u32> = placement.as_ref().map(|placement| {
+            let short: u32 = placement
+                .short
+                .entries()
+                .iter()
+                .map(|&(run, pieces)| run.saturating_mul(pieces))
+                .sum();
+            let left = self
+                .port
+                .free_chunks()
+                .saturating_sub(u32::try_from(placement.opened.len()).unwrap_or(u32::MAX));
+            short.saturating_sub(left)
+        });
         let placement = placement.filter(|_| !(mismatch || forced));
         if let Some(placement) = &placement {
             shape = Some(placement.short.clone());
@@ -374,6 +518,29 @@ impl ResidencyPlanner {
             }
             map
         });
+        // Short of whole chunks with free list slots scattered across
+        // partly used list chunks: moving the pages of the emptiest into
+        // the free slots of the rest frees them whole, no process leaving
+        // the device for it (a list compaction). Each chunk it frees counts
+        // as the chunks free now do; runs of adjacent chunks are then laid
+        // by the chunk compaction below, as for any free chunks. Only with
+        // nothing in flight: a move on its way changes the room first.
+        if let Some(need) = shape.as_ref()
+            && self.with_inner(|inner| inner.nothing_in_flight())
+        {
+            let wanted = placed_short.unwrap_or_else(|| {
+                need.entries()
+                    .iter()
+                    .map(|&(run, pieces)| run.saturating_mul(pieces))
+                    .sum::<u32>()
+                    .saturating_sub(self.port.free_chunks())
+            });
+            if wanted > 0 && self.compact_lists(victims.head_pid, wanted) {
+                self.plan_ended(victims.head, "a list compaction frees whole chunks", host_short, &[]);
+                self.note_short(victims.head, 0, 0);
+                return;
+            }
+        }
         // No eviction forms the head's runs (a chunk in every window holds
         // what no move off the device clears: a resident ranked above the
         // head, the head's own live parts, a shared item a resident holds,
@@ -960,7 +1127,14 @@ impl ResidencyPlanner {
                         // fired since: never moved back before it runs,
                         // while it can run.
                         // ([`Inner::unfired_protects`], its reads shared.)
-                        && !(proc.unfired && !proc.bind_waiting && !queued(*pid))
+                        // Asking for its first fire's room is part of
+                        // that fire: while anything is in flight it is
+                        // spared queued too, else a restore's first ask
+                        // left it a victim for the next head and it went
+                        // back down before it ran (the L40S at 3 GiB:
+                        // evictions 4017, restores 4012). With nothing in
+                        // flight it runs nothing, a victim like any other.
+                        && !(proc.unfired && !proc.bind_waiting && (!queued(*pid) || !quiet()))
                         // Restored past this head while it stood passed
                         // over: it fires before this head moves it again.
                         && proc.restored_past != Some(waiter.pid)
@@ -968,6 +1142,10 @@ impl ResidencyPlanner {
                         && !inner.prepare_blocked.contains(*pid)
                         // Being failed: it frees its pages as it ends.
                         && !inner.killing.contains(*pid)
+                        // Its pages move under a list compaction.
+                        && inner.settled_resident(**pid)
+                        // The finisher is no victim ([`super::inner::CapacityGate`]).
+                        && !inner.is_finisher(**pid)
                 })
                 .map(|(pid, proc)| Victim {
                     pid: *pid,
@@ -1052,7 +1230,13 @@ impl ResidencyPlanner {
                 // the victim set chose it (the one rule there).
                 let yields =
                     proc.idle || proc.held || proc.bind_waiting || quiet || !proc.firing();
+                // The finisher is no victim while it is the finisher
+                // ([`super::inner::CapacityGate`]): parked, the tiers'
+                // headroom kept for it served no one (the simulation's seed
+                // 72: the finisher evicted, every other ask held at the
+                // gate). The policy picks among the others.
                 if proc.state != Residency::Resident
+                    || inner.is_finisher(pid)
                     || inner.unfired_protects(pid)
                     || proc.restored_past == Some(head_pid)
                     || (proc.rank() <= head_rank && !yields)
@@ -1269,6 +1453,11 @@ impl ResidencyPlanner {
             let hoard = inner.accum.len() as u32;
             inner.queue.iter().find_map(|(&key, waiter)| {
                 if key == head_key || !waiter.is_unmet() {
+                    return None;
+                }
+                // Past what every tier keeps for the finisher: it waits
+                // on the gate ([`super::inner::CapacityGate`]).
+                if inner.capacity.is_some_and(|gate| gate.holds_waiter(waiter)) {
                     return None;
                 }
                 match &waiter.kind {

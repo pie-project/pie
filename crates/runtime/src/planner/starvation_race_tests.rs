@@ -6641,12 +6641,14 @@ fn a_victim_is_not_restored_before_its_head_nor_evicted_again_before_it_fires() 
         !members(&planner).contains(&victim),
         "restored for a waiting head and able to run: not moved back before it runs"
     );
-    // Waiting itself, behind the head (its lanes blocked on the planner):
-    // it cannot run, so the mark does not hold it, and no stall comes of it.
+    // Queued for its first fire's room while something is in flight: the
+    // ask is part of that fire, so the mark still holds it (else it went
+    // back down before it ran: the L40S at 3 GiB, evictions 4017, restores
+    // 4012).
     let own = planner.with_inner(|inner| inner.enqueue(victim, allocation(demand)));
     assert!(
-        planner.with_inner(|inner| !inner.unfired_protects(victim)),
-        "blocked on the head's progress: the mark does not hold it, the head not held"
+        planner.with_inner(|inner| inner.unfired_protects(victim)),
+        "queued for its first fire's room beside a fire in flight: still held"
     );
     planner.with_inner(|inner| {
         inner.queue.remove(&own);
@@ -6660,6 +6662,17 @@ fn a_victim_is_not_restored_before_its_head_nor_evicted_again_before_it_fires() 
         !members(&planner).contains(&victim),
         "nothing in flight: still able to run, not moved back before it runs"
     );
+    // Waiting itself with nothing in flight (its lanes blocked on the
+    // planner): it runs nothing, so the mark does not hold it, and no stall
+    // comes of it.
+    let own = planner.with_inner(|inner| inner.enqueue(victim, allocation(demand)));
+    assert!(
+        planner.with_inner(|inner| !inner.unfired_protects(victim)),
+        "blocked on the head's progress with nothing in flight: the mark does not hold it"
+    );
+    planner.with_inner(|inner| {
+        inner.queue.remove(&own);
+    });
     // Able to run again, then fired once: a candidate for good.
     let running = planner.fire_in_flight(head);
     assert!(!members(&planner).contains(&victim));

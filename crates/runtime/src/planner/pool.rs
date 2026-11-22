@@ -546,6 +546,35 @@ pub enum RiseRoom {
     Past { need: u32, total: u32 },
 }
 
+/// Every tier's room and what is held in it, in one unit, kv pages
+/// ([`PoolPort::capacity_census`]). Each item of state counts one figure
+/// wherever it lies: a kv page one (the free slots of partly used list
+/// chunks are room: a list compaction frees them whole,
+/// [`crate::store::kv::KvStore::plan_list_compaction`]), guest state and
+/// tables their bytes as pages ([`crate::store::roles::Roles::footprint`]),
+/// recurrent state its units as pages. So a move between tiers changes no
+/// count of state; only new state raises `held`, and only state given back
+/// lowers it. Beside it, `slack`: the room the guest shapes hold open that
+/// no state fills (their chunks' unused slots, the disk chunks parked parts
+/// take past their bytes), room no other shape takes until it empties, so
+/// not free.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CapacityCensus {
+    /// Every tier's chunks for state, as pages: the device's under its
+    /// current rung, the host tier's and the disk tier's.
+    pub whole: u64,
+    /// What every tier holds, each item once.
+    pub held: u64,
+    /// Room held open that no state fills: not free, and no state.
+    pub slack: u64,
+    /// Of `held`, what only idle cache holds: free to the gate (the
+    /// policy lets it go under pressure).
+    pub idle: u64,
+    /// Of `held`, the second slots moves under way hold: room taken until
+    /// they land, though no state was added.
+    pub moving: u64,
+}
+
 pub trait PoolPort: Send + Sync + 'static {
     /// The device's chunks by shape.
     fn chunk_stats(&self) -> ChunkStats;
@@ -869,6 +898,39 @@ pub trait PoolPort: Send + Sync + 'static {
     fn state_chunks_most(&self) -> u32 {
         u32::MAX
     }
+    /// Every tier's room and what is held in it, in one unit, kv pages,
+    /// read now ([`CapacityCensus`]): what the capacity gate is read from
+    /// ([`super::inner::CapacityGate`]). `None` where the pool keeps no
+    /// chunks (the tests' own pools).
+    fn capacity_census(&self) -> Option<CapacityCensus> {
+        None
+    }
+    /// The device's list chunks a list compaction would empty for
+    /// `wanted` whole chunks, the processes `may_fence` names fenced for it
+    /// ([`crate::store::kv::KvStore::plan_list_compaction`]); `None` where
+    /// none empties, or the pool keeps no chunks.
+    fn plan_list_compaction(
+        &self,
+        wanted: u32,
+        may_move: crate::store::kv::MayMove<'_>,
+    ) -> Option<crate::store::kv::ListCompaction> {
+        let _ = (wanted, may_move);
+        None
+    }
+    /// The guest state and tables `pid`'s binds took, as pages counted as
+    /// [`CapacityCensus::held`] counts them; 0 where the pool keeps none.
+    fn guest_pages_of(&self, pid: ProcessId) -> u64 {
+        let _ = pid;
+        0
+    }
+    /// The kv pages one process may hold at most: the declared context
+    /// served ([`crate::store::registry::Stores::context_pages`]), the
+    /// capacity gate's end for a process that states none
+    /// ([`super::inner::CapacityGate`]). `None`: no gate (a pool of no
+    /// tiers' facts, as the tests' own).
+    fn context_pages(&self) -> Option<u32> {
+        None
+    }
     /// The chunks the governor's target holds back from state
     /// ([`crate::store::shared::SharedPool::held_back_chunks`]): room only
     /// the target's rise gives. 0 where none is held back.
@@ -905,6 +967,17 @@ pub trait PoolPort: Send + Sync + 'static {
         count: u32,
     ) -> Vec<crate::store::kv::page_table::PhysicalKvPageId>;
     fn release_device(&self, pages: Vec<crate::store::kv::page_table::PhysicalKvPageId>);
+    /// Device pages the planner holds unwritten (gathered for a head),
+    /// given back and taken again at once, the fullest partly filled list
+    /// chunks first ([`crate::store::kv::KvStore::repack_reserved`]): no
+    /// copy, and the chunks only they held stand free whole. As they were
+    /// where the pool keeps no chunks.
+    fn repack_device(
+        &self,
+        pages: Vec<crate::store::kv::page_table::PhysicalKvPageId>,
+    ) -> Vec<crate::store::kv::page_table::PhysicalKvPageId> {
+        pages
+    }
     fn reserve_rs(&self, need: RsUnits) -> Option<crate::store::rs::RsGrant>;
     fn release_rs(&self, grant: crate::store::rs::RsGrant);
     /// Drops the checkpoints sharing state with `working_sets` that their
@@ -1337,6 +1410,74 @@ impl PoolPort for RegistryPool {
         crate::store::registry::try_get(self.model, self.engine)
             .and_then(|stores| stores.shared)
             .map_or(u32::MAX, |shared| shared.lock().unwrap().state_chunks_most())
+    }
+
+    fn capacity_census(&self) -> Option<CapacityCensus> {
+        let stores = crate::store::registry::try_get(self.model, self.engine)?;
+        let (state_chunks, per_chunk, chunk_bytes) = {
+            let shared = stores.shared.as_ref()?.lock().unwrap();
+            (
+                shared.state_chunks_now(),
+                shared.list_slots_for_chunks(1),
+                shared.pool().chunk_bytes(),
+            )
+        };
+        if per_chunk == 0 {
+            return None;
+        }
+        let host_chunks = stores.host.as_ref().map_or(0, |host| {
+            let host = host.lock().unwrap();
+            host.pool().total_chunks().saturating_sub(host.pool().reserved_chunks())
+        });
+        let kv = self.with_kv_tagged("planner-capacity-census", |kv| kv.census());
+        let disk_chunks = u64::from(kv.disk_slots) / per_chunk;
+        let (footprint, on_disk, slack) = stores.roles.as_ref().map_or((0, 0, 0), |roles| {
+            let roles = roles.lock().unwrap();
+            (roles.footprint(), roles.footprint_on_disk(), roles.slack())
+        });
+        let pages = |bytes: u64| (bytes * per_chunk).div_ceil(chunk_bytes.max(1));
+        // The disk chunks parked parts take, past their bytes.
+        let disk_slack = (kv.guest_disk * chunk_bytes / per_chunk).saturating_sub(on_disk);
+        let rs = self.rs_as_pages(self.with_rs(|rs| rs.census_units()));
+        Some(CapacityCensus {
+            whole: (u64::from(state_chunks) + u64::from(host_chunks) + disk_chunks) * per_chunk,
+            held: kv.held + pages(footprint) + u64::from(rs),
+            slack: (slack + disk_slack) * per_chunk / chunk_bytes.max(1),
+            idle: kv.idle,
+            moving: kv.moving,
+        })
+    }
+
+    fn plan_list_compaction(
+        &self,
+        wanted: u32,
+        may_move: crate::store::kv::MayMove<'_>,
+    ) -> Option<crate::store::kv::ListCompaction> {
+        crate::store::registry::try_get(self.model, self.engine)?.shared.as_ref()?;
+        self.with_kv_tagged("planner-list-compaction", |kv| {
+            kv.plan_list_compaction(wanted, may_move)
+        })
+    }
+
+    fn guest_pages_of(&self, pid: ProcessId) -> u64 {
+        let Some(stores) = crate::store::registry::try_get(self.model, self.engine) else {
+            return 0;
+        };
+        let Some(roles) = stores.roles.as_ref() else {
+            return 0;
+        };
+        let bytes = roles.lock().unwrap().footprint_of(pid);
+        let chunk_bytes = stores
+            .shared
+            .as_ref()
+            .map_or(1, |shared| shared.lock().unwrap().pool().chunk_bytes().max(1));
+        (bytes * u64::from(self.chunks_as_pages(1))).div_ceil(chunk_bytes)
+    }
+
+    fn context_pages(&self) -> Option<u32> {
+        crate::store::registry::try_get(self.model, self.engine)
+            .map(|stores| u32::try_from(stores.context_pages).unwrap_or(u32::MAX))
+            .filter(|&pages| pages > 0)
     }
 
     fn held_back(&self) -> u32 {
@@ -1784,6 +1925,18 @@ impl PoolPort for RegistryPool {
         self.with_kv_tagged("planner-release", |kv| {
             kv.release_device_reservation(pages);
         });
+    }
+
+    fn repack_device(
+        &self,
+        pages: Vec<crate::store::kv::page_table::PhysicalKvPageId>,
+    ) -> Vec<crate::store::kv::page_table::PhysicalKvPageId> {
+        if crate::store::registry::try_get(self.model, self.engine)
+            .is_none_or(|stores| stores.shared.is_none())
+        {
+            return pages;
+        }
+        self.with_kv_tagged("planner-repack", |kv| kv.repack_reserved(pages))
     }
 
     fn reserve_rs(&self, need: RsUnits) -> Option<crate::store::rs::RsGrant> {

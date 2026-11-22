@@ -194,6 +194,15 @@ impl PoolShape {
         self.total.div_ceil(self.segment)
     }
 
+    /// What one process may hold at most, in kv pages: half the state
+    /// chunks and a tenth less a program's largest run, so it always fits
+    /// the pool alone. The pool's declared context (the capacity gate's end
+    /// for a process: none states its own).
+    fn most_pages(&self) -> u32 {
+        let largest_run = self.programs.iter().map(|p| p.run * 2).max().unwrap_or(0);
+        (self.state_chunks() * 3 / 5).saturating_sub(largest_run).max(2) * PAGES_PER_CHUNK
+    }
+
     /// State chunks: the total less the reserved chunk and the activation.
     fn state_chunks(&self) -> u32 {
         self.total - 1 - 2
@@ -267,7 +276,7 @@ impl PoolShape {
         let tiers = crate::store::shared::Tiers::of(&facts).unwrap();
         let engines = [crate::store::registry::EngineStores {
             pools: crate::store::chunks::StorePools::of(&facts).expect("shared facts"),
-            max_context: 4096,
+            max_context: self.most_pages() as usize * 16,
             shared: Some(device),
             tiers,
         }];
@@ -931,8 +940,8 @@ impl Workload {
         let state = pool.state_chunks();
         // What one process may hold at most: half the state chunks less a
         // program's largest run, so it always fits the pool alone.
-        let largest_run = pool.programs.iter().map(|p| p.run * 2).max().unwrap_or(0);
-        let most = (state * 3 / 5).saturating_sub(largest_run).max(2) * PAGES_PER_CHUNK;
+        let _ = state;
+        let most = pool.most_pages();
         let mut rescore_rng = Rng(seed ^ 0x7e5c_07e5);
         let count = rng.range(6, 32);
         let horizon = rng.range(4, 40);
@@ -1005,6 +1014,30 @@ impl Workload {
                 script.beams -= 1;
             }
             scripts.push(script);
+        }
+        // A crowd of plain decodes beside the rest (beams, binds, rescores)
+        // on the same small pool, drawn from a stream of its own: each must
+        // finish within the run's bound, never starved by the others'
+        // restores and binds (the L40S at 3 GiB: 0 of 150 decodes done in
+        // 553 s while beams verified).
+        let mut crowd_rng = Rng(seed ^ 0xc0_7d_de_c0);
+        if crowd_rng.chance(1, 4) {
+            for _ in 0..crowd_rng.range(12, 24) {
+                let mut script = Script {
+                    at: crowd_rng.range(0, horizon),
+                    prompt: crowd_rng.range(1, 4),
+                    decode: crowd_rng.range(20, 60),
+                    grow_every: crowd_rng.range(1, 3),
+                    beams: 1,
+                    bind: Vec::new(),
+                    idle: None,
+                    rescore: None,
+                };
+                while script.pages() > most && script.decode > 0 {
+                    script.decode -= 1;
+                }
+                scripts.push(script);
+            }
         }
         let mut tier_full = Vec::new();
         if rng.chance(1, 4) {
@@ -1316,6 +1349,9 @@ struct Log {
     checks: u64,
     pages_checked: u64,
     guest_slots_checked: u64,
+    /// The capacity gate's figures as the last step with nothing moving
+    /// between tiers read them.
+    capacity: Option<super::inner::CapacityRead>,
 }
 
 impl Ctx {
@@ -1662,6 +1698,7 @@ async fn bind(ctx: &Ctx, pid: ProcessId, program: u32) -> Result<InstanceId, Str
                     |_| false,
                     Some(pid),
                     |pid| ctx.planner.is_resident(pid),
+                    |pid, chunks| ctx.planner.capacity_holds_chunks(pid, chunks),
                 )
             })();
             let (roles, engine, binding) = (roles.clone(), engine.clone(), binding.clone());
@@ -1696,7 +1733,10 @@ async fn bind(ctx: &Ctx, pid: ProcessId, program: u32) -> Result<InstanceId, Str
             }
         },
         || Some(roles.lock().unwrap().room_watch()),
-        |run, pieces| roles.lock().unwrap().free_runs(run) >= pieces,
+        |run, pieces| {
+            roles.lock().unwrap().free_runs(run) >= pieces
+                && !planner.capacity_would_hold(pid, run.max(1).saturating_mul(pieces))
+        },
         |run, pieces| {
             let suspended = roles.lock().unwrap().holds_guest_state(pid)
                 && planner.suspend_for_room(pid, run, pieces);
@@ -1755,7 +1795,7 @@ fn take_bind_error(
 ) -> String {
     let mut engine = engine.lock().unwrap();
     let free_chunks = roles.lock().unwrap().free_runs(1);
-    match crate::store::roles::take_bind(Some(roles), &mut *engine, binding, |_| false, Some(pid), |_| true) {
+    match crate::store::roles::take_bind(Some(roles), &mut *engine, binding, |_| false, Some(pid), |_| true, |_, _| false) {
         Ok(taken) => {
             if let Some(taken) = taken {
                 roles.lock().unwrap().untake(taken);
@@ -1985,7 +2025,7 @@ const LOST_WAKES_FAIL: bool = false;
 
 /// The checks after a settled step: the processes refused since the last
 /// (the run goes on), or `Err`, the failure that ends it.
-fn check(ctx: &Ctx, step: u32) -> Result<Vec<Failure>, Failure> {
+fn check(ctx: &Ctx, step: u32, moving: bool) -> Result<Vec<Failure>, Failure> {
     let fail = |kind: &str, line: String| Failure {
         step,
         kind: kind.to_string(),
@@ -2007,6 +2047,44 @@ fn check(ctx: &Ctx, step: u32) -> Result<Vec<Failure>, Failure> {
         .next()
     {
         return Err(fail("quiet", format!("a wait chosen with nothing in flight: {ended}")));
+    }
+    // The capacity gate's invariant: every path that adds state goes
+    // through it, so every tier together keeps the finisher's headroom.
+    // The capacity gate's invariant: every path that adds state goes
+    // through it, so between two steps with nothing moving between tiers
+    // (a move holds its slots on both while its copies land), the same
+    // finisher and the same capacity, the tiers' free pages never fall
+    // further short of the finisher's headroom. A breach is named at the
+    // step it happens.
+    let moving = moving
+        || ctx.planner.with_inner(|inner| {
+            !inner.evicting.is_empty()
+                || inner.procs.values().any(|proc| {
+                    matches!(
+                        proc.state,
+                        super::proc::Residency::Evicting | super::proc::Residency::Restoring
+                    )
+                })
+        });
+    if !moving && let Some(read) = ctx.planner.capacity_read() {
+        let before = ctx.log.lock().unwrap().capacity.replace(read);
+        let short = read.others_short();
+        if let Some(before) = before
+            && before.finisher == read.finisher
+            && before.whole == read.whole
+            && short > before.others_short()
+        {
+            return Err(fail(
+                "capacity",
+                format!(
+                    "every tier together holds {} pages free, {short} short of the finisher \
+                     {}'s headroom, {} short the step before: {read:?}; before {before:?}",
+                    read.gate().free,
+                    read.finisher,
+                    before.others_short()
+                ),
+            ));
+        }
     }
     if let Some(refusal) = std::mem::take(&mut ctx.engine.lock().unwrap().refusals)
         .into_iter()
@@ -2321,7 +2399,7 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
         // The drain task's beat.
         planner.tick();
         quiesce(&ctx, &mut lane, &mut pending, step, workload.late).await;
-        match check(&ctx, step) {
+        match check(&ctx, step, !pending.is_empty()) {
             Ok(refused) => {
                 for failed in refused {
                     if !failures
@@ -2369,9 +2447,18 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
                 kind: "liveness".to_string(),
                 line: format!(
                     "{} of {total} processes still running {} steps after the last arrival; \
-                     stuck {stuck:?}; queue {}; evicting/in flight {}; copies pending {}; free chunks {}",
+                     stuck {stuck:?}; capacity gate {:?}; queue {}; evicting/in flight {}; copies \
+                     pending {}; free chunks {}",
                     total - ended,
                     step - last_arrival,
+                    planner.capacity_gate().map(|gate| {
+                        let state = planner.with_inner(|inner| {
+                            inner.procs.get(&gate.finisher).map(|proc| {
+                                format!("{:?} unfired={} bind_waiting={}", proc.state, proc.unfired, proc.bind_waiting)
+                            })
+                        });
+                        (gate, state)
+                    }),
                     planner.debug_queue(),
                     planner.with_inner(|inner| inner.evicting.len()),
                     pending.len(),
@@ -2540,37 +2627,13 @@ fn replay_seed(seed: u64) -> Vec<Failure> {
 /// The failure shapes the simulation has found and the planner has not yet
 /// fixed, each with a seed that showed it (its regression test below,
 /// ignored until fixed). The fast sweep fails on any other shape; once a
-/// shape is fixed its entry goes and its test is no longer ignored.
-const KNOWN: [(&str, u64); 4] = [
-    // Every tier full, no idle cache: the device's chunks, the host's and
-    // the disk's all held, the fleet's state past all three, each resident
-    // a page short, every one's kv past the few swap slots left, the rest
-    // evicted and queued. A capacity deadlock admission lets in, not a wait
-    // the planner chose (seeds 3243, 93; 134 before the drain task ran the
-    // simulation's passes).
-    (
-        "stall allocation: placement none, moves some, host_short true, ended \"no room below for the head's own kv",
-        3243,
-    ),
-    (
-        "stall bind room: placement none, moves none, host_short false, ended \"every candidate blocked",
-        3591,
-    ),
-    (
-        "stall bind room: placement none, moves none, host_short true",
-        3243,
-    ),
-    // The same class: the swap tiers all but full (3 of 96 slots), ten
-    // residents blocked on room below, the device full of their kv.
-    (
-        "stall allocation: placement none, moves some, host_short false, ended \"no pick: the policy is asked",
-        2547,
-    ),
-];
+/// shape is fixed its entry goes and its test is no longer ignored. None
+/// now.
+const KNOWN: [(&str, u64); 0] = [];
 
 /// Shapes the simulation found and the runtime fixed, each seed's
 /// regression test run in the suite; the fast sweep fails on them again.
-const FIXED: [(&str, u64); 21] = [
+const FIXED: [(&str, u64); 34] = [
     // A bind's guest parts and its tables, rings or adapter each open a
     // fresh chunk, the refusal quoting the part short alone: served one
     // chunk, short again, a spin (seeds 1, 46, 4137, 4287). The refusal
@@ -2646,6 +2709,43 @@ const FIXED: [(&str, u64); 21] = [
     // beside a process said evicted, and its pair was taken anew under it
     // at the restore: another program's bind landed on the pair's old run.
     ("claims a bind of instance # (program #): Instance slots", 1348),
+    // Every tier full, no idle cache, the fleet's state past all three:
+    // a capacity deadlock admission let in. The gate keeps the finisher's
+    // headroom free on every tier together, counting held state once
+    // wherever it lies and the room the guest shapes hold open that no
+    // state fills (small slots' chunks, whole disk chunks of parked parts)
+    // as not free; a bind is weighed by the fresh chunks it opens (seeds
+    // 3243, 3591, 2547, 2771, 2292, 2144).
+    (
+        "stall allocation: placement none, moves some, host_short true, ended \"no room below for the head's own kv",
+        3243,
+    ),
+    (
+        "stall bind room: placement none, moves none, host_short false, ended \"every candidate blocked",
+        3591,
+    ),
+    ("stall bind room: placement none, moves none, host_short true", 3243),
+    (
+        "stall allocation: placement none, moves some, host_short false, ended \"no pick: the policy is asked",
+        2547,
+    ),
+    ("stall allocation", 2771),
+    ("stall restore", 2292),
+    ("liveness", 2144),
+    // Free list slots scattered across partly used list chunks, no whole
+    // chunk free for a bind's or a restore's runs: a list compaction moves
+    // the emptiest chunks' pages into the free slots of the rest, device to
+    // device, its readers fenced, and the chunks stand free whole (a bind
+    // of two single chunks, 4670; a restore of five, 2945; a restore of a
+    // run of two and four singles, its own gathered pages scattered and
+    // taken again the fullest chunks first, 2200; runs of two laid by the
+    // chunk compaction once the chunks stand free, 1610).
+    ("stall bind room", 4670),
+    ("stall restore", 2945),
+    ("stall restore", 2200),
+    ("stall bind room", 1610),
+    ("liveness", 731),
+    ("liveness", 4641),
 ];
 
 fn known(shape: &str) -> bool {
@@ -2792,15 +2892,64 @@ fn sim_seed_3392_a_waiter_s_guest_parts_park_with_its_kv_in_place() {
 }
 
 #[test]
-#[ignore = "known: a capacity deadlock across every tier (KNOWN[0])"]
 fn sim_seed_3243_every_tier_full_is_no_deadlock() {
-    regression(KNOWN[0]);
+    regression(FIXED[21]);
+    regression(FIXED[23]);
 }
 
 #[test]
-#[ignore = "known: a capacity deadlock across every tier (KNOWN[1])"]
 fn sim_seed_3591_residents_past_the_swap_left_are_no_deadlock() {
-    regression(KNOWN[1]);
+    regression(FIXED[22]);
+}
+
+#[test]
+fn sim_seed_2547_residents_a_page_short_are_no_deadlock() {
+    regression(FIXED[24]);
+}
+
+#[test]
+fn sim_seed_2771_guest_chunks_held_open_are_no_free_room() {
+    regression(FIXED[25]);
+}
+
+#[test]
+fn sim_seed_2292_a_restore_beside_full_tiers_is_served() {
+    regression(FIXED[26]);
+}
+
+#[test]
+fn sim_seed_2144_every_process_ends() {
+    regression(FIXED[27]);
+}
+
+#[test]
+fn sim_seed_4670_a_bind_of_whole_chunks_among_scattered_pages_is_compacted_for() {
+    regression(FIXED[28]);
+}
+
+#[test]
+fn sim_seed_2945_a_restore_of_whole_chunks_among_scattered_pages_is_compacted_for() {
+    regression(FIXED[29]);
+}
+
+#[test]
+fn sim_seed_2200_a_restore_s_run_among_scattered_gathered_pages_is_compacted_for() {
+    regression(FIXED[30]);
+}
+
+#[test]
+fn sim_seed_1610_a_bind_s_runs_of_two_are_laid_once_chunks_stand_free() {
+    regression(FIXED[31]);
+}
+
+#[test]
+fn sim_seed_731_every_process_ends() {
+    regression(FIXED[32]);
+}
+
+#[test]
+fn sim_seed_4641_every_process_ends() {
+    regression(FIXED[33]);
 }
 
 #[test]

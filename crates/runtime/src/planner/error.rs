@@ -47,6 +47,13 @@ pub enum PlannerError {
         need: u32,
         room: crate::store::shared::PoolRoom,
     },
+    /// A process's end (the declared context, in kv pages: it states none
+    /// of its own) past what the device holds alone: as the finisher it
+    /// would grow there and never finish ([`super::inner::CapacityGate`]).
+    EndPastDevice {
+        end: u32,
+        room: crate::store::shared::PoolRoom,
+    },
     Hog {
         need: u32,
         held: u32,
@@ -101,6 +108,12 @@ impl std::fmt::Display for PlannerError {
                 f,
                 "allocation of {need} kv pages can never fit: {}",
                 room.describe(*need)
+            ),
+            PlannerError::EndPastDevice { end, room } => write!(
+                f,
+                "a process may grow to the declared context, {end} kv pages, and it states no \
+                 end of its own: that never fits the device alone, so it could never finish: {}",
+                room.describe(*end)
             ),
             PlannerError::Hog { need, held, total } => write!(
                 f,

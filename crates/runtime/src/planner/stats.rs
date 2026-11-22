@@ -54,6 +54,9 @@ pub struct PlannerStats {
     pub grow_waits: AtomicU64,
     /// Plans that ended waiting on a compaction of scattered free chunks.
     pub compaction_waits: AtomicU64,
+    /// List compactions sent: pages moved off partly used list chunks to
+    /// free them whole ([`super::ResidencyPlanner::compact_lists`]).
+    pub list_compactions: AtomicU64,
     /// Passes that chose a wait only something in flight could end, with
     /// nothing in flight: each a planner bug, said as one
     /// ([`super::ResidencyPlanner::plan_ended`]).
@@ -62,6 +65,9 @@ pub struct PlannerStats {
     /// of room only the target's rise gives back
     /// ([`super::PoolPort::held_back`]), the policy asked meanwhile.
     pub target_waits: AtomicU64,
+    /// Allocations held at the capacity gate: past what every tier keeps
+    /// for the finisher ([`super::inner::CapacityGate`]).
+    pub capacity_waits: AtomicU64,
     /// Steps a pass forced by the simulation's check took on a settled
     /// step: a wake the planner was never given.
     #[cfg(test)]
