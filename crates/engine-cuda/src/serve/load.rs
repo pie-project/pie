@@ -1568,6 +1568,9 @@ impl Shell {
             &schedule_streams(&boot.trace, &compiled),
             pools.ids_a_lane(),
             buffers.as_ref().map(crate::store::rs::Buffers::page_tokens),
+            // A beam's fork copies a page's rows of every kv plane the pool
+            // holds (`Pools::page_planes`).
+            pools.page_planes().len(),
             // A hybrid beam's fork copies a page's first rows of each
             // buffered plane (`BEAM-PAGE-LISTS.md` §11).
             buffers
