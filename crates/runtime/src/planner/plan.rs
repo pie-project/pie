@@ -742,6 +742,14 @@ impl ResidencyPlanner {
                 return None;
             };
             let pid = waiter.pid;
+            // The capacity gate's finisher is never passed over: the heads
+            // behind it (others' restores) took the room its moves made,
+            // kept something in flight, and two of them went round, each
+            // restored and evicted for the other 125 times while its bind
+            // waited (the field mix, seed 178).
+            if inner.is_finisher(pid) {
+                return None;
+            }
             (inner.nothing_in_flight()
                 && inner.parked_moving.is_empty()
                 && !inner.queue.values().any(Waiter::rise_untaken)

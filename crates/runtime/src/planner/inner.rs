@@ -812,6 +812,21 @@ impl Inner {
     /// ([`CapacityGate`]): its restore and its growth go first and are
     /// funded whatever is in flight, so the one process the tiers keep
     /// room for finishes while younger work runs on.
+    /// Whether the capacity gate holds an ask of `pid`'s: it fires only
+    /// once the ones ahead of it in the gate's order finish. Spared as one
+    /// restored and not fired since, it held the room they wait on while
+    /// the moves around it kept something in flight for good (the field
+    /// mix, seed 178: the finisher's bind of two adjacent chunks unserved
+    /// 2,400 steps, one move away).
+    pub(super) fn gate_holds(&self, pid: ProcessId) -> bool {
+        self.capacity.is_some_and(|gate| {
+            let place = self.capacity_allow.get(&pid).copied();
+            self.queue
+                .values()
+                .any(|waiter| waiter.pid == pid && waiter.is_unmet() && gate.holds_waiter(waiter, place))
+        })
+    }
+
     /// The gate and its order as a pass reads them
     /// ([`super::ResidencyPlanner::capacity_order`]).
     pub(super) fn set_capacity(
@@ -1006,9 +1021,11 @@ impl Inner {
     /// (seed 4139). A head no move serves while such a one holds its room
     /// is passed over ([`super::ResidencyPlanner::stuck_head`]).
     pub(super) fn unfired_protects(&self, pid: ProcessId) -> bool {
-        self.procs
-            .get(&pid)
-            .is_some_and(|proc| proc.unfired && !proc.bind_waiting)
+        !self.gate_holds(pid)
+            && self
+                .procs
+                .get(&pid)
+                .is_some_and(|proc| proc.unfired && !proc.bind_waiting)
             && (!self
                 .queue
                 .values()

@@ -598,6 +598,41 @@ impl ResidencyPlanner {
         let parking_down = !parked.is_empty() && self.park_down(victims.head_pid, parked);
         let (mut picks, unhostable) =
             self.quote_and_pick(candidates, wanted, room, victims.rs_pages, model, engine);
+        // The map named a move for the head's runs, but no candidate it
+        // names qualifies (each chunk of the cheapest holds a slot no pick
+        // moves, or its move found no room below): moving chunks is the
+        // way left, as where the map names none. Left to the policy, the
+        // finisher's bind of two adjacent chunks waited 2,000 steps with
+        // two free chunks a compaction would have laid side by side (the
+        // field mix, seed 178).
+        // The capacity gate's finisher only: every other head may wait on
+        // the policy's answer, the finisher's room is the mechanism's.
+        if picks.is_empty()
+            && !parking_down
+            && let Some((run, pieces)) = shape.as_ref().and_then(RunNeed::longest)
+            && self.with_inner(|inner| {
+                inner.nothing_in_flight() && inner.is_finisher(victims.head_pid)
+            })
+            && self.port.compaction_comes(
+                run,
+                if placement.is_some() {
+                    self.port.guest_free_runs(run).saturating_add(pieces)
+                } else {
+                    pieces
+                },
+            )
+        {
+            self.stats.compaction_waits.fetch_add(1, Ordering::Relaxed);
+            self.plan_ended(victims.head, "compaction asked", host_short, &[]);
+            tracing::debug!(
+                head = %victims.head_pid,
+                run,
+                pieces,
+                "planner: no pick forms the head's runs; a compaction moves chunks for them"
+            );
+            self.note_short(victims.head, 0, 0);
+            return;
+        }
         // An occupant with no kv or state to move (only guest scratch,
         // given back at its park) quotes nothing and is no pick by pages:
         // it is one all the same, or its chunk does not empty.
@@ -1144,7 +1179,13 @@ impl ResidencyPlanner {
                         // back down before it ran (the L40S at 3 GiB:
                         // evictions 4017, restores 4012). With nothing in
                         // flight it runs nothing, a victim like any other.
-                        && !(proc.unfired && !proc.bind_waiting && (!queued(*pid) || !quiet()))
+                        // One whose ask the capacity gate holds cannot fire
+                        // until those ahead of it finish: no spare for it
+                        // ([`Inner::gate_holds`]).
+                        && !(proc.unfired
+                            && !proc.bind_waiting
+                            && !inner.gate_holds(**pid)
+                            && (!queued(*pid) || !quiet()))
                         // Restored past this head while it stood passed
                         // over: it fires before this head moves it again.
                         && proc.restored_past != Some(waiter.pid)
