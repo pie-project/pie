@@ -10,7 +10,9 @@ use profile::fire::{MeasuredBy, Now};
 /// measured by: a change to how one is timed moves it, and every stored
 /// entry it keys is measured again.
 pub const RATES_METHOD: u32 = 1;
-pub const CURVE_METHOD: u32 = 1;
+/// v2: a curve's point is the fastest of its rounds, a point slower than
+/// both neighbours timed again (v1 took the median).
+pub const CURVE_METHOD: u32 = 2;
 
 /// This device as its measurements depend on it: its name and the OS
 /// release whose Metal compiler builds the kernels (a release, not a build:
