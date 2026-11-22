@@ -209,6 +209,14 @@ pub struct Shell {
     /// residency (`filed`, `copied`; `Shell::preseat_weights`), for a
     /// measuring load that seats them again in a range reserved anew.
     preseated_as: Option<(bool, bool)>,
+    /// What this load's stored measurements are keyed by.
+    keys: crate::stored::Keys,
+    /// The decode products' times the profile states under a matching key:
+    /// a load's measurement joins them before it is saved.
+    products: Vec<profile::fire::ProductTime>,
+    /// Whether the load times the decode products' kernels no layer states
+    /// (`[engine] measure`).
+    routes_measuring: engine::rates::Measuring,
     segments: std::collections::HashMap<record::BodyKey, Segmented>,
     windows_memo: Vec<prepare::WindowsMemo>,
     cache: GraphCache,

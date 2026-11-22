@@ -52,6 +52,7 @@ fn load_as(fixture: &Fixture, whole: bool, held: bool, checkpoint: &std::path::P
         },
         profiles: None,
         top: engine_metal::Top::EveryRung,
+        measure: engine::rates::Measuring::Time,
     })
     .and_then(|mut shell| shell.raise_whole().map(|()| shell))
     .unwrap_or_else(|why| panic!("the shell loads: {why}"))

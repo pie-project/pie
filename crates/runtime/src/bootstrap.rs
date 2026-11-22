@@ -750,7 +750,17 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             dir,
             engines: prints.join(";"),
             deployment: model_id.clone(),
+            committed: engine_configs
+                .iter()
+                .flat_map(|d| d.engine_backend.committed_covers().iter().copied())
+                .collect(),
         });
+    // Every engine skips measuring (`[engine] measure = false`): the host
+    // cover no layer states is taken by its estimate, not warm runs.
+    let cover_skipped = !engine_configs.is_empty()
+        && engine_configs
+            .iter()
+            .all(|d| d.engine_backend.skips_measuring());
     let readers: Vec<Option<::engine::HostRoom>> = engine_configs
         .iter()
         .map(|d| d.engine_backend.host_room())
@@ -1026,7 +1036,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     }
     // The host cover, measured through the ordinary pipeline before ready,
     // or read where an earlier boot measured it under the same key.
-    match host_cover(&name, warm_context, cover_cache.as_ref()).await {
+    match host_cover(&name, warm_context, cover_cache.as_ref(), cover_skipped).await {
         Ok(cover) => crate::scheduler::set_host_cover(cover),
         Err(error) => {
             tracing::error!(%error, "measuring the host cover at load");
@@ -1067,8 +1077,21 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
 /// runs' context. Not the runtime's build: a build that changes none of
 /// those reuses the cover. `cache` is `None` where an engine states no
 /// fingerprint: the cover is measured.
-async fn host_cover(model: &str, context: usize, cache: Option<&CoverCache>) -> Result<usize> {
+/// Looked up the home's own cache first, then the covers committed for the
+/// engines' devices (`::engine::Engine::committed_covers`, the same entries
+/// under the same key), then measured; where every engine skips measuring
+/// (`skipped`, `[engine] measure = false`), the estimate in place of the
+/// warm runs ([`cover_estimate`]), said by name and kept nowhere.
+async fn host_cover(
+    model: &str,
+    context: usize,
+    cache: Option<&CoverCache>,
+    skipped: bool,
+) -> Result<usize> {
     let Some(cache) = cache else {
+        if skipped {
+            return Ok(cover_estimate("no engine keys the cover"));
+        }
         return measure_host_cover(model, context).await.map(|(cover, ..)| cover);
     };
     let reference = program::ProgramRef::parse("compat-openai")?;
@@ -1105,6 +1128,20 @@ async fn host_cover(model: &str, context: usize, cache: Option<&CoverCache>) -> 
             return Ok(cover);
         }
     }
+    if let Some(held) = cache.committed.iter().find_map(|text| committed_cover(text, &key)) {
+        tracing::info!(
+            cover = held.cover,
+            frame_us = held.frame_us,
+            turnaround_us = held.turnaround_us,
+            "the host cover, committed for the engines' devices under this key; nothing measured"
+        );
+        return Ok(held.cover);
+    }
+    if skipped {
+        return Ok(cover_estimate(
+            "neither the home's cache nor a committed cover holds this key",
+        ));
+    }
     let (cover, frame_us, turnaround_us) = measure_host_cover(model, context).await?;
     let held = serde_json::json!({
         "key": key,
@@ -1128,6 +1165,51 @@ struct CoverCache {
     engines: String,
     /// The model the cover's warm runs serve.
     deployment: String,
+    /// The covers committed for the engines' devices: each file's text.
+    committed: Vec<&'static str>,
+}
+
+/// One kept host cover, as the cache and a committed file state it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HeldCover {
+    pub cover: usize,
+    pub frame_us: f64,
+    pub turnaround_us: f64,
+}
+
+/// The entry of `text` (a committed covers file: a JSON list of the cache's
+/// entries) whose key is `key`, where it holds one.
+#[must_use]
+pub fn committed_cover(text: &str, key: &str) -> Option<HeldCover> {
+    let all: Vec<serde_json::Value> = serde_json::from_str(text).ok()?;
+    all.iter()
+        .find(|entry| entry.get("key").and_then(serde_json::Value::as_str) == Some(key))
+        .and_then(|entry| {
+            let field = |name: &str| entry.get(name).and_then(serde_json::Value::as_f64);
+            Some(HeldCover {
+                cover: field("cover")? as usize,
+                frame_us: field("frame_us")?,
+                turnaround_us: field("turnaround_us")?,
+            })
+        })
+}
+
+/// The host cover where every engine skips measuring and no layer states
+/// it: the frames the scheduler dispatches ahead at most
+/// (`scheduler::configured_dispatch_depth`). A cover is a guest turnaround
+/// over one frame's device time; one too small leaves the device idle
+/// between frames, one too large costs only window, never a result, so the
+/// most the dispatch depth allows is the estimate that never idles the
+/// device. Said by name.
+fn cover_estimate(why: &str) -> usize {
+    let cover = crate::scheduler::configured_dispatch_depth().max(1);
+    tracing::info!(
+        cover,
+        "the host cover: skipped (`[engine] measure = false`; {why}), served by the estimate: \
+         the frames dispatched ahead at most, so no turnaround idles the device (a cover too \
+         large costs window, never a result); no warm runs, kept nowhere"
+    );
+    cover
 }
 
 async fn measure_host_cover(model: &str, context: usize) -> Result<(usize, f64, f64)> {

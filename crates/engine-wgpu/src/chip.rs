@@ -1,5 +1,6 @@
 //! The wgpu registry and the profile one load resolves. A browser masks the
-//! adapter, so there are no checked-in profiles.
+//! adapter, so there are no checked-in decision profiles; a native
+//! adapter's committed measured profile is listed in [`SEEDED`].
 
 use std::path::Path;
 use std::sync::LazyLock;
@@ -20,9 +21,29 @@ pub fn registry() -> &'static Registry {
     &REGISTRY
 }
 
+/// The committed measured profiles of adapters native wgpu serves
+/// (`profiles/<device>.measured.toml`, `pie tune export --engine wgpu`),
+/// each listed here as `"<device>.measured.toml"`: a browser's masked
+/// adapter matches none. No decision profile is checked in.
+macro_rules! seeded {
+    ($($file:literal),* $(,)?) => {
+        pub const SEEDED: &[(&str, &str)] = &[
+            $(($file, include_str!(concat!("../profiles/", $file)))),*
+        ];
+    };
+}
+
+seeded!();
+
+/// The host covers committed for the adapters native wgpu serves
+/// (`profiles/<device>.covers.json`, `pie tune export --engine wgpu`), each
+/// listed here: the runtime takes a cover whose key matches where the
+/// home's own cache holds none (`engine::Engine::committed_covers`).
+pub const COVERS: &[&str] = &[];
+
 pub static SHELF: Shelf = Shelf {
     backend: "wgpu",
-    seeded: &[],
+    seeded: SEEDED,
     derived: None,
 };
 
@@ -87,9 +108,18 @@ pub fn resolve_stored(device: &Device, on: &str, profiles: Option<&Path>) -> (Pr
 /// The adapter this machine would serve, by name, with its facts.
 #[must_use]
 pub fn probe() -> Option<(String, Facts)> {
-    let context =
-        crate::device::Context::bind(&crate::api::DeviceBoot::default(), engine::Allowance::WHOLE)
-            .ok()?;
+    probe_at(0)
+}
+
+/// [`probe`] of the device `index` names, in the order the engine numbers
+/// them (`wgpu:<n>`).
+#[must_use]
+pub fn probe_at(index: u32) -> Option<(String, Facts)> {
+    let boot = crate::api::DeviceBoot {
+        adapter_index: index,
+        ..crate::api::DeviceBoot::default()
+    };
+    let context = crate::device::Context::bind(&boot, engine::Allowance::WHOLE).ok()?;
     let device = context.chip();
     Some((device.name.clone(), device.facts()))
 }
