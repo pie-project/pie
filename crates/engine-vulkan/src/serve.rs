@@ -135,6 +135,29 @@ impl Serve for Api {
         )
     }
 
+    fn time_kernels(
+        device: &Context,
+        tuning: &crate::tuning::Tuning,
+        tier: kernels_slang::Tier,
+        max_submit: Option<std::time::Duration>,
+        launch: f64,
+        kernels: &[kernels_slang::linear::gemm::Tactic],
+        plane: (u32, u32),
+        rows: u32,
+    ) -> Result<Vec<Vec<f64>>> {
+        let timer = |frame: crate::device::Frame| {
+            let started = std::time::Instant::now();
+            let span = frame.commit_spanned()?;
+            Ok((
+                span.filter(|&ns| ns > 0),
+                started.elapsed().as_nanos() as u64,
+            ))
+        };
+        engine_gpu::rates::time_kernels::<Api, _>(
+            device, tuning, tier, &timer, max_submit, launch, kernels, plane, rows,
+        )
+    }
+
     fn save_rates(
         device: &Context,
         boot: &crate::api::DeviceBoot,

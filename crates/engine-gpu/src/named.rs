@@ -441,6 +441,19 @@ impl<B: Serve> Serve for Named<B> {
         Err(Fault::Deviceless)
     }
 
+    fn time_kernels(
+        _device: &Self::Context,
+        _tuning: &Self::Tuning,
+        _tier: kernels_slang::Tier,
+        _max_submit: Option<std::time::Duration>,
+        _launch: f64,
+        kernels: &[kernels_slang::linear::gemm::Tactic],
+        _plane: (u32, u32),
+        _rows: u32,
+    ) -> Result<Vec<Vec<f64>>> {
+        Ok(vec![Vec::new(); kernels.len()])
+    }
+
     fn save_rates(
         _device: &Self::Context,
         _boot: &Self::DeviceBoot,

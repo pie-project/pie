@@ -94,9 +94,11 @@ fn the_settle_submits_no_fire_past_the_bound() {
             );
         }
     }
+    // The widest range, past the bound whole, fires no whole step: it is
+    // weighed on its widest plane alone, within the bound.
     let widest = settled.last().expect("a range");
     assert!(
-        !widest.checked && widest.estimates.is_empty(),
-        "the widest range, past the bound whole, fired: {widest:?}"
+        widest.estimates.is_empty(),
+        "the widest range fired a whole step: {widest:?}"
     );
 }

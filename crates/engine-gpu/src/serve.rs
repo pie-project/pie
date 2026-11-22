@@ -123,6 +123,21 @@ pub trait Serve: Backend {
         handed: Option<Self::Handed>,
     ) -> Result<(Self::Context, Self::Tuning)>;
 
+    /// Each of `kernels` timed at `rows` of one `n x k` plane on `device`
+    /// (`crate::rates::time_kernels`), its frames timed by the backend's
+    /// device spans: every fire's time, ns, a kernel.
+    #[allow(clippy::too_many_arguments)]
+    fn time_kernels(
+        device: &Self::Context,
+        tuning: &Self::Tuning,
+        tier: kernels_slang::Tier,
+        max_submit: Option<std::time::Duration>,
+        launch: f64,
+        kernels: &[kernels_slang::linear::gemm::Tactic],
+        plane: (u32, u32),
+        rows: u32,
+    ) -> Result<Vec<Vec<f64>>>;
+
     /// `rates` saved into the user's profile under `boot`, beside the rates
     /// a load measured there: what a later load reads back.
     fn save_rates(
@@ -2619,6 +2634,105 @@ impl<B: Serve> Shell<B> {
         Ok(())
     }
 
+    /// The range `bottom..=top` weighed on its widest plane alone
+    /// (`Serve::time_kernels`): the choice's kernel there and each of
+    /// `candidates`, one fire a round at `top` rows; the choice replaced
+    /// over the range where a kernel ran apart from it, as a range timed in
+    /// whole steps is.
+    fn settle_alone(
+        &mut self,
+        bottom: u32,
+        top: u32,
+        standing: &crate::dense::Dense,
+        candidates: &[kernels_slang::linear::gemm::Tactic],
+    ) -> Result<()> {
+        let Some(&(n, k, ..)) = self
+            .dense_planes
+            .iter()
+            .max_by_key(|&&(n, k, ..)| u64::from(n) * u64::from(k))
+        else {
+            return Ok(());
+        };
+        let kept = standing.at(top, n, k);
+        let mut kernels = vec![kept];
+        for &t in candidates {
+            if !kernels.contains(&t) {
+                kernels.push(t);
+            }
+        }
+        let max_submit = self
+            .submit_bound
+            .as_ref()
+            .map(|held| std::time::Duration::from_nanos(held.bound_ns as u64));
+        let launch = self.dense_rates.launch_ns.unwrap_or(0) as f64;
+        let samples = B::time_kernels(
+            &self.device,
+            &self.tuning,
+            self.tier,
+            max_submit,
+            launch,
+            &kernels,
+            (n, k),
+            top,
+        )?;
+        let fastest = |s: &[f64]| s.iter().copied().fold(f64::INFINITY, f64::min);
+        let slowest = |s: &[f64]| s.iter().copied().fold(0.0, f64::max);
+        let kept_best = fastest(&samples[0]);
+        let mut taken = 0;
+        let mut best = f64::INFINITY;
+        for (i, s) in samples.iter().enumerate().skip(1) {
+            if s.is_empty() {
+                continue;
+            }
+            let (ns, _) = crate::rates::median_spread(s);
+            if slowest(s) < kept_best && ns < best {
+                taken = i;
+                best = ns;
+            }
+        }
+        let decided = !samples[0].is_empty()
+            && (taken == 0
+                || samples
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, s)| i != taken && !s.is_empty())
+                    .all(|(_, s)| slowest(&samples[taken]) < fastest(s)));
+        let weighed: Vec<String> = kernels
+            .iter()
+            .zip(&samples)
+            .filter(|(_, s)| !s.is_empty())
+            .map(|(t, s)| {
+                let (ns, spread) = crate::rates::median_spread(s);
+                format!(
+                    "{} {:.1} µs ({:.0}%)",
+                    crate::dense::name(t),
+                    ns / 1e3,
+                    spread * 100.0
+                )
+            })
+            .collect();
+        tracing::info!(
+            "dense matmul in the served step, {bottom}-{top} rows: weighed on its widest plane \
+             {n}x{k} alone at {top} rows (no whole step timed): {} ({})",
+            if taken == 0 { "kept" } else { "replaced" },
+            weighed.join(" vs ")
+        );
+        if taken != 0 {
+            self.dense = standing.with_rows(bottom, top, kernels[taken]);
+        }
+        self.settled.push(Settled {
+            bottom,
+            top,
+            estimates: Vec::new(),
+            bound_ns: self.submit_bound.as_ref().map(|held| held.bound_ns),
+            checked: true,
+            replaced: taken != 0,
+            kernel: (taken != 0).then(|| kernels[taken]),
+            decided,
+        });
+        Ok(())
+    }
+
     /// A fingerprint of what the settle weighs: the curves, the model's
     /// planes, the kernels the choice took by them, the rungs and lanes it
     /// fires, the backend and the build.
@@ -2714,6 +2828,7 @@ impl<B: Serve> Shell<B> {
                         kernels.push(t);
                     }
                 }
+                let candidates = kernels.clone();
                 let mut options = vec![standing.clone()];
                 let mut taking: Vec<Option<Tactic>> = vec![None];
                 for t in kernels {
@@ -2789,15 +2904,22 @@ impl<B: Serve> Shell<B> {
                         }
                     }
                 }
+                if options.len() <= 1 && offered > 1 {
+                    // A range timed in no whole served step (the bound splits
+                    // it, or no other kernel's step fits) is weighed on its
+                    // widest plane alone: each kernel once a round, at the
+                    // range's top rows, within the bound (the plane's
+                    // columns split where it refuses one), so no stale or
+                    // wrong curve keeps a kernel several times slower.
+                    self.settle_alone(bottom, top, &standing, &candidates)?;
+                    bottom = top + 1;
+                    rows = rows.saturating_mul(2);
+                    continue;
+                }
                 if options.len() <= 1 && !said {
                     tracing::info!(
                         "dense matmul in the served step, {bottom}-{top} rows: from the curves, \
-                         unchecked ({})",
-                        if offered <= 1 {
-                            "no other kernel to weigh"
-                        } else {
-                            "no other kernel's step fits the submit bound"
-                        }
+                         unchecked (no other kernel to weigh)"
                     );
                 }
                 self.settled.push(Settled {

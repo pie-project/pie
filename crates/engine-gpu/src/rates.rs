@@ -1208,6 +1208,80 @@ fn median(mut v: Vec<u64>) -> u64 {
     v[v.len() / 2].max(1)
 }
 
+/// Each of `kernels` timed at `rows` of one `n x k` plane, [`REPEATS`]
+/// rounds interleaved (each kernel's fire in turn): every fire's time, ns, a
+/// kernel. Each fire reads the next plane of a rotation past the last-level
+/// cache and writes one output, as a curve's point does; a fire the device's
+/// bound on one submission refuses is timed on a slice of the plane's
+/// columns (halved until admitted, its time carried to the whole plane), a
+/// sample read below its launches or refused at every slice left out. What
+/// a dense settle weighs a range by where it times no whole served step.
+pub fn time_kernels<B: Serve, T: Tactics + ?Sized>(
+    device: &B::Context,
+    tactics: &T,
+    tier: kernels_slang::Tier,
+    timer: Timer<'_, B>,
+    max_submit: Option<std::time::Duration>,
+    launch: f64,
+    kernels: &[kernels_slang::linear::gemm::Tactic],
+    (n, k): (u32, u32),
+    rows: u32,
+) -> Result<Vec<Vec<f64>>> {
+    let mut rig = Rig::<B>::new(device, max_submit);
+    rig.lay_probe(tactics.gemm(tier, crate::submit::PROBE.0))?;
+    let largest = rig.device.max_buffer();
+    if !operands_fit(rows, n, k, None, largest) {
+        return Ok(vec![Vec::new(); kernels.len()]);
+    }
+    let act = rig.operand(rows, k, Dtype::Bf16)?;
+    let planes = shape_planes(n, k, None);
+    let plane = (2 * u64::from(n) * u64::from(k)).next_multiple_of(VIEW_ALIGN);
+    let slab = rig.slab(planes as u64 * plane, plane, true)?;
+    let weights = rig.views(&slab, planes, n, k, Dtype::Bf16)?;
+    let y = (2 * u64::from(rows) * u64::from(n)).next_multiple_of(VIEW_ALIGN);
+    let ys = rig.slab(y, y, false)?;
+    let touched = Touched::default();
+    let mut samples: Vec<Vec<f64>> = vec![Vec::new(); kernels.len()];
+    let mut split: Vec<u32> = vec![1; kernels.len()];
+    for _ in 0..REPEATS {
+        for (i, &tactic) in kernels.iter().enumerate() {
+            loop {
+                let cols = n.div_ceil(split[i]).next_multiple_of(64).min(n);
+                let plane: Vec<Tensor> = weights
+                    .iter()
+                    .map(|w| Tensor { rows: cols, ..*w })
+                    .collect();
+                let outs = rig.views(&ys, 1, rows, cols, Dtype::Bf16)?;
+                let rate = matmul_on(
+                    &mut rig,
+                    tactic,
+                    timer,
+                    (Tensor { rows, ..act }, &plane, &outs),
+                    Some(&touched),
+                    launch,
+                );
+                let past_bound = rig.past_bound.borrow_mut().take().is_some();
+                match rate {
+                    Ok(Ok(rate)) => {
+                        let ns = gemm_flops(rows, cols, k) / rate;
+                        samples[i].push(ns * f64::from(n) / f64::from(cols) + launch);
+                        break;
+                    }
+                    Err(_) if past_bound && cols > 64 => split[i] *= 2,
+                    Err(e) if !past_bound => {
+                        if !matches!(&e, Fault::Ceiling { .. }) {
+                            return Err(e);
+                        }
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+        }
+    }
+    Ok(samples)
+}
+
 /// Each of `wanted` (`(kernel, n, k)`, [`lacking`]) timed at the load's
 /// rows to `top` (`profile::fire::Rates::kernel_tflops_by_shape`): a matmul
 /// of each row count over an `n x k` plane, each fire reading the next plane
