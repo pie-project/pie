@@ -426,6 +426,7 @@ impl Model {
             Some(StepOutcome {
                 wrote: writes,
                 faulted,
+                ..
             }) if !writes.is_empty() && faulted.is_empty() => {
                 assert_eq!(writes.len(), 1, "one lane reports: {writes:?}");
                 let report = &writes[0];

@@ -20,6 +20,8 @@ pub(crate) struct Seat {
     /// count) span of it.
     pub pixels: Option<Pixels>,
     pub guests: Option<Guests>,
+    /// Where the fire's beam fault words lie in the readback, past its rows.
+    pub beam_tail: Option<engine_gpu::serve::BeamTail>,
 }
 
 pub(crate) type Pixels = (Buffer, String, Vec<(u64, u32)>);
@@ -41,19 +43,35 @@ pub(crate) type Mailbox = Arc<Mutex<Post>>;
 
 type Rows = Vec<Vec<f32>>;
 
+/// The readback's rows, and the beam fault words past them where the fire
+/// laid any (`tail`), in one read.
 fn read_seat(
     layout: Vec<ReadSpan>,
+    tail: Option<engine_gpu::serve::BeamTail>,
     seat: &Buffer,
-    on_read: impl FnOnce(Result<Rows, Fault>) + Send + 'static,
+    on_read: impl FnOnce(Result<(Rows, Vec<u32>), Fault>) + Send + 'static,
 ) {
-    let end = layout
+    let rows_end = layout
         .iter()
         .filter(|span| span.hosted)
         .map(|span| span.at + span.bytes())
         .max()
         .unwrap_or(0);
+    let end = tail.map_or(rows_end, |tail| {
+        rows_end.max(tail.at + u64::from(tail.words) * 4)
+    });
     seat.read_async(0, end, move |raw| {
-        on_read(raw.map(|raw| engine_gpu::serve::rows_from(&raw, &layout)));
+        on_read(raw.map(|raw| {
+            let words = tail.map_or_else(Vec::new, |tail| {
+                let from = usize::try_from(tail.at).unwrap_or(usize::MAX);
+                raw.get(from..from + tail.words as usize * 4)
+                    .unwrap_or(&[])
+                    .chunks_exact(4)
+                    .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+                    .collect()
+            });
+            (engine_gpu::serve::rows_from(&raw, &layout), words)
+        }));
     });
 }
 
@@ -321,8 +339,10 @@ pub(crate) fn on_done(
         mirror,
         pixels,
         guests,
+        beam_tail,
     } = seat;
     let read_layout = layout.clone();
+    let supplies = fed.clone().filter(engine_gpu::settle::FedCheck::reads_beams);
     let verdict = mirror.clone();
     let land = move |read: Result<Rows, String>| {
         worker.land(Landing {
@@ -343,7 +363,15 @@ pub(crate) fn on_done(
         tracing::debug!(seq, refused = refused.is_some(), "landing: work done");
         match refused {
             Some(why) => land(Err(why)),
-            None => read_seat(read_layout, &mirror, move |read| {
+            None => read_seat(read_layout, beam_tail, &mirror, move |read| {
+                let read = read.map(|(rows, words)| {
+                    if let Some(fed) = &supplies
+                        && beam_tail.is_some()
+                    {
+                        fed.supply(beam_tail.map_or(0, |tail| tail.word), words);
+                    }
+                    rows
+                });
                 let read = read.and_then(|rows| verdict.queue_verdict().map(|()| rows));
                 land(read.map_err(|fault| fault.to_string()));
             }),

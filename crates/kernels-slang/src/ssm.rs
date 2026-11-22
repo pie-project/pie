@@ -149,6 +149,52 @@ pub struct Committed {
     pub lane0: u32,
 }
 
+/// A buffering fire's staged rs table (`kernels/prim/carry.slang`), which
+/// its recurrent kernels read each lane's buffered rows through where they
+/// lie in the pool: lane `l` of the fire has [`CARRY_HEADER`] ints from int
+/// `l * CARRY_HEADER` (the buffer token its first own row lands at, or -1;
+/// the rows it carries ahead of its own; where its carried rows' tokens and
+/// its buffer pages start in the table; the rows of its run its state is
+/// committed at), its tokens and pages after. `slots` is the fire's lanes'
+/// records ([`Committed::slots`]); the window's lane `r` is the fire's
+/// `lane0 + r`. An rs page is a slot of the pool's rs list, `stride_words`
+/// words of the pool, `page_tokens` tokens of every plane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Carry {
+    pub table: Tensor,
+    pub slots: Tensor,
+    pub lane0: u32,
+    pub page_tokens: u32,
+    pub stride_words: u32,
+}
+
+/// The ints a lane's header takes in a [`Carry`] table.
+pub const CARRY_HEADER: u32 = 5;
+
+/// Where a buffered plane lies in an rs page: the word it starts at, and
+/// the words a token's row of it takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CarryPlane {
+    pub at: u32,
+    pub row: u32,
+}
+
+impl Carry {
+    /// The pages' scalars, refused where a page holds no token.
+    pub(crate) fn page_args(&self, op: &'static str) -> Result<[ArgValue; 2], Error> {
+        Ok([
+            nonzero(op, "the tokens an rs page holds", self.page_tokens)?.arg(),
+            self.stride_words.arg(),
+        ])
+    }
+}
+
+impl CarryPlane {
+    pub(crate) fn args(&self) -> [ArgValue; 2] {
+        [self.at.arg(), self.row.arg()]
+    }
+}
+
 /// The widest head a scan stages in workgroup memory.
 const HEAD_MAX: u32 = 256;
 

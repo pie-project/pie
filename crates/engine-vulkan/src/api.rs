@@ -76,6 +76,9 @@ impl Host for Api {
         PortMask::DECODE_ENVELOPE
             .with(eta_ir::registry::Port::Fold)
             .with(eta_ir::registry::Port::AttnMask)
+            // Each beam's parent: the engine keeps the beams' page lists
+            // (`engine_gpu::beam`).
+            .with(eta_ir::registry::Port::Parents)
     }
 
     fn settles_asynchronously(gpu: &Vulkan) -> bool {
@@ -140,6 +143,7 @@ impl Host for Api {
             // Its rows are read: the forward landed.
             if let Some(fed) = step_pending.fed.take() {
                 held = merged(held, fed.faults());
+                held.beam_common = fed.commons();
             }
             (sink)(at, merged(held, faulted));
         } else {

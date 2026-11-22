@@ -86,7 +86,10 @@ impl Done {
             faulted: self.faulted.clone(),
         };
         match &self.fed {
-            Some(fed) => merged(outcome, fed.faults()),
+            Some(fed) => engine::StepOutcome {
+                beam_common: fed.commons(),
+                ..merged(outcome, fed.faults())
+            },
             None => outcome,
         }
     }
@@ -194,10 +197,29 @@ pub struct FedLane {
 /// Reads the id at token seat row `row`.
 pub type ReadRow = Box<dyn Fn(u32) -> Option<u32> + Send + Sync>;
 
+/// A beam's fault word (`crate::beam`): its u32 word in the fire's input
+/// store, the lane it faults and its instance.
+#[derive(Debug, Clone)]
+pub struct BeamWord {
+    pub word: u32,
+    pub lane: u32,
+    pub instance: engine::InstanceId,
+}
+
 struct Fed {
     read: ReadRow,
     lanes: Vec<FedLane>,
     vocab: u32,
+    /// Reads the store's u32 word, and each beam's fault word.
+    read_word: Option<ReadRow>,
+    beams: Vec<BeamWord>,
+    /// Each beam group's common slot word (§11.3) and its instance.
+    commons: Vec<(u32, engine::InstanceId)>,
+    /// The store's words from a first one as the fire's readout brought
+    /// them back ([`FedCheck::supply`]): read in place of the store.
+    supplied: std::sync::Mutex<Option<(u32, Vec<u32>)>>,
+    /// The groups' common slots the landing read.
+    read_commons: std::sync::Mutex<Vec<(engine::InstanceId, u32)>>,
     faults: std::sync::Mutex<Option<Vec<engine::LaneFault>>>,
     ready: std::sync::Condvar,
 }
@@ -210,6 +232,39 @@ impl FedCheck {
                 read,
                 lanes,
                 vocab,
+                read_word: None,
+                beams: Vec::new(),
+                commons: Vec::new(),
+                supplied: std::sync::Mutex::new(None),
+                read_commons: std::sync::Mutex::new(Vec::new()),
+                faults: std::sync::Mutex::new(None),
+                ready: std::sync::Condvar::new(),
+            }),
+        }
+    }
+
+    /// A check of `lanes`' fed ids, as [`FedCheck::new`], and of each of
+    /// `beams`' fault words, read by `read_word`: a nonzero word faults its
+    /// lane by name (`crate::beam::fault_reason`).
+    #[must_use]
+    pub fn with_beams(
+        read: ReadRow,
+        lanes: Vec<FedLane>,
+        vocab: u32,
+        read_word: ReadRow,
+        beams: Vec<BeamWord>,
+        commons: Vec<(u32, engine::InstanceId)>,
+    ) -> FedCheck {
+        FedCheck {
+            inner: Arc::new(Fed {
+                read,
+                lanes,
+                vocab,
+                read_word: Some(read_word),
+                beams,
+                commons,
+                supplied: std::sync::Mutex::new(None),
+                read_commons: std::sync::Mutex::new(Vec::new()),
                 faults: std::sync::Mutex::new(None),
                 ready: std::sync::Condvar::new(),
             }),
@@ -244,8 +299,56 @@ impl FedCheck {
                 outcome.fault_lanes(lane.lanes.clone(), lane.instance, &why);
             }
         }
+        let supplied = fed.supplied.lock().expect("fed lock poisoned").take();
+        if let Some(read_word) = fed.read_word.as_ref().filter(|_| whole) {
+            let word = |at: u32| match &supplied {
+                Some((first, words)) => at
+                    .checked_sub(*first)
+                    .and_then(|k| words.get(k as usize).copied()),
+                None => read_word(at),
+            };
+            *fed.read_commons.lock().expect("fed lock poisoned") = fed
+                .commons
+                .iter()
+                .filter_map(|&(at, instance)| Some((instance, word(at)?)))
+                .collect();
+            for beam in &fed.beams {
+                let code = word(beam.word).unwrap_or(0);
+                if code == 0 {
+                    continue;
+                }
+                let why = crate::beam::fault_reason(code, beam.lane as usize);
+                tracing::warn!(lane = beam.lane, instance = beam.instance.0, %why, "a beam lane faults");
+                outcome.fault_lanes(beam.lane..beam.lane + 1, Some(beam.instance), &why);
+            }
+        }
         *faults = Some(outcome.faulted);
         fed.ready.notify_all();
+    }
+
+    /// The store's words from `first` as the fire's readout brought them
+    /// back: [`FedCheck::landed`] reads the beams' words there in place of
+    /// the store.
+    pub fn supply(&self, first: u32, words: Vec<u32>) {
+        *self.inner.supplied.lock().expect("fed lock poisoned") = Some((first, words));
+    }
+
+    /// Each beam group's common slot (§11.3) as the landing read it, once
+    /// the forward landed.
+    #[must_use]
+    pub fn commons(&self) -> Vec<(engine::InstanceId, u32)> {
+        let _ = self.faults();
+        self.inner
+            .read_commons
+            .lock()
+            .expect("fed lock poisoned")
+            .clone()
+    }
+
+    /// Whether the check reads beams' fault words.
+    #[must_use]
+    pub fn reads_beams(&self) -> bool {
+        !self.inner.beams.is_empty()
     }
 
     /// The lanes the fed ids faulted, once the forward landed.

@@ -739,6 +739,17 @@ impl Session {
         Ok(())
     }
 
+    /// [`Self::clear`] at an unpark: the instance's place past its resident
+    /// state, which the runtime copied in with it, and the pair's where
+    /// `pair`.
+    pub fn clear_moved(&self, pair: bool) -> Result<()> {
+        self.instance.clear_dead()?;
+        if pair {
+            self.pair.clear()?;
+        }
+        Ok(())
+    }
+
     /// Where its pair's state lies.
     #[must_use]
     pub fn pair_place(&self) -> &engine::program::ScratchPlace {

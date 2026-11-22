@@ -381,6 +381,19 @@ impl Serve for Api {
             &shell.shelf.mirror[arm],
             &hosted,
         )?;
+        // The fire's beam fault words land in its readback past its rows,
+        // from the store the head step wrote them in: read with the rows.
+        let beam_tail = prepared.beam_tail;
+        if let Some(tail) = beam_tail {
+            engine_gpu::backend::Frame::copy(
+                &mut frame,
+                shell.inputs_store(arm),
+                u64::from(tail.word) * 4,
+                &shell.shelf.mirror[arm],
+                tail.at,
+                u64::from(tail.words) * 4,
+            )?;
+        }
         let on_done = crate::landing::on_done(
             crate::landing::Seat {
                 seq,
@@ -396,6 +409,7 @@ impl Serve for Api {
                     )
                 }),
                 guests: prepared.guests.take(),
+                beam_tail,
             },
             std::sync::Arc::clone(&shell.shelf.mailbox),
             counts,

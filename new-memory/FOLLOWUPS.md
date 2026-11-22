@@ -1149,3 +1149,24 @@ settle exists for. Fix: stage a feed for those channels in the settle's fires (z
 declared shape; the settle only times), or settle through a class that reads none, instead of
 stopping.
 
+
+## F56. Hybrid beam replay grows with lineage divergence
+
+On a hybrid model each beam lane replays its buffered rows past its group's
+common ancestor every step (`new-memory/designs/BEAM-PAGE-LISTS.md` §11.3,
+`[c, s_t]`). Where two lineages stay apart, the rows grow with the steps
+since they parted: Vulkan Qwen3.5 beam-4 on one prompt carried 4 × 257 rows
+at step 257 and up to 4 × 1018 rows later in the search. engine-gpu serves
+it (a beam lane's carried rows are a span whose pages resolve through its
+list, its set's rs entries in its group's state; the per-fire tables stay
+O(lanes + widest bucket)), but the cost per step grows with the divergence
+(O(steps) replay, O(steps²) over a search). CUDA, Metal and XLA move to the
+same shape. A deep group's resident state (its lists and set entries) lies
+first in its instance's one scratch place (`GuestState::resident`); past a
+chunk that place is whole runs of adjacent chunks, so binding or restoring it
+relies on the planner naming a compaction for a run the free chunks' total
+covers, else it waits on scattered room that never forms a run. A bound by
+design is a spec question for AMD / Leader: per-beam state checkpoints (each
+beam's recurrent state kept at page boundaries, so a beam replays at most a
+page past its last checkpoint) would bound the replay by a page at the cost
+of a state per beam per page.
