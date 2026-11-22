@@ -664,6 +664,393 @@ fn a_guests_state_reads_zero_when_its_slots_change_owner() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The miniature whose pair keeps state: Qwen3's, its fires capturing
+/// attention scores into the score room of the pair a lane's program reads
+/// them through (`guest::state`).
+const SCORES_MODEL: &str = "qwen3-micro-text";
+const SCORE_KEYS: &str = "attn.scores";
+/// A pass's tokens on the scores miniature.
+const SCORE_ROWS: u32 = 4;
+const SCORE_EXTENTS: BindExtents = BindExtents {
+    row_count: 1,
+    token_count: SCORE_ROWS,
+    sampled_rows: 1,
+    query_len: SCORE_ROWS,
+    key_len: 1,
+};
+
+/// The scores miniature loaded, a program that puts each pass's key row in
+/// a channel the host reads registered, the test's chunks committed past
+/// the load's, and the slots its guests take in them.
+struct ScoresRig {
+    engine: backend::Engine,
+    trace: poem_ir::Trace,
+    program: engine::program::ProgramId,
+    slots: Slots,
+    facts: engine::chunk::ChunkFacts,
+    /// The key row's width: the load's context.
+    width: u32,
+}
+
+fn scores_rig() -> Option<ScoresRig> {
+    use engine::chunk::Growth;
+    use engine::load::{Budgets, Checkpoint, LoadRequest, Residency};
+    use eta_ir::container::{ChannelDecl, StageProgram, TraceContainer};
+    use eta_ir::op::Op;
+    use eta_ir::registry::Stage;
+    use eta_ir::types::Shape;
+
+    let boot = crate::gpu::device_boot();
+    if backend::Context::bind(&boot, backend::ALLOWANCE).is_err() {
+        eprintln!("not asked: no device");
+        return None;
+    }
+    let fixture = crate::model_logits::fixture(SCORES_MODEL, None);
+    assert!(
+        fixture.trace.nodes.iter().any(|node| matches!(
+            node.op,
+            poem_ir::Operation::Attn(poem_ir::Attn::ScoreCapture { .. })
+        )),
+        "{SCORES_MODEL} captures scores"
+    );
+    let mut engine = backend::Engine::new(boot, super::outputs::contract_for);
+    let loaded = engine
+        .load(LoadRequest {
+            trace: fixture.trace.clone(),
+            checkpoint: Checkpoint::Path(fixture.container.clone()),
+            budgets: Budgets {
+                max_lanes: 4,
+                max_tokens: 16,
+                buckets: vec![16],
+                max_adapters: 0,
+                page_size: 16,
+                max_context: 64,
+                context_declared: false,
+                slots: 4,
+                max_patches: None,
+                max_images: None,
+                max_voxels: None,
+                max_clips: None,
+            },
+            residency: Residency {
+                device: crate::gpu::share(),
+                ..Residency::default()
+            },
+            ordinal: 0,
+            frames_in_flight: 1,
+        })
+        .expect("the miniature loads");
+    let decls = output_decls(&loaded);
+    let decl = decls
+        .iter()
+        .find(|decl| decl.name == SCORE_KEYS)
+        .unwrap_or_else(|| panic!("{SCORES_MODEL} declares `{SCORE_KEYS}`"));
+    let rows = decl.layers.max(1);
+    let width = decl.width;
+    let program = TraceContainer {
+        names: vec![SCORE_KEYS.to_string()],
+        channels: vec![ChannelDecl {
+            shape: Shape::matrix(rows, width),
+            dtype: ChanDType::Concrete(EtaDtype::F32),
+            capacity: 2,
+            host_role: HostRole::Reader,
+            seeded: false,
+        }],
+        ports: Vec::new(),
+        stages: vec![StageProgram {
+            stage: Stage::Epilogue,
+            ops: vec![
+                Op::Output {
+                    index: 0,
+                    lane: 0,
+                    shape: Shape::matrix(rows, width),
+                    dtype: EtaDtype::F32,
+                },
+                Op::ChanPut { chan: 0, value: 0 },
+            ],
+        }],
+        externs: Vec::new(),
+        inputs: Vec::new(),
+    };
+    let program = engine
+        .register_program(&registration_of(&decls, program, 0x5c0e))
+        .expect("the program registers");
+
+    // The test's chunks: past the seats' runs where the pool is laid whole
+    // at its load, else in a segment committed past the load's.
+    let facts = loaded.caps.chunks.clone();
+    let segment = facts.segment_chunks;
+    let need = 12;
+    let first = if facts.segments.growth == Growth::Fixed {
+        let seats = 1 + engine
+            .loaded()
+            .expect("the shell stands")
+            .pool_layout()
+            .seat_chunks();
+        seats.div_ceil(segment) * segment
+    } else {
+        facts.segments.committed * segment
+    };
+    let commit = (first + need).div_ceil(segment);
+    let most = if facts.segments.growth == Growth::Fixed {
+        facts.segments.max - 1
+    } else {
+        facts.segments.max
+    };
+    assert!(most >= commit, "the test's chunks span {commit} segments of {most}");
+    engine.commit_segments(commit).expect("the segments commit");
+    let top = first + need;
+    let slots = Slots::of(&facts, top - 1, top - 2);
+    Some(ScoresRig {
+        engine,
+        trace: fixture.trace,
+        program,
+        slots,
+        facts,
+        width: rows * width,
+    })
+}
+
+impl ScoresRig {
+    /// An instance of the program over a channel of its own (id `channel`),
+    /// its state and pair where `slots` takes them, or at `pair` (and its
+    /// taking) where given.
+    fn bind(
+        &mut self,
+        channel: u64,
+        pair: Option<(&ScratchPlace, u64)>,
+    ) -> (InstanceId, InstanceBinding) {
+        let id = ChannelId(channel);
+        self.slots.register(
+            &mut self.engine,
+            ChannelRegistration {
+                id,
+                shape: vec![1, self.width],
+                dtype: ChanDType::Concrete(EtaDtype::F32),
+                host_role: HostRole::Reader,
+                seeded: false,
+                extern_dir: None,
+                capacity: 2,
+                extern_name: Vec::new(),
+                slots: Vec::new(),
+            },
+        );
+        let binding = self.slots.binding(
+            &self.engine,
+            InstanceBinding {
+                program: self.program,
+                channels: vec![id],
+                seeds: Vec::new(),
+                geometry: GeometryClass::Host,
+                extents: SCORE_EXTENTS,
+                ..InstanceBinding::default()
+            },
+            &[id],
+        );
+        let binding = match pair {
+            Some((pair, pair_generation)) => InstanceBinding {
+                pair: pair.clone(),
+                pair_generation,
+                ..binding
+            },
+            None => binding,
+        };
+        let instance = self
+            .engine
+            .bind_instance(&binding)
+            .expect("the instance binds")
+            .id;
+        (instance, binding)
+    }
+
+    /// One pass of `instance` over `tokens`, capturing its scores: the key
+    /// row its program put.
+    fn fire(&mut self, instance: InstanceId, tokens: &[u32]) -> Vec<f32> {
+        let word = self.trace.facts.word(
+            &Request::new(tokens.len() as u32, false).capturing_scores(true),
+        );
+        let mut ticket = self
+            .engine
+            .submit(&FrameSubmission::of(Step {
+                lanes: vec![Lane {
+                    slot: 0,
+                    word,
+                    tokens: tokens.to_vec(),
+                    readout: Readout::Last,
+                    kv_less: true,
+                    ..Lane::default()
+                }],
+                attachments: vec![Attachment {
+                    lane: 0,
+                    lanes: 1,
+                    instance,
+                    adapter_only: false,
+                    scratch: ScratchPlace::None,
+                }],
+                media: Vec::new(),
+                voxels: Vec::new(),
+            }))
+            .expect("the frame fires");
+        self.engine
+            .settle_frame(&mut ticket)
+            .expect("the frame settles");
+        let cell = self
+            .engine
+            .take_channel(instance, 0)
+            .expect("the channel reads")
+            .expect("the program put the key row");
+        let row: Vec<f32> = cell
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("an f32")))
+            .collect();
+        assert!(
+            row.iter().all(|v| v.is_finite()) && row.iter().any(|&v| v != 0.0),
+            "a key row of captured scores: {row:?}"
+        );
+        row
+    }
+}
+
+/// The largest difference between two rows of one width.
+fn row_apart(got: &[f32], want: &[f32]) -> f32 {
+    assert_eq!(got.len(), want.len(), "rows of one width");
+    got.iter()
+        .zip(want)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f32::max)
+}
+
+/// A pair whose every member is parked while an evacuation moves its
+/// state is laid where it lies now by an instance that joins it fresh
+/// (engine-cuda's `a_pair_whose_members_are_all_parked_is_laid_again_where_
+/// a_move_left_it`). Two instances of the scores program share a pair (its
+/// state the score room their fires capture into) and fire; both park
+/// (`Rebind::Parked`, `kept` as given); the pair's chunks move onto whole
+/// chunks nothing holds, and the bytes they left are filled with garbage.
+/// A third instance binds at the pair and its taking (a fresh joiner, no
+/// member live) and fires: its key row is the first's, and the bytes the
+/// pair left still hold the garbage (neither the bind's clear nor the
+/// fire's capture went there). The two parked members come back at the
+/// pair, now the joiner's live taking, and answer as before.
+///
+/// Each instance addresses the pair through its own session, which a bind
+/// resolves from the pool as it stands (`guest::state::Placed::at`) and an
+/// unpark retargets. Negative control (run once on Vulkan, reverted): a
+/// bind that took a parked member's pre-move span for a pair at its place
+/// and taking failed both variants here, at the joiner's check of the
+/// vacated bytes (its clear and its captured rows landed on them).
+fn a_fresh_joiner_of_an_all_parked_pair_lays_it_where_a_move_left_it(kept: bool) {
+    let Some(mut rig) = scores_rig() else {
+        return;
+    };
+    let state = rig
+        .engine
+        .guest_state(rig.program, &SCORE_EXTENTS, GeometryClass::Host)
+        .expect("the program's guest state");
+    assert!(state.per_pair > 0, "the pair keeps the score room");
+    let chunk_bytes = rig.facts.chunk_bytes;
+    let per_chunk = rig.slots.instance.expect("an Instance shape").per_chunk;
+    let tokens: [Vec<u32>; 2] = [vec![3, 11, 29, 5], vec![7, 2, 41, 17]];
+
+    let (a, a_binding) = rig.bind(1, None);
+    let (b, b_binding) = rig.bind(2, None);
+    assert_eq!(a_binding.pair, b_binding.pair, "A and B share the pair");
+    assert_eq!(a_binding.pair_generation, b_binding.pair_generation);
+    let pair = a_binding.pair.clone();
+    let taking = a_binding.pair_generation;
+    let want = [rig.fire(a, &tokens[0]), rig.fire(b, &tokens[1])];
+    assert!(
+        row_apart(&want[0], &want[1]) > 0.0,
+        "the two passes' rows tell them apart"
+    );
+
+    for id in [a, b] {
+        rig.engine
+            .rebind_slots(Rebind::Parked { id, kept })
+            .expect("the member parks");
+    }
+    // The pair's chunks onto whole chunks nothing holds: the chunks that
+    // lay there take the bytes the pair left.
+    let (from, run) = match &pair {
+        &ScratchPlace::Run { first, .. } => (first / per_chunk, 1),
+        ScratchPlace::Chunks { run, pieces } => (pieces[0], *run),
+        ScratchPlace::None => unreachable!("the pair keeps state"),
+    };
+    let ScratchPlace::Chunks { pieces, .. } =
+        rig.slots.state(u64::from(run) * chunk_bytes, run)
+    else {
+        panic!("a run of whole chunks");
+    };
+    let onto = pieces[0];
+    assert!(
+        onto + run <= from || from + run <= onto,
+        "the run moves apart from itself"
+    );
+    rig.engine
+        .evacuate(&Evacuation {
+            moves: (0..run).map(|at| (from + at, onto + at)).collect(),
+        })
+        .expect("the pair's chunks move while every member is parked");
+    let vacated = ScratchPlace::Chunks {
+        run,
+        pieces: vec![onto],
+    };
+    let vacated_bytes = u64::from(run) * chunk_bytes;
+    fill_room(&rig.engine, &vacated, vacated_bytes, 0xee);
+
+    // C joins the pair at its taking, no member live.
+    let (c, _) = rig.bind(3, Some((&pair, taking)));
+    let got = rig.fire(c, &tokens[0]);
+    assert!(
+        read_room(&rig.engine, &vacated, vacated_bytes)
+            .iter()
+            .all(|&byte| byte == 0xee),
+        "the joiner's bind and fire leave the bytes the pair left as they stand"
+    );
+    let off = row_apart(&got, &want[0]);
+    assert!(off < 1e-3, "the joiner's key row is A's: {off} apart");
+
+    // A and B come back at the pair, the joiner's live taking.
+    for (id, binding) in [(a, &a_binding), (b, &b_binding)] {
+        let scratch = rig.slots.state(state.instance_bytes(), state.run);
+        rig.engine
+            .rebind_slots(Rebind::Instance {
+                id,
+                instance: binding.instance_slots.clone(),
+                rings: Vec::new(),
+                adapter: Vec::new(),
+                scratch,
+                pair: pair.clone(),
+                pair_generation: taking,
+            })
+            .expect("the member comes back at the pair");
+    }
+    for (k, id) in [a, b].into_iter().enumerate() {
+        let got = rig.fire(id, &tokens[k]);
+        let off = row_apart(&got, &want[k]);
+        assert!(off < 1e-3, "member {k} answers as before the move: {off} apart");
+    }
+    assert!(
+        read_room(&rig.engine, &vacated, vacated_bytes)
+            .iter()
+            .all(|&byte| byte == 0xee),
+        "the returning members leave the bytes the pair left as they stand"
+    );
+    for id in [a, b, c] {
+        rig.engine.close_instance(id).expect("the instance closes");
+    }
+}
+
+#[test]
+fn a_fresh_joiner_of_a_pair_parked_kept_lays_it_where_a_move_left_it() {
+    a_fresh_joiner_of_an_all_parked_pair_lays_it_where_a_move_left_it(true);
+}
+
+#[test]
+fn a_fresh_joiner_of_a_pair_parked_shed_lays_it_where_a_move_left_it() {
+    a_fresh_joiner_of_an_all_parked_pair_lays_it_where_a_move_left_it(false);
+}
+
 /// What binding and closing a guest costs, its state cleared at each bind:
 /// `PIE_GUEST_BIND_ROUNDS` rounds (default 200) of one bind and one close.
 #[test]
