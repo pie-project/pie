@@ -1695,6 +1695,24 @@ impl Pools {
         self.pool.host_runs(offset, len)
     }
 
+    /// Test builds (`test-slot-fill`): each `(offset, len)` the runtime
+    /// gave back, poisoned on the host ([`Pool::poison`]); a range in a
+    /// segment released since is no memory any more and is passed over.
+    /// The ranges poisoned. Test builds alone, and only for ranges the
+    /// runtime gave back: slots no holder keeps, every fire and copy that
+    /// touched them retired or landed (`SlotPool`'s give-back), which is
+    /// [`Pool::poison`]'s contract.
+    #[cfg(feature = "test-slot-fill")]
+    pub fn poison_ranges(&self, ranges: &[(u64, u64)]) -> usize {
+        let committed = u64::from(self.pool.committed_chunks()) * self.layout.chunk_bytes;
+        ranges
+            .iter()
+            .filter(|&&(offset, len)| offset + len <= committed)
+            // SAFETY: the ranges are given back, as above.
+            .filter(|&&(offset, len)| unsafe { self.pool.poison(offset, len) }.is_ok())
+            .count()
+    }
+
     /// `into.len()` bytes at `offset` of the pool's buffer, read on the host.
     pub fn read_span(&self, offset: u64, into: &mut [u8]) -> Result<()> {
         self.pool.read(offset, into)

@@ -657,6 +657,17 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    // Test builds: a slot the shared pool gives back is poisoned by its
+    // engine before the engine's next verb (`Engine::poison_queue`), so a
+    // fire that reads a cell its owner never wrote reads NaN.
+    #[cfg(feature = "test-slot-fill")]
+    for (engine, stores) in engine_configs.iter_mut().zip(&arena_stores) {
+        if let Some(shared) = &stores.shared {
+            let queue = ::engine::chunk::PoisonQueue::default();
+            shared.lock().unwrap().pool_mut().poison_into(queue.clone());
+            engine.engine_backend.poison_queue(queue);
+        }
+    }
     // A shared pool's tiers are its host chunks and disk slots; today's
     // pools state theirs in pages.
     let kv_swap_capable = engine_configs.first().is_some_and(|d| {

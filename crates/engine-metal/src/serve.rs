@@ -2262,6 +2262,17 @@ impl Shell {
         self.pools.disk_chunk_bytes()
     }
 
+    /// Test builds (`test-slot-fill`): the runtime's given-back slots
+    /// poisoned before this engine's next verb ([`engine::chunk::PoisonQueue`]):
+    /// a slot is given back only once every fire that touched it retired
+    /// and every copy reading it landed, and its next owner writes nothing
+    /// before a verb of its own, so a host fill here races neither. The
+    /// ranges poisoned.
+    #[cfg(feature = "test-slot-fill")]
+    pub fn poison_given_back(&self, ranges: &[(u64, u64)]) -> usize {
+        self.pools.poison_ranges(ranges)
+    }
+
     /// See `Engine::settle_copies`: the last copy's command buffer retires.
     pub fn settle_copies(&mut self) -> Result<()> {
         if let Some(grafted) = self.grafted.take() {

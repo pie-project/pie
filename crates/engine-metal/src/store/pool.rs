@@ -1098,6 +1098,30 @@ impl Pool {
         Ok(())
     }
 
+    /// Test builds (`test-slot-fill`): `len` bytes from `offset` of the
+    /// range set to 0xFF on the host, NaN in every float width
+    /// ([`super::super::device::elastic`]'s `poison`).
+    ///
+    /// # Safety
+    ///
+    /// No frame in flight reads or writes these bytes, and none committed
+    /// after this call reads them expecting what they held.
+    #[cfg(feature = "test-slot-fill")]
+    pub unsafe fn poison(&self, offset: u64, len: u64) -> Result<()> {
+        self.walk(offset, len, |part, local, _, take| {
+            #[cfg(target_vendor = "apple")]
+            {
+                // SAFETY: the caller's contract.
+                unsafe { part.store.poison(local, take) }
+            }
+            #[cfg(not(target_vendor = "apple"))]
+            {
+                let _ = (part, local, take);
+                Err(Fault::Deviceless)
+            }
+        })
+    }
+
     /// `len` bytes from `offset` of the range as host runs `(from, len,
     /// address)`, `from` counted from `offset`: one per heap they cross,
     /// valid while those heaps stay mapped; the caller writes through them
