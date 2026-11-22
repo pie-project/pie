@@ -2257,14 +2257,26 @@ impl Shell {
             .unwrap_or_default();
         let trace = fnv(format!("{:?}", self.trace).as_bytes());
         let paging = self.paging();
+        // Every decision the profile resolves, rung by rung: the tuning's
+        // own Debug names the profile's source alone, so a decision that
+        // changed under the same source (kernel.dense measured anew at
+        // load, a user file edited) kept the key and built an earlier
+        // boot's keys, and a fire met a kernel that list did not hold.
+        let decisions: String = self
+            .tuning
+            .profile()
+            .entries()
+            .map(|(spec, rungs, _)| format!("{}={rungs:?};", spec.id))
+            .collect();
         let shape = format!(
-            "{:?}|{:?}|{}:{}:{}|{:?}",
+            "{:?}|{:?}|{}:{}:{}|{:?}|{:016x}",
             self.arena.rung_tokens(),
             self.budgets.tokens,
             paging.page_size,
             paging.pages_per_slot,
             paging.context(),
-            self.tuning
+            self.tuning,
+            fnv(decisions.as_bytes())
         );
         format!(
             "metal-pipelines-1|{}|{os}|{binary}|{trace:016x}|{:016x}",
@@ -2446,6 +2458,7 @@ impl Shell {
                 (rung, sizes)
             })
             .collect();
+        let _ = kernels_metal::linear::gemm::record_shapes(true);
         let walked = (|| -> Result<u32> {
             let mut fires = 0u32;
             for (rung, sizes) in sized {
@@ -2521,11 +2534,52 @@ impl Shell {
             Ok(fires)
         })();
         self.warming = false;
+        let shapes = kernels_metal::linear::gemm::record_shapes(false);
         let fires = walked?;
         // What the walk backed goes back, and the rung stands where it
         // stood.
         if self.rung != standing {
             self.set_rung(self.rung, standing)?;
+        }
+        // Every dense matmul kernel a fire's rows can reach is built: each
+        // shape the walk dispatched, at every row count up to the most it
+        // dispatched it at, routes (gemm::route under this load's tuning)
+        // to a kernel the walk built, or the load is refused by name here,
+        // never a fire while serving.
+        let built: std::collections::HashSet<String> = self
+            .pipelines
+            .keys()
+            .into_iter()
+            .map(|(_, entry, ..)| entry.to_string())
+            .collect();
+        let tuning = &self.tuning;
+        let mut unbuilt: Vec<String> = Vec::new();
+        for &(columns, contraction, f32_out, most) in &shapes {
+            for rows in 1..=most {
+                let entry =
+                    kernels_metal::linear::gemm::route(tuning, rows, columns, contraction, f32_out);
+                if !built.contains(&entry) {
+                    unbuilt.push(format!("{entry} at {rows} x {columns} x {contraction}"));
+                }
+            }
+        }
+        tracing::info!(
+            shapes = shapes.len(),
+            unbuilt = unbuilt.len(),
+            "metal: the walk's matmul shapes route only to kernels it built"
+        );
+        if let Some(first) = unbuilt.first() {
+            return Err(Fault::Param {
+                name: "kernel.dense".to_string(),
+                why: Box::leak(
+                    format!(
+                        "routes a matmul the load's walk did not build its kernel for: {first} \
+                         ({} such row counts); a fire there would be refused",
+                        unbuilt.len()
+                    )
+                    .into_boxed_str(),
+                ),
+            });
         }
         Ok((fires, self.pipelines.compiled() - before))
     }
