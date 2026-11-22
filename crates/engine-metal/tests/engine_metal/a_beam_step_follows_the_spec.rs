@@ -239,7 +239,7 @@ fn search(dev: &Dev, lanes: u32, folded: u32, steps: u32, seed: u64, rs_t: u32) 
         buffer.write(run_at, &bytes_of(&[run])).expect("the run");
         dev.run(&|sink| {
             let width = std::mem::size_of::<BeamStepRun>() as u32;
-            kbeam::beam_step(sink, Tensor::new(runs, 1, width, Dtype::U8), 1).expect("beam_step encodes");
+            kbeam::beam_step(sink, Tensor::new(runs, 1, width, Dtype::U8), 1, lanes).expect("beam_step encodes");
         });
         // §11.4 on the host: siblings part at this fire's row, other pairs
         // agree as far as their parents did; priming, every pair shares the
@@ -528,16 +528,18 @@ fn copies_move_every_plane(dev: &Dev) {
     assert_eq!(faults, vec![0, kbeam::PAGES_COPY_BOUNDS], "the copy past the pool faults its lane");
 }
 
-/// A group wider than the head step's threadgroup arrays hold
-/// (`MAX_LANES`, refused at bind and before a fire on the host) faults every
-/// one of its lanes by name on the device, never a step that returns and
-/// leaves its lists unresolved (the L40S's audit of CUDA's `beam_step`).
-fn a_too_wide_group_faults_every_lane(dev: &Dev) {
-    let lanes = kbeam::MAX_LANES + 1;
+/// A group wider than its dispatch's threadgroup block holds (the host
+/// sizes the block for the dispatch's widest group and refuses at bind a
+/// group past the device's threadgroup memory) faults every one of its
+/// lanes by name on the device, never a step that returns and leaves its
+/// lists unresolved (the L40S's audit of CUDA's `beam_step`): nine beams
+/// dispatched with a block for eight.
+fn a_group_past_its_block_faults_every_lane(dev: &Dev) {
+    let lanes = 9u32;
     let mut arena = Arena { at: 0 };
     let run_at = arena.take(std::mem::size_of::<BeamStepRun>() as u64);
     let faults_at = arena.take(u64::from(lanes) * 4);
-    let buffer = Buffer::zeroed(&dev.device, arena.at).expect("a buffer");
+    let mut buffer = Buffer::zeroed(&dev.device, arena.at).expect("a buffer");
     let base = buffer.address_at(0).expect("an address");
     let run = BeamStepRun {
         faults: base + faults_at,
@@ -550,18 +552,19 @@ fn a_too_wide_group_faults_every_lane(dev: &Dev) {
         backed: 1,
         ..BeamStepRun::default()
     };
-    let mut buffer = buffer;
     buffer.write(run_at, &bytes_of(&[run])).expect("the run");
     let runs = dev.handles.bind(&buffer, 0, buffer.bytes()).expect("the runs");
     dev.run(&|sink| {
         let width = std::mem::size_of::<BeamStepRun>() as u32;
-        kbeam::beam_step(sink, Tensor::new(runs, 1, width, Dtype::U8), 1).expect("beam_step encodes");
+        kbeam::beam_step(sink, Tensor::new(runs, 1, width, Dtype::U8), 1, lanes - 1)
+            .expect("beam_step encodes");
     });
     let faults = words(&dev.read(&buffer, faults_at, u64::from(lanes) * 4));
     assert_eq!(
         faults,
         vec![kbeam::PAGES_TOO_WIDE; lanes as usize],
-        "every lane of a {lanes}-beam group faults as too wide"
+        "every lane of a {lanes}-beam group in a block for {} faults as too wide",
+        lanes - 1
     );
 }
 
@@ -584,5 +587,8 @@ fn a_beam_step_follows_the_spec() {
     }
     copies_move_every_plane(&dev);
     rs_copies_move_every_plane(&dev);
-    a_too_wide_group_faults_every_lane(&dev);
+    a_group_past_its_block_faults_every_lane(&dev);
+    // Past the 64 the arrays were fixed at before: the block sized by the
+    // group, under Apple's 32 KiB (`kbeam::max_lanes`: 86).
+    search(&dev, 80, 37, 2 * PAGE + 3, 1, 0);
 }

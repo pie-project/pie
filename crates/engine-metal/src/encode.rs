@@ -262,6 +262,12 @@ impl Sink<'_> {
     ) -> Result<(), Error> {
         let group = crate::device::ctx::group_of(pipeline, fire)
             .map_err(|fault| Sink::refuse(fire, fault))?;
+        if fire.threadgroup_bytes > 0 {
+            // SAFETY: index 0 is the kernel's one `[[threadgroup(0)]]`
+            // block; Metal checks the length against the device's limit
+            // with the pipeline's own, which the caller sized under.
+            unsafe { encoder.setThreadgroupMemoryLength_atIndex(fire.threadgroup_bytes as usize, 0) };
+        }
         if let Some(indirect) = fire.indirect {
             let binding = self.handles.get(indirect.buf).ok_or_else(|| {
                 Sink::refuse(

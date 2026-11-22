@@ -1611,6 +1611,7 @@ impl PreparedLoad<'_> {
             arms,
         )?;
         let capture_bytes = capture.as_ref().map_or(0, CaptureLayout::member_bytes);
+        let beam_widest = beam_max_lanes(&device)?;
         let weighed = weighed.and_then(|(counts, rungs, live, fire_top)| {
             engine::load::estimate(&counts, &chip.tuned().rates)
                 .ok()
@@ -1694,6 +1695,7 @@ impl PreparedLoad<'_> {
                     paging.pages_per_slot,
                     u32::try_from(arms).unwrap_or(u32::MAX),
                 );
+                plane.set_beam_max_lanes(beam_widest);
                 // A decode envelope's positions ride the device where its
                 // rows rotate by them alone (no host-built mrope table): a
                 // pass whose epilogue advances them (a beam group's) stages
@@ -5312,6 +5314,7 @@ impl Shell {
                 page: self.pools.paging().page_size,
                 addresses,
                 planes: self.pools.kv_page_planes(),
+                max_lanes: self.programs.beam_max_lanes(),
             };
             let pools = &self.pools;
             crate::beam::plan(
@@ -6370,7 +6373,7 @@ impl Shell {
             frame.next_pass()?;
             {
                 let sink = Sink::new(&self.device, &frame, &self.pipelines, &self.handles);
-                kernels_metal::runtime::beam::beam_step(&sink, beam.groups, beam.group_count)
+                kernels_metal::runtime::beam::beam_step(&sink, beam.groups, beam.group_count, beam.widest)
                     .map_err(crate::error::kernel)?;
             }
             #[cfg(target_vendor = "apple")]
@@ -7187,4 +7190,26 @@ fn pooled<T>(f: impl FnOnce() -> T) -> T {
 #[cfg(not(target_vendor = "apple"))]
 fn pooled<T>(f: impl FnOnce() -> T) -> T {
     f()
+}
+
+/// The widest beam group the head step runs on `device`: the largest whose
+/// threadgroup block fits the device's threadgroup memory beside what
+/// `beam_step` declares itself (`kernels_metal::runtime::beam::max_lanes`).
+#[cfg(target_vendor = "apple")]
+fn beam_max_lanes(device: &Context) -> Result<u32> {
+    use objc2_metal::{MTLComputePipelineState as _, MTLDevice as _};
+    let pipeline = Pipelines::new().at(
+        device.device(),
+        kernels_metal::Fire::at("runtime/beam.metal", "beam_step"),
+    )?;
+    Ok(kernels_metal::runtime::beam::max_lanes(
+        device.device().maxThreadgroupMemoryLength() as u64,
+        pipeline.staticThreadgroupMemoryLength() as u64,
+    ))
+}
+
+/// A deviceless build serves no beam group.
+#[cfg(not(target_vendor = "apple"))]
+fn beam_max_lanes(_device: &Context) -> Result<u32> {
+    Ok(0)
 }

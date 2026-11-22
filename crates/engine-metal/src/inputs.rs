@@ -120,6 +120,9 @@ pub struct BeamAddresses {
 pub struct BeamStaged {
     pub groups: Tensor,
     pub group_count: u32,
+    /// The widest group's beams: what the head step's threadgroup block is
+    /// sized for.
+    pub widest: u32,
     pub copies: Tensor,
     pub planes: Tensor,
     pub copy_count: u32,
@@ -633,6 +636,7 @@ impl Inputs {
         Ok(Some(BeamStaged {
             groups: bind(b.groups, records.groups.len(), std::mem::size_of::<BeamStepRun>())?,
             group_count: records.groups.len() as u32,
+            widest: records.groups.iter().map(|group| group.lanes).max().unwrap_or(1),
             copies: bind(b.copies, records.copies.len(), std::mem::size_of::<PageCopyRun>())?,
             planes: bind(b.planes, records.planes.len(), std::mem::size_of::<PagePlane>())?,
             copy_count: records.copies.len() as u32,

@@ -16,7 +16,6 @@ using namespace metal;
 #define PIE_PAGES_EXHAUSTED 6u
 #define PIE_PAGES_TOO_WIDE 7u
 #define PIE_BEAM_HEADER 4u
-#define PIE_BEAM_MAX_LANES 64u
 #define PIE_BEAM_THREADS 256u
 
 // A lane's page table to resolve: its staged indices from entry `f0`, its
@@ -101,6 +100,11 @@ static inline void fault_max(ulong faults, uint lane, uint code) {
 kernel void beam_step(
     const device BeamStepRun* runs [[buffer(0)]],
     constant uint& run_count [[buffer(1)]],
+    // The step's per-beam arrays, sized at dispatch for the widest group of
+    // the dispatch: five of B words, then the B x B common-ancestor table
+    // (`beam_step_words`). `tg_words` is how many words the block holds.
+    constant uint& tg_words [[buffer(2)]],
+    threadgroup uint* tg [[threadgroup(0)]],
     uint group [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     uint threads_in [[threads_per_threadgroup]])
@@ -110,10 +114,11 @@ kernel void beam_step(
     const uint B = r.lanes, cap = r.cap, Q = r.reserve, S = r.page;
     const uint F = r.frames == 0u ? 1u : r.frames;
     const uint K = r.backed < Q ? r.backed : Q;
-    // A group wider than the step's threadgroup arrays hold (the host refuses
-    // it at bind, `PIE_BEAM_MAX_LANES` there too): every lane faulted by name,
-    // never a step that leaves its lists unresolved.
-    if (B > PIE_BEAM_MAX_LANES) {
+    // A group wider than the dispatch's block holds (the host sizes the block
+    // for its widest group and refuses at bind a group past the device's
+    // threadgroup memory): every lane faulted by name, never a step that
+    // leaves its lists unresolved.
+    if (B * (B + 5u) > tg_words) {
         for (uint b = tid; b < B; b += threads_in) fault_max(r.faults, b, PIE_PAGES_TOO_WIDE);
         return;
     }
@@ -135,11 +140,11 @@ kernel void beam_step(
     const uint c = r.slot / S - f0, o = r.slot % S;
     const uint cp = r.slot == 0u ? 0u : (r.slot - 1u) / S - f0;
 
-    threadgroup uint parent_of[PIE_BEAM_MAX_LANES];
-    threadgroup uint need[PIE_BEAM_MAX_LANES];
-    threadgroup uint rank_of[PIE_BEAM_MAX_LANES];
-    threadgroup uint fresh[PIE_BEAM_MAX_LANES];
-    threadgroup uint hand[PIE_BEAM_MAX_LANES];
+    threadgroup uint* parent_of = tg;
+    threadgroup uint* need = tg + B;
+    threadgroup uint* rank_of = tg + 2u * B;
+    threadgroup uint* fresh = tg + 3u * B;
+    threadgroup uint* hand = tg + 4u * B;
     threadgroup uint counts[PIE_BEAM_THREADS];
     threadgroup uint needed;
     threadgroup uint handed;
@@ -281,7 +286,7 @@ kernel void beam_step(
     // fire's rows (with one lane every row is common), never below the
     // folded slot; monotone, read by the host at harvest.
     device uint* lca = copies + 3u * B;
-    threadgroup uint lca_new[PIE_BEAM_MAX_LANES * PIE_BEAM_MAX_LANES];
+    threadgroup uint* lca_new = tg + 5u * B;
     threadgroup atomic_uint common_s;
     if (tid == 0u) atomic_store_explicit(&common_s, r.slot + 1u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);

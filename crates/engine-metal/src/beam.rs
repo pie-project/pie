@@ -111,6 +111,9 @@ pub struct Staged<'a> {
     pub page: u32,
     pub addresses: BeamAddresses,
     pub planes: Vec<kbeam::PagePlane>,
+    /// The widest group the head step runs on this device
+    /// ([`kbeam::max_lanes`]).
+    pub max_lanes: u32,
 }
 
 /// Plans `groups` over the fire as `staged`: `translation(source)` a lane's
@@ -143,14 +146,14 @@ pub fn plan(
         let first = group.lanes.first().ok_or_else(|| {
             Fault::program("beam", "a beam group of no lanes".to_string())
         })?;
-        if group.layout.lanes > kbeam::MAX_LANES {
+        if group.layout.lanes > staged.max_lanes {
             return Err(Fault::program(
                 "beam",
                 format!(
                     "instance {}'s beam group runs {} beams and the head step holds at most {}",
                     group.instance,
                     group.layout.lanes,
-                    kbeam::MAX_LANES
+                    staged.max_lanes
                 ),
             ));
         }

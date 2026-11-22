@@ -18,15 +18,41 @@ pub const PAGES_PARENT: u32 = 5;
 /// Fewer free pages than a fire hands out: unreachable with exact sizing,
 /// so a bug where it happens.
 pub const PAGES_EXHAUSTED: u32 = 6;
-/// A group wider than [`MAX_LANES`]: every lane faulted, its step not run.
-/// The host refuses such a group at bind and before a fire, so a fault
-/// here is a bug where it happens.
+/// A group wider than its dispatch's threadgroup block holds
+/// ([`max_lanes`]): every lane faulted, its step not run. The host refuses
+/// such a group at bind and before a fire, so a fault here is a bug where
+/// it happens.
 pub const PAGES_TOO_WIDE: u32 = 7;
 
-/// The most beams one group runs: `beam_step`'s threadgroup arrays
-/// (`PIE_BEAM_MAX_LANES`), about 18 KiB with the common-ancestor table
-/// (`MAX_LANES`² words), inside every Apple GPU's 32 KiB.
-pub const MAX_LANES: u32 = 64;
+/// The words `beam_step`'s threadgroup block takes for a group of `lanes`
+/// beams: five arrays of a word a beam, then the beams' common-ancestor
+/// table (`lanes`² words).
+#[must_use]
+pub const fn step_words(lanes: u32) -> u64 {
+    lanes as u64 * (lanes as u64 + 5)
+}
+
+/// [`step_words`] in bytes as a dispatch sets them: Metal takes a
+/// threadgroup block's length in multiples of 16 bytes.
+#[must_use]
+pub const fn step_bytes(lanes: u32) -> u64 {
+    (step_words(lanes) * 4).next_multiple_of(16)
+}
+
+/// The widest beam group `beam_step` runs on a device whose threadgroup
+/// memory is `device_bytes` (`maxThreadgroupMemoryLength`), the pipeline
+/// itself declaring `static_bytes` (`staticThreadgroupMemoryLength`): the
+/// largest width whose block fits beside them. Apple's 32 KiB with the
+/// step's own ~1 KiB: 86.
+#[must_use]
+pub fn max_lanes(device_bytes: u64, static_bytes: u64) -> u32 {
+    let room = device_bytes.saturating_sub(static_bytes);
+    let mut lanes = 0u32;
+    while step_bytes(lanes + 1) <= room {
+        lanes += 1;
+    }
+    lanes
+}
 
 const STEP_THREADS: u32 = 256;
 const COPY_THREADS: u32 = 128;
@@ -295,17 +321,19 @@ pub fn pipelines() -> [Fire; 3] {
 }
 
 /// Runs `run_count` [`BeamStepRun`]s from `runs` (bytes), a threadgroup a
-/// group.
-pub fn beam_step(ctx: &Ctx<'_>, runs: Tensor, run_count: u32) -> Result<(), Error> {
+/// group, its threadgroup block sized for the widest, `widest` beams
+/// ([`step_bytes`]; the caller holds it to [`max_lanes`]).
+pub fn beam_step(ctx: &Ctx<'_>, runs: Tensor, run_count: u32, widest: u32) -> Result<(), Error> {
     if run_count == 0 {
         return Ok(());
     }
+    let bytes = step_bytes(widest.max(1));
+    let tg_words = u32::try_from(bytes / 4).unwrap_or(u32::MAX);
     ctx.fire(
-        Fire::at(FILE, "beam_step").apply(Grid::of(
-            [STEP_THREADS * run_count, 1, 1],
-            [STEP_THREADS, 1, 1],
-        )),
-        &[runs.arg(), run_count.arg()],
+        Fire::at(FILE, "beam_step")
+            .apply(Grid::of([STEP_THREADS * run_count, 1, 1], [STEP_THREADS, 1, 1]))
+            .threadgroup_bytes(u32::try_from(bytes).unwrap_or(u32::MAX)),
+        &[runs.arg(), run_count.arg(), tg_words.arg()],
     )
 }
 
@@ -350,4 +378,23 @@ pub fn copy_rs_rows(
         )),
         &[runs.arg(), planes.arg(), run_count.arg()],
     )
+}
+
+#[cfg(test)]
+mod width_tests {
+    use super::{max_lanes, step_bytes};
+
+    /// The widest group is the largest whose block fits beside the
+    /// pipeline's own threadgroup memory, in Metal's 16-byte steps: 86 on
+    /// Apple's 32 KiB with the step's ~1 KiB, and one more beam never fits.
+    #[test]
+    fn the_widest_group_is_the_largest_whose_block_fits() {
+        let (device, own) = (32 << 10, 1036);
+        let widest = max_lanes(device, own);
+        assert_eq!(widest, 86);
+        assert!(step_bytes(widest) + own <= device);
+        assert!(step_bytes(widest + 1) + own > device);
+        assert_eq!(step_bytes(64), 17_664, "64 beams: 5 x 64 + 64 x 64 words");
+        assert_eq!(max_lanes(0, 0), 0);
+    }
 }

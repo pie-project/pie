@@ -155,6 +155,9 @@ pub struct Plane {
     /// pages wait (BEAM-PAGE-LISTS §3): the context's pages and the frames
     /// in flight.
     beam_bounds: (u32, u32),
+    /// The widest beam group the device's threadgroup memory holds for the
+    /// head step (`kernels_metal::runtime::beam::max_lanes`), set at load.
+    beam_max_lanes: u32,
     /// Whether a decode envelope's positions are copied from their cell on
     /// the device ([`Session::positions_cell`]) rather than read on the
     /// host: every load but one whose rows rotate by a host-built mrope
@@ -211,6 +214,7 @@ impl Plane {
             span_rows: 1,
             capture: 0,
             beam_bounds: (0, 1),
+            beam_max_lanes: 0,
             device_positions: false,
             next_program: 1,
             next_instance: 1,
@@ -413,19 +417,18 @@ impl Plane {
             .programs
             .get(&program_id)
             .ok_or_else(|| Fault::program("program::plane", format!("no program {program_id}")))?;
-        // A beam group wider than the head step's threadgroup arrays hold
-        // (`kernels_metal::runtime::beam::MAX_LANES`) is refused here by name,
-        // before anything is claimed, not at its first fire.
+        // A beam group wider than the head step's threadgroup block holds on
+        // this device ([`Plane::set_beam_max_lanes`]) is refused here by
+        // name, before anything is claimed, not at its first fire.
         if let Some(layout) = self.beam_of(program)
-            && layout.lanes > kernels_metal::runtime::beam::MAX_LANES
+            && layout.lanes > self.beam_max_lanes
         {
             return Err(Fault::program(
                 "program::plane",
                 format!(
                     "program {program_id} states parents for {} beams and the head step holds at \
-                     most {} a group",
-                    layout.lanes,
-                    kernels_metal::runtime::beam::MAX_LANES
+                     most {} a group on this device (its threadgroup memory)",
+                    layout.lanes, self.beam_max_lanes
                 ),
             ));
         }
@@ -691,6 +694,18 @@ impl Plane {
 
     /// The pages a beam group's lists span (the context's) and the frames
     /// its freed pages wait (the frames in flight).
+    /// The widest beam group the head step runs on this device
+    /// (`kernels_metal::runtime::beam::max_lanes`): a bind past it is
+    /// refused by name.
+    pub fn set_beam_max_lanes(&mut self, lanes: u32) {
+        self.beam_max_lanes = lanes;
+    }
+
+    #[must_use]
+    pub fn beam_max_lanes(&self) -> u32 {
+        self.beam_max_lanes
+    }
+
     pub fn set_beam_bounds(&mut self, pages: u32, frames: u32) {
         self.beam_bounds = (pages, frames.max(1));
     }
@@ -4723,6 +4738,7 @@ mod tests {
         let mut plane = Plane::new();
         plane.set_flight(1, 1, case.rows);
         plane.set_beam_bounds(4, 2);
+        plane.set_beam_max_lanes(kernels_metal::runtime::beam::max_lanes(32 << 10, 0));
         let program = plane.register(&context, &registration).expect("the program registers");
         let facts = plane.facts(program, &pools).expect("the program's facts");
         let count = case.bound.container.channels.len();
