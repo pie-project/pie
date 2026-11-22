@@ -10,7 +10,7 @@ use crate::device::alloc::Buffer;
 use crate::device::ctx::{Core, Frame, Pending};
 use engine_gpu::error::{Fault, Result};
 use engine_gpu::store::Pools;
-use engine_gpu::store::layout::{CHANNEL, INSTANCE};
+use engine_gpu::store::layout::INSTANCE;
 
 use crate::serve::GuestRing;
 use engine_gpu::backend::Buffer as _;
@@ -402,114 +402,10 @@ impl Pass {
     }
 }
 
-/// The cells of channels the device keeps between fires, by channel: one
-/// set for the engine, so a pass reads what another program's pass kept.
-/// A channel's cell lies in the `Channel` slots the runtime took for it
-/// when it was registered (or its instance bound), whether or not a pass
-/// keeps a cell in it now.
-pub type Kept = Arc<std::sync::Mutex<std::collections::HashMap<engine::channel::ChannelId, Cell>>>;
-
-/// Where a channel keeps a cell on the device.
-#[derive(Debug)]
-pub struct Cell {
-    place: CellPlace,
-    bytes: u64,
-    /// A pass kept a cell here the host has not superseded.
-    live: bool,
-}
-
-#[derive(Debug)]
-enum CellPlace {
-    /// In the channel's `Channel` slots (one run where the cell is past a
-    /// slot).
-    Pooled(Held),
-    /// A cell past a chunk, which the contract states no slots for: a
-    /// buffer of the engine's own.
-    Own(Buffer),
-}
-
-impl Cell {
-    /// A cell of `bytes` in `slots` (`Channel` slot refs, one run where
-    /// `bytes` is past a slot).
-    pub fn pooled(pools: &Pools<crate::device::Api>, slots: &[u32], bytes: u64) -> Result<Cell> {
-        let count = u32::try_from(slots.len()).unwrap_or(u32::MAX);
-        let first = *slots.first().ok_or_else(|| Fault::Program {
-            at: "guest::session",
-            why: "a channel cell placed in no Channel slots".into(),
-        })?;
-        if !consecutive(slots) {
-            return Err(Fault::Program {
-                at: "guest::session",
-                why: format!("a channel cell of {bytes} bytes in slots {slots:?}, not one run"),
-            });
-        }
-        Ok(Cell {
-            place: CellPlace::Pooled(Held::in_run(pools, CHANNEL, first, count, 0, bytes)?),
-            bytes,
-            live: false,
-        })
-    }
-
-    /// A cell past a chunk, in a buffer of its own.
-    pub fn own(device: &Context, bytes: u64) -> Result<Cell> {
-        Ok(Cell {
-            place: CellPlace::Own(Buffer::zeroed(
-                device,
-                bytes,
-                engine_gpu::books::owners::GUEST_STATE,
-            )?),
-            bytes,
-            live: false,
-        })
-    }
-
-    fn span(&self) -> (&Buffer, u64) {
-        match &self.place {
-            CellPlace::Pooled(held) => (held.buffer(), held.offset()),
-            CellPlace::Own(buffer) => (buffer, 0),
-        }
-    }
-
-    /// The cell as the forward reads it.
-    #[must_use]
-    pub fn device_cell(&self) -> engine_gpu::serve::DeviceCell<crate::device::Api> {
-        let (buffer, at) = self.span();
-        engine_gpu::serve::DeviceCell {
-            buffer: buffer.clone(),
-            at,
-            bytes: self.bytes,
-        }
-    }
-
-    pub fn rebind(&mut self, pools: &Pools<crate::device::Api>) -> Result<()> {
-        match &mut self.place {
-            CellPlace::Pooled(held) => held.rebind(pools),
-            CellPlace::Own(_) => Ok(()),
-        }
-    }
-
-    /// Moves a pooled cell to `slots`, whose bytes the runtime copied there.
-    pub fn retarget(&mut self, pools: &Pools<crate::device::Api>, slots: &[u32]) -> Result<()> {
-        let need = held::item_slots(
-            self.bytes,
-            pools.slot_bytes(CHANNEL)?,
-            pools.slots_per_chunk(CHANNEL)?,
-        )
-        .map_or(0, |(slots, _)| slots);
-        match &mut self.place {
-            CellPlace::Pooled(held) if slots.len() == need as usize && consecutive(slots) => {
-                held.retarget(pools, slots[0])
-            }
-            _ => Err(Fault::Program {
-                at: "guest::session",
-                why: format!(
-                    "a channel cell of {} bytes rebound to {slots:?}, which is not a run of the                      {need} slot(s) it holds",
-                    self.bytes
-                ),
-            }),
-        }
-    }
-}
+/// The cells channels keep on the device, shared by every engine's guest
+/// passes (`engine_gpu::guest::defer`).
+pub type Kept = engine_gpu::guest::defer::Kept<crate::device::Api>;
+pub type Cell = engine_gpu::guest::defer::Cell<crate::device::Api>;
 
 /// Where an instance's tables go: the `Instance` slots the runtime took
 /// for them, and a table's alignment there.
@@ -548,9 +444,8 @@ pub struct Session {
     /// group's name and the taking ([`Session::join_pair`]).
     pair_group: Option<(u64, u64)>,
 
-    kept: Kept,
-    /// The engine's channel behind each of the program's.
-    channels: Vec<engine::channel::ChannelId>,
+    /// The cells its channels keep on the device, by the program's index.
+    cells: engine_gpu::guest::defer::Cells<crate::device::Api>,
 
     /// Passes submitted and not yet waited on, oldest first.
     airborne: std::collections::VecDeque<Pending>,
@@ -759,8 +654,7 @@ impl Session {
             instance,
             pair,
             scores: layout.scores,
-            kept,
-            channels,
+            cells: engine_gpu::guest::defer::Cells::new(channels, kept),
             airborne: std::collections::VecDeque::new(),
             ring,
         };
@@ -1221,7 +1115,6 @@ impl Session {
     /// read back: the next fire's take of the channel restores it.
     pub fn keep(
         &mut self,
-        device: &Context,
         frame: &mut Frame,
         stage: usize,
         value: u32,
@@ -1231,44 +1124,14 @@ impl Session {
             at: "guest::session",
             why: format!("value {value} is not stage {stage}'s"),
         })?;
-        let _ = device;
-        let id = self.channel(channel)?;
-        let mut kept = self.kept.lock().expect("kept cells lock poisoned");
-        let cell = kept.get_mut(&id).ok_or_else(|| Fault::Program {
-            at: "guest::session",
-            why: format!(
-                "channel {id} keeps a cell on the device and holds no place for one: its \
-                 registration took no Channel slots"
-            ),
-        })?;
-        if cell.bytes < len {
-            return Err(Fault::Program {
-                at: "guest::session",
-                why: format!(
-                    "channel {id} keeps a {len}-byte value in a {}-byte cell",
-                    cell.bytes
-                ),
-            });
-        }
-        let (into, into_at) = cell.span();
         let (heap, base) = self.heap_at(stage)?;
-        frame.copy(heap, base + at, into, into_at, len)?;
-        cell.live = true;
-        Ok(())
+        self.cells.keep(frame, heap, base + at, len, channel)
     }
 
-    /// The engine's id of the program's `channel`.
-    fn channel(&self, channel: u32) -> Result<engine::channel::ChannelId> {
-        self.channels
-            .get(channel as usize)
-            .copied()
-            .ok_or_else(|| Fault::Program {
-                at: "guest::session",
-                why: format!(
-                    "channel {channel} is past the {} this instance binds",
-                    self.channels.len()
-                ),
-            })
+    /// The cells its channels keep on the device.
+    #[must_use]
+    pub fn cells(&self) -> &engine_gpu::guest::defer::Cells<crate::device::Api> {
+        &self.cells
     }
 
     /// The device cell a kept channel holds.
@@ -1277,13 +1140,7 @@ impl Session {
         &self,
         channel: u32,
     ) -> Option<engine_gpu::serve::DeviceCell<crate::device::Api>> {
-        let id = self.channels.get(channel as usize)?;
-        self.kept
-            .lock()
-            .expect("kept cells lock poisoned")
-            .get(id)
-            .filter(|cell| cell.live)
-            .map(Cell::device_cell)
+        self.cells.kept_cell(channel)
     }
 
     pub fn depart(&mut self, pending: Pending) {
@@ -1303,21 +1160,13 @@ impl Session {
 
     #[must_use]
     pub fn keeps(&self, channel: u32) -> bool {
-        self.kept_cell(channel).is_some()
+        self.cells.keeps(channel)
     }
 
     /// Drops the device's cell for `channel`, so the next take reads the
     /// ring, which the host has written.
     pub fn forget(&mut self, channel: u32) {
-        if let Some(id) = self.channels.get(channel as usize)
-            && let Some(cell) = self
-                .kept
-                .lock()
-                .expect("kept cells lock poisoned")
-                .get_mut(id)
-        {
-            cell.live = false;
-        }
+        self.cells.forget(channel);
     }
 
     /// Copies `channel`'s kept cell into `value`; false when the device keeps
@@ -1329,16 +1178,15 @@ impl Session {
         value: u32,
         channel: u32,
     ) -> Result<bool> {
-        let Some(cell) = self.kept_cell(channel) else {
+        if !self.cells.keeps(channel) {
             return Ok(false);
-        };
+        }
         let (at, len) = self.span(stage, value).ok_or_else(|| Fault::Program {
             at: "guest::session",
             why: format!("value {value} is not stage {stage}'s"),
         })?;
         let (heap, base) = self.heap_at(stage)?;
-        frame.copy(&cell.buffer, cell.at, heap, base + at, len.min(cell.bytes))?;
-        Ok(true)
+        self.cells.restore(frame, heap, base + at, len, channel)
     }
 
     pub fn dispatch(&self, frame: &Frame, at: usize) -> Result<()> {
