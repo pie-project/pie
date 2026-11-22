@@ -531,18 +531,21 @@ struct SimEngine {
     /// another live holder holds is refused by name, as the engine refuses
     /// it, and said as a failure of its own ([`Log::claims`]).
     claims: ::engine::guest_claims::Claims,
-    /// Instances parked (`Rebind::Parked`): they hold only their kept runs.
-    parked: std::collections::BTreeSet<u64>,
+    /// Instances parked (`Rebind::Parked`), and whether their park kept
+    /// their tables and rings in place: they hold only those, which an
+    /// evacuation moves as a live instance's.
+    parked: BTreeMap<u64, bool>,
     /// Refusals the claims made, said by the next check.
     refusals: Vec<String>,
 }
 
-/// The bytes `slot` of `shape` takes, as a claim's run: a slot ref's
-/// logical chunk and its offset there (a compaction moves runs whole, and
-/// every claim is laid again after one: [`SimEngine::rebase`]).
-fn slot_run(shape: u32, slot: u32) -> ::engine::guest_claims::Run {
+/// The bytes `slot` of `shape` takes, as a claim's run: the physical chunk
+/// its logical one lies at now and its offset there, as a device address an
+/// engine claims (a compaction or an evacuation moves chunks, and every
+/// claim is laid again after one: [`SimEngine::rebase`]).
+fn slot_run(bytes: &Bytes, shape: u32, slot: u32) -> ::engine::guest_claims::Run {
     let (chunk, off, len) = Bytes::place(shape, slot);
-    let start = u64::from(chunk) * MIB + off;
+    let start = u64::from(bytes.physical(chunk)) * MIB + off;
     ::engine::guest_claims::Run {
         segment: 0,
         start,
@@ -558,19 +561,19 @@ impl SimEngine {
         let mut runs: Vec<_> = places
             .instance
             .iter()
-            .map(|&slot| slot_run(INSTANCE, slot))
+            .map(|&slot| slot_run(bytes, INSTANCE, slot))
             .chain(
                 places
                     .rings
                     .iter()
-                    .flat_map(|ring| ring.slots.iter().map(|&slot| slot_run(CHANNEL, slot))),
+                    .flat_map(|ring| ring.slots.iter().map(|&slot| slot_run(bytes, CHANNEL, slot))),
             )
             .collect();
         if scratch {
             runs.extend(
                 place_slots(&places.scratch, bytes)
                     .into_iter()
-                    .map(|slot| slot_run(INSTANCE, slot)),
+                    .map(|slot| slot_run(bytes, INSTANCE, slot)),
             );
         }
         runs
@@ -582,7 +585,7 @@ impl SimEngine {
             taking: places.pair_generation,
             runs: place_slots(&places.pair, bytes)
                 .into_iter()
-                .map(|slot| slot_run(INSTANCE, slot))
+                .map(|slot| slot_run(bytes, INSTANCE, slot))
                 .collect(),
         })
     }
@@ -606,7 +609,7 @@ impl SimEngine {
                         self.claims
                             .members(pair)
                             .into_iter()
-                            .map(|member| (member, self.parked.contains(&member)))
+                            .map(|member| (member, self.parked.contains_key(&member)))
                             .collect::<Vec<_>>()
                     ),
                     ::engine::guest_claims::Holder::Instance(_) => String::new(),
@@ -622,16 +625,24 @@ impl SimEngine {
         })
     }
 
-    /// Every live claim laid again where a compaction left it, in one step
-    /// (an engine's evacuation rebase): a parked instance holds only what
-    /// it kept, in single slots a compaction leaves where they are.
+    /// Every live claim laid again where a compaction or an evacuation left
+    /// it, in one step (an engine's evacuation rebase): a parked instance
+    /// holds only what its park kept in place, moved with its chunks.
     fn rebase(&mut self) {
         let bytes = self.bytes.lock().unwrap();
         let mut moved = Vec::new();
         let mut pairs = BTreeMap::new();
         for (&id, places) in &self.instances {
-            if self.parked.contains(&id) {
-                continue;
+            match self.parked.get(&id) {
+                Some(false) => continue,
+                Some(true) => {
+                    moved.push((
+                        ::engine::guest_claims::Holder::Instance(id),
+                        Self::own_runs(places, &bytes, false),
+                    ));
+                    continue;
+                }
+                None => {}
             }
             moved.push((
                 ::engine::guest_claims::Holder::Instance(id),
@@ -833,7 +844,7 @@ impl Engine for SimEngine {
                         Vec::new()
                     };
                     self.claims.park(id.0, &runs);
-                    self.parked.insert(id.0);
+                    self.parked.insert(id.0, kept);
                     trace(|| format!("parked {} kept={kept}", id.0));
                 }
             }
@@ -935,6 +946,11 @@ struct Workload {
 
 impl Workload {
     fn of(seed: u64) -> Self {
+        // `PIE_SIM_FIELD`: every seed the field's mix, drawn from a stream
+        // of its own ([`Self::field_mix`]).
+        if std::env::var_os("PIE_SIM_FIELD").is_some() {
+            return Self::field_mix(seed, Rng(seed ^ 0xf1e1_d0a1));
+        }
         let mut rng = Rng(seed);
         let pool = PoolShape::of(&mut rng);
         let state = pool.state_chunks();
@@ -1080,6 +1096,96 @@ impl Workload {
             target,
             ring,
             landing_fails,
+        }
+    }
+
+    /// The L40S's 3 GiB disk-only stress mix: a small device, no host tier,
+    /// a small disk, verified beam searches (forks over a shared prompt, a
+    /// resident beam group's guest state bound early, a rescore that closes
+    /// it and binds a second program) beside a crowd of plain greedy
+    /// decodes. Every process must finish within the run's bound: beams
+    /// verified while every decode starved (150 of 150 unfinished in 527 s,
+    /// evictions and restores 1:1) is a liveness failure.
+    fn field_mix(seed: u64, mut rng: Rng) -> Self {
+        let mut pool = PoolShape::of(&mut rng);
+        pool.total = rng.range(14, 24);
+        pool.segment = [4, 6, pool.total][rng.below(3) as usize];
+        pool.host_chunks = 0;
+        // A small disk, or one roomy beside the device (the L40S's).
+        pool.disk_chunks = if rng.chance(1, 2) { rng.range(6, 16) } else { rng.range(32, 96) };
+        pool.programs.retain(|program| program.run * 2 <= pool.total / 4);
+        let most = pool.most_pages();
+        let horizon = rng.range(4, 30);
+        let beam_programs: Vec<u32> = (0..pool.programs.len() as u32).collect();
+        let mut scripts = Vec::new();
+        for _ in 0..rng.range(2, 6) {
+            let decode = rng.range(4, 16);
+            let mut script = Script {
+                at: rng.range(0, horizon),
+                prompt: rng.range(4, 16),
+                decode,
+                grow_every: rng.range(1, 2),
+                beams: 4,
+                bind: vec![(1.min(beam_programs.len() as u32 - 1), false)],
+                idle: None,
+                rescore: Some((
+                    rng.range(0, decode - 1),
+                    beam_programs[rng.below(beam_programs.len() as u64) as usize],
+                )),
+            };
+            while script.pages() > most && script.decode > 1 {
+                script.decode -= 1;
+            }
+            while script.pages() > most && script.prompt > 1 {
+                script.prompt -= 1;
+            }
+            while script.pages() > most && script.beams > 1 {
+                script.beams -= 1;
+            }
+            if let Some((when, program)) = script.rescore {
+                script.rescore = Some((when.min(script.decode.saturating_sub(1)), program));
+            }
+            scripts.push(script);
+        }
+        for _ in 0..rng.range(12, 40) {
+            let mut script = Script {
+                at: rng.range(0, horizon),
+                prompt: rng.range(1, 4),
+                decode: rng.range(20, 120),
+                grow_every: rng.range(1, 3),
+                beams: 1,
+                bind: Vec::new(),
+                idle: None,
+                rescore: None,
+            };
+            while script.pages() > most && script.decode > 0 {
+                script.decode -= 1;
+            }
+            scripts.push(script);
+        }
+        let late = [0, 4][rng.below(2) as usize];
+        // The device's room shrinks under the mix and comes back: its
+        // evacuations move parked state kept in place, claims and all.
+        let mut target = Vec::new();
+        let segments = pool.segments();
+        if segments >= 3 && rng.chance(1, 2) {
+            pool.governed = true;
+            let mut from = rng.range(0, horizon + 4);
+            for _ in 0..rng.range(1, 3) {
+                let to = from + rng.range(2, 24);
+                target.push((from, to, rng.range(segments - 1, segments - 1).max(2)));
+                from = to + rng.range(0, 12);
+            }
+        }
+        Self {
+            seed,
+            pool,
+            scripts,
+            tier_full: Vec::new(),
+            late,
+            target,
+            ring: None,
+            landing_fails: None,
         }
     }
 
@@ -1637,6 +1743,7 @@ async fn fire(
         drop(grant);
         ctx.log.lock().unwrap().fires += 1;
         ctx.at(pid, "fire in flight");
+        trace(|| format!("fire {pid} pages={pages} step={}", ctx.step.load(Ordering::Relaxed)));
         ctx.next_step().await;
         with_kv_lock(&ctx.stores.kv, "sim-land", |kv| {
             for seq in seqs {
@@ -2026,6 +2133,19 @@ const LOST_WAKES_FAIL: bool = false;
 /// The checks after a settled step: the processes refused since the last
 /// (the run goes on), or `Err`, the failure that ends it.
 fn check(ctx: &Ctx, step: u32, moving: bool) -> Result<Vec<Failure>, Failure> {
+    if std::env::var_os("PIE_SIM_CAP").is_some() {
+        eprintln!(
+            "SIMCAP step {step} read {:?} census {:?} device {:?} disk {:?} roles {:?}",
+            ctx.planner.capacity_read(),
+            ctx.planner.port.capacity_census(),
+            ctx.planner.port.device_stats(),
+            ctx.planner.port.disk_stats(),
+            ctx.stores.roles.as_ref().map(|roles| {
+                let roles = roles.lock().unwrap();
+                (roles.footprint(), roles.footprint_on_disk(), roles.slack())
+            }),
+        );
+    }
     let fail = |kind: &str, line: String| Failure {
         step,
         kind: kind.to_string(),
@@ -2114,6 +2234,12 @@ fn check(ctx: &Ctx, step: u32, moving: bool) -> Result<Vec<Failure>, Failure> {
         let leaked = roles.lock().unwrap().leaked();
         if leaked > 0 {
             return Err(fail("store", format!("{leaked} role slots leaked")));
+        }
+        // No ref two items hold, none an item holds that the pool counts
+        // free (the L40S on batch 3: instance slot 12537 handed to a
+        // restore's rebind and a fresh bind 1 ms apart).
+        if let Some(line) = roles.lock().unwrap().audit_device_slots().into_iter().next() {
+            return Err(fail("double", line));
         }
     }
     // A strict pass on the settled state: a head left waiting with nothing
@@ -2237,7 +2363,7 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
         instances: BTreeMap::new(),
         pair_generation: BTreeMap::new(),
         claims: ::engine::guest_claims::Claims::default(),
-        parked: std::collections::BTreeSet::new(),
+        parked: BTreeMap::new(),
         refusals: Vec::new(),
     }));
     // A governed pool's segment walk, the runtime's own: the engine takes
