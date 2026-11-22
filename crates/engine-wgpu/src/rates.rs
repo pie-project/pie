@@ -92,11 +92,18 @@ pub fn at_load(
             resident
         }
         (None, engine::rates::Measuring::Skip) => {
-            let (resident, why) = engine_gpu::rates::resident_estimate(device.chip().cores);
+            // A device fact no driver states as such: timed (milliseconds,
+            // stored nowhere), never defaulted.
+            let (resident, ms) = resident_for_skip(device, &tuning, max_submit)?;
+            let resident = resident.round().clamp(1.0, f64::from(u32::MAX)) as u32;
             tracing::info!(
                 resident,
-                "rates: skipped: `[rates] {}`, served by the estimate: {resident} workgroups ({why})",
-                profile::fire::RESIDENT_WORKGROUPS
+                ms,
+                "rates: `[rates] {}` timed despite measure = false (no layer states it, and the \
+                 device states no count a guest step's grid can stride over): a {}-cubed matmul \
+                 against one workgroup of it, single fires; stored nowhere",
+                profile::fire::RESIDENT_WORKGROUPS,
+                engine_gpu::rates::RESIDENT_SHAPE
             );
             resident
         }
@@ -110,6 +117,19 @@ pub fn at_load(
     };
     device.hold_resident(resident);
     Ok(tuning)
+}
+
+/// `[rates] resident_workgroups` timed where a load skips measuring and no
+/// layer states it (`engine_gpu::rates::resident_for_skip`): the
+/// workgroups, and the ms it took.
+fn resident_for_skip(
+    device: &Context,
+    tuning: &crate::tuning::Tuning,
+    max_submit: Option<std::time::Duration>,
+) -> Result<(f64, u128)> {
+    let tier = <Api as engine_gpu::serve::Serve>::tier(device);
+    let timer = timer();
+    engine_gpu::rates::resident_for_skip::<Api, _>(device, tuning, tier, &timer, max_submit)
 }
 
 /// The rates of `device` that `stated` lacks (every one where it states

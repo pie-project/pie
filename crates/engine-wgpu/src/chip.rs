@@ -33,7 +33,19 @@ macro_rules! seeded {
     };
 }
 
-seeded!();
+seeded!(
+    // The Adreno 840's, once exported from the phone's home (`pie tune
+    // export --engine wgpu`) and checked in as `profiles/<id>.measured.toml`
+    // (`<id>` the adapter's name by `profile::id_of`, `adreno-tm-840` for
+    // "Adreno (TM) 840"):
+    // "adreno-tm-840.measured.toml",
+);
+
+/// The host covers committed for the adapters native wgpu serves
+/// (`profiles/<device>.covers.json`, `pie tune export --engine wgpu`), each
+/// listed here: the runtime takes a cover whose key matches where the
+/// home's own cache holds none (`engine::Engine::committed_covers`).
+pub const COVERS: &[&str] = &[];
 
 pub static SHELF: Shelf = Shelf {
     backend: "wgpu",

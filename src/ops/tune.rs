@@ -261,12 +261,27 @@ fn export(engine: &str, device: Option<u32>, out: &std::path::Path) -> Result<St
         .find(|b| b.name == engine)
         .ok_or_else(|| anyhow!("this build hosts no `{engine}` engine; it hosts {names:?}"))?;
     let dir = crate::paths::pie_home().join("profiles");
-    let exported = runtime::engine::profiles::export(backend, &dir, device.unwrap_or(0))
+    let cache = crate::paths::pie_home().join("cache");
+    let exported = runtime::engine::profiles::export(backend, &dir, &cache, device.unwrap_or(0))
         .map_err(|e| anyhow!(e))?;
     std::fs::create_dir_all(out)?;
     let path = out.join(&exported.name);
     std::fs::write(&path, &exported.text)?;
-    Ok(format!(
+    let covers = match &exported.covers {
+        Some((name, text)) => {
+            let at = out.join(name);
+            std::fs::write(&at, text)?;
+            format!(
+                "wrote {}: the host covers the home's cache holds for it; listed in \
+                 crates/engine-{}/src/chip.rs `COVERS` (`include_str!(\"../profiles/{name}\")`), \
+                 a boot whose cover key matches one takes it.\n",
+                ui::short_path(&at),
+                backend.name,
+            )
+        }
+        None => "no host cover is cached for it in this home.\n".to_string(),
+    };
+    let main = format!(
         "wrote {} from {}: the stored measurements of {}, each under its key.\n\
          A build carries it once it is listed beside the engine's checked-in profiles \
          (crates/engine-{}/src/chip.rs, `\"{}\"`); a load of that device then takes each entry \
@@ -276,5 +291,6 @@ fn export(engine: &str, device: Option<u32>, out: &std::path::Path) -> Result<St
         exported.device,
         backend.name,
         exported.name,
-    ))
+    );
+    Ok(main + &covers)
 }

@@ -605,7 +605,7 @@ mod on_device {
                 attn_tflops_by_rows_keys: None,
                 product_ns: None,
                 kernel_tflops_by_shape: None,
-                dense_settled: None,
+                dense_settled: Vec::new(),
                 measured_on: None,
                 measured_by: None,
             },
@@ -1205,7 +1205,7 @@ mod ensure_tests {
             attn_tflops_by_rows_keys: None,
             product_ns: None,
             kernel_tflops_by_shape: None,
-            dense_settled: None,
+            dense_settled: Vec::new(),
             measured_on: None,
             measured_by: None,
         }

@@ -1415,13 +1415,14 @@ impl<'a> Walk<'a> {
         Some(out)
     }
 
-    /// `rates.dense_settled_keyed`: `[method, of, code, [[bottom, top,
-    /// replaced, vector, wide, tier], ...]]`, whole numbers.
-    fn dense_settled(&mut self, v: &Spanned<DeValue<'_>>) -> Option<crate::fire::DenseSettled> {
-        let what = "`rates.dense_settled_keyed` is [method, of, code, [[bottom, top, replaced, \
-                    vector, wide, tier], ...]], whole numbers";
+    /// `rates.dense_settled_keyed`: a list of `[method, of, code, [[bottom,
+    /// top, replaced, vector, wide, tier], ...]]`, whole numbers, one per
+    /// key (`of`), no key twice.
+    fn dense_settled(&mut self, v: &Spanned<DeValue<'_>>) -> Vec<crate::fire::DenseSettled> {
+        let what = "`rates.dense_settled_keyed` is a list of [method, of, code, [[bottom, top, \
+                    replaced, vector, wide, tier], ...]], whole numbers, one per key";
         let whole = |v: &DeValue<'_>| int(v).and_then(|x| u32::try_from(x).ok());
-        let parsed = match v.get_ref() {
+        let one = |v: &DeValue<'_>| match v {
             DeValue::Array(f) if f.len() == 4 => {
                 let head = whole(f[0].get_ref())
                     .zip(whole(f[1].get_ref()))
@@ -1443,22 +1444,38 @@ impl<'a> Walk<'a> {
                     _ => None,
                 };
                 head.zip(ranges)
+                    .map(|(((method, of), code), ranges)| crate::fire::DenseSettled {
+                        method,
+                        of,
+                        code,
+                        ranges,
+                    })
             }
             _ => None,
         };
+        let parsed = match v.get_ref() {
+            DeValue::Array(all) => all
+                .iter()
+                .map(|e| one(e.get_ref()))
+                .collect::<Option<Vec<crate::fire::DenseSettled>>>(),
+            _ => None,
+        };
         match parsed {
-            Some((((method, of), code), ranges)) => Some(crate::fire::DenseSettled {
-                method,
-                of,
-                code,
-                ranges,
-            }),
+            Some(all) => {
+                let mut keys: Vec<u32> = all.iter().map(|d| d.of).collect();
+                keys.sort_unstable();
+                if keys.windows(2).any(|w| w[0] == w[1]) {
+                    self.err(v.span().start, format!("{what}: a key stated twice"));
+                    return Vec::new();
+                }
+                all
+            }
             None => {
                 self.err(
                     v.span().start,
                     format!("{what}, not {}", found(v.get_ref())),
                 );
-                None
+                Vec::new()
             }
         }
     }

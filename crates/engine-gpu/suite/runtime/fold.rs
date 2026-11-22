@@ -466,6 +466,16 @@ fn load_under(
         submit_bound: bound,
         ..crate::gpu::device_boot()
     };
+    load_on(frames, boot, tokens, 4)
+}
+
+/// [`load_under`] on `boot`, a fire carrying up to `lanes` lanes.
+fn load_on(
+    frames: u8,
+    boot: crate::backend::DeviceBoot,
+    tokens: u32,
+    lanes: u32,
+) -> Option<(Model, InstanceId)> {
     if backend::Context::bind(&boot, backend::ALLOWANCE).is_err() {
         eprintln!("not asked: no device");
         return None;
@@ -477,7 +487,7 @@ fn load_under(
             trace: fixture.trace.clone(),
             checkpoint: Checkpoint::Path(fixture.container.clone()),
             budgets: Budgets {
-                max_lanes: 4,
+                max_lanes: lanes,
                 max_tokens: tokens,
                 buckets: vec![tokens],
                 max_adapters: 0,
@@ -879,6 +889,174 @@ fn a_hybrid_prompt_past_the_bound_a_layer_at_a_time_is_cut_by_rows_and_serves_al
         assert!(cos > 0.999, "{what}: logits whole and in pieces at cosine {cos}");
         eprintln!("{what}: cosine {cos:.6} whole against {pieces} + 1 pieces of at most {piece_rows} rows");
     }
+}
+
+/// A load that skips measuring (`[engine] measure = false`) on a device
+/// whose platform states a bound on one submission, a fresh profile
+/// directory (no user's file; where no checked-in layer states the
+/// roofline either, as none does for a wgpu adapter): the boot stands,
+/// timing only what the bound's estimate reads where no layer states it
+/// (`engine_gpu::rates::for_bound`), storing nothing, and holds every step
+/// to the bound: held to one between a row's layer and the widest step's,
+/// a long prompt is cut by rows; held to its own estimate, it goes a few
+/// layers a submission and serves what it served whole (its last logits,
+/// and a decode after it).
+#[test]
+fn under_skip_with_a_bound_and_no_rates_a_long_prompt_is_held_and_cut() {
+    use engine_gpu::submit::{Admitted, StepRows};
+    const LONG: u32 = 256;
+    let step = StepRows {
+        rows: LONG,
+        lanes: 1,
+        keys: LONG,
+        prompt: true,
+    };
+    let profiles = std::env::temp_dir().join(format!(
+        "pie-{}-skip-bound-profiles-{}",
+        backend::NAME,
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&profiles);
+    std::fs::create_dir_all(&profiles).expect("a profile directory");
+    let boot = crate::backend::DeviceBoot {
+        submit_bound: Some(Duration::from_secs(2)),
+        measure: engine::rates::Measuring::Skip,
+        profiles: Some(profiles.clone()),
+        ..crate::gpu::device_boot()
+    };
+    // A fire of as many lanes as rows: a skipping load's fire top is a
+    // decode fire of its lanes, here the prompt's rows.
+    let Some((mut model, _)) = load_on(1, boot, LONG, LONG) else {
+        return;
+    };
+    let prompt: Vec<u32> = (0..LONG).map(|at| (at * 37 + 11) % 256).collect();
+    // The prompt's logits, the decode's after it, and the ids of the
+    // prompt's step and the decode's (fire ids run one a fire, a leading
+    // row piece taking one).
+    let serve = |model: &mut Model, bound: f64| -> (Vec<f32>, Vec<f32>, u64, u64) {
+        let kv: Vec<u32> = (0..(LONG + 1).div_ceil(PAGE))
+            .map(|_| model.refs.take(LIST))
+            .collect();
+        let record: Vec<[u32; 2]> = (0..model.pieces)
+            .map(|_| {
+                let piece = model.refs.take(FIXED);
+                [piece, piece]
+            })
+            .collect();
+        let trace = model.trace.clone();
+        let lane = |tokens: Vec<u32>, held: u32, rs_reset: RsReset| Lane {
+            slot: 0,
+            word: word(&trace, tokens.len() as u32),
+            kv: KvDelta {
+                held,
+                ..KvDelta::default()
+            },
+            readout: Readout::Last,
+            tables: vec![(LIST, kv.clone())],
+            record: engine::fire::LaneRecord::Pieces(vec![(FIXED, record.clone())]),
+            rs: RsVerb::Fold,
+            rs_reset,
+            tokens,
+            ..Lane::default()
+        };
+        let mut fire = |lane: Lane, bound: f64| {
+            model.engine.loaded_mut().expect("loaded").hold_to(bound);
+            let mut ticket = model.submit(lane, None);
+            let bits = model.settled(&mut ticket);
+            let values: Vec<f32> = bits.into_iter().map(f32::from_bits).collect();
+            (ticket.steps[0].id.0, values)
+        };
+        let (at, prompted) = fire(lane(prompt.clone(), 0, RsReset::Fresh), bound);
+        let next = crate::model_logits::argmax(&prompted);
+        let (after, decoded) = fire(lane(vec![next], LONG, RsReset::Held), 2e9);
+        assert_eq!(after, at + 1, "the decode is the fire after the prompt's last");
+        (prompted, decoded, at, after)
+    };
+    let held = model
+        .engine
+        .loaded()
+        .expect("loaded")
+        .submit_bound()
+        .expect("a skipping load holds its steps to the stated bound")
+        .clone();
+    assert_eq!(held.worst, 1.0, "no ratio is measured under skip");
+    assert!(
+        matches!(held.admit(step), Admitted::Whole { .. }),
+        "within 2 s the step goes whole: {:?}",
+        held.admit(step)
+    );
+    let (whole, whole_decode, at, _) = serve(&mut model, 2e9);
+    assert_eq!(at, 1, "a step within the bound is fired whole");
+    // Read at a ratio of 1 (`Shell::hold_to`), as a fresh load's first step
+    // is: held to a bound between a row's layer and the step's, the step is
+    // cut by rows; held to its own whole estimate (a prompt step goes whole
+    // only a layer under the bound), it goes a few layers a submission.
+    model.engine.loaded_mut().expect("loaded").hold_to(2e9);
+    let held_at = |model: &Model| {
+        model
+            .engine
+            .loaded()
+            .expect("loaded")
+            .submit_bound()
+            .expect("held")
+            .clone()
+    };
+    let held = held_at(&model);
+    let (whole_ns, _) = held.step_ns(step);
+    let layer = |rows: u32| held.step_ns(StepRows { rows, ..step }).1;
+    let tight = (layer(1) * layer(LONG)).sqrt();
+    eprintln!(
+        "the step {:.3} ms whole; a layer of 1 row {:.3} ms, of {LONG} rows {:.3} ms",
+        whole_ns / 1e6,
+        layer(1) / 1e6,
+        layer(LONG) / 1e6,
+    );
+    model.engine.loaded_mut().expect("loaded").hold_to(tight);
+    let cut = held_at(&model);
+    assert!(
+        matches!(cut.admit(step), Admitted::Refused { .. }),
+        "a layer of the step is past {:.3} ms: {:?}",
+        tight / 1e6,
+        cut.admit(step)
+    );
+    let piece_rows = cut.rows_a_piece(step, LONG).expect("a piece of fewer rows fits");
+    assert!(piece_rows < LONG, "{piece_rows}");
+    model.engine.loaded_mut().expect("loaded").hold_to(whole_ns);
+    let split = held_at(&model);
+    assert!(
+        matches!(split.admit(step), Admitted::Layers { .. }),
+        "held to its own estimate, the step goes a few layers a submission: {:?}",
+        split.admit(step)
+    );
+    let (layered, layered_decode, _, _) = serve(&mut model, whole_ns);
+    for (what, a, b) in [("prompt", &whole, &layered), ("decode", &whole_decode, &layered_decode)] {
+        assert!(a.iter().chain(b.iter()).all(|v| v.is_finite()), "{what}: finite");
+        assert_eq!(
+            crate::model_logits::argmax(a),
+            crate::model_logits::argmax(b),
+            "{what}: the same argmax whole and split"
+        );
+    }
+    let stored: Vec<_> = walkdir(&profiles);
+    assert!(stored.is_empty(), "a skipping load stores nothing: {stored:?}");
+    let _ = std::fs::remove_dir_all(&profiles);
+}
+
+/// Every file under `dir`.
+fn walkdir(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut walk = vec![dir.to_path_buf()];
+    while let Some(at) = walk.pop() {
+        for entry in std::fs::read_dir(&at).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk.push(path);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    out
 }
 
 /// Under a stated submit bound small enough that one layer of a step of two

@@ -1170,7 +1170,12 @@ What each still times at load or boot, for its owner (paths under `crates/`):
   `cover_fingerprint` + deployment + sampler hash + frame + depth + context. Not under `[rates]`, not committed,
   not skipped: a `measure = false` boot still runs its warm runs on a clean home. engine-cuda / engine-xla /
   engine-cerebras state no fingerprint (`engine/src/engine.rs:199` default None): measured every boot, nothing kept.
-- **engine-gpu, still open**: under `measure = false` on a platform stating a submit bound (Android, Windows TDR)
-  with no roofline stated or committed, no cost holds a step to the bound: said by name at warn and served unheld
-  (`Shell::fit`, `engine-gpu/src/serve.rs`). A committed profile of the device closes it; an estimate from facts
-  needs facts the Vulkan / WebGPU APIs do not state (clocks, bandwidth).
+- **engine-gpu, closed on sc/gpu-committed-profiles-2**: under `measure = false` on a platform stating a submit
+  bound (Android, Windows TDR) with no roofline stated or committed, the load times only what the bound's estimate
+  reads (`engine_gpu::rates::for_bound`: a short launch chain, a one-row and a widest-rung matmul over the model's
+  widest layer plane, the attention of the widest rung against the context, the scan on a hybrid; single fires,
+  "timed for the submit bound despite measure = false"), kept in the bound alone and stored nowhere; steps are
+  held and cut as under a measured load. Without curves the dense kernel is estimated from the work's shape
+  (`engine_gpu::dense::by_shape`; by the roofline where one is stated); with curves but no roofline, the curves
+  weigh it (`dense::choose_unrated`). Still open: the Adreno 840's committed profile (`adreno-tm-840`, a
+  commented slot in each backend's `SEEDED`) awaits the phone's export.

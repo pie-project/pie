@@ -145,10 +145,13 @@ pub struct Rates {
     /// Measured; not one of [`KEYS`] (a load measures it once its model's
     /// shapes are known).
     pub kernel_tflops_by_shape: Option<Vec<KernelCurve>>,
-    /// The dense kernels a load's settle took in context over the curves'
-    /// picks ([`DENSE_SETTLED`]): what a later load of the same curves,
-    /// model and kernels takes again without walking a fire. Measured.
-    pub dense_settled: Option<DenseSettled>,
+    /// The dense kernels each load's settle took in context over the
+    /// curves' picks ([`DENSE_SETTLED`]), one entry per key (a model's
+    /// planes, curves and rungs: [`DenseSettled::of`]), many a device: what
+    /// a later load of the same curves, model and kernels takes again
+    /// without walking a fire. A new model's settle joins the others, never
+    /// replaces them. Measured; empty where none is stored.
+    pub dense_settled: Vec<DenseSettled>,
     /// The device a user's file's measurements were taken on
     /// ([`MEASURED_ON`]): its vendor, device id and driver, as the backend
     /// states them ([`Now::on`]). A file measured on another device (or
@@ -366,8 +369,8 @@ pub const KERNEL_CURVES: &str = "kernel_tflops_by_shape_keyed";
 /// dispatch ([`KERNEL_CURVES`]).
 pub const KERNEL_CURVES_PER_DISPATCH: &str = "kernel_tflops_by_shape";
 
-/// The `[rates]` key of [`Rates::dense_settled`]: `[method, of, code,
-/// [[bottom, top, replaced, vector, wide, tier], ...]]`. The settle an older
+/// The `[rates]` key of [`Rates::dense_settled`]: a list of `[method, of,
+/// code, [[bottom, top, replaced, vector, wide, tier], ...]]`, one per key. The settle an older
 /// pie stored under `dense_settled`, keyed by its version, is no longer read.
 pub const DENSE_SETTLED: &str = "dense_settled_keyed";
 
@@ -460,7 +463,18 @@ impl Rates {
                 }
                 (mine, theirs) => mine.or(theirs),
             },
-            dense_settled: self.dense_settled.or(below.dense_settled),
+            // Entry by entry, by its key: a load's settle joins the others
+            // (another model's), its own replacing one of the same key.
+            dense_settled: {
+                let mut all: Vec<DenseSettled> = below
+                    .dense_settled
+                    .into_iter()
+                    .filter(|t| self.dense_settled.iter().all(|m| m.of != t.of))
+                    .collect();
+                all.extend(self.dense_settled);
+                all.sort_by_key(|d| d.of);
+                all
+            },
             measured_on: self.measured_on.or(below.measured_on),
             // Entry by entry: a rate's key goes with its value.
             measured_by: match (self.measured_by, below.measured_by) {
@@ -500,7 +514,7 @@ impl Rates {
             ATTN_BY_ROWS_KEYS => self.attn_tflops_by_rows_keys.is_none(),
             "product_ns" => self.product_ns.is_none(),
             KERNEL_CURVES => self.kernel_tflops_by_shape.is_none(),
-            DENSE_SETTLED => self.dense_settled.is_none(),
+            DENSE_SETTLED => self.dense_settled.is_empty(),
             _ => true,
         }
     }
@@ -558,7 +572,7 @@ impl Rates {
         let on = now.on();
         let stored = KEYED.iter().any(|key| self.states(key))
             || self.kernel_tflops_by_shape.is_some()
-            || self.dense_settled.is_some();
+            || !self.dense_settled.is_empty();
         if !stored {
             said.push(format!("{what} measurements: none for `{on}`"));
             *self = Rates::default();
@@ -609,14 +623,15 @@ impl Rates {
             }
             self.kernel_tflops_by_shape = (!kept.is_empty()).then_some(kept);
         }
-        if let Some(settled) = self.dense_settled.take() {
+        for settled in std::mem::take(&mut self.dense_settled) {
             match now.method(DENSE_SETTLED) {
                 Some(method) if method == settled.method => {
-                    self.dense_settled = Some(settled);
+                    self.dense_settled.push(settled);
                 }
                 now => said.push(format!(
-                    "{what} dense settle: not taken, its method is version {} now, {} when \
-                     stored",
+                    "{what} dense settle {:#010x}: not taken, its method is version {} now, {} \
+                     when stored",
+                    settled.of,
                     now.map_or_else(|| "none".to_string(), |m| m.to_string()),
                     settled.method
                 )),
@@ -698,6 +713,7 @@ impl Rates {
         if let Some(product) = &mut self.product_ns {
             product.sort_by_key(ProductTime::key);
         }
+        self.dense_settled.sort_by_key(|d| d.of);
         self
     }
 
@@ -741,7 +757,11 @@ impl Rates {
                 .kernel_tflops_by_shape
                 .clone()
                 .filter(|_| has(KERNEL_CURVES)),
-            dense_settled: self.dense_settled.clone().filter(|_| has(DENSE_SETTLED)),
+            dense_settled: if has(DENSE_SETTLED) {
+                self.dense_settled.clone()
+            } else {
+                Vec::new()
+            },
             measured_on: self.measured_on.clone(),
             measured_by: self
                 .measured_by
@@ -853,25 +873,32 @@ impl Rates {
                 .collect();
             let _ = writeln!(out, "{KERNEL_CURVES} = [\n{}]", rows.concat());
         }
-        if let Some(settled) = &self.dense_settled {
-            let ranges: Vec<String> = settled
-                .ranges
+        if !self.dense_settled.is_empty() {
+            let mut settles: Vec<&DenseSettled> = self.dense_settled.iter().collect();
+            settles.sort_by_key(|d| d.of);
+            let rows: Vec<String> = settles
                 .iter()
-                .map(|r| {
+                .map(|settled| {
+                    let ranges: Vec<String> = settled
+                        .ranges
+                        .iter()
+                        .map(|r| {
+                            format!(
+                                "[{}, {}, {}, {}, {}, {}]",
+                                r[0], r[1], r[2], r[3], r[4], r[5]
+                            )
+                        })
+                        .collect();
                     format!(
-                        "[{}, {}, {}, {}, {}, {}]",
-                        r[0], r[1], r[2], r[3], r[4], r[5]
+                        "  [{}, {}, {}, [{}]],\n",
+                        settled.method,
+                        settled.of,
+                        settled.code,
+                        ranges.join(", ")
                     )
                 })
                 .collect();
-            let _ = writeln!(
-                out,
-                "{DENSE_SETTLED} = [{}, {}, {}, [{}]]",
-                settled.method,
-                settled.of,
-                settled.code,
-                ranges.join(", ")
-            );
+            let _ = writeln!(out, "{DENSE_SETTLED} = [\n{}]", rows.concat());
         }
         if let Some(on) = &self.measured_on {
             let _ = writeln!(out, "{MEASURED_ON} = {}", toml_string(on));
@@ -986,7 +1013,7 @@ pub struct Tuned {
     /// ([`crate::Source::Committed`]), sifted by its method: the settle
     /// takes it where the user's stored one's key does not match and its
     /// own does, never copied into the user's file.
-    pub committed_settle: Option<DenseSettled>,
+    pub committed_settle: Vec<DenseSettled>,
     /// The `[rates]` keys, curves and settle this load took no measurement
     /// of under `[engine] measure = false`, each served by the engine's
     /// estimate and named where it is (`engine::rates::Measuring::Skip`).
@@ -1001,10 +1028,9 @@ impl Tuned {
         self.saved_to = upper.saved_to.clone().or(self.saved_to.take());
         self.frame_cut |= upper.frame_cut;
         self.refused = upper.refused.clone().or(self.refused.take());
-        self.committed_settle = upper
-            .committed_settle
-            .clone()
-            .or(self.committed_settle.take());
+        if !upper.committed_settle.is_empty() {
+            self.committed_settle = upper.committed_settle.clone();
+        }
         self.skipped.extend(upper.skipped.iter().cloned());
     }
 
@@ -1097,12 +1123,12 @@ mod tests {
                     kernels: vec![("linear_gemm_gemv_v_bf16".into(), 7)],
                 },
             }]),
-            dense_settled: Some(DenseSettled {
+            dense_settled: vec![DenseSettled {
                 method: 1,
                 of: 77,
                 code: 9,
                 ranges: vec![[3, 4, 1, 4, 0, 1]],
-            }),
+            }],
             measured_on: Some("vk 10de:2c31 driver 1".into()),
             measured_by: Some(vec![(
                 "launch_ns".into(),
@@ -1125,7 +1151,7 @@ mod tests {
              cached_gbps = 28800.0\nelementwise_gbps = 450.0\nscan_gelems = 2684.3\nfew_row_tflops = 4.2\n\
              workgroups_per_core = 3.3\nkernel_tflops_by_shape_keyed = [\n  [1, 4, 1024, 2048, 512, 1, 1, \
              [[\"linear_gemm_gemv_v_bf16\", 7]], [[1, 0.5]], []],\n]\n\
-             dense_settled_keyed = [1, 77, 9, [[3, 4, 1, 4, 0, 1]]]\n\
+             dense_settled_keyed = [\n  [1, 77, 9, [[3, 4, 1, 4, 0, 1]]],\n]\n\
              measured_on = \"vk 10de:2c31 driver 1\"\n\
              measured_by = [\n  [\"launch_ns\", 2, [[\"linear_gemm_tiled_bf16\", 5]]],\n]\n"
         );
@@ -1217,12 +1243,12 @@ mod tests {
             hbm_gbps: Some(700.0),
             gemm_tflops_by_rows: Some(vec![(1024, vec![(256, 20.0)])]),
             kernel_tflops_by_shape: Some(vec![curve(32, "tiled"), curve(64, "coopmat")]),
-            dense_settled: Some(DenseSettled {
+            dense_settled: vec![DenseSettled {
                 method: 1,
                 of: 5,
                 code: 6,
                 ranges: vec![[1, 1, 0, 0, 0, 0]],
-            }),
+            }],
             measured_on: Some(now.on()),
             measured_by: Some(vec![
                 ("gemm_tflops_by_rows".into(), by(&["tiled", "coopmat"], now)),
@@ -1231,6 +1257,42 @@ mod tests {
             ]),
             ..Rates::default()
         }
+    }
+
+    /// Each model's settle is its own entry, by its key: a second model's
+    /// joins the first's (a save lays the new over the stored), one of the
+    /// same key replaces it, and the list writes and reads back whole.
+    #[test]
+    fn each_models_settle_is_kept_beside_the_others() {
+        let settle = |of: u32, replaced: u32| DenseSettled {
+            method: 1,
+            of,
+            code: 6,
+            ranges: vec![[1, 1, replaced, 0, 0, 0]],
+        };
+        let first = Rates {
+            dense_settled: vec![settle(7, 0)],
+            ..Rates::default()
+        };
+        let second = Rates {
+            dense_settled: vec![settle(3, 0)],
+            ..Rates::default()
+        };
+        let both = second.over(first.clone());
+        assert_eq!(both.dense_settled, vec![settle(3, 0), settle(7, 0)]);
+        let again = Rates {
+            dense_settled: vec![settle(7, 1)],
+            ..Rates::default()
+        }
+        .over(both.clone());
+        assert_eq!(again.dense_settled, vec![settle(3, 0), settle(7, 1)]);
+        let registry = crate::Registry::new("test", &[], &[]);
+        let read = registry
+            .load_user(&format!("api = 1\n{}", both.toml()), "two models")
+            .expect("both settles read back");
+        assert_eq!(read.rates().dense_settled, both.dense_settled);
+        let twice = "api = 1\n[rates]\ndense_settled_keyed = [[1, 7, 6, []], [1, 7, 6, []]]\n";
+        assert!(registry.load_user(twice, "twice").is_err(), "a key stated twice is refused");
     }
 
     /// The same file read by another build of the same kernels (a version

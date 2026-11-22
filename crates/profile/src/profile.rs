@@ -814,7 +814,7 @@ impl Registry {
                 }
                 // The settle is checked by the settle itself, after the
                 // user's stored one ([`crate::fire::Tuned::committed_settle`]).
-                file.tuned.committed_settle = file.tuned.rates.dense_settled.take();
+                file.tuned.committed_settle = std::mem::take(&mut file.tuned.rates.dense_settled);
                 committed_from = origin.clone();
                 committed_tuned.lay(&file.tuned);
                 if let Some(how) = how {
