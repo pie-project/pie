@@ -262,11 +262,21 @@ pub(super) fn loaded_bound(
     lanes: u32,
     bound: Option<std::time::Duration>,
 ) -> Option<Loaded> {
-    let tokens = (lanes * ROWS).next_power_of_two().max(16);
     let boot = crate::backend::DeviceBoot {
         submit_bound: bound,
         ..crate::gpu::device_boot()
     };
+    loaded_boot(tag, model, lanes, boot)
+}
+
+/// [`loaded_lanes`] on `boot`.
+pub(super) fn loaded_boot(
+    tag: &str,
+    model: &impl ForwardHybrid,
+    lanes: u32,
+    boot: crate::backend::DeviceBoot,
+) -> Option<Loaded> {
+    let tokens = (lanes * ROWS).next_power_of_two().max(16);
     if backend::Context::bind(&boot, backend::ALLOWANCE).is_err() {
         eprintln!("not asked: no device");
         return None;

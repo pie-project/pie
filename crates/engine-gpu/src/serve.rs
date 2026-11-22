@@ -292,6 +292,12 @@ pub trait Serve: Backend {
     /// Arm `arm`'s readout seat grew to `bytes`.
     fn grown(shell: &mut Shell<Self>, arm: usize, bytes: u64) -> Result<()>;
 
+    /// The load is done and serving starts: what the backend lays for the
+    /// frames serving holds, and makes no more of after.
+    fn serving(_shell: &mut Shell<Self>) -> Result<()> {
+        Ok(())
+    }
+
     /// Replays `prepared` where a kept step answers it, else how it walks.
     fn plan(shell: &mut Shell<Self>, prepared: &mut Prepared<'_, Self>) -> Result<Plan<Self>>;
 
@@ -369,6 +375,9 @@ pub enum InputCell<B: Backend> {
     /// The lane's guest refused its cell: its lanes fault, and its seat
     /// holds zeros, which nothing reads.
     Refused,
+    /// A stand-in fire's cell (the dense settle's): the seat holds zeros of
+    /// its declared shape.
+    Zeros,
 }
 
 /// A cell a guest channel keeps on the device: `bytes` at `at` of `buffer`
@@ -2644,8 +2653,9 @@ impl<B: Serve> Shell<B> {
              fire, with the settled kernels)",
             self.settled.len()
         );
-        // A settle fire the shell refuses as a program's (a class that reads
-        // a guest input no settle lane feeds, say) is no fault of the device:
+        // A settle fire the shell refuses as a program's (a class needing
+        // what no settle lane carries, a voxel clip say) is no fault of the
+        // device:
         // the settle stops, said, and the curves' kernels serve what it did
         // not reach; nothing of it is stored. Any other fault stands.
         if let Err(why) = settled {
@@ -3148,6 +3158,22 @@ impl<B: Serve> Shell<B> {
                             .word(&poem_ir::Request::new(per_lane, false))
                     };
                     let tokens: Vec<u32> = (0..per_lane).map(|i| 100 + (i * 7919) % 5000).collect();
+                    // Zeros for every guest input a class reads: a settle
+                    // lane feeds no channel, and a class reading one serves
+                    // the same kernels whatever the input holds.
+                    let zeros: Vec<(engine::fire::InputFeed, InputCell<B>)> = self
+                        .feeds
+                        .inputs
+                        .iter()
+                        .filter(|(seat, _)| !seat.voxel())
+                        .map(|(seat, _)| {
+                            let feed = engine::fire::InputFeed {
+                                id: seat.id,
+                                channel: engine::channel::ChannelId(0),
+                            };
+                            (feed, InputCell::Zeros)
+                        })
+                        .collect();
                     let mut samples: Vec<Vec<f64>> = vec![Vec::new(); options.len()];
                     // Whether a fire was timed by the host's clock (the
                     // device stated no span of it).
@@ -3165,6 +3191,7 @@ impl<B: Serve> Shell<B> {
                                 let seated: Vec<Seated<'_, B>> = (0..fire_lanes)
                                     .map(|slot| Seated {
                                         hosts: false,
+                                        inputs: &zeros,
                                         ..Seated::of(Lane {
                                             slot,
                                             word,
@@ -4761,7 +4788,7 @@ impl<B: Serve> Shell<B> {
                 })?;
                 let at = base + offset * seat.row_bytes();
                 match cell {
-                    InputCell::Refused => {
+                    InputCell::Refused | InputCell::Zeros => {
                         self.inputs[arm].write_input(at, &vec![0u8; bytes as usize])?;
                     }
                     InputCell::Host { bytes: raw, dtype } => {

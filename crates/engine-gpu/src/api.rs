@@ -983,6 +983,7 @@ where
         // What the load itself walked is the load's: serving counts from here.
         shell.unkept_serving();
         shell.bound_serving();
+        <B as crate::serve::Serve>::serving(&mut shell).map_err(fault)?;
         // The fire the shell took, which a binding may have bounded below
         // the one asked.
         let (max_lanes, max_tokens) = (shell.budget().max_lanes, shell.budget().max_tokens);

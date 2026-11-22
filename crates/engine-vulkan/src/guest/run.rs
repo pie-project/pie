@@ -74,11 +74,15 @@ impl<'a> OnDevice<'a> {
             .copied()
     }
 
-    /// Records the pass into a frame of its own for the caller to submit,
-    /// instead of running each stage to completion.
+    /// Records the pass for the caller to submit, instead of running each
+    /// stage to completion: into `frame`, which the step's earlier passes
+    /// recorded into, or a frame of its own.
     #[must_use]
-    pub fn deferred(mut self) -> OnDevice<'a> {
-        self.deferral = Some(Deferral::default());
+    pub fn deferred(mut self, frame: Option<Frame>) -> OnDevice<'a> {
+        self.deferral = Some(Deferral {
+            frame,
+            ..Deferral::default()
+        });
         self
     }
 

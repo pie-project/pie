@@ -553,16 +553,18 @@ fn composed(measured: &str, shapes: &[(u32, u32)], base: &str) -> String {
     out
 }
 
-/// `chip` with `kernel.dense` measured over this model's own bf16 shapes on
-/// an Apple10 GPU, where the tensor-op tile and the simdgroup kernels cross
-/// at rows the shapes decide (a fixed rule cost an M5 Pro's 8-row decode
-/// 16-19%). The ladder is fitted at the rows a load serves and kept under
+/// `chip` with `kernel.dense` measured over this model's own bf16 shapes:
+/// where the kernels cross (the tensor-op tile, the few-row vector forms
+/// and the simdgroup row tiles on Apple10; the vector forms and the tiles
+/// on every other GPU) the shapes decide with the rows, and a fixed rule
+/// cost an M5 Pro's 8-row decode 16-19% (the tile from 8 rows) and an M1
+/// Max's Gemma 4 E4B 29% (the vector forms to 8 rows). The ladder is fitted at the rows a load serves and kept under
 /// `profiles` (`metal/dense/<device>-<key>.toml`, keyed on the device, the
 /// OS build, the two kernels' sources and the shapes), so a later load of
 /// the same shapes reads it back and measures nothing. The profile's own
 /// `kernel.dense` (a checked-in device file's, the user's, or the default)
 /// stays the route before a measurement and for every shape not measured.
-/// A GPU without tensor ops (the M1) keeps its profile's. A kernel that
+/// A GPU without tensor ops never times the tensor-op tile. A kernel that
 /// answers wrongly refuses the load; a measurement that fails otherwise
 /// (memory refused at boot) leaves the profile's route serving, said.
 pub(crate) fn at_load(
@@ -571,9 +573,6 @@ pub(crate) fn at_load(
     profiles: Option<&std::path::Path>,
     contract: &checkpoint::contract::ModelContract,
 ) -> Result<Profile, String> {
-    if !kernels_metal::tuning::apple10(device.family()) {
-        return Ok(chip);
-    }
     let shapes = shapes_of(contract);
     if shapes.is_empty() {
         return Ok(chip);

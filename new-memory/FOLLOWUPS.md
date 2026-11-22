@@ -1132,3 +1132,4 @@ all, so a wrong or stale curve can still serve a kernel several times slower on 
 settle exists for. Fix: stage a feed for those channels in the settle's fires (zeros of the
 declared shape; the settle only times), or settle through a class that reads none, instead of
 stopping.
+
