@@ -18,8 +18,14 @@ pub const PAGES_PARENT: u32 = 5;
 /// Fewer free pages than a fire hands out: unreachable with exact sizing,
 /// so a bug where it happens.
 pub const PAGES_EXHAUSTED: u32 = 6;
+/// A group wider than [`MAX_LANES`]: every lane faulted, its step not run.
+/// The host refuses such a group at bind and before a fire, so a fault
+/// here is a bug where it happens.
+pub const PAGES_TOO_WIDE: u32 = 7;
 
-/// The most beams one group runs (the kernel's threadgroup arrays).
+/// The most beams one group runs: `beam_step`'s threadgroup arrays
+/// (`PIE_BEAM_MAX_LANES`), about 18 KiB with the common-ancestor table
+/// (`MAX_LANES`² words), inside every Apple GPU's 32 KiB.
 pub const MAX_LANES: u32 = 64;
 
 const STEP_THREADS: u32 = 256;

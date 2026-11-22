@@ -14,6 +14,7 @@ using namespace metal;
 #define PIE_PAGES_COPY_BOUNDS 4u
 #define PIE_PAGES_PARENT 5u
 #define PIE_PAGES_EXHAUSTED 6u
+#define PIE_PAGES_TOO_WIDE 7u
 #define PIE_BEAM_HEADER 4u
 #define PIE_BEAM_MAX_LANES 64u
 #define PIE_BEAM_THREADS 256u
@@ -109,7 +110,14 @@ kernel void beam_step(
     const uint B = r.lanes, cap = r.cap, Q = r.reserve, S = r.page;
     const uint F = r.frames == 0u ? 1u : r.frames;
     const uint K = r.backed < Q ? r.backed : Q;
-    if (B == 0u || B > PIE_BEAM_MAX_LANES || Q > cap || S == 0u) return;
+    // A group wider than the step's threadgroup arrays hold (the host refuses
+    // it at bind, `PIE_BEAM_MAX_LANES` there too): every lane faulted by name,
+    // never a step that leaves its lists unresolved.
+    if (B > PIE_BEAM_MAX_LANES) {
+        for (uint b = tid; b < B; b += threads_in) fault_max(r.faults, b, PIE_PAGES_TOO_WIDE);
+        return;
+    }
+    if (B == 0u || Q > cap || S == 0u) return;
     device uint* state = reinterpret_cast<device uint*>(r.state);
     const device uint* parents = reinterpret_cast<const device uint*>(r.parents);
     const device int* trans = reinterpret_cast<const device int*>(r.trans);

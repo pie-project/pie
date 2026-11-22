@@ -83,6 +83,14 @@ pub fn fault_reason(code: u32, lane: usize) -> String {
             );
             "found no free page of its working set's pool left (a bug: the pool is sized exactly)"
         }
+        kbeam::PAGES_TOO_WIDE => {
+            tracing::error!(
+                lane,
+                "engine-metal: BUG: a beam group wider than the head step holds reached the \
+                 device; bind and the fire's records refuse it"
+            );
+            "belongs to a group wider than the head step holds (a bug: refused at bind)"
+        }
         _ => "faulted",
     };
     format!(

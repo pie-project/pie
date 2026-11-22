@@ -413,6 +413,22 @@ impl Plane {
             .programs
             .get(&program_id)
             .ok_or_else(|| Fault::program("program::plane", format!("no program {program_id}")))?;
+        // A beam group wider than the head step's threadgroup arrays hold
+        // (`kernels_metal::runtime::beam::MAX_LANES`) is refused here by name,
+        // before anything is claimed, not at its first fire.
+        if let Some(layout) = self.beam_of(program)
+            && layout.lanes > kernels_metal::runtime::beam::MAX_LANES
+        {
+            return Err(Fault::program(
+                "program::plane",
+                format!(
+                    "program {program_id} states parents for {} beams and the head step holds at \
+                     most {} a group",
+                    layout.lanes,
+                    kernels_metal::runtime::beam::MAX_LANES
+                ),
+            ));
+        }
         // Where the instance's own state will lie, claimed before a table
         // there is zeroed or a seed published: a placement over another
         // live instance's is refused by name, and nothing changes.
