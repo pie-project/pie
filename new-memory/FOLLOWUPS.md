@@ -941,12 +941,3 @@ scan) every repeat of which reads so still refuses the load by name. A load meas
 where its profile lacks it, so no saved value stands behind it then. Make every consumer of those
 rates (the estimate's roofline, the top rung, the submit bound's step estimate, the dense choice's
 launch) handle an unmeasured rate, stated at load, so a load never refuses on timing.
-
-## F?? The dense settle skips a model whose classes read a guest input (slang backends, 2026-11-22)
-A settle fire seats plain lanes; on a model whose served classes read a guest input channel,
-`serve::feed_inputs` refuses them ("feeds no channel for it"), and the settle now stops there,
-said, the curves' kernels serving every range it did not reach. Such a model gets no settle at
-all, so a wrong or stale curve can still serve a kernel several times slower on it: the case the
-settle exists for. Fix: stage a feed for those channels in the settle's fires (zeros of the
-declared shape; the settle only times), or settle through a class that reads none, instead of
-stopping.
