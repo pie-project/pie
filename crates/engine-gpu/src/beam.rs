@@ -175,9 +175,9 @@ pub struct Group<B: Backend> {
     pub reserve: Vec<u32>,
     pub folded: u32,
     /// The set's rs entries its state holds already (§11.1): the buffer's
-    /// base slot they count from and how many, as the fires planned before
-    /// this one appended them.
-    pub appended: (u32, u32),
+    /// base slot they count from and the entries, as the fires planned
+    /// before this one wrote them.
+    pub appended: (u32, Vec<u32>),
 }
 
 /// A beam's lane as the fire stages it: its seat in the staged tables, its
@@ -248,8 +248,8 @@ pub struct Planned<'a, B: Backend> {
     /// instance.
     pub commons: Vec<(u32, engine::InstanceId)>,
     /// Each hybrid group's set's rs entries its state holds once this fire
-    /// lands: its base slot and how many (`Group::appended` for the next).
-    pub appended: Vec<(engine::InstanceId, u32, u32)>,
+    /// lands: its base slot and the entries (`Group::appended` for the next).
+    pub appended: Vec<(engine::InstanceId, u32, Vec<u32>)>,
     /// The highest pool page id the groups stage.
     pub top_page: Option<u32>,
 }
@@ -557,10 +557,30 @@ pub fn plan<'a, B: Backend>(
                     group.instance
                 )));
             }
-            let from = if group.appended.0 == base { group.appended.1.min(needed) } else { 0 };
-            let new = &set[from as usize..needed as usize];
+            // A set's pages may move under it (a restore lays its rs rows
+            // in fresh pages): the state's entries are written again from
+            // the first that differs from the set's own, not only appended.
+            let held_now = &group.appended.1;
+            let wanted = &set[..needed as usize];
+            let from = if group.appended.0 == base {
+                held_now
+                    .iter()
+                    .zip(wanted)
+                    .position(|(was, now)| was != now)
+                    .unwrap_or_else(|| held_now.len().min(wanted.len()))
+            } else {
+                0
+            };
+            let new = &wanted[from..];
+            let from = u32::try_from(from).unwrap_or(u32::MAX);
             append = (rs_bases.push(new)?, bases_at + from, u32::try_from(new.len()).unwrap_or(u32::MAX));
-            planned.appended.push((group.instance, base, needed.max(from)));
+            let mut kept = held_now.clone();
+            kept.truncate(from as usize);
+            kept.extend_from_slice(new);
+            if group.appended.0 == base && held_now.len() > kept.len() {
+                kept.extend_from_slice(&held_now[kept.len()..]);
+            }
+            planned.appended.push((group.instance, base, kept));
             for (beam, &lane) in group.lanes.iter().enumerate() {
                 if (rs.set)(lane).map(|(at, _)| at) != Some(base) {
                     return Err(refused(format!(

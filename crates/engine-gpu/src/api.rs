@@ -1888,7 +1888,7 @@ impl<B: Host> Gpu<B> {
                                 folded: first.kv.folded,
                                 appended: self
                                     .loaded()
-                                    .map_or((u32::MAX, 0), |shell| shell.beam_appended(attachment.instance)),
+                                    .map_or((u32::MAX, Vec::new()), |shell| shell.beam_appended(attachment.instance)),
                             });
                             None
                         }

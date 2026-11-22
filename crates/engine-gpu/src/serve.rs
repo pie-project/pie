@@ -755,7 +755,7 @@ pub struct Shell<B: Serve> {
     /// Each hybrid beam group's set's rs entries its state holds (§11.1),
     /// by instance: the buffer's base slot they count from and how many, as
     /// the fires planned so far appended them (`beam::Group::appended`).
-    beam_appended: std::sync::Mutex<std::collections::HashMap<engine::InstanceId, (u32, u32)>>,
+    beam_appended: std::sync::Mutex<std::collections::HashMap<engine::InstanceId, (u32, Vec<u32>)>>,
     /// Where a load told its weights are held seated each weight shape's
     /// atoms itself (`WeightShape::seated`: its first slot ref), until the
     /// runtime's first residency names its own.
@@ -2794,13 +2794,13 @@ impl<B: Serve> Shell<B> {
     /// The set's rs entries instance `instance`'s beam group's state holds
     /// (`beam::Group::appended`): none before its first fire.
     #[must_use]
-    pub fn beam_appended(&self, instance: engine::InstanceId) -> (u32, u32) {
+    pub fn beam_appended(&self, instance: engine::InstanceId) -> (u32, Vec<u32>) {
         self.beam_appended
             .lock()
             .expect("beam appends lock poisoned")
             .get(&instance)
-            .copied()
-            .unwrap_or((u32::MAX, 0))
+            .cloned()
+            .unwrap_or((u32::MAX, Vec::new()))
     }
 
     /// Instance `instance`'s beam group's state is laid afresh (a bind) or
@@ -3698,8 +3698,8 @@ impl<B: Serve> Shell<B> {
             rs_staged.as_ref(),
         )?;
         let mut appended = self.beam_appended.lock().expect("beam appends lock poisoned");
-        for &(instance, base, count) in &planned.appended {
-            appended.insert(instance, (base, count));
+        for (instance, base, entries) in &planned.appended {
+            appended.insert(*instance, (*base, entries.clone()));
         }
         drop(appended);
         Ok(planned)
