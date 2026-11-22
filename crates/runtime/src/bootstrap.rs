@@ -142,8 +142,10 @@ pub struct RuntimeConfig {
 
 pub struct ModelConfig {
     /// How much of the device budget this load gives back to the system's
-    /// memory pressure (`[engine.memory] yield`).
-    pub memory_yield: crate::governor::Yield,
+    /// memory pressure (`[engine.memory] yield`); `None` where the
+    /// deployment states none, resolved at load by the engines' memory
+    /// ([`crate::governor::yield_for`]).
+    pub memory_yield: Option<crate::governor::Yield>,
     pub name: String,
     pub model_id: String,
     pub kv_page_size: usize,
@@ -384,6 +386,15 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         })?;
         crate::pipeline::program::serve_forms(&facts.backend, facts.library_forms);
     }
+    // An unset yield follows the engines' memory: unified memory (the pool
+    // and the host share one RAM) yields fully, separate memory holds.
+    let unified_memory = engine_configs.iter().any(|d| {
+        d.engine_backend
+            .device_facts()
+            .is_some_and(|facts| facts.unified_memory)
+    });
+    let (memory_yield, stated) = crate::governor::yield_for(memory_yield, unified_memory);
+    tracing::info!("{stated}");
 
     // Each engine's readouts, a fire bound (`Engine::readout_facts`): a
     // fixed store's rows bound the rows one fire reads out, which the

@@ -954,7 +954,9 @@ pub struct MemoryConfig {
     /// and with it lowers how far yield can press. Once pressure goes, the
     /// pool grows back only on demand, up to the target: nothing is
     /// allocated for nobody. At `1` the pool trims under moderate pressure
-    /// too, by design; `0`, the default, never trims.
+    /// too, by design; `0` never trims. Omitted, it is `1` where the engine
+    /// states unified memory (Metal, phones, DGX Spark: the pool and the
+    /// host share one RAM) and `0` on separate device memory.
     ///
     /// Idle cache is not timed out by the runtime: with no worker policy
     /// installed it stays until a demand needs its room, and is then
@@ -962,7 +964,7 @@ pub struct MemoryConfig {
     /// long it is kept past that is the policy's to state, with its
     /// retention keys.
     #[serde(rename = "yield")]
-    pub yield_share: f64,
+    pub yield_share: Option<f64>,
 }
 
 impl Default for MemoryConfig {
@@ -974,7 +976,7 @@ impl Default for MemoryConfig {
             budget_disk: None,
             disk_path: None,
             disk_persistent: false,
-            yield_share: 0.0,
+            yield_share: None,
         }
     }
 }
@@ -1004,13 +1006,17 @@ impl MemoryConfig {
     }
 
     /// How much of the device budget this load gives back to the system's
-    /// memory pressure.
+    /// memory pressure; `None` where the deployment states none, for the
+    /// load to resolve by the engines' memory.
     ///
     /// # Errors
     ///
     /// `yield` is outside `[0, 1]`, refused by name.
-    pub fn yields(&self) -> Result<runtime::governor::Yield> {
-        Ok(runtime::governor::Yield::new(self.yield_share)?)
+    pub fn yields(&self) -> Result<Option<runtime::governor::Yield>> {
+        Ok(self
+            .yield_share
+            .map(runtime::governor::Yield::new)
+            .transpose()?)
     }
 
     fn validate(&self) -> Result<()> {
@@ -1214,7 +1220,14 @@ device = ["metal:0"]
         assert_eq!(cfg.engine.memory, MemoryConfig::default());
         assert_eq!(
             cfg.engine.memory.yields().unwrap(),
-            runtime::governor::Yield::NONE
+            None,
+            "unset: the load resolves it by the engines' memory"
+        );
+        let zero = format!("{MINIMAL_METAL}\n[engine.memory]\nyield = 0\n");
+        assert_eq!(
+            Config::parse(&zero).unwrap().engine.memory.yields().unwrap(),
+            Some(runtime::governor::Yield::NONE),
+            "a configured 0 is not unset"
         );
         let residency = cfg.engine.memory.residency();
         assert_eq!(residency.device, engine::Allowance::WHOLE);
@@ -1231,7 +1244,7 @@ device = ["metal:0"]
             "budget_device caps the device"
         );
         assert_eq!(cfg.engine.memory.residency().host_kv_budget, Some(8 << 30));
-        assert_eq!(cfg.engine.memory.yields().unwrap().share(), 0.5);
+        assert_eq!(cfg.engine.memory.yields().unwrap().map(|y| y.share()), Some(0.5));
 
         for bad in ["yield = -0.1", "yield = 1.5", "yield = nan"] {
             let toml = format!("{MINIMAL_METAL}\n[engine.memory]\n{bad}\n");
