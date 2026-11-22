@@ -104,6 +104,10 @@ struct Output {
     request_prompt_tokens: Vec<usize>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     request_output_tokens: Vec<usize>,
+    /// A batch's lanes' emitted tokens, each lane's (`token_ids` is the
+    /// first's).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    request_token_ids: Vec<Vec<u32>>,
     /// Guest-clock first-token latency from run start (report_timing only).
     /// The client-stamped `t0` message is the launch-inclusive number; this
     /// one excludes instantiation and locates where the time went.
@@ -747,11 +751,13 @@ async fn main(input: Input) -> Result<Output> {
         {
             return Err(error);
         }
+        let mut request_token_ids = Vec::with_capacity(batch_len);
         for (i, (_, res)) in lanes.into_iter().enumerate() {
             let result = res.expect("lane completed")?;
             if i == 0 {
-                first_tokens = result.tokens;
+                first_tokens.clone_from(&result.tokens);
             }
+            request_token_ids.push(result.tokens);
             request_prompt_tokens.push(result.num_prompt_tokens);
             request_output_tokens.push(result.num_output_tokens);
         }
@@ -767,6 +773,7 @@ async fn main(input: Input) -> Result<Output> {
             token_ids: first_tokens,
             request_prompt_tokens,
             request_output_tokens,
+            request_token_ids,
             ttft_us: None,
             intertoken_us: Vec::new(),
             token_monotonic_ns: Vec::new(),
@@ -797,6 +804,7 @@ async fn main(input: Input) -> Result<Output> {
         text,
         token_ids: result.tokens,
         request_prompt_tokens: Vec::new(),
+        request_token_ids: Vec::new(),
         request_output_tokens: Vec::new(),
         ttft_us: result.ttft_us,
         intertoken_us: result.intertoken_us,
