@@ -1141,21 +1141,21 @@ file, else a committed `profiles/<device>.measured.toml`, else measured — or, 
 `profile::Rates::sift_as` / `whence`, `Shelf` `.measured.toml` layer, `pie tune export`). Each other engine still
 measures outside it; until it ports, `measure = false` is refused by name for it (worker `EngineConfig::validate`).
 What each still times at load or boot, for its owner (paths under `crates/`):
-- **engine-cuda (CUDA, ROCm)**
-  - Roofline `[rates]`: `rates::ensure` `engine-cuda/src/rates.rs:131` -> `rates_at_load` :160 (timing `measure`
-    :252, `on_device::measure` :518). Through `rates_at_load` / `save_rates`, but stored unkeyed
-    (`measured_on` / `measured_by` None, :609-610), and the chip resolves by `SHELF.resolve` (`chip.rs:360`), not
-    `resolve_keyed`: no `Now`, no sift, no committed layer. Port: a `Now` (device + driver + cuBLASLt / hipBLASLt
-    version, kernel code), key each rate, resolve keyed, take `Measuring`.
-  - Decode products (`product_ns`): `Shell::routes_measured` `serve/load.rs:2285` -> `routes_by_body`
-    `serve/arming.rs:1050` -> `time_decode_body` :1110. Saved by `save_product_times` `rates.rs:176` (its own write
-    beside `saved_text`, not `save_rates`), read back `serve/load.rs:89`. Keyed per entry only by its own
-    `(kind, rows, k, m, kernel)`; CUDA's kernel code is an FNV of arch, driver, cuBLASLt, kernel code, METHOD
-    (`kernels-cuda/src/linear/routes.rs:17`), ROCm's a bare 0 / 1 (`kernels-rocm/src/linear/routes.rs:14`): no
-    `measured_on`, and `product_ns` (in `fire::KEYED`) needs a `measured_by` to be exported. Skip: the stated kernel.
-  - Graph bodies' memory record (bytes, not time): `measured::conclude` `serve/measured.rs:117`, its own file
-    `<cache>/bodies/<hash>` (`measured.rs:47`), keyed by a `DefaultHasher` of the crate version, exe size and mtime:
-    a version bump re-measures; not under `[rates]`.
+- **engine-cuda (CUDA, ROCm)**: ported on ROCm (sc/amd-keyed-measurements); CUDA's keys open.
+  - `engine-cuda/src/stored.rs` `Keys: Now`: on ROCm the device's name, arch and HIP driver / runtime; a kernel's
+    code is the carried kernel library's text and options (`kernels_rocm::stored::library_code`: any `.hip` change
+    measures again what fired it) and hipBLASLt's version. Method versions `RATES_METHOD` / `PRODUCT_METHOD`.
+  - Roofline `[rates]`: `chip::resolve_keyed` (committed `<device>.measured.toml` layer, each stored entry sifted),
+    `rates::ensure` -> `engine::rates::resolve_at_load` under `Knobs::measuring`, what it measures stamped
+    (`Keys::stamp`). `chip::resolve` stays unkeyed for `pie tune` / `pie profile`.
+  - Decode products: `product_ns` saved by `save_rates`, keyed (`measured_by["product_ns"]`: library + hipBLASLt),
+    read back through the resolved profile; route codes 0 / 1 stay tags. Skip: the stated kernel, by name.
+  - Bodies record (`serve/measured.rs`): keyed by the running binary's content (132 MiB in ~75 ms on the MI300X
+    host, once a process), no mtime; the deployment part still names the checkpoint by size and mtime.
+  - `measure = false`: a one-device cuda engine; group / lockstep boots still measure, and are refused by name.
+  - Open, CUDA: `stored::backend` for `not(rocm)` keys by device name and method alone (no driver, cuBLASLt or
+    cubin codes): the L40S fills it. Committed: `amd-instinct-mi300x-vf.measured.toml` (`cached_gbps`,
+    `product_ns`).
 - **engine-metal**
   - Roofline `[rates]`: `rates::at_load` `engine-metal/src/rates.rs:587` -> `rates_at_load` (timing `measure`
     :611). Unkeyed as CUDA's (`measured_on` / `measured_by` None), resolved by `SHELF.resolve` (`chip.rs:231`).

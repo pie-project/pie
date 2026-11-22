@@ -909,7 +909,8 @@ pub struct EngineConfig {
     /// curve at the model's planes, the dense settle), and keeps them for
     /// the next boot. `false` times nothing: each is served by the engine's
     /// estimate, named in the load log, and nothing is stored (`pie serve
-    /// --no-measure`). Vulkan and wgpu only.
+    /// --no-measure`). Vulkan, wgpu, and a one-device cuda engine (CUDA or
+    /// ROCm).
     #[serde(default = "default_measure")]
     pub measure: bool,
     /// `[engine.memory]`: the optional caps for sharing a machine.
@@ -1085,11 +1086,18 @@ impl EngineConfig {
         );
         self.memory.validate()?;
         ensure!(
-            self.measure || matches!(self.kind, EngineKind::Vulkan | EngineKind::Wgpu),
+            self.measure
+                || matches!(self.kind, EngineKind::Vulkan | EngineKind::Wgpu)
+                || (self.kind == EngineKind::Cuda && self.device.len() == 1),
             "engine.measure = false skips the measurements a load takes on the vulkan and wgpu \
-             engines; the {} engine still measures outside that path (new-memory/FOLLOWUPS.md), \
-             so omit the key",
-            self.kind.as_str()
+             engines and a one-device cuda engine; the {} engine{} still measures outside that \
+             path (new-memory/FOLLOWUPS.md), so omit the key",
+            self.kind.as_str(),
+            if self.kind == EngineKind::Cuda {
+                " across devices"
+            } else {
+                ""
+            }
         );
         ensure!(
             self.memory.kv_device_tokens.is_none() || self.kind == EngineKind::Cuda,

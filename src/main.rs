@@ -70,7 +70,7 @@ struct ServeArgs {
     /// Time no device measurement at load (`[engine] measure = false`):
     /// each rate, curve and settle no stored or committed profile states is
     /// served by the engine's estimate, named in the load log, and nothing
-    /// is stored. Vulkan and wgpu.
+    /// is stored. Vulkan, wgpu, and a one-device cuda engine (CUDA or ROCm).
     #[arg(long)]
     no_measure: bool,
 }

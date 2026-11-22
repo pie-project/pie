@@ -178,9 +178,11 @@ fn device_boot(
     home: &Path,
     cache_dir: &Path,
     adapter_dir: Option<&Path>,
+    measure: bool,
 ) -> Result<DeviceBoot> {
     let mut knobs = Knobs {
         profiles: Some(home.join("profiles")),
+        measuring: engine::rates::Measuring::of(measure),
         ..Knobs::default()
     };
     if let Some(words) = opts.diagnostics.as_deref() {
@@ -383,7 +385,7 @@ pub(crate) fn create_engine_backend_group(
         let EngineOptions::Cuda(opts) = rank_options else {
             return Err(anyhow!("cuda group creation requires cuda rank options"));
         };
-        let boot = device_boot(opts, home, cache_dir, adapter_dir)?;
+        let boot = device_boot(opts, home, cache_dir, adapter_dir, true)?;
         if opts.verbose {
             dump_device_boot(home, &boot, group_id, Some(rank));
         }
@@ -456,7 +458,7 @@ pub(crate) fn create_engine_lockstep(
                 "an expert-parallel group requires cuda rank options"
             ));
         };
-        let boot = device_boot(opts, home, cache_dir, adapter_dir)?;
+        let boot = device_boot(opts, home, cache_dir, adapter_dir, true)?;
         if opts.verbose {
             dump_device_boot(home, &boot, rank, Some(rank));
         }
@@ -541,7 +543,6 @@ pub(crate) fn create_engine_backend(
     opened: Option<runtime::engine::EngineBox>,
 ) -> Result<GroupEngine> {
     let cache_dir = &crate::disk::engine_cache_dir(home);
-    let _ = measure;
     let _ = (group_id, adapter_dir, &opened);
     validate_snapshot_dir(snapshot_dir)?;
 
@@ -561,7 +562,7 @@ pub(crate) fn create_engine_backend(
         _ => unreachable!("`EngineOptions` has no variants in this build"),
         #[cfg(feature = "engine-cuda")]
         EngineOptions::Cuda(opts) => {
-            let boot = device_boot(opts, home, cache_dir, adapter_dir)?;
+            let boot = device_boot(opts, home, cache_dir, adapter_dir, measure)?;
             if opts.verbose {
                 dump_device_boot(home, &boot, group_id, None);
             }
