@@ -783,6 +783,13 @@ impl ResidencyPlanner {
                 if inner.queue.values().any(Waiter::rise_untaken) {
                     return Step::Done("a rung raise served and not yet taken holds the queue");
                 }
+                // A list compaction moves pages of the processes it names,
+                // running and parked: nothing is served or moved until it
+                // lands (a restore of one, a move of its parked state), and
+                // its landing plans again.
+                if inner.relocating.is_some() {
+                    return Step::Done("a list compaction is on its way");
+                }
                 let Some((key, waiter)) = inner.unmet_head() else {
                     if inner.accum.len() > 0 && inner.queue.is_empty() {
                         let stranded = std::mem::take(&mut inner.accum);

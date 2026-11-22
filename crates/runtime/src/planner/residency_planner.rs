@@ -81,6 +81,11 @@ pub struct ResidencyPlanner {
     /// latched for good, one failure left every parked-in-place process's
     /// state holding the device while their owners waited to be served.
     pub(super) park_down_failed: AtomicU64,
+    /// A list compaction moved nothing: the room and the fires landed then
+    /// ([`Self::compaction_room`]), `u64::MAX` for none. It is planned
+    /// again once either has moved past it: on the same room it would find
+    /// the same readers with fires in flight, or the same chunks taken.
+    pub(super) list_compaction_failed: AtomicU64,
     /// The segment walk made no grow it promised: the next pass goes on
     /// past its grow steps ([`Self::no_grow`]).
     pub(super) no_grow: AtomicBool,
@@ -160,6 +165,7 @@ impl ResidencyPlanner {
             spill_failed: AtomicBool::new(false),
             parking_down: AtomicBool::new(false),
             park_down_failed: AtomicU64::new(u64::MAX),
+            list_compaction_failed: AtomicU64::new(u64::MAX),
             no_grow: AtomicBool::new(false),
             swap_bound: AtomicBool::new(false),
             port,
@@ -1377,6 +1383,16 @@ impl ResidencyPlanner {
     /// The room a move of parked state down a tier reads: the device's
     /// room given back and the free slots below. One refused is tried again
     /// once either moves.
+    /// The room a list compaction is planned on: the pool's room count, the
+    /// swap tiers' free slots and the fires landed.
+    pub(super) fn compaction_room(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = rustc_hash::FxHasher::default();
+        self.park_down_room().hash(&mut hasher);
+        self.stats.fires_landed.load(Ordering::Acquire).hash(&mut hasher);
+        hasher.finish()
+    }
+
     pub(super) fn park_down_room(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = rustc_hash::FxHasher::default();
