@@ -1175,8 +1175,15 @@ What each still times at load or boot, for its owner (paths under `crates/`):
   (entries whose key names the device's `measured_on`), listed in the backend's `COVERS`
   (`Engine::committed_covers`); looked up home cache > committed > measured. Under `measure = false` (every engine)
   the dispatch depth is taken by name in place of the warm runs (a cover too large costs window, never a result).
-  Open: only engine-gpu lists committed covers; engine-cuda / engine-xla / engine-cerebras state no fingerprint
-  (`Engine::cover_fingerprint` default None): measured every boot, nothing kept.
+  engine-cuda states one too (the device and its kernel libraries' code, the guest emitter's version, the decode
+  products' routes table, a fire's lanes and tokens) and lists its committed covers in `chip::COVERS`; a CUDA
+  group or lockstep rank states none (measured every boot). Open: engine-xla / engine-cerebras state no
+  fingerprint (`Engine::cover_fingerprint` default None): measured every boot, nothing kept.
+- **engine-cuda, open (accepted)**: an evacuation is all or nothing on one shell (sc/l40s-evac-atomic: every check
+  a dry run before the copy, nothing past it fails but the device), but a tensor-parallel group (`group.rs`) and
+  the expert-parallel lockstep (`lockstep.rs`) evacuate rank by rank. Every logical check is the same on each rank,
+  so a refusal comes from the first rank before anything moves; only a device fault on a later rank could leave
+  the ranks split, and a device fault poisons the context anyway.
 - **engine-gpu, closed on sc/gpu-committed-profiles-2**: under `measure = false` on a platform stating a submit
   bound (Android, Windows TDR) with no roofline stated or committed, the load times only what the bound's estimate
   reads (`engine_gpu::rates::for_bound`: a short launch chain, a one-row and a widest-rung matmul over the model's
