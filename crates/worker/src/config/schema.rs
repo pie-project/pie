@@ -343,9 +343,9 @@ mod tests {
         assert!(by_key("runtime.max_concurrent_processes").default.is_none());
         assert!(by_key("engine.max_context").default.is_none());
         assert!(by_key("engine.memory.budget_device").default.is_none());
-        assert_eq!(
-            by_key("engine.memory.yield").default,
-            Some(toml::Value::Float(0.0))
+        assert!(
+            by_key("engine.memory.yield").default.is_none(),
+            "the engine's memory decides it"
         );
         assert_eq!(
             by_key("server.listen").default,
