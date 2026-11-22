@@ -362,6 +362,9 @@ pub struct Shell {
     records_hold: bool,
     /// The fires this load took from records, building no text.
     records_used: u64,
+    /// The records whose program would not load from the disk cache: each
+    /// dropped, its fire traced and its program built and kept again.
+    records_mended: u64,
     /// Programs by the fire shape that traced them: a fire whose shape was
     /// seen skips the walk and runs what the first one compiled.
     traced: std::collections::HashMap<[u8; 32], std::sync::Arc<crate::device::Program>>,
@@ -1210,6 +1213,7 @@ impl Shell {
             record_checked: false,
             records_hold: true,
             records_used: 0,
+            records_mended: 0,
             traced: std::collections::HashMap::new(),
             shaped: std::collections::HashMap::new(),
             parked: std::collections::HashMap::new(),
@@ -3160,6 +3164,18 @@ impl Shell {
         };
         // a miss, which every path below that reads it is, keyed it
         let missed = |key: Option<[u8; 32]>| key.expect("a missed fire's key");
+        // The ladder tracing again after a record's program would not load:
+        // a fire whose program is seated, or parked, is done (nothing runs).
+        if self.deferred.is_some()
+            && (found.is_some()
+                || shape_key.is_some_and(|k| self.parked_shapes.contains_key(&k))
+                || key.is_some_and(|k| self.parked.contains_key(&k)))
+        {
+            return Ok(Fired {
+                rows: vec![Vec::new(); real],
+                ..Fired::default()
+            });
+        }
         if found.is_none() && self.deferred.is_some() {
             // A fire this build traced before, its program on disk: the
             // record names it, and no text is built (a warm load's tracing
@@ -4822,12 +4838,13 @@ impl Shell {
     /// chip, the pool's and the streamed weights' layouts, the staging and
     /// the compiler's flags. Not the pie version: an upgrade that changes
     /// none of these reuses every record.
-    /// This load's traced-fire records: the fires taken from them, and
-    /// whether they held (`false`: one parted from its trace, and the load
-    /// traced every fire).
+    /// This load's traced-fire records: the fires taken from them, whether
+    /// they held (`false`: one parted from its trace, and the load traced
+    /// every fire), and how many named a program that would not load (each
+    /// traced and built again).
     #[must_use]
-    pub fn trace_records(&self) -> (u64, bool) {
-        (self.records_used, self.records_hold)
+    pub fn trace_records(&self) -> (u64, bool, u64) {
+        (self.records_used, self.records_hold, self.records_mended)
     }
 
     /// The folder this load's traced-fire records lie in, if it keeps any.

@@ -586,6 +586,18 @@ impl Device {
         std::fs::read(dir.join(hex(key))).ok()
     }
 
+    /// Drops the record under fire `key` in `scope`, and the disk cache's
+    /// program file `name` it named: a program that would not load, which
+    /// the fire's trace builds and keeps again.
+    pub fn drop_trace_record(&self, scope: &str, key: &[u8; 32], name: &str) {
+        if let Some(dir) = self.traces_dir(scope) {
+            let _ = std::fs::remove_file(dir.join(hex(key)));
+        }
+        if let Some(dir) = self.disk.as_ref() {
+            let _ = std::fs::remove_file(dir.join(name));
+        }
+    }
+
     /// Keeps `record` under fire `key` in `scope` for later loads.
     pub fn keep_trace_record(&self, scope: &str, key: &[u8; 32], record: &[u8]) {
         let Some(dir) = self.traces_dir(scope) else {
@@ -1323,6 +1335,6 @@ impl Code {
     }
 }
 
-fn hex(bytes: &[u8; 32]) -> String {
+pub(crate) fn hex(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

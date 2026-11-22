@@ -12,10 +12,12 @@ const CONTEXT: u32 = 320;
 
 /// A prompt and three decodes: each step's logits, the load's records
 /// (fires taken, held) and where they lie.
-fn served() -> (Vec<Vec<f32>>, (u64, bool), Option<std::path::PathBuf>) {
+pub(crate) fn served(
+    context: u32,
+) -> (Vec<Vec<f32>>, (u64, bool, u64), Option<std::path::PathBuf>) {
     // a context no other test loads at: a scope of the test's own, whose
     // records no other test's load reads while this one makes them stale
-    let mut model = Model::load_with("qwen3-micro-text", None, CONTEXT, 7, None);
+    let mut model = Model::load_with("qwen3-micro-text", None, context, 7, None);
     let vocab = model.vocab;
     let mut refs = Refs::of(&model);
     let mut seq = Seq::new(0);
@@ -71,7 +73,7 @@ fn make_stale(dir: &std::path::Path) -> usize {
     files.len()
 }
 
-fn argmax(row: &[f32]) -> usize {
+pub(crate) fn argmax(row: &[f32]) -> usize {
     (0..row.len())
         .max_by(|&a, &b| row[a].total_cmp(&row[b]))
         .unwrap_or(0)
@@ -83,14 +85,14 @@ fn a_stale_trace_record_is_traced_again() {
         return;
     };
     // a load that keeps records (traced, or taken from earlier runs' ones)
-    let (want, _, dir) = served();
+    let (want, _, dir) = served(CONTEXT);
     let Some(dir) = dir.filter(|d| d.is_dir()) else {
         return;
     };
     let made = make_stale(&dir);
     assert!(made > 0, "the load kept its fires' records");
 
-    let (got, (used, hold), _) = served();
+    let (got, (used, hold, _), _) = served(CONTEXT);
     assert!(
         !hold,
         "a stale record parts from its fire's trace and is caught"
@@ -106,7 +108,7 @@ fn a_stale_trace_record_is_traced_again() {
     }
 
     // the parted load rewrote the records: the next takes them again
-    let (again, (used, hold), _) = served();
+    let (again, (used, hold, _), _) = served(CONTEXT);
     assert!(hold, "the rewritten records hold");
     assert!(used > 0, "the rewritten records are taken");
     for (step, (g, w)) in again.iter().zip(&want).enumerate() {

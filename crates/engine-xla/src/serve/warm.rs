@@ -429,7 +429,33 @@ impl Shell {
             return Err(fault);
         }
         let traced_s = started.elapsed().as_secs_f64();
-        let skipped = self.compile_deferred(deferred)?;
+        let (mut skipped, mended) = self.compile_deferred(deferred)?;
+        if mended > 0 {
+            // Fires whose record's program would not load: the ladder again,
+            // every other fire's program seated or parked, so only they trace
+            // and their programs are built.
+            self.records_mended += mended as u64;
+            self.deferred = Some(Vec::new());
+            for pass in 0..passes {
+                self.stage_all = pass == 1;
+                for shape in &shapes {
+                    self.warm_fire(shape)?;
+                }
+            }
+            self.stage_all = false;
+            let again = self.deferred.take().unwrap_or_default();
+            let (left, still) = self.compile_deferred(again)?;
+            skipped += left;
+            if still > 0 {
+                return Err(crate::error::Fault::Program {
+                    at: "serve::warm",
+                    why: format!(
+                        "{still} fires traced again after their records' programs would not \
+                         load were taken from records again"
+                    ),
+                });
+            }
+        }
         // A prompt reading every row of itself fires as the plain fire of its
         // rows and reads its rows again with its row count's readout program.
         let readouts = self.lay_readouts()?;
@@ -454,7 +480,9 @@ impl Shell {
     }
 
     /// Compiles what the ladder traced, a thread a core up to 8, and seats
-    /// each program under its keys; answers how many programs it left out.
+    /// each program under its keys; answers how many programs it left out,
+    /// and how many fires' records named a program that would not load
+    /// (each record dropped, for the ladder to trace its fire again).
     ///
     /// A program whose temporaries do not fit the chip's HBM beside the pool
     /// (PJRT's `RESOURCE_EXHAUSTED`) is left out, not the load: the ladder
@@ -462,7 +490,7 @@ impl Shell {
     /// and fails there, as every shape did before the ladder (Qwen3.8-Flash-
     /// Next's mini on a v5e refused its whole load over one, "Ran out of
     /// memory on HBM" at m=9772). Any other compile failure fails the load.
-    fn compile_deferred(&mut self, deferred: Vec<super::Deferred>) -> Result<usize> {
+    fn compile_deferred(&mut self, deferred: Vec<super::Deferred>) -> Result<(usize, usize)> {
         let mut texts: Vec<(&crate::device::Code, &crate::trace::Signature)> = Vec::new();
         let mut index: Vec<usize> = Vec::with_capacity(deferred.len());
         let mut seen: std::collections::HashMap<[u8; 32], usize> = std::collections::HashMap::new();
@@ -510,6 +538,11 @@ impl Shell {
         let stated = self.host_programs;
         let host_room = HostRoom::new(stated, 2 * need);
         let parked = std::sync::atomic::AtomicUsize::new(0);
+        // The programs records named that would not load from the disk cache
+        // (corrupt, or gone since the record was read), and how many of them
+        // were parked first.
+        let stale = std::sync::Mutex::new(std::collections::HashSet::new());
+        let stale_parked = std::sync::atomic::AtomicUsize::new(0);
         // The compiles' room, fixed here: two compiles', or what a stated
         // programs' room leaves of the free memory. A compile starts once
         // its own need and every running one's fit in it, woken by a compile
@@ -556,11 +589,22 @@ impl Shell {
                         let program = {
                             // a cached program loads, never compiled
                             let _admitted = text.text().map(|t| admission.admit(t));
-                            prepared(device, text, (*sig).clone())
+                            device.prepare_code(text, (*sig).clone())
                         };
                         if let Some(r) = reserved {
-                            host_room.done(r, program.is_ok());
+                            host_room.done(r, matches!(program, Ok(Some(_))));
                         }
+                        // a record's program that would not load: mended below
+                        let program = match program {
+                            Ok(Some(program)) => Ok(program),
+                            Ok(None) => {
+                                if let Ok(mut stale) = stale.lock() {
+                                    stale.insert(at);
+                                }
+                                continue;
+                            }
+                            Err(fault) => Err(fault),
+                        };
                         if kept || program.is_err() {
                             if let Ok(mut slot) = slots[at].lock() {
                                 *slot = Some(program);
@@ -616,8 +660,19 @@ impl Shell {
                                 full.store(true, SeqCst);
                                 break;
                             };
-                            let program = prepared(device, text, (*sig).clone());
-                            host_room.done(reserved, program.is_ok());
+                            let program = device.prepare_code(text, (*sig).clone());
+                            host_room.done(reserved, matches!(program, Ok(Some(_))));
+                            let program = match program {
+                                Ok(Some(program)) => Ok(program),
+                                Ok(None) => {
+                                    if let Ok(mut stale) = stale.lock() {
+                                        stale.insert(at);
+                                    }
+                                    stale_parked.fetch_add(1, SeqCst);
+                                    continue;
+                                }
+                                Err(fault) => Err(fault),
+                            };
                             if let Ok(mut slot) = loads[at].lock() {
                                 *slot = Some(program);
                             }
@@ -632,6 +687,7 @@ impl Shell {
                 }
             }
         }
+        let parked = parked.saturating_sub(stale_parked.load(SeqCst));
         if parked > 0 {
             tracing::warn!(
                 parked,
@@ -652,7 +708,27 @@ impl Shell {
             crate::pjrt::sys::PJRT_Error_Code_RESOURCE_EXHAUSTED
         );
         let mut left_out = std::collections::HashSet::new();
+        let stale = stale.into_inner().unwrap_or_default();
+        let mut mended = 0;
         for (d, at) in deferred.into_iter().zip(index) {
+            if stale.contains(&at) {
+                // Its record dropped with the file: the ladder traces the
+                // fire again, building and keeping its program.
+                if let (Some(scope), crate::device::Code::Cached { name, .. }) =
+                    (self.trace_scope.as_deref(), &d.code)
+                {
+                    tracing::warn!(
+                        record = %crate::device::hex(&d.key),
+                        scope,
+                        file = %name,
+                        "xla traced-fire record names a program that does not load from the \
+                         disk cache: its fire is traced again and its program built and kept again"
+                    );
+                    self.device.drop_trace_record(scope, &d.key, name);
+                }
+                mended += 1;
+                continue;
+            }
             let program = match programs[at].as_ref() {
                 Some(Ok(program)) => std::sync::Arc::clone(program),
                 Some(Err(fault)) => {
@@ -691,7 +767,7 @@ impl Shell {
                 self.shaped.insert(shape_key, program);
             }
         }
-        Ok(left_out.len())
+        Ok((left_out.len(), mended))
     }
 
     fn warm_fire(&mut self, shape: &[Want]) -> Result<()> {
@@ -784,21 +860,4 @@ fn lane_counts(p: u32) -> Vec<u32> {
     ns.sort_unstable();
     ns.dedup();
     ns
-}
-
-/// `code`'s program, from the disk cache where it is a cached one (whose
-/// file a later clear of the cache may have taken: refused by name).
-fn prepared(
-    device: &crate::device::Device,
-    code: &crate::device::Code,
-    sig: crate::trace::Signature,
-) -> Result<std::sync::Arc<crate::device::Program>> {
-    device
-        .prepare_code(code, sig)?
-        .ok_or_else(|| crate::error::Fault::Program {
-            at: "serve::warm",
-            why: "a program a traced fire's record names is gone from the disk cache: the \
-              cache was cleared under the load"
-                .to_string(),
-        })
 }
