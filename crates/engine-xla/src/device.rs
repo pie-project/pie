@@ -574,6 +574,12 @@ impl Device {
         Some(self.disk.as_ref()?.join("traces").join(scope))
     }
 
+    /// The folder `scope`'s records lie in, if the device keeps a disk cache.
+    #[must_use]
+    pub fn trace_records_dir(&self, scope: &str) -> Option<PathBuf> {
+        self.traces_dir(scope)
+    }
+
     /// The record kept under fire `key` in `scope`, if one was kept.
     pub fn trace_record(&self, scope: &str, key: &[u8; 32]) -> Option<Vec<u8>> {
         let dir = self.traces_dir(scope)?;

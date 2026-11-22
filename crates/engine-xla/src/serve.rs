@@ -360,6 +360,8 @@ pub struct Shell {
     /// records still hold: a parted one stops their use for the load.
     record_checked: bool,
     records_hold: bool,
+    /// The fires this load took from records, building no text.
+    records_used: u64,
     /// Programs by the fire shape that traced them: a fire whose shape was
     /// seen skips the walk and runs what the first one compiled.
     traced: std::collections::HashMap<[u8; 32], std::sync::Arc<crate::device::Program>>,
@@ -1207,6 +1209,7 @@ impl Shell {
             trace_scope: None,
             record_checked: false,
             records_hold: true,
+            records_used: 0,
             traced: std::collections::HashMap::new(),
             shaped: std::collections::HashMap::new(),
             parked: std::collections::HashMap::new(),
@@ -3162,9 +3165,12 @@ impl Shell {
             // record names it, and no text is built (a warm load's tracing
             // was most of its time: dense Qwen3-0.6B, 67 of 105 s).
             let full = missed(key);
-            let scope = self.trace_scope.clone().filter(|_| self.records_hold);
+            // Records are read while they hold, and kept whatever: a load
+            // whose record parted rewrites the scope's records as it traces.
+            let scope = self.trace_scope.clone();
             let recorded = scope
                 .as_deref()
+                .filter(|_| self.records_hold)
                 .and_then(|scope| self.device.trace_record(scope, &full))
                 .and_then(|bytes| serde_json::from_slice::<TraceRecord>(&bytes).ok())
                 .map(|r| {
@@ -3182,7 +3188,10 @@ impl Shell {
             let check = recorded.is_some() && !self.record_checked;
             let recorded_hash = recorded.as_ref().map(|(code, ..)| code.hash());
             let (code, sig, probed) = match recorded.filter(|_| !check) {
-                Some(found) => found,
+                Some(found) => {
+                    self.records_used += 1;
+                    found
+                }
                 None => {
                     let (text, sig, probed) = self.trace_text(
                         &slots,
@@ -3204,8 +3213,10 @@ impl Shell {
                         if recorded_hash.is_some_and(|h| h != hash) {
                             self.records_hold = false;
                             tracing::warn!(
-                                "xla traced-fire records part from their traces: this load traces every \
-                         fire (the records' scope misses an input of the tracer)"
+                                scope = scope.as_deref().unwrap_or_default(),
+                                "xla traced-fire record parts from its fire's trace: this load \
+                                 traces every fire in full and rewrites the scope's records (the \
+                                 scope misses an input of the tracer, or a record is stale)"
                             );
                         }
                     }
@@ -4811,6 +4822,20 @@ impl Shell {
     /// chip, the pool's and the streamed weights' layouts, the staging and
     /// the compiler's flags. Not the pie version: an upgrade that changes
     /// none of these reuses every record.
+    /// This load's traced-fire records: the fires taken from them, and
+    /// whether they held (`false`: one parted from its trace, and the load
+    /// traced every fire).
+    #[must_use]
+    pub fn trace_records(&self) -> (u64, bool) {
+        (self.records_used, self.records_hold)
+    }
+
+    /// The folder this load's traced-fire records lie in, if it keeps any.
+    #[must_use]
+    pub fn trace_records_dir(&self) -> Option<std::path::PathBuf> {
+        self.device.trace_records_dir(self.trace_scope.as_deref()?)
+    }
+
     pub(crate) fn trace_scope(&self) -> String {
         let mut h = blake3::Hasher::new();
         h.update(TRACE_RECORDS.as_bytes());

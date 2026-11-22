@@ -17,6 +17,7 @@ mod a_maintenance_write_is_timed;
 mod a_fire_the_load_did_not_prepare_is_counted;
 mod a_padded_decode_leaves_another_lanes_state;
 mod a_parked_ladder_program_loads_on_its_first_fire;
+mod a_stale_trace_record_is_traced_again;
 mod a_masked_beam_beside_plain_decodes_answers_as_each_alone;
 mod a_mixed_fire_the_load_states_laid_finds_its_program;
 mod a_pool_answers_what_the_base_build_answered;
