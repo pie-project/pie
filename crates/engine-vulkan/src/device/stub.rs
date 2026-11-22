@@ -140,7 +140,7 @@ impl Context {
         match self.never {}
     }
 
-    pub fn stock_descriptor_pools(&self, _pools: usize) -> Result<()> {
+    pub fn seal_descriptor_pools(&self, _frames: usize) -> Result<()> {
         match self.never {}
     }
 

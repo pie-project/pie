@@ -235,17 +235,13 @@ impl Serve for Api {
     fn shelf(
         device: &Context,
         _pipelines: &Pipelines,
-        readout: &[Buffer],
+        _readout: &[Buffer],
         weights_stream: bool,
         guest: engine_gpu::serve::GuestRoom,
     ) -> Result<Shelf> {
         // A guest bind writes its tables through the device's staging slab,
         // laid here where the load has not yet written through it.
         device.lay_staging()?;
-        // The descriptor pools of the frames serving holds at once: each
-        // arm's forward, the feed and the guest passes behind it, and the
-        // one a settle or a walk holds beside them.
-        device.stock_descriptor_pools(readout.len() + 3)?;
         // Every guest pass stages and reads back through a berth of one
         // ring of host room, laid for the frames in flight
         // ([`engine_gpu::guest::ring::ring_bytes`]).
@@ -286,6 +282,15 @@ impl Serve for Api {
 
     fn grown(_shell: &mut Shell<Api>, _arm: usize, _bytes: u64) -> Result<()> {
         Ok(())
+    }
+
+    /// The descriptor pools of the frames serving holds at once, laid now
+    /// and none made after: each arm's forward, the feed and the guest
+    /// passes behind it, and the one a settle or a walk holds beside them.
+    fn serving(shell: &mut Shell<Api>) -> Result<()> {
+        shell
+            .device()
+            .seal_descriptor_pools(shell.readout.len() + 3)
     }
 
     fn plan(shell: &mut Shell<Api>, prepared: &mut Prepared<'_, Api>) -> Result<Plan<Api>> {
