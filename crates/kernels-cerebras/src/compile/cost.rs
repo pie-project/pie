@@ -16,6 +16,7 @@ pub mod time;
 use serde::Serialize;
 
 use crate::compile::plan::{LayerKind, Plan, Shape};
+use crate::tuning;
 
 /// The plan's facts a step's time is a function of, per decode step.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -121,12 +122,6 @@ impl Features {
     }
 }
 
-/// A head control PE's merge of a received (value, id) pair into its own and its send on, in
-/// cycles. Fitted to the fabric simulator's max-reduce phase.
-const LOOP_MERGE: f64 = 75.0;
-/// A router hop the pairs pass on their way, in cycles.
-const LOOP_WIRE: f64 = 0.5;
-
 /// The cycles the token loop's max-reduce over a control line of `n` PEs takes into its middle
 /// (`n / 2`): the two-level chain in groups of `g1` (`G2W`), or with `g2` (`G3W`) > 0 the
 /// three-level tree ([`crate::compile::wiring::three_level`]). Each PE merges once its children's pairs
@@ -139,7 +134,12 @@ pub fn loop_reduce_cycles(n: u32, g1: u32, g2: u32) -> f64 {
     } else {
         crate::compile::wiring::two_level(n, root, g1 as usize)
     };
-    tree_cycles(&parent, root, LOOP_MERGE, LOOP_WIRE)
+    tree_cycles(
+        &parent,
+        root,
+        tuning::get().loop_merge,
+        tuning::get().loop_wire,
+    )
 }
 
 /// The cycles a reduction tree over a line (`parent[i]`: the point `i` sends to, `None` at
@@ -164,13 +164,6 @@ pub fn tree_cycles(parent: &[Option<usize>], root: usize, merge: f64, wire: f64)
     ready[root]
 }
 
-/// A member's add-and-forward a level-1 hop, in cycles (fitted on the fabric simulator).
-const CHAIN_ADD: f64 = 7.0;
-/// A group end's merge of its group's sum with the level-2 sum from beyond, in cycles.
-const CHAIN_MERGE: f64 = 7.0;
-/// A router hop the sums pass on their way, in cycles.
-const CHAIN_WIRE: f64 = 3.0;
-
 /// The cycles a two-level chain's half of `members` takes in groups of `group` (0: one group),
 /// from every member's partial to the sum leaving the half for the root. Groups count from the
 /// root out, the remainder farthest; each group end merges its sum into the level-2 sum once
@@ -190,9 +183,12 @@ pub fn chain_cycles(members: u32, group: u32) -> f64 {
     for j in 0..n {
         // far first: the remainder, then full groups
         let size = if j == 0 { members - (n - 1) * g } else { g };
-        let level1 = f64::from(size - 1) * (CHAIN_ADD + CHAIN_WIRE) + CHAIN_WIRE;
-        let level2 = end.map_or(f64::NEG_INFINITY, |e| e + f64::from(size) * CHAIN_WIRE);
-        end = Some(level1.max(level2) + CHAIN_MERGE);
+        let level1 = f64::from(size - 1) * (tuning::get().chain_add + tuning::get().chain_wire)
+            + tuning::get().chain_wire;
+        let level2 = end.map_or(f64::NEG_INFINITY, |e| {
+            e + f64::from(size) * tuning::get().chain_wire
+        });
+        end = Some(level1.max(level2) + tuning::get().chain_merge);
     }
     end.unwrap_or(0.0)
 }

@@ -12,6 +12,9 @@
 //! wafer-compile search --model <deployment> [--positions N] [--set K=V,...] [--keep N]
 //! ```
 //!
+//! `--profile <file>` (any subcommand) prices under the chip's calibration a profile file states
+//! (`engine-cerebras/profiles/cs3.toml`), else the defaults.
+//!
 //! `cost` prints a plan's cost features (`cost::Features`) and the bytes it moves on the weight
 //! and head PEs; `search` ranks a deployment's partitions by their predicted step (`search`).
 //!
@@ -752,7 +755,14 @@ fn stream(args: &[String]) -> Result<(), String> {
 }
 
 fn run() -> Result<(), String> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // `--profile <file>`: the chip's calibration the costs price under (else the defaults)
+    if let Some(i) = args.iter().position(|a| a == "--profile") {
+        let path = args.get(i + 1).ok_or(USAGE)?.clone();
+        let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
+        kernels_cerebras::tuning::set(kernels_cerebras::tuning::load(&text, &path)?)?;
+        args.drain(i..i + 2);
+    }
     match args.first().map(String::as_str) {
         Some("plan") => plan(&args[1..]),
         Some("build") => build(&args[1..]),

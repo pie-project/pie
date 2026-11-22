@@ -1,11 +1,9 @@
 //! Attention over an image's voxels in the tiled regime (`tiled_pe.csl`'s `attend`): each key
 //! sent towards the hub along its row and column, every query's product, exponent and sum
 //! where the key comes back off the broadcast.
-
-use crate::compile::cost::stream::DSD_ELEM;
-use crate::compile::cost::tiled::{CALL, KEY, KEY_HOP, SCALAR, WORD};
 use crate::compile::stream::tiled::{TOp, TileProgram};
 use crate::kernel::{HubSend, Kernel, Source, TiledForm};
+use crate::tuning;
 
 /// A voxel attention.
 pub struct Voxel;
@@ -24,13 +22,16 @@ fn price(p: &TileProgram, i: usize) -> f64 {
     let l = p.lay_of(*q);
     let c = f64::from(v.width);
     let keys = f64::from(v.grid[1] * v.grid[2]);
-    let per = KEY
-        + f64::from(p.gx + p.gy) * KEY_HOP
-        + c * WORD
-        + c * WORD
-        + 2.0 * c * DSD_ELEM
+    let per = tuning::get().tiled_key
+        + f64::from(p.gx + p.gy) * tuning::get().tiled_key_hop
+        + c * tuning::get().tiled_word
+        + c * tuning::get().tiled_word
+        + 2.0 * c * tuning::get().stream_dsd_elem
         + f64::from(l.px())
-            * (3.0 * c * DSD_ELEM + c.log2().ceil() * CALL + 3.0 * CALL + 4.0 * SCALAR);
+            * (3.0 * c * tuning::get().stream_dsd_elem
+                + c.log2().ceil() * tuning::get().tiled_call
+                + 3.0 * tuning::get().tiled_call
+                + 4.0 * tuning::get().tiled_scalar);
     keys * per
 }
 

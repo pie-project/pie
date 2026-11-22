@@ -155,6 +155,7 @@ impl Engine for CerebrasEngine {
                 "this cerebras engine already has a model loaded".into(),
             ));
         }
+        crate::chip::calibrate().map_err(Error::Load)?;
         let LoadRequest {
             trace,
             checkpoint,

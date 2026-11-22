@@ -1,10 +1,9 @@
 //! A group norm in the tiled regime (`tiled_pe.csl`'s `norm`): each group's sums all-reduced
 //! over the image's PEs through the hub, the result back down its broadcast tree.
-
-use crate::compile::cost::stream::DSD_ELEM;
-use crate::compile::cost::tiled::{SCALAR, STREAM_WORD, all_reduce, region};
+use crate::compile::cost::tiled::{all_reduce, region};
 use crate::compile::stream::tiled::{TOp, TileProgram};
 use crate::kernel::{HubSend, Kernel, Source, TiledForm};
+use crate::tuning;
 
 /// A group norm.
 pub struct GroupNorm;
@@ -21,9 +20,10 @@ fn price(p: &TileProgram, i: usize) -> f64 {
     let l = p.lay_of(*x);
     let c = f64::from(p.vals[x].width);
     let px = f64::from(l.px());
-    let local = px * c * 4.0 * DSD_ELEM + 2.0 * c * SCALAR / 4.0;
+    let local =
+        px * c * 4.0 * tuning::get().stream_dsd_elem + 2.0 * c * tuning::get().tiled_scalar / 4.0;
     let ar = 2.0 * all_reduce(p, *groups);
-    let recv = 2.0 * c * STREAM_WORD + c * SCALAR;
+    let recv = 2.0 * c * tuning::get().tiled_stream_word + c * tuning::get().tiled_scalar;
     local + ar + recv + region(p, *reg, l.px())
 }
 

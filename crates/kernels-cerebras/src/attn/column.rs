@@ -13,6 +13,7 @@ use crate::compile::stream::build::Program;
 use crate::compile::stream::place::KvSched;
 use crate::compile::stream::unit::{Joint, Lowering, Side, Step, side_of};
 use crate::kernel::{Column, ColumnAsk, GemmForm, Kernel, LineAlong, R, Source, UnitKernel};
+use crate::tuning;
 use poem_ir::{Attn, Def, Operation};
 
 /// Attention on a K / V column.
@@ -272,9 +273,9 @@ static GEMM: GemmForm = GemmForm {
 };
 
 /// Its GEMM op's cycles: per key block, its turn, the scores' product and all-reduces, the
-/// softmax and the values' product, plus a block's fitted overhead (`cost::gemm::KEY_BLOCK`).
+/// softmax and the values' product, plus a block's fitted overhead (`gemm_key_block`).
 fn gemm_price(p: &crate::compile::stream::gemm::GemmProgram, i: usize, _: &mut [f64; 5]) -> f64 {
-    use crate::compile::cost::gemm::{CALL, EXP, KEY_BLOCK, TURN, allred, mac};
+    use crate::compile::cost::gemm::{allred, mac};
     let crate::compile::stream::gemm::GOp::Attend { causal, .. } = &p.l.ops[i] else {
         return 0.0;
     };
@@ -285,21 +286,21 @@ fn gemm_price(p: &crate::compile::stream::gemm::GemmProgram, i: usize, _: &mut [
     // (a request's key blocks: its rows of PEs')
     let blocks = p.r / p.l.batch.max(1) / p.kbm;
     let sl = kb / p.band.max(1);
-    let blk = KEY_BLOCK
+    let blk = tuning::get().gemm_key_block
         + f64::from(p.kbm)
-            * (TURN
+            * (tuning::get().gemm_turn
                 + 3.0 * f64::from(half)
-                + f64::from(tb) * (CALL + f64::from(nc))
-                + CALL
+                + f64::from(tb) * (tuning::get().gemm_call + f64::from(nc))
+                + tuning::get().gemm_call
                 + f64::from(half))
         + f64::from(tb) * mac(kb * nc)
         + 2.0 * allred(tb * kb, p.band)
         + f64::from(tb * kb) * 1.0
         + f64::from(tb)
-            * (2.0 * (f64::from(kb) + 8.0 * CALL)
-                + f64::from(sl) * EXP
-                + 3.0 * EXP
-                + 4.0 * CALL
+            * (2.0 * (f64::from(kb) + 8.0 * tuning::get().gemm_call)
+                + f64::from(sl) * tuning::get().gemm_exp
+                + 3.0 * tuning::get().gemm_exp
+                + 4.0 * tuning::get().gemm_call
                 + f64::from(kb)
                 + mac(kb * nc))
         + if *causal {

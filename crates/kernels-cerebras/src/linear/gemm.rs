@@ -1,9 +1,9 @@
 //! A matmul in the GEMM regime (`gemm_pe.csl`'s `gemm`): a class's rows times a weight block off
 //! the tape below the array, every PE of a row reading every other's piece along the row line.
 
-use crate::compile::cost::gemm::{CALL, MAC_CALL, MAC_ELEM, PIECE, TURN};
 use crate::compile::stream::gemm::{GOp, GemmProgram, piece};
 use crate::kernel::{GemmForm, Kernel, LineAlong, Source};
+use crate::tuning;
 
 /// Op `i`'s cycles, by term: each column piece's turn, its input piece, each output segment's
 /// block off the column's tree and its MACs (a call a row and half).
@@ -24,17 +24,17 @@ fn price(p: &GemmProgram, i: usize, terms: &mut [f64; 5]) -> f64 {
             continue;
         }
         let xw = (rows * kc).div_ceil(2) * if *x32 { 2 } else { 1 };
-        terms[0] += TURN + PIECE;
+        terms[0] += tuning::get().gemm_turn + tuning::get().gemm_piece;
         terms[1] += 3.0 * f64::from(xw);
         for s in &segs {
             let w = s.4;
             let wb = f64::from(kc * w / 2);
             // the block off the column's tree
-            terms[2] += wb + CALL;
+            terms[2] += wb + tuning::get().gemm_call;
             // (a call a row and half: its block's MACs)
             let calls = f64::from(rows) * if *x32 { 2.0 } else { 1.0 };
-            terms[3] += calls * MAC_CALL;
-            terms[4] += calls * MAC_ELEM * f64::from(kc * w);
+            terms[3] += calls * tuning::get().gemm_mac_call;
+            terms[4] += calls * tuning::get().gemm_mac_elem * f64::from(kc * w);
         }
     }
     terms.iter().sum()

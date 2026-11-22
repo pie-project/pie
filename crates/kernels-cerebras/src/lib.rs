@@ -12,3 +12,4 @@ pub mod kernel;
 pub mod linear;
 pub mod sources;
 pub mod ssm;
+pub mod tuning;

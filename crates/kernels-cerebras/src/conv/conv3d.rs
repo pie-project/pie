@@ -1,11 +1,9 @@
 //! A convolution in the tiled regime (`tiled_pe.csl`'s `conv`): its weights streamed in blocks
 //! off the tape, each PE's pixels multiplied a block at a time, a 3 x 3 conv's input staged a
 //! chunk of channels at a time with its halo exchanged.
-
-use crate::compile::cost::stream::{DSD_ELEM, P1_STREAM};
-use crate::compile::cost::tiled::{CALL, HOP, STREAM_WORD, WORD};
 use crate::compile::stream::tiled::{TOp, TileProgram};
 use crate::kernel::{Kernel, Source, TiledForm};
+use crate::tuning;
 
 /// A convolution.
 pub struct Conv3d;
@@ -35,29 +33,31 @@ fn price(p: &TileProgram, i: usize) -> f64 {
     let weights = taps * cin_ * cout_;
     let kb = f64::from(p.kb[i].max(1));
     let blocks = taps * cin_ / kb;
-    let recv = weights / 2.0 * STREAM_WORD + blocks * CALL;
-    let mac = px * weights * P1_STREAM + blocks * px * CALL;
+    let recv = weights / 2.0 * tuning::get().tiled_stream_word + blocks * tuning::get().tiled_call;
+    let mac = px * weights * tuning::get().stream_p1 + blocks * px * tuning::get().tiled_call;
     let lx = p.lay_of(*x);
     // the input staged a chunk of kc channels at a time, its halo exchanged
     let kc = f64::from(p.kc[i].max(1));
     let chunks = cin_ / kc;
     let stage = if *k == 3 {
         let (th, tw) = (f64::from(lx.th), f64::from(lx.tw));
-        let fill = (th + 2.0) * (tw + 2.0) * kc * DSD_ELEM;
+        let fill = (th + 2.0) * (tw + 2.0) * kc * tuning::get().stream_dsd_elem;
         // two 16-bit values a wavelet
-        let ew = 4.0 * (th * kc / 2.0 * WORD + th * CALL) + 4.0 * f64::from(1u32 << lx.lsx) * HOP;
-        let ns =
-            4.0 * ((tw + 2.0) * kc / 2.0 * WORD + CALL) + 4.0 * f64::from(1u32 << lx.lsy) * HOP;
+        let ew = 4.0 * (th * kc / 2.0 * tuning::get().tiled_word + th * tuning::get().tiled_call)
+            + 4.0 * f64::from(1u32 << lx.lsx) * tuning::get().tiled_hop;
+        let ns = 4.0
+            * ((tw + 2.0) * kc / 2.0 * tuning::get().tiled_word + tuning::get().tiled_call)
+            + 4.0 * f64::from(1u32 << lx.lsy) * tuning::get().tiled_hop;
         chunks * (fill + ew + ns)
     } else {
-        px * cin_ * DSD_ELEM
+        px * cin_ * tuning::get().stream_dsd_elem
     };
     let tail = if bias.is_some() {
-        cout_ * STREAM_WORD + px * cout_ * DSD_ELEM
+        cout_ * tuning::get().tiled_stream_word + px * cout_ * tuning::get().stream_dsd_elem
     } else {
         0.0
     } + if p.vals[y].round {
-        2.0 * px * cout_ * DSD_ELEM
+        2.0 * px * cout_ * tuning::get().stream_dsd_elem
     } else {
         0.0
     };

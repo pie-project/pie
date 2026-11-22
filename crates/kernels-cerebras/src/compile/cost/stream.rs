@@ -1,5 +1,5 @@
 //! The stream regime's op-derived step time: each unit's rows priced by what its PEs do a row
-//! (matvec tiles at [`P1_STREAM`], region ops at [`DSD_ELEM`], all-reduces, rotations, stores
+//! (matvec tiles at `stream_p1`, region ops at `stream_dsd_elem`, all-reduces, rotations, stores
 //! and queries), the units' phases in the order the row stream and the barriers allow. A phase
 //! costs its rows x its pace: a row's path through its steps, or one PE's own work a row where
 //! that is longer. A pre-barrier phase starts when the rows reach the unit; a post-barrier phase
@@ -14,44 +14,15 @@ use std::collections::BTreeMap;
 use poem_ir::ValueId;
 
 use crate::compile::stream::unit::{self, Side, Step};
+use crate::tuning;
 
-/// Weight-PE matvec cycles an element a row (f32 accumulation).
-pub const P1_STREAM: f64 = 0.55;
-/// A region's DSD op: its issue, and an element of it.
-pub const DSD_OP: f64 = 0.0;
-pub const DSD_ELEM: f64 = 0.69;
-/// A vector exp's (math.vexp) and reciprocal's (three Newton steps) elements.
-pub const EXP_ELEM: f64 = 16.2;
-pub const RECIP_ELEM: f64 = 16.2;
-/// A chunk sum's element (the halving tree) and a level of it.
-pub const SUM_ELEM: f64 = 0.69;
-pub const SUM_LEVEL: f64 = 20.0;
-/// A scalar math call (rsqrt, recip, ln, exp of a scalar).
-pub const SCALAR_MATH: f64 = 60.0;
-/// A segment all-reduce over a unit's CX roots.
-pub const ALL_REDUCE: f64 = 210.0;
-/// A position's cos / sin from the rotation tables (`ops/srope.csl`): a call costs [`ROT_CALL`];
-/// a row whose position moved, [`ROT_CHANGE`] and [`ROT_LEVEL`] a level recomputed. One axis is
-/// taken to advance a step a row: `2^B / (2^B - 1)` levels a row at `B` bits a digit. Fitted on
-/// the simulator.
-pub const ROT_CALL: f64 = 170.0;
-pub const ROT_CHANGE: f64 = 429.0;
-pub const ROT_LEVEL: f64 = 152.0;
 /// A decode step's rotation computed at its root (`srope.csl`'s DIRECT, no tables): a moved
-/// position costs [`ROT_DIRECT_OPS`] DSD operations over the pairs, each [`ROT_DIRECT_OP`] to
-/// issue and [`DSD_ELEM`] an element.
+/// position costs [`ROT_DIRECT_OPS`] DSD operations over the pairs, each `stream_rot_direct_op` to
+/// issue and `stream_dsd_elem` an element.
 pub const ROT_DIRECT_OPS: f64 = 42.0;
-pub const ROT_DIRECT_OP: f64 = 30.0;
 /// DIRECT's step (`srope.csl`'s STEP): a position one past the last advanced by
 /// [`ROT_STEP_OPS`] DSD operations over the pairs, DIRECT at each multiple of the period.
 pub const ROT_STEP_OPS: f64 = 6.0;
-/// The row store: a held word cast out or summed back, a hop of the row chain.
-pub const STORE_WORD: f64 = 1.0;
-pub const CHAIN_HOP: f64 = 2.0;
-/// A stored row; a query, and an entry a PE keeps.
-pub const STORE: f64 = 508.0;
-pub const QUERY: f64 = 1_100.0;
-pub const QUERY_ENTRY: f64 = 151.0;
 
 /// What a printed region's `row()` does a row.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
@@ -158,7 +129,8 @@ impl RegionFeatures {
             return 0.0;
         }
         if self.rope_direct > 0.0 {
-            let op = ROT_DIRECT_OP + self.rope_direct * DSD_ELEM;
+            let op = tuning::get().stream_rot_direct_op
+                + self.rope_direct * tuning::get().stream_dsd_elem;
             if self.rope_step > 1.0 {
                 let n = self.rope_step;
                 return op * (ROT_DIRECT_OPS + (n - 1.0) * ROT_STEP_OPS) / n;
@@ -166,7 +138,7 @@ impl RegionFeatures {
             return ROT_DIRECT_OPS * op;
         }
         let d = self.rope_bits.max(1.0).exp2();
-        ROT_CHANGE + ROT_LEVEL * d / (d - 1.0)
+        tuning::get().stream_rot_change + tuning::get().stream_rot_level * d / (d - 1.0)
     }
 
     /// Cycles a row of `reps` runs of the region over a root's heads (the row's positions
@@ -174,15 +146,15 @@ impl RegionFeatures {
     #[must_use]
     pub fn cycles_reps(&self, chunk: u32, reps: u32) -> f64 {
         let levels = f64::from(chunk.max(2)).log2().ceil();
-        let one = self.dsd_ops * DSD_OP
-            + self.dsd_elems * DSD_ELEM
-            + self.exp_elems * EXP_ELEM
-            + self.recip_elems * RECIP_ELEM
-            + self.sum_elems * SUM_ELEM
-            + self.sums * levels * SUM_LEVEL
-            + self.scalar_math * SCALAR_MATH
-            + self.all_reduces * ALL_REDUCE
-            + self.rotations * ROT_CALL;
+        let one = self.dsd_ops * tuning::get().stream_dsd_op
+            + self.dsd_elems * tuning::get().stream_dsd_elem
+            + self.exp_elems * tuning::get().stream_exp_elem
+            + self.recip_elems * tuning::get().stream_recip_elem
+            + self.sum_elems * tuning::get().stream_sum_elem
+            + self.sums * levels * tuning::get().stream_sum_level
+            + self.scalar_math * tuning::get().stream_scalar_math
+            + self.all_reduces * tuning::get().stream_all_reduce
+            + self.rotations * tuning::get().stream_rot_call;
         f64::from(reps.max(1)) * one + self.rotation_advance()
     }
 }
@@ -228,9 +200,6 @@ fn passes(s: &Step) -> f64 {
     }
 }
 
-/// A word a root sends to or takes from the fabric (a helper's cast, its sums back).
-pub const FABRIC_WORD: f64 = 1.0;
-
 fn region_cycles(p: &Program, u: usize, step: usize) -> f64 {
     let b = &p.units[u];
     let Some((at, printed, params)) = b.regions.get(&step) else {
@@ -246,8 +215,8 @@ fn region_cycles(p: &Program, u: usize, step: usize) -> f64 {
                 .count() as f64;
             let nout = hp.results.len() as f64;
             RegionFeatures::of(&hp.csl, at.chunk / (h + 1)).cycles(at.chunk / (h + 1))
-                + (np * c + np * q + 2.0 * nout * q) * DSD_ELEM
-                + (np + nout) * (c - q) * FABRIC_WORD
+                + (np * c + np * q + 2.0 * nout * q) * tuning::get().stream_dsd_elem
+                + (np + nout) * (c - q) * tuning::get().stream_fabric_word
         }
         _ => RegionFeatures::of(&printed.csl, at.chunk).cycles_reps(at.chunk, at.reps),
     }
@@ -257,18 +226,13 @@ fn region_cycles(p: &Program, u: usize, step: usize) -> f64 {
 #[must_use]
 pub fn query_cycles(rows: u32, pya: u32, q_heads: u32) -> f64 {
     let ne = rows.div_ceil(pya.max(1));
-    QUERY + QUERY_ENTRY * f64::from(ne * q_heads)
+    tuning::get().stream_query + tuning::get().stream_query_entry * f64::from(ne * q_heads)
 }
 
-/// What a step measures over [`time`]'s price: the least ratio over every stream program run
-/// (the price misses time spent between units). A regime's choice ([`expected`]) reads the
-/// price so corrected.
-pub const MEASURED: f64 = 1.41;
-
-/// The step time a run of `p` is expected to measure: [`time`] by [`MEASURED`].
+/// The step time a run of `p` is expected to measure: [`time`] by `stream_measured`.
 #[must_use]
 pub fn expected(p: &Program) -> f64 {
-    time(p).cycles * MEASURED
+    time(p).cycles * tuning::get().stream_measured
 }
 
 /// The step time of `p`.
@@ -306,7 +270,7 @@ pub fn time_at(p: &Program, class_rows: &[u32]) -> StreamCost {
                         .enumerate()
                         .filter(|(i, _)| (*i >= b.unit.split) == phase)
                         .filter_map(|(_, s)| place::tile_dims(s, l, c).map(|t| (t, passes(s))))
-                        .map(|((a, bb), x)| f64::from(a * bb) * P1_STREAM * x)
+                        .map(|((a, bb), x)| f64::from(a * bb) * tuning::get().stream_p1 * x)
                         .sum::<f64>()
                 })
                 .fold(0.0, f64::max);
@@ -372,7 +336,7 @@ pub fn time_at(p: &Program, class_rows: &[u32]) -> StreamCost {
                             .fold(0.0, f64::max);
                         (
                             at_of(&ready, input.base),
-                            elems * P1_STREAM * passes(s),
+                            elems * tuning::get().stream_p1 * passes(s),
                             vec![*output],
                         )
                     }
@@ -381,7 +345,7 @@ pub fn time_at(p: &Program, class_rows: &[u32]) -> StreamCost {
                             .iter()
                             .map(|&x| at_of(&ready, x))
                             .fold(0.0, f64::max),
-                        STORE,
+                        tuning::get().stream_store,
                         Vec::new(),
                     ),
                     Step::Attend { out, .. } => (0.0, 0.0, vec![*out]),
@@ -416,8 +380,8 @@ pub fn time_at(p: &Program, class_rows: &[u32]) -> StreamCost {
                         parts.push(part("col", c));
                     }
                     Step::Store { .. } => {
-                        on(0, l.heads, STORE);
-                        parts.push(part("store", STORE));
+                        on(0, l.heads, tuning::get().stream_store);
+                        parts.push(part("store", tuning::get().stream_store));
                     }
                     Step::Attend { .. } => {
                         let block: u32 =
@@ -470,9 +434,9 @@ pub fn time_at(p: &Program, class_rows: &[u32]) -> StreamCost {
                     prologue: false,
                 };
                 let (per, _) = place::store_words(&r, &b.unit, l.py, l.px());
-                row_side += f64::from(per) * STORE_WORD
+                row_side += f64::from(per) * tuning::get().stream_store_word
                     + if phase {
-                        f64::from(l.px()) * CHAIN_HOP
+                        f64::from(l.px()) * tuning::get().stream_chain_hop
                     } else {
                         0.0
                     };
@@ -500,9 +464,6 @@ pub fn time_at(p: &Program, class_rows: &[u32]) -> StreamCost {
     }
 }
 
-/// A forwarded (or dropped) row's word at a CX root: in off the stream, out again.
-pub const FORWARD_WORD: f64 = 1.0;
-
 /// The step's end along the stream, row by row: each unit's CX roots run their schedule's
 /// segments in order ([`place::Seg`]), a row no sooner than it reaches the unit and no faster
 /// than the unit's pace ([`UnitCost`]), a late segment no sooner than every unit of its block has
@@ -510,7 +471,7 @@ pub const FORWARD_WORD: f64 = 1.0;
 #[must_use]
 pub fn timeline(p: &Program, units: &[UnitCost], class_rows: &[u32]) -> f64 {
     let built: Vec<u32> = p.class_rows.iter().map(|r| r.0).collect();
-    let fwd = f64::from(p.stream_hidden() / p.stream.py.max(1)) * FORWARD_WORD;
+    let fwd = f64::from(p.stream_hidden() / p.stream.py.max(1)) * tuning::get().stream_forward_word;
     // each path unit's segments with their classes (read off the stream at the build's rows)
     #[derive(Clone, Copy)]
     enum K {

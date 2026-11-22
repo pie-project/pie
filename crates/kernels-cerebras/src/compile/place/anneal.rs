@@ -115,7 +115,7 @@ enum Term {
     /// The row stream from unit block `a` to `b` (their CX roots, the same row), once a step.
     Gap { a: usize, b: usize, wires: u32 },
     /// A unit's head root (column `col` of block `u`) to a K / V column's root (block `k`),
-    /// there and back, once a step ([`super::cost::KV_HOP`] a hop).
+    /// there and back, once a step (`place_kv_hop` a hop).
     Trip {
         u: usize,
         col: u32,
@@ -146,7 +146,7 @@ struct Model {
 
 impl Model {
     fn term(&self, t: Term, at: &[Coord]) -> f64 {
-        let hop = super::cost::HOP;
+        let hop = crate::tuning::get().stream_chain_hop;
         match t {
             Term::Gap { a, b, wires } => {
                 // the gap's longest wire; a next unit not right after the last on its rows turns
@@ -163,7 +163,7 @@ impl Model {
             Term::Trip { u, col, down, k } => {
                 let (cx, cy) = (at[u].x + 1 + col, at[u].y + down);
                 let d = cx.abs_diff(at[k].x) + cy.abs_diff(at[k].y);
-                super::cost::KV_HOP * 2.0 * f64::from(d)
+                crate::tuning::get().place_kv_hop * 2.0 * f64::from(d)
             }
         }
     }
@@ -443,7 +443,8 @@ pub fn stream(p: &Program, moves: u64, seed: u64, units: bool) -> R<(Program, Re
             n += 1;
         }
     }
-    let t_start = if n > 0 { probe / f64::from(n) } else { 0.0 }.max(10.0 * super::cost::HOP);
+    let t_start = if n > 0 { probe / f64::from(n) } else { 0.0 }
+        .max(10.0 * crate::tuning::get().stream_chain_hop);
     let mut accepted = 0u64;
     let mut made = 0u64;
     // the bests found on the way (the router tries the best first, then the ones before it)

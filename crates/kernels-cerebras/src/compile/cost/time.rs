@@ -1,58 +1,43 @@
 //! A decode step's time in ms: the plan's partition ([`Features`]) at per-unit rates, plus each
-//! layer's own cost. The rates are the chip's: weight and head elements from `TSTAMP:1` phase
-//! stamps, the reductions' chains by their critical path ([`super::chain_cycles`]) at a fitted
-//! rate, KV elements and row span fitted. A layer's own cost is its kinds' ([`KIND_LAYER`]).
+//! layer's own cost. The rates are the chip's ([`crate::tuning`]): weight and head elements from
+//! `TSTAMP:1` phase stamps, the reductions' chains by their critical path
+//! ([`super::chain_cycles`]) at a fitted rate, KV elements and row span fitted. A layer's own cost
+//! is its kinds'.
 
 use super::Features;
 use crate::compile::plan::{Plan, Shape};
+use crate::tuning;
 
 /// One PE cycle ([`super::CLOCK_HZ`]), in ms.
 const CYCLE: f64 = 1e3 / super::CLOCK_HZ;
-/// ms a weight element: a weight PE's stamped matvec phases.
-pub const MATVEC: f64 = 1524.0 / 3328.0 * CYCLE;
-/// ms a KV element a row PE reads (fitted: the scores' and the values' passes on the CY column).
-pub const KV: f64 = 6.436e-6;
-/// ms a cycle of the reductions' chains ([`Features::chain`], fitted with KV and the span held):
-/// below a PE cycle, as the simulator's hop cycles overprice the chip's chains.
-pub const CHAIN: f64 = 1.093e-6;
-/// ms a row a layer's collectives cross down the columns (fitted).
-pub const SPAN_ROW: f64 = 1.267e-5;
-/// ms a column they cross along the rows: fitted to 0 (none the chip resolves).
-pub const SPAN_COL: f64 = 0.0;
-/// ms a head element: the head PE's stamped matvec phase (0.537 cycles an element).
-pub const HEAD: f64 = 0.537 * CYCLE;
-/// ms a cycle of the token loop's max-reduce ([`Features::loop_reduce`]): the chip's cycle.
-pub const LOOP_REDUCE: f64 = CYCLE;
 
 /// The partition's part of a step, in ms.
 #[must_use]
 pub fn partition(f: &Features) -> f64 {
-    MATVEC * f.matvec
-        + KV * f.kv
-        + CHAIN * f.chain
-        + SPAN_ROW * f.span_rows
-        + SPAN_COL * f.span_cols
-        + HEAD * f.head
-        + LOOP_REDUCE * f.loop_reduce
+    let t = tuning::get();
+    t.decode_matvec * CYCLE * f.matvec
+        + t.decode_kv * f.kv
+        + t.decode_chain * f.chain
+        + t.decode_span_row * f.span_rows
+        + t.decode_span_col * f.span_cols
+        + t.decode_head * CYCLE * f.head
+        + t.decode_loop_reduce * CYCLE * f.loop_reduce
 }
 
-/// A layer's own cost by its mixer's kind (ms: gated delta net, full attention, sliding-window
-/// attention, attention over another layer's KV), least squares over the chip's measured steps.
-pub const KIND_LAYER: [f64; 4] = [8.018e-3, 5.707e-3, 10.653e-3, 19.700e-3];
-
-/// [`KIND_LAYER`] over `shape`'s layers, a layer's mean.
+/// A layer's own cost by its mixer's kind (`layer_*`), over `shape`'s layers, a layer's mean.
 #[must_use]
 pub fn kinds_layer(shape: &Shape) -> f64 {
     use crate::compile::plan::LayerKind;
+    let t = tuning::get();
     let n = shape.layers.len().max(1) as f64;
     shape
         .layers
         .iter()
         .map(|l| match l {
-            LayerKind::Gdn => KIND_LAYER[0],
-            LayerKind::Global => KIND_LAYER[1],
-            LayerKind::Sliding { .. } => KIND_LAYER[2],
-            LayerKind::SharedKv { .. } => KIND_LAYER[3],
+            LayerKind::Gdn => t.layer_gdn,
+            LayerKind::Global => t.layer_global,
+            LayerKind::Sliding { .. } => t.layer_sliding,
+            LayerKind::SharedKv { .. } => t.layer_shared_kv,
         })
         .sum::<f64>()
         / n

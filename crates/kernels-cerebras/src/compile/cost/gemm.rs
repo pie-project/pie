@@ -1,32 +1,14 @@
 //! The GEMM regime's op-derived time and memory. Every op runs over the whole array, each PE in
 //! step with its row's and column's lines, so an op costs its rows' work at the pace of each
-//! line's root: line turns ([`TURN`]), words, `mac32` calls ([`MAC_CALL`], [`MAC_ELEM`]),
-//! all-reduce hops ([`HOP`]) and exponents ([`EXP`]). Each op adds [`OP`].
+//! line's root: line turns (`gemm_turn`), words, `mac32` calls (`gemm_mac_call`, `gemm_mac_elem`),
+//! all-reduce hops (`gemm_hop`) and exponents (`gemm_exp`). Each op adds `gemm_op`.
 
 use serde::Serialize;
 
-use super::stream::{ALL_REDUCE, RegionFeatures};
+use super::stream::RegionFeatures;
 use crate::compile::stream::gemm::{GOp, GemmProgram};
+use crate::tuning;
 
-/// A line's turn: two sends, two drains, four route writes, the next member's first word.
-pub const TURN: f64 = 150.0;
-/// A GEMM's piece past its turn and words (the interpreter's loop, the blocks' setup), fitted to
-/// flux2-mini on the simulator.
-pub const PIECE: f64 = 280.0;
-/// A `mac32` (or `tile32`) call's fixed cycles and a multiply-accumulate's: a call is a row of a
-/// block, its MACs the block's (`kc` `@fmachs` of `p` words, pipelined). Fitted to the chip.
-pub const MAC_CALL: f64 = 61.75;
-pub const MAC_ELEM: f64 = 0.543;
-/// A PE's hop of an all-reduce's chain (an `fadds` from the fabric into the fabric).
-pub const HOP: f64 = 12.0;
-/// A DSD op's fixed cycles.
-pub const CALL: f64 = 8.0;
-/// A scalar exponent (`math.exp1`).
-pub const EXP: f64 = 30.0;
-/// A key block's cycles past its modelled terms, fitted to the chip.
-pub const KEY_BLOCK: f64 = 11_770.0;
-/// An op's fixed cycles: the interpreter, the array's step between ops.
-pub const OP: f64 = 200.0;
 /// A PE's 32-bit words ([`crate::compile::check::PE_BYTES`]).
 pub const PE_WORDS: u32 = (crate::compile::check::PE_BYTES / 4) as u32;
 /// The code's words a PE (interpreter, line streams, all-reduces; regions counted apart), fitted
@@ -69,7 +51,7 @@ impl GemmCost {
 
 /// A `mac32` call of `n` multiply-accumulates.
 pub(crate) fn mac(n: u32) -> f64 {
-    MAC_CALL + MAC_ELEM * f64::from(n)
+    tuning::get().gemm_mac_call + tuning::get().gemm_mac_elem * f64::from(n)
 }
 
 /// An all-reduce of `n` words over `members` PEs.
@@ -77,16 +59,13 @@ pub(crate) fn allred(n: u32, members: u32) -> f64 {
     if members <= 1 {
         return 0.0;
     }
-    2.0 * f64::from(n) + f64::from(members) * HOP + 2.0 * CALL
+    2.0 * f64::from(n) + f64::from(members) * tuning::get().gemm_hop + 2.0 * tuning::get().gemm_call
 }
 
-/// What a step measures over [`time`]'s price (its terms fitted to the simulator's runs).
-pub const MEASURED: f64 = 1.0;
-
-/// The step time a run of `p` is expected to measure: [`time`] by [`MEASURED`].
+/// The step time a run of `p` is expected to measure: [`time`] by `gemm_measured`.
 #[must_use]
 pub fn expected(p: &GemmProgram) -> f64 {
-    time(p).cycles * MEASURED
+    time(p).cycles * tuning::get().gemm_measured
 }
 
 /// The program's time.
@@ -101,9 +80,12 @@ pub fn time(p: &GemmProgram) -> GemmCost {
             GOp::In { v, lane, .. } => {
                 let rows = if *lane { 1 } else { tb };
                 let w = crate::compile::stream::gemm::local_width(&p.l.vals[v], c, 0);
-                ("in", f64::from(rows * w) + CALL)
+                ("in", f64::from(rows * w) + tuning::get().gemm_call)
             }
-            GOp::Out { width, .. } => ("out", f64::from(tb * width / c) + CALL * f64::from(tb)),
+            GOp::Out { width, .. } => (
+                "out",
+                f64::from(tb * width / c) + tuning::get().gemm_call * f64::from(tb),
+            ),
             // a kernel's op: its price its module's ([`crate::kernel::GemmForm`])
             GOp::Gemm { .. } | GOp::Attend { .. } => match crate::kernel::gemm_form(op) {
                 Some(f) => (f.what_price, (f.price)(p, i, &mut terms)),
@@ -118,17 +100,18 @@ pub fn time(p: &GemmProgram) -> GemmCost {
                     RegionFeatures::of(&pr.csl, ch)
                 });
                 let heads = pr.map_or(0, |pr| pr.head_reduces);
-                let row = f.cycles(ch) - f.all_reduces * ALL_REDUCE
+                let row = f.cycles(ch) - f.all_reduces * tuning::get().stream_all_reduce
                     + f.all_reduces * allred(1, if g.head { p.band } else { c })
                     + f64::from(heads) * allred(1, p.band)
-                    + f64::from((g.args.len() + g.outs.len()) as u32) * (CALL + f64::from(ch));
+                    + f64::from((g.args.len() + g.outs.len()) as u32)
+                        * (tuning::get().gemm_call + f64::from(ch));
                 ("region", f64::from(rows) * row)
             }
         };
         ops.push(OpCost {
             op: i,
             what,
-            cycles: cy + OP,
+            cycles: cy + tuning::get().gemm_op,
             terms,
         });
     }

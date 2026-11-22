@@ -1,7 +1,7 @@
 //! What the wires between blocks cost a step: the link term the placer prices beside a regime's
 //! own (position-free) price. A stream step pays its wires twice: the fill (the row stream
 //! crosses each unit gap once, at its longest wire) and each (unit, K / V column) pair's round
-//! trip once a step at [`KV_HOP`] a hop (the rows pipeline, so not once a row).
+//! trip once a step at `place_kv_hop` a hop (the rows pipeline, so not once a row).
 //!
 //! Congestion is reported (shared fabric edges between block wires) but not priced.
 
@@ -10,15 +10,9 @@ use serde::Serialize;
 use crate::compile::floor::Coord;
 use crate::compile::stream::build::Program;
 use crate::compile::wiring::Link;
+use crate::tuning;
 
 type R<T> = Result<T, String>;
-
-/// Cycles a wire's hop ([`crate::compile::cost::stream::CHAIN_HOP`]).
-pub const HOP: f64 = crate::compile::cost::stream::CHAIN_HOP;
-
-/// Cycles a hop of a K / V round trip, each (unit, column) pair's paid once a step (fitted on
-/// the chip).
-pub const KV_HOP: f64 = 2.08;
 
 /// A unit's attention round trip: its rows a step, the hops there and back (its longest head).
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -98,9 +92,9 @@ pub fn stream(p: &Program) -> R<Links> {
             }
         }
     }
-    let fill = HOP * f64::from(fill_hops.iter().sum::<u32>());
+    let fill = tuning::get().stream_chain_hop * f64::from(fill_hops.iter().sum::<u32>());
     // (every unit's every K / V column: its round trip once a step)
-    let attention = KV_HOP * f64::from(kv.values().sum::<u32>());
+    let attention = tuning::get().place_kv_hop * f64::from(kv.values().sum::<u32>());
     let shared: Vec<u32> = edges.values().copied().filter(|&n| n > 1).collect();
     Ok(Links {
         fill_hops,
