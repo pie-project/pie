@@ -3440,6 +3440,45 @@ impl Roles {
         leaked
     }
 
+    /// Every device slot the items hold in slots of their shape (tables,
+    /// rings, channels, adapters: not guest runs of chunks), checked
+    /// against the pool and each other: each held by one item, and handed
+    /// out in the pool. What is said is a slot two items hold, or one an
+    /// item holds that the pool counts free: the store's double give that
+    /// handed one ref to a restore and a fresh bind together.
+    #[cfg(test)]
+    #[must_use]
+    pub fn audit_device_slots(&self) -> Vec<String> {
+        let device = self.device.lock().unwrap();
+        let mut seen: HashMap<(SlotRole, u32), Owner> = HashMap::new();
+        let mut said = Vec::new();
+        for (owner, item) in &self.items {
+            if item.tier != Tier::Device {
+                continue;
+            }
+            for part in item.parts.iter().filter(|part| !part.shaped()) {
+                let Some(shape) = self.shapes.of(part.role) else {
+                    continue;
+                };
+                for &slot_ref in &part.refs {
+                    if let Some(other) = seen.insert((part.role, slot_ref), *owner) {
+                        said.push(format!(
+                            "{:?} slot {slot_ref} held by {other:?} and {owner:?}",
+                            part.role
+                        ));
+                    }
+                    if !device.pool().is_held(shape.pool, device.slot(shape.pool, slot_ref)) {
+                        said.push(format!(
+                            "{:?} slot {slot_ref} held by {owner:?} is free in the pool",
+                            part.role
+                        ));
+                    }
+                }
+            }
+        }
+        said
+    }
+
     /// Role slots out of service for good: taken by moves whose copies an
     /// engine could not settle ([`Self::abandon`]).
     #[must_use]
@@ -3457,10 +3496,17 @@ impl Roles {
         let mut channels: BTreeSet<ChannelId> = BTreeSet::new();
         for (owner, item) in &self.items {
             match *owner {
-                Owner::Channel(id) if item.stale && item.holder == Some(holder) => {
+                // Only what lies on the device now: one moved off since its
+                // restore (parked again while its rebinds waited) names no
+                // slots the engine may claim.
+                Owner::Channel(id)
+                    if item.stale && item.holder == Some(holder) && item.tier == Tier::Device =>
+                {
                     channels.insert(id);
                 }
-                Owner::Instance(id) if item.stale && item.holder == Some(holder) => {
+                Owner::Instance(id)
+                    if item.stale && item.holder == Some(holder) && item.tier == Tier::Device =>
+                {
                     instances.insert(id);
                 }
                 // Its holders on the device; a parked one is rebound when it
@@ -3647,6 +3693,52 @@ impl Roles {
             Owner::Instance(_) => item.open,
             _ => true,
         })
+    }
+
+    /// Whether `rebind`, read off the roles before the lane ran it, still
+    /// says where its item lies: a park of an instance not closed since; a
+    /// rebind of an item that is on the device, not parked where it lies,
+    /// at the slots it names. One whose item has moved since (parked again
+    /// by an eviction or a bind's suspension while its restore waited on
+    /// its rebinds, its device slots given back at that park's commit) is
+    /// cancelled: sent, the engine claimed slots the store had handed out
+    /// again, and the next bind there was refused (the L40S and the M1 on
+    /// batch 3: instance slot 12537 rebound 4 ms after its park, the same
+    /// refs, then bound to another instance 1 ms later). The move that
+    /// brings it back names it anew.
+    #[must_use]
+    pub fn rebind_stands(&self, rebind: &Rebind) -> bool {
+        let owner = Owner::of(rebind);
+        if !self.rebinds(owner) {
+            return false;
+        }
+        let Some(item) = self.items.get(&owner) else {
+            return false;
+        };
+        match rebind {
+            Rebind::Parked { .. } => true,
+            Rebind::Instance { instance, .. } => {
+                item.tier == Tier::Device
+                    && !item.shed
+                    && item.parts.first().map_or(instance.is_empty(), |part| part.refs == *instance)
+            }
+            Rebind::Channel { slots, .. } => item.tier == Tier::Device && item.refs() == *slots,
+        }
+    }
+
+    /// Instances `ids` were said parked to the engine and their park was
+    /// taken back: each on the device where it lay, not parked where it
+    /// lies, is rebound at its slots ([`Self::stale`]) before its process
+    /// fires again, so the engine never believes a park the runtime undid.
+    pub fn park_undone(&mut self, ids: &[InstanceId]) {
+        for id in ids {
+            if let Some(item) = self.items.get_mut(&Owner::Instance(*id))
+                && item.tier == Tier::Device
+                && !item.shed
+            {
+                item.stale = true;
+            }
+        }
     }
 
     /// The engine took `owner`'s new slots.
@@ -4293,11 +4385,11 @@ pub fn rebind(
     // its rebinds: a closed instance is the engine's no longer, and the
     // runtime never rebinds what it closed.
     if let Some(roles) = roles
-        && !roles.lock().unwrap().rebinds(owner)
+        && !roles.lock().unwrap().rebind_stands(&rebind)
     {
         tracing::debug!(
             ?owner,
-            "a restore's rebind cancelled: closed since it was read"
+            "a rebind cancelled: its item closed or moved since it was read"
         );
         return Ok(());
     }

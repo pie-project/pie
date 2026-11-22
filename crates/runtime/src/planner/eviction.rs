@@ -21,6 +21,7 @@ use super::{ProcessId, ResidencyPlanner};
 /// with nothing in flight, each is a planner bug ([`ResidencyPlanner::plan_ended`]).
 const WAITS_ON_FLIGHT: &[&str] = &[
     "something in flight",
+    "kv on its way",
     "once more chunks stand free",
     "waits for the restored one's bind to fire",
 ];
@@ -379,7 +380,16 @@ impl ResidencyPlanner {
             // good under a tight disk budget, nothing in flight to free
             // anything (the disk-only M1 hang), and a victim the swap
             // cannot take is found unhostable when it is quoted.
-            if kv_deficit > 0 && !self.supply_stalled() {
+            // With nothing in flight no kv is on its way: the free pages
+            // the supply counts are ones the head's gathering did not take
+            // (held for another's restore, fenced, past the budget), and
+            // the wait was for good (AMD on batch 3: "kv on its way",
+            // kv_missing 10, nothing in flight, a run free at no move).
+            // The head's need is planned as any other's.
+            if kv_deficit > 0
+                && !self.supply_stalled()
+                && !self.with_inner(|inner| inner.nothing_in_flight())
+            {
                 self.plan_ended(victims.head, "kv on its way", host_short, &[]);
                 self.stats
                     .eviction_deferrals
