@@ -35,6 +35,7 @@ seeded!(
     "nvidia/nvidia-rtx-pro-4500-blackwell.toml",
     // Committed measured profiles (`pie tune export --engine vulkan`).
     "nvidia-rtx-pro-4500-blackwell.measured.toml",
+    "adreno-tm-840.measured.toml",
 );
 
 /// What a device no family file applies to runs.
