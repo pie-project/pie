@@ -147,6 +147,12 @@ seeded!(
     "apple-m5-pro.measured.toml",
 );
 
+/// The host covers committed for this backend's devices
+/// (`profiles/<device>.covers.json`, `pie tune export --engine metal`),
+/// each listed here: the runtime takes a cover whose key matches where the
+/// home's own cache holds none (`engine::Engine::committed_covers`).
+pub const COVERS: &[&str] = &[include_str!("../profiles/apple-m5-pro.covers.json")];
+
 pub static SHELF: Shelf = Shelf {
     backend: "metal",
     seeded: SEEDED,
