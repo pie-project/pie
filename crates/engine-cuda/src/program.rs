@@ -673,6 +673,18 @@ impl Plane {
         let scratch_piece = piece_at(&slots.scratch, room.instance_bytes(), span)?;
         let own = own_runs(&held, &place, &slots.scratch, scratch_piece, room.instance_bytes());
         let id = InstanceId(self.next_instance);
+        if engine::guest_claims::saying() {
+            engine::guest_claims::say(
+                "cuda: bind claims",
+                format_args!(
+                    "instance={} program={} instance_refs={:?} pair_generation={}",
+                    id.0,
+                    program_id,
+                    slots.instance,
+                    slots.pair_generation,
+                ),
+            );
+        }
         // Its pair's state is its group's: joined as it stands, or laid where
         // the binding names a new taking of it.
         if slots.pair == engine::ScratchPlace::None {
@@ -812,6 +824,18 @@ impl Plane {
         // in one step before a ring is pointed there: one moved onto bytes
         // another still holds is refused by name, every claim as it stood.
         let mut moved = Vec::with_capacity(self.instances.len());
+        if engine::guest_claims::saying() {
+            engine::guest_claims::say(
+                "cuda: an evacuation's rebase claims every live instance where it lies now",
+                format_args!(
+                    "instances={} parked={:?} kept={:?} closing={:?}",
+                    self.instances.len(),
+                    self.instances.iter().filter(|(_, bound)| bound.parked).map(|(id, _)| id.0).collect::<Vec<_>>(),
+                    self.instances.iter().filter(|(_, bound)| bound.kept).map(|(id, _)| id.0).collect::<Vec<_>>(),
+                    self.closing.iter().map(|id| id.0).collect::<Vec<_>>(),
+                ),
+            );
+        }
         for (id, bound) in &self.instances {
             // A parked instance that shed its state holds nothing here
             // (`engine::Rebind::Parked`): repointed and claimed at its
@@ -908,6 +932,19 @@ impl Plane {
             }
             _ => Vec::new(),
         };
+if engine::guest_claims::saying() {
+            engine::guest_claims::say(
+                "cuda: park",
+                format_args!(
+                    "instance={} kept={} was_parked={} was_kept={} instance_refs={:?}",
+                    id.0,
+                    kept,
+                    bound.parked,
+                    bound.kept,
+                    bound.slots.instance,
+                ),
+            );
+        }
         self.claims.park(id.0, &runs);
         bound.parked = true;
         bound.kept = kept;
@@ -952,6 +989,20 @@ impl Plane {
         // taking, and never moved by this member alone while another is
         // bound on it. One closed while a fire of it flies holds nothing.
         let own = own_runs(&held, &place, &slots.scratch, scratch_piece, room.instance_bytes());
+        if engine::guest_claims::saying() {
+            engine::guest_claims::say(
+                "cuda: rebind claims",
+                format_args!(
+                    "instance={} was_parked={} was_kept={} closing={} instance_refs={:?} pair_generation={}",
+                    id.0,
+                    bound.parked,
+                    bound.kept,
+                    self.closing.contains(&id),
+                    slots.instance,
+                    slots.pair_generation,
+                ),
+            );
+        }
         let fresh_pair = if self.closing.contains(&id) {
             false
         } else if slots.pair == engine::ScratchPlace::None {
@@ -1529,6 +1580,18 @@ impl Plane {
         // Its slots are the runtime's again once this returns: a fire still
         // airborne on them runs ahead, on the stream, of whatever is bound
         // there next.
+        if engine::guest_claims::saying() {
+            engine::guest_claims::say(
+                "cuda: close releases",
+                format_args!(
+                    "instance={} parked={} kept={} airborne={}",
+                    id.0,
+                    bound.parked,
+                    bound.kept,
+                    bound.session.airborne(),
+                ),
+            );
+        }
         self.claims.release(id.0);
         if bound.session.airborne() {
             self.closing.insert(id);
