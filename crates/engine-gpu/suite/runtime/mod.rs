@@ -4,6 +4,7 @@ mod bool_gather;
 mod bool_moves;
 mod fold;
 mod folded_roots;
+mod guest_settle;
 mod guest_state;
 mod hosted;
 mod lane_refusal;
