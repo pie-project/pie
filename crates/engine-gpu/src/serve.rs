@@ -369,6 +369,9 @@ pub enum InputCell<B: Backend> {
     /// The lane's guest refused its cell: its lanes fault, and its seat
     /// holds zeros, which nothing reads.
     Refused,
+    /// A stand-in fire's cell (the dense settle's): the seat holds zeros of
+    /// its declared shape.
+    Zeros,
 }
 
 /// A cell a guest channel keeps on the device: `bytes` at `at` of `buffer`
@@ -3038,6 +3041,22 @@ impl<B: Serve> Shell<B> {
                             .word(&poem_ir::Request::new(per_lane, false))
                     };
                     let tokens: Vec<u32> = (0..per_lane).map(|i| 100 + (i * 7919) % 5000).collect();
+                    // Zeros for every guest input a class reads: a settle
+                    // lane feeds no channel, and a class reading one serves
+                    // the same kernels whatever the input holds.
+                    let zeros: Vec<(engine::fire::InputFeed, InputCell<B>)> = self
+                        .feeds
+                        .inputs
+                        .iter()
+                        .filter(|(seat, _)| !seat.voxel())
+                        .map(|(seat, _)| {
+                            let feed = engine::fire::InputFeed {
+                                id: seat.id,
+                                channel: engine::channel::ChannelId(0),
+                            };
+                            (feed, InputCell::Zeros)
+                        })
+                        .collect();
                     let mut samples: Vec<Vec<f64>> = vec![Vec::new(); options.len()];
                     // Whether a fire was timed by the host's clock (the
                     // device stated no span of it).
@@ -3055,6 +3074,7 @@ impl<B: Serve> Shell<B> {
                                 let seated: Vec<Seated<'_, B>> = (0..fire_lanes)
                                     .map(|slot| Seated {
                                         hosts: false,
+                                        inputs: &zeros,
                                         ..Seated::of(Lane {
                                             slot,
                                             word,
@@ -4647,7 +4667,7 @@ impl<B: Serve> Shell<B> {
                 })?;
                 let at = base + offset * seat.row_bytes();
                 match cell {
-                    InputCell::Refused => {
+                    InputCell::Refused | InputCell::Zeros => {
                         self.inputs[arm].write_input(at, &vec![0u8; bytes as usize])?;
                     }
                     InputCell::Host { bytes: raw, dtype } => {
