@@ -1349,6 +1349,9 @@ struct Log {
     checks: u64,
     pages_checked: u64,
     guest_slots_checked: u64,
+    /// The capacity gate's figures as the last step with nothing moving
+    /// between tiers read them.
+    capacity: Option<super::inner::CapacityRead>,
 }
 
 impl Ctx {
@@ -1695,6 +1698,7 @@ async fn bind(ctx: &Ctx, pid: ProcessId, program: u32) -> Result<InstanceId, Str
                     |_| false,
                     Some(pid),
                     |pid| ctx.planner.is_resident(pid),
+                    |pid, chunks| ctx.planner.capacity_holds_chunks(pid, chunks),
                 )
             })();
             let (roles, engine, binding) = (roles.clone(), engine.clone(), binding.clone());
@@ -1788,7 +1792,7 @@ fn take_bind_error(
 ) -> String {
     let mut engine = engine.lock().unwrap();
     let free_chunks = roles.lock().unwrap().free_runs(1);
-    match crate::store::roles::take_bind(Some(roles), &mut *engine, binding, |_| false, Some(pid), |_| true) {
+    match crate::store::roles::take_bind(Some(roles), &mut *engine, binding, |_| false, Some(pid), |_| true, |_, _| false) {
         Ok(taken) => {
             if let Some(taken) = taken {
                 roles.lock().unwrap().untake(taken);
@@ -2018,7 +2022,7 @@ const LOST_WAKES_FAIL: bool = false;
 
 /// The checks after a settled step: the processes refused since the last
 /// (the run goes on), or `Err`, the failure that ends it.
-fn check(ctx: &Ctx, step: u32) -> Result<Vec<Failure>, Failure> {
+fn check(ctx: &Ctx, step: u32, moving: bool) -> Result<Vec<Failure>, Failure> {
     let fail = |kind: &str, line: String| Failure {
         step,
         kind: kind.to_string(),
@@ -2040,6 +2044,44 @@ fn check(ctx: &Ctx, step: u32) -> Result<Vec<Failure>, Failure> {
         .next()
     {
         return Err(fail("quiet", format!("a wait chosen with nothing in flight: {ended}")));
+    }
+    // The capacity gate's invariant: every path that adds state goes
+    // through it, so every tier together keeps the finisher's headroom.
+    // The capacity gate's invariant: every path that adds state goes
+    // through it, so between two steps with nothing moving between tiers
+    // (a move holds its slots on both while its copies land), the same
+    // finisher and the same capacity, the tiers' free pages never fall
+    // further short of the finisher's headroom. A breach is named at the
+    // step it happens.
+    let moving = moving
+        || ctx.planner.with_inner(|inner| {
+            !inner.evicting.is_empty()
+                || inner.procs.values().any(|proc| {
+                    matches!(
+                        proc.state,
+                        super::proc::Residency::Evicting | super::proc::Residency::Restoring
+                    )
+                })
+        });
+    if !moving && let Some(read) = ctx.planner.capacity_read() {
+        let before = ctx.log.lock().unwrap().capacity.replace(read);
+        let short = read.gate().short;
+        if let Some(before) = before
+            && before.finisher == read.finisher
+            && before.whole == read.whole
+            && short > before.gate().short
+        {
+            return Err(fail(
+                "capacity",
+                format!(
+                    "every tier together holds {} pages free, {short} short of the finisher \
+                     {}'s headroom, {} short the step before: {read:?}; before {before:?}",
+                    read.gate().free,
+                    read.finisher,
+                    before.gate().short
+                ),
+            ));
+        }
     }
     if let Some(refusal) = std::mem::take(&mut ctx.engine.lock().unwrap().refusals)
         .into_iter()
@@ -2354,7 +2396,7 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
         // The drain task's beat.
         planner.tick();
         quiesce(&ctx, &mut lane, &mut pending, step, workload.late).await;
-        match check(&ctx, step) {
+        match check(&ctx, step, !pending.is_empty()) {
             Ok(refused) => {
                 for failed in refused {
                     if !failures

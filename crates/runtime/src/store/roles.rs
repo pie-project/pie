@@ -3706,7 +3706,7 @@ pub fn bind_instance(
     holder: Option<Holder>,
     registered: impl Fn(ChannelId) -> bool,
 ) -> anyhow::Result<BoundInstance> {
-    let taken = take_bind(roles, engine, binding, registered, holder, |_| true)?;
+    let taken = take_bind(roles, engine, binding, registered, holder, |_| true, |_, _| false)?;
     bind_taken(roles, engine, binding, holder, taken)
 }
 
@@ -3725,6 +3725,7 @@ pub fn take_bind(
     registered: impl Fn(ChannelId) -> bool,
     holder: Option<Holder>,
     resident: impl Fn(Holder) -> bool,
+    gated: impl Fn(Holder, u32) -> bool,
 ) -> anyhow::Result<Option<Taken>> {
     let Some(roles) = roles else {
         return Ok(None);
@@ -3741,6 +3742,7 @@ pub fn take_bind(
         extents: binding.extents,
     };
     let mut roles = roles.lock().unwrap();
+    let free_before = roles.device.lock().unwrap().pool().free_chunks();
     let guest = roles.take_guest(&binding.channels, (pair, state), holder)?;
     let fresh = guest.fresh_runs();
     let mut taken = roles
@@ -3754,7 +3756,31 @@ pub fn take_bind(
         .map_err(|(error, opened)| roles.bind_short(error, fresh, opened))?;
     taken.holder = holder;
     roles.bind_taken_for(holder);
+    let opened = free_before.saturating_sub(roles.device.lock().unwrap().pool().free_chunks());
     drop(roles);
+    // The fresh chunks it took are new state: past what every tier keeps
+    // for the finisher (`gated`), the take goes back and the bind waits in
+    // the planner for the gate
+    // ([`crate::planner::ResidencyPlanner::capacity_holds_chunks`]).
+    if let Some(holder) = holder
+        && opened > 0
+        && gated(holder, opened)
+    {
+        roles_handle.lock().unwrap().untake(taken);
+        return Err(RolesError::BindShort(Box::new(RolesError::GuestShort {
+            what: format!(
+                "its guest state's {opened} fresh chunks, past what every tier keeps for the \
+                 finisher"
+            ),
+            bytes: 0,
+            room: GuestRoom::Slots {
+                slots: 0,
+                committable: 0,
+                chunks: opened,
+            },
+        }))
+        .into());
+    }
     // Read again past the take: a park that began since the first read
     // either saw this bind on its way and waits for it, or parked before
     // it was taken, and then the holder reads parked here and the take

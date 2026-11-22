@@ -297,27 +297,17 @@ impl ResidencyPlanner {
         }
     }
 
-    /// The error waiter `key` is refused with where its need could never
-    /// fit the device pool, even with nothing else resident: its kv pages
-    /// and the pages that free the runs of whole chunks it asks (a bind's,
-    /// or a restore's for its roles or the bind that suspended it), together
-    /// past the pool's total ([`super::PlannerError::PastDevice`]). `None`
-    /// for every other need, however short and for however long: it waits
-    /// (its owner parked) while the planner suspends and evicts by its
-    /// victim choice and the chunk map, and room given back, an eviction
-    /// landed or a completion wakes it. Over-demand is served slower, never
-    /// failed; no clock and no answer of the policy refuses a need that fits.
-    /// The device's room for state as pages, one figure for every
-    /// never-fits check (restores, binds, a fire's unit alone): the state
-    /// room at the narrowest rung, the lent span included
-    /// ([`super::pool::PoolPort::state_chunks_most`]); the kv pool's pages
-    /// where the kv pages are a pool of their own.
     /// The capacity gate as it stands ([`super::inner::CapacityGate`]): the
     /// finisher, the oldest admitted process not idle, and the pages every
     /// tier has free together (idle cache counted free: the policy lets it
     /// go) past the finisher's headroom, its end less what it holds on every
     /// tier. `None` where the pool states no end, or nothing is admitted.
     pub(super) fn capacity_gate(&self) -> Option<super::inner::CapacityGate> {
+        self.capacity_read().map(|read| read.gate())
+    }
+
+    /// The figures the capacity gate is read from ([`Self::capacity_gate`]).
+    pub(super) fn capacity_read(&self) -> Option<super::inner::CapacityRead> {
         let end = self.port.context_pages()?;
         // Pages the planner gathered and holds for its heads are free too:
         // counted taken, gathering for a head held it at the gate, given
@@ -335,14 +325,17 @@ impl ResidencyPlanner {
         let (model, engine) = self.port.locus();
         let holds = u64::from(super::holdings::held_page_count(finisher, model, engine))
             + u64::from(super::holdings::swapped_page_count(finisher, model, engine));
-        let headroom = u64::from(end).saturating_sub(holds);
-        let free = u64::from(self.port.device_stats().0)
-            + gathered
-            + u64::from(self.raw_swap_free())
-            + u64::from(self.port.reclaimable_idle());
-        Some(super::inner::CapacityGate {
+        Some(super::inner::CapacityRead {
             finisher,
-            spare: free.saturating_sub(headroom),
+            end: u64::from(end),
+            holds,
+            device: u64::from(self.port.device_stats().0),
+            gathered,
+            below: u64::from(self.raw_swap_free()),
+            idle: u64::from(self.port.reclaimable_idle()),
+            whole: u64::from(self.port.device_stats().1)
+                + u64::from(self.port.host_stats().1)
+                + u64::from(self.port.disk_stats().1),
         })
     }
 
@@ -353,6 +346,11 @@ impl ResidencyPlanner {
     /// each grant taken past it out of its spare: a fire's grant pays one
     /// lock, never a read of every tier.
     pub(super) fn capacity_holds(&self, pid: ProcessId, pages: u32) -> bool {
+        // No pass has read it yet: read now, before the first grant.
+        if self.with_counts(|inner| inner.capacity.is_none()) {
+            let gate = self.capacity_gate();
+            self.with_counts(|inner| inner.capacity = inner.capacity.or(gate));
+        }
         let Some((gate, holds)) = self.with_counts(|inner| {
             let gate = inner.capacity.as_mut()?;
             let holds = gate.holds(pid, pages);
@@ -377,6 +375,33 @@ impl ResidencyPlanner {
         holds
     }
 
+    /// [`Self::capacity_holds`] for a bind's `chunks` of fresh guest state.
+    pub fn capacity_holds_chunks(&self, pid: ProcessId, chunks: u32) -> bool {
+        self.capacity_holds(pid, self.port.chunks_as_pages(chunks))
+    }
+
+    /// Whether the gate would hold `chunks` of fresh state for `pid` now,
+    /// read without taking them out of its spare.
+    pub(super) fn capacity_would_hold(&self, pid: ProcessId, chunks: u32) -> bool {
+        let pages = self.port.chunks_as_pages(chunks);
+        self.with_inner(|inner| inner.capacity.is_some_and(|gate| gate.holds(pid, pages)))
+    }
+
+    /// The error waiter `key` is refused with where its need could never
+    /// fit the device pool, even with nothing else resident: its kv pages
+    /// and the pages that free the runs of whole chunks it asks (a bind's,
+    /// or a restore's for its roles or the bind that suspended it), together
+    /// past the pool's total ([`super::PlannerError::PastDevice`]). `None`
+    /// for every other need, however short and for however long: it waits
+    /// (its owner parked) while the planner suspends and evicts by its
+    /// victim choice and the chunk map, and room given back, an eviction
+    /// landed or a completion wakes it. Over-demand is served slower, never
+    /// failed; no clock and no answer of the policy refuses a need that fits.
+    /// The device's room for state as pages, one figure for every
+    /// never-fits check (restores, binds, a fire's unit alone): the state
+    /// room at the narrowest rung, the lent span included
+    /// ([`super::pool::PoolPort::state_chunks_most`]); the kv pool's pages
+    /// where the kv pages are a pool of their own.
     pub(super) fn device_pages_most(&self) -> u32 {
         match self.port.state_chunks_most() {
             u32::MAX => self.port.device_stats().1,
@@ -1970,6 +1995,12 @@ impl ResidencyPlanner {
             pages: self.port.chunks_as_pages(run.max(1).saturating_mul(pieces)),
         };
 
+        // A bind the capacity gate holds waits for the gate in the planner:
+        // suspended, it parked its process for room that was there, and
+        // came back to the same hold.
+        if self.capacity_would_hold(pid, run.max(1).saturating_mul(pieces)) {
+            return false;
+        }
         let before = self.stats.evictions_started.load(Ordering::Relaxed);
         ptrace!(
             "suspend-for-room pid={} run={} pieces={}",
@@ -2029,6 +2060,7 @@ impl ResidencyPlanner {
                     let proc = inner.procs.get(pid)?;
                     (proc.admitted
                         && proc.state == Residency::Resident
+                        && !inner.is_finisher(*pid)
                         && !inner.host_swap_blocked.contains(pid)
                         && !inner.prepare_blocked.contains(pid))
                     .then(|| (*pid, proc.rank()))

@@ -100,12 +100,59 @@ pub(super) struct CapacityGate {
     pub(super) finisher: ProcessId,
     /// Pages free on every tier together past the finisher's headroom.
     pub(super) spare: u64,
+    /// Pages free on every tier together.
+    pub(super) free: u64,
+    /// What the free pages fall short of the headroom: 0 while the gate's
+    /// invariant holds.
+    pub(super) short: u64,
+}
+
+/// What the capacity gate is read from, in kv pages: the finisher, its end
+/// and what it holds on every tier, and the free pages of each tier
+/// ([`super::ResidencyPlanner::capacity_read`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct CapacityRead {
+    pub(super) finisher: ProcessId,
+    pub(super) end: u64,
+    pub(super) holds: u64,
+    pub(super) device: u64,
+    pub(super) gathered: u64,
+    pub(super) below: u64,
+    pub(super) idle: u64,
+    /// Every tier's pages together: the device's state room, the host's
+    /// and the disk's.
+    pub(super) whole: u64,
+}
+
+impl CapacityRead {
+    pub(super) fn gate(&self) -> CapacityGate {
+        let headroom = self.end.saturating_sub(self.holds);
+        let free = self.device + self.gathered + self.below + self.idle;
+        CapacityGate {
+            finisher: self.finisher,
+            spare: free.saturating_sub(headroom),
+            free,
+            short: headroom.saturating_sub(free),
+        }
+    }
 }
 
 impl CapacityGate {
     /// Whether an allocation of `pages` for `pid` waits on the gate.
     pub(super) fn holds(&self, pid: ProcessId, pages: u32) -> bool {
         pid != self.finisher && pages > 0 && u64::from(pages) > self.spare
+    }
+
+    /// Whether `waiter` waits on the gate: an allocation's pages, or a
+    /// bind's room (its guest state's fresh chunks), new state either way;
+    /// a restore brings back what is held already, and a rung raise moves
+    /// the requester's own.
+    pub(super) fn holds_waiter(&self, waiter: &Waiter) -> bool {
+        match waiter.kind {
+            WaitKind::Allocation { rise: false, .. } => self.holds(waiter.pid, waiter.kv_need()),
+            WaitKind::BindRoom { rise: None, .. } => self.holds(waiter.pid, waiter.room_pages()),
+            _ => false,
+        }
     }
 }
 
@@ -507,11 +554,7 @@ impl Inner {
             }
             // An allocation past what every tier keeps for the finisher
             // waits on the gate: no head ([`CapacityGate`]).
-            if let WaitKind::Allocation { rise: false, .. } = waiter.kind
-                && self
-                    .capacity
-                    .is_some_and(|gate| gate.holds(waiter.pid, waiter.kv_need()))
-            {
+            if self.capacity.is_some_and(|gate| gate.holds_waiter(waiter)) {
                 continue;
             }
             match &waiter.kind {
