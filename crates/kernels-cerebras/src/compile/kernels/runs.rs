@@ -43,7 +43,7 @@ params! {
     /// by override), the MLP width a column, the global layers' mask, the row role (`AROW`), q
     /// heads a KV head, a head dim's columns a segment PE (sliding / global), the KV entries, the
     /// KV rows, the head dims, the window (0: the ring is exact), the levers' defaults.
-    pub struct WeightGemma12 {
+    pub struct WeightWindows {
         K: u32, Hc: u32, Ic: u32, MV: u32, KM: u32, AROW: u32, Qh: u32, DcS: u32, DcG: u32,
         NES: u32, NEG: u32, PYW: u32, HDS: u32, HDG: u32, WIN: u32, WSPEC: u32, RING: u32,
         DIAG: u32, FIFOW: u32, TSTAMP: u32, NRM: u32, MIXK: u32, KEV: u32, NR: u32, DONEG: u32,
@@ -53,39 +53,39 @@ params! {
 params! {
     /// `cx.csl` (NRM 1, HG 1): layers a unit, x's dims a row (by override per row run), the
     /// levers'.
-    pub struct CtlCxGemma12 { K: u32, Hc: u32, DIAG: u32, FIFOW: u32, XKEEP: u32, NRM: u32, HG: u32 }
+    pub struct CtlCxWindows { K: u32, Hc: u32, DIAG: u32, FIFOW: u32, XKEEP: u32, NRM: u32, HG: u32 }
 }
 
 params! {
     /// `cy.csl` (NRM 1, MIXK 1, ACT 1, KEV the schedule's): the weight kernel's shapes, the
     /// hidden size (`HR`), the levers' (`GELUT`: the CSL's form, a plan's levers set another).
-    pub struct CtlCyGemma12 {
+    pub struct CtlCyWindows {
         K: u32, KM: u32, Qh: u32, DcS: u32, DcG: u32, Ic: u32, HR: u32, DIAG: u32, FIFOW: u32,
         ATTL: u32, TSTAMP: u32, HDS: u32, HDG: u32, NRM: u32, MIXK: u32, ACT: u32, KEV: u32,
         GELUT: u32,
     }
 }
 
-pub const WEIGHT_GEMMA12: Kernel = Kernel {
+pub const WEIGHT_WINDOWS: Kernel = Kernel {
     source: "weight.csl",
     owns: &["w", "rcfg", "tdbg"],
-    params: WeightGemma12::NAMES,
+    params: WeightWindows::NAMES,
     route_slots: 18,
     rcfg: Some(weight),
 };
 
-pub const CTL_CX_GEMMA12: Kernel = Kernel {
+pub const CTL_CX_WINDOWS: Kernel = Kernel {
     source: "cx.csl",
     owns: &["x", "gam", "rcfg", "xdbg", "tdbg", "xred"],
-    params: CtlCxGemma12::NAMES,
+    params: CtlCxWindows::NAMES,
     route_slots: 12,
     rcfg: Some(cx),
 };
 
-pub const CTL_CY_GEMMA12: Kernel = Kernel {
+pub const CTL_CY_WINDOWS: Kernel = Kernel {
     source: "cy.csl",
     owns: &["qkw", "rot", "tab", "rcfg", "tdbg"],
-    params: CtlCyGemma12::NAMES,
+    params: CtlCyWindows::NAMES,
     route_slots: 12,
     rcfg: Some(cy),
 };
@@ -271,8 +271,8 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
     out.insert(
         Kind::WEIGHT,
         KernelBuild::of(
-            &WEIGHT_GEMMA12,
-            WeightGemma12 {
+            &WEIGHT_WINDOWS,
+            WeightWindows {
                 K: d.k,
                 Hc: hcw,
                 Ic: d.ic,
@@ -296,7 +296,7 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
                 NRM: sc.nrm,
                 MIXK: sc.mixk,
                 KEV: sc.kev,
-                NR: WEIGHT_GEMMA12.route_slots as u32,
+                NR: WEIGHT_WINDOWS.route_slots as u32,
                 DONEG: 1,
             },
         )?,
@@ -304,8 +304,8 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
     out.insert(
         Kind::CX,
         KernelBuild::of(
-            &CTL_CX_GEMMA12,
-            CtlCxGemma12 {
+            &CTL_CX_WINDOWS,
+            CtlCxWindows {
                 K: d.k,
                 Hc: hcw,
                 DIAG: 0,
@@ -319,8 +319,8 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
     out.insert(
         Kind::CY,
         KernelBuild::of(
-            &CTL_CY_GEMMA12,
-            CtlCyGemma12 {
+            &CTL_CY_WINDOWS,
+            CtlCyWindows {
                 K: d.k,
                 KM: d.km,
                 Qh: d.qh,

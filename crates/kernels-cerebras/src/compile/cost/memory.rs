@@ -130,14 +130,11 @@ fn kv(plan: &Plan, kind: LayerKind) -> (u32, u32) {
     }
 }
 
-/// A program as the linker measured it: its weight and head images' bytes, the least stack room
-/// of its other images, and its plan's moving bytes. A kernel change that moves code or buffers
-/// re-measures them.
+/// A kernel set's program as the linker measured it: its weight and head images' bytes, the
+/// least stack room of its other images, and its plan's moving bytes. A kernel change that moves
+/// code or buffers re-measures them.
 pub struct Anchor {
     pub kernels: KernelSet,
-    /// The model's shape signature and the preset (with its levers) the program was built from.
-    pub signature: [u32; 3],
-    pub preset: &'static str,
     pub weight_used: f64,
     pub head_used: f64,
     pub other_room: f64,
@@ -147,16 +144,13 @@ pub struct Anchor {
     pub head_moves: bool,
 }
 
-/// The anchor a model's plans are measured off: the one linked from the model itself, else its
-/// kernel set's widest.
+/// The anchor a model's plans are measured off: its kernel set's.
 #[must_use]
 pub fn anchor(shape: &Shape) -> &'static Anchor {
     let id = KernelSet::of_shape(shape);
-    let sig = shape.signature();
-    let of = ANCHORS.iter().filter(|a| a.kernels == id);
-    of.clone()
-        .find(|a| a.signature == sig)
-        .or_else(|| of.max_by(|a, b| a.weight_used.total_cmp(&b.weight_used)))
+    ANCHORS
+        .iter()
+        .find(|a| a.kernels == id)
         .expect("every kernel set has an anchor")
 }
 

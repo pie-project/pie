@@ -601,12 +601,11 @@ mod tests {
         assert!(e.contains("biases together with q / k head norms"), "{e}");
     }
 
-    /// The memory model, anchored on one linked program, predicts another of the same kernels'
-    /// within the search's margin: Qwen3.5-4B's weight and head images off the 0.8B's link.
+    /// The memory model, anchored on its kernel set's linked program, predicts another of the
+    /// same kernels' within the search's margin: Qwen3.5-4B's weight and head images.
     #[test]
     fn memory_follows_the_partition_within_the_margin() {
-        use crate::compile::cost::memory::{self, ANCHORS};
-        let small = ANCHORS.iter().find(|a| a.preset == "0.8b").unwrap();
+        use crate::compile::cost::memory;
         // the 4B's partition as it was linked
         let mut at = Preset::new(
             "4b",
@@ -631,7 +630,7 @@ mod tests {
         let want = (memory::PE_BYTES - 34848.0)
             .min(memory::PE_BYTES - 27968.0)
             .min(21568.0);
-        let got = memory::room(&p, small).min(21568.0);
+        let got = memory::room(&p, memory::anchor(&s)).min(21568.0);
         assert!(
             (got - want).abs() < crate::compile::search::MARGIN,
             "{got} vs {want}"

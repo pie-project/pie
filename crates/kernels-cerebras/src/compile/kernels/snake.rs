@@ -71,7 +71,7 @@ params! {
     }
 }
 
-pub const WEIGHT_QWEN: Kernel = Kernel {
+pub const WEIGHT_OWN: Kernel = Kernel {
     source: "weight.csl",
     owns: &["w", "rcfg", "tdbg"],
     params: WeightDense::NAMES,
@@ -87,7 +87,7 @@ pub const CTL_CX: Kernel = Kernel {
     rcfg: Some(cx),
 };
 
-pub const CTL_CY_QWEN: Kernel = Kernel {
+pub const CTL_CY_OWN: Kernel = Kernel {
     source: "cy.csl",
     owns: &["cw", "gpar", "gnw", "qkw", "rot", "tab", "rcfg", "tdbg"],
     params: CtlCyDense::NAMES,
@@ -165,7 +165,7 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
     out.insert(
         Kind::WEIGHT,
         KernelBuild::of(
-            &WEIGHT_QWEN,
+            &WEIGHT_OWN,
             WeightDense {
                 K: k,
                 Hc: hcc,
@@ -214,7 +214,7 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
     out.insert(
         Kind::CY,
         KernelBuild::of(
-            &CTL_CY_QWEN,
+            &CTL_CY_OWN,
             CtlCyDense {
                 K: k,
                 KM: km,

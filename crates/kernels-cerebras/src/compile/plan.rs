@@ -26,15 +26,6 @@ pub struct Shape {
     pub norm: NormSpec,
 }
 
-impl Shape {
-    /// What tells one model's partition from another's within a layout: the hidden size, the
-    /// layer count and the MLP's width (a pinned plan's made-for shape).
-    #[must_use]
-    pub fn signature(&self) -> [u32; 3] {
-        [self.hidden, self.layers.len() as u32, self.mlp.intermediate]
-    }
-}
-
 /// One decoder layer's mixer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LayerKind {

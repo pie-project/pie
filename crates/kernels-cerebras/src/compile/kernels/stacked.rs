@@ -52,7 +52,7 @@ params! {
     /// the global layers' mask, x's dims a row, the MLP width a column, the KV sharing, the
     /// sliding / global heads and KV entries, the KV rows, the window (0: the sliding entries
     /// are an exact ring), the levers' defaults.
-    pub struct WeightGemma {
+    pub struct WeightShared {
         K: u32, Hc: u32, Ic: u32, MV: u32, KM: u32, SH: u32, Qh: u32, DcS: u32, DcG: u32,
         NES: u32, NEG: u32, PYW: u32, HDS: u32, HDG: u32, WIN: u32, WSPEC: u32, PLOG: u32,
         DIAG: u32, FIFOW: u32, ATTL: u32, TSTAMP: u32, NRM: u32, MIXK: u32, PLE: u32, NR: u32,
@@ -62,13 +62,13 @@ params! {
 
 params! {
     /// `cx.csl` (NRM 1, PLE 1): layers a unit, x's dims a row, the levers' defaults.
-    pub struct CtlCxGemma { K: u32, Hc: u32, DIAG: u32, FIFOW: u32, XKEEP: u32, NRM: u32, PLE: u32 }
+    pub struct CtlCxShared { K: u32, Hc: u32, DIAG: u32, FIFOW: u32, XKEEP: u32, NRM: u32, PLE: u32 }
 }
 
 params! {
     /// `cy.csl` (NRM 1, MIXK 1, ACT 1, PLE 1, KVS 1): the layer mask and shapes as the weight
     /// kernel's, the hidden size (`HR`), the levers' defaults.
-    pub struct CtlCyGemma {
+    pub struct CtlCyShared {
         K: u32, KM: u32, SH: u32, Qh: u32, DcS: u32, DcG: u32, Ic: u32, HR: u32, DIAG: u32,
         FIFOW: u32, ATTL: u32, TSTAMP: u32, HDS: u32, HDG: u32, PLOG: u32, NRM: u32, MIXK: u32,
         ACT: u32, PLE: u32, KVS: u32,
@@ -77,37 +77,37 @@ params! {
 
 params! {
     /// `ple_gemma.csl`: the words a store PE holds and sends, the send delay.
-    pub struct PleGemma { NTW: u32, DLY: u32 }
+    pub struct PleShared { NTW: u32, DLY: u32 }
 }
 
-pub const WEIGHT_GEMMA: Kernel = Kernel {
+pub const WEIGHT_SHARED: Kernel = Kernel {
     source: "weight.csl",
     owns: &["w", "rcfg", "tdbg", "kvlog"],
-    params: WeightGemma::NAMES,
+    params: WeightShared::NAMES,
     route_slots: 18,
     rcfg: Some(weight),
 };
 
-pub const CTL_CX_GEMMA: Kernel = Kernel {
+pub const CTL_CX_SHARED: Kernel = Kernel {
     source: "cx.csl",
     owns: &["x", "gam", "rcfg", "xdbg", "tdbg", "xred"],
-    params: CtlCxGemma::NAMES,
+    params: CtlCxShared::NAMES,
     route_slots: 12,
     rcfg: Some(cx),
 };
 
-pub const CTL_CY_GEMMA: Kernel = Kernel {
+pub const CTL_CY_SHARED: Kernel = Kernel {
     source: "cy.csl",
     owns: &["qkw", "rot", "tab", "pl", "plog", "rcfg", "tdbg"],
-    params: CtlCyGemma::NAMES,
+    params: CtlCyShared::NAMES,
     route_slots: 12,
     rcfg: Some(cy),
 };
 
-pub const PLE_GEMMA: Kernel = Kernel {
+pub const PLE_SHARED: Kernel = Kernel {
     source: "ple_gemma.csl",
     owns: &["ptab", "rcfg", "psend"],
-    params: PleGemma::NAMES,
+    params: PleShared::NAMES,
     route_slots: 8,
     rcfg: Some(store_pe),
 };
@@ -270,8 +270,8 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
     out.insert(
         Kind::WEIGHT,
         KernelBuild::of(
-            &WEIGHT_GEMMA,
-            WeightGemma {
+            &WEIGHT_SHARED,
+            WeightShared {
                 K: k,
                 Hc: hcc,
                 Ic: ic,
@@ -296,7 +296,7 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
                 NRM: sc.nrm,
                 MIXK: sc.mixk,
                 PLE: sc.ple,
-                NR: WEIGHT_GEMMA.route_slots as u32,
+                NR: WEIGHT_SHARED.route_slots as u32,
                 DONEG: 1,
                 XHI: 1,
                 KVX: 1,
@@ -306,8 +306,8 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
     out.insert(
         Kind::CX,
         KernelBuild::of(
-            &CTL_CX_GEMMA,
-            CtlCxGemma {
+            &CTL_CX_SHARED,
+            CtlCxShared {
                 K: k,
                 Hc: hcc,
                 DIAG: 0,
@@ -321,8 +321,8 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
     out.insert(
         Kind::CY,
         KernelBuild::of(
-            &CTL_CY_GEMMA,
-            CtlCyGemma {
+            &CTL_CY_SHARED,
+            CtlCyShared {
                 K: k,
                 KM: km,
                 SH: 0,
@@ -356,8 +356,8 @@ pub fn store(prog: &Program) -> R<Kernels> {
     out.insert(
         STORE,
         KernelBuild::of(
-            &PLE_GEMMA,
-            PleGemma {
+            &PLE_SHARED,
+            PleShared {
                 NTW: ple::words(&prog.plan, &prog.floor),
                 DLY: 1500,
             },
