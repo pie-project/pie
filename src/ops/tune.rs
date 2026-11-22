@@ -261,11 +261,31 @@ fn export(engine: &str, device: Option<u32>, out: &std::path::Path) -> Result<St
         .iter()
         .find(|b| b.name == engine)
         .ok_or_else(|| anyhow!("this build hosts no `{engine}` engine; it hosts {names:?}"))?;
-    let dir = crate::paths::pie_home().join("profiles");
-    let cache = crate::paths::pie_home().join("cache");
-    let exported = runtime::engine::profiles::export(backend, &dir, &cache, device.unwrap_or(0))
-        .map_err(|e| anyhow!(e))?;
     std::fs::create_dir_all(out)?;
+    let cache = crate::paths::pie_home().join("cache");
+    // The bodies records first: a home whose rates all came from a committed
+    // profile stores none of its own, and still records its bodies.
+    let bodies =
+        runtime::engine::profiles::export_bodies(backend, &cache, out).map_err(|e| anyhow!(e))?;
+    let bodies = if bodies.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "wrote {} bodies record(s) of this build into {}: a build carries each from there, \
+             and a load of the same deployment holds its figure instead of measuring it.\n",
+            bodies.len(),
+            ui::short_path(&out.join("bodies")),
+        )
+    };
+    let dir = crate::paths::pie_home().join("profiles");
+    let exported =
+        match runtime::engine::profiles::export(backend, &dir, &cache, device.unwrap_or(0)) {
+            Ok(exported) => exported,
+            Err(why) if !bodies.is_empty() => {
+                return Ok(format!("no stored rates to write ({why}).\n{bodies}"));
+            }
+            Err(why) => return Err(anyhow!(why)),
+        };
     let path = out.join(&exported.name);
     std::fs::write(&path, &exported.text)?;
     let covers = match &exported.covers {
@@ -286,7 +306,7 @@ fn export(engine: &str, device: Option<u32>, out: &std::path::Path) -> Result<St
         "wrote {} from {}: the stored measurements of {}, each under its key.\n\
          A build carries it once it is listed beside the engine's checked-in profiles \
          (crates/engine-{}/src/chip.rs, `\"{}\"`); a load of that device then takes each entry \
-         whose key matches.\n",
+         whose key matches.\n{bodies}",
         ui::short_path(&path),
         ui::short_path(&exported.from),
         exported.device,

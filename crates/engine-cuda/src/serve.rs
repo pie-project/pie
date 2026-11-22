@@ -7,6 +7,15 @@ pub(crate) mod landing;
 mod lanes;
 mod load;
 mod measured;
+
+/// The bodies records under `cache_dir` this build made, copied into
+/// `out`'s `bodies/` for a build to carry (`pie tune export --engine cuda`).
+pub fn export_bodies(
+    cache_dir: &std::path::Path,
+    out: &std::path::Path,
+) -> std::io::Result<Vec<String>> {
+    measured::export(cache_dir, out)
+}
 pub use load::Staged;
 mod prepare;
 mod segments;

@@ -1150,8 +1150,11 @@ What each still times at load or boot, for its owner (paths under `crates/`):
     (`Keys::stamp`). `chip::resolve` stays unkeyed for `pie tune` / `pie profile`.
   - Decode products: `product_ns` saved by `save_rates`, keyed (`measured_by["product_ns"]`: library + hipBLASLt),
     read back through the resolved profile; route codes 0 / 1 stay tags. Skip: the stated kernel, by name.
-  - Bodies record (`serve/measured.rs`): keyed by the running binary's content (132 MiB in ~75 ms on the MI300X
-    host, once a process), no mtime; the deployment part still names the checkpoint by size and mtime.
+  - Bodies record (`serve/measured.rs`): keyed by the code that shapes it (`build.rs`: engine-cuda's sources and
+    its kernel crate's Rust and kernel sources, a compile-time constant: nothing hashed at boot, a pie version
+    that touches none of it keeps every record) and by the checkpoint's own identity (`zt::artifact_identity`,
+    its manifest's digests: a copied or moved file keeps its records). Committed beside the measured profile
+    (`profiles/bodies/<key>`, `pie tune export --engine cuda`), so a committed clean boot holds the figure.
   - `measure = false`: a one-device cuda engine; group / lockstep boots still measure, and are refused by name.
   - Open, CUDA: `stored::backend` for `not(rocm)` keys by device name and method alone (no driver, cuBLASLt or
     cubin codes): the L40S fills it. Committed: `amd-instinct-mi300x-vf.measured.toml` (`cached_gbps`,
