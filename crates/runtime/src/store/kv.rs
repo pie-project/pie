@@ -150,6 +150,22 @@ impl KvSpillTxn {
     }
 }
 
+/// The kv pages held on every tier ([`KvStore::census`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KvCensus {
+    /// Pages held anywhere: the device's list slots out, the host tier's,
+    /// and the disk's slots less the whole disk chunks other state holds. A
+    /// page a move holds on two tiers counts twice while the move is under
+    /// way: both slots are taken.
+    pub held: u64,
+    /// Of `held`, the second slots of the pages moves hold on two tiers.
+    pub moving: u64,
+    /// Of those, the pages only idle cache holds, on every tier.
+    pub idle: u64,
+    /// The disk tier's slots.
+    pub disk_slots: u32,
+}
+
 pub struct KvStore {
     table: KvPageTable,
     /// The list shape's slots, one a page.
@@ -213,6 +229,9 @@ pub struct KvStore {
     /// The same for idle cache below the device: see
     /// [`Self::below_device_cache_pages`].
     below_cached: std::cell::Cell<Option<(Instant, std::time::Duration, (u32, u32))>>,
+    /// The disk slots whole disk chunks hold for state other than kv
+    /// ([`Self::take_disk_chunks`]): a parked guest part's, or a record's.
+    guest_disk_slots: u32,
 }
 
 /// A persistent disk tier: a copy on disk of sealed pages, by key. A page
@@ -446,6 +465,7 @@ impl KvStore {
             hints: HashMap::new(),
             reclaimable: std::cell::Cell::new(None),
             below_cached: std::cell::Cell::new(None),
+            guest_disk_slots: 0,
         }
     }
 
@@ -1248,7 +1268,36 @@ impl KvStore {
         let per_chunk = per_chunk.max(1);
         let firsts = self.disk_pool.try_alloc_aligned_runs(n, per_chunk)?;
         self.below_cached.set(None);
+        self.guest_disk_slots += firsts.len() as u32 * per_chunk;
         Some(firsts.into_iter().map(|slot| slot.0 / per_chunk).collect())
+    }
+
+    /// The kv pages held on every tier, each once, and the idle cache's
+    /// among them, read now ([`KvCensus`]): what the capacity gate counts
+    /// kv by (`planner::PoolPort::capacity_census`).
+    #[must_use]
+    pub fn census(&self) -> KvCensus {
+        let disk_out = self
+            .disk_pool
+            .capacity()
+            .saturating_sub(self.disk_pool.available() as u32);
+        let roots = self.table.unused_cache_roots();
+        let (idle_host, idle_disk) =
+            if self.host_pool.capacity() == 0 && self.disk_pool.capacity() == 0 {
+                (0, 0)
+            } else {
+                self.table.cache_only_below_device(&roots)
+            };
+        KvCensus {
+            held: u64::from(self.pool.out())
+                + u64::from(self.host_pool.out())
+                + u64::from(disk_out.saturating_sub(self.guest_disk_slots)),
+            moving: self.table.moving_pages() as u64,
+            idle: u64::from(self.table.device_pages_freed(&roots))
+                + u64::from(idle_host)
+                + u64::from(idle_disk),
+            disk_slots: self.disk_pool.capacity(),
+        }
     }
 
     /// The disk tier's free slots, idle cache's not counted.
@@ -1266,6 +1315,9 @@ impl KvStore {
             .collect();
         self.disk_pool.release_runs(&firsts, per_chunk);
         self.below_cached.set(None);
+        self.guest_disk_slots = self
+            .guest_disk_slots
+            .saturating_sub(firsts.len() as u32 * per_chunk);
     }
 
     /// Parked sets' pages on the host going on down to disk, the sets of

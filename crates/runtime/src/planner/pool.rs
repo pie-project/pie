@@ -546,6 +546,27 @@ pub enum RiseRoom {
     Past { need: u32, total: u32 },
 }
 
+/// Every tier's room and what is held in it, in one unit, kv pages
+/// ([`PoolPort::capacity_census`]). Each item of state counts one figure
+/// wherever it lies: a kv page one, guest state and tables their bytes
+/// as pages ([`crate::store::roles::Roles::footprint`]), recurrent state
+/// its units as pages. So a move between tiers changes no count; only new state raises
+/// `held`, and only state given back lowers it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CapacityCensus {
+    /// Every tier's chunks for state, as pages: the device's under its
+    /// current rung, the host tier's and the disk tier's.
+    pub whole: u64,
+    /// What every tier holds, each item once.
+    pub held: u64,
+    /// Of `held`, what only idle cache holds: free to the gate (the
+    /// policy lets it go under pressure).
+    pub idle: u64,
+    /// Of `held`, the second slots moves under way hold: room taken until
+    /// they land, though no state was added.
+    pub moving: u64,
+}
+
 pub trait PoolPort: Send + Sync + 'static {
     /// The device's chunks by shape.
     fn chunk_stats(&self) -> ChunkStats;
@@ -868,6 +889,19 @@ pub trait PoolPort: Send + Sync + 'static {
     /// pages are a pool of their own.
     fn state_chunks_most(&self) -> u32 {
         u32::MAX
+    }
+    /// Every tier's room and what is held in it, in one unit, kv pages,
+    /// read now ([`CapacityCensus`]): what the capacity gate is read from
+    /// ([`super::inner::CapacityGate`]). `None` where the pool keeps no
+    /// chunks (the tests' own pools).
+    fn capacity_census(&self) -> Option<CapacityCensus> {
+        None
+    }
+    /// The guest state and tables `pid`'s binds took, as pages counted as
+    /// [`CapacityCensus::held`] counts them; 0 where the pool keeps none.
+    fn guest_pages_of(&self, pid: ProcessId) -> u64 {
+        let _ = pid;
+        0
     }
     /// The kv pages one process may hold at most: the declared context
     /// served ([`crate::store::registry::Stores::context_pages`]), the
@@ -1345,6 +1379,53 @@ impl PoolPort for RegistryPool {
         crate::store::registry::try_get(self.model, self.engine)
             .and_then(|stores| stores.shared)
             .map_or(u32::MAX, |shared| shared.lock().unwrap().state_chunks_most())
+    }
+
+    fn capacity_census(&self) -> Option<CapacityCensus> {
+        let stores = crate::store::registry::try_get(self.model, self.engine)?;
+        let (state_chunks, per_chunk, chunk_bytes) = {
+            let shared = stores.shared.as_ref()?.lock().unwrap();
+            (
+                shared.state_chunks_now(),
+                shared.list_slots_for_chunks(1),
+                shared.pool().chunk_bytes(),
+            )
+        };
+        if per_chunk == 0 {
+            return None;
+        }
+        let host_chunks = stores.host.as_ref().map_or(0, |host| {
+            let host = host.lock().unwrap();
+            host.pool().total_chunks().saturating_sub(host.pool().reserved_chunks())
+        });
+        let kv = self.with_kv_tagged("planner-capacity-census", |kv| kv.census());
+        let disk_chunks = u64::from(kv.disk_slots) / per_chunk;
+        let roles = stores
+            .roles
+            .as_ref()
+            .map_or(0, |roles| roles.lock().unwrap().footprint());
+        let rs = self.rs_as_pages(self.with_rs(|rs| rs.census_units()));
+        Some(CapacityCensus {
+            whole: (u64::from(state_chunks) + u64::from(host_chunks) + disk_chunks) * per_chunk,
+            held: kv.held + (roles * per_chunk).div_ceil(chunk_bytes.max(1)) + u64::from(rs),
+            idle: kv.idle,
+            moving: kv.moving,
+        })
+    }
+
+    fn guest_pages_of(&self, pid: ProcessId) -> u64 {
+        let Some(stores) = crate::store::registry::try_get(self.model, self.engine) else {
+            return 0;
+        };
+        let Some(roles) = stores.roles.as_ref() else {
+            return 0;
+        };
+        let bytes = roles.lock().unwrap().footprint_of(pid);
+        let chunk_bytes = stores
+            .shared
+            .as_ref()
+            .map_or(1, |shared| shared.lock().unwrap().pool().chunk_bytes().max(1));
+        (bytes * u64::from(self.chunks_as_pages(1))).div_ceil(chunk_bytes)
     }
 
     fn context_pages(&self) -> Option<u32> {

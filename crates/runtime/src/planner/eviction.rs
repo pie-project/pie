@@ -1286,6 +1286,11 @@ impl ResidencyPlanner {
                 if key == head_key || !waiter.is_unmet() {
                     return None;
                 }
+                // Past what every tier keeps for the finisher: it waits
+                // on the gate ([`super::inner::CapacityGate`]).
+                if inner.capacity.is_some_and(|gate| gate.holds_waiter(waiter)) {
+                    return None;
+                }
                 match &waiter.kind {
                     WaitKind::Allocation { demand, .. } if hoard >= demand.kv_pages => {
                         Some((key, *demand))

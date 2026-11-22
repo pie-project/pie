@@ -1733,7 +1733,10 @@ async fn bind(ctx: &Ctx, pid: ProcessId, program: u32) -> Result<InstanceId, Str
             }
         },
         || Some(roles.lock().unwrap().room_watch()),
-        |run, pieces| roles.lock().unwrap().free_runs(run) >= pieces,
+        |run, pieces| {
+            roles.lock().unwrap().free_runs(run) >= pieces
+                && !planner.capacity_would_hold(pid, run.max(1).saturating_mul(pieces))
+        },
         |run, pieces| {
             let suspended = roles.lock().unwrap().holds_guest_state(pid)
                 && planner.suspend_for_room(pid, run, pieces);
@@ -2065,11 +2068,11 @@ fn check(ctx: &Ctx, step: u32, moving: bool) -> Result<Vec<Failure>, Failure> {
         });
     if !moving && let Some(read) = ctx.planner.capacity_read() {
         let before = ctx.log.lock().unwrap().capacity.replace(read);
-        let short = read.gate().short;
+        let short = read.others_short();
         if let Some(before) = before
             && before.finisher == read.finisher
             && before.whole == read.whole
-            && short > before.gate().short
+            && short > before.others_short()
         {
             return Err(fail(
                 "capacity",
@@ -2078,7 +2081,7 @@ fn check(ctx: &Ctx, step: u32, moving: bool) -> Result<Vec<Failure>, Failure> {
                      {}'s headroom, {} short the step before: {read:?}; before {before:?}",
                     read.gate().free,
                     read.finisher,
-                    before.gate().short
+                    before.others_short()
                 ),
             ));
         }

@@ -676,6 +676,9 @@ pub struct Taken {
     chunk_slots: u32,
     /// The process whose bind took it ([`Roles::binds_on_way`]).
     holder: Option<Holder>,
+    /// The bytes it took for itself, counted on its way in
+    /// [`Roles::footprint`] until it is bound or given back.
+    bytes: u64,
 }
 
 /// A bind's guest state taken before it registered anything
@@ -960,6 +963,10 @@ pub struct Roles {
     binding: HashMap<Holder, u32>,
     /// Told each time one of those lands ([`Self::bind_landed`]).
     bind_landed: Arc<tokio::sync::Notify>,
+    /// The bytes the binds on their way took for themselves
+    /// ([`Taken::bytes`]): held, in no item yet. By the process each is
+    /// for, and together.
+    on_way: (HashMap<Option<Holder>, u64>, u64),
 }
 
 /// Device room given back: a count of the gives, and their event.
@@ -1031,6 +1038,7 @@ impl Roles {
             freed: Arc::default(),
             binding: HashMap::new(),
             bind_landed: Arc::default(),
+            on_way: (HashMap::new(), 0),
             guest_waiter: None,
             generations: 0,
             leaked: 0,
@@ -2437,6 +2445,7 @@ impl Roles {
 
     /// The bind of `taken` failed: its slots go back.
     pub fn untake(&mut self, taken: Taken) {
+        self.off_way(&taken);
         self.bind_ended_for(taken.holder);
         self.pin_shared(&taken, false);
         let shared = [
@@ -2522,6 +2531,7 @@ impl Roles {
 
     /// The engine bound `taken` as instance `id`, for `holder`.
     pub fn bound(&mut self, id: InstanceId, holder: Option<Holder>, taken: Taken) {
+        self.off_way(&taken);
         self.bind_ended_for(taken.holder);
         self.pin_shared(&taken, false);
         for &channel in &taken.channels {
@@ -3085,6 +3095,108 @@ impl Roles {
         }
     }
 
+    /// The whole chunks `part` takes on the device: a guest part its runs
+    /// of chunks (a run of slots, one), any other part its slots in whole
+    /// chunks of its shape.
+    fn part_chunks(&self, device: &super::shared::SharedPool, part: &Part) -> u64 {
+        if part.shaped() {
+            let (run, pieces) = part.chunk_runs();
+            u64::from(run) * u64::from(pieces)
+        } else {
+            let per_chunk = self
+                .shapes
+                .of(part.role)
+                .and_then(|shape| device.pool().shape(shape.pool))
+                .map_or(1, |shape| shape.slots_per_chunk.max(1));
+            (part.refs.len() as u64).div_ceil(u64::from(per_chunk))
+        }
+    }
+
+    /// The bytes `part` holds wherever it lies, one figure on every tier
+    /// (a move of it changes no count): a guest part in runs of whole
+    /// chunks those chunks, any other part (a run of guest slots, tables,
+    /// a ring, an adapter) its slots, dead guest scratch included (given
+    /// back at a park, taken fresh at the restore: the process's still).
+    fn part_bytes(&self, device: &super::shared::SharedPool, part: &Part) -> u64 {
+        let pool = device.pool();
+        if part.pieces > 0 {
+            return u64::from(part.chunks) * u64::from(part.pieces) * pool.chunk_bytes();
+        }
+        let slot_bytes = self
+            .shapes
+            .of(part.role)
+            .and_then(|shape| pool.shape(shape.pool))
+            .map_or(0, |shape| shape.slot_bytes);
+        let slots = if part.run > 0 { part.run as usize } else { part.refs.len() };
+        slots as u64 * slot_bytes
+    }
+
+    /// The bytes every item holds together, wherever each lies
+    /// ([`Self::part_bytes`]), and those the binds on their way took: what
+    /// the capacity gate counts guest state and tables by
+    /// (`planner::PoolPort::capacity_census`).
+    #[must_use]
+    pub fn footprint(&self) -> u64 {
+        let device = self.device.lock().unwrap();
+        self.items
+            .values()
+            .flat_map(|item| &item.parts)
+            .map(|part| self.part_bytes(&device, part))
+            .sum::<u64>()
+            + self.on_way.1
+    }
+
+    /// [`Self::footprint`] of what `holder`'s binds took: its items, and
+    /// its binds on their way.
+    #[must_use]
+    pub fn footprint_of(&self, holder: Holder) -> u64 {
+        let device = self.device.lock().unwrap();
+        self.items
+            .values()
+            .filter(|item| item.holder == Some(holder))
+            .flat_map(|item| &item.parts)
+            .map(|part| self.part_bytes(&device, part))
+            .sum::<u64>()
+            + self.on_way.0.get(&Some(holder)).copied().unwrap_or(0)
+    }
+
+    /// `taken` is off its way (bound or given back): its bytes are an
+    /// item's now, or free.
+    fn off_way(&mut self, taken: &Taken) {
+        if let Some(bytes) = self.on_way.0.get_mut(&taken.holder) {
+            *bytes = bytes.saturating_sub(taken.bytes);
+            if *bytes == 0 {
+                self.on_way.0.remove(&taken.holder);
+            }
+        }
+        self.on_way.1 = self.on_way.1.saturating_sub(taken.bytes);
+    }
+
+    /// The bytes `taken` took for itself: its own parts, and an adapter's
+    /// or a pair's taken for it (another's are their item's).
+    fn taken_bytes(&self, taken: &Taken) -> u64 {
+        let device = self.device.lock().unwrap();
+        let fresh = |part: &Part, fresh: bool| if fresh { self.part_bytes(&device, part) } else { 0 };
+        taken
+            .parts
+            .iter()
+            .map(|part| self.part_bytes(&device, part))
+            .sum::<u64>()
+            + taken.adapter.as_ref().map_or(0, |(_, part, own)| fresh(part, *own))
+            + taken.pair.as_ref().map_or(0, |(_, part, own, _)| fresh(part, *own))
+    }
+
+    /// `taken` is on its way: its bytes are counted until it is bound or
+    /// given back. The whole chunks they come to: what the capacity gate
+    /// weighs it by.
+    fn on_way_take(&mut self, taken: &mut Taken) -> u32 {
+        taken.bytes = self.taken_bytes(taken);
+        *self.on_way.0.entry(taken.holder).or_default() += taken.bytes;
+        self.on_way.1 += taken.bytes;
+        let chunk = self.device.lock().unwrap().pool().chunk_bytes().max(1);
+        u32::try_from(taken.bytes.div_ceil(chunk)).unwrap_or(u32::MAX)
+    }
+
     /// The whole chunks of `on` the live parts of `parts` take.
     fn chunks_on(&self, on: &Shared, parts: &[Part]) -> u64 {
         let pool = on.lock().unwrap();
@@ -3107,22 +3219,11 @@ impl Roles {
     /// eviction can make.
     fn fits_budget(&self, owners: &[Owner]) -> bool {
         let device = self.device.lock().unwrap();
-        let mut chunks = 0u64;
-        for owner in owners {
-            for part in &self.items[owner].parts {
-                chunks += if part.shaped() {
-                    let (run, pieces) = part.chunk_runs();
-                    u64::from(run) * u64::from(pieces)
-                } else {
-                    let per_chunk = self
-                        .shapes
-                        .of(part.role)
-                        .and_then(|shape| device.pool().shape(shape.pool))
-                        .map_or(1, |shape| shape.slots_per_chunk.max(1));
-                    (part.refs.len() as u64).div_ceil(u64::from(per_chunk))
-                };
-            }
-        }
+        let chunks: u64 = owners
+            .iter()
+            .flat_map(|owner| &self.items[owner].parts)
+            .map(|part| self.part_chunks(&device, part))
+            .sum();
         chunks <= u64::from(device.state_chunks_now())
     }
 
@@ -3742,7 +3843,6 @@ pub fn take_bind(
         extents: binding.extents,
     };
     let mut roles = roles.lock().unwrap();
-    let free_before = roles.device.lock().unwrap().pool().free_chunks();
     let guest = roles.take_guest(&binding.channels, (pair, state), holder)?;
     let fresh = guest.fresh_runs();
     let mut taken = roles
@@ -3756,27 +3856,26 @@ pub fn take_bind(
         .map_err(|(error, opened)| roles.bind_short(error, fresh, opened))?;
     taken.holder = holder;
     roles.bind_taken_for(holder);
-    let opened = free_before.saturating_sub(roles.device.lock().unwrap().pool().free_chunks());
+    let added = roles.on_way_take(&mut taken);
     drop(roles);
-    // The fresh chunks it took are new state: past what every tier keeps
-    // for the finisher (`gated`), the take goes back and the bind waits in
-    // the planner for the gate
-    // ([`crate::planner::ResidencyPlanner::capacity_holds_chunks`]).
+    // What it added is new state ([`Roles::footprint`]), weighed in whole
+    // chunks: past what every tier keeps for the finisher
+    // (`gated`), the take goes back and the bind waits in the planner for
+    // the gate ([`crate::planner::ResidencyPlanner::capacity_holds_chunks`]).
     if let Some(holder) = holder
-        && opened > 0
-        && gated(holder, opened)
+        && added > 0
+        && gated(holder, added)
     {
         roles_handle.lock().unwrap().untake(taken);
         return Err(RolesError::BindShort(Box::new(RolesError::GuestShort {
             what: format!(
-                "its guest state's {opened} fresh chunks, past what every tier keeps for the \
-                 finisher"
+                "its {added} new chunks of state, past what every tier keeps for the finisher"
             ),
             bytes: 0,
             room: GuestRoom::Slots {
                 slots: 0,
                 committable: 0,
-                chunks: opened,
+                chunks: added,
             },
         }))
         .into());

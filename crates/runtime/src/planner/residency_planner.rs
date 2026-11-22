@@ -298,10 +298,11 @@ impl ResidencyPlanner {
     }
 
     /// The capacity gate as it stands ([`super::inner::CapacityGate`]): the
-    /// finisher, the oldest admitted process not idle, and the pages every
-    /// tier has free together (idle cache counted free: the policy lets it
-    /// go) past the finisher's headroom, its end less what it holds on every
-    /// tier. `None` where the pool states no end, or nothing is admitted.
+    /// finisher, the oldest admitted process not idle, and what every tier's
+    /// room leaves past what is held (idle cache counted free: the policy
+    /// lets it go) and the finisher's headroom, its end less the kv pages
+    /// it holds on every tier. `None` where the pool states no end or keeps
+    /// no chunks, or nothing is admitted.
     pub(super) fn capacity_gate(&self) -> Option<super::inner::CapacityGate> {
         self.capacity_read().map(|read| read.gate())
     }
@@ -312,31 +313,81 @@ impl ResidencyPlanner {
         // Pages the planner gathered and holds for its heads are free too:
         // counted taken, gathering for a head held it at the gate, given
         // back it went again, a pass that never ended.
-        let (finisher, gathered) = self.with_inner(|inner| {
-            let finisher = inner
+        let (candidates, gathered) = self.with_inner(|inner| {
+            let mut candidates: Vec<(u64, ProcessId, bool, u64)> = inner
                 .procs
                 .iter()
                 .filter(|(_, proc)| proc.admitted && !proc.idle && !proc.held)
-                .min_by_key(|(_, proc)| proc.seq)
-                .map(|(pid, _)| *pid);
-            (finisher, inner.accum.len() as u64)
+                .map(|(pid, proc)| {
+                    // The room its binds wait for: queued, or the bind that
+                    // suspended it.
+                    let queued: u64 = inner
+                        .queue
+                        .values()
+                        .filter(|waiter| {
+                            waiter.pid == *pid
+                                && matches!(waiter.kind, WaitKind::BindRoom { rise: None, .. })
+                        })
+                        .map(|waiter| u64::from(waiter.room_pages()))
+                        .sum();
+                    let pending = proc.bind_room.map_or(0, |bind| u64::from(bind.pages));
+                    (proc.seq, *pid, proc.state == Residency::Resident, queued.max(pending))
+                })
+                .collect();
+            candidates.sort_unstable_by_key(|&(seq, ..)| seq);
+            (candidates, inner.accum.len() as u64)
         });
-        let finisher = finisher?;
+        if candidates.is_empty() {
+            return None;
+        }
+        let census = self.port.capacity_census()?;
         let (model, engine) = self.port.locus();
-        let holds = u64::from(super::holdings::held_page_count(finisher, model, engine))
-            + u64::from(super::holdings::swapped_page_count(finisher, model, engine));
-        Some(super::inner::CapacityRead {
-            finisher,
-            end: u64::from(end),
-            holds,
-            device: u64::from(self.port.device_stats().0),
-            gathered,
-            below: u64::from(self.raw_swap_free()),
-            idle: u64::from(self.port.reclaimable_idle()),
-            whole: u64::from(self.port.device_stats().1)
-                + u64::from(self.port.host_stats().1)
-                + u64::from(self.port.disk_stats().1),
-        })
+        let read = |&(_, finisher, resident, binding): &(u64, ProcessId, bool, u64)| {
+            let guest = self.port.guest_pages_of(finisher);
+            let below = u64::from(super::holdings::swapped_page_count(finisher, model, engine))
+                + if resident { 0 } else { guest };
+            super::inner::CapacityRead {
+                finisher,
+                end: u64::from(end),
+                // Every page of its working sets, on every tier.
+                kv: u64::from(super::holdings::held_page_count(finisher, model, engine)),
+                below,
+                binding,
+                guest,
+                whole: census.whole,
+                held: census.held,
+                idle: census.idle,
+                moving: census.moving,
+                gathered,
+            }
+        };
+        // The oldest whose need every tier's free room holds: its growth to
+        // its end, its restore's state and its binds' room. One whose need
+        // passes it (a bind of new state no end bound foretold, asked once
+        // the others were let in; a restore beside them) cannot finish until
+        // another does, and as the finisher it held every other ask while
+        // nothing anywhere could move (the simulation's seed 134: the
+        // oldest's bind of six chunks past the 72 pages free, every other
+        // process a page short). Where none fits, the oldest.
+        // A resident one first: one parked needs its restore placed, whole
+        // chunks among the others' state, before it grows at all; held as
+        // the finisher while its placement found no move below, it held
+        // every other ask (the simulation's seed 3243).
+        // Read one at a time, oldest first: the oldest is the finisher on
+        // all but a short pool's passes, read alone.
+        let mut fitting: Option<super::inner::CapacityRead> = None;
+        let mut oldest: Option<super::inner::CapacityRead> = None;
+        for candidate in &candidates {
+            let read = read(candidate);
+            oldest.get_or_insert(read);
+            if read.fits_landed() {
+                if read.below == 0 {
+                    return Some(read);
+                }
+                fitting.get_or_insert(read);
+            }
+        }
+        fitting.or(oldest)
     }
 
     /// Whether an allocation of `pages` for `pid` waits on the capacity
@@ -368,6 +419,7 @@ impl ResidencyPlanner {
                 pages,
                 finisher = %gate.finisher,
                 spare = gate.spare,
+                free = gate.free,
                 end = "the declared context",
                 "planner: an allocation waits for the finisher's headroom on all tiers"
             );
@@ -382,7 +434,7 @@ impl ResidencyPlanner {
 
     /// Whether the gate would hold `chunks` of fresh state for `pid` now,
     /// read without taking them out of its spare.
-    pub(super) fn capacity_would_hold(&self, pid: ProcessId, chunks: u32) -> bool {
+    pub fn capacity_would_hold(&self, pid: ProcessId, chunks: u32) -> bool {
         let pages = self.port.chunks_as_pages(chunks);
         self.with_inner(|inner| inner.capacity.is_some_and(|gate| gate.holds(pid, pages)))
     }
