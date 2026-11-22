@@ -462,6 +462,7 @@ impl Plane {
                 shared: adopted,
                 ids: channels.to_vec(),
                 parked: false,
+                kept: false,
             },
         );
         // Its pair's batch sets and its own scratch are laid now, in the
@@ -917,23 +918,34 @@ impl Plane {
         let mut moved = self
             .instances
             .iter()
-            // A parked instance holds nothing here (`engine::Rebind::Parked`):
-            // repointed, claimed and laid at its rebind, never here over what
-            // another owner holds (Mac Pro: a shed pair laid at its stale
-            // place after every evacuation).
-            .filter(|(_, bound)| !bound.parked)
+            // A parked instance that shed its state holds nothing here
+            // (`engine::Rebind::Parked`): repointed, claimed and laid at its
+            // rebind, never here over what another owner holds (Mac Pro: a
+            // shed pair laid at its stale place after every evacuation). One
+            // whose park kept its tables and rings in place holds them where
+            // the evacuation moved them, its scratch not (given back at the
+            // park): left on the old bytes, its claim let another instance
+            // bind over its tables at its own refs (the L40S's kept park,
+            // 743e8a54e on engine-cuda).
+            .filter(|(_, bound)| !bound.parked || bound.kept)
             .map(|(id, bound)| {
-                Ok((
-                    Holder::Instance(id.0),
-                    own_runs(pools, &bound.held, &bound.scratch_place)?,
-                ))
+                let scratch = if bound.parked {
+                    &engine::ScratchPlace::None
+                } else {
+                    &bound.scratch_place
+                };
+                Ok((Holder::Instance(id.0), own_runs(pools, &bound.held, scratch)?))
             })
             .collect::<Result<Vec<_>>>()?;
         for held in self.pairs.iter().filter(|held| !self.claims.members(held.id).is_empty()) {
             moved.push((Holder::Pair(held.id), pair_runs(pools, &held.place)?));
         }
         self.claims.claim_all(&moved)?;
-        for bound in self.instances.values_mut().filter(|bound| !bound.parked) {
+        for bound in self
+            .instances
+            .values_mut()
+            .filter(|bound| !bound.parked || bound.kept)
+        {
             bound.session.rebind(pools)?;
         }
         for ring in self.channels.values() {
@@ -1017,6 +1029,7 @@ impl Plane {
                 };
                 bound.session.retarget(pools, instance, rings)?;
                 bound.parked = false;
+                bound.kept = false;
                 bound.held = held;
                 // Its state moved with it: its scratch, and its pair's sets
                 // where the pair's place moved too. Their contents are dead
@@ -1050,6 +1063,7 @@ impl Plane {
                 };
                 self.claims.park(id.0, &runs);
                 bound.parked = true;
+                bound.kept = *kept;
                 Ok(())
             }
             engine::Rebind::Channel { id, slots } => self
@@ -1714,6 +1728,12 @@ struct Bound {
     /// another owner's until a rebind names where it lies, so nothing of
     /// it is repointed, laid or fired meanwhile.
     parked: bool,
+    /// Its park kept its tables and rings in place (`engine::Rebind::Parked
+    /// { kept: true }`): it still claims them, so an evacuation that moves
+    /// their chunks claims and repoints them where they now lie (its scratch
+    /// and pair share, given back at the park, stay another's until its
+    /// rebind).
+    kept: bool,
 }
 
 /// A fire naming an instance whose process parked, before a rebind named
@@ -4468,6 +4488,121 @@ mod tests {
             .expect("the slots rebind");
         names_status(&mut plane);
         assert_eq!(peak(&mut plane, 789), vec![789, 789]);
+    }
+
+    /// A park that kept its tables and rings in place still claims them, so
+    /// an evacuation that moves their chunks moves the claim with them: an
+    /// instance bound at the parked one's refs is refused by name (it would
+    /// lie on the kept tables), and the parked instance, rebound at the same
+    /// refs, fires as it did before the move. Before, the rebind skipped
+    /// every parked instance and the overlapping bind was accepted (the
+    /// L40S's kept park on engine-cuda, 743e8a54e).
+    #[test]
+    fn an_evacuation_moves_a_kept_park_s_claim_with_its_tables() {
+        use crate::store::Pools;
+        use engine::chunk::Evacuation;
+
+        let context = Context::bind().expect("a Metal 4 device");
+        let mut pools = Pools::guests_only(&context, CHUNK, GUEST_CHUNKS).expect("a pool");
+        let mut plane = Plane::new();
+        let (registration, _, seeds, token) = registration();
+        let program = plane
+            .register(&context, &registration)
+            .expect("the program registers");
+        let facts = plane.facts(program, &pools).expect("the program's facts");
+        let (instance, rings) = slots_for(&pools, &facts, 0);
+        let logits =
+            crate::device::Buffer::zeroed(&context, u64::from(VOCAB) * 2).expect("a logits plane");
+        let extents = Extents {
+            row_count: 1,
+            sampled_rows: 1,
+            query_len: 1,
+            ..Extents::default()
+        };
+        let bind = |plane: &mut Plane,
+                    pools: &Pools,
+                    instance: &[u32],
+                    rings: &[engine::RingSlots]| {
+            let id = plane.bind_placed(
+                &context,
+                program,
+                &seeds,
+                extents,
+                GeometryClass::Host,
+                PortMask::NONE,
+                &[],
+                session::Pooled {
+                    pools,
+                    instance,
+                    rings,
+                },
+            )?;
+            plane
+                .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, VOCAB, VOCAB, 1)
+                .expect("the logits bind");
+            Ok::<_, Fault>(id)
+        };
+        let kept = bind(&mut plane, &pools, &instance, &rings).expect("the instance binds");
+        let peak = |plane: &mut Plane, at: u32| {
+            let mut bf16 = vec![0u8; VOCAB as usize * 2];
+            bf16[at as usize * 2..at as usize * 2 + 2].copy_from_slice(&0x3f80u16.to_le_bytes());
+            let mut logits = logits.clone();
+            logits.write(0, &bf16).expect("the logits write");
+            let fired = plane
+                .fire(&context, kept, Attach::Epilogue)
+                .expect("the stage fires");
+            assert!(matches!(fired, Fired::Committed), "{fired:?}");
+            let cell = plane
+                .instance_mut(kept)
+                .expect("bound")
+                .take(token)
+                .expect("the take")
+                .expect("a token");
+            let (channel, seed) = &seeds[0];
+            plane
+                .instance_mut(kept)
+                .expect("bound")
+                .publish(*channel, seed)
+                .expect("the reseed");
+            i32::from_le_bytes(cell[..4].try_into().expect("an i32"))
+        };
+        assert_eq!(peak(&mut plane, 321), 321);
+
+        // Parked in place: it keeps its tables and rings, and claims them.
+        plane
+            .rebind_slots(&pools, &engine::Rebind::Parked { id: kept, kept: true })
+            .expect("the park");
+        // The evacuation moves both chunks under unchanged refs, to chunks
+        // nothing claimed: the bytes they left are free, so only a claim
+        // moved with the tables can refuse a bind at its refs.
+        let mut frame = context.frame().expect("a frame");
+        pools
+            .evacuate(&mut frame, &Evacuation { moves: vec![(1, 5), (2, 6)] })
+            .expect("the evacuation");
+        frame.commit().expect("the copies land");
+        plane.rebind(&pools).expect("the rebind");
+
+        // An instance at the parked one's refs would lie on its kept
+        // tables where they now are: refused by name.
+        let over = bind(&mut plane, &pools, &instance, &rings);
+        assert!(over.is_err(), "a bind over a kept park's moved tables is refused");
+
+        // Unparked at the same refs, it answers as before the move.
+        plane
+            .rebind_slots(
+                &pools,
+                &engine::Rebind::Instance {
+                    id: kept,
+                    instance: instance.clone(),
+                    rings: rings.clone(),
+                    adapter: Vec::new(),
+                    scratch: engine::ScratchPlace::None,
+                    pair: engine::ScratchPlace::None,
+                    pair_generation: 0,
+                },
+            )
+            .expect("the unpark");
+        assert_eq!(peak(&mut plane, 654), 654);
     }
 
     /// A bound program's role slots (its Instance tables and its Channel
