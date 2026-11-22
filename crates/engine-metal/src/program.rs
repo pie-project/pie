@@ -563,6 +563,18 @@ impl Plane {
             .get(&id)
             .map(|bound| (bound.program_id, bound.extents))
             .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
+        let moved = match self
+            .pairs
+            .iter()
+            .find(|held| held.program == program && held.extents == extents)
+        {
+            Some(held) if held.place == *place => {
+                let now: Vec<u64> =
+                    pools.guest_pieces(place)?.iter().map(|piece| piece.global).collect();
+                now != held.laid_at
+            }
+            _ => false,
+        };
         let held = self
             .pairs
             .iter_mut()
@@ -573,9 +585,12 @@ impl Plane {
             // (given back while its instances stayed bound, written by
             // another owner, taken again, perhaps at the same refs): laid
             // again there, over whatever the other owner left. The same
-            // live slots bound again lay nothing.
+            // taking moved by an evacuation while every member was parked
+            // (its sets laid where it lay before, another owner's bytes
+            // since) is laid where it lies now. The same live slots bound
+            // again lay nothing.
             let pair = held.id;
-            if held.place != *place || held.generation != generation {
+            if held.place != *place || held.generation != generation || moved {
                 held.place = place.clone();
                 held.generation = generation;
                 self.lay_pair(pools, pair)?;
@@ -591,6 +606,7 @@ impl Plane {
                 bound: 1,
                 place: place.clone(),
                 generation,
+                laid_at: Vec::new(),
             });
             if let Some(bound) = self.instances.get_mut(&id) {
                 bound.pair = pair;
@@ -765,6 +781,10 @@ impl Plane {
         let sets = self.pair_sets(program, &extents)?;
         let sizes: Vec<u64> = sets.iter().map(|set| set.2).collect();
         let pieces = pools.guest_pieces(&place)?;
+        let laid_at: Vec<u64> = pieces.iter().map(|piece| piece.global).collect();
+        if let Some(held) = self.pairs.iter_mut().find(|held| held.id == pair) {
+            held.laid_at = laid_at;
+        }
         let bytes: Vec<u64> = pieces.iter().map(|piece| piece.bytes).collect();
         for (&(stage, arm, stated), (at, offset)) in sets.iter().zip(guest::places(&sizes, &bytes)?) {
             let Some(batch) = self.batches.get_mut(&(pair, stage, arm)) else {
@@ -1701,6 +1721,13 @@ struct Pair {
     /// Which taking of `place` its sets were laid in
     /// (`engine::InstanceBinding::pair_generation`).
     generation: u64,
+    /// Where in the pool its sets were last laid (`GuestPiece::global` of
+    /// each piece of `place`). An evacuation moves a pair's chunks under the
+    /// refs and taking the runtime keeps, and lays the pair again only where
+    /// a member is bound and not parked ([`Plane::rebind`]): a pair all of
+    /// whose members were parked then is laid again where it lies at the
+    /// next join ([`Plane::join_pair`]).
+    laid_at: Vec<u64>,
 }
 
 #[derive(Debug)]
@@ -4606,14 +4633,18 @@ mod tests {
     }
 
     /// A pair whose members are all parked when an evacuation moves its
-    /// chunks (a lead for beamx40's NaN rescore on 6ea0b14ef): the runtime
-    /// keeps the pair's refs and generation and names it as it stood at each
-    /// member's restore. Every member's park left the pair, so the first
-    /// restore joins it fresh and lays its batch sets where the move put
-    /// them. The bytes the move vacated are overwritten with NaN after it, so
-    /// a set still pointing there answers wrongly (both lanes answer 0 with
-    /// the fresh lay skipped); restored, a batched stage of both members
-    /// answers each one's peak.
+    /// chunks (beamx40's NaN rescore on 6ea0b14ef): the runtime keeps the
+    /// pair's refs and generation. The bytes the move vacated are
+    /// overwritten with NaN after it, so a set still pointing there answers
+    /// wrongly.
+    /// - A new instance joins the pair at the same place and taking while
+    ///   its members are still parked (a verifier's rescore pipeline joining
+    ///   its process's pair after a raise): it fires with the sets where the
+    ///   move put them. Without the re-lay at join it answered 0, not its
+    ///   peak (the L40S's variant on engine-cuda, ddff745c6).
+    /// - Restored with the pair named as it stood, the parked members'
+    ///   batched stage answers each one's peak (both answer 0 with the
+    ///   restore's fresh lay skipped).
     #[test]
     fn a_pair_moved_while_its_members_were_parked_is_laid_where_it_lies() {
         use crate::store::Pools;
@@ -4673,10 +4704,10 @@ mod tests {
                 id
             })
             .collect();
-        let batched = |plane: &mut Plane| -> Vec<u32> {
+        let batched = |plane: &mut Plane, lanes: &[InstanceId]| -> Vec<u32> {
             let mut frame = context.frame().expect("a frame");
             let launched = plane
-                .stage_batched(&mut frame, &lanes, 0)
+                .stage_batched(&mut frame, lanes, 0)
                 .expect("the lanes stage");
             assert!(
                 launched.iter().all(|(_, launched)| matches!(launched, Launched::Airborne)),
@@ -4703,7 +4734,7 @@ mod tests {
                 })
                 .collect()
         };
-        assert_eq!(batched(&mut plane), peaks, "bound, the batch answers each peak");
+        assert_eq!(batched(&mut plane, &lanes), peaks, "bound, the batch answers each peak");
         let (pair_place, generation) = {
             let pair = plane
                 .pairs
@@ -4755,6 +4786,52 @@ mod tests {
         }
         plane.rebind(&pools).expect("the rebind");
 
+        // A new instance joins the pair at the same place and taking while
+        // its members are still parked (a verifier's rescore pipeline
+        // joining its process's pair after a raise's evacuation, the L40S's
+        // variant on engine-cuda): it fires with the sets where they lie now.
+        let joiner = {
+            let ids: Vec<ChannelId> =
+                (1..=count as u64).map(|c| ChannelId(c + 1000 * u64::from(LANES))).collect();
+            let (instance, rings) = slots_for(&pools, &facts, LANES);
+            let id = plane
+                .bind_placed(
+                    &context,
+                    program,
+                    &seeds,
+                    extents,
+                    GeometryClass::Host,
+                    PortMask::NONE,
+                    &ids,
+                    session::Pooled {
+                        pools: &pools,
+                        instance: &instance,
+                        rings: &rings,
+                    },
+                )
+                .expect("the joiner binds");
+            let mut logits = crate::device::Buffer::zeroed(&context, u64::from(VOCAB) * 2)
+                .expect("a logits plane");
+            let mut bf16 = vec![0u8; VOCAB as usize * 2];
+            bf16[987 * 2..987 * 2 + 2].copy_from_slice(&0x3f80u16.to_le_bytes());
+            logits.write(0, &bf16).expect("the logits write");
+            plane
+                .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, VOCAB, VOCAB, 1)
+                .expect("the logits bind");
+            planes.push(logits);
+            id
+        };
+        assert_eq!(
+            plane.pairs.iter().find(|held| held.program == program).map(|held| held.place.clone()),
+            Some(pair_place.clone()),
+            "the joiner joins the parked members' pair"
+        );
+        assert_eq!(
+            batched(&mut plane, &[joiner]),
+            vec![987],
+            "a joiner after its pair moved fires with the sets where they lie"
+        );
+
         // Restored as the runtime restores them: the pair named as it
         // stood, at the same taking.
         for ((&id, (instance, rings)), scratch) in lanes.iter().zip(&held).zip(&scratch) {
@@ -4774,7 +4851,7 @@ mod tests {
                 .expect("the restore");
         }
         assert_eq!(
-            batched(&mut plane),
+            batched(&mut plane, &lanes),
             peaks,
             "restored after its pair moved, the batch answers each peak"
         );
