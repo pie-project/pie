@@ -28,13 +28,12 @@ use crate::jit::{Ctx, refuse};
 use crate::linear::skeleton::LtEpilogue;
 use crate::linear::skeleton::{Epilogue, In, MAX_INS, MAX_OUTS, Paging, RowLeg, Skeleton};
 
-/// The streaming skeleton that serves `m x n x k` with `epi`: the gemv (one
-/// row) or the rows skeleton (up to its 16-row tile, one part), the first
-/// that covers it, each a warp streaming a weight row through every
-/// activation row, the epilogue fused. `None` where neither covers it: the
-/// product runs on cuBLASLt. The skinny skeleton tiles its rows on mma.sync
-/// as a GEMM does, so it is no streaming kernel and cuBLASLt serves what it
-/// would.
+/// The skeleton that serves `m x n x k` with `epi`, its epilogue fused: the
+/// gemv (one row) or the rows skeleton (up to its 16-row tile, one part),
+/// the first that covers it, each a warp streaming a weight row through
+/// every activation row; past them the skinny skeleton where it covers the
+/// product and tiles its rows tighter than cuBLASLt would ([`skinny_rows`]).
+/// `None` where none does: the product runs on cuBLASLt.
 fn streamed(
     epi: &Epilogue,
     m: i32,
@@ -45,6 +44,38 @@ fn streamed(
     [Skeleton::Gemv, Skeleton::Rows]
         .into_iter()
         .find(|s| s.covers(epi, m, n, k, tuning))
+        .or_else(|| {
+            let rows = u32::try_from(m).ok()?;
+            let cols = u32::try_from(n).ok()?.checked_mul(epi.parts())?;
+            (Skeleton::Skinny.covers(epi, m, n, k, tuning)
+                && skinny_rows(tuning, rows, cols, u32::try_from(k).ok()?).is_some())
+            .then_some(Skeleton::Skinny)
+        })
+}
+
+/// The rows the skinny skeleton pads `m` to, where it runs a dense product
+/// of `m x n x k` in place of cuBLASLt: past the rows skeleton's 16-row tile
+/// both stream the weight once over whole mma tiles of rows, so the one
+/// whose tile pads the rows least does the least work. The skinny skeleton
+/// tiles `m` in mma.sync's 16 rows within its one 64-row block; cuBLASLt's
+/// first heuristic algorithm ([`tile`]) pads to its tile's rows. `Some`
+/// where the skinny tile is the tighter (or cuBLASLt offers none), derived
+/// from the two tiles: nothing timed. Up to the rows skeleton's tile a
+/// product stays the streaming skeletons' or the library's few-row kernels'
+/// (which split K to fill the device); the skeleton's coverage
+/// (`kernel.gemm.skinny_rows`, the chip's own) bounds whether it runs at all.
+#[must_use]
+pub fn skinny_rows(tuning: &crate::tuning::Tuning, m: u32, n: u32, k: u32) -> Option<u32> {
+    let skinny = m.next_multiple_of(16);
+    if m <= crate::linear::skeleton::ROWS_M
+        || skinny > crate::linear::skinny::ROWS.min(tuning.gemm_skinny_rows())
+    {
+        return None;
+    }
+    match tile_rows(tuning, m, n, k) {
+        Some(rows) if m.next_multiple_of(rows) <= skinny => None,
+        _ => Some(skinny),
+    }
 }
 
 const fn dev(address: u64) -> *const c_void {

@@ -14,7 +14,7 @@ use dtype::Dtype;
 #[cfg(feature = "cuda")]
 pub(crate) mod cublas;
 #[cfg(feature = "cuda")]
-pub use cublas::{Tile, tile, tile_rows};
+pub use cublas::{Tile, skinny_rows, tile, tile_rows};
 #[cfg(feature = "cuda")]
 pub mod cublas_lt_fp8;
 
