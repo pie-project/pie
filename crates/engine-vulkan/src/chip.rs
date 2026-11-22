@@ -44,9 +44,6 @@ pub static SHELF: Shelf = Shelf {
     derived: Some(|_, _| DERIVED.to_string()),
 };
 
-/// The cores a device is sized by when no extension reports a count.
-pub const UNREPORTED_CORES: u32 = 16;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Device {
     pub name: String,
@@ -72,17 +69,30 @@ impl Device {
             None => facts,
         }
     }
-
-    #[must_use]
-    pub fn pricing_cores(&self) -> u32 {
-        self.cores.unwrap_or(UNREPORTED_CORES)
-    }
 }
 
 /// The vendor's family file, or the derived profile, then the user's file.
 #[must_use]
 pub fn resolve(device: &Device, profiles: Option<&Path>) -> (Profile, Report) {
     SHELF.resolve(registry(), &device.name, &device.facts(), profiles)
+}
+
+/// [`resolve`] for a load on the device `on` names (its vendor, device id
+/// and driver): the measurements the user's file stores kept where their
+/// keys match this build on this device, the rest dropped to be measured
+/// again ([`profile::fire::Rates::sift`]), each said in the load log.
+#[must_use]
+pub fn resolve_stored(device: &Device, on: &str, profiles: Option<&Path>) -> (Profile, Report) {
+    let keys = engine_gpu::stored::Keys::new(
+        on.to_string(),
+        <crate::device::Api as engine_gpu::serve::Serve>::TARGET,
+    );
+    let (profile, report) =
+        SHELF.resolve_keyed(registry(), &device.name, &device.facts(), profiles, &keys);
+    for line in &report.stored {
+        tracing::info!("{line}");
+    }
+    (profile, report)
 }
 
 #[must_use]
@@ -137,7 +147,7 @@ mod tests {
     }
 
     fn tuning(d: &Device) -> Tuning {
-        let cores = d.pricing_cores();
+        let cores = d.cores.unwrap_or(Limits::ASSUMED.cores);
         Tuning::new(
             resolve(d, None).0,
             Limits {

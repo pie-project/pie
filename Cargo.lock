@@ -1736,6 +1736,7 @@ dependencies = [
  "serde_json",
  "state",
  "thiserror 2.0.21",
+ "tracing",
  "web-std",
 ]
 
@@ -5091,6 +5092,7 @@ dependencies = [
  "getrandom 0.4.3",
  "grammar",
  "http",
+ "http-body-util",
  "ipnet",
  "libc",
  "lru",

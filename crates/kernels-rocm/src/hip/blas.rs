@@ -145,6 +145,7 @@ unsafe fn with_workspace(
     let bytes = unsafe { asks(blas, handle, call, run) }?.max(WORKSPACE_LEAST);
     let at = workspace(bytes)?;
     if crate::sizing::active() {
+        crate::sizing::counted();
         return Ok(());
     }
     // SAFETY: `at` is a laid slab of at least `bytes`, live while the

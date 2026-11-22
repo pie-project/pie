@@ -486,21 +486,6 @@ pub fn contiguous_entries(experts: u32, planes: &[(u64, u64)]) -> Vec<u64> {
         .collect()
 }
 
-/// Refuses a table that may name mapped host memory for a select with no
-/// per-route stream arm to read it.
-fn located_only(op: &'static str, experts: ExpertTable, what: &str) -> Result<(), Error> {
-    if experts.streams() {
-        return Err(refuse(
-            op,
-            format!(
-                "{what} reads its experts through the batch or matrix-core tiles only; an expert table \
-                 that may name mapped host memory (not located) is the per-route stream selects'"
-            ),
-        ));
-    }
-    Ok(())
-}
-
 /// Where a token-id-gathered table's row blocks lie, as the CUDA kernels
 /// take it: a u64 address a block of `block_rows` rows (null: the
 /// contiguous table), and a u32 read counter a block (`hits`, or 0).
@@ -2453,7 +2438,6 @@ pub fn matmul_select_fp8_mfma(
     const OP: &str = "linear.moe_select";
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
     let (q, act_scales) = crate::linear::act_quant::quantized_codes(ctx, OP, x, 128, false, 1)?;
-    located_only(OP, table, "an fp8 bank's select")?;
     matmul_select_fp8_quantized(ctx, x, q, act_scales, codes, scales, routes, y, table)
 }
 
@@ -2484,7 +2468,10 @@ pub fn matmul_select_fp8_quantized(
             "the quantized rows are not x's codes beside a scale a 128-wide block",
         ));
     }
-    located_only(op, table, "an fp8 bank's select")?;
+    // A table that streams names pool slots or the weight cache's host
+    // copy (pinned, or the file's mapping): the tiles read an expert's
+    // codes and factors where its entries say, device or host, as the
+    // lane-order MXFP4 tiles do.
     let fan = selected(op, x, routes, y)?;
     if !x.width.is_multiple_of(128) || !fp8_tiles(x, codes, scales, y) {
         return Err(refuse(

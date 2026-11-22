@@ -1194,36 +1194,6 @@ impl Lower<'_> {
         Ok((keys, picks))
     }
 
-    /// The order keys of `x` sorted descending (stably) along the last
-    /// axis, with their source indices when `indexed`.
-    fn sort_keys(&mut self, key: Val, indexed: bool) -> Lowering<(Val, Option<Val>)> {
-        let dims = self.f.dims(key).to_vec();
-        let last = (dims.len() - 1) as i64;
-        if !indexed {
-            let sorted = self
-                .f
-                .sort(&[key], last, true, |f, a, b| f.compare(Cmp::Gt, a[0], b[0]))?;
-            return Ok((sorted[0], None));
-        }
-        let index = self.f.iota(Elem::I32, &dims, last);
-        let sorted = self.f.sort(&[key, index], last, true, |f, a, b| {
-            f.compare(Cmp::Gt, a[0], b[0])
-        })?;
-        Ok((sorted[0], Some(sorted[1])))
-    }
-
-    /// Per row of the sorted `[B, R, n]` `plane`, the element at position
-    /// `at` (`[B, R]` i32; out of range reads `fill`).
-    fn at_position(&mut self, plane: Val, at: Val, fill: i64) -> Lowering<Val> {
-        let grid = self.f.dims(plane).to_vec();
-        let at = self.f.broadcast(at, &grid, &[0, 1])?;
-        let col = self.f.iota(Elem::I32, &grid, 2);
-        let here = self.f.compare(Cmp::Eq, col, at)?;
-        let floor = self.f.like_i(plane, fill);
-        let pick = self.f.select(here, plane, floor)?;
-        Ok(self.f.reduce(pick, &[2], Fold::Max)?)
-    }
-
     /// An i32 whose order is the interpreter's descending-sort order of the
     /// f32 `x`: monotone in the value, -0 and +0 one key, NaN below -inf.
     fn order_key(&mut self, x: Val) -> Lowering<Val> {
@@ -2117,20 +2087,20 @@ impl Lower<'_> {
                     _ => return refuse("rank_le over a non-integer k"),
                 };
                 let key = self.order_key(x)?;
-                let (sorted, _) = self.sort_keys(key, false)?;
                 let nan = self.is_nan(x)?;
                 let real = self.f.not(nan);
                 let count = self.f.convert(real, Elem::I32);
                 let count = self.f.reduce(count, &[2], Fold::Sum)?;
                 let t = self.f.min(k, count)?;
-                let one = self.f.const_i(Elem::I32, 1, &[b, rows]);
-                let at = self.f.sub(t, one)?;
-                let pivot = self.at_position(sorted, at, i64::from(i32::MIN))?;
+                // the t-th largest key by bisection, a masked count a round,
+                // without a sort (v6e, 4 top-k sampled lanes: the sort was
+                // 546 of the stage's 979 us)
+                let (ukey, pivot) = kth_ukey(&mut self.f, key, real, t, &grid)?;
                 let pivot = self.f.broadcast(pivot, &grid, &[0, 1])?;
                 let zero = self.f.const_i(Elem::I32, 0, &[b, rows]);
                 let some = self.f.compare(Cmp::Gt, t, zero)?;
                 let some = self.f.broadcast(some, &grid, &[0, 1])?;
-                let above = self.f.compare(Cmp::Ge, key, pivot)?;
+                let above = self.f.compare(Cmp::Ge, ukey, pivot)?;
                 let keep = self.f.and(above, real)?;
                 self.f.and(keep, some)?
             }
@@ -2439,6 +2409,51 @@ fn scan_sum_exclusive(f: &mut Func, x: Val) -> kernels_xla::hlo::Built<Val> {
 /// and the level's lanes of lower index) is below `p` (one round a bit of
 /// the row's length). A NaN lane (the least key) adds a NaN to any mass it
 /// enters, as the order's running sum does.
+/// The keys as unsigned in the same order (`ukey`), and each row's `t`-th
+/// largest of the real lanes' (`[B, R]` u32): the largest `K` with at least
+/// `t` real lanes at or above it, by bisection over the u32 range, a masked
+/// count a round (32 rounds), the sorted order's `t`-th key without a sort.
+/// A row with `t` 0 answers 0 (its lanes are cut by the caller).
+fn kth_ukey(
+    f: &mut Func,
+    key: Val,
+    real: Val,
+    t: Val,
+    grid: &[i64; 3],
+) -> kernels_xla::hlo::Built<(Val, Val)> {
+    let row = [grid[0], grid[1]];
+    let sign = f.like_i(key, i64::from(i32::MIN));
+    let ukey = f.xor(key, sign)?;
+    let ukey = f.bitcast(ukey, Elem::U32)?;
+    let count_ge = |f: &mut Func, at: Val| -> kernels_xla::hlo::Built<Val> {
+        let at = f.broadcast(at, grid, &[0, 1])?;
+        let ge = f.compare(Cmp::Ge, ukey, at)?;
+        let ge = f.and(ge, real)?;
+        let n = f.convert(ge, Elem::I32);
+        f.reduce(n, &[2], Fold::Sum)
+    };
+    // count_ge(lo) >= t holds from lo = 0 (t is at most the real lanes);
+    // the answer lies in [lo, hi]: take the upper half while it holds
+    let lo0 = f.const_i(Elem::U32, 0, &row);
+    let hi0 = f.const_i(Elem::U32, i64::from(u32::MAX), &row);
+    let out = f.for_loop(32, &[lo0, hi0], |f, _, st| {
+        let (lo, hi) = (st[0], st[1]);
+        let span = f.sub(hi, lo)?;
+        let one = f.like_i(span, 1);
+        let half = f.shr(span, one)?;
+        let odd = f.and(span, one)?;
+        let half = f.add(half, odd)?;
+        let mid = f.add(lo, half)?;
+        let c = count_ge(f, mid)?;
+        let holds = f.compare(Cmp::Ge, c, t)?;
+        let below = f.sub(mid, one)?;
+        let lo = f.select(holds, mid, lo)?;
+        let hi = f.select(holds, hi, below)?;
+        Ok(vec![lo, hi])
+    })?;
+    Ok((ukey, out[0]))
+}
+
 fn nucleus_prefix(
     f: &mut Func,
     x: Val,

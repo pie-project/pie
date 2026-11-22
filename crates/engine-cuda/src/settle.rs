@@ -73,21 +73,54 @@ impl Settlement {
         })
     }
 
-    pub fn claim(&self) -> Result<u32> {
-        self.free.take().ok_or(crate::error::Fault::Ceiling {
-            what: "settlement events (one per in-flight step)",
-            need: self.events.len() as u64 + 1,
-            have: self.events.len() as u64,
-        })
+    /// A settle event, as [`Free::claim`] claims: waited for while a step's
+    /// landing holds one, refused by name at once where the claimant's own
+    /// steps hold them all.
+    pub fn claim(&self) -> Result<crate::inputs::SlotGuard> {
+        self.free.claim(
+            "settlement events (one per in-flight step; every one held by a step not yet \
+             handed to its landing)",
+        )
     }
 
     #[must_use]
     pub fn event(&self, at: u32) -> &Event {
         &self.events[at as usize]
     }
+}
 
-    #[must_use]
-    pub fn recycler(&self) -> Arc<Free> {
-        Arc::clone(&self.free)
+#[cfg(test)]
+mod tests {
+    use super::Settlement;
+    use std::time::{Duration, Instant};
+
+    /// A settle event is claimed as a staging slot is: with one held by a
+    /// step's landing, a claim waits for it and then has it; with every one
+    /// held by the claimant's own steps, none landing, it is refused by name
+    /// at once.
+    #[test]
+    fn a_settle_event_waits_for_a_landing_and_refuses_a_claim_deeper_than_its_set() {
+        if !crate::device::present() {
+            eprintln!("skipping: no CUDA device on this machine");
+            return;
+        }
+        let settlement = Settlement::open(2).expect("two settle events");
+        let first = settlement.claim().expect("a free event");
+        let landing = settlement.claim().expect("a free event").landing();
+        let at = landing.at();
+        let lands = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(landing);
+        });
+        let began = Instant::now();
+        let got = settlement.claim().expect("the landing's event comes back");
+        assert!(began.elapsed() >= Duration::from_millis(150), "it waited for the landing");
+        assert_eq!(got.at(), at, "the landing's event");
+        lands.join().expect("the landing thread");
+        let began = Instant::now();
+        let refused = settlement.claim().expect_err("a third event of two, none landing");
+        assert!(began.elapsed() < Duration::from_millis(100), "refused at once");
+        assert!(refused.to_string().contains("settlement events"), "{refused}");
+        drop((first, got));
     }
 }

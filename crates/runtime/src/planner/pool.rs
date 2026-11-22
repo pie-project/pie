@@ -125,6 +125,79 @@ impl RunNeed {
     }
 }
 
+/// A restore head's whole restore as the store's takes place it
+/// ([`PoolPort::restore_placement`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RestorePlacement {
+    /// The free physical chunks its own takes open: no room for what is
+    /// still to lay ([`Self::short`]).
+    pub opened: Vec<u32>,
+    /// The budget's headroom its own takes leave; `None`: the map's own.
+    pub room: Option<u32>,
+    /// What does not stand once its own takes are placed: the pieces of
+    /// its own the takes refused (runs of whole chunks as they are, the
+    /// rest as the single chunks they open placed alone), then its pending
+    /// bind's runs where fewer stand free than it asks. Empty: it stands.
+    pub short: RunNeed,
+    /// The free runs of the pending bind's length its own takes leave.
+    pub bind_free_runs: Option<u32>,
+}
+
+impl RestorePlacement {
+    /// Whether the whole restore stands now.
+    #[must_use]
+    pub fn stands(&self) -> bool {
+        self.short.is_empty()
+    }
+
+    /// Read from `own` placed as `placement` went, `bind` laid in what it
+    /// left; `alone` the chunks pieces open placed alone
+    /// ([`crate::store::slots::SlotPool::opens_alone`]).
+    #[must_use]
+    pub fn of(
+        own: &[crate::store::slots::OwnPiece],
+        placement: &crate::store::slots::Placement,
+        bind: Option<(u32, u32)>,
+        alone: impl Fn(&[crate::store::slots::OwnPiece]) -> u32,
+    ) -> Self {
+        use crate::store::slots::OwnPiece;
+        let rest = &own[placement.placed.min(own.len())..];
+        let mut short = RunNeed::default();
+        for piece in rest {
+            if let OwnPiece::Chunks { run, pieces } = *piece {
+                short.add(run, pieces);
+            }
+        }
+        let singles: Vec<OwnPiece> = rest
+            .iter()
+            .filter(|piece| !matches!(piece, OwnPiece::Chunks { .. }))
+            .copied()
+            .collect();
+        short.add(1, alone(&singles));
+        let bind_free_runs = bind.map(|(run, _)| placement.free_runs(run));
+        if let Some((run, pieces)) = bind
+            && (!rest.is_empty() || bind_free_runs.is_some_and(|free| free < pieces))
+        {
+            short.add(run, pieces);
+        }
+        Self {
+            opened: placement.opened.iter().copied().collect(),
+            room: Some(placement.room),
+            short,
+            bind_free_runs,
+        }
+    }
+
+    /// `map` with the chunks its own takes open taken out and the headroom
+    /// they leave: the room what is short is laid in.
+    pub fn lay(&self, map: &mut ChunkMap) {
+        map.free.retain(|chunk| !self.opened.contains(chunk));
+        if let Some(room) = self.room {
+            map.headroom = Some(map.headroom.map_or(room, |had| had.min(room)));
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ChunkMap {
     /// Each chunk some candidate's pages lie in: the slots it holds in
@@ -213,6 +286,32 @@ fn cheapest_disjoint(windows: &[(u32, u32)], run: u32, pieces: u32) -> Option<Ve
 }
 
 impl ChunkMap {
+    /// The map as read for `pids` alone: each chunk's holders among them,
+    /// a chunk none of them holds left out. One map built for every
+    /// process serves every candidate list in a generation.
+    #[must_use]
+    pub fn restricted(&self, pids: &[ProcessId]) -> ChunkMap {
+        let wanted: std::collections::HashSet<ProcessId> = pids.iter().copied().collect();
+        ChunkMap {
+            held: self
+                .held
+                .iter()
+                .filter_map(|chunk| {
+                    let by: Vec<(ProcessId, u32)> =
+                        chunk.by.iter().copied().filter(|(pid, _)| wanted.contains(pid)).collect();
+                    (!by.is_empty()).then(|| ChunkHeld {
+                        chunk: chunk.chunk,
+                        used: chunk.used,
+                        by,
+                    })
+                })
+                .collect(),
+            free: self.free.clone(),
+            headroom: self.headroom,
+            segment_chunks: self.segment_chunks,
+        }
+    }
+
     /// `other`'s chunks counted in as well: a chunk both hold has the
     /// occupants of each, a pid in both its slots summed.
     pub fn merge(&mut self, other: ChunkMap) {
@@ -320,6 +419,28 @@ impl ChunkMap {
             self.segment_chunks,
             self.cheapest_runs(run, 1).map(|pids| pids.len()),
         )
+    }
+
+    /// The disjoint free runs of `run` adjacent chunks it holds, each inside
+    /// one segment, no more than its headroom opens: the map's figure for
+    /// the room a refusal read at that run ([`super::ResidencyPlanner::dump_stall`]).
+    #[must_use]
+    pub fn free_runs(&self, run: u32) -> u32 {
+        let run = run.max(1);
+        let mut free = self.free.clone();
+        free.sort_unstable();
+        let (mut runs, mut stretch, mut last) = (0u32, 0u32, None::<u32>);
+        for chunk in free {
+            let same = self.segment_chunks == 0
+                || last.is_some_and(|last| last / self.segment_chunks == chunk / self.segment_chunks);
+            stretch = if last == Some(chunk.wrapping_sub(1)) && same { stretch + 1 } else { 1 };
+            if stretch == run {
+                runs += 1;
+                stretch = 0;
+            }
+            last = Some(chunk);
+        }
+        self.headroom.map_or(runs, |headroom| runs.min(headroom / run))
     }
 
     /// The processes whose eviction empties the cheapest `pieces` disjoint
@@ -512,14 +633,107 @@ pub trait PoolPort: Send + Sync + 'static {
     fn guest_free_runs(&self, run: u32) -> u32 {
         u32::from(self.guest_room_free(run, 1))
     }
-    /// Whether every entry of `need` stands free together, as a guest's
-    /// takes lay them: the longest runs first, each shorter length beside
-    /// them, the budget's headroom spent by all of them. Where the pool
-    /// lays nothing apart, each entry read on its own.
-    fn guest_need_free(&self, need: &RunNeed) -> bool {
+    /// Whether every entry of `need` stands free together once `state` (a
+    /// restore's state, taken by its serve before its unpark) is placed, as
+    /// the takes lay them: the state's single slots where the store puts
+    /// them, then the longest runs first, each shorter length beside them,
+    /// the budget's headroom spent by all of them. The store's own
+    /// placement ([`crate::store::slots::SlotPool::chunk_runs_beside`]), so
+    /// what stands here is what the unpark finds. Where the pool lays
+    /// nothing apart, each entry read on its own.
+    fn guest_need_free(&self, need: &RunNeed, state: RsUnits) -> bool {
+        let _ = state;
         need.entries()
             .iter()
             .all(|&(run, pieces)| self.guest_room_free(run, pieces))
+    }
+    /// `pid`'s whole restore placed by the store's takes themselves: its
+    /// `kv_pages` still to gather and `state` its serve takes, every piece
+    /// its unpark takes, in that order, then `bind` (a pending bind's runs)
+    /// in what they leave ([`crate::store::slots::SlotPool::place`]). The
+    /// one placement a restore is sent on ([`Self::restore_stands`]), its
+    /// moves are planned by (the map lays [`RestorePlacement::short`] in
+    /// the room its own takes leave) and the stall line reads: a check
+    /// that mirrored the takes stood runs the restore's own takes then
+    /// broke (Mac Pro at 2 GiB: PendingBindShort, free runs (3, 2) before
+    /// and one after, need_moves 0). Where the pool keeps no roles, `need`
+    /// (the runs the planner reads its step as) is placed beside `state`.
+    fn restore_placement(
+        &self,
+        pid: ProcessId,
+        need: &RunNeed,
+        state: RsUnits,
+        kv_pages: u32,
+        bind: Option<(u32, u32)>,
+    ) -> RestorePlacement {
+        let _ = (pid, kv_pages);
+        let stands = match bind {
+            Some((run, pieces)) => self.room_beside_own(pid, run, pieces),
+            None => self.guest_need_free(need, state),
+        };
+        RestorePlacement {
+            opened: self.serve_opens(state),
+            room: None,
+            short: if stands {
+                RunNeed::default()
+            } else {
+                bind.map_or_else(|| need.clone(), |(run, pieces)| RunNeed::one(run, pieces))
+            },
+            bind_free_runs: None,
+        }
+    }
+    /// Whether `pid`'s whole restore stands now ([`Self::restore_placement`]).
+    fn restore_stands(
+        &self,
+        pid: ProcessId,
+        need: &RunNeed,
+        state: RsUnits,
+        kv_pages: u32,
+        bind: Option<(u32, u32)>,
+    ) -> bool {
+        self.restore_placement(pid, need, state, kv_pages, bind).stands()
+    }
+    /// Holds for `pid`'s served restore what its placement chose: the free
+    /// chunks its unpark's pieces and then `bind`'s runs open
+    /// ([`crate::store::roles::Roles::reserve_restore`]), closed to every
+    /// other take until its unpark and bind take them or
+    /// [`Self::release_restore`]. Whether it was held (its placement
+    /// stands). Where the pool keeps no roles, nothing is held.
+    fn reserve_restore(&self, pid: ProcessId, bind: Option<(u32, u32)>) -> bool {
+        let _ = (pid, bind);
+        false
+    }
+    /// `pid`'s reservation goes back: its restore failed, was queued again,
+    /// was withdrawn, landed with no bind pending, or its process is gone.
+    fn release_restore(&self, pid: ProcessId) {
+        let _ = pid;
+    }
+    /// The physical device chunks slot refs `refs` of engine shape `shape`
+    /// lie in: what a residency copy of them reads or writes, fenced
+    /// ([`Self::moving_out`]) until it lands. Empty where the pool keeps
+    /// no chunks.
+    fn copy_chunks(&self, shape: ::engine::chunk::ShapeId, refs: &[u32]) -> Vec<u32> {
+        let _ = (shape, refs);
+        Vec::new()
+    }
+    /// A residency move's copy reads `chunks` (physical) until
+    /// [`Self::moved_out`]: no raise takes them back for its activation
+    /// meanwhile ([`crate::store::slots::SlotPool::moving_out`]).
+    fn moving_out(&self, chunks: &[u32]) {
+        let _ = chunks;
+    }
+    /// The copy [`Self::moving_out`] named has landed, or will not; the
+    /// walk looks again (a raise that waited on it).
+    fn moved_out(&self, chunks: &[u32]) {
+        let _ = chunks;
+    }
+    /// The free physical chunks a restore's `state` would open as its serve
+    /// takes it, lowest first after the shapes' partly filled chunks
+    /// ([`crate::store::slots::SlotPool::opens_for`]): chunks the map must
+    /// not lay the head's runs in. Empty where the pool keeps no chunks.
+    fn serve_opens(&self, state: RsUnits) -> Vec<u32> {
+        let _ = state;
+        Vec::new()
     }
     /// Where a raise of the activation to `rung` (tokens) stands now: what
     /// a rung raise short of room waits on
@@ -549,6 +763,13 @@ pub trait PoolPort: Send + Sync + 'static {
         let _ = (run, pieces);
         false
     }
+    /// Whether a compaction asked for a head is on its way: its moves
+    /// fenced, or planned and still plannable for runs that do not stand
+    /// yet ([`crate::store::shared::SharedPool::compaction_under_way`]).
+    /// It moves the head's room as an eviction in flight does.
+    fn compaction_under_way(&self) -> bool {
+        false
+    }
     /// The pool's census for a head short of runs of `run` chunks
     /// ([`crate::store::slots::SlotPool::census`]); empty where the pool
     /// keeps no guest state.
@@ -561,6 +782,15 @@ pub trait PoolPort: Send + Sync + 'static {
     /// empty where the pool keeps no roles.
     fn unpark_census(&self, pid: ProcessId, need: Option<(u32, u32)>) -> String {
         let _ = (pid, need);
+        String::new()
+    }
+    /// Where the occupancy map's attribution of `pid` comes from, by
+    /// source and physical chunk: its movable kv pages, its guest items
+    /// (each item's owner, tier, parts and the chunks they lie in), and
+    /// its state's private device slots with each chunk's slots in use.
+    /// What a quiet wait's warn sets beside the map's attribution.
+    fn occupancy_sources(&self, pid: ProcessId) -> String {
+        let _ = pid;
         String::new()
     }
     /// The device pages that, moved out whole, free `chunks` chunks for a
@@ -633,11 +863,32 @@ pub trait PoolPort: Send + Sync + 'static {
     fn state_chunks(&self) -> u32 {
         u32::MAX
     }
+    /// [`crate::store::shared::SharedPool::state_chunks_most`]: the one
+    /// device figure a never-fits check reads. `u32::MAX` where the kv
+    /// pages are a pool of their own.
+    fn state_chunks_most(&self) -> u32 {
+        u32::MAX
+    }
+    /// The chunks the governor's target holds back from state
+    /// ([`crate::store::shared::SharedPool::held_back_chunks`]): room only
+    /// the target's rise gives. 0 where none is held back.
+    fn held_back(&self) -> u32 {
+        0
+    }
     /// The device pool's count of room given back (a chunk opened for
     /// state, [`crate::store::slots::SlotPool::room_gives`]): moved since
     /// a read, room has come free since.
     fn room_gives(&self) -> u64 {
         0
+    }
+    /// The device pool's count of every change to what it holds: room
+    /// given back ([`Self::room_gives`]), and each take, give and move of
+    /// slots. Unmoved, every placement and map read on it reads the same:
+    /// part of the planner's generation ([`super::ResidencyPlanner::generation`]).
+    /// Where the pool keeps no chunks, its gives and its free pages.
+    fn room_changes(&self) -> u64 {
+        self.room_gives()
+            .wrapping_add(u64::from(self.device_stats().0) << 32)
     }
     /// How a shared pool's chunks divide for good: what the weights, the
     /// activation and the reserved chunks hold, and what is left for kv and
@@ -814,24 +1065,122 @@ impl PoolPort for RegistryPool {
         self.guest_free_runs(run) >= pieces
     }
 
-    fn guest_need_free(&self, need: &RunNeed) -> bool {
+    fn guest_need_free(&self, need: &RunNeed, state: RsUnits) -> bool {
         use crate::store::slots::OwnPiece;
         let Some((last, laid)) = need.entries().split_last() else {
             return true;
         };
-        let own: Vec<OwnPiece> = laid
-            .iter()
-            .map(|&(run, pieces)| OwnPiece::Chunks { run, pieces })
-            .collect();
         crate::store::registry::try_get(self.model, self.engine)
             .and_then(|stores| stores.shared)
             .is_some_and(|shared| {
-                shared
-                    .lock()
-                    .unwrap()
-                    .pool()
-                    .chunk_runs_beside(&own, last.0, last.1)
+                let shared = shared.lock().unwrap();
+                let own: Vec<OwnPiece> = shared
+                    .state_takes(state)
+                    .into_iter()
+                    .map(|(shape, slots)| OwnPiece::Take { shape, slots })
+                    .chain(laid.iter().map(|&(run, pieces)| OwnPiece::Chunks { run, pieces }))
+                    .collect();
+                shared.pool().chunk_runs_beside(&own, last.0, last.1)
             })
+    }
+
+    fn restore_placement(
+        &self,
+        pid: ProcessId,
+        need: &RunNeed,
+        state: RsUnits,
+        kv_pages: u32,
+        bind: Option<(u32, u32)>,
+    ) -> RestorePlacement {
+        use crate::store::slots::OwnPiece;
+        let roles_and_shared = crate::store::registry::try_get(self.model, self.engine)
+            .and_then(|stores| Some((stores.shared.clone()?, stores.roles.clone()?)));
+        let Some((shared, roles)) = roles_and_shared else {
+            let stands = self.guest_need_free(need, state);
+            return RestorePlacement {
+                opened: self.serve_opens(state),
+                room: None,
+                short: if stands { RunNeed::default() } else { need.clone() },
+                bind_free_runs: None,
+            };
+        };
+        // Its kv pages first, as its grant takes them before its serve's
+        // state and its unpark: the takes read under the pool's lock and
+        // let go, the roles taking it themselves.
+        let takes = {
+            let shared = shared.lock().unwrap();
+            let mut takes: Vec<_> = shared.kv_takes(kv_pages).into_iter().collect();
+            takes.extend(shared.state_takes(state));
+            takes
+        };
+        let (own, placement) = roles.lock().unwrap().restore_placement(pid, &takes);
+        let pool_alone = |rest: &[OwnPiece]| {
+            shared.lock().unwrap().pool().opens_alone(rest)
+        };
+        RestorePlacement::of(&own, &placement, bind, pool_alone)
+    }
+
+    fn reserve_restore(&self, pid: ProcessId, bind: Option<(u32, u32)>) -> bool {
+        crate::store::registry::try_get(self.model, self.engine)
+            .and_then(|stores| stores.roles)
+            .is_some_and(|roles| roles.lock().unwrap().reserve_restore(pid, bind))
+    }
+
+    fn release_restore(&self, pid: ProcessId) {
+        if let Some(roles) =
+            crate::store::registry::try_get(self.model, self.engine).and_then(|stores| stores.roles)
+        {
+            roles.lock().unwrap().release_claim(pid);
+        }
+    }
+
+    fn copy_chunks(&self, shape: ::engine::chunk::ShapeId, refs: &[u32]) -> Vec<u32> {
+        let Some(shared) =
+            crate::store::registry::try_get(self.model, self.engine).and_then(|stores| stores.shared)
+        else {
+            return Vec::new();
+        };
+        let shared = shared.lock().unwrap();
+        let Some(pool_shape) = shared.pool_shape(shape) else {
+            return Vec::new();
+        };
+        let mut chunks: Vec<u32> = refs
+            .iter()
+            .filter_map(|&slot_ref| shared.pool().physical(shared.slot(pool_shape, slot_ref).chunk))
+            .collect();
+        chunks.sort_unstable();
+        chunks.dedup();
+        chunks
+    }
+
+    fn moving_out(&self, chunks: &[u32]) {
+        if let Some(shared) =
+            crate::store::registry::try_get(self.model, self.engine).and_then(|stores| stores.shared)
+        {
+            shared.lock().unwrap().pool_mut().moving_out(chunks);
+        }
+    }
+
+    fn moved_out(&self, chunks: &[u32]) {
+        if let Some(shared) =
+            crate::store::registry::try_get(self.model, self.engine).and_then(|stores| stores.shared)
+        {
+            shared.lock().unwrap().pool_mut().moved_out(chunks);
+        }
+        crate::store::shared::ask_walk(self.engine);
+    }
+
+    fn serve_opens(&self, state: RsUnits) -> Vec<u32> {
+        if state.is_zero() {
+            return Vec::new();
+        }
+        crate::store::registry::try_get(self.model, self.engine)
+            .and_then(|stores| stores.shared)
+            .and_then(|shared| {
+                let shared = shared.lock().unwrap();
+                shared.pool().opens_for(&shared.state_takes(state))
+            })
+            .unwrap_or_default()
     }
 
     fn rise_room(&self, rung: u32) -> RiseRoom {
@@ -866,6 +1215,46 @@ impl PoolPort for RegistryPool {
         }
     }
 
+    fn occupancy_sources(&self, pid: ProcessId) -> String {
+        let Some(stores) = crate::store::registry::try_get(self.model, self.engine) else {
+            return String::new();
+        };
+        let Some(shared) = stores.shared.clone() else {
+            return String::new();
+        };
+        let kv_sets = crate::inferlet::process::residency::kv_working_sets_for(&[pid], self.model, self.engine);
+        let guest = stores
+            .roles
+            .as_ref()
+            .map(|roles| roles.lock().unwrap().guest_items_census(pid))
+            .unwrap_or_default();
+        let rs_sets = crate::inferlet::process::residency::rs_working_set_ids(pid, self.model, self.engine);
+        let rs = if rs_sets.is_empty() {
+            Vec::new()
+        } else {
+            stores.rs.lock().unwrap().private_slot_refs(&rs_sets)
+        };
+        let kv = crate::store::registry::with_kv_lock(&stores.kv, "planner-sources", |kv| {
+            let groups: Vec<_> = kv_sets.into_iter().flatten().collect();
+            kv.movable_resident_pages_each(&groups).into_iter().map(|pages| pages.len()).sum::<usize>()
+        });
+        let pool = shared.lock().unwrap();
+        let rs: Vec<String> = rs
+            .iter()
+            .flat_map(|(engine, refs)| {
+                let shape = pool.pool_shape(*engine);
+                let pool = &pool;
+                refs.iter().filter_map(move |&slot_ref| {
+                    let shape = shape?;
+                    let slot = pool.slot(shape, slot_ref);
+                    let physical = pool.pool().physical(slot.chunk)?;
+                    Some(format!("shape {engine:?} chunk {physical} (used {})", pool.pool().chunk_used(slot.chunk)))
+                })
+            })
+            .collect();
+        format!("kv_movable_pages={kv} rs_private=[{}] guest=[{guest}]", rs.join(", "))
+    }
+
     fn unpark_census(&self, pid: ProcessId, need: Option<(u32, u32)>) -> String {
         crate::store::registry::try_get(self.model, self.engine)
             .and_then(|stores| stores.roles)
@@ -881,6 +1270,12 @@ impl PoolPort for RegistryPool {
                 format!("{} {}", shared.pool().census(run), shared.pool().budget_line())
             })
             .unwrap_or_default()
+    }
+
+    fn compaction_under_way(&self) -> bool {
+        crate::store::registry::try_get(self.model, self.engine)
+            .and_then(|stores| stores.shared)
+            .is_some_and(|shared| shared.lock().unwrap().compaction_under_way())
     }
 
     fn compaction_comes(&self, run: u32, pieces: u32) -> bool {
@@ -938,10 +1333,36 @@ impl PoolPort for RegistryPool {
             .map_or(u32::MAX, |shared| shared.lock().unwrap().state_chunks_now())
     }
 
+    fn state_chunks_most(&self) -> u32 {
+        crate::store::registry::try_get(self.model, self.engine)
+            .and_then(|stores| stores.shared)
+            .map_or(u32::MAX, |shared| shared.lock().unwrap().state_chunks_most())
+    }
+
+    fn held_back(&self) -> u32 {
+        crate::store::registry::try_get(self.model, self.engine)
+            .and_then(|stores| stores.shared)
+            .map_or(0, |shared| shared.lock().unwrap().held_back_chunks())
+    }
+
     fn room_gives(&self) -> u64 {
         crate::store::registry::try_get(self.model, self.engine)
             .and_then(|stores| stores.shared)
             .map_or(0, |shared| shared.lock().unwrap().pool().room_gives())
+    }
+
+    fn room_changes(&self) -> u64 {
+        let shared = crate::store::registry::try_get(self.model, self.engine)
+            .and_then(|stores| stores.shared);
+        match shared {
+            Some(shared) => {
+                let shared = shared.lock().unwrap();
+                shared.pool().room_gives().wrapping_add(shared.pool().room_changes())
+            }
+            None => self
+                .room_gives()
+                .wrapping_add(u64::from(self.device_stats().0) << 32),
+        }
     }
 
     fn chunk_occupants(&self, pids: &[ProcessId]) -> ChunkMap {
@@ -988,21 +1409,39 @@ impl PoolPort for RegistryPool {
             };
             let mut by: std::collections::BTreeMap<u32, (u32, Vec<(ProcessId, u32)>)> =
                 std::collections::BTreeMap::new();
-            for (&pid, sets) in pids.iter().zip(sets) {
-                let Some(sets) = sets else {
-                    continue;
-                };
-                let mut counts: std::collections::BTreeMap<u32, u32> = Default::default();
-                for page in kv.movable_resident_pages(&sets) {
+            // Every process's movable pages read in one walk of the
+            // running sets' pages ([`crate::store::kv::KvStore::movable_resident_pages_each`]).
+            let (named, groups): (Vec<ProcessId>, Vec<std::collections::HashSet<_>>) = pids
+                .iter()
+                .zip(sets)
+                .filter_map(|(&pid, sets)| sets.map(|sets| (pid, sets)))
+                .unzip();
+            let movable = kv.movable_resident_pages_each(&groups);
+            // Counted by physical chunk in one table the pool's size, its
+            // touched chunks reset after each process: no map per page.
+            let total = pool.pool().total_chunks() as usize;
+            let mut counts = vec![0u32; total];
+            let mut used = vec![0u32; total];
+            let mut touched: Vec<u32> = Vec::new();
+            for (pid, pages) in named.iter().zip(movable) {
+                for page in pages {
                     let slot = pool.slot(list.pool, page.0);
                     if let Some(physical) = pool.pool().physical(slot.chunk) {
-                        *counts.entry(physical).or_default() += 1;
-                        by.entry(physical)
-                            .or_insert_with(|| (pool.pool().chunk_used(slot.chunk), Vec::new()));
+                        let at = physical as usize;
+                        if counts[at] == 0 {
+                            touched.push(physical);
+                            used[at] = pool.pool().chunk_used(slot.chunk);
+                        }
+                        counts[at] += 1;
                     }
                 }
-                for (physical, pages) in counts {
-                    by.get_mut(&physical).expect("entered").1.push((pid, pages));
+                for physical in touched.drain(..) {
+                    let at = physical as usize;
+                    by.entry(physical)
+                        .or_insert_with(|| (used[at], Vec::new()))
+                        .1
+                        .push((*pid, counts[at]));
+                    counts[at] = 0;
                 }
             }
             for (pid, refs) in &state {
@@ -1097,6 +1536,49 @@ impl PoolPort for RegistryPool {
         let Some(stores) = crate::store::registry::try_get(self.model, self.engine) else {
             return false;
         };
+        // Their kv left on the device first: a page every reader of which
+        // is evicted (a prompt prefix several forks share, held at each
+        // eviction by another reader or a key) is theirs together, counted
+        // in the map as theirs (`chunk_occupants` of the evicted), and goes
+        // down a tier once with their sets, every reader's refs pointing
+        // there. Passed over, it held its chunk for good, no process its
+        // holder (the L40S at 3 GiB disk-only: chunk 4, one slot, seven
+        // evicted forks' refs, a head short of it unserved).
+        let kv_sets: Vec<(crate::store::kv::page_table::WorkingSetId, u64)> = pids
+            .iter()
+            .flat_map(|&pid| {
+                crate::inferlet::process::residency::kv_working_set_ids(pid, self.model, self.engine)
+            })
+            .map(|ws| (ws, 0))
+            .collect();
+        if !kv_sets.is_empty() {
+            // What a restore under way reads stays: it would bring it back.
+            let keep: HashSet<crate::store::kv::page_table::WorkingSetId> = planner
+                .restoring_pids()
+                .into_iter()
+                .flat_map(|pid| {
+                    crate::inferlet::process::residency::kv_working_set_ids(pid, self.model, self.engine)
+                })
+                .collect();
+            let sweep = self.with_kv_tagged("planner-park-down", |kv| {
+                kv.prepare_sweep(&keep, usize::MAX, &kv_sets, usize::MAX)
+            });
+            match sweep {
+                Ok(Some(txn)) => {
+                    super::exec::spawn_move_out(
+                        planner.clone(),
+                        txn,
+                        "parked kv move down",
+                        super::ResidencyPlanner::parked_down_done,
+                    );
+                    return true;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "planner: parked kv's move down refused");
+                }
+            }
+        }
         // An evicted process's state left on the device at its eviction
         // (records and rs list slots its suspend found no row for, or still
         // settling then) goes down with its parked role slots: left there,
@@ -1116,7 +1598,7 @@ impl PoolPort for RegistryPool {
         };
         let Some(roles) = stores.roles.clone() else {
             if rs.is_some() {
-                super::exec::spawn_park_down(planner.clone(), None, rs);
+                super::exec::spawn_park_down(planner.clone(), pids.to_vec(), None, rs);
                 return true;
             }
             return false;
@@ -1129,7 +1611,7 @@ impl PoolPort for RegistryPool {
             .unwrap()
             .prepare_park_down(&holders, stores.host.is_none());
         if down.txn.is_some() || rs.is_some() {
-            super::exec::spawn_park_down(planner.clone(), down.txn, rs);
+            super::exec::spawn_park_down(planner.clone(), pids.to_vec(), down.txn, rs);
             return true;
         }
         if let Some(host) = stores.host.as_ref().filter(|_| down.host_chunks > 0) {
@@ -1173,7 +1655,7 @@ impl PoolPort for RegistryPool {
         // now, else the disk.
         match roles.lock().unwrap().prepare_park_down(&holders, true).txn {
             Some(txn) => {
-                super::exec::spawn_park_down(planner.clone(), Some(txn), None);
+                super::exec::spawn_park_down(planner.clone(), pids.to_vec(), Some(txn), None);
                 true
             }
             None => false,

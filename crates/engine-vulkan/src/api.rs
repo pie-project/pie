@@ -46,6 +46,14 @@ pub struct DeviceBoot {
     /// only (`test-limits`): no config or profile reaches it.
     #[cfg(feature = "test-limits")]
     pub max_buffer: Option<u64>,
+
+    /// A test's device whose platform states a bound on one GPU submission
+    /// (as Android's KGSL states 2 s): the bound every serving step is held
+    /// to, in place of the platform's (`engine_gpu::rates::
+    /// stated_submit_bound`). Test builds only (`test-limits`): no config
+    /// or profile reaches it.
+    #[cfg(feature = "test-limits")]
+    pub submit_bound: Option<std::time::Duration>,
 }
 
 pub type Vulkan = engine_gpu::api::Gpu<Api>;
@@ -58,6 +66,10 @@ impl Host for Api {
 
     fn domain(boot: &DeviceBoot) -> MemoryDomain {
         MemoryDomain::VulkanDevice(boot.device_index)
+    }
+
+    fn measured_on(device: &crate::device::Context) -> String {
+        device.measured_on()
     }
 
     fn ports() -> PortMask {
@@ -93,7 +105,7 @@ impl Host for Api {
             let wrote = std::mem::take(&mut step_pending.wrote);
             let faulted = std::mem::take(&mut step_pending.faulted);
             let fed = step_pending.fed.take();
-            defer_attachment(gpu, step, at, &landed, wrote, faulted, fed)?;
+            defer_attachments(gpu, step, at, &landed, wrote, faulted, fed)?;
             gpu.loaded_mut()?.forget_seat(&landed);
             step_pending.rows = Some(Vec::new());
             return Ok((ticket, step_pending));
@@ -280,16 +292,15 @@ fn run_attachments(gpu: &mut Vulkan, step: &Step, landed: &Landed) -> Vec<engine
     faulted.faulted
 }
 
-/// Whether `step`'s one attachment can run behind its forward without
-/// the host waiting for either.
+/// Whether `step`'s attachments can run behind its forward, all in one
+/// frame, without the host waiting for any of them.
 fn defers(gpu: &Vulkan, step: &Step) -> bool {
     #[cfg(feature = "vulkan")]
     {
         gpu.sink.is_some()
             && gpu.settles_asynchronously()
-            && step.attachments.len() == 1
-            && !step.attachments[0].adapter_only
-            && gpu.programs.defers(step.attachments[0].instance)
+            && program_attachments(step).next().is_some()
+            && program_attachments(step).all(|attachment| gpu.programs.defers(attachment.instance))
     }
     #[cfg(not(feature = "vulkan"))]
     {
@@ -298,7 +309,7 @@ fn defers(gpu: &Vulkan, step: &Step) -> bool {
     }
 }
 
-fn defer_attachment(
+fn defer_attachments(
     gpu: &mut Vulkan,
     step: &Step,
     at: engine::StepDone,
@@ -318,8 +329,13 @@ fn defer_attachment(
         let shell = shell
             .as_ref()
             .ok_or_else(|| Error::Load("the vulkan engine has no model loaded".into()))?;
-        let attachment = &step.attachments[0];
-        let seats = lane_seats(shell, landed, attachment);
+        let passes: Vec<crate::program::DeferredPass<'_>> = program_attachments(step)
+            .map(|attachment| crate::program::DeferredPass {
+                instance: attachment.instance,
+                lanes: attachment_lanes(attachment),
+                seats: lane_seats(shell, landed, attachment),
+            })
+            .collect();
         let done = sink.clone().map(|sink| Done {
             at,
             sink,
@@ -330,13 +346,7 @@ fn defer_attachment(
             fed,
         });
         programs
-            .fire_deferred(
-                attachment.instance,
-                attachment_lanes(attachment),
-                shell.device(),
-                seats,
-                done,
-            )
+            .fire_deferred(passes, shell.device(), done)
             .map_err(refusal)
     }
     #[cfg(not(feature = "vulkan"))]

@@ -13,10 +13,6 @@
 //!   `engine::rates::GEMM_ROWS`, each fire reading the next of
 //!   `engine::rates::weights_at` weight planes (past the last-level cache),
 //!   for `gemm_tflops_by_rows`;
-//! - each of its vector matmul kernels (by the rows a workgroup carries) at
-//!   each of [`VECTOR_ROWS_TIMED`] over the widest plane, for
-//!   `vector_tflops_by_rows`, and each tiled kernel at each of [`TILE_ROWS`],
-//!   for `tile_tflops_by_rows`;
 //! - its prefill attention at `engine::rates::ATTN_SHAPE`'s heads over each
 //!   of `engine::rates::ATTN_KEYS` keys at head width 128 (64 and 256 at the
 //!   longest keys, said beside it), through the kernel a served fire selects
@@ -31,6 +27,12 @@
 //!   one before's output) against one matmul of the chain's rows, at each
 //!   length of `engine::rates::LAUNCH_CHAINS`, for what a dispatch adds to
 //!   its work (`engine::rates::launch_from`).
+//!
+//! Once a model's shapes are known, each dense kernel the slang backends
+//! choose between at each of its planes, at each power of two of rows to
+//! the load's most (`kernel_rows`), for `kernel_tflops_by_shape`
+//! ([`shapes_at_load`]): what a rung's dense kernel is chosen by, the
+//! kernels' occupancy at the model's own planes in their time.
 //!
 //! Every float operand a rate reads holds `engine::rates::operand_pattern`
 //! repeated (outputs, index tables and the scan's gates as laid), as every
@@ -182,26 +184,27 @@ fn tdr_value(name: &str) -> Option<u32> {
 
 /// The `[rates]` keys the slang backends' estimate weighs a fire by (of
 /// `profile::fire::KEYS`): what a load whose profile lacks one measures.
-/// `vector_tflops_by_rows` and `tile_tflops_by_rows` are each vector and
-/// tiled matmul kernel's rate by rows, which the dense matmul's kernel is
-/// chosen by (`crate::dense`). `few_row_tflops` and `workgroups_per_core`
-/// are not weighed here: no choice on these backends reads them, so a load
-/// measures neither.
-pub const KEYS: [&str; 8] = [
+/// `few_row_tflops` and `workgroups_per_core` are not weighed here: no
+/// choice on these backends reads them, so a load measures neither. The
+/// dense kernels' curves at the model's planes, which a rung's dense kernel
+/// is chosen by, are timed once the model's shapes are known
+/// ([`shapes_at_load`]).
+pub const KEYS: [&str; 6] = [
     "launch_ns",
     "gemm_tflops_by_rows",
     "attn_tflops_by_keys",
     "hbm_gbps",
     "elementwise_gbps",
     "scan_gelems",
-    "tile_tflops_by_rows",
-    "vector_tflops_by_rows",
 ];
 
 /// The `[rates]` keys a load measures where its profile lacks one: the
-/// estimate's [`KEYS`], and where the platform states a bound on one
+/// estimate's [`KEYS`]; where the platform states a bound on one
 /// submission (`max_submit`) the margin a serving step is held to it at
-/// (`profile::fire::SUBMIT_WORST_RATIO`, `crate::submit`).
+/// (`profile::fire::SUBMIT_WORST_RATIO`, `crate::submit`); and the
+/// workgroups the device holds at once, which a guest step's grid strides
+/// over and, where the device states no count of its compute units, what
+/// sizes a fire's work to it (`profile::fire::RESIDENT_WORKGROUPS`).
 #[must_use]
 pub fn keys_at(max_submit: Option<std::time::Duration>) -> Vec<&'static str> {
     let mut keys = KEYS.to_vec();
@@ -209,6 +212,7 @@ pub fn keys_at(max_submit: Option<std::time::Duration>) -> Vec<&'static str> {
         keys.push(profile::fire::SUBMIT_WORST_RATIO);
         keys.push(profile::fire::ATTN_BY_ROWS_KEYS);
     }
+    keys.push(profile::fire::RESIDENT_WORKGROUPS);
     keys
 }
 
@@ -217,16 +221,175 @@ pub fn keys_at(max_submit: Option<std::time::Duration>) -> Vec<&'static str> {
 /// slang load on a bound-stating device lays its top at (wgpu's 512, native
 /// Vulkan's 1024, and the narrower a phone's room leaves).
 pub const PREFIX_ROWS: [u32; 4] = [128, 256, 512, 1024];
-/// The rows each tiled kernel is timed at for `tile_tflops_by_rows`: from a
-/// decode's few to the matmul curve's first.
-const TILE_ROWS: [u32; 9] = [1, 2, 4, 8, 16, 32, 64, 128, 256];
 
-/// The rows each vector kernel is timed at for `vector_tflops_by_rows`: a
-/// decode's one to the matmul curve's first.
-const VECTOR_ROWS_TIMED: [u32; 9] = [1, 2, 4, 8, 16, 32, 64, 128, 256];
+/// The rows a load's rungs lie at: every power of two from one row to
+/// `top`, then `top`, the most rows a fire of the load may bring.
+fn kernel_rows(top: u32) -> Vec<u32> {
+    let top = top.max(1);
+    let mut rows = engine::memory::rungs(1, top);
+    if rows.last() != Some(&top) {
+        rows.push(top);
+    }
+    rows
+}
+
+/// The rows each dense kernel is timed at at a shape
+/// (`profile::fire::Rates::kernel_tflops_by_shape`): every power of four
+/// from one row to `top`, then `top`, so no kernel is weighed past the rows
+/// it was timed at; a rung between two is read between them, in log rows
+/// (`crate::dense`).
+fn timed_rows(top: u32) -> Vec<u32> {
+    let top = top.max(1);
+    let mut rows: Vec<u32> = std::iter::successors(Some(1u32), |&r| r.checked_mul(4))
+        .take_while(|&r| r < top)
+        .collect();
+    rows.push(top);
+    rows
+}
+
+/// The dense kernels a slang load chooses between at `tier` for fires of up
+/// to `top` rows (`crate::dense`): each vector kernel, and each tiled kernel
+/// the profile's path takes at some of those rows (a device whose path takes
+/// the 32x32 tile below some rows and the cooperative-matrix tile above
+/// chooses among both).
+#[must_use]
+pub fn dense_kernels<T: Tactics + ?Sized>(
+    target: kernels_slang::Target,
+    tactics: &T,
+    tier: kernels_slang::Tier,
+    top: u32,
+) -> Vec<kernels_slang::linear::gemm::Tactic> {
+    let mut all: Vec<kernels_slang::linear::gemm::Tactic> =
+        kernels_slang::linear::gemm::VECTOR_ROWS
+            .iter()
+            .map(|&rows| kernels_slang::linear::gemm::Tactic {
+                vector: rows,
+                ..tactics.gemm(tier, 1)
+            })
+            .collect();
+    for m in kernel_rows(top) {
+        for tactic in crate::dense::tiled_kernels(target, tactics.gemm(tier, m)) {
+            if !all.contains(&tactic) {
+                all.push(tactic);
+            }
+        }
+    }
+    all
+}
+
+/// The curve `tactic`'s kernel at an `n x k` plane is measured and read as
+/// (`profile::fire::KernelCurve`'s kind and key): a vector kernel by the rows
+/// a workgroup carries, a tiled one by its row tile at the plane.
+#[must_use]
+pub fn curve_key(
+    target: kernels_slang::Target,
+    tactic: kernels_slang::linear::gemm::Tactic,
+    n: u32,
+    k: u32,
+) -> (u32, u32) {
+    if tactic.vector > 0 {
+        (profile::fire::KernelCurve::VECTOR, tactic.vector)
+    } else {
+        let tile = kernels_slang::linear::gemm::tile_for(target, tactic, n, k).row_tile();
+        (profile::fire::KernelCurve::TILE, tile.max(1))
+    }
+}
+
+/// Of `kernels` at each of `shapes` (`(n, k)`), those whose curve `stated`
+/// does not serve to `top` rows (`profile::fire::KernelCurve::serves`): what
+/// a load measures once its model's shapes are known ([`measure_shapes`]).
+/// Two kernels read as one curve at a shape are measured once.
+#[must_use]
+pub fn lacking(
+    target: kernels_slang::Target,
+    kernels: &[kernels_slang::linear::gemm::Tactic],
+    stated: &Rates,
+    shapes: &[(u32, u32)],
+    top: u32,
+) -> Vec<(kernels_slang::linear::gemm::Tactic, u32, u32)> {
+    let mut out: Vec<(kernels_slang::linear::gemm::Tactic, u32, u32)> = Vec::new();
+    let mut seen: Vec<(u32, u32, u32, u32)> = Vec::new();
+    for &(n, k) in shapes {
+        for &tactic in kernels {
+            let (kind, key) = curve_key(target, tactic, n, k);
+            let id = (kind, key, n, k);
+            if seen.contains(&id) {
+                continue;
+            }
+            seen.push(id);
+            let served = stated
+                .kernel_tflops_by_shape
+                .iter()
+                .flatten()
+                .any(|c| c.id() == id && c.serves(top));
+            if !served {
+                out.push((tactic, n, k));
+            }
+        }
+    }
+    out
+}
+
+/// The weight planes a kernel's curve at an `n x k` plane rotates through:
+/// `engine::rates::weights_at`'s (past the last-level cache), but one where
+/// the plane alone passes every last-level cache served (a third of
+/// `engine::rates::WEIGHT_BYTES`): read cold every fire by itself, as an
+/// output head is. Never more than the model's weights hold of the plane
+/// (`model`, its weight bytes, where stated): a served fire's plane is read
+/// again after every other weight the model reads, so a model whose
+/// weights sit in a cache reads its planes warm in serving too (the
+/// rotation past the cache would lay millions of a 1 x 64 plane).
+fn shape_planes(n: u32, k: u32, model: Option<u64>) -> usize {
+    let plane = 2 * n as usize * k as usize;
+    let planes = if plane > engine::rates::WEIGHT_BYTES / 3 {
+        1
+    } else {
+        weights_at(n, k)
+    };
+    model.map_or(planes, |bytes| {
+        let held = usize::try_from(bytes.div_ceil(plane.max(1) as u64)).unwrap_or(usize::MAX);
+        planes.min(held.max(1))
+    })
+}
+
+/// Whether a rates matmul at `m x n x k` may be laid: no operand past the
+/// device's `largest` buffer, and the set (its activation, the weight planes
+/// it rotates through, [`shape_planes`]; its result; bf16) within the room
+/// the load admitted the rates step to lay (`engine::rates::step_bytes`).
+fn operands_fit(m: u32, n: u32, k: u32, model: Option<u64>, largest: u64) -> bool {
+    let (m64, n64, k64) = (u64::from(m), u64::from(n), u64::from(k));
+    let (act, plane, y) = (2 * m64 * k64, 2 * n64 * k64, 2 * m64 * n64);
+    let set = act + shape_planes(n, k, model) as u64 * plane + y;
+    act.max(plane).max(y) <= largest && set <= engine::rates::step_bytes()
+}
+
+/// The timings a point of a kernel's curve at a shape takes, interleaved
+/// with the other kernels' at the shape: its median the point, their spread
+/// what a choice between two kernels may call a difference.
+pub(crate) const REPEATS: usize = 3;
+
+/// The median of `samples` and their spread, `(max - min) / median`.
+pub(crate) fn median_spread(samples: &[f64]) -> (f64, f64) {
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let median = sorted[sorted.len() / 2];
+    let spread = (sorted[sorted.len() - 1] - sorted[0]) / median.max(f64::MIN_POSITIVE);
+    (median, spread)
+}
+
+/// The device time a point of a kernel's curve at a shape fills with its
+/// fires' frame (`Rig::budgeted`), timed by the device's timestamps where it
+/// has them (the host's wait, to 2.4 ms a frame on wgpu, then out of it):
+/// enough fires that the dispatches' own spread averages out, few enough
+/// that a curve's points take milliseconds each.
+const POINT_NS: f64 = 4e6;
 
 /// The matmul a launch is timed with: its work is nothing beside a launch.
 pub const LAUNCH: u32 = 16;
+
+/// The offset every view a rates step binds into a shared buffer starts at
+/// a multiple of: every backend's storage-binding alignment at most.
+const VIEW_ALIGN: u64 = 256;
 
 /// Timed frames of each kind; the median is kept.
 pub const ROUNDS: usize = 5;
@@ -376,7 +539,11 @@ struct Rig<'a, B: Serve> {
     /// ([`crate::submit::Probe`]), the clock it read (its curve time the
     /// probe's first time: the clock every measurement is kept at), and
     /// the probe's first measurement.
-    probe: Option<(crate::submit::Probe<B>, std::cell::Cell<crate::submit::Clock>, Fired)>,
+    probe: Option<(
+        crate::submit::Probe<B>,
+        std::cell::Cell<crate::submit::Clock>,
+        Fired,
+    )>,
     /// The device was re-timed since the last frame landed.
     retimed: std::cell::Cell<bool>,
     /// How frames are admitted under `max_submit`
@@ -385,6 +552,9 @@ struct Rig<'a, B: Serve> {
     /// carried up from a frame of no more fires (one carried down holds the
     /// frame's own submit, and only overestimates).
     admission: std::cell::Cell<engine::rates::Admission>,
+    /// The admission's worst ratio held where the caller gave it
+    /// ([`measure_shapes`]'s `worst`): no landing moves it.
+    worst_held: std::cell::Cell<bool>,
     /// The step whose fire, at one a frame, was past the bound: refused by
     /// name, and the step drops that shape ([`dropped`]).
     past_bound: std::cell::RefCell<Option<String>>,
@@ -393,6 +563,14 @@ struct Rig<'a, B: Serve> {
     /// fire, which a settled frame's admission carries as its least worst
     /// ratio (the Adreno 840 swung ~10% inside one settled step).
     swing: std::cell::Cell<f64>,
+    /// The current step's fire's bytes of a frame's parameter region and
+    /// the region's bytes, as its first frame took them, where the backend
+    /// bounds that region ([`crate::backend::Frame::uniform_room`]): a frame
+    /// of the step holds no more fires than fit it.
+    uniforms: std::cell::Cell<Option<(u64, u64)>>,
+    /// Whether the backend bounds a frame's parameter region (the first
+    /// frame says).
+    bounds_uniforms: std::cell::Cell<bool>,
     /// Each fire of a frame its own submission, queued behind the one before
     /// and the queue timed whole by the host's clock: so where the device
     /// states a bound on one submission (but for the launch's chain, whose
@@ -410,9 +588,61 @@ struct Rig<'a, B: Serve> {
     /// fire's frame ran 0.3 to 2.4 ms on an RTX under wgpu) and the
     /// estimate's scaling between shapes, not the device.
     drift: std::cell::Cell<f64>,
+    /// Every kernel the rig's frames fired since [`Rig::take_fired`] last
+    /// took them: what a measurement's stored key names
+    /// (`crate::stored`).
+    fired: std::cell::RefCell<std::collections::BTreeSet<crate::naming::Kernel>>,
+}
+
+/// A sink that fires through `inner` and keeps each kernel it fires: a
+/// measurement's kernels, as it fired them.
+struct Recording<'s, 'c> {
+    inner: &'s kernels_slang::Ctx<'c>,
+    fired: &'s std::cell::RefCell<std::collections::BTreeSet<crate::naming::Kernel>>,
+}
+
+impl kernels_slang::Encode for Recording<'_, '_> {
+    fn fire(
+        &self,
+        fire: kernels_slang::Fire,
+        args: &[kernels_slang::ArgValue],
+    ) -> std::result::Result<(), kernels_slang::Error> {
+        self.fired
+            .borrow_mut()
+            .insert(crate::naming::Kernel::of(fire)?);
+        self.inner.fire(fire, args)
+    }
+
+    fn absent(&self) -> std::result::Result<kernels_slang::ArgValue, kernels_slang::Error> {
+        self.inner.absent()
+    }
+
+    fn target(&self) -> kernels_slang::Target {
+        self.inner.target()
+    }
+
+    fn comm(
+        &self,
+        op: &'static str,
+    ) -> std::result::Result<kernels_slang::Comm, kernels_slang::Error> {
+        self.inner.comm(op)
+    }
+
+    fn rendezvous(&self, op: &'static str) -> std::result::Result<(), kernels_slang::Error> {
+        self.inner.rendezvous(op)
+    }
+
+    fn naming(&self) -> Option<&dyn kernels_slang::Naming> {
+        self.inner.naming()
+    }
 }
 
 impl<'a, B: Serve> Rig<'a, B> {
+    /// The kernels fired since the last take.
+    fn take_fired(&self) -> std::collections::BTreeSet<crate::naming::Kernel> {
+        std::mem::take(&mut *self.fired.borrow_mut())
+    }
+
     fn new(device: &'a B::Context, max_submit: Option<std::time::Duration>) -> Self {
         Rig {
             device,
@@ -430,10 +660,14 @@ impl<'a, B: Serve> Rig<'a, B> {
             probe: None,
             retimed: std::cell::Cell::new(false),
             admission: std::cell::Cell::new(engine::rates::Admission::new(max_submit)),
+            worst_held: std::cell::Cell::new(false),
             past_bound: std::cell::RefCell::new(None),
             swing: std::cell::Cell::new(1.0),
+            uniforms: std::cell::Cell::new(None),
+            bounds_uniforms: std::cell::Cell::new(true),
             queue: std::cell::Cell::new(max_submit.is_some()),
             drift: std::cell::Cell::new(1.0),
+            fired: std::cell::RefCell::new(std::collections::BTreeSet::new()),
         }
     }
 
@@ -447,6 +681,7 @@ impl<'a, B: Serve> Rig<'a, B> {
             .set(grown(&self.measured.borrow(), probe, work));
         self.basis.set(u32::MAX);
         self.work.set(Some(work));
+        self.uniforms.set(None);
     }
 
     /// The frames from here go on with the same fire under the name `step`,
@@ -485,7 +720,9 @@ impl<'a, B: Serve> Rig<'a, B> {
     /// The clock's ratio now: the last probe's time over its first (1 with
     /// no bound stated).
     fn ratio(&self) -> f64 {
-        self.probe.as_ref().map_or(1.0, |(_, clock, _)| clock.get().ratio)
+        self.probe
+            .as_ref()
+            .map_or(1.0, |(_, clock, _)| clock.get().ratio)
     }
 
     /// The current step's fire's estimate now, ns: at the clock's ratio.
@@ -537,6 +774,19 @@ impl<'a, B: Serve> Rig<'a, B> {
         Ok(())
     }
 
+    /// The most fires of the current step a frame's parameter region holds:
+    /// one until a frame of the step has said what a fire takes of it, none
+    /// past it where the backend bounds no such region.
+    fn uniform_fires(&self) -> u32 {
+        if !self.bounds_uniforms.get() {
+            return u32::MAX;
+        }
+        match self.uniforms.get() {
+            Some((per, room)) => u32::try_from(room / per.max(1)).unwrap_or(u32::MAX).max(1),
+            None => 1,
+        }
+    }
+
     /// The bound one frame is admitted under: `max_submit` over the worst
     /// ratio of a settled frame's time to its estimate seen so far.
     fn admitting(&self) -> Option<std::time::Duration> {
@@ -558,7 +808,7 @@ impl<'a, B: Serve> Rig<'a, B> {
                 Err(self.refuse(per_fire, 1))
             };
         }
-        a.fires(count, per_fire)
+        a.fires(count.min(self.uniform_fires()), per_fire)
             .ok_or_else(|| self.refuse(per_fire, 1))
     }
 
@@ -619,6 +869,72 @@ impl<'a, B: Serve> Rig<'a, B> {
         let handle = self.handles.bind(&buf, 0, buf.bytes())?;
         self.held.push(buf);
         Ok(Tensor::new(handle, rows, width, dtype))
+    }
+
+    /// `bytes` laid over as few buffers as the device's largest holds,
+    /// each a whole number of `stride`s, held: filled with
+    /// `engine::rates::operand_pattern` where `filled`, else zeroed.
+    fn slab(&mut self, bytes: u64, stride: u64, filled: bool) -> Result<Vec<B::Buffer>> {
+        let largest = (self.device.max_buffer() / stride).max(1) * stride;
+        let mut out = Vec::new();
+        let mut left = bytes.max(stride);
+        while left > 0 {
+            let size = left.min(largest);
+            let mut buf = B::Buffer::zeroed(self.device, size, crate::books::owners::TUNING)?;
+            if filled {
+                let pattern = self
+                    .pattern
+                    .get_or_insert_with(engine::rates::operand_pattern);
+                let mut at = 0u64;
+                while at < size {
+                    let n = (pattern.len() as u64).min(size - at);
+                    buf.write(at, &pattern[..n as usize])?;
+                    at += n;
+                }
+            }
+            self.held.push(buf.clone());
+            out.push(buf);
+            left -= size;
+        }
+        Ok(out)
+    }
+
+    /// Up to `count` views of `rows x width` of `dtype` into `bufs`, one a
+    /// stride of [`VIEW_ALIGN`]-aligned bytes, bound: as a served fire reads
+    /// its weights from views into a few large segments, not from buffers
+    /// of their own. As many as the buffers hold, one at least.
+    fn views(
+        &mut self,
+        bufs: &[B::Buffer],
+        count: usize,
+        rows: u32,
+        width: u32,
+        dtype: Dtype,
+    ) -> Result<Vec<Tensor>> {
+        let bytes = (u64::from(rows) * u64::from(width) * dtype.bits())
+            .div_ceil(8)
+            .max(4);
+        let stride = bytes.next_multiple_of(VIEW_ALIGN);
+        let mut out = Vec::with_capacity(count);
+        'bufs: for buf in bufs {
+            let mut at = 0u64;
+            while at + bytes <= buf.bytes() {
+                if out.len() == count {
+                    break 'bufs;
+                }
+                let handle = self.handles.bind(buf, at, bytes)?;
+                out.push(Tensor::new(handle, rows, width, dtype));
+                at += stride;
+            }
+        }
+        if out.is_empty() {
+            return Err(Fault::Ceiling {
+                what: "bytes of a rates operand's views",
+                need: bytes,
+                have: bufs.iter().map(|b| b.bytes()).max().unwrap_or(0),
+            });
+        }
+        Ok(out)
     }
 
     /// A zeroed buffer of `rows x width` of `dtype`, bound.
@@ -700,14 +1016,20 @@ impl<'a, B: Serve> Rig<'a, B> {
                 let f = self.device.frame()?;
                 {
                     let sink = B::sink(self.device, &f, &self.pipelines, &self.handles);
-                    fire(&sink)?;
+                    fire(&Recording {
+                        inner: &sink,
+                        fired: &self.fired,
+                    })?;
                 }
                 pending.push_back(crate::backend::Frame::commit_async(f, None)?);
             }
-            let mut f = self.device.frame()?;
+            let mut f = self.device.spanned()?;
             {
                 let sink = B::sink(self.device, &f, &self.pipelines, &self.handles);
-                fire(&sink)?;
+                fire(&Recording {
+                    inner: &sink,
+                    fired: &self.fired,
+                })?;
             }
             then(&mut f)?;
             timer(f)?;
@@ -716,26 +1038,56 @@ impl<'a, B: Serve> Rig<'a, B> {
             }
             (None, started.elapsed().as_nanos() as u64)
         } else {
-            let mut f = self.device.frame()?;
+            // A frame holds no more fires than its parameter region does
+            // (`Rig::fitting` sizes frames so): one past it would not enqueue.
+            if self.uniforms.get().is_some() && count > self.uniform_fires() {
+                return Err(Fault::Device {
+                    call: "rates",
+                    why: format!(
+                        "{step}: a frame of {count} fires passes the {} its parameter region holds",
+                        self.uniform_fires()
+                    ),
+                });
+            }
+            // Spanned: the device's two timestamps around the frame's work,
+            // none between its dispatches (a timestamp a dispatch serialises
+            // a tiler's work and ran a phone's one-row fires ~10x long).
+            let mut f = self.device.spanned()?;
             {
                 let sink = B::sink(self.device, &f, &self.pipelines, &self.handles);
+                let sink = Recording {
+                    inner: &sink,
+                    fired: &self.fired,
+                };
                 for _ in 0..count {
                     fire(&sink)?;
                 }
+            }
+            match crate::backend::Frame::uniform_room(&f) {
+                Some((taken, room)) => {
+                    let per = taken.div_ceil(u64::from(count.max(1)));
+                    let held = self.uniforms.get().map_or(0, |(p, _)| p);
+                    self.uniforms.set(Some((per.max(held), room)));
+                }
+                None => self.bounds_uniforms.set(false),
             }
             then(&mut f)?;
             timer(f)?
         };
         let took = timed.0.unwrap_or(timed.1) as f64;
-        let mut admission = self.admission.get();
-        admission.landed(estimate, took, count >= self.basis.get());
-        self.admission.set(admission);
+        if !self.worst_held.get() {
+            let mut admission = self.admission.get();
+            admission.landed(estimate, took, count >= self.basis.get());
+            self.admission.set(admission);
+        }
         // Kept at the clock the first probe read.
         let per_fire = took / f64::from(count.max(1)) / ratio;
         self.per_fire.set(Some(per_fire));
         self.basis.set(count);
         if let Some(work) = self.work.get() {
-            self.measured.borrow_mut().push(Fired { work, ns: per_fire });
+            self.measured
+                .borrow_mut()
+                .push(Fired { work, ns: per_fire });
         }
         tracing::debug!(
             step = %step,
@@ -754,6 +1106,64 @@ impl<'a, B: Serve> Rig<'a, B> {
     /// rate stops moving (`engine::rates::warmed_frames`, every engine's
     /// rule; the device's `max_submit` the only cap), the host's clock around
     /// each frame's one submit.
+    /// The current step's fire's ns at a point of a kernel's curve at a
+    /// shape (`measure_shapes`): its sets touched once (`touched`, shared by
+    /// every point over them), one warm fire, one fire timed, then one frame
+    /// of as many fires as the step's estimate says fill [`POINT_NS`] of the
+    /// device (as many as fit the bound), the fire's time the two frames'
+    /// difference over the fires between (the device's span where the
+    /// backend times one, else the host's clock). A point takes
+    /// [`REPEATS`] of these, interleaved with the other kernels' at its shape
+    /// (`measure_shapes`).
+    fn budgeted(
+        &self,
+        timer: Timer<'_, B>,
+        touched: &Touched,
+        sets: usize,
+        fire: &dyn Fn(&kernels_slang::Ctx<'_>) -> Result<()>,
+    ) -> Result<u64> {
+        let nothing = |_: &mut B::Frame| Ok(());
+        let fitted = |n: u32| -> Result<f64> {
+            let m = self.fitting(n)?;
+            self.frame(timer, m, fire, &nothing)
+                .map(|(_, w)| w as f64 * f64::from(n) / f64::from(m))
+        };
+        engine::rates::touch_once(
+            touched,
+            self.admitting(),
+            u32::try_from(sets).unwrap_or(u32::MAX),
+            &mut |n| fitted(n),
+        )?;
+        // A fire past the point's budget alone (an output head's at hundreds
+        // of rows: a second a fire on a phone) is its own point: no warming
+        // frame before it and no frame of more fires after it, whose one
+        // frame's fixed cost it dwarfs.
+        let long = |ns: Option<f64>| ns.is_some_and(|ns| ns >= POINT_NS);
+        if !long(self.per_fire_now()) {
+            self.fitting(1)?;
+            self.frame(timer, 1, fire, &nothing)?;
+        }
+        // Each frame twice, the faster kept, by the device's span where the
+        // backend times one, else the host's clock (whose wait only ever adds
+        // to a frame's: it ran 0.3 to 2.4 ms on wgpu).
+        let timed = |count: u32| -> Result<u64> {
+            let (span, host) = self.frame(timer, count, fire, &nothing)?;
+            Ok(span.unwrap_or(host))
+        };
+        let one = timed(1)?;
+        if long(self.per_fire_now()) {
+            return Ok(one.max(1));
+        }
+        let estimate = self.per_fire_now().unwrap_or(POINT_NS).max(1.0);
+        let wanted = (POINT_NS / estimate).ceil().clamp(2.0, f64::from(u32::MAX)) as u32;
+        let count = self.fitting(wanted)?;
+        if count < 2 {
+            return Ok(one.max(1));
+        }
+        let many = timed(count)?;
+        Ok((many.saturating_sub(one) / u64::from(count - 1)).max(1))
+    }
+
     fn each(
         &self,
         timer: Timer<'_, B>,
@@ -809,6 +1219,26 @@ impl<'a, B: Serve> Rig<'a, B> {
     }
 }
 
+/// The call a rate's reading names where it is impossible: a frame timed
+/// below its own dispatches' measured launches ([`engine::rates::rate_from`]).
+/// No measurement, and no fault of the device: the sample is repeated
+/// ([`repeated`]), and where every repeat is so, a curve's point is left
+/// unmeasured ([`dropped`]) and a single rate refused by name.
+const IMPLAUSIBLE: &str = "rates: a reading below its launches";
+
+/// `measure` repeated while its reading is impossible ([`IMPLAUSIBLE`]): the
+/// same sample, up to [`REPEATS`] times; the last reading kept.
+fn repeated<T>(mut measure: impl FnMut() -> Result<T>) -> Result<T> {
+    let mut last = measure();
+    for _ in 1..REPEATS {
+        match &last {
+            Err(Fault::Device { call, .. }) if *call == IMPLAUSIBLE => last = measure(),
+            _ => break,
+        }
+    }
+    last
+}
+
 /// `measured` where its step measured; `None` where a single fire of its
 /// shape was past the device's bound on one submission: that frame was
 /// refused by name (never submitted), and the step drops the shape, as the
@@ -820,6 +1250,11 @@ fn dropped<B: Serve, T>(
 ) -> Result<Option<T>> {
     match measured {
         Ok(v) => Ok(Some(v)),
+        Err(Fault::Device { call, why }) if call == IMPLAUSIBLE => {
+            tracing::info!(why = %why, "rates: every repeat of a point read below its launches; the point is left unmeasured");
+            say(&format!("[rates]: unmeasured ({why}, every repeat)"));
+            Ok(None)
+        }
         Err(e) => match rig.past_bound.borrow_mut().take() {
             Some(step) => {
                 tracing::debug!(step = %step, why = %e, "dropped: past the bound");
@@ -834,6 +1269,652 @@ fn dropped<B: Serve, T>(
 fn median(mut v: Vec<u64>) -> u64 {
     v.sort_unstable();
     v[v.len() / 2].max(1)
+}
+
+/// Each of `kernels` timed at `rows` of one `n x k` plane, [`REPEATS`]
+/// rounds interleaved (each kernel's fire in turn): every fire's time, ns, a
+/// kernel, carried to the whole plane. Each fire is a submission of its own
+/// over `n / pieces[i]` of the plane's columns (the pieces the caller cut
+/// so each fits the device's bound on one submission at its least clock),
+/// reading the next plane of a rotation past the last-level cache and
+/// writing one output, as a curve's point does. A piece the rig's own
+/// admission still refuses is halved until admitted; a sample read below
+/// its launches, or refused at every piece, is left out. What a dense
+/// settle weighs a range by where it times no whole served step.
+#[allow(clippy::too_many_arguments)]
+pub fn time_kernels<B: Serve, T: Tactics + ?Sized>(
+    device: &B::Context,
+    tactics: &T,
+    tier: kernels_slang::Tier,
+    timer: Timer<'_, B>,
+    max_submit: Option<std::time::Duration>,
+    launch: f64,
+    kernels: &[kernels_slang::linear::gemm::Tactic],
+    pieces: &[u32],
+    (n, k): (u32, u32),
+    rows: u32,
+) -> Result<Vec<Vec<f64>>> {
+    let mut rig = Rig::<B>::new(device, max_submit);
+    rig.lay_probe(tactics.gemm(tier, crate::submit::PROBE.0))?;
+    let largest = rig.device.max_buffer();
+    if !operands_fit(rows, n, k, None, largest) {
+        return Ok(vec![Vec::new(); kernels.len()]);
+    }
+    let act = rig.operand(rows, k, Dtype::Bf16)?;
+    let planes = shape_planes(n, k, None);
+    let plane = (2 * u64::from(n) * u64::from(k)).next_multiple_of(VIEW_ALIGN);
+    let slab = rig.slab(planes as u64 * plane, plane, true)?;
+    let weights = rig.views(&slab, planes, n, k, Dtype::Bf16)?;
+    let y = (2 * u64::from(rows) * u64::from(n)).next_multiple_of(VIEW_ALIGN);
+    let ys = rig.slab(y, y, false)?;
+    let nothing = |_: &mut B::Frame| Ok(());
+    let mut samples: Vec<Vec<f64>> = vec![Vec::new(); kernels.len()];
+    let mut split: Vec<u32> = pieces.iter().map(|&p| p.max(1)).collect();
+    split.resize(kernels.len(), 1);
+    let mut next = 0usize;
+    // Under a bound, each kernel's pieces from its own narrowest one: one
+    // fire over 64 of the plane's columns timed first, its device time
+    // carried by the columns, the pieces as wide as that keeps within the
+    // bound (no estimate grown from another kernel's fires stands for it).
+    // A kernel whose narrowest piece passes the bound is not weighed.
+    let mut skipped = vec![false; kernels.len()];
+    if let Some(bound) = max_submit {
+        let bound = bound.as_nanos() as f64;
+        for (i, &tactic) in kernels.iter().enumerate() {
+            let cols = 64u32.min(n);
+            let w = Tensor {
+                rows: cols,
+                ..weights[0]
+            };
+            let out = rig.views(&ys, 1, rows, cols, Dtype::Bf16)?[0];
+            let a = Tensor { rows, ..act };
+            rig.step(
+                format!("matmul {rows}x{cols}x{k}"),
+                Work::matmul(rows, cols, k),
+            );
+            let fire = |sink: &kernels_slang::Ctx<'_>| {
+                kernels_slang::linear::gemm::matmul(sink, tactic, a, w, out)
+                    .map_err(fault("rates: matmul"))
+            };
+            let timed = rig.frame(timer, 1, &fire, &nothing);
+            rig.past_bound.borrow_mut().take();
+            let Ok((span, host)) = timed else {
+                skipped[i] = true;
+                continue;
+            };
+            let narrow = span.unwrap_or(host) as f64;
+            if narrow > bound {
+                skipped[i] = true;
+                continue;
+            }
+            let per_piece = (bound / narrow).floor().max(1.0) * f64::from(cols);
+            let fit = (f64::from(n) / per_piece).ceil() as u32;
+            split[i] = split[i].max(fit.max(1));
+        }
+    }
+    for _ in 0..REPEATS {
+        for (i, &tactic) in kernels.iter().enumerate() {
+            if skipped[i] {
+                continue;
+            }
+            loop {
+                let cols = n.div_ceil(split[i]).next_multiple_of(64).min(n);
+                let w = Tensor {
+                    rows: cols,
+                    ..weights[next % weights.len()]
+                };
+                let out = rig.views(&ys, 1, rows, cols, Dtype::Bf16)?[0];
+                let a = Tensor { rows, ..act };
+                rig.step(
+                    format!("matmul {rows}x{cols}x{k}"),
+                    Work::matmul(rows, cols, k),
+                );
+                // One fire, one submission.
+                let fire = |sink: &kernels_slang::Ctx<'_>| {
+                    kernels_slang::linear::gemm::matmul(sink, tactic, a, w, out)
+                        .map_err(fault("rates: matmul"))
+                };
+                let timed = rig.frame(timer, 1, &fire, &nothing);
+                let past_bound = rig.past_bound.borrow_mut().take().is_some();
+                match timed {
+                    Ok((span, host)) => {
+                        next += 1;
+                        let ns = span.unwrap_or(host) as f64;
+                        if let Ok(rate) = engine::rates::rate_from(
+                            "matmul",
+                            ns,
+                            engine::rates::GEMM_DISPATCHES,
+                            launch,
+                            gemm_flops(rows, cols, k),
+                        ) {
+                            let ns = gemm_flops(rows, cols, k) / rate;
+                            samples[i].push(ns * f64::from(n) / f64::from(cols) + launch);
+                        }
+                        break;
+                    }
+                    Err(_) if past_bound && cols > 64 => split[i] *= 2,
+                    Err(e) if !past_bound => {
+                        if !matches!(&e, Fault::Ceiling { .. }) {
+                            return Err(e);
+                        }
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+        }
+    }
+    Ok(samples)
+}
+
+/// The version of [`measure_shapes`]' method (each dense kernel's curve's
+/// stored key, `profile::fire::KernelCurve::by`): bumped only when how a
+/// curve is measured changes.
+pub const CURVE_METHOD: u32 = 1;
+
+/// Each of `wanted` (`(kernel, n, k)`, [`lacking`]) timed at the load's
+/// rows to `top` (`profile::fire::Rates::kernel_tflops_by_shape`): a matmul
+/// of each row count over an `n x k` plane, each fire reading the next plane
+/// past the last-level cache, its flops over its time, every weight pass it
+/// makes in it. Each fire is admitted by the rig's estimate (grown from the
+/// fires it measured, the probe's first under a stated bound, as every
+/// rate's fire is), and a curve stops where the device's bound on one
+/// submission refuses a point or its operands would not fit
+/// (`curve_of`); where and why is recorded with it, so no load times it
+/// again. `stated` holds the device's rates, the launch and the bandwidth
+/// among them (a load measures these first, `engine::rates::rates_at_load`).
+///
+/// `model` states the model's weight bytes: no curve rotates through more
+/// of a plane than they hold ([`shape_planes`]); `None` rotates past the
+/// cache.
+///
+/// `worst` holds the admission's worst ratio of a fire's time to its
+/// estimate where given (a test pins it so a point's admission does not
+/// follow the box's clock); a load passes `None`, the ratio its fires
+/// measure as they land.
+pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
+    device: &B::Context,
+    tactics: &T,
+    tier: kernels_slang::Tier,
+    timer: Timer<'_, B>,
+    max_submit: Option<std::time::Duration>,
+    worst: Option<f64>,
+    stated: &Rates,
+    wanted: &[(kernels_slang::linear::gemm::Tactic, u32, u32)],
+    model: Option<u64>,
+    top: u32,
+    say: &mut dyn FnMut(&str),
+) -> Result<Vec<profile::fire::KernelCurve>> {
+    if wanted.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(launch_ns) = stated.launch_ns else {
+        return Err(Fault::Device {
+            call: "rates",
+            why: "the kernels' curves at the model's shapes are timed on the device's launch, \
+                  which the profile does not state"
+                .to_owned(),
+        });
+    };
+    let launch = launch_ns as f64;
+    let mut rig = Rig::<B>::new(device, max_submit);
+    // Under a stated bound, the probe first: every estimate grows from it.
+    rig.lay_probe(tactics.gemm(tier, crate::submit::PROBE.0))?;
+    // The clock warmed by the warm-up's cube where one fits the bound at the
+    // worst ratio measured; where none does, the curves are timed unwarmed,
+    // each point admitted by its own estimate (one past the bound stops its
+    // curve, `KernelCurve::BOUND`): a sizing never fails the load.
+    match warm(&mut rig, &|rows| tactics.gemm(tier, rows), timer) {
+        Ok((side, warmed, _)) => say(&format!(
+            "[rates]: warm-up: {} rotations of the {side}^3 matmul, settled at {:.1} TFLOP/s",
+            warmed.rotations,
+            warmed.rate / 1e3
+        )),
+        Err(why) if max_submit.is_some() => {
+            rig.past_bound.borrow_mut().take();
+            rig.release();
+            // The clock warmed on the probe instead (one small matmul the
+            // bound admitted as the step began), fired until its time
+            // settles; the curves timed unwarmed only where there is none.
+            let warmed = match rig.probe.as_ref() {
+                Some((probe, _, _)) => {
+                    let device = rig.device;
+                    let settled = engine::rates::settle(|_| probe.fire(device).map(Some))?;
+                    rig.retimed.set(false);
+                    (!settled.capped).then_some(settled)
+                }
+                None => None,
+            };
+            match warmed {
+                Some(settled) => {
+                    let mut admission = rig.admission.get();
+                    admission.settled = true;
+                    rig.admission.set(admission);
+                    tracing::info!(
+                        fires = settled.steps,
+                        probe_us = settled.last / 1e3,
+                        "rates: the warm-up's cube is past the bound; warmed on the probe"
+                    );
+                }
+                None => tracing::info!(
+                    why = %why,
+                    "rates: no warm-up cube fits the bound; the kernels' curves are timed \
+                     unwarmed, each point admitted by its own estimate"
+                ),
+            }
+        }
+        Err(why) => return Err(why),
+    }
+    // The worst ratio of a fire's time to its estimate the points are
+    // admitted at: the one measured as they land, or `worst` where given
+    // (held there, every landing aside).
+    if let Some(worst) = worst {
+        let mut admission = rig.admission.get();
+        admission.worst = worst.max(1.0);
+        rig.admission.set(admission);
+        rig.worst_held.set(true);
+    }
+    let rows = timed_rows(top);
+    let largest = rig.device.max_buffer();
+    // `(n, k, [(rows, ns a fire)])` of every tiled kernel's curve the
+    // profile states: what a vector kernel is held beaten against beside
+    // those timed here.
+    let stated_tiled: Vec<(u32, u32, Vec<(u32, f64)>)> = stated
+        .kernel_tflops_by_shape
+        .iter()
+        .flatten()
+        .filter(|c| c.kind == profile::fire::KernelCurve::TILE)
+        .map(|c| {
+            let ns = c
+                .curve
+                .iter()
+                .map(|&(m, t)| (m, gemm_flops(m, c.n, c.k) / (t * 1e3) + launch))
+                .collect();
+            (c.n, c.k, ns)
+        })
+        .collect();
+    let mut shapes: Vec<(u32, u32)> = Vec::new();
+    for &(_, n, k) in wanted {
+        if !shapes.contains(&(n, k)) {
+            shapes.push((n, k));
+        }
+    }
+    let mut curves = Vec::with_capacity(wanted.len());
+    for (n, k) in shapes {
+        // One kernel a shape's curve, all timed over one set of operands
+        // (they read a plane's shape, not its kernel): laid once at the most
+        // of the rows they fit, each point a view of its rows, the weight
+        // planes read once untimed for every point over them.
+        struct Timed {
+            tactic: kernels_slang::linear::gemm::Tactic,
+            kind: u32,
+            key: u32,
+            name: String,
+            points: Vec<(u32, f64, f64)>,
+            stop: Option<(u32, u32)>,
+            /// The parts of the plane's columns a fire covers one of: 1, else
+            /// the slice the bound admitted, its time carried to all.
+            split: u32,
+        }
+        let mut timed: Vec<Timed> = wanted
+            .iter()
+            .filter(|&&(_, wn, wk)| (wn, wk) == (n, k))
+            .map(|&(tactic, ..)| {
+                let (kind, key) = curve_key(B::TARGET, tactic, n, k);
+                let name = match kind {
+                    profile::fire::KernelCurve::VECTOR => {
+                        format!("vector matmul ({key} rows a workgroup)")
+                    }
+                    _ => format!("{key}-row tile matmul"),
+                };
+                Timed {
+                    tactic,
+                    kind,
+                    key,
+                    name,
+                    points: Vec::new(),
+                    stop: None,
+                    split: 1,
+                }
+            })
+            .collect();
+        // A slice of the plane is a whole number of the widest column tile
+        // among its kernels (so of every kernel's), and no narrower.
+        let floor = timed
+            .iter()
+            .map(|t| kernels_slang::linear::gemm::tile_for(B::TARGET, t.tactic, n, k).col_tile())
+            .max()
+            .unwrap_or(1);
+        let slice = |split: u32| n.div_ceil(floor).div_ceil(split) * floor;
+        let fits = |m: u32| operands_fit(m, n, k, model, largest);
+        let laid = match rows.iter().rev().copied().find(|&m| fits(m)) {
+            Some(most) => {
+                let act = rig.operand(most, k, Dtype::Bf16)?;
+                // The planes as views into a few large buffers, the way a
+                // served fire reads its weights from the pool's segments.
+                let planes = shape_planes(n, k, model);
+                let plane = (2 * u64::from(n) * u64::from(k)).next_multiple_of(VIEW_ALIGN);
+                let slab = rig.slab(planes as u64 * plane, plane, true)?;
+                let weights = rig.views(&slab, planes, n, k, Dtype::Bf16)?;
+                // The outputs: room for one at the most rows, each fire at
+                // fewer writing its own view of it (`ys`), as a served
+                // step's matmuls write their own outputs.
+                let y = (2 * u64::from(most) * u64::from(n)).next_multiple_of(VIEW_ALIGN);
+                let ys = rig.slab(y, y, false)?;
+                Some((act, weights, ys))
+            }
+            None => None,
+        };
+        let touched = Touched::default();
+        for (i, &m) in rows.iter().enumerate() {
+            let live: Vec<usize> = (0..timed.len())
+                .filter(|&t| timed[t].stop.is_none())
+                .collect();
+            if live.is_empty() {
+                break;
+            }
+            let Some((act, weights, ys)) = laid.as_ref().filter(|_| fits(m)) else {
+                for &t in &live {
+                    timed[t].stop = Some((m, profile::fire::KernelCurve::BUFFER));
+                }
+                break;
+            };
+            // [`REPEATS`] rounds over every live kernel, interleaved so the
+            // device's clock drifts over each alike; a kernel the bound
+            // refuses stops there.
+            let mut samples: Vec<Vec<f64>> = vec![Vec::new(); timed.len()];
+            // One interleaved round over every live kernel. A fire the bound
+            // refuses is timed on a slice of the plane's columns instead
+            // (halved until admitted, no narrower than the widest kernel's
+            // column tile):
+            // its work and its reads are the columns', so its time carried
+            // to them all is the kernel's at the plane. Refused at every
+            // slice, its curve stops there.
+            let mut round = |rig: &mut Rig<'_, B>,
+                             timed: &mut Vec<Timed>,
+                             samples: &mut Vec<Vec<f64>>|
+             -> Result<()> {
+                for &t in &live {
+                    // A slice's time, carried, while a wider one is tried.
+                    let mut held: Option<f64> = None;
+                    while timed[t].stop.is_none() {
+                        let cols = slice(timed[t].split).min(n);
+                        let plane: Vec<Tensor> = weights
+                            .iter()
+                            .map(|w| Tensor { rows: cols, ..*w })
+                            .collect();
+                        // One output every fire writes, as each matmul of a
+                        // served step waits on the one before it: fires to
+                        // outputs of their own ran side by side (a 64-row
+                        // tile's one-row fire, latency-bound, read 15x fast),
+                        // which no served step's matmuls do.
+                        let outs = rig.views(ys, 1, m, cols, Dtype::Bf16)?;
+                        let rate = matmul_on(
+                            rig,
+                            timed[t].tactic,
+                            timer,
+                            (Tensor { rows: m, ..*act }, &plane, &outs),
+                            Some(&touched),
+                            launch,
+                        );
+                        // A frame the device's room refuses (a ceiling, not a
+                        // fault of the device) is no measurement either:
+                        // its sample is dropped, never the step.
+                        let rate = match rate {
+                            Err(Fault::Ceiling { what, need, have }) => Ok(Err(format!(
+                                "the frame needs {need} {what}, past the {have} the device holds"
+                            ))),
+                            rate => rate,
+                        };
+                        match dropped(rig, rate, say)? {
+                            // Timed on a slice, the next fire tries one twice
+                            // as wide, its estimate grown from this one: the
+                            // widest slice the bound admits is timed, the
+                            // fewest fixed costs carried to the plane.
+                            // A fire timed below its launches is no
+                            // measurement: the sample is dropped, never the
+                            // step (a narrower slice's held time stands).
+                            Some(Err(why)) => {
+                                tracing::debug!(
+                                    kernel = timed[t].name.as_str(),
+                                    rows = m,
+                                    n,
+                                    k,
+                                    why = %why,
+                                    "rates point: a sample dropped"
+                                );
+                                say(&format!(
+                                    "[rates]: {}: a sample dropped ({why})",
+                                    timed[t].name
+                                ));
+                                samples[t].extend(held);
+                                break;
+                            }
+                            Some(Ok(rate)) => {
+                                let ns = gemm_flops(m, cols, k) / rate;
+                                let carried = ns * f64::from(n) / f64::from(cols) + launch;
+                                if timed[t].split > 1 {
+                                    held = Some(carried);
+                                    timed[t].split /= 2;
+                                    continue;
+                                }
+                                samples[t].push(carried);
+                                break;
+                            }
+                            None if held.is_some() => {
+                                timed[t].split *= 2;
+                                samples[t].extend(held);
+                                break;
+                            }
+                            None if cols > floor => timed[t].split *= 2,
+                            None => {
+                                tracing::info!(
+                                    kernel = timed[t].name.as_str(),
+                                    rows = m,
+                                    n,
+                                    k,
+                                    "rates point: past the bound, the curve stops"
+                                );
+                                timed[t].stop = Some((m, profile::fire::KernelCurve::BOUND));
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            };
+            for _ in 0..REPEATS {
+                round(&mut rig, &mut timed, &mut samples)?;
+            }
+            for &t in &live {
+                if timed[t].stop.is_some() {
+                    continue;
+                }
+                if samples[t].is_empty() {
+                    // Every sample dropped: no measurement here, the curve
+                    // stops (a curve of no point and no stop would not
+                    // read back).
+                    timed[t].stop = Some((m, profile::fire::KernelCurve::UNTIMED));
+                    continue;
+                }
+                let (ns, spread) = median_spread(&samples[t]);
+                tracing::info!(
+                    kernel = timed[t].name.as_str(),
+                    rows = m,
+                    n,
+                    k,
+                    measured_ms = ns / 1e6,
+                    spread,
+                    "rates point"
+                );
+                say(&format!(
+                    "[rates]: {} {m}x{n}x{k}: {:.3} ms a fire (spread {:.1}%)",
+                    timed[t].name,
+                    ns / 1e6,
+                    spread * 100.0
+                ));
+                timed[t].points.push((m, ns, spread));
+            }
+            // A vector kernel slower than twice the fastest tiled kernel at
+            // these rows stops: a tiled kernel's time at twice the rows is no
+            // more than twice its time (it could run as two fires), and a
+            // vector kernel's time never falls with more rows, so it is
+            // beaten over the next doubling at least; past that its weight
+            // passes (one a workgroup's rows) only grow with the rows.
+            let fastest_tiled = timed
+                .iter()
+                .filter(|c| c.kind == profile::fire::KernelCurve::TILE)
+                .filter_map(|c| c.points.last().filter(|p| p.0 == m).map(|p| p.1))
+                .chain(
+                    stated_tiled
+                        .iter()
+                        .filter(|(tn, tk, _)| (*tn, *tk) == (n, k))
+                        .filter_map(|(_, _, curve)| {
+                            let inside = curve.first().is_some_and(|&(at, _)| at <= m)
+                                && curve.last().is_some_and(|&(at, _)| at >= m);
+                            inside
+                                .then(|| profile::fire::interpolate(curve, f64::from(m)))
+                                .flatten()
+                        }),
+                )
+                .reduce(f64::min);
+            if let (Some(tiled), Some(&next)) = (fastest_tiled, rows.get(i + 1)) {
+                for c in timed
+                    .iter_mut()
+                    .filter(|c| c.tactic.vector > 0 && c.stop.is_none())
+                {
+                    if c.points
+                        .last()
+                        .is_some_and(|p| p.0 == m && p.1 > 2.0 * tiled)
+                    {
+                        c.stop = Some((next, profile::fire::KernelCurve::BEATEN));
+                    }
+                }
+            }
+        }
+        drop(laid);
+        rig.release();
+        for c in timed {
+            if let Some((at, why)) = c.stop {
+                tracing::info!(
+                    kernel = c.name.as_str(),
+                    n,
+                    k,
+                    rows = at,
+                    why,
+                    "rates curve stops short of the load's rows"
+                );
+            }
+            // Keyed by its method and its kernel's code (`crate::stored`).
+            let kernel = kernels_slang::linear::gemm::entry(B::TARGET, c.tactic, n, k)
+                .and_then(crate::naming::Kernel::of)
+                .map_err(fault("rates: a curve's kernel"))?;
+            let by = crate::stored::by(B::TARGET, profile::fire::KERNEL_CURVES, [&kernel])?;
+            tracing::info!(
+                "rates: curve {}/{} at {n}x{k} measured, stored under its key: {}",
+                c.kind,
+                c.key,
+                by.said()
+            );
+            curves.push(profile::fire::KernelCurve {
+                by,
+                kind: c.kind,
+                key: c.key,
+                n,
+                k,
+                curve: c
+                    .points
+                    .iter()
+                    .map(|&(m, ns, _)| (m, gemm_flops(m, n, k) / (ns - launch).max(1.0) / 1e3))
+                    .collect(),
+                stop: c.stop,
+                spread: c.points.iter().map(|&(m, _, spread)| (m, spread)).collect(),
+            });
+        }
+    }
+    Ok(curves)
+}
+
+/// `chip` with each dense kernel's curve at each of `shapes` to `top` rows
+/// (`profile::fire::Rates::kernel_tflops_by_shape`): the curves it lacks
+/// ([`lacking`]) measured on `device` ([`measure_shapes`]), joined to those
+/// it states, and saved to the user's profile `save` names, as a load saves
+/// its rates (`engine::rates::save_rates`). Nothing is timed where it lacks
+/// none.
+#[allow(clippy::too_many_arguments)]
+pub fn shapes_at_load<B: Serve, T: Tactics + ?Sized>(
+    device: &B::Context,
+    tactics: &T,
+    tier: kernels_slang::Tier,
+    timer: Timer<'_, B>,
+    max_submit: Option<std::time::Duration>,
+    chip: profile::Profile,
+    save: Option<engine::rates::SaveTo<'_>>,
+    on: &str,
+    shapes: &[(u32, u32)],
+    model: Option<u64>,
+    top: u32,
+) -> Result<profile::Profile> {
+    let stated = chip.rates();
+    let kernels = dense_kernels(B::TARGET, tactics, tier, top);
+    let wanted = lacking(B::TARGET, &kernels, &stated, shapes, top);
+    let name = |&(tactic, n, k): &(kernels_slang::linear::gemm::Tactic, u32, u32)| {
+        let (kind, key) = curve_key(B::TARGET, tactic, n, k);
+        format!("{kind}/{key} at {n}x{k}")
+    };
+    if wanted.is_empty() {
+        tracing::info!(
+            shapes = shapes.len(),
+            top,
+            "rates: every dense kernel's curve at the model's planes is stored under a matching \
+             key; none timed"
+        );
+        return Ok(chip);
+    }
+    tracing::info!(
+        curves = wanted.len(),
+        shapes = shapes.len(),
+        top,
+        "rates: timing the dense kernels at the model's planes, each stored under no matching \
+         key or short of {top} rows: {}",
+        wanted.iter().map(name).collect::<Vec<_>>().join(", ")
+    );
+    let curves = measure_shapes::<B, T>(
+        device,
+        tactics,
+        tier,
+        timer,
+        max_submit,
+        None,
+        &stated,
+        &wanted,
+        model,
+        top,
+        &mut |_| {},
+    )?;
+    let measured = Rates {
+        kernel_tflops_by_shape: Some(curves),
+        ..Rates::default()
+    }
+    .over(stated.clone());
+    let joined = Rates {
+        kernel_tflops_by_shape: measured.kernel_tflops_by_shape.clone(),
+        measured_on: Some(on.to_string()),
+        ..Rates::default()
+    };
+    let saved_to = save
+        .map(|save| engine::rates::save_rates(&save, &joined))
+        .transpose()
+        .map_err(|why| Fault::Device {
+            call: "rates at load",
+            why,
+        })?;
+    let mut tuned = chip.tuned().clone();
+    tuned.rates = measured;
+    tuned.measured_this_load = true;
+    if saved_to.is_some() {
+        tuned.saved_to = saved_to;
+    }
+    Ok(chip.with_tuned(tuned))
 }
 
 /// What `pie tune <backend> --rates` writes for `device`
@@ -913,22 +1994,20 @@ pub fn measure<B: Serve, T: Tactics + ?Sized>(
 struct Wanted {
     launch: bool,
     gemm: bool,
-    vectors: bool,
-    tiles: bool,
     attn: bool,
     elementwise: bool,
     scan: bool,
+    resident: bool,
 }
 
 impl Wanted {
-    fn of(stated: &Rates) -> Wanted {
-        let lacked = stated.missing(&KEYS);
+    fn of(stated: &Rates, keys: &[&'static str]) -> Wanted {
+        let lacked = stated.missing(keys);
         let lacks = |key: &str| lacked.contains(&key);
         Wanted {
+            resident: lacks(profile::fire::RESIDENT_WORKGROUPS),
             launch: lacks("launch_ns") || lacks("hbm_gbps"),
             gemm: lacks("gemm_tflops_by_rows"),
-            vectors: lacks("vector_tflops_by_rows"),
-            tiles: lacks("tile_tflops_by_rows"),
             attn: lacks("attn_tflops_by_keys"),
             elementwise: lacks("elementwise_gbps"),
             scan: lacks("scan_gelems"),
@@ -948,21 +2027,29 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
 ) -> Result<engine::rates::Measured> {
     // Only what `stated` lacks is timed; what it states stands in for the
     // rates the timed ones read (the launch, the bandwidth, the curve's peak).
-    let want = Wanted::of(stated);
+    // The keys a load asks for at this bound ([`keys_at`]), those `stated`
+    // lacks.
+    let want = Wanted::of(stated, &keys_at(max_submit));
     let mut rig = Rig::<B>::new(device, max_submit);
     // Under a stated bound, the probe first: every estimate grows from it.
     rig.lay_probe(tactics.gemm(tier, crate::submit::PROBE.0))?;
     // The launch first: every rate below takes its dispatches' launches off.
     let (bytes_per_ns, launch_ns) = match (want.launch, stated.hbm_gbps, stated.launch_ns) {
         (false, Some(bytes), Some(launch)) => (bytes, launch),
-        _ => {
-            let measured = copy_and_launch(&mut rig, tactics.gemm(tier, LAUNCH), timer, say)?;
+        _ => repeated(|| {
+            let measured = copy_and_launch(&mut rig, tactics.gemm(tier, LAUNCH), timer, say);
             rig.release();
             measured
-        }
+        })?,
     };
+    // Each measurement's kernels, as its frames fired them: what its stored
+    // key names (`crate::stored`); every kernel the step fired keys the
+    // margin it measures over the whole step.
+    let launch_fired = rig.take_fired();
+    let mut step_fired = launch_fired.clone();
     let launch = launch_ns as f64;
     let (side, warmed, walk_worst) = warm(&mut rig, &|rows| tactics.gemm(tier, rows), timer)?;
+    step_fired.extend(rig.take_fired());
     say(&format!(
         "[rates]: warm-up: {} rotations of the {side}^3 matmul, settled at {:.1} TFLOP/s",
         warmed.rotations,
@@ -977,8 +2064,11 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     for w in engine::rates::GEMM_WIDTHS.into_iter().filter(|_| want.gemm) {
         let mut curve = Vec::new();
         for m in engine::rates::GEMM_ROWS {
-            let rate = matmul(&mut rig, tactics.gemm(tier, m), timer, (m, w, w), launch);
-            rig.release();
+            let rate = repeated(|| {
+                let rate = matmul(&mut rig, tactics.gemm(tier, m), timer, (m, w, w), launch);
+                rig.release();
+                rate
+            });
             let Some(rate) = dropped(&rig, rate, say)? else {
                 continue;
             };
@@ -993,74 +2083,42 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
             gemm.push((w, curve));
         }
     }
-    // `vector_tflops_by_rows`: each vector kernel, by the rows a workgroup
-    // carries, at `VECTOR_ROWS_TIMED` of the widest plane, each fire reading
-    // the next plane past the last-level cache: its flops over its time,
-    // every weight pass it makes in it.
-    let w = engine::rates::GEMM_WIDTH;
-    let mut vector_curves: Vec<(u32, Vec<(u32, f64)>)> = Vec::new();
-    let carried = if want.vectors {
-        kernels_slang::linear::gemm::VECTOR_ROWS.to_vec()
+    let gemm_fired = rig.take_fired();
+    step_fired.extend(gemm_fired.iter().copied());
+    // `resident_workgroups`: the workgroups the device holds at once, from
+    // the matmul curve's peak (its kernel compute-bound there) and one
+    // workgroup of the same kernel over the same depth.
+    let resident = if want.resident {
+        let w = engine::rates::GEMM_WIDTH;
+        let curve = gemm
+            .iter()
+            .find(|(width, _)| *width == w)
+            .map(|(_, curve)| curve.clone())
+            .or_else(|| {
+                stated
+                    .gemm_tflops_by_rows
+                    .iter()
+                    .flatten()
+                    .find(|(width, _)| *width == w)
+                    .map(|(_, curve)| curve.iter().map(|&(m, t)| (m, t * 1e3)).collect())
+            })
+            .ok_or_else(|| Fault::Device {
+                call: "rates",
+                why: format!(
+                    "no matmul curve at width {w} to measure the resident workgroups against"
+                ),
+            })?;
+        let measured = resident_workgroups(&mut rig, tactics, tier, timer, &curve, w, launch)?;
+        rig.release();
+        say(&format!(
+            "[rates]: resident workgroups: {measured:.1} (one workgroup of the matmul's peak kernel against its full rate)"
+        ));
+        Some(measured)
     } else {
-        Vec::new()
+        None
     };
-    for rows in carried {
-        let vector = kernels_slang::linear::gemm::Tactic {
-            vector: rows,
-            ..tactics.gemm(tier, 1)
-        };
-        let mut curve = Vec::new();
-        for m in VECTOR_ROWS_TIMED {
-            let rate = matmul(&mut rig, vector, timer, (m, w, w), launch);
-            rig.release();
-            let Some(rate) = dropped(&rig, rate, say)? else {
-                continue;
-            };
-            say(&format!(
-                "[rates]: vector matmul ({rows} rows a workgroup) {m}x{w}x{w}: {:.1} TFLOP/s",
-                rate / 1e3
-            ));
-            curve.push((m, rate / 1e3));
-        }
-        if !curve.is_empty() {
-            vector_curves.push((rows, curve));
-        }
-    }
-    // `tile_tflops_by_rows`: each tiled kernel the backend can take, at
-    // `TILE_ROWS` of the widest plane, its flops at the rows it lands over
-    // its time, keyed by its row tile.
-    let mut tile_curves: Vec<(u32, Vec<(u32, f64)>)> = Vec::new();
-    // Every tiled kernel the profile's path reaches at some timed rows (a
-    // device whose path takes the 32x32 tile below some rows and the
-    // cooperative-matrix tile above times both).
-    let mut tiled_kernels: Vec<kernels_slang::linear::gemm::Tactic> = Vec::new();
-    for m in TILE_ROWS.into_iter().filter(|_| want.tiles) {
-        for tactic in crate::dense::tiled_kernels(B::TARGET, tactics.gemm(tier, m)) {
-            if !tiled_kernels.contains(&tactic) {
-                tiled_kernels.push(tactic);
-            }
-        }
-    }
-    for tactic in tiled_kernels {
-        let tile = kernels_slang::linear::gemm::tile_for(B::TARGET, tactic, w, w).row_tile();
-        let mut curve = Vec::new();
-        for m in TILE_ROWS {
-            let rate = matmul(&mut rig, tactic, timer, (m, w, w), launch);
-            rig.release();
-            let Some(rate) = dropped(&rig, rate, say)? else {
-                continue;
-            };
-            say(&format!(
-                "[rates]: {tile}-row tile matmul {m}x{w}x{w}: {:.1} TFLOP/s",
-                rate / 1e3
-            ));
-            curve.push((m, rate / 1e3));
-        }
-        if !curve.is_empty() && tile_curves.iter().all(|(at, _)| *at != tile) {
-            tile_curves.push((tile, curve));
-        }
-    }
-    tile_curves.sort_by_key(|(tile, _)| *tile);
+    let resident_fired = rig.take_fired();
+    step_fired.extend(resident_fired.iter().copied());
     // The attention curve at its own keys: from the narrowest whose shape
     // is compute-bound on this device (its matmul peak over its bandwidth),
     // whatever rows the matmul curve reached.
@@ -1082,8 +2140,19 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     };
     for keys in attn_keys {
         let shape = engine::rates::ATTN_SHAPE.at(keys);
-        let rate = attention(&mut rig, tactics, tier, timer, shape, launch, Kind::Attention);
-        rig.release();
+        let rate = repeated(|| {
+            let rate = attention(
+                &mut rig,
+                tactics,
+                tier,
+                timer,
+                shape,
+                launch,
+                Kind::Attention,
+            );
+            rig.release();
+            rate
+        });
         let Some(rate) = dropped(&rig, rate, say)? else {
             continue;
         };
@@ -1101,8 +2170,19 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         .filter(|&d| want.attn && d != 128)
     {
         let shape = engine::rates::ATTN_SHAPE.at(longest).with_dim(d);
-        let rate = attention(&mut rig, tactics, tier, timer, shape, launch, Kind::Attention);
-        rig.release();
+        let rate = repeated(|| {
+            let rate = attention(
+                &mut rig,
+                tactics,
+                tier,
+                timer,
+                shape,
+                launch,
+                Kind::Attention,
+            );
+            rig.release();
+            rate
+        });
         let Some(rate) = dropped(&rig, rate, say)? else {
             continue;
         };
@@ -1111,6 +2191,8 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
             rate / 1e3
         ));
     }
+    let attn_fired = rig.take_fired();
+    step_fired.extend(attn_fired.iter().copied());
     // Under a stated submit bound, the attention of a prompt step's rows
     // against a longer prefix, at each of [`PREFIX_ROWS`] against each of
     // `engine::rates::ATTN_KEYS` past them: the shapes the steps that near
@@ -1127,6 +2209,8 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     // ran at an eighth of it on an RTX). An estimate grown from another
     // shape moves no admission's worst ratio: its error is that shape's,
     // not the device's.
+    // A row's curve stops at the first point the bound refuses, as a
+    // kernel's does (`curve_of`): more keys or more rows take no less.
     let mut prefixed: Vec<(u32, Vec<(u32, f64)>)> = Vec::new();
     if max_submit.is_some() && stated.attn_tflops_by_rows_keys.is_none() {
         for rows in PREFIX_ROWS {
@@ -1137,10 +2221,21 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
                     keys,
                     ..engine::rates::ATTN_SHAPE
                 };
-                let rate = attention(&mut rig, tactics, tier, timer, shape, launch, Kind::Prefixed);
-                rig.release();
+                let rate = repeated(|| {
+                    let rate = attention(
+                        &mut rig,
+                        tactics,
+                        tier,
+                        timer,
+                        shape,
+                        launch,
+                        Kind::Prefixed,
+                    );
+                    rig.release();
+                    rate
+                });
                 let Some(rate) = dropped(&rig, rate, say)? else {
-                    continue;
+                    break;
                 };
                 say(&format!(
                     "[rates]: attention {rows} rows x {keys} keys d 128: {:.2} TFLOP/s",
@@ -1153,17 +2248,27 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
             }
         }
     }
+    let prefixed_fired = rig.take_fired();
+    step_fired.extend(prefixed_fired.iter().copied());
     let elementwise = if want.elementwise {
-        let gbps = elementwise(&mut rig, timer, launch)?;
-        rig.release();
+        let gbps = repeated(|| {
+            let gbps = elementwise(&mut rig, timer, launch);
+            rig.release();
+            gbps
+        })?;
         say(&format!("[rates]: per-row ops: {gbps:.0} GB/s"));
         Some(gbps)
     } else {
         None
     };
+    let elementwise_fired = rig.take_fired();
+    step_fired.extend(elementwise_fired.iter().copied());
     let scan = if want.scan {
-        let gelems = scan(&mut rig, tactics.recurrent(), timer, SCAN_SHAPE, launch)?;
-        rig.release();
+        let gelems = repeated(|| {
+            let gelems = scan(&mut rig, tactics.recurrent(), timer, SCAN_SHAPE, launch);
+            rig.release();
+            gelems
+        })?;
         Some(gelems)
     } else {
         None
@@ -1173,8 +2278,21 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     // timed (the device loaded for the whole step, past the drop a phone's
     // clock takes some seconds in), its settled rate against the warm-up's.
     // The margin a serving step is held to carries the drop as measured
-    // (an Adreno 840 halved its clock ~10 s into load).
-    let sustained = if max_submit.is_some() {
+    // (an Adreno 840 halved its clock ~10 s into load). Where the platform
+    // states the GPU's clock table, a serving step is held at its floor
+    // (`crate::clock`), which covers any drop: the margin is the estimate's
+    // error alone, and the sustained drop is not measured.
+    let scan_fired = rig.take_fired();
+    step_fired.extend(scan_fired.iter().copied());
+    let clock_table = crate::clock::ClockRange::read().ok();
+    if let (Some(_), Some(range)) = (max_submit, &clock_table) {
+        say(&format!(
+            "[rates]: sustained: not measured; a serving step is held at the floor of the GPU's \
+             clock table {range} (x{:.2})",
+            range.floor_factor()
+        ));
+    }
+    let sustained = if max_submit.is_some() && clock_table.is_none() {
         // Rotated as the warm-up rotated it: each fire its own submission,
         // admitted at the worst ratio the warm-up's walk measured (not at
         // the step's own worst since, which its micro-shapes' host latency
@@ -1186,7 +2304,13 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
             worst: walk_worst.max(1.0),
             ..step_admission
         });
-        let rotated = warm_at(&mut rig, side, &|rows| tactics.gemm(tier, rows), timer, walk_worst);
+        let rotated = warm_at(
+            &mut rig,
+            side,
+            &|rows| tactics.gemm(tier, rows),
+            timer,
+            walk_worst,
+        );
         rig.admission.set(step_admission);
         match rotated? {
             Some(hot) => {
@@ -1216,10 +2340,11 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     } else {
         1.0
     };
+    step_fired.extend(rig.take_fired());
     let tflops = |curve: Vec<(u32, f64)>| -> Vec<(u32, f64)> {
         curve.into_iter().map(|(x, r)| (x, r / 1e3)).collect()
     };
-    let rates = Rates {
+    let mut rates = Rates {
         launch_ns: want.launch.then_some(launch_ns),
         // A curve with no point measured is stated as none: the load is
         // refused by its key (`rates_at_load`), never weighed by nothing.
@@ -1234,10 +2359,11 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         elementwise_gbps: elementwise,
         scan_gelems: scan,
         few_row_tflops: None,
-        tile_tflops_by_rows: (!tile_curves.is_empty()).then_some(tile_curves),
-        vector_tflops_by_rows: (!vector_curves.is_empty()).then_some(vector_curves),
         product_ns: None,
         workgroups_per_core: None,
+        kernel_tflops_by_shape: None,
+        dense_settled: None,
+        resident_workgroups: resident,
         // How much slower the device ran than its own measurements said:
         // like frames' drift, the clock's swing and its sustained drop
         // (`Rig::drift`, `sustained`): the margin a serving step's estimate
@@ -1246,7 +2372,31 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         submit_worst_ratio: max_submit
             .map(|_| rig.drift.get().max(rig.swing.get()).max(sustained).max(1.0)),
         attn_tflops_by_rows_keys: (!prefixed.is_empty()).then_some(prefixed),
+        measured_on: None,
+        measured_by: None,
     };
+    // Each rate measured, keyed by its method and the kernels it fired
+    // (`crate::stored`); the device it was measured on is the backend's to
+    // state.
+    let mut keyed = Vec::new();
+    for (key, fired) in [
+        ("launch_ns", &launch_fired),
+        ("hbm_gbps", &launch_fired),
+        ("gemm_tflops_by_rows", &gemm_fired),
+        ("attn_tflops_by_keys", &attn_fired),
+        ("elementwise_gbps", &elementwise_fired),
+        ("scan_gelems", &scan_fired),
+        (profile::fire::RESIDENT_WORKGROUPS, &resident_fired),
+        (profile::fire::ATTN_BY_ROWS_KEYS, &prefixed_fired),
+        (profile::fire::SUBMIT_WORST_RATIO, &step_fired),
+    ] {
+        if rates.states(key) {
+            let by = crate::stored::by(B::TARGET, key, fired)?;
+            tracing::info!("rates: measured `{key}`, stored under its key: {}", by.said());
+            keyed.push((key.to_string(), by));
+        }
+    }
+    rates.measured_by = (!keyed.is_empty()).then_some(keyed);
     // A rate that settled at nothing is refused by name, never saved or
     // divided by.
     if let Some((key, why)) = engine::rates::unmeasured(&rates) {
@@ -1261,6 +2411,9 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     })
 }
 
+/// The version of [`elementwise`]'s method (`[rates] elementwise_gbps`'s
+/// stored key, `crate::stored`): bumped only when how it measures changes.
+pub const ELEMENTWISE_METHOD: u32 = 1;
 
 /// The per-row ops' bandwidth: the backend's rmsnorm, then its swiglu, at
 /// `engine::rates::ELEMENTWISE_SHAPE`, each fire the next of
@@ -1302,8 +2455,17 @@ fn elementwise<B: Serve>(rig: &mut Rig<'_, B>, timer: Timer<'_, B>, launch: f64)
         launch,
         engine::rates::elementwise_bytes(),
     )
-    .map_err(|why| Fault::Device { call: "rates", why })
+    .map_err(|why| Fault::Device {
+        call: IMPLAUSIBLE,
+        why,
+    })
 }
+
+/// The version of the method `[rates] submit_worst_ratio` is measured by
+/// (the warm-up's rotations, [`warm`], the step's drift and the sustained
+/// rotation after it; its stored key, `crate::stored`): bumped only when
+/// how it measures changes.
+pub const SUBMIT_METHOD: u32 = 1;
 
 /// The device warmed ([`engine::rates::warm_up`]): rotations of a cube
 /// matmul over its planes, each one frame timed by the host's clock around
@@ -1345,7 +2507,10 @@ fn warm<B: Serve>(
         // Its first fire estimated from the sizes before it (the first size
         // from the probe, [`grown`]); one past the bound is refused by name
         // unsubmitted and the walk stops at the size before.
-        rig.step(format!("warm-up walk {p}^3 (first fire)"), Work::matmul(p, p, p));
+        rig.step(
+            format!("warm-up walk {p}^3 (first fire)"),
+            Work::matmul(p, p, p),
+        );
         let timed = rig.frame(timer, 1, &fire, &nothing).and_then(|_| {
             rig.restep(format!("warm-up walk {p}^3"));
             rig.frame(timer, 1, &fire, &nothing)
@@ -1420,7 +2585,10 @@ fn warm_at<B: Serve>(
     // sustained rotation's after every rate, the clock dropped by however
     // long the host-bound shapes before it left the device idle). Past the
     // bound it is never submitted: the cube halves ([`warm`]).
-    rig.step(format!("warm-up {side}^3 (first fire)"), Work::matmul(m, n, k));
+    rig.step(
+        format!("warm-up {side}^3 (first fire)"),
+        Work::matmul(m, n, k),
+    );
     if let Err(e) = rig.frame(timer, 1, &fire, &nothing) {
         rig.release();
         return match rig.past_bound.borrow_mut().take() {
@@ -1516,6 +2684,11 @@ fn warm_at<B: Serve>(
     }
 }
 
+/// The version of [`matmul`]'s method as `[rates] gemm_tflops_by_rows`
+/// measures it (its stored key, `crate::stored`): bumped only when how it
+/// measures changes.
+pub const GEMM_METHOD: u32 = 1;
+
 /// The matmul rate at `(m, n, k)`, each fire reading the next of its
 /// weight planes, past the last-level cache.
 fn matmul<B: Serve>(
@@ -1530,22 +2703,106 @@ fn matmul<B: Serve>(
         .map(|_| rig.operand(n, k, Dtype::Bf16))
         .collect::<Result<Vec<Tensor>>>()?;
     let y = rig.zeros(m, n, Dtype::Bf16)?;
+    matmul_on(rig, tactic, timer, (act, &weights, &[y]), None, launch)?.map_err(|why| {
+        Fault::Device {
+            call: IMPLAUSIBLE,
+            why,
+        }
+    })
+}
+
+/// [`matmul`] over operands laid already: `act` (its rows the matmul's),
+/// the weight planes its fires rotate through, `y`; `touched` the planes'
+/// one untimed read, shared by every point over them. A fire timed below
+/// its launches comes back as the inner error: no measurement, though the
+/// device did nothing wrong.
+fn matmul_on<B: Serve>(
+    rig: &mut Rig<'_, B>,
+    tactic: kernels_slang::linear::gemm::Tactic,
+    timer: Timer<'_, B>,
+    (act, weights, ys): (Tensor, &[Tensor], &[Tensor]),
+    touched: Option<&Touched>,
+    launch: f64,
+) -> Result<std::result::Result<f64, String>> {
+    let (m, n, k) = (act.rows, ys[0].width, act.width);
     let next = std::cell::Cell::new(0usize);
     rig.step(format!("matmul {m}x{n}x{k}"), Work::matmul(m, n, k));
-    let ns = rig.each(timer, &Touched::default(), weights.len(), &|sink| {
-        let w = weights[next.get() % weights.len()];
-        next.set(next.get() + 1);
+    let fire = |sink: &kernels_slang::Ctx<'_>| {
+        let at = next.get();
+        next.set(at + 1);
+        let (w, y) = (weights[at % weights.len()], ys[at % ys.len()]);
         kernels_slang::linear::gemm::matmul(sink, tactic, act, w, y).map_err(fault("rates: matmul"))
-    })?;
-    engine::rates::rate_from(
+    };
+    // A curve's point (its planes' touch shared) to a small device budget;
+    // a rate of the device's own, settled over repeated rounds.
+    let ns = match touched {
+        Some(touched) => rig.budgeted(timer, touched, weights.len(), &fire)?,
+        None => rig.each(timer, &Touched::default(), weights.len(), &fire)?,
+    };
+    Ok(engine::rates::rate_from(
         &format!("matmul {m}x{n}x{k}"),
         ns as f64,
         engine::rates::GEMM_DISPATCHES,
         launch,
         gemm_flops(m, n, k),
-    )
-    .map_err(|why| Fault::Device { call: "rates", why })
+    ))
 }
+
+/// The version of [`resident_workgroups`]'s method (its stored key,
+/// `crate::stored`): bumped only when how it measures changes.
+pub const RESIDENT_METHOD: u32 = 1;
+
+/// The workgroups the device holds at once: the matmul `curve`'s peak
+/// rows (its kernel compute-bound there, at width `w`), the same kernel
+/// shrunk to one workgroup over the same depth, its time against the same
+/// work at the peak's rate. One workgroup runs at `1 / S` of the kernel's
+/// full rate (`engine::rates::workgroups_per_core`, the device as one).
+fn resident_workgroups<B: Serve, T: Tactics + ?Sized>(
+    rig: &mut Rig<'_, B>,
+    tactics: &T,
+    tier: kernels_slang::Tier,
+    timer: Timer<'_, B>,
+    curve: &[(u32, f64)],
+    w: u32,
+    launch: f64,
+) -> Result<f64> {
+    let refused = |why: String| Fault::Device { call: "rates", why };
+    let &(peak_rows, peak) = curve
+        .iter()
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .ok_or_else(|| refused("the matmul curve has no point".into()))?;
+    let tactic = tactics.gemm(tier, peak_rows);
+    let groups = |m: u32, n: u32| {
+        kernels_slang::linear::gemm::workgroups(B::TARGET, tactic, m, n, w)
+            .map_err(fault("rates: resident workgroups"))
+    };
+    let (mut m, mut n) = (peak_rows, w);
+    while groups(m, n)? > 1 {
+        let (wide, tall) = (groups(m, n.div_ceil(2))?, groups(m.div_ceil(2), n)?);
+        if n > 1 && wide < groups(m, n)? {
+            n = n.div_ceil(2);
+        } else if m > 1 && tall < groups(m, n)? {
+            m = m.div_ceil(2);
+        } else {
+            return Err(refused(format!(
+                "the {peak_rows}-row matmul's kernel launches {} workgroups at {m} x {n} x {w}, and no narrower shape of it launches fewer",
+                groups(m, n)?
+            )));
+        }
+    }
+    let one = matmul(rig, tactic, timer, (m, n, w), launch)?;
+    let flops = gemm_flops(m, n, w);
+    engine::rates::workgroups_per_core(1, 1, flops / one, flops / peak).ok_or_else(|| {
+        refused(format!(
+            "one workgroup of the {peak_rows}-row matmul ({m} x {n} x {w}) ran at {one} against {peak} at full width: no count of workgroups is made of it"
+        ))
+    })
+}
+
+/// The version of [`attention`]'s method (`[rates] attn_tflops_by_keys`'
+/// and `attn_tflops_by_rows_keys`' stored key, `crate::stored`): bumped
+/// only when how it measures changes.
+pub const ATTN_METHOD: u32 = 1;
 
 /// The prefill attention's rate at `s`: one sequence of `s.rows` rows
 /// attending itself, causal, its kv laid in pages of [`PAGE`], through the
@@ -1638,8 +2895,15 @@ fn attention<B: Serve, T: Tactics + ?Sized>(
         launch,
         attn_flops(s),
     )
-    .map_err(|why| Fault::Device { call: "rates", why })
+    .map_err(|why| Fault::Device {
+        call: IMPLAUSIBLE,
+        why,
+    })
 }
+
+/// The version of [`scan`]'s method (`[rates] scan_gelems`' stored key,
+/// `crate::stored`): bumped only when how it measures changes.
+pub const SCAN_METHOD: u32 = 1;
 
 /// The recurrent rate at [`SCAN_SHAPE`]: the causal conv over the scan's
 /// `qkv` channels, then the chunked gated-delta scan, one sequence on one
@@ -1679,8 +2943,7 @@ fn scan<B: Serve>(
     };
     let next = std::cell::Cell::new(0usize);
     let rows = f64::from(s.tokens) * f64::from(channels) * 2.0;
-    let state = 4.0
-        * f64::from(s.conv_width * channels + s.v_heads * s.k_dim * s.v_dim);
+    let state = 4.0 * f64::from(s.conv_width * channels + s.v_heads * s.k_dim * s.v_dim);
     let out = f64::from(s.tokens) * f64::from(s.v_heads * s.v_dim) * 4.0;
     rig.step(
         format!("scan {} tokens", s.tokens),
@@ -1729,8 +2992,16 @@ fn scan<B: Serve>(
         launch,
         scan_elements(s),
     )
-    .map_err(|why| Fault::Device { call: "rates", why })
+    .map_err(|why| Fault::Device {
+        call: IMPLAUSIBLE,
+        why,
+    })
 }
+
+/// The version of [`copy_and_launch`]'s method (`[rates] launch_ns`' and
+/// `hbm_gbps`' stored key, `crate::stored`): bumped only when how it
+/// measures changes.
+pub const LAUNCH_METHOD: u32 = 1;
 
 /// `(bytes a ns, a dispatch's ns)`: a copy of device memory, and the
 /// narrowest matmul back to back in one frame against one alone.
@@ -1788,7 +3059,10 @@ fn copy_and_launch<B: Serve>(
                     .collect::<Result<Vec<u64>>>()?,
             ))
         };
-        rig.step(format!("launch: a chain of {n} {LAUNCH}^3 matmuls"), tiny_work);
+        rig.step(
+            format!("launch: a chain of {n} {LAUNCH}^3 matmuls"),
+            tiny_work,
+        );
         let chain = wall(n, &chained)?;
         rig.step(
             format!("launch: one {}x{LAUNCH}x{LAUNCH} matmul", LAUNCH * n),
@@ -1858,7 +3132,10 @@ fn copy_and_launch<B: Serve>(
         launch as f64,
         2.0 * copy as f64,
     )
-    .map_err(|why| Fault::Device { call: "rates", why })?;
+    .map_err(|why| Fault::Device {
+        call: IMPLAUSIBLE,
+        why,
+    })?;
     Ok((bytes, launch))
 }
 
@@ -1874,7 +3151,15 @@ pub fn attention_rate<B: Serve, T: Tactics + ?Sized>(
     launch: f64,
 ) -> Result<f64> {
     let mut rig = Rig::<B>::new(device, None);
-    attention(&mut rig, tactics, tier, timer, shape, launch, Kind::Attention)
+    attention(
+        &mut rig,
+        tactics,
+        tier,
+        timer,
+        shape,
+        launch,
+        Kind::Attention,
+    )
 }
 
 /// The bf16 matmul rate of `device` at `(m, n, k)` under `tactic`: a check
@@ -1917,6 +3202,188 @@ fn rotation_fires(
 }
 
 #[cfg(test)]
+mod curve_tests {
+    use super::*;
+
+    /// A point is its repeats' median, and their spread its width over it.
+    #[test]
+    fn a_point_is_its_repeats_median_with_their_spread() {
+        assert_eq!(median_spread(&[3.0, 1.0, 2.0]), (2.0, 1.0));
+        assert_eq!(median_spread(&[5.0, 5.0, 5.0]), (5.0, 0.0));
+    }
+
+    /// The rows a shape's curves are timed at: every power of four, then the
+    /// load's most.
+    #[test]
+    fn a_shape_is_timed_at_every_power_of_four_to_the_top() {
+        assert_eq!(timed_rows(10240), [1, 4, 16, 64, 256, 1024, 4096, 10240]);
+        assert_eq!(timed_rows(4096), [1, 4, 16, 64, 256, 1024, 4096]);
+        assert_eq!(timed_rows(1), [1]);
+    }
+
+    /// A load times, at each of its shapes, each kernel whose curve the
+    /// profile lacks or holds short of the load's rows with no recorded stop;
+    /// a curve that reaches them, or stopped for a reason it records, is not
+    /// timed again; nor is a kernel at a shape twice.
+    #[test]
+    fn a_stopped_curve_is_kept_and_a_short_one_measured_again() {
+        let target = kernels_slang::Target::Spirv;
+        let vector = |rows| kernels_slang::linear::gemm::Tactic {
+            tier: kernels_slang::Tier::Subgroup,
+            vector: rows,
+            wide: false,
+        };
+        let kernels = [vector(1), vector(4), vector(4)];
+        let curve = |key, n, k, to, stop| profile::fire::KernelCurve {
+            by: profile::fire::MeasuredBy::default(),
+            kind: profile::fire::KernelCurve::VECTOR,
+            key,
+            n,
+            k,
+            curve: vec![(1, 0.5), (to, 4.0)],
+            stop,
+            spread: Vec::new(),
+        };
+        let rates = profile::fire::Rates {
+            kernel_tflops_by_shape: Some(vec![
+                // Reaches 8192 rows.
+                curve(1, 1024, 1024, 8192, None),
+                // Stopped by the bound at 2048: final.
+                curve(
+                    4,
+                    1024,
+                    1024,
+                    1024,
+                    Some((2048, profile::fire::KernelCurve::BOUND)),
+                ),
+                // Short of 8192 with no stop: timed again.
+                curve(1, 2048, 1024, 4096, None),
+            ]),
+            ..Default::default()
+        };
+        let shapes = [(1024, 1024), (2048, 1024)];
+        let ids = |wanted: Vec<(kernels_slang::linear::gemm::Tactic, u32, u32)>| {
+            wanted
+                .into_iter()
+                .map(|(t, n, k)| (t.vector, n, k))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(lacking(target, &kernels, &rates, &shapes, 8192)),
+            [(1, 2048, 1024), (4, 2048, 1024)]
+        );
+        // A load of fewer rows lacks only the shape never timed.
+        assert_eq!(
+            ids(lacking(target, &kernels, &rates, &shapes, 4096)),
+            [(4, 2048, 1024)]
+        );
+        // What a load saves keeps where the curves stopped and their points'
+        // spreads, and reads back.
+        let mut rates = rates;
+        if let Some(curves) = rates.kernel_tflops_by_shape.as_mut() {
+            curves[0].spread = vec![(1, 0.0), (8192, 0.05)];
+        }
+        let text = format!("api = 1\n{}", rates.toml());
+        let read = profile::Registry::new("test", &[], &[])
+            .load_user(&text, "test")
+            .unwrap()
+            .rates();
+        assert_eq!(read.kernel_tflops_by_shape, rates.kernel_tflops_by_shape);
+    }
+
+    /// Stored curves sifted by their keys (`crate::stored`): under the same
+    /// kernels (a pie version bump) the load times none; one kernel's code
+    /// changed, it times that kernel's curves alone; on another device,
+    /// every one.
+    #[test]
+    fn a_curve_is_timed_again_only_where_its_kernel_changed() {
+        struct Build {
+            on: &'static str,
+            code: [(&'static str, u32); 2],
+        }
+        impl profile::fire::Now for Build {
+            fn on(&self) -> String {
+                self.on.to_string()
+            }
+            fn method(&self, what: &str) -> Option<u32> {
+                crate::stored::method(what)
+            }
+            fn code(&self, kernel: &str) -> Option<u32> {
+                self.code
+                    .iter()
+                    .find(|(k, _)| *k == kernel)
+                    .map(|&(_, c)| c)
+            }
+        }
+        let target = kernels_slang::Target::Spirv;
+        let vector = kernels_slang::linear::gemm::Tactic {
+            tier: kernels_slang::Tier::Subgroup,
+            vector: 4,
+            wide: false,
+        };
+        let tiled = kernels_slang::linear::gemm::Tactic {
+            vector: 0,
+            ..vector
+        };
+        let kernels = [vector, tiled];
+        let build = Build {
+            on: "vulkan 10de:2c31 driver 0x1",
+            code: [("gemv", 1), ("tiled", 2)],
+        };
+        let curve = |kind, key, n, kernel: &str| profile::fire::KernelCurve {
+            by: profile::fire::MeasuredBy {
+                method: CURVE_METHOD,
+                kernels: vec![(
+                    kernel.to_string(),
+                    profile::fire::Now::code(&build, kernel).unwrap(),
+                )],
+            },
+            kind,
+            key,
+            n,
+            k: 1024,
+            curve: vec![(1, 0.5), (4096, 4.0)],
+            stop: None,
+            spread: Vec::new(),
+        };
+        let stored = profile::fire::Rates {
+            kernel_tflops_by_shape: Some(vec![
+                curve(profile::fire::KernelCurve::VECTOR, 4, 1024, "gemv"),
+                curve(profile::fire::KernelCurve::TILE, 32, 1024, "tiled"),
+                curve(profile::fire::KernelCurve::VECTOR, 4, 2048, "gemv"),
+                curve(profile::fire::KernelCurve::TILE, 32, 2048, "tiled"),
+            ]),
+            measured_on: Some(build.on.to_string()),
+            ..Default::default()
+        };
+        let shapes = [(1024, 1024), (2048, 1024)];
+        let wanted = |now: &Build| {
+            let mut rates = stored.clone();
+            rates.sift(now);
+            lacking(target, &kernels, &rates, &shapes, 4096)
+                .into_iter()
+                .map(|(t, n, _)| (t.vector, n))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(wanted(&build), [], "the same kernels: none timed");
+        let changed = Build {
+            code: [("gemv", 1), ("tiled", 3)],
+            ..build
+        };
+        assert_eq!(
+            wanted(&changed),
+            [(0, 1024), (0, 2048)],
+            "the tiled kernel's alone"
+        );
+        let other = Build {
+            on: "vulkan 10de:2c32 driver 0x1",
+            ..changed
+        };
+        assert_eq!(wanted(&other).len(), 4, "another device: every one");
+    }
+}
+
+#[cfg(test)]
 mod wanted_tests {
     use super::*;
 
@@ -1934,54 +3401,63 @@ mod wanted_tests {
             scan_gelems: Some(100.0),
             few_row_tflops: None,
             workgroups_per_core: None,
-            tile_tflops_by_rows: Some(vec![(32, vec![(4, 1.0)])]),
-            vector_tflops_by_rows: Some(vec![(4, vec![(1, 0.5)])]),
             submit_worst_ratio: None,
+            resident_workgroups: None,
             attn_tflops_by_rows_keys: None,
             product_ns: None,
+            kernel_tflops_by_shape: None,
+            dense_settled: None,
+            measured_on: None,
+            measured_by: None,
         };
         let none = Wanted {
             launch: false,
             gemm: false,
-            vectors: false,
-            tiles: false,
             attn: false,
             elementwise: false,
             scan: false,
+            resident: false,
         };
-        assert_eq!(Wanted::of(&all), none);
+        assert_eq!(Wanted::of(&all, &KEYS), none);
         let few = Rates {
-            vector_tflops_by_rows: None,
+            scan_gelems: None,
             ..all.clone()
         };
-        assert_eq!(
-            Wanted::of(&few),
-            Wanted {
-                vectors: true,
-                ..none
-            }
-        );
+        assert_eq!(Wanted::of(&few, &KEYS), Wanted { scan: true, ..none });
         let copy = Rates {
             hbm_gbps: None,
             cached_gbps: None,
             ..all.clone()
         };
         assert_eq!(
-            Wanted::of(&copy),
+            Wanted::of(&copy, &KEYS),
             Wanted {
                 launch: true,
                 ..none
             }
         );
-        let every = Wanted::of(&Rates::default());
+        let every = Wanted::of(&Rates::default(), &KEYS);
         assert!(
             every.launch
                 && every.gemm
-                && every.vectors
-                && every.tiles
                 && every.attn
                 && every.elementwise
                 && every.scan
+                && !every.resident
+        );
+        // The workgroups the device holds are measured where the profile
+        // lacks them, and only then.
+        let keys = keys_at(None);
+        assert!(Wanted::of(&all, &keys).resident);
+        assert_eq!(
+            Wanted::of(
+                &Rates {
+                    resident_workgroups: Some(48.0),
+                    ..all.clone()
+                },
+                &keys
+            ),
+            none
         );
     }
 }
@@ -2049,8 +3525,14 @@ mod admission_tests {
             settled: true,
             ..engine::rates::Admission::new(Some(BOUND))
         };
-        assert!(!admission.fits(Some(estimate)), "the d256 first fire is refused unsubmitted");
-        assert!(admission.fits(Some(took)), "the d64 fire it was estimated from fits");
+        assert!(
+            !admission.fits(Some(estimate)),
+            "the d256 first fire is refused unsubmitted"
+        );
+        assert!(
+            admission.fits(Some(took)),
+            "the d64 fire it was estimated from fits"
+        );
         // A smaller one: no longer than the larger measured.
         let d32 = attn(engine::rates::ATTN_SHAPE.at(512));
         assert_eq!(grown(&measured, None, d32), Some(took));
@@ -2070,10 +3552,17 @@ mod admission_tests {
         assert_eq!(grown(&[probe], Some(probe), tiny), Some(2e6));
         // The cube the walk measured, its first fire after: grown from it.
         let cube = Work::matmul(2048, 2048, 2048);
-        let walked = Fired { work: cube, ns: 40e6 };
+        let walked = Fired {
+            work: cube,
+            ns: 40e6,
+        };
         assert_eq!(grown(&[probe, walked], Some(probe), cube), Some(40e6));
         assert_eq!(
-            grown(&[probe, walked], Some(probe), Work::matmul(4096, 4096, 4096)),
+            grown(
+                &[probe, walked],
+                Some(probe),
+                Work::matmul(4096, 4096, 4096)
+            ),
             Some(320e6)
         );
         // Nothing measured: no estimate, and nothing fits a bound unestimated.

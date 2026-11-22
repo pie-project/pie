@@ -22,6 +22,9 @@ struct Input {
     temperature: f32,
     #[serde(default = "default_top_p")]
     top_p: f32,
+    /// Top-k truncation where sampled (0: none), as compat's.
+    #[serde(default)]
+    top_k: u32,
     /// When true, drop the chat-template stop tokens so the generator runs to
     /// `max_tokens` regardless of model emit.
     #[serde(default)]
@@ -30,8 +33,12 @@ struct Input {
     /// for `enable_thinking: false`.
     #[serde(default)]
     no_think: bool,
-    /// Busy-wait inside WASM for this many microseconds per drained token —
-    /// simulates per-token inferlet work.
+    /// Per-token inferlet compute, in microseconds: after each drained token
+    /// the guest spins on the monotonic clock this long (it reads the clock;
+    /// it never waits on a timer, which the host would read as outside input
+    /// and park the lane for). The lane stays awaited throughout, as a guest
+    /// computing between fires does. Off by default (0): each delayed lane
+    /// burns one CPU while it spins.
     #[serde(default)]
     wasm_delay_us: u64,
     /// Decode and return generated text (the throughput benchmark only needs
@@ -109,6 +116,10 @@ struct Output {
     request_prompt_tokens: Vec<usize>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     request_output_tokens: Vec<usize>,
+    /// A batch's lanes' emitted tokens, each lane's (`token_ids` is the
+    /// first's).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    request_token_ids: Vec<Vec<u32>>,
     /// Guest-clock first-token latency from run start (report_timing only).
     /// The client-stamped `t0` message is the launch-inclusive number; this
     /// one excludes instantiation and locates where the time went.
@@ -137,15 +148,17 @@ struct SampleKnobs {
     /// the stage reads, so every temperature runs one program.
     temperature: Option<Channel>,
     top_p: Option<Channel>,
+    top_k: Option<Channel>,
 }
 
 impl SampleKnobs {
-    fn new(temperature: f32, top_p: f32) -> Self {
+    fn new(temperature: f32, top_p: f32, top_k: u32) -> Self {
         let sampled = temperature > 0.0;
         Self {
             temperature: sampled
                 .then(|| Channel::from([sampler::inverse_temperature(temperature)])),
             top_p: (sampled && top_p < 1.0).then(|| Channel::from([top_p])),
+            top_k: (sampled && top_k > 0).then(|| Channel::from([top_k])),
         }
     }
 
@@ -154,7 +167,7 @@ impl SampleKnobs {
         sampler::Knobs {
             temperature: self.temperature.as_ref().map(|c| reshape(c.read(), [])),
             top_p: self.top_p.as_ref().map(|c| reshape(c.read(), [])),
-            top_k: None,
+            top_k: self.top_k.as_ref().map(|c| reshape(c.read(), [])),
             min_p: None,
             repetition: None,
             frequency: None,
@@ -331,7 +344,7 @@ async fn run_one(
     // A greedy pass steps its rng too, unread: the standard shape's.
     let sampled_rng = Channel::from([rng_seed, 0u32]);
     let prefill_rng = Channel::from([rng_seed ^ 0x9e37_79b9, 0u32]);
-    let (temperature, top_p) = (input.temperature, input.top_p);
+    let (temperature, top_p, top_k) = (input.temperature, input.top_p, input.top_k);
 
     let ws = WorkingSet::new();
     let n = prompt_vec.len() as u32;
@@ -393,7 +406,7 @@ async fn run_one(
     fwd_p
         .state(&[&ws], geometry(lag, &prefill_fold))
         .context("bind prefill state")?;
-    let prefill_knobs = SampleKnobs::new(temperature, top_p);
+    let prefill_knobs = SampleKnobs::new(temperature, top_p, top_k);
     fwd_p.epilogue(move || {
         let carried_on = tok_in.map(|tok_in| (tok_in.traced(), None));
         sampler::prefill(
@@ -414,7 +427,7 @@ async fn run_one(
             fwd.embed(&tok_in, &embed_indptr)?;
             fwd.state(&[ws_ref], geometry(lag, &decode_fold))
                 .context("bind decode state")?;
-            let knobs = SampleKnobs::new(temperature, top_p);
+            let knobs = SampleKnobs::new(temperature, top_p, top_k);
             fwd.epilogue(move || {
                 sampler::decode(
                     vocab,
@@ -596,7 +609,10 @@ async fn run_one(
             last_tick = now;
         }
         if input.wasm_delay_us > 0 {
-            std::thread::sleep(wasm_delay);
+            let until = std::time::Instant::now() + wasm_delay;
+            while std::time::Instant::now() < until {
+                std::hint::spin_loop();
+            }
         }
         // Refill the window after draining an accepted token. A stopped lane
         // `continue`s above and never reaches here, so it never submits more.
@@ -763,11 +779,13 @@ async fn main(input: Input) -> Result<Output> {
         {
             return Err(error);
         }
+        let mut request_token_ids = Vec::with_capacity(batch_len);
         for (i, (_, res)) in lanes.into_iter().enumerate() {
             let result = res.expect("lane completed")?;
             if i == 0 {
-                first_tokens = result.tokens;
+                first_tokens.clone_from(&result.tokens);
             }
+            request_token_ids.push(result.tokens);
             request_prompt_tokens.push(result.num_prompt_tokens);
             request_output_tokens.push(result.num_output_tokens);
         }
@@ -783,6 +801,7 @@ async fn main(input: Input) -> Result<Output> {
             token_ids: first_tokens,
             request_prompt_tokens,
             request_output_tokens,
+            request_token_ids,
             ttft_us: None,
             intertoken_us: Vec::new(),
             token_monotonic_ns: Vec::new(),
@@ -813,6 +832,7 @@ async fn main(input: Input) -> Result<Output> {
         text,
         token_ids: result.tokens,
         request_prompt_tokens: Vec::new(),
+        request_token_ids: Vec::new(),
         request_output_tokens: Vec::new(),
         ttft_us: result.ttft_us,
         intertoken_us: result.intertoken_us,

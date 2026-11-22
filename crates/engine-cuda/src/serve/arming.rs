@@ -76,6 +76,18 @@ struct Treatment {
     rs: record::RsBody,
 }
 
+/// A composition captured during arming and held: its rank by the user's
+/// rule, its key, where it came from, and what it weighed.
+struct Held {
+    rank: (u32, core::cmp::Reverse<Option<u64>>, core::cmp::Reverse<usize>, u8),
+    key: record::BodyKey,
+    bucket: u32,
+    target: BodySynth,
+    treatment: Treatment,
+    weight: u64,
+    at: usize,
+}
+
 /// A lattice being armed: the targets left, and what arming has counted.
 pub(super) struct Arming {
     targets: std::collections::VecDeque<(u32, BodySynth, Treatment)>,
@@ -84,7 +96,6 @@ pub(super) struct Arming {
     verify: bool,
     group: bool,
     records: bool,
-    priced: bool,
     dropped: std::collections::BTreeSet<u32>,
     weighed: [(usize, usize); Kind::COUNT],
     armed: usize,
@@ -96,6 +107,17 @@ pub(super) struct Arming {
     never_from: u32,
     belted: bool,
     starved: Option<u64>,
+    /// Each composition captured and still held, by the user's rule's rank
+    /// (`Shell::rule_rank`): the worst is given back first when the bodies
+    /// pass their allowance.
+    held: Vec<Held>,
+    /// The compositions given back for the allowance: stated eager after
+    /// arming, by name.
+    given_back: Vec<(u32, BodySynth, Treatment)>,
+    /// The bytes of the captures given back: room the pool's spare does not
+    /// show again (the driver keeps what it backed), which the next capture
+    /// takes.
+    freed: u64,
     peer_stopped: bool,
     unit_margin: u64,
     /// The bodies' allowance is a record's measurement
@@ -996,105 +1018,6 @@ impl Shell {
         }
     }
 
-    /// Arms the lattice over synthetic lanes. Their reads of the streamed
-    /// weights are the shell's, not a fire the runtime asked for: the use
-    /// record forgets them, so the runtime's first window orders the cache
-    /// by served tokens alone (a load arming at its starting residency arms
-    /// after the runtime last read the record).
-    /// The lattice's buckets a doubling past `engine.prefill_lattice_from`,
-    /// halved until the bodies of `rest` (the narrower prefill, mixed and
-    /// wide targets' buckets, still to arm) fit what the allowance has left
-    /// each at what the bodies of its kind armed so far weigh (`weighed`,
-    /// bytes and bodies a kind; the top bucket arms one of each first, and a
-    /// kind's bodies hold about as many nodes at any bucket, where kinds
-    /// differ: Qwen3.6-35B-A3B's mixed bodies 8.9 MiB, its lattice's 5.5 MiB
-    /// on average): a load whose
-    /// allowance arms every key keeps the profile's lattice, and one that
-    /// would leave keys to walk eagerly pads its fires to fewer buckets
-    /// instead. A coarser default lattice's buckets are the finer one's
-    /// every other past the fine rows, so nothing compiled changes. Returns
-    /// the buckets dropped; says so, and loudly where even the coarsest
-    /// lattice does not fit.
-    fn fit_lattice(
-        &mut self,
-        rest: &[(u32, Kind)],
-        kept: usize,
-        weighed: &[(usize, usize); Kind::COUNT],
-    ) -> std::collections::BTreeSet<u32> {
-        let Some((steps, from, mut fine)) = self.lattice else {
-            return std::collections::BTreeSet::new();
-        };
-        let spent = self.cache.body_stats().census;
-        if spent.bodies == 0 {
-            return std::collections::BTreeSet::new();
-        }
-        let average = spent.bytes / spent.bodies;
-        let price = |kind: Kind| match weighed[kind.at()] {
-            (bytes, bodies) if bodies > 0 => bytes / bodies,
-            _ => average,
-        };
-        let was = self.budget.buckets.clone();
-        let mut buckets = was.clone();
-        let need = |buckets: &[u32]| {
-            rest.iter()
-                .filter(|(b, _)| buckets.contains(b))
-                .map(|&(_, kind)| price(kind))
-                .sum::<usize>()
-                + kept * average
-        };
-        // What the allowance has left, or the card where it has less: the
-        // ceiling's spare stops arming as the allowance does.
-        let allowance = self.bodies_mem.saturating_sub(spent.bytes);
-        let spare = self
-            .pools
-            .spare_bytes_for_bodies(allowance as u64)
-            .map_or(allowance, |spare| {
-                usize::try_from(spare).unwrap_or(usize::MAX)
-            });
-        let room = allowance.min(spare);
-        while need(&buckets) > room {
-            if fine <= steps.max(1) {
-                eprintln!(
-                    "engine-cuda: WARNING: the bodies' hold of {} MiB arms no \
-                     lattice's every key: at {fine} bucket(s) a doubling past {from} rows the {} \
-                     narrower bodies still to arm weigh some {} MiB of the {} MiB left. Free \
-                     the card.",
-                    self.bodies_mem >> 20,
-                    rest.iter().filter(|(b, _)| buckets.contains(b)).count(),
-                    need(&buckets) >> 20,
-                    room >> 20,
-                );
-                break;
-            }
-            fine /= 2;
-            buckets = crate::api::default_lattice(self.budget.max_tokens, steps, from, fine);
-            buckets.retain(|bucket| was.contains(bucket));
-        }
-        if buckets.len() < was.len() {
-            eprintln!(
-                "engine-cuda: the bodies' hold of {} MiB arms every key at {fine} \
-                 bucket(s) a doubling past {from} rows, not the profile's {}: {} bucket(s), not \
-                 {} ({} bodies armed at {} KiB on average, {} still to arm at the profile's \
-                 lattice, {} MiB left).",
-                self.bodies_mem >> 20,
-                self.lattice.map_or(0, |(_, _, fine)| fine),
-                buckets.len(),
-                was.len(),
-                spent.bodies,
-                average >> 10,
-                rest.iter().filter(|(b, _)| was.contains(b)).count(),
-                room >> 20,
-            );
-        }
-        let dropped = was
-            .iter()
-            .filter(|b| !buckets.contains(b))
-            .copied()
-            .collect();
-        self.budget.buckets = buckets;
-        dropped
-    }
-
     /// Forgets the recorded bodies and arms the lattice again within the
     /// same load, allowed what its last arming took: the pool is backed by
     /// now and those bodies' memory is what the forgetting frees, whatever
@@ -1115,16 +1038,15 @@ impl Shell {
 
     /// The decode products `wanted` names, each timed in its real
     /// neighbourhood: for each shape (by rows, ascending), its bucket's
-    /// bodies armed with that bank on the skinny kernel and then on the
-    /// turned kernel (the other buckets' kept armed)
+    /// bodies armed with that bank on each of its candidate kernels in turn
+    /// (the other buckets' kept armed)
     /// (every bank decided before it as decided), and the decode body of its
     /// rows (that many one-row lanes) replayed [`BODY_ROUNDS`] rounds of
-    /// [`BODY_FIRES`] fires under each. The faster past the rounds'
+    /// [`BODY_FIRES`] fires under each. The fastest past the rounds'
     /// interquartile spread is kept for the shapes after it; equal within
-    /// it, the skinny kernel. The table the bodies end armed under is laid
+    /// it, the stated candidate (`profile::routes`). The table the bodies end armed under is laid
     /// on the context. What it measured: each shape under each kernel, the
     /// step's median ns and spread.
-    #[cfg(feature = "rocm")]
     pub(super) fn routes_by_body(
         &mut self,
         base: std::sync::Arc<kernels_cuda::linear::routes::Routes>,
@@ -1133,18 +1055,32 @@ impl Shell {
             kernels_cuda::linear::routes::Wanted,
         >,
     ) -> Result<crate::rates::ProductTimes> {
-        use kernels_cuda::linear::routes::Kernel;
         // A load that decodes nothing chooses no decode product's kernel.
         if self.decoding.iter().next().is_none() {
             return Ok(Vec::new());
         }
-        let mut shapes: Vec<_> = wanted.keys().copied().collect();
+        // A shape is timed by the decode body of its rows: one at rows no
+        // decode body carries (a prefill's or a mixed fire's) keeps its
+        // stated kernel, unmeasured.
+        let targets = self
+            .lattice_targets()
+            .map_or_else(Vec::new, |lattice| lattice.targets);
+        let timable = |m: u32| {
+            timing_target(
+                targets
+                    .iter()
+                    .map(|(bucket, target, treatment)| (*bucket, target, treatment.rs)),
+                m,
+            )
+            .is_some()
+        };
+        let mut shapes: Vec<_> = wanted.keys().copied().filter(|s| timable(s.m)).collect();
         shapes.sort_by_key(|s| (s.m, s.rows, s.k));
         let mut decided = base;
         let mut measured = Vec::new();
         for shape in shapes {
             let mut times = Vec::new();
-            for kernel in [Kernel::Skinny, Kernel::Turned] {
+            for &kernel in &wanted[&shape].candidates {
                 self.device
                     .set_routes(std::sync::Arc::new(decided.forcing(shape, kernel)));
                 // A product's rows in a body are its bucket's: only that
@@ -1158,7 +1094,7 @@ impl Shell {
             measured.extend(entries);
         }
         self.device.set_routes(decided);
-        let mut buckets: Vec<u32> = wanted.keys().map(|s| s.m).collect();
+        let mut buckets: Vec<u32> = wanted.keys().map(|s| s.m).filter(|&m| timable(m)).collect();
         buckets.dedup();
         for bucket in buckets {
             self.rearm_bucket(bucket)?;
@@ -1171,7 +1107,6 @@ impl Shell {
     /// armed one), replayed: its median ns a fire over [`BODY_ROUNDS`]
     /// rounds and their interquartile spread. Every timed fire must replay
     /// the body (none walks eagerly).
-    #[cfg(feature = "rocm")]
     fn time_decode_body(&mut self, m: u32) -> Result<(f64, f64)> {
         let targets = self
             .lattice_targets()
@@ -1222,7 +1157,6 @@ impl Shell {
 
     /// Bucket `bucket`'s bodies forgotten and armed again, the other
     /// buckets' kept: a re-arm allowed what the load's own arming took.
-    #[cfg(feature = "rocm")]
     fn rearm_bucket(&mut self, bucket: u32) -> Result<()> {
         self.cache.forget_bodies_at(bucket);
         self.arm_only = Some(bucket);
@@ -1368,6 +1302,14 @@ impl Shell {
             unfireable,
         } = found;
         let top = targets.iter().map(|(bucket, _)| *bucket).max();
+        // Captured in this order (the top bucket's compositions first, then
+        // by kind and bucket): the order bodies are captured in leaves
+        // process-wide state behind that every later graph's kernel-to-kernel
+        // transitions pay for (an L40S decode at one lane ran 3.4% slower
+        // after a capture across kinds by rows), so it is kept apart from
+        // which compositions the allowance keeps: that is the user's rule
+        // (`Shell::rule_rank`), applied by giving back the worst-ranked
+        // capture whenever the bodies pass their allowance (`arm_target`).
         let rank = |kind: Kind| match kind {
             Kind::Decode => 0u8,
             Kind::Mixed => 1,
@@ -1469,6 +1411,7 @@ impl Shell {
             } else {
                 vec![lanes]
             };
+            let launched = kernels_cuda::sizing::launches();
             for lanes in walks {
                 let owned = self.synthetic_lanes_with(&lanes, &media);
                 if matches!(target, BodySynth::Idle) {
@@ -1486,6 +1429,9 @@ impl Shell {
                     break 'targets;
                 }
             }
+            let launches = kernels_cuda::sizing::launches() - launched;
+            let entry = self.walked_launches.entry((*bucket, target.to_string())).or_insert(0);
+            *entry = (*entry).max(launches);
         }
         // The voxel walk is a plain fire: no recurrent treatment.
         self.arm_rs = record::RsBody::Folds;
@@ -1590,10 +1536,8 @@ impl Shell {
         if let Some(bucket) = self.arm_only {
             targets.retain(|(at, ..)| *at == bucket);
         }
-        // The top bucket's bodies and every decode body arm first; the
-        // narrower prefill, mixed and wide ones after them are what the
-        // lattice coarsens to fit the allowance, each priced at what its
-        // kind's bodies armed so far weigh.
+        // By rows, every kind's fewest first (`lattice_targets`): the
+        // allowance running out leaves the largest rungs, stated eager.
         Some(Arming {
             targets: targets.into(),
             top,
@@ -1601,7 +1545,6 @@ impl Shell {
             verify,
             group,
             records,
-            priced: verify || group || self.lattice.is_none(),
             dropped: std::collections::BTreeSet::new(),
             weighed: [(0usize, 0usize); Kind::COUNT],
             armed: 0,
@@ -1613,6 +1556,9 @@ impl Shell {
             never_from: 0,
             belted: false,
             starved: None,
+            held: Vec::new(),
+            given_back: Vec::new(),
+            freed: 0,
             peer_stopped: false,
             unit_margin: self.pools.arming_margin_bytes(),
             from_record: self.bodies_from_record || self.rearming,
@@ -1624,14 +1570,131 @@ impl Shell {
         })
     }
 
+    /// Selects before anything captures: a composition's fire backs the
+    /// activation span to its rung's carve (its synthetic lanes' pages lie in
+    /// the state pool's chunks, backed whole before arming), so priced by
+    /// that growth from the load's own rungs, the compositions whose growth
+    /// the pool's spare holds are the ones captured, in base order, and the
+    /// rest are stated eager untouched. The rung grows with the bucket the
+    /// user's rule ranks by, so what is selected is its best-ranked prefix,
+    /// and one left out is never warmed, so it never backs a span the
+    /// better-ranked ones then find no room beside. Where the spare holds
+    /// every carve (or the allowance is a measurement), all are selected and
+    /// base order is unchanged; the bodies themselves are weighed as they
+    /// capture ([`Shell::arm_target`]).
+    fn select_within_headroom(&mut self, st: &mut Arming) {
+        if st.verify || st.group || self.ep.is_some() || st.from_record {
+            return;
+        }
+        let mut spare = self
+            .pools
+            .spare_bytes_for_bodies(self.bodies_mem as u64)
+            .unwrap_or(u64::MAX);
+        let committed = self.arena.bytes();
+        let forked = self.compiled.arena_forked.as_ref();
+        let targets: Vec<(u32, BodySynth, Treatment)> = st.targets.drain(..).collect();
+        let growth = |target: &BodySynth| {
+            let (lanes, _) = target.lanes();
+            let tokens: u64 = lanes.iter().map(|(_, rows)| u64::from(*rows)).sum();
+            self.arena
+                .carve_of(forked, tokens, lanes.len() as u64)
+                .saturating_sub(committed)
+        };
+        // By the user's rule, best first: each priced by what it backs past
+        // the compositions already selected.
+        let mut order: Vec<usize> = (0..targets.len()).collect();
+        order.sort_by_key(|&at| self.rule_rank(targets[at].0, &targets[at].1));
+        let mut selected = vec![false; targets.len()];
+        let mut backed = 0u64;
+        for at in order {
+            let carve = growth(&targets[at].1);
+            let grows = carve.saturating_sub(backed);
+            if grows <= spare {
+                selected[at] = true;
+                spare -= grows;
+                backed = backed.max(carve);
+            }
+        }
+        let total = targets.len();
+        let mut kept = 0usize;
+        for (at, target) in targets.into_iter().enumerate() {
+            if selected[at] {
+                kept += 1;
+                st.targets.push_back(target);
+            } else {
+                st.given_back.push(target);
+            }
+        }
+        if kept < total {
+            eprintln!(
+                "engine-cuda: arming selects {kept} of {total} compositions by the user's rule: \
+                 the rest would back more of the activation span than the pool's spare holds"
+            );
+        }
+    }
+
     fn arm_lattice_fenced(&mut self, verify: bool) -> Result<()> {
         let Some(mut st) = self.arm_begin(verify) else {
             return Ok(());
         };
+        self.select_within_headroom(&mut st);
         while let Some((bucket, target, treatment)) = st.targets.pop_front() {
             self.arm_target(&mut st, bucket, target, treatment)?;
         }
+        // The compositions given back for the allowance, stated eager by
+        // name: each fired once, sealed, so nothing captures.
+        if !st.given_back.is_empty() {
+            self.cache.seal_bodies();
+            self.cache.state_eager(true);
+            for (bucket, target, treatment) in std::mem::take(&mut st.given_back) {
+                if st.never == 0 {
+                    st.never_from = bucket;
+                }
+                st.never += 1;
+                self.arm_rs = treatment.rs;
+                if matches!(target, BodySynth::Idle) {
+                    self.at_bucket(bucket);
+                }
+                let (lanes, media) = target.lanes();
+                let owned = self.synthetic_lanes_with(&lanes, &media);
+                if let Err(why) = self.fire_synthetic(&owned).and(self.device.synchronize()) {
+                    st.refused = Some(format!("bucket {bucket}, {target}: {why}"));
+                }
+            }
+            self.cache.state_eager(false);
+        }
         self.arm_end(st)
+    }
+
+    /// Where the user's rule ranks a composition for the bodies' allowance,
+    /// the least kept first: by rows across every kind, the fewest first
+    /// (what goes eager is always the largest rungs); within one row count
+    /// the one that launches more kernels first (more launches, more an
+    /// eager fire of it costs), as the size-only walk counted them
+    /// (`walked_launches`), else by its classes; then by kind.
+    fn rule_rank(
+        &self,
+        bucket: u32,
+        target: &BodySynth,
+    ) -> (u32, core::cmp::Reverse<Option<u64>>, core::cmp::Reverse<usize>, u8) {
+        let (lanes, _) = target.lanes();
+        let mut classes: Vec<usize> = lanes.iter().map(|(class, _)| *class).collect();
+        classes.sort_unstable();
+        classes.dedup();
+        let kind = match target.kind() {
+            Kind::Decode => 0u8,
+            Kind::Mixed => 1,
+            Kind::Prefill => 2,
+            Kind::Wide => 3,
+            Kind::Tower => 4,
+            Kind::Idle => 5,
+        };
+        (
+            bucket,
+            core::cmp::Reverse(self.walked_launches.get(&(bucket, target.to_string())).copied()),
+            core::cmp::Reverse(classes.len()),
+            kind,
+        )
     }
 
     fn arm_target(
@@ -1641,24 +1704,6 @@ impl Shell {
         target: BodySynth,
         treatment: Treatment,
     ) -> Result<()> {
-        // A record says the lattice fit whole: it arms as recorded.
-        if !st.priced && !st.from_record && st.narrower(bucket, &target) {
-            st.priced = true;
-            // What is still to arm: the narrower targets a coarser lattice
-            // may drop, and the rest (the top bucket's, the decodes'), which
-            // arm whatever the lattice.
-            let rest: Vec<(u32, Kind)> = std::iter::once((bucket, target.kind()))
-                .chain(
-                    st.targets
-                        .iter()
-                        .filter(|(bucket, target, _)| st.narrower(*bucket, target))
-                        .map(|(bucket, target, _)| (*bucket, target.kind())),
-                )
-                .collect();
-            let kept = st.targets.len() + 1 - rest.len();
-            let dropped = self.fit_lattice(&rest, kept, &st.weighed);
-            st.dropped.extend(dropped);
-        }
         let weighed_before = self.cache.body_stats().census;
         if st.dropped.contains(&bucket) {
             return Ok(());
@@ -1667,6 +1712,62 @@ impl Shell {
         // Past its kind's widest bucket a target captures cold: the top
         // bucket's fires made what its warm fire would.
         self.arm_cold = st.narrower(bucket, &target) && !st.verify;
+        // A single rank that is short of room (its allowance spent, or the
+        // pool's headroom under a unit's margin) gives back the held capture
+        // the user's rule ranks worst while that ranks below this one; where
+        // none does, this composition is the one left eager (stated after
+        // the loop) and arming goes on: a composition later in capture order
+        // may rank above what is held.
+        if !st.verify && !st.group && self.ep.is_none() {
+            let rank = self.rule_rank(bucket, &target);
+            loop {
+                // The room a capture has is the allowance net of what is
+                // held: a body given back frees its bytes for the next one.
+                // The pool's spare under its ceiling does not rise when one
+                // is given back (the driver keeps what it backed), so judged
+                // by it every better-ranked capture gave back every worse one
+                // and still found none, and even a one-lane decode walked
+                // eager at a tight budget.
+                // A body lies outside the pool, in the device's free memory:
+                // its room is what the device holds free, and a body given
+                // back frees its bytes for the next capture though the device
+                // does not show them free again (the driver keeps what it
+                // backed), so they count beside it. Short where that has no
+                // room for a body at the price the held ones set, or where
+                // the allowance net of what is held is spent.
+                let spent = self.cache.body_stats();
+                let free = crate::device::free_bytes()
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(st.freed);
+                let price = (2 * spent.census.bytes / spent.census.bodies.max(1)) as u64;
+                let short = (!st.from_record && free < price)
+                    || (st.capped && allowance_spent(spent.census.bytes, self.bodies_mem));
+                if !short || spent.census.bodies >= record::MAX_BODIES {
+                    break;
+                }
+                let worst = st
+                    .held
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, held)| held.rank > rank)
+                    .max_by(|(_, a), (_, b)| a.rank.cmp(&b.rank))
+                    .map(|(index, _)| index);
+                let Some(worst) = worst else {
+                    st.given_back.push((bucket, target, treatment));
+                    return Ok(());
+                };
+                let given = st.held.remove(worst);
+                self.cache.forget_body(&given.key);
+                st.freed = st.freed.saturating_add(given.weight);
+                st.took = st.took.map(|took| took.saturating_sub(given.weight));
+                st.armed -= 1;
+                st.tally[given.at].0 -= 1;
+                st.weighed[given.at].0 =
+                    st.weighed[given.at].0.saturating_sub(given.weight as usize);
+                st.weighed[given.at].1 = st.weighed[given.at].1.saturating_sub(1);
+                st.given_back.push((given.bucket, given.target, given.treatment));
+            }
+        }
         let spent = self.cache.body_stats();
         let room = (self.bodies_mem as u64).saturating_sub(spent.census.bytes as u64);
         let spare = self.pools.spare_bytes_for_bodies(room).unwrap_or(u64::MAX);
@@ -1678,10 +1779,15 @@ impl Shell {
         // Estimated where nothing is known; a record's allowance is a
         // measurement, and the headroom estimate is not consulted.
         let headroom = !st.from_record && spare < margin;
+        // A single rank gave back what it could above: only the bodies'
+        // count stops it here. An expert-parallel group stops every rank's
+        // captures where one runs out (the allowance or the headroom).
+        let single = !st.group && self.ep.is_none();
         let mine = !st.verify
             && (spent.census.bodies >= record::MAX_BODIES
-                || (st.capped && allowance_spent(spent.census.bytes, self.bodies_mem))
-                || headroom);
+                || (!single
+                    && ((st.capped && allowance_spent(spent.census.bytes, self.bodies_mem))
+                        || headroom)));
         let stop = match self.ep.as_ref() {
             // The group's ranks fire one sequence of steps: the allowance
             // one rank runs out of stops every rank's captures.
@@ -1791,9 +1897,57 @@ impl Shell {
             golden_ms.1 = clock.elapsed().as_secs_f64() * 1000.0;
         }
         if key.as_ref().is_some_and(|key| self.cache.body_armed(key)) {
+            let now = self.cache.body_stats().census;
+            // The stop above weighs what the bodies took before this
+            // capture, not what it took: the capture that crossed the
+            // allowance is given back, and its composition is the first
+            // stated eager (pushed back for the stop to state), so the
+            // bodies end within what the fit measured for them.
+            let weight = now.bytes.saturating_sub(weighed_before.bytes) as u64;
             st.armed += 1;
             st.tally[at].0 += 1;
-            let now = self.cache.body_stats().census;
+            if let Some(key) = key.as_ref() {
+                st.held.push(Held {
+                    rank: self.rule_rank(bucket, &target),
+                    key: key.clone(),
+                    bucket,
+                    target: target.clone(),
+                    treatment,
+                    weight,
+                    at,
+                });
+            }
+            // A capture takes the room given-back ones freed first.
+            st.freed = st.freed.saturating_sub(weight);
+            // Past the allowance (a capped single-rank arming): the capture
+            // the user's rule ranks last among those held (this one or an
+            // earlier) is given back, its weight off what the bodies took,
+            // until they fit; each is stated eager after the loop.
+            if st.capped && !st.group && !st.verify {
+                while allowance_spent(self.cache.body_stats().census.bytes, self.bodies_mem) {
+                    let Some(worst) = st
+                        .held
+                        .iter()
+                        .enumerate()
+                        .max_by(|(_, a), (_, b)| a.rank.cmp(&b.rank))
+                        .map(|(index, _)| index)
+                    else {
+                        break;
+                    };
+                    let given = st.held.remove(worst);
+                    self.cache.forget_body(&given.key);
+                    st.took = st.took.map(|took| took.saturating_sub(given.weight));
+                    st.armed -= 1;
+                    st.tally[given.at].0 -= 1;
+                    st.weighed[given.at].0 =
+                        st.weighed[given.at].0.saturating_sub(given.weight as usize);
+                    st.weighed[given.at].1 = st.weighed[given.at].1.saturating_sub(1);
+                    st.given_back.push((given.bucket, given.target, given.treatment));
+                }
+                if !st.held.iter().any(|held| Some(&held.key) == key.as_ref()) {
+                    return Ok(());
+                }
+            }
             if now.bodies > weighed_before.bodies {
                 st.weighed[at].0 += now.bytes.saturating_sub(weighed_before.bytes);
                 st.weighed[at].1 += now.bodies - weighed_before.bodies;
@@ -1974,14 +2128,14 @@ impl Shell {
         // Every composition arming stopped before (the report above says
         // why), by name: they walk eagerly for the life of the load by this
         // statement, their fires tallied as such (`BodyTally::stated_eager`).
-        let stated = self.cache.stated_eager();
-        if !stated.is_empty() {
+        let stated_now = self.cache.stated_eager();
+        if !stated_now.is_empty() && self.arm_only.is_none() {
             eprintln!(
                 "engine-cuda: {} composition key(s) walk eagerly by statement, arming stopped \
                  before them from bucket {}: {}",
-                stated.len(),
+                stated_now.len(),
                 st.never_from,
-                stated.join(", ")
+                stated_now.join(", ")
             );
         }
         // The lattice the bodies armed over against the profile's: fewer
@@ -2003,8 +2157,12 @@ impl Shell {
             // directory) measures all the same.
             self.bodies_took = captured.max(took);
         }
+        // A re-arm of one bucket (a product's kernel choice) is no
+        // arming of the deployment's: it concludes no record.
+        let stated = self.cache.stated_eager();
         if let Some(record) = self.bodies_record.as_deref()
             && !st.verify
+            && self.arm_only.is_none()
         {
             let measured = super::measured::Measured {
                 bytes: took,
@@ -2022,7 +2180,8 @@ impl Shell {
             match super::measured::conclude(
                 record,
                 self.bodies_from_record,
-                matches!(seal, Seal::Complete),
+                // Whole only where nothing walks eagerly by statement.
+                matches!(seal, Seal::Complete) && stated.is_empty(),
                 measured,
                 st.armed,
                 st.wanted + st.never,
@@ -2035,9 +2194,11 @@ impl Shell {
                 ),
             }
         }
-        // A load that records bodies serves every composition it fires from
-        // one: one that armed none, or stopped arming for want of room, would
-        // serve eagerly, which is never what a deployment asked for. A load
+        // A load that stopped arming for want of room serves the rungs past
+        // the stop (the largest: arming runs by rows) eagerly, each stated
+        // by name above, its fires counted apart (`BodyTally::stated_eager`),
+        // even where that is every rung. One whose recordings failed while
+        // room remained armed none for a fault, not for room: refused. A load
         // that stages host-resident experts reads each fire's routes back,
         // so it records none by design (`Run::capturable`; stated at load).
         let attempted = st.wanted + st.never;
@@ -2046,12 +2207,13 @@ impl Shell {
             && !st.verify
             && !st.group
             && attempted > 0
-            && (st.armed == 0 || st.starved.is_some())
+            && st.armed == 0
+            && st.never == 0
+            && st.refused.is_some()
         {
             return Err(Fault::Residency(format!(
-                "the card does not hold this deployment's graph bodies: {} of {attempted} \
-                 compositions armed{}. A load that records bodies serves every composition \
-                 from one rather than eagerly. Lower `[engine] max_context`, raise \
+                "this deployment's graph bodies would not record: {} of {attempted} \
+                 compositions armed{}, with room left. Lower `[engine] max_context`, raise \
                  `[engine.memory] budget_device`, or free what else holds the device; on a \
                  device another process shares, state `[engine.memory] budget_device` as this \
                  engine's part of it, so the fit leaves the other process its room. \
@@ -2354,13 +2516,11 @@ fn timing_target<'a, R: Copy>(
 
 /// Rounds a decode body is timed in (`Shell::routes_by_body`): the median
 /// kept, the interquartile range the spread a choice must clear.
-#[cfg(feature = "rocm")]
-const BODY_ROUNDS: usize = 9;
+const BODY_ROUNDS: usize = if cfg!(feature = "rocm") { 9 } else { 5 };
 
 /// Fires a round of a decode body's timing: each replayed and waited on, as
 /// a serving step is.
-#[cfg(feature = "rocm")]
-const BODY_FIRES: usize = 20;
+const BODY_FIRES: usize = if cfg!(feature = "rocm") { 20 } else { 10 };
 
 /// Whether bodies weighing `bytes` have spent an allowance of `allowance`:
 /// past it, not at it. A re-arm is allowed exactly what the arming before it

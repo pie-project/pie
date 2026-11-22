@@ -17,7 +17,8 @@
     const m1_u32* intrinsic_rows,
     m1_u32 rows_per_lane,
     m1_u32 temporary_stride,
-    m1_u8* lane_arenas) {
+    m1_u8* lane_arenas,
+    m1_u32 ptir_phase) {
 
   const m1_u32 lane_blocks = rows_per_lane == 0u ? 1u : rows_per_lane;
   const m1_u32 dispatch_lane = blockIdx.x / lane_blocks;

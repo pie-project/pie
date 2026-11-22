@@ -116,6 +116,22 @@ impl Arena {
         rungs
     }
 
+    /// The bytes of the span a fire of `tokens` tokens and `lanes` lanes
+    /// carves (its rung's carve, or `forked`'s where a fire that forks is
+    /// wider; the whole reservation past every rung): what the span must be
+    /// backed to before the fire runs ([`Arena::ensure`]).
+    #[must_use]
+    pub fn carve_of(&self, forked: Option<&ArenaMap>, tokens: u64, lanes: u64) -> u64 {
+        let carve = self
+            .rungs
+            .iter()
+            .find(|(rung, _)| {
+                u64::from(*rung) >= tokens && u64::from(*rung) >= lanes && *rung >= self.lane_reach
+            })
+            .map_or(self.reserved, |(_, map)| map.bytes);
+        carve.max(forked.map_or(0, |forked| forked.bytes))
+    }
+
     /// No smaller rung: every fire's arena at the span's start.
     pub fn drop_rungs(&mut self) {
         self.rungs.clear();

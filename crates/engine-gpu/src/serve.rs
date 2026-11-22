@@ -72,6 +72,12 @@ pub trait Serve: Backend {
     /// recordings, so no serving fire of it is unrecorded.
     type Probed;
 
+    /// The timestamps a timed step writes ([`Serve::walk_frame`]): laid at
+    /// load, one an arm (the most steps in flight), where a bound is
+    /// stated, and written by the one step in flight on the arm, so no
+    /// serving step lays any.
+    type Stamps;
+
     /// The fusions the backend implements.
     const FUSIONS: &'static [poem_compiler::fuse::Rule];
 
@@ -109,8 +115,6 @@ pub trait Serve: Backend {
     /// binding's offset.
     fn table_align(device: &Self::Context) -> u64;
 
-    /// Opens the device (adopting `handed` where the host handed one) and
-    /// its tuning.
     /// Opens the device (adopting `handed` where the host handed one), of
     /// which the load takes no more than `allowance` caps, and its tuning.
     fn open(
@@ -119,8 +123,53 @@ pub trait Serve: Backend {
         handed: Option<Self::Handed>,
     ) -> Result<(Self::Context, Self::Tuning)>;
 
+    /// Each of `kernels` timed at `rows` of one `n x k` plane on `device`
+    /// (`crate::rates::time_kernels`), its frames timed by the backend's
+    /// device spans: every fire's time, ns, a kernel.
+    #[allow(clippy::too_many_arguments)]
+    fn time_kernels(
+        device: &Self::Context,
+        tuning: &Self::Tuning,
+        tier: kernels_slang::Tier,
+        max_submit: Option<std::time::Duration>,
+        launch: f64,
+        kernels: &[kernels_slang::linear::gemm::Tactic],
+        pieces: &[u32],
+        plane: (u32, u32),
+        rows: u32,
+    ) -> Result<Vec<Vec<f64>>>;
+
+    /// `rates` saved into the user's profile under `boot`, beside the rates
+    /// a load measured there: what a later load reads back.
+    fn save_rates(
+        device: &Self::Context,
+        boot: &Self::DeviceBoot,
+        rates: &profile::fire::Rates,
+    ) -> Result<()>;
+
+    /// `tuning` with each dense kernel's rate curve at each of the model's
+    /// dense plane shapes (`shapes`, `(n, k)`) to `top_rows`, the most rows a
+    /// fire of the load may bring (`profile::fire::Rates::kernel_tflops_by_shape`):
+    /// those its profile lacks measured now, on `device`, and saved with the
+    /// device's rates (`crate::rates::measure_shapes`); what the dense
+    /// matmul's kernel at each rung is chosen by (`crate::dense`).
+    fn rate_shapes(
+        device: &Self::Context,
+        boot: &Self::DeviceBoot,
+        tuning: Self::Tuning,
+        shapes: &[(u32, u32)],
+        model_bytes: u64,
+        top_rows: u32,
+    ) -> Result<Self::Tuning>;
+
     /// The chunk size the pool's recipe aims at in place of the profile's.
     fn chunk_bytes(boot: &Self::DeviceBoot) -> Option<u64>;
+
+    /// The bound on one GPU submission a load of `boot` holds every serving
+    /// step to: the platform's (`crate::rates::stated_submit_bound`), or
+    /// the one a test's boot states in its place (`test-limits`); none
+    /// where neither states one.
+    fn submit_bound(boot: &Self::DeviceBoot) -> Option<std::time::Duration>;
 
     /// The highest tier the device runs.
     fn tier(device: &Self::Context) -> kernels_slang::Tier;
@@ -168,8 +217,26 @@ pub trait Serve: Backend {
         handles: &'f Handles<Self>,
     ) -> Self::Sink<'f>;
 
-    /// A frame a step walks into; `keep` where it is kept to replay.
-    fn walk_frame(device: &Self::Context, keep: bool) -> Result<Self::Frame>;
+    /// A frame a step walks into; `keep` where it is kept to replay;
+    /// `timed` (its arm's timestamps) where its device time is read once it
+    /// lands, as [`Serve::fire_timing`] states (under a stated submit
+    /// bound).
+    fn walk_frame(
+        device: &Self::Context,
+        keep: bool,
+        timed: Option<&Self::Stamps>,
+    ) -> Result<Self::Frame>;
+
+    /// One arm's timestamps ([`Serve::Stamps`]), laid at load: enough for
+    /// `pieces` timed frames whose times are still being read (the most
+    /// submissions one step splits into), where the backend reads a time
+    /// after the arm is free again; one where it reads it before.
+    fn lay_stamps(device: &Self::Context, pieces: u32) -> Result<Self::Stamps>;
+
+    /// Where a serving fire's device time is read from under a stated
+    /// submit bound (`crate::submit::Measured`), stated at load; a device
+    /// whose backend reads it nowhere is refused by name.
+    fn fire_timing(device: &Self::Context) -> Result<crate::submit::FireTiming>;
 
     /// The probe's work (`record`, its dispatches into a frame) laid for
     /// [`Serve::replay_probe`]: recorded once into a spanned frame kept to
@@ -224,6 +291,12 @@ pub trait Serve: Backend {
 
     /// Arm `arm`'s readout seat grew to `bytes`.
     fn grown(shell: &mut Shell<Self>, arm: usize, bytes: u64) -> Result<()>;
+
+    /// The load is done and serving starts: what the backend lays for the
+    /// frames serving holds, and makes no more of after.
+    fn serving(_shell: &mut Shell<Self>) -> Result<()> {
+        Ok(())
+    }
 
     /// Replays `prepared` where a kept step answers it, else how it walks.
     fn plan(shell: &mut Shell<Self>, prepared: &mut Prepared<'_, Self>) -> Result<Plan<Self>>;
@@ -302,6 +375,9 @@ pub enum InputCell<B: Backend> {
     /// The lane's guest refused its cell: its lanes fault, and its seat
     /// holds zeros, which nothing reads.
     Refused,
+    /// A stand-in fire's cell (the dense settle's): the seat holds zeros of
+    /// its declared shape.
+    Zeros,
 }
 
 /// A cell a guest channel keeps on the device: `bytes` at `at` of `buffer`
@@ -355,6 +431,11 @@ pub struct Boot<'a, B: Serve> {
     /// fire bound, and what the estimate weighed them by kept
     /// ([`Shell::weighed`]).
     pub check: Option<CheckRungs>,
+    /// A served load, whose programs the engine places once the shell is
+    /// raised (`Programs::load`): it fires nothing until it is told they
+    /// are ([`Shell::programs_placed`]). A suite's or a check's load places
+    /// none and fires from the start.
+    pub places_programs: bool,
 }
 
 /// How far a check's load lays its rungs.
@@ -473,6 +554,55 @@ pub struct Lane<'a> {
     pub word: u64,
 
     pub tokens: &'a [u32],
+}
+
+/// What the dense settle did over a range of rows ([`Shell::settle_dense`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Settled {
+    pub bottom: u32,
+    pub top: u32,
+    /// Under a stated submit bound, the estimate each option it fired was
+    /// admitted at, ns; empty where none is stated or nothing fired.
+    pub estimates: Vec<f64>,
+    /// The bound stated on one submission, ns.
+    pub bound_ns: Option<f64>,
+    /// Whether the range was checked on the served step (else its kernel
+    /// is the curves').
+    pub checked: bool,
+    /// Whether the check replaced the range's kernel.
+    pub replaced: bool,
+    /// The kernel it took over the range where it replaced it.
+    pub kernel: Option<kernels_slang::linear::gemm::Tactic>,
+    /// Whether the kernel taken (kept or replacing) ran apart from every
+    /// other option: what a later load takes again without firing.
+    pub decided: bool,
+}
+
+/// The version of the dense settle's method ([`Shell::settle_dense`]: how
+/// it weighs each range in whole served steps, or on its widest plane
+/// alone), its stored settle's key beside what it weighed and the kernels'
+/// code (`profile::fire::DenseSettled`): bumped only when how it weighs
+/// changes.
+pub const SETTLE_METHOD: u32 = 1;
+
+/// `tier` as the number a stored settle names it by.
+fn tier_number(tier: kernels_slang::Tier) -> u32 {
+    match tier {
+        kernels_slang::Tier::Baseline => 0,
+        kernels_slang::Tier::Subgroup => 1,
+        kernels_slang::Tier::Fp16 => 2,
+        kernels_slang::Tier::Coopmat => 3,
+    }
+}
+
+/// The tier a stored settle's number names ([`tier_number`]).
+fn tier_of(number: u32) -> kernels_slang::Tier {
+    match number {
+        1 => kernels_slang::Tier::Subgroup,
+        2 => kernels_slang::Tier::Fp16,
+        3 => kernels_slang::Tier::Coopmat,
+        _ => kernels_slang::Tier::Baseline,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -734,6 +864,19 @@ pub struct Shell<B: Serve> {
 
     /// The dense matmul's tactic at each rung ([`crate::dense`]).
     dense: crate::dense::Dense,
+    /// A served load whose programs are not placed yet: a fire is refused.
+    unplaced: bool,
+    /// The dense planes and the rates the dense kernel was chosen by: what
+    /// the settle prices an option's step by under a stated submit bound.
+    dense_planes: Vec<(u32, u32, u32, f64)>,
+    dense_rates: profile::fire::Rates,
+    /// What the dense settle did at each range ([`Shell::settled`]).
+    settled: Vec<Settled>,
+    /// The settle this load ran, for the engine to keep in the profile.
+    to_store: Option<profile::fire::DenseSettled>,
+    /// The times a settle measured kernels at on a plane alone: `((kernel,
+    /// n, k), rows, ns)`, what its next rung's pieces are estimated by.
+    alone: Vec<((kernels_slang::linear::gemm::Tactic, u32, u32), u32, f64)>,
 
     pipelines: B::Pipelines,
 
@@ -779,6 +922,27 @@ pub struct Shell<B: Serve> {
     /// The next step walks a layer at a time: its estimate is past the
     /// bound whole (`crate::submit::Admitted::Layers`).
     split_next: bool,
+    /// The consecutive layers each submission of a split walk takes
+    /// (`crate::submit::pack_layers`), 1 where the backend splits it.
+    split_layers: u32,
+    /// Under a stated submit bound, the next step's estimate at a ratio of
+    /// 1 (`crate::submit::SubmitBound::raw_ns`), which its flight carries
+    /// to its landing.
+    estimate_next: Option<crate::submit::Estimated>,
+    /// The landed fires whose device time is not yet read, each with its
+    /// estimate ([`Shell::timed`]).
+    timing: Vec<(crate::submit::Estimated, crate::submit::DeviceTime)>,
+    /// While the dense settle times its fires: the device time of each step
+    /// that landed, read from its arm's timestamps ([`Shell::timed`]).
+    spans: Option<Vec<crate::submit::DeviceTime>>,
+    /// The device time, ns, of the last fire whose time was read
+    /// ([`Shell::track`]).
+    last_landed: Option<u64>,
+    /// The kernels the last walked step picked, by class.
+    last_picks: Vec<String>,
+    /// Under a stated submit bound, each arm's timestamps, laid at load
+    /// ([`Serve::Stamps`]): the step in flight on an arm writes its own.
+    stamps: Vec<B::Stamps>,
 
     pub handles: Handles<B>,
     trace: Trace,
@@ -877,7 +1041,24 @@ pub struct Shell<B: Serve> {
 impl<B: Serve> Shell<B> {
     pub fn load(boot: Boot<'_, B>) -> Result<Shell<B>> {
         let (boot, mut fitted) = Shell::fit(boot)?;
-        let asks = Shell::name(&boot, &fitted, None)?;
+        let mut asks = Shell::name(&boot, &fitted, None)?;
+        // Each dense kernel's curve at the model's own planes, to the widest
+        // fire the load lays (the top the naming raise picked, with the
+        // profile path's kernels where no curve was timed yet): rows past it
+        // are never served. Timed, the load is named again with the
+        // kernels the curves pick.
+        let top = asks.rungs.iter().copied().max().unwrap_or(1);
+        if Shell::rate_shapes(&boot, &mut fitted, top)? {
+            let started = std::time::Instant::now();
+            asks = Shell::name(&boot, &fitted, None)?;
+            tracing::info!(
+                top,
+                kernels = asks.kernels.len(),
+                ms = started.elapsed().as_millis() as u64,
+                "the dense kernels' curves timed to the load's top: the load named again with \
+                 the kernels they pick"
+            );
+        }
         let device = &fitted.device;
 
         // Each is held to what the device binds a stage, by name, and then
@@ -913,6 +1094,36 @@ impl<B: Serve> Shell<B> {
         Shell::name(&boot, &fitted, rung)
     }
 
+    /// Each dense kernel's curve at the model's own planes timed to `top`
+    /// rows where the profile lacks it (`crate::rates::shapes_at_load`),
+    /// into `fitted`'s tuning; whether any was timed.
+    fn rate_shapes(boot: &Boot<'_, B>, fitted: &mut Fitted<B>, top: u32) -> Result<bool> {
+        if !fitted
+            .tuning
+            .profile()
+            .rates()
+            .complete(&crate::rates::KEYS)
+        {
+            return Ok(false);
+        }
+        let multiplied = crate::dense::multiplied(&boot.trace);
+        let counts = crate::top::counts(&boot.trace)?;
+        let shapes: Vec<(u32, u32)> = crate::dense::planes(&counts, Some(&multiplied))
+            .into_iter()
+            .map(|(n, k, ..)| (n, k))
+            .collect();
+        let before = fitted.tuning.profile().rates().kernel_tflops_by_shape;
+        fitted.tuning = B::rate_shapes(
+            &fitted.device,
+            boot.device,
+            fitted.tuning.clone(),
+            &shapes,
+            counts.weight_bytes,
+            top.max(1),
+        )?;
+        Ok(fitted.tuning.profile().rates().kernel_tflops_by_shape != before)
+    }
+
     /// Opens the device `boot` names and fits the load to it: the trace
     /// fused for the device, admitted, its budgets and slots fitted. Nothing
     /// is compiled, built or reserved: each raise compiles at the top its
@@ -929,7 +1140,6 @@ impl<B: Serve> Shell<B> {
             ..boot
         };
         B::admit(&device, &mut tuning, tier, &boot.trace)?;
-
         let profile = boot
             .profile
             .take()
@@ -1001,6 +1211,7 @@ impl<B: Serve> Shell<B> {
                 residency: boot.residency.clone(),
                 handed: None,
                 check: boot.check,
+                places_programs: boot.places_programs,
             },
             Fitted {
                 device: crate::named::Facts::of::<B>(device),
@@ -1019,6 +1230,7 @@ impl<B: Serve> Shell<B> {
     /// the model serves from, in the one order, on whatever backend `B` is.
     /// A naming load ([`Named`]) runs this same code and reserves nothing.
     fn raise(boot: Boot<'_, B>, fitted: Fitted<B>) -> Result<Shell<B>> {
+        let unplaced = boot.places_programs;
         let Fitted {
             device,
             tuning,
@@ -1229,13 +1441,13 @@ impl<B: Serve> Shell<B> {
         // feasible rungs to the estimate's fire top (its argmax over the
         // lattice to the context, `FireEstimate::fire_top`); a fire never
         // runs past the pick.
-        let device_profile = tuning.profile().clone();
-        let rated = device_profile.rates().complete(&crate::rates::KEYS);
+        let rated = tuning.profile().rates().complete(&crate::rates::KEYS);
         let counts = if rated {
             Some(crate::top::counts(&boot.trace)?)
         } else {
             None
         };
+        let device_profile = tuning.profile().clone();
         // The live range the ruling weighs a span against: the pool the room
         // leaves past one working set at the declared context, bound in the
         // segments the kernels bind.
@@ -1249,49 +1461,55 @@ impl<B: Serve> Shell<B> {
         // rows, then the top): the vector or the tiled kernels, whichever the
         // estimate weighs faster, one a rung where fires are recorded a rung
         // (`crate::dense`), else at each fire's rows.
-        let dense = {
-            let top = budgets.tokens.max_tokens.max(1);
+        let counts_of_rates = counts.as_ref().ok_or_else(|| {
+            Fault::Residency(format!(
+                "the profile states no `[rates]` {:?}, which the dense matmul's kernel at each \
+                 rung is chosen by",
+                device_profile.rates().missing(&crate::rates::KEYS)
+            ))
+        })?;
+        let dense_planes = crate::dense::planes(
+            counts_of_rates,
+            Some(&crate::dense::multiplied(&boot.trace)),
+        );
+        // The rungs to `chunk`, the most rows a fire takes and the rows the
+        // chunker cuts a prompt by (every full chunk lands at its rung's top,
+        // which is picked there, `crate::dense::choose`).
+        let choose_dense = |chunk: u32| {
+            let top = chunk.max(1);
             let mut rungs = engine::memory::rungs(1, top);
             if rungs.last() != Some(&top) {
                 rungs.push(top);
             }
-            let counts = counts.as_ref().ok_or_else(|| {
-                Fault::Residency(format!(
-                    "the profile states no `[rates]` {:?}, which the dense matmul's kernel at \
-                     each rung is chosen by",
-                    device_profile.rates().missing(&crate::rates::KEYS)
-                ))
-            })?;
-            let (dense, weighed) = crate::dense::choose(
+            match crate::dense::choose(
                 B::TARGET,
                 &rungs,
                 |rows| tuning.gemm(tier, rows),
                 &device_profile.rates(),
-                counts,
+                &dense_planes,
                 B::RECORDS,
-            )
-            .map_err(|key| {
-                Fault::Residency(format!(
+                Some(top),
+            ) {
+                // No curve timed yet (the naming raise, before the load
+                // times them to its top): the profile path's kernel a rung.
+                Err(crate::dense::UNREACHED) => Ok((
+                    crate::dense::Dense::path(&rungs, |rows| tuning.gemm(tier, rows)),
+                    Vec::new(),
+                )),
+                Err(key) => Err(Fault::Residency(format!(
                     "the profile states no `[rates] {key}`, which the dense matmul's kernel at \
                      each rung is chosen by"
-                ))
-            })?;
-            // Said once, by the load that serves: its naming walk weighs the same.
-            if !B::NAMES {
-                for w in &weighed {
-                    if B::RECORDS {
-                        tracing::info!("dense matmul {w}");
-                    } else {
-                        tracing::info!("dense matmul {w}; eager, each fire at its own rows");
-                    }
-                }
+                ))),
+                Ok(chosen) => Ok(chosen),
             }
-            std::sync::Arc::new(dense)
         };
+        let asked_chunk = budgets.tokens.max_tokens.max(1);
+        let (dense, mut weighed_dense) = choose_dense(asked_chunk)?;
+        let mut dense = std::sync::Arc::new(dense);
         let row_tile: engine::roofline::RowTile = {
             let dense = std::sync::Arc::clone(&dense);
             std::sync::Arc::new(move |m, n, k| {
-                kernels_slang::linear::gemm::tile_for(B::TARGET, dense.at(m), n, k).row_tile()
+                kernels_slang::linear::gemm::tile_for(B::TARGET, dense.at(m, n, k), n, k).row_tile()
             })
         };
         let mut chosen: Option<engine::load::TopRung> = None;
@@ -1333,7 +1551,8 @@ impl<B: Serve> Shell<B> {
             .map_err(|why| Fault::Unbound { what: why })?;
             if class_outputs.is_empty() {
                 return Err(Fault::Unbound {
-                    what: "no output, so a fire would compute nothing a reader can take".to_string(),
+                    what: "no output, so a fire would compute nothing a reader can take"
+                        .to_string(),
                 });
             }
             let float = |out: &&poem_exec::feeds::ClassOutput| {
@@ -1361,14 +1580,14 @@ impl<B: Serve> Shell<B> {
                     readouts: poem_compiler::arena::readouts_ceiling(&boot.budget),
                 };
                 let rect_of = |value: ValueId, name: &str| {
-                    poem_exec::store::arena::rect(&compiled.arena, value, ceiling).ok_or_else(|| {
-                        Fault::Unbound {
+                    poem_exec::store::arena::rect(&compiled.arena, value, ceiling).ok_or_else(
+                        || Fault::Unbound {
                             what: format!(
                                 "value {}, of output `{name}`, which the carve gave no rectangle",
                                 value.0
                             ),
-                        }
-                    })
+                        },
+                    )
                 };
                 let mut readouts = Vec::new();
                 let mut pixels = Vec::new();
@@ -1458,7 +1677,10 @@ impl<B: Serve> Shell<B> {
                 .iter()
                 .map(|rung| {
                     let (seat, store) = reserved(rung.tokens);
-                    (rung.tokens, rung.bytes().max(seat).max(pixel_bytes).max(store))
+                    (
+                        rung.tokens,
+                        rung.bytes().max(seat).max(pixel_bytes).max(store),
+                    )
                 })
                 .collect();
             // Each rung as the pool weighs it: the span's chunks, the room
@@ -1489,7 +1711,13 @@ impl<B: Serve> Shell<B> {
                     .iter()
                     .find(|rung| rung.tokens == tokens)
                     .and_then(|rung| {
-                        crate::store::pool::infeasible(rung, kv_budget, chunk, least_chunks, binding)
+                        crate::store::pool::infeasible(
+                            rung,
+                            kv_budget,
+                            chunk,
+                            least_chunks,
+                            binding,
+                        )
                     })
             };
             if !said {
@@ -1549,13 +1777,21 @@ impl<B: Serve> Shell<B> {
             // past it; a check's load lays on past it.
             if let (Some(counts), None) = (counts.as_ref(), chosen.as_ref()) {
                 let launches = u32::try_from(compiled.template().len()).unwrap_or(u32::MAX);
+                // The most any plane's tactic pads a fire of the rows to.
                 let padded = |rows: u32| {
-                    kernels_slang::linear::gemm::padded_rows(
-                        B::TARGET,
-                        dense.at(rows),
-                        rows,
-                        counts.width,
-                    )
+                    dense
+                        .tactics_at(rows)
+                        .into_iter()
+                        .map(|tactic| {
+                            kernels_slang::linear::gemm::padded_rows(
+                                B::TARGET,
+                                tactic,
+                                rows,
+                                counts.width,
+                            )
+                        })
+                        .max()
+                        .unwrap_or(rows)
                 };
                 // Each rung's span, the live range's share it takes; its
                 // other reservations bind it only through `why`.
@@ -1626,13 +1862,8 @@ impl<B: Serve> Shell<B> {
                 .copied()
                 .filter(|rung| laid.is_none_or(|laid| rung.tokens <= laid))
                 .collect();
-            let widest = crate::store::pool::widest_rung(
-                &held,
-                kv_budget,
-                chunk,
-                least_chunks,
-                binding,
-            );
+            let widest =
+                crate::store::pool::widest_rung(&held, kv_budget, chunk, least_chunks, binding);
             match widest {
                 Some(widest) if widest < top => {
                     budgets.tokens = crate::arena::bounded_budget(&budgets.tokens, widest);
@@ -1650,6 +1881,26 @@ impl<B: Serve> Shell<B> {
                 }
             }
         };
+        // A chunk the binding bounded below the one asked lands at its own
+        // rung's top: the dense kernel chosen again for it.
+        if budgets.tokens.max_tokens.max(1) != asked_chunk {
+            let (again, weighed_again) = choose_dense(budgets.tokens.max_tokens)?;
+            dense = std::sync::Arc::new(again);
+            weighed_dense = weighed_again;
+        }
+        // Said once, by the load that serves: its naming walk weighs the same.
+        if !B::NAMES {
+            for plane in dense.runs() {
+                tracing::info!("dense matmul plane {plane}");
+            }
+            for w in &weighed_dense {
+                if B::RECORDS {
+                    tracing::info!("dense matmul {w}");
+                } else {
+                    tracing::info!("dense matmul {w}; eager, each fire at its own rows");
+                }
+            }
+        }
         // The widest rung a check's load laid: its top once bounded.
         if let Some(weighed) = weighed.as_mut() {
             weighed.laid = budgets.tokens.max_tokens;
@@ -1657,7 +1908,7 @@ impl<B: Serve> Shell<B> {
         // Where the platform states a bound on one submission, every serving
         // step is held to it by the estimate (`crate::submit`), which must
         // then be stated: refused by its key otherwise.
-        let mut submit_bound = match crate::rates::stated_submit_bound() {
+        let mut submit_bound = match B::submit_bound(boot.device) {
             None => None,
             Some(bound) => {
                 let Some(estimate) = fire_estimate else {
@@ -1700,7 +1951,10 @@ impl<B: Serve> Shell<B> {
                     prefixed: prefixed
                         .into_iter()
                         .map(|(rows, curve)| {
-                            (rows, curve.into_iter().map(|(keys, t)| (keys, t * 1e3)).collect())
+                            (
+                                rows,
+                                curve.into_iter().map(|(keys, t)| (keys, t * 1e3)).collect(),
+                            )
                         })
                         .collect(),
                     bound_ns: bound.as_nanos() as f64,
@@ -1711,9 +1965,56 @@ impl<B: Serve> Shell<B> {
                     fire_lanes: budgets.tokens.max_lanes,
                     rungs: span.rungs().iter().map(|rung| rung.tokens).collect(),
                     scale: 1.0,
+                    measured: crate::submit::Measured::default(),
+                    clock: None,
                 };
+                // Each serving fire's device time, read once it lands, moves
+                // the scale its successors are read at
+                // (`crate::submit::Measured`): where it is read from is
+                // stated here, and a device it is read nowhere on is
+                // refused by name. A load that runs nothing on a device
+                // reads none.
+                let timing = if B::LANDS {
+                    Some(B::fire_timing(&device)?)
+                } else {
+                    None
+                };
+                // The GPU's clock table, where the platform states it: every
+                // estimate is read at its floor (`crate::clock`), read once,
+                // here. Where none is readable that is said, and the
+                // measured ratios alone hold a step.
+                let mut held = held;
+                match crate::clock::ClockRange::read() {
+                    Ok(range) => {
+                        let now = match &range.cur {
+                            Some((path, _)) => format!(
+                                "each fire's measured ratio read back to full clock at the \
+                                 clock {} states as it lands",
+                                path.display()
+                            ),
+                            None => "no current-clock node is readable: each fire's measured \
+                                     ratio is read as measured"
+                                .to_string(),
+                        };
+                        tracing::info!(
+                            "submit bound {} ms; GPU clock table {range} -> floor factor {:.2}; \
+                             {now}",
+                            bound.as_millis(),
+                            range.floor_factor()
+                        );
+                        held.clock = Some(range);
+                    }
+                    Err(why) => tracing::info!(
+                        "submit bound {} ms; {why}: no floor factor, each step held at the \
+                         measured ratios alone",
+                        bound.as_millis()
+                    ),
+                }
                 tracing::info!(
                     bound_ms = bound.as_millis() as u64,
+                    fire_timing = timing.map(|t| t.to_string()),
+                    clock = held.clock.as_ref().map(ToString::to_string),
+                    floor_factor = held.floor_factor(),
                     worst = held.worst,
                     worst_measured_this_load = device_profile.tuned().measured_this_load,
                     layers = held.layers,
@@ -1740,7 +2041,7 @@ impl<B: Serve> Shell<B> {
                     crate::submit::Clock::new(rates.gemm_compute_ns(m, n, k) + rates.launch_ns);
                 let probe = crate::submit::Probe::<B>::new(&device, tuning.gemm(tier, m))?;
                 clock.probed(probe.fire(&device)?);
-                held.scale = clock.scale();
+                held.probed(clock.ratio, held.clock_now());
                 tracing::info!(
                     curve_us = clock.curve_ns / 1e3,
                     ratio = clock.ratio,
@@ -1770,12 +2071,20 @@ impl<B: Serve> Shell<B> {
                         poem_ir::Attn::Prefill {
                             mask: Some(_),
                             bias: None,
-                            selected: None | Some(poem_ir::Blocks { per_head: false, .. }),
+                            selected: None
+                                | Some(poem_ir::Blocks {
+                                    per_head: false,
+                                    ..
+                                }),
                             ..
                         } | poem_ir::Attn::Decode {
                             mask: Some(_),
                             bias: None,
-                            selected: None | Some(poem_ir::Blocks { per_head: false, .. }),
+                            selected: None
+                                | Some(poem_ir::Blocks {
+                                    per_head: false,
+                                    ..
+                                }),
                             ..
                         }
                     ))
@@ -1829,6 +2138,16 @@ impl<B: Serve> Shell<B> {
         let page_tables = rows.tables.len();
 
         let arms = boot.runahead.frames().max(1);
+        // Under a stated submit bound, each arm's timestamps, laid here
+        // (`Serve::Stamps`): a timed step writes its arm's, so serving lays
+        // none. A load that runs nothing on a device times nothing.
+        let stamps = if let Some(held) = submit_bound.as_ref().filter(|_| B::LANDS) {
+            (0..arms)
+                .map(|_| B::lay_stamps(&device, held.layers.max(1)))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
 
         let gathers_readout = boot
             .trace
@@ -1891,8 +2210,12 @@ impl<B: Serve> Shell<B> {
 
         // Sized for what a fire reads out (`readout_seat`); a fire reading
         // more grows its arm's.
-        let readout_bytes =
-            readout_seat(&readouts, &boot.budget, budgets.max_voxels(), span.capture());
+        let readout_bytes = readout_seat(
+            &readouts,
+            &boot.budget,
+            budgets.max_voxels(),
+            span.capture(),
+        );
         let readout = (0..arms)
             .map(|_| B::Buffer::host(&device, readout_bytes, crate::books::owners::READOUT))
             .collect::<Result<Vec<_>>>()?;
@@ -2102,18 +2425,31 @@ impl<B: Serve> Shell<B> {
             device,
             tier,
             dense: std::sync::Arc::unwrap_or_clone(dense),
+            dense_planes: dense_planes.clone(),
+            dense_rates: device_profile.rates(),
+            settled: Vec::new(),
+            to_store: None,
+            alone: Vec::new(),
             built: B::compiled(&pipelines),
             recorded: 0,
             unkept: 0,
             drained: 0,
             walked: (0, 0),
             walk_only: false,
+            unplaced,
             readout_tally: (0, 0),
             weighed,
             submit_bound,
             probe,
             probed: 0,
             split_next: false,
+            split_layers: 1,
+            estimate_next: None,
+            timing: Vec::new(),
+            spans: None,
+            last_landed: None,
+            last_picks: Vec::new(),
+            stamps,
             pipelines,
             asks,
             handles,
@@ -2181,6 +2517,840 @@ impl<B: Serve> Shell<B> {
         Ok(shell)
     }
 
+    /// The dense matmul's kernel at each rung checked on the served step
+    /// itself: a kernel timed alone at a plane (the shape step's curves, which
+    /// only name the candidates) need not be the faster one in the step,
+    /// among the other work around each matmul. Over each power of two of
+    /// rows to the load's chunk (a recording backend's rungs; an eager one's
+    /// row counts, taken by the same ranges), a fire of those rows (as many
+    /// decode lanes where the load's lanes reach, else one lane's prompt of
+    /// them) is fired under the choice as it stands and under each kernel
+    /// the choice takes there or a vector kernel it takes anywhere, taken by
+    /// every plane over the range, where that kernel pads no more rows than
+    /// the choice does. Rounds are interleaved, each fire on fresh seats and
+    /// timed to its landing, walked so no option replays another's
+    /// recording; an option replaces the choice over a range only where its
+    /// median beats the choice's by more than their spreads. The seats are
+    /// opened fresh again after.
+    pub fn settle_dense(&mut self) -> Result<()> {
+        let lanes = self
+            .budgets
+            .tokens
+            .max_lanes
+            .min(u32::try_from(self.held.len()).unwrap_or(u32::MAX));
+        if lanes == 0 {
+            return Ok(());
+        }
+        self.settled.clear();
+        // The ranges a settle stored as decided under the same key (its
+        // method, what it weighed, the code of the kernels its steps fire;
+        // the device is the user's file's, `crate::stored`) are taken again
+        // without firing; the rest are settled (again) this load.
+        let (of, code) = self.settle_key(lanes)?;
+        let stored: Vec<[u32; 6]> = match self.dense_rates.dense_settled.clone() {
+            None => {
+                tracing::info!(
+                    method = SETTLE_METHOD,
+                    of = format_args!("{of:#010x}"),
+                    code = format_args!("{code:#010x}"),
+                    "dense settle: none stored; every range is settled this load"
+                );
+                Vec::new()
+            }
+            Some(stored) => {
+                let why = if stored.method != SETTLE_METHOD {
+                    Some(format!(
+                        "its method is version {SETTLE_METHOD} now, {} when stored",
+                        stored.method
+                    ))
+                } else if stored.of != of {
+                    Some(format!(
+                        "what it weighed changed (the curves, the model's planes, the rungs, \
+                         lanes or kernel choice: {:#010x} stored, {of:#010x} now)",
+                        stored.of
+                    ))
+                } else if stored.code != code {
+                    Some(format!(
+                        "the code of the kernels its steps fire changed ({:#010x} stored, \
+                         {code:#010x} now)",
+                        stored.code
+                    ))
+                } else {
+                    None
+                };
+                match why {
+                    None => {
+                        tracing::info!(
+                            method = SETTLE_METHOD,
+                            of = format_args!("{of:#010x}"),
+                            code = format_args!("{code:#010x}"),
+                            "dense settle: stored under a matching key; its {} decided ranges \
+                             reused",
+                            stored.ranges.len()
+                        );
+                        stored.ranges
+                    }
+                    Some(why) => {
+                        tracing::info!(
+                            method = SETTLE_METHOD,
+                            of = format_args!("{of:#010x}"),
+                            code = format_args!("{code:#010x}"),
+                            "dense settle: the stored settle is settled again: {why}"
+                        );
+                        Vec::new()
+                    }
+                }
+            }
+        };
+        for &[bottom, top, replaced, vector, wide, tier] in &stored {
+            if replaced != 0 {
+                let tactic = kernels_slang::linear::gemm::Tactic {
+                    tier: tier_of(tier),
+                    vector,
+                    wide: wide != 0,
+                };
+                self.dense = self.dense.with_rows(bottom, top, tactic);
+            }
+        }
+        let decided: Vec<(u32, u32)> = stored.iter().map(|r| (r[0], r[1])).collect();
+        // Each fire in one submission, as a step admitted whole goes out.
+        self.split_next(None);
+        let walk_only = std::mem::replace(&mut self.walk_only, true);
+        // Each fire timed by its arm's two timestamps around its frames, as
+        // a served step is under a stated bound (laid for the settle where
+        // none is stated): none between its dispatches.
+        let laid = self.stamps.is_empty();
+        if laid {
+            self.stamps = (0..self.inputs.len())
+                .map(|_| B::lay_stamps(&self.device, 1))
+                .collect::<Result<Vec<_>>>()?;
+        }
+        let settled = self.settle_dense_to(lanes, &decided);
+        if laid {
+            self.stamps.clear();
+        }
+        self.spans = None;
+        self.walk_only = walk_only;
+        self.recorded_serving();
+        self.unkept_serving();
+        self.walked_serving();
+        for slot in 0..lanes {
+            self.open(slot)?;
+        }
+        // The kernels the options built are the load's, not a fire's.
+        self.built = B::compiled(&self.pipelines);
+        // Every settle fire walked unkept, and a load records no body before
+        // its first served fire: none recorded stands on a kernel the
+        // settle replaced, so none is recorded again (each served shape
+        // records its body at its first fire, with the settled kernels).
+        let replaced = self.settled.iter().filter(|range| range.replaced).count();
+        tracing::info!(
+            ranges = self.settled.len(),
+            replaced,
+            recorded_before = 0,
+            "dense settle done: {replaced} of {} ranges replaced; no body was recorded before \
+             it, so none is recorded again (each served shape records its body at its first \
+             fire, with the settled kernels)",
+            self.settled.len()
+        );
+        // A settle fire the shell refuses as a program's (a class needing
+        // what no settle lane carries, a voxel clip say) is no fault of the
+        // device:
+        // the settle stops, said, and the curves' kernels serve what it did
+        // not reach; nothing of it is stored. Any other fault stands.
+        if let Err(why) = settled {
+            if !matches!(why, Fault::Program { .. }) {
+                return Err(why);
+            }
+            // The refusal names the class and the guest input that blocked it.
+            tracing::warn!(
+                %why,
+                "dense settle: a fire refused; the curves' kernels serve the ranges it did not \
+                 settle"
+            );
+            self.say_served("settle stopped short", replaced);
+            return Ok(());
+        }
+        // Stored for a later load under the same key: the ranges stored
+        // before and every range weighed now, an undecided one (no option ran
+        // apart from the rest) with the kernel this load serves it by. A boot
+        // whose stored settle's key matches weighs nothing again: a range is
+        // weighed once per key, never again load after load.
+        let mut ranges = stored.clone();
+        for range in self.settled.iter().filter(|range| range.checked) {
+            let (vector, wide, tier) = range.kernel.map_or((0, 0, 0), |t| {
+                (t.vector, u32::from(t.wide), tier_number(t.tier))
+            });
+            ranges.push([
+                range.bottom,
+                range.top,
+                u32::from(range.replaced),
+                vector,
+                wide,
+                tier,
+            ]);
+        }
+        let status: Vec<String> = self
+            .settled
+            .iter()
+            .map(|range| {
+                let what = if decided.contains(&(range.bottom, range.top)) {
+                    "stored, decided"
+                } else if !range.checked {
+                    "unchecked"
+                } else if range.decided {
+                    "decided this load"
+                } else {
+                    "undecided (its kernel as served now stored)"
+                };
+                format!("{}-{} {what}", range.bottom, range.top)
+            })
+            .collect();
+        tracing::info!("dense settle ranges: {}", status.join(", "));
+        if ranges.len() > stored.len() {
+            let keep = profile::fire::DenseSettled {
+                method: SETTLE_METHOD,
+                of,
+                code,
+                ranges,
+            };
+            self.dense_rates.dense_settled = Some(keep.clone());
+            self.to_store = Some(keep);
+        }
+        let weighed = self.settled.iter().any(|range| range.checked);
+        self.say_served(
+            match (stored.is_empty(), weighed) {
+                (true, _) => "settled this load",
+                (false, false) => "stored settle, nothing weighed this load",
+                (false, true) => "stored settle, the rest settled this load",
+            },
+            replaced,
+        );
+        Ok(())
+    }
+
+    /// The range `bottom..=top` weighed on its widest plane alone
+    /// (`Serve::time_kernels`): the choice's kernel there and each of
+    /// `candidates`, one fire a round at `top` rows; the choice replaced
+    /// over the range where a kernel ran apart from it, as a range timed in
+    /// whole steps is.
+    fn settle_alone(
+        &mut self,
+        bottom: u32,
+        top: u32,
+        standing: &crate::dense::Dense,
+        candidates: &[kernels_slang::linear::gemm::Tactic],
+    ) -> Result<()> {
+        let Some(&(n, k, ..)) = self
+            .dense_planes
+            .iter()
+            .max_by_key(|&&(n, k, ..)| u64::from(n) * u64::from(k))
+        else {
+            return Ok(());
+        };
+        let kept = standing.at(top, n, k);
+        let mut kernels = vec![kept];
+        for &t in candidates {
+            if !kernels.contains(&t) {
+                kernels.push(t);
+            }
+        }
+        // Under a stated bound each kernel's fire is cut into pieces of the
+        // plane's columns, each estimated to fit the bound at the GPU's
+        // least clock: its estimate the larger of its curve's and its time
+        // measured at the rows below (scaled by the rows), at the bound's
+        // stored ratio and floor factor. A kernel whose narrowest piece
+        // (64 columns) cannot fit is not weighed, said by name; the choice's
+        // own kernel not fitting leaves the range on the curves.
+        let mut pieces = vec![1u32; kernels.len()];
+        let mut weighed = vec![true; kernels.len()];
+        if let Some(held) = self.submit_bound.as_ref() {
+            let ratio = held.stored_ratio() * held.floor_factor();
+            for (i, &t) in kernels.iter().enumerate() {
+                let by_curve = crate::dense::plane_ns(B::TARGET, &self.dense_rates, t, (n, k), top);
+                let by_below = self
+                    .alone
+                    .iter()
+                    .filter(|&&(at, _, _)| at == (t, n, k))
+                    .map(|&(_, rows, ns)| ns * f64::from(top) / f64::from(rows))
+                    .fold(None, |most: Option<f64>, ns| {
+                        Some(most.map_or(ns, |m| m.max(ns)))
+                    });
+                let estimate = match (by_curve, by_below) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (a, b) => a.or(b),
+                };
+                let Some(estimate) = estimate.map(|ns| ns * ratio) else {
+                    weighed[i] = false;
+                    continue;
+                };
+                let narrowest = estimate * 64.0 / f64::from(n);
+                if narrowest > held.bound_ns {
+                    weighed[i] = false;
+                    tracing::info!(
+                        kernel = %crate::dense::name(&t),
+                        rows = top,
+                        n,
+                        k,
+                        estimate_ms = estimate / 1e6,
+                        bound_ms = held.bound_ns / 1e6,
+                        "dense settle: a kernel's narrowest piece of the plane is past the \
+                         submit bound at the least clock; not weighed"
+                    );
+                    continue;
+                }
+                pieces[i] = u32::try_from((estimate / held.bound_ns).ceil() as u64)
+                    .unwrap_or(u32::MAX)
+                    .max(1);
+            }
+        }
+        if !weighed[0] {
+            tracing::info!(
+                "dense matmul in the served step, {bottom}-{top} rows: from the curves, \
+                 unchecked (the choice's kernel cannot be weighed within the submit bound)"
+            );
+            return Ok(());
+        }
+        let kernels: Vec<kernels_slang::linear::gemm::Tactic> = kernels
+            .into_iter()
+            .zip(&weighed)
+            .filter_map(|(t, &w)| w.then_some(t))
+            .collect();
+        let pieces: Vec<u32> = pieces
+            .into_iter()
+            .zip(&weighed)
+            .filter_map(|(p, &w)| w.then_some(p))
+            .collect();
+        let max_submit = self.submit_bound.as_ref().map(|held| {
+            std::time::Duration::from_nanos((held.bound_ns / held.floor_factor()) as u64)
+        });
+        let launch = self.dense_rates.launch_ns.unwrap_or(0) as f64;
+        let samples = B::time_kernels(
+            &self.device,
+            &self.tuning,
+            self.tier,
+            max_submit,
+            launch,
+            &kernels,
+            &pieces,
+            (n, k),
+            top,
+        )?;
+        for (&t, s) in kernels.iter().zip(&samples) {
+            if !s.is_empty() {
+                let (ns, _) = crate::rates::median_spread(s);
+                self.alone.push(((t, n, k), top, ns));
+            }
+        }
+        let fastest = |s: &[f64]| s.iter().copied().fold(f64::INFINITY, f64::min);
+        let slowest = |s: &[f64]| s.iter().copied().fold(0.0, f64::max);
+        let kept_best = fastest(&samples[0]);
+        let mut taken = 0;
+        let mut best = f64::INFINITY;
+        for (i, s) in samples.iter().enumerate().skip(1) {
+            if s.is_empty() {
+                continue;
+            }
+            let (ns, _) = crate::rates::median_spread(s);
+            if slowest(s) < kept_best && ns < best {
+                taken = i;
+                best = ns;
+            }
+        }
+        let decided = !samples[0].is_empty()
+            && (taken == 0
+                || samples
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, s)| i != taken && !s.is_empty())
+                    .all(|(_, s)| slowest(&samples[taken]) < fastest(s)));
+        let weighed: Vec<String> = kernels
+            .iter()
+            .zip(&samples)
+            .filter(|(_, s)| !s.is_empty())
+            .map(|(t, s)| {
+                let (ns, spread) = crate::rates::median_spread(s);
+                format!(
+                    "{} {:.1} µs ({:.0}%)",
+                    crate::dense::name(t),
+                    ns / 1e3,
+                    spread * 100.0
+                )
+            })
+            .collect();
+        tracing::info!(
+            "dense matmul in the served step, {bottom}-{top} rows: weighed on its widest plane \
+             {n}x{k} alone at {top} rows (no whole step timed): {} ({})",
+            if taken == 0 { "kept" } else { "replaced" },
+            weighed.join(" vs ")
+        );
+        if taken != 0 {
+            self.dense = standing.with_rows(bottom, top, kernels[taken]);
+        }
+        self.settled.push(Settled {
+            bottom,
+            top,
+            estimates: Vec::new(),
+            bound_ns: self.submit_bound.as_ref().map(|held| held.bound_ns),
+            checked: true,
+            replaced: taken != 0,
+            kernel: (taken != 0).then(|| kernels[taken]),
+            decided,
+        });
+        Ok(())
+    }
+
+    /// The settle's key beside its method ([`SETTLE_METHOD`]): `of`, a
+    /// fingerprint of what it weighs (the curves, the model's planes, the
+    /// kernels the choice took by them, the rungs and lanes it fires, the
+    /// backend); and `code`, a fingerprint of the code of every kernel the
+    /// load's fires can ask for (`crate::stored::code_of_all`), which each
+    /// weighed step ran. Nothing of the build but its kernels keys it.
+    fn settle_key(&self, lanes: u32) -> Result<(u32, u32)> {
+        let of = profile::fire::fingerprint(
+            format!(
+                "{:?}|{:?}|{:?}|{lanes}|{}|{:?}",
+                self.dense_rates.kernel_tflops_by_shape,
+                self.dense_planes,
+                self.dense,
+                self.budgets.tokens.max_tokens,
+                B::TARGET,
+            )
+            .as_bytes(),
+        );
+        let kernels: std::collections::BTreeSet<crate::naming::Kernel> =
+            self.asks.kernels.iter().copied().collect();
+        let code = crate::stored::code_of_all(B::TARGET, &kernels)?;
+        Ok((of, code))
+    }
+
+    /// What the runtime's host cover depends on here
+    /// (`engine::Engine::cover_fingerprint`), by the rule every stored
+    /// measurement is keyed by (`crate::stored`): the device `on` names
+    /// (vendor, device id, driver), the code of every kernel the load's
+    /// fires can ask for, the guest emitter's and planner's versions, and
+    /// the tuning its fires run by (the profile's decisions, the dense
+    /// kernel each rung takes, the tier and the load's lanes and rows).
+    /// Nothing of the build but these: a version bump reuses the cover.
+    pub fn cover_fingerprint(&self, on: &str) -> Result<String> {
+        use crate::backend::Tactics as _;
+        let kernels: std::collections::BTreeSet<crate::naming::Kernel> =
+            self.asks.kernels.iter().copied().collect();
+        let code = crate::stored::code_of_all(B::TARGET, &kernels)?;
+        let decisions: Vec<(&str, &[profile::Rung])> = self
+            .tuning
+            .profile()
+            .entries()
+            .map(|(spec, rungs, _)| (spec.id, rungs))
+            .collect();
+        let tuning = profile::fire::fingerprint(
+            format!(
+                "{decisions:?}|{:?}|{:?}|{}|{}",
+                self.dense,
+                self.tier,
+                self.budgets.tokens.max_lanes,
+                self.budgets.tokens.max_tokens
+            )
+            .as_bytes(),
+        );
+        Ok(format!(
+            "{:?}|{on}|kernels {} {code:#010x}|emitter wgsl {} compiler {} plan {} lanes {}|tuning \
+             {tuning:#010x}",
+            B::TARGET,
+            kernels.len(),
+            eta_compiler::codegen::wgsl::WGSL_STEP_EMITTER_VERSION,
+            eta_compiler::plan::COMPILER_VERSION,
+            eta_compiler::plan::REGION_PLAN_VERSION,
+            eta_compiler::plan::lane_table::LANE_TABLE_ABI_VERSION,
+        ))
+    }
+
+    /// The kernel each plane serves at each row range now, said once the
+    /// settle is done (`whence`: stored or settled this load, `replaced` of
+    /// its ranges replaced).
+    fn say_served(&self, whence: &str, replaced: usize) {
+        for plane in self.dense.runs() {
+            tracing::info!(
+                "dense matmul served, plane {plane} ({whence}; {replaced} ranges replaced)"
+            );
+        }
+    }
+
+    /// The settle the load ran and the profile should keep, taken once.
+    pub fn take_settled(&mut self) -> Option<profile::fire::DenseSettled> {
+        self.to_store.take()
+    }
+
+    fn settle_dense_to(&mut self, lanes: u32, decided: &[(u32, u32)]) -> Result<()> {
+        use kernels_slang::linear::gemm::{Tactic, tile_for};
+        // Rounds a range's fires take, interleaved: the shape step's.
+        const ROUNDS: usize = crate::rates::REPEATS;
+        let tile = |t: Tactic| tile_for(B::TARGET, t, 4096, 4096).row_tile();
+        let chunk = self.budgets.tokens.max_tokens.max(1);
+        let vectors = self.dense.vector_kernels();
+        let entries = self.dense.entries();
+        let decode = self.trace.facts.word(&poem_ir::Request::new(1, false));
+        let mut bottom = 1;
+        let mut rows = 1u32;
+        while bottom <= chunk {
+            let top = rows.min(chunk);
+            if decided.contains(&(bottom, top)) {
+                // Decided by a stored settle: not fired again.
+                self.settled.push(Settled {
+                    bottom,
+                    top,
+                    estimates: Vec::new(),
+                    bound_ns: self.submit_bound.as_ref().map(|held| held.bound_ns),
+                    checked: false,
+                    replaced: false,
+                    kernel: None,
+                    decided: false,
+                });
+            } else if entries.iter().any(|&at| (bottom..=top).contains(&at)) {
+                let standing = self.dense.clone();
+                // The most rows any plane's kernel pads a fire to, over the
+                // range: no option pads past it.
+                let widest = (bottom..=top)
+                    .flat_map(|r| standing.tactics_at(r))
+                    .map(tile)
+                    .max()
+                    .unwrap_or(1);
+                let mut kernels: Vec<Tactic> = Vec::new();
+                // Every kernel the choice weighs at these rows (each vector
+                // kernel, the path's tiles: the one a load picked a whole
+                // step by before planes picked their own among them), and
+                // every kernel the choice takes here or a vector one it takes
+                // anywhere; each where it pads no more rows than the choice.
+                let base = self.tuning.gemm(self.tier, top);
+                let paths = crate::dense::tiled_kernels(B::TARGET, base);
+                let weighed = kernels_slang::linear::gemm::VECTOR_ROWS
+                    .iter()
+                    .map(|&vector| Tactic { vector, ..base })
+                    .chain(paths.iter().copied());
+                for t in (bottom..=top)
+                    .flat_map(|r| standing.tactics_at(r))
+                    .chain(vectors.iter().copied())
+                    .chain(weighed)
+                {
+                    // The path's own tiles at the rung (what a load ran a
+                    // whole step by, its fires laid at the rung already) are
+                    // weighed whatever they pad to: every matmul kernel
+                    // guards the rows it is given, so a tile past a fire's
+                    // rows reads and writes none of them.
+                    if !kernels.contains(&t) && (tile(t) <= widest || paths.contains(&t)) {
+                        kernels.push(t);
+                    }
+                }
+                let candidates = kernels.clone();
+                let mut options = vec![standing.clone()];
+                let mut taking: Vec<Option<Tactic>> = vec![None];
+                for t in kernels {
+                    let option = standing.with_rows(bottom, top, t);
+                    if !options.contains(&option) {
+                        options.push(option);
+                        taking.push(Some(t));
+                    }
+                }
+                // As many decode lanes, else one lane's prompt.
+                let (fire_lanes, per_lane) = if top <= lanes { (top, 1) } else { (1, top) };
+                // Under a stated submit bound, every fire is admitted as
+                // serving admits its step: the range is checked only where
+                // serving submits the step whole, and each option only where
+                // its step (the standing's estimate, lengthened by the
+                // option's matmul over the standing's by the curves) fits
+                // the bound too. A range serving splits keeps its kernel
+                // from the curves, unchecked.
+                let mut estimates: Vec<f64> = Vec::new();
+                let bound_ns = self.submit_bound.as_ref().map(|held| held.bound_ns);
+                let offered = options.len();
+                let mut said = false;
+                if self.submit_bound.is_some() && options.len() > 1 {
+                    self.retime(engine::FrameId(0))?;
+                    self.track();
+                }
+                if let Some(held) = self.submit_bound.clone().filter(|_| options.len() > 1) {
+                    let step = crate::submit::StepRows {
+                        rows: fire_lanes * per_lane,
+                        lanes: fire_lanes,
+                        keys: per_lane,
+                        prompt: per_lane > 1,
+                    };
+                    match held.admit(step) {
+                        crate::submit::Admitted::Whole { ns } => {
+                            let mut kept = Vec::new();
+                            for (i, option) in options.into_iter().enumerate() {
+                                let lengthened = if i == 0 {
+                                    Some(1.0)
+                                } else {
+                                    crate::dense::slower_by(
+                                        B::TARGET,
+                                        &self.dense_rates,
+                                        &self.dense_planes,
+                                        &standing,
+                                        &option,
+                                        top,
+                                    )
+                                };
+                                match lengthened.map(|by| ns * by.max(1.0)) {
+                                    Some(estimate) if estimate <= held.bound_ns => {
+                                        estimates.push(estimate);
+                                        kept.push(option);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            options = kept;
+                        }
+                        admitted => {
+                            tracing::info!(
+                                "dense matmul in the served step, {bottom}-{top} rows: from the \
+                                 curves, unchecked (served {} under the submit bound of {:.0} ms)",
+                                if admitted.split() {
+                                    "split by layers"
+                                } else {
+                                    "cut by rows"
+                                },
+                                held.bound_ns / 1e6
+                            );
+                            said = true;
+                            options.truncate(1);
+                        }
+                    }
+                }
+                if options.len() <= 1 && offered > 1 {
+                    // A range timed in no whole served step (the bound splits
+                    // it, or no other kernel's step fits) is weighed on its
+                    // widest plane alone: each kernel once a round, at the
+                    // range's top rows, within the bound (the plane's
+                    // columns split where it refuses one), so no stale or
+                    // wrong curve keeps a kernel several times slower.
+                    self.settle_alone(bottom, top, &standing, &candidates)?;
+                    bottom = top + 1;
+                    rows = rows.saturating_mul(2);
+                    continue;
+                }
+                if options.len() <= 1 && !said {
+                    tracing::info!(
+                        "dense matmul in the served step, {bottom}-{top} rows: from the curves, \
+                         unchecked (no other kernel to weigh)"
+                    );
+                }
+                self.settled.push(Settled {
+                    bottom,
+                    top,
+                    estimates: if options.len() > 1 {
+                        estimates.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    bound_ns,
+                    checked: options.len() > 1,
+                    replaced: false,
+                    kernel: None,
+                    decided: false,
+                });
+                if options.len() > 1 {
+                    let word = if per_lane == 1 {
+                        decode
+                    } else {
+                        self.trace
+                            .facts
+                            .word(&poem_ir::Request::new(per_lane, false))
+                    };
+                    let tokens: Vec<u32> = (0..per_lane).map(|i| 100 + (i * 7919) % 5000).collect();
+                    // Zeros for every guest input a class reads: a settle
+                    // lane feeds no channel, and a class reading one serves
+                    // the same kernels whatever the input holds.
+                    let zeros: Vec<(engine::fire::InputFeed, InputCell<B>)> = self
+                        .feeds
+                        .inputs
+                        .iter()
+                        .filter(|(seat, _)| !seat.voxel())
+                        .map(|(seat, _)| {
+                            let feed = engine::fire::InputFeed {
+                                id: seat.id,
+                                channel: engine::channel::ChannelId(0),
+                            };
+                            (feed, InputCell::Zeros)
+                        })
+                        .collect();
+                    let mut samples: Vec<Vec<f64>> = vec![Vec::new(); options.len()];
+                    // Whether a fire was timed by the host's clock (the
+                    // device stated no span of it).
+                    let host_clock = std::cell::Cell::new(false);
+                    // The GPU's clock at the range's first fire.
+                    let mut clock: Option<u64> = None;
+                    // A first round warms each option, untimed.
+                    for round in 0..=ROUNDS {
+                        for (i, option) in options.iter().enumerate() {
+                            self.dense = option.clone();
+                            let fired = (|| -> Result<f64> {
+                                for slot in 0..fire_lanes {
+                                    self.open(slot)?;
+                                }
+                                let seated: Vec<Seated<'_, B>> = (0..fire_lanes)
+                                    .map(|slot| Seated {
+                                        hosts: false,
+                                        inputs: &zeros,
+                                        ..Seated::of(Lane {
+                                            slot,
+                                            word,
+                                            tokens: &tokens,
+                                        })
+                                    })
+                                    .collect();
+                                self.drain()?;
+                                self.spans = Some(Vec::new());
+                                let began = std::time::Instant::now();
+                                self.fire_seated(&seated)?;
+                                let host = began.elapsed().as_secs_f64() * 1e9;
+                                let spans = self.spans.take().unwrap_or_default();
+                                // The device's times, filled once its steps
+                                // landed (a backend may fill one a moment
+                                // after it saw the landing).
+                                let read = std::time::Instant::now();
+                                while spans.iter().any(|time| time.get().is_none())
+                                    && read.elapsed() < std::time::Duration::from_secs(1)
+                                {
+                                    self.reap()?;
+                                    std::thread::yield_now();
+                                }
+                                let device: Option<u64> = (!spans.is_empty())
+                                    .then(|| {
+                                        spans
+                                            .iter()
+                                            .map(|time| time.get().flatten())
+                                            .sum::<Option<u64>>()
+                                    })
+                                    .flatten();
+                                // The device's span of the fire's frames: a
+                                // walk's host encode is not the served
+                                // step's, which replays its recording. The
+                                // host's clock only where the device times
+                                // nothing.
+                                let ns = device.map_or_else(
+                                    || {
+                                        host_clock.set(true);
+                                        host
+                                    },
+                                    |ns| ns as f64,
+                                );
+                                // At the clock the GPU ran at the range's
+                                // first fire, where the platform reads it: a
+                                // clock that fell between fires slows every
+                                // later one alike, not the option it fell on.
+                                Ok(
+                                    match self
+                                        .submit_bound
+                                        .as_ref()
+                                        .and_then(|held| held.clock_now())
+                                    {
+                                        Some(hz) => {
+                                            let first = *clock.get_or_insert(hz);
+                                            ns * hz as f64 / first as f64
+                                        }
+                                        None => ns,
+                                    },
+                                )
+                            })();
+                            match fired {
+                                Ok(ns) if round > 0 => samples[i].push(ns),
+                                Ok(_) => {}
+                                Err(e) => {
+                                    self.dense = standing;
+                                    return Err(e);
+                                }
+                            }
+                        }
+                    }
+                    // An option replaces the choice where every fire of it ran
+                    // faster than every fire of the choice (their ranges
+                    // apart: no repeat's noise could turn them around); of
+                    // those, the fastest by its median.
+                    let fastest = |s: &[f64]| s.iter().copied().fold(f64::INFINITY, f64::min);
+                    let slowest = |s: &[f64]| s.iter().copied().fold(0.0, f64::max);
+                    let kept_best = fastest(&samples[0]);
+                    let mut taken = 0;
+                    let mut best = f64::INFINITY;
+                    for (i, s) in samples.iter().enumerate().skip(1) {
+                        let (ns, _) = crate::rates::median_spread(s);
+                        if slowest(s) < kept_best && ns < best {
+                            taken = i;
+                            best = ns;
+                        }
+                    }
+                    let weighed: Vec<String> = options
+                        .iter()
+                        .zip(&samples)
+                        .map(|(o, s)| {
+                            let (ns, spread) = crate::rates::median_spread(s);
+                            format!(
+                                "{} {:.1} µs ({:.0}%)",
+                                o.runs_at(top).join(" / "),
+                                ns / 1e3,
+                                spread * 100.0
+                            )
+                        })
+                        .collect();
+                    tracing::info!(
+                        "dense matmul in the served step, {bottom}-{top} rows: {} ({}; timed by \
+                         the {})",
+                        if taken == 0 { "kept" } else { "replaced" },
+                        weighed.join(" vs "),
+                        if host_clock.get() {
+                            "host's clock (the device stated no span)"
+                        } else {
+                            "device's spans"
+                        }
+                    );
+                    // Decided where the choice stands (no option ran apart from
+                    // it, so the options tie with it or lose), or where the
+                    // kernel taken ran apart from every other option too;
+                    // undecided where it beat the choice but ties another.
+                    let decided = taken == 0
+                        || samples
+                            .iter()
+                            .enumerate()
+                            .filter(|&(i, _)| i != taken)
+                            .all(|(_, s)| slowest(&samples[taken]) < fastest(s));
+                    if let Some(range) = self.settled.last_mut() {
+                        range.replaced = taken != 0;
+                        range.kernel = taking.get(taken).copied().flatten();
+                        range.decided = decided;
+                    }
+                    self.dense = options.swap_remove(taken);
+                }
+            } else {
+                tracing::info!(
+                    "dense matmul in the served step, {bottom}-{top} rows: unchecked (no rung of \
+                     the load lies in these rows)"
+                );
+            }
+            bottom = top + 1;
+            rows = rows.saturating_mul(2);
+        }
+        Ok(())
+    }
+
+    /// Whether the dense settle reads the device time of each step that
+    /// lands ([`Shell::timed`]): a backend reads it then, a bound stated or
+    /// not.
+    #[must_use]
+    pub fn spans_wanted(&self) -> bool {
+        self.spans.is_some()
+    }
+
+    /// What the dense settle did at each range, in order.
+    #[must_use]
+    pub fn settled(&self) -> &[Settled] {
+        &self.settled
+    }
+
+    /// The engine placed the load's programs: the shell fires from here.
+    pub fn programs_placed(&mut self) {
+        self.unplaced = false;
+    }
+
     /// Opens seat `slot` for a direct fire: its record zeroed on the queue,
     /// nothing held.
     pub fn open(&mut self, slot: u32) -> Result<()> {
@@ -2216,9 +3386,10 @@ impl<B: Serve> Shell<B> {
     /// The disk tier: a slot file of `budget` bytes in disk chunks, any
     /// state shape's slots in any chunk, as [`Pools::disk_chunk_bytes`] and
     /// [`Pools::disk_division`] lay them; stated at load. Unstated
-    /// `budget`: a disk chunk for each of the pool's chunks, and at least
-    /// the kv pages of `seats` sequences at `context`, within a quarter of
-    /// the free disk. The disk chunks it holds.
+    /// `budget`: the disk chunks `seats` sequences' kv pages at `context`
+    /// and their state take, within the free disk
+    /// ([`engine::disk::derived_budget`]). One that cannot be seated is
+    /// refused by name, stated or not. The disk chunks it holds.
     pub fn seat_disk_kv(
         &mut self,
         budget: Option<u64>,
@@ -2230,26 +3401,31 @@ impl<B: Serve> Shell<B> {
         let paging = self.pools.paging();
         let layout = *self.pools.layout();
         let chunk = self.pools.disk_chunk_bytes();
-        let unstated = budget.is_none();
         let budget = budget.unwrap_or_else(|| {
             let pages =
                 u64::from(seats) * u64::from(context).div_ceil(u64::from(paging.page_size.max(1)));
             let per_list = layout.list.map_or(1, |list| u64::from(list.per_chunk.max(1)));
-            engine::disk::unstated_budget(
+            let state = (u64::from(seats) * self.state_slot_bytes()).div_ceil(chunk.max(1));
+            // The guest state the device can hold live (the room a guest
+            // program binds within): evicted, it has a home.
+            let guest = self.pool_chunk_facts().guest_room_bytes();
+            let bytes = engine::disk::unstated_budget(
                 dir,
                 0,
                 0,
-                u64::from(layout.total_chunks),
-                pages.div_ceil(per_list),
+                pages.div_ceil(per_list) + state,
                 chunk,
-            )
+                guest,
+            );
+            // Its inputs, stated at load: what the field rules on.
+            eprintln!(
+                "engine-gpu: the unstated disk tier: {bytes} bytes = {seats} seats x {context}                  tokens: {pages} kv pages in {} chunks and {state} chunks of state ({} B a seat),                  and {guest} B of guest state the device holds live, chunks of {chunk} B",
+                pages.div_ceil(per_list),
+                self.state_slot_bytes(),
+            );
+            bytes
         });
-        if let Err(error) = self.pools.seat_disk(&self.device, dir, budget) {
-            if !unstated {
-                return Err(error);
-            }
-            self.pools.unseat_disk();
-        }
+        self.pools.seat_disk(&self.device, dir, budget)?;
         let chunks = self.pools.disk_chunks();
         if chunks > 0 {
             let division = self
@@ -2638,14 +3814,13 @@ impl<B: Serve> Shell<B> {
 
     #[must_use]
     pub fn classes(&self) -> poem_ir::LaneClasses {
-        let outputs =
-            poem_exec::feeds::class_outputs(
-                &self.trace,
-                &self.compiled,
-                self.paging().context(),
-                self.paging().page_size,
-            )
-                .unwrap_or_default();
+        let outputs = poem_exec::feeds::class_outputs(
+            &self.trace,
+            &self.compiled,
+            self.paging().context(),
+            self.paging().page_size,
+        )
+        .unwrap_or_default();
         poem_exec::feeds::lane_classes(&self.trace, &self.compiled, &outputs)
     }
 
@@ -2918,6 +4093,15 @@ impl<B: Serve> Shell<B> {
 
     pub fn fire_seated(&mut self, lanes: &[Seated<'_, B>]) -> Result<Vec<Vec<f32>>> {
         use engine::frame::Shell as FrameShell;
+        // A served load fired before the engine placed its programs hangs
+        // the device on what placing them sets up: refused, by name.
+        if self.unplaced {
+            return Err(Fault::Unbound {
+                what: "the load's programs, which the engine places once the shell is raised \
+                       (`Programs::load`): a served load fires nothing before"
+                    .to_string(),
+            });
+        }
         // A direct fire's seat-addressed lanes read the seats' runs: back
         // their segments first, off the fire's path.
         if lanes.iter().any(|lane| !lane.refs) {
@@ -2946,7 +4130,10 @@ impl<B: Serve> Shell<B> {
     /// Fires `lanes` and reads back every output their programs read, the
     /// host's rows and those a reader on the device takes alike: each read's
     /// lane, output name and values (widened to f32), in the step's order.
-    pub fn fire_outputs(&mut self, lanes: &[Seated<'_, B>]) -> Result<Vec<(u32, String, Vec<f32>)>> {
+    pub fn fire_outputs(
+        &mut self,
+        lanes: &[Seated<'_, B>],
+    ) -> Result<Vec<(u32, String, Vec<f32>)>> {
         use engine::frame::Shell as FrameShell;
         if lanes.iter().any(|lane| !lane.refs) {
             let seats = self.pools.seat_segments();
@@ -2974,7 +4161,11 @@ impl<B: Serve> Shell<B> {
         let read: Vec<&ReadSpan> = (layout.iter())
             .filter(|span| span.rows > 0 && span.seated)
             .collect();
-        let end = read.iter().map(|span| span.at + span.bytes()).max().unwrap_or(0);
+        let end = read
+            .iter()
+            .map(|span| span.at + span.bytes())
+            .max()
+            .unwrap_or(0);
         let mut raw = vec![0u8; usize::try_from(end).unwrap_or(usize::MAX)];
         self.readout[arm].read(0, &mut raw)?;
         Ok(read
@@ -3570,9 +4761,9 @@ impl<B: Serve> Shell<B> {
                     return Err(program(
                         "serve::feed_inputs",
                         format!(
-                            "lane {} runs in a class that reads guest input {}, and the lane \
-                             feeds no channel for it",
-                            row.source, seat.id
+                            "lane {} runs in class {}, which reads guest input {}, and the \
+                             lane feeds no channel for it",
+                            row.source, row.class, seat.id
                         ),
                     ));
                 };
@@ -3597,7 +4788,7 @@ impl<B: Serve> Shell<B> {
                 })?;
                 let at = base + offset * seat.row_bytes();
                 match cell {
-                    InputCell::Refused => {
+                    InputCell::Refused | InputCell::Zeros => {
                         self.inputs[arm].write_input(at, &vec![0u8; bytes as usize])?;
                     }
                     InputCell::Host { bytes: raw, dtype } => {
@@ -3678,6 +4869,21 @@ impl<B: Serve> Shell<B> {
         self.submit_bound.as_ref()
     }
 
+    /// For a test: the stated bound restated at `bound_ns`, every estimate
+    /// read at the ratio the rates step measured alone from here (no probe
+    /// re-times the clock, nothing measured kept), so a test admits a step
+    /// at a ratio it knows. A load whose boot states no bound is left as it
+    /// is.
+    #[doc(hidden)]
+    pub fn hold_to(&mut self, bound_ns: f64) {
+        if let Some(held) = self.submit_bound.as_mut() {
+            held.bound_ns = bound_ns;
+            held.scale = 1.0;
+            held.measured = crate::submit::Measured::default();
+            self.probe = None;
+        }
+    }
+
     /// Under a stated submit bound, re-times the device's clock where frame
     /// `frame` follows an idle device: where the device's queue is empty as
     /// its first step goes out (every submission made on it so far landed,
@@ -3718,7 +4924,7 @@ impl<B: Serve> Shell<B> {
         let took = probe.fire(&self.device)?;
         self.probed += 1;
         clock.probed(took);
-        held.scale = clock.scale();
+        held.probed(clock.ratio, held.clock_now());
         tracing::debug!(
             frame = frame.0,
             took_us = took / 1e3,
@@ -3729,10 +4935,114 @@ impl<B: Serve> Shell<B> {
         Ok(())
     }
 
-    /// The next step this shell enqueues walks a layer at a time (or, at
-    /// `false`, as its backend plans it).
-    pub fn split_next(&mut self, split: bool) {
-        self.split_next = split;
+    /// The next step this shell enqueues walks in submissions of
+    /// `layers_a_piece` consecutive layers (or, at `None`, as its backend
+    /// plans it).
+    pub fn split_next(&mut self, layers_a_piece: Option<u32>) {
+        self.split_next = layers_a_piece.is_some();
+        self.split_layers = layers_a_piece.unwrap_or(1).max(1);
+    }
+
+    /// Under a stated submit bound, the next step this shell enqueues is
+    /// `next` (its estimate at a ratio of 1), admitted at the clock the GPU
+    /// runs at now where the platform states it; `None` clears it.
+    pub fn estimate_next(&mut self, next: Option<crate::submit::Estimated>) {
+        self.estimate_next = match (next, self.submit_bound.as_ref()) {
+            (Some(next), Some(held)) => Some(crate::submit::Estimated {
+                hz: held.clock_now(),
+                ..next
+            }),
+            _ => None,
+        };
+    }
+
+    /// A step estimated at `estimate` (its flight's) landed; its device
+    /// time is read from `time` once its backend fills it, without waiting
+    /// ([`Shell::track`]). The clock it ran at is the faster of the GPU's
+    /// as it was admitted and as its landing is seen here (a drop inside
+    /// it read at the clock before: its ratio only rises by that). Nothing
+    /// where the step carries no estimate (no bound is stated).
+    pub fn timed(
+        &mut self,
+        estimate: Option<crate::submit::Estimated>,
+        time: crate::submit::DeviceTime,
+    ) {
+        if let Some(spans) = self.spans.as_mut() {
+            spans.push(time.clone());
+        }
+        let (Some(estimate), Some(held)) = (estimate, self.submit_bound.as_ref()) else {
+            return;
+        };
+        let hz = match (estimate.hz, held.clock_now()) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        self.timing
+            .push((crate::submit::Estimated { hz, ..estimate }, time));
+    }
+
+    /// The kernels the last walked step picked, by class (a dense matmul at
+    /// its rows, attention tiled or walked).
+    #[must_use]
+    pub fn last_picks(&self) -> &[String] {
+        &self.last_picks
+    }
+
+    /// The device time, ns, of the last fire whose time [`Shell::track`]
+    /// read, under a stated bound.
+    #[must_use]
+    pub fn last_landed_ns(&self) -> Option<u64> {
+        self.last_landed
+    }
+
+    /// Under a stated submit bound, every landed fire's device time filled
+    /// so far is read against its estimate into the bound's measured ratios
+    /// (`crate::submit::Measured`), and what landed more than a bound ago
+    /// drops out: before a step is admitted. Reads only what the backends
+    /// filled where they saw the fires land; waits on nothing.
+    pub fn track(&mut self) {
+        let Some(held) = self.submit_bound.as_mut() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        let last = &mut self.last_landed;
+        self.timing.retain(|(estimate, time)| match time.get() {
+            None => true,
+            Some(None) => false,
+            Some(Some(ns)) => {
+                *last = Some(ns);
+                // A step that went out a layer at a time spans the host's
+                // encoding between its submissions too (a desktop GPU's
+                // 0.5 ms layers ran ~10x their estimate so): its time is
+                // said, its ratio not kept. A step in one submission, the
+                // decodes and every prompt piece that fits whole, keeps
+                // the device's own.
+                let ratio = if estimate.pieces > 1 {
+                    held.age(now);
+                    None
+                } else {
+                    held.landed(now, estimate.rows, estimate.ns, ns, estimate.hz)
+                };
+                // Each fire's device time against its estimate, at debug
+                // (its fields computed only where it is enabled).
+                tracing::debug!(
+                    frame = estimate.at.frame.0,
+                    step = estimate.at.step,
+                    rows = estimate.rows,
+                    lanes = estimate.lanes,
+                    pieces = estimate.pieces,
+                    estimate_ms = estimate.ns / 1e6,
+                    measured_ms = ns as f64 / 1e6,
+                    clock_mhz = %estimate
+                        .hz
+                        .map_or_else(|| "unknown".to_string(), |hz| (hz / 1_000_000).to_string()),
+                    ratio = ?ratio,
+                    "submit bound: a fire landed"
+                );
+                false
+            }
+        });
+        held.age(now);
     }
 
     pub fn harvest_through(&mut self, seq: u64) -> Result<()> {
@@ -4445,7 +5755,8 @@ impl<B: Serve> Shell<B> {
             .iter()
             .position(|&rows| rows == composition.bucket())
             .unwrap_or(0) as u32;
-        let staged = crate::mask::stage(&masks).map_err(|fault| fault.of_rows(composition.lanes()))?;
+        let staged =
+            crate::mask::stage(&masks).map_err(|fault| fault.of_rows(composition.lanes()))?;
         let mut windows = Windows::of(
             &self.trace,
             &self.compiled,
@@ -4647,19 +5958,17 @@ impl<B: Serve> Shell<B> {
         }));
         // Each capturing lane's rows by their bases in the score room's
         // key and page rows ([`crate::arena::Span::slots`] binds them).
-        let capture_table = self
-            .span
-            .capture()
-            .map_or_else(Vec::new, |rows| scored.table(&indptr_host, rows.keys, rows.pages));
-        let (readout_rows, readout_layout) =
-            readout_table(
-                &composition,
-                lanes,
-                &self.readouts,
-                &scored,
-                |class| self.readout_for(class),
-                |plane| self.gathers_readout && self.readouts[plane].seam == Kind::Readout,
-            )?;
+        let capture_table = self.span.capture().map_or_else(Vec::new, |rows| {
+            scored.table(&indptr_host, rows.keys, rows.pages)
+        });
+        let (readout_rows, readout_layout) = readout_table(
+            &composition,
+            lanes,
+            &self.readouts,
+            &scored,
+            |class| self.readout_for(class),
+            |plane| self.gathers_readout && self.readouts[plane].seam == Kind::Readout,
+        )?;
         let bound = self.inputs[arm].write(
             &self.handles,
             &crate::inputs::Fire {
@@ -4753,7 +6062,11 @@ impl<B: Serve> Shell<B> {
             .lanes()
             .iter()
             .enumerate()
-            .filter(|&(lane, _)| scored.row(u32::try_from(lane).unwrap_or(u32::MAX)).is_some())
+            .filter(|&(lane, _)| {
+                scored
+                    .row(u32::try_from(lane).unwrap_or(u32::MAX))
+                    .is_some()
+            })
             .find_map(|(_, row)| lanes[row.source as usize].scores)
             .map(|cell| (&cell.buffer, cell.at, cell.bytes));
         // A naming walk fires nothing: its capturing classes' rows bind the
@@ -4763,7 +6076,9 @@ impl<B: Serve> Shell<B> {
             _ => None,
         };
         let room = room.or(named.map(|buffer| (buffer, 0, u64::MAX)));
-        let slots = self.span.slots(&self.handles, rung, fire_rows, scored, room)?;
+        let slots = self
+            .span
+            .slots(&self.handles, rung, fire_rows, scored, room)?;
         self.last_capture = self.capture_rows(&composition, &slots);
         let caches = self.pools.table(
             &self.handles,
@@ -4977,7 +6292,7 @@ impl<B: Serve> Shell<B> {
         let mut frame = Some(if bind_only {
             B::bind_frame(&self.device)?
         } else {
-            B::walk_frame(&self.device, keep)?
+            B::walk_frame(&self.device, keep, self.stamps.get(p.arm))?
         });
         self.land_merges(frame.as_mut().expect("just opened"), p)?;
         // The sink borrows the frame, which leaves in `Walked`, so it ends
@@ -5017,7 +6332,7 @@ impl<B: Serve> Shell<B> {
                 self.pools.segments(&self.handles)?,
             );
             if split {
-                run.flush_between_layers(p.done.as_ref().map(|done| done.at));
+                run.flush_between_layers(p.done.as_ref().map(|done| done.at), self.split_layers);
             }
             walk(
                 &self.trace,
@@ -5027,8 +6342,9 @@ impl<B: Serve> Shell<B> {
                 cursor,
                 Filter::default(),
             )?;
-            run.take_cuts()
+            (run.take_cuts(), run.take_picks())
         };
+        let (cuts, picks) = cuts;
 
         let launches = (0..self.compiled.template().len() as u32)
             .map(|region| p.windows.runs(region).max(1))
@@ -5037,6 +6353,7 @@ impl<B: Serve> Shell<B> {
             frame,
             launches,
             cuts,
+            picks,
         })
     }
 
@@ -5067,6 +6384,9 @@ struct Walked<B: Serve> {
     cuts: Vec<crate::store::experts::Cut<B>>,
 
     launches: u32,
+
+    /// The kernels it picked, by class (`Run::take_picks`).
+    picks: Vec<String>,
 }
 
 /// One lane's VAE clips: each box `[t, h, w]` and the voxel rows they hold,
@@ -5437,6 +6757,10 @@ pub struct Flight<B: Serve> {
     pub rows: Vec<ReadSpan>,
     pub pixels: PixelSpans,
     pub api: B::Flight,
+    /// Under a stated submit bound, the step's estimate at a ratio of 1,
+    /// which its measured device time is read against once it lands
+    /// ([`Shell::timed`]).
+    pub estimate: Option<crate::submit::Estimated>,
 }
 
 impl<B: Serve> engine::frame::Shell for Shell<B> {
@@ -5490,6 +6814,23 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
         } else {
             B::plan(self, &mut prepared)?
         };
+        // How each step went to the device, where a bound is stated: the
+        // recording it replayed, or the walk it took (kept to replay, eager,
+        // or split in runs of `layers_a_piece` layers).
+        if self.submit_bound.is_some() {
+            tracing::debug!(
+                target: "engine_gpu::api",
+                rung = prepared.rung,
+                plan = match &plan {
+                    Plan::Replayed { .. } => "replayed",
+                    Plan::Walk { split: true, .. } => "walked split",
+                    Plan::Walk { keep: Some(_), .. } => "walked, kept to replay",
+                    Plan::Walk { keep: None, .. } => "walked eagerly",
+                },
+                layers_a_piece = self.split_layers,
+                "submit bound: a step goes to the device"
+            );
+        }
         let (keep, split) = match plan {
             Plan::Replayed {
                 pending,
@@ -5515,7 +6856,22 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
         };
         self.recorded += u64::from(keep.is_some());
         self.unkept += u64::from(keep.is_none());
-        let walked = self.walk_once(&prepared, keep.is_some(), split)?;
+        let walked = self.walk_once(&prepared, keep.is_some(), split);
+        self.split_layers = 1;
+        let walked = walked?;
+        // The kernels the walk picked, by class: what a split step ran
+        // against the whole step its rung records (its own line, kept).
+        if self.submit_bound.is_some() {
+            tracing::debug!(
+                target: "engine_gpu::api",
+                rung = prepared.rung,
+                split,
+                kept = keep.is_some(),
+                picks = ?walked.picks,
+                "submit bound: a walked step's kernel picks"
+            );
+        }
+        self.last_picks.clone_from(&walked.picks);
         let mut frame = walked.frame.expect("the walk opened a frame");
 
         // Each read plane's buffer (the span's, or a score room's) and every
@@ -5561,15 +6917,16 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
         // a source buffer: a pair of barriers each, not one a lane.
         let mut layout = prepared.readout_layout.clone();
         let mut regions: Vec<(B::Buffer, Vec<(u64, u64, u64)>)> = Vec::new();
-        for span in (layout.iter_mut())
-            .filter(|span| span.rows > 0 && (span.seated || span.spanned))
+        for span in
+            (layout.iter_mut()).filter(|span| span.rows > 0 && (span.seated || span.spanned))
         {
             let plane = &self.readouts[span.plane as usize];
-            let (from, layers) = bases[span.plane as usize]
-                .as_ref()
-                .ok_or_else(|| Fault::Unbound {
-                    what: format!("output `{}`, a read plane of no value", plane.output),
-                })?;
+            let (from, layers) =
+                bases[span.plane as usize]
+                    .as_ref()
+                    .ok_or_else(|| Fault::Unbound {
+                        what: format!("output `{}`, a read plane of no value", plane.output),
+                    })?;
             let row_bytes = u64::from(plane.width) * elem(plane.dtype);
             let gathered = self.gathers_readout && plane.seam == Kind::Readout;
             let (first, direct) = (span.first, span.direct);
@@ -5601,7 +6958,10 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
             let copies = span_copies(span, layers, row_bytes, source_row)
                 .into_iter()
                 .map(|copy| (copy.from, copy.to, copy.bytes));
-            match regions.iter_mut().find(|(buffer, _)| buffer.slab_id() == from.slab_id()) {
+            match regions
+                .iter_mut()
+                .find(|(buffer, _)| buffer.slab_id() == from.slab_id())
+            {
                 Some((_, list)) => list.extend(copies),
                 None => regions.push((from.clone(), copies.collect())),
             }
@@ -5679,6 +7039,7 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
             rows,
             pixels,
             api: B::fly(pending, fed),
+            estimate: self.estimate_next.take(),
         });
         Ok(Landed {
             seq,
@@ -6224,7 +7585,7 @@ impl<B: Serve> Shell<B> {
         let classes: Vec<usize> = (0..self.compiled.classes.classes.len())
             .filter(|&class| !self.captures(class))
             .collect();
-        for class in classes {
+        for &class in &classes {
             // Every count of lanes with every power of two of rows they can
             // bring between them (a decode is rows = lanes, a prefill one
             // lane), the rows spread over the lanes: each rung's views are
@@ -6248,6 +7609,22 @@ impl<B: Serve> Shell<B> {
                     );
                     rows = rows.saturating_mul(2);
                 }
+            }
+            // A lane of the class with one row beside a lane of another class
+            // bringing the rest of each rung's rows: a class's region runs
+            // its own rows, and a fire of its lanes alone brings it few rows
+            // only at the smallest rungs, where a decode of few rows takes
+            // its own kernels (the attention's split over keys) at whatever
+            // rung its fire's other lanes choose.
+            let filler = classes
+                .iter()
+                .copied()
+                .find(|&other| other != class)
+                .unwrap_or(class);
+            let mut tokens = 2u32;
+            while tokens <= top {
+                shapes.push(vec![(filler, tokens - 1), (class, 1)]);
+                tokens = tokens.saturating_mul(2);
             }
         }
         // Where the trace buffers a recurrence, a lane buffering its rows at

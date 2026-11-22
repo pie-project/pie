@@ -114,6 +114,18 @@ impl Kernel {
             Kernel::Pairs16 => 16,
         }
     }
+    /// The columns one workgroup of it computes: a matmul over a slice of
+    /// a plane's columns that is a whole number of these runs the plane's
+    /// own tiles.
+    #[must_use]
+    pub fn col_tile(self) -> u32 {
+        match self {
+            Kernel::GemvV { .. } | Kernel::Gemv | Kernel::PairsGemv { .. } => 8,
+            Kernel::Coopmat | Kernel::Pairs16 | Kernel::Pairs64 => 64,
+            Kernel::Register { cols, .. } => cols,
+            Kernel::Tiled => 32,
+        }
+    }
     /// The rows that share one read of the weight: a workgroup's rows. A
     /// matmul of `m` rows reads its weight `ceil(m / rows_a_read)` times
     /// (the plain vector kernels once a row, the eight-column one once a
@@ -223,6 +235,19 @@ pub fn kernels(
         crate::encode::distinct(&mut all, kernel(target, vector, op, 1, n, k)?);
     }
     Ok(all)
+}
+
+/// The kernel a projection of `n` columns over a contraction of `k` fires
+/// under `tactic`, at any rows: what a measurement of it is keyed by.
+pub fn entry(target: Target, tactic: Tactic, n: u32, k: u32) -> Result<Fire, Error> {
+    kernel(target, tactic, "linear.entry", 1, n, k)
+}
+
+/// The workgroups a projection of `m` rows over `n` columns and a
+/// contraction of `k` launches under `tactic`: its kernel's grid.
+pub fn workgroups(target: Target, tactic: Tactic, m: u32, n: u32, k: u32) -> Result<u64, Error> {
+    let fire = kernel(target, tactic, "linear.workgroups", m, n, k)?;
+    Ok(fire.groups.iter().map(|&g| u64::from(g)).product())
 }
 
 /// The kernel a projection of `m` rows takes, at its grid.

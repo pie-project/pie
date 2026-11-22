@@ -547,7 +547,6 @@ fn a_park_and_unpark_moves_through_the_host_and_rebinds_the_new_refs() {
         }],
         adapter: Vec::new(),
         scratch: ::engine::ScratchPlace::None,
-        resident: ::engine::ScratchPlace::None,
         pair: ::engine::ScratchPlace::None,
         pair_generation: 0,
     }));
@@ -1053,6 +1052,7 @@ fn bind_registering(engine: &mut FakeEngine) -> (InstanceBinding, u64) {
         &binding,
         |id| held_ids.contains(&id),
         None,
+        |_| true,
     )
     .unwrap();
     let mut rings = super::take_rings(Some(&roles), engine, &plans)
@@ -1197,6 +1197,55 @@ fn a_shared_adapter_is_one_set_of_slots_freed_at_the_last_close() {
     roles.lock().unwrap().close_instance(second);
     assert_eq!(held(&device), before, "freed at the last close");
     assert!(roles.lock().unwrap().slots(Owner::Adapter(7)).is_empty());
+}
+
+/// A shared adapter is its holders' while any of them may still fire: with
+/// one holder's park in flight, another's park leaves the adapter where it
+/// lies, so when the first park is taken back (the tier below full) its
+/// instance is resident on its adapter, never on slots given back (the
+/// pair's alias, the L40S's CUDA 700 on c8077be0f). Once every holder's
+/// park has landed, the adapter is parked where it lies, for a move down.
+#[test]
+fn a_shared_adapter_stays_while_a_holder_may_still_fire() {
+    let Pools { roles, .. } = pools();
+    let mut engine = adapting(7);
+    let _first = bind(&roles, &mut engine, Vec::new(), 1);
+    let _second = bind(&roles, &mut engine, Vec::new(), 2);
+    let was = engine.bindings[0].adapter_slots.clone();
+    let first = roles.lock().unwrap().prepare_park(holder(1)).unwrap();
+    let second = roles.lock().unwrap().prepare_park(holder(2)).unwrap();
+    assert!(
+        second.copies().iter().all(|copy| copy.shape != ADAPTER),
+        "a holder on its way keeps the adapter on the device"
+    );
+    roles.lock().unwrap().commit(second);
+    roles.lock().unwrap().abort(first);
+    assert_eq!(
+        roles.lock().unwrap().slots(Owner::Adapter(7)),
+        was,
+        "the resident holder's adapter where it lay"
+    );
+    // Both parks in flight at once, both landing: neither took the
+    // adapter, and once both have landed it is parked where it lies, live,
+    // room a move down takes.
+    let Pools { roles, .. } = pools();
+    let mut engine = adapting(7);
+    let _first = bind(&roles, &mut engine, Vec::new(), 1);
+    let _second = bind(&roles, &mut engine, Vec::new(), 2);
+    let was = engine.bindings[0].adapter_slots.clone();
+    let first = roles.lock().unwrap().prepare_park(holder(1)).unwrap();
+    let second = roles.lock().unwrap().prepare_park(holder(2)).unwrap();
+    roles.lock().unwrap().commit(first);
+    assert!(
+        roles.lock().unwrap().parked_chunk_slots(holder(3)).is_empty(),
+        "a holder still on its way: not parked yet"
+    );
+    roles.lock().unwrap().commit(second);
+    assert_eq!(roles.lock().unwrap().slots(Owner::Adapter(7)), was, "kept, live");
+    assert!(
+        !roles.lock().unwrap().parked_chunk_slots(holder(3)).is_empty(),
+        "parked where it lies: room a move down takes"
+    );
 }
 
 #[test]
@@ -1452,7 +1501,6 @@ fn an_instance_closed_between_a_restore_and_its_rebind_is_not_rebound() {
             rings: Vec::new(),
             adapter: Vec::new(),
             scratch: ::engine::ScratchPlace::None,
-            resident: ::engine::ScratchPlace::None,
             pair: ::engine::ScratchPlace::None,
             pair_generation: 0,
         })

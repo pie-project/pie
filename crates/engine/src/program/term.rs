@@ -345,6 +345,7 @@ mod tests {
     /// afresh from the pairs then, and the brute force's; fits that cross
     /// no breakpoint build nothing.
     #[test]
+    #[allow(clippy::print_stdout, reason = "the test reports what it built, under --nocapture")]
     fn a_fitted_term_is_the_term_built_afresh() {
         let mut seed = 0x2545_f491_4f6c_dd1du64;
         let mut next = |below: u64| {
@@ -465,6 +466,7 @@ mod tests {
     /// What a rebuild costs, printed (`--nocapture`): every bind and close
     /// builds the table again.
     #[test]
+    #[allow(clippy::print_stdout, reason = "the test reports its timing, under --nocapture")]
     fn a_rebuild_is_timed() {
         let mut seed = 7u64;
         let mut next = |below: u64| {

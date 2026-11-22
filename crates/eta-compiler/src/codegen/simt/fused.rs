@@ -641,6 +641,53 @@ pub fn splits_rows(stage: &CompiledStage, region: &Region) -> bool {
     streamed
 }
 
+/// The launches (phases) a region whose rows split runs in: one, and one
+/// more past each stream that reduces or argmaxes (`emit_stream` begins a
+/// phase there). 1 for a region whose rows do not split.
+#[must_use]
+pub fn split_phases(stage: &CompiledStage, region: &Region) -> u32 {
+    if !splits_rows(stage, region) {
+        return 1;
+    }
+    let Some(kinds) = stream_rows(stage, region) else {
+        return 1;
+    };
+    let ops: Vec<OpView> = OpView::of_all(&stage.normalized.ops);
+    let bases = result_bases(&ops);
+    let direct = analyze_direct_argmax(stage, region, &bases);
+    let claimed = direct.claimed();
+    let skipped = direct.skipped;
+    let direct_topk = analyze_direct_topk(stage);
+    let mut streams = super::stream::Streams::new(
+        stage,
+        region,
+        &ops,
+        &bases,
+        &kinds,
+        &claimed,
+        &skipped,
+        &direct_topk,
+    );
+    streams.split = true;
+    let mut phases = 1u32;
+    let mut at = 0usize;
+    while at < streams.order.len() {
+        let node = streams.order[at];
+        if left_out(&skipped, &ops, node) {
+            at += 1;
+            continue;
+        }
+        match streams.meets_after(at) {
+            Some((covered, meets)) => {
+                phases += u32::from(meets);
+                at += covered;
+            }
+            None => at += 1,
+        }
+    }
+    phases
+}
+
 pub fn emit_fused_region(
     dialect: Dialect,
     entry_name: &str,
@@ -857,6 +904,10 @@ pub fn emit_fused_region(
                 continue;
             }
         }
+        // A split row's op outside a stream runs in its region's current
+        // phase (`emit_stream`'s count of the phases its meets begin).
+        let chunk_at = source.len();
+        let phase = streams.as_ref().filter(|_| split).map(|s| s.meets.get());
         if is_view(stage, region, op, base) {
             aliases.elide(base, op.args[0]);
             continue;
@@ -867,6 +918,7 @@ pub fn emit_fused_region(
                 source,
                 "  {{\n    ptir_split_copy(scratch + offsets[{from}u], scratch + offsets[{base}u], descriptors[{base}u].len, descriptors[{base}u].dtype, ptir_part, ptir_split);\n{TAIL}  }}"
             );
+            guard_phase(&mut source, chunk_at, phase);
             continue;
         }
         if matches!(op.tag, tags::SCATTER_ADD | tags::SCATTER_SET)
@@ -953,9 +1005,19 @@ pub fn emit_fused_region(
             source.push_str("    __syncthreads();\n");
         }
         source.push_str("  }\n");
+        guard_phase(&mut source, chunk_at, phase);
     }
     source.push_str("}\n");
     Ok(source)
+}
+
+/// Guards the chunk emitted at `at` (an op's block, `  {` on) to run only in
+/// split phase `phase`, where the region's rows split.
+fn guard_phase(source: &mut String, at: usize, phase: Option<u32>) {
+    let Some(phase) = phase else { return };
+    if source[at..].starts_with("  {") {
+        source.insert_str(at + 2, &format!("if (ptir_phase == {phase}u) "));
+    }
 }
 
 /// The most ops and values whose tables a region stages in shared memory:

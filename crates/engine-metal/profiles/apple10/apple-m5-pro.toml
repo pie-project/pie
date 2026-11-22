@@ -46,5 +46,19 @@ scan_gelems = 305.5
 few_row_tflops = 25.09
 workgroups_per_core = 2.39
 
+[kernel]
+# kernel.dense from `pie tune metal` (quick grid) on 2026-11-21: the tensor-op
+# tile, the few-row vector forms and the simdgroup row tiles timed at rows 2 to
+# 512 over Qwen3-0.6B's, Qwen3.5-0.8B's, Gemma 4 E4B's and an 8B layer's bf16
+# weight shapes, each launch checked against an f64 reference; this ladder runs
+# at 1.009x the per-point best, the unmeasured route (the tile from 8 rows) at
+# 1.033x. At 8 rows the tile pads 8 rows to its 32 and loses to the 8-row
+# simdgroup tile by 1.1-1.9x; from 10 rows it wins by up to 1.8x.
+dense = [
+  { when = "rows >= 10", use = "mpp" },
+  { when = "rows < 8 and n < 248320", use = "rows" },
+  "tile",
+]
+
 [provenance]
 rates = "Metal's rates step (pie tune metal --rates) on 2026-11-18, the median of five runs: each kernel through the dispatch serving runs, timed by the GPU in frames the shared rule settles; the matmul at n = k = 1024, 2048, 4096 over engine::rates::weights_at planes, attention over engine::rates::attn_sets_at sets, each set touched once by the first point over it, the per-row ops warmed; the few-row matmul at m = 4 to 256 over n = k = 4096, its most flops over time; workgroups a core from the matmul's first curve rows over as few columns as launch one workgroup a core or fewer, against the curve's rate there; operands: engine::rates' pattern; launch: 4 of 5 runs read 7.8-7.9 us, one 1.7 us, a device state seen in about 1 run in 6 that also reads the per-row ops ~4% and short matmuls 10-25% lower; the medians are the five runs'"

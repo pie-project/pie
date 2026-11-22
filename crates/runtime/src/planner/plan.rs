@@ -64,7 +64,8 @@ enum Step {
         rise: Option<u32>,
     },
     Release(DevicePageReservation),
-    Done,
+    /// Nothing to do this pass, and why (recorded as the pass's end).
+    Done(&'static str),
 }
 
 pub(super) enum ServeOutcome {
@@ -85,13 +86,56 @@ enum Board {
 pub(super) const STALL_SAYS_AGAIN: std::time::Duration =
     super::residency_planner::ADMIT_SAYS_AFTER;
 
+/// A count of processes and the first few of them, for a log line.
+pub(super) fn some_pids<'a>(pids: impl ExactSizeIterator<Item = &'a ProcessId>) -> String {
+    const SHOWN: usize = 4;
+    let count = pids.len();
+    let shown: Vec<String> = pids.take(SHOWN).map(ToString::to_string).collect();
+    format!("{count}{:?}", shown)
+}
+
+// Tests that hold the planner to the progress invariant panic where a settled
+// pass leaves a head waiting with nothing in flight (`dump_stall`). Per
+// thread: a test's passes run on its own thread, and tests run side
+// by side.
+#[cfg(test)]
+thread_local! {
+    pub(super) static PROGRESS_STRICT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl ResidencyPlanner {
     pub fn plan(self: &Arc<Self>) {
         // A grant dropped unspent during the pass gave back room the pass
         // may have read before it came: the pass runs again on the pool as
         // it stands ([`super::grant::RoomReturns`]), so the drop, which
         // cannot plan itself, wakes the head within this step.
+        // Edge-triggered: a wake on the generation the last no-step pass
+        // ended on reads what that pass read, and plans nothing new. A
+        // stuck head is said once and costs no pass until an event (the
+        // Mac Pro's g2 spin: 56,671 no-step lines, ~199 s of map passes).
+        let generation = self.generation();
+        ptrace!("plan pass settled={}", *self.settled_at.lock() == Some(generation));
+        if *self.settled_at.lock() == Some(generation) {
+            self.stats.skipped_wakes.fetch_add(1, Ordering::Relaxed);
+            self.returns
+                .wake_cause
+                .store(super::grant::WAKE_CALL, Ordering::Release);
+            return;
+        }
         self.stats.plan_passes.fetch_add(1, Ordering::Relaxed);
+        self.pass_landed.store(
+            self.stats.fires_landed.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+        let began = crate::rt::Instant::now();
+        struct Timed<'a>(&'a super::stats::PlannerStats, crate::rt::Instant);
+        impl Drop for Timed<'_> {
+            fn drop(&mut self) {
+                self.0
+                    .pass_took(u64::try_from(self.1.elapsed().as_micros()).unwrap_or(u64::MAX));
+            }
+        }
+        let _timed = Timed(&self.stats, began);
         let cause = self
             .returns
             .wake_cause
@@ -100,6 +144,7 @@ impl ResidencyPlanner {
             self.returns.planning.store(true, Ordering::Release);
             self.returns.plan_begins();
             self.swap_bound.store(false, Ordering::Release);
+            let steps = crate::rt::Instant::now();
             let on_grow = loop {
                 let seen = self.returns.epoch();
                 let on_grow = self.plan_once();
@@ -107,8 +152,11 @@ impl ResidencyPlanner {
                     break on_grow;
                 }
             };
-            self.returns.planning.store(false, Ordering::Release);
+            self.phase_took(0, steps);
+            let wants = crate::rt::Instant::now();
             self.publish_wants();
+            self.returns.planning.store(false, Ordering::Release);
+            self.phase_took(1, wants);
             // Room that came free while the pass ran (its signal woke no one
             // then) and meets what the head lacks now: planned on at once.
             if self.returns.waiters.load(Ordering::Acquire) == 0
@@ -117,6 +165,22 @@ impl ResidencyPlanner {
                 break on_grow;
             }
         };
+        // A head left stuck is passed over and the pass planned on for the
+        // waiters behind it, until one moves or none is left
+        // ([`Self::stuck_head`]); the stall dump then reads the queue's
+        // true head.
+        let mut on_grow = on_grow;
+        let mut passed = false;
+        while !on_grow && let Some(stuck) = self.stuck_head() {
+            self.with_inner(|inner| inner.passed.push(stuck));
+            passed = true;
+            on_grow = self.plan_once();
+        }
+        if passed {
+            self.with_inner(|inner| inner.passed.clear());
+            self.publish_wants();
+        }
+        let rest = crate::rt::Instant::now();
         // The waiters parked behind a grow the walk was promised, now.
         let parked = if on_grow {
             self.with_inner(|inner| inner.queue.values().filter(|w| w.is_unmet()).count())
@@ -126,12 +190,89 @@ impl ResidencyPlanner {
         self.stats
             .grow_parked
             .store(parked as u64, Ordering::Relaxed);
-        if !on_grow {
+        // A force spans the one pass after the stall that set it: one this
+        // pass did not take (it ended before its eviction step, or on
+        // something in flight) is stale, read later beside evictions and
+        // restores in flight (the L40S at 3 GiB on c8077be0f: forced passes
+        // said with evicting=2 restoring=1, and after "kv on its way").
+        self.force_moves.store(false, Ordering::Release);
+        // Stuck as it began, its head is said: only where a head was passed
+        // over (every head after it found stuck too, or moved) can one be.
+        if !on_grow && passed {
             self.dump_stall();
         }
         // A waiter served or gone lacks nothing now.
         self.report_short();
         self.say_long_waits(cause);
+        self.phase_took(2, rest);
+        // Ended where it began, it took no step: settled until an event.
+        let ended = self.generation();
+        *self.settled_at.lock() = (ended == generation).then_some(ended);
+    }
+
+    fn phase_took(&self, phase: usize, since: crate::rt::Instant) {
+        if let Some(total) = self.stats.plan_phase_us.get(phase) {
+            total.fetch_add(
+                u64::try_from(since.elapsed().as_micros()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// Passes that built the occupancy map, their total microseconds, and
+    /// the quiet waits ([`super::stats::PlannerStats::quiet_waits`]).
+    #[must_use]
+    pub fn map_census(&self) -> (u64, u64, u64) {
+        (
+            self.stats.map_passes.load(Ordering::Relaxed),
+            self.stats.map_pass_us.load(Ordering::Relaxed),
+            self.stats.quiet_waits.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Wakes skipped on a settled generation, and occupancy maps read from
+    /// the cache ([`super::stats::PlannerStats::skipped_wakes`],
+    /// [`super::stats::PlannerStats::map_cache_hits`]).
+    #[must_use]
+    pub fn edge_census(&self) -> (u64, u64) {
+        (
+            self.stats.skipped_wakes.load(Ordering::Relaxed),
+            self.stats.map_cache_hits.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Settled passes that found a head stuck (each repeat), passes forced
+    /// for one, and how long the oldest waiting head has waited (ms): a run
+    /// that ends stuck reads so, never clean.
+    #[must_use]
+    pub fn stuck_census(&self) -> (u64, u64, u64) {
+        let oldest = self.with_inner(|inner| {
+            inner
+                .queue
+                .values()
+                .filter(|waiter| waiter.is_unmet())
+                .map(|waiter| waiter.since.elapsed())
+                .max()
+                .unwrap_or_default()
+        });
+        (
+            self.stats.stuck_settles.load(Ordering::Relaxed),
+            self.stats.forced_passes.load(Ordering::Relaxed),
+            u64::try_from(oldest.as_millis()).unwrap_or(u64::MAX),
+        )
+    }
+
+    /// Restores refused again on the room their last refusal left.
+    #[must_use]
+    pub fn refusal_repeats(&self) -> u64 {
+        self.stats.refusal_repeats.load(Ordering::Relaxed)
+    }
+
+    /// A pass's time by phase, in total microseconds: its steps, the wants
+    /// published after them, the rest ([`super::stats::PlannerStats::plan_phase_us`]).
+    #[must_use]
+    pub fn phase_census(&self) -> [u64; 3] {
+        [0, 1, 2].map(|phase| self.stats.plan_phase_us[phase].load(Ordering::Relaxed))
     }
 
     /// Every opened chunk, by the live slots it holds and the state of the
@@ -169,7 +310,7 @@ impl ResidencyPlanner {
                 .collect();
             (inner.procs.keys().copied().collect::<Vec<_>>(), class)
         });
-        let mut map = self.port.chunk_occupants(&all);
+        let mut map = self.occupants(&all);
         map.merge(self.port.parked_occupants(super::residency_planner::SWEEP));
         let bucket = |slots: u32| match slots {
             0 => "0",
@@ -201,6 +342,103 @@ impl ResidencyPlanner {
             .join(" ")
     }
 
+    /// Whether `pid` is a process this planner holds: a request of its that
+    /// came back cancelled was dropped under it, not by its departure.
+    #[must_use]
+    pub fn registered(&self, pid: ProcessId) -> bool {
+        self.with_inner(|inner| inner.procs.contains_key(&pid))
+    }
+
+    /// Plan passes so far, their total time (us), mean (us) and the power of
+    /// two of microseconds 99 of each 100 fell under: the census the field
+    /// reads a pass's cost by.
+    #[must_use]
+    pub fn pass_census(&self) -> (u64, u64, u64, u64) {
+        self.stats.pass_census()
+    }
+
+    /// Frames the scheduler holds out under the fire cap (capped: complete,
+    /// wider than the rung in hand) as the engine's rung gate states them:
+    /// the widest one's rows and the process its raise is funded for.
+    pub(super) fn capped_line(&self) -> String {
+        let (_, engine) = self.port.locus();
+        format!(
+            "rows={} owner={:?}",
+            crate::store::shared::owed_cut_rows(engine),
+            crate::store::shared::owed_by(engine)
+        )
+    }
+
+    /// A restore head's whole restore placed by the store's takes
+    /// ([`super::pool::PoolPort::restore_placement`]): its kv pages still to
+    /// gather, its serve's state and its unpark's pieces taken first, its
+    /// pending bind's runs in what they leave. `None` for any other head.
+    pub(super) fn head_placement(
+        &self,
+        head: EntryKey,
+        need: &RunNeed,
+    ) -> Option<super::pool::RestorePlacement> {
+        let (pid, state, bind, kv) = self.with_inner(|inner| {
+            let waiter = inner
+                .queue
+                .get(&head)
+                .filter(|waiter| matches!(waiter.kind, WaitKind::Restore { .. }))?;
+            let bind = inner
+                .procs
+                .get(&waiter.pid)
+                .and_then(|proc| proc.bind_room)
+                .map(|need| (need.run, need.pieces));
+            Some((waiter.pid, waiter.rs_need(), bind, inner.restore_kv_missing(head)))
+        })?;
+        Some(self.port.restore_placement(pid, need, state, kv, bind))
+    }
+
+    /// Whose the device's kv pages and state units are: every process the
+    /// planner knows (resident or evicted), idle cache, and the rest no
+    /// one here names (state of a process gone, a checkpoint). The L40S at
+    /// 3 GiB on 5120cbc3c held 150 pages and 17 chunks with no process
+    /// resident, the pool's census naming only "store" as their holder.
+    pub(super) fn store_holders(&self) -> String {
+        let (model, engine) = self.port.locus();
+        let pids: Vec<(ProcessId, bool)> = self.with_inner(|inner| {
+            inner
+                .procs
+                .iter()
+                .map(|(pid, proc)| (*pid, proc.state == Residency::Resident))
+                .collect()
+        });
+        let (mut kv_resident, mut kv_away) = (0u32, 0u32);
+        let (mut rs_resident, mut rs_away) = (RsUnits::default(), RsUnits::default());
+        for &(pid, resident) in &pids {
+            let pages = super::holdings::held_page_count(pid, model, engine);
+            let rs = super::holdings::held_rs_units(pid, model, engine);
+            if resident {
+                kv_resident += pages;
+                rs_resident = rs_resident.add(rs);
+            } else {
+                kv_away += pages;
+                rs_away = rs_away.add(rs);
+            }
+        }
+        let kv_out = self.port.device_out();
+        let idle = self.port.reclaimable_idle();
+        let (rs_free, rs_total) = self.port.rs_stats();
+        let rs_held = rs_total.sub(rs_free);
+        format!(
+            "kv: out={kv_out} resident={kv_resident} not_resident={kv_away} idle={idle} \
+             unnamed={}; state: held=({},{}) resident=({},{}) not_resident=({},{}) unnamed=({},{})",
+            kv_out.saturating_sub(kv_resident + kv_away + idle),
+            rs_held.slots,
+            rs_held.pages,
+            rs_resident.slots,
+            rs_resident.pages,
+            rs_away.slots,
+            rs_away.pages,
+            rs_held.sub(rs_resident.add(rs_away)).slots,
+            rs_held.sub(rs_resident.add(rs_away)).pages,
+        )
+    }
+
     /// Each wait served this pass past [`super::wait::LONG_WAIT`], with
     /// what woke the pass: a field's gaps between dispatches past 100 ms
     /// (the L40S at 6 GiB) are attributed to the room signal, a poke, the
@@ -216,12 +454,29 @@ impl ResidencyPlanner {
             super::grant::WAKE_BEAT => "beat",
             _ => "call (an arrival, a release)",
         };
-        for (kind, waited) in waits {
+        let now = (self.port.free_chunks(), self.port.device_stats().0, self.raw_swap_free());
+        for super::wait::LongWait {
+            kind,
+            lacked,
+            wanted: ([want_chunks, want_list, want_swap], [free_then, pages_then]),
+            waited,
+        } in waits
+        {
+            let want = |n: u64| if n == u64::MAX { "-".to_owned() } else { n.to_string() };
             if let Some(count) = self.stats.long_waits.get(usize::from(cause)) {
                 count.fetch_add(1, Ordering::Relaxed);
             }
             tracing::info!(
                 kind,
+                lacked,
+                want_chunks = %want(want_chunks),
+                want_list = %want(want_list),
+                want_swap = %want(want_swap),
+                free_chunks_then = free_then,
+                free_pages_then = pages_then,
+                free_chunks_after_pass = now.0,
+                free_pages_after_pass = now.1,
+                swap_free_after_pass = now.2,
                 waited_ms = waited.as_millis() as u64,
                 woken_by,
                 "planner: a wait past 100 ms served"
@@ -238,6 +493,33 @@ impl ResidencyPlanner {
     /// chunks, the pool's own census and the planner's map over every
     /// process, so a silent scheduler names the head that holds it.
     pub(super) fn dump_stall(self: &Arc<Self>) {
+        // Room the governor's target holds back is what the head waits on:
+        // the target's rise, an outside event, plans again
+        // ([`Self::target_raised`]). No bug, and no stall.
+        let held_back = self.port.held_back();
+        if held_back > 0 {
+            self.with_inner(|inner| {
+                let Some((key, pid, kind)) = inner
+                    .unmet_head()
+                    .map(|(key, waiter)| (key, waiter.pid, waiter.kind_name()))
+                else {
+                    return;
+                };
+                if inner.nothing_in_flight()
+                    && inner.stall_dumped.is_none_or(|(at, _, _)| at != key)
+                {
+                    inner.stall_dumped = Some((key, 0, crate::rt::Instant::now()));
+                    tracing::info!(
+                        ?key,
+                        %pid,
+                        kind,
+                        held_back,
+                        "planner: the queue's head waits on the governor's target (room it holds back)"
+                    );
+                }
+            });
+            return;
+        }
         let gives = self.port.room_gives();
         let stalled = self.with_inner(|inner| {
             let Some((key, waiter)) = inner.unmet_head() else {
@@ -245,12 +527,22 @@ impl ResidencyPlanner {
                 return None;
             };
             // A rung raise taking the room it was served is in flight.
+            // So is a grant or a bind's room served and not yet taken:
+            // its waiter takes it and fires (a head passed over for it,
+            // [`Self::stuck_head`]).
             if !inner.nothing_in_flight()
                 || !inner.parked_moving.is_empty()
                 || inner.queue.values().any(Waiter::rise_untaken)
+                || inner.queue.values().any(Waiter::untaken)
             {
                 return None;
             }
+            // A compaction on its way moves the head's room as a move does.
+            if self.port.compaction_under_way() {
+                return None;
+            }
+            // Found again: counted each time, said once a head and room.
+            self.stats.stuck_settles.fetch_add(1, Ordering::Relaxed);
             if let Some((at, seen, said)) = inner.stall_dumped
                 && (at, seen) == (key, gives)
                 && said.elapsed() < STALL_SAYS_AGAIN
@@ -264,21 +556,31 @@ impl ResidencyPlanner {
             // standing names the part or shape the map does not count.
             let refusal = inner.procs.get(&waiter.pid).map(|proc| {
                 format!(
-                    "refused_on_this_pool={} roles_short={:?} bind_room={:?} why={:?}",
+                    "refused_on_this_pool={} roles_short={:?} bind_room={:?} why={:?} \
+                     refusal_room=(run, free_runs)={:?} free_chunks={:?}",
                     proc.roles_short_gives == Some(gives),
                     proc.roles_short.map(|need| (need.run, need.pieces)),
                     proc.bind_room.map(|need| (need.run, need.pieces)),
                     proc.roles_short_why,
+                    proc.roles_short_runs,
+                    proc.roles_short_free,
                 )
             });
+            let refused_run = inner
+                .procs
+                .get(&waiter.pid)
+                .and_then(|proc| proc.roles_short_runs.map(|(run, _)| run));
             // Its kv pages still to gather: an allocation's need, and a
             // restore's beside its runs.
             let kv_missing = waiter.kv_need().saturating_sub(inner.accum.len() as u32);
             let again = inner.stall_dumped.is_some_and(|(at, seen, _)| (at, seen) == (key, gives));
             inner.stall_dumped = Some((key, gives, crate::rt::Instant::now()));
-            Some((key, pid, kind, pids, again, refusal, kv_missing))
+            let (plan, blocked) = inner.plan_fields(key);
+            Some((key, pid, kind, pids, again, refusal, kv_missing, plan, blocked, refused_run))
         });
-        let Some((key, pid, kind, pids, again, refusal, kv_missing)) = stalled else {
+        let Some((key, pid, kind, pids, again, refusal, kv_missing, plan, blocked, refused_run)) =
+            stalled
+        else {
             return;
         };
         // What the head's step takes, read as the map and the step read it.
@@ -295,14 +597,29 @@ impl ResidencyPlanner {
             .victim_set()
             .map(|set| set.candidates(true).into_iter().map(|(pid, _)| pid).collect())
             .unwrap_or(pids);
-        let mut map = self.port.chunk_occupants(&pids);
+        let mut map = self.occupants(&pids);
         map.merge(self.parked_map(pid));
         // The moves the whole need takes, every length laid together (the
-        // map's own line reads one run of the longest length alone).
-        let need_moves = need
+        // map's own line reads one run of the longest length alone), a
+        // restore's own takes placed first by the store's takes, as the
+        // eviction plan reads it ([`Self::head_placement`]).
+        let placement = need.as_ref().and_then(|need| self.head_placement(key, need));
+        if let Some(placement) = &placement {
+            placement.lay(&mut map);
+        }
+        let short = match (&placement, &need) {
+            (Some(placement), _) => Some(placement.short.clone()),
+            (None, need) => need.clone(),
+        };
+        let need_moves = short
             .as_ref()
-            .map(|need| map.cheapest_need(need).map(|pids| pids.len()));
+            .map(|short| map.cheapest_need(short).map(|pids| pids.len()));
+        // The map's figure for the room the refusal read, at its run: the
+        // map's free runs once the head's own takes are laid, and its free
+        // chunks, beside the refusal's own.
+        let map_room = refused_run.map(|run| (run, map.free_runs(run), map.free.len()));
         let held_by = self.held_by_state();
+        let store = self.store_holders();
         let (map, census) = (map.explain(run), self.port.chunk_census(run));
         // Every head queued fits the pool alone (one past it is refused at
         // its ask): unserved with nothing in flight, the planner found no
@@ -312,12 +629,24 @@ impl ResidencyPlanner {
             %pid,
             kind,
             need = ?need,
+            short = ?short,
+            own_opened = ?placement.as_ref().map(|placement| placement.opened.len()),
+            bind_free_runs_after_own = ?placement.as_ref().and_then(|placement| placement.bind_free_runs),
             kv_missing,
             kv_chunks = kv_missing.div_ceil(self.port.chunks_as_pages(1).max(1)),
             again,
             refusal = %refusal.unwrap_or_default(),
+            map_room_at_refused_run = ?map_room,
             ?need_moves,
+            %plan,
+            %blocked,
+            capped = %self.capped_line(),
+            passes = ?self.pass_census(),
+            skipped_wakes = self.stats.skipped_wakes.load(Ordering::Relaxed),
+            map_cache_hits = self.stats.map_cache_hits.load(Ordering::Relaxed),
+            swap = ?self.swap_stats(),
             %held_by,
+            %store,
             free_runs = ?need.as_ref().map(|need| {
                 need.entries()
                     .iter()
@@ -331,6 +660,35 @@ impl ResidencyPlanner {
             "planner: the queue's head fits the pool alone and is unserved with nothing in \
              flight (a planner bug: no step found)"
         );
+        // The progress invariant: a settled pass leaves every waiting head
+        // served or something in flight that moves the generation. Broken,
+        // tests fail by name; served, the next pass plans the head's need
+        // as if its placement did not stand, and never waits.
+        #[cfg(test)]
+        if PROGRESS_STRICT.with(std::cell::Cell::get) {
+            panic!(
+                "progress invariant: head {key:?} ({kind}, pid {pid}) waits with nothing in \
+                 flight; need {need:?}, short {short:?}, need_moves {need_moves:?}, placement \
+                 {placement:?}, plan {plan}"
+            );
+        }
+        self.force_moves.store(true, Ordering::Release);
+        self.events.fetch_add(1, Ordering::AcqRel);
+        if let Some(notify) = self.returns.drain.get() {
+            notify.notify_one();
+        }
+    }
+
+    /// The governor's target rose past what the pool maps: a commit can
+    /// come where none could, room no event of the pool's own has told
+    /// yet. Waiters plan again on it (the Mac's verified beam mix beside
+    /// another suite: the target swung 693 to 779 MiB for 25 minutes,
+    /// processes parked as "plan: resident again" and none planned).
+    pub fn target_raised(self: &Arc<Self>) {
+        if self.returns.waiters.load(Ordering::Acquire) != 0 {
+            ptrace!("target raised: a commit can come");
+            self.poke();
+        }
     }
 
     /// The segment walk made no grow it promised: the plan this wakes goes
@@ -354,8 +712,49 @@ impl ResidencyPlanner {
         true
     }
 
-    /// One pass; true where it ends waiting on a grow.
+    /// One pass over the queue's heads; true where it ends waiting on a
+    /// grow. Heads passed over this pass ([`Self::stuck_head`]) stay passed
+    /// until [`Self::plan`] clears them.
     pub(super) fn plan_once(self: &Arc<Self>) -> bool {
+        self.plan_heads()
+    }
+
+    /// The queue's head left stuck as a pass settles: no move named for it,
+    /// nothing in flight, no parked state or idle cache moving down, no
+    /// tails being swept, no grant or raise served and not yet taken, no
+    /// compaction on its way. [`Self::plan`] passes such a head over for
+    /// the rest of the pass and plans the next waiter, so one behind it
+    /// that can go does (a decoder's page served from pages free, a restore
+    /// whose room below the head's moves need); each heads the next pass
+    /// again, planned first on whatever came back. Held at the stuck head,
+    /// nothing moved and nothing came that could move it (seeds 134, 624: a
+    /// bind short of chunks only a full disk could empty, decoders behind
+    /// it that free pages would serve, nothing in flight). Read once a pass
+    /// where the stall dump read its head before: a firing fleet's pass
+    /// pays nothing more.
+    fn stuck_head(&self) -> Option<(EntryKey, ProcessId)> {
+        let stuck = self.with_inner(|inner| {
+            let Some((key, waiter)) = inner.unmet_head() else {
+                // No head at all (none passed over): none to say again.
+                if inner.passed.is_empty() {
+                    inner.stall_dumped = None;
+                }
+                return None;
+            };
+            let pid = waiter.pid;
+            (inner.nothing_in_flight()
+                && inner.parked_moving.is_empty()
+                && !inner.queue.values().any(Waiter::rise_untaken)
+                && !inner.queue.values().any(Waiter::untaken))
+            .then_some((key, pid))
+        })?;
+        (!self.demoting.load(Ordering::Acquire)
+            && !self.sweeping.load(Ordering::Acquire)
+            && !self.port.compaction_under_way())
+        .then_some(stuck)
+    }
+
+    fn plan_heads(self: &Arc<Self>) -> bool {
         if self.pause_due.swap(false, Ordering::AcqRel) {
             self.pause_held();
         }
@@ -378,14 +777,14 @@ impl ResidencyPlanner {
                 // the room it was funded is its, and its leaving plans
                 // again.
                 if inner.queue.values().any(Waiter::rise_untaken) {
-                    return Step::Done;
+                    return Step::Done("a rung raise served and not yet taken holds the queue");
                 }
                 let Some((key, waiter)) = inner.unmet_head() else {
                     if inner.accum.len() > 0 && inner.queue.is_empty() {
                         let stranded = std::mem::take(&mut inner.accum);
                         return Step::Release(stranded);
                     }
-                    return Step::Done;
+                    return Step::Done("no unmet head");
                 };
                 if let WaitKind::BindRoom {
                     run, pieces, rise, ..
@@ -405,7 +804,14 @@ impl ResidencyPlanner {
                 // (the L40S: 8 of 9 opened chunks held by no candidate and
                 // nothing parked, nothing in flight). They go back. An
                 // allocation's surplus stays: a burst serves several from it.
-                if is_restore && inner.accum.len() as u32 > waiter.kv_need() {
+                // Not while a head this pass passed over holds them: given
+                // back, they were gathered again for it on the next pass,
+                // and given back again, a pass that never settled (seed
+                // 3392).
+                if is_restore
+                    && inner.passed.is_empty()
+                    && inner.accum.len() as u32 > waiter.kv_need()
+                {
                     let spare = inner.accum.len() as u32 - waiter.kv_need();
                     return Step::Release(inner.accum.donate(spare));
                 }
@@ -413,7 +819,7 @@ impl ResidencyPlanner {
                 // Its parked state is on its way down a tier: restored now,
                 // it would miss the items moving. The landing pokes.
                 if is_restore && inner.parked_moving.contains(&pid) {
-                    return Step::Done;
+                    return Step::Done("its parked state moves down a tier: restored once it lands");
                 }
                 let demand = match &waiter.kind {
                     WaitKind::Allocation { demand, .. } => Some(*demand),
@@ -451,7 +857,7 @@ impl ResidencyPlanner {
                         // this restore instead moved every resident for a
                         // restore the planner would not serve, and the
                         // restored one's bind waited behind it for good.
-                        Some(_)
+                        Some(need)
                             if inner
                                 .bind_restoring
                                 .is_some_and(|restoring| restoring != pid)
@@ -476,7 +882,32 @@ impl ResidencyPlanner {
                                     }),
                                     _ => None,
                                 })
-                                .unwrap_or(Step::Done)
+                                .unwrap_or_else(|| {
+                                    // Its bind served and not yet taken: the
+                                    // hand-off is under way, no wait on a
+                                    // fire. Withdrawn (evicted again): it
+                                    // holds this head no longer.
+                                    let bind = inner.queue.values().find_map(|waiter| match waiter.kind {
+                                        WaitKind::BindRoom { served, withdrawn, .. }
+                                            if Some(waiter.pid) == restoring && waiter.is_unmet() =>
+                                        {
+                                            Some((served, withdrawn))
+                                        }
+                                        _ => None,
+                                    });
+                                    match bind {
+                                        Some((true, _)) => {
+                                            Step::Done("the restored one's bind is served and not yet taken")
+                                        }
+                                        Some((_, true)) => Step::RestoreBindRoom { key, need },
+                                        // Nothing in flight to fire it: its
+                                        // room is planned, never waited on.
+                                        _ if inner.nothing_in_flight() => {
+                                            Step::RestoreBindRoom { key, need }
+                                        }
+                                        _ => Step::Done("waits for the restored one's bind to fire"),
+                                    }
+                                })
                         }
                         // Its whole need: the room its bind asks too.
                         Some(need) if room_stood != Some(key) => {
@@ -492,7 +923,13 @@ impl ResidencyPlanner {
                 }
             });
             let fund_by_eviction = match step {
-                Step::Done => return false,
+                // Every pass that stops says where, for the stall line
+                // (Mac Pro at 2 GiB on 3e0f0f18f: need_moves 1, ended=none,
+                // 4,435 no-step lines).
+                Step::Done(ended) => {
+                    self.plan_stopped(ended);
+                    return false;
+                }
                 Step::BindRoom {
                     key,
                     run,
@@ -557,11 +994,13 @@ impl ResidencyPlanner {
                         rs: RsUnits::default(),
                     };
                     if self.wait_on_grow(no_grow, need) {
+                        self.plan_stopped("bind room: waits on a grow the walk makes");
                         return true;
                     }
                     // Parked state lying on the device moves down a tier
                     // before any resident does.
                     if self.park_down_for(&RunNeed::one(run, pieces)) {
+                        self.plan_stopped("bind room: parked state moves down");
                         return false;
                     }
                     true
@@ -591,7 +1030,25 @@ impl ResidencyPlanner {
                         !other_restoring,
                         "selected only with no other restoring that can still fire"
                     );
-                    if pid.is_some_and(|pid| self.port.room_beside_own(pid, need.run, need.pieces)) {
+                    // The one placement its restore is sent on: its serve's
+                    // state, every piece of its unpark, then the bind's runs
+                    // ([`super::pool::PoolPort::restore_stands`]). Read
+                    // beside its dead parts alone, the bind stood here while
+                    // the restore's own check, after its unpark took its live
+                    // parts and its runs of two, did not: sent, refused
+                    // (PendingBindShort), sent again (Mac Pro at 2 GiB on
+                    // 7e75af541: 52k no-step lines, free runs (7, 3)).
+                    let whole = self
+                        .head_room(key)
+                        .unwrap_or_else(|| RunNeed::one(need.run, need.pieces));
+                    if pid.is_some_and(|pid| {
+                        !self.no_more_room_than_refused(pid)
+                            && (self
+                                .head_placement(key, &whole)
+                                .is_some_and(|placement| placement.stands())
+                                || self.take_send_regardless(pid))
+                    }) {
+                        self.plan_stopped("bind-suspended restore sent: its placement stands");
                         room_stood = Some(key);
                         continue;
                     }
@@ -609,11 +1066,13 @@ impl ResidencyPlanner {
                     }
                     .within(self.port.state_chunks(), Some((need.run, need.pieces)));
                     if self.park_down_for(&room) {
+                        self.plan_stopped("bind-suspended restore: parked state moves down");
                         return false;
                     }
                     // Funded once nothing in flight can free room
                     // ([`Inner::nothing_in_flight`]).
                     if !self.with_inner(|inner| inner.nothing_in_flight()) {
+                        self.plan_stopped("bind-suspended restore: something in flight, not funded");
                         return false;
                     }
                     true
@@ -661,23 +1120,43 @@ impl ResidencyPlanner {
                     // runs of four fluctuating with a decoding fleet's
                     // takes sent it again ~350 times a second, each unpark
                     // short of a chunk (Mac Pro on 3b45462d4).
-                    let refused = self.with_inner(|inner| {
-                        inner.unmet_head().and_then(|(_, waiter)| {
-                            inner
-                                .procs
-                                .get(&waiter.pid)
-                                .map(|proc| (proc.roles_short_runs, proc.roles_short_free))
-                        })
+                    // One placement decides: the store's own, its serve's
+                    // state laid first ([`super::pool::PoolPort::guest_need_free`]). It
+                    // goes again where that stands now, unless it stood as
+                    // the refusal left the pool too (it read a room the
+                    // unpark did not): then only once more chunks stand
+                    // free than the refusal left
+                    // ([`super::proc::Proc::roles_short_stood`]).
+                    let (head_key, stood_at, free_left) = self.with_inner(|inner| {
+                        inner
+                            .unmet_head()
+                            .map(|(key, waiter)| {
+                                let proc = inner.procs.get(&waiter.pid);
+                                (
+                                    Some(key),
+                                    proc.and_then(|proc| proc.roles_short_stood),
+                                    proc.and_then(|proc| proc.roles_short_free),
+                                )
+                            })
+                            .unwrap_or_default()
                     });
-                    let map_moved = match refused {
-                        Some((Some((at_run, at)), free)) => {
-                            self.port.guest_free_runs(at_run) > at
-                                && free.is_none_or(|free| self.port.free_chunks() > free)
-                        }
-                        Some((None, _)) => true,
-                        None => false,
-                    };
-                    if !understated && map_moved && self.port.guest_need_free(&room) {
+                    // Never on the room its last refusal was taken in.
+                    let _ = stood_at;
+                    let _ = free_left;
+                    let moved = self
+                        .with_inner(|inner| inner.unmet_head().map(|(_, waiter)| waiter.pid))
+                        .is_none_or(|pid| !self.no_more_room_than_refused(pid));
+                    if !understated
+                        && moved
+                        && head_key.is_some_and(|key| {
+                            self.head_placement(key, &room)
+                                .is_some_and(|placement| placement.stands())
+                                || self
+                                    .with_inner(|inner| inner.queue.get(&key).map(|waiter| waiter.pid))
+                                    .is_some_and(|pid| self.take_send_regardless(pid))
+                        })
+                    {
+                        self.plan_stopped("restore sent again: its placement stands");
                         self.with_inner(|inner| {
                             let pid = inner.unmet_head().map(|(_, waiter)| waiter.pid);
                             if let Some(proc) = pid.and_then(|pid| inner.procs.get_mut(&pid)) {
@@ -690,6 +1169,7 @@ impl ResidencyPlanner {
                     // Not funded yet: it waits for a completion (one that
                     // frees room pokes the plan, which looks again here).
                     if !fund {
+                        self.plan_stopped("restore short of runs: something in flight, not funded");
                         return false;
                     }
                     // Idle cache holds chunks too: one set goes, and the
@@ -708,6 +1188,7 @@ impl ResidencyPlanner {
                         rs: RsUnits::default(),
                     };
                     if self.wait_on_grow(no_grow, grow) {
+                        self.plan_stopped("restore short of runs: waits on a grow the walk makes");
                         return true;
                     }
                     // Parked state lying on the device (role slots their
@@ -716,6 +1197,7 @@ impl ResidencyPlanner {
                     // stall: host full, every process evicted, the head's
                     // runs held by parked role slots, nothing to evict).
                     if self.park_down_for(&room) {
+                        self.plan_stopped("restore short of runs: parked state moves down");
                         return false;
                     }
                     // Else the occupants of the chunks it could take move
@@ -742,17 +1224,20 @@ impl ResidencyPlanner {
                             rs: RsUnits::default(),
                         },
                     ) {
+                        self.plan_stopped("short of kv: waits on a grow the walk makes");
                         return true;
                     }
                     // Idle cache a policy keys above the floor moves down
                     // a tier before any is dropped; the rest is dropped.
                     if self.demote_idle(count) {
+                        self.plan_stopped("short of kv: idle cache moves down");
                         return false;
                     }
                     if self.reclaim_idle_once() {
                         continue;
                     }
                     if self.sweep_stranded(count, false) {
+                        self.plan_stopped("short of kv: stranded tails swept");
                         return false;
                     }
                     fund_by_eviction
@@ -768,7 +1253,10 @@ impl ResidencyPlanner {
                     // state could take: they go back before anything moves.
                     // Kept, they starved every replay of a restarted process
                     // of the state slot its lanes asked for.
-                    if surplus > 0 && self.port.rs_as_pages(need) > 0 {
+                    if surplus > 0
+                        && self.port.rs_as_pages(need) > 0
+                        && self.with_inner(|inner| inner.passed.is_empty())
+                    {
                         let spare = self.with_inner(|inner| {
                             let keep = inner.unmet_head().map_or(0, |(_, head)| head.kv_need());
                             let spare = (inner.accum.len() as u32).saturating_sub(keep);
@@ -786,6 +1274,7 @@ impl ResidencyPlanner {
                             rs: ask,
                         },
                     ) {
+                        self.plan_stopped("short of state: waits on a grow the walk makes");
                         return true;
                     }
                     // On a shared pool the chunks idle cache holds open for
@@ -793,6 +1282,7 @@ impl ResidencyPlanner {
                     // tier before any is dropped.
                     let as_pages = self.port.rs_as_pages(need);
                     if as_pages > 0 && self.demote_idle(as_pages) {
+                        self.plan_stopped("short of state: idle cache moves down");
                         return false;
                     }
                     if self.reclaim_idle_once() || self.reclaim_head_sharing() {
@@ -802,6 +1292,7 @@ impl ResidencyPlanner {
                     // keep, lowest key first, before any set moves whole
                     // (its state with it).
                     if as_pages > 0 && self.sweep_stranded(as_pages, true) {
+                        self.plan_stopped("short of state: stranded tails swept");
                         return false;
                     }
                     fund_by_eviction
@@ -815,6 +1306,7 @@ impl ResidencyPlanner {
                                 rs: demand.rs,
                             },
                         ) {
+                            self.plan_stopped("allocation: waits on a grow for its state");
                             return true;
                         }
                         continue;
@@ -894,6 +1386,7 @@ impl ResidencyPlanner {
                                 rs: need.rs,
                             },
                         ) {
+                            self.plan_stopped("restore: waits on a grow for its state");
                             return true;
                         }
                         continue;
@@ -917,17 +1410,48 @@ impl ResidencyPlanner {
                         if proc.state != Residency::Evicted {
                             return Board::Replan;
                         }
+                        // Held below the policy's floor: never restored, on
+                        // any path, forced or not, until the policy lifts it
+                        // (its restore is queued again then).
+                        if proc.held {
+                            inner.queue.remove(&key);
+                            return Board::Replan;
+                        }
+                        // Restored past the head it was evicted for, that
+                        // head passed over: no victim for it until it fires.
+                        proc.restored_past = proc.evicted_for.filter(|head| {
+                            inner.passed.iter().any(|&(_, passed)| passed == *head)
+                        });
+                        let proc = inner.procs.get_mut(&pid).expect("read above");
                         proc.state = Residency::Restoring;
                         if let Some(waiter) = inner.queue.remove(&key) {
                             let waited = waiter.since.elapsed();
                             if waited > super::wait::LONG_WAIT {
-                                inner.long_waits.push(("restore", waited));
+                                inner.long_waits.push(super::wait::LongWait {
+                                    kind: "restore",
+                                    lacked: waiter.lacked,
+                                    wanted: waiter.wanted,
+                                    waited,
+                                });
                             }
                         }
                         Board::Go(inner.accum.donate(need.kv_pages))
                     });
                     match boarded {
                         Board::Go(pages) => {
+                            // What its placement chose (its unpark's pieces,
+                            // then its pending bind's runs) is held for it
+                            // until its unpark and bind land: no head served
+                            // meanwhile takes it (the L40S at 3 GiB on
+                            // c201812ea: PendingBindShort, its run-1 bind's
+                            // chunk taken between its serve and its unpark).
+                            let bind = self.with_inner(|inner| {
+                                inner.procs.get(&pid).and_then(|proc| proc.bind_room).map(|need| (need.run, need.pieces))
+                            });
+                            self.port.reserve_restore(pid, bind);
+                            // Said as the pass's end for this head: a restore
+                            // refused and queued again showed "ended=none".
+                            self.plan_ended(key, "restore sent", false, &[]);
                             exec::spawn_restore(self.clone(), pid, pages, slots);
                             continue;
                         }
@@ -941,6 +1465,7 @@ impl ResidencyPlanner {
             if fund_by_eviction {
                 self.plan_eviction();
             } else {
+                self.plan_stopped("restore short of kv: something in flight, not funded");
                 self.stats
                     .restore_absorb_short
                     .fetch_add(1, Ordering::Relaxed);

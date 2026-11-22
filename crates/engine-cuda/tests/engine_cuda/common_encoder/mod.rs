@@ -467,7 +467,6 @@ impl Rig {
         let bound = self.guest.bind(
             &mut self.engine,
             InstanceBinding {
-                resident: Default::default(),
                 program,
                 channels: vec![latent, out],
                 seeds: Vec::new(),

@@ -83,7 +83,7 @@ impl ToEnd {
     /// waits for one to leave, `Err(Some(d))` for `d` more of the spread.
     pub(super) fn room(
         &mut self,
-        procs: &HashMap<ProcessId, Proc>,
+        procs: &super::PidMap<Proc>,
         kv_total: u32,
         rs_total: RsUnits,
         now: Instant,
@@ -207,7 +207,7 @@ impl ToEnd {
 
 #[cfg(test)]
 mod tests {
-    use super::{Duration, HashMap, Instant, Proc, ProcessId, RsUnits, ToEnd, most_at_once};
+    use super::{Duration, Instant, Proc, ProcessId, RsUnits, ToEnd, most_at_once};
 
     #[test]
     fn lanes_started_apart_need_less_than_each_to_the_end() {
@@ -234,7 +234,7 @@ mod tests {
             };
             // A finished lane held 27 pages, 11 at its prompt, for 20 s.
             to_end.learn((27, none), (11, none), Duration::from_secs(20));
-            let mut procs = HashMap::new();
+            let mut procs = crate::planner::PidMap::new();
             // 128 want to start where 1855 pages hold 68 to the end at once.
             for seq in 0..128 {
                 let pid = ProcessId::new_v4();

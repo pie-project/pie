@@ -751,6 +751,20 @@ impl Pool {
         }
     }
 
+    /// The bytes of the heaps kept spare for the top: the device holds them,
+    /// mapped or not.
+    #[must_use]
+    pub fn top_spare_bytes(&self) -> u64 {
+        #[cfg(target_vendor = "apple")]
+        {
+            self.last().store.spare_held()
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            0
+        }
+    }
+
     /// The device bytes the span's backed segments hold.
     #[must_use]
     pub fn top_held_bytes(&self) -> u64 {
@@ -925,7 +939,19 @@ impl Pool {
                     bytes,
                 })
                 .collect();
-            elastic::grow_all(&mut targets)?;
+            let grown = elastic::grow_all(&mut targets)?;
+            // Test builds: the kv pool's new bytes are poisoned, not zeroed. A kv cell is
+            // written before any kernel reads it, and a kernel that reads one past a
+            // lane's keys (a tile's tail, under a zero weight) gets NaN, not zero.
+            #[cfg(feature = "test-slot-fill")]
+            for (target, range) in targets.iter().zip(&grown) {
+                if let Some((from, to)) = *range {
+                    // SAFETY: mapped and zeroed by `grow_all` just now; no frame
+                    // has been encoded against these bytes yet.
+                    unsafe { target.buffer.poison(from, to - from)? };
+                }
+            }
+            let _ = grown;
             let fresh = self.committed_chunks();
             // SAFETY: the chunks newly committed are no frame's yet.
             unsafe { self.hold_seam(chunks, fresh)? };

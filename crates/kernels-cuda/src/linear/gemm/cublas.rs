@@ -28,23 +28,74 @@ use crate::jit::{Ctx, refuse};
 use crate::linear::skeleton::LtEpilogue;
 use crate::linear::skeleton::{Epilogue, In, MAX_INS, MAX_OUTS, Paging, RowLeg, Skeleton};
 
-/// The streaming skeleton that serves `m x n x k` with `epi`: the gemv (one
-/// row) or the rows skeleton (up to its 16-row tile, one part), the first
-/// that covers it, each a warp streaming a weight row through every
-/// activation row, the epilogue fused. `None` where neither covers it: the
-/// product runs on cuBLASLt. The skinny skeleton tiles its rows on mma.sync
-/// as a GEMM does, so it is no streaming kernel and cuBLASLt serves what it
-/// would.
-fn streamed(
-    epi: &Epilogue,
-    m: i32,
-    n: i32,
-    k: i32,
-    tuning: &crate::tuning::Tuning,
-) -> Option<Skeleton> {
+/// The skeleton that serves `m x n x k` with `epi`, its epilogue fused: the
+/// gemv (one row) or the rows skeleton (up to its 16-row tile, one part),
+/// the first that covers it, each a warp streaming a weight row through
+/// every activation row; past them the skinny skeleton where it covers the
+/// product and tiles its rows tighter than cuBLASLt would ([`skinny_rows`]).
+/// `None` where none does: the product runs on cuBLASLt.
+fn streamed(ctx: &Ctx, epi: &Epilogue, w: u64, m: i32, n: i32, k: i32) -> Option<Skeleton> {
+    let tuning = ctx.tuning();
     [Skeleton::Gemv, Skeleton::Rows]
         .into_iter()
-        .find(|s| s.covers(epi, m, n, k, tuning))
+        .find(|s| s.covers(epi, m, n, k, &tuning))
+        .or_else(|| {
+            let rows = u32::try_from(m).ok()?;
+            let cols = u32::try_from(n).ok()?.checked_mul(epi.parts())?;
+            let depth = u32::try_from(k).ok()?;
+            if !Skeleton::Skinny.covers(epi, m, n, k, &tuning) {
+                return None;
+            }
+            let stated = skinny_rows(&tuning, rows, cols, depth).is_some();
+            // Where the device's measured product times are laid (a served
+            // load's), they choose among the candidates, the tile rule's
+            // stated first; unmeasured, the stated one serves, noted.
+            let Some(routes) = ctx.routes() else {
+                return stated.then_some(Skeleton::Skinny);
+            };
+            let listed = candidates(&tuning, rows, cols, depth, stated);
+            let codes: Vec<u32> = listed.iter().map(|c| c.code).collect();
+            let shape = crate::linear::routes::Shape {
+                kind: crate::linear::routes::Kind::Plain,
+                rows: cols,
+                k: depth,
+                m: rows,
+            };
+            let picked = routes.pick(shape, w, &codes);
+            let chosen = listed.iter().find(|c| c.code == picked)?;
+            match chosen.serves {
+                Serves::Skinny => Some(Skeleton::Skinny),
+                Serves::Lt(heuristic) => {
+                    lay_lt_pick(rows, cols, depth, heuristic);
+                    None
+                }
+            }
+        })
+}
+
+/// The rows the skinny skeleton pads `m` to, where it runs a dense product
+/// of `m x n x k` in place of cuBLASLt: past the rows skeleton's 16-row tile
+/// both stream the weight once over whole mma tiles of rows, so the one
+/// whose tile pads the rows least does the least work. The skinny skeleton
+/// tiles `m` in mma.sync's 16 rows within its one 64-row block; cuBLASLt's
+/// first heuristic algorithm ([`tile`]) pads to its tile's rows. `Some`
+/// where the skinny tile is the tighter (or cuBLASLt offers none), derived
+/// from the two tiles: nothing timed. Up to the rows skeleton's tile a
+/// product stays the streaming skeletons' or the library's few-row kernels'
+/// (which split K to fill the device); the skeleton's coverage
+/// (`kernel.gemm.skinny_rows`, the chip's own) bounds whether it runs at all.
+#[must_use]
+pub fn skinny_rows(tuning: &crate::tuning::Tuning, m: u32, n: u32, k: u32) -> Option<u32> {
+    let skinny = m.next_multiple_of(16);
+    if m <= crate::linear::skeleton::ROWS_M
+        || skinny > crate::linear::skinny::ROWS.min(tuning.gemm_skinny_rows())
+    {
+        return None;
+    }
+    match tile_rows(tuning, m, n, k) {
+        Some(rows) if m.next_multiple_of(rows) <= skinny => None,
+        _ => Some(skinny),
+    }
 }
 
 const fn dev(address: u64) -> *const c_void {
@@ -96,7 +147,7 @@ pub(crate) fn act_x_wt(
     let call = Call { act, w, y, m, n, k };
     let tuning = ctx.tuning();
     // A product bound by its weight's read streams it once.
-    if let Some(skeleton) = streamed(Epilogue::store(), m, n, k, &tuning) {
+    if let Some(skeleton) = streamed(ctx, Epilogue::store(), w, m, n, k) {
         return skeleton.fire(ctx, Epilogue::store(), w, act, &[], &[y], None, m, n, k);
     }
     // A prefill's wide product on cuBLAS's own algorithm with a split's
@@ -199,8 +250,7 @@ pub(crate) fn anchored(
     if m <= 0 || n <= 0 || k <= 0 || epi.plain() || ins.len() > MAX_INS || outs.len() > MAX_OUTS {
         return Ok(false);
     }
-    let tuning = ctx.tuning();
-    if let Some(skeleton) = streamed(epi, m, n, k, &tuning) {
+    if let Some(skeleton) = streamed(ctx, epi, w, m, n, k) {
         skeleton.fire(ctx, epi, w, act, ins, outs, paging, m, n, k)?;
         return Ok(true);
     }
@@ -390,6 +440,7 @@ fn gemm_ex(handle: cublasHandle_t, call: Call, algo: cublasGemmAlgo_t) -> cublas
     // tensors, or the arena's slabs allocated at those sizes.
     if crate::sizing::active() {
         // A size-only walk (`crate::sizing`) runs no product.
+        crate::sizing::counted();
         cublasStatus_t::CUBLAS_STATUS_SUCCESS
     } else {
         unsafe {
@@ -452,6 +503,7 @@ fn gemm_ex_f32(handle: cublasHandle_t, call: Call) -> cublasStatus_t {
     // the operands are device rows of the call's extents.
     if crate::sizing::active() {
         // A size-only walk (`crate::sizing`) runs no product.
+        crate::sizing::counted();
         cublasStatus_t::CUBLAS_STATUS_SUCCESS
     } else {
         unsafe {
@@ -637,6 +689,18 @@ fn first_heuristic(
     op_desc: lt::cublasLtMatmulDesc_t,
     plan: &LtPlan,
 ) -> Option<lt::cublasLtMatmulHeuristicResult_t> {
+    heuristics(lt_handle, workspace_bytes, op_desc, plan, 1)?.into_iter().next()
+}
+
+/// cuBLASLt's first `count` heuristic algorithms for the product, in its own
+/// ranking (as [`first_heuristic`]).
+fn heuristics(
+    lt_handle: lt::cublasLtHandle_t,
+    workspace_bytes: usize,
+    op_desc: lt::cublasLtMatmulDesc_t,
+    plan: &LtPlan,
+    count: usize,
+) -> Option<Vec<lt::cublasLtMatmulHeuristicResult_t>> {
     struct Pref(lt::cublasLtMatmulPreference_t);
     impl Drop for Pref {
         fn drop(&mut self) {
@@ -684,7 +748,7 @@ fn first_heuristic(
         // SAFETY: the heuristic result is a C struct of opaque algo words,
         // integers, a status whose zero is SUCCESS and a float; all-zero bytes are a
         // valid value.
-        vec![unsafe { core::mem::zeroed() }; 1];
+        vec![unsafe { core::mem::zeroed() }; count.max(1)];
     let mut returned: i32 = 0;
     // SAFETY: `lt_handle` is the device's live handle, the descriptors and
     // `pref.0` were created above, and `heuristics` has room for the count
@@ -698,7 +762,7 @@ fn first_heuristic(
             plan.c_desc,
             plan.c_desc,
             pref.0,
-            1,
+            i32::try_from(count.max(1)).unwrap_or(1),
             heuristics.as_mut_ptr(),
             &raw mut returned,
         )
@@ -707,7 +771,8 @@ fn first_heuristic(
     {
         return None;
     }
-    heuristics.pop()
+    heuristics.truncate(usize::try_from(returned).unwrap_or(0));
+    Some(heuristics)
 }
 
 fn run_lt(
@@ -728,6 +793,7 @@ fn run_lt(
     // hold. The operands are the caller's `call`, as for `gemm_ex`.
     let status = if crate::sizing::active() {
         // A size-only walk (`crate::sizing`) runs no product.
+        crate::sizing::counted();
         lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS
     } else {
         unsafe {
@@ -866,6 +932,7 @@ fn run_lt_epilogue(
     // bias, non-zero by the test above.
     let status = if crate::sizing::active() {
         // A size-only walk (`crate::sizing`) runs no product.
+        crate::sizing::counted();
         lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS
     } else {
         unsafe {
@@ -903,6 +970,11 @@ struct Device {
     /// shape, its epilogue ([`epilogue_code`]), whether it reads a bias and
     /// the workspace it was asked within; `None` where it offers none.
     epilogues: HashMap<(i32, i32, i32, u32, bool, usize), Option<lt::cublasLtMatmulAlgo_t>>,
+    /// The cuBLASLt algorithm the routes picked for a plain product, by its
+    /// shape (`streamed`): its plan runs it in place of the first.
+    lt_picks: HashMap<(i32, i32, i32), lt::cublasLtMatmulHeuristicResult_t>,
+    /// The candidates of a decode product, by shape (`candidates`).
+    listed: HashMap<(u32, u32, u32, bool), Arc<Vec<Candidate>>>,
 }
 
 /// An epilogue as the heuristic cache keys it.
@@ -925,6 +997,8 @@ fn with_device<R>(f: impl FnOnce(&mut Device) -> R) -> R {
                 },
                 plans: HashMap::new(),
                 epilogues: HashMap::new(),
+                lt_picks: HashMap::new(),
+                listed: HashMap::new(),
             }))
         }))
     };
@@ -952,13 +1026,13 @@ impl Device {
         if let Some(plan) = self.plans.get(&(m, n, k)) {
             return Some(Arc::clone(plan));
         }
-        let plan = Arc::new(build_lt_plan(
-            self.lt.handle,
-            self.lt.workspace_bytes,
-            m,
-            n,
-            k,
-        )?);
+        let mut plan = build_lt_plan(self.lt.handle, self.lt.workspace_bytes, m, n, k)?;
+        // The algorithm the routes picked for the shape, where they picked
+        // one past the first.
+        if let Some(&heuristic) = self.lt_picks.get(&(m, n, k)) {
+            plan.heuristics = vec![heuristic];
+        }
+        let plan = Arc::new(plan);
         self.plans.insert((m, n, k), Arc::clone(&plan));
         Some(plan)
     }
@@ -1051,4 +1125,173 @@ pub fn tile(tuning: &crate::tuning::Tuning, m: u32, n: u32, k: u32) -> Option<Ti
         split_k: split_k.max(1),
         waves: first.wavesCount,
     })
+}
+
+// ---------------------------------------------------------------------------
+// A decode product's candidates (`crate::linear::routes`): the skinny
+// skeleton and cuBLASLt's first algorithms, each under its code.
+
+/// cuBLASLt's ranked algorithms a decode product's candidates hold.
+const LT_CANDIDATES: usize = 2;
+
+/// What a candidate runs.
+#[derive(Clone, Copy)]
+enum Serves {
+    Skinny,
+    Lt(lt::cublasLtMatmulHeuristicResult_t),
+}
+
+/// One kernel that can serve a decode product, under its code.
+#[derive(Clone, Copy)]
+struct Candidate {
+    code: u32,
+    serves: Serves,
+}
+
+// SAFETY: a heuristic result is plain data (an algorithm's opaque words, a
+// status, sizes and a float); nothing in it points anywhere.
+unsafe impl Send for Candidate {}
+unsafe impl Sync for Candidate {}
+
+/// The device and driver every code folds in, besides the profile's own
+/// device: an entry measured under another driver or arch is not this one's.
+fn platform() -> &'static str {
+    static PLATFORM: OnceLock<String> = OnceLock::new();
+    PLATFORM.get_or_init(|| {
+        let mut driver: i32 = 0;
+        // SAFETY: a local out-parameter.
+        let _ = unsafe { cudarc::runtime::sys::cudaDriverGetVersion(&raw mut driver) };
+        // SAFETY: no arguments.
+        let lt_version = unsafe { lt::cublasLtGetVersion() };
+        format!(
+            "{}|driver {driver}|cublaslt {lt_version}",
+            crate::jit::cache::arch().unwrap_or("?")
+        )
+    })
+}
+
+/// The skinny skeleton's code: its unit's compile key, every source byte
+/// and option the kernel is built from.
+fn skinny_code() -> u32 {
+    static CODE: OnceLock<u32> = OnceLock::new();
+    *CODE.get_or_init(|| {
+        let kernel = crate::linear::skinny::kernel(Epilogue::store());
+        let fingerprint = kernel.root.as_ref().map_or_else(
+            || format!("skinny {}", kernel.name),
+            |root| root.key(kernel.name, crate::jit::cache::arch().unwrap_or("?")),
+        );
+        crate::linear::routes::code(platform(), &fingerprint)
+    })
+}
+
+/// The words that name a cuBLASLt algorithm's code: its id and the config
+/// its kernel is built from.
+fn algo_words(algo: &lt::cublasLtMatmulAlgo_t) -> String {
+    use lt::cublasLtMatmulAlgoConfigAttributes_t as A;
+    let mut words = Vec::new();
+    for attribute in [
+        A::CUBLASLT_ALGO_CONFIG_ID,
+        A::CUBLASLT_ALGO_CONFIG_TILE_ID,
+        A::CUBLASLT_ALGO_CONFIG_STAGES_ID,
+        A::CUBLASLT_ALGO_CONFIG_SPLITK_NUM,
+        A::CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME,
+        A::CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING,
+        A::CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION,
+        A::CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID,
+        A::CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID,
+    ] {
+        let mut value: u32 = 0;
+        let mut written: usize = 0;
+        // SAFETY: `algo` is an algorithm cuBLASLt returned; `value` and
+        // `written` are locals of the sizes passed.
+        let asked = unsafe {
+            lt::cublasLtMatmulAlgoConfigGetAttribute(
+                std::ptr::from_ref(algo),
+                attribute,
+                std::ptr::from_mut(&mut value).cast(),
+                std::mem::size_of::<u32>(),
+                &raw mut written,
+            )
+        };
+        if asked == lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            words.push(value.to_string());
+        } else {
+            clear_error();
+            words.push("-".to_owned());
+        }
+    }
+    words.join(".")
+}
+
+/// A plain dense product's candidates at `m x n x k`, the stated one first
+/// (the skinny skeleton where `skinny_first`, the tile rule's choice, else
+/// cuBLASLt's first algorithm), asked once a shape and kept.
+fn candidates(
+    tuning: &crate::tuning::Tuning,
+    m: u32,
+    n: u32,
+    k: u32,
+    skinny_first: bool,
+) -> Arc<Vec<Candidate>> {
+    with_device(|device| {
+        if let Some(listed) = device.listed.get(&(m, n, k, skinny_first)) {
+            return Arc::clone(listed);
+        }
+        device.configure((tuning.gemm_workspace_mb() as usize) << 20);
+        let mut lts = Vec::new();
+        if device.lt.ensure()
+            && let (Ok(mi), Ok(ni), Ok(ki)) = (i32::try_from(m), i32::try_from(n), i32::try_from(k))
+            && let Some(plan) = build_lt_plan(device.lt.handle, device.lt.workspace_bytes, mi, ni, ki)
+        {
+            lts = heuristics(
+                device.lt.handle,
+                device.lt.workspace_bytes,
+                plan.op_desc,
+                &plan,
+                LT_CANDIDATES,
+            )
+            .unwrap_or_default();
+        }
+        let skinny = Candidate { code: skinny_code(), serves: Serves::Skinny };
+        let lt: Vec<Candidate> = lts
+            .into_iter()
+            .map(|heuristic| Candidate {
+                code: crate::linear::routes::code(
+                    platform(),
+                    &format!("cublaslt {}", algo_words(&heuristic.algo)),
+                ),
+                serves: Serves::Lt(heuristic),
+            })
+            .collect();
+        let mut listed = Vec::with_capacity(lt.len() + 1);
+        if skinny_first || lt.is_empty() {
+            listed.push(skinny);
+            listed.extend(lt);
+        } else {
+            listed.push(lt[0]);
+            listed.push(skinny);
+            listed.extend(lt.into_iter().skip(1));
+        }
+        let listed = Arc::new(listed);
+        device.listed.insert((m, n, k, skinny_first), Arc::clone(&listed));
+        listed
+    })
+}
+
+/// The plain product of `m x n x k` runs on `heuristic` from here on (the
+/// routes' pick): its plan is laid anew where it ran another.
+fn lay_lt_pick(m: u32, n: u32, k: u32, heuristic: lt::cublasLtMatmulHeuristicResult_t) {
+    let (Ok(m), Ok(n), Ok(k)) = (i32::try_from(m), i32::try_from(n), i32::try_from(k)) else {
+        return;
+    };
+    with_device(|device| {
+        let same = device
+            .lt_picks
+            .get(&(m, n, k))
+            .is_some_and(|held| algo_words(&held.algo) == algo_words(&heuristic.algo));
+        if !same {
+            device.lt_picks.insert((m, n, k), heuristic);
+            device.plans.remove(&(m, n, k));
+        }
+    });
 }

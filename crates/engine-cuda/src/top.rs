@@ -128,6 +128,9 @@ pub fn row_tile(chip: &profile::Profile) -> engine::roofline::RowTile {
         std::sync::Arc::new(move |m, n, k| {
             if m <= kernels_cuda::linear::skeleton::ROWS_M {
                 1
+            } else if kernels_cuda::linear::gemm::skinny_rows(&tuning, m, n, k).is_some() {
+                // the skinny skeleton runs it, in mma.sync's 16-row tiles
+                16
             } else {
                 kernels_cuda::linear::gemm::tile_rows(&tuning, m, n, k).unwrap_or(1)
             }

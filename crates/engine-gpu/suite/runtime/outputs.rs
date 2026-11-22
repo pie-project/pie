@@ -250,8 +250,33 @@ pub(super) fn loaded(tag: &str, model: &impl ForwardHybrid) -> Option<Loaded> {
 
 /// [`loaded`], a fire carrying up to `lanes` lanes of [`ROWS`] tokens.
 pub(super) fn loaded_lanes(tag: &str, model: &impl ForwardHybrid, lanes: u32) -> Option<Loaded> {
+    loaded_bound(tag, model, lanes, None)
+}
+
+/// [`loaded_lanes`] on a device whose platform states `bound` on one GPU
+/// submission (the boot's, `test-limits`, as Android's KGSL states 2 s):
+/// every serving step held to it (`engine_gpu::submit`).
+pub(super) fn loaded_bound(
+    tag: &str,
+    model: &impl ForwardHybrid,
+    lanes: u32,
+    bound: Option<std::time::Duration>,
+) -> Option<Loaded> {
+    let boot = crate::backend::DeviceBoot {
+        submit_bound: bound,
+        ..crate::gpu::device_boot()
+    };
+    loaded_boot(tag, model, lanes, boot)
+}
+
+/// [`loaded_lanes`] on `boot`.
+pub(super) fn loaded_boot(
+    tag: &str,
+    model: &impl ForwardHybrid,
+    lanes: u32,
+    boot: crate::backend::DeviceBoot,
+) -> Option<Loaded> {
     let tokens = (lanes * ROWS).next_power_of_two().max(16);
-    let boot = crate::gpu::device_boot();
     if backend::Context::bind(&boot, backend::ALLOWANCE).is_err() {
         eprintln!("not asked: no device");
         return None;

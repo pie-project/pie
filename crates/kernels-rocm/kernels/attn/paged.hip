@@ -884,6 +884,16 @@ constexpr int kSelBlocks = 2048;
 constexpr int kSelWords = kSelBlocks / 32;
 
 
+// The narrow prefill's tiles in LDS (K, Vᵀ, the page table), one allocation
+// a head width: every body of a width shares it (the masked prefill runs the
+// unmasked body or the masked one in the same kernel).
+template <int D>
+__device__ __forceinline__ unsigned char* prefill_lds() {
+    constexpr int BC = 32, KPAD = D + 4, VPAD = BC + 4, TABLE = 512;
+    __shared__ alignas(16) unsigned char lds[(BC * KPAD + D * VPAD) * sizeof(bf16) + TABLE * sizeof(i32)];
+    return lds;
+}
+
 template <int D, bool HND, bool CAUSAL, bool SEL, bool MASK, bool FP8>
 __device__ __forceinline__ void paged_prefill_body(const Paged& p, const PrefillSel& sel,
                                                    const PrefillMask& mask) {
@@ -896,9 +906,11 @@ __device__ __forceinline__ void paged_prefill_body(const Paged& p, const Prefill
     // (t%16)·D/16) and, for the first 4·D threads, two V reads (keys 2(t%16)
     // and +1, columns 8·(t/16)).
     constexpr int KR = BC * D / 8 / THREADS;
-    __shared__ alignas(16) bf16 ks[BC * KPAD];
-    __shared__ alignas(16) bf16 vt[D * VPAD];
-    __shared__ i32 table[TABLE];
+    bf16* const ks = reinterpret_cast<bf16*>(prefill_lds<D>());
+    bf16* const vt = ks + BC * KPAD;
+    i32* const table = reinterpret_cast<i32*>(vt + D * VPAD);
+    static_assert((BC * KPAD * sizeof(bf16)) % 16 == 0 && (D * VPAD * sizeof(bf16)) % 16 == 0,
+                  "each tile on a 16-byte bound");
 
     // Causal tiles grow with their position: the last of a request walks the
     // most keys, so the grid starts there and the short ones fill the tail.
@@ -1126,9 +1138,28 @@ __global__ __launch_bounds__(512) void paged_prefill_selected(const Paged p, con
     paged_prefill_body<D, HND, true, true, false, false>(p, sel, PrefillMask{});
 }
 
-template <int D, bool HND>
+// `CAUSAL`: the plan's (as the unmasked prefill's): its block order, the
+// causal tiles' longest first. Each request is still cut at its rows'
+// positions, or not, by its mask word's wide bit.
+template <int D, bool HND, bool CAUSAL>
 __global__ __launch_bounds__(512) void paged_prefill_masked(const Paged p, const PrefillMask mask) {
-    paged_prefill_body<D, HND, false, false, true, false>(p, PrefillSel{}, mask);
+    // A request stating no mask (its word not wide, its boundary at or past
+    // its keys: no bit is read) is the unmasked causal prefill's: the same
+    // keys, cut at the same positions. Its block runs that body, the mask
+    // and the cut compile-time, as the unmasked prefill does; any other
+    // request runs the masked body. One body serves both kinds of lane.
+    if constexpr (CAUSAL) {
+        int bx, kv_head;
+        prefill_item(CAUSAL, bx, kv_head);
+        if (p.block_valid != nullptr && p.block_valid[bx] == 0) return;
+        const int req = p.request_indices[bx];
+        const u32 word = mask.origin != nullptr ? mask.origin[req] : 0x80000000u;
+        if ((word >> 31) == 0 && static_cast<int>(word & 0x7fffffffu) >= kv_length(p, req)) {
+            paged_prefill_body<D, HND, true, false, false, false>(p, PrefillSel{}, PrefillMask{});
+            return;
+        }
+    }
+    paged_prefill_body<D, HND, CAUSAL, false, true, false>(p, PrefillSel{}, mask);
 }
 
 // ----------------------------------------------------------------- merge --

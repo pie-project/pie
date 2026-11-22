@@ -1,6 +1,8 @@
 #![allow(unsafe_code)]
 #[cfg(feature = "rocm")]
 mod hip;
+#[cfg(feature = "rocm")]
+pub(crate) use hip::order_fp8_spans;
 
 use std::collections::BTreeMap;
 use std::path::Path;

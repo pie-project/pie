@@ -230,6 +230,16 @@ pub struct LaunchRegion {
     /// of its lane ([`crate::codegen::cuda::fused::splits_rows`]).
     #[serde(default)]
     pub splits_rows: bool,
+    /// The launches a region whose rows split runs in, one a phase: its
+    /// blocks' partials of a reduction (or candidates of an argmax) are all
+    /// written by one launch's end, and every block folds them in the next,
+    /// so no block waits on another (`fused::split_phases`). 1 otherwise.
+    #[serde(default = "one")]
+    pub phases: u32,
+}
+
+fn one() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -727,6 +737,7 @@ fn lower_region(stage: &CompiledStage, region: &Region) -> LaunchRegion {
         spent: crate::codegen::cuda::spent_values(stage, region),
         order: crate::codegen::cuda::emitted_order(stage, region),
         splits_rows: crate::codegen::cuda::fused::splits_rows(stage, region),
+        phases: crate::codegen::cuda::fused::split_phases(stage, region),
         kind: region.kind,
         schedule: region.schedule as u8,
         nodes: region.nodes.iter().copied().map(NodeIndex::get).collect(),

@@ -487,6 +487,35 @@ pub fn top_rung(
     estimate: &FireEstimate,
 ) -> Result<TopRung, NoRung> {
     let times: Vec<f64> = rungs.iter().map(|r| estimate.ns(r)).collect();
+    // Each rung as the ruling weighs it: its estimate, and why it is out
+    // where it is (the device's memory, a stated bound on one submission).
+    for (rung, &ns) in rungs.iter().zip(&times) {
+        tracing::debug!(
+            tokens = rung.tokens,
+            lanes = rung.lanes,
+            span_mib = rung.span_bytes >> 20,
+            estimate_ms = ns / 1e6,
+            tokens_per_ms = f64::from(rung.tokens) / (ns / 1e6).max(f64::MIN_POSITIVE),
+            infeasible = rung.infeasible.unwrap_or("-"),
+            "top rung: a rung weighed"
+        );
+    }
+    let feasible: Vec<(&RungFacts, f64)> = rungs
+        .iter()
+        .zip(times.iter().copied())
+        .filter(|(r, _)| r.infeasible.is_none())
+        .collect();
+    for (&(rung, _), (eff, live_share, score)) in
+        feasible.iter().zip(scores(&feasible, live_capacity_bytes))
+    {
+        tracing::debug!(
+            tokens = rung.tokens,
+            eff,
+            live_share,
+            score,
+            "top rung: a feasible rung scored"
+        );
+    }
     pick(rungs, &times, live_capacity_bytes)
 }
 

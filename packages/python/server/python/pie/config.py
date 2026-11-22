@@ -39,8 +39,6 @@ class RuntimeConfig:
     # a measurement can hold the geometry fixed while something else varies.
     frame_size: Optional[int] = None
     frame_dispatch_depth: Optional[int] = None
-    # Durations are written with their unit ("50ms", "120s").
-    submit_deadline: Optional[str] = None
     max_concurrent_processes: Optional[int] = None
     # The worker-plane policy: a built-in name or a .wasm path.
     worker_policy: Optional[str] = None

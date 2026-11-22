@@ -1502,7 +1502,7 @@ fn time_a_pooled_select() {
     if std::env::var("PIE_XLA_GMM_TIME").is_err() {
         return;
     }
-    for (e, n, k, t, tk) in [(128usize, 1536usize, 2048usize, 1usize, 8usize), (128, 2048, 768, 1, 8), (128, 1536, 2048, 8, 8)] {
+    for (e, n, k, t, tk) in [(128usize, 1536usize, 2048usize, 1usize, 8usize), (128, 2048, 768, 1, 8), (128, 1536, 2048, 8, 8), (128, 1536, 2048, 256, 8), (128, 2048, 768, 256, 8), (16, 768, 2048, 256, 8), (16, 2048, 768, 256, 8), (16, 768, 2048, 64, 8), (16, 2048, 768, 64, 8)] {
         let w: Vec<f32> = data(e * n * k, 91).iter().map(|v| round_bf16(v * 0.25)).collect();
         let rows = k / 128 * (n / 2);
         let table: Vec<i32> = (0..e).map(|x| (8 + x * rows) as i32).collect();

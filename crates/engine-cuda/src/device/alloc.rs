@@ -1424,6 +1424,42 @@ pub fn zero_span(at: u64, len: usize) -> Result<()> {
     }
 }
 
+/// Fills `len` bytes at `at` with `byte`, landed before it returns, on the
+/// calling thread's own stream: a diagnostic's fill of memory nothing wrote
+/// (`unwritten-nan`).
+pub fn fill_span(at: u64, len: usize, byte: u8) -> Result<()> {
+    if crate::sizing::active() && (crate::sizing::stands_in(at as usize)) {
+        return Ok(());
+    }
+    if len == 0 {
+        return Ok(());
+    }
+    #[cfg(feature = "device")]
+    {
+        use crate::device::rt;
+
+        // SAFETY: the address is a span the caller resolved against an
+        // allocation this shell owns; the stream is this thread's own.
+        unsafe {
+            crate::device::ctx::check(
+                "cudaMemsetAsync",
+                rt::cudaMemsetAsync(
+                    at as *mut core::ffi::c_void,
+                    core::ffi::c_int::from(byte),
+                    len,
+                    OWN_STREAM.cast(),
+                ),
+            )?;
+        }
+        crate::device::ctx::sync(OWN_STREAM)
+    }
+    #[cfg(not(feature = "device"))]
+    {
+        let _ = (at, byte);
+        Err(Fault::Runtimeless)
+    }
+}
+
 pub fn zero_span_on(stream: *mut core::ffi::c_void, at: u64, len: usize) -> Result<()> {
     // A size-only walk (`crate::sizing`) copies nothing to or from a
     // stand-in span.

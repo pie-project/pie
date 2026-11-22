@@ -62,8 +62,9 @@ pub enum DecodeSplit {
         #[constant(range(1..=65_536), default = 128)]
         groups: u32,
     },
-    /// `per` workgroups for each core the engine sizes work by (wgpu reports
-    /// no count: [`crate::chip::UNREPORTED_CORES`]).
+    /// `per` times the workgroups the device holds at once, as its rates
+    /// step measured them (WebGPU reports no count of an adapter's compute
+    /// units: `profile::fire::RESIDENT_WORKGROUPS`).
     PerCore {
         #[constant(range(1..=64), default = 1)]
         per: u32,
@@ -82,7 +83,9 @@ pub fn register(registry: &mut Registry) {
 #[derive(Clone, Debug)]
 pub struct Tuning {
     profile: Profile,
-    cores: u32,
+    /// The workgroups the device holds at once, as its profile states
+    /// them (`[rates] resident_workgroups`, measured at the first load).
+    resident: Option<u32>,
     /// The decodes (head width, LSE) whose split walk the adapter binds,
     /// as the load held them ([`Tuning::hold_decodes`]).
     splits: Vec<(u32, bool)>,
@@ -96,13 +99,32 @@ pub const WORKGROUP_BYTES_FLOOR: u32 = 16 << 10;
 
 impl Tuning {
     #[must_use]
-    pub fn new(profile: Profile, cores: u32) -> Tuning {
+    pub fn new(profile: Profile) -> Tuning {
+        let resident = profile
+            .rates()
+            .resident_workgroups
+            .map(|workgroups| workgroups.round().clamp(1.0, f64::from(u32::MAX)) as u32);
         Tuning {
             profile,
-            cores,
+            resident,
             splits: Vec::new(),
             workgroup_bytes: WORKGROUP_BYTES_FLOOR,
         }
+    }
+
+    /// The workgroups the device holds at once, as its profile states them;
+    /// `None` before the load's rates step has measured them.
+    #[must_use]
+    pub fn resident(&self) -> Option<u32> {
+        self.resident
+    }
+
+    /// What sizes work to the device: the workgroups it holds at once; one
+    /// before the rates step has measured them, in that step's own tuning,
+    /// whose timed kernels read neither the qmm's fill nor a decode's split
+    /// (a load's tuning states them, [`crate::rates::at_load`]).
+    fn sized(&self) -> u32 {
+        self.resident.unwrap_or(1)
     }
 
     /// With the workgroup memory the adapter states.
@@ -175,7 +197,7 @@ impl Tuning {
         let tiles = u64::from(rows.div_ceil(32)) * u64::from(n.div_ceil(64));
         QmmAt {
             rows: i64::from(rows),
-            fill: i64::try_from(tiles * 8 / u64::from(self.cores.max(1))).unwrap_or(i64::MAX),
+            fill: i64::try_from(tiles * 8 / u64::from(self.sized())).unwrap_or(i64::MAX),
             n: i64::from(n),
             k: i64::from(k),
             bits: i64::from(bits),
@@ -217,7 +239,7 @@ impl Tuning {
     pub fn sdpa_split_groups(&self) -> u32 {
         match *self.profile.get::<DecodeSplit>() {
             DecodeSplit::Fixed { groups } => groups,
-            DecodeSplit::PerCore { per } => self.cores.saturating_mul(per).max(1),
+            DecodeSplit::PerCore { per } => self.sized().saturating_mul(per).max(1),
         }
     }
 }
@@ -384,7 +406,7 @@ mod tests {
             f16: true,
         };
         let (profile, _) = crate::chip::resolve(&adapter, None);
-        Tuning::new(profile, crate::chip::UNREPORTED_CORES)
+        Tuning::new(profile)
     }
 
     /// The rungs between one row and a capacity hold the rungs of every

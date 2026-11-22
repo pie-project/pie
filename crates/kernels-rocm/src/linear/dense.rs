@@ -120,7 +120,7 @@ fn route(ctx: &Ctx, kind: Kind, m: i32, rows: i32, k: i32, w: u64, vectors: bool
         return Route::Turn;
     }
     let shape = Shape { kind, rows: rows.unsigned_abs(), k: k.unsigned_abs(), m: m.unsigned_abs() };
-    match ctx.routes().map(|routes| routes.pick(shape, w)) {
+    match ctx.routes().map(|routes| super::routes::pick(routes, shape, w)) {
         Some(Kernel::Turned) => Route::Turn,
         Some(Kernel::Skinny) | None => Route::Skinny,
     }

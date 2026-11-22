@@ -1,6 +1,8 @@
-//! `pie tune` on Metal: a kernel bench fits `kernel.qmm` and
-//! `kernel.qmm_fp16`; the other searchable decisions are searched end to end
-//! on the served models.
+//! `pie tune` on Metal: kernel benches fit `kernel.qmm`, `kernel.qmm_fp16`
+//! and `kernel.dense` ([`dense`]); the other searchable decisions are
+//! searched end to end on the served models.
+
+pub(crate) mod dense;
 
 use std::cell::RefCell;
 use std::fmt::Write as _;
@@ -354,6 +356,7 @@ impl Measured {
 const SEARCH_SKIPS: &[&str] = &[
     "kernel.qmm",
     "kernel.qmm_fp16",
+    "kernel.dense",
     "compiler.side_streams",
     "compiler.cost.collective_us",
 ];
@@ -918,7 +921,24 @@ pub fn run(
         say(&format!("measurements kept in {}", kept.display()));
         m
     };
-    let (fitted, mut lines) = fit(&measured, &grid, cores)?;
+    let (mut fitted, mut lines) = fit(&measured, &grid, cores)?;
+    // `kernel.dense`: its own bench, kept beside the quantised one's.
+    let kept_dense = cache
+        .join(profile::id_of(&name))
+        .join(format!("dense-{}.txt", depth.word()));
+    let dense_measured = if refit {
+        let text = std::fs::read_to_string(&kept_dense)
+            .map_err(|e| format!("no measurements at {}: {e}", kept_dense.display()))?;
+        dense::Measured::from_text(&text, device.family())?
+    } else {
+        let m = dense::measure(&device, &base, cores, depth, say)?;
+        std::fs::write(&kept_dense, m.to_text(&name)).map_err(|e| e.to_string())?;
+        say(&format!("measurements kept in {}", kept_dense.display()));
+        m
+    };
+    let (dense_entry, dense_line) = dense::fit(&dense_measured, depth)?;
+    fitted.push(dense_entry);
+    lines.push(dense_line);
     // The fitted matmul must also win on the served models to be kept.
     let mut knobs: Vec<search::Knob> = Vec::new();
     for (id, value) in &fitted {
@@ -950,7 +970,7 @@ pub fn run(
         chosen = fitted;
         for k in knobs
             .iter()
-            .filter(|k| k.id != "kernel.qmm" && k.id != "kernel.qmm_fp16")
+            .filter(|k| !["kernel.qmm", "kernel.qmm_fp16", "kernel.dense"].contains(&k.id))
         {
             lines.push(Line {
                 id: k.id,
@@ -1038,6 +1058,7 @@ pub fn run(
         wrong: measured
             .wrong
             .iter()
+            .chain(&dense_measured.wrong)
             .map(|(body, n, first)| format!("{body}: wrong at {n} points; first at {first}"))
             .collect(),
         checks,

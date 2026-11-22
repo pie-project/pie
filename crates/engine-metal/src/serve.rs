@@ -606,6 +606,15 @@ impl Shell {
                 call: "rates at load",
                 why,
             })?;
+        // The device measures `kernel.dense` here over the model's shapes,
+        // once: kept under the profiles and read back by later loads of the
+        // same shapes on the same kernels, over the profile's own ladder.
+        let chip =
+            crate::tune::dense::at_load(&device, chip, boot.profiles.as_deref(), boot.contract)
+                .map_err(|why| Fault::Device {
+                    call: "kernel.dense at load",
+                    why,
+                })?;
         if chip
             .ladder::<kernels_metal::tuning::Qmm>()
             .values()
@@ -2123,7 +2132,7 @@ impl Shell {
         // Told once the buffer retires, faulted or not: a faulted copy has
         // stopped reading its sources too, and its fault reaches the next
         // drain.
-        self.grafted = Some(frame.commit_async(Some(Box::new(move |_| sink(token))))?);
+        self.grafted = Some(frame.commit_async(Some(Box::new(move |_| sink(token, engine::Landing::Landed))))?);
         Ok(false)
     }
 
@@ -2177,6 +2186,40 @@ impl Shell {
     ) -> Result<()> {
         self.drain()?;
         self.pools.write_tier_slots(slots, bytes)
+    }
+
+    /// What the runtime's host cover depends on here
+    /// (`engine::Engine::cover_fingerprint`): the device and its OS, the
+    /// guest emitter's version, the kernel sources a fire dispatches, and
+    /// the tuning that routes among them. Not the binary: a build that
+    /// changes none of these reuses an earlier boot's cover.
+    #[must_use]
+    pub fn cover_fingerprint(&self) -> String {
+        let fnv = |bytes: &[u8]| {
+            bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
+        };
+        #[cfg(target_vendor = "apple")]
+        let os = objc2_foundation::NSProcessInfo::processInfo()
+            .operatingSystemVersionString()
+            .to_string();
+        #[cfg(not(target_vendor = "apple"))]
+        let os = String::new();
+        let kernels = kernels_metal::sources::SOURCES.iter().fold(
+            0xcbf2_9ce4_8422_2325u64,
+            |h, (name, text)| {
+                name.bytes()
+                    .chain([0u8])
+                    .chain(text.bytes())
+                    .chain([0u8])
+                    .fold(h, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
+            },
+        );
+        format!(
+            "metal|{}|{os}|emitter {}|kernels {kernels:016x}|tuning {:016x}",
+            self.device.name(),
+            eta_compiler::codegen::metal::METAL_M1_EMITTER_VERSION,
+            fnv(format!("{:?}", self.tuning).as_bytes()),
+        )
     }
 
     /// Builds, before ready, every compute pipeline a fire of this load
@@ -2383,16 +2426,18 @@ impl Shell {
         let octaves = engine::load::armed::scored_buckets(&rungs);
         // Beside each rung's own rows, every band start of the matmul
         // routing below it and above the rung before
-        // (`kernels_metal::linear::gemm::ROW_BANDS`), walked at that rung:
-        // a fire's rows reach every band its rungs span, and each band's
-        // kernel is built here, not refused while serving.
+        // (`kernels_metal::linear::gemm::row_bands`: the fixed bands and
+        // where the profile's `kernel.dense` changes its pick), walked at
+        // that rung: a fire's rows reach every band its rungs span, and each
+        // band's kernel is built here, not refused while serving.
+        let bands = kernels_metal::linear::gemm::row_bands(&self.tuning);
         let mut below = 0u32;
         let sized: Vec<(u32, Vec<u32>)> = rungs
             .iter()
             .map(|&rung| {
                 let mut sizes = vec![rung];
                 sizes.extend(
-                    kernels_metal::linear::gemm::ROW_BANDS
+                    bands
                         .iter()
                         .copied()
                         .filter(|&band| band > below && band < rung),
@@ -2511,8 +2556,8 @@ impl Shell {
         Ok(())
     }
 
-    /// Unstated `budget`: `seats` sequences at `context` and at least the pool,
-    /// within a quarter of the free space.
+    /// Unstated `budget`: `seats` sequences' state and kv at `context`,
+    /// within the free space ([`engine::disk::derived_budget`]).
     pub fn seat_disk_kv(
         &mut self,
         budget: Option<u64>,
@@ -2528,14 +2573,31 @@ impl Shell {
             .map_or(0, crate::rs::Buffers::page_bytes);
         let budget = match budget {
             Some(bytes) => bytes,
-            None => engine::disk::unstated_budget(
-                dir,
-                u64::from(paging.slots),
-                self.pools.state_slot_bytes() + buffered,
-                paging.pages(),
-                u64::from(seats) * u64::from(context).div_ceil(u64::from(paging.page_size.max(1))),
-                self.pools.page_bytes()?,
-            ),
+            None => {
+                let state_bytes = self.pools.state_slot_bytes() + buffered;
+                let state_rows = if state_bytes > 0 { u64::from(seats) } else { 0 };
+                let pages =
+                    u64::from(seats) * u64::from(context).div_ceil(u64::from(paging.page_size.max(1)));
+                let page_bytes = self.pools.page_bytes()?;
+                let free = engine::disk::free_space(dir);
+                // The guest state the device can hold live (the room a
+                // guest program binds within): evicted, it has a home.
+                let guest = self.pools.chunk_facts().guest_room_bytes();
+                let bytes = engine::disk::derived_budget(
+                    state_rows,
+                    state_bytes,
+                    pages,
+                    page_bytes,
+                    guest,
+                    free,
+                );
+                // Its inputs, stated at load: what the field rules on.
+                eprintln!(
+                    "engine-metal: the unstated disk tier: {bytes} bytes = {seats} seats x                      (state {state_bytes} B + {context} tokens of kv in {} pages of {page_bytes} B)                      + {guest} B of guest state the device holds live, within {free} bytes free",
+                    context.div_ceil(paging.page_size.max(1)),
+                );
+                bytes
+            }
         };
         self.pools.seat_disk(dir, budget)
     }
@@ -2719,8 +2781,13 @@ impl Shell {
     #[must_use]
     pub fn audit(&self) -> engine::memory::Audit {
         // The span is entered whole, backed or not: the bytes it has not
-        // backed yet are the device's too, as far as the ledger counts.
-        let unbacked = self.pools.span_reserved_bytes() - self.pools.span_held_bytes();
+        // backed yet are the device's too, as far as the ledger counts. The
+        // heaps kept spare for it back it as much as its mapped ones (the
+        // device holds both); counted unbacked too, they were counted twice.
+        let unbacked = self
+            .pools
+            .span_reserved_bytes()
+            .saturating_sub(self.pools.span_held_bytes() + self.pools.span_spare_bytes());
         self.ledger().audit(self.device.allocated() + unbacked)
     }
 

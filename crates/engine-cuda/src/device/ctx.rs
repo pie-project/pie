@@ -413,7 +413,6 @@ impl Context {
 
     /// Lay the device's measured product times on this context
     /// (`kernels_cuda::linear::routes`).
-    #[cfg(feature = "rocm")]
     pub fn set_routes(&mut self, routes: std::sync::Arc<kernels_cuda::linear::routes::Routes>) {
         self.ctx.set_routes(routes);
     }

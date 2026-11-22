@@ -104,6 +104,7 @@ fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<
         residency: engine::load::Residency::default(),
         handed: None,
         check: None,
+        places_programs: false,
     })
     .map_err(|e| e.to_string())?;
     let token = |i: u32| 100 + (i * 7919) % 5000;
@@ -364,11 +365,18 @@ pub fn run(
 ) -> Result<Outcome, String> {
     let began = Instant::now();
     let (name, facts) = crate::chip::probe().ok_or("no Vulkan device answers")?;
+    let (base, report) = crate::chip::resolve_facts(&name, &facts, profiles);
+    // The cores the device reports, or where it reports none the workgroups
+    // a load measured it holds at once, as its profile states them.
     let cores = facts
         .get("cores")
         .and_then(|v| u32::try_from(v).ok())
-        .unwrap_or(crate::chip::UNREPORTED_CORES);
-    let (base, report) = crate::chip::resolve_facts(&name, &facts, profiles);
+        .or_else(|| {
+            base.rates()
+                .resident_workgroups
+                .map(|workgroups| workgroups.round().clamp(1.0, f64::from(u32::MAX)) as u32)
+        })
+        .ok_or("the device reports no cores and its profile states no [rates] resident_workgroups: serve a model on it once, which measures them, then tune")?;
     say(&format!(
         "{name}: {}; starting from {}",
         facts.describe().join(", "),

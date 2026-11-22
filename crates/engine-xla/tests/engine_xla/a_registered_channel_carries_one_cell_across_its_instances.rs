@@ -71,7 +71,6 @@ fn bind(rig: &mut Rig, program: ProgramId, seeded: bool) -> InstanceId {
     let out = rig.channel_of(vec![2], Dtype::U32, HostRole::Reader);
     rig.engine
         .bind_instance(&InstanceBinding {
-            resident: Default::default(),
             program,
             channels: vec![COUNTER, out],
             seeds: if seeded {
@@ -279,7 +278,6 @@ fn a_guest_fault_fails_its_own_lanes_alone() {
         let out = rig.channel_of(vec![2], Dtype::U32, HostRole::Reader);
         rig.engine
             .bind_instance(&InstanceBinding {
-                resident: Default::default(),
                 program,
                 channels: vec![input, out],
                 seeds: if seeded {

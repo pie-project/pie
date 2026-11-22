@@ -76,8 +76,11 @@ impl engine_gpu::backend::Context<Api> for Context {
         Context::name(self)
     }
 
+    /// The reported cores, or the workgroups the load measured the device
+    /// holds (`Context::cores`): every caller reads it past the load's
+    /// rates step, which refuses a load whose profile still lacks them.
     fn cores(&self) -> u32 {
-        Context::cores(self)
+        Context::cores(self).unwrap_or(1)
     }
 
     fn capacity(&self) -> u64 {

@@ -236,7 +236,6 @@ pub fn alone_slots(
 ) -> engine_cuda::program::Slots {
     let held = plane.held(program).expect("the program's items");
     engine_cuda::program::Slots {
-        resident: engine::ScratchPlace::None,
         instance: Vec::new(),
         rings: held
             .ring_bytes

@@ -405,7 +405,6 @@ fn an_adapter_lies_in_its_slots() {
         rig.model
             .engine
             .rebind_slots(Rebind::Instance {
-                resident: Default::default(),
                 id: holder,
                 instance: Vec::new(),
                 rings: Vec::new(),

@@ -438,7 +438,6 @@ function cached(key: string, f: () => number): number {
 
 /** Waves per frame (k) for this deployment (cached). */
 export const frameSize = () => cached('frameSize', () => Math.max(witModel.frameSize(), 1));
-export const submitDeadlineUs = () => cached('submitDeadlineUs', () => Number(witModel.submitDeadlineUs()));
 /** Host-reader channel capacity that sustains run-ahead (not cached). */
 export const channelCapacity = () => Math.max(witModel.channelCapacity(), 2);
 export const kvPageSize = () => cached('kvPageSize', () => witModel.kvPageSize());

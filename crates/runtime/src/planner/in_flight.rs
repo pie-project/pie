@@ -41,20 +41,32 @@ impl ResidencyPlanner {
     /// `pid` binds a fire's slots: it counts as in flight until the token
     /// drops.
     pub fn fire_in_flight(self: &Arc<Self>, pid: ProcessId) -> FireInFlight {
-        let counted = self.with_counts(|inner| {
-            inner.procs.get_mut(&pid).is_some_and(|proc| {
-                proc.fires += 1;
-                proc.fired_at = crate::rt::Instant::now();
-                // Firing: a bind it was restored for went through.
-                if inner.bind_restoring == Some(pid) {
-                    inner.bind_restoring = None;
-                }
-                proc.fire_lapsed = false;
-                // It runs: an eviction candidate again.
-                proc.unfired = false;
-                true
-            })
+        let (counted, eligible) = self.with_counts(|inner| {
+            let Some(proc) = inner.procs.get_mut(&pid) else {
+                return (false, false);
+            };
+            proc.fires += 1;
+            proc.fired_at = crate::rt::Instant::now();
+            proc.fire_lapsed = false;
+            // It runs: an eviction candidate again, and no head of its
+            // holds a restore back any more.
+            let first = std::mem::replace(&mut proc.unfired, false);
+            proc.restored_past = None;
+            // Firing: a bind it was restored for went through.
+            let bound = inner.bind_restoring == Some(pid);
+            if bound {
+                inner.bind_restoring = None;
+            }
+            (true, first || bound)
         });
+        // Its first fire since a restore or a bind's serve ends what held
+        // waiters behind it (a victim's restore held for the head it was
+        // evicted for, the next bind-suspended restore): they plan now, not
+        // when this fire lands, and not never where its landing is quiet
+        // ([`Self::head_refused_on_room_unmoved`]).
+        if eligible && self.returns.waiters.load(std::sync::atomic::Ordering::Acquire) != 0 {
+            self.poke();
+        }
         FireInFlight {
             planner: Arc::downgrade(self),
             pid,

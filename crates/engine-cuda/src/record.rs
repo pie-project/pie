@@ -945,6 +945,12 @@ impl Bodies {
         self.recorder.sealed_seen.retain(|key| key.bucket != bucket);
     }
 
+    /// Drops the one recorded body `key`: arming gives back the capture
+    /// that took the bodies past their allowance (`Shell::arm_target`).
+    pub fn forget_body(&mut self, key: &BodyKey) {
+        self.map.forget(key);
+    }
+
     #[must_use]
     pub fn body_refused(&self, key: &BodyKey) -> bool {
         self.map.refused(key)
@@ -1299,6 +1305,12 @@ impl BodyMap {
         self.cold_refused.retain(|key| key.bucket != bucket);
         self.bodies_refused.retain(|key| key.bucket != bucket);
         self.sealed = false;
+    }
+
+    fn forget(&mut self, key: &BodyKey) {
+        self.bodies.remove(key);
+        self.body_order.retain(|held| held != key);
+        self.body_warm.remove(key);
     }
 
     fn holds(&self, key: &BodyKey) -> bool {

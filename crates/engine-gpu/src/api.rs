@@ -67,6 +67,10 @@ pub trait Host: Serve {
     /// The ports a load resolves on the device.
     fn ports() -> PortMask;
 
+    /// The device as what is measured on it is keyed by
+    /// (`crate::stored`): its vendor and device ids and its driver.
+    fn measured_on(device: &Self::Context) -> String;
+
     fn settles_asynchronously(gpu: &Gpu<Self>) -> bool;
 
     /// Fires `step` ([`Gpu::fire_step`]) and runs what attaches to it.
@@ -278,10 +282,14 @@ impl<B: Host> Gpu<B> {
     /// lane's where it carries no prompt). `None` where it is admitted.
     fn admit_step(&mut self, step: &Step, at: engine::StepDone) -> Option<Error> {
         let shell = self.shell.as_mut()?;
+        // The fires landed so far move the scale this step is read at
+        // (`crate::submit::Measured`).
+        shell.track();
         let held = shell.submit_bound()?;
         let rows = crate::submit::StepRows::of(step);
         let admitted = held.admit(rows);
         let (whole, per_layer) = held.step_ns(rows);
+        let raw = held.raw_ns(rows).0;
         tracing::debug!(
             frame = at.frame.0,
             step = at.step,
@@ -293,9 +301,21 @@ impl<B: Host> Gpu<B> {
             estimate_ms = whole / 1e6,
             per_layer_ms = per_layer / 1e6,
             worst = held.worst,
-            scale = held.scale,
+            probe_scale = held.scale,
+            measured_worst = held
+                .measured_rung(rows)
+                .map_or_else(|| held.measured.worst(), |rung| held.measured.worst_of(rung)),
+            measured_fires = held
+                .measured_rung(rows)
+                .map_or_else(|| held.measured.len(), |rung| held.measured.len_of(rung)),
+            stored_ratio = held.stored_ratio(),
+            measured_rung = ?held.measured_rung(rows),
+            error = held.error_for(rows),
+            floor_factor = held.floor_factor(),
+            ratio = held.ratio_for(rows),
             bound_ms = held.bound_ns / 1e6,
             split = admitted.split(),
+            layers_a_piece = ?admitted.layers_a_piece(),
             refused = matches!(admitted, crate::submit::Admitted::Refused { .. }),
             "submit bound: a step admitted"
         );
@@ -321,8 +341,56 @@ impl<B: Host> Gpu<B> {
                     .collect(),
             ));
         }
-        shell.split_next(admitted.split());
+        shell.split_next(admitted.layers_a_piece());
+        shell.estimate_next(Some(crate::submit::Estimated {
+            ns: raw,
+            at,
+            rows: rows.rows,
+            lanes: rows.lanes,
+            pieces: match admitted {
+                crate::submit::Admitted::Layers { submissions, .. } => submissions,
+                _ => 1,
+            },
+            hz: None,
+        }));
         None
+    }
+
+    /// Under a stated submit bound, where `step` is past it even a layer at
+    /// a time: the piece to fire before it and the rest, cut at the ratio
+    /// read now (`crate::submit::next_cut`). `None` where it is admitted as
+    /// it is, where no bound is stated, or where it cannot be cut (then
+    /// refused by name as it is admitted, the reason said here).
+    fn next_piece(&mut self, step: &Step) -> Option<(Step, Step)> {
+        let shell = self.shell.as_mut()?;
+        shell.track();
+        let held = shell.submit_bound()?;
+        let rows = crate::submit::StepRows::of(step);
+        match crate::submit::next_cut(held, step, &shell.trace().facts) {
+            Ok(None) => None,
+            Ok(Some((piece, rest, piece_rows))) => {
+                tracing::debug!(
+                    rows = rows.rows,
+                    lanes = rows.lanes,
+                    keys = rows.keys,
+                    piece_rows,
+                    ratio = held.ratio_for(rows),
+                    "submit bound: a step past the bound a layer at a time: a piece cut by rows"
+                );
+                Some((piece, rest))
+            }
+            Err(why) => {
+                tracing::warn!(
+                    rows = rows.rows,
+                    lanes = rows.lanes,
+                    keys = rows.keys,
+                    %why,
+                    "submit bound: a step past the bound a layer at a time cannot be cut by rows; \
+                     refused by name"
+                );
+                None
+            }
+        }
     }
 
     #[must_use]
@@ -605,6 +673,7 @@ pub fn refusal(refusal: Refusal) -> Error {
     match refusal {
         Refusal::Closed { what, id } => Error::Closed { what, id },
         Refusal::Program(why) => Error::Program(why),
+        Refusal::Claimed(refusal) => Error::Claimed(refusal),
     }
 }
 
@@ -617,6 +686,7 @@ pub fn fault(fault: Fault) -> Error {
     }
     match fault {
         Fault::Deviceless | Fault::Device { .. } => Error::Device(fault.to_string()),
+        Fault::TierFull(_) => Error::TierFull(fault.to_string()),
 
         Fault::PatchPayload { .. } => Error::Invalid(fault.to_string()),
 
@@ -653,6 +723,7 @@ pub fn fault(fault: Fault) -> Error {
 
         Fault::Adapter { .. } => Error::Load(fault.to_string()),
         Fault::Blob { .. } => Error::Load(fault.to_string()),
+        Fault::Claimed(refusal) => Error::Claimed(refusal),
         Fault::Program { .. } => Error::Program(fault.to_string()),
         Fault::Vulkan { .. }
         | Fault::Wgpu { .. }
@@ -801,6 +872,24 @@ where
         crate::backend::Context::host_room(self.shell.as_ref()?.device())
     }
 
+    fn cover_fingerprint(&self) -> Option<String> {
+        let shell = self.shell.as_ref()?;
+        match shell.cover_fingerprint(&B::measured_on(shell.device())) {
+            Ok(print) => {
+                tracing::info!(
+                    fingerprint = %print,
+                    "the host cover's key on this engine: the device, its kernels' code, the \
+                     guest emitter's version and the tuning its fires run by"
+                );
+                Some(print)
+            }
+            Err(why) => {
+                tracing::warn!(%why, "the host cover is keyed by nothing here: measured this boot");
+                None
+            }
+        }
+    }
+
     fn live(&self) -> engine::live::Live {
         self.live.clone()
     }
@@ -852,11 +941,7 @@ where
         // A served lane names its slots by ref: the only seat-addressed
         // fires of a served load are its own naming walk's, the widest a
         // cut's lanes, and those are the seats it is asked to lay.
-        let slots = poem_compiler::state_slots(
-            budgets.slots,
-            &trace,
-            crate::serve::naming_lanes(),
-        );
+        let slots = poem_compiler::state_slots(budgets.slots, &trace, crate::serve::naming_lanes());
         let (disk_kv_budget, disk_kv_dir, seats) = (
             residency.disk_kv_budget,
             residency.disk_kv_dir.clone(),
@@ -881,9 +966,11 @@ where
             device: &self.boot,
             handed: self.handed.take(),
             check: None,
+            places_programs: true,
         })
         .map_err(fault)?;
         self.programs.load(&place(&shell)).map_err(refusal)?;
+        shell.programs_placed();
         let started = std::time::Instant::now();
         let walked = shell.walk_binds().map_err(fault)?;
         if walked > 0 {
@@ -897,6 +984,7 @@ where
         // What the load itself walked is the load's: serving counts from here.
         shell.unkept_serving();
         shell.bound_serving();
+        <B as crate::serve::Serve>::serving(&mut shell).map_err(fault)?;
         // The fire the shell took, which a binding may have bounded below
         // the one asked.
         let (max_lanes, max_tokens) = (shell.budget().max_lanes, shell.budget().max_tokens);
@@ -910,6 +998,25 @@ where
                 budgets.max_context,
             )
             .map_err(fault)?;
+        // The dense kernel at each rung settled on the served step, once the
+        // load is whole (its programs placed, its kv seated); what a newly
+        // taken kernel binds is built by a second bind walk, and what either
+        // walked is the load's.
+        shell.settle_dense().map_err(fault)?;
+        // The settle this load ran, kept in the user's profile for a later
+        // load of the same curves, model, rungs and build.
+        if let Some(settled) = shell.take_settled() {
+            let rates = profile::fire::Rates {
+                dense_settled: Some(settled),
+                ..profile::fire::Rates::default()
+            };
+            if let Err(why) = B::save_rates(shell.device(), &self.boot, &rates) {
+                tracing::warn!(%why, "the dense settle was not kept in the profile");
+            }
+        }
+        shell.walk_binds().map_err(fault)?;
+        shell.unkept_serving();
+        shell.bound_serving();
 
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, arena_bytes, pool_bytes, input_bytes) = shell.footprint();
@@ -988,8 +1095,7 @@ where
             guest_cost: {
                 let rates = crate::backend::Tactics::profile(shell.tuning()).rates();
                 engine::GuestCost {
-                    submit_bound_ns: crate::rates::stated_submit_bound()
-                        .map(|bound| u64::try_from(bound.as_nanos()).unwrap_or(u64::MAX)),
+                    submit_bound_ns: shell.submit_bound().map(|held| held.bound_ns as u64),
                     launch_ns: rates.launch_ns,
                     elementwise_gbps: rates.elementwise_gbps,
                 }
@@ -1116,7 +1222,7 @@ where
         let landed = self
             .landed
             .clone()
-            .map(|sink| -> Box<dyn FnOnce() + Send> { Box::new(move || sink(token)) });
+            .map(|sink| -> Box<dyn FnOnce() + Send> { Box::new(move || sink(token, engine::Landing::Landed)) });
         let copied = self
             .loaded_mut()?
             .copy_slots_landing(copy, landed)
@@ -1533,8 +1639,48 @@ where
             };
             // Held to the platform's bound on one submission, where it
             // states one (`crate::submit`): a step past it whole walks a
-            // layer at a time; past it even so, its lanes are refused by
-            // name. Nothing is estimated where no bound is stated.
+            // layer at a time; past it even so, its prompt lane is cut by
+            // rows, its leading pieces fired first, each alone and held
+            // to the bound in turn; a step no row of which fits, or that
+            // cannot be cut, has its lanes refused by name. Nothing is
+            // estimated where no bound is stated.
+            let mut rest: Option<Step> = None;
+            let mut piece_failed = None;
+            loop {
+                let current = rest.as_ref().unwrap_or(step);
+                // The first piece at the ratio read now: the pieces landed
+                // before move it (`crate::submit::Measured`).
+                let Some((piece, after)) = self.next_piece(current) else {
+                    break;
+                };
+                if self.admit_step(&piece, at).is_some() {
+                    // Chosen to fit: refused only past what was weighed;
+                    // the step is refused as a whole, by name.
+                    piece_failed = self.admit_step(current, at);
+                    break;
+                }
+                // A piece tells no completion: the step's last piece does.
+                let fired = self.fire_step(&piece, at, true, None);
+                if let Some(shell) = self.shell.as_mut() {
+                    shell.split_next(None);
+                    shell.estimate_next(None);
+                }
+                if let Err(error) = fired {
+                    piece_failed = Some(error);
+                    break;
+                }
+                rest = Some(after);
+            }
+            if let Some(error) = piece_failed {
+                if error.stops_frame_at(index) {
+                    refused = Some(error);
+                    break;
+                }
+                self.pending = None;
+                self.count_built();
+                return Err(error);
+            }
+            let step = rest.as_ref().unwrap_or(step);
             if let Some(refused_lanes) = self.admit_step(step, at) {
                 if refused_lanes.stops_frame_at(index) {
                     refused = Some(refused_lanes);
@@ -1546,7 +1692,8 @@ where
             }
             let fired = B::step(self, step, at);
             if let Some(shell) = self.shell.as_mut() {
-                shell.split_next(false);
+                shell.split_next(None);
+                shell.estimate_next(None);
             }
             match fired {
                 Ok((ticket, step_pending)) => {
@@ -2098,7 +2245,12 @@ mod tests {
             [(4, Some(InstanceId(102))), (5, Some(InstanceId(102)))],
             "the refusing instance's two lanes, and no other"
         );
-        assert!(faulted.faulted.iter().all(|f| f.reason.contains("poisoned")));
+        assert!(
+            faulted
+                .faulted
+                .iter()
+                .all(|f| f.reason.contains("poisoned"))
+        );
         assert!(faulted.wrote.is_empty());
     }
 }

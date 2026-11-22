@@ -54,7 +54,7 @@ impl<B: Backend> Run<'_, B> {
                         block,
                         self.tensor(*y),
                     ),
-                    None => self.gemm(*act, |tactic| {
+                    None => self.gemm(*act, *w, |tactic| {
                         kernels_slang::linear::gemm::matmul(
                             self.ctx,
                             tactic,
@@ -88,7 +88,7 @@ impl<B: Backend> Run<'_, B> {
                         block,
                         self.tensor(*y),
                     ),
-                    None => self.gemm(*act, |tactic| {
+                    None => self.gemm(*act, *w, |tactic| {
                         kernels_slang::linear::gemm::lm_head(
                             self.ctx,
                             tactic,
@@ -670,17 +670,28 @@ impl<B: Backend> Run<'_, B> {
 }
 
 impl<B: Backend> Run<'_, B> {
-    /// A dense matmul from `act` into `y` at its rung's tactic
-    /// ([`crate::dense`]). A naming sink is told every way it goes: `matmul`
+    /// A dense matmul from `act` by the weight `w` at its plane's tactic at
+    /// the rows ([`crate::dense`]). A naming sink is told every way it goes: `matmul`
     /// at each tactic some fire of up to the load's most rows takes, each
     /// naming the vector kernels besides its tiled ones.
     fn gemm(
         &self,
         act: ValueId,
+        w: ValueId,
         matmul: impl Fn(kernels_slang::linear::gemm::Tactic) -> Result<(), kernels_slang::Error>,
     ) -> Result<(), kernels_slang::Error> {
         let Some(names) = self.ctx.naming() else {
-            return matmul(self.dense().at(self.tensor(act).rows));
+            let (rows, plane) = (self.tensor(act).rows, self.tensor(w));
+            let tactic = self.dense().at(rows, plane.rows, plane.width);
+            self.pick(|| {
+                format!(
+                    "dense at {rows} rows of a {}x{} plane: {}",
+                    plane.rows,
+                    plane.width,
+                    crate::dense::name(&tactic)
+                )
+            });
+            return matmul(tactic);
         };
         // The walk fires at one rung; a fire of the load brings up to the
         // most rows its rungs hold.

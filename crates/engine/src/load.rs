@@ -118,6 +118,13 @@ pub struct Residency {
     /// `None`: every seat at full context, and at least one device pool.
     #[serde(default)]
     pub host_kv_budget: Option<u64>,
+    /// The host memory the load holds its compiled programs in, where a
+    /// test fixes it; `None` (what every served load states: no config key
+    /// reaches it) is the host's free memory. A program past it is parked
+    /// in the backend's disk cache and loaded on the first fire of its
+    /// shape.
+    #[serde(default)]
+    pub host_programs: Option<u64>,
     /// `None` takes the engine's lane ceiling.
     #[serde(default)]
     pub kv_seats: Option<u32>,
@@ -174,6 +181,7 @@ impl Residency {
             device_kv_budget: None,
             device_kv_tokens: None,
             host_kv_budget: None,
+            host_programs: None,
             kv_seats: None,
             disk_kv_budget: Some(0),
             disk_kv_dir: None,

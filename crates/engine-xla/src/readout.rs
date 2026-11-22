@@ -197,8 +197,9 @@ pub struct Kept {
     pub readback: Vec<Option<(usize, Vec<u32>)>>,
     /// The output a decoder's pixels are, and each real lane's on the host.
     pub pixels: (String, Vec<Vec<f32>>),
-    /// The host-reading lanes' readout rows, when the fire gathered them.
-    pub host: Option<HostRows>,
+    /// The host-reading lanes' rows of each readout plane the fire gathered
+    /// them from.
+    pub host: Vec<HostRows>,
 }
 
 impl std::fmt::Debug for Kept {
@@ -253,7 +254,7 @@ impl Kept {
             return Ok(None);
         };
         let plane = &self.planes[*at];
-        if let Some(host) = self.host.as_ref().filter(|host| host.plane == *at)
+        if let Some(host) = self.host.iter().find(|host| host.plane == *at)
             && let Some(Some(start)) = host.at.get(lane)
             && plane.layers <= 1
         {

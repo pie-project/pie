@@ -403,6 +403,7 @@ pub unsafe fn matmul(
     }
     // A size-only walk (`crate::sizing`) plans the product and runs none.
     if crate::sizing::active() {
+        crate::sizing::counted();
         return Ok(true);
     }
     let (alpha, beta) = (1f32, 0f32);

@@ -10,7 +10,6 @@ use std::sync::Arc;
 use eta_compiler::codegen::launch::{LaunchPackage, LaunchStagePlan, ValueOrigin};
 use eta_compiler::codegen::wgsl;
 
-pub mod claims;
 pub mod held;
 pub mod ring;
 pub mod run;
@@ -757,10 +756,10 @@ mod tests {
                 ("top-k + top-p", 5_666_304, 3_689_472),
                 ("gumbel-max", 3_689_984, 912_896),
                 ("greedy", 3_688_704, 684_288),
-                ("top logprobs", 4_906_240, 2_735_872),
+                ("top logprobs", 4_906_240, 2_777_344),
                 ("sorted", 6_424_064, 3_646_976),
-                ("beam prefill", 4_906_240, 3_039_488),
-                ("beam-4 decode", 24_356_096, 12_156_160),
+                ("beam prefill", 4_906_240, 3_080_960),
+                ("beam-4 decode", 24_356_096, 12_197_632),
             ]
         );
     }
@@ -802,12 +801,12 @@ mod tests {
                 ("standard penalized gumbel-max", 9_466_624, 2_888_960),
                 ("standard penalized top-p", 10_835_200, 4_449_024),
                 ("standard penalized top-k + top-p", 11_139_840, 4_601_344),
-                ("standard greedy + top logprobs", 4_910_592, 2_736_896),
-                ("standard gumbel-max + top logprobs", 4_911_360, 2_736_896),
+                ("standard greedy + top logprobs", 4_910_592, 2_778_368),
+                ("standard gumbel-max + top logprobs", 4_911_360, 2_778_368),
                 ("standard top-p + top logprobs", 5_975_552, 3_841_536),
                 ("standard top-k + top-p + top logprobs", 6_280_192, 3_993_856),
-                ("standard penalized greedy + top logprobs", 10_686_976, 3_952_384),
-                ("standard penalized gumbel-max + top logprobs", 10_687_744, 3_952_384),
+                ("standard penalized greedy + top logprobs", 10_686_976, 3_993_856),
+                ("standard penalized gumbel-max + top logprobs", 10_687_744, 3_993_856),
                 ("standard penalized top-p + top logprobs", 12_056_320, 4_753_408),
                 ("standard penalized top-k + top-p + top logprobs", 12_360_960, 4_905_728),
             ]

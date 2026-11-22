@@ -188,7 +188,6 @@ fn bind(
             &vec![None; count],
             &ids,
             engine_cuda::program::Slots {
-                resident: engine::ScratchPlace::None,
                 instance: slots.0,
                 rings: slots.1,
                 scratch,

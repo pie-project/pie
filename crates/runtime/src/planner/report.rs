@@ -83,6 +83,55 @@ impl ResidencyPlanner {
         self.poke();
     }
 
+    /// An eviction whose copy the engine refused before reading or writing
+    /// any of it (a placement it will not copy: the runtime's own doing,
+    /// never the process's): the move is taken back, the process stays
+    /// resident, and it is no victim again until the pool moves past the
+    /// refusal, said as the runtime's bug. Failed for it, a beam lost its
+    /// process (Mac Pro at 5 GiB on 5aa45805b: "state chunk 1936 ... lies
+    /// inside the activation span's backed carve").
+    /// An eviction whose copy down failed because the tier below is full
+    /// (the disk tier's slot file, `StorageFull`): nothing on the device
+    /// changed, so the move is taken back and the process stays resident,
+    /// said by name, and it is no victim again until the pool moves past
+    /// it (its block lapses, [`Self::lapse_blocks`]): moved again at once,
+    /// it would find the tier as full.
+    pub(super) fn eviction_tier_full(self: &Arc<Self>, pid: ProcessId, error: &str) {
+        tracing::warn!(
+            pid = %pid,
+            %error,
+            "planner: the tier below is full: the eviction is taken back, the process kept \
+             resident, no victim until the pool moves"
+        );
+        self.stats.eviction_tier_full.fetch_add(1, Ordering::Relaxed);
+        self.eviction_failed_inner(pid, false, true);
+    }
+
+    pub(super) fn eviction_copy_refused(self: &Arc<Self>, pid: ProcessId, error: &str) {
+        tracing::error!(
+            pid = %pid,
+            %error,
+            "planner: the engine refused an eviction's copy untouched: the runtime placed state \
+             it will not copy (a runtime bug); the eviction is taken back, the process kept"
+        );
+        self.stats.eviction_faults.fetch_add(1, Ordering::Relaxed);
+        self.eviction_failed_inner(pid, false, true);
+    }
+
+    /// An eviction's copy did not land ([`::engine::Landing::Failed`]): its
+    /// state is still on the device, its move taken back, and the process
+    /// kept resident, a victim again at once: the copy goes again from
+    /// where its state lies. Blocked until the pool moved (as a full tier
+    /// is), a fleet with nothing else in flight waited on it for good.
+    pub(super) fn eviction_landing_failed(self: &Arc<Self>, pid: ProcessId, error: &str) {
+        tracing::warn!(
+            pid = %pid,
+            %error,
+            "planner: an eviction's copy did not land: taken back, the process kept resident"
+        );
+        self.eviction_failed_inner(pid, false, false);
+    }
+
     pub(super) fn eviction_found_nothing(self: &Arc<Self>, pid: ProcessId) {
         self.eviction_failed_inner(pid, false, true);
     }
@@ -101,7 +150,7 @@ impl ResidencyPlanner {
         let pool_now = self.pool_now();
         let signal = self.with_inner(|inner| {
             if host_swap_full || found_nothing {
-                inner.blocked_at = Some(pool_now);
+                inner.block_on(pool_now);
             }
             // One that left meanwhile is settled by its departure.
             if inner.procs.contains_key(&pid) {
@@ -147,12 +196,35 @@ impl ResidencyPlanner {
         }
     }
 
+    /// `pid`'s restore waits for its instances' rebinds (`Some`, the
+    /// instances), or no longer (`None`): waiting, it is nothing in flight
+    /// ([`super::proc::Proc::rebind_waiting`]), and the planner plans on
+    /// that at once.
+    pub(super) fn rebind_waiting(self: &Arc<Self>, pid: ProcessId, waiting: Option<String>) {
+        let changed = self.with_inner(|inner| {
+            let proc = inner.procs.get_mut(&pid)?;
+            let changed = proc.rebind_waiting.is_some() != waiting.is_some();
+            proc.rebind_waiting = waiting;
+            Some(changed)
+        });
+        if changed == Some(true) {
+            self.poke();
+        }
+    }
+
     pub(super) fn report_restored(self: &Arc<Self>, pid: ProcessId) {
         self.clear_host_swap_blocks();
+        // With no bind pending, its unpark took what was held for it: the
+        // rest goes back. A pending bind takes its runs from it, and its
+        // take gives back the rest.
+        if self.with_inner(|inner| inner.procs.get(&pid).is_none_or(|proc| proc.bind_room.is_none())) {
+            self.port.release_restore(pid);
+        }
         let signal = self.with_inner(|inner| {
             let proc = inner.procs.get_mut(&pid)?;
             debug_assert_eq!(proc.state, Residency::Restoring);
             proc.state = Residency::Resident;
+            proc.rebind_waiting = None;
             proc.progressed = false;
             // Back for a waiting head (its own restore): no victim until it
             // has fired once; and what it was evicted for is past.
@@ -164,6 +236,8 @@ impl ResidencyPlanner {
             proc.roles_short_gives = None;
             proc.roles_short_runs = None;
             proc.roles_short_free = None;
+            proc.last_refusal = None;
+            proc.roles_short_stood = None;
             proc.roles_refused = None;
             proc.evicted_queued = false;
             proc.roles_short_mismatch = None;
@@ -198,6 +272,7 @@ impl ResidencyPlanner {
     }
 
     pub(super) fn restore_failed(self: &Arc<Self>, pid: ProcessId, reason: &str) {
+        self.port.release_restore(pid);
         let live = self.with_inner(|inner| {
             let Some(proc) = inner.procs.get_mut(&pid) else {
                 return false;
@@ -206,6 +281,7 @@ impl ResidencyPlanner {
                 return false;
             }
             proc.state = Residency::Evicted;
+            proc.rebind_waiting = None;
             true
         });
         self.stats.restore_failures.fetch_add(1, Ordering::Relaxed);
@@ -256,6 +332,7 @@ impl ResidencyPlanner {
         need: (u32, u32),
         refused_free_runs: Option<u32>,
     ) {
+        self.port.release_restore(pid);
         let recorded = self.with_inner(|inner| {
             inner
                 .procs
@@ -322,16 +399,45 @@ impl ResidencyPlanner {
         self.stats
             .restore_roles_short
             .fetch_add(1, Ordering::Relaxed);
+        // The same refusal again on the same room: each send re-ran the
+        // pass (the head's own re-send moved the generation), so no pass
+        // ever settled and the invariant never saw it (Mac Pro g2 on
+        // bd4f4ffe7: 394k passes). A repeat is a settled stall: counted, a
+        // strict test fails, and it is read as the placement's mismatch
+        // (no race refused it twice on one room): held from a send until
+        // the room moves, its need planned on chunks only moves empty.
+        let room = ((run, pieces), free_chunks, refused_room);
+        let repeat = self.with_inner(|inner| {
+            inner.procs.get_mut(&pid).is_some_and(|proc| proc.last_refusal.replace(room) == Some(room))
+        });
+        if repeat {
+            self.stats.stuck_settles.fetch_add(1, Ordering::Relaxed);
+            self.stats.refusal_repeats.fetch_add(1, Ordering::Relaxed);
+            #[cfg(test)]
+            if super::plan::PROGRESS_STRICT.with(std::cell::Cell::get) {
+                panic!(
+                    "progress invariant: restore {pid} refused again on the same room \
+                     (need {:?}, free chunks {free_chunks}, free runs {refused_room})",
+                    (run, pieces)
+                );
+            }
+        }
         self.with_inner(|inner| {
+            let quiet = repeat || inner.nothing_in_flight_but(pid);
             if let Some(proc) = inner.procs.get_mut(&pid) {
                 proc.roles_short = Some(updated);
-                if proc.bind_room.is_some_and(|bind| bind.run == run) {
-                    proc.bind_room = Some(updated);
-                }
+                // The pending bind keeps its own runs: written back with its
+                // unpark's folded in, the next refusal folded them in again.
                 proc.roles_free_retry = None;
                 proc.roles_short_gives = Some(gives);
                 proc.roles_short_runs = Some((need.0, refused_room));
                 proc.roles_short_free = Some(free_chunks);
+                // Its own restore was in flight; anyone else's?
+                proc.roles_short_quiet = quiet;
+                // Read below, once it is queued again: until then, as if
+                // its placement stood it (the stricter key), so a pass the
+                // requeue runs sends it on no less.
+                proc.roles_short_stood = Some(true);
                 proc.roles_refused = Some(need);
                 // Refused against runs the map shows: the census names the
                 // mismatch (a room the map does not read).
@@ -348,6 +454,29 @@ impl ResidencyPlanner {
             }
         });
         self.requeue_restore(pid);
+        // The store's own placement of its whole need, its serve's state
+        // laid first, as the refusal leaves the pool.
+        let queued = self.with_inner(|inner| {
+            let bind = inner
+                .procs
+                .get(&pid)
+                .and_then(|proc| proc.bind_room)
+                .map(|need| (need.run, need.pieces));
+            inner.queue.iter().find_map(|(key, waiter)| {
+                (waiter.pid == pid && matches!(waiter.kind, WaitKind::Restore { .. }))
+                    .then(|| (*key, waiter.rs_need(), bind, inner.restore_kv_missing(*key)))
+            })
+        });
+        if let Some((key, state, bind, kv)) = queued {
+            let stood = self
+                .head_room(key)
+                .is_some_and(|need| self.port.restore_stands(pid, &need, state, kv, bind));
+            self.with_inner(|inner| {
+                if let Some(proc) = inner.procs.get_mut(&pid) {
+                    proc.roles_short_stood = Some(stood);
+                }
+            });
+        }
         // A need past the whole device pool: its gate is told, to refuse it
         // by name ([`Self::restore_never_fits`]) rather than wait.
         if self.restore_never_fits_now(pid)
@@ -368,6 +497,19 @@ impl ResidencyPlanner {
     /// More of `pid`'s pages were swapped out since its restore was quoted:
     /// it is queued again, to be quoted anew when served. No failure.
     pub(super) fn requeue_restore(self: &Arc<Self>, pid: ProcessId) {
+        self.port.release_restore(pid);
+        // Queued at what it has off the device, read now: its kv pages and
+        // its state. Queued at nothing, the planner's need and placement
+        // read no state for it until its next serve re-quoted it, stood a
+        // need its serve's state then broke, and sent it again, refused,
+        // round after round (Mac Pro at 2 GiB on 5aa45805b: 151k no-step
+        // lines, the refusal's room 0 free chunks beside 28 runs the
+        // planner read).
+        let (model, engine) = self.port.locus();
+        let demand = Demand {
+            kv_pages: super::holdings::swapped_page_count(pid, model, engine),
+            rs: super::holdings::swapped_rs_units(pid, model, engine),
+        };
         self.with_inner(|inner| {
             let Some(proc) = inner.procs.get_mut(&pid) else {
                 return;
@@ -379,12 +521,7 @@ impl ResidencyPlanner {
             if inner.bind_restoring == Some(pid) {
                 inner.bind_restoring = None;
             }
-            inner.enqueue(
-                pid,
-                WaitKind::Restore {
-                    demand: Demand::default(),
-                },
-            );
+            inner.enqueue(pid, WaitKind::Restore { demand });
         });
         self.poke();
     }

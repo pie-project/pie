@@ -217,6 +217,30 @@ impl<T: Decision> Ladder<T> {
         self.rungs.iter().map(|(_, v)| v)
     }
 
+    /// The values of variable `var` at which some rung's region starts or
+    /// stops holding, ascending: past each, the pick along `var` may change,
+    /// so a walk that must meet every pick a range of `var` reaches visits
+    /// each one inside it.
+    /// Along the other variables the pick may change too; a walk covers
+    /// them by visiting each of their values it serves at every value of
+    /// `var` it walks.
+    #[must_use]
+    pub fn starts(&self, var: usize) -> Vec<i64> {
+        let mut out: Vec<i64> = self
+            .rungs
+            .iter()
+            .flat_map(|(region, _)| region.boxes().iter())
+            .filter_map(|b| b.get(var))
+            .flat_map(|set| set.intervals().iter())
+            .flat_map(|&(lo, hi)| [Some(lo), hi.checked_add(1)])
+            .flatten()
+            .filter(|&v| v != i64::MIN && v != i64::MAX)
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.rungs.len()

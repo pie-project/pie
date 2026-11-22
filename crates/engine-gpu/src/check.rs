@@ -114,6 +114,7 @@ impl<B: Serve> engine::load::check::Bench for Bench<B> {
             residency: engine::load::Residency::default(),
             handed: None,
             check: Some(rungs),
+            places_programs: false,
         })
         .map_err(|e| e.to_string())?;
         // No runtime commits segments for a check's fires as residency

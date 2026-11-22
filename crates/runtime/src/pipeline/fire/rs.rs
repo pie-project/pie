@@ -144,6 +144,45 @@ pub fn demand(
     Ok(total)
 }
 
+/// What `plan` asks of the state of the lanes `lanes` alone: the rows of a
+/// windowed plan they own, and the groups a plan of groups leads with one
+/// of them ([`demand`] of the lanes one KV working set carries).
+pub fn demand_of_lanes(
+    store: &RsStore,
+    working_sets: &[RsWorkingSetId],
+    plan: &RsPlan,
+    lanes: &[usize],
+) -> Result<RsUnits, String> {
+    let mut total = RsUnits::default();
+    match plan {
+        RsPlan::Window(rows) => {
+            for &lane in lanes {
+                let (Some(&ws), Some(row)) = (working_sets.get(lane), rows.get(lane)) else {
+                    continue;
+                };
+                total = total.add(
+                    store
+                        .window_demand(ws, row.writes.clone())
+                        .map_err(|e| e.to_string())?,
+                );
+            }
+        }
+        RsPlan::Groups(groups) => {
+            for group in groups.iter().filter(|group| lanes.contains(&group.lanes[0])) {
+                let ws = working_sets[group.lanes[0]];
+                let (write_state, fresh, _, writes) = group.write(store, ws)?;
+                total = total.add(
+                    store
+                        .group_demand(ws, write_state, fresh, writes)
+                        .map_err(|e| e.to_string())?,
+                );
+                total.slots += group.snapshots.len() as u32;
+            }
+        }
+    }
+    Ok(total)
+}
+
 #[derive(Debug, Default)]
 pub struct PreparedRs {
     pub slot_ids: Vec<u32>,

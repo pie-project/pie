@@ -148,10 +148,23 @@ pub struct KvWrites {
 
 pub type CompletionSink = std::sync::Arc<dyn Fn(StepDone, StepOutcome) + Send + Sync>;
 
-/// Where an engine tells that a copy it answered as still landing
-/// ([`Engine::copy_slots_landing`]) has landed: called once with the copy's
-/// token, from any thread.
-pub type LandingSink = std::sync::Arc<dyn Fn(u64) + Send + Sync>;
+/// How a copy the engine answered as still landing
+/// ([`Engine::copy_slots_landing`]) ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Landing {
+    /// The copy read every source slot and wrote every destination.
+    Landed,
+    /// The copy did not complete (its device event faulted, or the tier
+    /// could not move its bytes): the destination is not to be trusted; the
+    /// sources were not given to any other owner by the engine and hold what
+    /// they held before the copy. The reason names the fault.
+    Failed(String),
+}
+
+/// Where an engine tells how a copy it answered as still landing
+/// ([`Engine::copy_slots_landing`]) ended: called once with the copy's
+/// token and its [`Landing`], from any thread.
+pub type LandingSink = std::sync::Arc<dyn Fn(u64, Landing) + Send + Sync>;
 
 /// A group of a tapped lane's pages, read out: each page's spans of group
 /// `group` (of [`Engine::tap_groups`]), page after page; or why not. A tap
@@ -180,6 +193,17 @@ pub trait Engine: Send {
     fn kind(&self) -> &'static str;
 
     fn device_facts(&self) -> Option<&DeviceFacts> {
+        None
+    }
+
+    /// What the runtime's host cover depends on in this engine (`runtime`'s
+    /// `measure_host_cover`): its device and driver, and the kernels and
+    /// guest code a sampler's fire runs on it, as one fingerprint. A boot
+    /// whose engines state the same fingerprints, for the same deployment,
+    /// sampler program and frame shape, reads the cover an earlier boot
+    /// measured instead of measuring it again. `None`, the default: the
+    /// cover is measured at every load.
+    fn cover_fingerprint(&self) -> Option<String> {
         None
     }
 
@@ -347,7 +371,9 @@ pub trait Engine: Send {
     /// An instance's or a channel's pool slots moved: the runtime parked
     /// them on another tier and copied them back into the fresh refs
     /// `rebind` names, each shape apart. Called before the next fire that
-    /// reads them, which must address the new slots. A channel closed with
+    /// reads them, which must address the new slots. A park itself is said
+    /// too ([`Rebind::Parked`]): the instance's old slots are another
+    /// owner's from then on. A channel closed with
     /// an instance still bound on it is still registered
     /// ([`Engine::close_channel`]): its rebind is served like an open one's.
     /// The default does nothing: an engine that states no `Instance` or
@@ -546,7 +572,9 @@ pub trait Engine: Send {
     /// reach them after they go back is ordered behind the copy. `false`:
     /// the copy may still read them, and the engine calls the sink
     /// [`Engine::on_landed`] gave it with `token` once it has read every
-    /// source slot. Every engine
+    /// source slot. The sink is called with [`Landing::Failed`] where the
+    /// copy faulted; its sources then still hold their bytes (an engine never
+    /// hands them on before telling). Every engine
     /// states it: an answer of `true` for a copy still reading its sources
     /// hands their memory to its next owner under the copy.
     fn copy_slots_landing(&mut self, copy: &SlotCopy, token: u64) -> Result<bool>;

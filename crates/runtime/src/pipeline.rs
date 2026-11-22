@@ -20,6 +20,10 @@ pub struct Pipeline {
     pub(crate) failure: PipelineFailure,
     pub(crate) scope: crate::store::PipelineScope,
     pub(crate) frame_seq: std::sync::atomic::AtomicU64,
+    /// One past the sequence of the frame a cut pass truncated to go in
+    /// frames of its own (`pipeline::fire::submit_pass_stamped`): the
+    /// frame's later slots follow in frames of their own too. 0: none.
+    reframed: std::sync::atomic::AtomicU64,
     /// Counted in [`ACTIVE`]: from its making, and again from each submit,
     /// until it parks or closes.
     active: AtomicBool,
@@ -43,6 +47,7 @@ impl Pipeline {
             }),
             failure,
             frame_seq: std::sync::atomic::AtomicU64::new(0),
+            reframed: std::sync::atomic::AtomicU64::new(0),
             active: AtomicBool::new(true),
             written: Mutex::new(std::collections::VecDeque::new()),
         }
@@ -71,6 +76,18 @@ impl Pipeline {
     pub(crate) fn next_frame_seq(&self) -> u64 {
         self.frame_seq
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Frame `seq` was truncated before one of its slots, a cut pass, so
+    /// that pass and the slots after it go in frames of their own.
+    pub(crate) fn mark_reframed(&self, seq: u64) {
+        self.reframed
+            .store(seq + 1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether frame `seq` was truncated so ([`Self::mark_reframed`]).
+    pub(crate) fn reframed(&self, seq: u64) -> bool {
+        self.reframed.load(std::sync::atomic::Ordering::Relaxed) == seq + 1
     }
 }
 

@@ -517,6 +517,7 @@ impl Engine for Xla {
         )
         .map_err(fault)?;
         let mut shell = shell;
+        shell.set_host_programs(residency.host_programs);
         // Every maintenance program a fire, a fork or a park runs later, one
         // a slot size, compiled now whether or not the ladder runs: none is
         // built after the load.
@@ -938,6 +939,10 @@ impl Engine for Xla {
                 let cell_row = |slot: u32| shell.and_then(|shell| shell.channel_row(slot));
                 self.programs.rebind(id, &rings, &cell_row).map_err(refusal)
             }
+            // This engine claims nothing at an instance's slots and an
+            // evacuation repoints none of a guest's: its next rebind names
+            // where it lies, before any fire of it.
+            engine::program::Rebind::Parked { .. } => Ok(()),
             engine::program::Rebind::Channel { id, slots } => {
                 let shell = self.shell.as_ref();
                 let cell_row = |slot: u32| shell.and_then(|shell| shell.channel_row(slot));

@@ -210,7 +210,7 @@ fn kept(device: &Device, plane: &[f32], rows: u32, layout: Vec<(u32, u32)>) -> K
             .collect(),
         readback: vec![None; layout.len()],
         pixels: (String::new(), Vec::new()),
-        host: None,
+        host: Vec::new(),
     }
 }
 
@@ -1186,6 +1186,7 @@ fn an_epilogue_agrees_with_the_host_interpreter_every_case() {
     the_statistics_agree(device, &mut stages);
     a_flat_top_k_agrees(device, &mut stages);
     a_nucleus_cut_agrees(device, &mut stages);
+    a_rank_cut_agrees(device, &mut stages);
     the_gumbel_draws_agree(device, &mut stages);
     the_bf16_rules_agree(device, &mut stages);
     a_near_tie_draws_evenly(device, &mut stages);
@@ -1657,6 +1658,89 @@ fn nucleus_plane(negative_row: bool) -> Vec<f32> {
         _ => 0.0,
     });
     plane
+}
+
+fn rank_cut() -> (TraceContainer, Vec<u32>) {
+    let grid = Shape::matrix(ROWS, VOCAB);
+    let mut p = Program::new();
+    let (_, k) = p.input(Shape::vector(ROWS), Dtype::U32);
+    let x = p.op(Op::Output {
+        index: 0,
+        lane: 0,
+        shape: grid,
+        dtype: Dtype::F32,
+    });
+    let keep = p.op(Op::PivotThreshold {
+        input: x,
+        predicate: Predicate::RankLe(k),
+    });
+    let outs = vec![p.output(grid, Dtype::Bool, keep)];
+    (p.container(), outs)
+}
+
+/// Rows for the top-k cut's corners, each with its `k` (`rank_ks`).
+fn rank_plane() -> Vec<f32> {
+    let n = VOCAB as usize;
+    let mut plane = vec![0.0f32; ROWS as usize * n];
+    let mut row = |r: usize, f: &dyn Fn(usize) -> f32| {
+        for i in 0..n {
+            plane[r * n + i] = f(i);
+        }
+    };
+    let logits = logits_plane(1, VOCAB, 5);
+    // 0: a logits row (both signs), k 40
+    row(0, &|i| logits[i]);
+    // 1: three lanes above five tied at the k-th key, k 5: every tie kept
+    row(1, &|i| match i {
+        9 | 900 | 2000 => 3.0,
+        _ if i % 500 == 11 && i / 500 < 5 => 1.5,
+        _ => -1.0,
+    });
+    // 2: NaNs above and among a few lanes, the rest -inf, k 6
+    row(2, &|i| match i {
+        0 | 50 | 3000 => f32::NAN,
+        7 => 2.0,
+        70 => 1.0,
+        700 => -0.5,
+        _ => f32::NEG_INFINITY,
+    });
+    // 3: zeros of both signs (one key) under two lanes, k 3
+    row(3, &|i| match i {
+        100 => 0.25,
+        200 => -0.0,
+        300 => 1.0,
+        _ if i % 2 == 0 => 0.0,
+        _ => -0.0,
+    });
+    // 4: the logits row, k 0: none kept
+    row(4, &|i| logits[i]);
+    // 5: the logits row, k past the vocabulary: every lane kept
+    row(5, &|i| logits[i]);
+    // 6: NaNs, k past the real lanes: every real lane kept
+    row(6, &|i| if i % 3 == 0 { logits[i] } else { f32::NAN });
+    // 7: a negative row, k 1: its largest only
+    row(7, &|i| -1.0 - (i as f32) * 1e-3);
+    plane
+}
+
+fn a_rank_cut_agrees(device: &Device, stages: &mut Stages) {
+    let (container, outs) = rank_cut();
+    let plan = plan_of(container, VOCAB);
+    let ks = vec![40, 5, 6, 3, 0, VOCAB + 7, VOCAB, 1];
+    let seeds = vec![(0, Value::U32(ks))];
+    let plane = rank_plane();
+    let want = host(&plan, &seeds, &plane, ROWS, &outs);
+    let kept = kept(device, &plane, ROWS, vec![(0, ROWS)]);
+    let got = on_device(
+        device,
+        stages,
+        &plan,
+        &seeds,
+        Some(&kept),
+        bound(&plan, &kept, 0),
+        &outs,
+    );
+    exact(&got[0], &want[0], "the top-k cut (bisection)");
 }
 
 fn a_nucleus_cut_agrees(device: &Device, stages: &mut Stages) {

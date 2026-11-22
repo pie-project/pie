@@ -17,7 +17,7 @@ use eta_ir::types::Dtype as EtaDtype;
 use poem::Request;
 
 use super::outputs::{
-    LAYERS, Loaded, Outputs, ROWS, T, WIDTH, epilogue, loaded_lanes, output_decls,
+    LAYERS, Loaded, Outputs, ROWS, T, WIDTH, epilogue, loaded_bound, output_decls,
     registration_of,
 };
 use super::slots::Slots;
@@ -189,7 +189,17 @@ fn argmax(planes: &std::collections::BTreeMap<String, (Vec<u64>, Vec<f32>)>, tok
 /// The loaded miniature, its epilogue registered, and the slots a test's
 /// guests take.
 fn setup(tag: &str, lanes: u32) -> Option<(Loaded, engine::program::ProgramId, Slots, u32)> {
-    let mut loaded = loaded_lanes(tag, &Outputs, lanes)?;
+    setup_bound(tag, lanes, None)
+}
+
+/// [`setup`] on a device whose platform states `bound` on one GPU
+/// submission ([`loaded_bound`]).
+fn setup_bound(
+    tag: &str,
+    lanes: u32,
+    bound: Option<std::time::Duration>,
+) -> Option<(Loaded, engine::program::ProgramId, Slots, u32)> {
+    let mut loaded = loaded_bound(tag, &Outputs, lanes, bound)?;
     let decls = output_decls(&loaded.caps);
     let program = loaded
         .engine
@@ -216,10 +226,45 @@ fn setup(tag: &str, lanes: u32) -> Option<(Loaded, engine::program::ProgramId, S
 /// and reads back through room the load laid.
 #[test]
 fn a_bound_guest_states_no_fire_term_and_64_lanes_fire_in_the_rungs_span() {
+    guest_states_no_fire_term_and_64_lanes_fire_in_the_rungs_span("guest-state-64", None);
+}
+
+/// [`a_bound_guest_states_no_fire_term_and_64_lanes_fire_in_the_rungs_span`]
+/// on a device whose platform states a bound on one GPU submission (KGSL's
+/// 2 s on Android, Windows' TDR delay): every serving step is estimated,
+/// timed into its arm's timestamps, and a frame after an idle device
+/// re-times the clock by the probe first (`engine_gpu::submit`). Every one
+/// of them writes what the load laid: a fire reserves nothing still.
+#[test]
+fn under_a_stated_submit_bound_64_guest_lanes_fire_reserving_nothing() {
+    guest_states_no_fire_term_and_64_lanes_fire_in_the_rungs_span(
+        "guest-state-64-bound",
+        Some(std::time::Duration::from_secs(2)),
+    );
+}
+
+fn guest_states_no_fire_term_and_64_lanes_fire_in_the_rungs_span(
+    tag: &str,
+    submit_bound: Option<std::time::Duration>,
+) {
     const LANES: u32 = 64;
-    let Some((loaded, program, mut slots, t_input)) = setup("guest-state-64", LANES) else {
+    let Some((loaded, program, mut slots, t_input)) = setup_bound(tag, LANES, submit_bound) else {
         return;
     };
+    // The bound stated is the one the load holds its steps to: the boot's
+    // where it states one, else the platform's own (Windows' TDR, Android's
+    // driver timeout; none elsewhere).
+    let stated = submit_bound.or_else(engine_gpu::rates::stated_submit_bound);
+    assert_eq!(
+        loaded
+            .engine
+            .loaded()
+            .expect("loaded")
+            .submit_bound()
+            .map(|held| held.bound_ns),
+        stated.map(|b| b.as_nanos() as f64),
+        "the load holds its steps to the bound its boot states"
+    );
     let Loaded {
         mut engine,
         trace,
@@ -285,6 +330,14 @@ fn a_bound_guest_states_no_fire_term_and_64_lanes_fire_in_the_rungs_span() {
         takes(&engine),
         fired_takes,
         "a fire of 64 guest sessions' passes reserves nothing"
+    );
+    // Under the bound, each frame here follows an idle device (each waited
+    // for), so the probe re-timed it: into what the load laid too.
+    let probed = engine.live().tallied(engine::live::Tally::Probed);
+    assert_eq!(
+        probed > 0,
+        submit_bound.is_some(),
+        "the probe re-times a frame after idle where a bound is stated, and only there: {probed}"
     );
     drop(engine);
     let _ = std::fs::remove_dir_all(&dir);

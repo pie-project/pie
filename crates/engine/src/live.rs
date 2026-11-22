@@ -82,10 +82,15 @@ pub enum Tally {
     /// submission): not a model fire, and recorded at load where the
     /// backend keeps recordings, so never [`Tally::Unrecorded`].
     Probed,
+    /// A program the load compiled and parked in its disk cache (the host
+    /// held no more in memory), loaded on the first fire of its shape: a
+    /// load from disk, never a build, so neither [`Tally::Compiled`] nor
+    /// [`Tally::BuiltInFire`]; counted so the stall it costs is seen.
+    LoadedInFire,
 }
 
 impl Tally {
-    pub const ALL: [Tally; 10] = [
+    pub const ALL: [Tally; 11] = [
         Tally::Compiled,
         Tally::Fallback,
         Tally::Unrecorded,
@@ -96,6 +101,7 @@ impl Tally {
         Tally::BoundInFire,
         Tally::Drained,
         Tally::Probed,
+        Tally::LoadedInFire,
     ];
 
     /// Its name in the model status.
@@ -112,6 +118,7 @@ impl Tally {
             Tally::BoundInFire => "bound_in_fire",
             Tally::Drained => "drained",
             Tally::Probed => "probed",
+            Tally::LoadedInFire => "loaded_in_fire",
         }
     }
 }

@@ -23,8 +23,8 @@
 use poem_ir::Request;
 
 use super::{Lane, Seated, Shell};
+use crate::device::{Admission, HostRoom, available_memory, compile_need};
 use crate::error::Result;
-use crate::device::{Admission, available_memory, compile_need, hold_bytes};
 
 /// One synthetic lane: its word, its rows, and the pages it holds before
 /// them (a decode lane at a page bound holds all but one slot of them).
@@ -484,28 +484,32 @@ impl Shell {
         // started together.
         let need = texts.iter().map(|(t, _)| compile_need(t)).max().unwrap_or(0);
         let least = texts.iter().map(|(t, _)| compile_need(t)).min().unwrap_or(0);
-        // A compiled program held in host memory costs ~64 bytes a byte of its
-        // text (0.5 GB a 9 MiB program; 65 of them 42 GB of a v5e host's 47),
-        // and libtpu's allocator keeps what a dropped one freed for its own
-        // next use, giving the host none back: what the ladder holds is
-        // budgeted up front, the free memory less two compiles' room, in
-        // ladder order. The rest are parked: compiled onto the disk cache (not
-        // held) where they are not there yet, loaded (~1 s, never compiled) by
-        // the first fire that takes their shape. With a disk cache the ladder
-        // holds none it compiles while it compiles: a held program's memory is
-        // a compile's room (Qwen3.6-35B-A3B's v5e ladder held 25 GB of a 47 GB
-        // host by its end, its last compiles one at a time); those the free
-        // memory holds load once the compiles are done.
+        // A compiled program held in host memory takes what its load is
+        // measured to take ([`HostRoom`]), and libtpu's allocator keeps what
+        // a dropped one freed for its own next use, giving the host none
+        // back: the ladder holds what the free memory does beside two
+        // compiles' room, in ladder order, each load admitted while it fits
+        // beside those under way. The rest are parked: compiled onto the disk
+        // cache (not held) where they are not there yet, loaded (~1 s, never
+        // compiled) by the first fire that takes their shape. With a disk
+        // cache the ladder holds none it compiles while it compiles: a held
+        // program's memory is a compile's room (Qwen3.6-35B-A3B's v5e ladder
+        // held 25 GB of a 47 GB host by its end, its last compiles one at a
+        // time); those the free memory holds load once the compiles are done.
         let parks = self.device.parks();
-        let budget = available_memory().map_or(u64::MAX, |b| b.saturating_sub(2 * need));
-        let held = std::sync::atomic::AtomicU64::new(0);
+        // the programs' room: what the load states (`Residency::host_programs`),
+        // else the host's free memory less two compiles'
+        let stated = self.host_programs;
+        let host_room = HostRoom::new(stated, 2 * need);
         let parked = std::sync::atomic::AtomicUsize::new(0);
-        // The compiles' room, fixed here: what the held programs' budget
-        // leaves of the free memory. A compile starts once its own need and
-        // every running one's fit in it, woken by a compile that ends (no
-        // poll of the free memory).
-        let admission =
-            Admission::new(available_memory().map_or(u64::MAX, |b| b.saturating_sub(budget)));
+        // The compiles' room, fixed here: two compiles', or what a stated
+        // programs' room leaves of the free memory. A compile starts once
+        // its own need and every running one's fit in it, woken by a compile
+        // that ends (no poll of the free memory).
+        let admission = Admission::new(match stated {
+            Some(stated) => available_memory().map_or(u64::MAX, |b| b.saturating_sub(stated)),
+            None => 2 * need,
+        });
         let room = available_memory().map_or(8, |b| b / least.max(1)) as usize;
         let threads = std::thread::available_parallelism()
             .map_or(1, |n| n.get())
@@ -529,13 +533,12 @@ impl Shell {
                         let Some((text, sig)) = texts.get(at) else {
                             break;
                         };
-                        let hold = hold_bytes(text);
-                        let kept = (!parks || device.on_disk(text))
-                            && held
-                                .fetch_update(SeqCst, SeqCst, |h| {
-                                    (h + hold <= budget).then_some(h + hold)
-                                })
-                                .is_ok();
+                        let reserved = if !parks || device.on_disk(text) {
+                            host_room.take(text)
+                        } else {
+                            None
+                        };
+                        let kept = reserved.is_some();
                         if !kept {
                             parked.fetch_add(1, SeqCst);
                             if device.on_disk(text) {
@@ -546,6 +549,9 @@ impl Shell {
                             let _admitted = admission.admit(text);
                             device.prepare(text, (*sig).clone())
                         };
+                        if let Some(r) = reserved {
+                            host_room.done(r, program.is_ok());
+                        }
                         if kept || program.is_err() {
                             if let Ok(mut slot) = slots[at].lock() {
                                 *slot = Some(program);
@@ -577,8 +583,6 @@ impl Shell {
         if parked > 0 {
             let next = std::sync::atomic::AtomicUsize::new(0);
             let full = std::sync::atomic::AtomicBool::new(false);
-            let loading = std::sync::atomic::AtomicU64::new(0);
-            let admit = std::sync::Mutex::new(());
             let loads: Vec<
                 std::sync::Mutex<Option<Result<std::sync::Arc<crate::device::Program>>>>,
             > = (0..texts.len())
@@ -599,18 +603,12 @@ impl Shell {
                             if held[at].is_some() || !device.on_disk(text) {
                                 continue;
                             }
-                            let hold = hold_bytes(text);
-                            {
-                                let _turn = admit.lock().expect("the warm admission lock poisoned");
-                                let busy = loading.load(SeqCst);
-                                if available_memory().is_none_or(|b| b < hold + busy + 2 * need) {
-                                    full.store(true, SeqCst);
-                                    break;
-                                }
-                                loading.fetch_add(hold, SeqCst);
-                            }
+                            let Some(reserved) = host_room.take(text) else {
+                                full.store(true, SeqCst);
+                                break;
+                            };
                             let program = device.prepare(text, (*sig).clone());
-                            loading.fetch_sub(hold, SeqCst);
+                            host_room.done(reserved, program.is_ok());
                             if let Ok(mut slot) = loads[at].lock() {
                                 *slot = Some(program);
                             }
@@ -628,8 +626,8 @@ impl Shell {
         if parked > 0 {
             tracing::warn!(
                 parked,
-                held_gib = held.load(SeqCst) >> 30,
-                "xla warm ladder parked programs on disk: the host's memory holds no more"
+                held_gib = host_room.held() >> 30,
+                "xla warm ladder parked programs on disk: the host's memory holds no more; the first fire of each one's shape loads it (`loaded_in_fire`)"
             );
         }
         // The compiles' scratch is freed by now: hand it back rather than
@@ -661,7 +659,22 @@ impl Shell {
                         why,
                     });
                 }
-                None => continue,
+                None => {
+                    // parked in the disk cache: the first fire of its shape
+                    // loads it (`Shell::load_parked`)
+                    if let Some(shape_key) = d.shape_key {
+                        self.parked_shapes.insert(shape_key, d.key);
+                    }
+                    self.parked.insert(
+                        d.key,
+                        super::Parked {
+                            text: d.text,
+                            sig: d.sig,
+                            probed: d.probed,
+                        },
+                    );
+                    continue;
+                }
             };
             self.probed.insert(d.key, d.probed);
             self.traced.insert(d.key, std::sync::Arc::clone(&program));

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -24,27 +24,27 @@ pub(super) struct Inner {
     pub(super) bind_restoring: Option<ProcessId>,
     pub(super) next_seq: u64,
     next_id: u64,
-    pub(super) procs: HashMap<ProcessId, Proc>,
+    pub(super) procs: super::PidMap<Proc>,
     pub(super) queue: BTreeMap<EntryKey, Waiter>,
     pub(super) accum: DevicePageReservation,
     /// Pages on their way back: a suspend's in flight, keyed by its process,
     /// or a departed process's still held by its working sets, keyed by the
     /// process gone, until its last [`super::Departure`] hold drops.
-    pub(super) evicting: HashMap<ProcessId, Reclaim>,
+    pub(super) evicting: super::PidMap<Reclaim>,
     pub(super) completion_credit: u32,
-    pub(super) host_swap_blocked: HashSet<ProcessId>,
-    pub(super) prepare_blocked: HashSet<ProcessId>,
+    pub(super) host_swap_blocked: super::PidSet,
+    pub(super) prepare_blocked: super::PidSet,
     /// The pool's room count and the swap tiers' free slots when the last
     /// of those blocks was set ([`super::ResidencyPlanner::lapse_blocks`]):
     /// a block holds only on the pool it was set on.
     pub(super) blocked_at: Option<(u64, u32)>,
-    pub(super) killing: HashSet<ProcessId>,
+    pub(super) killing: super::PidSet,
     pub(super) admitting: BTreeMap<(Rank, ProcessId), Arc<Notify>>,
     pub(super) to_end: super::to_end::ToEnd,
     /// The evicted processes whose parked state is on its way down a tier
     /// ([`super::ResidencyPlanner::park_down`]): none is restored until it
     /// lands, so no restore misses an item moving under it.
-    pub(super) parked_moving: HashSet<ProcessId>,
+    pub(super) parked_moving: super::PidSet,
     /// The unservable head the last stall dump named, the pool's room
     /// count then, and when ([`super::ResidencyPlanner::dump_stall`]): one
     /// dump per head and room change, and again each
@@ -55,14 +55,94 @@ pub(super) struct Inner {
     pub(super) quiet_planned: Option<(super::wait::EntryKey, [u64; 4])>,
     /// Waits served this pass past [`super::wait::LONG_WAIT`]: the kind and
     /// how long.
-    pub(super) long_waits: Vec<(&'static str, std::time::Duration)>,
+    pub(super) long_waits: Vec<super::wait::LongWait>,
     /// The head held unserved on something in flight: since when, on what
     /// room, and whether that was said ([`super::ResidencyPlanner::tick`]).
     pub(super) held_in_flight:
         Option<(super::wait::EntryKey, u64, crate::rt::Instant, bool)>,
+    /// How the last eviction plan ended, for the stall dump: the head it
+    /// planned for, where it stopped, whether the room below was short,
+    /// and the candidates its quote found unhostable.
+    pub(super) last_plan: Option<super::victim::PlanEnd>,
+    /// Each queued process's own last plan end: a stall line names its own
+    /// head's, never another entry's ([`Self::plan_fields`]).
+    pub(super) ends: super::PidMap<super::victim::PlanEnd>,
+    /// Heads this pass planned and left stuck, and their processes: no
+    /// move named for them and nothing in flight
+    /// ([`super::ResidencyPlanner::stuck_head`]). Passed over for the
+    /// rest of the pass, so a waiter behind that can go does, and holding
+    /// no victim's restore behind them meanwhile (no move is there for
+    /// them to keep room for); cleared as the pass ends, each heading the
+    /// next pass again.
+    pub(super) passed: Vec<(super::wait::EntryKey, ProcessId)>,
 }
 
 impl Inner {
+    /// The fields every line of a head left unserved carries: where the
+    /// last plan for `head` stopped, whether the room below was short and
+    /// whom its quote found unhostable (`ended=none` where no plan has
+    /// stopped for it yet); and every victim blocked now and every restore
+    /// waiting on its rebinds.
+    pub(super) fn plan_fields(&self, head: super::wait::EntryKey) -> (String, String) {
+        use super::plan::some_pids;
+        // Its own process's last end, whatever entry it was queued under
+        // then (a refused restore is queued again under a new one): read
+        // as the planner's last end of any entry, a stall line named
+        // another head's (Mac Pro at 2 GiB: "ended=none (last ... for
+        // entry ...)").
+        let pid = self.queue.get(&head).map(|waiter| waiter.pid);
+        // An entry served and gone from the queue: the last end, where it
+        // was this entry's.
+        let own = pid.and_then(|pid| self.ends.get(&pid)).or_else(|| {
+            self.last_plan.as_ref().filter(|end| end.head.1 == head.1)
+        });
+        let plan = match own {
+            Some(end) => format!(
+                "ended={:?}{} host_short={} unhostable={}",
+                end.ended,
+                if end.head.1 == head.1 {
+                    String::new()
+                } else {
+                    format!(" (as entry {})", end.head.1)
+                },
+                end.host_short,
+                some_pids(end.unhostable.iter())
+            ),
+            None => "ended=none host_short=false unhostable=0[]".to_owned(),
+        };
+        let rebinding: Vec<String> = self
+            .procs
+            .iter()
+            .filter_map(|(pid, proc)| {
+                proc.rebind_waiting.as_ref().map(|unbound| format!("{pid}: {unbound}"))
+            })
+            .collect();
+        // Rung raises waiting for room (capped frames' and rises'): each
+        // with its process, its rung and whether it was served.
+        let raises: Vec<String> = self
+            .queue
+            .values()
+            .filter_map(|waiter| match waiter.kind {
+                WaitKind::BindRoom {
+                    rise: Some(rung),
+                    served,
+                    withdrawn,
+                    ..
+                } => Some(format!(
+                    "{}: rung={rung} served={served} withdrawn={withdrawn}",
+                    waiter.pid
+                )),
+                _ => None,
+            })
+            .collect();
+        let blocked = format!(
+            "host_swap_blocked={} prepare_blocked={} rebind_waiting={rebinding:?} raises={raises:?}",
+            some_pids(self.host_swap_blocked.iter()),
+            some_pids(self.prepare_blocked.iter())
+        );
+        (plan, blocked)
+    }
+
     pub(super) fn kill_in_flight(&self) -> bool {
         self.killing.iter().any(|pid| {
             self.procs.contains_key(pid)
@@ -232,6 +312,8 @@ impl Inner {
                 pid,
                 kind,
                 since: crate::rt::Instant::now(),
+                lacked: "behind the head",
+                wanted: ([u64::MAX; 3], [0; 2]),
             },
         );
         key
@@ -303,11 +385,7 @@ impl Inner {
         let waiting = std::cell::OnceCell::<HashSet<ProcessId>>::new();
         let waiting = || {
             waiting.get_or_init(|| {
-                self.queue
-                    .values()
-                    .filter(|waiter| waiter.is_unmet())
-                    .map(|waiter| waiter.pid)
-                    .collect()
+                self.queue.values().map(|waiter| waiter.pid).collect()
             })
         };
         // Its head served: no unmet waiter of its, and resident. A restore
@@ -315,18 +393,43 @@ impl Inner {
         // its unpark is short: read by its queue alone, it looked served
         // in that gap, and the victim's restore went first (the L40S: one
         // victim evicted 5,894 times for one restore head, never served).
+        // Or served and not fired since (restored or bound for its wait,
+        // [`super::proc::Proc::unfired`]): the victim restored then took the
+        // room back before the head ran on it, the head's next ask evicted
+        // it again, and the two went round (the L40S at 3 GiB on 4cef0c7d3:
+        // 613 evictions within 200 ms of their process's restore, about one
+        // eviction a serve).
+        // Served and not yet taken (a bind's room served, an allocation's
+        // grant not yet taken) is unserved still: the room it was served
+        // is its until it takes it. Read as served, the victim's restore
+        // went first and took that room, the bind came back short, asked
+        // again and evicted the victim again, and round (seed 361: one
+        // process evicted and restored for one bind for good).
         let unserved = |head: ProcessId| {
             waiting().contains(&head)
                 || self
                     .procs
                     .get(&head)
-                    .is_some_and(|proc| proc.state != Residency::Resident)
+                    .is_some_and(|proc| {
+                        proc.state != Residency::Resident
+                            || (proc.unfired && !proc.idle)
+                            || proc.bind_waiting
+                    })
         };
+        let passed = |head: ProcessId| self.passed.iter().any(|&(_, pid)| pid == head);
         let held_for_head = |pid: ProcessId| {
             self.procs
                 .get(&pid)
                 .and_then(|proc| proc.evicted_for)
-                .is_some_and(|head| head != pid && unserved(head))
+                .is_some_and(|head| head != pid && unserved(head) && !passed(head))
+        };
+        let head_at_bind = |pid: ProcessId| {
+            self.procs
+                .get(&pid)
+                .and_then(|proc| proc.evicted_for)
+                .filter(|&head| !passed(head))
+                .and_then(|head| self.procs.get(&head))
+                .is_some_and(|head| head.state == Residency::Resident && head.bind_waiting)
         };
         // Evicted while it waited in the queue: held while any process
         // ahead of it (older) has an entry in the queue.
@@ -345,13 +448,29 @@ impl Inner {
                     && self.procs.get(&other.pid).is_some_and(|proc| proc.seq < seq)
             })
         };
+        // The oldest restore passed over for the head it was evicted for:
+        // where nothing else heads the queue, it does. With every waiter
+        // an evicted restore, each held for another's (the L40S at 3 GiB
+        // on 5120cbc3c: six beams evicted for one another, none resident,
+        // nothing in flight), no head was chosen, no restore was ever
+        // planned, and even the beat named none.
+        let mut held_restore: Option<EntryKey> = None;
         for (&key, waiter) in &self.queue {
-            if !waiter.is_unmet() {
+            if !waiter.is_unmet() || self.passed.iter().any(|&(passed, _)| passed == key) {
                 continue;
             }
             if matches!(waiter.kind, WaitKind::Restore { .. })
                 && (held_for_head(waiter.pid) || behind_queue(waiter.pid))
             {
+                // Held for a process at a bind, between its asks (out of
+                // the queue a moment as it takes again what it was
+                // served, or asks again): never the one that goes for want
+                // of a head. Gone then, the victim's restore went, took the
+                // room the bind was made, and the bind evicted it again
+                // (seed 1610).
+                if !head_at_bind(waiter.pid) {
+                    held_restore.get_or_insert(key);
+                }
                 continue;
             }
             match &waiter.kind {
@@ -387,7 +506,25 @@ impl Inner {
                 }
             }
             (Some(allocation), None) => allocation,
-            (None, restore) => restore?,
+            (None, Some(restore)) => restore,
+            // Nothing else waits that could be served: an older entry still
+            // to take its grant holds the queue (`behind_queue`'s case), as
+            // does anything in flight; else, nothing moving, the restore
+            // held for its head goes.
+            (None, None) => {
+                let held = held_restore?;
+                let served_untaken = self.queue.values().any(|waiter| match &waiter.kind {
+                    WaitKind::Allocation { outcome, .. } => outcome.is_some(),
+                    WaitKind::BindRoom { served, .. } => *served,
+                    WaitKind::Restore { .. } => false,
+                });
+                // A head restoring (or anything else in flight) may serve
+                // it yet: held, as the anti-thrash rule asks.
+                if served_untaken || !self.nothing_in_flight() {
+                    return None;
+                }
+                held
+            }
         };
         self.queue
             .get_key_value(&head)
@@ -423,10 +560,15 @@ impl Inner {
                 // meanwhile. Kept, the eviction waited on fires whose
                 // finalizer was that bind, and the bind on the eviction
                 // (Mac Pro's M5 soak: evicting=1 for good, pool free 0).
+                // A rung raise for its capped frame is not: the frame is
+                // admitted work its eviction waits on, and it goes only
+                // once raised (Mac Pro at 2 GiB on 4cef0c7d3: the eviction
+                // waited on a capped frame whose raise it withdrew).
                 WaitKind::BindRoom {
                     notify,
                     served: false,
                     withdrawn,
+                    rise: None,
                     ..
                 } => {
                     *withdrawn = true;
@@ -482,6 +624,7 @@ impl Inner {
                 continue;
             }
             let waited = waiter.since.elapsed();
+            let (lacked, wanted) = (waiter.lacked, waiter.wanted);
             let WaitKind::Allocation {
                 demand,
                 notify,
@@ -502,7 +645,12 @@ impl Inner {
             debug_assert!(outcome.is_none(), "an unmet waiter carries no outcome");
             *outcome = Some(Ok(AllocationGrant::new(kv, RsSlotReservation::empty())));
             if waited > super::wait::LONG_WAIT {
-                long_waits.push(("allocation", waited));
+                long_waits.push(super::wait::LongWait {
+                    kind: "allocation",
+                    lacked,
+                    wanted,
+                    waited,
+                });
             }
             wake.push((key, demand.kv_pages, notify.clone()));
         }
@@ -568,19 +716,39 @@ impl Inner {
         }
     }
 
+    /// Sets the room the victims blocked now are blocked on: those blocked
+    /// on another room go back among the candidates first. One stamp for
+    /// every block, refreshed by a later block on more room, held an
+    /// earlier victim out on room it fits (seed 3392: a victim of seven
+    /// pages blocked at six free below, kept out at nineteen, every waiter
+    /// left with nothing in flight).
+    pub(super) fn block_on(&mut self, room: (u64, u32)) {
+        if self.blocked_at != Some(room) {
+            self.host_swap_blocked.clear();
+            self.prepare_blocked.clear();
+        }
+        self.blocked_at = Some(room);
+    }
+
     /// Whether `pid`'s anti-thrash mark ([`super::proc::Proc::unfired`])
     /// keeps it out of the victims: only while it can fire, by state, never
     /// a clock. Waiting in the queue itself (its lanes blocked on the
-    /// planner, which serves the head first) or with nothing in flight
-    /// anywhere (nothing of it runs), it cannot, and protected it would hold
-    /// the head that waits on its room for good: it is a candidate.
+    /// planner, which serves the head first) or at a bind for room, it
+    /// cannot, and protected it would hold the head that waits on its
+    /// room for good: it is a candidate. Nothing in flight is no such
+    /// state: restored a moment ago it fires as soon as its lanes wake, and
+    /// moved back first, it went round with the head it made room for,
+    /// restored ahead of it and evicted for it again without a fire between
+    /// (seed 4139). A head no move serves while such a one holds its room
+    /// is passed over ([`super::ResidencyPlanner::stuck_head`]).
     pub(super) fn unfired_protects(&self, pid: ProcessId) -> bool {
-        self.procs.get(&pid).is_some_and(|proc| proc.unfired)
+        self.procs
+            .get(&pid)
+            .is_some_and(|proc| proc.unfired && !proc.bind_waiting)
             && !self
                 .queue
                 .values()
                 .any(|waiter| waiter.pid == pid && waiter.is_unmet())
-            && !self.nothing_in_flight()
     }
 
     /// Whether the one bind-suspended restore at a time
@@ -615,12 +783,85 @@ impl Inner {
     /// Counting waiter kinds instead missed one each time (stalled, then
     /// waiting at binds, then one resident between steps), and the fleet
     /// stood still with nothing coming.
+    /// The kv pages restore `key` still gathers: its kv need less what the
+    /// head has gathered (`accum`, the head's alone).
+    pub(super) fn restore_kv_missing(&self, key: EntryKey) -> u32 {
+        let Some(waiter) = self.queue.get(&key) else {
+            return 0;
+        };
+        let gathered = if self.unmet_head().is_some_and(|(head, _)| head == key) {
+            u32::try_from(self.accum.len()).unwrap_or(u32::MAX)
+        } else {
+            0
+        };
+        waiter.kv_need().saturating_sub(gathered)
+    }
+
+    /// A print of the planner's own book a pass reads: the queue (each
+    /// entry and whether it is unmet), the pages gathered, the moves in
+    /// flight and parked state moving, and each process's residency,
+    /// fires, idleness and recorded needs. Part of the planner's generation
+    /// ([`super::ResidencyPlanner::generation`]).
+    pub(super) fn book_print(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        // Unordered sets fold by a wrapping sum of each member's hash: no
+        // sort, no allocation, the same print whatever the map's order.
+        fn one(value: impl Hash) -> u64 {
+            let mut hasher = rustc_hash::FxHasher::default();
+            value.hash(&mut hasher);
+            hasher.finish()
+        }
+        let mut print = one((self.next_id, self.accum.len(), self.bind_restoring));
+        for (key, waiter) in &self.queue {
+            print = print
+                .rotate_left(5)
+                ^ one((key, waiter.pid, waiter.is_unmet(), waiter.kind_name()));
+        }
+        let evicting = self.evicting.keys().fold(0u64, |sum, pid| sum.wrapping_add(one(pid)));
+        let moving = self.parked_moving.iter().fold(0u64, |sum, pid| sum.wrapping_add(one(pid)));
+        let procs = self.procs.iter().fold(0u64, |sum, (pid, proc)| {
+            sum.wrapping_add(one((
+                pid,
+                proc.state as u8,
+                proc.fires,
+                proc.fire_lapsed,
+                proc.idle,
+                proc.roles_short.map(|need| (need.run, need.pieces)),
+                proc.bind_room.map(|need| (need.run, need.pieces)),
+            )))
+        });
+        one((print, evicting, moving, procs))
+    }
+
+    /// [`Self::nothing_in_flight`] but for `pid`'s own move.
+    pub(super) fn nothing_in_flight_but(&self, pid: ProcessId) -> bool {
+        self.evicting.keys().all(|evicting| *evicting == pid)
+            && !self.kill_in_flight()
+            && self.procs.iter().all(|(at, proc)| {
+                *at == pid
+                    || ((!proc.firing() || proc.bind_waiting)
+                        && match proc.state {
+                            Residency::Evicting => false,
+                            Residency::Restoring => proc.rebind_waiting.is_some(),
+                            _ => true,
+                        })
+            })
+    }
+
     pub(super) fn nothing_in_flight(&self) -> bool {
         self.evicting.is_empty()
             && !self.kill_in_flight()
             && self.procs.values().all(|proc| {
-                !proc.firing()
-                    && !matches!(proc.state, Residency::Evicting | Residency::Restoring)
+                // A fire held at a bind the store has not served is no fire
+                // submitted: nothing it waits on comes from it.
+                (!proc.firing() || proc.bind_waiting)
+                    && match proc.state {
+                        Residency::Evicting => false,
+                        // Waiting on its rebinds, it moves nothing: it is
+                        // waiting, not in flight ([`Proc::rebind_waiting`]).
+                        Residency::Restoring => proc.rebind_waiting.is_some(),
+                        _ => true,
+                    }
             })
     }
 

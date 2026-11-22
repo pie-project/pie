@@ -516,13 +516,16 @@ fn prefill_walk(
                 "the masked prefill walks bf16 pages, with no relative bias",
             ));
         }
-        // The same two families the unmasked prefill picks between.
-        let family = if matches!(shape.head_dim, 128 | 256) {
-            "paged_prefill_masked"
+        // The same two families the unmasked prefill picks between; the
+        // narrow one in the plan's block order, as the unmasked one is.
+        let entry = if matches!(shape.head_dim, 128 | 256) {
+            format!(
+                "::pie::attn::paged_prefill_masked<{}, {hnd}, {causal}>",
+                shape.head_dim
+            )
         } else {
-            "paged_prefill_wide_masked"
+            format!("::pie::attn::paged_prefill_wide_masked<{}, {hnd}>", shape.head_dim)
         };
-        let entry = format!("::pie::attn::{family}<{}, {hnd}>", shape.head_dim);
         ctx.fire(
             op,
             Fire::at(kernel(FILE, &entry)).apply(launch),

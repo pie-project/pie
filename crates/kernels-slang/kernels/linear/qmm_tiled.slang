@@ -1,4 +1,5 @@
 #include "prim/affine.slang"
+#include "prim/ieee.slang"
 #include "prim/params.slang"
 #include "prim/slot16.slang"
 #if !defined(PIE_COOPMAT)
@@ -90,7 +91,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     if (flat < CM_BM) {
         float amax = max(row_max[flat * 2u], row_max[flat * 2u + 1u]);
         float scale = 1.0;
-        if (amax > 32768.0 && !isinf(amax) && !isnan(amax)) {
+        if (amax > 32768.0 && ieee_finite(amax)) {
             scale = exp2(-ceil(log2(amax / 32768.0)));
         }
         row_scale[flat] = scale;

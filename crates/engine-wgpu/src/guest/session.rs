@@ -14,11 +14,11 @@ use engine_gpu::error::{Fault, Result};
 use engine_gpu::store::Pools;
 use engine_gpu::store::layout::INSTANCE;
 
-use engine_gpu::guest::claims::{Claims, Run};
+use engine::guest_claims::{Claims, Holder, PairClaim, Run};
 use engine_gpu::guest::held::{self, consecutive};
 use engine_gpu::guest::session::{
     HEAP_BINDING, STATUS_BINDING, STATUS_SPAN, STEP_BINDING, StageTables, TABLES_BINDING, bases,
-    groups_for, stage_tables, step_records, step_stride,
+    stage_tables, step_groups, step_records, step_stride,
 };
 use engine_gpu::guest::state::{GuestLayout, Side};
 
@@ -392,7 +392,8 @@ struct Stage {
     areas: Vec<u32>,
     stride: u64,
 
-    groups: u32,
+    /// Each step's workgroups ([`engine_gpu::guest::session::step_groups`]).
+    groups: Vec<u32>,
 
     offsets: Vec<u64>,
 
@@ -424,6 +425,9 @@ pub struct Session {
     slot_bytes: u64,
     /// The name its slots and heap are claimed by ([`Claims`]).
     claim: u64,
+    /// The group bound on its pair's taking that it is a member of: the
+    /// group's name and the taking ([`Session::join_pair`]).
+    pair_group: Option<(u64, u64)>,
     /// The instance's state and its pair's ([`engine_gpu::guest::state`]),
     /// which its stages' heaps and the pair's score room lie in, their
     /// contents dead between fires.
@@ -451,6 +455,21 @@ impl Drop for Session {
 }
 
 impl Session {
+    /// Its process parked (`engine::Rebind::Parked`), its passes landed:
+    /// it claims only the run of slots its status and tables lie in, where
+    /// they stayed in place (`kept`); its state and its share of its pair
+    /// are another owner's to take until [`Self::retarget`] claims where it
+    /// lies again.
+    pub fn park(&mut self, kept: bool) {
+        let runs = if kept {
+            self.own_runs().into_iter().take(1).collect()
+        } else {
+            Vec::new()
+        };
+        self.library.claims.park(self.claim, &runs);
+        self.pair_group = None;
+    }
+
     pub fn new(
         device: &Context,
         package: &LaunchPackage,
@@ -548,7 +567,7 @@ impl Session {
                     why: format!("stage {at}: {why}"),
                 })?;
             stages.push(build_stage(
-                device, &library, resolved, tables, lowered, args, stride, heap,
+                device, &plans[at], &library, resolved, tables, lowered, args, stride, heap,
             )?);
         }
 
@@ -559,6 +578,7 @@ impl Session {
             slots: tables.slots.to_vec(),
             slot_bytes: tables.pools.slot_bytes(INSTANCE)?,
             claim,
+            pair_group: None,
             instance,
             pair,
             scores: layout.scores,
@@ -572,6 +592,8 @@ impl Session {
     /// each base checked ([`bases`]), and claims its slots and heap
     /// ([`Claims`]): at the bind, and again where they moved.
     fn locate(&self) -> Result<()> {
+        // Claimed before a record is written there.
+        self.claim_runs()?;
         let places = [&self.instance, &self.pair];
         for stage in &self.stages {
             let bases = bases(
@@ -588,14 +610,18 @@ impl Session {
                 &step_records(&stage.lowered, &stage.areas, stage.stride, bases),
             )?;
         }
+        Ok(())
+    }
+
+    /// The runs the instance's own state takes: the run of slots its status
+    /// and tables lie in, and its state, its heaps' place.
+    fn own_runs(&self) -> Vec<Run> {
         let (start, end) = self.status.run_span(self.slot_bytes);
         let mut runs = vec![Run {
             segment: self.status.buffer().slab_id(),
             start,
             end,
         }];
-        // The instance's own state, its heaps' place; the pair's is every
-        // instance of the pair's, shared by design.
         if let Some((buffer, at)) = self.instance.span() {
             runs.push(Run {
                 segment: buffer.slab_id(),
@@ -603,7 +629,56 @@ impl Session {
                 end: at + self.instance.bytes(),
             });
         }
-        self.library.claims.claim(self.claim, &runs)
+        runs
+    }
+
+    /// The runs its pair's state takes, which the group of instances bound
+    /// on its taking claims ([`Claims::claim_with_pair`]).
+    fn pair_runs(&self) -> Vec<Run> {
+        self.pair
+            .span()
+            .map(|(buffer, at)| Run {
+                segment: buffer.slab_id(),
+                start: at,
+                end: at + self.pair.bytes(),
+            })
+            .into_iter()
+            .collect()
+    }
+
+    /// Claims its own state's runs, and joins its pair's group where it is
+    /// bound on one.
+    fn claim_runs(&self) -> Result<()> {
+        let runs = self.own_runs();
+        match self.pair_group {
+            Some((pair, taking)) => {
+                self.library.claims.claim_with_pair(
+                    self.claim,
+                    &runs,
+                    &PairClaim {
+                        pair,
+                        taking,
+                        runs: self.pair_runs(),
+                    },
+                )?;
+            }
+            None => self.library.claims.claim(self.claim, &runs)?,
+        }
+        Ok(())
+    }
+
+    /// Joins the group bound on its pair's taking `group` (its name and the
+    /// taking, [`engine_gpu::guest::state::Takings::group`]), claiming its
+    /// own runs with it: refused by name, and its claims as they stood,
+    /// where either overlaps another holder's.
+    pub fn join_pair(&mut self, group: Option<(u64, u64)>) -> Result<()> {
+        let was = self.pair_group;
+        self.pair_group = group;
+        if let Err(why) = self.claim_runs() {
+            self.pair_group = was;
+            return Err(why);
+        }
+        Ok(())
     }
 
     /// The pair's score room, where its program reads captured scores.
@@ -640,6 +715,13 @@ impl Session {
         self.status.rebind(pools)?;
         self.instance.rebind(pools)?;
         self.pair.rebind(pools)?;
+        // The evacuation moved the pair's state for every instance on it:
+        // the group's move, claimed as one before this member's own.
+        if let Some((pair, _)) = self.pair_group {
+            self.library
+                .claims
+                .claim_all(&[(Holder::Pair(pair), self.pair_runs())])?;
+        }
         self.locate()
     }
 
@@ -669,6 +751,7 @@ impl Session {
         slots: &[u32],
         scratch: &engine::program::ScratchPlace,
         pair: &engine::program::ScratchPlace,
+        pair_group: Option<(u64, u64)>,
     ) -> Result<()> {
         if slots.len() != self.slots.len() || !consecutive(slots) {
             return Err(Fault::Program {
@@ -698,6 +781,7 @@ impl Session {
         self.slots = slots.to_vec();
         self.instance.retarget(pools, scratch)?;
         self.pair.retarget(pools, pair)?;
+        self.pair_group = pair_group;
         self.locate()
     }
 
@@ -776,7 +860,13 @@ impl Session {
                         why: "a step's record lies past a dynamic offset's reach".into(),
                     }
                 })?;
-            frame.dispatch_at("guest", pipeline, group, &[offset], [stage.groups, 1, 1])?;
+            frame.dispatch_at(
+                "guest",
+                pipeline,
+                group,
+                &[offset],
+                [stage.groups[step], 1, 1],
+            )?;
         }
         Ok(())
     }
@@ -1020,6 +1110,7 @@ fn heap_span(
 #[allow(clippy::too_many_arguments)]
 fn build_stage(
     device: &Context,
+    plan: &eta_compiler::codegen::launch::LaunchStagePlan,
     library: &Library,
     resolved: StageTables,
     tables: [Held; 4],
@@ -1047,9 +1138,18 @@ fn build_stage(
         areas,
         stride,
         groups: if lowered.strides_the_grid {
-            groups_for(&descriptors, device.cores())
+            step_groups(
+                plan,
+                &descriptors,
+                &lowered.steps,
+                device.resident().ok_or_else(|| Fault::Device {
+                    call: "guest stage",
+                    why: "a guest step strides the grid by the workgroups the device holds, which the load measures before it binds a guest"
+                        .into(),
+                })?,
+            )
         } else {
-            1
+            vec![1; lowered.steps.len()]
         },
         offsets,
         descriptors,

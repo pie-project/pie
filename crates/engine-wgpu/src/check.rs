@@ -40,8 +40,7 @@ pub fn rated(profiles: &Path, say: &mut dyn FnMut(&str)) -> Result<engine::rates
         .map_err(|e| e.to_string())?;
     let chip = device.chip();
     let (profile, _) = crate::chip::resolve(&chip, Some(profiles));
-    let tuning = crate::tuning::Tuning::new(profile, device.cores())
-        .with_workgroup_bytes(device.workgroup_bytes());
+    let tuning = crate::tuning::Tuning::new(profile).with_workgroup_bytes(device.workgroup_bytes());
     say(&format!("measuring the [rates] of {}", chip.name));
     let measured = crate::rates::measure_saying(
         &device,

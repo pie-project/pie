@@ -34,8 +34,10 @@ pub(super) fn refuse_k_quants(trace: &Trace) -> Result<()> {
 /// or bank) put in the FP8 matrix core's order and made canonical for it
 /// (it reads e4m3fnuz): negative zero as zero (fnuz's NaN; the value it
 /// is), and a plane holding a NaN code (0x7f, 0xff: numbers to fnuz)
-/// refused. One staging buffer, the widest plane's, carries each plane out
-/// of place and back.
+/// refused ([`order_fp8_spans`]). Where it lies on the device or in the
+/// weight cache's host copy; a bank left in the serving file (a load told
+/// its weights are held) is put in order in its slots once filled
+/// (`store::Pools::weight_residency`).
 pub(super) fn canonical_fp8(
     trace: &Trace,
     index: &BTreeMap<&str, usize>,
@@ -44,9 +46,7 @@ pub(super) fn canonical_fp8(
     tier: Option<&crate::experts::Tier>,
     stream: *mut core::ffi::c_void,
 ) -> Result<()> {
-    // SAFETY: `stream` is the load's stream, live for the load.
-    let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };
-    let mut planes = Vec::new();
+    let mut spans = Vec::new();
     for (at, param) in trace.params.iter().enumerate() {
         if param.dtype != Dtype::E4m3 {
             continue;
@@ -61,49 +61,90 @@ pub(super) fn canonical_fp8(
         let (Some(&k), true) = (param.shape.last(), param.shape.len() >= 2) else {
             continue;
         };
+        if tier.is_some_and(|tier| tier.filed(at)) {
+            continue;
+        }
         let rows: u64 = param.shape[..param.shape.len() - 1].iter().product();
-        planes.push((at, rows, k));
+        spans.push((address(tier, store, places[at].offset, at)?, rows, k));
     }
-    if planes.is_empty() {
-        return Ok(());
-    }
-    let widest = planes
+    order_fp8_spans(stream, &spans).map_err(|fault| match fault {
+        Fault::Param { why, .. } => Fault::Param {
+            name: trace.params[spans_param(trace, index, tier)].name.clone(),
+            why,
+        },
+        other => other,
+    })
+}
+
+/// The first e4m3 plane [`canonical_fp8`] orders, to name a refusal by.
+fn spans_param(trace: &Trace, index: &BTreeMap<&str, usize>, tier: Option<&crate::experts::Tier>) -> usize {
+    trace
+        .params
         .iter()
-        .map(|(_, rows, k)| rows * k)
-        .max()
-        .unwrap_or(0);
-    let staging = Buffer::zeroed(usize::try_from(widest).unwrap_or(usize::MAX))?;
+        .enumerate()
+        .find(|(at, param)| {
+            param.dtype == Dtype::E4m3
+                && index.contains_key(format!("{}{}", param.name, poem_ir::SCALES).as_str())
+                && !tier.is_some_and(|tier| tier.filed(*at))
+        })
+        .map_or(0, |(at, _)| at)
+}
+
+/// Each `(codes, rows, k)` span of e4m3 codes, on the device or in host
+/// memory, put in the FP8 matrix core's order and made canonical, a run of
+/// whole 16-row strips at a time through one device staging span of at
+/// most [`FP8_STAGED`] bytes (a bank needs no bank-sized buffer). A span
+/// holding a NaN code (0x7f, 0xff: numbers to e4m3fnuz) refuses the load.
+pub(crate) fn order_fp8_spans(stream: *mut core::ffi::c_void, spans: &[(u64, u64, u64)]) -> Result<()> {
+    let Some(widest_k) = spans.iter().map(|&(_, _, k)| k).max() else {
+        return Ok(());
+    };
+    // SAFETY: `stream` is the caller's live stream.
+    let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };
+    // A run of whole strips: as many as the staging span holds of the
+    // widest K, at least one.
+    let strip = 16 * widest_k;
+    let run_rows = (FP8_STAGED / strip).max(1) * 16;
+    let staged = run_rows * widest_k;
+    let staging = Buffer::zeroed(usize::try_from(2 * staged).unwrap_or(usize::MAX))?;
+    let (input, output) = (staging.ptr(), staging.ptr() + staged);
     let nans = Buffer::zeroed(4)?;
-    for &(at, rows, k) in &planes {
-        let plane = address(tier, store, places[at].offset, at)?;
-        kernels_cuda::linear::act_quant::e4m3fn_shuffle(
-            &ctx,
-            "linear.matmul",
-            plane,
-            staging.ptr(),
-            rows,
-            k,
-            nans.ptr(),
-        )?;
-        crate::device::copy_d2d(
-            stream,
-            plane,
-            staging.ptr(),
-            usize::try_from(rows * k).unwrap_or(usize::MAX),
-        )?;
+    for &(codes, rows, k) in spans {
+        let mut first = 0;
+        while first < rows {
+            let take = run_rows.min(rows - first);
+            let at = codes + first * k;
+            let bytes = usize::try_from(take * k).unwrap_or(usize::MAX);
+            crate::device::copy_any(stream, input, at, bytes)?;
+            kernels_cuda::linear::act_quant::e4m3fn_shuffle(
+                &ctx,
+                "linear.matmul",
+                input,
+                output,
+                take,
+                k,
+                nans.ptr(),
+            )?;
+            crate::device::copy_any(stream, at, output, bytes)?;
+            first += take;
+        }
     }
     crate::device::ctx::sync(stream)?;
     let mut count = [0u8; 4];
     nans.read(0, &mut count)?;
     if u32::from_le_bytes(count) != 0 {
         return Err(Fault::Param {
-            name: trace.params[planes[0].0].name.clone(),
+            name: "the e4m3 codes put in order".to_string(),
             why: "is one of the fp8 planes, which together hold NaN codes (0x7f, 0xff); the FP8 \
                   matrix core reads e4m3fnuz, where they are numbers, so this load refuses them",
         });
     }
     Ok(())
 }
+
+/// The most bytes [`order_fp8_spans`] stages a run of: a bounded device
+/// span, whatever a bank's size.
+const FP8_STAGED: u64 = 256 << 20;
 
 /// Each `e4m3g128` projection's per-row factors (`[n, k / 128]`) folded to
 /// one a 64-row group, the FP8 kernels' finest: a release's 128-row blocks

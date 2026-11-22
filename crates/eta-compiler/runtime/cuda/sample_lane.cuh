@@ -567,7 +567,11 @@ struct M1Lane {
   }
 
   // Every block of the lane here before any goes on; what each put before
-  // is then what all get.
+  // is then what all get. It waits on the lane's other blocks, so they are
+  // resident at once: the launcher lays a lane's blocks over no more units
+  // than this process's queues run on hold of the kernel at once, and checks
+  // that before it launches (`launch_region`); nothing waits on a sampler, so
+  // another launch's blocks only delay it.
   __device__ __forceinline__ void barrier() {
     // Each block stores how many barriers it reached in its own word of the
     // lane's first line (no read-modify-write the blocks would queue on),

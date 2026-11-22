@@ -787,7 +787,7 @@ mod tests {
         };
         let dispatch = |policy: &mut FramePolicy, queued: &[u64]| -> Vec<Vec<u64>> {
             let queued: QueuedFireIds = queued.iter().copied().collect();
-            match policy.plan_dispatch(&queued, &HashSet::new(), false, std::time::Instant::now()) {
+            match policy.plan_dispatch(&queued, &HashSet::new(), false, crate::rt::Instant::now()) {
                 FramePlan::Dispatch(waves) => waves,
                 plan => panic!("expected a frame dispatch, got {plan:?}"),
             }

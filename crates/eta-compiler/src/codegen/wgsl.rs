@@ -39,12 +39,12 @@ pub const fn temporary_bytes(tag: u8, len: u64, rows: u64) -> u64 {
     }
 }
 
-/// Whether a node of `tag` runs the one-row select, which keeps its state
-/// in the [`SELECT_WORDS`] just below the temporary area (`sel_at`): a
-/// pivot's select ladder.
+/// Whether a node of `tag` may run the one-row select, which keeps its
+/// state in the [`SELECT_WORDS`] just below the temporary area (`sel_at`):
+/// a pivot's select ladder, and a one-row top-k's.
 #[must_use]
 pub const fn selects(tag: u8) -> bool {
-    tag == tags::PIVOT_THRESHOLD
+    tag == tags::PIVOT_THRESHOLD || tag == tags::TOP_K
 }
 
 const BARRIER: &str = "  storageBarrier();\n";
@@ -413,7 +413,10 @@ pub struct Stepwise {
 /// (`red_fan0`), so its hashes spread over four times the invocations.
 /// 10: a `gumbel_argmax` lane multiplies its logit by the op's `scale`
 /// (the temperature's reciprocal) where it divided by a divisor.
-pub const WGSL_STEP_EMITTER_VERSION: u16 = 10;
+/// 11: a one-row `top_k` takes the select ladder (`sel_top_k`), and every
+/// NaN test reads the value's bits (`f32_is_nan`): the compiler took `x != x`
+/// as false, so the sort keyed NaN first.
+pub const WGSL_STEP_EMITTER_VERSION: u16 = 11;
 
 /// The binding of the record a step module reads its node, rung, selector
 /// and bases from ([`StepUniform`]), beside the runtime's (0, 1 and 4): a
@@ -432,6 +435,41 @@ fn stepped(tag: u8) -> bool {
 /// The closed set's calls, in [`step_calls`]' order.
 fn calls() -> Vec<Call> {
     steps::calls_of(stepped)
+}
+
+/// The jobs call `call` of [`step_calls`] runs at `rung` over its node's
+/// first operand (`len` elements in `rows` rows): its grid-stride loop's
+/// bound, where that is not the operand's length. A reduction's level runs
+/// a job a group of `fan` inputs it folds (`op_reduce_level`: `rows *
+/// n_out`), and its finish a job a row (`op_reduce_finish`). `None` for a
+/// call whose loop bound is its widest value's length, which a stage's grid
+/// is already sized by. The WGSL these mirror is pinned
+/// (`the_job_counts_mirror_the_runtime`): a change there fails that test.
+#[must_use]
+pub fn step_jobs(call: u32, rung: u32, len: u32, rows: u32) -> Option<u64> {
+    let rows = rows.max(1);
+    let row = len / rows;
+    match calls().get(call as usize)? {
+        Call::ReduceLevel(reduce) => {
+            // `red_n_in`: the row folded by each level below this one.
+            let fan0 = if matches!(reduce, Reduce::GumbelArgmax) {
+                8
+            } else {
+                32
+            };
+            let fan_at = |level: u32| if level == 0 { fan0 } else { 32 };
+            let mut n_in = row;
+            for level in 0..rung {
+                n_in = n_in.div_ceil(fan_at(level));
+            }
+            if n_in <= 1 {
+                return Some(0);
+            }
+            Some(u64::from(rows) * u64::from(n_in.div_ceil(fan_at(rung))))
+        }
+        Call::ReduceFinish(_) => Some(u64::from(rows)),
+        _ => None,
+    }
 }
 
 fn reduce_name(reduce: Reduce) -> &'static str {
@@ -472,6 +510,7 @@ fn call_text(call: Call) -> String {
         Call::SelTally => alloc::format!("sel_tally({p})"),
         Call::SelPlace => alloc::format!("sel_place({p})"),
         Call::SelWalk => alloc::format!("sel_walk({p})"),
+        Call::SelTopK => alloc::format!("sel_top_k({p})"),
         _ if !named => alloc::format!("ptir_step({p})"),
         Call::Unary => alloc::format!("map_unary({p}, {j})"),
         Call::Arith => alloc::format!("bin_arith({p}, {j})"),
@@ -1093,8 +1132,8 @@ mod stepwise_tests {
         assert_eq!(temporary_bytes(tags::GUMBEL_ARGMAX, 4 * 151_936, 4), 4 * 18_992 * 16);
         assert_eq!(temporary_bytes(tags::ADD, 151_936, 1), 0);
         assert_eq!(temporary_bytes(tags::SORT_DESC, u64::MAX, 1), u64::MAX);
-        assert!(selects(tags::PIVOT_THRESHOLD));
-        assert!(!selects(tags::TOP_K) && !selects(tags::REDUCE_ARGMAX));
+        assert!(selects(tags::PIVOT_THRESHOLD) && selects(tags::TOP_K));
+        assert!(!selects(tags::SORT_DESC) && !selects(tags::REDUCE_ARGMAX));
         for cell in [
             "return tmp_base + ((buf * n) + c) * 2u;",
             "return tmp_base + (buf * span + row * stride + c) * 2u;",
@@ -1418,9 +1457,11 @@ mod bf16_store_tests {
             if stores_h {
                 storers += 1;
                 // An invocation strides over words (or rows of whole words,
-                // the scan), never over elements.
+                // the scan; or, a select's one workgroup, its invocations'
+                // words), never over elements.
                 let by_words = body.contains("< h_words(") && body.contains("= w + lanes")
-                    || body.contains("< h_words(") && body.contains("= w2 + lanes");
+                    || body.contains("< h_words(") && body.contains("= w2 + lanes")
+                    || body.contains("< h_words(") && body.contains("= w + PTIR_WG");
                 let by_groups = name == "op_cumulative" && body.contains("g < groups");
                 assert!(
                     by_words || by_groups,
@@ -1526,6 +1567,69 @@ mod bf16_store_tests {
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod job_tests {
+    use super::{Call, RUNTIME, Reduce, calls, step_jobs};
+
+    fn index(call: Call) -> u32 {
+        u32::try_from(
+            calls()
+                .iter()
+                .position(|c| *c == call)
+                .expect("the call is in the closed set"),
+        )
+        .expect("a call index fits a u32")
+    }
+
+    /// A vocab-wide argmax row: level 0 folds 32 inputs a job, each level
+    /// above 32 of the last's outputs, down to one; its finish a job a row;
+    /// the Gumbel argmax folds 8 at level 0; a call sized by its operand
+    /// states none.
+    #[test]
+    fn a_reduction_runs_a_job_a_group_it_folds_and_its_finish_a_row() {
+        let level = index(Call::ReduceLevel(Reduce::Argmax));
+        let rows = 2;
+        let len = 248_320 * rows;
+        assert_eq!(step_jobs(level, 0, len, rows), Some(2 * 7760));
+        assert_eq!(step_jobs(level, 1, len, rows), Some(2 * 243));
+        assert_eq!(step_jobs(level, 2, len, rows), Some(2 * 8));
+        assert_eq!(step_jobs(level, 3, len, rows), Some(2));
+        assert_eq!(step_jobs(level, 4, len, rows), Some(0));
+        let gumbel = index(Call::ReduceLevel(Reduce::GumbelArgmax));
+        assert_eq!(step_jobs(gumbel, 0, len, rows), Some(2 * 31_040));
+        assert_eq!(step_jobs(gumbel, 1, len, rows), Some(2 * 970));
+        let finish = index(Call::ReduceFinish(Reduce::Argmax));
+        assert_eq!(step_jobs(finish, 0, len, rows), Some(2));
+        assert_eq!(step_jobs(index(Call::Arith), 0, len, rows), None);
+    }
+
+    /// The WGSL `step_jobs` mirrors, line for line: where the runtime's
+    /// loop bounds or fans change, this fails, and `step_jobs` follows.
+    #[test]
+    fn the_job_counts_mirror_the_runtime() {
+        for line in [
+            "fn red_fan0(kind : u32) -> u32 { return select(32u, 8u, kind == RED_GUMBEL); }",
+            "    let fan = select(32u, red_fan0(kind), l == 0u);",
+            "    n = (n + fan - 1u) / fan;",
+            "  let n_in = red_n_in(len, kind, level);",
+            "  if (n_in <= 1u) { return; }",
+            "  let fan = select(32u, red_fan0(kind), level == 0u);",
+            "  let n_out = (n_in + fan - 1u) / fan;",
+            "  let total = rows * n_out;",
+            "  for (var job : u32 = tid; job < total; job = job + lanes) {",
+            "  for (var row : u32 = tid; row < rows; row = row + lanes) {",
+            "  let len = d_len(a) / max(rows, 1u);",
+            "  if (rank < 2u) { return 1u; }",
+            "  for (var k : u32 = 0u; k + 1u < rank; k = k + 1u) { n = n * d_dim(v, k); }",
+        ] {
+            assert!(
+                RUNTIME.lines().any(|have| have == line),
+                "the runtime no longer reads `{line}`: step_jobs mirrors it"
+            );
         }
     }
 }

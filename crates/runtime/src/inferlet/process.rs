@@ -209,11 +209,6 @@ impl WaitEpisode {
     }
 }
 
-/// Awaits `step`, saying once [`STEP_SAYS_AFTER`] has passed that process
-/// `pid` waits at `stage` (each span after that at DEBUG), and once more as
-/// the wait ends, with its duration: what a stall on the way from a process
-/// to the lane is read from (seats, bind, plan, enqueue). Outside a runtime
-/// it only awaits.
 /// Whether a wait stage is one on the planner or a store (its process
 /// blocked until room, a grant, its restore, a segment, a fire span or a
 /// rung comes), not a request the engine's lane answers on its own.
@@ -229,9 +224,31 @@ pub(crate) fn blocks_on_planner(stage: &str) -> bool {
             | "enqueue: the activation rung"
             | "bind: its pair's move"
             | "seat the lanes"
+            | "plan: pages another pass computes"
     )
 }
 
+/// Awaits `wait`, input from outside the runtime that `pid`'s guest
+/// blocks on: a session receive, a timer, an HTTP response. Ready at once,
+/// it parks nothing. Pending, the process's lanes are parked first: no
+/// frame waits on a guest that waits on the outside, and each lane rejoins
+/// with its own next submit. A guest that computes, or waits on its own
+/// fires and channels, never comes here and stays awaited.
+pub(crate) async fn away_while<F: std::future::Future>(pid: ProcessId, wait: F) -> F::Output {
+    let mut wait = std::pin::pin!(wait);
+    let first = std::future::poll_fn(|cx| std::task::Poll::Ready(wait.as_mut().poll(cx))).await;
+    if let std::task::Poll::Ready(output) = first {
+        return output;
+    }
+    crate::scheduler::worker::notify_owner_away(pid);
+    wait.await
+}
+
+/// Awaits `step`, saying once [`STEP_SAYS_AFTER`] has passed that process
+/// `pid` waits at `stage` (each span after that at DEBUG), and once more as
+/// the wait ends, with its duration: what a stall on the way from a process
+/// to the lane is read from (seats, bind, plan, enqueue). Outside a runtime
+/// it only awaits.
 pub(crate) async fn said<F: std::future::Future>(
     stage: &'static str,
     pid: ProcessId,
@@ -849,6 +866,15 @@ enum Message {
 
 const OUTPUT_BUFFER_CAP: usize = 4096;
 
+/// A guest's trap as its error: the trap with its cause and wasm backtrace,
+/// and what the guest last wrote to stderr (a Rust guest's panic message).
+fn trapped(call_err: &impl std::fmt::Debug, stderr: Option<String>) -> String {
+    match stderr {
+        Some(said) => format!("Call error: {call_err:?}\nguest stderr:\n{said}"),
+        None => format!("Call error: {call_err:?}"),
+    }
+}
+
 struct Process {
     process_id: ProcessId,
     client_pid: ProcessId,
@@ -1047,7 +1073,7 @@ impl Process {
                 }
                 Err(call_err) => {
                     wasm_run_us = duration_us(wasm_run_start.elapsed());
-                    Err(format!("Call error: {call_err}"))
+                    Err(trapped(&call_err, store.data().stderr_said()))
                 }
             };
             admission_wait_us = store.data().admission_wait_us();
@@ -1297,6 +1323,25 @@ pub(crate) mod probe {
 mod tests {
     use super::*;
 
+    /// A trap says its cause and the guest's last stderr, its panic message.
+    #[test]
+    fn a_trap_says_the_guest_panic_message() {
+        let tail = output::StderrTail::default();
+        let err = output::LogStream::new_stderr(ProcessId::new_v4(), tail.clone(), false);
+        err.write_bytes(b"\nthread '<unnamed>' panicked at crates/inferlet/src/eta.rs:164:14:\n");
+        err.write_bytes(b"stage seed on a fresh channel: channel is closed\n");
+        let trap = anyhow!("wasm trap: wasm `unreachable` instruction executed")
+            .context("error while executing at wasm backtrace:\n    0: 0x7d0f - beam_search.wasm!teacher_forced");
+        let said = trapped(&trap, tail.said());
+        assert!(said.contains("0x7d0f"), "{said}");
+        assert!(said.contains("unreachable"), "the cause: {said}");
+        assert!(
+            said.contains("panicked at crates/inferlet/src/eta.rs:164:14:\nstage seed on a fresh channel: channel is closed"),
+            "{said}"
+        );
+        assert!(!trapped(&trap, None).contains("guest stderr"));
+    }
+
     /// A wait is said at INFO once as its episode starts, not on repeats,
     /// and once as it ends; the next wait is a new episode.
     #[test]
@@ -1416,6 +1461,7 @@ mod blocked_tests {
             "enqueue: the activation rung",
             "bind: its pair's move",
             "seat the lanes",
+            "plan: pages another pass computes",
         ];
         let told = |pid: ProcessId| {
             crate::scheduler::worker::OWNERS_BLOCKED.lock().unwrap().contains(&pid)

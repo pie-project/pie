@@ -29,12 +29,11 @@
 //!   the kernel serving picks at those rows (below [`GEMM_ROWS`]' first, so
 //!   the curve never weighs it), its flops over its time once its weight
 //!   reads no longer bind it. Measured on every backend.
-//! - `tile_tflops_by_rows`: each tiled matmul kernel the backend can take
-//!   at decode-shaped and short prompt rows, below the matmul curve's first,
-//!   its flops at the rows it lands over its time (slang backends).
-//! - `vector_tflops_by_rows`: each vector matmul kernel (keyed by the rows a
-//!   workgroup carries) at 1 to 256 rows, its flops over its time, its
-//!   weight passes in it (slang backends).
+//! - `kernel_tflops_by_shape`: each dense matmul kernel the slang backends
+//!   choose between (the vector kernels by the rows a workgroup carries,
+//!   the tiled by their row tile) at each of a model's dense shapes, by
+//!   rows, its flops over its time, its weight passes in it; measured once
+//!   the model's shapes are known, not one of the estimate's keys.
 //! - `workgroups_per_core`: the workgroups a compute unit holds at once
 //!   for a kernel's full rate. Derived where the device states its
 //!   occupancy (CUDA, ROCm: the resident blocks a multiprocessor);
@@ -319,17 +318,13 @@ pub fn unmeasured(rates: &profile::fire::Rates) -> Option<(&'static str, String)
             }
         }
     }
-    if let Some(tiles) = &rates.tile_tflops_by_rows {
-        for (tile, curve) in tiles {
-            if let Some((key, at)) = point("tile_tflops_by_rows", "rows", curve) {
-                return Some((key, format!("{at} (a {tile}-row tile)")));
-            }
-        }
-    }
-    if let Some(vectors) = &rates.vector_tflops_by_rows {
-        for (rows, curve) in vectors {
-            if let Some((key, at)) = point("vector_tflops_by_rows", "rows", curve) {
-                return Some((key, format!("{at} ({rows} rows a workgroup)")));
+    if let Some(curves) = &rates.kernel_tflops_by_shape {
+        for c in curves {
+            if let Some((key, at)) = point(profile::fire::KERNEL_CURVES, "rows", &c.curve) {
+                return Some((
+                    key,
+                    format!("{at} (kernel {}/{} at {}x{})", c.kind, c.key, c.n, c.k),
+                ));
             }
         }
     }
@@ -1062,6 +1057,20 @@ pub fn saved_text(
         }
         lines.drain(at..end);
     }
+    // Keyed measurements ([`profile::fire::Rates::measured_on`]) are kept
+    // only beside those of the same device, each keyed: what another device
+    // measured, or a rate stored without a key, is no measurement of this
+    // one.
+    if let Some(on) = &measured.measured_on {
+        if kept.measured_on.as_ref() != Some(on) {
+            kept = profile::fire::Rates::default();
+        }
+        for key in profile::fire::KEYED {
+            if kept.states(key) && kept.key_of(key).is_none() {
+                kept.unstate(key);
+            }
+        }
+    }
     let table: Vec<String> = measured
         .clone()
         .over(kept)
@@ -1172,46 +1181,50 @@ pub fn rates_at_load(
             rates.missing(keys)
         ));
     }
-    // The user's file is this load's own output: it keeps every section and
-    // key this pie still reads (a person's own decisions), drops each it no
-    // longer reads (said, by name), gains what this load measured and how.
-    let saved_to = match save {
-        Some(save) => {
-            let existing = std::fs::read_to_string(&save.path).ok().map(|text| {
-                let (kept, dropped) = save.registry.prune(&text);
-                for key in dropped {
-                    eprintln!(
-                        "user profile {}: dropped `{key}`, no longer read",
-                        save.path.display()
-                    );
-                }
-                kept
-            });
-            let text = saved_text(existing.as_deref(), &rates.only(&lacked), &save.provenance);
-            let check = save
-                .registry
-                .parse(&text, "the measured rates", profile::Strict::User);
-            check.map_err(|why| {
-                format!(
-                    "{}: the measured rates would not read back: {why}",
-                    save.path.display()
-                )
-            })?;
-            if let Some(dir) = save.path.parent() {
-                std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-            }
-            std::fs::write(&save.path, text)
-                .map_err(|e| format!("{}: {e}", save.path.display()))?;
-            Some(save.path.display().to_string())
-        }
-        None => None,
-    };
+    // The user's file is this load's own output (`save_rates`).
+    let saved_to = save
+        .map(|save| save_rates(&save, &rates.only(&lacked)))
+        .transpose()?;
     let mut tuned = chip.tuned().clone();
     tuned.rates = rates;
     tuned.measured_this_load = true;
     tuned.saved_to = saved_to;
     tuned.frame_cut = unsettled;
     Ok(chip.with_tuned(tuned))
+}
+
+/// `measured` written into the user's file `save` names, as a load saves
+/// what it measured: the file keeps every section and key this pie still
+/// reads (a person's own decisions), drops each it no longer reads (said, by
+/// name), gains `measured` (each key it states replacing the file's) and how
+/// it was measured. The file must read back; its path, said.
+pub fn save_rates(save: &SaveTo<'_>, measured: &profile::fire::Rates) -> Result<String, String> {
+    let existing = std::fs::read_to_string(&save.path).ok().map(|text| {
+        let (kept, dropped) = save.registry.prune(&text);
+        for key in dropped {
+            tracing::warn!(
+                profile = %save.path.display(),
+                key = %key,
+                "user profile: dropped a key this pie no longer reads"
+            );
+        }
+        kept
+    });
+    let text = saved_text(existing.as_deref(), measured, &save.provenance);
+    let check = save
+        .registry
+        .parse(&text, "the measured rates", profile::Strict::User);
+    check.map_err(|why| {
+        format!(
+            "{}: the measured rates would not read back: {why}",
+            save.path.display()
+        )
+    })?;
+    if let Some(dir) = save.path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    std::fs::write(&save.path, text).map_err(|e| format!("{}: {e}", save.path.display()))?;
+    Ok(save.path.display().to_string())
 }
 
 /// The commit this pie was built from, as the build stated it in
@@ -1394,10 +1407,13 @@ mod tests {
             few_row_tflops: Some(4.0),
             workgroups_per_core: Some(3.3),
             submit_worst_ratio: None,
+            resident_workgroups: None,
             attn_tflops_by_rows_keys: None,
-            tile_tflops_by_rows: Some(vec![(32, vec![(8, 1.0), (256, 9.0)])]),
-            vector_tflops_by_rows: Some(vec![(4, vec![(1, 0.5), (256, 4.0)])]),
             product_ns: None,
+            kernel_tflops_by_shape: None,
+            dense_settled: None,
+            measured_on: None,
+            measured_by: None,
         }
     }
 
@@ -1510,6 +1526,148 @@ mod tests {
         )
         .unwrap();
         assert!(!second.tuned().measured_this_load);
+    }
+
+    /// This build on a device, as a keyed load checks a stored measurement
+    /// against (`profile::fire::Now`): each kernel's code, each method one.
+    struct Build {
+        on: &'static str,
+        code: Vec<(&'static str, u32)>,
+    }
+
+    impl profile::fire::Now for Build {
+        fn on(&self) -> String {
+            self.on.to_string()
+        }
+        fn method(&self, _: &str) -> Option<u32> {
+            Some(1)
+        }
+        fn code(&self, kernel: &str) -> Option<u32> {
+            self.code
+                .iter()
+                .find(|(k, _)| *k == kernel)
+                .map(|&(_, c)| c)
+        }
+    }
+
+    /// What a rates step measures under `build`, keyed: `gemm_tflops_by_rows`
+    /// fires the `gemm` kernel, every other rate the `copy` kernel.
+    fn keyed(build: &Build) -> profile::fire::Rates {
+        use profile::fire::Now as _;
+        let by = |kernel: &str| profile::fire::MeasuredBy {
+            method: 1,
+            kernels: vec![(kernel.to_string(), build.code(kernel).unwrap())],
+        };
+        profile::fire::Rates {
+            measured_on: Some(build.on()),
+            measured_by: Some(
+                profile::fire::KEYS
+                    .iter()
+                    .map(|&key| {
+                        let kernel = if key == "gemm_tflops_by_rows" {
+                            "gemm"
+                        } else {
+                            "copy"
+                        };
+                        (key.to_string(), by(kernel))
+                    })
+                    .collect(),
+            ),
+            ..all()
+        }
+    }
+
+    /// Loads of one home under keyed measurements: a second load of another
+    /// pie version (another provenance, the same kernels) measures nothing;
+    /// a load whose `gemm` kernel changed measures that rate alone; a load
+    /// on another device measures every one.
+    #[test]
+    fn keyed_loads_measure_only_what_their_keys_no_longer_match() {
+        static SHELF: profile::Shelf = profile::Shelf {
+            backend: "toy",
+            seeded: &[],
+            derived: None,
+        };
+        let registry = profile::Registry::new("toy", &[], &[]);
+        let facts = profile::Facts::of(&registry);
+        let dir = std::env::temp_dir().join(format!("pie-rates-keyed-{}", std::process::id()));
+        let path = SHELF.user_path(&dir, "Card X");
+        let save = |version: &str| SaveTo {
+            path: path.clone(),
+            provenance: ("rates", format!("\"pie {version}: a test\"")),
+            registry: &registry,
+        };
+        let build = Build {
+            on: "toy 10de:2c31 driver 1",
+            code: vec![("gemm", 7), ("copy", 9)],
+        };
+        // Each load: the keys it measured (none where it measured nothing).
+        let load = |build: &Build, version: &str| -> Vec<&'static str> {
+            let (chip, report) =
+                SHELF.resolve_keyed(&registry, "Card X", &facts, Some(&dir), build);
+            assert!(
+                !report.stored.is_empty(),
+                "every keyed load says what it found"
+            );
+            let lacked = chip.rates().missing(&profile::fire::KEYS);
+            let measures = std::cell::Cell::new(0);
+            rates_at_load(
+                chip,
+                &profile::fire::KEYS,
+                Some(save(version)),
+                None,
+                None,
+                |_| {
+                    measures.set(measures.get() + 1);
+                    Ok(Measured {
+                        rates: keyed(build).only(&lacked),
+                        unsettled: false,
+                    })
+                },
+            )
+            .unwrap();
+            assert_eq!(measures.get(), usize::from(!lacked.is_empty()));
+            lacked
+        };
+        assert_eq!(
+            load(&build, "0.6.0"),
+            profile::fire::KEYS,
+            "a first load measures all"
+        );
+        assert_eq!(
+            load(&build, "0.7.0"),
+            Vec::<&str>::new(),
+            "a version bump measures nothing"
+        );
+        let changed = Build {
+            code: vec![("gemm", 8), ("copy", 9)],
+            ..build
+        };
+        assert_eq!(
+            load(&changed, "0.7.1"),
+            ["gemm_tflops_by_rows"],
+            "a changed kernel measures its rates alone"
+        );
+        assert_eq!(load(&changed, "0.7.2"), Vec::<&str>::new());
+        let other = Build {
+            on: "toy 10de:2c32 driver 1",
+            ..changed
+        };
+        assert_eq!(
+            load(&other, "0.7.2"),
+            profile::fire::KEYS,
+            "another device measures all"
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            text.contains("measured_on = \"toy 10de:2c32 driver 1\""),
+            "{text}"
+        );
+        assert!(
+            !text.contains("2c31"),
+            "nothing of the other device stays: {text}"
+        );
     }
 
     /// A saved profile lacking one key a newer pie reads: the load asks for
@@ -1915,7 +2073,7 @@ mod tests {
         .unwrap_err();
         assert!(
             err.contains(
-                "measured no [\"scan_gelems\", \"few_row_tflops\", \"workgroups_per_core\", \"tile_tflops_by_rows\", \"vector_tflops_by_rows\"]"
+                "measured no [\"scan_gelems\", \"few_row_tflops\", \"workgroups_per_core\"]"
             ),
             "{err}"
         );
@@ -2248,10 +2406,13 @@ mod tests {
             few_row_tflops: Some(4.5),
             workgroups_per_core: Some(3.3),
             submit_worst_ratio: None,
+            resident_workgroups: None,
             attn_tflops_by_rows_keys: None,
-            tile_tflops_by_rows: None,
-            vector_tflops_by_rows: None,
             product_ns: None,
+            kernel_tflops_by_shape: None,
+            dense_settled: None,
+            measured_on: None,
+            measured_by: None,
         };
         assert_eq!(tuned(&rates), rates.toml());
         let (key, text) = provenance("vulkan", "the matmul through Coopmat");

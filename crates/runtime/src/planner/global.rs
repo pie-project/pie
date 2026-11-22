@@ -47,6 +47,21 @@ pub async fn persist_run(
     super::exec::persist(0, engine, keys, retention).await
 }
 
+/// Puts `planner` as `(model, engine)`'s, with no drain task: a test plans
+/// its passes itself. `None` takes it off.
+#[cfg(test)]
+pub(crate) fn set_test_planner(
+    model: usize,
+    engine: usize,
+    planner: Option<Arc<ResidencyPlanner>>,
+) {
+    let mut planners = PLANNERS.get_or_init(Default::default).write().unwrap();
+    match planner {
+        Some(planner) => planners.insert((model, engine), planner),
+        None => planners.remove(&(model, engine)),
+    };
+}
+
 pub fn planner_for(model: usize, engine: usize) -> Option<Arc<ResidencyPlanner>> {
     if model == 0 && engine == 0 {
         return PRIMARY.get().cloned();

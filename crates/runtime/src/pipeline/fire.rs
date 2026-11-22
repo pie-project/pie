@@ -320,6 +320,62 @@ fn kv_demand(
     .map_err(|error| format!("pipeline: KV demand: {error}"))
 }
 
+/// The pages `ws` holds on the device at once to take `written` alone: what
+/// it maps up to the fire's end (a prefix it shares counted), the pages it
+/// backs past that, and the copies of shared pages it writes.
+fn alone_kv_pages(
+    stores: &crate::store::registry::Stores,
+    ws: &KvWorkingSet,
+    written: &Written,
+) -> Result<usize, String> {
+    crate::store::registry::with_kv_lock(&stores.kv, "host-other", |store| {
+        let mapped = store.mapped_len(ws.id).map_err(|error| error.to_string())?;
+        let (held, asked) = match written {
+            Written::Span(span) => (
+                mapped.min(span.end),
+                host_kv_demand_locked(store, ws, span.clone())?,
+            ),
+            Written::Pages(pages) => (
+                mapped,
+                store
+                    .write_demand(ws.id, pages)
+                    .map_err(|error| error.to_string())?,
+            ),
+        };
+        usize::try_from(held)
+            .ok()
+            .and_then(|held| held.checked_add(asked))
+            .ok_or_else(|| "KV demand exceeds usize".to_string())
+    })
+    .map_err(|error| format!("pipeline: KV demand: {error}"))
+}
+
+/// What each unit of a fire takes on the device alone: one per KV working
+/// set of `sets` ([`alone_kv_pages`]), with the state the lanes it carries
+/// (`lanes`, beside it) ask of `plan`.
+fn alone_demands(
+    stores: &crate::store::registry::Stores,
+    sets: &[(&KvWorkingSet, Written)],
+    lanes: &[Vec<usize>],
+    rs_ids: &[crate::store::rs::RsWorkingSetId],
+    plan: &rs::RsPlan,
+) -> Result<Vec<crate::planner::Demand>, String> {
+    sets.iter()
+        .enumerate()
+        .map(|(at, (set, written))| {
+            let kv_pages = u32::try_from(alone_kv_pages(stores, set, written)?)
+                .map_err(|_| "pipeline: KV demand exceeds the planner ABI".to_string())?;
+            let rs = match lanes.get(at) {
+                Some(lanes) if !rs_ids.is_empty() => {
+                    rs::demand_of_lanes(&stores.rs.lock().unwrap(), rs_ids, plan, lanes)?
+                }
+                _ => crate::store::rs::RsUnits::default(),
+            };
+            Ok(crate::planner::Demand { kv_pages, rs })
+        })
+        .collect()
+}
+
 /// `windowed`: the fire reads window slots, which come back only once every
 /// fire that read them settles (its process finalizes it). A fire that would
 /// park finalizes its own tail as it lands while it waits, rather than
@@ -328,11 +384,18 @@ fn kv_demand(
 /// before this ask returns waited on a frame only this ask completes (Mac's
 /// gemma-4-e4b c64 stall). The lane is parked first, so the scheduler waits
 /// on none of its fires.
+///
+/// `alone`: what each unit of the fire takes on the device by itself
+/// ([`alone_demands`]), read only where the planner cannot grant the whole
+/// at once: a unit past the whole device is refused by name, never waited
+/// on (over-demand is served slower; only a need that could never fit
+/// alone is refused).
 async fn acquire_grant<C: FireContext>(
     ctx: &mut C,
     pipeline_id: uuid::Uuid,
     demand: crate::planner::Demand,
     windowed: bool,
+    alone: impl FnOnce() -> Result<Vec<crate::planner::Demand>, String>,
 ) -> Result<Option<crate::planner::AllocationGrant>, String> {
     let pid = ctx.process_id();
     let Some(planner) = crate::planner::planner_of(pid) else {
@@ -354,6 +417,20 @@ async fn acquire_grant<C: FireContext>(
             return Ok(Some(grant));
         }
         crate::scheduler::worker::notify_lane_close(pipeline_id, Some(pid));
+    } else if !demand.is_zero()
+        && let Some(grant) = planner.grant_now(pid, demand)
+    {
+        planner.note_peak(pid, demand);
+        return Ok(Some(grant));
+    }
+    // Granted whole, every unit fit beside the others; short, one past the
+    // device alone is refused here rather than parked.
+    if !demand.is_zero() {
+        for unit in alone()? {
+            if let Some(error) = planner.past_device(unit) {
+                return Err(format!("pipeline: KV capacity: {error}"));
+            }
+        }
     }
     // A yield may have dropped snapshots the demand was quoted against, so
     // the caller quotes it again rather than asking for the same.
@@ -367,6 +444,15 @@ async fn acquire_grant<C: FireContext>(
     } else {
         acquire.await
     };
+    // A request the planner dropped while its process is still its own
+    // (its entry gone under it) is asked again, quoted anew: a wait, never
+    // the client's failure (the L40S on 5aa45805b: a beam failed "prefill
+    // submit ... KV capacity: planner request cancelled"). One whose
+    // process left the planner is its departure's.
+    if matches!(acquired, Err(crate::planner::PlannerError::Cancelled)) && planner.registered(pid) {
+        tracing::debug!(%pid, "pipeline: a KV request the planner dropped is asked again");
+        return Ok(None);
+    }
     match acquired.map_err(|error| format!("pipeline: KV capacity: {error}"))? {
         crate::planner::Acquired::Granted(grant) => Ok(Some(grant)),
         crate::planner::Acquired::Yield => {
@@ -1143,8 +1229,10 @@ impl RungAsk {
         }
         // Until the raise, the process submits nothing: no frame waits on
         // its lanes (the frame's firing frees what the raise is funded
-        // with; the frame is not what funds it).
-        crate::scheduler::worker::notify_owner_waits(engine, self.pid);
+        // with; the frame is not what funds it). Its owner is told blocked
+        // from its first look short of the rung (`parks_here`) until the
+        // rung is there, and unblocked as that park ends: no owner is left
+        // blocked with no unblock to come.
         let funder = crate::store::shared::programs::Planner {
             pid: self.pid,
             quorum: self.quorum,
@@ -1157,12 +1245,23 @@ impl RungAsk {
             epoch_now: &epoch_now,
         };
         crate::inferlet::process::said("enqueue: the activation rung", self.pid, async {
+            // Parked once it waits, it stays parked until the rung is
+            // there: between two waits (the funding's, the watch's) its
+            // owner was unblocked, its lanes expected again, and a frame
+            // holding three complete fronts waited on a lane whose process
+            // waited on a raise that frame held up (Mac's beamx8 on
+            // e158f45d2: "a frame is held for lanes that have not
+            // submitted", the rung lowered to 8 under a wider ask).
+            let mut parked = None;
             loop {
                 let watch = crate::store::shared::rung_watch(engine);
                 tokio::pin!(watch);
                 watch.as_mut().enable();
                 if crate::store::shared::fire_cap(engine) >= width {
                     return Ok(());
+                }
+                if parked.is_none() {
+                    parked = crate::inferlet::process::parks_here();
                 }
                 crate::store::shared::programs::fund_span(shared, || width, &funder, &mover)
                     .await?;
@@ -1171,7 +1270,6 @@ impl RungAsk {
                     return Ok(());
                 }
                 // Waiting on a raise of the rung: its owner is parked here.
-                let _parked = crate::inferlet::process::parks_here();
                 watch.await;
             }
         })
@@ -1744,7 +1842,7 @@ async fn promote<C: FireContext>(
         kv_pages: u32::try_from(below).unwrap_or(u32::MAX),
         rs: Default::default(),
     };
-    let Some(mut grant) = acquire_grant(ctx, pipeline_id, demand, false).await? else {
+    let Some(mut grant) = acquire_grant(ctx, pipeline_id, demand, false, || Ok(Vec::new())).await? else {
         return Ok(None);
     };
     let Ok(lease) = ws.fire_lease() else {
@@ -2098,6 +2196,7 @@ async fn reserve<C: FireContext>(
     pipeline_id: uuid::Uuid,
     failure: &PipelineFailure,
     sets: &[(&KvWorkingSet, Written)],
+    set_lanes: &[Vec<usize>],
     rs_ids: &[crate::store::rs::RsWorkingSetId],
     rs_plan: impl Fn() -> Result<rs::RsPlan, String>,
     windowed: bool,
@@ -2114,7 +2213,9 @@ async fn reserve<C: FireContext>(
                 .map_err(|_| "pipeline: KV demand exceeds the planner ABI".to_string())?,
             rs: rs_slot_demand(stores, rs_ids, &plan)?,
         };
-        let Some(mut grant) = acquire_grant(ctx, pipeline_id, demand, windowed).await? else {
+        let alone = || alone_demands(stores, sets, set_lanes, rs_ids, &plan);
+        let Some(mut grant) = acquire_grant(ctx, pipeline_id, demand, windowed, alone).await?
+        else {
             continue;
         };
         let mut leases = Vec::with_capacity(sets.len());
@@ -3817,6 +3918,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
     this: Resource<Pipeline>,
     fwd: Resource<ForwardPass>,
     frame: Option<crate::scheduler::FrameStamp>,
+    ahead: u32,
 ) -> Anyhow<Result<(), String>> {
     let submit_probe = crate::scheduler::probe::host_submit();
     let submit_clock = crate::scheduler::probe::ProbeClock::start();
@@ -4195,12 +4297,20 @@ pub async fn submit_pass_stamped<C: FireContext>(
         {
             let lane = &full.lanes[0];
             // Pages another pass is computing now are waited for, not
-            // computed again.
-            coalesced = crate::pipeline::coalesce::before_pass(
-                &stores,
-                ws.id,
-                u64::from(lane.kv.held),
-                slots,
+            // computed again. Waiting on that pass's fire, the process
+            // submits nothing: it is parked while it waits, unblocked as the
+            // wait ends (greedy decodes of one prompt arriving together held
+            // the claimant's first frame for the waiters' lanes for good).
+            coalesced = crate::inferlet::process::said(
+                "plan: pages another pass computes",
+                pid,
+                crate::pipeline::coalesce::before_pass(
+                    &stores,
+                    ws.id,
+                    u64::from(lane.kv.held),
+                    slots,
+                    crate::inferlet::process::parks_here,
+                ),
             )
             .await;
             crate::offload::prefill::before_pass(
@@ -4373,6 +4483,9 @@ pub async fn submit_pass_stamped<C: FireContext>(
             &forced,
             &switched.tails,
         );
+        if let Err(refusal) = every_lane_in_last_piece(&cuts, full.lanes.len()) {
+            return Ok(Err(refusal));
+        }
         // Only a lone lane's rest is cut again once a raise lands.
         let recuttable = full.lanes.len() == 1 && cuts.len() > 1;
         // A piece that would not cut to the rung asks for its own width,
@@ -4457,6 +4570,25 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // The pieces in frames of their own, in the order they are cut, so
         // the pieces of concurrent prompts seal together.
         let frame_size = crate::scheduler::configured_frame_size().max(1);
+        // A cut pass behind fires of its own frame would run its leading
+        // pieces (unframed) between them and its last piece (framed with
+        // them): no order runs both before it. The frame goes with the fires
+        // ahead of it, and the pass and the frame's later slots in frames of
+        // their own, in order.
+        let frame = match frame {
+            Some(stamp) if reframes(stamp, ahead, cuts.len()) => {
+                let _ = scheduler.frame_truncate(stamp.lane, stamp.seq, ahead);
+                let pipeline = ctx.resources().get(&this)?;
+                pipeline.mark_reframed(stamp.seq);
+                Some(crate::scheduler::FrameStamp {
+                    seq: pipeline.next_frame_seq(),
+                    slot: 0,
+                    fires: 1,
+                    ..stamp
+                })
+            }
+            frame => frame,
+        };
         let mut frames = {
             let pipeline = ctx.resources().get(&this)?;
             piece_frames(frame, cuts.len(), frame_size, || pipeline.next_frame_seq())
@@ -4651,6 +4783,12 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     (&group_sets[group], written)
                 })
                 .collect();
+            // The lanes each set carries, for what their state asks alone.
+            let set_lanes: Vec<Vec<usize>> = if rs_ws_ids.is_empty() {
+                Vec::new()
+            } else {
+                present.iter().map(|&group| groups[group].1.clone()).collect()
+            };
             let rs_plan = || {
                 if windowed {
                     host_window_plan(&req, &fold, &rs_ws_ids, keep)
@@ -4674,6 +4812,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 quorum_pipeline_id,
                 &pipeline_failure,
                 &sets,
+                &set_lanes,
                 &rs_ws_ids,
                 rs_plan,
                 windowed,
@@ -4982,6 +5121,30 @@ pub async fn submit_pass_stamped<C: FireContext>(
 /// pieces queue in their order and the pieces of concurrent lanes seal
 /// together rather than one launch at a time. A pass sharing its frame keeps
 /// that frame for its last piece, its earlier pieces unframed.
+/// Whether a pass cut into `pieces`, stamped `stamp` behind `ahead` fires
+/// of its own frame, goes in frames of its own: its leading pieces go
+/// unframed and its last with the frame, so with fires of its frame ahead
+/// no order would run them all first.
+fn reframes(stamp: crate::scheduler::FrameStamp, ahead: u32, pieces: usize) -> bool {
+    stamp.fires > 1 && ahead > 0 && pieces > 1
+}
+
+/// Every lane of a pass rides its last fire, the one that runs the program:
+/// a pass whose last fire left a lane out would read it nowhere.
+fn every_lane_in_last_piece(cuts: &[Vec<Option<(u32, u32)>>], lanes: usize) -> Result<(), String> {
+    let held = cuts
+        .last()
+        .map_or(0, |piece| piece.iter().filter(|cut| cut.is_some()).count());
+    if held == lanes {
+        Ok(())
+    } else {
+        Err(format!(
+            "pipeline: the last fire of a pass of {lanes} lanes carries {held}: every lane of \
+             a pass rides its last fire, the one that runs its program"
+        ))
+    }
+}
+
 pub(crate) fn piece_frames(
     frame: Option<crate::scheduler::FrameStamp>,
     pieces: usize,
@@ -5047,7 +5210,7 @@ pub async fn submit_frame<C: FireContext>(
     }
     if k == 1 {
         let (_, rep) = fired[0];
-        return submit_pass_stamped(ctx, this, Resource::new_borrow(rep), None).await;
+        return submit_pass_stamped(ctx, this, Resource::new_borrow(rep), None, 0).await;
     }
     {
         let probe = crate::scheduler::probe::host_submit();
@@ -5068,16 +5231,31 @@ pub async fn submit_frame<C: FireContext>(
     };
     let fires = fired.len() as u32;
     for (index, &(slot, rep)) in fired.iter().enumerate() {
-        let stamp = crate::scheduler::FrameStamp {
-            lane,
-            seq,
-            slot,
-            fires,
+        // Once a cut pass truncated the frame, each slot after it goes in a
+        // frame of its own.
+        let reframed = ctx.resources().get(&this)?.reframed(seq);
+        let (stamp, ahead) = if reframed {
+            let seq = ctx.resources().get(&this)?.next_frame_seq();
+            let own = crate::scheduler::FrameStamp {
+                lane,
+                seq,
+                slot: 0,
+                fires: 1,
+            };
+            (own, 0)
+        } else {
+            let stamp = crate::scheduler::FrameStamp {
+                lane,
+                seq,
+                slot,
+                fires,
+            };
+            (stamp, index as u32)
         };
         let pipeline: Resource<Pipeline> = Resource::new_borrow(this.rep());
         let fwd: Resource<ForwardPass> = Resource::new_borrow(rep);
-        let outcome = submit_pass_stamped(ctx, pipeline, fwd, Some(stamp)).await;
-        if !matches!(outcome, Ok(Ok(()))) && index > 0 {
+        let outcome = submit_pass_stamped(ctx, pipeline, fwd, Some(stamp), ahead).await;
+        if !matches!(outcome, Ok(Ok(()))) && index > 0 && !reframed {
             let first: Resource<ForwardPass> = Resource::new_borrow(fired[0].1);
             if let Ok(pass) = ctx.resources().get(&first)
                 && let Ok(bound) = pass.bound()
@@ -6070,6 +6248,11 @@ async fn fire_device_geometry<C: FireContext>(
         .zip(&write_indexes)
         .map(|(set, indexes)| (set, Written::Pages(indexes.clone())))
         .collect();
+    let set_lanes: Vec<Vec<usize>> = if rs_ws_ids.is_empty() {
+        Vec::new()
+    } else {
+        groups.iter().map(|(_, lanes)| lanes.clone()).collect()
+    };
     let rs_plan = || {
         if windowed {
             device_window_plan(&stores, ws.id, &write_indexes[0], &rs_ws_ids)
@@ -6084,6 +6267,7 @@ async fn fire_device_geometry<C: FireContext>(
         quorum_pipeline_id,
         &pipeline_failure,
         &sets,
+        &set_lanes,
         &rs_ws_ids,
         rs_plan,
         windowed,
@@ -7749,6 +7933,8 @@ mod cut_tests {
         a_masked_pass_is_cut_with_its_rows_masks();
         the_last_piece_holds_what_the_program_reads();
         several_lanes_are_cut_and_end_together();
+        every_lane_of_a_pass_rides_its_last_fire();
+        a_cut_pass_behind_fires_of_its_frame_goes_in_frames_of_its_own();
         a_lane_only_in_the_last_piece_is_not_written_before_it();
         a_pass_with_media_is_cut_before_its_first_span();
         a_pass_with_media_keys_the_rows_before_it();
@@ -7917,6 +8103,39 @@ mod cut_tests {
         assert!(!tail.media.is_empty(), "it cuts the log");
         req.lanes[0].positions = (0..100).collect();
         assert_eq!(keyed_rows(&req), 0, "rows rotated off their slots");
+    }
+
+    /// The pieces a pass is cut into end together: its last fire holds
+    /// every lane, and a last piece that left one out is refused by name.
+    fn every_lane_of_a_pass_rides_its_last_fire() {
+        let mut req = prefill_lane(5, 100, 16);
+        let other = prefill_lane(0, 40, 16).lanes.remove(0);
+        req.lanes.push(other);
+        let pieces = pass_pieces(&req, true, true, 32, 16, &[], &[]);
+        assert!(pieces.len() > 1);
+        assert_eq!(every_lane_in_last_piece(&pieces, 2), Ok(()));
+        let short = vec![vec![Some((0, 50)), Some((0, 40))], vec![Some((50, 100)), None]];
+        let refusal = every_lane_in_last_piece(&short, 2).unwrap_err();
+        assert!(
+            refusal.contains("a pass of 2 lanes carries 1"),
+            "{refusal}"
+        );
+    }
+
+    /// A cut pass sends its leading pieces unframed and its last with its
+    /// frame: behind fires of its own frame it goes in frames of its own;
+    /// first in its frame, alone in it, or uncut, it keeps the frame.
+    fn a_cut_pass_behind_fires_of_its_frame_goes_in_frames_of_its_own() {
+        let stamp = |fires| crate::scheduler::FrameStamp {
+            lane: uuid::Uuid::from_u128(1),
+            seq: 3,
+            slot: 1,
+            fires,
+        };
+        assert!(reframes(stamp(2), 1, 3), "slot 1 behind slot 0, cut");
+        assert!(!reframes(stamp(2), 0, 3), "first in its frame");
+        assert!(!reframes(stamp(1), 0, 3), "a frame of its own");
+        assert!(!reframes(stamp(2), 1, 1), "uncut");
     }
 
     fn several_lanes_are_cut_and_end_together() {
@@ -8836,7 +9055,7 @@ pub(crate) mod fold_tests {
         ) -> Unfired {
             let none = || Ok(rs::RsPlan::Groups(Vec::new()));
             let id = uuid::Uuid::new_v4();
-            let reserved = reserve(ctx, (model, 0), stores, id, failure, &[], &[], none, false);
+            let reserved = reserve(ctx, (model, 0), stores, id, failure, &[], &[], &[], none, false);
             reserved.await.unwrap().unfired
         }
         /// A piece prepared as a pass prepares one, whose call then asks
@@ -8923,6 +9142,7 @@ pub(crate) mod fold_tests {
             &failure,
             &[],
             &[],
+            &[],
             refused,
             false,
         );
@@ -9006,7 +9226,7 @@ pub(crate) mod fold_tests {
                 let (ws, slots) = keyed_pass(stores, &tokens);
                 let stores = stores.clone();
                 let waiting = tokio::spawn(async move {
-                    crate::pipeline::coalesce::before_pass(&stores, ws, 0, &slots).await
+                    crate::pipeline::coalesce::before_pass(&stores, ws, 0, &slots, || {}).await
                 });
                 (ws, tokens, waiting)
             })
@@ -9030,13 +9250,13 @@ pub(crate) mod fold_tests {
         stores.kv.lock().set_keeps(true);
         let prompt = |tail: u32| -> Vec<u32> { (0..64).map(|t| 1300 + t).chain([tail]).collect() };
         let (first, slots) = keyed_pass(&stores, &prompt(1));
-        let claims = crate::pipeline::coalesce::before_pass(&stores, first, 0, &slots)
+        let claims = crate::pipeline::coalesce::before_pass(&stores, first, 0, &slots, || {})
             .await
             .expect("the first claims the pages it computes");
         let waiters = waiting_on(&stores, prompt);
         let other: Vec<u32> = (0..65).map(|t| 1500 + t).collect();
         let (ws, other_slots) = keyed_pass(&stores, &other);
-        let own = crate::pipeline::coalesce::before_pass(&stores, ws, 0, &other_slots).await;
+        let own = crate::pipeline::coalesce::before_pass(&stores, ws, 0, &other_slots, || {}).await;
         assert!(
             own.is_some(),
             "another prompt claims its own, waiting on nothing"
@@ -9088,7 +9308,7 @@ pub(crate) mod fold_tests {
                     .collect()
             };
             let (first, slots) = keyed_pass(&stores, &prompt(1));
-            let claims = crate::pipeline::coalesce::before_pass(&stores, first, 0, &slots)
+            let claims = crate::pipeline::coalesce::before_pass(&stores, first, 0, &slots, || {})
                 .await
                 .unwrap();
             let waiters = waiting_on(&stores, prompt);
@@ -9165,7 +9385,7 @@ pub(crate) mod fold_tests {
                     .collect()
             };
             let (first, slots) = keyed_pass(&stores, &prompt(1));
-            let claims = crate::pipeline::coalesce::before_pass(&stores, first, 0, &slots)
+            let claims = crate::pipeline::coalesce::before_pass(&stores, first, 0, &slots, || {})
                 .await
                 .unwrap();
             let waiters = waiting_on(&stores, prompt);
@@ -10363,7 +10583,6 @@ pub(crate) mod fold_tests {
             ) {
                 FramePlan::Dispatch(waves) => waves,
                 FramePlan::Hold(_) | FramePlan::Park => Vec::new(),
-                FramePlan::Terminate(lanes) => panic!("the scheduler gave up on {lanes:?}"),
             }
         }
     }
@@ -11358,5 +11577,163 @@ mod writable_tests {
             refused.contains("lane 2") && refused.contains("froze 8"),
             "{refused}"
         );
+    }
+}
+
+#[cfg(test)]
+mod alone_tests {
+    //! A fire's units against a small device pool, through [`reserve`] and
+    //! the planner's grant as a pass asks it: a unit is one KV working set's
+    //! lanes, with every page they read and write (what they share counted).
+    //! Over-demand is served slower; only a unit past the whole device is
+    //! refused, by name and at once.
+    use super::lifecycle_tests::TestContext;
+    use super::*;
+    use crate::store::kv::page_table::WorkingSetId;
+    use crate::store::registry::Stores;
+
+    const PAGE: u32 = 4;
+
+    /// A device of `pages` pages, a planner the test's process asks (on an
+    /// engine slot of its own, `engine`), and that process.
+    fn device(engine: usize, pages: usize) -> (usize, Stores, TestContext) {
+        let model = crate::store::registry::register_model(PAGE, &[pages], &[1]);
+        let stores = crate::store::registry::get(model, 0);
+        let planner = crate::planner::ResidencyPlanner::new(Arc::new(
+            crate::planner::RegistryPool::new(model, 0, false),
+        ));
+        crate::planner::init_planner(0, engine, planner);
+        let pid = uuid::Uuid::new_v4();
+        crate::planner::place(pid, engine);
+        let planner = crate::planner::planner_of(pid).expect("installed");
+        planner.register(pid);
+        planner.note_admitted(pid);
+        let ctx = TestContext {
+            id: pid,
+            resources: wasmtime::component::ResourceTable::new(),
+            tails: Vec::new(),
+        };
+        (model, stores, ctx)
+    }
+
+    /// A fresh set of `stores` reserving `pages` pages, the first `held`
+    /// of them written and mapped on the device.
+    fn set(model: usize, stores: &Stores, pages: u64, held: u64) -> KvWorkingSet {
+        let mut kv = stores.kv.lock();
+        let ws: WorkingSetId = kv.create_working_set();
+        kv.reserve(ws, pages).unwrap();
+        if held > 0 {
+            let indexes: Vec<u64> = (0..held).collect();
+            let need = kv.write_demand(ws, &indexes).unwrap();
+            let mut granted = kv.reserve_device_pages(need).unwrap();
+            let prepared = kv
+                .prepare_write_reserved(ws, &indexes, &mut granted)
+                .unwrap();
+            let commits: Vec<_> = (0..held)
+                .map(|_| crate::store::kv::write::PageCommit {
+                    token_hashes: Vec::new(),
+                    page_hash: None,
+                })
+                .collect();
+            let seq = kv.publish_prepared(prepared, &commits).unwrap();
+            kv.settle(seq);
+        }
+        KvWorkingSet::new(model, 0, ws, PAGE)
+    }
+
+    /// One fire writing `spans` (in pages), a set each, as a pass's lanes.
+    async fn fire(
+        ctx: &mut TestContext,
+        model: usize,
+        stores: &Stores,
+        sets: &[(&KvWorkingSet, std::ops::Range<u64>)],
+    ) -> Result<Reserved, String> {
+        let sets: Vec<(&KvWorkingSet, Written)> = sets
+            .iter()
+            .map(|(set, span)| (*set, Written::Span(span.clone())))
+            .collect();
+        let failure = PipelineFailure::default();
+        let none = || Ok(rs::RsPlan::Groups(Vec::new()));
+        let id = uuid::Uuid::new_v4();
+        let asked = reserve(ctx, (model, 0), stores, id, &failure, &sets, &[], &[], none, false);
+        tokio::time::timeout(std::time::Duration::from_secs(5), asked)
+            .await
+            .expect("answered at once, never parked")
+    }
+
+    /// Four lanes that fit beside each other are granted whole.
+    #[tokio::test(flavor = "current_thread")]
+    async fn lanes_that_fit_together_are_granted_whole() {
+        let (model, stores, mut ctx) = device(91, 16);
+        let lanes: Vec<KvWorkingSet> = (0..4).map(|_| set(model, &stores, 3, 0)).collect();
+        let spans: Vec<_> = lanes.iter().map(|set| (set, 0..3)).collect();
+        let reserved = fire(&mut ctx, model, &stores, &spans).await;
+        let reserved = reserved.expect("twelve pages of sixteen");
+        assert_eq!(reserved.kvtxns.len(), 4);
+        drop(reserved.unfired.submitted());
+    }
+
+    /// A lane whose rows alone are past the whole device is refused at
+    /// its submit, by name, and the planner is never asked to hold it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_lane_past_the_device_alone_is_refused_at_submit() {
+        let (model, stores, mut ctx) = device(92, 8);
+        let lane = set(model, &stores, 9, 0);
+        let refused = fire(&mut ctx, model, &stores, &[(&lane, 0..9)])
+            .await
+            .err()
+            .expect("nine pages of eight");
+        assert!(
+            refused.contains("device memory can never hold this need: 9 pages")
+                && refused.contains("past the whole 8-page device pool"),
+            "{refused}"
+        );
+        let planner = crate::planner::planner_of(ctx.id).unwrap();
+        assert!(!planner.demand_waits(), "nothing parked");
+    }
+
+    /// A lane is all it reads beside what it writes: one holding six pages
+    /// that asks three more of an eight-page device could never fire
+    /// alone, though its new rows fit what is free. It is refused at once
+    /// by name, where it parked until the planner failed its process as a
+    /// hog.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_lane_whose_prefix_and_rows_pass_the_device_is_refused_at_once() {
+        let (model, stores, mut ctx) = device(93, 8);
+        let lane = set(model, &stores, 9, 6);
+        let refused = fire(&mut ctx, model, &stores, &[(&lane, 6..9)])
+            .await
+            .err()
+            .expect("six held and three asked of eight");
+        assert!(
+            refused.contains("device memory can never hold this need: 9 pages"),
+            "{refused}"
+        );
+        // Asked alone, two of its pages fit beside what it holds.
+        let fits = fire(&mut ctx, model, &stores, &[(&lane, 6..8)]).await;
+        drop(fits.expect("eight of eight").unfired.submitted());
+    }
+
+    /// Lanes that each fit but pass the device together are no lane past
+    /// it: none is refused as one.
+    #[tokio::test(flavor = "current_thread")]
+    async fn lanes_past_the_device_only_together_are_no_lane_past_it() {
+        let (model, stores, mut ctx) = device(94, 8);
+        let lanes: Vec<KvWorkingSet> = (0..2).map(|_| set(model, &stores, 5, 0)).collect();
+        let sets: Vec<(&KvWorkingSet, Written)> = lanes
+            .iter()
+            .map(|set| (set, Written::Span(0..5)))
+            .collect();
+        let plan = rs::RsPlan::Groups(Vec::new());
+        let alone = alone_demands(&stores, &sets, &[], &[], &plan).unwrap();
+        let planner = crate::planner::planner_of(ctx.id).unwrap();
+        assert_eq!(alone.iter().map(|unit| unit.kv_pages).collect::<Vec<_>>(), [5, 5]);
+        assert!(alone.iter().all(|&unit| planner.past_device(unit).is_none()));
+        let whole = crate::planner::Demand {
+            kv_pages: 10,
+            rs: Default::default(),
+        };
+        assert!(planner.past_device(whole).is_some(), "the whole would be");
+        let _ = &mut ctx;
     }
 }

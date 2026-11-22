@@ -11,7 +11,7 @@ use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpHooks, WasiHttpView};
 
 use super::ProcessId;
-use super::output::LogStream;
+use super::output::{LogStream, StderrTail};
 use super::residency::ProcessResidency;
 use crate::inferlet::program::Script;
 use crate::inferlet::sandbox::InstancePolicy;
@@ -27,6 +27,8 @@ pub struct ProcessCtx {
     id: ProcessId,
 
     wasi_ctx: WasiCtx,
+    /// What the guest last wrote to stderr: said beside a trap.
+    stderr_tail: StderrTail,
     resource_table: ResourceTable,
     #[cfg(not(target_arch = "wasm32"))]
     http_ctx: WasiHttpCtx,
@@ -96,6 +98,9 @@ impl WasiView for ProcessCtx {
 #[cfg(not(target_arch = "wasm32"))]
 pub struct PieHttpHooks {
     network_allowed: bool,
+    /// The process whose guest sends: it waits on the outside until the
+    /// response comes back ([`crate::inferlet::process::away_while`]).
+    pid: ProcessId,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -103,6 +108,40 @@ impl WasiHttpHooks for PieHttpHooks {
     fn is_supported_scheme(&mut self, scheme: &http::uri::Scheme) -> bool {
         self.network_allowed
             && (*scheme == http::uri::Scheme::HTTP || *scheme == http::uri::Scheme::HTTPS)
+    }
+
+    /// The default send, its response awaited as outside input: the
+    /// process's lanes leave the frame while the guest waits on it.
+    fn send_request(
+        &mut self,
+        request: http::Request<wasmtime_wasi_http::WasiBody>,
+        options: Option<wasmtime_wasi_http::RequestOptions>,
+        fut: Box<dyn Future<Output = Result<(), wasmtime_wasi_http::Error>> + Send>,
+    ) -> Box<
+        dyn Future<
+                Output = Result<
+                    (
+                        http::Response<wasmtime_wasi_http::WasiBody>,
+                        Box<dyn Future<Output = Result<(), wasmtime_wasi_http::Error>> + Send>,
+                    ),
+                    wasmtime_wasi_http::Error,
+                >,
+            > + Send,
+    > {
+        _ = fut;
+        let pid = self.pid;
+        Box::new(async move {
+            use http_body_util::BodyExt;
+            let (response, io) = crate::inferlet::process::away_while(
+                pid,
+                wasmtime_wasi_http::default_send_request(request, options),
+            )
+            .await?;
+            Ok((
+                response.map(BodyExt::boxed_unsync),
+                Box::new(io) as Box<dyn Future<Output = _> + Send>,
+            ))
+        })
     }
 }
 
@@ -128,19 +167,18 @@ impl ProcessCtx {
         policy: &InstancePolicy,
         script: Option<Arc<Script>>,
     ) -> anyhow::Result<Self> {
+        let stderr_tail = StderrTail::default();
+        let streamed = matches!(output, OutputMode::Stream);
+        let err = LogStream::new_stderr(id, stderr_tail.clone(), streamed);
+
         #[cfg(target_arch = "wasm32")]
         let wasi_ctx = {
             let mut builder = WasiCtx::builder();
-            match output {
-                OutputMode::Discard => {}
-                OutputMode::Stream => {
-                    let (out, err) = (LogStream::new_stdout(id), LogStream::new_stderr(id));
-                    builder = builder
-                        .stdout(move |bytes| out.write_bytes(bytes))
-                        .stderr(move |bytes| err.write_bytes(bytes));
-                }
+            if streamed {
+                let out = LogStream::new_stdout(id);
+                builder = builder.stdout(move |bytes| out.write_bytes(bytes));
             }
-            builder.build()
+            builder.stderr(move |bytes| err.write_bytes(bytes)).build()
         };
         #[cfg(target_arch = "wasm32")]
         let scratch_dir: Option<PathBuf> = None;
@@ -161,12 +199,11 @@ impl ProcessCtx {
         }
 
         #[cfg(not(target_arch = "wasm32"))]
-        match output {
-            OutputMode::Discard => {}
-            OutputMode::Stream => {
+        {
+            if streamed {
                 builder.stdout(LogStream::new_stdout(id));
-                builder.stderr(LogStream::new_stderr(id));
             }
+            builder.stderr(err);
         }
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -188,12 +225,14 @@ impl ProcessCtx {
         Ok(ProcessCtx {
             id,
             wasi_ctx,
+            stderr_tail,
             resource_table: ResourceTable::new(),
             #[cfg(not(target_arch = "wasm32"))]
             http_ctx: WasiHttpCtx::new(),
             #[cfg(not(target_arch = "wasm32"))]
             http_hooks: PieHttpHooks {
                 network_allowed: policy.network.allow,
+                pid: id,
             },
             scratch_dir,
             script,
@@ -225,6 +264,11 @@ impl ProcessCtx {
 
     pub fn id(&self) -> ProcessId {
         self.id
+    }
+
+    /// What the guest last wrote to stderr; `None` if nothing.
+    pub(crate) fn stderr_said(&self) -> Option<String> {
+        self.stderr_tail.said()
     }
 
     pub(crate) fn tokens_cached(&self) -> u64 {

@@ -16,6 +16,8 @@ pub fn open(config_bytes: &[u8], contract_for: ContractFor) -> Result<Vulkan, St
             chunk_bytes: None,
             #[cfg(feature = "test-limits")]
             max_buffer: None,
+            #[cfg(feature = "test-limits")]
+            submit_bound: None,
         },
         contract_for,
     ))

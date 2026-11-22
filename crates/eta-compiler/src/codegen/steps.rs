@@ -168,6 +168,8 @@ pub enum Call {
     SelTally,
     SelPlace,
     SelWalk,
+    /// A top-k's candidates, sorted, its first `k` written as its results.
+    SelTopK,
 }
 
 /// How a node's steps are laid: none (a sink call, the engine's own), one
@@ -367,6 +369,13 @@ pub fn ladder_of(plan: &LaunchStagePlan, at: usize, tag: u8) -> Ladder {
             rank: pivot == Some(0),
             rounds: sort_rounds(plan, at),
         }
+    } else if tag == tags::TOP_K && one_row(plan, at) {
+        // One row's top `k`: its `k`-th key selected, the keys past it
+        // sorted; the row's sort where the select hands it over.
+        Ladder::Select {
+            rank: false,
+            rounds: sort_rounds(plan, at),
+        }
     } else if is_sort(tag) {
         Ladder::Sort {
             rounds: sort_rounds(plan, at),
@@ -393,6 +402,14 @@ pub fn ladders_of(tag: u8) -> Vec<Ladder> {
                 rank: true,
                 rounds: 1
             },
+            Ladder::Select {
+                rank: false,
+                rounds: 1
+            },
+            Ladder::Sort { rounds: 1 },
+        ]
+    } else if tag == tags::TOP_K {
+        alloc::vec![
             Ladder::Select {
                 rank: false,
                 rounds: 1
@@ -438,7 +455,11 @@ pub fn steps_of(tag: u8, ladder: Ladder) -> Option<Vec<NodeStep>> {
             } else {
                 push(Call::SelTally, "tally".into(), 0, 0);
                 push(Call::SelPlace, "place".into(), 0, 0);
-                push(Call::SelWalk, "walk".into(), 0, 0);
+                if tag == tags::TOP_K {
+                    push(Call::SelTopK, "top".into(), 0, 0);
+                } else {
+                    push(Call::SelWalk, "walk".into(), 0, 0);
+                }
                 sort_steps(&mut push, tag, rounds, true)?;
             }
         }

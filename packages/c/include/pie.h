@@ -52,7 +52,7 @@ const char *pie_version(void);
    `*out`. `config` is JSON or TOML with any of these keys, or NULL for the
    defaults:
 
-     {"budget_device": "2GiB", "max_context": 4096, "yield": 0.0,
+     {"budget_device": "2GiB", "max_context": 4096, "yield": null,
       "sandbox_memory_mb": 512, "max_concurrent_processes": null, "engine": true,
       "frame_size": 4, "frame_dispatch_depth": 2, "verbose": false}
 

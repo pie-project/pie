@@ -36,12 +36,14 @@ impl Serve for Api {
 
     type Shelf = Shelf;
 
-    type Flight = ();
+    type Flight = engine_gpu::submit::DeviceTime;
 
     type Keep = std::convert::Infallible;
 
     /// Eager by design: the probe is encoded at each fire.
-    type Probed = ();
+    type Probed = crate::device::Stamps;
+
+    type Stamps = crate::device::Stamps;
 
     const FUSIONS: &'static [poem_compiler::fuse::Rule] = &crate::FUSIONS;
 
@@ -74,10 +76,11 @@ impl Serve for Api {
             None => Context::bind(boot, allowance)?,
         };
         let measured = device.chip();
-        let (chip, report) = crate::chip::resolve(&measured, boot.profiles.as_deref());
+        let (chip, report) =
+            crate::chip::resolve_stored(&measured, &device.measured_on(), boot.profiles.as_deref());
         crate::chip::SHELF.tell_untuned(&measured.name, &report);
-        let tuning = crate::tuning::Tuning::new(chip, device.cores())
-            .with_workgroup_bytes(device.workgroup_bytes());
+        let tuning =
+            crate::tuning::Tuning::new(chip).with_workgroup_bytes(device.workgroup_bytes());
         // A device whose profile lacks the roofline's constants measures
         // them here, before ready, and keeps them in the user's profile (a
         // browser masks its adapter, so no profile states its rates, and
@@ -87,13 +90,73 @@ impl Serve for Api {
             &device,
             tuning,
             boot.profiles.as_deref(),
-            crate::rates::stated_submit_bound(),
+            <Self as Serve>::submit_bound(boot),
         )?;
         Ok((device, tuning))
     }
 
+    fn rate_shapes(
+        device: &Context,
+        boot: &crate::api::DeviceBoot,
+        tuning: crate::tuning::Tuning,
+        shapes: &[(u32, u32)],
+        model_bytes: u64,
+        top_rows: u32,
+    ) -> Result<crate::tuning::Tuning> {
+        crate::rates::shapes_at_load(
+            device,
+            tuning,
+            boot.profiles.as_deref(),
+            crate::rates::stated_submit_bound(),
+            shapes,
+            model_bytes,
+            top_rows,
+        )
+    }
+
+    fn time_kernels(
+        device: &Context,
+        tuning: &crate::tuning::Tuning,
+        tier: kernels_slang::Tier,
+        max_submit: Option<std::time::Duration>,
+        launch: f64,
+        kernels: &[kernels_slang::linear::gemm::Tactic],
+        pieces: &[u32],
+        plane: (u32, u32),
+        rows: u32,
+    ) -> Result<Vec<Vec<f64>>> {
+        let timer = |frame: crate::device::Frame| {
+            let started = std::time::Instant::now();
+            let span = frame.commit_spanned()?;
+            Ok((
+                span.filter(|&ns| ns > 0),
+                started.elapsed().as_nanos() as u64,
+            ))
+        };
+        engine_gpu::rates::time_kernels::<Api, _>(
+            device, tuning, tier, &timer, max_submit, launch, kernels, pieces, plane, rows,
+        )
+    }
+
+    fn save_rates(
+        device: &Context,
+        boot: &crate::api::DeviceBoot,
+        rates: &profile::fire::Rates,
+    ) -> Result<()> {
+        crate::rates::save_rates(device, boot.profiles.as_deref(), rates)
+    }
+
     fn chunk_bytes(boot: &crate::api::DeviceBoot) -> Option<u64> {
         boot.chunk_bytes
+    }
+
+    fn submit_bound(boot: &crate::api::DeviceBoot) -> Option<std::time::Duration> {
+        #[cfg(feature = "test-limits")]
+        if let Some(bound) = boot.submit_bound {
+            return Some(bound);
+        }
+        let _ = boot;
+        crate::rates::stated_submit_bound()
     }
 
     fn tier(device: &Context) -> kernels_slang::Tier {
@@ -151,20 +214,51 @@ impl Serve for Api {
         crate::encode::Sink::new(device, frame, pipelines, handles)
     }
 
-    fn walk_frame(device: &Context, _keep: bool) -> Result<Frame> {
-        device.frame()
+    fn walk_frame(
+        device: &Context,
+        _keep: bool,
+        timed: Option<&crate::device::Stamps>,
+    ) -> Result<Frame> {
+        // A timed step writes its arm's timestamps; its device time is
+        // filled once its work is done (`Context::timed_frame`) and read at
+        // its landing (`collect`), before the arm's next step goes out.
+        match timed {
+            Some(stamps) => device.timed_frame(stamps),
+            None => device.frame(),
+        }
     }
 
-    fn record_probe(_device: &Context, _record: &dyn Fn(&Frame) -> Result<()>) -> Result<()> {
-        Ok(())
+    /// `pieces` sets an arm: a frame's readback is mapped from its
+    /// work-done callback, which may run after its arm is free again, so
+    /// the arm's next frames take a set not still being read.
+    fn lay_stamps(device: &Context, pieces: u32) -> Result<crate::device::Stamps> {
+        device.stamps(pieces)
+    }
+
+    fn fire_timing(device: &Context) -> Result<engine_gpu::submit::FireTiming> {
+        Ok(if device.enabled().timestamps {
+            engine_gpu::submit::FireTiming::Timestamps
+        } else {
+            engine_gpu::submit::FireTiming::SubmitToDone
+        })
+    }
+
+    /// Eager by design, the probe records nothing: its timestamps alone
+    /// are laid here, at load, and every probe writes them.
+    fn record_probe(
+        device: &Context,
+        _record: &dyn Fn(&Frame) -> Result<()>,
+    ) -> Result<crate::device::Stamps> {
+        device.stamps(1)
     }
 
     fn replay_probe(
         device: &Context,
-        _probed: &(),
+        probed: &crate::device::Stamps,
         record: &dyn Fn(&Frame) -> Result<()>,
     ) -> Result<Option<u64>> {
-        let frame = device.spanned()?;
+        // Into the timestamps laid at load: a probe lays nothing.
+        let frame = device.spanned_into(probed)?;
         record(&frame)?;
         frame.commit_spanned()
     }
@@ -314,9 +408,10 @@ impl Serve for Api {
         Ok(pending)
     }
 
-    fn fly(pending: Pending, _fed: Option<Pending>) {
-        #[cfg_attr(not(feature = "wgpu"), allow(clippy::drop_non_drop))]
-        drop(pending);
+    /// What a step in flight keeps: its device time, filled once its work
+    /// is done where it was walked timed.
+    fn fly(pending: Pending, _fed: Option<Pending>) -> engine_gpu::submit::DeviceTime {
+        pending.device_time()
     }
 
     fn reap(shell: &mut Shell<Api>) -> Result<()> {
@@ -360,8 +455,11 @@ fn collect(shell: &mut Shell<Api>) {
             .inflight
             .front()
             .is_some_and(|flight| flight.seq == step.seq)
+            && let Some(flight) = shell.inflight.pop_front()
         {
-            shell.inflight.pop_front();
+            // Under a stated submit bound, the step's device time, read
+            // without waiting once its backend filled it (`Shell::track`).
+            shell.timed(flight.estimate, flight.api);
         }
         if step.failed {
             shell.arms.give(step.arm);

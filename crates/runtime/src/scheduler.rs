@@ -10,8 +10,7 @@ pub mod worker;
 pub use frame::FrameStamp;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::{Result, anyhow};
 
@@ -32,8 +31,43 @@ pub(crate) struct ControlCompletion {
 }
 
 struct ControlCompletionState {
-    result: Mutex<Option<std::result::Result<(), String>>>,
+    result: Mutex<Option<std::result::Result<(), (String, Refused)>>>,
     notify: tokio::sync::Notify,
+}
+
+/// An engine refused a control (a copy) before reading or writing any of
+/// it: its submission was impossible as stated (`engine::Error::Impossible`).
+/// What it would have moved lies where it lay.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct RefusedUntouched(pub String);
+
+/// A copy down a tier failed writing to that tier because it is full
+/// (`engine::Error::TierFull`): nothing on the device changed, so it is
+/// refused untouched too, and the waiter takes the move back by name.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct TierBelowFull(pub String);
+
+/// A copy the engine answered as still landing did not land
+/// ([`::engine::Landing::Failed`]): its destination is not to be trusted
+/// and its sources hold what they held, so the move is taken back from
+/// them, never committed.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct LandingFailed(pub String);
+
+/// How an engine refused a control, read from its error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Refused {
+    /// It failed: what it moved may be partly written.
+    Failed,
+    /// Refused before reading or writing any of it.
+    Untouched,
+    /// The tier it copied down to is full; nothing on the device changed.
+    TierFull,
+    /// It did not land: its sources hold what they held.
+    LandingFailed,
 }
 
 impl ControlCompletion {
@@ -49,23 +83,49 @@ impl ControlCompletion {
     pub(crate) async fn wait(&self) -> Result<()> {
         loop {
             if let Some(result) = self.inner.result.lock().unwrap().clone() {
-                return result.map_err(anyhow::Error::msg);
+                return result.map_err(Self::error);
             }
             let notified = self.inner.notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             if let Some(result) = self.inner.result.lock().unwrap().clone() {
-                return result.map_err(anyhow::Error::msg);
+                return result.map_err(Self::error);
             }
             notified.await;
         }
     }
 
+    fn error((message, refused): (String, Refused)) -> anyhow::Error {
+        match refused {
+            Refused::Untouched => anyhow::Error::new(RefusedUntouched(message)),
+            Refused::TierFull => anyhow::Error::new(TierBelowFull(message)),
+            Refused::LandingFailed => anyhow::Error::new(LandingFailed(message)),
+            Refused::Failed => anyhow::Error::msg(message),
+        }
+    }
+
     fn resolve(&self, result: &Result<()>) {
-        let result = result
-            .as_ref()
-            .map(|_| ())
-            .map_err(|error| format!("{error:#}"));
+        let result = result.as_ref().map(|_| ()).map_err(|error| {
+            let refused = error
+                .chain()
+                .find_map(|cause| {
+                    if cause
+                        .downcast_ref::<crate::engine::completion::CopyLandingFailed>()
+                        .is_some()
+                    {
+                        return Some(Refused::LandingFailed);
+                    }
+                    match cause.downcast_ref::<::engine::Error>() {
+                        Some(::engine::Error::TierFull(_)) => Some(Refused::TierFull),
+                        Some(
+                            ::engine::Error::Impossible(_) | ::engine::Error::Placement { .. },
+                        ) => Some(Refused::Untouched),
+                        _ => None,
+                    }
+                })
+                .unwrap_or(Refused::Failed);
+            (format!("{error:#}"), refused)
+        });
         *self.inner.result.lock().unwrap() = Some(result);
         self.inner.notify.notify_waiters();
     }
@@ -106,7 +166,39 @@ pub(crate) fn clear_scheduler_handle(engine_id: usize) {
     }
 }
 
+// A test's own scheduler for an engine, on its thread alone
+// ([`worker::test_lane::TestLane`]): the copies and pool requests its
+// planner and stores submit reach the test, never a lane of another test.
+#[cfg(test)]
+thread_local! {
+    static TEST_HANDLES: std::cell::RefCell<Vec<(usize, SchedulerHandle)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Puts `handle` (or, `None`, takes it off) as `engine_id`'s scheduler on
+/// this thread only.
+#[cfg(test)]
+pub(crate) fn set_test_handle(engine_id: usize, handle: Option<SchedulerHandle>) {
+    TEST_HANDLES.with(|handles| {
+        let mut handles = handles.borrow_mut();
+        handles.retain(|(engine, _)| *engine != engine_id);
+        if let Some(handle) = handle {
+            handles.push((engine_id, handle));
+        }
+    });
+}
+
 pub(crate) fn scheduler_handle(engine_id: usize) -> Result<SchedulerHandle> {
+    #[cfg(test)]
+    if let Some(handle) = TEST_HANDLES.with(|handles| {
+        handles
+            .borrow()
+            .iter()
+            .find(|(engine, _)| *engine == engine_id)
+            .map(|(_, handle)| handle.clone())
+    }) {
+        return Ok(handle);
+    }
     handle_registry()
         .read()
         .unwrap()
@@ -294,26 +386,6 @@ pub(crate) async fn tap_groups(engine_id: usize) -> Result<Option<::engine::TapG
     Ok(groups)
 }
 
-pub fn configured_submit_deadline() -> Duration {
-    *SUBMIT_DEADLINE.get_or_init(|| Duration::from_micros(100_000))
-}
-
-pub fn set_submit_deadline(deadline: Duration) {
-    let _ = SUBMIT_DEADLINE.set(deadline);
-}
-
-static SUBMIT_DEADLINE: OnceLock<Duration> = OnceLock::new();
-
-pub fn configured_silence_timeout() -> Duration {
-    *SILENCE_TIMEOUT.get_or_init(|| Duration::from_secs(600))
-}
-
-pub fn set_silence_timeout(timeout: Duration) {
-    let _ = SILENCE_TIMEOUT.set(timeout);
-}
-
-static SILENCE_TIMEOUT: OnceLock<Duration> = OnceLock::new();
-
 pub fn configured_frame_size() -> usize {
     match FRAME_SIZE.load(Ordering::Relaxed) {
         0 => DEFAULT_FRAME_SIZE,
@@ -475,6 +547,17 @@ pub async fn spawn(engine_indices: &[usize], page_size: u32) -> Result<Scheduler
 }
 
 pub(crate) fn device_domain(engine_idx: usize) -> ::engine::MemoryDomain {
+    // A test's own lane names its device ([`worker::test_lane::TestLane`]).
+    #[cfg(test)]
+    if let Some(domain) = TEST_HANDLES.with(|handles| {
+        handles
+            .borrow()
+            .iter()
+            .find(|(engine, _)| *engine == engine_idx)
+            .map(|(_, handle)| handle.device_domain())
+    }) {
+        return domain;
+    }
     crate::engine::get_spec(engine_idx)
         .map_or(::engine::MemoryDomain::HostPinned, |s| s.device_domain)
 }
@@ -634,5 +717,43 @@ mod abort_tests {
             !freed.load(Ordering::SeqCst),
             "copies that did not settle keep their slots out"
         );
+    }
+}
+
+#[cfg(test)]
+mod refused_untouched_tests {
+    use super::*;
+
+    /// An engine refusing a copy as impossible (before reading or writing
+    /// any of it) is told apart from a copy that failed: the waiter can
+    /// take the move back rather than fail the process.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_copy_refused_as_impossible_is_told_untouched() {
+        let refused = ControlCompletion::new();
+        refused.resolve(&Err(anyhow::Error::new(::engine::Error::Impossible(
+            "state chunk 1936 lies inside the carve".into(),
+        ))
+        .context("kv to LocalDisk copy")));
+        let error = refused.wait().await.expect_err("refused");
+        assert!(error.downcast_ref::<RefusedUntouched>().is_some(), "{error:#}");
+        let failed = ControlCompletion::new();
+        failed.resolve(&Err(anyhow::anyhow!("device lost")));
+        let error = failed.wait().await.expect_err("failed");
+        assert!(error.downcast_ref::<RefusedUntouched>().is_none(), "{error:#}");
+    }
+
+    /// A copy down to a full disk tier (the slot file's write failing
+    /// with `StorageFull`) is told as the tier below full, nothing on the
+    /// device changed: never a failed copy, never a string.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_copy_to_a_full_tier_is_told_as_the_tier_below_full() {
+        let full = ControlCompletion::new();
+        full.resolve(&Err(anyhow::Error::new(::engine::Error::TierFull(
+            "the disk tier's slot file is full: No space left on device".into(),
+        ))
+        .context("kv to LocalDisk copy")));
+        let error = full.wait().await.expect_err("refused");
+        assert!(error.downcast_ref::<TierBelowFull>().is_some(), "{error:#}");
+        assert!(error.downcast_ref::<RefusedUntouched>().is_none(), "{error:#}");
     }
 }

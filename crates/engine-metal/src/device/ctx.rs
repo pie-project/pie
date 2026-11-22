@@ -205,8 +205,24 @@ impl Context {
         &self.name
     }
 
+    /// What this process may place on the GPU now: the GPU's wired-memory
+    /// limit where the operator set one (`iogpu.wired_limit_mb`), else the
+    /// working set Metal recommends less what the process holds on the host
+    /// beside its GPU memory ([`host_resident`]: its guests, staging, the
+    /// weights' host side). On unified memory the device and the host are
+    /// one pool, so a load sized to the recommended working set alone,
+    /// beside a large host side, outgrows what the GPU can wire (the M1's
+    /// "Insufficient Memory" command buffers under gemma-4-E4B at c256).
+    /// Read now, not at bind: the host side grows as guests bind.
     #[must_use]
     pub fn working_set(&self) -> u64 {
+        derived_working_set(self.working_set, self.allocated())
+    }
+
+    /// The working set Metal recommends for this process, as the device
+    /// states it.
+    #[must_use]
+    pub fn recommended_working_set(&self) -> u64 {
         self.working_set
     }
 
@@ -242,6 +258,28 @@ impl Context {
         #[cfg(not(target_vendor = "apple"))]
         {
             0
+        }
+    }
+
+    /// What the host can still give this process's GPU memory now (the
+    /// governor's `host_room`, read on its tick): [`Context::working_set`]'s
+    /// rule over a fresh read of the device, less what every process's GPU
+    /// memory holds of it and the driver's floor. Negative where they
+    /// already hold more: the pool gives the difference back.
+    pub fn host_room() -> std::result::Result<i64, String> {
+        #[cfg(target_vendor = "apple")]
+        {
+            let device = MTLCreateSystemDefaultDevice()
+                .ok_or_else(|| "no Metal device to read the room of".to_string())?;
+            let mine = device.currentAllocatedSize() as u64;
+            let all = super::iokit::gpu_system_allocated().unwrap_or(mine).max(mine);
+            let usable = derived_working_set(device.recommendedMaxWorkingSetSize(), mine);
+            let held = all.saturating_add(crate::store::accounting::DRIVER_FLOOR);
+            Ok(i64::try_from(usable).unwrap_or(i64::MAX) - i64::try_from(held).unwrap_or(i64::MAX))
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            Err("no Metal device off Apple platforms".to_string())
         }
     }
 
@@ -1175,5 +1213,73 @@ fn declare(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, slabs: &[supe
             ProtocolObject::from_ref(&**slab),
             objc2_metal::MTLResourceUsage::Read | objc2_metal::MTLResourceUsage::Write,
         );
+    }
+}
+
+/// [`Context::working_set`]'s rule: the operator's GPU wired limit where
+/// set, else `recommended` less this process's host-resident memory beside
+/// the `gpu` bytes Metal holds for it.
+#[must_use]
+pub fn derived_working_set(recommended: u64, gpu: u64) -> u64 {
+    match wired_limit() {
+        Some(limit) => limit,
+        None => recommended.saturating_sub(host_resident(gpu)),
+    }
+}
+
+/// The GPU's wired-memory limit the operator set (`sysctl
+/// iogpu.wired_limit_mb`), in bytes; `None` at the system's default (0).
+#[must_use]
+pub fn wired_limit() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut mb: i32 = 0;
+        let mut len = std::mem::size_of::<i32>();
+        // SAFETY: `iogpu.wired_limit_mb` is an int sysctl; `len` states the
+        // out buffer's size and the call writes at most that many bytes.
+        let rc = unsafe {
+            libc::sysctlbyname(
+                c"iogpu.wired_limit_mb".as_ptr(),
+                (&raw mut mb).cast(),
+                &raw mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (rc == 0 && mb > 0).then(|| u64::try_from(mb).unwrap_or(0) << 20)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// What this process holds on the host beside the `gpu` bytes Metal holds
+/// for it: its physical footprint (which counts its GPU memory on unified
+/// memory) less those. 0 where the footprint cannot be read.
+#[must_use]
+pub fn host_resident(gpu: u64) -> u64 {
+    #[cfg(target_vendor = "apple")]
+    {
+        let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is a `rusage_info_v2`, the struct the
+        // RUSAGE_INFO_V2 flavor writes, owned here for the call.
+        let rc = unsafe {
+            libc::proc_pid_rusage(
+                libc::getpid(),
+                libc::RUSAGE_INFO_V2,
+                (&raw mut info).cast(),
+            )
+        };
+        if rc == 0 {
+            info.ri_phys_footprint.saturating_sub(gpu)
+        } else {
+            0
+        }
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let _ = gpu;
+        0
     }
 }

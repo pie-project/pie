@@ -14,12 +14,12 @@ use engine_gpu::store::layout::{CHANNEL, INSTANCE};
 
 use crate::serve::GuestRing;
 use engine_gpu::backend::Buffer as _;
-use engine_gpu::guest::claims::{Claims, Run};
+use engine::guest_claims::{Claims, Holder, PairClaim, Run};
 use engine_gpu::guest::held::{self, TableLayout, consecutive};
-use engine_gpu::guest::ring::{Berth, PassLayout, pass_bytes};
+use engine_gpu::guest::ring::{Berth, PassLayout};
 use engine_gpu::guest::session::{
     Bases, HEAP_BINDING, STATUS_BINDING, STATUS_SPAN, STEP_BINDING, StageTables, TABLES_BINDING,
-    groups_for, run_bases, stage_tables, step_records, step_stride,
+    run_bases, stage_tables, step_groups, step_records, step_stride,
 };
 use engine_gpu::guest::state::{GuestLayout, Side};
 
@@ -325,7 +325,8 @@ struct Stage {
     args: Held,
     stride: u64,
 
-    groups: u32,
+    /// Each step's workgroups ([`engine_gpu::guest::session::step_groups`]).
+    groups: Vec<u32>,
     set: vk::DescriptorSet,
 
     offsets: Vec<u64>,
@@ -360,7 +361,7 @@ impl std::fmt::Debug for Pass {
 impl Pass {
     /// The fault code the landed pass's status holds, if it faulted.
     pub fn status(&self) -> Result<Option<u32>> {
-        let at = self.layout.status.ok_or_else(|| Fault::Program {
+        let at = self.layout.status_at().ok_or_else(|| Fault::Program {
             at: "guest::session",
             why: "a pass's status was read before it was copied back".into(),
         })?;
@@ -535,6 +536,9 @@ pub struct Session {
     slot_bytes: u64,
     /// The name its slots and heap are claimed by ([`Claims`]).
     claim: u64,
+    /// The group bound on its pair's taking that it is a member of: the
+    /// group's name and the taking ([`Session::join_pair`]).
+    pair_group: Option<(u64, u64)>,
 
     kept: Kept,
     /// The engine's channel behind each of the program's.
@@ -680,8 +684,12 @@ impl Session {
             .next_back()
             .expect("the status word is the last table placed");
         let mut stages = Vec::with_capacity(plans.len());
-        for (((lowered, resolved), &heap), stated) in
-            code.iter().zip(resolved).zip(&layout.stages).zip(bases)
+        for ((((lowered, resolved), &heap), stated), plan) in code
+            .iter()
+            .zip(resolved)
+            .zip(&layout.stages)
+            .zip(bases)
+            .zip(plans.iter())
         {
             let tables = [(); 4].map(|()| placed.next().expect("four tables a stage"));
             let args = placed.next().expect("a stage's step records");
@@ -698,7 +706,7 @@ impl Session {
                 });
             }
             stages.push(build_stage(
-                device, lowered, resolved, tables, library, args, stride, heap,
+                device, plan, lowered, resolved, tables, library, args, stride, heap,
             )?);
         }
 
@@ -739,6 +747,7 @@ impl Session {
             slots: tables.slots.to_vec(),
             slot_bytes,
             claim: library.claims.instance(),
+            pair_group: None,
             instance,
             pair,
             scores: layout.scores,
@@ -777,20 +786,13 @@ impl Session {
     /// ([`Claims`]). Nothing on the queue uses the sets: at construction
     /// none has run, and a rebind settles first.
     fn write_sets(&self) -> Result<()> {
+        // Claimed before a set is pointed there.
+        self.claim_runs()?;
         let d = &self.core.device;
-        let mut runs = Vec::new();
         for (at, stage) in self.stages.iter().enumerate() {
             let (heap, base) = self.heap_at(at)?;
             // The run moved with the tables, and their bases in it did not.
-            let (_, (segment, start, end)) = run_bases(&stage.tables, self.slot_bytes)?;
-            let run = Run {
-                segment,
-                start,
-                end,
-            };
-            if !runs.contains(&run) {
-                runs.push(run);
-            }
+            let (_, (_, start, end)) = run_bases(&stage.tables, self.slot_bytes)?;
             let buffers = [
                 (
                     STATUS_BINDING,
@@ -850,8 +852,27 @@ impl Session {
             // call.
             unsafe { d.update_descriptor_sets(&writes, &[]) };
         }
-        // The instance's own state, its heaps' place; the pair's is every
-        // instance of the pair's, shared by design.
+        Ok(())
+    }
+
+    /// Each stage's run of table slots.
+    fn table_runs(&self) -> Result<Vec<Run>> {
+        let mut runs = Vec::new();
+        for stage in &self.stages {
+            let (_, (segment, start, end)) = run_bases(&stage.tables, self.slot_bytes)?;
+            runs.push(Run {
+                segment,
+                start,
+                end,
+            });
+        }
+        Ok(runs)
+    }
+
+    /// The runs the instance's own state takes: each stage's run of table
+    /// slots, and its state, its heaps' place.
+    fn own_runs(&self) -> Result<Vec<Run>> {
+        let mut runs = self.table_runs()?;
         if let Some((buffer, at)) = self.instance.span() {
             runs.push(Run {
                 segment: buffer.slab_id(),
@@ -859,7 +880,56 @@ impl Session {
                 end: at + self.instance.bytes(),
             });
         }
-        self.library.claims.claim(self.claim, &runs)
+        Ok(runs)
+    }
+
+    /// The runs its pair's state takes, which the group of instances bound
+    /// on its taking claims ([`Claims::claim_with_pair`]).
+    fn pair_runs(&self) -> Vec<Run> {
+        self.pair
+            .span()
+            .map(|(buffer, at)| Run {
+                segment: buffer.slab_id(),
+                start: at,
+                end: at + self.pair.bytes(),
+            })
+            .into_iter()
+            .collect()
+    }
+
+    /// Claims its own state's runs, and joins its pair's group where it is
+    /// bound on one.
+    fn claim_runs(&self) -> Result<()> {
+        let runs = self.own_runs()?;
+        match self.pair_group {
+            Some((pair, taking)) => {
+                self.library.claims.claim_with_pair(
+                    self.claim,
+                    &runs,
+                    &PairClaim {
+                        pair,
+                        taking,
+                        runs: self.pair_runs(),
+                    },
+                )?;
+            }
+            None => self.library.claims.claim(self.claim, &runs)?,
+        }
+        Ok(())
+    }
+
+    /// Joins the group bound on its pair's taking `group` (its name and the
+    /// taking, [`engine_gpu::guest::state::Takings::group`]), claiming its
+    /// own runs with it: refused by name, and its claims as they stood,
+    /// where either overlaps another holder's.
+    pub fn join_pair(&mut self, group: Option<(u64, u64)>) -> Result<()> {
+        let was = self.pair_group;
+        self.pair_group = group;
+        if let Err(why) = self.claim_runs() {
+            self.pair_group = was;
+            return Err(why);
+        }
+        Ok(())
     }
 
     /// Points the stages' sets at the chunks their tables' slots and the
@@ -879,6 +949,13 @@ impl Session {
         self.status.rebind(pools)?;
         self.instance.rebind(pools)?;
         self.pair.rebind(pools)?;
+        // The evacuation moved the pair's state for every instance on it:
+        // the group's move, claimed as one before this member's own.
+        if let Some((pair, _)) = self.pair_group {
+            self.library
+                .claims
+                .claim_all(&[(Holder::Pair(pair), self.pair_runs())])?;
+        }
         self.write_sets()
     }
 
@@ -939,6 +1016,7 @@ impl Session {
         slots: &[u32],
         scratch: &engine::program::ScratchPlace,
         pair: &engine::program::ScratchPlace,
+        pair_group: Option<(u64, u64)>,
     ) -> Result<()> {
         if slots.len() != self.slots.len() || !consecutive(slots) {
             return Err(Fault::Program {
@@ -971,6 +1049,7 @@ impl Session {
         self.slots = slots.to_vec();
         self.instance.retarget(pools, scratch)?;
         self.pair.retarget(pools, pair)?;
+        self.pair_group = pair_group;
         self.write_sets()
     }
 
@@ -996,23 +1075,29 @@ impl Session {
         self.heap_at(stage).ok()
     }
 
-    /// A pass of stage `stage` that stages the host-held roots `staged` and
-    /// reads back `read` (values of the stage): a berth of the guest ring
-    /// for them and its status, taken now and given back as the pass drops.
-    pub fn pass(&self, stage: usize, staged: &[u32], read: &[u32]) -> Result<Pass> {
-        let bytes = |value: &u32| {
-            self.span(stage, *value)
-                .map(|(_, bytes)| bytes)
-                .ok_or_else(|| Fault::Program {
-                    at: "guest::session",
-                    why: format!("value {value} is not stage {stage}'s"),
-                })
-        };
-        let staged = staged.iter().map(bytes).collect::<Result<Vec<u64>>>()?;
-        let read = read.iter().map(bytes).collect::<Result<Vec<u64>>>()?;
+    /// A pass of stage `stage` over its roots `roots` and the values
+    /// `wanted` the host may read back (global ids of `package`): a berth of
+    /// the guest ring of what its layout ([`engine_gpu::guest::ring::pass_layout`],
+    /// the computation the bind sized the stage's most by) lays, taken now
+    /// and given back as the pass drops.
+    pub fn pass(
+        &self,
+        package: &LaunchPackage,
+        stage: usize,
+        roots: &[u32],
+        wanted: &[u32],
+    ) -> Result<Pass> {
+        let layout = engine_gpu::guest::ring::pass_layout(
+            package,
+            stage,
+            roots,
+            wanted,
+            STATUS_SPAN,
+            |value| self.span(stage, value).map(|(_, bytes)| bytes),
+        )?;
         Ok(Pass {
-            berth: self.ring.take(pass_bytes(staged, STATUS_SPAN, read))?,
-            layout: PassLayout::default(),
+            berth: self.ring.take(layout.bytes())?,
+            layout,
         })
     }
 
@@ -1039,18 +1124,17 @@ impl Session {
         }
         // A pass still on the queue may read the heap the copy writes.
         self.settle()?;
-        let at = pass.layout.next(len, pass.berth.bytes())?;
+        let (at, _) = pass.layout.stage(value)?;
         pass.berth
             .buffer()
             .write_shared(pass.berth.at() + at, bytes)?;
-        pass.layout.staged.push((value, at, len));
         Ok(())
     }
 
     /// Copies what `pass` staged into stage `at_stage`'s heap.
     pub fn flush(&mut self, frame: &mut Frame, pass: &Pass, at_stage: usize) -> Result<()> {
         let (heap, base) = self.heap_at(at_stage)?;
-        for &(value, at, len) in &pass.layout.staged {
+        for (value, at, len) in pass.layout.staged() {
             let (into, _) = self.span(at_stage, value).ok_or_else(|| Fault::Program {
                 at: "guest::session",
                 why: format!("value {value} is not stage {at_stage}'s"),
@@ -1069,7 +1153,7 @@ impl Session {
     /// Copies the status word into `pass`'s berth, behind the stage's
     /// dispatch.
     pub fn read_status(&self, frame: &mut Frame, pass: &mut Pass) -> Result<()> {
-        let at = pass.layout.next(STATUS_SPAN, pass.berth.bytes())?;
+        let at = pass.layout.status();
         frame.copy(
             self.status.buffer(),
             self.status.offset(),
@@ -1077,7 +1161,6 @@ impl Session {
             pass.berth.at() + at,
             STATUS_SPAN,
         )?;
-        pass.layout.status = Some(at);
         Ok(())
     }
 
@@ -1095,7 +1178,7 @@ impl Session {
             why: format!("value {value} is not stage {stage}'s"),
         })?;
         let (heap, base) = self.heap_at(stage)?;
-        let at = pass.layout.next(len, pass.berth.bytes())?;
+        let (at, _) = pass.layout.read_back(value)?;
         frame.copy(
             heap,
             base + from,
@@ -1103,7 +1186,6 @@ impl Session {
             pass.berth.at() + at,
             len,
         )?;
-        pass.layout.read.push((value, at, len));
         Ok(())
     }
 
@@ -1236,11 +1318,18 @@ impl Session {
             at: "guest::session",
             why: format!("stage {at} is past this package's {}", self.stages.len()),
         })?;
-        let [groups, ..] = engine_gpu::workgroups(
-            "guest",
-            [stage.groups, 1, 1],
-            self.core.limits.max_compute_work_group_count,
-        )?;
+        let groups = stage
+            .groups
+            .iter()
+            .map(|&wanted| {
+                engine_gpu::workgroups(
+                    "guest",
+                    [wanted, 1, 1],
+                    self.core.limits.max_compute_work_group_count,
+                )
+                .map(|[groups, ..]| groups)
+            })
+            .collect::<Result<Vec<u32>>>()?;
         let d = &self.core.device;
         // SAFETY: `cmd` is the open frame's buffer, recorded only on this
         // thread (`Frame` is not `Sync`). The set, layout and pipelines are
@@ -1289,7 +1378,7 @@ impl Session {
                     &[offset],
                 );
                 d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
-                d.cmd_dispatch(cmd, groups, 1, 1);
+                d.cmd_dispatch(cmd, groups[step], 1, 1);
             }
 
             let after = vk::MemoryBarrier::default()
@@ -1311,6 +1400,18 @@ impl Session {
                 &[],
             );
         }
+        Ok(())
+    }
+
+    /// Its process parked (`engine::Rebind::Parked`): the passes on the
+    /// queue land, and it claims only its tables, where they stayed in
+    /// place (`kept`); its state and its share of its pair are another
+    /// owner's to take until [`Self::retarget`] claims where it lies again.
+    pub fn park(&mut self, kept: bool) -> Result<()> {
+        self.settle()?;
+        let runs = if kept { self.table_runs()? } else { Vec::new() };
+        self.library.claims.park(self.claim, &runs);
+        self.pair_group = None;
         Ok(())
     }
 
@@ -1337,6 +1438,7 @@ impl Drop for Session {
 #[allow(clippy::too_many_arguments)]
 fn build_stage(
     device: &Context,
+    plan: &eta_compiler::codegen::launch::LaunchStagePlan,
     lowered: &engine_gpu::guest::Lowered,
     resolved: StageTables,
     tables: [Held; 4],
@@ -1360,9 +1462,18 @@ fn build_stage(
         args,
         stride,
         groups: if lowered.strides_the_grid {
-            groups_for(&descriptors, device.cores())
+            step_groups(
+                plan,
+                &descriptors,
+                &lowered.steps,
+                device.resident().ok_or_else(|| Fault::Device {
+                    call: "guest stage",
+                    why: "a guest step strides the grid by the workgroups the device holds, which the load measures before it binds a guest"
+                        .into(),
+                })?,
+            )
         } else {
-            1
+            vec![1; lowered.steps.len()]
         },
         set: vk::DescriptorSet::null(),
         offsets,

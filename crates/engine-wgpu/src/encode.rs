@@ -105,6 +105,12 @@ pub fn profile_timing(on: bool) {
     TIMING.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether frames are timed on the device ([`profile_timing`]).
+#[must_use]
+pub fn timing_on() -> bool {
+    TIMING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn profile_shapes(on: bool) {
     SHAPES.store(on, std::sync::atomic::Ordering::Relaxed);
 }

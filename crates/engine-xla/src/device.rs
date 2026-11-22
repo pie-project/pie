@@ -568,6 +568,51 @@ impl Device {
 
     /// Whether the disk cache holds the program compiled from `text`.
     #[must_use]
+    /// The program the load compiled from `text` and parked in the disk
+    /// cache (`serve::warm`), loaded for the first fire of its shape: from
+    /// memory where it is held, else from the disk, never built. `None`:
+    /// the disk holds it no more (the cache was cleared under the load).
+    pub fn load_parked(&self, text: &str, sig: Signature) -> Result<Option<Arc<Program>>> {
+        let key = *blake3::hash(text.as_bytes()).as_bytes();
+        if let Some(hit) = self.cache.lock().expect("cache lock poisoned").get(&key) {
+            return Ok(Some(Arc::clone(hit)));
+        }
+        let client = self.client()?;
+        let started = std::time::Instant::now();
+        let Some(file) = self.cache_file(client, text) else {
+            return Ok(None);
+        };
+        let Some(exe) = std::fs::read(&file)
+            .ok()
+            .and_then(unpacked)
+            .and_then(|bytes| client.deserialize(&bytes).ok())
+        else {
+            return Ok(None);
+        };
+        touch(&file);
+        self.keep(&file);
+        if let Some(live) = self.live.get() {
+            live.tally(engine::live::Tally::LoadedInFire, 1);
+        }
+        tracing::info!(
+            bytes = text.len(),
+            ms = started.elapsed().as_millis() as u64,
+            "xla loaded a parked program for the first fire of its shape"
+        );
+        let memory = exe.compiled_memory().unwrap_or_default();
+        let program = Arc::new(Program {
+            exe: Some(exe),
+            sig,
+            text_bytes: text.len(),
+            memory,
+        });
+        self.cache
+            .lock()
+            .expect("cache lock poisoned")
+            .insert(key, Arc::clone(&program));
+        Ok(Some(program))
+    }
+
     pub fn on_disk(&self, text: &str) -> bool {
         self.client()
             .ok()
@@ -910,6 +955,132 @@ fn free_bytes(dir: &std::path::Path) -> Option<u64> {
 /// leaves ([`engine::host_memory`]). A cap the host's `MemAvailable` does
 /// not see OOM-kills a load or a registration whose compiles fit the host
 /// but not the cap.
+/// The process's resident bytes (`/proc/self/statm`), where the host
+/// states them.
+pub(crate) fn resident_bytes() -> Option<u64> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    // SAFETY: `sysconf` reads a constant of the running system.
+    #[allow(unsafe_code)]
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    u64::try_from(page).ok().map(|page| pages * page)
+}
+
+/// The host memory programs loaded and held take, measured, and the room
+/// they are loaded into. A program's hold is the resident growth of a load
+/// that ran alone, per byte of its text, the most any such load showed
+/// (a per-text-byte guess undercounted a v6e Qwen3.5-0.8B fire of 64
+/// lanes and 1024 rows sixfold: 0.5 GiB guessed, 3.0 GiB held). Until a
+/// load has been measured, loads run one at a time. A load goes ahead
+/// while the host's free memory now, less what every load still under way
+/// was reserved, holds its own hold and `floor`; else it waits for one
+/// under way to end, and is turned away only when none is and it still
+/// does not fit. With a `stated` room, what the measured holds and those
+/// under way take stays within it.
+pub(crate) struct HostRoom {
+    stated: Option<u64>,
+    floor: u64,
+    base: u64,
+    state: std::sync::Mutex<RoomState>,
+    ended: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct RoomState {
+    /// The bytes reserved for the loads under way, and how many there are.
+    reserved: u64,
+    loads: usize,
+    /// The most resident bytes a load alone grew by, per KiB of its text.
+    per_kib: u64,
+    /// Whether the load under way, if one alone, has stayed alone.
+    alone: bool,
+}
+
+/// A load admitted by [`HostRoom::take`]: what it reserved, where the
+/// process's resident bytes stood, and its text's length.
+pub(crate) struct Reserved {
+    bytes: u64,
+    resident: Option<u64>,
+    text: u64,
+}
+
+impl HostRoom {
+    pub(crate) fn new(stated: Option<u64>, floor: u64) -> Self {
+        Self {
+            stated,
+            floor,
+            base: resident_bytes().unwrap_or(0),
+            state: std::sync::Mutex::new(RoomState::default()),
+            ended: std::sync::Condvar::new(),
+        }
+    }
+
+    /// What the programs loaded since the room was made hold: the
+    /// process's resident growth.
+    pub(crate) fn held(&self) -> u64 {
+        resident_bytes().map_or(0, |r| r.saturating_sub(self.base))
+    }
+
+    /// Admits a load of `text`, waiting while those under way leave it no
+    /// room; `None` when it does not fit with none under way.
+    pub(crate) fn take(&self, text: &str) -> Option<Reserved> {
+        let len = text.len() as u64;
+        let mut st = self.state.lock().expect("the host room's lock poisoned");
+        loop {
+            let hold = (st.per_kib > 0).then(|| st.per_kib.saturating_mul(len) / 1024);
+            let fits = match hold {
+                // unmeasured: alone, where there is room at all
+                None => st.loads == 0 && self.room(0, 0),
+                Some(hold) => self.room(st.reserved, hold),
+            };
+            if fits {
+                st.alone = st.loads == 0;
+                st.loads += 1;
+                let bytes = hold.unwrap_or(0);
+                st.reserved += bytes;
+                return Some(Reserved {
+                    bytes,
+                    resident: resident_bytes(),
+                    text: len,
+                });
+            }
+            if st.loads == 0 {
+                return None;
+            }
+            st = self.ended.wait(st).expect("the host room's lock poisoned");
+        }
+    }
+
+    /// Whether a hold of `hold` fits beside `reserved` under way.
+    fn room(&self, reserved: u64, hold: u64) -> bool {
+        match self.stated {
+            Some(stated) => self.held().saturating_add(reserved).saturating_add(hold) <= stated,
+            None => available_memory().is_none_or(|free| {
+                free.saturating_sub(reserved).saturating_sub(hold) >= self.floor
+            }),
+        }
+    }
+
+    /// A load admitted ends; `held`: its program stays in memory. A load
+    /// that ran alone and stays is measured.
+    pub(crate) fn done(&self, r: Reserved, held: bool) {
+        let mut st = self.state.lock().expect("the host room's lock poisoned");
+        let alone = st.loads == 1 && st.alone;
+        if held
+            && alone
+            && let (Some(before), Some(after)) = (r.resident, resident_bytes())
+            && r.text > 0
+        {
+            let per_kib = after.saturating_sub(before).saturating_mul(1024) / r.text;
+            st.per_kib = st.per_kib.max(per_kib);
+        }
+        st.loads -= 1;
+        st.reserved -= r.bytes;
+        drop(st);
+        self.ended.notify_all();
+    }
+}
+
 pub(crate) fn available_memory() -> Option<u64> {
     engine::host_memory::available()
         .ok()

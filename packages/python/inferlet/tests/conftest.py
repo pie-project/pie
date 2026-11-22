@@ -62,7 +62,6 @@ def _make_model() -> types.ModuleType:
     m.SwitchDecl = SwitchDeclStub
     m.name = lambda: "mock-model"
     m.architecture = lambda: "qwen3_5"
-    m.submit_deadline_us = lambda: 50_000
     m.output_vocab_size = lambda: 151936
     m.kv_page_size = lambda: 16
     m.frame_size = lambda: 1

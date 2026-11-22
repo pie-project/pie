@@ -506,6 +506,7 @@ fn run(
         }
         // A size-only walk (`crate::sizing`) runs no product.
         if crate::sizing::active() {
+            crate::sizing::counted();
             OK
         } else {
             lt::cublasLtMatmul(

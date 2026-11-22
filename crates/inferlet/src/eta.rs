@@ -31,6 +31,24 @@ pub use eta_dsl::{
 thread_local! {
     static WIT_CHANNELS: RefCell<HashMap<u64, Rc<wit_channel::Channel>>> = RefCell::new(HashMap::new());
     static DECLARED: RefCell<HashMap<u64, ChannelSpec>> = RefCell::new(HashMap::new());
+    /// Channels whose seed the host refused, with its error: a constructor
+    /// has no `Result` to return it in, so the channel's next fallible use
+    /// (a pass binding it, a submit tracing it, a host take) returns it.
+    static REFUSED: RefCell<HashMap<u64, String>> = RefCell::new(HashMap::new());
+}
+
+fn refuse(gid: u64, why: String) {
+    REFUSED.with(|m| {
+        m.borrow_mut().entry(gid).or_insert(why);
+    });
+}
+
+/// The channel's WIT handle, or the error the host refused its seed with.
+fn channel_handle(gid: u64) -> Result<Rc<wit_channel::Channel>, String> {
+    if let Some(why) = REFUSED.with(|m| m.borrow().get(&gid).cloned()) {
+        return Err(why);
+    }
+    lookup_channel(gid).ok_or_else(|| format!("channel {gid} was never declared"))
 }
 
 #[derive(Clone)]
@@ -74,6 +92,8 @@ fn lookup_channel(gid: u64) -> Option<Rc<wit_channel::Channel>> {
     Some(wit)
 }
 
+/// Panics on a dtype no channel holds: a guest program's authoring error at
+/// the channel's construction, unreachable from any host error.
 fn to_wit_dtype(d: Dtype) -> WitDtype {
     match d {
         Dtype::F32 => WitDtype::F32,
@@ -128,13 +148,26 @@ impl Channel {
     }
 
     fn dsl(&self) -> DslChannel {
+        // An invariant, not a host error: every `Channel` registers its gid
+        // as it is built (`Channel::build`) and nothing in this crate
+        // releases one, so the lookup cannot miss whatever the host did.
         DslChannel::by_gid(self.gid).expect("channel token resolves in the DSL registry")
     }
 
-    fn wit(&self) -> Rc<wit_channel::Channel> {
-        lookup_channel(self.gid).expect("channel token resolves in the WIT registry")
+    fn wit(&self) -> Result<Rc<wit_channel::Channel>, String> {
+        channel_handle(self.gid)
     }
 
+    /// Stages `bytes` as the channel's seed; a refusal is returned by the
+    /// channel's next fallible use.
+    fn seed(&self, bytes: &[u8]) {
+        if let Err(why) = self.wit().and_then(|wit| wit.put(bytes)) {
+            refuse(self.gid, format!("{}: {why}", self.host_label("seed")));
+        }
+    }
+
+    /// Panics if the channel is already in use: an authoring error, not a
+    /// host one.
     pub fn capacity(self, n: u32) -> Channel {
         assert!(
             !channel_exists(self.gid),
@@ -159,9 +192,7 @@ impl Channel {
     pub fn from(v: impl IntoConst) -> Channel {
         let data: ConstData = v.into_const();
         let ch = Channel::build(data.shape, data.dtype, true);
-        ch.wit()
-            .put(&data.bytes)
-            .expect("stage seed on a fresh channel");
+        ch.seed(&data.bytes);
         ch
     }
 
@@ -170,6 +201,8 @@ impl Channel {
         Channel::build(shape.into_shape(), dtype, true)
     }
 
+    /// Panics if `v` holds other than `shape`'s element count: an authoring
+    /// error, not a host one.
     #[track_caller]
     pub fn from_shaped(shape: impl IntoShape, v: impl IntoConst) -> Channel {
         let data: ConstData = v.into_const();
@@ -180,9 +213,7 @@ impl Channel {
             "from_shaped: element count mismatch"
         );
         let ch = Channel::build(shape, data.dtype, true);
-        ch.wit()
-            .put(&data.bytes)
-            .expect("stage seed on a fresh channel");
+        ch.seed(&data.bytes);
         ch
     }
 
@@ -223,7 +254,7 @@ impl Channel {
     pub async fn take_host<T: FromChannel>(&self) -> Result<T, String> {
         self.check_host::<T>("take")?;
         self.dsl().note_host_take();
-        let raw = self.wit().take().await;
+        let raw = self.wit()?.take().await;
         self.decode_host::<T>(raw, "take")
     }
 
@@ -235,20 +266,22 @@ impl Channel {
         fps: f32,
     ) -> Result<crate::pie::inferlet::frames::Frames, String> {
         self.dsl().note_host_take();
-        crate::pie::inferlet::frames::Frames::from_channel(&self.wit(), width, height, count, fps)
+        let wit = self.wit()?;
+        crate::pie::inferlet::frames::Frames::from_channel(&wit, width, height, count, fps)
             .map_err(|why| format!("{}: {why}", self.host_label("take-frames")))
     }
 
     pub fn set_frames(&self, pixels: &crate::pie::inferlet::frames::Frames) -> Result<(), String> {
+        let wit = self.wit()?;
         pixels
-            .to_channel(&self.wit())
+            .to_channel(&wit)
             .map_err(|why| format!("{}: {why}", self.host_label("set-frames")))
     }
 
     pub async fn read_host<T: FromChannel>(&self) -> Result<T, String> {
         self.check_host::<T>("read")?;
         self.dsl().note_host_read();
-        let raw = self.wit().read().await;
+        let raw = self.wit()?.read().await;
         self.decode_host::<T>(raw, "read")
     }
 
@@ -285,14 +318,14 @@ impl Channel {
             }
             PutValue::Data(data) => {
                 self.dsl().note_host_put();
-                let _ = self.wit().put(&data.bytes);
+                let _ = self.wit().and_then(|wit| wit.put(&data.bytes));
             }
         }
     }
 
     pub fn set(&self, v: impl IntoConst) -> Result<(), String> {
         let data: ConstData = v.into_const();
-        self.wit().set(&data.bytes)
+        self.wit()?.set(&data.bytes)
     }
 }
 
@@ -648,7 +681,7 @@ impl ForwardPass {
                 return Err(format!("input `{name}` is already bound on lane {lane}"));
             }
         }
-        let wit = ch.wit();
+        let wit = ch.wit()?;
         self.wit.input(lane, name, wit.as_ref())?;
         self.inner
             .borrow_mut()
@@ -679,7 +712,7 @@ impl ForwardPass {
     /// rows.
     pub fn mask(&self, rows: &Channel) -> Result<(), String> {
         self.ensure_ports_available(&[Port::AttnMask])?;
-        let wit = rows.wit();
+        let wit = rows.wit()?;
         self.wit.mask(wit.as_ref())?;
         self.inner
             .borrow_mut()
@@ -707,8 +740,8 @@ impl ForwardPass {
 
     pub fn embed(&self, tokens: &Channel, indptr: &Channel) -> Result<(), String> {
         self.ensure_ports_available(&[Port::EmbedTokens, Port::EmbedIndptr])?;
-        let token_wit = tokens.wit();
-        let indptr_wit = indptr.wit();
+        let token_wit = tokens.wit()?;
+        let indptr_wit = indptr.wit()?;
         self.wit.embed(token_wit.as_ref(), indptr_wit.as_ref())?;
         self.inner.borrow_mut().ports.extend([
             (Port::EmbedTokens, claim_port(Port::EmbedTokens, tokens)),
@@ -749,8 +782,8 @@ impl ForwardPass {
         }
         let wits: Vec<Option<Rc<wit_channel::Channel>>> = stated
             .iter()
-            .map(|(_, channel)| channel.as_ref().map(Channel::wit))
-            .collect();
+            .map(|(_, channel)| channel.as_ref().map(Channel::wit).transpose())
+            .collect::<Result<_, String>>()?;
         let handles: Vec<Rc<wit_ws::WorkingSet>> = lanes.iter().map(|ws| ws.ws.clone()).collect();
         let borrows: Vec<&wit_ws::WorkingSet> = handles.iter().map(Rc::as_ref).collect();
         self.wit.state(
@@ -778,7 +811,7 @@ impl ForwardPass {
 
     pub fn readout(&self, indices: &Channel) -> Result<(), String> {
         self.ensure_ports_available(&[Port::Readout])?;
-        let indices_wit = indices.wit();
+        let indices_wit = indices.wit()?;
         self.wit.readout(indices_wit.as_ref())?;
         self.inner
             .borrow_mut()
@@ -890,6 +923,8 @@ impl ForwardPass {
         self.set_stage(Stage::Epilogue, body);
     }
 
+    /// Panics once the program is attached: an authoring error (a stage set
+    /// after the first submit), not a host one.
     fn set_stage(&self, stage: Stage, body: impl Fn() + 'static) {
         let mut inner = self.inner.borrow_mut();
         assert!(
@@ -937,8 +972,8 @@ impl ForwardPass {
         let handles: Vec<Rc<wit_channel::Channel>> = traced
             .channel_order()
             .iter()
-            .map(|gid| lookup_channel(*gid).expect("channel registered before submit"))
-            .collect();
+            .map(|gid| channel_handle(*gid))
+            .collect::<Result<_, String>>()?;
         let borrows: Vec<&wit_channel::Channel> = handles.iter().map(Rc::as_ref).collect();
         let bytes = traced.encode();
         self.wit.program(&bytes, &borrows)?;
@@ -1021,15 +1056,6 @@ pub fn frame_size() -> usize {
         static FRAME_SIZE: std::cell::OnceCell<usize> = const { std::cell::OnceCell::new() };
     }
     FRAME_SIZE.with(|k| *k.get_or_init(|| crate::model::frame_size().max(1) as usize))
-}
-
-pub fn submit_deadline() -> std::time::Duration {
-    thread_local! {
-        static DEADLINE: std::cell::OnceCell<u64> = const { std::cell::OnceCell::new() };
-    }
-    std::time::Duration::from_micros(
-        DEADLINE.with(|d| *d.get_or_init(crate::model::submit_deadline_us)),
-    )
 }
 
 pub fn channel_capacity() -> usize {
@@ -1276,5 +1302,25 @@ pub mod diffusion {
         let stable = eq(&unchanged, n as i32);
         let mean = &reduce_sum(entropy) / (n as f32);
         and(&stable, lt(&mean, threshold))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A seed the host refused is no panic: the channel's next fallible use
+    /// (a pass binding it, a submit tracing it, a host take) returns the
+    /// host's error, and only the first refusal is kept.
+    #[test]
+    fn a_refused_seed_is_returned_by_the_next_use() {
+        let gid = u64::MAX;
+        refuse(gid, "channel seed: channel is closed".to_string());
+        refuse(gid, "a later refusal".to_string());
+        assert_eq!(
+            channel_handle(gid).err().as_deref(),
+            Some("channel seed: channel is closed")
+        );
+        assert!(channel_handle(u64::MAX - 1).is_err(), "never declared");
     }
 }

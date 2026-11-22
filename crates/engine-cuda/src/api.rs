@@ -361,6 +361,7 @@ fn fault(fault: Fault) -> Error {
             "this fire wants {need} {what} and the load reserved {have}"
         )),
         Fault::Fragmented { .. } | Fault::Integrity { .. } => Error::Device(fault.to_string()),
+        Fault::TierFull(_) => Error::TierFull(fault.to_string()),
         Fault::Overcarved { .. } => Error::Invalid(fault.to_string()),
         Fault::Straddled { .. } | Fault::Recipe(_) => Error::Load(fault.to_string()),
         Fault::Mask { .. }
@@ -377,6 +378,7 @@ fn fault(fault: Fault) -> Error {
             wanted: 1,
             available: 0,
         },
+        Fault::Claimed(refusal) => Error::Claimed(refusal),
         Fault::Compile(_) | Fault::Program { .. } | Fault::Interpret(_) => {
             Error::Program(fault.to_string())
         }
@@ -719,27 +721,8 @@ impl Engine for Cuda {
                 size.piece >> 20
             );
         }
-        let mut budgets = budgets;
-        if budgets.context_declared && kv_budget.is_none() {
-            let fits = crate::store::declared_context_that_fits(
-                &trace,
-                budgets.page_size,
-                budgets.max_context,
-                residency.device,
-                plan.device_demand(),
-            )
-            .map_err(fault)?;
-            if fits < budgets.max_context {
-                eprintln!(
-                    "engine-cuda: the model declares a {}-token context and one sequence at it \
-                     takes more than half of what the load's allowance leaves past the weights; \
-                     serving {fits} tokens. State `[engine] max_context` to choose.",
-                    budgets.max_context
-                );
-                budgets.max_context = fits;
-            }
-        }
-
+        // A declared context is cut to the load's room where the load reads
+        // it, past this process's context and modules (`Shell::stage`).
         let patches = patch_ladder(&trace, &budgets);
         let voxels = poem_compiler::VoxelLadder::of(
             &trace,
@@ -793,11 +776,13 @@ impl Engine for Cuda {
         let mut shell = staged.finish().map_err(fault)?;
 
         shell.mount_adapters(self.boot.adapter_dir.clone());
+        // The context the load serves, a declared one as the load's room cut it.
+        let context = shell.paging().context();
         shell
             .seat_host_kv(
                 residency.host_kv_budget,
                 residency.kv_seats.unwrap_or(budgets.max_lanes),
-                budgets.max_context,
+                context,
                 ranks,
                 ring,
             )
@@ -812,6 +797,8 @@ impl Engine for Cuda {
                 residency.disk_kv_budget,
                 residency.disk_kv_dir.as_deref(),
                 residency.disk_kv_persistent,
+                residency.kv_seats.unwrap_or(budgets.max_lanes),
+                context,
                 self.boot.world,
             )
             .map_err(fault)?;
@@ -1048,7 +1035,6 @@ impl Engine for Cuda {
                 instance,
                 rings,
                 scratch,
-                resident,
                 pair,
                 pair_generation,
                 ..
@@ -1060,12 +1046,14 @@ impl Engine for Cuda {
                         instance,
                         rings,
                         scratch,
-                        resident,
                         pair,
                         pair_generation,
                     },
                 )
                 .map_err(fault),
+            engine::program::Rebind::Parked { id, kept } => {
+                self.loaded_mut()?.park_program(id, kept).map_err(fault)
+            }
             engine::program::Rebind::Channel { id, slots } => {
                 let old = self.channels.get(&id).cloned().ok_or_else(|| {
                     Error::Program(format!("channel {id} is not registered on this engine"))
@@ -1105,16 +1093,32 @@ impl Engine for Cuda {
         copy: &engine::chunk::SlotCopy,
         token: u64,
     ) -> EngineResult<bool> {
-        self.copy_slots(copy)?;
         let host = |domain| matches!(domain, MemoryDomain::HostPinned);
         let device = |domain| matches!(domain, MemoryDomain::CudaDevice(_));
+        let disk = |domain| matches!(domain, MemoryDomain::LocalDisk);
+        // A move between the host tier and the slot file runs on the tier's
+        // landing thread and is told how it ended: the engine thread only
+        // enqueues it.
+        let host_disk = (host(copy.src) && disk(copy.dst)) || (disk(copy.src) && host(copy.dst));
+        if host_disk && let Some(sink) = self.landed.clone() {
+            let told: crate::serve::landing::Told =
+                Box::new(move |landing| sink(token, landing));
+            self.loaded_mut()?.defer_disk_tell(Some(told));
+            let copied = self.copy_slots(copy);
+            // Not taken (nothing to move, or refused before enqueueing):
+            // answered in the call.
+            let untaken = self.loaded_mut()?.defer_disk_tell(None).is_some();
+            copied?;
+            return Ok(untaken);
+        }
+        self.copy_slots(copy)?;
         let parked = device(copy.src) && host(copy.dst);
         let Some(sink) = self.landed.clone().filter(|_| parked) else {
             return Ok(true);
         };
         let told = self
             .loaded_mut()?
-            .tell_swaps_landed(Box::new(move || sink(token)))
+            .tell_swaps_landed(Box::new(move |landing| sink(token, landing)))
             .map_err(fault)?;
         Ok(!told)
     }
@@ -1409,7 +1413,6 @@ impl Engine for Cuda {
                     instance: binding.instance_slots.clone(),
                     rings: binding.ring_slots.clone(),
                     scratch: binding.scratch.clone(),
-                    resident: binding.resident.clone(),
                     pair: binding.pair.clone(),
                     pair_generation: binding.pair_generation,
                 },

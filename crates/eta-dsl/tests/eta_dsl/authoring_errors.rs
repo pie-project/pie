@@ -22,6 +22,7 @@ fn detail(error: &TraceError) -> &str {
 fn authoring_errors_every_case() {
     a_dtype_mismatch_is_reported_with_a_span();
     every_mistake_in_one_trace_is_reported_together();
+    an_output_the_pass_does_not_read_out_fails_the_build();
 }
 
 fn a_dtype_mismatch_is_reported_with_a_span() {
@@ -72,6 +73,31 @@ fn every_mistake_in_one_trace_is_reported_together() {
     assert!(detail(authoring[0]).contains("shape [K]"), "{errors}");
     assert!(
         detail(authoring[1]).contains("one index per row"),
+        "{errors}"
+    );
+}
+
+/// An output the host declared no lane reading out fails the build by name;
+/// the guest does not panic mid-trace.
+fn an_output_the_pass_does_not_read_out_fails_the_build() {
+    let out = Channel::new([1], dtype::u32);
+    let mut builder = Builder::new(32_000, 16);
+    builder.outputs(crate::outputs::logits(32_000));
+    builder.stage(Stage::Epilogue, || {
+        out.put(reshape(reduce_argmax(intrinsics::output(0, "hidden")), [1]));
+        out.put(reshape(reduce_argmax(intrinsics::output(1, "logits")), [1]));
+    });
+
+    let errors = builder.build().expect_err("an undeclared output must fail");
+    let authoring = authoring(&errors);
+    assert!(
+        detail(authoring[0]).contains("lane 0 of this pass reads out no output `hidden`"),
+        "{errors}"
+    );
+    assert!(
+        authoring
+            .iter()
+            .any(|e| detail(e).contains("lane 1 of this pass reads out no output `logits`")),
         "{errors}"
     );
 }

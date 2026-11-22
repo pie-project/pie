@@ -1593,3 +1593,26 @@ async fn a_refused_evacuation_is_taken_back_whole_and_a_later_one_goes_through()
     assert_eq!(shared.lock().unwrap().mapped_segments(), 7);
     assert_eq!(grow.retarget(6), Retarget::NoRoom { held: 7 });
 }
+
+/// The weights' pinned slots never hold state: the room a need is held
+/// against (the never-fits check, a guest bind's short-or-refused read)
+/// leaves them out. Counted whole, a Qwen3-30B-A3B ROCm boot whose pool
+/// was almost all weights left its first binds waiting 45 minutes for
+/// room no move could make, nothing running.
+#[test]
+fn the_state_room_leaves_out_the_weights_pinned_slots() {
+    let mut pool = pool();
+    let (most, now) = (pool.state_chunks_most(), pool.state_chunks_now());
+    let shape = pool.weights_first();
+    let holder = crate::store::slots::Holder::Weights {
+        shape,
+        pinned: true,
+    };
+    pool.pool_mut()
+        .acquire(holder, shape, 8)
+        .expect("the weights' slots");
+    // Eight atoms, two a chunk: four chunks.
+    assert_eq!(pool.room().weight_chunks, 4);
+    assert_eq!(pool.state_chunks_most(), most - 4);
+    assert_eq!(pool.state_chunks_now(), now - 4);
+}

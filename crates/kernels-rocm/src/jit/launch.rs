@@ -21,6 +21,7 @@ pub(crate) unsafe fn issue(
 ) -> Result<(), Fault> {
     // A size-only walk (`crate::sizing`) launches nothing.
     if crate::sizing::active() {
+        crate::sizing::counted();
         return Ok(());
     }
     let api = sys::api().map_err(|_| Fault::Device {

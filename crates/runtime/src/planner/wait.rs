@@ -61,6 +61,27 @@ pub(super) struct Waiter {
     /// When it was queued: a wait past [`LONG_WAIT`] is said with what
     /// woke the pass that served it.
     pub(super) since: crate::rt::Instant,
+    /// What it lacked the last time a pass ended with it the queue's head
+    /// ([`super::ResidencyPlanner::publish_wants`]): said with a long
+    /// wait, so a wait served by a poke names the lack the room signal
+    /// did not measure. `"behind the head"` where it never headed.
+    pub(super) lacked: &'static str,
+    /// The wants published for it then (the device's free chunks, the kv
+    /// list's free slots, the swap tiers' free slots; `u64::MAX` for none)
+    /// and the free chunks and pages standing then: set beside the counts
+    /// at its serve, a long wait says whether its room came as a count the
+    /// signal measures.
+    pub(super) wanted: ([u64; 3], [u32; 2]),
+}
+
+/// A wait served past [`LONG_WAIT`]: its kind, what it lacked and the wants
+/// published for it as it last headed the queue ([`Waiter::lacked`],
+/// [`Waiter::wanted`]), and how long.
+pub(super) struct LongWait {
+    pub(super) kind: &'static str,
+    pub(super) lacked: &'static str,
+    pub(super) wanted: ([u64; 3], [u32; 2]),
+    pub(super) waited: std::time::Duration,
 }
 
 /// A wait long enough that what finally served it is said: a field's gaps
@@ -84,6 +105,20 @@ impl Waiter {
     /// chunks, [`WaitKind::BindRoom`]).
     /// A rung raise served and not yet taken: it holds the queue
     /// ([`WaitKind::BindRoom::rise`]).
+    /// Served and not yet taken: an allocation's grant waiting for its
+    /// waiter, a bind's room served and not taken.
+    pub(super) fn untaken(&self) -> bool {
+        match &self.kind {
+            WaitKind::Allocation {
+                outcome, yielded, ..
+            } => outcome.is_some() && !yielded,
+            WaitKind::Restore { .. } => false,
+            WaitKind::BindRoom {
+                served, withdrawn, ..
+            } => *served && !withdrawn,
+        }
+    }
+
     pub(super) fn rise_untaken(&self) -> bool {
         matches!(
             self.kind,

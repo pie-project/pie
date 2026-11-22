@@ -350,7 +350,12 @@ fn write_shelf(shelf: &Shelf, slots: &[u32], bytes: &[u8], what: &'static str) -
     Ok(())
 }
 
+/// A slot-file write failing for want of room on its file system is the
+/// tier below full ([`Fault::TierFull`]): nothing on the device changed.
 fn slot_file(error: std::io::Error) -> Fault {
+    if error.kind() == std::io::ErrorKind::StorageFull {
+        return Fault::TierFull(error.to_string());
+    }
     Fault::Integrity {
         at: "the disk tier's slot file",
         why: error.to_string(),
@@ -386,20 +391,14 @@ pub fn page_ceiling(trace: &Trace, page_size: u32, context: u32, bytes: u64) -> 
     })
 }
 
-/// A model's declared context shortened to what the card holds: the
+/// A model's declared context shortened to what the load's room holds: the
 /// longest whole number of pages, at most `declared`, at which one sequence
-/// takes no more than half of what the `allowance` of the card, less what others
-/// already hold, leaves past the weight tier: the activations and a second
-/// sequence have the other half. The most a declared context is served at:
-/// the fit shortens it to what it seats (`Pools::declare_context`).
-/// Never under one page.
-pub fn declared_context_that_fits(
-    trace: &Trace,
-    page_size: u32,
-    declared: u32,
-    allowance: engine::Allowance,
-    weights: u64,
-) -> Result<u32> {
+/// takes no more than half of `live`, the room the load's own room line
+/// leaves past the weight tier (read after this process's context and
+/// modules took theirs): the activations and a second sequence have the
+/// other half. The most a declared context is served at: the fit shortens it
+/// to what it seats (`Pools::declare_context`). Never under one page.
+pub fn declared_context_within(trace: &Trace, page_size: u32, declared: u32, live: u64) -> Result<u32> {
     let page_size = page_size.max(1);
     let window = window_of(trace)?;
     // A sequence as it is held between fires: a windowed row its window
@@ -410,11 +409,7 @@ pub fn declared_context_that_fits(
             Paging::of(page_size, pages.saturating_mul(page_size), 1, 1)?.held(window);
         one_slot_bytes(trace, paging)
     };
-    let ceiling = load_ceiling(allowance, false)?;
-    let (free, total) = device_memory()?;
-    let room = elastic::room_under(ceiling, free, total)
-        .saturating_sub(weight_tier_bytes(trace, weights, 0)?)
-        / 2;
+    let room = live / 2;
     let most = declared.div_ceil(page_size).max(1);
     if one(most)? <= room {
         return Ok(declared);
@@ -708,6 +703,10 @@ pub struct Pools {
     /// ([`Pools::lane_banks`]): a slot filled from the serving file, or a
     /// copy pinned from it, is laid in that order once filled.
     lanes: Vec<LaneBank>,
+    /// The fp8 banks ROCm puts in the FP8 matrix core's order
+    /// ([`Pools::fp8_banks`]): a slot filled from the serving file, or a
+    /// copy pinned from it, has its codes put in that order once filled.
+    fp8: Vec<Fp8Bank>,
     /// The pinned copy misses are read from, where the load left the
     /// weights in the file and the runtime streams them after all.
     miss_copy: Option<crate::device::Pinned>,
@@ -768,6 +767,9 @@ pub struct Pools {
     airborne: Option<Airborne>,
     host: Option<HostKv>,
     disk: Option<DiskTier>,
+    /// Where the next host<->disk move is told how it ended
+    /// ([`Pools::defer_disk_tell`]); taken by the move.
+    disk_told: DiskTell,
     /// The shared pool's host tier (CONTRACT-BC 22): chunks of the state
     /// pool's size, a slot of any shape at the place its host ref names, in
     /// pageable memory behind a page-locked staging ring ([`host`]).
@@ -809,8 +811,21 @@ struct Swap {
 /// aligned blocks it lies in) moves through.
 #[derive(Debug)]
 struct DiskTier {
-    file: engine::disk::SlotFile,
+    file: std::sync::Arc<engine::disk::SlotFile>,
+    /// Held across a slot cover's read-modify-write, here and on the host
+    /// tier's landing thread ([`host::DiskMove`]).
+    io: std::sync::Arc<std::sync::Mutex<()>>,
     stage: DiskStage,
+}
+
+/// A tell handed to the next host<->disk move ([`Pools::defer_disk_tell`]).
+#[derive(Default)]
+struct DiskTell(Option<crate::serve::landing::Told>);
+
+impl std::fmt::Debug for DiskTell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() { "DiskTell(pending)" } else { "DiskTell(none)" })
+    }
 }
 
 /// The pinned stage of the disk tier.
@@ -1247,6 +1262,7 @@ impl Pools {
             hosts_dropped: false,
             weights_filed: false,
             lanes: Vec::new(),
+            fp8: Vec::new(),
             miss_copy: None,
             preseated: false,
             stand_in: false,
@@ -1271,6 +1287,7 @@ impl Pools {
             airborne: None,
             host: None,
             disk: None,
+            disk_told: DiskTell::default(),
             tier: None,
             whole: false,
             swaps: Vec::new(),
@@ -1722,6 +1739,11 @@ impl Pools {
                 );
             }
         }
+        // A declared context the fit cannot seat even shortened is the
+        // card's refusal by name, not a residency fault: the load asked the
+        // model's context, and the card holds no sequence of it.
+        let declared = self.declared;
+        let short = |why: String| if declared { Fault::Card(why) } else { Fault::Residency(why) };
         let WorkingSet {
             least,
             need,
@@ -1732,7 +1754,7 @@ impl Pools {
         } = self
             .working_set(one_slot, bodies, programs, live, stated)
             .map_err(|spare| {
-                Fault::Residency(format!(
+                short(format!(
                     "the card does not hold this deployment's graph bodies: {resident}; past \
                      one working set at the declared context and the weights the pool seats it \
                      has {spare} bytes, and the bodies took {bodies} when this deployment last \
@@ -1768,7 +1790,7 @@ impl Pools {
                 ));
             }
             Err(_) => {
-                return Err(Fault::Residency(format!(
+                return Err(short(format!(
                     "the card does not hold this deployment: {resident}; under the load's \
                      allowance that leaves {room} bytes for the state pool, and one working set \
                      at the declared context needs {need}. Lower `[engine] max_context`, raise \
@@ -2397,18 +2419,10 @@ impl Pools {
     ) -> Result<engine::GuestState> {
         let layout = self.chunks.layout();
         let chunk = layout.chunk_bytes.max(1);
-        // The resident state is one run of slots in a chunk, moved as the
-        // instance's tables are.
-        if resident > chunk {
-            return Err(Fault::Ceiling {
-                what: "bytes of a guest's resident state (a beam group's page lists for its \
-                       depth), which lie in one chunk",
-                need: resident,
-                have: chunk,
-            });
-        }
-        let run =
-            u32::try_from(per_instance.max(per_pair).div_ceil(chunk)).unwrap_or(u32::MAX);
+        // An instance's place holds its resident state, then its scratch:
+        // one piece, moved whole at a park.
+        let place = resident + per_instance;
+        let run = u32::try_from(place.max(per_pair).div_ceil(chunk)).unwrap_or(u32::MAX);
         if run > layout.segment_chunks {
             return Err(Fault::Ceiling {
                 what: "chunks of a segment a guest's state lies in, one run",
@@ -2417,8 +2431,9 @@ impl Pools {
             });
         }
         Ok(engine::GuestState {
-            // The lane's scratch is dead between fires (one arm); what a later
-            // fire reads is resident.
+            // What a later fire reads (a beam group's state) lies first in the
+            // instance's place, copied with it at a park; its lane's value
+            // scratch past it is dead between fires (one arm).
             resident,
             scratch: per_instance,
             scratch_arms: 1,
@@ -3378,8 +3393,10 @@ impl Pools {
             }
             let mut fills = Vec::new();
             // The lane-order banks' slots filled from the serving file, as
-            // it lies: laid once filled.
+            // it lies: laid once filled (and the fp8 banks' codes put in
+            // their order).
             let mut laid = Vec::new();
+            let mut fp8 = Vec::new();
             for (atom, slot) in named.iter().enumerate() {
                 let Some(slot) = *slot else { continue };
                 if self.expert_caches[at].slots[atom] == Some(slot) {
@@ -3406,6 +3423,11 @@ impl Pools {
                     ));
                 }
                 if self.weights_filed {
+                    for bank in &self.fp8 {
+                        if let Some(codes) = banks().find(|b| b.plane.param == bank.codes) {
+                            fp8.push((to + codes.plane.offset, bank.rows, bank.k));
+                        }
+                    }
                     for lane in &self.lanes {
                         let at_of = |param: u32| {
                             banks()
@@ -3420,6 +3442,7 @@ impl Pools {
             }
             self.fill_weights(stream, &fills)?;
             self.lay_lanes(stream, &laid)?;
+            self.lay_fp8(stream, &fp8)?;
             self.expert_caches[at].slots = named;
         }
         self.stage_row_tables(stream)?;
@@ -3505,6 +3528,28 @@ impl Pools {
     /// rows and K.
     pub fn lane_banks(&mut self, lanes: Vec<LaneBank>) {
         self.lanes = lanes;
+    }
+
+    /// The fp8 banks the load puts in the FP8 matrix core's order
+    /// (`store::layout::fp8_ordered`): their codes' params, rows and K.
+    pub fn fp8_banks(&mut self, banks: Vec<Fp8Bank>) {
+        self.fp8 = banks;
+    }
+
+    /// Each `(codes, rows, k)` span of e4m3 codes put in the FP8 matrix
+    /// core's order and made canonical where it lies, host or device
+    /// (`weights::hip::order_fp8_span`); a span holding a NaN code refuses
+    /// the load.
+    fn lay_fp8(&self, stream: *mut core::ffi::c_void, spans: &[(u64, u64, u64)]) -> Result<()> {
+        #[cfg(feature = "rocm")]
+        {
+            crate::weights::order_fp8_spans(stream, spans)
+        }
+        #[cfg(not(feature = "rocm"))]
+        {
+            let _ = (stream, spans);
+            Ok(())
+        }
     }
 
     /// Each `(codes, exponents)` span of `rows` rows of K `k` laid in lane
@@ -3643,6 +3688,36 @@ impl Pools {
     /// tables located. The load arms over them; the runtime's first
     /// residency then names the slots it chose, and an atom it puts
     /// elsewhere is filled there again.
+    /// A measuring load's second fit on a flat range (one allocation, made
+    /// at the first fit: the least range the bodies armed over): where the
+    /// card could back more chunks than that allocation holds, everything
+    /// seated in it is let go (the weights preseated in it, the segments
+    /// arming's fires backed), so the refit may reserve the range anew at
+    /// what the card backs ([`chunks::Chunks::reshape`]); the caller seats
+    /// the weights again. Whether it did: a range mapped on demand, one a
+    /// body names, or one already as large as asked, keeps all it holds.
+    /// Whether the load seated its weights in the pool ahead of the
+    /// runtime's first residency ([`Pools::preseat_weights`]).
+    #[must_use]
+    pub const fn preseated(&self) -> bool {
+        self.preseated
+    }
+
+    pub fn free_for_refit(&mut self) -> Result<bool> {
+        if elastic::mapped_on_demand() || self.pinned || self.asked_chunks <= self.chunks.total() {
+            return Ok(false);
+        }
+        for cache in &mut self.row_caches {
+            cache.slots.fill(None);
+        }
+        for cache in &mut self.expert_caches {
+            cache.slots.fill(None);
+        }
+        self.preseated = false;
+        self.release_segments(0)?;
+        Ok(true)
+    }
+
     pub fn preseat_weights(
         &mut self,
         stream: *mut core::ffi::c_void,
@@ -3728,6 +3803,19 @@ impl Pools {
                 bank.host = copies.next().unwrap_or(bank.host);
             }
         }
+        // The file holds an fp8 bank's codes as it lies: its pinned copy's
+        // are put in the FP8 matrix core's order, an expert at a time.
+        let mut fp8 = Vec::new();
+        for cache in &self.expert_caches {
+            for bank in &self.fp8 {
+                for codes in cache.planes.iter().filter(|b| b.plane.param == bank.codes) {
+                    for expert in 0..u64::from(cache.shape.experts) {
+                        fp8.push((codes.host + expert * codes.plane.bytes, bank.rows, bank.k));
+                    }
+                }
+            }
+        }
+        self.lay_fp8(core::ptr::null_mut(), &fp8)?;
         // The file holds a lane-order bank as it lies: its pinned copy, what
         // misses read and slots are filled from, is laid in lane order.
         let mut laid = Vec::new();
@@ -4205,6 +4293,12 @@ impl Pools {
         self.disk.as_ref().map_or(0, |disk| disk.file.slots())
     }
 
+    /// The pool's chunk layout: its chunk bytes and shapes.
+    #[must_use]
+    pub fn chunk_layout(&self) -> &crate::store::layout::Layout {
+        self.chunks.layout()
+    }
+
     /// The bytes one disk chunk takes: a pool chunk, on the slot file's
     /// direct I/O boundary, laid out as the device's.
     #[must_use]
@@ -4507,50 +4601,44 @@ impl Pools {
                 self.through_disk(stream, to_disk, &slots, bytes)
             }
             (Tier::Host, Tier::Disk) | (Tier::Disk, Tier::Host) => {
+                // On the host tier's landing thread, behind every move it
+                // holds (a move into or out of these host slots lands before
+                // it): the engine thread only enqueues. Told later where a
+                // tell was handed in ([`Pools::defer_disk_tell`]); waited out
+                // here otherwise, as a copy that answers its sources read.
                 let to_disk = to == Tier::Disk;
-                // A copy still on a stream may read or write a host slot.
-                self.settle_swaps()?;
-                crate::device::ctx::sync(stream)?;
+                let len = usize::try_from(bytes).unwrap_or(usize::MAX);
                 let mut slots = Vec::with_capacity(pairs.len());
                 for &(src, dst) in pairs {
                     let (on_host, on_disk) = if to_disk { (src, dst) } else { (dst, src) };
                     slots.push((
                         self.tier_offset(kind, on_host)?,
                         self.disk_place(kind, on_disk)?,
+                        len,
                     ));
                 }
-                self.host_through_disk(to_disk, &slots, bytes)
+                let told = self.disk_told.0.take();
+                let (Some(spill), Some(tier)) = (self.disk.as_ref(), self.tier.as_mut()) else {
+                    if let Some(told) = told {
+                        told(engine::Landing::Landed);
+                    }
+                    return Ok(());
+                };
+                let waited = told.is_none();
+                let id = tier.disk(host::DiskMove {
+                    to_disk,
+                    file: std::sync::Arc::clone(&spill.file),
+                    io: std::sync::Arc::clone(&spill.io),
+                    slots,
+                    told,
+                })?;
+                if waited {
+                    tier.wait_job(id)?;
+                }
+                Ok(())
             }
             _ => Ok(()),
         }
-    }
-
-    /// Moves whole slots of `bytes` between the host tier and the disk
-    /// tier, `(host, disk)` byte places each, through the stage: a slot's
-    /// cover read whole, and written keeping its neighbours' bytes.
-    fn host_through_disk(&mut self, to_disk: bool, slots: &[(u64, u64)], bytes: u64) -> Result<()> {
-        let (Some(spill), Some(tier)) = (self.disk.as_mut(), self.tier.as_ref()) else {
-            return Ok(());
-        };
-        // The caller has synced the stream: no h2d out of the stage is in
-        // flight.
-        spill.stage.landing = false;
-        let len = usize::try_from(bytes).unwrap_or(usize::MAX);
-        let mut edge = engine::disk::Aligned::zeroed(engine::disk::ALIGN);
-        for &(host, disk) in slots {
-            let (start, span, lead) = cover(disk, bytes);
-            let staged = spill.stage.staged(span)?;
-            let place = tier.slice(host, len)?;
-            if to_disk {
-                staged[lead..lead + len].copy_from_slice(place);
-                keep_edges(&spill.file, start, staged, lead, len, &mut edge)?;
-                spill.file.write_span(start, staged).map_err(slot_file)?;
-            } else {
-                spill.file.read_span(start, staged).map_err(slot_file)?;
-                place.copy_from_slice(&staged[lead..lead + len]);
-            }
-        }
-        Ok(())
     }
 
     /// Moves whole slots of `bytes` between the device and the disk tier,
@@ -4564,12 +4652,19 @@ impl Pools {
         slots: &[(u64, u64)],
         bytes: u64,
     ) -> Result<()> {
+        // Behind every move between the host tier and these bytes of the
+        // file, done on the tier's landing thread.
+        if let Some(tier) = self.tier.as_ref() {
+            tier.wait_disk(slots.iter().map(|&(_, disk)| (disk, bytes)))?;
+        }
         let Some(spill) = self.disk.as_mut() else {
             return Ok(());
         };
         let len = usize::try_from(bytes).unwrap_or(usize::MAX);
         let mut edge = engine::disk::Aligned::zeroed(engine::disk::ALIGN);
+        let io = std::sync::Arc::clone(&spill.io);
         for &(device, disk) in slots {
+            let _io = io.lock().expect("the slot file's I/O");
             if spill.stage.landing {
                 crate::device::ctx::sync(stream)?;
                 spill.stage.landing = false;
@@ -4644,7 +4739,8 @@ impl Pools {
         self.disk = file
             .map(|file| {
                 crate::device::Pinned::mapped_uninit(room).map(|pinned| DiskTier {
-                    file,
+                    file: std::sync::Arc::new(file),
+                    io: std::sync::Arc::default(),
                     stage: DiskStage {
                         pinned,
                         room,
@@ -4777,6 +4873,16 @@ impl Pools {
             }
         }
         Ok(())
+    }
+
+    /// Where the next move between the host tier and the slot file is told
+    /// how it ended, on the tier's landing thread, instead of waited out by
+    /// the caller. Returns any tell no such move took since.
+    pub fn defer_disk_tell(
+        &mut self,
+        told: Option<crate::serve::landing::Told>,
+    ) -> Option<crate::serve::landing::Told> {
+        std::mem::replace(&mut self.disk_told.0, told)
     }
 
     /// Waits, on the host, for every move still landing.
@@ -5206,6 +5312,16 @@ struct ExpertBank {
 pub struct LaneBank {
     pub codes: u32,
     pub scales: u32,
+    pub rows: u64,
+    pub k: u64,
+}
+
+/// An fp8 bank ROCm puts in the FP8 matrix core's order
+/// (`store::layout::fp8_ordered`): its codes' param, an expert's rows and
+/// K.
+#[derive(Debug, Clone, Copy)]
+pub struct Fp8Bank {
+    pub codes: u32,
     pub rows: u64,
     pub k: u64,
 }

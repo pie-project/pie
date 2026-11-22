@@ -538,7 +538,6 @@ impl Rig {
             .bind(
                 &mut self.engine,
                 InstanceBinding {
-                    resident: Default::default(),
                     program,
                     channels,
                     seeds: Vec::new(),

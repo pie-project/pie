@@ -322,9 +322,7 @@ pub fn guest_budget(
         }
     };
     Ok(eta_ir::validate::Budget {
-        room_bytes: u64::from(chunks.state_chunks())
-            .saturating_mul(chunks.chunk_bytes)
-            .saturating_sub(chunks.held_bytes),
+        room_bytes: chunks.guest_room_bytes(),
         submit,
     })
 }

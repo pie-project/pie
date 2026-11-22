@@ -34,7 +34,12 @@ pub fn noise(seed: u64, n: usize) -> Vec<f32> {
 /// directory is `$PIE_HOME/profiles` where `PIE_HOME` is set, as `pie`'s
 /// own loads use, and otherwise one directory per backend in the temp dir,
 /// shared by every test of the run.
+///
+/// Every device a test opens is booted by this, so the calling test is
+/// counted among the tests holding a device until it ends ([`sole`]); it
+/// waits here while another test holds the process's devices alone.
 pub fn device_boot() -> DeviceBoot {
+    open(false);
     let profiles = std::env::var_os("PIE_HOME").map_or_else(
         || std::env::temp_dir().join(format!("pie-{}-profiles", crate::backend::NAME)),
         |home| std::path::PathBuf::from(home).join("profiles"),
@@ -88,6 +93,58 @@ impl Drop for Held {
 
 thread_local! {
     static HELD: std::cell::RefCell<Option<Held>> = const { std::cell::RefCell::new(None) };
+    static OPENED: std::cell::RefCell<Option<Opened>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The process's devices: a test holding one (or a share, under which it
+/// may open one) reads this gate until it ends; a test holding them all
+/// alone ([`sole`]) writes it.
+static DEVICES: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// The calling test's hold on [`DEVICES`], kept by its thread until the
+/// test ends.
+enum Opened {
+    Shared(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>),
+    Sole(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>),
+}
+
+/// Takes the calling test's hold on the process's devices, unless it holds
+/// one already: shared, or where `sole` every device alone.
+fn open(sole: bool) {
+    OPENED.with(|opened| {
+        let mut opened = opened.borrow_mut();
+        if let Some(held) = opened.as_ref() {
+            assert!(
+                matches!(held, Opened::Sole(_)) || !sole,
+                "a test takes the process's devices alone before it opens one"
+            );
+            return;
+        }
+        *opened = Some(if sole {
+            Opened::Sole(
+                DEVICES
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+        } else {
+            Opened::Shared(
+                DEVICES
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+        });
+    });
+}
+
+/// The calling test holds every device of the process alone until it ends:
+/// it waits until no other test holds a device (or a share, under which it
+/// may open one), and no test opens one meanwhile. For a test that reads
+/// what the driver holds for the process (`Context::outside`): the driver
+/// reports its usage a process, every device of it summed, so another
+/// test's device opening, building pipelines, reserving or closing beside
+/// this one's would read as this one's. Call this first, before any load.
+pub fn sole() {
+    open(true);
 }
 
 /// Takes the calling test's share, once `free` says the holders leave room
@@ -123,6 +180,7 @@ fn take(alone: bool, free: impl Fn(&Holders) -> bool) {
 /// would stretch by its own fires and loads. The test's loads still take
 /// its share ([`share`]); call this before them.
 pub fn alone() {
+    open(false);
     take(true, |holders| holders.count == 0);
 }
 
@@ -149,6 +207,7 @@ fn share_bytes() -> Option<u64> {
 /// load it makes then takes the same share. Take it before
 /// `model_logits::loading`, which a test holding a share waits on.
 pub fn share() -> engine::Allowance {
+    open(false);
     take(false, |holders| !holders.alone && holders.count < SHARES - 1);
     engine::Allowance {
         budget: share_bytes(),
@@ -279,6 +338,37 @@ impl Gpu {
         let span = frame.commit_spanned().expect("the frame lands");
         let host = started.elapsed().as_nanos() as f64;
         span.map_or(host, |ns| ns as f64)
+    }
+
+    /// One arm's timestamps, laid as a load under a stated submit bound
+    /// lays them (`Serve::lay_stamps`).
+    pub fn stamps(&self) -> <crate::backend::Api as engine_gpu::serve::Serve>::Stamps {
+        <crate::backend::Api as engine_gpu::serve::Serve>::lay_stamps(&self.device, 1)
+            .expect("the timestamps lay")
+    }
+
+    /// `f` walked into a step's timed frame writing `stamps`, as a serving
+    /// step walks under a stated submit bound (`Serve::walk_frame`), kept
+    /// to replay where `keep`, committed as a step is, and its device time
+    /// as the backend reads it once it lands (`crate::backend::fired_time`),
+    /// ns: `None` where the backend reads none.
+    pub fn fired(
+        &self,
+        stamps: &<crate::backend::Api as engine_gpu::serve::Serve>::Stamps,
+        keep: bool,
+        f: impl FnOnce(&Sink<'_>) -> Result<(), kernels_slang::Error>,
+    ) -> Option<u64> {
+        let frame = <crate::backend::Api as engine_gpu::serve::Serve>::walk_frame(
+            &self.device,
+            keep,
+            Some(stamps),
+        )
+        .expect("a timed frame");
+        {
+            let sink = Sink::new(&self.device, &frame, &self.pipelines, &self.handles);
+            f(&sink).expect("the kernel fires");
+        }
+        crate::backend::fired_time(frame, keep)
     }
 
     pub fn down(&self, handle: u32, n: usize) -> Vec<f32> {

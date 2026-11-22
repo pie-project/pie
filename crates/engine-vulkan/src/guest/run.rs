@@ -74,11 +74,15 @@ impl<'a> OnDevice<'a> {
             .copied()
     }
 
-    /// Records the pass into a frame of its own for the caller to submit,
-    /// instead of running each stage to completion.
+    /// Records the pass for the caller to submit, instead of running each
+    /// stage to completion: into `frame`, which the step's earlier passes
+    /// recorded into, or a frame of its own.
     #[must_use]
-    pub fn deferred(mut self) -> OnDevice<'a> {
-        self.deferral = Some(Deferral::default());
+    pub fn deferred(mut self, frame: Option<Frame>) -> OnDevice<'a> {
+        self.deferral = Some(Deferral {
+            frame,
+            ..Deferral::default()
+        });
         self
     }
 
@@ -112,25 +116,8 @@ impl<'a> OnDevice<'a> {
             });
         }
         // The pass's berth: each root the host may stage, its status, and
-        // each value the host may read back.
-        let mut staged = Vec::new();
-        for &global in roots {
-            if package.values[global as usize].source != ValueOrigin::Output
-                && let Some(local) = local_of(package, at, global)?
-                && !staged.contains(&local)
-            {
-                staged.push(local);
-            }
-        }
-        let mut read = Vec::new();
-        for &global in wanted {
-            if let Some(local) = local_of(package, at, global)?
-                && !read.contains(&local)
-            {
-                read.push(local);
-            }
-        }
-        let mut pass = self.session.pass(at, &staged, &read)?;
+        // each value the host may read back, each laid once.
+        let mut pass = self.session.pass(package, at, roots, wanted)?;
         let mut frame = match self.deferral.as_mut().and_then(|d| d.frame.take()) {
             Some(frame) => frame,
             None => self.device.frame()?,

@@ -240,6 +240,9 @@ struct Split {
     layer: Option<u32>,
     step: Option<engine::StepDone>,
     since: std::time::Instant,
+    /// The layers a submission takes, and the layers begun since the last.
+    each: u32,
+    begun: u32,
 }
 
 pub struct Run<'c, B: Backend> {
@@ -292,6 +295,11 @@ pub struct Run<'c, B: Backend> {
     /// The layer whose work the frame holds unsubmitted, when the step is
     /// submitted a layer at a time.
     split: Option<Split>,
+
+    /// The kernels the walk picked, by class (a dense matmul at its rows,
+    /// attention, its tile or its walk), each once: what a step's line says
+    /// it ran ([`Run::take_picks`]).
+    picks: std::cell::RefCell<std::collections::BTreeSet<String>>,
 
     /// The highest kernels-slang tier the adapter runs, where the backend's
     /// tactics read it.
@@ -353,6 +361,7 @@ impl<'c, B: Backend> Run<'c, B> {
             hashes,
             tuning,
             split: None,
+            picks: std::cell::RefCell::new(std::collections::BTreeSet::new()),
             tier,
             dense,
         }
@@ -367,12 +376,15 @@ impl<'c, B: Backend> Run<'c, B> {
         self.dense
     }
 
-    /// Submits the frame each time a node of a new layer has run.
-    pub fn flush_between_layers(&mut self, step: Option<engine::StepDone>) {
+    /// Submits the frame each time a node of a new layer has run past
+    /// every `each` layers (`crate::submit::pack_layers`).
+    pub fn flush_between_layers(&mut self, step: Option<engine::StepDone>, each: u32) {
         self.split = Some(Split {
             layer: None,
             step,
             since: std::time::Instant::now(),
+            each: each.max(1),
+            begun: 0,
         });
     }
 
@@ -392,7 +404,12 @@ impl<'c, B: Backend> Run<'c, B> {
             }
             return;
         };
-        if let Some(held) = split.layer.filter(|&held| held != layer) {
+        if let Some(held) = split.layer.filter(|&held| held != layer)
+            && {
+                split.begun += 1;
+                split.begun % split.each == 0
+            }
+        {
             let at = std::time::Instant::now();
             let flushed = B::submit_recording();
             let done = std::time::Instant::now();
@@ -1081,6 +1098,20 @@ impl<'c, B: Backend> Run<'c, B> {
 
     /// The host steps of the expert stages this walk made, in order: one
     /// for each segment a kept frame's flushes cut.
+    /// The walk picked `what` (a kernel by class).
+    pub fn pick(&self, what: impl FnOnce() -> String) {
+        if self.ctx.naming().is_none() {
+            self.picks.borrow_mut().insert(what());
+        }
+    }
+
+    /// The kernels the walk picked so far, by class, each once.
+    pub fn take_picks(&self) -> Vec<String> {
+        std::mem::take(&mut *self.picks.borrow_mut())
+            .into_iter()
+            .collect()
+    }
+
     pub fn take_cuts(&self) -> Vec<crate::store::experts::Cut<B>> {
         std::mem::take(&mut self.staged_layer.borrow_mut().cuts)
     }

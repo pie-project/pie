@@ -696,7 +696,6 @@ impl Rig {
     pub fn bind(&mut self, program: ProgramId, channels: Vec<ChannelId>, rows: u32) -> InstanceId {
         self.engine
             .bind_instance(&InstanceBinding {
-                resident: Default::default(),
                 program,
                 channels,
                 seeds: Vec::new(),

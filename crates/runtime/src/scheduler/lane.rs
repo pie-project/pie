@@ -16,7 +16,40 @@ use crate::store::roles::Pump;
 
 use super::worker::{BindRespond, HostKvOp, PoolOp, PreLaunchCopy, QueuedItem};
 
-pub(super) type LaunchResult = std::result::Result<SubmissionCompletion, String>;
+pub(super) type LaunchResult = std::result::Result<SubmissionCompletion, LaunchRefusal>;
+
+/// A launch the lane did not fire: why, and, where the engine refused it
+/// for where state lies (`engine::Error::Placement`), the logical chunks
+/// it named: nothing was read or written, the runtime moves that state and
+/// fires the launch again, failing no lane.
+#[derive(Debug, Clone)]
+pub(super) struct LaunchRefusal {
+    pub(super) message: String,
+    pub(super) placement: Vec<u32>,
+}
+
+impl std::fmt::Display for LaunchRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::ops::Deref for LaunchRefusal {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.message
+    }
+}
+
+impl From<String> for LaunchRefusal {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            placement: Vec::new(),
+        }
+    }
+}
 
 type LaunchReplyTx = tokio::sync::oneshot::Sender<LaunchResult>;
 
@@ -418,6 +451,69 @@ fn strip_members(
     fire.instances = instances;
 }
 
+/// What each engine's lane is in now, and since when: a stall dump names
+/// the call a lane is held in (its controls posted and unanswered behind
+/// it), never only that they are unanswered.
+static LANE_NOW: std::sync::Mutex<
+    std::collections::BTreeMap<usize, (std::borrow::Cow<'static, str>, Instant)>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// The call engine `engine`'s lane is in, said.
+pub(super) fn lane_now(engine: usize) -> String {
+    match LANE_NOW.lock().unwrap().get(&engine) {
+        Some((what, since)) => format!("lane: in {what} for {:?}", since.elapsed()),
+        None => "lane: waiting for work".to_string(),
+    }
+}
+
+/// The lane is in `what` until this drops.
+struct InCall(usize);
+
+impl InCall {
+    fn new(engine: usize, what: std::borrow::Cow<'static, str>) -> Self {
+        LANE_NOW
+            .lock()
+            .unwrap()
+            .insert(engine, (what, Instant::now()));
+        Self(engine)
+    }
+}
+
+impl Drop for InCall {
+    fn drop(&mut self) {
+        LANE_NOW.lock().unwrap().remove(&self.0);
+    }
+}
+
+/// A control item's call, said.
+fn control_call(item: &QueuedItem) -> std::borrow::Cow<'static, str> {
+    match item {
+        QueuedItem::CopyTracked { plan, .. } | QueuedItem::PreLaunchCopy { plan, .. } => {
+            format!("{} ({})", plan.label(), plan.describe()).into()
+        }
+        QueuedItem::Pool { op, .. } => format!("a pool op {}", op.name()).into(),
+        _ => "a control".into(),
+    }
+}
+
+/// Settles the completion of copy `token` as the engine told it ended:
+/// landed, or failed, never counted as landed (its destination is not to
+/// be trusted, its sources hold what they held).
+fn tell_landing(
+    broker: &crate::engine::CompletionBroker,
+    engine_idx: usize,
+    token: u64,
+    landing: ::engine::Landing,
+) {
+    match landing {
+        ::engine::Landing::Landed => broker.notify(token, waker::FIRST_COMPLETION_EPOCH),
+        ::engine::Landing::Failed(why) => {
+            tracing::warn!(engine_idx, token, %why, "a tier copy failed to land");
+            broker.fail(token, waker::FIRST_COMPLETION_EPOCH, why);
+        }
+    }
+}
+
 fn backend(engine: &mut Option<EngineBox>) -> Result<&mut EngineBox> {
     engine.as_mut().ok_or_else(|| anyhow!(NO_BACKEND))
 }
@@ -425,7 +521,7 @@ fn backend(engine: &mut Option<EngineBox>) -> Result<&mut EngineBox> {
 fn fail_request(request: LaneRequest, why: &str) {
     match request {
         LaneRequest::Launch { reply, .. } => {
-            let _ = reply.send(Err(why.to_string()));
+            let _ = reply.send(Err(why.to_string().into()));
         }
         LaneRequest::Control { item, reply } => {
             match &*item {
@@ -651,8 +747,11 @@ impl Lane {
             // A copy still landing settles its tracked completion here: the
             // runtime gives its source slots back only then.
             let landed = broker.clone();
-            engine.on_landed(std::sync::Arc::new(move |token: u64| {
-                landed.notify(token, waker::FIRST_COMPLETION_EPOCH);
+            engine.on_landed(std::sync::Arc::new(move |token: u64, landing: ::engine::Landing| {
+                // A copy that failed leaves its data at its source: its
+                // completion settles failed, never landed, and the move
+                // waiting on it is taken back (`planner::exec`).
+                tell_landing(&landed, engine_idx, token, landing);
                 // The scheduler retires the copy's completion on its next
                 // turn: woken now, not at its idle backstop, so the move
                 // waiting on it commits (and its pages come back) at once.
@@ -738,7 +837,9 @@ impl Lane {
                     reply,
                     ..
                 } => {
+                    let _in = InCall::new(engine_idx, "a frame's fire".into());
                     let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let mut placement = Vec::new();
                         let fault = past_rung(
                             crate::store::shared::engine_rows(engine_idx),
                             &frame,
@@ -748,7 +849,7 @@ impl Lane {
                             // A fire wider than the rung the engine holds,
                             // or naming a slot nobody was handed, is refused
                             // before the engine reads it.
-                            _ if fault.is_some() => Err(fault.unwrap_or_default()),
+                            _ if fault.is_some() => Err(fault.unwrap_or_default().into()),
                             Some(engine) => {
                                 crate::probe_fire!(stats.fire.execute.engine_fire_us, {
                                     Self::fire_frame(
@@ -763,12 +864,20 @@ impl Lane {
                                         &settlements,
                                         &inline_faults,
                                         &mut landed_instances,
+                                        &mut placement,
                                     )
                                 })
+                                .map_err(|message| LaunchRefusal {
+                                    message,
+                                    placement: std::mem::take(&mut placement),
+                                })
                             }
-                            None => Err(NO_BACKEND.to_string()),
+                            None => Err(NO_BACKEND.to_string().into()),
                         };
-                        if result.is_err() {
+                        // Refused for where state lies, nothing was read or
+                        // written: its fires are fired again once the state
+                        // moves, so none of their cells is failed.
+                        if result.as_ref().is_err_and(|refusal| refusal.placement.is_empty()) {
                             let cells: Vec<_> = frame.terminal_cells().collect();
                             crate::engine::completion::settle(
                                 &cells,
@@ -778,10 +887,11 @@ impl Lane {
                         result
                     }));
                     let panicked = served.is_err();
-                    let _ = reply.send(served.unwrap_or_else(|_| Err(LANE_PANICKED.to_string())));
+                    let _ = reply.send(served.unwrap_or_else(|_| Err(LANE_PANICKED.to_string().into())));
                     panicked
                 }
                 LaneRequest::Control { item, reply } => {
+                    let _in = InCall::new(engine_idx, control_call(&item));
                     let on_panic = Self::commit_on_failure(&item, LANE_PANICKED);
                     let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         Self::execute_control(
@@ -921,6 +1031,7 @@ impl Lane {
         settlements: &std::sync::Arc<crate::engine::completion::FrameSettlements>,
         inline_faults: &InlineFaults,
         landed: &mut HashMap<::engine::FrameId, Vec<LandingReads>>,
+        placement: &mut Vec<u32>,
     ) -> std::result::Result<SubmissionCompletion, String> {
         use crate::engine::completion;
 
@@ -1017,8 +1128,14 @@ impl Lane {
                 }
                 Err(error) => {
                     let_go(&reads);
-                    if matches!(error, ::engine::Error::Impossible(_)) {
+                    if matches!(
+                        error,
+                        ::engine::Error::Impossible(_) | ::engine::Error::Placement { .. }
+                    ) {
                         crate::store::shared::programs::impossible_submission(engine_idx, &error);
+                    }
+                    if let ::engine::Error::Placement { chunks, .. } = &error {
+                        placement.extend_from_slice(chunks);
                     }
                     return Err(format!("{error}"));
                 }
@@ -1280,6 +1397,10 @@ impl Lane {
                     &bind.binding,
                     |id| channels.engine_registered(id) || held.contains(&id),
                     pipeline_id,
+                    |pid| {
+                        crate::planner::planner_for(0, engine_idx)
+                            .is_none_or(|planner| planner.is_resident(pid))
+                    },
                 )
                 .and_then(|taken| {
                     match crate::store::roles::take_rings(roles.as_ref(), &mut **engine, &plans) {
@@ -1786,8 +1907,8 @@ mod landing_tests {
             tokens: Arc::clone(&tokens),
         };
         let told = broker.clone();
-        engine.on_landed(Arc::new(move |token| {
-            told.notify(token, waker::FIRST_COMPLETION_EPOCH);
+        engine.on_landed(Arc::new(move |token, landing| {
+            tell_landing(&told, 0, token, landing);
         }));
         (Box::new(engine), tokens, sink)
     }
@@ -1808,12 +1929,34 @@ mod landing_tests {
         let token = tokens.lock().unwrap()[0];
         let sink = sink.lock().unwrap().clone().expect("the lane gave a sink");
         assert!(!completion.is_settled());
-        sink(token);
+        sink(token, ::engine::Landing::Landed);
         assert!(
             completion.is_settled(),
             "told landed, the copy's sources may go back"
         );
         assert!(completion.check().is_some_and(|settled| settled.is_ok()));
+    }
+
+    /// A copy told failed (`engine::Landing::Failed`) settles failed by
+    /// name, never as landed: what waits on it takes its move back from the
+    /// sources, which hold what they held.
+    #[test]
+    fn a_copy_told_failed_never_settles_as_landed() {
+        let broker = crate::engine::CompletionBroker::new();
+        let (mut late, tokens, sink) = engine(false, &broker);
+        let completion =
+            copy_settled_on_landing(&mut late, &broker, park()).expect("the copy is taken");
+        let token = tokens.lock().unwrap()[0];
+        let sink = sink.lock().unwrap().clone().expect("the lane gave a sink");
+        sink(token, ::engine::Landing::Failed("event faulted".into()));
+        let settled = completion.check().expect("settled");
+        let error = settled.expect_err("failed, not landed");
+        assert!(
+            error
+                .downcast_ref::<crate::engine::completion::CopyLandingFailed>()
+                .is_some(),
+            "{error:#}"
+        );
     }
 
     /// An engine whose copies land inside the call settles at once, as

@@ -529,6 +529,14 @@ impl Elastic {
         self.top.iter().flatten().map(|chunk| chunk.bytes).sum()
     }
 
+    /// The bytes of the heaps kept spare for the top (`back_whole_top`, and
+    /// those a narrowing emptied): made, so the device holds them, but
+    /// mapped under no tile until the top's next map takes them back.
+    #[must_use]
+    pub fn spare_held(&self) -> u64 {
+        self.spare.iter().map(|spare| spare.chunk.bytes).sum()
+    }
+
     /// Where the top's mapped run to its end starts: its end where none is
     /// mapped. A low heap held for the bottom ([`Elastic::hold_low`]) below
     /// an unmapped one is the bottom's, not the run's.
@@ -1011,6 +1019,22 @@ impl Elastic {
         self.walk_spans(offset, bytes, |span, _, take| {
             // SAFETY: `host_span` returned `take` writable bytes there.
             unsafe { std::ptr::write_bytes(span.as_ptr(), 0, usize_of(take)) };
+            Ok(())
+        })
+    }
+
+    /// Test builds (`test-slot-fill`): `bytes` from `offset` set to 0xFF (NaN in
+    /// every float width), so a kernel that reads a cell nothing wrote fails the test
+    /// that reads it rather than finding a zero.
+    ///
+    /// # Safety
+    ///
+    /// As [`zero`](Self::zero).
+    #[cfg(feature = "test-slot-fill")]
+    pub unsafe fn poison(&self, offset: u64, bytes: u64) -> Result<()> {
+        self.walk_spans(offset, bytes, |span, _, take| {
+            // SAFETY: `host_span` returned `take` writable bytes there.
+            unsafe { std::ptr::write_bytes(span.as_ptr(), 0xff, usize_of(take)) };
             Ok(())
         })
     }

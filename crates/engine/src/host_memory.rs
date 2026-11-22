@@ -16,11 +16,15 @@
 //!
 //! A reading that cannot be taken is refused by name: no `MemAvailable`,
 //! or a group whose `memory.max` or `memory.current` cannot be read as a
-//! number.
+//! number. `/proc/meminfo` and cgroups are Linux's (and Android's); on
+//! another platform the reading is refused by name, and a load states its
+//! host budget instead.
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use std::path::{Path, PathBuf};
 
 /// Where the cgroup v2 hierarchy is mounted.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
 /// What the host had available to the process when read.
@@ -49,6 +53,7 @@ impl Available {
 /// # Errors
 ///
 /// Names the reading that could not be taken.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn available() -> Result<Available, String> {
     let meminfo =
         std::fs::read_to_string("/proc/meminfo").map_err(|e| format!("/proc/meminfo: {e}"))?;
@@ -59,6 +64,16 @@ pub fn available() -> Result<Available, String> {
     })
 }
 
+/// What the host has available to the process: not read on this platform.
+///
+/// # Errors
+///
+/// Always: the reading is `/proc/meminfo`'s and the cgroups', Linux's.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub fn available() -> Result<Available, String> {
+    Err("host memory isn't read on this platform; state budget_host".to_string())
+}
+
 /// What `/proc/meminfo`'s text and the cgroups under `root` leave the
 /// process whose `/proc/self/cgroup` reads `own`, each group's files read
 /// through `read` (an absent file is a group that states nothing).
@@ -66,6 +81,7 @@ pub fn available() -> Result<Available, String> {
 /// # Errors
 ///
 /// Names the reading that could not be taken.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn available_of(
     meminfo: &str,
     own: Option<&str>,
@@ -81,6 +97,7 @@ pub fn available_of(
 }
 
 /// `MemAvailable` in bytes, from `/proc/meminfo`'s text.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn mem_available(meminfo: &str) -> Option<u64> {
     meminfo.lines().find_map(|line| {
         let rest = line.strip_prefix("MemAvailable:")?;
@@ -91,6 +108,7 @@ fn mem_available(meminfo: &str) -> Option<u64> {
 
 /// The least any capped cgroup v2 ancestor leaves, walking from the group
 /// `own` names up to `root`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn cgroup_room(
     own: Option<&str>,
     root: &Path,
@@ -113,6 +131,7 @@ fn cgroup_room(
 }
 
 /// What the group at `dir` leaves: `None` where it states no limit.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn group_room(
     dir: &Path,
     read: &impl Fn(&Path) -> std::io::Result<String>,
@@ -166,7 +185,7 @@ fn group_room(
     ))
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 mod tests {
     use super::*;
     use std::collections::HashMap;

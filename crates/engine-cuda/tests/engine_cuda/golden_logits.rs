@@ -475,6 +475,79 @@ fn load_under(
     .map_err(|why| why.to_string())
 }
 
+/// A load of `fixture` under `allowance` at the model's declared context
+/// `declared`: the load serves it as long as its room holds.
+fn load_declared(
+    fixture: &Fixture,
+    cache: &Path,
+    allowance: engine::Allowance,
+    declared: u32,
+) -> Result<Shell, String> {
+    Shell::load(Boot {
+        trace: fixture.trace.clone(),
+        contract: &fixture.contract,
+        checkpoint: &fixture.container,
+        budget: Budget::new(1, TOKENS),
+        patches: None,
+        voxels: None,
+        page_size: PAGE,
+        context: declared,
+        slots: 1,
+        kv_budget: None,
+        allowance,
+        context_declared: true,
+        ordinal: 0,
+        knobs: knobs(),
+        cache_dir: Some(cache),
+        runahead: engine::runahead::Runahead::F1,
+        residency: engine_cuda::experts::Plan::default(),
+        world: engine_cuda::World::default(),
+        expert: engine_cuda::World::default(),
+        comm: core::ptr::null_mut(),
+    })
+    .map_err(|why| why.to_string())
+}
+
+/// A declared context is cut to the room the load's own room line leaves,
+/// past this process's context and modules: under budgets from where the
+/// modules leave no sequence a room to where they leave a long one, a load
+/// serves the declared context cut to what it seats, or refuses the card by
+/// name, never faulting on residency.
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn a_declared_context_is_cut_to_the_room_past_the_modules() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    const DECLARED: u32 = 1 << 24;
+    let cache = cache_dir();
+    let model = buffered_model();
+    let fixture = fixture(&model, &cache);
+    let mut served = 0;
+    for mib in (512u64..=2048).step_by(128) {
+        let allowance = engine::Allowance {
+            budget: Some(mib << 20),
+        };
+        match load_declared(&fixture, &cache, allowance, DECLARED) {
+            Ok(shell) => {
+                let context = shell.paging().context();
+                println!("budget {mib} MiB: serves {context} of {DECLARED} tokens");
+                assert!(context <= DECLARED);
+                served += 1;
+            }
+            Err(why) => {
+                println!("budget {mib} MiB: refused: {why}");
+                assert!(
+                    !why.starts_with("weight residency"),
+                    "under {mib} MiB the declared context faulted on residency: {why}"
+                );
+            }
+        }
+    }
+    assert!(served > 0, "no budget served the declared context cut to its room");
+}
+
 /// The load's knobs: `PIE_GOLDEN_CHUNK` (bytes) sets the chunk size the
 /// state pool aims near, so a miniature's records are cut into pieces as a
 /// full model's are. The logits are the same either way.
@@ -957,6 +1030,8 @@ fn served_offloaded(fixture: &Fixture, cache: &Path, offload: bool) -> Vec<(u64,
             Some(256 << 20),
             Some(dir.path()),
             false,
+            1,
+            1,
             engine_cuda::World::default(),
         )
         .expect("the disk tier seats");
@@ -1175,6 +1250,8 @@ fn tier_round_trip(model: &str, cache: &Path) -> Vec<(String, u64)> {
             Some(budget),
             Some(dir.path()),
             false,
+            1,
+            1,
             engine_cuda::World::default(),
         )
         .expect("the disk tier seats");
@@ -2994,6 +3071,57 @@ fn golden_held_small() {
             hash(&small),
             hash(&host),
             "{model} told its weights are held in a pool too small for them"
+        );
+    }
+}
+
+/// A measuring load ends with the pool a recorded one has: `PIE_GOLDEN_MODELS`
+/// (MoE miniatures the pool seats whole), each loaded told its weights are
+/// held (the load seats them in the pool ahead of the runtime) twice
+/// against a cache of its own, first with no record of what its bodies take
+/// (it arms them over the least range, measures them, and fits again: on a
+/// flat range, one allocation, it reserves the range anew where the card
+/// backs more), then from the record that load saved. The first's pool
+/// holds every chunk the second's does, less the chunks its first arming's
+/// bodies took (the runtime's graph memory may hold them still).
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_measuring_refit() {
+    let cache = cache_dir();
+    let models = std::env::var("PIE_GOLDEN_MODELS")
+        .expect("PIE_GOLDEN_MODELS names the MoE miniatures to load");
+    for model in models.split(',').map(str::trim).filter(|m| !m.is_empty()) {
+        let fixture = fixture(model, &cache);
+        // A cache of its own: no record of the bodies; the profiles shared.
+        let own = cache.join(format!("measuring-{}-{model}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&own);
+        std::fs::create_dir_all(&own).unwrap_or_else(|why| panic!("{}: {why}", own.display()));
+        let told = || {
+            let mut knobs = knobs();
+            knobs.dense_weights = false;
+            knobs.weights_held = true;
+            knobs
+        };
+        let (measured, took, chunk) = {
+            let mut shell = load_with(&fixture, &own, told());
+            let facts = shell.chunk_facts().expect("the pool states its chunks");
+            (facts.total_chunks, shell.bodies_took(), facts.chunk_bytes)
+        };
+        let recorded = {
+            let mut shell = load_with(&fixture, &own, told());
+            shell.chunk_facts().expect("the pool states its chunks").total_chunks
+        };
+        let _ = std::fs::remove_dir_all(&own);
+        let slack = u32::try_from(took.div_ceil(chunk.max(1))).unwrap_or(u32::MAX);
+        println!(
+            "measuring {model}: {measured} chunks measuring, {recorded} from the record \
+             (its bodies took {} MiB, {slack} chunk(s))",
+            took >> 20
+        );
+        assert!(
+            measured.saturating_add(slack) >= recorded,
+            "{model}: a measuring load's pool holds {measured} chunks and a recorded one's \
+             {recorded}, more apart than the {slack} chunk(s) its first arming's bodies took"
         );
     }
 }

@@ -63,14 +63,6 @@ pub(crate) fn notify_process_suspend(pid: ProcessId) {
     broadcast(|| SchedulerItem::PipelineLeave(pid, Some(pid), LeaveKind::Suspend, None));
 }
 
-/// `pid` waits on something the frame's firing would free: no frame on
-/// `engine` waits on its lanes until its next submit.
-pub(crate) fn notify_owner_waits(engine: usize, pid: ProcessId) {
-    if let Ok(handle) = crate::scheduler::scheduler_handle(engine) {
-        let _ = handle.send(SchedulerItem::OwnerWaits(pid));
-    }
-}
-
 /// `pid` is blocked on the planner or a store (a grant, its restore, room
 /// for a bind, a segment, a fire span, a rung): until it is through it
 /// submits nothing, so no frame on any engine waits on its lanes, and its
@@ -91,6 +83,13 @@ pub(crate) fn notify_owner_unblocked(pid: ProcessId) {
 /// The owners told blocked, in order; for a test.
 #[cfg(test)]
 pub(crate) static OWNERS_BLOCKED: std::sync::Mutex<Vec<ProcessId>> = std::sync::Mutex::new(Vec::new());
+
+/// `pid`'s guest waits on input from outside the runtime (a session
+/// receive, a timer, an HTTP response): no frame on any engine waits on its
+/// lanes until each submits again.
+pub(crate) fn notify_owner_away(pid: ProcessId) {
+    broadcast(|| SchedulerItem::OwnerAway(pid));
+}
 
 pub(crate) fn notify_process_resume(pid: ProcessId) {
     broadcast(|| SchedulerItem::ProcessResume(pid));
@@ -318,6 +317,10 @@ enum SchedulerItem {
     OwnerWaits(ProcessId),
     /// The owner's wait on the planner or a store ended.
     OwnerUnblocked(ProcessId),
+    /// The process's guest waits on outside input: its lanes go out of the
+    /// frame until each submits again
+    /// ([`super::frame::FramePolicy::on_owner_away`]).
+    OwnerAway(ProcessId),
     FrameTruncate {
         lane: ProcessId,
         seq: u64,
@@ -340,6 +343,19 @@ enum SchedulerItem {
         response: tokio::sync::oneshot::Sender<Result<()>>,
     },
     Stop,
+}
+
+/// The rows a frame may seal at: the fire cap, or, until the scheduler has
+/// granted the walk that cap (`granted`), the rung the engine still holds
+/// (`held`) where frames queued wider (`queued`) were cut under it. Frames
+/// cut before the cap came down go; the grant, and the rung's lower after
+/// it, wait for them.
+pub(super) fn seal_rows(cap: u32, held: u32, granted: Option<u32>, queued: usize) -> usize {
+    let cap = cap as usize;
+    if granted == Some(cap as u32) || queued <= cap {
+        return cap;
+    }
+    queued.min(held as usize).max(cap)
 }
 
 /// A change to how much of the pool has memory under it.
@@ -369,6 +385,22 @@ pub(crate) enum PoolOp {
     /// what an aborted move waits for before it gives back slots a copy may
     /// still be writing.
     SettleCopies,
+}
+
+impl PoolOp {
+    /// Its name, as a stall dump says the call a lane is in.
+    pub(crate) const fn name(&self) -> &'static str {
+        match self {
+            Self::CommitSegments(_) => "commit segments",
+            Self::ReleaseSegments(_) => "release segments",
+            Self::Rung { .. } => "set rung",
+            Self::CommitSpan(_) => "commit span",
+            Self::ReleaseSpan(_) => "release span",
+            Self::Evacuate(_) => "evacuate",
+            Self::Rebind(_) => "rebind",
+            Self::SettleCopies => "settle copies (waits every copy landed)",
+        }
+    }
 }
 
 /// A read or write of host kv slots' bytes, behind every copy queued before
@@ -459,7 +491,7 @@ impl std::future::Future for ReplyWait {
         match self.get_mut() {
             ReplyWait::Launch(reply) => std::pin::Pin::new(reply).poll(cx).map(|answer| {
                 LaneReply::Launch(answer.unwrap_or_else(|_| {
-                    Err("the engine lane dropped this launch unanswered".to_string())
+                    Err("the engine lane dropped this launch unanswered".to_string().into())
                 }))
             }),
             ReplyWait::Control { id, reply } => {
@@ -488,6 +520,28 @@ pub(crate) enum PreLaunchCopy {
 }
 
 impl PreLaunchCopy {
+    /// What the copy moves, between which tiers: what a stall dump names
+    /// an unsettled copy by.
+    pub(super) fn describe(&self) -> String {
+        match self {
+            Self::Kv(copy) => format!(
+                "kv {:?}->{:?} {} pages",
+                copy.src,
+                copy.dst,
+                copy.src_page_ids.len().max(copy.moves.len())
+            ),
+            Self::State(_) => "recurrent state".to_string(),
+            Self::Slots(copy) => format!(
+                "shape {} {:?}->{:?} {} slots {} runs",
+                copy.shape.0,
+                copy.src,
+                copy.dst,
+                copy.slots.len(),
+                copy.runs.len()
+            ),
+        }
+    }
+
     pub(super) fn label(&self) -> &'static str {
         match self {
             Self::Kv(_) => "KV copy",
@@ -656,6 +710,8 @@ impl RowCount {
 pub(super) struct QueuedLaunch {
     fire_id: u64,
     framed: bool,
+    /// Fired in a batch of its own ([`HeldForPlacement::solo`]).
+    solo: bool,
     request: Box<PendingRequest>,
 }
 
@@ -664,6 +720,7 @@ impl QueuedLaunch {
         Self {
             fire_id: request.logical_fire_id,
             framed: request.frame.is_some(),
+            solo: false,
             request,
         }
     }
@@ -702,6 +759,22 @@ struct PendingLaunchBatch {
     /// What the batch takes of its rung: its tokens, or the recurrent rows
     /// its requests carry where they are more.
     rung_rows: usize,
+    /// Where the engine refused it for where state lies
+    /// (`engine::Error::Placement`), the logical chunks it named.
+    placement: Vec<u32>,
+}
+
+/// Fires of a batch the engine refused for where state lies, held until
+/// the pool has moved that state down ([`crate::store::shared::evacuate_refused`]),
+/// then fired again; none fails for it.
+struct HeldForPlacement {
+    chunks: Vec<u32>,
+    requests: Vec<Box<PendingRequest>>,
+    /// Fired again one by one: refused again after the move landed, so
+    /// only the fires the engine still refuses alone fail.
+    solo: bool,
+    /// The planner was asked for the free chunks its move lacks.
+    funding: bool,
 }
 
 enum ControlSlotState {
@@ -718,6 +791,10 @@ struct PendingControl {
     operation: &'static str,
     holds_launches: bool,
     prelaunch: bool,
+    /// What it moves, said by a stall dump (a copy's tiers and slots).
+    what: String,
+    /// When it was posted to the lane: how long a dump finds it unsettled.
+    since: crate::rt::Instant,
 }
 
 #[derive(Default)]
@@ -787,7 +864,12 @@ struct QueueScan {
     /// behind its copy.
     untracked: Vec<u64>,
     riding: HashSet<Option<ProcessId>>,
+    /// The pipelines with a framed launch queued: an unframed one behind it
+    /// does not ride ahead of it.
+    framed_ahead: HashSet<ProcessId>,
     drain_eligible: Vec<u64>,
+    /// The rider batch is one fire fired alone ([`QueuedLaunch::solo`]).
+    solo: bool,
 }
 
 impl QueueScan {
@@ -796,6 +878,8 @@ impl QueueScan {
         self.blocked_lanes.clear();
         self.untracked.clear();
         self.riding.clear();
+        self.framed_ahead.clear();
+        self.solo = false;
         self.drain_eligible.clear();
     }
 }
@@ -1510,6 +1594,8 @@ impl BatchScheduler {
         let mut slot_buffer = SlotBuffer::new();
         let mut terminated_processes: HashSet<ProcessId> = HashSet::new();
         let mut in_flight_launches = VecDeque::new();
+        let mut held_for_placement: Vec<HeldForPlacement> = Vec::new();
+        let mut refused_once: HashSet<u32> = HashSet::new();
         let mut batch_want = BatchWant::default();
         let mut row_count = RowCount::default();
         let mut in_flight_control = InFlightControls::default();
@@ -1525,6 +1611,12 @@ impl BatchScheduler {
             .preload_free_slots(crate::inferlet::process::execution_slot_capacity().unwrap_or(0));
         let mut stall_since: Option<crate::rt::Instant> = None;
         let mut stall_dumps: u32 = 0;
+        // The cap the scheduler last told the walk it holds nothing wider
+        // than ([`crate::store::shared::grant_rung`]), and what was said of
+        // frames held under the cap.
+        let mut granted_cap: Option<u32> = None;
+        let mut held_cap_said: Option<u32> = None;
+        let mut owed_said = 0usize;
 
         loop {
             let mut progress = false;
@@ -1560,7 +1652,11 @@ impl BatchScheduler {
                 &mut instances,
                 &stats,
                 &mut frame_policy,
+                &mut held_for_placement,
+                &mut refused_once,
+                engine_id,
             );
+            progress |= Self::release_held(&mut held_for_placement, &mut pending, engine_id);
             progress |= Self::retire_ready_control(&mut in_flight_control);
             // A step's tokens stay within the pool's activation rung (SPEC
             // decision 6): smaller while the system is critical.
@@ -1584,19 +1680,58 @@ impl BatchScheduler {
                 limits.max_forward_tokens,
             );
             let cap = crate::store::shared::fire_cap(engine_id);
+            // A grant is of one cap: moved since, it is granted again.
+            if granted_cap.is_some_and(|granted| granted != cap) {
+                granted_cap = None;
+            }
             let mut stepped = limits;
-            stepped.max_forward_tokens = stepped.max_forward_tokens.min(cap as usize).max(1);
+            // Frames queued before the cap came down were cut at the rung
+            // the engine still holds: they seal under it, and the rung
+            // comes down once they have gone (the grant below waits on
+            // them). Capped there, a complete frame sat unsealed on a raise
+            // the pressure that lowered the cap could not fund (Mac's beam
+            // mix: the rung raised to 64, the cap lowered to 16 under frames
+            // cut at 64, nothing submitted for 25 minutes). Past the grant
+            // (none wider queued then), nothing wider seals: the rung may
+            // be coming down.
+            let seal = seal_rows(
+                cap,
+                crate::store::shared::engine_rows(engine_id),
+                granted_cap,
+                frame_policy.queued_widest(),
+            );
+            if seal > cap as usize && held_cap_said != Some(cap) {
+                held_cap_said = Some(cap);
+                tracing::info!(
+                    engine_id,
+                    cap,
+                    queued = frame_policy.queued_widest(),
+                    "the activation rung's cap came down under frames already cut wider: they \
+                     seal under the rung the engine holds, and the rung comes down once they \
+                     have gone"
+                );
+            }
+            stepped.max_forward_tokens = stepped.max_forward_tokens.min(seal).max(1);
             // No frame past the cap is sealed from here, and no unframed
             // launch past it posted (`post_frame` holds it): once none in
             // flight is either, nor a frame sealed before still to go, the
             // pool may lower its rung.
             frame_policy.cap_fires(stepped.max_forward_tokens);
+            // Nor while a complete frame cut wider than the cap waits
+            // unsealed (capped): lowered under it, the frame went only once
+            // raised again, a raise its owner's eviction could not fund
+            // while that eviction waited on the frame (Mac Pro at 2 GiB on
+            // 4cef0c7d3 and 6c21ebca3: capped frames, evictions waiting on
+            // them, the raise never served). Kept, the walk lifts the cap
+            // to the frame with no raise at all.
             if in_flight_launches
                 .iter()
                 .all(|batch| batch.rung_rows <= cap as usize)
                 && frame_policy.sealed_widest() <= cap as usize
+                && frame_policy.queued_widest() <= cap as usize
             {
                 crate::store::shared::grant_rung(engine_id, cap);
+                granted_cap = Some(cap);
             }
             let (dispatched, wait_hint) = Self::dispatch_ready_items(
                 &lane,
@@ -1617,6 +1752,19 @@ impl BatchScheduler {
             // owner is told, its walk raising the rung to them (a hold with
             // nothing in flight waited on a raise nothing asked for).
             let (owed, owed_by) = frame_policy.cut_owed_by();
+            // A frame queued wider after the lower was granted waits on a
+            // raise to it: said once a width, never silent.
+            if owed > 0 && owed_said != owed {
+                tracing::info!(
+                    engine_id,
+                    owed,
+                    cap,
+                    owner = ?owed_by,
+                    "a frame cut wider than the activation rung's cap waits unsealed for a raise \
+                     to it, asked of the cap's owner"
+                );
+            }
+            owed_said = owed;
             crate::store::shared::owe_cut_rows(
                 engine_id,
                 u32::try_from(owed).unwrap_or(u32::MAX),
@@ -1848,6 +1996,7 @@ impl BatchScheduler {
                                 "[pie-sched] engine {engine_id} stalled for {stalled_for:?} \
                                  (no progress, work queued or in flight); state:\n{}",
                                 Self::render_debug_dump(
+                                    engine_id,
                                     &pending,
                                     &in_flight_launches,
                                     &in_flight_control,
@@ -1884,6 +2033,7 @@ impl BatchScheduler {
 
     #[allow(clippy::too_many_arguments)]
     fn render_debug_dump(
+        engine_id: usize,
         pending: &VecDeque<QueuedItem>,
         in_flight_launches: &VecDeque<PendingLaunchBatch>,
         in_flight_control: &InFlightControls,
@@ -1942,17 +2092,28 @@ impl BatchScheduler {
         if in_flight_control.is_empty() {
             let _ = writeln!(out, "in_flight_control: none");
         }
+        // Where each control stands, by whose move it waits on: posted and
+        // unanswered, the lane has not taken it (it is in another call,
+        // said below); accepted and unsettled, the engine owes its landing
+        // (its copy pipeline: a staging ring, a tier write, an event).
         for control in in_flight_control.iter() {
+            let age = control.since.elapsed();
             let state = match &control.state {
-                ControlSlotState::Posted { id } => format!("posted(id={id})"),
-                ControlSlotState::Ready(c) => format!("settled={}", c.is_settled()),
+                ControlSlotState::Posted { id } => {
+                    format!("posted(id={id}) {age:?} ago, unanswered: the lane has not taken it")
+                }
+                ControlSlotState::Ready(c) if c.is_settled() => format!("settled {age:?} after posting"),
+                ControlSlotState::Ready(_) => {
+                    format!("accepted, unsettled {age:?} after posting: the engine owes its landing")
+                }
             };
             let _ = writeln!(
                 out,
-                "in_flight_control: {} pipeline {:?} {state}",
-                control.operation, control.pipeline_id,
+                "in_flight_control: {} ({}) pipeline {:?} {state}",
+                control.operation, control.what, control.pipeline_id,
             );
         }
+        let _ = writeln!(out, "{}", super::lane::lane_now(engine_id));
         let _ = write!(out, "{}", frame_policy.debug_summary());
         out
     }
@@ -2111,6 +2272,9 @@ impl BatchScheduler {
             }
             SchedulerItem::OwnerUnblocked(pid) => {
                 frame_policy.on_owner_unblocked(pid);
+            }
+            SchedulerItem::OwnerAway(pid) => {
+                frame_policy.on_owner_away(pid);
             }
             SchedulerItem::FrameTruncate {
                 lane,
@@ -2529,9 +2693,11 @@ impl BatchScheduler {
                     operation: plan.label(),
                     holds_launches,
                     prelaunch: true,
+                    what: plan.describe(),
+                    since: crate::rt::Instant::now(),
                 });
             }
-            QueuedItem::CopyTracked { completion, .. } => {
+            QueuedItem::CopyTracked { completion, plan } => {
                 in_flight_control.push(PendingControl {
                     state: ControlSlotState::Posted { id },
                     logical_completion: None,
@@ -2541,6 +2707,8 @@ impl BatchScheduler {
                     operation: "tracked KV copy",
                     holds_launches,
                     prelaunch: false,
+                    what: plan.describe(),
+                    since: crate::rt::Instant::now(),
                 });
             }
             _ => {}
@@ -2566,11 +2734,27 @@ impl BatchScheduler {
                     }
                     // A launch never overtakes a copy its pipeline queued
                     // ahead of it: the copy fills what the launch reads.
-                    let behind_copy = launch
-                        .pipeline_id
-                        .is_some_and(|pipeline| scan.blocked_lanes.contains(&pipeline));
+                    // Nor a framed launch its pipeline queued ahead of it:
+                    // what that fire writes (its kv, its rings), this one
+                    // reads. It rides once that one's frame has gone.
+                    let behind_copy = launch.pipeline_id.is_some_and(|pipeline| {
+                        scan.blocked_lanes.contains(&pipeline)
+                            || scan.framed_ahead.contains(&pipeline)
+                    });
                     if launch.framed {
                         scan.queued_ids.push(launch.fire_id);
+                        if let Some(pipeline) = launch.pipeline_id {
+                            scan.framed_ahead.insert(pipeline);
+                        }
+                    } else if launch.solo {
+                        // Fired alone: the first such, and with no rider.
+                        if !behind_copy && scan.untracked.is_empty() {
+                            scan.untracked.push(launch.fire_id);
+                            scan.riding.insert(None);
+                            scan.solo = true;
+                        }
+                    } else if scan.solo {
+                        // Behind a solo fire: the next batch.
                     } else if !behind_copy && scan.riding.insert(launch.pipeline_id) {
                         // Pieces of different prompts' passes (cut at their
                         // checkpoints) share a fire rather than taking one each.
@@ -2696,22 +2880,11 @@ impl BatchScheduler {
                         break;
                     }
                     FramePlan::Park => break,
-                    FramePlan::Terminate(doomed) => {
-                        for pid in doomed {
-                            let reason = super::frame::ABANDONED;
-                            tracing::error!(pid = %pid, "scheduler: terminating pipeline: {reason}");
-                            crate::inferlet::process::terminate_by(
-                                pid,
-                                Err(reason.to_string()),
-                                crate::policy::By::Host,
-                            );
-                        }
-                        continue;
-                    }
                 }
             };
             let (frame_progress, posted) = Self::post_frame(
                 slot_buffer,
+                frame_policy,
                 engine_loop,
                 replies,
                 instances,
@@ -2779,6 +2952,7 @@ impl BatchScheduler {
     )]
     fn post_frame(
         slot_buffer: &mut SlotBuffer,
+        frame_policy: &mut FramePolicy,
         engine_loop: &Lane,
         replies: &mut LaneReplies,
         instances: &mut HashMap<::engine::InstanceId, TrackedInstance>,
@@ -2852,6 +3026,26 @@ impl BatchScheduler {
                 progress = true;
             }
         }
+        // The device runs the waves in order, and a pipeline's fires in a
+        // wave in the order they stand: each pipeline's fires post in the
+        // order it submitted them, or the one out of order is refused.
+        for wave in &mut survivors {
+            wave.retain(|request| {
+                let Some(pipeline) = request.pipeline_id else {
+                    return true;
+                };
+                match frame_policy.admit_post(pipeline, request.logical_fire_id) {
+                    Ok(()) => true,
+                    Err(later) => {
+                        let reason = super::frame::out_of_order(pipeline, request.logical_fire_id, later);
+                        tracing::error!("{reason}");
+                        request.completion.reject_unsubmitted(reason);
+                        progress = true;
+                        false
+                    }
+                }
+            });
+        }
         if survivors.iter().all(Vec::is_empty) {
             return (progress, false);
         }
@@ -2882,15 +3076,78 @@ impl BatchScheduler {
             batch_size,
             total_tokens,
             rung_rows: total_tokens.max(carried),
+            placement: Vec::new(),
         });
         (true, true)
     }
 
+    /// Fires held for a refused chunk's move whose state has moved go
+    /// again, ahead of what is queued, as fires of their own (no frame):
+    /// their frame went when they were first sent.
+    fn release_held(
+        held: &mut Vec<HeldForPlacement>,
+        pending: &mut PendingQueue,
+        engine_id: EngineId,
+    ) -> bool {
+        let (ready, mut waiting): (Vec<_>, Vec<_>) = std::mem::take(held)
+            .into_iter()
+            .partition(|batch| !crate::store::shared::refusals_pending(engine_id, &batch.chunks));
+        // A move that found no free chunk below for some of its chunks is a
+        // need like any other: the planner is asked for that many free
+        // chunks, funded as a bind's room (idle cache, parked state down,
+        // residents moved), never a silent wait.
+        for batch in waiting.iter_mut().filter(|batch| !batch.funding) {
+            let stuck = crate::store::shared::refusals_stuck(engine_id, &batch.chunks);
+            let owner = batch.requests.iter().find_map(|request| request.process_id);
+            if stuck == 0 {
+                continue;
+            }
+            let Some(owner) = owner else {
+                continue;
+            };
+            let Some(planner) = crate::planner::planner_for(0, engine_id) else {
+                continue;
+            };
+            batch.funding = true;
+            tracing::debug!(
+                engine_id,
+                %owner,
+                stuck,
+                "scheduler: a refused chunk's move lacks free chunks below: the planner makes them"
+            );
+            crate::rt::spawn(async move {
+                if let Err(error) = planner.wait_bind_room(owner, 1, stuck).await {
+                    tracing::warn!(%owner, %error, "scheduler: the room for a refused chunk's move was refused");
+                }
+                crate::store::shared::ask_walk(engine_id);
+            });
+        }
+        *held = waiting;
+        if ready.is_empty() {
+            return false;
+        }
+        let mut items = std::mem::take(&mut pending.items);
+        for batch in ready.into_iter().rev() {
+            for mut request in batch.requests.into_iter().rev() {
+                request.frame = None;
+                let mut launch = QueuedLaunch::new(request);
+                launch.solo = batch.solo;
+                items.push_front(QueuedItem::Launch(launch));
+            }
+        }
+        pending.replace(items);
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn retire_ready_launches(
         in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
         instances: &mut HashMap<::engine::InstanceId, TrackedInstance>,
         stats: &Arc<SchedulerStats>,
         frame_policy: &mut FramePolicy,
+        held: &mut Vec<HeldForPlacement>,
+        refused_once: &mut HashSet<u32>,
+        engine_id: EngineId,
     ) -> bool {
         let mut progress = false;
         while let Some(front) = in_flight_launches.front() {
@@ -2930,6 +3187,43 @@ impl BatchScheduler {
                 }
             }
             if let Some(message) = launch_failure {
+                // Refused for where state lies: nothing was read or
+                // written. Its state moves down and its fires go again;
+                // none fails. Refused again for chunks already moved once,
+                // a runtime bug: said loudly, its fires go again one by
+                // one, and only one the engine still refuses alone fails.
+                if !retired.placement.is_empty() {
+                    let repeat = retired.placement.iter().all(|chunk| refused_once.contains(chunk));
+                    if !repeat || retired.requests.len() > 1 {
+                        if repeat {
+                            tracing::error!(
+                                engine_id,
+                                chunks = ?retired.placement,
+                                %message,
+                                lanes = retired.requests.len(),
+                                "scheduler: the engine refused chunks moved down for it already \
+                                 (a runtime bug): its fires go again one by one"
+                            );
+                        }
+                        refused_once.extend(retired.placement.iter().copied());
+                        crate::store::shared::evacuate_refused(engine_id, &retired.placement);
+                        held.push(HeldForPlacement {
+                            chunks: retired.placement,
+                            requests: retired.requests,
+                            solo: repeat,
+                            funding: false,
+                        });
+                        progress = true;
+                        continue;
+                    }
+                    tracing::error!(
+                        engine_id,
+                        chunks = ?retired.placement,
+                        %message,
+                        "scheduler: a fire refused alone for chunks moved down for it already \
+                         fails (a runtime bug)"
+                    );
+                }
                 let message = format!("direct launch rejected: {message}");
                 for request in &retired.requests {
                     request.completion.reject_unsubmitted(message.clone());
@@ -3026,8 +3320,9 @@ impl BatchScheduler {
                 }
                 batch.state = LaunchState::Accepted(completion);
             }
-            Err(message) => {
-                batch.state = LaunchState::Failed(message);
+            Err(refusal) => {
+                batch.state = LaunchState::Failed(refusal.message);
+                batch.placement = refusal.placement;
             }
         }
     }
@@ -3445,6 +3740,8 @@ mod tests {
             operation: "tracked roles copy",
             holds_launches: false,
             prelaunch: false,
+            what: String::new(),
+            since: crate::rt::Instant::now(),
         });
         let (rollback, _rx) = tokio::sync::mpsc::unbounded_channel();
         BatchScheduler::apply_control_commit(
@@ -3467,11 +3764,112 @@ mod tests {
         assert!(error.to_string().contains("unanswered"), "{error}");
     }
 
+    fn refused_request(fire: u64) -> Box<PendingRequest> {
+        Box::new(PendingRequest {
+            lora_program: false,
+            logical_fire_id: fire,
+            request: crate::engine::FireRequest::default(),
+            instance_id: ::engine::InstanceId(1),
+            completion: crate::engine::WorkItemCompletion::new(1, 0),
+            process_id: None,
+            pipeline_id: Some(ProcessId::from_u128(u128::from(fire))),
+            prelaunch_copy: None,
+            prelaunch_state_copy: None,
+            frame: Some(FrameStamp {
+                lane: ProcessId::from_u128(u128::from(fire)),
+                seq: 0,
+                slot: 0,
+                fires: 1,
+            }),
+        })
+    }
+
+    fn refused_batch(fires: &[u64], chunks: &[u32]) -> PendingLaunchBatch {
+        PendingLaunchBatch {
+            state: LaunchState::Failed(
+                "impossible submission: state chunk 2057 lies inside the carve".into(),
+            ),
+            requests: fires.iter().map(|&fire| refused_request(fire)).collect(),
+            started: Instant::now(),
+            batch_size: fires.len() as u64,
+            total_tokens: fires.len(),
+            rung_rows: fires.len(),
+            placement: chunks.to_vec(),
+        }
+    }
+
+    /// Mac Pro at 5 GiB on 6c21ebca3: one launch refused "impossible
+    /// submission: state chunk 2057 ... inside the activation span's backed
+    /// carve" failed all 42 lanes of its frame and poisoned their channels.
+    /// A batch the engine refuses for where state lies is held, nothing
+    /// failed, while the pool moves that state down, then fired again as
+    /// fires of their own; refused again for a chunk already moved, its
+    /// fires go again one by one, and only one the engine still refuses
+    /// alone fails.
+    fn a_launch_refused_for_placement_is_fired_again_after_the_move_failing_none() {
+        let engine = 9_999;
+        let stats = Arc::new(SchedulerStats::default());
+        let mut policy = FramePolicy::new(1, 64, 4096, None);
+        let (mut held, mut refused_once) = (Vec::new(), HashSet::new());
+        let mut pending = PendingQueue::default();
+        let mut flight = VecDeque::from([refused_batch(&[1, 2, 3], &[2057])]);
+        let mut retire = |flight: &mut VecDeque<PendingLaunchBatch>,
+                          held: &mut Vec<HeldForPlacement>,
+                          refused_once: &mut HashSet<u32>| {
+            BatchScheduler::retire_ready_launches(
+                flight,
+                &mut HashMap::new(),
+                &stats,
+                &mut policy,
+                held,
+                refused_once,
+                engine,
+            )
+        };
+        assert!(retire(&mut flight, &mut held, &mut refused_once));
+        assert_eq!(held.len(), 1, "held for its state's move");
+        assert!(!held[0].solo);
+        let unsettled = |pending: &PendingQueue| {
+            pending.items.iter().all(|item| match item {
+                QueuedItem::Launch(launch) => !launch.request.completion.is_settled(),
+                _ => true,
+            })
+        };
+        // No pool here: nothing is pending its move, so they go again.
+        assert!(BatchScheduler::release_held(&mut held, &mut pending, engine));
+        assert_eq!(pending.len(), 3, "fired again");
+        assert!(unsettled(&pending), "none failed");
+        assert!(
+            pending.items.iter().all(|item| matches!(
+                item,
+                QueuedItem::Launch(launch) if !launch.framed && !launch.solo
+            )),
+            "as fires of their own, riding together"
+        );
+        // Refused again for the chunk already moved: one by one.
+        let mut flight = VecDeque::from([refused_batch(&[4, 5], &[2057])]);
+        assert!(retire(&mut flight, &mut held, &mut refused_once));
+        assert!(held[0].solo, "a runtime bug: its fires go again alone");
+        let mut pending = PendingQueue::default();
+        BatchScheduler::release_held(&mut held, &mut pending, engine);
+        assert!(pending.items.iter().all(|item| matches!(item, QueuedItem::Launch(launch) if launch.solo)));
+        assert!(unsettled(&pending));
+        // One refused alone again fails, alone.
+        let alone = refused_batch(&[4], &[2057]);
+        let completion = alone.requests[0].completion.clone();
+        let mut flight = VecDeque::from([alone]);
+        retire(&mut flight, &mut held, &mut refused_once);
+        assert!(held.is_empty());
+        assert!(completion.is_settled(), "the one the engine still refuses alone fails");
+    }
+
     #[test]
     fn worker_every_case() {
+        a_launch_refused_for_placement_is_fired_again_after_the_move_failing_none();
         a_panicking_engine_fails_its_launch_instead_of_leaving_it_in_flight();
         a_retryable_refusal_past_admission_fails_by_name_instead_of_replaying();
         a_launch_waits_for_the_copy_queued_ahead_of_it();
+        an_unframed_piece_waits_for_its_pipelines_framed_fire_queued_ahead();
         a_pass_that_only_reorders_lets_the_worker_park();
         what_a_frame_settled_inside_submit_wrote_is_kept_when_it_is_answered();
         a_step_wider_than_the_rung_the_engine_holds_never_reaches_it();
@@ -3516,13 +3914,15 @@ mod tests {
             panic!("past the rung: refused");
         };
         assert!(
-            wide.contains("3 token rows") && wide.contains("the rung the engine was told"),
-            "refused by name: {wide}"
+            wide.message.contains("3 token rows")
+                && wide.message.contains("the rung the engine was told"),
+            "refused by name: {}",
+            wide.message
         );
         let Err(narrow) = answer(2) else {
             panic!("the engine panics on what reaches it");
         };
-        assert!(narrow.contains("panic"), "it reached the engine: {narrow}");
+        assert!(narrow.message.contains("panic"), "it reached the engine: {}", narrow.message);
         let _ = lane.shutdown();
     }
 
@@ -3611,6 +4011,44 @@ mod tests {
         let mut cache = ScanCache::default();
         let scan = BatchScheduler::scan_queue(&mut cache, &pending, false);
         assert_eq!(scan.untracked, [9]);
+    }
+
+    /// A cut pass in slot 1 sends its leading pieces unframed: they never
+    /// ride ahead of slot 0 of the same pipeline, queued framed before them
+    /// and waiting for its frame. Another pipeline's piece still rides; once
+    /// slot 0's frame has gone, the piece rides too.
+    fn an_unframed_piece_waits_for_its_pipelines_framed_fire_queued_ahead() {
+        let (pipeline, other) = (ProcessId::from_u128(5), ProcessId::from_u128(6));
+        let launch = |fire: u64, pipeline: ProcessId, framed: bool| PendingRequest {
+            lora_program: false,
+            logical_fire_id: fire,
+            request: crate::engine::FireRequest::default(),
+            instance_id: ::engine::InstanceId(fire),
+            completion: crate::engine::WorkItemCompletion::new(fire, 0),
+            process_id: None,
+            pipeline_id: Some(pipeline),
+            prelaunch_copy: None,
+            prelaunch_state_copy: None,
+            frame: framed.then_some(FrameStamp {
+                lane: pipeline,
+                seq: 0,
+                slot: 0,
+                fires: 2,
+            }),
+        };
+        let mut pending = PendingQueue::default();
+        BatchScheduler::queue_attempt(&mut pending, launch(1, pipeline, true));
+        BatchScheduler::queue_attempt(&mut pending, launch(2, pipeline, false));
+        BatchScheduler::queue_attempt(&mut pending, launch(3, other, false));
+        let mut cache = ScanCache::default();
+        let scan = BatchScheduler::scan_queue(&mut cache, &pending, false);
+        assert_eq!(scan.untracked, [3], "slot 1's piece waits behind slot 0");
+        assert_eq!(scan.queued_ids, [1].into_iter().collect());
+        // Slot 0's frame is posted: the piece rides.
+        assert!(matches!(pending.pop_front(), Some(QueuedItem::Launch(_))));
+        let mut cache = ScanCache::default();
+        let scan = BatchScheduler::scan_queue(&mut cache, &pending, false);
+        assert_eq!(scan.untracked, [2, 3]);
     }
 
     fn a_panicking_engine_fails_its_launch_instead_of_leaving_it_in_flight() {
@@ -4069,7 +4507,7 @@ mod tests {
             .expect("the launch is answered");
         let answer = match answer {
             Ok(frame) => within("the frame settles", frame).map_err(|error| format!("{error:#}")),
-            Err(error) => Err(error),
+            Err(error) => Err(error.message),
         };
         let fires = completions
             .iter()
@@ -4443,7 +4881,7 @@ mod tests {
                 Ok(frame) => {
                     within("the frame settles", frame).map_err(|error| format!("{error:#}"))
                 }
-                Err(error) => Err(error),
+                Err(error) => Err(error.message),
             };
             let results = flat
                 .iter()
@@ -4889,5 +5327,129 @@ mod tests {
             |_, _| async { Ok(::engine::ProgramId(3)) },
         ));
         assert_eq!(retried.expect("registers afresh"), ::engine::ProgramId(3));
+    }
+}
+
+/// A test's own lane for an engine: the copies its planner and stores
+/// submit (`copy_tier_tracked`) are handed to the test, which lands each
+/// one (or refuses it) when it chooses; the pool requests a move waits on
+/// (`settle_copies`, a rebind) are answered at once. Installed for this
+/// thread alone ([`crate::scheduler::set_test_handle`]).
+#[cfg(test)]
+pub(crate) mod test_lane {
+    use super::*;
+
+    pub(crate) struct TestLane {
+        engine: usize,
+        rx: tokio::sync::mpsc::UnboundedReceiver<SchedulerItem>,
+    }
+
+    /// One copy handed to the lane, unlanded.
+    pub(crate) struct LaneCopy {
+        /// Down to the disk tier.
+        pub(crate) to_disk: bool,
+        /// Up from the disk tier.
+        pub(crate) from_disk: bool,
+        /// The slots it copies, shape by shape (a shared pool's every copy).
+        pub(crate) slots: Option<::engine::chunk::SlotCopy>,
+        completion: ControlCompletion,
+    }
+
+    impl LaneCopy {
+        /// The copy lands: its completion resolves.
+        pub(crate) fn land(self) {
+            self.completion.resolve(&Ok(()));
+        }
+
+        /// The copy did not land (`engine::Landing::Failed`): its
+        /// destination is not to be trusted, its sources hold what they
+        /// held.
+        pub(crate) fn fail_landing(self, why: &str) {
+            self.completion.resolve(&Err(anyhow::Error::new(
+                crate::engine::completion::CopyLandingFailed(why.to_string()),
+            )));
+        }
+
+        /// The tier it copies down to is full (`engine::Error::TierFull`):
+        /// nothing on the device changed.
+        pub(crate) fn refuse_tier_full(self) {
+            self.completion
+                .resolve(&Err(anyhow::Error::new(::engine::Error::TierFull(
+                    "the disk tier's slot file is full (test lane)".into(),
+                ))));
+        }
+    }
+
+    impl TestLane {
+        pub(crate) fn install(engine: usize) -> Self {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<SchedulerItem>();
+            let handle = SchedulerHandle {
+                inner: Arc::new(SchedulerControl {
+                    tx,
+                    active_senders: AtomicUsize::new(0),
+                    shutdown_wait: Condvar::new(),
+                    shutdown_gate: Mutex::new(()),
+                    program_ids: Mutex::new(HashMap::new()),
+                    accepting: AtomicBool::new(true),
+                    stats: Arc::new(SchedulerStats::default()),
+                    device_domain: ::engine::MemoryDomain::CudaDevice(0),
+                    codegen_backend: None,
+                }),
+            };
+            crate::scheduler::set_test_handle(engine, Some(handle));
+            Self { engine, rx }
+        }
+
+        /// The copies submitted since the last take, in order; every pool
+        /// request is answered, a rebind by `rebind` as the lane runs it
+        /// (`store::roles::rebind`), every other item dropped.
+        pub(crate) fn take(
+            &mut self,
+            rebind: &mut dyn FnMut(::engine::Rebind) -> Result<()>,
+        ) -> Vec<LaneCopy> {
+            let mut copies = Vec::new();
+            while let Ok(item) = self.rx.try_recv() {
+                match item {
+                    SchedulerItem::CopyTracked { plan, completion } => {
+                        let disk = ::engine::MemoryDomain::LocalDisk;
+                        let (to_disk, from_disk) = match &plan {
+                            PreLaunchCopy::Slots(copy) => (copy.dst == disk, copy.src == disk),
+                            PreLaunchCopy::Kv(copy) => (copy.dst == disk, copy.src == disk),
+                            PreLaunchCopy::State(_) => (false, false),
+                        };
+                        let slots = match &plan {
+                            PreLaunchCopy::Slots(copy) => Some(copy.clone()),
+                            _ => None,
+                        };
+                        copies.push(LaneCopy {
+                            to_disk,
+                            from_disk,
+                            slots,
+                            completion,
+                        });
+                    }
+                    SchedulerItem::Pool {
+                        op: PoolOp::Rebind(change),
+                        response,
+                    } => {
+                        let _ = response.send(rebind(change));
+                    }
+                    SchedulerItem::Pool { response, .. } => {
+                        let _ = response.send(Ok(()));
+                    }
+                    SchedulerItem::HostKv { response, .. } => {
+                        let _ = response.send(Ok(Vec::new()));
+                    }
+                    _ => {}
+                }
+            }
+            copies
+        }
+    }
+
+    impl Drop for TestLane {
+        fn drop(&mut self) {
+            crate::scheduler::set_test_handle(self.engine, None);
+        }
     }
 }

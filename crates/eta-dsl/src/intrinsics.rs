@@ -1,9 +1,9 @@
 use eta_ir::registry::{Axis, OutputDecl};
-use eta_ir::types::{Dtype, Shape};
+use eta_ir::types::{Dtype, Shape, ValueType};
 
 use crate::context::{current_rows, intern_name};
 use crate::model;
-use crate::value::{Tensor, output_val};
+use crate::value::{Tensor, output_val, poison};
 
 pub fn vocab() -> u32 {
     model::vocab()
@@ -15,17 +15,27 @@ pub fn page_size() -> u32 {
 pub const activation_type: Dtype = Dtype::F32;
 
 /// Lane `lane`'s output `name` as the model declares it: its readout rows (a
-/// lone row read as its width alone), or its layers stacked.
+/// lone row read as its width alone), or its layers stacked. An output the
+/// host declares no such way is a trace error, so the build fails by name
+/// rather than the guest panicking mid-trace.
 #[track_caller]
 pub fn output(lane: u32, name: &str) -> Tensor {
-    let decl = declared(lane, name);
+    let decl = match declared(lane, name) {
+        Ok(decl) => decl,
+        Err(missing) => return missing,
+    };
     let rows = match decl.axis {
         Axis::Lane => decl.layers.max(1),
         Axis::Row | Axis::Voxel if decl.readout => current_rows().max(1),
-        Axis::Row | Axis::Voxel => panic!(
-            "output `{name}` is one row a token or voxel of lane {lane}: \
-             `output_rows` reads the rows it names"
-        ),
+        Axis::Row | Axis::Voxel => {
+            return poison(
+                alloc::format!(
+                    "output `{name}` is one row a token or voxel of lane {lane}: \
+                     `output_rows` reads the rows it names"
+                ),
+                ValueType::new(Shape::matrix(current_rows().max(1), decl.width), decl.dtype),
+            );
+        }
     };
     let t = output_val(
         intern_name(name),
@@ -43,7 +53,10 @@ pub fn output(lane: u32, name: &str) -> Tensor {
 /// `rows` rows of lane `lane`'s output `name`, one a token or voxel.
 #[track_caller]
 pub fn output_rows(lane: u32, name: &str, rows: u32) -> Tensor {
-    let decl = declared(lane, name);
+    let decl = match declared(lane, name) {
+        Ok(decl) => decl,
+        Err(missing) => return missing,
+    };
     output_val(
         intern_name(name),
         lane,
@@ -52,10 +65,16 @@ pub fn output_rows(lane: u32, name: &str, rows: u32) -> Tensor {
     )
 }
 
+/// The declaration of lane `lane`'s output `name`, or a poisoned stand-in
+/// recording that the pass reads out no such output.
 #[track_caller]
-fn declared(lane: u32, name: &str) -> OutputDecl {
-    model::output(lane, name)
-        .unwrap_or_else(|| panic!("lane {lane} of this pass reads out no output `{name}`"))
+fn declared(lane: u32, name: &str) -> Result<OutputDecl, Tensor> {
+    model::output(lane, name).ok_or_else(|| {
+        poison(
+            alloc::format!("lane {lane} of this pass reads out no output `{name}`"),
+            ValueType::new(Shape::matrix(current_rows().max(1), 1), Dtype::F32),
+        )
+    })
 }
 
 fn single_row_reshape(t: Tensor) -> Tensor {

@@ -51,11 +51,6 @@ def architecture() -> str:
     return _model.architecture()
 
 
-def submit_deadline_us() -> int:
-    """How long a pipeline may hold a frame's wait-set, in microseconds."""
-    return _model.submit_deadline_us()
-
-
 @dataclass(frozen=True)
 class BlockDrafter:
     """What a guest needs to seed a BLOCK drafter's draft pass."""

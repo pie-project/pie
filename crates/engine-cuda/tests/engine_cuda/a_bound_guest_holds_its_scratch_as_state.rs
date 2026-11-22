@@ -247,7 +247,6 @@ fn a_bound_guest_holds_its_scratch_as_state() {
                     &[None],
                     &[engine::ChannelId(1)],
                     engine_cuda::program::Slots {
-                        resident: engine::ScratchPlace::None,
                         instance: slots.0,
                         rings: slots.1,
                         scratch,
@@ -388,7 +387,6 @@ fn a_pair_taken_again_at_the_same_refs_is_laid_again() {
                 &[None],
                 &[engine::ChannelId(1)],
                 engine_cuda::program::Slots {
-                    resident: engine::ScratchPlace::None,
                     instance: slots.0,
                     rings: slots.1,
                     scratch,
@@ -544,7 +542,6 @@ fn a_guests_state_reads_zero_when_its_slots_change_owner() {
                 &[None],
                 &[engine::ChannelId(1)],
                 engine_cuda::program::Slots {
-                    resident: engine::ScratchPlace::None,
                     instance: slots.0.clone(),
                     rings: slots.1.clone(),
                     scratch: scratch.clone(),
@@ -595,7 +592,6 @@ fn a_guests_state_reads_zero_when_its_slots_change_owner() {
         .rebind_program(
             b,
             engine_cuda::program::Slots {
-                resident: engine::ScratchPlace::None,
                 instance: b_slots.0,
                 rings: b_slots.1,
                 scratch: fresh.clone(),
@@ -615,4 +611,109 @@ fn a_guests_state_reads_zero_when_its_slots_change_owner() {
     fire(&mut shell, word, &tokens, &attach(b));
     shell.drain().expect("the device drains");
     shell.close_program_instance(b).expect("B closes");
+}
+
+/// A park releases what it shed (`engine::Rebind::Parked`): instance A
+/// parks with its tables kept in place, its scratch and its pair given
+/// back; instance B binds into exactly that scratch and pair without an
+/// overlap refusal; A's unpark rebinds it to fresh room, claimed again,
+/// and it fires there. Unparked without the park said, B's bind would be
+/// refused by name on A's stale claim (Metal and Vulkan under pressure on
+/// 720d94565).
+#[test]
+fn a_parked_instance_s_shed_room_is_another_s_and_its_unpark_claims_again() {
+    if !engine_cuda::device::present() {
+        eprintln!("no CUDA device: skipping");
+        return;
+    }
+    let trace = poem::trace_hybrid("guest-park-claims", &Micro, Platform::Cuda);
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let path = Weights::random(&trace, 4253).write(dir.path());
+    let word = trace.facts.word(&Request::new(ROWS, false));
+    let tokens: Vec<Vec<u32>> = vec![vec![7]];
+
+    let mut shell = shell(trace, &path);
+    let facts = shell.chunk_facts().expect("the chunk facts");
+    let segments = facts.segments.committed.max(1);
+    shell
+        .commit_segments(segments)
+        .expect("the first segment commits");
+    let mut guest = crate::guest::Guest::of(&facts, segments * facts.segment_chunks);
+    let program = register(&mut shell);
+    let extents = Extents {
+        row_count: 1,
+        sampled_rows: 1,
+        query_len: 1,
+        ..Extents::default()
+    };
+    let state = shell
+        .guest_state(program, extents)
+        .expect("the program's guest state");
+    let bind = |shell: &mut Shell,
+                guest: &mut crate::guest::Guest,
+                scratch: &engine::ScratchPlace,
+                pair: &engine::ScratchPlace,
+                generation: u64| {
+        let slots = guest.slots(
+            &shell.program_facts(program).expect("the program's facts"),
+            |_| false,
+        );
+        let id = shell.bind_program(
+            program,
+            &[],
+            extents,
+            GeometryClass::Host,
+            PortMask::NONE,
+            &[None],
+            &[engine::ChannelId(1)],
+            engine_cuda::program::Slots {
+                instance: slots.0.clone(),
+                rings: slots.1.clone(),
+                scratch: scratch.clone(),
+                pair: pair.clone(),
+                pair_generation: generation,
+            },
+        );
+        (id, slots)
+    };
+    let attach = |instance| {
+        [Attached {
+            lane: 0,
+            lanes: 1,
+            instance,
+            adapter_only: false,
+        }]
+    };
+
+    let (scratch, pair) = guest.places((program, extents), &state);
+    let (a, a_slots) = bind(&mut shell, &mut guest, &scratch, &pair, 1);
+    let a = a.expect("A binds");
+    fire(&mut shell, word, &tokens, &attach(a));
+    shell.drain().expect("the device drains");
+
+    shell.park_program(a, true).expect("A parks, its tables kept in place");
+    let (b, _) = bind(&mut shell, &mut guest, &scratch, &pair, 2);
+    let b = b.expect("B binds on the scratch and pair A's park gave back, no overlap");
+
+    let (fresh, fresh_pair) = guest.places((program, "unparked"), &state);
+    shell
+        .rebind_program(
+            a,
+            engine_cuda::program::Slots {
+                instance: a_slots.0,
+                rings: a_slots.1,
+                scratch: fresh,
+                pair: fresh_pair,
+                pair_generation: 3,
+            },
+        )
+        .expect("A's unpark claims fresh room");
+    fire(&mut shell, word, &tokens, &attach(a));
+    fire(&mut shell, word, &tokens, &attach(b));
+    shell.drain().expect("the device drains");
+    for instance in [a, b] {
+        shell
+            .close_program_instance(instance)
+            .expect("the instance closes");
+    }
 }

@@ -5,7 +5,7 @@ use poem_compiler::Budget;
 use poem_ir::{Dtype, StructKind};
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::device::{Buffer, Pinned};
 use crate::error::Result;
@@ -190,8 +190,6 @@ pub fn attention_workspace_bytes(
 }
 
 const ALIGN: u64 = 256;
-
-const CLAIM_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Clone, Debug)]
 struct Grant {
@@ -388,10 +386,18 @@ pub struct Fire<'a> {
     pub rs: Option<RsFire<'a>>,
 }
 
+/// A set of `depth` slots, taken and given back. A slot given back wakes a
+/// claim waiting on the set ([`Free::claim`]); a guard handed to its step's
+/// landing ([`SlotGuard::landing`]) is counted until it drops.
 #[derive(Debug)]
 pub struct Free {
     bits: AtomicU64,
     depth: u32,
+    /// The taken slots a step's landing holds: each comes back without the
+    /// claimant's doing.
+    landing: AtomicU32,
+    lock: std::sync::Mutex<()>,
+    given: std::sync::Condvar,
 }
 
 impl Free {
@@ -406,6 +412,9 @@ impl Free {
         Arc::new(Free {
             bits: AtomicU64::new(bits),
             depth: depth as u32,
+            landing: AtomicU32::new(0),
+            lock: std::sync::Mutex::new(()),
+            given: std::sync::Condvar::new(),
         })
     }
 
@@ -431,6 +440,40 @@ impl Free {
 
     pub fn give(&self, at: u32) {
         self.bits.fetch_or(1u64 << at, Ordering::Release);
+        // Under the lock, so a claim between its failed take and its wait
+        // does not miss this.
+        let _held = self.lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.given.notify_all();
+    }
+
+    /// A slot of the set. Where every one is taken and a step's landing
+    /// holds one, it waits for a slot to come back, however long the device
+    /// takes: a landing gives its slot back. Where the claimant's own
+    /// unlanded steps hold every one, none can come back until it lands one
+    /// itself, and the claim is refused by name at once: the claimant is
+    /// running deeper than the `depth` it was laid for.
+    pub fn claim(self: &Arc<Self>, what: &'static str) -> Result<SlotGuard> {
+        let mut held = self.lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if let Some(at) = self.take() {
+                return Ok(SlotGuard {
+                    free: Arc::clone(self),
+                    at,
+                    landing: false,
+                });
+            }
+            if self.landing.load(Ordering::Acquire) == 0 {
+                return Err(crate::error::Fault::Ceiling {
+                    what,
+                    need: u64::from(self.depth) + 1,
+                    have: u64::from(self.depth),
+                });
+            }
+            held = self
+                .given
+                .wait(held)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
     }
 
     #[must_use]
@@ -443,6 +486,7 @@ impl Free {
 pub struct SlotGuard {
     free: Arc<Free>,
     at: u32,
+    landing: bool,
 }
 
 impl SlotGuard {
@@ -450,11 +494,28 @@ impl SlotGuard {
     pub fn at(&self) -> u32 {
         self.at
     }
+
+    /// The guard as its step's landing holds it: it comes back when the step
+    /// lands, without its claimant's doing, so a claim on a full set waits
+    /// for it.
+    #[must_use]
+    pub fn landing(mut self) -> SlotGuard {
+        if !self.landing {
+            self.landing = true;
+            self.free.landing.fetch_add(1, Ordering::AcqRel);
+        }
+        self
+    }
 }
 
 impl Drop for SlotGuard {
     fn drop(&mut self) {
+        // Given back before it stops counting as landing: a claim that saw
+        // the set full then either takes it or is woken for it.
         self.free.give(self.at);
+        if self.landing {
+            self.free.landing.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 
@@ -1275,30 +1336,10 @@ impl Inputs {
     }
 
     pub fn claim(&self) -> Result<SlotGuard> {
-        if let Some(at) = self.free.take() {
-            return Ok(SlotGuard {
-                free: Arc::clone(&self.free),
-                at,
-            });
-        }
-        let until = std::time::Instant::now() + CLAIM_DEADLINE;
-        loop {
-            std::hint::spin_loop();
-            if let Some(at) = self.free.take() {
-                return Ok(SlotGuard {
-                    free: Arc::clone(&self.free),
-                    at,
-                });
-            }
-            if std::time::Instant::now() >= until {
-                return Err(crate::error::Fault::Ceiling {
-                    what: "staging slots (every one is still in flight; the caller \
-                           is running deeper than the frames_in_flight it loaded with)",
-                    need: self.staging.len() as u64 + 1,
-                    have: self.staging.len() as u64,
-                });
-            }
-        }
+        self.free.claim(
+            "staging slots (every one held by a step not yet handed to its landing; the caller \
+             is running deeper than the frames_in_flight it loaded with)",
+        )
     }
 
     #[must_use]
@@ -2326,5 +2367,50 @@ mod prefill_grant_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod claim_tests {
+    use super::Free;
+    use std::time::{Duration, Instant};
+
+    /// Every slot taken, one held by its step's landing: a claim waits for
+    /// the landing to give it back, however long that takes, and then has it.
+    #[test]
+    fn a_full_set_with_a_landing_pending_waits_and_then_claims() {
+        let free = Free::of(2);
+        let first = free.claim("slots").expect("a free slot");
+        let landing = free.claim("slots").expect("a free slot").landing();
+        let at = landing.at();
+        let lands = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(landing);
+        });
+        let began = Instant::now();
+        let got = free.claim("slots").expect("the landing's slot comes back");
+        assert!(began.elapsed() >= Duration::from_millis(150), "it waited for the landing");
+        assert_eq!(got.at(), at, "the landing's slot");
+        lands.join().expect("the landing thread");
+        drop(first);
+    }
+
+    /// Every slot held by the claimant's own steps, none landing: no slot
+    /// can come back until the claimant lands one, so the claim is refused
+    /// by name at once, never after a timer.
+    #[test]
+    fn a_claim_deeper_than_the_set_is_refused_at_once_by_name() {
+        let free = Free::of(2);
+        let held = [
+            free.claim("slots").expect("a free slot"),
+            free.claim("slots").expect("a free slot"),
+        ];
+        let began = Instant::now();
+        let refused = free
+            .claim("staging slots (the caller runs deeper than its frames in flight)")
+            .expect_err("a third slot of two, none landing");
+        assert!(began.elapsed() < Duration::from_millis(100), "refused at once");
+        assert!(refused.to_string().contains("staging slots"), "{refused}");
+        drop(held);
     }
 }

@@ -107,6 +107,13 @@ impl Shell {
         self.weighed.as_ref()
     }
 
+    /// What the device's free bytes paid for the bodies the load armed,
+    /// the figure a load with no record measures (0 where none armed).
+    #[must_use]
+    pub const fn bodies_took(&self) -> u64 {
+        self.bodies_took
+    }
+
     #[must_use]
     pub fn body_stats(&self) -> record::BodyStats {
         self.cache.body_stats()
@@ -194,6 +201,7 @@ impl Shell {
     /// cannot hold them), the runtime streams them from a pinned copy made
     /// of it, as from the file's.
     pub(crate) fn preseat_weights(&mut self, filed: bool, copied: bool) -> crate::Result<()> {
+        self.preseated_as = Some((filed, copied));
         if filed {
             self.pools.file_weights();
         }
@@ -395,15 +403,22 @@ impl Shell {
         self.pools.settle_swaps()
     }
 
-    /// Calls `landed` once every move between the device and the host tier
-    /// enqueued so far has landed, from a waiter of its own: nothing is
-    /// enqueued on the swap stream for it, so no later move waits on it.
-    /// `false` (and `landed` dropped) where the moves ride no swap stream,
-    /// so each has landed by the time it returned.
-    pub fn tell_swaps_landed(
+    /// Where the next move between the host tier and the slot file is told
+    /// how it ended ([`crate::store::Pools::defer_disk_tell`]); returns a
+    /// tell no such move took.
+    pub fn defer_disk_tell(
         &mut self,
-        landed: Box<dyn FnOnce() + Send + 'static>,
-    ) -> crate::Result<bool> {
+        told: Option<super::landing::Told>,
+    ) -> Option<super::landing::Told> {
+        self.pools.defer_disk_tell(told)
+    }
+
+    /// Tells `landed` how every move between the device and the host tier
+    /// enqueued so far ended (landed, or failed with its fault), from a
+    /// waiter of its own: nothing is enqueued on the swap stream for it, so
+    /// no later move waits on it. `false` (and `landed` dropped) where the
+    /// moves ride no swap stream, so each has landed by the time it returned.
+    pub fn tell_swaps_landed(&mut self, landed: super::landing::Told) -> crate::Result<bool> {
         if super::diag::on().tier_inline {
             return Ok(false);
         }

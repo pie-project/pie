@@ -144,7 +144,7 @@ fn a_carried_history_copies_none_of_the_pool() {
         seats: vec![vec![Some(engine_xla::readout::Seat { first: 0, count: 1 })]],
         readback: vec![None],
         pixels: (String::new(), Vec::new()),
-        host: None,
+        host: Vec::new(),
     };
     let bound = engine_xla::guest::run::bound(&plan, Some(&kept), 0, 1)
         .expect("the program reads its own lane")

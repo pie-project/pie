@@ -248,6 +248,21 @@ impl Facts {
             .is_some_and(|bit| word & (1 << bit) != 0)
     }
 
+    /// `word` with `builtin`'s bit set to `on`, where the trace gives it a
+    /// bit; as it was where it gives none.
+    #[must_use]
+    pub fn with(&self, word: u64, builtin: Builtin, on: bool) -> u64 {
+        match self
+            .table
+            .iter()
+            .position(|fact| *fact == Fact::Builtin(builtin))
+        {
+            Some(bit) if on => word | (1 << bit),
+            Some(bit) => word & !(1 << bit),
+            None => word,
+        }
+    }
+
     /// A request per reachable word, plainest first; each switch also at one value never read.
     #[must_use]
     pub fn requests(&self) -> Vec<Request> {

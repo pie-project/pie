@@ -45,9 +45,6 @@ pub struct ProgramRegistration {
 pub struct BindExtents {
     pub row_count: u32,
     pub token_count: u32,
-    /// The readout rows one instance reads (its rows per instance), what
-    /// every engine checks its readout seats against: a beam group's
-    /// (`parents`) instance reads its `b` beams' rows.
     pub sampled_rows: u32,
     pub query_len: u32,
     pub key_len: u32,
@@ -93,16 +90,10 @@ pub struct InstanceBinding {
     /// program binds none.
     #[serde(default)]
     pub adapter_slots: Vec<u32>,
-    /// Where this instance's lanes' scratch lies ([`GuestState::scratch`]):
-    /// dead between fires.
+    /// Where this instance's lanes' scratch lies
+    /// ([`GuestState::resident`]).
     #[serde(default)]
     pub scratch: ScratchPlace,
-    /// Where its resident state lies ([`GuestState::resident`]): one run of
-    /// adjacent `Instance` slots, live from the bind to the close, copied
-    /// wherever a park moves the instance and laid again at the same bytes
-    /// in the slots it comes back to ([`Rebind::Instance`]).
-    #[serde(default)]
-    pub resident: ScratchPlace,
     /// Where its pair's lies ([`GuestState::per_pair`]): the same on every
     /// instance of the pair, taken at the pair's first bind and given back
     /// at its last close.
@@ -123,18 +114,33 @@ pub struct InstanceBinding {
 /// what the (program, extents) pair keeps once while any instance of it is
 /// bound ([`crate::Engine::guest_state`]). Each lies in the `Instance` role,
 /// taken at the bind and held while bound ([`InstanceBinding::scratch`],
-/// [`InstanceBinding::resident`], [`InstanceBinding::pair`],
-/// [`ScratchPlace`]). The scratch's and the pair's contents are dead between
-/// fires: a park gives them back and an unpark takes fresh room, nothing
-/// copied. The resident state is live: a park copies it wherever the
-/// instance goes and an unpark copies it back into fresh slots. The engine
-/// is told where each lies ([`Rebind::Instance`]).
+/// [`InstanceBinding::pair`], [`ScratchPlace`]). Their contents are dead
+/// between fires: a park gives them back and an unpark takes fresh room,
+/// nothing copied, the engine told where ([`Rebind::Instance`]).
+///
+/// A guest pair holds no GPU-written state across fires: anything a fire
+/// writes that a later fire reads lives in resident ([`GuestState::resident`]),
+/// the instance's tables ([`InstanceBinding::instance_slots`]), its rings
+/// or channel cells, all moved byte for byte by a park. A pair may
+/// hold host-laid constant tables (descriptors, params, bindings,
+/// offsets, lane indices, layout words) laid when the pair lands and read
+/// by later fires without restaging. So a pair's bytes may be dropped on
+/// park and retaken freely, but whenever a pair lands in new room (a fresh
+/// taking, a rebind, a moving retarget, or a park that brings it back
+/// elsewhere) the runtime gives it a new pair generation
+/// ([`InstanceBinding::pair_generation`]), and the engine lays its tables
+/// again before the next fire. Settled from code on CUDA (host-staged
+/// tables), XLA (no pair), Metal (batch sets laid at the rebind) and
+/// engine-gpu (heaps and score rows a fire writes before it reads).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuestState {
     /// Bytes an instance holds from bind to unbind that a later fire reads
-    /// (a beam group's page lists): one run of adjacent `Instance` slots, at
-    /// most a chunk, taken at the bind, priced and moved as the instance's
-    /// tables are ([`InstanceBinding::resident`]).
+    /// as a fire left them (a beam group's state, capture rows): laid with
+    /// the scratch at [`InstanceBinding::scratch`], copied down a tier at a
+    /// park and back into fresh room at an unpark byte for byte, the engine
+    /// told where ([`Rebind::Instance`]). Where it is stated, the whole
+    /// place is copied, its scratch with it. Per-fire bytes are stated as
+    /// [`Self::scratch`], never here.
     #[serde(default)]
     pub resident: u64,
     /// Bytes ONE fire of the instance needs for its value scratch: dead outside that
@@ -440,10 +446,6 @@ pub enum Rebind {
         /// Its scratch, as [`InstanceBinding::scratch`].
         #[serde(default)]
         scratch: ScratchPlace,
-        /// Its resident state's slots, as [`InstanceBinding::resident`],
-        /// holding the bytes they held before the move.
-        #[serde(default)]
-        resident: ScratchPlace,
         /// Its pair's, as [`InstanceBinding::pair`].
         #[serde(default)]
         pair: ScratchPlace,
@@ -458,6 +460,20 @@ pub enum Rebind {
         id: crate::channel::ChannelId,
         slots: Vec<u32>,
     },
+    /// Instance `id`'s process parked: the slots it was last bound or
+    /// rebound at are given back (its live parts copied down a tier, or
+    /// left where they lie with its scratch given back), and another owner
+    /// may take them once this returns. Sent after the park's copies have
+    /// landed and before any of those slots is handed out again. Until a
+    /// [`Rebind::Instance`] names where it lies again, no fire names it,
+    /// and the engine holds and writes nothing at its old slots: no claim
+    /// on them, nothing laid there (an evacuation repoints none of it, and
+    /// a pair none of whose instances is bound is laid by none), nothing
+    /// read. `kept`: its tables and rings stayed where they lie (no tier
+    /// below took them; only its scratch and its share of its pair were
+    /// given back), still its own, which the rebind names again; else
+    /// they went down a tier with the rest.
+    Parked { id: InstanceId, kept: bool },
 }
 
 /// The `Channel` slots the runtime took for one of an instance's rings.

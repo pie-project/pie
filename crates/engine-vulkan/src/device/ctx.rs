@@ -167,6 +167,14 @@ pub(crate) struct Core {
 
     spare_fences: Mutex<Vec<vk::Fence>>,
 
+    /// The descriptor pools frames bind through: those no frame holds,
+    /// reset, and what is lent ([`Spares`]). A frame takes its pools here
+    /// and gives them back once its fence passed; serving makes none
+    /// ([`Context::seal_descriptor_pools`]).
+    spares: Mutex<Spares>,
+    /// Woken as pools come back.
+    given: std::sync::Condvar,
+
     /// The frame whose fenced submission went to the queue last: the
     /// queue has emptied once it landed ([`Context::idle`]).
     last: Mutex<std::sync::Weak<Inner>>,
@@ -196,6 +204,11 @@ pub(crate) struct Core {
     /// The largest device-local heap, which device reservations take.
     heap: usize,
     pub(crate) vendor_id: u32,
+    /// The device's PCI id and its driver's version, as the physical
+    /// device states them: with the vendor, what a stored measurement is
+    /// keyed by ([`Context::measured_on`]).
+    pub(crate) device_id: u32,
+    pub(crate) driver_version: u32,
     pub(crate) discrete: bool,
     pub(crate) api_version: u32,
     pub(crate) features: Enabled,
@@ -404,6 +417,102 @@ impl Core {
     }
 }
 
+/// The descriptor pools: `free` reset and held by no frame, `lent` held by
+/// frames, `kept` of those by kept frames (which replay, so hold theirs
+/// until they drop); `sealed` from the start of serving, after which a
+/// one-time frame (every frame a served step submits) takes only these and
+/// a kept one (a recording, built and counted as one) makes its own, with
+/// `stock` the pools the load laid.
+#[derive(Debug, Default)]
+pub(crate) struct Spares {
+    free: Vec<vk::DescriptorPool>,
+    lent: usize,
+    kept: usize,
+    sealed: bool,
+    stock: usize,
+}
+
+impl Core {
+    /// A reset descriptor pool for a frame that holds `mine` already (a
+    /// `one_time` frame gives them back once its fence passed; a kept one
+    /// when it drops). Before serving, a new one where none is free. While
+    /// serving, a kept frame's own, and a one-time frame's a free one,
+    /// waited for while a one-time frame other than this one holds pools
+    /// (each lands, so gives them back), and refused by name where none can
+    /// come back.
+    fn descriptor_pool(&self, one_time: bool, mine: usize) -> Result<vk::DescriptorPool> {
+        let mut spares = self.spares.lock().expect("spares lock poisoned");
+        loop {
+            let pool = if spares.sealed && !one_time {
+                Some(self.new_descriptor_pool()?)
+            } else {
+                match spares.free.pop() {
+                    Some(pool) => Some(pool),
+                    None if !spares.sealed => Some(self.new_descriptor_pool()?),
+                    None => None,
+                }
+            };
+            if let Some(pool) = pool {
+                spares.lent += 1;
+                if !one_time {
+                    spares.kept += 1;
+                }
+                return Ok(pool);
+            }
+            let others = spares.lent - spares.kept - if one_time { mine } else { 0 };
+            if others == 0 {
+                return Err(Fault::Ceiling {
+                    what: "descriptor pools while serving: no spare descriptor pool, and no frame \
+                           in flight holds one to give back (the load stocked them)",
+                    need: spares.lent as u64 + 1,
+                    have: spares.stock as u64,
+                });
+            }
+            spares = self.given.wait(spares).expect("spares lock poisoned");
+        }
+    }
+
+    /// `pools`, reset, back to the spares from a frame (`one_time`, else a
+    /// kept one).
+    fn give_pools(&self, pools: Vec<vk::DescriptorPool>, one_time: bool) {
+        if pools.is_empty() {
+            return;
+        }
+        for &pool in &pools {
+            // SAFETY: the frame that held `pool` landed (its fence passed) or
+            // was never submitted, so no command uses its sets; a pool is
+            // reset by its one holder.
+            let _ = unsafe {
+                self.device
+                    .reset_descriptor_pool(pool, vk::DescriptorPoolResetFlags::empty())
+            };
+        }
+        let mut spares = self.spares.lock().expect("spares lock poisoned");
+        spares.lent -= pools.len();
+        if !one_time {
+            spares.kept -= pools.len();
+        }
+        spares.free.extend(pools);
+        self.given.notify_all();
+    }
+
+    fn new_descriptor_pool(&self) -> Result<vk::DescriptorPool> {
+        let sizes = [vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(BUFFERS_PER_POOL)];
+        // SAFETY: `device` is live and the create info is complete.
+        unsafe {
+            self.device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(SETS_PER_POOL)
+                    .pool_sizes(&sizes),
+                None,
+            )
+        }
+        .map_err(|e| self.fault("vkCreateDescriptorPool", e))
+    }
+}
+
 impl Drop for Core {
     fn drop(&mut self) {
         // SAFETY: this is the last `Arc<Core>`, so every slab, frame, cache and
@@ -426,6 +535,11 @@ impl Drop for Core {
             let pools = std::mem::take(self.pools.get_mut().expect("pools lock poisoned"));
             for pool in pools.into_values() {
                 self.device.destroy_command_pool(pool, None);
+            }
+            for pool in
+                std::mem::take(&mut self.spares.get_mut().expect("spares lock poisoned").free)
+            {
+                self.device.destroy_descriptor_pool(pool, None);
             }
             // The instance is the process's (`shared_instance`).
             self.device.destroy_device(None);
@@ -459,6 +573,9 @@ pub struct Context {
     pub(crate) dummy: Slab,
     pipeline_cache: Arc<PipelineCache>,
     device_index: u32,
+    /// The workgroups the device holds at once, as the load's rates step
+    /// measured them ([`Context::resident`]).
+    resident: std::sync::OnceLock<u32>,
 }
 
 /// The device's pipeline cache, which kernel and guest pipelines share. A
@@ -1073,6 +1190,8 @@ impl Context {
                 pool,
             )])),
             spare_fences: Mutex::new(Vec::new()),
+            spares: Mutex::new(Spares::default()),
+            given: std::sync::Condvar::new(),
             last: Mutex::new(std::sync::Weak::new()),
             orphans: Mutex::new(Vec::new()),
             family,
@@ -1089,6 +1208,8 @@ impl Context {
             ceiling,
             heap,
             vendor_id: props.vendor_id,
+            device_id: props.device_id,
+            driver_version: props.driver_version,
             discrete: props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU,
             api_version: props.api_version,
             features: enabled,
@@ -1108,6 +1229,7 @@ impl Context {
             dummy,
             pipeline_cache,
             device_index: boot.device_index,
+            resident: std::sync::OnceLock::new(),
         })
     }
 
@@ -1150,9 +1272,27 @@ impl Context {
         self.max_buffer
     }
 
+    /// What sizes work to the device, as its kernels count cores: the
+    /// compute units the driver reports, or where it reports none the
+    /// workgroups the device holds at once ([`Context::resident`]). `None`
+    /// before the load has measured them.
     #[must_use]
-    pub fn cores(&self) -> u32 {
-        self.core.cores.unwrap_or(crate::chip::UNREPORTED_CORES)
+    pub fn cores(&self) -> Option<u32> {
+        self.core.cores.or_else(|| self.resident.get().copied())
+    }
+
+    /// The workgroups the device holds at once, as the load's rates step
+    /// measured them on every device (`profile::fire::RESIDENT_WORKGROUPS`):
+    /// what a guest step's grid strides over. `None` before the load has.
+    #[must_use]
+    pub fn resident(&self) -> Option<u32> {
+        self.resident.get().copied()
+    }
+
+    /// Lays the workgroups the load's rates step measured
+    /// ([`Context::resident`]); the first holds.
+    pub(crate) fn hold_resident(&self, workgroups: u32) {
+        let _ = self.resident.set(workgroups);
     }
 
     /// The alignment a guest table takes in its pool slot: 16 at least, and
@@ -1180,7 +1320,11 @@ impl Context {
     #[must_use]
     pub fn limits(&self) -> crate::tuning::Limits {
         crate::tuning::Limits {
-            cores: self.cores(),
+            // Before the rates step has measured a device the driver reports
+            // no cores of, one: that step's own tuning, whose timed kernels
+            // read neither the qmm's fill nor a decode's split per core (a
+            // load's tuning states them, `crate::rates::at_load`).
+            cores: self.cores().unwrap_or(1),
             lanes: self.lanes(),
             shared_bytes: self.core.limits.max_compute_shared_memory_size,
             invocations: self.core.limits.max_compute_work_group_invocations,
@@ -1210,6 +1354,17 @@ impl Context {
     #[must_use]
     pub fn enabled(&self) -> Enabled {
         self.core.features
+    }
+
+    /// The device as a measurement stored in the user's profile is keyed
+    /// by (`engine_gpu::stored`): its vendor and device ids and its
+    /// driver's version. Another driver measures again.
+    #[must_use]
+    pub fn measured_on(&self) -> String {
+        format!(
+            "vulkan {:04x}:{:04x} driver {:#x}",
+            self.core.vendor_id, self.core.device_id, self.core.driver_version
+        )
     }
 
     #[must_use]
@@ -1311,6 +1466,28 @@ impl Context {
         self.core.staging(&mut transfer).map(|_| ())
     }
 
+    /// Serving starts: the spares are stocked to `frames` free pools (the
+    /// frames serving holds at once, each one pool: the load's kept frames
+    /// hold their own beside them), and from here no frame makes one
+    /// ([`Core::descriptor_pool`]).
+    pub fn seal_descriptor_pools(&self, frames: usize) -> Result<()> {
+        let mut spares = self.core.spares.lock().expect("spares lock poisoned");
+        while spares.free.len() < frames {
+            let pool = self.core.new_descriptor_pool()?;
+            spares.free.push(pool);
+        }
+        spares.stock = spares.free.len();
+        spares.sealed = true;
+        Ok(())
+    }
+
+    /// The descriptor pools free, lent and kept now.
+    #[must_use]
+    pub fn descriptor_pools(&self) -> (usize, usize, usize) {
+        let spares = self.core.spares.lock().expect("spares lock poisoned");
+        (spares.free.len(), spares.lent, spares.kept)
+    }
+
     pub fn frame(&self) -> Result<Frame> {
         self.frame_with(true)
     }
@@ -1360,16 +1537,40 @@ impl Context {
         self.spanned_with(false)
     }
 
+    /// Whether the queue writes timestamps (its family's
+    /// `timestampValidBits` nonzero, a nonzero `timestampPeriod`): a
+    /// spanned frame then reads its device time back.
+    #[must_use]
+    pub fn writes_timestamps(&self) -> bool {
+        self.core.stamp_bits() > 0
+    }
+
     fn spanned_with(&self, one_time: bool) -> Result<Frame> {
-        let frame = self.frame_with(one_time)?;
+        if self.core.stamp_bits() == 0 {
+            return self.frame_with(one_time);
+        }
+        let stamps = self.stamps()?;
+        self.spanned_into(&stamps, !one_time)
+    }
+
+    /// Two timestamps' query pool, laid now, which a spanned frame writes
+    /// ([`Context::spanned_into`]): laid at load and written by one frame
+    /// in flight at a time, so no serving frame lays one.
+    pub fn stamps(&self) -> Result<Stamps> {
         let core = &self.core;
         if core.stamp_bits() == 0 {
-            return Ok(frame);
+            return Err(Fault::Unbound {
+                what: format!(
+                    "timestamps on {}, whose queue family writes none (timestampValidBits 0, or \
+                     timestampPeriod 0)",
+                    core.name
+                ),
+            });
         }
-        let d = &core.device;
-        // SAFETY: `d` is live; the queue writes timestamps (checked above).
+        // SAFETY: `core.device` is live; the queue writes timestamps
+        // (checked above).
         let pool = unsafe {
-            d.create_query_pool(
+            core.device.create_query_pool(
                 &vk::QueryPoolCreateInfo::default()
                     .query_type(vk::QueryType::TIMESTAMP)
                     .query_count(2),
@@ -1377,6 +1578,22 @@ impl Context {
             )
         }
         .map_err(|e| core.fault("vkCreateQueryPool", e))?;
+        Ok(Stamps(Arc::new(StampPool {
+            core: Arc::clone(core),
+            pool,
+        })))
+    }
+
+    /// A frame writing its two timestamps into `stamps` (laid before,
+    /// [`Context::stamps`]): their reset and the opening one recorded first,
+    /// the closing one as it is submitted or kept; kept to replay where
+    /// `keep`, each replay writing them anew. One frame in flight writes a
+    /// pool at a time: its device time is read ([`Pending::span_ns`])
+    /// before the next is submitted.
+    pub fn spanned_into(&self, stamps: &Stamps, keep: bool) -> Result<Frame> {
+        let frame = self.frame_with(!keep)?;
+        let d = &self.core.device;
+        let pool = stamps.0.pool;
         let cmd = frame.inner.cmd();
         // SAFETY: `cmd` is recording outside a render pass and only this
         // frame records into it; the range is the pool's two queries.
@@ -1384,7 +1601,7 @@ impl Context {
             d.cmd_reset_query_pool(cmd, pool, 0, 2);
             d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, pool, 0);
         }
-        *frame.inner.span.lock().expect("span lock poisoned") = Some(pool);
+        *frame.inner.span.lock().expect("span lock poisoned") = Some(stamps.clone());
         Ok(frame)
     }
 
@@ -1461,9 +1678,11 @@ impl Context {
         Ok(Frame {
             inner: Arc::new(Inner {
                 core: Arc::clone(core),
+                one_time,
                 cmd: std::sync::atomic::AtomicU64::new(vk::Handle::as_raw(cmd)),
                 cuts: Mutex::new(Vec::new()),
                 segments: Mutex::new(Vec::new()),
+                held: Mutex::new(Vec::new()),
                 segmented: std::sync::atomic::AtomicBool::new(false),
                 cmd_pool: pool,
                 fence,
@@ -1503,6 +1722,9 @@ fn pick_family(families: &[vk::QueueFamilyProperties]) -> Option<u32> {
 
 pub(crate) struct Inner {
     pub(crate) core: Arc<Core>,
+    /// Submitted once (not kept): its descriptor pools go back once its
+    /// fence passed.
+    one_time: bool,
     /// The command buffer being recorded (a kept frame's last segment).
     cmd: std::sync::atomic::AtomicU64,
     /// A kept frame's segments before its last, in order: each ended where
@@ -1515,6 +1737,9 @@ pub(crate) struct Inner {
     /// whose last segment's fence lands after them (it begins with a barrier
     /// on every command before it on the queue).
     segments: Mutex<Vec<vk::CommandBuffer>>,
+    /// The segments ended and not yet submitted: submitted with the frame,
+    /// back to back ([`Frame::submit`]).
+    held: Mutex<Vec<vk::CommandBuffer>>,
     /// A segment was submitted: a frame dropped unsubmitted waits for the
     /// queue before it frees them.
     segmented: std::sync::atomic::AtomicBool,
@@ -1531,7 +1756,7 @@ pub(crate) struct Inner {
 
     /// A spanned frame's two timestamps, before its work and after it
     /// ([`Context::spanned`]).
-    span: Mutex<Option<vk::QueryPool>>,
+    span: Mutex<Option<Stamps>>,
 
     spare: Mutex<std::collections::HashMap<u64, Vec<vk::DescriptorSet>>>,
 
@@ -1548,6 +1773,31 @@ pub(crate) struct Inner {
 impl Inner {
     pub(crate) fn cmd(&self) -> vk::CommandBuffer {
         vk::Handle::from_raw(self.cmd.load(Ordering::Acquire))
+    }
+}
+
+/// Two timestamps' query pool a spanned frame writes
+/// ([`Context::stamps`]), shared by the frames that write it, one in flight
+/// at a time; destroyed with the last.
+#[derive(Clone)]
+pub struct Stamps(Arc<StampPool>);
+
+impl std::fmt::Debug for Stamps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Stamps").finish()
+    }
+}
+
+struct StampPool {
+    core: Arc<Core>,
+    pool: vk::QueryPool,
+}
+
+impl Drop for StampPool {
+    fn drop(&mut self) {
+        // SAFETY: the last frame holding the pool is gone, and a submitted
+        // frame waits its fence before it drops, so no submission names it.
+        unsafe { self.core.device.destroy_query_pool(self.pool, None) };
     }
 }
 
@@ -1576,14 +1826,11 @@ impl Drop for Inner {
                 let queue = self.core.queue.lock().expect("queue lock poisoned");
                 let _ = d.queue_wait_idle(*queue);
             }
-            for pool in self.pools.get_mut().expect("pools lock poisoned").drain(..) {
-                d.destroy_descriptor_pool(pool, None);
-            }
+            // Its descriptor pools go back to the device's spares, reset:
+            // the next frame takes them rather than making its own.
+            self.give_pools();
             if let Some(timing) = self.timing.get_mut().expect("timing lock poisoned").take() {
                 d.destroy_query_pool(timing.pool, None);
-            }
-            if let Some(span) = self.span.get_mut().expect("span lock poisoned").take() {
-                d.destroy_query_pool(span, None);
             }
             let owned = self
                 .core
@@ -1614,7 +1861,13 @@ impl Inner {
     /// The device's time between a spanned frame's two timestamps, ns, once
     /// it landed; `None` for a frame that writes none.
     fn span_ns(&self) -> Result<Option<u64>> {
-        let Some(pool) = *self.span.lock().expect("span lock poisoned") else {
+        let Some(pool) = self
+            .span
+            .lock()
+            .expect("span lock poisoned")
+            .as_ref()
+            .map(|stamps| stamps.0.pool)
+        else {
             return Ok(None);
         };
         let core = &self.core;
@@ -1784,19 +2037,7 @@ impl Frame {
         let mut sets = match got {
             Some(sets) => sets,
             None => {
-                let sizes = [vk::DescriptorPoolSize::default()
-                    .ty(vk::DescriptorType::STORAGE_BUFFER)
-                    .descriptor_count(BUFFERS_PER_POOL)];
-                // SAFETY: `d` is live and the create info is complete.
-                let pool = unsafe {
-                    d.create_descriptor_pool(
-                        &vk::DescriptorPoolCreateInfo::default()
-                            .max_sets(SETS_PER_POOL)
-                            .pool_sizes(&sizes),
-                        None,
-                    )
-                }
-                .map_err(|e| core.fault("vkCreateDescriptorPool", e))?;
+                let pool = core.descriptor_pool(self.inner.one_time, pools.len())?;
                 pools.push(pool);
                 let info = vk::DescriptorSetAllocateInfo::default()
                     .descriptor_pool(pool)
@@ -1971,10 +2212,13 @@ impl Frame {
     }
 
     /// [`engine_gpu::backend::Frame::submit_segment`]: what the frame holds
-    /// submitted unawaited, recording on in a new buffer from the same
-    /// (this thread's) pool that begins with a barrier on every command
-    /// submitted before it, as every frame begins. A kept frame's segment is
-    /// a cut its replays wait on ([`Frame::flush`]).
+    /// ended as a segment of its own, recording on in a new buffer from the
+    /// same (this thread's) pool that begins with a barrier on every command
+    /// before it, as every frame begins. The segments are submitted with the
+    /// frame, each its own submission, back to back ([`Frame::submit`]): the
+    /// device runs them without waiting on the host's encoding between
+    /// them. A kept frame's segment is a cut its replays wait on
+    /// ([`Frame::flush`]).
     pub fn submit_segment(&self) -> Result<()> {
         if self.kept {
             return self.flush();
@@ -1985,20 +2229,15 @@ impl Frame {
         // SAFETY: as in `flush`: this frame's `cmd` is recording and only
         // `&self` records into it.
         unsafe { d.end_command_buffer(cmd) }.map_err(|e| core.fault("vkEndCommandBuffer", e))?;
-        {
-            let bufs = [cmd];
-            let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
-            let queue = core.queue.lock().expect("queue lock poisoned");
-            // SAFETY: `cmd` is executable and submitted once, with no
-            // fence; the queue is held under its lock.
-            unsafe { d.queue_submit(*queue, &submits, vk::Fence::null()) }
-                .map_err(|e| core.fault("vkQueueSubmit", e))?;
-        }
-        self.inner.segmented.store(true, Ordering::Release);
         self.inner
             .segments
             .lock()
             .expect("segments lock poisoned")
+            .push(cmd);
+        self.inner
+            .held
+            .lock()
+            .expect("held lock poisoned")
             .push(cmd);
         // SAFETY: `cmd_pool` is this frame's (this thread's) pool.
         let next = unsafe {
@@ -2052,6 +2291,17 @@ impl Frame {
             let bufs = [cmd];
             let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
             let queue = core.queue.lock().expect("queue lock poisoned");
+            // A split step's held segments go first, in order.
+            let held = std::mem::take(&mut *self.inner.held.lock().expect("held lock poisoned"));
+            for segment in held {
+                let bufs = [segment];
+                let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
+                // SAFETY: `segment` was ended and never submitted; it has no
+                // fence; the queue is held under its lock.
+                unsafe { d.queue_submit(*queue, &submits, vk::Fence::null()) }
+                    .map_err(|e| core.fault("vkQueueSubmit", e))?;
+                self.inner.segmented.store(true, Ordering::Release);
+            }
             // SAFETY: `cmd` is executable, the fence is unsignaled (reset after
             // each wait) and the queue is held under its lock.
             unsafe { d.queue_submit(*queue, &submits, self.inner.fence) }
@@ -2129,6 +2379,18 @@ impl Frame {
         let bufs = [self.inner.cmd()];
         let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
         let queue = core.queue.lock().expect("queue lock poisoned");
+        // A split step's segments first, each its own submission, back to
+        // back under the one hold of the queue.
+        let held = std::mem::take(&mut *self.inner.held.lock().expect("held lock poisoned"));
+        for segment in held {
+            let bufs = [segment];
+            let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
+            // SAFETY: `segment` was ended and never submitted; it has no
+            // fence; the queue is held under its lock.
+            unsafe { core.device.queue_submit(*queue, &submits, vk::Fence::null()) }
+                .map_err(|e| core.fault("vkQueueSubmit", e))?;
+            self.inner.segmented.store(true, Ordering::Release);
+        }
         // SAFETY: `cmd` was just ended and never submitted, the fence is the
         // frame's own unsignaled one, and the queue is held under its lock.
         unsafe { core.device.queue_submit(*queue, &submits, self.inner.fence) }
@@ -2173,7 +2435,13 @@ impl Frame {
 
     /// A spanned frame's closing timestamp, written while it is open.
     fn stamp_end(&self) {
-        let span = *self.inner.span.lock().expect("span lock poisoned");
+        let span = self
+            .inner
+            .span
+            .lock()
+            .expect("span lock poisoned")
+            .as_ref()
+            .map(|stamps| stamps.0.pool);
         if let Some(pool) = span
             && self.open
         {
@@ -2193,18 +2461,24 @@ impl Frame {
     /// A [`Context::spanned_kept`] frame, its closing timestamp written,
     /// kept to replay ([`Kept::replay_spanned`]).
     pub fn into_kept_spanned(self) -> Result<Kept> {
-        self.stamp_end();
         self.into_kept()
     }
 
+    /// Kept to replay; a spanned frame's closing timestamp written first,
+    /// so each replay writes both anew.
     pub fn into_kept(mut self) -> Result<Kept> {
+        self.stamp_end();
         self.end()?;
         Ok(Kept {
             inner: Arc::clone(&self.inner),
         })
     }
 
+    /// Submits; `on_done` runs once it lands. A spanned frame's closing
+    /// timestamp is written first, so [`Pending::span_ns`] reads its device
+    /// time once it landed.
     pub fn commit_async(mut self, on_done: Option<engine_gpu::backend::OnDone>) -> Result<Pending> {
+        self.stamp_end();
         let at = crate::encode::profiling().then(std::time::Instant::now);
         self.submit()?;
         if let Some(at) = at {
@@ -2370,6 +2644,9 @@ impl Landing {
     }
 }
 
+/// A clone is the same submission: each of the sessions whose passes one
+/// frame carries keeps one, and the frame's last drop waits on its fence.
+#[derive(Clone)]
 pub struct Pending {
     inner: Arc<Inner>,
     /// Set where a watcher thread is the fence's one waiter.
@@ -2404,6 +2681,9 @@ impl Pending {
         let (watched, told) = (Arc::clone(inner), Arc::clone(&landing));
         std::thread::spawn(move || {
             let result = watched.block_on_fence();
+            if result.is_ok() {
+                watched.landed_pools();
+            }
             on_done(
                 result
                     .err()
@@ -2428,12 +2708,38 @@ impl Pending {
         if let Some(at) = at {
             crate::encode::credit_fence(at.elapsed().as_nanos() as u64);
         }
+        self.inner.landed_pools();
         self.inner.harvest_timing();
         Ok(())
+    }
+
+    /// The device's time between a spanned frame's two timestamps, ns, read
+    /// once it landed (its fence waited: the read waits on nothing more);
+    /// `None` for a frame that writes none.
+    pub fn span_ns(&self) -> Result<Option<u64>> {
+        self.inner.span_ns()
     }
 }
 
 impl Inner {
+    /// A one-time frame landed: its descriptor pools go back now, not when
+    /// its last handle drops (a session holds a landed pass's until the
+    /// next departs).
+    fn landed_pools(&self) {
+        if self.one_time {
+            self.give_pools();
+        }
+    }
+
+    /// Gives every descriptor pool the frame holds back to the spares, and
+    /// the sets it kept of them: once only.
+    fn give_pools(&self) {
+        let pools: Vec<vk::DescriptorPool> =
+            std::mem::take(&mut *self.pools.lock().expect("pools lock poisoned"));
+        self.spare.lock().expect("spare lock poisoned").clear();
+        self.core.give_pools(pools, self.one_time);
+    }
+
     /// Blocks on this frame's fence. Only a frame's one waiter calls this:
     /// a watcher thread where the frame has one, else [`Pending::wait`].
     fn block_on_fence(&self) -> std::result::Result<(), vk::Result> {
@@ -2513,6 +2819,112 @@ mod tests {
     use std::time::Instant;
 
     use super::{Context, Ordering};
+
+    /// A storage-buffer set layout, as a kernel's.
+    fn layout(context: &Context) -> ash::vk::DescriptorSetLayout {
+        use ash::vk;
+        let bindings = [vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)];
+        // SAFETY: the device is live and the create info outlives the call.
+        unsafe {
+            context
+                .core
+                .device
+                .create_descriptor_set_layout(
+                    &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                    None,
+                )
+                .expect("a set layout")
+        }
+    }
+
+    /// Serving makes no descriptor pool: with every stocked pool held by a
+    /// frame in flight, one more frame waits for one to come back rather
+    /// than making its own, and every pool is free again once they land.
+    #[test]
+    fn serving_with_every_pool_lent_waits_and_makes_none() {
+        let bound = Context::bind(&crate::api::DeviceBoot::default(), engine::Allowance::WHOLE);
+        let Ok(context) = bound else {
+            eprintln!("not asked: {:?}", bound.err());
+            return;
+        };
+        let layout = layout(&context);
+        context.seal_descriptor_pools(2).unwrap();
+        let (stock, lent, _) = context.descriptor_pools();
+        assert_eq!(lent, 0);
+        // Every stocked pool lent, each to a frame on the queue.
+        let busy: Vec<super::Frame> = (0..stock)
+            .map(|_| {
+                let frame = context.frame().unwrap();
+                frame.descriptor_set(layout).unwrap();
+                frame
+            })
+            .collect();
+        assert_eq!(context.descriptor_pools(), (0, stock, 0));
+        let context = Arc::new(context);
+        let waiting = {
+            let context = Arc::clone(&context);
+            std::thread::spawn(move || {
+                let frame = context.frame().unwrap();
+                frame.descriptor_set(layout).unwrap();
+                frame.commit().unwrap();
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!waiting.is_finished(), "a frame made a pool while serving");
+        for frame in busy {
+            frame.commit().unwrap();
+        }
+        waiting.join().unwrap();
+        assert_eq!(
+            context.descriptor_pools(),
+            (stock, 0, 0),
+            "a pool was made after the seal, or one never came back"
+        );
+        // SAFETY: no set of the layout is in use: every frame landed.
+        unsafe {
+            context
+                .core
+                .device
+                .destroy_descriptor_set_layout(layout, None)
+        };
+    }
+
+    /// Where no frame holds a pool to give back, a frame asking for one
+    /// while serving is refused by name, not given a new pool.
+    #[test]
+    fn a_frame_finding_no_pool_and_none_lent_is_refused() {
+        let bound = Context::bind(&crate::api::DeviceBoot::default(), engine::Allowance::WHOLE);
+        let Ok(context) = bound else {
+            eprintln!("not asked: {:?}", bound.err());
+            return;
+        };
+        let layout = layout(&context);
+        context.seal_descriptor_pools(0).unwrap();
+        let (stock, ..) = context.descriptor_pools();
+        let held: Vec<super::Frame> = (0..stock)
+            .map(|_| {
+                let frame = context.frame_kept().unwrap();
+                frame.descriptor_set(layout).unwrap();
+                frame
+            })
+            .collect();
+        let frame = context.frame().unwrap();
+        let refused = frame.descriptor_set(layout).unwrap_err().to_string();
+        assert!(refused.contains("no spare descriptor pool"), "{refused}");
+        drop(frame);
+        drop(held);
+        // SAFETY: no set of the layout is in use.
+        unsafe {
+            context
+                .core
+                .device
+                .destroy_descriptor_set_layout(layout, None)
+        };
+    }
 
     /// A build marks the cache changed and returns without writing it (no
     /// submission or build waits on the file); the cache's writer writes it,

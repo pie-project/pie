@@ -88,7 +88,7 @@ fn a_stage_past_the_submit_bound_is_refused_by_name() {
         panic!("{refused}");
     };
     assert_eq!((stage, bound_ns), (Stage::Epilogue, PHONE.bound_ns));
-    assert!(cost_ns > 80_000_000_000, "{cost_ns}");
+    assert!(cost_ns > 80_000_000_000.0, "{cost_ns}");
     assert!(refused.to_string().contains("submission"), "{refused}");
 
     // A device stating no bound holds the stage to none.

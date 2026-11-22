@@ -451,7 +451,21 @@ impl Model {
 
 /// The miniature loaded with `frames` in flight.
 fn load(frames: u8) -> Option<(Model, InstanceId)> {
-    let boot = crate::gpu::device_boot();
+    load_under(frames, None, PAGE)
+}
+
+/// [`load`] for fires of up to `tokens` rows, a set's kv pages for as many
+/// rows past its own, on a device whose platform states `bound` on one GPU
+/// submission where given (the boot's, `test-limits`).
+fn load_under(
+    frames: u8,
+    bound: Option<Duration>,
+    tokens: u32,
+) -> Option<(Model, InstanceId)> {
+    let boot = crate::backend::DeviceBoot {
+        submit_bound: bound,
+        ..crate::gpu::device_boot()
+    };
     if backend::Context::bind(&boot, backend::ALLOWANCE).is_err() {
         eprintln!("not asked: no device");
         return None;
@@ -464,11 +478,11 @@ fn load(frames: u8) -> Option<(Model, InstanceId)> {
             checkpoint: Checkpoint::Path(fixture.container.clone()),
             budgets: Budgets {
                 max_lanes: 4,
-                max_tokens: PAGE,
-                buckets: vec![PAGE],
+                max_tokens: tokens,
+                buckets: vec![tokens],
                 max_adapters: 0,
                 page_size: PAGE,
-                max_context: 64,
+                max_context: 64.max(2 * tokens),
                 context_declared: false,
                 slots: SETS + 1,
                 max_patches: None,
@@ -514,7 +528,7 @@ fn load(frames: u8) -> Option<(Model, InstanceId)> {
     // rs slots and its record).
     let per = |id| facts.shape(id).map_or(1, |shape| shape.slots_per_chunk);
     let need = 2
-        + (SETS * ((PROMPT + 3 * ROWS).div_ceil(PAGE) + 1)).div_ceil(per(LIST))
+        + (SETS * ((PROMPT + 3 * ROWS).max(tokens + 1).div_ceil(PAGE) + 1)).div_ceil(per(LIST))
         + (SETS * rs_pages).div_ceil(per(RS))
         + (SETS * pieces).div_ceil(per(FIXED));
     let segment = facts.segment_chunks;
@@ -735,4 +749,292 @@ fn a_two_run_lineage_replays_both_runs() {
         one == two,
         "a lineage of two runs side by side replays what one run over the same slots replays"
     );
+}
+
+/// Under a stated submit bound small enough that one layer of a 512-row
+/// prompt step of qwen35-tiny (attention and gated-delta recurrent layers)
+/// is past it, the step is cut by rows (`engine_gpu::submit::row_pieces`),
+/// its recurrent state carried piece to piece in its record, and serves
+/// what it served whole under a roomy bound: its last logits, and a decode
+/// after it read from the record the pieces left. The tight load is booted
+/// under a stated bound, then held to one between a row's layer and the
+/// step's at the ratio its rates step measured alone (`Shell::hold_to`: a
+/// desktop GPU's idle probe swings 1x to 7x from frame to frame).
+#[test]
+fn a_hybrid_prompt_past_the_bound_a_layer_at_a_time_is_cut_by_rows_and_serves_alike() {
+    use engine_gpu::submit::{Admitted, StepRows};
+    const LONG: u32 = 512;
+    let step = StepRows {
+        rows: LONG,
+        lanes: 1,
+        keys: LONG,
+        prompt: true,
+    };
+    let prompt: Vec<u32> = (0..LONG).map(|at| (at * 37 + 11) % 256).collect();
+    // The prompt, the load's first fire, on a set of its own held to
+    // `bound`, then a decode of its argmax held to a roomy one: the logits
+    // of both, and the fires the prompt's step took past its own (its
+    // leading row pieces: fire ids run one a fire from 1).
+    let serve = |model: &mut Model, bound: f64| -> (Vec<f32>, Vec<f32>, u64) {
+        let kv: Vec<u32> = (0..(LONG + 1).div_ceil(PAGE))
+            .map(|_| model.refs.take(LIST))
+            .collect();
+        let record: Vec<[u32; 2]> = (0..model.pieces)
+            .map(|_| {
+                let piece = model.refs.take(FIXED);
+                [piece, piece]
+            })
+            .collect();
+        let trace = model.trace.clone();
+        let lane = |tokens: Vec<u32>, held: u32, rs_reset: RsReset| Lane {
+            slot: 0,
+            word: word(&trace, tokens.len() as u32),
+            kv: KvDelta {
+                held,
+                ..KvDelta::default()
+            },
+            readout: Readout::Last,
+            tables: vec![(LIST, kv.clone())],
+            record: engine::fire::LaneRecord::Pieces(vec![(FIXED, record.clone())]),
+            rs: RsVerb::Fold,
+            rs_reset,
+            tokens,
+            ..Lane::default()
+        };
+        let mut fire = |lane: Lane, bound: f64| {
+            model.engine.loaded_mut().expect("loaded").hold_to(bound);
+            let mut ticket = model.submit(lane, None);
+            let bits = model.settled(&mut ticket);
+            let values: Vec<f32> = bits.into_iter().map(f32::from_bits).collect();
+            (ticket.steps[0].id.0, values)
+        };
+        let (at, prompted) = fire(lane(prompt.clone(), 0, RsReset::Fresh), bound);
+        let next = crate::model_logits::argmax(&prompted);
+        let (after, decoded) = fire(lane(vec![next], LONG, RsReset::Held), 2e9);
+        assert_eq!(after, at + 1, "the decode is the fire after the prompt's last");
+        (prompted, decoded, at - 1)
+    };
+    let held_of = |model: &Model| {
+        model
+            .engine
+            .loaded()
+            .expect("loaded")
+            .submit_bound()
+            .expect("the bound the boot states")
+            .clone()
+    };
+    let Some((mut roomy, _)) = load_under(1, Some(Duration::from_secs(2)), LONG) else {
+        return;
+    };
+    let held = held_of(&roomy);
+    assert!(matches!(held.admit(step), Admitted::Whole { .. }), "{:?}", held.admit(step));
+    let (whole, whole_decode, pieces) = serve(&mut roomy, 2e9);
+    assert_eq!(pieces, 0, "a step within the bound is fired whole");
+    drop(roomy);
+    let Some((mut cut, _)) = load_under(1, Some(Duration::from_secs(2)), LONG) else {
+        return;
+    };
+    // A bound between one row's layer and the whole step's as `admit` reads
+    // them once held (at the ratio the rates step measured alone: the
+    // load's probe read the clock of a device idle since its boot, an L40S
+    // at ~210 MHz, and a hold drops that scale): a layer of the step past
+    // it, a row's within.
+    cut.engine.loaded_mut().expect("loaded").hold_to(2e9);
+    let held = held_of(&cut);
+    let layer = |rows: u32| held.step_ns(StepRows { rows, ..step }).1;
+    let tight = (layer(1) * layer(LONG)).sqrt();
+    eprintln!(
+        "a layer of 1 row {:.3} ms, of {LONG} rows {:.3} ms; the bound {:.3} ms",
+        layer(1) / 1e6,
+        layer(LONG) / 1e6,
+        tight / 1e6,
+    );
+    cut.engine.loaded_mut().expect("loaded").hold_to(tight);
+    let held = held_of(&cut);
+    cut.engine.loaded_mut().expect("loaded").hold_to(2e9);
+    assert!(
+        matches!(held.admit(step), Admitted::Refused { .. }),
+        "a layer of the step is past the bound: {:?}",
+        held.admit(step)
+    );
+    let piece_rows = held.rows_a_piece(step, LONG).expect("a piece of fewer rows fits");
+    assert!(piece_rows < LONG);
+    // Pieces of at most `piece_rows` rows, fewer as the pieces landed raise
+    // the ratio each next one is cut at.
+    let (pieced, pieced_decode, pieces) = serve(&mut cut, tight);
+    assert!(
+        pieces >= u64::from(LONG.div_ceil(piece_rows) - 1),
+        "the step went out in {pieces} + 1 pieces, of at most {piece_rows} rows"
+    );
+    let cosine = |a: &[f32], b: &[f32]| {
+        let dot: f64 = a.iter().zip(b).map(|(x, y)| f64::from(*x) * f64::from(*y)).sum();
+        let norm = |v: &[f32]| v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+        dot / (norm(a) * norm(b)).max(f64::MIN_POSITIVE)
+    };
+    for (what, a, b) in [("prompt", &whole, &pieced), ("decode", &whole_decode, &pieced_decode)] {
+        assert!(a.iter().chain(b.iter()).all(|v| v.is_finite()), "{what}: finite");
+        let (wa, wb) = (crate::model_logits::argmax(a), crate::model_logits::argmax(b));
+        assert_eq!(wa, wb, "{what}: the same argmax whole and in pieces");
+        let cos = cosine(a, b);
+        assert!(cos > 0.999, "{what}: logits whole and in pieces at cosine {cos}");
+        eprintln!("{what}: cosine {cos:.6} whole against {pieces} + 1 pieces of at most {piece_rows} rows");
+    }
+}
+
+/// Under a stated submit bound small enough that one layer of a step of two
+/// 256-row qwen35-tiny prompts is past it, the step is cut lane by lane,
+/// then by rows (`engine_gpu::submit::next_cut`): each prompt lane its own
+/// sequence of pieces, its recurrent state carried in its own record, both
+/// lanes' last rows in the step's last piece. Both prompts' logits, and a
+/// decode of both after, are what the step served whole.
+#[test]
+fn a_step_of_two_hybrid_prompts_past_the_bound_is_cut_lane_by_lane_and_serves_alike() {
+    use engine_gpu::submit::{Admitted, StepRows};
+    const EACH: u32 = 256;
+    let prompts: [Vec<u32>; 2] = [
+        (0..EACH).map(|at| (at * 37 + 11) % 256).collect(),
+        (0..EACH).map(|at| (at * 53 + 5) % 256).collect(),
+    ];
+    let step = StepRows {
+        rows: 2 * EACH,
+        lanes: 2,
+        keys: EACH,
+        prompt: true,
+    };
+    // Both prompts in one step held to `bound`, the load's first fire,
+    // then a decode of both held to a roomy one: each lane's logits of
+    // both, and the fires the prompts' step took past its own.
+    let serve = |model: &mut Model, bound: f64| -> (Vec<Vec<f32>>, Vec<Vec<f32>>, u64) {
+        let trace = model.trace.clone();
+        let sets: Vec<(Vec<u32>, Vec<[u32; 2]>)> = (0..2)
+            .map(|_| {
+                let kv = (0..(EACH + 1).div_ceil(PAGE))
+                    .map(|_| model.refs.take(LIST))
+                    .collect();
+                let record = (0..model.pieces)
+                    .map(|_| {
+                        let piece = model.refs.take(FIXED);
+                        [piece, piece]
+                    })
+                    .collect();
+                (kv, record)
+            })
+            .collect();
+        let lane = |at: usize, tokens: Vec<u32>, held: u32, rs_reset: RsReset| Lane {
+            slot: at as u32,
+            word: word(&trace, tokens.len() as u32),
+            kv: KvDelta {
+                held,
+                ..KvDelta::default()
+            },
+            readout: Readout::Last,
+            tables: vec![(LIST, sets[at].0.clone())],
+            record: engine::fire::LaneRecord::Pieces(vec![(FIXED, sets[at].1.clone())]),
+            rs: RsVerb::Fold,
+            rs_reset,
+            tokens,
+            ..Lane::default()
+        };
+        let mut fire = |lanes: Vec<Lane>, bound: f64| {
+            model.engine.loaded_mut().expect("loaded").hold_to(bound);
+            let mut ticket = model
+                .engine
+                .submit(&FrameSubmission::of(Step {
+                    lanes,
+                    attachments: Vec::new(),
+                    media: Vec::new(),
+                    voxels: Vec::new(),
+                }))
+                .unwrap_or_else(|why| panic!("the step fires: {why}"));
+            model.engine.settle_frame(&mut ticket).expect("the step settles");
+            let step = &ticket.steps[0];
+            (
+                step.id.0,
+                step.readouts.iter().map(|r| r.values.clone()).collect::<Vec<_>>(),
+            )
+        };
+        let (at, prompted) = fire(
+            (0..2)
+                .map(|at| lane(at, prompts[at].clone(), 0, RsReset::Fresh))
+                .collect(),
+            bound,
+        );
+        assert_eq!(prompted.len(), 2, "both lanes read out");
+        let (after, decoded) = fire(
+            (0..2)
+                .map(|at| {
+                    let next = crate::model_logits::argmax(&prompted[at]);
+                    lane(at, vec![next], EACH, RsReset::Held)
+                })
+                .collect(),
+            2e9,
+        );
+        assert_eq!(after, at + 1, "the decode is the fire after the prompts' last");
+        (prompted, decoded, at - 1)
+    };
+    let held_of = |model: &Model| {
+        model
+            .engine
+            .loaded()
+            .expect("loaded")
+            .submit_bound()
+            .expect("the bound the boot states")
+            .clone()
+    };
+    let Some((mut roomy, _)) = load_under(1, Some(Duration::from_secs(2)), 2 * EACH) else {
+        return;
+    };
+    let (whole, whole_decode, pieces) = serve(&mut roomy, 2e9);
+    assert_eq!(pieces, 0, "a step within the bound is fired whole");
+    drop(roomy);
+    let Some((mut cut, _)) = load_under(1, Some(Duration::from_secs(2)), 2 * EACH) else {
+        return;
+    };
+    // A bound between one row's layer and the two-prompt step's as `admit`
+    // reads them once held (at the ratio the rates step measured alone: a
+    // hold drops the scale the load's probe read off a device idle since
+    // its boot): a layer of the step past it, a row's within it.
+    cut.engine.loaded_mut().expect("loaded").hold_to(2e9);
+    let held = held_of(&cut);
+    let layer = |s: StepRows| held.step_ns(s).1;
+    let one = StepRows {
+        rows: 1,
+        lanes: 1,
+        keys: EACH,
+        prompt: true,
+    };
+    let tight = (layer(one) * layer(step)).sqrt();
+    eprintln!(
+        "a layer of 1 row {:.3} ms, of two {EACH}-row prompts {:.3} ms; the bound {:.3} ms",
+        layer(one) / 1e6,
+        layer(step) / 1e6,
+        tight / 1e6,
+    );
+    cut.engine.loaded_mut().expect("loaded").hold_to(tight);
+    let held = held_of(&cut);
+    assert!(
+        matches!(held.admit(step), Admitted::Refused { .. }),
+        "a layer of the step is past the bound: {:?}",
+        held.admit(step)
+    );
+    let (pieced, pieced_decode, pieces) = serve(&mut cut, tight);
+    assert!(pieces >= 2, "each prompt lane cut off in a piece at least: {pieces}");
+    let cosine = |a: &[f32], b: &[f32]| {
+        let dot: f64 = a.iter().zip(b).map(|(x, y)| f64::from(*x) * f64::from(*y)).sum();
+        let norm = |v: &[f32]| v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+        dot / (norm(a) * norm(b)).max(f64::MIN_POSITIVE)
+    };
+    for lane in 0..2 {
+        for (what, a, b) in [
+            ("prompt", &whole[lane], &pieced[lane]),
+            ("decode", &whole_decode[lane], &pieced_decode[lane]),
+        ] {
+            assert!(a.iter().chain(b.iter()).all(|v| v.is_finite()), "lane {lane} {what}: finite");
+            let (wa, wb) = (crate::model_logits::argmax(a), crate::model_logits::argmax(b));
+            assert_eq!(wa, wb, "lane {lane} {what}: the same argmax whole and in pieces");
+            let cos = cosine(a, b);
+            assert!(cos > 0.999, "lane {lane} {what}: logits at cosine {cos}");
+            eprintln!("lane {lane} {what}: cosine {cos:.6} whole against {pieces} + 1 pieces");
+        }
+    }
 }

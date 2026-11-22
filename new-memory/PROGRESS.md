@@ -1496,11 +1496,16 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - MI300X speed table (AMD), main 30abc9d5 vs tip+parity (= M119), all bodies armed: Qwen3-8B / gemma-4-E4B /
   Qwen3-30B-A3B / Qwen3.5-9B decode c1..c256 and prefill 512 / 2048 at parity or better; boot faster on every model
   (8B 19.5 vs 26.4 s, gemma 18.8 vs 20.6, 30B 21.2 vs 24.8, Qwen3.5 21.3 vs 36.5). c256 ~510 tok/s stall is
-  intermittent on main too. Open: ROCm capacity -4.6% (M118's bodies stretch is held out of a flat range for good;
-  fix sc/rocm-flat-fit in test).
+  intermittent on main too. ROCm capacity: the -4.6% closed with sc/rocm-flat-fit (e6dae80b7). MI300X kv
+  device_pages vs main 236982f97, same config (16-token pages on both): Qwen3-8B 75984 vs 60496 (+25.6%),
+  Qwen3.5-9B 301415 vs 248370 (+21%), Qwen3-30B-A3B 125712 vs 66312 (+90%) on a boot holding its bodies' record.
+  A measuring boot (no record) kept the least range its bodies armed over for its life on a flat range whose
+  weights it preseats (30B first boot 37170 pages, -44% vs main): sc/amd-measuring-refit reserves the range anew
+  at the refit and seats the weights again (30B: 125676 measuring vs 125712 recorded; 2048 weight chunks reseated
+  in 5.8 s); golden_measuring_refit gates it (glm53-mini u4g64 9104 = 9104, base 91).
 - A4 step 1 (813def0b, AMD): ROCm streams affine expert banks through the weight cache (layout, ranking, bank_table,
-  HIP biased / quantized selects read the table). MXFP4 (lane-ordered banks, bias_sum) and block FP8 stay resident
-  as main serves them. MI300X glm53-mini u4g64: cached / told held / moved = resident bitwise; host / mixed differ
+  HIP biased / quantized selects read the table). MXFP4 (lane-ordered banks, bias_sum) and block FP8 stayed resident
+  as main served them then (both stream since: the MXFP4 and block-FP8 entries below). MI300X glm53-mini u4g64: cached / told held / moved = resident bitwise; host / mixed differ
   at 6.25e-2 (per-route vs batch u4 arm, 0/12 top tokens) — strict host equality queued with step (b).
 - XLA after the main merge (TPU, v6e): XLA gates pass on memory-followups; speed vs pre-merge prefill +12.8 / +7.3 /
   +25.6 %, decode at parity.
@@ -1517,7 +1522,13 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   parity, then miss cost c1/c64. Pooled arm kernel-tested bitwise (sc/xla-stream 61e3d06e3), not wired yet.
 - A4 (b) piece (AMD; merged 8f17ef344, 53b9faf43): streamed affine banks take the held batch/grouped arms -> strict
   host equality (glm53-mini u4g64 all five modes a4cac630); batch arm on host-mapped banks 7.8 ms vs 66.6 ms per-route
-  (c64 gate_up). bias_sum reads through an expert table. Next: MXFP4 lane order via tables.
+  (c64 gate_up). bias_sum reads through an expert table. Next: MXFP4 lane order via tables (done since: 33f3d40c
+  biased / not lane-ordered, 0f4b22e8 lane-ordered, 41d4ddb7 told held from the file).
+- A4 block FP8 (AMD; sc/amd-fp8-stream): ROCm streams fp8 expert banks (e4m3 codes beside f32 factors a 128x128
+  block) through the weight cache, their codes put in the FP8 matrix core's order where a copy lies (a pinned copy in
+  place; a told-held load's slots once filled), bounded staging, NaN refusal kept; the fp8 selects read the table.
+  MI300X glm53-mini-bf16-e4m3tile128a8: cached / told held / moved / host / mixed / mixed told held all
+  bc198e3485ffefe7 = the resident golden on main, strict. CUDA's fp8 path unchanged (ROCm-only by cfg). A4 done.
 - Governor `yield` (user ruling 2026-11-15; sc/np-governor-yield): `[engine.memory] governor_backoff` /
   `governor_release_idle` and the loop constants PATIENCE, IDLE_AFTER, CUT_EVERY, CUT_SHARE, SETTLED, KEEP_CACHE
   (with FIRST_HOLD / LONGEST_HOLD, GROWTH_STEP and macOS's refault MIN_EVICTED / THRASHING) are gone for one key,

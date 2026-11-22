@@ -142,7 +142,8 @@ impl Shell {
             _ => Vec::new(),
         };
         let lanes = u32::try_from(prepared.lanes.len()).unwrap_or(u32::MAX);
-        let slot = prepared.slot.take();
+        // Its staging slot comes back as the step lands.
+        let slot = prepared.slot.take().map(crate::inputs::SlotGuard::landing);
         drop(prepared);
 
         // The guest passes this step launched that land with it: their
@@ -190,12 +191,13 @@ impl Shell {
             .chain(page_faults.iter().map(|&(word, _, _)| word))
             .chain(commons.iter().map(|&(word, _)| word))
             .collect();
-        let at = self.settlement.claim()?;
+        let event = self.settlement.claim()?;
+        let at = event.at();
         let tap = match self.tap_tokens(at, &reports, &commits) {
             Ok(tap) => tap,
             Err(fault) => {
                 let _ = self.device.synchronize();
-                self.settlement.recycler().give(at);
+                drop(event);
                 drop(slot);
                 lost(done, fault)?;
                 return Ok(Settled::default());
@@ -217,13 +219,14 @@ impl Shell {
         if let Err(fault) = ordered {
             let _ = self.device.synchronize();
             airborne.abandon();
-            self.settlement.recycler().give(at);
+            drop(event);
             drop(slot);
             lost(done, fault)?;
             return Ok(Settled::default());
         }
 
-        let recycler = self.settlement.recycler();
+        // Its settle event comes back as the step lands.
+        let event = event.landing();
         let told = done.clone();
         let posted = self.device.host_fn(Box::new(move || {
             // Read before the event goes back: its tap is the next step's then.
@@ -270,7 +273,7 @@ impl Shell {
                 }
             }
             drop(slot);
-            recycler.give(at);
+            drop(event);
             airborne.leave();
             if let Some(done) = done {
                 (done.sink)(done.at, outcome);
@@ -278,8 +281,9 @@ impl Shell {
         }));
         if let Err(fault) = posted {
             let _ = self.device.synchronize();
+            // The step's landing, never posted, gave its event back as it
+            // dropped.
             self.airborne.abandon();
-            self.settlement.recycler().give(at);
             lost(told, fault)?;
             return Ok(Settled::default());
         }

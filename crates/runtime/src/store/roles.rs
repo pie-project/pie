@@ -90,11 +90,50 @@ pub enum Owner {
 }
 
 impl Owner {
+    /// Its place in an order of owners: kind, then id.
+    fn order(&self) -> (u8, u128, [u32; 5]) {
+        match self {
+            Owner::Instance(id) => (0, u128::from(id.0), [0; 5]),
+            Owner::Channel(id) => (1, u128::from(id.0), [0; 5]),
+            Owner::Adapter(key) => (2, *key, [0; 5]),
+            Owner::Pair(key) => {
+                let at = key.extents;
+                (
+                    3,
+                    u128::from(key.program.0),
+                    [at.row_count, at.token_count, at.sampled_rows, at.query_len, at.key_len],
+                )
+            }
+        }
+    }
+}
+
+impl PartialOrd for Owner {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Owner {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.order().cmp(&other.order())
+    }
+}
+
+// The items by owner: under test in owner order, so a seeded simulation's
+// parks and unparks lay their slots the same on each run; in service they
+// hash.
+#[cfg(test)]
+type Items = std::collections::BTreeMap<Owner, Item>;
+#[cfg(not(test))]
+type Items = HashMap<Owner, Item>;
+
+impl Owner {
     /// Whose slots `rebind` moves.
     #[must_use]
     pub fn of(rebind: &Rebind) -> Self {
         match rebind {
-            Rebind::Instance { id, .. } => Owner::Instance(*id),
+            Rebind::Instance { id, .. } | Rebind::Parked { id, .. } => Owner::Instance(*id),
             Rebind::Channel { id, .. } => Owner::Channel(*id),
         }
     }
@@ -131,6 +170,17 @@ pub enum RolesError {
         channel: ChannelId,
         holder: Option<Holder>,
     },
+    /// The process binding is not resident (evicted, or on its way off or
+    /// back onto the device): a bind of it waits for it to be resident
+    /// again ([`bind_when_resident`]), as one on a channel parked with it
+    /// does. Bound meanwhile, its instance stood on the device outside its
+    /// process's park, never said parked to the engine, while the pair it
+    /// joined went down with a later move of that process's and its run was
+    /// taken by another (the simulation's seed 1116: a rescore's bind on a
+    /// process evicted with its first program closed, holding no item the
+    /// park could take).
+    #[error("its process is parked or moving")]
+    HolderParked(Holder),
     #[error("the adapter this binding lands is parked with the instances that hold it")]
     AdapterParked,
     /// The pair's state is on its way to or from the host with the
@@ -278,8 +328,14 @@ pub const GUEST_WAITER: u64 = u64::MAX - 1;
 /// budget hold ([`super::slots::SlotPool::committable_runs`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuestRoom {
-    /// One run of `slots` adjacent `Instance` slots in a chunk.
-    Slots { slots: u32, committable: u32 },
+    /// One run of `slots` adjacent `Instance` slots in a chunk; `chunks`,
+    /// the fresh chunks the whole bind asks with it (each of its parts a
+    /// run of slots, the part short first among them), at least one.
+    Slots {
+        slots: u32,
+        committable: u32,
+        chunks: u32,
+    },
     /// `pieces` runs of `run` adjacent whole chunks, each inside one
     /// segment, and the free runs of that length and free chunks there
     /// were.
@@ -298,7 +354,7 @@ impl GuestRoom {
     #[must_use]
     pub fn chunk_runs(self) -> (u32, u32) {
         match self {
-            Self::Slots { .. } => (1, 1),
+            Self::Slots { chunks, .. } => (1, chunks.max(1)),
             Self::Runs { run, pieces, .. } => (run, pieces),
         }
     }
@@ -327,15 +383,29 @@ impl GuestRoom {
                 free_chunks,
                 committable,
             },
-            slots => slots,
+            // Each of the bind's parts a run of slots opening a chunk of its
+            // own: the room asked is every one of them, never the part short
+            // first alone (seed 16 of the simulation: an instance's and its
+            // pair's runs each opening a chunk, refused as one, served one
+            // chunk, short again, a spin).
+            Self::Slots {
+                slots,
+                committable,
+                chunks,
+            } => Self::Slots {
+                slots,
+                committable,
+                chunks: chunks.max(whole),
+            },
         }
     }
 
     fn with_committable(self, runs: u32) -> Self {
         match self {
-            Self::Slots { slots, .. } => Self::Slots {
+            Self::Slots { slots, chunks, .. } => Self::Slots {
                 slots,
                 committable: runs,
+                chunks,
             },
             Self::Runs {
                 run,
@@ -390,7 +460,12 @@ impl RolesError {
 impl std::fmt::Display for GuestRoom {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Slots { slots, .. } => write!(f, "no chunk has a run of {slots} free slots")?,
+            Self::Slots { slots, chunks, .. } => {
+                write!(f, "no chunk has a run of {slots} free slots")?;
+                if *chunks > 1 {
+                    write!(f, " (the bind opens {chunks} chunks)")?;
+                }
+            }
             Self::Runs {
                 run,
                 pieces,
@@ -432,7 +507,9 @@ enum Tier {
 /// contents are dead between fires, is never copied and holds nothing off
 /// the device (`refs` empty there), fresh room taken when it comes back:
 /// `pieces` runs of `chunks` adjacent whole chunks, or (`run`) one run of
-/// that many slots.
+/// that many slots. A guest part holding resident bytes (`held`,
+/// `engine::GuestState::resident`) is laid the same way and copied as a
+/// live part is: down a tier at a park, back into fresh runs at an unpark.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Part {
     role: SlotRole,
@@ -441,14 +518,19 @@ struct Part {
     pieces: u32,
     chunks: u32,
     run: u32,
-    /// A guest's resident state ([`GuestState::resident`]): live, one run
-    /// of adjacent slots, moved as the instance's tables are.
-    resident: bool,
+    held: bool,
 }
 
 impl Part {
-    /// Guest scratch, dead between fires.
+    /// Guest scratch, dead between fires: given back at a park, never
+    /// copied.
     fn dead(&self) -> bool {
+        self.shaped() && !self.held
+    }
+
+    /// A guest part, laid on the device as runs of whole chunks or a run
+    /// of slots ([`Roles::retake`]), dead or held.
+    fn shaped(&self) -> bool {
         self.pieces > 0 || self.run > 0
     }
 
@@ -466,6 +548,7 @@ impl Part {
             GuestRoom::Slots {
                 slots: self.run,
                 committable: 0,
+                chunks: 1,
             }
         }
     }
@@ -514,6 +597,15 @@ struct Item {
     /// let go meanwhile, it is given back only once the last of them has
     /// landed ([`Roles::landed`]), never under a fire still reading it.
     reads: u32,
+    /// A pair or an adapter: binds taken on it and not yet bound or given
+    /// back ([`Roles::take_instance`] to [`Roles::bound`] or
+    /// [`Roles::untake`]). The taker is no member yet, so it is in no
+    /// `attached`: held only by this, the item went with its last member's
+    /// park (or was given back as unheld) while the bind was on its way,
+    /// and the bind named slots another owner took next (the L40S at
+    /// 3 GiB on df488038b: a rescore's instance bound over a live pair's
+    /// run, `guest::claims` refused).
+    binds: u32,
     /// Which taking of its slots it lies in: a new one each time it is
     /// given fresh slots ([`Roles::next_generation`]). A pair's is the
     /// engine's to compare ([`::engine::InstanceBinding::pair_generation`]):
@@ -537,8 +629,21 @@ impl Item {
             stale: false,
             shed: false,
             reads: 0,
+            binds: 0,
             generation: 0,
         }
+    }
+
+    /// On the device and short of a dead part (guest scratch, a pair's
+    /// state) its rebind must name: parked where it lies ([`Self::shed`]),
+    /// or a dead part with no slots. Its unpark takes fresh ones in their
+    /// class before its restore commits, the runs counted in its need
+    /// ([`Roles::unpark_need`]): let through, the restore committed and
+    /// waited on a rebind no room was made for (Mac Pro at 2 GiB on
+    /// 1e87ab171: InstanceId(5), its process Restoring until teardown).
+    fn takes_fresh(&self) -> bool {
+        self.tier == Tier::Device
+            && (self.shed || self.parts.iter().any(|part| part.dead() && part.refs.is_empty()))
     }
 
     fn refs(&self) -> Vec<u32> {
@@ -569,6 +674,8 @@ pub struct Taken {
     /// The slots of an `Instance` chunk: a whole part's chunks are its
     /// refs over it.
     chunk_slots: u32,
+    /// The process whose bind took it ([`Roles::binds_on_way`]).
+    holder: Option<Holder>,
 }
 
 /// A bind's guest state taken before it registered anything
@@ -578,8 +685,37 @@ pub struct Taken {
 #[derive(Debug, Default)]
 pub struct GuestTaken {
     scratch: Option<Part>,
-    resident: Option<Part>,
     pair: Option<(FireKey, Part, bool, u64)>,
+    /// Its pair came back from a park for this bind: fresh room, kept on
+    /// the device whatever the bind's fate (the pair item's own).
+    pair_retaken: bool,
+}
+
+impl GuestTaken {
+    /// The runs of chunks its fresh parts took, `(run, pieces)` summed at
+    /// the longest run: what a bind short of room for its tables beside
+    /// them asks with its own chunk ([`Roles::bind_short`]).
+    fn fresh_runs(&self) -> Option<(u32, u32)> {
+        let parts: Vec<(u32, u32)> = self
+            .scratch
+            .iter()
+            .chain(
+                self.pair
+                    .iter()
+                    .filter(|(_, _, fresh, _)| *fresh || self.pair_retaken)
+                    .map(|(_, part, ..)| part),
+            )
+            .map(Part::chunk_runs)
+            .collect();
+        let longest = parts.iter().map(|&(run, _)| run).max()?;
+        Some((
+            longest,
+            parts
+                .iter()
+                .map(|&(run, pieces)| run.div_ceil(longest).saturating_mul(pieces))
+                .sum(),
+        ))
+    }
 }
 
 impl Taken {
@@ -611,12 +747,6 @@ impl Taken {
         scratch(&self.parts).map_or(ScratchPlace::None, |part| place(part, self.chunk_slots))
     }
 
-    /// [`::engine::InstanceBinding::resident`].
-    #[must_use]
-    pub fn resident(&self) -> ScratchPlace {
-        resident(&self.parts).map_or(ScratchPlace::None, |part| place(part, self.chunk_slots))
-    }
-
     /// [`::engine::InstanceBinding::pair`].
     #[must_use]
     pub fn pair(&self) -> ScratchPlace {
@@ -638,12 +768,7 @@ impl Taken {
 
 /// An instance's scratch: its dead part.
 fn scratch(parts: &[Part]) -> Option<&Part> {
-    parts.iter().find(|part| part.dead())
-}
-
-/// An instance's resident guest state: its live run past its tables.
-fn resident(parts: &[Part]) -> Option<&Part> {
-    parts.iter().find(|part| part.resident)
+    parts.iter().find(|part| part.shaped())
 }
 
 /// Where a dead part lies: its run's first slot ref and slots, or each of
@@ -767,18 +892,49 @@ impl RoleMove {
     pub fn copies(&self) -> &[RoleCopy] {
         &self.copies
     }
+
+    /// A park's instances, moved down or left where they lie
+    /// ([`Item::shed`]): each is said to the engine as parked
+    /// ([`Rebind::Parked`]) once the copies have landed and before the
+    /// commit gives its device slots to anyone else; a move down of one
+    /// parked where it lies says it again, its tables kept nowhere now.
+    /// None for an unpark.
+    #[must_use]
+    pub fn parked(&self) -> Vec<Rebind> {
+        if !self.out {
+            return Vec::new();
+        }
+        let parked = |kept: bool| {
+            move |(owner, _): &(Owner, Vec<Part>)| match *owner {
+                Owner::Instance(id) => Some(Rebind::Parked { id, kept }),
+                _ => None,
+            }
+        };
+        self.items
+            .iter()
+            .filter_map(parked(false))
+            .chain(self.shed.iter().filter_map(parked(true)))
+            .collect()
+    }
 }
 
 /// See the module docs.
 #[derive(Debug)]
 pub struct Roles {
+    /// Each served restore's reservation on the device pool, by holder
+    /// ([`super::slots::SlotPool::reserve_chunks`]): its unpark and bind
+    /// take from it, until it is released.
+    claims: HashMap<Holder, u64>,
+    /// The reservation the takes under way may take from: its holder's,
+    /// set for the length of its unpark or bind.
+    claim: Option<u64>,
     device: Shared,
     host: Option<Shared>,
     /// The disk tier, where the load keeps one ([`Self::set_disk`]).
     disk: Option<Disk>,
     shapes: RoleShapes,
     programs: HashMap<ProgramId, ProgramFacts>,
-    items: HashMap<Owner, Item>,
+    items: Items,
     /// The host writes held while their instance's slots are parked or
     /// not yet rebound, in the order they were asked.
     held: Vec<(InstanceId, Pump)>,
@@ -799,6 +955,11 @@ pub struct Roles {
     generations: u64,
     /// Slots out of service for good ([`Self::abandon`]).
     leaked: u64,
+    /// Binds taken and not yet bound or given back, by process
+    /// ([`Self::binds_on_way`]): a park of the process waits for them.
+    binding: HashMap<Holder, u32>,
+    /// Told each time one of those lands ([`Self::bind_landed`]).
+    bind_landed: Arc<tokio::sync::Notify>,
 }
 
 /// Device room given back: a count of the gives, and their event.
@@ -856,16 +1017,20 @@ impl Roles {
             return None;
         }
         Some(Self {
+            claims: HashMap::new(),
+            claim: None,
             device: Arc::clone(device),
             host: host.cloned(),
             disk: None,
             shapes,
             programs: HashMap::new(),
-            items: HashMap::new(),
+            items: Items::new(),
             held: Vec::new(),
             chunk_slots,
             stated: std::collections::HashSet::new(),
             freed: Arc::default(),
+            binding: HashMap::new(),
+            bind_landed: Arc::default(),
             guest_waiter: None,
             generations: 0,
             leaked: 0,
@@ -1024,6 +1189,42 @@ impl Roles {
         }
     }
 
+    /// Every item `holder` moves with, for a quiet wait's census: its owner,
+    /// tier, whether shed, and each part's role, live or dead, and the
+    /// physical chunks its refs lie in where it is on the device.
+    #[must_use]
+    pub fn guest_items_census(&self, holder: Holder) -> String {
+        let device = self.device.lock().unwrap();
+        let mut out = Vec::new();
+        for (owner, item) in &self.items {
+            if !self.moves_with(*owner, item, holder) {
+                continue;
+            }
+            let parts: Vec<String> = item
+                .parts
+                .iter()
+                .map(|part| {
+                    let chunks: BTreeSet<u32> = match (item.tier == Tier::Device, self.shapes.of(part.role)) {
+                        (true, Some(shape)) => part
+                            .refs
+                            .iter()
+                            .filter_map(|&slot_ref| device.pool().physical(device.slot(shape.pool, slot_ref).chunk))
+                            .collect(),
+                        _ => BTreeSet::new(),
+                    };
+                    format!(
+                        "{:?} {} refs={} chunks={chunks:?}",
+                        part.role,
+                        if part.dead() { "dead" } else { "live" },
+                        part.refs.len()
+                    )
+                })
+                .collect();
+            out.push(format!("{owner:?} tier={:?} shed={} [{}]", item.tier, item.shed, parts.join("; ")));
+        }
+        out.join(" | ")
+    }
+
     /// Per logical chunk, the slots each of `holders` holds there in guest
     /// items bound on the device: dead parts (scratch and pair state, given
     /// back at a park whatever lies below) and live ones (tables, rings),
@@ -1080,6 +1281,22 @@ impl Roles {
         })
     }
 
+    /// Whether `holder` holds any part of a guest's state on the device,
+    /// live, held or dead: what a park of it moves down a tier or gives
+    /// back. A process with no kv or state of its own (a prompt not
+    /// seated) holding only such parts is a victim whose eviction parks
+    /// them ([`crate::planner`]'s eviction): read by dead parts alone, one
+    /// holding resident bytes (a held part) "found nothing to move", its
+    /// chunks never emptied (seed 3392).
+    #[must_use]
+    pub fn holds_device_parts(&self, holder: Holder) -> bool {
+        self.items.values().any(|item| {
+            item.holder == Some(holder)
+                && item.tier == Tier::Device
+                && item.parts.iter().any(|part| !part.refs.is_empty())
+        })
+    }
+
     /// Whether `pair`'s state is on its way to or from the host with the
     /// instances that hold it, and those instances with their holders: what
     /// a restore short of it ([`RolesError::PairParked`]) waits to see end.
@@ -1097,6 +1314,17 @@ impl Roles {
                     (*id, holder)
                 })
                 .collect()
+        })
+    }
+
+    /// The pair of one of `instances` on its way to or from the device
+    /// (another holder's park or restore moving it): what an unpark that
+    /// would leave them unbound waits to see end ([`Self::pair_moving`]).
+    #[must_use]
+    pub fn moving_pair_of(&self, instances: &[InstanceId]) -> Option<FireKey> {
+        instances.iter().find_map(|id| {
+            let key = self.items.get(&Owner::Instance(*id))?.pair?;
+            (self.items.get(&Owner::Pair(key))?.tier == Tier::Moving).then_some(key)
         })
     }
 
@@ -1129,20 +1357,21 @@ impl Roles {
             pieces: 0,
             chunks: 0,
             run: 0,
-            resident: false,
+            held: false,
         };
         if slots == 0 {
             return Ok(part(Vec::new()));
         }
         let shape = self.shape(role)?;
         let mut pool = on.lock().unwrap();
+        let claim = if Arc::ptr_eq(on, &self.device) { self.claim } else { None };
         if !contiguous {
             return pool
-                .take_refs(shape.pool, u64::from(slots))
+                .claiming(claim, |pool| pool.take_refs(shape.pool, u64::from(slots)))
                 .map(part)
                 .ok_or(RolesError::Short { role, slots });
         }
-        match pool.take_run(shape.pool, u64::from(slots)) {
+        match pool.claiming(claim, |pool| pool.take_run(shape.pool, u64::from(slots))) {
             Ok(refs) => Ok(part(refs)),
             Err(SlotError::RunPastChunk { per_chunk, .. }) => Err(RolesError::PastChunk {
                 role,
@@ -1184,7 +1413,7 @@ impl Roles {
             pieces,
             chunks: if pieces > 0 { run } else { 0 },
             run: slots,
-            resident: false,
+            held: false,
         })
     }
 
@@ -1272,11 +1501,13 @@ impl Roles {
     fn retake(&self, like: &Part) -> Result<Part, GuestRoom> {
         let shape = self.shape(SlotRole::Instance).map_err(|_| like.room())?;
         let mut pool = self.device.lock().unwrap();
-        let taken = if like.pieces > 0 {
-            pool.take_chunk_runs(shape.pool, like.chunks, like.pieces)
-        } else {
-            pool.take_run(shape.pool, u64::from(like.run))
-        };
+        let taken = pool.claiming(self.claim, |pool| {
+            if like.pieces > 0 {
+                pool.take_chunk_runs(shape.pool, like.chunks, like.pieces)
+            } else {
+                pool.take_run(shape.pool, u64::from(like.run))
+            }
+        });
         match taken {
             Ok(refs) => Ok(Part {
                 refs,
@@ -1294,7 +1525,15 @@ impl Roles {
                 free_chunks,
                 committable: 0,
             }),
-            Err(_) => Err(like.room()),
+            // Any other refusal (the budget, a run across a segment's end)
+            // is said by name: read as the part's ask alone, its room's
+            // zeros looked like a full device (Mac Pro at 2 GiB on
+            // c10d7de5d: "free_runs: 0, free_chunks: 0, committable: 0" on a
+            // device 310 of 365 pages free).
+            Err(error) => {
+                tracing::warn!(%error, run = like.chunks, pieces = like.pieces, "roles: a guest part's fresh room refused by the pool");
+                Err(like.room())
+            }
         }
     }
 
@@ -1327,12 +1566,18 @@ impl Roles {
         };
         let mut own: Vec<OwnPiece> = Vec::new();
         for (owner, item) in &self.items {
-            let parked = matches!(item.tier, Tier::Host | Tier::Disk)
-                || (item.tier == Tier::Device && item.shed);
+            let parked = matches!(item.tier, Tier::Host | Tier::Disk) || item.takes_fresh();
             if !parked || !self.unparks_with(*owner, item, holder) {
                 continue;
             }
-            for part in item.parts.iter().filter(|part| part.dead() && part.refs.is_empty()) {
+            let below = matches!(item.tier, Tier::Host | Tier::Disk);
+            // Its guest parts laid fresh: the dead ones given back, and a
+            // held one coming up from a tier below.
+            for part in item
+                .parts
+                .iter()
+                .filter(|part| (part.dead() && part.refs.is_empty()) || (part.held && below))
+            {
                 own.push(if part.pieces > 0 {
                     OwnPiece::Chunks {
                         run: part.chunks,
@@ -1350,7 +1595,7 @@ impl Roles {
         // then its runs of slots ([`Self::prepare_unpark`]).
         own.sort_by_key(|piece| match *piece {
             OwnPiece::Chunks { run, .. } => (0, std::cmp::Reverse(run)),
-            OwnPiece::Slots { .. } => (1, std::cmp::Reverse(0)),
+            OwnPiece::Slots { .. } | OwnPiece::Take { .. } => (1, std::cmp::Reverse(0)),
         });
         self.device
             .lock()
@@ -1359,66 +1604,232 @@ impl Roles {
             .chunk_runs_beside(&own, run, pieces)
     }
 
-    /// The runs of adjacent chunks `holder`'s unpark lays fresh for its own
-    /// parked state before any bind's room, one entry per run length, the
-    /// longest first, as the unpark takes it: each dead part given back at
-    /// its park in whole chunks (its pieces of runs of its length), and the
-    /// slots of its dead runs of slots and of the live parts of items
-    /// parked below the device, by shape, past the free slots that shape's
-    /// partly filled chunks hold, in single chunks. Parts still on the
-    /// device (parked in place, or never parked) lay nothing. What a map of
-    /// free chunks must stand beside a bind's runs for the restore that
-    /// bind suspended, as [`Self::fits_beside_unpark`] reads it, and what a
-    /// restore short of its roles asks. Counted in runs of one length, a
-    /// run of two read as two single chunks (the L40S: a need of sixteen
-    /// single chunks while the unpark was refused a run of two), and every
-    /// part a chunk of its own asked twenty-one chunks for twenty small
-    /// items it would lay in one or none.
+    /// Every piece `holder`'s unpark takes on the device, in the order it
+    /// takes them, as the pool's placement reads them
+    /// ([`super::slots::OwnPiece`]): each dead part with no slots (given
+    /// back at its park, or short of slots its rebind names) as its runs of
+    /// whole chunks or its run of slots, and each live part of an item
+    /// parked below the device as the take that brings it back (a run of
+    /// slots where it is contiguous, single slots else); the whole-chunk
+    /// runs first, the longest first, then the rest
+    /// ([`Self::prepare_unpark`]).
+    fn unpark_pieces(&self, holder: Holder) -> Vec<super::slots::OwnPiece> {
+        use super::slots::OwnPiece;
+        let (groups, order) = self.unpark_order(holder);
+        order
+            .into_iter()
+            .filter_map(|(at, index)| {
+                let part = &groups[at].2[index];
+                let shape = self.shapes.of(part.role)?;
+                // As [`Self::take_parts`] takes it on the device: a dead
+                // part retaken fresh ([`Self::retake`]), a live one by
+                // [`Self::take`].
+                Some(if part.shaped() {
+                    if part.pieces > 0 {
+                        OwnPiece::Chunks {
+                            run: part.chunks.max(1),
+                            pieces: part.pieces,
+                        }
+                    } else {
+                        OwnPiece::Slots {
+                            shape: shape.pool,
+                            slots: part.run,
+                        }
+                    }
+                } else {
+                    let slots = u32::try_from(part.refs.len()).unwrap_or(u32::MAX);
+                    if part.contiguous {
+                        OwnPiece::Slots {
+                            shape: shape.pool,
+                            slots,
+                        }
+                    } else {
+                        OwnPiece::Take {
+                            shape: shape.pool,
+                            slots: u64::from(slots),
+                        }
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// The items `holder`'s unpark brings back, each with whether it shed
+    /// its dead parts at its park (it takes those fresh, its live parts
+    /// where they lie), and the order its parts are taken in: its runs of
+    /// whole chunks first, the longest first, then its runs of slots and
+    /// its live parts, in the items' order. Taken in the items' order, a
+    /// single chunk opened for a table at the lowest free chunk split the
+    /// only stretch a run of two stood in, and the unpark was refused the
+    /// run its need counted on (the L40S). What the unpark takes
+    /// ([`Self::prepare_unpark`]) and what its placement reads
+    /// ([`Self::unpark_pieces`]): one order.
+    #[allow(clippy::type_complexity)]
+    fn unpark_order(&self, holder: Holder) -> (Vec<(Owner, bool, Vec<Part>)>, Vec<(usize, usize)>) {
+        // Items that shed their dead parts at the park take fresh ones in
+        // their class, their live parts where they lie: nothing is copied.
+        // So does one on the device with a dead part its rebind must name
+        // and no slots for it ([`Item::takes_fresh`]): the restore commits
+        // only with every part its rebinds name in place.
+        let groups: Vec<(Owner, bool, Vec<Part>)> = self
+            .items
+            .iter()
+            .filter(|(owner, item)| item.takes_fresh() && self.unparks_with(**owner, item, holder))
+            .map(|(owner, item)| (*owner, true, item.parts.clone()))
+            .chain(
+                self.items
+                    .iter()
+                    .filter(|(owner, item)| {
+                        matches!(item.tier, Tier::Host | Tier::Disk)
+                            && self.unparks_with(**owner, item, holder)
+                    })
+                    .map(|(owner, item)| (*owner, false, item.parts.clone())),
+            )
+            .collect();
+        let mut order: Vec<(usize, usize)> = groups
+            .iter()
+            .enumerate()
+            .flat_map(|(at, (_, shed, parts))| {
+                parts
+                    .iter()
+                    .enumerate()
+                    .filter(move |(_, part)| !*shed || (part.dead() && part.refs.is_empty()))
+                    .map(move |(index, _)| (at, index))
+            })
+            .collect();
+        order.sort_by_key(|&(at, index)| {
+            let part = &groups[at].2[index];
+            if part.shaped() && part.pieces > 0 {
+                (0, std::cmp::Reverse(part.chunks))
+            } else {
+                (1, std::cmp::Reverse(0))
+            }
+        });
+        (groups, order)
+    }
+
+    /// The runs of adjacent chunks `holder`'s unpark lays fresh, one entry
+    /// per run length, the longest first, read from the pool's own
+    /// placement of every piece it takes ([`Self::unpark_pieces`]): its
+    /// runs of whole chunks, and the chunks its runs and takes of slots
+    /// open beyond the partly filled ones, in single chunks. A run of 465
+    /// slots asks a chunk wherever no partly filled chunk of its class holds
+    /// it, whatever free slots other chunks hold: counted by free slots, it
+    /// asked none, the need stood, and the unpark was refused for good (the
+    /// L40S on 5aa45805b: need [(1, 1)], refused a run of 465 slots).
+    /// Where the pool cannot place them all now, each run of slots and
+    /// take asks a chunk of its own.
     #[must_use]
     pub fn unpark_need(&self, holder: Holder) -> Vec<(u32, u32)> {
+        use super::slots::OwnPiece;
+        let own = self.unpark_pieces(holder);
         let mut runs: BTreeMap<u32, u64> = BTreeMap::new();
-        let mut slots: HashMap<SlotRole, u64> = HashMap::new();
-        for (owner, item) in &self.items {
-            let below = matches!(item.tier, Tier::Host | Tier::Disk);
-            let parked = below || (item.tier == Tier::Device && item.shed);
-            if !parked || !self.unparks_with(*owner, item, holder) {
-                continue;
-            }
-            for part in &item.parts {
-                if part.dead() {
-                    if !part.refs.is_empty() {
-                        continue;
-                    }
-                    if part.pieces > 0 {
-                        *runs.entry(part.chunks.max(1)).or_default() += u64::from(part.pieces);
-                    } else {
-                        *slots.entry(part.role).or_default() += u64::from(part.run);
-                    }
-                } else if below {
-                    *slots.entry(part.role).or_default() += part.refs.len() as u64;
+        let mut whole = 0u32;
+        for piece in &own {
+            match *piece {
+                OwnPiece::Chunks { run, pieces } => {
+                    *runs.entry(run).or_default() += u64::from(pieces);
+                    whole = whole.saturating_add(run.saturating_mul(pieces));
                 }
+                OwnPiece::Slots { .. } | OwnPiece::Take { .. } => {}
             }
         }
+        // Where its placement does not stand now, its placement alone: a
+        // part each a whole chunk was no placement (`SlotPool::opens_alone`).
         let device = self.device.lock().unwrap();
-        for (role, wanted) in slots {
-            let Some(shape) = self.shapes.of(role) else {
-                continue;
-            };
-            let Some(state) = device.pool().shape(shape.pool) else {
-                continue;
-            };
-            let per_chunk = u64::from(state.slots_per_chunk.max(1));
-            let chunks = wanted
-                .saturating_sub(device.pool().partial_free(shape.pool))
-                .div_ceil(per_chunk);
-            if chunks > 0 {
-                *runs.entry(1).or_default() += chunks;
-            }
+        let pool = device.pool();
+        let singles = pool
+            .opens_beside(&own)
+            .unwrap_or_else(|| pool.opens_alone(&own))
+            .saturating_sub(whole);
+        drop(device);
+        if singles > 0 {
+            *runs.entry(1).or_default() += u64::from(singles);
         }
         runs.into_iter()
             .rev()
             .map(|(run, pieces)| (run, u32::try_from(pieces).unwrap_or(u32::MAX)))
             .collect()
+    }
+
+    /// `holder`'s whole restore placed by the takes themselves
+    /// ([`super::slots::SlotPool::place`]): `takes` (its kv pages still to
+    /// gather and the single slots its serve takes, by shape) first, then
+    /// every piece its unpark takes, in the unpark's order. The pieces it
+    /// asked, beside where they went: the one placement a restore is sent
+    /// on, its moves planned by, and its pending bind read against.
+    #[must_use]
+    pub fn restore_placement(
+        &self,
+        holder: Holder,
+        takes: &[(super::slots::ShapeId, u64)],
+    ) -> (Vec<super::slots::OwnPiece>, super::slots::Placement) {
+        use super::slots::OwnPiece;
+        let own: Vec<OwnPiece> = takes
+            .iter()
+            .map(|&(shape, slots)| OwnPiece::Take { shape, slots })
+            .chain(self.unpark_pieces(holder))
+            .collect();
+        let placement = self.device.lock().unwrap().pool().place(&own);
+        (own, placement)
+    }
+
+    /// Holds for `holder`'s served restore the free chunks its unpark's
+    /// pieces and then `bind` (a pending bind's runs) open as the takes
+    /// place them ([`super::slots::SlotPool::place`]): no other take opens
+    /// them until its unpark and bind have taken them or it is released.
+    /// Whether its whole placement stands; held only where it does.
+    pub fn reserve_restore(&mut self, holder: Holder, bind: Option<(u32, u32)>) -> bool {
+        use super::slots::OwnPiece;
+        self.release_claim(holder);
+        let own: Vec<OwnPiece> = self
+            .unpark_pieces(holder)
+            .into_iter()
+            .chain(bind.map(|(run, pieces)| OwnPiece::Chunks { run, pieces }))
+            .collect();
+        let mut device = self.device.lock().unwrap();
+        let placement = device.pool().place(&own);
+        if !placement.stands() {
+            return false;
+        }
+        let ticket = device.pool_mut().reserve_chunks(placement.opened.iter().copied());
+        drop(device);
+        self.claims.insert(holder, ticket);
+        true
+    }
+
+    /// `own` placed for `holder` by the takes themselves
+    /// ([`super::slots::SlotPool::place`]), what is held for its served
+    /// restore open to them: the one placement its pending bind is checked
+    /// by once its unpark has taken its own. Read as a count of free runs
+    /// without its own reservation, a restore whose bind runs were held for
+    /// it found none of them, every serve (Mac Pro g2 on bd4f4ffe7:
+    /// PendingBindShort, 0 free runs of 7 where 5 stood).
+    #[must_use]
+    pub fn place_claimed(&self, holder: Holder, own: &[super::slots::OwnPiece]) -> super::slots::Placement {
+        let ticket = self.claims.get(&holder).copied();
+        self.device
+            .lock()
+            .unwrap()
+            .pool_mut()
+            .with_claim(ticket, |pool| pool.place(own))
+    }
+
+    /// `holder`'s reservation, its chunks not yet taken, goes back.
+    pub fn release_claim(&mut self, holder: Holder) {
+        if let Some(ticket) = self.claims.remove(&holder) {
+            self.device.lock().unwrap().pool_mut().release_reservation(ticket);
+        }
+    }
+
+    /// The chunks held for `holder`'s served restore.
+    #[cfg(test)]
+    #[must_use]
+    pub fn claimed(&self, holder: Holder) -> Vec<u32> {
+        self.claims
+            .get(&holder)
+            .map(|&ticket| self.device.lock().unwrap().pool().reserved(ticket))
+            .unwrap_or_default()
     }
 
     /// What `holder`'s restore would take back, in one line for a stall
@@ -1432,8 +1843,7 @@ impl Roles {
     pub fn unpark_census(&self, holder: Holder, need: Option<(u32, u32)>) -> String {
         let mut items = Vec::new();
         for (owner, item) in &self.items {
-            let parked = matches!(item.tier, Tier::Host | Tier::Disk)
-                || (item.tier == Tier::Device && item.shed);
+            let parked = matches!(item.tier, Tier::Host | Tier::Disk) || item.takes_fresh();
             if !parked || !self.unparks_with(*owner, item, holder) {
                 continue;
             }
@@ -1534,6 +1944,7 @@ impl Roles {
             }
             self.free_if_done(owner);
         }
+        self.release_unheld_pairs();
     }
 
     /// `holder`'s guest bind no longer waits: it bound, was refused, or
@@ -1573,14 +1984,10 @@ impl Roles {
     ) -> Result<Vec<Part>, RolesError> {
         let mut taken = Vec::with_capacity(like.len());
         for part in like {
-            let took = match (part.dead(), device) {
-                (false, _) => self
-                    .take(on, part.role, part.refs.len() as u32, part.contiguous)
-                    .map(|taken| Part {
-                        resident: part.resident,
-                        ..taken
-                    }),
-                (true, true) => self.retake(part).map_err(|room| {
+            let took = if device && part.shaped() {
+                // Laid as runs on the device, dead or held: its fresh runs,
+                // a held part's bytes copied into them.
+                self.retake(part).map_err(|room| {
                     let (run, _) = part.chunk_runs();
                     let committable = self.device.lock().unwrap().pool().committable_runs(run);
                     RolesError::GuestShort {
@@ -1588,11 +1995,20 @@ impl Roles {
                         bytes: self.dead_bytes(part),
                         room: room.with_committable(committable),
                     }
-                }),
-                (true, false) => Ok(Part {
+                })
+            } else if part.dead() {
+                Ok(Part {
                     refs: Vec::new(),
                     ..part.clone()
-                }),
+                })
+            } else {
+                // Below the device, its slots anywhere; what it is (held,
+                // its runs' shape for the way back) goes with it.
+                self.take(on, part.role, part.refs.len() as u32, part.contiguous)
+                    .map(|taken| Part {
+                        refs: taken.refs,
+                        ..part.clone()
+                    })
             };
             match took {
                 Ok(part) => taken.push(part),
@@ -1634,10 +2050,10 @@ impl Roles {
         registered: impl Fn(ChannelId) -> bool,
         adapter: Option<u128>,
         guest: GuestTaken,
-    ) -> Result<Taken, RolesError> {
+    ) -> Result<Taken, (RolesError, u32)> {
         let Some(facts) = self.programs.get(&program).cloned() else {
             self.untake_guest(guest);
-            return Err(RolesError::Program(program));
+            return Err((RolesError::Program(program), 0));
         };
         let mut shared = Vec::new();
         for &id in channels {
@@ -1645,10 +2061,13 @@ impl Roles {
                 if item.tier != Tier::Device {
                     let holder = item.holder;
                     self.untake_guest(guest);
-                    return Err(RolesError::Parked {
-                        channel: id,
-                        holder,
-                    });
+                    return Err((
+                        RolesError::Parked {
+                            channel: id,
+                            holder,
+                        },
+                        0,
+                    ));
                 }
                 shared.push(id);
             }
@@ -1669,7 +2088,7 @@ impl Roles {
             Ok(part) => taken.parts.push(part),
             Err(error) => {
                 self.untake_guest(guest);
-                return Err(error);
+                return Err((error, 0));
             }
         }
         for ring in &facts.rings {
@@ -1691,9 +2110,10 @@ impl Roles {
                     taken.rings.push(ring.channel);
                 }
                 Err(error) => {
+                    let opened = u32::try_from(taken.parts.len()).unwrap_or(u32::MAX);
                     self.give(&device, &taken.parts);
                     self.untake_guest(guest);
-                    return Err(error);
+                    return Err((error, opened));
                 }
             }
         }
@@ -1706,7 +2126,7 @@ impl Roles {
                 Some(_) => {
                     self.give(&device, &taken.parts);
                     self.untake_guest(guest);
-                    return Err(RolesError::AdapterParked);
+                    return Err((RolesError::AdapterParked, 0));
                 }
                 None => match self.take(
                     &device,
@@ -1716,19 +2136,36 @@ impl Roles {
                 ) {
                     Ok(part) => Some((key, part, true)),
                     Err(error) => {
+                        let opened = u32::try_from(taken.parts.len()).unwrap_or(u32::MAX);
                         self.give(&device, &taken.parts);
                         self.untake_guest(guest);
-                        return Err(error);
+                        return Err((error, opened));
                     }
                 },
             };
         }
-        // After the rings ([`own_rings`] reads them in order after the
-        // tables): its resident state, live, then its scratch.
-        taken.parts.extend(guest.resident);
         taken.parts.extend(guest.scratch);
         taken.pair = guest.pair;
+        self.pin_shared(&taken, true);
         Ok(taken)
+    }
+
+    /// The pair and the adapter `taken` names that are items already: held
+    /// by its bind (`pin`), or let go of at its bind or its give back.
+    fn pin_shared(&mut self, taken: &Taken, pin: bool) {
+        let owners = [
+            taken.adapter.as_ref().map(|(key, ..)| Owner::Adapter(*key)),
+            taken.pair.as_ref().map(|(key, ..)| Owner::Pair(*key)),
+        ];
+        for owner in owners.into_iter().flatten() {
+            if let Some(item) = self.items.get_mut(&owner) {
+                item.binds = if pin {
+                    item.binds + 1
+                } else {
+                    item.binds.saturating_sub(1)
+                };
+            }
+        }
     }
 
     /// A guest program's state for a bind of an instance on `channels`
@@ -1747,6 +2184,24 @@ impl Roles {
     /// meanwhile leaves that need as it is, and waits on the commit and the
     /// planner as it does (the planner asks the walk for its need too).
     pub fn take_guest(
+        &mut self,
+        channels: &[ChannelId],
+        (pair, state): (FireKey, GuestState),
+        holder: Option<Holder>,
+    ) -> Result<GuestTaken, RolesError> {
+        self.claim = holder.and_then(|holder| self.claims.get(&holder).copied());
+        let taken = self.take_guest_claimed(channels, (pair, state), holder);
+        self.claim = None;
+        // Its bind took what was held for it: the rest goes back.
+        if taken.is_ok()
+            && let Some(holder) = holder
+        {
+            self.release_claim(holder);
+        }
+        taken
+    }
+
+    fn take_guest_claimed(
         &mut self,
         channels: &[ChannelId],
         (pair, state): (FireKey, GuestState),
@@ -1799,10 +2254,9 @@ impl Roles {
         }
         let mut taken = GuestTaken::default();
         let run = state.chunks_a_piece();
-        // The instance's dead bytes: every scratch arm (none taken per fire
-        // yet), placed at the bind. Its resident state is a live part of its
-        // own, taken below.
-        let per_instance = state.instance_bytes().saturating_sub(state.resident);
+        // The instance's own bytes: its resident part and every scratch arm
+        // (none taken per fire yet), placed at the bind.
+        let per_instance = state.instance_bytes();
         if (per_instance > 0 || state.per_pair > 0) && self.stated.insert(pair) {
             self.state_room(pair, state);
         }
@@ -1836,36 +2290,17 @@ impl Roles {
                 || format!("an instance of {pair}'s scratch"),
                 heads,
             ) {
-                Ok(part) => taken.scratch = Some(part),
-                Err(error) => {
-                    self.untake_guest(taken);
-                    return Err(error.asking(whole));
-                }
-            }
-        }
-        // Its resident state: one run of adjacent Instance slots, live from
-        // the bind to the close, moved as its tables are (copied on a park,
-        // copied back on the unpark).
-        if state.resident > 0 {
-            let device = Arc::clone(&self.device);
-            let slots = match self.shape(SlotRole::Instance) {
-                Ok(shape) => u32::try_from(state.resident.div_ceil(shape.slot_bytes.max(1)))
-                    .unwrap_or(u32::MAX),
-                Err(error) => {
-                    self.untake_guest(taken);
-                    return Err(error);
-                }
-            };
-            match self.take(&device, SlotRole::Instance, slots, true) {
+                // Resident bytes beside the scratch: the part is held,
+                // copied at a park and back at an unpark, never dead.
                 Ok(part) => {
-                    taken.resident = Some(Part {
-                        resident: true,
+                    taken.scratch = Some(Part {
+                        held: state.resident > 0,
                         ..part
                     });
                 }
                 Err(error) => {
                     self.untake_guest(taken);
-                    return Err(self.bind_short(error));
+                    return Err(error.asking(whole));
                 }
             }
         }
@@ -1893,6 +2328,7 @@ impl Roles {
                             item.tier = Tier::Device;
                             item.shed = false;
                             item.generation = generation;
+                            taken.pair_retaken = true;
                             Some((pair, part, false, generation))
                         }
                         Err(room) => {
@@ -1957,8 +2393,56 @@ impl Roles {
         );
     }
 
+    /// A bind of `holder`'s was taken: it is on its way until bound or
+    /// given back.
+    fn bind_taken_for(&mut self, holder: Option<Holder>) {
+        if let Some(holder) = holder {
+            *self.binding.entry(holder).or_default() += 1;
+        }
+    }
+
+    /// A bind of `holder`'s was bound or given back.
+    fn bind_ended_for(&mut self, holder: Option<Holder>) {
+        let Some(holder) = holder else {
+            return;
+        };
+        if let Some(count) = self.binding.get_mut(&holder) {
+            *count -= 1;
+            if *count == 0 {
+                self.binding.remove(&holder);
+            }
+        }
+        self.bind_landed.notify_waiters();
+    }
+
+    /// Whether a bind of `holder`'s is on its way: taken, its slots and
+    /// its pair held, and not yet bound by the engine or given back. A
+    /// park of `holder` waits for it ([`Self::bind_landed`]): parked
+    /// meanwhile, the instance it binds stood on the device outside its
+    /// process's park, its pair given fresh slots at a restore the
+    /// instance's bind never named, and those slots went to another
+    /// program's bind (the simulation, a yield between a bind's take and
+    /// its bind: `guest::claims` refused an instance over a live pair's
+    /// run, the L40S's claims refusals at 3 GiB).
+    #[must_use]
+    pub fn binds_on_way(&self, holder: Holder) -> bool {
+        self.binding.contains_key(&holder)
+    }
+
+    /// Told each time a bind on its way is bound or given back.
+    #[must_use]
+    pub fn bind_landed(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.bind_landed)
+    }
+
     /// The bind of `taken` failed: its slots go back.
     pub fn untake(&mut self, taken: Taken) {
+        self.bind_ended_for(taken.holder);
+        self.pin_shared(&taken, false);
+        let shared = [
+            taken.adapter.as_ref().map(|(key, ..)| Owner::Adapter(*key)),
+            taken.pair.as_ref().map(|(key, ..)| Owner::Pair(*key)),
+        ];
         self.give(&self.device, &taken.parts);
         if let Some((_, part, true)) = taken.adapter {
             self.give(&self.device, &[part]);
@@ -1966,18 +2450,60 @@ impl Roles {
         if let Some((_, part, true, _)) = taken.pair {
             self.give(&self.device, &[part]);
         }
+        // What the bind held and no one else holds goes now: a pair whose
+        // members all parked while the bind was on its way, an adapter or
+        // pair with none attached.
+        for owner in shared.into_iter().flatten() {
+            self.free_if_done(owner);
+        }
+        self.release_unheld_pairs();
     }
 
     /// A bind's or a registration's take short of slots (`Short`, `NoRun`):
     /// a free chunk of the budget holds any one item (a run past a chunk is
     /// `PastChunk`), so it waits for room as a guest state does
     /// ([`RolesError::BindShort`]). Anything else stands as it is.
-    fn bind_short(&self, error: RolesError) -> RolesError {
+    /// `guest`: the runs its guest state's fresh parts took; `opened`: the
+    /// parts of its own (tables, rings, adapter) taken before the one
+    /// short, each of which may have opened a chunk.
+    fn bind_short(&self, error: RolesError, guest: Option<(u32, u32)>, opened: u32) -> RolesError {
         match error {
             RolesError::Short { .. } | RolesError::NoRun { .. }
                 if self.device.lock().unwrap().state_chunks_now() > 0 =>
             {
-                RolesError::BindShort(Box::new(error))
+                // Short of its tables' chunk beside the fresh chunks its guest
+                // state took (and gave back): the room asked is all of them,
+                // never the tables' one chunk alone (seed 46 of the
+                // simulation on f152f9631: a scratch chunk and a pair chunk
+                // taken, the tables short of a third, one chunk served, short
+                // again, a spin). Runs of more than one chunk ask one more
+                // run of their length for the tables: over, never under.
+                let short = match guest.or((opened > 0).then_some((1, 0))) {
+                    Some((run, pieces)) => RolesError::GuestShort {
+                        what: format!(
+                            "its tables, rings and adapter beside its guest state's {pieces} fresh \
+                             runs ({error})"
+                        ),
+                        bytes: 0,
+                        room: if run <= 1 {
+                            GuestRoom::Slots {
+                                slots: 0,
+                                committable: 0,
+                                chunks: pieces + opened + 1,
+                            }
+                        } else {
+                            GuestRoom::Runs {
+                                run,
+                                pieces: pieces + opened + 1,
+                                free_runs: 0,
+                                free_chunks: 0,
+                                committable: 0,
+                            }
+                        },
+                    },
+                    None => error,
+                };
+                RolesError::BindShort(Box::new(short))
             }
             error => error,
         }
@@ -1986,7 +2512,7 @@ impl Roles {
     /// A guest state taken for a bind that registered nothing, or failed
     /// before its instance's take: its chunks go back.
     pub fn untake_guest(&mut self, guest: GuestTaken) {
-        for part in guest.scratch.iter().chain(&guest.resident) {
+        if let Some(part) = &guest.scratch {
             self.give(&self.device, std::slice::from_ref(part));
         }
         if let Some((_, part, true, _)) = guest.pair {
@@ -1996,6 +2522,8 @@ impl Roles {
 
     /// The engine bound `taken` as instance `id`, for `holder`.
     pub fn bound(&mut self, id: InstanceId, holder: Option<Holder>, taken: Taken) {
+        self.bind_ended_for(taken.holder);
+        self.pin_shared(&taken, false);
         for &channel in &taken.channels {
             if let Some(item) = self.items.get_mut(&Owner::Channel(channel)) {
                 item.attached.insert(id);
@@ -2012,6 +2540,9 @@ impl Roles {
                 adapter
             });
             shared.attached.insert(id);
+            // A live member again: no longer parked where it lies, so no
+            // move down takes it from under this instance.
+            shared.shed = false;
             item.adapter = Some(key);
         }
         if let Some((key, part, _, generation)) = taken.pair {
@@ -2109,7 +2640,12 @@ impl Roles {
         let Some(item) = self.items.get(&owner) else {
             return;
         };
-        if item.open || !item.attached.is_empty() || item.tier == Tier::Moving || item.reads > 0 {
+        if item.open
+            || !item.attached.is_empty()
+            || item.tier == Tier::Moving
+            || item.reads > 0
+            || item.binds > 0
+        {
             return;
         }
         let item = self.items.remove(&owner).expect("present");
@@ -2132,20 +2668,123 @@ impl Roles {
                         instance(id).is_some_and(|instance| instance.holder == Some(holder))
                     })
             }
-            Owner::Adapter(_) | Owner::Pair(_) => {
+            // A pair's run is its batch's while any member is on the device
+            // or on its way to or from it: a member mid-park (its move may
+            // yet be taken back, the tier below full) or mid-unpark holds
+            // it. Read as parked, the pair went with another holder's park,
+            // the member's park was taken back, and the run, given back
+            // under a resident member, was another program's fresh room
+            // (the L40S at 3 GiB on c8077be0f: instance 371's pair run
+            // bound by 372-374 of another program, CUDA 700 on its next
+            // fire). The member's park landing gives it back
+            // ([`Self::release_unheld_pairs`]).
+            // A bind on its way holds it as a member does.
+            Owner::Pair(_) if item.binds > 0 => false,
+            Owner::Adapter(_) if item.binds > 0 => false,
+            Owner::Pair(_) => {
                 item.attached
                     .iter()
                     .any(|id| instance(id).is_some_and(|instance| instance.holder == Some(holder)))
                     && item.attached.iter().all(|id| {
-                        instance(id).is_some_and(|instance| {
-                            // Parked already: off the device, or parked
-                            // where it lies (no room below, [`Item::shed`]).
-                            instance.holder == Some(holder)
-                                || instance.tier != Tier::Device
-                                || instance.shed
+                        instance(id).is_none_or(|instance| {
+                            instance.holder == Some(holder) || Self::settled_parked(instance)
                         })
                     })
             }
+            Owner::Adapter(_) => {
+                item.attached
+                    .iter()
+                    .any(|id| instance(id).is_some_and(|instance| instance.holder == Some(holder)))
+                    && item.attached.iter().all(|id| {
+                        // Gone (closed) holds it no longer: read as held, a
+                        // beam pair's scratch whose other copies had ended
+                        // never moved with the last one, and its chunk stayed
+                        // on the device for good (the L40S at 3 GiB on
+                        // c10d7de5d: chunk 17, a pair of 73 dead refs, its
+                        // evicted holder no candidate, the head one chunk short).
+                        // Parked already and settled, as a pair's: a member
+                        // on its way holds it (its park may yet be taken
+                        // back), and a member's landing park parks it where
+                        // it lies ([`Self::release_unheld_pairs`]).
+                        instance(id).is_none_or(|instance| {
+                            instance.holder == Some(holder) || Self::settled_parked(instance)
+                        })
+                    })
+            }
+        }
+    }
+
+    /// A member parked and settled: off the device, or parked where it
+    /// lies ([`Item::shed`]); never one on its way (`Moving`).
+    fn settled_parked(instance: &Item) -> bool {
+        matches!(instance.tier, Tier::Host | Tier::Disk)
+            || (instance.tier == Tier::Device && instance.shed)
+    }
+
+    /// Gives back the run of each pair on the device every member of which
+    /// is parked and settled, nothing reading it: what a member's park
+    /// left behind while another member was on its way
+    /// ([`Self::moves_with`]). Its state is dead between fires; it parks
+    /// as one with no slots below, and a member's restore takes it fresh.
+    fn release_unheld_pairs(&mut self) {
+        let settled = |item: &Item| {
+            item.tier == Tier::Device
+                && !item.shed
+                && item.reads == 0
+                && item.binds == 0
+                && !item.attached.is_empty()
+                && item.attached.iter().all(|id| {
+                    self.items
+                        .get(&Owner::Instance(*id))
+                        .is_none_or(Self::settled_parked)
+                })
+        };
+        // An adapter holds live parts: parked where it lies, its room a
+        // move down a tier takes ([`Self::prepare_park_down`]), its rebind
+        // at its first member's unpark.
+        let adapters: Vec<Owner> = self
+            .items
+            .iter()
+            .filter(|(owner, item)| matches!(owner, Owner::Adapter(_)) && settled(item))
+            .map(|(owner, _)| *owner)
+            .collect();
+        for owner in adapters {
+            self.items.get_mut(&owner).expect("present").shed = true;
+        }
+        let unheld: Vec<Owner> = self
+            .items
+            .iter()
+            .filter(|(owner, item)| {
+                matches!(owner, Owner::Pair(_))
+                    && item.tier == Tier::Device
+                    && !item.shed
+                    && item.reads == 0
+                    && item.binds == 0
+                    && item.parts.iter().all(Part::dead)
+                    && !item.attached.is_empty()
+                    && item.attached.iter().all(|id| {
+                        self.items
+                            .get(&Owner::Instance(*id))
+                            .is_none_or(Self::settled_parked)
+                    })
+            })
+            .map(|(owner, _)| *owner)
+            .collect();
+        for owner in unheld {
+            let item = self.items.get_mut(&owner).expect("present");
+            let emptied: Vec<Part> = item
+                .parts
+                .iter()
+                .map(|part| Part {
+                    refs: Vec::new(),
+                    ..part.clone()
+                })
+                .collect();
+            let old = std::mem::replace(&mut item.parts, emptied);
+            item.tier = Tier::Host;
+            item.stale = false;
+            let device = Arc::clone(&self.device);
+            self.give_freeing(&device, &old);
         }
     }
 
@@ -2185,9 +2824,6 @@ impl Roles {
         let mut shed = Vec::new();
         for owner in owners {
             let parts = self.items[&owner].parts.clone();
-            if let Some(part) = resident(&parts) {
-                tracing::debug!(?owner, slots = ?part.refs, "a guest's resident run parks");
-            }
             let emptied = |parts: &[Part]| -> Vec<Part> {
                 parts
                     .iter()
@@ -2247,73 +2883,27 @@ impl Roles {
     /// Unparks `holder`'s parked items: device slots taken for each, all or
     /// none. `None` when nothing is parked.
     pub fn prepare_unpark(&mut self, holder: Holder) -> Result<Option<RoleMove>, RolesError> {
-        let owners: Vec<Owner> = self
-            .items
-            .iter()
-            .filter(|(owner, item)| {
-                matches!(item.tier, Tier::Host | Tier::Disk)
-                    && self.unparks_with(**owner, item, holder)
-            })
-            .map(|(owner, _)| *owner)
-            .collect();
-        // Items that shed their dead parts at the park take fresh ones in
-        // their class, their live parts where they lie: nothing is copied.
-        let shed_owners: Vec<Owner> = self
-            .items
-            .iter()
-            .filter(|(owner, item)| {
-                item.tier == Tier::Device && item.shed && self.unparks_with(**owner, item, holder)
-            })
-            .map(|(owner, _)| *owner)
-            .collect();
+        self.claim = self.claims.get(&holder).copied();
+        let unparked = self.prepare_unpark_claimed(holder);
+        self.claim = None;
+        unparked
+    }
+
+    fn prepare_unpark_claimed(&mut self, holder: Holder) -> Result<Option<RoleMove>, RolesError> {
+        let (groups, order) = self.unpark_order(holder);
         // An instance whose pair is on its way back with another process's
         // unpark is rebound once that lands: until then its restore is
         // queued again, never told no room for its pair. One parked where
         // it lies (no tier below, [`Item::shed`]) waits the same: let
         // through, it came back with its pair away, so its restore named it
         // no rebind and its next fire ran on the places it gave back.
-        if let Some(pair) = owners.iter().chain(&shed_owners).find_map(|owner| {
+        if let Some(pair) = groups.iter().find_map(|(owner, _, _)| {
             let key = self.items[owner].pair?;
             (self.items.get(&Owner::Pair(key))?.tier == Tier::Moving).then_some(key)
         }) {
             return Err(RolesError::PairParked(pair));
         }
         let device = Arc::clone(&self.device);
-        // Every part it takes, of every item: a shed item's dead parts (its
-        // live ones stay where they lie), a parked item's all. Its runs of
-        // whole chunks are laid first, the longest first, then its runs of
-        // slots and its live parts: taken in the items' order, a single
-        // chunk opened for a table at the lowest free chunk split the only
-        // stretch a run of two stood in, and the unpark was refused the
-        // run its need counted on (the L40S).
-        let groups: Vec<(Owner, bool, Vec<Part>)> = shed_owners
-            .iter()
-            .map(|owner| (*owner, true, self.items[owner].parts.clone()))
-            .chain(
-                owners
-                    .iter()
-                    .map(|owner| (*owner, false, self.items[owner].parts.clone())),
-            )
-            .collect();
-        let mut order: Vec<(usize, usize)> = groups
-            .iter()
-            .enumerate()
-            .flat_map(|(at, (_, shed, parts))| {
-                parts
-                    .iter()
-                    .enumerate()
-                    .filter(move |(_, part)| !*shed || part.dead())
-                    .map(move |(index, _)| (at, index))
-            })
-            .collect();
-        order.sort_by_key(|&(at, index)| {
-            let part = &groups[at].2[index];
-            if part.dead() && part.pieces > 0 {
-                (0, std::cmp::Reverse(part.chunks))
-            } else {
-                (1, std::cmp::Reverse(0))
-            }
-        });
         let mut back: Vec<Vec<Option<Part>>> =
             groups.iter().map(|(_, _, parts)| vec![None; parts.len()]).collect();
         for (at, index) in order {
@@ -2345,11 +2935,6 @@ impl Roles {
                 shed.push((owner, parts));
             } else {
                 items.push((owner, parts));
-            }
-        }
-        for (owner, parts) in &items {
-            if let Some(part) = resident(parts) {
-                tracing::debug!(?owner, slots = ?part.refs, "a guest's resident run comes back");
             }
         }
         let below: Vec<Tier> = items.iter().map(|(owner, _)| self.items[owner].tier).collect();
@@ -2433,16 +3018,49 @@ impl Roles {
     /// `disk_too`, is counted in host chunks: the room kv on the host
     /// moving on down to disk makes for it, older below newer.
     pub fn prepare_park_down(&mut self, holders: &[Holder], disk_too: bool) -> ParkDown {
-        let owners: Vec<Owner> = self
+        let mut owners: Vec<Owner> = self
             .parked_on_device()
             .filter(|(_, _, holder)| holders.contains(holder))
             .map(|(owner, ..)| owner)
             .collect();
+        // Left behind: a shared item (a pair, an adapter) still on the
+        // device that moves with one of these parked holders now, its other
+        // holders parked or gone since that holder's park (which left it,
+        // shared then). It goes down as a parked item does, its dead parts
+        // given back (the L40S at 3 GiB on c10d7de5d: a beam pair of 73 dead
+        // refs on chunk 17, its last holder evicted, the head one chunk
+        // short for good).
+        let behind: Vec<Owner> = self
+            .items
+            .iter()
+            .filter(|(owner, item)| {
+                matches!(owner, Owner::Pair(_) | Owner::Adapter(_))
+                    && item.tier == Tier::Device
+                    && !item.shed
+                    && holders.iter().any(|&holder| self.moves_with(**owner, item, holder))
+            })
+            .map(|(owner, _)| *owner)
+            .collect();
+        owners.extend(behind);
         let mut items = Vec::new();
         let mut below = Vec::new();
         let mut host_chunks = 0u64;
         for owner in owners {
             let parts = self.items[&owner].parts.clone();
+            // Nothing live: nothing to copy, its dead parts given back.
+            if parts.iter().all(Part::dead) {
+                let emptied: Vec<Part> = parts
+                    .iter()
+                    .map(|part| Part {
+                        refs: Vec::new(),
+                        ..part.clone()
+                    })
+                    .collect();
+                self.items.get_mut(&owner).expect("present").tier = Tier::Moving;
+                items.push((owner, emptied));
+                below.push(Tier::Host);
+                continue;
+            }
             let on_host = self
                 .host
                 .clone()
@@ -2492,7 +3110,7 @@ impl Roles {
         let mut chunks = 0u64;
         for owner in owners {
             for part in &self.items[owner].parts {
-                chunks += if part.dead() {
+                chunks += if part.shaped() {
                     let (run, pieces) = part.chunk_runs();
                     u64::from(run) * u64::from(pieces)
                 } else {
@@ -2599,6 +3217,10 @@ impl Roles {
             self.give_on(if txn.out { Tier::Device } else { below }, &old);
             self.free_if_done(owner);
         }
+        // A pair a member's park left behind, every member now parked.
+        if txn.out {
+            self.release_unheld_pairs();
+        }
         // A bind waiting on a pair's move looks again.
         self.freed
             .gives
@@ -2611,7 +3233,20 @@ impl Roles {
     pub fn abort(&mut self, txn: RoleMove) {
         for (owner, parts) in txn.shed {
             if !txn.out {
-                let dead: Vec<Part> = parts.into_iter().filter(|part| part.dead()).collect();
+                // Only the dead parts the unpark took fresh: one the item
+                // held in place already ([`Item::takes_fresh`]) stays its.
+                let had: Vec<Part> = self
+                    .items
+                    .get(&owner)
+                    .map_or_else(Vec::new, |item| item.parts.clone());
+                let dead: Vec<Part> = parts
+                    .into_iter()
+                    .zip(had.iter().map(Some).chain(std::iter::repeat(None)))
+                    .filter(|(part, had)| {
+                        part.dead() && had.is_none_or(|had| had.refs.is_empty())
+                    })
+                    .map(|(part, _)| part)
+                    .collect();
                 let device = Arc::clone(&self.device);
                 self.give(&device, &dead);
             }
@@ -2748,8 +3383,6 @@ impl Roles {
                     adapter: self.adapter_refs(item),
                     scratch: scratch(&item.parts)
                         .map_or(ScratchPlace::None, |part| place(part, self.chunk_slots)),
-                    resident: resident(&item.parts)
-                        .map_or(ScratchPlace::None, |part| place(part, self.chunk_slots)),
                     pair: item
                         .pair
                         .and_then(|key| self.items.get(&Owner::Pair(key)))
@@ -2785,11 +3418,49 @@ impl Roles {
                 Owner::Instance(id)
                     if item.holder == Some(holder)
                         && item.open
-                        && (item.tier != Tier::Device || item.shed || item.stale) =>
+                        && (item.tier != Tier::Device || item.stale || item.takes_fresh()) =>
                 {
                     Some(id)
                 }
                 _ => None,
+            })
+            .collect()
+    }
+
+    /// `holder`'s open instances an unpark of `txn` (none: nothing to
+    /// unpark) would leave unbound, its rebinds unable to name them: off
+    /// the device or moving and not in it, short of a dead part it does
+    /// not take ([`Item::takes_fresh`]), or holding a pair that is not on
+    /// the device and not in it. A restore commits only once this is empty
+    /// ([`Self::prepare_unpark`] then [`Self::commit`]): committed with
+    /// one, it waited Restoring on a rebind nothing would make (Mac Pro at
+    /// 2 GiB on 1e87ab171, InstanceId(5)).
+    #[must_use]
+    pub fn unbound_after(&self, holder: Holder, txn: Option<&RoleMove>) -> Vec<InstanceId> {
+        let moved = |owner: Owner| {
+            txn.is_some_and(|txn| {
+                txn.items.iter().chain(&txn.shed).any(|(moved, _)| *moved == owner)
+            })
+        };
+        self.items
+            .iter()
+            .filter_map(|(owner, item)| {
+                let Owner::Instance(id) = *owner else {
+                    return None;
+                };
+                if item.holder != Some(holder) || !item.open {
+                    return None;
+                }
+                let placed = moved(*owner)
+                    || (item.tier == Tier::Device && !item.shed && !item.takes_fresh());
+                let pair = item.pair.is_none_or(|key| {
+                    moved(Owner::Pair(key))
+                        || self
+                            .items
+                            .get(&Owner::Pair(key))
+                            .is_some_and(|pair| pair.tier == Tier::Device && !pair.takes_fresh())
+                });
+                (!placed || !pair).then_some(id)
             })
             .collect()
     }
@@ -2938,7 +3609,7 @@ pub fn take_ring(
     Ok(Some(
         roles
             .take_channel(&facts)
-            .map_err(|error| roles.bind_short(error))?,
+            .map_err(|error| roles.bind_short(error, None, 0))?,
     ))
 }
 
@@ -3035,7 +3706,7 @@ pub fn bind_instance(
     holder: Option<Holder>,
     registered: impl Fn(ChannelId) -> bool,
 ) -> anyhow::Result<BoundInstance> {
-    let taken = take_bind(roles, engine, binding, registered, holder)?;
+    let taken = take_bind(roles, engine, binding, registered, holder, |_| true)?;
     bind_taken(roles, engine, binding, holder, taken)
 }
 
@@ -3053,10 +3724,15 @@ pub fn take_bind(
     binding: &InstanceBinding,
     registered: impl Fn(ChannelId) -> bool,
     holder: Option<Holder>,
+    resident: impl Fn(Holder) -> bool,
 ) -> anyhow::Result<Option<Taken>> {
     let Some(roles) = roles else {
         return Ok(None);
     };
+    let roles_handle = roles;
+    if let Some(holder) = holder.filter(|&holder| !resident(holder)) {
+        return Err(RolesError::HolderParked(holder).into());
+    }
     learn_program(roles, engine, binding.program)?;
     let state = engine.guest_state(binding.program, &binding.extents, binding.geometry)?;
     let adapter = engine.adapter_key(binding)?;
@@ -3066,7 +3742,8 @@ pub fn take_bind(
     };
     let mut roles = roles.lock().unwrap();
     let guest = roles.take_guest(&binding.channels, (pair, state), holder)?;
-    let taken = roles
+    let fresh = guest.fresh_runs();
+    let mut taken = roles
         .take_instance(
             binding.program,
             &binding.channels,
@@ -3074,7 +3751,18 @@ pub fn take_bind(
             adapter,
             guest,
         )
-        .map_err(|error| roles.bind_short(error))?;
+        .map_err(|(error, opened)| roles.bind_short(error, fresh, opened))?;
+    taken.holder = holder;
+    roles.bind_taken_for(holder);
+    drop(roles);
+    // Read again past the take: a park that began since the first read
+    // either saw this bind on its way and waits for it, or parked before
+    // it was taken, and then the holder reads parked here and the take
+    // goes back.
+    if let Some(holder) = holder.filter(|&holder| !resident(holder)) {
+        roles_handle.lock().unwrap().untake(taken);
+        return Err(RolesError::HolderParked(holder).into());
+    }
     Ok(Some(taken))
 }
 
@@ -3096,7 +3784,6 @@ pub fn bind_taken(
         ring_slots: taken.ring_slots(),
         adapter_slots: taken.adapter_slots(),
         scratch: taken.scratch(),
-        resident: taken.resident(),
         pair: taken.pair(),
         pair_generation: taken.pair_generation(),
         ..binding.clone()
@@ -3127,7 +3814,8 @@ pub fn bind_taken(
 /// waits by `grown(prefix, run)` ([`grow_for_guest`]: the walk commits a
 /// segment past the committed prefix `prefix`, as it does for a kv
 /// admission short of room) and binds again; a wait that ends with no
-/// segment left to commit is the bind's refusal.
+/// segment left to commit binds again too, short of room the planner then
+/// makes ([`RolesError::BindShort`]), never refused for it.
 ///
 /// This is not a retry: nothing is attempted again on the chance it now
 /// fits, and nothing is degraded or made smaller. The bind is sent again
@@ -3208,6 +3896,7 @@ where
                 RolesError::PairParked(_) | RolesError::GuestGrow { .. }
             ) || error.room_runs().is_some()
                 || matches!(error, RolesError::Parked { holder: Some(holder), .. } if *holder == pid)
+                || matches!(error, RolesError::HolderParked(holder) if *holder == pid)
         });
         if waits_on {
             settle().await;
@@ -3272,6 +3961,8 @@ where
                 }
             };
             tokio::select! {
+                // In order, never at random: a seeded run takes the same branch.
+                biased;
                 () = freed => {}
                 made = planned(run, pieces) => match made {
                     Err(why) => {
@@ -3314,9 +4005,21 @@ where
                 }
             };
             tokio::select! {
+                // In order, never at random: a seeded run takes the same branch.
+                biased;
+                // No segment left to commit within the budget by the time
+                // it looked (the room the refusal counted was committed
+                // for others, or the target came down): the room is the
+                // planner's to make now, never the client's refusal. It
+                // binds again, and a bind short of room then waits in the
+                // planner (`BindShort`); only a need that can never fit
+                // alone is refused (Mac Pro at 5 GiB on 1e87ab171: two
+                // first-frame binds refused to the client "no segment is
+                // left to commit" beside "the segments left ... hold 3
+                // more", two reads at two instants).
                 grew = grown(prefix, run) => {
                     if let Err(why) = grew {
-                        return Err(error.context(format!("refused: {why}")));
+                        tracing::debug!(%pid, %why, "a bind's commit will not come: the planner makes its room");
                     }
                 }
                 () = freed => {}
@@ -3340,7 +4043,8 @@ where
         }
         let parked_with_it = matches!(
             error.downcast_ref::<RolesError>(),
-            Some(RolesError::Parked { holder: Some(holder), .. }) if *holder == pid
+            Some(RolesError::Parked { holder: Some(holder), .. } | RolesError::HolderParked(holder))
+                if *holder == pid
         );
         if !parked_with_it {
             return Err(error);
@@ -3436,7 +4140,12 @@ pub fn rebind(
         );
         return Ok(());
     }
+    let parked = matches!(rebind, Rebind::Parked { .. });
     engine.rebind_slots(rebind)?;
+    // A park names no new slots: nothing is rebound, no held write goes.
+    if parked {
+        return Ok(());
+    }
     let Some(roles) = roles else {
         return Ok(());
     };

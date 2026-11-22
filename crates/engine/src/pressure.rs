@@ -41,6 +41,9 @@ impl Yield {
     /// The machine is this process's: every target is its ceiling.
     pub const NONE: Yield = Yield(0.0);
 
+    /// All of the pool above the floor goes back at full pressure.
+    pub const FULL: Yield = Yield(1.0);
+
     /// # Errors
     ///
     /// `share` is not a number in `[0, 1]`.

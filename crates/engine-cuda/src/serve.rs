@@ -3,7 +3,7 @@ mod boot;
 pub(crate) mod btrace;
 pub mod diag;
 mod enqueue;
-mod landing;
+pub(crate) mod landing;
 mod lanes;
 mod load;
 mod measured;
@@ -144,10 +144,6 @@ pub struct Shell {
     prefill_lanes: u32,
     /// `engine.fire_lanes` (`Shell::fire_lanes`).
     fire_lanes: u32,
-    /// The default lattice's `(steps, prefill_from, prefill_steps)` where no
-    /// buckets were stated: what arming coarsens to fit the bodies' allowance
-    /// (`Shell::fit_lattice`).
-    lattice: Option<(u32, u32, u32)>,
     pad: bool,
     bodies: bool,
     bodies_mem: usize,
@@ -164,6 +160,10 @@ pub struct Shell {
     rearming: bool,
     /// An arming narrowed to one bucket's targets (`Shell::rearm_bucket`).
     arm_only: Option<u32>,
+    /// The kernels each composition launches, as the size-only walk passed
+    /// over them (`Shell::size_arming`), by its bucket and composition: the
+    /// order arming takes within one row count (`lattice_targets`).
+    walked_launches: std::collections::HashMap<(u32, String), u64>,
     /// What the last arming's captures took, which a re-arm within the
     /// same load is allowed.
     bodies_took: u64,
@@ -206,6 +206,10 @@ pub struct Shell {
     /// never arms once lanes name slot refs (it is refused by name, or the
     /// bodies stay as recorded).
     arm_deferred: bool,
+    /// How the load seated its weights ahead of the runtime's first
+    /// residency (`filed`, `copied`; `Shell::preseat_weights`), for a
+    /// measuring load that seats them again in a range reserved anew.
+    preseated_as: Option<(bool, bool)>,
     segments: std::collections::HashMap<record::BodyKey, Segmented>,
     windows_memo: Vec<prepare::WindowsMemo>,
     cache: GraphCache,
@@ -630,6 +634,8 @@ impl Shell {
         budget: Option<u64>,
         dir: Option<&std::path::Path>,
         persistent: bool,
+        seats: u32,
+        context: u32,
         world: crate::World,
     ) -> Result<u32> {
         let ranks = u64::from(world.size.max(1));
@@ -652,12 +658,44 @@ impl Shell {
                 } else {
                     0
                 };
+                // Derived on its own ([`engine::disk::derived_budget`]): the
+                // disk chunks `seats` sequences' kv pages at `context` and
+                // their state take, within this rank's share of the free
+                // disk; nothing of the device pool enters it. Never four times the host
+                // tier (a host budget below one chunk seated no disk tier)
+                // nor a quarter of the disk. One that cannot be seated is
+                // refused by name.
                 let free = engine::disk::free_space(dir).saturating_add(kept);
-                let host = u64::from(self.pools.host_pages()) * self.pools.paged_page_bytes();
-                let bytes = host.saturating_mul(4).min(free / 4 / ranks);
-                if self.pools.seat_disk(dir, world.rank, bytes, keep).is_err() {
-                    self.pools.unseat_disk();
-                }
+                let paging = self.pools.paging();
+                let pages = u64::from(seats)
+                    * u64::from(context).div_ceil(u64::from(paging.page_size.max(1)));
+                let per_chunk = self
+                    .pools
+                    .chunk_layout()
+                    .list
+                    .as_ref()
+                    .map_or(1, |list| u64::from(list.per_chunk.max(1)));
+                let chunk = self.pools.disk_chunk_bytes();
+                let state = (u64::from(seats) * self.state_row_bytes()).div_ceil(chunk.max(1));
+                // The guest state the device can hold live (the room a
+                // guest program binds within): evicted, it has a home.
+                let guest = self.chunk_facts()?.guest_room_bytes();
+                let bytes = engine::disk::derived_budget(
+                    0,
+                    0,
+                    pages.div_ceil(per_chunk) + state,
+                    chunk,
+                    guest,
+                    free / ranks,
+                );
+                // Its inputs, stated at load: what the field rules on.
+                eprintln!(
+                    "engine-cuda: the unstated disk tier: {bytes} bytes = {seats} seats x                      {context} tokens: {pages} kv pages in {} chunks and {state} chunks of state                      ({} B a seat), and {guest} B of guest state the device holds live, chunks of {chunk} B, within {} bytes free a rank",
+                    pages.div_ceil(per_chunk),
+                    self.state_row_bytes(),
+                    free / ranks,
+                );
+                self.pools.seat_disk(dir, world.rank, bytes, keep)?;
                 Some(bytes)
             }
         };
@@ -1067,6 +1105,13 @@ impl Shell {
         let pools = &self.pools;
         self.programs
             .rebase(&|item, bytes| pools.guest_item(item, bytes))
+    }
+
+    /// Instance `id`'s process parked (`engine::Rebind::Parked`).
+    pub fn park_program(&mut self, id: engine::InstanceId, kept: bool) -> Result<()> {
+        let pools = &self.pools;
+        self.programs
+            .park(id, kept, &|item, bytes| pools.guest_item(item, bytes))
     }
 
     /// Instance `id`'s items lie in `slots` now.

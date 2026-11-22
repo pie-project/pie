@@ -163,8 +163,11 @@ pub(crate) type View = (wgpu::Buffer, u64, u64);
 
 /// A group by its layout, not its pipeline: kernels of one layout (the
 /// variants of a kernel, by the rows they take) share what a dispatch binds
-/// over the same views.
-type BindKey = (wgpu::BindGroupLayout, Vec<View>);
+/// over the same views, at the same uniform size. One layout serves kernels
+/// whose uniform blocks differ (a decode walk's scalars and a prefill tile's
+/// two more), and a group binds its uniform at one size: a group made for
+/// the smaller block fails validation on the larger.
+type BindKey = (wgpu::BindGroupLayout, Vec<View>, u64);
 
 /// A bind group layout by what it holds: each storage binding a kernel
 /// reaches and whether it is read-only, and its uniform's binding.
@@ -316,7 +319,7 @@ impl Pipelines {
         views: &[View],
         uniform_bytes: u64,
     ) -> Result<wgpu::BindGroup> {
-        let key: BindKey = (pipeline.layout.clone(), views.to_vec());
+        let key: BindKey = (pipeline.layout.clone(), views.to_vec(), uniform_bytes);
         if let Some(group) = self.binds.borrow().groups.get(&key) {
             self.bind_hits.set(self.bind_hits.get() + 1);
             BIND_TRAFFIC[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -422,7 +425,11 @@ fn bind_layout(
             .map(|at| {
                 (
                     at,
-                    declared.read_only.get(at as usize).copied().unwrap_or(false),
+                    declared
+                        .read_only
+                        .get(at as usize)
+                        .copied()
+                        .unwrap_or(false),
                 )
             })
             .collect(),

@@ -257,13 +257,53 @@ pub fn located(segment: (u64, u64), laid: [Laid; 6], heap: Laid) -> Result<Bases
 
 pub const WORKGROUP: u32 = eta_compiler::codegen::wgsl::WORKGROUP;
 
-pub const GROUPS_PER_CORE: u32 = 4;
-
-pub fn groups_for(descriptors: &[ValueDesc], cores: u32) -> u32 {
+pub fn groups_for(descriptors: &[ValueDesc], workgroups: u32) -> u32 {
     let widest = descriptors.iter().map(|d| d.len).max().unwrap_or(1).max(1);
     let wanted = widest.div_ceil(WORKGROUP);
-    let cap = cores.max(1).saturating_mul(GROUPS_PER_CORE);
-    wanted.clamp(1, cap)
+    wanted.clamp(1, workgroups.max(1))
+}
+
+/// Each of `steps`' workgroups, at most `workgroups` (the device holds at
+/// once): the jobs its call runs over its node's first operand
+/// ([`eta_compiler::codegen::wgsl::step_jobs`]) a workgroup's invocations
+/// each, else what the stage's widest value wants ([`groups_for`]). A step
+/// whose jobs are far fewer than the widest value (a reduction's levels,
+/// its finish) launches no workgroup only to find no job.
+#[must_use]
+pub fn step_groups(
+    plan: &eta_compiler::codegen::launch::LaunchStagePlan,
+    descriptors: &[ValueDesc],
+    steps: &[eta_compiler::codegen::wgsl::Step],
+    workgroups: u32,
+) -> Vec<u32> {
+    let widest = groups_for(descriptors, u32::MAX);
+    steps
+        .iter()
+        .map(|step| {
+            let jobs = plan
+                .ops
+                .get(step.node as usize)
+                .and_then(|op| op.args.first())
+                .and_then(|&a0| descriptors.get(a0 as usize))
+                .and_then(|a| {
+                    eta_compiler::codegen::wgsl::step_jobs(step.call, step.rung, a.len, rows_of(a))
+                });
+            let wanted = jobs.map_or(widest, |jobs| {
+                u32::try_from(jobs.div_ceil(u64::from(WORKGROUP))).unwrap_or(u32::MAX)
+            });
+            wanted.clamp(1, workgroups.max(1))
+        })
+        .collect()
+}
+
+/// A value's rows as the runtime counts them (`rows_of`): its dims but the
+/// last, one where its rank is under two.
+fn rows_of(value: &ValueDesc) -> u32 {
+    let rank = (value.rank as usize).min(value.dims.len());
+    if rank < 2 {
+        return 1;
+    }
+    value.dims[..rank - 1].iter().product::<u32>().max(1)
 }
 
 #[cfg(test)]

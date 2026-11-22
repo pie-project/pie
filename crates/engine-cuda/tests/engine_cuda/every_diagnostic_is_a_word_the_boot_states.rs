@@ -28,6 +28,7 @@ const WORDS: &[(&str, Reads)] = &[
     }),
     ("chunk-bytes=1048576", |d| d.chunk_bytes == Some(1 << 20)),
     ("untabled-experts", |d| d.untabled_experts),
+    ("unwritten-nan", |d| d.unwritten_nan),
 ];
 
 #[test]

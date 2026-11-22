@@ -286,6 +286,28 @@ impl CompletionBroker {
     pub fn notify(&self, wait_id: u64, epoch: u64) {
         let _ = self.inner.table.publish(wait_id, epoch);
     }
+
+    /// A copy answered as still landing ended without landing
+    /// ([`::engine::Landing::Failed`]): its completion settles as
+    /// [`CopyLandingFailed`], never as landed. Its destination is not to be
+    /// trusted, and its sources hold what they held.
+    pub fn fail(&self, wait_id: u64, epoch: u64, why: String) {
+        failed_landings().lock().unwrap().insert(wait_id, why);
+        let _ = self.inner.table.publish(wait_id, epoch);
+    }
+}
+
+/// A copy that did not land, said by the engine
+/// ([`::engine::Landing::Failed`]): its destination is not to be trusted,
+/// its sources hold what they held before it.
+#[derive(Debug, thiserror::Error)]
+#[error("the copy did not land: {0}")]
+pub struct CopyLandingFailed(pub String);
+
+/// The landing completions told failed, by wait id, until read.
+fn failed_landings() -> &'static Mutex<std::collections::HashMap<u64, String>> {
+    static FAILED: OnceLock<Mutex<std::collections::HashMap<u64, String>>> = OnceLock::new();
+    FAILED.get_or_init(Mutex::default)
 }
 
 #[derive(Clone)]
@@ -376,6 +398,10 @@ impl SubmissionCompletion {
                                     "engine callback published before terminal outcome settled"
                                 )))
                             })
+                        } else if let Some(why) =
+                            failed_landings().lock().unwrap().remove(&slot)
+                        {
+                            Some(Err(anyhow::Error::new(CopyLandingFailed(why))))
                         } else {
                             Some(Ok(()))
                         }

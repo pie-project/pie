@@ -44,7 +44,7 @@ use profile::fire::Rates;
 
 
 /// The rates this backend's estimate weighs a fire by, of
-/// `profile::fire::KEYS` (all but the slang backends' `tile_tflops_by_rows` and `vector_tflops_by_rows`): what its load measures where its
+/// `profile::fire::KEYS` (every one): what its load measures where its
 /// chip's profile states none.
 pub const KEYS: [&str; 8] = [
     "launch_ns",
@@ -783,10 +783,13 @@ pub fn measure(
         few_row_tflops: few_row,
         workgroups_per_core: per_core,
         submit_worst_ratio: None,
+        resident_workgroups: None,
         attn_tflops_by_rows_keys: None,
-        tile_tflops_by_rows: None,
-        vector_tflops_by_rows: None,
         product_ns: None,
+        kernel_tflops_by_shape: None,
+        dense_settled: None,
+        measured_on: None,
+        measured_by: None,
     })
 }
 

@@ -45,9 +45,23 @@ pub fn at_load(
         provenance: provenance(&measured.name),
         registry: crate::chip::registry(),
     });
+    let keys = engine_gpu::rates::keys_at(max_submit);
+    let lacked = stated.missing(&keys);
+    if lacked.is_empty() {
+        tracing::info!(
+            "rates: every [rates] key the load weighs by is stated ({}); none measured",
+            keys.join(", ")
+        );
+    } else {
+        tracing::info!(
+            "rates: measuring {}: no layer states them, or the user's file stored them under no \
+             matching key (its stored measurements' lines say which)",
+            lacked.join(", ")
+        );
+    }
     let chip = engine::rates::rates_at_load(
         chip,
-        &engine_gpu::rates::keys_at(max_submit),
+        &keys,
         save,
         Some(device.left()),
         max_submit,
@@ -57,6 +71,19 @@ pub fn at_load(
         call: "rates at load",
         why,
     })?;
+    let resident = chip
+        .rates()
+        .resident_workgroups
+        .map(|workgroups| workgroups.round().clamp(1.0, f64::from(u32::MAX)) as u32)
+        .ok_or_else(|| engine_gpu::error::Fault::Device {
+            call: "rates at load",
+            why: "the profile states no [rates] resident_workgroups after the rates step".into(),
+        })?;
+    device.hold_resident(resident);
+    tracing::info!(
+        resident,
+        "the workgroups the device holds at once, as its profile states them"
+    );
     Ok(crate::tuning::Tuning::new(chip, device.limits()))
 }
 
@@ -76,6 +103,88 @@ pub fn measure(
         "rates: measuring, each submission within the bound"
     );
     engine_gpu::rates::measure::<Api, _>(device, tuning, tier, &timer, max_submit, stated)
+        .map(|measured| on(device, measured))
+}
+
+/// `measured` stated as measured on `device` (`engine_gpu::stored`).
+fn on(device: &Context, mut measured: engine::rates::Measured) -> engine::rates::Measured {
+    measured.rates.measured_on = Some(device.measured_on());
+    measured
+}
+
+/// `rates` saved into the user's profile under `profiles` for this device
+/// (`engine::rates::save_rates`), where a load names a profile directory.
+pub fn save_rates(
+    device: &Context,
+    profiles: Option<&std::path::Path>,
+    rates: &profile::fire::Rates,
+) -> Result<()> {
+    let Some(profiles) = profiles else {
+        return Ok(());
+    };
+    let measured = device.chip();
+    let save = engine::rates::SaveTo {
+        path: crate::chip::SHELF.user_path(profiles, &measured.name),
+        provenance: provenance(&measured.name),
+        registry: crate::chip::registry(),
+    };
+    let rates = profile::fire::Rates {
+        measured_on: Some(device.measured_on()),
+        ..rates.clone()
+    };
+    engine::rates::save_rates(&save, &rates)
+        .map(drop)
+        .map_err(|why| engine_gpu::Fault::Device {
+            call: "rates at load",
+            why,
+        })
+}
+
+/// `tuning` with each dense kernel's curve at each of the model's `shapes`
+/// to `top_rows` (`engine_gpu::rates::shapes_at_load`), saved to the user's
+/// profile under `profiles`, each timed frame under `max_submit` where the
+/// device states one.
+pub fn shapes_at_load(
+    device: &Context,
+    tuning: crate::tuning::Tuning,
+    profiles: Option<&std::path::Path>,
+    max_submit: Option<std::time::Duration>,
+    shapes: &[(u32, u32)],
+    model_bytes: u64,
+    top_rows: u32,
+) -> Result<crate::tuning::Tuning> {
+    let tier = <Api as engine_gpu::serve::Serve>::tier(device);
+    // Each point timed by the device's two timestamps around its frame (a
+    // spanned frame, none between its dispatches): the host's wait swings a
+    // frame more than the kernels it weighs apart.
+    let timer = |frame: Frame| {
+        let started = std::time::Instant::now();
+        let span = frame.commit_spanned()?;
+        Ok((
+            span.filter(|&ns| ns > 0),
+            started.elapsed().as_nanos() as u64,
+        ))
+    };
+    let measured = device.chip();
+    let save = profiles.map(|profiles| engine::rates::SaveTo {
+        path: crate::chip::SHELF.user_path(profiles, &measured.name),
+        provenance: provenance(&measured.name),
+        registry: crate::chip::registry(),
+    });
+    let chip = engine_gpu::rates::shapes_at_load::<Api, _>(
+        device,
+        &tuning,
+        tier,
+        &timer,
+        max_submit,
+        tuning.profile().clone(),
+        save,
+        &device.measured_on(),
+        shapes,
+        Some(model_bytes),
+        top_rows,
+    );
+    Ok(crate::tuning::Tuning::new(chip?, device.limits()))
 }
 
 /// [`measure`], saying how the warm-up ended.
@@ -99,6 +208,7 @@ pub fn measure_saying(
         &profile::fire::Rates::default(),
         say,
     )
+    .map(|measured| on(device, measured))
 }
 
 /// The bf16 matmul rate of `device` at `(m, n, k)`, under the tactic

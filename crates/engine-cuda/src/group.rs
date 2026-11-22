@@ -704,7 +704,13 @@ impl Engine for Group {
 
     fn on_landed(&mut self, sink: engine::LandingSink) {
         let left = Arc::clone(&self.landing);
-        let each: engine::LandingSink = Arc::new(move |token| {
+        // A rank's copy that failed fails the group's: the first rank's
+        // fault is told once the last rank has told.
+        let failed: Arc<Mutex<std::collections::HashMap<u64, String>>> = Arc::default();
+        let each: engine::LandingSink = Arc::new(move |token, landing| {
+            if let engine::Landing::Failed(why) = landing {
+                failed.lock().unwrap().entry(token).or_insert(why);
+            }
             let last = {
                 let mut left = left.lock().unwrap();
                 match left.get_mut(&token) {
@@ -720,7 +726,10 @@ impl Engine for Group {
                 }
             };
             if last {
-                sink(token);
+                match failed.lock().unwrap().remove(&token) {
+                    Some(why) => sink(token, engine::Landing::Failed(why)),
+                    None => sink(token, engine::Landing::Landed),
+                }
             }
         });
         for shell in &self.ranks {

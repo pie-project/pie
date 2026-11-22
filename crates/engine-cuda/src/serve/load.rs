@@ -86,7 +86,6 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // The product times the device's profile holds choose between the
     // kernels that can serve a decode product; arming notes the shapes it
     // lacks, measured once it has armed (`Staged::finish`).
-    #[cfg(feature = "rocm")]
     device.set_routes(std::sync::Arc::new(kernels_cuda::linear::routes::Routes::of(
         chip.rates().product_ns.as_deref().unwrap_or_default(),
     )));
@@ -284,14 +283,41 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // bodies and the guests' programs have the other half; the token budget
     // halves toward its floor until they do, and the lattice follows.
     let (free, total) = crate::store::device_memory()?;
-    let after_weights = crate::device::elastic::room_under(ceiling, free, total).saturating_sub(
-        crate::store::weight_tier_bytes(
-            &boot.trace,
-            boot.residency.resident_bytes(&boot.trace)?,
-            0,
-        )?,
-    );
+    let weight_tier = crate::store::weight_tier_bytes(
+        &boot.trace,
+        boot.residency.resident_bytes(&boot.trace)?,
+        0,
+    )?;
+    let after_weights =
+        crate::device::elastic::room_under(ceiling, free, total).saturating_sub(weight_tier);
+    // Each byte charged once: what the card holds now (this process's
+    // context and kernel modules among it; no weight has landed yet), the
+    // weight tier to come, and the driver's floor.
+    let room_line = room_line(boot.allowance, ceiling, total - free, weight_tier, after_weights);
+    eprintln!("engine-cuda: {room_line}");
     let after_weights = held_beside(boot, after_weights)?;
+    // A declared context is the model's, not the operator's: it is served at
+    // the longest one sequence of which takes half the room this line leaves
+    // (this process's context and modules already out of it), and the fit
+    // shortens it further where the load does not seat it
+    // (`Pools::declare_context`); a card that seats none is refused by name.
+    if boot.context_declared {
+        let fits = crate::store::declared_context_within(
+            &boot.trace,
+            boot.page_size,
+            boot.context,
+            after_weights,
+        )?;
+        if fits < boot.context {
+            eprintln!(
+                "engine-cuda: the model declares a {}-token context and one sequence at it \
+                 takes more than half of the room the load has past the weights; serving \
+                 {fits} tokens. State `[engine] max_context` to choose.",
+                boot.context
+            );
+            boot.context = fits;
+        }
+    }
     let facts = kv::probe(&boot.trace)?;
     let derive_voxels = boot
         .voxels
@@ -409,6 +435,8 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             |rows| rows,
         );
         let counts = crate::top::counts(&boot.trace)?;
+        // A card on which no rung fits beside one sequence is refused by
+        // name, with the room it had: too small for this load as stated.
         let (top, estimate) = crate::top::choose(
             &rungs,
             after_weights,
@@ -417,7 +445,15 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             crate::top::shape(&chip)?,
             device.name(),
             &counts,
-        )?;
+        )
+        .map_err(|fault| match fault {
+            Fault::Card(why) => Fault::Card(format!(
+                "{room_line}; one sequence at {} tokens takes {} MiB beside a fire: {why}",
+                boot.context,
+                candidates.first().map_or(0, |c| c.beside) >> 20,
+            )),
+            fault => fault,
+        })?;
         // Which pricing the estimate gave the dense matmuls, said once: the
         // waves of the kernels hipBLASLt states, or the measured curve as
         // timed and why its solutions went unread.
@@ -581,7 +617,6 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         regions,
         anchored,
         asked,
-        stated_buckets: !stated_buckets.is_empty(),
         ceiling,
         weighed,
     })
@@ -644,6 +679,17 @@ fn host_copy(boot: &Boot<'_>, params: &[usize]) -> Result<HostCopy> {
         .flat_map(|&codes| crate::store::layout::packed_planes(&boot.trace, codes))
         .flatten()
         .map(|plane| plane as usize)
+        // And an fp8 bank's codes ROCm puts in the FP8 matrix core's order
+        // (`store::layout::fp8_ordered`), laid alike: in a copy where one is
+        // read, in its slots once filled under a load told its weights are
+        // held. Its factors lie as the file holds them.
+        .chain(
+            params
+                .iter()
+                .filter(|_| !boot.knobs.weights_held)
+                .filter(|&&codes| crate::store::layout::fp8_ordered(&boot.trace, codes))
+                .copied(),
+        )
         .collect();
     let relaid = |param: usize| {
         lanes.contains(&param)
@@ -688,6 +734,39 @@ fn host_copy(boot: &Boot<'_>, params: &[usize]) -> Result<HostCopy> {
         )));
     }
     Ok(HostCopy::Pinned)
+}
+
+/// The load's room as the fit reads it, each byte once: the ceiling the
+/// allowance sets, what the card holds now (this process's context and
+/// kernel modules, and any other process's, before a weight lands), the
+/// weight tier to come and the driver's floor, and what is left live.
+fn room_line(
+    allowance: engine::Allowance,
+    ceiling: u64,
+    in_use: u64,
+    weights: u64,
+    live: u64,
+) -> String {
+    let mib = |bytes: u64| bytes >> 20;
+    let held = match allowance.budget {
+        // The ceiling is what other holders held at the load's start plus
+        // the budget: past that, the card's bytes in use are this load's.
+        Some(budget) => format!(
+            "{} MiB of it this process's context and modules, charged to the {} MiB budget",
+            mib(in_use.saturating_sub(ceiling.saturating_sub(budget))),
+            mib(budget)
+        ),
+        None => "no budget stated".to_owned(),
+    };
+    format!(
+        "the load's room: ceiling {} MiB; the card holds {} MiB before the weights land ({held}); \
+         weight tier {} MiB; driver floor {} MiB; {} MiB live past the weights",
+        mib(ceiling),
+        mib(in_use),
+        mib(weights),
+        mib(crate::device::elastic::safety_floor_bytes()),
+        mib(live),
+    )
 }
 
 /// `room` less the banks the weight cache takes, where the card holds them
@@ -928,7 +1007,6 @@ impl Shell {
             regions: folded,
             anchored,
             asked,
-            stated_buckets,
             ceiling,
             weighed,
         } = bake(&mut boot)?;
@@ -1334,6 +1412,24 @@ impl Shell {
                 })
                 .collect(),
         );
+        // The fp8 banks put in the FP8 matrix core's order, which a slot
+        // filled from the file (or a copy pinned from it) is put in once
+        // filled.
+        pools.fp8_banks(
+            pools
+                .expert_params()
+                .into_iter()
+                .filter(|&param| crate::store::layout::fp8_ordered(&boot.trace, param as usize))
+                .filter_map(|param| {
+                    let shape = &boot.trace.params[param as usize].shape;
+                    Some(crate::store::Fp8Bank {
+                        codes: param,
+                        rows: *shape.get(1)?,
+                        k: shape[2..].iter().product::<u64>(),
+                    })
+                })
+                .collect(),
+        );
         // The activation rungs a pool may drop to (SPEC decision 6), each a
         // bucket's carve laid at the reservation's end.
         let rungs = activation_rungs(&boot.trace, &budgets, &compiled)?;
@@ -1611,11 +1707,6 @@ impl Shell {
             seat_spread: engine.seat_spread,
             prefill_lanes: engine.prefill_lanes,
             fire_lanes: engine.fire_lanes,
-            lattice: (!stated_buckets && engine.prefill_lattice_from > 0).then_some((
-                engine.lattice_steps,
-                engine.prefill_lattice_from,
-                engine.prefill_lattice_steps,
-            )),
             pad: recording.pad(),
             golden_arm: Golden::Off,
             bodies: recording.bodies(),
@@ -1625,6 +1716,7 @@ impl Shell {
             arming_at_load: false,
             rearming: false,
             arm_only: None,
+            walked_launches: std::collections::HashMap::new(),
             bodies_took: 0,
             measuring: false,
             workspace: None,
@@ -1635,6 +1727,7 @@ impl Shell {
             arm_cold: false,
             arm_rs: crate::record::RsBody::Folds,
             arm_deferred: false,
+            preseated_as: None,
             card: (0, 0),
             held_for_fires: 0,
             live: engine::live::Live::armed(),
@@ -1809,10 +1902,29 @@ impl Shell {
         {
             buffers.lay_reach(&mut shell.pools, false)?;
         }
-        let fitted = shell
+        let fitted = match shell
             .pools
             .fit_the_card(bodies, shell.held_for_fires, false, &resident)
-            .map_err(|why| shell.expert_staging.short(why))?;
+        {
+            // A record's bodies no longer fit beside one working set (the
+            // card or the budget is tighter than when it was taken): the
+            // load measures again, arming what fits and stating the rest
+            // eager, as a load with no record does.
+            Err(Fault::Residency(why)) if shell.bodies_from_record => {
+                eprintln!(
+                    "engine-cuda: the bodies' record no longer fits ({why}); this load measures \
+                     them again"
+                );
+                shell.bodies_from_record = false;
+                shell.measuring = !crate::device::elastic::mapped_on_demand();
+                let bodies = shell.bodies_hold();
+                shell
+                    .pools
+                    .fit_the_card(bodies, shell.held_for_fires, false, &resident)
+            }
+            fitted => fitted,
+        }
+        .map_err(|why| shell.expert_staging.short(why))?;
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
                 "[arm-trace] claim before arming: {} pages, {} chunks, room {} MiB (fresh {})",
@@ -1973,8 +2085,6 @@ impl Staged {
             free_before,
             profiles,
         } = self;
-        #[cfg(not(feature = "rocm"))]
-        let _ = &profiles;
         if arm_trace {
             eprintln!(
                 "[arm-trace] device free {} MiB before arming",
@@ -2016,7 +2126,6 @@ impl Staged {
             let armed = shell.arm_bodies();
             shell.arming_at_load = false;
             armed?;
-            #[cfg(feature = "rocm")]
             shell.routes_measured(profiles.as_deref())?;
             if shell.measuring {
                 shell.measured_refit(device_total, free_before)?;
@@ -2183,39 +2292,71 @@ impl Shell {
     /// time under each kernel (`Shell::routes_by_body`), saved in the
     /// device's user profile, and the lattice left armed under the choices.
     /// A load whose profile holds every shape measures nothing.
-    #[cfg(feature = "rocm")]
     fn routes_measured(&mut self, profiles: Option<&std::path::Path>) -> Result<()> {
         let Some(routes) = self.device.ctx().routes().cloned() else {
             return Ok(());
         };
         let wanted = routes.wanted();
         if wanted.is_empty() {
+            eprintln!(
+                "engine-cuda: decode products' kernels from the profile: every shape the bodies \
+                 hold reused, 0 measured"
+            );
+            return Ok(());
+        }
+        // A load that records no bodies serves every fire as an eager walk:
+        // there is no body to time a product's kernel by, so it keeps the
+        // routes it has, saves no choice to the profile, and says so.
+        if !self.records_bodies() {
+            eprintln!(
+                "engine-cuda: card: routes unmeasured, no recorded bodies: {} decode product \
+                 shape(s) keep their routes as they stand, and none is saved",
+                wanted.len()
+            );
             return Ok(());
         }
         let started = std::time::Instant::now();
         let measured = self.routes_by_body(routes, &wanted)?;
+        if measured.is_empty() {
+            // Every shape a decode body times is the profile's: nothing is
+            // measured or saved; the rest (rows no decode body carries) keep
+            // their stated kernel.
+            eprintln!(
+                "engine-cuda: decode products' kernels from the profile: 0 measured; {} shape(s) \
+                 at rows no decode body carries keep their stated kernel",
+                wanted.len()
+            );
+            return Ok(());
+        }
         let saved = crate::rates::save_product_times(profiles, self.device.name(), &measured)
             .map_err(Fault::Card)?;
         let chosen = self.device.ctx().routes().cloned();
         let said: Vec<String> = wanted
-            .keys()
-            .map(|s| {
+            .iter()
+            .map(|(s, noted)| {
                 let us = |kernel| {
                     measured
                         .iter()
                         .find(|(shape, k, ..)| shape == s && *k == kernel)
                         .map_or(f64::NAN, |&(.., ns, _)| ns / 1e3)
                 };
-                let pick = chosen.as_ref().map(|c| c.pick(*s, 0));
+                let pick = chosen
+                    .as_ref()
+                    .map_or(noted.candidates.first().copied().unwrap_or(0), |c| {
+                        c.pick(*s, 0, &noted.candidates)
+                    });
+                let times: Vec<String> = noted
+                    .candidates
+                    .iter()
+                    .map(|&kernel| format!("{kernel:08x} {:.1} us", us(kernel)))
+                    .collect();
                 format!(
-                    "{:?} {}x{} m{}: step {:.1} us skinny / {:.1} us turned -> {:?}",
+                    "{:?} {}x{} m{}: step {} -> {pick:08x}",
                     s.kind,
                     s.rows,
                     s.k,
                     s.m,
-                    us(kernels_cuda::linear::routes::Kernel::Skinny),
-                    us(kernels_cuda::linear::routes::Kernel::Turned),
-                    pick.unwrap_or(kernels_cuda::linear::routes::Kernel::Skinny),
+                    times.join(" / "),
                 )
             })
             .collect();
@@ -2235,12 +2376,46 @@ impl Shell {
     /// Its record holds the figure, so a later boot fits once.
     fn measured_refit(&mut self, device_total: u64, free_before: u64) -> Result<()> {
         let started = std::time::Instant::now();
-        let hold = self.bodies_took;
+        let mut hold = self.bodies_took;
+        let weighed = self.cache.body_stats().census.bytes as u64;
         self.cache.forget_bodies();
+        // A flat range was allocated at the least range the bodies armed
+        // over; where the card backs more, it is let go (the weights
+        // preseated in it with it) so the refit reserves it anew at what the
+        // card backs, and the weights are seated again in it below.
+        let preseated = self.pools.preseated();
+        self.device.synchronize()?;
+        let refilled = self.pools.free_for_refit()?;
         let resident = footprint(self, device_total, free_before);
-        let fitted = self
+        let fitted = match self
             .pools
-            .fit_the_card(hold, self.held_for_fires, false, &resident)?;
+            .fit_the_card(hold, self.held_for_fires, false, &resident)
+        {
+            // What the captures took (the device's free bytes they cost)
+            // past one working set no longer fits: an arming that stopped for
+            // room holds what its bodies weigh, the rest stated eager.
+            Err(Fault::Residency(_)) if weighed < hold => {
+                hold = weighed;
+                self.pools
+                    .fit_the_card(hold, self.held_for_fires, false, &resident)?
+            }
+            fitted => fitted?,
+        };
+        if refilled && let (true, Some((filed, copied))) = (preseated, self.preseated_as) {
+            let began = std::time::Instant::now();
+            self.preseat_weights(filed, copied)?;
+            let chunks = self
+                .pools
+                .preseat_plan()
+                .map_or(0, |plan| self.pools.weight_chunks(&plan).len());
+            eprintln!(
+                "engine-cuda: a measuring boot's flat range held the least range the bodies \
+                 armed over; it was reserved anew at {} chunks, and the weights the pool holds \
+                 ({chunks} chunks) were seated in it again from their copy in {:.1} s",
+                fitted.chunks,
+                began.elapsed().as_secs_f64()
+            );
+        }
         self.lay_workspace()?;
         self.bodies_mem = usize::try_from(hold).unwrap_or(usize::MAX);
         self.rearming = true;
@@ -2698,8 +2873,6 @@ pub(super) struct Baked {
     pub(super) anchored: std::collections::BTreeMap<u64, kernels_ir::Anchored>,
     /// The budget asked before the card cut its tokens at the asked lanes.
     pub(super) asked: Budget,
-    /// Whether the load stated its buckets (no default lattice to coarsen).
-    pub(super) stated_buckets: bool,
     /// What the card may hold in all under the load's allowance, resolved
     /// before the load took anything (`elastic::ceiling_of`).
     pub(super) ceiling: u64,

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{SmallVec, smallvec};
 
 use super::hash::Hash256;
@@ -1581,6 +1581,100 @@ impl KvPageTable {
             .collect())
     }
 
+    /// [`Self::movable_resident_pages`] of each of `groups`, the running
+    /// working sets' and the pins' locations walked once for all of them:
+    /// asked one group at a time, every group walked every running set's
+    /// every page (O(groups x pages): ~32 us a process, ~9 ms a map of 250
+    /// on a realistic store, every pass that built the occupancy map).
+    pub fn movable_resident_pages_each(
+        &self,
+        groups: &[HashSet<WorkingSetId>],
+    ) -> Vec<Vec<(TriePageLocation, PhysicalKvPageId)>> {
+        if groups.is_empty() {
+            return Vec::new();
+        }
+        // The running sets reading each location (one inline, more in a
+        // list: most pages have one reader), and the pinned ones.
+        enum Readers {
+            One(WorkingSetId),
+            Many(Vec<WorkingSetId>),
+        }
+        // Each running set's locations, walked once: the readers counted
+        // from them, and a group of running sets read from them again
+        // rather than resolved a second time.
+        let mut readers: FxHashMap<TriePageLocation, Readers> = FxHashMap::default();
+        let mut walked: FxHashMap<WorkingSetId, Vec<TriePageLocation>> = FxHashMap::default();
+        for (ws, entry) in self.working_sets.iter() {
+            if entry.suspended {
+                continue;
+            }
+            let mut locations = Vec::new();
+            let _ = self.visit_working_set_locations(ws, |location| {
+                locations.push(location);
+                match readers.entry(location) {
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(Readers::One(ws));
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut slot) => {
+                        let by = slot.get_mut();
+                        match by {
+                            Readers::One(first) => *by = Readers::Many(vec![*first, ws]),
+                            Readers::Many(list) => list.push(ws),
+                        }
+                    }
+                }
+            });
+            walked.insert(ws, locations);
+        }
+        let mut pinned: FxHashSet<TriePageLocation> = FxHashSet::default();
+        for &terminal in self.pins.keys() {
+            self.visit_anchor_locations(terminal, |location| {
+                pinned.insert(location);
+            });
+        }
+        groups
+            .iter()
+            .map(|sets| {
+                let mut seen: FxHashSet<TriePageLocation> = FxHashSet::default();
+                let mut out = Vec::new();
+                for &ws in sets {
+                    let fresh;
+                    let locations: &[TriePageLocation] = match walked.get(&ws) {
+                        Some(locations) => locations,
+                        None => {
+                            let mut locations = Vec::new();
+                            if self
+                                .visit_working_set_locations(ws, |location| locations.push(location))
+                                .is_err()
+                            {
+                                // A set the table no longer knows: as a
+                                // group it names nothing movable.
+                                return Vec::new();
+                            }
+                            fresh = locations;
+                            &fresh
+                        }
+                    };
+                    for &location in locations {
+                        if (sets.len() > 1 && !seen.insert(location))
+                            || pinned.contains(&location)
+                            || readers.get(&location).is_some_and(|by| match by {
+                                Readers::One(reader) => !sets.contains(reader),
+                                Readers::Many(list) => list.iter().any(|reader| !sets.contains(reader)),
+                            })
+                        {
+                            continue;
+                        }
+                        if let Ok(KvPageBacking::Resident(id)) = self.backing_at(&location) {
+                            out.push((location, id));
+                        }
+                    }
+                }
+                out
+            })
+            .collect()
+    }
+
     /// Only those pages stay; the rest of `working_sets` can still go.
     fn staying(
         &self,
@@ -2154,7 +2248,19 @@ impl KvPageTable {
         working_sets: &HashSet<WorkingSetId>,
     ) -> Result<FxHashSet<TriePageLocation>, KvTableError> {
         let mut locations = FxHashSet::default();
-        for &ws in working_sets {
+        // Under test the sets are walked in id order, whatever order the
+        // caller's set holds them in: the locations' order (and every move
+        // laid from it) is then the same on each run of a seeded simulation.
+        // In service they are walked as the set holds them, nothing built.
+        #[cfg(test)]
+        let order = {
+            let mut order: Vec<WorkingSetId> = working_sets.iter().copied().collect();
+            order.sort_unstable_by_key(|ws| ws.to_bits());
+            order
+        };
+        #[cfg(not(test))]
+        let order = working_sets.iter().copied();
+        for ws in order {
             self.visit_working_set_locations(ws, |location| {
                 locations.insert(location);
             })?;

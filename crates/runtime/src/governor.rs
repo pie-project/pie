@@ -67,6 +67,30 @@ pub fn source_for(yields: Yield, source: impl FnOnce() -> Result<Source, String>
     })
 }
 
+/// The yield a load runs at, and the line its load log states it in. A
+/// deployment's `[engine.memory] yield` is kept as configured. Unset, it is
+/// `1` where an engine the governor steers states unified memory (the pool
+/// and the host share one RAM, so a pool that never yields starves the
+/// system and the device's own command buffers with it), and `0` (a
+/// dedicated machine) on separate device memory.
+#[must_use]
+pub fn yield_for(configured: Option<Yield>, unified_memory: bool) -> (Yield, String) {
+    match configured {
+        Some(yields) => (
+            yields,
+            format!("engine.memory.yield = {}: as configured", yields.share()),
+        ),
+        None if unified_memory => (
+            Yield::FULL,
+            "engine.memory.yield = 1: unified memory, the pool and the host share RAM".to_string(),
+        ),
+        None => (
+            Yield::NONE,
+            "engine.memory.yield = 0: separate device memory, the pool holds its budget".to_string(),
+        ),
+    }
+}
+
 impl Reader {
     #[must_use]
     pub const fn new(source: Source) -> Self {
@@ -375,6 +399,40 @@ mod tests {
     fn a_yield_of_zero_reads_nothing_and_loads_without_a_source() {
         let none = || -> Result<Source, String> { panic!("not read at yield 0") };
         assert_eq!(source_for(Yield::NONE, none), Ok(None));
+    }
+
+    #[test]
+    fn an_unset_yield_is_full_on_unified_memory_and_none_on_separate() {
+        let (yields, line) = yield_for(None, true);
+        assert_eq!(yields, Yield::FULL);
+        assert_eq!(
+            line,
+            "engine.memory.yield = 1: unified memory, the pool and the host share RAM"
+        );
+        let (yields, line) = yield_for(Some(Yield::NONE), true);
+        assert_eq!(yields, Yield::NONE, "a configured 0 is kept on unified memory");
+        assert_eq!(line, "engine.memory.yield = 0: as configured");
+        let (yields, line) = yield_for(Some(share(0.5)), false);
+        assert_eq!(yields, share(0.5));
+        assert_eq!(line, "engine.memory.yield = 0.5: as configured");
+        let (yields, _) = yield_for(None, false);
+        assert_eq!(yields, Yield::NONE, "separate device memory: the default stays 0");
+    }
+
+    #[test]
+    fn the_unified_default_reads_the_system_s_pressure() {
+        let (yields, _) = yield_for(None, true);
+        let file = Source::File("/pie-pressure".into());
+        let read = std::cell::Cell::new(false);
+        let source = source_for(yields, || {
+            read.set(true);
+            Ok(file.clone())
+        });
+        assert!(read.get(), "the system's source is asked");
+        assert_eq!(source, Ok(Some(file)));
+        let (yields, _) = yield_for(None, false);
+        let none = || -> Result<Source, String> { panic!("not read on separate memory") };
+        assert_eq!(source_for(yields, none), Ok(None));
     }
 
     #[test]

@@ -22,11 +22,6 @@ export function architecture(): string {
   return _model.architecture();
 }
 
-/** How long a pipeline may hold a frame's wait-set, in microseconds. */
-export function submitDeadlineUs(): number {
-  return Number(_model.submitDeadlineUs());
-}
-
 /** The bound model's block drafter, if it carries one. */
 export function draftBlock(): BlockDrafter | undefined {
   return _model.draftBlock();

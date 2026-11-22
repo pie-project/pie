@@ -254,7 +254,7 @@ pub enum ValidateError {
     /// one submission ([`Budget::submit`]).
     StagePastSubmit {
         stage: Stage,
-        cost_ns: u64,
+        cost_ns: f64,
         bound_ns: u64,
     },
 }
@@ -358,7 +358,7 @@ impl fmt::Display for ValidateError {
             } => write!(
                 f,
                 "stage {}: the rates this device's load measured cost it at least \
-                 {cost_ns} ns, past the {bound_ns} ns the device states one submission \
+                 {cost_ns:.0} ns, past the {bound_ns} ns the device states one submission \
                  may take; its fire would fault every tenant's",
                 stage.name()
             ),
@@ -499,10 +499,14 @@ pub fn check_budget(bound: &BoundTrace, budget: Budget) -> Result<(), ValidateEr
         }
         if let Some(submit) = budget.submit {
             let cost = submit.cost_ns(footprint.launches, footprint.work);
-            if !(cost <= submit.bound_ns as f64) {
+            // A cost past the bound, or one that names no number, is refused.
+            if !matches!(
+                cost.partial_cmp(&(submit.bound_ns as f64)),
+                Some(core::cmp::Ordering::Less | core::cmp::Ordering::Equal)
+            ) {
                 return Err(ValidateError::StagePastSubmit {
                     stage: footprint.stage,
-                    cost_ns: if cost.is_finite() { cost as u64 } else { u64::MAX },
+                    cost_ns: cost,
                     bound_ns: submit.bound_ns,
                 });
             }

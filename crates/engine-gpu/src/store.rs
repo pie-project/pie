@@ -2111,7 +2111,12 @@ impl<B: Backend> Spill<B> {
     }
 }
 
+/// A slot-file write failing for want of room on its file system is the
+/// tier below full ([`Fault::TierFull`]): nothing on the device changed.
 fn slot_file(error: std::io::Error) -> Fault {
+    if error.kind() == std::io::ErrorKind::StorageFull {
+        return Fault::TierFull(error.to_string());
+    }
     Fault::Device {
         call: "slot file",
         why: error.to_string(),

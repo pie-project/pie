@@ -475,6 +475,18 @@ impl ChunkFacts {
         self.act_chunks.last().map_or(0, |&(_, chunks)| chunks)
     }
 
+    /// The guest state the device can hold live: its state chunks' bytes
+    /// less what the engine holds back of them. The room a guest program's
+    /// registration binds within, and so the most guest state any seats
+    /// hold on the device, which a disk tier derived on its own gives a
+    /// home when they are evicted.
+    #[must_use]
+    pub fn guest_room_bytes(&self) -> u64 {
+        u64::from(self.state_chunks())
+            .saturating_mul(self.chunk_bytes)
+            .saturating_sub(self.held_bytes)
+    }
+
     /// The chunks state may take beside the largest rung's activation.
     #[must_use]
     pub fn state_chunks(&self) -> u32 {
