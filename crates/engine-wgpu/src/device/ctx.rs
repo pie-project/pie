@@ -842,6 +842,19 @@ impl Context {
         self.core.enabled
     }
 
+    /// The device as a measurement stored in the user's profile is keyed
+    /// by (`engine_gpu::stored`): the adapter's backend, its vendor and
+    /// device ids and its driver as the adapter states them. Another driver
+    /// measures again.
+    #[must_use]
+    pub fn measured_on(&self) -> String {
+        let info = &self.core.info;
+        format!(
+            "wgpu {:?} {:04x}:{:04x} driver {} {}",
+            info.backend, info.vendor, info.device, info.driver, info.driver_info
+        )
+    }
+
     #[must_use]
     pub fn chip(&self) -> crate::chip::Device {
         crate::chip::Device {

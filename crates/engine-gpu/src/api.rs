@@ -67,6 +67,10 @@ pub trait Host: Serve {
     /// The ports a load resolves on the device.
     fn ports() -> PortMask;
 
+    /// The device as what is measured on it is keyed by
+    /// (`crate::stored`): its vendor and device ids and its driver.
+    fn measured_on(device: &Self::Context) -> String;
+
     fn settles_asynchronously(gpu: &Gpu<Self>) -> bool;
 
     /// Fires `step` ([`Gpu::fire_step`]) and runs what attaches to it.
@@ -865,6 +869,24 @@ where
 
     fn host_room(&self) -> Option<engine::HostRoom> {
         crate::backend::Context::host_room(self.shell.as_ref()?.device())
+    }
+
+    fn cover_fingerprint(&self) -> Option<String> {
+        let shell = self.shell.as_ref()?;
+        match shell.cover_fingerprint(&B::measured_on(shell.device())) {
+            Ok(print) => {
+                tracing::info!(
+                    fingerprint = %print,
+                    "the host cover's key on this engine: the device, its kernels' code, the \
+                     guest emitter's version and the tuning its fires run by"
+                );
+                Some(print)
+            }
+            Err(why) => {
+                tracing::warn!(%why, "the host cover is keyed by nothing here: measured this boot");
+                None
+            }
+        }
     }
 
     fn live(&self) -> engine::live::Live {
