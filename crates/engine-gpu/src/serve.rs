@@ -2645,11 +2645,13 @@ impl<B: Serve> Shell<B> {
             self.settled.len()
         );
         settled?;
-        // Stored for a later load of the same curves, model, rungs and build:
-        // the ranges decided before and those decided now; an undecided
-        // range is settled again on the next load.
+        // Stored for a later load under the same key: the ranges stored
+        // before and every range weighed now, an undecided one (no option ran
+        // apart from the rest) with the kernel this load serves it by. A boot
+        // whose stored settle's key matches weighs nothing again: a range is
+        // weighed once per key, never again load after load.
         let mut ranges = stored.clone();
-        for range in self.settled.iter().filter(|range| range.decided) {
+        for range in self.settled.iter().filter(|range| range.checked) {
             let (vector, wide, tier) = range.kernel.map_or((0, 0, 0), |t| {
                 (t.vector, u32::from(t.wide), tier_number(t.tier))
             });
@@ -2673,7 +2675,7 @@ impl<B: Serve> Shell<B> {
                 } else if range.decided {
                     "decided this load"
                 } else {
-                    "undecided (settled again next load)"
+                    "undecided (its kernel as served now stored)"
                 };
                 format!("{}-{} {what}", range.bottom, range.top)
             })
@@ -2689,11 +2691,12 @@ impl<B: Serve> Shell<B> {
             self.dense_rates.dense_settled = Some(keep.clone());
             self.to_store = Some(keep);
         }
+        let weighed = self.settled.iter().any(|range| range.checked);
         self.say_served(
-            if stored.is_empty() {
-                "settled this load"
-            } else {
-                "stored settle, the rest settled this load"
+            match (stored.is_empty(), weighed) {
+                (true, _) => "settled this load",
+                (false, false) => "stored settle, nothing weighed this load",
+                (false, true) => "stored settle, the rest settled this load",
             },
             replaced,
         );
