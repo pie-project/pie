@@ -1812,6 +1812,7 @@ impl BatchScheduler {
                 // Nothing queued or in flight: the batch's ask goes while
                 // the scheduler sleeps.
                 batch_want.release();
+                lane.parks().parking();
                 match rx.recv().await {
                     Some(item) => Some(item),
                     None => {
@@ -1854,6 +1855,9 @@ impl BatchScheduler {
                 let have_settle = front_launch.is_some();
                 let have_control_settles = !control_settles.is_empty();
                 let mut reply_answer = None;
+                // The lane stays awake for this turn's launches only until
+                // the scheduler parks (`Lane::next_request`).
+                lane.parks().parking();
                 let parked = {
                     let settle_wait = async {
                         match front_launch {
