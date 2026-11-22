@@ -1558,12 +1558,32 @@ impl SharedPool {
     /// the reserved and the smallest rung's activation, the span the rung
     /// lends included. One figure, whatever the rung now: what a need past
     /// it can never be held in (the never-fits check), on every path.
+    /// Less what never holds state: the weights' pinned slots and what
+    /// below the span the engine binds none of
+    /// ([`Self::held_for_good`]). Counted whole, a bind needing more than
+    /// the weights left waited for room no move could make (a Qwen3-30B-A3B
+    /// ROCm boot whose pool was almost all weights: the first requests
+    /// waited at bind 45 minutes with nothing running).
     #[must_use]
     pub fn state_chunks_most(&self) -> u32 {
         self.pool
             .total_chunks()
             .saturating_sub(self.pool.reserved_chunks())
             .saturating_sub(self.pool.act_chunks(0))
+            .saturating_sub(self.held_for_good())
+    }
+
+    /// The chunks below the activation's span that never hold state: the
+    /// weights' pinned slots, and what the engine binds none of
+    /// ([`Self::room`]'s reading).
+    fn held_for_good(&self) -> u32 {
+        let room = self.room();
+        let below_span = self
+            .pool
+            .total_chunks()
+            .saturating_sub(self.pool.act_max())
+            .saturating_sub(self.pool.reserved_chunks());
+        below_span.saturating_sub(room.state_chunks)
     }
 
     /// The chunks state may take under the current rung: every chunk but
@@ -1574,6 +1594,7 @@ impl SharedPool {
             .total_chunks()
             .saturating_sub(self.pool.reserved_chunks())
             .saturating_sub(self.pool.act_reserved())
+            .saturating_sub(self.held_for_good())
     }
 
     /// Slots of pool shape `shape` the state chunks hold under the current
