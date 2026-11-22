@@ -672,6 +672,20 @@ impl ResidencyPlanner {
                  {placement:?}, plan {plan}"
             );
         }
+        // A victim whose move found the tier below full waits for the pool
+        // to move, and with nothing in flight nothing moves it: it goes
+        // again in the forced pass (the simulation's seed 431: the one
+        // resident with pages to move, its move refused while the disk tier
+        // stood full a step, kept out with nothing else moving and the
+        // finisher's one page unserved). Lifted once a stall, as the stall
+        // is said. One whose move found nothing to move finds nothing again
+        // on the same pool: it stays out.
+        self.with_inner(|inner| {
+            inner.host_swap_blocked.clear();
+            if inner.prepare_blocked.is_empty() {
+                inner.blocked_at = None;
+            }
+        });
         self.force_moves.store(true, Ordering::Release);
         self.events.fetch_add(1, Ordering::AcqRel);
         if let Some(notify) = self.returns.drain.get() {

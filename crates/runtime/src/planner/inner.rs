@@ -88,6 +88,11 @@ pub(super) struct Inner {
     /// fires until it lands), or `Some` of none for one that fenced no one.
     /// One at a time, and in flight as a move is.
     pub(super) relocating: Option<super::PidSet>,
+    /// Every eviction landed (`Some` of the head it was made for, if any)
+    /// and restore landed (`None`), in order, for the simulation's progress
+    /// gate.
+    #[cfg(test)]
+    pub(super) moves: Vec<(ProcessId, Option<Option<ProcessId>>)>,
 }
 
 /// The capacity gate (the mechanism; who parks for whom stays the
@@ -615,6 +620,13 @@ impl Inner {
         // went first and took that room, the bind came back short, asked
         // again and evicted the victim again, and round (seed 361: one
         // process evicted and restored for one bind for good).
+        // And served, still in its request: the room it was made goes on
+        // growing as it runs, and a victim restored beside it was evicted
+        // again for its next page, and again (the field mix over 50 seeds:
+        // 1,811 evictions for 1,405 finished, 55 of them a lane's again for
+        // the same head with no restore of that head between). The victim
+        // comes back once that one ends, idles or is moved itself: evicted
+        // once for it each time it arrives.
         let unserved = |head: ProcessId| {
             waiting().contains(&head)
                 || self
@@ -624,6 +636,7 @@ impl Inner {
                         proc.state != Residency::Resident
                             || (proc.unfired && !proc.idle)
                             || proc.bind_waiting
+                            || Self::in_request(proc)
                     })
         };
         let passed = |head: ProcessId| self.passed.iter().any(|&(_, pid)| pid == head);
@@ -825,6 +838,45 @@ impl Inner {
                 .values()
                 .any(|waiter| waiter.pid == pid && waiter.is_unmet() && gate.holds_waiter(waiter, place))
         })
+    }
+
+    /// Whether `proc` is resident in its request: admitted, not a handle's
+    /// stand-in, not idle on its client nor held below the policy's floor.
+    pub(super) fn in_request(proc: &Proc) -> bool {
+        proc.admitted
+            && !proc.holder
+            && !proc.idle
+            && !proc.held
+            && proc.state == Residency::Resident
+    }
+
+    /// Whether `pid` keeps its room against a head the policy ranks at
+    /// `head`: admitted and resident in its request, a process runs to its
+    /// end, moved only for room something ranked above it asks (the rank
+    /// is the policy's victim order, [`Proc::rank`]). Moved for its peers'
+    /// asks whenever it stood between fires, a lane went round with them,
+    /// evicted and restored while about three lanes stepped (the L40S at
+    /// 3 GiB: 1,923 evictions, restores 1,922, 0 of 150 decodes finished in
+    /// 542 s).
+    ///
+    /// It keeps none where it cannot go on until room comes: idle or held
+    /// (the policy's), at a bind for room, its ask held by the capacity
+    /// gate (it goes only once those ahead of it in the gate's order
+    /// finish, and they may need its room), or waiting in the queue with
+    /// nothing in flight (`quiet`, [`Self::nothing_in_flight`] as the
+    /// caller read it). So whatever holds the room the gate's first needs
+    /// either goes on to its end or yields, and the gate's order still
+    /// finishes everyone.
+    pub(super) fn keeps_room(&self, pid: ProcessId, head: Rank, quiet: bool) -> bool {
+        self.procs
+            .get(&pid)
+            .is_some_and(|proc| proc.rank() <= head && Self::in_request(proc) && !proc.bind_waiting)
+            && !(quiet
+                && self
+                    .queue
+                    .values()
+                    .any(|waiter| waiter.pid == pid && waiter.is_unmet()))
+            && !self.gate_holds(pid)
     }
 
     /// The gate and its order as a pass reads them

@@ -949,7 +949,7 @@ impl Workload {
         // `PIE_SIM_FIELD`: every seed the field's mix, drawn from a stream
         // of its own ([`Self::field_mix`]).
         if std::env::var_os("PIE_SIM_FIELD").is_some() {
-            return Self::field_mix(seed, Rng(seed ^ 0xf1e1_d0a1));
+            return Self::field(seed);
         }
         let mut rng = Rng(seed);
         let pool = PoolShape::of(&mut rng);
@@ -1106,6 +1106,10 @@ impl Workload {
     /// decodes. Every process must finish within the run's bound: beams
     /// verified while every decode starved (150 of 150 unfinished in 527 s,
     /// evictions and restores 1:1) is a liveness failure.
+    fn field(seed: u64) -> Self {
+        Self::field_mix(seed, Rng(seed ^ 0xf1e1_d0a1))
+    }
+
     fn field_mix(seed: u64, mut rng: Rng) -> Self {
         let mut pool = PoolShape::of(&mut rng);
         pool.total = rng.range(14, 24);
@@ -1244,6 +1248,17 @@ struct Coverage {
     integrity_checks: u64,
     pages_checked: u64,
     guest_slots_checked: u64,
+    /// Processes that ended their work, and the steps on which any process
+    /// was live: `fires / live_steps` is the lanes stepping a step, and
+    /// `evictions / finished` the moves a finished request cost.
+    finished: u64,
+    live_steps: u64,
+    /// Evictions of a process for a head it was evicted for before with no
+    /// arrival of that head between ([`Progress::moved`]): 0 where the
+    /// progress rule holds.
+    over_bound: u64,
+    /// The most any process was suspended for its own binds' room.
+    most_suspended: u64,
 }
 
 impl Coverage {
@@ -1275,6 +1290,10 @@ impl Coverage {
         self.integrity_checks += other.integrity_checks;
         self.pages_checked += other.pages_checked;
         self.guest_slots_checked += other.guest_slots_checked;
+        self.finished += other.finished;
+        self.live_steps += other.live_steps;
+        self.over_bound += other.over_bound;
+        self.most_suspended = self.most_suspended.max(other.most_suspended);
     }
 }
 
@@ -1348,6 +1367,8 @@ fn shape_of(failure: &Failure) -> String {
         .collect();
     words.truncate(120);
     match failure.kind.as_str() {
+        // One shape: how far past the bound is the line's, not the shape's.
+        "thrash" => "thrash: evicted past the safe order's bound".to_string(),
         "stall" => {
             let line = &failure.line;
             let kind = line
@@ -1458,6 +1479,64 @@ struct Log {
     /// The capacity gate's figures as the last step with nothing moving
     /// between tiers read them.
     capacity: Option<super::inner::CapacityRead>,
+    /// Processes that ended their work.
+    finished: u64,
+    /// Processes back from their client with a new request, in order.
+    requests: Vec<ProcessId>,
+    /// Each process's binds asked.
+    binds_of: std::collections::HashMap<ProcessId, u32>,
+}
+
+/// The fleet's progress as the safe order bounds it ([`Progress::moved`]).
+#[derive(Default)]
+struct Progress {
+    /// Each eviction of a process for a head, the head not arrived again
+    /// since: `(victim, head)`.
+    owed: std::collections::HashSet<(ProcessId, ProcessId)>,
+    /// Evictions of a process for a head it was evicted for before, that
+    /// head not having arrived again (a restore, or a new request) between.
+    again: u64,
+    /// The first such, said.
+    first: Option<String>,
+    /// Each process's suspensions for its own bind's room.
+    suspended: std::collections::HashMap<ProcessId, u32>,
+}
+
+impl Progress {
+    /// The evictions and restores the planner landed by `step`, and the
+    /// requests begun. A process runs to the end of its request but for
+    /// room something ranked above it asks, and once evicted for one it
+    /// comes back only once that one is done with its request (or the
+    /// gate's order needs it first): it is evicted for a head at most once
+    /// per arrival of that head (its first ask, a restore, or a request
+    /// after an idle wait). Restored beside the head it was evicted for, a
+    /// lane went back down for the head's next page, round and round while
+    /// about three lanes stepped (the L40S at 3 GiB: 1,923 evictions, 150
+    /// decodes unfinished in 542 s).
+    fn moved(&mut self, ctx: &Ctx, step: u32) {
+        for pid in std::mem::take(&mut ctx.log.lock().unwrap().requests) {
+            self.owed.retain(|&(_, head)| head != pid);
+        }
+        for (pid, evicted) in ctx.planner.with_inner(|inner| std::mem::take(&mut inner.moves)) {
+            match evicted {
+                Some(Some(head)) => {
+                    if !self.owed.insert((pid, head)) {
+                        self.again += 1;
+                        self.first.get_or_insert_with(|| {
+                            format!(
+                                "process {} evicted again at step {step} for head {} with no \
+                                 arrival of that head between",
+                                &pid.to_string()[..8],
+                                &head.to_string()[..8]
+                            )
+                        });
+                    }
+                }
+                Some(None) => *self.suspended.entry(pid).or_default() += 1,
+                None => self.owed.retain(|&(_, head)| head != pid),
+            }
+        }
+    }
 }
 
 impl Ctx {
@@ -1778,6 +1857,7 @@ async fn bind(ctx: &Ctx, pid: ProcessId, program: u32) -> Result<InstanceId, Str
     };
     let engine = ctx.engine.clone();
     ctx.at(pid, "bind");
+    *ctx.log.lock().unwrap().binds_of.entry(pid).or_default() += 1;
     // Sent again more than this in one step with no step between, the
     // bind spins: said by name (it never yields, so nothing else runs).
     let tries = Mutex::new((0u64, 0u32));
@@ -1992,6 +2072,7 @@ async fn run_process(ctx: Arc<Ctx>, pid: ProcessId, script: Script) {
                     ctx.next_step().await;
                 }
                 planner.set_idle(pid, false);
+                ctx.log.lock().unwrap().requests.push(pid);
                 ctx.act();
             }
             if let Some((when, program)) = script.rescore
@@ -2009,8 +2090,8 @@ async fn run_process(ctx: Arc<Ctx>, pid: ProcessId, script: Script) {
         Ok::<(), String>(())
     }
     .await;
-    if let Err(why) = lived {
-        ctx.refused(pid, why);
+    if let Err(why) = &lived {
+        ctx.refused(pid, why.clone());
     }
     // Its end, as the runtime's: its instances close (the engine's close
     // first, then the roles give their slots back), its sets go back, it
@@ -2022,6 +2103,9 @@ async fn run_process(ctx: Arc<Ctx>, pid: ProcessId, script: Script) {
         set.handle.release();
     }
     drop(sets);
+    if lived.is_ok() {
+        ctx.log.lock().unwrap().finished += 1;
+    }
     planner.unregister(pid);
     drop(departure);
     unregister_residency(pid);
@@ -2457,6 +2541,7 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
         .map(|(_, script)| 1 + script.decode)
         .sum();
     let bound = last_arrival + 600 + work;
+    let mut progress = Progress::default();
     let mut step = 0u32;
     loop {
         // The engine's side: what was submitted last step lands now.
@@ -2536,6 +2621,8 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
         // The drain task's beat.
         planner.tick();
         quiesce(&ctx, &mut lane, &mut pending, step, workload.late).await;
+        progress.moved(&ctx, step);
+        coverage.live_steps += u64::from(tasks.len() > ctx.log.lock().unwrap().ended);
         match check(&ctx, step, !pending.is_empty()) {
             Ok(refused) => {
                 for failed in refused {
@@ -2628,6 +2715,40 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
         coverage.integrity_checks = log.checks;
         coverage.pages_checked = log.pages_checked;
         coverage.guest_slots_checked = log.guest_slots_checked;
+        coverage.finished = log.finished;
+        // No process was evicted for a head twice per arrival of that head
+        // ([`Progress::moved`]).
+        // A process suspends for its own bind's room at most once a bind:
+        // restored only once that room stands free beside its kv, it binds
+        // (the M1 at beamx40: bind suspensions 1,996 over 201 processes,
+        // some suspended 58 to 68 times, unfinished in 45 minutes).
+        for (pid, &suspended) in &progress.suspended {
+            let binds = log.binds_of.get(pid).copied().unwrap_or(0);
+            coverage.most_suspended = coverage.most_suspended.max(u64::from(suspended));
+            if suspended > binds {
+                progress.again += u64::from(suspended - binds);
+                progress.first.get_or_insert_with(|| {
+                    format!(
+                        "process {} suspended {suspended} times for its binds' room over \
+                         {binds} binds",
+                        &pid.to_string()[..8]
+                    )
+                });
+            }
+        }
+        coverage.over_bound = progress.again;
+        if let Some(first) = progress.first.take() {
+            failures.push(Failure {
+                step,
+                kind: "thrash".to_string(),
+                line: format!(
+                    "{first}; {} such, {} evictions for {} finished",
+                    progress.again,
+                    coverage.evictions,
+                    log.finished
+                ),
+            });
+        }
     }
     coverage.cache_left = u64::from(with_kv_lock(&ctx.stores.kv, "sim-cache", |kv| {
         kv.reclaimable_cache_pages()
@@ -2730,6 +2851,11 @@ fn report(failures: &[(u64, Failure)], coverage: &Coverage, shrinking: bool) -> 
         shapes.entry(shape_of(failure)).or_default().push(*seed);
     }
     let mut out = format!("SIM coverage: {coverage:?}\n");
+    out += &format!(
+        "SIM progress: {:.2} fires a live step, {:.2} evictions a finished process\n",
+        coverage.fires as f64 / coverage.live_steps.max(1) as f64,
+        coverage.evictions as f64 / coverage.finished.max(1) as f64
+    );
     out += &format!("SIM {} failures, {} shapes\n", failures.len(), shapes.len());
     for (shape, seeds) in &shapes {
         out += &format!(
@@ -2770,7 +2896,7 @@ const KNOWN: [(&str, u64); 0] = [];
 
 /// Shapes the simulation found and the runtime fixed, each seed's
 /// regression test run in the suite; the fast sweep fails on them again.
-const FIXED: [(&str, u64); 34] = [
+const FIXED: [(&str, u64); 35] = [
     // A bind's guest parts and its tables, rings or adapter each open a
     // fresh chunk, the refusal quoting the part short alone: served one
     // chunk, short again, a spin (seeds 1, 46, 4137, 4287). The refusal
@@ -2883,6 +3009,12 @@ const FIXED: [(&str, u64); 34] = [
     ("stall bind room", 1610),
     ("liveness", 731),
     ("liveness", 4641),
+    // The one resident with pages to move, its move refused while the disk
+    // tier stood full a step: blocked until the pool moved, with nothing
+    // else in flight to move it, and the finisher's one page unserved. A
+    // pass forced for a head left waiting with nothing in flight lifts the
+    // block.
+    ("liveness", 431),
 ];
 
 fn known(shape: &str) -> bool {
@@ -3092,6 +3224,43 @@ fn sim_seed_4641_every_process_ends() {
 #[test]
 fn sim_seed_1348_an_eviction_taken_back_is_back_before_its_process_is_resident() {
     regression(FIXED[20]);
+}
+
+#[test]
+fn sim_seed_431_a_block_nothing_in_flight_moves_lifts_at_a_forced_pass() {
+    regression(FIXED[34]);
+}
+
+/// Field-mix seed `seed` ([`Workload::field`]) runs clean.
+fn field_regression(seed: u64) {
+    let failures = run(&Workload::field(seed), None).0;
+    for failure in &failures {
+        eprintln!(
+            "SIM field seed {seed} step {} [{}]: {}",
+            failure.step,
+            shape_of(failure),
+            failure.line
+        );
+    }
+    assert!(failures.is_empty(), "field seed {seed}: {} failures", failures.len());
+}
+
+/// A lane restored beside the head it was evicted for went back down for
+/// the head's next page, and again: a victim comes back once its head is
+/// done with its request ([`Progress::moved`]).
+#[test]
+fn sim_field_seed_3_a_lane_is_evicted_once_for_a_head_s_request() {
+    field_regression(3);
+}
+
+/// Seeds 863 and 178 of the field mix: processes still at admission at
+/// the run's bound (863), and the finisher's bind of two adjacent chunks
+/// unserved while two restores went round (178). Both end as lanes run to
+/// the end of their requests.
+#[test]
+fn sim_field_seeds_863_and_178_end() {
+    field_regression(863);
+    field_regression(178);
 }
 
 /// What a run did, as a string two runs of one seed must agree on.

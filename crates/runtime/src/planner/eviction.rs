@@ -1066,7 +1066,9 @@ impl ResidencyPlanner {
     /// block: room given back, or swap slots freed. Cleared only by a
     /// restore or a departure, a block outlived the pool it was set on, and
     /// a stall where neither came kept every such resident out of the
-    /// victim set for good. Never on the same pool twice.
+    /// victim set for good. Never on the same pool twice, but for a full
+    /// tier below and a head left waiting with nothing in flight on the
+    /// pool the block was set on ([`Self::dump_stall`]).
     pub(super) fn lapse_blocks(&self) {
         let blocked = self.with_inner(|inner| inner.blocked_at);
         let Some(at) = blocked else {
@@ -1209,6 +1211,10 @@ impl ResidencyPlanner {
                         && inner.settled_resident(**pid)
                         // The finisher is no victim ([`super::inner::CapacityGate`]).
                         && !inner.is_finisher(**pid)
+                        // In its request, it runs to its end but for room
+                        // something ranked above it asks
+                        // ([`Inner::keeps_room`]).
+                        && !inner.keeps_room(**pid, head.0, quiet())
                 })
                 .map(|(pid, proc)| Victim {
                     pid: *pid,
@@ -1303,6 +1309,7 @@ impl ResidencyPlanner {
                     || inner.unfired_protects(pid)
                     || proc.restored_past == Some(head_pid)
                     || (proc.rank() <= head_rank && !yields)
+                    || inner.keeps_room(pid, head_rank, quiet)
                     || (!proc.progressed && !yields && !e6_relaxed)
                 {
                     continue;

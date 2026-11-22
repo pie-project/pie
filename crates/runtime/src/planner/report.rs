@@ -19,6 +19,8 @@ impl ResidencyPlanner {
             inner.evicting.remove(&pid);
             debug_assert_eq!(proc.state, Residency::Evicting);
             proc.state = Residency::Evicted;
+            #[cfg(test)]
+            inner.moves.push((pid, Some(proc.evicted_for)));
             // Parked again: the next suspended bind may come back.
             if inner.bind_restoring == Some(pid) {
                 inner.bind_restoring = None;
@@ -104,7 +106,9 @@ impl ResidencyPlanner {
              resident, no victim until the pool moves"
         );
         self.stats.eviction_tier_full.fetch_add(1, Ordering::Relaxed);
-        self.eviction_failed_inner(pid, false, true);
+        // Blocked as room below short, which a stall with nothing in flight
+        // lifts ([`Self::dump_stall`]).
+        self.eviction_failed_inner(pid, true, false);
     }
 
     pub(super) fn eviction_copy_refused(self: &Arc<Self>, pid: ProcessId, error: &str) {
@@ -221,6 +225,8 @@ impl ResidencyPlanner {
             self.port.release_restore(pid);
         }
         let signal = self.with_inner(|inner| {
+            #[cfg(test)]
+            inner.moves.push((pid, None));
             let proc = inner.procs.get_mut(&pid)?;
             debug_assert_eq!(proc.state, Residency::Restoring);
             proc.state = Residency::Resident;
