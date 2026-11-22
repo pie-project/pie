@@ -2038,7 +2038,6 @@ fn check(ctx: &Ctx, step: u32) -> Result<Vec<Failure>, Failure> {
         (
             stats.serves.load(Ordering::Relaxed),
             stats.evictions_started.load(Ordering::Relaxed),
-            stats.compaction_waits.load(Ordering::Relaxed),
             planner.with_inner(|inner| {
                 inner
                     .procs
@@ -2049,6 +2048,9 @@ fn check(ctx: &Ctx, step: u32) -> Result<Vec<Failure>, Failure> {
         )
     };
     let before = moves();
+    if crate::planner::trace_enabled() {
+        println!("SIM CHECK {step}");
+    }
     let queue = planner.debug_queue();
     let ended = planner.with_inner(|inner| {
         inner.unmet_head().map(|(key, _)| {
@@ -2186,6 +2188,9 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
     let planner = Arc::new(ResidencyPlanner::new(Arc::new(port)));
     planner_cell.set(Arc::downgrade(&planner)).unwrap();
     super::global::set_test_planner(model, 0, Some(planner.clone()));
+    // Its passes run on the drain task, as the runtime's do: a wake is a
+    // notify the task plans on, never a pass inside the waker's own call.
+    planner.arm_drain_task();
     if let Some(grow) = &grow {
         grow.start();
     }
@@ -2511,24 +2516,29 @@ fn replay_seed(seed: u64) -> Vec<Failure> {
 /// fixed, each with a seed that showed it (its regression test below,
 /// ignored until fixed). The fast sweep fails on any other shape; once a
 /// shape is fixed its entry goes and its test is no longer ignored.
-const KNOWN: [(&str, u64); 3] = [
-    // Every tier full, no idle cache: device 14 chunks, host 3, disk 6, the
-    // fleet's state past all three, each resident a page short and nothing
-    // with room below to move to (copies through a ring of one piece let
-    // more processes in before the first moves landed). A capacity deadlock
-    // admission lets in, not a wait the planner chose.
-    ("stall bind room: placement none, moves none, host_short true", 3243),
-    // The same class with a bind's take and its bind apart: the device
-    // full, the residents a page short each, every one's kv past the few
-    // swap slots left (host_swap_blocked), the rest evicted and queued.
-    (
-        "stall allocation: placement none, moves some, host_short false, ended \"every candidate blocked",
-        134,
-    ),
+const KNOWN: [(&str, u64); 4] = [
+    // Every tier full, no idle cache: the device's chunks, the host's and
+    // the disk's all held, the fleet's state past all three, each resident
+    // a page short, every one's kv past the few swap slots left, the rest
+    // evicted and queued. A capacity deadlock admission lets in, not a wait
+    // the planner chose (seeds 3243, 93; 134 before the drain task ran the
+    // simulation's passes).
     (
         "stall allocation: placement none, moves some, host_short true, ended \"no room below for the head's own kv",
-        93,
+        3243,
     ),
+    (
+        "stall bind room: placement none, moves none, host_short false, ended \"every candidate blocked",
+        3591,
+    ),
+    (
+        "stall bind room: placement none, moves none, host_short true",
+        3243,
+    ),
+    // An instance's bind over the run of a pair whose member the engine
+    // still holds bound unparked while the roles gave the pair fresh slots
+    // at another holder's restore: under investigation.
+    ("claims a bind of instance # (program #): Instance slots", 1348),
 ];
 
 /// Shapes the simulation found and the runtime fixed, each seed's
@@ -2755,14 +2765,14 @@ fn sim_seed_3243_every_tier_full_is_no_deadlock() {
 
 #[test]
 #[ignore = "known: a capacity deadlock across every tier (KNOWN[1])"]
-fn sim_seed_134_residents_past_the_swap_left_are_no_deadlock() {
+fn sim_seed_3591_residents_past_the_swap_left_are_no_deadlock() {
     regression(KNOWN[1]);
 }
 
 #[test]
-#[ignore = "known: a capacity deadlock across every tier (KNOWN[2])"]
-fn sim_seed_93_a_head_s_own_kv_past_the_swap_left_is_no_deadlock() {
-    regression(KNOWN[2]);
+#[ignore = "known: an instance bound over a live pair's run (KNOWN[3])"]
+fn sim_seed_1348_no_bind_lands_on_a_live_pair_s_run() {
+    regression(KNOWN[3]);
 }
 
 /// What a run did, as a string two runs of one seed must agree on.

@@ -1148,7 +1148,19 @@ async fn restore(
         .map(|roles| roles.lock().unwrap().prepare_unpark(pid))
         .transpose()
     {
-        Ok(roles) => roles.flatten(),
+        Ok(roles) => {
+            // Its unpark took its parts out of the room its serve held for
+            // it: the placement every other waiter reads changed, and a
+            // restore head the pass that sent this one found short (waiting
+            // on this one in flight) may stand now. Planned on that, not on
+            // this restore's landing (the simulation's lost wakes: "restore
+            // short of runs: something in flight, not funded", its
+            // placement standing once the restore sent before it unparked).
+            if planner.returns.waiters.load(std::sync::atomic::Ordering::Acquire) != 0 {
+                planner.poke();
+            }
+            roles.flatten()
+        }
         Err(error) => {
             abort(
                 model,

@@ -727,8 +727,19 @@ impl ResidencyPlanner {
         // A head never refused is tried against the room standing, its
         // want its need.
         let past = |count: u32| if refused { u64::from(count).saturating_add(1) } else { 0 };
+        // Refused, it goes again on any chunk more than its refusal left
+        // where its placement stands, which reads its own parked parts
+        // retaken first: fewer chunks free than its whole need's count can
+        // stand it. A floor of that count left a chunk given back that
+        // stood it unwoken, the head waiting on a pass some other event
+        // ran (the simulation's lost wakes: "restore short of runs:
+        // something in flight, not funded", then sent at once).
         let mut want_chunks = self.head_room(key).map_or(u64::MAX, |need| {
-            need.chunks().max(if refused { past(self.port.free_chunks()) } else { 0 })
+            if refused {
+                past(self.port.free_chunks())
+            } else {
+                need.chunks()
+            }
         });
         let want_list = if kv_missing > 0 {
             u64::from(kv_missing).max(if refused { past(self.port.device_stats().0) } else { 0 })
@@ -1916,7 +1927,16 @@ impl ResidencyPlanner {
                 proc.bind_room = None;
             }
         });
-        self.stats.evictions_started.load(Ordering::Relaxed) > before
+        let suspended = self.stats.evictions_started.load(Ordering::Relaxed) > before;
+        // Its suspension begun changes who heads the queue (a restore ahead
+        // of new work goes first only while the fleet runs): the waiters
+        // plan on it now, not on its landing (the simulation's lost wakes:
+        // allocations served at once by a pass forced after a bind's
+        // suspend, none planned since).
+        if suspended && self.returns.waiters.load(Ordering::Acquire) != 0 {
+            self.poke();
+        }
+        suspended
     }
 
     /// A worker with no host or disk tier leaves it running.
