@@ -145,6 +145,30 @@ pub fn route(tuning: &Tuning, rows: u32, columns: u32, contraction: u32, f32_out
     }
 }
 
+/// Whether [`act_x_wt`] keeps the shapes it dispatches ([`record_shapes`]):
+/// on while a load walks its rungs, off while serving (one load of a flag a
+/// matmul then).
+static RECORDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The shapes recorded since recording started: `(columns, contraction,
+/// f32 columns)` and the most rows each was dispatched at.
+static RECORDED: std::sync::Mutex<std::collections::BTreeMap<(u32, u32, bool), u32>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Starts (`true`) or stops (`false`) keeping every shape [`act_x_wt`]
+/// dispatches, and returns what was kept since the last start, `(columns,
+/// contraction, f32 columns, most rows)`: what a load's walk checks the
+/// kernels it built against ([`route`] at every row count up to the most).
+pub fn record_shapes(on: bool) -> Vec<(u32, u32, bool, u32)> {
+    let mut recorded = RECORDED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let kept = std::mem::take(&mut *recorded)
+        .into_iter()
+        .map(|((columns, contraction, f32_out), rows)| (columns, contraction, f32_out, rows))
+        .collect();
+    RECORDING.store(on, std::sync::atomic::Ordering::Relaxed);
+    kept
+}
+
 pub fn act_x_wt(
     ctx: &Ctx<'_>,
     tuning: &Tuning,
@@ -157,6 +181,13 @@ pub fn act_x_wt(
     let (rows, columns, contraction) = extent(op, act, y)?;
     if rows == 0 {
         return Ok(());
+    }
+    if RECORDING.load(std::sync::atomic::Ordering::Relaxed) {
+        let mut recorded = RECORDED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let most = recorded
+            .entry((columns, contraction, y.dtype == dtype::Dtype::F32))
+            .or_insert(0);
+        *most = (*most).max(rows);
     }
     let (entry, grid) = if y.dtype == dtype::Dtype::F32 {
         // f32 columns (`matmul_f32`), a threadgroup each.
