@@ -3087,13 +3087,19 @@ impl<B: Serve> Shell<B> {
             .entries()
             .map(|(spec, rungs, _)| (spec.id, rungs))
             .collect();
+        // The picks as resolved, whichever layer decided them (a user's
+        // stored entry, a committed one, a measurement, the estimate under
+        // skip): the dense kernel each rung takes after the settle, and the
+        // workgroups a guest step strides over; never which file stated them.
         let tuning = profile::fire::fingerprint(
             format!(
-                "{decisions:?}|{:?}|{:?}|{}|{}",
+                "{decisions:?}|{:?}|{:?}|{}|{}|cores {} resident {:?}",
                 self.dense,
                 self.tier,
                 self.budgets.tokens.max_lanes,
-                self.budgets.tokens.max_tokens
+                self.budgets.tokens.max_tokens,
+                crate::backend::Context::cores(&self.device),
+                crate::backend::Context::resident(&self.device),
             )
             .as_bytes(),
         );
@@ -3118,6 +3124,53 @@ impl<B: Serve> Shell<B> {
                 "dense matmul served, plane {plane} ({whence}; {replaced} ranges replaced)"
             );
         }
+    }
+
+    /// The dense kernel each plane takes at `rows`, as the load serves it
+    /// (after the settle, stored, committed or weighed now).
+    #[must_use]
+    pub fn dense_tactics_at(&self, rows: u32) -> Vec<kernels_slang::linear::gemm::Tactic> {
+        self.dense.tactics_at(rows)
+    }
+
+    /// The entry points the dense matmul fires at `rows` over each of the
+    /// model's planes: what the load must have built before ready.
+    pub fn dense_entries_at(&self, rows: u32) -> Result<Vec<&'static str>> {
+        self.dense_planes
+            .iter()
+            .map(|&(n, k, ..)| {
+                kernels_slang::linear::gemm::entry(B::TARGET, self.dense.at(rows, n, k), n, k)
+                    .map(|fire| fire.entrypoint)
+                    .map_err(|why| Fault::Device {
+                        call: "dense entry",
+                        why: why.to_string(),
+                    })
+            })
+            .collect()
+    }
+
+    /// Every kernel whose pipeline is built, in the order built.
+    #[must_use]
+    pub fn built_kernels(&self) -> Vec<&'static str> {
+        B::built_since(&self.pipelines, 0)
+    }
+
+    /// The stored settle's row of a range `bottom..=top` that replaced the
+    /// curves' kernel with `tactic` (`profile::fire::DenseSettled::ranges`).
+    #[must_use]
+    pub fn settled_row(
+        bottom: u32,
+        top: u32,
+        tactic: kernels_slang::linear::gemm::Tactic,
+    ) -> [u32; 6] {
+        [
+            bottom,
+            top,
+            1,
+            tactic.vector,
+            u32::from(tactic.wide),
+            tier_number(tactic.tier),
+        ]
     }
 
     /// The settle the load ran and the profile should keep, taken once.

@@ -20,6 +20,7 @@ mod shared;
 mod slots;
 mod settle_bound;
 mod submit_bound;
+mod swapped_pick;
 mod unplaced;
 mod rs_layout;
 mod buffered_fold;
