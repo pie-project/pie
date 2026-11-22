@@ -55,6 +55,47 @@ pub struct Reader {
 ///
 /// `yield` > 0 and `source` (this system's, [`Source::of_this_system`])
 /// did not answer.
+/// Whether an engine reads the host's room itself (`Engine::host_room`), and
+/// whether this system's pressure can then discount the process's own
+/// memory ([`yield_for`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Room {
+    /// No engine reads the room: the yield reads the system's pressure
+    /// whole.
+    Unread,
+    /// An engine reads it, and the pressure is read beside the process's
+    /// own memory ([`Source::of_this_system_beside_own`]).
+    BesideOwn,
+    /// An engine reads it, and this system's pressure cannot discount the
+    /// process.
+    Undiscounted,
+}
+
+impl Room {
+    /// The room an engine set states: `reads` whether any engine reads the
+    /// host's room, beside whether this system can discount the process.
+    #[must_use]
+    pub fn of(reads: bool) -> Room {
+        match (reads, Source::of_this_system_beside_own()) {
+            (false, _) => Room::Unread,
+            (true, Ok(_)) => Room::BesideOwn,
+            (true, Err(_)) => Room::Undiscounted,
+        }
+    }
+
+    /// The pressure source a yield reads under this room.
+    ///
+    /// # Errors
+    ///
+    /// As the source's own.
+    pub fn source(self) -> Result<Source, String> {
+        match self {
+            Room::BesideOwn => Source::of_this_system_beside_own(),
+            Room::Unread | Room::Undiscounted => Source::of_this_system(),
+        }
+    }
+}
+
 pub fn source_for(yields: Yield, source: impl FnOnce() -> Result<Source, String>) -> Result<Option<Source>, String> {
     if !yields.yields() {
         return Ok(None);
@@ -72,17 +113,39 @@ pub fn source_for(yields: Yield, source: impl FnOnce() -> Result<Source, String>
 /// `1` where an engine the governor steers states unified memory (the pool
 /// and the host share one RAM, so a pool that never yields starves the
 /// system and the device's own command buffers with it), and `0` (a
-/// dedicated machine) on separate device memory.
+/// dedicated machine) on separate device memory. Where an engine reads
+/// the host's room itself (`Engine::host_room`: it holds its pool within
+/// what its own host side leaves), the yield reacts only to the rest of
+/// the system: `own` says this system's pressure can discount the
+/// process's own memory ([`Source::of_this_system_beside_own`]), and an
+/// unset yield is `1` over that reading; where it cannot (`own` false),
+/// an unset yield is `0`, the room reader alone holding the pool (a
+/// system-wide reading counts the process's own load as pressure, and the
+/// pool would give its room back to itself: the M1's gemma-4-E4B at
+/// c256 kept 3.8 of its 10.4 GB and ran 34% slower).
 #[must_use]
-pub fn yield_for(configured: Option<Yield>, unified_memory: bool) -> (Yield, String) {
+pub fn yield_for(configured: Option<Yield>, unified_memory: bool, room: Room) -> (Yield, String) {
     match configured {
         Some(yields) => (
             yields,
             format!("engine.memory.yield = {}: as configured", yields.share()),
         ),
-        None if unified_memory => (
+        None if unified_memory && room == Room::Unread => (
             Yield::FULL,
             "engine.memory.yield = 1: unified memory, the pool and the host share RAM".to_string(),
+        ),
+        None if unified_memory && room == Room::BesideOwn => (
+            Yield::FULL,
+            "engine.memory.yield = 1: unified memory; the reading discounts this process's own \
+             memory, which the engine's own room reader holds the pool within"
+                .to_string(),
+        ),
+        None if unified_memory => (
+            Yield::NONE,
+            "engine.memory.yield = 0: unified memory; the engine holds its pool within the \
+             host's room itself, and this system's pressure cannot discount the process's own \
+             memory"
+                .to_string(),
         ),
         None => (
             Yield::NONE,
@@ -403,25 +466,44 @@ mod tests {
 
     #[test]
     fn an_unset_yield_is_full_on_unified_memory_and_none_on_separate() {
-        let (yields, line) = yield_for(None, true);
+        let (yields, line) = yield_for(None, true, Room::Unread);
         assert_eq!(yields, Yield::FULL);
         assert_eq!(
             line,
             "engine.memory.yield = 1: unified memory, the pool and the host share RAM"
         );
-        let (yields, line) = yield_for(Some(Yield::NONE), true);
+        let (yields, line) = yield_for(Some(Yield::NONE), true, Room::Unread);
         assert_eq!(yields, Yield::NONE, "a configured 0 is kept on unified memory");
         assert_eq!(line, "engine.memory.yield = 0: as configured");
-        let (yields, line) = yield_for(Some(share(0.5)), false);
+        let (yields, line) = yield_for(Some(share(0.5)), false, Room::Unread);
         assert_eq!(yields, share(0.5));
         assert_eq!(line, "engine.memory.yield = 0.5: as configured");
-        let (yields, _) = yield_for(None, false);
+        let (yields, _) = yield_for(None, false, Room::Unread);
+        assert_eq!(yields, Yield::NONE, "separate device memory: the default stays 0");
+    }
+
+    /// Where an engine reads the host's room itself, the unset yield reacts
+    /// only to the rest of the system: full over a reading beside the
+    /// process's own memory where the system can discount it, else 0 (a
+    /// pool that yielded to its own load ran the M1's gemma-4-E4B c256 34%
+    /// slower). A configured yield is kept either way.
+    #[test]
+    fn a_room_reading_engine_yields_only_to_the_rest_of_the_system() {
+        let (yields, line) = yield_for(None, true, Room::BesideOwn);
+        assert_eq!(yields, Yield::FULL);
+        assert!(line.contains("discounts this process's own memory"), "{line}");
+        let (yields, line) = yield_for(None, true, Room::Undiscounted);
+        assert_eq!(yields, Yield::NONE, "no discount: the room reader alone holds the pool");
+        assert!(line.contains("cannot discount"), "{line}");
+        let (yields, _) = yield_for(Some(share(0.5)), true, Room::Undiscounted);
+        assert_eq!(yields, share(0.5), "a configured yield is kept");
+        let (yields, _) = yield_for(None, false, Room::BesideOwn);
         assert_eq!(yields, Yield::NONE, "separate device memory: the default stays 0");
     }
 
     #[test]
     fn the_unified_default_reads_the_system_s_pressure() {
-        let (yields, _) = yield_for(None, true);
+        let (yields, _) = yield_for(None, true, Room::Unread);
         let file = Source::File("/pie-pressure".into());
         let read = std::cell::Cell::new(false);
         let source = source_for(yields, || {
@@ -430,7 +512,7 @@ mod tests {
         });
         assert!(read.get(), "the system's source is asked");
         assert_eq!(source, Ok(Some(file)));
-        let (yields, _) = yield_for(None, false);
+        let (yields, _) = yield_for(None, false, Room::Unread);
         let none = || -> Result<Source, String> { panic!("not read on separate memory") };
         assert_eq!(source_for(yields, none), Ok(None));
     }
