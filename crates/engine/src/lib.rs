@@ -21,6 +21,7 @@ pub mod extent;
 pub mod fire;
 pub mod fit;
 pub mod frame;
+pub mod guest_claims;
 pub mod host_memory;
 pub mod live;
 pub mod load;
@@ -47,7 +48,7 @@ pub use chunk::{
     WeightAtom, WeightKind, WeightResidency, WeightShape, WeightUses,
 };
 pub use engine::{
-    CompletionSink, Engine, HostRoom, KvWrites, LandingSink, LaneFault, Prepared, ProgramCompile,
+    CompletionSink, Engine, HostRoom, KvWrites, Landing, LandingSink, LaneFault, Prepared, ProgramCompile,
     StepDone,
     StepOutcome, TapGroups, TapSink, Tapped,
 };

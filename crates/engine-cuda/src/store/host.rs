@@ -35,6 +35,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 
+use engine::Landing;
+
 use crate::device::Pinned;
 use crate::device::alloc;
 use crate::device::graph::Event;
@@ -153,20 +155,37 @@ impl Ring {
 
 /// An event a landing thread waits on: the runtime's events are safe to
 /// wait on from any thread, and only the landing thread touches this one.
-struct Landing(Event);
+struct Waiting(Event);
 
 // SAFETY: a CUDA event may be waited on and destroyed from any thread of the
 // process; the job that carries it is the only holder once it is sent.
-unsafe impl Send for Landing {}
+unsafe impl Send for Waiting {}
 
 /// One piece for the landing thread: once the copy `after` follows has
 /// landed (if any), each `(ring address, tier address, bytes)` moved into
 /// the tier (`to_tier`) or out of it into the ring.
 struct Job {
     id: u64,
-    after: Option<Landing>,
+    after: Option<Waiting>,
     to_tier: bool,
     moves: Vec<(usize, usize, usize)>,
+    /// A move between the tier and the slot file, done on the landing
+    /// thread in the jobs' order, in place of `moves`.
+    disk: Option<(usize, DiskMove)>,
+}
+
+/// A move between the host tier and the disk tier's slot file: each
+/// `(tier offset, slot file byte, bytes)` read from the file into the tier,
+/// or written from the tier into the file (`to_disk`), on the tier's landing
+/// thread; told how it ended where `told` is given.
+pub struct DiskMove {
+    pub to_disk: bool,
+    pub file: Arc<engine::disk::SlotFile>,
+    /// Held across a slot's cover's read-modify-write: a write keeps the
+    /// bytes of the slots beside it, which another thread may be writing.
+    pub io: Arc<Mutex<()>>,
+    pub slots: Vec<(u64, u64, usize)>,
+    pub told: Option<crate::serve::landing::Told>,
 }
 
 /// What the landing thread reports back.
@@ -237,6 +256,9 @@ pub struct HostTier {
     next: u64,
     /// The last job writing into each chunk: one a read waits for.
     writing: Vec<u64>,
+    /// The last host<->disk job on each aligned block of the slot file: a
+    /// move between the device and the file waits for it.
+    disk_writing: std::collections::HashMap<u64, u64>,
     /// Whether each chunk's pages are committed ([`alloc::commit_anon`]).
     committed: Vec<AtomicBool>,
     shared: Arc<Shared>,
@@ -313,6 +335,7 @@ impl HostTier {
             turn: 0,
             next: 0,
             writing: vec![0; chunks as usize],
+            disk_writing: std::collections::HashMap::new(),
             committed: (0..chunks).map(|_| AtomicBool::new(false)).collect(),
             shared,
             send: Some(send),
@@ -368,7 +391,8 @@ impl HostTier {
         let id = self.next;
         let job = Job {
             id,
-            after: after.map(Landing),
+            after: after.map(Waiting),
+            disk: None,
             to_tier,
             moves,
         };
@@ -379,6 +403,73 @@ impl HostTier {
                 what: "the host tier's landing thread is gone".to_string(),
             })?;
         Ok(id)
+    }
+
+    /// Hands a move between the tier and the slot file to the landing
+    /// thread, behind every move it holds: the engine thread only enqueues
+    /// it. Returns its job id ([`HostTier::wait_job`]).
+    pub fn disk(&mut self, mv: DiskMove) -> Result<u64> {
+        self.fault()?;
+        for &(offset, _, len) in &mv.slots {
+            self.check(offset, len)?;
+        }
+        self.next += 1;
+        let id = self.next;
+        let align = engine::disk::ALIGN as u64;
+        let chunk_bytes = self.chunk_bytes.max(1);
+        for &(offset, place, len) in &mv.slots {
+            let mut block = place / align * align;
+            while block < place + len as u64 {
+                self.disk_writing.insert(block, id);
+                block += align;
+            }
+            if !mv.to_disk {
+                for chunk in offset / chunk_bytes..(offset + len as u64).div_ceil(chunk_bytes) {
+                    if let Some(writing) = self.writing.get_mut(chunk as usize) {
+                        *writing = id;
+                    }
+                }
+            }
+        }
+        let job = Job {
+            id,
+            after: None,
+            to_tier: !mv.to_disk,
+            moves: Vec::new(),
+            disk: Some((self.base as usize, mv)),
+        };
+        self.send
+            .as_ref()
+            .and_then(|send| send.send(job).ok())
+            .ok_or_else(|| Fault::Unbound {
+                what: "the host tier's landing thread is gone".to_string(),
+            })?;
+        Ok(id)
+    }
+
+    /// Waits, on the calling thread, until landing-thread job `id` is done.
+    pub fn wait_job(&self, id: u64) -> Result<()> {
+        drop(self.shared.wait(id));
+        self.fault()
+    }
+
+    /// Waits until every host<->disk job on the slot file's bytes `places`
+    /// (`(byte, bytes)` each) is done: a move between the device and the
+    /// file reads or writes them after.
+    pub fn wait_disk(&self, places: impl IntoIterator<Item = (u64, u64)>) -> Result<()> {
+        let align = engine::disk::ALIGN as u64;
+        let mut need = 0;
+        for (place, len) in places {
+            let mut block = place / align * align;
+            while block < place + len {
+                need = need.max(self.disk_writing.get(&block).copied().unwrap_or(0));
+                block += align;
+            }
+        }
+        if need > 0 {
+            drop(self.shared.wait(need));
+        }
+        self.fault()
     }
 
     /// Waits until every job writing into `chunks` is done.
@@ -566,6 +657,27 @@ fn land(jobs: &Receiver<Job>, shared: &Shared, ordinal: i32) {
         return;
     }
     while let Ok(job) = jobs.recv() {
+        if let Some((base, mv)) = job.disk {
+            // A slot file that faults fails this move alone, told by name:
+            // the tier and the other moves go on.
+            let moved = disk_io(base, &mv);
+            if let Some(told) = mv.told {
+                told(match moved {
+                    Ok(()) => Landing::Landed,
+                    Err(why) => Landing::Failed(format!(
+                        "a move between the host tier and the slot file failed: {why}"
+                    )),
+                });
+            } else if let Err(why) = moved {
+                shared.finish(
+                    job.id,
+                    Some(format!("a move between the host tier and the slot file failed: {why}")),
+                );
+                continue;
+            }
+            shared.finish(job.id, None);
+            continue;
+        }
         let settled = job.after.as_ref().map_or(Ok(()), |after| after.0.settle());
         let fault = match settled {
             Err(why) => Some(format!("a host tier move did not land: {why}")),
@@ -577,6 +689,51 @@ fn land(jobs: &Receiver<Job>, shared: &Shared, ordinal: i32) {
         drop(job.after);
         shared.finish(job.id, fault);
     }
+}
+
+/// Debug and tests: a delay before each host<->disk move's I/O, in
+/// milliseconds (a slow disk).
+pub static DISK_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `mv`'s I/O, on the landing thread: each slot's cover of aligned blocks
+/// read whole, and written keeping its neighbours' bytes.
+fn disk_io(base: usize, mv: &DiskMove) -> std::io::Result<()> {
+    let delay = DISK_DELAY_MS.load(Ordering::Relaxed);
+    if delay > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(delay));
+    }
+    let align = engine::disk::ALIGN;
+    let mut edge = engine::disk::Aligned::zeroed(align);
+    for &(offset, place, len) in &mv.slots {
+        let start = place / align as u64 * align as u64;
+        let end = (place + len as u64).next_multiple_of(align as u64);
+        let lead = (place - start) as usize;
+        let mut staged = engine::disk::Aligned::zeroed((end - start) as usize);
+        let span = staged.as_mut_slice();
+        // SAFETY: the span lies in the tier's mapping (checked and committed
+        // when the move was enqueued), and only this thread moves its bytes
+        // now: every job before it touching them is done, none after runs.
+        let tier = unsafe { std::slice::from_raw_parts_mut((base + offset as usize) as *mut u8, len) };
+        let _io = mv.io.lock().expect("the slot file's I/O");
+        if mv.to_disk {
+            span[lead..lead + len].copy_from_slice(tier);
+            let block = edge.as_mut_slice();
+            if lead > 0 {
+                mv.file.read_span(start, block)?;
+                span[..lead].copy_from_slice(&block[..lead]);
+            }
+            if lead + len < span.len() {
+                let last = span.len() - align;
+                mv.file.read_span(start + last as u64, block)?;
+                span[lead + len..].copy_from_slice(&block[lead + len - last..]);
+            }
+            mv.file.write_span(start, span)?;
+        } else {
+            mv.file.read_span(start, span)?;
+            tier.copy_from_slice(&span[lead..lead + len]);
+        }
+    }
+    Ok(())
 }
 
 /// The threads that fault the ring's pages in before it is locked.
@@ -709,5 +866,98 @@ mod tests {
                 vec![(8, 1008, 2), (50, 2000, 2)],
             ]
         );
+    }
+
+    /// A tier of 4 chunks of 64 KiB behind a small ring, and a slot file of
+    /// 16 slots of 64 KiB, on the device this thread binds.
+    #[cfg(feature = "device")]
+    fn tier_and_file(name: &str) -> (crate::device::Context, super::HostTier, std::sync::Arc<engine::disk::SlotFile>, std::path::PathBuf) {
+        let device = crate::device::Context::bind(0, None).expect("a device");
+        let ring = super::Ring::pin(staging_ring(64 << 10, 1, 256 << 10)).expect("a ring");
+        let tier = super::HostTier::new(64 << 10, 4, ring).expect("a tier");
+        let dir = std::env::temp_dir().join(format!("pie-host-disk-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = engine::disk::SlotFile::open(&dir, "t.state", 64 << 10, 16 * (64 << 10))
+            .expect("the slot file opens")
+            .expect("it holds slots");
+        (device, tier, std::sync::Arc::new(file), dir)
+    }
+
+    /// A slow disk write holds no engine-thread call: enqueueing the move
+    /// and the next one return at once, and the move is told landed after
+    /// the disk took its time; its bytes come back whole.
+    #[cfg(feature = "device")]
+    #[test]
+    fn a_slow_disk_move_never_holds_the_engine_thread() {
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+        let (_device, mut tier, file, dir) = tier_and_file("slow");
+        let io = std::sync::Arc::default();
+        tier.slice(0, 4096).unwrap().fill(0x5a);
+        super::DISK_DELAY_MS.store(1500, Ordering::Relaxed);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let began = Instant::now();
+        let told = tx.clone();
+        tier.disk(super::DiskMove {
+            to_disk: true,
+            file: std::sync::Arc::clone(&file),
+            io: std::sync::Arc::clone(&io),
+            slots: vec![(0, 3 * (64 << 10), 4096)],
+            told: Some(Box::new(move |landing| told.send(landing).unwrap())),
+        })
+        .unwrap();
+        let enqueued = began.elapsed();
+        let next = Instant::now();
+        tier.disk(super::DiskMove {
+            to_disk: true,
+            file: std::sync::Arc::clone(&file),
+            io: std::sync::Arc::clone(&io),
+            slots: vec![(64 << 10, 5 * (64 << 10), 4096)],
+            told: Some(Box::new(move |landing| tx.send(landing).unwrap())),
+        })
+        .unwrap();
+        assert!(enqueued < Duration::from_millis(200), "enqueueing took {enqueued:?}");
+        assert!(next.elapsed() < Duration::from_millis(200), "the next call waited on the disk");
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), engine::Landing::Landed);
+        assert!(began.elapsed() >= Duration::from_millis(1400), "told before the disk was done");
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), engine::Landing::Landed);
+        super::DISK_DELAY_MS.store(0, Ordering::Relaxed);
+        // Back from the file into another chunk, waited out by the caller.
+        let id = tier
+            .disk(super::DiskMove {
+                to_disk: false,
+                file,
+                io,
+                slots: vec![(2 * (64 << 10), 3 * (64 << 10), 4096)],
+                told: None,
+            })
+            .unwrap();
+        tier.wait_job(id).unwrap();
+        assert!(tier.slice(2 * (64 << 10), 4096).unwrap().iter().all(|&b| b == 0x5a));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A move the slot file refuses is told failed with the fault, never
+    /// landed, and the tier goes on.
+    #[cfg(feature = "device")]
+    #[test]
+    fn a_disk_move_that_faults_is_told_failed() {
+        let (_device, mut tier, file, dir) = tier_and_file("fault");
+        let (tx, rx) = std::sync::mpsc::channel();
+        tier.disk(super::DiskMove {
+            to_disk: true,
+            file,
+            io: std::sync::Arc::default(),
+            // Past the file's 16 slots.
+            slots: vec![(0, 40 * (64 << 10), 4096)],
+            told: Some(Box::new(move |landing| tx.send(landing).unwrap())),
+        })
+        .unwrap();
+        match rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap() {
+            engine::Landing::Failed(why) => assert!(why.contains("slot file"), "{why}"),
+            engine::Landing::Landed => panic!("a refused move was told landed"),
+        }
+        assert!(tier.slice(0, 4096).is_ok(), "the tier goes on");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

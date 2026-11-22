@@ -361,6 +361,7 @@ fn fault(fault: Fault) -> Error {
             "this fire wants {need} {what} and the load reserved {have}"
         )),
         Fault::Fragmented { .. } | Fault::Integrity { .. } => Error::Device(fault.to_string()),
+        Fault::TierFull(_) => Error::TierFull(fault.to_string()),
         Fault::Overcarved { .. } => Error::Invalid(fault.to_string()),
         Fault::Straddled { .. } | Fault::Recipe(_) => Error::Load(fault.to_string()),
         Fault::Mask { .. }
@@ -377,6 +378,7 @@ fn fault(fault: Fault) -> Error {
             wanted: 1,
             available: 0,
         },
+        Fault::Claimed(refusal) => Error::Claimed(refusal),
         Fault::Compile(_) | Fault::Program { .. } | Fault::Interpret(_) => {
             Error::Program(fault.to_string())
         }
@@ -812,6 +814,8 @@ impl Engine for Cuda {
                 residency.disk_kv_budget,
                 residency.disk_kv_dir.as_deref(),
                 residency.disk_kv_persistent,
+                residency.kv_seats.unwrap_or(budgets.max_lanes),
+                budgets.max_context,
                 self.boot.world,
             )
             .map_err(fault)?;
@@ -1057,6 +1061,9 @@ impl Engine for Cuda {
                     },
                 )
                 .map_err(fault),
+            engine::program::Rebind::Parked { id, kept } => {
+                self.loaded_mut()?.park_program(id, kept).map_err(fault)
+            }
             engine::program::Rebind::Channel { id, slots } => {
                 let old = self.channels.get(&id).cloned().ok_or_else(|| {
                     Error::Program(format!("channel {id} is not registered on this engine"))
@@ -1096,16 +1103,32 @@ impl Engine for Cuda {
         copy: &engine::chunk::SlotCopy,
         token: u64,
     ) -> EngineResult<bool> {
-        self.copy_slots(copy)?;
         let host = |domain| matches!(domain, MemoryDomain::HostPinned);
         let device = |domain| matches!(domain, MemoryDomain::CudaDevice(_));
+        let disk = |domain| matches!(domain, MemoryDomain::LocalDisk);
+        // A move between the host tier and the slot file runs on the tier's
+        // landing thread and is told how it ended: the engine thread only
+        // enqueues it.
+        let host_disk = (host(copy.src) && disk(copy.dst)) || (disk(copy.src) && host(copy.dst));
+        if host_disk && let Some(sink) = self.landed.clone() {
+            let told: crate::serve::landing::Told =
+                Box::new(move |landing| sink(token, landing));
+            self.loaded_mut()?.defer_disk_tell(Some(told));
+            let copied = self.copy_slots(copy);
+            // Not taken (nothing to move, or refused before enqueueing):
+            // answered in the call.
+            let untaken = self.loaded_mut()?.defer_disk_tell(None).is_some();
+            copied?;
+            return Ok(untaken);
+        }
+        self.copy_slots(copy)?;
         let parked = device(copy.src) && host(copy.dst);
         let Some(sink) = self.landed.clone().filter(|_| parked) else {
             return Ok(true);
         };
         let told = self
             .loaded_mut()?
-            .tell_swaps_landed(Box::new(move || sink(token)))
+            .tell_swaps_landed(Box::new(move |landing| sink(token, landing)))
             .map_err(fault)?;
         Ok(!told)
     }

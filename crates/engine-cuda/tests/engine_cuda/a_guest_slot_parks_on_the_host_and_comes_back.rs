@@ -401,7 +401,7 @@ fn a_park_is_told_landed_once_it_has_read_its_slots() {
             .expect("the slots park");
         let (told, landed) = std::sync::mpsc::channel();
         let telling = shell
-            .tell_swaps_landed(Box::new(move || {
+            .tell_swaps_landed(Box::new(move |_| {
                 let _ = told.send(());
             }))
             .expect("the shell takes the landing");

@@ -395,15 +395,22 @@ impl Shell {
         self.pools.settle_swaps()
     }
 
-    /// Calls `landed` once every move between the device and the host tier
-    /// enqueued so far has landed, from a waiter of its own: nothing is
-    /// enqueued on the swap stream for it, so no later move waits on it.
-    /// `false` (and `landed` dropped) where the moves ride no swap stream,
-    /// so each has landed by the time it returned.
-    pub fn tell_swaps_landed(
+    /// Where the next move between the host tier and the slot file is told
+    /// how it ended ([`crate::store::Pools::defer_disk_tell`]); returns a
+    /// tell no such move took.
+    pub fn defer_disk_tell(
         &mut self,
-        landed: Box<dyn FnOnce() + Send + 'static>,
-    ) -> crate::Result<bool> {
+        told: Option<super::landing::Told>,
+    ) -> Option<super::landing::Told> {
+        self.pools.defer_disk_tell(told)
+    }
+
+    /// Tells `landed` how every move between the device and the host tier
+    /// enqueued so far ended (landed, or failed with its fault), from a
+    /// waiter of its own: nothing is enqueued on the swap stream for it, so
+    /// no later move waits on it. `false` (and `landed` dropped) where the
+    /// moves ride no swap stream, so each has landed by the time it returned.
+    pub fn tell_swaps_landed(&mut self, landed: super::landing::Told) -> crate::Result<bool> {
         if super::diag::on().tier_inline {
             return Ok(false);
         }
