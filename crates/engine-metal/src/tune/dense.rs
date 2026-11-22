@@ -475,11 +475,27 @@ fn fnv(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
-/// What a measured `kernel.dense` stands on: the device, the kernels it
-/// timed (their Metal sources) and the shapes. Not the pie version: a build
-/// that changes neither kernel keeps the measurement.
-fn load_key(device: &str, shapes: &[(u32, u32)]) -> u64 {
+/// The OS build: the kernels compile with its Metal compiler, so an update
+/// can move where they cross.
+fn os_build() -> String {
+    #[cfg(target_vendor = "apple")]
+    {
+        objc2_foundation::NSProcessInfo::processInfo()
+            .operatingSystemVersionString()
+            .to_string()
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        String::new()
+    }
+}
+
+/// What a measured `kernel.dense` stands on: the device, the OS build, the
+/// kernels it timed (their Metal sources) and the shapes. Not the pie
+/// version: a build that changes neither kernel keeps the measurement.
+fn load_key(device: &str, os: &str, shapes: &[(u32, u32)]) -> u64 {
     let mut hash = fnv(0xcbf2_9ce4_8422_2325, device.as_bytes());
+    hash = fnv(hash, os.as_bytes());
     for file in ["linear/gemm.metal", "linear/gemm_mpp.metal"] {
         hash = fnv(hash, file.as_bytes());
         hash = fnv(hash, kernels_metal::sources::source(file).unwrap_or("").as_bytes());
@@ -495,26 +511,67 @@ fn load_key(device: &str, shapes: &[(u32, u32)]) -> u64 {
 /// to 8, where the kernels cross, then the prompt rows a few at a time.
 const LOAD_ROWS: [u32; 15] = [2, 3, 4, 5, 6, 8, 10, 12, 16, 24, 32, 48, 64, 128, 512];
 
-/// `chip` with `kernel.dense` measured on this device, where its profile
-/// states none and the GPU has the tensor-op tile, so the tile is not taken
-/// where it loses (a fixed rule cost an M5 Pro's 8-row decode 16-19%). The
-/// ladder is fitted over the model's own bf16 shapes at the rows a load
-/// serves and kept under `profiles` (`metal/dense/<device>-<key>.toml`,
-/// keyed on the device, the two kernels' sources and the shapes), so a
-/// later load of the same shapes on the same kernels reads it back instead
-/// of measuring. A profile that states `kernel.dense` (a checked-in device
-/// file, or the user's) and a GPU without tensor ops keep theirs.
+/// The rungs of a `kernel.dense` value as TOML array elements, one a line.
+fn rungs_of(value: &str) -> Vec<String> {
+    let value = value.trim();
+    let Some(inner) = value.strip_prefix('[').and_then(|v| v.strip_suffix(']')) else {
+        return vec![value.to_string()];
+    };
+    inner
+        .lines()
+        .map(|l| l.trim().trim_end_matches(',').trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// `measured` (fitted over `shapes` alone) held to those shapes, then
+/// `base`'s rungs for every other shape: each measured rung gains the
+/// shapes' guard, and its terminal rung becomes a guarded one.
+fn composed(measured: &str, shapes: &[(u32, u32)], base: &str) -> String {
+    let guard = shapes
+        .iter()
+        .map(|(n, k)| format!("(n == {n} and k == {k})"))
+        .collect::<Vec<_>>()
+        .join(" or ");
+    let mut out = String::from("[\n");
+    for rung in rungs_of(measured) {
+        let body = rung.trim_start_matches('{').trim_end_matches('}').trim();
+        let line = if let Some(rest) = body.strip_prefix("when = \"") {
+            let (when, pick) = rest.split_once('"').unwrap_or((rest, ""));
+            format!("  {{ when = \"({when}) and ({guard})\"{pick} }},\n")
+        } else if body.starts_with('"') {
+            format!("  {{ when = \"{guard}\", use = {body} }},\n")
+        } else {
+            format!("  {{ when = \"{guard}\", {body} }},\n")
+        };
+        out.push_str(&line);
+    }
+    for rung in rungs_of(base) {
+        out.push_str(&format!("  {rung},\n"));
+    }
+    out.push(']');
+    out
+}
+
+/// `chip` with `kernel.dense` measured over this model's own bf16 shapes on
+/// an Apple10 GPU, where the tensor-op tile and the simdgroup kernels cross
+/// at rows the shapes decide (a fixed rule cost an M5 Pro's 8-row decode
+/// 16-19%). The ladder is fitted at the rows a load serves and kept under
+/// `profiles` (`metal/dense/<device>-<key>.toml`, keyed on the device, the
+/// OS build, the two kernels' sources and the shapes), so a later load of
+/// the same shapes reads it back and measures nothing. The profile's own
+/// `kernel.dense` (a checked-in device file's, the user's, or the default)
+/// stays the route before a measurement and for every shape not measured.
+/// A GPU without tensor ops (the M1) keeps its profile's. A kernel that
+/// answers wrongly refuses the load; a measurement that fails otherwise
+/// (memory refused at boot) leaves the profile's route serving, said.
 pub(crate) fn at_load(
     device: &Context,
     chip: Profile,
     profiles: Option<&std::path::Path>,
     contract: &checkpoint::contract::ModelContract,
 ) -> Result<Profile, String> {
-    let spec = Dense::spec();
-    let stated = chip
-        .entries()
-        .any(|(s, _, defaulted)| s.id == spec.id && !defaulted);
-    if stated || !kernels_metal::tuning::apple10(device.family()) {
+    if !kernels_metal::tuning::apple10(device.family()) {
         return Ok(chip);
     }
     let shapes = shapes_of(contract);
@@ -522,7 +579,7 @@ pub(crate) fn at_load(
         return Ok(chip);
     }
     let name = device.name().to_string();
-    let key = load_key(&name, &shapes);
+    let key = load_key(&name, &os_build(), &shapes);
     let path = profiles.map(|p| {
         p.join("metal")
             .join("dense")
@@ -540,16 +597,27 @@ pub(crate) fn at_load(
         None => {
             let began = std::time::Instant::now();
             let measured =
-                measure_at(device, &chip, device.cores(), &shapes, &LOAD_ROWS, &mut |_| {})?;
+                match measure_at(device, &chip, device.cores(), &shapes, &LOAD_ROWS, &mut |_| {}) {
+                    Ok(m) => m,
+                    Err(why) => {
+                        eprintln!("{name}: kernel.dense not measured: {why}; the profile's route serves");
+                        return Ok(chip);
+                    }
+                };
             if let Some((body, n, first)) = measured.wrong.first() {
                 return Err(format!(
                     "kernel.dense at load: `{body}` answered wrongly at {n} points; first at {first}"
                 ));
             }
-            let ((_, ladder), line) = fit_at(&measured, &LOAD_ROWS, shapes.len())?;
+            let ((_, ladder), line) = match fit_at(&measured, &LOAD_ROWS, shapes.len()) {
+                Ok(fitted) => fitted,
+                Err(why) => {
+                    eprintln!("{name}: kernel.dense not measured: {why}; the profile's route serves");
+                    return Ok(chip);
+                }
+            };
             eprintln!(
-                "{name}: the profile states no kernel.dense; measured it over the model's {} bf16 \
-                 shapes in {:.1} s: {}",
+                "{name}: measured kernel.dense over the model's {} bf16 shapes in {:.1} s: {}",
                 shapes.len(),
                 began.elapsed().as_secs_f64(),
                 line.text
@@ -557,7 +625,7 @@ pub(crate) fn at_load(
             if let Some(path) = &path {
                 let text = format!(
                     "# kernel.dense measured at load on {name}, over {} bf16 shapes \
-                     ({}) at rows {LOAD_ROWS:?}; key {key:016x}: the device, \
+                     ({}) at rows {LOAD_ROWS:?}; key {key:016x}: the device, the OS build, \
                      linear/gemm.metal and linear/gemm_mpp.metal, the shapes. {}\n\
                      dense = {}\n",
                     shapes.len(),
@@ -569,26 +637,41 @@ pub(crate) fn at_load(
                     line.text,
                     ladder.trim()
                 );
-                if let Some(dir) = path.parent() {
-                    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+                let written = path
+                    .parent()
+                    .map_or(Ok(()), std::fs::create_dir_all)
+                    .and_then(|()| std::fs::write(path, text));
+                if let Err(e) = written {
+                    eprintln!("{name}: kernel.dense not kept at {}: {e}", path.display());
                 }
-                std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))?;
             }
             ladder
         }
     };
-    crate::chip::registry()
-        .overlay(
+    let spec = Dense::spec();
+    let base = chip
+        .entries()
+        .find(|(s, ..)| s.id == spec.id)
+        .map(|(s, rungs, _)| profile::render::value_toml(s, rungs))
+        .unwrap_or_else(|| "\"tile\"".to_string());
+    let over = |value: &str| {
+        crate::chip::registry().overlay(
             &chip,
-            &format!("[kernel]\ndense = {ladder}\n"),
+            &format!("[kernel]\ndense = {value}\n"),
             chip.target().clone(),
             chip.source().clone(),
         )
-        .map_err(|e| {
+    };
+    match over(&composed(&ladder, &shapes, &base)) {
+        Ok(p) => Ok(p),
+        // A composition the registry refuses (a profile rung the measured
+        // ones leave unreachable): the measured ladder alone serves.
+        Err(_) => over(&ladder).map_err(|e| {
             format!(
                 "kernel.dense measured at load{}: {e}",
                 path.map(|p| format!(" ({})", p.display()))
                     .unwrap_or_default()
             )
-        })
+        }),
+    }
 }
