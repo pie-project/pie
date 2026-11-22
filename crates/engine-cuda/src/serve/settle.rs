@@ -123,7 +123,8 @@ impl Shell {
             Vec::new()
         };
         let lanes = u32::try_from(prepared.lanes.len()).unwrap_or(u32::MAX);
-        let slot = prepared.slot.take();
+        // Its staging slot comes back as the step lands.
+        let slot = prepared.slot.take().map(crate::inputs::SlotGuard::landing);
         drop(prepared);
 
         // The guest passes this step launched that land with it: their
