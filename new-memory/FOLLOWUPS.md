@@ -1104,3 +1104,31 @@ it (the lanes the load promises must seat at the cut context, beside one
 rung's activation span) or drop it in favour of the capacity gate's finisher
 guarantee; the fit's own shortening (`Pools::declare_context`) already
 derives what one working set needs.
+
+## F?? An unplaced served load hangs the GPU (slang backends, 2026-11-21)
+A direct fire on a served load before the engine places its programs (`Programs::load`)
+hangs the device instead of being refused: found when the dense settle fired from inside
+`Shell::load` (rows 1, its first fire never landed; the same fire placed after
+`Programs::load` lands in 6 ms). Suite and check loads place no programs and fire fine, so
+it is something a served load expects `Programs::load` to have set up (its readout / shelf
+placement, a table it writes, or a submit it makes), not yet pinned. Today a served load is
+guarded by phase (`Boot::places_programs`, refused by name until `Shell::programs_placed`).
+Find the resource and guard on it instead.
+
+## F?? Every consumer of a device's scalar rates handles an unmeasured one (slang backends, 2026-11-21)
+A device rate read below its own launches (a physically impossible frame) is repeated
+(`engine_gpu::rates::repeated`, REPEATS times); a curve point every repeat of which reads so is
+left unmeasured and the load goes on, but a single rate (the copy and launch, the per-row ops, the
+scan) every repeat of which reads so still refuses the load by name. A load measures a rate only
+where its profile lacks it, so no saved value stands behind it then. Make every consumer of those
+rates (the estimate's roofline, the top rung, the submit bound's step estimate, the dense choice's
+launch) handle an unmeasured rate, stated at load, so a load never refuses on timing.
+
+## F?? The dense settle skips a model whose classes read a guest input (slang backends, 2026-11-22)
+A settle fire seats plain lanes; on a model whose served classes read a guest input channel,
+`serve::feed_inputs` refuses them ("feeds no channel for it"), and the settle now stops there,
+said, the curves' kernels serving every range it did not reach. Such a model gets no settle at
+all, so a wrong or stale curve can still serve a kernel several times slower on it: the case the
+settle exists for. Fix: stage a feed for those channels in the settle's fires (zeros of the
+declared shape; the settle only times), or settle through a class that reads none, instead of
+stopping.

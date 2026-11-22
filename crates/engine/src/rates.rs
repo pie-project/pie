@@ -29,12 +29,11 @@
 //!   the kernel serving picks at those rows (below [`GEMM_ROWS`]' first, so
 //!   the curve never weighs it), its flops over its time once its weight
 //!   reads no longer bind it. Measured on every backend.
-//! - `tile_tflops_by_rows`: each tiled matmul kernel the backend can take
-//!   at decode-shaped and short prompt rows, below the matmul curve's first,
-//!   its flops at the rows it lands over its time (slang backends).
-//! - `vector_tflops_by_rows`: each vector matmul kernel (keyed by the rows a
-//!   workgroup carries) at 1 to 256 rows, its flops over its time, its
-//!   weight passes in it (slang backends).
+//! - `kernel_tflops_by_shape`: each dense matmul kernel the slang backends
+//!   choose between (the vector kernels by the rows a workgroup carries,
+//!   the tiled by their row tile) at each of a model's dense shapes, by
+//!   rows, its flops over its time, its weight passes in it; measured once
+//!   the model's shapes are known, not one of the estimate's keys.
 //! - `workgroups_per_core`: the workgroups a compute unit holds at once
 //!   for a kernel's full rate. Derived where the device states its
 //!   occupancy (CUDA, ROCm: the resident blocks a multiprocessor);
@@ -319,17 +318,13 @@ pub fn unmeasured(rates: &profile::fire::Rates) -> Option<(&'static str, String)
             }
         }
     }
-    if let Some(tiles) = &rates.tile_tflops_by_rows {
-        for (tile, curve) in tiles {
-            if let Some((key, at)) = point("tile_tflops_by_rows", "rows", curve) {
-                return Some((key, format!("{at} (a {tile}-row tile)")));
-            }
-        }
-    }
-    if let Some(vectors) = &rates.vector_tflops_by_rows {
-        for (rows, curve) in vectors {
-            if let Some((key, at)) = point("vector_tflops_by_rows", "rows", curve) {
-                return Some((key, format!("{at} ({rows} rows a workgroup)")));
+    if let Some(curves) = &rates.kernel_tflops_by_shape {
+        for c in curves {
+            if let Some((key, at)) = point(profile::fire::KERNEL_CURVES, "rows", &c.curve) {
+                return Some((
+                    key,
+                    format!("{at} (kernel {}/{} at {}x{})", c.kind, c.key, c.n, c.k),
+                ));
             }
         }
     }
@@ -1172,47 +1167,50 @@ pub fn rates_at_load(
             rates.missing(keys)
         ));
     }
-    // The user's file is this load's own output: it keeps every section and
-    // key this pie still reads (a person's own decisions), drops each it no
-    // longer reads (said, by name), gains what this load measured and how.
-    let saved_to = match save {
-        Some(save) => {
-            let existing = std::fs::read_to_string(&save.path).ok().map(|text| {
-                let (kept, dropped) = save.registry.prune(&text);
-                for key in dropped {
-                    tracing::warn!(
-                        profile = %save.path.display(),
-                        key = %key,
-                        "user profile: dropped a key this pie no longer reads"
-                    );
-                }
-                kept
-            });
-            let text = saved_text(existing.as_deref(), &rates.only(&lacked), &save.provenance);
-            let check = save
-                .registry
-                .parse(&text, "the measured rates", profile::Strict::User);
-            check.map_err(|why| {
-                format!(
-                    "{}: the measured rates would not read back: {why}",
-                    save.path.display()
-                )
-            })?;
-            if let Some(dir) = save.path.parent() {
-                std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-            }
-            std::fs::write(&save.path, text)
-                .map_err(|e| format!("{}: {e}", save.path.display()))?;
-            Some(save.path.display().to_string())
-        }
-        None => None,
-    };
+    // The user's file is this load's own output (`save_rates`).
+    let saved_to = save
+        .map(|save| save_rates(&save, &rates.only(&lacked)))
+        .transpose()?;
     let mut tuned = chip.tuned().clone();
     tuned.rates = rates;
     tuned.measured_this_load = true;
     tuned.saved_to = saved_to;
     tuned.frame_cut = unsettled;
     Ok(chip.with_tuned(tuned))
+}
+
+/// `measured` written into the user's file `save` names, as a load saves
+/// what it measured: the file keeps every section and key this pie still
+/// reads (a person's own decisions), drops each it no longer reads (said, by
+/// name), gains `measured` (each key it states replacing the file's) and how
+/// it was measured. The file must read back; its path, said.
+pub fn save_rates(save: &SaveTo<'_>, measured: &profile::fire::Rates) -> Result<String, String> {
+    let existing = std::fs::read_to_string(&save.path).ok().map(|text| {
+        let (kept, dropped) = save.registry.prune(&text);
+        for key in dropped {
+            tracing::warn!(
+                profile = %save.path.display(),
+                key = %key,
+                "user profile: dropped a key this pie no longer reads"
+            );
+        }
+        kept
+    });
+    let text = saved_text(existing.as_deref(), measured, &save.provenance);
+    let check = save
+        .registry
+        .parse(&text, "the measured rates", profile::Strict::User);
+    check.map_err(|why| {
+        format!(
+            "{}: the measured rates would not read back: {why}",
+            save.path.display()
+        )
+    })?;
+    if let Some(dir) = save.path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    std::fs::write(&save.path, text).map_err(|e| format!("{}: {e}", save.path.display()))?;
+    Ok(save.path.display().to_string())
 }
 
 /// The commit this pie was built from, as the build stated it in
@@ -1397,9 +1395,9 @@ mod tests {
             submit_worst_ratio: None,
             resident_workgroups: None,
             attn_tflops_by_rows_keys: None,
-            tile_tflops_by_rows: Some(vec![(32, vec![(8, 1.0), (256, 9.0)])]),
-            vector_tflops_by_rows: Some(vec![(4, vec![(1, 0.5), (256, 4.0)])]),
             product_ns: None,
+            kernel_tflops_by_shape: None,
+            dense_settled: None,
         }
     }
 
@@ -1917,7 +1915,7 @@ mod tests {
         .unwrap_err();
         assert!(
             err.contains(
-                "measured no [\"scan_gelems\", \"few_row_tflops\", \"workgroups_per_core\", \"tile_tflops_by_rows\", \"vector_tflops_by_rows\"]"
+                "measured no [\"scan_gelems\", \"few_row_tflops\", \"workgroups_per_core\"]"
             ),
             "{err}"
         );
@@ -2252,9 +2250,9 @@ mod tests {
             submit_worst_ratio: None,
             resident_workgroups: None,
             attn_tflops_by_rows_keys: None,
-            tile_tflops_by_rows: None,
-            vector_tflops_by_rows: None,
             product_ns: None,
+            kernel_tflops_by_shape: None,
+            dense_settled: None,
         };
         assert_eq!(tuned(&rates), rates.toml());
         let (key, text) = provenance("vulkan", "the matmul through Coopmat");

@@ -700,6 +700,25 @@ impl Registry {
                     continue;
                 }
             };
+            if !file.ignored_rates.is_empty() {
+                eprintln!(
+                    "{origin}: ignored `[rates]` {}, which this pie no longer reads; the rest is \
+                     read and what it lacks is measured",
+                    file.ignored_rates.join(", ")
+                );
+            }
+            if file
+                .ignored_rates
+                .iter()
+                .any(|key| key == crate::fire::KERNEL_CURVES_PER_DISPATCH)
+            {
+                eprintln!(
+                    "{origin}: the dense kernels' curves it states were timed per dispatch (~10x \
+                     long at few rows on a tiler): measured again this load, by frame spans \
+                     (`[rates] {}`)",
+                    crate::fire::KERNEL_CURVES
+                );
+            }
             let spelled = match facts {
                 Some(facts) => match self.admits(&file, facts) {
                     Ok(spelled) => spelled,

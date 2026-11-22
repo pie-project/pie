@@ -23,10 +23,9 @@
 //! scan_gelems = 2700.0     # gated-delta scan state elements, G a second
 //! few_row_tflops = 4.2     # bf16 matmul TFLOP/s at 4-256 rows, as served
 //! workgroups_per_core = 3.3 # workgroups a core holds for a kernel's full rate
-//! # each tiled kernel's TFLOP/s by rows below its full fill, keyed by its row tile
-//! tile_tflops_by_rows = [[32, [[8, 1.0], [256, 9.0]]], [256, [[8, 0.2], [256, 12.0]]]]
-//! # each vector kernel's TFLOP/s by rows, keyed by the rows a workgroup carries
-//! vector_tflops_by_rows = [[1, [[1, 0.3], [256, 2.0]]], [16, [[1, 0.1], [256, 6.0]]]]
+//! # each dense kernel's TFLOP/s by rows at each of a model's dense shapes:
+//! # [kind, key, n, k, stopped at rows, why, [[rows, TFLOP/s], ...]]
+//! kernel_tflops_by_shape_spanned = [[1, 4, 1024, 1024, 0, 0, [[1, 0.3], [256, 2.0]]]]
 //! ```
 //!
 //! Every key is a measurement of the device as serving runs it, but one:
@@ -117,19 +116,6 @@ pub struct Rates {
     /// it runs. Measured, and read, only where the platform states a bound
     /// on one submission (`engine_gpu::submit`); not one of [`KEYS`].
     pub attn_tflops_by_rows_keys: Option<Vec<(u32, Vec<(u32, f64)>)>>,
-    /// Each tiled matmul kernel's bf16 TFLOP/s by rows below the matmul
-    /// curve's, its flops counted at the rows it lands (not its tile's):
-    /// `(row tile, [(rows, TFLOP/s)])`, ascending in row tile, keyed by the
-    /// rows one tile of the kernel computes (the slang backends' tiles).
-    /// What a matmul of few rows costs on each tiled kernel, so a choice
-    /// between them and the vector kernels weighs measured costs at partial
-    /// fill. Measured.
-    pub tile_tflops_by_rows: Option<Vec<(u32, Vec<(u32, f64)>)>>,
-    /// Each vector matmul kernel's bf16 TFLOP/s by rows, its flops at the
-    /// rows it lands over its time (its weight passes in it): `(rows a
-    /// workgroup carries, [(rows, TFLOP/s)])`, ascending in the rows a
-    /// workgroup carries (the slang backends' vector kernels). Measured.
-    pub vector_tflops_by_rows: Option<Vec<(u32, Vec<(u32, f64)>)>>,
     /// Each decode product's time on each kernel that can serve it, measured
     /// in place (a captured burst over the model's own layer weights, as a
     /// step meets them), keyed by the product's shape: what a backend picks
@@ -137,6 +123,79 @@ pub struct Rates {
     /// Entries accumulate load to load, a load measuring only the shapes the
     /// table lacks. Not a roofline rate: no load requires it.
     pub product_ns: Option<Vec<ProductTime>>,
+    /// Each dense matmul kernel's bf16 TFLOP/s by rows at each dense shape
+    /// of the models loaded on the device ([`KernelCurve`]), its flops at the
+    /// rows it lands over its time (every weight pass it makes in it): what
+    /// the slang backends choose a rung's dense kernel by, each kernel
+    /// weighed at the model's own planes. Entries accumulate load to load, a
+    /// load measuring only the shapes and kernels the table lacks to its rows.
+    /// Measured; not one of [`KEYS`] (a load measures it once its model's
+    /// shapes are known).
+    pub kernel_tflops_by_shape: Option<Vec<KernelCurve>>,
+    /// The dense kernels a load's settle took in context over the curves'
+    /// picks ([`DENSE_SETTLED`]): what a later load of the same curves,
+    /// model and build takes again without walking a fire. Measured.
+    pub dense_settled: Option<DenseSettled>,
+}
+
+/// A settle's outcome: `of`, a fingerprint of what it settled (the curves,
+/// the model's planes, the load's rungs and kernels, the build), and each
+/// row range it decided, `[bottom, top, replaced, vector, wide, tier]`: 1
+/// where it replaced the curves' kernel with the one named (the tier
+/// `kernels_slang::Tier` as a number), 0 where it kept theirs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DenseSettled {
+    pub of: u32,
+    pub ranges: Vec<[u32; 6]>,
+}
+
+/// One dense kernel's measured curve at one shape
+/// ([`Rates::kernel_tflops_by_shape`]): the kernel (`kind`
+/// [`KernelCurve::VECTOR`], `key` the rows a workgroup carries, or
+/// [`KernelCurve::TILE`], `key` its row tile at the shape), the plane's `n x
+/// k`, its TFLOP/s by rows ascending, and where it stopped short of the rows
+/// it was asked to reach, if it did (`stop`: the rows not timed, and why,
+/// [`KernelCurve::BOUND`]: that fire's estimate passed the device's bound on
+/// one submission; [`KernelCurve::BUFFER`]: an operand passed the device's
+/// largest buffer; [`KernelCurve::BEATEN`]: a vector kernel ran slower than
+/// twice a tiled kernel at the same rows, beaten at every rows past them).
+/// A stopped curve is final: no load times it again.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KernelCurve {
+    pub kind: u32,
+    pub key: u32,
+    pub n: u32,
+    pub k: u32,
+    pub curve: Vec<(u32, f64)>,
+    pub stop: Option<(u32, u32)>,
+    /// Each point's spread over its repeats, `(max - min) / median`, by
+    /// rows as `curve`: what a choice between two kernels may call a
+    /// difference (none stated: no spread measured).
+    pub spread: Vec<(u32, f64)>,
+}
+
+impl KernelCurve {
+    pub const VECTOR: u32 = 1;
+    pub const TILE: u32 = 2;
+    pub const BOUND: u32 = 1;
+    pub const BUFFER: u32 = 2;
+    pub const BEATEN: u32 = 3;
+    /// Every sample at the rows was dropped (a fire timed below its
+    /// launches): no measurement there, and nothing past it.
+    pub const UNTIMED: u32 = 4;
+
+    /// What the curve measures: its kernel and shape.
+    #[must_use]
+    pub const fn id(&self) -> (u32, u32, u32, u32) {
+        (self.kind, self.key, self.n, self.k)
+    }
+
+    /// Whether a load of up to `rows` needs nothing more of it: it reaches
+    /// them, or stopped for a reason it records.
+    #[must_use]
+    pub fn serves(&self, rows: u32) -> bool {
+        self.stop.is_some() || self.curve.last().is_some_and(|&(at, _)| at >= rows)
+    }
 }
 
 /// One product's measured time on one kernel ([`Rates::product_ns`]): the
@@ -165,7 +224,7 @@ impl ProductTime {
 
 /// Every roofline key `[rates]` holds, in the order a profile writes them
 /// ([`Rates::product_ns`] is not one: no load requires it).
-pub const KEYS: [&str; 11] = [
+pub const KEYS: [&str; 9] = [
     "launch_ns",
     "gemm_tflops_by_rows",
     "attn_tflops_by_keys",
@@ -175,9 +234,24 @@ pub const KEYS: [&str; 11] = [
     "scan_gelems",
     "few_row_tflops",
     "workgroups_per_core",
-    "tile_tflops_by_rows",
-    "vector_tflops_by_rows",
 ];
+
+/// The `[rates]` key of the dense kernels' curves at a model's planes
+/// (`Rates::kernel_tflops_by_shape`), tagged with how they are measured:
+/// each point's frame timed by its two timestamps (`spanned`). Curves an
+/// older pie wrote under `kernel_tflops_by_shape` were timed with a
+/// timestamp pair around every dispatch, which on a tiler ran its few-row
+/// points ~10x long: that key is no longer read, so a user file stating it
+/// is measured again.
+pub const KERNEL_CURVES: &str = "kernel_tflops_by_shape_spanned";
+
+/// The key an older pie wrote its dense kernels' curves under, timed per
+/// dispatch ([`KERNEL_CURVES`]).
+pub const KERNEL_CURVES_PER_DISPATCH: &str = "kernel_tflops_by_shape";
+
+/// The `[rates]` key of [`Rates::dense_settled`]:
+/// `[of, [[bottom, top, replaced, vector, wide, tier], ...]]`.
+pub const DENSE_SETTLED: &str = "dense_settled";
 
 /// The `[rates]` key of [`Rates::submit_worst_ratio`]: what a load on a
 /// platform that states a bound on one submission measures beside the
@@ -211,8 +285,6 @@ impl Rates {
             attn_tflops_by_rows_keys: self
                 .attn_tflops_by_rows_keys
                 .or(below.attn_tflops_by_rows_keys),
-            tile_tflops_by_rows: self.tile_tflops_by_rows.or(below.tile_tflops_by_rows),
-            vector_tflops_by_rows: self.vector_tflops_by_rows.or(below.vector_tflops_by_rows),
             // Entry by entry: a load's shapes join those already measured,
             // its own replacing a shape both state.
             product_ns: match (self.product_ns, below.product_ns) {
@@ -227,6 +299,24 @@ impl Rates {
                 }
                 (mine, theirs) => mine.or(theirs),
             },
+            // Entry by entry, as `product_ns`: a load's curves join those
+            // already measured, its own replacing one both state.
+            kernel_tflops_by_shape: match (
+                self.kernel_tflops_by_shape,
+                below.kernel_tflops_by_shape,
+            ) {
+                (Some(mine), Some(theirs)) => {
+                    let mut all: Vec<KernelCurve> = theirs
+                        .into_iter()
+                        .filter(|t| mine.iter().all(|m| m.id() != t.id()))
+                        .collect();
+                    all.extend(mine);
+                    all.sort_by_key(KernelCurve::id);
+                    Some(all)
+                }
+                (mine, theirs) => mine.or(theirs),
+            },
+            dense_settled: self.dense_settled.or(below.dense_settled),
         }
     }
 
@@ -257,9 +347,7 @@ impl Rates {
             workgroups_per_core: self
                 .workgroups_per_core
                 .filter(|_| has("workgroups_per_core")),
-            submit_worst_ratio: self
-                .submit_worst_ratio
-                .filter(|_| has(SUBMIT_WORST_RATIO)),
+            submit_worst_ratio: self.submit_worst_ratio.filter(|_| has(SUBMIT_WORST_RATIO)),
             resident_workgroups: self
                 .resident_workgroups
                 .filter(|_| has(RESIDENT_WORKGROUPS)),
@@ -267,15 +355,12 @@ impl Rates {
                 .attn_tflops_by_rows_keys
                 .clone()
                 .filter(|_| has(ATTN_BY_ROWS_KEYS)),
-            tile_tflops_by_rows: self
-                .tile_tflops_by_rows
-                .clone()
-                .filter(|_| has("tile_tflops_by_rows")),
-            vector_tflops_by_rows: self
-                .vector_tflops_by_rows
-                .clone()
-                .filter(|_| has("vector_tflops_by_rows")),
             product_ns: self.product_ns.clone().filter(|_| has("product_ns")),
+            kernel_tflops_by_shape: self
+                .kernel_tflops_by_shape
+                .clone()
+                .filter(|_| has(KERNEL_CURVES)),
+            dense_settled: self.dense_settled.clone().filter(|_| has(DENSE_SETTLED)),
         }
     }
 
@@ -297,9 +382,9 @@ impl Rates {
             SUBMIT_WORST_RATIO => self.submit_worst_ratio.is_none(),
             RESIDENT_WORKGROUPS => self.resident_workgroups.is_none(),
             ATTN_BY_ROWS_KEYS => self.attn_tflops_by_rows_keys.is_none(),
-            "tile_tflops_by_rows" => self.tile_tflops_by_rows.is_none(),
-            "vector_tflops_by_rows" => self.vector_tflops_by_rows.is_none(),
             "product_ns" => self.product_ns.is_none(),
+            KERNEL_CURVES => self.kernel_tflops_by_shape.is_none(),
+            DENSE_SETTLED => self.dense_settled.is_none(),
             _ => true,
         };
         keys.iter().copied().filter(|key| unstated(key)).collect()
@@ -355,12 +440,6 @@ impl Rates {
         float("workgroups_per_core", self.workgroups_per_core);
         float(SUBMIT_WORST_RATIO, self.submit_worst_ratio);
         float(RESIDENT_WORKGROUPS, self.resident_workgroups);
-        keyed(&mut out, "tile_tflops_by_rows", &self.tile_tflops_by_rows);
-        keyed(
-            &mut out,
-            "vector_tflops_by_rows",
-            &self.vector_tflops_by_rows,
-        );
         if let Some(times) = &self.product_ns {
             let rows: Vec<String> = times
                 .iter()
@@ -374,6 +453,56 @@ impl Rates {
             let _ = writeln!(out, "product_ns = [\n{}]", rows.concat());
         }
         keyed(&mut out, ATTN_BY_ROWS_KEYS, &self.attn_tflops_by_rows_keys);
+        if let Some(curves) = &self.kernel_tflops_by_shape {
+            let rows: Vec<String> = curves
+                .iter()
+                .map(|c| {
+                    let points: Vec<String> = c
+                        .curve
+                        .iter()
+                        .map(|(x, r)| format!("[{x}, {r:?}]"))
+                        .collect();
+                    let (at, why) = c.stop.unwrap_or((0, 0));
+                    let spread = if c.spread.is_empty() {
+                        String::new()
+                    } else {
+                        let s: Vec<String> = c
+                            .spread
+                            .iter()
+                            .map(|(x, f)| format!("[{x}, {f:?}]"))
+                            .collect();
+                        format!(", [{}]", s.join(", "))
+                    };
+                    format!(
+                        "  [{}, {}, {}, {}, {at}, {why}, [{}]{spread}],\n",
+                        c.kind,
+                        c.key,
+                        c.n,
+                        c.k,
+                        points.join(", ")
+                    )
+                })
+                .collect();
+            let _ = writeln!(out, "{KERNEL_CURVES} = [\n{}]", rows.concat());
+        }
+        if let Some(settled) = &self.dense_settled {
+            let ranges: Vec<String> = settled
+                .ranges
+                .iter()
+                .map(|r| {
+                    format!(
+                        "[{}, {}, {}, {}, {}, {}]",
+                        r[0], r[1], r[2], r[3], r[4], r[5]
+                    )
+                })
+                .collect();
+            let _ = writeln!(
+                out,
+                "{DENSE_SETTLED} = [{}, [{}]]",
+                settled.of,
+                ranges.join(", ")
+            );
+        }
         out
     }
 }
@@ -531,20 +660,25 @@ mod tests {
             submit_worst_ratio: None,
             resident_workgroups: None,
             attn_tflops_by_rows_keys: None,
-            tile_tflops_by_rows: Some(vec![(32, vec![(8, 1.0), (256, 9.5)])]),
-            vector_tflops_by_rows: Some(vec![(4, vec![(1, 0.5)])]),
             product_ns: None,
+            kernel_tflops_by_shape: Some(vec![KernelCurve {
+                kind: KernelCurve::VECTOR,
+                key: 4,
+                n: 1024,
+                k: 2048,
+                curve: vec![(1, 0.5)],
+                stop: Some((512, KernelCurve::BOUND)),
+                spread: Vec::new(),
+            }]),
+            dense_settled: Some(DenseSettled {
+                of: 77,
+                ranges: vec![[3, 4, 1, 4, 0, 1]],
+            }),
         };
         assert!(rates.complete(&KEYS));
         assert_eq!(
             rates.only(&KEYS[..6]).missing(&KEYS),
-            [
-                "scan_gelems",
-                "few_row_tflops",
-                "workgroups_per_core",
-                "tile_tflops_by_rows",
-                "vector_tflops_by_rows"
-            ]
+            ["scan_gelems", "few_row_tflops", "workgroups_per_core",]
         );
         assert_eq!(
             rates.toml(),
@@ -552,8 +686,72 @@ mod tests {
              150.0]]],\n  [4096, [[256, 90.5], [8192, 210.0]]],\n]\n\
              attn_tflops_by_keys = [[512, 60.0], [8192, 400.0]]\nhbm_gbps = 654.4\n\
              cached_gbps = 28800.0\nelementwise_gbps = 450.0\nscan_gelems = 2684.3\nfew_row_tflops = 4.2\n\
-             workgroups_per_core = 3.3\ntile_tflops_by_rows = [\n  [32, [[8, 1.0], [256, 9.5]]],\n]\nvector_tflops_by_rows = [\n  [4, [[1, 0.5]]],\n]\n"
+             workgroups_per_core = 3.3\nkernel_tflops_by_shape_spanned = [\n  [1, 4, 1024, 2048, 512, 1, [[1, 0.5]]],\n]\n\
+             dense_settled = [77, [[3, 4, 1, 4, 0, 1]]]\n"
         );
+        // It reads back.
+        let registry = crate::Registry::new("test", &[], &[]);
+        let read = registry
+            .parse(
+                &format!("api = 1\n{}", rates.toml()),
+                "user",
+                crate::registry::Strict::User,
+            )
+            .unwrap();
+        assert_eq!(read.tuned.rates.dense_settled, rates.dense_settled);
+    }
+
+    /// A user file an older pie wrote, stating rates this pie no longer
+    /// reads, is read for the rest (those left unread, named); a checked-in
+    /// file stating one is refused by it.
+    #[test]
+    fn a_user_files_obsolete_rates_are_left_unread_and_the_rest_read() {
+        let text = "api = 1\n[rates]\nlaunch_ns = 904\nhbm_gbps = 650.0\n\
+                    vector_tflops_by_rows = [[1, [[1, 0.5]]]]\nkernel_stops = []\n";
+        let registry = crate::Registry::new("test", &[], &[]);
+        let file = registry
+            .parse(text, "user", crate::registry::Strict::User)
+            .unwrap();
+        assert_eq!(file.tuned.rates.launch_ns, Some(904));
+        assert_eq!(file.tuned.rates.hbm_gbps, Some(650.0));
+        assert_eq!(
+            file.ignored_rates,
+            ["vector_tflops_by_rows", "kernel_stops"]
+        );
+        let read = registry.load_user(text, "user").unwrap().rates();
+        assert_eq!(read.launch_ns, Some(904));
+        let refused = registry
+            .parse(text, "checked in", crate::registry::Strict::CheckedIn)
+            .unwrap_err();
+        assert_eq!(
+            refused.stale_rates,
+            ["vector_tflops_by_rows", "kernel_stops"]
+        );
+        // A save drops them.
+        let (kept, dropped) = registry.prune(text);
+        assert!(!kept.contains("vector_tflops_by_rows"), "{kept}");
+        assert_eq!(dropped.len(), 2, "{dropped:?}");
+    }
+
+    /// Curves an older pie timed per dispatch (`kernel_tflops_by_shape`)
+    /// are left unread in a user file, as any key this pie no longer reads:
+    /// the rates read hold no curves, so the next load measures them again
+    /// by frame spans and saves them under [`KERNEL_CURVES`], the old key
+    /// pruned.
+    #[test]
+    fn curves_timed_per_dispatch_are_measured_again() {
+        let text = "api = 1\n[rates]\nlaunch_ns = 904\n\
+                    kernel_tflops_by_shape = [[1, 4, 1024, 2048, 0, 0, [[1, 0.006], [256, 0.37]]]]\n";
+        let registry = crate::Registry::new("test", &[], &[]);
+        let file = registry
+            .parse(text, "user", crate::registry::Strict::User)
+            .unwrap();
+        assert_eq!(file.ignored_rates, [KERNEL_CURVES_PER_DISPATCH]);
+        let read = registry.load_user(text, "user").unwrap().rates();
+        assert_eq!(read.kernel_tflops_by_shape, None);
+        assert!(read.missing(&[KERNEL_CURVES]).contains(&KERNEL_CURVES));
+        let (kept, _) = registry.prune(text);
+        assert!(!kept.contains(KERNEL_CURVES_PER_DISPATCH), "{kept}");
     }
 
     /// The margin a load measures under a stated submit bound is saved with
@@ -572,13 +770,19 @@ mod tests {
         let registry = crate::Registry::new("test", &[], &[]);
         let read = registry.load_user(&text, "test").unwrap().rates();
         assert_eq!(read.submit_worst_ratio, Some(1.83));
-        assert_eq!(read.attn_tflops_by_rows_keys, measured.attn_tflops_by_rows_keys);
+        assert_eq!(
+            read.attn_tflops_by_rows_keys,
+            measured.attn_tflops_by_rows_keys
+        );
         assert!(read.missing(&[SUBMIT_WORST_RATIO]).is_empty());
         assert_eq!(
             Rates::default().missing(&[SUBMIT_WORST_RATIO]),
             [SUBMIT_WORST_RATIO]
         );
-        assert_eq!(measured.only(&[SUBMIT_WORST_RATIO]).submit_worst_ratio, Some(1.83));
+        assert_eq!(
+            measured.only(&[SUBMIT_WORST_RATIO]).submit_worst_ratio,
+            Some(1.83)
+        );
     }
 
     #[test]

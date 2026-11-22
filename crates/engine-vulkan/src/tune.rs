@@ -104,6 +104,7 @@ fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<
         residency: engine::load::Residency::default(),
         handed: None,
         check: None,
+        places_programs: false,
     })
     .map_err(|e| e.to_string())?;
     let token = |i: u32| 100 + (i * 7919) % 5000;

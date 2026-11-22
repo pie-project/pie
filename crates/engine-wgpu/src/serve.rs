@@ -94,6 +94,57 @@ impl Serve for Api {
         Ok((device, tuning))
     }
 
+    fn rate_shapes(
+        device: &Context,
+        boot: &crate::api::DeviceBoot,
+        tuning: crate::tuning::Tuning,
+        shapes: &[(u32, u32)],
+        model_bytes: u64,
+        top_rows: u32,
+    ) -> Result<crate::tuning::Tuning> {
+        crate::rates::shapes_at_load(
+            device,
+            tuning,
+            boot.profiles.as_deref(),
+            crate::rates::stated_submit_bound(),
+            shapes,
+            model_bytes,
+            top_rows,
+        )
+    }
+
+    fn time_kernels(
+        device: &Context,
+        tuning: &crate::tuning::Tuning,
+        tier: kernels_slang::Tier,
+        max_submit: Option<std::time::Duration>,
+        launch: f64,
+        kernels: &[kernels_slang::linear::gemm::Tactic],
+        pieces: &[u32],
+        plane: (u32, u32),
+        rows: u32,
+    ) -> Result<Vec<Vec<f64>>> {
+        let timer = |frame: crate::device::Frame| {
+            let started = std::time::Instant::now();
+            let span = frame.commit_spanned()?;
+            Ok((
+                span.filter(|&ns| ns > 0),
+                started.elapsed().as_nanos() as u64,
+            ))
+        };
+        engine_gpu::rates::time_kernels::<Api, _>(
+            device, tuning, tier, &timer, max_submit, launch, kernels, pieces, plane, rows,
+        )
+    }
+
+    fn save_rates(
+        device: &Context,
+        boot: &crate::api::DeviceBoot,
+        rates: &profile::fire::Rates,
+    ) -> Result<()> {
+        crate::rates::save_rates(device, boot.profiles.as_deref(), rates)
+    }
+
     fn chunk_bytes(boot: &crate::api::DeviceBoot) -> Option<u64> {
         boot.chunk_bytes
     }

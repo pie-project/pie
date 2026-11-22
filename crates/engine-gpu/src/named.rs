@@ -441,6 +441,39 @@ impl<B: Serve> Serve for Named<B> {
         Err(Fault::Deviceless)
     }
 
+    fn time_kernels(
+        _device: &Self::Context,
+        _tuning: &Self::Tuning,
+        _tier: kernels_slang::Tier,
+        _max_submit: Option<std::time::Duration>,
+        _launch: f64,
+        kernels: &[kernels_slang::linear::gemm::Tactic],
+        _pieces: &[u32],
+        _plane: (u32, u32),
+        _rows: u32,
+    ) -> Result<Vec<Vec<f64>>> {
+        Ok(vec![Vec::new(); kernels.len()])
+    }
+
+    fn save_rates(
+        _device: &Self::Context,
+        _boot: &Self::DeviceBoot,
+        _rates: &profile::fire::Rates,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn rate_shapes(
+        _device: &Facts,
+        _boot: &B::DeviceBoot,
+        tuning: B::Tuning,
+        _shapes: &[(u32, u32)],
+        _model_bytes: u64,
+        _top_rows: u32,
+    ) -> Result<B::Tuning> {
+        Ok(tuning)
+    }
+
     fn chunk_bytes(boot: &B::DeviceBoot) -> Option<u64> {
         B::chunk_bytes(boot)
     }
@@ -515,10 +548,7 @@ impl<B: Serve> Serve for Named<B> {
     }
 
     /// A naming load runs nothing on a device: no probe to lay.
-    fn record_probe(
-        _device: &Facts,
-        _record: &dyn Fn(&NoFrame) -> Result<()>,
-    ) -> Result<()> {
+    fn record_probe(_device: &Facts, _record: &dyn Fn(&NoFrame) -> Result<()>) -> Result<()> {
         Ok(())
     }
 

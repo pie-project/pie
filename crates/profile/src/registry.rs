@@ -114,6 +114,10 @@ pub struct File {
     pub entries: BTreeMap<&'static str, Vec<Rung>>,
     /// `[rates]` ([`crate::fire`]).
     pub tuned: crate::fire::Tuned,
+    /// `[rates]` keys a user file states that this pie no longer reads:
+    /// left unread (the rest of the file is read, a load measures what it
+    /// lacks, and a save drops them, [`Registry::prune`]).
+    pub ignored_rates: Vec<String>,
 }
 
 impl Registry {
@@ -386,6 +390,7 @@ impl Registry {
             walk.err(0, format!("a profile starts with `api = {API}`"));
         }
         walk.file_lints(&file);
+        file.ignored_rates = std::mem::take(&mut walk.ignored_rates);
         if walk.diags.is_empty() {
             Ok(file)
         } else {
@@ -639,6 +644,9 @@ struct Walk<'a> {
     inherited: &'a [(usize, i64)],
     /// `[rates]` keys stated that no rate reads.
     stale_rates: Vec<String>,
+    /// Of `stale_rates`, those a user file states: left unread, the file
+    /// read for the rest.
+    ignored_rates: Vec<String>,
     /// What the file states that this pie no longer reads: each key (or a
     /// list's item) by name, and where it lies ([`Registry::prune`]).
     unread: Vec<(String, Unread)>,
@@ -669,6 +677,7 @@ impl<'a> Walk<'a> {
             under: &NONE,
             inherited: &[],
             stale_rates: Vec::new(),
+            ignored_rates: Vec::new(),
             unread: Vec::new(),
         }
     }
@@ -1125,14 +1134,6 @@ impl<'a> Walk<'a> {
                     rates.gemm_tflops_by_rows = self.width_curves(v, key);
                     continue;
                 }
-                key @ "tile_tflops_by_rows" => {
-                    rates.tile_tflops_by_rows = self.width_curves(v, key);
-                    continue;
-                }
-                key @ "vector_tflops_by_rows" => {
-                    rates.vector_tflops_by_rows = self.width_curves(v, key);
-                    continue;
-                }
                 key @ crate::fire::ATTN_BY_ROWS_KEYS => {
                     rates.attn_tflops_by_rows_keys = self.width_curves(v, key);
                     continue;
@@ -1143,6 +1144,14 @@ impl<'a> Walk<'a> {
                 }
                 "product_ns" => {
                     rates.product_ns = self.product_times(v);
+                    continue;
+                }
+                crate::fire::KERNEL_CURVES => {
+                    rates.kernel_tflops_by_shape = self.kernel_curves(v);
+                    continue;
+                }
+                crate::fire::DENSE_SETTLED => {
+                    rates.dense_settled = self.dense_settled(v);
                     continue;
                 }
                 "elementwise_gbps" => &mut rates.elementwise_gbps,
@@ -1170,14 +1179,22 @@ impl<'a> Walk<'a> {
                     self.stale_rates.push(other.to_string());
                     self.unread
                         .push((format!("rates.{other}"), Unread::Entry(v.span())));
+                    // A user file is a load's own output, written by an
+                    // older pie: a rate this pie no longer reads is left
+                    // unread, the rest of the file read (a checked-in file
+                    // stating one is refused by name).
+                    if self.strict == Strict::User {
+                        self.ignored_rates.push(other.to_string());
+                        continue;
+                    }
                     self.err(
                         k.span().start,
                         format!(
                             "`rates` holds `launch_ns`, `gemm_tflops_by_rows`, \
                              `attn_tflops_by_keys`, `hbm_gbps`, `cached_gbps`, `elementwise_gbps`, \
                              `scan_gelems`, `few_row_tflops`, `workgroups_per_core`, \
-                             `tile_tflops_by_rows`, `vector_tflops_by_rows`, `product_ns`, \
-                             `submit_worst_ratio`, `attn_tflops_by_rows_keys` and `resident_workgroups`, not `{other}`"
+                             `product_ns`, `submit_worst_ratio`, `attn_tflops_by_rows_keys`, \
+                             `resident_workgroups`, `kernel_tflops_by_shape_spanned` and `dense_settled`, not `{other}`"
                         ),
                     );
                     continue;
@@ -1201,11 +1218,18 @@ impl<'a> Walk<'a> {
     /// `rates.product_ns`: a list of `[kind, rows, k, m, kernel, ns, spread]`,
     /// whole numbers then a positive time and a spread at least zero, no
     /// shape twice.
-    fn product_times(&mut self, value: &Spanned<DeValue<'_>>) -> Option<Vec<crate::fire::ProductTime>> {
+
+    fn product_times(
+        &mut self,
+        value: &Spanned<DeValue<'_>>,
+    ) -> Option<Vec<crate::fire::ProductTime>> {
         let what = "`rates.product_ns` is a list of [kind, rows, k, m, kernel, ns, spread], each \
                     shape once";
         let DeValue::Array(entries) = value.get_ref() else {
-            self.err(value.span().start, format!("{what}, not {}", found(value.get_ref())));
+            self.err(
+                value.span().start,
+                format!("{what}, not {}", found(value.get_ref())),
+            );
             return None;
         };
         let number = |v: &DeValue<'_>| match v {
@@ -1218,11 +1242,33 @@ impl<'a> Walk<'a> {
             let parsed = match entry.get_ref() {
                 DeValue::Array(f) if f.len() == 7 => {
                     let whole = |i: usize| int(f[i].get_ref()).and_then(|v| u32::try_from(v).ok());
-                    match (whole(0), whole(1), whole(2), whole(3), whole(4), number(f[5].get_ref()), number(f[6].get_ref())) {
-                        (Some(kind), Some(rows), Some(k), Some(m), Some(kernel), Some(ns), Some(spread))
-                            if ns.is_finite() && ns > 0.0 && spread.is_finite() && spread >= 0.0 =>
-                        {
-                            Some(crate::fire::ProductTime { kind, rows, k, m, kernel, ns, spread })
+                    match (
+                        whole(0),
+                        whole(1),
+                        whole(2),
+                        whole(3),
+                        whole(4),
+                        number(f[5].get_ref()),
+                        number(f[6].get_ref()),
+                    ) {
+                        (
+                            Some(kind),
+                            Some(rows),
+                            Some(k),
+                            Some(m),
+                            Some(kernel),
+                            Some(ns),
+                            Some(spread),
+                        ) if ns.is_finite() && ns > 0.0 && spread.is_finite() && spread >= 0.0 => {
+                            Some(crate::fire::ProductTime {
+                                kind,
+                                rows,
+                                k,
+                                m,
+                                kernel,
+                                ns,
+                                spread,
+                            })
                         }
                         _ => None,
                     }
@@ -1232,7 +1278,10 @@ impl<'a> Walk<'a> {
             match parsed {
                 Some(t) if out.iter().all(|o| o.key() != t.key()) => out.push(t),
                 _ => {
-                    self.err(entry.span().start, format!("{what}, not {}", found(entry.get_ref())));
+                    self.err(
+                        entry.span().start,
+                        format!("{what}, not {}", found(entry.get_ref())),
+                    );
                     return None;
                 }
             }
@@ -1240,8 +1289,159 @@ impl<'a> Walk<'a> {
         Some(out)
     }
 
-    /// `rates.<key>` (`gemm_tflops_by_rows`, `tile_tflops_by_rows`,
-    /// `vector_tflops_by_rows`, `attn_tflops_by_rows_keys`): `[outer, curve]`
+    /// `rates.dense_settled`: `[of, [[bottom, top, replaced, vector, wide,
+    /// tier], ...]]`, whole numbers.
+    fn dense_settled(&mut self, v: &Spanned<DeValue<'_>>) -> Option<crate::fire::DenseSettled> {
+        let what = "`rates.dense_settled` is [of, [[bottom, top, replaced, vector, wide, tier], \
+                    ...]], whole \
+                    numbers";
+        let whole = |v: &DeValue<'_>| int(v).and_then(|x| u32::try_from(x).ok());
+        let parsed = match v.get_ref() {
+            DeValue::Array(f) if f.len() == 2 => {
+                let of = whole(f[0].get_ref());
+                let ranges = match f[1].get_ref() {
+                    DeValue::Array(rs) => rs
+                        .iter()
+                        .map(|r| match r.get_ref() {
+                            DeValue::Array(x) if x.len() == 6 => {
+                                let mut out = [0u32; 6];
+                                for (slot, x) in out.iter_mut().zip(x.iter()) {
+                                    *slot = whole(x.get_ref())?;
+                                }
+                                Some(out)
+                            }
+                            _ => None,
+                        })
+                        .collect::<Option<Vec<[u32; 6]>>>(),
+                    _ => None,
+                };
+                of.zip(ranges)
+            }
+            _ => None,
+        };
+        match parsed {
+            Some((of, ranges)) => Some(crate::fire::DenseSettled { of, ranges }),
+            None => {
+                self.err(
+                    v.span().start,
+                    format!("{what}, not {}", found(v.get_ref())),
+                );
+                None
+            }
+        }
+    }
+
+    /// `rates.kernel_tflops_by_shape`: a list of `[kind, key, n, k, stopped
+    /// at rows, why, curve]`, whole numbers then a curve of `[rows, TFLOP/s]`
+    /// ascending in rows; no kernel and shape twice; a stop of `0, 0` is none.
+    fn kernel_curves(
+        &mut self,
+        value: &Spanned<DeValue<'_>>,
+    ) -> Option<Vec<crate::fire::KernelCurve>> {
+        let what = "`rates.kernel_tflops_by_shape_spanned` is a list of [kind, key, n, k, stopped at \
+                    rows, why, [[rows, TFLOP/s], ...], optionally [[rows, spread], ...]], no \
+                    kernel and shape twice";
+        let DeValue::Array(entries) = value.get_ref() else {
+            self.err(
+                value.span().start,
+                format!("{what}, not {}", found(value.get_ref())),
+            );
+            return None;
+        };
+        let mut out: Vec<crate::fire::KernelCurve> = Vec::with_capacity(entries.len());
+        for entry in entries.iter() {
+            let fields = match entry.get_ref() {
+                DeValue::Array(f) if f.len() == 7 || f.len() == 8 => {
+                    let whole = |i: usize| int(f[i].get_ref()).and_then(|v| u32::try_from(v).ok());
+                    match (whole(0), whole(1), whole(2), whole(3), whole(4), whole(5)) {
+                        (Some(kind), Some(key), Some(n), Some(k), Some(at), Some(why))
+                            if n > 0 && k > 0 && (at == 0) == (why == 0) =>
+                        {
+                            Some((
+                                kind,
+                                key,
+                                n,
+                                k,
+                                (at > 0).then_some((at, why)),
+                                &f[6],
+                                f.get(7),
+                            ))
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            let Some((kind, key, n, k, stop, points, spread)) = fields
+                .filter(|&(kind, key, n, k, ..)| out.iter().all(|c| c.id() != (kind, key, n, k)))
+            else {
+                self.err(
+                    entry.span().start,
+                    format!("{what}, not {}", found(entry.get_ref())),
+                );
+                return None;
+            };
+            // A curve stopped at its first rows holds no point.
+            let empty = matches!(points.get_ref(), DeValue::Array(p) if p.is_empty());
+            let curve = if empty && stop.is_some() {
+                Vec::new()
+            } else {
+                self.curve(points, crate::fire::KERNEL_CURVES)?
+            };
+            // The points' spreads, `[rows, fraction at least zero]` each.
+            let spread = match spread.map(|s| s.get_ref()) {
+                None => Vec::new(),
+                Some(DeValue::Array(items)) => {
+                    let mut out = Vec::with_capacity(items.len());
+                    for item in items.iter() {
+                        let pair = match item.get_ref() {
+                            DeValue::Array(p) if p.len() == 2 => {
+                                let x = int(p[0].get_ref()).and_then(|v| u32::try_from(v).ok());
+                                let f = match p[1].get_ref() {
+                                    DeValue::Float(f) => f.as_str().replace('_', "").parse().ok(),
+                                    DeValue::Integer(_) => int(p[1].get_ref()).map(|i| i as f64),
+                                    _ => None,
+                                }
+                                .filter(|f: &f64| f.is_finite() && *f >= 0.0);
+                                x.zip(f)
+                            }
+                            _ => None,
+                        };
+                        match pair {
+                            Some(pair) => out.push(pair),
+                            None => {
+                                self.err(
+                                    item.span().start,
+                                    format!("{what}: a spread is [rows, fraction at least zero]"),
+                                );
+                                return None;
+                            }
+                        }
+                    }
+                    out
+                }
+                Some(_) => {
+                    self.err(
+                        entry.span().start,
+                        format!("{what}: the spreads are a list"),
+                    );
+                    return None;
+                }
+            };
+            out.push(crate::fire::KernelCurve {
+                kind,
+                key,
+                n,
+                k,
+                curve,
+                stop,
+                spread,
+            });
+        }
+        Some(out)
+    }
+
+    /// `rates.<key>` (`gemm_tflops_by_rows`, `attn_tflops_by_rows_keys`): `[outer, curve]`
     /// pairs, a whole positive outer key (a width, a row tile, rows) and a
     /// curve of `[x, TFLOP/s]` each, strictly ascending in the outer key.
     fn width_curves(
