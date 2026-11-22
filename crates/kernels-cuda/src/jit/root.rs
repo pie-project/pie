@@ -217,7 +217,7 @@ impl Root {
     }
 }
 
-const FLOAT_CONTRACT: &str = "fmad=false,prec-div=true,prec-sqrt=true";
+pub(crate) const FLOAT_CONTRACT: &str = "fmad=false,prec-div=true,prec-sqrt=true";
 
 /// The arch-specific twin of a plain `sm_XY` target, for the chips that
 /// have one: Hopper's `sm_90a`, the datacenter Blackwells' `sm_100a` and
