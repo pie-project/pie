@@ -910,7 +910,8 @@ pub struct EngineConfig {
     /// the next boot. `false` times nothing: each is served by the engine's
     /// estimate, named in the load log, and nothing is stored (`pie serve
     /// --no-measure`). Vulkan, wgpu, and a one-device cuda engine (CUDA or
-    /// ROCm).
+    /// ROCm); xla, whose load times nothing on the device, states it to the
+    /// runtime, which estimates the host cover rather than timing it.
     #[serde(default = "default_measure")]
     pub measure: bool,
     /// `[engine.memory]`: the optional caps for sharing a machine.
@@ -1087,10 +1088,13 @@ impl EngineConfig {
         self.memory.validate()?;
         ensure!(
             self.measure
-                || matches!(self.kind, EngineKind::Vulkan | EngineKind::Wgpu | EngineKind::Metal)
+                || matches!(
+                    self.kind,
+                    EngineKind::Vulkan | EngineKind::Wgpu | EngineKind::Metal | EngineKind::Xla
+                )
                 || (self.kind == EngineKind::Cuda && self.device.len() == 1),
-            "engine.measure = false skips the measurements a load takes on the vulkan, wgpu and \
-             metal engines and a one-device cuda engine; the {} engine{} still measures outside \
+            "engine.measure = false skips the measurements a load takes on the vulkan, wgpu, \
+             metal and xla engines and a one-device cuda engine; the {} engine{} still measures outside \
              that path (new-memory/FOLLOWUPS.md), so omit the key",
             self.kind.as_str(),
             if self.kind == EngineKind::Cuda {
@@ -1496,6 +1500,12 @@ device = ["metal:0"]
         assert!(!cfg.engine.measure);
         let mut cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
         cfg.skip_measuring().expect("metal skips");
+        assert!(!cfg.engine.measure);
+        let xla = MINIMAL_METAL
+            .replace("type = \"metal\"", "type = \"xla\"")
+            .replace("metal:0", "tpu:0");
+        let mut cfg: Config = toml::from_str(&xla).unwrap();
+        cfg.skip_measuring().expect("xla skips");
         assert!(!cfg.engine.measure);
         let cuda = MINIMAL_METAL
             .replace("type = \"metal\"", "type = \"cuda\"")

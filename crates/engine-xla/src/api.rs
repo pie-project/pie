@@ -55,6 +55,13 @@ pub struct DeviceBoot {
     /// `$PIE_HOME/profiles`, where a user's TPU profiles live.
     pub profiles: Option<PathBuf>,
 
+    /// `[xla] measure` (`[engine] measure`, `pie serve --no-measure`):
+    /// `false` states the load skips measuring. An XLA load times nothing
+    /// on the device (its profile is the chip's, tuned by `pie tune`); the
+    /// runtime then takes its estimates for what it would time at load
+    /// (the host cover), by name.
+    pub measure: bool,
+
     /// Device bytes the load leaves past its weights and pool for XLA's
     /// scratch; `None` takes the chip's (`chip::Tpu::headroom`).
     pub headroom: Option<u64>,
@@ -84,6 +91,7 @@ impl Default for DeviceBoot {
             plugin: None,
             ordinal: 0,
             profiles: None,
+            measure: true,
             headroom: None,
             seat_tokens: None,
             stream_weights: false,
@@ -461,6 +469,24 @@ impl Engine for Xla {
 
     fn device_facts(&self) -> Option<&DeviceFacts> {
         self.caps.as_ref().map(|caps| &caps.device)
+    }
+
+    fn cover_fingerprint(&self) -> Option<String> {
+        let print = self.shell.as_ref()?.cover_fingerprint();
+        tracing::info!(
+            fingerprint = %print,
+            "the host cover's key on this engine: the TPU, the kernels its programs lower \
+             through, the tuning and the compiler's flags"
+        );
+        Some(print)
+    }
+
+    fn committed_covers(&self) -> &'static [&'static str] {
+        crate::chip::COVERS
+    }
+
+    fn skips_measuring(&self) -> bool {
+        !self.boot.measure
     }
 
     fn load(&mut self, request: LoadRequest) -> EngineResult<Loaded> {

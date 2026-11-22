@@ -4,7 +4,7 @@ use crate::api::{ContractFor, DeviceBoot, Xla};
 
 pub fn open(config_bytes: &[u8], contract_for: ContractFor) -> Result<Xla, String> {
     let doc = parse(config_bytes)?;
-    Ok(Xla::new(device_boot(&doc), contract_for))
+    Ok(Xla::new(device_boot(&doc)?, contract_for))
 }
 
 fn parse(config_bytes: &[u8]) -> Result<toml::Table, String> {
@@ -18,9 +18,15 @@ fn table(doc: &toml::Table) -> Option<&toml::Table> {
     doc.get("xla").and_then(toml::Value::as_table)
 }
 
-fn device_boot(doc: &toml::Table) -> DeviceBoot {
+fn device_boot(doc: &toml::Table) -> Result<DeviceBoot, String> {
     let t = table(doc);
-    DeviceBoot {
+    let measure = match t.and_then(|t| t.get("measure")) {
+        None => true,
+        Some(toml::Value::Boolean(measure)) => *measure,
+        Some(other) => return Err(format!("[xla] measure is true or false, not {other}")),
+    };
+    Ok(DeviceBoot {
+        measure,
         plugin: t
             .and_then(|t| t.get("plugin"))
             .and_then(toml::Value::as_str)
@@ -49,5 +55,5 @@ fn device_boot(doc: &toml::Table) -> DeviceBoot {
             .map(str::trim)
             .filter(|p| !p.is_empty())
             .map(std::path::PathBuf::from),
-    }
+    })
 }

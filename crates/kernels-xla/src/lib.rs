@@ -1,3 +1,7 @@
+/// A fingerprint of this crate's sources, taken at build (`build.rs`):
+/// what the programs its ops lower to depend on beside their tuning.
+pub const SOURCE_FINGERPRINT: &str = env!("KERNELS_XLA_SOURCE_FINGERPRINT");
+
 pub mod attn;
 pub mod blocks;
 pub mod check;

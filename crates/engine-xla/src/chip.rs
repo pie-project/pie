@@ -359,6 +359,12 @@ macro_rules! seeded {
 
 seeded!("v5e.toml", "v6e.toml", "v7.toml");
 
+/// The host covers committed for TPUs (`profiles/<device>.covers.json`,
+/// `pie tune export --engine xla`), each listed here: the runtime takes a
+/// cover whose key matches where the home's own cache holds none
+/// (`engine::Engine::committed_covers`).
+pub const COVERS: &[&str] = &[];
+
 pub static SHELF: Shelf = Shelf {
     backend: "xla",
     seeded: SEEDED,
