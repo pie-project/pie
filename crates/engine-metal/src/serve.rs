@@ -2563,6 +2563,11 @@ impl Shell {
                 }
             }
         }
+        tracing::info!(
+            shapes = shapes.len(),
+            unbuilt = unbuilt.len(),
+            "metal: the walk's matmul shapes route only to kernels it built"
+        );
         if let Some(first) = unbuilt.first() {
             return Err(Fault::Param {
                 name: "kernel.dense".to_string(),
