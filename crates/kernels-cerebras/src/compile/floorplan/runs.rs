@@ -47,6 +47,15 @@ pub fn plan(s: &Shape, pr: &Preset) -> R<Plan> {
             _ => None,
         })
         .ok_or("runs: no sliding layer")?;
+    // what the cut lays ([`crate::compile::tiles::runs`]): whole scores segments, every hidden
+    // dim a slot
+    if swa == 0 || !px.is_multiple_of(swa) {
+        return Err(format!("runs: {px} columns in segments of {swa}"));
+    }
+    let slots = ra.min(py) * hca + py.saturating_sub(ra) * hcw;
+    if slots < s.hidden {
+        return Err(format!("runs: {slots} hidden slots for {}", s.hidden));
+    }
     let groups = groups_split(py, py / 2, ra, pr.need("GA")?, pr.need("GW")?);
     let g2 = pr.need("G2")?;
     let plan = Plan {

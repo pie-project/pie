@@ -25,8 +25,23 @@ pub fn plan(s: &Shape, pr: &Preset) -> R<Plan> {
         return Err(format!("stacked: {n} layers on {nu} units"));
     }
     let k = n / nu;
-    if !s.hidden.is_multiple_of(py) {
+    if !s.hidden.is_multiple_of(py) || !py.is_multiple_of(2) {
         return Err(format!("stacked: {} hidden over {py} rows", s.hidden));
+    }
+    // what the cut lays ([`crate::compile::tiles::stacked`]): a per-layer input a column, one or
+    // two KV heads, every layer's MLP even over the columns, a store in each unit column
+    let ple = s.ple.ok_or("stacked: no per-layer inputs")?.width;
+    if ple != px || !(1..=2).contains(&s.attn.kv_heads) || nu < 2 {
+        return Err(format!(
+            "stacked: PLE {ple} on {px} columns, {} KV heads, {nu} units",
+            s.attn.kv_heads
+        ));
+    }
+    if let Some(l) = (0..n).find(|&l| !s.mlp.width(l).is_multiple_of(px)) {
+        return Err(format!(
+            "stacked: layer {l}'s MLP {} over {px} columns",
+            s.mlp.width(l)
+        ));
     }
     let window = s
         .layers
@@ -202,10 +217,17 @@ impl Arrangement {
 
 #[cfg(test)]
 mod tests {
-    /// A Gemma 4 model plans by the search, on the derived arrangement: the one-layer E4B mini.
+    /// A Gemma 4 model plans by the search, on the derived arrangement: the six-layer E4B mini;
+    /// the one-layer one, whose second unit column would store no per-layer inputs, finds none.
     #[test]
     fn a_shape_with_a_derived_arrangement_plans() {
-        let p = crate::compile::target::searched("gemma4-e4b-mini-l1-bf16-kv-bf16").plan;
+        let p = crate::compile::target::searched("gemma4-e4b-mini-l6-bf16-kv-bf16").plan;
         crate::compile::program::Program::of(p).unwrap();
+        let t = poem_compiler::catalog::repository()
+            .parse("gemma4-e4b-mini-l1-bf16-kv-bf16")
+            .unwrap()
+            .trace(poem_ir::Platform::Cerebras);
+        let e = crate::compile::target::plan(&t, &crate::compile::target::Ask::default());
+        assert!(e.is_err_and(|e| e.contains("the search found no partition")));
     }
 }
