@@ -297,6 +297,28 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     let room_line = room_line(boot.allowance, ceiling, total - free, weight_tier, after_weights);
     eprintln!("engine-cuda: {room_line}");
     let after_weights = held_beside(boot, after_weights)?;
+    // A declared context is the model's, not the operator's: it is served at
+    // the longest one sequence of which takes half the room this line leaves
+    // (this process's context and modules already out of it), and the fit
+    // shortens it further where the load does not seat it
+    // (`Pools::declare_context`); a card that seats none is refused by name.
+    if boot.context_declared {
+        let fits = crate::store::declared_context_within(
+            &boot.trace,
+            boot.page_size,
+            boot.context,
+            after_weights,
+        )?;
+        if fits < boot.context {
+            eprintln!(
+                "engine-cuda: the model declares a {}-token context and one sequence at it \
+                 takes more than half of the room the load has past the weights; serving \
+                 {fits} tokens. State `[engine] max_context` to choose.",
+                boot.context
+            );
+            boot.context = fits;
+        }
+    }
     let facts = kv::probe(&boot.trace)?;
     let derive_voxels = boot
         .voxels

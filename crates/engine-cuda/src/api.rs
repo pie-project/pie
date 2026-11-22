@@ -721,27 +721,8 @@ impl Engine for Cuda {
                 size.piece >> 20
             );
         }
-        let mut budgets = budgets;
-        if budgets.context_declared && kv_budget.is_none() {
-            let fits = crate::store::declared_context_that_fits(
-                &trace,
-                budgets.page_size,
-                budgets.max_context,
-                residency.device,
-                plan.device_demand(),
-            )
-            .map_err(fault)?;
-            if fits < budgets.max_context {
-                eprintln!(
-                    "engine-cuda: the model declares a {}-token context and one sequence at it \
-                     takes more than half of what the load's allowance leaves past the weights; \
-                     serving {fits} tokens. State `[engine] max_context` to choose.",
-                    budgets.max_context
-                );
-                budgets.max_context = fits;
-            }
-        }
-
+        // A declared context is cut to the load's room where the load reads
+        // it, past this process's context and modules (`Shell::stage`).
         let patches = patch_ladder(&trace, &budgets);
         let voxels = poem_compiler::VoxelLadder::of(
             &trace,
@@ -795,11 +776,13 @@ impl Engine for Cuda {
         let mut shell = staged.finish().map_err(fault)?;
 
         shell.mount_adapters(self.boot.adapter_dir.clone());
+        // The context the load serves, a declared one as the load's room cut it.
+        let context = shell.paging().context();
         shell
             .seat_host_kv(
                 residency.host_kv_budget,
                 residency.kv_seats.unwrap_or(budgets.max_lanes),
-                budgets.max_context,
+                context,
                 ranks,
                 ring,
             )
@@ -815,7 +798,7 @@ impl Engine for Cuda {
                 residency.disk_kv_dir.as_deref(),
                 residency.disk_kv_persistent,
                 residency.kv_seats.unwrap_or(budgets.max_lanes),
-                budgets.max_context,
+                context,
                 self.boot.world,
             )
             .map_err(fault)?;
