@@ -1631,7 +1631,7 @@ async fn bind(ctx: &Ctx, pid: ProcessId, program: u32) -> Result<InstanceId, Str
             let (at, count) = *tries.lock().unwrap();
             let count = if at == step { count + 1 } else { 1 };
             *tries.lock().unwrap() = (step, count);
-            let bound = (|| {
+            let taken = (|| {
                 if count > SPIN {
                     let short = take_bind_error(&roles, &engine, &binding, pid);
                     anyhow::bail!(
@@ -1640,14 +1640,23 @@ async fn bind(ctx: &Ctx, pid: ProcessId, program: u32) -> Result<InstanceId, Str
                     );
                 }
                 let mut engine = engine.lock().unwrap();
-                let taken = crate::store::roles::take_bind(
+                crate::store::roles::take_bind(
                     Some(&roles),
                     &mut *engine,
                     &binding,
                     |_| false,
                     Some(pid),
                     |pid| ctx.planner.is_resident(pid),
-                )?;
+                )
+            })();
+            let (roles, engine, binding) = (roles.clone(), engine.clone(), binding.clone());
+            async move {
+                let taken = taken?;
+                // The lane takes the slots, and the engine binds them after,
+                // the roles' lock let go between: parks, restores and closes
+                // of the pair's other members land in that window.
+                tokio::task::yield_now().await;
+                let mut engine = engine.lock().unwrap();
                 crate::store::roles::bind_taken(
                     Some(&roles),
                     &mut *engine,
@@ -1655,8 +1664,7 @@ async fn bind(ctx: &Ctx, pid: ProcessId, program: u32) -> Result<InstanceId, Str
                     Some(pid),
                     taken,
                 )
-            })();
-            async move { bound }
+            }
         },
         || planner.wait_resident(pid),
         // A segment commit for its run, as the runtime's lane waits on it
@@ -2478,13 +2486,24 @@ fn replay_seed(seed: u64) -> Vec<Failure> {
 /// fixed, each with a seed that showed it (its regression test below,
 /// ignored until fixed). The fast sweep fails on any other shape; once a
 /// shape is fixed its entry goes and its test is no longer ignored.
-const KNOWN: [(&str, u64); 1] = [
+const KNOWN: [(&str, u64); 3] = [
     // Every tier full, no idle cache: device 14 chunks, host 3, disk 6, the
     // fleet's state past all three, each resident a page short and nothing
     // with room below to move to (copies through a ring of one piece let
     // more processes in before the first moves landed). A capacity deadlock
     // admission lets in, not a wait the planner chose.
     ("stall bind room: placement none, moves none, host_short true", 3243),
+    // The same class with a bind's take and its bind apart: the device
+    // full, the residents a page short each, every one's kv past the few
+    // swap slots left (host_swap_blocked), the rest evicted and queued.
+    (
+        "stall allocation: placement none, moves some, host_short false, ended \"every candidate blocked",
+        134,
+    ),
+    (
+        "stall allocation: placement none, moves some, host_short true, ended \"no room below for the head's own kv",
+        93,
+    ),
 ];
 
 /// Shapes the simulation found and the runtime fixed, each seed's
@@ -2707,6 +2726,18 @@ fn sim_seed_3392_a_waiter_s_guest_parts_park_with_its_kv_in_place() {
 #[ignore = "known: a capacity deadlock across every tier (KNOWN[0])"]
 fn sim_seed_3243_every_tier_full_is_no_deadlock() {
     regression(KNOWN[0]);
+}
+
+#[test]
+#[ignore = "known: a capacity deadlock across every tier (KNOWN[1])"]
+fn sim_seed_134_residents_past_the_swap_left_are_no_deadlock() {
+    regression(KNOWN[1]);
+}
+
+#[test]
+#[ignore = "known: a capacity deadlock across every tier (KNOWN[2])"]
+fn sim_seed_93_a_head_s_own_kv_past_the_swap_left_is_no_deadlock() {
+    regression(KNOWN[2]);
 }
 
 /// What a run did, as a string two runs of one seed must agree on.

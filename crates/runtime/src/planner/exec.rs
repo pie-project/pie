@@ -871,10 +871,27 @@ pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     // host has room; what it lacks stays on the device, never dropped. Its
     // guest scratch, dead between fires, is given back whatever lies below:
     // a process with nothing else to move still frees its Instance chunks.
-    let roles = stores
-        .roles
-        .as_ref()
-        .and_then(|roles| roles.lock().unwrap().prepare_park(pid));
+    // A bind of its on its way (taken, the engine's bind still to land)
+    // lands first: its instance parks with the rest. Parked under it, the
+    // instance stood on the device outside the park and its pair's slots
+    // went to another bind ([`crate::store::roles::Roles::binds_on_way`]).
+    let roles = match stores.roles.as_ref() {
+        Some(roles) => loop {
+            let landed = roles.lock().unwrap().bind_landed();
+            let notified = landed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut held = roles.lock().unwrap();
+                if !held.binds_on_way(pid) {
+                    break held.prepare_park(pid);
+                }
+            }
+            tracing::debug!(%pid, "planner: an eviction waits for its bind on its way");
+            notified.await;
+        },
+        None => None,
+    };
     if kv.is_none() && rs.is_none() && roles.is_none() {
         if !rs_short.is_zero() {
             // The host lacks rows for its state: nothing moves and nothing

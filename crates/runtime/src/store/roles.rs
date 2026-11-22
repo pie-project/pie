@@ -674,6 +674,8 @@ pub struct Taken {
     /// The slots of an `Instance` chunk: a whole part's chunks are its
     /// refs over it.
     chunk_slots: u32,
+    /// The process whose bind took it ([`Roles::binds_on_way`]).
+    holder: Option<Holder>,
 }
 
 /// A bind's guest state taken before it registered anything
@@ -953,6 +955,11 @@ pub struct Roles {
     generations: u64,
     /// Slots out of service for good ([`Self::abandon`]).
     leaked: u64,
+    /// Binds taken and not yet bound or given back, by process
+    /// ([`Self::binds_on_way`]): a park of the process waits for them.
+    binding: HashMap<Holder, u32>,
+    /// Told each time one of those lands ([`Self::bind_landed`]).
+    bind_landed: Arc<tokio::sync::Notify>,
 }
 
 /// Device room given back: a count of the gives, and their event.
@@ -1022,6 +1029,8 @@ impl Roles {
             chunk_slots,
             stated: std::collections::HashSet::new(),
             freed: Arc::default(),
+            binding: HashMap::new(),
+            bind_landed: Arc::default(),
             guest_waiter: None,
             generations: 0,
             leaked: 0,
@@ -2384,8 +2393,51 @@ impl Roles {
         );
     }
 
+    /// A bind of `holder`'s was taken: it is on its way until bound or
+    /// given back.
+    fn bind_taken_for(&mut self, holder: Option<Holder>) {
+        if let Some(holder) = holder {
+            *self.binding.entry(holder).or_default() += 1;
+        }
+    }
+
+    /// A bind of `holder`'s was bound or given back.
+    fn bind_ended_for(&mut self, holder: Option<Holder>) {
+        let Some(holder) = holder else {
+            return;
+        };
+        if let Some(count) = self.binding.get_mut(&holder) {
+            *count -= 1;
+            if *count == 0 {
+                self.binding.remove(&holder);
+            }
+        }
+        self.bind_landed.notify_waiters();
+    }
+
+    /// Whether a bind of `holder`'s is on its way: taken, its slots and
+    /// its pair held, and not yet bound by the engine or given back. A
+    /// park of `holder` waits for it ([`Self::bind_landed`]): parked
+    /// meanwhile, the instance it binds stood on the device outside its
+    /// process's park, its pair given fresh slots at a restore the
+    /// instance's bind never named, and those slots went to another
+    /// program's bind (the simulation, a yield between a bind's take and
+    /// its bind: `guest::claims` refused an instance over a live pair's
+    /// run, the L40S's claims refusals at 3 GiB).
+    #[must_use]
+    pub fn binds_on_way(&self, holder: Holder) -> bool {
+        self.binding.contains_key(&holder)
+    }
+
+    /// Told each time a bind on its way is bound or given back.
+    #[must_use]
+    pub fn bind_landed(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.bind_landed)
+    }
+
     /// The bind of `taken` failed: its slots go back.
     pub fn untake(&mut self, taken: Taken) {
+        self.bind_ended_for(taken.holder);
         self.pin_shared(&taken, false);
         let shared = [
             taken.adapter.as_ref().map(|(key, ..)| Owner::Adapter(*key)),
@@ -2470,6 +2522,7 @@ impl Roles {
 
     /// The engine bound `taken` as instance `id`, for `holder`.
     pub fn bound(&mut self, id: InstanceId, holder: Option<Holder>, taken: Taken) {
+        self.bind_ended_for(taken.holder);
         self.pin_shared(&taken, false);
         for &channel in &taken.channels {
             if let Some(item) = self.items.get_mut(&Owner::Channel(channel)) {
@@ -3676,6 +3729,7 @@ pub fn take_bind(
     let Some(roles) = roles else {
         return Ok(None);
     };
+    let roles_handle = roles;
     if let Some(holder) = holder.filter(|&holder| !resident(holder)) {
         return Err(RolesError::HolderParked(holder).into());
     }
@@ -3689,7 +3743,7 @@ pub fn take_bind(
     let mut roles = roles.lock().unwrap();
     let guest = roles.take_guest(&binding.channels, (pair, state), holder)?;
     let fresh = guest.fresh_runs();
-    let taken = roles
+    let mut taken = roles
         .take_instance(
             binding.program,
             &binding.channels,
@@ -3698,6 +3752,17 @@ pub fn take_bind(
             guest,
         )
         .map_err(|(error, opened)| roles.bind_short(error, fresh, opened))?;
+    taken.holder = holder;
+    roles.bind_taken_for(holder);
+    drop(roles);
+    // Read again past the take: a park that began since the first read
+    // either saw this bind on its way and waits for it, or parked before
+    // it was taken, and then the holder reads parked here and the take
+    // goes back.
+    if let Some(holder) = holder.filter(|&holder| !resident(holder)) {
+        roles_handle.lock().unwrap().untake(taken);
+        return Err(RolesError::HolderParked(holder).into());
+    }
     Ok(Some(taken))
 }
 

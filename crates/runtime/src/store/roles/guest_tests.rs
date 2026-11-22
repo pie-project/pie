@@ -3580,3 +3580,43 @@ fn a_bind_of_a_process_not_resident_waits_for_its_restore() {
     );
     assert_eq!(held(&device), before, "nothing taken");
 }
+
+/// A bind taken for a process is on its way until the engine's bind lands
+/// or it is given back: a park of that process waits for it
+/// ([`Roles::binds_on_way`], the planner's eviction), so the instance parks
+/// with the rest. Parked under it, the instance stood on the device outside
+/// its process's park and its pair's run went to another program's bind
+/// (the simulation with a yield between take and bind: `guest::claims`
+/// refused binds over a live pair's run in nine seeds of 5000). A process
+/// whose park began after the take's first read is refused past the take,
+/// and the take goes back.
+#[test]
+fn a_bind_on_its_way_holds_its_process_s_park_until_it_lands() {
+    let Pools { device, roles } = pools(64);
+    let mut engine = GuestEngine::new(2 * CHUNK, PAIR);
+    learn_program(&roles, &mut engine, PROGRAM).unwrap();
+    let binding = InstanceBinding {
+        program: PROGRAM,
+        ..InstanceBinding::default()
+    };
+    let taken = take_bind(Some(&roles), &mut engine, &binding, |_| false, Some(holder(2)), |_| true)
+        .unwrap()
+        .expect("slots taken");
+    assert!(roles.lock().unwrap().binds_on_way(holder(2)), "on its way");
+    bind_taken(Some(&roles), &mut engine, &binding, Some(holder(2)), Some(taken)).unwrap();
+    assert!(!roles.lock().unwrap().binds_on_way(holder(2)), "landed");
+    // Resident at the first read, parked by the second: the take goes back.
+    let before = held(&device);
+    let reads = std::cell::Cell::new(0);
+    let error = take_bind(Some(&roles), &mut engine, &binding, |_| false, Some(holder(3)), |_| {
+        reads.set(reads.get() + 1);
+        reads.get() == 1
+    })
+    .expect_err("parked past the take");
+    assert!(
+        matches!(short_of_wait(&error), Some(RolesError::HolderParked(by)) if *by == holder(3)),
+        "{error:#}"
+    );
+    assert!(!roles.lock().unwrap().binds_on_way(holder(3)));
+    assert_eq!(held(&device), before, "the take went back");
+}
