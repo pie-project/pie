@@ -2596,9 +2596,11 @@ impl<B: Serve> Shell<B> {
             if !matches!(why, Fault::Program { .. }) {
                 return Err(why);
             }
+            // The refusal names the class and the guest input that blocked it.
             tracing::warn!(
                 %why,
-                "dense settle: a fire refused; the curves' kernels serve the ranges it did not settle"
+                "dense settle: a fire refused; the curves' kernels serve the ranges it did not \
+                 settle"
             );
             self.say_served("settle stopped short", replaced);
             return Ok(());
@@ -4618,9 +4620,9 @@ impl<B: Serve> Shell<B> {
                     return Err(program(
                         "serve::feed_inputs",
                         format!(
-                            "lane {} runs in a class that reads guest input {}, and the lane \
-                             feeds no channel for it",
-                            row.source, seat.id
+                            "lane {} runs in class {}, which reads guest input {}, and the \
+                             lane feeds no channel for it",
+                            row.source, row.class, seat.id
                         ),
                     ));
                 };
