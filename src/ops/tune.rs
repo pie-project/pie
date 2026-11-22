@@ -73,7 +73,8 @@ pub enum TuneCmd {
     /// `crates/engine-<backend>/profiles/`, a load of that device takes each
     /// entry whose key matches and measures nothing more for it.
     Export {
-        /// The engine whose stored measurements to write: `vulkan`, `wgpu`.
+        /// The engine whose stored measurements to write: `vulkan`, `wgpu`,
+        /// `cuda` (CUDA or ROCm, as the build hosts it).
         #[arg(long)]
         engine: String,
         /// The device, by number (`vulkan:<n>`); the first without it.
