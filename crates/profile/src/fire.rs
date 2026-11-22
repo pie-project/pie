@@ -291,6 +291,8 @@ pub struct KernelCurve {
 impl KernelCurve {
     pub const VECTOR: u32 = 1;
     pub const TILE: u32 = 2;
+    /// A tensor-op (Metal 4 MPP) tile, `key` its row tile: Metal's.
+    pub const MPP: u32 = 3;
     pub const BOUND: u32 = 1;
     pub const BUFFER: u32 = 2;
     pub const BEATEN: u32 = 3;

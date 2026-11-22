@@ -1156,20 +1156,27 @@ What each still times at load or boot, for its owner (paths under `crates/`):
   - Open, CUDA: `stored::backend` for `not(rocm)` keys by device name and method alone (no driver, cuBLASLt or
     cubin codes): the L40S fills it. Committed: `amd-instinct-mi300x-vf.measured.toml` (`cached_gbps`,
     `product_ns`).
-- **engine-metal**
-  - Roofline `[rates]`: `rates::at_load` `engine-metal/src/rates.rs:587` -> `rates_at_load` (timing `measure`
-    :611). Unkeyed as CUDA's (`measured_on` / `measured_by` None), resolved by `SHELF.resolve` (`chip.rs:231`).
-  - `kernel.dense` crossover per model: `tune::dense::at_load` `engine-metal/src/tune/dense.rs:570` (timing
-    `measure_at` :216, fit `fit_at` :403), its own file `<profiles>/metal/dense/<device>-<key>.toml`, keyed by its
-    own FNV `load_key` :496 (device name, OS build, gemm sources, the model's shapes; no method version). The
-    engine-gpu counterparts are `kernel_tflops_by_shape_keyed` + `dense_settled_keyed`: port it to those keys.
+- **engine-metal**: ported (sc/macpro-committed-profiles). `chip::resolve_keyed` resolves through
+  `Shelf::resolve_keyed` under `stored::Keys` (`on` = `metal <device> macOS <major>`; each `[rates]` key and dense curve
+  keyed by its method and the resolved Metal source of every file its measurement fired, recorded by
+  `encode::record_fired`); `rates::at_load` takes `Measuring` through `resolve_at_load`; `tune::dense::at_load` keeps
+  the per-model crossover as `kernel_tflops_by_shape_keyed` curves (vector forms `1/8`, simdgroup tiles `2/0`,
+  tensor-op tile `3/32`, `KernelCurve::MPP`) in the user file, the ladder fitted from them each load (no
+  `dense_settled`: the fit is the settle, recomputed from the curves); `[metal] measure = false` skips both (the fire
+  top a decode fire of the lanes where no roofline is stated); `cover_fingerprint` keys on `on` and every decision's
+  resolved rungs. Committed: `apple-m5-pro.measured.toml` (Qwen3-0.6B, Qwen3.5-0.8B, Gemma 4 E4B shapes). The
+  runtime host cover is committed beside a device's profile on sc/gpu-committed-profiles-2 (below).
 - **engine-xla**: nothing timed at load and stored (the guest compile ledger `guest/run.rs:198` is in-process RSS).
   No `cover_fingerprint`, so the runtime re-times its host cover every boot (below).
 - **runtime host cover**: `host_cover` `runtime/src/bootstrap.rs:1062` (called :1021), timing `measure_host_cover`
   :1125 (warm `compat-openai` runs at depth 1), cached in `<cache>/cover/<fnv>.json` keyed by every engine's
-  `cover_fingerprint` + deployment + sampler hash + frame + depth + context. Not under `[rates]`, not committed,
-  not skipped: a `measure = false` boot still runs its warm runs on a clean home. engine-cuda / engine-xla /
-  engine-cerebras state no fingerprint (`engine/src/engine.rs:199` default None): measured every boot, nothing kept.
+  `cover_fingerprint` + deployment + sampler hash + frame + depth + context. Committed (sc/gpu-committed-profiles-2):
+  `<device>.covers.json` beside the device's measured profile, written by `pie tune export` from the home's cache
+  (entries whose key names the device's `measured_on`), listed in the backend's `COVERS`
+  (`Engine::committed_covers`); looked up home cache > committed > measured. Under `measure = false` (every engine)
+  the dispatch depth is taken by name in place of the warm runs (a cover too large costs window, never a result).
+  Open: only engine-gpu lists committed covers; engine-cuda / engine-xla / engine-cerebras state no fingerprint
+  (`Engine::cover_fingerprint` default None): measured every boot, nothing kept.
 - **engine-gpu, closed on sc/gpu-committed-profiles-2**: under `measure = false` on a platform stating a submit
   bound (Android, Windows TDR) with no roofline stated or committed, the load times only what the bound's estimate
   reads (`engine_gpu::rates::for_bound`: a short launch chain, a one-row and a widest-rung matmul over the model's

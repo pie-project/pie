@@ -34,6 +34,9 @@ pub struct DeviceBoot {
     pub adapter_dir: Option<std::path::PathBuf>,
     /// `$PIE_HOME/profiles`, where a user's device profiles live.
     pub profiles: Option<std::path::PathBuf>,
+    /// `[metal] measure`: whether a load times what no stored or committed
+    /// profile states under a matching key.
+    pub measure: engine::rates::Measuring,
 }
 
 struct PendingStep {
@@ -592,6 +595,7 @@ impl Engine for Metal {
                     residency: experts::Plan::default(),
                     profiles: self.boot.profiles.clone(),
                     top: crate::Top::Ruled,
+                    measure: self.boot.measure,
                 })
                 .map_err(fault)?;
                 let narrower = (budgets.max_tokens / 2).max(MIN_FITTED_FORWARD_TOKENS);

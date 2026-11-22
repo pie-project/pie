@@ -12,6 +12,7 @@ fn an_operator_declared_adapter_is_refused() {
         DeviceBoot {
             adapter_dir: None,
             profiles: None,
+            measure: engine::rates::Measuring::Time,
         },
         |_, _| Err("no contract: nothing loads here".to_string()),
     );

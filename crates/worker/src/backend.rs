@@ -590,6 +590,7 @@ pub(crate) fn create_engine_backend(
                 "profiles = {}\n",
                 toml::Value::String(home.join("profiles").display().to_string())
             ));
+            boot_doc.push_str(&format!("measure = {measure}\n"));
             if let Some(mount) = adapter_dir {
                 boot_doc.push_str(&format!(
                     "\n[model]\nadapter_dir = {}\n",
