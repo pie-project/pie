@@ -869,3 +869,150 @@ fn an_evacuation_moves_a_kept_park_s_claim_and_tables() {
             .expect("the instance closes");
     }
 }
+
+/// A pair whose every member is parked while an evacuation moves its runs
+/// is laid again where they lie now: instance A parks (its pair's members
+/// all parked), the chunk holding the pair moves, and another chunk moves
+/// onto the bytes it left. B then binds at the same pair and taking, and A
+/// comes back at it; both fire and answer as A did before the move.
+/// Unmoved, the pair's tables would stand at the old bytes, another chunk's
+/// now, and the fires would read them.
+#[test]
+fn a_pair_whose_members_are_all_parked_is_laid_again_where_a_move_left_it() {
+    if !engine_cuda::device::present() {
+        eprintln!("no CUDA device: skipping");
+        return;
+    }
+    let trace = poem::trace_hybrid("guest-pair-relay", &Micro, Platform::Cuda);
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let path = Weights::random(&trace, 4271).write(dir.path());
+    let word = trace.facts.word(&Request::new(ROWS, false));
+    let tokens: Vec<Vec<u32>> = vec![vec![13]];
+
+    let mut shell = shell(trace, &path);
+    let facts = shell.chunk_facts().expect("the chunk facts");
+    let segments = facts.segments.committed.max(1);
+    shell
+        .commit_segments(segments)
+        .expect("the first segment commits");
+    let committed = segments * facts.segment_chunks;
+    let mut guest = crate::guest::Guest::of(&facts, committed);
+    let per_chunk = facts
+        .shapes
+        .iter()
+        .find(|shape| shape.role == engine::chunk::SlotRole::Instance)
+        .expect("the load states the Instance shape")
+        .slots_per_chunk;
+    let program = register(&mut shell);
+    let extents = Extents {
+        row_count: 1,
+        sampled_rows: 1,
+        query_len: 1,
+        ..Extents::default()
+    };
+    let state = shell
+        .guest_state(program, extents)
+        .expect("the program's guest state");
+    let bind = |shell: &mut Shell,
+                slots: (Vec<u32>, Vec<engine::program::RingSlots>),
+                scratch: &engine::ScratchPlace,
+                pair: &engine::ScratchPlace| {
+        shell.bind_program(
+            program,
+            &[],
+            extents,
+            GeometryClass::Host,
+            PortMask::NONE,
+            &[None],
+            &[engine::ChannelId(1)],
+            engine_cuda::program::Slots {
+                instance: slots.0,
+                rings: slots.1,
+                scratch: scratch.clone(),
+                pair: pair.clone(),
+                pair_generation: 1,
+            },
+        )
+    };
+    let attach = |instance| {
+        [Attached {
+            lane: 0,
+            lanes: 1,
+            instance,
+            adapter_only: false,
+        }]
+    };
+    // The cell the instance's epilogue put: what reads the pair's tables.
+    let put = |shell: &mut Shell, instance| {
+        let cell = shell
+            .program_instance(instance)
+            .expect("the instance settles")
+            .expect("the instance")
+            .take(0)
+            .expect("its channel reads")
+            .expect("its epilogue put a cell");
+        i32::from_le_bytes(cell[..4].try_into().expect("an i32 cell"))
+    };
+
+    let (scratch, pair) = guest.places((program, extents), &state);
+    let engine::ScratchPlace::Run { first, .. } = pair else {
+        panic!("a small guest's pair lies in a run of Instance slots: {pair:?}");
+    };
+    let a_slots = guest.slots(
+        &shell.program_facts(program).expect("the program's facts"),
+        |_| false,
+    );
+    let a = bind(&mut shell, a_slots.clone(), &scratch, &pair).expect("A binds");
+    let want = fire(&mut shell, word, &tokens, &attach(a));
+    shell.drain().expect("the device drains");
+    let wanted = put(&mut shell, a);
+
+    shell.park_program(a, false).expect("A parks: every member of its pair parked");
+    // The pair's chunk onto the last chunk of state backed, then another
+    // chunk onto the bytes it left: the old bytes are another chunk's.
+    let held = first / per_chunk;
+    let last = committed.min(facts.state_chunks() + 1) - 1;
+    let other = last - 1;
+    assert!(held != last && held != other, "the pair's chunk is not a test's spare");
+    shell
+        .evacuate(&engine::chunk::Evacuation { moves: vec![(held, last)] })
+        .expect("the pair's chunk moves while every member is parked");
+    shell
+        .evacuate(&engine::chunk::Evacuation { moves: vec![(other, held)] })
+        .expect("another chunk moves onto the bytes it left");
+
+    // B joins the pair at its taking; A comes back at it.
+    let (b_scratch, _) = guest.places((program, "b"), &state);
+    let b_slots = guest.slots(
+        &shell.program_facts(program).expect("the program's facts"),
+        |_| false,
+    );
+    let b = bind(&mut shell, b_slots, &b_scratch, &pair).expect("B binds at the pair's taking");
+    let got_b = fire(&mut shell, word, &tokens, &attach(b));
+    shell.drain().expect("the device drains");
+    let b_put = put(&mut shell, b);
+    let (a_scratch, _) = guest.places((program, "a again"), &state);
+    shell
+        .rebind_program(
+            a,
+            engine_cuda::program::Slots {
+                instance: a_slots.0,
+                rings: a_slots.1,
+                scratch: a_scratch,
+                pair: pair.clone(),
+                pair_generation: 1,
+            },
+        )
+        .expect("A comes back at the pair's taking");
+    let got_a = fire(&mut shell, word, &tokens, &attach(a));
+    shell.drain().expect("the device drains");
+    assert_eq!(got_b, want, "B's logits are A's before the move");
+    assert_eq!(got_a, want, "A's logits are its own before the move");
+    assert_eq!(b_put, wanted, "B's epilogue reads the pair where the move left it");
+    assert_eq!(put(&mut shell, a), wanted, "A's epilogue reads the pair where the move left it");
+    for instance in [a, b] {
+        shell
+            .close_program_instance(instance)
+            .expect("the instance closes");
+    }
+}

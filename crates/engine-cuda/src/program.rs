@@ -760,6 +760,15 @@ impl Plane {
             batch.base = base;
             batch.stale = true;
             clears.push((&slots.pair, base, batch.room.bytes()));
+        } else {
+            // The same taking, joined as it stands: its tables are laid
+            // again where its runs lie now, should a move have left them
+            // elsewhere while no member was live.
+            let base = piece_at(&slots.pair, batch.room.bytes(), span)?;
+            if base != batch.base {
+                batch.base = base;
+                batch.stale = true;
+            }
         }
         clear_state(&clears, stream)?;
         let program = &*program;
@@ -901,11 +910,25 @@ impl Plane {
             bound.scratch = piece_at(&bound.slots.scratch, room.instance_bytes(), span)?
                 .next_multiple_of(launch::SPAN_ALIGN);
         }
+        // Every bound pair's base where the evacuation left its runs, its
+        // members parked or not: a member that binds or comes back at the
+        // same taking finds its tables laid where its runs lie now, never at
+        // bytes the move handed on. A pair none live holds may lie in slots
+        // given back; where they no longer resolve, it is laid again at the
+        // next bind that names them.
         for (program_id, program) in &mut self.programs {
-            for batch in program.batches.iter_mut().filter(|batch| {
-                batch.bound > 0 && live.contains(&(*program_id, batch.extents))
-            }) {
-                let base = piece_at(&batch.pair, batch.room.bytes(), span)?;
+            for batch in program.batches.iter_mut().filter(|batch| batch.bound > 0) {
+                let base = if live.contains(&(*program_id, batch.extents)) {
+                    piece_at(&batch.pair, batch.room.bytes(), span)?
+                } else {
+                    match piece_at(&batch.pair, batch.room.bytes(), span) {
+                        Ok(base) => base,
+                        Err(_) => {
+                            batch.stale = true;
+                            continue;
+                        }
+                    }
+                };
                 if base != batch.base {
                     batch.base = base;
                     batch.stale = true;
