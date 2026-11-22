@@ -1210,12 +1210,15 @@ fn median(mut v: Vec<u64>) -> u64 {
 
 /// Each of `kernels` timed at `rows` of one `n x k` plane, [`REPEATS`]
 /// rounds interleaved (each kernel's fire in turn): every fire's time, ns, a
-/// kernel. Each fire reads the next plane of a rotation past the last-level
-/// cache and writes one output, as a curve's point does; a fire the device's
-/// bound on one submission refuses is timed on a slice of the plane's
-/// columns (halved until admitted, its time carried to the whole plane), a
-/// sample read below its launches or refused at every slice left out. What
-/// a dense settle weighs a range by where it times no whole served step.
+/// kernel, carried to the whole plane. Each fire is a submission of its own
+/// over `n / pieces[i]` of the plane's columns (the pieces the caller cut
+/// so each fits the device's bound on one submission at its least clock),
+/// reading the next plane of a rotation past the last-level cache and
+/// writing one output, as a curve's point does. A piece the rig's own
+/// admission still refuses is halved until admitted; a sample read below
+/// its launches, or refused at every piece, is left out. What a dense
+/// settle weighs a range by where it times no whole served step.
+#[allow(clippy::too_many_arguments)]
 pub fn time_kernels<B: Serve, T: Tactics + ?Sized>(
     device: &B::Context,
     tactics: &T,
@@ -1224,6 +1227,7 @@ pub fn time_kernels<B: Serve, T: Tactics + ?Sized>(
     max_submit: Option<std::time::Duration>,
     launch: f64,
     kernels: &[kernels_slang::linear::gemm::Tactic],
+    pieces: &[u32],
     (n, k): (u32, u32),
     rows: u32,
 ) -> Result<Vec<Vec<f64>>> {
@@ -1240,31 +1244,89 @@ pub fn time_kernels<B: Serve, T: Tactics + ?Sized>(
     let weights = rig.views(&slab, planes, n, k, Dtype::Bf16)?;
     let y = (2 * u64::from(rows) * u64::from(n)).next_multiple_of(VIEW_ALIGN);
     let ys = rig.slab(y, y, false)?;
-    let touched = Touched::default();
+    let nothing = |_: &mut B::Frame| Ok(());
     let mut samples: Vec<Vec<f64>> = vec![Vec::new(); kernels.len()];
-    let mut split: Vec<u32> = vec![1; kernels.len()];
+    let mut split: Vec<u32> = pieces.iter().map(|&p| p.max(1)).collect();
+    split.resize(kernels.len(), 1);
+    let mut next = 0usize;
+    // Under a bound, each kernel's pieces from its own narrowest one: one
+    // fire over 64 of the plane's columns timed first, its device time
+    // carried by the columns, the pieces as wide as that keeps within the
+    // bound (no estimate grown from another kernel's fires stands for it).
+    // A kernel whose narrowest piece passes the bound is not weighed.
+    let mut skipped = vec![false; kernels.len()];
+    if let Some(bound) = max_submit {
+        let bound = bound.as_nanos() as f64;
+        for (i, &tactic) in kernels.iter().enumerate() {
+            let cols = 64u32.min(n);
+            let w = Tensor {
+                rows: cols,
+                ..weights[0]
+            };
+            let out = rig.views(&ys, 1, rows, cols, Dtype::Bf16)?[0];
+            let a = Tensor { rows, ..act };
+            rig.step(
+                format!("matmul {rows}x{cols}x{k}"),
+                Work::matmul(rows, cols, k),
+            );
+            let fire = |sink: &kernels_slang::Ctx<'_>| {
+                kernels_slang::linear::gemm::matmul(sink, tactic, a, w, out)
+                    .map_err(fault("rates: matmul"))
+            };
+            let timed = rig.frame(timer, 1, &fire, &nothing);
+            rig.past_bound.borrow_mut().take();
+            let Ok((span, host)) = timed else {
+                skipped[i] = true;
+                continue;
+            };
+            let narrow = span.unwrap_or(host) as f64;
+            if narrow > bound {
+                skipped[i] = true;
+                continue;
+            }
+            let per_piece = (bound / narrow).floor().max(1.0) * f64::from(cols);
+            let fit = (f64::from(n) / per_piece).ceil() as u32;
+            split[i] = split[i].max(fit.max(1));
+        }
+    }
     for _ in 0..REPEATS {
         for (i, &tactic) in kernels.iter().enumerate() {
+            if skipped[i] {
+                continue;
+            }
             loop {
                 let cols = n.div_ceil(split[i]).next_multiple_of(64).min(n);
-                let plane: Vec<Tensor> = weights
-                    .iter()
-                    .map(|w| Tensor { rows: cols, ..*w })
-                    .collect();
-                let outs = rig.views(&ys, 1, rows, cols, Dtype::Bf16)?;
-                let rate = matmul_on(
-                    &mut rig,
-                    tactic,
-                    timer,
-                    (Tensor { rows, ..act }, &plane, &outs),
-                    Some(&touched),
-                    launch,
+                let w = Tensor {
+                    rows: cols,
+                    ..weights[next % weights.len()]
+                };
+                let out = rig.views(&ys, 1, rows, cols, Dtype::Bf16)?[0];
+                let a = Tensor { rows, ..act };
+                rig.step(
+                    format!("matmul {rows}x{cols}x{k}"),
+                    Work::matmul(rows, cols, k),
                 );
+                // One fire, one submission.
+                let fire = |sink: &kernels_slang::Ctx<'_>| {
+                    kernels_slang::linear::gemm::matmul(sink, tactic, a, w, out)
+                        .map_err(fault("rates: matmul"))
+                };
+                let timed = rig.frame(timer, 1, &fire, &nothing);
                 let past_bound = rig.past_bound.borrow_mut().take().is_some();
-                match rate {
-                    Ok(Ok(rate)) => {
-                        let ns = gemm_flops(rows, cols, k) / rate;
-                        samples[i].push(ns * f64::from(n) / f64::from(cols) + launch);
+                match timed {
+                    Ok((span, host)) => {
+                        next += 1;
+                        let ns = span.unwrap_or(host) as f64;
+                        if let Ok(rate) = engine::rates::rate_from(
+                            "matmul",
+                            ns,
+                            engine::rates::GEMM_DISPATCHES,
+                            launch,
+                            gemm_flops(rows, cols, k),
+                        ) {
+                            let ns = gemm_flops(rows, cols, k) / rate;
+                            samples[i].push(ns * f64::from(n) / f64::from(cols) + launch);
+                        }
                         break;
                     }
                     Err(_) if past_bound && cols > 64 => split[i] *= 2,

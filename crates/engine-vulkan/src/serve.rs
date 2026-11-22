@@ -142,6 +142,7 @@ impl Serve for Api {
         max_submit: Option<std::time::Duration>,
         launch: f64,
         kernels: &[kernels_slang::linear::gemm::Tactic],
+        pieces: &[u32],
         plane: (u32, u32),
         rows: u32,
     ) -> Result<Vec<Vec<f64>>> {
@@ -154,7 +155,7 @@ impl Serve for Api {
             ))
         };
         engine_gpu::rates::time_kernels::<Api, _>(
-            device, tuning, tier, &timer, max_submit, launch, kernels, plane, rows,
+            device, tuning, tier, &timer, max_submit, launch, kernels, pieces, plane, rows,
         )
     }
 

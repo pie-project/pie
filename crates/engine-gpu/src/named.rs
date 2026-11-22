@@ -448,6 +448,7 @@ impl<B: Serve> Serve for Named<B> {
         _max_submit: Option<std::time::Duration>,
         _launch: f64,
         kernels: &[kernels_slang::linear::gemm::Tactic],
+        _pieces: &[u32],
         _plane: (u32, u32),
         _rows: u32,
     ) -> Result<Vec<Vec<f64>>> {

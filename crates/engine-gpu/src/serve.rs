@@ -134,6 +134,7 @@ pub trait Serve: Backend {
         max_submit: Option<std::time::Duration>,
         launch: f64,
         kernels: &[kernels_slang::linear::gemm::Tactic],
+        pieces: &[u32],
         plane: (u32, u32),
         rows: u32,
     ) -> Result<Vec<Vec<f64>>>;
@@ -857,6 +858,9 @@ pub struct Shell<B: Serve> {
     settled: Vec<Settled>,
     /// The settle this load ran, for the engine to keep in the profile.
     to_store: Option<profile::fire::DenseSettled>,
+    /// The times a settle measured kernels at on a plane alone: `((kernel,
+    /// n, k), rows, ns)`, what its next rung's pieces are estimated by.
+    alone: Vec<((kernels_slang::linear::gemm::Tactic, u32, u32), u32, f64)>,
 
     pipelines: B::Pipelines,
 
@@ -2409,6 +2413,7 @@ impl<B: Serve> Shell<B> {
             dense_rates: device_profile.rates(),
             settled: Vec::new(),
             to_store: None,
+            alone: Vec::new(),
             built: B::compiled(&pipelines),
             recorded: 0,
             unkept: 0,
@@ -2660,10 +2665,75 @@ impl<B: Serve> Shell<B> {
                 kernels.push(t);
             }
         }
-        let max_submit = self
-            .submit_bound
-            .as_ref()
-            .map(|held| std::time::Duration::from_nanos(held.bound_ns as u64));
+        // Under a stated bound each kernel's fire is cut into pieces of the
+        // plane's columns, each estimated to fit the bound at the GPU's
+        // least clock: its estimate the larger of its curve's and its time
+        // measured at the rows below (scaled by the rows), at the bound's
+        // stored ratio and floor factor. A kernel whose narrowest piece
+        // (64 columns) cannot fit is not weighed, said by name; the choice's
+        // own kernel not fitting leaves the range on the curves.
+        let mut pieces = vec![1u32; kernels.len()];
+        let mut weighed = vec![true; kernels.len()];
+        if let Some(held) = self.submit_bound.as_ref() {
+            let ratio = held.stored_ratio() * held.floor_factor();
+            for (i, &t) in kernels.iter().enumerate() {
+                let by_curve = crate::dense::plane_ns(B::TARGET, &self.dense_rates, t, (n, k), top);
+                let by_below = self
+                    .alone
+                    .iter()
+                    .filter(|&&(at, _, _)| at == (t, n, k))
+                    .map(|&(_, rows, ns)| ns * f64::from(top) / f64::from(rows))
+                    .fold(None, |most: Option<f64>, ns| {
+                        Some(most.map_or(ns, |m| m.max(ns)))
+                    });
+                let estimate = match (by_curve, by_below) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (a, b) => a.or(b),
+                };
+                let Some(estimate) = estimate.map(|ns| ns * ratio) else {
+                    weighed[i] = false;
+                    continue;
+                };
+                let narrowest = estimate * 64.0 / f64::from(n);
+                if narrowest > held.bound_ns {
+                    weighed[i] = false;
+                    tracing::info!(
+                        kernel = %crate::dense::name(&t),
+                        rows = top,
+                        n,
+                        k,
+                        estimate_ms = estimate / 1e6,
+                        bound_ms = held.bound_ns / 1e6,
+                        "dense settle: a kernel's narrowest piece of the plane is past the \
+                         submit bound at the least clock; not weighed"
+                    );
+                    continue;
+                }
+                pieces[i] = u32::try_from((estimate / held.bound_ns).ceil() as u64)
+                    .unwrap_or(u32::MAX)
+                    .max(1);
+            }
+        }
+        if !weighed[0] {
+            tracing::info!(
+                "dense matmul in the served step, {bottom}-{top} rows: from the curves, \
+                 unchecked (the choice's kernel cannot be weighed within the submit bound)"
+            );
+            return Ok(());
+        }
+        let kernels: Vec<kernels_slang::linear::gemm::Tactic> = kernels
+            .into_iter()
+            .zip(&weighed)
+            .filter_map(|(t, &w)| w.then_some(t))
+            .collect();
+        let pieces: Vec<u32> = pieces
+            .into_iter()
+            .zip(&weighed)
+            .filter_map(|(p, &w)| w.then_some(p))
+            .collect();
+        let max_submit = self.submit_bound.as_ref().map(|held| {
+            std::time::Duration::from_nanos((held.bound_ns / held.floor_factor()) as u64)
+        });
         let launch = self.dense_rates.launch_ns.unwrap_or(0) as f64;
         let samples = B::time_kernels(
             &self.device,
@@ -2672,9 +2742,16 @@ impl<B: Serve> Shell<B> {
             max_submit,
             launch,
             &kernels,
+            &pieces,
             (n, k),
             top,
         )?;
+        for (&t, s) in kernels.iter().zip(&samples) {
+            if !s.is_empty() {
+                let (ns, _) = crate::rates::median_spread(s);
+                self.alone.push(((t, n, k), top, ns));
+            }
+        }
         let fastest = |s: &[f64]| s.iter().copied().fold(f64::INFINITY, f64::min);
         let slowest = |s: &[f64]| s.iter().copied().fold(0.0, f64::max);
         let kept_best = fastest(&samples[0]);

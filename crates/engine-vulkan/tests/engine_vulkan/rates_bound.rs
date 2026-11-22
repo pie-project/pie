@@ -278,3 +278,67 @@ fn a_head_past_the_bound_is_timed_on_slices_of_its_columns() {
         "no head curve timed at one row: {curves:?}"
     );
 }
+
+/// A settle's plane-alone weighing under a stated bound smaller than one
+/// whole-plane fire (an output head's at 256 rows, tens of ms on a desktop
+/// GPU, against a 4 ms bound): its fires are cut into pieces of the plane's
+/// columns, each a submission of its own, and no submission's time on the
+/// device passes the bound, while every kernel still gets its samples.
+#[test]
+fn a_plane_weighed_past_the_bound_is_cut_into_pieces_each_within_it() {
+    let Ok(device) = Context::bind(&crate::gpu::device_boot(), engine::Allowance::WHOLE) else {
+        eprintln!("not asked: no device");
+        return;
+    };
+    let bound = std::time::Duration::from_millis(4);
+    let (chip, _) = engine_vulkan::chip::resolve(&device.chip(), None);
+    let tuning = engine_vulkan::tuning::Tuning::new(chip, device.limits());
+    let tier = <Api as engine_gpu::serve::Serve>::tier(&device);
+    let longest = std::cell::Cell::new(0u64);
+    let timer = |frame: Frame| {
+        let started = std::time::Instant::now();
+        let span = frame.commit_spanned()?;
+        let ns = span.unwrap_or(started.elapsed().as_nanos() as u64);
+        longest.set(longest.get().max(ns));
+        Ok((span, started.elapsed().as_nanos() as u64))
+    };
+    let (n, k, rows) = (151_936, 1024, 256);
+    let kernels: Vec<kernels_slang::linear::gemm::Tactic> = [1u32, 8]
+        .iter()
+        .map(|&vector| kernels_slang::linear::gemm::Tactic {
+            vector,
+            ..engine_gpu::backend::Tactics::gemm(&tuning, tier, rows)
+        })
+        .collect();
+    let samples = engine_gpu::rates::time_kernels::<Api, _>(
+        &device,
+        &tuning,
+        tier,
+        &timer,
+        Some(bound),
+        1000.0,
+        &kernels,
+        &[1, 1],
+        (n, k),
+        rows,
+    )
+    .expect("the weighing lands under the bound");
+    assert!(
+        samples.iter().all(|s| !s.is_empty()),
+        "a kernel got no sample: {samples:?}"
+    );
+    // Carried to the whole plane, a fire is past the bound: it was cut.
+    assert!(
+        samples
+            .iter()
+            .flatten()
+            .any(|&ns| ns > bound.as_nanos() as f64),
+        "no fire needed cutting: {samples:?}"
+    );
+    assert!(
+        longest.get() <= bound.as_nanos() as u64,
+        "a submission ran {:.1} ms on the device, past the {:.1} ms bound",
+        longest.get() as f64 / 1e6,
+        bound.as_secs_f64() * 1e3
+    );
+}

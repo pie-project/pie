@@ -335,6 +335,29 @@ pub fn planes(counts: &Counts, multiplied: Option<&[(u32, u32)]>) -> Vec<(u32, u
     planes
 }
 
+/// `tactic`'s time, ns, at `rows` of one `n x k` plane by its curve there
+/// (`rates`): past the curve's last point at that point's rate, never
+/// below it. `None` where no point was timed at the plane.
+#[must_use]
+pub fn plane_ns(
+    target: Target,
+    rates: &profile::fire::Rates,
+    tactic: Tactic,
+    (n, k): (u32, u32),
+    rows: u32,
+) -> Option<f64> {
+    let curves = rates.kernel_tflops_by_shape.as_deref()?;
+    let (kind, key) = crate::rates::curve_key(target, tactic, n, k);
+    let found = curves.iter().find(|c| c.id() == (kind, key, n, k))?;
+    let (&(first, _), &(most, last)) = (found.curve.first()?, found.curve.last()?);
+    let flops = |at: u32| 2.0 * f64::from(at) * f64::from(n) * f64::from(k);
+    if rows > most {
+        return (last > 0.0).then(|| flops(rows) / (last * 1e3));
+    }
+    let at = rows.max(first);
+    profile::fire::interpolate(&found.curve, f64::from(at)).map(|t| flops(at) / (t * 1e3))
+}
+
 /// How many times `standing`'s dense matmul time at `rows` over `planes`
 /// `option`'s takes, by the kernels' curves (`rates`): the most it could
 /// lengthen a step `standing` is estimated at. `None` where a curve does
