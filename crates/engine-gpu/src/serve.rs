@@ -2898,6 +2898,47 @@ impl<B: Serve> Shell<B> {
         Ok((of, code))
     }
 
+    /// What the runtime's host cover depends on here
+    /// (`engine::Engine::cover_fingerprint`), by the rule every stored
+    /// measurement is keyed by (`crate::stored`): the device `on` names
+    /// (vendor, device id, driver), the code of every kernel the load's
+    /// fires can ask for, the guest emitter's and planner's versions, and
+    /// the tuning its fires run by (the profile's decisions, the dense
+    /// kernel each rung takes, the tier and the load's lanes and rows).
+    /// Nothing of the build but these: a version bump reuses the cover.
+    pub fn cover_fingerprint(&self, on: &str) -> Result<String> {
+        use crate::backend::Tactics as _;
+        let kernels: std::collections::BTreeSet<crate::naming::Kernel> =
+            self.asks.kernels.iter().copied().collect();
+        let code = crate::stored::code_of_all(B::TARGET, &kernels)?;
+        let decisions: Vec<(&str, &[profile::Rung])> = self
+            .tuning
+            .profile()
+            .entries()
+            .map(|(spec, rungs, _)| (spec.id, rungs))
+            .collect();
+        let tuning = profile::fire::fingerprint(
+            format!(
+                "{decisions:?}|{:?}|{:?}|{}|{}",
+                self.dense,
+                self.tier,
+                self.budgets.tokens.max_lanes,
+                self.budgets.tokens.max_tokens
+            )
+            .as_bytes(),
+        );
+        Ok(format!(
+            "{:?}|{on}|kernels {} {code:#010x}|emitter wgsl {} compiler {} plan {} lanes {}|tuning \
+             {tuning:#010x}",
+            B::TARGET,
+            kernels.len(),
+            eta_compiler::codegen::wgsl::WGSL_STEP_EMITTER_VERSION,
+            eta_compiler::plan::COMPILER_VERSION,
+            eta_compiler::plan::REGION_PLAN_VERSION,
+            eta_compiler::plan::lane_table::LANE_TABLE_ABI_VERSION,
+        ))
+    }
+
     /// The kernel each plane serves at each row range now, said once the
     /// settle is done (`whence`: stored or settled this load, `replaced` of
     /// its ranges replaced).
