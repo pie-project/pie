@@ -1,5 +1,6 @@
 use crate::Tuning;
 use crate::error::Error;
+use crate::tuning::Dense;
 
 use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, refuse, stated};
 use crate::tensor::Tensor;
@@ -68,12 +69,6 @@ const LANES_PER_TILE: u32 = 32;
 
 const MPP_FILE: &str = "linear/gemm_mpp.metal";
 
-/// The fewest rows the tensor-op tile lands: its smallest row tile.
-const MPP_MIN_ROWS: u32 = 8;
-
-/// The contraction the tensor-op tile walks per multiply.
-const MPP_K: u32 = 64;
-
 pub fn matmul(
     ctx: &Ctx<'_>,
     tuning: &Tuning,
@@ -94,19 +89,37 @@ pub fn lm_head(
     act_x_wt(ctx, tuning, "linear.matmul", act, w, y)
 }
 
-/// `act . w^T` for bf16 activations and weights. On a GPU with tensor ops,
-/// rows from the tensor-op tile's 8 up take it where the shape fits its
-/// tiles; every other GPU and shape takes the simdgroup-matrix kernels.
+/// `act . w^T` for bf16 activations and weights. Past one row the kernel is
+/// `kernel.dense`'s pick ([`Tuning::dense`]): the tensor-op tile on a GPU
+/// with tensor ops where the profile picks it and the shape fits its tiles,
+/// else the few-row vector forms or the simdgroup-matrix row tiles.
 /// The first row count of each band the routing of [`act_x_wt`] keeps one
-/// kernel over, at every shape and on either tier: one row; the few-row
-/// forms unrolled for 2, 4 and 8 rows (2; 3-4; 5-8); the tensor-op tile
-/// from 8 and its wider column tile past [`MPP_NARROW_ROWS`]; the row tiles
-/// past [`VECTOR_MAX_ROWS`] and from [`TILE_M`]. A load builds every
-/// pipeline a fire can be routed to by walking each of these row counts its
-/// rungs reach beside the rungs' own (a walk of the rungs alone missed the
-/// 8-row vector form on a tensor-op GPU, where rows 5-7 take it and the
-/// 8-row rung takes the tensor-op tile).
+/// kernel over whatever the profile picks, at every shape and on either
+/// tier: one row; the few-row forms unrolled for 2, 4 and 8 rows (2; 3-4;
+/// 5-8); the tensor-op tile from 8 and its wider column tile past
+/// [`MPP_NARROW_ROWS`]; the row tiles past [`VECTOR_MAX_ROWS`] and from
+/// [`TILE_M`]. [`row_bands`] adds the row counts where the profile's
+/// `kernel.dense` changes its pick. A load builds every pipeline a fire can
+/// be routed to by walking each of these row counts its rungs reach beside
+/// the rungs' own (a walk of the rungs alone missed the 8-row vector form
+/// on a tensor-op GPU, where rows 5-7 take it and the 8-row rung takes the
+/// tensor-op tile).
 pub const ROW_BANDS: [u32; 8] = [1, 2, 3, 5, 8, VECTOR_MAX_ROWS, TILE_M, MPP_NARROW_ROWS + 1];
+
+/// [`ROW_BANDS`] and every row count past one where `tuning`'s
+/// `kernel.dense` may change its pick, ascending: the row counts a load's
+/// walk visits beside its rungs.
+#[must_use]
+pub fn row_bands(tuning: &Tuning) -> Vec<u32> {
+    let mut bands: Vec<u32> = ROW_BANDS
+        .iter()
+        .copied()
+        .chain(tuning.dense_row_starts())
+        .collect();
+    bands.sort_unstable();
+    bands.dedup();
+    bands
+}
 
 /// The kernel [`act_x_wt`] fires for `rows` rows into `columns` columns
 /// over `contraction` (`f32_out`: f32 columns): what the dispatch takes,
@@ -223,24 +236,21 @@ pub fn rows_computed(tuning: &Tuning, rows: u32, columns: u32, contraction: u32)
     }
 }
 
-/// Whether `rows` (past one) take the few-row vector forms: below
-/// [`VECTOR_MAX_ROWS`], and not where the tensor-op tile fits (from its
-/// smallest row tile up it reads the weight once on the tensor ops).
+/// Whether `rows` (past one) take the few-row vector forms: where
+/// `kernel.dense` picks them (up to [`ROWS_MAX`] rows).
 fn few_rows(tuning: &Tuning, rows: u32, columns: u32, contraction: u32) -> bool {
-    rows > 1 && rows < VECTOR_MAX_ROWS && mpp_fit(tuning, rows, columns, contraction).is_none()
+    rows > 1 && tuning.dense(rows, columns, contraction) == Dense::Rows
 }
 
+/// The tensor-op tile's `(row tile, column tile)`, where `kernel.dense`
+/// picks it for `rows` rows (past one) at this shape on this GPU.
 fn mpp_fit(tuning: &Tuning, rows: u32, columns: u32, contraction: u32) -> Option<(u32, u32)> {
     let bn = if rows <= MPP_NARROW_ROWS || !columns.is_multiple_of(128) {
         64
     } else {
         128
     };
-    (tuning.tensor_ops()
-        && rows >= MPP_MIN_ROWS
-        && columns.is_multiple_of(bn)
-        && contraction.is_multiple_of(MPP_K))
-    .then_some((MPP_M, bn))
+    (rows > 1 && tuning.dense(rows, columns, contraction) == Dense::Mpp).then_some((MPP_M, bn))
 }
 
 fn mpp(
@@ -333,15 +343,28 @@ fn vector_grid(op: &'static str, rows: u32, columns: u32) -> Result<Grid, Error>
 
 #[cfg(test)]
 mod walk_tests {
-    use super::{ROW_BANDS, route};
+    use super::{route, row_bands};
     use crate::Tuning;
 
-    fn tunings() -> [Tuning; 2] {
+    /// Today's default and a measured-looking `kernel.dense` whose picks
+    /// change at row counts no fixed band names, each without tensor ops
+    /// and with them.
+    fn tunings() -> Vec<Tuning> {
         let mut registry = profile::Registry::new("metal", &[], &["rows"]);
         crate::tuning::register(&mut registry);
-        let profile = registry.with_overrides("");
-        let plain = Tuning::new(profile, false, None);
-        [plain.clone(), plain.with_family(10)]
+        let measured = "[kernel]\ndense = [\n  { when = \"rows >= 24 and n >= 2048\", use = \"mpp\" },\n  \
+                        { when = \"rows >= 12 and rows <= 13\", use = \"mpp\" },\n  \
+                        { when = \"rows >= 40\", use = \"mpp\" },\n  { use = \"rows\" },\n  { use = \"tile\" },\n]\n";
+        [
+            registry.with_overrides(""),
+            registry.with_overrides(measured),
+        ]
+        .into_iter()
+        .flat_map(|profile| {
+            let plain = Tuning::new(profile, false, None);
+            [plain.clone(), plain.with_family(10)]
+        })
+        .collect()
     }
 
     /// Every row count up to a load's top rung is routed to a kernel the
@@ -363,16 +386,18 @@ mod walk_tests {
         ];
         for top in [8u32, 64, 512] {
             let rungs: Vec<u32> = (0..).map(|p| 1u32 << p).take_while(|&r| r <= top).collect();
-            let walked: Vec<u32> = rungs
-                .iter()
-                .copied()
-                .chain(ROW_BANDS.iter().copied().filter(|&b| b <= top))
-                .collect();
             for tuning in tunings() {
+                let walked: Vec<u32> = rungs
+                    .iter()
+                    .copied()
+                    .chain(row_bands(&tuning).into_iter().filter(|&b| b <= top))
+                    .collect();
                 for &(k, n) in &shapes {
                     for f32_out in [false, true] {
-                        let built: std::collections::BTreeSet<String> =
-                            walked.iter().map(|&rows| route(&tuning, rows, n, k, f32_out)).collect();
+                        let built: std::collections::BTreeSet<String> = walked
+                            .iter()
+                            .map(|&rows| route(&tuning, rows, n, k, f32_out))
+                            .collect();
                         for rows in 1..=top {
                             let kernel = route(&tuning, rows, n, k, f32_out);
                             assert!(

@@ -606,6 +606,15 @@ impl Shell {
                 call: "rates at load",
                 why,
             })?;
+        // An Apple10 device whose profile states no `kernel.dense` measures
+        // it here over the model's shapes, once: kept under the profiles and
+        // read back by later loads of the same shapes on the same kernels.
+        let chip =
+            crate::tune::dense::at_load(&device, chip, boot.profiles.as_deref(), boot.contract)
+                .map_err(|why| Fault::Device {
+                    call: "kernel.dense at load",
+                    why,
+                })?;
         if chip
             .ladder::<kernels_metal::tuning::Qmm>()
             .values()
@@ -2383,16 +2392,18 @@ impl Shell {
         let octaves = engine::load::armed::scored_buckets(&rungs);
         // Beside each rung's own rows, every band start of the matmul
         // routing below it and above the rung before
-        // (`kernels_metal::linear::gemm::ROW_BANDS`), walked at that rung:
-        // a fire's rows reach every band its rungs span, and each band's
-        // kernel is built here, not refused while serving.
+        // (`kernels_metal::linear::gemm::row_bands`: the fixed bands and
+        // where the profile's `kernel.dense` changes its pick), walked at
+        // that rung: a fire's rows reach every band its rungs span, and each
+        // band's kernel is built here, not refused while serving.
+        let bands = kernels_metal::linear::gemm::row_bands(&self.tuning);
         let mut below = 0u32;
         let sized: Vec<(u32, Vec<u32>)> = rungs
             .iter()
             .map(|&rung| {
                 let mut sizes = vec![rung];
                 sizes.extend(
-                    kernels_metal::linear::gemm::ROW_BANDS
+                    bands
                         .iter()
                         .copied()
                         .filter(|&band| band > below && band < rung),
