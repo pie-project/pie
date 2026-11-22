@@ -1023,6 +1023,22 @@ impl Elastic {
         })
     }
 
+    /// Test builds (`test-slot-fill`): `bytes` from `offset` set to 0xFF (NaN in
+    /// every float width), so a kernel that reads a cell nothing wrote fails the test
+    /// that reads it rather than finding a zero.
+    ///
+    /// # Safety
+    ///
+    /// As [`zero`](Self::zero).
+    #[cfg(feature = "test-slot-fill")]
+    pub unsafe fn poison(&self, offset: u64, bytes: u64) -> Result<()> {
+        self.walk_spans(offset, bytes, |span, _, take| {
+            // SAFETY: `host_span` returned `take` writable bytes there.
+            unsafe { std::ptr::write_bytes(span.as_ptr(), 0xff, usize_of(take)) };
+            Ok(())
+        })
+    }
+
     /// Copy the mapped bytes at `offset` into `into`.
     ///
     /// # Errors

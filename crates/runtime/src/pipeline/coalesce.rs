@@ -99,13 +99,20 @@ impl Drop for ClaimGuard {
 /// Before a keyed pass over `slots` from row `held` of working set `ws`:
 /// waits out the pages another pass is computing that this one would
 /// compute first, then claims the ones it will compute, for as long as the
-/// guard it answers stands.
-pub(crate) async fn before_pass(
+/// guard it answers stands. `waits` is told once, as it first waits, and
+/// what it answers is held until the wait ends: its process submits
+/// nothing until those pages seal, so no frame may wait on its lanes
+/// meanwhile (the frame would hold the claimant's fire whose pages it
+/// waits on).
+pub(crate) async fn before_pass<Told>(
     stores: &Stores,
     ws: WorkingSetId,
     held: u64,
     slots: &[Hash256],
+    waits: impl FnOnce() -> Told,
 ) -> Option<ClaimGuard> {
+    let mut waits = Some(waits);
+    let mut _told: Option<Told> = None;
     let page_size = stores.kv_page_size;
     let page = u64::from(page_size.max(1));
     let keys = if held == 0 {
@@ -138,6 +145,9 @@ pub(crate) async fn before_pass(
             break mine;
         }
         waited = true;
+        if let Some(waits) = waits.take() {
+            _told = Some(waits());
+        }
         tokio::select! {
             () = &mut joined => {}
             () = &mut released => {}

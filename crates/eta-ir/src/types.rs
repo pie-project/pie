@@ -161,7 +161,7 @@ mod dtype_tests {
         for d in [Dtype::F32, Dtype::I32, Dtype::U32, Dtype::Bool, Dtype::Bf16] {
             assert!(supports(d), "{d:?}");
             assert_eq!(from_wire(wire_dtype(d)), Some(d), "{d:?}");
-            assert_eq!(name(d).is_some(), true, "{d:?}");
+            assert!(name(d).is_some(), "{d:?}");
         }
         assert!(is_float(Dtype::Bf16) && is_numeric(Dtype::Bf16) && !is_int(Dtype::Bf16));
         assert_eq!(to_wire(Dtype::F16), None, "f16 stays out");
