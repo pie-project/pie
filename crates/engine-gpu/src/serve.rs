@@ -2588,7 +2588,21 @@ impl<B: Serve> Shell<B> {
              fire, with the settled kernels)",
             self.settled.len()
         );
-        settled?;
+        // A settle fire the shell refuses as a program's (a class that reads
+        // a guest input no settle lane feeds, say) is no fault of the device:
+        // the settle stops, said, and the curves' kernels serve what it did
+        // not reach; nothing of it is stored. Any other fault stands.
+        if let Err(why) = settled {
+            if !matches!(why, Fault::Program { .. }) {
+                return Err(why);
+            }
+            tracing::warn!(
+                %why,
+                "dense settle: a fire refused; the curves' kernels serve the ranges it did not settle"
+            );
+            self.say_served("settle stopped short", replaced);
+            return Ok(());
+        }
         // Stored for a later load of the same curves, model, rungs and build:
         // the ranges decided before and those decided now; an undecided
         // range is settled again on the next load.
