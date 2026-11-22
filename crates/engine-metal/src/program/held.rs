@@ -36,6 +36,21 @@ unsafe impl Send for HostAt {}
 // SAFETY: as above.
 unsafe impl Sync for HostAt {}
 
+/// A u32 of a held region on the host ([`Held::host_word`]), read once the
+/// GPU wrote it: the region is held while a frame that writes it flies.
+#[derive(Debug, Clone, Copy)]
+pub struct HostWord(HostAt);
+
+impl HostWord {
+    /// The word as the GPU left it.
+    #[must_use]
+    pub fn read(self) -> u32 {
+        // SAFETY: four 4-aligned bytes inside one host run of a mapped
+        // Shared heap (`Held::host_word`), the heap outliving the region.
+        unsafe { std::ptr::read_volatile(self.0.0.as_ptr().cast::<u32>()) }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum Place {
     /// Bytes `[at, at + bytes)` of slot `slot` of shape `shape`, written
@@ -257,6 +272,24 @@ impl Held {
             self.write(0, &vec![0u8; bytes])?;
         }
         Ok(())
+    }
+
+    /// The host address of the u32 at byte `at`, where one host run holds
+    /// all four bytes: what a completion handler reads the GPU's word at,
+    /// the region held for the frame's life.
+    #[must_use]
+    pub fn host_word(&self, at: u64) -> Option<HostWord> {
+        let end = at.checked_add(4)?;
+        if end > self.bytes || at % 4 != 0 {
+            return None;
+        }
+        let Place::Slot { runs, .. } = &self.place;
+        runs.iter().find_map(|&(from, len, host)| {
+            (at >= from && end <= from + len).then(|| {
+                // SAFETY: `at - from` lies inside the run, checked above.
+                HostWord(HostAt(unsafe { host.0.add(usize_of(at - from)) }))
+            })
+        })
     }
 
     /// The GPU address of byte `at`.

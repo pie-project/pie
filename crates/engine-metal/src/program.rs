@@ -151,12 +151,39 @@ pub struct Plane {
     /// that reads them out, held in its `Instance` slots after its tables;
     /// 0 where the load reads out no scores.
     capture: u64,
+    /// The pages a beam group's lists span and the frames its pending
+    /// pages wait (BEAM-PAGE-LISTS §3): the context's pages and the frames
+    /// in flight.
+    beam_bounds: (u32, u32),
+    /// Whether a decode envelope's positions are copied from their cell on
+    /// the device ([`Session::positions_cell`]) rather than read on the
+    /// host: every load but one whose rows rotate by a host-built mrope
+    /// table.
+    device_positions: bool,
     next_program: u64,
     next_instance: u64,
     /// Where each live instance's own state lies in the pool: a bind or a
     /// rebind over another's is refused by name before it writes
     /// ([`engine::guest_claims`]).
     claims: Claims,
+}
+
+/// A beam group's resident state, as its instance lays it
+/// (BEAM-PAGE-LISTS §4): its beams, the list width and pool pages it is
+/// laid for, and its ring of pending pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BeamLayout {
+    pub lanes: u32,
+    pub cap: u32,
+    pub frames: u32,
+}
+
+impl BeamLayout {
+    /// The state's bytes.
+    #[must_use]
+    pub const fn bytes(&self) -> u64 {
+        kernels_metal::runtime::beam::beam_state_words(self.lanes, self.cap, self.frames) * 4
+    }
 }
 
 impl Default for Plane {
@@ -183,6 +210,8 @@ impl Plane {
             rows: 1,
             span_rows: 1,
             capture: 0,
+            beam_bounds: (0, 1),
+            device_positions: false,
             next_program: 1,
             next_instance: 1,
             claims: Claims::default(),
@@ -246,6 +275,12 @@ impl Plane {
     #[must_use]
     pub const fn stats(&self) -> eta_exec::CacheStats {
         self.cache.stats()
+    }
+
+    /// The wall time every region compile since load took, in nanoseconds.
+    #[must_use]
+    pub const fn compile_nanos(&self) -> u64 {
+        self.cache.compile_nanos()
     }
 
     /// Compiles each of `registrations` into the cache without registering
@@ -415,6 +450,7 @@ impl Plane {
             }
         };
         let capture = self.capture_of(program);
+        let beam = self.beam_of(program).map_or(0, |layout| layout.bytes());
         let session = match Session::bind(
             &program.compiled,
             &program.plan,
@@ -424,6 +460,7 @@ impl Plane {
             pooled,
             self.rows_for(program, &extents)?,
             capture,
+            beam,
             self.arms,
         ) {
             Ok(mut session) => {
@@ -431,7 +468,13 @@ impl Plane {
                 // runs: its pages and slots are the host's, its token the
                 // device's.
                 if geometry == GeometryClass::DecodeEnvelope {
-                    session.allow_run_ahead(&program.compiled, &program.plan, geometry, device);
+                    session.allow_run_ahead(
+                        &program.compiled,
+                        &program.plan,
+                        geometry,
+                        device,
+                        self.device_positions,
+                    );
                     tracing::debug!(
                         program = program_id.0,
                         runs_ahead = session.runs_ahead(),
@@ -628,6 +671,152 @@ impl Plane {
     /// of a program reading them out as its own state.
     pub fn set_capture(&mut self, bytes: u64) {
         self.capture = bytes;
+    }
+
+    /// The pages a beam group's lists span (the context's) and the frames
+    /// its freed pages wait (the frames in flight).
+    pub fn set_beam_bounds(&mut self, pages: u32, frames: u32) {
+        self.beam_bounds = (pages, frames.max(1));
+    }
+
+    /// Whether decode envelopes' positions are fed on the device.
+    pub fn set_device_positions(&mut self, on: bool) {
+        self.device_positions = on;
+    }
+
+    /// Whether decode envelopes' positions are fed on the device.
+    #[must_use]
+    pub const fn device_positions(&self) -> bool {
+        self.device_positions
+    }
+
+    /// The cell instance `id`'s next pass reads its positions from
+    /// ([`Session::positions_cell`]); `None` where the load reads them on
+    /// the host or the program states none.
+    pub fn positions_cell(&self, id: InstanceId) -> Result<Option<(crate::device::Buffer, u64)>> {
+        if !self.device_positions {
+            return Ok(None);
+        }
+        let bound = self
+            .instances
+            .get(&id)
+            .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
+        let Some(program) = self.programs.get(&bound.program_id) else {
+            return Ok(None);
+        };
+        bound.session.positions_cell(&program.plan)
+    }
+
+    /// A beam group's layout where `program` states each beam's parent
+    /// (`Port::Parents`, `[lanes]` u32 in a channel): its pool holds its
+    /// beams' pages (each at most a sequence's), the pages a fire hands
+    /// out, those pending over the frames in flight and the prompt's own
+    /// page (BEAM-PAGE-LISTS §3). `None` for any other program.
+    fn beam_of(&self, program: &Program) -> Option<BeamLayout> {
+        let binding = program
+            .plan
+            .package
+            .ports
+            .iter()
+            .find(|binding| binding.port == eta_ir::registry::Port::Parents && !binding.is_const)?;
+        let channel = program.plan.package.channels.get(binding.channel as usize)?;
+        let lanes = u32::try_from(ChannelShape::of(channel).numel).ok()?;
+        let (pages, frames) = self.beam_bounds;
+        let cap = lanes
+            .saturating_mul(pages)
+            .saturating_add(lanes.saturating_mul(frames + 1))
+            .saturating_add(1);
+        Some(BeamLayout { lanes, cap, frames })
+    }
+
+    /// Instance `id`'s beam group: its state's GPU address now and its
+    /// layout; `None` for an instance whose program states no parents.
+    pub fn beam_state(&self, id: InstanceId) -> Result<Option<(u64, BeamLayout)>> {
+        let bound = self
+            .instances
+            .get(&id)
+            .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
+        let Some(program) = self.programs.get(&bound.program_id) else {
+            return Ok(None);
+        };
+        let Some(layout) = self.beam_of(program) else {
+            return Ok(None);
+        };
+        let address = bound.session.beam_row().ok_or_else(|| {
+            Fault::program(
+                "program::plane",
+                format!("instance {id} states parents and holds no beam state"),
+            )
+        })?;
+        Ok(Some((address, layout)))
+    }
+
+    /// Beam `beam`'s page list of instance `id`'s beam group as its last
+    /// fire left it (`BEAM-PAGE-LISTS.md` §6.6): the lists are kept twice by
+    /// the fire count's parity (`runtime/beam.metal`), the last fire's at
+    /// `4 + (fired mod 2) * lanes * cap` words, `cap` columns a beam. The
+    /// caller lands every fire in flight first.
+    pub fn beam_list(&self, id: InstanceId, beam: u32) -> Result<Vec<u32>> {
+        let bound = self
+            .instances
+            .get(&id)
+            .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
+        let layout = self
+            .programs
+            .get(&bound.program_id)
+            .and_then(|program| self.beam_of(program))
+            .ok_or_else(|| {
+                Fault::program(
+                    "program::beam_list",
+                    format!("instance {id} binds no beam group (parents)"),
+                )
+            })?;
+        if beam >= layout.lanes {
+            return Err(Fault::program(
+                "program::beam_list",
+                format!("beam {beam} of a group of {}", layout.lanes),
+            ));
+        }
+        let mut header = [0u8; 16];
+        bound.session.read_beam(0, &mut header)?;
+        let word = |at: usize| u32::from_le_bytes([header[at], header[at + 1], header[at + 2], header[at + 3]]);
+        if word(0) == 0 {
+            return Err(Fault::program(
+                "program::beam_list",
+                format!("instance {id}'s beam group has fired no step yet"),
+            ));
+        }
+        let fired = word(4);
+        let (lanes, cap) = (u64::from(layout.lanes), u64::from(layout.cap));
+        let row = (4 + u64::from(fired & 1) * lanes * cap + u64::from(beam) * cap) * 4;
+        let mut bytes = vec![0u8; cap as usize * 4];
+        bound.session.read_beam(row, &mut bytes)?;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+            .collect())
+    }
+
+    /// The host address of instance `id`'s beam group's common slot word
+    /// (BEAM-PAGE-LISTS §11.3): its header's fourth, below which every live
+    /// beam's rows are one, as its last head step left it. `None` where it
+    /// holds no beam state.
+    #[must_use]
+    pub fn beam_common_word(&self, id: InstanceId) -> Option<held::HostWord> {
+        self.instances.get(&id)?.session.beam_word(12)
+    }
+
+    /// The cell instance `id`'s next pass reads its beams' parents from
+    /// ([`Session::parents_cell`]).
+    pub fn parents_cell(&self, id: InstanceId) -> Result<Option<(crate::device::Buffer, u64)>> {
+        let bound = self
+            .instances
+            .get(&id)
+            .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
+        let Some(program) = self.programs.get(&bound.program_id) else {
+            return Ok(None);
+        };
+        bound.session.parents_cell(&program.plan)
     }
 
     /// The score-row bytes an instance of `program` holds: the load's rows
@@ -872,6 +1061,7 @@ impl Plane {
             program.plan.package.channels.len(),
             self.program_rows(program),
             self.capture_of(program),
+            self.beam_of(program).map_or(0, |layout| layout.bytes()),
             self.arms,
         );
         let layout = held::TableLayout::of(&sizes, instance_slot);
@@ -1533,7 +1723,7 @@ impl Plane {
                                         let (dispatches, threads) =
                                             prepared.bind_streamed(&encoder, region)?;
                                         if let Some(&word) = dispatches.get(step) {
-                                            launch::dispatch_streamed_step(&encoder, word, threads);
+                                            launch::dispatch_streamed_step(&encoder, word, threads, region);
                                         }
                                     }
                                     frame.level();
@@ -1696,7 +1886,7 @@ struct Bound {
     /// The pair whose batch sets its grouped stages fire with.
     pair: u64,
     /// Where its value scratch lies, one a frame in flight, for the stages
-    /// it fires alone (`engine::GuestState::resident`).
+    /// it fires alone (`engine::GuestState::scratch`).
     scratch_place: engine::ScratchPlace,
     scratch: Vec<launch::ScratchAt>,
     program_id: ProgramId,
@@ -4468,6 +4658,117 @@ mod tests {
             .expect("the slots rebind");
         names_status(&mut plane);
         assert_eq!(peak(&mut plane, 789), vec![789, 789]);
+    }
+
+    /// A beam group's state lies in its instance's tables (BEAM-PAGE-LISTS
+    /// §4), which the runtime copies wherever a park or a move takes the
+    /// instance: a rebind to fresh Instance slots carries the group's state
+    /// with them, at the same offset in the run, as the score rows are.
+    /// Left in the old slots, the next step read the slots' next owner's
+    /// bytes as its map.
+    #[test]
+    fn a_beam_groups_state_follows_its_instance_to_fresh_slots() {
+        use crate::store::layout::INSTANCE;
+        use eta_compiler::codegen::program::{Backend, emit_program};
+        use eta_compiler::contract::beam_stage;
+        use eta_compiler::plan::compile_bound;
+        let Ok(context) = Context::bind() else {
+            eprintln!("no device: skipping");
+            return;
+        };
+        let case = beam_stage().into_iter().next().expect("a beam case");
+        // Its parents channel, `[rows]` u32, stated as the beam's parents.
+        let parents = case
+            .bound
+            .container
+            .channels
+            .iter()
+            .position(|channel| {
+                channel.dtype == eta_ir::container::ChanDType::Concrete(eta_ir::Dtype::U32)
+                    && channel.shape.dims() == [case.rows]
+            })
+            .expect("a parents channel");
+        let stages = compile_bound(&case.bound);
+        let backend = Backend::parse("metal").expect("the metal codegen");
+        let mut launch = eta_compiler::codegen::launch::build(&case.bound, &stages);
+        launch.ports.push(eta_compiler::codegen::launch::LaunchPort {
+            port: eta_ir::registry::Port::Parents,
+            channel: u32::try_from(parents).expect("a channel index"),
+            ..Default::default()
+        });
+        let registration = ProgramRegistration {
+            program_hash: 0xbea5_0000,
+            emitted_kernels: emit_program(backend, &stages, &case.bound),
+            emitter_version: backend.emitter_version(),
+            launch,
+            ..Default::default()
+        };
+        let pools = crate::store::Pools::guests_only(&context, CHUNK, GUEST_CHUNKS).expect("a pool");
+        let mut plane = Plane::new();
+        plane.set_flight(1, 1, case.rows);
+        plane.set_beam_bounds(4, 2);
+        let program = plane.register(&context, &registration).expect("the program registers");
+        let facts = plane.facts(program, &pools).expect("the program's facts");
+        let count = case.bound.container.channels.len();
+        let ids: Vec<ChannelId> = (1..=count as u64).map(ChannelId).collect();
+        let (instance, rings) = slots_for(&pools, &facts, 0);
+        let id = plane
+            .bind_placed(
+                &context,
+                program,
+                &case.wire_seeds(),
+                Extents {
+                    row_count: case.rows,
+                    sampled_rows: case.rows,
+                    query_len: case.rows,
+                    ..Extents::default()
+                },
+                GeometryClass::Host,
+                PortMask::NONE,
+                &ids,
+                session::Pooled {
+                    pools: &pools,
+                    instance: &instance,
+                    rings: &rings,
+                },
+            )
+            .expect("the instance binds");
+        let (before, _) = plane
+            .beam_state(id)
+            .expect("the instance")
+            .expect("its program states parents");
+
+        // The runtime's move: the tables copied to fresh slots of the same
+        // chunk, then the rebind names them.
+        let (fresh, _) = slots_for(&pools, &facts, 1);
+        let mut frame = context.frame().expect("a frame");
+        let moves: Vec<(u32, u32)> = instance.iter().copied().zip(fresh.iter().copied()).collect();
+        pools.copy_shape(&mut frame, INSTANCE, &moves).expect("the tables copy");
+        frame.commit().expect("the copy lands");
+        plane
+            .rebind_slots(
+                &pools,
+                &engine::Rebind::Instance {
+                    id,
+                    instance: fresh.clone(),
+                    rings: rings.clone(),
+                    adapter: Vec::new(),
+                    scratch: engine::ScratchPlace::None,
+                    pair: engine::ScratchPlace::None,
+                    pair_generation: 0,
+                },
+            )
+            .expect("the rebind");
+        let (after, _) = plane
+            .beam_state(id)
+            .expect("the instance")
+            .expect("its program states parents");
+        let slot = pools.slot_bytes(INSTANCE).expect("an instance slot");
+        assert_eq!(
+            after,
+            before + u64::from(fresh[0] - instance[0]) * slot,
+            "the group's state moved with its tables, to the same offset in the fresh run"
+        );
     }
 
     /// A bound program's role slots (its Instance tables and its Channel

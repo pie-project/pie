@@ -7,17 +7,15 @@ use poem_ir::{Operation, Ssm, ValueId};
 use crate::rs::{Convolved, Seat};
 use crate::run::Run;
 
-fn extended_origin(
-    indptr: &[i32],
-    lanes: &[engine::rs::LanePlan],
-    lane0: u32,
-    r: usize,
-) -> (u32, u32) {
+/// Lane `r`'s first extended row and its carried rows among them
+/// (`Seat::ext_replay`: a compact decode lane takes none), as the kernels
+/// lay them.
+fn extended_origin(indptr: &[i32], ext_replay: &[u32], lane0: u32, r: usize) -> (u32, u32) {
     let mut begin = indptr[r].max(0) as u32;
     for j in 0..r {
-        begin += lanes.get(lane0 as usize + j).map_or(0, |plan| plan.replay);
+        begin += ext_replay.get(lane0 as usize + j).copied().unwrap_or(0);
     }
-    let replay = lanes.get(lane0 as usize + r).map_or(0, |plan| plan.replay);
+    let replay = ext_replay.get(lane0 as usize + r).copied().unwrap_or(0);
     (begin, replay)
 }
 
@@ -37,6 +35,7 @@ impl Run<'_> {
             commit: seat.commit,
             slots: self.lane_slots(state).unwrap_or(seat.slots),
             lane0: self.window().span.lane_offset,
+            ext_replay: seat.ext_replay_table,
         }
     }
 
@@ -132,15 +131,17 @@ impl Run<'_> {
         let mut copies = Vec::new();
         for r in 0..indptr.len().saturating_sub(1) {
             let rows = (indptr[r + 1] - indptr[r]).max(0) as u32;
-            let (begin, replay) = extended_origin(indptr, &seat.lanes, lane0, r);
+            let (begin, replay) = extended_origin(indptr, &seat.ext_replay, lane0, r);
             let Some(plan) = seat.lanes.get(lane0 as usize + r) else {
                 continue;
             };
             // Every run the lane replays, one after another: a lane sharing
             // its set replays the slots its mask admits (its ancestry), which
             // its siblings' slots interleave, so not one run from its first.
+            // A lane that takes no extended carried rows reads them from its
+            // buffer: none are gathered.
             let mut at = begin;
-            for run in &plan.gathers {
+            for run in plan.gathers.iter().filter(|_| replay == plan.replay) {
                 self.rs_move(op, &mut copies, seat, plane, run, ext, at, false)?;
                 at += run.count;
             }
@@ -167,6 +168,31 @@ impl Run<'_> {
         }
         self.rs_flush(&copies)?;
         Ok(ext)
+    }
+
+    /// Copies each lane's own rows of `own` (laid by the fire's rows) into
+    /// its buffer pages of plane `plane`: what [`Self::rs_extend`] scatters,
+    /// for a plane an op lands rather than reads (a gated-delta row's
+    /// corrected keys and `u`, where the fire stages no page table).
+    pub(crate) fn rs_scatter(
+        &self,
+        op: &'static str,
+        seat: &Seat,
+        plane: usize,
+        own: Tensor,
+    ) -> Result<(), Error> {
+        let indptr = self.qo_indptr_host();
+        let lane0 = self.window().span.lane_offset;
+        let mut copies = Vec::new();
+        for r in 0..indptr.len().saturating_sub(1) {
+            let Some(plan) = seat.lanes.get(lane0 as usize + r) else {
+                continue;
+            };
+            if let Some(run) = &plan.scatter {
+                self.rs_move(op, &mut copies, seat, plane, run, own, indptr[r].max(0) as u32, true)?;
+            }
+        }
+        self.rs_flush(&copies)
     }
 
     pub(crate) fn rs_out(
@@ -242,7 +268,7 @@ impl Run<'_> {
         let mut copies = Vec::new();
         for r in 0..indptr.len().saturating_sub(1) {
             let rows = (indptr[r + 1] - indptr[r]).max(0) as u32;
-            let (begin, replay) = extended_origin(indptr, &seat.lanes, lane0, r);
+            let (begin, replay) = extended_origin(indptr, &seat.ext_replay, lane0, r);
             self.rs_copy(
                 op,
                 &mut copies,
@@ -294,6 +320,30 @@ impl Run<'_> {
         // page table reads and lands the buffer's too.
         let paged = seat.paged(self.handles(), conv.x);
         let fits = ssm::causal_conv1d_verify_fits(ext_y.width, conv.conv_width, conv.dilation);
+        // The beam groups' conv folds first (BEAM-PAGE-LISTS §11.3): each
+        // group's window moves on by the rows its beams share before any of
+        // its lanes reads it.
+        if let Some(folds) = seat.folds {
+            let Some(paged) = paged.filter(|_| fits) else {
+                return Err(Error::Backend {
+                    op: OP,
+                    detail: "a beam group folds its shared rows before the step, and the conv \
+                          reads its rows through no page table: a group fold reads them there"
+                        .to_string(),
+                });
+            };
+            ssm::causal_conv1d_group_fold(
+                self.ctx(),
+                folds,
+                self.window_lanes(),
+                self.rs_committed(seat, conv.state).slots,
+                paged,
+                &self.recurrent(conv.state),
+                ext_y.width,
+                conv.conv_width,
+                conv.dilation,
+            )?;
+        }
         if fits {
             let source = match paged {
                 Some(_) => self.tensor(conv.x),
@@ -312,6 +362,16 @@ impl Run<'_> {
                 ext_y,
                 self.tensor(y),
                 self.rs_snapshots(conv.state),
+                // The carried scan (a decode window over the corrected
+                // planes, through a page table) reads its own row alone.
+                paged.is_some()
+                    && seat
+                        .layout
+                        .in_of
+                        .get(&y.0)
+                        .is_some_and(|&plane| seat.layout.planes[plane].role == crate::rs::Role::Keys)
+                    && self.rs_snapshots(conv.state).is_none()
+                    && self.carried_window(seat),
             )?;
             return Ok(ext_y);
         }

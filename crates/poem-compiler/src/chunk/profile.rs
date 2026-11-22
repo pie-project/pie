@@ -127,7 +127,7 @@ impl ChunkProfile {
         tma_rows: false,
         state_f32: true,
         rs_mamba2: false,
-        rs_corrected: false,
+        rs_corrected: true,
         token_slot: None,
         one_window: false,
         full_from: None,

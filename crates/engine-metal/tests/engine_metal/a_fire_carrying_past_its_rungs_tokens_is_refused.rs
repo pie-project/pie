@@ -1,12 +1,15 @@
 #![cfg(target_vendor = "apple")]
 
 //! A fire whose lanes carry more recurrent rows into it than the tokens of
-//! the rung it stages in (`engine::fire::rung_rows`: the runtime asks the
-//! rung for them, and a device-geometry fire's count is the engine's alone)
-//! is refused by name before anything is encoded, so nothing past the
-//! rung's rs scratch is written: its state reads back as it was. A lane
-//! carrying exactly the rung's tokens fires at it. Each rung's rs scratch
-//! holds its own rows and as many again.
+//! the rung it stages in, counted as the runtime counts them toward the
+//! rung (`engine::fire::rung_rows`, `engine::fire::lane_carried`: a lane of
+//! more than one own row all its carried rows, a decode lane none), is
+//! refused by name before anything is encoded, so nothing past the rung's
+//! rs scratch is written: its state reads back as it was. A lane carrying
+//! exactly the rung's tokens fires at it; a decode lane carrying past them
+//! fires too, its step reading them in place through its page table (a
+//! beam in a parents pass carries every row since its fold). Each rung's
+//! rs scratch holds its own rows and as many again.
 
 use engine::fire::{FoldLen, RsReset, RsVerb};
 use engine_metal::serve::Seated;
@@ -68,6 +71,8 @@ fn a_fire_carrying_past_its_rungs_tokens_is_refused() {
     assert!(room > 0, "the rung holds rs scratch");
     let rows: Vec<u32> = (0..=rung).map(|at| (7 + at * 37) % 256).collect();
     let next = [42u32];
+    // A lane of two own rows: its carried rows count toward the rung.
+    let wide = [42u32, 43];
     let layout = shell.pool_layout();
     let pages = (rung + 2).div_ceil(layout.rs_tokens.max(1)) + 1;
 
@@ -96,7 +101,8 @@ fn a_fire_carrying_past_its_rungs_tokens_is_refused() {
     )
     .expect("buffering, folding one row, runs");
 
-    // At the rung: slot 0 carries one row past its tokens.
+    // At the rung: slot 0, two rows of its own, carries one row past its
+    // tokens.
     shell
         .set_rung(u32::MAX, rung)
         .expect("the rung lowers");
@@ -105,7 +111,7 @@ fn a_fire_carrying_past_its_rungs_tokens_is_refused() {
         &mut shell,
         &fixture,
         0,
-        &next,
+        &wide,
         &buffer(pages, 0, 0),
         RsReset::Held,
         rung + 1,
@@ -133,9 +139,23 @@ fn a_fire_carrying_past_its_rungs_tokens_is_refused() {
         rung + 1,
     )
     .expect("a fire carrying exactly its rung's tokens fires");
+    // Slot 0 again, one row of its own: a decode lane's carried rows count
+    // toward no rung, so it fires carrying past the rung's tokens.
+    fire(
+        &mut shell,
+        &fixture,
+        0,
+        &next,
+        &buffer(pages, 0, 0),
+        RsReset::Held,
+        rung + 1,
+    )
+    .expect("a decode lane carrying past its rung's tokens fires in place");
     eprintln!(
-        "rung {rung}: rs scratch {room} B; a fire carrying {} rows is refused and writes \
-         nothing, one carrying {rung} fires; every rung {rooms:?}",
+        "rung {rung}: rs scratch {room} B; a two-row fire carrying {} rows is refused and \
+         writes nothing, one carrying {rung} fires, a decode carrying {} fires; every rung \
+         {rooms:?}",
+        rung + 1,
         rung + 1
     );
 }

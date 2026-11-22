@@ -492,6 +492,9 @@ fn rs_rows(
             // key heads, bf16) and its corrected values (`u`, the value
             // its delta rule writes, f32): a decode step reads the buffered
             // rows as a linear attention over them and never re-steps one.
+            // Then its per-head scalars (`crate::rs::gdn_scalars_bytes`),
+            // keyed by the gate prep's output: the `[b | a]` plane stays for
+            // a reader that recomputes them.
             Operation::Ssm(Ssm::GatedDeltaChunked {
                 qkv,
                 gates,
@@ -512,6 +515,7 @@ fn rs_rows(
                     if rs_corrected {
                         planes.push((*qkv, Some(u64::from(k_heads * k_dim) * RS_ELEMENT)));
                         planes.push((*y, Some(u64::from(v_heads * v_dim) * 4)));
+                        planes.push((*gates, Some(crate::rs::gdn_scalars_bytes(*v_heads))));
                     }
                     recurrences.push((planes, *state, node.layer));
                 }

@@ -1984,6 +1984,28 @@ impl Pools {
     }
 
     /// Copies token runs between kv pages (slot refs of the list shape).
+    /// The GPU addresses kv list pages `refs` (slot refs) start at: what a
+    /// beam group's page copies address (BEAM-PAGE-LISTS §6.4).
+    pub fn kv_page_addresses(&self, refs: &[u32]) -> Result<Vec<u64>> {
+        let list = *self.shape(LIST)?;
+        refs.iter()
+            .map(|&page| {
+                let physical = self.physical(LIST, page)?;
+                Ok(self.pool.address(self.physical_slot_at(&list, physical)?))
+            })
+            .collect()
+    }
+
+    /// The planes a kv list page holds, as [`Self::copy_kv`] copies them:
+    /// where each lies in the page and the bytes a token holds in it.
+    #[must_use]
+    pub fn kv_page_planes(&self) -> Vec<kernels_metal::runtime::beam::PagePlane> {
+        self.kv_runs()
+            .into_iter()
+            .map(|(offset, cell)| kernels_metal::runtime::beam::PagePlane { offset, cell })
+            .collect()
+    }
+
     pub fn copy_kv(&mut self, frame: &mut Frame, moves: &[KvRun]) -> Result<()> {
         let page_size = u64::from(self.paging.page_size);
         let mut placed = Vec::with_capacity(moves.len());

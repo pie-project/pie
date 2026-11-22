@@ -1149,3 +1149,21 @@ settle exists for. Fix: stage a feed for those channels in the settle's fires (z
 declared shape; the settle only times), or settle through a class that reads none, instead of
 stopping.
 
+## F?? Metal streamed guest passes run far below bandwidth (needs Metal System Trace counters)
+Qwen3.5-0.8B beam-4 on the M1 Max, the beam epilogue's log-softmax region (4 rows x vocab ≈ 1M
+elements), after sc/mac-beam-hybrid 83cbd18f9 / ce84536d1 / 0f6db38c4 (register handover, dropped
+stores, broadcast index once a pass, a pipeline per streamed step, broadcast sinking, length
+classes; guest time 0.81 -> 0.54 ms a fire). The region now runs only the passes it needs (max
+reduce, exponentials, sum reduce, one output pass) and still takes 0.32 ms: each full pass ~70 µs
+and each reduction ~60 µs, against ~10-15 µs of memory traffic each.
+Measured (streamed-repeat / streamed-nop / streamed-groups diagnostics):
+- a dispatch's fixed cost is ~4 µs (streamed-nop), so launches are not it;
+- the group cap is at its optimum: r2 0.68 / 0.45 / 0.33 / 0.32 / 0.42 / 0.87 ms at 8 / 16 / 32 /
+  64 / 256 / 1024 groups of 512 threads, slower both ways;
+- pass count, materialized broadcasts and the per-element broadcast index are gone and moved it
+  little (0.55 -> 0.54 ms for the last two passes removed).
+Not yet separated: memory latency against ALU (the precise exp / log the bit-exact results need,
+the bf16 roundings), and the reductions' three dependent levels. That needs the GPU's counters
+(Metal System Trace / Instruments: occupancy, ALU and memory utilization per dispatch), which a
+headless session cannot capture. The M5 meets the beam rule already (beam-4 / 4-lane 1.023x), so
+this is the M1's and a general guest-codegen item, not a gate.
