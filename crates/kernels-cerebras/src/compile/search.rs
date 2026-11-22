@@ -1,7 +1,7 @@
 //! The search: a model's partitions ranked by what they cost ([`crate::compile::cost`]). From the layer
 //! graph's fastest candidates ([`crate::compile::cold`]) it moves the keys one or two at a time, keeps
-//! the moves that plan, serve and fit, and walks to the fastest predicted step. A measured
-//! partition is priced at its measurement; the best few are built before one is returned.
+//! the moves that plan, serve and fit, and walks to the fastest predicted step; the best few are
+//! built before one is returned.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -21,10 +21,6 @@ pub const MARGIN: f64 = 512.0;
 /// The refusals the repair follows a step.
 const BEAM: usize = 96;
 
-/// The margin (ms) an unmeasured partition must beat a measured one by: the time model's largest
-/// held-out error.
-pub const UNMEASURED: f64 = 0.021;
-
 /// A cold search's starting points, and at most this many of one unit count.
 const COLD_SEEDS: usize = 8;
 const COLD_EACH: usize = 2;
@@ -40,36 +36,19 @@ pub struct Scored {
     pub room: f64,
 }
 
-/// What a search is asked: the positions to serve (else the made-for preset's, else 4096) and
-/// overrides set over every preset.
+/// What a search is asked: the positions to serve (else 4096) and overrides set over every
+/// preset.
 #[derive(Clone, Debug, Default)]
 pub struct Asked {
     pub positions: Option<u32>,
     pub set: String,
-    /// No measurement a price or a candidate: the layer graph and the model's terms alone (what a
-    /// model the chip has not run gets).
-    pub cold: bool,
 }
 
 /// The candidates `shape` searched to, fastest first (at most `keep`), each built.
 pub fn search(shape: &Shape, ask: &Asked, keep: usize) -> R<Vec<Scored>> {
     crate::compile::compose::refuse(shape)?;
-    let sig = shape.signature();
-    // the model's measured program, if the chip ran one (not with `cold`): the cost model's
-    // data, its partition priced at its measurement, the positions it serves and the layer
-    // cost read off it; no starting point
-    let measured = (!ask.cold)
-        .then(|| crate::compile::cost::measured::on(sig))
-        .flatten()
-        .and_then(|m| m.preset.set(&ask.set).ok());
-    let reference = measured
-        .as_ref()
-        .and_then(|p| floorplan::plan(shape, p).ok());
-    let positions = ask
-        .positions
-        .or(reference.as_ref().map(|p| p.contract.positions))
-        .unwrap_or(4096);
-    let layer = time::layer(shape, reference.as_ref());
+    let positions = ask.positions.unwrap_or(4096);
+    let layer = time::kinds_layer(shape);
     let pinned: Vec<String> = ask
         .set
         .split(',')
@@ -81,7 +60,6 @@ pub fn search(shape: &Shape, ask: &Asked, keep: usize) -> R<Vec<Scored>> {
         positions,
         layer,
         anchor: memory::anchor(shape),
-        measured: measured.clone(),
     };
     // the starting points: the layer graph's candidates that plan and fit ([`crate::compile::cold`]),
     // the fastest few (at most [`COLD_EACH`] of a unit count)
@@ -123,13 +101,6 @@ pub fn search(shape: &Shape, ask: &Asked, keep: usize) -> R<Vec<Scored>> {
             keep_best(best);
         }
     }
-    // the measured partition, a candidate as priced (the walks may not reach it)
-    if let Some(m) = &measured
-        && let Some(mut sc) = s.score(m).filter(|c| builds(&c.planned.plan))
-    {
-        sc.planned.preset.name = format!("measured({})", m.name);
-        keep_best(sc);
-    }
     let mut all: Vec<Scored> = found.into_values().collect();
     all.sort_by(|a, b| a.ms.total_cmp(&b.ms));
     let mut out = Vec::new();
@@ -167,9 +138,6 @@ struct Search<'a> {
     positions: u32,
     layer: f64,
     anchor: &'static Anchor,
-    /// The model's measured program, if the chip ran one: every other partition's price past the
-    /// model's error ([`UNMEASURED`]).
-    measured: Option<Preset>,
 }
 
 impl Search<'_> {
@@ -189,11 +157,8 @@ impl Search<'_> {
         if room < f64::from(STACK_ROOM) + MARGIN {
             return None;
         }
-        let unmeasured = self.measured.as_ref().is_some_and(|m| {
-            m.keys != p.keys || m.levers != p.levers || m.arrangement != p.arrangement
-        });
         Some(Scored {
-            ms: time::step(&plan, self.layer) + if unmeasured { UNMEASURED } else { 0.0 },
+            ms: time::step(&plan, self.layer),
             room,
             planned: Planned {
                 plan,
@@ -418,17 +383,6 @@ fn ladder(v: f64) -> Vec<f64> {
 fn key(p: &Preset) -> String {
     p.keys
         .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-/// `plan`'s keys that differ from `preset`'s, as `K=V` (for reports).
-#[must_use]
-pub fn moved(from: &Preset, to: &Preset) -> String {
-    to.keys
-        .iter()
-        .filter(|(k, v)| from.keys.get(*k) != Some(v))
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join(",")

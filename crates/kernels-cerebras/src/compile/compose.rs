@@ -358,7 +358,7 @@ pub fn blocks(plan: &Plan, set: KernelSet, fp: &Floorplan) -> R<Vec<Box<dyn Bloc
 mod tests {
     use super::*;
     use crate::compile::program::Program;
-    use crate::compile::target::{Ask, plan};
+    use crate::compile::target::{SHIPPING, searched};
 
     fn trace(name: &str) -> poem_ir::Trace {
         poem_compiler::catalog::repository()
@@ -375,10 +375,9 @@ mod tests {
         .unwrap()
     }
 
-    /// The schedule of `name`'s plan (the pinned plan `preset`, else the search's).
-    fn schedule(name: &str, preset: Option<&str>) -> Schedule {
-        let ask = preset.map_or_else(Ask::default, Ask::preset);
-        let p = plan(&trace(name), &ask).unwrap().plan;
+    /// The schedule of `name`'s plan (the search's).
+    fn schedule(name: &str) -> Schedule {
+        let p = searched(name).plan;
         let sc = Program::of(p.clone()).unwrap().schedule;
         let fp = Floorplan::of(
             &p,
@@ -396,14 +395,14 @@ mod tests {
     /// its kernels were built with.
     #[test]
     fn a_layer_program_schedules_its_kernels() {
-        for (name, preset, nrm, mixk, act, ple, kvs, hg) in [
-            ("qwen35-d9b-bf16-kv-bf16", "9b", 0, 0, 0, 0, 0, 0),
-            ("llama31-8b-bf16-kv-bf16", "l3-8b", 0, 0, 0, 0, 0, 0),
-            ("gemma4-e4b-bf16-kv-bf16", "e4b", 1, 1, 1, 1, 1, 0),
-            ("gemma4-12b-bf16-kv-bf16", "g12", 1, 1, 1, 0, 0, 1),
-            ("gptoss-20b-bf16-mxfp4-kv-bf16", "full", 2, 2, 0, 0, 0, 0),
+        for (name, nrm, mixk, act, ple, kvs, hg) in [
+            ("qwen35-d9b-bf16-kv-bf16", 0, 0, 0, 0, 0, 0),
+            ("llama31-8b-bf16-kv-bf16", 0, 0, 0, 0, 0, 0),
+            ("gemma4-e4b-bf16-kv-bf16", 1, 1, 1, 1, 1, 0),
+            ("gemma4-12b-bf16-kv-bf16", 1, 1, 1, 0, 0, 1),
+            ("gptoss-20b-bf16-mxfp4-kv-bf16", 2, 2, 0, 0, 0, 0),
         ] {
-            let sc = schedule(name, Some(preset));
+            let sc = schedule(name);
             assert_eq!(
                 (sc.nrm, sc.mixk, sc.act, sc.ple, sc.kvs, sc.hg),
                 (nrm, mixk, act, ple, kvs, hg),
@@ -411,19 +410,11 @@ mod tests {
             );
         }
         // the MoE halves' variants: gpt-oss's biases and sinks, the mini's head norms and SiLU
-        for (name, preset, want) in [
-            (
-                "gptoss-20b-bf16-mxfp4-kv-bf16",
-                Some("full"),
-                (1, 1, 0, 1, 1, 1, 0),
-            ),
-            (
-                "qwen3-30b-a3b-mini-bf16-kv-bf16",
-                None,
-                (0, 0, 1, 0, 0, 0, 1),
-            ),
+        for (name, want) in [
+            ("gptoss-20b-bf16-mxfp4-kv-bf16", (1, 1, 0, 1, 1, 1, 0)),
+            ("qwen3-30b-a3b-mini-bf16-kv-bf16", (0, 0, 1, 0, 0, 0, 1)),
         ] {
-            let sc = schedule(name, preset);
+            let sc = schedule(name);
             assert_eq!(
                 (sc.qb, sc.snk, sc.qkn, sc.ob, sc.rb, sc.xb, sc.glu),
                 want,
@@ -432,9 +423,10 @@ mod tests {
         }
     }
 
-    /// Every measured program composes and builds, each class in its block's preferred colour.
+    /// Every shipping model's plan composes and builds, each class in its block's preferred
+    /// colour.
     #[test]
-    fn every_preset_composes() {
+    fn every_shipping_plan_composes() {
         // ... and keeps every class's preferred colour: the colouring changes no shipping palette
         let check = |p: crate::compile::plan::Plan, what: &str| {
             let prog = Program::of(p).unwrap_or_else(|e| panic!("{what}: {e}"));
@@ -442,34 +434,23 @@ mod tests {
                 crate::compile::fabric::Palette::of(prog.blocks.iter().flat_map(|b| b.colours()));
             assert_eq!(prog.palette.map, declared.map, "{what}");
         };
-        for (name, preset) in [
-            ("qwen35-d9b-bf16-kv-bf16", "9b"),
-            ("qwen35-d4b-bf16-kv-bf16", "4b"),
-            ("qwen35-d0.8b-bf16-kv-bf16", "0.8b"),
-            ("qwen3-8b-bf16-kv-bf16", "q3-8b"),
-            ("llama31-8b-bf16-kv-bf16", "l3-8b"),
-            ("gemma4-e2b-bf16-kv-bf16", "e2b"),
-            ("gemma4-e4b-bf16-kv-bf16", "e4b"),
-            ("gemma4-12b-bf16-kv-bf16", "g12"),
-            ("gptoss-20b-bf16-mxfp4-kv-bf16", "full"),
-        ] {
-            check(plan(&trace(name), &Ask::preset(preset)).unwrap().plan, name);
+        for name in SHIPPING {
+            check(searched(name).plan, name);
         }
     }
 
     /// A reduction group need not divide its chain: the last group of each half is short.
     #[test]
     fn a_short_last_reduction_group_composes() {
-        for (name, preset, set) in [
-            ("qwen35-d9b-bf16-kv-bf16", "9b", "G2=5"),
-            ("qwen35-d9b-bf16-kv-bf16", "9b", "G2Y=5"),
-            ("gptoss-20b-bf16-mxfp4-kv-bf16", "full", "G2=5"),
+        for (name, set) in [
+            ("qwen35-d9b-bf16-kv-bf16", "G2=5"),
+            ("qwen35-d9b-bf16-kv-bf16", "G2Y=5"),
+            ("gptoss-20b-bf16-mxfp4-kv-bf16", "G2=5"),
         ] {
-            let ask = Ask {
-                set: set.into(),
-                ..Ask::preset(preset)
-            };
-            Program::of(plan(&trace(name), &ask).unwrap().plan)
+            let p = searched(name);
+            let preset = p.preset.set(set).unwrap();
+            crate::compile::floorplan::plan(&p.plan.shape, &preset)
+                .and_then(Program::of)
                 .unwrap_or_else(|e| panic!("{name} {set}: {e}"));
         }
     }

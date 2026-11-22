@@ -1,7 +1,6 @@
 //! The wafer's decode target: the model's [`Shape`] read off its trace ([`shape`]), the role
 //! kernels its layers take ([`super::kernels::KernelSet`]), and its plan ([`plan`]): the search's
-//! fastest partition that builds, or a named plan as a debug override. [`plan_shape`] does the
-//! same for a shape stated outright.
+//! fastest partition that builds. [`plan_shape`] does the same for a shape stated outright.
 
 use poem_ir::{
     Attn, Def, Elemwise, Gather, GluAct, Guard, Linear, NormAxis, NormWeight, Operation, RopeFreqs,
@@ -9,12 +8,10 @@ use poem_ir::{
 };
 
 use super::compose::BiasOn;
-use super::kernels::KernelSet;
 use super::plan::{
     Act, AttnSpec, GdnSpec, HeadSpec, LayerKind, MlpSpec, MoeSpec, NormSpec, Plan, PleSpec, Preset,
     RopeSpec, Shape, YarnSpec,
 };
-use super::program::Program;
 
 type R<T> = Result<T, String>;
 
@@ -405,149 +402,73 @@ pub struct Planned {
     pub preset: Preset,
 }
 
-/// The wafer target for one shape: the measured program asked for by name (a debug override), the overrides
-/// set over it and the positions it must serve.
-struct Wafer {
-    shape: Shape,
-    preset: Option<String>,
-    set: String,
-    /// The positions the program must serve (the serving context); `None`: as many as the
-    /// preset holds.
-    positions: Option<u32>,
-}
-
-impl Wafer {
-    /// The measured program asked for by name, with the overrides set and the positions asked
-    /// for: it must be of the shape's kernel set ([`crate::compile::cost::measured`]).
-    fn named(&self) -> Option<Preset> {
-        let name = self.preset.as_ref()?;
-        let kernels = KernelSet::of_shape(&self.shape);
-        let p = crate::compile::cost::measured::named(name)
-            .filter(|m| m.kernels == kernels)?
-            .preset;
-        let mut preset = p.set(&self.set).ok()?;
-        if let Some(n) = self.positions {
-            preset.keys.insert("CTX".into(), f64::from(n));
-        }
-        Some(preset)
-    }
-
-    /// The plan `preset` makes of the shape, serving exactly the positions asked for (if any).
-    fn plan_of(&self, preset: &Preset) -> R<Plan> {
-        let mut plan = super::floorplan::plan(&self.shape, preset)?;
-        if let Some(n) = self.positions {
-            let held = plan.contract.positions;
-            if n > held {
-                return Err(format!(
-                    "preset {}: {n} positions, of at most {held}",
-                    preset.name
-                ));
-            }
-            plan.contract.positions = n;
-        }
-        // the head's rows (or its band's columns) hold every vocabulary row: the cut pads the
-        // tables to what they hold, so a token past it would have no logit and no embedding
-        let h = &plan.partition.head;
-        let held = u64::from(h.rows.max(h.cols)) * u64::from(h.vocab_rows);
-        if held < u64::from(self.shape.vocab) {
-            return Err(format!(
-                "preset {}: the head's {} rows of {} vocabulary rows hold {held} of {} tokens",
-                preset.name,
-                h.rows.max(h.cols),
-                h.vocab_rows,
-                self.shape.vocab
-            ));
-        }
-        // the images leave the stack its room, as the memory model measures them
-        let room = super::cost::memory::room(&plan, super::cost::memory::anchor(&self.shape));
-        if room < f64::from(super::build::STACK_ROOM) {
-            return Err(format!(
-                "preset {}: the images leave {room:.0} B of stack room, under {} B",
-                preset.name,
-                super::build::STACK_ROOM
-            ));
-        }
-        Ok(plan)
-    }
-
-    /// The measured program asked for, if it builds; with none named, the search's fastest partition
-    /// ([`crate::compile::search`]).
-    fn choose(&self) -> R<Planned> {
-        let Some(name) = &self.preset else {
-            let ask = crate::compile::search::Asked {
-                positions: self.positions,
-                set: self.set.clone(),
-                cold: false,
-            };
-            return crate::compile::search::search(&self.shape, &ask, 1)
-                .map(|mut f| f.remove(0).planned);
-        };
-        let Some(preset) = self.named() else {
-            return Err(match crate::compile::cost::measured::named(name) {
-                Some(m) => format!(
-                    "the measured program {name} is a plan for the {} kernels; this model's layers take the {} kernels",
-                    m.kernels.name(),
-                    KernelSet::of_shape(&self.shape).name()
-                ),
-                None => format!("no measured program {name}"),
-            });
-        };
-        let built = self.plan_of(&preset).and_then(|plan| {
-            Program::build(plan.clone())
-                .map(|_| plan)
-                .map_err(|e| format!("preset {}: {e}", preset.name))
-        });
-        match built {
-            Ok(plan) => Ok(Planned { plan, preset }),
-            Err(e) => Err(format!("the measured program does not build: {e}")),
-        }
-    }
-}
-
-/// The plan of `trace`: its shape, then the named plan `ask` names (a debug override), else the
-/// search's, with its overrides and positions.
+/// The plan of `trace`: its shape, then the search's, with the overrides and positions `ask`
+/// states.
 pub fn plan(trace: &Trace, ask: &Ask) -> R<Planned> {
     plan_shape(shape(trace)?, ask)
 }
 
-/// The plan of a shape stated outright, chosen as [`plan`] chooses.
+/// The plan of a shape stated outright, chosen as [`plan`] chooses: the search's fastest
+/// partition ([`crate::compile::search`]).
 pub fn plan_shape(shape: Shape, ask: &Ask) -> R<Planned> {
-    ask.target(shape)?.choose()
+    Preset::default().set(&ask.set)?;
+    let asked = crate::compile::search::Asked {
+        positions: ask.positions,
+        set: ask.set.clone(),
+    };
+    crate::compile::search::search(&shape, &asked, 1).map(|mut f| f.remove(0).planned)
 }
 
-/// What a plan is asked for beyond the model: a named plan (a debug override; else the search's),
-/// overrides of its keys (`K=V,...`), and the positions it must serve.
+/// What a plan is asked for beyond the model: overrides of its keys (`K=V,...`) and the positions
+/// it must serve.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Ask {
-    pub preset: Option<String>,
     pub set: String,
     pub positions: Option<u32>,
 }
 
-impl Ask {
-    fn target(&self, shape: Shape) -> R<Wafer> {
-        Preset::default().set(&self.set)?;
-        super::compose::refuse(&shape)?;
-        Ok(Wafer {
-            shape,
-            preset: self.preset.clone(),
-            set: self.set.clone(),
-            positions: self.positions,
-        })
-    }
+/// The shipping models' deployments.
+#[cfg(test)]
+pub(crate) const SHIPPING: [&str; 9] = [
+    "qwen35-d0.8b-bf16-kv-bf16",
+    "qwen35-d4b-bf16-kv-bf16",
+    "qwen35-d9b-bf16-kv-bf16",
+    "qwen3-8b-bf16-kv-bf16",
+    "llama31-8b-bf16-kv-bf16",
+    "gemma4-e2b-bf16-kv-bf16",
+    "gemma4-e4b-bf16-kv-bf16",
+    "gemma4-12b-bf16-kv-bf16",
+    "gptoss-20b-bf16-mxfp4-kv-bf16",
+];
 
-    /// A named preset, nothing else.
-    pub fn preset(name: &str) -> Ask {
-        Ask {
-            preset: Some(name.into()),
-            ..Ask::default()
-        }
-    }
+/// The search's plan of catalog deployment `name`, searched once a test run.
+#[cfg(test)]
+pub(crate) fn searched(name: &str) -> Planned {
+    use std::sync::{Arc, Mutex, OnceLock};
+    type Cells = Mutex<std::collections::BTreeMap<String, Arc<OnceLock<Planned>>>>;
+    static CELLS: OnceLock<Cells> = OnceLock::new();
+    let cell = CELLS
+        .get_or_init(Cells::default)
+        .lock()
+        .unwrap()
+        .entry(name.to_string())
+        .or_default()
+        .clone();
+    cell.get_or_init(|| {
+        let t = poem_compiler::catalog::repository()
+            .parse(name)
+            .unwrap_or_else(|| panic!("{name} parses"))
+            .trace(poem_ir::Platform::Cerebras);
+        plan(&t, &Ask::default()).unwrap_or_else(|e| panic!("{name}: {e}"))
+    })
+    .clone()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compile::kernels::KernelSet;
+    use crate::compile::program::Program;
 
     fn trace(name: &str) -> Trace {
         poem_compiler::catalog::repository()
@@ -569,104 +490,45 @@ mod tests {
     /// model's.
     #[test]
     fn a_vision_deployment_plans_its_language_model() {
-        let want = plan(&trace("gemma4-e4b-bf16-kv-bf16"), &Ask::preset("e4b"))
-            .unwrap()
-            .plan;
-        let got = plan(
-            &trace("gemma4-e4b-vision-bf16-kv-bf16"),
-            &Ask::preset("e4b"),
-        )
-        .unwrap()
-        .plan;
+        let want = searched("gemma4-e4b-bf16-kv-bf16").plan;
+        let got = searched("gemma4-e4b-vision-bf16-kv-bf16").plan;
         assert_eq!(
             serde_json::to_value(&got).unwrap(),
             serde_json::to_value(&want).unwrap()
         );
     }
 
-    /// Every shipping model plans from its trace to the cut its staged prep holds: (kernel set,
-    /// units, layers a unit, columns, rows, a row's dims, vocabulary rows a head PE).
+    /// Every shipping model plans from its trace, on its kernel set, its head holding the
+    /// vocabulary.
     #[test]
     fn shipping_models_plan_from_their_traces() {
-        for (name, preset, want) in [
-            (
-                "qwen35-d9b-bf16-kv-bf16",
-                "9b",
-                (KernelSet::Own, 8, 4, 256, 256, 16, 216),
-            ),
-            (
-                "qwen35-d4b-bf16-kv-bf16",
-                "4b",
-                (KernelSet::Own, 8, 4, 256, 192, 14, 216),
-            ),
-            (
-                "qwen35-d0.8b-bf16-kv-bf16",
-                "0.8b",
-                (KernelSet::Own, 6, 4, 256, 128, 8, 216),
-            ),
-            (
-                "qwen3-8b-bf16-kv-bf16",
-                "q3-8b",
-                (KernelSet::Own, 9, 4, 256, 228, 18, 132),
-            ),
-            (
-                "gemma4-e2b-bf16-kv-bf16",
-                "e2b",
-                (KernelSet::Shared, 7, 5, 256, 128, 12, 232),
-            ),
-            (
-                "gemma4-e4b-bf16-kv-bf16",
-                "e4b",
-                (KernelSet::Shared, 7, 6, 256, 160, 16, 232),
-            ),
-            (
-                "gemma4-12b-bf16-kv-bf16",
-                "g12",
-                (KernelSet::Windows, 8, 6, 344, 283, 12, 232),
-            ),
-            (
-                "gptoss-20b-bf16-mxfp4-kv-bf16",
-                "full",
-                (KernelSet::Experts, 12, 2, 352, 160, 18, 272),
-            ),
-            (
-                "llama31-8b-bf16-kv-bf16",
-                "l3-8b",
-                (KernelSet::Own, 8, 4, 256, 256, 16, 112),
-            ),
+        for (name, set) in [
+            ("qwen35-d9b-bf16-kv-bf16", KernelSet::Own),
+            ("qwen35-d4b-bf16-kv-bf16", KernelSet::Own),
+            ("qwen35-d0.8b-bf16-kv-bf16", KernelSet::Own),
+            ("qwen3-8b-bf16-kv-bf16", KernelSet::Own),
+            ("gemma4-e2b-bf16-kv-bf16", KernelSet::Shared),
+            ("gemma4-e4b-bf16-kv-bf16", KernelSet::Shared),
+            ("gemma4-12b-bf16-kv-bf16", KernelSet::Windows),
+            ("gptoss-20b-bf16-mxfp4-kv-bf16", KernelSet::Experts),
+            ("llama31-8b-bf16-kv-bf16", KernelSet::Own),
         ] {
-            // with no preset named, the search gives each its measured program (the 12B a
-            // partition it predicts faster by more than the model's largest error)
-            let p = plan(&trace(name), &Ask::preset(preset)).unwrap().plan;
-            if preset != "g12" {
-                let chosen = plan(&trace(name), &Ask::default()).unwrap();
-                assert_eq!(
-                    serde_json::to_value(&chosen.plan).unwrap(),
-                    serde_json::to_value(&p).unwrap(),
-                    "{name}"
-                );
-            }
-            let q = &p.partition;
-            let got = (
-                KernelSet::of_shape(&p.shape),
-                q.units,
-                q.layers_per_unit,
-                q.cols,
-                q.rows,
-                q.row_dims[0].dims,
-                q.head.vocab_rows,
+            let p = searched(name).plan;
+            assert_eq!(KernelSet::of_shape(&p.shape), set, "{name}");
+            let h = &p.partition.head;
+            assert!(
+                u64::from(h.rows.max(h.cols)) * u64::from(h.vocab_rows) >= u64::from(p.shape.vocab),
+                "{name}"
             );
-            assert_eq!(got, want, "{name}");
+            assert_eq!(p.contract.positions, 4096, "{name}");
         }
     }
 
     /// Llama 3.1 8B: dense attention with no q / k norm, its rotation Llama 3's (the long waves
-    /// stretched: frequencies of their own), eps 1e-5; with no preset named, the first that fits.
+    /// stretched: frequencies of their own), eps 1e-5.
     #[test]
     fn llama_plans_from_its_trace() {
-        let p = plan(&trace("llama31-8b-bf16-kv-bf16"), &Ask::default())
-            .unwrap()
-            .plan;
+        let p = searched("llama31-8b-bf16-kv-bf16").plan;
         let s = &p.shape;
         assert_eq!(KernelSet::of_shape(&p.shape), KernelSet::Own);
         assert!(!s.attn.qk_norm && !s.attn.output_gate && s.gdn.is_none());
@@ -682,73 +544,26 @@ mod tests {
     }
 
     /// The positions asked for bound the plan: the RoPE tables' levels follow them, and more than
-    /// the preset holds refuse it.
+    /// any partition holds find none.
     #[test]
     fn positions_bound_the_plan() {
-        let t = trace("qwen35-d9b-bf16-kv-bf16");
-        let ask = |positions| Ask {
-            preset: Some("9b".into()),
-            positions,
+        let p = searched("qwen35-d0.8b-bf16-kv-bf16").plan;
+        assert_eq!((p.contract.positions, p.contract.rope_levels), (4096, 4));
+        let ask = Ask {
+            positions: Some(1 << 20),
             ..Ask::default()
         };
-        let full = plan(&t, &ask(None)).unwrap().plan;
-        assert_eq!(
-            (full.contract.positions, full.contract.rope_levels),
-            (16384, 5)
-        );
-        assert_eq!(full.levers, "NPX:1,DIAG:0,TSTAMP:0,XKEEP:0,HACC16:0,ATTL:2");
-        let short = plan(&t, &ask(Some(4096))).unwrap().plan;
-        assert_eq!(
-            (short.contract.positions, short.contract.rope_levels),
-            (4096, 4)
-        );
-        let e = plan(&t, &ask(Some(1 << 20))).unwrap_err();
-        assert!(e.contains("of at most 16384"), "{e}");
+        let e = plan(&trace("qwen35-d0.8b-bf16-kv-bf16"), &ask).unwrap_err();
+        assert!(e.contains("the search found no partition"), "{e}");
     }
 
-    /// Overrides that leave the head short of the vocabulary, or the images short of the stack's
-    /// room, are refused by name; Llama's VR=144 holds its vocabulary and plans.
+    /// A shape no shipping model has plans: Qwen3.5-0.8B with another MLP width plans and builds.
     #[test]
-    fn overrides_that_do_not_hold_are_refused() {
-        let t = trace("qwen35-d9b-bf16-kv-bf16");
-        let set = |s: &str| Ask {
-            preset: Some("9b".into()),
-            set: s.into(),
-            ..Ask::default()
-        };
-        let e = plan(&t, &set("VR=144,HR=1153")).unwrap_err();
-        assert!(e.contains("hold 166032 of 248320 tokens"), "{e}");
-        let e = plan(&t, &set("PY=224")).unwrap_err();
-        assert!(e.contains("of stack room"), "{e}");
-        let l = Ask {
-            preset: Some("l3-8b".into()),
-            set: "VR=144".into(),
-            ..Ask::default()
-        };
-        plan(&trace("llama31-8b-bf16-kv-bf16"), &l).unwrap();
-    }
-
-    /// With no program measured on the shape, the search plans it: Qwen3.5-0.8B with another
-    /// MLP width (no shipping model's shape) plans and builds.
-    /// A measured program of another kernel set is refused by name.
-    #[test]
-    fn a_shape_with_no_measured_program_is_searched() {
+    fn a_shape_of_no_shipping_model_is_searched() {
         let mut s = shape(&trace("qwen35-d0.8b-bf16-kv-bf16")).unwrap();
         s.mlp.intermediate += 256;
         let p = plan_shape(s, &Ask::default()).unwrap();
         Program::of(p.plan).unwrap();
-        let e = plan(&trace("qwen35-d0.8b-bf16-kv-bf16"), &Ask::preset("e2b")).unwrap_err();
-        assert!(e.contains("is a plan for the shared kernels"), "{e}");
-    }
-
-    /// With no plan named, a shipping model plans its measured program.
-    #[test]
-    fn the_search_chooses_the_measured_program() {
-        let t = trace("llama31-8b-bf16-kv-bf16");
-        assert_eq!(
-            plan(&t, &Ask::default()).unwrap().plan,
-            plan(&t, &Ask::preset("l3-8b")).unwrap().plan
-        );
     }
 
     /// A partition is refused where it cannot link or serve: wider than the wafer, a head's dims
@@ -757,18 +572,20 @@ mod tests {
     #[test]
     fn fit_refuses_what_cannot_serve() {
         let t = trace("llama31-8b-bf16-kv-bf16");
-        let ask = |set: &str| Ask {
-            preset: Some("l3-8b".into()),
-            set: set.into(),
-            ..Ask::default()
+        let s = shape(&t).unwrap();
+        let at = searched("llama31-8b-bf16-kv-bf16").preset;
+        let refused = |set: &str| {
+            crate::compile::floorplan::plan(&s, &at.clone().set(set).unwrap())
+                .and_then(|p| Program::build(p).map(|_| ()))
+                .unwrap_err()
         };
-        let e = plan(&t, &ask("PX=320")).unwrap_err();
+        let e = refused("PX=320");
         assert!(e.contains("dims over 40 columns"), "{e}");
-        let e = plan(&t, &ask("PX=288")).unwrap_err();
+        let e = refused("PX=288");
         assert!(e.contains("dims over 36 columns"), "{e}");
-        let e = plan(&t, &ask("PX=512")).unwrap_err();
+        let e = refused("PX=512");
         assert!(e.contains("over the wafer"), "{e}");
-        let mut odd = shape(&t).unwrap();
+        let mut odd = s.clone();
         odd.mlp.intermediate += 64;
         let e = plan_shape(odd, &Ask::default()).unwrap_err();
         assert!(e.contains("the search found no partition"), "{e}");
@@ -784,19 +601,32 @@ mod tests {
         assert!(e.contains("biases together with q / k head norms"), "{e}");
     }
 
-    /// The memory model, anchored on one measured program, predicts another of the same kernels'
+    /// The memory model, anchored on one linked program, predicts another of the same kernels'
     /// within the search's margin: Qwen3.5-4B's weight and head images off the 0.8B's link.
     #[test]
     fn memory_follows_the_partition_within_the_margin() {
         use crate::compile::cost::memory::{self, ANCHORS};
         let small = ANCHORS.iter().find(|a| a.preset == "0.8b").unwrap();
-        // the 4B's program as it was linked for the measurement
-        let ask = Ask {
-            preset: Some("4b".into()),
-            set: "PY=256,NE=64,G2=16,G2Y=16".into(),
-            ..Ask::default()
-        };
-        let p = plan(&trace("qwen35-d4b-bf16-kv-bf16"), &ask).unwrap().plan;
+        // the 4B's partition as it was linked
+        let mut at = Preset::new(
+            "4b",
+            &[
+                ("G2", 16.0),
+                ("G2Y", 16.0),
+                ("HR", 1153.0),
+                ("K", 4.0),
+                ("NE", 64.0),
+                ("PX", 256.0),
+                ("PY", 256.0),
+                ("UNX", 2.0),
+                ("UNY", 4.0),
+                ("VR", 216.0),
+                ("WL", 1.0),
+            ],
+        );
+        at.levers = "NPX:1,DIAG:0,TSTAMP:0,XKEEP:0,HACC16:0,ATTL:2".into();
+        let s = shape(&trace("qwen35-d4b-bf16-kv-bf16")).unwrap();
+        let p = crate::compile::floorplan::plan(&s, &at).unwrap();
         // the 4B as linked: weight 34,848 B, head 27,968 B, every other image's room 21,568 B
         let want = (memory::PE_BYTES - 34848.0)
             .min(memory::PE_BYTES - 27968.0)

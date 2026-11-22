@@ -2,8 +2,8 @@
 //! of a session, or compare it). The cut goes to `<out>/<name>.npy`, the plan to `<out>/plan.json`.
 //!
 //! ```text
-//! wafer-stage --model <deployment> --checkpoint <dir | .zt> --out <dir> [--preset <name>]
-//!             [--set K=V,...] [--positions N]
+//! wafer-stage --model <deployment> --checkpoint <dir | .zt> --out <dir> [--set K=V,...]
+//!             [--positions N]
 //! wafer-stage --plan <plan.json> --landed <params.safetensors> --out <dir>
 //! ```
 
@@ -15,7 +15,7 @@ use kernels_cerebras::compile::target::{self, Ask};
 use kernels_cerebras::compile::tiles;
 
 const USAGE: &str = "usage: wafer-stage --model <deployment> --checkpoint <dir | .zt> --out <dir> \
-                     [--preset <name>] [--set K=V,...] [--positions N]\n       \
+                     [--set K=V,...] [--positions N]\n       \
                      wafer-stage --plan <plan.json> --landed <params.safetensors> --out <dir>";
 
 fn main() {
@@ -54,7 +54,6 @@ fn run() -> Result<(), String> {
                 .try_trace(poem_ir::Platform::Cerebras)
                 .map_err(|e| format!("{model}: {e}"))?;
             let ask = Ask {
-                preset: get.get("preset").cloned(),
                 set: get.get("set").cloned().unwrap_or_default(),
                 positions: get
                     .get("positions")

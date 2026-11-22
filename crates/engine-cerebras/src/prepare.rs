@@ -233,12 +233,11 @@ pub fn prepare(
         tracing::warn!(settings = ?knobs, "cerebras: debug settings in force");
     }
     let ask = Ask {
-        preset: knobs.preset.clone(),
         set: knobs.set.clone(),
         positions: max_model_len,
     };
     let cache = Cache::open(cfg)?;
-    // One plan: the search's (or the preset's), which the memory model already holds within its
+    // One plan: the search's, which the memory model already holds within its
     // PEs; a link past it is an error.
     let planned = target::plan(trace, &ask).map_err(|e| format!("{}: {e}", trace.name))?;
     let plan = planned.plan;

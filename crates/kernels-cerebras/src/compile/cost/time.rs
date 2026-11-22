@@ -1,8 +1,7 @@
 //! A decode step's time in ms: the plan's partition ([`Features`]) at per-unit rates, plus each
 //! layer's own cost. The rates are the chip's: weight and head elements from `TSTAMP:1` phase
 //! stamps, the reductions' chains by their critical path ([`super::chain_cycles`]) at a fitted
-//! rate, KV elements and row span fitted. A layer's own cost is what the chip measured past those
-//! terms ([`super::measured`]), else its kinds' ([`KIND_LAYER`]).
+//! rate, KV elements and row span fitted. A layer's own cost is its kinds' ([`KIND_LAYER`]).
 
 use super::Features;
 use crate::compile::plan::{Plan, Shape};
@@ -37,24 +36,8 @@ pub fn partition(f: &Features) -> f64 {
         + LOOP_REDUCE * f.loop_reduce
 }
 
-/// A layer's own cost, in ms: read off the measured step of the model's measured `reference`
-/// plan, else its layers' kinds' ([`kinds_layer`]).
-#[must_use]
-pub fn layer(shape: &Shape, reference: Option<&Plan>) -> f64 {
-    let sig = shape.signature();
-    match (super::measured::on(sig).map(|m| m.ms), reference) {
-        (Some(ms), Some(r)) => {
-            let f = Features::of(r);
-            (ms - partition(&f)) / f.layers
-        }
-        _ => kinds_layer(shape),
-    }
-}
-
 /// A layer's own cost by its mixer's kind (ms: gated delta net, full attention, sliding-window
-/// attention, attention over another layer's KV), least squares over the chip's measured programs
-/// (`the_layer_kinds_follow_the_measurements` refits it). It leaves out per-model phases, so a
-/// model the chip ran takes its own ([`layer`]); no partition choice reads it.
+/// attention, attention over another layer's KV), least squares over the chip's measured steps.
 pub const KIND_LAYER: [f64; 4] = [8.018e-3, 5.707e-3, 10.653e-3, 19.700e-3];
 
 /// [`KIND_LAYER`] over `shape`'s layers, a layer's mean.

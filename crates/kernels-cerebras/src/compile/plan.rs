@@ -476,8 +476,8 @@ impl Partition {
     }
 }
 
-/// A partition's choices by name (a pinned plan's or the search's), with any overrides set over
-/// them. Keys are the layout's (`PX`, `PY`, `K`, `G2`, ...); values are numbers.
+/// A partition's choices by name (the search's), with any overrides set over them. Keys are the
+/// layout's (`PX`, `PY`, `K`, `G2`, ...); values are numbers.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Preset {
     pub name: String,
@@ -485,14 +485,6 @@ pub struct Preset {
     /// The kernel levers the preset's program ships with (`K:V,...`, see
     /// [`super::emit::params::Levers`]): the plan carries them to the build.
     pub levers: String,
-    /// The shape signature of the model this partition's program was measured on
-    /// ([`Shape::signature`]): there its price is its measurement.
-    #[serde(default)]
-    pub measured_on: Option<[u32; 3]>,
-    /// The stacked unit columns' placement the preset's program was measured with (its unit
-    /// shape's; [`Partition::arrangement`]).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub arrangement: Option<Arrangement>,
 }
 
 impl Preset {
@@ -501,8 +493,6 @@ impl Preset {
             name: name.to_string(),
             keys: keys.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
             levers: String::new(),
-            measured_on: None,
-            arrangement: None,
         }
     }
 

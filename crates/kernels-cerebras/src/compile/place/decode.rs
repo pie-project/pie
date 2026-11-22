@@ -159,7 +159,6 @@ mod tests {
     use crate::compile::emit::params::Levers;
     use crate::compile::plan::Plan;
     use crate::compile::program::Program;
-    use crate::compile::target::{Ask, plan};
 
     /// Every file `plan` emits, built as it is and placed by the placer pinned to it.
     fn same(plan: &Plan, name: &str) {
@@ -204,24 +203,10 @@ mod tests {
     #[test]
     fn the_pinned_placement_is_the_program() {
         std::thread::scope(|sc| {
-            for (model, preset) in [
-                ("qwen35-d0.8b-bf16-kv-bf16", "0.8b"),
-                ("qwen35-d4b-bf16-kv-bf16", "4b"),
-                ("qwen35-d9b-bf16-kv-bf16", "9b"),
-                ("qwen3-8b-bf16-kv-bf16", "q3-8b"),
-                ("llama31-8b-bf16-kv-bf16", "l3-8b"),
-                ("gemma4-e2b-bf16-kv-bf16", "e2b"),
-                ("gemma4-e4b-bf16-kv-bf16", "e4b"),
-                ("gemma4-12b-bf16-kv-bf16", "g12"),
-                ("gptoss-20b-bf16-mxfp4-kv-bf16", "full"),
-            ] {
+            for model in crate::compile::target::SHIPPING {
                 sc.spawn(move || {
-                    let t = poem_compiler::catalog::repository()
-                        .parse(model)
-                        .unwrap()
-                        .trace(poem_ir::Platform::Cerebras);
-                    let p = plan(&t, &Ask::preset(preset)).unwrap().plan;
-                    same(&p, preset);
+                    let p = crate::compile::target::searched(model).plan;
+                    same(&p, model);
                 });
             }
         });

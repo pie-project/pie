@@ -14,8 +14,7 @@ use crate::compile::plan::{
 
 type R<T> = Result<T, String>;
 
-/// Preset keys: the unit shape (PX, PY, NU; one the arrangement is not made for takes
-/// [`Arrangement::derive`]), head rows (HR), global KV entries a KV row (NEG), reduction groups
+/// Preset keys: the unit shape (PX, PY, NU; its arrangement [`Arrangement::derive`]), head rows (HR), global KV entries a KV row (NEG), reduction groups
 /// (G2, G2W), posted loop (LOOP). The sliding window runs over `PYW` KV rows (exact ring where
 /// NES divides it, else every row with older entries masked). Overrides: `PYW`, `NEG`, `G2`,
 /// `G2W`, `G3W`, `CAP`, `LOOP`.
@@ -84,12 +83,7 @@ pub fn plan(s: &Shape, pr: &Preset) -> R<Plan> {
             vocab_rows: ceil_to(s.vocab, hr, 8),
             ..Default::default()
         },
-        arrangement: Some(
-            pr.arrangement
-                .clone()
-                .filter(|a| a.unit == (px, py, nu))
-                .unwrap_or_else(|| Arrangement::derive(s, (px, py, nu))),
-        ),
+        arrangement: Some(Arrangement::derive(s, (px, py, nu))),
     };
     let contract = Contract {
         positions: neg * pyw,
@@ -116,10 +110,10 @@ pub const STORE_WORDS: u32 = 19_000;
 pub const STORE_BUS: [u8; 2] = [17, 10];
 
 impl Arrangement {
-    /// The arrangement of `nu` units of `px` x `py` weight PEs where no pinned plan states one:
-    /// column A holds the shared caches' source unit on (the KV line runs north) and at least
-    /// half the units, column B the rest, levelled so the last levels hand off across. Each
-    /// column's storage holds its layers' side input, [`STORE_WORDS`] words a storage PE.
+    /// The arrangement of `nu` units of `px` x `py` weight PEs: column A holds the shared caches'
+    /// source unit on (the KV line runs north) and at least half the units, column B the rest,
+    /// levelled so the last levels hand off across. Each column's storage holds its layers' side
+    /// input, [`STORE_WORDS`] words a storage PE.
     #[must_use]
     pub fn derive(shape: &Shape, (px, py, nu): (u32, u32, u32)) -> Arrangement {
         let n = nu.max(1);
@@ -208,45 +202,10 @@ impl Arrangement {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::compile::target::{Ask, plan};
-
-    fn trace(name: &str) -> poem_ir::Trace {
-        poem_compiler::catalog::repository()
-            .parse(name)
-            .unwrap_or_else(|| panic!("{name} parses"))
-            .trace(poem_ir::Platform::Cerebras)
-    }
-
-    /// The derived arrangement matches the pinned E2B and E4B ones but for column A's top row.
+    /// A Gemma 4 model plans by the search, on the derived arrangement: the one-layer E4B mini.
     #[test]
-    fn the_derived_arrangement_is_the_pinned_ones() {
-        for (name, preset) in [
-            ("gemma4-e2b-bf16-kv-bf16", "e2b"),
-            ("gemma4-e4b-bf16-kv-bf16", "e4b"),
-        ] {
-            let p = plan(&trace(name), &Ask::preset(preset)).unwrap().plan;
-            let pinned = p.partition.arrangement.clone().unwrap();
-            let derived = Arrangement::derive(&p.shape, pinned.unit);
-            assert_eq!(
-                Arrangement {
-                    a_top: pinned.a_top,
-                    ..derived.clone()
-                },
-                pinned,
-                "{name}"
-            );
-            assert!(derived.a_top <= pinned.a_top, "{name}");
-        }
-    }
-
-    /// A Gemma 4 model no pinned arrangement is made for plans by the search, on the derived
-    /// arrangement: the one-layer E4B mini.
-    #[test]
-    fn a_shape_with_no_pinned_arrangement_plans() {
-        let p = plan(&trace("gemma4-e4b-mini-l1-bf16-kv-bf16"), &Ask::default())
-            .unwrap()
-            .plan;
+    fn a_shape_with_a_derived_arrangement_plans() {
+        let p = crate::compile::target::searched("gemma4-e4b-mini-l1-bf16-kv-bf16").plan;
         crate::compile::program::Program::of(p).unwrap();
     }
 }

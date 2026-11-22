@@ -1,5 +1,4 @@
-//! The search's cold start: a model's first partitions from its layer graph alone, no measured
-//! program or named plan. Each kernel set's constructor reads a few structural keys (the units,
+//! The search's cold start: a model's first partitions from its layer graph alone. Each kernel set's constructor reads a few structural keys (the units,
 //! the columns and rows a unit, the KV entries a row, the segments); their values are drawn from
 //! what the shape divides (the layers into units of one layer pattern, the heads over the
 //! columns, the hidden over the rows) and from the fabric's size, the rest at the kernels'
@@ -262,56 +261,4 @@ pub fn candidates(s: &Shape, positions: u32) -> Vec<Preset> {
         }
     }
     out
-}
-
-#[cfg(test)]
-mod tests {
-    /// From the layer graph alone, the search builds every measured model's program and prices
-    /// it within 3% of the chip's measured partition priced alike (the kinds' layer cost both).
-    #[test]
-    fn cold_search_builds_every_measured_model_within_three_percent() {
-        let names = [
-            "qwen35-d0.8b-bf16-kv-bf16",
-            "qwen35-d4b-bf16-kv-bf16",
-            "qwen35-d9b-bf16-kv-bf16",
-            "llama31-8b-bf16-kv-bf16",
-            "qwen3-8b-bf16-kv-bf16",
-            "gemma4-e2b-bf16-kv-bf16",
-            "gemma4-e4b-bf16-kv-bf16",
-            "gemma4-12b-bf16-kv-bf16",
-            "gptoss-20b-bf16-mxfp4-kv-bf16",
-        ];
-        std::thread::scope(|sc| {
-            for n in names {
-                sc.spawn(move || {
-                    let t = poem_compiler::catalog::repository()
-                        .parse(n)
-                        .unwrap()
-                        .trace(poem_ir::Platform::Cerebras);
-                    let s = crate::compile::target::shape(&t).unwrap();
-                    let m = crate::compile::cost::measured::on(s.signature()).expect("measured");
-                    let plan = crate::compile::floorplan::plan(&s, &m.preset).unwrap();
-                    let measured =
-                        crate::compile::cost::time::step(&plan, crate::compile::cost::time::kinds_layer(&s));
-                    let ask = crate::compile::search::Asked {
-                        positions: Some(plan.contract.positions),
-                        cold: true,
-                        ..Default::default()
-                    };
-                    let t0 = std::time::Instant::now();
-                    let best = crate::compile::search::search(&s, &ask, 1)
-                        .unwrap_or_else(|e| panic!("{n}: {e}"))
-                        .remove(0);
-                    let gap = best.ms / measured - 1.0;
-                    eprintln!(
-                        "{n}: cold {:.4} ms, the measured partition {measured:.4} ({:+.1}%), {:.0} s",
-                        best.ms,
-                        gap * 100.0,
-                        t0.elapsed().as_secs_f64()
-                    );
-                    assert!(gap < 0.03, "{n}: {:+.1}%", gap * 100.0);
-                });
-            }
-        });
-    }
 }

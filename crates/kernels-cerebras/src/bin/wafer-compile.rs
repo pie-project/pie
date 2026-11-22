@@ -3,8 +3,8 @@
 //! builds: the program's sources and the artifact the engine runs.
 //!
 //! ```text
-//! wafer-compile plan (--model <deployment> | --shape <shape.json>) [--preset <name>]
-//!                [--set K=V,...] [--positions N] --out <dir>
+//! wafer-compile plan (--model <deployment> | --shape <shape.json>) [--set K=V,...]
+//!                [--positions N] --out <dir>
 //! wafer-compile build --plan <plan.json> --out <dir> [--emit floor,rcfg,kernels,layout,host,plan,
 //!                 bindings,program] [--levers K:V,...] [--kernels <kernels dir>]
 //! wafer-compile link --build <dir> [--fabric simulator|system]
@@ -16,10 +16,9 @@
 //! and head PEs; `search` ranks a deployment's partitions by their predicted step (`search`).
 //!
 //! `plan` writes `<dir>/plan.json` (the [`Plan`]) and names the preset it took.
-//! `--model` names a catalog deployment (`qwen35-d9b-bf16-kv-bf16`); `--preset` a measured
-//! program by name (`cost::measured`, a debug override; else the search's); `--set` overrides its
-//! keys; `--positions` the positions the program must serve (else as many as the plan holds). The
-//! plan carries the kernel levers its program ships with; `build --levers` sets more over them.
+//! `--model` names a catalog deployment (`qwen35-d9b-bf16-kv-bf16`); `--set` pins the search's
+//! keys; `--positions` the positions the program must serve. The plan carries the kernel levers
+//! its program ships with; `build --levers` sets more over them.
 //!
 //! `build` writes everything the plan builds into `<dir>` (the sources, the artifact), its
 //! kernels the embedded ones unless `--kernels` names a directory. `link` compiles a build
@@ -38,7 +37,7 @@ use kernels_cerebras::compile::target::{self, Ask};
 use kernels_cerebras::compile::toolchain::{Arch, Cslc, Toolchain};
 
 const USAGE: &str = "usage: wafer-compile plan (--model <deployment> | --shape <shape.json>) \
-     [--preset <name>] [--set K=V,...] [--positions N] --out <dir>\n       wafer-compile build --plan <plan.json> \
+     [--set K=V,...] [--positions N] --out <dir>\n       wafer-compile build --plan <plan.json> \
      --out <dir> [--emit a,b] [--levers K:V,...] [--kernels <dir>]\n       wafer-compile link \
      --build <dir> [--fabric simulator|system]\n       wafer-compile cost --plan <plan.json>\n       \
      wafer-compile search --model <deployment> [--positions N] [--set K=V,...] [--keep N]\n       \
@@ -92,17 +91,9 @@ fn mkdir(dir: &Path) -> Result<(), String> {
 fn plan(args: &[String]) -> Result<(), String> {
     let f = flags(
         args,
-        &[
-            "--model",
-            "--shape",
-            "--preset",
-            "--set",
-            "--positions",
-            "--out",
-        ],
+        &["--model", "--shape", "--set", "--positions", "--out"],
     )?;
     let ask = Ask {
-        preset: get(&f, "--preset").map(str::to_string),
         set: get(&f, "--set").unwrap_or("").to_string(),
         positions: get(&f, "--positions")
             .map(|n| n.parse().map_err(|e| format!("--positions {n}: {e}")))
@@ -230,13 +221,9 @@ fn cost(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// `search`: a deployment's partitions ranked by their predicted step, with the preset made for
-/// it (if any) for comparison.
+/// `search`: a deployment's partitions ranked by their predicted step.
 fn search(args: &[String]) -> Result<(), String> {
-    let f = flags(
-        args,
-        &["--model", "--positions", "--set", "--keep", "--cold"],
-    )?;
+    let f = flags(args, &["--model", "--positions", "--set", "--keep"])?;
     let name = get(&f, "--model").ok_or(USAGE)?;
     let catalog = poem_compiler::catalog::repository();
     let d = catalog
@@ -251,41 +238,18 @@ fn search(args: &[String]) -> Result<(), String> {
             .map(|n| n.parse().map_err(|e| format!("--positions {n}: {e}")))
             .transpose()?,
         set: get(&f, "--set").unwrap_or("").to_string(),
-        cold: get(&f, "--cold").is_some_and(|v| v == "1"),
     };
     let keep = get(&f, "--keep")
         .map_or(Ok(5), str::parse)
         .map_err(|e| format!("--keep: {e}"))?;
-    let made = kernels_cerebras::compile::cost::measured::on(shape.signature()).map(|m| m.preset);
-    // cold: the measured program priced as the cold search prices (the median layer), its gap
-    if ask.cold
-        && let Some(m) = kernels_cerebras::compile::cost::measured::on(shape.signature())
-        && let Ok(mut plan) = kernels_cerebras::compile::floorplan::plan(&shape, &m.preset)
-    {
-        if let Some(n) = ask.positions {
-            plan.contract.positions = n;
-        }
-        let ms = kernels_cerebras::compile::cost::time::step(
-            &plan,
-            kernels_cerebras::compile::cost::time::kinds_layer(&shape),
-        );
-        println!(
-            "measured {} {ms:.4} ms priced cold (the chip's {:.4})",
-            m.preset.name, m.ms
-        );
-    }
     let t0 = std::time::Instant::now();
     for (i, c) in kernels_cerebras::compile::search::search(&shape, &ask, keep)?
         .iter()
         .enumerate()
     {
-        let moved = made.as_ref().map_or_else(
-            || format!("{:?}", c.planned.preset.keys),
-            |m| kernels_cerebras::compile::search::moved(m, &c.planned.preset),
-        );
         println!(
-            "{i} {} {:.4} ms {:.0} B [{}]",
-            c.planned.preset.name, c.ms, c.room, moved
+            "{i} {} {:.4} ms {:.0} B {:?}",
+            c.planned.preset.name, c.ms, c.room, c.planned.preset.keys
         );
     }
     println!("search {:.1} s", t0.elapsed().as_secs_f64());

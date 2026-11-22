@@ -173,25 +173,13 @@ pub fn read(artifact: &Path) -> R<Option<Vec<Probe>>> {
 mod tests {
     use super::*;
     use crate::compile::emit::params::{Levers, kernels};
-    use crate::compile::target::{Ask, plan};
-
-    fn measured(model: &str, preset: &str) -> Program {
-        let t = poem_compiler::catalog::repository()
-            .parse(model)
-            .unwrap()
-            .trace(poem_ir::Platform::Cerebras);
-        Program::of(plan(&t, &Ask::preset(preset)).unwrap().plan).unwrap()
-    }
 
     /// A shipping build stamps nothing on the path; `TSTAMP:1` probes every unit's CX column,
     /// the loop's root and unit 0's weight and CY PEs, each at its source's `tdbg` length.
     #[test]
     fn a_stamping_build_probes_every_unit_and_its_phases() {
-        for (file, preset) in [
-            ("llama31-8b-bf16-kv-bf16", "l3-8b"),
-            ("gptoss-20b-bf16-mxfp4-kv-bf16", "full"),
-        ] {
-            let prog = measured(file, preset);
+        for file in ["llama31-8b-bf16-kv-bf16", "gptoss-20b-bf16-mxfp4-kv-bf16"] {
+            let prog = Program::of(crate::compile::target::searched(file).plan).unwrap();
             let plain = kernels(&prog, &Levers::of(&prog.plan.levers, "").unwrap()).unwrap();
             assert!(!on(&plain), "{file}");
             let ks = kernels(&prog, &Levers::of(&prog.plan.levers, "TSTAMP:1").unwrap()).unwrap();
