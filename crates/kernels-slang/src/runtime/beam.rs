@@ -18,8 +18,28 @@ const STEP_GROUP: u32 = 256;
 const COPY_GROUP: u32 = 256;
 const RS_GROUP: u32 = 256;
 
-/// The beams one group's step holds at most (its workgroup's tables).
-pub const MAX_LANES: u32 = 64;
+/// The workgroup storage every Vulkan and WebGPU device grants a workgroup
+/// (`maxComputeSharedMemorySize`'s and `maxComputeWorkgroupStorageSize`'s
+/// floor): the device limit the head step's tables live within.
+pub const WORKGROUP_STORAGE: u32 = 16 << 10;
+
+/// The step's workgroup storage beside its per-beam tables: its record (20
+/// words), its scan's counts (a word a thread) and three words.
+const STEP_FIXED: u32 = (20 + STEP_GROUP + 3) * 4;
+
+/// The bytes a beam takes of the step's tables: six words (its parent,
+/// need, rank, fresh page, handed page and fault).
+const STEP_PER_LANE: u32 = 6 * 4;
+
+/// The beams one group's step holds at most: its tables within
+/// [`WORKGROUP_STORAGE`], as the shader lays them (`PIE_BEAM_MAX_LANES`),
+/// a multiple of the workgroup's threads. Wider groups are refused by name.
+pub const MAX_LANES: u32 = 512;
+
+const _: () = assert!(
+    STEP_FIXED + MAX_LANES * STEP_PER_LANE <= WORKGROUP_STORAGE,
+    "the head step's tables pass the workgroup storage every device grants"
+);
 
 /// Each lane's fault (`BEAM-PAGE-LISTS.md` §7).
 pub const PAGES_PAST_RESERVE: u32 = 1;
@@ -156,7 +176,10 @@ pub fn admit_lanes(lanes: u32) -> Result<(), Error> {
     if lanes == 0 || lanes > MAX_LANES {
         return Err(refuse(
             "runtime.beam_step",
-            format!("a group of {lanes} beams; the head step holds 1 to {MAX_LANES}"),
+            format!(
+                "a group of {lanes} beams; the head step's tables hold 1 to {MAX_LANES} in the \
+                 {WORKGROUP_STORAGE} bytes of workgroup storage every device grants"
+            ),
         ));
     }
     Ok(())

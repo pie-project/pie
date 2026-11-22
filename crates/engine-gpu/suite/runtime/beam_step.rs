@@ -341,6 +341,25 @@ fn a_beam_step_follows_the_spec() {
     }
 }
 
+/// Groups wider than the old fixed 64 and than the step's workgroup (256
+/// threads), up to the most its tables hold in the workgroup storage every
+/// device grants, follow the spec; one past it is refused by name.
+#[test]
+fn a_beam_group_past_64_and_past_the_workgroup_follows_the_spec() {
+    let Some(mut gpu) = Gpu::open() else {
+        eprintln!("not asked: no device");
+        return;
+    };
+    let most = kernels_slang::runtime::beam::MAX_LANES;
+    for lanes in [65u32, 300, most] {
+        run(&mut gpu, lanes, 37, 0x7A11 + u64::from(lanes));
+    }
+    let why = kernels_slang::runtime::beam::admit_lanes(most + 1)
+        .expect_err("a group past the step's tables is refused")
+        .to_string();
+    assert!(why.contains("workgroup storage"), "{why}");
+}
+
 #[test]
 fn a_parent_past_the_beams_faults_its_lane_alone() {
     let Some(mut gpu) = Gpu::open() else {

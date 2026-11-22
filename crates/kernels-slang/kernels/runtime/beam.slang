@@ -42,7 +42,10 @@ PIE_POOL_WRITE(uint, params.seg_words)
 #define PIE_PAGES_PARENT 5u
 #define PIE_PAGES_EXHAUSTED 6u
 #define PIE_BEAM_HEADER 4u
-#define PIE_BEAM_MAX_LANES 64u
+// The beams one group's step holds: its six per-beam tables (24 bytes a
+// beam) beside the rest of its workgroup storage, within the 16 KiB every
+// Vulkan and WebGPU device grants a workgroup (`runtime::beam::MAX_LANES`).
+#define PIE_BEAM_MAX_LANES 512u
 #define PIE_BEAM_NONE 0xFFFFFFFFu
 
 #if defined(PIE_BEAM_STEP)
@@ -92,8 +95,8 @@ void main(uint3 local : SV_GroupThreadID, uint3 group : SV_GroupID) {
     if (live_group && t < REC) {
         g_rec[t] = store[params.runs + group.x * REC + t];
     }
-    if (t < PIE_BEAM_MAX_LANES) {
-        g_fault[t].store(0u);
+    for (uint b = t; b < PIE_BEAM_MAX_LANES; b += PIE_GROUP_X) {
+        g_fault[b].store(0u);
     }
     GroupMemoryBarrierWithGroupSync();
 
@@ -444,8 +447,10 @@ void main(uint3 local : SV_GroupThreadID, uint3 group : SV_GroupID) {
         pie_pool_set(state + 3u, at);
         store[common] = at;
     }
-    if (ok && t < B) {
-        store[faults + t] = g_fault[t].load();
+    if (ok) {
+        for (uint b = t; b < B; b += T) {
+            store[faults + b] = g_fault[b].load();
+        }
     }
 }
 
