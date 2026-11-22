@@ -424,6 +424,10 @@ impl Engine for Metal {
         Some(std::sync::Arc::new(crate::device::Context::host_room))
     }
 
+    fn cover_fingerprint(&self) -> Option<String> {
+        self.shell.as_ref().map(crate::serve::Shell::cover_fingerprint)
+    }
+
     fn kind(&self) -> &'static str {
         "metal"
     }
