@@ -791,6 +791,7 @@ impl Plane {
                 scores,
                 scratch,
                 parked: false,
+                kept: false,
             },
         );
         Ok(id)
@@ -812,10 +813,11 @@ impl Plane {
         // another still holds is refused by name, every claim as it stood.
         let mut moved = Vec::with_capacity(self.instances.len());
         for (id, bound) in &self.instances {
-            // A parked instance holds nothing here
+            // A parked instance that shed its state holds nothing here
             // (`engine::Rebind::Parked`): repointed and claimed at its
-            // rebind.
-            if self.closing.contains(id) || bound.parked {
+            // rebind. One whose park kept its tables and rings in place
+            // holds them, where the evacuation moved them.
+            if self.closing.contains(id) || (bound.parked && !bound.kept) {
                 continue;
             }
             let Some(program) = self.programs.get(&bound.program_id) else {
@@ -823,6 +825,13 @@ impl Plane {
             };
             let held = program.held(self.score_bytes);
             let place = bound.slots.place(&held, span)?;
+            if bound.parked {
+                moved.push((
+                    Holder::Instance(id.0),
+                    own_runs(&held, &place, &engine::ScratchPlace::None, 0, 0),
+                ));
+                continue;
+            }
             let room = program.bound_room(bound.session.extents())?;
             let scratch = piece_at(&bound.slots.scratch, room.instance_bytes(), span)?;
             moved.push((
@@ -847,7 +856,11 @@ impl Plane {
             .filter(|bound| !bound.parked)
             .map(|bound| (bound.program_id, bound.session.extents()))
             .collect();
-        for bound in self.instances.values_mut().filter(|bound| !bound.parked) {
+        for bound in self
+            .instances
+            .values_mut()
+            .filter(|bound| !bound.parked || bound.kept)
+        {
             let Some(program) = self.programs.get(&bound.program_id) else {
                 continue;
             };
@@ -855,6 +868,11 @@ impl Plane {
             let place = bound.slots.place(&held, span)?;
             bound.scores = held.score_at.map(|at| place.instance + at);
             bound.session.rebase(&place)?;
+            // A kept park's scratch went back with its park: nothing of it
+            // is repointed until its rebind names fresh room.
+            if bound.parked {
+                continue;
+            }
             let room = program.bound_room(bound.session.extents())?;
             bound.scratch = piece_at(&bound.slots.scratch, room.instance_bytes(), span)?
                 .next_multiple_of(launch::SPAN_ALIGN);
@@ -892,6 +910,7 @@ impl Plane {
         };
         self.claims.park(id.0, &runs);
         bound.parked = true;
+        bound.kept = kept;
         Ok(())
     }
 
@@ -990,6 +1009,7 @@ impl Plane {
         bound.scratch = scratch;
         bound.slots = slots;
         bound.parked = false;
+        bound.kept = false;
         let pair = bound.slots.pair.clone();
         let generation = bound.slots.pair_generation;
         let batch = self
@@ -1581,6 +1601,10 @@ struct Bound {
     /// another owner's until a rebind names where it lies, so nothing of
     /// it is repointed or fired meanwhile.
     parked: bool,
+    /// Its park kept its tables and rings in place (`Rebind::Parked {
+    /// kept }`): they stay claimed, and an evacuation moves them, claim and
+    /// rings, as a live instance's.
+    kept: bool,
 }
 
 /// Where a guest item lies in the pool, as a binding names it.
