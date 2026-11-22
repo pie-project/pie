@@ -847,13 +847,13 @@ pub struct BeamStepRun {
 
 const _: () = assert!(size_of::<BeamStepRun>() == 88);
 
-/// The most beams one group holds.
-pub const BEAM_MAX_LANES: u32 = 64;
 /// A lane's parent past its group (`beam_step`).
 pub const PAGES_PARENT: u32 = 5;
 /// A fire found fewer free pages than it hands out (exact sizing makes it
 /// unreachable: a bug where it happens).
 pub const PAGES_EXHAUSTED: u32 = 6;
+/// A group wider than its step was laid for (`beam_step`'s `width`).
+pub const PAGES_TOO_WIDE: u32 = 7;
 
 /// The u32 words of a group's state header (primed, fires run, the pool's
 /// pages at the last fire, the common slot), before its lists
@@ -880,17 +880,46 @@ pub const fn beam_copies_word(lanes: u32, cap: u32, frames: u32) -> u64 {
 
 const BEAM_BLOCK: u32 = 256;
 
-/// Runs each of `run_count` [`BeamStepRun`]s at `runs`, a block a group.
-pub fn beam_step(ctx: &Ctx, runs: DevicePtr, run_count: u32) -> Result<(), Error> {
+/// The dynamic shared memory `beam_step` takes for groups of up to `width`
+/// beams: five per-lane tables and the lanes' pairwise common slots.
+#[must_use]
+pub const fn beam_step_shared_bytes(width: u32) -> u32 {
+    (5 * width + width * width) * 4
+}
+
+/// The shared memory `beam_step` holds beside them: its 256-word count
+/// table and three words.
+const BEAM_STATIC_SHARED: u32 = (256 + 3) * 4;
+
+/// The widest beam group the device steps: the most beams whose tables fit
+/// a block's opt-in shared memory beside the step's own (48 KiB where the
+/// device does not say). A bind wider than it is refused by name.
+#[must_use]
+pub fn beam_max_lanes(ctx: &Ctx) -> u32 {
+    let optin = ctx.smem_per_block_optin();
+    let room = optin.unwrap_or(48 << 10).saturating_sub(BEAM_STATIC_SHARED);
+    let mut width = 1u32;
+    while beam_step_shared_bytes(width + 1) <= room {
+        width += 1;
+    }
+    width
+}
+
+/// Runs each of `run_count` [`BeamStepRun`]s at `runs`, a block a group, its
+/// tables laid for groups of up to `width` beams (a wider one faults its
+/// lanes [`PAGES_TOO_WIDE`]).
+pub fn beam_step(ctx: &Ctx, runs: DevicePtr, run_count: u32, width: u32) -> Result<(), Error> {
     const OP: &str = "channel.beam_step";
     if run_count == 0 {
         return Ok(());
     }
+    let width = width.max(1);
     ctx.fire(
         OP,
-        Fire::at(kernel(FILE, "::pie::runtime::channel::beam_step"))
-            .apply(Launch::grid([run_count, 1, 1], [BEAM_BLOCK, 1, 1])),
-        &[ArgValue::Ptr(runs), ArgValue::U32(run_count)],
+        Fire::at(kernel(FILE, "::pie::runtime::channel::beam_step")).apply(
+            Launch::grid([run_count, 1, 1], [BEAM_BLOCK, 1, 1]).smem(beam_step_shared_bytes(width)),
+        ),
+        &[ArgValue::Ptr(runs), ArgValue::U32(run_count), ArgValue::U32(width)],
     )
 }
 

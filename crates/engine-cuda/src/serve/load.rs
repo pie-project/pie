@@ -1596,7 +1596,14 @@ impl Shell {
         }
         // A beam group's page lists count in kv pages to its bind's depth,
         // and a page it frees waits out the frames in flight.
-        programs.set_beam_bounds(boot.page_size, u32::from(boot.runahead.frames_in_flight));
+        // A beam group's width is bound by the shared memory its step lays
+        // its tables in (`channel::beam_max_lanes`): a wider bind is refused
+        // by name.
+        programs.set_beam_bounds(
+            boot.page_size,
+            u32::from(boot.runahead.frames_in_flight),
+            kernels_cuda::runtime::channel::beam_max_lanes(&device.ctx()),
+        );
 
         let airborne = crate::settle::Airborne::new();
         let mut pools = pools;

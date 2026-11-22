@@ -872,7 +872,8 @@ fn stage_pages(
     store.stage(stream, at.trans, &image)?;
     // The fire's lanes' fault words, zero before its kernels write them.
     crate::device::zero_span_on(stream, base + faults, work.faults.len() * 4)?;
-    kernels_cuda::runtime::channel::beam_step(device.ctx(), groups_at, groups.len() as u32)?;
+    let width = groups.iter().map(|group| group.lanes).max().unwrap_or(1);
+    kernels_cuda::runtime::channel::beam_step(device.ctx(), groups_at, groups.len() as u32, width)?;
     kernels_cuda::runtime::channel::copy_pages(
         device.ctx(),
         copies_at,

@@ -302,6 +302,9 @@ pub struct Plane {
     score_bytes: u64,
     /// The pages and frames a beam group's state is laid for.
     beam_bounds: (u32, u32),
+    /// The widest beam group the device's step holds
+    /// (`kernels_cuda::runtime::channel::beam_max_lanes`).
+    beam_max_lanes: u32,
     /// Where each live instance's own state lies, by device address: a
     /// bind or a rebind over another's is refused by name before it writes
     /// ([`engine::guest_claims`]).
@@ -485,6 +488,7 @@ impl Plane {
             arenas: launch::Arenas::default(),
             score_bytes: 0,
             beam_bounds: (0, 1),
+            beam_max_lanes: u32::MAX,
             claims: Claims::default(),
         }
     }
@@ -503,8 +507,9 @@ impl Plane {
 
     /// The kv page a beam group's lists count in, and the frames its
     /// pending pages wait (the frames in flight): its depth is each bind's.
-    pub fn set_beam_bounds(&mut self, page: u32, frames: u32) {
+    pub fn set_beam_bounds(&mut self, page: u32, frames: u32, max_lanes: u32) {
         self.beam_bounds = (page.max(1), frames.max(1));
+        self.beam_max_lanes = max_lanes;
     }
 
     /// Where instance `id`'s beam group keeps its page lists now, and how it
@@ -581,6 +586,14 @@ impl Plane {
         // (BEAM-PAGE-LISTS §3, §4). A search past it faults SHORT by name.
         let beam = match program.beam_lanes() {
             Some(lanes) => {
+                if lanes > self.beam_max_lanes {
+                    return Err(Fault::Ceiling {
+                        what: "beams of one group, whose step lays its tables in one block's \
+                               shared memory",
+                        need: u64::from(lanes),
+                        have: u64::from(self.beam_max_lanes),
+                    });
+                }
                 let (page, frames) = self.beam_bounds;
                 if extents.key_len <= 1 {
                     return Err(Fault::program(

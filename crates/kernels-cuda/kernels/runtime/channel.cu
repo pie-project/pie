@@ -731,6 +731,7 @@ __global__ void copy_pages(
 #define PIE_BEAM_HEADER 4u
 #define PIE_PAGES_PARENT 5u
 #define PIE_PAGES_EXHAUSTED 6u
+#define PIE_PAGES_TOO_WIDE 7u
 
 // A lane's page table to resolve: its staged indices from entry `f0`, its
 // rows' staged write pages and offsets.
@@ -841,12 +842,11 @@ struct BeamStepRun {
 
 static_assert(sizeof(BeamStepRun) == 88, "BeamStepRun: the Rust `channel::BeamStepRun` mirrors this layout");
 
-#define PIE_BEAM_MAX_LANES 64u
 
 // One block a group (blockIdx.x). §5 on the group's first fire, §6.1-6.3
 // after, then §6.5 over its lanes' staged tables; leaves this fire's copies
 // (§6.4) in its state for `copy_pages`.
-__global__ void beam_step(const BeamStepRun* __restrict__ runs, u32 run_count)
+__global__ void beam_step(const BeamStepRun* __restrict__ runs, u32 run_count, u32 width)
 {
     if (blockIdx.x >= run_count) return;
     const BeamStepRun r = runs[blockIdx.x];
@@ -855,7 +855,15 @@ __global__ void beam_step(const BeamStepRun* __restrict__ runs, u32 run_count)
     // The pool pages the fire stages (`reserve` is the pool's whole): the
     // lowest-free rule keeps every page the step names below them.
     const u32 K = r.backed < Q ? r.backed : Q;
-    if (B == 0u || B > PIE_BEAM_MAX_LANES || Q > cap) return;
+    if (B == 0u) return;
+    // A group wider than the launch was laid for (`width`), or a pool past
+    // the state's columns, steps nothing: each of its lanes faults by name.
+    if (B > width || Q > cap) {
+        for (u32 b = threadIdx.x; b < B; b += blockDim.x) {
+            atomicMax(&r.faults[b], B > width ? PIE_PAGES_TOO_WIDE : PIE_PAGES_PAST_RESERVE);
+        }
+        return;
+    }
     u32* header = r.state;
     const u32 primed = header[0];
     const u32 fired = header[1];
@@ -873,11 +881,14 @@ __global__ void beam_step(const BeamStepRun* __restrict__ runs, u32 run_count)
     const u32 c = r.slot / S - f0, o = r.slot % S;
     const u32 cp = r.slot == 0u ? 0u : (r.slot - 1u) / S - f0;
 
-    __shared__ u32 parent_of[PIE_BEAM_MAX_LANES];
-    __shared__ u32 need[PIE_BEAM_MAX_LANES];
-    __shared__ u32 rank_of[PIE_BEAM_MAX_LANES];
-    __shared__ u32 fresh[PIE_BEAM_MAX_LANES];
-    __shared__ u32 hand[PIE_BEAM_MAX_LANES];
+    // Per-lane tables and the lanes' pairwise common slots, laid for the
+    // launch's widest group (`width`, `channel::beam_step_shared_bytes`).
+    extern __shared__ u32 beam_shared[];
+    u32* parent_of = beam_shared;
+    u32* need = parent_of + width;
+    u32* rank_of = need + width;
+    u32* fresh = rank_of + width;
+    u32* hand = fresh + width;
     __shared__ u32 counts[256];
     __shared__ u32 needed;
     __shared__ u32 handed;
@@ -1050,7 +1061,7 @@ __global__ void beam_step(const BeamStepRun* __restrict__ runs, u32 run_count)
     // fire's rows (with one lane every row is common), never below the
     // folded slot; monotone, read by the host at harvest.
     u32* lca = copies + 3u * B;
-    __shared__ u32 lca_new[PIE_BEAM_MAX_LANES * PIE_BEAM_MAX_LANES];
+    u32* lca_new = hand + width;
     __shared__ u32 common;
     if (threadIdx.x == 0u) common = r.slot + 1u;
     __syncthreads();
