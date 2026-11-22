@@ -168,14 +168,11 @@ fn ensure_by(
 /// What a load measured of its decode products (`Shell::routes_by_body`):
 /// each shape under each kernel, the median ns of the decode step whose
 /// body serves it so, and the interquartile spread of the rounds.
-#[cfg(feature = "rocm")]
-pub type ProductTimes =
-    Vec<(kernels_cuda::linear::routes::Shape, kernels_cuda::linear::routes::Kernel, f64, f64)>;
+pub type ProductTimes = Vec<(kernels_cuda::linear::routes::Shape, u32, f64, f64)>;
 
 /// `measured` saved in device `device`'s user profile under `profiles`
 /// (`[rates] product_ns`, joining what it holds), with its provenance; the
 /// path, or `None` where the load names no profile directory.
-#[cfg(feature = "rocm")]
 pub fn save_product_times(
     profiles: Option<&std::path::Path>,
     device: &str,
@@ -187,8 +184,20 @@ pub fn save_product_times(
     let path = crate::chip::SHELF.user_path(profiles, device);
     let registry = crate::chip::registry();
     let existing = std::fs::read_to_string(&path).ok().map(|text| registry.prune(&text).0);
+    // What the profile held, each newly measured entry in place of one of
+    // the same key: entries accumulate load to load.
+    let fresh = kernels_cuda::linear::routes::product_times(measured);
+    let mut joined: Vec<profile::fire::ProductTime> = existing
+        .as_deref()
+        .and_then(|text| registry.parse(text, "the device's profile", profile::Strict::User).ok())
+        .and_then(|file| file.tuned.rates.product_ns)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|old| fresh.iter().all(|new| new.key() != old.key()))
+        .collect();
+    joined.extend(fresh);
     let rates = Rates {
-        product_ns: Some(kernels_cuda::linear::routes::product_times(measured)),
+        product_ns: Some(joined),
         ..Rates::default()
     };
     let how = (
@@ -1242,5 +1251,63 @@ mod ensure_tests {
         })
         .unwrap_err();
         assert!(err.contains("measuring them needs"), "{err}");
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod kept_routes_tests {
+    use kernels_cuda::linear::routes::{Kind, Routes, Shape, code};
+
+    /// Two loads across a version bump: the first measures every candidate
+    /// of its decode products and keeps the times in the device's profile;
+    /// the second, from another pie build, reads that profile and measures
+    /// nothing. A changed kernel is measured again.
+    #[test]
+    fn a_profile_kept_across_a_version_bump_measures_nothing_again() {
+        let dir = std::env::temp_dir().join(format!("pie-kept-routes-{}", std::process::id()));
+        let platform = "sm_89|driver 13000|cublaslt 130000";
+        let candidates: Vec<u32> = ["skinny jit/a/r1", "cublaslt 7.0.1.1", "cublaslt 7.0.2.1"]
+            .iter()
+            .map(|fingerprint| code(platform, fingerprint))
+            .collect();
+        let shapes = [
+            Shape { kind: Kind::Plain, rows: 1536, k: 1536, m: 64 },
+            Shape { kind: Kind::Plain, rows: 12288, k: 1536, m: 32 },
+        ];
+
+        // Load one: an empty profile notes every shape wanted.
+        let first = Routes::default();
+        for shape in shapes {
+            first.pick(shape, 0x1000, &candidates);
+        }
+        let wanted = first.wanted();
+        assert_eq!(wanted.len(), shapes.len());
+        let measured: Vec<_> = wanted
+            .iter()
+            .flat_map(|(shape, noted)| {
+                noted.candidates.iter().map(|&kernel| (*shape, kernel, 1000.0, 10.0))
+            })
+            .collect();
+        let saved = super::save_product_times(Some(&dir), "test-device", &measured)
+            .expect("the times save")
+            .expect("a profile directory was named");
+
+        // Load two, another pie build: the profile as saved, read back.
+        let text = std::fs::read_to_string(&saved).expect("the saved profile reads");
+        let bumped = text.replace(&engine::rates::build_commit(), "another-build");
+        let file = crate::chip::registry()
+            .parse(&bumped, "the kept routes", profile::Strict::User)
+            .expect("the kept routes parse");
+        let second = Routes::of(file.tuned.rates.product_ns.as_deref().unwrap_or_default());
+        for shape in shapes {
+            second.pick(shape, 0x1000, &candidates);
+        }
+        assert!(second.wanted().is_empty(), "a kept profile measures nothing across a version bump");
+
+        // A kernel whose code changed is another candidate: wanted again.
+        let changed = [code(platform, "skinny jit/a/r2"), candidates[1], candidates[2]];
+        second.pick(shapes[0], 0x1000, &changed);
+        assert_eq!(second.wanted().len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
