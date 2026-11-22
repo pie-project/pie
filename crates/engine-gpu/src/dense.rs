@@ -207,8 +207,10 @@ impl Dense {
 /// every number written as it reads back from a profile (the shortest form
 /// of each float), so the key is the same whatever order a layer listed the
 /// curves in and whatever layer (a load's own, a user's file, a committed
-/// export) stated them. The curves (each one's id, points, spreads and
-/// stop; not its stored key, which says what measured it), the model's
+/// export) stated them, and whatever other model's curves the device
+/// stores beside them. The curves at the model's planes (each one's id,
+/// points, spreads and stop; not its stored key, which says what measured
+/// it), the model's
 /// dense planes, the dense choice, the load's lanes, its top rows and the
 /// target.
 #[must_use]
@@ -226,9 +228,12 @@ pub fn settle_of(
             .collect::<Vec<_>>()
             .join(",")
     };
+    // The curves at the model's own planes alone: another model's curves,
+    // stored on the same device, weigh nothing this settle weighed.
     let mut curves: Vec<String> = curves
         .unwrap_or_default()
         .iter()
+        .filter(|c| planes.iter().any(|&(n, k, ..)| (n, k) == (c.n, c.k)))
         .map(|c| {
             format!(
                 "{}/{}@{}x{}[{}]s[{}]{}",
@@ -1328,6 +1333,11 @@ mod tests {
             first,
             "a profile written and read back keys the same"
         );
+        let mut other = r.clone();
+        let mut elsewhere = other.kernel_tflops_by_shape.as_ref().unwrap()[0].clone();
+        elsewhere.n = 777;
+        other.kernel_tflops_by_shape.as_mut().unwrap().push(elsewhere);
+        assert_eq!(key(&other), first, "another model's curve keys nothing");
         let mut moved = r.clone();
         moved.kernel_tflops_by_shape.as_mut().unwrap()[0].curve[0].1 *= 1.5;
         assert_ne!(key(&moved), first, "a point that moves keys anew");

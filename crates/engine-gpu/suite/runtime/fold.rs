@@ -899,8 +899,10 @@ fn a_hybrid_prompt_past_the_bound_a_layer_at_a_time_is_cut_by_rows_and_serves_al
 /// (`engine_gpu::rates::for_bound`), storing nothing, and holds every step
 /// to the bound: held to one between a row's layer and the widest step's,
 /// a long prompt is cut by rows; held to its own estimate, it goes a few
-/// layers a submission and serves what it served whole (its last logits,
-/// and a decode after it).
+/// layers a submission. (Serving a cut step is the measured load's test
+/// above: the cut is the same once a bound holds the steps; a miniature's
+/// launch-bound steps run several times their skipped estimate, which the
+/// landed ratio then carries, so a served cut is no fixed outcome here.)
 #[test]
 fn under_skip_with_a_bound_and_no_rates_a_long_prompt_is_held_and_cut() {
     use engine_gpu::submit::{Admitted, StepRows};
@@ -987,6 +989,9 @@ fn under_skip_with_a_bound_and_no_rates_a_long_prompt_is_held_and_cut() {
     );
     let (whole, whole_decode, at, _) = serve(&mut model, 2e9);
     assert_eq!(at, 1, "a step within the bound is fired whole");
+    for (what, logits) in [("prompt", &whole), ("decode", &whole_decode)] {
+        assert!(logits.iter().all(|v| v.is_finite()), "{what}: finite");
+    }
     // Read at a ratio of 1 (`Shell::hold_to`), as a fresh load's first step
     // is: held to a bound between a row's layer and the step's, the step is
     // cut by rows; held to its own whole estimate (a prompt step goes whole
@@ -1028,15 +1033,6 @@ fn under_skip_with_a_bound_and_no_rates_a_long_prompt_is_held_and_cut() {
         "held to its own estimate, the step goes a few layers a submission: {:?}",
         split.admit(step)
     );
-    let (layered, layered_decode, _, _) = serve(&mut model, whole_ns);
-    for (what, a, b) in [("prompt", &whole, &layered), ("decode", &whole_decode, &layered_decode)] {
-        assert!(a.iter().chain(b.iter()).all(|v| v.is_finite()), "{what}: finite");
-        assert_eq!(
-            crate::model_logits::argmax(a),
-            crate::model_logits::argmax(b),
-            "{what}: the same argmax whole and split"
-        );
-    }
     let stored: Vec<_> = walkdir(&profiles);
     assert!(stored.is_empty(), "a skipping load stores nothing: {stored:?}");
     let _ = std::fs::remove_dir_all(&profiles);

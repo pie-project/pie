@@ -42,7 +42,9 @@ seeded!(
 /// (`profiles/<device>.covers.json`, `pie tune export --engine vulkan`),
 /// each listed here: the runtime takes a cover whose key matches where the
 /// home's own cache holds none (`engine::Engine::committed_covers`).
-pub const COVERS: &[&str] = &[];
+pub const COVERS: &[&str] = &[include_str!(
+    "../profiles/nvidia-rtx-pro-4500-blackwell.covers.json"
+)];
 
 /// What a device no family file applies to runs.
 pub const DERIVED: &str = include_str!("derived.toml");
