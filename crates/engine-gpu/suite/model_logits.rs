@@ -1134,8 +1134,10 @@ fn a_windowed_miniature_fires_every_rung_from_what_the_load_built() {
 #[test]
 fn a_served_miniature_is_in_the_ledger_whole() {
     use engine::memory::Class;
+    // The driver reports what it holds the process, every device summed:
+    // no other test holds one while this one reads it.
+    crate::gpu::sole();
     let fixture = fixture("qwen3-micro-text", None);
-    // No other test loads while this one reads what the driver holds.
     let _alone = loading();
     let Some(mut shell) = load_alone(
         &fixture,
