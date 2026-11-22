@@ -2951,13 +2951,16 @@ impl<B: Serve> Shell<B> {
                             "device's spans"
                         }
                     );
-                    // Decided where the kernel taken ran apart from every other
-                    // option: each of its fires faster than each of theirs.
-                    let decided = samples
-                        .iter()
-                        .enumerate()
-                        .filter(|&(i, _)| i != taken)
-                        .all(|(_, s)| slowest(&samples[taken]) < fastest(s));
+                    // Decided where the choice stands (no option ran apart from
+                    // it, so the options tie with it or lose), or where the
+                    // kernel taken ran apart from every other option too;
+                    // undecided where it beat the choice but ties another.
+                    let decided = taken == 0
+                        || samples
+                            .iter()
+                            .enumerate()
+                            .filter(|&(i, _)| i != taken)
+                            .all(|(_, s)| slowest(&samples[taken]) < fastest(s));
                     if let Some(range) = self.settled.last_mut() {
                         range.replaced = taken != 0;
                         range.kernel = taking.get(taken).copied().flatten();
