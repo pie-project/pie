@@ -30,7 +30,7 @@ fn reference(a: &[f32], w: &[f32], bias: Option<&[f32]>, m: usize, n: usize, k: 
 /// The table that answers the turned kernel wherever it and the skinny
 /// kernel both cover a product: a test of the turned kernel runs under it.
 fn turned_table() -> std::sync::Arc<kernels_rocm::linear::routes::Routes> {
-    std::sync::Arc::new(kernels_rocm::linear::routes::Routes::all(kernels_rocm::linear::routes::Kernel::Turned))
+    std::sync::Arc::new(kernels_rocm::linear::routes::Routes::all(kernels_rocm::linear::routes::Kernel::Turned as u32))
 }
 
 #[test]
