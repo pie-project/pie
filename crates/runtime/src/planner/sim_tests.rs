@@ -2516,7 +2516,7 @@ fn replay_seed(seed: u64) -> Vec<Failure> {
 /// fixed, each with a seed that showed it (its regression test below,
 /// ignored until fixed). The fast sweep fails on any other shape; once a
 /// shape is fixed its entry goes and its test is no longer ignored.
-const KNOWN: [(&str, u64); 4] = [
+const KNOWN: [(&str, u64); 3] = [
     // Every tier full, no idle cache: the device's chunks, the host's and
     // the disk's all held, the fleet's state past all three, each resident
     // a page short, every one's kv past the few swap slots left, the rest
@@ -2535,15 +2535,11 @@ const KNOWN: [(&str, u64); 4] = [
         "stall bind room: placement none, moves none, host_short true",
         3243,
     ),
-    // An instance's bind over the run of a pair whose member the engine
-    // still holds bound unparked while the roles gave the pair fresh slots
-    // at another holder's restore: under investigation.
-    ("claims a bind of instance # (program #): Instance slots", 1348),
 ];
 
 /// Shapes the simulation found and the runtime fixed, each seed's
 /// regression test run in the suite; the fast sweep fails on them again.
-const FIXED: [(&str, u64); 20] = [
+const FIXED: [(&str, u64); 21] = [
     // A bind's guest parts and its tables, rings or adapter each open a
     // fresh chunk, the refusal quoting the part short alone: served one
     // chunk, short again, a spin (seeds 1, 46, 4137, 4287). The refusal
@@ -2612,6 +2608,13 @@ const FIXED: [(&str, u64); 20] = [
     // physical place, its later chunks read by logical id after a
     // compaction moved chunks.
     ("corrupt", 3785),
+    // An eviction taken back for a full tier below returned its process
+    // resident before the take-back ran (spawned, after its copies): picked
+    // again at once, the second eviction parked nothing of its items still
+    // moving, the take-back then left its instance bound on the device
+    // beside a process said evicted, and its pair was taken anew under it
+    // at the restore: another program's bind landed on the pair's old run.
+    ("claims a bind of instance # (program #): Instance slots", 1348),
 ];
 
 fn known(shape: &str) -> bool {
@@ -2770,9 +2773,8 @@ fn sim_seed_3591_residents_past_the_swap_left_are_no_deadlock() {
 }
 
 #[test]
-#[ignore = "known: an instance bound over a live pair's run (KNOWN[3])"]
-fn sim_seed_1348_no_bind_lands_on_a_live_pair_s_run() {
-    regression(KNOWN[3]);
+fn sim_seed_1348_an_eviction_taken_back_is_back_before_its_process_is_resident() {
+    regression(FIXED[20]);
 }
 
 /// What a run did, as a string two runs of one seed must agree on.

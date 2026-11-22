@@ -685,6 +685,30 @@ impl From<CopyFailure> for String {
     }
 }
 
+impl MoveGuard {
+    /// Takes the move back now, once every copy of it handed to the engine
+    /// has landed: what follows reads the items where the move found them.
+    /// Dropped instead, the take-back ran later on a task of its own, and
+    /// the process said resident meanwhile was picked again, its second
+    /// eviction finding its items still moving and parking none of them;
+    /// the first move's take-back then left its instance bound on the
+    /// device beside a process said evicted, and its pair was taken anew
+    /// at its restore under it (the simulation's seed 1348: a bind over a
+    /// live pair's run).
+    async fn take_back(mut self) {
+        let Some(txn) = self.txn.take() else {
+            return;
+        };
+        let in_flight = std::mem::take(&mut self.in_flight);
+        if !self.submitted {
+            abort(self.model, self.engine, txn);
+            return;
+        }
+        let settled = crate::scheduler::settle_copies(self.engine);
+        settle_or_abandon(self.model, self.engine, in_flight, settled, txn).await;
+    }
+}
+
 impl Drop for MoveGuard {
     fn drop(&mut self) {
         let Some(txn) = self.txn.take() else {
@@ -918,15 +942,17 @@ pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
         tracing::warn!(pid = %pid, %error, "planner: eviction copy failed");
         if error.tier_full {
             // The tier below is full: nothing on the device changed, the
-            // move is taken back, the process stays resident.
-            drop(guard);
+            // move is taken back, the process stays resident, once the
+            // take-back is done.
+            guard.take_back().await;
             planner.eviction_tier_full(pid, &error.message);
         } else if error.untouched {
             // Refused untouched: its state lies where it lay, and the move
             // is taken back; the process stays as it was.
-            drop(guard);
+            guard.take_back().await;
             planner.eviction_copy_refused(pid, &error.message);
         } else {
+            guard.take_back().await;
             planner.eviction_copy_failed(pid, &error.message);
         }
         return;
@@ -940,7 +966,7 @@ pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     // refuses fails the process by name, its move taken back.
     if let Err(error) = park(engine, guard.parked()).await {
         tracing::warn!(pid = %pid, %error, "planner: eviction's park not taken by the engine");
-        drop(guard);
+        guard.take_back().await;
         planner.eviction_copy_failed(pid, &error);
         return;
     }
@@ -1036,7 +1062,7 @@ async fn move_out(
     let (model, engine) = planner.locus();
     if let Err(error) = guard.copy(&planner, ProcessId::nil()).await {
         tracing::warn!(%error, "planner: {label} copy failed");
-        drop(guard);
+        guard.take_back().await;
         done(&planner, false);
         return;
     }
