@@ -197,6 +197,29 @@ pub fn register_model_with_chunks(kv_page_size: u32, engines: &[EngineStores]) -
     REGISTRY.push(RwLock::new(stores))
 }
 
+// A test's own kv seed for the shared stores it registers on its thread
+// ([`set_test_kv_seed`]): a seeded simulation's page keys, and every order
+// read from them, the same on each run.
+#[cfg(test)]
+thread_local! {
+    static TEST_KV_SEED: std::cell::Cell<Option<[u8; 32]>> = const { std::cell::Cell::new(None) };
+}
+
+/// Seeds the kv stores this thread registers next with `seed` (`None`:
+/// random again).
+#[cfg(test)]
+pub fn set_test_kv_seed(seed: Option<[u8; 32]>) {
+    TEST_KV_SEED.with(|cell| cell.set(seed));
+}
+
+fn kv_seed() -> [u8; 32] {
+    #[cfg(test)]
+    if let Some(seed) = TEST_KV_SEED.with(std::cell::Cell::get) {
+        return seed;
+    }
+    rand::random::<[u8; 32]>()
+}
+
 /// The stores of an engine whose pool is `shared`: kv pages are the list
 /// shape's slot refs, the rs store's state slots its records (or its
 /// window lists' pages each list's refs), as many seats as records. Below
@@ -217,7 +240,7 @@ pub fn shared_stores(
         || ShapePool::new(ShapeKind::List, 0, 0, 0),
         |list| ShapePool::shared(shared, list),
     );
-    let mut kv = KvStore::with_pool(pages, 0, 0, rand::random::<[u8; 32]>());
+    let mut kv = KvStore::with_pool(pages, 0, 0, kv_seed());
     if let Some(list) = list {
         let host = tiers
             .host
@@ -228,21 +251,63 @@ pub fn shared_stores(
     if let Some(identity) = crate::model::identity() {
         kv.set_domain(identity.domain());
     }
-    let rs = RsStore::shared(shared, tiers.host.as_ref());
-    kv.set_keeps(kv_sharing() && records == 0 && !rs.is_window());
-    kv.set_page_size(kv_page_size);
+    let kv = Arc::new(parking_lot::Mutex::new(kv));
+    let mut rs = RsStore::shared(shared, tiers.host.as_ref());
+    // Where no host row is free (no host tier on unified memory), an
+    // evicted process's records and rs list slots park on disk.
+    if tiers.disk_slots > 0 {
+        rs.set_disk(
+            shared,
+            Arc::new(KvDiskSlots(Arc::downgrade(&kv), tiers.disk_chunk_slots)),
+        );
+    }
+    {
+        let mut kv = kv.lock();
+        kv.set_keeps(kv_sharing() && records == 0 && !rs.is_window());
+        kv.set_page_size(kv_page_size);
+    }
     Stores {
-        kv: Arc::new(parking_lot::Mutex::new(kv)),
+        kv: Arc::clone(&kv),
         rs: Arc::new(Mutex::new(rs)),
         seats: Arc::new(Mutex::new(Seats::new(records))),
         kv_page_size,
         context_pages: context_pages(max_context, kv_page_size),
         shared: Some(Arc::clone(shared)),
         host: tiers.host.clone(),
-        roles: super::roles::Roles::new(shared, tiers.host.as_ref())
-            .map(|roles| Arc::new(Mutex::new(roles))),
+        roles: super::roles::Roles::new(shared, tiers.host.as_ref()).map(|mut roles| {
+            if tiers.disk_slots > 0 {
+                roles.set_disk(Arc::new(KvDiskSlots(
+                    Arc::downgrade(&kv),
+                    tiers.disk_chunk_slots,
+                )));
+            }
+            Arc::new(Mutex::new(roles))
+        }),
         pinned_kv: None,
         pinned_state: None,
+    }
+}
+
+/// The disk tier's slot file as the roles park on it: whole disk chunks of
+/// the kv store's slots, `.1` kv slots a chunk ([`super::roles::DiskSlots`]).
+struct KvDiskSlots(std::sync::Weak<parking_lot::Mutex<KvStore>>, u32);
+
+impl super::roles::DiskSlots for KvDiskSlots {
+    fn take_chunks(&self, n: usize) -> Option<Vec<u32>> {
+        let kv = self.0.upgrade()?;
+        with_kv_lock(&kv, "roles-disk", |kv| kv.take_disk_chunks(n, self.1))
+    }
+
+    fn give_chunks(&self, chunks: &[u32]) {
+        if let Some(kv) = self.0.upgrade() {
+            with_kv_lock(&kv, "roles-disk", |kv| kv.give_disk_chunks(chunks, self.1));
+        }
+    }
+
+    fn free_chunks(&self) -> usize {
+        self.0.upgrade().map_or(0, |kv| {
+            with_kv_lock(&kv, "roles-disk", |kv| kv.disk_free_slots()) / self.1.max(1) as usize
+        })
     }
 }
 

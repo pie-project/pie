@@ -668,6 +668,7 @@ pub fn refusal(refusal: Refusal) -> Error {
     match refusal {
         Refusal::Closed { what, id } => Error::Closed { what, id },
         Refusal::Program(why) => Error::Program(why),
+        Refusal::Claimed(refusal) => Error::Claimed(refusal),
     }
 }
 
@@ -680,6 +681,7 @@ pub fn fault(fault: Fault) -> Error {
     }
     match fault {
         Fault::Deviceless | Fault::Device { .. } => Error::Device(fault.to_string()),
+        Fault::TierFull(_) => Error::TierFull(fault.to_string()),
 
         Fault::PatchPayload { .. } => Error::Invalid(fault.to_string()),
 
@@ -716,6 +718,7 @@ pub fn fault(fault: Fault) -> Error {
 
         Fault::Adapter { .. } => Error::Load(fault.to_string()),
         Fault::Blob { .. } => Error::Load(fault.to_string()),
+        Fault::Claimed(refusal) => Error::Claimed(refusal),
         Fault::Program { .. } => Error::Program(fault.to_string()),
         Fault::Vulkan { .. }
         | Fault::Wgpu { .. }
@@ -1174,7 +1177,7 @@ where
         let landed = self
             .landed
             .clone()
-            .map(|sink| -> Box<dyn FnOnce() + Send> { Box::new(move || sink(token)) });
+            .map(|sink| -> Box<dyn FnOnce() + Send> { Box::new(move || sink(token, engine::Landing::Landed)) });
         let copied = self
             .loaded_mut()?
             .copy_slots_landing(copy, landed)

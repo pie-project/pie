@@ -65,6 +65,10 @@ pub(crate) struct Half {
     /// The taking of its pair's slots its session lies in
     /// (`engine::InstanceBinding::pair_generation`).
     pair_generation: u64,
+    /// Its process parked (`engine::Rebind::Parked`): its slots are
+    /// another owner's until a rebind names where it lies, so nothing of
+    /// it is repointed, claimed or fired meanwhile.
+    parked: bool,
     poisoned: Arc<AtomicBool>,
 }
 
@@ -85,6 +89,12 @@ impl Half {
         pass: Pass<'_>,
     ) -> Result<(), Refusal> {
         let instance = self.id;
+        if self.parked {
+            return Err(Refusal::Program(format!(
+                "instance {instance} is fired while parked: its slots are another owner's until \
+                 a rebind names where it lies"
+            )));
+        }
         let inputs = PassInputs::none();
         let mut runner =
             crate::guest::run::OnDevice::new(device, &mut self.session, widen, pass.seats);
@@ -498,16 +508,25 @@ impl Plane {
         #[cfg(not(feature = "wgpu"))]
         let _ = (place, layout);
         #[cfg(feature = "wgpu")]
-        let session = self
+        let mut session = self
             .build_session(place, binding, &plan, layout)
             .map_err(|why| {
                 Refusal::Program(format!("program {} does not bind: {why}", binding.program))
             })?;
         // The instance's room is fresh, its pair's where none holds that
-        // taking: both are another owner's bytes until cleared.
+        // taking: both are another owner's bytes until cleared. The pair's
+        // state is claimed by the group bound on its taking, before it is.
         #[cfg(feature = "wgpu")]
         {
             let fresh_pair = self.takings.take(&binding.pair, binding.pair_generation);
+            let group = self
+                .takings
+                .group(&binding.pair, binding.pair_generation)
+                .map(|group| (group, binding.pair_generation));
+            if let Err(fault) = session.join_pair(group) {
+                self.takings.give(&binding.pair, binding.pair_generation);
+                return Err(Refusal::fault(fault));
+            }
             if let Err(fault) = session.clear(fresh_pair) {
                 self.takings.give(&binding.pair, binding.pair_generation);
                 return Err(Refusal::Program(format!(
@@ -532,6 +551,7 @@ impl Plane {
                     inst: inst.clone(),
                     session,
                     pair_generation: binding.pair_generation,
+                    parked: false,
                     poisoned: Arc::clone(&poisoned),
                 })),
                 #[cfg(feature = "wgpu")]
@@ -569,8 +589,11 @@ impl Plane {
         #[cfg(feature = "wgpu")]
         {
             let half = seat.half.lock().expect("half lock poisoned");
-            self.takings
-                .give(half.session.pair_place(), half.pair_generation);
+            // A parked one left its taking at its park.
+            if !half.parked {
+                self.takings
+                    .give(half.session.pair_place(), half.pair_generation);
+            }
         }
         #[cfg(not(feature = "wgpu"))]
         drop(seat);
@@ -1043,7 +1066,7 @@ impl Plane {
             &sizes,
             place.align,
         )
-        .map_err(|fault| Refusal::Program(fault.to_string()))?;
+        .map_err(Refusal::fault)?;
         Ok(ProgramFacts {
             instance,
             ..ProgramFacts::default()
@@ -1064,9 +1087,14 @@ impl Plane {
         #[cfg(feature = "wgpu")]
         for seat in self.instances.values_mut() {
             let mut half = seat.half.lock().expect("half lock poisoned");
+            // A parked instance's slots are another owner's: repointed and
+            // claimed at its rebind, not here.
+            if half.parked {
+                continue;
+            }
             half.session
                 .rebind(pools)
-                .map_err(|fault| Refusal::Program(fault.to_string()))?;
+                .map_err(Refusal::fault)?;
             seat.scores = half.session.scores();
         }
         #[cfg(not(feature = "wgpu"))]
@@ -1105,21 +1133,55 @@ impl Plane {
                     seat.gate.settle(*id)?;
                     let mut half = seat.half.lock().expect("half lock poisoned");
                     let was = (half.session.pair_place().clone(), half.pair_generation);
-                    half.session
-                        .retarget(pools, instance, scratch, pair)
-                        .map_err(|fault| Refusal::Program(fault.to_string()))?;
+                    // The pair's taking it binds on is claimed by the group
+                    // bound on it, this member joining it with its own runs.
+                    let fresh_pair = self.takings.take(pair, *pair_generation);
+                    let group = self
+                        .takings
+                        .group(pair, *pair_generation)
+                        .map(|group| (group, *pair_generation));
+                    if let Err(fault) = half.session.retarget(pools, instance, scratch, pair, group)
+                    {
+                        self.takings.give(pair, *pair_generation);
+                        return Err(Refusal::fault(fault));
+                    }
                     // The unpark's room is fresh; the pair's is cleared where
                     // this is the first instance on its new taking.
-                    self.takings.give(&was.0, was.1);
-                    let fresh_pair = self.takings.take(pair, *pair_generation);
+                    // A parked one left its taking at its park.
+                    if !half.parked {
+                        self.takings.give(&was.0, was.1);
+                    }
                     half.pair_generation = *pair_generation;
+                    half.parked = false;
                     half.session
                         .clear(fresh_pair)
-                        .map_err(|fault| Refusal::Program(fault.to_string()))?;
+                        .map_err(Refusal::fault)?;
                     seat.scores = half.session.scores();
                 }
                 #[cfg(not(feature = "wgpu"))]
                 let _ = (seat, pools, instance, scratch, pair, pair_generation);
+                Ok(())
+            }
+            Rebind::Parked { id, kept } => {
+                let seat = self.instances.get_mut(id).ok_or(Refusal::Closed {
+                    what: "instance",
+                    id: id.0,
+                })?;
+                #[cfg(feature = "wgpu")]
+                {
+                    seat.gate.settle(*id)?;
+                    let mut half = seat.half.lock().expect("half lock poisoned");
+                    // Said again by a move down of its tables: kept nowhere now.
+                    half.session.park(*kept);
+                    if !half.parked {
+                        // It leaves its pair's taking as it leaves the group.
+                        self.takings
+                            .give(half.session.pair_place(), half.pair_generation);
+                        half.parked = true;
+                    }
+                }
+                #[cfg(not(feature = "wgpu"))]
+                let _ = (seat, kept);
                 Ok(())
             }
             Rebind::Channel { id, .. } => Err(Refusal::Program(format!(
@@ -1342,7 +1404,7 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
                 |at, local| session.span(at, local).map(|(_, held)| held),
                 &seats,
             )
-            .map_err(|fault| Refusal::Program(fault.to_string()))?;
+            .map_err(Refusal::fault)?;
             if let Some((output, lane)) = unread {
                 return Err(engine_gpu::program::unread(instance, &output, lane));
             }

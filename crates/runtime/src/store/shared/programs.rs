@@ -741,6 +741,11 @@ pub async fn take_raise(
         evacuation.moves.len(),
         stood,
     );
+    // Frames held out under the cap the raise may now cover: the walk
+    // lifts the cap to them (no fire in flight wakes it otherwise).
+    if super::owed_cut_rows(mover.engine()) > 0 {
+        super::ask_walk(mover.engine());
+    }
     Ok(Some(evacuation))
 }
 
@@ -763,26 +768,35 @@ pub async fn carry_raise(
     if notice.is_none() && evacuation.moves.is_empty() {
         return Ok(());
     }
-    if let Some((from, to)) = notice
-        && let Err(error) = mover.set_rung(from, to).await
-    {
-        tracing::warn!(%error, from, to, "a raise's carve was refused; fires stay at the rung in hand");
-        shared.lock().unwrap().raise_refused(evacuation);
-        return Err(format!(
-            "the engine refused the carve for rung {to}: {error}"
-        ));
-    }
+    // The state in the wider carve moves down first, and only then does
+    // the engine back the carve over where it lay: told first, a fire still
+    // at the rung in hand that read a chunk not yet moved was refused
+    // inside the carve (Mac Pro at 2 GiB on 6c21ebca3: "state chunk 231
+    // (physical 433) lies inside the activation span's backed carve", a
+    // forward failed and three beams were lost).
     if !evacuation.moves.is_empty()
         && let Err(error) = mover.evacuate(SharedPool::rung_moves(evacuation)).await
     {
         tracing::warn!(%error, "a raise's copy was refused; fires stay at the rung in hand");
         shared.lock().unwrap().raise_refused(evacuation);
-        if let Some((from, to)) = notice
-            && let Err(error) = mover.set_rung(to, from).await
-        {
-            tracing::warn!(%error, from = to, to = from, "a rung notice was refused");
-        }
         return Err(format!("the engine refused a raise's copy: {error}"));
+    }
+    if let Some((from, to)) = notice
+        && let Err(error) = mover.set_rung(from, to).await
+    {
+        tracing::warn!(%error, from, to, "a raise's carve was refused; fires stay at the rung in hand");
+        let next = mover.epoch_now().saturating_add(1);
+        let mut pool = shared.lock().unwrap();
+        if evacuation.moves.is_empty() {
+            pool.raise_refused(evacuation);
+        } else {
+            // Its copy landed: the state stays where it moved, and the
+            // activation is the rung in hand's again.
+            pool.raise_carve_refused(next);
+        }
+        return Err(format!(
+            "the engine refused the carve for rung {to}: {error}"
+        ));
     }
     let next = mover.epoch_now().saturating_add(1);
     shared.lock().unwrap().raise_copied(next);
@@ -815,6 +829,9 @@ pub async fn fund_span(
     mover: &impl Mover,
 ) -> Result<(), String> {
     let engine = mover.engine();
+    // Each wait on the rung parks the process waiting (where one does: a
+    // pass's ask; a bind's funding on the lane has none): it submits
+    // nothing until the rung is there, so no frame waits on its lanes.
     loop {
         // Armed before the look: a change between the two is not lost.
         let watch = super::rung_watch(engine);
@@ -843,6 +860,7 @@ pub async fn fund_span(
             // The engine holds a rung the terms no longer fit: the walk
             // brings it down, and tells the rung.
             super::ask_walk(engine);
+            let _parked = crate::inferlet::process::parks_here();
             watch.await;
             continue;
         };
@@ -855,6 +873,7 @@ pub async fn fund_span(
             if !cut {
                 super::ask_walk(engine);
             }
+            let _parked = crate::inferlet::process::parks_here();
             watch.await;
             continue;
         }
@@ -876,6 +895,7 @@ pub async fn fund_span(
         {
             // The walk is raising it, or the room went to another since:
             // either moves the rung or frees room.
+            let _parked = crate::inferlet::process::parks_here();
             watch.await;
         }
     }

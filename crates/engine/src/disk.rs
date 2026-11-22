@@ -129,20 +129,76 @@ impl SlotFile {
     }
 }
 
+/// The disk tier's bytes where none is stated: [`derived_budget`] against
+/// the free space under `dir`.
 #[must_use]
 pub fn unstated_budget(
     dir: &Path,
-    rows: u64,
-    row_bytes: u64,
-    pages: u64,
-    seated: u64,
+    seats: u64,
+    state_bytes: u64,
+    seat_pages: u64,
     page_bytes: u64,
+    guest_bytes: u64,
+) -> u64 {
+    derived_budget(seats, state_bytes, seat_pages, page_bytes, guest_bytes, free_space(dir))
+}
+
+/// The disk tier's bytes derived on their own, from what can be parked:
+/// the declared concurrency's state (`seats` sequences, `state_bytes`
+/// each) and kv (`seat_pages` pages of `page_bytes`: the seats at the
+/// declared context), each on the slot file's direct I/O boundary, within
+/// the `free` bytes the disk has. Never a share of the host tier (a host
+/// budget below one chunk seated no disk tier at all), a fraction of the
+/// free space, nor the device pool (a hidden multiple of the device
+/// budget: 62 GB at 2 GiB and 125 GB at 5 GiB on one model and mix).
+#[must_use]
+pub fn derived_budget(
+    seats: u64,
+    state_bytes: u64,
+    seat_pages: u64,
+    page_bytes: u64,
+    guest_bytes: u64,
+    free: u64,
 ) -> u64 {
     let slot = |bytes: u64| bytes.next_multiple_of(ALIGN as u64);
-    let wanted = rows
-        .saturating_mul(slot(row_bytes))
-        .saturating_add(pages.max(seated).saturating_mul(slot(page_bytes)));
-    wanted.min(free_space(dir) / 4)
+    let wanted = seats
+        .saturating_mul(slot(state_bytes))
+        .saturating_add(seat_pages.saturating_mul(slot(page_bytes)))
+        .saturating_add(slot(guest_bytes));
+    if wanted > free {
+        // A capacity fact, said at load: what can be parked needs more disk
+        // than is free; the tier is seated to the free space, sparse.
+        eprintln!(
+            "engine: the disk tier's parkable need, {wanted} bytes, is past the {free} bytes free \
+             on its disk: seated at {free} bytes, written as it is used"
+        );
+    }
+    wanted.min(free)
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    /// Derived from what can be parked alone: the seats' state and their
+    /// kv at the declared context; the free space bounds it whole, never a
+    /// quarter of it, and nothing of the device pool enters it.
+    #[test]
+    fn the_unstated_disk_tier_is_derived_from_the_load_within_the_free_space() {
+        let page = ALIGN as u64;
+        assert_eq!(derived_budget(2, page, 10, page, 0, u64::MAX), 12 * page);
+        assert_eq!(derived_budget(0, 0, 40, page, 0, u64::MAX), 40 * page);
+        assert_eq!(
+            derived_budget(0, 0, 40, page, 3 * page, u64::MAX),
+            43 * page,
+            "the guest state the device holds live has a home too"
+        );
+        assert_eq!(
+            derived_budget(0, 0, 40, page, 0, 20 * page),
+            20 * page,
+            "the free space whole, not a quarter of it"
+        );
+    }
 }
 
 /// Windows reads and writes at an offset through `seek_read`/`seek_write`,

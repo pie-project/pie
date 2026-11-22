@@ -41,18 +41,32 @@ impl ResidencyPlanner {
     /// `pid` binds a fire's slots: it counts as in flight until the token
     /// drops.
     pub fn fire_in_flight(self: &Arc<Self>, pid: ProcessId) -> FireInFlight {
-        let counted = self.with_counts(|inner| {
-            inner.procs.get_mut(&pid).is_some_and(|proc| {
-                proc.fires += 1;
-                proc.fired_at = crate::rt::Instant::now();
-                // Firing: a bind it was restored for went through.
-                if inner.bind_restoring == Some(pid) {
-                    inner.bind_restoring = None;
-                }
-                proc.fire_lapsed = false;
-                true
-            })
+        let (counted, eligible) = self.with_counts(|inner| {
+            let Some(proc) = inner.procs.get_mut(&pid) else {
+                return (false, false);
+            };
+            proc.fires += 1;
+            proc.fired_at = crate::rt::Instant::now();
+            proc.fire_lapsed = false;
+            // It runs: an eviction candidate again, and no head of its
+            // holds a restore back any more.
+            let first = std::mem::replace(&mut proc.unfired, false);
+            proc.restored_past = None;
+            // Firing: a bind it was restored for went through.
+            let bound = inner.bind_restoring == Some(pid);
+            if bound {
+                inner.bind_restoring = None;
+            }
+            (true, first || bound)
         });
+        // Its first fire since a restore or a bind's serve ends what held
+        // waiters behind it (a victim's restore held for the head it was
+        // evicted for, the next bind-suspended restore): they plan now, not
+        // when this fire lands, and not never where its landing is quiet
+        // ([`Self::head_refused_on_room_unmoved`]).
+        if eligible && self.returns.waiters.load(std::sync::atomic::Ordering::Acquire) != 0 {
+            self.poke();
+        }
         FireInFlight {
             planner: Arc::downgrade(self),
             pid,
@@ -68,9 +82,19 @@ impl ResidencyPlanner {
                 proc.fire_lapsed = false;
             }
         });
+        self.stats
+            .fires_landed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // After the count drops: a poke read before it would see the fire
-        // still in flight and wait on a settling that has passed.
-        self.pages_freed();
+        // still in flight and wait on a settling that has passed. A head
+        // refused on room that has not moved since is not planned again
+        // for it: fire landings re-planned such a head at hundreds a second
+        // (Mac Pro on 22b0a3e83: 838 no-step lines a second at peak).
+        if self.head_refused_on_room_unmoved() {
+            self.pages_freed_quietly();
+        } else {
+            self.pages_freed();
+        }
     }
 
     /// A parked process whose fires have stood unsettled past

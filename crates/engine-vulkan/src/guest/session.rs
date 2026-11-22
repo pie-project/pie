@@ -14,7 +14,7 @@ use engine_gpu::store::layout::{CHANNEL, INSTANCE};
 
 use crate::serve::GuestRing;
 use engine_gpu::backend::Buffer as _;
-use engine_gpu::guest::claims::{Claims, Run};
+use engine::guest_claims::{Claims, Holder, PairClaim, Run};
 use engine_gpu::guest::held::{self, TableLayout, consecutive};
 use engine_gpu::guest::ring::{Berth, PassLayout};
 use engine_gpu::guest::session::{
@@ -536,6 +536,9 @@ pub struct Session {
     slot_bytes: u64,
     /// The name its slots and heap are claimed by ([`Claims`]).
     claim: u64,
+    /// The group bound on its pair's taking that it is a member of: the
+    /// group's name and the taking ([`Session::join_pair`]).
+    pair_group: Option<(u64, u64)>,
 
     kept: Kept,
     /// The engine's channel behind each of the program's.
@@ -744,6 +747,7 @@ impl Session {
             slots: tables.slots.to_vec(),
             slot_bytes,
             claim: library.claims.instance(),
+            pair_group: None,
             instance,
             pair,
             scores: layout.scores,
@@ -782,20 +786,13 @@ impl Session {
     /// ([`Claims`]). Nothing on the queue uses the sets: at construction
     /// none has run, and a rebind settles first.
     fn write_sets(&self) -> Result<()> {
+        // Claimed before a set is pointed there.
+        self.claim_runs()?;
         let d = &self.core.device;
-        let mut runs = Vec::new();
         for (at, stage) in self.stages.iter().enumerate() {
             let (heap, base) = self.heap_at(at)?;
             // The run moved with the tables, and their bases in it did not.
-            let (_, (segment, start, end)) = run_bases(&stage.tables, self.slot_bytes)?;
-            let run = Run {
-                segment,
-                start,
-                end,
-            };
-            if !runs.contains(&run) {
-                runs.push(run);
-            }
+            let (_, (_, start, end)) = run_bases(&stage.tables, self.slot_bytes)?;
             let buffers = [
                 (
                     STATUS_BINDING,
@@ -855,8 +852,27 @@ impl Session {
             // call.
             unsafe { d.update_descriptor_sets(&writes, &[]) };
         }
-        // The instance's own state, its heaps' place; the pair's is every
-        // instance of the pair's, shared by design.
+        Ok(())
+    }
+
+    /// Each stage's run of table slots.
+    fn table_runs(&self) -> Result<Vec<Run>> {
+        let mut runs = Vec::new();
+        for stage in &self.stages {
+            let (_, (segment, start, end)) = run_bases(&stage.tables, self.slot_bytes)?;
+            runs.push(Run {
+                segment,
+                start,
+                end,
+            });
+        }
+        Ok(runs)
+    }
+
+    /// The runs the instance's own state takes: each stage's run of table
+    /// slots, and its state, its heaps' place.
+    fn own_runs(&self) -> Result<Vec<Run>> {
+        let mut runs = self.table_runs()?;
         if let Some((buffer, at)) = self.instance.span() {
             runs.push(Run {
                 segment: buffer.slab_id(),
@@ -864,7 +880,56 @@ impl Session {
                 end: at + self.instance.bytes(),
             });
         }
-        self.library.claims.claim(self.claim, &runs)
+        Ok(runs)
+    }
+
+    /// The runs its pair's state takes, which the group of instances bound
+    /// on its taking claims ([`Claims::claim_with_pair`]).
+    fn pair_runs(&self) -> Vec<Run> {
+        self.pair
+            .span()
+            .map(|(buffer, at)| Run {
+                segment: buffer.slab_id(),
+                start: at,
+                end: at + self.pair.bytes(),
+            })
+            .into_iter()
+            .collect()
+    }
+
+    /// Claims its own state's runs, and joins its pair's group where it is
+    /// bound on one.
+    fn claim_runs(&self) -> Result<()> {
+        let runs = self.own_runs()?;
+        match self.pair_group {
+            Some((pair, taking)) => {
+                self.library.claims.claim_with_pair(
+                    self.claim,
+                    &runs,
+                    &PairClaim {
+                        pair,
+                        taking,
+                        runs: self.pair_runs(),
+                    },
+                )?;
+            }
+            None => self.library.claims.claim(self.claim, &runs)?,
+        }
+        Ok(())
+    }
+
+    /// Joins the group bound on its pair's taking `group` (its name and the
+    /// taking, [`engine_gpu::guest::state::Takings::group`]), claiming its
+    /// own runs with it: refused by name, and its claims as they stood,
+    /// where either overlaps another holder's.
+    pub fn join_pair(&mut self, group: Option<(u64, u64)>) -> Result<()> {
+        let was = self.pair_group;
+        self.pair_group = group;
+        if let Err(why) = self.claim_runs() {
+            self.pair_group = was;
+            return Err(why);
+        }
+        Ok(())
     }
 
     /// Points the stages' sets at the chunks their tables' slots and the
@@ -884,6 +949,13 @@ impl Session {
         self.status.rebind(pools)?;
         self.instance.rebind(pools)?;
         self.pair.rebind(pools)?;
+        // The evacuation moved the pair's state for every instance on it:
+        // the group's move, claimed as one before this member's own.
+        if let Some((pair, _)) = self.pair_group {
+            self.library
+                .claims
+                .claim_all(&[(Holder::Pair(pair), self.pair_runs())])?;
+        }
         self.write_sets()
     }
 
@@ -944,6 +1016,7 @@ impl Session {
         slots: &[u32],
         scratch: &engine::program::ScratchPlace,
         pair: &engine::program::ScratchPlace,
+        pair_group: Option<(u64, u64)>,
     ) -> Result<()> {
         if slots.len() != self.slots.len() || !consecutive(slots) {
             return Err(Fault::Program {
@@ -976,6 +1049,7 @@ impl Session {
         self.slots = slots.to_vec();
         self.instance.retarget(pools, scratch)?;
         self.pair.retarget(pools, pair)?;
+        self.pair_group = pair_group;
         self.write_sets()
     }
 
@@ -1326,6 +1400,18 @@ impl Session {
                 &[],
             );
         }
+        Ok(())
+    }
+
+    /// Its process parked (`engine::Rebind::Parked`): the passes on the
+    /// queue land, and it claims only its tables, where they stayed in
+    /// place (`kept`); its state and its share of its pair are another
+    /// owner's to take until [`Self::retarget`] claims where it lies again.
+    pub fn park(&mut self, kept: bool) -> Result<()> {
+        self.settle()?;
+        let runs = if kept { self.table_runs()? } else { Vec::new() };
+        self.library.claims.park(self.claim, &runs);
+        self.pair_group = None;
         Ok(())
     }
 
