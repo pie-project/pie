@@ -1187,15 +1187,18 @@ What each still times at load or boot, for its owner (paths under `crates/`):
   weigh it (`dense::choose_unrated`). Still open: the Adreno 840's committed profile (`adreno-tm-840`, a
   commented slot in each backend's `SEEDED`) awaits the phone's export.
 
-## F57. Metal's kernel.dense fit turns agreeing curves into different ladders (found 2026-11-22)
-The load's ladder is `tune::dense::fit_at` over the per-shape curves (`profile::tune::fit`, `Options::default()`:
-`min_gain` 1% of the floor, up to 8 rungs). A rung that fixes the 8-row pick alone saves under 1% (one row count of
-six in the decode band), so whether it is kept turns on noise. Two clean measuring boots of Gemma 4 E4B on an M5 Pro
-(sc/macpro-metal-covers, each point the fastest of 7 rounds, a point slower than both neighbours re-timed over 21)
-measured curves that agree (153 points at rows 6-12: median 0.25%, max 1.88% apart; no row count where the fastest
-kernel differs) and fitted a 4-rung ladder serving c8 at 177.8 tok/s and a 5-rung one serving 199.8. A committed
-profile exported from either freezes its ladder. `min_gain` is a chosen threshold, and a fit that serves c8 slower
-than another candidate ladder must never be picked. sc/macpro-dense-fit (held) replaces the fit with the curves'
-per-point winners (no threshold, no cap; ties settled by the neighbouring row count, else the profile's pick): on
-the M5 it served Gemma c8 at 200.0 / 199.9 / 200.1 over three fresh measurements; on an M1 Max it served c8 7.5%
-under 8ed8f8679 with its 8-row fires faster on the device (the loss off the device, unexplained).
+## F57. Metal's kernel.dense ladder from agreeing curves (found 2026-11-22; decided 2026-11-22)
+The load's ladder was `tune::dense::fit_at` over the per-shape curves (`profile::tune::fit`, `min_gain` 1% of the
+floor): a rung that fixes the 8-row pick alone saves under 1%, so noise decided whether it was kept. Two clean
+measuring boots of Gemma 4 E4B on an M5 Pro measured curves that agree (rows 6-12, 153 points: median 0.25%, max
+1.88% apart; the fastest kernel the same at every row count) and fitted ladders serving c8 at 177.8 and 199.8 tok/s.
+Decided (Leader): the load takes each measured point's winner (`tune::dense::winners`, sc/macpro-dense-winners),
+no fit and no threshold; ties within a point's timed rounds go to the neighbouring row count's winner, else the
+profile's pick. Two clean measuring boots now serve Gemma c8 at 199.0 and 200.0. Still open:
+- Their ladders are not byte-identical (50 and 51 rungs): at one point (2560x2048, 16 rows) the two runs' winners
+  differ by more than either run's spread (1.4% one way, 2.5% the other), and at 13 points one run calls two
+  kernels tied and the other does not. Run-to-run variation exceeds a run's own spread (the fastest of 7 rounds);
+  a spread taken from two passes apart in time would state it, measured, at twice the curve pass's time.
+- An M1 Max served c8 7.5% under 8ed8f8679 on a per-point ladder whose 8-row fires were faster on the device:
+  Mac's whole-step capture is to show which row counts or frames the curves mispredict.
+- `pie tune metal`'s cross-model fit (the checked-in device file's generic ladder) still fits under `min_gain`.

@@ -663,6 +663,17 @@ fn points_of(
             if times.iter().all(Option::is_none) {
                 continue;
             }
+            let spread: Vec<Option<f64>> = candidates
+                .iter()
+                .map(|d| {
+                    let (kind, key) = curve_id(*d);
+                    curves
+                        .iter()
+                        .find(|c| c.id() == (kind, key, n, k))
+                        .and_then(|c| c.spread.iter().find(|(r, _)| *r == rows))
+                        .map(|(_, s)| *s)
+                })
+                .collect();
             let baseline = candidates
                 .iter()
                 .position(|d| *d == today.dense(rows, n, k))
@@ -672,7 +683,7 @@ fn points_of(
                 n,
                 k,
                 times,
-                spread: Vec::new(),
+                spread,
                 baseline,
             });
         }
@@ -684,14 +695,134 @@ fn points_of(
     }
 }
 
-/// `chip` with `kernel.dense` fitted over this model's own bf16 shapes,
+/// The ladder a load's measurement states: at each measured shape and row
+/// count the candidate that ran fastest, adjacent row counts with the same
+/// winner merged into one rung (a band runs from its first row count to the
+/// row before the next band's), no threshold and no cap, so a model's own
+/// ladder is its measurement. Where candidates' timed rounds overlap the
+/// winner's, the measurement does not order them, and the pick there is the
+/// one that won a neighbouring row count (below first), else `today`'s, so a
+/// repeat measurement cannot flip it on noise. Returns the ladder (closed by
+/// the simdgroup tiles, which run anywhere) and what to say of it.
+fn winners(measured: &Measured, today: &kernels_metal::Tuning) -> (String, String) {
+    let mut shapes: Vec<(u32, u32)> = measured.points.iter().map(|p| (p.n, p.k)).collect();
+    shapes.dedup();
+    let mut rungs = Vec::new();
+    let (mut points, mut unordered, mut today_cost, mut won_cost) = (0usize, 0usize, 0f64, 0f64);
+    for &(n, k) in &shapes {
+        let mut at: Vec<&Point> = measured
+            .points
+            .iter()
+            .filter(|p| (p.n, p.k) == (n, k))
+            .collect();
+        at.sort_by_key(|p| p.rows);
+        // Per row count: the winner, or every candidate the winner's rounds
+        // do not separate it from.
+        let picks: Vec<Vec<usize>> = at
+            .iter()
+            .map(|p| {
+                let Some(best) = (0..p.times.len())
+                    .filter(|&c| p.times[c].is_some())
+                    .min_by(|&a, &b| {
+                        let t = |c: usize| p.times[c].unwrap_or(f64::INFINITY);
+                        t(a).total_cmp(&t(b))
+                    })
+                else {
+                    return Vec::new();
+                };
+                // A candidate's rounds span from its fastest (its time) to
+                // its time stretched by its stated spread.
+                let range = |c: usize| {
+                    let t = p.times.get(c).copied().flatten()?;
+                    let s = p.spread.get(c).copied().flatten().unwrap_or(0.0);
+                    Some((t, t * (1.0 + s)))
+                };
+                match range(best) {
+                    Some((lo, hi)) => (0..p.times.len())
+                        .filter(|&c| {
+                            c == best
+                                || range(c).is_some_and(|(clo, chi)| clo <= hi && lo <= chi)
+                        })
+                        .collect(),
+                    None => vec![best],
+                }
+            })
+            .collect();
+        let mut chosen: Vec<Option<usize>> = picks
+            .iter()
+            .map(|tied| (tied.len() == 1).then(|| tied[0]))
+            .collect();
+        for i in 0..at.len() {
+            if chosen[i].is_some() || picks[i].is_empty() {
+                continue;
+            }
+            unordered += 1;
+            let neighbour = (0..i)
+                .rev()
+                .find_map(|j| chosen[j])
+                .filter(|c| picks[i].contains(c))
+                .or_else(|| {
+                    (i + 1..at.len())
+                        .find_map(|j| chosen[j])
+                        .filter(|c| picks[i].contains(c))
+                });
+            let profile = measured
+                .candidates
+                .iter()
+                .position(|d| *d == today.dense(at[i].rows, n, k))
+                .filter(|c| picks[i].contains(c));
+            chosen[i] = neighbour.or(profile).or(Some(picks[i][0]));
+        }
+        for (i, p) in at.iter().enumerate() {
+            if let Some(t) = chosen[i].and_then(|c| p.times[c]) {
+                points += 1;
+                won_cost += 1.0;
+                today_cost += p.baseline.and_then(|b| p.times[b]).map_or(1.0, |b| b / t);
+            }
+        }
+        // Merge adjacent row counts with one winner into a band.
+        let mut i = 0;
+        while i < at.len() {
+            let Some(c) = chosen[i] else {
+                i += 1;
+                continue;
+            };
+            let mut j = i + 1;
+            while j < at.len() && chosen[j] == Some(c) {
+                j += 1;
+            }
+            let lo = at[i].rows;
+            let rows = if j < at.len() {
+                format!("rows >= {lo} and rows <= {}", at[j].rows - 1)
+            } else {
+                format!("rows >= {lo}")
+            };
+            rungs.push(format!(
+                "  {{ when = \"n == {n} and k == {k} and {rows}\", {} }},",
+                body(measured.candidates[c])
+            ));
+            i = j;
+        }
+    }
+    let said = format!(
+        "{} rungs, each measured point's winner ({unordered} of {points} points not ordered \
+         by their timed rounds, settled by a neighbour or the profile); the profile's ladder \
+         runs at {:.3}x them",
+        rungs.len(),
+        if won_cost > 0.0 { today_cost / won_cost } else { 1.0 }
+    );
+    (format!("[\n{}\n  {{ use = \"tile\" }},\n]", rungs.join("\n")), said)
+}
+
+/// `chip` with `kernel.dense` stated by this model's own bf16 shapes,
 /// from each shape's curves (`[rates] kernel_tflops_by_shape_keyed`, one a
 /// candidate kernel): taken where the user's file or the device's committed
 /// measured profile states them under a matching key (`crate::stored`: the
 /// device, its OS release, the kernel's source), else measured here before
 /// ready and stored to the user's file. Under `measure = false` a shape no
 /// layer states is not measured: it keeps the profile's route, named. The
-/// fitted ladder is held to the shapes it was fitted over, the profile's
+/// ladder is each measured point's winner ([`winners`], no fit and no
+/// threshold), held to the shapes it was measured over, the profile's
 /// own ladder after it for every other shape (a head past the measurement's
 /// weight budget). A kernel that answers wrongly refuses the load; a
 /// measurement that fails otherwise (memory refused at boot) leaves the
@@ -803,17 +934,13 @@ pub(crate) fn at_load(
     }
     let today = kernels_metal::Tuning::new(chip.clone(), false, device.cores()).with_family(family);
     let points = points_of(&curves, &candidates, &fitted, &today);
-    let ((_, ladder), line) = match fit_at(&points, &LOAD_ROWS, fitted.len()) {
-        Ok(fit) => fit,
-        Err(why) => {
-            eprintln!("{name}: kernel.dense not fitted: {why}; the profile's route serves");
-            return Ok(chip);
-        }
-    };
+    let (ladder, said) = winners(&points, &today);
     tracing::info!(
-        "kernel.dense: fitted over the model's {} measured shapes: {}",
+        "kernel.dense: the model's {} measured shapes' ladder (ladder {:016x}): {said}",
         fitted.len(),
-        line.text
+        ladder
+            .bytes()
+            .fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
     );
     let spec = Dense::spec();
     let base = chip
