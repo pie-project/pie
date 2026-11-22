@@ -431,6 +431,14 @@ impl Engine for Metal {
         self.shell.as_ref().map(crate::serve::Shell::cover_fingerprint)
     }
 
+    fn committed_covers(&self) -> &'static [&'static str] {
+        crate::chip::COVERS
+    }
+
+    fn skips_measuring(&self) -> bool {
+        self.boot.measure == engine::rates::Measuring::Skip
+    }
+
     fn kind(&self) -> &'static str {
         "metal"
     }
