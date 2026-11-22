@@ -391,20 +391,14 @@ pub fn page_ceiling(trace: &Trace, page_size: u32, context: u32, bytes: u64) -> 
     })
 }
 
-/// A model's declared context shortened to what the card holds: the
+/// A model's declared context shortened to what the load's room holds: the
 /// longest whole number of pages, at most `declared`, at which one sequence
-/// takes no more than half of what the `allowance` of the card, less what others
-/// already hold, leaves past the weight tier: the activations and a second
-/// sequence have the other half. The most a declared context is served at:
-/// the fit shortens it to what it seats (`Pools::declare_context`).
-/// Never under one page.
-pub fn declared_context_that_fits(
-    trace: &Trace,
-    page_size: u32,
-    declared: u32,
-    allowance: engine::Allowance,
-    weights: u64,
-) -> Result<u32> {
+/// takes no more than half of `live`, the room the load's own room line
+/// leaves past the weight tier (read after this process's context and
+/// modules took theirs): the activations and a second sequence have the
+/// other half. The most a declared context is served at: the fit shortens it
+/// to what it seats (`Pools::declare_context`). Never under one page.
+pub fn declared_context_within(trace: &Trace, page_size: u32, declared: u32, live: u64) -> Result<u32> {
     let page_size = page_size.max(1);
     let window = window_of(trace)?;
     // A sequence as it is held between fires: a windowed row its window
@@ -415,11 +409,7 @@ pub fn declared_context_that_fits(
             Paging::of(page_size, pages.saturating_mul(page_size), 1, 1)?.held(window);
         one_slot_bytes(trace, paging)
     };
-    let ceiling = load_ceiling(allowance, false)?;
-    let (free, total) = device_memory()?;
-    let room = elastic::room_under(ceiling, free, total)
-        .saturating_sub(weight_tier_bytes(trace, weights, 0)?)
-        / 2;
+    let room = live / 2;
     let most = declared.div_ceil(page_size).max(1);
     if one(most)? <= room {
         return Ok(declared);
@@ -1749,6 +1739,11 @@ impl Pools {
                 );
             }
         }
+        // A declared context the fit cannot seat even shortened is the
+        // card's refusal by name, not a residency fault: the load asked the
+        // model's context, and the card holds no sequence of it.
+        let declared = self.declared;
+        let short = |why: String| if declared { Fault::Card(why) } else { Fault::Residency(why) };
         let WorkingSet {
             least,
             need,
@@ -1759,7 +1754,7 @@ impl Pools {
         } = self
             .working_set(one_slot, bodies, programs, live, stated)
             .map_err(|spare| {
-                Fault::Residency(format!(
+                short(format!(
                     "the card does not hold this deployment's graph bodies: {resident}; past \
                      one working set at the declared context and the weights the pool seats it \
                      has {spare} bytes, and the bodies took {bodies} when this deployment last \
@@ -1795,7 +1790,7 @@ impl Pools {
                 ));
             }
             Err(_) => {
-                return Err(Fault::Residency(format!(
+                return Err(short(format!(
                     "the card does not hold this deployment: {resident}; under the load's \
                      allowance that leaves {room} bytes for the state pool, and one working set \
                      at the declared context needs {need}. Lower `[engine] max_context`, raise \

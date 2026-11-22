@@ -475,6 +475,79 @@ fn load_under(
     .map_err(|why| why.to_string())
 }
 
+/// A load of `fixture` under `allowance` at the model's declared context
+/// `declared`: the load serves it as long as its room holds.
+fn load_declared(
+    fixture: &Fixture,
+    cache: &Path,
+    allowance: engine::Allowance,
+    declared: u32,
+) -> Result<Shell, String> {
+    Shell::load(Boot {
+        trace: fixture.trace.clone(),
+        contract: &fixture.contract,
+        checkpoint: &fixture.container,
+        budget: Budget::new(1, TOKENS),
+        patches: None,
+        voxels: None,
+        page_size: PAGE,
+        context: declared,
+        slots: 1,
+        kv_budget: None,
+        allowance,
+        context_declared: true,
+        ordinal: 0,
+        knobs: knobs(),
+        cache_dir: Some(cache),
+        runahead: engine::runahead::Runahead::F1,
+        residency: engine_cuda::experts::Plan::default(),
+        world: engine_cuda::World::default(),
+        expert: engine_cuda::World::default(),
+        comm: core::ptr::null_mut(),
+    })
+    .map_err(|why| why.to_string())
+}
+
+/// A declared context is cut to the room the load's own room line leaves,
+/// past this process's context and modules: under budgets from where the
+/// modules leave no sequence a room to where they leave a long one, a load
+/// serves the declared context cut to what it seats, or refuses the card by
+/// name, never faulting on residency.
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn a_declared_context_is_cut_to_the_room_past_the_modules() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    const DECLARED: u32 = 1 << 24;
+    let cache = cache_dir();
+    let model = buffered_model();
+    let fixture = fixture(&model, &cache);
+    let mut served = 0;
+    for mib in (512u64..=2048).step_by(128) {
+        let allowance = engine::Allowance {
+            budget: Some(mib << 20),
+        };
+        match load_declared(&fixture, &cache, allowance, DECLARED) {
+            Ok(shell) => {
+                let context = shell.paging().context();
+                println!("budget {mib} MiB: serves {context} of {DECLARED} tokens");
+                assert!(context <= DECLARED);
+                served += 1;
+            }
+            Err(why) => {
+                println!("budget {mib} MiB: refused: {why}");
+                assert!(
+                    !why.starts_with("weight residency"),
+                    "under {mib} MiB the declared context faulted on residency: {why}"
+                );
+            }
+        }
+    }
+    assert!(served > 0, "no budget served the declared context cut to its room");
+}
+
 /// The load's knobs: `PIE_GOLDEN_CHUNK` (bytes) sets the chunk size the
 /// state pool aims near, so a miniature's records are cut into pieces as a
 /// full model's are. The logits are the same either way.

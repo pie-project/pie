@@ -1083,3 +1083,14 @@ gate ~29, up ~59, down ~28 us; pooled calls a uniform ~45 us (+75 us a step). Su
 expert DMA's overlap with neighbouring ops in the fire (the held up call's 59 us looks like a
 wait on its weight copy that the pooled form spreads), or reads off the 4.5M-row pool. Next: a
 profile of the pooled call's DMA waits in the fire, and the same fire's schedule held vs pooled.
+
+## F48. The declared-context cut's "one sequence at most half the room" is a tuned constant
+
+`store::declared_context_within` (engine-cuda) serves a declared context at
+the longest one sequence of which takes no more than half the live room past
+the weights, "the activations and a second sequence having the other half".
+The half was moved from the old pre-stage cut, not set by any ruling. Derive
+it (the lanes the load promises must seat at the cut context, beside one
+rung's activation span) or drop it in favour of the capacity gate's finisher
+guarantee; the fit's own shortening (`Pools::declare_context`) already
+derives what one working set needs.
