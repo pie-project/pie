@@ -336,6 +336,15 @@ impl Serve for Api {
         Ok(())
     }
 
+    /// The descriptor pools of the frames serving holds at once, laid now
+    /// and none made after: each arm's forward, the feed and the guest
+    /// passes behind it, and the one a settle or a walk holds beside them.
+    fn serving(shell: &mut Shell<Api>) -> Result<()> {
+        shell
+            .device()
+            .seal_descriptor_pools(shell.readout.len() + 3)
+    }
+
     fn plan(shell: &mut Shell<Api>, prepared: &mut Prepared<'_, Api>) -> Result<Plan<Api>> {
         // The custom-mask buffer grows: a recording would keep the one it outgrew.
         // A fire landing snapshots binds a table of its own: not recorded.

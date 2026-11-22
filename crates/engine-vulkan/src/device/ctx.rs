@@ -167,6 +167,14 @@ pub(crate) struct Core {
 
     spare_fences: Mutex<Vec<vk::Fence>>,
 
+    /// The descriptor pools frames bind through: those no frame holds,
+    /// reset, and what is lent ([`Spares`]). A frame takes its pools here
+    /// and gives them back once its fence passed; serving makes none
+    /// ([`Context::seal_descriptor_pools`]).
+    spares: Mutex<Spares>,
+    /// Woken as pools come back.
+    given: std::sync::Condvar,
+
     /// The frame whose fenced submission went to the queue last: the
     /// queue has emptied once it landed ([`Context::idle`]).
     last: Mutex<std::sync::Weak<Inner>>,
@@ -409,6 +417,102 @@ impl Core {
     }
 }
 
+/// The descriptor pools: `free` reset and held by no frame, `lent` held by
+/// frames, `kept` of those by kept frames (which replay, so hold theirs
+/// until they drop); `sealed` from the start of serving, after which a
+/// one-time frame (every frame a served step submits) takes only these and
+/// a kept one (a recording, built and counted as one) makes its own, with
+/// `stock` the pools the load laid.
+#[derive(Debug, Default)]
+pub(crate) struct Spares {
+    free: Vec<vk::DescriptorPool>,
+    lent: usize,
+    kept: usize,
+    sealed: bool,
+    stock: usize,
+}
+
+impl Core {
+    /// A reset descriptor pool for a frame that holds `mine` already (a
+    /// `one_time` frame gives them back once its fence passed; a kept one
+    /// when it drops). Before serving, a new one where none is free. While
+    /// serving, a kept frame's own, and a one-time frame's a free one,
+    /// waited for while a one-time frame other than this one holds pools
+    /// (each lands, so gives them back), and refused by name where none can
+    /// come back.
+    fn descriptor_pool(&self, one_time: bool, mine: usize) -> Result<vk::DescriptorPool> {
+        let mut spares = self.spares.lock().expect("spares lock poisoned");
+        loop {
+            let pool = if spares.sealed && !one_time {
+                Some(self.new_descriptor_pool()?)
+            } else {
+                match spares.free.pop() {
+                    Some(pool) => Some(pool),
+                    None if !spares.sealed => Some(self.new_descriptor_pool()?),
+                    None => None,
+                }
+            };
+            if let Some(pool) = pool {
+                spares.lent += 1;
+                if !one_time {
+                    spares.kept += 1;
+                }
+                return Ok(pool);
+            }
+            let others = spares.lent - spares.kept - if one_time { mine } else { 0 };
+            if others == 0 {
+                return Err(Fault::Ceiling {
+                    what: "descriptor pools while serving: no spare descriptor pool, and no frame \
+                           in flight holds one to give back (the load stocked them)",
+                    need: spares.lent as u64 + 1,
+                    have: spares.stock as u64,
+                });
+            }
+            spares = self.given.wait(spares).expect("spares lock poisoned");
+        }
+    }
+
+    /// `pools`, reset, back to the spares from a frame (`one_time`, else a
+    /// kept one).
+    fn give_pools(&self, pools: Vec<vk::DescriptorPool>, one_time: bool) {
+        if pools.is_empty() {
+            return;
+        }
+        for &pool in &pools {
+            // SAFETY: the frame that held `pool` landed (its fence passed) or
+            // was never submitted, so no command uses its sets; a pool is
+            // reset by its one holder.
+            let _ = unsafe {
+                self.device
+                    .reset_descriptor_pool(pool, vk::DescriptorPoolResetFlags::empty())
+            };
+        }
+        let mut spares = self.spares.lock().expect("spares lock poisoned");
+        spares.lent -= pools.len();
+        if !one_time {
+            spares.kept -= pools.len();
+        }
+        spares.free.extend(pools);
+        self.given.notify_all();
+    }
+
+    fn new_descriptor_pool(&self) -> Result<vk::DescriptorPool> {
+        let sizes = [vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(BUFFERS_PER_POOL)];
+        // SAFETY: `device` is live and the create info is complete.
+        unsafe {
+            self.device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(SETS_PER_POOL)
+                    .pool_sizes(&sizes),
+                None,
+            )
+        }
+        .map_err(|e| self.fault("vkCreateDescriptorPool", e))
+    }
+}
+
 impl Drop for Core {
     fn drop(&mut self) {
         // SAFETY: this is the last `Arc<Core>`, so every slab, frame, cache and
@@ -431,6 +535,11 @@ impl Drop for Core {
             let pools = std::mem::take(self.pools.get_mut().expect("pools lock poisoned"));
             for pool in pools.into_values() {
                 self.device.destroy_command_pool(pool, None);
+            }
+            for pool in
+                std::mem::take(&mut self.spares.get_mut().expect("spares lock poisoned").free)
+            {
+                self.device.destroy_descriptor_pool(pool, None);
             }
             // The instance is the process's (`shared_instance`).
             self.device.destroy_device(None);
@@ -1081,6 +1190,8 @@ impl Context {
                 pool,
             )])),
             spare_fences: Mutex::new(Vec::new()),
+            spares: Mutex::new(Spares::default()),
+            given: std::sync::Condvar::new(),
             last: Mutex::new(std::sync::Weak::new()),
             orphans: Mutex::new(Vec::new()),
             family,
@@ -1355,6 +1466,28 @@ impl Context {
         self.core.staging(&mut transfer).map(|_| ())
     }
 
+    /// Serving starts: the spares are stocked to `frames` free pools (the
+    /// frames serving holds at once, each one pool: the load's kept frames
+    /// hold their own beside them), and from here no frame makes one
+    /// ([`Core::descriptor_pool`]).
+    pub fn seal_descriptor_pools(&self, frames: usize) -> Result<()> {
+        let mut spares = self.core.spares.lock().expect("spares lock poisoned");
+        while spares.free.len() < frames {
+            let pool = self.core.new_descriptor_pool()?;
+            spares.free.push(pool);
+        }
+        spares.stock = spares.free.len();
+        spares.sealed = true;
+        Ok(())
+    }
+
+    /// The descriptor pools free, lent and kept now.
+    #[must_use]
+    pub fn descriptor_pools(&self) -> (usize, usize, usize) {
+        let spares = self.core.spares.lock().expect("spares lock poisoned");
+        (spares.free.len(), spares.lent, spares.kept)
+    }
+
     pub fn frame(&self) -> Result<Frame> {
         self.frame_with(true)
     }
@@ -1545,6 +1678,7 @@ impl Context {
         Ok(Frame {
             inner: Arc::new(Inner {
                 core: Arc::clone(core),
+                one_time,
                 cmd: std::sync::atomic::AtomicU64::new(vk::Handle::as_raw(cmd)),
                 cuts: Mutex::new(Vec::new()),
                 segments: Mutex::new(Vec::new()),
@@ -1588,6 +1722,9 @@ fn pick_family(families: &[vk::QueueFamilyProperties]) -> Option<u32> {
 
 pub(crate) struct Inner {
     pub(crate) core: Arc<Core>,
+    /// Submitted once (not kept): its descriptor pools go back once its
+    /// fence passed.
+    one_time: bool,
     /// The command buffer being recorded (a kept frame's last segment).
     cmd: std::sync::atomic::AtomicU64,
     /// A kept frame's segments before its last, in order: each ended where
@@ -1689,9 +1826,9 @@ impl Drop for Inner {
                 let queue = self.core.queue.lock().expect("queue lock poisoned");
                 let _ = d.queue_wait_idle(*queue);
             }
-            for pool in self.pools.get_mut().expect("pools lock poisoned").drain(..) {
-                d.destroy_descriptor_pool(pool, None);
-            }
+            // Its descriptor pools go back to the device's spares, reset:
+            // the next frame takes them rather than making its own.
+            self.give_pools();
             if let Some(timing) = self.timing.get_mut().expect("timing lock poisoned").take() {
                 d.destroy_query_pool(timing.pool, None);
             }
@@ -1900,19 +2037,7 @@ impl Frame {
         let mut sets = match got {
             Some(sets) => sets,
             None => {
-                let sizes = [vk::DescriptorPoolSize::default()
-                    .ty(vk::DescriptorType::STORAGE_BUFFER)
-                    .descriptor_count(BUFFERS_PER_POOL)];
-                // SAFETY: `d` is live and the create info is complete.
-                let pool = unsafe {
-                    d.create_descriptor_pool(
-                        &vk::DescriptorPoolCreateInfo::default()
-                            .max_sets(SETS_PER_POOL)
-                            .pool_sizes(&sizes),
-                        None,
-                    )
-                }
-                .map_err(|e| core.fault("vkCreateDescriptorPool", e))?;
+                let pool = core.descriptor_pool(self.inner.one_time, pools.len())?;
                 pools.push(pool);
                 let info = vk::DescriptorSetAllocateInfo::default()
                     .descriptor_pool(pool)
@@ -2519,6 +2644,9 @@ impl Landing {
     }
 }
 
+/// A clone is the same submission: each of the sessions whose passes one
+/// frame carries keeps one, and the frame's last drop waits on its fence.
+#[derive(Clone)]
 pub struct Pending {
     inner: Arc<Inner>,
     /// Set where a watcher thread is the fence's one waiter.
@@ -2553,6 +2681,9 @@ impl Pending {
         let (watched, told) = (Arc::clone(inner), Arc::clone(&landing));
         std::thread::spawn(move || {
             let result = watched.block_on_fence();
+            if result.is_ok() {
+                watched.landed_pools();
+            }
             on_done(
                 result
                     .err()
@@ -2577,6 +2708,7 @@ impl Pending {
         if let Some(at) = at {
             crate::encode::credit_fence(at.elapsed().as_nanos() as u64);
         }
+        self.inner.landed_pools();
         self.inner.harvest_timing();
         Ok(())
     }
@@ -2590,6 +2722,24 @@ impl Pending {
 }
 
 impl Inner {
+    /// A one-time frame landed: its descriptor pools go back now, not when
+    /// its last handle drops (a session holds a landed pass's until the
+    /// next departs).
+    fn landed_pools(&self) {
+        if self.one_time {
+            self.give_pools();
+        }
+    }
+
+    /// Gives every descriptor pool the frame holds back to the spares, and
+    /// the sets it kept of them: once only.
+    fn give_pools(&self) {
+        let pools: Vec<vk::DescriptorPool> =
+            std::mem::take(&mut *self.pools.lock().expect("pools lock poisoned"));
+        self.spare.lock().expect("spare lock poisoned").clear();
+        self.core.give_pools(pools, self.one_time);
+    }
+
     /// Blocks on this frame's fence. Only a frame's one waiter calls this:
     /// a watcher thread where the frame has one, else [`Pending::wait`].
     fn block_on_fence(&self) -> std::result::Result<(), vk::Result> {
@@ -2669,6 +2819,112 @@ mod tests {
     use std::time::Instant;
 
     use super::{Context, Ordering};
+
+    /// A storage-buffer set layout, as a kernel's.
+    fn layout(context: &Context) -> ash::vk::DescriptorSetLayout {
+        use ash::vk;
+        let bindings = [vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)];
+        // SAFETY: the device is live and the create info outlives the call.
+        unsafe {
+            context
+                .core
+                .device
+                .create_descriptor_set_layout(
+                    &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                    None,
+                )
+                .expect("a set layout")
+        }
+    }
+
+    /// Serving makes no descriptor pool: with every stocked pool held by a
+    /// frame in flight, one more frame waits for one to come back rather
+    /// than making its own, and every pool is free again once they land.
+    #[test]
+    fn serving_with_every_pool_lent_waits_and_makes_none() {
+        let bound = Context::bind(&crate::api::DeviceBoot::default(), engine::Allowance::WHOLE);
+        let Ok(context) = bound else {
+            eprintln!("not asked: {:?}", bound.err());
+            return;
+        };
+        let layout = layout(&context);
+        context.seal_descriptor_pools(2).unwrap();
+        let (stock, lent, _) = context.descriptor_pools();
+        assert_eq!(lent, 0);
+        // Every stocked pool lent, each to a frame on the queue.
+        let busy: Vec<super::Frame> = (0..stock)
+            .map(|_| {
+                let frame = context.frame().unwrap();
+                frame.descriptor_set(layout).unwrap();
+                frame
+            })
+            .collect();
+        assert_eq!(context.descriptor_pools(), (0, stock, 0));
+        let context = Arc::new(context);
+        let waiting = {
+            let context = Arc::clone(&context);
+            std::thread::spawn(move || {
+                let frame = context.frame().unwrap();
+                frame.descriptor_set(layout).unwrap();
+                frame.commit().unwrap();
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!waiting.is_finished(), "a frame made a pool while serving");
+        for frame in busy {
+            frame.commit().unwrap();
+        }
+        waiting.join().unwrap();
+        assert_eq!(
+            context.descriptor_pools(),
+            (stock, 0, 0),
+            "a pool was made after the seal, or one never came back"
+        );
+        // SAFETY: no set of the layout is in use: every frame landed.
+        unsafe {
+            context
+                .core
+                .device
+                .destroy_descriptor_set_layout(layout, None)
+        };
+    }
+
+    /// Where no frame holds a pool to give back, a frame asking for one
+    /// while serving is refused by name, not given a new pool.
+    #[test]
+    fn a_frame_finding_no_pool_and_none_lent_is_refused() {
+        let bound = Context::bind(&crate::api::DeviceBoot::default(), engine::Allowance::WHOLE);
+        let Ok(context) = bound else {
+            eprintln!("not asked: {:?}", bound.err());
+            return;
+        };
+        let layout = layout(&context);
+        context.seal_descriptor_pools(0).unwrap();
+        let (stock, ..) = context.descriptor_pools();
+        let held: Vec<super::Frame> = (0..stock)
+            .map(|_| {
+                let frame = context.frame_kept().unwrap();
+                frame.descriptor_set(layout).unwrap();
+                frame
+            })
+            .collect();
+        let frame = context.frame().unwrap();
+        let refused = frame.descriptor_set(layout).unwrap_err().to_string();
+        assert!(refused.contains("no spare descriptor pool"), "{refused}");
+        drop(frame);
+        drop(held);
+        // SAFETY: no set of the layout is in use.
+        unsafe {
+            context
+                .core
+                .device
+                .destroy_descriptor_set_layout(layout, None)
+        };
+    }
 
     /// A build marks the cache changed and returns without writing it (no
     /// submission or build waits on the file); the cache's writer writes it,

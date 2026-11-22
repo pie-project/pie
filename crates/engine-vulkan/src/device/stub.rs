@@ -145,6 +145,10 @@ impl Context {
         match self.never {}
     }
 
+    pub fn seal_descriptor_pools(&self, _frames: usize) -> Result<()> {
+        match self.never {}
+    }
+
     pub fn frame(&self) -> Result<Frame> {
         match self.never {}
     }
