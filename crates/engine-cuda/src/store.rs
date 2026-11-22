@@ -3647,6 +3647,36 @@ impl Pools {
     /// tables located. The load arms over them; the runtime's first
     /// residency then names the slots it chose, and an atom it puts
     /// elsewhere is filled there again.
+    /// A measuring load's second fit on a flat range (one allocation, made
+    /// at the first fit: the least range the bodies armed over): where the
+    /// card could back more chunks than that allocation holds, everything
+    /// seated in it is let go (the weights preseated in it, the segments
+    /// arming's fires backed), so the refit may reserve the range anew at
+    /// what the card backs ([`chunks::Chunks::reshape`]); the caller seats
+    /// the weights again. Whether it did: a range mapped on demand, one a
+    /// body names, or one already as large as asked, keeps all it holds.
+    /// Whether the load seated its weights in the pool ahead of the
+    /// runtime's first residency ([`Pools::preseat_weights`]).
+    #[must_use]
+    pub const fn preseated(&self) -> bool {
+        self.preseated
+    }
+
+    pub fn free_for_refit(&mut self) -> Result<bool> {
+        if elastic::mapped_on_demand() || self.pinned || self.asked_chunks <= self.chunks.total() {
+            return Ok(false);
+        }
+        for cache in &mut self.row_caches {
+            cache.slots.fill(None);
+        }
+        for cache in &mut self.expert_caches {
+            cache.slots.fill(None);
+        }
+        self.preseated = false;
+        self.release_segments(0)?;
+        Ok(true)
+    }
+
     pub fn preseat_weights(
         &mut self,
         stream: *mut core::ffi::c_void,
