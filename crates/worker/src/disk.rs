@@ -4,13 +4,35 @@ pub fn engine_cache_dir(home: &Path) -> PathBuf {
     home.join("cache")
 }
 
-/// Where a load's kv slot files live when the config names no path: one
-/// directory per checkpoint digest, so no two models share one.
-pub fn kv_dir(engine_cache_dir: &Path, snapshot_dir: &Path) -> anyhow::Result<PathBuf> {
-    let digest = crate::weights::model_artifact_digest(snapshot_dir)?;
-    Ok(engine_cache_dir
-        .join("kv")
-        .join(blake3::Hash::from(digest).to_hex().as_str()))
+/// Where a load's kv slot files live when the config names no path.
+///
+/// A persistent tier holds kv computed from these exact weights and is read
+/// again by the next run: one directory per checkpoint content digest, so
+/// no run reads kv another checkpoint wrote. The digest reads each file once
+/// and is memoized beside the directories by each file's stats
+/// ([`crate::weights::model_artifact_digest`]). A directory named by an
+/// earlier digest is not found under the new name and is left to cache
+/// cleanup.
+///
+/// A scratch tier (the default) never outlives its process, so no run can
+/// read another's kv: its directory is named by the checkpoint's path, and
+/// no byte of the checkpoint is read for it. Two live processes serving one
+/// path share it exactly as they shared the digest-named directory before:
+/// each slot file is locked at open (a second server is refused by name) and
+/// unlinked once locked, so a later process creates its own.
+pub fn kv_dir(
+    engine_cache_dir: &Path,
+    snapshot_dir: &Path,
+    persistent: bool,
+) -> anyhow::Result<PathBuf> {
+    let kv = engine_cache_dir.join("kv");
+    if !persistent {
+        let path = std::fs::canonicalize(snapshot_dir).unwrap_or_else(|_| snapshot_dir.into());
+        let named = blake3::hash(path.as_os_str().as_encoded_bytes());
+        return Ok(kv.join(format!("scratch-{}", named.to_hex())));
+    }
+    let digest = crate::weights::model_artifact_digest(snapshot_dir, &kv.join("digests"))?;
+    Ok(kv.join(blake3::Hash::from(digest).to_hex().as_str()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
