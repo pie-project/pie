@@ -35,10 +35,7 @@ seeded!(
     "nvidia/nvidia-rtx-pro-4500-blackwell.toml",
     // Committed measured profiles (`pie tune export --engine vulkan`).
     "nvidia-rtx-pro-4500-blackwell.measured.toml",
-    // The Adreno 840's, once exported from the phone's home and checked in
-    // as `profiles/<id>.measured.toml` (`<id>` the driver's device name by
-    // `profile::id_of`, `adreno-tm-840` for "Adreno (TM) 840"):
-    // "adreno-tm-840.measured.toml",
+    "adreno-tm-840.measured.toml",
 );
 
 /// The host covers committed for this backend's devices

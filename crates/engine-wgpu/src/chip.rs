@@ -33,13 +33,7 @@ macro_rules! seeded {
     };
 }
 
-seeded!(
-    // The Adreno 840's, once exported from the phone's home (`pie tune
-    // export --engine wgpu`) and checked in as `profiles/<id>.measured.toml`
-    // (`<id>` the adapter's name by `profile::id_of`, `adreno-tm-840` for
-    // "Adreno (TM) 840"):
-    // "adreno-tm-840.measured.toml",
-);
+seeded!();
 
 /// The host covers committed for the adapters native wgpu serves
 /// (`profiles/<device>.covers.json`, `pie tune export --engine wgpu`), each
