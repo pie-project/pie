@@ -28,26 +28,72 @@ pub fn noise(seed: u64, n: usize) -> Vec<f32> {
 }
 
 /// The boot every suite load takes: the backend's default with a profiles
-/// directory, so a load reads the device's measured `[rates]` (and keeps
-/// what it measures) instead of the checked-in profiles alone, which leave
-/// an unprofiled device (a phone's GPU) with no roofline rates. The
-/// directory is `$PIE_HOME/profiles` where `PIE_HOME` is set, as `pie`'s
-/// own loads use, and otherwise one directory per backend in the temp dir,
-/// shared by every test of the run.
+/// directory of this test process's own ([`profiles`]), so a load reads the
+/// device's measured `[rates]` (and keeps what it measures) instead of the
+/// checked-in profiles alone, which leave an unprofiled device (a phone's
+/// GPU) with no roofline rates, and reads nothing an earlier run, or `pie`'s
+/// own loads (`$PIE_HOME`), left there.
 ///
 /// Every device a test opens is booted by this, so the calling test is
 /// counted among the tests holding a device until it ends ([`sole`]); it
 /// waits here while another test holds the process's devices alone.
 pub fn device_boot() -> DeviceBoot {
+    let profiles = profiles().to_path_buf();
     open(false);
-    let profiles = std::env::var_os("PIE_HOME").map_or_else(
-        || std::env::temp_dir().join(format!("pie-{}-profiles", crate::backend::NAME)),
-        |home| std::path::PathBuf::from(home).join("profiles"),
-    );
     DeviceBoot {
         profiles: Some(profiles),
         ..DeviceBoot::default()
     }
+}
+
+/// The submit bound the process's rates step measures under ([`profiles`]):
+/// the roomy one the bounded loads state (`runtime::fold`), so every key a
+/// bounded load weighs by is measured, and no point is past it.
+const MEASURED_UNDER: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The profiles directory of this test process, fresh: what a load reads
+/// from it is what this process measured, never what an earlier run left
+/// (its kernel curves and picks, its rates), so a run answers as a clean
+/// one does. The device's rates are measured into it once, as the first
+/// test opens a device and before any other test opens one (every one waits
+/// here), so the rates step times the device alone: a load's rates step
+/// timed beside other tests' fires drops points past its bound and misses
+/// keys. Each model's kernel curves are measured at its first load, and
+/// kept for the process's later loads. Under the target's temp directory, a
+/// directory a process; those of processes no longer running are removed
+/// (where `/proc` says which run).
+pub fn profiles() -> &'static std::path::Path {
+    static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let root = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("pie-{}-profiles", crate::backend::NAME));
+        #[cfg(target_os = "linux")]
+        for entry in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+            let gone = entry
+                .file_name()
+                .to_str()
+                .and_then(|pid| pid.parse::<u32>().ok())
+                .is_some_and(|pid| !std::path::Path::new(&format!("/proc/{pid}")).exists());
+            if gone {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+        let dir = root.join(std::process::id().to_string());
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the test process's profiles directory");
+        let boot = DeviceBoot {
+            profiles: Some(dir.clone()),
+            submit_bound: Some(MEASURED_UNDER),
+            ..DeviceBoot::default()
+        };
+        // No device: no rates, and no test that would read them runs.
+        if let Err(why) =
+            <crate::backend::Api as engine_gpu::serve::Serve>::open(&boot, ALLOWANCE, None)
+        {
+            eprintln!("the process's rates step: {why}");
+        }
+        dir
+    })
 }
 
 /// How many parts the harness cuts the device into. A test that loads a
