@@ -1029,6 +1029,39 @@ impl Pool {
         Ok(())
     }
 
+    /// Takes back an evacuation whose copies landed ([`Self::evacuate`]):
+    /// each moved chunk copied, in `frame`, from where it lies now back to
+    /// where `before` (the table before it) put it, and the table restored.
+    /// A move's source lay free from the evacuation until now (nothing is
+    /// handed out while the verb runs), so the copies back land on bytes no
+    /// one else holds.
+    pub fn evacuate_back(
+        &mut self,
+        frame: &mut Frame,
+        evacuation: &Evacuation,
+        before: ChunkTable,
+    ) -> Result<()> {
+        for &(logical, _) in &evacuation.moves {
+            let now = self.physical(logical)?;
+            let was = before.physical(logical).ok_or_else(|| Fault::Ceiling {
+                what: "chunks of the state pool",
+                need: u64::from(logical) + 1,
+                have: u64::from(self.total_chunks),
+            })?;
+            if now == was {
+                continue;
+            }
+            self.copy(
+                frame,
+                u64::from(now) * self.chunk_bytes,
+                u64::from(was) * self.chunk_bytes,
+                self.chunk_bytes,
+            )?;
+        }
+        self.table = before;
+        Ok(())
+    }
+
     /// The host address of physical chunk `physical`'s bytes, valid until
     /// the segment holding it is given back; the caller writes through it
     /// only where no frame in flight reads them.

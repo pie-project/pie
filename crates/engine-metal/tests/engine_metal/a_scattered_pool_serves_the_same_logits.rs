@@ -714,6 +714,60 @@ fn check_near(model: &str, hybrid: bool, chunk: Option<u64>) -> Vec<Vec<f32>> {
     seats
 }
 
+/// An evacuation refused past its copies and its rebind (a holder whose refs
+/// the moved table cannot resolve, beamx40 on d821e8d1c) is taken back whole:
+/// the refusal answered, the chunk table as it stood, and the lanes decode on
+/// at the refs they lay in, the seats' logits bit for bit. Before, the copies
+/// and the claims stood moved while the refusal told the runtime nothing
+/// moved, and the two maps parted.
+#[test]
+fn a_refused_evacuation_moves_nothing() {
+    if !engine_metal::device::present() {
+        eprintln!("skipping: no Metal device");
+        return;
+    }
+    for model in ["qwen3-micro-text", "qwen35-tiny"] {
+        let fixture = fixture(model);
+        const STEPS: usize = 8;
+        let mut shell = load_near(&fixture, CONTEXT, None);
+        let seats = serve(&mut shell, &fixture.trace, &Placement::Seats, STEPS, usize::MAX, &mut |_| {});
+        drop(shell);
+
+        let mut shell = load_near(&fixture, CONTEXT, None);
+        let facts = shell.pool_chunk_facts();
+        let layout = shell.pool_layout();
+        let segment = facts.segment_chunks;
+        let low = layout.free_chunk();
+        let per = |id| facts.shape(id).map_or(1, |s| s.slots_per_chunk);
+        let place = |first| Placement::Refs {
+            first,
+            per_list: facts.shape(LIST).map(|s| s.slots_per_chunk),
+            per_fixed: per(FIXED),
+            pieces: layout.pieces,
+            window: None,
+        };
+        let held = place(0).held();
+        let kept = (low + held).div_ceil(segment);
+        let first = kept * segment;
+        shell
+            .commit_segments(kept + held.div_ceil(segment))
+            .expect("the segments commit");
+        let scattered = serve(&mut shell, &fixture.trace, &place(first), STEPS, STEPS / 2, &mut |shell| {
+            let before = shell.chunk_table();
+            let moves = (0..held).map(|at| (first + at, low + at)).collect();
+            engine_metal::serve::fail_next_repoint();
+            let refused = shell.evacuate(&Evacuation { moves });
+            assert!(refused.is_err(), "{model}: the injected refusal is answered");
+            assert_eq!(shell.chunk_table(), before, "{model}: a refused evacuation moves nothing");
+        });
+        same(
+            &format!("{model}: decoding on past a refused evacuation, against the seats' runs"),
+            &scattered,
+            &seats,
+        );
+    }
+}
+
 #[test]
 fn a_scattered_dense_pool_serves_the_same_logits() {
     check("qwen3-micro-text", false);

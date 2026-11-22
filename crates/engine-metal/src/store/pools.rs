@@ -2305,6 +2305,28 @@ impl Pools {
     /// done whatever follows: a weight cache that fails to restage is a
     /// fault of its own ([`Self::weights_ready`]), never a refusal, which
     /// would have the runtime roll back a move this engine made.
+    /// The chunk table as it stands: what [`Self::evacuate_back`] restores.
+    #[must_use]
+    pub fn chunk_table(&self) -> engine::chunk::ChunkTable {
+        self.pool.table().clone()
+    }
+
+    /// Takes back an evacuation whose copies landed ([`Pool::evacuate_back`]),
+    /// the weight caches' tables restaged where their chunks lie again.
+    pub fn evacuate_back(
+        &mut self,
+        frame: &mut Frame,
+        evacuation: &Evacuation,
+        before: engine::chunk::ChunkTable,
+    ) -> Result<()> {
+        self.pool.evacuate_back(frame, evacuation, before)?;
+        match self.restage_weights() {
+            Ok(()) => self.weights_stale = None,
+            Err(fault) => self.weights_stale = Some(fault.to_string()),
+        }
+        Ok(())
+    }
+
     pub fn evacuate(&mut self, frame: &mut Frame, evacuation: &Evacuation) -> Result<()> {
         self.pool.evacuate(frame, evacuation)?;
         if let Err(fault) = self.restage_weights() {
