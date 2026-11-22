@@ -333,6 +333,14 @@ impl Library {
         }
     }
 
+    /// Claims every holder's runs where an evacuation left them, in one
+    /// step ([`Claims::claim_all`]): refused by name, every claim as it
+    /// stood, where one lands on another's.
+    pub fn claim_moved(&self, moved: &[(Holder, Vec<Run>)]) -> Result<()> {
+        self.claims.claim_all(moved)?;
+        Ok(())
+    }
+
     /// The pipelines built after the load, each at a bind that found its
     /// call missing: none, where the load built every call.
     #[must_use]
@@ -588,12 +596,17 @@ impl Session {
         Ok(session)
     }
 
-    /// Writes each stage's step records with where the instance lies now,
-    /// each base checked ([`bases`]), and claims its slots and heap
-    /// ([`Claims`]): at the bind, and again where they moved.
+    /// Claims its slots and heap ([`Claims`]), then writes its step
+    /// records there ([`Self::write_records`]): at the bind and a rebind.
     fn locate(&self) -> Result<()> {
         // Claimed before a record is written there.
         self.claim_runs()?;
+        self.write_records()
+    }
+
+    /// Writes each stage's step records with where the instance lies now,
+    /// claimed already, each base checked ([`bases`]).
+    fn write_records(&self) -> Result<()> {
         let places = [&self.instance, &self.pair];
         for stage in &self.stages {
             let bases = bases(
@@ -703,9 +716,18 @@ impl Session {
         heap_span([&self.instance, &self.pair], stage.heap)
     }
 
-    /// Points the stages' bind groups at the chunks their tables' slots
-    /// and the guest's state sit in now, after an evacuation.
-    pub fn rebind(&mut self, pools: &Pools<crate::device::Api>) -> Result<()> {
+    /// After an evacuation, its passes landed, takes where its tables'
+    /// slots and, bound, its state and its pair's sit in now, and returns
+    /// the runs it holds there, to be claimed with every other holder's in
+    /// one step ([`Library::claim_moved`]) before [`Self::repoint`] writes
+    /// its step records there. A park that kept its tables in place
+    /// (`parked`) holds their run alone, as its park claimed: its state and
+    /// its share of its pair went back at its park.
+    pub fn relocate(
+        &mut self,
+        pools: &Pools<crate::device::Api>,
+        parked: bool,
+    ) -> Result<Vec<(Holder, Vec<Run>)>> {
         for stage in &mut self.stages {
             for table in &mut stage.tables {
                 table.rebind(pools)?;
@@ -713,16 +735,24 @@ impl Session {
             stage.args.rebind(pools)?;
         }
         self.status.rebind(pools)?;
+        if parked {
+            let tables = self.own_runs().into_iter().take(1).collect();
+            return Ok(vec![(Holder::Instance(self.claim), tables)]);
+        }
         self.instance.rebind(pools)?;
         self.pair.rebind(pools)?;
-        // The evacuation moved the pair's state for every instance on it:
-        // the group's move, claimed as one before this member's own.
+        let mut moved = vec![(Holder::Instance(self.claim), self.own_runs())];
+        // The pair's state moved for every instance on it: the group's.
         if let Some((pair, _)) = self.pair_group {
-            self.library
-                .claims
-                .claim_all(&[(Holder::Pair(pair), self.pair_runs())])?;
+            moved.push((Holder::Pair(pair), self.pair_runs()));
         }
-        self.locate()
+        Ok(moved)
+    }
+
+    /// Writes its step records where [`Self::relocate`] found its slots
+    /// and state, claimed there.
+    pub fn repoint(&self) -> Result<()> {
+        self.write_records()
     }
 
     /// Moves the tables to `slots` (`Instance` slot refs, as many as they

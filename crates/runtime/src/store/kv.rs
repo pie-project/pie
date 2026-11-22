@@ -7,7 +7,7 @@ pub mod write;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -150,6 +150,88 @@ impl KvSpillTxn {
     }
 }
 
+/// What a list compaction empties ([`KvStore::plan_list_compaction`]):
+/// list chunks of the device whose every slot holds a page that may move,
+/// the fewest pages first, and the processes whose sets read those pages:
+/// those running, each fenced while its pages move (no fire of theirs
+/// reads them then), and those parked (their sets suspended), whose
+/// restore waits for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListCompaction {
+    /// The list chunks it empties, logical.
+    pub chunks: Vec<u32>,
+    /// The pages it moves.
+    pub pages: usize,
+    /// The running processes whose sets read them.
+    pub readers: Vec<ProcessId>,
+    /// The parked processes whose suspended sets read them.
+    pub parked: Vec<ProcessId>,
+}
+
+/// Who a list compaction's page may move for: a running set's process
+/// (`suspended` false) fenced for it, a suspended set's process held from
+/// its restore ([`KvStore::plan_list_compaction`]).
+pub type MayMove<'a> = &'a dyn Fn(ProcessId, bool) -> bool;
+
+/// A list chunk's pages and the processes reading them, running and
+/// parked; `None` for a chunk one of whose pages stays.
+type ChunkPages = Option<(
+    Vec<(TriePageLocation, PhysicalKvPageId)>,
+    BTreeSet<ProcessId>,
+    BTreeSet<ProcessId>,
+)>;
+
+/// A list compaction under way ([`KvStore::prepare_relocate`]): each page,
+/// its device slot and the slot it moves to, both of the device's list
+/// shape. The pages are pinned as a move's until it commits or aborts.
+#[derive(Debug)]
+pub struct KvRelocateTxn {
+    pages: Vec<(TriePageLocation, PhysicalKvPageId, PhysicalKvPageId)>,
+    shape: Option<::engine::chunk::ShapeId>,
+    /// The chunks it empties, logical.
+    chunks: Vec<u32>,
+}
+
+impl KvRelocateTxn {
+    /// The list shape the pages are slots of.
+    pub fn shape(&self) -> Option<::engine::chunk::ShapeId> {
+        self.shape
+    }
+
+    /// The device slots copied, and the device slots they go to.
+    pub fn copy_plan(&self) -> (Vec<u32>, Vec<u32>) {
+        self.pages.iter().map(|(_, from, to)| (from.0, to.0)).unzip()
+    }
+
+    pub fn page_count(&self) -> usize {
+        self.pages.len()
+    }
+
+    /// The chunks it empties, logical.
+    pub fn chunks(&self) -> &[u32] {
+        &self.chunks
+    }
+}
+
+/// The kv pages held on every tier ([`KvStore::census`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KvCensus {
+    /// Pages held anywhere: the device's list slots out, the host tier's,
+    /// and the disk's slots less the whole disk chunks other state holds
+    /// (`guest_disk`). A page a move holds on two tiers counts twice while
+    /// the move is under way: both slots are taken.
+    pub held: u64,
+    /// The disk slots whole disk chunks hold for parked guest parts
+    /// ([`KvStore::take_disk_chunks`]).
+    pub guest_disk: u64,
+    /// Of `held`, the second slots of the pages moves hold on two tiers.
+    pub moving: u64,
+    /// Of those, the pages only idle cache holds, on every tier.
+    pub idle: u64,
+    /// The disk tier's slots.
+    pub disk_slots: u32,
+}
+
 pub struct KvStore {
     table: KvPageTable,
     /// The list shape's slots, one a page.
@@ -213,6 +295,9 @@ pub struct KvStore {
     /// The same for idle cache below the device: see
     /// [`Self::below_device_cache_pages`].
     below_cached: std::cell::Cell<Option<(Instant, std::time::Duration, (u32, u32))>>,
+    /// The disk slots whole disk chunks hold for state other than kv
+    /// ([`Self::take_disk_chunks`]): a parked guest part's.
+    guest_disk_slots: u32,
 }
 
 /// A persistent disk tier: a copy on disk of sealed pages, by key. A page
@@ -446,6 +531,7 @@ impl KvStore {
             hints: HashMap::new(),
             reclaimable: std::cell::Cell::new(None),
             below_cached: std::cell::Cell::new(None),
+            guest_disk_slots: 0,
         }
     }
 
@@ -1248,7 +1334,251 @@ impl KvStore {
         let per_chunk = per_chunk.max(1);
         let firsts = self.disk_pool.try_alloc_aligned_runs(n, per_chunk)?;
         self.below_cached.set(None);
+        self.guest_disk_slots += firsts.len() as u32 * per_chunk;
         Some(firsts.into_iter().map(|slot| slot.0 / per_chunk).collect())
+    }
+
+    /// The kv pages held on every tier, each once, and the idle cache's
+    /// among them, read now ([`KvCensus`]): what the capacity gate counts
+    /// kv by (`planner::PoolPort::capacity_census`).
+    #[must_use]
+    pub fn census(&self) -> KvCensus {
+        let disk_out = self
+            .disk_pool
+            .capacity()
+            .saturating_sub(self.disk_pool.available() as u32);
+        let roots = self.table.unused_cache_roots();
+        let (idle_host, idle_disk) =
+            if self.host_pool.capacity() == 0 && self.disk_pool.capacity() == 0 {
+                (0, 0)
+            } else {
+                self.table.cache_only_below_device(&roots)
+            };
+        KvCensus {
+            held: u64::from(self.pool.out())
+                + u64::from(self.host_pool.out())
+                + u64::from(disk_out.saturating_sub(self.guest_disk_slots)),
+            guest_disk: u64::from(self.guest_disk_slots),
+            moving: self.table.moving_pages() as u64,
+            idle: u64::from(self.table.device_pages_freed(&roots))
+                + u64::from(idle_host)
+                + u64::from(idle_disk),
+            disk_slots: self.disk_pool.capacity(),
+        }
+    }
+
+    /// The device's list chunks and the pages in each that may move, by
+    /// logical chunk: each chunk's used slots, and its pages with the
+    /// processes reading them (`None` for a chunk one of whose slots stays:
+    /// a page a move or pin holds, one read by a set of a process
+    /// `may_move` refuses, or a slot let go and still waiting on a fire).
+    /// Chunks a chunk move or copy holds are left out as sources and as
+    /// destinations alike.
+    fn list_chunk_pages(
+        &self,
+        may_move: MayMove<'_>,
+    ) -> Option<(u32, Vec<crate::store::slots::SingleChunk>, BTreeMap<u32, ChunkPages>)> {
+        let (shared, shape) = self.pool.shared_shape()?;
+        let (spc, chunks) = shared.lock().unwrap().single_chunks(shape);
+        if spc == 0 {
+            return None;
+        }
+        let base = self.pool.base();
+        let mut by_chunk: BTreeMap<u32, ChunkPages> = BTreeMap::new();
+        for (location, id, readers) in self.table.device_pages_by_reader() {
+            let chunk = id.0.saturating_sub(base) / spc;
+            let entry = by_chunk
+                .entry(chunk)
+                .or_insert_with(|| Some((Vec::new(), BTreeSet::new(), BTreeSet::new())));
+            let Some((pages, running, parked)) = entry else {
+                continue;
+            };
+            let movable = readers.is_some_and(|readers| {
+                readers.into_iter().all(|(ws, suspended)| {
+                    match self.table.owner(ws).ok().flatten() {
+                        Some(pid) if may_move(pid, suspended) => {
+                            if suspended {
+                                parked.insert(pid);
+                            } else {
+                                running.insert(pid);
+                            }
+                            true
+                        }
+                        _ => false,
+                    }
+                })
+            });
+            if movable {
+                pages.push((location, id));
+            } else {
+                *entry = None;
+            }
+        }
+        Some((spc, chunks, by_chunk))
+    }
+
+    /// The list chunks a compaction empties for `wanted` whole chunks
+    /// ([`ListCompaction`]): free list slots scattered across partly used
+    /// chunks are room a bind or a restore of whole chunks cannot take, and
+    /// moving the pages of the emptiest chunks into the free slots of the
+    /// rest frees those chunks whole. A chunk is a source only where every
+    /// slot it holds is a page that may move (`may_move` names the
+    /// processes whose sets may be fenced for it, and the parked ones whose
+    /// restore may wait for it); its pages go to the free slots of the
+    /// chunks left, fullest first. Fewest pages first, then the lowest
+    /// chunk: as many chunks as `wanted`, or as many as the free slots
+    /// elsewhere take. `None` where none empties.
+    #[must_use]
+    pub fn plan_list_compaction(&self, wanted: u32, may_move: MayMove<'_>) -> Option<ListCompaction> {
+        let (spc, chunks, by_chunk) = self.list_chunk_pages(may_move)?;
+        let mut room: u64 = chunks
+            .iter()
+            .filter(|chunk| chunk.settled)
+            .map(|chunk| u64::from(spc - chunk.used))
+            .sum();
+        #[allow(clippy::type_complexity)]
+        let mut sources: Vec<(u32, u32, &BTreeSet<ProcessId>, &BTreeSet<ProcessId>)> = chunks
+            .iter()
+            .filter(|chunk| chunk.settled && chunk.used > 0)
+            .filter_map(|chunk| {
+                let (pages, running, parked) = by_chunk.get(&chunk.logical)?.as_ref()?;
+                (pages.len() as u32 == chunk.used)
+                    .then_some((chunk.used, chunk.logical, running, parked))
+            })
+            .collect();
+        sources.sort_unstable_by_key(|&(used, logical, ..)| (used, logical));
+        let (mut picked, mut moving) = (Vec::new(), 0u64);
+        let (mut readers, mut parked) = (BTreeSet::new(), BTreeSet::new());
+        for (used, logical, running, held) in sources {
+            if picked.len() as u32 >= wanted {
+                break;
+            }
+            // Emptied, it is no destination: its free slots leave the room.
+            let left = room - u64::from(spc - used);
+            if moving + u64::from(used) > left {
+                continue;
+            }
+            room = left;
+            moving += u64::from(used);
+            picked.push(logical);
+            readers.extend(running.iter().copied());
+            parked.extend(held.iter().copied());
+        }
+        (!picked.is_empty()).then(|| ListCompaction {
+            chunks: picked,
+            pages: moving as usize,
+            readers: readers.into_iter().collect(),
+            parked: parked.into_iter().collect(),
+        })
+    }
+
+    /// Takes `plan`'s pages out of their chunks: each chunk whose every
+    /// slot still holds a page that may move (`fenced` names the running
+    /// processes whose sets are fenced now, none of their fires in flight;
+    /// the plan's parked ones are held from their restore) has its
+    /// pages given fresh slots in the partly filled chunks outside the plan
+    /// and pinned as a move's until [`Self::commit_relocate`] or
+    /// [`Self::abort_relocate`]. A chunk that changed since the plan (a
+    /// page taken into it, a reader not fenced) is left where it lies.
+    /// `None` where no chunk of the plan still empties.
+    pub fn prepare_relocate(
+        &mut self,
+        plan: &ListCompaction,
+        fenced: &HashSet<ProcessId>,
+    ) -> Option<KvRelocateTxn> {
+        let may_move = |pid: ProcessId, suspended: bool| {
+            if suspended {
+                plan.parked.contains(&pid)
+            } else {
+                fenced.contains(&pid)
+            }
+        };
+        let (_, chunks, by_chunk) = self.list_chunk_pages(&may_move)?;
+        let used: HashMap<u32, (u32, bool)> = chunks
+            .iter()
+            .map(|chunk| (chunk.logical, (chunk.used, chunk.settled)))
+            .collect();
+        let mut emptied = Vec::new();
+        let mut pages = Vec::new();
+        for &logical in &plan.chunks {
+            let Some(&(count, true)) = used.get(&logical) else {
+                continue;
+            };
+            let Some(Some((movable, ..))) = by_chunk.get(&logical) else {
+                continue;
+            };
+            if movable.len() as u32 != count || count == 0 {
+                continue;
+            }
+            emptied.push(logical);
+            pages.extend(movable.iter().copied());
+        }
+        if pages.is_empty() {
+            return None;
+        }
+        // Chunks a copy or a chunk move holds take no page either.
+        let outside: BTreeSet<u32> = emptied
+            .iter()
+            .copied()
+            .chain(chunks.iter().filter(|chunk| !chunk.settled).map(|chunk| chunk.logical))
+            .collect();
+        let to = self.pool.try_alloc_outside(pages.len(), &outside)?;
+        self.table
+            .pin_swap_locations(pages.iter().map(|&(location, _)| location));
+        Some(KvRelocateTxn {
+            pages: pages
+                .into_iter()
+                .zip(to)
+                .map(|((location, from), to)| (location, from, to))
+                .collect(),
+            shape: self.shape,
+            chunks: emptied,
+        })
+    }
+
+    /// The copy of `txn` landed: each page reads its new slot from now on
+    /// (every working set's table is read again), and its old slot goes
+    /// back, its chunk free once all of them have. No fire reads the old
+    /// slots: their readers were fenced with no fire in flight, and the
+    /// copy out of them, ordered behind every fire before it, has landed.
+    pub fn commit_relocate(&mut self, txn: KvRelocateTxn) -> Result<usize, KvStoreError> {
+        let replacements: Vec<_> = txn
+            .pages
+            .iter()
+            .map(|&(location, from, to)| {
+                (
+                    location,
+                    KvPageBacking::Resident(from),
+                    KvPageBacking::Resident(to),
+                )
+            })
+            .collect();
+        if let Err(error) = self.table.replace_backings(&replacements) {
+            self.abort_relocate(txn);
+            return Err(error.into());
+        }
+        let freed = self
+            .table
+            .unpin_swap_locations(txn.pages.iter().map(|&(location, ..)| location));
+        for flat in self.flat.values_mut() {
+            *flat = None;
+        }
+        let count = txn.pages.len();
+        self.pool
+            .release_reserved(txn.pages.into_iter().map(|(_, from, _)| from).collect());
+        self.end_move(freed);
+        Ok(count)
+    }
+
+    /// `txn` did not land: its pages stay where they lay, and the slots
+    /// taken for them go back (the copy into them settled first).
+    pub fn abort_relocate(&mut self, txn: KvRelocateTxn) {
+        let freed = self
+            .table
+            .unpin_swap_locations(txn.pages.iter().map(|&(location, ..)| location));
+        self.pool
+            .release_reserved(txn.pages.into_iter().map(|(_, _, to)| to).collect());
+        self.end_move(freed);
     }
 
     /// The disk tier's free slots, idle cache's not counted.
@@ -1266,6 +1596,9 @@ impl KvStore {
             .collect();
         self.disk_pool.release_runs(&firsts, per_chunk);
         self.below_cached.set(None);
+        self.guest_disk_slots = self
+            .guest_disk_slots
+            .saturating_sub(firsts.len() as u32 * per_chunk);
     }
 
     /// Parked sets' pages on the host going on down to disk, the sets of
@@ -2644,6 +2977,52 @@ impl KvStore {
 
     pub fn release_device_reservation(&mut self, pages: Vec<PhysicalKvPageId>) {
         self.pool.release_reserved(pages);
+    }
+
+    /// Reserved device pages no fire has touched, given back and taken
+    /// again at once: the fullest partly filled list chunks first, so the
+    /// chunks only they held stand free whole, with no copy. As many come
+    /// back as went. Only where that frees more chunks than the take opens
+    /// again: else they stay as they are (taken again, they would free and
+    /// fill the same room on every ask).
+    pub fn repack_reserved(&mut self, pages: Vec<PhysicalKvPageId>) -> Vec<PhysicalKvPageId> {
+        let n = pages.len();
+        if n == 0 || self.repack_frees(&pages) == 0 {
+            return pages;
+        }
+        self.pool.release_reserved(pages);
+        self.pool
+            .try_alloc_n(n)
+            .expect("the slots just given back stand free")
+    }
+
+    /// The chunks [`Self::repack_reserved`] would free past those its take
+    /// opens again: the chunks only `pages` hold, less the fresh chunks the
+    /// pages need past the free slots of the chunks left.
+    fn repack_frees(&self, pages: &[PhysicalKvPageId]) -> u32 {
+        let Some((shared, shape)) = self.pool.shared_shape() else {
+            return 0;
+        };
+        let (spc, chunks) = shared.lock().unwrap().single_chunks(shape);
+        if spc == 0 {
+            return 0;
+        }
+        let base = self.pool.base();
+        let mut mine: HashMap<u32, u32> = HashMap::new();
+        for page in pages {
+            *mine.entry(page.0.saturating_sub(base) / spc).or_default() += 1;
+        }
+        let (mut emptied, mut room) = (0u32, 0u64);
+        for chunk in &chunks {
+            let held = mine.get(&chunk.logical).copied().unwrap_or(0);
+            if held == chunk.used {
+                emptied += 1;
+            } else {
+                room += u64::from(spc - chunk.used + held);
+            }
+        }
+        let opened = (pages.len() as u64).saturating_sub(room).div_ceil(u64::from(spc));
+        emptied.saturating_sub(u32::try_from(opened).unwrap_or(u32::MAX))
     }
 
     pub fn prepare_suspend(

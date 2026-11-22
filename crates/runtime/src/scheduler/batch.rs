@@ -273,10 +273,15 @@ pub(crate) fn build_batch_request(
             completions.push(req.completion.clone());
             let base = u32::try_from(lanes.len()).unwrap_or(u32::MAX);
             let mut own: Vec<u32> = Vec::new();
+            // Each lane moves into the step; its page ids stay with the
+            // request, which a fire refused for placement goes again by
+            // once its lanes come back from the step (`restore_lanes`).
             lanes.extend(
-                std::mem::take(&mut req.request.lanes)
-                    .into_iter()
-                    .map(|mut lane| {
+                req.request
+                    .lanes
+                    .iter_mut()
+                    .map(|fire_lane| {
+                        let mut lane = std::mem::take(&mut fire_lane.lane);
                         lane.fires_after = fires_after;
                         lane.group = lane.group.map(|id| {
                             let local =
@@ -286,7 +291,7 @@ pub(crate) fn build_batch_request(
                                 });
                             groups + u32::try_from(local).unwrap_or(u32::MAX)
                         });
-                        lane.lane
+                        lane
                     }),
             );
             groups = groups.saturating_add(u32::try_from(own.len()).unwrap_or(u32::MAX));
@@ -319,6 +324,85 @@ pub(crate) fn build_batch_request(
             completions,
         }
     })
+}
+
+/// Puts back into `requests` what the build moved out of them into
+/// `steps` (a frame the engine refused for where state lies before any of
+/// its steps ran): each fire's lanes into the page shells it kept, and its
+/// media and voxels, found by its own completion. Says, per request,
+/// whether it came back: a fire a refused lane took out of the frame
+/// (failed alone) is in no step, and goes nowhere again.
+pub(crate) fn restore_lanes(requests: &mut [Box<PendingRequest>], steps: Vec<StepFire>) -> Vec<bool> {
+    let mut restored = vec![false; requests.len()];
+    for step in steps {
+        let ::engine::Step {
+            lanes,
+            media,
+            voxels,
+            ..
+        } = step.submission;
+        let members = step.member_lanes.len().saturating_sub(1);
+        let member_of = |lane: u32| {
+            step.member_lanes[..members]
+                .partition_point(|&start| start <= lane)
+                .saturating_sub(1)
+        };
+        let mut media_of: Vec<Vec<engine::fire::StepMedia>> = vec![Vec::new(); members];
+        for row in media {
+            if members > 0 {
+                media_of[member_of(row.lane)].push(row);
+            }
+        }
+        let mut voxels_of: Vec<Vec<engine::fire::StepVoxels>> = vec![Vec::new(); members];
+        for row in voxels {
+            if members > 0 {
+                voxels_of[member_of(row.lane)].push(row);
+            }
+        }
+        let mut lanes = lanes.into_iter();
+        for member in 0..members {
+            let span = (step.member_lanes[member + 1] - step.member_lanes[member]) as usize;
+            let own: Vec<::engine::Lane> = lanes.by_ref().take(span).collect();
+            let Some(completion) = step.completions.get(member) else {
+                continue;
+            };
+            let Some(at) = (0..requests.len())
+                .find(|&at| !restored[at] && requests[at].completion.same_request(completion))
+            else {
+                continue;
+            };
+            let request = &mut requests[at].request;
+            if request.lanes.len() != own.len() {
+                debug_assert!(
+                    false,
+                    "a fire's lanes come back {} for the {} it was built with",
+                    own.len(),
+                    request.lanes.len()
+                );
+                continue;
+            }
+            for (shell, lane) in request.lanes.iter_mut().zip(own) {
+                shell.lane = lane;
+            }
+            let base = step.member_lanes[member];
+            request.media = std::mem::take(&mut media_of[member])
+                .into_iter()
+                .map(|mut row| {
+                    row.lane -= base;
+                    row
+                })
+                .collect();
+            request.voxels = std::mem::take(&mut voxels_of[member])
+                .into_iter()
+                .map(|mut row| {
+                    row.lane -= base;
+                    row
+                })
+                .collect();
+            restored[at] = true;
+        }
+    }
+    restored
 }
 
 #[allow(

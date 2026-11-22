@@ -874,7 +874,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                      parks={} serves={} evictions={} deferrals={} \
                      evict_rollbacks={} evict_faults={} restore_faults={} restores={} restore_failures={} restore_roles_short={} leaked_role_slots={} gate_parks={} \
                      hogs={} starved={} restarted={} salvaged={} swapfull={}/{} e6_relax={} rshort={} \
-                     grow_waits={} compaction_waits={} grow_parked={} no_grows={} \
+                     grow_waits={} compaction_waits={} list_compactions={} grow_parked={} no_grows={} \
                      lock_n={} lock_wait_ms={} lock_hold_ms={} lock_wmax_us={} lock_hmax_us={} \
                      d2h_pages={} h2d_pages={} d2h_rs={} h2d_rs={} d2h_ms={} h2d_ms={} \
                      disk_free={}/{} disk_w_pages={} host_disk_pages={} disk_r_pages={} disk_w_ms={} disk_r_ms={} \
@@ -920,6 +920,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     d.restore_absorb_short_total,
                     d.grow_waits_total,
                     d.compaction_waits_total,
+                    d.list_compactions_total,
                     d.grow_parked,
                     d.no_grows_total,
                     lk_n,

@@ -69,6 +69,10 @@ pub(crate) struct Half {
     /// another owner's until a rebind names where it lies, so nothing of
     /// it is repointed, claimed or fired meanwhile.
     parked: bool,
+    /// Its park kept its tables in place (`Rebind::Parked { kept }`): they
+    /// stay claimed, and an evacuation moves their claim as a bound
+    /// instance's.
+    kept: bool,
     poisoned: Arc<AtomicBool>,
 }
 
@@ -552,6 +556,7 @@ impl Plane {
                     session,
                     pair_generation: binding.pair_generation,
                     parked: false,
+                    kept: false,
                     poisoned: Arc::clone(&poisoned),
                 })),
                 #[cfg(feature = "wgpu")]
@@ -1085,17 +1090,42 @@ impl Plane {
     /// Points every instance's tables at the chunks their slots sit in now.
     pub fn rebind(&mut self, pools: &Pools<crate::device::Api>) -> Result<(), Refusal> {
         #[cfg(feature = "wgpu")]
-        for seat in self.instances.values_mut() {
-            let mut half = seat.half.lock().expect("half lock poisoned");
-            // A parked instance's slots are another owner's: repointed and
-            // claimed at its rebind, not here.
-            if half.parked {
-                continue;
+        {
+            // Every holder's runs where the evacuation left them, claimed
+            // in one step before a record is written there. A parked
+            // instance that shed its state holds nothing here: repointed
+            // and claimed at its rebind. One whose park kept its tables in
+            // place holds them, where the evacuation moved them.
+            let mut moved: Vec<(engine::guest_claims::Holder, Vec<engine::guest_claims::Run>)> =
+                Vec::new();
+            for seat in self.instances.values() {
+                let mut half = seat.half.lock().expect("half lock poisoned");
+                if half.parked && !half.kept {
+                    continue;
+                }
+                let parked = half.parked;
+                for (holder, runs) in half
+                    .session
+                    .relocate(pools, parked)
+                    .map_err(Refusal::fault)?
+                {
+                    // A pair's members each name its runs: claimed once.
+                    if !moved.iter().any(|(held, _)| *held == holder) {
+                        moved.push((holder, runs));
+                    }
+                }
             }
-            half.session
-                .rebind(pools)
-                .map_err(Refusal::fault)?;
-            seat.scores = half.session.scores();
+            if let Some(library) = &self.library {
+                library.claim_moved(&moved).map_err(Refusal::fault)?;
+            }
+            for seat in self.instances.values_mut() {
+                let half = seat.half.lock().expect("half lock poisoned");
+                if half.parked {
+                    continue;
+                }
+                half.session.repoint().map_err(Refusal::fault)?;
+                seat.scores = half.session.scores();
+            }
         }
         #[cfg(not(feature = "wgpu"))]
         let _ = pools;
@@ -1153,6 +1183,7 @@ impl Plane {
                     }
                     half.pair_generation = *pair_generation;
                     half.parked = false;
+                    half.kept = false;
                     half.session
                         .clear(fresh_pair)
                         .map_err(Refusal::fault)?;
@@ -1173,6 +1204,7 @@ impl Plane {
                     let mut half = seat.half.lock().expect("half lock poisoned");
                     // Said again by a move down of its tables: kept nowhere now.
                     half.session.park(*kept);
+                    half.kept = *kept;
                     if !half.parked {
                         // It leaves its pair's taking as it leaves the group.
                         self.takings

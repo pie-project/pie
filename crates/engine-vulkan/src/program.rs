@@ -38,6 +38,11 @@ struct Instance {
     /// it is repointed, claimed or fired meanwhile.
     #[cfg(feature = "vulkan")]
     parked: bool,
+    /// Its park kept its tables in place (`Rebind::Parked { kept }`): they
+    /// stay claimed, and an evacuation moves their claim as a bound
+    /// instance's.
+    #[cfg(feature = "vulkan")]
+    kept: bool,
 
     /// The channels whose device cells this instance holds itself (none
     /// registered covers them), in its `ring_slots`.
@@ -526,6 +531,8 @@ impl Plane {
                 pair_generation: binding.pair_generation,
                 #[cfg(feature = "vulkan")]
                 parked: false,
+                #[cfg(feature = "vulkan")]
+                kept: false,
                 own_cells,
                 landing: Arc::default(),
                 faulted: Arc::default(),
@@ -641,10 +648,30 @@ impl Plane {
         #[cfg(feature = "vulkan")]
         {
             let program = Refusal::fault;
-            // A parked instance's slots are another owner's: repointed and
-            // claimed at its rebind, not here.
-            for seat in self.instances.values_mut().filter(|seat| !seat.parked) {
-                seat.session.rebind(pools).map_err(program)?;
+            // Every holder's runs where the evacuation left them, claimed
+            // in one step before a set is pointed there. A parked instance
+            // that shed its state holds nothing here: repointed and claimed
+            // at its rebind. One whose park kept its tables in place holds
+            // them, where the evacuation moved them.
+            let mut moved: Vec<(engine::guest_claims::Holder, Vec<engine::guest_claims::Run>)> =
+                Vec::new();
+            for seat in self
+                .instances
+                .values_mut()
+                .filter(|seat| !seat.parked || seat.kept)
+            {
+                for (holder, runs) in seat.session.relocate(pools, seat.parked).map_err(program)? {
+                    // A pair's members each name its runs: claimed once.
+                    if !moved.iter().any(|(held, _)| *held == holder) {
+                        moved.push((holder, runs));
+                    }
+                }
+            }
+            if let Some(library) = &self.library {
+                library.claim_moved(&moved).map_err(program)?;
+            }
+            for seat in self.instances.values().filter(|seat| !seat.parked) {
+                seat.session.repoint().map_err(program)?;
             }
             for cell in self
                 .kept
@@ -704,6 +731,7 @@ impl Plane {
                     }
                     seat.pair_generation = *pair_generation;
                     seat.parked = false;
+                    seat.kept = false;
                     seat.session.clear(fresh_pair).map_err(program)?;
                     let mut kept = self.kept.lock().expect("kept cells lock poisoned");
                     for ring in rings {
@@ -730,6 +758,7 @@ impl Plane {
                     })?;
                     // Said again by a move down of its tables: kept nowhere now.
                     seat.session.park(*kept).map_err(program)?;
+                    seat.kept = *kept;
                     if !seat.parked {
                         // It leaves its pair's taking as it leaves the group.
                         self.takings

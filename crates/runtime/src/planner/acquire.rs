@@ -63,6 +63,11 @@ impl ResidencyPlanner {
             }
             return Some(AllocationGrant::empty());
         }
+        // Past what every tier keeps for the finisher, it queues and waits
+        // there, named ([`super::inner::CapacityGate`]).
+        if self.capacity_holds(pid, demand.kv_pages) {
+            return None;
+        }
         let uncontended = self.returns.waiters.load(Ordering::Acquire) == 0
             && self.nonresident.load(Ordering::Acquire) == 0;
         if !self.seated_first {
@@ -170,6 +175,16 @@ impl ResidencyPlanner {
             return Ok(Acquired::Granted(grant));
         }
         let (_, kv_total) = self.port.device_stats();
+        // The finisher grows on the device alone: an end past the device
+        // never finishes, and is refused by name at its first ask, the
+        // bound named (the declared context: a process states no end).
+        if !rise
+            && let Some(end) = self.port.context_pages()
+            && end > self.device_pages_most()
+            && let Some(room) = self.port.room()
+        {
+            return Err(PlannerError::EndPastDevice { end, room });
+        }
         if demand.kv_pages > kv_total && !rise {
             if let Some(room) = self.port.room() {
                 return Err(PlannerError::PastPool {
@@ -434,11 +449,7 @@ impl ResidencyPlanner {
     }
 
     pub fn is_resident(&self, pid: ProcessId) -> bool {
-        self.inner
-            .lock()
-            .procs
-            .get(&pid)
-            .is_none_or(|proc| proc.state == Residency::Resident)
+        self.inner.lock().settled_resident(pid)
     }
 
     /// Registers kv working set `ws` of process `pid` in `residency`,
@@ -456,10 +467,7 @@ impl ResidencyPlanner {
         ws: &crate::store::kv::working_set::KvWorkingSet,
     ) {
         let inner = self.lock_inner();
-        let resident = inner
-            .procs
-            .get(&pid)
-            .is_none_or(|proc| proc.state == Residency::Resident);
+        let resident = inner.settled_resident(pid);
         let handle = ws.suspend_handle();
         if !resident {
             handle.fence();
@@ -484,12 +492,13 @@ impl ResidencyPlanner {
         loop {
             let (signal, asked) = {
                 let mut inner = self.lock_inner();
-                let Some(proc) = inner.procs.get_mut(&pid) else {
+                if !inner.procs.contains_key(&pid) {
                     return Err(PlannerError::Cancelled);
-                };
-                if proc.state == Residency::Resident {
+                }
+                if inner.settled_resident(pid) {
                     return Ok(());
                 }
+                let proc = inner.procs.get_mut(&pid).expect("present");
                 // Parked owing its restore (it went idle): a process waiting
                 // to be resident asks for it again.
                 // Left parked, nothing queues it, and the wait never ends
