@@ -896,6 +896,8 @@ impl Engine for Cuda {
             // CUDA states no bound on one submission (no watchdog on a
             // compute device).
             guest_cost: engine::GuestCost::default(),
+            // A beam group's page list (`beam_list`), read at a search's finish.
+            host_ops: engine::HostOps { beam_list: true },
             mixed_lanes: engine::MixedLanes::Any,
             frames_in_flight: u32::from(
                 engine::runahead::Runahead::of(frames_in_flight).frames_in_flight,

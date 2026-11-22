@@ -55,6 +55,9 @@ pub struct EngineSpec {
     pub limits: SchedulerLimits,
     pub device_geometry_port_mask: PortMask,
     pub device_domain: MemoryDomain,
+    /// The host ops the engine serves, as its load stated them
+    /// ([`::engine::Capabilities::host_ops`]).
+    pub host_ops: ::engine::HostOps,
     /// The engine's kind ([`::engine::Engine::kind`]), as bind names it.
     pub kind: &'static str,
     /// The backend the host emits a guest program's kernels for
@@ -258,6 +261,31 @@ pub fn get_spec(engine_id: usize) -> Result<EngineSpec> {
         .get(engine_id)
         .and_then(|d| d.as_ref().map(|r| r.spec.clone()))
         .ok_or_else(|| anyhow!("unknown engine {engine_id}"))
+}
+
+/// Refuses a program of `package` on engine `engine_id` by name where it
+/// needs a host op the engine's load did not state it serves
+/// ([`::engine::HostOps::needed_by`]): asked at the bind, before anything is
+/// registered or any step submitted, so a beam search on an engine without
+/// `beam_list` fails at its start, not at its finish.
+pub fn refuse_unserved_host_ops(
+    engine_id: usize,
+    package: &eta_compiler::codegen::launch::LaunchPackage,
+) -> Result<()> {
+    let needed = ::engine::HostOps::needed_by(package);
+    if needed.is_empty() {
+        return Ok(());
+    }
+    let spec = get_spec(engine_id)?;
+    match spec.host_ops.unserved(&needed) {
+        Some(op) => Err(anyhow!(
+            "the {} engine does not serve `{}`, which this program needs (a beam group reads its \
+             chosen beam's page list at its finish): refused at its bind, before any step",
+            spec.kind,
+            op.name()
+        )),
+        None => Ok(()),
+    }
 }
 
 pub fn take_engine_backend(engine_id: usize) -> Result<EngineBox> {

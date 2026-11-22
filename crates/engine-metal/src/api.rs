@@ -720,6 +720,8 @@ impl Engine for Metal {
             // Metal states no bound on one submission yet
             // (`crate::rates::at_load`).
             guest_cost: engine::GuestCost::default(),
+            // No `beam_list`: a beam group's bind is refused by name.
+            host_ops: engine::HostOps::NONE,
             mixed_lanes: engine::MixedLanes::Any,
             frames_in_flight: engine::stated_frames(shell.frames_in_flight())?,
         };

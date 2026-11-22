@@ -1123,6 +1123,8 @@ where
                     elementwise_gbps: rates.elementwise_gbps,
                 }
             },
+            // A beam group's page list (`beam_list`), read at a search's finish.
+            host_ops: engine::HostOps { beam_list: true },
             mixed_lanes: engine::MixedLanes::Any,
             frames_in_flight: engine::stated_frames(shell.frames_in_flight())?,
         };
