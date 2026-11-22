@@ -1155,9 +1155,9 @@ impl RungAsk {
         // Until the raise, the process submits nothing: no frame waits on
         // its lanes (the frame's firing frees what the raise is funded
         // with; the frame is not what funds it). Its owner is told blocked
-        // where the funding or the watch below parks it (`parks_here`), and
-        // unblocked as that park ends: a raise funded at once blocks
-        // nothing, and no owner is left blocked with no unblock to come.
+        // from its first look short of the rung (`parks_here`) until the
+        // rung is there, and unblocked as that park ends: no owner is left
+        // blocked with no unblock to come.
         let funder = crate::store::shared::programs::Planner {
             pid: self.pid,
             quorum: self.quorum,
@@ -1170,12 +1170,23 @@ impl RungAsk {
             epoch_now: &epoch_now,
         };
         crate::inferlet::process::said("enqueue: the activation rung", self.pid, async {
+            // Parked once it waits, it stays parked until the rung is
+            // there: between two waits (the funding's, the watch's) its
+            // owner was unblocked, its lanes expected again, and a frame
+            // holding three complete fronts waited on a lane whose process
+            // waited on a raise that frame held up (Mac's beamx8 on
+            // e158f45d2: "a frame is held for lanes that have not
+            // submitted", the rung lowered to 8 under a wider ask).
+            let mut parked = None;
             loop {
                 let watch = crate::store::shared::rung_watch(engine);
                 tokio::pin!(watch);
                 watch.as_mut().enable();
                 if crate::store::shared::fire_cap(engine) >= width {
                     return Ok(());
+                }
+                if parked.is_none() {
+                    parked = crate::inferlet::process::parks_here();
                 }
                 crate::store::shared::programs::fund_span(shared, || width, &funder, &mover)
                     .await?;
@@ -1184,7 +1195,6 @@ impl RungAsk {
                     return Ok(());
                 }
                 // Waiting on a raise of the rung: its owner is parked here.
-                let _parked = crate::inferlet::process::parks_here();
                 watch.await;
             }
         })

@@ -829,6 +829,9 @@ pub async fn fund_span(
     mover: &impl Mover,
 ) -> Result<(), String> {
     let engine = mover.engine();
+    // Each wait on the rung parks the process waiting (where one does: a
+    // pass's ask; a bind's funding on the lane has none): it submits
+    // nothing until the rung is there, so no frame waits on its lanes.
     loop {
         // Armed before the look: a change between the two is not lost.
         let watch = super::rung_watch(engine);
@@ -857,6 +860,7 @@ pub async fn fund_span(
             // The engine holds a rung the terms no longer fit: the walk
             // brings it down, and tells the rung.
             super::ask_walk(engine);
+            let _parked = crate::inferlet::process::parks_here();
             watch.await;
             continue;
         };
@@ -869,6 +873,7 @@ pub async fn fund_span(
             if !cut {
                 super::ask_walk(engine);
             }
+            let _parked = crate::inferlet::process::parks_here();
             watch.await;
             continue;
         }
@@ -890,6 +895,7 @@ pub async fn fund_span(
         {
             // The walk is raising it, or the room went to another since:
             // either moves the rung or frees room.
+            let _parked = crate::inferlet::process::parks_here();
             watch.await;
         }
     }

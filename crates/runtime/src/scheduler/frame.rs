@@ -2828,6 +2828,58 @@ mod tests {
         assert_eq!(policy.cut_owed(), 0);
     }
 
+    /// Mac's beamx8 on e158f45d2: the rung lowered to 8, one lane's process
+    /// waited for a raise ("enqueue: the activation rung") while three
+    /// lanes' fronts stood complete, and the frame was held for the fourth.
+    /// Waiting on the raise, its owner is parked (`parks_here`, as
+    /// owner-waits): the frame seals with the three, and once the raise
+    /// comes the fourth submits and serves.
+    #[test]
+    fn a_lane_whose_process_waits_for_a_raise_holds_no_frame() {
+        fn settled(policy: &mut FramePolicy, ids: &QueuedFireIds) -> FramePlan {
+            let mut now = Instant::now();
+            for _ in 0..100 {
+                match plan(policy, ids, now) {
+                    FramePlan::Hold(wait) => now += wait.max(Duration::from_millis(1)),
+                    plan => return plan,
+                }
+            }
+            panic!("held for good: {}", policy.debug_summary());
+        }
+        let mut policy = FramePolicy::new(1, 4096, 1 << 20, None).with_silence_timeout_off();
+        let lanes: Vec<ProcessId> = (0..4).map(|_| pid()).collect();
+        let mut id = 1u64;
+        let mut first = Vec::new();
+        for &lane in &lanes {
+            policy.on_fire_enqueued(stamp(lane, 0, 0, 1), Some(lane), id, 1, 1);
+            first.push(id);
+            id += 1;
+        }
+        let ids: QueuedFireIds = first.iter().copied().collect();
+        assert_eq!(fires(&settled(&mut policy, &ids)).len(), 4);
+        policy.on_frame_posted(lanes.clone(), Instant::now());
+        policy.on_frame_retired(lanes.clone());
+        // Three submit; the fourth's process waits for a raise, parked.
+        let mut three = Vec::new();
+        for &lane in &lanes[..3] {
+            policy.on_fire_enqueued(stamp(lane, 1, 0, 1), Some(lane), id, 1, 1);
+            three.push(id);
+            id += 1;
+        }
+        policy.on_owner_waits(lanes[3]);
+        let ids: QueuedFireIds = three.iter().copied().collect();
+        let mut sent = fires(&settled(&mut policy, &ids));
+        sent.sort_unstable();
+        assert_eq!(sent, three, "the frame seals with what arrived");
+        policy.on_frame_posted(lanes[..3].to_vec(), Instant::now());
+        policy.on_frame_retired(lanes[..3].to_vec());
+        // The raise comes: its process submits, and it serves.
+        policy.on_owner_unblocked(lanes[3]);
+        policy.on_fire_enqueued(stamp(lanes[3], 1, 0, 1), Some(lanes[3]), id, 8, 1);
+        let ids: QueuedFireIds = [id].into_iter().collect();
+        assert_eq!(fires(&settled(&mut policy, &ids)), vec![id], "the fourth serves");
+    }
+
     /// Mac's verified beam mix under pressure: frames cut at a rung of 64
     /// queued, then the cap lowered to 16 while the engine still held 64.
     /// Capped at 16 they sat unsealed on a raise the pressure could not
