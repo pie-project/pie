@@ -519,6 +519,21 @@ fn prefill_walk(
         // The same two families the unmasked prefill picks between; the
         // narrow one in the plan's block order, as the unmasked one is.
         let entry = if matches!(shape.head_dim, 128 | 256) {
+            // A causal one first runs its requests that read no bit on the
+            // unmasked body (`paged_prefill_unmasked_of`); the masked kernel
+            // then skips exactly those. Each request's word, staged per
+            // fire, picks its kernel, so no body is keyed by it.
+            if plan.causal {
+                let plain = format!(
+                    "::pie::attn::paged_prefill_unmasked_of<{}, {hnd}>",
+                    shape.head_dim
+                );
+                ctx.fire(
+                    op,
+                    Fire::at(kernel(FILE, &plain)).apply(launch),
+                    &[ArgValue::of(&args), ArgValue::of(&mask)],
+                )?;
+            }
             format!(
                 "::pie::attn::paged_prefill_masked<{}, {hnd}, {causal}>",
                 shape.head_dim
