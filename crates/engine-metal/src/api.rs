@@ -413,6 +413,10 @@ fn adapter_of(
 }
 
 impl Engine for Metal {
+    fn cover_fingerprint(&self) -> Option<String> {
+        self.shell.as_ref().map(crate::serve::Shell::cover_fingerprint)
+    }
+
     fn kind(&self) -> &'static str {
         "metal"
     }

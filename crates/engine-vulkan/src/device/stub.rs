@@ -123,6 +123,11 @@ impl Context {
     }
 
     #[must_use]
+    pub fn measured_on(&self) -> String {
+        match self.never {}
+    }
+
+    #[must_use]
     pub fn chip(&self) -> crate::chip::Device {
         match self.never {}
     }

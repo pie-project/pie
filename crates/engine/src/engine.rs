@@ -176,6 +176,17 @@ pub trait Engine: Send {
         None
     }
 
+    /// What the runtime's host cover depends on in this engine (`runtime`'s
+    /// `measure_host_cover`): its device and driver, and the kernels and
+    /// guest code a sampler's fire runs on it, as one fingerprint. A boot
+    /// whose engines state the same fingerprints, for the same deployment,
+    /// sampler program and frame shape, reads the cover an earlier boot
+    /// measured instead of measuring it again. `None`, the default: the
+    /// cover is measured at every load.
+    fn cover_fingerprint(&self) -> Option<String> {
+        None
+    }
+
     /// The reader of what the host can still give this process, where the
     /// device shares the host's memory and no budget of the device's says
     /// what it has: the runtime's governor reads it on its tick and holds

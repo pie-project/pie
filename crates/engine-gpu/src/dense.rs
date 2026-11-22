@@ -757,6 +757,7 @@ mod tests {
     /// A kernel's curve at the 4096-square planes of [`counts`].
     fn at_4096(kind: u32, key: u32, curve: Vec<(u32, f64)>) -> profile::fire::KernelCurve {
         profile::fire::KernelCurve {
+            by: profile::fire::MeasuredBy::default(),
             kind,
             key,
             n: 4096,
@@ -969,6 +970,7 @@ mod tests {
             ..counts()
         };
         let curve = |kind, key, n, k, rate: f64| profile::fire::KernelCurve {
+            by: profile::fire::MeasuredBy::default(),
             kind,
             key,
             n,
@@ -1841,6 +1843,7 @@ mod tests {
             .into_iter()
             .map(
                 |(kind, key, n, k, stop, curve, spread)| profile::fire::KernelCurve {
+                    by: profile::fire::MeasuredBy::default(),
                     kind,
                     key,
                     n,
@@ -1952,6 +1955,7 @@ mod tests {
             ..counts()
         };
         let curve = |kind, key, n, k, points: Vec<(u32, f64)>, stop| profile::fire::KernelCurve {
+            by: profile::fire::MeasuredBy::default(),
             kind,
             key,
             n,
@@ -2055,6 +2059,7 @@ mod tests {
             ..counts()
         };
         let curve = |kind, key, n, k, points: Vec<(u32, f64)>, stop| profile::fire::KernelCurve {
+            by: profile::fire::MeasuredBy::default(),
             kind,
             key,
             n,
@@ -2154,6 +2159,7 @@ mod tests {
         let (n, k) = (1024, 2048);
         let tile = crate::rates::curve_key(Target::Spirv, coopmat(0), n, k).1;
         let curve = |kind, key, points: Vec<(u32, f64)>| profile::fire::KernelCurve {
+            by: profile::fire::MeasuredBy::default(),
             kind,
             key,
             n,
@@ -2230,6 +2236,7 @@ mod tests {
         };
         let with = |spread: f64| {
             let curve = |wide, n, k, rate: f64| profile::fire::KernelCurve {
+                by: profile::fire::MeasuredBy::default(),
                 kind: profile::fire::KernelCurve::TILE,
                 key: key(wide, n, k),
                 n,
@@ -2292,6 +2299,7 @@ mod tests {
         };
         let rows: Vec<u32> = (0..7).map(|i| 1 << i).collect();
         let curve = |key: u32, lead: bool| profile::fire::KernelCurve {
+            by: profile::fire::MeasuredBy::default(),
             kind: profile::fire::KernelCurve::VECTOR,
             key,
             n: 4096,
@@ -2343,6 +2351,7 @@ mod tests {
             wide: true,
         };
         let curve = |kind, key, n, k, points: Vec<(u32, f64)>, stop| profile::fire::KernelCurve {
+            by: profile::fire::MeasuredBy::default(),
             kind,
             key,
             n,

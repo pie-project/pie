@@ -46,6 +46,19 @@ pub fn at_load(
         registry: crate::chip::registry(),
     });
     let keys = engine_gpu::rates::keys_at(max_submit);
+    let lacked = stated.missing(&keys);
+    if lacked.is_empty() {
+        tracing::info!(
+            "rates: every [rates] key the load weighs by is stated ({}); none measured",
+            keys.join(", ")
+        );
+    } else {
+        tracing::info!(
+            "rates: measuring {}: no layer states them, or the user's file stored them under no \
+             matching key (its stored measurements' lines say which)",
+            lacked.join(", ")
+        );
+    }
     let chip = engine::rates::rates_at_load(
         chip,
         &keys,
@@ -90,6 +103,13 @@ pub fn measure(
         "rates: measuring, each submission within the bound"
     );
     engine_gpu::rates::measure::<Api, _>(device, tuning, tier, &timer, max_submit, stated)
+        .map(|measured| on(device, measured))
+}
+
+/// `measured` stated as measured on `device` (`engine_gpu::stored`).
+fn on(device: &Context, mut measured: engine::rates::Measured) -> engine::rates::Measured {
+    measured.rates.measured_on = Some(device.measured_on());
+    measured
 }
 
 /// `rates` saved into the user's profile under `profiles` for this device
@@ -108,7 +128,11 @@ pub fn save_rates(
         provenance: provenance(&measured.name),
         registry: crate::chip::registry(),
     };
-    engine::rates::save_rates(&save, rates)
+    let rates = profile::fire::Rates {
+        measured_on: Some(device.measured_on()),
+        ..rates.clone()
+    };
+    engine::rates::save_rates(&save, &rates)
         .map(drop)
         .map_err(|why| engine_gpu::Fault::Device {
             call: "rates at load",
@@ -155,6 +179,7 @@ pub fn shapes_at_load(
         max_submit,
         tuning.profile().clone(),
         save,
+        &device.measured_on(),
         shapes,
         Some(model_bytes),
         top_rows,
@@ -183,6 +208,7 @@ pub fn measure_saying(
         &profile::fire::Rates::default(),
         say,
     )
+    .map(|measured| on(device, measured))
 }
 
 /// The bf16 matmul rate of `device` at `(m, n, k)`, under the tactic
