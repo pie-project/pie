@@ -923,7 +923,7 @@ Tool for whoever picks it up: the sync-and-read check above, on a build without 
 (the self-resetting branch, `sc/amd-meet-reset-dropped`, local on the MI300X host), plus the
 fire's stream map at the stalled launch.
 
-## F47. XLA's in-place write fence costs hybrid decode 2.6–4.3% (v6e, found 2026-11-21)
+## F49. XLA's in-place write fence costs hybrid decode 2.6–4.3% (v6e, found 2026-11-21)
 
 `kernels_xla::hlo::Func::fence` puts an `optimization_barrier` over a parameter's buffer and
 every read of the version an in-place write overwrites, so XLA cannot schedule a read after the
