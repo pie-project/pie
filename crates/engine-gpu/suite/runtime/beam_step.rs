@@ -438,6 +438,50 @@ fn a_parent_past_the_beams_faults_its_lane_alone() {
     }
 }
 
+/// A step record past the step's bounds (its pool past the state's columns)
+/// steps nothing and faults every lane by the group's code: never a silent
+/// skip that leaves the lists unresolved.
+#[test]
+fn a_record_past_the_steps_bounds_faults_every_lane() {
+    let Some(mut gpu) = Gpu::open() else {
+        eprintln!("not asked: no device");
+        return;
+    };
+    let (lanes, folded) = (4u32, 21u32);
+    let layout = BeamLayout::of(lanes, folded + 8, PAGE, FRAMES).expect("the layout");
+    let cap = layout.cap;
+    let state_words = kb::state_words(lanes, cap, FRAMES) as u32;
+    let lay = Lay::of(lanes, cap, 4);
+    let pool_words = state_words + (cap + 64) * UNIT;
+    let pool_h = gpu.up_u32(&vec![0u32; pool_words as usize]);
+    let store_h = gpu.up_u32(&vec![0u32; lay.words as usize]);
+    let mut store = vec![0u32; lay.words as usize];
+    store[..kb::STEP_WORDS as usize].copy_from_slice(&[
+        0, lay.parents, lay.trans, lay.lists, lay.faults, lanes, cap,
+        // A pool of more pages than the state's columns hold.
+        cap + 1,
+        PAGE, folded, folded, 0, FRAMES, 0, 0, 0, lay.common, 0, 0, 0,
+    ]);
+    gpu.write_u32(store_h, &store);
+    gpu.run(|c| {
+        kb::step(
+            c,
+            Records {
+                store: Tensor::new(store_h, 1, lay.words, Dtype::U32),
+                pool: Segments::one(pool_h, pool_words),
+                runs: lay.steps,
+                count: 1,
+                planes: lay.planes,
+            },
+        )
+    });
+    let got = gpu.down_u32(store_h, lay.words as usize);
+    let faults = &got[lay.faults as usize..(lay.faults + lanes) as usize];
+    assert_eq!(faults, [kb::PAGES_GROUP; 4], "every lane faults the group's code");
+    let pool = gpu.down_u32(pool_h, state_words as usize);
+    assert!(pool.iter().all(|&w| w == 0), "nothing was stepped");
+}
+
 /// The rs planes of a hybrid's page (§11.2's case): one of a word a row
 /// from word 0 and one of two words a row after the page's `T` rows of it,
 /// in a page of `4 T` words.

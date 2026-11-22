@@ -48,6 +48,7 @@ pub const PAGES_BELOW_FLOOR: u32 = 3;
 pub const PAGES_COPY_BOUNDS: u32 = 4;
 pub const PAGES_PARENT: u32 = 5;
 pub const PAGES_EXHAUSTED: u32 = 6;
+pub const PAGES_GROUP: u32 = 7;
 
 /// A group's state header's words.
 pub const HEADER: u64 = 4;
