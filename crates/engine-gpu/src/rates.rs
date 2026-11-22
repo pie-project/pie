@@ -605,6 +605,11 @@ struct Rig<'a, B: Serve> {
     /// each a frame of its own, by the device's span where it writes one;
     /// no frame lengthened or warmed until its rate settles.
     quick: bool,
+    /// The most weight planes a matmul's fires rotate through, where a
+    /// reading needs none read cold ([`resident_for_skip`]: a compute-bound
+    /// matmul against one workgroup of it, its operands' place in the cache
+    /// moving neither); `None`, every reading's [`weights_at`].
+    planes_most: Option<usize>,
 }
 
 /// A sink that fires through `inner` and keeps each kernel it fires: a
@@ -682,6 +687,7 @@ impl<'a, B: Serve> Rig<'a, B> {
             drift: std::cell::Cell::new(1.0),
             fired: std::cell::RefCell::new(std::collections::BTreeSet::new()),
             quick: false,
+            planes_most: None,
         }
     }
 
@@ -2676,7 +2682,8 @@ fn warm_at<B: Serve>(
 ) -> Result<Option<engine::rates::Warmed>> {
     let (m, n, k) = (side, side, side);
     let act = rig.operand(m, k, Dtype::Bf16)?;
-    let weights = (0..weights_at(n, k))
+    let planes = rig.planes_most.map_or(weights_at(n, k), |most| weights_at(n, k).min(most));
+    let weights = (0..planes)
         .map(|_| rig.operand(n, k, Dtype::Bf16))
         .collect::<Result<Vec<Tensor>>>()?;
     let y = rig.zeros(m, n, Dtype::Bf16)?;
@@ -2808,7 +2815,8 @@ fn matmul<B: Serve>(
     launch: f64,
 ) -> Result<f64> {
     let act = rig.operand(m, k, Dtype::Bf16)?;
-    let weights = (0..weights_at(n, k))
+    let planes = rig.planes_most.map_or(weights_at(n, k), |most| weights_at(n, k).min(most));
+    let weights = (0..planes)
         .map(|_| rig.operand(n, k, Dtype::Bf16))
         .collect::<Result<Vec<Tensor>>>()?;
     let y = rig.zeros(m, n, Dtype::Bf16)?;
@@ -3499,6 +3507,9 @@ pub fn resident_for_skip<B: Serve, T: Tactics + ?Sized>(
     let started = std::time::Instant::now();
     let mut rig = Rig::<B>::new(device, max_submit);
     rig.quick = true;
+    // Both matmuls compute-bound at their depth: a plane read warm or cold
+    // moves neither, so each rotates through two, not past the cache.
+    rig.planes_most = Some(2);
     rig.lay_probe(tactics.gemm(tier, crate::submit::PROBE.0))?;
     let launch = {
         let act = rig.zeros(LAUNCH, LAUNCH, Dtype::Bf16)?;
