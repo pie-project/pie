@@ -160,7 +160,7 @@ static RECORDED: std::sync::Mutex<std::collections::BTreeMap<(u32, u32, bool), u
 /// contraction, f32 columns, most rows)`: what a load's walk checks the
 /// kernels it built against ([`route`] at every row count up to the most).
 pub fn record_shapes(on: bool) -> Vec<(u32, u32, bool, u32)> {
-    let mut recorded = RECORDED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut recorded = RECORDED.lock().expect("recorded shapes lock poisoned");
     let kept = std::mem::take(&mut *recorded)
         .into_iter()
         .map(|((columns, contraction, f32_out), rows)| (columns, contraction, f32_out, rows))
@@ -183,7 +183,7 @@ pub fn act_x_wt(
         return Ok(());
     }
     if RECORDING.load(std::sync::atomic::Ordering::Relaxed) {
-        let mut recorded = RECORDED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut recorded = RECORDED.lock().expect("recorded shapes lock poisoned");
         let most = recorded
             .entry((columns, contraction, y.dtype == dtype::Dtype::F32))
             .or_insert(0);
