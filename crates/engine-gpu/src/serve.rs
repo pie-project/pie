@@ -165,6 +165,11 @@ pub trait Serve: Backend {
     /// The chunk size the pool's recipe aims at in place of the profile's.
     fn chunk_bytes(boot: &Self::DeviceBoot) -> Option<u64>;
 
+    /// Whether a load of `boot` times what no stored or committed profile
+    /// states under a matching key, or skips it (`[engine] measure`): each
+    /// skipped rate, curve and settle is served by the estimate, named.
+    fn measuring(boot: &Self::DeviceBoot) -> engine::rates::Measuring;
+
     /// The bound on one GPU submission a load of `boot` holds every serving
     /// step to: the platform's (`crate::rates::stated_submit_bound`), or
     /// the one a test's boot states in its place (`test-limits`); none
@@ -870,6 +875,13 @@ pub struct Shell<B: Serve> {
     /// the settle prices an option's step by under a stated submit bound.
     dense_planes: Vec<(u32, u32, u32, f64)>,
     dense_rates: profile::fire::Rates,
+    /// The dense settle a committed measured profile states, taken where
+    /// the user's stored one's key does not match and its own does
+    /// (`profile::fire::Tuned::committed_settle`).
+    committed_settle: Option<profile::fire::DenseSettled>,
+    /// Whether the load times what no stored or committed profile states
+    /// (`[engine] measure`): skipped, the settle fires nothing.
+    measuring: engine::rates::Measuring,
     /// What the dense settle did at each range ([`Shell::settled`]).
     settled: Vec<Settled>,
     /// The settle this load ran, for the engine to keep in the profile.
@@ -1447,6 +1459,26 @@ impl<B: Serve> Shell<B> {
         } else {
             None
         };
+        // A load that skips measuring (`[engine] measure = false`) with no
+        // roofline stated serves by the estimate's static half: the dense
+        // matmul takes the profile path's kernel a rung, and the fire top is
+        // a decode fire of the load's lanes; each said by name.
+        let skipping = B::measuring(boot.device) == engine::rates::Measuring::Skip;
+        let unweighed = skipping && !rated;
+        if unweighed {
+            tracing::info!(
+                "skipped: the roofline `[rates]` {:?} (`[engine] measure = false`, no layer states \
+                 them), served by the estimate: the dense matmul takes the profile path's kernel \
+                 at each rung, and the fire top is a decode fire of the load's lanes (no rate \
+                 weighs the rungs)",
+                tuning.profile().rates().missing(&crate::rates::KEYS)
+            );
+        }
+        let plane_counts = match (&counts, unweighed) {
+            (Some(counts), _) => Some(counts.clone()),
+            (None, true) => Some(crate::top::counts(&boot.trace)?),
+            (None, false) => None,
+        };
         let device_profile = tuning.profile().clone();
         // The live range the ruling weighs a span against: the pool the room
         // leaves past one working set at the declared context, bound in the
@@ -1461,7 +1493,7 @@ impl<B: Serve> Shell<B> {
         // rows, then the top): the vector or the tiled kernels, whichever the
         // estimate weighs faster, one a rung where fires are recorded a rung
         // (`crate::dense`), else at each fire's rows.
-        let counts_of_rates = counts.as_ref().ok_or_else(|| {
+        let counts_of_rates = plane_counts.as_ref().ok_or_else(|| {
             Fault::Residency(format!(
                 "the profile states no `[rates]` {:?}, which the dense matmul's kernel at each \
                  rung is chosen by",
@@ -1491,8 +1523,15 @@ impl<B: Serve> Shell<B> {
                 Some(top),
             ) {
                 // No curve timed yet (the naming raise, before the load
-                // times them to its top): the profile path's kernel a rung.
+                // times them to its top), or none stated where the load
+                // skips measuring: the profile path's kernel a rung.
                 Err(crate::dense::UNREACHED) => Ok((
+                    crate::dense::Dense::path(&rungs, |rows| tuning.gemm(tier, rows)),
+                    Vec::new(),
+                )),
+                // No roofline where the load skips measuring: the same,
+                // said where the load skips (`unweighed`).
+                Err(_) if unweighed => Ok((
                     crate::dense::Dense::path(&rungs, |rows| tuning.gemm(tier, rows)),
                     Vec::new(),
                 )),
@@ -1516,6 +1555,23 @@ impl<B: Serve> Shell<B> {
         // The widest rung the load lays once the pick is made: the pick's,
         // or a check's past it.
         let mut laid: Option<u32> = None;
+        // No rate weighs the rungs where the load skips measuring with no
+        // roofline stated: the fire top is the narrowest rung a full decode
+        // fire of the load's lanes takes (one row a lane), a prompt chunked
+        // to it, never wider than the rungs the room holds.
+        if unweighed {
+            let lanes = budgets.tokens.max_lanes.max(1);
+            if lanes < budgets.tokens.max_tokens {
+                tracing::info!(
+                    lanes,
+                    asked = budgets.tokens.max_tokens,
+                    "skipped: the fire top's weighing (no roofline), served by the estimate: the \
+                     narrowest rung a decode fire of the load's {lanes} lanes takes, a prompt \
+                     chunked to it"
+                );
+                laid = Some(lanes);
+            }
+        }
         let mut weighed: Option<engine::load::check::Weighed> = None;
         // The estimate the pick weighed the rungs by: what a serving step is
         // held to a stated submit bound by (`crate::submit`).
@@ -1910,6 +1966,20 @@ impl<B: Serve> Shell<B> {
         // then be stated: refused by its key otherwise.
         let mut submit_bound = match B::submit_bound(boot.device) {
             None => None,
+            // A load that skips measuring with no roofline stated has no
+            // cost, stated or estimated, to hold a step to the bound by:
+            // said by name, every step unheld (a step past the bound loses
+            // the device), never a refused boot.
+            Some(bound) if unweighed => {
+                tracing::warn!(
+                    "skipped: the roofline on a device whose platform states a bound of {} ms on \
+                     one GPU submission: no cost, stated or estimated, holds a serving step to it, \
+                     so none is held (a step past the bound loses the device); a committed \
+                     measured profile of this device, or `[engine] measure = true`, states it",
+                    bound.as_millis()
+                );
+                None
+            }
             Some(bound) => {
                 let Some(estimate) = fire_estimate else {
                     return Err(Fault::Residency(format!(
@@ -1923,7 +1993,23 @@ impl<B: Serve> Shell<B> {
                 };
                 // The margin the rates step measured beside the rates, saved
                 // with them: refused by its key where unstated.
-                let Some(worst) = device_profile.rates().submit_worst_ratio else {
+                let worst = match device_profile.rates().submit_worst_ratio {
+                    Some(worst) => Some(worst),
+                    // Skipped: the estimate as it stands, at a ratio of 1;
+                    // each served step's measured ratio raises it as it
+                    // lands (`crate::submit::Measured`).
+                    None if skipping => {
+                        tracing::info!(
+                            "skipped: `[rates] {}`, served by the estimate: a step is held at \
+                             the ratio 1 of its estimate until a served step's measured ratio \
+                             passes it",
+                            profile::fire::SUBMIT_WORST_RATIO
+                        );
+                        Some(1.0)
+                    }
+                    None => None,
+                };
+                let Some(worst) = worst else {
                     return Err(Fault::Residency(format!(
                         "the platform states a bound of {} ms on one GPU submission and device \
                          {}'s profile leaves `[rates] {}` unstated, so nothing holds a serving \
@@ -1936,7 +2022,23 @@ impl<B: Serve> Shell<B> {
                 };
                 // A prompt step's attention against a longer prefix,
                 // measured with them: refused by its key where unstated.
-                let Some(prefixed) = device_profile.rates().attn_tflops_by_rows_keys else {
+                let prefixed = match device_profile.rates().attn_tflops_by_rows_keys {
+                    Some(prefixed) => Some(prefixed),
+                    // Skipped: a prompt step's attention against a longer
+                    // prefix is read off the square curve
+                    // (`crate::submit::SubmitBound::raw_ns`).
+                    None if skipping => {
+                        tracing::info!(
+                            "skipped: `[rates] {}`, served by the estimate: a prompt step's \
+                             attention against a longer prefix is read off the square attention \
+                             curve",
+                            profile::fire::ATTN_BY_ROWS_KEYS
+                        );
+                        Some(Vec::new())
+                    }
+                    None => None,
+                };
+                let Some(prefixed) = prefixed else {
                     return Err(Fault::Residency(format!(
                         "the platform states a bound of {} ms on one GPU submission and device \
                          {}'s profile leaves `[rates] {}` unstated, so nothing estimates a prompt \
@@ -2427,6 +2529,8 @@ impl<B: Serve> Shell<B> {
             dense: std::sync::Arc::unwrap_or_clone(dense),
             dense_planes: dense_planes.clone(),
             dense_rates: device_profile.rates(),
+            committed_settle: device_profile.tuned().committed_settle.clone(),
+            measuring: B::measuring(boot.device),
             settled: Vec::new(),
             to_store: None,
             alone: Vec::new(),
@@ -2547,61 +2651,95 @@ impl<B: Serve> Shell<B> {
         // the device is the user's file's, `crate::stored`) are taken again
         // without firing; the rest are settled (again) this load.
         let (of, code) = self.settle_key(lanes)?;
-        let stored: Vec<[u32; 6]> = match self.dense_rates.dense_settled.clone() {
-            None => {
+        // The user's stored settle first, then a committed profile's: the
+        // first whose key matches is taken, each other said and why.
+        let why_not = |stored: &profile::fire::DenseSettled| {
+            if stored.method != SETTLE_METHOD {
+                Some(format!(
+                    "its method is version {SETTLE_METHOD} now, {} when stored",
+                    stored.method
+                ))
+            } else if stored.of != of {
+                Some(format!(
+                    "what it weighed changed (the curves, the model's planes, the rungs, lanes or \
+                     kernel choice: {:#010x} stored, {of:#010x} now)",
+                    stored.of
+                ))
+            } else if stored.code != code {
+                Some(format!(
+                    "the code of the kernels its steps fire changed ({:#010x} stored, \
+                     {code:#010x} now)",
+                    stored.code
+                ))
+            } else {
+                None
+            }
+        };
+        let mut taken: Option<(&str, profile::fire::DenseSettled)> = None;
+        for (whence, settled) in [
+            ("stored", self.dense_rates.dense_settled.clone()),
+            ("committed", self.committed_settle.clone()),
+        ] {
+            let Some(settled) = settled else {
                 tracing::info!(
                     method = SETTLE_METHOD,
                     of = format_args!("{of:#010x}"),
                     code = format_args!("{code:#010x}"),
-                    "dense settle: none stored; every range is settled this load"
+                    "dense settle: none {whence}"
                 );
-                Vec::new()
+                continue;
+            };
+            match why_not(&settled) {
+                None => {
+                    tracing::info!(
+                        method = SETTLE_METHOD,
+                        of = format_args!("{of:#010x}"),
+                        code = format_args!("{code:#010x}"),
+                        "dense settle: {whence}, its key matches; its {} decided ranges taken",
+                        settled.ranges.len()
+                    );
+                    taken = Some((whence, settled));
+                    break;
+                }
+                Some(why) => tracing::info!(
+                    method = SETTLE_METHOD,
+                    of = format_args!("{of:#010x}"),
+                    code = format_args!("{code:#010x}"),
+                    "dense settle: the {whence} settle is not taken: {why}"
+                ),
             }
-            Some(stored) => {
-                let why = if stored.method != SETTLE_METHOD {
-                    Some(format!(
-                        "its method is version {SETTLE_METHOD} now, {} when stored",
-                        stored.method
-                    ))
-                } else if stored.of != of {
-                    Some(format!(
-                        "what it weighed changed (the curves, the model's planes, the rungs, \
-                         lanes or kernel choice: {:#010x} stored, {of:#010x} now)",
-                        stored.of
-                    ))
-                } else if stored.code != code {
-                    Some(format!(
-                        "the code of the kernels its steps fire changed ({:#010x} stored, \
-                         {code:#010x} now)",
-                        stored.code
-                    ))
-                } else {
-                    None
-                };
-                match why {
-                    None => {
-                        tracing::info!(
-                            method = SETTLE_METHOD,
-                            of = format_args!("{of:#010x}"),
-                            code = format_args!("{code:#010x}"),
-                            "dense settle: stored under a matching key; its {} decided ranges \
-                             reused",
-                            stored.ranges.len()
-                        );
-                        stored.ranges
-                    }
-                    Some(why) => {
-                        tracing::info!(
-                            method = SETTLE_METHOD,
-                            of = format_args!("{of:#010x}"),
-                            code = format_args!("{code:#010x}"),
-                            "dense settle: the stored settle is settled again: {why}"
-                        );
-                        Vec::new()
-                    }
+        }
+        let (whence, stored): (&str, Vec<[u32; 6]>) = match taken {
+            Some((whence, settled)) => (whence, settled.ranges),
+            None => ("none", Vec::new()),
+        };
+        // Skipped: nothing fires; each range the settle would weigh keeps
+        // the kernel the curves (or the profile path) chose, said by name.
+        if self.measuring == engine::rates::Measuring::Skip {
+            for &[bottom, top, replaced, vector, wide, tier] in &stored {
+                if replaced != 0 {
+                    let tactic = kernels_slang::linear::gemm::Tactic {
+                        tier: tier_of(tier),
+                        vector,
+                        wide: wide != 0,
+                    };
+                    self.dense = self.dense.with_rows(bottom, top, tactic);
                 }
             }
-        };
+            let replaced = stored.iter().filter(|r| r[2] != 0).count();
+            tracing::info!(
+                "skipped: the dense settle (`[engine] measure = false`){}, served by the estimate: \
+                 each range it would weigh on the served step keeps the kernel the curves (or the \
+                 profile path) chose; nothing stored",
+                if stored.is_empty() {
+                    String::new()
+                } else {
+                    format!(" past the {} ranges the {whence} settle decided", stored.len())
+                }
+            );
+            self.say_served("settle skipped", replaced);
+            return Ok(());
+        }
         for &[bottom, top, replaced, vector, wide, tier] in &stored {
             if replaced != 0 {
                 let tactic = kernels_slang::linear::gemm::Tactic {
@@ -2907,10 +3045,16 @@ impl<B: Serve> Shell<B> {
     /// load's fires can ask for (`crate::stored::code_of_all`), which each
     /// weighed step ran. Nothing of the build but its kernels keys it.
     fn settle_key(&self, lanes: u32) -> Result<(u32, u32)> {
+        // The curves in one order whatever layer stated them, and in what
+        // order (a load's own, a user's file, a committed profile's).
+        let curves = self.dense_rates.kernel_tflops_by_shape.clone().map(|mut curves| {
+            curves.sort_by_key(profile::fire::KernelCurve::id);
+            curves
+        });
         let of = profile::fire::fingerprint(
             format!(
                 "{:?}|{:?}|{:?}|{lanes}|{}|{:?}",
-                self.dense_rates.kernel_tflops_by_shape,
+                curves,
                 self.dense_planes,
                 self.dense,
                 self.budgets.tokens.max_tokens,

@@ -301,6 +301,12 @@ impl KernelCurve {
         (self.kind, self.key, self.n, self.k)
     }
 
+    /// The curve as a load's log names it: `<kind>/<key> at <n>x<k>`.
+    #[must_use]
+    pub fn name(&self) -> String {
+        format!("{}/{} at {}x{}", self.kind, self.key, self.n, self.k)
+    }
+
     /// Whether a load of up to `rows` needs nothing more of it: it reaches
     /// them, or stopped for a reason it records.
     #[must_use]
@@ -533,32 +539,39 @@ impl Rates {
     }
 
     /// A user's file's measurements (`self`, its `[rates]` alone) checked
-    /// against `now`, this build on this device: each whose key matches is
-    /// kept, to be taken with no measurement; each whose key does not (or
-    /// that states none) is dropped, to be measured again, by itself.
-    /// Measured on another device (or driver), every one is dropped. What
-    /// was kept and what dropped, and why, is said, a line each.
+    /// against `now`, this build on this device ([`Rates::sift_as`], said as
+    /// `stored`).
     pub fn sift(&mut self, now: &dyn Now) -> Vec<String> {
+        self.sift_as(now, "stored")
+    }
+
+    /// Stored measurements (`self`, a file's `[rates]` alone: the user's,
+    /// `what` "stored", or a committed measured profile's, "committed")
+    /// checked against `now`, this build on this device: each whose key
+    /// matches is kept, to be taken with no measurement; each whose key
+    /// does not (or that states none) is dropped, by itself. Measured on
+    /// another device (or driver), every one is dropped. Each drop is said,
+    /// a line each, with why; what is kept is said once the layers are
+    /// joined ([`Rates::whence`]), by the layer that decides it.
+    pub fn sift_as(&mut self, now: &dyn Now, what: &str) -> Vec<String> {
         let mut said = Vec::new();
         let on = now.on();
         let stored = KEYED.iter().any(|key| self.states(key))
             || self.kernel_tflops_by_shape.is_some()
             || self.dense_settled.is_some();
         if !stored {
-            said.push(format!("stored measurements: none for `{on}`"));
+            said.push(format!("{what} measurements: none for `{on}`"));
             *self = Rates::default();
             return said;
         }
         if self.measured_on.as_deref() != Some(on.as_str()) {
             said.push(format!(
-                "stored measurements: taken on `{}`, this device is `{on}`: every one is \
-                 measured again",
+                "{what} measurements: taken on `{}`, this device is `{on}`: none is taken",
                 self.measured_on.as_deref().unwrap_or("no device stated")
             ));
             *self = Rates::default();
             return said;
         }
-        said.push(format!("stored measurements: taken on `{on}`, this device"));
         for key in KEYED {
             if !self.states(key) {
                 continue;
@@ -567,15 +580,9 @@ impl Rates {
                 None => Some("stored without a key".to_string()),
                 Some(by) => by.stale(key, now),
             };
-            match why {
-                None => said.push(format!(
-                    "stored `{key}`: reused, its key matches ({})",
-                    self.key_of(key).map(MeasuredBy::said).unwrap_or_default()
-                )),
-                Some(why) => {
-                    said.push(format!("stored `{key}`: measured again, {why}"));
-                    self.unstate(key);
-                }
+            if let Some(why) = why {
+                said.push(format!("{what} `{key}`: not taken, {why}"));
+                self.unstate(key);
             }
         }
         // A key whose rate is not stated keys nothing.
@@ -590,43 +597,25 @@ impl Rates {
             })
             .filter(|by| !by.is_empty());
         if let Some(curves) = self.kernel_tflops_by_shape.take() {
-            let mut reused = Vec::new();
             let mut kept = Vec::with_capacity(curves.len());
             for curve in curves {
-                let name = format!("{}/{} at {}x{}", curve.kind, curve.key, curve.n, curve.k);
                 match curve.by.stale(KERNEL_CURVES, now) {
-                    None => {
-                        reused.push(format!("{name} ({})", curve.by.said()));
-                        kept.push(curve);
-                    }
-                    Some(why) => {
-                        said.push(format!("stored curve {name}: measured again, {why}"));
-                    }
+                    None => kept.push(curve),
+                    Some(why) => said.push(format!(
+                        "{what} curve {}: not taken, {why}",
+                        curve.name()
+                    )),
                 }
-            }
-            if !reused.is_empty() {
-                said.push(format!(
-                    "stored curves: {} reused, their keys match: {}",
-                    reused.len(),
-                    reused.join("; ")
-                ));
             }
             self.kernel_tflops_by_shape = (!kept.is_empty()).then_some(kept);
         }
         if let Some(settled) = self.dense_settled.take() {
             match now.method(DENSE_SETTLED) {
                 Some(method) if method == settled.method => {
-                    said.push(format!(
-                        "stored dense settle: kept for the settle to check, method v{method}, \
-                         of {:#010x}, code {:#010x}, {} ranges",
-                        settled.of,
-                        settled.code,
-                        settled.ranges.len()
-                    ));
                     self.dense_settled = Some(settled);
                 }
                 now => said.push(format!(
-                    "stored dense settle: settled again, its method is version {} now, {} when \
+                    "{what} dense settle: not taken, its method is version {} now, {} when \
                      stored",
                     now.map_or_else(|| "none".to_string(), |m| m.to_string()),
                     settled.method
@@ -634,6 +623,82 @@ impl Rates {
             }
         }
         said
+    }
+
+    /// Each entry `self` (the rates a load takes, the user's stored over a
+    /// committed profile's, each sifted: [`Rates::sift_as`]) states by its
+    /// key, said once by the layer that decides it: `stored` (`user`, the
+    /// user's sifted `[rates]`, from `user_from`) where the user's file
+    /// states it, else `committed` (from `committed_from`). The dense
+    /// settle's key is checked by the settle itself, which says which it
+    /// takes.
+    #[must_use]
+    pub fn whence(&self, user: &Rates, user_from: &str, committed_from: &str) -> Vec<String> {
+        let mut said = Vec::new();
+        for key in KEYED {
+            if !self.states(key) {
+                continue;
+            }
+            let Some(by) = self.key_of(key) else {
+                continue;
+            };
+            let from = if user.states(key) {
+                format!("stored ({user_from})")
+            } else {
+                format!("committed ({committed_from})")
+            };
+            said.push(format!("`{key}`: {from}, its key matches: {}", by.said()));
+        }
+        for curve in self.kernel_tflops_by_shape.iter().flatten() {
+            let mine = user
+                .kernel_tflops_by_shape
+                .iter()
+                .flatten()
+                .any(|c| c.id() == curve.id());
+            let from = if mine {
+                format!("stored ({user_from})")
+            } else {
+                format!("committed ({committed_from})")
+            };
+            said.push(format!(
+                "curve {}: {from}, its key matches: {}",
+                curve.name(),
+                curve.by.said()
+            ));
+        }
+        said
+    }
+
+    /// The first entry of `self` a committed measured profile could not
+    /// take ([`crate::Strict::Measured`]): no device stated, or a rate (one
+    /// of [`KEYED`]) stored without a key. `None` where every entry is keyed.
+    #[must_use]
+    pub fn unkeyed(&self) -> Option<String> {
+        if self.measured_on.is_none() {
+            return Some(format!("`rates.{MEASURED_ON}` names no device"));
+        }
+        KEYED
+            .iter()
+            .find(|key| self.states(key) && self.key_of(key).is_none())
+            .map(|key| format!("`rates.{key}` is stored without a key"))
+    }
+
+    /// `self` in the order a committed measured profile writes it: each
+    /// rate's key by its rate, each curve by its kernel and shape, so one
+    /// device's export writes the same text whatever order its loads stored
+    /// them in.
+    #[must_use]
+    pub fn ordered(mut self) -> Rates {
+        if let Some(by) = &mut self.measured_by {
+            by.sort_by(|a, b| a.0.cmp(&b.0));
+        }
+        if let Some(curves) = &mut self.kernel_tflops_by_shape {
+            curves.sort_by_key(KernelCurve::id);
+        }
+        if let Some(product) = &mut self.product_ns {
+            product.sort_by_key(ProductTime::key);
+        }
+        self
     }
 
     fn is_empty(&self) -> bool {
@@ -917,6 +982,15 @@ pub struct Tuned {
     /// this pie does not read (`<file>: <key>`): the layer was refused, and
     /// a load refuses by it rather than run without the file.
     pub refused: Option<String>,
+    /// The dense settle a committed measured profile states
+    /// ([`crate::Source::Committed`]), sifted by its method: the settle
+    /// takes it where the user's stored one's key does not match and its
+    /// own does, never copied into the user's file.
+    pub committed_settle: Option<DenseSettled>,
+    /// The `[rates]` keys, curves and settle this load took no measurement
+    /// of under `[engine] measure = false`, each served by the engine's
+    /// estimate and named where it is (`engine::rates::Measuring::Skip`).
+    pub skipped: Vec<String>,
 }
 
 impl Tuned {
@@ -927,6 +1001,11 @@ impl Tuned {
         self.saved_to = upper.saved_to.clone().or(self.saved_to.take());
         self.frame_cut |= upper.frame_cut;
         self.refused = upper.refused.clone().or(self.refused.take());
+        self.committed_settle = upper
+            .committed_settle
+            .clone()
+            .or(self.committed_settle.take());
+        self.skipped.extend(upper.skipped.iter().cloned());
     }
 
     /// `[rates]` as profile TOML, nothing where nothing is stated or the
@@ -957,6 +1036,7 @@ mod tests {
             saved_to: None,
             frame_cut: false,
             refused: None,
+            ..Tuned::default()
         };
         let up = Tuned {
             rates: Rates {
@@ -969,6 +1049,7 @@ mod tests {
             saved_to: None,
             frame_cut: false,
             refused: None,
+            ..Tuned::default()
         };
         low.lay(&up);
         assert_eq!(
@@ -1161,12 +1242,20 @@ mod tests {
         let mut rates = stored(&now);
         let said = rates.sift(&now);
         assert_eq!(rates, stored(&now), "{said:#?}");
-        assert!(said.iter().all(|l| !l.contains("again")), "{said:#?}");
+        assert!(said.is_empty(), "nothing is dropped: {said:#?}");
+        // Each entry taken is said by the layer deciding it, with its key.
+        let whence = rates.whence(&rates, "user.toml", "no committed profile");
         assert!(
-            said.iter()
-                .any(|l| l.contains("stored `launch_ns`: reused"))
+            whence
+                .iter()
+                .any(|l| l.starts_with("`launch_ns`: stored (user.toml), its key matches")),
+            "{whence:#?}"
         );
-        assert!(said.iter().any(|l| l.contains("2 reused")), "{said:#?}");
+        assert_eq!(
+            whence.iter().filter(|l| l.starts_with("curve ")).count(),
+            2,
+            "{whence:#?}"
+        );
     }
 
     /// One kernel's code changed: the measurements it fired are dropped,
@@ -1195,7 +1284,7 @@ mod tests {
         );
         assert!(
             said.iter()
-                .any(|l| l.contains("gemm_tflops_by_rows`: measured again, kernel `coopmat`")),
+                .any(|l| l.contains("gemm_tflops_by_rows`: not taken, kernel `coopmat`")),
             "{said:#?}"
         );
         assert_eq!(
@@ -1228,7 +1317,7 @@ mod tests {
         };
         let said = rates.sift(&other);
         assert_eq!(rates, Rates::default());
-        assert!(said[0].contains("every one is measured again"), "{said:#?}");
+        assert!(said[0].contains("none is taken"), "{said:#?}");
         let mut unkeyed = Rates {
             measured_by: None,
             ..stored(&now)

@@ -1133,3 +1133,44 @@ settle exists for. Fix: stage a feed for those channels in the settle's fires (z
 declared shape; the settle only times), or settle through a class that reads none, instead of
 stopping.
 
+
+## F56. Every engine's load-time measurements through the one keyed resolve path (found 2026-11-22)
+sc/gpu-committed-profiles put engine-gpu (Vulkan, wgpu) behind one path: each stored entry is taken from the user's
+file, else a committed `profiles/<device>.measured.toml`, else measured — or, under `[engine] measure = false` /
+`pie serve --no-measure`, skipped and served by the estimate, by name (`engine::rates::resolve_at_load`,
+`profile::Rates::sift_as` / `whence`, `Shelf` `.measured.toml` layer, `pie tune export`). Each other engine still
+measures outside it; until it ports, `measure = false` is refused by name for it (worker `EngineConfig::validate`).
+What each still times at load or boot, for its owner (paths under `crates/`):
+- **engine-cuda (CUDA, ROCm)**
+  - Roofline `[rates]`: `rates::ensure` `engine-cuda/src/rates.rs:131` -> `rates_at_load` :160 (timing `measure`
+    :252, `on_device::measure` :518). Through `rates_at_load` / `save_rates`, but stored unkeyed
+    (`measured_on` / `measured_by` None, :609-610), and the chip resolves by `SHELF.resolve` (`chip.rs:360`), not
+    `resolve_keyed`: no `Now`, no sift, no committed layer. Port: a `Now` (device + driver + cuBLASLt / hipBLASLt
+    version, kernel code), key each rate, resolve keyed, take `Measuring`.
+  - Decode products (`product_ns`): `Shell::routes_measured` `serve/load.rs:2285` -> `routes_by_body`
+    `serve/arming.rs:1050` -> `time_decode_body` :1110. Saved by `save_product_times` `rates.rs:176` (its own write
+    beside `saved_text`, not `save_rates`), read back `serve/load.rs:89`. Keyed per entry only by its own
+    `(kind, rows, k, m, kernel)`; CUDA's kernel code is an FNV of arch, driver, cuBLASLt, kernel code, METHOD
+    (`kernels-cuda/src/linear/routes.rs:17`), ROCm's a bare 0 / 1 (`kernels-rocm/src/linear/routes.rs:14`): no
+    `measured_on`, and `product_ns` (in `fire::KEYED`) needs a `measured_by` to be exported. Skip: the stated kernel.
+  - Graph bodies' memory record (bytes, not time): `measured::conclude` `serve/measured.rs:117`, its own file
+    `<cache>/bodies/<hash>` (`measured.rs:47`), keyed by a `DefaultHasher` of the crate version, exe size and mtime:
+    a version bump re-measures; not under `[rates]`.
+- **engine-metal**
+  - Roofline `[rates]`: `rates::at_load` `engine-metal/src/rates.rs:587` -> `rates_at_load` (timing `measure`
+    :611). Unkeyed as CUDA's (`measured_on` / `measured_by` None), resolved by `SHELF.resolve` (`chip.rs:231`).
+  - `kernel.dense` crossover per model: `tune::dense::at_load` `engine-metal/src/tune/dense.rs:570` (timing
+    `measure_at` :216, fit `fit_at` :403), its own file `<profiles>/metal/dense/<device>-<key>.toml`, keyed by its
+    own FNV `load_key` :496 (device name, OS build, gemm sources, the model's shapes; no method version). The
+    engine-gpu counterparts are `kernel_tflops_by_shape_keyed` + `dense_settled_keyed`: port it to those keys.
+- **engine-xla**: nothing timed at load and stored (the guest compile ledger `guest/run.rs:198` is in-process RSS).
+  No `cover_fingerprint`, so the runtime re-times its host cover every boot (below).
+- **runtime host cover**: `host_cover` `runtime/src/bootstrap.rs:1062` (called :1021), timing `measure_host_cover`
+  :1125 (warm `compat-openai` runs at depth 1), cached in `<cache>/cover/<fnv>.json` keyed by every engine's
+  `cover_fingerprint` + deployment + sampler hash + frame + depth + context. Not under `[rates]`, not committed,
+  not skipped: a `measure = false` boot still runs its warm runs on a clean home. engine-cuda / engine-xla /
+  engine-cerebras state no fingerprint (`engine/src/engine.rs:199` default None): measured every boot, nothing kept.
+- **engine-gpu, still open**: under `measure = false` on a platform stating a submit bound (Android, Windows TDR)
+  with no roofline stated or committed, no cost holds a step to the bound: said by name at warn and served unheld
+  (`Shell::fit`, `engine-gpu/src/serve.rs`). A committed profile of the device closes it; an estimate from facts
+  needs facts the Vulkan / WebGPU APIs do not state (clocks, bandwidth).

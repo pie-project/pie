@@ -351,6 +351,64 @@ fn bench_cuda<'a>(
     )))
 }
 
+/// What `pie tune export` wrote of a device ([`export`]).
+pub struct Exported {
+    /// The device, by name.
+    pub device: String,
+    /// The user's file it was read from.
+    pub from: std::path::PathBuf,
+    /// Its committed file's name (`profile::measured_name`).
+    pub name: String,
+    /// The committed measured profile.
+    pub text: String,
+}
+
+/// The stored measurements of `backend`'s device `index` (the user's file
+/// under `profiles` a load keeps them in) in committed form
+/// (`profile::export`): refused by name where the device is not found, its
+/// user file holds none, or an entry is stored without a key.
+pub fn export(backend: &Backend, profiles: &Path, index: u32) -> Result<Exported, String> {
+    let device = device_name(backend, index)?;
+    let from = backend.shelf.user_path(profiles, &device);
+    let user = std::fs::read_to_string(&from).map_err(|e| {
+        format!(
+            "{}: {e}: no measurement of `{device}` is stored; a load of it stores them",
+            from.display()
+        )
+    })?;
+    let text = profile::export(
+        (backend.registry)(),
+        &device,
+        &user,
+        &from.display().to_string(),
+    )?;
+    Ok(Exported {
+        name: profile::measured_name(&device),
+        device,
+        from,
+        text,
+    })
+}
+
+/// The name of `backend`'s device `index`, as its loads file its profiles.
+fn device_name(backend: &Backend, index: u32) -> Result<String, String> {
+    let probed = match backend.name {
+        #[cfg(feature = "vulkan")]
+        "vulkan" => engine_vulkan::chip::probe_at(index),
+        #[cfg(feature = "wgpu")]
+        "wgpu" => engine_wgpu::chip::probe_at(index),
+        _ if index == 0 => (backend.probe)(),
+        other => {
+            return Err(format!(
+                "`--device {index}`: the {other} engine names its first device alone here"
+            ));
+        }
+    };
+    probed
+        .map(|(name, _)| name)
+        .ok_or_else(|| format!("no {} device {index} on this machine", backend.name))
+}
+
 /// Every backend this build hosts.
 #[must_use]
 #[allow(clippy::vec_init_then_push)]

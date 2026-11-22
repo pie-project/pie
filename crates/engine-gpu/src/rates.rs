@@ -216,6 +216,28 @@ pub fn keys_at(max_submit: Option<std::time::Duration>) -> Vec<&'static str> {
     keys
 }
 
+/// The workgroups the device holds at once where a load skips measuring
+/// them (`engine::rates::Measuring::Skip`) and no layer states them
+/// (`profile::fire::RESIDENT_WORKGROUPS`): the estimate from the device's
+/// facts, the compute units its driver reports (`cores`), one workgroup
+/// each; where it reports none, one workgroup, as a load sizes the device
+/// before its rates step. A guest step strides its grid over them: any count
+/// is correct, the measured one only faster. With what the estimate rests
+/// on, in words.
+#[must_use]
+pub fn resident_estimate(cores: Option<u32>) -> (u32, &'static str) {
+    match cores {
+        Some(cores) if cores > 0 => (
+            cores,
+            "the compute units the driver reports, one workgroup each",
+        ),
+        _ => (
+            1,
+            "one workgroup: the driver reports no compute units, and nothing measured them",
+        ),
+    }
+}
+
 /// The rows of a prompt step the prefixed attention curve is timed at
 /// (`profile::fire::Rates::attn_tflops_by_rows_keys`): the prompt rungs a
 /// slang load on a bound-stating device lays its top at (wgpu's 512, native
@@ -1853,6 +1875,7 @@ pub fn shapes_at_load<B: Serve, T: Tactics + ?Sized>(
     shapes: &[(u32, u32)],
     model: Option<u64>,
     top: u32,
+    measuring: engine::rates::Measuring,
 ) -> Result<profile::Profile> {
     let stated = chip.rates();
     let kernels = dense_kernels(B::TARGET, tactics, tier, top);
@@ -1865,10 +1888,30 @@ pub fn shapes_at_load<B: Serve, T: Tactics + ?Sized>(
         tracing::info!(
             shapes = shapes.len(),
             top,
-            "rates: every dense kernel's curve at the model's planes is stored under a matching \
-             key; none timed"
+            "rates: every dense kernel's curve at the model's planes is stored or committed under \
+             a matching key; none timed"
         );
         return Ok(chip);
+    }
+    // Skipped: nothing timed or stored; each curve's kernel is weighed by
+    // the curves stated where any is, the profile path's kernel a rung
+    // where none is (`crate::dense::choose`).
+    if measuring == engine::rates::Measuring::Skip {
+        let served = if stated.kernel_tflops_by_shape.is_some() {
+            "the dense choice weighs the kernels whose curves are stated, and takes the \
+             profile path's kernel where none reaches"
+        } else {
+            "no curve is stated, so the dense matmul takes the profile path's kernel at each rung"
+        };
+        let mut tuned = chip.tuned().clone();
+        for want in &wanted {
+            let curve = name(want);
+            tracing::info!(
+                "rates: skipped: gemm curve {curve} to {top} rows, served by the estimate: {served}"
+            );
+            tuned.skipped.push(format!("curve {curve}"));
+        }
+        return Ok(chip.with_tuned(tuned));
     }
     tracing::info!(
         curves = wanted.len(),
@@ -1891,16 +1934,19 @@ pub fn shapes_at_load<B: Serve, T: Tactics + ?Sized>(
         top,
         &mut |_| {},
     )?;
+    // The user's file gains what this load measured alone: a curve taken
+    // from a committed profile stays the committed profile's.
+    let fresh = Rates {
+        kernel_tflops_by_shape: Some(curves.clone()),
+        measured_on: Some(on.to_string()),
+        ..Rates::default()
+    };
     let measured = Rates {
         kernel_tflops_by_shape: Some(curves),
         ..Rates::default()
     }
     .over(stated.clone());
-    let joined = Rates {
-        kernel_tflops_by_shape: measured.kernel_tflops_by_shape.clone(),
-        measured_on: Some(on.to_string()),
-        ..Rates::default()
-    };
+    let joined = fresh;
     let saved_to = save
         .map(|save| engine::rates::save_rates(&save, &joined))
         .transpose()

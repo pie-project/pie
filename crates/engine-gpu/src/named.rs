@@ -478,6 +478,10 @@ impl<B: Serve> Serve for Named<B> {
         B::chunk_bytes(boot)
     }
 
+    fn measuring(boot: &B::DeviceBoot) -> engine::rates::Measuring {
+        B::measuring(boot)
+    }
+
     fn submit_bound(boot: &Self::DeviceBoot) -> Option<std::time::Duration> {
         B::submit_bound(boot)
     }

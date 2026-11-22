@@ -956,6 +956,7 @@ mod tests {
             saved_to: None,
             frame_cut: false,
             refused: None,
+            ..profile::fire::Tuned::default()
         };
         assert_eq!(
             line_of(&top, 2048, 512 * MIB, 2 << 30, &tuned),

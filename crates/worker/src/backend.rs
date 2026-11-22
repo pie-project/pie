@@ -536,10 +536,12 @@ pub(crate) fn create_engine_backend(
     adapters: &crate::config::AdapterConfig,
     residency: engine::Residency,
     max_context: Option<u32>,
+    measure: bool,
     overrides: &runtime::engine::load::Overrides,
     opened: Option<runtime::engine::EngineBox>,
 ) -> Result<GroupEngine> {
     let cache_dir = &crate::disk::engine_cache_dir(home);
+    let _ = measure;
     let _ = (group_id, adapter_dir, &opened);
     validate_snapshot_dir(snapshot_dir)?;
 
@@ -632,7 +634,7 @@ pub(crate) fn create_engine_backend(
                 .clone()
                 .unwrap_or_else(|| cache_dir.join("vulkan-pipelines.bin"));
             boot_doc.push_str(&format!(
-                "pipeline_cache = {}\nprofiles = {}\n",
+                "pipeline_cache = {}\nprofiles = {}\nmeasure = {measure}\n",
                 toml::Value::String(cache.display().to_string()),
                 toml::Value::String(home.join("profiles").display().to_string())
             ));
@@ -675,7 +677,7 @@ pub(crate) fn create_engine_backend(
                 ));
             }
             boot_doc.push_str(&format!(
-                "profiles = {}\n",
+                "profiles = {}\nmeasure = {measure}\n",
                 toml::Value::String(home.join("profiles").display().to_string())
             ));
             let backend = opened.map_or_else(

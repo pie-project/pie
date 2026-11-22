@@ -426,6 +426,7 @@ fn create_engine_group(
         &m.adapters,
         residency,
         cfg.engine.max_context,
+        cfg.engine.measure,
         &m.overrides()?,
         opened,
     )

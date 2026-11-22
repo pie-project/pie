@@ -91,6 +91,7 @@ impl Serve for Api {
             tuning,
             boot.profiles.as_deref(),
             <Self as Serve>::submit_bound(boot),
+            boot.measure,
         )?;
         Ok((device, tuning))
     }
@@ -111,6 +112,7 @@ impl Serve for Api {
             shapes,
             model_bytes,
             top_rows,
+            boot.measure,
         )
     }
 
@@ -148,6 +150,10 @@ impl Serve for Api {
 
     fn chunk_bytes(boot: &crate::api::DeviceBoot) -> Option<u64> {
         boot.chunk_bytes
+    }
+
+    fn measuring(boot: &crate::api::DeviceBoot) -> engine::rates::Measuring {
+        boot.measure
     }
 
     fn submit_bound(boot: &crate::api::DeviceBoot) -> Option<std::time::Duration> {
