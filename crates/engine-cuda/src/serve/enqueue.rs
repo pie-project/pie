@@ -930,7 +930,8 @@ impl FireCtx<'_> {
                 tables: kernels_cuda::runtime::channel::RsTables {
                     lanes: tables.lanes,
                     pages: tables.pages,
-                    replay_tok: tables.replay_tok,
+                    lane_rows: tables.lane_rows,
+                    replay_spans: tables.replay_spans,
                     page_tokens: buffers.page_tokens(),
                 },
                 extended: p.rs.body == record::RsBody::Replays,

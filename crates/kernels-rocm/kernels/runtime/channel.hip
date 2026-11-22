@@ -7,6 +7,7 @@
 // cells are published back.
 
 #include "prim/device.hip"
+#include "runtime/rs_rows.hip"
 
 namespace pie::channel {
 
@@ -403,12 +404,24 @@ __device__ __forceinline__ void rs_copy_row(u8* dst, const u8* src, u32 row_byte
     for (u32 h = threadIdx.x; h < (row_bytes >> 1); h += blockDim.x) d[h] = s[h];
 }
 
+// A lane's `page_off` with this bit set names its entry of the fire's beam
+// rows in its low bits (`CARRY_ROWS`): a beam stages no pages.
+constexpr u32 RS_ROWS = 0x80000000u;
+
 // The page row token `tok` of plane (`plane_off`, `plane_stride`) lies at.
 __device__ __forceinline__ u8* rs_page_row(
-    const u64* pages, RsLane lane, u32 tok, u32 page_tokens, u64 plane_off, u64 plane_stride)
+    const u64* pages, const RsRows* lane_rows, RsLane lane, u32 tok, u32 page_tokens,
+    u64 plane_off, u64 plane_stride)
 {
-    const u64 slot = pages[lane.page_off + tok / page_tokens];
-    return reinterpret_cast<u8*>(slot + plane_off + static_cast<u64>(tok % page_tokens) * plane_stride);
+    u64 slot;
+    u32 row;
+    if (lane.page_off & RS_ROWS) {
+        lane_rows[lane.page_off & ~RS_ROWS].locate(tok, slot, row);
+    } else {
+        slot = pages[lane.page_off + tok / page_tokens];
+        row = tok % page_tokens;
+    }
+    return reinterpret_cast<u8*>(slot + plane_off + static_cast<u64>(row) * plane_stride);
 }
 
 // Lands each lane's rows of `src` (a block a lane) at its buffer tokens:
@@ -422,6 +435,7 @@ __global__ void rs_scatter(
     u32 lanes_stated,
     const RsLane* __restrict__ lanes_tab,
     const u64* __restrict__ pages,
+    const RsRows* __restrict__ lane_rows,
     u32 page_tokens,
     u64 plane_off,
     u64 plane_stride)
@@ -436,7 +450,7 @@ __global__ void rs_scatter(
     const u32 t0 = qo_indptr[r];
     const u32 n = qo_indptr[r + 1] - t0;
     for (u32 e = 0; e < n; ++e) {
-        u8* dst = rs_page_row(pages, lane, lane.at + e, page_tokens, plane_off, plane_stride);
+        u8* dst = rs_page_row(pages, lane_rows, lane, lane.at + e, page_tokens, plane_off, plane_stride);
         rs_copy_row(dst, src + static_cast<u64>(row0 + t0 + e) * row_bytes, row_bytes);
     }
 }
@@ -483,7 +497,8 @@ __global__ void rs_ext_gather(
     u32 lanes_stated,
     const RsLane* __restrict__ lanes_tab,
     const u64* __restrict__ pages,
-    const u32* __restrict__ replay_tok,
+    const RsRows* __restrict__ lane_rows,
+    const u32* __restrict__ replay_spans,
     u32 page_tokens,
     u64 plane_off,
     u64 plane_stride)
@@ -523,10 +538,15 @@ __global__ void rs_ext_gather(
     const RsLane lane = lanes_tab[lane0 + r];
     const u32 e0 = begin;
     if (pages != nullptr) {
-        for (u32 k = 0; k < lane.replay; ++k) {
-            const u32 tok = replay_tok[lane.replay_off + k];
-            const u8* src = rs_page_row(pages, lane, tok, page_tokens, plane_off, plane_stride);
-            rs_copy_row(ext + static_cast<u64>(e0 + k) * row_bytes, src, row_bytes);
+        // Its replayed rows, span by span ((start, count) pairs of buffer
+        // tokens, in order).
+        u32 span = lane.replay_off;
+        for (u32 k = 0; k < lane.replay; span += 2u) {
+            const u32 start = replay_spans[span], count = replay_spans[span + 1u];
+            for (u32 i = 0; i < count && k < lane.replay; ++i, ++k) {
+                const u8* src = rs_page_row(pages, lane_rows, lane, start + i, page_tokens, plane_off, plane_stride);
+                rs_copy_row(ext + static_cast<u64>(e0 + k) * row_bytes, src, row_bytes);
+            }
         }
     }
     const u32 t0 = qo_indptr[r];
@@ -536,7 +556,7 @@ __global__ void rs_ext_gather(
         rs_copy_row(ext + static_cast<u64>(e0 + lane.replay + e) * row_bytes, src, row_bytes);
         // A buffered plane's own rows land in the lane's buffer too.
         if (pages != nullptr && lane.at != RS_NONE) {
-            rs_copy_row(rs_page_row(pages, lane, lane.at + e, page_tokens, plane_off, plane_stride),
+            rs_copy_row(rs_page_row(pages, lane_rows, lane, lane.at + e, page_tokens, plane_off, plane_stride),
                         src, row_bytes);
         }
     }
@@ -663,28 +683,10 @@ struct BeamListRun {
 
 static_assert(sizeof(BeamListRun) == 40, "BeamListRun: the Rust `channel::BeamListRun` mirrors this layout");
 
-// A lane's rs page table to resolve (§11, a hybrid's): its `entries`
-// entries from `from`, entry e holding the `tokens` buffered rows of slots
-// `base + e * tokens` on, each resolved to the set's entry holding the same
-// rows of its beam's list's page (`bases`: the set's entries' slot
-// addresses, `bases_len` of them, from its entry 0).
-struct BeamRsRun {
-    u64* pages;
-    const u64* bases;
-    u32 lane;
-    u32 from;
-    u32 entries;
-    u32 base;
-    u32 tokens;
-    u32 bases_len;
-};
-
-static_assert(sizeof(BeamRsRun) == 40, "BeamRsRun: the Rust `channel::BeamRsRun` mirrors this layout");
-
 // A beam's rs copy (§6.4 on a hybrid): the first `tokens` slots of pool page
 // `src` to pool page `dst` (the `[src, dst, tokens]` its group's step left
 // at `copy`), row by row of each plane, through the set's rs entries
-// (`bases`, as `BeamRsRun`'s): a slot below the buffer (the prompt's tail,
+// (`bases`, the set's rs entries' slot addresses): a slot below the buffer (the prompt's tail,
 // in the state) has no row and is skipped.
 struct RsCopyRun {
     const u32* copy;
@@ -753,8 +755,9 @@ __global__ void copy_rs_rows(
 }
 
 // A group's step: its state, the parents its last epilogue wrote, its pool's
-// device ids, its lanes' list runs and fault words, the numbers of §3, and
-// on a hybrid its lanes' rs page tables (§11).
+// device ids, its lanes' list runs and fault words, and the numbers of §3;
+// on a hybrid its beams' rs rows (`RsRows`, §11.1, a beam each), which it
+// points at their lists as it leaves them.
 struct BeamStepRun {
     u32* state;
     const u32* parents;
@@ -770,8 +773,7 @@ struct BeamStepRun {
     u32 list_count;
     u32 frames;
     u32 backed;
-    u32 rs_count;
-    const BeamRsRun* rs;
+    RsRows* rows;
 };
 
 static_assert(sizeof(BeamStepRun) == 88, "BeamStepRun: the Rust `channel::BeamStepRun` mirrors this layout");
@@ -797,6 +799,10 @@ __global__ void beam_step(const BeamStepRun* __restrict__ runs, u32 run_count)
     const u32 parity = fired & 1u;
     u32* map_old = r.state + PIE_BEAM_HEADER + parity * B * cap;
     u32* map_new = r.state + PIE_BEAM_HEADER + (parity ^ 1u) * B * cap;
+    // A hybrid's beams read their rs rows through the lists this step leaves.
+    if (r.rows != nullptr) {
+        for (u32 b = threadIdx.x; b < B; b += blockDim.x) r.rows[b].list = map_new + b * cap;
+    }
     u32* free_pages = r.state + PIE_BEAM_HEADER + 2u * B * cap;
     u32* pend = free_pages + cap + (fired % F) * cap;
     u32* copies = free_pages + cap + F * cap;
@@ -968,36 +974,6 @@ __global__ void beam_step(const BeamStepRun* __restrict__ runs, u32 run_count)
                 continue;
             }
             l.write_page[row] = r.trans[q];
-        }
-    }
-    // §6.5 on a hybrid (§11): each lane's rs page table over the same list,
-    // slot by slot: entry e (slot `base + e T`) holds the rows of the set's
-    // slot (f0 + list[j]) S + (slot mod S), j its column; its write page
-    // among them.
-    for (u32 i = 0u; i < r.rs_count; ++i) {
-        const BeamRsRun l = r.rs[i];
-        const u32* list = map_new + l.lane * cap;
-        const u64 T = l.tokens == 0u ? 1u : l.tokens;
-        for (u32 e = threadIdx.x; e < l.entries; e += blockDim.x) {
-            const u64 slot = l.base + e * T;
-            if (slot < static_cast<u64>(f0) * S) continue;
-            const u64 j = slot / S - f0;
-            if (j >= cap) {
-                atomicMax(&r.faults[l.lane], PIE_PAGES_SHORT);
-                continue;
-            }
-            const u32 q = list[j];
-            if (q >= K) {
-                atomicMax(&r.faults[l.lane], q >= Q ? PIE_PAGES_PAST_RESERVE : PIE_PAGES_EXHAUSTED);
-                continue;
-            }
-            const u64 sigma = (static_cast<u64>(f0) + q) * S + slot % S;
-            const u64 at = (sigma - l.base) / T;
-            if (sigma < l.base || at >= l.bases_len) {
-                atomicMax(&r.faults[l.lane], PIE_PAGES_PAST_RESERVE);
-                continue;
-            }
-            l.pages[l.from + e] = l.bases[at];
         }
     }
     // The group's common slot (BEAM-PAGE-LISTS §11.3, §11.4): the depth of

@@ -1398,7 +1398,8 @@ impl<'c> Run<'c> {
         let mut carry = kernels_cuda::ssm::Carry {
             lanes: tables.lanes,
             pages: tables.pages,
-            replay_tok: tables.replay_tok,
+            lane_rows: tables.lane_rows,
+            replay_spans: tables.replay_spans,
             page_tokens: tables.page_tokens.max(1),
             ..kernels_cuda::ssm::Carry::NONE
         };
@@ -1427,7 +1428,8 @@ impl<'c> Run<'c> {
         let mut carry = kernels_cuda::ssm::Carry {
             lanes: tables.lanes,
             pages: tables.pages,
-            replay_tok: tables.replay_tok,
+            lane_rows: tables.lane_rows,
+            replay_spans: tables.replay_spans,
             commit_len: pool.commit_len.ptr,
             page_tokens: tables.page_tokens.max(1),
             #[cfg(not(feature = "rocm"))]

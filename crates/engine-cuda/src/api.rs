@@ -877,7 +877,11 @@ impl Engine for Cuda {
                 max_readouts: u32::try_from(poem_compiler::arena::readouts_ceiling(shell.budget()))
                     .unwrap_or(u32::MAX),
                 // Each lane's rung bounds what it replays.
-                replayed_rows: 0,
+                // A lane's replayed rows are spans of its buffer and a beam's
+                // resolve through its group's list (`kernels_cuda::ssm::Carry`):
+                // no table holds a row, so a fire replays what its lanes'
+                // contexts hold.
+                replayed_rows: shell.fire_lanes().saturating_mul(paging.context()),
             },
             has_lora: true,
             has_attn_page_mask: false,

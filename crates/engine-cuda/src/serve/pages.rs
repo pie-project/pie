@@ -25,6 +25,9 @@ pub struct PageGroup {
     pub parents: u64,
     pub state: u64,
     pub layout: crate::program::launch::BeamLayout,
+    /// Its first beam's entry of the fire's beam rows (`channel::RsRows`),
+    /// its beams' in order from it.
+    pub rows_at: u32,
     /// Its lanes in beam order: the lane's index in the fire, its seat in
     /// the staged page tables, its first row, the slots it held before the
     /// fire and the rows the fire lands.
@@ -61,10 +64,9 @@ pub struct GroupPlan {
     pub frames: u32,
     /// The pool pages staged from the first (`backed`).
     pub backed: u32,
-    /// Where its beams' rs page tables start in [`PageWork::rs`], and how
-    /// many (none off a hybrid).
-    pub rs_at: u32,
-    pub rs_count: u32,
+    /// Its beams' entries of the fire's beam rows from this one, where they
+    /// read rs rows (a hybrid's): the step points them at its lists.
+    pub rows_at: Option<u32>,
 }
 
 /// The pool pages a group of `lanes` beams can name at the fire whose
@@ -111,15 +113,20 @@ pub struct CopyPlan {
     pub planes: u32,
 }
 
-/// A beam's rs page table to resolve (a hybrid's, `BEAM-PAGE-LISTS.md`
-/// §11): its first entry in the fire's rs page table and how many, the
-/// buffer's first slot and its rows a page, and where the set's rs entries'
-/// slot addresses start in [`PageWork::bases`] and how many.
+/// Where a lane's rs rows lie (`channel::RsRows`): its entry of the fire's
+/// lane rows; a beam's (a hybrid's, `BEAM-PAGE-LISTS.md` §11.1) list's row of
+/// its group's state before the step points it (the state's first list:
+/// valid memory; 0 for a lane alone on its set) and the list's columns, the group's first pool page `f0`
+/// and kv page, the buffer's first slot and its rows a page, and where the
+/// set's rs entries' slot addresses start in [`PageWork::bases`] and how
+/// many.
 #[derive(Clone, Copy, Debug)]
-pub struct RsListPlan {
-    pub lane: u32,
-    pub from: u32,
-    pub entries: u32,
+pub struct RsRowsPlan {
+    pub entry: u32,
+    pub list: u64,
+    pub cap: u32,
+    pub f0: u32,
+    pub page: u32,
     pub base: u32,
     pub tokens: u32,
     pub bases_at: u32,
@@ -164,13 +171,18 @@ pub struct RsFire<'a> {
 pub struct PageWork {
     pub groups: Vec<GroupPlan>,
     pub lists: Vec<ListPlan>,
-    /// The beams' rs page tables (a hybrid's).
-    pub rs: Vec<RsListPlan>,
+    /// Where the lanes' rs rows lie: the beams' (a hybrid's) and the
+    /// buffering lanes' alone on their sets.
+    pub rs: Vec<RsRowsPlan>,
     pub copies: Vec<CopyPlan>,
     /// The beams' rs copies (a hybrid's).
     pub rs_copies: Vec<RsCopyPlan>,
     pub trans: Vec<i32>,
+    /// The pool and rs pages' addresses: the lanes' alone on their sets
+    /// first ([`PageWork::of_lanes`]), then the groups'.
     pub bases: Vec<u64>,
+    /// Whether lanes alone on their sets read pages of `bases`.
+    pub lanes: bool,
     pub planes: Vec<PagePlane>,
     /// Per fault word, the lane it faults.
     pub faults: Vec<(usize, engine::InstanceId)>,
@@ -182,7 +194,19 @@ pub struct PageWork {
 impl PageWork {
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.groups.is_empty()
+        self.groups.is_empty() && !self.lanes
+    }
+
+    /// The work of a fire whose lanes alone on their sets read their rows
+    /// through `slots` (the slot addresses of the pages they read or write,
+    /// `RsLane::page_off` counting from the first), before its groups'.
+    #[must_use]
+    pub fn of_lanes(slots: Vec<u64>) -> PageWork {
+        PageWork {
+            lanes: !slots.is_empty(),
+            bases: slots,
+            ..PageWork::default()
+        }
     }
 }
 
@@ -235,8 +259,9 @@ pub fn plan(
     rs: Option<&RsFire<'_>>,
     device_ids: &mut dyn FnMut(&mut [i32]) -> Result<()>,
     page_base: &mut dyn FnMut(u32) -> Result<u64>,
+    lane_pages: Vec<u64>,
 ) -> Result<PageWork> {
-    let mut work = PageWork::default();
+    let mut work = PageWork::of_lanes(lane_pages);
     if groups.is_empty() {
         return Ok(work);
     }
@@ -325,15 +350,13 @@ pub fn plan(
             }
         }
         let list_count = work.lists.len() as u32 - lists_at;
-        // A hybrid's beams (§11): each beam's rs page table, column 0 at its
-        // entry `f0 - base / S`, resolved over the same list; the group's rs
-        // pool pages are the set's, as its lanes' tables stage them.
-        let rs_at = work.rs.len() as u32;
+        // A hybrid's beams (§11.1): each beam's rs rows, resolved row by row
+        // through the same list; the group's rs pool pages are the set's.
         let mut rs_bases_at = None;
         if let Some(rs) = rs {
-            rs_bases_at = rs_lists(&mut work, rs, group, f0, page, slot, backed)?;
+            rs_bases_at = rs_lists(&mut work, rs, group, f0, page, slot)?;
         }
-        let rs_count = work.rs.len() as u32 - rs_at;
+        let rows_at = rs_bases_at.map(|_| group.rows_at);
         // The head step leaves the group's common slot in its header's fourth
         // word (§11.3).
         work.commons.push((group.state + 12, group.instance));
@@ -352,8 +375,7 @@ pub fn plan(
             slot,
             frames: group.layout.frames,
             backed,
-            rs_at,
-            rs_count,
+            rows_at,
         });
         let bases_at = work.bases.len() as u32;
         for &p in pool {
@@ -396,11 +418,10 @@ pub fn plan(
     Ok(work)
 }
 
-/// A hybrid group's rs page tables (`BEAM-PAGE-LISTS.md` §11): each beam's
-/// entries for slots `base..=slot`, each resolved slot by slot through its
-/// list to the set's entry holding the same rows, and the set's rs entries'
-/// slot addresses (beam 0's table as staged: every beam's names the set's)
-/// in [`PageWork::bases`]; their run, its length and the buffer's base, or
+/// A hybrid group's beams' rs rows (`BEAM-PAGE-LISTS.md` §11.1): where each
+/// beam's rows resolve, slot by slot through its list to the set's entry
+/// holding the same rows, and the set's rs entries' slot addresses in
+/// [`PageWork::bases`]; their run, its length and the buffer's base, or
 /// `None` for a group whose lanes buffer no rows. Refused by name where a
 /// page's rows do not divide a kv page, or where the buffer does not start
 /// on a row page (an entry would straddle two of a beam's pages).
@@ -408,10 +429,9 @@ fn rs_lists(
     work: &mut PageWork,
     rs: &RsFire<'_>,
     group: &PageGroup,
-    _f0: u32,
+    f0: u32,
     page: u32,
     slot: u32,
-    _backed: u32,
 ) -> Result<Option<(u32, u32, u32)>> {
     let lane_of = |source: usize| -> Option<kernels_cuda::runtime::channel::RsLane> {
         let fire_lane = *rs.order.get(source)? as usize;
@@ -444,9 +464,8 @@ fn rs_lists(
     let bases_at = work.bases.len() as u32;
     work.bases.extend_from_slice(&set);
     let bases_len = set.len() as u32;
-    let entries = (slot - base) / tokens + 1;
     for (beam, lane) in group.lanes.iter().enumerate() {
-        let rs_lane = lane_of(lane.source).ok_or_else(|| {
+        lane_of(lane.source).ok_or_else(|| {
             Fault::program(
                 "serve::pages",
                 format!(
@@ -455,10 +474,14 @@ fn rs_lists(
                 ),
             )
         })?;
-        work.rs.push(RsListPlan {
-            lane: beam as u32,
-            from: rs_lane.page_off,
-            entries,
+        work.rs.push(RsRowsPlan {
+            entry: group.rows_at + beam as u32,
+            list: group.state
+                + u64::from(kernels_cuda::runtime::channel::BEAM_HEADER + beam as u32 * group.layout.cap)
+                    * 4,
+            cap: group.layout.cap,
+            f0,
+            page,
             base,
             tokens,
             bases_at,

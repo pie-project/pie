@@ -53,12 +53,14 @@ impl Page {
     }
 
     /// The tables of one lane landing its own row at `at`, carrying the
-    /// `replay` rows before it, committing `commit` rows of its run.
+    /// `replay` rows before it (tokens `0..replay`), committing `commit` rows
+    /// of its run.
     fn carry(&self, gpu: &mut Gpu, at: u32, replay: u32, commit: i32) -> Carry {
         let mut carry = Carry {
             lanes: gpu.up(&[at, replay, 0u32, 0, 0]),
             pages: gpu.up(&[self.base]),
-            replay_tok: gpu.up(&(0..replay.max(1)).collect::<Vec<u32>>()),
+            // Its rows as two spans, so a run is walked across spans.
+            replay_spans: gpu.up(&[0u32, replay / 2, replay / 2, replay - replay / 2]),
             commit_len: gpu.up(&[commit]),
             page_tokens: PAGE,
             ..Carry::NONE

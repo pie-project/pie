@@ -53,17 +53,38 @@ impl Page {
         }
     }
 
+    /// `carry`'s lane reading its rows through its entry of the fire's lane
+    /// rows (`RsRows`, resolved on the device) in place of its staged page.
+    fn through_rows(&self, gpu: &mut Gpu, carry: &mut Carry, at: u32, replay: u32) {
+        use kernels_cuda::runtime::channel::{RsLane, RsRows};
+        carry.lanes = gpu.up(&[at, replay, 0u32, RsLane::ROWS, 0]);
+        carry.pages = 0;
+        let bases = gpu.up(&[self.base]);
+        carry.lane_rows = gpu.up(&[RsRows {
+            list: 0,
+            bases,
+            cap: 0,
+            f0: 0,
+            page: 1,
+            base: 0,
+            tokens: self.tokens,
+            bases_len: 1,
+        }]);
+    }
+
     fn row(&self, plane: usize, tok: u32) -> u64 {
         self.base + self.offs[plane] + u64::from(tok) * self.strides[plane]
     }
 
     /// The tables of one lane landing its own row at `at`, carrying the
-    /// `replay` rows before it, committing `commit` rows of its run.
+    /// `replay` rows before it (tokens `0..replay`), committing `commit` rows
+    /// of its run.
     fn carry(&self, gpu: &mut Gpu, at: u32, replay: u32, commit: i32) -> Carry {
         let mut carry = Carry {
             lanes: gpu.up(&[at, replay, 0u32, 0, 0]),
             pages: gpu.up(&[self.base]),
-            replay_tok: gpu.up(&(0..replay.max(1)).collect::<Vec<u32>>()),
+            // Its rows as two spans, so a run is walked across spans.
+            replay_spans: gpu.up(&[0u32, replay / 2, replay / 2, replay - replay / 2]),
             commit_len: gpu.up(&[commit]),
             page_tokens: self.tokens,
             ..Carry::NONE
@@ -595,7 +616,7 @@ fn a_gated_delta_decode_splitting_its_carried_rows_answers_the_whole_one() {
     let planes = [2 * u64::from(VH) * 2, width as u64 * 2, u64::from(VH * VD) * 4];
     let sms = gpu.ctx().multiprocessors().unwrap_or(1);
     let room = gpu.zeros(ssm::carry_split_bytes(sms) as usize);
-    let run = |gpu: &mut Gpu, split: u64| {
+    let run = |gpu: &mut Gpu, split: u64, rows: bool| {
         let page = Page::of(gpu, &planes, Some((1, &keys)), T as u32);
         let slab = gpu.up(&seed);
         let y = gpu.zeros(T * (VH * VD) as usize * 4);
@@ -603,6 +624,9 @@ fn a_gated_delta_decode_splitting_its_carried_rows_answers_the_whole_one() {
             let c = if j + 1 == T { T as i32 - 3 } else { 0 };
             let mut carry = page.carry(gpu, j as u32, j as u32, c);
             carry.split = split;
+            if rows {
+                page.through_rows(gpu, &mut carry, j as u32, j as u32);
+            }
             ssm::gated_delta_carried(
                 &gpu.ctx(),
                 Tensor::new(row(qkv, j, conv_dim, 2), 1, conv_dim as u32, Dtype::Bf16),
@@ -628,8 +652,14 @@ fn a_gated_delta_decode_splitting_its_carried_rows_answers_the_whole_one() {
             .collect();
         (gpu.down::<f32>(y, T * (VH * VD) as usize), us, gpu.down::<u16>(slab, stride))
     };
-    let (want_y, want_u, want_slab) = run(&mut gpu, 0);
-    let (got_y, got_u, got_slab) = run(&mut gpu, room);
+    let (want_y, want_u, want_slab) = run(&mut gpu, 0, false);
+    // Read through the lane's rows on the device, every byte as through its
+    // staged page.
+    let (rows_y, rows_u, rows_slab) = run(&mut gpu, 0, true);
+    assert_eq!(rows_y, want_y, "the decodes' rows through the lane rows");
+    assert_eq!(rows_u, want_u, "the corrected values through the lane rows");
+    assert_eq!(rows_slab, want_slab, "the state through the lane rows");
+    let (got_y, got_u, got_slab) = run(&mut gpu, room, false);
     near(&got_y, &want_y, 1e-4, "the split decodes' rows");
     near(&got_u, &want_u, 1e-4, "the split decodes' corrected values");
     let got: Vec<f32> = got_slab.into_iter().map(from_bf16).collect();

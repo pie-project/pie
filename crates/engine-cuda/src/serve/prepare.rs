@@ -405,6 +405,10 @@ impl Shell {
         // its parents cell and its state; and each lane's group.
         let mut page_groups: Vec<super::pages::PageGroup> = Vec::new();
         let mut group_of: Vec<Option<usize>> = vec![None; lanes.len()];
+        // Each beam's entry of the fire's beam rows (`channel::RsRows`):
+        // its group's first, then the group's beams in order.
+        let mut beam_row: Vec<u32> = vec![0; lanes.len()];
+        let mut beam_rows = 0u32;
         for attached in attachments {
             let first = attached.lane as usize;
             let src = self.programs.token_device_source(attached.instance);
@@ -500,14 +504,17 @@ impl Shell {
                 }
                 for lane in 0..spanned.len() {
                     group_of[first + lane] = Some(page_groups.len());
+                    beam_row[first + lane] = beam_rows + lane as u32;
                 }
                 page_groups.push(super::pages::PageGroup {
                     instance: attached.instance,
                     parents,
                     state,
                     layout,
+                    rows_at: beam_rows,
                     lanes: Vec::new(),
                 });
+                beam_rows += spanned.len() as u32;
             }
             if can_runahead && envelope_class {
                 if first < lanes.len() {
@@ -1773,8 +1780,12 @@ impl Shell {
             _ => record::RsBody::Folds,
         };
         let mut rs_lanes: Vec<kernels_cuda::runtime::channel::RsLane> = Vec::new();
-        let mut rs_slots: Vec<u64> = Vec::new();
-        let mut rs_tokens: Vec<u32> = Vec::new();
+        // The slot addresses of the pages the lanes alone on their sets read
+        // or write, a lane's after another's.
+        let mut lane_pages: Vec<u64> = Vec::new();
+        // Each lane's replayed rows as (start, count) spans of its buffer
+        // tokens, in order (`kernels_cuda::ssm::Carry::replay_spans`).
+        let mut rs_spans: Vec<u32> = Vec::new();
         let mut rs_folds: Vec<kernels_cuda::ssm::GroupFold> = Vec::new();
         if rs_body.buffers() {
             let buffers = self.buffers.as_ref().ok_or_else(|| Fault::Unbound {
@@ -1795,30 +1806,47 @@ impl Shell {
                     });
                     continue;
                 };
-                let replay_off = rs_tokens.len() as u32;
-                let page_off = rs_slots.len();
-                // Only the pages the fire reads or writes of the lane's: its
-                // replayed tokens and its own rows (a beam group's set is
-                // backed to its pool's end, which no beam reads this fire).
-                let tokens = buffers.page_tokens().max(1);
-                let reach = rs_reads[fire_lane]
-                    .iter()
-                    .map(|span| span.end)
-                    .chain(core::iter::once(*at + row.rows))
-                    .max()
-                    .unwrap_or(0)
-                    .div_ceil(tokens) as usize;
-                for &page in pages.iter().take(reach.max(1)) {
-                    rs_slots.push(buffers.slot(&self.pools, page)?);
-                }
+                let replay_off = rs_spans.len() as u32;
+                // No table holds an entry a row. A beam's rows resolve on the
+                // device through its entry of the fire's lane rows
+                // (`channel::RsRows`), through its group's list (§11.1); any
+                // other lane's through the pages of its buffer the fire reads
+                // or writes, from the one holding its first replayed or own
+                // row (its tokens then count from that page), laid beside
+                // the beams' sets' pages (`PageWork::bases`).
+                let (page_off, skip) = if group_of[row.source as usize].is_some() {
+                    (kernels_cuda::runtime::channel::RsLane::ROWS | beam_row[row.source as usize], 0)
+                } else {
+                    let tokens = buffers.page_tokens().max(1);
+                    let reads = &rs_reads[fire_lane];
+                    let first = reads.iter().map(|span| span.start).chain([*at]).min().unwrap_or(0);
+                    let reach = reads
+                        .iter()
+                        .map(|span| span.end)
+                        .chain([*at + row.rows])
+                        .max()
+                        .unwrap_or(0)
+                        .div_ceil(tokens)
+                        .max(1) as usize;
+                    let from = (first / tokens) as usize;
+                    let slots = pages
+                        .iter()
+                        .take(reach)
+                        .skip(from)
+                        .map(|&page| buffers.slot(&self.pools, page))
+                        .collect::<Result<Vec<u64>>>()?;
+                    let page_off = lane_pages.len() as u32;
+                    lane_pages.extend(slots);
+                    (page_off, from as u32 * tokens)
+                };
                 for span in &rs_reads[fire_lane] {
-                    rs_tokens.extend(span.clone());
+                    rs_spans.extend([span.start - skip, span.end - span.start]);
                 }
                 rs_lanes.push(kernels_cuda::runtime::channel::RsLane {
-                    at: *at,
+                    at: *at - skip,
                     replay: rs_replays[fire_lane],
                     replay_off,
-                    page_off: page_off as u32,
+                    page_off,
                     ext: begin,
                 });
             }
@@ -1827,10 +1855,10 @@ impl Shell {
             for (lane, rows) in &group_folds {
                 rs_folds.push(kernels_cuda::ssm::GroupFold {
                     lane: *lane as u32,
-                    fold_off: rs_tokens.len() as u32,
+                    fold_off: rs_spans.len() as u32,
                     rows: rows.len() as u32,
                 });
-                rs_tokens.extend(rows.clone());
+                rs_spans.extend([rows.start, rows.end - rows.start]);
             }
         }
         // The records as the kernels read them: each row's pieces by the
@@ -1925,7 +1953,7 @@ impl Shell {
             self.pools.page_ids(list, &mut geometry.write_page)?;
         }
         let page_work = if page_groups.is_empty() {
-            super::pages::PageWork::default()
+            super::pages::PageWork::of_lanes(lane_pages)
         } else {
             // A group's lanes are seated in lane order: its beams.
             for group in &mut page_groups {
@@ -1983,6 +2011,7 @@ impl Shell {
                 rs_fire.as_ref(),
                 &mut |ids| pools.page_ids(0, ids),
                 &mut |page| pools.page_base(0, page),
+                lane_pages,
             )?
         };
         super::btrace::mark("admit");
@@ -2291,8 +2320,7 @@ impl Shell {
                 packings: &packing_fires,
                 rs: rs_body.buffers().then_some(crate::inputs::RsFire {
                     lanes: &rs_lanes,
-                    pages: &rs_slots,
-                    replay_tok: &rs_tokens,
+                    replay_spans: &rs_spans,
                     folds: &rs_folds,
                 }),
             },

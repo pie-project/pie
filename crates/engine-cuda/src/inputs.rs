@@ -241,14 +241,21 @@ pub struct Handles {
 
 /// Where a fire's staged rs tables lie on the device: a
 /// [`kernels_cuda::runtime::channel::RsLane`] a lane (padded lanes inert),
-/// the slot address of each lane's rs buffer pages, and each replayed row's
-/// buffer token. Fixed for the load, so a recorded body reads whatever slots
-/// the fire it serves names.
+/// each buffering lane's rs rows ([`kernels_cuda::runtime::channel::RsRows`]),
+/// and each lane's replayed rows as spans of its buffer tokens. Fixed for the
+/// load, so a recorded body reads whatever rows the fire it serves names.
 #[derive(Debug, Clone, Copy)]
 pub struct RsHandles {
     pub lanes: u64,
+    /// The slot addresses of the pages its lanes alone on their sets read or
+    /// write (`PagesAt::bases`, a lane's from its [`RsLane::page_off`]).
+    ///
+    /// [`RsLane::page_off`]: kernels_cuda::runtime::channel::RsLane::page_off
     pub pages: u64,
-    pub replay_tok: u64,
+    /// The fire's beams' rs rows, an entry a beam
+    /// ([`kernels_cuda::runtime::channel::RsRows`]).
+    pub lane_rows: u64,
+    pub replay_spans: u64,
     /// The beam groups' folds (§11.3), [`RsHandles::fold_entries`] of them,
     /// those past the fire's folding none.
     pub folds: u64,
@@ -269,8 +276,7 @@ const fn rs_lane_table_bytes(lanes: u64) -> u64 {
 #[derive(Debug, Clone, Copy)]
 pub struct RsFire<'a> {
     pub lanes: &'a [kernels_cuda::runtime::channel::RsLane],
-    pub pages: &'a [u64],
-    pub replay_tok: &'a [u32],
+    pub replay_spans: &'a [u32],
     /// The fire's beam group folds (§11.3).
     pub folds: &'a [kernels_cuda::ssm::GroupFold],
 }
@@ -279,9 +285,7 @@ pub struct RsFire<'a> {
 #[derive(Debug, Clone, Copy)]
 struct RsAt {
     lanes: u64,
-    pages: u64,
-    pages_cap: u64,
-    replay_tok: u64,
+    replay_spans: u64,
     replay_cap: u64,
     /// A group fold a lane at most: a group holds a lane or more.
     folds: u64,
@@ -469,8 +473,8 @@ pub struct Staged {
     /// The ids staged for the recurrent rows.
     state_ids: u32,
     packed: bool,
-    /// The rs tables' pages and replayed rows staged, when it buffers.
-    rs: Option<(u32, u32)>,
+    /// The rs tables' replay span words staged, when it buffers.
+    rs: Option<u32>,
 }
 
 impl Staged {
@@ -632,12 +636,12 @@ fn stage_pages(
     store: &mut Buffer,
     at: PagesAt,
     tables: &[TableHandles],
-    rs_pages: Option<u64>,
+    rs_tables: bool,
     work: &crate::serve::pages::PageWork,
     slot: u32,
 ) -> Result<Option<u64>> {
     use kernels_cuda::runtime::channel::{
-        BeamListRun, BeamRsRun, BeamStepRun, PageCopyRun, PagePlane, RsCopyRun,
+        BeamListRun, RsRows, BeamStepRun, PageCopyRun, PagePlane, RsCopyRun,
     };
     if work.is_empty() {
         return Ok(None);
@@ -661,13 +665,14 @@ fn stage_pages(
         Ok(())
     };
     fits("beam pool pages in one fire", work.trans.len(), at.trans_cap)?;
-    fits("beam pool pages copied in one fire", work.bases.len(), at.bases_cap)?;
+    fits("pool and rs pages one fire's lanes name", work.bases.len(), at.bases_cap)?;
     fits("kv planes a page copy spans", work.planes.len(), at.planes_cap)?;
     fits("beam list runs in one fire", work.lists.len(), at.lists_cap)?;
     fits("beam groups in one fire", work.groups.len(), at.groups_cap)?;
     fits("beam copies in one fire", work.copies.len(), at.copies_cap)?;
     fits("beam lanes in one fire", work.faults.len(), at.faults_cap)?;
-    fits("beam rs page tables in one fire", work.rs.len(), at.rs_cap)?;
+    let beam_rows = work.rs.iter().map(|plan| plan.entry as usize + 1).max().unwrap_or(0);
+    fits("lanes whose rs rows one fire lays", beam_rows, at.rs_cap)?;
     fits("beam rs copies in one fire", work.rs_copies.len(), at.rs_cap)?;
     let base = store.ptr();
     let faults = at.faults + u64::from(slot) * at.faults_cap * 4;
@@ -709,36 +714,34 @@ fn stage_pages(
         at.lists,
         bytes_of(lists.as_ptr().cast(), lists.len() * size_of::<BeamListRun>()),
     )?;
-    // A hybrid's beams' rs page tables (§11): each beam's entries in the
-    // fire's rs page table, over its group's rs pool pages.
-    let rs_runs: Vec<BeamRsRun> = work
-        .rs
-        .iter()
-        .map(|list| {
-            rs_pages
-                .map(|pages| BeamRsRun {
-                    pages,
-                    bases: base + at.bases + u64::from(list.bases_at) * 8,
-                    lane: list.lane,
-                    from: list.from,
-                    entries: list.entries,
-                    base: list.base,
-                    tokens: list.tokens,
-                    bases_len: list.bases_len,
-                })
-                .ok_or_else(|| {
-                    crate::error::Fault::program(
-                        "inputs::commit",
-                        "a beam group's rs page tables, in a fire that stages no rs tables",
-                    )
-                })
-        })
-        .collect::<crate::error::Result<_>>()?;
-    store.stage(
-        stream,
-        at.rs,
-        bytes_of(rs_runs.as_ptr().cast(), rs_runs.len() * size_of::<BeamRsRun>()),
-    )?;
+    // The lanes' rs rows: where the carried kernels resolve each lane's rows,
+    // a beam's (§11.1) through its group's list, which the step points it at.
+    if !work.rs.is_empty() {
+        if !rs_tables {
+            return Err(crate::error::Fault::program(
+                "inputs::commit",
+                "a lane's rs rows, in a fire that stages no rs tables",
+            ));
+        }
+        let mut rows = vec![RsRows::default(); beam_rows];
+        for plan in &work.rs {
+            rows[plan.entry as usize] = RsRows {
+                list: plan.list,
+                bases: base + at.bases + u64::from(plan.bases_at) * 8,
+                cap: plan.cap,
+                f0: plan.f0,
+                page: plan.page,
+                base: plan.base,
+                tokens: plan.tokens,
+                bases_len: plan.bases_len,
+            };
+        }
+        store.stage(
+            stream,
+            at.rs,
+            bytes_of(rows.as_ptr().cast(), rows.len() * size_of::<RsRows>()),
+        )?;
+    }
     let groups: Vec<BeamStepRun> = work
         .groups
         .iter()
@@ -757,8 +760,9 @@ fn stage_pages(
             list_count: group.list_count,
             frames: group.frames,
             backed: group.backed,
-            rs_count: group.rs_count,
-            rs: base + at.rs + u64::from(group.rs_at) * size_of::<BeamRsRun>() as u64,
+            rows: group
+                .rows_at
+                .map_or(0, |at_row| base + at.rs + u64::from(at_row) * size_of::<RsRows>() as u64),
         })
         .collect();
     store.stage(
@@ -826,7 +830,8 @@ fn stage_pages(
         rs_copies.len() as u32,
         work.rs_copies.iter().map(|copy| copy.planes).max().unwrap_or(0),
     )?;
-    Ok(Some(base + faults))
+    // Fault words only a beam group's step writes.
+    Ok((!work.groups.is_empty()).then_some(base + faults))
 }
 
 #[derive(Debug)]
@@ -909,8 +914,9 @@ struct PagesAt {
     copies_cap: u64,
     faults: u64,
     faults_cap: u64,
-    /// A hybrid's beams' rs page tables and rs copies
-    /// (`BEAM-PAGE-LISTS.md` §11).
+    /// The buffering lanes' rs rows, an entry each
+    /// ([`kernels_cuda::runtime::channel::RsRows`]), and a hybrid's beams' rs
+    /// copies (`BEAM-PAGE-LISTS.md` §11).
     rs: u64,
     rs_cap: u64,
     rs_copies: u64,
@@ -1003,7 +1009,7 @@ impl Inputs {
         let mask_runs = take(lanes * size_of::<kernels_cuda::runtime::channel::BitRun>() as u64);
         let pages_at = {
             use kernels_cuda::runtime::channel::{
-                BeamListRun, BeamRsRun, BeamStepRun, PageCopyRun, PagePlane, RsCopyRun,
+                BeamListRun, RsRows, BeamStepRun, PageCopyRun, PagePlane, RsCopyRun,
             };
             // A hybrid's beams also resolve and copy their rs rows (§11): the
             // set's rs entries' addresses (a sequence's at most, its pages of
@@ -1037,7 +1043,7 @@ impl Inputs {
                 copies_cap: lanes,
                 faults: take(lanes * 4 * in_flight),
                 faults_cap: lanes,
-                rs: take(lanes * rs_side * size_of::<BeamRsRun>() as u64),
+                rs: take(lanes * rs_side * size_of::<RsRows>() as u64),
                 rs_cap: lanes * rs_side,
                 rs_copies: take(lanes * rs_side * size_of::<RsCopyRun>() as u64),
             }
@@ -1063,22 +1069,18 @@ impl Inputs {
                 permutation: take(rows * 4),
             })
             .collect();
-        // A fire replays through the run no more rows than the widest
-        // bucket's tokens (`engine::fire::rung_rows`); a decoding lane's
-        // carried rows are a kernel input and no rows of the run, so the
-        // tables hold four buckets' tokens of carried rows, the beam groups'
-        // fold rows past them, and the pages they and its own rows lie in. A
-        // fire naming more is refused by name where the tables are staged.
-        let rs = rs_page_tokens.map(|tokens| {
-            // A group's fold rows are rows of its buffer it would otherwise
-            // replay, past its lanes' replays: as many again at most.
+        // A lane's replayed rows are spans of its buffer tokens: one for a
+        // lane alone on its set or a beam over its own list, whatever it
+        // carries; the spans its mask admits for a lane sharing its set by
+        // mask. The span table holds four buckets' tokens of span words, the
+        // beam groups' fold spans among them (a fire naming more is refused
+        // by name where the tables are staged); where each lane's rows lie
+        // is its entry of the lane rows (`PagesAt::rs`).
+        let rs = rs_page_tokens.map(|_| {
             let replay_cap = 8 * rows;
-            let pages_cap = (replay_cap + rows).div_ceil(u64::from(tokens.max(1))) + 2 * lanes;
             RsAt {
                 lanes: take(rs_lane_table_bytes(lanes)),
-                pages: take(pages_cap * 8),
-                pages_cap,
-                replay_tok: take(replay_cap * 4),
+                replay_spans: take(replay_cap * 4),
                 replay_cap,
                 folds: take(lanes * FOLD_BYTES),
                 folds_cap: lanes,
@@ -1545,13 +1547,11 @@ impl Inputs {
                 ));
             }
             (Some(tables), Some(at)) => {
-                if tables.pages.len() as u64 > at.pages_cap
-                    || tables.replay_tok.len() as u64 > at.replay_cap
-                {
+                if tables.replay_spans.len() as u64 > at.replay_cap {
                     return Err(crate::error::Fault::Ceiling {
-                        what: "rs buffer pages and replayed rows staged",
-                        need: (tables.pages.len() as u64).max(tables.replay_tok.len() as u64),
-                        have: at.pages_cap.min(at.replay_cap),
+                        what: "span words of the rows a fire's lanes replay",
+                        need: tables.replay_spans.len() as u64,
+                        have: at.replay_cap,
                     });
                 }
                 let mut lanes_tab = tables.lanes.to_vec();
@@ -1567,17 +1567,9 @@ impl Inputs {
                     )
                 };
                 put(at.lanes, raw, "staged rs lanes")?;
-                // SAFETY: plain integers, read as their bytes.
-                let pages = unsafe {
-                    core::slice::from_raw_parts(
-                        tables.pages.as_ptr().cast::<u8>(),
-                        tables.pages.len() * 8,
-                    )
-                };
-                put(at.pages, pages, "staged rs pages")?;
                 put(
-                    at.replay_tok,
-                    u32_bytes_of(tables.replay_tok),
+                    at.replay_spans,
+                    u32_bytes_of(tables.replay_spans),
                     "staged rs replay rows",
                 )?;
                 // Every entry, those past the fire's folds folding none: a
@@ -1599,7 +1591,7 @@ impl Inputs {
                     )
                 };
                 put(at.folds, raw, "staged beam group folds")?;
-                Some((tables.pages.len() as u32, tables.replay_tok.len() as u32))
+                Some(tables.replay_spans.len() as u32)
             }
         };
 
@@ -1917,7 +1909,7 @@ impl Inputs {
         }
 
         let rs = match (rs, rs_at) {
-            (Some((pages, toks)), Some(at)) => {
+            (Some(spans), Some(at)) => {
                 // A lane's whole `RsLane`, its extended-run place with it:
                 // a shorter copy leaves the last lanes' tails as an earlier
                 // fire staged them.
@@ -1925,13 +1917,13 @@ impl Inputs {
                     at.lanes,
                     rs_lane_table_bytes(u64::from(table_lanes.max(lanes))) as usize,
                 )?;
-                copy(at.pages, *pages as usize * 8)?;
-                copy(at.replay_tok, *toks as usize * 4)?;
+                copy(at.replay_spans, *spans as usize * 4)?;
                 copy(at.folds, (at.folds_cap * FOLD_BYTES) as usize)?;
                 Some(RsHandles {
                     lanes: base + at.lanes,
-                    pages: base + at.pages,
-                    replay_tok: base + at.replay_tok,
+                    pages: base + pages_at.bases,
+                    lane_rows: base + pages_at.rs,
+                    replay_spans: base + at.replay_spans,
                     folds: base + at.folds,
                     fold_entries: at.folds_cap as u32,
                 })
@@ -1969,7 +1961,7 @@ impl Inputs {
             &mut *store,
             *pages_at,
             &page_tables,
-            rs.as_ref().map(|handles| handles.pages),
+            rs.is_some(),
             pages,
             slot.at(),
         )?;

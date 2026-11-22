@@ -3,13 +3,15 @@
 //! by fire: widths 2, 4 and 8, a prompt ending mid-page and one ending on a
 //! page, parents with forks and retirements; and the state moved to another
 //! allocation mid-search (a suspend and restore of the instance's bytes),
-//! after which the search goes on identically.
+//! after which the search goes on identically. On a hybrid each beam's rs
+//! row lands, through its group's list as the step left it
+//! (`channel::RsRows`), on the set's row of the slot §11.1 names.
 #![cfg(feature = "cuda")]
 #![allow(unsafe_code)]
 
 use crate::common::Gpu;
 use engine::beam::{self, Fire, State};
-use kernels_cuda::runtime::channel::{self, BeamListRun, BeamRsRun, BeamStepRun};
+use kernels_cuda::runtime::channel::{self, BeamListRun, RsRows, BeamStepRun, RsLane, RsPlane, RsTables};
 
 const PAGE: u32 = 16;
 const FRAMES: u32 = 2;
@@ -37,14 +39,8 @@ impl Lcg {
     }
 }
 
-/// The slot address the synthetic rs translation gives the set's rs entry
-/// `e` (a hybrid's, `BEAM-PAGE-LISTS.md` §11).
-fn rs_base(e: u32) -> u64 {
-    0x7000_0000 + u64::from(e) * 0x100
-}
-
-/// Where a beam's rs page table starts in the fire's.
-const RS_FROM: u32 = 3;
+/// The bytes of a beam's rs row in the synthetic set.
+const RS_ROW: u32 = 4;
 
 /// The device id the synthetic translation gives pool page `q`.
 fn device_id(q: u32) -> i32 {
@@ -74,13 +70,16 @@ fn search_rs(gpu: &mut Gpu, lanes: u32, folded: u32, steps: u32, seed: u64, rs_t
     // A table each beam: its entries from `f0`, one row.
     let indices_at = gpu.up(&vec![-1i32; (lanes * cap) as usize]);
     let write_page_at = gpu.up(&vec![-1i32; lanes as usize]);
-    // An rs page table each beam (its run `RS_FROM` past the last's), and
-    // the set's rs entries' slot addresses, every slot of its reserve.
+    // The set's rs entries, every slot of its reserve, `rs_tokens` rows of
+    // `RS_ROW` bytes each, and their slot addresses.
     let rs_entries_set = ((f0 + reserve) * PAGE - rs_from_slot).div_ceil(rs_tokens);
-    let rs_span = RS_FROM + rs_entries_set;
-    let rs_pages_at = gpu.up(&vec![0u64; (lanes * rs_span) as usize]);
-    let rs_bases: Vec<u64> = (0..rs_entries_set).map(rs_base).collect();
+    let rs_entry_bytes = u64::from(rs_tokens * RS_ROW);
+    let rs_rows_at = gpu.up(&vec![0u32; (rs_entries_set * rs_tokens) as usize]);
+    let rs_bases: Vec<u64> = (0..rs_entries_set)
+        .map(|e| rs_rows_at + u64::from(e) * rs_entry_bytes)
+        .collect();
     let rs_bases_at = gpu.up(&rs_bases);
+    let indptr_at = gpu.up(&(0..=lanes).collect::<Vec<u32>>());
     let mut replay = State::new(lanes, cap, FRAMES);
     let mut rng = Lcg(seed);
     for t in 0..steps {
@@ -110,20 +109,20 @@ fn search_rs(gpu: &mut Gpu, lanes: u32, folded: u32, steps: u32, seed: u64, rs_t
             })
             .collect();
         let lists_at = gpu.up(&lists);
-        let rs_entries = (slot - rs_from_slot) / rs_tokens + 1;
-        let rs_runs: Vec<BeamRsRun> = (0..lanes)
-            .map(|b| BeamRsRun {
-                pages: rs_pages_at,
+        // A hybrid's beams' rs rows (§11.1): the step points each at its list.
+        let beams: Vec<RsRows> = (0..lanes)
+            .map(|b| RsRows {
+                list: state_at + u64::from(channel::BEAM_HEADER + b * cap) * 4,
                 bases: rs_bases_at,
-                lane: b,
-                from: b * rs_span + RS_FROM,
-                entries: rs_entries,
+                cap,
+                f0,
+                page: PAGE,
                 base: rs_from_slot,
                 tokens: rs_tokens,
                 bases_len: rs_entries_set,
             })
             .collect();
-        let rs_at = gpu.up(&rs_runs);
+        let beams_at = gpu.up(&beams);
         let run = BeamStepRun {
             state: state_at,
             parents: parents_at,
@@ -141,8 +140,7 @@ fn search_rs(gpu: &mut Gpu, lanes: u32, folded: u32, steps: u32, seed: u64, rs_t
             // The pages the engine stages: the lowest-free rule keeps every
             // page the step names below them, or a lane faults.
             backed: pool,
-            rs_count: lanes,
-            rs: rs_at,
+            rows: beams_at,
         };
         let run_at = gpu.up(&[run]);
         channel::beam_step(&ctx, run_at, 1).expect("beam_step launches");
@@ -192,23 +190,35 @@ fn search_rs(gpu: &mut Gpu, lanes: u32, folded: u32, steps: u32, seed: u64, rs_t
             assert_eq!(entries, &list[..], "{at}: beam {b}'s resolved entries");
             assert_eq!(writes[b], device_id(want.lists[b][c as usize]), "{at}: beam {b}'s write page");
         }
-        // A hybrid's rs page tables (§11), slot by slot: entry e (slot
-        // `base + e T`) holds the set's rows of slot (f0 + list[j]) S +
-        // slot mod S, its write page among them; entries on the frozen
-        // pages are left as staged.
-        let rs_resolved: Vec<u64> = gpu.down(rs_pages_at, (lanes * rs_span) as usize);
+        // A hybrid's rows (§11.1): each beam lands its row at this fire's
+        // slot through the list the step pointed it at, on the set's row of
+        // slot (f0 + list[j]) S + slot mod S.
+        let rs_lanes: Vec<RsLane> = (0..lanes)
+            .map(|b| RsLane {
+                at: slot - rs_from_slot,
+                replay: 0,
+                replay_off: 0,
+                page_off: RsLane::ROWS | b,
+                ext: 0,
+            })
+            .collect();
+        let rows: Vec<u32> = (0..lanes).map(|b| (t << 8) | b | 0x8000_0000).collect();
+        let tables = RsTables {
+            lanes: gpu.up(&rs_lanes),
+            pages: 0,
+            lane_rows: beams_at,
+            replay_spans: 0,
+            page_tokens: rs_tokens,
+        };
+        let plane = RsPlane { off: 0, stride: u64::from(RS_ROW) };
+        channel::rs_scatter(&ctx, gpu.up(&rows), RS_ROW, indptr_at, lanes, tables, plane)
+            .expect("rs_scatter launches");
+        gpu.sync();
+        let landed: Vec<u32> = gpu.down(rs_rows_at, (rs_entries_set * rs_tokens) as usize);
         for b in 0..lanes as usize {
-            let at_b = b * rs_span as usize + RS_FROM as usize;
-            for e in 0..rs_entries {
-                let s = rs_from_slot + e * rs_tokens;
-                let want_rs = if s < f0 * PAGE {
-                    0
-                } else {
-                    let q = want.lists[b][(s / PAGE - f0) as usize];
-                    rs_base(((f0 + q) * PAGE + s % PAGE - rs_from_slot) / rs_tokens)
-                };
-                assert_eq!(rs_resolved[at_b + e as usize], want_rs, "{at}: beam {b}'s rs entry {e}");
-            }
+            let q = want.lists[b][c as usize];
+            let sigma = (f0 + q) * PAGE + slot % PAGE - rs_from_slot;
+            assert_eq!(landed[sigma as usize], rows[b], "{at}: beam {b}'s rs row");
         }
     }
 }
@@ -258,8 +268,7 @@ fn a_parent_past_the_group_faults_its_lane() {
             list_count: 0,
             frames: FRAMES,
             backed: reserve,
-            rs_count: 0,
-            rs: 0,
+            rows: 0,
         };
         let run_at = gpu.up(&[run]);
         channel::beam_step(&ctx, run_at, 1).expect("beam_step launches");

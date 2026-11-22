@@ -24,26 +24,31 @@ const FILE: &str = "ssm/mixers.hip";
 pub struct Carry {
     pub lanes: u64,
     pub pages: u64,
-    pub replay_tok: u64,
+    pub replay_spans: u64,
     pub commit_len: u64,
     pub plane_off: [u64; 4],
     pub plane_stride: [u64; 4],
     pub page_tokens: u32,
     pub pad: u32,
+    /// The fire's beams' rows ([`crate::runtime::channel::RsRows`]), a
+    /// fire lane each, read by a lane whose page offset names one
+    /// ([`crate::runtime::channel::RsLane::ROWS`]); 0 where no lane is a beam.
+    pub lane_rows: u64,
 }
 
-const _: () = assert!(size_of::<Carry>() == 104);
+const _: () = assert!(size_of::<Carry>() == 112);
 
 impl Carry {
     pub const NONE: Carry = Carry {
         lanes: 0,
         pages: 0,
-        replay_tok: 0,
+        replay_spans: 0,
         commit_len: 0,
         plane_off: [0; 4],
         plane_stride: [0; 4],
         page_tokens: 1,
         pad: 0,
+        lane_rows: 0,
     };
 
     /// The kernels' argument.

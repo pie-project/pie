@@ -1778,12 +1778,24 @@ const LAGGED_STEPS: u32 = 30;
 /// none. `lag` 0 folds each row as it lands. Each step's logits, and the
 /// fires of the decodes walked with no body.
 fn served_lagged(fixture: &Fixture, cache: &Path, lag: u32) -> (Vec<Vec<f32>>, u64) {
+    served_lagged_over(fixture, cache, lag, TOKENS, LAGGED_STEPS)
+}
+
+/// [`served_lagged`] on a load whose fires take `tokens` rows, over
+/// `decodes` decodes.
+fn served_lagged_over(
+    fixture: &Fixture,
+    cache: &Path,
+    lag: u32,
+    tokens: u32,
+    decodes: u32,
+) -> (Vec<Vec<f32>>, u64) {
     use engine::fire::{FoldLen, RsVerb};
     let mut shell = Shell::load(Boot {
         trace: fixture.trace.clone(),
         contract: &fixture.contract,
         checkpoint: &fixture.container,
-        budget: Budget::new(1, TOKENS),
+        budget: Budget::new(1, tokens),
         patches: None,
         voxels: None,
         page_size: PAGE,
@@ -1842,7 +1854,7 @@ fn served_lagged(fixture: &Fixture, cache: &Path, lag: u32) -> (Vec<Vec<f32>>, u
     };
     step(&mut shell, &prompt, rs);
     let before = shell.body_stats().tally;
-    for at in 0..LAGGED_STEPS {
+    for at in 0..decodes {
         let token = (fed * 7 + 11) % 1000;
         if lag == 0 {
             step(&mut shell, &[token], RsVerb::Fold);
@@ -1944,6 +1956,55 @@ fn golden_lagged() {
         );
         assert_eq!(unbodied, 0, "a lagged decode walked with no body");
     }
+}
+
+/// A lane alone on its set carrying more rows unfolded than nine of its
+/// fires' widths (the most a per-fire page table held) answers what the
+/// folding lane answers, to the tolerance of [`golden_lagged`]: its rows
+/// resolve through its own pages on the device, whatever it carries.
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_lagged_past_the_fire() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    const FIRE: u32 = 64;
+    const STEPS: u32 = 9 * FIRE + 40;
+    let cache = cache_dir();
+    let model = buffered_model();
+    let fixture = fixture(&model, &cache);
+    let (folded, _) = served_lagged_over(&fixture, &cache, 0, FIRE, STEPS);
+    let (lagged, unbodied) = served_lagged_over(&fixture, &cache, STEPS + 8, FIRE, STEPS);
+    assert_eq!(lagged.len(), folded.len());
+    let mut worst = 0f32;
+    let mut flips = 0usize;
+    for (lagged, folded) in lagged.iter().zip(&folded) {
+        let scale = folded.iter().fold(0f32, |most, v| most.max(v.abs()));
+        let apart = lagged
+            .iter()
+            .zip(folded)
+            .fold(0f32, |most, (a, b)| most.max((a - b).abs()));
+        worst = worst.max(apart / scale.max(f32::MIN_POSITIVE));
+        if argmax(lagged) != argmax(folded) {
+            let mut sorted = folded.clone();
+            sorted.sort_by(|x, y| y.total_cmp(x));
+            if (sorted[0] - sorted[1]) / scale.max(f32::MIN_POSITIVE) > 0.02 {
+                flips += 1;
+            }
+        }
+    }
+    println!(
+        "golden {model}-lagged past the fire: {} steps carrying up to {} rows on {FIRE}-row \
+         fires, logits apart by {worst:e} of their scale, {flips} flipped, {unbodied} unbodied",
+        lagged.len(),
+        STEPS + 4
+    );
+    assert!(
+        worst < 0.05 && flips == 0,
+        "carrying past the fire the lane's logits lie {worst:e} of their scale from the folded \
+         lane's, {flips} greedy token(s) flipped"
+    );
 }
 
 /// Decode steps the pace probe times a schedule.

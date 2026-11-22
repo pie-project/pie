@@ -434,6 +434,10 @@ const _: () = assert!(size_of::<RsLane>() == 20);
 
 impl RsLane {
     pub const NONE: u32 = u32::MAX;
+    /// A [`RsLane::page_off`] with this bit names the lane's entry of the
+    /// fire's lane rows ([`RsTables::lane_rows`], [`RsRows`]) in its low bits:
+    /// its rows resolve on the device, and it stages no pages.
+    pub const ROWS: u32 = 0x8000_0000;
 
     /// A lane that lands no rows and replays none.
     pub const INERT: RsLane = RsLane {
@@ -452,7 +456,10 @@ impl RsLane {
 pub struct RsTables {
     pub lanes: DevicePtr,
     pub pages: DevicePtr,
-    pub replay_tok: DevicePtr,
+    /// The fire's beams' rows ([`RsRows`]), a fire lane each: a lane whose
+    /// [`RsLane::page_off`] carries [`RsLane::ROWS`] reads its rows there.
+    pub lane_rows: DevicePtr,
+    pub replay_spans: DevicePtr,
     /// The rows a page holds.
     pub page_tokens: u32,
 }
@@ -494,6 +501,7 @@ pub fn rs_scatter(
             ArgValue::U32(lanes_stated),
             ArgValue::Ptr(tables.lanes),
             ArgValue::Ptr(tables.pages),
+            ArgValue::Ptr(tables.lane_rows),
             ArgValue::U32(tables.page_tokens),
             ArgValue::Usize(plane.off),
             ArgValue::Usize(plane.stride),
@@ -571,7 +579,8 @@ pub fn rs_ext_gather(
             ArgValue::U32(lanes_stated),
             ArgValue::Ptr(tables.lanes),
             ArgValue::Ptr(pages),
-            ArgValue::Ptr(tables.replay_tok),
+            ArgValue::Ptr(tables.lane_rows),
+            ArgValue::Ptr(tables.replay_spans),
             ArgValue::U32(tables.page_tokens.max(1)),
             ArgValue::Usize(at.off),
             ArgValue::Usize(at.stride),
@@ -730,31 +739,34 @@ pub struct BeamListRun {
 
 const _: () = assert!(size_of::<BeamListRun>() == 40);
 
-/// A lane's rs page table [`beam_step`] resolves over its group's list, on a
-/// hybrid (`BEAM-PAGE-LISTS.md` §11; `channel.hip`'s `BeamRsRun`): its
-/// `entries` entries from `from`, entry e holding the `tokens` rows of slots
-/// `base + e * tokens` on, each resolved to the set's entry (`bases`, from
-/// its entry 0, `bases_len` of them) holding the same rows of its beam's
-/// list's page.
+/// Where a lane's buffered rows lie (`runtime/rs_rows.hip`'s `RsRows`), resolved row
+/// by row on the device, so a fire stages no entry a row whatever its lanes
+/// carry: buffer token `tok` (slot `base + tok`) is the row of slot `σ` on
+/// entry `(σ - base) / tokens` of `bases` (`bases_len` of them), row
+/// `(σ - base) mod tokens`. A lane alone on its set reads its own pages
+/// (`list` 0, `σ` the slot). A beam on a hybrid (`BEAM-PAGE-LISTS.md` §11.1)
+/// reads its set's through its row of its group's list, which [`beam_step`]
+/// points `list` at (`cap` columns): `σ = (f0 + list[slot / page - f0]) page
+/// + slot mod page`, a slot below `f0 page` the set's own.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct BeamRsRun {
-    pub pages: DevicePtr,
+pub struct RsRows {
+    pub list: DevicePtr,
     pub bases: DevicePtr,
-    pub lane: u32,
-    pub from: u32,
-    pub entries: u32,
+    pub cap: u32,
+    pub f0: u32,
+    pub page: u32,
     pub base: u32,
     pub tokens: u32,
     pub bases_len: u32,
 }
 
-const _: () = assert!(size_of::<BeamRsRun>() == 40);
+const _: () = assert!(size_of::<RsRows>() == 40);
 
 /// A beam's rs copy (`BEAM-PAGE-LISTS.md` §6.4 on a hybrid, `channel.hip`'s
 /// `RsCopyRun`): the `[src, dst, tokens]` its group's step left at `copy`,
 /// moved row by row of each plane through the set's rs entries (`bases`,
-/// as [`BeamRsRun`]'s); slots below the buffer have no row.
+/// as [`RsRows`]'s); slots below the buffer have no row.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RsCopyRun {
@@ -829,9 +841,9 @@ pub struct BeamStepRun {
     /// names lies below them (the lowest-free rule), and one that does not
     /// faults its lane.
     pub backed: u32,
-    /// Its lanes' rs page tables (a hybrid's, §11), `rs_count` of them.
-    pub rs_count: u32,
-    pub rs: DevicePtr,
+    /// Its beams' rs rows on a hybrid ([`RsRows`], a beam each), which the
+    /// step points at their lists as it leaves them; 0 off a hybrid.
+    pub rows: DevicePtr,
 }
 
 const _: () = assert!(size_of::<BeamStepRun>() == 88);
@@ -844,12 +856,17 @@ pub const PAGES_PARENT: u32 = 5;
 /// unreachable: a bug where it happens).
 pub const PAGES_EXHAUSTED: u32 = 6;
 
+/// The u32 words of a group's state header (primed, fires run, the pool's
+/// pages at the last fire, the common slot), before its lists
+/// (`PIE_BEAM_HEADER`).
+pub const BEAM_HEADER: u32 = 4;
+
 /// The u32 words a group of `lanes` beams keeps for lists of `cap` columns
 /// over `cap` pool pages and `frames` pending rings
 /// (`channel.hip`'s state layout).
 #[must_use]
 pub const fn beam_state_words(lanes: u32, cap: u32, frames: u32) -> u64 {
-    4 + 2 * lanes as u64 * cap as u64
+    BEAM_HEADER as u64 + 2 * lanes as u64 * cap as u64
         + cap as u64
         + frames as u64 * cap as u64
         + 3 * lanes as u64
@@ -859,7 +876,7 @@ pub const fn beam_state_words(lanes: u32, cap: u32, frames: u32) -> u64 {
 /// The state words where a group's copies for this fire lie.
 #[must_use]
 pub const fn beam_copies_word(lanes: u32, cap: u32, frames: u32) -> u64 {
-    4 + 2 * lanes as u64 * cap as u64 + cap as u64 + frames as u64 * cap as u64
+    BEAM_HEADER as u64 + 2 * lanes as u64 * cap as u64 + cap as u64 + frames as u64 * cap as u64
 }
 
 const BEAM_BLOCK: u32 = 256;
