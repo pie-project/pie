@@ -236,7 +236,12 @@ fn a_state_model_serves_the_cuda_reference() {
                     None => 0.0,
                 };
                 let same = mine[0].0 == want[0].0;
-                let tie = !same && (mine[0].1 - row[want[0].0 as usize]) <= gap;
+                // XLA's pick one of the reference's tokens tied at its top
+                // logit, or within the reference's top-2 gap of it
+                let tied = want
+                    .iter()
+                    .any(|&(id, l)| id == mine[0].0 && l == want[0].1);
+                let tie = !same && (tied || (mine[0].1 - row[want[0].0 as usize]) <= gap);
                 let worst = want
                     .iter()
                     .map(|&(id, l)| (row[id as usize] - l).abs())
