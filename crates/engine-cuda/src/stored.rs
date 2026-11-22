@@ -42,6 +42,17 @@ impl Keys {
         Keys { on, codes }
     }
 
+    /// Every kernel library's code, as one line.
+    #[must_use]
+    pub fn codes_said(&self) -> String {
+        let codes: Vec<String> = self
+            .codes
+            .iter()
+            .map(|(name, code)| format!("{name} {code:#010x}"))
+            .collect();
+        codes.join(", ")
+    }
+
     /// What measured `what` (a `[rates]` key) on this build: its method and
     /// each kernel it fires with its code; `None` where no method of this
     /// build measures it.
