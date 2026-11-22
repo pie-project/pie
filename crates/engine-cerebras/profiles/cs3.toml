@@ -1,5 +1,8 @@
 api = 1
 
+[target]
+assumes = { system = "cs3" }
+
 # The CS-3's calibration: the cost model's per-unit cycles and rates (kernels-cerebras
 # `tuning`). The decode rates are fitted to the chip's `TSTAMP:1` phase stamps and bare decode
 # steps (each layer kind's own cost by least squares over them); the stream, GEMM and tiled

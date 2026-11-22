@@ -15,6 +15,7 @@ path = "src/lib.rs"
 [dependencies]
 dtype = { package = "pie-dtype", path = "../dtype" }
 kernels-cerebras = { path = "../kernels-cerebras" }
+profile = { package = "pie-profile", path = "../profile" }
 libloading = "0.9"
 libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }

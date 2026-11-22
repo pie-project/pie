@@ -3,7 +3,7 @@
 
 use std::sync::{LazyLock, OnceLock};
 
-use profile::{Decision, Profile, Registry};
+use profile::{Decision, Domain, Facts, Profile, Registry, Var};
 
 macro_rules! costs {
     ($($ty:ident, $field:ident = $id:literal, $default:literal, $doc:literal;)*) => {
@@ -155,8 +155,11 @@ costs! {
         "Cycles a hop of a K / V round trip.";
 }
 
+/// The facts a profile assumes: the system it calibrates.
+pub const FACTS: &[Var] = &[Var::fixed("system", Domain::Enum(&["cs3"]))];
+
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
-    let mut r = Registry::new("cerebras", &[], &[]);
+    let mut r = Registry::new("cerebras", FACTS, &[]);
     register(&mut r);
     r
 });
@@ -165,6 +168,12 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
 #[must_use]
 pub fn registry() -> &'static Registry {
     &REGISTRY
+}
+
+/// A CS-3's facts.
+#[must_use]
+pub fn cs3() -> Facts {
+    Facts::of(registry()).word("system", "cs3")
 }
 
 /// The calibration profile file `text` states (`origin` names it), the rest at the defaults.
