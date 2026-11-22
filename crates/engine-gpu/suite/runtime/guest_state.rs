@@ -8,6 +8,7 @@
 use engine::ChannelId;
 use engine::Engine;
 use engine::channel::ChannelRegistration;
+use engine::chunk::Evacuation;
 use engine::fire::{Attachment, FrameSubmission, InputFeed, Lane, Readout, Step};
 use engine::program::{BindExtents, InstanceBinding, InstanceId, Rebind, ScratchPlace};
 use engine_gpu::backend::Buffer as _;
@@ -52,6 +53,17 @@ fn bind_in(
     first: u64,
     room: Option<&InstanceBinding>,
 ) -> (InstanceId, Vec<ChannelId>, InstanceBinding) {
+    try_bind_in(engine, slots, program, first, room).expect("the instance binds")
+}
+
+/// [`bind_in`], its refusal returned.
+fn try_bind_in(
+    engine: &mut backend::Engine,
+    slots: &mut Slots,
+    program: engine::program::ProgramId,
+    first: u64,
+    room: Option<&InstanceBinding>,
+) -> engine::Result<(InstanceId, Vec<ChannelId>, InstanceBinding)> {
     let channels: Vec<ChannelId> = [
         (vec![1, 1], EtaDtype::I32, HostRole::Reader),
         (vec![LAYERS, WIDTH], EtaDtype::F32, HostRole::Reader),
@@ -100,17 +112,14 @@ fn bind_in(
         },
         None => binding,
     };
-    let instance = engine
-        .bind_instance(&binding)
-        .expect("the instance binds")
-        .id;
+    let instance = engine.bind_instance(&binding)?.id;
     assert!(
         engine
             .publish_channel(instance, 2, &T.to_le_bytes())
             .expect("the timestep publishes"),
         "the ring had room"
     );
-    (instance, channels, binding)
+    Ok((instance, channels, binding))
 }
 
 /// One step: lane `k` reads token `tokens[k]` last and feeds instance
@@ -413,6 +422,108 @@ fn an_unparked_guest_serves_on_from_fresh_room_with_nothing_copied() {
             ids,
             [argmax(&planes, token)],
             "a pass after the unpark reads token {token}'s row"
+        );
+    }
+    drop(engine);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An evacuation under a kept park (`Rebind::Parked { kept: true }`):
+/// instance A parks with its tables kept in place, and the chunk holding
+/// them moves onto a free one. A's claim moves with them: an instance bound
+/// at A's own refs (now the new bytes) is refused by name, and one bound in
+/// the chunk now lying on A's old bytes binds and serves. A's unpark
+/// rebinds it at the same refs and it reads its tables as before the move.
+/// Unmoved, A's claim would stand on the old bytes: the first bind would
+/// pass over A's tables and the second be refused on a stale claim.
+#[test]
+fn an_evacuation_moves_a_kept_park_s_claim_and_tables() {
+    let Some((loaded, program, mut slots, t_input)) = setup("guest-state-kept-evac", 4) else {
+        return;
+    };
+    let chunk_bytes = loaded.caps.caps.chunks.chunk_bytes;
+    let Loaded {
+        mut engine,
+        trace,
+        planes,
+        dir,
+        ..
+    } = loaded;
+    let state = engine
+        .guest_state(program, &EXTENTS, GeometryClass::Host)
+        .expect("the program's guest state");
+    let word = trace.facts.word(&Request::new(ROWS, false));
+    let per_chunk = slots.instance.expect("an Instance shape").per_chunk;
+    // Room an instance's state and its pair's take, nobody's yet.
+    let fresh = |slots: &mut Slots, pair_generation: u64, base: &InstanceBinding| InstanceBinding {
+        scratch: slots.state(state.instance_bytes(), state.run),
+        pair: slots.state(state.per_pair, state.run),
+        pair_generation,
+        ..base.clone()
+    };
+
+    let (a, a_channels, a_binding) = bind(&mut engine, &mut slots, program, 1);
+    let a_bound = [(a, a_channels)];
+    let ids = fire(&mut engine, word, t_input, &a_bound, &[5]);
+    assert_eq!(ids, [argmax(&planes, 5)], "A's pass reads its row");
+
+    engine
+        .rebind_slots(Rebind::Parked { id: a, kept: true })
+        .expect("A parks, its tables kept in place");
+    // A's tables' chunk onto a chunk nothing holds: the chunk that lay
+    // there takes the bytes A's tables left.
+    let tables = a_binding.instance_slots[0] / per_chunk;
+    let ScratchPlace::Chunks { pieces, .. } = slots.state(chunk_bytes, 1) else {
+        panic!("a whole chunk of room");
+    };
+    let onto = pieces[0];
+    assert_ne!(tables, onto);
+    engine
+        .evacuate(&Evacuation {
+            moves: vec![(tables, onto)],
+        })
+        .expect("the chunk moves under the kept park");
+
+    // At A's own refs, the new bytes: A's.
+    let at_a = fresh(&mut slots, 4, &a_binding);
+    let why = try_bind_in(&mut engine, &mut slots, program, 4, Some(&at_a))
+        .expect_err("an instance at A's refs overlaps A's kept tables where they moved");
+    assert!(
+        why.to_string().contains("would overlap"),
+        "refused by name as an overlap: {why}"
+    );
+    // In the chunk now lying on A's old bytes: free of A.
+    let displaced = InstanceBinding {
+        instance_slots: a_binding
+            .instance_slots
+            .iter()
+            .map(|&slot| onto * per_chunk + slot % per_chunk)
+            .collect(),
+        ..fresh(&mut slots, 5, &a_binding)
+    };
+    let (b, b_channels, _) = try_bind_in(&mut engine, &mut slots, program, 7, Some(&displaced))
+        .expect("B binds on the bytes A's tables left, no stale claim");
+    let ids = fire(&mut engine, word, t_input, &[(b, b_channels)], &[9]);
+    assert_eq!(ids, [argmax(&planes, 9)], "B serves from A's old bytes");
+
+    let unparked = fresh(&mut slots, 6, &a_binding);
+    engine
+        .rebind_slots(Rebind::Instance {
+            id: a,
+            instance: a_binding.instance_slots.clone(),
+            rings: Vec::new(),
+            adapter: Vec::new(),
+            scratch: unparked.scratch,
+            pair: unparked.pair,
+            pair_generation: unparked.pair_generation,
+        })
+        .expect("A's unpark claims its moved tables");
+    for token in [5, 2] {
+        let ids = fire(&mut engine, word, t_input, &a_bound, &[token]);
+        assert_eq!(
+            ids,
+            [argmax(&planes, token)],
+            "A reads its tables as before the move: token {token}'s row"
         );
     }
     drop(engine);
