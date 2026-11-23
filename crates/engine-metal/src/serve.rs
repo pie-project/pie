@@ -5501,10 +5501,15 @@ impl Shell {
                 &|source| lanes[source].translation.to_vec(),
                 &|source| lanes[source].folded,
                 &mut |refs| {
-                    for &page in refs {
+                    // The group's translation names slot refs (logical):
+                    // translated through the chunk table first, then each
+                    // physical page admitted. Admitting the refs themselves
+                    // checked the wrong chunk once an evacuation moved one.
+                    let ids = pools.kv_pages(refs, None)?;
+                    for &page in &ids {
                         pools.admit_list_page(page)?;
                     }
-                    Ok((pools.kv_pages(refs, None)?, pools.kv_page_addresses(refs)?))
+                    Ok((ids, pools.kv_page_addresses(refs)?))
                 },
             )?
         };
