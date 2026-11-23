@@ -1092,6 +1092,11 @@ impl Shell {
         let mut rs_ends: Vec<Option<u32>> = vec![None; lanes.len()];
         let mut rs_lens: Vec<i32> = Vec::with_capacity(lanes.len());
         let mut rs_order: Vec<u32> = vec![0; lanes.len()];
+        // Each seat's lane, and where its rings stand and how far its fire
+        // folds them (`super::ring`), a seat each.
+        let mut seat_sources: Vec<usize> = Vec::with_capacity(lanes.len());
+        let mut window_folds: Vec<Option<(u32, u32)>> = Vec::with_capacity(lanes.len());
+        let ringed_load = self.pools.ring().is_some();
         let mut snapshots = crate::store::rs::SnapTable {
             indptr: vec![0],
             ..Default::default()
@@ -1290,6 +1295,30 @@ impl Shell {
             let fire_lane = rs_moves.len();
             rs_order[row.source as usize] = fire_lane as u32;
             let port = envelope_of[source].and_then(|(held, _)| resolved[held].fold.as_deref());
+            // The lane's rings: folded where its runtime states, or where a
+            // fold counted on the device not yet settled left them, and
+            // advanced by the fold its fire states (CONTRACT-BC 21).
+            seat_sources.push(source);
+            window_folds.push(match &seated.window_fold {
+                Some(stated) if ringed_load => {
+                    let slot = seated.rs_slot.unwrap_or(lane.slot);
+                    let held = fold_held(
+                        &mut self.rs_ahead,
+                        slot,
+                        Some(seated.folded),
+                        seated.rs_reset == RsReset::Fresh,
+                    );
+                    let cell = envelope_of[source].map_or(rs_moves.len(), |(_, at)| at);
+                    let to = held
+                        .saturating_add(stated_fold(stated.fold, cell, port)?)
+                        .min(have + row.rows);
+                    if stated.fold == FoldLen::Device && matches!(seated.rs, RsVerb::Fold) {
+                        self.rs_ahead.insert(slot, to);
+                    }
+                    Some((held, to - held))
+                }
+                _ => None,
+            });
             let (verb, folded) = match &seated.rs {
                 RsVerb::Fold => {
                     // A lane that folds its rows itself leaves nothing ahead:
@@ -1587,9 +1616,9 @@ impl Shell {
                 .ring()
                 .map_or(0, |(_, ring)| ring.page_bytes);
             let planes = self.pools.ring_planes();
-            let keys: Vec<u32> = lanes
+            let keys: Vec<u32> = seat_sources
                 .iter()
-                .map(|seated| seated.rs_slot.unwrap_or(seated.lane.slot))
+                .map(|&source| lanes[source].rs_slot.unwrap_or(lanes[source].lane.slot))
                 .collect();
             let mut null = [0i32];
             self.pools.page_ids(1, &mut null)?;
@@ -1597,24 +1626,15 @@ impl Shell {
             let mut own_next = 0u32;
             let mut composed_tables: Vec<Vec<u32>> = Vec::with_capacity(seats.len());
             for (lane, seat) in seats.iter().enumerate() {
-                let seated = &lanes[lane];
+                let seated = &lanes[seat_sources[lane]];
                 if kv_less_seats[lane] {
                     composed_tables.push(tables[lane].to_vec());
                     continue;
                 }
-                let (base, folded, fold) = match &seated.window_fold {
-                    Some(stated) => {
-                        let engine::fire::FoldLen::Host(fold) = stated.fold else {
-                            return Err(Fault::Unbound {
-                                what: "a windowed lane's fold counted on the device, which \
-                                       this engine's rings do not fold yet"
-                                    .into(),
-                            });
-                        };
-                        (stated.base, seated.folded, fold)
-                    }
+                let (base, folded, fold) = match (&seated.window_fold, window_folds[lane]) {
+                    (Some(stated), Some((folded, fold))) => (stated.base, folded, fold),
                     // A runtimeless lane folds every row it writes.
-                    None => {
+                    _ => {
                         let base = seat.have / page * page;
                         (base, seat.have, seat.rows)
                     }
