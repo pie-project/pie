@@ -226,3 +226,46 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
     `rows_ext(max_tokens)` rows, compact (a decoding lane's rows never take it); engine-gpu and XLA own T, carried
     T, no slot (their replay lies in the rung's own rooms). `FireLimits.replayed_rows` stays the step's bound on
     every lane's replayed rows.
+24. **The step compositions a load is sent are stated at load, one function computes them (`engine::shapes`).**
+    The runtime states its step builder's rules in the load request (`LoadRequest.steps: StepRules { kinds:
+    [Decode, Mixed, Prefill], treatments: [Folds, Buffers] }`, `StepRules::runtime()`); over the facts the load
+    states of itself (`StepFacts::stated(caps, readouts)`: the rungs of `ChunkFacts.act_chunks` up to the
+    first holding `max_tokens` (one fire's tokens where none is stated), `max_lanes`, `max_tokens`,
+    `ReadoutFacts::fire_rows(max_readouts)`, whether a shape is the rs list, and the attachments it serves), `StepShapes::of(rules, facts)`
+    is the finite set of compositions the builder can form: per rung, per kind (decode lanes only, prompt lanes
+    only, both) and per treatment (every lane folding, or any lane buffering, a decode lane beside a prompt
+    included; buffered only where the load has an rs list), a `StepShape { rung, kind, treatment, rows,
+    decode_lanes, prompt_lanes, prompt_rows, lane_rows, readout_rows, attachments }` of inclusive spans. A decode
+    lane takes one row, a prompt lane two or more; the prompt rows split across the prompt lanes in any way with
+    each lane in `lane_rows` (uneven splits such as [10, 6] and odd lane counts occur at any rung: the builder
+    joins whole members as they come); readout rows are the sequence lanes' (a kv-less lane's land through the
+    readout landing). `attachments: Attachments { mask, adapter, inputs, snapshots, tap, float }` are what the
+    shape's lanes may carry, in any subset on any lane (`Attachments::served(has_lora, inputs declared,
+    rs_snapshots > 0)`: a mask, a tap and a float lane always); an engine whose bodies key on one records the
+    shape with and without it, so a lattice built from plain requests alone is a gap. Lane-word classes are no
+    part of a shape (an engine crosses its classes with each). A folded shape's
+    rows run from past the rung below to its own; a buffered one's from one (its rung holds its carried rows,
+    `fire::rung_holds`). The set is ordered smallest first across kinds: by rung, then decode, mixed, prompt, then
+    folded before buffered.
+    - **Where it is computed.** The engine computes it once its lattice is fixed and before its arm walk, walks it
+      in its order, and states it with those it runs eager (`Capabilities.steps: StatedSteps { shapes, eager }`).
+      The runtime computes it again from the stated facts at bootstrap and refuses a load whose stated set is
+      another by name (`StatedSteps::agrees`). No setter: nothing changes the set after ready.
+    - **The allowance split.** The runtime owns the set and its order; the engine owns its measured allowance.
+      The engine records each shape's bodies in the set's order while they fit, and states the shapes whose bodies
+      do not fit eager at load (`eager`, indices; under smallest-first the tail of the order). An eager shape still
+      fires, uncaptured and tallied (`live::Tally::Eager`), never refused. A shape is left unstated by no engine.
+    - **The builder forms nothing outside it.** `StepGroup::accepts` takes a member only where the step with it
+      stays in the set (`StepShapes::shape_of`), else it goes in a later step; a lone member outside the set is
+      refused at admission by name (the builder cuts no member). Under the contract check (debug builds or
+      `PIE_CHECK_REPLAY`, `shapes::check_on`), every step formed is checked, a gap failing with the composition and
+      the nearest stated shapes (`StepGap`).
+    - **Engines, interim.** Each engine computes and states the set after its walk and says what it does with it:
+      CUDA names each shape whose padded buckets its lattice walk records no body of that kind and treatment for
+      (`Shell::walk_gaps`; today mixed and wide targets are folded only, so buffered mixed shapes are named); Metal,
+      engine-gpu (Vulkan, wgpu), XLA log the set and that their walks do not key on it yet; Cerebras computes it and
+      records no bodies. Each walk then takes its targets from the set in its own branch: CUDA records the buffered
+      treatment of mixed / wide targets; Metal arms each readout-row tier inside a shape's `readout_rows` at its
+      rung; engine-gpu records each shape before ready (sc/gpu-arm-before-ready); XLA lays its warm ladder from it
+      (its laid mixed rungs, `Capabilities.mixed_lanes`, are narrower than the set's mixed shapes, so it states those
+      it cannot lay eager).

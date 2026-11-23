@@ -1414,6 +1414,66 @@ impl Shell {
         })
     }
 
+    /// The shapes of the load's stated step set (`engine::StepShapes`) the
+    /// lattice walk records no body for, each named with the buckets it
+    /// leaves unwalked: for every shape, each bucket its rows pad to needs a
+    /// target of its kind (a wide target counted by its lanes' rows) and
+    /// treatment (folds, or any treatment that buffers). The interim stub
+    /// of CONTRACT-BC 24: the walk does not take its targets from the set
+    /// yet, so a gap here is a composition serving would fire eager.
+    pub(crate) fn walk_gaps(&self, shapes: &engine::StepShapes) -> Vec<String> {
+        use engine::{StepKind, Treatment as Rs};
+        let Some(lattice) = self.lattice_targets() else {
+            return shapes
+                .shapes
+                .iter()
+                .map(|shape| format!("{shape}: the load walks no lattice"))
+                .collect();
+        };
+        let kind_of = |target: &BodySynth| match target {
+            BodySynth::Decode { .. } => Some(StepKind::Decode),
+            BodySynth::Prefill { .. } => Some(StepKind::Prefill),
+            BodySynth::Mixed { .. } => Some(StepKind::Mixed),
+            BodySynth::Wide { lanes } => {
+                let decodes = lanes.iter().any(|&(_, rows)| rows <= 1);
+                let prompts = lanes.iter().any(|&(_, rows)| rows > 1);
+                Some(match (decodes, prompts) {
+                    (true, true) => StepKind::Mixed,
+                    (false, true) => StepKind::Prefill,
+                    _ => StepKind::Decode,
+                })
+            }
+            BodySynth::Tower { .. } | BodySynth::Idle => None,
+        };
+        let walked: std::collections::HashSet<(StepKind, bool, u32)> = lattice
+            .targets
+            .iter()
+            .filter_map(|(bucket, target, treatment)| {
+                Some((kind_of(target)?, treatment.rs.buffers(), *bucket))
+            })
+            .collect();
+        let buckets = &self.budget.buckets;
+        let padded = |rows: u32| self.bucket_for(rows).unwrap_or_else(|| buckets.last().copied().unwrap_or(rows));
+        shapes
+            .shapes
+            .iter()
+            .filter_map(|shape| {
+                let buffers = shape.treatment == Rs::Buffers;
+                let (from, to) = (padded(shape.rows.lo), padded(shape.rows.hi));
+                let needed: Vec<u32> = if buckets.is_empty() {
+                    (from..=to).collect()
+                } else {
+                    buckets.iter().copied().filter(|&b| from <= b && b <= to).collect()
+                };
+                let missing: Vec<u32> = needed
+                    .into_iter()
+                    .filter(|&bucket| !walked.contains(&(shape.kind, buffers, bucket)))
+                    .collect();
+                (!missing.is_empty()).then(|| format!("[{shape}] buckets {missing:?} unwalked"))
+            })
+            .collect()
+    }
+
     /// The scratch slabs this load's fires take: each composition of the
     /// lattice fired once, size-only (`crate::sizing`), in arming's order.
     /// Nothing launches, copies or commits; the slabs are laid at what the

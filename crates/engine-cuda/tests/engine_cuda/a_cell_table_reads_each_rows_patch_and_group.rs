@@ -183,6 +183,7 @@ fn a_cell_table_reads_each_rows_patch_and_group() {
             },
             ordinal: 0,
             frames_in_flight: 1,
+            steps: Default::default(),
         })
         .expect("the cell plan loads");
     let mut guest = crate::guest::Guest::on(&mut engine, &loaded.caps.chunks);

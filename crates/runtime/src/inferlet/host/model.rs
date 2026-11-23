@@ -221,6 +221,7 @@ mod tests {
             max_readouts: 0,
             readout_store: 0,
             max_replayed_rows: 0,
+            shapes: None,
             max_forward_requests: 8,
             max_forward_tokens,
             max_page_refs: 64,

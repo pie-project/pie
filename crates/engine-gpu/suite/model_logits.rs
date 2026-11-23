@@ -708,6 +708,7 @@ fn a_served_hybrid_load_lays_the_seats_its_own_fires_take() {
             residency,
             ordinal: 0,
             frames_in_flight: 1,
+            steps: Default::default(),
         })
         .unwrap_or_else(|why| panic!("the served load lays the seats its pool holds: {why}"));
     let shell = engine.loaded().expect("the shell stands");

@@ -747,6 +747,7 @@ fn scores_rig() -> Option<ScoresRig> {
             },
             ordinal: 0,
             frames_in_flight: 1,
+            steps: Default::default(),
         })
         .expect("the miniature loads");
     let decls = output_decls(&loaded);

@@ -135,6 +135,7 @@ impl Engine for Spatial {
             residency,
             ordinal: _,
             frames_in_flight: _,
+            steps,
         } = request;
         // The program keeps one sequence's cache and every lane's as host
         // tokens: there is no device pool to back with a slot file or to
@@ -288,7 +289,23 @@ impl Engine for Spatial {
             mixed_lanes: engine::MixedLanes::Any,
             // one frame at a time: no run-ahead
             frames_in_flight: 1,
+            steps: engine::StatedSteps::default(),
         };
+
+        // The step compositions the runtime's builder forms over this load's
+        // facts (CONTRACT-BC 24). Interim: computed once the caps are; Cerebras records
+        // no bodies (degenerate facts, out of scope for this set).
+        let mut caps = caps;
+        caps.steps = engine::StatedSteps::of(
+            &steps,
+            &engine::StepFacts::stated(&caps, &engine::ReadoutFacts::default()),
+        );
+        tracing::info!(
+            "engine-cerebras: step set: {}; its arm walk does not key on the set yet, so none \
+             of the {} is checked against what it records",
+            caps.steps.shapes.census(),
+            caps.steps.shapes.len(),
+        );
         self.facts = Some(facts);
         self.caps = Some(caps.clone());
         Ok(Loaded {
@@ -689,6 +706,7 @@ mod tests {
                 residency: Residency::default(),
                 ordinal: 0,
                 frames_in_flight: 1,
+                steps: Default::default(),
             })
             .expect_err("the load is refused");
         assert!(refused.to_string().contains("no float output"), "{refused}");

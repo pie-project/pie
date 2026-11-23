@@ -576,6 +576,9 @@ pub fn request(
         residency,
         ordinal,
         frames_in_flight,
+        // The step builder's rules: the engine computes the set of step
+        // compositions it will be sent from them before its arm walk.
+        steps: ::engine::StepRules::runtime(),
     })
 }
 

@@ -69,6 +69,7 @@ fn the_settle_submits_no_fire_past_the_bound() {
             },
             ordinal: 0,
             frames_in_flight: 1,
+            steps: Default::default(),
         })
         .expect("the model loads");
     let shell = engine.loaded_mut().expect("loaded");

@@ -167,6 +167,14 @@ pub struct Capabilities {
     /// one it does not is refused at its bind, before any step. Required:
     /// an engine states what it serves.
     pub host_ops: HostOps,
+
+    /// The step compositions the load's step builder forms, as the engine
+    /// computed them before its arm walk ([`crate::StepShapes::of`] of the
+    /// request's [`crate::LoadRequest::steps`] over its own
+    /// [`crate::StepFacts`]), and those it runs eager. The runtime computes
+    /// the set again from the stated facts and refuses a load stating
+    /// another, by name (CONTRACT-BC 24).
+    pub steps: crate::StatedSteps,
 }
 
 /// An op the runtime asks an engine for on the host, outside a fire, that

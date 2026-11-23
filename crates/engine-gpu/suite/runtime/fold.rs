@@ -509,6 +509,7 @@ fn load_on(
             },
             ordinal: 0,
             frames_in_flight: frames,
+            steps: Default::default(),
         })
         .expect("the miniature loads");
     let asynchronous = engine.settles_asynchronously();

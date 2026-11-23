@@ -166,6 +166,7 @@ fn a_refused_lane_is_refused_alone() {
             },
             ordinal: 0,
             frames_in_flight: 1,
+            steps: Default::default(),
         })
         .expect("the miniature loads");
     // The activation at its widest, as the other shell tests take it: a
