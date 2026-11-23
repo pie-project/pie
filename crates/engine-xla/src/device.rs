@@ -498,14 +498,16 @@ impl Device {
         file.file_name()?.to_str().map(str::to_string)
     }
 
-    /// Whether the disk cache holds the program `code` names.
+    /// Whether the disk cache holds the program `code` names: for one a
+    /// record names, its file as long as the record kept it.
     pub fn code_on_disk(&self, code: &Code) -> bool {
         match code {
             Code::Text(text) => self.on_disk(text),
-            Code::Cached { name, .. } => self
+            Code::Cached { name, file_len, .. } => self
                 .disk
                 .as_ref()
-                .is_some_and(|dir| dir.join(name).exists()),
+                .and_then(|dir| std::fs::metadata(dir.join(name)).ok())
+                .is_some_and(|meta| meta.len() == *file_len),
         }
     }
 
@@ -520,8 +522,21 @@ impl Device {
         }
     }
 
-    /// [`Device::load_parked`] of `code`.
+    /// [`Device::load_parked`] of `code`: what the first fire of its shape
+    /// waits on (the loader's load of it under way, or its own), said with
+    /// the wait.
     pub fn load_parked_code(&self, code: &Code, sig: Signature) -> Result<Option<Arc<Program>>> {
+        let started = std::time::Instant::now();
+        let program = self.load_parked_inner(code, sig);
+        tracing::info!(
+            waited_ms = started.elapsed().as_secs_f64() * 1e3,
+            bytes = code.len(),
+            "xla a fire took its program from the disk cache"
+        );
+        program
+    }
+
+    fn load_parked_inner(&self, code: &Code, sig: Signature) -> Result<Option<Arc<Program>>> {
         match code {
             Code::Text(text) => self.load_parked(text, sig),
             Code::Cached {
@@ -665,6 +680,20 @@ impl Device {
         while *demand > 0 {
             demand = self.quiet.wait(demand).expect("demand lock poisoned");
         }
+    }
+
+    /// Counts a record the ladder found its file gone or changed for.
+    pub fn note_mended(&self) {
+        self.mended
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The length of the disk cache's program file `name`, if it is there.
+    #[must_use]
+    pub fn cached_len(&self, name: &str) -> Option<u64> {
+        std::fs::metadata(self.disk.as_ref()?.join(name))
+            .ok()
+            .map(|meta| meta.len())
     }
 
     /// The records [`Device::mend_record`] dropped.
@@ -1395,6 +1424,8 @@ pub enum Code {
         len: usize,
         /// What compiling the text takes of the host (`compile_need`).
         need: u64,
+        /// The program file's length as it was kept.
+        file_len: u64,
     },
 }
 
