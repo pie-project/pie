@@ -1248,6 +1248,16 @@ impl SlotPool {
             .collect()
     }
 
+    /// Every free chunk a take could open now, `(logical, physical)`: what
+    /// the engine must resolve to backed memory at the same physical.
+    #[must_use]
+    pub fn takeable_physical(&self) -> Vec<(u32, u32)> {
+        self.open
+            .iter_in(0, self.total)
+            .map(|physical| (self.physical_to_logical[physical as usize], physical))
+            .collect()
+    }
+
     /// The first segment under the largest rung's activation (the segment
     /// count where activation lives apart).
     pub fn top_segment(&self) -> u32 {
@@ -1987,6 +1997,7 @@ impl SlotPool {
     /// Moves a held chunk onto free physical chunk `step.to`, as the
     /// engine's `ChunkTable::apply` does: the free logical id there takes the
     /// moved one's old place.
+    #[track_caller]
     fn move_chunk(&mut self, step: ChunkMove) {
         self.changes += 1;
         let meta = self.chunks[step.logical as usize];
@@ -2006,6 +2017,7 @@ impl SlotPool {
             self.reopen(step.to);
             return;
         }
+        self.assert_backed("a move", step.logical, step.to);
         self.open.clear(step.to);
         self.free.clear(step.to);
         self.free.set(step.from);
@@ -2933,6 +2945,7 @@ impl SlotPool {
     }
 
     /// Adds `holder`'s reference to slots someone already holds.
+    #[track_caller]
     pub fn share(&mut self, holder: Holder, slots: &[Slot]) {
         let live = holder.is_live();
         for &slot in slots {
@@ -2966,6 +2979,7 @@ impl SlotPool {
     /// Drops `holder`'s reference on each of `slots`. A slot no one holds
     /// any more is handed out again once the later of `epoch` and the last
     /// fire that touched it retires.
+    #[track_caller]
     pub fn release(&mut self, holder: Holder, slots: &[Slot], epoch: u64) {
         let live = holder.is_live();
         let mut immediate = Vec::new();
@@ -2976,7 +2990,7 @@ impl SlotPool {
             let was = state.refs[at];
             let mut now = was;
             if live {
-                assert!(now.live > 0, "{slot:?} has no live reference to drop");
+                assert!(now.live > 0, "{slot:?} has no live reference of {holder:?} to drop");
                 now.live -= 1;
             } else {
                 assert!(now.cache > 0, "{slot:?} has no cache reference to drop");
@@ -3102,6 +3116,27 @@ impl SlotPool {
         self.pending.values().map(Vec::len).sum()
     }
 
+    /// A chunk taken or moved onto lies in memory the engine backs for
+    /// state: a committed segment (the bottom's, or a span segment the
+    /// walk committed). Checked at every take and
+    /// every move's destination in debug builds, naming the logical chunk,
+    /// its physical and the segment: met, a fire on it reads or writes
+    /// memory the engine gave back (the M1 on 6b69c5978: a fire on chunk
+    /// 423 of a segment released 3 ms before).
+    #[track_caller]
+    fn assert_backed(&self, what: &str, logical: u32, physical: u32) {
+        if cfg!(debug_assertions) {
+            let segment = self.segments.of(physical);
+            let state = self.segments.state(segment);
+            assert!(
+                physical >= self.reserved && state == SegmentState::Committed,
+                "{what} of logical chunk {logical} on physical {physical} in segment {segment} \
+                 ({state:?}), which the engine does not back for state"
+            );
+        }
+    }
+
+    #[track_caller]
     fn locate(&mut self, slot: Slot) -> (&mut ShapeState, usize) {
         let meta = self.chunks[slot.chunk as usize];
         assert!(meta.shape != NO_SHAPE, "{slot:?} lies in a free chunk");
@@ -3120,10 +3155,12 @@ impl SlotPool {
 
     /// Opens free physical chunk `physical` for `shape`, to hold `class`
     /// ([`ChunkMeta::class`]); its logical id.
+    #[track_caller]
     fn open_at(&mut self, physical: u32, shape: ShapeId, class: u32) -> u32 {
+        let logical = self.physical_to_logical[physical as usize];
+        self.assert_backed("a take", logical, physical);
         self.open.clear(physical);
         self.free.clear(physical);
-        let logical = self.physical_to_logical[physical as usize];
         debug_assert_eq!(self.chunks[logical as usize].shape, NO_SHAPE);
         self.segments.hold(physical);
         self.held += 1;
@@ -4777,6 +4814,98 @@ mod tests {
     /// top segment's activation aside).
     fn run_pool() -> SlotPool {
         SlotPool::new(facts_with(16, 4, 4, &[(ShapeKind::Fixed, 1024)], &[(16, 4)]))
+    }
+
+    /// The pool's table after its moves, one by one, is the engine's after
+    /// `ChunkTable::apply` of the same list: held chunks moved into holes
+    /// among free ones, free logicals swapped up in their place, and moves
+    /// whose destination is the physical another move of the list left (a
+    /// chain) or whose logical another moved onto (the M1's 35 chunks into
+    /// scattered holes, then a segment release under the free ids swapped
+    /// up).
+    #[test]
+    fn the_pools_moves_leave_the_table_the_engines_apply_does() {
+        let mut rng = 0x5eed_u64;
+        let mut next = |below: u32| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            u32::try_from(rng % u64::from(below)).unwrap()
+        };
+        let mut applied = 0;
+        for _ in 0..200 {
+            let mut pool = SlotPool::new(facts_with(24, 4, 6, &[(ShapeKind::Fixed, 1)], &[]));
+            let holder = Holder::WorkingSet(1);
+            let held = pool.acquire(holder, 0, u64::from(next(16) + 1)).unwrap();
+            // Scatter what is held: some given back.
+            let back: Vec<Slot> = held.iter().copied().filter(|_| next(3) == 0).collect();
+            pool.release(holder, &back, 0);
+            pool.retire_through(u64::MAX);
+            let mut engine = ::engine::chunk::ChunkTable::identity(pool.total_chunks());
+            for _ in 0..4 {
+                // Planned as the walk plans: held chunks to open ones, the
+                // list applied by the pool move by move, by the engine
+                // whole.
+                let open: Vec<u32> = pool.open.iter_in(0, pool.total_chunks()).collect();
+                let sources: Vec<u32> = (pool.reserved..pool.total_chunks())
+                    .filter(|&chunk| !pool.free.get(chunk) && !pool.fenced.get(chunk))
+                    .collect();
+                let mut moves = Vec::new();
+                let mut taken = BTreeSet::new();
+                for &from in &sources {
+                    if next(2) == 0 || open.is_empty() {
+                        continue;
+                    }
+                    let to = open[next(open.len() as u32) as usize];
+                    if !taken.insert(to) {
+                        continue;
+                    }
+                    moves.push(ChunkMove {
+                        logical: pool.physical_to_logical[from as usize],
+                        from,
+                        to,
+                    });
+                }
+                if moves.is_empty() || pool.apply_compaction(&moves, 1).is_err() {
+                    continue;
+                }
+                let evacuation = ::engine::chunk::Evacuation {
+                    moves: moves.iter().map(|step| (step.logical, step.to)).collect(),
+                };
+                engine.apply(&evacuation).unwrap();
+                applied += 1;
+                pool.retire_through(u64::MAX);
+                for logical in 0..pool.total_chunks() {
+                    assert_eq!(
+                        engine.physical(logical),
+                        Some(pool.logical_to_physical[logical as usize]),
+                        "logical chunk {logical} after {moves:?}"
+                    );
+                }
+                pool.check();
+            }
+            // Free chunks swapped among themselves (a move let go mid-way),
+            // in chains: each the engine's swap too.
+            let free: Vec<u32> = (0..pool.total_chunks())
+                .filter(|&logical| pool.chunks[logical as usize].shape == NO_SHAPE && logical >= pool.reserved)
+                .collect();
+            for _ in 0..8 {
+                if free.len() < 2 {
+                    break;
+                }
+                let logical = free[next(free.len() as u32) as usize];
+                let to = pool.logical_to_physical[free[next(free.len() as u32) as usize] as usize];
+                let from = pool.logical_to_physical[logical as usize];
+                pool.move_chunk(ChunkMove { logical, from, to });
+                engine
+                    .apply(&::engine::chunk::Evacuation { moves: vec![(logical, to)] })
+                    .unwrap();
+            }
+            for logical in 0..pool.total_chunks() {
+                assert_eq!(engine.physical(logical), Some(pool.logical_to_physical[logical as usize]));
+            }
+        }
+        assert!(applied > 100, "moves applied: {applied}");
     }
 
     /// A freed run's hole is one the next run of its length takes exactly:

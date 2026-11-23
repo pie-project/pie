@@ -2702,7 +2702,11 @@ fn check(ctx: &Ctx, step: u32, moving: bool) -> Result<Vec<Failure>, Failure> {
             }
             let shared = shared.lock().unwrap();
             let pool = shared.pool();
-            let outside = view.strays(&pool.held_physical());
+            let mut outside = view.strays(&pool.held_physical());
+            // And every free chunk a take could open: a free logical id the
+            // engine resolves elsewhere, or to memory it gave back, is a
+            // fire on the next take's state there.
+            outside.extend(view.strays(&pool.takeable_physical()));
             if !outside.is_empty() {
                 return Err(fail(
                     "ceiling",
@@ -2998,12 +3002,21 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
                         view.faults.push(fault.clone());
                         anyhow::bail!(fault);
                     }
-                    if let crate::scheduler::worker::PoolOp::Evacuate(evacuation) = &op
-                        && let Err(error) = view.table.apply(evacuation)
-                    {
-                        let fault = format!("the engine's table refused {:?}: {error}", evacuation.moves);
-                        view.faults.push(fault.clone());
-                        anyhow::bail!(fault);
+                    if let crate::scheduler::worker::PoolOp::Evacuate(evacuation) = &op {
+                        if let Err(error) = view.table.apply(evacuation) {
+                            let fault =
+                                format!("the engine's table refused {:?}: {error}", evacuation.moves);
+                            view.faults.push(fault.clone());
+                            anyhow::bail!(fault);
+                        }
+                        // `PIE_SIM_LATE_REFUSE`: the engine refuses an
+                        // evacuation after its table took the moves, one
+                        // time in a few (Metal before 6b69c5978's next: a
+                        // rebind failing past the swap). The runtime takes
+                        // the move back; the tables part.
+                        if std::env::var_os("PIE_SIM_LATE_REFUSE").is_some() && view.rng.chance(1, 4) {
+                            anyhow::bail!("an evacuation refused past its table swap (simulated)");
+                        }
                     }
                     // A segment given back holds nothing the engine resolves
                     // there.
