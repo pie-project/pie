@@ -4895,7 +4895,20 @@ impl Shell {
                     && let Some(fold) = seated.window
                 {
                     self.windowed_pages(k, seated, fold, have, row.rows)?
+                } else if self.pools.ring().is_some() && seated.refs {
+                    // The runtime states every lane's fold on a load served as
+                    // ring + buffer; its buffer slots are no whole window.
+                    return Err(Fault::program(
+                        "serve::windowed",
+                        format!(
+                            "lane in slot {} of a load whose windowed layers are ring + buffer \
+                             states no window fold (`Lane::window`)",
+                            lane.slot
+                        ),
+                    ));
                 } else {
+                    // The engine's own fires (arming, the pipeline walk) are
+                    // seat-addressed: each reads and writes its seat's own run.
                     let page_size = u64::from(self.pools.window_paging(k).page_size.max(1));
                     let after = u64::from(have) + u64::from(row.rows);
                     let pages = u32::try_from(after.div_ceil(page_size).max(1)).unwrap_or(u32::MAX);
