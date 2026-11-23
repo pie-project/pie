@@ -1358,6 +1358,8 @@ impl Shell {
             },
             !boot.knobs.dense_weights(),
             boot.knobs.diagnostics.one_window,
+            boot.knobs.diagnostics.windowed_state,
+            boot.budget.max_tokens,
         )?;
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
@@ -1441,6 +1443,10 @@ impl Shell {
         // The activation rungs a pool may drop to (SPEC decision 6), each a
         // bucket's carve laid at the reservation's end.
         let rungs = activation_rungs(&boot.trace, &budgets, &compiled)?;
+        // The own-row pages of a load that keeps rings lie at the span's
+        // top, above every carve (`store::OwnRows`).
+        let own_rows = pools.own_rows_bytes();
+        let arena_bytes = arena_bytes + own_rows;
         eprintln!(
             "engine-cuda: activation rungs {:?} under an arena of {arena_bytes} bytes",
             rungs
@@ -1448,7 +1454,9 @@ impl Shell {
                 .map(|(tokens, map)| (*tokens, map.bytes))
                 .collect::<Vec<_>>(),
         );
-        let mut arena = Arena::reserve(arena_bytes).with_rungs(rungs);
+        let mut arena = Arena::reserve(arena_bytes)
+            .keeping_top(own_rows)
+            .with_rungs(rungs);
         // The arena is backed here, at load, whole, out of the elastic pool
         // the allowance leaves past the weights: every carve a fire lays,
         // wherever in the span, and a fire reading out past one row a lane
@@ -1666,6 +1674,8 @@ impl Shell {
             .then(|| crate::tap::row_layers(&boot.trace).and_then(|rows| pools.tap_groups(&rows)))
             .flatten();
         let mut shell = Shell {
+            ring_runs: None,
+            ring_seen: crate::serve::RingSeen::default(),
             weighed,
             device,
             accounting,

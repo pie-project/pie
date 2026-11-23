@@ -28,6 +28,10 @@ pub struct Seated<'a> {
     /// (`KvDelta::write_end`); its rows land in `[folded, write_end)`.
     pub write_end: u32,
     pub window: &'a [u32],
+    /// How the lane's windowed layers stand as ring + buffer and how far its
+    /// fire folds them (`Lane::window`); `None` where the runtime states
+    /// none (a runtimeless lane folds every row it writes).
+    pub window_fold: Option<engine::fire::WindowFold>,
     /// The lane's slot refs of the window lists past the first, narrowest
     /// first: a list each, where lanes name slot refs.
     pub more_windows: &'a [&'a [u32]],
@@ -64,6 +68,7 @@ impl<'a> Seated<'a> {
             translation: &[],
             write_end: 0,
             window: &[],
+            window_fold: None,
             more_windows: &[],
             mask: None,
             adapter: None,

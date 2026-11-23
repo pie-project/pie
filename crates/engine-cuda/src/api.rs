@@ -802,7 +802,9 @@ impl Engine for Cuda {
             shell.drop_rungs();
         }
         let mut chunk_facts = shell.chunk_facts().map_err(fault)?;
-        chunk_facts.record_bytes = shell.state_slot_bytes();
+        chunk_facts.record_bytes = shell.record_bytes();
+        chunk_facts.windowed = shell.windowed_layers();
+        let windowed_state = !chunk_facts.windowed.is_empty();
         chunk_facts.disk_persistent = residency.disk_kv_persistent && chunk_facts.disk_chunks > 0;
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, arena_bytes, pool_bytes, input_bytes) = shell.footprint();
@@ -876,8 +878,13 @@ impl Engine for Cuda {
             kv_handle,
             media_encode: false,
             rs_verbs: true,
-            windowed_state: false,
-            rs_snapshots: if state_rows && shell.lands_snapshots() {
+            windowed_state,
+            // A load of rings alone lands its snapshots itself
+            // (`serve::ring`); one of recurrent state too, as its state
+            // lands them.
+            rs_snapshots: if (state_rows && shell.lands_snapshots())
+                || (windowed_state && !state_rows)
+            {
                 crate::store::rs::SNAPSHOTS
             } else {
                 0
@@ -1147,7 +1154,7 @@ impl Engine for Cuda {
 
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
         use crate::store::Tier;
-        use crate::store::layout::{FIXED, LIST, WINDOW};
+        use crate::store::layout::{FIXED, LIST, RING, WINDOW};
         let tier = |domain| match domain {
             MemoryDomain::CudaDevice(_) => Some(Tier::Device),
             MemoryDomain::HostPinned => Some(Tier::Host),
@@ -1174,14 +1181,18 @@ impl Engine for Cuda {
                 .copy_tier_slots(copy.shape, from, to, &copy.slots)
                 .map_err(fault);
         }
-        if copy.shape == FIXED {
+        if copy.shape == FIXED || copy.shape == RING {
             if !copy.runs.is_empty() {
                 return Err(Error::Invalid(
                     "a fixed record is copied whole, not a run of its tokens".into(),
                 ));
             }
+            // A record is one unit across its shapes: named by any shape's
+            // first piece, copied whole.
             for &(src, dst) in &copy.slots {
-                shell.fork_state(src, dst).map_err(fault)?;
+                shell
+                    .fork_state(shell.record_key(src), shell.record_key(dst))
+                    .map_err(fault)?;
             }
             return Ok(());
         }
@@ -1735,7 +1746,7 @@ impl Cuda {
         // kv refs, and its recurrent record is the pairs `fixed` names, a
         // piece each, copied onto the slots the fire writes where the two
         // differ.
-        use crate::store::layout::{FIXED, LIST, WINDOW};
+        use crate::store::layout::{FIXED, LIST, RING, WINDOW};
         let by_refs = submission.lanes.iter().any(|lane| {
             !lane.tables.is_empty()
                 || !matches!(lane.record, engine::fire::LaneRecord::Unstated)
@@ -1773,7 +1784,16 @@ impl Cuda {
             nulls.push(matches!(lane.record, engine::fire::LaneRecord::Null));
             let record = match pieces {
                 [] => None,
-                [(shape, pieces)] if *shape == FIXED => {
+                // A record's pieces: its rings' first, then its state's
+                // (CONTRACT-BC 21), named as one record by its first.
+                stated
+                    if stated.iter().all(|(shape, _)| *shape == FIXED || *shape == RING)
+                        && stated.windows(2).all(|pair| pair[0].0 == RING && pair[1].0 == FIXED) =>
+                {
+                    let pieces: Vec<[u32; 2]> = stated
+                        .iter()
+                        .flat_map(|(_, pieces)| pieces.iter().copied())
+                        .collect();
                     let runs: Vec<u32> = pieces.iter().map(|[run, _]| *run).collect();
                     let written: Vec<u32> = pieces.iter().map(|[_, written]| *written).collect();
                     let run = shell.name_record(&runs).map_err(fault)?;
@@ -1795,9 +1815,21 @@ impl Cuda {
             for snap in lane
                 .rs_snapshots
                 .iter()
-                .filter(|snap| !snap.pieces.is_empty())
+                .filter(|snap| !snap.pieces.is_empty() || !snap.fixed.is_empty())
             {
-                let named = shell.name_record(&snap.pieces).map_err(fault)?;
+                // A record of rings and state names its pieces a shape at a
+                // time: the rings' first.
+                let pieces: Vec<u32> = if snap.fixed.is_empty() {
+                    snap.pieces.clone()
+                } else {
+                    snap.fixed
+                        .iter()
+                        .filter(|(shape, _)| *shape == RING)
+                        .chain(snap.fixed.iter().filter(|(shape, _)| *shape == FIXED))
+                        .flat_map(|(_, pieces)| pieces.iter().copied())
+                        .collect()
+                };
+                let named = shell.name_record(&pieces).map_err(fault)?;
                 if named != snap.slot {
                     return Err(Error::Invalid(format!(
                         "lane in slot {} snapshots into the record at slot ref {}, whose \
@@ -1864,6 +1896,7 @@ impl Cuda {
                     },
                     write_end: lane.kv.write_end,
                     window: table(lane, WINDOW).unwrap_or(&[]),
+                    window_fold: lane.window.clone(),
                     more_windows: &more_windows[at],
                     mask: lane.mask.as_ref(),
                     adapter: lane_adapters[at].or(lane.adapter),

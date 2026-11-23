@@ -429,7 +429,7 @@ impl Shell {
     /// refs and the load holds state: the null record, ref 0.
     #[must_use]
     pub fn null_record(&self) -> Option<u32> {
-        (self.pools.by_refs() && self.pools.has_state()).then_some(0)
+        (self.pools.by_refs() && self.pools.has_record()).then_some(0)
     }
 
     /// Copies a working set's recurrent record from slot `src` onto `dst`,

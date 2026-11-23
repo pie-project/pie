@@ -1390,3 +1390,16 @@ ms quiet; at the loader's measured width (4–5) and with fires' loads ahead of 
 ms. A cover the cache or a committed file holds is not timed at all. A fresh one should wait for
 the loader (an engine hook the runtime calls before it times the cover); not built, as the
 measured width leaves it unpolluted on v6e.
+
+## F64
+
+The harmony chat decoding leaves channel headers in an OpenAI chat completion's `content`, on main (ecfd6ed57)
+as on the windowed-state line: gpt-oss-20b served greedy through `/v1/chat/completions` answers `content`
+`"<|channel|>analysis"` beside its `reasoning_content`, and, once it reaches its final channel,
+`"<|channel|>analysis<|start|>assistant<|channel|>final<|message|>**17 × 23** …"`. The reasoning is split
+out (`ThinkingDecoder` on `analysis_prefix`, `chat-template/src/harmony.rs:236`), but the tokens before its
+`<|message|>` stay in the content, and nothing strips the `<|end|><|start|>assistant<|channel|>final<|message|>`
+header that opens the final channel: the chat decoder is the generic one (`GenericChatDecoder`, :229), which
+knows only the stop ids. Open: a harmony chat decoder that drops every header a channel opens with (and keeps
+only the final channel's text as content), checked through compat-openai on gpt-oss-20b. Formatting only: the
+tokens drawn are the model's.

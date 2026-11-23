@@ -156,6 +156,16 @@ impl Shell {
             .as_ref()
             .map(|buffers| buffers.scratch(&self.pools));
         let tapping = self.tapping(p.lanes)?;
+        // A windowed fire's own-row pages start as their ring pages: one
+        // launch of every page's copy.
+        let fills: Vec<(u64, u64, u64)> = p
+            .ring_work
+            .fills
+            .iter()
+            .map(|&(to, from)| (to, from, p.ring_work.page_bytes))
+            .chain(p.ring_work.refills.iter().copied())
+            .collect();
+        self.copy_ring_runs(&fills)?;
         let mut fire = FireCtx {
             live: &self.live,
             tapping: tapping.as_ref(),
@@ -206,6 +216,10 @@ impl Shell {
         super::btrace::mark("route");
         let readback = fire.readback(p, &staged)?;
         super::btrace::mark("readback");
+        // A windowed fire's snapshots land before its fold, which may write
+        // the ring pages they read.
+        self.copy_ring_runs(&p.ring_work.snaps)?;
+        self.fold_rings(&p.ring_work)?;
         if tapping.is_some() {
             // The read-outs hold the tapped pages and the host slots they
             // fill until they land: a later fire that writes a page waits for
@@ -219,6 +233,43 @@ impl Shell {
         }
         super::btrace::flush(seq);
         Ok((p.windows.launches(), readback))
+    }
+}
+
+impl Shell {
+    /// A windowed fire's fold (CONTRACT-BC 19): the rows it folds, from
+    /// their buffer or own-row pages onto their ring pages, after its
+    /// forward on its stream.
+    fn fold_rings(&mut self, work: &super::ring::Work) -> Result<()> {
+        self.copy_ring_runs(&work.folds)
+    }
+
+    /// `runs` (to, from, bytes) in one launch of `copy_runs` on the fire's
+    /// stream, their table staged ahead of it on the same stream.
+    fn copy_ring_runs(&mut self, runs: &[(u64, u64, u64)]) -> Result<()> {
+        if runs.is_empty() {
+            return Ok(());
+        }
+        // `kernels_cuda::runtime::channel::CopyRun`s: three words a run.
+        let raw: Vec<u8> = runs
+            .iter()
+            .flat_map(|&(dst, src, bytes)| [dst, src, bytes])
+            .flat_map(u64::to_le_bytes)
+            .collect();
+        let bytes = raw.len();
+        if self.ring_runs.as_ref().is_none_or(|held| held.bytes() < bytes) {
+            self.ring_runs = Some(crate::device::alloc::Buffer::zeroed(
+                bytes.next_power_of_two(),
+            )?);
+        }
+        let held = self.ring_runs.as_ref().map_or(0, |held| held.ptr());
+        crate::device::alloc::stage_raw(self.device.stream(), held, &raw)?;
+        kernels_cuda::runtime::channel::copy_runs(
+            &self.device.ctx(),
+            held,
+            u32::try_from(runs.len()).unwrap_or(u32::MAX),
+        )
+        .map_err(Fault::from)
     }
 }
 

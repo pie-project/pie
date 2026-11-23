@@ -19,6 +19,7 @@ pub fn export_bodies(
 pub use load::Staged;
 pub(crate) mod pages;
 mod prepare;
+mod ring;
 mod segments;
 mod settle;
 mod stats;
@@ -68,10 +69,28 @@ use crate::window::Windows;
 use enqueue::{GuestBatch, GuestFault, Owed, Reap, reap_guest_fires};
 use segments::Segmented;
 
+/// What a load's windowed fires have done ([`Shell::ring_seen`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RingSeen {
+    /// Fires' own pages written on their ring directly.
+    pub direct: u64,
+    /// Own-row pages taken.
+    pub own: u64,
+    /// Ring pages a fire both read and then folded rows onto.
+    pub read_then_folded: u64,
+}
+
 pub struct Shell {
     /// The rungs the load weighed its top by and the estimate it weighed
     /// them with (`None` where the profile states no rates).
     weighed: Option<crate::top::Weighed>,
+    /// A windowed fire's ring-fold runs as the device reads them, grown to
+    /// the most a fire has folded (`serve::ring`).
+    ring_runs: Option<crate::device::alloc::Buffer>,
+    /// What the windowed fires served have done since load: pages they
+    /// wrote on their rings directly, own-row pages they took, and the ring
+    /// pages they folded onto that their own reads had read.
+    ring_seen: RingSeen,
     device: Context,
     accounting: crate::store::Accounting,
     trace: Trace,
@@ -798,6 +817,37 @@ impl Shell {
         self.pools.state_slot_bytes()
     }
 
+    /// The bytes a record takes, its rings' among them.
+    #[must_use]
+    pub fn record_bytes(&self) -> u64 {
+        self.pools.record_bytes()
+    }
+
+    /// What this load's windowed fires have done since it loaded.
+    #[must_use]
+    pub fn ring_seen(&self) -> RingSeen {
+        self.ring_seen
+    }
+
+    /// The side streams this load's fires fork regions onto.
+    #[must_use]
+    pub fn side_streams(&self) -> usize {
+        self.device.side_streams().len()
+    }
+
+    /// The record a slot ref names (`Pools::record_key`).
+    #[must_use]
+    pub fn record_key(&self, slot: u32) -> u32 {
+        self.pools.record_key(slot)
+    }
+
+    /// The windowed layers the record holds the rings of; none where the
+    /// load serves its windowed rows by window lists.
+    #[must_use]
+    pub fn windowed_layers(&self) -> Vec<engine::chunk::WindowedLayer> {
+        self.pools.windowed_layers()
+    }
+
     pub fn state_bytes(&mut self, slot: u32) -> Result<Vec<u8>> {
         self.pools.state_bytes(self.device.stream(), slot)
     }
@@ -1476,6 +1526,9 @@ pub(crate) struct MergeLand {
 }
 
 pub struct Prepared<'a> {
+    /// The ring work of a fire of windowed lanes: the pages filled before
+    /// it, the rows folded after.
+    ring_work: ring::Work,
     lanes: &'a [Seated<'a>],
     attachments: &'a [Attached],
     composition: Composition,

@@ -584,6 +584,20 @@ pub fn device_memory() -> Result<(u64, u64)> {
     crate::device::card::memory()
 }
 
+/// A fire's own-row pages (`Pools::own`): `pages` pages laid as
+/// window-buffer slots from `start` bytes past the activation's base (which
+/// moves with the pool's chunks: a refit moves it), a page id of
+/// the buffer's grain each. Above every carve of the activation's span: the
+/// load's carves are laid `bytes` lower.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnRows {
+    pub start: u64,
+    pub pages: u32,
+    pub page_bytes: u64,
+    pub grain: u64,
+    pub bytes: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Shape {
     Kv {
@@ -676,6 +690,10 @@ impl Seats {
 
 #[derive(Debug)]
 pub struct Pools {
+    /// The pages of a fire's own rows its lane folds past its ring, at the
+    /// activation's top (CONTRACT-BC 19: rows a fire folds itself take no
+    /// window-buffer slot).
+    own: Option<OwnRows>,
     pool: PhysicalPool,
     /// The state pool: the kv rows' pages and the working sets' recurrent
     /// records, a slot each.
@@ -723,6 +741,9 @@ pub struct Pools {
     /// Each record a lane named by slot refs, by its first piece's ref: the
     /// refs of all its pieces.
     records: std::collections::HashMap<u32, Vec<u32>>,
+    /// A record's state's first piece, by the record it names
+    /// ([`Pools::record_key`]).
+    record_names: std::collections::HashMap<u32, u32>,
     /// The lanes a fire's staged id tables are laid for, and the entries its
     /// snapshot table is ([`Pools::seat_tables`]).
     id_lanes: u32,
@@ -1050,6 +1071,8 @@ impl Pools {
         experts: &[usize],
         rows: bool,
         one_window: bool,
+        windowed_state: bool,
+        own_rows_tokens: u32,
     ) -> Result<Pools> {
         let pool = PhysicalPool::open(device, ceiling)?;
         let layout = lay(
@@ -1060,7 +1083,20 @@ impl Pools {
             experts,
             rows,
             one_window,
+            windowed_state,
         )?;
+        // The pages a fire's own rows take where its lane folds them past
+        // what its ring holds (`OwnRows`): at the activation's top, above
+        // every carve.
+        let own_pages = layout
+            .ring
+            .as_ref()
+            .map(|ring| &ring.ring)
+            .map(|ring| (2 * own_rows_tokens.div_ceil(ring.page_rows) + 1, ring.page_bytes));
+        let grain = layout.windows.first().map_or(1, |window| window.grain.max(1));
+        let own_bytes = own_pages.map_or(0, |(pages, bytes)| u64::from(pages) * bytes + grain);
+        let carved = activation;
+        let activation = activation + own_bytes;
         let mut shapes = Vec::with_capacity(trace.caches.len());
         let mut windows_of: Vec<(u32, u8)> = Vec::new();
 
@@ -1251,7 +1287,15 @@ impl Pools {
             (None, _) => asked,
         };
         let chunks = chunks::Chunks::reserve(&pool, layout, total, activation)?;
+        let own = own_pages.map(|(pages, page_bytes)| OwnRows {
+            start: carved.next_multiple_of(grain),
+            pages,
+            page_bytes,
+            grain,
+            bytes: own_bytes,
+        });
         Ok(Pools {
+            own,
             pool,
             chunks,
             row_caches: Vec::new(),
@@ -1268,6 +1312,7 @@ impl Pools {
             stand_in: false,
             file_spans: Vec::new(),
             records: std::collections::HashMap::new(),
+            record_names: std::collections::HashMap::new(),
             id_lanes: 1,
             snap_entries: 1,
             shapes,
@@ -1493,7 +1538,7 @@ impl Pools {
         let fitted = self.fitted_chunks();
         let room = fitted.saturating_sub(self.chunks.weight_chunks_under(fitted));
         let layout = self.chunks.layout();
-        let state = self.has_state();
+        let state = self.has_record();
         let fits = |records: u32, pages: u64| {
             chunks_at(layout, &self.paging, pages, if state { records } else { 0 }) <= room
         };
@@ -1540,7 +1585,7 @@ impl Pools {
         live: u64,
         stated: Option<u64>,
     ) -> core::result::Result<WorkingSet, u64> {
-        let slots = u32::from(self.has_state());
+        let slots = u32::from(self.has_record());
         let least = chunks_at(self.chunks.layout(), &self.paging, pages, slots);
         let need = self.chunk_bytes(least);
         // A stated budget is the pool's before the bodies and programs are
@@ -2024,6 +2069,211 @@ impl Pools {
             .sum::<u64>()
     }
 
+    /// The windowed layers a record holds the rings of (CONTRACT-BC 21),
+    /// where the load serves them as ring + buffer: each windowed cache row
+    /// (its `layer`) with its window and its share of the ring's bytes, the
+    /// last row's share padded to the pieces the record takes.
+    #[must_use]
+    pub fn windowed_layers(&self) -> Vec<engine::chunk::WindowedLayer> {
+        let Some((_, ring)) = self.ring() else {
+            return Vec::new();
+        };
+        ring.layers
+            .iter()
+            .map(|&(layer, window, bytes)| engine::chunk::WindowedLayer {
+                layer,
+                window,
+                bytes,
+            })
+            .collect()
+    }
+
+    /// The record's rings, where the load serves its windowed rows as ring
+    /// + buffer.
+    #[must_use]
+    pub fn ring(&self) -> Option<(&layout::RingShape, &layout::Ring)> {
+        let ring = self.chunks.layout().ring.as_ref()?;
+        Some((ring, &ring.ring))
+    }
+
+    /// The bytes the own-row pages take at the activation's top (none
+    /// where the load keeps no ring): every carve is laid this much lower.
+    #[must_use]
+    pub fn own_rows_bytes(&self) -> u64 {
+        self.own.map_or(0, |own| own.bytes)
+    }
+
+    /// Own-row page `page`'s id, as a window-buffer page.
+    pub fn own_page_id(&self, page: u32) -> Result<i32> {
+        let own = self.own.ok_or_else(|| {
+            Fault::program("store::ring", "an own-row page of a load that keeps no ring")
+        })?;
+        if page >= own.pages {
+            return Err(Fault::Ceiling {
+                what: "own-row pages of a fire that folds its rows past its ring",
+                need: u64::from(page) + 1,
+                have: u64::from(own.pages),
+            });
+        }
+        let at = self.activation_base() - self.chunks.base()
+            + own.start
+            + u64::from(page) * own.page_bytes;
+        let q = at / own.grain;
+        i32::try_from(q).map_err(|_| Fault::Ceiling {
+            what: "page ids of the state pool",
+            need: q,
+            have: i32::MAX as u64,
+        })
+    }
+
+    /// The pool's base, every page id counted from it.
+    #[must_use]
+    pub fn pool_base(&self) -> u64 {
+        self.chunks.base()
+    }
+
+    /// The step the window buffer's page ids count in (ring and own-row
+    /// pages' too).
+    #[must_use]
+    pub fn window_grain(&self) -> u64 {
+        self.chunks
+            .layout()
+            .windows
+            .first()
+            .map_or(1, |window| window.grain.max(1))
+    }
+
+    /// Own-row page `page`'s address.
+    pub fn own_page_at(&self, page: u32) -> Result<u64> {
+        let own = self.own.ok_or_else(|| {
+            Fault::program("store::ring", "an own-row page of a load that keeps no ring")
+        })?;
+        Ok(self.activation_base() + own.start + u64::from(page) * own.page_bytes)
+    }
+
+    /// The ring pages of the record `key` names, in ring order, by the ids
+    /// a kernel reads a window-buffer page by, and their addresses; the
+    /// record seated and backed.
+    pub fn ring_pages(&mut self, key: u32) -> Result<Vec<(i32, u64)>> {
+        let slots = self.ensure_record(key)?;
+        let (fixed, ring) = self.ring().ok_or_else(|| {
+            Fault::program("store::ring", "ring pages of a load that keeps no ring")
+        })?;
+        let fixed_grain = fixed.slot.grain.max(1);
+        let (pages, page_bytes, ring_offset) = (ring.pages, ring.page_bytes, ring.offset);
+        let places: Vec<(u32, u32)> = (0..pages).map(|page| ring.place(page)).collect();
+        let grain = self
+            .chunks
+            .layout()
+            .windows
+            .first()
+            .map_or(1, |window| window.grain.max(1));
+        let mut out = Vec::with_capacity(pages as usize);
+        for (piece, within) in places {
+            let slot = *slots.get(piece as usize).ok_or_else(|| {
+                Fault::program("store::ring", "a ring page past its record's pieces")
+            })?;
+            let offset = u64::try_from(self.chunks.page_id(Kind::Ring, slot)?)
+                .unwrap_or(0)
+                * fixed_grain
+                + ring_offset
+                + u64::from(within) * page_bytes;
+            let q = offset / grain;
+            out.push((
+                i32::try_from(q).map_err(|_| Fault::Ceiling {
+                    what: "page ids of the state pool",
+                    need: q,
+                    have: i32::MAX as u64,
+                })?,
+                self.chunks.base() + offset,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Window-buffer slot `slot` (a slot ref): the page id a kernel reads it
+    /// by and its address, seated and backed.
+    pub fn window_slot(&mut self, slot: u32) -> Result<(i32, u64)> {
+        self.seat_pages(Kind::Window(0), std::iter::once(u64::from(slot)))?;
+        let bytes = self
+            .chunks
+            .layout()
+            .windows
+            .first()
+            .map_or(0, |window| window.slot_bytes);
+        Ok((
+            self.chunks.page_id(Kind::Window(0), slot)?,
+            self.chunks.span(Kind::Window(0), slot, 0, bytes)?,
+        ))
+    }
+
+    /// Each windowed row's planes in a window-buffer page (and so in a ring
+    /// page): (offset, bytes a row), its key plane's then its value plane's.
+    #[must_use]
+    pub fn ring_planes(&self) -> Vec<(u64, u64)> {
+        let Some((_, ring)) = self.ring() else {
+            return Vec::new();
+        };
+        ring.windows
+            .iter()
+            .filter_map(|&(row, _)| match self.shapes.get(row as usize) {
+                Some(&Shape::Kv {
+                    dtype,
+                    keys_width,
+                    values_width,
+                    offsets,
+                    ..
+                }) => {
+                    let elem = u64::from(elem_size(dtype));
+                    Some([
+                        (offsets[0], keys_width * elem),
+                        (offsets[1], values_width * elem),
+                    ])
+                }
+                _ => None,
+            })
+            .flatten()
+            // The compressor states the windowed pages key lie in them a
+            // row each too (two planes a state): they fold with the rows.
+            .chain(
+                self.pooled
+                    .iter()
+                    .filter(|row| row.windowed)
+                    .flat_map(|row| {
+                        let plane = row.plane_bytes(self.paging.page_size);
+                        let per_row = row.width * u64::from(elem_size(POOL_STATE));
+                        [(row.offset, per_row), (row.offset + plane, per_row)]
+                    }),
+            )
+            .collect()
+    }
+
+    /// The widest window a ring holds the rows of, and the rows a page.
+    #[must_use]
+    pub fn ring_window(&self) -> Option<(u32, u32)> {
+        let (_, ring) = self.ring()?;
+        Some((
+            ring.windows.iter().map(|&(_, w)| w).max().unwrap_or(0),
+            ring.page_rows,
+        ))
+    }
+
+    /// The bytes a record takes: its recurrent rows' and its rings'.
+    #[must_use]
+    pub fn record_bytes(&self) -> u64 {
+        self.state_slot_bytes()
+            + self.ring().map_or(0, |(fixed, _)| {
+                fixed.slot.slot_bytes * u64::from(fixed.pieces)
+            })
+    }
+
+    /// Whether a working set holds a record: its recurrent rows, or its
+    /// windowed rows' rings.
+    #[must_use]
+    pub fn has_record(&self) -> bool {
+        self.has_state() || self.ring().is_some()
+    }
+
     #[must_use]
     pub fn has_state(&self) -> bool {
         self.shapes
@@ -2192,7 +2442,11 @@ impl Pools {
                     let seat = seats.page_tables.get(table).ok_or_else(|| Fault::Unbound {
                         what: format!("page table {table}, which this fire staged none of"),
                     })?;
-                    let pages = if windowed {
+                    // A ringed load's windowed table names ring and own-row
+                    // pages anywhere in the pool's range: its planes span it.
+                    let pages = if windowed && self.ring().is_some() {
+                        self.chunks.bytes() / grain_of(&self.chunks, list).max(1)
+                    } else if windowed {
                         self.paging.window_pages()
                     } else {
                         self.paging.pages()
@@ -2322,16 +2576,59 @@ impl Pools {
         let (from, to) = (self.ensure_record(src)?, self.ensure_record(dst)?);
         // A record moving to or from the host tier lands first.
         self.fence_all_swaps(stream)?;
-        let bytes = self.fixed()?.slot.slot_bytes;
-        for (&from, &to) in from.iter().zip(&to) {
+        for (piece, (&from, &to)) in from.iter().zip(&to).enumerate() {
+            let (kind, bytes) = self.piece_kind(piece)?;
             crate::device::copy_d2d(
                 stream,
-                self.chunks.span(Kind::Fixed, to, 0, bytes)?,
-                self.chunks.span(Kind::Fixed, from, 0, bytes)?,
+                self.chunks.span(kind, to, 0, bytes)?,
+                self.chunks.span(kind, from, 0, bytes)?,
                 usize::try_from(bytes).unwrap_or(0),
             )?;
         }
         Ok(())
+    }
+
+    /// The shapes a record spans, in its pieces' order: its rings', then
+    /// its state's (CONTRACT-BC 21), each with its pieces and slot bytes.
+    fn record_shapes(&self) -> Vec<(Kind, u32, u64)> {
+        let layout = self.chunks.layout();
+        layout
+            .ring
+            .as_ref()
+            .map(|ring| (Kind::Ring, ring.pieces, ring.slot.slot_bytes))
+            .into_iter()
+            .chain(
+                layout
+                    .fixed
+                    .as_ref()
+                    .map(|fixed| (Kind::Fixed, fixed.pieces, fixed.slot.slot_bytes)),
+            )
+            .collect()
+    }
+
+    /// The pieces a record takes, every shape's.
+    fn record_pieces(&self) -> u32 {
+        self.record_shapes().iter().map(|&(_, pieces, _)| pieces).sum()
+    }
+
+    /// The record's rings' pieces: the first of its pieces.
+    fn ring_pieces(&self) -> u32 {
+        self.chunks.layout().ring.as_ref().map_or(0, |ring| ring.pieces)
+    }
+
+    /// Piece `piece` of a record: its shape's kind and slot bytes.
+    fn piece_kind(&self, piece: usize) -> Result<(Kind, u64)> {
+        let mut at = piece as u64;
+        for (kind, pieces, bytes) in self.record_shapes() {
+            if at < u64::from(pieces) {
+                return Ok((kind, bytes));
+            }
+            at -= u64::from(pieces);
+        }
+        Err(Fault::program(
+            "store::state",
+            format!("piece {piece} past a record's pieces"),
+        ))
     }
 
     fn fixed(&self) -> Result<&layout::FixedShape> {
@@ -2362,6 +2659,7 @@ impl Pools {
     /// Lets go of the name [`Pools::name_record`] gave `key`.
     pub fn forget_record(&mut self, key: u32) {
         self.records.remove(&key);
+        self.record_names.retain(|_, named| *named != key);
     }
 
     /// The whole chunks of the span under a carve that leaves `under`
@@ -2470,8 +2768,8 @@ impl Pools {
     /// Names the record whose pieces lie in the slot refs `pieces`, for the
     /// fires and copies that name it by its first.
     pub fn name_record(&mut self, pieces: &[u32]) -> Result<u32> {
-        let want = self.fixed()?.pieces as usize;
-        let Some(&key) = pieces.first().filter(|_| pieces.len() == want) else {
+        let want = self.record_pieces() as usize;
+        let Some(&key) = pieces.first().filter(|_| want > 0 && pieces.len() == want) else {
             return Err(Fault::program(
                 "store::state",
                 format!(
@@ -2483,7 +2781,20 @@ impl Pools {
         if want > 1 {
             self.records.insert(key, pieces.to_vec());
         }
+        // A record of rings and state is named by its rings' first piece;
+        // its state's first names it too.
+        if let Some(&state) = pieces.get(self.ring_pieces() as usize).filter(|_| self.ring_pieces() > 0)
+        {
+            self.record_names.insert(state, key);
+        }
         Ok(key)
+    }
+
+    /// The record a slot ref names: itself, or the record whose state's
+    /// first piece it is.
+    #[must_use]
+    pub fn record_key(&self, slot: u32) -> u32 {
+        self.record_names.get(&slot).copied().unwrap_or(slot)
     }
 
     /// The slots of the record `key` names, in the record's order: the
@@ -2499,9 +2810,14 @@ impl Pools {
     /// one buffer.
     fn record_into(&self, key: u32, slots: &mut Vec<u32>) -> Result<()> {
         slots.clear();
-        let pieces = self.fixed()?.pieces;
+        let pieces = self.record_pieces();
+        if pieces == 0 {
+            return Err(Fault::program("store::state", "a record named and no fixed shape"));
+        }
         if !self.chunks.by_refs() {
-            slots.extend((0..pieces).map(|piece| key * pieces + piece));
+            for (_, n, _) in self.record_shapes() {
+                slots.extend((0..n).map(|piece| key * n + piece));
+            }
             return Ok(());
         }
         if pieces == 1 {
@@ -2521,24 +2837,49 @@ impl Pools {
     /// The record `key` names, its slots seated and backed.
     fn ensure_record(&mut self, key: u32) -> Result<Vec<u32>> {
         let slots = self.record(key)?;
-        self.seat_pages(Kind::Fixed, slots.iter().map(|&slot| u64::from(slot)))?;
+        self.seat_record(&slots)?;
         Ok(slots)
+    }
+
+    /// Seats and backs a record's pieces, each on its shape.
+    fn seat_record(&mut self, slots: &[u32]) -> Result<()> {
+        let rings = self.ring_pieces() as usize;
+        let (ring, state) = slots.split_at(rings.min(slots.len()));
+        if !ring.is_empty() {
+            self.seat_pages(Kind::Ring, ring.iter().map(|&slot| u64::from(slot)))?;
+        }
+        if !state.is_empty() {
+            self.seat_pages(Kind::Fixed, state.iter().map(|&slot| u64::from(slot)))?;
+        }
+        Ok(())
     }
 
     /// The record's bytes as the host holds them, `(slot of the record,
     /// offset, bytes)` in order: each recurrent row piece after piece.
     fn record_spans(&self) -> Vec<(u32, u64, u64)> {
+        // Its rings' pieces whole (`layout::Ring`), first.
+        let mut spans: Vec<(u32, u64, u64)> = self
+            .chunks
+            .layout()
+            .ring
+            .as_ref()
+            .map(|ring| {
+                (0..ring.pieces)
+                    .map(|piece| (piece, 0, ring.slot.slot_bytes))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let rings = self.ring_pieces();
         let Some(fixed) = self.chunks.layout().fixed.as_ref() else {
-            return Vec::new();
+            return spans;
         };
-        let mut spans = Vec::new();
         for shape in &self.shapes {
             let Shape::State { run, .. } = *shape else {
                 continue;
             };
             let row = &fixed.rows[run];
             for (piece, &slot) in row.slots.iter().enumerate() {
-                spans.push((slot, row.offset, row.piece_bytes(piece as u32)));
+                spans.push((rings + slot, row.offset, row.piece_bytes(piece as u32)));
             }
         }
         spans
@@ -2580,8 +2921,9 @@ impl Pools {
         for &key in keys.iter().filter(|&&key| key >= 0) {
             self.state_row(key as u32)?;
             self.record_into(key as u32, &mut record)?;
-            self.seat_pages(Kind::Fixed, record.iter().map(|&slot| u64::from(slot)))?;
+            self.seat_record(&record)?;
         }
+        let rings = self.ring_pieces() as usize;
         let fixed = self.fixed()?;
         // One table of one piece: the ids as the keys lie, no padding.
         let single = fixed.tables.len() == 1 && fixed.tables[0].len() == 1;
@@ -2601,7 +2943,7 @@ impl Pools {
             for table in &fixed.tables {
                 for (piece, &slot) in table.iter().enumerate() {
                     out[column * block + lane * table.len() + piece] =
-                        self.chunks.page_id(Kind::Fixed, record[slot as usize])?;
+                        self.chunks.page_id(Kind::Fixed, record[rings + slot as usize])?;
                 }
                 column += table.len();
             }
@@ -2676,9 +3018,9 @@ impl Pools {
         self.record_spans()
             .into_iter()
             .map(|(piece, offset, bytes)| {
+                let (kind, _) = self.piece_kind(piece as usize)?;
                 Ok((
-                    self.chunks
-                        .span(Kind::Fixed, record[piece as usize], offset, bytes)?,
+                    self.chunks.span(kind, record[piece as usize], offset, bytes)?,
                     bytes,
                 ))
             })
@@ -2897,9 +3239,9 @@ impl Pools {
     /// refused past the slots it seats, where lanes do not name slot refs.
     fn state_row(&self, slot: u32) -> Result<bool> {
         if self.chunks.by_refs() {
-            return Ok(self.has_state());
+            return Ok(self.has_record());
         }
-        slab_row(self.has_state(), self.paging.slots, slot)
+        slab_row(self.has_record(), self.paging.slots, slot)
     }
 
     /// From here on lanes name their slots by slot ref
@@ -4377,6 +4719,7 @@ impl Pools {
                 Kind::Window(layout::window_of(window).unwrap_or(0) as u8)
             }
             layout::FIXED => Kind::Fixed,
+            layout::RING => Kind::Ring,
             layout::RS => Kind::Rs,
             layout::INSTANCE => Kind::Instance,
             layout::CHANNEL => Kind::Channel,
@@ -5117,9 +5460,9 @@ impl Pools {
             return Ok(());
         }
         let record = self.ensure_record(slot)?;
-        let bytes = self.fixed()?.slot.slot_bytes;
-        for piece in record {
-            let at = self.chunks.span(Kind::Fixed, piece, 0, bytes)?;
+        for (at, piece) in record.into_iter().enumerate() {
+            let (kind, bytes) = self.piece_kind(at)?;
+            let at = self.chunks.span(kind, piece, 0, bytes)?;
             let len = usize::try_from(bytes).unwrap_or(0);
             match stream {
                 Some(stream) => crate::device::zero_span_on(stream, at, len)?,
@@ -5165,6 +5508,61 @@ impl Pools {
     }
 }
 
+/// The step `list`'s page ids count in.
+fn grain_of(chunks: &chunks::Chunks, list: u8) -> u64 {
+    chunks
+        .layout()
+        .shape(Kind::paged(list))
+        .map_or(1, |shape| shape.grain)
+}
+
+/// The ring hook this engine answers the windowed recipe with
+/// (`poem_compiler::chunk::RingLayout`): its kernels read a window's rows by
+/// one page table of window-buffer slots, so its ring is `ceil(W / P) + 1`
+/// pages of the widest window `W`, each laid exactly as a buffer slot, every
+/// piece at a chunk's start (a page then has an id of the buffer's grain).
+/// A layer's share is its rows of every page, the last padded to the whole.
+struct CudaRings;
+
+impl poem_compiler::chunk::RingLayout for CudaRings {
+    fn ring_region(
+        &self,
+        layers: &[poem_compiler::chunk::WindowedRow],
+        buffer: &poem_compiler::chunk::WindowBufferSlot<'_>,
+    ) -> poem_compiler::chunk::RingRegion {
+        let p = u64::from(buffer.tokens.max(1));
+        let widest = layers
+            .iter()
+            .map(|layer| u64::from(layer.window))
+            .max()
+            .unwrap_or(0);
+        let pages = widest.div_ceil(p) + 1;
+        let bytes = pages * buffer.bytes;
+        let mut layer_bytes: Vec<u64> = layers
+            .iter()
+            .map(|layer| {
+                pages
+                    * buffer
+                        .rows
+                        .iter()
+                        .filter(|run| layer.rows.contains(&run.row))
+                        .map(|run| p * run.per_token)
+                        .sum::<u64>()
+            })
+            .collect();
+        let laid: u64 = layer_bytes.iter().sum();
+        if let Some(last) = layer_bytes.last_mut() {
+            *last += bytes.saturating_sub(laid);
+        }
+        poem_compiler::chunk::RingRegion {
+            bytes,
+            atom: buffer.bytes,
+            placement: poem_compiler::chunk::RingPlacement::ChunkStart,
+            layer_bytes,
+        }
+    }
+}
+
 /// How `trace`'s kv rows sit in the state pool's chunks: the compiler's
 /// recipe for a server card, its token slots this paging's pages. Where the
 /// paging keeps no window (the widest spans the context) every row is a list
@@ -5177,6 +5575,7 @@ fn lay(
     experts: &[usize],
     rows: bool,
     one_window: bool,
+    windowed: bool,
 ) -> Result<layout::Layout> {
     let context = if paging.window.is_some() {
         paging.context()
@@ -5198,10 +5597,14 @@ fn lay(
     };
     // Each plane at the bytes its slot holds: laid scales as their atoms.
     let view = crate::weights::laid_view(trace);
-    let recipe =
-        poem_compiler::chunk::plan(&view, budgets, &profile).map_err(|why| Fault::Unbound {
-            what: format!("a chunk recipe for this load's cache rows: {why}"),
-        })?;
+    let recipe = if windowed {
+        poem_compiler::chunk::plan_windowed(&view, budgets, &profile, &CudaRings)
+    } else {
+        poem_compiler::chunk::plan(&view, budgets, &profile)
+    }
+    .map_err(|why| Fault::Unbound {
+        what: format!("a chunk recipe for this load's cache rows: {why}"),
+    })?;
     let banks: Vec<(usize, u64, u64)> = if experts.is_empty() {
         Vec::new()
     } else {
@@ -5254,6 +5657,10 @@ fn chunks_at(layout: &layout::Layout, paging: &Paging, pages: u64, slots: u32) -
                     .fixed
                     .as_ref()
                     .map_or(1, |fixed| u64::from(fixed.pieces)),
+        )
+        + layout.chunks_for(
+            Kind::Ring,
+            u64::from(slots) * layout.ring.as_ref().map_or(0, |ring| u64::from(ring.pieces)),
         );
     u32::try_from(chunks).unwrap_or(u32::MAX)
 }
@@ -5613,6 +6020,7 @@ mod tests {
                     rows: Vec::new(),
                     tables: Vec::new(),
                 }),
+                ring: None,
                 rs: None,
                 instance: shape(layout::INSTANCE, 0, layout::INSTANCE_SLOT),
                 channel: shape(layout::CHANNEL, 0, layout::CHANNEL_SLOT),
@@ -5729,6 +6137,7 @@ mod tests {
             list: Some(shape(layout::LIST, 16, 7)),
             windows: Vec::new(),
             fixed: None,
+            ring: None,
             rs: None,
             instance: shape(layout::INSTANCE, 0, 512),
             channel: shape(layout::CHANNEL, 0, 2048),
