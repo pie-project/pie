@@ -917,6 +917,14 @@ impl FireCtx<'_> {
             .rs_scratch
             .filter(|_| p.rs.rows_ext > 0)
             .map(|(ptr, bytes)| crate::run::RsScratch::new(ptr, bytes, p.rs.rows_ext));
+        // A hybrid's fires buffer recurrent rows, and every hybrid load binds
+        // beam groups (the engine states `Port::Parents`), whose fires fold
+        // ahead of their body. A size-only walk of a buffering composition
+        // walks those folds too, over one stand-in group, so each fold kernel
+        // the trace's recurrences dispatch is resolved before ready, not on
+        // a group's first serving fire.
+        let folds_ahead = p.rs.group_folds
+            || (crate::sizing::active() && p.rs.body.buffers() && self.buffers.is_some());
         if p.rs.body.buffers()
             && let Some(buffers) = self.buffers
         {
@@ -937,13 +945,13 @@ impl FireCtx<'_> {
                 extended: p.rs.body == record::RsBody::Replays,
                 splits: p.rs.body == record::RsBody::Splits,
                 scratch: rs_scratch.as_ref(),
-                folds: p.rs.group_folds.then_some((tables.folds, tables.fold_entries)),
+                folds: folds_ahead.then_some((tables.folds, tables.fold_entries.max(1))),
             });
         }
         // The fire's beam group folds, every layer's, on its stream ahead of
         // its body (§11.3): no step of the fire reads a state before its
         // fold.
-        if p.rs.group_folds {
+        if folds_ahead {
             run.fold_groups_ahead()
                 .map_err(|error| Fault::from(crate::error::kernel(error)))?;
         }
