@@ -75,16 +75,39 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
     Fixed records hold state only. Forks share rs-list slots by refcount; a write into a shared, partially filled tail
     slot is preceded by a slot copy (runtime asks via `copy_slots`, or the engine copies a `(src, dst)` pair stated in
     the fire). Contract 15 (group CoW of the state record when a lane folds) still applies to the state record.
-19. **Sliding-window kv is a trimmed list, not a ring (supersedes every ring rule; amends 3, 4, 11, 12).**
-    Facts state window lists as `SlotKind::List` shapes with a `window` (rows retained); one shape per distinct
-    window, layers of that window layer-major inside the slot; T = the kv page size. `Lane.tables` for a window list
-    has the same token-order length as the full table; slots the runtime has trimmed are ref 0 (null chunk) — today's
-    window kernels already skip pages outside the window, so they read it unchanged. The runtime drops a slot from a
-    working set once its last row is below `committed_end - window` (rows of a fire still being decided — spec drafts —
-    are never counted as committed); freeing goes through refcount and the per-fire epoch (17). Prefill longer than the
-    window simply holds more slots until the next trim. Forks / prefix-cache entries share window slots by refcount
-    like the kv list; a write into a shared partially filled tail slot follows the kv list's tail rule. No ring cap,
-    ring addressing, gcd form or `kv.window_copies` remain; a backend's ring path is deleted, not kept.
+19. **A windowed layer is state + buffer, exactly like a recurrent layer (user ruling: "a window model has exactly
+    the same mental model as a recurrent model. Use the buffer. The window holds only folded rows."; supersedes the
+    trimmed window lists of the earlier 19 and the ring shapes, ring addressing and gcd form of 3, 4, 11, 12).**
+    Windowed layers are the sliding-window attention layers (Gemma, gpt-oss, and the window part of a windowed sink
+    attention). Attention over rows chosen by score (index-selected or compressed attention) is no window: it stays kv.
+    - **State.** Per windowed layer the lane's record holds a ring of W rows (that layer's K and V) holding only
+      folded rows, row r at ring place `r mod W`, and, for a layer with S sink rows, those S rows beside it (folded
+      once, never dropped). The ring and sinks are record bytes: they copy, park and restore with the record as
+      opaque bytes and are costed in the record's tier. Their layout is the engine's (a plane of its own or inside
+      the state bytes); the contract states only the bytes per windowed layer, at least (W + S) times that layer's
+      K + V row bytes, padded as the engine pads them. W need not be a page multiple.
+    - **Buffer.** The windowed layers' K/V rows `[folded, p)` live in window-buffer slots, a slot list like kv: taken
+      on demand as rows accrue (no carried-rows bound; a fire too wide for the pool is cut like chunked prefill,
+      never refused), named in the lane's tables in token order. A fold frees every buffer slot whose rows are all
+      folded. On a hybrid the rs rows keep their own buffer (18, 20); window K/V use this list.
+    - **Fold.** The lane's folded index (`KvDelta.folded`, the one `RsVerb::Buffer.folded` states) is the only
+      source of truth. Advancing folded from f to f' writes buffer rows `[f, f')` into the ring at `row mod W`,
+      dropping the oldest past W, in the same fold step as rs. Lanes sharing a folded window (a beam group: the
+      shared common-ancestor lagged fold) fold once; 12 and 15 order a group's fold after every lane read.
+    - **Read.** Row p of a windowed layer reads keys `[0, S)` and `[max(S, p - W + 1), p]` (`[max(0, p - W + 1), p]`
+      for a plain window): those below folded from the ring and sinks, those in `[folded, p]` from the lane's
+      buffer rows in lineage order (the `buffered_reads` lineage the rs replay uses; a lane never reads a sibling's
+      divergent rows) and its own rows. One mask; one softmax over the union.
+    - **Sharing.** A ring shared with a prefix-cache entry (or any other owner at a different fold point) is copied
+      once at its first fold (copy-on-first-fold, bounded by the ring's bytes: the record's `cow != run`), so
+      committed state stays immutable. An auto-checkpoint on a windowed model is a snapshot of the ring. A windowed
+      lane's snapshot is its record plus its unfolded buffer slots, as an rs lane's; window tables are not saved.
+    - **Prefill.** A long prefill streams through the ring in the same fire.
+    - **Gone.** Window lists, their slot tables, ref-0 trimming, `slot_copies` of window lists, `KvCopy.windowed`
+      and `PoolFacts.window_tokens` go. An engine states that it serves windowed layers as ring + buffer
+      (`Capabilities.windowed_state`); until every engine does, the old window-list fields stay in the engine crate
+      marked "removed by the windowed-state change; do not use in new code", and the integration commit removes
+      them everywhere before anything lands (no dual paths in what lands).
 
 20. **rs-list mechanics (fills in 18).** `SlotShape.role: SlotRole` (serde default `State`); the rs list is
     `SlotKind::List { tokens: T_rs, rate: 1 }` with `role: RsBuffer` (refused on non-List). At most one kv list and
@@ -94,17 +117,24 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
     before any lane of the fire reads or writes (after earlier fires); no two copies share a dst; `pages` already
     names dst; `validate_chunks` checks them like table refs. A buffered write no longer forces record CoW. A model
     that buffers rs rows must state an rs-list shape.
-21. **Window-list fields (fills in 19; final after WL2).** `SlotKind::List { tokens, rate, window: Option<u32> }`
-    (serde default None); `window: Some(w)` retains w rows, role State, `tokens` = its own slot size T_w (<= the kv
-    page; compiler picks a power of two >= 16 by waste). `ChunkFacts::validate` refuses two window lists with the
-    same w, `Some(0)`, an RsBuffer with a window, and more than 4 window lists. `Lane.tables` holds the kv list's
-    table and one table per window list, each in that list's own token order: entry i = slot holding rows
-    `[i*T_w, (i+1)*T_w)`, ref 0 (null chunk) where trimmed or not written; `validate_chunks` accepts ref 0 only in a
-    window list's table, never in `slot_copies`. Each list trims on its own: slot i dropped once
-    `(i+1)*T_w - 1 < committed_end - w` (settled commits only; draft rows never count), freed through refcount and
-    the per-fire epoch. Forks / prefix-cache checkpoints share window slots by refcount, list by list. A write into a
-    shared window slot is preceded by a whole-slot copy in `Lane.slot_copies` under that list's shape id (degenerate
-    pools: `KvCopy.windowed` pairs on the pre-launch copy). `KvDelta::window_copies` is removed.
+21. **Windowed-state fields (fills in 19).** `ChunkFacts.windowed: Vec<WindowedLayer { layer, window, sinks,
+    bytes }>` (serde default; layers ascending and distinct, `window > 0`, `bytes > 0`), the rings and sinks a
+    record holds; `ChunkFacts.record_bytes` counts them (validate refuses rings past it). The window buffer is
+    `SlotKind::List { tokens: T, rate: 1, window: None }` with `role: SlotRole::WindowBuffer`: a slot holds T
+    unfolded rows of every windowed layer's K and V, layer-major as the engine lays it. `ChunkFacts::validate`
+    refuses a window buffer of another kind, two window buffers, a window buffer with no windowed layer and windowed
+    layers with none, and any window list beside windowed layers. A lane states `Lane.window: Option<WindowFold {
+    base, fold, lineage }>` (serde default None), on every seated lane of such a load and on no other:
+    `base` is the row entry 0 of the lane's window-buffer table holds (a multiple of T, `<= kv.folded`), `fold` how
+    far the fire advances folded (`FoldLen`, read as `RsVerb::Buffer`'s: a device-counted fold's count reaches the
+    runtime when the fire settles, and the engine keeps the row its rings stand at with the record), `lineage`
+    which buffered rows the windowed layers read. On a hybrid `RsVerb::Buffer` states the same folded, fold and
+    lineage (`Lane::validate` refuses otherwise). The window-buffer table sits in `Lane.tables` under its shape id:
+    entry i = slot of rows `[base + i*T, base + (i+1)*T)`, every entry a real slot (no ref 0). Forks / prefix-cache
+    entries share window-buffer slots by refcount; a write into a shared partly filled slot is preceded by a
+    whole-slot copy in `Lane.slot_copies` under the buffer's shape id (as the rs list's, 20). A copy-on-first-fold
+    of a shared ring is the record's `[run, cow]` with `cow != run`. `Capabilities.windowed_state` (serde default
+    false; `Serves.windowed_state`): a lane stating `window` to an engine without it is refused by name.
 22. **Host and disk tiers of shared shapes (fills in the tiers part of 12).** `ChunkFacts.host_chunks`: host chunks
     of `chunk_bytes`, ids from 0, none reserved, no ChunkTable (a host ref names its own place); any state shape
     (weights excepted) may open any host chunk; a host ref of shape s is `chunk * s.slots_per_chunk + index` at
