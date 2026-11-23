@@ -707,15 +707,24 @@ template <typename T>
     const constant int& page_ints  [[buffer(18)]],
     const device ulong* map        [[buffer(19)]],
     const device int* ext_replay   [[buffer(20)]],
-    uint2 pos [[thread_position_in_grid]]) {
+    uint2 pos [[thread_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]]) {
   const int c = int(pos.x);
   const int r = int(pos.y);
+  // The lanes before this one's extended rows, read side by side across the
+  // simdgroup (one lane `r` a threadgroup row) and summed once, before any
+  // thread of it leaves: a thread each read them all in turn, 63 at a
+  // 64-lane fire's last lane.
+  // A row's last simdgroup may be partial (a thread a channel): its
+  // active lanes, the low ones, share the lanes between them.
+  const int active = int(metal::simd_sum(1u));
+  int before = 0;
+  for (int j = int(simd_lane); j < r; j += active) {
+    before += ext_replay[lane0 + j];
+  }
+  int begin = indptr[r] + metal::simd_sum(before);
   if (c >= channels) {
     return;
-  }
-  int begin = indptr[r];
-  for (int j = 0; j < r; ++j) {
-    begin += ext_replay[lane0 + j];
   }
   begin -= replay[lane0 + r] - ext_replay[lane0 + r];
   const int rep = replay[lane0 + r];
@@ -778,4 +787,4 @@ template [[host_name("causal_conv1d_carried_bfloat16")]]
     device bfloat*, device bfloat*, const constant int&, const constant int&,
     const constant int&, device uchar*, const device int*, const constant uint&,
     const constant uint&, const constant uint&, const constant int&, const device ulong*,
-    const device int*, uint2);
+    const device int*, uint2, uint);

@@ -1479,10 +1479,14 @@ template <typename T, int SG, int VROWS>
   threadgroup ulong u_at_s[kVerifyChunk];
   threadgroup float kn_s[kVerifyChunk][D];
 
-  int begin = indptr[r];
-  for (int j = 0; j < r; ++j) {
-    begin += ext_replay[lane0 + j];
+  // The lanes before this one's extended rows: the simdgroup's 32 threads
+  // read them side by side and sum once, not one after another a thread
+  // (a 64-lane fire's last lane read 63 in turn).
+  int before = 0;
+  for (int j = lane; j < r; j += 32) {
+    before += ext_replay[lane0 + j];
   }
+  int begin = indptr[r] + metal::simd_sum(before);
   begin -= replay[lane0 + r] - ext_replay[lane0 + r];
   const int rep = min(replay[lane0 + r], kVerifyChunk);
   const device int* ids = slots + size_t(lane0 + r) * pie_state_pieces(map);
