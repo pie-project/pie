@@ -25,6 +25,11 @@ pub struct DeviceBoot {
     /// `$PIE_HOME/profiles`, where a native user's adapter profiles live.
     pub profiles: Option<PathBuf>,
 
+    /// Whether the load times what no stored or committed profile states
+    /// under a matching key (`[engine] measure`, `pie serve --no-measure`):
+    /// skipped, each rate, curve and settle is served by the estimate, named.
+    pub measure: engine::rates::Measuring,
+
     /// Diagnostics: the chunk size the pool's recipe aims at, in place of
     /// the profile's (a small one cuts records into pieces).
     pub chunk_bytes: Option<u64>,
@@ -51,6 +56,7 @@ impl Default for DeviceBoot {
             backends: None,
             power_preference: crate::boot::DEFAULT_POWER_PREFERENCE.to_string(),
             profiles: None,
+            measure: engine::rates::Measuring::Time,
             chunk_bytes: None,
             #[cfg(feature = "test-limits")]
             max_buffer: None,

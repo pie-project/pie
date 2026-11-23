@@ -1136,6 +1136,57 @@ pub fn rates_at_load(
     max_submit: Option<std::time::Duration>,
     measure: impl FnOnce(Option<std::time::Duration>) -> Result<Measured, String>,
 ) -> Result<profile::Profile, String> {
+    resolve_at_load(
+        chip,
+        keys,
+        save,
+        room,
+        max_submit,
+        Measuring::Time,
+        measure,
+    )
+}
+
+/// Whether a load times what no layer states (`[engine] measure`, `pie
+/// serve --no-measure`): [`Measuring::Time`] measures each rate, curve and
+/// settle no layer states under a matching key, before the load is ready,
+/// and stores it; [`Measuring::Skip`] times nothing: each is served by the
+/// engine's estimate, named where it is, and nothing is stored for it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Measuring {
+    #[default]
+    Time,
+    Skip,
+}
+
+impl Measuring {
+    /// `[engine] measure`'s value: `true` times, `false` skips.
+    #[must_use]
+    pub fn of(measure: bool) -> Measuring {
+        if measure {
+            Measuring::Time
+        } else {
+            Measuring::Skip
+        }
+    }
+}
+
+/// [`rates_at_load`] under `measuring`: where it skips, nothing is timed or
+/// saved, each key of `keys` no layer states is said, by name, to be served
+/// by the estimate, and kept as skipped in the profile
+/// (`profile::fire::Tuned::skipped`), so each choice that reads it takes
+/// the engine's estimate and names it. A checked-in profile stating a rate
+/// this pie does not read is refused either way: it is a build's fault, not
+/// a measurement.
+pub fn resolve_at_load(
+    chip: profile::Profile,
+    keys: &[&'static str],
+    save: Option<SaveTo<'_>>,
+    room: Option<u64>,
+    max_submit: Option<std::time::Duration>,
+    measuring: Measuring,
+    measure: impl FnOnce(Option<std::time::Duration>) -> Result<Measured, String>,
+) -> Result<profile::Profile, String> {
     // A checked-in file this device takes states a rate this pie does not
     // read: it was refused whole, and the load is refused by it.
     if let Some(stale) = &chip.tuned().refused {
@@ -1150,6 +1201,18 @@ pub fn rates_at_load(
         return Ok(chip);
     }
     let lacked = stated.missing(keys);
+    if measuring == Measuring::Skip {
+        for key in &lacked {
+            tracing::info!(
+                "rates: skipped: `[rates] {key}`: nothing timed (`[engine] measure = false`) and no \
+                 layer states it under a matching key; served by the estimate, which names what \
+                 it takes in its place"
+            );
+        }
+        let mut tuned = chip.tuned().clone();
+        tuned.skipped.extend(lacked.iter().map(|key| (*key).to_string()));
+        return Ok(chip.with_tuned(tuned));
+    }
     // The step lays its buffers before any of the load's: where the load's
     // budget leaves the device less than it lays at most, the load is
     // refused by name, never left to wait for memory.
@@ -1411,7 +1474,7 @@ mod tests {
             attn_tflops_by_rows_keys: None,
             product_ns: None,
             kernel_tflops_by_shape: None,
-            dense_settled: None,
+            dense_settled: Vec::new(),
             measured_on: None,
             measured_by: None,
         }
@@ -1575,6 +1638,385 @@ mod tests {
             ),
             ..all()
         }
+    }
+
+    /// A shelf of the toy backend carrying `committed`, a committed
+    /// measured profile of `Card X` (none where `None`).
+    fn shelf_with(committed: Option<String>) -> &'static profile::Shelf {
+        let seeded: Vec<(&'static str, &'static str)> = committed
+            .map(|text| {
+                let name: &'static str = Box::leak(profile::measured_name("Card X").into_boxed_str());
+                (name, &*Box::leak(text.into_boxed_str()))
+            })
+            .into_iter()
+            .collect();
+        Box::leak(Box::new(profile::Shelf {
+            backend: "toy",
+            seeded: Box::leak(seeded.into_boxed_slice()),
+            derived: None,
+        }))
+    }
+
+    /// The user's file a load under `build` saves, as `pie tune export`
+    /// reads it: every rate measured, each keyed.
+    fn stored_text(build: &Build) -> String {
+        saved_text(None, &keyed(build), &provenance("toy", "a test"))
+    }
+
+    /// One load of `Card X` from `shelf` with the user's files under `dir`:
+    /// the keys it measured (none where it measured nothing), each measured
+    /// under `build`, and the profile and report it resolved.
+    fn load_from(
+        shelf: &profile::Shelf,
+        dir: &std::path::Path,
+        build: &Build,
+        measuring: Measuring,
+    ) -> (Vec<&'static str>, profile::Profile, profile::Report) {
+        let registry = profile::Registry::new("toy", &[], &[]);
+        let facts = profile::Facts::of(&registry);
+        let (chip, report) = shelf.resolve_keyed(&registry, "Card X", &facts, Some(dir), build);
+        let lacked = chip.rates().missing(&profile::fire::KEYS);
+        let measured = std::cell::Cell::new(Vec::new());
+        let loaded = resolve_at_load(
+            chip,
+            &profile::fire::KEYS,
+            Some(SaveTo {
+                path: shelf.user_path(dir, "Card X"),
+                provenance: provenance("toy", "a test"),
+                registry: &registry,
+            }),
+            None,
+            None,
+            measuring,
+            |_| {
+                measured.set(lacked.clone());
+                Ok(Measured {
+                    rates: keyed(build).only(&lacked),
+                    unsettled: false,
+                })
+            },
+        )
+        .unwrap();
+        (measured.take(), loaded, report)
+    }
+
+    fn home(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("pie-rates-{name}-{}", std::process::id()))
+    }
+
+    /// A clean home whose device pie carries a committed measured profile
+    /// of, under matching keys: nothing is measured or saved, every entry
+    /// taken from the committed profile and said so, by its key.
+    #[test]
+    fn a_committed_entry_whose_key_matches_is_taken_and_nothing_measured() {
+        let build = Build {
+            on: "toy 10de:2c31 driver 1",
+            code: vec![("gemm", 7), ("copy", 9)],
+        };
+        let registry = profile::Registry::new("toy", &[], &[]);
+        let committed =
+            profile::export(&registry, "Card X", &stored_text(&build), "user.toml").unwrap();
+        let shelf = shelf_with(Some(committed));
+        let dir = home("committed-taken");
+        let (measured, loaded, report) = load_from(shelf, &dir, &build, Measuring::Time);
+        assert_eq!(measured, Vec::<&str>::new(), "{:#?}", report.stored);
+        assert_eq!(loaded.rates().launch_ns, all().launch_ns);
+        assert!(!loaded.tuned().measured_this_load);
+        assert!(!shelf.user_path(&dir, "Card X").exists(), "nothing is saved");
+        assert!(
+            report.stored.iter().any(|l| l.starts_with(
+                "`gemm_tflops_by_rows`: committed (committed measured profile \
+                 card-x.measured.toml), its key matches: method v1, kernels [gemm 0x00000007]"
+            )),
+            "{:#?}",
+            report.stored
+        );
+        assert_eq!(
+            report
+                .layers
+                .last()
+                .cloned()
+                .unwrap_or(profile::Source::Defaults),
+            profile::Source::Committed("card-x.measured.toml".into())
+        );
+    }
+
+    /// A kernel whose code changed since the committed profile was
+    /// exported: its entries alone are measured (and saved to the user's
+    /// file), every other taken from the committed profile; the next load
+    /// takes the measured entry from the user's file and measures nothing.
+    #[test]
+    fn a_changed_kernel_measures_only_its_committed_entries() {
+        let exported = Build {
+            on: "toy 10de:2c31 driver 1",
+            code: vec![("gemm", 7), ("copy", 9)],
+        };
+        let registry = profile::Registry::new("toy", &[], &[]);
+        let committed =
+            profile::export(&registry, "Card X", &stored_text(&exported), "user.toml").unwrap();
+        let shelf = shelf_with(Some(committed));
+        let dir = home("committed-changed");
+        let now = Build {
+            code: vec![("gemm", 8), ("copy", 9)],
+            ..exported
+        };
+        let (measured, _, report) = load_from(shelf, &dir, &now, Measuring::Time);
+        assert_eq!(measured, ["gemm_tflops_by_rows"], "{:#?}", report.stored);
+        assert!(
+            report.stored.iter().any(|l| l.contains(
+                "committed `gemm_tflops_by_rows`: not taken, kernel `gemm`'s code changed"
+            )),
+            "{:#?}",
+            report.stored
+        );
+        let (again, loaded, report) = load_from(shelf, &dir, &now, Measuring::Time);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(again, Vec::<&str>::new(), "{:#?}", report.stored);
+        assert!(
+            report
+                .stored
+                .iter()
+                .any(|l| l.starts_with("`gemm_tflops_by_rows`: stored (user profile")),
+            "{:#?}",
+            report.stored
+        );
+        assert!(
+            report
+                .stored
+                .iter()
+                .any(|l| l.starts_with("`launch_ns`: committed")),
+            "{:#?}",
+            report.stored
+        );
+        assert_eq!(loaded.rates().complete(&profile::fire::KEYS), true);
+        // Another driver: the committed profile is none of this device's.
+        let other = Build {
+            on: "toy 10de:2c31 driver 2",
+            ..now
+        };
+        let dir = home("committed-driver");
+        let (measured, _, _) = load_from(shelf, &dir, &other, Measuring::Time);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(measured, profile::fire::KEYS);
+    }
+
+    /// The user's stored entry under a matching key is taken over the
+    /// committed one; where the user's key no longer matches, the committed
+    /// entry whose key does is taken.
+    #[test]
+    fn a_users_entry_is_taken_over_a_committed_one() {
+        let build = Build {
+            on: "toy 10de:2c31 driver 1",
+            code: vec![("gemm", 7), ("copy", 9)],
+        };
+        let registry = profile::Registry::new("toy", &[], &[]);
+        let committed = profile::export(
+            &registry,
+            "Card X",
+            &saved_text(
+                None,
+                &profile::fire::Rates {
+                    launch_ns: Some(2222),
+                    ..keyed(&build)
+                },
+                &provenance("toy", "a test"),
+            ),
+            "user.toml",
+        )
+        .unwrap();
+        let shelf = shelf_with(Some(committed));
+        let dir = home("user-over-committed");
+        let path = shelf.user_path(&dir, "Card X");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut user = profile::fire::Rates {
+            launch_ns: Some(1111),
+            ..keyed(&build)
+        }
+        .only(&["launch_ns"]);
+        user.measured_on = Some("toy 10de:2c31 driver 1".into());
+        std::fs::write(&path, saved_text(None, &user, &provenance("toy", "a test"))).unwrap();
+        let (measured, loaded, report) = load_from(shelf, &dir, &build, Measuring::Time);
+        assert_eq!(measured, Vec::<&str>::new());
+        assert_eq!(loaded.rates().launch_ns, Some(1111), "{:#?}", report.stored);
+        assert!(
+            report
+                .stored
+                .iter()
+                .any(|l| l.starts_with("`launch_ns`: stored (user profile")),
+            "{:#?}",
+            report.stored
+        );
+        // The user's launch keyed by a kernel whose code changed since: the
+        // committed launch, whose key matches, is taken.
+        user.measured_by = Some(vec![(
+            "launch_ns".into(),
+            profile::fire::MeasuredBy {
+                method: 1,
+                kernels: vec![("copy".into(), 8)],
+            },
+        )]);
+        std::fs::write(&path, saved_text(None, &user, &provenance("toy", "a test"))).unwrap();
+        let (measured, loaded, report) = load_from(shelf, &dir, &build, Measuring::Time);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(measured, Vec::<&str>::new());
+        assert_eq!(loaded.rates().launch_ns, Some(2222), "{:#?}", report.stored);
+        assert!(
+            report
+                .stored
+                .iter()
+                .any(|l| l.contains("stored `launch_ns`: not taken, kernel `copy`'s code changed")),
+            "{:#?}",
+            report.stored
+        );
+    }
+
+    /// `pie tune export` of a user's file reads back to the entries it
+    /// stores, the same text whatever order they were stored in, with no
+    /// date or path; an entry stored without a key is refused by name.
+    #[test]
+    fn an_export_reads_back_the_entries_it_stores() {
+        let build = Build {
+            on: "toy 10de:2c31 driver 1",
+            code: vec![("gemm", 7), ("copy", 9)],
+        };
+        let registry = profile::Registry::new("toy", &[], &[]);
+        let mut rates = keyed(&build);
+        rates.kernel_tflops_by_shape = Some(vec![
+            profile::fire::KernelCurve {
+                kind: profile::fire::KernelCurve::TILE,
+                key: 64,
+                n: 1024,
+                k: 1024,
+                curve: vec![(1, 0.5), (64, 9.0)],
+                stop: None,
+                spread: vec![(1, 0.01), (64, 0.02)],
+                by: profile::fire::MeasuredBy {
+                    method: 1,
+                    kernels: vec![("gemm".into(), 7)],
+                },
+            },
+            profile::fire::KernelCurve {
+                kind: profile::fire::KernelCurve::VECTOR,
+                key: 4,
+                n: 1024,
+                k: 1024,
+                curve: vec![(1, 0.3)],
+                stop: Some((16, profile::fire::KernelCurve::BEATEN)),
+                spread: vec![(1, 0.01)],
+                by: profile::fire::MeasuredBy {
+                    method: 1,
+                    kernels: vec![("gemm".into(), 7)],
+                },
+            },
+        ]);
+        rates.dense_settled = vec![
+            profile::fire::DenseSettled {
+                method: 1,
+                of: 5,
+                code: 6,
+                ranges: vec![[1, 1, 0, 0, 0, 0]],
+            },
+            profile::fire::DenseSettled {
+                method: 1,
+                of: 9,
+                code: 6,
+                ranges: vec![[1, 1, 1, 4, 0, 1]],
+            },
+        ];
+        let user = saved_text(None, &rates, &provenance("toy", "a test"));
+        let text = profile::export(&registry, "Card X", &user, "user.toml").unwrap();
+        let read = registry
+            .parse(&text, "card-x.measured.toml", profile::Strict::Measured)
+            .unwrap();
+        let stored = registry
+            .parse(&user, "user.toml", profile::Strict::User)
+            .unwrap();
+        assert_eq!(read.tuned.rates, stored.tuned.rates.clone().ordered());
+        // Stored in another order, the same text.
+        let mut shuffled = rates.clone();
+        shuffled.measured_by.as_mut().unwrap().reverse();
+        shuffled.kernel_tflops_by_shape.as_mut().unwrap().reverse();
+        let again = saved_text(None, &shuffled, &provenance("toy", "another day"));
+        assert_eq!(
+            profile::export(&registry, "Card X", &again, "elsewhere.toml").unwrap(),
+            text
+        );
+        assert!(!text.contains(&today()), "{text}");
+        assert!(!text.contains("user.toml"), "{text}");
+        // A decision file is refused the measured profile's keys; a
+        // measured profile is refused a decision.
+        assert!(registry
+            .parse(&text, "x.toml", profile::Strict::CheckedIn)
+            .is_err());
+        // An entry stored without a key.
+        let mut unkeyed = rates.clone();
+        unkeyed
+            .measured_by
+            .as_mut()
+            .unwrap()
+            .retain(|(rate, _)| rate != "hbm_gbps");
+        let refused = profile::export(
+            &registry,
+            "Card X",
+            &saved_text(None, &unkeyed, &provenance("toy", "a test")),
+            "user.toml",
+        )
+        .unwrap_err();
+        assert!(
+            refused.contains("`rates.hbm_gbps` is stored without a key"),
+            "{refused}"
+        );
+        let mut nowhere = rates;
+        nowhere.measured_on = None;
+        let refused = profile::export(
+            &registry,
+            "Card X",
+            &saved_text(None, &nowhere, &provenance("toy", "a test")),
+            "user.toml",
+        )
+        .unwrap_err();
+        assert!(refused.contains("names no device"), "{refused}");
+    }
+
+    /// A load under `measure = false` with no profile measures nothing,
+    /// saves nothing and loads, each key it lacked kept as skipped, by name.
+    #[test]
+    fn a_skipping_load_measures_nothing_and_names_each_skip() {
+        let build = Build {
+            on: "toy 10de:2c31 driver 1",
+            code: vec![("gemm", 7), ("copy", 9)],
+        };
+        let shelf = shelf_with(None);
+        let dir = home("skip");
+        let (measured, loaded, report) = load_from(shelf, &dir, &build, Measuring::Skip);
+        assert_eq!(measured, Vec::<&str>::new());
+        assert!(!shelf.user_path(&dir, "Card X").exists(), "nothing is saved");
+        assert_eq!(loaded.tuned().skipped, profile::fire::KEYS, "{report:?}");
+        assert!(!loaded.tuned().measured_this_load);
+        assert_eq!(loaded.rates(), profile::fire::Rates::default());
+        // A committed profile still serves what it states under skip.
+        let registry = profile::Registry::new("toy", &[], &[]);
+        let committed = profile::export(
+            &registry,
+            "Card X",
+            &saved_text(
+                None,
+                &keyed(&build).only(&["launch_ns", "hbm_gbps"]),
+                &provenance("toy", "a test"),
+            ),
+            "user.toml",
+        )
+        .unwrap();
+        let (measured, loaded, _) =
+            load_from(shelf_with(Some(committed)), &dir, &build, Measuring::Skip);
+        assert_eq!(measured, Vec::<&str>::new());
+        assert_eq!(loaded.rates().launch_ns, all().launch_ns);
+        assert_eq!(
+            loaded.tuned().skipped.len(),
+            profile::fire::KEYS.len() - 2,
+            "{:?}",
+            loaded.tuned().skipped
+        );
     }
 
     /// Loads of one home under keyed measurements: a second load of another
@@ -2410,7 +2852,7 @@ mod tests {
             attn_tflops_by_rows_keys: None,
             product_ns: None,
             kernel_tflops_by_shape: None,
-            dense_settled: None,
+            dense_settled: Vec::new(),
             measured_on: None,
             measured_by: None,
         };

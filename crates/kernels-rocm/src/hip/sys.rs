@@ -85,6 +85,8 @@ table!(Hip from "libamdhip64.so" {
     fn hipSetDevice(device: c_int) -> HipError;
     fn hipGetDevice(device: *mut c_int) -> HipError;
     fn hipGetDevicePropertiesR0600(props: *mut c_void, device: c_int) -> HipError;
+    fn hipDriverGetVersion(version: *mut c_int) -> HipError;
+    fn hipRuntimeGetVersion(version: *mut c_int) -> HipError;
     fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> HipError;
     fn hipMemcpyAsync(dst: *mut c_void, src: *const c_void, bytes: usize, kind: c_int, stream: Stream) -> HipError;
     fn hipStreamIsCapturing(stream: Stream, status: *mut c_int) -> HipError;

@@ -42,26 +42,54 @@ impl Measured {
 
 const HEADER: &str = "pie-bodies 3";
 
-/// The record's file for a deployment whose bodies `parts` shape.
+/// The record's file for a deployment whose bodies `parts` shape, under
+/// this build ([`build`]): what the bodies hold moves with the engine's code
+/// as much as with its kernels', so the build keys it by its content.
 #[must_use]
 pub(crate) fn path(cache_dir: &Path, parts: &str) -> PathBuf {
-    use std::hash::{Hash, Hasher};
-    let build = std::env::current_exe()
-        .and_then(std::fs::metadata)
-        .map(|meta| {
-            let time = meta
-                .modified()
-                .ok()
-                .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
-                .map_or(0, |at| at.as_nanos());
-            format!("{}:{time}", meta.len())
-        })
-        .unwrap_or_default();
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    (env!("CARGO_PKG_VERSION"), build, parts).hash(&mut hasher);
+    let mut key = build().to_le_bytes().to_vec();
+    key.extend_from_slice(parts.as_bytes());
     cache_dir
         .join("bodies")
-        .join(format!("{:016x}", hasher.finish()))
+        .join(format!("{:016x}", content_hash(&key)))
+}
+
+/// The running executable's content, hashed once a process: a rebuild that
+/// changes nothing keeps its records, and a copied or touched binary keeps
+/// them too; any change to the code is another build. Where the binary
+/// does not read, every load is a build of its own (nothing is reused).
+fn build() -> u64 {
+    static BUILD: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BUILD.get_or_init(|| {
+        let started = std::time::Instant::now();
+        let Ok(bytes) = std::env::current_exe().and_then(std::fs::read) else {
+            return std::process::id().into();
+        };
+        let hash = content_hash(&bytes);
+        eprintln!(
+            "engine-cuda: the bodies record is keyed by this build's content: {} MiB hashed in \
+             {:.1} ms",
+            bytes.len() >> 20,
+            started.elapsed().as_secs_f64() * 1e3
+        );
+        hash
+    })
+}
+
+/// A fast 64-bit hash of `bytes`, a word at a time (a multiply and a
+/// rotate a word), the length folded in: a key for files, not a defence.
+fn content_hash(bytes: &[u8]) -> u64 {
+    const K: u64 = 0x517c_c1b7_2722_0a95;
+    let mut hash = bytes.len() as u64;
+    let mut words = bytes.chunks_exact(8);
+    for word in &mut words {
+        let word = u64::from_le_bytes(word.try_into().expect("an 8-byte chunk"));
+        hash = (hash.rotate_left(5) ^ word).wrapping_mul(K);
+    }
+    for &byte in words.remainder() {
+        hash = (hash.rotate_left(5) ^ u64::from(byte)).wrapping_mul(K);
+    }
+    hash
 }
 
 /// The record at `path`; none where it is missing or not whole.

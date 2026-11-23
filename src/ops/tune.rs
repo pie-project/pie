@@ -2,7 +2,7 @@
 //! backend can measure, and write the result to the user's shelf.
 
 use anyhow::{Result, anyhow, bail};
-use clap::Args;
+use clap::{Args, Subcommand};
 use runtime::engine::profiles::backends;
 
 use super::profile::text;
@@ -10,6 +10,9 @@ use crate::ui::{self, Answer, Palette};
 
 #[derive(Args, Debug)]
 pub struct TuneArgs {
+    #[command(subcommand)]
+    pub cmd: Option<TuneCmd>,
+
     /// The backend to tune; needed only where this build hosts several.
     pub backend: Option<String>,
 
@@ -61,7 +64,37 @@ pub struct TuneArgs {
     pub rates: bool,
 }
 
+#[derive(Subcommand, Debug)]
+pub enum TuneCmd {
+    /// Write a device's stored measurements (the user's profile a load
+    /// keeps them in) as a committed measured profile,
+    /// `<out>/<device>.measured.toml`: each entry with its key, in a fixed
+    /// order, no date or path. Checked in under
+    /// `crates/engine-<backend>/profiles/`, a load of that device takes each
+    /// entry whose key matches and measures nothing more for it.
+    Export {
+        /// The engine whose stored measurements to write: `vulkan`, `wgpu`,
+        /// `cuda` (CUDA or ROCm, as the build hosts it).
+        #[arg(long)]
+        engine: String,
+        /// The device, by number (`vulkan:<n>`); the first without it.
+        #[arg(long, value_name = "N")]
+        device: Option<u32>,
+        /// The directory to write into: the engine's `profiles/`.
+        #[arg(long, value_name = "DIR")]
+        out: std::path::PathBuf,
+    },
+}
+
 pub fn run(args: TuneArgs) -> Result<Answer> {
+    if let Some(TuneCmd::Export {
+        engine,
+        device,
+        out,
+    }) = &args.cmd
+    {
+        return export(engine, *device, out).map(text);
+    }
     let mut all = backends();
     let names: Vec<&str> = all.iter().map(|b| b.name).collect();
     let tunable: Vec<&str> = all
@@ -217,4 +250,48 @@ fn write_profile(
         backend.name
     ));
     Ok(out)
+}
+
+/// `pie tune export`: the stored measurements of `engine`'s device `device`
+/// written to `out` in committed form (`profile::export`).
+fn export(engine: &str, device: Option<u32>, out: &std::path::Path) -> Result<String> {
+    let all = backends();
+    let names: Vec<&str> = all.iter().map(|b| b.name).collect();
+    let backend = all
+        .iter()
+        .find(|b| b.name == engine)
+        .ok_or_else(|| anyhow!("this build hosts no `{engine}` engine; it hosts {names:?}"))?;
+    let dir = crate::paths::pie_home().join("profiles");
+    let cache = crate::paths::pie_home().join("cache");
+    let exported = runtime::engine::profiles::export(backend, &dir, &cache, device.unwrap_or(0))
+        .map_err(|e| anyhow!(e))?;
+    std::fs::create_dir_all(out)?;
+    let path = out.join(&exported.name);
+    std::fs::write(&path, &exported.text)?;
+    let covers = match &exported.covers {
+        Some((name, text)) => {
+            let at = out.join(name);
+            std::fs::write(&at, text)?;
+            format!(
+                "wrote {}: the host covers the home's cache holds for it; listed in \
+                 crates/engine-{}/src/chip.rs `COVERS` (`include_str!(\"../profiles/{name}\")`), \
+                 a boot whose cover key matches one takes it.\n",
+                ui::short_path(&at),
+                backend.name,
+            )
+        }
+        None => "no host cover is cached for it in this home.\n".to_string(),
+    };
+    let main = format!(
+        "wrote {} from {}: the stored measurements of {}, each under its key.\n\
+         A build carries it once it is listed beside the engine's checked-in profiles \
+         (crates/engine-{}/src/chip.rs, `\"{}\"`); a load of that device then takes each entry \
+         whose key matches.\n",
+        ui::short_path(&path),
+        ui::short_path(&exported.from),
+        exported.device,
+        backend.name,
+        exported.name,
+    );
+    Ok(main + &covers)
 }

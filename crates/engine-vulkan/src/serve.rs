@@ -113,6 +113,7 @@ impl Serve for Api {
             tuning,
             boot.profiles.as_deref(),
             <Self as Serve>::submit_bound(boot),
+            boot.measure,
         )?;
         Ok((device, tuning))
     }
@@ -133,6 +134,7 @@ impl Serve for Api {
             shapes,
             model_bytes,
             top_rows,
+            boot.measure,
         )
     }
 
@@ -160,6 +162,24 @@ impl Serve for Api {
         )
     }
 
+    fn time_for_bound(
+        device: &Context,
+        tuning: &crate::tuning::Tuning,
+        tier: kernels_slang::Tier,
+        max_submit: std::time::Duration,
+        at: &engine_gpu::rates::ForBound,
+    ) -> Result<engine_gpu::rates::BoundTimes> {
+        let timer = |frame: crate::device::Frame| {
+            let started = std::time::Instant::now();
+            let span = frame.commit_spanned()?;
+            Ok((
+                span.filter(|&ns| ns > 0),
+                started.elapsed().as_nanos() as u64,
+            ))
+        };
+        engine_gpu::rates::for_bound::<Api, _>(device, tuning, tier, &timer, max_submit, at)
+    }
+
     fn save_rates(
         device: &Context,
         boot: &crate::api::DeviceBoot,
@@ -170,6 +190,14 @@ impl Serve for Api {
 
     fn chunk_bytes(boot: &crate::api::DeviceBoot) -> Option<u64> {
         boot.chunk_bytes
+    }
+
+    fn committed_covers() -> &'static [&'static str] {
+        crate::chip::COVERS
+    }
+
+    fn measuring(boot: &crate::api::DeviceBoot) -> engine::rates::Measuring {
+        boot.measure
     }
 
     fn submit_bound(boot: &crate::api::DeviceBoot) -> Option<std::time::Duration> {

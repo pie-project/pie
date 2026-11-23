@@ -213,8 +213,15 @@ shelved!(
         "sm120/nvidia-rtx-pro-4500-blackwell.toml",
         "sm120/nvidia-rtx-pro-6000-blackwell-server-edition.toml",
         "sm121.toml",
+        // Committed measured profiles (`pie tune export --engine cuda`).
+        "nvidia-l40s.measured.toml",
     ],
-    rocm: ["gfx94.toml", "gfx94/amd-instinct-mi300x.toml"],
+    rocm: [
+        "gfx94.toml",
+        "gfx94/amd-instinct-mi300x.toml",
+        // Committed measured profiles (`pie tune export --engine cuda`).
+        "amd-instinct-mi300x-vf.measured.toml",
+    ],
 );
 
 pub static SHELF: Shelf = Shelf {
@@ -355,10 +362,31 @@ pub fn profile(overrides: &str) -> Profile {
 }
 
 /// Resolve the profile one load runs under: its compute capability's
-/// family file, the file for this GPU, then the user's.
+/// family file, the file for this GPU, then the user's, each as it states
+/// itself (no stored measurement checked against a build): what `pie tune`
+/// and `pie profile` read.
 #[must_use]
 pub fn resolve(device: &str, facts: &Facts, profiles: Option<&Path>) -> (Profile, Report) {
     SHELF.resolve(registry(), device, facts, profiles)
+}
+
+/// [`resolve`] for a load: also the device's committed measured profile
+/// (`<device>.measured.toml`), and each stored measurement, the committed
+/// profile's and the user's, taken where its key matches this build on this
+/// device (`keys`) and dropped to be measured again where it does not, each
+/// drop said in the load log.
+#[must_use]
+pub fn resolve_keyed(
+    device: &str,
+    facts: &Facts,
+    profiles: Option<&Path>,
+    keys: &crate::stored::Keys,
+) -> (Profile, Report) {
+    let (profile, report) = SHELF.resolve_keyed(registry(), device, facts, profiles, keys);
+    for line in &report.stored {
+        eprintln!("engine-cuda: {line}");
+    }
+    (profile, report)
 }
 
 #[cfg(test)]
@@ -396,7 +424,8 @@ mod tests {
         SHELF
             .check_beside(registry(), &dir, BESIDE)
             .unwrap_or_else(|e| panic!("{e}"));
-        for (name, text) in SEEDED.iter().filter(|(n, _)| !n.contains('/')) {
+        let family = |n: &str| !n.contains('/') && !n.ends_with(".measured.toml");
+        for (name, text) in SEEDED.iter().filter(|(n, _)| family(n)) {
             let file = registry()
                 .parse(text, name, profile::Strict::CheckedIn)
                 .expect("checked above");
@@ -1152,17 +1181,23 @@ mod hip {
     #[test]
     fn a_cdna3_gpu_takes_its_family() {
         // The MI300X (the card and a cloud VF of it) reads its rates from its
-        // device file; the MI325X has none yet.
-        for (gpu, device) in [
-            ("AMD Instinct MI300X", true),
-            ("AMD Instinct MI300X VF", true),
-            ("AMD Instinct MI325X", false),
+        // device file; the MI325X has none yet. The VF also carries its
+        // committed measured profile, under the device files.
+        for (gpu, device, committed) in [
+            ("AMD Instinct MI300X", true, false),
+            ("AMD Instinct MI300X VF", true, true),
+            ("AMD Instinct MI325X", false, false),
         ] {
             let (profile, report) = resolve(gpu, &facts(9, 4, 304), None);
             let mut layers = vec![profile::Source::Seeded("gfx94.toml".into())];
             if device {
                 layers.push(profile::Source::Seeded(
                     "gfx94/amd-instinct-mi300x.toml".into(),
+                ));
+            }
+            if committed {
+                layers.push(profile::Source::Committed(
+                    "amd-instinct-mi300x-vf.measured.toml".into(),
                 ));
             }
             assert_eq!(report.layers, layers, "{gpu}");

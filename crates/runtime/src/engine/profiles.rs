@@ -351,6 +351,121 @@ fn bench_cuda<'a>(
     )))
 }
 
+/// What `pie tune export` wrote of a device ([`export`]).
+pub struct Exported {
+    /// The device, by name.
+    pub device: String,
+    /// The user's file it was read from.
+    pub from: std::path::PathBuf,
+    /// Its committed file's name (`profile::measured_name`).
+    pub name: String,
+    /// The committed measured profile.
+    pub text: String,
+    /// The host covers the home's cache holds for this device
+    /// (`<device>.covers.json`, its name and text): each entry whose key
+    /// names the device the measurements were taken on. `None` where it
+    /// holds none.
+    pub covers: Option<(String, String)>,
+}
+
+/// The name a device's committed host covers are filed under:
+/// `<id>.covers.json`, beside its committed measured profile.
+#[must_use]
+pub fn covers_name(device: &str) -> String {
+    format!("{}.covers.json", profile::id_of(device))
+}
+
+/// Every host cover the cache under `cache` holds (`<cache>/cover/*.json`)
+/// whose key names `on` (the device and driver the measurements were taken
+/// on, as an engine's cover fingerprint names them), sorted by key: a JSON
+/// list of the cache's own entries, as the runtime reads a committed one.
+/// `None` where it holds none.
+#[must_use]
+pub fn covers_of(cache: &Path, on: &str) -> Option<String> {
+    let mut held: Vec<serde_json::Value> = std::fs::read_dir(cache.join("cover"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+        .filter_map(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .filter(|entry| {
+            entry
+                .get("key")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|key| key.split('|').any(|part| part == on))
+        })
+        .collect();
+    if held.is_empty() {
+        return None;
+    }
+    held.sort_by(|a, b| {
+        let key = |v: &serde_json::Value| v.get("key").and_then(|k| k.as_str()).unwrap_or("").to_owned();
+        key(a).cmp(&key(b))
+    });
+    serde_json::to_string_pretty(&held).ok().map(|text| text + "\n")
+}
+
+/// The stored measurements of `backend`'s device `index` (the user's file
+/// under `profiles` a load keeps them in) in committed form
+/// (`profile::export`): refused by name where the device is not found, its
+/// user file holds none, or an entry is stored without a key.
+/// With them, the host covers the home's cache (`cache`) holds for the
+/// device ([`covers_of`]).
+pub fn export(
+    backend: &Backend,
+    profiles: &Path,
+    cache: &Path,
+    index: u32,
+) -> Result<Exported, String> {
+    let device = device_name(backend, index)?;
+    let from = backend.shelf.user_path(profiles, &device);
+    let user = std::fs::read_to_string(&from).map_err(|e| {
+        format!(
+            "{}: {e}: no measurement of `{device}` is stored; a load of it stores them",
+            from.display()
+        )
+    })?;
+    let text = profile::export(
+        (backend.registry)(),
+        &device,
+        &user,
+        &from.display().to_string(),
+    )?;
+    let on = (backend.registry)()
+        .parse(&user, &from.display().to_string(), profile::Strict::User)
+        .ok()
+        .and_then(|file| file.tuned.rates.measured_on);
+    let covers = on
+        .and_then(|on| covers_of(cache, &on))
+        .map(|text| (covers_name(&device), text));
+    Ok(Exported {
+        name: profile::measured_name(&device),
+        device,
+        from,
+        text,
+        covers,
+    })
+}
+
+/// The name of `backend`'s device `index`, as its loads file its profiles.
+fn device_name(backend: &Backend, index: u32) -> Result<String, String> {
+    let probed = match backend.name {
+        #[cfg(feature = "vulkan")]
+        "vulkan" => engine_vulkan::chip::probe_at(index),
+        #[cfg(feature = "wgpu")]
+        "wgpu" => engine_wgpu::chip::probe_at(index),
+        _ if index == 0 => (backend.probe)(),
+        other => {
+            return Err(format!(
+                "`--device {index}`: the {other} engine names its first device alone here"
+            ));
+        }
+    };
+    probed
+        .map(|(name, _)| name)
+        .ok_or_else(|| format!("no {} device {index} on this machine", backend.name))
+}
+
 /// Every backend this build hosts.
 #[must_use]
 #[allow(clippy::vec_init_then_push)]
@@ -424,4 +539,40 @@ pub fn backends() -> Vec<Backend> {
         bench: None,
     });
     out
+}
+
+#[cfg(test)]
+mod cover_tests {
+    use super::*;
+
+    /// The covers a home's cache holds for a device are exported (another
+    /// device's left out), and a boot reads each back by its exact key.
+    #[test]
+    fn a_homes_covers_export_and_read_back_by_key() {
+        let cache = std::env::temp_dir().join(format!("pie-covers-{}", std::process::id()));
+        let dir = cache.join("cover");
+        std::fs::create_dir_all(&dir).unwrap();
+        let on = "vulkan 10de:2c31 driver 1";
+        let entry = |key: &str, cover: u32| {
+            serde_json::json!({"key": key, "cover": cover, "frame_us": 5400.0, "turnaround_us": 97.0})
+                .to_string()
+        };
+        let ours = format!("Spirv|{on}|kernels 24 0x1|model a|sampler 9|frame 1|depth 2|context 64");
+        let theirs = "Spirv|vulkan 10de:9999 driver 1|kernels 24 0x1|model a".to_string();
+        std::fs::write(dir.join("a.json"), entry(&ours, 1)).unwrap();
+        std::fs::write(dir.join("b.json"), entry(&theirs, 2)).unwrap();
+        let text = covers_of(&cache, on).expect("one cover of the device");
+        std::fs::remove_dir_all(&cache).unwrap();
+        assert!(!text.contains("10de:9999"), "{text}");
+        assert_eq!(
+            crate::bootstrap::committed_cover(&text, &ours),
+            Some(crate::bootstrap::HeldCover {
+                cover: 1,
+                frame_us: 5400.0,
+                turnaround_us: 97.0
+            })
+        );
+        assert_eq!(crate::bootstrap::committed_cover(&text, "another key"), None);
+        assert_eq!(covers_name("NVIDIA RTX PRO 4500 Blackwell"), "nvidia-rtx-pro-4500-blackwell.covers.json");
+    }
 }
