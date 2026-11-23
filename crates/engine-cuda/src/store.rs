@@ -1534,7 +1534,7 @@ impl Pools {
         let fitted = self.fitted_chunks();
         let room = fitted.saturating_sub(self.chunks.weight_chunks_under(fitted));
         let layout = self.chunks.layout();
-        let state = self.has_state();
+        let state = self.has_record();
         let fits = |records: u32, pages: u64| {
             chunks_at(layout, &self.paging, pages, if state { records } else { 0 }) <= room
         };
@@ -1581,7 +1581,7 @@ impl Pools {
         live: u64,
         stated: Option<u64>,
     ) -> core::result::Result<WorkingSet, u64> {
-        let slots = u32::from(self.has_state());
+        let slots = u32::from(self.has_record());
         let least = chunks_at(self.chunks.layout(), &self.paging, pages, slots);
         let need = self.chunk_bytes(least);
         // A stated budget is the pool's before the bodies and programs are
@@ -2232,6 +2232,13 @@ impl Pools {
             })
     }
 
+    /// Whether a working set holds a record: its recurrent rows, or its
+    /// windowed rows' rings.
+    #[must_use]
+    pub fn has_record(&self) -> bool {
+        self.has_state() || self.ring().is_some()
+    }
+
     #[must_use]
     pub fn has_state(&self) -> bool {
         self.shapes
@@ -2735,6 +2742,12 @@ impl Pools {
             return Vec::new();
         };
         let mut spans = Vec::new();
+        // A record of rings is its pieces whole (`layout::Ring`).
+        if fixed.ring.is_some() {
+            return (0..fixed.pieces)
+                .map(|piece| (piece, 0, fixed.slot.slot_bytes))
+                .collect();
+        }
         for shape in &self.shapes {
             let Shape::State { run, .. } = *shape else {
                 continue;
@@ -3059,9 +3072,9 @@ impl Pools {
     /// refused past the slots it seats, where lanes do not name slot refs.
     fn state_row(&self, slot: u32) -> Result<bool> {
         if self.chunks.by_refs() {
-            return Ok(self.has_state());
+            return Ok(self.has_record());
         }
-        slab_row(self.has_state(), self.paging.slots, slot)
+        slab_row(self.has_record(), self.paging.slots, slot)
     }
 
     /// From here on lanes name their slots by slot ref
