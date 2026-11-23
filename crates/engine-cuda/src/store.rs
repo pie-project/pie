@@ -2079,7 +2079,6 @@ impl Pools {
             .map(|&(layer, window, bytes)| engine::chunk::WindowedLayer {
                 layer,
                 window,
-                sinks: 0,
                 bytes,
             })
             .collect()
