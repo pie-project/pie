@@ -1637,6 +1637,12 @@ impl Shell {
                     continue;
                 }
                 let (base, folded, fold) = match (&seated.window_fold, window_folds[lane]) {
+                    // A lane with no buffer slot reads every row below its
+                    // fire from its ring: its buffer starts at its fold's
+                    // page, whatever base it states.
+                    (Some(_), Some((folded, fold))) if window_ids[lane].is_empty() => {
+                        (folded / page * page, folded, fold)
+                    }
                     (Some(stated), Some((folded, fold))) => (stated.base, folded, fold),
                     // A runtimeless lane folds every row it writes.
                     _ => {

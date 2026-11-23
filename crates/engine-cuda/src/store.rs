@@ -585,7 +585,8 @@ pub fn device_memory() -> Result<(u64, u64)> {
 }
 
 /// A fire's own-row pages (`Pools::own`): `pages` pages laid as
-/// window-buffer slots from `start` bytes past the pool's base, a page id of
+/// window-buffer slots from `start` bytes past the activation's base (which
+/// moves with the pool's chunks: a refit moves it), a page id of
 /// the buffer's grain each. Above every carve of the activation's span: the
 /// load's carves are laid `bytes` lower.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1284,8 +1285,7 @@ impl Pools {
         };
         let chunks = chunks::Chunks::reserve(&pool, layout, total, activation)?;
         let own = own_pages.map(|(pages, page_bytes)| OwnRows {
-            start: u64::from(chunks.total()) * chunks.layout().chunk_bytes
-                + carved.next_multiple_of(grain),
+            start: carved.next_multiple_of(grain),
             pages,
             page_bytes,
             grain,
@@ -2112,7 +2112,10 @@ impl Pools {
                 have: u64::from(own.pages),
             });
         }
-        let q = (own.start + u64::from(page) * own.page_bytes) / own.grain;
+        let at = self.activation_base() - self.chunks.base()
+            + own.start
+            + u64::from(page) * own.page_bytes;
+        let q = at / own.grain;
         i32::try_from(q).map_err(|_| Fault::Ceiling {
             what: "page ids of the state pool",
             need: q,
@@ -2142,7 +2145,7 @@ impl Pools {
         let own = self.own.ok_or_else(|| {
             Fault::program("store::ring", "an own-row page of a load that keeps no ring")
         })?;
-        Ok(self.chunks.base() + own.start + u64::from(page) * own.page_bytes)
+        Ok(self.activation_base() + own.start + u64::from(page) * own.page_bytes)
     }
 
     /// The ring pages of the record `key` names, in ring order, by the ids
