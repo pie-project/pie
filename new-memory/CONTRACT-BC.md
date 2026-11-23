@@ -141,7 +141,7 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
     stay named for this fire's reads and the fold frees their slots after. A lane carrying none: the folded index
     after the fire (`kv.folded` plus a host-counted fold; `kv.folded` for a device-counted one), rounded down to T;
     rows the fire computes and folds itself take no slot. Validated: a multiple of T, at most the folded index
-    after the fire. A kv-less lane carries no attention rows and states no `window`. `fold` how
+    after the fire, and at most `kv.folded` where the lane carries earlier-buffered rows (`kv.held > kv.folded`). A kv-less lane carries no attention rows and states no `window`. `fold` how
     far the fire advances folded (`FoldLen`, read as `RsVerb::Buffer`'s: a device-counted fold's count reaches the
     runtime when the fire settles, and the engine keeps the row its rings stand at with the record), `lineage`
     which buffered rows the windowed layers read. On a hybrid `RsVerb::Buffer` states the same folded, fold and
