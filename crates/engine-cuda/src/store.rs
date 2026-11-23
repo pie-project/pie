@@ -2442,7 +2442,11 @@ impl Pools {
                     let seat = seats.page_tables.get(table).ok_or_else(|| Fault::Unbound {
                         what: format!("page table {table}, which this fire staged none of"),
                     })?;
-                    let pages = if windowed {
+                    // A ringed load's windowed table names ring and own-row
+                    // pages anywhere in the pool's range: its planes span it.
+                    let pages = if windowed && self.ring().is_some() {
+                        self.chunks.bytes() / grain_of(&self.chunks, list).max(1)
+                    } else if windowed {
                         self.paging.window_pages()
                     } else {
                         self.paging.pages()
@@ -5456,6 +5460,14 @@ impl Pools {
             self.ensure_windowed(window_pages.iter().flatten().copied())
         }
     }
+}
+
+/// The step `list`'s page ids count in.
+fn grain_of(chunks: &chunks::Chunks, list: u8) -> u64 {
+    chunks
+        .layout()
+        .shape(Kind::paged(list))
+        .map_or(1, |shape| shape.grain)
 }
 
 /// The ring hook this engine answers the windowed recipe with
