@@ -1189,3 +1189,20 @@ What each still times at load or boot, for its owner (paths under `crates/`):
   (`engine_gpu::dense::by_shape`; by the roofline where one is stated); with curves but no roofline, the curves
   weigh it (`dense::choose_unrated`). Still open: the Adreno 840's committed profile (`adreno-tm-840`, a
   commented slot in each backend's `SEEDED`) awaits the phone's export.
+
+## F61. ROCm's causal masked prefill: split or merged, chosen per bucket, picks wrong where live rows decide (frozen, ~1%; MI300X, 2026-11-23)
+A causal masked prefill serves its requests that read no bit either split (`paged_prefill_unmasked_of`
+then the skipping `paged_prefill_masked`, landed in 385b52884) or merged (one launch, the plain body
+behind a branch). Split gains Qwen3-30B-A3B about 4.3 ms at pf2048; merged is about 0.75 ms faster
+on Qwen3-8B served (forced, same build and home: split 71.4 / 71.9 ms, merged 70.9 / 70.9).
+- A per-shape choice keyed and timed per body bucket (prototype: `profile::routes`
+  `Kind::PrefillMasked`, the bucket's prefill body timed on lanes stating no mask, local
+  sc/amd-prefill-split-measured, not pushed) picks split for 8B: equal or faster at every bucket
+  from 64 rows (2048: 56.07 vs 56.35 ms; 2234: 58.07 vs 58.11). Its timing lane fills its bucket;
+  a served 2061-row prompt runs in the 2234 bucket with about 8% of its tiles empty (block_valid).
+  The tradeoff turns on how many query tiles fill 304 CUs at one block a CU against two, which a
+  bucket key cannot see.
+- If reopened (the bar: more than 2%): choose per fire by live tiles against a measured crossover
+  in tiles per CU (stored keyed, measured once by sweeping live rows on one bucket's body), the
+  pick staged as a per-fire word both kernels read, as the mask word is, so one recorded body
+  serves both ways. No constant and no residency guess.

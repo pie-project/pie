@@ -312,7 +312,7 @@ impl Context {
             };
             let stream: *mut c_void = stream.cast();
             self.slabs.attach(stream);
-            Ok(Side {
+            let mut side = Side {
                 stream,
                 cublas,
                 // a side stream's kernels launch plainly: a programmatic
@@ -333,7 +333,12 @@ impl Context {
                     .with_slabs(self.slabs)
                     .with_tuning(self.ctx.tuning())
                     .with_rank(self.ctx.rank()),
-            })
+            };
+            // The routes the main context holds, as `set_routes` keeps them.
+            if let Some(routes) = self.ctx.routes() {
+                side.ctx.set_routes(routes.clone());
+            }
+            Ok(side)
         }
     }
 
@@ -413,7 +418,13 @@ impl Context {
 
     /// Lay the device's measured product times on this context
     /// (`kernels_cuda::linear::routes`).
+    /// The side streams' contexts take it too: a kernel the table picks (a
+    /// decode product's) launches on whichever stream its fire places it,
+    /// and reads the same choice there.
     pub fn set_routes(&mut self, routes: std::sync::Arc<kernels_cuda::linear::routes::Routes>) {
+        for side in self.side.iter_mut().chain(self.conditional.as_mut()) {
+            side.ctx.set_routes(routes.clone());
+        }
         self.ctx.set_routes(routes);
     }
 
