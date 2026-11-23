@@ -4919,9 +4919,9 @@ impl Shell {
                 {
                     let port_fold = ports.as_ref().and_then(engine::ports::LanePorts::fold);
                     self.windowed_pages(k, seated, fold, port_fold, have, row.rows)?
-                } else if self.pools.ring().is_some() && seated.refs {
-                    // The runtime states every lane's fold on a load served as
-                    // ring + buffer; its buffer slots are no whole window.
+                } else if self.pools.ring().is_some() && seated.ring.is_some() {
+                    // A lane whose record holds rings states how it folds
+                    // them; its buffer slots are no whole window.
                     return Err(Fault::program(
                         "serve::windowed",
                         format!(
@@ -4931,13 +4931,16 @@ impl Shell {
                         ),
                     ));
                 } else {
-                    // The engine's own fires (arming, the pipeline walk) are
-                    // seat-addressed: each reads and writes its seat's own run.
+                    // A lane with no fold and no ring (arming, the load's own
+                    // fires, the pipeline walk): its own record, its seat's
+                    // run of window slots.
                     let page_size = u64::from(self.pools.window_paging(k).page_size.max(1));
                     let after = u64::from(have) + u64::from(row.rows);
                     let pages = u32::try_from(after.div_ceil(page_size).max(1)).unwrap_or(u32::MAX);
                     let refs = seated.windows.get(k).map_or(&[][..], Vec::as_slice);
-                    let seat = (!seated.refs || refs.is_empty()).then_some((lane.slot, pages));
+                    let seat = (!seated.refs || refs.is_empty() || self.pools.ring().is_some())
+                        .then_some((lane.slot, pages));
+                    let refs = if self.pools.ring().is_some() { &[][..] } else { refs };
                     self.pools.window_pages(k, refs, seat)?
                 });
             }
