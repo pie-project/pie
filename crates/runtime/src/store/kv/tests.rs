@@ -93,6 +93,7 @@ fn tests_every_case() {
     a_demote_leaves_what_a_higher_key_covers();
     idle_cache_the_tiers_keep_off_the_host_is_dropped_not_demoted();
     on_the_host_the_lower_set_goes_first();
+    a_higher_set_moving_down_takes_the_room_of_a_lower_one_on_the_host();
     a_keep_the_policy_states_is_honoured_and_unkeyed_idle_cache_waits_for_a_demand();
     idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight();
     an_answer_goes_before_an_older_prompt();
@@ -1328,6 +1329,44 @@ fn on_the_host_the_lower_set_goes_first() {
     );
 }
 
+/// Each tier holds the highest keys first: B (10) fills the host, and A
+/// (20) moving down off the device takes B's room there; keyed alike,
+/// nothing on the host is displaced and A finds no room.
+fn a_higher_set_moving_down_takes_the_room_of_a_lower_one_on_the_host() {
+    for (a_key, displaced) in [(20, true), (10, false)] {
+        let mut store = KvStore::new_with_swap(16, 4, 0, h(47));
+        store.set_page_size(16);
+        let (a, b) = (ProcessId::from_u128(55), ProcessId::from_u128(56));
+        let (a_tokens, b_tokens) = (prompt(27, 4), prompt(28, 4));
+        sealed_and_gone(&mut store, &b_tokens, b);
+        let keys = move |owner: Option<ProcessId>| if owner == Some(a) { a_key } else { 10 };
+        let txn = store.prepare_demote(16, keys).unwrap().expect("B to the host");
+        store.commit_suspend(txn).unwrap();
+        assert_eq!(store.host_swap_available(), 0, "the host is full");
+        sealed_and_gone(&mut store, &a_tokens, a);
+        let below = |store: &mut KvStore, tokens: &[u32]| {
+            let probe = store.create_working_set();
+            let found = keys_ahead(store, probe, 0, tokens);
+            store.release_working_set(probe, store.current_epoch());
+            store.cached_run_any_tier(&found).len()
+        };
+        match store.prepare_demote(16, keys).unwrap() {
+            Some(txn) => {
+                assert!(displaced, "keyed alike, nothing is displaced");
+                store.commit_suspend(txn).unwrap();
+                store.retire_idle();
+                assert_eq!(on_device(&mut store, &a_tokens), 0, "A moved down");
+                assert_eq!(below(&mut store, &a_tokens), 4, "A on the host");
+                assert_eq!(below(&mut store, &b_tokens), 0, "B gave its room");
+            }
+            None => {
+                assert!(!displaced, "A keyed higher takes B's room");
+                assert_eq!(below(&mut store, &b_tokens), 4, "B stays");
+            }
+        }
+    }
+}
+
 /// Rows of one key and one tier set for every owner, as a test's table.
 struct Rows(i64, u8);
 
@@ -1489,7 +1528,7 @@ fn a_kept_disk_tier_takes_back_the_pages_its_journal_names() {
         4,
         "the orphan's and the short page's slots are free again"
     );
-    store.drop_entries_off_device(usize::MAX, &|_| 0);
+    store.drop_entries_off_device(usize::MAX, &|_| 0, None);
     assert_eq!(
         store.cached_run_any_tier(&keys).len(),
         3,

@@ -1086,7 +1086,7 @@ impl ResidencyPlanner {
         if self.demoting.swap(true, Ordering::AcqRel) {
             return true;
         }
-        let (mut host_free, host_total) = self.port.host_stats();
+        let (host_free, host_total) = self.port.host_stats();
         let (disk_free, _) = self.port.disk_stats();
         // A full host is under pressure too: its own idle cache, lowest key
         // first, goes on down to disk before the device's lands there, as
@@ -1101,14 +1101,11 @@ impl ResidencyPlanner {
                 exec::spawn_spill(self.clone(), txn, Self::spill_done);
                 return true;
             }
-            // Settling pages on their disk copies may have freed some.
-            host_free = self.port.host_stats().0;
         }
-        let (disk_free, _) = self.port.disk_stats();
-        let room = (host_free + disk_free).min(wanted.max(1));
-        let txn = (room > 0)
-            .then(|| self.port.prepare_demote(room as usize))
-            .flatten();
+        // Short of free slots below, the store makes the room from idle cache
+        // the host holds keyed below what moves down (each tier holds the
+        // highest keys first), or moves nothing.
+        let txn = self.port.prepare_demote(wanted.max(1) as usize);
         let Some(txn) = txn else {
             self.demoting.store(false, Ordering::Release);
             return false;

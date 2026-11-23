@@ -1182,8 +1182,6 @@ impl KvStore {
         keys: impl Keys,
         now: bool,
     ) -> Result<Option<KvResidencyTxn>, KvStoreError> {
-        // Free slots only: a demote gives up no copy for idle cache.
-        let room = room.min(self.host_pool.available() + self.disk_pool.available());
         if room == 0 {
             return Ok(None);
         }
@@ -1220,7 +1218,24 @@ impl KvStore {
                 if pages.is_empty() {
                     continue;
                 }
-                pages.truncate(room);
+                // Each tier holds the highest keys first: short of free slots
+                // below, the group's room comes from idle cache the host
+                // holds keyed lower, lowest first. Keyed alike (no policy),
+                // nothing is displaced and a demote takes free slots only.
+                let want = pages.len().min(room);
+                if self.host_pool.available() + self.disk_pool.available() < want {
+                    let host = want.saturating_sub(self.disk_pool.available());
+                    if self.drop_entries_off_device(host, &keys, Some(key)) > 0 {
+                        // Dropping can compact the pages just listed.
+                        pages = self.table.cache_only_pages(&self.roots(&ids), &above);
+                        pages.retain(|(location, _)| self.copy_of(location).is_none());
+                    }
+                }
+                let free = self.host_pool.available() + self.disk_pool.available();
+                if free == 0 || pages.is_empty() {
+                    continue;
+                }
+                pages.truncate(room.min(free));
                 tracing::debug!(target: "pie::kv", pages = pages.len(), "demote");
                 let records = self.demote_records(&ids, pages.iter().map(|&(at, _)| at), key);
                 // A run split over the tiers would leave its disk tail
@@ -3111,7 +3126,7 @@ impl KvStore {
         let mut pages = self.table.movable_resident_pages(working_sets)?;
         // Host room is for what is paused before what is cached.
         if self.host_pool.available() < pages.len() {
-            self.drop_entries_off_device(pages.len(), &keys);
+            self.drop_entries_off_device(pages.len(), &keys, None);
             // Dropping can compact the pages just listed: list them again.
             pages = self.table.movable_resident_pages(working_sets)?;
         }
@@ -3172,7 +3187,7 @@ impl KvStore {
         let mut pages = self.table.stranded_pages(keep, order, wanted, spare_heads);
         if self.swap_available() < pages.len().min(room) {
             let wanted = pages.len().min(room).saturating_sub(self.disk_swap_available());
-            self.drop_entries_off_device(wanted, keys);
+            self.drop_entries_off_device(wanted, keys, None);
             // Dropping can compact the pages just listed: list them again.
             pages = self.table.stranded_pages(keep, order, wanted, spare_heads);
         }
@@ -3472,7 +3487,7 @@ impl KvStore {
     /// slots free: the lowest retention key first, then the least recently
     /// used, so the host keeps the higher keys as the device does. No
     /// lookup hits what goes, and no one will bring it back.
-    fn drop_entries_off_device(&mut self, wanted: usize, keys: &impl Keys) {
+    fn drop_entries_off_device(&mut self, wanted: usize, keys: &impl Keys, below: Option<i64>) -> usize {
         let unused: HashSet<NodeId> = self.table.unused_cache_roots().into_iter().collect();
         let mut entries: Vec<(i64, Instant, u64)> = self
             .cache
@@ -3481,11 +3496,14 @@ impl KvStore {
                 unused.contains(&entry.path.terminal)
                     && !self.table.settled_on_device(entry.path.terminal)
                     && !self.persisted_whole(entry)
+                    // Room made for a demote is host room: only what holds it.
+                    && (below.is_none() || self.table.holds_on_host(entry.path.terminal))
             })
             .map(|(&id, entry)| {
                 let key = keys.key_at(entry.owner, self.key_token(entry.path.pages));
                 (key, entry.last_use, id)
             })
+            .filter(|&(key, _, _)| below.is_none_or(|below| key < below))
             .collect();
         entries.sort_unstable();
         let mut dropped = 0;
@@ -3496,7 +3514,8 @@ impl KvStore {
             self.drop_entries(vec![id], By::Host, self.current_epoch());
             dropped += 1;
         }
-        tracing::debug!(target: "pie::kv", entries = dropped, wanted, "dropped off device");
+        tracing::debug!(target: "pie::kv", entries = dropped, wanted, ?below, "dropped off device");
+        dropped
     }
 
     pub fn mark_suspended(&mut self, working_sets: &HashSet<WorkingSetId>) {

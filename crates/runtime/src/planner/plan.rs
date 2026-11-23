@@ -1028,7 +1028,12 @@ impl ResidencyPlanner {
                     // allocation: a bind is new demand, not a restore, and
                     // it is funded whether or not the fleet has stalled (a
                     // fleet that keeps decoding never stalls, and the bind
-                    // waited behind it for good).
+                    // waited behind it for good). Idle cache its tiers let
+                    // below the device moves down before any is dropped.
+                    if self.demote_idle(self.port.chunks_as_pages(run.saturating_mul(pieces))) {
+                        self.plan_stopped("short of runs: idle cache moves down");
+                        return false;
+                    }
                     if self.reclaim_idle_once() || self.sweep_stranded(u32::MAX, false) {
                         continue;
                     }
@@ -1097,6 +1102,10 @@ impl ResidencyPlanner {
                         self.plan_stopped("bind-suspended restore sent: its placement stands");
                         room_stood = Some(key);
                         continue;
+                    }
+                    if self.demote_idle(self.port.chunks_as_pages(need.run.saturating_mul(need.pieces))) {
+                        self.plan_stopped("bind short of runs: idle cache moves down");
+                        return false;
                     }
                     if self.reclaim_idle_once() || self.sweep_stranded(u32::MAX, false) {
                         continue;
@@ -1218,9 +1227,14 @@ impl ResidencyPlanner {
                         self.plan_stopped("restore short of runs: something in flight, not funded");
                         return false;
                     }
-                    // Idle cache holds chunks too: one set goes, and the
+                    // Idle cache holds chunks too: what its tiers let below
+                    // the device moves down, else one set goes, and the
                     // restore tries again in what it left, before any
                     // resident moves for it.
+                    if self.demote_idle(self.port.chunks_as_pages(run.saturating_mul(pieces))) {
+                        self.plan_stopped("restore short of runs: idle cache moves down");
+                        return false;
+                    }
                     if self.reclaim_idle_once() || self.sweep_stranded(u32::MAX, false) {
                         self.with_inner(|inner| inner.roles_retry_head());
                         continue;
