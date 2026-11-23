@@ -727,6 +727,36 @@ pub fn table_apart(engine: &[u32], runtime: &[u32]) -> Option<String> {
     })
 }
 
+/// After every evacuation the engine took or refused (a raise's copy, the
+/// segment walk's, a compaction): the engine's chunk table checked against
+/// the runtime's map as the move left it, never assumed. Apart, said at
+/// ERROR naming the first logical chunk they place apart and `what` moved,
+/// and a debug build stops on it: a fire through a table the runtime does
+/// not share reads and writes chunks it never placed (the M1's NaN: a free
+/// logical id swapped up onto a segment the walk then gave back, taken by
+/// the runtime at a physical the engine did not resolve it to). An engine
+/// that states no table is not checked.
+pub async fn check_moved(shared: &Shared, mover: &impl Mover, what: &str) {
+    let runtime = shared.lock().unwrap().pool().chunk_table().to_vec();
+    let Err(apart) = mover.check_table(runtime).await else {
+        return;
+    };
+    if !(apart.contains("lies on physical") || apart.contains("chunk table holds")) {
+        return;
+    }
+    tracing::error!(
+        engine = mover.engine(),
+        %apart,
+        what,
+        "store: the engine's chunk table and the runtime's are apart after a move"
+    );
+    assert!(
+        !cfg!(debug_assertions),
+        "engine {}: after {what}, the engine's chunk table is apart from the runtime's: {apart}",
+        mover.engine()
+    );
+}
+
 /// After a refused raise: the engine's chunk table checked against the
 /// runtime's map as the refusal left it, never assumed (debug builds).
 async fn check_refused(shared: &Shared, mover: &impl Mover) {
@@ -855,6 +885,9 @@ pub async fn carry_raise(
         return Err(format!(
             "the engine refused the carve for rung {to}: {error}"
         ));
+    }
+    if !evacuation.moves.is_empty() {
+        check_moved(shared, mover, "a raise's copy").await;
     }
     let next = mover.epoch_now().saturating_add(1);
     shared.lock().unwrap().raise_copied(next);

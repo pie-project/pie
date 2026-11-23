@@ -740,6 +740,9 @@ impl SharedGrow {
                 PoolOp::CommitSpan(n) => Some(*n),
                 _ => None,
             };
+            let moved = matches!(op, PoolOp::Evacuate(_)).then(|| {
+                if compacting.is_some() { "a compaction" } else { "a segment's evacuation" }
+            });
             match (self.lane)(self.engine, op).await {
                 Ok(()) => {
                     // A segment mapped: what was promised a waiter is
@@ -791,8 +794,18 @@ impl SharedGrow {
                             planner.pages_freed();
                         }
                     }
+                    // Refused means nothing moved: the map taken back is
+                    // the engine's table still.
+                    if let Some(what) = moved {
+                        super::programs::check_moved(&self.shared, &WalkMover(self), what).await;
+                    }
                     return;
                 }
+            }
+            // Taken: the engine's table is the runtime's map as the move
+            // left it.
+            if let Some(what) = moved {
+                super::programs::check_moved(&self.shared, &WalkMover(self), what).await;
             }
             if evacuating.is_some() {
                 // The engine took the copy and waits it out before it
