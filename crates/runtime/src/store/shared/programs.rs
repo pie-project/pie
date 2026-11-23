@@ -718,7 +718,10 @@ pub async fn take_raise(
             Some(at) if !pool.raise_owed(at) || pool.copying().is_some() => None,
             Some(at) => {
                 let stood = pool.stands_at(at);
-                pool.plan_raise(at).ok().and_then(|evacuation| {
+                pool.plan_raise(at)
+                    .inspect_err(|error| tracing::debug!(%error, rung = at, "a raise is not plannable as the pool stands"))
+                    .ok()
+                    .and_then(|evacuation| {
                     let notice = pool.raise_applied(&evacuation).ok()?;
                     Some((evacuation, notice, stood))
                 })

@@ -1189,3 +1189,36 @@ What each still times at load or boot, for its owner (paths under `crates/`):
   (`engine_gpu::dense::by_shape`; by the roofline where one is stated); with curves but no roofline, the curves
   weigh it (`dense::choose_unrated`). Still open: the Adreno 840's committed profile (`adreno-tm-840`, a
   commented slot in each backend's `SEEDED`) awaits the phone's export.
+
+## F56. The capacity gate does not charge the room a park to disk opens (planner sim, found 2026-11-23)
+The field mix as it now runs (beam pools bound beside the prefill's instance, frames owing rung raises, two-ended
+pools with the span backed on demand) fails 4 of the 751 seeds without the wide shape: 401 and 645 (liveness: every
+tier full, the finisher a page short), 589 (a victim evicted twice for one head) and 603 (a raise owed to its
+owner's frame never planned: `rung_short` reads the raise as fitting while `plan_rung` finds no free run below for
+a run in the span, so the planner funds nothing and the walk has nothing to move). Seed 401's cause: a park to
+disk lays its guest parts in whole disk chunks per slot class, which raises the census's slack; the gate's margin
+(`CapacityRead::margin`, the largest other resident's move) counts the move's own pages only, so a move under a
+finisher whose spare was 0 left every tier full (free 72 -> 39 in one step, slack +32). Charging a chunk per slot
+class of the mover's held parts in the margin passes 589 and 645 but breaks main seed 134 (a thrash) and leaves 401
+failing: the margin must be the exact granularity a park opens (the classes whose chunks on the tier below have no
+room for its parts), not a bound.
+
+## F57. The safe order turns short with no ask past it: a gate accounting gap, not admission (planner sim, found 2026-11-23)
+
+The field mix's seed 401 (45 processes arriving at once on a 15-chunk device) and the 401 family (589, 645;
+the Metal w17 mix's thrash and liveness seeds, 31 of its first 200: 18, 43, 47, 54, 67, 70, 74, 76, 77, 84,
+88, ...) end with every process short in the banker's order. `PIE_SIM_SHORT=1` says each step the order turns
+short (`ResidencyPlanner::order_least`, the raw least room in the order, negative when some process cannot
+finish in turn) with the gate's read. On 401 it turns short at step 7 already (least -6, free 99, `moving` 9,
+unit 29), again at 10 (-6) and 17 (-21, `moving` 21): before any process grew far, while moves were under way.
+
+Admission at the last place does not explain it: a newcomer appended last needs its end with every other
+process's holdings given back, which fits whenever its end fits the pool, so a banker's check there refuses
+nothing. The order goes short because a step's reads move under the gate: the second slots of moves under way
+(`moving`) and the margin (`unit`, the largest other resident's move) grow with grants the gate let through as
+safe at their own read. A grant's cost (`CapacityGate::cost`) charges the margin for the asker's own move only;
+the read after the grant also counts the moving copies the grant's own eviction or restore opened. The fix is
+in the gate's accounting (charge what a grant will put in flight, or read the order after the moves it starts),
+then admission priced by the same order. Repro: `PIE_SIM_SHORT=1 PIE_SIM_FIELD=1 PIE_SIM_SEED=401` on
+`replay_one_simulated_seed`, and `PIE_SIM_METAL=1` sweeps.
+

@@ -157,7 +157,7 @@ impl RestorePlacement {
     pub fn of(
         own: &[crate::store::slots::OwnPiece],
         placement: &crate::store::slots::Placement,
-        bind: Option<(u32, u32)>,
+        bind: &[(u32, u32)],
         alone: impl Fn(&[crate::store::slots::OwnPiece]) -> u32,
     ) -> Self {
         use crate::store::slots::OwnPiece;
@@ -174,11 +174,16 @@ impl RestorePlacement {
             .copied()
             .collect();
         short.add(1, alone(&singles));
-        let bind_free_runs = bind.map(|(run, _)| placement.free_runs(run));
-        if let Some((run, pieces)) = bind
-            && (!rest.is_empty() || bind_free_runs.is_some_and(|free| free < pieces))
-        {
-            short.add(run, pieces);
+        // Its longest runs, and every chunk it asks among the free single
+        // chunks: the runs of each length stand where both do.
+        let bind_free_runs = bind.first().map(|&(run, _)| placement.free_runs(run));
+        let bind_chunks: u32 = bind.iter().map(|&(run, pieces)| run.saturating_mul(pieces)).sum();
+        let bind_short = bind.first().is_some_and(|&(run, pieces)| placement.free_runs(run) < pieces)
+            || (!bind.is_empty() && placement.free_runs(1) < bind_chunks);
+        if !bind.is_empty() && (!rest.is_empty() || bind_short) {
+            for &(run, pieces) in bind {
+                short.add(run, pieces);
+            }
         }
         Self {
             opened: placement.opened.iter().copied().collect(),
@@ -693,20 +698,23 @@ pub trait PoolPort: Send + Sync + 'static {
         need: &RunNeed,
         state: RsUnits,
         kv_pages: u32,
-        bind: Option<(u32, u32)>,
+        bind: &[(u32, u32)],
     ) -> RestorePlacement {
         let _ = (pid, kv_pages);
-        let stands = match bind {
-            Some((run, pieces)) => self.room_beside_own(pid, run, pieces),
-            None => self.guest_need_free(need, state),
+        let stands = if bind.is_empty() {
+            self.guest_need_free(need, state)
+        } else {
+            bind.iter().all(|&(run, pieces)| self.room_beside_own(pid, run, pieces))
         };
         RestorePlacement {
             opened: self.serve_opens(state),
             room: None,
             short: if stands {
                 RunNeed::default()
+            } else if bind.is_empty() {
+                need.clone()
             } else {
-                bind.map_or_else(|| need.clone(), |(run, pieces)| RunNeed::one(run, pieces))
+                RunNeed::of(bind.iter().copied())
             },
             bind_free_runs: None,
         }
@@ -718,7 +726,7 @@ pub trait PoolPort: Send + Sync + 'static {
         need: &RunNeed,
         state: RsUnits,
         kv_pages: u32,
-        bind: Option<(u32, u32)>,
+        bind: &[(u32, u32)],
     ) -> bool {
         self.restore_placement(pid, need, state, kv_pages, bind).stands()
     }
@@ -728,7 +736,7 @@ pub trait PoolPort: Send + Sync + 'static {
     /// other take until its unpark and bind take them or
     /// [`Self::release_restore`]. Whether it was held (its placement
     /// stands). Where the pool keeps no roles, nothing is held.
-    fn reserve_restore(&self, pid: ProcessId, bind: Option<(u32, u32)>) -> bool {
+    fn reserve_restore(&self, pid: ProcessId, bind: &[(u32, u32)]) -> bool {
         let _ = (pid, bind);
         false
     }
@@ -896,6 +904,12 @@ pub trait PoolPort: Send + Sync + 'static {
     /// device figure a never-fits check reads. `u32::MAX` where the kv
     /// pages are a pool of their own.
     fn state_chunks_most(&self) -> u32 {
+        u32::MAX
+    }
+    /// The longest run of adjacent chunks any arrangement of the pool lays
+    /// for state ([`crate::store::slots::SlotPool::longest_run_most`]);
+    /// `u32::MAX` where the pool keeps no chunks.
+    fn longest_run_most(&self) -> u32 {
         u32::MAX
     }
     /// Every tier's room and what is held in it, in one unit, kv pages,
@@ -1163,7 +1177,7 @@ impl PoolPort for RegistryPool {
         need: &RunNeed,
         state: RsUnits,
         kv_pages: u32,
-        bind: Option<(u32, u32)>,
+        bind: &[(u32, u32)],
     ) -> RestorePlacement {
         use crate::store::slots::OwnPiece;
         let roles_and_shared = crate::store::registry::try_get(self.model, self.engine)
@@ -1193,7 +1207,7 @@ impl PoolPort for RegistryPool {
         RestorePlacement::of(&own, &placement, bind, pool_alone)
     }
 
-    fn reserve_restore(&self, pid: ProcessId, bind: Option<(u32, u32)>) -> bool {
+    fn reserve_restore(&self, pid: ProcessId, bind: &[(u32, u32)]) -> bool {
         crate::store::registry::try_get(self.model, self.engine)
             .and_then(|stores| stores.roles)
             .is_some_and(|roles| roles.lock().unwrap().reserve_restore(pid, bind))
@@ -1410,6 +1424,12 @@ impl PoolPort for RegistryPool {
         crate::store::registry::try_get(self.model, self.engine)
             .and_then(|stores| stores.shared)
             .map_or(u32::MAX, |shared| shared.lock().unwrap().state_chunks_most())
+    }
+
+    fn longest_run_most(&self) -> u32 {
+        crate::store::registry::try_get(self.model, self.engine)
+            .and_then(|stores| stores.shared)
+            .map_or(u32::MAX, |shared| shared.lock().unwrap().pool().longest_run_most())
     }
 
     fn capacity_census(&self) -> Option<CapacityCensus> {

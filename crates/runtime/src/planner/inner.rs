@@ -50,6 +50,9 @@ pub(super) struct Inner {
     /// dump per head and room change, and again each
     /// [`super::plan::STALL_SAYS_AGAIN`] while it stays unserved.
     pub(super) stall_dumped: Option<(super::wait::EntryKey, u64, crate::rt::Instant)>,
+    /// The head whose stall was last said, and when: said once a stall
+    /// episode, whatever room moves meanwhile.
+    pub(super) stall_said: Option<(super::wait::EntryKey, crate::rt::Instant)>,
     /// The room a pass last planned a quiet head on (nothing in flight):
     /// the head and the pool's counts ([`super::ResidencyPlanner::tick`]).
     pub(super) quiet_planned: Option<(super::wait::EntryKey, [u64; 4])>,
@@ -788,6 +791,7 @@ impl Inner {
         }
         self.evicting.insert(pid, expected);
         let mut wake = Vec::new();
+        let mut withdrawn_bind = None;
         for waiter in self.queue.values_mut().filter(|w| w.pid == pid) {
             match &mut waiter.kind {
                 WaitKind::Allocation {
@@ -806,17 +810,39 @@ impl Inner {
                 // once raised (Mac Pro at 2 GiB on 4cef0c7d3: the eviction
                 // waited on a capped frame whose raise it withdrew).
                 WaitKind::BindRoom {
+                    run,
+                    pieces,
+                    singles,
+                    pages,
                     notify,
                     served: false,
                     withdrawn,
                     rise: None,
-                    ..
                 } => {
                     *withdrawn = true;
                     wake.push(notify.clone());
+                    withdrawn_bind.get_or_insert(super::proc::PendingBind {
+                        singles: *singles,
+                        run: *run,
+                        pieces: *pieces,
+                        pages: *pages,
+                    });
                 }
                 _ => {}
             }
+        }
+        // The room its bind waited for is what its restore brings back
+        // with it, as a bind suspended for room asks
+        // ([`Proc::bind_room`]): counted in its need and laid beside its
+        // restore. Forgotten, an evicted process's need read its bind's
+        // room short: made the capacity gate's finisher, restored, it asked
+        // the room again past what stood free, lost its place and was
+        // evicted for the new finisher, round and round (the field mix's
+        // wide shape, seed 7).
+        if let Some(bind) = withdrawn_bind
+            && let Some(proc) = self.procs.get_mut(&pid)
+        {
+            proc.bind_room.get_or_insert(bind);
         }
         wake
     }
@@ -837,6 +863,39 @@ impl Inner {
             self.queue
                 .values()
                 .any(|waiter| waiter.pid == pid && waiter.is_unmet() && gate.holds_waiter(waiter, place))
+        })
+    }
+
+    /// `pid` arrived (its restore landed, a new request, or it left): the
+    /// processes restored past it while it stood passed over may be moved
+    /// for it again ([`super::proc::Proc::restored_past`]).
+    pub(super) fn arrived(&mut self, pid: ProcessId) {
+        for proc in self.procs.values_mut() {
+            if proc.restored_past == Some(pid) {
+                proc.restored_past = None;
+            }
+            if proc.last_resort_for == Some(pid) {
+                proc.last_resort_for = None;
+            }
+        }
+    }
+
+    /// Whether `head` was evicted for `pid` and is not back yet: no victim
+    /// for `head`'s asks, `pid` is.
+    pub(super) fn evicted_for_by(&self, head: ProcessId, pid: ProcessId) -> bool {
+        self.procs
+            .get(&head)
+            .is_some_and(|proc| proc.state != Residency::Resident && proc.evicted_for == Some(pid))
+    }
+
+    /// Whether `pid`'s bind was served its room and has not taken it yet:
+    /// room made for it, it takes it as it wakes. Moved meanwhile, the room
+    /// went to others, the bind found its process parked, and its restore
+    /// came back without the room, short again (the simulation's field
+    /// mix, seed 13: suspended twice for one bind).
+    pub(super) fn bind_served(&self, pid: ProcessId) -> bool {
+        self.queue.values().any(|waiter| {
+            waiter.pid == pid && matches!(waiter.kind, WaitKind::BindRoom { served: true, .. })
         })
     }
 

@@ -824,6 +824,22 @@ impl KvStore {
         }
     }
 
+    /// Every page the trie keeps resident on the device, by its device slot
+    /// (for tests: each must lie in a slot the pool counts held).
+    #[cfg(test)]
+    pub(crate) fn device_page_slots(&self) -> Vec<crate::store::slots::Slot> {
+        let Some((shared, shape)) = self.pool.shared_shape() else {
+            return Vec::new();
+        };
+        let base = self.pool.base();
+        let shared = shared.lock().unwrap();
+        self.table
+            .device_pages_by_reader()
+            .into_iter()
+            .map(|(_, id, _)| shared.slot(shape, id.0.saturating_sub(base)))
+            .collect()
+    }
+
     pub fn cached_working_sets(&self) -> Vec<CachedWorkingSet> {
         let mut sets: HashMap<ProcessId, CachedWorkingSet> = HashMap::new();
         for entry in self.cache.values() {

@@ -290,6 +290,11 @@ impl SharedGrow {
                     // again once room is freed, not on its next wake.
                     self.raise_blocked.store(true, Ordering::Release);
                     tracing::debug!(engine = self.engine, %error, goal, "the activation rung waits");
+                    // Runs in its way with no free run below: the segment
+                    // walk, next, compacts below the raise's activation.
+                    if self.shared.lock().unwrap().compaction_for_raise(goal) {
+                        tracing::debug!(engine = self.engine, goal, "a raise waits on a compaction below its activation");
+                    }
                     self.fund_owed();
                     return;
                 }
@@ -504,9 +509,23 @@ impl SharedGrow {
                     self.room_freed();
                     return;
                 }
-                // Short again (the pool moved since), or nothing left to
-                // raise: asked again as it stands.
-                Ok(Some(Ok(None))) => {}
+                // Short again (the pool moved since), or not plannable as
+                // the pool stands (a copy still reading the span, chunks
+                // held for a served restore there): asked again once room
+                // moves. Asked again at once, the raise was planned and
+                // refused in a loop that never yielded, every other task
+                // starved (the simulation's field mix, seed 274: a raise
+                // owner's frame, 1.8 M asks in 20 s).
+                Ok(Some(Ok(None))) => {
+                    let given = self.shared.lock().unwrap().pool().room_watch();
+                    let rung = super::rung_watch(engine);
+                    tokio::select! {
+                        // In order, never at random: a seeded run takes the same branch.
+                        biased;
+                        () = given.given() => {}
+                        () = rung => {}
+                    }
+                }
                 Ok(Some(Err(refused))) => {
                     tracing::warn!(engine, rung, %refused, "the engine refused a raise to held frames");
                     return;
