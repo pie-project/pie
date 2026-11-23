@@ -4446,8 +4446,16 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 }
                 _ => Vec::new(),
             };
-            let keep = window_at
-                .filter(|&row| row < slots.end)
+            // What the piece's advance retires no slot behind: the pass's
+            // earliest window checkpoint at or before the piece's end, its
+            // own end included (a cut placed on the checkpoint row) and one an
+            // earlier piece took (its next pieces may be on their way before
+            // it settles and takes it). Its windows reach back from there.
+            let keep = checkpoints
+                .iter()
+                .copied()
+                .filter(|&row| windowed && held < row && row <= slots.end)
+                .min()
                 .and_then(|row| u32::try_from(row).ok());
             // The furthest the engine lands of those inside the fire.
             let mut inside: Vec<u32> = checkpoints

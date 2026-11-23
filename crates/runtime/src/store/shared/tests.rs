@@ -551,6 +551,47 @@ fn window_geometry() -> crate::store::rs::RsGeometry {
     }
 }
 
+/// A pass cut so its window checkpoint is a piece's own end (64, the end of
+/// 0..64), with the next piece (64..72) on its way before the first settles:
+/// each piece keeps what 64's windows reach, so the checkpoint is taken at the
+/// first piece's settle though the next one writes, and a later pass adopts
+/// it at 64 by its key. Without the keep across the cut the next piece's
+/// advance trims narrow 5 (rows 40..48), which 64 reaches; without taking it
+/// beside the piece in flight it is refused outright.
+#[test]
+fn a_window_checkpoint_on_a_cut_is_kept_and_found() {
+    use crate::pipeline::fire::rs::settle;
+    let (facts, shared, stores) = windowed_stores();
+    let mut rs = stores.rs.lock().unwrap();
+    let ws = rs.create_working_set(window_geometry());
+    let first = window_fire_keeping(&mut rs, ws, 0..64, None, Some(64));
+    let (narrow, wide) = window_tables(&first, &shared);
+    // The next piece is prepared (its writes in flight) before the first
+    // settles, as the pass's pieces go out.
+    let next = window_fire_keeping(&mut rs, ws, 64..72, None, Some(64));
+    settle(&mut rs, first.txn);
+    rs.retire_idle();
+    assert!(
+        rs.checkpoint_at(ws, [7; 32], None, 64).unwrap(),
+        "the checkpoint on the cut is taken beside the piece in flight"
+    );
+    settle(&mut rs, next.txn);
+    rs.release_working_set(ws);
+    rs.retire_idle();
+
+    // The next pass finds it by its key and stands at 64 on the slots it took.
+    let warm = rs.create_working_set(window_geometry());
+    assert!(rs.adopt_checkpoint(warm, &[7; 32]).unwrap());
+    assert_eq!(rs.window_positions(warm), Ok(Some((64, 64))));
+    let out = window_fire(&mut rs, warm, 64..65, None);
+    let lane = shared_lanes(&out, &shared, 1).remove(0);
+    lane.validate_chunks(&facts).unwrap();
+    let (n64, w64) = window_tables(&out, &shared);
+    assert_eq!(n64[5..8], narrow[5..8]);
+    assert_eq!(w64[..4], wide[..4]);
+    settle(&mut rs, out.txn);
+}
+
 /// (c3) A window pass ending inside a page keeps its checkpoint at the page
 /// boundary before its end: the fire trims nothing that boundary's windows
 /// reach, so the checkpoint holds the slots `[at - window, at)` touches. Had
