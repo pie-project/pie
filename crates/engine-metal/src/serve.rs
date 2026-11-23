@@ -2851,11 +2851,23 @@ impl Shell {
     }
 
     pub fn copy_state(&mut self, moves: &[(u32, u32)]) -> Result<()> {
-        if moves.is_empty() || !self.pools.has_state() {
+        self.copy_records(moves, &[])
+    }
+
+    /// A fire's record forks before it (`cow != run`): the state pieces'
+    /// slots and, on a windowed load, the rings' (`layout::RING`), copied
+    /// whole run onto cow in one frame (CONTRACT-BC 19's copy-on-first-fold:
+    /// the fire then reads and writes the cow side).
+    pub fn copy_records(&mut self, state: &[(u32, u32)], rings: &[(u32, u32)]) -> Result<()> {
+        let state = if self.pools.has_state() { state } else { &[] };
+        if state.is_empty() && rings.is_empty() {
             return Ok(());
         }
         let mut frame = self.device.frame()?;
-        self.pools.copy_state(&mut frame, moves)?;
+        self.pools.copy_state(&mut frame, state)?;
+        if !rings.is_empty() {
+            self.pools.copy_shape(&mut frame, crate::store::layout::RING, rings)?;
+        }
         self.grafted = Some(frame.commit_async(None)?);
         Ok(())
     }
@@ -3616,13 +3628,8 @@ impl Shell {
         let pieces = seated
             .ring
             .ok_or_else(|| refuse("a windowed lane states no ring pieces in its record".to_string()))?;
-        if pieces.iter().any(|&[run, cow]| run != cow) {
-            return Err(refuse(
-                "a ring shared with another owner (its record's run and cow differ) is copied \
-                 at its first fold, which this engine does not yet do"
-                    .to_string(),
-            ));
-        }
+        // A shared ring (`cow != run`) was copied run onto cow before the
+        // fire (`Shell::copy_records`): the fire reads and writes cow.
         // Ring page j: piece j / per_chunk, the window slot j % per_chunk of
         // that chunk (a ring piece is one slot of one chunk, its ref the
         // chunk).
@@ -3630,7 +3637,7 @@ impl Shell {
             .map(|j| {
                 pieces
                     .get((j / per_chunk) as usize)
-                    .map(|&[run, _]| run * per_chunk + j % per_chunk)
+                    .map(|&[_, cow]| cow * per_chunk + j % per_chunk)
                     .ok_or_else(|| {
                         refuse(format!(
                             "a ring of {} pages in {} piece(s) of {per_chunk} pages",

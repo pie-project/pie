@@ -1503,8 +1503,16 @@ impl Metal {
                 pieces.iter().map(|&[_, cow]| cow).collect()
             }));
         }
-        if !forks.is_empty() {
-            shell.copy_state(&forks).map_err(fault)?;
+        let mut ring_forks: Vec<(u32, u32)> = Vec::new();
+        for pieces in ring_of.iter().flatten() {
+            for &[run, cow] in pieces {
+                if run != cow && !ring_forks.contains(&(run, cow)) {
+                    ring_forks.push((run, cow));
+                }
+            }
+        }
+        if !forks.is_empty() || !ring_forks.is_empty() {
+            shell.copy_records(&forks, &ring_forks).map_err(fault)?;
         }
         // Tail copies (an rs-list or kv slot a fork shares) land before any
         // lane of the fire reads or writes (CONTRACT-BC 20).
