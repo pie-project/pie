@@ -4103,6 +4103,20 @@ fn replay_one_simulated_seed() {
 /// adjacent chunks arriving once the decoders around it have scattered
 /// their pages over the pool ([`a_run_the_pool_can_open_is_opened`]).
 fn run_need_workload(seed: u64, total: u32, segment: u32, run: u32, governed: bool) -> Workload {
+    run_pieces_workload(seed, total, segment, run, 1, governed)
+}
+
+/// [`run_need_workload`] with a bind of `pieces` runs of `run` chunks
+/// beside its single chunks (the M1's run 4b: a restore's bind of two runs
+/// of 28 and two single chunks, 104 chunks free).
+fn run_pieces_workload(
+    seed: u64,
+    total: u32,
+    segment: u32,
+    run: u32,
+    pieces: u32,
+    governed: bool,
+) -> Workload {
     let mut rng = Rng(seed ^ 0x52_4e_ed);
     let pool = PoolShape {
         total,
@@ -4118,7 +4132,7 @@ fn run_need_workload(seed: u64, total: u32, segment: u32, run: u32, governed: bo
             },
             Program {
                 run,
-                scratch: u64::from(run) * MIB,
+                scratch: u64::from(run * pieces) * MIB,
                 resident: 0,
                 per_pair: 0,
             },
@@ -4195,6 +4209,52 @@ fn a_run_the_pool_can_open_is_opened() {
         }
     }
     assert!(waited > 0, "no run waited for room: the shape scatters nothing");
+}
+
+/// `PIE_SIM_PIECES`: binds of two runs beside their single chunks, among
+/// decoders scattering their pages, many arriving at once so binds suspend
+/// their processes and restores carry the bind's room (the M1's run 4b);
+/// every process ends, no restore's placement and takes disagree.
+#[test]
+#[ignore]
+fn binds_of_two_runs_beside_singles_restore_and_end() {
+    let seeds = std::env::var("PIE_SIM_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(200u64);
+    let mut failed = 0;
+    let mut coverage = Coverage::default();
+    for seed in 0..seeds {
+        for (total, segment, length) in [(30, 6, 5), (36, 6, 6), (40, 8, 6), (48, 8, 8)] {
+            let mut workload = run_pieces_workload(seed, total, segment, length, 2, seed % 2 == 0);
+            // Many binds, arriving close together.
+            // The run program's state is resident (held across parks, as a
+            // beam group's): a parked process's restore lays its runs again.
+            if let Some(program) = workload.pool.programs.last_mut() {
+                program.resident = program.scratch;
+            }
+            let mut bind = workload.scripts.last().cloned().expect("a bind");
+            bind.decode = 30;
+            bind.grow_every = 1;
+            let mut rng = Rng(seed ^ 0xb1d5);
+            for _ in 0..rng.range(2, 6) {
+                let mut more = bind.clone();
+                more.at = rng.range(0, 30);
+                more.decode = rng.range(10, 40);
+                workload.scripts.push(more);
+            }
+            let (failures, covered) = run(&workload, None);
+            coverage.add(&covered);
+            for failure in &failures {
+                failed += 1;
+                eprintln!(
+                    "SIM pieces seed={seed} total={total} segment={segment} run={length} step={} kind={} {}",
+                    failure.step,
+                    failure.kind,
+                    failure.line.chars().take(600).collect::<String>()
+                );
+            }
+        }
+    }
+    eprintln!("SIM pieces: {failed} failures, binds {}, bind waits {}, suspends {}, restores {}", coverage.binds, coverage.bind_waits, coverage.bind_suspends, coverage.restores);
+    assert_eq!(failed, 0);
 }
 
 /// A bind of a run of seven adjacent chunks in a pool of segments of six:

@@ -4816,6 +4816,41 @@ mod tests {
         SlotPool::new(facts_with(16, 4, 4, &[(ShapeKind::Fixed, 1024)], &[(16, 4)]))
     }
 
+    /// Two runs of thirty asked where one free run of thirty stands among
+    /// scattered free chunks (the M1's run 4b: a restore's guest state of
+    /// two runs of 30, one such run free of 110 free chunks): the placement
+    /// is short, as the takes are; with a second run opened, it stands.
+    #[test]
+    fn a_placement_of_two_runs_lays_each_disjointly() {
+        let mut pool = SlotPool::new(facts_with(105, 35, 3, &[(ShapeKind::Fixed, 1)], &[]));
+        let holder = Holder::WorkingSet(1);
+        // Every chunk held, then segment 1 given back whole and every other
+        // chunk of segment 2.
+        let held = pool.acquire(holder, 0, 104).unwrap();
+        let back: Vec<Slot> = held
+            .iter()
+            .copied()
+            .filter(|slot| {
+                let physical = pool.logical_to_physical[slot.chunk as usize];
+                (35..70).contains(&physical) || (physical >= 70 && physical % 2 == 0)
+            })
+            .collect();
+        pool.release(holder, &back, 0);
+        pool.retire_through(u64::MAX);
+        assert_eq!(pool.free_chunk_runs(30), 1);
+        assert!(pool.free_chunks() >= 50, "free chunks enough: {}", pool.free_chunks());
+        let two = [OwnPiece::Chunks { run: 30, pieces: 2 }];
+        assert!(!pool.place(&two).stands(), "one free run lays one piece, not two");
+        let one = [OwnPiece::Chunks { run: 30, pieces: 1 }];
+        assert!(pool.place(&one).stands());
+        // Nor two pieces asked apart, one after the other.
+        let apart = [
+            OwnPiece::Chunks { run: 30, pieces: 1 },
+            OwnPiece::Chunks { run: 30, pieces: 1 },
+        ];
+        assert_eq!(pool.place(&apart).placed, 1);
+    }
+
     /// The pool's table after its moves, one by one, is the engine's after
     /// `ChunkTable::apply` of the same list: held chunks moved into holes
     /// among free ones, free logicals swapped up in their place, and moves

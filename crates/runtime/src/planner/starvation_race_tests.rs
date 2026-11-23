@@ -10053,6 +10053,8 @@ async fn a_raced_refusal_standing_with_nothing_in_flight_is_sent_again() {
             });
             proc.bind_room = proc.roles_short;
             proc.roles_short_free = Some(6);
+            // Refused in the room as it stands: none given back since.
+            proc.roles_short_gives = Some(PoolPort::room_gives(&*pool));
             proc.roles_short_quiet = quiet;
             inner.enqueue(
                 head,

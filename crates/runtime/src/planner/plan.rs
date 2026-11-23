@@ -1209,7 +1209,8 @@ impl ResidencyPlanner {
                     // refused restore took and gave back is no more room.
                     // Read at the length its refusal named, in the room
                     // the refusal read.
-                    // And only once more chunks stand free than it left:
+                    // And only once room was given back since it was
+                    // refused ([`Self::no_more_room_than_refused`]):
                     // runs of four fluctuating with a decoding fleet's
                     // takes sent it again ~350 times a second, each unpark
                     // short of a chunk (Mac Pro on 3b45462d4).

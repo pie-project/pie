@@ -2521,12 +2521,14 @@ impl ResidencyPlanner {
     /// on. A pass for it finds no step.
     pub(super) fn head_refused_on_room_unmoved(&self) -> bool {
         let free = self.port.free_chunks();
+        let gives = self.port.room_gives();
         self.with_inner(|inner| {
             inner.unmet_head().is_some_and(|(_, waiter)| {
                 matches!(waiter.kind, WaitKind::Restore { .. })
                     && inner.procs.get(&waiter.pid).is_some_and(|proc| {
                         proc.roles_short.is_some()
                             && proc.roles_short_free.is_some_and(|left| free <= left)
+                            && proc.roles_short_gives == Some(gives)
                     })
             })
         })

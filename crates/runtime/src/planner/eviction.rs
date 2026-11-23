@@ -22,7 +22,7 @@ use super::{ProcessId, ResidencyPlanner};
 const WAITS_ON_FLIGHT: &[&str] = &[
     "something in flight",
     "kv on its way",
-    "once more chunks stand free",
+    "once room is given back",
     "waits for the restored one's bind to fire",
 ];
 
@@ -794,7 +794,7 @@ impl ResidencyPlanner {
             // policy's to make room for (the M1 on ca5c710a7: need_moves 0,
             // "no pick: the policy is asked" among 111 candidates): either
             // the store's placement stands it, and it is sent again once
-            // more chunks stand free than its refusal left, or its own
+            // room is given back since its refusal, or its own
             // check refuses what the map stands, and that is said.
             let fits = match (placement.as_ref(), shape.as_ref(), map.as_ref()) {
                 (Some(placement), Some(need), Some(map)) => map
@@ -809,7 +809,7 @@ impl ResidencyPlanner {
                 // Its own check's refusal is the line's `why`
                 // (`roles_short_why`); a free chunk's event pokes the plan.
                 let end = if stands {
-                    "the head's placement stands: sent again once more chunks stand free than its refusal left"
+                    "the head's placement stands: sent again once room is given back since its refusal"
                 } else {
                     "the map stands the head and its own check refuses it (why=)"
                 };
@@ -974,11 +974,21 @@ impl ResidencyPlanner {
     /// the moves it plans read the store's placement, [`Self::head_placement`]).
     pub(super) fn no_more_room_than_refused(&self, pid: ProcessId) -> bool {
         let free = self.port.free_chunks();
+        let gives = self.port.room_gives();
         self.with_inner(|inner| {
             let Some(proc) = inner.procs.get(&pid) else {
                 return false;
             };
-            if !proc.roles_short_free.is_some_and(|left| free <= left) {
+            // The room moved where more chunks stand free, or where any was
+            // given back since (a compaction's run opened, a release): read
+            // as a count alone, a compaction that opened the second run of
+            // thirty while takes elsewhere left fewer chunks free stood the
+            // placement, and the restore held for good on "no more room"
+            // (the M1's run 4b: 110 free at the refusal, 104 with both runs
+            // standing, 196 s of stalls).
+            if !proc.roles_short_free.is_some_and(|left| free <= left)
+                || proc.roles_short_gives != Some(gives)
+            {
                 return false;
             }
             // Refused while another's take could race it, and nothing in
