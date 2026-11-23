@@ -42,6 +42,7 @@ mod a_tower_region_reads_the_patch_window;
 mod a_verify_walk_is_the_committed_walk;
 mod a_wide_row_reads_no_kv_cell_past_its_keys;
 mod an_adapter_in_slots_is_one_landing_through_the_table;
+mod an_airborne_pass_samples_its_own_row;
 mod an_envelope_keeps_two_passes_in_flight;
 mod an_idle_lane_reports_its_last_landing;
 mod an_instance_outlives_its_failed_frame;

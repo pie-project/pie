@@ -1209,3 +1209,18 @@ than another candidate ladder must never be picked. sc/macpro-dense-fit (held) r
 per-point winners (no threshold, no cap; ties settled by the neighbouring row count, else the profile's pick): on
 the M5 it served Gemma c8 at 200.0 / 199.9 / 200.1 over three fresh measurements; on an M1 Max it served c8 7.5%
 under 8ed8f8679 with its 8-row fires faster on the device (the loss off the device, unexplained).
+
+## F??. A device with no measured profile serves Qwen3.5 slower than its family's measured device (found 2026-11-23)
+With no profile of its own (`--no-measure`, a clean home, the Adreno 840's committed profile unlisted), the phone
+serves `qualcomm.toml`, whose numbers are not measured on any device. Every `[rates]` key is skipped and served by
+the estimate. The load is safe: the submit bound holds every step, prefills ramped to ~2000 tokens, and gpufaults did
+not change over 12 boots. It is slower, though. Measured ABBA on 05d724218 against the committed profile, ms/step:
+- Qwen3.5: 27% slower at c1 (40.1 vs 31.5) and 4.9% slower at c4 (56.7 vs 54.1). A 1-token request takes 0.35 s vs
+  0.10 s.
+- Qwen3 is unaffected (c1 1% faster, c4 1.2% slower).
+
+Cause: with no rates, the dense rungs pick a kernel by the work's shape alone. Rung 1 takes gemv x1 ("reads no more
+weight … so no bandwidth or flops makes another faster"), where the measured rates pick gemv x8 for 1-64 rows on
+Qwen3.5's shapes. Fix shape: a family-level committed entry, with no hard-coded default. The vendor family file
+(`qualcomm.toml`) carries a measured device's crossover as an estimate, keyed so an exact-device entry (the device's
+own committed or stored profile) wins over it.
