@@ -6831,6 +6831,77 @@ pub(crate) mod lifecycle_tests {
         }
     }
 
+    /// A beam's finish while a frame the process submitted is held unsealed
+    /// under the rung's cap (the M1, race5 run 6: a 17-row frame of the set
+    /// staged before its finish, fired 79 s later after a raise, its lanes'
+    /// reserve naming the old tail the finish let go). The finish lets
+    /// nothing go until that frame lands: the set's table stands as the
+    /// frame named it, and once it lands the finish relists.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_beams_finish_waits_for_a_frame_held_under_the_cap() -> anyhow::Result<()> {
+        struct HeldFrame {
+            id: uuid::Uuid,
+            resources: ResourceTable,
+            landed: Option<tokio::sync::oneshot::Receiver<()>>,
+        }
+        impl FireContext for HeldFrame {
+            fn resources(&mut self) -> &mut ResourceTable {
+                &mut self.resources
+            }
+            fn process_id(&self) -> uuid::Uuid {
+                self.id
+            }
+            async fn settle_pipeline_tail(&mut self) -> anyhow::Result<()> {
+                if let Some(landed) = self.landed.take() {
+                    let _ = landed.await;
+                }
+                Ok(())
+            }
+        }
+        let model = crate::store::registry::register_model(32, &[8], &[4]);
+        let stores = crate::store::registry::get(model, 0);
+        let ws = {
+            let mut store = stores.kv.lock();
+            let ws = store.create_working_set();
+            store.reserve(ws, 4).expect("reserve four pages");
+            let mut granted = store.reserve_device_pages(4).expect("four free pages");
+            let (_, txn) = kv::prepare_explicit_reserved(&mut store, ws, &[0, 1, 2, 3], &mut granted)
+                .expect("write four pages");
+            kv::settle(&mut store, txn);
+            ws
+        };
+        let table = |stores: &crate::store::registry::Stores| {
+            crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
+                kv.flat_table(ws).map(<[_]>::to_vec).unwrap_or_default()
+            })
+        };
+        let before = table(&stores);
+        assert_eq!(before.len(), 4);
+        let (land, landed) = tokio::sync::oneshot::channel();
+        let mut context = HeldFrame {
+            id: uuid::Uuid::new_v4(),
+            resources: ResourceTable::new(),
+            landed: Some(landed),
+        };
+        let finish = relist_beam(&mut context, model, 0, ws, 1, &[2, 0]);
+        tokio::pin!(finish);
+        for _ in 0..20 {
+            tokio::select! {
+                biased;
+                _ = &mut finish => panic!("the finish ran before the held frame landed"),
+                () = tokio::task::yield_now() => {}
+            }
+        }
+        assert_eq!(table(&stores), before, "nothing let go while the frame is held");
+        let _ = land.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(5), finish)
+            .await
+            .expect("the finish goes once the frame landed")
+            .expect("relisted");
+        assert_eq!(table(&stores), vec![before[0], before[3], before[1]]);
+        Ok(())
+    }
+
     /// Mac's gemma-4-e4b c64 stall: a windowed ask that settled its tail
     /// whole first waited on its pass's earlier piece, whose frame only the
     /// piece asking completes. The ask now returns once the planner grants
@@ -7686,6 +7757,7 @@ mod static_admission_tests {
                     "the fire carries the end it moves and no place"
                 );
                 Box::new(PendingRequest {
+                    queued: std::time::Instant::now(),
                     lora_program: false,
                     logical_fire_id: instance,
                     request,

@@ -445,6 +445,10 @@ pub(crate) fn build_frame_submission(
             });
         }
         steps.push(StepFire {
+            fire_stamps: group
+                .iter()
+                .map(|request| (request.logical_fire_id, request.queued))
+                .collect(),
             submission: ::engine::Step {
                 lanes,
                 attachments,
@@ -471,6 +475,7 @@ mod tests {
 
     fn pending(request: FireRequest, instance_id: InstanceId) -> Box<PendingRequest> {
         Box::new(PendingRequest {
+            queued: std::time::Instant::now(),
             lora_program: false,
             logical_fire_id: 1,
             request,

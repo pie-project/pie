@@ -146,6 +146,9 @@ pub struct StepFire {
     /// its own fire alone.
     pub member_lanes: Vec<u32>,
     pub instances: Vec<::engine::InstanceId>,
+    /// Each fire's logical id and when its request was handed to the
+    /// scheduler, where known (a debug check names a stale request by them).
+    pub fire_stamps: Vec<(u64, std::time::Instant)>,
 }
 
 #[derive(Default)]

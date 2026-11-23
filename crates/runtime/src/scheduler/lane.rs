@@ -249,32 +249,86 @@ fn past_rung(held: u32, frame: &crate::engine::FrameFire) -> Option<String> {
 
 fn unassigned_ref(engine_idx: usize, frame: &crate::engine::FrameFire) -> Option<String> {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("PIE_CHECK_SLOT_REFS").is_some()) {
+    // Always in a debug build: a stale request (built before the stores let
+    // its slots go, fired after) is named at its source, whatever the path.
+    if !*ON.get_or_init(|| {
+        cfg!(debug_assertions) || std::env::var_os("PIE_CHECK_SLOT_REFS").is_some()
+    }) {
         return None;
     }
-    let shared = crate::store::registry::try_get(0, engine_idx)?.shared?;
+    let stores = crate::store::registry::try_get(0, engine_idx)?;
+    let shared = stores.shared.clone()?;
+    // Read off the pool's lock: the roles take it themselves.
+    let instance_slots = |id: ::engine::InstanceId| {
+        stores
+            .roles
+            .as_ref()
+            .map(|roles| roles.lock().unwrap().fire_slots_of(id))
+            .unwrap_or_default()
+    };
+    let named: Vec<Vec<Vec<(String, crate::store::slots::Slot)>>> = frame
+        .steps
+        .iter()
+        .map(|step| {
+            let mut seen = std::collections::BTreeSet::new();
+            step.instances
+                .iter()
+                .map(|&id| if seen.insert(id) { instance_slots(id) } else { Vec::new() })
+                .collect()
+        })
+        .collect();
     let pool = shared.lock().unwrap();
-    frame.steps.iter().find_map(|step| {
-        step.submission
-            .lanes
-            .iter()
-            .enumerate()
-            .find_map(|(at, lane)| {
-                let fixed: Vec<(::engine::chunk::ShapeId, Vec<u32>)> = lane
-                    .record
-                    .pieces()
-                    .iter()
-                    .map(|(shape, pairs)| (*shape, pairs.iter().flatten().copied().collect()))
-                    .collect();
-                pool.unassigned(&lane.tables)
-                    .or_else(|| pool.unassigned(&fixed))
-                    .map(|(shape, slot_ref)| {
-                        format!(
-                            "a fire's lane {at} names slot ref {slot_ref} of shape {shape:?}, \
-                         which the pool has not handed out"
-                        )
-                    })
+    let list = pool.list().map(|list| list.id);
+    frame.steps.iter().enumerate().find_map(|(at, step)| {
+        // The fire a lane is of: its logical id and how long ago its
+        // request was handed to the scheduler.
+        let fire_of = |lane: usize| {
+            let member = step
+                .member_lanes
+                .windows(2)
+                .position(|span| (span[0] as usize..span[1] as usize).contains(&lane));
+            let stamp = member.and_then(|member| step.fire_stamps.get(member));
+            match stamp {
+                Some(&(id, queued)) => format!("fire {id}, handed to the scheduler {:?} ago", queued.elapsed()),
+                None => "fire unknown".to_string(),
+            }
+        };
+        let lane_fault = step.submission.lanes.iter().enumerate().find_map(|(lane_at, lane)| {
+            let fixed: Vec<(::engine::chunk::ShapeId, Vec<u32>)> = lane
+                .record
+                .pieces()
+                .iter()
+                .map(|(shape, pairs)| (*shape, pairs.iter().flatten().copied().collect()))
+                .collect();
+            let reserve: Vec<(::engine::chunk::ShapeId, Vec<u32>)> = list
+                .filter(|_| !lane.reserve.is_empty())
+                .map(|shape| (shape, lane.reserve.clone()))
+                .into_iter()
+                .collect();
+            let (what, found) = [("its tables", pool.unassigned(&lane.tables)),
+                ("its record", pool.unassigned(&fixed)),
+                ("its reserve (its set's page table at submit)", pool.unassigned(&reserve))]
+                .into_iter()
+                .find_map(|(what, found)| found.map(|found| (what, found)))?;
+            let (shape, slot_ref) = found;
+            let instance = step.instances.get(lane_at);
+            Some(format!(
+                "step {at}'s lane {lane_at} (instance {instance:?}, {}) names slot ref {slot_ref} \
+                 of shape {shape:?} in {what}, which the pool has not handed out: a request \
+                 built before its stores let the slot go",
+                fire_of(lane_at)
+            ))
+        });
+        lane_fault.or_else(|| {
+            named.get(at)?.iter().flatten().find_map(|(what, slot)| {
+                (pool.pool().refs(*slot) == (0, 0)).then(|| {
+                    format!(
+                        "step {at} binds {what} on slot {slot:?}, which the pool counts free: an \
+                         instance's part named past its release"
+                    )
+                })
             })
+        })
     })
 }
 
