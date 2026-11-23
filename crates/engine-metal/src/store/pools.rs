@@ -1482,6 +1482,11 @@ impl Pools {
         ))
     }
 
+    /// Window table `k`'s slot bytes.
+    pub fn window_slot_bytes(&self, k: usize) -> Result<u64> {
+        Ok(self.shape(WINDOWS[k.min(MAX_WINDOWS - 1)])?.slot_bytes)
+    }
+
     /// Window table `k`'s slots a chunk.
     pub fn window_slots_a_chunk(&self, k: usize) -> Result<u32> {
         Ok(self.shape(WINDOWS[k.min(MAX_WINDOWS - 1)])?.per_chunk.max(1))

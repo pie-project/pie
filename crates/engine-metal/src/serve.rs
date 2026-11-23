@@ -371,6 +371,12 @@ pub struct Shell {
     /// fold, after its forward, has read them, while the next fire stages.
     own_arms: u32,
     own_arm: u32,
+    /// `PIE_WINDOW_WATCH`: each complete ring page's hash, by (ring ref, page).
+    page_watch: std::collections::HashMap<(u32, u32), u64>,
+    /// A ring load's frames in order on the GPU: each waits for the one
+    /// before to end (`PIE_WINDOW_CHAIN`, a test of frame overlap).
+    #[cfg(target_vendor = "apple")]
+    chain: Option<(objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLEvent>>, std::cell::Cell<u64>)>,
     landed: BTreeMap<u64, Vec<(String, Vec<f32>)>>,
     /// Steps let go before they landed ([`Shell::forget`]): their rows are
     /// dropped as they land rather than held.
@@ -1270,6 +1276,8 @@ impl PreparedLoad<'_> {
         // that takes any (only a lane of more than `R - W + 1` rows does),
         // an arm each.
         let own_chunks: u32 = match (&rows.ring, rows.windows.first()) {
+            (Some(_), Some(_)) if std::env::var_os("PIE_WINDOW_NO_SHIFT").is_some() => 0,
+            (Some(_), Some(_)) if std::env::var_os("PIE_WINDOW_NO_OWN").is_some() => 1,
             (Some(_), Some(window)) if window.bytes > 0 => {
                 let page = window.tokens.max(1);
                 let per_chunk = (rows.chunk_bytes / window.bytes).max(1);
@@ -1607,6 +1615,11 @@ impl PreparedLoad<'_> {
         let (span_view, span_at, span_bytes) = pools.span_view();
         // The arena ends below the own-row pages at the range's top.
         let own_bytes = u64::from(own_chunks) * pools.chunk_bytes();
+        #[cfg(target_vendor = "apple")]
+        let chain = std::env::var_os("PIE_WINDOW_CHAIN").and_then(|_| {
+            use objc2_metal::MTLDevice as _;
+            device.device().newEvent().map(|event| (event, std::cell::Cell::new(0)))
+        });
         let own_top = (
             pools.layout().total_chunks.saturating_sub(own_chunks),
             own_chunks,
@@ -1775,6 +1788,9 @@ impl PreparedLoad<'_> {
             own_top,
             own_arms: u32::try_from(arms).unwrap_or(1).max(1),
             own_arm: 0,
+            page_watch: std::collections::HashMap::new(),
+            #[cfg(target_vendor = "apple")]
+            chain,
             landed: BTreeMap::new(),
             forgotten: std::collections::BTreeSet::new(),
             host_rows: crate::diag::on().host_rows,
@@ -3691,7 +3707,8 @@ impl Shell {
         let held = u64::from(fold.base) + buffer.len() as u64 * u64::from(page);
         // The fire's own rows past the buffer: their ring rows, or own pages.
         let shared = pieces.first().is_some_and(|&[_, cow]| self.ring_shared.contains(&cow));
-        let direct = crate::store::windowed::direct_allowed(shared, rows, ring_rows, window);
+        let direct = crate::store::windowed::direct_allowed(shared, rows, ring_rows, window)
+            || std::env::var_os("PIE_WINDOW_NO_OWN").is_some();
         // Rows of the fire no buffer slot holds: below the buffer's base (the
         // rows it folds itself) or past its last slot.
         let outside = have < fold.base || u64::from(end) > held;
@@ -3745,11 +3762,20 @@ impl Shell {
             own: &own_ix,
             own_page,
         };
-        let fills: Vec<(u64, u64)> = by_index
+        let mut fills: Vec<(u64, u64)> = by_index
             .own_fills(seated.folded)
             .into_iter()
             .map(|(ring, own)| (bytes[ring as usize], bytes[own as usize]))
             .collect();
+        // A buffer slot holding rows folded before the fire (its first, from
+        // `base` up to `folded`: rows a fire folded itself into the ring and
+        // wrote to no slot) is refilled from its ring page, which holds them.
+        for (i, &slot_at) in buffer_at.iter().enumerate() {
+            let n = fold.base / page + u32::try_from(i).unwrap_or(u32::MAX);
+            if u64::from(n) * u64::from(page) < u64::from(seated.folded) {
+                fills.push((ring_at[n as usize % ring_at.len().max(1)], slot_at));
+            }
+        }
         if !fills.is_empty() {
             self.window_fills.push((k, fills));
         }
@@ -3766,11 +3792,37 @@ impl Shell {
             })?,
         }
         .min(end.saturating_sub(seated.folded));
+        // A complete ring page (every row two or more behind `have`, past any
+        // frame in flight) never changes; one that does was overwritten.
+        if std::env::var_os("PIE_WINDOW_WATCH").is_some() {
+            let slot_bytes = self.pools.window_slot_bytes(k)?;
+            let done_pages = have.saturating_sub(8) / page;
+            for n in 0..done_pages.min(ring_at.len() as u32) {
+                let mut bytes = vec![0u8; usize::try_from(slot_bytes).unwrap_or(0)];
+                self.pools.read_span(ring_at[n as usize], &mut bytes)?;
+                let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3));
+                let key = (ring_refs[n as usize], n);
+                match self.page_watch.insert(key, hash) {
+                    Some(was) if was != hash => eprintln!(
+                        "wwatch CHANGED slot {} ring ref {} page {n} (have {have}, rows {rows}) {was:x} -> {hash:x}",
+                        seated.lane.slot, ring_refs[n as usize]
+                    ),
+                    None => eprintln!("wpage slot {} page {n} hash {hash:x} at have {have}", seated.lane.slot),
+                    _ => {}
+                }
+            }
+        }
         if std::env::var_os("PIE_WINDOW_TRACE").is_some() {
             eprintln!(
-                "wtrace slot {} have {have} rows {rows} folded {} advance {advance} base {} \
+                "wtrace slot {} tok {:?} tag {} have {have} rows {rows} folded {} advance {advance} base {} \
                  buffer {:?} own {} at page {own_page} direct {direct} ring {:?} refs {:?} fills {}",
                 seated.lane.slot,
+                (
+                    seated.lane.tokens.len(),
+                    seated.lane.tokens.iter().fold(0u64, |h, &t| h.wrapping_mul(1_000_003).wrapping_add(u64::from(t))),
+                    seated.lane.tokens.get(5..9)
+                ),
+                seated.reports,
                 seated.folded,
                 fold.base,
                 buffer_refs,
@@ -4555,6 +4607,15 @@ impl Shell {
             need: self.arms.depth() as u64 + 1,
             have: self.arms.depth() as u64,
         })?;
+        if std::env::var_os("PIE_WINDOW_TRACE").is_some() {
+            let current = self.arena.current();
+            let ((inputs_at, inputs_bytes), _) = self.arena.regions(current, arm as u64);
+            eprintln!(
+                "atrace arm {arm} rung {current} tokens {} inputs [{inputs_at}, {})",
+                self.arena.current_tokens(),
+                inputs_at + inputs_bytes
+            );
+        }
 
         let mut resolved: Vec<engine::ports::Envelope> = Vec::new();
         // Each resolved envelope's instance, by the same index.
@@ -4992,7 +5053,11 @@ impl Shell {
                     // scratch page, in the own-row region's last chunk (past
                     // every arm's share).
                     let page_size = self.pools.window_paging(k).page_size.max(1);
-                    let (first, chunks) = self.own_top;
+                    let (first, chunks) = if std::env::var_os("PIE_WINDOW_NO_SHIFT").is_some() {
+                        (self.pools.layout().total_chunks - 1, 1)
+                    } else {
+                        self.own_top
+                    };
                     if chunks == 0 {
                         return Err(Fault::program(
                             "serve::windowed",
@@ -5227,6 +5292,12 @@ impl Shell {
                 ports.as_ref().and_then(engine::ports::LanePorts::fold),
             )
             .map_err(|error| Fault::program("serve::rs", format!("lane {source}: {error}")))?;
+            if std::env::var_os("PIE_WINDOW_TRACE").is_some() {
+                eprintln!(
+                    "rtrace slot {} have {have} rows {} rs {:?} replay {} commit {} gather {:?} scatter {:?} has_state {}",
+                    lane.slot, row.rows, rs, plan.replay, plan.commit, plan.gather, plan.scatter, self.pools.has_state()
+                );
+            }
             // A reporting lane that buffers tells, where the fire settles,
             // how many slots past its state's frozen length this fire froze
             // (as `LanePlan::of` reckons it) and, where a port places its
@@ -6310,6 +6381,12 @@ impl Shell {
             };
             let (ring, committed, cell_bytes, cell_dtype) =
                 self.programs.feed_cell(feed.instance, feed.channel)?;
+            if std::env::var_os("PIE_WINDOW_TRACE").is_some() {
+                eprintln!(
+                    "ftrace lane {} id {} instance {:?} channel {} cell {committed} to {} bytes {} arm {}",
+                    feed.lane, feed.id, feed.instance, feed.channel, at + feed.at, feed.bytes, p.arm
+                );
+            }
             let element = cell_dtype;
             if element == feed.dtype {
                 if cell_bytes < feed.bytes {
@@ -6436,6 +6513,10 @@ impl Shell {
     fn walk(&self, p: &Prepared<'_>, dry: bool) -> Result<Walked> {
         let place = At::new();
         let mut frame = self.device.frame()?;
+        #[cfg(target_vendor = "apple")]
+        if !dry && let Some((event, value)) = self.chain.as_ref() {
+            frame.fence(event, value.get(), false)?;
+        }
         if let Some(plane) = self.nan_flags.as_ref() {
             frame.fill_zero(plane.slab(), 0, plane.bytes())?;
             #[cfg(target_vendor = "apple")]
@@ -6868,6 +6949,11 @@ impl engine::frame::Shell for Shell {
         }
         if self.own_used > 0 {
             self.own_arm = (self.own_arm + 1) % self.own_arms;
+        }
+        #[cfg(target_vendor = "apple")]
+        if let Some((event, value)) = self.chain.as_ref() {
+            value.set(value.get() + 1);
+            frame.fence(event, value.get(), true)?;
         }
         let pending = frame.commit_async(Some(Box::new(move |refused: Option<String>| {
             counts.leave();
