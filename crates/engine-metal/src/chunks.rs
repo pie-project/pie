@@ -34,6 +34,11 @@ impl Shell {
     pub fn chunk_facts(&self) -> Result<ChunkFacts> {
         let mut facts = self.pool_chunk_facts();
         facts.record_bytes = self.state_slot_bytes();
+        // A windowed load's record holds its rings too (CONTRACT-BC 21).
+        if let Some(ring) = self.pool_ring() {
+            facts.windowed.clone_from(&ring.layers);
+            facts.record_bytes += ring.layers.iter().map(|layer| layer.bytes).sum::<u64>();
+        }
         facts
             .validate()
             .map_err(|why| crate::error::Fault::Unbound {

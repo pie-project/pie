@@ -7,7 +7,7 @@ mod pools;
 pub mod streamed;
 pub mod windowed;
 
-pub use pools::{GuestPiece, Pools, Rows, RsRows, TablePaging, WindowRows};
+pub use pools::{GuestPiece, Pools, RingRows, Rows, RsRows, TablePaging, WindowRows};
 
 use kernels_metal::{StateMap, Tensor};
 use poem_ir::{Attn, Def, Dtype, Operation, Trace};

@@ -1485,6 +1485,9 @@ impl PreparedLoad<'_> {
             for (window, pages) in rows.windows.iter().zip(&window_pages) {
                 layout = layout.with_window(window.bytes, window.rows, window.tokens, *pages)?;
             }
+            if let Some(ring) = &rows.ring {
+                layout = layout.with_ring(ring.pieces);
+            }
             let layout = layout
                 .with_rs(
                     rows.rs.as_ref().map_or(0, |rs| rs.bytes),
@@ -3528,6 +3531,11 @@ impl Shell {
             grafted.wait()?;
         }
         Ok(())
+    }
+
+    #[must_use]
+    pub fn pool_ring(&self) -> Option<&crate::store::RingRows> {
+        self.pools.ring()
     }
 
     #[must_use]

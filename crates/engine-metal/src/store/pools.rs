@@ -187,6 +187,17 @@ pub struct Rows {
     /// The trace's cache rows each shape lays out, in order.
     pub kv_rows: Vec<u32>,
     pub state_rows: Vec<u32>,
+    /// A windowed recipe's rings (CONTRACT-BC 19, 21): the whole chunks a
+    /// record's ring takes (`layout::RING`, one slot a chunk) and the
+    /// windowed layers it holds, each with its bytes (`ChunkFacts::windowed`).
+    pub ring: Option<RingRows>,
+}
+
+/// A windowed recipe's rings, as [`Rows::plan`] reads them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RingRows {
+    pub pieces: u32,
+    pub layers: Vec<engine::chunk::WindowedLayer>,
 }
 
 /// Why the recipe and this shell disagree, as a load refusal.
@@ -496,6 +507,26 @@ impl Rows {
             rs,
             kv_rows,
             state_rows,
+            ring: recipe.windowed.as_ref().and_then(|windowed| {
+                let SlotLayout::Fixed { pieces_per_ws, .. } = windowed.ring_shape(recipe)? else {
+                    return None;
+                };
+                Some(RingRows {
+                    pieces: *pieces_per_ws,
+                    layers: windowed
+                        .layers
+                        .iter()
+                        .zip(&windowed.region.layer_bytes)
+                        .filter_map(|(layer, &bytes)| {
+                            Some(engine::chunk::WindowedLayer {
+                                layer: layer.layer?,
+                                window: layer.window,
+                                bytes,
+                            })
+                        })
+                        .collect(),
+                })
+            }),
         })
     }
 }
@@ -586,6 +617,8 @@ pub struct Pools {
     /// Each distinct set of record slots a state row's pieces lie in.
     bands: Vec<Vec<u32>>,
     rs: Option<RsRows>,
+    /// A windowed load's rings ([`Rows::ring`]).
+    ring: Option<RingRows>,
     /// The page tables a fire stages, by the list each pages.
     tables: Vec<TablePaging>,
     /// The disk tier (CONTRACT-BC 22): one slot file of disk chunks, each a
@@ -660,6 +693,13 @@ fn slot_at(layout: &Layout, shape: &Slots, slot: u32) -> u64 {
 }
 
 impl Pools {
+    /// A windowed load's rings: the chunks a record's ring takes and the
+    /// windowed layers it holds (`ChunkFacts::windowed`).
+    #[must_use]
+    pub fn ring(&self) -> Option<&RingRows> {
+        self.ring.as_ref()
+    }
+
     /// A pool of `chunks` chunks of `chunk_bytes` holding no state rows:
     /// only the guest shapes (`INSTANCE`, `CHANNEL`), every segment
     /// committed. For tests of what guests place in slots.
@@ -692,6 +732,7 @@ impl Pools {
             rs: None,
             kv_rows: Vec::new(),
             state_rows: Vec::new(),
+            ring: None,
         };
         let paging = super::kv::Paging::of(16, 256, 1, 1)?;
         let mut pools = Pools::reserve(device, rows, layout, paging)?;
@@ -727,6 +768,7 @@ impl Pools {
             rs: None,
             kv_rows: Vec::new(),
             state_rows: Vec::new(),
+            ring: None,
         };
         let paging = super::kv::Paging::of(16, 256, 1, 1)?;
         let mut pools = Pools::reserve(device, rows, layout, paging)?;
@@ -779,6 +821,7 @@ impl Pools {
                 rows.bands
             },
             rs: rows.rs,
+            ring: rows.ring,
             tables: rows.tables,
             rows: rows.rows,
             pool,
