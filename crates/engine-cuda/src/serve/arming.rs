@@ -698,6 +698,7 @@ impl Shell {
                 rs_slot: None,
                 rs_read: None,
                 rs_snapshots: &[],
+                replay_stated: None,
                 group: None,
                 inputs: &[],
                 reports: 0,
