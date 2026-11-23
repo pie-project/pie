@@ -195,12 +195,48 @@ impl Work {
     }
 }
 
+/// Two lanes that read one pool of buffered rows as separate hypotheses:
+/// the same record, the same window-buffer slots (a beam group laid in one
+/// shared pool, each beam's rows told apart only by its mask). A window
+/// would cut such a pool by its slots, not by each hypothesis's own
+/// positions, so its lanes would read too few of their own rows: refused by
+/// name until windowed beams lie in a page list a lane. `lanes` is each
+/// lane's (record, buffer slots); a lane with no buffer slot shares none.
+#[must_use]
+pub fn shared_pool(lanes: &[(u32, &[u32])]) -> Option<(usize, usize)> {
+    for (at, (record, buffer)) in lanes.iter().enumerate() {
+        if buffer.is_empty() {
+            continue;
+        }
+        if let Some(other) = lanes[..at]
+            .iter()
+            .position(|(held, slots)| held == record && slots == buffer)
+        {
+            return Some((other, at));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn ring(pages: u32) -> Vec<(i32, u64)> {
         (0..pages).map(|p| (100 + p as i32, 1000 + u64::from(p))).collect()
+    }
+
+    #[test]
+    fn hypotheses_sharing_one_pool_of_window_rows_are_found() {
+        let pool = [7u32, 8];
+        let other = [9u32];
+        // A beam group laid in one pool: one record, one buffer.
+        assert_eq!(shared_pool(&[(1, &pool), (1, &pool)]), Some((0, 1)));
+        // Lanes of their own records, or with buffers of their own (a page
+        // list a beam), or with none, share nothing.
+        assert_eq!(shared_pool(&[(1, &pool), (2, &pool)]), None);
+        assert_eq!(shared_pool(&[(1, &pool), (1, &other)]), None);
+        assert_eq!(shared_pool(&[(1, &[]), (1, &[])]), None);
     }
 
     #[test]

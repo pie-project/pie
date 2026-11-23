@@ -1629,6 +1629,24 @@ impl Shell {
             // (CONTRACT-BC 19). Each record's fold, as its first lane states.
             let mut record_folds: std::collections::HashMap<u32, (u32, u32)> =
                 std::collections::HashMap::new();
+            let stated_buffers: Vec<(u32, &[u32])> = (0..seats.len())
+                .map(|lane| {
+                    let stated = lanes[seat_sources[lane]].window_fold.is_some();
+                    (keys[lane], if stated { window_ids[lane].as_ref() } else { &[][..] })
+                })
+                .collect();
+            if let Some((one, other)) = super::ring::shared_pool(&stated_buffers) {
+                return Err(Fault::Unbound {
+                    what: format!(
+                        "lanes {} and {} read one pool of buffered rows as separate hypotheses \
+                         (one record, one window buffer, told apart by their masks) on a model \
+                         with windowed layers: a window cuts such a pool by its slots, not by \
+                         each hypothesis's positions. Windowed beams are served by a page list \
+                         a lane",
+                        seat_sources[one], seat_sources[other]
+                    ),
+                });
+            }
             let mut composed_tables: Vec<Vec<u32>> = Vec::with_capacity(seats.len());
             for (lane, seat) in seats.iter().enumerate() {
                 let seated = &lanes[seat_sources[lane]];
