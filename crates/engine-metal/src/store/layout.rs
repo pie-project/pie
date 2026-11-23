@@ -31,6 +31,11 @@ pub const FIXED: ShapeId = ShapeId(1);
 /// The first window list's shape.
 pub const WINDOW: ShapeId = ShapeId(2);
 pub const RS: ShapeId = ShapeId(3);
+/// A windowed lane's ring (`SlotRole::Ring`, CONTRACT-BC 21): its own fixed
+/// shape of one slot a chunk, each piece a whole chunk tiled by window-slot
+/// pages from its start (`chunks::MetalRing`). A windowed recipe pages one
+/// window table, so the second window list's id is free for it.
+pub const RING: ShapeId = ShapeId(4);
 
 /// A guest instance's bind-time launch tables (`SlotRole::Instance`). The
 /// weight shapes follow the guest shapes (`streamed::WEIGHTS`).
@@ -135,6 +140,11 @@ pub struct Layout {
     /// recurrent layer's rs planes a slot.
     pub rs: Option<Slots>,
     pub rs_tokens: u32,
+    /// A windowed load's rings ([`RING`]): one slot a chunk, `ring_pieces` a
+    /// record, stated before the record's state shape; the window list is
+    /// then its window buffer (`SlotRole::WindowBuffer`).
+    pub ring: Option<Slots>,
+    pub ring_pieces: u32,
     /// The seats seat-addressed lanes take.
     pub seats: u32,
     /// Guest instances' tables and rings (REDESIGN step 4): shapes no
@@ -183,6 +193,8 @@ impl Layout {
             windows: [None; MAX_WINDOWS],
             rs: None,
             rs_tokens: 0,
+            ring: None,
+            ring_pieces: 0,
             seats,
             instance: Slots::of(INSTANCE, INSTANCE_SLOT, chunk_bytes),
             channel: Slots::of(CHANNEL, CHANNEL_SLOT, chunk_bytes),
@@ -250,6 +262,19 @@ impl Layout {
             tokens,
         });
         Ok(self)
+    }
+
+    /// A windowed load's rings: `pieces` whole chunks a record ([`RING`],
+    /// one slot a chunk). The layers they hold and their bytes are the
+    /// pool's to state (`Pools::chunk_facts`, `ChunkFacts::windowed`).
+    #[must_use]
+    pub fn with_ring(mut self, pieces: u32) -> Layout {
+        if pieces == 0 {
+            return self;
+        }
+        self.ring = Slots::of(RING, self.chunk_bytes, self.chunk_bytes);
+        self.ring_pieces = pieces;
+        self
     }
 
     /// The window lists, in order.
@@ -468,16 +493,27 @@ impl Layout {
         }
         // The window lists: lists of their own slots, each with its window
         // (CONTRACT-BC 19, 21).
+        // A windowed load's one window table is its window buffer: a list of
+        // `T` unfolded rows of every windowed layer, no window of its own.
+        let buffered = self.ring.is_some();
         for window in self.window_lists() {
-            shapes.push(shape(
+            let listed = shape(
                 &window.slots,
                 SlotKind::List {
                     tokens: window.tokens,
                     rate: 1,
-                    window: Some(window.rows),
+                    window: (!buffered).then_some(window.rows),
                 },
                 &Vec::new(),
-            ));
+            );
+            shapes.push(if buffered {
+                SlotShape {
+                    role: SlotRole::WindowBuffer,
+                    ..listed
+                }
+            } else {
+                listed
+            });
         }
         if let Some(rs) = &self.rs {
             shapes.push(SlotShape {
@@ -488,6 +524,19 @@ impl Layout {
                         tokens: self.rs_tokens,
                         rate: 1,
                         window: None,
+                    },
+                    &Vec::new(),
+                )
+            });
+        }
+        // The rings: their own fixed shape, stated before the record's state.
+        if let Some(ring) = &self.ring {
+            shapes.push(SlotShape {
+                role: SlotRole::Ring,
+                ..shape(
+                    ring,
+                    SlotKind::Fixed {
+                        pieces: self.ring_pieces,
                     },
                     &Vec::new(),
                 )
