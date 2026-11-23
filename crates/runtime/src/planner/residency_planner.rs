@@ -1169,13 +1169,23 @@ impl ResidencyPlanner {
         }
     }
 
-    pub(super) fn reclaim_idle_once(&self) -> bool {
-        if self.idle_reclaim_exhausted.swap(true, Ordering::AcqRel) || self.port.reclaim_idle() == 0
-        {
-            return false;
+    /// Drops idle cache for what the head is `short` of, past what earlier
+    /// reclaims freed that is still returning, and no more
+    /// ([`super::pool::PoolPort::reclaim_idle`]).
+    pub(super) fn reclaim_idle_once(&self, short: super::pool::IdleShort) -> IdleOutcome {
+        if self.idle_reclaim_exhausted.swap(true, Ordering::AcqRel) {
+            return IdleOutcome::Nothing;
         }
-        self.idle_reclaim_exhausted.store(false, Ordering::Release);
-        true
+        let reclaim = self.port.reclaim_idle(short);
+        if reclaim.freed > 0 {
+            self.idle_reclaim_exhausted.store(false, Ordering::Release);
+            return IdleOutcome::Freed;
+        }
+        if reclaim.returning > 0 {
+            self.idle_reclaim_exhausted.store(false, Ordering::Release);
+            return IdleOutcome::Returning;
+        }
+        IdleOutcome::Nothing
     }
 
     /// Idle cache the device is short of room for moves down a tier, host
@@ -2673,4 +2683,18 @@ impl Drop for ScopeNotify<'_> {
     fn drop(&mut self) {
         self.0.notify_waiters();
     }
+}
+
+/// What one idle reclaim came to ([`ResidencyPlanner::reclaim_idle_once`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum IdleOutcome {
+    /// Something went: the head looks again in what it left.
+    Freed,
+    /// Nothing more went: pages earlier reclaims freed cover what is short
+    /// and wait on a fire's retirement. The head waits for it (the settle
+    /// that retires them wakes the planner), never on a clock, and nothing
+    /// else is taken for it meanwhile.
+    Returning,
+    /// Nothing went and nothing is returning.
+    Nothing,
 }

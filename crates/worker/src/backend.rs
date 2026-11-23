@@ -247,7 +247,10 @@ fn load_request(
         -1,
         frames_in_flight,
     )?;
-    if request.residency.disk_kv_budget != Some(0) && request.residency.disk_kv_dir.is_none() {
+    // A disk tier only where its budget is stated: none is no tier.
+    if request.residency.disk_kv_budget.is_some_and(|bytes| bytes > 0)
+        && request.residency.disk_kv_dir.is_none()
+    {
         let dir = crate::disk::kv_dir(
             cache_dir,
             snapshot_dir,

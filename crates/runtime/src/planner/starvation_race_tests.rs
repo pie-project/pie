@@ -133,8 +133,8 @@ impl PoolPort for RacePool {
     fn rs_host_stats(&self) -> (RsUnits, RsUnits) {
         Default::default()
     }
-    fn reclaim_idle(&self) -> u32 {
-        0
+    fn reclaim_idle(&self, _: super::pool::IdleShort) -> super::pool::IdleReclaim {
+        super::pool::IdleReclaim::default()
     }
     fn reclaimable_idle(&self) -> u32 {
         0
@@ -1522,8 +1522,8 @@ impl PoolPort for RingPool {
     fn rs_host_stats(&self) -> (RsUnits, RsUnits) {
         Default::default()
     }
-    fn reclaim_idle(&self) -> u32 {
-        0
+    fn reclaim_idle(&self, _: super::pool::IdleShort) -> super::pool::IdleReclaim {
+        super::pool::IdleReclaim::default()
     }
     fn reclaimable_idle(&self) -> u32 {
         0
@@ -2540,6 +2540,12 @@ struct BindRoomPool {
     /// holder of which it moves (the store's sweep of evicted processes'
     /// kv left on the device), or leaves them on the device.
     sweeps_shared: std::sync::atomic::AtomicBool,
+    /// Where set, what a reclaim frees waits on a fire's retirement
+    /// here (`returning`), as the kv store's pages read by a fire in
+    /// flight do: a reclaim frees only what is short past them.
+    retiring: parking_lot::Mutex<Option<Vec<u32>>>,
+    /// The cache chunks reclaims let go, in all.
+    reclaimed: AtomicU32,
 }
 
 impl BindRoomPool {
@@ -2569,7 +2575,17 @@ impl BindRoomPool {
             store_refuses: std::sync::atomic::AtomicBool::new(false),
             shared: parking_lot::Mutex::new(Vec::new()),
             sweeps_shared: std::sync::atomic::AtomicBool::new(true),
+            retiring: parking_lot::Mutex::new(None),
+            reclaimed: AtomicU32::new(0),
         }
+    }
+
+    /// The fire reading what reclaims let go retires: it comes free, and
+    /// the planner hears of it as a settle tells it.
+    fn retire(&self, planner: &Arc<ResidencyPlanner>) {
+        let back = self.retiring.lock().as_mut().map(std::mem::take).unwrap_or_default();
+        self.free.lock().extend(back);
+        planner.pages_freed();
     }
 
     /// The kv chunks of residents no longer on the device go back free,
@@ -2790,11 +2806,28 @@ impl PoolPort for BindRoomPool {
         crate::rt::spawn(async move { planner.parked_down_done(true) });
         true
     }
-    fn reclaim_idle(&self) -> u32 {
+    fn reclaim_idle(&self, short: super::pool::IdleShort) -> super::pool::IdleReclaim {
+        if let Some(returning) = self.retiring.lock().as_mut() {
+            let want = (short.kv_pages as usize).saturating_sub(returning.len());
+            let mut cache = self.cache.lock();
+            let take = want.min(cache.len());
+            let dropped: Vec<u32> = cache.drain(..take).collect();
+            self.reclaimed.fetch_add(dropped.len() as u32, Ordering::Relaxed);
+            let freed = dropped.len() as u32;
+            returning.extend(dropped);
+            return super::pool::IdleReclaim {
+                freed,
+                returning: returning.len() as u32,
+            };
+        }
         let dropped: Vec<u32> = std::mem::take(&mut *self.cache.lock());
         let count = dropped.len() as u32;
+        self.reclaimed.fetch_add(count, Ordering::Relaxed);
         self.free.lock().extend(dropped);
-        count
+        super::pool::IdleReclaim {
+            freed: count,
+            returning: 0,
+        }
     }
     fn reclaimable_idle(&self) -> u32 {
         self.cache.lock().len() as u32
@@ -2988,6 +3021,43 @@ async fn a_bind_short_of_room_lands_once_idle_cache_is_dropped() {
         0,
         "no process was parked"
     );
+}
+
+/// Idle cache fills the pool and what a reclaim lets go waits on a fire's
+/// retirement: the bind short of a run of 3 has 3 chunks reclaimed, and
+/// the next pass for the same shortfall counts them as returning, reclaims
+/// nothing more and waits, never on a clock. Their retirement wakes it,
+/// and it is served in them; the rest of the cache stays.
+#[tokio::test(flavor = "current_thread")]
+async fn a_bind_waits_for_what_its_reclaim_freed_to_retire_and_reclaims_no_more() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..8, 0));
+    *pool.retiring.lock() = Some(Vec::new());
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let pid = ProcessId::new_v4();
+    planner.register(pid);
+    planner.note_admitted(pid);
+    let p = planner.clone();
+    let mut waited = crate::rt::spawn(async move { p.wait_bind_room(pid, 3, 1).await });
+    for _ in 0..3 {
+        planner.plan();
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+    }
+    let early = tokio::time::timeout(std::time::Duration::from_millis(300), &mut waited).await;
+    assert!(early.is_err(), "it waits for the retirement");
+    assert_eq!(pool.reclaimed.load(Ordering::Relaxed), 3, "the shortfall, once");
+    assert_eq!(pool.cache.lock().len(), 5, "no more of the cache went");
+    assert_eq!(
+        planner.stats.evictions_started.load(Ordering::Relaxed),
+        0,
+        "and no one moved for it"
+    );
+    pool.retire(&planner);
+    waited.await.expect("the wait ends").expect("served");
+    assert_eq!(pool.reclaimed.load(Ordering::Relaxed), 3);
+    assert_eq!(pool.cache.lock().len(), 5);
 }
 
 /// Resident guest state fills the pool and no cache is left: the bind

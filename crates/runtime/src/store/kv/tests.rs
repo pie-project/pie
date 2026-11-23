@@ -10,6 +10,11 @@ use super::write::{KvPreparedWrite, PageCommit, PreparedTarget};
 use crate::inferlet::process::ProcessId;
 use crate::policy::retention::Keys;
 
+/// Keys that let every entry go: the runtime's to drop as its room is wanted.
+fn floor(_: Option<ProcessId>) -> i64 {
+    crate::policy::retention::FLOOR
+}
+
 fn h(seed: u32) -> Hash256 {
     let mut out = [0u8; 32];
     out[..4].copy_from_slice(&seed.to_le_bytes());
@@ -484,21 +489,21 @@ fn store_reclaims_cache_lowest_rank_first_and_spares_what_live_ones_read() {
     let rank = |owner: Option<ProcessId>| i64::from(owner == Some(kept));
 
     // Equal ranks: the one used longest ago goes, and alone.
-    assert_eq!(store.reclaim_cache(store.current_epoch(), rank), 2);
+    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, rank), 2);
     assert!(!store.owns_cache(old) && store.owns_cache(new));
     assert_eq!(on_device(&mut store, &old_tokens), 0);
 
     // A live working set reads `new`, so dropping it would free nothing:
     // the higher-ranked one goes instead.
     let reader = reader(&mut store, &new_tokens, 2);
-    assert_eq!(store.reclaim_cache(store.current_epoch(), rank), 2);
+    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, rank), 2);
     assert!(store.owns_cache(new) && !store.owns_cache(kept));
-    assert_eq!(store.reclaim_cache(store.current_epoch(), rank), 0);
+    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, rank), 0);
 
     // Once nothing reads it, it can go too.
     store.release_working_set(reader, store.current_epoch());
     store.retire_idle();
-    assert_eq!(store.reclaim_cache(store.current_epoch(), rank), 2);
+    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, rank), 2);
     assert!(store.cached_working_sets().is_empty());
 
     // An owner's whole cached working-set goes when the policy drops it.
@@ -531,16 +536,16 @@ fn reclaim_spares_the_prefixes_a_live_working_set_kept() {
 
     // The running process's entries are the older, but freeing pages
     // means taking the idle one, and only it.
-    assert_eq!(store.reclaim_cache(store.current_epoch(), rank), 2);
+    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, rank), 2);
     assert!(store.owns_cache(running) && !store.owns_cache(idle));
-    assert_eq!(store.reclaim_cache(store.current_epoch(), rank), 0);
+    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, rank), 0);
     assert_eq!(entries(&store, running), 4);
 
     // Once it ends they are the cache's alone, and go.
     store.release_working_set(ws, store.current_epoch());
     store.retire_idle();
     assert_eq!(store.available_pages(), 4);
-    assert_eq!(store.reclaim_cache(store.current_epoch(), rank), 4);
+    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, rank), 4);
     assert!(store.cached_working_sets().is_empty());
 
     // A reader of a shorter prefix spares only what it reads: the longer
@@ -553,11 +558,11 @@ fn reclaim_spares_the_prefixes_a_live_working_set_kept() {
     }
     store.release_working_set(ws, store.current_epoch());
     let reader = reader(&mut store, &tokens, 2);
-    assert_eq!(store.reclaim_cache(store.current_epoch(), rank), 2);
+    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, rank), 2);
     assert_eq!(entries(&store, idle), 2);
     assert_eq!(on_device(&mut store, &tokens), 2);
     store.release_working_set(reader, store.current_epoch());
-    assert_eq!(store.reclaim_cache(store.current_epoch(), rank), 2);
+    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, rank), 2);
     assert_eq!(store.available_pages(), 8);
 }
 
@@ -592,7 +597,7 @@ fn a_suspend_past_host_swap_spills_to_disk_and_restores_whole() {
     let ws = store.create_working_set();
     let before = commit_fresh(&mut store, ws, 3, 1);
     let sets = HashSet::from([ws]);
-    let Some(txn) = store.prepare_suspend(&sets).unwrap() else {
+    let Some(txn) = store.prepare_suspend(&sets, floor).unwrap() else {
         panic!("three private resident pages suspend");
     };
     let tiers: Vec<_> = txn
@@ -604,7 +609,7 @@ fn a_suspend_past_host_swap_spills_to_disk_and_restores_whole() {
     assert_eq!(tiers, [(HostPinned, 1), (LocalDisk, 2)]);
     assert_eq!(store.commit_suspend(txn).unwrap(), 3);
     assert_eq!(
-        (store.host_swap_available(), store.disk_swap_available()),
+        (store.host_swap_available(), store.disk_swap_available(floor)),
         (0, 0)
     );
     store.retire_idle();
@@ -613,7 +618,7 @@ fn a_suspend_past_host_swap_spills_to_disk_and_restores_whole() {
     let txn = store.prepare_restore(&sets, &mut granted).unwrap();
     assert_eq!(store.commit_restore(txn).unwrap(), 3);
     assert_eq!(
-        (store.host_swap_available(), store.disk_swap_available()),
+        (store.host_swap_available(), store.disk_swap_available(floor)),
         (1, 2)
     );
     assert_eq!(
@@ -638,7 +643,7 @@ fn a_suspend_takes_shared_pages_to_the_host_in_place() {
     commit_fresh(&mut store, c, 1, 1);
     assert_eq!(store.available_pages(), 2);
     let suspend = |store: &mut KvStore, ws| {
-        let Some(txn) = store.prepare_suspend(&HashSet::from([ws])).unwrap() else {
+        let Some(txn) = store.prepare_suspend(&HashSet::from([ws]), floor).unwrap() else {
             panic!("a suspend with pages to move");
         };
         store.commit_suspend(txn).unwrap()
@@ -682,12 +687,12 @@ fn a_suspend_takes_shared_pages_to_the_host_in_place() {
     store.retire_idle();
     assert!(
         store
-            .prepare_sweep(&HashSet::from([c]), usize::MAX, &[], usize::MAX)
+            .prepare_sweep(&HashSet::from([c]), usize::MAX, &[], usize::MAX, floor)
             .unwrap()
             .is_none()
     );
     let sweep = store
-        .prepare_sweep(&HashSet::new(), usize::MAX, &[], usize::MAX)
+        .prepare_sweep(&HashSet::new(), usize::MAX, &[], usize::MAX, floor)
         .unwrap()
         .unwrap();
     let mut granted = store.reserve_device_pages(4).unwrap();
@@ -732,7 +737,7 @@ fn a_prefix_page_every_reader_left_on_the_device_goes_down_with_them() {
     // The move down of its readers' parked state takes it.
     let order: Vec<_> = forks.iter().map(|&ws| (ws, 0)).collect();
     let sweep = store
-        .prepare_sweep(&HashSet::new(), usize::MAX, &order, usize::MAX)
+        .prepare_sweep(&HashSet::new(), usize::MAX, &order, usize::MAX, floor)
         .unwrap()
         .expect("the shared page moves");
     assert_eq!(store.commit_suspend(sweep).unwrap(), 1, "once, for every reader");
@@ -759,11 +764,17 @@ fn a_prefix_page_every_reader_left_on_the_device_goes_down_with_them() {
         .collect();
     store.discard_cache(owner, crate::policy::By::Policy);
     for &ws in &forks[..6] {
-        assert!(store.prepare_suspend(&HashSet::from([ws])).unwrap().is_none(), "read by the rest");
+        assert!(
+            store
+                .prepare_suspend(&HashSet::from([ws]), floor)
+                .unwrap()
+                .is_none(),
+            "read by the rest"
+        );
         store.mark_suspended(&HashSet::from([ws]));
     }
     let last = store
-        .prepare_suspend(&HashSet::from([forks[6]]))
+        .prepare_suspend(&HashSet::from([forks[6]]), floor)
         .unwrap()
         .expect("the last reader's suspend takes the page");
     assert_eq!(store.commit_suspend(last).unwrap(), 1);
@@ -777,10 +788,11 @@ fn an_entry_left_on_the_host_goes_when_swap_needs_room() {
     let w = store.create_working_set();
     sealed(&mut store, w, &tokens);
     store.keep_checkpoint(w, 3, Some(ProcessId::from_u128(1)));
-    let suspend = |store: &mut KvStore, ws| match store.prepare_suspend(&HashSet::from([ws])) {
-        Ok(Some(txn)) => store.commit_suspend(txn).unwrap(),
-        other => panic!("a suspend with room: {other:?}"),
-    };
+    let suspend =
+        |store: &mut KvStore, ws| match store.prepare_suspend(&HashSet::from([ws]), floor) {
+            Ok(Some(txn)) => store.commit_suspend(txn).unwrap(),
+            other => panic!("a suspend with room: {other:?}"),
+        };
     assert_eq!(suspend(&mut store, w), 3);
     store.release_working_set(w, store.current_epoch());
     assert_eq!(store.host_swap_available(), 0);
@@ -803,7 +815,7 @@ fn a_move_under_way_keeps_only_the_pages_it_holds() {
     let quote = |store: &KvStore| store.reclaim_quotes(&[HashSet::from([b])], u32::MAX);
     // B runs beside A: only its own page goes.
     assert_eq!(quote(&store), [ReclaimQuote::Pages(1)]);
-    let Some(txn) = store.prepare_suspend(&HashSet::from([a])).unwrap() else {
+    let Some(txn) = store.prepare_suspend(&HashSet::from([a]), floor).unwrap() else {
         panic!("A has its own page to move");
     };
     assert_eq!(store.commit_suspend(txn).unwrap(), 1);
@@ -815,7 +827,7 @@ fn a_move_under_way_keeps_only_the_pages_it_holds() {
         .prepare_restore(&HashSet::from([a]), &mut granted)
         .unwrap();
     assert_eq!(quote(&store), [ReclaimQuote::Pages(1)]);
-    let Some(txn) = store.prepare_suspend(&HashSet::from([b])).unwrap() else {
+    let Some(txn) = store.prepare_suspend(&HashSet::from([b]), floor).unwrap() else {
         panic!("B's own page still goes");
     };
     assert_eq!(txn.page_count(), 1);
@@ -838,7 +850,7 @@ fn a_sweep_takes_readers_in_order_and_a_kept_head_last() {
     store.mark_suspended(&HashSet::from([a, b]));
     let page = u64::from(store.page_size.max(1));
     let sweep = store
-        .prepare_sweep(&HashSet::new(), usize::MAX, &[(b, page), (a, 0)], 1)
+        .prepare_sweep(&HashSet::new(), usize::MAX, &[(b, page), (a, 0)], 1, floor)
         .unwrap()
         .expect("something to move");
     assert_eq!(sweep.page_count(), 1, "no more than was wanted");
@@ -859,7 +871,7 @@ fn a_sweep_suspends_only_the_readers_of_what_it_moves() {
     // Suspended with nothing moved, as a kv-less eviction leaves them.
     store.mark_suspended(&HashSet::from([a, b]));
     let sweep = store
-        .prepare_sweep(&HashSet::new(), 2, &[], usize::MAX)
+        .prepare_sweep(&HashSet::new(), 2, &[], usize::MAX, floor)
         .unwrap()
         .expect("room for two pages");
     assert_eq!(sweep.page_count(), 2);
@@ -877,7 +889,7 @@ fn a_sweep_suspends_only_the_readers_of_what_it_moves() {
     // It runs: the next sweep leaves it alone.
     assert!(
         store
-            .prepare_sweep(&HashSet::new(), usize::MAX, &[], usize::MAX)
+            .prepare_sweep(&HashSet::new(), usize::MAX, &[], usize::MAX, floor)
             .unwrap()
             .is_none()
     );
@@ -1324,7 +1336,7 @@ fn what_decode_wrote_is_reclaimed_before_the_prompt() {
     let reader = store.create_working_set();
     let keys = keys_ahead(&store, reader, 0, &tokens);
     assert_eq!(store.cached_run(&keys).len(), 2);
-    assert_eq!(store.reclaim_cache(store.current_epoch(), |_| 0), 1);
+    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, |_| 0), 1);
     assert_eq!(store.cached_run(&keys).len(), 1, "the prompt's page stays");
 }
 
@@ -1338,7 +1350,7 @@ fn idle_cache_goes_to_the_host_and_comes_back_on_a_hit() {
         .expect("three cache-only pages");
     assert_eq!(txn.page_count(), 3);
     assert_eq!(
-        store.reclaim_cache(store.current_epoch(), |_| 0),
+        store.reclaim_cache(store.current_epoch(), 1, |_| 0),
         0,
         "a group in a move is not dropped"
     );
@@ -1347,7 +1359,7 @@ fn idle_cache_goes_to_the_host_and_comes_back_on_a_hit() {
     assert_eq!(store.available_pages(), 8);
     assert_eq!(on_device(&mut store, &tokens), 0);
     assert_eq!(
-        store.reclaim_cache(store.current_epoch(), |_| 0),
+        store.reclaim_cache(store.current_epoch(), 1, |_| 0),
         0,
         "nothing on the device to free"
     );
@@ -1369,7 +1381,7 @@ fn idle_cache_goes_to_the_host_and_comes_back_on_a_hit() {
     store.release_reader(pin);
     store.release_working_set(reader, store.current_epoch());
     store.retire_idle();
-    assert_eq!(store.reclaim_cache(store.current_epoch(), |_| 0), 3);
+    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, |_| 0), 3);
     assert_eq!(store.available_pages(), 8);
 }
 
@@ -1381,7 +1393,7 @@ fn a_suspend_short_of_host_room_drops_host_cache_first() {
     assert_eq!(store.host_swap_available(), 0);
     let running = store.create_working_set();
     commit_fresh(&mut store, running, 2, 1);
-    let Some(txn) = store.prepare_suspend(&HashSet::from([running])).unwrap() else {
+    let Some(txn) = store.prepare_suspend(&HashSet::from([running]), floor).unwrap() else {
         panic!("two pages to move");
     };
     use ::engine::transfer::MemoryDomain::HostPinned;
@@ -1409,19 +1421,19 @@ fn a_tail_past_its_step_goes_before_another_head() {
         entries: vec![(a, None, -1), (a, Some(40), 0), (b, None, -1)],
     };
     assert_eq!(
-        store.reclaim_cache(store.current_epoch(), keys.clone()),
+        store.reclaim_cache(store.current_epoch(), 1, keys.clone()),
         1,
         "A's tail"
     );
     assert_eq!(on_device(&mut store, &a_tokens), 3);
     assert_eq!(
-        store.reclaim_cache(store.current_epoch(), keys.clone()),
+        store.reclaim_cache(store.current_epoch(), 1, keys.clone()),
         4,
         "B whole"
     );
     assert_eq!(on_device(&mut store, &b_tokens), 0);
     assert_eq!(on_device(&mut store, &a_tokens), 3, "A's head stays");
-    assert_eq!(store.reclaim_cache(store.current_epoch(), keys.clone()), 3);
+    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, keys.clone()), 3);
     assert_eq!(store.available_pages(), 16);
 }
 
@@ -1467,7 +1479,7 @@ fn floor_keyed_idle_cache_is_dropped_not_demoted() {
     );
     assert_eq!(store.host_swap_available(), 8, "the host is untouched");
     assert_eq!(
-        store.reclaim_droppable(store.current_epoch(), |_| FLOOR),
+        store.reclaim_droppable(store.current_epoch(), 1, |_| FLOOR),
         3,
         "it is dropped"
     );
@@ -1509,7 +1521,7 @@ fn an_answer_goes_before_an_older_prompt() {
     store.fold(ws, 40, true).unwrap();
     store.release_working_set(ws, store.current_epoch());
     store.retire_idle();
-    assert_eq!(store.reclaim_cache(store.current_epoch(), |_| 0), 1);
+    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, |_| 0), 1);
     assert_eq!(on_device(&mut store, &other), 2, "the older prompt stays");
 }
 
@@ -1599,7 +1611,7 @@ fn a_kept_disk_tier_takes_back_the_pages_its_journal_names() {
         4,
         "the orphan's and the short page's slots are free again"
     );
-    store.drop_entries_off_device();
+    store.drop_entries_off_device(usize::MAX, usize::MAX, &floor);
     assert_eq!(
         store.cached_run_any_tier(&keys).len(),
         3,
@@ -1612,11 +1624,11 @@ fn a_kept_disk_tier_takes_back_the_pages_its_journal_names() {
     assert_eq!(store.keep_disk(&path, true).unwrap(), 4);
     assert_eq!(store.disk_pool.available(), 4);
     assert_eq!(
-        store.disk_swap_available(),
+        store.disk_swap_available(floor),
         8,
         "swap may take every copy's slot"
     );
-    store.yield_disk(8);
+    store.yield_disk(8, &floor);
     assert_eq!(store.disk_pool.available(), 8, "every slot given back");
     assert_eq!(store.persisted_pages(), 0);
     drop(store);
@@ -1685,13 +1697,18 @@ fn a_persisted_run_settles_on_disk_and_outlives_hits_and_restarts() {
     assert_eq!(store.below_device(&run), 0, "the pages stay on the device");
 
     let epoch = store.current_epoch();
-    assert_eq!(store.reclaim_cache(epoch, Steps::default()), 3);
+    assert_eq!(
+        store.reclaim_cache(epoch, 1, Steps::default()),
+        1,
+        "settled as far as is short"
+    );
+    assert_eq!(store.reclaim_cache(epoch, 3, Steps::default()), 2);
     let run = store.cached_run_any_tier(&keys);
     assert_eq!(run.len(), 3, "the entry stays");
     assert_eq!(store.below_device(&run), 3, "settled on its copies");
     assert_eq!(store.disk_pool.available(), 5, "with nothing copied");
     assert_eq!(
-        store.reclaim_cache(epoch, Steps::default()),
+        store.reclaim_cache(epoch, 1, Steps::default()),
         0,
         "what is on disk alone frees no device page"
     );
@@ -1715,7 +1732,7 @@ fn a_persisted_run_settles_on_disk_and_outlives_hits_and_restarts() {
         3,
         "a restart finds it"
     );
-    assert_eq!(store.make_swap_room(8), 8, "swap wins");
+    assert_eq!(store.make_swap_room(8, &floor), 8, "swap wins");
     assert_eq!(store.persisted_pages(), 0);
     drop(store);
     assert_eq!(store_for().keep_disk(&path, true).unwrap(), 0);
@@ -1815,7 +1832,7 @@ fn swap_takes_the_lowest_retention_key_first_and_a_raised_key_is_kept() {
     let (low, high) = (run_of(500), run_of(600));
     let mut store = store_for();
     store.keep_disk(&path, true).unwrap();
-    for ((tokens, keys), key) in [(&low, 1), (&high, 9)] {
+    for ((tokens, keys), key) in [(&low, -1), (&high, 0)] {
         let gpu = store.pool.try_alloc_n(2).unwrap();
         assert!(store.import_cached_at(
             &[],
@@ -1827,7 +1844,7 @@ fn swap_takes_the_lowest_retention_key_first_and_a_raised_key_is_kept() {
         assert_eq!(store.commit_persist(txn), 2);
     }
     assert_eq!(store.disk_pool.available(), 0);
-    assert_eq!(store.make_swap_room(2), 2);
+    assert_eq!(store.make_swap_room(2, &floor), 2);
     assert_eq!(store.persisted_pages(), 2);
     let kept: HashSet<Hash256> = store.persisted_keys().into_iter().collect();
     assert!(
@@ -1889,7 +1906,7 @@ fn a_parked_set_wakes_with_the_pages_its_peers_moved() {
     s.set_parked(b, true);
 
     let txn = s
-        .prepare_suspend(&HashSet::from([a]))
+        .prepare_suspend(&HashSet::from([a]), floor)
         .unwrap()
         .expect("no running reader keeps them");
     assert_eq!(s.commit_suspend(txn).unwrap(), 3);
@@ -1935,22 +1952,14 @@ fn a_keep_the_policy_states_is_honoured_and_unkeyed_idle_cache_waits_for_a_deman
             FLOOR
         }
     };
-    assert_eq!(store.reclaim_droppable(store.current_epoch(), keep), 3);
-    assert_eq!(
-        on_device(&mut store, &unkept_tokens),
-        0,
-        "unkept: reclaimed"
-    );
-    assert_eq!(
-        on_device(&mut store, &kept_tokens),
-        3,
-        "the keep is honoured"
-    );
-    assert_eq!(store.reclaim_droppable(store.current_epoch(), keep), 0);
+    assert_eq!(store.reclaim_droppable(store.current_epoch(), 1, keep), 3);
+    assert_eq!(on_device(&mut store, &unkept_tokens), 0, "unkept: reclaimed");
+    assert_eq!(on_device(&mut store, &kept_tokens), 3, "the keep is honoured");
+    assert_eq!(store.reclaim_droppable(store.current_epoch(), 1, keep), 0);
     assert_eq!(on_device(&mut store, &kept_tokens), 3, "still kept");
     // The keep is over: the policy lowers the key, and the next demand
     // reclaims it.
-    assert_eq!(store.reclaim_droppable(store.current_epoch(), |_| FLOOR), 3);
+    assert_eq!(store.reclaim_droppable(store.current_epoch(), 1, |_| FLOOR), 3);
     assert_eq!(on_device(&mut store, &kept_tokens), 0);
 }
 
@@ -1968,7 +1977,7 @@ fn idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight() {
     let busy = store.begin_fire();
     let other = store.begin_fire();
     assert_eq!(
-        store.reclaim_droppable(store.current_epoch(), |_| FLOOR),
+        store.reclaim_droppable(store.current_epoch(), 1, |_| FLOOR),
         3,
         "dropped"
     );
@@ -1987,7 +1996,7 @@ fn idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight() {
     store.release_working_set(ws, read);
     store.retire_idle();
     assert_eq!(
-        store.reclaim_droppable(store.current_epoch(), |_| FLOOR),
+        store.reclaim_droppable(store.current_epoch(), 1, |_| FLOOR),
         3,
         "dropped"
     );
@@ -2109,4 +2118,227 @@ fn a_release_with_nothing_in_flight_frees_its_pages_at_once() {
     let before = store.available_pages();
     store.release_working_set(ws, store.current_epoch());
     assert_eq!(store.available_pages(), before + 3, "free now, no retire asked");
+}
+
+/// Keys that name their revision: what a reclaim reads under them it may
+/// keep until they, the table or the entries move.
+#[derive(Clone, Copy)]
+struct Revised(u64);
+
+impl Keys for Revised {
+    fn key_at(&self, _: Option<ProcessId>, _: u64) -> i64 {
+        crate::policy::retention::FLOOR
+    }
+
+    fn revision(&self) -> Option<u64> {
+        Some(self.0)
+    }
+}
+
+#[test]
+/// A reclaim frees what is short and no more: a store of 256 pages freed a
+/// 64th of itself, times up to eight for a slow walk, whatever was short.
+/// The order it walked stands for the next while nothing it reads moves,
+/// and is walked again once something does.
+fn a_reclaim_frees_what_is_short_and_keeps_its_order_until_it_moves() {
+    let mut store = KvStore::new(256, h(60));
+    let owners: Vec<ProcessId> = (1..=6).map(ProcessId::from_u128).collect();
+    for (seed, &owner) in (60..).zip(&owners) {
+        kept_and_gone(&mut store, seed, 1, owner);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let keys = Revised(1);
+    let free = store.available_pages();
+    let epoch = store.current_epoch();
+    assert_eq!(store.reclaim_cache(epoch, 0, keys), 0, "nothing short, nothing goes");
+    assert_eq!(store.reclaim_cache(epoch, 1, keys), 1);
+    assert_eq!(store.available_pages(), free + 1);
+    assert!(!store.owns_cache(owners[0]), "the least recently used goes");
+    assert!(owners[1..].iter().all(|&owner| store.owns_cache(owner)));
+    let kept = store.order.as_ref().expect("the walk is kept").groups.clone();
+    assert_eq!(kept, store.reclaim_order(&keys), "as a walk now finds it");
+
+    assert_eq!(store.reclaim_cache(epoch, 3, keys), 3);
+    assert_eq!(store.available_pages(), free + 4);
+    assert!(owners[..4].iter().all(|&owner| !store.owns_cache(owner)));
+    assert!(owners[4..].iter().all(|&owner| store.owns_cache(owner)));
+    let kept = store.order.as_ref().expect("the walk is kept").groups.clone();
+    assert_eq!(kept.len(), 2);
+    assert_eq!(kept, store.reclaim_order(&keys));
+
+    // An entry joining moves the order: the walk takes it in.
+    let late = ProcessId::from_u128(7);
+    kept_and_gone(&mut store, 70, 1, late);
+    assert_eq!(store.reclaim_cache(epoch, 2, keys), 2);
+    assert!(store.owns_cache(late), "the most recently used goes last");
+    assert_eq!(store.reclaim_cache(epoch, 1, keys), 1);
+    assert!(store.cached_working_sets().is_empty());
+
+    // Keys of no revision keep nothing.
+    kept_and_gone(&mut store, 71, 1, late);
+    assert_eq!(store.reclaim_cache(epoch, 1, floor), 1);
+    assert!(store.order.is_none());
+}
+
+#[test]
+/// A suspend short of host room drops idle cache below the device lowest
+/// key first, then least recently used, only until its room is covered;
+/// cache a key keeps above the floor stays, and the suspend is refused for
+/// want of room rather than have it dropped.
+fn a_suspend_drops_cache_off_the_device_until_covered_and_never_what_a_key_keeps() {
+    let mut store = KvStore::new_with_swap(8, 4, 0, h(61));
+    let (kept, old, new) = (
+        ProcessId::from_u128(1),
+        ProcessId::from_u128(2),
+        ProcessId::from_u128(3),
+    );
+    let keys = move |owner: Option<ProcessId>| if owner == Some(kept) { 5 } else { 0 };
+    for (seed, owner) in [(80, kept), (81, old), (82, new)] {
+        let ws = store.create_working_set();
+        sealed(&mut store, ws, &prompt(seed, 1));
+        store.keep_checkpoint(ws, 1, Some(owner));
+        let Some(txn) = store.prepare_suspend(&HashSet::from([ws]), keys).unwrap() else {
+            panic!("a page to move");
+        };
+        assert_eq!(store.commit_suspend(txn).unwrap(), 1);
+        store.release_working_set(ws, store.current_epoch());
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert_eq!(store.host_swap_available(), 1);
+
+    // Two pages to park, one slot free: one entry goes, the older at the
+    // lower key, and nothing past it.
+    let v = store.create_working_set();
+    commit_fresh(&mut store, v, 2, 1);
+    let Some(txn) = store.prepare_suspend(&HashSet::from([v]), keys).unwrap() else {
+        panic!("its pages to move");
+    };
+    assert_eq!(store.commit_suspend(txn).unwrap(), 2);
+    assert!(!store.owns_cache(old), "the oldest the keys let go");
+    assert!(store.owns_cache(new), "the room was covered");
+    assert!(store.owns_cache(kept));
+    assert_eq!(store.droppable_below_device(keys), (1, 0), "the kept page is no room");
+
+    // Two more, none free: the last droppable entry goes, and the kept one
+    // stays with the room it holds.
+    let w = store.create_working_set();
+    commit_fresh(&mut store, w, 2, 1);
+    match store.prepare_suspend(&HashSet::from([w]), keys) {
+        Err(super::KvStoreError::HostSwapFull {
+            requested: 2,
+            available: 1,
+        }) => {}
+        other => panic!("refused for want of room: {other:?}"),
+    }
+    assert!(!store.owns_cache(new));
+    assert!(store.owns_cache(kept), "a key above the floor keeps it");
+    assert_eq!(store.droppable_below_device(keys), (0, 0));
+}
+
+#[test]
+/// A suspend gives up the disk tier's copies only where their keys let
+/// them go: a copy kept above the floor is no room, and the suspend is
+/// refused for want of it rather than take it.
+fn a_suspend_takes_no_disk_copy_a_key_keeps() {
+    use super::hash::{chain_slots, page_hash};
+    let seed = h(62);
+    let run_of = |first: u32| {
+        let tokens: Vec<Vec<Option<Hash256>>> =
+            chain_slots(&seed, None, 0, &(first..first + 8).collect::<Vec<_>>())
+                .chunks(4)
+                .map(|page| page.iter().map(|h| Some(*h)).collect())
+                .collect();
+        let keys: Vec<Hash256> = tokens.iter().map(|page| page_hash(page)).collect();
+        (tokens, keys)
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = KvStore::new_with_swap(8, 0, 4, seed);
+    store.set_page_size(4);
+    store.set_keeps(true);
+    store.keep_disk(&dir.path().join("g0.journal"), true).unwrap();
+    let (low, high) = (run_of(700), run_of(800));
+    for ((tokens, keys), key) in [(&low, 0), (&high, 9)] {
+        let gpu = store.pool.try_alloc_n(2).unwrap();
+        assert!(store.import_cached_at(
+            &[],
+            tokens.clone(),
+            keys.clone(),
+            gpu.into_iter().map(KvPageBacking::Resident).collect(),
+        ));
+        let txn = store.prepare_persist(keys, key).expect("two pages");
+        assert_eq!(store.commit_persist(txn), 2);
+    }
+    assert_eq!(store.disk_pool.available(), 0);
+    assert_eq!(store.disk_swap_available(floor), 2, "the kept copies are no room");
+
+    let ws = store.create_working_set();
+    commit_fresh(&mut store, ws, 3, 1);
+    match store.prepare_suspend(&HashSet::from([ws]), floor) {
+        Err(super::KvStoreError::HostSwapFull {
+            requested: 3,
+            available: 2,
+        }) => {}
+        other => panic!("refused for want of room: {other:?}"),
+    }
+    let kept: HashSet<Hash256> = store.persisted_keys().into_iter().collect();
+    assert!(high.1.iter().all(|key| kept.contains(key)), "the kept copies stay");
+    assert!(low.1.iter().all(|key| !kept.contains(key)), "the floor's went");
+    assert_eq!(store.make_swap_room(4, &floor), 2, "and nothing more yields");
+}
+
+#[test]
+/// What a reclaim frees while a fire in flight still reads it waits on that
+/// fire's retirement: it is returning, and counts toward the shortfall, so
+/// a reclaim for the same shortfall frees nothing more. Past it, only what
+/// is still short goes; the fire's settle brings it back.
+fn a_reclaim_counts_what_it_freed_as_returning_until_its_fire_retires() {
+    let mut store = KvStore::new(8, h(63));
+    let (early, late) = (ProcessId::from_u128(1), ProcessId::from_u128(2));
+    let a = store.create_working_set();
+    sealed(&mut store, a, &prompt(90, 2));
+    store.keep_checkpoint(a, 2, Some(early));
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    kept_and_gone(&mut store, 91, 2, late);
+    let fire = store.begin_fire();
+    store.release_working_set(a, store.current_epoch());
+    let free = store.available_pages();
+    let epoch = store.current_epoch();
+
+    assert_eq!(store.reclaim_cache(epoch, 2, floor), 2);
+    assert!(!store.owns_cache(early), "the least recently used went");
+    assert_eq!(store.available_pages(), free, "the fire in flight still reads it");
+    assert_eq!(store.reclaim_returning(), 2);
+    assert_eq!(
+        store.reclaim_cache(epoch, 2, floor),
+        0,
+        "the same shortfall again: what returns covers it"
+    );
+    assert!(store.owns_cache(late), "nothing more went");
+
+    store.settle(fire);
+    assert_eq!(store.reclaim_returning(), 0);
+    assert_eq!(store.available_pages(), free + 2, "back once the fire retired");
+    assert_eq!(store.reclaim_cache(store.current_epoch(), 2, floor), 2);
+    assert!(!store.owns_cache(late), "a new shortfall reclaims again");
+}
+
+#[test]
+/// With no disk tier (and the host short, or none), a suspend whose pages
+/// need the disk is refused by name, as on a full disk: nothing goes
+/// anywhere else, and the pages stay on the device.
+fn a_suspend_that_needs_the_disk_with_no_disk_tier_is_refused_by_name() {
+    for host in [0, 2] {
+        let mut store = KvStore::new_with_swap(8, host, 0, h(64));
+        let ws = store.create_working_set();
+        commit_fresh(&mut store, ws, 3, 1);
+        match store.prepare_suspend(&HashSet::from([ws]), floor) {
+            Err(error @ super::KvStoreError::HostSwapFull { requested: 3, available }) => {
+                assert_eq!(available, host as usize);
+                assert!(error.to_string().contains("swap exhausted"), "{error}");
+            }
+            other => panic!("refused for want of a disk tier: {other:?}"),
+        }
+        assert_eq!(store.swapped_page_count(&HashSet::from([ws])).unwrap(), 0);
+        assert_eq!(store.disk_swap_capacity(), 0);
+    }
 }

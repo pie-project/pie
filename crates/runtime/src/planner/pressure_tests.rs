@@ -39,8 +39,8 @@ impl PoolPort for TierPool {
     fn rs_host_stats(&self) -> (RsUnits, RsUnits) {
         Default::default()
     }
-    fn reclaim_idle(&self) -> u32 {
-        0
+    fn reclaim_idle(&self, _: super::pool::IdleShort) -> super::pool::IdleReclaim {
+        super::pool::IdleReclaim::default()
     }
     fn reclaimable_idle(&self) -> u32 {
         self.device_cache

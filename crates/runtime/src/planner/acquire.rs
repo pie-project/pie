@@ -232,13 +232,24 @@ impl ResidencyPlanner {
             });
             if !rs_free.covers(demand.rs) && resident && !self.port.grow_rs(demand.rs) {
                 // What this frees may be what an older waiter parked on.
-                if self.reclaim_idle_once() {
-                    self.pages_freed();
-                    return Ok(Acquired::Requote);
-                }
-                if self.reclaim_own_sharing(pid) {
-                    self.pages_freed();
-                    return Ok(Acquired::Requote);
+                let short = super::pool::IdleShort {
+                    kv_pages: self.port.rs_as_pages(demand.rs.sub(rs_free)),
+                    rs: true,
+                };
+                match self.reclaim_idle_once(short) {
+                    super::residency_planner::IdleOutcome::Freed => {
+                        self.pages_freed();
+                        return Ok(Acquired::Requote);
+                    }
+                    // Pages a reclaim freed are on their way back: it parks
+                    // for them, and their retirement wakes it.
+                    super::residency_planner::IdleOutcome::Returning => {}
+                    super::residency_planner::IdleOutcome::Nothing => {
+                        if self.reclaim_own_sharing(pid) {
+                            self.pages_freed();
+                            return Ok(Acquired::Requote);
+                        }
+                    }
                 }
             }
         }

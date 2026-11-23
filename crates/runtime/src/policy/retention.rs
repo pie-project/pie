@@ -5,6 +5,7 @@
 //! covers is at the [`FLOOR`].
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::RwLock;
 
@@ -51,6 +52,13 @@ pub trait Keys {
     fn steps(&self, _owner: ProcessId) -> Vec<u64> {
         Vec::new()
     }
+
+    /// The table's revision: a key read under one revision stands until the
+    /// next. `None`: the keys say nothing of when they change, and nothing
+    /// read under them may be kept.
+    fn revision(&self) -> Option<u64> {
+        None
+    }
 }
 
 impl<F: Fn(Option<ProcessId>) -> i64> Keys for F {
@@ -77,12 +85,21 @@ impl Keys for Installed {
             .map(|steps| steps.iter().filter_map(|&(upto, _)| upto).collect())
             .unwrap_or_default()
     }
+
+    fn revision(&self) -> Option<u64> {
+        Some(REVISION.load(Ordering::Acquire))
+    }
 }
 
 static CURRENT: RwLock<Option<Table>> = RwLock::new(None);
 
+/// Bumped by each install, under the table's write lock.
+static REVISION: AtomicU64 = AtomicU64::new(0);
+
 pub(crate) fn install(retention: Option<Table>) {
-    *CURRENT.write() = retention;
+    let mut current = CURRENT.write();
+    *current = retention;
+    REVISION.fetch_add(1, Ordering::AcqRel);
 }
 
 #[cfg(test)]

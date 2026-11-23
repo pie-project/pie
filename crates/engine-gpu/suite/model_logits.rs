@@ -2652,7 +2652,7 @@ fn a_tier_round_trip_is_bit_exact_for_every_parked_shape() {
     let (host, disk) = (MemoryDomain::HostPinned, MemoryDomain::LocalDisk);
     const BUDGET: u64 = 64 << 20;
     let chunks = shell
-        .seat_disk_kv(Some(BUDGET), Some(&dir), SEATS, CONTEXT)
+        .seat_disk_kv(Some(BUDGET), Some(&dir))
         .expect("the slot file opens");
     // The budget divides into disk chunks of a pool chunk each (on a direct
     // I/O boundary), laid out as the device's: any shape's slots take any

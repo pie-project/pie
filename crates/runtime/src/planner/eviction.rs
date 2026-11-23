@@ -179,8 +179,10 @@ impl ResidencyPlanner {
     }
 
     /// Free and total slots suspended kv can go to: host, then disk. The
-    /// slots only idle cache holds there count as free: a suspend makes its
-    /// room by dropping them (`KvStore::make_swap_room`). Counted as full,
+    /// slots only idle cache its keys let go holds there count as free: a
+    /// suspend makes its room by dropping it (`KvStore::make_swap_room`);
+    /// what a key keeps above the floor is full, and asked for with tier
+    /// pressure. Counted as full,
     /// a disk tier holding idle cache made every victim unhostable, and a
     /// head the pool fits alone waited with nothing issued.
     pub(super) fn swap_stats(&self) -> (u32, u32) {
