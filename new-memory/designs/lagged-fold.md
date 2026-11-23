@@ -115,7 +115,7 @@ The cost is a fixed path switch, not a cost a row: a replaying fire takes
 the `~rsx` body, whose recurrent layers run `conv1d_extended` /
 `gated_delta_extended` (`engine-cuda/src/dispatch/ssm.rs:463`), two chunked
 prefill passes a layer (committed part, then the tail) plus the gather and
-scatter into the extended scratch; `rung_rows(own, carried)` lifts the
+scatter into the extended scratch; the rung check (then `rung_rows(own, carried)`, now `fire::rung_holds`) lifts the
 fire's rung by its carried rows (c64); some shapes have no `~rsx` body and
 walk eagerly. The lagged fold cannot land on this path.
 
@@ -144,7 +144,7 @@ One pass a recurrent layer, inside the ordinary decode body:
   (~1 MFLOP a row a layer a lane on 0.8B; ~3.5 GFLOP a step at c64, L = 2).
   Expected: within a few percent of the single-row step for L ≤ 2.
 - **Body and rung.** The rung is chosen from the fire's own rows; carried
-  rows are a kernel input, not rows of the fire (`rung_rows` stops counting
+  rows are a kernel input, not rows of the fire (`fire::lane_carried` stops counting
   them for this kernel's lanes). One body a rung, captured at load, the
   same count as today's decode bodies: the replay kernel replaces the
   single-row recurrent kernels in the decode body, a lane with no carried

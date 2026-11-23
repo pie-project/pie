@@ -484,6 +484,13 @@ impl Layout {
             }],
             shapes,
             act_chunks: act_chunks.to_vec(),
+            // A rung holds its tokens of own rows and of carried rows
+            // (`crate::arena`'s rung check); no bound on the two together.
+            act_replay: act_chunks
+                .iter()
+                .map(|&(tokens, _)| engine::RungReplay::floor(tokens))
+                .collect(),
+            rs_compact: false,
             eager_rungs: Vec::new(),
             held_bytes: 0,
             outside_bytes: 0,

@@ -47,7 +47,7 @@ pub struct FireLimits {
     /// The most buffered recurrent rows one fire's lanes replay, summed over
     /// every lane, a decode lane's (`lane_carried`'s none) included: what
     /// the engine's staged replay table holds a fire (0: no bound past each
-    /// lane's rung, [`crate::fire::rung_rows`]). The runtime steps no more
+    /// lane's rung, [`crate::fire::rung_holds`]). The runtime steps no more
     /// replayed rows than this together, a fire that would carry more
     /// going in the steps after.
     #[serde(default)]

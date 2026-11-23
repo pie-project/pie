@@ -2,7 +2,7 @@
 
 //! A fire whose lanes carry more recurrent rows into it than the tokens of
 //! the rung it stages in, counted as the runtime counts them toward the
-//! rung (`engine::fire::rung_rows`, `engine::fire::lane_carried`: a lane of
+//! rung (`engine::fire::rung_holds`, `engine::fire::lane_carried`: a lane of
 //! more than one own row all its carried rows, a decode lane none), is
 //! refused by name before anything is encoded, so nothing past the rung's
 //! rs scratch is written: its state reads back as it was. A lane carrying
@@ -118,7 +118,7 @@ fn a_fire_carrying_past_its_rungs_tokens_is_refused() {
     )
     .expect_err("a fire carrying past its rung's tokens is refused");
     assert!(
-        why.contains("rung_rows")
+        why.contains("rung_holds")
             && why.contains(&format!("carry {}", rung + 1))
             && why.contains(&format!("past the {rung} tokens")),
         "the refusal names the fire's carried rows and the rung's tokens: {why}"

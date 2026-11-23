@@ -1207,7 +1207,7 @@ impl PreparedLoad<'_> {
         // Each rung's rs scratch: a fire of the rung's tokens and lanes
         // replays its own rows and the rows its lanes carry in, which the
         // contract holds to the rung's tokens summed over the lanes
-        // ([`engine::fire::rung_rows`]): its own rows and as many again.
+        // ([`engine::fire::rung_holds`]): its own rows and as many again.
         let rs_room: Vec<u64> = rungs
             .iter()
             .map(|(tokens, _)| match (&rs_layout, &rows.rs) {
@@ -5626,7 +5626,7 @@ impl Shell {
         // toward the rung (`engine::fire::lane_carried`: a decode lane's
         // none, its step reading them in place through its page table; a
         // wider lane's all), are no more than the tokens of the rung the
-        // fire stages in (`engine::fire::rung_rows`). Where the device
+        // fire stages in (`engine::fire::rung_holds`). Where the device
         // places a lane's rows only the engine counts them; a count past the
         // rung is a wrong count, refused by name before anything is
         // encoded. The rs scratch's own bound is checked at the seat.
@@ -5642,7 +5642,7 @@ impl Shell {
                 format!(
                     "this fire's lanes carry {counted} recurrent rows into it toward the rung, \
                      past the {rung_tokens} tokens of the rung it stages in \
-                     (engine::fire::rung_rows); the fire is refused and writes nothing"
+                     (engine::fire::rung_holds); the fire is refused and writes nothing"
                 ),
             ));
         }

@@ -16,7 +16,7 @@ pub struct FireRequest {
     pub media: Vec<engine::fire::StepMedia>,
     /// The recurrent rows its lanes carry unfolded into the fire, which it
     /// replays ahead of its own, summed over them
-    /// ([`engine::fire::rung_rows`]): their count where the host places
+    /// ([`engine::fire::rung_holds`]): their count where the host places
     /// its rows, a bound on it where the device does.
     pub carried: u32,
     /// The buffered recurrent rows its lanes replay ahead of their own,
@@ -58,7 +58,7 @@ impl FireRequest {
     }
 
     /// What the fire asks its activation rung for: its own rows, or the
-    /// rows it carries where they are more ([`engine::fire::rung_rows`]).
+    /// rows it carries where they are more ([`engine::fire::rung_holds`]).
     #[must_use]
     pub fn rung_rows(&self) -> usize {
         self.tokens().max(self.carried as usize)

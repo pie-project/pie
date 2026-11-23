@@ -1149,7 +1149,7 @@ settle exists for. Fix: stage a feed for those channels in the settle's fires (z
 declared shape; the settle only times), or settle through a class that reads none, instead of
 stopping.
 
-## F?? Metal streamed guest passes run far below bandwidth (needs Metal System Trace counters)
+## F61. Metal streamed guest passes run far below bandwidth (needs Metal System Trace counters)
 Qwen3.5-0.8B beam-4 on the M1 Max, the beam epilogue's log-softmax region (4 rows x vocab ≈ 1M
 elements), after sc/mac-beam-hybrid 83cbd18f9 / ce84536d1 / 0f6db38c4 (register handover, dropped
 stores, broadcast index once a pass, a pipeline per streamed step, broadcast sinking, length
@@ -1168,7 +1168,7 @@ the bf16 roundings), and the reductions' three dependent levels. That needs the 
 headless session cannot capture. The M5 meets the beam rule already (beam-4 / 4-lane 1.023x), so
 this is the M1's and a general guest-codegen item, not a gate.
 
-## F?? Chunked lane scratch through the eta scratch ABI (post-PR)
+## F62. Chunked lane scratch through the eta scratch ABI (post-PR)
 
 A guest instance's value scratch lies whole in one run of adjacent chunks inside one segment: the eta
 scratch ABI (`eta-compiler` codegen/lane_scratch.rs) has a grouped kernel address every value of a lane
@@ -1197,7 +1197,7 @@ shared, each item whole in one piece); no kernel reads that layout. Removing the
 Estimate for Metal and the shared eta change: ~2 days, plus CUDA / HIP's emitter side.
 
 
-## F58. Hybrid beam replay grows with lineage divergence
+## F60. Hybrid beam replay grows with lineage divergence
 
 On a hybrid model each beam lane replays its buffered rows past its group's
 common ancestor every step (`new-memory/designs/BEAM-PAGE-LISTS.md` §11.3,

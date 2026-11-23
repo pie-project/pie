@@ -556,6 +556,19 @@ impl Layout {
             .collect(),
             shapes,
             act_chunks: self.act().to_vec(),
+            // Each rung's rs scratch is laid for its tokens of own rows and
+            // as many carried (`serve`'s `rs_room`: `scratch_rows(T + T)`):
+            // own T, carried T (a decode lane's none), 2T together.
+            act_replay: self
+                .act()
+                .iter()
+                .map(|&(tokens, _)| engine::RungReplay {
+                    own_max: Some(tokens),
+                    carried_max: Some(tokens),
+                    total_max: Some(tokens.saturating_mul(2)),
+                })
+                .collect(),
+            rs_compact: false,
             eager_rungs: Vec::new(),
             held_bytes: 0,
             outside_bytes: 0,

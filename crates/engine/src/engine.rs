@@ -140,7 +140,7 @@ pub struct KvWrites {
     /// One past the last slot the lane's rows landed at, in the set's own
     /// slot numbering: a position. `None` where the engine does not tell
     /// it; the set is then taken to have written as far as it reserved
-    /// ([`crate::fire::rung_rows`], device geometry). `end` and `fold` are
+    /// ([`crate::fire::rung_holds`], device geometry). `end` and `fold` are
     /// one report: an engine that reports `end` for a lane whose fire
     /// folds on the device reports `fold` too.
     pub end: Option<u32>,

@@ -449,7 +449,7 @@ impl Laid {
         let rs_replay = take(lanes * 4);
         let rs_commit = take(lanes * 4);
         // A fire's lanes carry no more buffered rows than its widest
-        // bucket's tokens (`engine::fire::rung_rows`, refused past at the
+        // bucket's tokens (`engine::fire::rung_holds`, refused past at the
         // stage): the table holds a header a lane, those rows' tokens, and
         // the pages they and the lanes' own rows lie in.
         let rs_carry = rs_page_tokens.map(|tokens| {
