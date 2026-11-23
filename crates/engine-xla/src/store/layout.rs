@@ -285,7 +285,9 @@ impl Layout {
                 tokens: 0,
                 slot_bytes: buffer.slot_bytes,
                 planes: Vec::new(),
-                rows: buffer.rows.clone(),
+                // its rows read through the window buffer's planes: no cache
+                // row is laid by it
+                rows: Vec::new(),
             });
             shapes.push(buffer);
             shapes.extend(ring);

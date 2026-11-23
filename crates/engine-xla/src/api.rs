@@ -602,7 +602,7 @@ impl Engine for Xla {
             kv_handle: None,
             media_encode: false,
             rs_verbs: shell.serves_rs_verbs(),
-            windowed_state: false,
+            windowed_state: shell.serves_windowed_state(),
             rs_snapshots: shell.snapshots(),
             bidirectional_attention: true,
             adapter_attachments: true,
@@ -1950,6 +1950,20 @@ impl Xla {
                 lane.slot
             )));
         }
+        // A load serving windowed layers as ring + buffer: every lane the
+        // runtime seats states its fold (CONTRACT-BC 21), a kv-less one none.
+        if shell.serves_windowed_state()
+            && let Some(lane) = submission
+                .lanes
+                .iter()
+                .find(|lane| !lane.kv_less && lane.window.is_none())
+        {
+            return Err(Error::Invalid(format!(
+                "lane in slot {} states no window fold, and this load serves its windowed layers \
+                 as ring + buffer: the runtime states every seated lane's",
+                lane.slot
+            )));
+        }
         let mut words: Vec<u64> = submission.lanes.iter().map(|lane| lane.word).collect();
         for (at, slot) in lane_adapters.iter().enumerate() {
             if slot.is_none() {
@@ -2029,6 +2043,7 @@ impl Xla {
                         .unwrap_or(&[]),
                 },
                 fixed: lane.record.pieces(),
+                window_fold: lane.window,
                 copies: &lane.slot_copies,
             })
             .collect();

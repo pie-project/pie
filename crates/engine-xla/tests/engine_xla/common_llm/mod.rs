@@ -456,6 +456,10 @@ impl Refs {
 pub struct Seq {
     pub slot: u32,
     pub held: u32,
+    /// The rows folded into the rings (`lane_fold`).
+    pub folded: u32,
+    /// The window-buffer slot of each page that holds buffered rows.
+    pub buffered: std::collections::BTreeMap<u32, u32>,
     pub kv: Vec<u32>,
     pub window: Vec<u32>,
     pub record: Vec<(engine::chunk::ShapeId, Vec<[u32; 2]>)>,
@@ -472,6 +476,60 @@ impl Seq {
     pub fn lane(&mut self, model: &Model, refs: &mut Refs, tokens: Vec<u32>) -> Lane {
         let word = model.word(tokens.len() as u32);
         self.lane_of(model.context, word, refs, tokens)
+    }
+
+    /// [`Seq::lane`] of a windowed load folding `fold` rows (CONTRACT-BC
+    /// 21): the rows past `folded + fold` stay in window-buffer slots, the
+    /// lane's table of them from its base. The caller adds the rows to
+    /// `held` once the fire is done, as for [`Seq::lane`].
+    pub fn lane_fold(
+        &mut self,
+        model: &Model,
+        refs: &mut Refs,
+        tokens: Vec<u32>,
+        fold: u32,
+    ) -> Lane {
+        use engine::chunk::{SlotKind, SlotRole};
+        let rows = tokens.len() as u32;
+        let mut lane = self.lane(model, refs, tokens);
+        let buffer = refs
+            .shapes(|s| s.role == SlotRole::WindowBuffer)
+            .into_iter()
+            .next()
+            .expect("a windowed load's window buffer");
+        let SlotKind::List { tokens: page, .. } = buffer.kind else {
+            unreachable!()
+        };
+        let page = page.max(1);
+        let after = self.held + rows;
+        let folded = self.folded + fold;
+        assert!(folded <= after, "a fold past the lane's rows");
+        let carrying = self.held > self.folded;
+        let base = if carrying { self.folded } else { folded } / page * page;
+        let end = if carrying || after > folded {
+            after.div_ceil(page)
+        } else {
+            base / page
+        };
+        let table: Vec<u32> = (base / page..end)
+            .map(|p| {
+                *self
+                    .buffered
+                    .entry(p)
+                    .or_insert_with(|| refs.take(buffer.id))
+            })
+            .collect();
+        lane.tables.push((buffer.id, table));
+        lane.kv.folded = self.folded;
+        lane.window = Some(engine::fire::WindowFold {
+            base,
+            fold: engine::fire::FoldLen::Host(fold),
+            lineage: engine::fire::Lineage::Set,
+        });
+        // the slots wholly folded are free after the fire
+        self.buffered.retain(|&p, _| (p + 1) * page > folded);
+        self.folded = folded;
+        lane
     }
 
     /// The lane as the runtime fires it: legacy page ids in a degenerate
@@ -549,6 +607,24 @@ impl Seq {
                 })
                 .collect();
             lane.tables.push((list.id, table));
+        }
+        // Windowed layers as ring + buffer (CONTRACT-BC 19, 21): every fire
+        // folds every row it computes, so the lane names no buffer slot and
+        // its folded index is every row it held before.
+        let page = refs
+            .shapes(|s| s.role == SlotRole::WindowBuffer)
+            .first()
+            .and_then(|s| match s.kind {
+                SlotKind::List { tokens, .. } => Some(tokens.max(1)),
+                _ => None,
+            });
+        if let Some(page) = page {
+            lane.kv.folded = self.held;
+            lane.window = Some(engine::fire::WindowFold {
+                base: after / page * page,
+                fold: engine::fire::FoldLen::Host(rows),
+                lineage: engine::fire::Lineage::Set,
+            });
         }
         if self.record.is_empty() {
             for fixed in refs.shapes(|s| {

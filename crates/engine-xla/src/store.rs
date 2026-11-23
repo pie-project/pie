@@ -173,6 +173,9 @@ pub struct Pools {
     /// The staging slab: its first pool row and its rows (none on a shell
     /// the load did not size).
     slab: (u32, u32),
+    /// The windowed state's own-row pages: their first pool row and count
+    /// ([`Pools::own_grain`]).
+    own: (u32, u32),
     /// `(rung tokens, chunks)`: what each rung's staged inputs take of the
     /// slab ([`ChunkFacts::act_chunks`]).
     act_chunks: Vec<(u32, u32)>,
@@ -545,7 +548,29 @@ impl Pools {
         // the slab at its start, so one slab is every fire's; the frames in
         // flight hold their copies in the host ring.
         let chunk_rows = layout.chunk_bytes / ROW_BYTES;
-        let slab_chunks = narrow(u64::from(staging.rows).div_ceil(chunk_rows.max(1)));
+        // The own-row pages of the windowed state (CONTRACT-BC 19): a fire's
+        // rows past its window buffer the ring cannot take whole while the
+        // fire reads them, each laid as a window-buffer slot, after the
+        // staged inputs at a page's grain: a fire's pages and a page a lane.
+        let (own_pages, page_rows) = match (layout.ring(), layout.window(), paging.window) {
+            (Some(_), Some(window), Some(w)) => {
+                if layout.chunk_bytes % window.slot_bytes != 0 {
+                    return Err(Fault::Unbound {
+                        what: format!(
+                            "a windowed load whose chunk of {} bytes is no whole number of its \
+                             {}-byte window pages: its ring pages would lie off the window \
+                             buffer's grain",
+                            layout.chunk_bytes, window.slot_bytes
+                        ),
+                    });
+                }
+                (w.fire_pages + w.lanes.max(1), window.slot_bytes / ROW_BYTES)
+            }
+            _ => (0, 1),
+        };
+        let inputs_rows = u64::from(staging.rows).next_multiple_of(page_rows.max(1));
+        let own_rows = u64::from(own_pages) * page_rows;
+        let slab_chunks = narrow((inputs_rows + own_rows).div_ceil(chunk_rows.max(1)));
         let chunks = chunks + slab_chunks;
         // The streamed weights seated whole, in chunks of their own just
         // below the slab: the state chunks the pool would have had stay
@@ -563,7 +588,14 @@ impl Pools {
         let act_chunks: Vec<(u32, u32)> = staging
             .rungs
             .iter()
-            .map(|&(tokens, rows)| (tokens, narrow(u64::from(rows).div_ceil(chunk_rows.max(1)))))
+            .map(|&(tokens, rows)| {
+                let rows = if own_pages > 0 {
+                    inputs_rows + own_rows
+                } else {
+                    u64::from(rows)
+                };
+                (tokens, narrow(rows.div_ceil(chunk_rows.max(1))))
+            })
             .collect();
         let ring = if device.is_dry() || staging.rows == 0 {
             None
@@ -701,6 +733,7 @@ impl Pools {
             weight_views: Vec::new(),
             host_banks: Vec::new(),
             slab: (slab_row, staging.rows),
+            own: (narrow(u64::from(slab_row) + inputs_rows), own_pages),
             act_chunks,
             ring,
             bulk,
@@ -1335,30 +1368,73 @@ impl Pools {
 
     #[must_use]
     pub fn has_state(&self) -> bool {
-        !self.records.is_empty()
+        // recurrent state, not a windowed load's rings: what the fire's
+        // padding, the ladder and snapshots weigh
+        self.layout
+            .shapes
+            .iter()
+            .any(|s| matches!(s.kind, Kind::Fixed { .. }))
     }
 
     /// States the windowed layers of `recipe` (`poem_compiler::chunk::
-    /// plan_windowed`'s), each its ring's bytes in the record as the ring
-    /// hook shared them out ([`Rings`]).
+    /// plan_windowed`'s), each its ring's bytes in the record: its rows of
+    /// the ring pages as this store lays them, the padding the last's.
     pub fn set_windowed(&mut self, recipe: &poem_compiler::chunk::WindowedRecipe) {
         let Some(ring) = self.layout.ring() else {
             self.windowed = Vec::new();
             return;
         };
-        let _ = ring;
-        self.windowed = recipe
+        // each layer's rows of the ring pages, the slot's padding the last's:
+        // the record's ring bytes as this store lays them
+        let ring_bytes = u64::from(ring.pieces()) * ring.slot_bytes;
+        let rows = u64::from(ring.pieces()) * u64::from(self.paging.page_size);
+        let mut windowed: Vec<engine::chunk::WindowedLayer> = recipe
             .layers
             .iter()
-            .zip(&recipe.region.layer_bytes)
-            .filter_map(|(l, &bytes)| {
+            .filter_map(|l| {
                 Some(engine::chunk::WindowedLayer {
                     layer: l.layer?,
                     window: l.window,
-                    bytes,
+                    bytes: rows * l.per_token,
                 })
             })
             .collect();
+        let laid: u64 = windowed.iter().map(|l| l.bytes).sum();
+        if let Some(last) = windowed.last_mut() {
+            last.bytes += ring_bytes.saturating_sub(laid);
+        }
+        self.windowed = windowed;
+    }
+
+    /// The windowed state's own-row pages, as grain indices of the window
+    /// buffer's grain (the ids a composed window table names): none where
+    /// the load holds no rings.
+    #[must_use]
+    pub fn own_grains(&self) -> Vec<u32> {
+        let Some(window) = self.layout.window() else {
+            return Vec::new();
+        };
+        let grain = self.layout.grain(window).max(1);
+        let (first, pages) = self.own;
+        (0..u64::from(pages))
+            .map(|k| narrow((u64::from(first) * ROW_BYTES + k * window.slot_bytes) / grain))
+            .collect()
+    }
+
+    /// The pool row a page of the window buffer's grain starts at.
+    #[must_use]
+    pub fn page_row(&self, grain: u32) -> i64 {
+        let g = self
+            .layout
+            .window()
+            .map_or(ROW_BYTES, |w| self.layout.grain(w));
+        i64::try_from(u64::from(grain) * g / ROW_BYTES).unwrap_or(i64::MAX)
+    }
+
+    /// The pool rows a window-buffer page spans.
+    #[must_use]
+    pub fn page_rows(&self) -> u64 {
+        self.layout.window().map_or(0, |w| w.slot_bytes / ROW_BYTES)
     }
 
     /// A working set's record: every fixed shape's pieces.
@@ -1678,6 +1754,27 @@ impl Pools {
             let from = self.slot_row(id, src)?;
             let to = self.slot_row(id, dst)?;
             spans.push((rows, from, to));
+        }
+        self.copy_rows(device, handles, &spans)
+    }
+
+    /// Whole-page copies `(to, from)` of pages of the window buffer's grain
+    /// (the windowed state's fills and folds, `serve::ring`): the slot copy
+    /// at a window-buffer slot's size, which the load warms.
+    pub fn copy_pages(
+        &mut self,
+        device: &Device,
+        handles: &Handles,
+        pages: &[(u32, u32)],
+    ) -> Result<()> {
+        let rows = self.page_rows();
+        let spans: Vec<(u64, i64, i64)> = pages
+            .iter()
+            .filter(|(to, from)| to != from)
+            .map(|&(to, from)| (rows, self.page_row(from), self.page_row(to)))
+            .collect();
+        if spans.is_empty() {
+            return Ok(());
         }
         self.copy_rows(device, handles, &spans)
     }

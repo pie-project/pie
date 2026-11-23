@@ -10,6 +10,7 @@
 //! too; one lane holding the rest otherwise). A padding lane reads and writes
 //! only the sink page and the sink slot.
 
+pub(crate) mod ring;
 mod size;
 mod stream;
 mod warm;
@@ -191,10 +192,13 @@ pub struct Seated<'a> {
 
     pub first: Option<u32>,
 
-    /// The lane's slot refs of the window list, in its token order (its
-    /// slots hold the kv page's tokens), 0 where trimmed; empty for a lane
-    /// handed none.
+    /// The lane's window-buffer table (CONTRACT-BC 21): its slot refs in
+    /// token order from [`Seated::window_fold`]'s `base`, every one a real
+    /// slot; empty for a lane buffering none.
     pub window: &'a [u32],
+    /// The lane's windowed layers as state + buffer: its buffer's base and
+    /// how far the fire folds.
+    pub window_fold: Option<engine::fire::WindowFold>,
 
     /// The lane's record: one `[run, cow]` slot ref a piece of each fixed
     /// shape (`engine::fire::Lane::fixed`).
@@ -229,6 +233,7 @@ impl<'a> Seated<'a> {
             writes: None,
             first: None,
             window: &[],
+            window_fold: None,
             fixed: &[],
             copies: &[],
         }
@@ -1291,6 +1296,14 @@ impl Shell {
         &self.device
     }
 
+    /// Whether this load serves its windowed layers as ring + buffer
+    /// (`engine::Capabilities::windowed_state`, CONTRACT-BC 19, 21): it does
+    /// wherever it holds windowed layers.
+    #[must_use]
+    pub fn serves_windowed_state(&self) -> bool {
+        self.pools.layout().ring().is_some()
+    }
+
     /// The device, shared: what a registration's compile, off the engine
     /// thread, holds.
     #[must_use]
@@ -2266,23 +2279,105 @@ impl Shell {
         let mut carried: u32 = 0;
         let mut lane_pages: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
         let mut lane_windows: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
+        // The windowed state (CONTRACT-BC 19, 21): each windowed lane's
+        // table composed of its ring, buffer and own-row pages, the pages
+        // filled before the fire and folded into the rings after it.
+        let ring_shape = self.pools.layout().ring().map(|s| s.id);
+        let ring_of = |seated: &Seated<'_>| -> Option<Vec<u32>> {
+            let id = ring_shape?;
+            let (_, pairs) = seated.fixed.iter().find(|(held, _)| *held == id)?;
+            Some(pairs.iter().map(|&[_, cow]| cow).collect())
+        };
+        let rings_named: Vec<Option<Vec<u32>>> = lanes.iter().map(ring_of).collect();
+        let own_grains = self.pools.own_grains();
+        let mut own_taken = 0usize;
+        let mut ring_fills: Vec<(u32, u32)> = Vec::new();
+        let mut ring_folds: Vec<(u32, u32)> = Vec::new();
+        let widest = paging.window.map_or(0, |w| w.tokens);
         for (at, seated) in lanes.iter().enumerate() {
             let pages = match kv_shape {
                 Some(id) if !seated.kv_less => self.pools.grains(id, seated.pages)?,
                 _ => seated.pages.to_vec(),
             };
-            let window = match window_shape {
-                Some(id) if !seated.kv_less && !seated.window.is_empty() => {
-                    self.pools.grains(id, seated.window)?
-                }
-                Some(_) if !seated.kv_less && !seated.pages.is_empty() => {
-                    return Err(Fault::Program {
+            let window = match (window_shape, ring_shape) {
+                (Some(buffer_id), Some(ring_id)) if !seated.kv_less => {
+                    let refuse = |why: String| Fault::Program {
                         at: "serve::prepare",
-                        why: format!(
-                            "lane {at} names kv slots and no window list table, which this \
-                             load's windowed rows read"
+                        why: format!("lane {at}: {why}"),
+                    };
+                    let have = match seated.held {
+                        Some(held) => held,
+                        None => self
+                            .held
+                            .get(seated.lane.slot as usize)
+                            .copied()
+                            .unwrap_or(0),
+                    };
+                    let rows = seated.lane.tokens.len() as u32;
+                    // A lane the engine fires for itself (the staging pass,
+                    // a ladder fire) folds every row it computes; one the
+                    // runtime fires states its fold (`api`, refused there
+                    // without one).
+                    let (fold, folded) = match seated.window_fold {
+                        Some(fold) => (fold, seated.folded),
+                        None => (
+                            engine::fire::WindowFold {
+                                base: (have + rows) / paging.page_size.max(1)
+                                    * paging.page_size.max(1),
+                                fold: engine::fire::FoldLen::Host(rows),
+                                lineage: engine::fire::Lineage::Set,
+                            },
+                            have,
                         ),
-                    });
+                    };
+                    let fold_rows = match fold.fold {
+                        engine::fire::FoldLen::Host(rows) => rows,
+                        engine::fire::FoldLen::Device => {
+                            return Err(refuse(
+                                "folds by a device count, which this engine's rings do not take yet".into(),
+                            ));
+                        }
+                    };
+                    let ring_refs = rings_named[at].clone().ok_or_else(|| {
+                        refuse(format!(
+                            "names no ring piece of shape {ring_id} in its record"
+                        ))
+                    })?;
+                    let ring = self.pools.grains(ring_id, &ring_refs)?;
+                    let buffer = self.pools.grains(buffer_id, seated.window)?;
+                    let alone = rings_named
+                        .iter()
+                        .filter(|r| r.as_ref() == Some(&ring_refs))
+                        .count()
+                        == 1;
+                    let mut own = || -> Result<u32> {
+                        let page = own_grains.get(own_taken).copied().ok_or(Fault::Ceiling {
+                            what: "own-row pages of a windowed fire",
+                            need: own_taken as u64 + 1,
+                            have: own_grains.len() as u64,
+                        })?;
+                        own_taken += 1;
+                        Ok(page)
+                    };
+                    let composed = ring::compose(
+                        &ring::RingLane {
+                            ring: &ring,
+                            buffer: &buffer,
+                            base: fold.base,
+                            have,
+                            rows,
+                            folded,
+                            fold: fold_rows,
+                            alone,
+                        },
+                        paging.page_size,
+                        widest,
+                        0,
+                        &mut own,
+                    )?;
+                    ring_fills.extend(composed.fills);
+                    ring_folds.extend(composed.folds);
+                    composed.table
                 }
                 _ => Vec::new(),
             };
@@ -2376,6 +2471,12 @@ impl Shell {
         }
         if !copies.is_empty() {
             self.pools.copy(&self.device, &self.handles, &copies)?;
+        }
+        // own-row pages holding folded rows below the fire: the ring's,
+        // after any record's copy-on-first-fold above
+        if !ring_fills.is_empty() {
+            self.pools
+                .copy_pages(&self.device, &self.handles, &ring_fills)?;
         }
         if !fresh.is_empty() {
             self.pools.zero(&self.device, &self.handles, &fresh)?;
@@ -3347,6 +3448,12 @@ impl Shell {
             &inputs,
             timing(),
         )?;
+        // The fold: each page the next window reads, from its buffer or
+        // own-row page into its ring page, on the stream behind the fire.
+        if !ring_folds.is_empty() {
+            self.pools
+                .copy_pages(&self.device, &self.handles, &ring_folds)?;
+        }
         let t3 = std::time::Instant::now();
         // The program's outputs: a plane per output the fire's classes
         // write, then a decoder's pixel plane and its grid, then the probes.

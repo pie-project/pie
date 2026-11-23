@@ -728,6 +728,7 @@ impl Shell {
         for slot in 0..(shape.len() as u32).min(slots) {
             self.open(slot)?;
         }
+        let windowed_state = self.pools.layout().ring().is_some();
         let seated: Vec<Seated<'_>> = shape
             .iter()
             .zip(&owned)
@@ -739,9 +740,11 @@ impl Shell {
                     tokens,
                 });
                 seated.pages = &scratch.pages;
-                seated.window = &scratch.window;
                 seated.fixed = &scratch.fixed;
                 seated.held = Some(held_of(want, page_size));
+                if !windowed_state {
+                    seated.window = &scratch.window;
+                }
                 if want.all_rows {
                     seated.readout = Some(every);
                 }
