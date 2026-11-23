@@ -673,12 +673,14 @@ async fn main(input: Input) -> Result<String> {
 
 /// After a search's finish, one plain fire on its working set: the last
 /// token of `hypothesis` (the one the search fed no fire) at slot `slot`,
-/// folding, its second-ranked next token's log-probability against an
-/// unbranched decode of `prompt` and `hypothesis` and that token
-/// ([`rescore`]: its spread over the compositions the width and an unfolded
-/// run take, as the set carries the search's unfolded rows into this fire),
-/// within a step's room ([`Rescored::room`]). How far apart, the room, and its score; past
-/// the room it fails by name.
+/// folding, the log-probabilities of its [`FINISH_TOKENS`] likeliest next
+/// tokens, each against an unbranched decode of `prompt` and `hypothesis`
+/// scoring that token there ([`rescore_last`]), each within its own room
+/// ([`Rescored::room`]). How far apart, the room and the score of the one
+/// farthest from its room; past its room it fails, stating what it measured
+/// (the rank, the values, how far past the room). It establishes only that
+/// the set's next-token head differs from the unbranched decode's past
+/// rounding, not what made it differ.
 async fn finish_check(
     ws: &WorkingSet,
     prompt: &[u32],
@@ -769,12 +771,13 @@ async fn finish_check(
     if apart > room {
         return Err(format!(
             "after its finish the set scored its {}-ranked next token ({}) {got:.4} and an \
-             unbranched decode {:.4}: {apart:.4} apart, room {room:.4} ({STEP_ULPS} bf16 gaps at \
-             its logits' scale): {:.2} times its room; its pages are not its beam's",
+             unbranched decode {:.4}: {apart:.4} apart, {:.2} times its room {room:.4} \
+             ({STEP_ULPS} bf16 gaps at its logits' scale); past rounding, so the set's next-token \
+             head is not the unbranched decode's",
             at + 1,
             tokens[at],
             want.step,
-            apart / room
+            apart / room,
         )
         .into());
     }
