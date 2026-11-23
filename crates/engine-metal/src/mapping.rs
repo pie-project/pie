@@ -230,6 +230,12 @@ pub fn cut(
     let span = map.span();
     let len = map.len();
     if span <= ceiling && apart.is_empty() {
+        // A mapping that fits whole is read ahead as a cut one is.
+        if crate::diag::on().prefault {
+            let mut planes: Vec<(&str, u64, u64)> = bound.to_vec();
+            planes.sort_by_key(|(_, offset, length)| (*offset, *length));
+            prefault(map, &planes);
+        }
         return Ok(vec![Cut::whole(map)]);
     }
     if bound.is_empty() {

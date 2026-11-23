@@ -79,7 +79,11 @@ impl Default for Diagnostics {
             host_rows: false,
             nan_check: false,
             nan_limit: 3.0e38,
-            prefault: false,
+            // The warm road's zero-copy weights fault in page by page as the
+            // GPU first touches them (~1 GB/s); read ahead by many threads at
+            // load they land at the disk's rate (Gemma 4 E4B on the M1, 14.2
+            // GiB: ready 21-26 s -> 15.3 s). `prefault=off` keeps the lazy road.
+            prefault: true,
             copy_resident: true,
             keepalive_iters: None,
             window_ceiling: None,
