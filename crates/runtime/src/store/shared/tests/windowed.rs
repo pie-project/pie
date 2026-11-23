@@ -982,7 +982,7 @@ fn a_kv_only_window_model_s_record_is_its_ring() {
 }
 
 /// A beam group's long prompt on a windowed-only load (four beams of 792
-/// rows, wider together than the 2897 a fire holds) is cut as kv lanes
+/// rows sharing one record, its lagged fold stated, wider together than the 2897 a fire holds) is cut as kv lanes
 /// are: its lanes replay nothing, so several lanes are cuttable
 /// ([`crate::pipeline::fire::window_only`]); a hybrid's are not, its
 /// recurrent layers keeping their bound. The cut run buffers the same rows
@@ -999,6 +999,24 @@ fn a_beam_group_s_long_prompt_on_a_windowed_load_is_cut_not_refused() {
     assert!(crate::pipeline::fire::window_only(&stores, true));
     let (_, hybrid) = stores_of(&hybrid_facts());
     assert!(!crate::pipeline::fire::window_only(&hybrid, true), "a hybrid keeps the rs bound");
+    // An engine stating an rs list beside a record of rings alone: no
+    // recurrent layer replays, so its lanes are cut too.
+    let mut listed = windowed_facts();
+    listed.shapes.push(Facts {
+        role: SlotRole::RsBuffer,
+        ..shape(
+            RS,
+            SlotKind::List {
+                tokens: RS_TOKENS,
+                rate: 1,
+                window: None,
+            },
+            MIB / 8,
+        )
+    });
+    listed.validate().unwrap();
+    let (_, listed) = stores_of(&listed);
+    assert!(crate::pipeline::fire::window_only(&listed, true));
 
     // The pass, cut as the host pass cuts a window-only load's lanes.
     let req = crate::engine::FireRequest {
@@ -1048,17 +1066,27 @@ fn a_beam_group_s_long_prompt_on_a_windowed_load_is_cut_not_refused() {
         } else {
             vec![(0..BEAMS as u32).map(|at| (5 + at * ROWS, 5 + (at + 1) * ROWS)).collect()]
         };
-        for spans in spans {
+        let count = spans.len();
+        for (at, spans) in spans.into_iter().enumerate() {
+            // The group's lagged common-ancestor fold lands with the last
+            // piece; the pieces before it buffer their rows.
+            let fold = if at + 1 == count {
+                GroupFold::Host(400)
+            } else {
+                GroupFold::None
+            };
             let low = spans.iter().map(|&(from, _)| from).min().unwrap();
             let high = spans.iter().map(|&(_, to)| to).max().unwrap();
             let lanes: Vec<usize> = (0..spans.len()).collect();
             let ids = vec![ws; spans.len()];
-            let plan = one(lanes, low..high, GroupFold::None);
+            let plan = one(lanes, low..high, fold);
             demand(&rs, &ids, &plan).expect("counted, never refused");
             let out = prepare_many(&mut rs, &ids, &plan, None).unwrap();
             let rows: Vec<(u32, u32)> = spans.iter().map(|&(from, to)| (from, to - from)).collect();
-            for lane in lanes_of(&out, &shared, &rows, 5) {
-                valid(&lane, &facts);
+            let lanes = lanes_of(&out, &shared, &rows, 5);
+            for lane in &lanes {
+                valid(lane, &facts);
+                assert_eq!(record(lane), record(&lanes[0]), "the group's one record");
             }
             settle(&mut rs, out.txn);
         }
@@ -1073,4 +1101,89 @@ fn a_beam_group_s_long_prompt_on_a_windowed_load_is_cut_not_refused() {
         held
     };
     assert_eq!(run(true), run(false), "the same rows, folded the same");
+}
+
+/// Two frames in flight: lane A's fire folds its buffered rows (frame N,
+/// still running), and every slot then free is handed to the next frame.
+/// The slots A's fold frees are not among them: its fire still reads them
+/// (buffer rows into the ring), so they stay held until it settles, and only
+/// then come free.
+#[test]
+fn a_fold_s_freed_slots_stay_held_until_its_fire_settles() {
+    let facts = windowed_facts();
+    let (shared, stores) = stores_of(&facts);
+    let mut rs = stores.rs.lock().unwrap();
+    let a = warm(&mut rs, 6);
+    let b = warm(&mut rs, 6);
+    let out = prepare_many(&mut rs, &[a], &one(vec![0], 6..13, GroupFold::None), None).unwrap();
+    let held: Vec<u32> = table(&lanes_of(&out, &shared, &[(6, 7)], 6)[0]);
+    settle(&mut rs, out.txn);
+
+    // Frame N: A folds through 12, freeing the slots of rows 4..12.
+    let folding = prepare_many(&mut rs, &[a], &one(vec![0], 13..14, GroupFold::Host(6)), None)
+        .unwrap();
+    rs.retire_idle();
+    let freed: HashSet<u32> = held[..2].iter().copied().collect();
+    let free_before = rs.free().pages;
+
+    // Frame N+1, staged while N runs: B takes every slot that stands free.
+    let grant = rs.reserve(RsUnits::of(0, free_before)).expect("what stands free");
+    let taken: HashSet<u32> = grant.pages.iter().map(|&id| rs.engine_id(id)).collect();
+    assert!(
+        taken.is_disjoint(&freed),
+        "a slot frame N's fold still reads was handed to frame N+1"
+    );
+    rs.release_reservation(grant);
+    let out = prepare_many(&mut rs, &[b], &one(vec![0], 6..10, GroupFold::None), None).unwrap();
+    let theirs: HashSet<u32> = table(&lanes_of(&out, &shared, &[(6, 4)], 6)[0])
+        .into_iter()
+        .collect();
+    assert!(theirs.is_disjoint(&freed), "B's rows land in slots of their own");
+
+    // Frame N lands: its freed slots come back.
+    settle(&mut rs, folding.txn);
+    rs.retire_idle();
+    assert!(rs.free().pages >= free_before - theirs.len() as u32 + freed.len() as u32);
+    settle(&mut rs, out.txn);
+}
+
+/// A masked windowed lane folding nothing (a beam inferlet's Fold::None):
+/// the lowering to ring + buffer leaves the lane's folded index and its
+/// mask as staged, so the mask's column 0 is the folded index the engine
+/// reads from (`kv.folded`, the kv set's, which the inferlet's
+/// `WorkingSet::folded` reads too). The window buffer's base is a table
+/// origin at or below it, never the mask's origin; the buffered rows from
+/// the folded index on are the mask's columns.
+#[test]
+fn a_masked_lane_folding_nothing_keeps_its_mask_origin_at_the_folded_index() {
+    let facts = windowed_facts();
+    let (shared, stores) = stores_of(&facts);
+    let mut rs = stores.rs.lock().unwrap();
+    let ws = warm(&mut rs, 6);
+    let out = prepare_many(&mut rs, &[ws], &one(vec![0], 6..13, GroupFold::None), None).unwrap();
+    settle(&mut rs, out.txn);
+    // Rows 13.. on, the lane carrying 6..13 unfolded: a mask of the 8
+    // columns from the folded index (6) through its own row.
+    let out = prepare_many(&mut rs, &[ws], &one(vec![0], 13..14, GroupFold::None), None).unwrap();
+    let mask = ::engine::Masking::Extent(::engine::Mask::new(vec![8], 8));
+    let mut req = crate::engine::FireRequest {
+        lanes: vec![{
+            let mut lane = crate::engine::fire::lane_of(0, vec![1], 13, Vec::new());
+            lane.lane.kv.folded = 6;
+            lane.lane.mask = Some(mask.clone());
+            lane
+        }],
+        ..crate::engine::FireRequest::default()
+    };
+    out.apply_to(&mut req);
+    crate::pipeline::fire::rs::apply_shared(&mut req, Some(&shared), Some(&out));
+    let lane = &req.lanes[0].lane;
+    assert_eq!(lane.kv.folded, 6, "the folded index as staged");
+    assert_eq!(lane.mask, Some(mask), "the mask as staged, column 0 at the folded index");
+    let window = lane.window.unwrap();
+    assert_eq!(window.fold, FoldLen::Host(0));
+    assert_eq!(window.base, 4, "the table's origin, at or below the mask's");
+    assert_eq!(rs.frozen(ws), Ok(6), "the store folds nothing either");
+    valid(lane, &facts);
+    settle(&mut rs, out.txn);
 }

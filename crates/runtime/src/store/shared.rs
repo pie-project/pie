@@ -848,6 +848,10 @@ pub struct SharedPool {
     /// pages, each lane's slots of it named in its tables and its fold in
     /// `Lane::window`; the rings ride in the record's fixed shapes.
     window_buffer: Option<TokenShape>,
+    /// The record holds recurrent state beside the windowed layers' rings
+    /// (`ChunkFacts::record_bytes` past `ring_bytes`): the model has
+    /// recurrent layers, whose rows replay.
+    recurrent: bool,
     /// The window lists, narrowest window first (CONTRACT-BC 19).
     windows: Vec<TokenShape>,
     /// The fixed shapes of role [`SlotRole::State`]: a record's.
@@ -1159,6 +1163,7 @@ impl SharedPool {
             list: lists.first().copied(),
             rs_list: rs_lists.first().copied(),
             window_buffer: window_buffers.first().copied(),
+            recurrent: facts.record_bytes > facts.ring_bytes(),
             windows,
             fixed,
             roles: RoleShapes {
@@ -1236,6 +1241,14 @@ impl SharedPool {
     #[must_use]
     pub fn window_buffer(&self) -> Option<TokenShape> {
         self.window_buffer
+    }
+
+    /// Whether the model has recurrent layers: the record holds state
+    /// beside the windowed layers' rings. A load of windowed layers alone
+    /// holds rings only, and its lanes replay nothing.
+    #[must_use]
+    pub fn recurrent(&self) -> bool {
+        self.recurrent
     }
 
     /// The list the rs store's buffer pages are slots of: the rs list, or,
