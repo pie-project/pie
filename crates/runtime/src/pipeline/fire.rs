@@ -463,6 +463,135 @@ async fn acquire_grant<C: FireContext>(
     }
 }
 
+/// A beam search's finish of kv set `ws` from page `f0` by `order`
+/// (`KvStore::relist_beam_with`): once the set is out of any move (a
+/// suspend or a sweep in flight pins its old tail: waited on, never a
+/// refusal), and with each chosen page something else still reads copied
+/// first onto a page the planner grants (copy-on-write, the rule every
+/// shared page a set changes keeps), so no page ends up named twice.
+pub(crate) async fn relist_beam<C: FireContext>(
+    ctx: &mut C,
+    model: usize,
+    engine: usize,
+    ws: crate::store::kv::page_table::WorkingSetId,
+    leases: Option<crate::store::kv::working_set::KvSuspendHandle>,
+    f0: u64,
+    order: &[u32],
+) -> Result<(), String> {
+    let stores = crate::store::registry::get(model, engine);
+    // Every fire the process submitted lands first, a frame the scheduler
+    // holds out under the rung's cap among them: built before the finish,
+    // its lanes name the set's tail as it stood (each lane's reserve is the
+    // set's whole table at its submit), and fired after it, it read the
+    // pages the finish let go (the M1, race5 run 6: a fire 79 s after the
+    // finish named a freed page of the old tail, the swap since putting it
+    // on a released segment).
+    ctx.settle_pipeline_tail()
+        .await
+        .map_err(|error| format!("a beam's finish waiting for its fires to land: {error:#}"))?;
+    // And every fire the set itself has submitted, on any pipeline (a closed
+    // one's run-ahead fires included, which the process's tail no longer
+    // lists): each holds a lease on the set until it lands (the M1's run 12:
+    // a fire 4 s after the finish carried the set's pre-relist reserve).
+    if let Some(leases) = &leases {
+        leases.quiesce().await;
+    }
+    loop {
+        let needs = match crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
+            kv.relist_beam_needs(ws, f0, order)
+        }) {
+            Ok(needs) => needs,
+            // Its pages went below with its process (evicted since its
+            // last fire): the finish waits for its restore, as a fire does,
+            // and goes then.
+            Err(crate::store::kv::KvStoreError::Table(
+                crate::store::kv::page_table::KvTableError::NonResident { .. },
+            )) => {
+                settle_and_wait_resident(ctx).await?;
+                continue;
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        let shared = match needs {
+            crate::store::kv::RelistNeeds::MoveEnd(ended) => {
+                let notified = ended.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
+                    kv.set_in_move(ws)
+                }) {
+                    notified.await;
+                }
+                continue;
+            }
+            crate::store::kv::RelistNeeds::Copies(shared) => shared,
+        };
+        let mut copies = Vec::new();
+        let mut grant = None;
+        if !shared.is_empty() {
+            let demand = crate::planner::Demand {
+                kv_pages: u32::try_from(shared.len()).unwrap_or(u32::MAX),
+                rs: crate::store::rs::RsUnits::default(),
+            };
+            let pid = ctx.process_id();
+            let Some(mut granted) = acquire_grant(ctx, pid, demand, false, || Ok(vec![demand])).await? else {
+                continue;
+            };
+            let pages: Vec<crate::store::kv::page_table::PhysicalKvPageId> =
+                granted.lend_kv().drain(..shared.len()).collect();
+            grant = Some(granted);
+            let shape = crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| kv.list_shape());
+            let copy = crate::scheduler::TierMove {
+                kind: crate::scheduler::TierKind::kv(shape),
+                tier: crate::scheduler::device_domain(engine),
+                out: true,
+                device: shared.iter().map(|page| page.0).collect(),
+                slots: pages.iter().map(|page| page.0).collect(),
+                source: None,
+            };
+            let copied = match crate::scheduler::copy_tier_tracked(engine, &copy) {
+                Ok(completion) => completion.wait().await.map_err(|error| error.to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+            if let Err(error) = copied {
+                crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
+                    kv.release_device_reservation(pages);
+                });
+                return Err(format!("a beam's finish copying the chosen pages another reads: {error}"));
+            }
+            copies = shared.into_iter().zip(pages).collect::<Vec<_>>();
+        }
+        let done = crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
+            kv.relist_beam_with(ws, f0, order, &copies)
+        });
+        drop(grant);
+        match done {
+            Ok(true) => return Ok(()),
+            // Evicted while the copies ran: they go back, and the finish
+            // waits for its restore.
+            Err(crate::store::kv::KvStoreError::Table(
+                crate::store::kv::page_table::KvTableError::NonResident { .. },
+            )) => {
+                crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
+                    kv.release_device_reservation(copies.into_iter().map(|(_, copy)| copy).collect());
+                });
+                settle_and_wait_resident(ctx).await?;
+            }
+            // A move began while the copies ran: they go back, and the
+            // finish waits for its end.
+            Ok(false) => crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
+                kv.release_device_reservation(copies.into_iter().map(|(_, copy)| copy).collect());
+            }),
+            Err(error) => {
+                crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
+                    kv.release_device_reservation(copies.into_iter().map(|(_, copy)| copy).collect());
+                });
+                return Err(error.to_string());
+            }
+        }
+    }
+}
+
 /// Awaits `ask` (a windowed planner ask) while finalizing the process's
 /// pending fires as each lands, `drained` told when any did (their window
 /// slots are back): never waits on the tail whole before the ask, since the
@@ -613,6 +742,8 @@ fn host_rs_plan(
     req: &crate::engine::FireRequest,
     fold: &geometry::Fold,
     snapshots: &[u32],
+    beam_ends: Option<&[u32]>,
+    beam_commons: Option<&[u32]>,
 ) -> Result<rs::RsPlan, String> {
     if ids.is_empty() {
         return Ok(rs::RsPlan::Groups(Vec::new()));
@@ -624,7 +755,7 @@ fn host_rs_plan(
         (lane.kv.held, lane.kv.held.saturating_add(rows))
     };
     let mut plans = Vec::with_capacity(groups.len());
-    for (_, lanes) in groups {
+    for (at, (_, lanes)) in groups.iter().enumerate() {
         if let Some(&empty) = lanes
             .iter()
             .find(|&&lane| req.lanes[lane].tokens.is_empty())
@@ -652,6 +783,25 @@ fn host_rs_plan(
                 let high = lanes.iter().map(|&lane| span(lane).1).max().unwrap_or(end);
                 Some(low..high)
             };
+        // A beam group's beams name any page of its pool, and their rows lie
+        // slot by slot on its pages (§11): its buffer is backed from the
+        // state's end to the pool's.
+        let beam_end = beam_ends.and_then(|ends| ends.get(at).copied());
+        // A beam group folds the rows every live beam shares into its set
+        // once (§11.3): to its common slot, never past the rows it has.
+        let fold = match (beam_end, beam_commons.and_then(|commons| commons.get(at).copied())) {
+            (Some(_), Some(common)) if common > frozen => {
+                rs::GroupFold::Host(common.min(end).saturating_sub(frozen))
+            }
+            _ => fold,
+        };
+        let writes = match beam_end {
+            Some(end) => {
+                let high = writes.as_ref().map_or(end, |writes| writes.end);
+                Some(frozen..high.max(end))
+            }
+            None => writes,
+        };
         let snapshots = match (&writes, groups.len()) {
             (None, 1) => snapshots.to_vec(),
             _ => Vec::new(),
@@ -661,6 +811,7 @@ fn host_rs_plan(
             writes,
             fold,
             snapshots,
+            beams: beam_end.is_some(),
         });
     }
     Ok(rs::RsPlan::Groups(plans))
@@ -677,9 +828,26 @@ fn device_rs_plan(
     lanes: &PassLanes,
     split: &[u32],
     fold: &geometry::Fold,
+    beams: bool,
 ) -> Result<rs::RsPlan, String> {
     if ids.is_empty() {
         return Ok(rs::RsPlan::Groups(Vec::new()));
+    }
+    // A beam group's beams name any page of their set's kv reservation (its
+    // pool, grown a column at a time), and their rows lie slot by slot on its
+    // pages (`BEAM-PAGE-LISTS.md` §11): the rs buffer is backed to the same
+    // end. Read before the rs store's lock is taken.
+    let mut beam_ends = std::collections::HashMap::new();
+    if beams {
+        let page = u64::from(stores.kv_page_size.max(1));
+        for (_, group) in groups {
+            let first = group[0];
+            let pages = crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
+                kv.page_len(lanes.kv[first].id)
+            })
+            .map_err(|error| format!("pipeline: a beam group's kv reservation: {error}"))?;
+            beam_ends.insert(first, u32::try_from(pages * page).unwrap_or(u32::MAX));
+        }
     }
     let store = stores.rs.lock().unwrap();
     let mut plans = Vec::with_capacity(groups.len());
@@ -688,7 +856,10 @@ fn device_rs_plan(
         let frozen = store
             .frozen(ids[first])
             .map_err(|error| error.to_string())?;
-        let reserved = lanes.cursors[first].lock().unwrap().reserved;
+        let mut reserved = lanes.cursors[first].lock().unwrap().reserved;
+        if let Some(&end) = beam_ends.get(&first) {
+            reserved = reserved.max(end);
+        }
         let rows = split[first + 1] - split[first];
         let fold = match device_fold(
             fold.of(first),
@@ -708,6 +879,7 @@ fn device_rs_plan(
             writes: Some(frozen..reserved),
             fold,
             snapshots: Vec::new(),
+            beams,
         });
     }
     Ok(rs::RsPlan::Groups(plans))
@@ -716,7 +888,7 @@ fn device_rs_plan(
 /// A lane's rows in a fire, or a fire's (its lanes' summed): its own, and
 /// the recurrent rows it carries in unfolded, which earlier fires wrote and
 /// nothing has folded, and which it replays ahead of its own
-/// ([`::engine::fire::rung_rows`]).
+/// ([`::engine::fire::rung_holds`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct FireRows {
     own: u32,
@@ -724,10 +896,11 @@ struct FireRows {
 }
 
 impl FireRows {
-    /// What a fire of these rows asks the activation rung for: a rung
-    /// holds its tokens of own rows and as many carried ones.
+    /// The rows a rung must hold for these: its own and its carried rows
+    /// each.
+    #[cfg(test)]
     fn ask(self) -> u32 {
-        ::engine::fire::rung_rows(self.own, self.carried)
+        self.own.max(self.carried)
     }
 
     fn of(lanes: impl IntoIterator<Item = FireRows>) -> FireRows {
@@ -743,11 +916,16 @@ impl FireRows {
 /// The own and carried rows of a lane the host places at `start..end`, its
 /// recurrent state folded through `frozen` (`None`: it has none, and
 /// carries nothing): it carries the rows between its state and its first
-/// row.
+/// row. A lane of one row asks the rung for none of them: the engines'
+/// decode step replays them as data, inside its own rows' body.
 fn lane_rows(start: u32, end: u32, frozen: Option<u32>) -> FireRows {
+    let own = end.saturating_sub(start);
     FireRows {
-        own: end.saturating_sub(start),
-        carried: frozen.map_or(0, |frozen| start.saturating_sub(frozen)),
+        own,
+        carried: ::engine::fire::lane_carried(
+            own,
+            frozen.map_or(0, |frozen| start.saturating_sub(frozen)),
+        ),
     }
 }
 
@@ -758,7 +936,7 @@ fn lane_rows(start: u32, end: u32, frozen: Option<u32>) -> FireRows {
 /// here; it replays no more than the rows standing unfolded in its set
 /// then: those written past `frozen`, up to the set's written end, by
 /// fires that settled, and every row of its fires staged and still to
-/// settle ([`::engine::fire::rung_rows`], device geometry).
+/// settle ([`::engine::fire::rung_holds`], device geometry).
 fn device_lane_rows(
     own: u32,
     cursor: &crate::inferlet::host::working_set::Cursor,
@@ -766,7 +944,10 @@ fn device_lane_rows(
 ) -> FireRows {
     FireRows {
         own,
-        carried: frozen.map_or(0, |frozen| cursor.unfolded(frozen)),
+        carried: ::engine::fire::lane_carried(
+            own,
+            frozen.map_or(0, |frozen| cursor.unfolded(frozen)),
+        ),
     }
 }
 
@@ -826,32 +1007,229 @@ fn piece_rows(
     )
 }
 
-/// The most carried rows a fire holds on `engine`: the tokens of the
-/// largest activation rung fires may take, whose replay scratch holds as
-/// many; what one fire holds where the pool states no rung.
-fn largest_rung(stores: &crate::store::registry::Stores, engine: usize) -> u32 {
+/// The rung a fire of `rows` asks, `replayed` every lane's carried rows (a
+/// decode lane's included): the rows of the smallest activation rung whose
+/// stated replay scratch holds it ([`::engine::fire::rung_holds`] against
+/// each rung's [`::engine::RungReplay`], its replay scratch rows counted as
+/// the load lays them, [`::engine::ReplayRows::of_sums`]), or its own and
+/// carried rows where the first rung that wide holds it already. Where the
+/// pool states no rung, one fire's tokens at the contract's floor. Refused
+/// by name, naming the bound that binds, where no rung holds it: before any
+/// step. Own rows past every rung are not this check's (a fire's capacity,
+/// refused where the pass is cut).
+fn replay_rung(
+    stores: &crate::store::registry::Stores,
+    engine: usize,
+    rows: FireRows,
+    replayed: u32,
+    lanes: u32,
+    compact: bool,
+) -> Result<u32, String> {
     let holds = crate::engine::get_spec(engine).map_or(u32::MAX, |spec| {
         u32::try_from(spec.limits.max_forward_tokens).unwrap_or(u32::MAX)
     });
-    stores.shared.as_ref().map_or(holds, |shared| {
-        shared.lock().unwrap().rung_for(u32::MAX).min(holds)
+    let (stated, widest) = stores.shared.as_ref().map_or_else(
+        || (std::sync::Arc::new(Vec::new()), u32::MAX),
+        |shared| shared.lock().unwrap().rung_replays(),
+    );
+    let reach = holds.min(widest);
+    let end = stated
+        .iter()
+        .position(|&(tokens, _)| tokens > reach)
+        .unwrap_or(stated.len());
+    let pinned;
+    let rungs: &[(u32, ::engine::RungReplay)] = if end == 0 {
+        // No rung stated (pinned pools) or none a fire may take: one fire's
+        // tokens, its own and carried rows each, the engine's scratch its own.
+        pinned = [(holds, crate::store::shared::rows_only(holds))];
+        &pinned
+    } else {
+        &stated[..end]
+    };
+    let count = ::engine::ReplayRows::of_sums(rows.own, rows.carried, replayed, lanes, compact);
+    let floor = rows.own.max(rows.carried);
+    let mut first = true;
+    let mut past = None;
+    for (tokens, bound) in rungs {
+        let tokens = *tokens;
+        if tokens < floor {
+            continue;
+        }
+        match ::engine::fire::rung_holds(bound, count) {
+            Ok(()) => return Ok(if first { floor } else { tokens }),
+            Err(why) => past = Some((tokens, why)),
+        }
+        first = false;
+    }
+    let (tokens, why) = match past {
+        Some(past) => past,
+        None => {
+            let (tokens, bound) = rungs.last().expect("one rung at least");
+            let tokens = *tokens;
+            match ::engine::fire::rung_holds(bound, count) {
+                Ok(()) => return Ok(tokens),
+                Err(why) => (tokens, why),
+            }
+        }
+    };
+    if why.bound == ::engine::ReplayBound::Own {
+        return Ok(tokens);
+    }
+    Err(format!(
+        "pipeline: no activation rung holds this fire's replay: at the largest, of {tokens} \
+         tokens, it has {why}; fold what its lanes have written before they write more"
+    ))
+}
+
+/// The load's stated rungs a fire carrying recurrent state hands the
+/// scheduler, which holds a step of several such fires to the rung its
+/// width picks ([`crate::engine::FireRequest::replay_rungs`]); `None` for a
+/// fire carrying none.
+fn fire_rungs(
+    stores: &crate::store::registry::Stores,
+    carries: bool,
+) -> Option<crate::store::shared::Replays> {
+    let shared = stores.shared.as_ref().filter(|_| carries)?;
+    Some(shared.lock().unwrap().rung_replays().0)
+}
+
+/// The widest rung a host pass's pieces ask, each piece as it is cut
+/// ([`replay_rung`]: its own rows and the rows it carries in, against every
+/// rung's stated bounds); refused by name where some piece no rung holds.
+/// The uncut pass's own rows are no piece's.
+fn pieces_rung(
+    stores: &crate::store::registry::Stores,
+    engine: usize,
+    full: &crate::engine::FireRequest,
+    cuts: &[Vec<Option<(u32, u32)>>],
+    frozen: &[Option<u32>],
+    folds_each: bool,
+    scratch: &PassScratch<'_>,
+) -> Result<u32, String> {
+    let mut widest = 0u32;
+    for (at, piece) in cuts.iter().enumerate() {
+        let behind = folds_each && at > 0;
+        let rows = replay_rung(
+            stores,
+            engine,
+            piece_rows(full, piece, frozen, behind),
+            piece_replayed(full, piece, frozen, behind),
+            piece_lanes(piece),
+            scratch.compact(stores, full, piece, frozen, behind),
+        )?;
+        widest = widest.max(rows);
+    }
+    Ok(widest)
+}
+
+/// The lanes with rows in `piece`.
+fn piece_lanes(piece: &[Option<(u32, u32)>]) -> u32 {
+    u32::try_from(piece.iter().filter(|cut| cut.is_some()).count()).unwrap_or(u32::MAX)
+}
+
+/// What a host pass's pieces' rs scratch is laid by
+/// ([`::engine::fire::scratch_compact`]), from what the runtime puts in
+/// each piece's fire: which lanes share their set with another (their
+/// buffered reads are their masks' lineage, `Lineage::Admitted`, else
+/// every buffered slot, `Lineage::Set`, as `RsVerb::Buffer` states them),
+/// and the rows a piece lands its state at (`checkpoints`, as many of them
+/// inside a fire as the engine lands, `snapshots`; a piece of several
+/// lanes lands none), each an rs snapshot verb.
+pub(crate) struct PassScratch<'a> {
+    pub(crate) shared: Vec<bool>,
+    pub(crate) checkpoints: &'a [u64],
+    pub(crate) snapshots: usize,
+}
+
+impl PassScratch<'_> {
+    /// Whether `piece`'s fire's rs scratch is compact.
+    fn compact(
+        &self,
+        stores: &crate::store::registry::Stores,
+        full: &crate::engine::FireRequest,
+        piece: &[Option<(u32, u32)>],
+        frozen: &[Option<u32>],
+        folded_behind: bool,
+    ) -> bool {
+        let mut kept: Vec<(u64, u64)> = Vec::new();
+        let mut one_run = true;
+        for (lane, (rows, cut)) in full.lanes.iter().zip(piece).enumerate() {
+            let Some((from, to)) = *cut else {
+                continue;
+            };
+            let start = rows.kv.held.saturating_add(from);
+            let end = rows.kv.held.saturating_add(to);
+            kept.push((u64::from(start), u64::from(end)));
+            let Some(state) = frozen.get(lane).copied().flatten() else {
+                continue;
+            };
+            let folded = if folded_behind { start } else { state };
+            let shared = self.shared.get(lane).copied().unwrap_or(false);
+            let lineage = if shared {
+                ::engine::fire::Lineage::Admitted
+            } else {
+                ::engine::fire::Lineage::Set
+            };
+            // A lane sharing its set whose mask the host does not state (the
+            // device resolves it) reads slots the host cannot name: not one
+            // run as far as it can say.
+            one_run &= !(shared && rows.mask.is_none())
+                && ::engine::fire::lane_one_run(rows.mask.as_ref(), folded, start, lineage);
+        }
+        let snapshots = match kept.as_slice() {
+            [(start, end)] => {
+                self.snapshots > 0
+                    && self.checkpoints.iter().any(|&row| *start < row && row < *end)
+            }
+            _ => false,
+        };
+        fire_compact(stores, one_run, snapshots)
+    }
+}
+
+/// Whether a fire whose lanes' buffered rows are each one stretch (or not)
+/// and that lands rs snapshots (or not) has a compact rs scratch on these
+/// stores' load ([`::engine::fire::scratch_compact`]).
+fn fire_compact(
+    stores: &crate::store::registry::Stores,
+    every_lane_one_run: bool,
+    any_lane_snapshots: bool,
+) -> bool {
+    stores.shared.as_ref().is_some_and(|shared| {
+        let pool = shared.lock().unwrap();
+        ::engine::fire::scratch_compact(
+            pool.rs_compact(),
+            pool.rs_scratch_per_fire(),
+            every_lane_one_run,
+            any_lane_snapshots,
+        )
     })
 }
 
-/// A fire carrying more recurrent rows than the largest rung's tokens is
-/// refused by name, before anything is submitted: no rung's replay scratch
-/// holds them. Up to there it raises the rung as a wider fire does.
-fn check_largest_rung(rows: FireRows, largest: u32) -> Result<(), String> {
-    if rows.carried <= largest {
-        return Ok(());
-    }
-    Err(format!(
-        "pipeline: a fire would carry {} recurrent rows unfolded into it, past the {largest} \
-         tokens of the largest activation rung, whose replay scratch holds as many; fold \
-         what its lanes have written before they write more",
-        rows.carried
-    ))
+/// The buffered recurrent rows one piece of a host pass replays, summed
+/// over every lane, a decode lane's included (what
+/// [`::engine::FireLimits::replayed_rows`] bounds a step by): each lane's
+/// rows between its state and its first, as [`piece_rows`] counts them
+/// before [`::engine::fire::lane_carried`] drops a decode lane's.
+fn piece_replayed(
+    full: &crate::engine::FireRequest,
+    piece: &[Option<(u32, u32)>],
+    frozen: &[Option<u32>],
+    folded_behind: bool,
+) -> u32 {
+    full.lanes
+        .iter()
+        .zip(piece)
+        .enumerate()
+        .filter_map(|(lane, (rows, cut))| {
+            let (from, _) = (*cut)?;
+            let start = rows.kv.held.saturating_add(from);
+            let frozen = frozen.get(lane).copied().flatten()?;
+            Some(if folded_behind { 0 } else { start.saturating_sub(frozen) })
+        })
+        .fold(0u32, u32::saturating_add)
 }
+
 
 fn group_fold(fold: &geometry::Fold, first: usize, frozen: u32, end: u32) -> rs::GroupFold {
     match fold.of(first) {
@@ -2498,6 +2876,29 @@ static KV_WRITES: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<u64, ::engine::KvWrites>>,
 > = std::sync::LazyLock::new(Default::default);
 
+/// Each beam group's common slot, by its instance (`BEAM-PAGE-LISTS.md`
+/// §11.3): the largest any landed step reported. Monotone, so a later report
+/// never lowers it.
+static BEAM_COMMON: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<::engine::InstanceId, u32>>,
+> = std::sync::LazyLock::new(Default::default);
+
+pub(crate) fn record_beam_common(commons: Vec<(::engine::InstanceId, u32)>) {
+    if commons.is_empty() {
+        return;
+    }
+    let mut held = BEAM_COMMON.lock().unwrap();
+    for (instance, common) in commons {
+        let at = held.entry(instance).or_insert(0);
+        *at = (*at).max(common);
+    }
+}
+
+/// The largest common slot instance `instance`'s beam group has reported.
+fn beam_common_of(instance: ::engine::InstanceId) -> u32 {
+    BEAM_COMMON.lock().unwrap().get(&instance).copied().unwrap_or(0)
+}
+
 pub(crate) fn record_kv_writes(writes: Vec<::engine::KvWrites>) {
     let mut held = KV_WRITES.lock().unwrap();
     for written in writes {
@@ -3012,6 +3413,7 @@ pub(crate) fn map_lane_pages(
                 continue;
             };
             map_pages(&mut lane.pages, &table)?;
+            lane.ws = Some(*ws);
         }
     }
     Ok(())
@@ -3040,6 +3442,51 @@ fn working_set_flat_table(
         )
     })
     .map_err(|error| format!("pipeline: KV page translation: {error}"))
+}
+
+/// Hands each lane that states its own page list its working set's whole
+/// table: the pages its list names lie in it (`engine::fire::Lane::reserve`).
+/// Its own list stays its rows' pages, which the engine stages and the
+/// device then resolves over.
+fn stamp_lane_reserve(
+    req: &mut crate::engine::FireRequest,
+    stores: &crate::store::registry::Stores,
+    groups: &LaneGroups,
+) -> Result<(), String> {
+    for (ws, lanes) in groups {
+        let table = working_set_flat_table(stores, *ws)?;
+        for &lane in lanes {
+            if let Some(lane) = req.lanes.get_mut(lane) {
+                lane.lane.reserve.clone_from(&table);
+                lane.ws = Some(*ws);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The named refusal of a beam group's growth that could never fit alone:
+/// its set would need `end` pages (its frozen ones and its pool's `named`
+/// for this fire's column) and the kv pool holds `capacity` with nothing
+/// else resident. Anything smaller waits like any reservation. The search's
+/// earlier columns stay valid output (`BEAM-PAGE-LISTS.md` §3).
+pub(crate) const BEAM_POOL_OUTGROWN: &str = "outgrows the kv pool";
+
+fn beam_pool_fits(lane: usize, end: u64, named: u64, capacity: u32) -> Result<(), String> {
+    if end > u64::from(capacity) {
+        return Err(format!(
+            "pipeline: lane {lane}'s beams' pool {BEAM_POOL_OUTGROWN}: its next column needs \
+             {named} pool page(s), {end} with its frozen ones, and the kv pool holds \
+             {capacity} with nothing else resident; the search's earlier columns are its output"
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `fwd`'s program states each beam's parent (its lanes hold their
+/// own page lists of their set's reserve): decided when it registered.
+fn binds_pages<C: FireContext>(ctx: &mut C, fwd: &Resource<ForwardPass>) -> Anyhow<bool> {
+    Ok(ctx.resources().get(fwd)?.instance.program.binds_pages)
 }
 
 /// The slots lane `lane`'s rows may land at where the device places them,
@@ -3078,6 +3525,7 @@ fn stamp_lane_translation(
         for &lane in lanes {
             if let Some(lane) = req.lanes.get_mut(lane) {
                 lane.translation.clone_from(&table);
+                lane.ws = Some(*ws);
             }
         }
     }
@@ -3402,6 +3850,69 @@ fn unsettle(
     });
 }
 
+/// The fold of a run-ahead fire (its tokens the device's) on sets with a
+/// recurrent state or windows: each group's no further than where the rows
+/// its program has accepted end ([`Cursor::accepted`], bounded by the
+/// run-ahead window), so the rows past them stay buffered and a stop takes
+/// them back. (A decode's buffered row costs it about what one fold's
+/// state write does, CUDA's gated delta on Qwen3.5-0.8B at 64 lanes: a fold
+/// takes every accepted row at once.) A fold the device counts, or over a
+/// folded length the host does not know, stays as stated.
+///
+/// [`Cursor::accepted`]: crate::inferlet::host::working_set::Cursor::accepted
+fn lagged_fold(
+    fold: &geometry::Fold,
+    lanes: &PassLanes,
+    groups: &LaneGroups,
+    landings: &[geometry::Landing],
+) -> geometry::Fold {
+    let count = landings.len();
+    if (0..count).any(|lane| fold.of(lane).is_none()) {
+        return fold.clone();
+    }
+    let bound = crate::scheduler::run_ahead_window();
+    let mut counts: Vec<u32> = (0..count).map(|lane| fold.of(lane).unwrap_or(0)).collect();
+    for (_, group) in groups {
+        let first = group[0];
+        let place = &lanes.places[first];
+        if !place.folded_exact {
+            continue;
+        }
+        let accepted = lanes.cursors[first]
+            .lock()
+            .unwrap()
+            .accepted(landings[first].start, bound);
+        let room = accepted.saturating_sub(place.folded);
+        for &lane in group {
+            counts[lane] = counts[lane].min(room);
+        }
+    }
+    geometry::Fold::Host(counts)
+}
+
+/// The outputs a fire just reserved its moves for publishes to the host:
+/// the program accepts the fire's rows as it takes them.
+fn host_reads(
+    cells: &BoundCells,
+    accesses: &[(bool, bool)],
+) -> Vec<crate::inferlet::host::working_set::HostRead> {
+    cells
+        .iter()
+        .zip(accesses)
+        .filter(|(_, (_, publish))| *publish)
+        .filter_map(|(cell, _)| {
+            let c = cell.lock().unwrap();
+            if c.role != Some(HostRole::Reader) {
+                return None;
+            }
+            Some(crate::inferlet::host::working_set::HostRead {
+                cell: Arc::downgrade(cell),
+                index: c.last_published()?,
+            })
+        })
+        .collect()
+}
+
 /// What a fire whose rows the host places folds on `group`'s working set.
 /// A count the host knows over a folded length it knows is a slot, frozen
 /// as the fire is prepared; anything else is placed when the pass's last
@@ -3718,11 +4229,21 @@ pub async fn submit_pass_stamped<C: FireContext>(
     let submit_probe = crate::scheduler::probe::host_submit();
     let submit_clock = crate::scheduler::probe::ProbeClock::start();
     {
-        if ctx.resources().get(&fwd)?.devgeo.is_some() {
-            return fire_device_geometry(ctx, this, fwd, frame).await;
-        }
-        if ctx.resources().get(&fwd)?.float.is_some() {
-            return float::fire_float_lane(ctx, this, fwd, frame).await;
+        let placed_by_device = {
+            let pass = ctx.resources().get(&fwd)?;
+            pass.devgeo.is_some() || pass.float.is_some()
+        };
+        if placed_by_device {
+            let pipeline = this.rep();
+            let submitted = if ctx.resources().get(&fwd)?.devgeo.is_some() {
+                fire_device_geometry(ctx, this, fwd, frame).await?
+            } else {
+                float::fire_float_lane(ctx, this, fwd, frame).await?
+            };
+            if submitted.is_ok() {
+                record_writes(ctx, pipeline, None)?;
+            }
+            return Ok(submitted);
         }
         let began = crate::scheduler::probe::ProbeClock::start();
         let opened = open_pipeline(ctx, &this, &fwd).await?;
@@ -3884,6 +4405,78 @@ pub async fn submit_pass_stamped<C: FireContext>(
             .iter()
             .map(|(_, lanes)| pass_lanes.kv[lanes[0]].clone())
             .collect();
+        // Lanes that state their own page lists (beam search) write pages of
+        // their sets' reserve the device names: every page from the frozen
+        // full pages to what `reserve` granted is backed, and the engine is
+        // handed each set's whole table to resolve them in.
+        // Each beam group's pool end (a slot), which its rs buffer is backed
+        // to as well (`BEAM-PAGE-LISTS.md` §11).
+        let mut beam_ends: Vec<u32> = Vec::new();
+        // Each beam group's common slot, as its last harvested steps left it
+        // (§11.3): one pass, one group, one instance.
+        let beam_common = beam_common_of(instance_id);
+        let mut beam_commons: Vec<u32> = Vec::new();
+        let paged_reserve: Option<Vec<Vec<u64>>> = if binds_pages(ctx, &fwd)? {
+            let page = u64::from(page_size.max(1));
+            let mut reserves = Vec::with_capacity(groups.len());
+            for (_, lanes) in &groups {
+                let lane = lanes[0];
+                let folded = pass_lanes.places[lane].folded;
+                // The beams' pool grows a column at a time (BEAM-PAGE-LISTS.md
+                // §3): before the fire that opens a column the set reserves
+                // what its column needs, waiting like any reservation. The
+                // step hands out the lowest free pages, so every page named or
+                // pending lies below `B (c + 2) + B F + 1`, `c` this fire's
+                // column and `F` the engine's frames in flight.
+                let f0 = u64::from(folded) / page;
+                let last = lanes
+                    .iter()
+                    .map(|&lane| u64::from(landings[lane].start) + u64::from(landings[lane].rows.max(1)) - 1)
+                    .max()
+                    .unwrap_or(u64::from(folded));
+                let beams = lanes.len() as u64;
+                let frames = crate::scheduler::configured_dispatch_depth().max(1) as u64;
+                let column = (last / page).saturating_sub(f0);
+                let named = beams * (column + 2) + beams * frames + 1;
+                let end = f0 + named;
+                let end_slot = u32::try_from(end * page).unwrap_or(u32::MAX);
+                let capacity = crate::store::registry::with_kv_lock(
+                    &stores.kv,
+                    "host-other",
+                    |kv| kv.capacity_pages(),
+                );
+                if let Err(refusal) = beam_pool_fits(lane, end, named, capacity) {
+                    return Ok(Err(refusal));
+                }
+                if let Err(refusal) = crate::inferlet::host::working_set::grow_pages(
+                    &pass_lanes.kv[lane],
+                    end_slot,
+                ) {
+                    return Ok(Err(format!(
+                        "pipeline: lane {lane}'s beams' pool cannot grow to its column's {named} \
+                         page(s): {refusal}"
+                    )));
+                }
+                {
+                    let mut cursor = pass_lanes.cursors[lane].lock().unwrap();
+                    cursor.reserved = cursor.reserved.max(end_slot);
+                }
+                beam_ends.push(end_slot);
+                beam_commons.push(beam_common);
+                // Only the pages the column adds are backed here: the pool's
+                // pages are the group's alone and the device keeps what they
+                // hold, so a page an earlier fire still in flight writes is
+                // not copied before this one writes it.
+                let mapped = crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
+                    kv.mapped_len(pass_lanes.kv[lane].id)
+                })
+                .map_err(|error| anyhow::anyhow!("pipeline: KV rows: {error}"))?;
+                reserves.push((mapped.max(f0)..end).collect());
+            }
+            Some(reserves)
+        } else {
+            None
+        };
         if let Err(refusal) = crate::inferlet::process::said(
             "seat the lanes",
             ctx.process_id(),
@@ -3920,6 +4513,22 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 Err(error) => return Ok(Err(error)),
             };
         let windowed = crate::model::model().rs_caps().window_tokens > 0;
+        // On a set with a recurrent state or windows a run-ahead fire folds
+        // no further than the rows the program has accepted, so a stop can
+        // take back the rest; a fire whose tokens the host places is
+        // accepted as it is submitted, and everything before it with it.
+        // A state that buffers no row folds every row as before.
+        let lags = !rs_ws_ids.is_empty() && stores.rs.lock().unwrap().holds_unfolded();
+        let fold = match (!lags, decode_envelope.is_some()) {
+            (true, _) => fold,
+            (false, true) => lagged_fold(&fold, &pass_lanes, &groups, &landings),
+            (false, false) => {
+                for cursor in &pass_lanes.cursors {
+                    cursor.lock().unwrap().accept_all();
+                }
+                fold
+            }
+        };
         // A long host pass runs as several fires; all but the last run the
         // model's forward alone. A recurrent state folding all its rows, or
         // none, folds each fire's rows in turn.
@@ -4160,9 +4769,31 @@ pub async fn submit_pass_stamped<C: FireContext>(
             .iter()
             .map(|lane| Some((0, u32::try_from(lane.tokens.len()).unwrap_or(u32::MAX))))
             .collect();
+        // What no cut removes: the rows the pass carries in, checked with no
+        // own row (a piece as small as the rules allow); its own rows and
+        // carried rows together are each piece's, checked as it is cut.
         let carried = piece_rows(&full, &whole, &frozen, false).carried;
-        let largest = largest_rung(&stores, engine);
-        if let Err(refusal) = check_largest_rung(FireRows { own: 0, carried }, largest) {
+        let replayed = piece_replayed(&full, &whole, &frozen, false);
+        let scratch = PassScratch {
+            shared: (0..full.lanes.len())
+                .map(|lane| {
+                    groups
+                        .iter()
+                        .any(|(_, lanes)| lanes.len() > 1 && lanes.contains(&lane))
+                })
+                .collect(),
+            checkpoints: &checkpoints,
+            snapshots,
+        };
+        let whole_compact = scratch.compact(&stores, &full, &whole, &frozen, false);
+        if let Err(refusal) = replay_rung(
+            &stores,
+            engine,
+            FireRows { own: 0, carried },
+            replayed,
+            piece_lanes(&whole),
+            whole_compact,
+        ) {
             return Ok(Err(refusal));
         }
         let wanted = prefill_want(rows_total, engine).max(carried);
@@ -4192,12 +4823,11 @@ pub async fn submit_pass_stamped<C: FireContext>(
             .enumerate()
             .map(|(at, piece)| piece_rows(&full, piece, &frozen, folds_each && at > 0))
             .collect();
-        for rows in &pieces {
-            if let Err(refusal) = check_largest_rung(*rows, largest) {
-                return Ok(Err(refusal));
-            }
-        }
-        let widest = pieces.iter().map(|rows| rows.ask()).max().unwrap_or(0);
+        let widest = match pieces_rung(&stores, engine, &full, &cuts, &frozen, folds_each, &scratch)
+        {
+            Ok(widest) => widest,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
         let (wanted, rung_ask) = if widest > wanted {
             // The wider ask stands before the narrower goes.
             let taken = taken.max(widest as usize);
@@ -4294,6 +4924,18 @@ pub async fn submit_pass_stamped<C: FireContext>(
         let mut submitted: Vec<crate::engine::completion::WorkItemCompletion> = Vec::new();
         // The working sets a piece of this pass has moved the cursor of.
         let mut advanced = vec![false; groups.len()];
+        let mut writes = Vec::with_capacity(groups.len());
+        let set_start = |group: usize, start: u64| {
+            let (set, lanes) = (&group_sets[group], &groups[group].1);
+            SetStart {
+                model: set.model,
+                engine: set.engine,
+                kv: set.id,
+                cursor: pass_lanes.cursors[lanes[0]].clone(),
+                start,
+                rs: rs_ws_ids.get(lanes[0]).copied(),
+            }
+        };
         let mut at = 0;
         while at < cuts.len() {
             if recuttable && at > 0 && at + 1 < cuts.len() {
@@ -4361,10 +5003,19 @@ pub async fn submit_pass_stamped<C: FireContext>(
             // said: it never waits on a rung that does not come. A piece
             // cut again once a raise landed is counted as it is cut now.
             let counted = piece_rows(&full, piece, &frozen, folds_each && at > 0);
-            if let Err(refusal) = check_largest_rung(counted, largest) {
-                return Ok(Err(refusal));
-            }
-            let width = counted.ask();
+            let width = match replay_rung(
+                &stores,
+                engine,
+                counted,
+                piece_replayed(&full, piece, &frozen, folds_each && at > 0),
+                piece_lanes(piece),
+                scratch.compact(&stores, &full, piece, &frozen, folds_each && at > 0),
+            ) {
+                Ok(width) => width,
+                Err(refusal) => return Ok(Err(refusal)),
+            };
+            let piece_compact =
+                scratch.compact(&stores, &full, piece, &frozen, folds_each && at > 0);
             if let Some(ask) = rung_ask.as_ref()
                 && let Err(refusal) = ask.wait(width).await
             {
@@ -4386,6 +5037,9 @@ pub async fn submit_pass_stamped<C: FireContext>(
             };
             // What the scheduler steps and holds the fire by.
             req.carried = counted.carried;
+            req.replayed = piece_replayed(&full, piece, &frozen, folds_each && at > 0);
+            req.scratch_compact = piece_compact;
+            req.replay_rungs = fire_rungs(&stores, !rs_ws_ids.is_empty());
             // A piece's request keeps only the lanes with rows in it,
             // renumbered; `groups` holds the pass's lane indices. What reads
             // the piece's request (its written spans, its page tables) needs
@@ -4459,7 +5113,13 @@ pub async fn submit_pass_stamped<C: FireContext>(
             let present = written_groups(&piece_groups);
             let sets: Vec<(&KvWorkingSet, Written)> = present
                 .iter()
-                .map(|&group| (&group_sets[group], Written::Span(spans[group].1.clone())))
+                .map(|&group| {
+                    let written = match &paged_reserve {
+                        Some(reserves) => Written::Pages(reserves[group].clone()),
+                        None => Written::Span(spans[group].1.clone()),
+                    };
+                    (&group_sets[group], written)
+                })
                 .collect();
             // The lanes each set carries, for what their state asks alone.
             let set_lanes: Vec<Vec<usize>> = if rs_ws_ids.is_empty() {
@@ -4471,7 +5131,16 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 if windowed {
                     host_window_plan(&req, &fold, &rs_ws_ids, keep)
                 } else {
-                    host_rs_plan(&stores, &rs_ws_ids, &groups, &req, &fold, &inside)
+                    host_rs_plan(
+                        &stores,
+                        &rs_ws_ids,
+                        &groups,
+                        &req,
+                        &fold,
+                        &inside,
+                        (!beam_ends.is_empty()).then_some(beam_ends.as_slice()),
+                        (!beam_ends.is_empty()).then_some(beam_commons.as_slice()),
+                    )
                 }
             };
             let reserved = reserve(
@@ -4502,6 +5171,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             // Every fire logs what it writes where its tokens are known; what
             // it folds seals once it settles.
             let reports = pass_slots.is_none()
+                && paged_reserve.is_none()
                 && decode_envelope.is_some()
                 && !wide
                 && plain
@@ -4574,6 +5244,9 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 };
                 // A piece carrying media is not its tokens' alone.
                 let rows = match (&pass_slots, pages) {
+                    // A lane's own page list holds its slots apart from the
+                    // set's: the set's rows there are no one token's.
+                    _ if paged_reserve.is_some() => LogRows::Unknown,
                     (Some(_), _) if !req.media.is_empty() => LogRows::Unknown,
                     (Some(_), _) => LogRows::Known {
                         start: slots.start,
@@ -4600,6 +5273,12 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 });
             }
             if let Err(refusal) = map_lane_pages(&mut req, &stores, &piece_groups) {
+                record_submit_failure(ctx, &fwd, &pipeline_failure, &refusal);
+                return Ok(Err(refusal));
+            }
+            if paged_reserve.is_some()
+                && let Err(refusal) = stamp_lane_reserve(&mut req, &stores, &piece_groups)
+            {
                 record_submit_failure(ctx, &fwd, &pipeline_failure, &refusal);
                 return Ok(Err(refusal));
             }
@@ -4637,6 +5316,10 @@ pub async fn submit_pass_stamped<C: FireContext>(
             if let Some(reservation) = &ticket_reservation {
                 reservation.apply_to(&mut req);
             }
+            // A run-ahead fire's rows on a set with a recurrent state or
+            // windows wait for the program to take what it publishes.
+            let run_ahead_reads = (last && decode_envelope.is_some() && lags)
+                .then(|| host_reads(&cells, &accesses));
 
             let scheduler_clock = crate::scheduler::probe::ProbeClock::start();
             let submit_error =
@@ -4689,11 +5372,13 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 let start = if advanced[group] {
                     slots.start
                 } else {
-                    lanes
+                    let start = lanes
                         .iter()
                         .map(|&lane| u64::from(landings[lane].start))
                         .min()
-                        .unwrap_or(slots.start)
+                        .unwrap_or(slots.start);
+                    writes.push(set_start(group, start));
+                    start
                 };
                 advanced[group] = true;
                 advance_cursor(
@@ -4705,6 +5390,11 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     )),
                 );
                 host_wrote(cell, &completion, start as u32, slots.end as u32);
+                if let Some(reads) = &run_ahead_reads {
+                    cell.lock()
+                        .unwrap()
+                        .run_ahead(start as u32, slots.end as u32, reads.clone());
+                }
             }
             unqueued.queue(
                 &pipe_fires,
@@ -4748,11 +5438,13 @@ pub async fn submit_pass_stamped<C: FireContext>(
             if let (Some(end), Some(start)) = (end, start) {
                 let cell = &pass_lanes.cursors[lanes[0]];
                 advance_cursor(cell, Some(end), Some((start, Vec::new())));
+                writes.push(set_start(group, u64::from(start)));
                 if let Some(last) = submitted.last() {
                     host_wrote(cell, last, start, end);
                 }
             }
         }
+        record_writes(ctx, this.rep(), Some(writes))?;
         crate::probe_fire_record!(submit_probe.total_us, submit_clock.elapsed());
         crate::probe_fire_count!(submit_probe.submits);
         Ok(Ok(()))
@@ -5080,6 +5772,197 @@ async fn pipeline_close_inner<C: FireContext>(
 
 pub async fn pipeline_close<C: FireContext>(ctx: &mut C, this: Resource<Pipeline>) -> Anyhow<()> {
     pipeline_close_inner(ctx, &this).await
+}
+
+/// Where one fire began writing one working set.
+#[derive(Clone)]
+pub(crate) struct SetStart {
+    model: usize,
+    engine: crate::engine::EngineId,
+    kv: crate::store::kv::page_table::WorkingSetId,
+    cursor: CursorCell,
+    start: u64,
+    /// The set's recurrent state (or windows) the fire's rows land in: its
+    /// buffer or its windows' head, taken back with the rows.
+    rs: Option<crate::store::rs::RsWorkingSetId>,
+}
+
+/// What one fire wrote, set by set: `None` where the device placed its rows.
+pub(crate) type FireWrites = Option<Vec<SetStart>>;
+
+fn record_writes<C: FireContext>(ctx: &mut C, pipeline: u32, writes: FireWrites) -> Anyhow<()> {
+    let pipeline: Resource<Pipeline> = Resource::new_borrow(pipeline);
+    let pipeline = ctx.resources().get(&pipeline)?;
+    let mut written = pipeline.written.lock().unwrap();
+    written.push_back(writes);
+    // A fire further back than the run-ahead window is one the program
+    // read past before submitting the newest: never taken back.
+    let window = crate::scheduler::run_ahead_window();
+    while written.len() > window {
+        written.pop_front();
+    }
+    Ok(())
+}
+
+/// The row each working set the last `fires` fires wrote ends at once they
+/// are taken back: where the first of them began writing it. `Err` names
+/// what cannot be taken back.
+fn retracted_ends(
+    written: &std::collections::VecDeque<FireWrites>,
+    fires: usize,
+) -> Result<Vec<SetStart>, String> {
+    let mut ends: Vec<SetStart> = Vec::new();
+    for (at, fire) in written.iter().skip(written.len() - fires).enumerate() {
+        let Some(sets) = fire else {
+            return Err(format!(
+                "the {} fire from the end placed its rows where the device says, which the \
+                 host cannot take back",
+                fires - at
+            ));
+        };
+        for set in sets {
+            match ends.iter_mut().find(|end| end.kv == set.kv) {
+                Some(end) => end.start = end.start.min(set.start),
+                None => ends.push(set.clone()),
+            }
+        }
+    }
+    Ok(ends)
+}
+
+/// Takes back what the last `fires` fires submitted on the closed pipeline
+/// `this` wrote, once every fire on it has landed: each working set they
+/// wrote ends where the first of them began writing it. A set whose rows
+/// cannot be taken back leaves the pipeline failed by that name, so the set
+/// is refused wherever it is used next rather than read past its stop.
+pub async fn pipeline_retract<C: FireContext>(
+    ctx: &mut C,
+    this: Resource<Pipeline>,
+    fires: u32,
+) -> Anyhow<Result<(), String>> {
+    let fires = fires as usize;
+    let (pending, failure, written, ends) = {
+        let pipeline = ctx.resources().get(&this)?;
+        if !pipeline.scope.is_closed() {
+            return Ok(Err(
+                "pipeline: retract on an open pipeline: close it first, so no fire follows the \
+                 ones taken back"
+                    .to_string(),
+            ));
+        }
+        let written = pipeline.written.lock().unwrap();
+        if fires > written.len() {
+            return Ok(Err(format!(
+                "pipeline: retract of {fires} fire(s), past the {} it can take back: the \
+                 fires submitted, up to its run-ahead window of {}",
+                written.len(),
+                crate::scheduler::run_ahead_window()
+            )));
+        }
+        (
+            pipeline.fires.clone(),
+            pipeline.failure.clone(),
+            written.len() - fires,
+            retracted_ends(&written, fires),
+        )
+    };
+    if fires == 0 {
+        return Ok(Ok(()));
+    }
+    // A fire that may still write is never cut under: every fire on the
+    // pipeline lands, and its fold and log settle, first.
+    finalize_all(ctx, &pending, false).await?;
+    ctx.resources()
+        .get(&this)?
+        .written
+        .lock()
+        .unwrap()
+        .truncate(written);
+    if pipeline_failed(&failure).is_some() {
+        return Ok(Ok(()));
+    }
+    let refused = match ends {
+        Err(why) => Some(why),
+        Ok(ends) => {
+            let mut refused = None;
+            for end in &ends {
+                let stores = crate::store::registry::get(end.model, end.engine);
+                match take_back(&stores, end).await {
+                    Ok(()) => retract_cursor(&end.cursor, end.start),
+                    Err(why) => {
+                        refused = Some(why);
+                        break;
+                    }
+                }
+            }
+            refused
+        }
+    };
+    if let Some(why) = refused {
+        let mut failure = failure.lock().unwrap();
+        if failure.is_none() {
+            *failure = Some(format!(
+                "its rows past where the program stopped could not be taken back: {why}"
+            ));
+        }
+    }
+    Ok(Ok(()))
+}
+
+/// Returns once kv set `ws` is in no move, waiting on each move's end.
+async fn kv_out_of_move(stores: &crate::store::registry::Stores, ws: crate::store::kv::page_table::WorkingSetId) {
+    loop {
+        let ended = crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| kv.moves_ended());
+        let notified = ended.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| kv.set_in_move(ws)) {
+            return;
+        }
+        notified.await;
+    }
+}
+
+/// Takes `end`'s set back to where the retracted fires began writing it:
+/// its unaccepted run-ahead rows first (refused where the run-ahead bound
+/// accepted rows past the cut), then its recurrent state's buffer or its
+/// windows' head (refused where a fold reached past the cut), then its KV.
+/// Under the lagged fold none of these touches a folded row.
+async fn take_back(stores: &crate::store::registry::Stores, end: &SetStart) -> Result<(), String> {
+    let cut = u32::try_from(end.start).unwrap_or(u32::MAX);
+    end.cursor.lock().unwrap().take_back(cut)?;
+    if let Some(rs) = end.rs {
+        match stores.rs.lock().unwrap().truncate(rs, cut) {
+            // A set released already holds nothing to take back.
+            Ok(()) | Err(crate::store::rs::RsError::UnknownWorkingSet) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    // A set in a move (a suspend or a sweep pins its pages) is cut once
+    // the move ends: cut under it, the pages it freed went back again as
+    // the move committed (the M1's beam line: a kv page released twice).
+    loop {
+        kv_out_of_move(stores, end.kv).await;
+        match crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
+            kv.truncate(end.kv, end.start)
+        }) {
+            Ok(())
+            | Err(crate::store::kv::KvStoreError::Table(
+                crate::store::kv::page_table::KvTableError::UnknownWorkingSet,
+            )) => return Ok(()),
+            Err(crate::store::kv::KvStoreError::MoveInFlight) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+}
+
+/// The host's record of a set's rows ends at `end`.
+fn retract_cursor(cell: &CursorCell, end: u64) {
+    let end = u32::try_from(end).unwrap_or(u32::MAX);
+    let mut cursor = cell.lock().unwrap();
+    cursor.tail = Some(end);
+    cursor.written = cursor.written.min(end);
+    cursor.spans.retain(|&(from, _, _)| from < end);
 }
 
 pub async fn pipeline_drop<C: FireContext>(ctx: &mut C, this: Resource<Pipeline>) -> Anyhow<()> {
@@ -5594,6 +6477,18 @@ async fn fire_device_geometry<C: FireContext>(
         .ports
         .iter()
         .any(|binding| binding.port == Port::Positions);
+    // A beam group's pass (`parents`): its beams' recurrent rows are each
+    // their own list's (`BEAM-PAGE-LISTS.md` §11).
+    let states_parents = ctx
+        .resources()
+        .get(&fwd)?
+        .instance
+        .program
+        .bound
+        .container
+        .ports
+        .iter()
+        .any(|binding| binding.port == Port::Parents);
     let mut write_indexes: Vec<Vec<u64>> = Vec::with_capacity(groups.len());
     let mut write_ends: Vec<u32> = Vec::with_capacity(groups.len());
     for (_, lanes) in &groups {
@@ -5662,21 +6557,46 @@ async fn fire_device_geometry<C: FireContext>(
         Ok(frozen) => frozen,
         Err(error) => return Ok(Err(error)),
     };
+    // Each group's bound on what its lanes replay, every lane's, a decode
+    // lane's included (what a step is held to by the engine's stated
+    // replayed rows).
+    let replayed = groups
+        .iter()
+        .map(|(_, lanes)| {
+            let cursor = pass_lanes.cursors[lanes[0]].lock().unwrap();
+            let carried = device_lane_rows(0, &cursor, frozen[lanes[0]]).carried;
+            carried.saturating_mul(u32::try_from(lanes.len()).unwrap_or(u32::MAX))
+        })
+        .fold(0u32, u32::saturating_add);
     let counted = FireRows::of(groups.iter().flat_map(|(_, lanes)| {
         let carried = {
             let cursor = pass_lanes.cursors[lanes[0]].lock().unwrap();
             device_lane_rows(0, &cursor, frozen[lanes[0]]).carried
         };
         let split = &resolved_qo_indptr;
-        lanes.iter().map(move |&lane| FireRows {
-            own: split[lane + 1] - split[lane],
-            carried,
+        lanes.iter().map(move |&lane| {
+            let own = split[lane + 1] - split[lane];
+            FireRows {
+                own,
+                carried: ::engine::fire::lane_carried(own, carried),
+            }
         })
     }));
-    if let Err(refusal) = check_largest_rung(counted, largest_rung(&stores, ws.engine)) {
-        return Ok(Err(refusal));
-    }
-    let rows = counted.ask();
+    // A device-placed fire lands no rs snapshot. A lane alone on its set
+    // replays every buffered slot of it, one run ending at its first row
+    // (`Lineage::Set`); a lane sharing its set reads the slots its mask
+    // admits, resolved on the device: not one run as far as the host can
+    // say.
+    let every_lane_one_run = groups
+        .iter()
+        .all(|(_, lanes)| lanes.len() == 1 || frozen[lanes[0]].is_none());
+    let compact = fire_compact(&stores, every_lane_one_run, false);
+    let fire_lanes = u32::try_from(groups.iter().map(|(_, lanes)| lanes.len()).sum::<usize>())
+        .unwrap_or(u32::MAX);
+    let rows = match replay_rung(&stores, ws.engine, counted, replayed, fire_lanes, compact) {
+        Ok(rows) => rows,
+        Err(refusal) => return Ok(Err(refusal)),
+    };
     let rung_ask = ask_rung(
         &stores,
         ws.engine,
@@ -5711,7 +6631,7 @@ async fn fire_device_geometry<C: FireContext>(
         if windowed {
             device_window_plan(&stores, ws.id, &write_indexes[0], &rs_ws_ids)
         } else {
-            device_rs_plan(&stores, &rs_ws_ids, &groups, &pass_lanes, &split, &fold)
+            device_rs_plan(&stores, &rs_ws_ids, &groups, &pass_lanes, &split, &fold, states_parents)
         }
     };
     let reserved = reserve(
@@ -5841,6 +6761,9 @@ async fn fire_device_geometry<C: FireContext>(
             })
             .collect(),
         carried: counted.carried,
+        replayed,
+        scratch_compact: compact,
+        replay_rungs: fire_rungs(&stores, !rs_ws_ids.is_empty()),
         ..crate::engine::FireRequest::default()
     };
     rs_prepared.apply_to(&mut req);
@@ -6136,6 +7059,81 @@ pub(crate) mod lifecycle_tests {
         fn pipeline_tails(&self) -> Vec<PendingFires> {
             self.tails.clone()
         }
+    }
+
+    /// A beam's finish while a frame the process submitted is held unsealed
+    /// under the rung's cap (the M1, race5 run 6: a 17-row frame of the set
+    /// staged before its finish, fired 79 s later after a raise, its lanes'
+    /// reserve naming the old tail the finish let go). The finish lets
+    /// nothing go until that frame lands: the set's table stands as the
+    /// frame named it, and once it lands the finish relists.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_beams_finish_waits_for_a_frame_held_under_the_cap() -> anyhow::Result<()> {
+        struct HeldFrame {
+            id: uuid::Uuid,
+            resources: ResourceTable,
+            landed: Option<tokio::sync::oneshot::Receiver<()>>,
+        }
+        impl FireContext for HeldFrame {
+            fn resources(&mut self) -> &mut ResourceTable {
+                &mut self.resources
+            }
+            fn process_id(&self) -> uuid::Uuid {
+                self.id
+            }
+            async fn settle_pipeline_tail(&mut self) -> anyhow::Result<()> {
+                if let Some(landed) = self.landed.take() {
+                    let _ = landed.await;
+                }
+                Ok(())
+            }
+        }
+        let model = crate::store::registry::register_model(32, &[8], &[4]);
+        let stores = crate::store::registry::get(model, 0);
+        let ws = {
+            let mut store = stores.kv.lock();
+            let ws = store.create_working_set();
+            store.reserve(ws, 4).expect("reserve four pages");
+            let mut granted = store.reserve_device_pages(4).expect("four free pages");
+            let (_, txn) = kv::prepare_explicit_reserved(&mut store, ws, &[0, 1, 2, 3], &mut granted)
+                .expect("write four pages");
+            kv::settle(&mut store, txn);
+            ws
+        };
+        let table = |stores: &crate::store::registry::Stores| {
+            crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
+                kv.flat_table(ws).map(<[_]>::to_vec).unwrap_or_default()
+            })
+        };
+        let before = table(&stores);
+        assert_eq!(before.len(), 4);
+        let (land, landed) = tokio::sync::oneshot::channel();
+        let mut context = HeldFrame {
+            id: uuid::Uuid::new_v4(),
+            resources: ResourceTable::new(),
+            landed: Some(landed),
+        };
+        let finish = relist_beam(&mut context, model, 0, ws, None, 1, &[2, 0]);
+        tokio::pin!(finish);
+        for _ in 0..20 {
+            tokio::select! {
+                biased;
+                _ = &mut finish => panic!("the finish ran before the held frame landed"),
+                () = tokio::task::yield_now() => {}
+            }
+        }
+        assert_eq!(table(&stores), before, "nothing let go while the frame is held");
+        let _ = land.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(5), finish)
+            .await
+            .expect("the finish goes once the frame landed")
+            .expect("relisted");
+        assert_eq!(table(&stores), vec![before[0], before[3], before[1]]);
+        // The next fire's translation and reserve are stamped from this
+        // table: they name the listed pages alone.
+        let stamped = working_set_flat_table(&stores, ws).expect("the set's table");
+        assert_eq!(stamped, [before[0].0, before[3].0, before[1].0]);
+        Ok(())
     }
 
     /// Mac's gemma-4-e4b c64 stall: a windowed ask that settled its tail
@@ -6499,6 +7497,345 @@ pub(crate) mod lifecycle_tests {
         Ok(())
     }
 
+    /// A decode run ahead on a closed pipeline: `fires` fires after a
+    /// 20-token prompt, each writing one row and folding it as it is
+    /// prepared (a decode's fold, frozen at once, not sealed), their
+    /// completions pending. The set, its cursor, and the fires.
+    struct RunAhead {
+        context: TestContext,
+        pipeline: u32,
+        ws: KvWorkingSet,
+        cursor: CursorCell,
+        stores: crate::store::registry::Stores,
+        completions: Vec<crate::engine::WorkItemCompletion>,
+    }
+
+    /// `state`: the set keeps a recurrent state frozen through that row,
+    /// and its decodes fold nothing (the lagged fold: the program accepted
+    /// none of them yet).
+    fn run_ahead(fires: u32, state: Option<u32>) -> anyhow::Result<RunAhead> {
+        let model = crate::store::registry::register_model_with_swap(
+            16,
+            &[64],
+            &[0],
+            &[0],
+            &[crate::store::registry::StatePool { slots: 1, pages: 4 }],
+            &[0],
+        );
+        let stores = crate::store::registry::get(model, 0);
+        let rs = state.map(|frozen| {
+            let mut rs = stores.rs.lock().unwrap();
+            let ws = rs.create_working_set(crate::store::rs::RsGeometry {
+                state_size: 8,
+                buffer_page_tokens: 4,
+            });
+            rs.fold(ws, frozen);
+            ws
+        });
+        let prompt: Vec<u32> = (0..20).map(|t| 3000 + t).collect();
+        let id = {
+            let mut kv = stores.kv.lock();
+            kv.set_keeps(true);
+            let id = kv.create_working_set();
+            kv.reserve(id, 4).expect("reserve the test sequence");
+            let mut granted = kv.reserve_device_pages(4).expect("four free pages");
+            kv::prepare_explicit_reserved(&mut kv, id, &[0, 1, 2, 3], &mut granted)
+                .expect("publish the pages");
+            kv.log_rows(id, 0, &prompt).unwrap();
+            kv.fold(id, 20, false).unwrap();
+            id
+        };
+        let ws = KvWorkingSet::new(model, 0, id, 16);
+        let cursor: CursorCell = Arc::new(Mutex::new(Default::default()));
+        let mut context = TestContext {
+            id: uuid::Uuid::new_v4(),
+            resources: ResourceTable::new(),
+            tails: Vec::new(),
+        };
+        let pipeline = context.resources.push(Pipeline::new())?.rep();
+        let borrowed: Resource<Pipeline> = Resource::new_borrow(pipeline);
+        let (queue, failure) = {
+            let pipeline = context.resources.get(&borrowed)?;
+            ws.claim_pipeline_scope(&pipeline.scope)
+                .expect("the pipeline takes the set");
+            (pipeline.fires.clone(), pipeline.failure.clone())
+        };
+        let mut completions = Vec::new();
+        for at in 0..fires {
+            let start = 20 + u64::from(at);
+            let seq = {
+                let mut kv = stores.kv.lock();
+                let seq = kv.log_begin(id, start).unwrap();
+                if rs.is_none() {
+                    kv.freeze(id, start + 1).unwrap();
+                }
+                seq
+            };
+            let completion = crate::engine::WorkItemCompletion::deferred_with_guard(None);
+            queue
+                .lock()
+                .unwrap()
+                .push_back(PendingOp::Fire(PendingFire {
+                    completion: completion.clone(),
+                    checkpoints: Vec::new(),
+                    kv: vec![FireWs {
+                        ws: id,
+                        kvtxn: KvTxnGuard::new(model, 0, None),
+                        log: Some(LogFire {
+                            seq,
+                            rows: LogRows::Known {
+                                start,
+                                tokens: vec![5000 + at],
+                            },
+                        }),
+                        lease: ws.fire_lease().expect("lease the set"),
+                        fold: rs.is_none().then_some(FoldAt {
+                            by: FoldBy::To(start + 1),
+                            decoded: true,
+                        }),
+                        reports: Vec::new(),
+                        staged: None,
+                    }],
+                    device_geometry: false,
+                    rstxn: RsTxnsGuard::new(model, 0, None),
+                    model,
+                    engine: 0,
+                    fwd_rep: u32::MAX,
+                    cells: Vec::new(),
+                    failure: failure.clone(),
+                    retired: None,
+                }));
+            advance_cursor(&cursor, Some(start as u32 + 1), None);
+            record_writes(
+                &mut context,
+                pipeline,
+                Some(vec![SetStart {
+                    model,
+                    engine: 0,
+                    kv: id,
+                    cursor: cursor.clone(),
+                    start,
+                    rs,
+                }]),
+            )?;
+            completions.push(completion);
+        }
+        context.resources.get(&borrowed)?.scope.close();
+        Ok(RunAhead {
+            context,
+            pipeline,
+            ws,
+            cursor,
+            stores,
+            completions,
+        })
+    }
+
+    impl RunAhead {
+        /// Folded length, log length and pages held.
+        fn length(&self) -> (u64, usize, u64) {
+            let kv = self.stores.kv.lock();
+            (
+                kv.folded(self.ws.id).unwrap(),
+                kv.logged(self.ws.id).unwrap().len(),
+                kv.mapped_len(self.ws.id).unwrap(),
+            )
+        }
+
+        fn failure(&mut self) -> Option<String> {
+            let borrowed: Resource<Pipeline> = Resource::new_borrow(self.pipeline);
+            let failure = self
+                .context
+                .resources
+                .get(&borrowed)
+                .unwrap()
+                .failure
+                .clone();
+            failure.lock().unwrap().clone()
+        }
+    }
+
+    /// A program stopped at the third token of a decode run ahead six fires
+    /// (EOS or a stop string alike: the loop breaks on the token the third
+    /// fire wrote out). The take-back waits for the fires still in flight:
+    /// nothing is cut under one. Once they land the set holds the prompt
+    /// and the three rows kept, its cursor ends there, a fork taken then
+    /// holds nothing past them, and the rows taken back are never sealed.
+    /// A run that stopped at its budget takes nothing back.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stop_takes_back_what_ran_ahead_once_it_lands() -> anyhow::Result<()> {
+        use std::future::Future;
+        let mut run = run_ahead(6, None)?;
+        for completion in &run.completions[..2] {
+            resolve_test_completion(completion, false);
+        }
+        assert_eq!(run.length().0, 26, "every fire folded as it was prepared");
+        let pipeline = run.pipeline;
+        let retract = {
+            let context = &mut run.context;
+            let mut retract =
+                Box::pin(pipeline_retract(context, Resource::new_borrow(pipeline), 3));
+            let waker = std::task::Waker::noop();
+            let mut cx = std::task::Context::from_waker(waker);
+            for _ in 0..8 {
+                assert!(
+                    retract.as_mut().poll(&mut cx).is_pending(),
+                    "it waits on the fires in flight"
+                );
+                tokio::task::yield_now().await;
+            }
+            retract
+        };
+        drop(retract);
+        assert_eq!(
+            run.length(),
+            (26, 22, 4),
+            "nothing cut under a fire in flight"
+        );
+        for completion in &run.completions[2..] {
+            resolve_test_completion(completion, false);
+        }
+        pipeline_retract(&mut run.context, Resource::new_borrow(pipeline), 3)
+            .await?
+            .map_err(anyhow::Error::msg)?;
+        assert_eq!(
+            run.length(),
+            (23, 23, 2),
+            "the prompt and the three rows kept"
+        );
+        assert_eq!(run.cursor.lock().unwrap().tail, Some(23));
+        assert_eq!(run.failure(), None);
+        let kept: Vec<u32> = (0..20).map(|t| 3000 + t).chain(5000..5003).collect();
+        {
+            let mut kv = run.stores.kv.lock();
+            assert_eq!(kv.logged(run.ws.id).unwrap(), &kept[..]);
+            let child = kv.fork(run.ws.id).unwrap();
+            assert_eq!(
+                kv.folded(child).unwrap(),
+                23,
+                "a fork holds nothing past the stop"
+            );
+            assert_eq!(kv.mapped_len(child).unwrap(), 2);
+            assert_eq!(
+                kv.sealed_in(run.ws.id, 0..2).unwrap(),
+                [0],
+                "and nothing past it sealed"
+            );
+            let epoch = kv.current_epoch();
+            kv.release_working_set(child, epoch);
+        }
+
+        let mut whole = run_ahead(6, None)?;
+        for completion in &whole.completions {
+            resolve_test_completion(completion, false);
+        }
+        let pipeline = whole.pipeline;
+        pipeline_retract(&mut whole.context, Resource::new_borrow(pipeline), 0)
+            .await?
+            .map_err(anyhow::Error::msg)?;
+        let fires = whole
+            .context
+            .resources
+            .get(&Resource::<Pipeline>::new_borrow(pipeline))?
+            .fires
+            .clone();
+        finalize_all(&mut whole.context, &fires, false).await?;
+        assert_eq!(
+            whole.length(),
+            (26, 26, 4),
+            "its budget's rows, no stray one"
+        );
+        Ok(())
+    }
+
+    /// Under the lagged fold a run-ahead past a stop on a set with a
+    /// recurrent state folded none of its rows: the take-back is a buffer
+    /// truncate, the state untouched, the set usable for the next turn.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stop_on_a_recurrent_set_takes_back_its_buffered_rows() -> anyhow::Result<()> {
+        let mut run = run_ahead(6, Some(20))?;
+        for completion in &run.completions {
+            resolve_test_completion(completion, false);
+        }
+        let pipeline = run.pipeline;
+        pipeline_retract(&mut run.context, Resource::new_borrow(pipeline), 3)
+            .await?
+            .map_err(anyhow::Error::msg)?;
+        assert_eq!(run.failure(), None);
+        let (folded, logged, _) = run.length();
+        assert_eq!((folded, logged), (20, 23), "the three rows kept stay buffered");
+        assert_eq!(run.cursor.lock().unwrap().tail, Some(23));
+        Ok(())
+    }
+
+    /// Rows a recurrent state folded past the cut, or the run-ahead bound
+    /// accepted, are not taken back: the pipeline fails by that name, and
+    /// its set is refused where it is used next. A
+    /// retract on an open pipeline, or past what it submitted, is refused.
+    #[tokio::test(flavor = "current_thread")]
+    async fn what_cannot_be_taken_back_is_refused_by_name() -> anyhow::Result<()> {
+        let mut run = run_ahead(4, Some(20))?;
+        for completion in &run.completions {
+            resolve_test_completion(completion, false);
+        }
+        let pipeline = run.pipeline;
+        let past = pipeline_retract(&mut run.context, Resource::new_borrow(pipeline), 5).await?;
+        assert!(past.unwrap_err().contains("past the 4 it can take back"));
+        // No more than the run-ahead window is kept, however long the
+        // pipeline runs.
+        let window = crate::scheduler::run_ahead_window();
+        let long = run_ahead(u32::try_from(window).unwrap() + 3, None)?;
+        let borrowed: Resource<Pipeline> = Resource::new_borrow(long.pipeline);
+        assert_eq!(
+            long.context
+                .resources
+                .get(&borrowed)?
+                .written
+                .lock()
+                .unwrap()
+                .len(),
+            window
+        );
+        // A state folded past the cut is not taken back: the pipeline fails
+        // by that name, and its set is refused where it is used next.
+        let mut run = run_ahead(4, Some(23))?;
+        for completion in &run.completions {
+            resolve_test_completion(completion, false);
+        }
+        let pipeline = run.pipeline;
+        pipeline_retract(&mut run.context, Resource::new_borrow(pipeline), 2)
+            .await?
+            .map_err(anyhow::Error::msg)?;
+        let failure = run.failure().expect("the pipeline fails");
+        assert!(failure.contains("a fold is not taken back"), "{failure}");
+        assert_eq!(run.length().1, 24, "nothing taken back");
+        let next = crate::store::PipelineScope::failing_as(Default::default(), || true);
+        let refused = run.ws.claim_pipeline_scope(&next).unwrap_err().to_string();
+        assert!(refused.contains("could not be taken back"), "{refused}");
+        // Nor are rows the run-ahead bound accepted unread.
+        let mut run = run_ahead(4, Some(20))?;
+        run.cursor.lock().unwrap().bound_accepted = 23;
+        for completion in &run.completions {
+            resolve_test_completion(completion, false);
+        }
+        let pipeline = run.pipeline;
+        pipeline_retract(&mut run.context, Resource::new_borrow(pipeline), 2)
+            .await?
+            .map_err(anyhow::Error::msg)?;
+        let failure = run.failure().expect("the pipeline fails");
+        assert!(failure.contains("run-ahead bound"), "{failure}");
+
+        let mut context = TestContext {
+            id: uuid::Uuid::new_v4(),
+            resources: ResourceTable::new(),
+            tails: Vec::new(),
+        };
+        let open = context.resources.push(Pipeline::new())?.rep();
+        let refused = pipeline_retract(&mut context, Resource::new_borrow(open), 1).await?;
+        assert!(refused.unwrap_err().contains("open pipeline"));
+        Ok(())
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn close_and_drop_share_graceful_fifo_drain_semantics() -> anyhow::Result<()> {
         let mut context = TestContext {
@@ -6625,6 +7962,7 @@ mod static_admission_tests {
             prefill_lanes: 0,
             max_readouts: 0,
             readout_store: 0,
+            max_replayed_rows: 0,
         };
         for (case, submissions) in cases {
             let ring = channel(HostRole::None, 4, false);
@@ -6653,6 +7991,7 @@ mod static_admission_tests {
                     "the fire carries the end it moves and no place"
                 );
                 Box::new(PendingRequest {
+                    queued: std::time::Instant::now(),
                     lora_program: false,
                     logical_fire_id: instance,
                     request,
@@ -7005,7 +8344,7 @@ mod rung_wait_tests {
         planner.note_admitted(pid);
         let bind = {
             let planner = planner.clone();
-            crate::rt::spawn(async move { planner.wait_bind_room(pid, 2, 1).await })
+            crate::rt::spawn(async move { planner.wait_bind_room(pid, 2, 1, 0).await })
         };
         while !planner.demand_waits() {
             tokio::task::yield_now().await;
@@ -7423,6 +8762,14 @@ pub(crate) mod fold_tests {
         geometry::Fold::Host(vec![u32::MAX])
     }
 
+    #[test]
+    fn a_beam_pool_that_could_never_fit_alone_is_refused_by_name() {
+        assert_eq!(super::beam_pool_fits(0, 40, 37, 40), Ok(()));
+        let refusal = super::beam_pool_fits(2, 41, 38, 40).unwrap_err();
+        assert!(refusal.contains(super::BEAM_POOL_OUTGROWN), "{refusal}");
+        assert!(refusal.contains("lane 2"), "{refusal}");
+    }
+
     fn request(lanes: usize) -> crate::engine::FireRequest {
         crate::engine::FireRequest {
             lanes: (0..lanes)
@@ -7803,7 +9150,7 @@ pub(crate) mod fold_tests {
         let ids = [rs, rs];
         let groups = lane_groups(&[ws, ws]);
         assert_eq!(groups.len(), 1);
-        let plan = host_rs_plan(&stores, &ids, &groups, &req, &all(), &[]).unwrap();
+        let plan = host_rs_plan(&stores, &ids, &groups, &req, &all(), &[], None, None).unwrap();
         let rs::RsPlan::Groups(plan) = plan else {
             panic!("a plain recurrent model plans groups");
         };
@@ -7869,7 +9216,7 @@ pub(crate) mod fold_tests {
             assert_eq!(stated, Count(1));
             // Its recurrent state folds the same count, as the plan is
             // reserved.
-            let plan = device_rs_plan(&stores, &[rs], &groups, &pass, &[0, 1], &all()).unwrap();
+            let plan = device_rs_plan(&stores, &[rs], &groups, &pass, &[0, 1], &all(), false).unwrap();
             let rs::RsPlan::Groups(plan) = plan else {
                 panic!("a plain recurrent model plans groups");
             };
@@ -7976,7 +9323,7 @@ pub(crate) mod fold_tests {
         let groups = lane_groups(&[ws]);
         let pass = lanes(19, true, &[&cell]);
         let over = geometry::Fold::Host(vec![9]);
-        let refused = device_rs_plan(&stores, &[rs], &groups, &pass, &[0, 2], &over)
+        let refused = device_rs_plan(&stores, &[rs], &groups, &pass, &[0, 2], &over, false)
             .err()
             .expect("a recurrent state's fold is final as stated");
         assert_eq!(refused, past_rows_refusal(0, 2));
@@ -8005,7 +9352,7 @@ pub(crate) mod fold_tests {
         };
         if let Some(rs) = rs {
             let groups = lane_groups(&[ws]);
-            let plan = host_rs_plan(stores, &[rs], &groups, &req, fold, &[]).unwrap();
+            let plan = host_rs_plan(stores, &[rs], &groups, &req, fold, &[], None, None).unwrap();
             let rs::RsPlan::Groups(plan) = plan else {
                 panic!("a plain recurrent model plans groups");
             };
@@ -10077,8 +11424,10 @@ mod unfolded_tests {
                         )
                         .unwrap();
                         let carried: u32 = reads.iter().map(|span| span.end - span.start).sum();
+                        // A decode lane (one row) states none: its step
+                        // replays them as data, beside its own row.
                         assert!(
-                            carried <= fire.stated,
+                            carried <= fire.stated || fire.own == 1,
                             "replays {carried} rows, stated {}",
                             fire.stated
                         );
@@ -10198,38 +11547,25 @@ mod unfolded_tests {
         assert_eq!(crate::store::shared::wanted_rows(ENGINE), 0);
     }
 
-    /// No rung's replay scratch holds more carried rows than the largest
-    /// rung's tokens: a fire carrying more is refused by name, before
-    /// anything is submitted, whatever its own rows.
+    /// At the contract's floor (a rung stating nothing holds its tokens of
+    /// own rows and as many carried) no rung's replay scratch holds more
+    /// carried rows than the largest rung's tokens: a fire carrying more is
+    /// refused by name, naming the bound, before anything is submitted;
+    /// own rows past it are another refusal's (the capacity of a fire).
     #[test]
     fn a_fire_carrying_past_the_largest_rung_is_refused_by_name() {
+        let (_, stores) = pool_with_rungs_of(vec![(256, 2), (2048, 8)]);
         let carrying = |carried| FireRows { own: 5, carried };
-        assert!(check_largest_rung(carrying(0), 2048).is_ok());
-        assert!(check_largest_rung(carrying(2048), 2048).is_ok());
-        let host = check_largest_rung(carrying(2049), 2048).unwrap_err();
+        assert_eq!(replay_rung(&stores, 56, carrying(0), 0, 1, false), Ok(5));
+        assert_eq!(replay_rung(&stores, 56, carrying(2048), 2048, 1, false), Ok(2048));
+        let host = replay_rung(&stores, 56, carrying(2049), 2049, 1, false).unwrap_err();
         assert!(
-            host.contains("carry 2049 recurrent rows unfolded")
-                && host.contains("past the 2048 tokens of the largest activation rung")
+            host.contains("of 2048 tokens")
+                && host.contains("2049 carried recurrent rows")
                 && host.contains("fold what its lanes have written before they write more"),
             "{host}"
         );
-        // Own rows past it are another refusal's (the capacity of a fire).
-        assert!(
-            check_largest_rung(
-                FireRows {
-                    own: 4096,
-                    carried: 0
-                },
-                2048
-            )
-            .is_ok()
-        );
-        // The pool's largest rung is what is asked against.
-        let stores = pool_of_one_row_rs_pages();
-        let largest = largest_rung(&stores, 56);
-        let pool = stores.shared.as_ref().unwrap().lock().unwrap();
-        assert_eq!(largest, pool.rung_for(u32::MAX));
-        assert!(pool.rungs().last().is_none_or(|&last| largest <= last));
+        assert!(replay_rung(&stores, 56, FireRows { own: 4096, carried: 0 }, 0, 1, false).is_ok());
     }
 
     /// A pass cut into pieces: one folding all it writes folds piece by
@@ -10273,6 +11609,305 @@ mod unfolded_tests {
         );
     }
 
+    /// The rung a fire asks is the smallest whose stated replay scratch
+    /// holds it, each bound counted by the engine crate's functions:
+    ///
+    /// - Metal-shaped (own T, carried T counted the `lane_carried` way, total
+    ///   2T of scratch rows; an rs scratch laying every carried row): a w8
+    ///   replay (8 decode lanes, 8 own rows, 1052 carried, a decode lane's
+    ///   counting none toward carried) is served at the 1024 rung; a w11
+    ///   replay of 929 composed own rows and 1144 carried (2073 scratch rows)
+    ///   is refused by name at the top rung, its total binding, though its
+    ///   lanes are few.
+    /// - CUDA-shaped (own T, carried the widest bucket's tokens, no total):
+    ///   both are held to their own and carried rows alone.
+    /// - Each bound binds alone, the refusal naming it.
+    #[test]
+    fn a_fire_s_rung_holds_its_stated_replay_bounds() {
+        use ::engine::RungReplay;
+        let metal = |tokens: u32| RungReplay {
+            own_max: Some(tokens),
+            carried_max: Some(tokens),
+            scratch: rows_bytes(2 * tokens),
+        };
+        let rungs = vec![(256, 2), (1024, 8)];
+        let (_, stores) = pool_stating(rungs.clone(), vec![metal(256), metal(1024)], false);
+        // Eight decode lanes, each replaying its share of 1052 rows.
+        let w8 = FireRows { own: 8, carried: 0 };
+        assert_eq!(replay_rung(&stores, 56, w8, 1052, 8, false), Ok(1024), "served at the 1024 rung");
+        let w11 = FireRows { own: 929, carried: 0 };
+        let refused = replay_rung(&stores, 56, w11, 1144, 11, false).unwrap_err();
+        assert!(
+            refused.contains("of 1024 tokens") && refused.contains("2077 bytes of rs scratch"),
+            "{refused}"
+        );
+        // On a compact rs scratch a decode lane's rows take none of it.
+        let (_, compact) = pool_stating(rungs.clone(), vec![metal(256), metal(1024)], true);
+        assert_eq!(replay_rung(&compact, 56, w11, 1144, 11, true), Ok(929));
+
+        // CUDA-shaped: carried held to the widest bucket's tokens, no total.
+        let cuda = |tokens: u32| RungReplay {
+            own_max: Some(tokens),
+            carried_max: Some(1024),
+            scratch: rows_bytes(0).unbound(),
+        };
+        let (_, cuda_stores) = pool_stating(rungs.clone(), vec![cuda(256), cuda(1024)], false);
+        assert_eq!(replay_rung(&cuda_stores, 56, w8, 1052, 8, false), Ok(8));
+        assert_eq!(replay_rung(&cuda_stores, 56, w11, 1144, 11, false), Ok(929), "no total bound: its own rows ask");
+
+        // Each bound alone.
+        let only = |bound: RungReplay| pool_stating(vec![(64, 1)], vec![bound], false).1;
+        let none = RungReplay {
+            own_max: None,
+            carried_max: None,
+            scratch: rows_bytes(0).unbound(),
+        };
+        let own = only(RungReplay {
+            own_max: Some(64),
+            ..none.clone()
+        });
+        assert!(replay_rung(&own, 56, FireRows { own: 65, carried: 0 }, 0, 1, false).is_ok(), "own past: capacity's");
+        let carried = only(RungReplay {
+            carried_max: Some(64),
+            ..none.clone()
+        });
+        let why = replay_rung(&carried, 56, FireRows { own: 2, carried: 65 }, 65, 1, false).unwrap_err();
+        assert!(why.contains("65 carried recurrent rows"), "{why}");
+        let total = only(RungReplay {
+            scratch: rows_bytes(64),
+            ..none.clone()
+        });
+        let why = replay_rung(&total, 56, FireRows { own: 4, carried: 0 }, 61, 1, false).unwrap_err();
+        assert!(why.contains("69 bytes of rs scratch"), "{why}");
+        assert!(replay_rung(&total, 56, FireRows { own: 4, carried: 0 }, 60, 1, false).is_ok());
+    }
+
+    /// A host pass whose uncut own rows and carried rows together pass the
+    /// widest rung's replay scratch, but whose pieces each fit, is served in
+    /// pieces: the whole-pass check counts no own row, each piece its own
+    /// as it is cut. A piece that no cut brings under a rung is refused by
+    /// name.
+    #[test]
+    fn a_pass_too_wide_uncut_is_served_in_pieces_that_fit() {
+        let metal = |tokens: u32| ::engine::RungReplay {
+            own_max: Some(tokens),
+            carried_max: Some(tokens),
+            scratch: rows_bytes(2 * tokens),
+        };
+        let (_, stores) = pool_stating(vec![(256, 2), (1024, 8)], vec![metal(256), metal(1024)], false);
+        // Folded through 100, 300 rows buffered since, 2000 more to write
+        // folding all: uncut, 2000 own and 300 carried pass 2048.
+        let full = lane(400, 2000);
+        let frozen = [Some(100)];
+        let whole = vec![Some((0, 2000))];
+        assert!(
+            replay_rung(
+                &stores,
+                56,
+                piece_rows(&full, &whole, &frozen, false),
+                piece_replayed(&full, &whole, &frozen, false),
+                1,
+                false
+            )
+            .is_ok(),
+            "own rows past every rung are the cut's, not a refusal"
+        );
+        let cuts: Vec<Vec<Option<(u32, u32)>>> = host_cuts(&full, true, 512, 16, &[], 0)
+            .into_iter()
+            .map(|cut| vec![Some(cut)])
+            .collect();
+        assert!(cuts.len() > 1, "the pass is cut");
+        assert_eq!(
+            pieces_rung(&stores, 56, &full, &cuts, &frozen, true, &no_scratch()),
+            Ok(512),
+            "every piece fits: the widest asks its 512 rows, the 1024 rung, the first \
+             carrying the 300 rows beside them"
+        );
+        // A piece of eleven lanes, 929 own rows, replaying 1144: refused by
+        // name, whatever its lane count.
+        let mut eleven = lane(1244, 84);
+        for _ in 1..11 {
+            let more = eleven.lanes[0].clone();
+            eleven.lanes.push(more);
+        }
+        eleven.lanes[0].tokens = vec![0; 89];
+        let frozen = [Some(1140); 11];
+        let one = vec![(0..11).map(|at| Some((0, if at == 0 { 89 } else { 84 }))).collect()];
+        let refused =
+            pieces_rung(&stores, 56, &eleven, &one, &frozen, false, &no_scratch()).unwrap_err();
+        assert!(refused.contains("of 1024 tokens"), "{refused}");
+    }
+
+    /// A pass of lanes alone on their sets, folding nothing, landing no
+    /// snapshot.
+    fn no_scratch() -> PassScratch<'static> {
+        PassScratch {
+            shared: Vec::new(),
+            checkpoints: &[],
+            snapshots: 0,
+        }
+    }
+
+    /// Compactness is the fire's, by one function on both sides
+    /// ([`::engine::fire::scratch_compact`], each lane by
+    /// [`::engine::fire::lane_one_run`] from its verb's mask, folded index,
+    /// first row and lineage): a fire on a compact layout is compact unless
+    /// a lane of it lands an rs snapshot (an auto-checkpoint inside the
+    /// fire) or a lane's buffered rows are not one stretch (a beam's
+    /// ancestry among its siblings'). Not compact, its scratch counts every
+    /// carried row, a decode lane's included, and its rung is chosen so: a
+    /// 160-lane fire of 16 beam groups of 10 decode lanes, replaying 4200
+    /// rows, needs a rung whose total holds 4360, or is refused by name.
+    #[test]
+    fn a_fire_s_compactness_is_its_lanes_and_snapshots() {
+        use ::engine::fire::{Lineage, lane_one_run, scratch_compact};
+        assert!(scratch_compact(true, true, true, false));
+        assert!(!scratch_compact(true, true, true, true), "a lane lands a snapshot");
+        assert!(!scratch_compact(false, true, true, false), "a layout not compact");
+        assert!(!scratch_compact(true, true, false, false), "a lane of more than one run");
+        // A lane alone on its set replays one run ending at its first row.
+        assert!(lane_one_run(None, 100, 104, Lineage::Set));
+        assert!(lane_one_run(None, 104, 104, Lineage::Set), "nothing buffered");
+        // A beam lane admitting slots 100..102 and 103..104 of 100..104:
+        // two runs; admitting 102..104 alone: one run, ending at its row.
+        let mask = |runs: Vec<u32>| ::engine::Masking::Extent(::engine::Mask::new(runs, 5));
+        assert!(!lane_one_run(Some(&mask(vec![0, 2, 1, 1, 1])), 100, 104, Lineage::Admitted));
+        assert!(lane_one_run(Some(&mask(vec![2, 3])), 100, 104, Lineage::Admitted));
+        assert!(!lane_one_run(Some(&mask(vec![0, 2, 2, 1])), 100, 104, Lineage::Admitted), "not ending at its row");
+
+        // The runtime's side, from what it puts in the fire: a lone lane
+        // writing 102..106 from its state at 100, an auto-checkpoint at 104.
+        let (_, stores) = pool_stating(vec![(64, 1)], Vec::new(), true);
+        let full = lane_at(102, 4);
+        let piece = vec![Some((0, 4))];
+        let frozen = [Some(100)];
+        assert!(no_scratch().compact(&stores, &full, &piece, &frozen, false), "compact");
+        let checkpoints = [104u64];
+        let landing = PassScratch {
+            checkpoints: &checkpoints,
+            snapshots: 1,
+            ..no_scratch()
+        };
+        assert!(
+            !landing.compact(&stores, &full, &piece, &frozen, false),
+            "the snapshot it lands makes it not compact"
+        );
+        let mut beam = lane_at(102, 4);
+        beam.lanes[0].lane.mask = Some(mask(vec![0, 1, 1, 1, 6]));
+        let sharing = PassScratch {
+            shared: vec![true],
+            ..no_scratch()
+        };
+        assert!(
+            !sharing.compact(&stores, &beam, &piece, &frozen, false),
+            "a beam lane whose ancestry is two runs"
+        );
+        assert!(
+            !sharing.compact(&stores, &full, &piece, &frozen, false),
+            "a beam lane whose mask the device resolves"
+        );
+        // Mac's w4 lane: folded 34, its row at 38, sharing its set, its mask
+        // admitting the one buffered slot 34 (a parent's), not ending at 38.
+        let mut w4 = lane_at(38, 1);
+        w4.lanes[0].lane.mask = Some(::engine::Masking::Extent(::engine::Mask::new(vec![0, 1, 3, 1], 5)));
+        assert!(!sharing.compact(&stores, &w4, &[Some((0, 1))], &[Some(34)], false));
+
+        // The 160-lane fire on a Metal-shaped load: not compact, it counts
+        // 160 own and 4200 replayed rows in its scratch.
+        let metal = |tokens: u32| ::engine::RungReplay {
+            own_max: Some(tokens),
+            carried_max: Some(tokens),
+            scratch: rows_bytes(2 * tokens),
+        };
+        let (_, metal_stores) =
+            pool_stating(vec![(1024, 4), (4096, 8)], vec![metal(1024), metal(4096)], true);
+        let wide = FireRows { own: 160, carried: 0 };
+        assert_eq!(replay_rung(&metal_stores, 56, wide, 4200, 160, false), Ok(4096), "a rung holding 4360");
+        assert_eq!(replay_rung(&metal_stores, 56, wide, 4200, 160, true), Ok(160), "compact, it would not need it");
+        let (_, narrow) = pool_stating(vec![(1024, 4)], vec![metal(1024)], true);
+        let refused = replay_rung(&narrow, 56, wide, 4200, 160, false).unwrap_err();
+        assert!(refused.contains("4364 bytes of rs scratch"), "{refused}");
+    }
+
+    /// Metal's rs scratch is bytes, not a row budget: a rung reserves each
+    /// scratch slot's rows at 2T and the lanes' work term at min(T, max
+    /// lanes); a fire of fewer lanes has the work term's slack for more
+    /// rows. A non-compact replay of 126 own and 1150 replayed rows fits
+    /// the 1024 rung at 60 and at 176 lanes, past 2T rows at 60 lanes too;
+    /// one whose bytes pass the reserve is refused by name.
+    #[test]
+    fn a_rung_s_scratch_is_its_bytes_over_its_lanes() {
+        let pad = |bytes: u64| bytes.div_ceil(256) * 256;
+        let metal = |tokens: u32| ::engine::RungReplay {
+            own_max: Some(tokens),
+            carried_max: Some(tokens),
+            scratch: ::engine::ScratchBytes {
+                slot_bytes: vec![1000],
+                lane_bytes: 50_000,
+                room_bytes: pad(2 * u64::from(tokens) * 1000) + pad(u64::from(tokens) * 50_000),
+                pad: 256,
+            },
+        };
+        let (_, stores) = pool_stating(vec![(1024, 8)], vec![metal(1024)], true);
+        let fire = FireRows { own: 126, carried: 0 };
+        assert!(replay_rung(&stores, 56, fire, 1150, 60, false).is_ok());
+        assert!(replay_rung(&stores, 56, fire, 1150, 176, false).is_ok());
+        assert!(
+            replay_rung(&stores, 56, fire, 2300, 60, false).is_ok(),
+            "past 2T rows, in the work term's slack"
+        );
+        let refused = replay_rung(&stores, 56, fire, 52_000, 176, false).unwrap_err();
+        assert!(refused.contains("bytes of rs scratch"), "{refused}");
+    }
+
+    /// Mac's measurements (Metal, Qwen3.5-0.8B w8, the old path): its rs
+    /// scratch from `rs::Layout`, eight scratch slots of
+    /// [12288, 64, 4096, 12288, 128, 128, 8192, 8192] bytes a row, 1 MiB a
+    /// lane, each term rounded to 256; rung 256 reserves 291,667,968 bytes,
+    /// rung 512 583,335,936. Three non-compact replay fires fit the rung
+    /// they ran at, to the byte Metal counted; the fourth (256, 48 lanes,
+    /// 9040 scratch rows, 460,530,688 bytes) passes rung 256 and is placed
+    /// at 512, never refused.
+    #[test]
+    fn mac_s_qwen3_5_replay_fires_fit_their_rungs_by_their_bytes() {
+        let scratch = |room_bytes| ::engine::ScratchBytes {
+            slot_bytes: vec![12288, 64, 4096, 12288, 128, 128, 8192, 8192],
+            lane_bytes: 262_144 * 4,
+            room_bytes,
+            pad: 256,
+        };
+        let rung = |tokens: u32, room| ::engine::RungReplay {
+            own_max: Some(tokens),
+            carried_max: Some(tokens),
+            scratch: scratch(room),
+        };
+        let (r256, r512) = (rung(256, 291_667_968), rung(512, 583_335_936));
+        let fire = |lanes: u32, rows: u32| ::engine::ReplayRows {
+            own: lanes,
+            carried: 0,
+            scratch: rows,
+            lanes,
+        };
+        assert_eq!(r512.scratch.bytes(1969, 121), 216_223_488);
+        assert_eq!(r512.scratch.bytes(1640, 128), 208_634_368);
+        assert_eq!(r256.scratch.bytes(5560, 32), 285_844_992);
+        assert_eq!(r256.scratch.bytes(9040, 48), 460_530_688);
+        assert!(::engine::fire::rung_holds(&r512, fire(121, 1969)).is_ok());
+        assert!(::engine::fire::rung_holds(&r512, fire(128, 1640)).is_ok());
+        assert!(::engine::fire::rung_holds(&r256, fire(32, 5560)).is_ok());
+        let over = ::engine::fire::rung_holds(&r256, fire(48, 9040)).unwrap_err();
+        assert_eq!(over.bound, ::engine::ReplayBound::Scratch);
+        // The runtime places that fire at 512: 48 decode lanes replaying
+        // 8992 rows, not compact.
+        let (_, stores) = pool_stating(vec![(256, 4), (512, 8)], vec![r256, r512], true);
+        let rows = FireRows { own: 48, carried: 0 };
+        assert_eq!(replay_rung(&stores, 56, rows, 8992, 48, false), Ok(512));
+    }
+
+    fn lane_at(held: u32, rows: u32) -> crate::engine::FireRequest {
+        lane(held, rows)
+    }
+
     pub(super) fn pool_of_one_row_rs_pages() -> crate::store::registry::Stores {
         pool_with_rungs(Vec::new())
     }
@@ -10287,6 +11922,50 @@ mod unfolded_tests {
     pub(super) fn pool_with_rungs_of(
         act_chunks: Vec<(u32, u32)>,
     ) -> (usize, crate::store::registry::Stores) {
+        pool_stating(act_chunks, Vec::new(), false)
+    }
+
+    /// [`pool_with_rungs_of`], each rung's replay scratch stated
+    /// (`act_replay`) and the load's rs scratch `rs_compact` or not.
+    /// A Metal-shaped test scratch: one byte a row, no lane term past its
+    /// 4-byte floor (`ScratchBytes::bytes`, Metal's formula), holding `rows`
+    /// scratch rows.
+    pub(super) fn rows_bytes(rows: u32) -> ::engine::ScratchBytes {
+        ::engine::ScratchBytes {
+            slot_bytes: vec![1],
+            lane_bytes: 0,
+            room_bytes: u64::from(rows) + 4,
+            pad: 1,
+        }
+    }
+
+    trait Unbound {
+        fn unbound(self) -> ::engine::ScratchBytes;
+    }
+
+    impl Unbound for ::engine::ScratchBytes {
+        /// No bytes binding.
+        fn unbound(self) -> ::engine::ScratchBytes {
+            ::engine::ScratchBytes {
+                slot_bytes: Vec::new(),
+                ..self
+            }
+        }
+    }
+
+    pub(super) fn pool_stating(
+        act_chunks: Vec<(u32, u32)>,
+        act_replay: Vec<::engine::RungReplay>,
+        rs_compact: bool,
+    ) -> (usize, crate::store::registry::Stores) {
+        let act_replay = if act_replay.is_empty() {
+            act_chunks
+                .iter()
+                .map(|&(tokens, _)| crate::store::shared::rows_only(tokens))
+                .collect()
+        } else {
+            act_replay
+        };
         use ::engine::chunk::{
             ChunkFacts, Growth, Reserved, ReservedRun, SegmentFacts, ShapeId, SlotKind, SlotRole,
             SlotShape,
@@ -10327,6 +12006,9 @@ mod unfolded_tests {
                 shape(2, SlotKind::Fixed { pieces: 1 }, SlotRole::State),
             ],
             act_chunks,
+            act_replay,
+            rs_compact,
+            rs_scratch_per_fire: true,
             ..ChunkFacts::default()
         };
         let pool = crate::store::shared::SharedPool::new(&facts, 1024).unwrap();
@@ -10413,9 +12095,9 @@ mod unfolded_tests {
             };
             let mut req = lane(10, 4);
             let plan = if device_places {
-                device_rs_plan(&stores, &ids, &groups_of, &pass, &[0, 4], fold)
+                device_rs_plan(&stores, &ids, &groups_of, &pass, &[0, 4], fold, false)
             } else {
-                host_rs_plan(&stores, &ids, &groups_of, &req, fold, &[])
+                host_rs_plan(&stores, &ids, &groups_of, &req, fold, &[], None, None)
             }
             .expect(&what);
             let prepared =
@@ -10492,6 +12174,8 @@ mod unfolded_tests {
                 &lane(held, rows),
                 &geometry::Fold::Host(fold),
                 &[],
+                None,
+                None,
             )
         };
 
@@ -10566,6 +12250,7 @@ mod unfolded_tests {
                 &lanes,
                 &[0, 5],
                 &geometry::Fold::Device,
+                false,
             )
         };
         let planned = groups(device(13 + 5 + 5).unwrap());

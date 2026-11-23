@@ -44,6 +44,14 @@ pub struct FireLimits {
     /// 0: as many as `max_tokens`.
     #[serde(default)]
     pub max_readouts: u32,
+    /// The most buffered recurrent rows one fire's lanes replay, summed over
+    /// every lane, a decode lane's (`lane_carried`'s none) included: what
+    /// the engine's staged replay table holds a fire (0: no bound past each
+    /// lane's rung, [`crate::fire::rung_holds`]). The runtime steps no more
+    /// replayed rows than this together, a fire that would carry more
+    /// going in the steps after.
+    #[serde(default)]
+    pub replayed_rows: u32,
 }
 
 /// What a load states beside its chunk pool ([`ChunkFacts`], which holds
@@ -142,6 +150,67 @@ pub struct Capabilities {
     /// serves without building a program: the runtime's cutter composes no
     /// other ([`MixedLanes::fits`]).
     pub mixed_lanes: MixedLanes,
+
+    /// The host ops this load serves ([`HostOps`]): a program that needs
+    /// one it does not is refused at its bind, before any step. Required:
+    /// an engine states what it serves.
+    pub host_ops: HostOps,
+}
+
+/// An op the runtime asks an engine for on the host, outside a fire, that
+/// a program's finish relies on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HostOp {
+    /// A beam group's beam's page list (`crate::Engine::beam_list`), read
+    /// at a beam search's finish.
+    BeamList,
+}
+
+impl HostOp {
+    /// The op's name, as the engine's verb.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            HostOp::BeamList => "beam_list",
+        }
+    }
+}
+
+/// The host ops an engine serves ([`Capabilities::host_ops`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostOps {
+    /// [`HostOp::BeamList`].
+    pub beam_list: bool,
+}
+
+impl HostOps {
+    /// None served.
+    pub const NONE: HostOps = HostOps { beam_list: false };
+
+    #[must_use]
+    pub fn serves(self, op: HostOp) -> bool {
+        match op {
+            HostOp::BeamList => self.beam_list,
+        }
+    }
+
+    /// The host ops a program of `package` needs: a beam group (a
+    /// `Port::Parents` read from a channel) reads its chosen beam's page
+    /// list at its finish.
+    #[must_use]
+    pub fn needed_by(package: &eta_compiler::codegen::launch::LaunchPackage) -> Vec<HostOp> {
+        let beam = package
+            .ports
+            .iter()
+            .any(|binding| binding.port == eta_ir::registry::Port::Parents && !binding.is_const);
+        if beam { vec![HostOp::BeamList] } else { Vec::new() }
+    }
+
+    /// The first op of `needed` this does not serve.
+    #[must_use]
+    pub fn unserved(self, needed: &[HostOp]) -> Option<HostOp> {
+        needed.iter().copied().find(|&op| !self.serves(op))
+    }
 }
 
 /// Which mixed fires a load lays: every one within its fire limits
@@ -243,6 +312,7 @@ mod mixed_lanes {
                 prefill_rows: 0,
                 prefill_lanes: 0,
                 max_readouts: 0,
+                replayed_rows: 0,
             },
         )
     }

@@ -1,8 +1,14 @@
 //! engine-metal's integration tests, one binary: each module was a test file.
 
 mod a_bank_past_2_gib_reads_its_last_rows;
+mod a_beam_step_follows_the_spec;
 mod a_bound_guest_leaves_the_span_as_it_was;
 mod a_cold_registration_compiles_while_lanes_fire;
+mod a_group_fold_is_the_sequential_fold;
+mod a_carry_past_the_table_is_served;
+mod a_lagged_decode_answers_the_unlagged;
+mod the_resident_probe_counts_the_cores;
+mod the_carried_scan_times_as_the_step;
 mod a_mixed_fires_last_rows_are_each_lanes_own;
 mod a_prefill_reads_no_kv_cell_past_its_keys;
 mod a_prewarmed_program_registers_off_thread_without_compiling;

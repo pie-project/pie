@@ -356,6 +356,20 @@ fn the_gdn_recurrence_answers_the_reference() {
                 slots: i32s(sb, 5),
                 lane0: lane0 as u32,
             };
+            // No lane lands a row in an rs buffer: each header's `at` is -1.
+            let header = kernels_slang::ssm::CARRY_HEADER as usize;
+            let mut table = vec![0i32; 5 * header];
+            for lane in 0..5 {
+                table[lane * header] = -1;
+            }
+            let carry = kernels_slang::ssm::Carry {
+                table: i32s(gpu.up_i32(&table), table.len()),
+                slots: i32s(sb, 5),
+                lane0: lane0 as u32,
+                page_tokens: 16,
+                stride_words: 0,
+            };
+            let unlanded = kernels_slang::ssm::CarryPlane { at: 0, row: 0 };
             let work = 5 * slab;
             // The window's 4 lanes in one dispatch, and in dispatches of a
             // work plane holding 2 and 1 of them.
@@ -396,6 +410,11 @@ fn the_gdn_recurrence_answers_the_reference() {
                                         dv,
                                         y(o[0].0, rows),
                                         row0,
+                                        &kernels_slang::ssm::Carry {
+                                            lane0: committed.lane0 + first,
+                                            ..carry
+                                        },
+                                        [unlanded, unlanded],
                                     )?;
                                 }
                                 Ok(())

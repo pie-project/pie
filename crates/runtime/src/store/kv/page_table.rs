@@ -214,6 +214,12 @@ pub enum KvTableError {
     /// as its length.
     #[error("{}", UNPLACED)]
     FoldUnplaced,
+    /// [`KvPageTable::truncate`] ends inside a sealed page.
+    #[error(
+        "row {rows} ends inside a sealed page: its rows past {rows} are frozen under the key \
+         that names them"
+    )]
+    SealedPast { rows: u64 },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -483,6 +489,47 @@ impl KvPageTable {
         }
         self.publish_appended(ws, pages)?;
         Ok(Vec::new())
+    }
+
+    /// `ws` ends at row `rows`: what it holds past them goes, the pages
+    /// wholly past them leave its path (freed where nothing else holds
+    /// them), and its folded length, log and prompt reach stop there. The
+    /// page the rows end inside stays, its rows past `rows` the buffer's.
+    /// Refused while a fold is on its way unplaced, or where that page is
+    /// sealed: a sealed page is frozen whole, and its rows past `rows` would
+    /// be written in place under the key that names them.
+    pub fn truncate(
+        &mut self,
+        ws: WorkingSetId,
+        rows: u64,
+        page_size: u32,
+    ) -> Result<Vec<KvPageBacking>, KvTableError> {
+        let page = u64::from(page_size.max(1));
+        let entry = self.entry(ws)?;
+        if entry.unsettled > 0 {
+            return Err(KvTableError::FoldUnsettled);
+        }
+        let (terminal, mapped_len) = (entry.terminal, entry.mapped_len);
+        let kept = rows.div_ceil(page).min(mapped_len);
+        if !rows.is_multiple_of(page) && rows / page < mapped_len && self.sealed(ws, rows / page)? {
+            return Err(KvTableError::SealedPast { rows });
+        }
+        let freed = if kept < mapped_len {
+            let segs = self.segments(terminal, mapped_len);
+            let terminal = (kept > 0).then(|| self.boundary_terminal(&segs, kept));
+            self.move_terminal(ws, terminal)?
+        } else {
+            Vec::new()
+        };
+        let entry = self.entry_mut(ws)?;
+        entry.mapped_len = kept;
+        entry.folded = entry.folded.min(rows);
+        entry.prompt_pages = entry.prompt_pages.min(rows / page);
+        entry.logged.truncate(rows as usize);
+        for cut in entry.pending.values_mut() {
+            *cut = (*cut).min(rows);
+        }
+        Ok(freed)
     }
 
     pub fn commit_in_place(
@@ -2249,6 +2296,32 @@ impl KvPageTable {
             }
         }
         Ok(())
+    }
+
+    /// Every live working set whose table resolves now, and the device page
+    /// ids it names: what a page given back must be in none of (a check).
+    pub fn every_resident_table(&self) -> Vec<(WorkingSetId, Vec<u32>)> {
+        self.working_sets
+            .iter()
+            .filter_map(|(ws, _)| Some((ws, self.flatten(ws).ok()?.iter().map(|page| page.0).collect())))
+            .collect()
+    }
+
+    /// The device page ids `working_sets` reach that are resident, for a
+    /// debug line.
+    pub fn resident_ids(&self, working_sets: &HashSet<WorkingSetId>) -> Vec<u32> {
+        let Ok(locations) = self.locations(working_sets) else {
+            return Vec::new();
+        };
+        let mut ids: Vec<u32> = locations
+            .into_iter()
+            .filter_map(|location| match self.backing_at(&location).ok()? {
+                KvPageBacking::Resident(id) => Some(id.0),
+                _ => None,
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
     }
 
     fn locations(

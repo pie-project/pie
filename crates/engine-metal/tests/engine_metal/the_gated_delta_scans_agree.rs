@@ -199,6 +199,7 @@ fn the_scans_agree() {
         commit: table(commit),
         slots: table(h_slot[s as usize]),
         lane0: 0,
+        ext_replay: table(h_replay),
     };
     let splits = (V_DIM / 32) as i32;
 

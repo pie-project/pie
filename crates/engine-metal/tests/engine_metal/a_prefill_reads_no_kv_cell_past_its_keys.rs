@@ -60,6 +60,7 @@ fn a_prefill_reads_no_kv_cell_past_its_keys() {
                 }
                 let seated: Vec<Seated<'_>> = (0..lanes)
                     .map(|slot| Seated {
+                        replay_stated: None,
                         held: Some(0),
                         ..Seated::of(Lane { slot, word: word(&fixture.trace, rows), tokens: &prompt })
                     })

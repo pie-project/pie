@@ -175,6 +175,7 @@ fn report(shell: &mut Shell, vocab: u32, tokens: &[u32], fold: bool, slot: u32) 
         Arc::new(move |_at, outcome| heard.lock().unwrap().push(outcome))
     };
     let lanes = [Seated {
+        replay_stated: None,
         held: Some(0),
         reports: 7,
         ..Seated::of(Lane {
@@ -227,6 +228,7 @@ fn a_kv_only_lane_reports_its_device_fold() {
     shell.open(3).expect("slot 3 opens");
     let vocab = shell
         .fire_seated(&[Seated {
+            replay_stated: None,
             held: Some(0),
             ..Seated::of(Lane {
                 slot: 3,
@@ -240,6 +242,7 @@ fn a_kv_only_lane_reports_its_device_fold() {
         engine::StepOutcome {
             wrote: writes,
             faulted,
+            ..
         } if faulted.is_empty() && !writes.is_empty() => {
             assert_eq!(writes.len(), 1, "one reporting lane");
             assert_eq!(writes[0].tag, 7);
@@ -251,6 +254,7 @@ fn a_kv_only_lane_reports_its_device_fold() {
         engine::StepOutcome {
             wrote: writes,
             faulted,
+            ..
         } if faulted.is_empty() && !writes.is_empty() => {
             assert_eq!(writes.len(), 1, "one reporting lane");
             assert_eq!(writes[0].fold, None, "no `fold` port, no fold told");

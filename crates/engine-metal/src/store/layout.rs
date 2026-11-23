@@ -556,6 +556,11 @@ impl Layout {
             .collect(),
             shapes,
             act_chunks: self.act().to_vec(),
+            // Each rung's rs scratch, from its reserve: the shell states it
+            // (`Shell::pool_chunk_facts`).
+            act_replay: Vec::new(),
+            rs_compact: false,
+            rs_scratch_per_fire: false,
             eager_rungs: Vec::new(),
             held_bytes: 0,
             outside_bytes: 0,

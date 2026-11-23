@@ -32,6 +32,7 @@ fn a_take_leaves_passes_in_flight_flying() {
     shell.open(3).expect("slot 3 opens");
     let vocab = shell
         .fire_seated(&[Seated {
+            replay_stated: None,
             held: Some(0),
             ..Seated::of(Lane {
                 slot: 3,

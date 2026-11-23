@@ -340,7 +340,12 @@ pub fn resolves(class: GeometryClass, port: Port) -> bool {
         // placed, and so may the mask that says what the rows see: one the
         // device computes (beam ancestry) the runtime cannot resolve, for a
         // fire staged ahead or not.
-        GeometryClass::DecodeEnvelope => matches!(port, Port::Positions | Port::AttnMask),
+        // So may each beam's parent, over which the engine keeps the beams'
+        // own page lists (`new-memory/designs/BEAM-PAGE-LISTS.md`).
+        GeometryClass::DecodeEnvelope => matches!(
+            port,
+            Port::Positions | Port::AttnMask | Port::Parents
+        ),
         GeometryClass::DeviceGeometry => matches!(port, Port::EmbedIndptr | Port::AttnMask),
         GeometryClass::Host => false,
     }

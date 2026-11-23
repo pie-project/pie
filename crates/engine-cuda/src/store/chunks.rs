@@ -1076,6 +1076,11 @@ impl Chunks {
                 .copied()
                 .chain(std::iter::once((max_tokens, self.act)))
                 .collect(),
+            // Each rung's replay scratch, from the rs extended run's own
+            // reserve: the shell states it (`Shell::chunk_facts`).
+            act_replay: Vec::new(),
+            rs_compact: false,
+            rs_scratch_per_fire: false,
             eager_rungs: Vec::new(),
             held_bytes: 0,
             outside_bytes: 0,

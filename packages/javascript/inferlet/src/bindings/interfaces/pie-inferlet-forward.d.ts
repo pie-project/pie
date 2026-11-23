@@ -96,12 +96,21 @@ export interface MediaSpanAudio {
  * - `fold`: per lane, how many more slots freeze after this fire;
  *   `u32::MAX` folds everything. Default: none. May be computed on the
  *   device; lanes sharing a working set fold by the first one's count.
+ * - `parents`: `[lanes]` u32, a beam search's: lane `b` continues lane
+ *   `parents[b]` of the fire before. Every lane names the same working
+ *   set, whose reserve past its frozen full pages is a pool each lane
+ *   holds its own pages of; the engine keeps the lanes' page lists and
+ *   reorders them by the parents before each fire reads or appends
+ *   (`new-memory/designs/BEAM-PAGE-LISTS.md`). Computed on the device by
+ *   the epilogue before; the first fire ignores it. A parent past the
+ *   lanes faults its lane. Default: none.
  */
 export interface StateGeometry {
   positions?: Channel,
   slots?: Channel,
   kvLen?: Channel,
   fold?: Channel,
+  parents?: Channel,
 }
 
 export class ForwardPass {

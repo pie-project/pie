@@ -346,6 +346,12 @@ pub struct Lane {
     /// in slots of their own as it runs.
     #[serde(default)]
     pub rs_snapshots: Vec<RsSnapshot>,
+    /// The lane's replay as the runtime stated it when it chose the fire's
+    /// rung ([`LaneReplay`]): what an engine's submit check compares its own
+    /// count with ([`replay_agrees`]). `None` on a lane carrying no
+    /// recurrent verb.
+    #[serde(default)]
+    pub replay_stated: Option<LaneReplay>,
     pub readout: Readout,
     /// Unique to its pass in a fire, so two passes' lanes never attend each other.
     #[serde(default)]
@@ -381,6 +387,11 @@ pub struct Lane {
     /// translation its program's page indexes address.
     #[serde(default)]
     pub list: ListKind,
+    /// A lane stating its own page list (`state-geometry.pages`): its
+    /// working set's whole kv list table (slot refs), whose pages past the
+    /// frozen full ones its list's entries name. Empty for any other lane.
+    #[serde(default)]
+    pub reserve: Vec<u32>,
     /// The lane's recurrent-state record. The runtime states one for every
     /// lane of a load that holds recurrent state, a record or none.
     #[serde(default)]
@@ -737,46 +748,354 @@ pub enum Lineage {
     Admitted,
 }
 
-/// The rows a fire asks its activation rung for: `own` rows of its lanes,
-/// and `carried` recurrent rows, those earlier fires wrote and nothing has
-/// folded yet, which the fire replays ahead of its own.
+/// What one activation rung's replay scratch holds, as the engine states it
+/// for that rung ([`crate::chunk::ChunkFacts::act_replay`]), from its own
+/// reserve formula: every engine whose rungs replay states it, no default.
+/// A fire's rows are counted by [`ReplayRows`]; it runs at a rung that holds
+/// them ([`rung_holds`]), the smallest such rung the runtime finds, and one
+/// no rung holds is refused by name before anything is submitted. An
+/// engine's own check at submit calls the same [`rung_holds`] against the
+/// rung it stages the fire in.
 ///
-/// The contract on carried rows, with no stated limit: a rung's replay
-/// scratch holds at least the rung's tokens of carried rows; a fire carries
-/// at most its rung's tokens; the runtime asks the rung for max(own,
-/// carried) and refuses past the largest rung.
+/// - `own_max`: the fire's own rows, every row its lanes compute in it
+///   (`None`: not binding).
+/// - `carried_max`: its carried rows counted as a rung counts them
+///   ([`lane_carried`]: a decode lane's none, a wider lane's all), summed
+///   (`None`: not binding).
+/// - `scratch`: its rs scratch's bytes ([`ScratchBytes`]), its scratch rows
+///   ([`rs_scratch_rows`]) over its lanes.
 ///
-/// - The engine: at rung `r` a fire's replay scratch holds at least `r` own
-///   rows and `r` carried rows, in extended rows (the recurrent layers' rows
-///   only). It is a floor, what the runtime relies on (a fire granted rung
-///   `r` may carry `r`); an engine may lay more.
-/// - The runtime: a fire carrying more than its rung's tokens raises the
-///   rung as a wider fire does; one carrying more than the largest rung's
-///   tokens is refused by name, before anything is submitted. The counts
-///   are a fire's, summed over its lanes.
-/// - Device geometry: a lane's carried rows are the buffered slots between
-///   its state and its first row that its mask admits (`folded..first`,
-///   [`buffered_reads`]). Where the device says where a lane's rows land,
-///   both ends are its program's (`fold` and `slots`), resolved at the
-///   engine's prepare, after the lane's earlier fires have run: no count
-///   exists when the runtime asks. The runtime states a bound in its place,
-///   the rows that can stand unfolded in the lane's working set when the
-///   fire runs: those between the state's frozen length and the set's
-///   written end (one past the highest slot a settled fire wrote; a lane
-///   that rewinds leaves the rows past it buffered, so the end only
-///   rises), and every row of the set's device-placed fires staged and not
-///   yet settled. It asks the rung for max(own, that bound) summed over the
-///   fire's lanes, and refuses past the largest rung as for any fire. An
-///   engine that takes such fires reports where each lane's rows ended
-///   when the fire settles ([`crate::KvWrites::end`]); a fire that reports
-///   none is taken to have written as far as its set reserved. The
-///   engine's check where the count resolves is a fault for a wrong count
-///   only (a mask admitting slots nobody wrote): a fire whose lanes replay
-///   more than the tokens of the rung it runs at, summed over them, is
-///   refused by name at prepare and writes nothing.
+/// Device geometry: a lane's carried rows are the buffered slots between its
+/// state and its first row that its mask admits (`folded..first`,
+/// [`buffered_reads`]). Where the device says where a lane's rows land, no
+/// count exists when the runtime asks: it states a bound in its place, the
+/// rows that can stand unfolded in the lane's working set when the fire runs.
+/// The engine's check where the count resolves is a fault for a wrong count
+/// only. An engine that takes such fires reports where each lane's rows
+/// ended when the fire settles ([`crate::KvWrites::end`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RungReplay {
+    pub own_max: Option<u32>,
+    pub carried_max: Option<u32>,
+    pub scratch: ScratchBytes,
+}
+
+/// A rung's rs scratch as bytes, the engine's own reserve formula: a fire
+/// of `rows` scratch rows over `lanes` lanes (each at least one) takes, for
+/// each scratch slot, `rows * slot_bytes` (at least 4) rounded up to `pad`,
+/// and `lanes * lane_bytes` (at least 4) rounded up to `pad`, the whole at
+/// least one `pad` (Metal's `Seat::scratch_bytes` to the byte), and fits
+/// where that is at most `room_bytes`. An engine laying no rs scratch
+/// beyond its rung's rows (its replay inside the rung's own rooms, bounded
+/// by `own_max` and `carried_max`) states no slot: no bytes bind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScratchBytes {
+    pub slot_bytes: Vec<u64>,
+    pub lane_bytes: u64,
+    pub room_bytes: u64,
+    pub pad: u64,
+}
+
+impl ScratchBytes {
+    /// The bytes a fire of `rows` scratch rows over `lanes` lanes takes.
+    #[must_use]
+    pub fn bytes(&self, rows: u32, lanes: u32) -> u64 {
+        if self.slot_bytes.is_empty() {
+            return 0;
+        }
+        let pad = self.pad.max(1);
+        let up = |bytes: u64| bytes.max(4).div_ceil(pad).saturating_mul(pad);
+        let rows = u64::from(rows.max(1));
+        let lanes = u64::from(lanes.max(1));
+        let slots = self
+            .slot_bytes
+            .iter()
+            .fold(0u64, |sum, &slot| sum.saturating_add(up(rows.saturating_mul(slot))));
+        slots
+            .saturating_add(up(lanes.saturating_mul(self.lane_bytes)))
+            .max(pad)
+    }
+
+    /// The bytes binding, where any do.
+    #[must_use]
+    pub fn binds(&self) -> bool {
+        !self.slot_bytes.is_empty()
+    }
+}
+
+/// A fire's rows as a rung's replay scratch counts them ([`RungReplay`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayRows {
+    /// Every row the fire's lanes compute in it.
+    pub own: u32,
+    /// Its lanes' carried rows, each counted by [`lane_carried`], summed.
+    pub carried: u32,
+    /// Its rs scratch rows ([`rs_scratch_rows`]).
+    pub scratch: u32,
+    /// Its lanes.
+    pub lanes: u32,
+}
+
+impl ReplayRows {
+    /// The rows of a fire whose lanes compute `(own, carried)` rows each,
+    /// `carried` every buffered row a lane replays ahead of its own (a
+    /// decode lane's included), its rs scratch `compact` or not (the fire's,
+    /// [`scratch_compact`]).
+    #[must_use]
+    pub fn of_lanes(lanes: impl IntoIterator<Item = (u32, u32)> + Clone, compact: bool) -> ReplayRows {
+        let own = lanes
+            .clone()
+            .into_iter()
+            .fold(0u32, |sum, (own, _)| sum.saturating_add(own));
+        ReplayRows {
+            own,
+            carried: lanes
+                .clone()
+                .into_iter()
+                .fold(0u32, |sum, (own, carried)| {
+                    sum.saturating_add(lane_carried(own, carried))
+                }),
+            scratch: rs_scratch_rows(own, lanes.clone(), compact),
+            lanes: u32::try_from(lanes.into_iter().count()).unwrap_or(u32::MAX),
+        }
+    }
+
+    /// The same counts from a fire's sums: `own` rows, `carried` counted by
+    /// [`lane_carried`] lane by lane, `replayed` every lane's carried rows
+    /// (a decode lane's included), over `lanes` lanes, its rs scratch
+    /// `compact` or not (the fire's, [`scratch_compact`]).
+    #[must_use]
+    pub fn of_sums(own: u32, carried: u32, replayed: u32, lanes: u32, compact: bool) -> ReplayRows {
+        ReplayRows {
+            own,
+            carried,
+            scratch: own.saturating_add(if compact { carried } else { replayed }),
+            lanes,
+        }
+    }
+}
+
+/// The rs scratch rows a fire of `own` rows takes, its lanes carrying
+/// `(lane own, carried)` rows each: its own rows, and each lane's carried
+/// rows as the fire's scratch lays them: where it is `compact`
+/// ([`scratch_compact`]) only those a rung counts ([`lane_carried`]: a
+/// decode lane's none), else every one, a decode lane's included.
 #[must_use]
-pub fn rung_rows(own: u32, carried: u32) -> u32 {
-    own.max(carried)
+pub fn rs_scratch_rows(own: u32, lanes: impl IntoIterator<Item = (u32, u32)>, compact: bool) -> u32 {
+    lanes.into_iter().fold(own, |sum, (lane_own, carried)| {
+        sum.saturating_add(if compact {
+            lane_carried(lane_own, carried)
+        } else {
+            carried
+        })
+    })
+}
+
+/// Which of a rung's stated bounds a fire passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReplayBound {
+    Own,
+    Carried,
+    Scratch,
+}
+
+/// A fire's count past one of its rung's bounds: which, the fire's count of
+/// it and the rung's (rows, or the scratch's bytes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayPast {
+    pub bound: ReplayBound,
+    pub rows: u64,
+    pub max: u64,
+}
+
+impl std::fmt::Display for ReplayPast {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let what = match self.bound {
+            ReplayBound::Own => "own rows",
+            ReplayBound::Carried => "carried recurrent rows (a decode lane's counting none)",
+            ReplayBound::Scratch => {
+                "bytes of rs scratch (its own rows and its lanes' carried rows, over its lanes)"
+            }
+        };
+        write!(f, "{} {what}, past the {} the rung's replay scratch holds", self.rows, self.max)
+    }
+}
+
+/// Whether `rung` holds a fire of `rows`: own, carried and scratch bytes in
+/// that order, the first it passes named. What the runtime picks a fire's
+/// rung by and an engine checks a fire at submit by.
+pub fn rung_holds(rung: &RungReplay, rows: ReplayRows) -> std::result::Result<(), ReplayPast> {
+    for (bound, count, max) in [
+        (ReplayBound::Own, rows.own, rung.own_max),
+        (ReplayBound::Carried, rows.carried, rung.carried_max),
+    ] {
+        if let Some(max) = max
+            && count > max
+        {
+            return Err(ReplayPast {
+                bound,
+                rows: u64::from(count),
+                max: u64::from(max),
+            });
+        }
+    }
+    let bytes = rung.scratch.bytes(rows.scratch, rows.lanes);
+    if rung.scratch.binds() && bytes > rung.scratch.room_bytes {
+        return Err(ReplayPast {
+            bound: ReplayBound::Scratch,
+            rows: bytes,
+            max: rung.scratch.room_bytes,
+        });
+    }
+    Ok(())
+}
+
+/// Whether a lane's buffered rows are one stretch its fire's rs page table
+/// names ([`scratch_compact`]): the buffered rows it replays
+/// ([`buffered_reads`] of its mask, its folded index, its first row and its
+/// lineage, as [`RsVerb::Buffer`] states them) are one run at most, ending
+/// where its own rows start, so they and the rows it lands in the buffer
+/// are one adjacent stretch of the same pages. A lane whose admitted slots
+/// are not one run (a beam's ancestry among its siblings') is not; one
+/// whose mask cannot be read is not either.
+#[must_use]
+pub fn lane_one_run(masking: Option<&Masking>, folded: u32, first: u32, lineage: Lineage) -> bool {
+    match buffered_reads(masking, folded, first, lineage) {
+        Ok(runs) => match runs.as_slice() {
+            [] => true,
+            [run] => run.end == first,
+            _ => false,
+        },
+        Err(_) => false,
+    }
+}
+
+/// A lane's replay as the runtime states it ([`Lane::replay_stated`]): the
+/// buffered rows it replays ahead of its own (its lineage's,
+/// [`buffered_reads`], a decode lane's included) and whether they are one
+/// stretch ([`lane_one_run`]), from the verb it sends.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaneReplay {
+    pub replayed: u32,
+    pub one_run: bool,
+}
+
+impl LaneReplay {
+    /// A lane of `verb` whose first row is `first`, its mask `masking`.
+    #[must_use]
+    pub fn of(verb: &RsVerb, masking: Option<&Masking>, first: u32) -> Option<LaneReplay> {
+        let RsVerb::Buffer {
+            folded, lineage, ..
+        } = verb
+        else {
+            return None;
+        };
+        let reads = buffered_reads(masking, *folded, first, *lineage).ok();
+        Some(LaneReplay {
+            replayed: reads
+                .as_ref()
+                .map_or(first.saturating_sub(*folded), |runs| {
+                    runs.iter().map(|run| run.len() as u32).sum()
+                }),
+            one_run: lane_one_run(masking, *folded, first, *lineage),
+        })
+    }
+}
+
+/// The debug cross-check at an engine's door: the fire's rows and
+/// compactness as its lanes state the runtime counted them
+/// ([`Lane::replay_stated`]) against the engine's own (`own`,
+/// `own_compact`), at the rung it stages the fire in. A disagreement in
+/// compactness, or in whether `rung` holds the fire, is a contract bug,
+/// named with both inputs. `layout_compact`, `per_fire` and `snapshots` are
+/// [`scratch_compact`]'s; `lanes` each lane's own rows and its stated replay.
+/// A fire none of whose lanes states one is not compared. Engines call it
+/// in debug builds ([`replay_check_on`]).
+pub fn replay_agrees(
+    lanes: impl IntoIterator<Item = (u32, Option<LaneReplay>)>,
+    rung: &RungReplay,
+    own: ReplayRows,
+    own_compact: bool,
+    layout_compact: bool,
+    per_fire: bool,
+    snapshots: bool,
+) -> std::result::Result<(), String> {
+    let lanes: Vec<(u32, Option<LaneReplay>)> = lanes.into_iter().collect();
+    if lanes.iter().all(|(_, stated)| stated.is_none()) {
+        return Ok(());
+    }
+    let stated: Vec<(u32, LaneReplay)> = lanes
+        .iter()
+        .map(|&(rows, stated)| (rows, stated.unwrap_or_default()))
+        .collect();
+    let compact = scratch_compact(
+        layout_compact,
+        per_fire,
+        stated.iter().all(|(_, lane)| lane.one_run),
+        snapshots,
+    );
+    let rows = ReplayRows::of_lanes(
+        stated.iter().map(|&(own, lane)| (own, lane.replayed)),
+        compact,
+    );
+    let held = rung_holds(rung, rows).is_ok();
+    let own_held = rung_holds(rung, own).is_ok();
+    // The runtime may count more than the engine lays (a mask the device
+    // resolves, a bound in place of a count): only its counting less, a
+    // fire it priced compact the engine lays wide, or one it found held
+    // the engine refuses, is the bug.
+    if (compact && !own_compact) || (held && !own_held) {
+        return Err(format!(
+            "the runtime's count of this fire's replay and the engine's disagree (a contract \
+             bug): stated {rows:?} compact {compact} (held {held}), the engine's {own:?} compact \
+             {own_compact} (held {own_held}), at {rung:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// Whether engines run [`replay_agrees`] at their door: debug builds, or
+/// `PIE_CHECK_REPLAY` set; it changes no behavior but to name a contract
+/// bug.
+#[must_use]
+pub fn replay_check_on() -> bool {
+    cfg!(debug_assertions) || std::env::var_os("PIE_CHECK_REPLAY").is_some()
+}
+
+/// Whether a fire's rs scratch is compact, laying only the carried rows a
+/// rung counts ([`lane_carried`]: a decode lane's none) rather than every
+/// lane's: the one function both the runtime (choosing the fire's rung) and
+/// the engine (checking it at submit) decide it by, from what both know. A
+/// fire is compact where the load's rs layout is (`layout_compact`,
+/// `ChunkFacts::rs_compact`), and, on a load whose compactness is a fire's
+/// (`per_fire`, `ChunkFacts::rs_scratch_per_fire`: Metal's, its rs page
+/// table read per fire), every lane's buffered rows are one stretch
+/// (`every_lane_one_run`, each lane by [`lane_one_run`]) and no lane lands
+/// an rs snapshot (`any_lane_snapshots`: a lane's `Lane::rs_snapshots`, an
+/// auto-checkpoint's included). On a load whose compactness is not a
+/// fire's (CUDA: a decoding lane's carried rows never take its scratch),
+/// the layout alone decides. No engine decides compactness otherwise.
+#[must_use]
+pub fn scratch_compact(
+    layout_compact: bool,
+    per_fire: bool,
+    every_lane_one_run: bool,
+    any_lane_snapshots: bool,
+) -> bool {
+    layout_compact && (!per_fire || (every_lane_one_run && !any_lane_snapshots))
+}
+
+
+/// The carried rows a lane of `own` rows counts toward a rung's
+/// `carried_max` ([`RungReplay`]): a
+/// decode lane's (one own row, a one-token class's) none, since its decode
+/// step replays them in the step's own kernels, a lane's buffered rows a
+/// kernel input and no rows of the fire (at most the run-ahead window of
+/// them, which the set's reservation holds); a wider lane's all of them,
+/// which it replays through the rung's replay scratch.
+#[must_use]
+pub fn lane_carried(own: u32, carried: u32) -> u32 {
+    if own == 1 { 0 } else { carried }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1269,6 +1588,48 @@ fn partition(indptr: &[u32], name: &str, bytes: usize, align: usize, strict: boo
 
 #[cfg(test)]
 mod tests {
+    /// Metal's `Seat::scratch_bytes`, as engine-metal lays a rung's rs
+    /// scratch: each slot's rows and the lanes' work term at least 4 bytes
+    /// rounded to 256, rows and lanes each at least one, the whole at least
+    /// 256.
+    fn metal_scratch_bytes(slots: &[u64], work_elems: u64, rows_ext: u32, lanes: u32) -> u64 {
+        let rows = u64::from(rows_ext.max(1));
+        let mut at = 0u64;
+        for &slot in slots {
+            at += (rows * slot).max(4).next_multiple_of(256);
+        }
+        at += (u64::from(lanes.max(1)) * work_elems * 4).max(4).next_multiple_of(256);
+        at.max(256)
+    }
+
+    #[test]
+    fn scratch_bytes_is_metals_reserve_to_the_byte() {
+        for (slots, work_elems) in [
+            (vec![2u64, 4096, 12_288, 300], 2048u64),
+            (vec![1], 0),
+            (vec![513, 3], 1),
+        ] {
+            let model = ScratchBytes {
+                slot_bytes: slots.clone(),
+                lane_bytes: work_elems * 4,
+                room_bytes: 0,
+                pad: 256,
+            };
+            for rows in [0u32, 1, 2, 7, 255, 1024, 2048] {
+                for lanes in [0u32, 1, 3, 8, 64] {
+                    assert_eq!(
+                        model.bytes(rows, lanes),
+                        metal_scratch_bytes(&slots, work_elems, rows, lanes),
+                        "slots {slots:?}, work {work_elems}, rows {rows}, lanes {lanes}"
+                    );
+                }
+            }
+        }
+        // A zero term costs one pad, not nothing.
+        let one = ScratchBytes { slot_bytes: vec![1], lane_bytes: 0, room_bytes: 0, pad: 256 };
+        assert_eq!(one.bytes(0, 0), 512);
+    }
+
     use super::*;
 
     fn mask(kept: &[bool]) -> Mask {

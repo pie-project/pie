@@ -21,6 +21,7 @@ fn fire(shell: &mut Shell, fixture: &Fixture, pages: &[u32]) -> Result<Vec<Vec<f
     let tokens: Vec<u32> = (0..page + 1).map(|at| (at * 37 + 11) % 256).collect();
     shell
         .fire_seated(&[Seated {
+            replay_stated: None,
             held: Some(0),
             refs: true,
             pages,

@@ -91,6 +91,8 @@ pub(crate) struct WindowAdvance {
 pub enum RsError {
     #[error("unknown rs working set")]
     UnknownWorkingSet,
+    #[error("a beam search's finish: {0}")]
+    BeamFinish(&'static str),
     #[error("a fire writes slot {slot}, which its state already holds (it holds {frozen})")]
     BelowFrozen { slot: u32, frozen: u32 },
     #[error("rs batch contains the same working set more than once")]
@@ -112,6 +114,16 @@ pub enum RsError {
          did not settle ({0}): how far its record is folded is not known"
     )]
     DeviceFoldFailed(String),
+    #[error(
+        "its state holds the rows below {committed}, past the cut at {cut}: a fold is not taken \
+         back"
+    )]
+    FoldedPastCut { committed: u32, cut: u32 },
+    #[error(
+        "its state buffers no row (a short conv state, which no buffered plane carries): every \
+         row folds as it is written, and a fold is not taken back"
+    )]
+    Unbuffered,
 }
 
 pub const RS_TRANSLATION_UNMAPPED: u32 = u32::MAX;
@@ -850,6 +862,14 @@ impl RsStore {
     /// and the window pools.
     pub fn is_window(&self) -> bool {
         !self.window.is_empty()
+    }
+
+    /// Rows can stand unfolded in a set: in its buffer pages, or past its
+    /// windows' committed position. A state with neither (a pool with no rs
+    /// list: Inkling's short conv state, which no buffered plane carries)
+    /// folds every row a fire writes.
+    pub fn holds_unfolded(&self) -> bool {
+        self.is_window() || self.pages.capacity() > 0
     }
 
     /// The window lists, in their order.
@@ -1855,6 +1875,10 @@ impl RsStore {
             let tail = advance.commit_end.saturating_sub(window.committed);
             window.committed = window.committed.saturating_add(fold.min(tail));
         }
+        // The committed position never passes a row the program has not
+        // accepted (the lagged fold), so a host-positioned fire retires no
+        // slot a stop's rewind still needs. A device-positioned fire commits
+        // nothing and is never taken back: it retires behind its reach.
         let reach = if advance.positioned {
             window.committed
         } else {
@@ -2176,8 +2200,22 @@ impl RsStore {
     }
 
     pub fn commit_folds(&mut self, folds: RsPendingFolds) {
+        self.commit_folds_keeping(folds, &[]);
+    }
+
+    /// [`RsStore::commit_folds`], the sets of `keep` folding their state
+    /// only: a beam group's buffer backs its pool page by page
+    /// (`BEAM-PAGE-LISTS.md` §11), whatever slots its state has folded
+    /// (§11.3), so none of it goes back while the group runs.
+    pub fn commit_folds_keeping(&mut self, folds: RsPendingFolds, keep: &[RsWorkingSetId]) {
         for RsPendingFold { ws, tokens } in folds.0 {
-            self.fold(ws, tokens);
+            if keep.contains(&ws) {
+                if let Ok(entry) = self.entry_mut(ws) {
+                    entry.frozen = entry.frozen.saturating_add(tokens);
+                }
+            } else {
+                self.fold(ws, tokens);
+            }
         }
     }
 
@@ -2301,6 +2339,46 @@ impl RsStore {
         for id in dropped {
             self.decref(id);
         }
+    }
+
+    /// Takes back `ws`'s rows from `cut` on, which only its buffer or its
+    /// windows' heads hold: the buffer pages wholly past it go back, and
+    /// each window list's slots wholly past it; the head ends at `cut`. A
+    /// slot the cut falls inside stays, its rows past the cut stray until
+    /// the next write lands over them (copying it first where shared).
+    /// Refused where the state, or the windows' committed position, holds
+    /// rows past `cut`.
+    pub fn truncate(&mut self, ws: RsWorkingSetId, cut: u32) -> Result<(), RsError> {
+        if !self.holds_unfolded() {
+            self.entry(ws)?;
+            return Err(RsError::Unbuffered);
+        }
+        let page = self.page_tokens(self.entry(ws)?);
+        let lists = self.window.clone();
+        let base = self.buffer_base(self.entry(ws)?);
+        let entry = self.entry_mut(ws)?;
+        let committed = entry.window.map_or(entry.frozen, |window| window.committed);
+        if committed > cut {
+            return Err(RsError::FoldedPastCut { committed, cut });
+        }
+        let mut dropped: Vec<RsSlotId> = Vec::new();
+        let keep = cut.saturating_sub(base).div_ceil(page) as usize;
+        if entry.buffer.len() > keep {
+            dropped.extend(entry.buffer.drain(keep..).flatten());
+        }
+        if let Some(window) = entry.window.as_mut() {
+            window.head = window.head.min(cut);
+            for (geom, table) in lists.iter().zip(entry.windows.iter_mut()) {
+                let keep = cut.div_ceil(geom.tokens.max(1)) as usize;
+                if table.len() > keep {
+                    dropped.extend(table.drain(keep..).flatten());
+                }
+            }
+        }
+        for id in dropped {
+            self.decref(id);
+        }
+        Ok(())
     }
 
     pub fn frozen(&self, ws: RsWorkingSetId) -> Result<u32, RsError> {
@@ -2790,6 +2868,54 @@ impl RsStore {
         for (list, ids) in grant.windows.into_iter().enumerate() {
             self.list_pool(list).release_reserved(ids);
         }
+    }
+
+    /// A beam search's finish on a hybrid (`BEAM-PAGE-LISTS.md` §6.6,
+    /// §11): the set's buffered rows become its chosen beam's, slot by slot.
+    /// The buffer's entry holding slot `s` (`f0 S <= s < end`) becomes the
+    /// entry that held slot `(f0 + order[s / S - f0]) S + s mod S`; entries
+    /// on the frozen pages stay; every entry no longer named is let go once
+    /// the fires that may read it retire. Nothing is copied.
+    pub fn relist_beam(
+        &mut self,
+        ws: RsWorkingSetId,
+        f0: u32,
+        page: u32,
+        order: &[u32],
+        end: u32,
+    ) -> Result<(), RsError> {
+        let epoch = self.seq;
+        let (base, tokens) = {
+            let entry = self.entry(ws)?;
+            (self.buffer_base(entry), self.page_tokens(entry))
+        };
+        let entry = self.entry_mut(ws)?;
+        let old = entry.buffer.clone();
+        let count = end.saturating_sub(base).div_ceil(tokens) as usize;
+        let mut new = Vec::with_capacity(count);
+        for e in 0..count as u32 {
+            let slot = base + e * tokens;
+            if slot < f0 * page {
+                new.push(old.get(e as usize).copied().flatten());
+                continue;
+            }
+            let column = (slot / page - f0) as usize;
+            let q = *order.get(column).ok_or(RsError::BeamFinish(
+                "the chosen beam's list is shorter than its buffered rows",
+            ))?;
+            let sigma = (f0 + q) * page + slot % page;
+            let from = ((sigma - base) / tokens) as usize;
+            new.push(old.get(from).copied().flatten());
+        }
+        let freed: Vec<RsSlotId> = old
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|id| !new.contains(&Some(*id)))
+            .collect();
+        entry.buffer = new;
+        self.recycle(freed, epoch);
+        Ok(())
     }
 
     fn entry(&self, ws: RsWorkingSetId) -> Result<&RsEntry, RsError> {

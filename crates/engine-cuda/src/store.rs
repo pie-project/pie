@@ -2411,11 +2411,18 @@ impl Pools {
     /// the bytes, each a run of `Instance` slots where the runtime lays it
     /// so, else one run of the adjacent chunks that hold the larger, which
     /// a segment must hold.
-    pub fn guest_state(&self, per_instance: u64, per_pair: u64) -> Result<engine::GuestState> {
+    pub fn guest_state(
+        &self,
+        per_instance: u64,
+        resident: u64,
+        per_pair: u64,
+    ) -> Result<engine::GuestState> {
         let layout = self.chunks.layout();
         let chunk = layout.chunk_bytes.max(1);
-        let run =
-            u32::try_from(per_instance.max(per_pair).div_ceil(chunk)).unwrap_or(u32::MAX);
+        // An instance's place holds its resident state, then its scratch:
+        // one piece, moved whole at a park.
+        let place = resident + per_instance;
+        let run = u32::try_from(place.max(per_pair).div_ceil(chunk)).unwrap_or(u32::MAX);
         if run > layout.segment_chunks {
             return Err(Fault::Ceiling {
                 what: "chunks of a segment a guest's state lies in, one run",
@@ -2424,12 +2431,10 @@ impl Pools {
             });
         }
         Ok(engine::GuestState {
-            // The instance's value scratch, dead between fires: a park gives it
-            // back and an unpark takes fresh room. Today's arms are folded into
-            // it: one arm. What a later fire reads lies in the instance's
-            // tables, which the runtime copies with the instance, so no
-            // resident part is stated apart.
-            resident: 0,
+            // What a later fire reads (a beam group's state) lies first in the
+            // instance's place, copied with it at a park; its lane's value
+            // scratch past it is dead between fires (one arm).
+            resident,
             scratch: per_instance,
             scratch_arms: 1,
             per_pair,
@@ -2678,6 +2683,47 @@ impl Pools {
                 ))
             })
             .collect()
+    }
+
+    /// Seats and backs the full-context kv pages `pages` (a lane's working
+    /// set's reserve its own page list names, `serve::pages`).
+    pub fn seat_kv_pages(&mut self, pages: &[u32]) -> Result<()> {
+        self.ensure_kv_pages(pages)
+    }
+
+    /// The address kv page `page` of list `list` starts at, seated.
+    pub fn page_base(&self, list: u8, page: u32) -> Result<u64> {
+        self.chunks.span(Kind::paged(list), page, 0, 1)
+    }
+
+    /// The planes a full-context kv page holds, as [`Self::copy_kv`] copies
+    /// them: where each lies in the page and the bytes a token holds in it.
+    #[must_use]
+    pub fn page_planes(&self) -> Vec<kernels_cuda::runtime::channel::PagePlane> {
+        let mut planes = Vec::new();
+        for shape in &self.shapes {
+            let Shape::Kv {
+                windowed: false,
+                dtype,
+                keys_width,
+                values_width,
+                values_plane,
+                offsets,
+                ..
+            } = *shape
+            else {
+                continue;
+            };
+            let element = u64::from(elem_size(dtype));
+            for (at, &offset) in offsets.iter().enumerate().take(values_plane + 1) {
+                let width = if at == 0 { keys_width } else { values_width };
+                planes.push(kernels_cuda::runtime::channel::PagePlane {
+                    offset,
+                    cell: width * element,
+                });
+            }
+        }
+        planes
     }
 
     /// Copies `moves` in the full rows and `windowed` (whole pages) in the

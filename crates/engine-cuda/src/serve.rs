@@ -17,6 +17,7 @@ pub fn export_bodies(
     measured::export(cache_dir, out)
 }
 pub use load::Staged;
+pub(crate) mod pages;
 mod prepare;
 mod segments;
 mod settle;
@@ -939,6 +940,44 @@ impl Shell {
         self.programs.finish(pending)
     }
 
+    /// Beam `beam`'s page list of instance `id`'s beam group as its last
+    /// fire left it (`BEAM-PAGE-LISTS.md` §6.6): its state's lists are kept
+    /// twice by the fire count's parity (`channel.hip`), the last fire's at
+    /// `4 + (fired mod 2) * lanes * cap` words, `cap` columns a beam. Every
+    /// fire in flight lands first.
+    pub fn beam_list(&mut self, id: engine::InstanceId, beam: u32) -> Result<Vec<u32>> {
+        let (at, layout) = self.programs.beam_state(id).ok_or_else(|| {
+            crate::error::Fault::program(
+                "serve::beam_list",
+                format!("instance {id} binds no beam group (parents)"),
+            )
+        })?;
+        if beam >= layout.lanes {
+            return Err(crate::error::Fault::program(
+                "serve::beam_list",
+                format!("beam {beam} of a group of {}", layout.lanes),
+            ));
+        }
+        self.device.synchronize()?;
+        let mut header = [0u8; 16];
+        crate::device::copy_d2h(at, &mut header)?;
+        let fired = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+        if header[0] == 0 {
+            return Err(crate::error::Fault::program(
+                "serve::beam_list",
+                format!("instance {id}'s beam group has fired no step yet"),
+            ));
+        }
+        let (lanes, cap) = (u64::from(layout.lanes), u64::from(layout.cap));
+        let row = (4 + u64::from(fired & 1) * lanes * cap + u64::from(beam) * cap) * 4;
+        let mut bytes = vec![0u8; cap as usize * 4];
+        crate::device::copy_d2h(at + row, &mut bytes)?;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+            .collect())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn bind_program(
         &mut self,
@@ -951,6 +990,26 @@ impl Shell {
         ids: &[engine::ChannelId],
         slots: crate::program::Slots,
     ) -> Result<engine::InstanceId> {
+        // A hybrid's beam group pages its beams' recurrent rows by the same
+        // lists as their kv slots, slot by slot (`BEAM-PAGE-LISTS.md` §11):
+        // the rs page's rows must divide the kv page's. A load whose recipe
+        // does not says so at the bind, before any beam fires.
+        if device.contains(eta_ir::registry::Port::Parents)
+            && let Some(buffers) = self.buffers.as_ref()
+        {
+            let (tokens, page) = (buffers.page_tokens().max(1), self.pools.paging().page_size);
+            if page % tokens != 0 {
+                return Err(crate::error::Fault::program(
+                    "serve::bind",
+                    format!(
+                        "a beam group (parents) on this hybrid pages its beams' recurrent rows \
+                         by their kv page lists, and the load's recipe pages them {tokens} rows a \
+                         page against kv pages of {page}: the rs page's rows must divide the kv \
+                         page's (BEAM-PAGE-LISTS.md §11)"
+                    ),
+                ));
+            }
+        }
         let stream = self.device.stream();
         let buffers_rs = self.buffers.is_some();
         let pools = &self.pools;
@@ -985,8 +1044,8 @@ impl Shell {
         program: engine::ProgramId,
         extents: eta_exec::Extents,
     ) -> Result<engine::GuestState> {
-        let (per_instance, per_pair) = self.programs.state_bytes(program, extents)?;
-        self.pools.guest_state(per_instance, per_pair)
+        let (per_instance, resident, per_pair) = self.programs.state_bytes(program, extents)?;
+        self.pools.guest_state(per_instance, resident, per_pair)
     }
 
     /// What an instance of `program` keeps in the pool's `Instance` and
@@ -1378,6 +1437,8 @@ struct RsFire<'a> {
     truncates: bool,
     /// How its lanes treat their recurrent rows.
     body: record::RsBody,
+    /// Whether its beam groups fold their sets (§11.3): it stages a fold.
+    group_folds: bool,
     rows_ext: u32,
     snapshots: crate::store::rs::SnapTable,
 }
@@ -1452,6 +1513,10 @@ pub struct Prepared<'a> {
     lengths: crate::inputs::Staged,
     token_injects: Vec<crate::inputs::TokenInject>,
     mask_injects: Vec<crate::inputs::MaskInject>,
+    /// What the fire's pages-bound lanes have the device resolve and copy.
+    page_work: pages::PageWork,
+    /// Where the staged fire's page-list fault words lie, read at settle.
+    page_faults: Option<u64>,
     kv_reports: Vec<KvReport>,
     bodied: bool,
     /// Why not, in a load that records bodies: the key and the reason.

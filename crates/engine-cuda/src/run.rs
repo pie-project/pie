@@ -346,7 +346,13 @@ pub struct RsSeat<'a> {
     pub buffers: &'a crate::store::rs::Buffers,
     pub tables: kernels_cuda::runtime::channel::RsTables,
     pub extended: bool,
+    /// Whether its decode steps split their carried rows over the spare
+    /// blocks (`record::RsBody::Splits`).
+    pub splits: bool,
     pub scratch: Option<&'a RsScratch>,
+    /// The beam groups' fold table and its entries, where the fire stages
+    /// folds (§11.3): every recurrent layer folds them ahead of the body.
+    pub folds: Option<(u64, u32)>,
 }
 
 /// A recurrent pool as a one-token arm reads it: a lane of one row folds it
@@ -1061,6 +1067,12 @@ impl<'c> Run<'c> {
         )
     }
 
+    /// Whether this fire buffers recurrent rows (its lanes carry rows past
+    /// their states).
+    pub(crate) fn rs_buffering(&self) -> bool {
+        self.rs.is_some()
+    }
+
     /// Whether the fire's recurrences run over extended rows: a lane of it
     /// replays buffered rows. One answer a fire, so a body keyed by it
     /// replays the kernels it recorded.
@@ -1316,6 +1328,123 @@ impl<'c> Run<'c> {
         if let Some(scratch) = self.rs.as_ref().and_then(|seat| seat.scratch) {
             scratch.layer_done(self.window().span().lane_offset);
         }
+    }
+
+    /// Whether `id` is a buffered plane of this buffering fire: a decode
+    /// step reading it carries each lane's buffered rows ahead of its own
+    /// and lands its own row in the buffer itself.
+    pub(crate) fn rs_buffered(&self, id: ValueId) -> bool {
+        self.rs
+            .as_ref()
+            .is_some_and(|seat| seat.buffers.planes().of(id).is_some())
+    }
+
+    /// Whether `gates` is a decode step's gate prep output in a buffering
+    /// fire, whose `[b | a]` its recurrence lands.
+    pub(crate) fn rs_step_gates(&self, gates: ValueId) -> bool {
+        self.rs
+                .as_ref()
+                .is_some_and(|seat| seat.buffers.planes().step_gates(gates).is_some())
+    }
+
+    /// Value `id`'s buffered plane.
+    pub(crate) fn rs_plane(
+        &self,
+        op: &'static str,
+        id: ValueId,
+    ) -> Result<crate::store::rs::Plane, kernels_cuda::Error> {
+        self.rs
+            .as_ref()
+            .and_then(|seat| seat.buffers.planes().of(id))
+            .ok_or_else(|| kernels_cuda::Error::Backend {
+                op,
+                detail: format!(
+                    "value {} is no plane this load buffers, so a lane's carried rows have \
+                     nowhere to be read from",
+                    id.0
+                ),
+            })
+    }
+
+    /// The window's qo boundaries as its recurrent kernels read them.
+    pub(crate) fn rs_qo_indptr(&self) -> Tensor {
+        self.rs_indptr().0
+    }
+
+    /// This load's buffered planes, where the fire buffers.
+    pub(crate) fn rs_planes(&self) -> Option<&'c crate::store::rs::Planes> {
+        self.rs.as_ref().map(|seat| seat.buffers.planes())
+    }
+
+    /// The carried rows a decode step of this window reads: the staged
+    /// tables, the commit lengths of `pool` and the places of the step's
+    /// buffered `planes` (in the order its kernel reads them).
+    /// The beam groups' folds a recurrent layer runs before its step
+    /// (`BEAM-PAGE-LISTS.md` §11.3): a carry over the fire's whole lane table
+    /// (a fold names its representative by its fire lane) placing `planes`,
+    /// the fold table, and its entries. `None`: the fire's body folds none.
+    pub(crate) fn rs_group_folds(
+        &self,
+        op: &'static str,
+        planes: &[crate::store::rs::Plane],
+    ) -> Result<Option<(kernels_cuda::ssm::Carry, Tensor, u32)>, kernels_cuda::Error> {
+        let Some(seat) = self.rs.as_ref() else {
+            return Ok(None);
+        };
+        let Some((folds, entries)) = seat.folds else {
+            return Ok(None);
+        };
+        let tables = seat.tables;
+        let mut carry = kernels_cuda::ssm::Carry {
+            lanes: tables.lanes,
+            pages: tables.pages,
+            lane_rows: tables.lane_rows,
+            replay_spans: tables.replay_spans,
+            page_tokens: tables.page_tokens.max(1),
+            ..kernels_cuda::ssm::Carry::NONE
+        };
+        for (at, &plane) in planes.iter().enumerate() {
+            let place = seat
+                .buffers
+                .place(plane)
+                .map_err(|fault| Self::rs_fault(op, fault))?;
+            carry.plane_off[at] = place.off;
+            carry.plane_stride[at] = place.stride;
+        }
+        let table = Tensor::new(folds, entries, 3, poem_ir::Dtype::U32);
+        Ok(Some((carry, table, entries)))
+    }
+
+    pub(crate) fn rs_carry(
+        &self,
+        op: &'static str,
+        planes: &[crate::store::rs::Plane],
+        pool: &RecurrentPool,
+    ) -> Result<kernels_cuda::ssm::Carry, kernels_cuda::Error> {
+        let Some(seat) = self.rs.as_ref() else {
+            return Ok(kernels_cuda::ssm::Carry::NONE);
+        };
+        let tables = self.rs_tables(seat);
+        let mut carry = kernels_cuda::ssm::Carry {
+            lanes: tables.lanes,
+            pages: tables.pages,
+            lane_rows: tables.lane_rows,
+            replay_spans: tables.replay_spans,
+            commit_len: pool.commit_len.ptr,
+            page_tokens: tables.page_tokens.max(1),
+            #[cfg(not(feature = "rocm"))]
+            split: if seat.splits { seat.buffers.split_room() } else { 0 },
+            ..kernels_cuda::ssm::Carry::NONE
+        };
+        for (at, &plane) in planes.iter().enumerate() {
+            let place = seat
+                .buffers
+                .place(plane)
+                .map_err(|fault| Self::rs_fault(op, fault))?;
+            carry.plane_off[at] = place.off;
+            carry.plane_stride[at] = place.stride;
+        }
+        Ok(carry)
     }
 
     pub(crate) fn values(&self) -> &'c [ValueDecl] {

@@ -1511,6 +1511,7 @@ impl CheckLoad<'_> {
         let held = fire.keys_per_lane.saturating_sub(fire.tokens_per_lane);
         let lanes: Vec<crate::Seated<'_>> = (0..fire.lanes)
             .map(|slot| crate::Seated {
+                replay_stated: None,
                 held: Some(held),
                 ..crate::Seated::of(crate::Lane {
                     slot,

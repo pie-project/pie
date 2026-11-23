@@ -53,7 +53,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ::engine::chunk::{
@@ -85,7 +85,7 @@ const STEP: std::time::Duration = std::time::Duration::from_millis(20);
 const MOST_PAGES: u64 = 512;
 
 /// splitmix64: a seeded stream, so a seed replays its workload.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Rng(u64);
 
 impl Rng {
@@ -141,6 +141,13 @@ struct PoolShape {
     /// ([`crate::store::shared::SharedGrow`]) moving it. Else it is whole
     /// from its load.
     governed: bool,
+    /// The activation span backed on demand, the pool growing from both
+    /// ends (`Growth::TwoEnded`, Metal's): a lowered rung lends span
+    /// segments to state, backed by the walk before any chunk there opens,
+    /// and a raise takes them back.
+    span_on_demand: bool,
+    /// `(rung tokens, activation chunks)`, ascending: the engine's rungs.
+    act: Vec<(u32, u32)>,
 }
 
 impl PoolShape {
@@ -187,11 +194,23 @@ impl PoolShape {
             disk_chunks,
             programs,
             governed: false,
+            span_on_demand: false,
+            act: vec![(16, 1), (256, 2)],
         }
     }
 
     fn segments(&self) -> u32 {
         self.total.div_ceil(self.segment)
+    }
+
+    /// The largest rung's activation chunks.
+    fn act_max(&self) -> u32 {
+        self.act.last().map_or(0, |&(_, chunks)| chunks)
+    }
+
+    /// The segment the largest rung's activation starts in.
+    fn top_segment(&self) -> u32 {
+        (self.total - self.act_max()) / self.segment
     }
 
     /// What one process may hold at most, in kv pages: half the state
@@ -205,7 +224,7 @@ impl PoolShape {
 
     /// State chunks: the total less the reserved chunk and the activation.
     fn state_chunks(&self) -> u32 {
-        self.total - 1 - 2
+        self.total - 1 - self.act_max()
     }
 
     fn facts(&self) -> ChunkFacts {
@@ -225,12 +244,18 @@ impl PoolShape {
             total_chunks: self.total,
             segment_chunks: self.segment,
             segments: SegmentFacts {
-                committed: segments,
-                max: segments,
-                growth: if self.governed {
-                    Growth::Bottom
+                // A two-ended pool's load backs the bottom alone: the span
+                // under the largest rung's activation is backed on demand.
+                committed: if self.governed && self.span_on_demand {
+                    self.top_segment()
                 } else {
-                    Growth::Fixed
+                    segments
+                },
+                max: segments,
+                growth: match (self.governed, self.span_on_demand) {
+                    (true, true) => Growth::TwoEnded,
+                    (true, false) => Growth::Bottom,
+                    _ => Growth::Fixed,
                 },
             },
             reserved: vec![ReservedRun {
@@ -252,9 +277,14 @@ impl PoolShape {
                 shape(1, SlotKind::Fixed { pieces: 1 }, SLOT, SlotRole::Instance),
                 shape(2, SlotKind::Fixed { pieces: 1 }, 1 << 10, SlotRole::Channel),
             ],
-            act_chunks: vec![(16, 1), (256, 2)],
+            act_chunks: self.act.clone(),
+            // Metal states its span from the segment the largest rung's
+            // carve starts in (`Layout::facts`).
+            act_span_chunks: (self.governed && self.span_on_demand)
+                .then(|| self.total - self.top_segment() * self.segment),
             host_chunks: self.host_chunks,
             disk_chunks: self.disk_chunks,
+            span_backed_on_demand: self.governed && self.span_on_demand,
             ..ChunkFacts::default()
         };
         facts.validate().unwrap();
@@ -323,6 +353,12 @@ fn pattern(tag: u64, of: u64, at: u64) -> u64 {
 /// alike; the disk tier's slot file is laid out as the device), so a slot
 /// lies at a byte range of its chunk, whatever shape wrote it. A write
 /// clears what it overlaps; a copy of a slot no one wrote writes garbage.
+/// The device's bytes lie at physical chunks: a slot ref (a logical
+/// chunk's) is resolved through the chunk table when it is read or
+/// written, a copy's when it is submitted ([`Resolved`]), and a move of
+/// chunks (an evacuation, a compaction) carries their bytes when the
+/// engine takes it. A copy landing after its chunks moved, or a read at
+/// a resolution taken before, finds another chunk's bytes.
 #[derive(Default)]
 struct Bytes {
     at: BTreeMap<(u8, u32, u64), (u64, u64)>,
@@ -359,6 +395,7 @@ impl Bytes {
             self.to_logical = (0..total).collect();
         }
         for step in moves {
+            self.swap_chunks(step.from, step.to);
             let displaced = self.to_logical[step.to as usize];
             self.to_physical[step.logical as usize] = step.to;
             self.to_physical[displaced as usize] = step.from;
@@ -394,7 +431,42 @@ impl Bytes {
         (slot / spc, u64::from(slot % spc) * bytes, bytes)
     }
 
-    fn clear(&mut self, tier: u8, chunk: u32, off: u64, len: u64) {
+    /// Where slot `slot` of `shape` lies on `tier` now: the device's
+    /// through its chunk table.
+    fn key(&self, tier: u8, shape: u32, slot: u32) -> (u32, u64, u64) {
+        let (chunk, off, len) = Self::place(shape, slot);
+        if tier == TIER_DEVICE {
+            (self.physical(chunk), off, len)
+        } else {
+            (chunk, off, len)
+        }
+    }
+
+    /// The engine's copy of a moved chunk: physical chunks `a` and `b`
+    /// trade their bytes (the free one's are no one's).
+    fn swap_chunks(&mut self, a: u32, b: u32) {
+        if a == b {
+            return;
+        }
+        let take = |at: &mut BTreeMap<(u8, u32, u64), (u64, u64)>, chunk: u32| {
+            let keys: Vec<_> = at
+                .range((TIER_DEVICE, chunk, 0)..(TIER_DEVICE, chunk + 1, 0))
+                .map(|(key, _)| *key)
+                .collect();
+            keys.into_iter()
+                .map(|key| (key.2, at.remove(&key).expect("present")))
+                .collect::<Vec<_>>()
+        };
+        let (from_a, from_b) = (take(&mut self.at, a), take(&mut self.at, b));
+        for (off, value) in from_a {
+            self.at.insert((TIER_DEVICE, b, off), value);
+        }
+        for (off, value) in from_b {
+            self.at.insert((TIER_DEVICE, a, off), value);
+        }
+    }
+
+    fn clear_at(&mut self, tier: u8, (chunk, off, len): (u32, u64, u64)) {
         let from = (tier, chunk, off.saturating_sub(PAGE));
         let to = (tier, chunk, off + len);
         let overlapped: Vec<_> = self
@@ -408,18 +480,56 @@ impl Bytes {
         }
     }
 
-    fn write(&mut self, tier: u8, shape: u32, slot: u32, value: u64) {
-        let (chunk, off, len) = Self::place(shape, slot);
-        self.clear(tier, chunk, off, len);
+    fn write_at(&mut self, tier: u8, (chunk, off, len): (u32, u64, u64), value: u64) {
+        self.clear_at(tier, (chunk, off, len));
         self.at.insert((tier, chunk, off), (len, value));
     }
 
-    fn read(&self, tier: u8, shape: u32, slot: u32) -> Option<u64> {
-        let (chunk, off, len) = Self::place(shape, slot);
+    fn read_at(&self, tier: u8, (chunk, off, len): (u32, u64, u64)) -> Option<u64> {
         self.at
             .get(&(tier, chunk, off))
             .filter(|(bytes, _)| *bytes == len)
             .map(|(_, value)| *value)
+    }
+
+    /// `copy`'s places as the engine encodes it now: each source and
+    /// destination slot through the chunk table as it stands at submit.
+    fn resolve(&self, copy: &::engine::chunk::SlotCopy) -> Resolved {
+        let (src, dst) = (Self::tier(copy.src), Self::tier(copy.dst));
+        Resolved {
+            src,
+            dst,
+            slots: copy
+                .slots
+                .iter()
+                .map(|&(from, to)| (self.key(src, copy.shape.0, from), self.key(dst, copy.shape.0, to)))
+                .collect(),
+        }
+    }
+
+    /// A copy landing at the places it was encoded at.
+    fn land(&mut self, copy: &Resolved) {
+        for &(from, to) in &copy.slots {
+            match self.read_at(copy.src, from) {
+                Some(value) => self.write_at(copy.dst, to, value),
+                None => self.clear_at(copy.dst, to),
+            }
+        }
+    }
+
+    /// A copy failing: what it wrote is garbage.
+    fn garbage(&mut self, copy: &Resolved) {
+        for &(_, to) in &copy.slots {
+            self.write_at(copy.dst, to, 0xdead_beef);
+        }
+    }
+
+    fn write(&mut self, tier: u8, shape: u32, slot: u32, value: u64) {
+        self.write_at(tier, self.key(tier, shape, slot), value);
+    }
+
+    fn read(&self, tier: u8, shape: u32, slot: u32) -> Option<u64> {
+        self.read_at(tier, self.key(tier, shape, slot))
     }
 
     fn tier(domain: ::engine::MemoryDomain) -> u8 {
@@ -430,33 +540,176 @@ impl Bytes {
         }
     }
 
-    /// A copy landing: each source slot's bytes to its destination slot.
-    fn copy(&mut self, copy: &::engine::chunk::SlotCopy) {
-        let (src, dst) = (Self::tier(copy.src), Self::tier(copy.dst));
-        for &(from, to) in &copy.slots {
-            match self.read(src, copy.shape.0, from) {
-                Some(value) => self.write(dst, copy.shape.0, to, value),
-                None => {
-                    let (chunk, off, len) = Self::place(copy.shape.0, to);
-                    self.clear(dst, chunk, off, len);
+}
+
+/// The engine's own view of its state pool, as the pool ops it applied
+/// left it (Metal's two-ended pool): the bottom segments committed, and the
+/// span segments backed from the top. A physical chunk holds state only
+/// below the bottom's end (never past the span's first chunk) or in a
+/// backed span segment; a fire or a move naming any other is refused as an
+/// impossible submission (the M1 at beamx40: "this fire wants 357
+/// committed chunks of the state pool and the load reserved 350").
+#[derive(Debug)]
+struct EngineView {
+    total: u32,
+    segment: u32,
+    /// The span's first chunk: the segment the largest rung's activation
+    /// starts in.
+    top_first: u32,
+    bottom: u32,
+    span: u32,
+    /// A span backing refused one time in this many (the system refusing
+    /// a heap): the runtime takes it as a refused lend.
+    refuse_span: Option<u64>,
+    rng: Rng,
+    /// Moves the engine refused as impossible: a planner bug, each said.
+    faults: Vec<String>,
+    /// The engine's own logical-to-physical table, as the evacuations it
+    /// took left it: what a fire's refs resolve through.
+    table: ::engine::chunk::ChunkTable,
+}
+
+impl EngineView {
+    fn segments(&self) -> u32 {
+        self.total.div_ceil(self.segment)
+    }
+
+    /// Whether physical chunk `physical` lies in memory the engine backs
+    /// for state.
+    fn admits(&self, physical: u32) -> bool {
+        let bottom_end = self.bottom.saturating_mul(self.segment).min(self.top_first);
+        let segment = physical / self.segment;
+        physical < self.total
+            && (physical < bottom_end
+                || (physical >= self.top_first
+                    && segment >= self.segments() - self.span.min(self.segments())))
+    }
+
+    /// Held chunks `(logical, physical)` as the pool counts them that the
+    /// engine resolves elsewhere, or to memory it does not back for state:
+    /// a fire on them reads or writes what the runtime does not hold there.
+    fn strays(&self, held: &[(u32, u32)]) -> Vec<(u32, u32, Option<u32>)> {
+        held.iter()
+            .filter_map(|&(logical, physical)| {
+                let engine = self.table.physical(logical);
+                (engine != Some(physical) || !self.admits(physical)).then_some((logical, physical, engine))
+            })
+            .collect()
+    }
+
+    /// Applies `op` as the engine does, or refuses it.
+    fn apply(&mut self, op: &crate::scheduler::worker::PoolOp) -> Result<(), String> {
+        use crate::scheduler::worker::PoolOp;
+        match *op {
+            PoolOp::CommitSegments(n) | PoolOp::ReleaseSegments(n) => self.bottom = n,
+            PoolOp::CommitSpan(n) => {
+                if self.refuse_span.is_some_and(|den| self.rng.chance(1, den)) {
+                    return Err("the system refused the span's heap (simulated)".to_string());
+                }
+                self.span = self.span.max(n);
+            }
+            PoolOp::ReleaseSpan(n) => self.span = self.span.min(n),
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+/// The first slot a holder outside the pool names that the pool does not
+/// count held, said with its holder.
+fn stray_holders(ctx: &Ctx, shared: &Arc<Mutex<crate::store::shared::SharedPool>>) -> Option<String> {
+    let mut named: Vec<(String, crate::store::slots::Slot)> = Vec::new();
+    with_kv_lock(&ctx.stores.kv, "sim-holders", |kv| {
+        named.extend(kv.device_page_slots().into_iter().map(|slot| ("a kv page".to_string(), slot)));
+    });
+    if let Some(roles) = &ctx.stores.roles {
+        named.extend(roles.lock().unwrap().device_slots_named());
+    }
+    {
+        let engine = ctx.engine.lock().unwrap();
+        let bytes = ctx.bytes.lock().unwrap();
+        let shared = shared.lock().unwrap();
+        for (&id, places) in &engine.instances {
+            let parked = engine.parked.get(&id).copied();
+            if parked == Some(false) {
+                continue;
+            }
+            let (Some(instance), Some(channel)) = (
+                shared.pool_shape(ShapeId(INSTANCE)),
+                shared.pool_shape(ShapeId(CHANNEL)),
+            ) else {
+                continue;
+            };
+            for &slot in &places.instance {
+                named.push((format!("instance {id}'s tables"), shared.slot(instance, slot)));
+            }
+            for ring in &places.rings {
+                for &slot in &ring.slots {
+                    named.push((format!("instance {id}'s ring"), shared.slot(channel, slot)));
+                }
+            }
+            if parked.is_none() {
+                for slot in place_slots(&places.scratch, &bytes) {
+                    named.push((format!("instance {id}'s scratch"), shared.slot(instance, slot)));
+                }
+                for slot in place_slots(&places.pair, &bytes) {
+                    named.push((
+                        format!("instance {id}'s pair (program {})", places.program),
+                        shared.slot(instance, slot),
+                    ));
                 }
             }
         }
     }
+    let shared = shared.lock().unwrap();
+    let pool = shared.pool();
+    named.into_iter().find_map(|(holder, slot)| {
+        (pool.refs(slot) == (0, 0)).then(|| {
+            format!(
+                "{holder} names {slot:?} (physical {:?}), which the pool counts free",
+                pool.physical(slot.chunk)
+            )
+        })
+    })
+}
+
+/// The shared pool's invariants ([`crate::store::slots::SlotPool::check`]),
+/// a broken one said rather than panicking the run.
+fn pool_check(shared: &Arc<Mutex<crate::store::shared::SharedPool>>) -> Option<String> {
+    let shared = shared.lock().unwrap();
+    let pool = shared.pool();
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pool.check()))
+        .err()
+        .map(|panic| {
+            panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                .unwrap_or_default()
+        })
+}
+
+/// A copy as the engine encoded it: each `(source, destination)` slot's
+/// place on its tier, the device's physical.
+#[derive(Debug)]
+struct Resolved {
+    src: u8,
+    dst: u8,
+    slots: Vec<((u32, u64, u64), (u32, u64, u64))>,
 }
 
 /// A copy landing moves its slots' bytes. Its sources keep theirs: a move
 /// taken back after some of its copies landed (the tier below full for the
 /// next) leaves its process reading them where they lie, and slots a
 /// committed move gave back are rewritten by whoever takes them next.
-fn land_bytes(bytes: &Mutex<Bytes>, copy: &::engine::chunk::SlotCopy) {
+fn land_bytes(bytes: &Mutex<Bytes>, copy: &::engine::chunk::SlotCopy, resolved: &Resolved) {
     trace(|| {
         format!(
-            "copy {:?} {:?}->{:?} {:?}",
-            copy.shape, copy.src, copy.dst, copy.slots
+            "copy {:?} {:?}->{:?} {:?} at {:?}",
+            copy.shape, copy.src, copy.dst, copy.slots, resolved.slots
         )
     });
-    bytes.lock().unwrap().copy(copy);
+    bytes.lock().unwrap().land(resolved);
 }
 
 /// `PIE_SIM_TRACE`: every copy landed, bind and rebind said, to diff two
@@ -913,6 +1166,17 @@ struct Script {
     /// binds this program in their place, as a beam's verifier opens a
     /// rescore's pipeline of a second program once the first is closed.
     rescore: Option<(u32, u32)>,
+    /// Before this decode fire its frame is cut wider than the activation
+    /// rung's cap: it owes the walk a raise to the widest rung, its owner,
+    /// and fires only once the cap lifts to it (the scheduler's frame held
+    /// out under the cap, `crate::store::shared::owe_cut_rows`). The raise
+    /// moves state out of the wider span, parked state kept in place
+    /// among it, while its owner and the rest park and come back.
+    raise: Option<u32>,
+    /// A verifier's rescore per hypothesis, every `.1` steps: an instance
+    /// of program `.0` bound beside the beam group's (its pair shared),
+    /// fired once and closed (the M1's beam w17 verify groups).
+    verify: Option<(u32, u32)>,
 }
 
 impl Script {
@@ -959,6 +1223,10 @@ impl Workload {
         if std::env::var_os("PIE_SIM_FIELD").is_some() {
             return Self::field(seed);
         }
+        // `PIE_SIM_METAL`: the M1's pool, scaled ([`Self::metal`]).
+        if std::env::var_os("PIE_SIM_METAL").is_some() {
+            return Self::metal(seed);
+        }
         let mut rng = Rng(seed);
         let pool = PoolShape::of(&mut rng);
         let state = pool.state_chunks();
@@ -982,6 +1250,8 @@ impl Workload {
                 bind: Vec::new(),
                 idle: None,
                 rescore: None,
+                raise: None,
+                verify: None,
             };
             match kind {
                 // A plain decode: a short prompt, long growth.
@@ -1056,6 +1326,8 @@ impl Workload {
                     bind: Vec::new(),
                     idle: None,
                     rescore: None,
+                    raise: None,
+                    verify: None,
                 };
                 while script.pages() > most && script.decode > 0 {
                     script.decode -= 1;
@@ -1079,6 +1351,8 @@ impl Workload {
         let segments = pool.segments();
         if segments >= 3 && governor_rng.chance(1, 3) {
             pool.governed = true;
+            // Drawn from a stream of its own: Metal's two-ended pool.
+            pool.span_on_demand = Rng(seed ^ 0x5ba_e2d0).chance(1, 2);
             let mut from = governor_rng.range(0, horizon + 4);
             for _ in 0..governor_rng.range(1, 3) {
                 let to = from + governor_rng.range(2, 24);
@@ -1129,21 +1403,36 @@ impl Workload {
         let most = pool.most_pages();
         let horizon = rng.range(4, 30);
         let beam_programs: Vec<u32> = (0..pool.programs.len() as u32).collect();
+        // The beam pool's fire is bound after the prompt beside the
+        // prefill's, both open in one pipeline until the search ends (the
+        // beam-search inferlet): a bind short of room with guest state of
+        // its own suspends its process. Drawn from a stream of its own, so
+        // every other draw of a seed stands as it was.
+        let mut pool_rng = Rng(seed ^ 0xbea_9001);
+        // A beam's frame cut wider than the rung's cap, its raise owed:
+        // drawn from a stream of its own too.
+        let mut raise_rng = Rng(seed ^ 0x2a15_e0ed);
         let mut scripts = Vec::new();
         for _ in 0..rng.range(2, 6) {
             let decode = rng.range(4, 16);
+            let beam_pool = beam_programs[pool_rng.below(beam_programs.len() as u64) as usize];
             let mut script = Script {
                 at: rng.range(0, horizon),
                 prompt: rng.range(4, 16),
                 decode,
                 grow_every: rng.range(1, 2),
                 beams: 4,
-                bind: vec![(1.min(beam_programs.len() as u32 - 1), false)],
+                bind: vec![
+                    (1.min(beam_programs.len() as u32 - 1), false),
+                    (beam_pool, true),
+                ],
                 idle: None,
                 rescore: Some((
                     rng.range(0, decode - 1),
                     beam_programs[rng.below(beam_programs.len() as u64) as usize],
                 )),
+                raise: raise_rng.chance(1, 2).then(|| raise_rng.range(0, decode - 1)),
+                verify: None,
             };
             while script.pages() > most && script.decode > 1 {
                 script.decode -= 1;
@@ -1157,6 +1446,7 @@ impl Workload {
             if let Some((when, program)) = script.rescore {
                 script.rescore = Some((when.min(script.decode.saturating_sub(1)), program));
             }
+            script.raise = script.raise.map(|when| when.min(script.decode.saturating_sub(1)));
             scripts.push(script);
         }
         for _ in 0..rng.range(12, 40) {
@@ -1169,11 +1459,32 @@ impl Workload {
                 bind: Vec::new(),
                 idle: None,
                 rescore: None,
+                raise: None,
+                verify: None,
             };
             while script.pages() > most && script.decode > 0 {
                 script.decode -= 1;
             }
             scripts.push(script);
+        }
+        // Wide: many beam searches at once beside the decodes (the M1's
+        // beamx40, 80 verified beam-4 searches), drawn from a stream of its
+        // own so every other draw of a seed stands as it was.
+        let mut wide_rng = Rng(seed ^ 0x80_81de);
+        if wide_rng.chance(1, 4) {
+            let template = scripts[0].clone();
+            for _ in 0..wide_rng.range(40, 80) {
+                let mut script = template.clone();
+                script.at = wide_rng.range(0, horizon);
+                if let Some((_, program)) = script.rescore {
+                    script.rescore =
+                        Some((wide_rng.range(0, script.decode.saturating_sub(1)), program));
+                }
+                script.raise = raise_rng
+                    .chance(1, 2)
+                    .then(|| raise_rng.range(0, script.decode.saturating_sub(1)));
+                scripts.push(script);
+            }
         }
         let late = [0, 4][rng.below(2) as usize];
         // The device's room shrinks under the mix and comes back: its
@@ -1182,6 +1493,7 @@ impl Workload {
         let segments = pool.segments();
         if segments >= 3 && rng.chance(1, 2) {
             pool.governed = true;
+            pool.span_on_demand = Rng(seed ^ 0x5ba_e2d0).chance(1, 2);
             let mut from = rng.range(0, horizon + 4);
             for _ in 0..rng.range(1, 3) {
                 let to = from + rng.range(2, 24);
@@ -1199,6 +1511,100 @@ impl Workload {
             ring: None,
             landing_fails: None,
         }
+    }
+
+    /// The M1's pool at 16 beam w17 searches beside 16 greedy decodes
+    /// (Qwen3-0.6B), scaled down tenfold: 14 bottom segments of 3 chunks
+    /// and a span of 4 (a partial last segment), Metal's two-ended pool
+    /// with its span backed on demand, rungs of 1, 3 and 4 chunks (the
+    /// M1's 7, 34 and 40), the governor's target under what is held. The
+    /// field mix's scripts, beams widened toward 17 where they fit.
+    fn metal(seed: u64) -> Self {
+        let mut workload = Self::field_mix(seed, Rng(seed ^ 0x3e7a_1001));
+        let mut rng = Rng(seed ^ 0x3e7a_1002);
+        let pool = &mut workload.pool;
+        pool.total = 46;
+        pool.segment = 3;
+        pool.act = vec![(16, 1), (64, 3), (128, 4)];
+        pool.governed = true;
+        pool.span_on_demand = true;
+        pool.disk_chunks = rng.range(24, 96);
+        // A guest run of a whole segment beside the field's.
+        if !pool.programs.iter().any(|program| program.run == 3) {
+            pool.programs.push(Program {
+                run: 3,
+                scratch: 3 * MIB,
+                resident: 0,
+                per_pair: 3 * MIB,
+            });
+        }
+        let programs = pool.programs.len() as u32;
+        let most = pool.most_pages();
+        // Sixteen beam searches and sixteen greedy decodes, arriving at
+        // once (the M1's load), each beam's pool one of every program.
+        let beams: Vec<Script> = workload.scripts.iter().filter(|s| s.beams > 1).cloned().collect();
+        let greedy: Vec<Script> = workload.scripts.iter().filter(|s| s.beams == 1).cloned().collect();
+        let mut scripts = Vec::new();
+        for k in 0..16 {
+            if let Some(template) = beams.get(k % beams.len().max(1)) {
+                let mut script = template.clone();
+                script.at = rng.range(0, 4);
+                if let Some(slot) = script.bind.last_mut() {
+                    slot.0 = rng.below(u64::from(programs)) as u32;
+                    if let Some(verify) = &mut script.verify {
+                        verify.0 = slot.0;
+                    }
+                }
+                scripts.push(script);
+            }
+            if let Some(template) = greedy.get(k % greedy.len().max(1)) {
+                let mut script = template.clone();
+                script.at = rng.range(0, 4);
+                scripts.push(script);
+            }
+        }
+        workload.scripts = scripts;
+        let segments = pool.segments();
+        // Small disks for some: a park finding no room below keeps its
+        // tables and rings in place on the device.
+        if rng.chance(1, 2) {
+            pool.disk_chunks = rng.range(6, 16);
+        }
+        for script in &mut workload.scripts {
+            if script.beams > 1 {
+                script.beams = 17;
+                // Its verifier: the beam pool's program, a hypothesis
+                // rescored every step or few.
+                let beam_pool = script.bind.last().map_or(0, |&(program, _)| program);
+                script.verify = Some((beam_pool, rng.range(1, 3)));
+            }
+            while script.pages() > most && script.beams > 2 {
+                script.beams -= 1;
+            }
+            while script.pages() > most && script.decode > 1 {
+                script.decode -= 1;
+            }
+            while script.pages() > most && script.prompt > 1 {
+                script.prompt -= 1;
+            }
+            if let Some((when, program)) = script.rescore {
+                script.rescore = Some((when.min(script.decode.saturating_sub(1)), program));
+            }
+            script.raise = script.raise.map(|when| when.min(script.decode.saturating_sub(1)));
+        }
+        // The governor's shrink and regrow under live state (the M1's
+        // target toggling 12 and 11 segments every few seconds): short
+        // windows a segment or two under the pool, close together.
+        workload.target = Vec::new();
+        let mut from = rng.range(0, 8);
+        for _ in 0..rng.range(4, 14) {
+            let to = from + rng.range(2, 8);
+            workload
+                .target
+                .push((from, to, rng.range(segments - 4, segments - 1)));
+            from = to + rng.range(1, 5);
+        }
+        workload
     }
 
     /// The governor's target at `step`, in segments.
@@ -1265,8 +1671,14 @@ struct Coverage {
     /// arrival of that head between ([`Progress::moved`]): 0 where the
     /// progress rule holds.
     over_bound: u64,
-    /// The most any process was suspended for its own binds' room.
+    /// The most suspensions one bind took for its own room.
     most_suspended: u64,
+    /// Frames held out for a raise, the raises the walk told the engine,
+    /// and its evacuations (a raise's and the segment walk's).
+    raises_owed: u64,
+    rung_raises: u64,
+    rung_lowers: u64,
+    evacuations: u64,
 }
 
 impl Coverage {
@@ -1302,6 +1714,10 @@ impl Coverage {
         self.live_steps += other.live_steps;
         self.over_bound += other.over_bound;
         self.most_suspended = self.most_suspended.max(other.most_suspended);
+        self.raises_owed += other.raises_owed;
+        self.rung_raises += other.rung_raises;
+        self.rung_lowers += other.rung_lowers;
+        self.evacuations += other.evacuations;
     }
 }
 
@@ -1461,6 +1877,10 @@ struct Ctx {
     stepped: tokio::sync::Notify,
     log: Mutex<Log>,
     rng: Mutex<Rng>,
+    /// A governed pool's walk runs: the activation rung moves.
+    walks: bool,
+    /// A two-ended pool's engine view ([`EngineView`]).
+    engine_view: Option<Arc<Mutex<EngineView>>>,
 }
 
 #[derive(Default)]
@@ -1479,6 +1899,8 @@ struct Log {
     bind_suspends: u64,
     idles: u64,
     rescores: u64,
+    /// The safe order stood short at the last settled step.
+    short: bool,
     /// Bytes found not as written: (process, what).
     corrupt: Vec<(ProcessId, String)>,
     checks: u64,
@@ -1491,8 +1913,15 @@ struct Log {
     finished: u64,
     /// Processes back from their client with a new request, in order.
     requests: Vec<ProcessId>,
-    /// Each process's binds asked.
-    binds_of: std::collections::HashMap<ProcessId, u32>,
+    /// The most suspensions one bind took for its own room.
+    most_suspended: u32,
+    /// Frames held out for a raise ([`owe_raise`]).
+    raises_owed: u64,
+    /// Binds suspended for their own room more than once: (process,
+    /// program, suspensions).
+    bind_thrash: Vec<(ProcessId, u32, u32)>,
+    /// Each process's evictions landed.
+    evicted_of: std::collections::HashMap<ProcessId, u32>,
 }
 
 /// The fleet's progress as the safe order bounds it ([`Progress::moved`]).
@@ -1506,8 +1935,6 @@ struct Progress {
     again: u64,
     /// The first such, said.
     first: Option<String>,
-    /// Each process's suspensions for its own bind's room.
-    suspended: std::collections::HashMap<ProcessId, u32>,
 }
 
 impl Progress {
@@ -1526,6 +1953,9 @@ impl Progress {
             self.owed.retain(|&(_, head)| head != pid);
         }
         for (pid, evicted) in ctx.planner.with_inner(|inner| std::mem::take(&mut inner.moves)) {
+            if evicted.is_some() {
+                *ctx.log.lock().unwrap().evicted_of.entry(pid).or_default() += 1;
+            }
             match evicted {
                 Some(Some(head)) => {
                     if !self.owed.insert((pid, head)) {
@@ -1540,7 +1970,7 @@ impl Progress {
                         });
                     }
                 }
-                Some(None) => *self.suspended.entry(pid).or_default() += 1,
+                Some(None) => {}
                 None => self.owed.retain(|&(_, head)| head != pid),
             }
         }
@@ -1548,6 +1978,20 @@ impl Progress {
 }
 
 impl Ctx {
+    /// `pid`'s evictions landed: those [`Progress::moved`] has read, and
+    /// those the planner logged since.
+    fn evictions_of(&self, pid: ProcessId) -> u32 {
+        let logged = self.planner.with_inner(|inner| {
+            inner
+                .moves
+                .iter()
+                .filter(|(moved, evicted)| *moved == pid && evicted.is_some())
+                .count()
+        });
+        self.log.lock().unwrap().evicted_of.get(&pid).copied().unwrap_or(0)
+            + u32::try_from(logged).unwrap_or(u32::MAX)
+    }
+
     fn act(&self) {
         self.log.lock().unwrap().acts += 1;
     }
@@ -1770,6 +2214,22 @@ async fn fire(
             continue;
         };
         let in_flight = planner.fire_in_flight(pid);
+        // Every chunk held as the fire goes lies where the engine backs
+        // state: an engine checks a fire's chunks as it submits (Metal's
+        // `Pool::admit`), not only at a settled step.
+        if let (Some(view), Some(shared)) = (&ctx.engine_view, &ctx.stores.shared) {
+            let held = shared.lock().unwrap().pool().held_physical();
+            let mut view = view.lock().unwrap();
+            if let Some(&(logical, physical, engine)) = view.strays(&held).first() {
+                let fault = format!(
+                    "impossible submission: a fire of {pid} with logical chunk {logical} on \
+                     physical {physical} (the engine's table: {engine:?}), outside the state \
+                     pool's backed chunks (bottom {}, span {}, top_first {})",
+                    view.bottom, view.span, view.top_first
+                );
+                view.faults.push(fault);
+            }
+        }
         // What the fire reads is as its owner wrote it.
         if let Err(what) = verify(ctx, sets, instances) {
             ctx.log.lock().unwrap().corrupt.push((pid, what));
@@ -1865,10 +2325,15 @@ async fn bind(ctx: &Ctx, pid: ProcessId, program: u32) -> Result<InstanceId, Str
     };
     let engine = ctx.engine.clone();
     ctx.at(pid, "bind");
-    *ctx.log.lock().unwrap().binds_of.entry(pid).or_default() += 1;
     // Sent again more than this in one step with no step between, the
     // bind spins: said by name (it never yields, so nothing else runs).
     let tries = Mutex::new((0u64, 0u32));
+    // Its suspensions while it binds: its evictions landed (suspended for
+    // its room, or evicted while it waited for it, the room then its
+    // restore's to bring). Restored with that room beside its kv, the bind
+    // is served: once a bind ([`Log::bind_thrash`]). An eviction taken back
+    // parked nothing and is none.
+    let evicted_before = ctx.evictions_of(pid);
     let bound = crate::store::roles::bind_when_resident(
         pid,
         || {
@@ -1928,21 +2393,22 @@ async fn bind(ctx: &Ctx, pid: ProcessId, program: u32) -> Result<InstanceId, Str
             }
         },
         || Some(roles.lock().unwrap().room_watch()),
-        |run, pieces| {
-            roles.lock().unwrap().free_runs(run) >= pieces
-                && !planner.capacity_would_hold(pid, run.max(1).saturating_mul(pieces))
+        |run, pieces, singles| {
+            roles.lock().unwrap().room_free(run, pieces, singles)
+                && !planner.capacity_would_hold(
+                    pid,
+                    run.max(1).saturating_mul(pieces).saturating_add(singles),
+                )
         },
-        |run, pieces| {
-            let suspended = roles.lock().unwrap().holds_guest_state(pid)
-                && planner.suspend_for_room(pid, run, pieces);
-            ctx.log.lock().unwrap().bind_suspends += u64::from(suspended);
-            suspended
+        |run, pieces, singles| {
+            roles.lock().unwrap().holds_guest_state(pid)
+                && planner.suspend_for_room(pid, run, pieces, singles)
         },
-        |run, pieces| {
+        |run, pieces, singles| {
             ctx.log.lock().unwrap().bind_waits += 1;
             async move {
                 planner
-                    .wait_bind_room(pid, run, pieces)
+                    .wait_bind_room(pid, run, pieces, singles)
                     .await
                     .map_err(|error| error.to_string())
             }
@@ -1951,8 +2417,17 @@ async fn bind(ctx: &Ctx, pid: ProcessId, program: u32) -> Result<InstanceId, Str
         |waiting| planner.set_bind_waiting(pid, waiting),
         || async {},
     )
-    .await
-    .map_err(|error| format!("bind program {program}: {error:#}"))?;
+    .await;
+    {
+        let suspended = ctx.evictions_of(pid) - evicted_before;
+        let mut log = ctx.log.lock().unwrap();
+        log.bind_suspends += u64::from(suspended);
+        log.most_suspended = log.most_suspended.max(suspended);
+        if suspended > 1 {
+            log.bind_thrash.push((pid, program, suspended));
+        }
+    }
+    let bound = bound.map_err(|error| format!("bind program {program}: {error:#}"))?;
     ctx.log.lock().unwrap().binds += 1;
     // Its pair's state, laid by the first instance bound on it, must last
     // while any is bound.
@@ -2041,6 +2516,38 @@ fn new_set(
     })
 }
 
+/// `pid`'s frame is cut wider than the activation rung's cap: it owes the
+/// walk a raise to the widest rung and waits, step by step, until the cap
+/// lifts to it, as the scheduler holds the frame out unsealed. A pool with
+/// one rung, or no walk, has nothing to raise. Its owner parks and comes
+/// back meanwhile as any process: the raise's moves carry its parked
+/// state.
+async fn owe_raise(ctx: &Ctx, pid: ProcessId) {
+    let Some(shared) = ctx.stores.shared.clone() else {
+        return;
+    };
+    let rungs = shared.lock().unwrap().rungs();
+    let (Some(&widest), true) = (rungs.last(), rungs.len() > 1 && ctx.walks) else {
+        return;
+    };
+    // Cut no wider than the cap: its frame goes as it is.
+    if crate::store::shared::fire_cap(0) >= widest {
+        return;
+    }
+    ctx.at(pid, "raise owed");
+    ctx.log.lock().unwrap().raises_owed += 1;
+    loop {
+        // One frame owed at a time, as one lane's frame holds the gate.
+        if crate::store::shared::owed_by(0).is_none_or(|by| by == pid) {
+            crate::store::shared::owe_cut_rows(0, widest, Some(pid));
+            if crate::store::shared::fire_cap(0) >= widest {
+                return;
+            }
+        }
+        ctx.next_step().await;
+    }
+}
+
 /// A process's life by `script`, as the runtime runs one.
 async fn run_process(ctx: Arc<Ctx>, pid: ProcessId, script: Script) {
     let planner = ctx.planner.clone();
@@ -2092,8 +2599,27 @@ async fn run_process(ctx: Arc<Ctx>, pid: ProcessId, script: Script) {
                 }
                 instances.push(bind(&ctx, pid, program).await?);
             }
+            if let Some((program, every)) = script.verify
+                && (at + 1) % every.max(1) == 0
+            {
+                // A hypothesis rescored: its verifier bound beside the
+                // group (the pair shared), fired once, closed.
+                ctx.log.lock().unwrap().rescores += 1;
+                let verifier = bind(&ctx, pid, program).await?;
+                let mut with = instances.clone();
+                with.push(verifier);
+                let fired = fire(&ctx, pid, &mut sets, &with, 0).await;
+                close(&ctx, verifier);
+                fired?;
+            }
             let pages = u64::from((at + 1) % script.grow_every == 0);
+            if script.raise == Some(at) {
+                owe_raise(&ctx, pid).await;
+            }
             fire(&ctx, pid, &mut sets, &instances, pages).await?;
+            if script.raise == Some(at) {
+                crate::store::shared::owe_cut_rows(0, 0, None);
+            }
         }
         Ok::<(), String>(())
     }
@@ -2185,7 +2711,7 @@ fn walk(ctx: &Ctx) -> bool {
 async fn quiesce(
     ctx: &Ctx,
     lane: &mut TestLane,
-    pending: &mut Vec<(u32, LaneCopy)>,
+    pending: &mut Vec<(u32, LaneCopy, Option<Resolved>)>,
     step: u32,
     late: u64,
 ) {
@@ -2203,7 +2729,10 @@ async fn quiesce(
         tokio::task::yield_now().await;
         for copy in lane.take(&mut |change| ctx.rebind(change)) {
             let delay = u32::from(late > 0 && ctx.rng.lock().unwrap().chance(1, late));
-            pending.push((step + 1 + delay, copy));
+            // Encoded now: its places resolved through the chunk table as
+            // it stands at submit.
+            let resolved = copy.slots.as_ref().map(|slots| ctx.bytes.lock().unwrap().resolve(slots));
+            pending.push((step + 1 + delay, copy, resolved));
         }
         let now = signature(pending.len());
         if now == last {
@@ -2248,6 +2777,84 @@ fn check(ctx: &Ctx, step: u32, moving: bool) -> Result<Vec<Failure>, Failure> {
     };
     if let Some(panic) = take_panics().into_iter().next() {
         return Err(fail("panic", panic));
+    }
+    // Every holder's chunks lie where the engine's state pool holds state
+    // under the rung in force: below the activation the current rung
+    // carves, in memory the engine backs (the M1 at beamx40: a raise that
+    // left a holder's refs past the committed chunks, a fire refused as
+    // an impossible submission, the chunk maps diverging after).
+    if let Some(shared) = &ctx.stores.shared {
+        // The pool's own bookkeeping holds: every run whole, every held
+        // chunk's slots counted (the M1 on 5fd1e46e8: "Slot { chunk: 277,
+        // index: 0 } lies in a free chunk" seconds into a beam w17 load).
+        if let Some(why) = pool_check(shared) {
+            return Err(fail("bookkeeping", why));
+        }
+        // Every slot a holder outside the pool names is one the pool counts
+        // held: the kv trie's resident pages, the roles' live parts on the
+        // device, and the engine's bound instances' tables, rings and
+        // scratch (a parked one's kept tables and rings). A slot named past
+        // its release is read and written as another's (the M1's fires on
+        // free logical chunks swapped onto a released segment).
+        // `PIE_SIM_SHORT`: each step the safe order turns short, said with
+        // the gate's read and what the last step granted.
+        if std::env::var_os("PIE_SIM_SHORT").is_some() {
+            let least = ctx.planner.order_least();
+            let was = ctx.log.lock().unwrap().short;
+            let now = least.is_some_and(|least| least < 0);
+            if now && !was {
+                eprintln!(
+                    "SIMSHORT step {step}: least {least:?} read {:?} gate {:?}",
+                    ctx.planner.capacity_read(),
+                    ctx.planner.capacity_gate()
+                );
+            }
+            ctx.log.lock().unwrap().short = now;
+        }
+        if let Some(why) = stray_holders(ctx, shared) {
+            return Err(fail("stale ref", why));
+        }
+        let (unbacked, limit, rung) = {
+            let shared = shared.lock().unwrap();
+            let pool = shared.pool();
+            (pool.held_unbacked(), pool.state_limit(), pool.rung())
+        };
+        // And where the engine backs them, as the ops it applied left it.
+        if let Some(view) = &ctx.engine_view {
+            let mut view = view.lock().unwrap();
+            if let Some(fault) = view.faults.drain(..).next() {
+                return Err(fail("ceiling", fault));
+            }
+            let shared = shared.lock().unwrap();
+            let pool = shared.pool();
+            let mut outside = view.strays(&pool.held_physical());
+            // And every free chunk a take could open: a free logical id the
+            // engine resolves elsewhere, or to memory it gave back, is a
+            // fire on the next take's state there.
+            outside.extend(view.strays(&pool.takeable_physical()));
+            if !outside.is_empty() {
+                return Err(fail(
+                    "ceiling",
+                    format!(
+                        "held chunks (logical, physical, the engine's physical) {outside:?} lie \
+                         elsewhere in the engine's table or outside what it backs for state \
+                         (bottom {}, span {}, top_first {}): a fire on them is an impossible \
+                         submission",
+                        view.bottom, view.span, view.top_first
+                    ),
+                ));
+            }
+        }
+        if !unbacked.is_empty() {
+            return Err(fail(
+                "ceiling",
+                format!(
+                    "held chunks (logical, physical) {unbacked:?} lie where the engine holds no \
+                     state: past the activation of rung {rung} (state below {limit}) or in an \
+                     uncommitted segment"
+                ),
+            ));
+        }
     }
     let mut refused: Vec<Failure> = std::mem::take(&mut ctx.log.lock().unwrap().refusals)
         .into_iter()
@@ -2392,13 +2999,14 @@ fn check(ctx: &Ctx, step: u32, moving: bool) -> Result<Vec<Failure>, Failure> {
     if passed.is_err() {
         let why = take_panics().join("; ");
         // The head's pending bind, as the planner holds it: no bind of the
-        // workload asks more than two pieces (an instance and its pair).
+        // workload asks more than two pieces (an instance and its pair) and
+        // a chunk for each of its tables, rings and adapter.
         let head = why
             .split_once(", pid ")
             .and_then(|(_, rest)| rest.get(..36))
             .and_then(|pid| ProcessId::parse_str(pid).ok());
         let pending = head.and_then(|pid| planner.pending_bind(pid));
-        let ratchet = pending.is_some_and(|bind| bind.pieces > 2);
+        let ratchet = pending.is_some_and(|bind| bind.pieces > 5);
         let state = format!(
             "{why}; pending bind {:?}{}; queue {}; free chunks {}; device pages {:?}",
             pending.map(|bind| (bind.run, bind.pieces)),
@@ -2465,6 +3073,31 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
     // each move at once (an evacuation's chunks moved in its table and
     // every claim laid again), the live processes its lanes.
     let live = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    // The walk's evacuations (a raise's and the segment walk's), and the
+    // raises it took.
+    let lane_ops = Arc::new([AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)]);
+    // The engine's view of a two-ended pool, as the ops it applied left it.
+    let engine_view = (workload.pool.governed && workload.pool.span_on_demand).then(|| {
+        let pool = &workload.pool;
+        let segments = pool.segments();
+        let mut refuse_rng = Rng(workload.seed ^ 0x2ef0_5ed0);
+        let refuse_span = refuse_rng.chance(1, 2).then(|| u64::from(refuse_rng.range(2, 6)));
+        Arc::new(Mutex::new(EngineView {
+            total: pool.total,
+            segment: pool.segment,
+            top_first: pool.top_segment() * pool.segment,
+            bottom: pool.top_segment().min(segments),
+            span: 0,
+            refuse_span,
+            rng: refuse_rng,
+            faults: Vec::new(),
+            table: ::engine::chunk::ChunkTable::identity(pool.total),
+        }))
+    });
+    // The engine's rung gate, a static per engine: as a fresh one's.
+    crate::store::shared::owe_cut_rows(0, 0, None);
+    crate::store::shared::set_fire_cap_for_test(0, u32::MAX);
+    crate::store::shared::grant_rung(0, u32::MAX);
     let planner_cell: Arc<std::sync::OnceLock<std::sync::Weak<ResidencyPlanner>>> =
         Arc::default();
     let mut grow = workload.pool.governed.then(|| {
@@ -2473,9 +3106,73 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
             (bytes.clone(), engine.clone(), workload.pool.total);
         let told = planner_cell.clone();
         let lanes = live.clone();
+        let ops = lane_ops.clone();
+        let view = engine_view.clone();
+        let lane_shared = stores.shared.clone();
         crate::store::shared::SharedGrow::new(model, 0, shared)
             .with_lane(move |op| {
+                if let Some(view) = &view {
+                    let mut view = view.lock().unwrap();
+                    view.apply(&op).map_err(|why| anyhow::anyhow!(why))?;
+                    // A move's destinations lie in memory the engine backs.
+                    if let crate::scheduler::worker::PoolOp::Evacuate(evacuation) = &op
+                        && let Some(&(logical, to)) =
+                            evacuation.moves.iter().find(|&&(_, to)| !view.admits(to))
+                    {
+                        let _ = lane_shared;
+                        let fault = format!(
+                            "impossible submission: logical chunk {logical} moved to physical {to}, \
+                             outside the state pool's backed chunks ({view:?})"
+                        );
+                        view.faults.push(fault.clone());
+                        anyhow::bail!(fault);
+                    }
+                    if let crate::scheduler::worker::PoolOp::Evacuate(evacuation) = &op {
+                        if let Err(error) = view.table.apply(evacuation) {
+                            let fault =
+                                format!("the engine's table refused {:?}: {error}", evacuation.moves);
+                            view.faults.push(fault.clone());
+                            anyhow::bail!(fault);
+                        }
+                        // `PIE_SIM_LATE_REFUSE`: the engine refuses an
+                        // evacuation after its table took the moves, one
+                        // time in a few (Metal before 6b69c5978's next: a
+                        // rebind failing past the swap). The runtime takes
+                        // the move back; the tables part.
+                        if std::env::var_os("PIE_SIM_LATE_REFUSE").is_some() && view.rng.chance(1, 4) {
+                            anyhow::bail!("an evacuation refused past its table swap (simulated)");
+                        }
+                    }
+                    // A segment given back holds nothing the engine resolves
+                    // there.
+                    if let crate::scheduler::worker::PoolOp::ReleaseSegments(_)
+                    | crate::scheduler::worker::PoolOp::ReleaseSpan(_) = &op
+                        && let Some(shared) = &lane_shared
+                    {
+                        let held = shared.lock().unwrap().pool().held_physical();
+                        let strays = view.strays(&held);
+                        if !strays.is_empty() {
+                            let fault = format!(
+                                "{op:?} given back under held chunks (logical, physical, the \
+                                 engine's physical) {strays:?}"
+                            );
+                            view.faults.push(fault.clone());
+                            anyhow::bail!(fault);
+                        }
+                    }
+                }
+                if let crate::scheduler::worker::PoolOp::Evacuate(evacuation) = &op
+                    && let Some(shared) = &lane_shared
+                    && let Some(why) = pool_check(shared)
+                {
+                    let fault = format!("bookkeeping after evacuate {:?}: {why}", evacuation.moves);
+                    if let Some(view) = &view {
+                        view.lock().unwrap().faults.push(fault.clone());
+                    }
+                    anyhow::bail!(fault);
+                }
                 if let crate::scheduler::worker::PoolOp::Evacuate(evacuation) = op {
+                    ops[1].fetch_add(1, Ordering::Relaxed);
                     trace(|| format!("evacuate {:?}", evacuation.moves));
                     lane_bytes
                         .lock()
@@ -2517,8 +3214,12 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
         stepped: tokio::sync::Notify::new(),
         log: Mutex::new(Log::default()),
         rng: Mutex::new(Rng(workload.seed ^ 0x5eed)),
+        walks: grow.is_some(),
+        engine_view,
     });
     let mut pid_rng = Rng(workload.seed.wrapping_mul(31).wrapping_add(7));
+    let mut fires_before = 0u64;
+    let mut rung = ctx.stores.shared.as_ref().map_or(0, |shared| shared.lock().unwrap().rung());
     let scripts: Vec<(usize, &Script)> = workload
         .scripts
         .iter()
@@ -2531,7 +3232,7 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
     }
     let last_arrival = arrivals.keys().next_back().copied().unwrap_or(0);
     let total = scripts.len();
-    let mut pending: Vec<(u32, LaneCopy)> = Vec::new();
+    let mut pending: Vec<(u32, LaneCopy, Option<Resolved>)> = Vec::new();
     let mut coverage = Coverage {
         seeds: 1,
         processes: total as u64,
@@ -2562,20 +3263,20 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
         }
         ctx.stepped.notify_waiters();
         let (due, later): (Vec<_>, Vec<_>) = match workload.ring {
-            None => pending.drain(..).partition(|(at, _)| *at <= step),
+            None => pending.drain(..).partition(|(at, ..)| *at <= step),
             // Through a ring: in order, at most its pieces a step.
             Some(pieces) => {
                 let lands = pending
                     .iter()
                     .take(pieces)
-                    .take_while(|(at, _)| *at <= step)
+                    .take_while(|(at, ..)| *at <= step)
                     .count();
                 let later = pending.split_off(lands);
                 (std::mem::replace(&mut pending, later), Vec::new())
             }
         };
         pending.extend(later);
-        for (_, copy) in due {
+        for (_, copy, resolved) in due {
             coverage.copies += 1;
             coverage.disk_copies += u64::from(copy.to_disk || copy.from_disk);
             if copy.to_disk && workload.tier_full_at(step) {
@@ -2586,17 +3287,13 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
             {
                 // Failed: what it wrote is garbage, its sources untouched.
                 coverage.landing_failed += 1;
-                if let Some(slots) = &copy.slots {
-                    let mut bytes = ctx.bytes.lock().unwrap();
-                    let dst = Bytes::tier(slots.dst);
-                    for &(_, to) in &slots.slots {
-                        bytes.write(dst, slots.shape.0, to, 0xdead_beef);
-                    }
+                if let Some(resolved) = &resolved {
+                    ctx.bytes.lock().unwrap().garbage(resolved);
                 }
                 copy.fail_landing("the device event faulted (simulated)");
             } else {
-                if let Some(slots) = &copy.slots {
-                    land_bytes(&ctx.bytes, slots);
+                if let (Some(slots), Some(resolved)) = (&copy.slots, &resolved) {
+                    land_bytes(&ctx.bytes, slots, resolved);
                 }
                 copy.land();
             }
@@ -2614,10 +3311,30 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
                 walk(&ctx);
             }
         }
+        // The lanes live: the fires the last step took, as a scheduler's
+        // lanes are the processes stepping, not every one admitted (parked
+        // and waiting ones' lanes are parked). Few stepping, the walk takes
+        // the rung down while demand waits and raises it again for a frame
+        // held out under the cap.
+        let fired = ctx.log.lock().unwrap().fires;
         live.store(
-            u32::try_from(tasks.len() - ctx.log.lock().unwrap().ended).unwrap_or(u32::MAX),
+            u32::try_from(fired - fires_before).unwrap_or(u32::MAX),
             Ordering::Relaxed,
         );
+        fires_before = fired;
+        // The scheduler's turn: its fires (one row a lane) step under the
+        // cap, so it holds none wider than the cap in flight.
+        crate::store::shared::grant_rung(0, crate::store::shared::fire_cap(0));
+        if let Some(shared) = &ctx.stores.shared {
+            let now = shared.lock().unwrap().rung();
+            if now > rung {
+                lane_ops[0].fetch_add(1, Ordering::Relaxed);
+            }
+            if now < rung {
+                lane_ops[2].fetch_add(1, Ordering::Relaxed);
+            }
+            rung = now;
+        }
         quiesce(&ctx, &mut lane, &mut pending, step, workload.late).await;
         for script in arrivals.remove(&step).unwrap_or_default() {
             let pid =
@@ -2718,6 +3435,10 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
         coverage.binds = log.binds;
         coverage.bind_waits = log.bind_waits;
         coverage.bind_suspends = log.bind_suspends;
+        coverage.raises_owed = log.raises_owed;
+        coverage.rung_raises = lane_ops[0].load(Ordering::Relaxed);
+        coverage.rung_lowers = lane_ops[2].load(Ordering::Relaxed);
+        coverage.evacuations = lane_ops[1].load(Ordering::Relaxed);
         coverage.idles = log.idles;
         coverage.rescores = log.rescores;
         coverage.integrity_checks = log.checks;
@@ -2726,23 +3447,20 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
         coverage.finished = log.finished;
         // No process was evicted for a head twice per arrival of that head
         // ([`Progress::moved`]).
-        // A process suspends for its own bind's room at most once a bind:
+        // A bind suspends its process for its own room at most once:
         // restored only once that room stands free beside its kv, it binds
         // (the M1 at beamx40: bind suspensions 1,996 over 201 processes,
         // some suspended 58 to 68 times, unfinished in 45 minutes).
-        for (pid, &suspended) in &progress.suspended {
-            let binds = log.binds_of.get(pid).copied().unwrap_or(0);
-            coverage.most_suspended = coverage.most_suspended.max(u64::from(suspended));
-            if suspended > binds {
-                progress.again += u64::from(suspended - binds);
-                progress.first.get_or_insert_with(|| {
-                    format!(
-                        "process {} suspended {suspended} times for its binds' room over \
-                         {binds} binds",
-                        &pid.to_string()[..8]
-                    )
-                });
-            }
+        coverage.most_suspended = u64::from(log.most_suspended);
+        for &(pid, program, suspended) in &log.bind_thrash {
+            progress.again += u64::from(suspended - 1);
+            progress.first.get_or_insert_with(|| {
+                format!(
+                    "process {} suspended {suspended} times for one bind's room (program \
+                     {program})",
+                    &pid.to_string()[..8]
+                )
+            });
         }
         coverage.over_bound = progress.again;
         if let Some(first) = progress.first.take() {
@@ -2758,6 +3476,7 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
             });
         }
     }
+    crate::store::shared::owe_cut_rows(0, 0, None);
     coverage.cache_left = u64::from(with_kv_lock(&ctx.stores.kv, "sim-cache", |kv| {
         kv.reclaimable_cache_pages()
     }));
@@ -2766,7 +3485,7 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
     for task in &tasks {
         task.abort();
     }
-    for (_, copy) in pending.drain(..) {
+    for (_, copy, _) in pending.drain(..) {
         copy.land();
     }
     for _ in 0..64 {
@@ -2839,7 +3558,8 @@ fn sweep(seeds: std::ops::Range<u64>) -> (Vec<(u64, Failure)>, Coverage) {
         coverage.add(&covered);
         for failure in found {
             eprintln!(
-                "SIM seed={seed} step={} kind={} shape=[{}]\n    {}",
+                "SIM seed={seed} processes={} step={} kind={} shape=[{}]\n    {}",
+                workload.scripts.len(),
                 failure.step,
                 failure.kind,
                 shape_of(&failure),
@@ -2860,9 +3580,13 @@ fn report(failures: &[(u64, Failure)], coverage: &Coverage, shrinking: bool) -> 
     }
     let mut out = format!("SIM coverage: {coverage:?}\n");
     out += &format!(
-        "SIM progress: {:.2} fires a live step, {:.2} evictions a finished process\n",
+        "SIM progress: {:.1} requests finished a 1,000 steps, {:.2} fires a live step, {:.2} \
+         evictions and {:.2} bind suspensions a finished process, at most {} suspensions a bind\n",
+        coverage.finished as f64 * 1000.0 / coverage.steps.max(1) as f64,
         coverage.fires as f64 / coverage.live_steps.max(1) as f64,
-        coverage.evictions as f64 / coverage.finished.max(1) as f64
+        coverage.evictions as f64 / coverage.finished.max(1) as f64,
+        coverage.bind_suspends as f64 / coverage.finished.max(1) as f64,
+        coverage.most_suspended
     );
     out += &format!("SIM {} failures, {} shapes\n", failures.len(), shapes.len());
     for (shape, seeds) in &shapes {
@@ -3381,4 +4105,187 @@ fn replay_one_simulated_seed() {
         "seed {seed}: {} failures",
         failures.len()
     );
+}
+
+/// A pool of `total` chunks in segments of `segment`, a bind of `run`
+/// adjacent chunks arriving once the decoders around it have scattered
+/// their pages over the pool ([`a_run_the_pool_can_open_is_opened`]).
+fn run_need_workload(seed: u64, total: u32, segment: u32, run: u32, governed: bool) -> Workload {
+    run_pieces_workload(seed, total, segment, run, 1, governed)
+}
+
+/// [`run_need_workload`] with a bind of `pieces` runs of `run` chunks
+/// beside its single chunks (the M1's run 4b: a restore's bind of two runs
+/// of 28 and two single chunks, 104 chunks free).
+fn run_pieces_workload(
+    seed: u64,
+    total: u32,
+    segment: u32,
+    run: u32,
+    pieces: u32,
+    governed: bool,
+) -> Workload {
+    let mut rng = Rng(seed ^ 0x52_4e_ed);
+    let pool = PoolShape {
+        total,
+        segment,
+        host_chunks: 0,
+        disk_chunks: 64,
+        programs: vec![
+            Program {
+                run: 1,
+                scratch: 393_216,
+                resident: 0,
+                per_pair: 0,
+            },
+            Program {
+                run,
+                scratch: u64::from(run * pieces) * MIB,
+                resident: 0,
+                per_pair: 0,
+            },
+        ],
+        governed,
+        span_on_demand: false,
+        act: vec![(16, 1), (256, 2)],
+    };
+    let most = pool.most_pages();
+    // Decoders of every length, each ending at its own step: the chunks
+    // they give back lie scattered among those still held.
+    let mut scripts: Vec<Script> = (0..14)
+        .map(|_| Script {
+            at: rng.range(0, 6),
+            prompt: rng.range(1, 3),
+            decode: rng.range(6, 80),
+            grow_every: rng.range(1, 2),
+            beams: 1,
+            bind: Vec::new(),
+            idle: None,
+            rescore: None,
+            raise: None,
+            verify: None,
+        })
+        .collect();
+    for script in &mut scripts {
+        while script.pages() > most && script.decode > 0 {
+            script.decode -= 1;
+        }
+    }
+    scripts.push(Script {
+        at: rng.range(10, 30),
+        prompt: 1,
+        decode: 4,
+        grow_every: 4,
+        beams: 1,
+        bind: vec![(1, false)],
+        idle: None,
+        rescore: None,
+        raise: None,
+        verify: None,
+    });
+    Workload {
+        seed,
+        pool,
+        scripts,
+        tier_full: Vec::new(),
+        late: 0,
+        target: Vec::new(),
+        ring: None,
+        landing_fails: None,
+    }
+}
+
+/// A bind of a run of five adjacent chunks, the pool's free chunks enough
+/// for it but scattered under decoders' pages (the M5 at beam w32: a
+/// restore of three runs of 57 with 99 chunks free and no run of 57, the
+/// planner finding no step 0.5 M times): the run is opened, by moves the
+/// pool makes, and every process ends.
+#[test]
+fn a_run_the_pool_can_open_is_opened() {
+    let mut waited = 0;
+    for seed in 0..40 {
+        for governed in [false, true] {
+            let (failures, coverage) = run(&run_need_workload(seed, 18, 6, 5, governed), None);
+            for failure in &failures {
+                eprintln!(
+                    "SIM run need seed {seed} (governed {governed}) step {}: [{}] {}",
+                    failure.step, failure.kind, failure.line
+                );
+            }
+            assert!(failures.is_empty(), "seed {seed} governed {governed}: {} failures", failures.len());
+            waited += coverage.bind_waits;
+        }
+    }
+    assert!(waited > 0, "no run waited for room: the shape scatters nothing");
+}
+
+/// `PIE_SIM_PIECES`: binds of two runs beside their single chunks, among
+/// decoders scattering their pages, many arriving at once so binds suspend
+/// their processes and restores carry the bind's room (the M1's run 4b);
+/// every process ends, no restore's placement and takes disagree.
+#[test]
+#[ignore]
+fn binds_of_two_runs_beside_singles_restore_and_end() {
+    let seeds = std::env::var("PIE_SIM_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(200u64);
+    let mut failed = 0;
+    let mut coverage = Coverage::default();
+    for seed in 0..seeds {
+        for (total, segment, length, pieces) in [
+            (30, 6, 5, 2),
+            (36, 6, 6, 2),
+            (40, 8, 6, 2),
+            (48, 8, 8, 2),
+            // Three runs and the singles beside them (the M1's run 10: a
+            // restore of three runs of 30 and two single chunks).
+            (42, 6, 5, 3),
+            (48, 8, 6, 3),
+        ] {
+            let mut workload = run_pieces_workload(seed, total, segment, length, pieces, seed % 2 == 0);
+            // Many binds, arriving close together.
+            // The run program's state is resident (held across parks, as a
+            // beam group's): a parked process's restore lays its runs again.
+            if let Some(program) = workload.pool.programs.last_mut() {
+                program.resident = program.scratch;
+            }
+            let mut bind = workload.scripts.last().cloned().expect("a bind");
+            bind.decode = 30;
+            bind.grow_every = 1;
+            let mut rng = Rng(seed ^ 0xb1d5);
+            for _ in 0..rng.range(2, 6) {
+                let mut more = bind.clone();
+                more.at = rng.range(0, 30);
+                more.decode = rng.range(10, 40);
+                workload.scripts.push(more);
+            }
+            let (failures, covered) = run(&workload, None);
+            coverage.add(&covered);
+            for failure in &failures {
+                failed += 1;
+                eprintln!(
+                    "SIM pieces seed={seed} total={total} segment={segment} run={length}x{pieces} step={} kind={} {}",
+                    failure.step,
+                    failure.kind,
+                    failure.line.chars().take(600).collect::<String>()
+                );
+            }
+        }
+    }
+    eprintln!("SIM pieces: {failed} failures, binds {}, bind waits {}, suspends {}, restores {}", coverage.binds, coverage.bind_waits, coverage.bind_suspends, coverage.restores);
+    assert_eq!(failed, 0);
+}
+
+/// A bind of a run of seven adjacent chunks in a pool of segments of six:
+/// a run lies inside one segment, so no arrangement of the pool ever
+/// opens it. It is refused by name, at once, and nothing waits on it.
+#[test]
+fn a_run_no_arrangement_opens_is_refused_by_name() {
+    let (failures, _) = run(&run_need_workload(0, 18, 6, 7, false), None);
+    for failure in &failures {
+        eprintln!("SIM run past a segment step {}: [{}] {}", failure.step, failure.kind, failure.line);
+    }
+    assert!(
+        failures.iter().all(|failure| failure.kind == "refused" && failure.line.contains("never")),
+        "only its refusal, by name: {failures:?}"
+    );
+    assert!(failures.iter().any(|failure| failure.kind == "refused"), "refused");
 }

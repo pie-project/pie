@@ -726,6 +726,8 @@ impl Engine for Metal {
                     &budgets, &trace,
                 )))
                 .unwrap_or(u32::MAX),
+                // Each lane's rung bounds what it replays.
+                replayed_rows: 0,
             },
             has_lora: true,
             has_attn_page_mask: false,
@@ -734,7 +736,8 @@ impl Engine for Metal {
             draft_proposals_from: shell.trace().drafter.map_or(1, |d| d.proposals_from),
             ports: PortMask::DEVICE_GEOMETRY
                 .with(Port::AttnMask)
-                .with(Port::Fold),
+                .with(Port::Fold)
+                .with(Port::Parents),
             geometry: GeometryClass::DeviceGeometry,
             kv_handle: None,
             media_encode: false,
@@ -748,6 +751,8 @@ impl Engine for Metal {
             // Metal states no bound on one submission yet
             // (`crate::rates::at_load`).
             guest_cost: engine::GuestCost::default(),
+            // A beam group's page list (`beam_list`), read at a search's finish.
+            host_ops: engine::HostOps { beam_list: true },
             mixed_lanes: engine::MixedLanes::Any,
             frames_in_flight: engine::stated_frames(shell.frames_in_flight())?,
         };
@@ -783,7 +788,7 @@ impl Engine for Metal {
                 walked
             }
         };
-        shell.seal_pipelines();
+        shell.seal_pipelines().map_err(fault)?;
         tracing::info!(
             fires,
             built,
@@ -1063,17 +1068,21 @@ impl Engine for Metal {
 
     fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
         let shell = self.loaded_mut()?;
-        let before = shell.program_compilations();
+        let before = (shell.program_compilations(), shell.program_compile_nanos());
         let id = shell.register_program(registration).map_err(fault)?;
         // A registration after ready that compiled guest code is one the
         // load's prewarm did not prepare: built at its registration, before
-        // its first fire (no fire waits on it).
-        let built = shell.program_compilations() - before;
+        // its first fire (no fire waits on it). Its compile's wall time
+        // reads an OS shader-cache hit apart from a cold compile.
+        let built = shell.program_compilations() - before.0;
         if built > 0 {
+            let ms = (shell.program_compile_nanos() - before.1) / 1_000_000;
             self.live.tally(engine::live::Tally::BuiltAtRegister, built);
+            self.live.tally(engine::live::Tally::BuiltAtRegisterMs, ms);
             tracing::warn!(
                 program = registration.program_hash,
                 regions = built,
+                ms,
                 "metal: a registration after ready compiled guest code the prewarm did not"
             );
         }
@@ -1109,17 +1118,22 @@ impl Engine for Metal {
                 engine::Error::Program("a prepared program this engine did not prepare".into())
             })?;
         let shell = self.loaded_mut()?;
-        let before = shell.program_compilations();
+        let before = (shell.program_compilations(), shell.program_compile_nanos());
         let id = shell.finish_program(*registered).map_err(fault)?;
         // The compile's regions count at the finish: a registration after
         // ready that compiled guest code is one the prewarm did not prepare,
-        // built at its registration (no fire waits on it).
-        let built = shell.program_compilations() - before;
+        // built at its registration (no fire waits on it). Its compile's
+        // wall time, off this thread, reads a cache hit apart from a cold
+        // compile.
+        let built = shell.program_compilations() - before.0;
         if built > 0 {
+            let ms = (shell.program_compile_nanos() - before.1) / 1_000_000;
             self.live.tally(engine::live::Tally::BuiltAtRegister, built);
+            self.live.tally(engine::live::Tally::BuiltAtRegisterMs, ms);
             tracing::warn!(
                 program = id.0,
                 regions = built,
+                ms,
                 "metal: a registration after ready compiled guest code the prewarm did not"
             );
         }
@@ -1275,6 +1289,10 @@ impl Engine for Metal {
         self.instance(instance)?
             .publish(channel, cell)
             .map_err(fault)
+    }
+
+    fn beam_list(&mut self, instance: InstanceId, beam: u32) -> EngineResult<Vec<u32>> {
+        self.loaded_mut()?.beam_list(instance, beam).map_err(fault)
     }
 
     fn take_channel(
@@ -1517,6 +1535,7 @@ impl Metal {
             .enumerate()
             .map(|(at, lane)| {
                 Ok(Seated {
+                    replay_stated: lane.replay_stated,
                     lane: Lane {
                         slot: lane.slot,
                         word: words[at],
@@ -1537,11 +1556,19 @@ impl Metal {
                         Readout::Rows(rows) => Some(rows.as_slice()),
                         Readout::Last | Readout::None => None,
                     },
-                    translation: match lane.list {
-                        engine::fire::ListKind::Translation => {
-                            pages_of[at].as_deref().unwrap_or(&[])
+                    // A beam group's lane resolves through its working set's
+                    // whole reserve (the pool its list's entries name,
+                    // BEAM-PAGE-LISTS §6.5); any other lane through its own
+                    // table.
+                    translation: if lane.reserve.is_empty() {
+                        match lane.list {
+                            engine::fire::ListKind::Translation => {
+                                pages_of[at].as_deref().unwrap_or(&[])
+                            }
+                            engine::fire::ListKind::Pages => &[],
                         }
-                        engine::fire::ListKind::Pages => &[],
+                    } else {
+                        &lane.reserve
                     },
                     rs: &lane.rs,
                     rs_reset: lane.rs_reset,

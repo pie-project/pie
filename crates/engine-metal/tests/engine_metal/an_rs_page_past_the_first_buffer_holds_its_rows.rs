@@ -50,6 +50,7 @@ fn walk(shell: &mut Shell, fixture: &Fixture, rs_pages: u32, refs: Option<&Refs>
         (&next[..], buffer(rs_pages, 1, 0), RsReset::Held, bound + 1),
     ] {
         let lane = Seated {
+            replay_stated: None,
             held: Some(held),
             rs: &verb,
             rs_reset: reset,
@@ -88,13 +89,17 @@ fn an_rs_page_past_the_first_buffer_holds_its_rows() {
         let shell = load_near(&fixture, CONTEXT, Some(chunk));
         let layout = shell.pool_layout();
         let (ids, parts) = shell.page_ids();
+        // The walk's rs pages fit one chunk: a gated-delta row's corrected
+        // planes (keys, u) make an rs slot wider than the conv input alone.
+        let rs_pages = u64::from((CARRIED + 2).div_ceil(layout.rs_tokens.max(1)) + 1);
         ids.shift.is_some()
             && parts > 1
-            && layout
-                .rs
-                .is_some_and(|rs| !layout.chunk_bytes.is_multiple_of(rs.slot_bytes))
+            && layout.rs.is_some_and(|rs| {
+                !layout.chunk_bytes.is_multiple_of(rs.slot_bytes)
+                    && layout.chunk_bytes / rs.slot_bytes >= rs_pages
+            })
     })
-    .expect("a chunk the rs slots do not tile");
+    .expect("a chunk the rs slots do not tile and that holds the walk's rs pages");
     let mut shell = load_near(&fixture, CONTEXT, Some(chunk));
     let layout = shell.pool_layout();
     let facts = shell.pool_chunk_facts();

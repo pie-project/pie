@@ -9,6 +9,7 @@
 // sysctl, allowed there by name.
 #![deny(unsafe_code)]
 
+pub mod beam;
 pub mod adapter;
 pub mod caps;
 pub mod channel;
@@ -38,8 +39,8 @@ pub mod transfer;
 
 pub use adapter::{AdapterPlane, AdapterRegistration};
 pub use caps::{
-    Capabilities, DeviceFacts, FireLimits, GuestCost, LibraryForms, MixedLanes, MixedRung,
-    PoolFacts, stated_frames,
+    Capabilities, DeviceFacts, FireLimits, GuestCost, HostOp, HostOps, LibraryForms, MixedLanes,
+    MixedRung, PoolFacts, stated_frames,
 };
 pub use channel::{ChannelId, ChannelRegistration, ChannelSeed, HostMirror, RegisteredChannel};
 pub use chunk::{
@@ -55,8 +56,8 @@ pub use engine::{
 pub use error::{Error, Result};
 pub use fire::{
     Attachment, FireId, FireTicket, FoldLen, FrameId, FrameSubmission, FrameTicket, KvDelta, Lane,
-    LaneReadout, LaneRecord, ListKind, Mask, Masking, MediaEncode, Readout, RsReset, RsSnapshot,
-    RsVerb, Serves, Step,
+    LaneReadout, LaneRecord, LaneReplay, ListKind, Mask, Masking, MediaEncode, Readout, ReplayBound,
+    ReplayPast, ReplayRows, RsReset, RsSnapshot, RsVerb, RungReplay, ScratchBytes, Serves, Step,
 };
 pub use load::{Allowance, Budgets, Checkpoint, LoadFacts, LoadRequest, Loaded, Residency};
 pub use memory::SAFETY_FLOOR_BYTES;

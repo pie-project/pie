@@ -81,6 +81,9 @@ impl Host for Api {
         PortMask::DECODE_ENVELOPE
             .with(eta_ir::registry::Port::Fold)
             .with(eta_ir::registry::Port::AttnMask)
+            // Each beam's parent: the engine keeps the beams' page lists
+            // (`engine_gpu::beam`).
+            .with(eta_ir::registry::Port::Parents)
     }
 
     fn settles_asynchronously(gpu: &Vulkan) -> bool {
@@ -138,17 +141,20 @@ impl Host for Api {
         } else if defers && let Some(sink) = gpu.sink.as_ref() {
             // The forward's own report was held for the sampler.
             let mut held = engine::StepOutcome {
+                beam_common: Vec::new(),
                 wrote: std::mem::take(&mut step_pending.wrote),
                 faulted: std::mem::take(&mut step_pending.faulted),
             };
             // Its rows are read: the forward landed.
             if let Some(fed) = step_pending.fed.take() {
                 held = merged(held, fed.faults());
+                held.beam_common = fed.commons();
             }
             (sink)(at, merged(held, faulted));
         } else {
             // Told with the frame's settle, inside the submit.
             let held = engine::StepOutcome {
+                beam_common: Vec::new(),
                 wrote: Vec::new(),
                 faulted: std::mem::take(&mut step_pending.faulted),
             };

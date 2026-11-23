@@ -1019,6 +1019,28 @@ impl Pools {
             }],
             shapes,
             act_chunks: self.act_chunks.clone(),
+            // A fire carries at most its rung's tokens of carried rows
+            // (`crate::rs::carried_room`), every lane's; its own rows its
+            // rung's tokens. Stated as the floor: a decode lane's replay is
+            // the prepare check's, which counts it.
+            act_replay: self
+                .act_chunks
+                .iter()
+                .map(|&(tokens, _)| engine::RungReplay {
+                    own_max: Some(tokens),
+                    carried_max: Some(crate::rs::carried_room(tokens)),
+                    // Each window's scratch is laid for the rung's carried
+                    // rows (`crate::rs::carried_room`): no bytes beyond.
+                    scratch: engine::ScratchBytes {
+                        slot_bytes: Vec::new(),
+                        lane_bytes: 0,
+                        room_bytes: 0,
+                        pad: 1,
+                    },
+                })
+                .collect(),
+            rs_compact: false,
+            rs_scratch_per_fire: false,
             eager_rungs: Vec::new(),
             held_bytes: 0,
             outside_bytes: 0,

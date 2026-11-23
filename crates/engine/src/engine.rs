@@ -39,6 +39,11 @@ pub struct StepOutcome {
     /// request by its reason, and poisons its instance; no other lane is
     /// touched.
     pub faulted: Vec<LaneFault>,
+    /// Each beam group's common slot as the step's head step left it
+    /// (`BEAM-PAGE-LISTS.md` §11.3): the slot below which every live beam's
+    /// rows lie on the same pages, by the group's instance. Monotone; the
+    /// runtime folds the group's set to the largest it has seen.
+    pub beam_common: Vec<(InstanceId, u32)>,
 }
 
 /// A lane of a step that faulted: lane `lane` of the step's
@@ -64,6 +69,7 @@ impl StepOutcome {
         StepOutcome {
             wrote,
             faulted: Vec::new(),
+            beam_common: Vec::new(),
         }
     }
 
@@ -75,6 +81,7 @@ impl StepOutcome {
         StepOutcome {
             wrote: Vec::new(),
             faulted: every_lane(lanes, reason.into()),
+            beam_common: Vec::new(),
         }
     }
 
@@ -133,7 +140,7 @@ pub struct KvWrites {
     /// One past the last slot the lane's rows landed at, in the set's own
     /// slot numbering: a position. `None` where the engine does not tell
     /// it; the set is then taken to have written as far as it reserved
-    /// ([`crate::fire::rung_rows`], device geometry). `end` and `fold` are
+    /// ([`crate::fire::rung_holds`], device geometry). `end` and `fold` are
     /// one report: an engine that reports `end` for a lane whose fire
     /// folds on the device reports `fold` too.
     pub end: Option<u32>,
@@ -445,6 +452,16 @@ pub trait Engine: Send {
     fn take_channel(&mut self, instance: InstanceId, channel: u32) -> Result<Option<Vec<u8>>> {
         let _ = (instance, channel);
         Err(self.unsupported("take_channel"))
+    }
+
+    /// Beam `beam`'s page list of instance `instance`'s beam group, as its
+    /// last fire left it (`BEAM-PAGE-LISTS.md` §6.6): the pool page of each
+    /// column, the group's list width of them (columns past the last fire's
+    /// unspecified). Read once a search ends, after its fires have landed;
+    /// an engine waits for them.
+    fn beam_list(&mut self, instance: InstanceId, beam: u32) -> Result<Vec<u32>> {
+        let _ = (instance, beam);
+        Err(self.unsupported("beam_list"))
     }
 
     fn register_adapter(&mut self, registration: &AdapterRegistration) -> Result<()> {

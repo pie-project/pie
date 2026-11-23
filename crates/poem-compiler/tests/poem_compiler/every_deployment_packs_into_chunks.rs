@@ -563,12 +563,17 @@ fn qwen35_vision_mtp_lays_its_rs_rows_in_an_rs_list_layer_major() {
             panic!("no fixed record")
         };
         assert!(rows.iter().all(|r| matches!(r.row, RowId::Cache(_))));
-        // Each row buffers the conv's input and `[b | a]`, committing into
-        // its layer's delta state.
+        // Each row buffers the conv's input and `[b | a]` (and, where the
+        // backend reads the rows as a linear attention, their keys,
+        // corrected values and per-head scalars), committing into its
+        // layer's delta state.
         for rs in recipe.rs.rows.values() {
             let state = name_of(&trace, RowId::Cache(rs.state.unwrap()));
             assert!(state.ends_with("gdn.delta_state"), "{state}");
-            assert_eq!(rs.planes.len(), 2);
+            assert_eq!(rs.planes.len(), if chunk.rs_corrected { 5 } else { 2 });
+            if chunk.rs_corrected {
+                assert_eq!(rs.planes[4].bytes % 8, 0, "two f32 a value head");
+            }
         }
     }
 }

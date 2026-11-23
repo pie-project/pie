@@ -55,7 +55,7 @@ fn a_load_walks_its_score_capturing_forms() {
     assert!(captures, "the plan has a word capturing its scores");
     let mut shell = load(&fixture);
     shell.warm_pipelines().expect("the walk runs");
-    shell.seal_pipelines();
+    shell.seal_pipelines().expect("the fixed pipelines build");
     let scores = |rows: u32| {
         fixture
             .trace
@@ -74,6 +74,7 @@ fn a_load_walks_its_score_capturing_forms() {
     shell
         .fire_attached(
             &[Seated {
+                replay_stated: None,
                 held: Some(0),
                 ..Seated::of(Lane {
                     slot: 0,
@@ -87,6 +88,7 @@ fn a_load_walks_its_score_capturing_forms() {
     shell
         .fire_attached(
             &[Seated {
+                replay_stated: None,
                 held: Some(tokens.len() as u32),
                 ..Seated::of(Lane {
                     slot: 0,
