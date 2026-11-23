@@ -325,12 +325,12 @@ pub struct WindowedRow {
     pub rows: Vec<RowId>,
     /// W: the rows the layer attends back over, its own included.
     pub window: u32,
-    /// S: the sink rows `[0, S)` the layer always reads. 0 today: the IR
-    /// states no sink rows (DeepSeek's `attn.window_sink` sink is a learned
-    /// logit, a weight, not kv rows).
-    pub sinks: u32,
-    /// The layer's K and V bytes of one row, every row's planes.
+    /// The layer's K and V bytes of one row, every row's planes, unsplit.
     pub per_token: u64,
+    /// How the ranks cut the layer's rows (its kv heads): each rank holds
+    /// the layer's ring at its own per-rank bytes
+    /// ([`WindowedRecipe::rank_layer_bytes`]).
+    pub shard: Shard,
 }
 
 /// Where the ring region lies, as the engine's ring hook answers.
@@ -378,8 +378,8 @@ pub trait RingLayout {
     fn ring_region(&self, layers: &[WindowedRow], buffer: &WindowBufferSlot<'_>) -> RingRegion;
 }
 
-/// The plain per-layer form: each layer's ring of `W + S` rows of its K and
-/// V, one after another, each at a multiple of `align`.
+/// The plain per-layer form: each layer's ring of `W` rows of its K and V,
+/// one after another, each at a multiple of `align`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlainRings {
     pub region: RingRegion,
@@ -397,10 +397,7 @@ pub fn plain_rings(layers: &[WindowedRow], align: u64) -> PlainRings {
     let mut layer_bytes = Vec::with_capacity(layers.len());
     let mut at = 0u64;
     for layer in layers {
-        let ring = align_up(
-            u64::from(layer.window.saturating_add(layer.sinks)) * layer.per_token,
-            align,
-        );
+        let ring = align_up(u64::from(layer.window) * layer.per_token, align);
         offsets.push(at);
         layer_bytes.push(ring);
         at += ring;
@@ -462,6 +459,28 @@ impl WindowedRecipe {
     #[must_use]
     pub fn buffer<'a>(&self, recipe: &'a ChunkRecipe) -> Option<&'a SlotLayout> {
         recipe.slots.get(self.buffer)
+    }
+
+    /// Each windowed layer's share of the ring region on one of `tp` ranks:
+    /// its share cut by the parts the ranks cut that layer's own rows into
+    /// (the fewest, where its rows are cut differently), aligned as the
+    /// recipe's rows are.
+    #[must_use]
+    pub fn rank_layer_bytes(&self, recipe: &ChunkRecipe, tp: u32) -> Vec<u64> {
+        let align = recipe.profile.align();
+        self.layers
+            .iter()
+            .zip(&self.region.layer_bytes)
+            .map(|(layer, bytes)| {
+                let cut = layer
+                    .rows
+                    .iter()
+                    .map(|row| recipe.shards.get(row).map_or(1, |shard| parts(shard, tp)))
+                    .min()
+                    .unwrap_or(1);
+                align_up(bytes.div_ceil(cut.max(1)), align)
+            })
+            .collect()
     }
 
     /// Where layer `at`'s rows run in the window buffer's slot: each of its
@@ -681,7 +700,16 @@ impl ChunkRecipe {
                     _ => false,
                 }
                 && run.atoms_per_piece % parts == 0;
-            let (atoms_per_piece, atom_bytes) = if on_atoms {
+            let (atoms_per_piece, atom_bytes) = if run.row == RowId::Ring {
+                // The ring shrinks layer by layer, each by its own rows'
+                // parts: its atoms keep their count, each its share of the
+                // ring's bytes on the rank.
+                let rank: u64 = self
+                    .windowed
+                    .as_ref()
+                    .map_or(0, |w| w.rank_layer_bytes(self, tp).iter().sum());
+                (run.atoms_per_piece, rank.div_ceil(atom.extent.max(1)))
+            } else if on_atoms {
                 (run.atoms_per_piece / parts, atom.bytes)
             } else {
                 (run.atoms_per_piece, atom.bytes.div_ceil(parts))
@@ -825,8 +853,8 @@ fn windowed_layers(rows: &[&TokenRow]) -> Vec<WindowedRow> {
                 layer: row.layer,
                 rows: vec![row.id],
                 window,
-                sinks: 0,
                 per_token: row.per_token(),
+                shard: row.shard.clone(),
             }),
         }
     }
@@ -850,19 +878,14 @@ fn check_ring(region: &RingRegion, layers: &[WindowedRow]) -> Result<(), ChunkEr
             region.bytes
         ));
     }
-    if let Some((at, _)) =
-        region
-            .layer_bytes
-            .iter()
-            .zip(layers)
-            .enumerate()
-            .find(|(_, (bytes, layer))| {
-                **bytes < u64::from(layer.window.saturating_add(layer.sinks)) * layer.per_token
-            })
+    if let Some((at, _)) = region
+        .layer_bytes
+        .iter()
+        .zip(layers)
+        .enumerate()
+        .find(|(_, (bytes, layer))| **bytes < u64::from(layer.window) * layer.per_token)
     {
-        return wrong(format!(
-            "layer {at}'s share holds fewer than its W + S rows"
-        ));
+        return wrong(format!("layer {at}'s share holds fewer than its W rows"));
     }
     if region.atom == 0 || !region.bytes.is_multiple_of(region.atom) {
         return wrong(format!(
@@ -1038,9 +1061,6 @@ fn plan_with(
                 },
             );
             check_ring(&region, &layers)?;
-            if let Some(first) = windowed.first() {
-                shards.insert(RowId::Ring, first.shard.clone());
-            }
             Some((
                 SlotLayout::List {
                     tokens: page,
@@ -1101,7 +1121,7 @@ fn plan_with(
                 layer: None,
                 bytes,
                 atom,
-                shard: shards.get(&RowId::Ring).cloned().unwrap_or_default(),
+                shard: Shard::Replicated,
             },
         );
     }
@@ -1207,6 +1227,12 @@ fn plan_with(
         on_edge
     };
 
+    // A windowed recipe's window buffer and ring shape (at chunk starts),
+    // weighed beside the others; nothing where the recipe has neither.
+    let windowed_weighed = windowing.as_ref().map(|(buffer, _, region)| Windowed {
+        buffer,
+        ring: ring_atom.filter(|_| region.placement == RingPlacement::ChunkStart),
+    });
     // Weight slots first: of the sizes whose chunks the weights fill within
     // a point of the best, the one the states (kv list, window lists, rs
     // list and fixed records together) waste least in.
@@ -1260,6 +1286,7 @@ fn plan_with(
             record,
             chunk,
             &device,
+            windowed_weighed,
         );
         let better = match &best {
             None => true,
@@ -1700,6 +1727,15 @@ fn pick_fixed(rows: &[FixedRow], record: u64, chunk: u64, align: u64) -> Option<
 /// What a working set takes at the profile's context with chunks of `chunk`
 /// bytes, and what of that holds nothing: its kv and window lists, its rs list
 /// at [`EXPECTED_UNFOLDED`] tokens, and its own fixed record.
+/// A windowed recipe's shapes as [`weigh`] weighs them: the window buffer,
+/// and the ring's atoms where it lies at chunk starts.
+#[derive(Clone, Copy)]
+struct Windowed<'a> {
+    buffer: &'a SlotLayout,
+    ring: Option<Atom>,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn weigh(
     tokens: &[SlotLayout],
     rs: Option<&RsShape>,
@@ -1707,6 +1743,7 @@ fn weigh(
     record: u64,
     chunk: u64,
     device: &ChunkProfile,
+    windowed: Option<Windowed<'_>>,
 ) -> Waste {
     let mut waste = Waste::default();
     let context = device.context;
@@ -1746,6 +1783,32 @@ fn weigh(
         waste.state += sets * record / working;
         waste.fixed_pad += sets * held.saturating_sub(record) / working;
         waste.chunk_tail += tail(sets * u64::from(pick.pieces), pick.slot) / working;
+    }
+    if let Some(Windowed { buffer, ring }) = windowed {
+        // The window buffer holds a fire's unfolded tail, as the rs list
+        // does: [`EXPECTED_UNFOLDED`] rows.
+        shapes += 1;
+        let tokens = match buffer {
+            SlotLayout::List { tokens, .. } => (*tokens).max(1),
+            _ => 1,
+        };
+        let slots = u64::from(EXPECTED_UNFOLDED.div_ceil(tokens));
+        let per_token: u64 = buffer.runs().iter().map(|r| r.per_token).sum();
+        let held = u64::from(EXPECTED_UNFOLDED.min(tokens)) * per_token;
+        waste.state += held;
+        waste.list_tail += (slots * buffer.bytes()).saturating_sub(held);
+        waste.chunk_tail += tail(slots, buffer.bytes());
+        // A ring at chunk starts: whole chunks a record, as a fixed shape.
+        if let Some(atom) = ring {
+            shapes += 1;
+            let per_piece = (chunk / atom.bytes.max(1)).max(1);
+            let pieces = atom.extent.div_ceil(per_piece).max(1);
+            let ring_record = atom.extent * atom.bytes;
+            let working = u64::from(device.concurrency.max(1));
+            let sets = working * u64::from(FIXED_SETS_PER_WS);
+            waste.state += sets * ring_record / working;
+            waste.fixed_pad += sets * (pieces * chunk).saturating_sub(ring_record) / working;
+        }
     }
     waste.open_chunks = shapes * chunk / 2 / u64::from(device.concurrency.max(1));
     let (segment, chunks) = device.segment(chunk);
