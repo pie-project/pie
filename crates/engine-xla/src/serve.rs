@@ -2333,7 +2333,13 @@ impl Shell {
         // anything.
         let holds = engine::RungReplay {
             carried_max: Some(crate::rs::carried_room(descriptor.bucket)),
-            ..engine::RungReplay::default()
+            own_max: None,
+            scratch: engine::ScratchBytes {
+                slot_bytes: Vec::new(),
+                lane_bytes: 0,
+                room_bytes: 0,
+                pad: 1,
+            },
         };
         let count = engine::ReplayRows {
             carried,

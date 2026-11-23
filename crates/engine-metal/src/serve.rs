@@ -1727,7 +1727,36 @@ impl Shell {
     /// The chunk pool as the runtime counts it.
     #[must_use]
     pub fn pool_chunk_facts(&self) -> engine::chunk::ChunkFacts {
-        self.pools.chunk_facts()
+        let mut facts = self.pools.chunk_facts();
+        // Each rung's rs scratch, from its reserve (`rs_room` at load): a
+        // rung of T tokens lays `Seat::scratch_bytes(layout, own + T,
+        // min(T, max_lanes))`, each scratch slot's rows rounded to 256 bytes
+        // and the lanes' work term too; a fire takes the same of its own
+        // scratch rows and lanes, its own rows and carried rows each at
+        // most the rung's tokens. Its compactness is a fire's (its rs page
+        // table read per fire).
+        if let Some(layout) = &self.rs_layout {
+            let rooms = self.arena.rs_rooms();
+            facts.act_replay = facts
+                .act_chunks
+                .iter()
+                .map(|&(tokens, _)| engine::RungReplay {
+                    own_max: Some(tokens),
+                    carried_max: Some(tokens),
+                    scratch: engine::ScratchBytes {
+                        slot_bytes: layout.slots.clone(),
+                        lane_bytes: layout.work_elems.saturating_mul(4),
+                        room_bytes: rooms
+                            .iter()
+                            .find(|&&(at, _)| at == tokens)
+                            .map_or(0, |&(_, bytes)| bytes),
+                        pad: 256,
+                    },
+                })
+                .collect();
+            facts.rs_scratch_per_fire = true;
+        }
+        facts
     }
 
     /// Backs every seat's run, its pages and its record: what a caller

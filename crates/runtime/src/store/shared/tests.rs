@@ -308,6 +308,12 @@ fn fixed_facts() -> ChunkFacts {
             MIB / 4,
         )
     });
+    // Each rung's rs scratch: its rows only, nothing past them laid.
+    facts.act_replay = facts
+        .act_chunks
+        .iter()
+        .map(|&(tokens, _)| super::rows_only(tokens))
+        .collect();
     facts.validate().unwrap();
     facts
 }

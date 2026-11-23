@@ -182,6 +182,33 @@ impl Shell {
         let rungs = self.arena.rungs(self.compiled.arena_forked.as_ref());
         let mut facts = self.pools.chunk_facts(max_tokens, &rungs)?;
         (facts.held_bytes, facts.outside_bytes) = self.held_and_outside();
+        // Each rung's replay scratch, from the extended run's reserve
+        // (`store::rs::Buffers::reserve`): `RsScratch::need(rows_ext, row)`,
+        // `(rows_ext + 64) * row + 4 MiB`, laid for the widest bucket's
+        // `rows_ext(max_tokens)` whatever the fire's bucket, so the rows a
+        // fire's extended run takes, its own and its replayed (a decoding
+        // lane's none: its decode step reads them as a linear attention, so
+        // its scratch is always compact), are at most that many.
+        if let Some(buffers) = &self.buffers {
+            let row = buffers.ext_row_bytes();
+            let rows = u64::from(crate::store::rs::Buffers::rows_ext(max_tokens));
+            facts.act_replay = facts
+                .act_chunks
+                .iter()
+                .map(|&(tokens, _)| engine::RungReplay {
+                    own_max: Some(tokens),
+                    carried_max: Some(max_tokens),
+                    scratch: engine::ScratchBytes {
+                        slot_bytes: vec![row],
+                        lane_bytes: 0,
+                        room_bytes: rows.saturating_mul(row),
+                        pad: 1,
+                    },
+                })
+                .collect();
+            facts.rs_compact = true;
+            facts.rs_scratch_per_fire = false;
+        }
         Ok(facts)
     }
 

@@ -620,6 +620,24 @@ pub enum SharedError {
     },
 }
 
+/// A rung of `tokens` on a load that replays no buffered recurrent row (no
+/// rs list: [`ChunkFacts::validate`] holds a load that does to stating its
+/// rs scratch): its own and carried rows each at most its tokens, no rs
+/// scratch to bind.
+#[must_use]
+pub fn rows_only(tokens: u32) -> ::engine::RungReplay {
+    ::engine::RungReplay {
+        own_max: Some(tokens),
+        carried_max: Some(tokens),
+        scratch: ::engine::ScratchBytes {
+            slot_bytes: Vec::new(),
+            lane_bytes: 0,
+            room_bytes: 0,
+            pad: 1,
+        },
+    }
+}
+
 /// A shared pool's chunks as they divide for good ([`SharedPool::room`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PoolRoom {
@@ -920,6 +938,8 @@ pub struct SharedPool {
     /// The load's rs scratch lays only the carried rows a rung counts
     /// (`ChunkFacts::rs_compact`).
     rs_compact: bool,
+    /// Its scratch compactness is a fire's (`ChunkFacts::rs_scratch_per_fire`).
+    rs_scratch_per_fire: bool,
 }
 
 /// The fence epoch a raise's moved-off chunks wait on until the engine has
@@ -1178,9 +1198,15 @@ impl SharedPool {
                 .act_chunks
                 .iter()
                 .enumerate()
-                .map(|(at, &(tokens, _))| (tokens, facts.rung_replay(at)))
+                .map(|(at, &(tokens, _))| {
+                    (
+                        tokens,
+                        facts.rung_replay(at).cloned().unwrap_or_else(|| rows_only(tokens)),
+                    )
+                })
                 .collect(),
             rs_compact: facts.rs_compact,
+            rs_scratch_per_fire: facts.rs_scratch_per_fire,
         };
         // The engine holds the rung the pool starts at.
         shared.told = shared.pool.rung();
@@ -2234,9 +2260,15 @@ impl SharedPool {
         let widest = self.rung_for(u32::MAX);
         self.replay
             .iter()
-            .copied()
-            .filter(|&(tokens, _)| tokens <= widest)
+            .filter(|(tokens, _)| *tokens <= widest)
+            .cloned()
             .collect()
+    }
+
+    /// Its scratch compactness is a fire's.
+    #[must_use]
+    pub fn rs_scratch_per_fire(&self) -> bool {
+        self.rs_scratch_per_fire
     }
 
     /// The load's rs scratch layout is compact
