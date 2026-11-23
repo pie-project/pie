@@ -805,7 +805,8 @@ pub struct ReplayRows {
 impl ReplayRows {
     /// The rows of a fire whose lanes compute `(own, carried)` rows each,
     /// `carried` every buffered row a lane replays ahead of its own (a
-    /// decode lane's included), on a load whose rs scratch is `compact`.
+    /// decode lane's included), its rs scratch `compact` or not (the fire's,
+    /// [`scratch_compact`]).
     #[must_use]
     pub fn of_lanes(lanes: impl IntoIterator<Item = (u32, u32)> + Clone, compact: bool) -> ReplayRows {
         let own = lanes
@@ -826,7 +827,8 @@ impl ReplayRows {
 
     /// The same counts from a fire's sums: `own` rows, `carried` counted by
     /// [`lane_carried`] lane by lane, and `replayed` every lane's carried
-    /// rows (a decode lane's included). [`rs_scratch_rows`] summed.
+    /// rows (a decode lane's included), its rs scratch `compact` or not (the
+    /// fire's, [`scratch_compact`]). [`rs_scratch_rows`] summed.
     #[must_use]
     pub fn of_sums(own: u32, carried: u32, replayed: u32, compact: bool) -> ReplayRows {
         ReplayRows {
@@ -847,11 +849,46 @@ impl ReplayRows {
     }
 }
 
+/// Whether a lane's buffered rows are one stretch its fire's rs page table
+/// names ([`scratch_compact`]): the buffered rows it replays
+/// ([`buffered_reads`] of its mask, its folded index, its first row and its
+/// lineage, as [`RsVerb::Buffer`] states them) are one run at most, ending
+/// where its own rows start, so they and the rows it lands in the buffer
+/// are one adjacent stretch of the same pages. A lane whose admitted slots
+/// are not one run (a beam's ancestry among its siblings') is not; one
+/// whose mask cannot be read is not either.
+#[must_use]
+pub fn lane_one_run(masking: Option<&Masking>, folded: u32, first: u32, lineage: Lineage) -> bool {
+    match buffered_reads(masking, folded, first, lineage) {
+        Ok(runs) => match runs.as_slice() {
+            [] => true,
+            [run] => run.end == first,
+            _ => false,
+        },
+        Err(_) => false,
+    }
+}
+
+/// Whether a fire's rs scratch is compact, laying only the carried rows a
+/// rung counts ([`lane_carried`]: a decode lane's none) rather than every
+/// lane's: the one function both the runtime (choosing the fire's rung) and
+/// the engine (checking it at submit) decide it by, from what both know. A
+/// fire is compact exactly where the load's rs layout is
+/// (`ChunkFacts::rs_compact`: every recurrent op on its paged forms, its rs
+/// page table staged), every lane's buffered rows are one stretch
+/// (`every_lane_one_run`, each lane by [`lane_one_run`]), and no lane lands
+/// an rs snapshot (`any_lane_snapshots`: a lane's `Lane::rs_snapshots`, an
+/// auto-checkpoint's included). No engine decides compactness otherwise.
+#[must_use]
+pub fn scratch_compact(layout_compact: bool, every_lane_one_run: bool, any_lane_snapshots: bool) -> bool {
+    layout_compact && every_lane_one_run && !any_lane_snapshots
+}
+
 /// The replay scratch rows a fire of `own` rows takes, its lanes carrying
 /// `(lane own, carried)` rows each: its own rows, and each lane's carried
-/// rows as the load's scratch lays them: on a `compact` load only those a
-/// rung counts ([`lane_carried`]: a decode lane's none), else every one, a
-/// decode lane's included.
+/// rows as the fire's scratch lays them: where it is `compact`
+/// ([`scratch_compact`]) only those a rung counts ([`lane_carried`]: a
+/// decode lane's none), else every one, a decode lane's included.
 #[must_use]
 pub fn rs_scratch_rows(own: u32, lanes: impl IntoIterator<Item = (u32, u32)>, compact: bool) -> u32 {
     lanes.into_iter().fold(own, |sum, (lane_own, carried)| {

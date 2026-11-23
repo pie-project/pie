@@ -124,3 +124,21 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
     lane's tables / Lane.fixed. Byte reads of host refs (read_host_kv / read_host_state) are not stated. copy_kv /
     copy_state to/from host remain only for engines stating degenerate facts. TP: smallest host/disk chunk counts
     across ranks; each rank moves its band.
+23. **A rung's replay scratch is stated; one function checks a fire against it (replaces `fire::rung_rows`).**
+    Each activation rung states what its replay scratch holds: `ChunkFacts.act_replay: Vec<RungReplay { own_max,
+    carried_max, total_max }>` (each `Option<u32>`, `None` not binding; one a rung of `act_chunks`, in its order;
+    empty: each rung `RungReplay::floor(T)`, own T and carried T). A fire's rows are `ReplayRows { own, carried,
+    scratch }`: `own` every row its lanes compute in it (never its lane count), `carried` each lane's by
+    `fire::lane_carried` (a decode lane's none), `scratch` `fire::rs_scratch_rows` (own, and each lane's carried
+    rows: on a compact fire `lane_carried`'s, else every one, a decode lane's included). A fire's compactness is
+    the fire's, decided only by `fire::scratch_compact(ChunkFacts.rs_compact, every_lane_one_run,
+    any_lane_snapshots)`: the load's rs layout compact (every recurrent op paged, its page table staged), every
+    lane's buffered rows one stretch (`fire::lane_one_run(mask, folded, first, lineage)`, from its
+    `RsVerb::Buffer`: one run at most of `buffered_reads`, ending at its first row), and no lane landing an rs
+    snapshot (an auto-checkpoint's included); no engine derives it otherwise. `fire::rung_holds(&RungReplay, ReplayRows)` returns the bound that binds (`ReplayPast { bound:
+    Own | Carried | Total, rows, max }`). The runtime runs a fire at the smallest rung that holds it, each piece
+    of a cut pass as cut (the uncut pass's own rows are no piece's), and refuses by name, naming the bound, a
+    piece no rung holds, before any step; each engine's submit check calls the same functions against the rung
+    it stages in. Stated today: Metal own T, carried T, total 2T; CUDA own T, carried its widest
+    bucket's tokens, no total; engine-gpu and XLA the floor. `FireLimits.replayed_rows` stays the step's bound on
+    every lane's replayed rows.

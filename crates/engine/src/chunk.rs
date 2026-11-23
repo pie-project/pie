@@ -81,9 +81,11 @@ pub struct ChunkFacts {
     /// ([`crate::RungReplay::floor`]).
     #[serde(default)]
     pub act_replay: Vec<crate::RungReplay>,
-    /// The load's rs scratch lays only the carried rows a rung counts
-    /// ([`crate::fire::lane_carried`]: a decode lane's none), not every
-    /// lane's: how [`crate::fire::rs_scratch_rows`] counts its fires.
+    /// The load's rs scratch layout is compact (every recurrent op on its
+    /// paged forms, its rs page table staged): a fire on it lays only the
+    /// carried rows a rung counts ([`crate::fire::lane_carried`]: a decode
+    /// lane's none) where the fire is compact too
+    /// ([`crate::fire::scratch_compact`], which alone decides it).
     #[serde(default)]
     pub rs_compact: bool,
     /// The rungs of [`ChunkFacts::act_chunks`] the engine states eager, by
