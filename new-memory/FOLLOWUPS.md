@@ -1206,3 +1206,21 @@ on Qwen3-8B served (forced, same build and home: split 71.4 / 71.9 ms, merged 70
   in tiles per CU (stored keyed, measured once by sweeping live rows on one bucket's body), the
   pick staged as a per-fire word both kernels read, as the mask word is, so one recorded body
   serves both ways. No constant and no residency guess.
+
+## F63. A product pick decided inside its own measured spread lands either way from boot to boot, and moved served c64 ~2% (MI300X, 2026-11-23)
+Of a kind with F51 (a measured quantity that does not reproduce across boots), on the choosing side:
+`profile::routes` keeps a decode product's stated kernel unless another is faster past the two
+measurements' spread, but where the two kernels sit within a few microseconds of each other the
+measured times land on either side of that line from one measuring boot to the next. Qwen3-30B-A3B,
+two fresh homes of one build family: Normed 128x2048 m8 took the turned kernel in one (5691.4 vs
+5672.4 us) and the skinny kernel in the other (5667.9 vs 5670.4 us). Served c64 between the two
+homes moved about 2% (mean of 10, 6006 vs 5859 tok/s); with both builds on one shared home the
+difference went away (5921 vs 5981, sd 132 / 216), so the profile's pick, not the code, carried it.
+- Bounded mostly by committed profiles: a device's committed `<device>.measured.toml` fixes the
+  pick once per device, so every boot of a shipped build serves the same choice. What stays open
+  is a user's own measuring boot (a home with no committed entry for its key, or a code change that
+  retires the committed one), which can land the other way and serve ~2% differently.
+- If it matters: a pick inside the noise could keep the stated kernel unless the margin holds
+  across repeated rounds (re-time the near-ties, or widen the spread to the rounds' range), so a
+  near-tie stays stated instead of a coin flip; or the export can mark near-ties so a reviewer sees
+  which committed picks are noise-decided.
