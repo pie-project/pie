@@ -359,6 +359,9 @@ pub struct Shell {
     window_fills: Vec<(usize, Vec<(u64, u64)>)>,
     /// Own-row pages this fire's lanes took of `Shell::own_top`.
     own_used: u32,
+    /// The first ring piece (cow side) of each ring two lanes of this fire
+    /// share.
+    ring_shared: std::collections::HashSet<u32>,
     /// The own-row pages' chunks at the range's top, `(first, count)`: a
     /// windowed lane's rows past what its ring keeps for its queries, read
     /// as pages of the window slot each fire from these chunks.
@@ -1761,6 +1764,7 @@ impl PreparedLoad<'_> {
             window_folds: Vec::new(),
             window_fills: Vec::new(),
             own_used: 0,
+            ring_shared: std::collections::HashSet::new(),
             own_top,
             landed: BTreeMap::new(),
             forgotten: std::collections::BTreeSet::new(),
@@ -3617,6 +3621,7 @@ impl Shell {
         k: usize,
         seated: &Seated<'_>,
         fold: engine::fire::WindowFold,
+        port_fold: Option<u32>,
         have: u32,
         rows: u32,
     ) -> Result<Vec<u32>> {
@@ -3661,7 +3666,7 @@ impl Shell {
         let end = have + rows;
         let held = u64::from(fold.base) + buffer.len() as u64 * u64::from(page);
         // The fire's own rows past the buffer: their ring rows, or own pages.
-        let shared = false;
+        let shared = pieces.first().is_some_and(|&[_, cow]| self.ring_shared.contains(&cow));
         let direct = crate::store::windowed::direct_allowed(shared, rows, ring_rows, window);
         let (own, own_at, own_page) = if direct || u64::from(end) <= held {
             (Vec::new(), Vec::new(), 0)
@@ -3718,16 +3723,19 @@ impl Shell {
         if !fills.is_empty() {
             self.window_fills.push((k, fills));
         }
+        // A device-counted fold reads its count from the lane's `fold` port,
+        // as the recurrent state's does, bounded by the rows the lane holds.
         let advance = match fold.fold {
             engine::fire::FoldLen::Host(rows) => rows,
-            engine::fire::FoldLen::Device => {
-                return Err(refuse(
-                    "a device-counted window fold (a beam group's lagged fold) is not yet served \
-                     on Metal"
+            engine::fire::FoldLen::Device => port_fold.ok_or_else(|| {
+                refuse(
+                    "a lane states a device-counted window fold, and the program attached to \
+                     it resolved no `fold` port"
                         .to_string(),
-                ));
-            }
-        };
+                )
+            })?,
+        }
+        .min(end.saturating_sub(seated.folded));
         if advance > 0 {
             let copies: Vec<(u64, u64, u32, u32)> = by_index
                 .fold_copies(seated.folded, seated.folded + advance)?
@@ -4789,6 +4797,21 @@ impl Shell {
         let window_lists = self.pools.layout().window_lists().count();
         // A fire's windowed own-row pages, fills and folds start afresh.
         self.own_used = 0;
+        // Rings two or more of this fire's lanes write (a beam group on one
+        // record, unforked): none of them writes its own rows into it
+        // directly, since a sibling's queries still read the rows it would
+        // overwrite.
+        self.ring_shared.clear();
+        {
+            let mut seen = std::collections::HashSet::new();
+            for seated in lanes {
+                if let Some(&[_, cow]) = seated.ring.and_then(|pieces| pieces.first()) {
+                    if !seen.insert(cow) {
+                        self.ring_shared.insert(cow);
+                    }
+                }
+            }
+        }
         self.window_fills.clear();
         self.window_folds.clear();
         let mut window_tables: Vec<Vec<Vec<u32>>> =
@@ -4894,7 +4917,8 @@ impl Shell {
                 } else if self.pools.ring().is_some()
                     && let Some(fold) = seated.window
                 {
-                    self.windowed_pages(k, seated, fold, have, row.rows)?
+                    let port_fold = ports.as_ref().and_then(engine::ports::LanePorts::fold);
+                    self.windowed_pages(k, seated, fold, port_fold, have, row.rows)?
                 } else if self.pools.ring().is_some() && seated.refs {
                     // The runtime states every lane's fold on a load served as
                     // ring + buffer; its buffer slots are no whole window.
