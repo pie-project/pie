@@ -271,6 +271,8 @@ impl Engine for Spatial {
             classes: facts.classes(),
             // Cerebras states no bound on one submission.
             guest_cost: engine::GuestCost::default(),
+            // No `beam_list`: a beam group's bind is refused by name.
+            host_ops: engine::HostOps::NONE,
             mixed_lanes: engine::MixedLanes::Any,
             // one frame at a time: no run-ahead
             frames_in_flight: 1,

@@ -190,6 +190,9 @@ pub struct EngineConfig {
     /// dispatch depth and a beam group's pool's `F`.
     pub frames_in_flight: u32,
     pub device_geometry_port_mask: eta_ir::registry::PortMask,
+    /// The host ops the engine serves ([`::engine::Capabilities::host_ops`]):
+    /// a program needing another is refused at its bind.
+    pub host_ops: ::engine::HostOps,
     pub limits: crate::engine::SchedulerLimits,
     /// The facts the engine's trace branches on.
     pub facts: poem_ir::Facts,
@@ -794,6 +797,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     device_domain: ::engine::MemoryDomain::HostPinned,
                     limits: d.limits,
                     device_geometry_port_mask: d.device_geometry_port_mask,
+                    host_ops: d.host_ops,
                     kind: "",
                     codegen_backend: None,
                 },
