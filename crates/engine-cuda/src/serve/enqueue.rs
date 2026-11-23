@@ -198,7 +198,7 @@ impl Shell {
             seq,
         };
         super::btrace::mark("prepare_tail");
-        fire.gate(p)?;
+        fire.gate(p, slot)?;
         super::btrace::mark("gate");
         let staged = fire.stage(p, slot)?;
         super::btrace::mark("stage");
@@ -404,7 +404,20 @@ impl FireCtx<'_> {
         layout.stage(self.device.stream(), &keys_at)
     }
 
-    fn gate(&mut self, p: &Prepared<'_>) -> Result<()> {
+    /// The lanes a fire's fold gate covers: the most its body carries (its
+    /// key's lane ceiling), so a body recorded at one fire's lanes lays the
+    /// mask of every fire it serves.
+    fn gate_lanes(&self, p: &Prepared<'_>) -> u32 {
+        p.composition
+            .lane_count()
+            .max(p.lane_ceiling.min(self.predicate.lanes()))
+    }
+
+    /// Stages the fire's fold gate with its tables (`Inputs::write_gate`):
+    /// each lane's commit word (a prologue's, or the constant a fold always
+    /// or never takes) and the rows it folds. The mask the folds read is laid
+    /// from them on the device, inside the fire's body (`Run::lay_gate`).
+    fn gate(&mut self, p: &mut Prepared<'_>, slot: &SlotGuard) -> Result<()> {
         let lane_count = p.composition.lane_count();
         if p.rs.predicated || p.rs.truncates {
             let mut commits: Vec<u64> = vec![self.predicate.always(); lane_count as usize];
@@ -427,18 +440,22 @@ impl FireCtx<'_> {
                     *slot = session.commit_word();
                 }
             }
-            self.predicate
-                .write(self.device.stream(), &commits, &p.rs.lens)?;
-            if p.rs.predicated {
-                kernels_cuda::runtime::channel::mask_from_commit(
-                    self.device.ctx(),
-                    self.predicate.commits(),
-                    self.predicate.indptr(),
-                    self.predicate.mask(lane_count).ptr,
-                    lane_count,
-                )
-                .map_err(Fault::from)?;
+            let lanes = self.gate_lanes(p);
+            if lanes > self.predicate.lanes() {
+                return Err(Fault::Ceiling {
+                    what: "rs fold predicates",
+                    need: u64::from(lanes),
+                    have: u64::from(self.predicate.lanes()),
+                });
             }
+            self.inputs.write_gate(
+                slot,
+                &mut p.lengths,
+                &commits,
+                &p.rs.lens,
+                lanes,
+                self.predicate.always(),
+            )?;
         }
         Ok(())
     }
@@ -687,7 +704,7 @@ impl FireCtx<'_> {
         }
         // A lane that folds part of its extended rows splits its scan there.
         let commit_len = if p.rs.truncates {
-            self.predicate.commit_len(lane_count)
+            self.inputs.gate_lens(lane_count)
         } else {
             kernels_cuda::Tensor::ABSENT
         };
@@ -943,6 +960,15 @@ impl FireCtx<'_> {
         // The fire's beam group folds, every layer's, on its stream ahead of
         // its body (§11.3): no step of the fire reads a state before its
         // fold.
+        if p.rs.predicated {
+            let lanes = self.gate_lanes(p);
+            run = run.gated(crate::run::Gate {
+                commits: self.inputs.gate_commits(),
+                indptr: self.predicate.indptr(),
+                mask: self.predicate.mask(lanes).ptr,
+                lanes,
+            });
+        }
         if p.rs.group_folds {
             run.fold_groups_ahead()
                 .map_err(|error| Fault::from(crate::error::kernel(error)))?;
@@ -969,15 +995,17 @@ impl FireCtx<'_> {
                 Some(lanes) => Cursor::across(&place, lanes),
                 None => Cursor::new(&place),
             };
-            walk(
-                self.trace,
-                self.compiled,
-                &p.descriptor,
-                &mut run,
-                &mut cursor,
-                Filter::default(),
-            )
-            .map_err(Fault::from)
+            lay_gate(&run).and_then(|()| {
+                walk(
+                    self.trace,
+                    self.compiled,
+                    &p.descriptor,
+                    &mut run,
+                    &mut cursor,
+                    Filter::default(),
+                )
+                .map_err(Fault::from)
+            })
         } else if records {
             if self.arming && !p.bodied {
                 Ok(())
@@ -1028,6 +1056,21 @@ impl FireCtx<'_> {
                         .unwrap_or("its composition is one a body does not carry"),
                 );
                 let mut cursor = Cursor::new(&place);
+                lay_gate(&run).and_then(|()| {
+                    walk(
+                        self.trace,
+                        self.compiled,
+                        &p.descriptor,
+                        &mut run,
+                        &mut cursor,
+                        Filter::default(),
+                    )
+                    .map_err(Fault::from)
+                })
+            }
+        } else {
+            let mut cursor = Cursor::new(&place);
+            lay_gate(&run).and_then(|()| {
                 walk(
                     self.trace,
                     self.compiled,
@@ -1037,18 +1080,7 @@ impl FireCtx<'_> {
                     Filter::default(),
                 )
                 .map_err(Fault::from)
-            }
-        } else {
-            let mut cursor = Cursor::new(&place);
-            walk(
-                self.trace,
-                self.compiled,
-                &p.descriptor,
-                &mut run,
-                &mut cursor,
-                Filter::default(),
-            )
-            .map_err(Fault::from)
+            })
         };
         drop(run);
         #[cfg(feature = "rocm")]
@@ -1713,6 +1745,13 @@ pub(super) fn fault_of(fired: Fired, instance: engine::InstanceId, at: &str) -> 
     }
 }
 
+/// An eager walk's fold gate, laid ahead of the walk as a body records it
+/// ahead of its first stretch (`record::Bodies::fire_body`).
+fn lay_gate(run: &Run<'_>) -> Result<()> {
+    run.lay_gate()
+        .map_err(|error| Fault::from(crate::error::kernel(error)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Fired, committed_or};
@@ -1742,3 +1781,4 @@ mod tests {
         }
     }
 }
+
