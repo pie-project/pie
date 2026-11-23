@@ -1190,7 +1190,7 @@ What each still times at load or boot, for its owner (paths under `crates/`):
   weigh it (`dense::choose_unrated`). Still open: the Adreno 840's committed profile (`adreno-tm-840`, a
   commented slot in each backend's `SEEDED`) awaits the phone's export.
 
-## F61. ROCm's causal masked prefill: split or merged, chosen per bucket, picks wrong where live rows decide (frozen, ~1%; MI300X, 2026-11-23)
+## F62. ROCm's causal masked prefill: split or merged, chosen per bucket, picks wrong where live rows decide (frozen, ~1%; MI300X, 2026-11-23)
 A causal masked prefill serves its requests that read no bit either split (`paged_prefill_unmasked_of`
 then the skipping `paged_prefill_masked`, landed in 385b52884) or merged (one launch, the plain body
 behind a branch). Split gains Qwen3-30B-A3B about 4.3 ms at pf2048; merged is about 0.75 ms faster
