@@ -1435,6 +1435,7 @@ impl Metal {
         let mut record_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
         let mut run_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
         let mut window_of: Vec<Vec<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
+        let mut ring_of: Vec<Option<Vec<[u32; 2]>>> = Vec::with_capacity(submission.lanes.len());
         let mut forks: Vec<(u32, u32)> = Vec::new();
         for lane in &submission.lanes {
             pages_of.push(
@@ -1456,6 +1457,13 @@ impl Metal {
                 })
                 .collect();
             window_of.push(windows);
+            ring_of.push(match &lane.record {
+                engine::fire::LaneRecord::Pieces(pieces) => pieces
+                    .iter()
+                    .find(|(shape, _)| *shape == crate::store::layout::RING)
+                    .map(|(_, pieces)| pieces.clone()),
+                _ => None,
+            });
             // A load that holds state is told every lane's record: its
             // pieces, or none (the null record).
             let fixed: Option<Vec<[u32; 2]>> = match &lane.record {
@@ -1543,6 +1551,8 @@ impl Metal {
                     record: record_of[at].as_deref(),
                     record_run: run_of[at].as_deref(),
                     windows: &window_of[at],
+                    ring: ring_of[at].as_deref(),
+                    window: submission.lanes[at].window,
                     reports: lane.reports,
                 })
             })

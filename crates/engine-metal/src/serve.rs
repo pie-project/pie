@@ -210,6 +210,11 @@ pub struct Seated<'a> {
     /// trimmed behind the window), for the windowed rows; a missing or empty
     /// seat-addresses them.
     pub windows: &'a [Vec<u32>],
+    /// A windowed load's lane: its record's ring pieces (`layout::RING`
+    /// slot refs, `[run, cow]`) and how this fire folds its window
+    /// (`engine::fire::Lane::window`, CONTRACT-BC 19, 21).
+    pub ring: Option<&'a [[u32; 2]]>,
+    pub window: Option<engine::fire::WindowFold>,
     /// The runtime's report tag for this lane (`engine::fire` lane
     /// `reports`); 0: no report asked.
     pub reports: u64,
@@ -241,6 +246,8 @@ impl<'a> Seated<'a> {
             record: None,
             record_run: None,
             windows: &[],
+            ring: None,
+            window: None,
             reports: 0,
         }
     }
