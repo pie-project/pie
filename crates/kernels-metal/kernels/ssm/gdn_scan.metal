@@ -1423,6 +1423,21 @@ template [[host_name("gated_delta_group_fold_bfloat16")]]
         float4(st[v][0], st[v][1], st[v][2], st[v][3]);                      \
   }
 
+// One carried row's step on the tile from the staged inputs.
+#define PIE_GDN_STEP_CARRIED(t)                                                \
+  {                                                                          \
+    const float g = g_s[t];                                                  \
+    const float k0 = kn_s[t][PER * lane + 0], k1 = kn_s[t][PER * lane + 1];  \
+    const float k2 = kn_s[t][PER * lane + 2], k3 = kn_s[t][PER * lane + 3];  \
+    for (int v = 0; v < VROWS; ++v) {                                        \
+      const float u = u_s[t][sg * VROWS + v];                                \
+      st[v][0] = g * st[v][0] + k0 * u;                                      \
+      st[v][1] = g * st[v][1] + k1 * u;                                      \
+      st[v][2] = g * st[v][2] + k2 * u;                                      \
+      st[v][3] = g * st[v][3] + k3 * u;                                      \
+    }                                                                        \
+  }
+
 // `gated_delta_carried` for a carry of one chunk (up to `kVerifyChunk`
 // rows, a decode at its run-ahead lag): the fused step's tiling, a
 // simdgroup holding 16 value rows of the head's state in registers, loaded
@@ -1620,21 +1635,17 @@ template <typename T, int SG, int VROWS>
   // as its landing stored them), the state written once the rows this fire
   // folds are in; then the own row as the scan step takes it, on the state
   // with every carried row in.
-  for (int t = 0; t < rep; ++t) {
-    if (t == keep && keep > 0) {
-      PIE_GDN_STORE_STATE;
-    }
-    const float g = g_s[t];
-    const int sv = sg * VROWS;
-    for (int v = 0; v < VROWS; ++v) {
-      const float u = u_s[t][sv + v];
-      for (int i = 0; i < PER; ++i) {
-        st[v][i] = g * st[v][i] + kn_s[t][PER * lane + i] * u;
-      }
-    }
+  // The rows the lane folds, the state stored, then the rest: no branch
+  // and no store inside either loop, so the tile stays in registers.
+  const int folds = min(keep, rep);
+  for (int t = 0; t < folds; ++t) {
+    PIE_GDN_STEP_CARRIED(t);
   }
-  if (keep == rep && rep > 0) {
+  if (folds > 0) {
     PIE_GDN_STORE_STATE;
+  }
+  for (int t = folds; t < rep; ++t) {
+    PIE_GDN_STEP_CARRIED(t);
   }
 
   // The own row: its corrected value, readout and landing.
