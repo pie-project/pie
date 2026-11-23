@@ -1849,7 +1849,14 @@ impl<B: Host> Gpu<B> {
         for attachment in &submission.attachments {
             let lane = attachment.lane as usize;
             let stated = &submission.lanes[lane];
-            if crate::store::frozen::reads_count(&stated.rs, stated.reports) {
+            let window_counted = matches!(
+                stated.window,
+                Some(engine::fire::WindowFold {
+                    fold: engine::fire::FoldLen::Device,
+                    ..
+                })
+            );
+            if crate::store::frozen::reads_count(&stated.rs, stated.reports) || window_counted {
                 match self.programs.envelope_fold(attachment.instance) {
                     Ok(count) => folds[lane].count = count,
                     Err(refused) => faulted.fault_lanes(

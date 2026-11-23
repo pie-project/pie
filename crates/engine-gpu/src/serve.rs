@@ -1714,6 +1714,11 @@ impl<B: Serve> Shell<B> {
                     buffer.bytes,
                     crate::store::layout::gcd(rows.chunk_bytes, buffer.bytes),
                 );
+                tracing::info!(
+                    slot_bytes = buffer.bytes,
+                    rungs = ?span.fire_bytes(buffer.bytes),
+                    "each rung's activation holds its fires' own windowed rows: (tokens, bytes)"
+                );
             }
             // A capturing lane's row is as wide as the load's context, in its
             // pages: the widths the span lays its rows at.
@@ -4457,6 +4462,17 @@ impl<B: Serve> Shell<B> {
     }
 
     pub fn fire_seated(&mut self, lanes: &[Seated<'_, B>]) -> Result<Vec<Vec<f32>>> {
+        self.fire_folded(lanes, &[])
+    }
+
+    /// [`Shell::fire_seated`] where lanes fold by a count their programs
+    /// make on the device (`FoldLen::Device`): `folds[i]` lane `i`'s, as the
+    /// engine reads it at the fire.
+    pub fn fire_folded(
+        &mut self,
+        lanes: &[Seated<'_, B>],
+        folds: &[crate::store::frozen::DeviceFold],
+    ) -> Result<Vec<Vec<f32>>> {
         use engine::frame::Shell as FrameShell;
         // A served load fired before the engine placed its programs hangs
         // the device on what placing them sets up: refused, by name.
@@ -4481,7 +4497,7 @@ impl<B: Serve> Shell<B> {
 
                 media: &[],
                 clips: &[],
-                folds: &[],
+                folds,
                 done: None,
                 guests: None,
             },
@@ -5874,6 +5890,7 @@ impl<B: Serve> Shell<B> {
                     first: have,
                     rows: row.rows,
                     buffer: Vec::new(),
+                    reads: Vec::new(),
                     record: u32::try_from(seats.len().saturating_sub(1)).unwrap_or(u32::MAX),
                     keeps: false,
                 });
@@ -5897,15 +5914,30 @@ impl<B: Serve> Shell<B> {
                     },
                 };
                 let folded = if seated.refs { seated.folded } else { have };
-                let engine::fire::FoldLen::Host(fold) = window.fold else {
-                    return Err(program(
-                        "serve::stage",
-                        format!(
-                            "lane {source} folds its windowed layers by a count its program \
-                             makes on the device, which this load's rings do not take"
-                        ),
-                    ));
+                // A fold the device counts: the count its program's `fold`
+                // port holds at the fire, as the recurrent scans take it.
+                let fold = match window.fold {
+                    engine::fire::FoldLen::Host(fold) => fold,
+                    engine::fire::FoldLen::Device => device.count.ok_or_else(|| {
+                        program(
+                            "serve::stage",
+                            format!(
+                                "lane {source} folds its windowed layers by a count its \
+                                 program makes on the device, and no attached program holds \
+                                 one at the fire"
+                            ),
+                        )
+                    })?,
                 };
+                // The buffered rows its lineage reads, as its recurrent
+                // layers replay them.
+                let reads = engine::fire::buffered_reads(
+                    seated.mask.filter(|_| seated.refs),
+                    folded,
+                    have,
+                    window.lineage,
+                )
+                .map_err(|why| program("serve::stage", format!("lane {source}: {why}")))?;
                 let end = have + row.rows;
                 let to = folded.saturating_add(fold);
                 // The slots a seat's table names: of the rows read from it
@@ -5939,6 +5971,7 @@ impl<B: Serve> Shell<B> {
                     first: have,
                     rows: row.rows,
                     buffer,
+                    reads,
                     // The lane's entry of the fire's record table.
                     record: u32::try_from(seats.len().saturating_sub(1)).unwrap_or(u32::MAX),
                     keeps: true,
@@ -6827,7 +6860,7 @@ impl<B: Serve> Shell<B> {
                 seat.with(fire, slot_ids.get(at..at + pieces).unwrap_or(&[]))
             })
             .collect();
-        crate::ring::stage(&lanes, tokens, rows).map(Some)
+        crate::ring::stage(&lanes, tokens, rows, &self.pools.windows()).map(Some)
     }
 
     fn walk_once(&self, p: &Prepared<'_, B>, keep: bool, split: bool) -> Result<Walked<B>> {

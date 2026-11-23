@@ -371,6 +371,16 @@ impl<B: Backend> Span<B> {
         }
     }
 
+    /// Each rung's tokens and the bytes its fire slots take in its carve
+    /// (what its stated activation chunks count for them).
+    #[must_use]
+    pub fn fire_bytes(&self, slot_bytes: u64) -> Vec<(u32, u64)> {
+        self.rungs
+            .iter()
+            .map(|rung| (rung.tokens, u64::from(rung.fire_slots) * slot_bytes))
+            .collect()
+    }
+
     /// The tokens rung `rung`'s fires bring at most.
     #[must_use]
     pub fn rung_tokens(&self, rung: usize) -> u32 {

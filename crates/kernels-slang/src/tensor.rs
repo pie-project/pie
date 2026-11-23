@@ -148,12 +148,14 @@ pub struct KvPool {
 /// `slot_stride` words into the pool.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Ring {
-    /// `4 + pieces` i32 a lane: its folded index (keys below it lie in the
+    /// `6 + pieces` i32 a lane: its folded index (keys below it lie in the
     /// ring), its buffer base (a page's first row: entry `i` of its table
     /// holds rows `[base + i * page, base + (i + 1) * page)`), its first row
     /// in the fire (keys from it on lie in the fire's own slots, the page
     /// table's after the lane's buffer slots of the rows below it), its
-    /// folded index after the fire (the fold's), then its record's units.
+    /// folded index after the fire (the fold's), the buffered rows it does
+    /// not read and the first slot of its one run of those it reads (a
+    /// row's window counts along its lineage), then its record's units.
     pub lanes: Tensor,
     pub rows: u32,
     /// The record's pieces the keys and the values lie in.

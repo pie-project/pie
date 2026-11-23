@@ -276,7 +276,15 @@ fn stage(gpu: &mut Gpu, g: &Geometry, lanes: &[Lane], laid: &Laid, to: &[usize])
         .zip(to)
         .enumerate()
         .flat_map(|(l, (lane, &to))| {
-            [lane.folded as i32, lane.base as i32, lane.first as i32, to as i32]
+            // Alone on its set: its lineage is the set's slots.
+            [
+                lane.folded as i32,
+                lane.base as i32,
+                lane.first as i32,
+                to as i32,
+                0,
+                lane.folded as i32,
+            ]
                 .into_iter()
                 .chain(laid.records[l * PIECES..][..PIECES].iter().copied())
         })
@@ -690,4 +698,200 @@ fn a_ring_decode_costs_what_a_paged_window_does() {
         best[2] / best[0],
         best[1] / best[0]
     );
+}
+
+/// Beam siblings sharing one set read along their own lineages
+/// (CONTRACT-BC 19, `Lineage::Admitted`): two lanes over one folded ring
+/// (rows below 48) and one set's buffer whose rows 48..64 interleave theirs
+/// (lane 0 the even slots, lane 1 the odd), each decoding a row past them
+/// through its mask. A row's window of 32 counts along its lineage (its
+/// eight buffered rows, then its own), so it starts at ring row 25, where
+/// counting the set's slots would start it at 33 or 34; each lane answers
+/// the reference over exactly its lineage's keys.
+#[test]
+fn beam_siblings_read_their_window_along_their_own_lineage() {
+    let Some(mut gpu) = Gpu::open() else {
+        eprintln!("not asked: no device");
+        return;
+    };
+    let t = |b: u32, r: usize, w: usize, d: Dtype| Tensor::new(b, r as u32, w as u32, d);
+    let hd = 64usize;
+    let g = Geometry::of(hd, 16, 2);
+    let (folded, firsts) = (48usize, [64usize, 65]);
+    let mut pool: Vec<f32> = noise(41, g.elems)
+        .into_iter()
+        .map(|x| crate::gpu::widen(crate::gpu::bf16(x)))
+        .collect();
+    let row_of = |seed: u64| -> Vec<f64> {
+        noise(seed, g.row)
+            .into_iter()
+            .map(|x| f64::from(crate::gpu::widen(crate::gpu::bf16(x))))
+            .collect()
+    };
+    let put = |pool: &mut Vec<f32>, at: usize, row: &[f64]| {
+        for (d, x) in row.iter().enumerate() {
+            pool[at + d] = *x as f32;
+        }
+    };
+    // The common ancestor's rows in the one record's ring (lane 0's).
+    let anc: Vec<(Vec<f64>, Vec<f64>)> = (0..folded)
+        .map(|r| (row_of(1000 + r as u64), row_of(5000 + r as u64)))
+        .collect();
+    for r in folded - R..folded {
+        put(&mut pool, g.ring_at(0, r % R, false), &anc[r].0);
+        put(&mut pool, g.ring_at(0, r % R, true), &anc[r].1);
+    }
+    // The set's buffer: slot unit 1 rows 48..64 (lane l's at slot 48 + 2i + l),
+    // unit 3 past them; each lane's own row in a fire slot of its own.
+    let buffered: Vec<(Vec<f64>, Vec<f64>)> = (0..16)
+        .map(|i| (row_of(9000 + i), row_of(9500 + i)))
+        .collect();
+    for (i, (k, v)) in buffered.iter().enumerate() {
+        put(&mut pool, g.slot_at(1, i, false), k);
+        put(&mut pool, g.slot_at(1, i, true), v);
+    }
+    let own: Vec<(Vec<f64>, Vec<f64>)> = (0..2).map(|l| (row_of(700 + l), row_of(800 + l))).collect();
+    for (l, unit) in [(0usize, 5u32), (1, 7)] {
+        put(&mut pool, g.slot_at(unit, 0, false), &own[l].0);
+        put(&mut pool, g.slot_at(unit, 0, true), &own[l].1);
+    }
+    let (pool_buf, _) = gpu.up(&pool);
+    let record = [g.record0 as i32, (g.record0 + 1) as i32];
+    let mut lanes_table = Vec::new();
+    for l in 0..2usize {
+        let shift = firsts[l] - folded - 8;
+        lanes_table.extend([folded as i32, 48, firsts[l] as i32, folded as i32, shift as i32, 48]);
+        lanes_table.extend(record);
+    }
+    let indices = [1u32, 5, 1, 3, 7];
+    let indptr = [0u32, 2, 5];
+    // Masks from the folded index: a lane's own buffered slots and its row.
+    let mut mask = vec![0u8; 2 * MASK_STRIDE];
+    let mut words = Vec::new();
+    for l in 0..2usize {
+        for c in 0..MASK_STRIDE {
+            let slot = folded + c;
+            let mine = (slot < 64 && (slot - folded) % 2 == l) || slot == firsts[l];
+            mask[l * MASK_STRIDE + c] = u8::from(mine);
+        }
+        words.extend([folded as u32, (l * MASK_STRIDE) as u32]);
+    }
+    let (pi, pp) = (gpu.up_u32(&indices), gpu.up_u32(&indptr));
+    let rl = gpu.up_i32(&lanes_table);
+    let pos = gpu.up_i32(&[64, 65]);
+    let own_req = gpu.up_i32(&[0, 1]);
+    let (mb, eb) = (gpu.up_u32(&pack(&mask)), gpu.up_u32(&words));
+    let cells = |w: usize| t(pool_buf, g.elems / w, w, Dtype::Bf16);
+    let kv = KvPool {
+        keys: cells(g.row),
+        values: cells(g.row),
+        page_indices: t(pi, indices.len(), 1, Dtype::U32),
+        page_indptr: t(pp, indptr.len(), 1, Dtype::U32),
+        page_size: PAGE as i32,
+        seq_stride: g.row as u64,
+        head_stride: hd as u64,
+        pool: Segments::one(pool_buf, (g.elems / 2) as u32),
+        page_stride: [g.slot_words as u32, g.slot_words as u32],
+        origin: [0, (PAGE * g.row / 2) as u32],
+        ring: Some(Ring {
+            lanes: t(rl, lanes_table.len(), 1, Dtype::I32),
+            rows: R as u32,
+            piece: PIECE as u32,
+            values_piece: PIECE as u32,
+            pieces: PIECES as u32,
+            keys: RING_AT as u32,
+            values: (RING_AT + R * g.row / 2) as u32,
+            slot_stride: g.piece_words as u32,
+        }),
+    };
+    let tables = sdpa::Tables {
+        positions: t(pos, 2, 1, Dtype::I32),
+        request_of_token: t(own_req, 2, 1, Dtype::I32),
+        mask: t(mb, 1, 2 * MASK_STRIDE, Dtype::U8),
+        mask_words: t(eb, 2, 2, Dtype::U32),
+        row0: 0,
+        rows: 2,
+    };
+    // The reference: lineage start 25 for both rows.
+    let (q, qr) = gpu.up(&noise(77, 2 * QH * hd));
+    let scale = 1.0 / (hd as f64).sqrt();
+    let mut want = Vec::new();
+    for l in 0..2usize {
+        let lin = folded + 8;
+        let start = lin + 1 - W;
+        assert!(start < folded && firsts[l] + 1 - W > start, "the lineage starts earlier");
+        let mut keys: Vec<(&[f64], &[f64])> = (start..folded)
+            .map(|r| (anc[r].0.as_slice(), anc[r].1.as_slice()))
+            .collect();
+        for i in (l..16).step_by(2) {
+            keys.push((&buffered[i].0, &buffered[i].1));
+        }
+        keys.push((&own[l].0, &own[l].1));
+        for h in 0..QH {
+            let kh = h / (QH / KVH);
+            let qv = &qr[(l * QH + h) * hd..][..hd];
+            let s: Vec<f64> = keys
+                .iter()
+                .map(|(k, _)| {
+                    qv.iter()
+                        .zip(&k[kh * hd..][..hd])
+                        .map(|(a, b)| f64::from(*a) * b)
+                        .sum::<f64>()
+                        * scale
+                })
+                .collect();
+            let top = s.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let z: f64 = s.iter().map(|x| (x - top).exp()).sum();
+            for d in 0..hd {
+                want.push(
+                    keys.iter()
+                        .zip(&s)
+                        .map(|((_, v), x)| (x - top).exp() * v[kh * hd + d])
+                        .sum::<f64>()
+                        / z,
+                );
+            }
+        }
+    }
+    let qt = t(q, 2, QH * hd, Dtype::Bf16);
+    let n = 2 * QH * hd;
+    for (subgroup, threads) in [(true, 256u32), (false, 256), (false, 128)] {
+        if subgroup && (!crate::backend::SPIRV || gpu.subgroup() < 32) {
+            continue;
+        }
+        let tactic = sdpa::Tactic {
+            tier: if subgroup {
+                kernels_slang::Tier::Subgroup
+            } else {
+                kernels_slang::Tier::Baseline
+            },
+            narrow: gpu.subgroup() < 32,
+            decode_threads: threads,
+            tile_rows: 16,
+            tile_lanes: 16,
+            split_groups: 1,
+            split_min_keys: 8,
+            prefill_work: 0,
+        };
+        let o = gpu.zeros(n);
+        let ot = t(o, 2, QH * hd, Dtype::Bf16);
+        gpu.run(|c| {
+            sdpa::decode(c, tactic, qt, &tables, &kv, Some(W as u32), hd as u32, scale as f32, ot, None, None)
+        });
+        close(
+            &gpu.down(o, n),
+            &want,
+            &format!("siblings' lineage windows, subgroup {subgroup} threads {threads}"),
+        );
+        let o = gpu.zeros(n);
+        let ot = t(o, 2, QH * hd, Dtype::Bf16);
+        gpu.run(|c| {
+            sdpa::prefill(c, tactic, qt, &tables, &kv, Some(W as u32), hd as u32, scale as f32, ot, None)
+        });
+        close(
+            &gpu.down(o, n),
+            &want,
+            &format!("siblings' lineage windows, tiled, subgroup {subgroup}"),
+        );
+    }
 }

@@ -13,8 +13,20 @@
 //! its own rows never touch a buffer slot. The fold, after the layer's last
 //! read, moves rows `[folded, folded')` (the last `R` of them) into the
 //! ring and the fire's rows past `folded'` into the lane's buffer slots.
+//!
+//! Positions past the folded index are a lane's lineage's
+//! (`engine::fire::buffered_reads`): a lane sharing its set with siblings
+//! reads the buffered rows its mask admits, its own rows after them, so a
+//! row's window and the ring place a folded row lands at count along that
+//! lineage, not along the set's slots.
+
+use std::ops::Range;
 
 use crate::error::{Fault, Result};
+
+/// The ints a lane takes in the kernels' lane table before its record's
+/// units (`kernels_slang::Ring::lanes`).
+pub const LANE_INTS: usize = 6;
 
 /// One lane of a fire as the ring kernels see it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +42,9 @@ pub struct Lane<'a> {
     pub rows: u32,
     /// The lane's window-buffer slots as kernel units, from `base`.
     pub buffer: &'a [u32],
+    /// The buffered rows `[folded, first)` the lane's lineage holds, in
+    /// order (all of them for a lane alone on its set).
+    pub reads: &'a [Range<u32>],
     /// The fire's slots of the lane's rows, as kernel units.
     pub fire: &'a [u32],
     /// Which lane of the fire's record table the lane's ring is, and its
@@ -51,6 +66,7 @@ pub struct Seat {
     pub first: u32,
     pub rows: u32,
     pub buffer: Vec<u32>,
+    pub reads: Vec<Range<u32>>,
     pub record: u32,
     pub keeps: bool,
 }
@@ -66,6 +82,7 @@ impl Seat {
             first: self.first,
             rows: self.rows,
             buffer: &self.buffer,
+            reads: &self.reads,
             fire,
             record: self.record,
             units,
@@ -77,8 +94,10 @@ impl Seat {
 /// What a fire stages for its windowed layers.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Staged {
-    /// `4 + pieces` ints a lane: folded, base, first, folded after the
-    /// fire, its record's units (`Ring::lanes`).
+    /// [`LANE_INTS`] `+ pieces` ints a lane: folded, base, first, folded
+    /// after the fire, the buffered rows it does not read (its lineage's
+    /// shift from the set's slots), the first slot of its one run of
+    /// buffered rows, its record's units (`Ring::lanes`).
     pub lanes: Vec<i32>,
     /// The page table: a lane's buffer slots of its rows below its first,
     /// then its fire slots.
@@ -108,8 +127,11 @@ pub fn most_jobs(rows: u32, carried: u32) -> u32 {
 }
 
 /// Stages `lanes` for rings of at most `ring_rows` rows (a narrower layer's
-/// fold drops the rows past its own), slots of `tokens` rows.
-pub fn stage(lanes: &[Lane<'_>], tokens: u32, ring_rows: u32) -> Result<Staged> {
+/// fold drops the rows past its own) read through `windows`, slots of
+/// `tokens` rows. A lane whose lineage holds buffered rows in more than one
+/// run is refused by name where a row's window starts among them (the
+/// kernels map a lineage position to a slot through one run).
+pub fn stage(lanes: &[Lane<'_>], tokens: u32, ring_rows: u32, windows: &[u32]) -> Result<Staged> {
     let bad = |why: String| Fault::Program {
         at: "ring::stage",
         why,
@@ -128,7 +150,6 @@ pub fn stage(lanes: &[Lane<'_>], tokens: u32, ring_rows: u32) -> Result<Staged> 
     // fold it once.
     let mut landed: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
     for (at, lane) in lanes.iter().enumerate() {
-        let to = lane.folded.saturating_add(lane.fold);
         if lane.base % tokens != 0 || lane.first < lane.folded {
             return Err(bad(format!(
                 "lane {at} buffers from row {} with slots of {tokens}, its first row {} \
@@ -136,11 +157,42 @@ pub fn stage(lanes: &[Lane<'_>], tokens: u32, ring_rows: u32) -> Result<Staged> 
                 lane.base, lane.first, lane.folded
             )));
         }
-        let end = lane.first.saturating_add(lane.rows);
-        if to > end {
+        if lane
+            .reads
+            .iter()
+            .any(|run| run.start < lane.folded || run.end > lane.first || run.start >= run.end)
+        {
             return Err(bad(format!(
-                "lane {at} folds to row {to}, past its last row {end}"
+                "lane {at} reads buffered rows {:?} outside {}..{}",
+                lane.reads, lane.folded, lane.first
             )));
+        }
+        // Its lineage: the buffered rows it reads, then its own.
+        let admitted: u32 = lane.reads.iter().map(|run| run.end - run.start).sum();
+        let shift = lane.first - lane.folded - admitted;
+        let run_at = lane.reads.first().map_or(lane.first, |run| run.start);
+        let to = lane.folded.saturating_add(lane.fold);
+        let last = lane.folded + admitted + lane.rows;
+        if to > last {
+            return Err(bad(format!(
+                "lane {at} folds to row {to} of its lineage, past its last {last}"
+            )));
+        }
+        if lane.reads.len() > 1 {
+            for &window in windows {
+                for row in 0..lane.rows {
+                    let lin = lane.folded + admitted + row;
+                    let start = (lin + 1).saturating_sub(window);
+                    if start >= lane.folded && start < lane.folded + admitted {
+                        return Err(bad(format!(
+                            "lane {at}'s row {row} starts its window of {window} among the \
+                             buffered rows of its lineage, which runs over {} runs of the set's \
+                             slots",
+                            lane.reads.len()
+                        )));
+                    }
+                }
+            }
         }
         // Its buffered rows read, `[folded, first)`, lie in its buffer from
         // `base`; the rows of the fire past `to` land there.
@@ -180,12 +232,14 @@ pub fn stage(lanes: &[Lane<'_>], tokens: u32, ring_rows: u32) -> Result<Staged> 
             read_base as i32,
             lane.first as i32,
             if lane.keeps { to as i32 } else { lane.folded as i32 },
+            shift as i32,
+            run_at as i32,
         ]);
         out.lanes.extend_from_slice(lane.units);
         for i in 0..buffered {
             out.indices.push(entry(lane.base + i * tokens)? as i32);
         }
-        for row in lane.first..end {
+        for row in lane.first..lane.first + lane.rows {
             let (unit, offset) = fire(row)?;
             if (row - lane.first) % tokens == 0 {
                 out.indices.push(unit as i32);
@@ -197,29 +251,42 @@ pub fn stage(lanes: &[Lane<'_>], tokens: u32, ring_rows: u32) -> Result<Staged> 
         if !lane.keeps {
             continue;
         }
+        // The set's slot lineage position `l` lies at.
+        let slot_of = |l: u32| -> u32 {
+            let mut rank = l - lane.folded;
+            for run in lane.reads {
+                if rank < run.end - run.start {
+                    return run.start + rank;
+                }
+                rank -= run.end - run.start;
+            }
+            lane.first + rank
+        };
         // The fold: the last `ring_rows` of `[folded, to)` into the ring, a
-        // row by its index (each layer's ring at its own place).
-        let source = |row: u32| -> Result<(u32, u32)> {
+        // row by its lineage position (each layer's ring at its own place).
+        let source = |l: u32| -> Result<(u32, u32)> {
+            let row = slot_of(l);
             if row < lane.first {
                 Ok((entry(row)?, (row - lane.base) % tokens))
             } else {
                 fire(row)
             }
         };
-        for row in lane.folded.max(to.saturating_sub(ring_rows))..to {
-            if !landed.insert((lane.record, row)) {
+        for l in lane.folded.max(to.saturating_sub(ring_rows))..to {
+            if !landed.insert((lane.record, l)) {
                 continue;
             }
-            let (unit, at_row) = source(row)?;
+            let (unit, at_row) = source(l)?;
             out.jobs.extend([
                 unit as i32,
                 at_row as i32,
                 -1 - lane.record as i32,
-                row as i32,
+                l as i32,
             ]);
         }
         // The fire's rows it leaves unfolded, into its buffer slots.
-        for row in to.max(lane.first)..end {
+        for l in to.max(lane.folded + admitted)..last {
+            let row = slot_of(l);
             let (unit, at_row) = fire(row)?;
             if row < lane.base {
                 return Err(bad(format!(
@@ -255,13 +322,14 @@ mod tests {
             first: 55,
             rows: 1,
             buffer: &[7, 9],
+            reads: &[50..55],
             fire: &[30],
             record: 0,
             units: &[4],
             keeps: true,
         };
-        let s = stage(&[lane], 16, 40).unwrap();
-        assert_eq!(s.lanes, [50, 48, 55, 56, 4]);
+        let s = stage(&[lane], 16, 40, &[32]).unwrap();
+        assert_eq!(s.lanes, [50, 48, 55, 56, 0, 50, 4]);
         assert_eq!(s.indices, [7, 30]);
         assert_eq!(s.indptr, [0, 2]);
         assert_eq!((s.write_page, s.write_offset), (vec![30], vec![0]));
@@ -283,12 +351,13 @@ mod tests {
             first: 0,
             rows: 110,
             buffer: &[3],
+            reads: &[],
             fire: &[10, 11, 12, 13, 14, 15, 16],
             record: 2,
             units: &[4],
             keeps: true,
         };
-        let s = stage(&[lane], 16, 40).unwrap();
+        let s = stage(&[lane], 16, 40, &[32]).unwrap();
         assert_eq!(s.indices, [10, 11, 12, 13, 14, 15, 16]);
         assert_eq!(s.jobs[0], 40 + 10);
         // Row 60 is fire slot 3 row 12, ring place 20 of lane 2's record.
@@ -307,18 +376,52 @@ mod tests {
             first: 16,
             rows: 2,
             buffer: &[5],
+            reads: &[],
             fire,
             record: 0,
             units: &[4],
             keeps: true,
         };
-        let s = stage(&[lane(&[1]), lane(&[2])], 16, 40).unwrap();
+        let s = stage(&[lane(&[1]), lane(&[2])], 16, 40, &[32]).unwrap();
         let ring_jobs = s.jobs[1..].chunks(4).filter(|j| j[2] < 0).count();
         assert_eq!(ring_jobs, 1);
     }
 
+    /// A beam lane sharing its set with a sibling: its lineage holds the
+    /// buffered rows its mask admits (50, 52, 54 of 50..56), then its own
+    /// row 56. Its lane table states the three rows it does not read; its
+    /// fold walks its lineage, lineage position 53 (its own row) landing
+    /// from its fire slot.
+    #[test]
+    fn a_lineage_folds_and_shifts_along_its_own_rows() {
+        let reads = [50..51, 52..53, 54..55];
+        let lane = Lane {
+            folded: 50,
+            fold: 4,
+            base: 48,
+            first: 56,
+            rows: 1,
+            buffer: &[7],
+            reads: &reads,
+            fire: &[30],
+            record: 0,
+            units: &[4],
+            keeps: true,
+        };
+        let s = stage(&[lane.clone()], 16, 40, &[32]).unwrap();
+        assert_eq!(&s.lanes[..6], &[50, 48, 56, 54, 3, 50]);
+        let jobs: Vec<&[i32]> = s.jobs[1..].chunks(4).collect();
+        assert_eq!(
+            jobs,
+            [&[7, 2, -1, 50][..], &[7, 4, -1, 51], &[7, 6, -1, 52], &[30, 0, -1, 53]]
+        );
+        // A window starting among those three runs is refused by name.
+        let why = stage(&[lane], 16, 40, &[3]).unwrap_err().to_string();
+        assert!(why.contains("runs of the set's slots"), "{why}");
+    }
+
     #[test]
     fn a_ring_of_no_rows_is_refused() {
-        assert!(stage(&[], 16, 0).is_err());
+        assert!(stage(&[], 16, 0, &[]).is_err());
     }
 }

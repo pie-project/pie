@@ -2068,6 +2068,86 @@ fn windowed_rows(fixture: &Fixture, page: u32, context: u32, prompt: u32, steps:
     Some(out)
 }
 
+/// The committed fixture of the window lists' logits
+/// (`suite/fixtures/window/<backend>-<name>.txt`, written by a build
+/// serving window lists with `$PIE_WINDOW_FIXTURE_WRITE`): each row's
+/// argmax and its top 8 logits, and every 256th logit of the first, middle
+/// and last rows. This build's rows are held to it under a bf16-derived
+/// bound: each logit within 2^-6 of its row's largest top logit, the same
+/// argmax.
+fn fixture_check(name: &str, rows: &[Vec<f32>]) {
+    const TOP: usize = 8;
+    const STRIDE: usize = 256;
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../engine-gpu/suite/fixtures/window")
+        .join(format!("{}-{name}.txt", backend::NAME));
+    let sampled = |rows: usize| [0, rows / 2, rows.saturating_sub(1)];
+    if std::env::var_os("PIE_WINDOW_FIXTURE_WRITE").is_some() {
+        let mut text = format!("rows {} width {}\n", rows.len(), rows[0].len());
+        for row in rows {
+            let mut order: Vec<usize> = (0..row.len()).collect();
+            order.sort_by(|&a, &b| row[b].total_cmp(&row[a]));
+            text.push_str(&format!("top {}", argmax(row)));
+            for &at in &order[..TOP] {
+                text.push_str(&format!(" {at}:{:e}", row[at]));
+            }
+            text.push('\n');
+        }
+        for at in sampled(rows.len()) {
+            text.push_str(&format!("sample {at}"));
+            for col in (0..rows[at].len()).step_by(STRIDE) {
+                text.push_str(&format!(" {:e}", rows[at][col]));
+            }
+            text.push('\n');
+        }
+        std::fs::create_dir_all(path.parent().expect("a dir")).expect("the fixture dir");
+        std::fs::write(&path, text).expect("the fixture writes");
+        return;
+    }
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|why| panic!("{}: {why}", path.display()));
+    let mut lines = text.lines();
+    let head: Vec<usize> = lines
+        .next()
+        .expect("a head")
+        .split_whitespace()
+        .filter_map(|w| w.parse().ok())
+        .collect();
+    assert_eq!(head, [rows.len(), rows[0].len()], "{name}: rows and width");
+    let mut worst = 0f32;
+    let mut scales = Vec::new();
+    for (at, line) in lines.by_ref().take(rows.len()).enumerate() {
+        let mut words = line.split_whitespace().skip(1);
+        let want_argmax: usize = words.next().and_then(|w| w.parse().ok()).expect("an argmax");
+        assert_eq!(argmax(&rows[at]) as usize, want_argmax, "{name}: row {at}'s argmax");
+        let tops: Vec<(usize, f32)> = words
+            .map(|w| {
+                let (col, value) = w.split_once(':').expect("col:value");
+                (col.parse().expect("a column"), value.parse().expect("a logit"))
+            })
+            .collect();
+        let scale = tops.iter().fold(0f32, |m, &(_, v)| m.max(v.abs())).max(1e-3);
+        scales.push(scale);
+        for &(col, value) in &tops {
+            let err = (rows[at][col] - value).abs();
+            worst = worst.max(err / scale);
+            assert!(err <= scale / 64.0, "{name}: row {at} column {col}: {} against {value}", rows[at][col]);
+        }
+    }
+    for line in lines {
+        let mut words = line.split_whitespace().skip(1);
+        let at: usize = words.next().and_then(|w| w.parse().ok()).expect("a row");
+        for (k, w) in words.enumerate() {
+            let value: f32 = w.parse().expect("a logit");
+            let col = k * STRIDE;
+            let err = (rows[at][col] - value).abs();
+            worst = worst.max(err / scales[at]);
+            assert!(err <= scales[at] / 64.0, "{name}: row {at} column {col}: {} against {value}", rows[at][col]);
+        }
+    }
+    eprintln!("{name}: against the window lists' fixture, worst {worst:.2e} of a row's top logit");
+}
+
 /// The window lists' logits, written by a build serving them
 /// (`$PIE_WINDOW_GOLDEN`, `<name>.bin`, with `$PIE_WINDOW_GOLDEN_WRITE`), and
 /// held against what this build serves where the file is there.
@@ -2107,6 +2187,7 @@ fn windowed_logits(model: &str, page: u32) {
     let Some(rows) = windowed_rows(&fixture, page, 1024, 700, 16) else {
         return;
     };
+    fixture_check(&format!("{model}-p{page}"), &rows);
     golden(&format!("{model}-p{page}"), &rows);
 }
 
@@ -2149,6 +2230,7 @@ fn two_windows_answer_what_their_window_lists_did() {
     let Some(rows) = windowed_rows(&fixture, 32, 1024, 700, 16) else {
         return;
     };
+    fixture_check(&format!("{MODEL}-two-windows"), &rows);
     golden(&format!("{MODEL}-two-windows"), &rows);
 }
 
@@ -2211,6 +2293,9 @@ struct RingLane<'a> {
     base: u32,
     fold: u32,
     table: Vec<u32>,
+    /// Its fold counted on the device (`FoldLen::Device`, `fold` the count
+    /// its program holds at the fire).
+    device: bool,
 }
 
 fn fire_rings(shell: &mut Shell, trace: &Trace, lanes: &[(&RingLane<'_>, &[u32])]) -> Vec<Vec<f32>> {
@@ -2229,7 +2314,11 @@ fn fire_rings(shell: &mut Shell, trace: &Trace, lanes: &[(&RingLane<'_>, &[u32])
             windows: table,
             window: Some(engine::fire::WindowFold {
                 base: lane.base,
-                fold: engine::fire::FoldLen::Host(lane.fold),
+                fold: if lane.device {
+                    engine::fire::FoldLen::Device
+                } else {
+                    engine::fire::FoldLen::Host(lane.fold)
+                },
                 lineage: engine::fire::Lineage::Set,
             }),
             ..Seated::of(Lane {
@@ -2239,7 +2328,14 @@ fn fire_rings(shell: &mut Shell, trace: &Trace, lanes: &[(&RingLane<'_>, &[u32])
             })
         })
         .collect();
-    shell.fire_seated(&seated).expect("the fire lands")
+    let folds: Vec<engine_gpu::store::frozen::DeviceFold> = lanes
+        .iter()
+        .map(|(lane, _)| engine_gpu::store::frozen::DeviceFold {
+            count: lane.device.then_some(lane.fold),
+            reports: 0,
+        })
+        .collect();
+    shell.fire_folded(&seated, &folds).expect("the fire lands")
 }
 
 /// The logit rows of `tokens` fed one lane alone, folding every row, the
@@ -2294,6 +2390,7 @@ fn beam_forks_read_one_folded_ring_through_divergent_buffers() {
             base: (have + n) / PAGE * PAGE,
             fold: n,
             table: Vec::new(),
+            device: false,
         };
         last = fire_rings(&mut shell, &fixture.trace, &[(&lane, piece)]);
         have += n;
@@ -2317,6 +2414,7 @@ fn beam_forks_read_one_folded_ring_through_divergent_buffers() {
                 table: (0..(folded + step + 1 - base).div_ceil(PAGE))
                     .map(|k| refs.slot(fork, k))
                     .collect(),
+                device: false,
             })
             .collect();
         let got = fire_rings(
@@ -2362,6 +2460,7 @@ fn beam_forks_read_one_folded_ring_through_divergent_buffers() {
             } else {
                 Vec::new()
             },
+            device: false,
         };
         let got = fire_rings(&mut shell, &fixture.trace, &[(&lane, &next[..])]);
         tokens.push(next[0]);
@@ -2405,6 +2504,7 @@ fn a_stop_truncate_leaves_the_ring_untouched() {
             base: (have + n) / PAGE * PAGE,
             fold: n,
             table: Vec::new(),
+            device: false,
         };
         last = fire_rings(&mut shell, &fixture.trace, &[(&lane, piece)]);
         have += n;
@@ -2422,6 +2522,7 @@ fn a_stop_truncate_leaves_the_ring_untouched() {
             table: (0..(have + 1 - base).div_ceil(PAGE))
                 .map(|k| refs.slot(0, k))
                 .collect(),
+            device: false,
         }
     };
     let mut next = argmax(&last[0]);
@@ -3052,4 +3153,78 @@ fn windowed_decode_time_one_lane() {
 #[test]
 fn windowed_decode_time_four_lanes() {
     windowed_decode_time("gemma4-e4b-mini-l1", 4);
+}
+
+/// A fold the device counts (`FoldLen::Device`): a lane prefills 600 rows
+/// (all folded), decodes five rows it buffers, then fires a row whose
+/// program's count folds four of its six (600..604), the rest left: the
+/// row it carried at 604 in its buffer, its own at 605 landing there. It
+/// decodes on from the folded index the count left, answering as a lane
+/// fed its rows alone.
+#[test]
+fn a_device_counted_fold_folds_what_its_count_says() {
+    const MODEL: &str = "gemma4-e4b-mini-l1";
+    let fixture = fixture(MODEL, None);
+    let Some(mut shell) = load_paged(&fixture, PAGE, 1024, None) else {
+        return;
+    };
+    let refs = RingRefs::of(&mut shell);
+    let record = refs.record(0);
+    let prompt: Vec<u32> = (0..600u32).map(|at| (at * 29 + 3) % 256).collect();
+    let mut have = 0u32;
+    let mut last = Vec::new();
+    for piece in prompt.chunks(200) {
+        let n = piece.len() as u32;
+        let lane = RingLane {
+            slot: 0,
+            record: &record,
+            have,
+            folded: have,
+            base: (have + n) / PAGE * PAGE,
+            fold: n,
+            table: Vec::new(),
+            device: false,
+        };
+        last = fire_rings(&mut shell, &fixture.trace, &[(&lane, piece)]);
+        have += n;
+    }
+    let table = |upto: u32, base: u32| -> Vec<u32> {
+        (0..(upto - base).div_ceil(PAGE)).map(|k| refs.slot(0, k)).collect()
+    };
+    let mut folded = have;
+    let mut next = argmax(&last[0]);
+    let mut tokens = Vec::new();
+    let mut rows = Vec::new();
+    for step in 0..10u32 {
+        let have = 600 + step;
+        // Row 605 folds by the device's count of 4; the rows after fold
+        // nothing until then, every row from 609 on all it carries.
+        let (fold, device) = match have {
+            605 => (4, true),
+            h if h >= 609 => (h + 1 - folded, false),
+            _ => (0, false),
+        };
+        let base = folded / PAGE * PAGE;
+        let lane = RingLane {
+            slot: 0,
+            record: &record,
+            have,
+            folded,
+            base,
+            fold,
+            table: table(have + 1, base),
+            device,
+        };
+        let got = fire_rings(&mut shell, &fixture.trace, &[(&lane, &[next][..])]);
+        tokens.push(next);
+        rows.push(got[0].clone());
+        next = argmax(&got[0]);
+        folded += fold;
+    }
+    let want = alone(&fixture, &prompt, &tokens);
+    near(
+        &format!("{MODEL}: a device-counted fold"),
+        &rows,
+        &want[want.len() - rows.len()..],
+    );
 }

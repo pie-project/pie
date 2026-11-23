@@ -197,8 +197,10 @@ uint mask_byte(uint i) {
 // base + (i + 1) T)`; the fire's own rows in the fire's slots, laid as
 // buffer slots, the lane's first row of the fire at row 0 of its first.
 // `ring_lanes` holds, a lane, its folded index, its buffer base (a slot's
-// first row), its first row of the fire and its folded index after the
-// fire (the fold's), then its record's units, `pieces` of them. The page
+// first row), its first row of the fire, its folded index after the fire
+// (the fold's), the buffered rows it does not read and the first slot of
+// its one run of buffered rows (its lineage, `ring_start`), then its
+// record's units, `pieces` of them. The page
 // table holds, a lane, its buffer slots of rows below its first row of the
 // fire, then its fire slots.
 [[vk::binding(SDPA_SEGMENTS_AT)]] StructuredBuffer<int> ring_lanes;
@@ -274,6 +276,11 @@ struct Keys {
     int folded;
     int base;
     int first;
+    // The buffered rows the lane does not read (its lineage runs this many
+    // rows behind the set's slots), and the first slot of its one run of
+    // buffered rows.
+    int shift;
+    int run_at;
     uint ring_k;
     uint ring_v;
 };
@@ -281,18 +288,22 @@ struct Keys {
 Keys keys_of(int req) {
     Keys at;
 #if defined(PIE_RING)
-    uint lane = (4u + params.pieces) * uint(req);
+    uint lane = (6u + params.pieces) * uint(req);
     at.folded = ring_lanes[lane];
     at.base = ring_lanes[lane + 1u];
     at.first = ring_lanes[lane + 2u];
-    uint rec_k = uint(ring_lanes[lane + 4u + params.ring_piece]) * params.slot_stride;
-    uint rec_v = uint(ring_lanes[lane + 4u + params.ring_piece_v]) * params.slot_stride;
+    at.shift = ring_lanes[lane + 4u];
+    at.run_at = ring_lanes[lane + 5u];
+    uint rec_k = uint(ring_lanes[lane + 6u + params.ring_piece]) * params.slot_stride;
+    uint rec_v = uint(ring_lanes[lane + 6u + params.ring_piece_v]) * params.slot_stride;
     at.ring_k = 2u * (rec_k + params.ring_k);
     at.ring_v = 2u * (rec_v + params.ring_v);
 #else
     at.folded = 0;
     at.base = 0;
     at.first = 0x7fffffff;
+    at.shift = 0;
+    at.run_at = 0;
     at.ring_k = 0u;
     at.ring_v = 0u;
 #endif
@@ -366,6 +377,21 @@ int window_start(int q_pos) {
     return (params.window > 0 && q_pos >= params.window) ? q_pos - params.window + 1 : 0;
 }
 
+#if defined(PIE_RING)
+// A ring lane's row's first key: its window counted along its lineage (the
+// buffered rows it reads, then its own: `q_pos - shift`), mapped back to
+// the set's slots. Below the folded index the two agree; among its buffered
+// rows they lie in its one run from `run_at`; past them, among its own.
+int ring_start(Keys at, int q_pos) {
+    int s = window_start(q_pos - at.shift);
+    if (s >= at.folded) {
+        int admitted = at.first - at.folded - at.shift;
+        s = s >= at.folded + admitted ? s + at.shift : at.run_at + (s - at.folded);
+    }
+    return s;
+}
+#endif
+
 uint row_base(uint row, uint q_head) {
     return (fire_row(row) * uint(params.n_q_heads) + q_head) * uint(PIE_HEAD_DIM);
 }
@@ -407,7 +433,11 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 #endif
     int q_pos = live ? position_ids[fire_row(row)] : -1;
     uint origin = live ? mask_origin(row) : MASK_NONE;
+#if defined(PIE_RING)
+    int start = live ? ring_start(ring, q_pos) : 0;
+#else
     int start = window_start(q_pos);
+#endif
     uint q_base = row_base(row, q_head);
     int kv_head = int(q_head) / params.gqa_factor;
 
@@ -738,7 +768,11 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     uint row = group.y;
     uint tid = local.x;
     int q_pos = position_ids[fire_row(row)];
+#if defined(PIE_RING)
+    int start = ring_start(keys_of(req_of_token[fire_row(row)]), q_pos);
+#else
     int start = window_start(q_pos);
+#endif
     uint base_row = row_base(row, q_head);
     float merged_max, merged_sum;
     uint subgroups;
@@ -807,6 +841,9 @@ groupshared float sdpa_max[MAX_WALKERS];
 groupshared float sdpa_sum[MAX_WALKERS];
 groupshared float sdpa_fold[MAX_WALKERS][32];
 groupshared int sdpa_pos;
+#if defined(PIE_RING)
+groupshared int sdpa_start;
+#endif
 
 // The walkers' share of the row's keys: each 32-lane strip takes every
 // `walkers`-th step from its own.
@@ -971,10 +1008,17 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     // bound below decides loops of barriers and an early return.
     if (tid == 0u) {
         sdpa_pos = position_ids[fire_row(row)];
+#if defined(PIE_RING)
+        sdpa_start = ring_start(keys_of(req_of_token[fire_row(row)]), sdpa_pos);
+#endif
     }
     GroupMemoryBarrierWithGroupSync();
     int q_pos = workgroupUniformLoad(sdpa_pos);
+#if defined(PIE_RING)
+    int start = workgroupUniformLoad(sdpa_start);
+#else
     int start = window_start(q_pos);
+#endif
     uint base_row = row_base(row, q_head);
     float merged_max, merged_sum;
     uint walkers;

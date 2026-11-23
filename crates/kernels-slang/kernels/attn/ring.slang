@@ -9,13 +9,13 @@
 // ints a job: the source slot (units of `page_stride` words from the
 // layer's origins) and its row there; the destination, a slot unit (`>= 0`)
 // or the ring of lane `-1 - dst` (its record's piece `piece` at its unit
-// `lanes[(4 + pieces) lane + 4 + piece]`, units of `slot_stride` words into
+// `lanes[(6 + pieces) lane + 6 + piece]`, units of `slot_stride` words into
 // the pool, the ring's keys at word
 // `ring_k` past it, its values at `ring_v` of piece `ring_piece_v`), and
 // its row there: a slot's
 // row, or the ring's row `r` itself, which lands at place `r % ring_rows`
 // unless it lies `ring_rows` or more below the lane's folded index after
-// the fire (`lanes[(4 + pieces) lane + 3]`), so a layer of a narrower ring than the
+// the fire (`lanes[(6 + pieces) lane + 3]`), so a layer of a narrower ring than the
 // jobs were laid for drops the rows past it. No two jobs of a fire land on
 // one destination row, and none reads a row another writes.
 
@@ -63,13 +63,13 @@ void main(uint3 gid : SV_DispatchThreadID) {
     uint to;
     if (dst < 0) {
         uint lane = uint(-1 - dst);
-        uint at_lane = (4u + params.pieces) * lane;
+        uint at_lane = (6u + params.pieces) * lane;
         if (dst_row + params.ring_rows < uint(lanes[at_lane + 3u])) {
             return;
         }
         dst_row = dst_row % params.ring_rows;
         uint piece = values ? params.ring_piece_v : params.ring_piece;
-        uint rec = uint(lanes[at_lane + 4u + piece]) * params.slot_stride;
+        uint rec = uint(lanes[at_lane + 6u + piece]) * params.slot_stride;
         to = rec + (values ? params.ring_v : params.ring_k) + dst_row * row_words + i;
     } else {
         to = origin + uint(dst) * params.page_stride + dst_row * row_words + i;

@@ -602,12 +602,6 @@ fn rings_of(recipe: &ChunkRecipe) -> Result<Vec<(RowId, RingRun)>> {
                 layer.rows.len()
             )));
         };
-        if layer.sinks > 0 {
-            return Err(disagree(format!(
-                "states {} sink rows of layer {:?}, which this shell does not read",
-                layer.sinks, layer.layer
-            )));
-        }
         out.push((
             *row,
             RingRun {
@@ -1027,6 +1021,14 @@ impl<B: Backend> Pools<B> {
                 out.push((ring.rows, self.table_of(Paged::Buffer)));
             }
         }
+        out
+    }
+
+    /// The distinct windows the windowed rows read through.
+    #[must_use]
+    pub fn windows(&self) -> Vec<u32> {
+        let mut out: Vec<u32> = self.window_tables().into_iter().map(|(w, _)| w).collect();
+        out.sort_unstable();
         out
     }
 
