@@ -255,13 +255,16 @@ impl RolesError {
     /// pieces)`: `pieces` free runs of `run` adjacent chunks. One free
     /// chunk holds a slot item, whatever its run of slots.
     #[must_use]
-    pub fn room_runs(&self) -> Option<(u32, u32)> {
+    pub fn room_runs(&self) -> Option<(u32, u32, u32)> {
         let Self::BindShort(short) = self else {
             return None;
         };
         match short.as_ref() {
-            Self::GuestShort { room, .. } => Some(room.chunk_runs()),
-            Self::Short { .. } | Self::NoRun { .. } => Some((1, 1)),
+            Self::GuestShort { room, .. } => {
+                let (run, pieces) = room.chunk_runs();
+                Some((run, pieces, room.singles()))
+            }
+            Self::Short { .. } | Self::NoRun { .. } => Some((1, 1, 0)),
             _ => None,
         }
     }
@@ -345,6 +348,11 @@ pub enum GuestRoom {
         free_runs: u32,
         free_chunks: u32,
         committable: u32,
+        /// Single chunks the bind opens beside its runs: its tables, rings
+        /// and adapter, each role's slots in chunks of their own. Asked as
+        /// runs of `run`, one short chunk was a whole run more, and a bind
+        /// that fits the device alone was refused as never fitting.
+        singles: u32,
     },
 }
 
@@ -359,6 +367,15 @@ impl GuestRoom {
         }
     }
 
+    /// The single chunks it asks beside its runs.
+    #[must_use]
+    pub fn singles(self) -> u32 {
+        match self {
+            Self::Slots { .. } => 0,
+            Self::Runs { singles, .. } => singles,
+        }
+    }
+
     fn committable(self) -> u32 {
         match self {
             Self::Slots { committable, .. } | Self::Runs { committable, .. } => committable,
@@ -366,9 +383,10 @@ impl GuestRoom {
     }
 
     /// The same room, asking `whole` runs of its run where that is more
-    /// than it named: what the whole bind takes, not the part that came up
-    /// short first.
-    fn asking(self, whole: u32) -> Self {
+    /// than it named, and `beside` single chunks for the bind's tables,
+    /// rings and adapter: what the whole bind takes, not the part that came
+    /// up short first.
+    fn asking(self, whole: u32, beside: u32) -> Self {
         match self {
             Self::Runs {
                 run,
@@ -376,12 +394,14 @@ impl GuestRoom {
                 free_runs,
                 free_chunks,
                 committable,
+                singles,
             } => Self::Runs {
                 run,
                 pieces: pieces.max(whole),
                 free_runs,
                 free_chunks,
                 committable,
+                singles: singles.max(beside),
             },
             // Each of the bind's parts a run of slots opening a chunk of its
             // own: the room asked is every one of them, never the part short
@@ -395,7 +415,7 @@ impl GuestRoom {
             } => Self::Slots {
                 slots,
                 committable,
-                chunks: chunks.max(whole),
+                chunks: chunks.max(whole.saturating_add(beside)),
             },
         }
     }
@@ -412,6 +432,7 @@ impl GuestRoom {
                 pieces,
                 free_runs,
                 free_chunks,
+                singles,
                 ..
             } => Self::Runs {
                 run,
@@ -419,6 +440,7 @@ impl GuestRoom {
                 free_runs,
                 free_chunks,
                 committable: runs,
+                singles,
             },
         }
     }
@@ -431,13 +453,13 @@ impl RolesError {
     /// part short first, the restore came back once that stood, the bind
     /// took it for another part, came up short again and was suspended
     /// again (bind, suspend, restore, short).
-    fn asking(self, whole: u32) -> Self {
+    fn asking(self, whole: u32, beside: u32) -> Self {
         match self {
-            Self::BindShort(short) => Self::BindShort(Box::new(short.asking(whole))),
+            Self::BindShort(short) => Self::BindShort(Box::new(short.asking(whole, beside))),
             Self::GuestShort { what, bytes, room } => Self::GuestShort {
                 what,
                 bytes,
-                room: room.asking(whole),
+                room: room.asking(whole, beside),
             },
             Self::GuestGrow {
                 what,
@@ -448,7 +470,7 @@ impl RolesError {
             } => Self::GuestGrow {
                 what,
                 bytes,
-                room: room.asking(whole),
+                room: room.asking(whole, beside),
                 run,
                 prefix,
             },
@@ -471,12 +493,18 @@ impl std::fmt::Display for GuestRoom {
                 pieces,
                 free_runs,
                 free_chunks,
+                singles,
                 ..
-            } => write!(
-                f,
-                "{pieces} runs of {run} adjacent chunks inside one segment asked, and \
-                 {free_runs} such runs were free ({free_chunks} free chunks)"
-            )?,
+            } => {
+                write!(
+                    f,
+                    "{pieces} runs of {run} adjacent chunks inside one segment asked, and \
+                     {free_runs} such runs were free ({free_chunks} free chunks)"
+                )?;
+                if *singles > 0 {
+                    write!(f, ", and {singles} single chunks beside them")?;
+                }
+            }
         }
         match self.committable() {
             0 => write!(f, ", and no segment is left to commit within the budget"),
@@ -543,6 +571,7 @@ impl Part {
                 free_runs: 0,
                 free_chunks: 0,
                 committable: 0,
+                singles: 0,
             }
         } else {
             GuestRoom::Slots {
@@ -1532,6 +1561,7 @@ impl Roles {
                 free_runs,
                 free_chunks,
                 committable: 0,
+                singles: 0,
             }),
             // Any other refusal (the budget, a run across a segment's end)
             // is said by name: read as the part's ask alone, its room's
@@ -1787,13 +1817,13 @@ impl Roles {
     /// place them ([`super::slots::SlotPool::place`]): no other take opens
     /// them until its unpark and bind have taken them or it is released.
     /// Whether its whole placement stands; held only where it does.
-    pub fn reserve_restore(&mut self, holder: Holder, bind: Option<(u32, u32)>) -> bool {
+    pub fn reserve_restore(&mut self, holder: Holder, bind: &[(u32, u32)]) -> bool {
         use super::slots::OwnPiece;
         self.release_claim(holder);
         let own: Vec<OwnPiece> = self
             .unpark_pieces(holder)
             .into_iter()
-            .chain(bind.map(|(run, pieces)| OwnPiece::Chunks { run, pieces }))
+            .chain(bind.iter().map(|&(run, pieces)| OwnPiece::Chunks { run, pieces }))
             .collect();
         let mut device = self.device.lock().unwrap();
         let placement = device.pool().place(&own);
@@ -1895,6 +1925,16 @@ impl Roles {
     #[must_use]
     pub fn free_runs(&self, run: u32) -> u32 {
         self.device.lock().unwrap().pool().free_chunk_runs(run)
+    }
+
+    /// Whether `pieces` free runs of `run` chunks stand, and `singles` free
+    /// chunks beside them.
+    #[must_use]
+    pub fn room_free(&self, run: u32, pieces: u32, singles: u32) -> bool {
+        let pool = self.device.lock().unwrap();
+        let pool = pool.pool();
+        pool.free_chunk_runs(run) >= pieces
+            && pool.free_chunk_runs(1) >= run.max(1).saturating_mul(pieces).saturating_add(singles)
     }
 
     /// Gives `parts` back on `on`: a failed take's rollback, which frees no
@@ -2051,6 +2091,56 @@ impl Roles {
     /// else fresh ones; with them the guest state `guest`, taken before
     /// anything was registered for the bind ([`Self::take_guest`]), which
     /// goes back with the rest where the take fails.
+    /// The fresh chunks the parts a bind of `program` takes beside its
+    /// guest state may open: its tables, each ring of its own (a channel
+    /// `registered` names holds its ring) and its adapter where none is on
+    /// the device, as [`Self::take_instance`] takes them, each role's parts
+    /// in as few chunks as their slots fill.
+    fn instance_parts_fresh(
+        &self,
+        program: ProgramId,
+        channels: &[ChannelId],
+        registered: impl Fn(ChannelId) -> bool,
+        adapter: Option<u128>,
+    ) -> u32 {
+        let Some(facts) = self.programs.get(&program) else {
+            return 0;
+        };
+        let rings: u32 = facts
+            .rings
+            .iter()
+            .filter(|ring| {
+                !channels
+                    .get(ring.channel as usize)
+                    .is_some_and(|&id| registered(id))
+            })
+            .map(|ring| ring.footprint.slots)
+            .sum();
+        let adapter = adapter
+            .filter(|&key| {
+                !matches!(self.items.get(&Owner::Adapter(key)), Some(item) if item.tier == Tier::Device)
+            })
+            .map_or(0, |_| facts.adapter.slots);
+        let Ok(instance) = self.shape(SlotRole::Instance) else {
+            return 0;
+        };
+        let chunk_bytes = u64::from(self.chunk_slots) * instance.slot_bytes;
+        [
+            (SlotRole::Instance, facts.instance.slots),
+            (SlotRole::Channel, rings),
+            (SlotRole::Adapter, adapter),
+        ]
+        .into_iter()
+        .filter(|&(_, slots)| slots > 0)
+        .map(|(role, slots)| {
+            let bytes = self
+                .shape(role)
+                .map_or(chunk_bytes, |shape| u64::from(slots) * shape.slot_bytes);
+            u32::try_from(bytes.div_ceil(chunk_bytes.max(1)).max(1)).unwrap_or(u32::MAX)
+        })
+        .sum()
+    }
+
     pub fn take_instance(
         &mut self,
         program: ProgramId,
@@ -2196,9 +2286,17 @@ impl Roles {
         channels: &[ChannelId],
         (pair, state): (FireKey, GuestState),
         holder: Option<Holder>,
+        beside: u32,
     ) -> Result<GuestTaken, RolesError> {
         self.claim = holder.and_then(|holder| self.claims.get(&holder).copied());
-        let taken = self.take_guest_claimed(channels, (pair, state), holder);
+        if let Some(ticket) = self.claim {
+            tracing::debug!(
+                ?holder,
+                chunks = ?self.device.lock().unwrap().pool().reserved(ticket),
+                "roles: a bind takes from what its restore held for it"
+            );
+        }
+        let taken = self.take_guest_claimed(channels, (pair, state), holder, beside);
         self.claim = None;
         // Its bind took what was held for it: the rest goes back.
         if taken.is_ok()
@@ -2214,9 +2312,10 @@ impl Roles {
         channels: &[ChannelId],
         (pair, state): (FireKey, GuestState),
         holder: Option<Holder>,
+        beside: u32,
     ) -> Result<GuestTaken, RolesError> {
         let heads = holder.is_none_or(|holder| self.guest_waiter.is_none_or(|counted| counted == holder));
-        let taken = self.take_guest_now(channels, (pair, state), heads);
+        let taken = self.take_guest_now(channels, (pair, state), heads, beside);
         if let Some(holder) = holder.filter(|_| heads) {
             match &taken {
                 Err(RolesError::GuestGrow { .. }) => self.guest_waiter = Some(holder),
@@ -2232,6 +2331,7 @@ impl Roles {
         channels: &[ChannelId],
         (pair, state): (FireKey, GuestState),
         heads: bool,
+        beside: u32,
     ) -> Result<GuestTaken, RolesError> {
         // What segregating runs by length holds back: each class's partly
         // filled Instance chunks and their free bytes, at debug.
@@ -2270,16 +2370,31 @@ impl Roles {
         }
         // Every part the bind takes fresh (its scratch, and its pair's state
         // where the pair holds none on the device now), in runs of the
-        // longest: what a refusal for want of room asks
+        // longest, and a single chunk for each role of its tables, rings
+        // and adapter (`beside`): what a refusal for want of room asks
         // ([`RolesError::asking`]), so the room it waits on holds the bind.
+        // Those parts found slots in chunks open when it was refused; once
+        // its process was suspended and restored for the room asked, those
+        // slots had gone, the bind was short again of the chunks they then
+        // opened and its process went down a second time for one bind (the
+        // simulation's field mix, seed 86: refused opening 2 chunks,
+        // restored with 2, refused again opening 4).
         let pair_fresh = state.per_pair > 0
             && !matches!(
                 self.items.get(&Owner::Pair(pair)),
                 Some(item) if item.tier == Tier::Device && !item.shed
             );
+        // Its pair's state is asked too where another holds it on the
+        // device now: suspended for this room, the pair's holders may park
+        // meanwhile, and the bind, restored with the room asked, lays the
+        // pair fresh (the simulation's seed 380: asked a run of three,
+        // restored with it, short of the pair's second run). Over, never
+        // under: the room a pair joined in place leaves goes back with the
+        // take.
+        let _ = pair_fresh;
         let fresh: Vec<(u32, u32)> = [
             (per_instance > 0).then_some(per_instance),
-            pair_fresh.then_some(state.per_pair),
+            (state.per_pair > 0).then_some(state.per_pair),
         ]
         .into_iter()
         .flatten()
@@ -2290,7 +2405,7 @@ impl Roles {
         let whole: u32 = fresh
             .iter()
             .map(|&(run, pieces)| run.div_ceil(longest).saturating_mul(pieces))
-            .sum();
+            .sum::<u32>();
         if per_instance > 0 {
             match self.take_scratch(
                 per_instance,
@@ -2308,7 +2423,7 @@ impl Roles {
                 }
                 Err(error) => {
                     self.untake_guest(taken);
-                    return Err(error.asking(whole));
+                    return Err(error.asking(whole, beside));
                 }
             }
         }
@@ -2352,7 +2467,7 @@ impl Roles {
                             } else {
                                 short
                             }
-                            .asking(whole));
+                            .asking(whole, beside));
                         }
                     }
                 }
@@ -2390,7 +2505,7 @@ impl Roles {
                         }
                         Err(error) => {
                             self.untake_guest(taken);
-                            return Err(error.asking(whole));
+                            return Err(error.asking(whole, beside));
                         }
                     }
                 }
@@ -2522,10 +2637,11 @@ impl Roles {
                         } else {
                             GuestRoom::Runs {
                                 run,
-                                pieces: pieces + opened + 1,
+                                pieces,
                                 free_runs: 0,
                                 free_chunks: 0,
                                 committable: 0,
+                                singles: opened + 1,
                             }
                         },
                     },
@@ -4034,13 +4150,14 @@ pub fn take_bind(
     };
     let mut roles = roles.lock().unwrap();
     let free_before = roles.device.lock().unwrap().pool().free_chunks();
-    let guest = roles.take_guest(&binding.channels, (pair, state), holder)?;
+    let beside = roles.instance_parts_fresh(binding.program, &binding.channels, &registered, adapter);
+    let guest = roles.take_guest(&binding.channels, (pair, state), holder, beside)?;
     let fresh = guest.fresh_runs();
     let mut taken = roles
         .take_instance(
             binding.program,
             &binding.channels,
-            registered,
+            &registered,
             adapter,
             guest,
         )
@@ -4062,16 +4179,37 @@ pub fn take_bind(
         && gated(holder, added)
     {
         roles_handle.lock().unwrap().untake(taken);
+        // The room it waits for is the whole bind's, as a refusal for want
+        // of room asks ([`Roles::take_guest`]): what it opened now (slots
+        // its tables took in chunks open now) may be gone by the time its
+        // process, suspended meanwhile, is restored with that room, and the
+        // bind is short again (the simulation's field mix, seed 80: held
+        // opening 1 chunk, restored with it, short of 4).
+        // Runs of more than a chunk are asked as runs: asked as single
+        // chunks, room was made in chunks that formed no run (the
+        // simulation's seed 189: a victim moved for four single chunks, the
+        // bind's run of two still short).
+        let room = match fresh {
+            Some((run, pieces)) if run > 1 => GuestRoom::Runs {
+                run,
+                pieces,
+                free_runs: 0,
+                free_chunks: 0,
+                committable: 0,
+                singles: beside,
+            },
+            fresh => GuestRoom::Slots {
+                slots: 0,
+                committable: 0,
+                chunks: added.max(fresh.map_or(0, |(_, pieces)| pieces).saturating_add(beside)),
+            },
+        };
         return Err(RolesError::BindShort(Box::new(RolesError::GuestShort {
             what: format!(
                 "its {added} new chunks of state, past what every tier keeps for the finisher"
             ),
             bytes: 0,
-            room: GuestRoom::Slots {
-                slots: 0,
-                committable: 0,
-                chunks: added,
-            },
+            room,
         }))
         .into());
     }
@@ -4160,9 +4298,9 @@ pub async fn bind_when_resident<T, E, B, W, G, P, S>(
     resident: impl Fn() -> W,
     grown: impl Fn(u32, u32) -> G,
     room: impl Fn() -> Option<RoomWatch>,
-    fits: impl Fn(u32, u32) -> bool,
-    suspend: impl Fn(u32, u32) -> bool,
-    planned: impl Fn(u32, u32) -> P,
+    fits: impl Fn(u32, u32, u32) -> bool,
+    suspend: impl Fn(u32, u32, u32) -> bool,
+    planned: impl Fn(u32, u32, u32) -> P,
     leave: impl Fn(),
     waiting: impl Fn(bool),
     settle: impl Fn() -> S,
@@ -4234,14 +4372,14 @@ where
             .await;
             continue;
         }
-        if let Some((run, pieces)) = error
+        if let Some((run, pieces, singles)) = error
             .downcast_ref::<RolesError>()
             .and_then(RolesError::room_runs)
         {
             // Holding guest state of its own, it would wait on itself: it is
             // suspended, its state given back, and binds once restored with
             // room for this bind (`run`, `pieces`) beside its own.
-            if !restored_for_room && suspend(run, pieces) {
+            if !restored_for_room && suspend(run, pieces, singles) {
                 tracing::debug!(%pid, %error, "a bind short of room suspends its process");
                 // Waiting for its restore, not for room: its need is not
                 // counted meanwhile.
@@ -4271,7 +4409,7 @@ where
                 loop {
                     let next = room();
                     watch.freed().await;
-                    if fits(run, pieces) {
+                    if fits(run, pieces, singles) {
                         return;
                     }
                     match next {
@@ -4284,7 +4422,7 @@ where
                 // In order, never at random: a seeded run takes the same branch.
                 biased;
                 () = freed => {}
-                made = planned(run, pieces) => match made {
+                made = planned(run, pieces, singles) => match made {
                     Err(why) => {
                         return Err(error.context(format!("its wait for room ended: {why}")));
                     }
@@ -4308,7 +4446,7 @@ where
         }) = error.downcast_ref::<RolesError>()
         {
             let (prefix, run) = (*prefix, *run);
-            let pieces = short.chunk_runs().1;
+            let (pieces, singles) = (short.chunk_runs().1, short.singles());
             tracing::debug!(%pid, %error, "a bind waits on a segment commit");
             waits();
             // A commit, room given back (its runs may stand free in it), or
@@ -4343,7 +4481,7 @@ where
                     }
                 }
                 () = freed => {}
-                made = planned(run, pieces) => match made {
+                made = planned(run, pieces, singles) => match made {
                     Err(why) => {
                         return Err(error.context(format!("its wait for room ended: {why}")));
                     }

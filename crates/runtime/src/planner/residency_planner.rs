@@ -86,6 +86,9 @@ pub struct ResidencyPlanner {
     /// again once either has moved past it: on the same room it would find
     /// the same readers with fires in flight, or the same chunks taken.
     pub(super) list_compaction_failed: AtomicU64,
+    /// What had landed (fires, evictions, restores) when the pages gathered
+    /// for the heads were last packed again ([`Self::compact_lists`]).
+    pub(super) repacked_at: AtomicU64,
     /// The segment walk made no grow it promised: the next pass goes on
     /// past its grow steps ([`Self::no_grow`]).
     pub(super) no_grow: AtomicBool,
@@ -166,6 +169,7 @@ impl ResidencyPlanner {
             parking_down: AtomicBool::new(false),
             park_down_failed: AtomicU64::new(u64::MAX),
             list_compaction_failed: AtomicU64::new(u64::MAX),
+            repacked_at: AtomicU64::new(u64::MAX),
             no_grow: AtomicBool::new(false),
             swap_bound: AtomicBool::new(false),
             port,
@@ -448,6 +452,23 @@ impl ResidencyPlanner {
         // Fewest needed first, the oldest first among equals (candidates
         // come by admission, and the sort is stable).
         order.sort_by_key(|&(need, ..)| need);
+        // The finisher stays first while it still fits, or while no one
+        // else does: it runs to its end. Read afresh each pass, the first
+        // flipped between two processes as a restore moved one's need:
+        // restored as the finisher, the other's next ask evicted it, which
+        // made it the finisher again, 914 times over one head in the field
+        // mix's wide shape (seed 7: many beam searches at once). A move
+        // under way opens chunks below for a step (the slack): read then,
+        // no one fitted, and the finisher passed to whoever needed least
+        // for that step, its own restore's victim among the rest.
+        let kept = self.with_inner(|inner| inner.capacity.map(|gate| gate.finisher));
+        let fits = |&(need, _, read): &(u64, u64, super::inner::CapacityRead)| need <= read.free();
+        if let Some(at) = order.iter().position(|&(_, _, read)| Some(read.finisher) == kept)
+            && (fits(&order[at]) || !order.iter().any(fits))
+        {
+            let first = order.remove(at);
+            order.insert(0, first);
+        }
         let (_, _, first) = *order.first()?;
         let mut free = first.free() as i128;
         let mut least = i128::MAX;
@@ -1171,9 +1192,12 @@ impl ResidencyPlanner {
         let (need, suspended, kv_missing) = self.with_inner(|inner| {
             let waiter = inner.queue.get(&inner.locate(key)?)?;
             match &waiter.kind {
-                WaitKind::BindRoom { run, pieces, .. } => {
-                    Some(((*run, *pieces), None, (0, RsUnits::default())))
-                }
+                WaitKind::BindRoom {
+                    run,
+                    pieces,
+                    singles,
+                    ..
+                } => Some(((*run, *pieces), None, (*singles, (0, RsUnits::default())))),
                 WaitKind::Restore { .. } => {
                     let proc = inner.procs.get(&waiter.pid)?;
                     let need = proc.restore_need()?;
@@ -1187,6 +1211,8 @@ impl ResidencyPlanner {
                         .bind_room
                         .filter(|bind| !suspended && bind.run != need.0)
                         .map(|bind| (bind.run, bind.pieces));
+                    // The single chunks its bind asks beside its runs.
+                    let singles = proc.bind_room.map_or(0, |bind| bind.singles);
                     // Its kv pages not yet gathered take chunks of the same
                     // free pool as its runs, and so does its state (records,
                     // rs list slots) its serve takes before its unpark.
@@ -1194,12 +1220,13 @@ impl ResidencyPlanner {
                     Some((
                         need,
                         Some((waiter.pid, suspended, bind, refused)),
-                        (kv_missing, waiter.rs_need()),
+                        (singles, (kv_missing, waiter.rs_need())),
                     ))
                 }
                 WaitKind::Allocation { .. } => None,
             }
         })?;
+        let (singles, kv_missing) = kv_missing;
         let refused = suspended.and_then(|(_, _, _, refused)| refused);
         let mut room = match suspended {
             // A bind's runs beside what its own unpark takes back first.
@@ -1216,6 +1243,7 @@ impl ResidencyPlanner {
             }
             None => RunNeed::one(need.0, need.1),
         };
+        room.add(1, singles);
         if let Some((run, pieces)) = refused {
             room.at_least(run, pieces);
         }
@@ -1459,6 +1487,16 @@ impl ResidencyPlanner {
     /// once either moves.
     /// The room a list compaction is planned on: the pool's room count, the
     /// swap tiers' free slots and the fires landed.
+    /// What has landed: fires, evictions and restores, hashed.
+    pub(super) fn landed(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = rustc_hash::FxHasher::default();
+        self.stats.fires_landed.load(Ordering::Acquire).hash(&mut hasher);
+        self.stats.evictions.load(Ordering::Acquire).hash(&mut hasher);
+        self.stats.restores.load(Ordering::Acquire).hash(&mut hasher);
+        hasher.finish()
+    }
+
     pub(super) fn compaction_room(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = rustc_hash::FxHasher::default();
@@ -1991,6 +2029,12 @@ impl ResidencyPlanner {
             let changed = inner.procs.get_mut(&pid).is_some_and(|proc| {
                 let was = proc.bind_waiting;
                 proc.bind_waiting = waiting;
+                // Resident and binding again: the room an eviction taken
+                // back left pending is its bind's own again, taken or
+                // asked anew.
+                if !waiting && proc.state == Residency::Resident {
+                    proc.bind_room = None;
+                }
                 was != waiting
             });
             // The suspended bind it was restored for waits for room again:
@@ -2014,6 +2058,10 @@ impl ResidencyPlanner {
     /// parked process queues its restore, ahead of its next fire.
     pub fn set_idle(self: &Arc<Self>, pid: ProcessId, idle: bool) {
         self.with_inner(|inner| {
+            // A new request: it arrives.
+            if !idle {
+                inner.arrived(pid);
+            }
             let Some(proc) = inner.procs.get_mut(&pid) else {
                 return;
             };
@@ -2131,17 +2179,25 @@ impl ResidencyPlanner {
     /// adjacent chunks: its restore waits for them beside its kv pages
     /// ([`super::proc::Proc::bind_room`]), never served into the same
     /// shortfall.
-    pub fn suspend_for_room(self: &Arc<Self>, pid: ProcessId, run: u32, pieces: u32) -> bool {
+    pub fn suspend_for_room(
+        self: &Arc<Self>,
+        pid: ProcessId,
+        run: u32,
+        pieces: u32,
+        singles: u32,
+    ) -> bool {
+        let chunks = run.max(1).saturating_mul(pieces).saturating_add(singles);
         let need = PendingBind {
+            singles,
             run: run.max(1),
             pieces,
-            pages: self.port.chunks_as_pages(run.max(1).saturating_mul(pieces)),
+            pages: self.port.chunks_as_pages(chunks),
         };
 
         // A bind the capacity gate holds waits for the gate in the planner:
         // suspended, it parked its process for room that was there, and
         // came back to the same hold.
-        if self.capacity_would_hold(pid, run.max(1).saturating_mul(pieces)) {
+        if self.capacity_would_hold(pid, chunks) {
             return false;
         }
         let before = self.stats.evictions_started.load(Ordering::Relaxed);
@@ -2317,6 +2373,7 @@ impl ResidencyPlanner {
         crate::inferlet::process::vacate_seat(pid);
         let (signal, removed, charged) = self.with_inner(|inner| {
             let departed = inner.procs.remove(&pid);
+            inner.arrived(pid);
             if inner.bind_restoring == Some(pid) {
                 inner.bind_restoring = None;
             }

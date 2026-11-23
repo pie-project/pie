@@ -641,8 +641,11 @@ impl ResidencyPlanner {
         pid: ProcessId,
         run: u32,
         pieces: u32,
+        singles: u32,
     ) -> Result<BindRoomWait, PlannerError> {
-        let pages = self.port.chunks_as_pages(run.max(1).saturating_mul(pieces));
+        let pages = self
+            .port
+            .chunks_as_pages(run.max(1).saturating_mul(pieces).saturating_add(singles));
         // Runs past the whole device pool never stand: refused by name, at
         // once. Any other bind waits for its runs, however long.
         let total = self.device_pages_most();
@@ -653,7 +656,7 @@ impl ResidencyPlanner {
                 runs: Some((run.max(1), pieces)),
             });
         }
-        self.wait_room(pid, run, pieces, pages, None)
+        self.wait_room(pid, (run, pieces, singles), pages, None)
             .await
             .map(|(wait, _registration)| wait)
     }
@@ -688,7 +691,7 @@ impl ResidencyPlanner {
             super::pool::RiseRoom::Short { pieces } => pieces,
         };
         let pages = self.port.chunks_as_pages(pieces);
-        let (wait, registration) = self.wait_room(pid, 1, pieces, pages, Some(rung)).await?;
+        let (wait, registration) = self.wait_room(pid, (1, pieces, 0), pages, Some(rung)).await?;
         if wait == BindRoomWait::Withdrawn {
             return Ok(None);
         }
@@ -709,8 +712,7 @@ impl ResidencyPlanner {
     async fn wait_room(
         self: &Arc<Self>,
         pid: ProcessId,
-        run: u32,
-        pieces: u32,
+        (run, pieces, singles): (u32, u32, u32),
         pages: u32,
         rise: Option<u32>,
     ) -> Result<(BindRoomWait, Option<WaitRegistration<'_>>), PlannerError> {
@@ -725,12 +727,20 @@ impl ResidencyPlanner {
                 if proc.state != Residency::Resident && !raising {
                     return Some(None);
                 }
+                // Its bind asks its room again: what an eviction it was
+                // withdrawn by left pending is this ask now.
+                if rise.is_none()
+                    && let Some(proc) = inner.procs.get_mut(&pid)
+                {
+                    proc.bind_room = None;
+                }
                 Some(Some({
                     inner.enqueue(
                         pid,
                         WaitKind::BindRoom {
                             run,
                             pieces,
+                            singles,
                             pages,
                             notify: notify.clone(),
                             served: false,

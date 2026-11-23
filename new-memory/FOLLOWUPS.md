@@ -1133,3 +1133,16 @@ settle exists for. Fix: stage a feed for those channels in the settle's fires (z
 declared shape; the settle only times), or settle through a class that reads none, instead of
 stopping.
 
+
+## F56. The capacity gate does not charge the room a park to disk opens (planner sim, found 2026-11-23)
+The field mix as it now runs (beam pools bound beside the prefill's instance, frames owing rung raises, two-ended
+pools with the span backed on demand) fails 4 of the 751 seeds without the wide shape: 401 and 645 (liveness: every
+tier full, the finisher a page short), 589 (a victim evicted twice for one head) and 603 (a raise owed to its
+owner's frame never planned: `rung_short` reads the raise as fitting while `plan_rung` finds no free run below for
+a run in the span, so the planner funds nothing and the walk has nothing to move). Seed 401's cause: a park to
+disk lays its guest parts in whole disk chunks per slot class, which raises the census's slack; the gate's margin
+(`CapacityRead::margin`, the largest other resident's move) counts the move's own pages only, so a move under a
+finisher whose spare was 0 left every tier full (free 72 -> 39 in one step, slack +32). Charging a chunk per slot
+class of the mover's held parts in the margin passes 589 and 645 but breaks main seed 134 (a thrash) and leaves 401
+failing: the margin must be the exact granularity a park opens (the classes whose chunks on the tier below have no
+room for its parts), not a bound.

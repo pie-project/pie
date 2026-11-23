@@ -904,6 +904,13 @@ impl SlotPool {
         ticket
     }
 
+    /// Whether a reservation holds a chunk in `start..end`.
+    fn reserved_in(&self, start: u32, end: u32) -> bool {
+        self.held_for
+            .values()
+            .any(|held| held.range(start..end).next().is_some())
+    }
+
     /// The chunks `ticket` still holds.
     #[must_use]
     pub fn reserved(&self, ticket: u64) -> Vec<u32> {
@@ -1197,6 +1204,34 @@ impl SlotPool {
         self.act_max
     }
 
+    /// Held state chunks lying where the engine's state pool does not
+    /// hold them under the rung in force, `(logical, physical)`: at or past
+    /// the current rung's activation (the carve the activation writes), or
+    /// in a segment with no memory under it (a span segment backed on
+    /// demand among them). Empty
+    /// where every holder's refs read memory the engine backs for state.
+    #[must_use]
+    pub fn held_unbacked(&self) -> Vec<(u32, u32)> {
+        let limit = self.state_limit();
+        (0..self.total)
+            .filter(|&logical| self.chunks[logical as usize].shape != NO_SHAPE)
+            .map(|logical| (logical, self.logical_to_physical[logical as usize]))
+            .filter(|&(_, physical)| {
+                let segment = self.segments.of(physical);
+                physical >= limit || self.segments.state(segment) == SegmentState::Uncommitted
+            })
+            .collect()
+    }
+
+    /// Every chunk opened for a shape, `(logical, physical)`.
+    #[must_use]
+    pub fn held_physical(&self) -> Vec<(u32, u32)> {
+        (0..self.total)
+            .filter(|&logical| self.chunks[logical as usize].shape != NO_SHAPE)
+            .map(|logical| (logical, self.logical_to_physical[logical as usize]))
+            .collect()
+    }
+
     /// The first segment under the largest rung's activation (the segment
     /// count where activation lives apart).
     pub fn top_segment(&self) -> u32 {
@@ -1316,7 +1351,10 @@ impl SlotPool {
         // A move's copy still reads chunks the raise would take back: it
         // waits for the copy to land (its end asks the walk again), never
         // laying its activation over state a copy is reading.
-        let read = self.moving_out.range(limit..).count();
+        // Chunks a served restore's reservation keeps there are as taken:
+        // laid under the activation, its bind's runs were gone.
+        let read = self.moving_out.range(limit..).count()
+            + usize::from(self.reserved_in(limit, self.total));
         if read > 0 {
             return Err(SlotError::Occupied {
                 rung,
@@ -3286,6 +3324,15 @@ impl SlotPool {
         if self.moving_out.range(range.start..range.end).next().is_some() {
             return None;
         }
+        // Nor one holding chunks a served restore's reservation keeps for
+        // its unpark and bind ([`Self::reserve_chunks`]): released, they
+        // left the reservation unable to open them, and the bind they were
+        // held for came up short, its process suspended again (the
+        // simulation's seed 263: a run of three held in a segment the walk
+        // gave back).
+        if self.reserved_in(range.start, range.end) {
+            return None;
+        }
         let sources: Vec<u32> = (range.start..range.end)
             .filter(|&chunk| !self.free.get(chunk))
             .collect();
@@ -3465,7 +3512,11 @@ impl SlotPool {
         // Nor released while a residency copy still reads or writes one of
         // its chunks: it waits for the copy to land ([`Self::moved_out`]).
         let range = self.segments.range(segment);
-        let copying = u32::try_from(self.moving_out.range(range.start..range.end).count()).unwrap_or(u32::MAX);
+        // Nor while a served restore's reservation keeps one of its chunks
+        // ([`Self::plan_evacuation`]).
+        let copying = u32::try_from(self.moving_out.range(range.start..range.end).count())
+            .unwrap_or(u32::MAX)
+            .saturating_add(u32::from(self.reserved_in(range.start, range.end)));
         if copying > 0 {
             return Err(SegmentError::Held { segment, held: copying });
         }

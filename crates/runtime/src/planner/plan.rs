@@ -61,6 +61,7 @@ enum Step {
         key: EntryKey,
         run: u32,
         pieces: u32,
+        singles: u32,
         rise: Option<u32>,
     },
     Release(DevicePageReservation),
@@ -387,10 +388,11 @@ impl ResidencyPlanner {
                 .procs
                 .get(&waiter.pid)
                 .and_then(|proc| proc.bind_room)
-                .map(|need| (need.run, need.pieces));
+                .map(|need| need.entries())
+                .unwrap_or_default();
             Some((waiter.pid, waiter.rs_need(), bind, inner.restore_kv_missing(head)))
         })?;
-        Some(self.port.restore_placement(pid, need, state, kv, bind))
+        Some(self.port.restore_placement(pid, need, state, kv, &bind))
     }
 
     /// Whose the device's kv pages and state units are: every process the
@@ -820,13 +822,18 @@ impl ResidencyPlanner {
                     return Step::Done("no unmet head");
                 };
                 if let WaitKind::BindRoom {
-                    run, pieces, rise, ..
+                    run,
+                    pieces,
+                    singles,
+                    rise,
+                    ..
                 } = waiter.kind
                 {
                     return Step::BindRoom {
                         key,
                         run,
                         pieces,
+                        singles,
                         rise,
                     };
                 }
@@ -908,6 +915,7 @@ impl ResidencyPlanner {
                                     WaitKind::BindRoom {
                                         run,
                                         pieces,
+                                        singles,
                                         served: false,
                                         withdrawn: false,
                                         ..
@@ -915,6 +923,7 @@ impl ResidencyPlanner {
                                         key: *key,
                                         run,
                                         pieces,
+                                        singles,
                                         rise: None,
                                     }),
                                     _ => None,
@@ -971,6 +980,7 @@ impl ResidencyPlanner {
                     key,
                     run,
                     pieces,
+                    singles,
                     rise,
                 } => {
                     // A rung raise asks what its raise lacks now, as a run
@@ -1008,8 +1018,29 @@ impl ResidencyPlanner {
                             }
                         },
                     };
-                    // Its runs stand free: the bind takes them.
-                    if rise.is_none() && self.port.guest_room_free(run, pieces) {
+                    // Its runs stand free, and its single chunks beside
+                    // them: the bind takes them, unless the capacity gate
+                    // holds its fresh state. Served there, its take was
+                    // held, it asked again and was served at once, a spin
+                    // in one step: it waits for the gate, which moves as
+                    // those ahead of it finish.
+                    if rise.is_none()
+                        && self.port.guest_room_free(run, pieces)
+                        && (singles == 0
+                            || self
+                                .port
+                                .guest_room_free(1, run.saturating_mul(pieces).saturating_add(singles)))
+                    {
+                        let pid = self.with_inner(|inner| inner.queue.get(&key).map(|waiter| waiter.pid));
+                        if pid.is_some_and(|pid| {
+                            self.capacity_would_hold(
+                                pid,
+                                run.saturating_mul(pieces).saturating_add(singles),
+                            )
+                        }) {
+                            self.plan_stopped("bind room: its runs stand, held at the capacity gate");
+                            return false;
+                        }
                         self.serve_bind_room(key);
                         continue;
                     }
@@ -1027,7 +1058,9 @@ impl ResidencyPlanner {
                     // that, moving no one. Only where none is coming (the
                     // governor's target reached) are residents moved.
                     let need = Demand {
-                        kv_pages: self.port.chunks_as_pages(run.saturating_mul(pieces)),
+                        kv_pages: self
+                            .port
+                            .chunks_as_pages(run.saturating_mul(pieces).saturating_add(singles)),
                         rs: RsUnits::default(),
                     };
                     if self.wait_on_grow(no_grow, need) {
@@ -1036,7 +1069,7 @@ impl ResidencyPlanner {
                     }
                     // Parked state lying on the device moves down a tier
                     // before any resident does.
-                    if self.park_down_for(&RunNeed::one(run, pieces)) {
+                    if self.park_down_for(&RunNeed::of([(run, pieces), (1, singles)])) {
                         self.plan_stopped("bind room: parked state moves down");
                         return false;
                     }
@@ -1075,9 +1108,7 @@ impl ResidencyPlanner {
                     // parts and its runs of two, did not: sent, refused
                     // (PendingBindShort), sent again (Mac Pro at 2 GiB on
                     // 7e75af541: 52k no-step lines, free runs (7, 3)).
-                    let whole = self
-                        .head_room(key)
-                        .unwrap_or_else(|| RunNeed::one(need.run, need.pieces));
+                    let whole = self.head_room(key).unwrap_or_else(|| need.runs());
                     if pid.is_some_and(|pid| {
                         !self.no_more_room_than_refused(pid)
                             && (self
@@ -1098,8 +1129,12 @@ impl ResidencyPlanner {
                     // the bind-suspended head's runs never funded): the
                     // bind's runs beside its own retake ([`Self::beside_own`]).
                     let room = match pid {
-                        Some(pid) => self.beside_own(pid, (need.run, need.pieces)),
-                        None => RunNeed::one(need.run, need.pieces),
+                        Some(pid) => {
+                            let mut room = self.beside_own(pid, (need.run, need.pieces));
+                            room.add(1, need.singles);
+                            room
+                        }
+                        None => need.runs(),
                     }
                     .within(self.port.state_chunks(), Some((need.run, need.pieces)));
                     if self.park_down_for(&room) {
@@ -1455,7 +1490,11 @@ impl ResidencyPlanner {
                             return Board::Replan;
                         }
                         // Restored past the head it was evicted for, that
-                        // head passed over: no victim for it until it fires.
+                        // head passed over: no victim for it until that head
+                        // arrives ([`Inner::arrived`]). Moved for it again
+                        // once it fired, it went round with a head no move
+                        // formed runs for, restored past it and moved back
+                        // (the simulation's seeds 189, 276).
                         proc.restored_past = proc.evicted_for.filter(|head| {
                             inner.passed.iter().any(|&(_, passed)| passed == *head)
                         });
@@ -1483,9 +1522,10 @@ impl ResidencyPlanner {
                             // c201812ea: PendingBindShort, its run-1 bind's
                             // chunk taken between its serve and its unpark).
                             let bind = self.with_inner(|inner| {
-                                inner.procs.get(&pid).and_then(|proc| proc.bind_room).map(|need| (need.run, need.pieces))
+                                inner.procs.get(&pid).and_then(|proc| proc.bind_room).map(|need| need.entries())
                             });
-                            self.port.reserve_restore(pid, bind);
+                            let held = self.port.reserve_restore(pid, bind.as_deref().unwrap_or_default());
+                            tracing::debug!(%pid, ?bind, held, "planner: a restore sent, its placement held for it");
                             // Said as the pass's end for this head: a restore
                             // refused and queued again showed "ended=none".
                             self.plan_ended(key, "restore sent", false, &[]);

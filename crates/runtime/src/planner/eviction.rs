@@ -218,7 +218,16 @@ impl ResidencyPlanner {
             return false;
         }
         let before = self.port.free_chunks();
-        let gathered = self.with_inner(|inner| std::mem::take(inner.accum.lend()));
+        // Packed once with nothing landed since, the head gathered its pages
+        // again from the chunks the packing freed and packed them again,
+        // pass after pass (the simulation's seed 2477): packed again only
+        // once something has landed.
+        let landed = self.landed();
+        let gathered = if self.repacked_at.load(Ordering::Acquire) == landed {
+            Vec::new()
+        } else {
+            self.with_inner(|inner| std::mem::take(inner.accum.lend()))
+        };
         let wanted = if gathered.is_empty() {
             wanted
         } else {
@@ -226,6 +235,7 @@ impl ResidencyPlanner {
             self.with_inner(|inner| inner.accum.lend().extend(packed));
             let freed = self.port.free_chunks().saturating_sub(before);
             if freed > 0 {
+                self.repacked_at.store(landed, Ordering::Release);
                 tracing::debug!(
                     %head,
                     freed,
@@ -664,6 +674,7 @@ impl ResidencyPlanner {
         if let Some(need) = shape.as_ref() {
             let (run, pieces) = need.longest().unwrap_or((1, 0));
             tracing::debug!(
+                head = %victims.head_pid,
                 ?need,
                 picks = ?picks.iter().map(|&(pid, _)| pid).collect::<Vec<_>>(),
                 chunks = ?map.as_ref().map(|map| (map.held.len(), map.free.len())),
@@ -1211,6 +1222,15 @@ impl ResidencyPlanner {
                         && inner.settled_resident(**pid)
                         // The finisher is no victim ([`super::inner::CapacityGate`]).
                         && !inner.is_finisher(**pid)
+                        // Served its bind's room, it takes it as it wakes.
+                        && !inner.bind_served(**pid)
+                        // The head is a restore of one evicted for this
+                        // process: moved for it, the two went round, each
+                        // evicted for the other's ask (the simulation's
+                        // seed 4255: a bind's victim, restored as the head,
+                        // evicted the bind it was moved for, and was moved
+                        // for it again).
+                        && !inner.evicted_for_by(waiter.pid, **pid)
                         // In its request, it runs to its end but for room
                         // something ranked above it asks
                         // ([`Inner::keeps_room`]).
@@ -1306,6 +1326,8 @@ impl ResidencyPlanner {
                 // gate). The policy picks among the others.
                 if proc.state != Residency::Resident
                     || inner.is_finisher(pid)
+                    || inner.bind_served(pid)
+                    || inner.evicted_for_by(head_pid, pid)
                     || inner.unfired_protects(pid)
                     || proc.restored_past == Some(head_pid)
                     || (proc.rank() <= head_rank && !yields)
@@ -1463,7 +1485,14 @@ impl ResidencyPlanner {
                         .zip(&rs_quotes)
                         .filter_map(|((pid, quote), &rs)| {
                             let proc = inner.procs.get(pid)?;
-                            if (proc.rank() <= head_rank && !proc.idle && !proc.held)
+                            // Restored past this head while it stood passed
+                            // over: the last resort keeps that rule too, or
+                            // it went round with the head, restored past it
+                            // and moved for it again (the simulation's seed
+                            // 361).
+                            if proc.restored_past == Some(waiter.pid)
+                                || proc.last_resort_for == Some(waiter.pid)
+                                || (proc.rank() <= head_rank && !proc.idle && !proc.held)
                                 || (proc.holder && !proc.idle)
                                 || proc.state != Residency::Resident
                                 || inner.host_swap_blocked.contains(pid)
@@ -1498,6 +1527,23 @@ impl ResidencyPlanner {
         let (Some(head), false) = (head, picks.is_empty()) else {
             return false;
         };
+        tracing::debug!(
+            ?head,
+            picks = ?picks.iter().map(|&(pid, _)| pid).collect::<Vec<_>>(),
+            "planner: the last resort moves residents the victim set found no fresh one among"
+        );
+        // Moved for this head once by the last resort, a victim is not
+        // again until the head arrives: moved for pages, it formed the
+        // head nothing, was restored and moved again (the simulation's
+        // seed 361).
+        self.with_inner(|inner| {
+            let head_pid = inner.queue.get(&head).map(|waiter| waiter.pid);
+            for &(pid, _) in &picks {
+                if let Some(proc) = inner.procs.get_mut(&pid) {
+                    proc.last_resort_for = head_pid;
+                }
+            }
+        });
         if !self.commit_evictions(head, picks, true) {
             return false;
         }

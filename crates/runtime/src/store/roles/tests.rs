@@ -1381,7 +1381,7 @@ fn a_ring_short_of_a_run_waits_for_a_chunk_and_registers_nothing() {
         matches!(short, RolesError::BindShort(inner) if matches!(**inner, RolesError::NoRun { .. })),
         "{error}"
     );
-    assert_eq!(short.room_runs(), Some((1, 1)), "it waits for a chunk");
+    assert_eq!(short.room_runs(), Some((1, 1, 0)), "it waits for a chunk");
     assert!(super::waits_for_room(&error));
     assert!(engine.registrations.is_empty(), "nothing registered");
     assert_eq!(held(&device), before, "nothing taken");
