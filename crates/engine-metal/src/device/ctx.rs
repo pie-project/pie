@@ -532,6 +532,17 @@ impl Context {
                 call: "commandBuffer",
                 why: "the queue would not open a command buffer".to_string(),
             })?;
+            // `hold_next_frame`: the frame's first pass waits for the host.
+            #[cfg(feature = "fault-injection")]
+            if HOLD_NEXT.with(|next| next.replace(false)) {
+                use objc2_metal::MTLDevice as _;
+                let event = self.device().newSharedEvent().ok_or(Fault::Device {
+                    call: "newSharedEvent",
+                    why: "the device would not make a shared event".to_string(),
+                })?;
+                buffer.encodeWaitForEvent_value(ProtocolObject::from_ref(&*event), 1);
+                HELD.with(|held| *held.borrow_mut() = Some(event));
+            }
             let encoder = buffer.computeCommandEncoder().ok_or(Fault::Device {
                 call: "computeCommandEncoder",
                 why: "the command buffer would not open a compute pass".to_string(),
@@ -1095,6 +1106,31 @@ const INJECTED: &str = "a failure injected by `fail_next_frame`";
 #[cfg(feature = "fault-injection")]
 pub fn fail_next_frame() {
     FAIL_NEXT.with(|next| next.set(true));
+}
+
+#[cfg(all(target_vendor = "apple", feature = "fault-injection"))]
+thread_local! {
+    static HOLD_NEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static HELD: RefCell<Option<Retained<ProtocolObject<dyn objc2_metal::MTLSharedEvent>>>> =
+        const { RefCell::new(None) };
+}
+
+/// Holds the next frame this thread opens on the device until
+/// [`release_held_frame`]: its first pass waits for the host, so a test can
+/// stage the next frame while this one is genuinely still to run. A test
+/// seam only, under the `fault-injection` feature, as [`fail_next_frame`].
+#[cfg(all(target_vendor = "apple", feature = "fault-injection"))]
+pub fn hold_next_frame() {
+    HOLD_NEXT.with(|next| next.set(true));
+}
+
+/// Lets the frame [`hold_next_frame`] held run.
+#[cfg(all(target_vendor = "apple", feature = "fault-injection"))]
+pub fn release_held_frame() {
+    use objc2_metal::MTLSharedEvent as _;
+    if let Some(event) = HELD.with(|held| held.borrow_mut().take()) {
+        event.setSignaledValue(1);
+    }
 }
 
 // SAFETY: what a `Pending` does to its command buffer is `status`, `error`
