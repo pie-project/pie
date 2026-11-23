@@ -391,14 +391,15 @@ pub struct Lane {
     /// lane of a load that holds recurrent state, a record or none. On a
     /// load with windowed layers served as ring + buffer it holds their
     /// rings too ([`crate::ChunkFacts::windowed`]), and `cow != run` is also
-    /// the copy-on-first-fold of a ring another owner shares (CONTRACT-BC
-    /// 19).
+    /// the copy-on-first-fold of a record another owner shares (CONTRACT-BC
+    /// 19): the whole record, rings and rs state together, since the fold
+    /// changes both.
     #[serde(default)]
     pub record: LaneRecord,
     /// How the lane's windowed layers stand as ring + buffer and how far
     /// this fire folds them (CONTRACT-BC 19, 21). Stated on every lane of a
     /// load whose engine states [`crate::ChunkFacts::windowed`]; `None`
-    /// elsewhere.
+    /// elsewhere, and on a kv-less lane, which carries no attention rows.
     #[serde(default)]
     pub window: Option<WindowFold>,
     /// Whole-slot copies `[src, dst]` (logical slot refs) of each list
@@ -525,7 +526,8 @@ impl Lane {
 
     /// A lane's windowed layers (CONTRACT-BC 21): stated only to an engine
     /// that serves them as ring + buffer; the buffer starts at or below the
-    /// lane's folded index; on a hybrid the rs fold is the same fold.
+    /// lane's folded index after the fire; on a hybrid the rs fold is the
+    /// same fold.
     fn validate_window(&self, serves: Serves) -> Result<()> {
         let Some(window) = &self.window else {
             return Ok(());
@@ -533,11 +535,15 @@ impl Lane {
         if !serves.windowed_state {
             return Err(Error::unsupported("engine", WINDOW_WITHOUT_RING));
         }
-        if window.base > self.kv.folded {
+        let after = match window.fold {
+            FoldLen::Host(rows) => self.kv.folded.saturating_add(rows),
+            FoldLen::Device => self.kv.folded,
+        };
+        if window.base > after {
             return Err(Error::Invalid(format!(
                 "lane in slot {} starts its window buffer at row {}, past its folded \
-                 index {}: the rows below it are in the ring",
-                self.slot, window.base, self.kv.folded
+                 index after the fire {after}: the rows below it are in the ring",
+                self.slot, window.base
             )));
         }
         if let RsVerb::Buffer {
@@ -819,14 +825,24 @@ pub enum RsVerb {
 /// A lane's windowed (sliding-window attention) layers as state + buffer,
 /// as a recurrent layer is (CONTRACT-BC 19, 21). The lane's folded index is
 /// [`KvDelta::folded`], the one index its recurrent layers fold by too
-/// ([`RsVerb::Buffer`] states the same `folded`, `fold` and `lineage`):
+/// ([`RsVerb::Buffer`] states the same `folded`, `fold` and `lineage`; the
+/// windowed-state integration lifts one lane-level fold out of it, so rs
+/// and window read one field, and until then [`Lane::validate`] holds the
+/// two equal):
 ///
 /// - The ring: rows below `folded`, the last W of each windowed layer (and
-///   its S sink rows, folded once and never dropped), in the lane's record ([`Lane::record`], [`crate::ChunkFacts::windowed`]).
-/// - The buffer: rows `[folded, end)` (`end` one past the lane's last row)
-///   in the window buffer's slots the lane's table names
-///   ([`crate::SlotRole::WindowBuffer`], [`Lane::tables`]), entry `i` rows
-///   `[base + i * T, base + (i + 1) * T)`.
+///   its S sink rows, folded once and never dropped), in the lane's record
+///   ([`Lane::record`], [`crate::ChunkFacts::windowed`]).
+/// - The buffer: the rows still unfolded after the fire, in the window
+///   buffer's slots the lane's table names ([`crate::SlotRole::WindowBuffer`],
+///   [`Lane::tables`]), entry `i` rows `[base + i * T, base + (i + 1) * T)`,
+///   every entry a real slot. Rows the fire itself folds take no buffer
+///   slot: their K/V live in the fire's own activation while the fire reads
+///   them, and only the ring receives them at the fold. A fire's activation
+///   holds its own folded rows' K/V for its reads (an engine sizes its
+///   activation for it; the runtime cuts a fire whose activation cannot, as
+///   chunked prefill), so a long prefill holds at most about one fire's
+///   tail of slots.
 /// - Attention: row `p` of a windowed layer of window W and S sinks reads
 ///   keys `[0, S)` and `[max(S, p - W + 1), p]` (`[max(0, p - W + 1), p]`
 ///   for S = 0): those below `folded` from the ring and sinks, those
@@ -839,8 +855,12 @@ pub enum RsVerb {
 ///   it once (CONTRACT-BC 12, 15).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowFold {
-    /// The row entry 0 of the lane's window-buffer table holds: on a slot's
-    /// first row, at or below `folded`.
+    /// The row entry 0 of the lane's window-buffer table holds, on a slot's
+    /// first row: the lane's folded index after the fire, rounded down to
+    /// `T` (for a device-counted fold, the index as the runtime knows it,
+    /// `folded`). Where the lane carries rows earlier fires buffered (its
+    /// first row past `folded`), those keep their slots while the fire
+    /// reads and folds them: `base` is `folded` rounded down to `T`.
     pub base: u32,
     /// How far this fire advances `folded`, the rows it folds into the
     /// rings: [`FoldLen`] as [`RsVerb::Buffer`]'s `fold` reads it (a
@@ -1441,6 +1461,23 @@ mod tests {
         lane.window = Some(WindowFold { base: 32, ..fold });
         let why = lane.validate_for(serves).unwrap_err().to_string();
         assert!(why.contains("past its folded index"), "{why}");
+        // A prefill folding its own rows: the table starts at the folded
+        // index after the fire, rounded down.
+        lane.window = Some(WindowFold {
+            base: 32,
+            fold: FoldLen::Host(20),
+            lineage: Lineage::Set,
+        });
+        assert!(lane.validate_for(serves).is_ok());
+        lane.window = Some(WindowFold {
+            base: 32,
+            fold: FoldLen::Device,
+            lineage: Lineage::Set,
+        });
+        assert!(
+            lane.validate_for(serves).is_err(),
+            "a device-counted fold's base is the folded index the runtime knows"
+        );
         lane.window = Some(fold);
         lane.rs = RsVerb::Buffer {
             pages: Vec::new(),

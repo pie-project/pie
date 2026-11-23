@@ -86,23 +86,33 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
       opaque bytes and are costed in the record's tier. Their layout is the engine's (a plane of its own or inside
       the state bytes); the contract states only the bytes per windowed layer, at least (W + S) times that layer's
       K + V row bytes, padded as the engine pads them. W need not be a page multiple.
-    - **Buffer.** The windowed layers' K/V rows `[folded, p)` live in window-buffer slots, a slot list like kv: taken
-      on demand as rows accrue (no carried-rows bound; a fire too wide for the pool is cut like chunked prefill,
-      never refused), named in the lane's tables in token order. A fold frees every buffer slot whose rows are all
-      folded. On a hybrid the rs rows keep their own buffer (18, 20); window K/V use this list.
+    - **Buffer.** The windowed layers' K/V rows still unfolded after a fire live in window-buffer slots, a slot list
+      like kv: taken on demand as rows accrue (no carried-rows bound; a fire too wide for the pool is cut like
+      chunked prefill, never refused), named in the lane's tables in token order, every entry a real slot. Rows a
+      fire itself folds take no buffer slot: their K/V live in the fire's own activation scratch while the fire
+      reads them, and only the ring (the last W, plus sinks) receives them at the fold. A fold frees every buffer
+      slot whose rows are all folded. On a hybrid the rs rows keep their own buffer (18, 20); window K/V use this
+      list.
     - **Fold.** The lane's folded index (`KvDelta.folded`, the one `RsVerb::Buffer.folded` states) is the only
-      source of truth. Advancing folded from f to f' writes buffer rows `[f, f')` into the ring at `row mod W`,
-      dropping the oldest past W, in the same fold step as rs. Lanes sharing a folded window (a beam group: the
-      shared common-ancestor lagged fold) fold once; 12 and 15 order a group's fold after every lane read.
+      source of truth. Advancing folded from f to f' writes rows `[f, f')` (buffered, or the fire's own) into the
+      ring at `row mod W`, dropping the oldest past W, in the same fold step as rs. One fold per lane: the
+      integration commit lifts a single lane-level fold (folded, fold, lineage) out of `RsVerb::Buffer`, so rs and
+      window read one field; until then the two are stated equal and validated so. Lanes sharing a folded window
+      (a beam group: the shared common-ancestor lagged fold) fold once; 12 and 15 order a group's fold after every
+      lane read.
     - **Read.** Row p of a windowed layer reads keys `[0, S)` and `[max(S, p - W + 1), p]` (`[max(0, p - W + 1), p]`
       for a plain window): those below folded from the ring and sinks, those in `[folded, p]` from the lane's
       buffer rows in lineage order (the `buffered_reads` lineage the rs replay uses; a lane never reads a sibling's
       divergent rows) and its own rows. One mask; one softmax over the union.
-    - **Sharing.** A ring shared with a prefix-cache entry (or any other owner at a different fold point) is copied
-      once at its first fold (copy-on-first-fold, bounded by the ring's bytes: the record's `cow != run`), so
-      committed state stays immutable. An auto-checkpoint on a windowed model is a snapshot of the ring. A windowed
+    - **Sharing.** A record shared with a prefix-cache entry (or any other owner at a different fold point) is
+      copied once at its first fold (copy-on-first-fold: the record's `cow != run`), so committed state stays
+      immutable. The whole record is copied, rings and rs state together: on a hybrid the fold changes the rs state
+      too. An auto-checkpoint on a windowed model is a snapshot of the ring. A windowed
       lane's snapshot is its record plus its unfolded buffer slots, as an rs lane's; window tables are not saved.
-    - **Prefill.** A long prefill streams through the ring in the same fire.
+    - **Prefill.** A long prefill streams through the ring in the same fire. A fire's activation holds its own
+      folded rows' K/V for the fire's reads: an engine sizes its activation for it, and the runtime cuts a fire
+      whose activation cannot hold it, as chunked prefill. So a long prefill holds at most about one fire's tail of
+      buffer slots.
     - **Gone.** Window lists, their slot tables, ref-0 trimming, `slot_copies` of window lists, `KvCopy.windowed`
       and `PoolFacts.window_tokens` go. An engine states that it serves windowed layers as ring + buffer
       (`Capabilities.windowed_state`); until every engine does, the old window-list fields stay in the engine crate
@@ -125,7 +135,11 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
     refuses a window buffer of another kind, two window buffers, a window buffer with no windowed layer and windowed
     layers with none, and any window list beside windowed layers. A lane states `Lane.window: Option<WindowFold {
     base, fold, lineage }>` (serde default None), on every seated lane of such a load and on no other:
-    `base` is the row entry 0 of the lane's window-buffer table holds (a multiple of T, `<= kv.folded`), `fold` how
+    `base` is the row entry 0 of the lane's window-buffer table holds: the lane's folded index after the fire
+    (`kv.folded` plus a host-counted fold; `kv.folded` for a device-counted one), rounded down to T, and where the
+    lane carries rows earlier fires buffered (its first row past `kv.folded`) those keep their slots while the fire
+    reads and folds them, so `base` is `kv.folded` rounded down to T (validated: a multiple of T, at most the folded
+    index after the fire). A kv-less lane carries no attention rows and states no `window`. `fold` how
     far the fire advances folded (`FoldLen`, read as `RsVerb::Buffer`'s: a device-counted fold's count reaches the
     runtime when the fire settles, and the engine keeps the row its rings stand at with the record), `lineage`
     which buffered rows the windowed layers read. On a hybrid `RsVerb::Buffer` states the same folded, fold and
@@ -133,8 +147,9 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
     entry i = slot of rows `[base + i*T, base + (i+1)*T)`, every entry a real slot (no ref 0). Forks / prefix-cache
     entries share window-buffer slots by refcount; a write into a shared partly filled slot is preceded by a
     whole-slot copy in `Lane.slot_copies` under the buffer's shape id (as the rs list's, 20). A copy-on-first-fold
-    of a shared ring is the record's `[run, cow]` with `cow != run`. `Capabilities.windowed_state` (serde default
-    false; `Serves.windowed_state`): a lane stating `window` to an engine without it is refused by name.
+    of a shared record is the record's `[run, cow]` with `cow != run`, the whole record.
+    `Capabilities.windowed_state` (serde default false; `Serves.windowed_state`): a lane stating `window` to an
+    engine without it is refused by name.
 22. **Host and disk tiers of shared shapes (fills in the tiers part of 12).** `ChunkFacts.host_chunks`: host chunks
     of `chunk_bytes`, ids from 0, none reserved, no ChunkTable (a host ref names its own place); any state shape
     (weights excepted) may open any host chunk; a host ref of shape s is `chunk * s.slots_per_chunk + index` at
