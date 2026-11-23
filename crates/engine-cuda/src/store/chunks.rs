@@ -1000,10 +1000,7 @@ impl Chunks {
         }
         // Where the record holds the rings, the one window list is the
         // window buffer (CONTRACT-BC 21).
-        let ringed = layout
-            .fixed
-            .as_ref()
-            .is_some_and(|fixed| fixed.ring.is_some());
+        let ringed = layout.ring.is_some();
         for window in &layout.windows {
             let mut stated = shape(
                 window,
@@ -1030,18 +1027,24 @@ impl Chunks {
             stated.role = engine::chunk::SlotRole::RsBuffer;
             shapes.push(stated);
         }
-        if let Some(fixed) = &layout.fixed {
+        // The ring shape, before the record's state shape (CONTRACT-BC 21).
+        if let Some(ring) = &layout.ring {
             let mut stated = shape(
+                &ring.slot,
+                SlotKind::Fixed {
+                    pieces: ring.pieces,
+                },
+            );
+            stated.role = engine::chunk::SlotRole::Ring;
+            shapes.push(stated);
+        }
+        if let Some(fixed) = &layout.fixed {
+            shapes.push(shape(
                 &fixed.slot,
                 SlotKind::Fixed {
                     pieces: fixed.pieces,
                 },
-            );
-            // A record of rings alone is the ring shape (CONTRACT-BC 21).
-            if fixed.ring.is_some() {
-                stated.role = engine::chunk::SlotRole::Ring;
-            }
-            shapes.push(stated);
+            ));
         }
         for role in [
             engine::chunk::SlotRole::Instance,

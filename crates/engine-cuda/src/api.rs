@@ -1123,7 +1123,7 @@ impl Engine for Cuda {
 
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
         use crate::store::Tier;
-        use crate::store::layout::{FIXED, LIST, WINDOW};
+        use crate::store::layout::{FIXED, LIST, RING, WINDOW};
         let tier = |domain| match domain {
             MemoryDomain::CudaDevice(_) => Some(Tier::Device),
             MemoryDomain::HostPinned => Some(Tier::Host),
@@ -1150,14 +1150,18 @@ impl Engine for Cuda {
                 .copy_tier_slots(copy.shape, from, to, &copy.slots)
                 .map_err(fault);
         }
-        if copy.shape == FIXED {
+        if copy.shape == FIXED || copy.shape == RING {
             if !copy.runs.is_empty() {
                 return Err(Error::Invalid(
                     "a fixed record is copied whole, not a run of its tokens".into(),
                 ));
             }
+            // A record is one unit across its shapes: named by any shape's
+            // first piece, copied whole.
             for &(src, dst) in &copy.slots {
-                shell.fork_state(src, dst).map_err(fault)?;
+                shell
+                    .fork_state(shell.record_key(src), shell.record_key(dst))
+                    .map_err(fault)?;
             }
             return Ok(());
         }
@@ -1707,7 +1711,7 @@ impl Cuda {
         // kv refs, and its recurrent record is the pairs `fixed` names, a
         // piece each, copied onto the slots the fire writes where the two
         // differ.
-        use crate::store::layout::{FIXED, LIST, WINDOW};
+        use crate::store::layout::{FIXED, LIST, RING, WINDOW};
         let by_refs = submission.lanes.iter().any(|lane| {
             !lane.tables.is_empty()
                 || !matches!(lane.record, engine::fire::LaneRecord::Unstated)
@@ -1745,7 +1749,16 @@ impl Cuda {
             nulls.push(matches!(lane.record, engine::fire::LaneRecord::Null));
             let record = match pieces {
                 [] => None,
-                [(shape, pieces)] if *shape == FIXED => {
+                // A record's pieces: its rings' first, then its state's
+                // (CONTRACT-BC 21), named as one record by its first.
+                stated
+                    if stated.iter().all(|(shape, _)| *shape == FIXED || *shape == RING)
+                        && stated.windows(2).all(|pair| pair[0].0 == RING && pair[1].0 == FIXED) =>
+                {
+                    let pieces: Vec<[u32; 2]> = stated
+                        .iter()
+                        .flat_map(|(_, pieces)| pieces.iter().copied())
+                        .collect();
                     let runs: Vec<u32> = pieces.iter().map(|[run, _]| *run).collect();
                     let written: Vec<u32> = pieces.iter().map(|[_, written]| *written).collect();
                     let run = shell.name_record(&runs).map_err(fault)?;

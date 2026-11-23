@@ -834,6 +834,12 @@ impl Shell {
         self.device.side_streams().len()
     }
 
+    /// The record a slot ref names (`Pools::record_key`).
+    #[must_use]
+    pub fn record_key(&self, slot: u32) -> u32 {
+        self.pools.record_key(slot)
+    }
+
     /// The windowed layers the record holds the rings of; none where the
     /// load serves its windowed rows by window lists.
     #[must_use]

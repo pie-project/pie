@@ -49,6 +49,9 @@ pub fn window_of(id: ShapeId) -> Option<usize> {
 pub const FIXED: ShapeId = ShapeId(2);
 /// The rs list's.
 pub const RS: ShapeId = ShapeId(3);
+/// The ring shape's: the windowed layers' rings, a record's first pieces
+/// (CONTRACT-BC 21), clear of the weight shapes' and the window lists'.
+pub const RING: ShapeId = ShapeId(MORE_WINDOWS - 1);
 
 /// The guest shapes' ids start here, clear of the weight shapes' and the
 /// window lists'.
@@ -103,6 +106,8 @@ pub enum Kind {
     Instance,
     /// A slot of a ring only the device reads and writes ([`CHANNEL`]).
     Channel,
+    /// A piece of a record's windowed rings, a chunk's one slot ([`RING`]).
+    Ring,
 }
 
 impl Kind {
@@ -117,6 +122,7 @@ impl Kind {
         Kind::Window(3),
         Kind::Instance,
         Kind::Channel,
+        Kind::Ring,
     ];
 
     /// The shape the pages of a kv row of list `list` are slots of: 0 the
@@ -158,11 +164,12 @@ impl Kind {
             Kind::Window(at) => 3 + at as usize,
             Kind::Instance => 3 + MOST_WINDOWS,
             Kind::Channel => 4 + MOST_WINDOWS,
+            Kind::Ring => 5 + MOST_WINDOWS,
         }
     }
 
     /// The kinds [`Kind::index`] numbers.
-    pub const COUNT: usize = 5 + MOST_WINDOWS;
+    pub const COUNT: usize = 6 + MOST_WINDOWS;
 
     #[must_use]
     pub const fn name(self) -> &'static str {
@@ -173,6 +180,7 @@ impl Kind {
             Kind::Rs => "rs buffer page",
             Kind::Instance => "guest instance slot",
             Kind::Channel => "guest channel slot",
+            Kind::Ring => "ring slot",
         }
     }
 }
@@ -323,6 +331,9 @@ pub struct Layout {
     /// window page by one table.
     pub windows: Vec<SlotShape>,
     pub fixed: Option<FixedShape>,
+    /// The windowed rings, a record's first pieces, where the load serves
+    /// its windowed rows as ring + buffer.
+    pub ring: Option<RingShape>,
     pub rs: Option<RsShape>,
     /// The guest shapes: an instance's tables, a device ring.
     pub instance: SlotShape,
@@ -921,9 +932,16 @@ pub struct FixedShape {
     /// The id tables a fire stages a lane: each a run of the record's slots
     /// some row's pieces lie in, the rows that share a run sharing a table.
     pub tables: Vec<Vec<u32>>,
-    /// The windowed layers' rings the record holds (CONTRACT-BC 19, 21),
-    /// where the load serves them as ring + buffer.
-    pub ring: Option<Ring>,
+}
+
+/// The ring shape: a record's windowed rings, `pieces` slots of it, one a
+/// chunk, named first among the record's pieces (CONTRACT-BC 21).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RingShape {
+    pub slot: SlotShape,
+    /// The slots a record's rings take.
+    pub pieces: u32,
+    pub ring: Ring,
 }
 
 /// The windowed layers' rings in a record: `pages` pages laid exactly as a
@@ -967,12 +985,12 @@ impl Ring {
     }
 }
 
-impl FixedShape {
-    /// The record of a load that holds no recurrent state but serves its
-    /// windowed rows as ring + buffer: its ring shape's pieces alone, each a
+impl RingShape {
+    /// The rings of a load that serves its windowed rows as ring + buffer:
+    /// its ring shape's pieces, each a
     /// chunk's whole slot, their pages laid as the window buffer's slots
     /// from the ring run's offset (`CudaRings`, the recipe's ring hook).
-    pub fn of_ring(recipe: &ChunkRecipe, buffer: &SlotShape) -> Result<Option<FixedShape>> {
+    pub fn of_ring(recipe: &ChunkRecipe, buffer: &SlotShape) -> Result<Option<RingShape>> {
         let Some(windowed) = recipe.windowed.as_ref() else {
             return Ok(None);
         };
@@ -1013,9 +1031,9 @@ impl FixedShape {
                 (layer.layer.or(row).unwrap_or(0), layer.window, bytes)
             })
             .collect();
-        Ok(Some(FixedShape {
+        Ok(Some(RingShape {
             slot: SlotShape {
-                id: FIXED,
+                id: RING,
                 tokens: 0,
                 slot_bytes: *bytes,
                 per_chunk: u32::try_from(chunk_bytes / (*bytes).max(1))
@@ -1027,9 +1045,7 @@ impl FixedShape {
                 pools: Vec::new(),
             },
             pieces: (*pieces_per_ws).max(1),
-            rows: Vec::new(),
-            tables: Vec::new(),
-            ring: Some(Ring {
+            ring: Ring {
                 pages,
                 per_piece: u32::try_from(run.atoms_per_piece).unwrap_or(u32::MAX).max(1),
                 offset: run.offset,
@@ -1037,7 +1053,7 @@ impl FixedShape {
                 page_rows,
                 windows,
                 layers,
-            }),
+            },
         }))
     }
 }
@@ -1112,7 +1128,6 @@ impl FixedShape {
             pieces: (*pieces_per_ws).max(1),
             rows,
             tables,
-            ring: None,
         })
     }
 
@@ -1173,23 +1188,17 @@ impl Layout {
                 ),
             });
         }
-        let mut fixed = recipe
+        let fixed = recipe
             .fixed()
             .map(|layout| FixedShape::of(recipe, layout))
             .transpose()?;
         // A windowed recipe's one window buffer, stated as the first window
         // list's shape, and its rings as the record.
         let mut windows = windows;
+        let mut ring = None;
         if let Some(buffer) = recipe.window_buffer() {
             let buffer = SlotShape::of(buffer, chunk_bytes, WINDOW)?;
-            if fixed.as_ref().is_some_and(|fixed| !fixed.rows.is_empty()) {
-                return Err(Fault::Unbound {
-                    what: "windowed rows as ring + buffer beside recurrent state in one \
-                           record, which this engine does not lay yet"
-                        .into(),
-                });
-            }
-            fixed = FixedShape::of_ring(recipe, &buffer)?;
+            ring = RingShape::of_ring(recipe, &buffer)?;
             windows = vec![buffer];
         }
         let rs = recipe
@@ -1319,6 +1328,7 @@ impl Layout {
             list,
             windows,
             fixed,
+            ring,
             rs,
             instance: SlotShape::guest(INSTANCE, INSTANCE_SLOT, chunk_bytes),
             channel: SlotShape::guest(CHANNEL, CHANNEL_SLOT, chunk_bytes),
@@ -1333,6 +1343,7 @@ impl Layout {
             Kind::List => self.list.as_ref(),
             Kind::Window(at) => self.windows.get(at as usize),
             Kind::Fixed => self.fixed.as_ref().map(|fixed| &fixed.slot),
+            Kind::Ring => self.ring.as_ref().map(|ring| &ring.slot),
             Kind::Rs => self.rs.as_ref().map(|rs| &rs.slot),
             Kind::Instance => Some(&self.instance),
             Kind::Channel => Some(&self.channel),
@@ -1346,6 +1357,7 @@ impl Layout {
             .iter()
             .chain(&self.windows)
             .chain(self.rs.as_ref().map(|rs| &rs.slot))
+            .chain(self.ring.as_ref().map(|ring| &ring.slot))
             .chain(self.fixed.as_ref().map(|fixed| &fixed.slot))
             .chain([&self.instance, &self.channel])
     }
