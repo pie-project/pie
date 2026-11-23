@@ -95,6 +95,7 @@ fn tests_every_case() {
     on_the_host_the_lower_set_goes_first();
     a_higher_set_moving_down_takes_the_room_of_a_lower_one_on_the_host();
     the_lowest_set_that_finds_no_room_below_goes_before_a_higher_one_moves();
+    a_demote_keeps_off_the_disk_what_its_row_keeps_off_it();
     a_keep_the_policy_states_is_honoured_and_unkeyed_idle_cache_waits_for_a_demand();
     idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight();
     an_answer_goes_before_an_older_prompt();
@@ -1395,6 +1396,27 @@ fn the_lowest_set_that_finds_no_room_below_goes_before_a_higher_one_moves() {
     assert_eq!(store.reclaim_droppable(store.current_epoch(), keys), 4, "B goes");
     assert_eq!(on_device(&mut store, &b_tokens), 0);
     assert_eq!(on_device(&mut store, &a_tokens), 4, "A stays");
+}
+
+/// A row naming the device and the host keeps idle cache off the disk: a
+/// demote takes the host's room and no more, however much room the disk
+/// has (conform's keep: fillers spilled to disk, so the host never filled
+/// and the lower set on it was never displaced).
+fn a_demote_keeps_off_the_disk_what_its_row_keeps_off_it() {
+    use crate::policy::retention::{DEVICE, HOST};
+    let mut store = KvStore::new_with_swap(16, 4, 8, h(53));
+    store.set_page_size(16);
+    let owner = ProcessId::from_u128(61);
+    let tokens = prompt(33, 8);
+    sealed_and_gone(&mut store, &tokens, owner);
+    let txn = store
+        .prepare_demote(16, Rows(0, DEVICE | HOST))
+        .unwrap()
+        .expect("the host's room");
+    assert_eq!(txn.page_count(), 4, "the host's four slots, none of the disk's");
+    store.commit_suspend(txn).unwrap();
+    assert_eq!(store.host_swap_available(), 0);
+    assert_eq!(store.disk_swap_available(), 8, "the disk untouched");
 }
 
 /// Rows of one key and one tier set for every owner, as a test's table.

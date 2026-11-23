@@ -1238,16 +1238,23 @@ impl KvStore {
                 // below, the group's room comes from idle cache the host
                 // holds keyed lower, lowest first. Keyed alike (no policy),
                 // nothing is displaced and a demote takes free slots only.
+                // Disk is room only for a group every row of which lets it
+                // on disk; the rest moves to the host or nowhere.
+                let disk = if ids.iter().all(|&id| self.tiers_of(id, &keys) & retention::DISK != 0) {
+                    self.disk_pool.available()
+                } else {
+                    0
+                };
                 let want = pages.len().min(room);
-                if self.host_pool.available() + self.disk_pool.available() < want {
-                    let host = want.saturating_sub(self.disk_pool.available());
+                if self.host_pool.available() + disk < want {
+                    let host = want.saturating_sub(disk);
                     if self.drop_entries_off_device(host, &keys, Some(key)) > 0 {
                         // Dropping can compact the pages just listed.
                         pages = self.table.cache_only_pages(&self.roots(&ids), &above);
                         pages.retain(|(location, _)| self.copy_of(location).is_none());
                     }
                 }
-                let free = self.host_pool.available() + self.disk_pool.available();
+                let free = self.host_pool.available() + disk;
                 if pages.is_empty() {
                     continue;
                 }
@@ -1263,7 +1270,8 @@ impl KvStore {
                 // following on from pages a restart loses: a persistent
                 // tier takes a group the host cannot hold whole.
                 let host = self.host_pool.available();
-                let on_host = if pages.len() <= host
+                let on_host = if disk == 0
+                    || pages.len() <= host
                     || records.is_empty()
                     || self.disk_pool.available() < pages.len()
                 {
