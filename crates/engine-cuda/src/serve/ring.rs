@@ -195,22 +195,22 @@ impl Work {
     }
 }
 
-/// Two lanes that read one pool of buffered rows as separate hypotheses:
-/// the same record, the same window-buffer slots (a beam group laid in one
-/// shared pool, each beam's rows told apart only by its mask). A window
-/// would cut such a pool by its slots, not by each hypothesis's own
-/// positions, so its lanes would read too few of their own rows: refused by
-/// name until windowed beams lie in a page list a lane. `lanes` is each
-/// lane's (record, buffer slots); a lane with no buffer slot shares none.
+/// Two lanes that read one pool of rows as separate hypotheses: lanes of
+/// one working set (or one record) each telling its own rows apart by a
+/// mask of its own (a beam group laid in one shared pool). A window cuts
+/// such a pool by its slots, not by each hypothesis's own positions, so its
+/// lanes would read too few of their own rows: refused by name until
+/// windowed beams lie in a page list a lane. `lanes` is each lane's
+/// (working set, record, whether it states a mask).
 #[must_use]
-pub fn shared_pool(lanes: &[(u32, &[u32])]) -> Option<(usize, usize)> {
-    for (at, (record, buffer)) in lanes.iter().enumerate() {
-        if buffer.is_empty() {
+pub fn shared_pool(lanes: &[(u64, u32, bool)]) -> Option<(usize, usize)> {
+    for (at, &(set, record, masked)) in lanes.iter().enumerate() {
+        if !masked {
             continue;
         }
         if let Some(other) = lanes[..at]
             .iter()
-            .position(|(held, slots)| held == record && slots == buffer)
+            .position(|&(held, named, its)| its && (held == set || named == record))
         {
             return Some((other, at));
         }
@@ -228,15 +228,15 @@ mod tests {
 
     #[test]
     fn hypotheses_sharing_one_pool_of_window_rows_are_found() {
-        let pool = [7u32, 8];
-        let other = [9u32];
-        // A beam group laid in one pool: one record, one buffer.
-        assert_eq!(shared_pool(&[(1, &pool), (1, &pool)]), Some((0, 1)));
-        // Lanes of their own records, or with buffers of their own (a page
-        // list a beam), or with none, share nothing.
-        assert_eq!(shared_pool(&[(1, &pool), (2, &pool)]), None);
-        assert_eq!(shared_pool(&[(1, &pool), (1, &other)]), None);
-        assert_eq!(shared_pool(&[(1, &[]), (1, &[])]), None);
+        // A beam group laid in one pool: one working set, a mask a lane.
+        assert_eq!(shared_pool(&[(5, 1, true), (5, 2, true)]), Some((0, 1)));
+        // Or one record.
+        assert_eq!(shared_pool(&[(5, 1, true), (6, 1, true)]), Some((0, 1)));
+        // Unmasked lanes of one set (a plain fork), masked lanes of their
+        // own sets and records, share no pool.
+        assert_eq!(shared_pool(&[(5, 1, false), (5, 1, false)]), None);
+        assert_eq!(shared_pool(&[(5, 1, true), (6, 2, true)]), None);
+        assert_eq!(shared_pool(&[(5, 1, true), (5, 1, false)]), None);
     }
 
     #[test]

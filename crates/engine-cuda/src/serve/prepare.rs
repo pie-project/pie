@@ -1629,17 +1629,21 @@ impl Shell {
             // (CONTRACT-BC 19). Each record's fold, as its first lane states.
             let mut record_folds: std::collections::HashMap<u32, (u32, u32)> =
                 std::collections::HashMap::new();
-            let stated_buffers: Vec<(u32, &[u32])> = (0..seats.len())
+            let pooled: Vec<(u64, u32, bool)> = (0..seats.len())
                 .map(|lane| {
-                    let stated = lanes[seat_sources[lane]].window_fold.is_some();
-                    (keys[lane], if stated { window_ids[lane].as_ref() } else { &[][..] })
+                    let seated = &lanes[seat_sources[lane]];
+                    (
+                        seated.set,
+                        keys[lane],
+                        seated.window_fold.is_some() && seated.mask.is_some(),
+                    )
                 })
                 .collect();
-            if let Some((one, other)) = super::ring::shared_pool(&stated_buffers) {
+            if let Some((one, other)) = super::ring::shared_pool(&pooled) {
                 return Err(Fault::Unbound {
                     what: format!(
                         "lanes {} and {} read one pool of buffered rows as separate hypotheses \
-                         (one record, one window buffer, told apart by their masks) on a model \
+                         (one working set, each lane's rows told apart by its mask) on a model \
                          with windowed layers: a window cuts such a pool by its slots, not by \
                          each hypothesis's positions. Windowed beams are served by a page list \
                          a lane",

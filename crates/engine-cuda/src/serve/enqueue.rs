@@ -156,15 +156,15 @@ impl Shell {
             .as_ref()
             .map(|buffers| buffers.scratch(&self.pools));
         let tapping = self.tapping(p.lanes)?;
-        // A windowed fire's own-row pages start as their ring pages.
-        for &(to, from) in &p.ring_work.fills {
-            crate::device::alloc::copy_any(
-                self.device.stream(),
-                to,
-                from,
-                p.ring_work.page_bytes as usize,
-            )?;
-        }
+        // A windowed fire's own-row pages start as their ring pages: one
+        // launch of every page's copy.
+        let fills: Vec<(u64, u64, u64)> = p
+            .ring_work
+            .fills
+            .iter()
+            .map(|&(to, from)| (to, from, p.ring_work.page_bytes))
+            .collect();
+        self.copy_ring_runs(&fills)?;
         let mut fire = FireCtx {
             live: &self.live,
             tapping: tapping.as_ref(),
@@ -237,12 +237,17 @@ impl Shell {
     /// their buffer or own-row pages onto their ring pages, after its
     /// forward on its stream.
     fn fold_rings(&mut self, work: &super::ring::Work) -> Result<()> {
-        if work.folds.is_empty() {
+        self.copy_ring_runs(&work.folds)
+    }
+
+    /// `runs` (to, from, bytes) in one launch of `copy_runs` on the fire's
+    /// stream, their table staged ahead of it on the same stream.
+    fn copy_ring_runs(&mut self, runs: &[(u64, u64, u64)]) -> Result<()> {
+        if runs.is_empty() {
             return Ok(());
         }
         // `kernels_cuda::runtime::channel::CopyRun`s: three words a run.
-        let raw: Vec<u8> = work
-            .folds
+        let raw: Vec<u8> = runs
             .iter()
             .flat_map(|&(dst, src, bytes)| [dst, src, bytes])
             .flat_map(u64::to_le_bytes)
@@ -258,7 +263,7 @@ impl Shell {
         kernels_cuda::runtime::channel::copy_runs(
             &self.device.ctx(),
             held,
-            u32::try_from(work.folds.len()).unwrap_or(u32::MAX),
+            u32::try_from(runs.len()).unwrap_or(u32::MAX),
         )
         .map_err(Fault::from)
     }

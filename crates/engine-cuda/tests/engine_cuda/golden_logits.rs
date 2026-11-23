@@ -616,6 +616,19 @@ fn fire(shell: &mut Shell, trace: &Trace, tokens: &[u32]) -> Vec<f32> {
 /// The model served over [`SCRIPT`]: each step's logits' hash and top token.
 fn served(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
     let mut shell = load(fixture, cache);
+    if std::env::var_os("PIE_GOLDEN_FACTS").is_some() {
+        let facts = shell.chunk_facts().expect("the pool states its chunks");
+        eprintln!(
+            "golden-facts {} chunk {} shapes {:?}",
+            fixture.model,
+            facts.chunk_bytes,
+            facts
+                .shapes
+                .iter()
+                .map(|s| (s.id.0, s.role, s.slot_bytes, s.slots_per_chunk, s.kind.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
     shell.open(0).expect("slot 0 opens");
     let mut fed = 0u32;
     let mut last = None;
