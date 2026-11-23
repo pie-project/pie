@@ -982,7 +982,7 @@ fn a_kv_only_window_model_s_record_is_its_ring() {
 }
 
 /// A beam group's long prompt on a windowed-only load (four beams of 792
-/// rows, wider together than the 2897 a fire holds) is cut as kv lanes
+/// rows sharing one record, its lagged fold stated, wider together than the 2897 a fire holds) is cut as kv lanes
 /// are: its lanes replay nothing, so several lanes are cuttable
 /// ([`crate::pipeline::fire::window_only`]); a hybrid's are not, its
 /// recurrent layers keeping their bound. The cut run buffers the same rows
@@ -999,6 +999,24 @@ fn a_beam_group_s_long_prompt_on_a_windowed_load_is_cut_not_refused() {
     assert!(crate::pipeline::fire::window_only(&stores, true));
     let (_, hybrid) = stores_of(&hybrid_facts());
     assert!(!crate::pipeline::fire::window_only(&hybrid, true), "a hybrid keeps the rs bound");
+    // An engine stating an rs list beside a record of rings alone: no
+    // recurrent layer replays, so its lanes are cut too.
+    let mut listed = windowed_facts();
+    listed.shapes.push(Facts {
+        role: SlotRole::RsBuffer,
+        ..shape(
+            RS,
+            SlotKind::List {
+                tokens: RS_TOKENS,
+                rate: 1,
+                window: None,
+            },
+            MIB / 8,
+        )
+    });
+    listed.validate().unwrap();
+    let (_, listed) = stores_of(&listed);
+    assert!(crate::pipeline::fire::window_only(&listed, true));
 
     // The pass, cut as the host pass cuts a window-only load's lanes.
     let req = crate::engine::FireRequest {
@@ -1048,17 +1066,27 @@ fn a_beam_group_s_long_prompt_on_a_windowed_load_is_cut_not_refused() {
         } else {
             vec![(0..BEAMS as u32).map(|at| (5 + at * ROWS, 5 + (at + 1) * ROWS)).collect()]
         };
-        for spans in spans {
+        let count = spans.len();
+        for (at, spans) in spans.into_iter().enumerate() {
+            // The group's lagged common-ancestor fold lands with the last
+            // piece; the pieces before it buffer their rows.
+            let fold = if at + 1 == count {
+                GroupFold::Host(400)
+            } else {
+                GroupFold::None
+            };
             let low = spans.iter().map(|&(from, _)| from).min().unwrap();
             let high = spans.iter().map(|&(_, to)| to).max().unwrap();
             let lanes: Vec<usize> = (0..spans.len()).collect();
             let ids = vec![ws; spans.len()];
-            let plan = one(lanes, low..high, GroupFold::None);
+            let plan = one(lanes, low..high, fold);
             demand(&rs, &ids, &plan).expect("counted, never refused");
             let out = prepare_many(&mut rs, &ids, &plan, None).unwrap();
             let rows: Vec<(u32, u32)> = spans.iter().map(|&(from, to)| (from, to - from)).collect();
-            for lane in lanes_of(&out, &shared, &rows, 5) {
-                valid(&lane, &facts);
+            let lanes = lanes_of(&out, &shared, &rows, 5);
+            for lane in &lanes {
+                valid(lane, &facts);
+                assert_eq!(record(lane), record(&lanes[0]), "the group's one record");
             }
             settle(&mut rs, out.txn);
         }

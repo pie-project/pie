@@ -464,6 +464,9 @@ fn lower_window(
             lane.tables.push((buffer.id, pages));
             base
         }
+        // A lane carrying rows earlier fires buffered starts no later than
+        // them; one folding all it computes, at the folded index after it.
+        _ if lane.kv.held > lane.kv.folded => lane.kv.folded - lane.kv.folded % tokens,
         _ => after - after % tokens,
     };
     lane.window = Some(engine::fire::WindowFold {
