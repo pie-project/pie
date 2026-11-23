@@ -615,6 +615,58 @@ impl EngineView {
     }
 }
 
+/// The first slot a holder outside the pool names that the pool does not
+/// count held, said with its holder.
+fn stray_holders(ctx: &Ctx, shared: &Arc<Mutex<crate::store::shared::SharedPool>>) -> Option<String> {
+    let mut named: Vec<(String, crate::store::slots::Slot)> = Vec::new();
+    with_kv_lock(&ctx.stores.kv, "sim-holders", |kv| {
+        named.extend(kv.device_page_slots().into_iter().map(|slot| ("a kv page".to_string(), slot)));
+    });
+    if let Some(roles) = &ctx.stores.roles {
+        named.extend(roles.lock().unwrap().device_slots_named());
+    }
+    {
+        let engine = ctx.engine.lock().unwrap();
+        let bytes = ctx.bytes.lock().unwrap();
+        let shared = shared.lock().unwrap();
+        for (&id, places) in &engine.instances {
+            let parked = engine.parked.get(&id).copied();
+            if parked == Some(false) {
+                continue;
+            }
+            let (Some(instance), Some(channel)) = (
+                shared.pool_shape(ShapeId(INSTANCE)),
+                shared.pool_shape(ShapeId(CHANNEL)),
+            ) else {
+                continue;
+            };
+            for &slot in &places.instance {
+                named.push((format!("instance {id}'s tables"), shared.slot(instance, slot)));
+            }
+            for ring in &places.rings {
+                for &slot in &ring.slots {
+                    named.push((format!("instance {id}'s ring"), shared.slot(channel, slot)));
+                }
+            }
+            if parked.is_none() {
+                for slot in place_slots(&places.scratch, &bytes) {
+                    named.push((format!("instance {id}'s scratch"), shared.slot(instance, slot)));
+                }
+            }
+        }
+    }
+    let shared = shared.lock().unwrap();
+    let pool = shared.pool();
+    named.into_iter().find_map(|(holder, slot)| {
+        (pool.refs(slot) == (0, 0)).then(|| {
+            format!(
+                "{holder} names {slot:?} (physical {:?}), which the pool counts free",
+                pool.physical(slot.chunk)
+            )
+        })
+    })
+}
+
 /// The shared pool's invariants ([`crate::store::slots::SlotPool::check`]),
 /// a broken one said rather than panicking the run.
 fn pool_check(shared: &Arc<Mutex<crate::store::shared::SharedPool>>) -> Option<String> {
@@ -2688,6 +2740,15 @@ fn check(ctx: &Ctx, step: u32, moving: bool) -> Result<Vec<Failure>, Failure> {
         // index: 0 } lies in a free chunk" seconds into a beam w17 load).
         if let Some(why) = pool_check(shared) {
             return Err(fail("bookkeeping", why));
+        }
+        // Every slot a holder outside the pool names is one the pool counts
+        // held: the kv trie's resident pages, the roles' live parts on the
+        // device, and the engine's bound instances' tables, rings and
+        // scratch (a parked one's kept tables and rings). A slot named past
+        // its release is read and written as another's (the M1's fires on
+        // free logical chunks swapped onto a released segment).
+        if let Some(why) = stray_holders(ctx, shared) {
+            return Err(fail("stale ref", why));
         }
         let (unbacked, limit, rung) = {
             let shared = shared.lock().unwrap();

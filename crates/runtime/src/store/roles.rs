@@ -1226,6 +1226,32 @@ impl Roles {
         }
     }
 
+    /// Every live part's slot on the device, by item: what the pool must
+    /// count held while the item names it (for tests: a holder naming a
+    /// slot the pool counts free reads and writes another's state).
+    #[cfg(test)]
+    pub(crate) fn device_slots_named(&self) -> Vec<(String, super::slots::Slot)> {
+        let device = self.device.lock().unwrap();
+        let mut out = Vec::new();
+        for (owner, item) in &self.items {
+            if item.tier != Tier::Device {
+                continue;
+            }
+            for part in item.parts.iter().filter(|part| !part.dead()) {
+                let Some(shape) = self.shapes.of(part.role) else {
+                    continue;
+                };
+                for &slot_ref in &part.refs {
+                    out.push((
+                        format!("{owner:?} {:?} shed={}", part.role, item.shed),
+                        device.slot(shape.pool, slot_ref),
+                    ));
+                }
+            }
+        }
+        out
+    }
+
     /// Every item `holder` moves with, for a quiet wait's census: its owner,
     /// tier, whether shed, and each part's role, live or dead, and the
     /// physical chunks its refs lie in where it is on the device.
