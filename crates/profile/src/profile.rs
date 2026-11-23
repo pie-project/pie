@@ -740,6 +740,13 @@ impl Registry {
                     continue;
                 }
             };
+            if !file.skipped_rates.is_empty() {
+                eprintln!(
+                    "WARN {origin}: skipped `[rates]` {}: each measured again, the rest of the file \
+                     read",
+                    file.skipped_rates.join(", ")
+                );
+            }
             if !file.ignored_rates.is_empty() {
                 eprintln!(
                     "{origin}: ignored `[rates]` {}, which this pie no longer reads; the rest is \

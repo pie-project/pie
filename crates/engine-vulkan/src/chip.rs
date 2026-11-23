@@ -114,6 +114,18 @@ pub fn probe() -> Option<(String, Facts)> {
 /// [`probe`] of the device `index` names, in the order the engine numbers
 /// them (`vulkan:<n>`).
 #[must_use]
+/// The device and driver device `index`'s measurements are keyed as taken
+/// on (`Context::measured_on`): what a home's host covers of it name.
+#[must_use]
+pub fn measured_on_at(index: u32) -> Option<String> {
+    let boot = crate::api::DeviceBoot {
+        device_index: index,
+        ..crate::api::DeviceBoot::default()
+    };
+    let context = crate::device::Context::bind(&boot, engine::Allowance::WHOLE).ok()?;
+    Some(context.measured_on())
+}
+
 pub fn probe_at(index: u32) -> Option<(String, Facts)> {
     let boot = crate::api::DeviceBoot {
         device_index: index,

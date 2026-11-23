@@ -57,6 +57,23 @@ mod tests {
             );
         }
         assert_eq!(find("compat-openai").map(|b| b.name), Some("compat-openai"));
+        // No build path in a component: the same source builds the same
+        // bytes (and program hash) in any checkout, so a key on the hash (a
+        // committed host cover's) matches another tree's build.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("the repository root");
+        let root = root.to_string_lossy();
+        for b in ALL.iter().chain(POLICIES) {
+            assert!(
+                !b.component
+                    .windows(root.len())
+                    .any(|w| w == root.as_bytes()),
+                "{}: the component names the checkout it was built in ({root})",
+                b.name
+            );
+        }
         assert!(find("nobody").is_none());
     }
 }

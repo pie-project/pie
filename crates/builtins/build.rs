@@ -151,10 +151,31 @@ fn build(workspace: &Path, target_dir: &Path, builtins: &[Builtin]) {
         "CARGO_BUILD_TARGET",
         "CARGO_TARGET_DIR",
         "RUSTC_WORKSPACE_WRAPPER",
+        "CARGO_TARGET_WASM32_WASIP3_RUSTFLAGS",
     ] {
         command.env_remove(var);
     }
     command.env("CARGO_TARGET_DIR", target_dir);
+    // Reproducible: no checkout's, home's or target's path is written into a
+    // component (panic locations, debug strings), so one source builds the
+    // same bytes, and the same program hash, in any tree on any machine.
+    // What a component's hash keys (a host cover, `runtime::bootstrap`) is
+    // then its source, not where it was built.
+    let root = workspace
+        .join("../../..")
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    let cargo_home = env::var_os("CARGO_HOME").map(PathBuf::from).or_else(|| {
+        env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo"))
+    });
+    let mut remaps = vec![
+        format!("--remap-path-prefix={}=/pie", root.display()),
+        format!("--remap-path-prefix={}=/target", target_dir.display()),
+    ];
+    if let Some(cargo_home) = cargo_home {
+        remaps.push(format!("--remap-path-prefix={}=/cargo", cargo_home.display()));
+    }
+    command.env("CARGO_TARGET_WASM32_WASIP3_RUSTFLAGS", remaps.join(" "));
     let output = command
         .output()
         .unwrap_or_else(|e| panic!("running cargo for {}: {e}", workspace.display()));

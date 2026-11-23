@@ -125,6 +125,10 @@ pub struct File {
     /// left unread (the rest of the file is read, a load measures what it
     /// lacks, and a save drops them, [`Registry::prune`]).
     pub ignored_rates: Vec<String>,
+    /// `[rates]` entries of a user file that did not read (another pie's
+    /// form), each with why: skipped alone and measured again, the rest of
+    /// the file read.
+    pub skipped_rates: Vec<String>,
 }
 
 impl Registry {
@@ -417,6 +421,7 @@ impl Registry {
         }
         walk.file_lints(&file);
         file.ignored_rates = std::mem::take(&mut walk.ignored_rates);
+        file.skipped_rates = std::mem::take(&mut walk.skipped_rates);
         if walk.diags.is_empty() {
             Ok(file)
         } else {
@@ -729,6 +734,7 @@ impl<'a> Walk<'a> {
             inherited: &[],
             stale_rates: Vec::new(),
             ignored_rates: Vec::new(),
+            skipped_rates: Vec::new(),
             unread: Vec::new(),
         }
     }
@@ -1180,30 +1186,59 @@ impl<'a> Walk<'a> {
             f.filter(|f| f.is_finite() && *f > 0.0)
         };
         for (k, v) in t.iter() {
+            // A user file is a load's own output: an entry of it that does
+            // not read (written by another pie, in another form) is skipped
+            // alone, by name, and measured again; the rest of the file is
+            // read. No older form is read in its place.
+            let before = self.diags.len();
+            let (key, rates) = (k.get_ref().to_string(), &mut rates);
+            self.rate_entry(k, v, rates, &positive);
+            if self.strict == Strict::User && self.diags.len() > before {
+                let why: Vec<String> = self
+                    .diags
+                    .drain(before..)
+                    .map(|d| d.message)
+                    .collect();
+                rates.unstate(&key);
+                self.skipped_rates.push(format!("{key} ({})", why.join("; ")));
+            }
+        }
+        rates
+    }
+
+    /// One `[rates]` entry, `k = v`, into `rates`.
+    fn rate_entry(
+        &mut self,
+        k: &Spanned<std::borrow::Cow<'_, str>>,
+        v: &Spanned<DeValue<'_>>,
+        rates: &mut crate::fire::Rates,
+        positive: &dyn Fn(&DeValue<'_>) -> Option<f64>,
+    ) {
+        {
             let slot = match k.get_ref().as_ref() {
                 key @ "gemm_tflops_by_rows" => {
                     rates.gemm_tflops_by_rows = self.width_curves(v, key);
-                    continue;
+                    return;
                 }
                 key @ crate::fire::ATTN_BY_ROWS_KEYS => {
                     rates.attn_tflops_by_rows_keys = self.width_curves(v, key);
-                    continue;
+                    return;
                 }
                 key @ "attn_tflops_by_keys" => {
                     rates.attn_tflops_by_keys = self.curve(v, key);
-                    continue;
+                    return;
                 }
                 "product_ns" => {
                     rates.product_ns = self.product_times(v);
-                    continue;
+                    return;
                 }
                 crate::fire::KERNEL_CURVES => {
                     rates.kernel_tflops_by_shape = self.kernel_curves(v);
-                    continue;
+                    return;
                 }
                 crate::fire::DENSE_SETTLED => {
                     rates.dense_settled = self.dense_settled(v);
-                    continue;
+                    return;
                 }
                 key @ (crate::fire::MEASURED_ON | crate::fire::MEASURED_BY)
                     if self.strict == Strict::CheckedIn =>
@@ -1215,7 +1250,7 @@ impl<'a> Walk<'a> {
                              profile states its rates as decisions, unkeyed"
                         ),
                     );
-                    continue;
+                    return;
                 }
                 crate::fire::MEASURED_ON => {
                     match v.get_ref() {
@@ -1230,11 +1265,11 @@ impl<'a> Walk<'a> {
                             ),
                         ),
                     }
-                    continue;
+                    return;
                 }
                 crate::fire::MEASURED_BY => {
                     rates.measured_by = self.measured_by(v);
-                    continue;
+                    return;
                 }
                 "elementwise_gbps" => &mut rates.elementwise_gbps,
                 "hbm_gbps" => &mut rates.hbm_gbps,
@@ -1255,7 +1290,7 @@ impl<'a> Walk<'a> {
                             ),
                         ),
                     }
-                    continue;
+                    return;
                 }
                 other => {
                     self.stale_rates.push(other.to_string());
@@ -1267,7 +1302,7 @@ impl<'a> Walk<'a> {
                     // stating one is refused by name).
                     if self.strict == Strict::User {
                         self.ignored_rates.push(other.to_string());
-                        continue;
+                        return;
                     }
                     self.err(
                         k.span().start,
@@ -1280,7 +1315,7 @@ impl<'a> Walk<'a> {
                              `dense_settled_keyed`, `measured_on` and `measured_by`, not `{other}`"
                         ),
                     );
-                    continue;
+                    return;
                 }
             };
             match positive(v.get_ref()) {
@@ -1295,7 +1330,6 @@ impl<'a> Walk<'a> {
                 ),
             }
         }
-        rates
     }
 
     /// `rates.product_ns`: a list of `[kind, rows, k, m, kernel, ns, spread]`,

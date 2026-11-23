@@ -342,3 +342,65 @@ fn a_plane_weighed_past_the_bound_is_cut_into_pieces_each_within_it() {
         bound.as_secs_f64() * 1e3
     );
 }
+
+/// A model of a smaller top rung measured first, then one of a larger top
+/// sharing its shapes: the second extends each shared curve with the rows
+/// it lacks and never times a stored point again, so the first model's
+/// points (what its settle and its cover were weighed by) are unchanged.
+#[test]
+fn a_later_model_extends_a_shared_curve_and_keeps_its_points() {
+    let Ok(device) = Context::bind(&crate::gpu::device_boot(), engine::Allowance::WHOLE) else {
+        eprintln!("not asked: no device");
+        return;
+    };
+    let (chip, _) = engine_vulkan::chip::resolve(&device.chip(), None);
+    let tuning = engine_vulkan::tuning::Tuning::new(chip, device.limits());
+    let tier = <Api as engine_gpu::serve::Serve>::tier(&device);
+    let timer = |frame: Frame| {
+        let started = std::time::Instant::now();
+        let span = frame.commit_spanned()?;
+        Ok((span.filter(|&ns| ns > 0), started.elapsed().as_nanos() as u64))
+    };
+    let say = &mut |_: &str| {};
+    let stated = Rates {
+        launch_ns: Some(1000),
+        ..Rates::default()
+    };
+    let shapes = [(1024, 1024)];
+    let measure = |stated: &Rates, top: u32| {
+        let kernels =
+            engine_gpu::rates::dense_kernels(kernels_slang::Target::Spirv, &tuning, tier, top);
+        let wanted =
+            engine_gpu::rates::lacking(kernels_slang::Target::Spirv, &kernels, stated, &shapes, top);
+        let curves = engine_gpu::rates::measure_shapes::<Api, _>(
+            &device, &tuning, tier, &timer, None, None, stated, &wanted, None, top, say,
+        )
+        .expect("the curves are timed");
+        Rates {
+            kernel_tflops_by_shape: Some(curves),
+            ..Rates::default()
+        }
+        .over(stated.clone())
+    };
+    let first = measure(&stated, 16);
+    let second = measure(&first, 64);
+    for a in first.kernel_tflops_by_shape.iter().flatten().filter(|c| c.stop.is_none()) {
+        let b = second
+            .kernel_tflops_by_shape
+            .iter()
+            .flatten()
+            .find(|b| b.id() == a.id())
+            .expect("the shared curve stands");
+        assert_eq!(
+            &b.curve[..a.curve.len()],
+            &a.curve[..],
+            "{}: the first model's points are kept as stored",
+            a.name()
+        );
+        assert!(
+            b.curve.last().map(|p| p.0) > a.curve.last().map(|p| p.0) || b.stop.is_some(),
+            "{}: extended past the first model's rows, or stopped",
+            a.name()
+        );
+    }
+}

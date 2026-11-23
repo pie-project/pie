@@ -1009,7 +1009,13 @@ where
         // load is whole (its programs placed, its kv seated); what a newly
         // taken kernel binds is built by a second bind walk, and what either
         // walked is the load's.
+        let settling = std::time::Instant::now();
         shell.settle_dense().map_err(fault)?;
+        tracing::info!(
+            settle_ms = settling.elapsed().as_millis() as u64,
+            "load phases: the dense settle (after the shell stood; nothing fired where a stored \
+             or committed settle's key matched, or under measure = false)"
+        );
         // The settle this load ran, kept in the user's profile for a later
         // load of the same curves, model, rungs and build.
         if let Some(settled) = shell.take_settled() {
@@ -1095,12 +1101,30 @@ where
             classes: shell.classes(),
             // The platform's stated bound on one submission (KGSL's on
             // Android, none elsewhere) and the rates this load measured.
+            // Where the load skipped measuring them, the rates its bound's
+            // estimate was timed at (`crate::rates::for_bound`): what holds
+            // its steps to the bound holds its guest stages to it too.
             guest_cost: {
                 let rates = crate::backend::Tactics::profile(shell.tuning()).rates();
+                let held = shell.submit_bound().map(|held| &held.estimate.rates);
+                if let Some(c) = held
+                    && (rates.launch_ns.is_none() || rates.elementwise_gbps.is_none())
+                {
+                    tracing::info!(
+                        launch_ns = c.launch_ns,
+                        elementwise_gbps = c.elementwise_bytes_per_ns,
+                        "a guest stage is costed against the submit bound at the rates the \
+                         bound's probe timed (no layer states them, measure = false): probed"
+                    );
+                }
                 engine::GuestCost {
                     submit_bound_ns: shell.submit_bound().map(|held| held.bound_ns as u64),
-                    launch_ns: rates.launch_ns,
-                    elementwise_gbps: rates.elementwise_gbps,
+                    launch_ns: rates
+                        .launch_ns
+                        .or_else(|| held.map(|c| c.launch_ns.round() as u64)),
+                    elementwise_gbps: rates
+                        .elementwise_gbps
+                        .or_else(|| held.map(|c| c.elementwise_bytes_per_ns)),
                 }
             },
             mixed_lanes: engine::MixedLanes::Any,

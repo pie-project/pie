@@ -537,6 +537,10 @@ impl Rates {
             RESIDENT_WORKGROUPS => self.resident_workgroups = None,
             ATTN_BY_ROWS_KEYS => self.attn_tflops_by_rows_keys = None,
             "product_ns" => self.product_ns = None,
+            KERNEL_CURVES => self.kernel_tflops_by_shape = None,
+            DENSE_SETTLED => self.dense_settled = Vec::new(),
+            MEASURED_ON => self.measured_on = None,
+            MEASURED_BY => self.measured_by = None,
             _ => {}
         }
         if let Some(by) = &mut self.measured_by {
@@ -1295,6 +1299,26 @@ mod tests {
         assert_eq!(read.rates().dense_settled, both.dense_settled);
         let twice = "api = 1\n[rates]\ndense_settled_keyed = [[1, 7, 6, []], [1, 7, 6, []]]\n";
         assert!(registry.load_user(twice, "twice").is_err(), "a key stated twice is refused");
+    }
+
+    /// A user file one entry of which another pie wrote in another form
+    /// (the settle as one entry, not a list): that entry alone is skipped,
+    /// named, and the rest of the file read.
+    #[test]
+    fn a_user_files_unreadable_entry_is_skipped_alone() {
+        let registry = crate::Registry::new("test", &[], &[]);
+        let text = "api = 1\n[rates]\nlaunch_ns = 900\nhbm_gbps = 700.0\n\
+                    dense_settled_keyed = [1, 77, 9, [[3, 4, 1, 4, 0, 1]]]\n";
+        let file = registry
+            .parse(text, "old.toml", crate::Strict::User)
+            .expect("the rest of the file reads");
+        assert_eq!(file.tuned.rates.launch_ns, Some(900));
+        assert_eq!(file.tuned.rates.hbm_gbps, Some(700.0));
+        assert!(file.tuned.rates.dense_settled.is_empty());
+        assert_eq!(file.skipped_rates.len(), 1, "{:?}", file.skipped_rates);
+        assert!(file.skipped_rates[0].starts_with(DENSE_SETTLED), "{:?}", file.skipped_rates);
+        // A committed profile is the build's: refused whole, by name.
+        assert!(registry.parse(text, "c.measured.toml", crate::Strict::Measured).is_err());
     }
 
     /// The same file read by another build of the same kernels (a version

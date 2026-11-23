@@ -372,6 +372,15 @@ impl Drop for Group {
 }
 
 impl Engine for Group {
+    /// A group keys no host cover, and `measure = false` is refused for one by name (worker config).
+    fn committed_covers(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    fn skips_measuring(&self) -> bool {
+        false
+    }
+
     fn kind(&self) -> &'static str {
         "cuda"
     }

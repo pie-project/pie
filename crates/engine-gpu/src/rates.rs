@@ -1584,6 +1584,15 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
             /// The parts of the plane's columns a fire covers one of: 1, else
             /// the slice the bound admitted, its time carried to all.
             split: u32,
+            /// The points a stored curve of the kernel at the shape already
+            /// states (another load's, to fewer rows), and their spreads,
+            /// kept as stored: a later load extends a curve with the rows
+            /// it lacks and never times a stored point again, so what a
+            /// settle or a cover weighed by them stays.
+            kept: Vec<(u32, f64)>,
+            kept_spread: Vec<(u32, f64)>,
+            /// The most rows `kept` reaches: rows past it alone are timed.
+            past: u32,
         }
         let mut timed: Vec<Timed> = wanted
             .iter()
@@ -1596,6 +1605,12 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
                     }
                     _ => format!("{key}-row tile matmul"),
                 };
+                let stored = stated
+                    .kernel_tflops_by_shape
+                    .iter()
+                    .flatten()
+                    .find(|c| c.id() == (kind, key, n, k) && c.stop.is_none());
+                let kept = stored.map(|c| c.curve.clone()).unwrap_or_default();
                 Timed {
                     tactic,
                     kind,
@@ -1604,6 +1619,9 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
                     points: Vec::new(),
                     stop: None,
                     split: 1,
+                    past: kept.last().map_or(0, |&(m, _)| m),
+                    kept,
+                    kept_spread: stored.map(|c| c.spread.clone()).unwrap_or_default(),
                 }
             })
             .collect();
@@ -1636,11 +1654,16 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
         };
         let touched = Touched::default();
         for (i, &m) in rows.iter().enumerate() {
+            if timed.iter().all(|t| t.stop.is_some()) {
+                break;
+            }
+            // A kernel whose stored curve reaches these rows keeps its
+            // points: only the rows past them are timed.
             let live: Vec<usize> = (0..timed.len())
-                .filter(|&t| timed[t].stop.is_none())
+                .filter(|&t| timed[t].stop.is_none() && m > timed[t].past)
                 .collect();
             if live.is_empty() {
-                break;
+                continue;
             }
             let Some((act, weights, ys)) = laid.as_ref().filter(|_| fits(m)) else {
                 for &t in &live {
@@ -1911,12 +1934,22 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
                 n,
                 k,
                 curve: c
-                    .points
+                    .kept
                     .iter()
-                    .map(|&(m, ns, _)| (m, gemm_flops(m, n, k) / (ns - launch).max(1.0) / 1e3))
+                    .copied()
+                    .chain(
+                        c.points
+                            .iter()
+                            .map(|&(m, ns, _)| (m, gemm_flops(m, n, k) / (ns - launch).max(1.0) / 1e3)),
+                    )
                     .collect(),
                 stop: c.stop,
-                spread: c.points.iter().map(|&(m, _, spread)| (m, spread)).collect(),
+                spread: c
+                    .kept_spread
+                    .iter()
+                    .copied()
+                    .chain(c.points.iter().map(|&(m, _, spread)| (m, spread)))
+                    .collect(),
             });
         }
     }
