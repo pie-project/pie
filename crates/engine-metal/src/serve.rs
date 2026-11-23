@@ -3797,6 +3797,17 @@ impl Shell {
         .min(end.saturating_sub(seated.folded));
         // A complete ring page (every row two or more behind `have`, past any
         // frame in flight) never changes; one that does was overwritten.
+        if seated.folded != have || !buffer_refs.is_empty() {
+            eprintln!(
+                "wanomaly slot {} have {have} rows {rows} folded {} base {} fold {:?} buffer {:?} direct {direct} own {}",
+                seated.lane.slot,
+                seated.folded,
+                fold.base,
+                fold.fold,
+                buffer_refs,
+                own.len()
+            );
+        }
         if std::env::var_os("PIE_WINDOW_WATCH").is_some() {
             let slot_bytes = self.pools.window_slot_bytes(k)?;
             let done_pages = have.saturating_sub(8) / page;
@@ -4197,6 +4208,17 @@ impl Shell {
         #[cfg(target_vendor = "apple")]
         frame.barrier(&self.device)?;
 
+        if std::env::var_os("PIE_EPI_TRACE").is_some() {
+            for attached in prepared.attachments.iter().filter(|a| !a.adapter_only) {
+                eprintln!(
+                    "epitrace instance {:?} in_flight {} ahead_depth {} frames_in_flight {}",
+                    attached.instance,
+                    self.programs.in_flight(attached.instance),
+                    self.programs.ahead_depth(attached.instance),
+                    self.inflight.len()
+                );
+            }
+        }
         let mut owed = Vec::with_capacity(prepared.attachments.len());
         match self.stage_epilogues(frame, prepared, &first_row, &lane_rows, &mut owed) {
             Ok(()) => Ok(owed),
@@ -6563,7 +6585,11 @@ impl Shell {
                         .filter(|_| !dry)
                         .map(crate::ane::Ane::handoff),
                 )
-                .flushing_after(if dry { 0 } else { HEAD_LAUNCHES });
+                .flushing_after(if dry || std::env::var_os("PIE_WINDOW_NOFLUSH").is_some() {
+                    0
+                } else {
+                    HEAD_LAUNCHES
+                });
             let mut run = Run::new(
                 &sink,
                 &self.handles,
@@ -6849,6 +6875,13 @@ impl engine::frame::Shell for Shell {
                 lanes.join(" ")
             )
         });
+        // `PIE_WINDOW_SERIAL_WALK` (a race bisection): the frames in flight
+        // land before this one is encoded, its prepare having overlapped them.
+        if std::env::var_os("PIE_WINDOW_SERIAL_WALK").is_some() {
+            while !self.inflight.is_empty() {
+                self.harvest_one()?;
+            }
+        }
         let walked = self.walk_once(&prepared)?;
         fire_trace(|| "forward-encoded".to_string());
         let profile = crate::encode::kernel_profile();
@@ -6871,6 +6904,13 @@ impl engine::frame::Shell for Shell {
         }
         let mut frame = walked.frame;
 
+        // `PIE_WINDOW_SERIAL_EPI` (a race bisection): the forward walked while
+        // the frames in flight run; they land before the epilogues encode.
+        if std::env::var_os("PIE_WINDOW_SERIAL_EPI").is_some() {
+            while !self.inflight.is_empty() {
+                self.harvest_one()?;
+            }
+        }
         let mut readbacks = vec![None; prepared.lanes.len()];
         if self.host_rows || self.rows_wanted {
             let seat = &self.readout[self.arena.current()][prepared.arm];
@@ -6890,6 +6930,11 @@ impl engine::frame::Shell for Shell {
             }
         }
 
+        if std::env::var_os("PIE_WINDOW_SERIAL_EPI2").is_some() {
+            while !self.inflight.is_empty() {
+                self.harvest_one()?;
+            }
+        }
         let attached: Vec<(engine::InstanceId, std::ops::Range<u32>)> = self
             .encode_epilogues(&mut frame, &prepared)?
             .into_iter()
@@ -6973,6 +7018,13 @@ impl engine::frame::Shell for Shell {
         if let Some((event, value)) = self.chain.as_ref() {
             value.set(value.get() + 1);
             frame.fence(event, value.get(), true)?;
+        }
+        // `PIE_WINDOW_SERIAL_COMMIT` (a race bisection): encoded while the
+        // frames in flight run, committed only once they landed.
+        if std::env::var_os("PIE_WINDOW_SERIAL_COMMIT").is_some() {
+            while !self.inflight.is_empty() {
+                self.harvest_one()?;
+            }
         }
         let pending = frame.commit_async(Some(Box::new(move |refused: Option<String>| {
             counts.leave();

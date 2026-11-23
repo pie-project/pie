@@ -1541,6 +1541,14 @@ impl Metal {
             .iter()
             .flat_map(|lane| lane.slot_copies.iter().cloned())
             .collect();
+        if !slot_copies.is_empty() || !forks.is_empty() {
+            eprintln!(
+                "wanomaly submit slot_copies {} forks {} first copy {:?}",
+                slot_copies.len(),
+                forks.len(),
+                slot_copies.first()
+            );
+        }
         shell.copy_slot_pairs(&slot_copies).map_err(fault)?;
         let seated: Vec<Seated<'_>> = submission
             .lanes
