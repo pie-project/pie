@@ -129,8 +129,8 @@ pub struct Residency {
     #[serde(default)]
     pub kv_seats: Option<u32>,
     /// Bytes of slot files under `disk_kv_dir` kv pages may be suspended
-    /// into below host memory, shared by the ranks; zero turns it off.
-    /// `None`: the engine's default.
+    /// into below host memory, shared by the ranks. `None` or zero: no disk
+    /// tier. Only stated config sizes it; no engine chooses one.
     #[serde(default)]
     pub disk_kv_budget: Option<u64>,
     #[serde(default)]
@@ -183,7 +183,7 @@ impl Residency {
             host_kv_budget: None,
             host_programs: None,
             kv_seats: None,
-            disk_kv_budget: Some(0),
+            disk_kv_budget: None,
             disk_kv_dir: None,
             disk_kv_persistent: false,
             kv_export: false,

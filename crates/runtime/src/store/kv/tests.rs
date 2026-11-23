@@ -2154,3 +2154,24 @@ fn a_reclaim_counts_what_it_freed_as_returning_until_its_fire_retires() {
     assert_eq!(store.reclaim_cache(store.current_epoch(), 2, floor), 2);
     assert!(!store.owns_cache(late), "a new shortfall reclaims again");
 }
+
+#[test]
+/// With no disk tier (and the host short, or none), a suspend whose pages
+/// need the disk is refused by name, as on a full disk: nothing goes
+/// anywhere else, and the pages stay on the device.
+fn a_suspend_that_needs_the_disk_with_no_disk_tier_is_refused_by_name() {
+    for host in [0, 2] {
+        let mut store = KvStore::new_with_swap(8, host, 0, h(64));
+        let ws = store.create_working_set();
+        commit_fresh(&mut store, ws, 3, 1);
+        match store.prepare_suspend(&HashSet::from([ws]), floor) {
+            Err(error @ super::KvStoreError::HostSwapFull { requested: 3, available }) => {
+                assert_eq!(available, host as usize);
+                assert!(error.to_string().contains("swap exhausted"), "{error}");
+            }
+            other => panic!("refused for want of a disk tier: {other:?}"),
+        }
+        assert_eq!(store.swapped_page_count(&HashSet::from([ws])).unwrap(), 0);
+        assert_eq!(store.disk_swap_capacity(), 0);
+    }
+}

@@ -1645,8 +1645,9 @@ async fn restore(
 /// Persists the sealed run `keys` (from token 0) on the disk tier of
 /// `engine`: each resident page not on disk yet is copied to a fresh slot
 /// and stays where it is, then the journal names it. Answers the pages
-/// persisted; none when the tier is not kept, is full, or the run is not
-/// held here.
+/// persisted; none when the tier is full or the run is not held here. A
+/// worker with no disk tier, or one not kept across runs, refuses it by
+/// name: there is nowhere a copy outlives the run.
 pub(super) async fn persist(
     model: usize,
     engine: usize,
@@ -1654,9 +1655,20 @@ pub(super) async fn persist(
     retention: i64,
 ) -> Result<usize, String> {
     let stores = crate::store::registry::get(model, engine);
-    let Some(txn) = crate::store::registry::with_kv_lock(&stores.kv, "persist", |kv| {
-        kv.prepare_persist(&keys, retention)
-    }) else {
+    let prepared = crate::store::registry::with_kv_lock(&stores.kv, "persist", |kv| {
+        if kv.disk_swap_capacity() == 0 {
+            return Err("no disk tier: engine.memory.budget_disk states none, so no run \
+                        is kept on disk"
+                .to_string());
+        }
+        if !kv.disk_persistent() {
+            return Err("the disk tier is not kept across runs \
+                        (engine.memory.disk_persistent): a copy there outlives nothing"
+                .to_string());
+        }
+        Ok(kv.prepare_persist(&keys, retention))
+    })?;
+    let Some(txn) = prepared else {
         return Ok(0);
     };
     let (device, slots) = txn.copy_plan();

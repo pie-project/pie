@@ -711,11 +711,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 disk_chunks = d.chunks.disk_chunks,
                 chunk_bytes = d.chunks.chunk_bytes,
                 "kv tiers: suspended kv goes to {}",
-                if d.chunks.host_chunks == 0 {
-                    "the disk (no host tier)"
-                } else {
-                    "the host, then the disk"
-                }
+                below_device(d.chunks.host_chunks > 0, d.chunks.disk_chunks > 0)
             );
         } else if kv_swap_capable {
             tracing::info!(
@@ -723,7 +719,8 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 planner_pages,
                 host_pages = d.chunks.kv_host_pages(),
                 disk_pages = d.chunks.kv_disk_pages(),
-                "kv tiers: suspended kv goes to the host, then the disk"
+                "kv tiers: suspended kv goes to {}",
+                below_device(d.chunks.kv_host_pages() > 0, d.chunks.kv_disk_pages() > 0)
             );
         } else {
             tracing::warn!(
@@ -1740,5 +1737,15 @@ mod tests {
             "a cap under the seats stands"
         );
         assert_eq!(seat_cap(512, false, Some(0)), 1, "one sequence at least");
+    }
+}
+
+/// The tiers below the device suspended kv goes to, as a load stated them.
+fn below_device(host: bool, disk: bool) -> &'static str {
+    match (host, disk) {
+        (true, true) => "the host, then the disk",
+        (true, false) => "the host (no disk tier)",
+        (false, true) => "the disk (no host tier)",
+        (false, false) => "nowhere: no tier below the device",
     }
 }

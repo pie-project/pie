@@ -663,12 +663,7 @@ impl Engine for Metal {
         told_within(&mut budgets, shell.budget());
         shell.mount_adapters(self.boot.adapter_dir.clone());
         shell
-            .seat_disk_kv(
-                residency.disk_kv_budget,
-                residency.disk_kv_dir.as_deref(),
-                residency.kv_seats.unwrap_or(budgets.max_lanes),
-                budgets.max_context,
-            )
+            .seat_disk_kv(residency.disk_kv_budget, residency.disk_kv_dir.as_deref())
             .map_err(fault)?;
 
         if crate::diag::on().tier_trace {
@@ -1714,7 +1709,7 @@ fn no_host_tier(host_kv_budget: Option<u64>) -> EngineResult<()> {
         Some(budget) => Err(Error::Load(format!(
             "budget_host ({budget} bytes) on Metal: the device's memory is the host's, so \
              there is no host kv tier (a move there would copy within the same memory and \
-             free nothing); suspended state goes to the disk tier (budget_disk). Remove \
+             free nothing); suspended state goes to the disk tier where budget_disk states one. Remove \
              budget_host from [engine.memory]"
         ))),
         None => Ok(()),

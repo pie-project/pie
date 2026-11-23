@@ -773,8 +773,6 @@ impl Engine for Cuda {
                 residency.disk_kv_budget,
                 residency.disk_kv_dir.as_deref(),
                 residency.disk_kv_persistent,
-                residency.kv_seats.unwrap_or(budgets.max_lanes),
-                context,
                 self.boot.world,
             )
             .map_err(fault)?;
