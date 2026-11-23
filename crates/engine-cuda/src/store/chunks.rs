@@ -1031,12 +1031,17 @@ impl Chunks {
             shapes.push(stated);
         }
         if let Some(fixed) = &layout.fixed {
-            shapes.push(shape(
+            let mut stated = shape(
                 &fixed.slot,
                 SlotKind::Fixed {
                     pieces: fixed.pieces,
                 },
-            ));
+            );
+            // A record of rings alone is the ring shape (CONTRACT-BC 21).
+            if fixed.ring.is_some() {
+                stated.role = engine::chunk::SlotRole::Ring;
+            }
+            shapes.push(stated);
         }
         for role in [
             engine::chunk::SlotRole::Instance,
