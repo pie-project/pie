@@ -1624,6 +1624,11 @@ impl Shell {
             self.pools.page_ids(1, &mut null)?;
             let null = null[0];
             let mut own_next = 0u32;
+            // A record a group of lanes shares folds once: the group's
+            // common rows, which its lanes read from slots they share
+            // (CONTRACT-BC 19). Each record's fold, as its first lane states.
+            let mut record_folds: std::collections::HashMap<u32, (u32, u32)> =
+                std::collections::HashMap::new();
             let mut composed_tables: Vec<Vec<u32>> = Vec::with_capacity(seats.len());
             for (lane, seat) in seats.iter().enumerate() {
                 let seated = &lanes[seat_sources[lane]];
@@ -1648,6 +1653,34 @@ impl Shell {
                     })
                     .collect::<Result<Vec<_>>>()?;
                 let alone = keys.iter().filter(|&&key| key == keys[lane]).count() == 1;
+                if !alone && folded + fold > seat.have {
+                    return Err(Fault::program(
+                        "serve::ring",
+                        format!(
+                            "lanes sharing a record fold rows [{folded}, {}) into it, past \
+                             row {} where one of them computes its own in this fire: a group \
+                             folds only the rows its lanes share",
+                            folded + fold,
+                            seat.have
+                        ),
+                    ));
+                }
+                let first_fold = match record_folds.get(&keys[lane]) {
+                    None => {
+                        record_folds.insert(keys[lane], (folded, fold));
+                        true
+                    }
+                    Some(&stated) if stated == (folded, fold) => false,
+                    Some(&(was, by)) => {
+                        return Err(Fault::program(
+                            "serve::ring",
+                            format!(
+                                "lanes sharing a record fold it from {was} by {by} and from \
+                                 {folded} by {fold}: a record folds once a fire"
+                            ),
+                        ));
+                    }
+                };
                 let pools = &self.pools;
                 let mut own = || {
                     let at = own_next;
@@ -1670,7 +1703,12 @@ impl Shell {
                     null,
                     &mut own,
                 )?;
-                ring_work.add(&composed, &planes);
+                // The group's fold is its first lane's; the others read.
+                if first_fold {
+                    ring_work.add(&composed, &planes);
+                } else {
+                    ring_work.fills.extend_from_slice(&composed.fills);
+                }
                 composed_tables.push(composed.table.iter().map(|&id| id as u32).collect());
             }
             window_tables.push(composed_tables);

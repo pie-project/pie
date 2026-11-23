@@ -2120,6 +2120,23 @@ impl Pools {
         })
     }
 
+    /// The pool's base, every page id counted from it.
+    #[must_use]
+    pub fn pool_base(&self) -> u64 {
+        self.chunks.base()
+    }
+
+    /// The step the window buffer's page ids count in (ring and own-row
+    /// pages' too).
+    #[must_use]
+    pub fn window_grain(&self) -> u64 {
+        self.chunks
+            .layout()
+            .windows
+            .first()
+            .map_or(1, |window| window.grain.max(1))
+    }
+
     /// Own-row page `page`'s address.
     pub fn own_page_at(&self, page: u32) -> Result<u64> {
         let own = self.own.ok_or_else(|| {

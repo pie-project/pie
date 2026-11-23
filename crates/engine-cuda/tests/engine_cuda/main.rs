@@ -98,6 +98,7 @@ mod a_windowed_row_reads_what_the_full_row_reads;
 mod an_adapter_is_not_a_lanes_scratch;
 mod an_epilogue_agrees_with_the_host_interpreter;
 mod an_exported_kv_stays_mapped;
+mod a_ring_page_id_reaches_its_address;
 mod a_guest_reads_no_row_past_its_seat;
 mod an_output_of_ids_reads_as_stored;
 mod every_catalog_deployment_dispatches;
