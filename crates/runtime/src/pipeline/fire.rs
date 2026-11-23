@@ -1028,21 +1028,29 @@ fn replay_rung(
     let holds = crate::engine::get_spec(engine).map_or(u32::MAX, |spec| {
         u32::try_from(spec.limits.max_forward_tokens).unwrap_or(u32::MAX)
     });
-    let mut rungs = stores
-        .shared
-        .as_ref()
-        .map_or_else(Vec::new, |shared| shared.lock().unwrap().rung_replays());
-    rungs.retain(|&(tokens, _)| tokens <= holds);
-    if rungs.is_empty() {
-        // No rung stated (pinned pools): one fire's tokens, its own and
-        // carried rows each, the engine's scratch its own to check.
-        rungs.push((holds, crate::store::shared::rows_only(holds)));
-    }
+    let (stated, widest) = stores.shared.as_ref().map_or_else(
+        || (std::sync::Arc::new(Vec::new()), u32::MAX),
+        |shared| shared.lock().unwrap().rung_replays(),
+    );
+    let reach = holds.min(widest);
+    let end = stated
+        .iter()
+        .position(|&(tokens, _)| tokens > reach)
+        .unwrap_or(stated.len());
+    let pinned;
+    let rungs: &[(u32, ::engine::RungReplay)] = if end == 0 {
+        // No rung stated (pinned pools) or none a fire may take: one fire's
+        // tokens, its own and carried rows each, the engine's scratch its own.
+        pinned = [(holds, crate::store::shared::rows_only(holds))];
+        &pinned
+    } else {
+        &stated[..end]
+    };
     let count = ::engine::ReplayRows::of_sums(rows.own, rows.carried, replayed, lanes, compact);
     let floor = rows.own.max(rows.carried);
     let mut first = true;
     let mut past = None;
-    for (tokens, bound) in &rungs {
+    for (tokens, bound) in rungs {
         let tokens = *tokens;
         if tokens < floor {
             continue;
@@ -1073,16 +1081,16 @@ fn replay_rung(
     ))
 }
 
-/// What the rung a fire of `width` rows asks holds of its replay: the
-/// stated bounds of the narrowest rung at least that wide.
-fn rung_model(stores: &crate::store::registry::Stores, width: u32) -> Option<::engine::RungReplay> {
-    let shared = stores.shared.as_ref()?;
-    let rungs = shared.lock().unwrap().rung_replays();
-    rungs
-        .iter()
-        .find(|(tokens, _)| *tokens >= width)
-        .or_else(|| rungs.last())
-        .map(|(_, rung)| rung.clone())
+/// The load's stated rungs a fire carrying recurrent state hands the
+/// scheduler, which holds a step of several such fires to the rung its
+/// width picks ([`crate::engine::FireRequest::replay_rungs`]); `None` for a
+/// fire carrying none.
+fn fire_rungs(
+    stores: &crate::store::registry::Stores,
+    carries: bool,
+) -> Option<crate::store::shared::Replays> {
+    let shared = stores.shared.as_ref().filter(|_| carries)?;
+    Some(shared.lock().unwrap().rung_replays().0)
 }
 
 /// The widest rung a host pass's pieces ask, each piece as it is cut
@@ -5031,7 +5039,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             req.carried = counted.carried;
             req.replayed = piece_replayed(&full, piece, &frozen, folds_each && at > 0);
             req.scratch_compact = piece_compact;
-            req.replay_rung = rung_model(&stores, width);
+            req.replay_rungs = fire_rungs(&stores, !rs_ws_ids.is_empty());
             // A piece's request keeps only the lanes with rows in it,
             // renumbered; `groups` holds the pass's lane indices. What reads
             // the piece's request (its written spans, its page tables) needs
@@ -6755,7 +6763,7 @@ async fn fire_device_geometry<C: FireContext>(
         carried: counted.carried,
         replayed,
         scratch_compact: compact,
-        replay_rung: rung_model(&stores, rows),
+        replay_rungs: fire_rungs(&stores, !rs_ws_ids.is_empty()),
         ..crate::engine::FireRequest::default()
     };
     rs_prepared.apply_to(&mut req);

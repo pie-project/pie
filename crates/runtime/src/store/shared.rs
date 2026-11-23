@@ -652,6 +652,10 @@ pub enum SharedError {
     },
 }
 
+/// Each activation rung's tokens and what its replay scratch holds,
+/// ascending: stated once at load, shared by every fire that reads it.
+pub type Replays = Arc<Vec<(u32, ::engine::RungReplay)>>;
+
 /// A rung of `tokens` on a load that replays no buffered recurrent row (no
 /// rs list: [`ChunkFacts::validate`] holds a load that does to stating its
 /// rs scratch): its own and carried rows each at most its tokens, no rs
@@ -972,7 +976,7 @@ pub struct SharedPool {
     engine: Option<usize>,
     /// What each rung's replay scratch holds, by its tokens, ascending
     /// (`ChunkFacts::act_replay`, or each rung's floor).
-    replay: Vec<(u32, ::engine::RungReplay)>,
+    replay: Replays,
     /// The load's rs scratch lays only the carried rows a rung counts
     /// (`ChunkFacts::rs_compact`).
     rs_compact: bool,
@@ -1234,7 +1238,8 @@ impl SharedPool {
             walk_target: None,
             programs: programs::ProgramFires::default(),
             engine: None,
-            replay: facts
+            replay: Arc::new(
+                facts
                 .act_chunks
                 .iter()
                 .enumerate()
@@ -1245,6 +1250,7 @@ impl SharedPool {
                     )
                 })
                 .collect(),
+            ),
             rs_compact: facts.rs_compact,
             rs_scratch_per_fire: facts.rs_scratch_per_fire,
         };
@@ -2314,15 +2320,11 @@ impl SharedPool {
     }
 
     /// What each activation rung's replay scratch holds, by its tokens,
-    /// ascending, up to the widest a fire may take ([`Self::rung_for`]).
+    /// ascending (shared, stated once at load), and the widest a fire may
+    /// take now ([`Self::rung_for`]).
     #[must_use]
-    pub fn rung_replays(&self) -> Vec<(u32, ::engine::RungReplay)> {
-        let widest = self.rung_for(u32::MAX);
-        self.replay
-            .iter()
-            .filter(|(tokens, _)| *tokens <= widest)
-            .cloned()
-            .collect()
+    pub fn rung_replays(&self) -> (Replays, u32) {
+        (Arc::clone(&self.replay), self.rung_for(u32::MAX))
     }
 
     /// Its scratch compactness is a fire's.
