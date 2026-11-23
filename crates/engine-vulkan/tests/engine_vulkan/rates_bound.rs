@@ -367,7 +367,7 @@ fn a_later_model_extends_a_shared_curve_and_keeps_its_points() {
         ..Rates::default()
     };
     let shapes = [(1024, 1024)];
-    let measure = |stated: &Rates, top: u32| {
+    let mut measure = |stated: &Rates, top: u32| {
         let kernels =
             engine_gpu::rates::dense_kernels(kernels_slang::Target::Spirv, &tuning, tier, top);
         let wanted =

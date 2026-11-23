@@ -706,6 +706,9 @@ struct Walk<'a> {
     /// What the file states that this pie no longer reads: each key (or a
     /// list's item) by name, and where it lies ([`Registry::prune`]).
     unread: Vec<(String, Unread)>,
+    /// `[rates]` entries of a user file that did not read, each with why:
+    /// skipped alone, the rest read.
+    skipped_rates: Vec<String>,
 }
 
 /// Where a key this pie no longer reads lies in a file's text.

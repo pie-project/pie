@@ -612,6 +612,10 @@ impl Engine for Cuda {
         crate::chip::COVERS
     }
 
+    fn skips_measuring(&self) -> bool {
+        self.boot.knobs.measuring == engine::rates::Measuring::Skip
+    }
+
     fn device_facts(&self) -> Option<&DeviceFacts> {
         self.caps.as_ref().map(|caps| &caps.device)
     }
