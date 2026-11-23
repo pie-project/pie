@@ -250,11 +250,10 @@ fn past_rung(held: u32, frame: &crate::engine::FrameFire) -> Option<String> {
 fn unassigned_ref(engine_idx: usize, frame: &crate::engine::FrameFire) -> Option<String> {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // Always in a debug build, and with PIE_CHECK_SLOT_REFS in any: a stale
-    // request (built before the stores let its slots go, fired after) is
-    // named at its source, whatever the path. A lane's tables hold its kv
-    // list's translation (a device-geometry lane's whole mapped table, the
-    // one Metal's beam plan resolves a group's pages through) and its window
-    // lists; its reserve and record are read beside them.
+    // request (built before its stores let its slots go, fired after) is
+    // named at its source, whatever the path. Ownership exact: a slot the
+    // pool holds for another owner (its chunk reused by another shape, or
+    // the page another set's) is as stale as a free one.
     if !*ON.get_or_init(|| {
         cfg!(debug_assertions) || std::env::var_os("PIE_CHECK_SLOT_REFS").is_some()
     }) {
@@ -262,7 +261,21 @@ fn unassigned_ref(engine_idx: usize, frame: &crate::engine::FrameFire) -> Option
     }
     let stores = crate::store::registry::try_get(0, engine_idx)?;
     let shared = stores.shared.clone()?;
-    // Read off the pool's lock: the roles take it themselves.
+    // Read off the pool's lock: the kv store and the roles take it
+    // themselves. Each lane's set's pages as its table stands now.
+    let sets: std::collections::HashMap<
+        crate::store::kv::page_table::WorkingSetId,
+        Option<std::collections::HashSet<u32>>,
+    > = crate::store::registry::with_kv_lock(&stores.kv, "slot-ref-check", |kv| {
+        frame
+            .steps
+            .iter()
+            .flat_map(|step| step.lane_sets.iter().flatten().copied())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .map(|ws| (ws, kv.device_refs_of(ws)))
+            .collect()
+    });
     let instance_slots = |id: ::engine::InstanceId| {
         stores
             .roles
@@ -270,7 +283,7 @@ fn unassigned_ref(engine_idx: usize, frame: &crate::engine::FrameFire) -> Option
             .map(|roles| roles.lock().unwrap().fire_slots_of(id))
             .unwrap_or_default()
     };
-    let named: Vec<Vec<Vec<(String, crate::store::slots::Slot)>>> = frame
+    let named: Vec<Vec<Vec<(String, crate::store::slots::ShapeId, crate::store::slots::Slot)>>> = frame
         .steps
         .iter()
         .map(|step| {
@@ -291,13 +304,14 @@ fn unassigned_ref(engine_idx: usize, frame: &crate::engine::FrameFire) -> Option
                 .member_lanes
                 .windows(2)
                 .position(|span| (span[0] as usize..span[1] as usize).contains(&lane));
-            let stamp = member.and_then(|member| step.fire_stamps.get(member));
-            match stamp {
+            match member.and_then(|member| step.fire_stamps.get(member)) {
                 Some(&(id, queued)) => format!("fire {id}, handed to the scheduler {:?} ago", queued.elapsed()),
                 None => "fire unknown".to_string(),
             }
         };
         let lane_fault = step.submission.lanes.iter().enumerate().find_map(|(lane_at, lane)| {
+            let instance = step.instances.get(lane_at);
+            let set = step.lane_sets.get(lane_at).copied().flatten();
             let fixed: Vec<(::engine::chunk::ShapeId, Vec<u32>)> = lane
                 .record
                 .pieces()
@@ -309,26 +323,42 @@ fn unassigned_ref(engine_idx: usize, frame: &crate::engine::FrameFire) -> Option
                 .map(|shape| (shape, lane.reserve.clone()))
                 .into_iter()
                 .collect();
-            let (what, found) = [("its tables", pool.unassigned(&lane.tables)),
+            let held = [
+                ("its tables", pool.unassigned(&lane.tables)),
                 ("its record", pool.unassigned(&fixed)),
-                ("its reserve (its set's page table at submit)", pool.unassigned(&reserve))]
-                .into_iter()
-                .find_map(|(what, found)| found.map(|found| (what, found)))?;
-            let (shape, slot_ref) = found;
-            let instance = step.instances.get(lane_at);
+                ("its reserve (its set's page table at submit)", pool.unassigned(&reserve)),
+            ]
+            .into_iter()
+            .find_map(|(what, found)| found.map(|found| (what, found, "which the pool has not handed out to its shape")));
+            // Its kv refs (its list's translation or pages, its reserve) are
+            // pages its own set holds now, not merely someone's.
+            let owned = || {
+                let pages = sets.get(&set?)?.as_ref()?;
+                let kv_refs = lane
+                    .tables
+                    .iter()
+                    .filter(|(shape, _)| Some(*shape) == list)
+                    .flat_map(|(_, refs)| refs.iter())
+                    .chain(lane.reserve.iter());
+                kv_refs
+                    .copied()
+                    .find(|slot_ref| !pages.contains(slot_ref))
+                    .map(|slot_ref| ("its kv list or reserve", (list.unwrap_or_default(), slot_ref), "which its set's table no longer holds"))
+            };
+            let (what, (shape, slot_ref), why) = held.or_else(owned)?;
             Some(format!(
-                "step {at}'s lane {lane_at} (instance {instance:?}, {}) names slot ref {slot_ref} \
-                 of shape {shape:?} in {what}, which the pool has not handed out: a request \
-                 built before its stores let the slot go",
+                "step {at}'s lane {lane_at} (instance {instance:?}, set {set:?}, {}) names slot ref \
+                 {slot_ref} of shape {shape:?} in {what}, {why}: a request built before its \
+                 stores let the slot go",
                 fire_of(lane_at)
             ))
         });
         lane_fault.or_else(|| {
-            named.get(at)?.iter().flatten().find_map(|(what, slot)| {
-                (pool.pool().refs(*slot) == (0, 0)).then(|| {
+            named.get(at)?.iter().flatten().find_map(|(what, shape, slot)| {
+                (!pool.pool().is_held(*shape, *slot)).then(|| {
                     format!(
-                        "step {at} binds {what} on slot {slot:?}, which the pool counts free: an \
-                         instance's part named past its release"
+                        "step {at} binds {what} on slot {slot:?}, which the pool does not hold for \
+                         its shape: an instance's part named past its release"
                     )
                 })
             })

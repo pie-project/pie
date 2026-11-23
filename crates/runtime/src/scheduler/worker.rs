@@ -3895,6 +3895,7 @@ mod tests {
         let frame = |lanes: u32| crate::engine::FrameFire {
             steps: vec![crate::engine::StepFire {
                 fire_stamps: Vec::new(),
+            lane_sets: Vec::new(),
                 submission: ::engine::Step {
                     lanes: (0..lanes)
                         .map(|lane| ::engine::Lane::decode(lane, 0, 1, 0))
@@ -4074,6 +4075,7 @@ mod tests {
                 crate::engine::FrameFire {
                     steps: vec![crate::engine::StepFire {
                         fire_stamps: Vec::new(),
+            lane_sets: Vec::new(),
                         submission: ::engine::Step {
                             lanes: vec![::engine::Lane::decode(0, 0, 1, 0)],
                             attachments: Vec::new(),
@@ -4186,6 +4188,7 @@ mod tests {
             crate::engine::FrameFire {
                 steps: vec![crate::engine::StepFire {
                     fire_stamps: Vec::new(),
+            lane_sets: Vec::new(),
                     submission: ::engine::Step {
                         lanes: vec![::engine::Lane::decode(0, 0, 1, 0)],
                         attachments: Vec::new(),
@@ -4328,6 +4331,7 @@ mod tests {
             crate::engine::FrameFire {
                 steps: vec![crate::engine::StepFire {
                     fire_stamps: Vec::new(),
+            lane_sets: Vec::new(),
                     submission: ::engine::Step {
                         lanes: vec![::engine::Lane {
                             reports: TAG,
@@ -4482,6 +4486,7 @@ mod tests {
         let fire = crate::engine::FrameFire {
             steps: vec![crate::engine::StepFire {
                 fire_stamps: Vec::new(),
+            lane_sets: Vec::new(),
                 submission: ::engine::Step {
                     lanes: (0..lanes)
                         .map(|lane| ::engine::Lane::decode(lane, 0, 1, 0))
@@ -4806,6 +4811,7 @@ mod tests {
                 .collect();
             fire.steps.push(crate::engine::StepFire {
                 fire_stamps: Vec::new(),
+            lane_sets: Vec::new(),
                 submission: ::engine::Step {
                     lanes: fires.iter().map(|(_, lane)| lane.clone()).collect(),
                     attachments: (0..lanes)

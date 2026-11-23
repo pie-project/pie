@@ -1193,7 +1193,10 @@ impl Roles {
     /// tables, rings and scratch, its pair's state and the channels' rings
     /// and adapter it is bound to, each part with what it is, where the item
     /// lies on the device. What a fire's check at the engine reads.
-    pub(crate) fn fire_slots_of(&self, id: InstanceId) -> Vec<(String, super::slots::Slot)> {
+    pub(crate) fn fire_slots_of(
+        &self,
+        id: InstanceId,
+    ) -> Vec<(String, super::slots::ShapeId, super::slots::Slot)> {
         let device = self.device.lock().unwrap();
         let mut out = Vec::new();
         let Some(instance) = self.items.get(&Owner::Instance(id)) else {
@@ -1217,6 +1220,7 @@ impl Roles {
                 for &slot_ref in &part.refs {
                     out.push((
                         format!("{owner:?}'s {:?} slot ref {slot_ref}", part.role),
+                        shape.pool,
                         device.slot(shape.pool, slot_ref),
                     ));
                 }

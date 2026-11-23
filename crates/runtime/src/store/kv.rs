@@ -2697,6 +2697,16 @@ impl KvStore {
         Ok(RelistNeeds::Copies(shared))
     }
 
+    /// The slot refs of `ws`'s pages on the device as its table stands now
+    /// (each page id less the pool's base), `None` where its table does not
+    /// resolve (a page below the device): what a lane of its names must lie
+    /// among, for a check at the engine's door.
+    pub fn device_refs_of(&mut self, ws: WorkingSetId) -> Option<std::collections::HashSet<u32>> {
+        let base = self.pool.base();
+        let table = self.flat_table(ws).ok()?;
+        Some(table.iter().map(|page| page.0.saturating_sub(base)).collect())
+    }
+
     /// The shared pool's kv list shape its pages are slots of, if any.
     pub fn list_shape(&self) -> Option<::engine::chunk::ShapeId> {
         self.shape

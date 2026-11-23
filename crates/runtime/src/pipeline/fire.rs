@@ -3231,6 +3231,7 @@ pub(crate) fn map_lane_pages(
                 continue;
             };
             map_pages(&mut lane.pages, &table)?;
+            lane.ws = Some(*ws);
         }
     }
     Ok(())
@@ -3275,6 +3276,7 @@ fn stamp_lane_reserve(
         for &lane in lanes {
             if let Some(lane) = req.lanes.get_mut(lane) {
                 lane.lane.reserve.clone_from(&table);
+                lane.ws = Some(*ws);
             }
         }
     }
@@ -3341,6 +3343,7 @@ fn stamp_lane_translation(
         for &lane in lanes {
             if let Some(lane) = req.lanes.get_mut(lane) {
                 lane.translation.clone_from(&table);
+                lane.ws = Some(*ws);
             }
         }
     }
