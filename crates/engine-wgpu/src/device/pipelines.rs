@@ -29,12 +29,11 @@ pub struct Pipeline {
     pub stride: Vec<u32>,
 
     /// This kernel's module with each storage binding read from an element
-    /// offset ([`Rebased`]): built the first time a dispatch binds a window
-    /// of a value from past the value's first aligned byte, which the
-    /// load's bind walk does for each class region a fire lays past a
-    /// value's first row. `None` once built where the module cannot be
-    /// rebased.
-    rebased: std::sync::OnceLock<Option<Arc<Rebased>>>,
+    /// offset ([`Rebased`]): built by the load's bind walk where one of its
+    /// dispatches binds a window of a value past the value's first aligned
+    /// byte (a class region a fire lays past a value's first row); a fire
+    /// never builds it ([`Pipelines::rebased`]).
+    rebased: std::sync::OnceLock<Arc<Rebased>>,
 
     /// The WGSL the pipeline was built from, kept for its rebased twin.
     wgsl: String,
@@ -387,16 +386,15 @@ pub(crate) fn group_of(
 #[derive(Default)]
 pub struct Pipelines {
     built: RefCell<HashMap<&'static str, Arc<Pipeline>>>,
-    /// The kernels built, in the order their pipelines were.
+    /// The kernels built, in the order their pipelines were (a rebased
+    /// twin under its kernel's name), and each twin a fire needed that no
+    /// bind walk built ([`Pipelines::rebased`]).
     order: RefCell<Vec<&'static str>>,
     binds: RefCell<BindCache>,
     /// One layout for every kernel that declares the same bindings.
     layouts: RefCell<HashMap<LayoutKey, wgpu::BindGroupLayout>>,
     bind_hits: Cell<u64>,
     bind_misses: Cell<u64>,
-    /// Groups a fire made of its own frame's scratch views, which no cache
-    /// keeps.
-    scratch_groups: Cell<u64>,
 }
 
 static BIND_TRAFFIC: [std::sync::atomic::AtomicU64; 2] = [
@@ -452,16 +450,11 @@ impl Pipelines {
         engine_gpu::storage_buffers(key, own, pool, device.storage_buffers())
     }
 
-    /// The bind groups made so far: each cache miss, and each group of a
-    /// fire's scratch views ([`engine_gpu::serve::Serve::bound`]).
+    /// The bind groups made so far: each cache miss
+    /// ([`engine_gpu::serve::Serve::bound`]).
     #[must_use]
     pub fn bound(&self) -> u64 {
-        self.bind_misses.get() + self.scratch_groups.get()
-    }
-
-    /// Counts a group a fire made of its own frame's scratch views.
-    pub(crate) fn note_scratch_group(&self) {
-        self.scratch_groups.set(self.scratch_groups.get() + 1);
+        self.bind_misses.get()
     }
 
     #[must_use]
@@ -514,22 +507,39 @@ impl Pipelines {
         Ok(pipeline)
     }
 
-    /// `pipeline`'s rebased twin ([`Rebased`]), built on first use (counted
-    /// as a pipeline built, as [`Self::get`]'s are); `None` where its
-    /// module cannot be rebased.
+    /// `pipeline`'s rebased twin ([`Rebased`]). The load's bind walk
+    /// (`build`) builds it, refusing a module that cannot be rebased by
+    /// name; a fire only takes the twin the load built. A fire whose
+    /// dispatch needs a twin no walk built is a bug: it is counted among
+    /// the kernels built on a fire's path ([`Self::built_since`], which
+    /// the served tally reads), panics by name in a debug build, and is
+    /// refused by name otherwise. Nothing is built for it.
     pub(crate) fn rebased(
         &self,
         device: &Context,
         pipeline: &Pipeline,
-    ) -> Result<Option<Arc<Rebased>>> {
+        build: bool,
+    ) -> Result<Arc<Rebased>> {
         if let Some(held) = pipeline.rebased.get() {
-            return Ok(held.clone());
+            return Ok(Arc::clone(held));
+        }
+        if !build {
+            self.order.borrow_mut().push(pipeline.name);
+            let why = format!(
+                "a fire binds a window of a value past its first aligned byte through \
+                 kernel {}'s rebased twin, which no bind walk of the load built",
+                pipeline.name
+            );
+            debug_assert!(false, "{why}");
+            return Err(Fault::Shader {
+                file: pipeline.file,
+                entrypoint: pipeline.name,
+                why,
+            });
         }
         let built = build_rebased(device.core(), &self.layouts, pipeline)?;
-        if built.is_some() {
-            self.order.borrow_mut().push(pipeline.name);
-        }
-        Ok(pipeline.rebased.get_or_init(|| built).clone())
+        self.order.borrow_mut().push(pipeline.name);
+        Ok(Arc::clone(pipeline.rebased.get_or_init(|| built)))
     }
 }
 
@@ -741,7 +751,7 @@ fn build_rebased(
     core: &Arc<Core>,
     layouts: &RefCell<HashMap<LayoutKey, wgpu::BindGroupLayout>>,
     pipeline: &Pipeline,
-) -> Result<Option<Arc<Rebased>>> {
+) -> Result<Arc<Rebased>> {
     let shader = |why: String| Fault::Shader {
         file: pipeline.file,
         entrypoint: pipeline.name,
@@ -749,20 +759,15 @@ fn build_rebased(
     };
     let declared = reflect(&pipeline.wgsl).map_err(shader)?;
     let binding = declared.uniform.map_or(declared.bindings, |at| at + 1);
-    let wgsl = match rebase_wgsl(&pipeline.wgsl, &declared.names, binding) {
-        Ok(wgsl) => wgsl,
-        Err(why) => {
-            tracing::debug!(kernel = pipeline.name, %why, "no rebased twin");
-            return Ok(None);
-        }
-    };
+    let wgsl = rebase_wgsl(&pipeline.wgsl, &declared.names, binding)
+        .map_err(|why| shader(format!("no rebased twin: {why}")))?;
     let (twin, layout) = pipeline_of(core, layouts, pipeline.name, &declared, Some(binding), &wgsl)
         .map_err(shader)?;
     let bytes = 16 * u32::try_from(declared.bindings.div_ceil(4).max(1)).unwrap_or(u32::MAX);
-    Ok(Some(Arc::new(Rebased {
+    Ok(Arc::new(Rebased {
         pipeline: twin,
         layout,
         binding,
         bytes,
-    })))
+    }))
 }
