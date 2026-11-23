@@ -1187,9 +1187,25 @@ impl KvStore {
         }
         self.split_at_steps(&keys);
         self.split_persisted();
-        let mut groups: Vec<(i64, Vec<u64>)> = self
-            .reclaim_order(&keys)
+        let order = self.reclaim_order(&keys);
+        // The device holds the highest keys first: idle cache keyed lower
+        // that may not move down is dropped (the caller's reclaim) before
+        // anything keyed above it moves down. A sweep (`now`) moves what its
+        // row keeps off the device whatever lies below.
+        let floor = (!now)
+            .then(|| {
+                order
+                    .iter()
+                    .filter(|(_, ids)| self.table.frees_device_pages(&self.roots(ids)))
+                    .find(|(_, ids)| {
+                        ids.iter().all(|&id| self.tiers_of(id, &keys) & retention::HOST == 0)
+                    })
+                    .map(|(key, _)| *key)
+            })
+            .flatten();
+        let mut groups: Vec<(i64, Vec<u64>)> = order
             .into_iter()
+            .filter(|(key, _)| floor.is_none_or(|floor| *key < floor))
             .map(|(key, ids)| {
                 let ids: Vec<u64> = ids
                     .into_iter()
