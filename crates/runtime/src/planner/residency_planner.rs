@@ -402,7 +402,8 @@ impl ResidencyPlanner {
             }
             if !std::mem::replace(&mut counted, true) {
                 self.stats.admission_waits.fetch_add(1, Ordering::Relaxed);
-                tracing::debug!(%pid, "planner: a newcomer waits for room at the capacity gate's last place");
+                // Said once a newcomer: how many the gate held, and when.
+                tracing::info!(%pid, "planner: a newcomer waits for room at the capacity gate's last place");
             }
             rose.await;
         }
