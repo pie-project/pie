@@ -62,6 +62,11 @@ enum Place {
         at: u64,
         runs: Vec<(u64, u64, HostAt)>,
     },
+    /// Bytes of an instance's place in the pool (a guest's resident state,
+    /// `engine::GuestState::resident`), laid where its place's pieces lie
+    /// now and laid again from them after any move, never repointed by
+    /// itself: `runs` as [`Place::Slot`]'s.
+    Pool { runs: Vec<(u64, u64, HostAt)> },
 }
 
 /// A table's or a ring's bytes as a kernel binds them: `buffer` at
@@ -149,14 +154,46 @@ impl Held {
         Ok(region)
     }
 
-    /// Points a pooled region at the chunk its ref sits in now.
+    /// `bytes` of the pool from range offset `global`, bound through
+    /// `buffer` at `offset` (a [`crate::store::GuestPiece`]'s view and local
+    /// byte): a guest's resident state where its place lies now, not zeroed
+    /// (a restore's bytes are the runtime's copy; a bind zeroes it itself).
+    pub fn in_pool(
+        pools: &Pools,
+        buffer: Buffer,
+        offset: u64,
+        global: u64,
+        bytes: u64,
+    ) -> Result<Held> {
+        Ok(Held {
+            buffer,
+            offset,
+            bytes,
+            place: Place::Pool {
+                runs: host_runs(pools.host_runs(global, bytes)?),
+            },
+        })
+    }
+
+    fn runs(&self) -> &[(u64, u64, HostAt)] {
+        match &self.place {
+            Place::Slot { runs, .. } | Place::Pool { runs } => runs,
+        }
+    }
+
+    /// Points a pooled region at the chunk its ref sits in now. A region of
+    /// an instance's place is laid again from its pieces instead
+    /// ([`Held::in_pool`]), so it is left as it is.
     pub fn rebind(&mut self, pools: &Pools) -> Result<()> {
         let Place::Slot {
             shape,
             slot,
             at,
             runs,
-        } = &mut self.place;
+        } = &mut self.place
+        else {
+            return Ok(());
+        };
         let (buffer, offset, fresh) = pools.span_runs(*shape, *slot, *at, self.bytes)?;
         self.buffer = buffer;
         self.offset = offset;
@@ -167,21 +204,28 @@ impl Held {
     /// The slot ref a pooled region lies in.
     #[must_use]
     pub fn slot(&self) -> Option<u32> {
-        let Place::Slot { slot, .. } = self.place;
-        Some(slot)
+        match self.place {
+            Place::Slot { slot, .. } => Some(slot),
+            Place::Pool { .. } => None,
+        }
     }
 
     /// Moves a pooled region to slot ref `to` of its shape, whose bytes
     /// the runtime already copied there (`Engine::rebind_slots`).
     pub fn retarget(&mut self, pools: &Pools, to: u32) -> Result<()> {
-        let Place::Slot { slot, .. } = &mut self.place;
+        let Place::Slot { slot, .. } = &mut self.place else {
+            return Err(Fault::program(
+                "program::held",
+                "a region of an instance's place is laid from its place, never retargeted to a slot",
+            ));
+        };
         *slot = to;
         self.rebind(pools)
     }
 
     #[must_use]
     pub fn is_pooled(&self) -> bool {
-        matches!(self.place, Place::Slot { .. })
+        true
     }
 
     #[must_use]
@@ -225,7 +269,7 @@ impl Held {
     /// writes only bytes no frame in flight reads.
     pub fn write(&mut self, at: u64, from: &[u8]) -> Result<()> {
         self.check(at, from.len())?;
-        let Place::Slot { runs, .. } = &self.place;
+        let runs = self.runs();
         for (run, part) in pieces(runs, at, from.len() as u64) {
             let (from_at, host, len) = part;
             // SAFETY: `check` keeps the span inside the region, and each
@@ -243,7 +287,7 @@ impl Held {
 
     pub fn read(&self, at: u64, into: &mut [u8]) -> Result<()> {
         self.check(at, into.len())?;
-        let Place::Slot { runs, .. } = &self.place;
+        let runs = self.runs();
         for (run, part) in pieces(runs, at, into.len() as u64) {
             let (from_at, host, len) = part;
             // SAFETY: as `write`.
@@ -283,7 +327,7 @@ impl Held {
         if end > self.bytes || at % 4 != 0 {
             return None;
         }
-        let Place::Slot { runs, .. } = &self.place;
+        let runs = self.runs();
         runs.iter().find_map(|&(from, len, host)| {
             (at >= from && end <= from + len).then(|| {
                 // SAFETY: `at - from` lies inside the run, checked above.

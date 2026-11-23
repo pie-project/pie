@@ -273,7 +273,14 @@ impl Plane {
             .ok_or_else(|| Fault::program("program::plane", format!("no program {program_id}")))?;
         let pair: Vec<u64> = self.pair_sets(program, extents)?.iter().map(|s| s.2).collect();
         let instance = self.instance_sets(program, extents)?;
-        Ok(guest::guest_state(&pair, &instance, room_of(pools)?))
+        Ok(guest::guest_state(&pair, &instance, self.resident_of(program), room_of(pools)?))
+    }
+
+    /// The bytes an instance of `program` keeps resident in its place
+    /// (`engine::GuestState::resident`): its beam group's state, laid in
+    /// 16-byte steps (the state's ulong runs).
+    fn resident_of(&self, program: &Program) -> u64 {
+        self.beam_of(program).map_or(0, |layout| layout.bytes().next_multiple_of(16))
     }
 
     #[must_use]
@@ -469,7 +476,9 @@ impl Plane {
             }
         };
         let capture = self.capture_of(program);
-        let beam = self.beam_of(program).map_or(0, |layout| layout.bytes());
+        // A beam group's state is resident in its place, not its tables
+        // ([`Plane::lay_scratch`]).
+        let beam = 0;
         let session = match Session::bind(
             &program.compiled,
             &program.plan,
@@ -516,6 +525,7 @@ impl Plane {
                 pair: 0,
                 scratch_place: scratch.clone(),
                 scratch: Vec::new(),
+                beam: None,
                 program_id,
                 extents,
                 session,
@@ -773,7 +783,7 @@ impl Plane {
         let Some(layout) = self.beam_of(program) else {
             return Ok(None);
         };
-        let address = bound.session.beam_row().ok_or_else(|| {
+        let address = bound.beam.as_ref().and_then(|beam| beam.address_at(0)).ok_or_else(|| {
             Fault::program(
                 "program::plane",
                 format!("instance {id} states parents and holds no beam state"),
@@ -809,7 +819,10 @@ impl Plane {
             ));
         }
         let mut header = [0u8; 16];
-        bound.session.read_beam(0, &mut header)?;
+        let state = bound.beam.as_ref().ok_or_else(|| {
+            Fault::program("program::beam_list", format!("instance {id} holds no beam state"))
+        })?;
+        state.read(0, &mut header)?;
         let word = |at: usize| u32::from_le_bytes([header[at], header[at + 1], header[at + 2], header[at + 3]]);
         if word(0) == 0 {
             return Err(Fault::program(
@@ -821,7 +834,7 @@ impl Plane {
         let (lanes, cap) = (u64::from(layout.lanes), u64::from(layout.cap));
         let row = (4 + u64::from(fired & 1) * lanes * cap + u64::from(beam) * cap) * 4;
         let mut bytes = vec![0u8; cap as usize * 4];
-        bound.session.read_beam(row, &mut bytes)?;
+        state.read(row, &mut bytes)?;
         Ok(bytes
             .chunks_exact(4)
             .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
@@ -834,7 +847,7 @@ impl Plane {
     /// holds no beam state.
     #[must_use]
     pub fn beam_common_word(&self, id: InstanceId) -> Option<held::HostWord> {
-        self.instances.get(&id)?.session.beam_word(12)
+        self.instances.get(&id)?.beam.as_ref()?.host_word(12)
     }
 
     /// The cell instance `id`'s next pass reads its beams' parents from
@@ -1016,18 +1029,43 @@ impl Plane {
         let program = self.programs.get(&bound.program_id).ok_or_else(|| {
             Fault::program("program::plane", format!("instance {id} names a program that is gone"))
         })?;
-        let sizes = self.instance_sets(program, &bound.extents)?;
+        let resident = self.resident_of(program);
+        let sizes = guest::with_resident(resident, &self.instance_sets(program, &bound.extents)?);
         let pieces = pools.guest_pieces(&bound.scratch_place)?;
         let bytes: Vec<u64> = pieces.iter().map(|piece| piece.bytes).collect();
-        let scratch = guest::places(&sizes, &bytes)?
-            .into_iter()
+        let mut laid = guest::places(&sizes, &bytes)?.into_iter();
+        // The resident state first ([`guest::with_resident`]): where the
+        // place lies now, its bytes as they stand (the runtime's copy after
+        // an unpark; zeroed at the bind, [`Plane::bind`]).
+        let beam = match (resident > 0).then(|| laid.next()).flatten() {
+            Some((at, offset)) => {
+                let piece = &pieces[at];
+                let layout = self.beam_of(program).expect("a resident state is a beam group's");
+                Some(held::Held::in_pool(
+                    pools,
+                    piece.view.clone(),
+                    piece.local + offset,
+                    piece.global + offset,
+                    layout.bytes(),
+                )?)
+            }
+            None => None,
+        };
+        let scratch = laid
             .map(|(at, offset)| launch::ScratchAt {
                 buffer: pieces[at].view.clone(),
                 offset: pieces[at].local + offset,
             })
             .collect();
         if let Some(bound) = self.instances.get_mut(&id) {
+            let fresh = bound.beam.is_none();
             bound.scratch = scratch;
+            bound.beam = beam;
+            // A bind's first lay: the group's state starts unprimed
+            // (header zero, BEAM-PAGE-LISTS §5).
+            if fresh && let Some(beam) = bound.beam.as_mut() {
+                beam.zero_span(0, beam.bytes())?;
+            }
         }
         Ok(())
     }
@@ -1092,7 +1130,9 @@ impl Plane {
             program.plan.package.channels.len(),
             self.program_rows(program),
             self.capture_of(program),
-            self.beam_of(program).map_or(0, |layout| layout.bytes()),
+            // A beam group's state lies in the instance's place
+            // (`GuestState::resident`), not its tables.
+            0,
             self.arms,
         );
         let layout = held::TableLayout::of(&sizes, instance_slot);
@@ -1920,6 +1960,10 @@ struct Bound {
     /// it fires alone (`engine::GuestState::scratch`).
     scratch_place: engine::ScratchPlace,
     scratch: Vec<launch::ScratchAt>,
+    /// Its beam group's state where its place lies now
+    /// (`engine::GuestState::resident`, [`Plane::lay_scratch`]): `None`
+    /// for a program that states no parents.
+    beam: Option<held::Held>,
     program_id: ProgramId,
     /// The extents it was bound at: with the program, the pair whose fire
     /// term the runtime counts (`engine::Engine::fire_facts`).
@@ -4691,12 +4735,13 @@ mod tests {
         assert_eq!(peak(&mut plane, 789), vec![789, 789]);
     }
 
-    /// A beam group's state lies in its instance's tables (BEAM-PAGE-LISTS
-    /// §4), which the runtime copies wherever a park or a move takes the
-    /// instance: a rebind to fresh Instance slots carries the group's state
-    /// with them, at the same offset in the run, as the score rows are.
-    /// Left in the old slots, the next step read the slots' next owner's
-    /// bytes as its map.
+    /// A beam group's state is resident in its instance's place
+    /// (`GuestState::resident`, BEAM-PAGE-LISTS §4), first in it, and the
+    /// runtime copies the place byte for byte wherever a park or a move
+    /// takes it: a rebind naming a fresh place carries the group's state
+    /// there, its bytes as they stood, and one that moves only the tables
+    /// leaves it where it lies. Left in the old place, the next step read
+    /// its next owner's bytes as its map.
     #[test]
     fn a_beam_groups_state_follows_its_instance_to_fresh_slots() {
         use crate::store::layout::INSTANCE;
@@ -4769,9 +4814,30 @@ mod tests {
             .beam_state(id)
             .expect("the instance")
             .expect("its program states parents");
-
-        // The runtime's move: the tables copied to fresh slots of the same
-        // chunk, then the rebind names them.
+        // The state's first bytes marked: the group as a step left it.
+        let mark = [0x5au8, 0xa5, 0x3c, 0xc3];
+        plane
+            .instances
+            .get_mut(&id)
+            .and_then(|bound| bound.beam.as_mut())
+            .expect("a resident state")
+            .write(4, &mark)
+            .expect("the mark");
+        let old_place = plane.instances[&id].scratch_place.clone();
+        // A fresh place of the same shape, past every chunk the test used.
+        let per_chunk = pools.slots_per_chunk(INSTANCE).expect("instance slots a chunk");
+        let new_place = match &old_place {
+            engine::ScratchPlace::Run { first, slots } => engine::ScratchPlace::Run {
+                first: (GUEST_CHUNKS - 1) * per_chunk + first % per_chunk,
+                slots: *slots,
+            },
+            engine::ScratchPlace::Chunks { run, pieces } => engine::ScratchPlace::Chunks {
+                run: *run,
+                pieces: (0..pieces.len() as u32).map(|k| GUEST_CHUNKS - (k + 1) * run).collect(),
+            },
+            engine::ScratchPlace::None => panic!("a beam group holds a place"),
+        };
+        // A rebind of the tables alone: the place, and the state in it, stay.
         let (fresh, _) = slots_for(&pools, &facts, 1);
         let mut frame = context.frame().expect("a frame");
         let moves: Vec<(u32, u32)> = instance.iter().copied().zip(fresh.iter().copied()).collect();
@@ -4791,16 +4857,43 @@ mod tests {
                 },
             )
             .expect("the rebind");
-        let (after, _) = plane
-            .beam_state(id)
-            .expect("the instance")
-            .expect("its program states parents");
-        let slot = pools.slot_bytes(INSTANCE).expect("an instance slot");
-        assert_eq!(
-            after,
-            before + u64::from(fresh[0] - instance[0]) * slot,
-            "the group's state moved with its tables, to the same offset in the fresh run"
-        );
+        let (stayed, _) = plane.beam_state(id).expect("the instance").expect("parents");
+        assert_eq!(stayed, before, "a rebind of the tables alone leaves the state in its place");
+
+        // The runtime's move of the place: its bytes copied whole to the
+        // fresh place (on the host here), then the rebind names it.
+        let mut pools = pools;
+        let from = pools.guest_pieces(&old_place).expect("the old place");
+        let to = pools.guest_pieces(&new_place).expect("the new place");
+        for (from, to) in from.iter().zip(&to) {
+            let mut bytes = vec![0u8; usize::try_from(from.bytes).expect("a piece")];
+            pools.read_span(from.global, &mut bytes).expect("the place reads");
+            pools.write_span(to.global, &bytes).expect("the place writes");
+        }
+        plane
+            .rebind_slots(
+                &pools,
+                &engine::Rebind::Instance {
+                    id,
+                    instance: fresh.clone(),
+                    rings: rings.clone(),
+                    adapter: Vec::new(),
+                    scratch: new_place.clone(),
+                    pair: engine::ScratchPlace::None,
+                    pair_generation: 0,
+                },
+            )
+            .expect("the rebind");
+        let (after, _) = plane.beam_state(id).expect("the instance").expect("parents");
+        let first = |place: &engine::ScratchPlace| {
+            pools.guest_pieces(place).expect("a place")[0].view.address_at(0).expect("an address")
+                + pools.guest_pieces(place).expect("a place")[0].local
+        };
+        assert_eq!(after, first(&new_place), "the group's state moved with its place, first in it");
+        assert_eq!(before, first(&old_place), "it lay first in its place before");
+        let mut got = [0u8; 4];
+        plane.instances[&id].beam.as_ref().expect("a resident state").read(4, &mut got).expect("read");
+        assert_eq!(got, mark, "the state's bytes came with it, not zeroed");
     }
 
     /// A bound program's role slots (its Instance tables and its Channel
