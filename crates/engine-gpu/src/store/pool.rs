@@ -381,6 +381,15 @@ impl<B: Backend> Pool<B> {
             .map(|buffer| (buffer, self.segment_bytes(last)))
     }
 
+    /// The virtual byte the span's buffer (the last segment's,
+    /// [`Self::span_place`]) starts at.
+    #[must_use]
+    pub fn span_base(&self) -> u64 {
+        u64::from(self.segments().saturating_sub(1))
+            * u64::from(self.segment_chunks)
+            * self.chunk_bytes
+    }
+
     /// The segment buffer virtual byte `at` lies in and its offset there;
     /// refuses an uncommitted one.
     pub fn locate(&self, at: u64) -> Result<(&B::Buffer, u64)> {

@@ -217,6 +217,7 @@ impl Serve for Api {
         tuning.hold_decodes(
             tier,
             &engine_gpu::scratch::decodes(trace),
+            &engine_gpu::scratch::windowed_decodes(trace),
             device.storage_buffers(),
         )
     }

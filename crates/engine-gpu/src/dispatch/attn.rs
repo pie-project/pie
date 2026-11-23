@@ -12,6 +12,37 @@ impl<B: Backend> DispatchAttn for Run<'_, B> {
 }
 
 impl<B: Backend> Run<'_, B> {
+    /// Every windowed layer's fold into its ring (CONTRACT-BC 19, 21), one
+    /// dispatch a fire, after its walk: every attention reading a ring (its
+    /// own layer's and a shared tail's, which reads its owner's) reads the
+    /// ring the fire found, its early rows' windows reaching rows the fold
+    /// drops. The rows each lane folds go into its ring, the fire's rows it
+    /// leaves unfolded into its buffer; the fold table opens with each
+    /// ring's geometry in the pools' row order (`Pools::ring_layers`), the
+    /// order the cache table binds them in.
+    pub fn fold_rings(&self) -> Result<(), kernels_slang::Error> {
+        let layers: Vec<&kernels_slang::KvPool> = self
+            .cache_pools()
+            .iter()
+            .filter_map(|pool| match pool {
+                crate::run::CachePool::Kv(pool) if pool.ring.is_some() => Some(pool),
+                _ => None,
+            })
+            .collect();
+        if layers.is_empty() {
+            return Ok(());
+        }
+        let Some((jobs, most)) = self.bindings().ring_jobs else {
+            return Err(kernels_slang::Error::Backend {
+                op: "attn.ring_fold",
+                detail: "a fire reading a ring staged no fold table".to_string(),
+            });
+        };
+        kernels_slang::attn::ring::fold(self.ctx, &layers, jobs, most)
+    }
+}
+
+impl<B: Backend> Run<'_, B> {
     fn prefill_tables(
         &self,
         plan: poem_ir::ValueId,

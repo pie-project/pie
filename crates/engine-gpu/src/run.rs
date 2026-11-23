@@ -207,6 +207,11 @@ pub struct FireBindings {
     /// a geometry input states (CONTRACT-BC 21); any other reads table 0.
     pub window_tables: Vec<(u32, usize)>,
 
+    /// The fold's job table of the fire's windowed rows and the most jobs
+    /// its grid takes (`kernels_slang::attn::ring::fold`), where the load
+    /// has them.
+    pub ring_jobs: Option<(Tensor, u32)>,
+
     pub tables: FireTables,
 
     pub rs: Option<std::sync::Arc<crate::rs::Seat>>,
@@ -1272,6 +1277,11 @@ impl<'c, B: Backend> Run<'c, B> {
                     .map(|&(_, table)| table)
             })
             .unwrap_or(0)
+    }
+
+    /// Every row's pool the fire binds, in the pools' row order.
+    pub fn cache_pools(&self) -> &'c [CachePool] {
+        &self.caches.0
     }
 
     pub fn pool(&self, id: ValueId) -> &KvPool {
