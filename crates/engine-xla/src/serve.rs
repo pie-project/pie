@@ -3170,6 +3170,12 @@ impl Shell {
         }
         let caches = self.pools.table(&table_seats, &record_rows_t)?;
 
+        // A fire that may carry buffered rows takes the buffered path whatever
+        // verbs its lanes send this time (a folding lane's plan replays
+        // nothing and commits its rows): whether a lane buffers is the
+        // runtime's fold timing (its lagged fold), so the program is the one
+        // the warm ladder lays for the same held rows.
+        let rs_active = rs_active || (any_held && self.pools.buffers_rs());
         let rs_seat = match (&self.rs_layout, rs_active) {
             (Some(layout), true) => {
                 let replay: Vec<i32> = rs_plans.iter().map(|p| p.replay as i32).collect();
@@ -3183,7 +3189,7 @@ impl Shell {
                 // ladder lays with the same held rows. A fire of fresh lanes
                 // alone (a first prefill) carries nothing and lays its own rows.
                 debug_assert!(any_held || replays.iter().all(|&(_, replayed)| replayed == 0));
-                let replays = any_held && self.pools.buffers_rs();
+                let replays = any_held;
                 let mut maps = std::collections::HashMap::new();
                 for window in windows.all() {
                     if window.indptr_host.is_empty() {

@@ -88,6 +88,17 @@ impl Shell {
             all_rows: false,
             masked: false,
         };
+        // A decode lane beside prompts holds its own prompt, a page of it:
+        // its fire is the one a served decode lane's is (on a load that
+        // buffers recurrent rows, one that may carry them), at the page
+        // bound the prompts beside it set.
+        let beside = Want {
+            word: decode,
+            rows: 1,
+            held_pages: 1,
+            all_rows: false,
+            masked: false,
+        };
         let hybrid = self.has_state();
         let mut shapes: Vec<Vec<Want>> = Vec::new();
         // A class reads a lane's mask (the mask fold: data, not a class).
@@ -244,7 +255,7 @@ impl Shell {
                     if rows < 2 || d == 0 || d != self.mixed_decode_lanes(host) {
                         continue;
                     }
-                    let mut lanes = vec![fresh(decode, 1); d as usize];
+                    let mut lanes = vec![beside; d as usize];
                     lanes.push(fresh(prefill, rows));
                     shapes.push(lanes);
                 }
@@ -266,7 +277,7 @@ impl Shell {
                     // one-row lanes their count pads with and the rest lane
                     let r = b.saturating_sub(d + p - n);
                     if r >= 2 * n {
-                        let mut lanes = vec![fresh(decode, 1); d as usize];
+                        let mut lanes = vec![beside; d as usize];
                         lanes.extend(std::iter::repeat_n(fresh(prefill, r / n), n as usize));
                         lanes[d as usize].rows += r % n;
                         shapes.push(lanes);
@@ -287,7 +298,7 @@ impl Shell {
                             && d + 2 * n <= self.budgets.tokens.max_lanes
                             && d == self.mixed_decode_lanes(pad.rung(n + 1).max(host))
                         {
-                            let mut lanes = vec![fresh(decode, 1); d as usize];
+                            let mut lanes = vec![beside; d as usize];
                             lanes.extend(std::iter::repeat_n(fresh(prefill, each), n as usize));
                             // A full fire's prompts fill the widest rows, and the
                             // lanes they pad to push it onto the top rung (v6e
@@ -320,7 +331,7 @@ impl Shell {
                 }
                 let ones = (left - d) + (h - 1 - n);
                 for rows in [widest / 2, widest - d - ones] {
-                    let mut lanes = vec![fresh(decode, 1); d as usize];
+                    let mut lanes = vec![beside; d as usize];
                     lanes.extend(std::iter::repeat_n(fresh(prefill, rows / n), n as usize));
                     lanes[d as usize].rows += rows % n;
                     shapes.push(lanes);
