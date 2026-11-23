@@ -126,12 +126,19 @@ fn page_bytes() -> usize {
     usize::try_from(page).ok().filter(|&page| page > 0).unwrap_or(4096)
 }
 
-/// The link's fixed cost a copy and its rate, and the fill rate: a page
-/// copy (after one that pays the stream's start), then copies doubling in
-/// size, each timed twice, while a doubling moves bytes faster than the
-/// last size did even at its best of the two (so the rate found is past the
-/// measurement's own spread), up to the largest tensor; each size also
-/// filled from pageable memory.
+/// Rounds a size is timed in: its rate is the fastest of them.
+const ROUNDS: usize = 3;
+
+/// The link's fixed cost a copy and its rate, and the fill rate, by the
+/// curves' rule: a page copy (after one that pays the stream's start),
+/// then copies doubling in size, each the fastest of [`ROUNDS`] rounds,
+/// while that rate rises, up to the largest tensor. A link's rate rises
+/// with every doubling (its fixed cost a smaller share each time), so a
+/// rise counts only past the spread of the last size's own rounds: a size
+/// no faster than that is where the link is full. A size slower than both
+/// its neighbours is timed again before it is taken for the curve's end.
+/// Each size is also filled from pageable memory, its fastest round the
+/// fill rate.
 fn measure(stream: *mut c_void, largest: usize) -> Result<Rates> {
     let page = page_bytes();
     let crossing = |src: &Pinned, dst: &Buffer, bytes: usize| -> Result<f64> {
@@ -140,40 +147,70 @@ fn measure(stream: *mut c_void, largest: usize) -> Result<Rates> {
         crate::device::ctx::sync(stream)?;
         Ok(started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE))
     };
-    let twice = |src: &Pinned, dst: &Buffer, bytes: usize| -> Result<(f64, f64)> {
-        let (a, b) = (crossing(src, dst, bytes)?, crossing(src, dst, bytes)?);
-        // Bytes a second at the slower and at the faster of the two.
-        Ok((bytes as f64 / a.max(b), bytes as f64 / a.min(b)))
-    };
-    let filling = |from: &[u8], into: &Pinned| -> f64 {
-        let started = Instant::now();
-        // SAFETY: `into` holds `from.len()` bytes and nothing reads it.
-        unsafe { core::ptr::copy_nonoverlapping(from.as_ptr(), into.host(), from.len()) };
-        from.len() as f64 / started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE)
-    };
-    let (src, dst) = (Pinned::mapped_uninit(page)?, Buffer::zeroed_apart(page)?);
-    crossing(&src, &dst, page)?;
-    let latency = crossing(&src, &dst, page)?;
-    let (mut at, mut best) = (page, twice(&src, &dst, page)?);
     let mut fill = 0.0f64;
-    let mut bytes = page;
-    while bytes < largest {
-        bytes = (bytes * 2).min(largest);
+    // The fastest and the slowest round of a copy of `bytes`, and the
+    // fastest of filling it.
+    let mut fastest = |bytes: usize| -> Result<(f64, f64)> {
         let (src, dst) = (Pinned::mapped_uninit(bytes)?, Buffer::zeroed_apart(bytes)?);
         // A pageable source, its pages made before it is timed.
         let from = vec![1u8; bytes];
-        fill = fill.max(filling(&from, &src));
-        let rates = twice(&src, &dst, bytes)?;
-        if rates.0 <= best.1 {
+        let (mut best, mut worst) = (0.0f64, f64::INFINITY);
+        for _ in 0..ROUNDS {
+            let started = Instant::now();
+            // SAFETY: `src` holds `bytes` and no copy reads it now.
+            unsafe { core::ptr::copy_nonoverlapping(from.as_ptr(), src.host(), bytes) };
+            let filled = started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE);
+            fill = fill.max(bytes as f64 / filled);
+            let rate = bytes as f64 / crossing(&src, &dst, bytes)?;
+            (best, worst) = (best.max(rate), worst.min(rate));
+        }
+        Ok((best, worst))
+    };
+    let (src, dst) = (Pinned::mapped_uninit(page)?, Buffer::zeroed_apart(page)?);
+    crossing(&src, &dst, page)?;
+    let latency = (0..ROUNDS)
+        .map(|_| crossing(&src, &dst, page))
+        .collect::<Result<Vec<f64>>>()?
+        .into_iter()
+        .fold(f64::INFINITY, f64::min);
+    drop((src, dst));
+    // `(bytes, fastest, slowest)` a size.
+    let first = fastest(page)?;
+    let mut curve = vec![(page, first.0, first.1)];
+    // A rise past the spread of `last`'s rounds.
+    let rises = |at: f64, last: (usize, f64, f64)| at > last.1 + (last.1 - last.2);
+    while let Some(&last) = curve.last()
+        && last.0 < largest
+    {
+        let next = (last.0 * 2).min(largest);
+        let at = fastest(next)?;
+        if rises(at.0, last) {
+            curve.push((next, at.0, at.1));
+            continue;
+        }
+        // No rise: a dip if the size past it rises beyond the last again.
+        let past = (next * 2).min(largest);
+        if past == next {
             break;
         }
-        (at, best) = (bytes, rates);
+        let beyond = fastest(past)?;
+        if rises(beyond.0, last) && beyond.0 > at.0 {
+            let again = fastest(next)?;
+            let retimed = if again.0 > at.0 { again } else { at };
+            curve.push((next, retimed.0, retimed.1));
+            curve.push((past, beyond.0, beyond.1));
+            continue;
+        }
+        break;
     }
+    let (saturated, copy) = curve
+        .iter()
+        .fold((page, 0.0), |best, &(bytes, rate, _)| if rate > best.1 { (bytes, rate) } else { best });
     Ok(Rates {
         latency,
-        copy: best.1,
-        saturated: at,
-        fill: if fill > 0.0 { fill } else { best.1 },
+        copy,
+        saturated,
+        fill: if fill > 0.0 { fill } else { copy },
     })
 }
 

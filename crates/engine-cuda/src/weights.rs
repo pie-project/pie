@@ -621,6 +621,7 @@ impl Weights {
                 .map(|(_, place)| usize::try_from(place.bytes).unwrap_or(usize::MAX))
                 .max()
                 .unwrap_or(0);
+            let opening = std::time::Instant::now();
             let ring = match largest {
                 0 => None,
                 _ => match crate::landing_ring::Ring::open(largest) {
@@ -628,12 +629,13 @@ impl Weights {
                         eprintln!(
                             "engine-cuda: the weights cross by a pinned ring of 2 x {} KiB: the \
                              link moves {:.1} GB/s from {} KiB copies past a {:.1} us latency; \
-                             a slot fills at {:.1} GB/s",
+                             a slot fills at {:.1} GB/s (measured in {} ms)",
                             ring.slot_bytes() >> 10,
                             ring.rates.copy / 1e9,
                             ring.rates.saturated >> 10,
                             ring.rates.latency * 1e6,
                             ring.rates.fill / 1e9,
+                            opening.elapsed().as_millis(),
                         );
                         Some(ring)
                     }
@@ -661,6 +663,7 @@ impl Weights {
             // live (each buffer until its last use), never a host image of
             // the whole model.
             let streaming = compile_streaming(&metadata, contract, target)?;
+            let landing_started = std::time::Instant::now();
             Execution::new(&streaming, snapshot)
                 .streaming()
                 .sink(&mut sink)
@@ -668,6 +671,10 @@ impl Weights {
             if let Some(ring) = &sink.ring {
                 ring.drain()?;
             }
+            eprintln!(
+                "engine-cuda: the weights landed in {} ms",
+                landing_started.elapsed().as_millis()
+            );
             sink.landed
         };
 
