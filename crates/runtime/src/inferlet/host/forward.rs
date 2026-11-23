@@ -1596,7 +1596,16 @@ impl ProcessCtx {
         };
         let order = order.to_vec();
         if let Err(error) =
-            crate::pipeline::fire::relist_beam(self, kv.model, kv.engine, kv.id, u64::from(f0), &order).await
+            crate::pipeline::fire::relist_beam(
+                self,
+                kv.model,
+                kv.engine,
+                kv.id,
+                Some(kv.suspend_handle()),
+                u64::from(f0),
+                &order,
+            )
+            .await
         {
             return Ok(Err(format!("adopt-beam: kv: {error}")));
         }

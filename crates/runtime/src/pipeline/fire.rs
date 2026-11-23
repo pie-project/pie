@@ -474,6 +474,7 @@ pub(crate) async fn relist_beam<C: FireContext>(
     model: usize,
     engine: usize,
     ws: crate::store::kv::page_table::WorkingSetId,
+    leases: Option<crate::store::kv::working_set::KvSuspendHandle>,
     f0: u64,
     order: &[u32],
 ) -> Result<(), String> {
@@ -488,6 +489,13 @@ pub(crate) async fn relist_beam<C: FireContext>(
     ctx.settle_pipeline_tail()
         .await
         .map_err(|error| format!("a beam's finish waiting for its fires to land: {error:#}"))?;
+    // And every fire the set itself has submitted, on any pipeline (a closed
+    // one's run-ahead fires included, which the process's tail no longer
+    // lists): each holds a lease on the set until it lands (the M1's run 12:
+    // a fire 4 s after the finish carried the set's pre-relist reserve).
+    if let Some(leases) = &leases {
+        leases.quiesce().await;
+    }
     loop {
         let needs = match crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
             kv.relist_beam_needs(ws, f0, order)
@@ -6886,7 +6894,7 @@ pub(crate) mod lifecycle_tests {
             resources: ResourceTable::new(),
             landed: Some(landed),
         };
-        let finish = relist_beam(&mut context, model, 0, ws, 1, &[2, 0]);
+        let finish = relist_beam(&mut context, model, 0, ws, None, 1, &[2, 0]);
         tokio::pin!(finish);
         for _ in 0..20 {
             tokio::select! {

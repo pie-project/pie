@@ -2243,6 +2243,15 @@ impl KvPageTable {
         Ok(())
     }
 
+    /// Every live working set whose table resolves now, and the device page
+    /// ids it names: what a page given back must be in none of (a check).
+    pub fn every_resident_table(&self) -> Vec<(WorkingSetId, Vec<u32>)> {
+        self.working_sets
+            .iter()
+            .filter_map(|(ws, _)| Some((ws, self.flatten(ws).ok()?.iter().map(|page| page.0).collect())))
+            .collect()
+    }
+
     /// The device page ids `working_sets` reach that are resident, for a
     /// debug line.
     pub fn resident_ids(&self, working_sets: &HashSet<WorkingSetId>) -> Vec<u32> {

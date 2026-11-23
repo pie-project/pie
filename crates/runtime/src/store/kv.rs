@@ -1626,6 +1626,7 @@ impl KvStore {
                 KvPageBacking::OnDisk(slot) => disk.push(slot),
             }
         }
+        self.check_given_back(&device, "reserved backings given back");
         self.pool.release_reserved(device);
         self.host_pool.release_reserved(host);
         self.release_disk(disk);
@@ -2249,6 +2250,14 @@ impl KvStore {
         if !backings.is_empty() {
             tracing::debug!(target: "runtime::store::kv", epoch, ?backings, "backings let go");
         }
+        let resident: Vec<PhysicalKvPageId> = backings
+            .iter()
+            .filter_map(|backing| match backing {
+                KvPageBacking::Resident(id) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        self.check_given_back(&resident, "backings let go");
         let mut resident = Vec::new();
         let mut swapped = Vec::new();
         for backing in backings {
@@ -2695,6 +2704,34 @@ impl KvStore {
             }
         }
         Ok(RelistNeeds::Copies(shared))
+    }
+
+    /// Device pages given back must be in no live set's table: one still
+    /// named reads or writes a page another may take (the M1's runs 11 and
+    /// 12: a set's own table named a page whose segment was released). Said
+    /// at ERROR naming the set and the page, in a debug build or with
+    /// PIE_CHECK_SLOT_REFS (a walk of every set's table a give-back).
+    fn check_given_back(&self, ids: &[PhysicalKvPageId], what: &str) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if ids.is_empty()
+            || !*ON.get_or_init(|| {
+                cfg!(debug_assertions) || std::env::var_os("PIE_CHECK_SLOT_REFS").is_some()
+            })
+        {
+            return;
+        }
+        let given: std::collections::HashSet<u32> = ids.iter().map(|id| id.0).collect();
+        for (ws, pages) in self.table.every_resident_table() {
+            if let Some(page) = pages.iter().find(|page| given.contains(page)) {
+                tracing::error!(
+                    target: "runtime::store::kv",
+                    ?ws,
+                    page,
+                    what,
+                    "kv: a page given back is still named by a live set's table"
+                );
+            }
+        }
     }
 
     /// The slot refs of `ws`'s pages on the device as its table stands now
@@ -3361,8 +3398,9 @@ impl KvStore {
         // newest fire's epoch: held there, they stood as deficit while
         // unrelated fires ran, and each suspend that landed so was followed
         // by as many more (Qwen3-8B c256: 841 suspends where main moves 338).
-        self.pool
-            .release_reserved(txn.pages.into_iter().map(|page| page.gpu_id).collect());
+        let given: Vec<PhysicalKvPageId> = txn.pages.iter().map(|page| page.gpu_id).collect();
+        self.check_given_back(&given, "a suspend's commit");
+        self.pool.release_reserved(given);
         self.end_move(freed);
         Ok(count)
     }

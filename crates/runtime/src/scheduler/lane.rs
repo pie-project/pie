@@ -330,6 +330,30 @@ fn unassigned_ref(engine_idx: usize, frame: &crate::engine::FrameFire) -> Option
             ]
             .into_iter()
             .find_map(|(what, found)| found.map(|found| (what, found, "which the pool has not handed out to its shape")));
+            if !lane.reserve.is_empty() {
+                tracing::debug!(
+                    lane = lane_at,
+                    ?instance,
+                    ?set,
+                    reserve = lane.reserve.len(),
+                    first = ?lane.reserve.iter().take(8).collect::<Vec<_>>(),
+                    "a beam lane at the engine's door: its stamping set and reserve"
+                );
+            }
+            // A lane whose set's table does not resolve now (its pages below,
+            // or the set gone) names pages its set no longer holds there: it
+            // does not fire (skipped, the check was passed by a fire whose
+            // set had been suspended since its stamp: the M1's run 12).
+            if let Some(ws) = set
+                && sets.get(&ws).is_some_and(Option::is_none)
+            {
+                return Some(format!(
+                    "step {at}'s lane {lane_at} (instance {instance:?}, set {ws:?}, {}) names its \
+                     set's pages, and its set's table does not resolve now (its pages below or \
+                     the set released): a request built before its set moved",
+                    fire_of(lane_at)
+                ));
+            }
             // Its kv refs (its list's translation or pages, its reserve) are
             // pages its own set holds now, not merely someone's.
             let owned = || {
