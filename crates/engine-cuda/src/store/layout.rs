@@ -921,6 +921,102 @@ pub struct FixedShape {
     /// The id tables a fire stages a lane: each a run of the record's slots
     /// some row's pieces lie in, the rows that share a run sharing a table.
     pub tables: Vec<Vec<u32>>,
+    /// The windowed layers' rings the record holds (CONTRACT-BC 19, 21),
+    /// where the load serves them as ring + buffer.
+    pub ring: Option<Ring>,
+}
+
+/// The windowed layers' rings in a record: `pages` pages laid exactly as a
+/// window-buffer slot is (every windowed row's `P` rows, layer-major), so a
+/// kernel reads a ring page by a page id of the window buffer's grain. Row
+/// `r` folded lies on ring page `(r / P) mod pages`; `pages * P` rows are
+/// the widest window rounded up to a page and one page more (the rows a
+/// lane's own fire writes past its window before it folds). A record piece
+/// holds `per_piece` ring pages, the last piece padded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ring {
+    /// Ring pages: `ceil(W / P) + 1` of the widest window `W`.
+    pub pages: u32,
+    /// Ring pages a record piece holds.
+    pub per_piece: u32,
+    /// A ring page's bytes: a window-buffer slot's.
+    pub page_bytes: u64,
+    /// Rows a page holds: the window buffer's `P`.
+    pub page_rows: u32,
+    /// Each windowed row's window, by cache row, as its slot lays them.
+    pub windows: Vec<(u32, u32)>,
+}
+
+impl Ring {
+    /// The rows the ring holds.
+    #[must_use]
+    pub const fn rows(&self) -> u32 {
+        self.pages * self.page_rows
+    }
+
+    /// Ring page `page`'s record piece and its place in it.
+    #[must_use]
+    pub const fn place(&self, page: u32) -> (u32, u32) {
+        (page / self.per_piece, page % self.per_piece)
+    }
+}
+
+impl FixedShape {
+    /// The record of a load that holds no recurrent state but serves its
+    /// windowed rows as ring + buffer: the rings alone, laid in pieces of
+    /// whole window-buffer pages. `buffer` is the window buffer's shape
+    /// (every windowed row, one window list merged); `windows` each
+    /// windowed row's window by cache row.
+    pub fn ring_only(
+        buffer: &SlotShape,
+        chunk_bytes: u64,
+        windows: Vec<(u32, u32)>,
+    ) -> Result<FixedShape> {
+        let page_rows = buffer.tokens.max(1);
+        let widest = windows.iter().map(|&(_, w)| w).max().unwrap_or(0);
+        if widest == 0 {
+            return Err(Fault::program(
+                "store::layout",
+                "rings laid for a load with no windowed row",
+            ));
+        }
+        let pages = widest.div_ceil(page_rows) + 1;
+        let fit = u32::try_from(chunk_bytes / buffer.slot_bytes.max(1)).unwrap_or(u32::MAX);
+        if fit == 0 {
+            return Err(Fault::program(
+                "store::layout",
+                format!(
+                    "a window-buffer page of {} bytes fits no chunk of {chunk_bytes}",
+                    buffer.slot_bytes
+                ),
+            ));
+        }
+        let per_piece = pages.min(fit);
+        let slot_bytes = u64::from(per_piece) * buffer.slot_bytes;
+        Ok(FixedShape {
+            slot: SlotShape {
+                id: FIXED,
+                tokens: 0,
+                slot_bytes,
+                per_chunk: u32::try_from(chunk_bytes / slot_bytes).unwrap_or(u32::MAX).max(1),
+                grain: gcd(chunk_bytes, slot_bytes),
+                window: None,
+                rows: Vec::new(),
+                pools: Vec::new(),
+            },
+            pieces: pages.div_ceil(per_piece),
+            rows: Vec::new(),
+            tables: Vec::new(),
+            ring: Some(Ring {
+                pages,
+                per_piece,
+                page_bytes: buffer.slot_bytes,
+                page_rows,
+                windows,
+            }),
+        })
+    }
+
 }
 
 impl FixedShape {
@@ -993,6 +1089,7 @@ impl FixedShape {
             pieces: (*pieces_per_ws).max(1),
             rows,
             tables,
+            ring: None,
         })
     }
 

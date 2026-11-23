@@ -797,6 +797,19 @@ impl Shell {
         self.pools.state_slot_bytes()
     }
 
+    /// The bytes a record takes, its rings' among them.
+    #[must_use]
+    pub fn record_bytes(&self) -> u64 {
+        self.pools.record_bytes()
+    }
+
+    /// The windowed layers the record holds the rings of; none where the
+    /// load serves its windowed rows by window lists.
+    #[must_use]
+    pub fn windowed_layers(&self) -> Vec<engine::chunk::WindowedLayer> {
+        self.pools.windowed_layers()
+    }
+
     pub fn state_bytes(&mut self, slot: u32) -> Result<Vec<u8>> {
         self.pools.state_bytes(self.device.stream(), slot)
     }

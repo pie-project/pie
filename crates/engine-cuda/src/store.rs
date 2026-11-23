@@ -1050,17 +1050,21 @@ impl Pools {
         experts: &[usize],
         rows: bool,
         one_window: bool,
+        windowed_state: bool,
     ) -> Result<Pools> {
         let pool = PhysicalPool::open(device, ceiling)?;
-        let layout = lay(
+        let mut layout = lay(
             trace,
             &paging,
             budgets,
             chunk_bytes,
             experts,
             rows,
-            one_window,
+            one_window || windowed_state,
         )?;
+        if windowed_state {
+            ring_record(&mut layout, trace)?;
+        }
         let mut shapes = Vec::with_capacity(trace.caches.len());
         let mut windows_of: Vec<(u32, u8)> = Vec::new();
 
@@ -2022,6 +2026,59 @@ impl Pools {
                 Shape::Kv { .. } => 0,
             })
             .sum::<u64>()
+    }
+
+    /// The windowed layers a record holds the rings of (CONTRACT-BC 21),
+    /// where the load serves them as ring + buffer: each windowed cache row
+    /// (its `layer`) with its window and its share of the ring's bytes, the
+    /// last row's share padded to the pieces the record takes.
+    #[must_use]
+    pub fn windowed_layers(&self) -> Vec<engine::chunk::WindowedLayer> {
+        let Some((fixed, ring)) = self.ring() else {
+            return Vec::new();
+        };
+        let rows = u64::from(ring.rows());
+        let mut layers: Vec<engine::chunk::WindowedLayer> = ring
+            .windows
+            .iter()
+            .filter_map(|&(row, window)| match self.shapes.get(row as usize) {
+                Some(&Shape::Kv {
+                    dtype,
+                    keys_width,
+                    values_width,
+                    ..
+                }) => Some(engine::chunk::WindowedLayer {
+                    layer: row,
+                    window,
+                    sinks: 0,
+                    bytes: rows * (keys_width + values_width) * u64::from(elem_size(dtype)),
+                }),
+                _ => None,
+            })
+            .collect();
+        let laid: u64 = layers.iter().map(|layer| layer.bytes).sum();
+        let held = fixed.slot.slot_bytes * u64::from(fixed.pieces);
+        if let Some(last) = layers.last_mut() {
+            last.bytes += held.saturating_sub(laid);
+        }
+        layers
+    }
+
+    /// The record's rings, where the load serves its windowed rows as ring
+    /// + buffer.
+    #[must_use]
+    pub fn ring(&self) -> Option<(&layout::FixedShape, &layout::Ring)> {
+        let fixed = self.chunks.layout().fixed.as_ref()?;
+        Some((fixed, fixed.ring.as_ref()?))
+    }
+
+    /// The bytes a record takes: its recurrent rows' and its rings'.
+    #[must_use]
+    pub fn record_bytes(&self) -> u64 {
+        self.state_slot_bytes()
+            + self.ring().map_or(0, |(fixed, _)| {
+                fixed.slot.slot_bytes * u64::from(fixed.pieces)
+            })
     }
 
     #[must_use]
@@ -5117,6 +5174,50 @@ impl Pools {
             self.ensure_windowed(window_pages.iter().flatten().copied())
         }
     }
+}
+
+/// Lays the windowed rows' rings as the record of a load served as ring +
+/// buffer (CONTRACT-BC 19, 21): its one window list (every windowed row,
+/// merged) is the window buffer, and the record holds the rings, pages laid
+/// as the buffer's slots. A load whose record holds recurrent state too is
+/// not served so yet.
+fn ring_record(layout: &mut layout::Layout, trace: &Trace) -> Result<()> {
+    let windows: Vec<(u32, u32)> = trace
+        .caches
+        .iter()
+        .enumerate()
+        .filter_map(|(row, cache)| match cache {
+            CacheRow::Kv {
+                window: Some(window),
+                ..
+            } => Some((row as u32, *window)),
+            _ => None,
+        })
+        .collect();
+    if windows.is_empty() {
+        return Ok(());
+    }
+    let [buffer] = layout.windows.as_slice() else {
+        return Err(Fault::Unbound {
+            what: format!(
+                "windowed rows in {} window lists, where ring + buffer lays them in one",
+                layout.windows.len()
+            ),
+        });
+    };
+    if layout.fixed.is_some() {
+        return Err(Fault::Unbound {
+            what: "windowed rows as ring + buffer beside recurrent state in one record, which \
+                   this engine does not lay yet"
+                .into(),
+        });
+    }
+    layout.fixed = Some(layout::FixedShape::ring_only(
+        buffer,
+        layout.chunk_bytes,
+        windows,
+    )?);
+    Ok(())
 }
 
 /// How `trace`'s kv rows sit in the state pool's chunks: the compiler's

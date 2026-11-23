@@ -33,6 +33,11 @@ pub struct Diagnostics {
     /// a row of a narrower window then keeps pages its kernels no longer
     /// read. The same logits as a list a window.
     pub one_window: bool,
+    /// Serves the windowed kv rows as ring + buffer (CONTRACT-BC 19, 21):
+    /// each windowed layer's last folded rows a ring in the lane's record,
+    /// its unfolded rows in the window buffer. The window lists' path until
+    /// the windowed-state change integrates.
+    pub windowed_state: bool,
     /// Copies between the device and the host tier ride the compute stream,
     /// ahead of every fire after them, not the swap stream beside those
     /// fires: to weigh the overlap.
@@ -77,6 +82,7 @@ impl Default for Diagnostics {
             dense_experts: false,
             untabled_experts: false,
             one_window: false,
+            windowed_state: false,
             tier_inline: false,
             unwritten_nan: false,
         }
@@ -139,6 +145,9 @@ impl Diagnostics {
         if self.one_window {
             words.push("one-window".to_string());
         }
+        if self.windowed_state {
+            words.push("windowed-state".to_string());
+        }
         if self.tier_inline {
             words.push("tier-inline".to_string());
         }
@@ -191,6 +200,7 @@ impl std::str::FromStr for Diagnostics {
                 "dense-experts" => diag.dense_experts = switch(word, value)?,
                 "untabled-experts" => diag.untabled_experts = switch(word, value)?,
                 "one-window" => diag.one_window = switch(word, value)?,
+                "windowed-state" => diag.windowed_state = switch(word, value)?,
                 "tier-inline" => diag.tier_inline = switch(word, value)?,
                 "unwritten-nan" => diag.unwritten_nan = switch(word, value)?,
                 "fuse-chains" => diag.fuse_chains = switch(word, value)?,

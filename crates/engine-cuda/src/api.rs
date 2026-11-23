@@ -785,7 +785,9 @@ impl Engine for Cuda {
             shell.drop_rungs();
         }
         let mut chunk_facts = shell.chunk_facts().map_err(fault)?;
-        chunk_facts.record_bytes = shell.state_slot_bytes();
+        chunk_facts.record_bytes = shell.record_bytes();
+        chunk_facts.windowed = shell.windowed_layers();
+        let windowed_state = !chunk_facts.windowed.is_empty();
         chunk_facts.disk_persistent = residency.disk_kv_persistent && chunk_facts.disk_chunks > 0;
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, arena_bytes, pool_bytes, input_bytes) = shell.footprint();
@@ -852,7 +854,7 @@ impl Engine for Cuda {
             kv_handle,
             media_encode: false,
             rs_verbs: true,
-            windowed_state: false,
+            windowed_state,
             rs_snapshots: if state_rows && shell.lands_snapshots() {
                 crate::store::rs::SNAPSHOTS
             } else {

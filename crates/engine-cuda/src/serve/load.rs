@@ -1358,6 +1358,7 @@ impl Shell {
             },
             !boot.knobs.dense_weights(),
             boot.knobs.diagnostics.one_window,
+            boot.knobs.diagnostics.windowed_state,
         )?;
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(

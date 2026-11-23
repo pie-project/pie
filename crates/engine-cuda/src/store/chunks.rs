@@ -998,15 +998,25 @@ impl Chunks {
                 },
             ));
         }
+        // Where the record holds the rings, the one window list is the
+        // window buffer (CONTRACT-BC 21).
+        let ringed = layout
+            .fixed
+            .as_ref()
+            .is_some_and(|fixed| fixed.ring.is_some());
         for window in &layout.windows {
-            shapes.push(shape(
+            let mut stated = shape(
                 window,
                 SlotKind::List {
                     tokens: window.tokens,
                     rate: 1,
-                    window: window.window,
+                    window: if ringed { None } else { window.window },
                 },
-            ));
+            );
+            if ringed {
+                stated.role = engine::chunk::SlotRole::WindowBuffer;
+            }
+            shapes.push(stated);
         }
         if let Some(rs) = &layout.rs {
             let mut stated = shape(
