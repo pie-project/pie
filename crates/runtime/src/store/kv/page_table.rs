@@ -2243,6 +2243,23 @@ impl KvPageTable {
         Ok(())
     }
 
+    /// The device page ids `working_sets` reach that are resident, for a
+    /// debug line.
+    pub fn resident_ids(&self, working_sets: &HashSet<WorkingSetId>) -> Vec<u32> {
+        let Ok(locations) = self.locations(working_sets) else {
+            return Vec::new();
+        };
+        let mut ids: Vec<u32> = locations
+            .into_iter()
+            .filter_map(|location| match self.backing_at(&location).ok()? {
+                KvPageBacking::Resident(id) => Some(id.0),
+                _ => None,
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
     fn locations(
         &self,
         working_sets: &HashSet<WorkingSetId>,

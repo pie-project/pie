@@ -910,6 +910,11 @@ impl KvStore {
             moves.iter().for_each(|&(_, _, slot)| persisted.back(slot));
         }
         let freed = moves.len();
+        tracing::debug!(
+            target: "runtime::store::kv",
+            pages = ?moves.iter().map(|&(_, gpu, slot)| (gpu.0, slot.0)).collect::<Vec<_>>(),
+            "cache-only device pages settled on their disk copies"
+        );
         self.pool
             .recycle_after_epoch(moves.into_iter().map(|(_, gpu, _)| gpu).collect(), epoch);
         // With no fire in flight the epoch has retired already: the pages
@@ -1920,6 +1925,7 @@ impl KvStore {
             self.hints.remove(&owner);
         }
         let freed = self.table.release_working_set_backings(ws);
+        tracing::debug!(target: "runtime::store::kv", ?ws, ?freed, "a set released");
         self.recycle_backings(freed, epoch);
         // What no fire in flight reads is free now, not at a next fire.
         self.retire_idle();
@@ -2115,6 +2121,7 @@ impl KvStore {
             return Err(KvStoreError::MoveInFlight);
         }
         let freed = self.table.truncate(ws, rows, self.page_size)?;
+        tracing::debug!(target: "runtime::store::kv", ?ws, rows, ?freed, "a set cut");
         let epoch = self.retired_through();
         self.recycle_backings(freed, epoch);
         self.refresh_flat(ws);
@@ -2239,6 +2246,9 @@ impl KvStore {
     }
 
     fn recycle_backings(&mut self, backings: Vec<KvPageBacking>, epoch: u64) {
+        if !backings.is_empty() {
+            tracing::debug!(target: "runtime::store::kv", epoch, ?backings, "backings let go");
+        }
         let mut resident = Vec::new();
         let mut swapped = Vec::new();
         for backing in backings {
@@ -2743,6 +2753,15 @@ impl KvStore {
             .collect();
         let mut freed = self.table.replace_tail(ws, f0, pages)?;
         freed.retain(|backing| !matches!(backing, KvPageBacking::Resident(id) if listed.contains(id)));
+        tracing::debug!(
+            target: "runtime::store::kv",
+            ?ws,
+            f0,
+            listed = ?listed.iter().map(|page| page.0).collect::<Vec<_>>(),
+            ?freed,
+            copies = ?copies.iter().map(|&(from, to)| (from.0, to.0)).collect::<Vec<_>>(),
+            "a beam's finish relisted its set's tail"
+        );
         // Copies made and not named (their page turned private meanwhile)
         // go back at once: no fire read them.
         let unused: Vec<PhysicalKvPageId> = copies
@@ -2765,13 +2784,26 @@ impl KvStore {
     pub fn flat_table(&mut self, ws: WorkingSetId) -> Result<&[PhysicalKvPageId], KvStoreError> {
         if !self.flat.get(&ws).is_some_and(Option::is_some) {
             let flat = self.table.flatten(ws)?;
+            tracing::debug!(
+                target: "runtime::store::kv",
+                ?ws,
+                pages = ?flat.iter().map(|page| page.0).collect::<Vec<_>>(),
+                "a set's flat table rebuilt"
+            );
             self.flat.insert(ws, Some(flat));
         }
         Ok(self.flat[&ws].as_deref().expect("just populated"))
     }
 
     fn refresh_flat(&mut self, ws: WorkingSetId) {
-        self.flat.insert(ws, self.table.flatten(ws).ok());
+        let flat = self.table.flatten(ws).ok();
+        tracing::debug!(
+            target: "runtime::store::kv",
+            ?ws,
+            pages = ?flat.as_ref().map(|flat| flat.iter().map(|page| page.0).collect::<Vec<_>>()),
+            "a set's flat table refreshed"
+        );
+        self.flat.insert(ws, flat);
     }
 
     pub fn page_hash_at(
@@ -3304,6 +3336,13 @@ impl KvStore {
             self.keep_demoted(landed, records);
         }
         let count = txn.pages.len();
+        tracing::debug!(
+            target: "runtime::store::kv",
+            sets = ?txn.working_sets,
+            moved = ?txn.pages.iter().map(|page| page.gpu_id.0).collect::<Vec<_>>(),
+            left_resident = ?self.table.resident_ids(&txn.working_sets),
+            "a suspend committed: its device pages go back, those left resident another reads"
+        );
         // No fire still in flight can read these pages: the suspend waited
         // for every fire of the process to settle (its fence is up and its
         // leases quiesced), the pages are its own (a shared page does not
@@ -3396,6 +3435,13 @@ impl KvStore {
         for &ws in &txn.working_sets {
             self.refresh_flat(ws);
         }
+        tracing::debug!(
+            target: "runtime::store::kv",
+            sets = ?txn.working_sets,
+            placed = ?txn.pages.iter().map(|page| page.gpu_id.0).collect::<Vec<_>>(),
+            resident = ?self.table.resident_ids(&txn.working_sets),
+            "a restore committed"
+        );
         let count = txn.pages.len();
         self.release_swapped(txn.pages.into_iter().map(|page| page.swapped));
         self.end_move(freed);

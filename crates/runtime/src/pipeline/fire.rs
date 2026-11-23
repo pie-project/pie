@@ -479,10 +479,21 @@ pub(crate) async fn relist_beam<C: FireContext>(
 ) -> Result<(), String> {
     let stores = crate::store::registry::get(model, engine);
     loop {
-        let needs = crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
+        let needs = match crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
             kv.relist_beam_needs(ws, f0, order)
-        })
-        .map_err(|error| error.to_string())?;
+        }) {
+            Ok(needs) => needs,
+            // Its pages went below with its process (evicted since its
+            // last fire): the finish waits for its restore, as a fire does,
+            // and goes then.
+            Err(crate::store::kv::KvStoreError::Table(
+                crate::store::kv::page_table::KvTableError::NonResident { .. },
+            )) => {
+                settle_and_wait_resident(ctx).await?;
+                continue;
+            }
+            Err(error) => return Err(error.to_string()),
+        };
         let shared = match needs {
             crate::store::kv::RelistNeeds::MoveEnd(ended) => {
                 let notified = ended.notified();
@@ -538,6 +549,16 @@ pub(crate) async fn relist_beam<C: FireContext>(
         drop(grant);
         match done {
             Ok(true) => return Ok(()),
+            // Evicted while the copies ran: they go back, and the finish
+            // waits for its restore.
+            Err(crate::store::kv::KvStoreError::Table(
+                crate::store::kv::page_table::KvTableError::NonResident { .. },
+            )) => {
+                crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
+                    kv.release_device_reservation(copies.into_iter().map(|(_, copy)| copy).collect());
+                });
+                settle_and_wait_resident(ctx).await?;
+            }
             // A move began while the copies ran: they go back, and the
             // finish waits for its end.
             Ok(false) => crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
