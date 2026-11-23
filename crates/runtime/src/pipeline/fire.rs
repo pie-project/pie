@@ -6899,6 +6899,10 @@ pub(crate) mod lifecycle_tests {
             .expect("the finish goes once the frame landed")
             .expect("relisted");
         assert_eq!(table(&stores), vec![before[0], before[3], before[1]]);
+        // The next fire's translation and reserve are stamped from this
+        // table: they name the listed pages alone.
+        let stamped = working_set_flat_table(&stores, ws).expect("the set's table");
+        assert_eq!(stamped, [before[0].0, before[3].0, before[1].0]);
         Ok(())
     }
 

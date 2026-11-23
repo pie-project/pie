@@ -249,8 +249,12 @@ fn past_rung(held: u32, frame: &crate::engine::FrameFire) -> Option<String> {
 
 fn unassigned_ref(engine_idx: usize, frame: &crate::engine::FrameFire) -> Option<String> {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // Always in a debug build: a stale request (built before the stores let
-    // its slots go, fired after) is named at its source, whatever the path.
+    // Always in a debug build, and with PIE_CHECK_SLOT_REFS in any: a stale
+    // request (built before the stores let its slots go, fired after) is
+    // named at its source, whatever the path. A lane's tables hold its kv
+    // list's translation (a device-geometry lane's whole mapped table, the
+    // one Metal's beam plan resolves a group's pages through) and its window
+    // lists; its reserve and record are read beside them.
     if !*ON.get_or_init(|| {
         cfg!(debug_assertions) || std::env::var_os("PIE_CHECK_SLOT_REFS").is_some()
     }) {
@@ -898,7 +902,13 @@ impl Lane {
                             crate::store::shared::engine_rows(engine_idx),
                             &frame,
                         )
-                        .or_else(|| unassigned_ref(engine_idx, &frame));
+                        .or_else(|| {
+                            let stale = unassigned_ref(engine_idx, &frame);
+                            if let Some(why) = &stale {
+                                tracing::error!(engine = engine_idx, %why, "a fire names a slot the pool has not handed out: refused before the engine reads it");
+                            }
+                            stale
+                        });
                         let result = match engine.as_mut() {
                             // A fire wider than the rung the engine holds,
                             // or naming a slot nobody was handed, is refused

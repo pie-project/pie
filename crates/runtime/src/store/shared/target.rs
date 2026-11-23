@@ -731,6 +731,28 @@ impl SharedGrow {
                 Some(SegmentMove::ReleaseSpan { n }) => PoolOp::ReleaseSpan(n),
             };
             self.no_room.store(false, Ordering::Release);
+            // Every chunk an evacuation or compaction moves is held as it is
+            // sent: planned and applied under the pool's lock just now, one
+            // let go since moves as a free chunk the engine still copies.
+            // Said by name (the M1, race5 run 8: logicals 98 and 99 moved as
+            // sources 500 ms after the kv store gave their pages back).
+            if let PoolOp::Evacuate(evacuation) = &op {
+                let pool = self.shared.lock().unwrap();
+                let free: Vec<(u32, u32)> = evacuation
+                    .moves
+                    .iter()
+                    .copied()
+                    .filter(|&(logical, _)| !pool.pool().holds_chunk(logical))
+                    .collect();
+                if !free.is_empty() {
+                    tracing::error!(
+                        engine = self.engine,
+                        ?free,
+                        compaction = compacting.is_some(),
+                        "store: an evacuation sent moves chunks no one holds (logical, to)"
+                    );
+                }
+            }
             tracing::debug!(engine = self.engine, goal, ?op, "a segment move");
             let commit = match &op {
                 PoolOp::CommitSegments(prefix) => Some(*prefix),
