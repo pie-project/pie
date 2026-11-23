@@ -922,10 +922,16 @@ impl ResidencyPlanner {
             let quiet = self.with_inner(|inner| inner.nothing_in_flight());
             let held_by = self.held_by_state();
             let store = self.store_holders();
+            // What the pool's walker awaits and for how long: a walk stuck
+            // on a lane op's reply steps nothing, the head's asked
+            // compaction or grow never sent (the M1's run 10).
+            let walk = crate::store::shared::walk_waiting(self.port.locus().1)
+                .map_or_else(|| "nothing".to_string(), |(what, since)| format!("{what} since {since:?} ago"));
             tracing::warn!(
                 %pid,
                 kind,
                 quiet,
+                %walk,
                 %plan,
                 %blocked,
                 capped = %self.capped_line(),

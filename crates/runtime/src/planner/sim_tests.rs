@@ -4222,8 +4222,17 @@ fn binds_of_two_runs_beside_singles_restore_and_end() {
     let mut failed = 0;
     let mut coverage = Coverage::default();
     for seed in 0..seeds {
-        for (total, segment, length) in [(30, 6, 5), (36, 6, 6), (40, 8, 6), (48, 8, 8)] {
-            let mut workload = run_pieces_workload(seed, total, segment, length, 2, seed % 2 == 0);
+        for (total, segment, length, pieces) in [
+            (30, 6, 5, 2),
+            (36, 6, 6, 2),
+            (40, 8, 6, 2),
+            (48, 8, 8, 2),
+            // Three runs and the singles beside them (the M1's run 10: a
+            // restore of three runs of 30 and two single chunks).
+            (42, 6, 5, 3),
+            (48, 8, 6, 3),
+        ] {
+            let mut workload = run_pieces_workload(seed, total, segment, length, pieces, seed % 2 == 0);
             // Many binds, arriving close together.
             // The run program's state is resident (held across parks, as a
             // beam group's): a parked process's restore lays its runs again.
@@ -4245,7 +4254,7 @@ fn binds_of_two_runs_beside_singles_restore_and_end() {
             for failure in &failures {
                 failed += 1;
                 eprintln!(
-                    "SIM pieces seed={seed} total={total} segment={segment} run={length} step={} kind={} {}",
+                    "SIM pieces seed={seed} total={total} segment={segment} run={length}x{pieces} step={} kind={} {}",
                     failure.step,
                     failure.kind,
                     failure.line.chars().take(600).collect::<String>()
