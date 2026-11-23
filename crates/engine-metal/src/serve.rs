@@ -4930,17 +4930,30 @@ impl Shell {
                             lane.slot
                         ),
                     ));
+                } else if self.pools.ring().is_some() {
+                    // A lane with no fold and no ring on a ring + buffer load
+                    // (arming, the load's own fires, the pipeline walk): no
+                    // seat holds a run of window slots, and nothing reads what
+                    // such a fire computes, so every page it names is one
+                    // scratch page, the own-row region's first.
+                    let page_size = self.pools.window_paging(k).page_size.max(1);
+                    let (first, chunks) = self.own_top;
+                    if chunks == 0 {
+                        return Err(Fault::program(
+                            "serve::windowed",
+                            "a ring + buffer load with no own-row region for a fold-less lane"
+                                .to_string(),
+                        ));
+                    }
+                    let (_, id) = self.pools.window_slot_at(k, first, 0)?;
+                    let after = have.saturating_add(row.rows);
+                    vec![id; after.div_ceil(page_size).max(1) as usize]
                 } else {
-                    // A lane with no fold and no ring (arming, the load's own
-                    // fires, the pipeline walk): its own record, its seat's
-                    // run of window slots.
                     let page_size = u64::from(self.pools.window_paging(k).page_size.max(1));
                     let after = u64::from(have) + u64::from(row.rows);
                     let pages = u32::try_from(after.div_ceil(page_size).max(1)).unwrap_or(u32::MAX);
                     let refs = seated.windows.get(k).map_or(&[][..], Vec::as_slice);
-                    let seat = (!seated.refs || refs.is_empty() || self.pools.ring().is_some())
-                        .then_some((lane.slot, pages));
-                    let refs = if self.pools.ring().is_some() { &[][..] } else { refs };
+                    let seat = (!seated.refs || refs.is_empty()).then_some((lane.slot, pages));
                     self.pools.window_pages(k, refs, seat)?
                 });
             }
