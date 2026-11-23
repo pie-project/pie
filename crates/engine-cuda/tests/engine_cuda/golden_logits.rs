@@ -3625,3 +3625,44 @@ fn a_dense_model_reads_no_routed_or_recurrent_decision() {
         }
     }
 }
+
+/// CONTRACT-BC 19: a load serving its windowed rows as ring + buffer arms
+/// every composition it fires, as its window lists do (the arming pass's
+/// synthetic lanes fold on records of their own): `PIE_GOLDEN_MODELS`
+/// (default the mini Gemma and MiMo, windowed beside full attention, MiMo's
+/// routed), many seats.
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_windowed_arms() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    let cache = cache_dir();
+    let models = std::env::var("PIE_GOLDEN_MODELS").map_or_else(
+        |_| vec!["gemma4-e4b-mini-l6".to_string(), "mimo26-flash-mini".to_string()],
+        |_| models(),
+    );
+    for model in models {
+        let fixture = fixture(&model, &cache);
+        let mut knobs = knobs();
+        knobs.diagnostics.windowed_state = true;
+        let shell = load_lanes(&fixture, &cache, knobs, 16, None);
+        assert!(
+            !shell.windowed_layers().is_empty(),
+            "{model}: the load keeps rings"
+        );
+        let armed = shell.armed().expect("the load armed its lattice");
+        println!(
+            "windowed arms {model}: {} of {} compositions",
+            armed.armed, armed.wanted
+        );
+        assert!(
+            armed.wanted > 0 && armed.armed == armed.wanted,
+            "{model}: {} of {} compositions armed ({:?})",
+            armed.armed,
+            armed.wanted,
+            armed.last_refusal
+        );
+    }
+}
