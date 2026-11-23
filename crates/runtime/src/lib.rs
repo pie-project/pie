@@ -16,6 +16,11 @@ pub(crate) mod pipeline;
 pub mod planner;
 pub mod policy;
 pub mod rt;
+#[cfg(not(any(
+    target_arch = "wasm32",
+    all(target_vendor = "apple", not(target_os = "macos"))
+)))]
+pub(crate) mod sandbox_pool;
 pub mod scheduler;
 pub mod server;
 pub(crate) mod service;
