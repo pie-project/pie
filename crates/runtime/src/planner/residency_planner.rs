@@ -215,6 +215,7 @@ impl ResidencyPlanner {
             slots: total.slots.min(1),
             pages: total.pages.min(1),
             windows,
+            wbuf: 0,
         }
     }
 

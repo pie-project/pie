@@ -653,6 +653,7 @@ fn a_window_checkpoint_behind_the_fire_end_holds_what_its_windows_reach() {
 mod programs;
 mod span;
 mod tiers;
+mod windowed;
 
 /// What a grow waiter is short of.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
