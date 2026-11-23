@@ -871,6 +871,14 @@ where
         crate::backend::Context::host_room(self.shell.as_ref()?.device())
     }
 
+    fn committed_covers(&self) -> &'static [&'static str] {
+        B::committed_covers()
+    }
+
+    fn skips_measuring(&self) -> bool {
+        B::measuring(&self.boot) == engine::rates::Measuring::Skip
+    }
+
     fn cover_fingerprint(&self) -> Option<String> {
         let shell = self.shell.as_ref()?;
         match shell.cover_fingerprint(&B::measured_on(shell.device())) {
@@ -1006,7 +1014,7 @@ where
         // load of the same curves, model, rungs and build.
         if let Some(settled) = shell.take_settled() {
             let rates = profile::fire::Rates {
-                dense_settled: Some(settled),
+                dense_settled: vec![settled],
                 ..profile::fire::Rates::default()
             };
             if let Err(why) = B::save_rates(shell.device(), &self.boot, &rates) {
@@ -1906,7 +1914,13 @@ impl<B: Host> Gpu<B> {
             }
         }
 
-        let guests = B::guests(self, submission)?;
+        // A deferred step's passes go behind its forward from the engine's
+        // thread; none runs on its landing.
+        let guests = if defers {
+            None
+        } else {
+            B::guests(self, submission)?
+        };
 
         let mut reads: Vec<Vec<String>> = vec![Vec::new(); submission.lanes.len()];
         // Each lane's score room: its first attachment's pair's, where that
@@ -2151,7 +2165,7 @@ impl<B: Host> Gpu<B> {
                     })
                     .collect();
                 let check = crate::settle::FedCheck::new(
-                    shell.token_row_reader(prepared.arm),
+                    <B as crate::serve::Serve>::token_row_reader(shell, prepared.arm),
                     lanes,
                     vocab,
                 );

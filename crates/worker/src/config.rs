@@ -94,6 +94,13 @@ impl Config {
     ///
     /// An engine flavor with no diagnostics record. A flag that quietly did
     /// nothing would be the same silence the typed record exists to end.
+    /// `pie serve --no-measure`: the load times nothing (`[engine] measure
+    /// = false`), refused by name on an engine that does not skip yet.
+    pub fn skip_measuring(&mut self) -> Result<()> {
+        self.engine.measure = false;
+        self.engine.validate()
+    }
+
     pub fn state_diagnostics(&mut self, words: &str) -> Result<()> {
         match self.engine.kind {
             EngineKind::Cuda | EngineKind::Metal => {
@@ -897,6 +904,15 @@ pub struct EngineConfig {
     /// not fit.
     #[serde(default)]
     pub max_context: Option<u32>,
+    /// Whether a load times the device measurements no stored or committed
+    /// profile states under a matching key (its rates, each dense kernel's
+    /// curve at the model's planes, the dense settle), and keeps them for
+    /// the next boot. `false` times nothing: each is served by the engine's
+    /// estimate, named in the load log, and nothing is stored (`pie serve
+    /// --no-measure`). Vulkan, wgpu, and a one-device cuda engine (CUDA or
+    /// ROCm).
+    #[serde(default = "default_measure")]
+    pub measure: bool,
     /// `[engine.memory]`: the optional caps for sharing a machine.
     #[serde(default)]
     pub memory: MemoryConfig,
@@ -1070,6 +1086,20 @@ impl EngineConfig {
         );
         self.memory.validate()?;
         ensure!(
+            self.measure
+                || matches!(self.kind, EngineKind::Vulkan | EngineKind::Wgpu | EngineKind::Metal)
+                || (self.kind == EngineKind::Cuda && self.device.len() == 1),
+            "engine.measure = false skips the measurements a load takes on the vulkan, wgpu and \
+             metal engines and a one-device cuda engine; the {} engine{} still measures outside \
+             that path (new-memory/FOLLOWUPS.md), so omit the key",
+            self.kind.as_str(),
+            if self.kind == EngineKind::Cuda {
+                " across devices"
+            } else {
+                ""
+            }
+        );
+        ensure!(
             self.memory.kv_device_tokens.is_none() || self.kind == EngineKind::Cuda,
             "engine.memory.kv_device_tokens sizes the cuda engine's device pool; the {} engine \
              does not size its pool by tokens, so omit the key",
@@ -1134,6 +1164,9 @@ impl EngineKind {
 
 fn default_tp_size() -> u32 {
     1
+}
+fn default_measure() -> bool {
+    true
 }
 fn default_ep_size() -> u32 {
     1
@@ -1203,6 +1236,7 @@ device = ["metal:0"]
         a_distributed_worker_states_no_cluster_policies();
         a_submit_deadline_is_an_unknown_key();
         the_diag_flag_states_the_engines_diagnostics_key();
+        measuring_is_skipped_where_the_engine_skips_and_refused_elsewhere();
         an_engine_s_own_key_is_written_beside_the_common_ones();
         parses_minimal_metal_config();
         every_engine_kind_round_trips_through_its_config_string();
@@ -1436,6 +1470,43 @@ device = ["metal:0"]
         assert!(
             why.to_string().contains("vulkan"),
             "and the refusal names the flavor: {why}"
+        );
+    }
+
+    fn measuring_is_skipped_where_the_engine_skips_and_refused_elsewhere() {
+        let vulkan = MINIMAL_METAL
+            .replace("type = \"metal\"", "type = \"vulkan\"")
+            .replace("metal:0", "vulkan:0");
+        let cfg: Config = toml::from_str(&vulkan).unwrap();
+        assert!(cfg.engine.measure, "a load measures unless told not to");
+        let skipping = vulkan.replace(
+            "device = [\"vulkan:0\"]",
+            "device = [\"vulkan:0\"]\nmeasure = false",
+        );
+        let cfg: Config = toml::from_str(&skipping).unwrap();
+        assert!(!cfg.engine.measure);
+        cfg.engine.validate().expect("vulkan skips");
+        assert!(
+            cfg.engine.options.get("measure").is_none(),
+            "a common key, not the engine's own"
+        );
+        // `pie serve --no-measure`.
+        let mut cfg: Config = toml::from_str(&vulkan).unwrap();
+        cfg.skip_measuring().expect("vulkan skips");
+        assert!(!cfg.engine.measure);
+        let mut cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
+        cfg.skip_measuring().expect("metal skips");
+        assert!(!cfg.engine.measure);
+        let cuda = MINIMAL_METAL
+            .replace("type = \"metal\"", "type = \"cuda\"")
+            .replace("metal:0", "cuda:0");
+        let mut cfg: Config = toml::from_str(&cuda).unwrap();
+        let why = cfg
+            .skip_measuring()
+            .expect_err("cuda measures outside the skip path yet");
+        assert!(
+            why.to_string().contains("the cuda engine still measures"),
+            "{why}"
         );
     }
 

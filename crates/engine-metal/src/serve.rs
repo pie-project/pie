@@ -57,6 +57,11 @@ pub struct Boot<'a> {
     pub profiles: Option<std::path::PathBuf>,
     /// How the top rung is chosen.
     pub top: Top,
+    /// Whether the load times what no stored or committed profile states
+    /// under a matching key (`[engine] measure`, `pie serve --no-measure`):
+    /// skipped, each rate and dense curve is served by the estimate and the
+    /// profile's own ladder, named.
+    pub measure: engine::rates::Measuring,
 }
 
 /// How a load chooses the top rung of its fires.
@@ -597,11 +602,18 @@ impl Shell {
         let perf_cores = crate::chip::perf_cores();
         let measured = crate::chip::measured(&device, perf_cores);
         let (chip, chip_report) =
-            crate::chip::resolve(device.name(), &measured, boot.profiles.as_deref());
+            crate::chip::resolve_keyed(device.name(), &measured, boot.profiles.as_deref());
         crate::chip::tell_untuned(device.name(), &chip_report);
         // A device whose profile lacks the roofline's constants measures
         // them here, before ready, and keeps them in the user's profile.
-        let chip = crate::rates::at_load(&device, chip, &measured, boot.profiles.as_deref(), None)
+        let chip = crate::rates::at_load(
+            &device,
+            chip,
+            &measured,
+            boot.profiles.as_deref(),
+            None,
+            boot.measure,
+        )
             .map_err(|why| Fault::Device {
                 call: "rates at load",
                 why,
@@ -610,7 +622,13 @@ impl Shell {
         // once: kept under the profiles and read back by later loads of the
         // same shapes on the same kernels, over the profile's own ladder.
         let chip =
-            crate::tune::dense::at_load(&device, chip, boot.profiles.as_deref(), boot.contract)
+            crate::tune::dense::at_load(
+                &device,
+                chip,
+                boot.profiles.as_deref(),
+                boot.contract,
+                boot.measure,
+            )
                 .map_err(|why| Fault::Device {
                     call: "kernel.dense at load",
                     why,
@@ -1297,16 +1315,51 @@ impl PreparedLoad<'_> {
         } else {
             None
         };
+        // A load that skips measuring (`[engine] measure = false`) with no
+        // roofline stated serves by the estimate's static half: no rate
+        // weighs the rungs, so the fire top is the narrowest feasible rung a
+        // decode fire of the load's lanes takes (one row a lane), a prompt
+        // chunked to it; said by name.
+        let unweighed = boot.measure == engine::rates::Measuring::Skip
+            && !chip.rates().complete(&crate::rates::KEYS);
         if let Some((counts, rungs, live, _)) = weighed.as_ref().filter(|_| boot.top == Top::Ruled) {
             let (live, rungs) = (*live, rungs.clone());
-            let pick = crate::top::choose(
-                &rungs,
-                live,
-                boot.context,
-                &chip.tuned().rates,
-                device.name(),
-                &counts,
-            )?;
+            let pick = if unweighed {
+                let lanes = budgets.tokens.max_lanes.max(1);
+                let feasible = || rungs.iter().filter(|r| r.infeasible.is_none());
+                let rung = feasible()
+                    .filter(|r| r.tokens >= lanes)
+                    .min_by_key(|r| r.tokens)
+                    .or_else(|| feasible().max_by_key(|r| r.tokens))
+                    .ok_or_else(|| Fault::Param {
+                        name: "rungs".to_string(),
+                        why: "no rung of this load is feasible on this device",
+                    })?;
+                tracing::info!(
+                    lanes,
+                    tokens = rung.tokens,
+                    missing = ?chip.rates().missing(&crate::rates::KEYS),
+                    "skipped: the roofline `[rates]` (`[engine] measure = false`, no layer states \
+                     them), served by the estimate: the fire top is the narrowest rung a decode \
+                     fire of the load's lanes takes, a prompt chunked to it (no rate weighs the \
+                     rungs)"
+                );
+                engine::load::TopRung {
+                    tokens: rung.tokens,
+                    lanes: rung.lanes,
+                    span_bytes: rung.span_bytes,
+                    why: engine::load::TopWhy::OnlyFeasible,
+                }
+            } else {
+                crate::top::choose(
+                    &rungs,
+                    live,
+                    boot.context,
+                    &chip.tuned().rates,
+                    device.name(),
+                    &counts,
+                )?
+            };
             let asked = budgets.tokens.max_tokens;
             tracing::info!(
                 "{}: {}",
@@ -2033,16 +2086,58 @@ impl Shell {
             return Ok(());
         }
         self.drain()?;
+        let before = self.pools.chunk_table().clone();
         let mut frame = self.device.frame()?;
         self.pools.evacuate(&mut frame, evacuation)?;
         frame.commit()?;
         // Guest tables, rings and landed adapters in moved chunks: the refs
         // stand, their addresses do not.
+        let Err(refused) = self.repoint_after_move() else {
+            return Ok(());
+        };
+        // Refused past the copies (a holder whose refs this table cannot
+        // resolve): the evacuation is taken back whole, so the refusal
+        // means nothing moved (`Engine::evacuate`), the runtime takes its
+        // raise back too, and the two keep one map. Answered as half done,
+        // the runtime's map and this one parted: a later hand-out landed on
+        // bytes the engine had moved a holder onto (beamx40 on d821e8d1c, a
+        // rescore's bind over a pair; a NaN where no claim stood guard).
+        tracing::warn!(
+            %refused,
+            moves = evacuation.moves.len(),
+            "metal: an evacuation's rebind was refused; its moves are taken back"
+        );
+        let mut frame = self.device.frame()?;
+        self.pools.evacuate_back(&mut frame, evacuation, before)?;
+        frame.commit()?;
+        self.repoint_after_move().map_err(|again| {
+            Fault::program(
+                "serve::evacuate",
+                format!(
+                    "an evacuation refused ({refused}) and taken back could not repoint where its \
+                     holders lay before it ({again}): a bug"
+                ),
+            )
+        })?;
+        Err(refused)
+    }
+
+    /// Every landing, guest table, ring and lay pointed where the chunk
+    /// table puts their refs now ([`Self::evacuate`]).
+    fn repoint_after_move(&mut self) -> Result<()> {
         let landings: Vec<Landing> = self.landings.values().cloned().collect();
         for landing in &landings {
             self.point_landing(landing)?;
         }
-        self.programs.rebind(&self.pools)
+        self.programs.rebind(&self.pools)?;
+        #[cfg(feature = "fault-injection")]
+        if FAIL_NEXT_REPOINT.with(|next| next.replace(false)) {
+            return Err(Fault::program(
+                "serve::evacuate",
+                "a refusal injected by `fail_next_repoint`, past the copies and the rebind",
+            ));
+        }
+        Ok(())
     }
 
     /// Whole-slot copies a fire states (`Lane::slot_copies`), each
@@ -2167,6 +2262,17 @@ impl Shell {
         self.pools.disk_chunk_bytes()
     }
 
+    /// Test builds (`test-slot-fill`): the runtime's given-back slots
+    /// poisoned before this engine's next verb ([`engine::chunk::PoisonQueue`]):
+    /// a slot is given back only once every fire that touched it retired
+    /// and every copy reading it landed, and its next owner writes nothing
+    /// before a verb of its own, so a host fill here races neither. The
+    /// ranges poisoned.
+    #[cfg(feature = "test-slot-fill")]
+    pub fn poison_given_back(&self, ranges: &[(u64, u64)]) -> usize {
+        self.pools.poison_ranges(ranges)
+    }
+
     /// See `Engine::settle_copies`: the last copy's command buffer retires.
     pub fn settle_copies(&mut self) -> Result<()> {
         if let Some(grafted) = self.grafted.take() {
@@ -2220,11 +2326,22 @@ impl Shell {
                     .fold(h, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
             },
         );
+        // Every decision as the load resolved it, rung by rung (the dense
+        // ladder measured or taken at load among them): the tuning's own
+        // Debug names the profile's source alone, so a pick that changed
+        // under one source kept the cover an earlier pick was timed under.
+        let decisions: String = self
+            .tuning
+            .profile()
+            .entries()
+            .map(|(spec, rungs, _)| format!("{}={rungs:?};", spec.id))
+            .collect();
         format!(
-            "metal|{}|{os}|emitter {}|kernels {kernels:016x}|tuning {:016x}",
-            self.device.name(),
+            "metal|{}|{os}|emitter {}|kernels {kernels:016x}|tuning {:016x}|picks {:016x}",
+            crate::stored::measured_on(self.device.name()),
             eta_compiler::codegen::metal::METAL_M1_EMITTER_VERSION,
             fnv(format!("{:?}", self.tuning).as_bytes()),
+            fnv(decisions.as_bytes()),
         )
     }
 
@@ -2263,14 +2380,26 @@ impl Shell {
             .unwrap_or_default();
         let trace = fnv(format!("{:?}", self.trace).as_bytes());
         let paging = self.paging();
+        // Every decision the profile resolves, rung by rung: the tuning's
+        // own Debug names the profile's source alone, so a decision that
+        // changed under the same source (kernel.dense measured anew at
+        // load, a user file edited) kept the key and built an earlier
+        // boot's keys, and a fire met a kernel that list did not hold.
+        let decisions: String = self
+            .tuning
+            .profile()
+            .entries()
+            .map(|(spec, rungs, _)| format!("{}={rungs:?};", spec.id))
+            .collect();
         let shape = format!(
-            "{:?}|{:?}|{}:{}:{}|{:?}",
+            "{:?}|{:?}|{}:{}:{}|{:?}|{:016x}",
             self.arena.rung_tokens(),
             self.budgets.tokens,
             paging.page_size,
             paging.pages_per_slot,
             paging.context(),
-            self.tuning
+            self.tuning,
+            fnv(decisions.as_bytes())
         );
         format!(
             "metal-pipelines-1|{}|{os}|{binary}|{trace:016x}|{:016x}",
@@ -2452,6 +2581,7 @@ impl Shell {
                 (rung, sizes)
             })
             .collect();
+        let _ = kernels_metal::linear::gemm::record_shapes(true);
         let walked = (|| -> Result<u32> {
             let mut fires = 0u32;
             for (rung, sizes) in sized {
@@ -2527,11 +2657,52 @@ impl Shell {
             Ok(fires)
         })();
         self.warming = false;
+        let shapes = kernels_metal::linear::gemm::record_shapes(false);
         let fires = walked?;
         // What the walk backed goes back, and the rung stands where it
         // stood.
         if self.rung != standing {
             self.set_rung(self.rung, standing)?;
+        }
+        // Every dense matmul kernel a fire's rows can reach is built: each
+        // shape the walk dispatched, at every row count up to the most it
+        // dispatched it at, routes (gemm::route under this load's tuning)
+        // to a kernel the walk built, or the load is refused by name here,
+        // never a fire while serving.
+        let built: std::collections::HashSet<String> = self
+            .pipelines
+            .keys()
+            .into_iter()
+            .map(|(_, entry, ..)| entry.to_string())
+            .collect();
+        let tuning = &self.tuning;
+        let mut unbuilt: Vec<String> = Vec::new();
+        for &(columns, contraction, f32_out, most) in &shapes {
+            for rows in 1..=most {
+                let entry =
+                    kernels_metal::linear::gemm::route(tuning, rows, columns, contraction, f32_out);
+                if !built.contains(&entry) {
+                    unbuilt.push(format!("{entry} at {rows} x {columns} x {contraction}"));
+                }
+            }
+        }
+        tracing::info!(
+            shapes = shapes.len(),
+            unbuilt = unbuilt.len(),
+            "metal: the walk's matmul shapes route only to kernels it built"
+        );
+        if let Some(first) = unbuilt.first() {
+            return Err(Fault::Param {
+                name: "kernel.dense".to_string(),
+                why: Box::leak(
+                    format!(
+                        "routes a matmul the load's walk did not build its kernel for: {first} \
+                         ({} such row counts); a fire there would be refused",
+                        unbuilt.len()
+                    )
+                    .into_boxed_str(),
+                ),
+            });
         }
         Ok((fires, self.pipelines.compiled() - before))
     }
@@ -6665,4 +6836,19 @@ fn pooled<T>(f: impl FnOnce() -> T) -> T {
 #[cfg(not(target_vendor = "apple"))]
 fn pooled<T>(f: impl FnOnce() -> T) -> T {
     f()
+}
+
+#[cfg(feature = "fault-injection")]
+thread_local! {
+    static FAIL_NEXT_REPOINT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The next evacuation on this thread is refused past its copies and its
+/// rebind, as a holder whose refs the moved table cannot resolve refuses
+/// it: what `Shell::evacuate` must take back whole. A test seam only,
+/// compiled under the `fault-injection` feature, as
+/// [`crate::device::ctx::fail_next_frame`].
+#[cfg(feature = "fault-injection")]
+pub fn fail_next_repoint() {
+    FAIL_NEXT_REPOINT.with(|next| next.set(true));
 }

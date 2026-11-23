@@ -102,6 +102,11 @@ pub enum Source {
     /// A family or device file checked in with pie, by its path under the
     /// backend's `profiles/`.
     Seeded(String),
+    /// A measured profile checked in with pie (`<device>.measured.toml`
+    /// under the backend's `profiles/`, written by `pie tune export`), by
+    /// its path: a device's stored measurements, each keyed, taken entry by
+    /// entry where the user's file stores none under a matching key.
+    Committed(String),
     /// Built by the backend from the facts, for a device no family file
     /// applies to.
     Derived,
@@ -114,6 +119,7 @@ impl std::fmt::Display for Source {
         match self {
             Source::User(p) => write!(f, "user profile {p}"),
             Source::Seeded(p) => write!(f, "checked-in profile {p}"),
+            Source::Committed(p) => write!(f, "committed measured profile {p}"),
             Source::Derived => write!(f, "derived profile"),
             Source::Defaults => write!(f, "registry defaults"),
         }
@@ -143,8 +149,10 @@ pub struct Report {
     /// states rates measured on it.
     pub rates_measured: Option<String>,
     /// What a keyed resolve ([`Registry::resolve_keyed`]) said of the
-    /// user's file's measurements: each kept (its key matches this build on
-    /// this device) or dropped to be measured again, and why, a line each.
+    /// stored measurements, the user's file's and a committed measured
+    /// profile's: each entry taken, by the layer that decides it and its
+    /// key, and each not taken (its key no longer matches this build on
+    /// this device) and why, a line each.
     pub stored: Vec<String>,
 }
 
@@ -691,6 +699,12 @@ impl Registry {
         // tune --rates`) lie under the checked-in layers': a checked-in
         // profile's rate wins where it states one.
         let mut user_tuned = crate::fire::Tuned::default();
+        // A committed measured profile's rates lie under the user's: an
+        // entry the user's file stores under a matching key is taken over
+        // the committed one, entry by entry.
+        let mut committed_tuned = crate::fire::Tuned::default();
+        let mut user_from = String::from("no user file");
+        let mut committed_from = String::from("no committed profile");
         let mut rates_measured: Option<String> = None;
         let mut user_rates_measured: Option<String> = None;
         let mut measured: BTreeMap<&'static str, bool> = BTreeMap::new();
@@ -702,8 +716,11 @@ impl Registry {
         let mut rejected = Vec::new();
         for layer in layers {
             let seeded = matches!(layer.source, Source::Seeded(_));
+            let committed = matches!(layer.source, Source::Committed(_));
             let strict = if seeded {
                 Strict::CheckedIn
+            } else if committed {
+                Strict::Measured
             } else {
                 Strict::User
             };
@@ -785,6 +802,24 @@ impl Registry {
                 if let Some(how) = how {
                     rates_measured = how;
                 }
+            } else if committed {
+                if let Some(now) = now {
+                    stored.extend(
+                        file.tuned
+                            .rates
+                            .sift_as(now, "committed")
+                            .into_iter()
+                            .map(|line| format!("{origin}: {line}")),
+                    );
+                }
+                // The settle is checked by the settle itself, after the
+                // user's stored one ([`crate::fire::Tuned::committed_settle`]).
+                file.tuned.committed_settle = std::mem::take(&mut file.tuned.rates.dense_settled);
+                committed_from = origin.clone();
+                committed_tuned.lay(&file.tuned);
+                if let Some(how) = how {
+                    user_rates_measured = how;
+                }
             } else {
                 if let Some(now) = now {
                     stored.extend(
@@ -795,6 +830,7 @@ impl Registry {
                             .map(|line| format!("{origin}: {line}")),
                     );
                 }
+                user_from = origin.clone();
                 user_tuned.lay(&file.tuned);
                 if let Some(how) = how {
                     user_rates_measured = how;
@@ -805,17 +841,30 @@ impl Registry {
         // The checked-in rates over the user's: theirs stand only where no
         // checked-in layer states one.
         if let Some(now) = now
-            && !layers.iter().any(|l| matches!(l.source, Source::User(_)))
+            && !layers
+                .iter()
+                .any(|l| matches!(l.source, Source::User(_) | Source::Committed(_)))
         {
             stored.push(format!(
-                "stored measurements: no user file for `{}`; whatever no checked-in layer \
-                 states is measured",
+                "stored measurements: no user file and no committed measured profile for `{}`; \
+                 whatever no checked-in layer states is measured (or skipped)",
                 now.on()
             ));
         }
+        // Each entry the user's file and a committed profile state, by the
+        // layer that decides it (the user's over the committed).
+        let user_rates = user_tuned.rates.clone();
+        committed_tuned.lay(&user_tuned);
+        if now.is_some() {
+            stored.extend(
+                committed_tuned
+                    .rates
+                    .whence(&user_rates, &user_from, &committed_from),
+            );
+        }
         rates_measured = rates_measured.or(user_rates_measured);
-        user_tuned.lay(&tuned);
-        let tuned = user_tuned;
+        committed_tuned.lay(&tuned);
+        let tuned = committed_tuned;
         let top = used.last().cloned().unwrap_or(Source::Defaults);
         let report = Report {
             used: top.clone(),

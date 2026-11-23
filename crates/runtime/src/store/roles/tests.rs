@@ -1057,6 +1057,7 @@ fn bind_registering(engine: &mut FakeEngine) -> (InstanceBinding, u64) {
         |id| held_ids.contains(&id),
         None,
         |_| true,
+        |_, _| false,
     )
     .unwrap();
     let mut rings = super::take_rings(Some(&roles), engine, &plans)
@@ -1818,4 +1819,43 @@ fn a_role_slot_wider_than_a_kv_slot_parks_to_disk_in_a_run_and_restores_whole() 
     assert_eq!(held(&device), resident);
     roles.lock().unwrap().close_instance(instance);
     assert_eq!(held(&device), before);
+}
+
+/// A restore's rebinds read off the roles, then the process parked again
+/// before the lane ran them (an eviction while its restore waited on its
+/// rebinds): the rebind of the instance's old device refs is cancelled at
+/// the lane, never sent, while the park itself is said. Sent, the engine
+/// claimed slots the park's commit gave back, and the next bind there was
+/// refused (the L40S and the M1 on batch 3: slot 12537 rebound 4 ms after
+/// its park, at the same refs, bound to another instance 1 ms later).
+#[test]
+fn a_rebind_read_before_a_park_is_cancelled_once_its_item_moved() {
+    let Pools { roles, .. } = pools();
+    let mut engine = FakeEngine::default();
+    let channel = registered(&roles, &mut engine, 1, 1);
+    let instance = bind(&roles, &mut engine, vec![channel], 1);
+    let park = roles.lock().unwrap().prepare_park(holder(1)).unwrap();
+    roles.lock().unwrap().commit(park);
+    let unpark = roles.lock().unwrap().prepare_unpark(holder(1)).unwrap().unwrap();
+    roles.lock().unwrap().commit(unpark);
+    let stale = roles.lock().unwrap().stale(holder(1));
+    let read = stale
+        .iter()
+        .find(|rebind| Owner::of(rebind) == Owner::Instance(instance))
+        .cloned()
+        .expect("the instance's rebind");
+    assert!(roles.lock().unwrap().rebind_stands(&read), "read where it lies: it stands");
+    // Parked again before the lane ran it.
+    let park = roles.lock().unwrap().prepare_park(holder(1)).unwrap();
+    let parked = park.parked();
+    assert!(!roles.lock().unwrap().rebind_stands(&read), "its item moving out: cancelled");
+    assert!(parked.iter().all(|rebind| roles.lock().unwrap().rebind_stands(rebind)), "the park is said");
+    roles.lock().unwrap().commit(park);
+    assert!(!roles.lock().unwrap().rebind_stands(&read), "its item below: cancelled");
+    assert!(
+        roles.lock().unwrap().stale(holder(1)).iter().all(|rebind| !matches!(rebind, Rebind::Instance { .. })),
+        "nothing below is named to the engine"
+    );
+    roles.lock().unwrap().close_instance(instance);
+    roles.lock().unwrap().close_channel(channel);
 }

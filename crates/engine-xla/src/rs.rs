@@ -50,9 +50,9 @@ pub struct Layout {
     pub planes: Vec<Plane>,
     pub regions: Vec<Region>,
 
-    pub in_of: HashMap<u32, usize>,
+    pub in_of: std::collections::BTreeMap<u32, usize>,
 
-    pub out_of: HashMap<u32, usize>,
+    pub out_of: std::collections::BTreeMap<u32, usize>,
 
     pub token_bytes: u64,
 
