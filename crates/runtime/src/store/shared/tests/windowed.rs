@@ -1102,3 +1102,47 @@ fn a_beam_group_s_long_prompt_on_a_windowed_load_is_cut_not_refused() {
     };
     assert_eq!(run(true), run(false), "the same rows, folded the same");
 }
+
+/// Two frames in flight: lane A's fire folds its buffered rows (frame N,
+/// still running), and every slot then free is handed to the next frame.
+/// The slots A's fold frees are not among them: its fire still reads them
+/// (buffer rows into the ring), so they stay held until it settles, and only
+/// then come free.
+#[test]
+fn a_fold_s_freed_slots_stay_held_until_its_fire_settles() {
+    let facts = windowed_facts();
+    let (shared, stores) = stores_of(&facts);
+    let mut rs = stores.rs.lock().unwrap();
+    let a = warm(&mut rs, 6);
+    let b = warm(&mut rs, 6);
+    let out = prepare_many(&mut rs, &[a], &one(vec![0], 6..13, GroupFold::None), None).unwrap();
+    let held: Vec<u32> = table(&lanes_of(&out, &shared, &[(6, 7)], 6)[0]);
+    settle(&mut rs, out.txn);
+
+    // Frame N: A folds through 12, freeing the slots of rows 4..12.
+    let folding = prepare_many(&mut rs, &[a], &one(vec![0], 13..14, GroupFold::Host(6)), None)
+        .unwrap();
+    rs.retire_idle();
+    let freed: HashSet<u32> = held[..2].iter().copied().collect();
+    let free_before = rs.free().pages;
+
+    // Frame N+1, staged while N runs: B takes every slot that stands free.
+    let grant = rs.reserve(RsUnits::of(0, free_before)).expect("what stands free");
+    let taken: HashSet<u32> = grant.pages.iter().map(|&id| rs.engine_id(id)).collect();
+    assert!(
+        taken.is_disjoint(&freed),
+        "a slot frame N's fold still reads was handed to frame N+1"
+    );
+    rs.release_reservation(grant);
+    let out = prepare_many(&mut rs, &[b], &one(vec![0], 6..10, GroupFold::None), None).unwrap();
+    let theirs: HashSet<u32> = table(&lanes_of(&out, &shared, &[(6, 4)], 6)[0])
+        .into_iter()
+        .collect();
+    assert!(theirs.is_disjoint(&freed), "B's rows land in slots of their own");
+
+    // Frame N lands: its freed slots come back.
+    settle(&mut rs, folding.txn);
+    rs.retire_idle();
+    assert!(rs.free().pages >= free_before - theirs.len() as u32 + freed.len() as u32);
+    settle(&mut rs, out.txn);
+}
