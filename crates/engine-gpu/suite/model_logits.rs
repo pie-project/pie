@@ -2985,3 +2985,71 @@ fn a_windowed_miniature_over_a_poisoned_pool_answers_finite() {
     poisoned("gemma4-e4b-mini-l1");
 }
 
+
+/// Decode time on a windowed miniature past its window: `lanes` seats
+/// prefill 700 rows each, then decode; the best of rounds of 128 steps,
+/// host wall time a step. A proxy for serving's decode, printed.
+fn windowed_decode_time(model: &str, lanes: u32) {
+    let fixture = fixture(model, None);
+    let Some(mut shell) = load_paged(&fixture, PAGE, 1024, None) else {
+        return;
+    };
+    let prompt: Vec<u32> = (0..700u32).map(|at| (at * 37 + 11) % 256).collect();
+    let mut have = vec![0u32; lanes as usize];
+    let mut fed: Vec<Vec<u32>> = vec![Vec::new(); lanes as usize];
+    for lane in 0..lanes as usize {
+        let mut last = Vec::new();
+        for piece in prompt.chunks(256) {
+            let seated = Seated {
+                held: Some(have[lane]),
+                ..Seated::of(Lane {
+                    slot: lane as u32,
+                    word: word(&fixture.trace, piece.len() as u32),
+                    tokens: piece,
+                })
+            };
+            last = shell.fire_seated(&[seated]).expect("the prefill lands");
+            have[lane] += piece.len() as u32;
+        }
+        fed[lane] = vec![argmax(&last[0])];
+    }
+    let step = |shell: &mut Shell, have: &mut Vec<u32>, fed: &mut Vec<Vec<u32>>| {
+        let seated: Vec<Seated<'_>> = (0..lanes as usize)
+            .map(|lane| Seated {
+                held: Some(have[lane]),
+                ..Seated::of(Lane {
+                    slot: lane as u32,
+                    word: word(&fixture.trace, 1),
+                    tokens: &fed[lane],
+                })
+            })
+            .collect();
+        let got = shell.fire_seated(&seated).expect("the decode lands");
+        for lane in 0..lanes as usize {
+            have[lane] += 1;
+            fed[lane] = vec![argmax(&got[lane])];
+        }
+    };
+    for _ in 0..16 {
+        step(&mut shell, &mut have, &mut fed);
+    }
+    let mut best = f64::INFINITY;
+    for _ in 0..5 {
+        let started = std::time::Instant::now();
+        for _ in 0..48 {
+            step(&mut shell, &mut have, &mut fed);
+        }
+        best = best.min(started.elapsed().as_secs_f64() / 48.0);
+    }
+    eprintln!("decode time: {model} {lanes} lanes: {:.1} us a step", best * 1e6);
+}
+
+#[test]
+fn windowed_decode_time_one_lane() {
+    windowed_decode_time("gemma4-e4b-mini-l1", 1);
+}
+
+#[test]
+fn windowed_decode_time_four_lanes() {
+    windowed_decode_time("gemma4-e4b-mini-l1", 4);
+}

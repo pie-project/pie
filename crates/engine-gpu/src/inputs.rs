@@ -445,7 +445,7 @@ impl Laid {
         });
         let ring = ring.then(|| {
             let most = crate::ring::most_jobs(budget.max_tokens, budget.max_tokens);
-            let lanes_at = take(lanes * 4 * 4);
+            let lanes_at = take(lanes * (4 + u64::from(pieces)) * 4);
             let jobs_at = take((1 + 4 * u64::from(most)) * 4);
             (lanes_at, jobs_at, most)
         });
@@ -687,13 +687,13 @@ impl<B: Backend> Inputs<B> {
         };
         let ring_jobs = match self.laid.ring {
             Some((lanes_at, jobs_at, most)) => {
-                if fire.ring_lanes.len() > 4 * lanes as usize
+                if fire.ring_lanes.len() > (4 + self.laid.pieces) as usize * lanes as usize
                     || fire.ring_jobs.len() > 1 + 4 * most as usize
                 {
                     return Err(Fault::Ceiling {
                         what: "ints of a fire's windowed lane and fold tables",
                         need: (fire.ring_lanes.len() + fire.ring_jobs.len()) as u64,
-                        have: 4 * u64::from(lanes) + 1 + 4 * u64::from(most),
+                        have: u64::from(4 + self.laid.pieces) * u64::from(lanes) + 1 + 4 * u64::from(most),
                     });
                 }
                 self.store.write(lanes_at, bytes_of(fire.ring_lanes))?;
@@ -723,7 +723,7 @@ impl<B: Backend> Inputs<B> {
                 handles,
                 &self.store,
                 lanes_at,
-                (4 * lanes).max(1),
+                ((4 + self.laid.pieces) * lanes).max(1),
                 self.laid.room(lanes_at)?,
             )?,
             None => Tensor::new(kernels_slang::ABSENT, 0, 1, Dtype::I32),

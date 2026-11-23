@@ -32,8 +32,10 @@ pub struct Lane<'a> {
     pub buffer: &'a [u32],
     /// The fire's slots of the lane's rows, as kernel units.
     pub fire: &'a [u32],
-    /// Which lane of the fire's record table the lane's ring is.
+    /// Which lane of the fire's record table the lane's ring is, and its
+    /// record's units.
     pub record: u32,
+    pub units: &'a [i32],
     /// Whether the lane keeps its rows: a kv-less lane's rows land in its
     /// fire slots and fold nowhere.
     pub keeps: bool,
@@ -54,9 +56,9 @@ pub struct Seat {
 }
 
 impl Seat {
-    /// The lane with its fire slots.
+    /// The lane with its fire slots and its record's units.
     #[must_use]
-    pub fn with<'a>(&'a self, fire: &'a [u32]) -> Lane<'a> {
+    pub fn with<'a>(&'a self, fire: &'a [u32], units: &'a [i32]) -> Lane<'a> {
         Lane {
             folded: self.folded,
             fold: self.fold,
@@ -66,6 +68,7 @@ impl Seat {
             buffer: &self.buffer,
             fire,
             record: self.record,
+            units,
             keeps: self.keeps,
         }
     }
@@ -74,8 +77,8 @@ impl Seat {
 /// What a fire stages for its windowed layers.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Staged {
-    /// Four ints a lane: folded, base, first, folded after the fire
-    /// (`Ring::lanes`).
+    /// `4 + pieces` ints a lane: folded, base, first, folded after the
+    /// fire, its record's units (`Ring::lanes`).
     pub lanes: Vec<i32>,
     /// The page table: a lane's buffer slots of its rows below its first,
     /// then its fire slots.
@@ -178,6 +181,7 @@ pub fn stage(lanes: &[Lane<'_>], tokens: u32, ring_rows: u32) -> Result<Staged> 
             lane.first as i32,
             if lane.keeps { to as i32 } else { lane.folded as i32 },
         ]);
+        out.lanes.extend_from_slice(lane.units);
         for i in 0..buffered {
             out.indices.push(entry(lane.base + i * tokens)? as i32);
         }
@@ -253,10 +257,11 @@ mod tests {
             buffer: &[7, 9],
             fire: &[30],
             record: 0,
+            units: &[4],
             keeps: true,
         };
         let s = stage(&[lane], 16, 40).unwrap();
-        assert_eq!(s.lanes, [50, 48, 55, 56]);
+        assert_eq!(s.lanes, [50, 48, 55, 56, 4]);
         assert_eq!(s.indices, [7, 30]);
         assert_eq!(s.indptr, [0, 2]);
         assert_eq!((s.write_page, s.write_offset), (vec![30], vec![0]));
@@ -280,6 +285,7 @@ mod tests {
             buffer: &[3],
             fire: &[10, 11, 12, 13, 14, 15, 16],
             record: 2,
+            units: &[4],
             keeps: true,
         };
         let s = stage(&[lane], 16, 40).unwrap();
@@ -303,6 +309,7 @@ mod tests {
             buffer: &[5],
             fire,
             record: 0,
+            units: &[4],
             keeps: true,
         };
         let s = stage(&[lane(&[1]), lane(&[2])], 16, 40).unwrap();

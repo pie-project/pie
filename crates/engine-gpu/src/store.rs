@@ -82,9 +82,9 @@ pub struct Seats {
 
     pub slot_of_row: Tensor,
 
-    /// Four ints a lane where the fire reads windowed rows: its folded
-    /// index, buffer base, first row of the fire and folded index after it
-    /// (`kernels_slang::Ring`).
+    /// `4 + pieces` ints a lane where the fire reads windowed rows: its
+    /// folded index, buffer base, first row of the fire, folded index after
+    /// it, and its record's units (`kernels_slang::Ring::lanes`).
     pub ring_lanes: Tensor,
 }
 
@@ -1342,7 +1342,6 @@ impl<B: Backend> Pools<B> {
                         ],
                         ring: ring.map(|ring| kernels_slang::Ring {
                             lanes: seats.ring_lanes,
-                            slots: seats.slot_ids,
                             rows: ring.rows,
                             piece: ring.piece,
                             values_piece: ring.values_piece,

@@ -196,15 +196,13 @@ uint mask_byte(uint i) {
 // row of the fire in its window-buffer slots, entry `i` rows `[base + i T,
 // base + (i + 1) T)`; the fire's own rows in the fire's slots, laid as
 // buffer slots, the lane's first row of the fire at row 0 of its first.
-// `ring_lanes` holds four ints a lane: its folded index, its buffer base
-// (a slot's first row), its first row of the fire, and its folded index
-// after the fire (the fold's). The page table holds,
-// a lane, its buffer slots of rows below its first row of the fire, then
-// its fire slots. `ring_slots` holds the lane's record, `pieces` units a
-// lane (the fire's slot table).
+// `ring_lanes` holds, a lane, its folded index, its buffer base (a slot's
+// first row), its first row of the fire and its folded index after the
+// fire (the fold's), then its record's units, `pieces` of them. The page
+// table holds, a lane, its buffer slots of rows below its first row of the
+// fire, then its fire slots.
 [[vk::binding(SDPA_SEGMENTS_AT)]] StructuredBuffer<int> ring_lanes;
-[[vk::binding(SDPA_SEGMENTS_AT + 1)]] StructuredBuffer<int> ring_slots;
-#define SDPA_POOL_AT (SDPA_SEGMENTS_AT + 2)
+#define SDPA_POOL_AT (SDPA_SEGMENTS_AT + 1)
 #else
 #define SDPA_POOL_AT SDPA_SEGMENTS_AT
 #endif
@@ -283,11 +281,12 @@ struct Keys {
 Keys keys_of(int req) {
     Keys at;
 #if defined(PIE_RING)
-    at.folded = ring_lanes[4u * uint(req)];
-    at.base = ring_lanes[4u * uint(req) + 1u];
-    at.first = ring_lanes[4u * uint(req) + 2u];
-    uint rec_k = uint(ring_slots[uint(req) * params.pieces + params.ring_piece]) * params.slot_stride;
-    uint rec_v = uint(ring_slots[uint(req) * params.pieces + params.ring_piece_v]) * params.slot_stride;
+    uint lane = (4u + params.pieces) * uint(req);
+    at.folded = ring_lanes[lane];
+    at.base = ring_lanes[lane + 1u];
+    at.first = ring_lanes[lane + 2u];
+    uint rec_k = uint(ring_lanes[lane + 4u + params.ring_piece]) * params.slot_stride;
+    uint rec_v = uint(ring_lanes[lane + 4u + params.ring_piece_v]) * params.slot_stride;
     at.ring_k = 2u * (rec_k + params.ring_k);
     at.ring_v = 2u * (rec_v + params.ring_v);
 #else

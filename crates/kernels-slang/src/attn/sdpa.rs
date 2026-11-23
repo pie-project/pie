@@ -262,7 +262,7 @@ fn args(
     ];
     args.extend_from_slice(extra);
     if let Some(ring) = &pool.ring {
-        args.extend([ring.lanes.arg(), ring.slots.arg()]);
+        args.push(ring.lanes.arg());
     }
     args.extend(pool.pool.args(false));
     args.extend([
@@ -286,11 +286,8 @@ fn ring_params(op: &'static str, pool: &KvPool) -> Result<Vec<ArgValue>, Error> 
     let Some(ring) = &pool.ring else {
         return Ok(Vec::new());
     };
-    if ring.lanes.dtype != Dtype::I32 || ring.slots.dtype != Dtype::I32 {
-        return Err(refuse(
-            op,
-            "a ring's lane and record tables are i32".to_string(),
-        ));
+    if ring.lanes.dtype != Dtype::I32 {
+        return Err(refuse(op, "a ring's lane table is i32".to_string()));
     }
     if ring.pieces == 0 || ring.piece >= ring.pieces || ring.values_piece >= ring.pieces {
         return Err(refuse(

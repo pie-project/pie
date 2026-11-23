@@ -26,7 +26,7 @@ pub fn fold(ctx: &Ctx<'_>, pool: &KvPool, jobs: Tensor, most: u32) -> Result<(),
     let Some(ring) = &pool.ring else {
         return Err(refuse(OP, "a fold into a ring of a layer that holds none"));
     };
-    if jobs.dtype != Dtype::I32 || ring.slots.dtype != Dtype::I32 {
+    if jobs.dtype != Dtype::I32 || ring.lanes.dtype != Dtype::I32 {
         return Err(refuse(OP, "the fold's job and record tables are i32"));
     }
     if u64::from(jobs.rows) * u64::from(jobs.width) < 1 + u64::from(most) * u64::from(JOB_INTS) {
@@ -60,7 +60,7 @@ pub fn fold(ctx: &Ctx<'_>, pool: &KvPool, jobs: Tensor, most: u32) -> Result<(),
     ctx.fire(
         Fire::at(RING, "attn_ring_fold").apply(Grid::of([2 * row_words, most, 1], [64, 1, 1])),
         &[
-            &[jobs.arg(), ring.slots.arg(), ring.lanes.arg()][..],
+            &[jobs.arg(), ring.lanes.arg()][..],
             &pool.pool.args(true),
             &[
                 pool.pool.words.arg(),

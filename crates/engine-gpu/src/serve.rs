@@ -6206,7 +6206,7 @@ impl<B: Serve> Shell<B> {
         );
         // The fire's windowed rows (CONTRACT-BC 19, 21): its own rows in
         // its rung's fire slots, read and folded as the ring kernels say.
-        let ring = self.stage_rings(&ring_lanes, rung)?;
+        let ring = self.stage_rings(&ring_lanes, &slot_ids, rung)?;
         if let Some(staged) = &ring {
             let most = crate::ring::most_jobs(self.span.rung_tokens(rung), self.span.rung_tokens(rung));
             let jobs = u32::try_from(staged.jobs.first().copied().unwrap_or(0)).unwrap_or(0);
@@ -6794,6 +6794,7 @@ impl<B: Serve> Shell<B> {
     fn stage_rings(
         &self,
         seats: &[crate::ring::Seat],
+        slot_ids: &[i32],
         rung: usize,
     ) -> Result<Option<crate::ring::Staged>> {
         let Some((rows, _)) = self.pools.rings() else {
@@ -6817,10 +6818,14 @@ impl<B: Serve> Shell<B> {
             owned.push(&units[from..from + *want as usize]);
             from += *want as usize;
         }
+        let pieces = self.pools.pieces() as usize;
         let lanes: Vec<crate::ring::Lane<'_>> = seats
             .iter()
             .zip(owned)
-            .map(|(seat, fire)| seat.with(fire))
+            .map(|(seat, fire)| {
+                let at = seat.record as usize * pieces;
+                seat.with(fire, slot_ids.get(at..at + pieces).unwrap_or(&[]))
+            })
             .collect();
         crate::ring::stage(&lanes, tokens, rows).map(Some)
     }

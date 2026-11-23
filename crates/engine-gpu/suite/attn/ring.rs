@@ -270,11 +270,15 @@ fn stage(gpu: &mut Gpu, g: &Geometry, lanes: &[Lane], laid: &Laid, to: &[usize])
         indices.extend_from_slice(table);
         indptr.push(indices.len() as u32);
     }
+    // A lane's fold, then its record's units.
     let ring_lanes: Vec<i32> = lanes
         .iter()
         .zip(to)
-        .flat_map(|(lane, &to)| {
+        .enumerate()
+        .flat_map(|(l, (lane, &to))| {
             [lane.folded as i32, lane.base as i32, lane.first as i32, to as i32]
+                .into_iter()
+                .chain(laid.records[l * PIECES..][..PIECES].iter().copied())
         })
         .collect();
     let rows: usize = lanes.iter().map(|lane| lane.rows).sum();
@@ -299,7 +303,7 @@ fn stage(gpu: &mut Gpu, g: &Geometry, lanes: &[Lane], laid: &Laid, to: &[usize])
         }
     }
     let (pi, pp) = (gpu.up_u32(&indices), gpu.up_u32(&indptr));
-    let (rl, rs) = (gpu.up_i32(&ring_lanes), gpu.up_i32(&laid.records));
+    let rl = gpu.up_i32(&ring_lanes);
     let (pos, own) = (gpu.up_i32(&positions), gpu.up_i32(&owner));
     let (mb, eb) = (gpu.up_u32(&pack(&mask)), gpu.up_u32(&words));
     let words = u32::try_from(g.elems / 2).expect("the pool's words");
@@ -317,7 +321,6 @@ fn stage(gpu: &mut Gpu, g: &Geometry, lanes: &[Lane], laid: &Laid, to: &[usize])
         origin: [0, (PAGE * g.row / 2) as u32],
         ring: Some(Ring {
             lanes: t(rl, ring_lanes.len(), 1, Dtype::I32),
-            slots: t(rs, laid.records.len(), 1, Dtype::I32),
             rows: g.r as u32,
             piece: PIECE as u32,
             values_piece: PIECE as u32,
