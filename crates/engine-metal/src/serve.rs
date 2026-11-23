@@ -1258,19 +1258,25 @@ impl PreparedLoad<'_> {
         // a fire's own rows past what its ring keeps for its queries lie in
         // window-slot pages at the range's very top, whole chunks every
         // rung's carve holds, so the page grid runs from each chunk's start.
-        // As many as the widest rung's rows take, a boundary page a lane, an
-        // arm each.
+        // As many as the widest rung's rows take, two boundary pages a lane
+        // that takes any (only a lane of more than `R - W + 1` rows does),
+        // an arm each.
         let own_chunks: u32 = match (&rows.ring, rows.windows.first()) {
             (Some(_), Some(window)) if window.bytes > 0 => {
+                let page = window.tokens.max(1);
                 let per_chunk = (rows.chunk_bytes / window.bytes).max(1);
-                let widest = rungs.last().map_or(0, |(tokens, _)| *tokens);
-                let lanes = u64::from(widest.min(boot.budget.max_lanes));
-                let pages = (u64::from(widest).div_ceil(u64::from(window.tokens.max(1))) + lanes)
-                    * arms as u64;
+                let widest = u64::from(rungs.last().map_or(0, |(tokens, _)| *tokens));
+                let ring = crate::chunks::MetalRing::rows(window.rows, page);
+                let past = u64::from(ring.saturating_sub(window.rows)) + 2;
+                let lanes = (widest / past).min(u64::from(boot.budget.max_lanes));
+                let pages = (widest.div_ceil(u64::from(page)) + 2 * lanes) * arms as u64;
                 u32::try_from(pages.div_ceil(per_chunk)).unwrap_or(u32::MAX)
             }
             _ => 0,
         };
+        if crate::diag::on().tier_trace && own_chunks > 0 {
+            eprintln!("residency: windowed own-row pages take the range's top {own_chunks} chunks");
+        }
         let mut act = crate::arena::act_chunks(
             &rungs,
             scratch.bytes(),
@@ -1603,7 +1609,8 @@ impl PreparedLoad<'_> {
             io,
             rs_room,
             arms as u64,
-        );
+        )
+        .beyond(own_bytes);
         // The runtime holds, from the start, the widest rung whose activation
         // the smallest rung's chunks hold (`SlotPool::rung` over this `act`),
         // and sends no notice for it: frames stage in that rung's regions
