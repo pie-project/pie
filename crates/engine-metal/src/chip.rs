@@ -138,6 +138,8 @@ seeded!(
     "apple9/apple-m4-pro.toml",
     "apple10.toml",
     "apple10/apple-m5-pro.toml",
+    // Committed measured profiles (`pie tune export --engine metal`).
+    "apple-m5-pro.measured.toml",
 );
 
 pub static SHELF: Shelf = Shelf {
@@ -227,6 +229,23 @@ pub fn resolve(device: &str, facts: &Facts, profiles: Option<&Path>) -> (Profile
     SHELF.resolve(registry(), device, facts, profiles)
 }
 
+/// [`resolve`] with the stored measurements keyed: each `[rates]` entry and
+/// dense curve is taken from the user's file where its key matches this
+/// build on this device (`crate::stored`), else from the device's
+/// committed measured profile where its key matches, else left for the
+/// load to measure; each is said once, by the layer and key that decided it.
+#[must_use]
+pub fn resolve_keyed(device: &str, facts: &Facts, profiles: Option<&Path>) -> (Profile, Report) {
+    let keys = crate::stored::Keys {
+        on: crate::stored::measured_on(device),
+    };
+    let (profile, report) = SHELF.resolve_keyed(registry(), device, facts, profiles, &keys);
+    for line in &report.stored {
+        tracing::info!("{line}");
+    }
+    (profile, report)
+}
+
 #[must_use]
 pub fn user_path(profiles: &Path, device: &str) -> PathBuf {
     SHELF.user_path(profiles, device)
@@ -263,7 +282,12 @@ mod tests {
 
     #[test]
     fn every_checked_in_profile_dumps_to_a_file_that_reads_back_strictly() {
-        for (name, text) in SEEDED {
+        // A committed measured profile holds measurements, no decision
+        // (`the_checked_in_profiles_hold_together` reads it as one).
+        for (name, text) in SEEDED
+            .iter()
+            .filter(|(name, _)| !name.ends_with(profile::MEASURED_SUFFIX))
+        {
             let p = registry()
                 .load(text, name)
                 .unwrap_or_else(|e| panic!("{e}"));
@@ -299,7 +323,10 @@ mod tests {
                 .parse(text, name, profile::Strict::CheckedIn)
                 .unwrap_or_else(|e| panic!("{e}"))
         };
-        for (name, _) in SEEDED {
+        for (name, _) in SEEDED
+            .iter()
+            .filter(|(name, _)| !name.ends_with(profile::MEASURED_SUFFIX))
+        {
             let family = name
                 .split_once('/')
                 .map(|(dir, _)| parse(&format!("{dir}.toml")));

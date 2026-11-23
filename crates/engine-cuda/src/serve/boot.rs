@@ -91,6 +91,10 @@ pub struct Knobs {
     pub profiles: Option<std::path::PathBuf>,
     /// A profile used as is instead of resolving one (`chip::pinned`).
     pub chip: Option<profile::Profile>,
+    /// Whether the load times what no layer of the device's profile states
+    /// under a matching key (`[engine] measure`, `pie serve --no-measure`):
+    /// its roofline rates and its decode products' kernels.
+    pub measuring: engine::rates::Measuring,
     /// An expert-parallel group's rebalance: every this many steps (none,
     /// the engine's default, which is never; 0, never), over the loads of
     /// the last `expert_load_window` steps (none: as many as it waits),

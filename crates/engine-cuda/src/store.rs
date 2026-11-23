@@ -2934,18 +2934,46 @@ impl Pools {
         self.fitted.min(self.chunks.total())
     }
 
-    /// See `Engine::evacuate`.
-    pub fn evacuate(
+    /// What `evacuation` takes, checked against the pool with nothing
+    /// moved ([`chunks::Chunks::prepare_evacuation`]).
+    pub fn prepare_evacuation(
+        &self,
+        evacuation: &engine::chunk::Evacuation,
+    ) -> Result<chunks::Evacuated> {
+        self.chunks.prepare_evacuation(evacuation)
+    }
+
+    /// `look` of the pool as `evacuated` would leave it: a dry run of what
+    /// reads where chunks lie, the pool as it stands after.
+    pub fn as_if<R>(
+        &mut self,
+        evacuated: &mut chunks::Evacuated,
+        look: impl FnOnce(&Pools) -> R,
+    ) -> R {
+        self.chunks.swap_table(evacuated);
+        let seen = look(self);
+        self.chunks.swap_table(evacuated);
+        seen
+    }
+
+    /// Moves the chunks `evacuated` names (see `Engine::evacuate`): the
+    /// copy enqueued behind every move still landing, then the table. A
+    /// copy that cannot be enqueued leaves the pool as it was.
+    pub fn move_chunks(
         &mut self,
         stream: *mut core::ffi::c_void,
-        evacuation: &engine::chunk::Evacuation,
+        evacuated: chunks::Evacuated,
     ) -> Result<()> {
-        self.fence_all_swaps(stream)?;
-        self.chunks.evacuate(stream, evacuation)?;
-        // The copy's own completion: `release_segments` settles it before
-        // the evacuated segment goes, so no later fire need retire first.
+        self.chunks.evacuate(stream, evacuated)
+    }
+
+    /// The device's copies of what follows the table, after
+    /// [`Pools::move_chunks`]: the copy's own completion held (so
+    /// `release_segments` settles it before the evacuated segment goes, and
+    /// no later fire need retire first), and each cached atom's table entry
+    /// where its chunk moved. It fails only where the device does.
+    pub fn restage_after_move(&mut self, stream: *mut core::ffi::c_void) -> Result<()> {
         self.hold_until(stream, Vec::new(), Vec::new())?;
-        // A cached atom's chunk may have moved: its table entry with it.
         self.stage_row_tables(stream)?;
         self.stage_expert_tables(stream)
     }

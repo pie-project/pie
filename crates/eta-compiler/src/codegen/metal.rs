@@ -39,7 +39,7 @@ pub const LIBRARY_FORMS: crate::plan::LibraryForms = crate::plan::LibraryForms {
     bf16_cut: false,
 };
 
-pub const METAL_M1_EMITTER_VERSION: u16 = 80;
+pub const METAL_M1_EMITTER_VERSION: u16 = 81;
 
 pub const METAL_M1_MAX_CHANNELS: usize = 29;
 

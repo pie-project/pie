@@ -1029,6 +1029,39 @@ impl Pool {
         Ok(())
     }
 
+    /// Takes back an evacuation whose copies landed ([`Self::evacuate`]):
+    /// each moved chunk copied, in `frame`, from where it lies now back to
+    /// where `before` (the table before it) put it, and the table restored.
+    /// A move's source lay free from the evacuation until now (nothing is
+    /// handed out while the verb runs), so the copies back land on bytes no
+    /// one else holds.
+    pub fn evacuate_back(
+        &mut self,
+        frame: &mut Frame,
+        evacuation: &Evacuation,
+        before: ChunkTable,
+    ) -> Result<()> {
+        for &(logical, _) in &evacuation.moves {
+            let now = self.physical(logical)?;
+            let was = before.physical(logical).ok_or_else(|| Fault::Ceiling {
+                what: "chunks of the state pool",
+                need: u64::from(logical) + 1,
+                have: u64::from(self.total_chunks),
+            })?;
+            if now == was {
+                continue;
+            }
+            self.copy(
+                frame,
+                u64::from(now) * self.chunk_bytes,
+                u64::from(was) * self.chunk_bytes,
+                self.chunk_bytes,
+            )?;
+        }
+        self.table = before;
+        Ok(())
+    }
+
     /// The host address of physical chunk `physical`'s bytes, valid until
     /// the segment holding it is given back; the caller writes through it
     /// only where no frame in flight reads them.
@@ -1063,6 +1096,30 @@ impl Pool {
             done += take;
         }
         Ok(())
+    }
+
+    /// Test builds (`test-slot-fill`): `len` bytes from `offset` of the
+    /// range set to 0xFF on the host, NaN in every float width
+    /// ([`super::super::device::elastic`]'s `poison`).
+    ///
+    /// # Safety
+    ///
+    /// No frame in flight reads or writes these bytes, and none committed
+    /// after this call reads them expecting what they held.
+    #[cfg(feature = "test-slot-fill")]
+    pub unsafe fn poison(&self, offset: u64, len: u64) -> Result<()> {
+        self.walk(offset, len, |part, local, _, take| {
+            #[cfg(target_vendor = "apple")]
+            {
+                // SAFETY: the caller's contract.
+                unsafe { part.store.poison(local, take) }
+            }
+            #[cfg(not(target_vendor = "apple"))]
+            {
+                let _ = (part, local, take);
+                Err(Fault::Deviceless)
+            }
+        })
     }
 
     /// `len` bytes from `offset` of the range as host runs `(from, len,

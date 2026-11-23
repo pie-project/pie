@@ -762,6 +762,9 @@ struct PendingLaunchBatch {
     /// Where the engine refused it for where state lies
     /// (`engine::Error::Placement`), the logical chunks it named.
     placement: Vec<u32>,
+    /// Refused so, its steps as the engine was handed them: the lanes its
+    /// requests go again by (`batch::restore_lanes`).
+    unfired: Vec<crate::engine::StepFire>,
 }
 
 /// Fires of a batch the engine refused for where state lies, held until
@@ -1404,11 +1407,15 @@ impl SchedulerHandle {
                 .and_then(|stores| stores.roles)
                 .map(|roles| roles.lock().unwrap().room_watch())
         };
-        // Whether `pieces` runs of `run` chunks stand free for its state.
+        // Whether `pieces` runs of `run` chunks stand free for its state,
+        // and the capacity gate lets them in.
         let fits = |run: u32, pieces: u32| {
             crate::store::registry::try_get(0, engine)
                 .and_then(|stores| stores.roles)
                 .is_some_and(|roles| roles.lock().unwrap().free_runs(run) >= pieces)
+                && crate::planner::planner_for(0, engine).is_none_or(|planner| {
+                    !planner.capacity_would_hold(pid, run.max(1).saturating_mul(pieces))
+                })
         };
         // Holding guest state of its own, it is suspended instead: waiting,
         // it would hold room its own bind lacks.
@@ -1808,6 +1815,7 @@ impl BatchScheduler {
                 // Nothing queued or in flight: the batch's ask goes while
                 // the scheduler sleeps.
                 batch_want.release();
+                lane.parks().parking();
                 match rx.recv().await {
                     Some(item) => Some(item),
                     None => {
@@ -1850,6 +1858,9 @@ impl BatchScheduler {
                 let have_settle = front_launch.is_some();
                 let have_control_settles = !control_settles.is_empty();
                 let mut reply_answer = None;
+                // The lane stays awake for this turn's launches only until
+                // the scheduler parks (`Lane::next_request`).
+                lane.parks().parking();
                 let parked = {
                     let settle_wait = async {
                         match front_launch {
@@ -3011,7 +3022,10 @@ impl BatchScheduler {
         for slots in slot_buffer.iter_mut() {
             let mut kept_wave = Vec::with_capacity(slots.len());
             for request in slots.iter_mut().filter_map(Option::take) {
-                if Self::admits_to_frame(&request, instances) {
+                if request.request.lanes.is_empty() {
+                    Self::refuse_laneless(&request);
+                    progress = true;
+                } else if Self::admits_to_frame(&request, instances) {
                     kept_wave.push(request);
                 } else {
                     progress = true;
@@ -3020,7 +3034,10 @@ impl BatchScheduler {
             survivors.push(kept_wave);
         }
         for (wave, request) in collisions {
-            if Self::admits_to_frame(&request, instances) {
+            if request.request.lanes.is_empty() {
+                Self::refuse_laneless(&request);
+                progress = true;
+            } else if Self::admits_to_frame(&request, instances) {
                 survivors[wave].push(request);
             } else {
                 progress = true;
@@ -3062,6 +3079,11 @@ impl BatchScheduler {
             .sum::<usize>();
         let (submission, requests) =
             batch::build_frame_submission(survivors, limits, page_size, stats);
+        debug_assert!(
+            !submission.steps.is_empty()
+                && submission.steps.iter().all(|step| !step.submission.lanes.is_empty()),
+            "a fire posted to the engine carries at least one lane in every step"
+        );
         let batch_size = requests.len() as u64;
         for request in &requests {
             if let Some(instance) = instances.get_mut(&request.instance_id) {
@@ -3077,8 +3099,22 @@ impl BatchScheduler {
             total_tokens,
             rung_rows: total_tokens.max(carried),
             placement: Vec::new(),
+            unfired: Vec::new(),
         });
         (true, true)
+    }
+
+    /// A fire with no lanes is never posted (the engine refuses it whole,
+    /// failing every fire beside it): it fails alone, by name. None is
+    /// formed so; one that reaches here is a runtime bug.
+    fn refuse_laneless(request: &PendingRequest) {
+        let reason = format!(
+            "scheduler: fire {} of pipeline {:?} carries no lanes (a runtime bug): it fails alone, \
+             never posted",
+            request.logical_fire_id, request.pipeline_id
+        );
+        tracing::error!("{reason}");
+        request.completion.reject_unsubmitted(reason);
     }
 
     /// Fires held for a refused chunk's move whose state has moved go
@@ -3165,7 +3201,7 @@ impl BatchScheduler {
                 }
                 _ => None,
             };
-            let retired = in_flight_launches.pop_front().expect("front batch exists");
+            let mut retired = in_flight_launches.pop_front().expect("front batch exists");
             tracing::debug!(
                 target: "pie::launch",
                 lanes = retired.requests.len(),
@@ -3193,6 +3229,36 @@ impl BatchScheduler {
                 // a runtime bug: said loudly, its fires go again one by
                 // one, and only one the engine still refuses alone fails.
                 if !retired.placement.is_empty() {
+                    // Its fires go again by the lanes the refused steps hand
+                    // back: the build moved them out of the requests, and a
+                    // request fired again without them is a fire with no
+                    // lanes. One a refused lane took out of the frame failed
+                    // alone already and goes nowhere again.
+                    let restored = batch::restore_lanes(
+                        &mut retired.requests,
+                        std::mem::take(&mut retired.unfired),
+                    );
+                    let mut again = Vec::with_capacity(retired.requests.len());
+                    for (request, back) in retired.requests.into_iter().zip(restored) {
+                        if back {
+                            again.push(request);
+                        } else if !request.completion.is_settled() {
+                            debug_assert!(false, "a fire refused for placement came back with no lanes");
+                            tracing::error!(
+                                engine_id,
+                                "scheduler: a fire refused for placement came back with no \
+                                 lanes to fire again by (a runtime bug): it fails"
+                            );
+                            request.completion.reject_unsubmitted(format!(
+                                "direct launch rejected: {message} (its lanes were not handed back)"
+                            ));
+                        }
+                    }
+                    retired.requests = again;
+                    if retired.requests.is_empty() {
+                        progress = true;
+                        continue;
+                    }
                     let repeat = retired.placement.iter().all(|chunk| refused_once.contains(chunk));
                     if !repeat || retired.requests.len() > 1 {
                         if repeat {
@@ -3323,6 +3389,7 @@ impl BatchScheduler {
             Err(refusal) => {
                 batch.state = LaunchState::Failed(refusal.message);
                 batch.placement = refusal.placement;
+                batch.unfired = refusal.unfired;
             }
         }
     }
@@ -3764,11 +3831,18 @@ mod tests {
         assert!(error.to_string().contains("unanswered"), "{error}");
     }
 
+    /// Fire `fire`'s request: one decode lane in slot `fire`, a page of its own.
     fn refused_request(fire: u64) -> Box<PendingRequest> {
+        let slot = u32::try_from(fire).expect("a test fire id");
         Box::new(PendingRequest {
             lora_program: false,
             logical_fire_id: fire,
-            request: crate::engine::FireRequest::default(),
+            request: crate::engine::FireRequest::one(crate::engine::fire::lane_of(
+                slot,
+                vec![100 + slot],
+                3,
+                vec![slot],
+            )),
             instance_id: ::engine::InstanceId(1),
             completion: crate::engine::WorkItemCompletion::new(1, 0),
             process_id: None,
@@ -3784,18 +3858,156 @@ mod tests {
         })
     }
 
-    fn refused_batch(fires: &[u64], chunks: &[u32]) -> PendingLaunchBatch {
+    fn refused_limits() -> SchedulerLimits {
+        SchedulerLimits {
+            max_forward_requests: 8,
+            max_forward_tokens: 64,
+            max_page_refs: 64,
+            max_context: 0,
+            prefill_rows: 0,
+            prefill_lanes: 0,
+            max_readouts: 0,
+            readout_store: 0,
+        }
+    }
+
+    /// `requests` built into a frame the engine refused for where `chunks`
+    /// lie before any step ran: its steps come back with the refusal, as
+    /// the lane hands them (`LaunchRefusal::unfired`).
+    fn refused_frame(requests: Vec<Box<PendingRequest>>, chunks: &[u32]) -> PendingLaunchBatch {
+        let fires = requests.len();
+        let (frame, requests) = batch::build_frame_submission(
+            vec![requests],
+            refused_limits(),
+            16,
+            &SchedulerStats::default(),
+        );
         PendingLaunchBatch {
             state: LaunchState::Failed(
                 "impossible submission: state chunk 2057 lies inside the carve".into(),
             ),
-            requests: fires.iter().map(|&fire| refused_request(fire)).collect(),
+            requests,
             started: Instant::now(),
-            batch_size: fires.len() as u64,
-            total_tokens: fires.len(),
-            rung_rows: fires.len(),
+            batch_size: fires as u64,
+            total_tokens: fires,
+            rung_rows: fires,
             placement: chunks.to_vec(),
+            unfired: frame.steps,
         }
+    }
+
+    fn refused_batch(fires: &[u64], chunks: &[u32]) -> PendingLaunchBatch {
+        refused_frame(fires.iter().map(|&fire| refused_request(fire)).collect(), chunks)
+    }
+
+    /// beamx40 on M1 (6ea0b14ef): a frame refused for where state lies went
+    /// again from requests the build had moved its lanes out of, and the
+    /// engine refused it whole, "a fire carries no lanes", poisoning a
+    /// rescore pipeline's channel. A fire refused for placement goes again
+    /// with every lane, page and token it was built with; one a refused
+    /// lane took out of the frame (failed alone) does not go again; and a
+    /// fire with no lanes is never posted, failing alone by name.
+    fn a_frame_refused_for_placement_goes_again_with_every_lane_it_was_built_with() {
+        let engine = 9_998;
+        let stats = Arc::new(SchedulerStats::default());
+        let mut policy = FramePolicy::new(1, 64, 4096, None);
+        let (mut held, mut refused_once) = (Vec::new(), HashSet::new());
+        let built: Vec<_> = [7, 8, 9].map(refused_request).into_iter().collect();
+        // What the build stamps (the fires after it in its frame) aside.
+        let lanes_of = |request: &PendingRequest| {
+            let mut lanes = request.request.lanes.clone();
+            for lane in &mut lanes {
+                lane.fires_after = None;
+            }
+            lanes
+        };
+        let before: Vec<_> = built.iter().map(|request| lanes_of(request)).collect();
+        // Fire 9 rode the frame, but a refused lane took it out (failed
+        // alone) before the placement refusal: it is in no step.
+        let gone = refused_request(9);
+        gone.completion.reject_unsubmitted("engine: lane 2 refused".to_string());
+        let mut batch = refused_frame(built.into_iter().take(2).collect(), &[2057]);
+        assert!(
+            batch.requests.iter().all(|request| request.request.lanes.iter().all(|lane| lane.tokens.is_empty())),
+            "the build moved the lanes into the steps"
+        );
+        batch.requests.push(gone);
+        let mut flight = VecDeque::from([batch]);
+        assert!(BatchScheduler::retire_ready_launches(
+            &mut flight,
+            &mut HashMap::new(),
+            &stats,
+            &mut policy,
+            &mut held,
+            &mut refused_once,
+            engine,
+        ));
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].requests.len(), 2, "the fire failed alone goes nowhere again");
+        let mut pending = PendingQueue::default();
+        assert!(BatchScheduler::release_held(&mut held, &mut pending, engine));
+        let again: Vec<Box<PendingRequest>> = std::mem::take(&mut pending.items)
+            .into_iter()
+            .map(|item| match item {
+                QueuedItem::Launch(launch) => launch.into_request(),
+                _ => panic!("only launches go again"),
+            })
+            .collect();
+        for (request, lanes) in again.iter().zip(&before) {
+            assert!(!request.completion.is_settled(), "none failed");
+            assert_eq!(&lanes_of(request), lanes, "every lane, page and token it was built with");
+        }
+        let (frame, _) =
+            batch::build_frame_submission(vec![again], refused_limits(), 16, &SchedulerStats::default());
+        assert!(!frame.steps.is_empty());
+        assert!(
+            frame.steps.iter().all(|step| step.submission.validate().is_ok()),
+            "the engine takes the fire it goes again as"
+        );
+
+        // A request with no lanes reaching the post fails alone, by name,
+        // and what rides beside it is posted.
+        let mut laneless = refused_request(11);
+        laneless.request.lanes.clear();
+        laneless.frame = None;
+        let laneless_completion = laneless.completion.clone();
+        let mut beside = refused_request(12);
+        beside.frame = None;
+        let instance = ::engine::InstanceId(1);
+        let bound = crate::engine::BoundInstance::new(
+            &::engine::BoundInstance {
+                id: instance,
+                program: ::engine::ProgramId::default(),
+                geometry: eta_ir::registry::GeometryClass::default(),
+                standing_guest_bytes: 0,
+            },
+            0,
+        );
+        let mut instances = HashMap::from([(instance, TrackedInstance::from_bound(&bound))]);
+        let mut pending = PendingQueue::default();
+        pending.push_back(QueuedItem::Launch(QueuedLaunch::new(laneless)));
+        pending.push_back(QueuedItem::Launch(QueuedLaunch::new(beside)));
+        let mut lane = Lane::spawn(9_997, None, Arc::clone(&stats));
+        let mut replies = LaneReplies::default();
+        let mut posted = VecDeque::new();
+        let (progress, fired) = BatchScheduler::post_frame(
+            &mut SlotBuffer::new(),
+            &mut FramePolicy::new(1, 64, 4096, None),
+            &lane,
+            &mut replies,
+            &mut instances,
+            &mut pending,
+            &mut posted,
+            16,
+            refused_limits(),
+            &stats,
+            &[vec![11, 12]],
+        );
+        assert!(progress && fired);
+        assert!(laneless_completion.is_settled(), "the fire with no lanes fails alone");
+        assert_eq!(posted.len(), 1);
+        assert_eq!(posted[0].requests.len(), 1, "only the fire beside it is posted");
+        lane.shutdown();
     }
 
     /// Mac Pro at 5 GiB on 6c21ebca3: one launch refused "impossible
@@ -3866,6 +4078,7 @@ mod tests {
     #[test]
     fn worker_every_case() {
         a_launch_refused_for_placement_is_fired_again_after_the_move_failing_none();
+        a_frame_refused_for_placement_goes_again_with_every_lane_it_was_built_with();
         a_panicking_engine_fails_its_launch_instead_of_leaving_it_in_flight();
         a_retryable_refusal_past_admission_fails_by_name_instead_of_replaying();
         a_launch_waits_for_the_copy_queued_ahead_of_it();

@@ -1531,6 +1531,26 @@ impl SharedPool {
         Ok(slots.iter().map(|&slot| self.pool.slot_ref(slot)).collect())
     }
 
+    /// The chunks of `shape`'s single slots and the slots a chunk holds
+    /// ([`SlotPool::single_chunks`]).
+    #[must_use]
+    pub fn single_chunks(&self, shape: ShapeId) -> (u32, Vec<super::slots::SingleChunk>) {
+        let spc = self.pool.shape(shape).map_or(0, |s| s.slots_per_chunk);
+        (spc, self.pool.single_chunks(shape))
+    }
+
+    /// `n` slots of `shape` for the store outside logical chunks
+    /// `outside`, as slot refs ([`SlotPool::acquire_outside`]).
+    pub fn take_refs_outside(
+        &mut self,
+        shape: ShapeId,
+        n: u64,
+        outside: &std::collections::BTreeSet<u32>,
+    ) -> Option<Vec<u32>> {
+        let slots = self.pool.acquire_outside(STORE, shape, n, outside)?;
+        Some(slots.iter().map(|&slot| self.pool.slot_ref(slot)).collect())
+    }
+
     /// The store lets `refs` of `shape` go; no fire reads them any more.
     pub fn give_refs(&mut self, shape: ShapeId, refs: &[u32]) {
         let slots: Vec<Slot> = refs.iter().map(|&r| self.slot(shape, r)).collect();

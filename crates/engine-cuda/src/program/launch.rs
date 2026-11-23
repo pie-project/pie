@@ -482,9 +482,16 @@ impl Rings {
     /// Points the rings at `place`: where the pool's slots they lie in are
     /// now. Every fire staged after addresses them there.
     pub fn rebase(&mut self, place: &Place) -> Result<()> {
-        let slots = self.shapes.len();
-        let mut cells = Vec::with_capacity(slots);
-        for channel in 0..slots {
+        let cells = self.cells(place)?;
+        self.rebase_to(place, cells);
+        Ok(())
+    }
+
+    /// Each ring's cell at `place`: refused where a ring only the device
+    /// touches has nowhere to lie. Nothing is pointed.
+    pub fn cells(&self, place: &Place) -> Result<Vec<u64>> {
+        let mut cells = Vec::with_capacity(self.shapes.len());
+        for channel in 0..self.shapes.len() {
             let own = place.rings.get(channel).copied().unwrap_or(0);
             cells.push(match self.held.native_at[channel] {
                 Some(at) => place.instance + at,
@@ -501,6 +508,12 @@ impl Rings {
                 }
             });
         }
+        Ok(cells)
+    }
+
+    /// The rings pointed at `place`, their `cells` there ([`Self::cells`]).
+    pub fn rebase_to(&mut self, place: &Place, cells: Vec<u64>) {
+        let slots = self.shapes.len();
         let words = (slots * size_of::<u32>()) as u64;
         self.cells = cells;
         self.registry = place.instance;
@@ -511,7 +524,6 @@ impl Rings {
             place.instance + 2 * words,
             u32::try_from(slots).unwrap_or(u32::MAX),
         );
-        Ok(())
     }
 
     /// Where the instance's item lies now.
@@ -765,7 +777,9 @@ pub struct Prepared {
     /// ([`row_split_max`]), a region each.
     row_split_most: Vec<u32>,
     /// The launches (phases) each region runs in ([`LaunchRegion::phases`]):
-    /// a region whose rows split, once a phase; every other region once.
+    /// a region compiled to split its rows, once a phase, whether or not
+    /// this fire splits them (past [`LANE_SAMPLER_BLOCKS`] rows each runs
+    /// on one block, its phases one after another); every other region once.
     phases: Vec<u32>,
     lanes: u32,
     filled: u32,
@@ -1089,12 +1103,7 @@ impl Prepared {
             .zip(&rows_of)
             .map(|(region, &rows)| row_split_max(plan, &descriptors, region, rows))
             .collect();
-        let phases = plan
-            .fused
-            .iter()
-            .zip(&rows_of)
-            .map(|(region, &rows)| if splits_rows(region, rows) { region.phases.max(1) } else { 1 })
-            .collect();
+        let phases = plan.fused.iter().map(|region| region.phases.max(1)).collect();
 
         let mut records = Vec::with_capacity(plan.ops.len());
         let mut result_base = 0u32;

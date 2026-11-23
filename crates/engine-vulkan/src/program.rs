@@ -1,19 +1,17 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
 
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
 use engine::program::{
-    BoundInstance, Footprint, InstanceBinding, InstanceId, ProgramFacts, ProgramId, Rebind,
-    RingFacts,
+    BoundInstance, InstanceBinding, InstanceId, ProgramFacts, ProgramId, Rebind, RingFacts,
 };
 use engine_gpu::program::Place;
 use engine_gpu::store::Pools;
-use engine_gpu::store::layout::{CHANNEL, INSTANCE};
+use engine_gpu::store::layout::INSTANCE;
 #[cfg(feature = "vulkan")]
 use eta_exec::StepOutcome;
 use eta_exec::{ChannelState, ExecPlan, HostOp, InterpInstance, PassInputs, Value};
-use eta_ir::container::{ChanDType, HostRole};
 use eta_ir::registry::{GeometryClass, Port, Stage};
 
 use engine_gpu::program::Refusal;
@@ -38,6 +36,11 @@ struct Instance {
     /// it is repointed, claimed or fired meanwhile.
     #[cfg(feature = "vulkan")]
     parked: bool,
+    /// Its park kept its tables in place (`Rebind::Parked { kept }`): they
+    /// stay claimed, and an evacuation moves their claim as a bound
+    /// instance's.
+    #[cfg(feature = "vulkan")]
+    kept: bool,
 
     /// The channels whose device cells this instance holds itself (none
     /// registered covers them), in its `ring_slots`.
@@ -62,193 +65,11 @@ fn parked_fire(instance: InstanceId) -> Refusal {
     ))
 }
 
-/// One attachment's pass the step's deferred frame carries: its instance,
-/// its lanes, and what its fire read out for each of them.
+/// One attachment's pass the step's deferred frame carries.
 #[cfg(feature = "vulkan")]
-pub struct DeferredPass<'a> {
-    pub instance: InstanceId,
-    pub lanes: std::ops::Range<u32>,
-    pub seats: Vec<Vec<crate::guest::run::Readout<'a>>>,
-}
-
-/// A pass recorded into the step's deferred frame: its berth, the ring cells
-/// it owes the host, and where its instance learns it landed.
-#[cfg(feature = "vulkan")]
-struct Recorded {
-    instance: InstanceId,
-    program: ProgramId,
-    lanes: std::ops::Range<u32>,
-    pass: crate::guest::session::Pass,
-    fixups: Vec<(Arc<ChannelState>, u64, crate::guest::run::Landing)>,
-    owed: Vec<(u32, u64)>,
-    owing: Arc<Owed>,
-    faulted: Arc<AtomicBool>,
-}
-
-#[cfg(feature = "vulkan")]
-impl Recorded {
-    /// `seat`'s pass, its cells owed from now until it lands.
-    fn of(
-        seat: &Instance,
-        instance: InstanceId,
-        lanes: std::ops::Range<u32>,
-        pass: crate::guest::session::Pass,
-        landings: Vec<crate::guest::run::Landing>,
-    ) -> Recorded {
-        let fixups: Vec<(Arc<ChannelState>, u64, crate::guest::run::Landing)> = landings
-            .into_iter()
-            .map(|landing| {
-                let ring = Arc::clone(&seat.inst.channels[landing.channel as usize]);
-                let sequence = ring.tail().saturating_sub(1);
-                (ring, sequence, landing)
-            })
-            .collect();
-        let owed: Vec<(u32, u64)> = fixups
-            .iter()
-            .map(|(_, sequence, landing)| (landing.channel, *sequence))
-            .collect();
-        seat.landing.owe(&owed);
-        Recorded {
-            instance,
-            program: seat.program,
-            lanes,
-            pass,
-            fixups,
-            owed,
-            owing: Arc::clone(&seat.landing),
-            faulted: Arc::clone(&seat.faulted),
-        }
-    }
-
-    /// The pass never reaches the queue: what waits on its cells finds the
-    /// instance poisoned rather than waiting on.
-    fn never(self) {
-        self.faulted.store(true, Ordering::Release);
-        self.owing.land(&self.owed);
-    }
-
-    /// The frame landed (or the queue refused it, `refused`): the host's
-    /// cells into the rings, the berth back to the ring, and why its lanes
-    /// fault, if they do.
-    fn land(self, refused: Option<String>) -> Option<String> {
-        let Recorded {
-            instance,
-            program,
-            pass,
-            fixups,
-            owed,
-            owing,
-            faulted,
-            ..
-        } = self;
-        let mut fault = refused.or_else(|| match pass.status() {
-            Ok(None) => None,
-            Ok(Some(code)) => Some(format!(
-                "instance {instance} (program {program}) faulted on the device with code {code}"
-            )),
-            Err(why) => Some(why.to_string()),
-        });
-        if fault.is_none() {
-            for (ring, sequence, landing) in &fixups {
-                match crate::guest::run::landed_value(&pass, landing) {
-                    Ok(value) => ring.encode_sequence(*sequence, &value),
-                    Err(why) => {
-                        fault = Some(why.to_string());
-                        break;
-                    }
-                }
-            }
-        }
-        if fault.is_some() {
-            faulted.store(true, Ordering::Release);
-        }
-        owing.land(&owed);
-        // The pass's berth goes back to the ring as it drops.
-        drop(pass);
-        fault
-    }
-}
-
-/// Ring cells a pass on the queue has yet to land, as (channel, sequence):
-/// the ring holds a cell for each from the pass's submit, and its value only
-/// once the pass's frame lands. Each landing wakes whoever waits on one.
-#[derive(Debug, Default)]
-struct Owed {
-    cells: Mutex<Vec<(u32, u64)>>,
-    landed: Condvar,
-}
-
-impl Owed {
-    #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
-    fn owe(&self, cells: &[(u32, u64)]) {
-        self.cells
-            .lock()
-            .expect("landing lock poisoned")
-            .extend(cells.iter().copied());
-    }
-
-    fn owes(&self, cell: (u32, u64)) -> bool {
-        self.cells
-            .lock()
-            .expect("landing lock poisoned")
-            .contains(&cell)
-    }
-
-    /// The pass that owed `cells` landed them (or faulted).
-    #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
-    fn land(&self, cells: &[(u32, u64)]) {
-        self.cells
-            .lock()
-            .expect("landing lock poisoned")
-            .retain(|cell| !cells.contains(cell));
-        self.landed.notify_all();
-    }
-
-    /// Waits, woken by each landing, until `cell` holds its value or the
-    /// instance faulted.
-    fn wait(&self, cell: (u32, u64), faulted: &AtomicBool) {
-        let mut cells = self.cells.lock().expect("landing lock poisoned");
-        while cells.contains(&cell) && !faulted.load(Ordering::Acquire) {
-            cells = self.landed.wait(cells).expect("landing lock poisoned");
-        }
-    }
-}
-
-/// The count `ring`, channel `channel` of `instance`'s `fold` port, holds at
-/// the fire. The next fire's count is what this one's pass puts, so a fire
-/// staged while that pass is on the queue finds its cell in the ring before
-/// the value is: it waits for the landing, which keeps the fold exact at the
-/// cost of running such fires one after another. A fire whose count is
-/// already in the ring reads it at once.
-fn fold_count(
-    instance: InstanceId,
-    channel: u32,
-    ring: &ChannelState,
-    owed: &Owed,
-    faulted: &AtomicBool,
-) -> Result<Option<u32>, Refusal> {
-    owed.wait((channel, ring.head()), faulted);
-    if faulted.load(Ordering::Acquire) {
-        return Err(Refusal::Program(format!("instance {instance} is poisoned")));
-    }
-    if ring.is_empty() {
-        return Err(Refusal::Program(format!(
-            "instance {instance}: the `fold` ring is empty at the fire"
-        )));
-    }
-    let len = match ring.front() {
-        Value::U32(cells) => cells.first().copied(),
-        Value::I32(cells) => cells.first().map(|&n| n.max(0) as u32),
-        other => {
-            return Err(Refusal::Program(format!(
-                "instance {instance}: `fold` holds {:?}, not a count",
-                other.dtype()
-            )));
-        }
-    };
-    len.map(Some)
-        .ok_or_else(|| Refusal::Program(format!("instance {instance}: `fold` holds an empty cell")))
-}
+pub type DeferredPass<'a> =
+    engine_gpu::guest::defer::DeferredPass<Vec<Vec<crate::guest::run::Readout<'a>>>>;
+use engine_gpu::guest::defer::{Owed, cell_facts, device_cell_bytes, fold_count, puts_into};
 
 #[derive(Default)]
 pub struct Plane {
@@ -351,7 +172,13 @@ impl Plane {
         {
             #[cfg(feature = "vulkan")]
             {
-                let cell = self.cell(place, registration.id, bytes, &registration.slots)?;
+                let cell = crate::guest::session::Cell::of(
+                    place.pools,
+                    place.device,
+                    registration.id,
+                    bytes,
+                    &registration.slots,
+                )?;
                 self.kept
                     .lock()
                     .expect("kept cells lock poisoned")
@@ -500,7 +327,10 @@ impl Plane {
                     .iter()
                     .find(|ring| ring.channel == dense as u32)
                     .map_or(&[][..], |ring| ring.slots.as_slice());
-                cells.push((id, self.cell(place, id, bytes, slots)?));
+                cells.push((
+                    id,
+                    crate::guest::session::Cell::of(place.pools, place.device, id, bytes, slots)?,
+                ));
             }
             let mut kept = self.kept.lock().expect("kept cells lock poisoned");
             for (id, cell) in cells {
@@ -526,6 +356,8 @@ impl Plane {
                 pair_generation: binding.pair_generation,
                 #[cfg(feature = "vulkan")]
                 parked: false,
+                #[cfg(feature = "vulkan")]
+                kept: false,
                 own_cells,
                 landing: Arc::default(),
                 faulted: Arc::default(),
@@ -641,10 +473,30 @@ impl Plane {
         #[cfg(feature = "vulkan")]
         {
             let program = Refusal::fault;
-            // A parked instance's slots are another owner's: repointed and
-            // claimed at its rebind, not here.
-            for seat in self.instances.values_mut().filter(|seat| !seat.parked) {
-                seat.session.rebind(pools).map_err(program)?;
+            // Every holder's runs where the evacuation left them, claimed
+            // in one step before a set is pointed there. A parked instance
+            // that shed its state holds nothing here: repointed and claimed
+            // at its rebind. One whose park kept its tables in place holds
+            // them, where the evacuation moved them.
+            let mut moved: Vec<(engine::guest_claims::Holder, Vec<engine::guest_claims::Run>)> =
+                Vec::new();
+            for seat in self
+                .instances
+                .values_mut()
+                .filter(|seat| !seat.parked || seat.kept)
+            {
+                for (holder, runs) in seat.session.relocate(pools, seat.parked).map_err(program)? {
+                    // A pair's members each name its runs: claimed once.
+                    if !moved.iter().any(|(held, _)| *held == holder) {
+                        moved.push((holder, runs));
+                    }
+                }
+            }
+            if let Some(library) = &self.library {
+                library.claim_moved(&moved).map_err(program)?;
+            }
+            for seat in self.instances.values().filter(|seat| !seat.parked) {
+                seat.session.repoint().map_err(program)?;
             }
             for cell in self
                 .kept
@@ -704,6 +556,7 @@ impl Plane {
                     }
                     seat.pair_generation = *pair_generation;
                     seat.parked = false;
+                    seat.kept = false;
                     seat.session.clear(fresh_pair).map_err(program)?;
                     let mut kept = self.kept.lock().expect("kept cells lock poisoned");
                     for ring in rings {
@@ -730,6 +583,7 @@ impl Plane {
                     })?;
                     // Said again by a move down of its tables: kept nowhere now.
                     seat.session.park(*kept).map_err(program)?;
+                    seat.kept = *kept;
                     if !seat.parked {
                         // It leaves its pair's taking as it leaves the group.
                         self.takings
@@ -759,38 +613,6 @@ impl Plane {
         #[cfg(not(feature = "vulkan"))]
         let _ = (pools, rebind);
         Ok(())
-    }
-
-    /// A device cell of `bytes` for channel `id` in `slots`: a run of
-    /// `Channel` slots, or, past a chunk, a buffer of the engine's own.
-    #[cfg(feature = "vulkan")]
-    fn cell(
-        &self,
-        place: &Place<'_, crate::device::Api>,
-        id: ChannelId,
-        bytes: u64,
-        slots: &[u32],
-    ) -> Result<crate::guest::session::Cell, Refusal> {
-        let program = Refusal::fault;
-        let slot_bytes = place.pools.slot_bytes(CHANNEL).map_err(program)?;
-        let per_chunk = place.pools.slots_per_chunk(CHANNEL).map_err(program)?;
-        match engine_gpu::guest::held::item_slots(bytes, slot_bytes, per_chunk) {
-            Some((need, _)) if slots.len() == need as usize => {
-                crate::guest::session::Cell::pooled(place.pools, slots, bytes).map_err(program)
-            }
-            Some((need, _)) => Err(Refusal::Program(format!(
-                "channel {id}'s device cell of {bytes} bytes takes {need} channel slot(s) and \
-                 the binding names {slots:?}"
-            ))),
-            None if slots.is_empty() => {
-                crate::guest::session::Cell::own(place.device, bytes).map_err(program)
-            }
-            None => Err(Refusal::Program(format!(
-                "channel {id}'s device cell of {bytes} bytes is past a chunk, the engine's to \
-                 keep, and the binding names {} channel slot(s) for it",
-                slots.len()
-            ))),
-        }
     }
 
     pub fn input_cell(
@@ -1152,27 +974,13 @@ impl Plane {
         lane_at: usize,
     ) -> Option<engine_gpu::serve::DeviceCell<crate::device::Api>> {
         let seat = self.instances.get(&instance)?;
-        if !seat.geometry.ports().contains(Port::EmbedTokens) {
-            return None;
-        }
-        let binding = seat
-            .plan
-            .package
-            .ports
-            .iter()
-            .find(|binding| binding.port == Port::EmbedTokens && !binding.is_const)?;
-        let mut cell = seat.session.kept_cell(binding.channel)?;
-        if lane_at > 0 {
-            let indptr = engine_gpu::program::embed_indptr(&seat.plan, &seat.inst);
-            let start = u64::from(*indptr.get(lane_at)?);
-            let end = u64::from(*indptr.get(lane_at + 1)?);
-            if end != start + 1 || end * 4 > cell.bytes {
-                return None;
-            }
-            cell.at += start * 4;
-            cell.bytes = 4;
-        }
-        Some(cell)
+        engine_gpu::guest::defer::token_feed(
+            &seat.plan,
+            &seat.inst,
+            seat.geometry,
+            seat.session.cells(),
+            lane_at,
+        )
     }
 
     /// Whether `instance`'s pass can be recorded to land later: one stage,
@@ -1207,6 +1015,7 @@ impl Plane {
         device: &crate::device::Context,
         done: Option<engine_gpu::settle::Done>,
     ) -> Result<(), Refusal> {
+        use engine_gpu::guest::defer::{Recorded, Recording, outcome_of};
         let Plane {
             instances,
             tally,
@@ -1228,145 +1037,70 @@ impl Plane {
                     .to_owned(),
             )
         })?;
-        let mut frame: Option<crate::device::ctx::Frame> = None;
-        let mut recorded: Vec<Recorded> = Vec::new();
-        let mut faults: Vec<(std::ops::Range<u32>, InstanceId, String)> = Vec::new();
-        for DeferredPass {
-            instance,
-            lanes,
-            seats,
-        } in passes
-        {
-            let seat = instances.get_mut(&instance).ok_or(Refusal::Closed {
-                what: "instance",
-                id: instance.0,
-            })?;
-            let program = seat.program;
-            let refused = match offered_read(seat, instance, &seats) {
-                Err(refusal) => Some((refusal.to_string(), false)),
-                Ok(()) => {
-                    let inputs = PassInputs::none();
-                    let mut runner =
-                        crate::guest::run::OnDevice::new(device, &mut seat.session, widen, seats)
-                            .deferred(frame.take());
-                    let outcome = eta_exec::step_with(
-                        &mut seat.inst,
-                        &seat.plan,
-                        &inputs,
-                        &mut runner,
-                        Stage::Epilogue,
-                    );
-                    let deferral = runner.take_deferral().unwrap_or_default();
-                    let crate::guest::run::Deferral {
-                        frame: left,
+        let mut departs: Vec<(InstanceId, crate::device::Pending)> = Vec::new();
+        let record = |pass: DeferredPass<'_>, frame: Option<crate::device::ctx::Frame>| {
+            let DeferredPass {
+                instance,
+                lanes,
+                seats,
+            } = pass;
+            let Some(seat) = instances.get_mut(&instance) else {
+                return Recording {
+                    frame,
+                    pass: Err(format!("instance {instance} is closed")),
+                };
+            };
+            if let Err(refused) = offered_read(seat, instance, &seats) {
+                return Recording {
+                    frame,
+                    pass: Err(refused.to_string()),
+                };
+            }
+            let inputs = PassInputs::none();
+            let mut runner =
+                crate::guest::run::OnDevice::new(device, &mut seat.session, widen, seats)
+                    .deferred(frame);
+            let outcome = eta_exec::step_with(
+                &mut seat.inst,
+                &seat.plan,
+                &inputs,
+                &mut runner,
+                Stage::Epilogue,
+            );
+            let crate::guest::run::Deferral {
+                frame,
+                pass,
+                landings,
+            } = runner.take_deferral().unwrap_or_default();
+            let committed = matches!(outcome, StepOutcome::Committed);
+            if committed {
+                *tally += 1;
+            }
+            let pass = outcome_of(outcome, instance, seat.program, || {
+                pass.map(|pass| {
+                    Recorded::of(
+                        instance,
+                        seat.program,
+                        lanes,
                         pass,
                         landings,
-                    } = deferral;
-                    let lost = left.is_none() && (pass.is_some() || !recorded.is_empty());
-                    frame = left;
-                    match outcome {
-                        StepOutcome::Committed => {
-                            *tally += 1;
-                            if let Some(pass) = pass {
-                                recorded.push(Recorded::of(
-                                    seat,
-                                    instance,
-                                    lanes.clone(),
-                                    pass,
-                                    landings,
-                                ));
-                            }
-                            None
-                        }
-                        StepOutcome::Blocked(channel) => Some((
-                            format!(
-                                "instance {instance} (program {program}) blocked on channel {channel}"
-                            ),
-                            lost,
-                        )),
-                        StepOutcome::Faulted(why) => Some((
-                            format!("instance {instance} (program {program}) faulted: {why}"),
-                            lost,
-                        )),
-                    }
-                }
-            };
-            if let Some((why, lost)) = refused {
-                // The pass faulted on the host: its own lanes fault, and the
-                // step's other lanes commit.
-                tracing::warn!(instance = instance.0, %why, "a deferred guest epilogue faulted its lanes");
-                faults.push((lanes, instance, why));
-                if lost {
-                    for pass in recorded.drain(..) {
-                        let why = format!(
-                            "instance {} (program {}): the frame its pass was recorded into was lost when a later pass of the step faulted",
-                            pass.instance, pass.program
-                        );
-                        faults.push((pass.lanes.clone(), pass.instance, why));
-                        pass.never();
-                    }
-                }
-            }
-        }
-        let tell = |done: Option<engine_gpu::settle::Done>,
-                    faults: &[(std::ops::Range<u32>, InstanceId, String)]| {
-            if let Some(done) = done {
-                let mut outcome = done.settled();
-                for (lanes, instance, why) in faults {
-                    outcome.fault_lanes(lanes.clone(), Some(*instance), why);
-                }
-                (done.sink)(done.at, outcome);
-            }
+                        &seat.inst.channels,
+                        &seat.landing,
+                        &seat.faulted,
+                    )
+                })
+            });
+            Recording { frame, pass }
         };
-        let Some(frame) = frame else {
-            tell(done, &faults);
-            return Ok(());
-        };
-        let seats_of: Vec<InstanceId> = recorded.iter().map(|pass| pass.instance).collect();
-        let held = Arc::new(Mutex::new(recorded));
-        let landing = Arc::clone(&held);
-        let on_done = move |refused: Option<String>| {
-            // The queue refusing the buffer the step's forward and these
-            // passes rode is the step lost whole; what each pass's own
-            // status and landing say is its lanes'.
-            let lost = refused.clone();
-            let mut faults = faults;
-            for pass in landing.lock().expect("passes lock poisoned").drain(..) {
-                let (lanes, instance) = (pass.lanes.clone(), pass.instance);
-                if let Some(why) = pass.land(refused.clone()) {
-                    faults.push((lanes, instance, why));
-                }
-            }
-            if let Some(done) = done.as_ref() {
-                if lost.is_some() {
-                    done.tell(lost, "vulkan guest pass");
-                    return;
-                }
-                let mut outcome = done.settled();
-                for (lanes, instance, why) in &faults {
-                    outcome.fault_lanes(lanes.clone(), Some(*instance), why);
-                }
-                (done.sink)(done.at, outcome);
-            }
-        };
-        let pending = match frame.commit_async(Some(Box::new(on_done))) {
-            Ok(pending) => pending,
-            Err(fault) => {
-                // A frame that never went to the queue lands nothing: what
-                // waits on its cells finds the instances poisoned rather
-                // than waiting on.
-                for pass in held.lock().expect("passes lock poisoned").drain(..) {
-                    pass.never();
-                }
-                return Err(Refusal::Program(format!(
-                    "a deferred guest frame of {} pass(es): {fault}",
-                    seats_of.len()
-                )));
-            }
-        };
-        for instance in seats_of {
+        engine_gpu::guest::defer::fire_deferred::<crate::device::Api, _, _>(
+            passes,
+            record,
+            done,
+            |instance, pending| departs.push((instance, pending)),
+        )?;
+        for (instance, pending) in departs {
             if let Some(seat) = instances.get_mut(&instance) {
-                seat.session.depart(pending.clone());
+                seat.session.depart(pending);
             }
         }
         Ok(())
@@ -1651,143 +1385,25 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
     }
 }
 
-/// Whether a stage of `plan` puts into its channel `channel`.
-fn puts_into(plan: &ExecPlan, channel: u32) -> bool {
-    plan.package
-        .stages
-        .iter()
-        .any(|stage| stage.puts.iter().any(|put| put.channel == channel))
-}
-
-/// The bytes a channel's cell takes on the device, where a pass may keep one
-/// there: a channel the host does not read (`guest::run`). A value lies in a
-/// guest heap at its dtype's width an element (`eta_exec::element_bytes`,
-/// as `ValueDesc::device_bytes` lays it).
-fn device_cell_bytes(shape: &[u32], dtype: ChanDType, host_role: HostRole) -> Option<u64> {
-    if host_role == HostRole::Reader {
-        return None;
-    }
-    let numel = numel_of(shape) as u64;
-    let element = eta_exec::element_bytes(eta_exec::concrete_dtype(dtype));
-    Some(numel.saturating_mul(element).max(4))
-}
-
-/// A channel's device cell as `Channel` slots: a slot where the cell fits
-/// one, else a run of adjacent slots (`Footprint::contiguous`); none where
-/// the host reads the channel, or the cell is past a chunk (the engine
-/// keeps that one).
-fn cell_facts(
-    channel: u32,
-    shape: &[u32],
-    dtype: ChanDType,
-    capacity: u32,
-    host_role: HostRole,
-    pools: &Pools<crate::device::Api>,
-) -> Result<Option<RingFacts>, Refusal> {
-    let Some(bytes) = device_cell_bytes(shape, dtype, host_role) else {
-        return Ok(None);
-    };
-    let program = Refusal::fault;
-    let slot_bytes = pools.slot_bytes(CHANNEL).map_err(program)?;
-    let per_chunk = pools.slots_per_chunk(CHANNEL).map_err(program)?;
-    Ok(
-        engine_gpu::guest::held::item_slots(bytes, slot_bytes, per_chunk).map(
-            |(slots, contiguous)| RingFacts {
-                channel,
-                cell_bytes: eta_exec::wire_cell_bytes(
-                    eta_exec::concrete_dtype(dtype),
-                    numel_of(shape),
-                ) as u64,
-                capacity,
-                footprint: Footprint {
-                    bytes,
-                    slots,
-                    contiguous,
-                },
-            },
-        ),
+/// What a pass is offered it reads: every seat the fire read out for its
+/// lanes (the arm's seat, or rows where they lie in the fire's span) is a
+/// row of an output the program reads, else the pass is refused by name.
+#[cfg(feature = "vulkan")]
+fn offered_read(
+    seat: &Instance,
+    instance: InstanceId,
+    seats: &[Vec<crate::guest::run::Readout<'_>>],
+) -> Result<(), Refusal> {
+    let session = &seat.session;
+    let unread = engine_gpu::guest::run::unread_seat(
+        &seat.plan.package,
+        |at, local| session.span(at, local).map(|(_, held)| held),
+        seats,
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{AtomicBool, ChannelState, InstanceId, Ordering, Owed, Value, fold_count};
-    use std::sync::Arc;
-
-    /// Two fires in flight, each folding by the count the pass before it
-    /// puts: the pass's cell is in the `fold` ring from its submit, its
-    /// value only once its frame lands. A fire staged behind a pass on the
-    /// queue reads the count that pass lands, not the cell's placeholder,
-    /// and a fire whose count is in the ring reads it at once.
-    #[test]
-    fn a_fire_staged_behind_a_pass_in_flight_reads_the_count_it_lands() {
-        const FOLD: u32 = 3;
-        let instance = InstanceId(1);
-        let ring = Arc::new(ChannelState::host(eta_ir::Dtype::U32, 1, 4));
-        let owed = Arc::new(Owed::default());
-        let faulted = Arc::new(AtomicBool::new(false));
-
-        // The seeded count: the first fire reads it at once.
-        assert!(ring.push(&Value::U32(vec![4])));
-        assert_eq!(
-            fold_count(instance, FOLD, &ring, &owed, &faulted).unwrap(),
-            Some(4)
-        );
-        assert!(ring.pop().is_some());
-        // Its pass and the next fire's go to the queue: each puts a cell
-        // whose value lands later.
-        for _ in 0..2 {
-            let sequence = ring.tail();
-            assert!(ring.push(&Value::U32(vec![0])));
-            owed.owe(&[(FOLD, sequence)]);
-        }
-        let lands = {
-            let (ring, owed) = (Arc::clone(&ring), Arc::clone(&owed));
-            std::thread::spawn(move || {
-                for (sequence, count) in [(1, 4), (2, 4)] {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                    ring.encode_sequence(sequence, &Value::U32(vec![count]));
-                    owed.land(&[(FOLD, sequence)]);
-                }
-            })
-        };
-        // The second fire, staged while the first's pass is on the queue.
-        assert_eq!(
-            fold_count(instance, FOLD, &ring, &owed, &faulted).unwrap(),
-            Some(4)
-        );
-        assert!(ring.pop().is_some());
-        // The third, staged while the second's is.
-        assert_eq!(
-            fold_count(instance, FOLD, &ring, &owed, &faulted).unwrap(),
-            Some(4)
-        );
-        lands.join().unwrap();
-    }
-
-    /// A pass that faults lands nothing; the fire waiting on its cell is
-    /// refused, not left waiting.
-    #[test]
-    fn a_fire_behind_a_pass_that_faulted_is_refused() {
-        let ring = ChannelState::host(eta_ir::Dtype::U32, 1, 4);
-        let owed = Arc::new(Owed::default());
-        let faulted = Arc::new(AtomicBool::new(false));
-        assert!(ring.push(&Value::U32(vec![0])));
-        owed.owe(&[(3, 0)]);
-        let faults = {
-            let (owed, faulted) = (Arc::clone(&owed), Arc::clone(&faulted));
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-                faulted.store(true, Ordering::Release);
-                owed.land(&[(3, 0)]);
-            })
-        };
-        let refused = fold_count(InstanceId(1), 3, &ring, &owed, &faulted);
-        assert!(
-            matches!(refused, Err(ref why) if why.to_string().contains("poisoned")),
-            "{refused:?}"
-        );
-        faults.join().unwrap();
+    .map_err(Refusal::fault)?;
+    match unread {
+        Some((output, lane)) => Err(engine_gpu::program::unread(instance, &output, lane)),
+        None => Ok(()),
     }
 }
 
@@ -1832,27 +1448,5 @@ mod registration_tests {
         assert!(why.contains("emits no WGSL for"), "{why}");
         assert_eq!(plane.forms.tally(), (0, 0), "the refusal is not kept");
         assert!(plane.programs.is_empty());
-    }
-}
-
-/// What a pass is offered it reads: every seat the fire read out for its
-/// lanes (the arm's seat, or rows where they lie in the fire's span) is a
-/// row of an output the program reads, else the pass is refused by name.
-#[cfg(feature = "vulkan")]
-fn offered_read(
-    seat: &Instance,
-    instance: InstanceId,
-    seats: &[Vec<crate::guest::run::Readout<'_>>],
-) -> Result<(), Refusal> {
-    let session = &seat.session;
-    let unread = engine_gpu::guest::run::unread_seat(
-        &seat.plan.package,
-        |at, local| session.span(at, local).map(|(_, held)| held),
-        seats,
-    )
-    .map_err(Refusal::fault)?;
-    match unread {
-        Some((output, lane)) => Err(engine_gpu::program::unread(instance, &output, lane)),
-        None => Ok(()),
     }
 }

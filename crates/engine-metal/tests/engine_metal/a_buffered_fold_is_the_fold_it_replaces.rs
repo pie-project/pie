@@ -131,6 +131,7 @@ fn load(trace: poem::Trace, contract: &checkpoint::contract::ModelContract, chec
         profiles: None,
         residency: engine_metal::ResidencyPlan::default(),
         top: engine_metal::Top::EveryRung,
+        measure: engine::rates::Measuring::Time,
     })
     .and_then(|mut shell| shell.raise_whole().map(|()| shell))
     .expect("the micro shell loads")

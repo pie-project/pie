@@ -775,6 +775,18 @@ impl Plane {
         let scratch_piece = piece_at(&slots.scratch, room.place_bytes(), span)?;
         let own = own_runs(&held, &place, &slots.scratch, scratch_piece, room.place_bytes());
         let id = InstanceId(self.next_instance);
+        if engine::guest_claims::saying() {
+            engine::guest_claims::say(
+                "cuda: bind claims",
+                format_args!(
+                    "instance={} program={} instance_refs={:?} pair_generation={}",
+                    id.0,
+                    program_id,
+                    slots.instance,
+                    slots.pair_generation,
+                ),
+            );
+        }
         // Its pair's state is its group's: joined as it stands, or laid where
         // the binding names a new taking of it.
         if slots.pair == engine::ScratchPlace::None {
@@ -851,6 +863,15 @@ impl Plane {
             batch.base = base;
             batch.stale = true;
             clears.push((&slots.pair, base, batch.room.bytes()));
+        } else {
+            // The same taking, joined as it stands: its tables are laid
+            // again where its runs lie now, should a move have left them
+            // elsewhere while no member was live.
+            let base = piece_at(&slots.pair, batch.room.bytes(), span)?;
+            if base != batch.base {
+                batch.base = base;
+                batch.stale = true;
+            }
         }
         clear_state(&clears, stream)?;
         let program = &*program;
@@ -901,6 +922,7 @@ impl Plane {
                 scratch,
                 resident,
                 parked: false,
+                kept: false,
             },
         );
         Ok(id)
@@ -914,18 +936,32 @@ impl Plane {
             .ok_or_else(|| Fault::program("program::plane", format!("no program {program_id}")))
     }
 
-    /// Points every instance's rings at where their pool slots lie now:
-    /// after an evacuation moved chunks, ahead of the next fire staged.
-    pub fn rebase(&mut self, span: Span<'_>) -> Result<()> {
-        // Every live instance's state where the evacuation left it, claimed
-        // in one step before a ring is pointed there: one moved onto bytes
-        // another still holds is refused by name, every claim as it stood.
+    /// Where an evacuation leaves every live instance's state and every
+    /// bound pair's, read through `span` as the pool will stand after it,
+    /// and what each then claims: every check its rebase makes, made with
+    /// nothing changed ([`Programs::apply_rebase`] then cannot fail).
+    pub fn plan_rebase(&self, span: Span<'_>) -> Result<Rebase> {
         let mut moved = Vec::with_capacity(self.instances.len());
+        let mut instances = Vec::with_capacity(self.instances.len());
+        if engine::guest_claims::saying() {
+            engine::guest_claims::say(
+                "cuda: an evacuation's rebase claims every live instance where it lies now",
+                format_args!(
+                    "instances={} parked={:?} kept={:?} closing={:?}",
+                    self.instances.len(),
+                    self.instances.iter().filter(|(_, bound)| bound.parked).map(|(id, _)| id.0).collect::<Vec<_>>(),
+                    self.instances.iter().filter(|(_, bound)| bound.kept).map(|(id, _)| id.0).collect::<Vec<_>>(),
+                    self.closing.iter().map(|id| id.0).collect::<Vec<_>>(),
+                ),
+            );
+        }
         for (id, bound) in &self.instances {
-            // A parked instance holds nothing here
+            // A parked instance that shed its state holds nothing here
             // (`engine::Rebind::Parked`): repointed and claimed at its
-            // rebind.
-            if self.closing.contains(id) || bound.parked {
+            // rebind. One whose park kept its tables and rings in place
+            // holds them, where the evacuation moved them. A closing one is
+            // repointed and claims nothing.
+            if bound.parked && !bound.kept {
                 continue;
             }
             let Some(program) = self.programs.get(&bound.program_id) else {
@@ -949,8 +985,15 @@ impl Plane {
                 let base = piece_at(&batch.pair, batch.room.bytes(), span)?;
                 moved.push((Holder::Pair(batch.claim), vec![device_run(base, batch.room.bytes())]));
             }
+            let cells = bound.session.ring_cells(&place)?;
+            instances.push(Rebased {
+                id: *id,
+                scores: held.score_at.map(|at| place.instance + at),
+                scratch: scratch.map(|(scratch, _)| scratch.next_multiple_of(launch::SPAN_ALIGN)),
+                place,
+                cells,
+            });
         }
-        self.claims.claim_all(&moved)?;
         let live: Vec<(ProgramId, Extents)> = self
             .instances
             .values()
@@ -978,9 +1021,76 @@ impl Plane {
                     batch.base = base;
                     batch.stale = true;
                 }
+                // A pair whose every member closed while a fire of it flew
+                // holds nothing any more.
+                let claimed = !self.claims.members(batch.claim).is_empty();
+                let base = if claimed || live.contains(&(*program_id, batch.extents)) {
+                    piece_at(&batch.pair, batch.room.bytes(), span)?
+                } else {
+                    match piece_at(&batch.pair, batch.room.bytes(), span) {
+                        Ok(base) => base,
+                        Err(_) => {
+                            batches.push((*program_id, at, None));
+                            continue;
+                        }
+                    }
+                };
+                if claimed {
+                    moved.push((Holder::Pair(batch.claim), vec![device_run(base, batch.room.bytes())]));
+                }
+                batches.push((*program_id, at, Some(base)));
             }
         }
-        Ok(())
+        Ok(Rebase { moved, instances, batches })
+    }
+
+    /// Claims what `rebase` names, in one step: refused by name, and
+    /// nothing changed, where one moved onto bytes another still holds.
+    /// Answers what the claim took the place of, for
+    /// [`Programs::unclaim_rebase`].
+    pub fn claim_rebase(&self, rebase: &Rebase) -> Result<engine::guest_claims::Before> {
+        Ok(self.claims.claim_all_undoable(&rebase.moved)?)
+    }
+
+    /// Undoes [`Programs::claim_rebase`]: a later step of the evacuation
+    /// failed, and nothing of it holds.
+    pub fn unclaim_rebase(&self, before: engine::guest_claims::Before) {
+        self.claims.restore(before);
+    }
+
+    /// Points every instance's rings and every pair's base where `rebase`
+    /// found them, its claims made ([`Programs::claim_rebase`]): after an
+    /// evacuation moved chunks, ahead of the next fire staged.
+    pub fn apply_rebase(&mut self, rebase: Rebase) {
+        for planned in rebase.instances {
+            let Some(bound) = self.instances.get_mut(&planned.id) else {
+                continue;
+            };
+            bound.scores = planned.scores;
+            bound.session.rebase_to(&planned.place, planned.cells);
+            if let Some(scratch) = planned.scratch {
+                bound.scratch = scratch;
+            }
+        }
+        for (program_id, at, base) in rebase.batches {
+            let Some(batch) = self
+                .programs
+                .get_mut(&program_id)
+                .and_then(|program| program.batches.get_mut(at))
+            else {
+                continue;
+            };
+            // A pair whose runs no longer resolve is laid again at the next
+            // bind that names them.
+            let Some(base) = base else {
+                batch.stale = true;
+                continue;
+            };
+            if base != batch.base {
+                batch.base = base;
+                batch.stale = true;
+            }
+        }
     }
 
     /// Instance `id`'s process parked (`engine::Rebind::Parked`): nothing
@@ -1000,8 +1110,22 @@ impl Plane {
             }
             _ => Vec::new(),
         };
+if engine::guest_claims::saying() {
+            engine::guest_claims::say(
+                "cuda: park",
+                format_args!(
+                    "instance={} kept={} was_parked={} was_kept={} instance_refs={:?}",
+                    id.0,
+                    kept,
+                    bound.parked,
+                    bound.kept,
+                    bound.slots.instance,
+                ),
+            );
+        }
         self.claims.park(id.0, &runs);
         bound.parked = true;
+        bound.kept = kept;
         Ok(())
     }
 
@@ -1104,6 +1228,7 @@ impl Plane {
         bound.resident = resident;
         bound.slots = slots;
         bound.parked = false;
+        bound.kept = false;
         let pair = bound.slots.pair.clone();
         let generation = bound.slots.pair_generation;
         let batch = self
@@ -1635,6 +1760,18 @@ impl Plane {
         // Its slots are the runtime's again once this returns: a fire still
         // airborne on them runs ahead, on the stream, of whatever is bound
         // there next.
+        if engine::guest_claims::saying() {
+            engine::guest_claims::say(
+                "cuda: close releases",
+                format_args!(
+                    "instance={} parked={} kept={} airborne={}",
+                    id.0,
+                    bound.parked,
+                    bound.kept,
+                    bound.session.airborne(),
+                ),
+            );
+        }
         self.claims.release(id.0);
         if bound.session.airborne() {
             self.closing.insert(id);
@@ -1711,6 +1848,10 @@ struct Bound {
     /// another owner's until a rebind names where it lies, so nothing of
     /// it is repointed or fired meanwhile.
     parked: bool,
+    /// Its park kept its tables and rings in place (`Rebind::Parked {
+    /// kept }`): they stay claimed, and an evacuation moves them, claim and
+    /// rings, as a live instance's.
+    kept: bool,
 }
 
 /// Where a guest item lies in the pool, as a binding names it.
@@ -1721,6 +1862,25 @@ pub enum Item<'a> {
     /// `run` adjacent chunks from logical chunk `first`
     /// (`engine::ScratchPlace::Chunks`).
     Chunks { first: u32, run: u32 },
+}
+
+/// What an evacuation does to the guests' state ([`Programs::plan_rebase`]).
+pub struct Rebase {
+    moved: Vec<(Holder, Vec<Run>)>,
+    instances: Vec<Rebased>,
+    /// Each bound pair's base where the evacuation leaves it; `None` where
+    /// its runs no longer resolve (none live holds it).
+    batches: Vec<(ProgramId, usize, Option<u64>)>,
+}
+
+/// One live instance where an evacuation leaves it.
+struct Rebased {
+    id: InstanceId,
+    place: launch::Place,
+    cells: Vec<u64>,
+    scores: Option<u64>,
+    /// `None` for a kept park: its scratch went back with its park.
+    scratch: Option<u64>,
 }
 
 /// The address of a guest item of the stated bytes, where it lies now
