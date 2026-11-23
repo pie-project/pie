@@ -1685,6 +1685,357 @@ template <typename T, int SG, int VROWS>
 }
 
 
+// A short carry's prepared inputs, a record a lane in the seat's work area
+// (`table`, `k_heads * table_rows` float4s a lane): what every simdgroup of
+// `gated_delta_carried_short` made for itself, made once a lane and value
+// head by `gated_delta_carried_prep`, so the scan reads dense planes as the
+// scan step reads `gdn_prep`'s. Offsets in floats from the lane's record.
+struct GdnShortRecord {
+  size_t qn, kn, kc, uc, g, own, facts, end;
+};
+
+inline GdnShortRecord gdn_short_record(int k_heads, int v_heads) {
+  constexpr size_t D = 128;
+  const size_t K = size_t(k_heads), V = size_t(v_heads), R = size_t(kVerifyChunk);
+  GdnShortRecord at;
+  at.qn = 0;
+  at.kn = K * D;
+  at.kc = 2 * K * D;
+  at.uc = at.kc + R * K * D;
+  at.g = at.uc + R * V * D;
+  at.own = at.g + R * V;
+  at.facts = at.own + 4 * V;
+  at.end = at.facts + 8;
+  return at;
+}
+
+// One simdgroup a (lane, value head): the lane's facts, the own row's normed
+// q and k (its key head's, written once a key head), its gates and the q.k
+// dot, the own row's landing of its keys, gates and key norm, and each
+// carried row's normed key, decay and corrected value, read from the rs
+// buffer pages once and laid dense.
+template <typename T>
+[[kernel]] void gated_delta_carried_prep(
+    const device T* qkv         [[buffer(0)]],
+    const device int* indptr    [[buffer(1)]],
+    const device int* replay    [[buffer(2)]],
+    const device int* commit    [[buffer(3)]],
+    const device int* slots     [[buffer(4)]],
+    const constant int& lane0   [[buffer(5)]],
+    const device T* ba          [[buffer(6)]],
+    const device float* a_log   [[buffer(7)]],
+    const device T* dt_bias     [[buffer(8)]],
+    device float* rstate        [[buffer(9)]],
+    device float* y             [[buffer(10)]],
+    device float* gates         [[buffer(11)]],
+    const constant int& k_heads [[buffer(12)]],
+    const constant int& v_heads [[buffer(13)]],
+    device uchar* ba_slab       [[buffer(14)]],
+    const device int* page_table [[buffer(15)]],
+    const constant uint& page_tokens [[buffer(16)]],
+    const constant uint& page_bytes [[buffer(17)]],
+    const constant uint& ba_row_bytes [[buffer(18)]],
+    device uchar* key_slab      [[buffer(19)]],
+    const constant uint& key_row_bytes [[buffer(20)]],
+    device uchar* u_slab        [[buffer(21)]],
+    const constant uint& u_row_bytes [[buffer(22)]],
+    const device ulong* map     [[buffer(23)]],
+    const constant uint& page_ints [[buffer(24)]],
+    device float4* table        [[buffer(25)]],
+    const constant uint& table_rows [[buffer(26)]],
+    const device int* ext_replay [[buffer(27)]],
+    device uchar* scalar_slab   [[buffer(28)]],
+    const constant uint& scalar_row_bytes [[buffer(29)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint lane_u [[thread_index_in_simdgroup]]) {
+  constexpr int D = 128;
+  constexpr int PER = D / 32;
+  const int lane = int(lane_u);
+  const int hv = int(group.z) % v_heads;
+  const int r = int(group.z) / v_heads;
+  int before = 0;
+  for (int j = lane; j < r; j += 32) {
+    before += ext_replay[lane0 + j];
+  }
+  int begin = indptr[r] + metal::simd_sum(before);
+  begin -= replay[lane0 + r] - ext_replay[lane0 + r];
+  const int rep = min(replay[lane0 + r], kVerifyChunk);
+  const device int* ids = slots + size_t(lane0 + r) * pie_state_pieces(map);
+  if (indptr[r + 1] - indptr[r] != 1 || ids[0] < 0) {
+    return;
+  }
+  const int own = indptr[r] - rep;
+  const int t_own = rep;
+  const int keep = min(commit[lane0 + r], rep + 1);
+  const device int* pages = page_table + size_t(lane0 + r) * page_ints;
+  const bool lands = pages[0] >= 0 && keep < rep + 1;
+  const int ratio = v_heads / k_heads;
+  const int hk = hv / ratio;
+  const bool key_head = hv % ratio == 0;
+  const size_t keys = size_t(k_heads) * D;
+  const size_t pitch = 2 * keys + size_t(v_heads) * D;
+  const float scale = 1.0f / metal::sqrt(float(D));
+  const size_t vh = size_t(v_heads);
+  const GdnShortRecord at = gdn_short_record(k_heads, v_heads);
+  device float* rec = reinterpret_cast<device float*>(table) +
+                      size_t(lane0 + r) * size_t(k_heads) * size_t(table_rows) * 4;
+
+  // The carried rows, dense: read before the own row's landing writes the
+  // slabs they lie in.
+  for (int t = 0; t < rep; ++t) {
+    const device float* srow = reinterpret_cast<const device float*>(
+        gdn_buffered_row(scalar_slab, pages, t, page_tokens, page_bytes, scalar_row_bytes));
+    const device float* urow = reinterpret_cast<const device float*>(
+        gdn_buffered_row(u_slab, pages, t, page_tokens, page_bytes, u_row_bytes));
+    const float4 u4 = *reinterpret_cast<const device float4*>(urow + size_t(hv) * D + size_t(PER * lane));
+    *reinterpret_cast<device float4*>(rec + at.uc + (size_t(t) * vh + size_t(hv)) * D + size_t(PER * lane)) = u4;
+    if (key_head) {
+      const device T* krow = reinterpret_cast<const device T*>(
+          gdn_buffered_row(key_slab, pages, t, page_tokens, page_bytes, key_row_bytes));
+      const float rinv = srow[vh + size_t(hv)];
+      const float4 k4 = float4(*reinterpret_cast<const device vec<T, 4>*>(krow + size_t(hk) * D + size_t(PER * lane)));
+      *reinterpret_cast<device float4*>(rec + at.kc + (size_t(t) * size_t(k_heads) + size_t(hk)) * D + size_t(PER * lane)) =
+          k4 * rinv;
+    }
+    if (lane == 0) {
+      rec[at.g + size_t(t) * vh + size_t(hv)] = metal::exp(srow[hv]);
+    }
+  }
+
+  // The own row's normed q and k: the scan's own reduction, lane for lane.
+  const size_t row = size_t(begin + t_own) * pitch;
+  const size_t qbase = row + size_t(hk) * D;
+  const size_t kbase = qbase + keys;
+  float qn[PER], kn[PER];
+  float own_kinv;
+  {
+    const float4 q4 = float4(*reinterpret_cast<const device vec<T, 4>*>(qkv + qbase + size_t(PER * lane)));
+    const float4 k4 = float4(*reinterpret_cast<const device vec<T, 4>*>(qkv + kbase + size_t(PER * lane)));
+    float qs = 0.0f, ks = 0.0f;
+    for (int i = 0; i < PER; ++i) {
+      qs += q4[i] * q4[i];
+      ks += k4[i] * k4[i];
+    }
+    const float qinv = metal::rsqrt(gdn_row_sum<32>(qs) + 1e-6f) * scale;
+    const float kinv = metal::rsqrt(gdn_row_sum<32>(ks) + 1e-6f);
+    own_kinv = kinv;
+    for (int i = 0; i < PER; ++i) {
+      qn[i] = q4[i] * qinv;
+      kn[i] = k4[i] * kinv;
+    }
+  }
+  float kq = 0.0f;
+  for (int i = 0; i < PER; ++i) {
+    kq += qn[i] * kn[i];
+  }
+  kq = gdn_row_sum<32>(kq);
+  if (key_head) {
+    *reinterpret_cast<device float4*>(rec + at.qn + size_t(hk) * D + size_t(PER * lane)) =
+        float4(qn[0], qn[1], qn[2], qn[3]);
+    *reinterpret_cast<device float4*>(rec + at.kn + size_t(hk) * D + size_t(PER * lane)) =
+        float4(kn[0], kn[1], kn[2], kn[3]);
+  }
+  if (lands && lane == 0) {
+    reinterpret_cast<device float*>(gdn_buffered_row(
+        scalar_slab, pages, t_own, page_tokens, page_bytes, scalar_row_bytes))[vh + size_t(hv)] =
+        own_kinv;
+  }
+  if (lands && key_head) {
+    device T* krow = reinterpret_cast<device T*>(
+        gdn_buffered_row(key_slab, pages, t_own, page_tokens, page_bytes, key_row_bytes));
+    for (int i = 0; i < PER; ++i) {
+      const int d = PER * lane + i;
+      krow[size_t(hk) * D + size_t(d)] = qkv[kbase + size_t(d)];
+    }
+  }
+  const float2 own_g = gdn_verify_gates<T>(ba, a_log, dt_bias, hv, v_heads, t_own, begin, own, rep,
+                                          lands && lane == 0, ba_slab, pages,
+                                          page_tokens, page_bytes, ba_row_bytes);
+  if (lane == 0) {
+    const size_t gat = size_t(own + t_own) * 2 * vh + size_t(hv);
+    gates[gat] = own_g.x;
+    gates[gat + vh] = own_g.y;
+    if (lands) {
+      reinterpret_cast<device float*>(gdn_buffered_row(
+          scalar_slab, pages, t_own, page_tokens, page_bytes, scalar_row_bytes))[hv] = own_g.x;
+    }
+    rec[at.own + 4 * size_t(hv) + 0] = own_g.x;
+    rec[at.own + 4 * size_t(hv) + 1] = own_g.y;
+    rec[at.own + 4 * size_t(hv) + 2] = kq;
+    if (hv == 0) {
+      device int* facts = reinterpret_cast<device int*>(rec + at.facts);
+      facts[0] = begin;
+      facts[1] = rep;
+      facts[2] = keep;
+      facts[3] = lands ? 1 : 0;
+      const ulong uoff = lands ? ulong(gdn_buffered_row(u_slab, pages, t_own, page_tokens,
+                                                         page_bytes, u_row_bytes) - u_slab)
+                               : 0ul;
+      facts[4] = int(uint(uoff & 0xffffffffu));
+      facts[5] = int(uint(uoff >> 32));
+    }
+  }
+}
+
+template [[host_name("gated_delta_carried_prep_bfloat16")]]
+[[kernel]] void gated_delta_carried_prep<bfloat>(
+    const device bfloat*, const device int*, const device int*, const device int*,
+    const device int*, const constant int&, const device bfloat*, const device float*,
+    const device bfloat*, device float*, device float*, device float*, const constant int&,
+    const constant int&, device uchar*, const device int*, const constant uint&,
+    const constant uint&, const constant uint&, device uchar*, const constant uint&,
+    device uchar*, const constant uint&, const device ulong*, const constant uint&,
+    device float4*, const constant uint&, const device int*, device uchar*,
+    const constant uint&, uint3, uint);
+
+// A short carry's scan over its prepared record (`gated_delta_carried_prep`):
+// the state tile in registers, the carried rows' steps from the dense
+// planes, the own row as the scan step takes it. Its reads are the state,
+// the record and the own row's value: the chain of `gated_delta_scan_step`.
+template <typename T, int SG, int VROWS>
+[[kernel]] void gated_delta_carried_prepped(
+    const device T* qkv         [[buffer(0)]],
+    const device int* indptr    [[buffer(1)]],
+    const device int* replay    [[buffer(2)]],
+    const device int* commit    [[buffer(3)]],
+    const device int* slots     [[buffer(4)]],
+    const constant int& lane0   [[buffer(5)]],
+    const device T* ba          [[buffer(6)]],
+    const device float* a_log   [[buffer(7)]],
+    const device T* dt_bias     [[buffer(8)]],
+    device float* rstate        [[buffer(9)]],
+    device float* y             [[buffer(10)]],
+    device float* gates         [[buffer(11)]],
+    const constant int& k_heads [[buffer(12)]],
+    const constant int& v_heads [[buffer(13)]],
+    device uchar* ba_slab       [[buffer(14)]],
+    const device int* page_table [[buffer(15)]],
+    const constant uint& page_tokens [[buffer(16)]],
+    const constant uint& page_bytes [[buffer(17)]],
+    const constant uint& ba_row_bytes [[buffer(18)]],
+    device uchar* key_slab      [[buffer(19)]],
+    const constant uint& key_row_bytes [[buffer(20)]],
+    device uchar* u_slab        [[buffer(21)]],
+    const constant uint& u_row_bytes [[buffer(22)]],
+    const device ulong* map     [[buffer(23)]],
+    const constant uint& page_ints [[buffer(24)]],
+    device float4* table        [[buffer(25)]],
+    const constant uint& table_rows [[buffer(26)]],
+    const device int* ext_replay [[buffer(27)]],
+    device uchar* scalar_slab   [[buffer(28)]],
+    const constant uint& scalar_row_bytes [[buffer(29)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint lane_u [[thread_index_in_simdgroup]],
+    uint sg_u [[simdgroup_index_in_threadgroup]]) {
+  constexpr int D = 128;
+  constexpr int PER = D / 32;
+  const int lane = int(lane_u);
+  const int sg = int(sg_u);
+  const int hv = int(group.z) % v_heads;
+  const int r = int(group.z) / v_heads;
+  const int dv_base = int(group.y) * SG * VROWS + sg * VROWS;
+  const device int* ids = slots + size_t(lane0 + r) * pie_state_pieces(map);
+  if (indptr[r + 1] - indptr[r] != 1 || ids[0] < 0) {
+    return;
+  }
+  device float* cells = gdn_cells<VROWS, PER>(rstate, map, ids, hv, v_heads, dv_base, D, D);
+  float st[VROWS][PER];
+  for (int v = 0; v < VROWS; ++v) {
+    const float4 s4 = *reinterpret_cast<const device float4*>(cells + size_t(v) * D + size_t(PER * lane));
+    for (int i = 0; i < PER; ++i) {
+      st[v][i] = s4[i];
+    }
+  }
+  const GdnShortRecord at = gdn_short_record(k_heads, v_heads);
+  const device float* rec = reinterpret_cast<const device float*>(table) +
+                            size_t(lane0 + r) * size_t(k_heads) * size_t(table_rows) * 4;
+  const device int* facts = reinterpret_cast<const device int*>(rec + at.facts);
+  const int begin = facts[0];
+  const int rep = facts[1];
+  const int keep = facts[2];
+  const bool lands = facts[3] != 0;
+  const ulong uoff = ulong(uint(facts[4])) | (ulong(uint(facts[5])) << 32);
+  const int ratio = v_heads / k_heads;
+  const int hk = hv / ratio;
+  const size_t keys = size_t(k_heads) * D;
+  const size_t pitch = 2 * keys + size_t(v_heads) * D;
+  const size_t vh = size_t(v_heads);
+  const int own = indptr[r] - rep;
+  const int t_own = rep;
+  const float4 qn = *reinterpret_cast<const device float4*>(rec + at.qn + size_t(hk) * D + size_t(PER * lane));
+  const float4 kn = *reinterpret_cast<const device float4*>(rec + at.kn + size_t(hk) * D + size_t(PER * lane));
+  const float own_glog = rec[at.own + 4 * size_t(hv) + 0];
+  const float beta = rec[at.own + 4 * size_t(hv) + 1];
+  const float kq = rec[at.own + 4 * size_t(hv) + 2];
+
+  auto step = [&](int t) {
+    const float g = rec[at.g + size_t(t) * vh + size_t(hv)];
+    const float4 k4 = *reinterpret_cast<const device float4*>(
+        rec + at.kc + (size_t(t) * size_t(k_heads) + size_t(hk)) * D + size_t(PER * lane));
+    const float4 u4 = *reinterpret_cast<const device float4*>(
+        rec + at.uc + (size_t(t) * vh + size_t(hv)) * D + size_t(dv_base));
+    for (int v = 0; v < VROWS; ++v) {
+      const float u = u4[v];
+      st[v][0] = g * st[v][0] + k4[0] * u;
+      st[v][1] = g * st[v][1] + k4[1] * u;
+      st[v][2] = g * st[v][2] + k4[2] * u;
+      st[v][3] = g * st[v][3] + k4[3] * u;
+    }
+  };
+  const int folds = min(keep, rep);
+  for (int t = 0; t < folds; ++t) {
+    step(t);
+  }
+  if (folds > 0) {
+    PIE_GDN_STORE_STATE;
+  }
+  for (int t = folds; t < rep; ++t) {
+    step(t);
+  }
+
+  const float g_own = metal::exp(own_glog);
+  const size_t vbase = size_t(begin + t_own) * pitch + 2 * keys + size_t(hv) * D;
+  const size_t row_out = (size_t(own + t_own) * vh + size_t(hv)) * D;
+  device float* urow = lands ? reinterpret_cast<device float*>(u_slab + uoff) : nullptr;
+  for (int v = 0; v < VROWS; ++v) {
+    float pa = 0.0f, po = 0.0f;
+    for (int i = 0; i < PER; ++i) {
+      pa += st[v][i] * kn[i];
+      po += st[v][i] * qn[i];
+    }
+    const float mem = g_own * gdn_row_sum<32>(pa);
+    const float qs = g_own * gdn_row_sum<32>(po);
+    const float val = float(qkv[vbase + size_t(dv_base + v)]);
+    const float u = beta * (val - mem);
+    const float o = qs + kq * u;
+    if (lane == 0) {
+      y[row_out + size_t(dv_base + v)] = o;
+      if (urow != nullptr) {
+        urow[size_t(hv) * D + size_t(dv_base + v)] = u;
+      }
+    }
+    if (keep == rep + 1) {
+      for (int i = 0; i < PER; ++i) {
+        st[v][i] = g_own * st[v][i] + kn[i] * u;
+      }
+    }
+  }
+  if (keep == rep + 1) {
+    PIE_GDN_STORE_STATE;
+  }
+}
+
+template [[host_name("gated_delta_carried_prepped_bfloat16_s_8_v_4")]]
+[[kernel]] void gated_delta_carried_prepped<bfloat, 8, 4>(
+    const device bfloat*, const device int*, const device int*, const device int*,
+    const device int*, const constant int&, const device bfloat*, const device float*,
+    const device bfloat*, device float*, device float*, device float*, const constant int&,
+    const constant int&, device uchar*, const device int*, const constant uint&,
+    const constant uint&, const constant uint&, device uchar*, const constant uint&,
+    device uchar*, const constant uint&, const device ulong*, const constant uint&,
+    device float4*, const constant uint&, const device int*, device uchar*,
+    const constant uint&, uint3, uint, uint);
+
 #define PIE_GDN_CARRIED_SHORT(sg, vrows)                                      \
   template [[host_name("gated_delta_carried_short_bfloat16_s_" #sg "_v_" #vrows)]] \
   [[kernel]] void gated_delta_carried_short<bfloat, sg, vrows>(               \
