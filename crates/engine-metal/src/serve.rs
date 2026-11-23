@@ -4721,6 +4721,10 @@ impl Shell {
         // (checked backed) once the fire's segments are committed.
         let mut state_ids: Vec<u32> = Vec::new();
         let mut rs_plans: Vec<engine::rs::LanePlan> = Vec::with_capacity(lanes.len());
+        // Each lane's buffered reads as one run ending at its first row
+        // (`engine::fire::lane_one_run`), the input the shared compactness
+        // helper takes, from the same verb values the plan is built from.
+        let mut rs_one_run: Vec<bool> = Vec::with_capacity(lanes.len());
         // Per seat, its buffer's base and its set's rs pages (slab slots),
         // where it buffers: what a hybrid's beams resolve over (§11).
         let mut rs_sets: Vec<Option<(u32, Vec<u32>)>> = Vec::with_capacity(lanes.len());
@@ -5063,6 +5067,12 @@ impl Shell {
                 ports.as_ref().and_then(engine::ports::LanePorts::fold),
             )
             .map_err(|error| Fault::program("serve::rs", format!("lane {source}: {error}")))?;
+            rs_one_run.push(match &rs {
+                engine::fire::RsVerb::Buffer { folded, lineage, .. } => {
+                    engine::fire::lane_one_run(masking, *folded, first, *lineage)
+                }
+                _ => true,
+            });
             // A beam group's lanes share their set's state: what its lanes
             // fold is folded once for all of them, from the first's buffered
             // rows, before any reads it (§11.3). Each lane then replays only
@@ -5668,17 +5678,30 @@ impl Shell {
                 carried_max: Some(tokens),
                 total_max: Some(tokens.saturating_mul(2)),
             };
-            // Counted as the runtime counts them: by the load's stated
-            // `rs_compact` (`Shell::pool_chunk_facts`), so the rung the
-            // runtime chose and this check agree. What a fire that is not
-            // compact (snapshot lanes, no rs page table) really lays in the
-            // scratch is the seat's own bytes check below, against the
-            // rung's reserved bytes.
+            // The fire's compactness by the one function the runtime also
+            // evaluates on this fire (`engine::fire::scratch_compact`: the
+            // load's stated layout fact, every lane one run, no snapshot),
+            // so the rung the runtime chose and this check agree. What the
+            // fire really lays in its scratch stays the seat's bytes check
+            // below, the named guard against the two ever parting.
             let load_compact = self.rs_layout.as_ref().is_some_and(|layout| layout.compact)
                 && self.rs_buffers.is_some();
+            let fire_compact = engine::fire::scratch_compact(
+                load_compact,
+                rs_one_run.iter().all(|&one| one),
+                !rs_snaps.is_empty(),
+            );
+            if fire_compact != compact {
+                tracing::warn!(
+                    helper = fire_compact,
+                    laid = compact,
+                    "engine::fire::scratch_compact and the rs scratch Metal lays disagree for \
+                     this fire (a contract bug): the bytes check below guards it"
+                );
+            }
             let held = engine::ReplayRows::of_lanes(
                 rs_plans.iter().zip(&rs_own).map(|(plan, &own)| (own, plan.replay)),
-                load_compact,
+                fire_compact,
             );
             if let Err(past) = engine::fire::rung_holds(&rung, held) {
                 return Err(Fault::program(
