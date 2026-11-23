@@ -910,6 +910,7 @@ impl Context {
                 time: engine_gpu::submit::DeviceTime::default(),
                 wall: AtomicBool::new(false),
                 held: Mutex::new(Vec::new()),
+                guest: Mutex::new(FrameGuest::default()),
             }),
             open: true,
             dispatches: std::cell::Cell::new(0),
@@ -1065,6 +1066,17 @@ pub(crate) struct Inner {
     /// A split step's segments, ended and not yet submitted: submitted with
     /// the frame, back to back ([`Frame::submit_segment`]).
     held: Mutex<Vec<wgpu::CommandBuffer>>,
+    /// What the guest passes recorded into the frame share: the buffer they
+    /// read back into, which the frame gives up at its submit (its passes
+    /// hold it until they are read), and the bytes of their widens' rows
+    /// so far in the widen's table region.
+    guest: Mutex<FrameGuest>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct FrameGuest {
+    outbox: Option<Arc<crate::guest::outbox::Outbox>>,
+    widened: u64,
 }
 
 impl Inner {
@@ -1110,6 +1122,25 @@ pub struct Frame {
 }
 
 impl Frame {
+    /// The buffer the frame's guest passes read back into: taken of `pool`
+    /// by the first.
+    pub(crate) fn guest_outbox(
+        &self,
+        pool: &Arc<crate::guest::outbox::Pool>,
+    ) -> Arc<crate::guest::outbox::Outbox> {
+        let mut guest = self.inner.guest.lock().expect("guest lock poisoned");
+        Arc::clone(guest.outbox.get_or_insert_with(|| pool.take()))
+    }
+
+    /// Where `bytes` of a widen's rows go in the widen's table region, past
+    /// the rows the frame's earlier widens wrote there.
+    pub(crate) fn widen_rows(&self, bytes: u64) -> u64 {
+        let mut guest = self.inner.guest.lock().expect("guest lock poisoned");
+        let at = guest.widened;
+        guest.widened += bytes;
+        at
+    }
+
     pub(crate) fn close_pass(&self) {
         self.inner.pass.lock().expect("pass lock poisoned").take();
     }
@@ -1492,6 +1523,8 @@ impl Frame {
             return Ok(());
         }
         self.open = false;
+        // Its guest passes hold their read-back buffer from here.
+        self.inner.guest.lock().expect("guest lock poisoned").outbox = None;
         self.close_pass();
         self.land_uniforms();
         let core = &self.inner.core;
@@ -1727,6 +1760,9 @@ impl Drop for Frame {
     }
 }
 
+/// A clone is the same submission: each of the sessions whose passes one
+/// frame carries keeps one.
+#[derive(Clone)]
 pub struct Pending {
     inner: Arc<Inner>,
 }

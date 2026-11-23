@@ -20,7 +20,7 @@ pub(crate) mod device {
 }
 #[cfg(feature = "rocm")]
 pub mod hiprtc;
-mod root;
+pub(crate) mod root;
 
 pub use abi::{Arg, ArgValue};
 pub use ctx::{Ctx, Fire, Launch, PLACED_ALIGN, Pad, SlabKey, Slabs, TICKETS, kernels_strict, strict_kernels};

@@ -6641,12 +6641,14 @@ fn a_victim_is_not_restored_before_its_head_nor_evicted_again_before_it_fires() 
         !members(&planner).contains(&victim),
         "restored for a waiting head and able to run: not moved back before it runs"
     );
-    // Waiting itself, behind the head (its lanes blocked on the planner):
-    // it cannot run, so the mark does not hold it, and no stall comes of it.
+    // Queued for its first fire's room while something is in flight: the
+    // ask is part of that fire, so the mark still holds it (else it went
+    // back down before it ran: the L40S at 3 GiB, evictions 4017, restores
+    // 4012).
     let own = planner.with_inner(|inner| inner.enqueue(victim, allocation(demand)));
     assert!(
-        planner.with_inner(|inner| !inner.unfired_protects(victim)),
-        "blocked on the head's progress: the mark does not hold it, the head not held"
+        planner.with_inner(|inner| inner.unfired_protects(victim)),
+        "queued for its first fire's room beside a fire in flight: still held"
     );
     planner.with_inner(|inner| {
         inner.queue.remove(&own);
@@ -6660,6 +6662,17 @@ fn a_victim_is_not_restored_before_its_head_nor_evicted_again_before_it_fires() 
         !members(&planner).contains(&victim),
         "nothing in flight: still able to run, not moved back before it runs"
     );
+    // Waiting itself with nothing in flight (its lanes blocked on the
+    // planner): it runs nothing, so the mark does not hold it, and no stall
+    // comes of it.
+    let own = planner.with_inner(|inner| inner.enqueue(victim, allocation(demand)));
+    assert!(
+        planner.with_inner(|inner| !inner.unfired_protects(victim)),
+        "blocked on the head's progress with nothing in flight: the mark does not hold it"
+    );
+    planner.with_inner(|inner| {
+        inner.queue.remove(&own);
+    });
     // Able to run again, then fired once: a candidate for good.
     let running = planner.fire_in_flight(head);
     assert!(!members(&planner).contains(&victim));
@@ -9447,10 +9460,12 @@ async fn a_pass_that_sends_a_refused_restore_again_says_so() {
 /// process's restore, about one eviction a serve. A victim was restored as
 /// soon as the head it was evicted for was served, took the room back
 /// before the head ran on it, and the head's next ask evicted it again.
-/// A victim's restore waits until its head has fired once since it was
-/// served (or the head waits on its client).
+/// Restored once the head had fired, it was evicted again for the head's
+/// next page (the field mix: a lane evicted for the same head with no
+/// restore of the head between). A victim's restore waits until its head
+/// is done with its request (here, waits on its client).
 #[test]
-fn a_victim_is_restored_only_once_its_head_has_fired_on_the_room() {
+fn a_victim_is_restored_only_once_its_head_is_done_with_its_request() {
     let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::with_swap(8, 64))));
     let (head, victim, other) = (ProcessId::new_v4(), ProcessId::new_v4(), ProcessId::new_v4());
     for pid in [head, victim, other] {
@@ -9476,15 +9491,16 @@ fn a_victim_is_restored_only_once_its_head_has_fired_on_the_room() {
     // Something else in flight, so no quiet fallback applies.
     let fire = planner.fire_in_flight(other);
     assert_eq!(head_of(&planner), None, "its head has not run on the room yet");
-    // The head fires: its victim may come back.
-    // Its first fire plans at once: the victim's restore is sent then, not
-    // when the fire lands.
+    // The head fires: it runs on in its request, and grows into the room.
     let head_fire = planner.fire_in_flight(head);
+    assert_eq!(head_of(&planner), None, "its head runs on in its request");
+    // The head waits on its client: its victim may come back.
+    planner.set_idle(head, true);
     let sent = planner.with_inner(|inner| {
         inner.unmet_head().map(|(_, waiter)| waiter.pid) == Some(victim)
             || !inner.queue.values().any(|waiter| waiter.pid == victim)
     });
-    assert!(sent, "the head ran: the victim is restored");
+    assert!(sent, "the head's request is done: the victim is restored");
     drop(head_fire);
     drop(fire);
 }
@@ -9529,14 +9545,14 @@ fn an_eviction_to_a_full_tier_is_taken_back_and_its_process_kept() {
     planner.with_inner(|inner| {
         assert_eq!(inner.procs[&pid].state, Residency::Resident, "kept, resident");
         assert!(!inner.killing.contains(&pid), "not failed");
-        assert!(inner.prepare_blocked.contains(&pid), "no victim until the pool moves");
+        assert!(inner.host_swap_blocked.contains(&pid), "no victim until the pool moves");
         assert!(inner.evicting.is_empty(), "its eviction is settled");
     });
     // The pool moves (a fire lands): the block lapses.
     planner.stats.fires_landed.fetch_add(1, Ordering::Relaxed);
     planner.lapse_blocks();
     planner.with_inner(|inner| {
-        assert!(!inner.prepare_blocked.contains(&pid), "a candidate again once the pool moved");
+        assert!(!inner.host_swap_blocked.contains(&pid), "a candidate again once the pool moved");
     });
 }
 

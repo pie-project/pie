@@ -22,6 +22,9 @@ pub(crate) struct Seat {
     pub guests: Option<Guests>,
     /// Where the fire's beam fault words lie in the readback, past its rows.
     pub beam_tail: Option<engine_gpu::serve::BeamTail>,
+    /// The fed lanes' token rows to read with the fire's rows: the buffer
+    /// they were copied to, their bytes, and where the fed check reads them.
+    pub fed: Option<(Buffer, u64, crate::serve::FedWords)>,
 }
 
 pub(crate) type Pixels = (Buffer, String, Vec<(u64, u32)>);
@@ -340,6 +343,7 @@ pub(crate) fn on_done(
         pixels,
         guests,
         beam_tail,
+        fed: fed_rows,
     } = seat;
     let read_layout = layout.clone();
     let supplies = fed.clone().filter(engine_gpu::settle::FedCheck::reads_beams);
@@ -373,7 +377,18 @@ pub(crate) fn on_done(
                     rows
                 });
                 let read = read.and_then(|rows| verdict.queue_verdict().map(|()| rows));
-                land(read.map_err(|fault| fault.to_string()));
+                match fed_rows {
+                    // The fed rows next, then the landing: its fed check
+                    // reads the words they hold.
+                    Some((buffer, bytes, words)) => buffer.read_async(0, bytes, move |raw| {
+                        match raw {
+                            Ok(raw) => *words.lock().expect("fed words lock poisoned") = raw,
+                            Err(_) => words.lock().expect("fed words lock poisoned").clear(),
+                        }
+                        land(read.map_err(|fault| fault.to_string()));
+                    }),
+                    None => land(read.map_err(|fault| fault.to_string())),
+                }
             }),
         }
     })

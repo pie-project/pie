@@ -51,8 +51,13 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         u32::try_from(minor).unwrap_or(0),
         device.device().num_sm,
     );
-    let (resolved, report) =
-        crate::chip::resolve(device.name(), &measured, boot.knobs.profiles.as_deref());
+    let keys = crate::stored::Keys::of(boot.ordinal, device.name());
+    let (resolved, report) = crate::chip::resolve_keyed(
+        device.name(),
+        &measured,
+        boot.knobs.profiles.as_deref(),
+        &keys,
+    );
     let chip = match boot.knobs.chip.clone() {
         // A pinned profile pins decisions, not the device: the rates it
         // leaves unstated are this device's, as its own profile states them.
@@ -76,19 +81,21 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         chip,
         boot.ordinal,
         device.name(),
-        &measured,
+        &keys,
         boot.knobs.profiles.as_deref(),
         boot.cache_dir,
         room,
+        boot.knobs.measuring,
     )
     .map_err(Fault::Card)?;
     device.set_tuning(kernels_cuda::tuning::Tuning::of(&chip));
     // The product times the device's profile holds choose between the
     // kernels that can serve a decode product; arming notes the shapes it
     // lacks, measured once it has armed (`Staged::finish`).
-    device.set_routes(std::sync::Arc::new(kernels_cuda::linear::routes::Routes::of(
-        chip.rates().product_ns.as_deref().unwrap_or_default(),
-    )));
+    let products = chip.rates().product_ns.clone().unwrap_or_default();
+    device.set_routes(std::sync::Arc::new(
+        kernels_cuda::linear::routes::Routes::of(&products),
+    ));
     let engine = crate::chip::Engine::of(&chip);
     // The most rows one prompt lays: its context, where the model keeps a
     // lane's rows (kv or recurrent state); a model that keeps none (a
@@ -616,6 +623,8 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         profile,
         regions,
         anchored,
+        keys,
+        products,
         asked,
         ceiling,
         weighed,
@@ -1006,6 +1015,8 @@ impl Shell {
             profile,
             regions: folded,
             anchored,
+            keys,
+            products,
             asked,
             ceiling,
             weighed,
@@ -1013,11 +1024,8 @@ impl Shell {
         // What shapes this deployment's bodies, beside the engine build
         // the record's key carries ([`super::measured`]).
         let bodies_shape = format!(
-            "{}|{:?}|{}|{:?}|{}|{}|{}|{:?}",
-            boot.checkpoint.display(),
-            std::fs::metadata(boot.checkpoint)
-                .map(|meta| (meta.len(), meta.modified().ok()))
-                .ok(),
+            "{}|{}|{:?}|{}|{}|{}|{:?}",
+            super::measured::checkpoint_identity(boot.checkpoint),
             boot.trace.name,
             profile,
             boot.page_size,
@@ -1658,6 +1666,9 @@ impl Shell {
             compiled,
             regions,
             ep: None,
+            keys,
+            products,
+            routes_measuring: boot.knobs.measuring,
             forced_bucket: None,
             budget: budgets.tokens.clone(),
             budgets,
@@ -2318,6 +2329,17 @@ impl Shell {
             );
             return Ok(());
         }
+        // Under `[engine] measure = false` nothing is timed: each shape no
+        // layer states keeps its stated kernel, by name, and none is saved.
+        if self.routes_measuring == engine::rates::Measuring::Skip {
+            eprintln!(
+                "engine-cuda: rates: skipped: `[rates] product_ns` for {} decode product \
+                 shape(s): nothing timed (`[engine] measure = false`); each keeps its stated \
+                 kernel",
+                wanted.len()
+            );
+            return Ok(());
+        }
         let started = std::time::Instant::now();
         let measured = self.routes_by_body(routes, &wanted)?;
         if measured.is_empty() {
@@ -2331,8 +2353,14 @@ impl Shell {
             );
             return Ok(());
         }
-        let saved = crate::rates::save_product_times(profiles, self.device.name(), &measured)
-            .map_err(Fault::Card)?;
+        let saved = crate::rates::save_product_times(
+            profiles,
+            self.device.name(),
+            &self.keys,
+            &self.products,
+            &measured,
+        )
+        .map_err(Fault::Card)?;
         let chosen = self.device.ctx().routes().cloned();
         let said: Vec<String> = wanted
             .iter()
@@ -2875,6 +2903,11 @@ pub(super) struct Baked {
     /// The anchored region each `fused.anchored` of the trace names, by key.
     pub(super) anchored: std::collections::BTreeMap<u64, kernels_ir::Anchored>,
     /// The budget asked before the card cut its tokens at the asked lanes.
+    /// What this load's stored measurements are keyed by.
+    pub(super) keys: crate::stored::Keys,
+    /// The decode products' times the device's profile states under a
+    /// matching key, which a measurement of more joins.
+    pub(super) products: Vec<profile::fire::ProductTime>,
     pub(super) asked: Budget,
     /// What the card may hold in all under the load's allowance, resolved
     /// before the load took anything (`elastic::ceiling_of`).

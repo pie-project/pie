@@ -37,6 +37,11 @@ pub struct DeviceBoot {
     /// `$PIE_HOME/profiles`, where a user's device profiles live.
     pub profiles: Option<PathBuf>,
 
+    /// Whether the load times what no stored or committed profile states
+    /// under a matching key (`[engine] measure`, `pie serve --no-measure`):
+    /// skipped, each rate, curve and settle is served by the estimate, named.
+    pub measure: engine::rates::Measuring,
+
     /// Diagnostics: the chunk size the pool's recipe aims at, in place of
     /// the profile's (a small one cuts records into pieces).
     pub chunk_bytes: Option<u64>,

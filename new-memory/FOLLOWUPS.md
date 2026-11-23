@@ -963,7 +963,7 @@ by name). engine-cuda nets the page cache in its own reader (`weights.rs` ~372-4
 inactive only (what the kernel reclaims first, before a charge fails: the conservative room) or
 inactive + active (all file cache, which reclaim reaches under pressure).
 
-## F45. Beam page lists: per-group reserve terms against a pool-wide reserve by fires in flight
+## F57. Beam page lists: per-group reserve terms against a pool-wide reserve by fires in flight
 
 A beam group's pool (`new-memory/designs/BEAM-PAGE-LISTS.md` §3) grows a
 column at a time to `B (c + 2) + B F + 1` pages: each live column's pages,
@@ -1150,7 +1150,7 @@ declared shape; the settle only times), or settle through a class that reads non
 stopping.
 
 
-## F56. Hybrid beam replay grows with lineage divergence
+## F58. Hybrid beam replay grows with lineage divergence
 
 On a hybrid model each beam lane replays its buffered rows past its group's
 common ancestor every step (`new-memory/designs/BEAM-PAGE-LISTS.md` §11.3,
@@ -1170,3 +1170,59 @@ design is a spec question for AMD / Leader: per-beam state checkpoints (each
 beam's recurrent state kept at page boundaries, so a beam replays at most a
 page past its last checkpoint) would bound the replay by a page at the cost
 of a state per beam per page.
+
+## F56. Every engine's load-time measurements through the one keyed resolve path (found 2026-11-22)
+sc/gpu-committed-profiles put engine-gpu (Vulkan, wgpu) behind one path: each stored entry is taken from the user's
+file, else a committed `profiles/<device>.measured.toml`, else measured — or, under `[engine] measure = false` /
+`pie serve --no-measure`, skipped and served by the estimate, by name (`engine::rates::resolve_at_load`,
+`profile::Rates::sift_as` / `whence`, `Shelf` `.measured.toml` layer, `pie tune export`). Each other engine still
+measures outside it; until it ports, `measure = false` is refused by name for it (worker `EngineConfig::validate`).
+What each still times at load or boot, for its owner (paths under `crates/`):
+- **engine-cuda (CUDA, ROCm)**: ported on ROCm (sc/amd-keyed-measurements); CUDA's keys open.
+  - `engine-cuda/src/stored.rs` `Keys: Now`: on ROCm the device's name, arch and HIP driver / runtime; a kernel's
+    code is the carried kernel library's text and options (`kernels_rocm::stored::library_code`: any `.hip` change
+    measures again what fired it) and hipBLASLt's version. Method versions `RATES_METHOD` / `PRODUCT_METHOD`.
+  - Roofline `[rates]`: `chip::resolve_keyed` (committed `<device>.measured.toml` layer, each stored entry sifted),
+    `rates::ensure` -> `engine::rates::resolve_at_load` under `Knobs::measuring`, what it measures stamped
+    (`Keys::stamp`). `chip::resolve` stays unkeyed for `pie tune` / `pie profile`.
+  - Decode products: `product_ns` saved by `save_rates`, keyed (`measured_by["product_ns"]`: library + hipBLASLt),
+    read back through the resolved profile; route codes 0 / 1 stay tags. Skip: the stated kernel, by name.
+  - Bodies record (`serve/measured.rs`): keyed by the code that shapes it (`build.rs`: engine-cuda's sources and
+    its kernel crate's Rust and kernel sources, a compile-time constant: nothing hashed at boot, a pie version
+    that touches none of it keeps every record) and by the checkpoint's own identity (`zt::artifact_identity`,
+    its manifest's digests: a copied or moved file keeps its records). Committed beside the measured profile
+    (`profiles/bodies/<key>`, `pie tune export --engine cuda`), so a committed clean boot holds the figure.
+  - `measure = false`: a one-device cuda engine; group / lockstep boots still measure, and are refused by name.
+  - Open, CUDA: `stored::backend` for `not(rocm)` keys by device name and method alone (no driver, cuBLASLt or
+    cubin codes): the L40S fills it. Committed: `amd-instinct-mi300x-vf.measured.toml` (`cached_gbps`,
+    `product_ns`).
+- **engine-metal**: ported (sc/macpro-committed-profiles). `chip::resolve_keyed` resolves through
+  `Shelf::resolve_keyed` under `stored::Keys` (`on` = `metal <device> macOS <major>`; each `[rates]` key and dense curve
+  keyed by its method and the resolved Metal source of every file its measurement fired, recorded by
+  `encode::record_fired`); `rates::at_load` takes `Measuring` through `resolve_at_load`; `tune::dense::at_load` keeps
+  the per-model crossover as `kernel_tflops_by_shape_keyed` curves (vector forms `1/8`, simdgroup tiles `2/0`,
+  tensor-op tile `3/32`, `KernelCurve::MPP`) in the user file, the ladder fitted from them each load (no
+  `dense_settled`: the fit is the settle, recomputed from the curves); `[metal] measure = false` skips both (the fire
+  top a decode fire of the lanes where no roofline is stated); `cover_fingerprint` keys on `on` and every decision's
+  resolved rungs. Committed: `apple-m5-pro.measured.toml` (Qwen3-0.6B, Qwen3.5-0.8B, Gemma 4 E4B shapes). The
+  runtime host cover is committed beside a device's profile on sc/gpu-committed-profiles-2 (below).
+- **engine-xla**: nothing timed at load and stored (the guest compile ledger `guest/run.rs:198` is in-process RSS).
+  No `cover_fingerprint`, so the runtime re-times its host cover every boot (below).
+- **runtime host cover**: `host_cover` `runtime/src/bootstrap.rs:1062` (called :1021), timing `measure_host_cover`
+  :1125 (warm `compat-openai` runs at depth 1), cached in `<cache>/cover/<fnv>.json` keyed by every engine's
+  `cover_fingerprint` + deployment + sampler hash + frame + depth + context. Committed (sc/gpu-committed-profiles-2):
+  `<device>.covers.json` beside the device's measured profile, written by `pie tune export` from the home's cache
+  (entries whose key names the device's `measured_on`), listed in the backend's `COVERS`
+  (`Engine::committed_covers`); looked up home cache > committed > measured. Under `measure = false` (every engine)
+  the dispatch depth is taken by name in place of the warm runs (a cover too large costs window, never a result).
+  Open: only engine-gpu lists committed covers; engine-cuda / engine-xla / engine-cerebras state no fingerprint
+  (`Engine::cover_fingerprint` default None): measured every boot, nothing kept.
+- **engine-gpu, closed on sc/gpu-committed-profiles-2**: under `measure = false` on a platform stating a submit
+  bound (Android, Windows TDR) with no roofline stated or committed, the load times only what the bound's estimate
+  reads (`engine_gpu::rates::for_bound`: a short launch chain, a one-row and a widest-rung matmul over the model's
+  widest layer plane, the attention of the widest rung against the context, the scan on a hybrid; single fires,
+  "timed for the submit bound despite measure = false"), kept in the bound alone and stored nowhere; steps are
+  held and cut as under a measured load. Without curves the dense kernel is estimated from the work's shape
+  (`engine_gpu::dense::by_shape`; by the roofline where one is stated); with curves but no roofline, the curves
+  weigh it (`dense::choose_unrated`). Still open: the Adreno 840's committed profile (`adreno-tm-840`, a
+  commented slot in each backend's `SEEDED`) awaits the phone's export.

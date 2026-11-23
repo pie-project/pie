@@ -37,15 +37,8 @@ pub struct Deferral {
     pub landings: Vec<Landing>,
 }
 
-/// A put the host reads, landing in the pass's berth.
-#[derive(Clone, Copy, Debug)]
-pub struct Landing {
-    pub channel: u32,
-    /// Its value in the stage.
-    pub value: u32,
-    pub dtype: Dtype,
-    pub held: u64,
-}
+pub use engine_gpu::guest::defer::Landing;
+use engine_gpu::guest::defer::{host_reads_not, keeps};
 
 impl<'a> OnDevice<'a> {
     pub fn new(
@@ -189,8 +182,7 @@ impl<'a> OnDevice<'a> {
                 keeps(package, channel, bytes)
             };
             if on_device {
-                self.session
-                    .keep(self.device, &mut frame, at, local, channel)?;
+                self.session.keep(&mut frame, at, local, channel)?;
             } else {
                 self.session.forget(channel);
                 landed.push((put.value, channel));
@@ -311,44 +303,18 @@ impl StageRunner for OnDevice<'_> {
     }
 }
 
-/// Cells at least this large stay on the device between fires when only the
-/// device reads them: a sampler's token histograms, a vocabulary wide each.
-const KEEP_BYTES: u64 = 64 << 10;
+impl engine_gpu::guest::defer::LandedPass for Pass {
+    fn status(&self) -> Result<Option<u32>> {
+        Pass::status(self)
+    }
 
-fn keeps(package: &LaunchPackage, channel: u32, bytes: u64) -> bool {
-    package.channels.get(channel as usize).is_some_and(|decl| {
-        decl.capacity == 1
-            && decl.host_role != eta_ir::container::HostRole::Reader
-            && bytes >= KEEP_BYTES
-    })
-}
-
-/// Whether a deferred pass keeps `channel`'s puts on the device: every one the
-/// host does not read, at the fire (a `fold` count, an `attn_mask`) or after.
-fn host_reads_not(package: &LaunchPackage, channel: u32) -> bool {
-    let read_at_fire = package.ports.iter().any(|binding| {
-        binding.channel == channel
-            && !binding.is_const
-            && matches!(
-                binding.port,
-                eta_ir::registry::Port::Fold | eta_ir::registry::Port::AttnMask
-            )
-    });
-    !read_at_fire
-        && package
-            .channels
-            .get(channel as usize)
-            .is_some_and(|decl| decl.host_role != eta_ir::container::HostRole::Reader)
-}
-
-/// The value a landed pass read back for `landing`.
-pub fn landed_value(landed: &Pass, landing: &Landing) -> Result<Value> {
-    let (at, bytes) = landed
-        .read_at(landing.value)
-        .ok_or_else(|| Fault::Program {
+    /// The value the pass read back for `landing`.
+    fn value(&self, landing: &Landing) -> Result<Value> {
+        let (at, bytes) = self.read_at(landing.value).ok_or_else(|| Fault::Program {
             at: "guest::run",
             why: format!("value {} was not read back by its pass", landing.value),
         })?;
-    let raw = landed.read(at, bytes.min(landing.held))?;
-    Ok(from_heap(&raw, landing.dtype, landing.held))
+        let raw = self.read(at, bytes.min(landing.held))?;
+        Ok(from_heap(&raw, landing.dtype, landing.held))
+    }
 }

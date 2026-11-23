@@ -271,6 +271,17 @@ impl FedCheck {
         }
     }
 
+    /// The token seat rows the check reads: up to the last fed lane's.
+    #[must_use]
+    pub fn rows(&self) -> u32 {
+        self.inner
+            .lanes
+            .iter()
+            .map(|lane| lane.row + 1)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// The forward landed (`whole`), or was lost: reads the fed ids back,
     /// once. A lost step faults every lane by its own loss, not here.
     pub fn landed(&self, whole: bool) {

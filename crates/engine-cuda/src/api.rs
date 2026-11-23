@@ -142,30 +142,6 @@ impl Cuda {
         self.boot.world.rank
     }
 
-    #[must_use]
-    /// Points every registered ring's cells at where their `Channel` slots
-    /// lie now, after an evacuation moved chunks.
-    fn rebase_channels(&mut self) -> EngineResult<()> {
-        let Some(shell) = self.shell.as_ref() else {
-            return Ok(());
-        };
-        for endpoint in self.channels.values() {
-            let slots = endpoint.slots();
-            if slots.is_empty() {
-                continue;
-            }
-            let at = shell
-                .guest_span(
-                    engine::chunk::SlotRole::Channel,
-                    &slots,
-                    crate::program::Endpoint::cell_span(endpoint.wire_bytes(), endpoint.cap1() - 1),
-                )
-                .map_err(fault)?;
-            endpoint.rebase(at);
-        }
-        Ok(())
-    }
-
     /// Whether a live instance is bound on channel `id`.
     fn bound_on(&self, id: ChannelId) -> bool {
         self.attached
@@ -970,9 +946,31 @@ impl Engine for Cuda {
         self.loaded_mut()?.weight_uses().map_err(fault)
     }
 
+    /// All or nothing: an `Err` moved nothing (`Shell::evacuate_with`).
     fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
-        self.loaded_mut()?.evacuate(evacuation).map_err(fault)?;
-        self.rebase_channels()
+        let endpoints: Vec<_> = self
+            .channels
+            .values()
+            .filter(|endpoint| !endpoint.slots().is_empty())
+            .cloned()
+            .collect();
+        let channels: Vec<(Vec<u32>, u64)> = endpoints
+            .iter()
+            .map(|endpoint| {
+                (
+                    endpoint.slots(),
+                    crate::program::Endpoint::cell_span(endpoint.wire_bytes(), endpoint.cap1() - 1),
+                )
+            })
+            .collect();
+        let at = self
+            .loaded_mut()?
+            .evacuate_with(evacuation, &channels)
+            .map_err(fault)?;
+        for (endpoint, at) in endpoints.iter().zip(at) {
+            endpoint.rebase(at);
+        }
+        Ok(())
     }
 
     fn program_facts(&self, program: ProgramId) -> EngineResult<engine::program::ProgramFacts> {

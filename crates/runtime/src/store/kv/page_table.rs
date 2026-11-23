@@ -1948,6 +1948,11 @@ impl KvPageTable {
             .count() as u32
     }
 
+    /// The pages a move between tiers holds a slot of on both sides.
+    pub fn moving_pages(&self) -> usize {
+        self.swap_locations.len()
+    }
+
     /// Dropping what holds it would change pages under the move.
     pub fn in_move_at(&self, root: NodeId) -> bool {
         if self.swap_locations.is_empty() {
@@ -2187,6 +2192,56 @@ impl KvPageTable {
                 .ok_or(KvTableError::BackingChanged),
             Pages::ParentSelection { .. } => Err(KvTableError::BackingChanged),
         }
+    }
+
+    /// Every page resident on the device, where it lies and its id, with
+    /// the working sets whose pages it is, each with whether it is
+    /// suspended (none: idle cache, read by no set): what a list
+    /// compaction reads its movable pages from
+    /// ([`super::KvStore::plan_list_compaction`]). `None` for a page that
+    /// stays where it lies: one a move holds, or one a pin keeps (an
+    /// export, a promote, a persist).
+    #[allow(clippy::type_complexity)]
+    pub fn device_pages_by_reader(
+        &self,
+    ) -> Vec<(TriePageLocation, PhysicalKvPageId, Option<Vec<(WorkingSetId, bool)>>)> {
+        let mut readers: FxHashMap<TriePageLocation, Option<Vec<(WorkingSetId, bool)>>> =
+            FxHashMap::default();
+        for (ws, entry) in self.working_sets.iter() {
+            let suspended = entry.suspended;
+            let _ = self.visit_working_set_locations(ws, |location| {
+                if let Some(list) = readers.entry(location).or_insert_with(|| Some(Vec::new())) {
+                    list.push((ws, suspended));
+                }
+            });
+        }
+        for &terminal in self.pins.keys() {
+            self.visit_anchor_locations(terminal, |location| {
+                readers.insert(location, None);
+            });
+        }
+        let mut pages = Vec::new();
+        for (node, trie_node) in self.nodes.iter() {
+            let Pages::Owned { backings, .. } = &trie_node.pages else {
+                continue;
+            };
+            for (local, backing) in backings.iter().enumerate() {
+                let KvPageBacking::Resident(id) = *backing else {
+                    continue;
+                };
+                let location = TriePageLocation {
+                    node,
+                    local: local as u64,
+                };
+                let by = if self.swap_locations.contains(&location) {
+                    None
+                } else {
+                    readers.get(&location).cloned().unwrap_or(Some(Vec::new()))
+                };
+                pages.push((location, id, by));
+            }
+        }
+        pages
     }
 
     pub fn page_location_pinned(&self, location: TriePageLocation) -> bool {

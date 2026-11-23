@@ -396,7 +396,14 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             .device_facts()
             .is_some_and(|facts| facts.unified_memory)
     });
-    let (memory_yield, stated) = crate::governor::yield_for(memory_yield, unified_memory);
+    // Where an engine reads the host's room itself, the yield reacts only to
+    // the rest of the system (`governor::yield_for`).
+    let room = crate::governor::Room::of(
+        engine_configs
+            .iter()
+            .any(|d| d.engine_backend.host_room().is_some()),
+    );
+    let (memory_yield, stated) = crate::governor::yield_for(memory_yield, unified_memory, room);
     tracing::info!("{stated}");
 
     // Each engine's readouts, a fire bound (`Engine::readout_facts`): a
@@ -653,6 +660,17 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    // Test builds: a slot the shared pool gives back is poisoned by its
+    // engine before the engine's next verb (`Engine::poison_queue`), so a
+    // fire that reads a cell its owner never wrote reads NaN.
+    #[cfg(feature = "test-slot-fill")]
+    for (engine, stores) in engine_configs.iter_mut().zip(&arena_stores) {
+        if let Some(shared) = &stores.shared {
+            let queue = ::engine::chunk::PoisonQueue::default();
+            shared.lock().unwrap().pool_mut().poison_into(queue.clone());
+            engine.engine_backend.poison_queue(queue);
+        }
+    }
     // A shared pool's tiers are its host chunks and disk slots; today's
     // pools state theirs in pages.
     let kv_swap_capable = engine_configs.first().is_some_and(|d| {
@@ -746,7 +764,17 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             dir,
             engines: prints.join(";"),
             deployment: model_id.clone(),
+            committed: engine_configs
+                .iter()
+                .flat_map(|d| d.engine_backend.committed_covers().iter().copied())
+                .collect(),
         });
+    // Every engine skips measuring (`[engine] measure = false`): the host
+    // cover no layer states is taken by its estimate, not warm runs.
+    let cover_skipped = !engine_configs.is_empty()
+        && engine_configs
+            .iter()
+            .all(|d| d.engine_backend.skips_measuring());
     let readers: Vec<Option<::engine::HostRoom>> = engine_configs
         .iter()
         .map(|d| d.engine_backend.host_room())
@@ -878,7 +906,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                      parks={} serves={} evictions={} deferrals={} \
                      evict_rollbacks={} evict_faults={} restore_faults={} restores={} restore_failures={} restore_roles_short={} leaked_role_slots={} gate_parks={} \
                      hogs={} starved={} restarted={} salvaged={} swapfull={}/{} e6_relax={} rshort={} \
-                     grow_waits={} compaction_waits={} grow_parked={} no_grows={} \
+                     grow_waits={} compaction_waits={} list_compactions={} grow_parked={} no_grows={} \
                      lock_n={} lock_wait_ms={} lock_hold_ms={} lock_wmax_us={} lock_hmax_us={} \
                      d2h_pages={} h2d_pages={} d2h_rs={} h2d_rs={} d2h_ms={} h2d_ms={} \
                      disk_free={}/{} disk_w_pages={} host_disk_pages={} disk_r_pages={} disk_w_ms={} disk_r_ms={} \
@@ -924,6 +952,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     d.restore_absorb_short_total,
                     d.grow_waits_total,
                     d.compaction_waits_total,
+                    d.list_compactions_total,
                     d.grow_parked,
                     d.no_grows_total,
                     lk_n,
@@ -997,7 +1026,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     // read.
     let moves = governed.iter().any(crate::governor::run::yield_applies);
     let source = if moves {
-        crate::governor::source_for(memory_yield, ::engine::pressure::Source::of_this_system)
+        crate::governor::source_for(memory_yield, || room.source())
     } else {
         Ok(None)
     };
@@ -1022,7 +1051,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     }
     // The host cover, measured through the ordinary pipeline before ready,
     // or read where an earlier boot measured it under the same key.
-    match host_cover(&name, warm_context, cover_cache.as_ref()).await {
+    match host_cover(&name, warm_context, cover_cache.as_ref(), cover_skipped).await {
         Ok(cover) => crate::scheduler::set_host_cover(cover),
         Err(error) => {
             tracing::error!(%error, "measuring the host cover at load");
@@ -1063,8 +1092,21 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
 /// runs' context. Not the runtime's build: a build that changes none of
 /// those reuses the cover. `cache` is `None` where an engine states no
 /// fingerprint: the cover is measured.
-async fn host_cover(model: &str, context: usize, cache: Option<&CoverCache>) -> Result<usize> {
+/// Looked up the home's own cache first, then the covers committed for the
+/// engines' devices (`::engine::Engine::committed_covers`, the same entries
+/// under the same key), then measured; where every engine skips measuring
+/// (`skipped`, `[engine] measure = false`), the estimate in place of the
+/// warm runs ([`cover_estimate`]), said by name and kept nowhere.
+async fn host_cover(
+    model: &str,
+    context: usize,
+    cache: Option<&CoverCache>,
+    skipped: bool,
+) -> Result<usize> {
     let Some(cache) = cache else {
+        if skipped {
+            return Ok(cover_estimate("no engine keys the cover"));
+        }
         return measure_host_cover(model, context).await.map(|(cover, ..)| cover);
     };
     let reference = program::ProgramRef::parse("compat-openai")?;
@@ -1101,6 +1143,20 @@ async fn host_cover(model: &str, context: usize, cache: Option<&CoverCache>) -> 
             return Ok(cover);
         }
     }
+    if let Some(held) = cache.committed.iter().find_map(|text| committed_cover(text, &key)) {
+        tracing::info!(
+            cover = held.cover,
+            frame_us = held.frame_us,
+            turnaround_us = held.turnaround_us,
+            "the host cover, committed for the engines' devices under this key; nothing measured"
+        );
+        return Ok(held.cover);
+    }
+    if skipped {
+        return Ok(cover_estimate(
+            "neither the home's cache nor a committed cover holds this key",
+        ));
+    }
     let (cover, frame_us, turnaround_us) = measure_host_cover(model, context).await?;
     let held = serde_json::json!({
         "key": key,
@@ -1124,6 +1180,51 @@ struct CoverCache {
     engines: String,
     /// The model the cover's warm runs serve.
     deployment: String,
+    /// The covers committed for the engines' devices: each file's text.
+    committed: Vec<&'static str>,
+}
+
+/// One kept host cover, as the cache and a committed file state it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HeldCover {
+    pub cover: usize,
+    pub frame_us: f64,
+    pub turnaround_us: f64,
+}
+
+/// The entry of `text` (a committed covers file: a JSON list of the cache's
+/// entries) whose key is `key`, where it holds one.
+#[must_use]
+pub fn committed_cover(text: &str, key: &str) -> Option<HeldCover> {
+    let all: Vec<serde_json::Value> = serde_json::from_str(text).ok()?;
+    all.iter()
+        .find(|entry| entry.get("key").and_then(serde_json::Value::as_str) == Some(key))
+        .and_then(|entry| {
+            let field = |name: &str| entry.get(name).and_then(serde_json::Value::as_f64);
+            Some(HeldCover {
+                cover: field("cover")? as usize,
+                frame_us: field("frame_us")?,
+                turnaround_us: field("turnaround_us")?,
+            })
+        })
+}
+
+/// The host cover where every engine skips measuring and no layer states
+/// it: the frames the scheduler dispatches ahead at most
+/// (`scheduler::configured_dispatch_depth`). A cover is a guest turnaround
+/// over one frame's device time; one too small leaves the device idle
+/// between frames, one too large costs only window, never a result, so the
+/// most the dispatch depth allows is the estimate that never idles the
+/// device. Said by name.
+fn cover_estimate(why: &str) -> usize {
+    let cover = crate::scheduler::configured_dispatch_depth().max(1);
+    tracing::info!(
+        cover,
+        "the host cover: skipped (`[engine] measure = false`; {why}), served by the estimate: \
+         the frames dispatched ahead at most, so no turnaround idles the device (a cover too \
+         large costs window, never a result); no warm runs, kept nowhere"
+    );
+    cover
 }
 
 async fn measure_host_cover(model: &str, context: usize) -> Result<(usize, f64, f64)> {

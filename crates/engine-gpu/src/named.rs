@@ -463,6 +463,19 @@ impl<B: Serve> Serve for Named<B> {
         Ok(())
     }
 
+    fn time_for_bound(
+        _device: &Facts,
+        _tuning: &B::Tuning,
+        _tier: kernels_slang::Tier,
+        _max_submit: std::time::Duration,
+        _at: &crate::rates::ForBound,
+    ) -> Result<crate::rates::BoundTimes> {
+        Err(crate::error::Fault::Unbound {
+            what: "a submit bound's timing on a naming load, which runs nothing on a device"
+                .into(),
+        })
+    }
+
     fn rate_shapes(
         _device: &Facts,
         _boot: &B::DeviceBoot,
@@ -476,6 +489,14 @@ impl<B: Serve> Serve for Named<B> {
 
     fn chunk_bytes(boot: &B::DeviceBoot) -> Option<u64> {
         B::chunk_bytes(boot)
+    }
+
+    fn committed_covers() -> &'static [&'static str] {
+        B::committed_covers()
+    }
+
+    fn measuring(boot: &B::DeviceBoot) -> engine::rates::Measuring {
+        B::measuring(boot)
     }
 
     fn submit_bound(boot: &Self::DeviceBoot) -> Option<std::time::Duration> {
