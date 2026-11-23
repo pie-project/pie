@@ -3106,11 +3106,12 @@ impl KvStore {
     pub fn prepare_suspend(
         &mut self,
         working_sets: &HashSet<WorkingSetId>,
+        keys: impl Keys,
     ) -> Result<Option<KvResidencyTxn>, KvStoreError> {
         let mut pages = self.table.movable_resident_pages(working_sets)?;
         // Host room is for what is paused before what is cached.
         if self.host_pool.available() < pages.len() {
-            self.drop_entries_off_device();
+            self.drop_entries_off_device(pages.len(), &keys);
             // Dropping can compact the pages just listed: list them again.
             pages = self.table.movable_resident_pages(working_sets)?;
         }
@@ -3134,8 +3135,9 @@ impl KvStore {
         room: usize,
         order: &[(WorkingSetId, u64)],
         wanted: usize,
+        keys: impl Keys,
     ) -> Result<Option<KvResidencyTxn>, KvStoreError> {
-        self.prepare_sweep_with(keep, room, order, wanted, true)
+        self.prepare_sweep_with(keep, room, order, wanted, true, &keys)
     }
 
     /// [`Self::prepare_sweep`] of the tails alone: the heads `order` names
@@ -3146,8 +3148,9 @@ impl KvStore {
         room: usize,
         order: &[(WorkingSetId, u64)],
         wanted: usize,
+        keys: impl Keys,
     ) -> Result<Option<KvResidencyTxn>, KvStoreError> {
-        self.prepare_sweep_with(keep, room, order, wanted, false)
+        self.prepare_sweep_with(keep, room, order, wanted, false, &keys)
     }
 
     fn prepare_sweep_with(
@@ -3157,6 +3160,7 @@ impl KvStore {
         order: &[(WorkingSetId, u64)],
         wanted: usize,
         spare_heads: bool,
+        keys: &impl Keys,
     ) -> Result<Option<KvResidencyTxn>, KvStoreError> {
         // In tokens as a policy states them, in pages here.
         let page = u64::from(self.page_size.max(1));
@@ -3167,7 +3171,8 @@ impl KvStore {
         let order = &order[..];
         let mut pages = self.table.stranded_pages(keep, order, wanted, spare_heads);
         if self.swap_available() < pages.len().min(room) {
-            self.drop_entries_off_device();
+            let wanted = pages.len().min(room).saturating_sub(self.disk_swap_available());
+            self.drop_entries_off_device(wanted, keys);
             // Dropping can compact the pages just listed: list them again.
             pages = self.table.stranded_pages(keep, order, wanted, spare_heads);
         }
@@ -3463,10 +3468,13 @@ impl KvStore {
         self.persisted.as_ref().map_or(0, |p| p.slots.len())
     }
 
-    /// No lookup hits them, and no one will bring them back.
-    fn drop_entries_off_device(&mut self) {
+    /// Drops idle cache held off the device until the host has `wanted`
+    /// slots free: the lowest retention key first, then the least recently
+    /// used, so the host keeps the higher keys as the device does. No
+    /// lookup hits what goes, and no one will bring it back.
+    fn drop_entries_off_device(&mut self, wanted: usize, keys: &impl Keys) {
         let unused: HashSet<NodeId> = self.table.unused_cache_roots().into_iter().collect();
-        let keys: Vec<u64> = self
+        let mut entries: Vec<(i64, Instant, u64)> = self
             .cache
             .iter()
             .filter(|(_, entry)| {
@@ -3474,10 +3482,21 @@ impl KvStore {
                     && !self.table.settled_on_device(entry.path.terminal)
                     && !self.persisted_whole(entry)
             })
-            .map(|(&key, _)| key)
+            .map(|(&id, entry)| {
+                let key = keys.key_at(entry.owner, self.key_token(entry.path.pages));
+                (key, entry.last_use, id)
+            })
             .collect();
-        tracing::debug!(target: "pie::kv", entries = keys.len(), "dropped off device");
-        self.drop_entries(keys, By::Host, self.current_epoch());
+        entries.sort_unstable();
+        let mut dropped = 0;
+        for (_, _, id) in entries {
+            if self.host_pool.available() >= wanted {
+                break;
+            }
+            self.drop_entries(vec![id], By::Host, self.current_epoch());
+            dropped += 1;
+        }
+        tracing::debug!(target: "pie::kv", entries = dropped, wanted, "dropped off device");
     }
 
     pub fn mark_suspended(&mut self, working_sets: &HashSet<WorkingSetId>) {

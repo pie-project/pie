@@ -988,7 +988,7 @@ pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
                     "planner: an eviction's sets released while it waited are passed over"
                 );
             }
-            let prepared = kv.prepare_suspend(&live);
+            let prepared = kv.prepare_suspend(&live, crate::policy::retention::Installed);
             (live, prepared)
         });
     let kv = match prepared {
