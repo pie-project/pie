@@ -371,10 +371,37 @@ impl Shelf {
 /// refused by name; so is a file that does not read, or states no
 /// measurement. The text reads back to the same entries.
 pub fn export(registry: &Registry, device: &str, user: &str, origin: &str) -> Result<String, String> {
+    export_reporting(registry, device, user, origin).map(|(text, _)| text)
+}
+
+/// [`export`], with what a boot of each model the export carries a settle
+/// of reads, model by model ([`settles_carried`]): each line says one
+/// model's settle, the curves its planes take and whether each is carried;
+/// a settle whose planes lack a curve is left out, by name (a boot of that
+/// model would time its curves, so a settle over curves the export does not
+/// carry would key nothing it serves).
+pub fn export_reporting(
+    registry: &Registry,
+    device: &str,
+    user: &str,
+    origin: &str,
+) -> Result<(String, Vec<String>), String> {
     let file = registry
         .parse(user, origin, Strict::User)
         .map_err(|e| e.to_string())?;
-    let rates = file.tuned.rates.ordered();
+    export_rates(registry, device, file.tuned.rates, origin)
+}
+
+/// [`export_reporting`] of `rates` (a home's measured entries, merged over
+/// what of a committed profile still holds: [`merge_committed`]).
+pub fn export_rates(
+    registry: &Registry,
+    device: &str,
+    rates: crate::fire::Rates,
+    origin: &str,
+) -> Result<(String, Vec<String>), String> {
+    let mut rates = rates.ordered();
+    let report = settles_carried(&mut rates);
     if rates == crate::fire::Rates::default() {
         return Err(format!("{origin}: stores no measurement of `{device}`"));
     }
@@ -400,7 +427,128 @@ pub fn export(registry: &Registry, device: &str, user: &str, origin: &str) -> Re
             "the export of {origin} reads back other entries than it stores"
         ));
     }
-    Ok(text)
+    Ok((text, report))
+}
+
+/// A home's measured entries (`measured`, its user's file, sifted) laid over
+/// the device's committed profile (`committed`, as it reads), each committed
+/// entry checked against this build (`now`): one whose key still matches is
+/// carried, one whose key no longer does is dropped. A re-export so never
+/// shrinks a committed profile silently. Each entry is said, a line each:
+/// measured (the home's), carried (the committed one's) or dropped (its key
+/// no longer matches, and why). Refused by name where a rate the committed
+/// profile stated is dropped and the home did not measure it again: a boot
+/// would then measure it.
+pub fn merge_committed(
+    measured: crate::fire::Rates,
+    committed: Option<crate::fire::Rates>,
+    now: Option<&dyn crate::fire::Now>,
+) -> Result<(crate::fire::Rates, Vec<String>), String> {
+    use crate::fire::{DENSE_SETTLED, KERNEL_CURVES, KEYED};
+    let mut report = Vec::new();
+    let Some(mut committed) = committed else {
+        for key in KEYED.iter().filter(|key| measured.states(key)) {
+            report.push(format!("`{key}`: measured"));
+        }
+        return Ok((measured, report));
+    };
+    let before = committed.clone();
+    let dropped = match now {
+        Some(now) => committed.sift_as(now, "committed"),
+        None => Vec::new(),
+    };
+    for line in &dropped {
+        report.push(format!("dropped: {line}"));
+    }
+    let mut refused = Vec::new();
+    for key in KEYED {
+        match (measured.states(key), committed.states(key), before.states(key)) {
+            (true, _, _) => report.push(format!("`{key}`: measured")),
+            (false, true, _) => report.push(format!("`{key}`: carried from the committed profile")),
+            (false, false, true) => refused.push(key),
+            (false, false, false) => {}
+        }
+    }
+    if !refused.is_empty() {
+        return Err(format!(
+            "the committed profile states {refused:?}, whose keys no longer match this build, and \
+             the home did not measure them again: a boot would measure them; boot with `[engine] \
+             measure = true` once, then export"
+        ));
+    }
+    let curve_ids = |r: &crate::fire::Rates| -> Vec<(u32, u32, u32, u32)> {
+        r.kernel_tflops_by_shape
+            .iter()
+            .flatten()
+            .map(crate::fire::KernelCurve::id)
+            .collect()
+    };
+    let (mine, carried) = (curve_ids(&measured), curve_ids(&committed));
+    report.push(format!(
+        "{KERNEL_CURVES}: {} measured, {} carried from the committed profile",
+        mine.len(),
+        carried.iter().filter(|id| !mine.contains(id)).count()
+    ));
+    let settles_mine: Vec<u32> = measured.dense_settled.iter().map(|d| d.of).collect();
+    report.push(format!(
+        "{DENSE_SETTLED}: {} measured, {} carried from the committed profile",
+        settles_mine.len(),
+        committed
+            .dense_settled
+            .iter()
+            .filter(|d| !settles_mine.contains(&d.of))
+            .count()
+    ));
+    let measured_on = measured.measured_on.clone().or(committed.measured_on.clone());
+    let mut merged = measured.over(committed);
+    merged.measured_on = measured_on;
+    Ok((merged, report))
+}
+
+/// For each settle `rates` stores (one a model), what a boot of its model
+/// reads beside it: the dense curves at each of its planes, by kernel. A
+/// settle one of whose planes `rates` states no curve at is taken out of
+/// `rates` and said: carried, a boot of the model would time that plane's
+/// curves and settle again over them.
+pub fn settles_carried(rates: &mut crate::fire::Rates) -> Vec<String> {
+    let curves = rates.kernel_tflops_by_shape.clone().unwrap_or_default();
+    let mut report = Vec::new();
+    let mut kept = Vec::new();
+    for settled in std::mem::take(&mut rates.dense_settled) {
+        let at: Vec<String> = settled
+            .planes
+            .iter()
+            .map(|&(n, k)| {
+                let count = curves.iter().filter(|c| (c.n, c.k) == (n, k)).count();
+                format!("{n}x{k}: {count} curve(s)")
+            })
+            .collect();
+        let missing: Vec<String> = settled
+            .planes
+            .iter()
+            .filter(|&&(n, k)| !curves.iter().any(|c| (c.n, c.k) == (n, k)))
+            .map(|(n, k)| format!("{n}x{k}"))
+            .collect();
+        if missing.is_empty() {
+            report.push(format!(
+                "model settle {:#010x}: its settle and the curves at each of its planes are \
+                 carried ({}); a boot of it measures none of them",
+                settled.of,
+                at.join(", ")
+            ));
+            kept.push(settled);
+        } else {
+            report.push(format!(
+                "WARN model settle {:#010x}: left out: no curve is stored at {} ({}); a boot of \
+                 it times those curves and settles again",
+                settled.of,
+                missing.join(", "),
+                at.join(", ")
+            ));
+        }
+    }
+    rates.dense_settled = kept;
+    report
 }
 
 fn seeded(path: &str, text: &str) -> Candidate {

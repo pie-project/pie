@@ -1457,10 +1457,10 @@ impl<'a> Walk<'a> {
     /// key (`of`), no key twice.
     fn dense_settled(&mut self, v: &Spanned<DeValue<'_>>) -> Vec<crate::fire::DenseSettled> {
         let what = "`rates.dense_settled_keyed` is a list of [method, of, code, [[bottom, top, \
-                    replaced, vector, wide, tier], ...]], whole numbers, one per key";
+                    replaced, vector, wide, tier], ...], [[n, k], ...]], whole numbers, one per key";
         let whole = |v: &DeValue<'_>| int(v).and_then(|x| u32::try_from(x).ok());
         let one = |v: &DeValue<'_>| match v {
-            DeValue::Array(f) if f.len() == 4 => {
+            DeValue::Array(f) if f.len() == 5 => {
                 let head = whole(f[0].get_ref())
                     .zip(whole(f[1].get_ref()))
                     .zip(whole(f[2].get_ref()));
@@ -1480,13 +1480,27 @@ impl<'a> Walk<'a> {
                         .collect::<Option<Vec<[u32; 6]>>>(),
                     _ => None,
                 };
-                head.zip(ranges)
-                    .map(|(((method, of), code), ranges)| crate::fire::DenseSettled {
+                let planes = match f[4].get_ref() {
+                    DeValue::Array(ps) => ps
+                        .iter()
+                        .map(|p| match p.get_ref() {
+                            DeValue::Array(x) if x.len() == 2 => {
+                                Some((whole(x[0].get_ref())?, whole(x[1].get_ref())?))
+                            }
+                            _ => None,
+                        })
+                        .collect::<Option<Vec<(u32, u32)>>>(),
+                    _ => None,
+                };
+                head.zip(ranges).zip(planes).map(|((((method, of), code), ranges), planes)| {
+                    crate::fire::DenseSettled {
                         method,
                         of,
                         code,
                         ranges,
-                    })
+                        planes,
+                    }
+                })
             }
             _ => None,
         };

@@ -794,6 +794,15 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         .iter()
         .map(|reader| reader.as_ref().and(host.as_ref()).map(|host| host.pool()))
         .collect();
+    // Every engine's own measurements beside the cover's, said once the
+    // load stands: "measured 0" where none was timed.
+    let mut measured: Vec<String> = Vec::new();
+    for d in &engine_configs {
+        match d.engine_backend.measured_at_load() {
+            Some(timed) => measured.extend(timed),
+            None => measured.push(format!("{}: not tracked", d.engine_backend.kind())),
+        }
+    }
     let engines: Vec<usize> = engine_configs
         .into_iter()
         .map(|d| {
@@ -1056,7 +1065,17 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     // The host cover, measured through the ordinary pipeline before ready,
     // or read where an earlier boot measured it under the same key.
     match host_cover(&name, warm_context, cover_cache.as_ref(), cover_skipped).await {
-        Ok(cover) => crate::scheduler::set_host_cover(cover),
+        Ok((cover, timed)) => {
+            crate::scheduler::set_host_cover(cover);
+            if timed {
+                measured.push("host cover".to_string());
+            }
+            if measured.is_empty() {
+                tracing::info!("load: measured 0");
+            } else {
+                tracing::info!("load: measured {}: {}", measured.len(), measured.join(", "));
+            }
+        }
         Err(error) => {
             tracing::error!(%error, "measuring the host cover at load");
             scheduler_shutdown.shutdown().await.ok();
@@ -1106,12 +1125,14 @@ async fn host_cover(
     context: usize,
     cache: Option<&CoverCache>,
     skipped: bool,
-) -> Result<usize> {
+) -> Result<(usize, bool)> {
     let Some(cache) = cache else {
         if skipped {
-            return Ok(cover_estimate("no engine keys the cover"));
+            return Ok((cover_estimate("no engine keys the cover"), false));
         }
-        return measure_host_cover(model, context).await.map(|(cover, ..)| cover);
+        return measure_host_cover(model, context)
+            .await
+            .map(|(cover, ..)| (cover, true));
     };
     let reference = program::ProgramRef::parse("compat-openai")?;
     let built = program::resolve(None, &reference).await?;
@@ -1149,7 +1170,7 @@ async fn host_cover(
                 path = %path.display(),
                 "the host cover, read where an earlier boot measured it under this key"
             );
-            return Ok(cover);
+            return Ok((cover, false));
         }
     }
     if let Some(held) = cache.committed.iter().find_map(|text| committed_cover(text, &key)) {
@@ -1159,11 +1180,12 @@ async fn host_cover(
             turnaround_us = held.turnaround_us,
             "the host cover, committed for the engines' devices under this key; nothing measured"
         );
-        return Ok(held.cover);
+        return Ok((held.cover, false));
     }
     if skipped {
-        return Ok(cover_estimate(
-            "neither the home's cache nor a committed cover holds this key",
+        return Ok((
+            cover_estimate("neither the home's cache nor a committed cover holds this key"),
+            false,
         ));
     }
     let (cover, frame_us, turnaround_us) = measure_host_cover(model, context).await?;
@@ -1178,7 +1200,7 @@ async fn host_cover(
     {
         tracing::warn!(%why, path = %path.display(), "the host cover is not kept for the next boot");
     }
-    Ok(cover)
+    Ok((cover, true))
 }
 
 /// Where the host cover is kept between boots, and what of the load its key

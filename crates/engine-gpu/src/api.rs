@@ -875,6 +875,10 @@ where
         B::committed_covers()
     }
 
+    fn measured_at_load(&self) -> Option<Vec<String>> {
+        self.shell.as_ref().map(crate::serve::Shell::measured_at_load)
+    }
+
     fn skips_measuring(&self) -> bool {
         B::measuring(&self.boot) == engine::rates::Measuring::Skip
     }

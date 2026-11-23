@@ -111,6 +111,17 @@ pub fn probe() -> Option<(String, Facts)> {
     probe_at(0)
 }
 
+/// What this build keys device `index`'s stored measurements by
+/// (`profile::fire::Now`: its device and driver, each kernel's code): what a
+/// committed entry is checked against before an export carries it.
+#[must_use]
+pub fn now_at(index: u32) -> Option<Box<dyn profile::fire::Now>> {
+    measured_on_at(index).map(|on| {
+        Box::new(engine_gpu::stored::Keys::new(on, kernels_slang::Target::Spirv))
+            as Box<dyn profile::fire::Now>
+    })
+}
+
 /// The device and driver device `index`'s measurements are keyed as taken
 /// on (`Context::measured_on`): what a home's host covers of it name.
 #[must_use]

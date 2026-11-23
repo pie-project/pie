@@ -365,6 +365,9 @@ pub struct Exported {
     /// where the home stores no measurement of the device (every entry a
     /// load took matched a committed one), with why.
     pub measured: Result<(String, String), String>,
+    /// What a boot of each model the export carries a settle of reads, and
+    /// whether each is carried (`profile::settles_carried`), a line a model.
+    pub report: Vec<String>,
     /// The host covers the home's cache holds for this device
     /// (`<device>.covers.json`, its name and text): each entry whose key
     /// names the device the measurements were taken on. `None` where it
@@ -453,11 +456,20 @@ pub fn export(
         }
     };
     let from = backend.shelf.user_path(profiles, &device);
+    let committed = backend
+        .shelf
+        .seeded
+        .iter()
+        .find(|(path, _)| *path == profile::measured_name(&device))
+        .map(|(_, text)| *text);
+    let now = device_now(backend, index, &device);
     let mut exported = held(
         (backend.registry)(),
         device.clone(),
         from,
         cache,
+        committed,
+        now.as_deref(),
         || device_on(backend, index, &device),
     );
     exported.unprobed = unprobed;
@@ -494,8 +506,11 @@ fn held(
     device: String,
     from: std::path::PathBuf,
     cache: &Path,
+    committed: Option<&str>,
+    now: Option<&dyn profile::fire::Now>,
     on: impl FnOnce() -> Option<String>,
 ) -> Exported {
+    let origin = from.display().to_string();
     let user = std::fs::read_to_string(&from).map_err(|e| {
         format!(
             "{}: {e}: no measurement of `{device}` is stored (a load that took every entry from \
@@ -503,16 +518,39 @@ fn held(
             from.display()
         )
     });
-    let measured = user.as_ref().map_err(Clone::clone).and_then(|user| {
-        profile::export(registry, &device, user, &from.display().to_string())
-            .map(|text| (profile::measured_name(&device), text))
-    });
-    let stored_on = user.as_ref().ok().and_then(|user| {
-        registry
-            .parse(user, &from.display().to_string(), profile::Strict::User)
-            .ok()
-            .and_then(|file| file.tuned.rates.measured_on)
-    });
+    let stored = user
+        .as_ref()
+        .ok()
+        .map(|user| registry.parse(user, &origin, profile::Strict::User));
+    let stored_on = match &stored {
+        Some(Ok(file)) => file.tuned.rates.measured_on.clone(),
+        _ => None,
+    };
+    let committed_rates = committed
+        .map(|text| registry.parse(text, &profile::measured_name(&device), profile::Strict::Measured));
+    let mut report = Vec::new();
+    // The home's measured entries over what of the committed profile still
+    // holds for this build, each said: a re-export never shrinks it.
+    let measured = (|| -> Result<(String, String), String> {
+        let mine = match stored {
+            Some(Ok(file)) => file.tuned.rates,
+            Some(Err(why)) => return Err(why.to_string()),
+            None => profile::fire::Rates::default(),
+        };
+        let theirs = match committed_rates {
+            Some(Ok(file)) => Some(file.tuned.rates),
+            Some(Err(why)) => return Err(format!("the committed profile does not read: {why}")),
+            None => None,
+        };
+        if mine == profile::fire::Rates::default() && theirs.is_none() {
+            return Err(user.clone().err().unwrap_or_else(|| format!("{origin}: stores nothing")));
+        }
+        let (merged, lines) = profile::merge_committed(mine, theirs, now)?;
+        report.extend(lines);
+        let (text, lines) = profile::export_rates(registry, &device, merged, &origin)?;
+        report.extend(lines);
+        Ok((profile::measured_name(&device), text))
+    })();
     let covers = stored_on
         .or_else(on)
         .and_then(|on| covers_of(cache, &on))
@@ -522,7 +560,28 @@ fn held(
         unprobed: None,
         from,
         measured,
+        report,
         covers,
+    }
+}
+
+/// What this build keys `backend`'s device `index` (named `device`) by
+/// (`profile::fire::Now`): what a committed entry is checked against before
+/// an export carries it. `None` where the engine states none here (its
+/// committed entries are carried unchecked, and a boot checks them).
+fn device_now(backend: &Backend, index: u32, device: &str) -> Option<Box<dyn profile::fire::Now>> {
+    let _ = (index, device);
+    match backend.name {
+        #[cfg(feature = "vulkan")]
+        "vulkan" => engine_vulkan::chip::now_at(index),
+        #[cfg(feature = "wgpu")]
+        "wgpu" => engine_wgpu::chip::now_at(index),
+        #[cfg(feature = "engine-cuda")]
+        "cuda" => Some(Box::new(engine_cuda::stored::Keys::of(
+            i32::try_from(index).unwrap_or(0),
+            device,
+        ))),
+        _ => None,
     }
 }
 
@@ -715,6 +774,8 @@ mod cover_tests {
             "Card X".into(),
             home.join("profiles/toy/user/card-x.toml"),
             &cache,
+            None,
+            None,
             || Some(on.to_string()),
         );
         std::fs::remove_dir_all(&home).unwrap();

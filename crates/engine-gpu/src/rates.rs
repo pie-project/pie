@@ -2059,6 +2059,7 @@ pub fn shapes_at_load<B: Serve, T: Tactics + ?Sized>(
     let mut tuned = chip.tuned().clone();
     tuned.rates = measured;
     tuned.measured_this_load = true;
+    tuned.timed.push(format!("dense curves ({})", wanted.len()));
     if saved_to.is_some() {
         tuned.saved_to = saved_to;
     }
@@ -2412,12 +2413,7 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     let elementwise_fired = rig.take_fired();
     step_fired.extend(elementwise_fired.iter().copied());
     let scan = if want.scan {
-        let gelems = repeated(|| {
-            let gelems = scan(&mut rig, tactics.recurrent(), timer, SCAN_SHAPE, launch);
-            rig.release();
-            gelems
-        })?;
-        Some(gelems)
+        Some(scan_within(&mut rig, tactics, timer, launch, say)?)
     } else {
         None
     };
@@ -2980,7 +2976,8 @@ fn attention<B: Serve, T: Tactics + ?Sized>(
     let page_indptr = rig.words(&[0, pages], 2, 1, Dtype::U32)?;
     // Each fire reads the next of these q / k / v sets, past the last-level
     // cache, as a served fire reads each layer's kv cold.
-    let sets = (0..engine::rates::attn_sets_at(s, PAGE).min(ATTN_SETS_MOST))
+    let most = rig.planes_most.map_or(ATTN_SETS_MOST, |most| most.min(ATTN_SETS_MOST));
+    let sets = (0..engine::rates::attn_sets_at(s, PAGE).min(most))
         .map(|_| {
             let q = rig.operand(s.rows, s.q_heads * s.head_dim, Dtype::Bf16)?;
             let keys = rig.operand(s.keys, kv_width, Dtype::Bf16)?;
@@ -3148,6 +3145,46 @@ fn scan<B: Serve>(
     })
 }
 
+/// The scan's rate, timed at [`SCAN_SHAPE`] where one fire of it fits the
+/// device's bound on one submission, else at the most tokens that do (halved
+/// from it, refused unsubmitted by its estimate each time it does not): the
+/// rate is elements a ns, which a shorter sequence of the same heads measures
+/// alike, so a slow device's scan is sized to its bound, never refused.
+fn scan_within<B: Serve, T: Tactics + ?Sized>(
+    rig: &mut Rig<'_, B>,
+    tactics: &T,
+    timer: Timer<'_, B>,
+    launch: f64,
+    say: &mut dyn FnMut(&str),
+) -> Result<f64> {
+    let mut shape = SCAN_SHAPE;
+    loop {
+        let rate = repeated(|| {
+            let gelems = scan(rig, tactics.recurrent(), timer, shape, launch);
+            rig.release();
+            gelems
+        });
+        let past = rig.past_bound.borrow_mut().take().is_some();
+        match rate {
+            Err(_) if past && shape.tokens > 1 => {
+                let tokens = shape.tokens / 2;
+                say(&format!(
+                    "[rates]: scan of {} tokens is past the bound: timed at {tokens}",
+                    shape.tokens
+                ));
+                tracing::info!(
+                    tokens = shape.tokens,
+                    next = tokens,
+                    "rates: the scan's fire is past the device's bound on one submission: timed \
+                     at half its tokens (its rate a ns is the same work's)"
+                );
+                shape.tokens = tokens;
+            }
+            rate => return rate,
+        }
+    }
+}
+
 /// The version of [`copy_and_launch`]'s method (`[rates] launch_ns`' and
 /// `hbm_gbps`' stored key, `crate::stored`): bumped only when how it
 /// measures changes.
@@ -3182,9 +3219,18 @@ fn copy_and_launch<B: Serve>(
     // The launch: a chain of `n` dependent tiny matmuls in one frame (each
     // reads the one before's output) against one matmul of `n` times the
     // rows, at each chain length of the lattice.
+    // Each chain the device's bound admits (a chain is one submission): a
+    // chain past it is skipped by name, the shorter ones read; none at all
+    // refuses by name.
     let mut gaps = Vec::with_capacity(engine::rates::LAUNCH_CHAINS.len());
     for n in engine::rates::LAUNCH_CHAINS {
-        gaps.push((n, launch_gap(rig, tactic, timer, (act, w, y), n)?));
+        match launch_gap(rig, tactic, timer, (act, w, y), n) {
+            Ok(gap) => gaps.push((n, gap)),
+            Err(why) if rig.past_bound.borrow_mut().take().is_some() && !gaps.is_empty() => {
+                say(&format!("[rates]: launch chain of {n} past the bound, skipped ({why})"));
+            }
+            Err(why) => return Err(why),
+        }
     }
     say(&format!(
         "[rates]: launch: {}",
@@ -3476,6 +3522,12 @@ pub fn for_bound<B: Serve, T: Tactics + ?Sized>(
     let narrow = matmul(&mut rig, at.narrow, timer, (1, n, k), 0.0);
     rig.release();
     let read_bytes_per_ns = narrow?;
+    // The bound's estimate takes each dispatch's longer of its reads at the
+    // bandwidth (the one-row read above, cold) and its flops at the rates
+    // below: those need no cold read, so each rotates through two sets, not
+    // past the cache (most of the probe's time on a phone was laying and
+    // touching the cold rotation, 768 MiB a point).
+    rig.planes_most = Some(2);
     let matmul_flops_per_ns = if at.rows > 1 {
         let wide = matmul(&mut rig, at.wide, timer, (at.rows, n, k), 0.0);
         rig.release();
@@ -3498,7 +3550,7 @@ pub fn for_bound<B: Serve, T: Tactics + ?Sized>(
         None => None,
     };
     let scan_elements_per_ns = if at.recurrent {
-        let rate = scan(&mut rig, tactics.recurrent(), timer, SCAN_SHAPE, 0.0);
+        let rate = scan_within(&mut rig, tactics, timer, 0.0, &mut |_| {});
         rig.release();
         Some(rate?)
     } else {
@@ -3513,12 +3565,17 @@ pub fn for_bound<B: Serve, T: Tactics + ?Sized>(
     })
 }
 
-/// The rows and width of the matmul the device's resident workgroups are
-/// read against where a load skips measuring ([`resident_for_skip`]): a
-/// square of [`engine::rates::GEMM_WIDTHS`]' narrowest at that many rows,
-/// whose tiles fill any device served (a thousand 32 x 32 tiles), its
-/// kernel compute-bound there.
-pub const RESIDENT_SHAPE: u32 = engine::rates::GEMM_WIDTHS[0];
+/// The width (and depth) of the matmul the device's resident workgroups are
+/// read against where a load skips measuring ([`resident_for_skip`]): the
+/// rates step's widest ([`engine::rates::GEMM_WIDTH`]), whose one-workgroup
+/// fire is long enough that its launch is a small share of it (at 1024 a
+/// phone's one-workgroup fire was launch-bound, and the count read ~2x the
+/// rates step's), at [`RESIDENT_ROWS`] rows.
+pub const RESIDENT_SHAPE: u32 = engine::rates::GEMM_WIDTH;
+
+/// The rows of the full-width matmul [`resident_for_skip`] reads the kernel's
+/// rate at: a thousand rows fill every device served many times over.
+pub const RESIDENT_ROWS: u32 = 1024;
 
 /// `[rates] resident_workgroups` where a load skips measuring
 /// (`engine::rates::Measuring::Skip`) and no layer states it: a device fact
@@ -3561,9 +3618,15 @@ pub fn resident_for_skip<B: Serve, T: Tactics + ?Sized>(
         launch?.max(0.0)
     };
     let w = RESIDENT_SHAPE;
-    let peak = matmul(&mut rig, tactics.gemm(tier, w), timer, (w, w, w), launch);
+    let peak = matmul(
+        &mut rig,
+        tactics.gemm(tier, RESIDENT_ROWS),
+        timer,
+        (RESIDENT_ROWS, w, w),
+        launch,
+    );
     rig.release();
-    let curve = [(w, peak?)];
+    let curve = [(RESIDENT_ROWS, peak?)];
     let resident = resident_workgroups(&mut rig, tactics, tier, timer, &curve, w, launch);
     rig.release();
     Ok((resident?, started.elapsed().as_millis()))

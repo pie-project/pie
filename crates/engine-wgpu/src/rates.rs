@@ -100,9 +100,10 @@ pub fn at_load(
                 resident,
                 ms,
                 "rates: `[rates] {}` timed despite measure = false (no layer states it, and the \
-                 device states no count a guest step's grid can stride over): a {}-cubed matmul \
-                 against one workgroup of it, single fires; stored nowhere",
+                 device states no count a guest step's grid can stride over): a {}-row matmul of \
+                 width {} against one workgroup of it, single fires; stored nowhere",
                 profile::fire::RESIDENT_WORKGROUPS,
+                engine_gpu::rates::RESIDENT_ROWS,
                 engine_gpu::rates::RESIDENT_SHAPE
             );
             resident
@@ -116,6 +117,11 @@ pub fn at_load(
         }
     };
     device.hold_resident(resident);
+    if tuning.resident().is_none() && measuring == engine::rates::Measuring::Skip {
+        let mut tuned = tuning.profile().tuned().clone();
+        tuned.timed.push(profile::fire::RESIDENT_WORKGROUPS.to_string());
+        return Ok(tuning.with_profile(tuning.profile().with_tuned(tuned)));
+    }
     Ok(tuning)
 }
 

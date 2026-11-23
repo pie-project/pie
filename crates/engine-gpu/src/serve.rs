@@ -912,6 +912,9 @@ pub struct Shell<B: Serve> {
     /// The key the settle looked its stored entries up by, once it ran:
     /// `(of, code)` ([`Shell::settle_key`]).
     settle_keyed: Option<(u32, u32)>,
+    /// What the shell timed at load beside its profile's
+    /// (`profile::fire::Tuned::timed`): the bound probe, the settle.
+    timed: Vec<String>,
     /// Whether the load times what no stored or committed profile states
     /// (`[engine] measure`): skipped, the settle fires nothing.
     measuring: engine::rates::Measuring,
@@ -2076,6 +2079,7 @@ impl<B: Serve> Shell<B> {
         // for_bound`, single fires, milliseconds), said by name, kept in the
         // bound alone (no other choice reads it) and stored nowhere.
         let mut bound_prefixed: Option<Vec<(u32, Vec<(u32, f64)>)>> = None;
+        let mut bound_timed = false;
         if unweighed
             && B::LANDS
             && let Some(bound) = B::submit_bound(boot.device)
@@ -2137,6 +2141,7 @@ impl<B: Serve> Shell<B> {
             );
             fire_estimate = Some(estimate);
             bound_prefixed = rates.attn_tflops_by_rows_keys;
+            bound_timed = true;
         }
         // Where the platform states a bound on one submission, every serving
         // step is held to it by the estimate (`crate::submit`), which must
@@ -2702,6 +2707,11 @@ impl<B: Serve> Shell<B> {
             dense_rates: device_profile.rates(),
             committed_settle: device_profile.tuned().committed_settle.clone(),
             settle_keyed: None,
+            timed: if bound_timed {
+                vec!["bound probe".to_string()]
+            } else {
+                Vec::new()
+            },
             measuring: B::measuring(boot.device),
             settled: Vec::new(),
             to_store: None,
@@ -3023,6 +3033,13 @@ impl<B: Serve> Shell<B> {
                 of,
                 code,
                 ranges,
+                planes: {
+                    let mut planes: Vec<(u32, u32)> =
+                        self.dense_planes.iter().map(|&(n, k, ..)| (n, k)).collect();
+                    planes.sort_unstable();
+                    planes.dedup();
+                    planes
+                },
             };
             self.dense_rates.dense_settled.retain(|s| s.of != of);
             self.dense_rates.dense_settled.push(keep.clone());
@@ -3319,6 +3336,21 @@ impl<B: Serve> Shell<B> {
                     })
             })
             .collect()
+    }
+
+    /// What this load timed, each by name: its profile's (`rates`, the
+    /// dense curves, `resident_workgroups`) and the shell's (the bound
+    /// probe, the settle where it weighed a range). Empty: it measured
+    /// nothing.
+    #[must_use]
+    pub fn measured_at_load(&self) -> Vec<String> {
+        use crate::backend::Tactics as _;
+        let mut all = self.tuning.profile().tuned().timed.clone();
+        all.extend(self.timed.iter().cloned());
+        if self.settled.iter().any(|range| range.checked) {
+            all.push("settle".to_string());
+        }
+        all
     }
 
     /// The key the dense settle looked its stored entries up by, `(of,

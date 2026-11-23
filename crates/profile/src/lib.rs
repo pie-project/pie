@@ -22,7 +22,10 @@ pub use profile::{Candidate, Facts, Pair, Profile, Report, Source, coord};
 pub use profile_macros::Decision;
 pub use region::{Region, Set};
 pub use registry::{API, Diagnostic, File, Refusal, Registry, Strict, Target};
-pub use shelf::{MEASURED_SUFFIX, Shelf, export, id_of, measured_name};
+pub use shelf::{
+    MEASURED_SUFFIX, Shelf, export, export_rates, export_reporting, id_of, measured_name,
+    merge_committed, settles_carried,
+};
 pub use spec::{Alternative, Constant, Domain, Kind, Shape, Sort, Spec, Tune, Value, Var};
 pub use when::When;
 

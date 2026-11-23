@@ -404,3 +404,59 @@ fn a_later_model_extends_a_shared_curve_and_keeps_its_points() {
         );
     }
 }
+
+/// Under a bound one fire of the scan's full sequence is past (a slow
+/// device's measuring boot), the rates step times the scan at the most
+/// tokens that fit the bound and lands: the scan's rate is stated, never a
+/// refused boot.
+#[test]
+fn a_scan_past_the_bound_is_timed_shorter_and_the_step_lands() {
+    let Ok(device) = Context::bind(&crate::gpu::device_boot(), engine::Allowance::WHOLE) else {
+        eprintln!("not asked: no device");
+        return;
+    };
+    let (chip, _) = engine_vulkan::chip::resolve(&device.chip(), None);
+    let tuning = engine_vulkan::tuning::Tuning::new(chip, device.limits());
+    let tier = <Api as engine_gpu::serve::Serve>::tier(&device);
+    let timer = |frame: Frame| {
+        let started = std::time::Instant::now();
+        let span = frame.commit_spanned()?;
+        Ok((span.filter(|&ns| ns > 0), started.elapsed().as_nanos() as u64))
+    };
+    // Every rate stated but the scan's: the step times the scan alone.
+    let stated = Rates {
+        launch_ns: Some(1000),
+        gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 10.0), (8192, 30.0)])]),
+        attn_tflops_by_keys: Some(vec![(512, 5.0), (8192, 10.0)]),
+        hbm_gbps: Some(600.0),
+        elementwise_gbps: Some(600.0),
+        resident_workgroups: Some(100.0),
+        submit_worst_ratio: Some(1.0),
+        attn_tflops_by_rows_keys: Some(vec![(128, vec![(512, 1.0)])]),
+        ..Rates::default()
+    };
+    // A bound the full sequence's fire is past: a quarter of its time alone.
+    let full = {
+        let measured = engine_gpu::rates::measure::<Api, _>(&device, &tuning, tier, &timer, None, &stated)
+            .expect("the scan is timed unbounded");
+        let gelems = measured.rates.scan_gelems.expect("the scan's rate");
+        engine::rates::scan_elements(engine::rates::SCAN_SHAPE) / gelems
+    };
+    let bound = std::time::Duration::from_nanos((full / 4.0).max(200_000.0) as u64);
+    let mut said = Vec::new();
+    let measured = engine_gpu::rates::measure_saying::<Api, _>(
+        &device,
+        &tuning,
+        tier,
+        &timer,
+        Some(bound),
+        &stated,
+        &mut |line| said.push(line.to_string()),
+    )
+    .unwrap_or_else(|why| panic!("the step lands under {bound:?}: {why}\n{said:#?}"));
+    assert!(measured.rates.scan_gelems.is_some_and(|g| g > 0.0), "{said:#?}");
+    assert!(
+        said.iter().any(|l| l.contains("timed at")),
+        "the scan was timed shorter: {said:#?}"
+    );
+}

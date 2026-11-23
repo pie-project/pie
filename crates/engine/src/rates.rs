@@ -1251,6 +1251,7 @@ pub fn resolve_at_load(
     let mut tuned = chip.tuned().clone();
     tuned.rates = rates;
     tuned.measured_this_load = true;
+    tuned.timed.push(format!("rates ({})", lacked.join(", ")));
     tuned.saved_to = saved_to;
     tuned.frame_cut = unsettled;
     Ok(chip.with_tuned(tuned))
@@ -1915,12 +1916,14 @@ mod tests {
                 of: 5,
                 code: 6,
                 ranges: vec![[1, 1, 0, 0, 0, 0]],
+                planes: vec![(1024, 1024)],
             },
             profile::fire::DenseSettled {
                 method: 1,
                 of: 9,
                 code: 6,
                 ranges: vec![[1, 1, 1, 4, 0, 1]],
+                planes: vec![(1024, 1024)],
             },
         ];
         let user = saved_text(None, &rates, &provenance("toy", "a test"));

@@ -258,6 +258,10 @@ pub struct DenseSettled {
     pub of: u32,
     pub code: u32,
     pub ranges: Vec<[u32; 6]>,
+    /// The model's dense planes the settle weighed, `(n, k)`, sorted: what a
+    /// boot of that model reads the curves at, so an export can say which
+    /// curves the settle's model needs and whether each is carried.
+    pub planes: Vec<(u32, u32)>,
 }
 
 /// One dense kernel's measured curve at one shape
@@ -372,7 +376,8 @@ pub const KERNEL_CURVES: &str = "kernel_tflops_by_shape_keyed";
 pub const KERNEL_CURVES_PER_DISPATCH: &str = "kernel_tflops_by_shape";
 
 /// The `[rates]` key of [`Rates::dense_settled`]: a list of `[method, of,
-/// code, [[bottom, top, replaced, vector, wide, tier], ...]]`, one per key. The settle an older
+/// code, [[bottom, top, replaced, vector, wide, tier], ...], [[n, k], ...]]`,
+/// one per key. The settle an older
 /// pie stored under `dense_settled`, keyed by its version, is no longer read.
 pub const DENSE_SETTLED: &str = "dense_settled_keyed";
 
@@ -895,12 +900,15 @@ impl Rates {
                             )
                         })
                         .collect();
+                    let planes: Vec<String> =
+                        settled.planes.iter().map(|(n, k)| format!("[{n}, {k}]")).collect();
                     format!(
-                        "  [{}, {}, {}, [{}]],\n",
+                        "  [{}, {}, {}, [{}], [{}]],\n",
                         settled.method,
                         settled.of,
                         settled.code,
-                        ranges.join(", ")
+                        ranges.join(", "),
+                        planes.join(", ")
                     )
                 })
                 .collect();
@@ -1024,6 +1032,10 @@ pub struct Tuned {
     /// of under `[engine] measure = false`, each served by the engine's
     /// estimate and named where it is (`engine::rates::Measuring::Skip`).
     pub skipped: Vec<String>,
+    /// What this load timed, each by name (`rates (launch_ns, ...)`,
+    /// `curves (n)`, `resident_workgroups`, `bound probe`, `settle`): what
+    /// the load's last line says it measured ("measured 0" where none).
+    pub timed: Vec<String>,
 }
 
 impl Tuned {
@@ -1038,6 +1050,7 @@ impl Tuned {
             self.committed_settle = upper.committed_settle.clone();
         }
         self.skipped.extend(upper.skipped.iter().cloned());
+        self.timed.extend(upper.timed.iter().cloned());
     }
 
     /// `[rates]` as profile TOML, nothing where nothing is stated or the
@@ -1134,6 +1147,7 @@ mod tests {
                 of: 77,
                 code: 9,
                 ranges: vec![[3, 4, 1, 4, 0, 1]],
+                planes: vec![(1024, 2048)],
             }],
             measured_on: Some("vk 10de:2c31 driver 1".into()),
             measured_by: Some(vec![(
@@ -1157,7 +1171,7 @@ mod tests {
              cached_gbps = 28800.0\nelementwise_gbps = 450.0\nscan_gelems = 2684.3\nfew_row_tflops = 4.2\n\
              workgroups_per_core = 3.3\nkernel_tflops_by_shape_keyed = [\n  [1, 4, 1024, 2048, 512, 1, 1, \
              [[\"linear_gemm_gemv_v_bf16\", 7]], [[1, 0.5]], []],\n]\n\
-             dense_settled_keyed = [\n  [1, 77, 9, [[3, 4, 1, 4, 0, 1]]],\n]\n\
+             dense_settled_keyed = [\n  [1, 77, 9, [[3, 4, 1, 4, 0, 1]], [[1024, 2048]]],\n]\n\
              measured_on = \"vk 10de:2c31 driver 1\"\n\
              measured_by = [\n  [\"launch_ns\", 2, [[\"linear_gemm_tiled_bf16\", 5]]],\n]\n"
         );
@@ -1254,6 +1268,7 @@ mod tests {
                 of: 5,
                 code: 6,
                 ranges: vec![[1, 1, 0, 0, 0, 0]],
+                planes: vec![(1024, 1024)],
             }],
             measured_on: Some(now.on()),
             measured_by: Some(vec![
@@ -1275,6 +1290,7 @@ mod tests {
             of,
             code: 6,
             ranges: vec![[1, 1, replaced, 0, 0, 0]],
+            planes: vec![(1024, 1024)],
         };
         let first = Rates {
             dense_settled: vec![settle(7, 0)],
@@ -1297,7 +1313,7 @@ mod tests {
             .load_user(&format!("api = 1\n{}", both.toml()), "two models")
             .expect("both settles read back");
         assert_eq!(read.rates().dense_settled, both.dense_settled);
-        let twice = "api = 1\n[rates]\ndense_settled_keyed = [[1, 7, 6, []], [1, 7, 6, []]]\n";
+        let twice = "api = 1\n[rates]\ndense_settled_keyed = [[1, 7, 6, [], []], [1, 7, 6, [], []]]\n";
         // A key stated twice: the entry is skipped in a user's file (the rest
         // read), refused whole in a committed one.
         let read = registry.load_user(twice, "twice").expect("the rest reads");
@@ -1306,6 +1322,85 @@ mod tests {
             registry.parse(twice, "c.measured.toml", crate::Strict::Measured).is_err(),
             "a committed profile stating a key twice is refused"
         );
+    }
+
+    /// A re-export of a home that took its rates from a committed profile
+    /// and measured one model's curves keeps every committed entry still
+    /// keyed for this build (carried) beside the home's (measured), each
+    /// said; a committed rate whose key no longer matches and that the home
+    /// did not measure again refuses the export by name.
+    #[test]
+    fn a_re_export_keeps_the_committed_entries_and_says_each() {
+        let now = build();
+        let committed = stored(&now);
+        let measured = Rates {
+            kernel_tflops_by_shape: committed
+                .kernel_tflops_by_shape
+                .clone()
+                .map(|curves| curves.into_iter().take(1).map(|mut c| {
+                    c.n = 777;
+                    c
+                }).collect()),
+            measured_on: Some(now.on()),
+            ..Rates::default()
+        };
+        let (merged, report) =
+            crate::merge_committed(measured, Some(committed.clone()), Some(&now)).unwrap();
+        assert_eq!(merged.launch_ns, committed.launch_ns, "the committed rate is carried");
+        assert_eq!(merged.hbm_gbps, committed.hbm_gbps);
+        assert_eq!(
+            merged.kernel_tflops_by_shape.as_ref().map(Vec::len),
+            Some(committed.kernel_tflops_by_shape.as_ref().map_or(0, Vec::len) + 1),
+            "the committed curves and the home's"
+        );
+        assert_eq!(merged.dense_settled, committed.dense_settled);
+        assert!(
+            report.iter().any(|l| l == "`launch_ns`: carried from the committed profile"),
+            "{report:#?}"
+        );
+        assert!(report.iter().any(|l| l.contains("1 measured")), "{report:#?}");
+        // A kernel whose code moved: its committed rates no longer match.
+        let mut moved = build();
+        moved.code = vec![("tiled", 11), ("coopmat", 23), ("gemv", 33)];
+        let refused =
+            crate::merge_committed(Rates::default(), Some(committed), Some(&moved)).unwrap_err();
+        assert!(refused.contains("gemm_tflops_by_rows"), "{refused}");
+    }
+
+    /// An export says each model's settle with the curves a boot of it
+    /// reads, and leaves out one whose planes carry no curve.
+    #[test]
+    fn an_export_carries_a_models_settle_only_with_its_curves() {
+        let curve = |n: u32, k: u32| KernelCurve {
+            kind: KernelCurve::VECTOR,
+            key: 1,
+            n,
+            k,
+            curve: vec![(1, 0.5)],
+            stop: None,
+            spread: Vec::new(),
+            by: MeasuredBy::default(),
+        };
+        let settle = |of: u32, planes: Vec<(u32, u32)>| DenseSettled {
+            method: 1,
+            of,
+            code: 2,
+            ranges: vec![[1, 1, 0, 0, 0, 0]],
+            planes,
+        };
+        let mut rates = Rates {
+            kernel_tflops_by_shape: Some(vec![curve(1024, 2048), curve(3072, 1024)]),
+            dense_settled: vec![
+                settle(7, vec![(1024, 2048), (3072, 1024)]),
+                settle(9, vec![(1024, 2048), (5120, 1024)]),
+            ],
+            ..Rates::default()
+        };
+        let report = crate::settles_carried(&mut rates);
+        assert_eq!(rates.dense_settled.len(), 1);
+        assert_eq!(rates.dense_settled[0].of, 7);
+        assert!(report[0].contains("carried") && report[0].contains("3072x1024: 1 curve"), "{report:?}");
+        assert!(report[1].starts_with("WARN") && report[1].contains("5120x1024"), "{report:?}");
     }
 
     /// A user file one entry of which another pie wrote in another form

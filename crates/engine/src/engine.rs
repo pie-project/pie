@@ -214,6 +214,13 @@ pub trait Engine: Send {
     /// load-time measurements too, by name. Every engine states it.
     fn skips_measuring(&self) -> bool;
 
+    /// What this engine's load timed, each by name (empty: it measured
+    /// nothing); `None` where the engine does not track it, said as such on
+    /// the load's last line.
+    fn measured_at_load(&self) -> Option<Vec<String>> {
+        None
+    }
+
     /// The reader of what the host can still give this process, where the
     /// device shares the host's memory and no budget of the device's says
     /// what it has: the runtime's governor reads it on its tick and holds

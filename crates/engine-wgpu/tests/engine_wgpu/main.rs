@@ -33,6 +33,20 @@ mod backend {
         }
     }
 
+    /// wgpu times no frame apart from its own fires here: nothing to watch.
+    pub fn watch_frames(_on: bool) {}
+
+    /// `None`: wgpu keeps no longest frame span.
+    pub fn longest_frame_ns() -> Option<u64> {
+        None
+    }
+
+    /// The backend's profile registry: what a user's or a committed file is
+    /// read against.
+    pub fn registry() -> &'static profile::Registry {
+        engine_wgpu::chip::registry()
+    }
+
     pub const NAME: &str = "wgpu";
     pub const PLATFORM: poem::Platform = poem::Platform::Wgpu;
     /// Kernels compile to WGSL: no register-tiled or cooperative-matrix

@@ -18,6 +18,8 @@ mod roles;
 mod scores;
 mod shared;
 mod slots;
+mod bounded_measuring;
+mod measured_none;
 mod settle_bound;
 mod settle_key;
 mod submit_bound;
