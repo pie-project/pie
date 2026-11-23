@@ -1417,7 +1417,23 @@ impl SlotPool {
         let limit = self.total - act;
         let sources = self.held_in(limit, self.state_limit()).len() as u32;
         let targets = self.open.iter_in(0, limit).take(sources as usize).count() as u32;
-        budget.max(sources - targets)
+        let short = budget.max(sources - targets);
+        // Runs in the way move whole, each to a free run below: free chunks
+        // enough, scattered, open none. A compaction below the raise's
+        // limit opens them where it can (the walk makes it,
+        // [`super::shared::SharedPool::compaction_for_raise`]); where none
+        // can, what the runs take is short, for the planner to free (the
+        // simulation's field seed 603: read as fitting, the raise waited
+        // with nothing funded and nothing to move).
+        match self.raise_runs_short(rung) {
+            Some((run, pieces))
+                if !self.compacting() && self.plan_compaction_below(run, pieces, limit).is_none() =>
+            {
+                let open = self.open.iter_in(0, limit).count() as u32;
+                short.max((run * pieces + sources).saturating_sub(open).max(1))
+            }
+            _ => short,
+        }
     }
 
     /// Carries out `evacuation` and takes its rung; the fire at `epoch`
@@ -1499,11 +1515,50 @@ impl SlotPool {
     /// emptiable chunks enough waited with no move (the L40S at 3 GiB on
     /// c201812ea: 119 such lines, compaction_moves None).
     pub fn plan_compaction_for(&self, run: u32, pieces: u32) -> Option<Vec<ChunkMove>> {
+        self.plan_compaction_below(run, pieces, self.state_limit())
+    }
+
+    /// The runs a raise to `rung` finds no free run below its activation
+    /// for, as `(run, pieces)` of the longest: each run of chunks in the
+    /// raise's way moves whole to a free run below ([`Self::plan_rung`]),
+    /// and where free chunks there stand scattered, none does. `None` where
+    /// the raise's moves plan as the pool stands, or its way holds no run.
+    #[must_use]
+    pub fn raise_runs_short(&self, rung: u32) -> Option<(u32, u32)> {
+        let act = self.act_chunks(rung);
+        let limit = self.total - act;
+        let sources = self.held_in(limit, self.state_limit());
+        if sources.is_empty() {
+            return None;
+        }
+        let targets: BTreeSet<u32> = self.open.iter_in(0, limit).collect();
+        if self.moves_keeping_runs(&sources, targets.clone(), false).is_some() {
+            return None;
+        }
+        // The runs in the way, by length: the longest that finds no room is
+        // the one a compaction opens first.
+        let mut lengths: BTreeMap<u32, u32> = BTreeMap::new();
+        for (&head, &run) in &self.runs {
+            let at = self.logical_to_physical[head as usize];
+            if sources.contains(&at) {
+                *lengths.entry(run).or_default() += 1;
+            }
+        }
+        let (&run, &pieces) = lengths.iter().next_back()?;
+        let standing = self.runs_below(run, u32::MAX, limit, |chunk| targets.contains(&chunk)).len();
+        (standing < pieces as usize).then_some((run, pieces))
+    }
+
+    /// [`Self::plan_compaction_for`] below physical chunk `below`: a raise's
+    /// activation limit, where the runs in its way go
+    /// ([`Self::raise_runs_short`]).
+    pub fn plan_compaction_below(&self, run: u32, pieces: u32, below: u32) -> Option<Vec<ChunkMove>> {
         let run = run.max(1);
         if run > self.segments.segment_chunks() || self.compacting() {
             return None;
         }
-        let standing = self.runs_where(run, u32::MAX, |chunk| self.open.get(chunk));
+        let below = below.min(self.state_limit());
+        let standing = self.runs_below(run, u32::MAX, below, |chunk| self.open.get(chunk));
         if standing.len() >= pieces.max(1) as usize {
             return None;
         }
@@ -1526,16 +1581,21 @@ impl SlotPool {
         // parked state's moving down): moved under it, the copy read a chunk
         // handed on. Reserved chunks are free and closed: neither a source
         // (not held) nor a destination (not open).
+        // Nor one a move before still copies into or out of (fenced until
+        // the fire carrying that copy retires): moved again, the first
+        // move's retire unfenced the chunk the second still reads, and it
+        // was handed on under that copy.
+        let still = |chunk: u32| self.moving_out.contains_key(&chunk) || self.fenced.get(chunk);
         let movable = |chunk: u32| {
             chunk >= self.reserved
                 && !self.free.get(chunk)
-                && !self.moving_out.contains_key(&chunk)
+                && !still(chunk)
                 && self.chunks[self.physical_to_logical[chunk as usize] as usize].shape != NO_SHAPE
-                && member_of.get(&chunk).is_none_or(|&(at, len)| {
-                    (at..at + len).all(|member| !self.moving_out.contains_key(&member))
-                })
+                && member_of
+                    .get(&chunk)
+                    .is_none_or(|&(at, len)| (at..at + len).all(|member| !still(member)))
         };
-        let limit = self.state_limit().min(self.ceiling);
+        let limit = below.min(self.ceiling);
         let mut windows: Vec<(u32, u32)> = Vec::new();
         for segment in 0..self.segments.count() {
             if self.segments.state(segment) != SegmentState::Committed {
@@ -2449,11 +2509,16 @@ impl SlotPool {
     /// [`Self::chunk_runs_for`] over the chunks `free` reads as free and
     /// `room` chunks of the budget's headroom.
     fn runs_where(&self, run: u32, room: u32, free: impl Fn(u32) -> bool) -> Vec<u32> {
+        self.runs_below(run, room, self.state_limit(), free)
+    }
+
+    /// [`Self::runs_where`] below physical chunk `below` (and the ceiling).
+    fn runs_below(&self, run: u32, room: u32, below: u32, free: impl Fn(u32) -> bool) -> Vec<u32> {
         let run = run.max(1);
         if run > self.segments.segment_chunks() {
             return Vec::new();
         }
-        let limit = self.state_limit().min(self.ceiling);
+        let limit = below.min(self.ceiling);
         let most = (room / run) as usize;
         let mut firsts = Vec::new();
         for segment in 0..self.segments.count() {
@@ -2759,14 +2824,16 @@ impl SlotPool {
     /// ref order: the chunks they lie in, `first` its chunk's slot 0, each
     /// opened for the shape where it is named rather than lowest first (a
     /// last chunk's slots past `n` stay free for the shape). What a load's
-    /// own placement is adopted by. A segment of theirs not yet committed
-    /// is counted committed: the backend backed it. All or nothing.
+    /// own placement is adopted by, its segments committed first (the
+    /// load's `commit_for`, which the boot backs): a claim never commits a
+    /// segment itself, so nothing opens that the engine was not told to
+    /// back. All or nothing.
     ///
     /// # Errors
     ///
     /// [`SlotError::Unclaimable`] where `first` is not a slot 0 or a chunk
     /// is past the pool, reserved, open already, not free, in the
-    /// activation span or draining; [`SlotError::Budget`] where the chunks
+    /// activation span, draining or in a segment not committed; [`SlotError::Budget`] where the chunks
     /// outgrow what is committed.
     pub fn claim(
         &mut self,
@@ -2777,25 +2844,10 @@ impl SlotPool {
     ) -> Result<Vec<Slot>, SlotError> {
         let range = self.claimable(shape, first, n)?;
         let count = range.end - range.start;
-        let uncommitted: BTreeSet<u32> = range
-            .clone()
-            .map(|chunk| self.segments.of(self.logical_to_physical[chunk as usize]))
-            .filter(|&segment| self.segments.state(segment) == SegmentState::Uncommitted)
-            .collect();
-        let added: u32 = uncommitted
-            .iter()
-            .map(|&segment| self.segments.len(segment))
-            .sum();
         let needed = self.reserved + self.held + self.act + count;
-        let committed = self.committed_chunks() + added;
+        let committed = self.committed_chunks();
         if needed > committed {
             return Err(SlotError::Budget { needed, committed });
-        }
-        for segment in uncommitted {
-            self.segments.set_state(segment, SegmentState::Committed);
-            for chunk in self.segments.range(segment) {
-                self.reopen(chunk);
-            }
         }
         let mut taken = Vec::with_capacity(usize::try_from(n).unwrap_or(0));
         for chunk in range {
@@ -2865,11 +2917,16 @@ impl SlotPool {
             SegmentState::Draining { .. }
         ) {
             Some("its segment is draining")
-        } else if self.span_on_demand
-            && self.segments.of(physical) >= self.top_segment
-            && self.segments.state(self.segments.of(physical)) == SegmentState::Uncommitted
-        {
-            Some("its span segment is not backed yet (commit_span)")
+        } else if self.segments.state(self.segments.of(physical)) == SegmentState::Uncommitted {
+            // Committed here only as the engine backs it: a claim that
+            // committed a segment itself opened chunks the engine was never
+            // told to back, and a fire on them was refused (Metal's admit:
+            // "committed chunks of the state pool").
+            Some(if self.segments.of(physical) >= self.top_segment {
+                "its span segment is not backed yet (commit_span)"
+            } else {
+                "its segment is not backed yet (commit_segments)"
+            })
         } else {
             None
         }
@@ -3537,7 +3594,12 @@ impl SlotPool {
         let range = self.segments.range(segment);
         // Nor while a served restore's reservation keeps one of its chunks
         // ([`Self::plan_evacuation`]).
-        let copying = u32::try_from(self.moving_out.range(range.start..range.end).count())
+        // Nor while a chunk move's copy still reads or writes one of its
+        // chunks (fenced until the fire carrying it retires): a compaction
+        // moving chunks out leaves the segment empty and committed, and
+        // given back then, the copy read memory the engine unmapped.
+        let fenced = range.clone().filter(|&chunk| self.fenced.get(chunk)).count();
+        let copying = u32::try_from(self.moving_out.range(range.start..range.end).count() + fenced)
             .unwrap_or(u32::MAX)
             .saturating_add(u32::from(self.reserved_in(range.start, range.end)));
         if copying > 0 {

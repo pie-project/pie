@@ -290,6 +290,11 @@ impl SharedGrow {
                     // again once room is freed, not on its next wake.
                     self.raise_blocked.store(true, Ordering::Release);
                     tracing::debug!(engine = self.engine, %error, goal, "the activation rung waits");
+                    // Runs in its way with no free run below: the segment
+                    // walk, next, compacts below the raise's activation.
+                    if self.shared.lock().unwrap().compaction_for_raise(goal) {
+                        tracing::debug!(engine = self.engine, goal, "a raise waits on a compaction below its activation");
+                    }
                     self.fund_owed();
                     return;
                 }

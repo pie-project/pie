@@ -146,6 +146,8 @@ struct PoolShape {
     /// segments to state, backed by the walk before any chunk there opens,
     /// and a raise takes them back.
     span_on_demand: bool,
+    /// `(rung tokens, activation chunks)`, ascending: the engine's rungs.
+    act: Vec<(u32, u32)>,
 }
 
 impl PoolShape {
@@ -193,6 +195,7 @@ impl PoolShape {
             programs,
             governed: false,
             span_on_demand: false,
+            act: vec![(16, 1), (256, 2)],
         }
     }
 
@@ -200,9 +203,14 @@ impl PoolShape {
         self.total.div_ceil(self.segment)
     }
 
-    /// The segment the largest rung's activation (two chunks) starts in.
+    /// The largest rung's activation chunks.
+    fn act_max(&self) -> u32 {
+        self.act.last().map_or(0, |&(_, chunks)| chunks)
+    }
+
+    /// The segment the largest rung's activation starts in.
     fn top_segment(&self) -> u32 {
-        (self.total - 2) / self.segment
+        (self.total - self.act_max()) / self.segment
     }
 
     /// What one process may hold at most, in kv pages: half the state
@@ -216,7 +224,7 @@ impl PoolShape {
 
     /// State chunks: the total less the reserved chunk and the activation.
     fn state_chunks(&self) -> u32 {
-        self.total - 1 - 2
+        self.total - 1 - self.act_max()
     }
 
     fn facts(&self) -> ChunkFacts {
@@ -269,7 +277,11 @@ impl PoolShape {
                 shape(1, SlotKind::Fixed { pieces: 1 }, SLOT, SlotRole::Instance),
                 shape(2, SlotKind::Fixed { pieces: 1 }, 1 << 10, SlotRole::Channel),
             ],
-            act_chunks: vec![(16, 1), (256, 2)],
+            act_chunks: self.act.clone(),
+            // Metal states its span from the segment the largest rung's
+            // carve starts in (`Layout::facts`).
+            act_span_chunks: (self.governed && self.span_on_demand)
+                .then(|| self.total - self.top_segment() * self.segment),
             host_chunks: self.host_chunks,
             disk_chunks: self.disk_chunks,
             span_backed_on_demand: self.governed && self.span_on_demand,
@@ -552,6 +564,9 @@ struct EngineView {
     rng: Rng,
     /// Moves the engine refused as impossible: a planner bug, each said.
     faults: Vec<String>,
+    /// The engine's own logical-to-physical table, as the evacuations it
+    /// took left it: what a fire's refs resolve through.
+    table: ::engine::chunk::ChunkTable,
 }
 
 impl EngineView {
@@ -564,8 +579,22 @@ impl EngineView {
     fn admits(&self, physical: u32) -> bool {
         let bottom_end = self.bottom.saturating_mul(self.segment).min(self.top_first);
         let segment = physical / self.segment;
-        physical < bottom_end
-            || (physical >= self.top_first && segment >= self.segments() - self.span.min(self.segments()))
+        physical < self.total
+            && (physical < bottom_end
+                || (physical >= self.top_first
+                    && segment >= self.segments() - self.span.min(self.segments())))
+    }
+
+    /// Held chunks `(logical, physical)` as the pool counts them that the
+    /// engine resolves elsewhere, or to memory it does not back for state:
+    /// a fire on them reads or writes what the runtime does not hold there.
+    fn strays(&self, held: &[(u32, u32)]) -> Vec<(u32, u32, Option<u32>)> {
+        held.iter()
+            .filter_map(|&(logical, physical)| {
+                let engine = self.table.physical(logical);
+                (engine != Some(physical) || !self.admits(physical)).then_some((logical, physical, engine))
+            })
+            .collect()
     }
 
     /// Applies `op` as the engine does, or refuses it.
@@ -584,6 +613,22 @@ impl EngineView {
         }
         Ok(())
     }
+}
+
+/// The shared pool's invariants ([`crate::store::slots::SlotPool::check`]),
+/// a broken one said rather than panicking the run.
+fn pool_check(shared: &Arc<Mutex<crate::store::shared::SharedPool>>) -> Option<String> {
+    let shared = shared.lock().unwrap();
+    let pool = shared.pool();
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pool.check()))
+        .err()
+        .map(|panic| {
+            panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                .unwrap_or_default()
+        })
 }
 
 /// A copy as the engine encoded it: each `(source, destination)` slot's
@@ -1108,6 +1153,10 @@ impl Workload {
         if std::env::var_os("PIE_SIM_FIELD").is_some() {
             return Self::field(seed);
         }
+        // `PIE_SIM_METAL`: the M1's pool, scaled ([`Self::metal`]).
+        if std::env::var_os("PIE_SIM_METAL").is_some() {
+            return Self::metal(seed);
+        }
         let mut rng = Rng(seed);
         let pool = PoolShape::of(&mut rng);
         let state = pool.state_chunks();
@@ -1388,6 +1437,88 @@ impl Workload {
             ring: None,
             landing_fails: None,
         }
+    }
+
+    /// The M1's pool at 16 beam w17 searches beside 16 greedy decodes
+    /// (Qwen3-0.6B), scaled down tenfold: 14 bottom segments of 3 chunks
+    /// and a span of 4 (a partial last segment), Metal's two-ended pool
+    /// with its span backed on demand, rungs of 1, 3 and 4 chunks (the
+    /// M1's 7, 34 and 40), the governor's target under what is held. The
+    /// field mix's scripts, beams widened toward 17 where they fit.
+    fn metal(seed: u64) -> Self {
+        let mut workload = Self::field_mix(seed, Rng(seed ^ 0x3e7a_1001));
+        let mut rng = Rng(seed ^ 0x3e7a_1002);
+        let pool = &mut workload.pool;
+        pool.total = 46;
+        pool.segment = 3;
+        pool.act = vec![(16, 1), (64, 3), (128, 4)];
+        pool.governed = true;
+        pool.span_on_demand = true;
+        pool.disk_chunks = rng.range(24, 96);
+        // A guest run of a whole segment beside the field's.
+        if !pool.programs.iter().any(|program| program.run == 3) {
+            pool.programs.push(Program {
+                run: 3,
+                scratch: 3 * MIB,
+                resident: 0,
+                per_pair: 3 * MIB,
+            });
+        }
+        let programs = pool.programs.len() as u32;
+        let most = pool.most_pages();
+        // Sixteen beam searches and sixteen greedy decodes, arriving at
+        // once (the M1's load), each beam's pool one of every program.
+        let beams: Vec<Script> = workload.scripts.iter().filter(|s| s.beams > 1).cloned().collect();
+        let greedy: Vec<Script> = workload.scripts.iter().filter(|s| s.beams == 1).cloned().collect();
+        let mut scripts = Vec::new();
+        for k in 0..16 {
+            if let Some(template) = beams.get(k % beams.len().max(1)) {
+                let mut script = template.clone();
+                script.at = rng.range(0, 4);
+                if let Some(slot) = script.bind.last_mut() {
+                    slot.0 = rng.below(u64::from(programs)) as u32;
+                }
+                scripts.push(script);
+            }
+            if let Some(template) = greedy.get(k % greedy.len().max(1)) {
+                let mut script = template.clone();
+                script.at = rng.range(0, 4);
+                scripts.push(script);
+            }
+        }
+        workload.scripts = scripts;
+        let segments = pool.segments();
+        for script in &mut workload.scripts {
+            if script.beams > 1 {
+                script.beams = rng.range(4, 17);
+            }
+            while script.pages() > most && script.beams > 2 {
+                script.beams -= 1;
+            }
+            while script.pages() > most && script.decode > 1 {
+                script.decode -= 1;
+            }
+            while script.pages() > most && script.prompt > 1 {
+                script.prompt -= 1;
+            }
+            if let Some((when, program)) = script.rescore {
+                script.rescore = Some((when.min(script.decode.saturating_sub(1)), program));
+            }
+            script.raise = script.raise.map(|when| when.min(script.decode.saturating_sub(1)));
+        }
+        // The governor's shrink and regrow under live state (the M1's
+        // target toggling 12 and 11 segments every few seconds): short
+        // windows a segment or two under the pool, close together.
+        workload.target = Vec::new();
+        let mut from = rng.range(0, 8);
+        for _ in 0..rng.range(4, 14) {
+            let to = from + rng.range(2, 8);
+            workload
+                .target
+                .push((from, to, rng.range(segments - 4, segments - 1)));
+            from = to + rng.range(1, 5);
+        }
+        workload
     }
 
     /// The governor's target at `step`, in segments.
@@ -1995,6 +2126,22 @@ async fn fire(
             continue;
         };
         let in_flight = planner.fire_in_flight(pid);
+        // Every chunk held as the fire goes lies where the engine backs
+        // state: an engine checks a fire's chunks as it submits (Metal's
+        // `Pool::admit`), not only at a settled step.
+        if let (Some(view), Some(shared)) = (&ctx.engine_view, &ctx.stores.shared) {
+            let held = shared.lock().unwrap().pool().held_physical();
+            let mut view = view.lock().unwrap();
+            if let Some(&(logical, physical, engine)) = view.strays(&held).first() {
+                let fault = format!(
+                    "impossible submission: a fire of {pid} with logical chunk {logical} on \
+                     physical {physical} (the engine's table: {engine:?}), outside the state \
+                     pool's backed chunks (bottom {}, span {}, top_first {})",
+                    view.bottom, view.span, view.top_first
+                );
+                view.faults.push(fault);
+            }
+        }
         // What the fire reads is as its owner wrote it.
         if let Err(what) = verify(ctx, sets, instances) {
             ctx.log.lock().unwrap().corrupt.push((pid, what));
@@ -2536,6 +2683,12 @@ fn check(ctx: &Ctx, step: u32, moving: bool) -> Result<Vec<Failure>, Failure> {
     // left a holder's refs past the committed chunks, a fire refused as
     // an impossible submission, the chunk maps diverging after).
     if let Some(shared) = &ctx.stores.shared {
+        // The pool's own bookkeeping holds: every run whole, every held
+        // chunk's slots counted (the M1 on 5fd1e46e8: "Slot { chunk: 277,
+        // index: 0 } lies in a free chunk" seconds into a beam w17 load).
+        if let Some(why) = pool_check(shared) {
+            return Err(fail("bookkeeping", why));
+        }
         let (unbacked, limit, rung) = {
             let shared = shared.lock().unwrap();
             let pool = shared.pool();
@@ -2549,17 +2702,16 @@ fn check(ctx: &Ctx, step: u32, moving: bool) -> Result<Vec<Failure>, Failure> {
             }
             let shared = shared.lock().unwrap();
             let pool = shared.pool();
-            let outside: Vec<(u32, u32)> = pool
-                .held_physical()
-                .into_iter()
-                .filter(|&(_, physical)| !view.admits(physical))
-                .collect();
+            let outside = view.strays(&pool.held_physical());
             if !outside.is_empty() {
                 return Err(fail(
                     "ceiling",
                     format!(
-                        "held chunks (logical, physical) {outside:?} lie outside what the engine \
-                         backs for state ({view:?}): a fire on them is an impossible submission"
+                        "held chunks (logical, physical, the engine's physical) {outside:?} lie \
+                         elsewhere in the engine's table or outside what it backs for state \
+                         (bottom {}, span {}, top_first {}): a fire on them is an impossible \
+                         submission",
+                        view.bottom, view.span, view.top_first
                     ),
                 ));
             }
@@ -2810,6 +2962,7 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
             refuse_span,
             rng: refuse_rng,
             faults: Vec::new(),
+            table: ::engine::chunk::ChunkTable::identity(pool.total),
         }))
     });
     // The engine's rung gate, a static per engine: as a fresh one's.
@@ -2845,6 +2998,40 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
                         view.faults.push(fault.clone());
                         anyhow::bail!(fault);
                     }
+                    if let crate::scheduler::worker::PoolOp::Evacuate(evacuation) = &op
+                        && let Err(error) = view.table.apply(evacuation)
+                    {
+                        let fault = format!("the engine's table refused {:?}: {error}", evacuation.moves);
+                        view.faults.push(fault.clone());
+                        anyhow::bail!(fault);
+                    }
+                    // A segment given back holds nothing the engine resolves
+                    // there.
+                    if let crate::scheduler::worker::PoolOp::ReleaseSegments(_)
+                    | crate::scheduler::worker::PoolOp::ReleaseSpan(_) = &op
+                        && let Some(shared) = &lane_shared
+                    {
+                        let held = shared.lock().unwrap().pool().held_physical();
+                        let strays = view.strays(&held);
+                        if !strays.is_empty() {
+                            let fault = format!(
+                                "{op:?} given back under held chunks (logical, physical, the \
+                                 engine's physical) {strays:?}"
+                            );
+                            view.faults.push(fault.clone());
+                            anyhow::bail!(fault);
+                        }
+                    }
+                }
+                if let crate::scheduler::worker::PoolOp::Evacuate(evacuation) = &op
+                    && let Some(shared) = &lane_shared
+                    && let Some(why) = pool_check(shared)
+                {
+                    let fault = format!("bookkeeping after evacuate {:?}: {why}", evacuation.moves);
+                    if let Some(view) = &view {
+                        view.lock().unwrap().faults.push(fault.clone());
+                    }
+                    anyhow::bail!(fault);
                 }
                 if let crate::scheduler::worker::PoolOp::Evacuate(evacuation) = op {
                     ops[1].fetch_add(1, Ordering::Relaxed);
@@ -3808,6 +3995,7 @@ fn run_need_workload(seed: u64, total: u32, segment: u32, run: u32, governed: bo
         ],
         governed,
         span_on_demand: false,
+        act: vec![(16, 1), (256, 2)],
     };
     let most = pool.most_pages();
     // Decoders of every length, each ending at its own step: the chunks
