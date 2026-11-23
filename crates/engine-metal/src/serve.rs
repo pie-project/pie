@@ -350,6 +350,10 @@ pub struct Shell {
     airborne: Airborne,
     inflight: VecDeque<Flight>,
     grafted: Option<Pending>,
+    /// The windowed folds this fire's lanes make, `(window table, copies)`
+    /// ([`Pools::fold_window_rows`]): planned as the fire is prepared,
+    /// encoded after its forward in its own frame.
+    window_folds: Vec<(usize, Vec<(u32, u32, u32, u32)>)>,
     landed: BTreeMap<u64, Vec<(String, Vec<f32>)>>,
     /// Steps let go before they landed ([`Shell::forget`]): their rows are
     /// dropped as they land rather than held.
@@ -1712,6 +1716,7 @@ impl PreparedLoad<'_> {
             airborne: Airborne::new(),
             inflight: VecDeque::new(),
             grafted: None,
+            window_folds: Vec::new(),
             landed: BTreeMap::new(),
             forgotten: std::collections::BTreeSet::new(),
             host_rows: crate::diag::on().host_rows,
@@ -3541,7 +3546,100 @@ impl Shell {
     }
 
     #[must_use]
-    pub fn pool_ring(&self) -> Option<&crate::store::RingRows> {
+/// A windowed lane's window table for this fire (CONTRACT-BC 19, 21;
+    /// `store::windowed`): its ring's pages below the buffer's base, its
+    /// window-buffer slots from it, and the fire's own rows past them in
+    /// their ring rows, as page ids at the window slot's stride.
+    fn windowed_pages(
+        &mut self,
+        k: usize,
+        seated: &Seated<'_>,
+        fold: engine::fire::WindowFold,
+        have: u32,
+        rows: u32,
+    ) -> Result<Vec<u32>> {
+        let refuse = |why: String| Fault::program("serve::windowed", why);
+        let page = self.pools.window_paging(k).page_size.max(1);
+        let window = self.pools.layout().window(k).map_or(0, |list| list.rows);
+        let per_chunk = self.pools.layout().window(k).map_or(0, |list| list.slots.per_chunk).max(1);
+        let ring_rows = crate::chunks::MetalRing::rows(window, page);
+        let pieces = seated
+            .ring
+            .ok_or_else(|| refuse("a windowed lane states no ring pieces in its record".to_string()))?;
+        if pieces.iter().any(|&[run, cow]| run != cow) {
+            return Err(refuse(
+                "a ring shared with another owner (its record's run and cow differ) is copied \
+                 at its first fold, which this engine does not yet do"
+                    .to_string(),
+            ));
+        }
+        // Ring page j: piece j / per_chunk, the window slot j % per_chunk of
+        // that chunk (a ring piece is one slot of one chunk, its ref the
+        // chunk).
+        let ring_refs: Vec<u32> = (0..ring_rows / page)
+            .map(|j| {
+                pieces
+                    .get((j / per_chunk) as usize)
+                    .map(|&[run, _]| run * per_chunk + j % per_chunk)
+                    .ok_or_else(|| {
+                        refuse(format!(
+                            "a ring of {} pages in {} piece(s) of {per_chunk} pages",
+                            ring_rows / page,
+                            pieces.len()
+                        ))
+                    })
+            })
+            .collect::<Result<_>>()?;
+        let ring = self.pools.window_pages(k, &ring_refs, None)?;
+        let buffer_refs = seated.windows.get(k).map_or(&[][..], Vec::as_slice);
+        let buffer = self.pools.window_pages(k, buffer_refs, None)?;
+        let shared = false;
+        if !crate::store::windowed::direct_allowed(shared, rows, ring_rows, window) {
+            return Err(refuse(format!(
+                "a fire of {rows} rows writes past what its ring keeps for its own queries \
+                 (R {ring_rows}, W {window}); its rows past R - W + 1 go to activation pages, \
+                 which this engine does not yet lay"
+            )));
+        }
+        let lane = crate::store::windowed::WindowedLane {
+            page,
+            ring: &ring,
+            base: fold.base,
+            buffer: &buffer,
+            own: &[],
+            own_page: 0,
+        };
+        let pages = lane.pages(have + rows)?;
+        // The fold this fire makes, over refs (byte offsets come from refs):
+        // the buffered rows it advances over into their ring rows.
+        let advance = match fold.fold {
+            engine::fire::FoldLen::Host(rows) => rows,
+            engine::fire::FoldLen::Device => {
+                return Err(refuse(
+                    "a device-counted window fold (a beam group's lagged fold) is not yet served \
+                     on Metal"
+                        .to_string(),
+                ));
+            }
+        };
+        if advance > 0 {
+            let by_ref = crate::store::windowed::WindowedLane {
+                page,
+                ring: &ring_refs,
+                base: fold.base,
+                buffer: buffer_refs,
+                own: &[],
+                own_page: 0,
+            };
+            let copies = by_ref.fold_copies(seated.folded, seated.folded + advance)?;
+            if !copies.is_empty() {
+                self.window_folds.push((k, copies));
+            }
+        }
+        Ok(pages)
+    }
+
+        pub fn pool_ring(&self) -> Option<&crate::store::RingRows> {
         self.pools.ring()
     }
 
@@ -4686,6 +4784,10 @@ impl Shell {
             for (k, lists) in window_tables.iter_mut().enumerate() {
                 lists.push(if seated.kv_less {
                     Vec::new()
+                } else if self.pools.ring().is_some()
+                    && let Some(fold) = seated.window
+                {
+                    self.windowed_pages(k, seated, fold, have, row.rows)?
                 } else {
                     let page_size = u64::from(self.pools.window_paging(k).page_size.max(1));
                     let after = u64::from(have) + u64::from(row.rows);
@@ -6528,6 +6630,11 @@ impl engine::frame::Shell for Shell {
                 .collect();
             (Some((tell, checks)), None)
         };
+        // The windowed lanes' folds, after the forward that read their rows:
+        // queue order lands them before any later fire reads the rings.
+        for (k, copies) in std::mem::take(&mut self.window_folds) {
+            self.pools.fold_window_rows(&mut frame, k, &copies)?;
+        }
         let pending = frame.commit_async(Some(Box::new(move |refused: Option<String>| {
             counts.leave();
             if let Some((tell, checks)) = in_handler.as_ref() {

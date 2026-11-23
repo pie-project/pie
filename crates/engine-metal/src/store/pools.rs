@@ -1466,6 +1466,57 @@ impl Pools {
         refs.iter().map(|&r| unit(r)).collect()
     }
 
+    /// A windowed fold's copies in `frame` (CONTRACT-BC 19; `store::windowed`):
+    /// each `(source ref, ring ref, first row, rows)` of window table `k`'s
+    /// slot shape copies those rows of every windowed layer's keys and values
+    /// from the source slot to the ring slot, at the same rows of the slot.
+    pub fn fold_window_rows(
+        &self,
+        frame: &mut Frame,
+        k: usize,
+        copies: &[(u32, u32, u32, u32)],
+    ) -> Result<()> {
+        if copies.is_empty() {
+            return Ok(());
+        }
+        let id = WINDOWS[k.min(MAX_WINDOWS - 1)];
+        let paging = TablePaging::Window(u8::try_from(k).unwrap_or(u8::MAX));
+        let runs: Vec<(u64, u64, u64, u64)> = self
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Kv {
+                    paging: at,
+                    keys,
+                    values,
+                    keys_cell,
+                    values_cell,
+                    ..
+                } if *at == paging => Some((*keys, *keys_cell, *values, *values_cell)),
+                _ => None,
+            })
+            .collect();
+        for &(source, ring, first, rows) in copies {
+            let from = self.slot_offset(id, source)?;
+            let to = self.slot_offset(id, ring)?;
+            for &(keys, keys_cell, values, values_cell) in &runs {
+                let at = u64::from(first);
+                let len = u64::from(rows);
+                self.pool
+                    .copy(frame, from + keys + at * keys_cell, to + keys + at * keys_cell, len * keys_cell)?;
+                if values != keys {
+                    self.pool.copy(
+                        frame,
+                        from + values + at * values_cell,
+                        to + values + at * values_cell,
+                        len * values_cell,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The page explicit write descriptor page `page` names, as kernels
     /// address it (its buffer in the high bits, as `kv_pages` states it).
     pub fn kv_page(&self, page: u32) -> Result<u32> {
