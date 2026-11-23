@@ -447,6 +447,22 @@ pub fn export(
     })
 }
 
+/// The records of what a deployment's bodies took (the cuda engine's
+/// memory measurement) that this build made, from `cache_dir` into `out`'s
+/// `bodies/`, beside its committed measured profile: the names written.
+/// Another engine keeps none.
+pub fn export_bodies(backend: &Backend, cache_dir: &Path, out: &Path) -> Result<Vec<String>, String> {
+    match backend.name {
+        #[cfg(feature = "engine-cuda")]
+        "cuda" => engine_cuda::serve::export_bodies(cache_dir, out)
+            .map_err(|e| format!("{}: {e}", out.display())),
+        _ => {
+            let _ = (cache_dir, out);
+            Ok(Vec::new())
+        }
+    }
+}
+
 /// The name of `backend`'s device `index`, as its loads file its profiles.
 fn device_name(backend: &Backend, index: u32) -> Result<String, String> {
     let probed = match backend.name {

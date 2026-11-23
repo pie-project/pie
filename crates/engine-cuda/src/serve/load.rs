@@ -1024,11 +1024,8 @@ impl Shell {
         // What shapes this deployment's bodies, beside the engine build
         // the record's key carries ([`super::measured`]).
         let bodies_shape = format!(
-            "{}|{:?}|{}|{:?}|{}|{}|{}|{:?}",
-            boot.checkpoint.display(),
-            std::fs::metadata(boot.checkpoint)
-                .map(|meta| (meta.len(), meta.modified().ok()))
-                .ok(),
+            "{}|{}|{:?}|{}|{}|{}|{:?}",
+            super::measured::checkpoint_identity(boot.checkpoint),
             boot.trace.name,
             profile,
             boot.page_size,

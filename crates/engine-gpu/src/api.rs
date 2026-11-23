@@ -1896,7 +1896,13 @@ impl<B: Host> Gpu<B> {
             }
         }
 
-        let guests = B::guests(self, submission)?;
+        // A deferred step's passes go behind its forward from the engine's
+        // thread; none runs on its landing.
+        let guests = if defers {
+            None
+        } else {
+            B::guests(self, submission)?
+        };
 
         let mut reads: Vec<Vec<String>> = vec![Vec::new(); submission.lanes.len()];
         // Each lane's score room: its first attachment's pair's, where that
@@ -2141,7 +2147,7 @@ impl<B: Host> Gpu<B> {
                     })
                     .collect();
                 let check = crate::settle::FedCheck::new(
-                    shell.token_row_reader(prepared.arm),
+                    <B as crate::serve::Serve>::token_row_reader(shell, prepared.arm),
                     lanes,
                     vocab,
                 );

@@ -40,11 +40,11 @@ impl Measured {
     }
 }
 
-const HEADER: &str = "pie-bodies 3";
+const HEADER: &str = "pie-bodies 4";
 
 /// The record's file for a deployment whose bodies `parts` shape, under
 /// this build ([`build`]): what the bodies hold moves with the engine's code
-/// as much as with its kernels', so the build keys it by its content.
+/// as much as with its kernels', so the code they were built from keys it.
 #[must_use]
 pub(crate) fn path(cache_dir: &Path, parts: &str) -> PathBuf {
     let mut key = build().to_le_bytes().to_vec();
@@ -54,26 +54,26 @@ pub(crate) fn path(cache_dir: &Path, parts: &str) -> PathBuf {
         .join(format!("{:016x}", content_hash(&key)))
 }
 
-/// The running executable's content, hashed once a process: a rebuild that
-/// changes nothing keeps its records, and a copied or touched binary keeps
-/// them too; any change to the code is another build. Where the binary
-/// does not read, every load is a build of its own (nothing is reused).
+/// The code that shapes what the bodies hold, as this build was compiled
+/// from it (`build.rs`: this crate's sources and its kernel crate's): a pie
+/// version that changes none of it keeps every record.
 fn build() -> u64 {
-    static BUILD: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *BUILD.get_or_init(|| {
-        let started = std::time::Instant::now();
-        let Ok(bytes) = std::env::current_exe().and_then(std::fs::read) else {
-            return std::process::id().into();
-        };
-        let hash = content_hash(&bytes);
-        eprintln!(
-            "engine-cuda: the bodies record is keyed by this build's content: {} MiB hashed in \
-             {:.1} ms",
-            bytes.len() >> 20,
-            started.elapsed().as_secs_f64() * 1e3
-        );
-        hash
-    })
+    u64::from_str_radix(env!("PIE_BODIES_BUILD"), 16).expect("build.rs writes 16 hex digits")
+}
+
+/// What names a checkpoint in a record's key: its artifact's own identity
+/// (each object's and shard's digest, from its manifest, a few KB read),
+/// so a copied or moved file keeps its records; a file with none is named
+/// by its path and size.
+pub(crate) fn checkpoint_identity(path: &Path) -> String {
+    match checkpoint::file::zt::artifact_identity(path) {
+        Ok(Some(identity)) => format!("zt:{:016x}", content_hash(&identity)),
+        _ => format!(
+            "{}:{:?}",
+            path.display(),
+            std::fs::metadata(path).map(|meta| meta.len()).ok()
+        ),
+    }
 }
 
 /// A fast 64-bit hash of `bytes`, a word at a time (a multiply and a
@@ -92,12 +92,36 @@ fn content_hash(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// The record at `path`; none where it is missing or not whole.
+/// The record at `path`, else the committed record of the same key
+/// ([`COMMITTED`]: a measured profile's bodies, carried by the build); none
+/// where neither is there and whole.
 #[must_use]
 pub(crate) fn read(path: &Path) -> Option<Measured> {
-    let text = std::fs::read_to_string(path).ok()?;
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| parse(&text))
+        .or_else(|| committed(path))
+}
+
+/// The committed record keyed as `path` is (its file name), where the build
+/// carries one.
+fn committed(path: &Path) -> Option<Measured> {
+    let name = path.file_name()?.to_str()?;
+    let (_, text) = COMMITTED.iter().find(|(key, _)| *key == name)?;
+    parse(text)
+}
+
+// The committed records (`profiles/bodies/<key>`), by key (`build.rs`).
+include!(concat!(env!("OUT_DIR"), "/committed_bodies.rs"));
+
+/// A record's text, read where it is whole and of this build.
+fn parse(text: &str) -> Option<Measured> {
     let mut lines = text.lines();
     if lines.next()? != HEADER {
+        return None;
+    }
+    let built = lines.next()?.strip_prefix("build ")?;
+    if u64::from_str_radix(built.trim(), 16).ok()? != build() {
         return None;
     }
     let mut field =
@@ -122,8 +146,11 @@ pub(crate) fn write(path: &Path, measured: Measured) -> std::io::Result<()> {
     std::fs::write(
         &partial,
         format!(
-            "{HEADER}\nbytes {}\nbodies {}\ncaptured {}\n",
-            measured.bytes, measured.bodies, measured.captured
+            "{HEADER}\nbuild {:016x}\nbytes {}\nbodies {}\ncaptured {}\n",
+            build(),
+            measured.bytes,
+            measured.bodies,
+            measured.captured
         ),
     )?;
     std::fs::rename(partial, path)
@@ -286,5 +313,80 @@ mod tests {
                 .is_some()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The records under `cache_dir` (`$PIE_HOME/cache`) this build made,
+/// copied into `out`'s `bodies/` for a build to carry (`pie tune export
+/// --engine cuda`): the names copied. A record another build made keys no
+/// load of this one, and is left.
+pub(crate) fn export(cache_dir: &Path, out: &Path) -> std::io::Result<Vec<String>> {
+    let from = cache_dir.join("bodies");
+    let to = out.join("bodies");
+    let mut copied = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&from) else {
+        return Ok(copied);
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
+            continue;
+        };
+        if path.extension().is_some() {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if parse(&text).is_none() {
+            continue;
+        }
+        std::fs::create_dir_all(&to)?;
+        std::fs::write(to.join(&name), text)?;
+        copied.push(name);
+    }
+    copied.sort();
+    Ok(copied)
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+
+    fn tmp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pie-bodies-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn a_record_of_this_build_reads_back_and_exports_and_another_builds_does_not() {
+        let cache = tmp("cache");
+        let record = path(&cache, "a deployment");
+        let measured = Measured { bytes: 100, bodies: 3, captured: 120 };
+        write(&record, measured).unwrap();
+        let back = read(&record).expect("this build's record reads");
+        assert_eq!((back.bytes, back.bodies, back.captured), (100, 3, 120));
+        // Another build's record keys no load of this one, and is not carried.
+        let other = cache.join("bodies").join("0000000000000000");
+        std::fs::write(
+            &other,
+            format!("{HEADER}\nbuild 0123456789abcdef\nbytes 1\nbodies 1\ncaptured 1\n"),
+        )
+        .unwrap();
+        assert!(read(&other).is_none());
+        let out = tmp("out");
+        let copied = export(&cache, &out).unwrap();
+        assert_eq!(copied, vec![record.file_name().unwrap().to_str().unwrap().to_string()]);
+        let _ = std::fs::remove_dir_all(cache);
+        let _ = std::fs::remove_dir_all(out);
+    }
+
+    #[test]
+    fn a_key_moves_with_the_deployment_and_not_with_the_cache_directory() {
+        let a = path(Path::new("/a"), "one");
+        let b = path(Path::new("/b"), "one");
+        assert_eq!(a.file_name(), b.file_name());
+        assert_ne!(a.file_name(), path(Path::new("/a"), "two").file_name());
     }
 }

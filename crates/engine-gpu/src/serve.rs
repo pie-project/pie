@@ -322,6 +322,13 @@ pub trait Serve: Backend {
         Ok(())
     }
 
+    /// How a fed check reads arm `arm`'s token seat rows once its fire
+    /// landed ([`crate::settle::FedCheck`]): from the seat itself, where the
+    /// host reads it without waiting on the work queued behind the fire.
+    fn token_row_reader(shell: &Shell<Self>, arm: usize) -> crate::settle::ReadRow {
+        shell.token_row_reader(arm)
+    }
+
     /// Replays `prepared` where a kept step answers it, else how it walks.
     fn plan(shell: &mut Shell<Self>, prepared: &mut Prepared<'_, Self>) -> Result<Plan<Self>>;
 
@@ -403,6 +410,10 @@ pub enum InputCell<B: Backend> {
     /// its declared shape.
     Zeros,
 }
+
+/// An output a lane read out: its seat, offset, element count, dtype and
+/// name.
+pub type ReadSeat<'a, B> = (&'a <B as Backend>::Buffer, u64, u32, eta_ir::Dtype, &'a str);
 
 /// A cell a guest channel keeps on the device: `bytes` at `at` of `buffer`
 /// (a pool segment, where the channel's `Channel` slots lie).
@@ -2551,6 +2562,7 @@ impl<B: Serve> Shell<B> {
                 seats: readout.len() + pixel_out.len(),
                 max_lanes: boot.budget.max_lanes,
                 planes: u32::try_from(readouts.len() + pixels.len()).unwrap_or(u32::MAX),
+                max_tokens: boot.budget.max_tokens,
             },
         )?;
 
@@ -5025,6 +5037,54 @@ impl<B: Serve> Shell<B> {
         self.pixel_spans(p)
     }
 
+    /// What step `landed`, still in flight, read out for its lane `lane`:
+    /// each output's seat, offset, element count, dtype and name. Its arm
+    /// stays taken until the harvest, so a reader submitted behind it on the
+    /// queue sees its readout; a spanned read's rows lie in the fire's span,
+    /// read only while no later fire was submitted to carve over them.
+    /// `None` where the step is no longer in flight.
+    #[must_use]
+    pub fn flight_seats(&self, landed: &Landed, lane: u32) -> Option<Vec<ReadSeat<'_, B>>> {
+        let flight = self.inflight.iter().find(|f| f.seq == landed.seq)?;
+        self.seats_of(flight.arm, &flight.rows, landed, lane)
+    }
+
+    /// What arm `arm`'s reads `rows` read out for lane `lane` of step
+    /// `landed`, as [`Shell::flight_seats`] states them.
+    #[must_use]
+    pub fn seats_of(
+        &self,
+        arm: usize,
+        rows: &[ReadSpan],
+        landed: &Landed,
+        lane: u32,
+    ) -> Option<Vec<ReadSeat<'_, B>>> {
+        let seat = self.readout.get(arm)?;
+        let span = self.span_buffer().ok()?;
+        let last = landed.seq + 1 == self.airborne.entered();
+        let reads: Vec<&ReadSpan> = (rows.iter())
+            .filter(|read| read.lane == lane && read.rows > 0)
+            .filter(|read| read.seated || read.spanned)
+            .collect();
+        if !last && reads.iter().any(|read| read.spanned) {
+            return None;
+        }
+        Some(
+            reads
+                .into_iter()
+                .map(|read| {
+                    (
+                        if read.spanned { span } else { seat },
+                        read.at,
+                        read.values(),
+                        read.dtype,
+                        self.output_name(read.plane),
+                    )
+                })
+                .collect(),
+        )
+    }
+
     /// Lane `lane`'s span of the pixel plane `landed`'s fire wrote, bf16:
     /// its seat, the offset, the element count and the plane's output.
     #[must_use]
@@ -5409,6 +5469,12 @@ impl<B: Serve> Shell<B> {
 
     fn harvest_one(&mut self) -> Result<()> {
         B::harvest_one(self)
+    }
+
+    /// Arm `arm`'s token seat: its buffer and the first byte there.
+    #[must_use]
+    pub fn token_seat(&self, arm: usize) -> (&B::Buffer, u64) {
+        self.inputs[arm].token_seat()
     }
 
     /// Reads token seat row `row` of arm `arm`, as a fed check does once
@@ -7831,6 +7897,8 @@ pub struct GuestRoom {
     pub seats: usize,
     pub max_lanes: u32,
     pub planes: u32,
+    /// The most token rows a fire carries.
+    pub max_tokens: u32,
 }
 
 /// The views a fire of `owned` lanes stages: its seated lanes, their media

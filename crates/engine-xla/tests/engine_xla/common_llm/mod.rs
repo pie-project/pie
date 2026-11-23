@@ -138,6 +138,34 @@ impl Drop for Model {
     }
 }
 
+/// Removes the fixtures of loads whose process is gone (`pie-xla-llm-
+/// <model>-<pid>-<nanos>` under the temp dir): a killed test runs no drop,
+/// and a model's checkpoint is gigabytes (13 GB a GLM-5 next miniature).
+fn sweep_fixtures() {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(rest) = name.strip_prefix("pie-xla-llm-") else {
+            continue;
+        };
+        // `<model>-<pid>-<nanos>`: the pid is the field before the last
+        let mut fields = rest.rsplitn(3, '-');
+        let (Some(_nanos), Some(pid), Some(_model)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<u32>() else {
+            continue;
+        };
+        if pid != std::process::id() && !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 impl Model {
     /// Model `name` of the catalog, cut to `layers` where stated, its
     /// weights drawn from `seed`, seated at `context` tokens.
@@ -153,13 +181,29 @@ impl Model {
         seed: u64,
         disk: Option<&std::path::Path>,
     ) -> Model {
-        Model::load_full(name, layers, context, seed, disk, false, 0)
+        Model::load_full(
+            name,
+            layers,
+            context,
+            &|p, t| write_checkpoint(p, t, seed),
+            disk,
+            false,
+            0,
+        )
     }
 
     /// [`Model::load`] told whether its weights are held
     /// (`Residency::weights_held`: held, nothing streams).
     pub fn load_held(name: &str, layers: Option<u32>, context: u32, seed: u64) -> Model {
-        Model::load_full(name, layers, context, seed, None, true, 0)
+        Model::load_full(
+            name,
+            layers,
+            context,
+            &|p, t| write_checkpoint(p, t, seed),
+            None,
+            true,
+            0,
+        )
     }
 
     /// [`Model::load_held`] with `extra` chunks more in its pool: the pool
@@ -171,14 +215,34 @@ impl Model {
         seed: u64,
         extra: u32,
     ) -> Model {
-        Model::load_full(name, layers, context, seed, None, true, extra)
+        Model::load_full(
+            name,
+            layers,
+            context,
+            &|p, t| write_checkpoint(p, t, seed),
+            None,
+            true,
+            extra,
+        )
+    }
+
+    /// The model (cut to `layers` where given), its checkpoint the planes
+    /// `write` lays: another backend's seeding, to compare served logits
+    /// across backends.
+    pub fn load_written(
+        name: &str,
+        layers: Option<u32>,
+        context: u32,
+        write: &dyn Fn(&std::path::Path, &poem_ir::Trace),
+    ) -> Model {
+        Model::load_full(name, layers, context, write, None, false, 0)
     }
 
     fn load_full(
         name: &str,
         layers: Option<u32>,
         context: u32,
-        seed: u64,
+        write: &dyn Fn(&std::path::Path, &poem_ir::Trace),
         disk: Option<&std::path::Path>,
         held: bool,
         extra: u32,
@@ -191,6 +255,7 @@ impl Model {
         let trace = package
             .trace(name, &deploy, name, Platform::Xla)
             .unwrap_or_else(|why| panic!("`{name}` traces: {why:#}"));
+        sweep_fixtures();
         let dir = std::env::temp_dir().join(format!(
             "pie-xla-llm-{name}-{}-{}",
             std::process::id(),
@@ -200,7 +265,7 @@ impl Model {
         ));
         std::fs::create_dir_all(&dir).expect("a scratch directory");
         let path = dir.join("weights.zt");
-        write_checkpoint(&path, &trace, seed);
+        write(&path, &trace);
         let vocab = trace
             .params
             .iter()

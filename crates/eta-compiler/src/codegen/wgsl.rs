@@ -416,7 +416,10 @@ pub struct Stepwise {
 /// 11: a one-row `top_k` takes the select ladder (`sel_top_k`), and every
 /// NaN test reads the value's bits (`f32_is_nan`): the compiler took `x != x`
 /// as false, so the sort keyed NaN first.
-pub const WGSL_STEP_EMITTER_VERSION: u16 = 11;
+/// 12: the runtime's max / min combines (`cmax`, `cmin`) and the pivot's
+/// monotone test read NaN off its bits too (`f32_is_nan`), as the
+/// gpu-nan-poison change (fdc691b25) wrote them.
+pub const WGSL_STEP_EMITTER_VERSION: u16 = 12;
 
 /// The binding of the record a step module reads its node, rung, selector
 /// and bases from ([`StepUniform`]), beside the runtime's (0, 1 and 4): a

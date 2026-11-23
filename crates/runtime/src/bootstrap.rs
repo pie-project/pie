@@ -393,7 +393,14 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             .device_facts()
             .is_some_and(|facts| facts.unified_memory)
     });
-    let (memory_yield, stated) = crate::governor::yield_for(memory_yield, unified_memory);
+    // Where an engine reads the host's room itself, the yield reacts only to
+    // the rest of the system (`governor::yield_for`).
+    let room = crate::governor::Room::of(
+        engine_configs
+            .iter()
+            .any(|d| d.engine_backend.host_room().is_some()),
+    );
+    let (memory_yield, stated) = crate::governor::yield_for(memory_yield, unified_memory, room);
     tracing::info!("{stated}");
 
     // Each engine's readouts, a fire bound (`Engine::readout_facts`): a
@@ -650,6 +657,17 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    // Test builds: a slot the shared pool gives back is poisoned by its
+    // engine before the engine's next verb (`Engine::poison_queue`), so a
+    // fire that reads a cell its owner never wrote reads NaN.
+    #[cfg(feature = "test-slot-fill")]
+    for (engine, stores) in engine_configs.iter_mut().zip(&arena_stores) {
+        if let Some(shared) = &stores.shared {
+            let queue = ::engine::chunk::PoisonQueue::default();
+            shared.lock().unwrap().pool_mut().poison_into(queue.clone());
+            engine.engine_backend.poison_queue(queue);
+        }
+    }
     // A shared pool's tiers are its host chunks and disk slots; today's
     // pools state theirs in pages.
     let kv_swap_capable = engine_configs.first().is_some_and(|d| {
@@ -884,7 +902,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                      parks={} serves={} evictions={} deferrals={} \
                      evict_rollbacks={} evict_faults={} restore_faults={} restores={} restore_failures={} restore_roles_short={} leaked_role_slots={} gate_parks={} \
                      hogs={} starved={} restarted={} salvaged={} swapfull={}/{} e6_relax={} rshort={} \
-                     grow_waits={} compaction_waits={} grow_parked={} no_grows={} \
+                     grow_waits={} compaction_waits={} list_compactions={} grow_parked={} no_grows={} \
                      lock_n={} lock_wait_ms={} lock_hold_ms={} lock_wmax_us={} lock_hmax_us={} \
                      d2h_pages={} h2d_pages={} d2h_rs={} h2d_rs={} d2h_ms={} h2d_ms={} \
                      disk_free={}/{} disk_w_pages={} host_disk_pages={} disk_r_pages={} disk_w_ms={} disk_r_ms={} \
@@ -930,6 +948,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     d.restore_absorb_short_total,
                     d.grow_waits_total,
                     d.compaction_waits_total,
+                    d.list_compactions_total,
                     d.grow_parked,
                     d.no_grows_total,
                     lk_n,
@@ -1003,7 +1022,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     // read.
     let moves = governed.iter().any(crate::governor::run::yield_applies);
     let source = if moves {
-        crate::governor::source_for(memory_yield, ::engine::pressure::Source::of_this_system)
+        crate::governor::source_for(memory_yield, || room.source())
     } else {
         Ok(None)
     };

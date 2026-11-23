@@ -7,16 +7,25 @@ use engine_gpu::serve::{Launch, Plan, Prepared, Serve, Shell};
 use crate::device::{Api, Buffer, Context, Frame, Pending, Pipelines};
 use engine_gpu::error::Result;
 
+/// The token words a landing read back for its fed check.
+pub(crate) type FedWords = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
+
 /// What the shell keeps of WebGPU's own: each arm's readback mirror, the
 /// mailbox landed steps post to, and the worker that lands them.
 pub struct Shelf {
     mirror: Vec<Buffer>,
 
+    /// Each arm's fed token rows, copied from its token seat by a fire whose
+    /// lanes the device fed, read by its landing, and the words it read:
+    /// a fed check reads them there, never behind the work queued after the
+    /// fire (a device buffer's read waits for the whole queue).
+    fed: Vec<(Buffer, FedWords)>,
+
     /// The guest plane's readback buffers, one a thread that runs guest
     /// passes, a chunk of the pool each, and its readout widen's table:
     /// reserved before the pool is sized, the plane takes them at its load.
     #[cfg(feature = "wgpu")]
-    pub(crate) guest: (Vec<Buffer>, Buffer),
+    pub(crate) guest: (std::sync::Arc<crate::guest::outbox::Pool>, Buffer),
 
     mailbox: crate::landing::Mailbox,
 
@@ -52,9 +61,9 @@ impl Serve for Api {
 
     const RECORDS: bool = false;
 
-    /// Every cell of a guest's rings lies on the host: a pass reads its
-    /// takes from there and lands its puts there.
-    const CHANNEL_CELLS: bool = false;
+    /// A guest channel keeps a cell on the device between passes where the
+    /// host does not read it (`engine_gpu::guest::defer`).
+    const CHANNEL_CELLS: bool = true;
 
     /// A step's guest passes run once it landed (`landing`), and a later
     /// fire may be on the queue by then: they read the arm's seat.
@@ -322,22 +331,26 @@ impl Serve for Api {
         let threads = u32::try_from(crate::landing::guest_threads()).unwrap_or(u32::MAX);
         Ok(Shelf {
             #[cfg(feature = "wgpu")]
+            // A readback buffer, a chunk each, for each thread that runs
+            // guest passes and for each frame in flight whose passes land
+            // behind it (each arm's seats) and the one a settle holds.
             guest: (
-                (0..threads)
-                    .map(|_| {
-                        Buffer::with(
-                            device,
-                            guest.chunk_bytes,
-                            crate::device::Memory::Readback,
-                            engine_gpu::books::owners::GUEST,
-                        )
-                    })
-                    .collect::<Result<Vec<_>>>()?,
+                crate::guest::outbox::Pool::new(
+                    (0..threads as usize + guest.seats + 1)
+                        .map(|_| {
+                            Buffer::with(
+                                device,
+                                guest.chunk_bytes,
+                                crate::device::Memory::Readback,
+                                engine_gpu::books::owners::GUEST,
+                            )
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                ),
                 Buffer::with(
                     device,
                     crate::guest::widen::Widen::table_bytes(
                         device,
-                        guest.seats,
                         threads,
                         u64::from(guest.max_lanes) * u64::from(guest.planes),
                     ),
@@ -345,6 +358,20 @@ impl Serve for Api {
                     engine_gpu::books::owners::GUEST,
                 )?,
             ),
+            fed: readout
+                .iter()
+                .map(|_| {
+                    Ok((
+                        Buffer::with(
+                            device,
+                            u64::from(guest.max_tokens.max(1)) * 4,
+                            crate::device::Memory::Readback,
+                            engine_gpu::books::owners::READOUT,
+                        )?,
+                        FedWords::default(),
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?,
             mirror: readout
                 .iter()
                 .map(|seat| {
@@ -362,6 +389,22 @@ impl Serve for Api {
     }
 
     fn forget(_shelf: &mut Shelf) {}
+
+    fn token_row_reader(shell: &Shell<Api>, arm: usize) -> engine_gpu::settle::ReadRow {
+        let words = shell
+            .shelf
+            .fed
+            .get(arm)
+            .map(|(_, words)| words.clone())
+            .unwrap_or_default();
+        Box::new(move |row| {
+            let words = words.lock().expect("fed words lock poisoned");
+            let at = row as usize * 4;
+            words
+                .get(at..at + 4)
+                .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+        })
+    }
 
     fn grown(shell: &mut Shell<Api>, arm: usize, bytes: u64) -> Result<()> {
         shell.shelf.mirror[arm] = Buffer::with(
@@ -409,6 +452,17 @@ impl Serve for Api {
             &shell.shelf.mirror[arm],
             &hosted,
         )?;
+        // The fed lanes' token rows, for the landing to read with its rows.
+        let fed = match fed_check.as_ref().map(engine_gpu::settle::FedCheck::rows) {
+            Some(rows) if rows > 0 => {
+                let (store, tokens) = shell.token_seat(arm);
+                let (into, words) = &shell.shelf.fed[arm];
+                let bytes = (u64::from(rows) * 4).min(into.bytes());
+                engine_gpu::backend::Frame::copy(&mut frame, store, tokens, into, 0, bytes)?;
+                Some((into.clone(), bytes, words.clone()))
+            }
+            _ => None,
+        };
         let on_done = crate::landing::on_done(
             crate::landing::Seat {
                 seq,
@@ -424,6 +478,7 @@ impl Serve for Api {
                     )
                 }),
                 guests: prepared.guests.take(),
+                fed,
             },
             std::sync::Arc::clone(&shell.shelf.mailbox),
             counts,

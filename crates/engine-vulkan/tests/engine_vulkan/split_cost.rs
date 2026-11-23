@@ -4,10 +4,10 @@
 //! runs of layers, each mode on a seat of its own so every round's fire of
 //! each attends the same keys. A measurement: run on its own.
 //!
-//! The device's profile is read as every suite load reads it,
-//! `$PIE_HOME/profiles` where `PIE_HOME` is set (point it at the serving
-//! home so the rates, and the kernels they pick, are serving's), else the
-//! suite's own directory in the temp dir.
+//! The device's profile is `$PIE_HOME/profiles` where `PIE_HOME` is set
+//! (point it at the serving home so the rates, and the kernels they pick,
+//! are serving's), else the test process's own, as every suite load reads
+//! it (`crate::gpu::profiles`).
 //!
 //! Under the device's bound on one submission (the platform's, else the 2 s
 //! the test states) nothing is fired that the bound does not admit: the
@@ -45,7 +45,10 @@ const MOST: u32 = 360;
 #[ignore = "a measurement: run on its own"]
 fn a_split_step_costs_its_submits_alone() {
     let fixture = fixture("qwen3-0.6b", None);
-    let boot = crate::gpu::device_boot();
+    let mut boot = crate::gpu::device_boot();
+    if let Some(home) = std::env::var_os("PIE_HOME") {
+        boot.profiles = Some(std::path::PathBuf::from(home).join("profiles"));
+    }
     eprintln!("profiles: {:?}", boot.profiles);
     let bound = engine_gpu::rates::stated_submit_bound().unwrap_or(Duration::from_secs(2));
     let device = backend::DeviceBoot {
