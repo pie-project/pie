@@ -5,6 +5,7 @@ pub mod layout;
 pub mod pool;
 mod pools;
 pub mod streamed;
+pub mod windowed;
 
 pub use pools::{GuestPiece, Pools, Rows, RsRows, TablePaging, WindowRows};
 
