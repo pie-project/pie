@@ -133,7 +133,7 @@ impl PoolPort for RacePool {
     fn rs_host_stats(&self) -> (RsUnits, RsUnits) {
         Default::default()
     }
-    fn reclaim_idle(&self) -> u32 {
+    fn reclaim_idle(&self, _: super::pool::IdleShort) -> u32 {
         0
     }
     fn reclaimable_idle(&self) -> u32 {
@@ -1522,7 +1522,7 @@ impl PoolPort for RingPool {
     fn rs_host_stats(&self) -> (RsUnits, RsUnits) {
         Default::default()
     }
-    fn reclaim_idle(&self) -> u32 {
+    fn reclaim_idle(&self, _: super::pool::IdleShort) -> u32 {
         0
     }
     fn reclaimable_idle(&self) -> u32 {
@@ -2790,7 +2790,7 @@ impl PoolPort for BindRoomPool {
         crate::rt::spawn(async move { planner.parked_down_done(true) });
         true
     }
-    fn reclaim_idle(&self) -> u32 {
+    fn reclaim_idle(&self, _: super::pool::IdleShort) -> u32 {
         let dropped: Vec<u32> = std::mem::take(&mut *self.cache.lock());
         let count = dropped.len() as u32;
         self.free.lock().extend(dropped);

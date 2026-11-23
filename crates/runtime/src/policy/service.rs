@@ -543,7 +543,8 @@ const STORES: Cache = Cache {
             .map(|stores| {
                 store_registry::with_kv_lock(&stores.kv, "policy-memory", |kv| {
                     let capacity = kv.host_swap_capacity() + kv.disk_swap_capacity();
-                    let available = kv.host_swap_available() + kv.disk_swap_available();
+                    let available = kv.host_swap_available()
+                        + kv.disk_swap_available(crate::policy::retention::Installed);
                     (u64::from(capacity), available as u64)
                 })
             })

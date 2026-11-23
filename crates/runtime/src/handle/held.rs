@@ -5,7 +5,6 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 
-use super::FORK_WAIT;
 use crate::inferlet::ProcessId;
 use crate::inferlet::host::working_set::Cursor;
 use crate::inferlet::process::ProcessResidency;
@@ -223,7 +222,10 @@ impl Drop for Held {
 }
 
 /// Runs `f` on the store once no move holds a page `kv` maps: what a set names
-/// under a move is not where its map says.
+/// under a move is not where its map says. It waits for the move to end with
+/// no deadline: every move ends, landed or aborted, and each end wakes it
+/// ([`KvStore::moves_ended`]). A store that refuses the set, then or after,
+/// refuses it by name.
 async fn settled<T>(
     kv: &KvWorkingSet,
     label: &'static str,
@@ -231,7 +233,6 @@ async fn settled<T>(
 ) -> Result<T, String> {
     let stores = store_registry::get(kv.model, kv.engine);
     let set = HashSet::from([kv.id]);
-    let deadline = crate::rt::time::Instant::now() + FORK_WAIT;
     loop {
         let ended = store_registry::with_kv_lock(&stores.kv, label, |store| store.moves_ended());
         let notified = ended.notified();
@@ -247,21 +248,17 @@ async fn settled<T>(
         if let Some(done) = done {
             return Ok(done);
         }
-        let now = crate::rt::time::Instant::now();
-        if now >= deadline {
-            return Err("its pages are still moving".to_string());
-        }
-        let _ = crate::rt::time::timeout(deadline - now, notified).await;
+        notified.await;
     }
 }
 
-/// [`settled`] for recurrent state: woken when a move lets slots go.
+/// [`settled`] for recurrent state: woken when a move lets slots go
+/// ([`RsStore::moves_ended`]), landed or aborted.
 async fn rs_settled<T>(
     rs: &RsWorkingSet,
     mut f: impl FnMut(&mut RsStore) -> T,
 ) -> Result<T, String> {
     let stores = store_registry::get(rs.model, rs.engine);
-    let deadline = crate::rt::time::Instant::now() + FORK_WAIT;
     loop {
         let ended = stores.rs.lock().unwrap().moves_ended();
         let notified = ended.notified();
@@ -273,11 +270,7 @@ async fn rs_settled<T>(
                 return Ok(f(&mut store));
             }
         }
-        let now = crate::rt::time::Instant::now();
-        if now >= deadline {
-            return Err("its state is still moving".to_string());
-        }
-        let _ = crate::rt::time::timeout(deadline - now, notified).await;
+        notified.await;
     }
 }
 
@@ -401,6 +394,65 @@ pub(super) mod tests {
             Ok(7),
             "the child takes what the fold left"
         );
+    }
+
+    /// A fork of a set whose page is under a move waits for the move to
+    /// end, however long it takes (it was refused at 250 ms), and goes on
+    /// as the move lands or is called off.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_fork_waits_for_a_move_with_no_deadline_and_goes_on_as_it_ends() {
+        use crate::store::kv::write::PageCommit;
+        for lands in [true, false] {
+            let model = store_registry::register_model_with_swap(
+                4,
+                &[8],
+                &[8],
+                &[0],
+                &[store_registry::StatePool::default()],
+                &[0],
+            );
+            let stores = store_registry::get(model, 0);
+            let (kv, txn) = {
+                let mut store = stores.kv.lock();
+                let ws = store.create_working_set();
+                store.reserve(ws, 1).unwrap();
+                let need = store.write_demand(ws, &[0]).unwrap();
+                let mut granted = store.reserve_device_pages(need).unwrap();
+                let prepared = store
+                    .prepare_write_reserved(ws, &[0], &mut granted)
+                    .unwrap();
+                let commit = PageCommit {
+                    token_hashes: Vec::new(),
+                    page_hash: None,
+                };
+                let seq = store.publish_prepared(prepared, &[commit]).unwrap();
+                store.settle(seq);
+                let floor = |_: Option<ProcessId>| crate::policy::retention::FLOOR;
+                let txn = store.prepare_suspend(&HashSet::from([ws]), floor).unwrap();
+                (ws, txn.expect("its page moves"))
+            };
+            let held = Held::park(
+                ProcessId::new_v4(),
+                KvWorkingSet::new(model, 0, kv, 4),
+                None,
+                Cursor::default(),
+            );
+            let mut fork = Box::pin(held.fork(ProcessId::new_v4()));
+            let waited =
+                crate::rt::time::timeout(std::time::Duration::from_millis(300), fork.as_mut())
+                    .await;
+            assert!(waited.is_err(), "still waiting past 250 ms: {lands}");
+            {
+                let mut store = stores.kv.lock();
+                if lands {
+                    store.commit_suspend(txn).unwrap();
+                } else {
+                    store.abort_suspend(txn);
+                }
+            }
+            let child = fork.await.expect("the move ended");
+            assert!(stores.kv.lock().folded_exact(child.parts().kv.id).unwrap());
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -7,7 +7,7 @@ use super::grant::{AllocationGrant, Demand, DevicePageReservation, RsSlotReserva
 use super::holdings::{swapped_page_count, swapped_rs_units};
 use super::inner::RestoreGate;
 use super::proc::{PendingBind, Residency};
-use super::pool::RunNeed;
+use super::pool::{IdleShort, RunNeed};
 use super::wait::{EntryKey, WaitKind, Waiter};
 use super::{ProcessId, ResidencyPlanner, exec};
 use crate::store::rs::RsUnits;
@@ -1020,7 +1020,11 @@ impl ResidencyPlanner {
                     // it is funded whether or not the fleet has stalled (a
                     // fleet that keeps decoding never stalls, and the bind
                     // waited behind it for good).
-                    if self.reclaim_idle_once() || self.sweep_stranded(u32::MAX, false) {
+                    let short = IdleShort {
+                        kv_pages: self.port.chunks_as_pages(run.saturating_mul(pieces)),
+                        rs: true,
+                    };
+                    if self.reclaim_idle_once(short) || self.sweep_stranded(u32::MAX, false) {
                         continue;
                     }
                     // A grow the walk will make holds its runs: it waits on
@@ -1089,7 +1093,11 @@ impl ResidencyPlanner {
                         room_stood = Some(key);
                         continue;
                     }
-                    if self.reclaim_idle_once() || self.sweep_stranded(u32::MAX, false) {
+                    let short = IdleShort {
+                        kv_pages: self.port.chunks_as_pages(need.run.saturating_mul(need.pieces)),
+                        rs: true,
+                    };
+                    if self.reclaim_idle_once(short) || self.sweep_stranded(u32::MAX, false) {
                         continue;
                     }
                     // Parked state lying on the device moves down a tier for
@@ -1212,7 +1220,13 @@ impl ResidencyPlanner {
                     // Idle cache holds chunks too: one set goes, and the
                     // restore tries again in what it left, before any
                     // resident moves for it.
-                    if self.reclaim_idle_once() || self.sweep_stranded(u32::MAX, false) {
+                    let short = IdleShort {
+                        kv_pages: self
+                            .port
+                            .chunks_as_pages(u32::try_from(room.chunks()).unwrap_or(u32::MAX)),
+                        rs: true,
+                    };
+                    if self.reclaim_idle_once(short) || self.sweep_stranded(u32::MAX, false) {
                         self.with_inner(|inner| inner.roles_retry_head());
                         continue;
                     }
@@ -1270,7 +1284,11 @@ impl ResidencyPlanner {
                         self.plan_stopped("short of kv: idle cache moves down");
                         return false;
                     }
-                    if self.reclaim_idle_once() {
+                    let short = IdleShort {
+                        kv_pages: count,
+                        rs: false,
+                    };
+                    if self.reclaim_idle_once(short) {
                         continue;
                     }
                     if self.sweep_stranded(count, false) {
@@ -1322,7 +1340,11 @@ impl ResidencyPlanner {
                         self.plan_stopped("short of state: idle cache moves down");
                         return false;
                     }
-                    if self.reclaim_idle_once() || self.reclaim_head_sharing() {
+                    let short = IdleShort {
+                        kv_pages: as_pages,
+                        rs: true,
+                    };
+                    if self.reclaim_idle_once(short) || self.reclaim_head_sharing() {
                         continue;
                     }
                     // And the tails of sets at rest past what their keys

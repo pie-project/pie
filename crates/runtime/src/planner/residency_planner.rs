@@ -1047,8 +1047,11 @@ impl ResidencyPlanner {
         }
     }
 
-    pub(super) fn reclaim_idle_once(&self) -> bool {
-        if self.idle_reclaim_exhausted.swap(true, Ordering::AcqRel) || self.port.reclaim_idle() == 0
+    /// Drops idle cache for what the head is `short` of, and no more
+    /// ([`super::pool::PoolPort::reclaim_idle`]): whether any went.
+    pub(super) fn reclaim_idle_once(&self, short: super::pool::IdleShort) -> bool {
+        if self.idle_reclaim_exhausted.swap(true, Ordering::AcqRel)
+            || self.port.reclaim_idle(short) == 0
         {
             return false;
         }

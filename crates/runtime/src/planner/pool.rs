@@ -11,6 +11,18 @@ const WINDOW_GROWTH: u32 = 2;
 /// The device's chunks by slot shape, each free and in all. In the
 /// degenerate mode a chunk is one slot of a pinned shape: a kv page (the list
 /// shape), a state slot, a buffer or window-ring page.
+/// What a waiter is short of that dropping idle cache may give:
+/// [`PoolPort::reclaim_idle`] frees that, and no more than the last group it
+/// reaches holds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IdleShort {
+    /// Device pages of kv (on a shared pool, the chunks short state takes
+    /// counted as pages too).
+    pub kv_pages: u32,
+    /// Whether state is short too: one owner's checkpoints at one key go.
+    pub rs: bool,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ChunkStats {
     /// The kv pages', `(free, total)`.
@@ -593,14 +605,16 @@ pub trait PoolPort: Send + Sync + 'static {
         self.chunk_stats().rs
     }
     fn rs_host_stats(&self) -> (RsUnits, RsUnits);
-    /// Drops idle cache, but only what its retention key lets the runtime
-    /// drop unasked (`pressure::may_drop`); room past that is asked of the
-    /// policy with tier pressure.
-    fn reclaim_idle(&self) -> u32;
+    /// Drops idle cache for what a waiter is `short` of, and no more, but
+    /// only what its retention key lets the runtime drop unasked
+    /// (`pressure::may_drop`); room past that is asked of the policy with
+    /// tier pressure.
+    fn reclaim_idle(&self, short: IdleShort) -> u32;
     /// Called until it frees nothing, without freeing them.
     fn reclaimable_idle(&self) -> u32;
-    /// The host and disk slots only idle cache holds, `(host, disk)`: below
-    /// the device what the next demand may take by dropping them, so the
+    /// The host and disk slots only idle cache its retention keys let go
+    /// holds, `(host, disk)`: below the device what the next demand may take
+    /// by dropping them (cache keyed above the floor is no such room), so the
     /// pressure report counts them as room, as [`Self::reclaimable_idle`]
     /// is on the device. Every port states it; a pool with no tier below
     /// the device states `(0, 0)`.
@@ -1101,7 +1115,10 @@ impl PoolPort for RegistryPool {
 
     fn disk_stats(&self) -> (u32, u32) {
         self.with_kv_tagged("planner-disk-stats", |kv| {
-            (kv.disk_swap_available() as u32, kv.disk_swap_capacity())
+            (
+                kv.disk_swap_available(crate::policy::retention::Installed) as u32,
+                kv.disk_swap_capacity(),
+            )
         })
     }
 
@@ -1702,7 +1719,13 @@ impl PoolPort for RegistryPool {
                 })
                 .collect();
             let sweep = self.with_kv_tagged("planner-park-down", |kv| {
-                kv.prepare_sweep(&keep, usize::MAX, &kv_sets, usize::MAX)
+                kv.prepare_sweep(
+                    &keep,
+                    usize::MAX,
+                    &kv_sets,
+                    usize::MAX,
+                    crate::policy::retention::Installed,
+                )
             });
             match sweep {
                 Ok(Some(txn)) => {
@@ -1824,12 +1847,26 @@ impl PoolPort for RegistryPool {
         u32::try_from(slots).unwrap_or(u32::MAX)
     }
 
-    fn reclaim_idle(&self) -> u32 {
-        let pages = self.with_kv_tagged("planner-reclaim-idle", |kv| {
-            let epoch = kv.current_epoch();
-            kv.reclaim_droppable(epoch, crate::policy::retention::Installed)
-        });
-        let slots = self.with_rs(|rs| rs.reclaim_droppable(crate::policy::retention::Installed));
+    fn reclaim_idle(&self, short: IdleShort) -> u32 {
+        let pages = if short.kv_pages > 0 {
+            self.with_kv_tagged("planner-reclaim-idle", |kv| {
+                let epoch = kv.current_epoch();
+                kv.reclaim_droppable(
+                    epoch,
+                    short.kv_pages as usize,
+                    crate::policy::retention::Installed,
+                )
+            })
+        } else {
+            0
+        };
+        // On a shared pool state's chunks are kv's too: what kv's cache
+        // left short, its checkpoints may give.
+        let slots = if short.rs || (self.shared.is_some() && pages < short.kv_pages as usize) {
+            self.with_rs(|rs| rs.reclaim_droppable(crate::policy::retention::Installed))
+        } else {
+            0
+        };
         (pages + slots) as u32
     }
 
@@ -1849,7 +1886,7 @@ impl PoolPort for RegistryPool {
 
     fn idle_below_device(&self) -> (u32, u32) {
         self.with_kv_tagged("planner-idle-below-device", |kv| {
-            kv.below_device_cache_pages()
+            kv.droppable_below_device(crate::policy::retention::Installed)
         })
     }
 
@@ -1970,7 +2007,7 @@ impl PoolPort for RegistryPool {
             return None;
         }
         self.with_kv_tagged("planner-sweep", |kv| {
-            kv.prepare_sweep(keep, room, order, wanted)
+            kv.prepare_sweep(keep, room, order, wanted, crate::policy::retention::Installed)
         })
         .inspect_err(|error| tracing::warn!(%error, "planner: sweep prepare failed"))
         .ok()
@@ -1988,7 +2025,7 @@ impl PoolPort for RegistryPool {
             return None;
         }
         self.with_kv_tagged("planner-sweep", |kv| {
-            kv.prepare_tail_sweep(keep, room, order, wanted)
+            kv.prepare_tail_sweep(keep, room, order, wanted, crate::policy::retention::Installed)
         })
         .inspect_err(|error| tracing::warn!(%error, "planner: sweep prepare failed"))
         .ok()
