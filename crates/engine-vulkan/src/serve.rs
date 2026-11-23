@@ -199,8 +199,8 @@ impl Serve for Api {
         crate::armed::dir(boot)
     }
 
-    fn armed_build() -> u64 {
-        crate::armed::BUILD
+    fn armed_build(pipelines: &Pipelines) -> u64 {
+        crate::armed::build(pipelines)
     }
 
     fn committed_armed() -> &'static [(&'static str, &'static str)] {

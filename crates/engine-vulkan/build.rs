@@ -1,52 +1,20 @@
-//! The hash of the code a Vulkan walk records (`PIE_ARMED_BUILD`): this
-//! crate's sources, the shared shell's (`engine-gpu`) and the Slang
-//! kernels' (`kernels-slang`), which keys what a load armed; and the armed
-//! records the build carries (`profiles/bodies/<key>`, `pie tune export
-//! --engine vulkan`).
+//! The hash of the encoder's layout (`PIE_ENCODER_LAYOUT`: the files that
+//! lay a recording's commands and its fire block), which a test holds to
+//! `armed::ENCODING`; and the armed records the build carries
+//! (`profiles/bodies/<key>`, `pie tune export --engine vulkan`).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-fn files(root: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            files(&path, out);
-        } else {
-            out.push(path);
-        }
-    }
-}
+/// The files that lay a recording's commands and its fire block.
+const LAYOUT: [&str; 3] = ["src/encode.rs", "src/device/block.rs", "src/record.rs"];
 
 fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets it"));
-    let base = manifest.join("..");
-    let roots = [
-        manifest.join("src"),
-        base.join("engine-gpu").join("src"),
-        base.join("kernels-slang").join("src"),
-        base.join("kernels-slang").join("kernels"),
-    ];
-    let mut paths = Vec::new();
-    for root in &roots {
-        println!("cargo:rerun-if-changed={}", root.display());
-        files(root, &mut paths);
-    }
-    let mut named: Vec<(String, PathBuf)> = paths
-        .into_iter()
-        .map(|path| {
-            let name = path
-                .strip_prefix(&base)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            (name, path)
-        })
-        .collect();
-    named.sort();
-    // FNV-1a over each file's name and bytes, in name order.
+    // The encoder's layout: the files that lay what a recording's commands
+    // carry and what its fire block holds. A change to them that moves the
+    // recorded layout bumps `armed::ENCODING` (a test holds the two together).
+    let mut layout: Vec<PathBuf> = LAYOUT.iter().map(|file| manifest.join(file)).collect();
+    layout.sort();
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     let mut eat = |bytes: &[u8]| {
         for byte in bytes {
@@ -54,13 +22,19 @@ fn main() {
             hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
     };
-    for (name, path) in &named {
+    for path in &layout {
+        println!("cargo:rerun-if-changed={}", path.display());
+        let name = path
+            .strip_prefix(&manifest)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
         eat(name.as_bytes());
         eat(&[0]);
         eat(&std::fs::read(path).unwrap_or_default());
         eat(&[0]);
     }
-    println!("cargo:rustc-env=PIE_ARMED_BUILD={hash:016x}");
+    println!("cargo:rustc-env=PIE_ENCODER_LAYOUT={hash:016x}");
 
     let committed = manifest.join("profiles").join("bodies");
     println!("cargo:rerun-if-changed={}", committed.display());

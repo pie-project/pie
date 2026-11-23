@@ -184,10 +184,11 @@ pub trait Serve: Backend {
         None
     }
 
-    /// The hash of the code a walk of this backend records (its own, the
-    /// shared shell's, its kernels'), which keys what a load armed
-    /// ([`crate::armed`]).
-    fn armed_build() -> u64 {
+    /// What keys what a load armed ([`crate::armed`]) beside the device, the
+    /// model, the lattice and the dense picks: the version of the layout a
+    /// recording's commands take, and the code of the kernels the load
+    /// built (`pipelines`).
+    fn armed_build(_pipelines: &Self::Pipelines) -> u64 {
         0
     }
 
@@ -1026,6 +1027,9 @@ pub struct Shell<B: Serve> {
     /// The load armed its bodies ([`Shell::record_bodies`]): a fire of an
     /// armed kind fills a body, never records one.
     pub armed: bool,
+    /// The record the load armed from, where it armed from one
+    /// ([`crate::armed`]): a serving fire it left unarmed makes it stale.
+    armed_from: Option<std::path::PathBuf>,
     /// The load is done and serving: a fire the load neither armed nor
     /// stated eager is a bug from here ([`Shell::unarmed`]).
     pub serving: bool,
@@ -2865,6 +2869,7 @@ impl<B: Serve> Shell<B> {
             eager: 0,
             eager_next: false,
             armed: false,
+            armed_from: None,
             serving: false,
             unarmed_named: std::collections::BTreeSet::new(),
             drained: 0,
@@ -7691,6 +7696,18 @@ impl<B: Serve> Shell<B> {
             prepared.rung,
             prepared.arm,
         );
+        // A load armed from a record that left this fire unarmed armed from
+        // a stale one: the next load measures its lattice again.
+        if let Some(path) = self.armed_from.take() {
+            // Written over, not removed: a committed record of the key is
+            // passed over too while the home's own entry stands.
+            let _ = std::fs::write(&path, "stale\n");
+            tracing::warn!(
+                path = %path.display(),
+                "the record this load armed from left a serving fire unarmed: dropped, the next \
+                 load arms its whole lattice (a committed one is exported again)"
+            );
+        }
         if cfg!(debug_assertions) && self.serving {
             return Err(Fault::Unbound {
                 what: format!(
@@ -9455,7 +9472,7 @@ impl<B: Serve> Shell<B> {
         let depth = self.arms.depth();
         let mut recorded = 0u64;
         // What a load of this build, device, model and lattice armed before.
-        let build = B::armed_build();
+        let build = B::armed_build(&self.pipelines);
         let record = records.map(|dir| {
             crate::armed::path(
                 dir,
@@ -9473,6 +9490,9 @@ impl<B: Serve> Shell<B> {
         let known = record
             .as_deref()
             .and_then(|path| crate::armed::read(path, build, B::committed_armed()));
+        if known.is_some() {
+            self.armed_from.clone_from(&record);
+        }
         if let (Some(known), Some(path)) = (&known, &record) {
             tracing::info!(
                 path = %path.display(),

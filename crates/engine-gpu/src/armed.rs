@@ -5,10 +5,11 @@
 //! lattice's other shapes fill the families those recorded at their first
 //! fire, recording nothing.
 //!
-//! Each record is its own entry, keyed on what shapes the bodies: the build
-//! (the backend's hash of the code its walks record, [`crate::serve::Serve::armed_build`]),
-//! the device, the model's trace, the lattice, the rungs and the dense
-//! kernels the load settled. A key that differs in any part names another
+//! Each record is its own entry, keyed on what shapes the bodies: the
+//! backend's version of the layout a recording's commands take and the code
+//! of the kernels the load built ([`crate::serve::Serve::armed_build`]), the
+//! device, the model's trace, the lattice, the rungs and the dense kernels
+//! the load settled. A key that differs in any part names another
 //! file, so a stale entry is measured again alone. A load reads the user's
 //! record (`<cache>/vulkan-bodies/<key>`), else the build's committed one of
 //! the same key (`pie tune export` copies the user's into the engine's
@@ -51,18 +52,21 @@ fn hash(bytes: &[u8]) -> u64 {
     })
 }
 
-/// The record at `path`, else the committed record of the same key
-/// (`committed`, by file name), where either is whole and of `build`.
+/// The record at `path`, else, where the home keeps no entry of the key,
+/// the committed record of the same key (`committed`, by file name); `None`
+/// where the one read is not whole and of `build` (a home's entry written
+/// stale passes over the committed one: a load that armed from it left a
+/// fire unarmed).
 #[must_use]
 pub fn read(path: &Path, build: u64, committed: &[(&str, &str)]) -> Option<Armed> {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| parse(&text, build))
-        .or_else(|| {
+    match std::fs::read_to_string(path) {
+        Ok(text) => parse(&text, build),
+        Err(_) => {
             let name = path.file_name()?.to_str()?;
             let (_, text) = committed.iter().find(|(key, _)| *key == name)?;
             parse(text, build)
-        })
+        }
+    }
 }
 
 fn parse(text: &str, build: u64) -> Option<Armed> {
@@ -112,10 +116,10 @@ pub fn write(path: &Path, armed: &Armed, build: u64) -> std::io::Result<()> {
     std::fs::rename(partial, path)
 }
 
-/// Copies every whole record of `build` in `from` into `to` (a backend's
+/// Copies every whole record in `from` into `to` (a backend's
 /// `profiles/bodies/`), each under its key: what a build carries for a
 /// clean home on a known device. The keys copied.
-pub fn export(from: &Path, to: &Path, build: u64) -> std::io::Result<Vec<String>> {
+pub fn export(from: &Path, to: &Path) -> std::io::Result<Vec<String>> {
     let mut copied = Vec::new();
     let Ok(entries) = std::fs::read_dir(from) else {
         return Ok(copied);
@@ -131,7 +135,12 @@ pub fn export(from: &Path, to: &Path, build: u64) -> std::io::Result<Vec<String>
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
-        if parse(&text, build).is_none() {
+        let build = text
+            .lines()
+            .nth(1)
+            .and_then(|line| line.strip_prefix("build "))
+            .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok());
+        if build.and_then(|build| parse(&text, build)).is_none() {
             continue;
         }
         std::fs::create_dir_all(to)?;
