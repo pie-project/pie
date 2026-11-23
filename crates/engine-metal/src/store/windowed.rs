@@ -16,6 +16,15 @@
 //! earlier rows are a whole ring behind, past every window. A fold copies the
 //! rows it advances over that lie in buffer slots into their ring rows, at
 //! the same row of the page (`R` a multiple of `P`).
+//!
+//! A fire writes every row before its queries read, so its own rows go
+//! straight into the ring only where none of them overwrites a row a query of
+//! the fire still reads ([`direct_allowed`]): a solo lane (no beam sibling,
+//! no prefix-cache entry sharing the record before its copy) of at most
+//! `R - W + 1` rows. Otherwise its own rows lie in activation pages
+//! ([`WindowedLane::own`]), each filled first from its ring page where it
+//! holds rows folded before the fire ([`WindowedLane::own_fills`]), and the
+//! fold copies them into the ring at the fire's end.
 
 use crate::error::{Fault, Result};
 
@@ -30,6 +39,23 @@ pub struct WindowedLane<'a> {
     pub base: u32,
     /// The buffer's slots, page ids at the same stride.
     pub buffer: &'a [u32],
+    /// Where the fire's own rows past the buffer lie when they may not go
+    /// straight into the ring ([`direct_allowed`]): activation pages at the
+    /// same stride, entry `i` the logical page `own_page + i`. Empty: they go
+    /// into the ring.
+    pub own: &'a [u32],
+    /// The logical page `own`'s entry 0 holds.
+    pub own_page: u32,
+}
+
+/// Whether a fire's own rows may go straight into the lane's ring: a solo
+/// lane's (`shared` false: no beam sibling, no copy-on-first-fold pending)
+/// fire of at most `R - W + 1` rows, so no row it writes overwrites a row
+/// one of its queries reads (the first query reads back `W - 1` rows, the
+/// last row lands `rows - 1` past it, and the ring holds `R`).
+#[must_use]
+pub fn direct_allowed(shared: bool, rows: u32, ring_rows: u32, window: u32) -> bool {
+    !shared && u64::from(rows) + u64::from(window) <= u64::from(ring_rows) + 1
 }
 
 fn refused(why: String) -> Fault {
@@ -57,6 +83,9 @@ impl WindowedLane<'_> {
         let held = base + self.buffer.len() as u64 * u64::from(page);
         if first >= base && first < held {
             return Ok(self.buffer[usize::try_from((first - base) / u64::from(page)).unwrap_or(usize::MAX)]);
+        }
+        if n >= self.own_page && ((n - self.own_page) as usize) < self.own.len() {
+            return Ok(self.own[(n - self.own_page) as usize]);
         }
         if self.ring.is_empty() {
             return Err(refused(format!(
@@ -89,7 +118,12 @@ impl WindowedLane<'_> {
                 self.ring_rows()
             )));
         }
-        let held = u64::from(self.base) + self.buffer.len() as u64 * u64::from(page);
+        // Rows the fold moves: the buffer's, then the activation pages'.
+        let held = if self.own.is_empty() {
+            u64::from(self.base) + self.buffer.len() as u64 * u64::from(page)
+        } else {
+            (u64::from(self.own_page) + self.own.len() as u64) * u64::from(page)
+        };
         let mut out = Vec::new();
         let mut row = u64::from(from.max(self.base));
         let end = u64::from(to).min(held);
@@ -104,6 +138,27 @@ impl WindowedLane<'_> {
             row += u64::from(rows);
         }
         Ok(out)
+    }
+
+    /// The ring pages to copy into the activation pages before the fire:
+    /// an activation page whose logical page holds rows folded before the
+    /// fire (below `folded`) reads them from its ring page, as the ring page
+    /// would have held them. `(ring page, activation page)`.
+    #[must_use]
+    pub fn own_fills(&self, folded: u32) -> Vec<(u32, u32)> {
+        let page = self.page.max(1);
+        if self.ring.is_empty() {
+            return Vec::new();
+        }
+        self.own
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &activation)| {
+                let n = self.own_page + u32::try_from(i).unwrap_or(u32::MAX);
+                (u64::from(n) * u64::from(page) < u64::from(folded))
+                    .then(|| (self.ring[n as usize % self.ring.len()], activation))
+            })
+            .collect()
     }
 }
 
@@ -132,7 +187,7 @@ mod tests {
         for folded in [0u32, 16, 33, 48, 130] {
             let base = folded / P * P;
             let buffer: Vec<u32> = (500..503).collect();
-            let lane = WindowedLane { page: P, ring: &ring, base, buffer: &buffer };
+            let lane = WindowedLane { page: P, ring: &ring, base, buffer: &buffer, own: &[], own_page: 0 };
             let end = base + 3 * P;
             for q in folded..end {
                 let lo = (q + 1).saturating_sub(w);
@@ -159,7 +214,7 @@ mod tests {
     fn a_fold_copies_the_buffered_rows_into_their_ring_rows() {
         let ring: Vec<u32> = (100..104).collect();
         let buffer = [500u32, 501];
-        let lane = WindowedLane { page: P, ring: &ring, base: 32, buffer: &buffer };
+        let lane = WindowedLane { page: P, ring: &ring, base: 32, buffer: &buffer, own: &[], own_page: 0 };
         // Rows 35..70: 35..48 in slot 500 (page 2), 48..64 in 501 (page 3),
         // 64..70 the fire's own (page 4, its ring page 100).
         let copies = lane.fold_copies(35, 70).expect("a fold");
@@ -168,10 +223,34 @@ mod tests {
         assert_eq!(lane.page_of(4).expect("page 4"), 100, "the fire's own rows read their ring page");
     }
 
+    /// A fire's own rows go straight into the ring only for a solo lane of
+    /// at most `R - W + 1` rows; past that, or shared, they lie in
+    /// activation pages, the one holding rows folded before the fire filled
+    /// from its ring page first, and the fold copies them into the ring.
+    #[test]
+    fn a_long_or_shared_fire_writes_its_own_rows_beside_the_ring() {
+        let (w, ring_rows) = (40u32, crate::chunks::MetalRing::rows(40, P));
+        assert!(direct_allowed(false, ring_rows - w + 1, ring_rows, w));
+        assert!(!direct_allowed(false, ring_rows - w + 2, ring_rows, w), "a row past R - W + 1");
+        assert!(!direct_allowed(true, 1, ring_rows, w), "a shared record");
+        // Folded through row 37 (page 2 part folded), no buffer: a 30-row
+        // fire's own rows 37..67 lie in activation pages for pages 2..4.
+        let ring: Vec<u32> = (100..104).collect();
+        let own = [900u32, 901, 902];
+        let lane = WindowedLane { page: P, ring: &ring, base: 32, buffer: &[], own: &own, own_page: 2 };
+        assert_eq!(lane.page_of(2).expect("page 2"), 900);
+        assert_eq!(lane.page_of(1).expect("page 1"), 101, "a page wholly folded reads its ring page");
+        assert_eq!(lane.own_fills(37), vec![(102, 900)], "page 2 holds rows folded before the fire");
+        assert_eq!(
+            lane.fold_copies(37, 67).expect("a fold"),
+            vec![(900, 102, 5, 11), (901, 103, 0, 16), (902, 100, 0, 3)]
+        );
+    }
+
     #[test]
     fn a_base_off_the_page_grid_is_refused() {
         let ring = [1u32, 2, 3];
-        let lane = WindowedLane { page: P, ring: &ring, base: 5, buffer: &[] };
+        let lane = WindowedLane { page: P, ring: &ring, base: 5, buffer: &[], own: &[], own_page: 0 };
         assert!(lane.page_of(0).is_err());
     }
 }
