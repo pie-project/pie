@@ -11612,7 +11612,7 @@ mod unfolded_tests {
         let w11 = FireRows { own: 929, carried: 0 };
         let refused = replay_rung(&stores, 56, w11, 1144, 11, false).unwrap_err();
         assert!(
-            refused.contains("of 1024 tokens") && refused.contains("2074 bytes of rs scratch"),
+            refused.contains("of 1024 tokens") && refused.contains("2077 bytes of rs scratch"),
             "{refused}"
         );
         // On a compact rs scratch a decode lane's rows take none of it.
@@ -11652,7 +11652,7 @@ mod unfolded_tests {
             ..none.clone()
         });
         let why = replay_rung(&total, 56, FireRows { own: 4, carried: 0 }, 61, 1, false).unwrap_err();
-        assert!(why.contains("66 bytes of rs scratch"), "{why}");
+        assert!(why.contains("69 bytes of rs scratch"), "{why}");
         assert!(replay_rung(&total, 56, FireRows { own: 4, carried: 0 }, 60, 1, false).is_ok());
     }
 
@@ -11800,7 +11800,7 @@ mod unfolded_tests {
         assert_eq!(replay_rung(&metal_stores, 56, wide, 4200, 160, true), Ok(160), "compact, it would not need it");
         let (_, narrow) = pool_stating(vec![(1024, 4)], vec![metal(1024)], true);
         let refused = replay_rung(&narrow, 56, wide, 4200, 160, false).unwrap_err();
-        assert!(refused.contains("4361 bytes of rs scratch"), "{refused}");
+        assert!(refused.contains("4364 bytes of rs scratch"), "{refused}");
     }
 
     /// Metal's rs scratch is bytes, not a row budget: a rung reserves each
@@ -11902,12 +11902,13 @@ mod unfolded_tests {
     /// [`pool_with_rungs_of`], each rung's replay scratch stated
     /// (`act_replay`) and the load's rs scratch `rs_compact` or not.
     /// A Metal-shaped test scratch: one byte a row, no lane term past its
-    /// one pad, holding `rows` scratch rows.
+    /// 4-byte floor (`ScratchBytes::bytes`, Metal's formula), holding `rows`
+    /// scratch rows.
     pub(super) fn rows_bytes(rows: u32) -> ::engine::ScratchBytes {
         ::engine::ScratchBytes {
             slot_bytes: vec![1],
             lane_bytes: 0,
-            room_bytes: u64::from(rows) + 1,
+            room_bytes: u64::from(rows) + 4,
             pad: 1,
         }
     }

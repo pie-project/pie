@@ -775,12 +775,13 @@ pub struct RungReplay {
 }
 
 /// A rung's rs scratch as bytes, the engine's own reserve formula: a fire
-/// of `rows` scratch rows over `lanes` lanes takes, for each scratch slot,
-/// `rows * slot_bytes` rounded up to `pad`, and `lanes * lane_bytes`
-/// rounded up to `pad` (each at least one `pad`), and fits where that is at
-/// most `room_bytes`. An engine laying no rs scratch beyond its rung's rows
-/// (its replay inside the rung's own rooms, bounded by `own_max` and
-/// `carried_max`) states no slot: no bytes bind.
+/// of `rows` scratch rows over `lanes` lanes (each at least one) takes, for
+/// each scratch slot, `rows * slot_bytes` (at least 4) rounded up to `pad`,
+/// and `lanes * lane_bytes` (at least 4) rounded up to `pad`, the whole at
+/// least one `pad` (Metal's `Seat::scratch_bytes` to the byte), and fits
+/// where that is at most `room_bytes`. An engine laying no rs scratch
+/// beyond its rung's rows (its replay inside the rung's own rooms, bounded
+/// by `own_max` and `carried_max`) states no slot: no bytes bind.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScratchBytes {
     pub slot_bytes: Vec<u64>,
@@ -797,11 +798,16 @@ impl ScratchBytes {
             return 0;
         }
         let pad = self.pad.max(1);
-        let up = |bytes: u64| bytes.max(1).div_ceil(pad).saturating_mul(pad);
-        let slots = self.slot_bytes.iter().fold(0u64, |sum, &slot| {
-            sum.saturating_add(up(u64::from(rows).saturating_mul(slot)))
-        });
-        slots.saturating_add(up(u64::from(lanes).saturating_mul(self.lane_bytes)))
+        let up = |bytes: u64| bytes.max(4).div_ceil(pad).saturating_mul(pad);
+        let rows = u64::from(rows.max(1));
+        let lanes = u64::from(lanes.max(1));
+        let slots = self
+            .slot_bytes
+            .iter()
+            .fold(0u64, |sum, &slot| sum.saturating_add(up(rows.saturating_mul(slot))));
+        slots
+            .saturating_add(up(lanes.saturating_mul(self.lane_bytes)))
+            .max(pad)
     }
 
     /// The bytes binding, where any do.
@@ -1484,6 +1490,48 @@ fn partition(indptr: &[u32], name: &str, bytes: usize, align: usize, strict: boo
 
 #[cfg(test)]
 mod tests {
+    /// Metal's `Seat::scratch_bytes`, as engine-metal lays a rung's rs
+    /// scratch: each slot's rows and the lanes' work term at least 4 bytes
+    /// rounded to 256, rows and lanes each at least one, the whole at least
+    /// 256.
+    fn metal_scratch_bytes(slots: &[u64], work_elems: u64, rows_ext: u32, lanes: u32) -> u64 {
+        let rows = u64::from(rows_ext.max(1));
+        let mut at = 0u64;
+        for &slot in slots {
+            at += (rows * slot).max(4).next_multiple_of(256);
+        }
+        at += (u64::from(lanes.max(1)) * work_elems * 4).max(4).next_multiple_of(256);
+        at.max(256)
+    }
+
+    #[test]
+    fn scratch_bytes_is_metals_reserve_to_the_byte() {
+        for (slots, work_elems) in [
+            (vec![2u64, 4096, 12_288, 300], 2048u64),
+            (vec![1], 0),
+            (vec![513, 3], 1),
+        ] {
+            let model = ScratchBytes {
+                slot_bytes: slots.clone(),
+                lane_bytes: work_elems * 4,
+                room_bytes: 0,
+                pad: 256,
+            };
+            for rows in [0u32, 1, 2, 7, 255, 1024, 2048] {
+                for lanes in [0u32, 1, 3, 8, 64] {
+                    assert_eq!(
+                        model.bytes(rows, lanes),
+                        metal_scratch_bytes(&slots, work_elems, rows, lanes),
+                        "slots {slots:?}, work {work_elems}, rows {rows}, lanes {lanes}"
+                    );
+                }
+            }
+        }
+        // A zero term costs one pad, not nothing.
+        let one = ScratchBytes { slot_bytes: vec![1], lane_bytes: 0, room_bytes: 0, pad: 256 };
+        assert_eq!(one.bytes(0, 0), 512);
+    }
+
     use super::*;
 
     fn mask(kept: &[bool]) -> Mask {
