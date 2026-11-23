@@ -7,11 +7,10 @@
 //! [`scope_domain`] is the one place a domain is made from a scope.
 //!
 //! **The grant seam.** A `group` scope crosses tenants only where a grant
-//! covers the asking tenant; the cross-tenant grant table is the PLEX port's.
-//! It answers [`granted`]; until it lands, [`NoGrants`] answers `None` for
-//! every group, so a group is tenant-local. A grant is resolved when a set
-//! asks and again each time a pass computes keys, so a revoked or reissued
-//! grant (a new [`GrantId`]) is seen on the next pass.
+//! covers the asking tenant: [`granted`] answers from the PLEX share-groups
+//! table ([`crate::policy::grants`]), else the group is tenant-local. A grant
+//! is resolved when a set asks and again each time a pass computes keys, so a
+//! revoked or reissued grant (a new [`GrantId`]) is seen on the next pass.
 
 use crate::store::kv::hash::{Hash256, cache_domain};
 
@@ -57,25 +56,11 @@ pub enum ShareAs {
     OnBehalf(Hash256),
 }
 
-/// The grants a group scope may cross tenants under.
-pub trait GrantLookup {
-    /// The grant covering `tenant` for `group`, if one does. O(1): it runs
-    /// under the kv store's lock at each keyed pass.
-    fn granted(&self, group: &str, tenant: &TenantId) -> Option<GrantId>;
-}
-
-/// No grant table: every group is tenant-local. The PLEX port replaces it.
-pub struct NoGrants;
-
-impl GrantLookup for NoGrants {
-    fn granted(&self, _group: &str, _tenant: &TenantId) -> Option<GrantId> {
-        None
-    }
-}
-
-/// The grant covering `tenant` for `group`.
+/// The grant covering `tenant` for `group`, if one does: its id changes
+/// with every change to its row. O(1): it runs under the kv store's lock at
+/// each keyed pass.
 pub fn granted(group: &str, tenant: &TenantId) -> Option<GrantId> {
-    NoGrants.granted(group, tenant)
+    crate::policy::grants::granted(group, &tenant.0).map(GrantId)
 }
 
 /// The domain a set asking `scope` keys its pages under, within the model
@@ -218,10 +203,5 @@ mod tests {
             d(&ShareScope::Tenant, &a, Some(GrantId(1))),
             d(&ShareScope::Tenant, &asker("a", "other"), None)
         );
-    }
-
-    #[test]
-    fn the_stub_grants_nothing() {
-        assert_eq!(granted("g", &TenantId("a".into())), None);
     }
 }

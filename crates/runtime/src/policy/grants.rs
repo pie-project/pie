@@ -7,8 +7,8 @@
 //! it links. A worker holds the newest version it was sent while some gateway
 //! link stands. The KV hash domain of a `share(group(g))` ask is the model's
 //! identity, "group", `g` and the grant's id where [`granted`] says the
-//! asker's tenant is in, and is tenant-local otherwise: `policy::share`'s
-//! `GrantLookup` seam answers from [`granted`].
+//! asker's tenant is in, and is tenant-local otherwise: [`crate::policy::share::granted`]
+//! answers from [`granted`].
 //!
 //! It fails closed: no table yet, a table withdrawn (every gateway link gone),
 //! or a policy's rows withdrawn by its lease, is no grant.

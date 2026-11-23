@@ -8533,6 +8533,81 @@ pub(crate) mod fold_tests {
         assert_eq!(kept, 0, "a private set keeps nothing at release");
     }
 
+    /// A group scope crosses tenants only under a grant: two granted
+    /// tenants' sets asking `group(g)` share pages; an ungranted tenant's
+    /// `group(g)` is its own. Once the grant changes (revoked for one
+    /// tenant, a new id for the rest), a set with no rows takes the
+    /// tenant-local domain on its next pass, and a set with rows shares no
+    /// more.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_group_shares_across_tenants_only_while_granted() {
+        use crate::policy::grants;
+        use crate::policy::share::{
+            Asker, SessionId, ShareAs, ShareScope, TenantId, scope_domain,
+        };
+        let _grants = grants::TEST_LOCK.lock();
+        let grant = |version, tenants: &[&str]| {
+            let tenants = tenants.iter().map(|t| t.to_string()).collect();
+            grants::install(version, vec![("g".into(), tenants, version)], None);
+        };
+        grants::withdraw();
+        grant(1, &["a", "b"]);
+        let asker = |tenant: &str| Asker {
+            tenant: TenantId(tenant.into()),
+            session: SessionId::Named("s".into()),
+        };
+        let group = |tenant: &str| ShareAs::Scope(ShareScope::Group("g".into()), asker(tenant));
+        let model = crate::store::registry::register_model(16, &[64], &[4]);
+        let stores = crate::store::registry::get(model, 0);
+        stores.kv.lock().set_keeps(true);
+        let tokens: Vec<u32> = (0..65).map(|t| 3100 + t).collect();
+        let of = |tenant: &str| keyed_pass_as(&stores, &tokens, Some(group(tenant)));
+        let looked = |ws, slots: &[_]| {
+            supply(&stores, ws, &rows(0, &tokens), slots, Attach::Kv, 65, 16).rows
+        };
+        // a computes and seals the prompt under group(g).
+        let (a1, a1_slots) = of("a");
+        written(&stores, a1, &tokens);
+        {
+            let mut kv = stores.kv.lock();
+            kv.freeze(a1, 65).unwrap();
+            kv.seal_rows(a1, 0, &a1_slots, 16).unwrap();
+        }
+        // b, granted too, keys a's chain and maps a's pages in.
+        let (b1, b1_slots) = of("b");
+        assert_eq!(a1_slots, b1_slots, "granted tenants key one chain");
+        assert_eq!(looked(b1, &b1_slots), 64, "b maps a's four sealed pages");
+        // c, not granted: its group(g) is its own.
+        let (c1, c1_slots) = of("c");
+        assert_ne!(c1_slots, a1_slots, "an ungranted tenant keys its own chain");
+        assert_eq!(looked(c1, &c1_slots), 0, "c finds none of a's");
+        // A set of b's that asked but keyed nothing yet; a1 holds rows.
+        let fresh = {
+            let mut kv = stores.kv.lock();
+            let ws = kv.create_working_set();
+            kv.share(ws, group("b")).unwrap();
+            ws
+        };
+        // b's grant is revoked; a's row is reissued under a new id.
+        grant(2, &["a"]);
+        let mut kv = stores.kv.lock();
+        let local = scope_domain(&kv.domain(), &ShareScope::Group("g".into()), &asker("b"), None);
+        assert_eq!(
+            kv.pass_domain(fresh).unwrap(),
+            (local, true),
+            "a set with no rows takes the tenant-local domain"
+        );
+        assert!(kv.shares(fresh));
+        let (_, shared) = kv.pass_domain(a1).unwrap();
+        assert!(!shared, "a set with rows keyed under the old grant shares no more");
+        assert!(!kv.shares(a1));
+        let fresh_slots = kv.slot_hashes(fresh, 0, &tokens, 16).unwrap().unwrap();
+        drop(kv);
+        assert_ne!(fresh_slots, a1_slots, "b no longer keys the group's chain");
+        assert_eq!(looked(fresh, &fresh_slots), 0, "b finds none of a's now");
+        grants::withdraw();
+    }
+
     /// Passes over `prompt(2..5)` that arrive while a first pass over
     /// `prompt(1)` claims the pages they share, each waiting.
     fn waiting_on(

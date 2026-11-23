@@ -98,7 +98,7 @@ Nothing already cached is lost: the pages stay, unmatched.
   worker links.
 - **Worker** (`runtime/src/policy/grants.rs`): `granted(group, tenant) ->
   Option<u64>` (the grant's id), one read lock and two hash lookups, behind
-  `policy::share`'s `GrantLookup` seam, which the keying sites call at each
+  `policy::share::granted` (the grant seam), which the keying sites call at each
   keyed pass under the kv lock. A newer version replaces the table, an older
   is ignored. A set already holding rows keyed under a grant stops sharing
   when the grant changes (a chain cannot change domain midway); a set with
