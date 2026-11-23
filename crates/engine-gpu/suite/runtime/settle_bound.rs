@@ -21,6 +21,9 @@ const TOKENS: u32 = 256;
 
 #[test]
 fn the_settle_submits_no_fire_past_the_bound() {
+    // Alone on the device: its fresh profile directory measures the rates
+    // again, and a rates step timed beside other tests' fires drops points.
+    crate::gpu::sole();
     // A profile directory of this test's own: the process's shared one
     // keeps each model's settle, so a load after another test's of the
     // same model takes that settle and walks no range.
