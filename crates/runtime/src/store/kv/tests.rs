@@ -2118,3 +2118,39 @@ fn a_suspend_takes_no_disk_copy_a_key_keeps() {
     assert!(low.1.iter().all(|key| !kept.contains(key)), "the floor's went");
     assert_eq!(store.make_swap_room(4, &floor), 2, "and nothing more yields");
 }
+
+#[test]
+/// What a reclaim frees while a fire in flight still reads it waits on that
+/// fire's retirement: it is returning, and counts toward the shortfall, so
+/// a reclaim for the same shortfall frees nothing more. Past it, only what
+/// is still short goes; the fire's settle brings it back.
+fn a_reclaim_counts_what_it_freed_as_returning_until_its_fire_retires() {
+    let mut store = KvStore::new(8, h(63));
+    let (early, late) = (ProcessId::from_u128(1), ProcessId::from_u128(2));
+    let a = store.create_working_set();
+    sealed(&mut store, a, &prompt(90, 2));
+    store.keep_checkpoint(a, 2, Some(early));
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    kept_and_gone(&mut store, 91, 2, late);
+    let fire = store.begin_fire();
+    store.release_working_set(a, store.current_epoch());
+    let free = store.available_pages();
+    let epoch = store.current_epoch();
+
+    assert_eq!(store.reclaim_cache(epoch, 2, floor), 2);
+    assert!(!store.owns_cache(early), "the least recently used went");
+    assert_eq!(store.available_pages(), free, "the fire in flight still reads it");
+    assert_eq!(store.reclaim_returning(), 2);
+    assert_eq!(
+        store.reclaim_cache(epoch, 2, floor),
+        0,
+        "the same shortfall again: what returns covers it"
+    );
+    assert!(store.owns_cache(late), "nothing more went");
+
+    store.settle(fire);
+    assert_eq!(store.reclaim_returning(), 0);
+    assert_eq!(store.available_pages(), free + 2, "back once the fire retired");
+    assert_eq!(store.reclaim_cache(store.current_epoch(), 2, floor), 2);
+    assert!(!store.owns_cache(late), "a new shortfall reclaims again");
+}

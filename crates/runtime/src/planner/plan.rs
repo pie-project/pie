@@ -9,6 +9,7 @@ use super::inner::RestoreGate;
 use super::proc::{PendingBind, Residency};
 use super::pool::{IdleShort, RunNeed};
 use super::wait::{EntryKey, WaitKind, Waiter};
+use super::residency_planner::IdleOutcome;
 use super::{ProcessId, ResidencyPlanner, exec};
 use crate::store::rs::RsUnits;
 
@@ -1024,7 +1025,17 @@ impl ResidencyPlanner {
                         kv_pages: self.port.chunks_as_pages(run.saturating_mul(pieces)),
                         rs: true,
                     };
-                    if self.reclaim_idle_once(short) || self.sweep_stranded(u32::MAX, false) {
+                    match self.reclaim_idle_once(short) {
+                        IdleOutcome::Freed => {
+                            continue;
+                        }
+                        IdleOutcome::Returning => {
+                            self.plan_stopped("bind room: reclaimed pages return as their fires retire");
+                            return false;
+                        }
+                        IdleOutcome::Nothing => {}
+                    }
+                    if self.sweep_stranded(u32::MAX, false) {
                         continue;
                     }
                     // A grow the walk will make holds its runs: it waits on
@@ -1097,7 +1108,17 @@ impl ResidencyPlanner {
                         kv_pages: self.port.chunks_as_pages(need.run.saturating_mul(need.pieces)),
                         rs: true,
                     };
-                    if self.reclaim_idle_once(short) || self.sweep_stranded(u32::MAX, false) {
+                    match self.reclaim_idle_once(short) {
+                        IdleOutcome::Freed => {
+                            continue;
+                        }
+                        IdleOutcome::Returning => {
+                            self.plan_stopped("bind-suspended restore: reclaimed pages return as their fires retire");
+                            return false;
+                        }
+                        IdleOutcome::Nothing => {}
+                    }
+                    if self.sweep_stranded(u32::MAX, false) {
                         continue;
                     }
                     // Parked state lying on the device moves down a tier for
@@ -1226,7 +1247,18 @@ impl ResidencyPlanner {
                             .chunks_as_pages(u32::try_from(room.chunks()).unwrap_or(u32::MAX)),
                         rs: true,
                     };
-                    if self.reclaim_idle_once(short) || self.sweep_stranded(u32::MAX, false) {
+                    match self.reclaim_idle_once(short) {
+                        IdleOutcome::Freed => {
+                            self.with_inner(|inner| inner.roles_retry_head());
+                            continue;
+                        }
+                        IdleOutcome::Returning => {
+                            self.plan_stopped("restore short of runs: reclaimed pages return as their fires retire");
+                            return false;
+                        }
+                        IdleOutcome::Nothing => {}
+                    }
+                    if self.sweep_stranded(u32::MAX, false) {
                         self.with_inner(|inner| inner.roles_retry_head());
                         continue;
                     }
@@ -1288,8 +1320,15 @@ impl ResidencyPlanner {
                         kv_pages: count,
                         rs: false,
                     };
-                    if self.reclaim_idle_once(short) {
-                        continue;
+                    match self.reclaim_idle_once(short) {
+                        IdleOutcome::Freed => {
+                            continue;
+                        }
+                        IdleOutcome::Returning => {
+                            self.plan_stopped("short of kv: reclaimed pages return as their fires retire");
+                            return false;
+                        }
+                        IdleOutcome::Nothing => {}
                     }
                     if self.sweep_stranded(count, false) {
                         self.plan_stopped("short of kv: stranded tails swept");
@@ -1344,7 +1383,17 @@ impl ResidencyPlanner {
                         kv_pages: as_pages,
                         rs: true,
                     };
-                    if self.reclaim_idle_once(short) || self.reclaim_head_sharing() {
+                    match self.reclaim_idle_once(short) {
+                        IdleOutcome::Freed => {
+                            continue;
+                        }
+                        IdleOutcome::Returning => {
+                            self.plan_stopped("short of state: reclaimed pages return as their fires retire");
+                            return false;
+                        }
+                        IdleOutcome::Nothing => {}
+                    }
+                    if self.reclaim_head_sharing() {
                         continue;
                     }
                     // And the tails of sets at rest past what their keys

@@ -317,6 +317,23 @@ impl<I: PoolId> ShapePool<I> {
         }
     }
 
+    /// Keeps of `ids` those let go and still waiting on a fire's
+    /// retirement.
+    pub fn retain_pending(&self, ids: &mut std::collections::HashSet<I>)
+    where
+        I: std::hash::Hash + Eq,
+    {
+        if ids.is_empty() {
+            return;
+        }
+        let pending: std::collections::HashSet<I> = self
+            .pending
+            .iter()
+            .flat_map(|(_, batch)| batch.iter().copied())
+            .collect();
+        ids.retain(|id| pending.contains(id));
+    }
+
     /// `ids`, which no fire has touched, go back now.
     pub fn release_reserved(&mut self, ids: Vec<I>) {
         self.give_back(&ids);

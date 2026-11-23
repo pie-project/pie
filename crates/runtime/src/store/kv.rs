@@ -303,6 +303,13 @@ pub struct KvStore {
     /// Bumped as an entry joins or leaves the cache, or is used: what a kept
     /// order read of the entries stands until it moves.
     entries_rev: u64,
+    /// Device pages a reclaim freed that wait on a fire's retirement: they
+    /// are returning, and count toward what a waiter is short of, so a
+    /// reclaim for the same shortfall frees none past them
+    /// ([`Self::reclaim_returning`]).
+    returning: HashSet<PhysicalKvPageId>,
+    /// While a reclaim runs, the device pages it lets go.
+    reclaiming: Option<Vec<PhysicalKvPageId>>,
     /// The disk slots whole disk chunks hold for state other than kv
     /// ([`Self::take_disk_chunks`]): a parked guest part's.
     guest_disk_slots: u32,
@@ -554,6 +561,8 @@ impl KvStore {
             droppable_below: std::cell::Cell::new(None),
             order: None,
             entries_rev: 0,
+            returning: HashSet::new(),
+            reclaiming: None,
             guest_disk_slots: 0,
         }
     }
@@ -926,9 +935,13 @@ impl KvStore {
         keys: impl Keys,
         drops: fn(i64) -> bool,
     ) -> usize {
+        // Pages an earlier reclaim freed are on their way back: what they
+        // cover is not short.
+        let short = short.saturating_sub(self.reclaim_returning());
         if short == 0 {
             return 0;
         }
+        self.reclaiming = Some(Vec::new());
         let mut freed = 0;
         let mut order = self.kept_order(&keys);
         // Groups that free no device page go last; the walk stops as soon as
@@ -978,8 +991,20 @@ impl KvStore {
         }
         order.retain(|(_, ids)| !ids.is_empty());
         self.keep_order(order, &keys);
+        let mut let_go: HashSet<PhysicalKvPageId> =
+            self.reclaiming.take().unwrap_or_default().into_iter().collect();
+        self.pool.retain_pending(&mut let_go);
+        self.returning.extend(let_go);
         tracing::debug!(target: "pie::kv", short, freed, "reclaimed");
         freed
+    }
+
+    /// The device pages reclaims freed that still wait on a fire's
+    /// retirement: returning, with nothing more to do but wait for it (a
+    /// fire's settle retires them, and tells the planner).
+    pub fn reclaim_returning(&mut self) -> usize {
+        self.pool.retain_pending(&mut self.returning);
+        self.returning.len()
     }
 
     /// [`Self::reclaim_order`], walked again (and the entries split at
@@ -1068,8 +1093,11 @@ impl KvStore {
             moves.iter().for_each(|&(_, _, slot)| persisted.back(slot));
         }
         let freed = moves.len();
-        self.pool
-            .recycle_after_epoch(moves.into_iter().map(|(_, gpu, _)| gpu).collect(), epoch);
+        let gpu: Vec<PhysicalKvPageId> = moves.into_iter().map(|(_, gpu, _)| gpu).collect();
+        if let Some(reclaiming) = &mut self.reclaiming {
+            reclaiming.extend(&gpu);
+        }
+        self.pool.recycle_after_epoch(gpu, epoch);
         // With no fire in flight the epoch has retired already: the pages
         // are free now, not at a next fire that may wait on them.
         self.retire_idle();
@@ -2664,6 +2692,9 @@ impl KvStore {
                 KvPageBacking::Resident(id) => resident.push(id),
                 swapped_backing => swapped.push(swapped_backing),
             }
+        }
+        if let Some(reclaiming) = &mut self.reclaiming {
+            reclaiming.extend(&resident);
         }
         self.pool.recycle_after_epoch(resident, epoch);
         self.release_swapped(swapped);

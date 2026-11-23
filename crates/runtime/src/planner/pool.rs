@@ -23,6 +23,16 @@ pub struct IdleShort {
     pub rs: bool,
 }
 
+/// What [`PoolPort::reclaim_idle`] did: pages and slots it freed, and the
+/// device pages reclaims freed that still wait on a fire's retirement
+/// (returning: they count toward the shortfall, and the waiter waits for
+/// the retirement, which wakes the planner).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IdleReclaim {
+    pub freed: u32,
+    pub returning: u32,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ChunkStats {
     /// The kv pages', `(free, total)`.
@@ -609,7 +619,7 @@ pub trait PoolPort: Send + Sync + 'static {
     /// only what its retention key lets the runtime drop unasked
     /// (`pressure::may_drop`); room past that is asked of the policy with
     /// tier pressure.
-    fn reclaim_idle(&self, short: IdleShort) -> u32;
+    fn reclaim_idle(&self, short: IdleShort) -> IdleReclaim;
     /// Called until it frees nothing, without freeing them.
     fn reclaimable_idle(&self) -> u32;
     /// The host and disk slots only idle cache its retention keys let go
@@ -1847,27 +1857,32 @@ impl PoolPort for RegistryPool {
         u32::try_from(slots).unwrap_or(u32::MAX)
     }
 
-    fn reclaim_idle(&self, short: IdleShort) -> u32 {
-        let pages = if short.kv_pages > 0 {
+    fn reclaim_idle(&self, short: IdleShort) -> IdleReclaim {
+        let (pages, returning) = if short.kv_pages > 0 {
             self.with_kv_tagged("planner-reclaim-idle", |kv| {
                 let epoch = kv.current_epoch();
-                kv.reclaim_droppable(
+                let pages = kv.reclaim_droppable(
                     epoch,
                     short.kv_pages as usize,
                     crate::policy::retention::Installed,
-                )
+                );
+                (pages, kv.reclaim_returning())
             })
         } else {
-            0
+            (0, 0)
         };
         // On a shared pool state's chunks are kv's too: what kv's cache
         // left short, its checkpoints may give.
-        let slots = if short.rs || (self.shared.is_some() && pages < short.kv_pages as usize) {
+        let covered = pages.max(returning);
+        let slots = if short.rs || (self.shared.is_some() && covered < short.kv_pages as usize) {
             self.with_rs(|rs| rs.reclaim_droppable(crate::policy::retention::Installed))
         } else {
             0
         };
-        (pages + slots) as u32
+        IdleReclaim {
+            freed: (pages + slots) as u32,
+            returning: returning as u32,
+        }
     }
 
     fn reclaimable_idle(&self) -> u32 {

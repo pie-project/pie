@@ -236,13 +236,20 @@ impl ResidencyPlanner {
                     kv_pages: self.port.rs_as_pages(demand.rs.sub(rs_free)),
                     rs: true,
                 };
-                if self.reclaim_idle_once(short) {
-                    self.pages_freed();
-                    return Ok(Acquired::Requote);
-                }
-                if self.reclaim_own_sharing(pid) {
-                    self.pages_freed();
-                    return Ok(Acquired::Requote);
+                match self.reclaim_idle_once(short) {
+                    super::residency_planner::IdleOutcome::Freed => {
+                        self.pages_freed();
+                        return Ok(Acquired::Requote);
+                    }
+                    // Pages a reclaim freed are on their way back: it parks
+                    // for them, and their retirement wakes it.
+                    super::residency_planner::IdleOutcome::Returning => {}
+                    super::residency_planner::IdleOutcome::Nothing => {
+                        if self.reclaim_own_sharing(pid) {
+                            self.pages_freed();
+                            return Ok(Acquired::Requote);
+                        }
+                    }
                 }
             }
         }
