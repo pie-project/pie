@@ -546,6 +546,18 @@ impl Lane {
                 self.slot, window.base
             )));
         }
+        // Rows earlier fires buffered (the set holds rows past its folded
+        // index before this fire's) stay named for the fire's reads: the
+        // table starts at or below the folded index before the fire (with
+        // `base` on a slot's first row, at most it rounded down).
+        if self.kv.held > self.kv.folded && window.base > self.kv.folded {
+            return Err(Error::Invalid(format!(
+                "lane in slot {} carries rows {}..{} earlier fires buffered and starts its \
+                 window buffer at row {}, past them: they stay named until the fold frees \
+                 them",
+                self.slot, self.kv.folded, self.kv.held, window.base
+            )));
+        }
         if let RsVerb::Buffer {
             folded,
             fold,
@@ -1461,21 +1473,46 @@ mod tests {
         lane.window = Some(WindowFold { base: 32, ..fold });
         let why = lane.validate_for(serves).unwrap_err().to_string();
         assert!(why.contains("past its folded index"), "{why}");
-        // A prefill folding its own rows: the table starts at the folded
-        // index after the fire, rounded down.
+        // Rows 20..40 earlier fires buffered stay named while this fire
+        // folds them: the table may not start past 20.
         lane.window = Some(WindowFold {
             base: 32,
             fold: FoldLen::Host(20),
             lineage: Lineage::Set,
         });
-        assert!(lane.validate_for(serves).is_ok());
-        lane.window = Some(WindowFold {
+        let why = lane.validate_for(serves).unwrap_err().to_string();
+        assert!(why.contains("earlier fires buffered"), "{why}");
+
+        // A lane folding every row it computes (no earlier-buffered rows,
+        // an empty table): the table starts at the folded index after the
+        // fire, rounded down, past the one before it.
+        let mut prefill = Lane::decode(0, 0, 1, 20);
+        prefill.tokens = vec![1; 20];
+        prefill.kv.folded = 20;
+        prefill.window = Some(WindowFold {
+            base: 32,
+            fold: FoldLen::Host(20),
+            lineage: Lineage::Set,
+        });
+        assert!(prefill.validate_for(serves).is_ok());
+        // Past the folded index after the fire (40): refused.
+        prefill.window = Some(WindowFold {
+            base: 48,
+            fold: FoldLen::Host(20),
+            lineage: Lineage::Set,
+        });
+        let why = prefill.validate_for(serves).unwrap_err().to_string();
+        assert!(
+            why.contains("past its folded index after the fire 40"),
+            "{why}"
+        );
+        prefill.window = Some(WindowFold {
             base: 32,
             fold: FoldLen::Device,
             lineage: Lineage::Set,
         });
         assert!(
-            lane.validate_for(serves).is_err(),
+            prefill.validate_for(serves).is_err(),
             "a device-counted fold's base is the folded index the runtime knows"
         );
         lane.window = Some(fold);
