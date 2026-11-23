@@ -1414,6 +1414,15 @@ template [[host_name("gated_delta_group_fold_bfloat16")]]
     device uchar*, const constant uint&, const device ulong*, const constant uint&, uint3,
     uint);
 
+// The carried kernel's state tile back to its cells (a macro, not a
+// lambda: a lambda capturing the tile by reference makes it addressable,
+// and the compiler then keeps it in thread memory, not registers).
+#define PIE_GDN_STORE_STATE                                                   \
+  for (int v = 0; v < VROWS; ++v) {                                          \
+    *reinterpret_cast<device float4*>(cells + size_t(v) * D + size_t(PER * lane)) = \
+        float4(st[v][0], st[v][1], st[v][2], st[v][3]);                      \
+  }
+
 // `gated_delta_carried` for a carry of one chunk (up to `kVerifyChunk`
 // rows, a decode at its run-ahead lag): the fused step's tiling, a
 // simdgroup holding 16 value rows of the head's state in registers, loaded
@@ -1512,23 +1521,40 @@ template <typename T, int SG, int VROWS>
       st[v][i] = s4[i];
     }
   }
-  float4 k0 = float4(0.0f);
-  float rinv0 = 0.0f, glog0 = 0.0f;
-  float u0[VROWS];
-  if (rep > 0) {
-    const device T* krow = reinterpret_cast<const device T*>(
-        gdn_buffered_row(key_slab, pages, 0, page_tokens, page_bytes, key_row_bytes));
-    const device float* srow = reinterpret_cast<const device float*>(
-        gdn_buffered_row(scalar_slab, pages, 0, page_tokens, page_bytes, scalar_row_bytes));
-    const device float* urow = reinterpret_cast<const device float*>(
-        gdn_buffered_row(u_slab, pages, 0, page_tokens, page_bytes, u_row_bytes));
-    k0 = float4(*reinterpret_cast<const device vec<T, 4>*>(krow + size_t(hk) * D + size_t(PER * lane)));
-    rinv0 = srow[vh + size_t(hv)];
-    glog0 = srow[hv];
-    for (int v = 0; v < VROWS; ++v) {
-      u0[v] = urow[size_t(hv) * D + size_t(dv_base + v)];
+  // The carried rows' inputs, staged by the threadgroup at once: each
+  // row's normed key (its key head), its log-gate, and the threadgroup's
+  // value columns of its corrected value, one element a thread with every
+  // load in flight together, behind one barrier. Read one row after
+  // another inside the step loop, a 7-row carry waited on 7 loads in turn.
+  threadgroup float kn_s[kVerifyChunk][D];
+  threadgroup float u_s[kVerifyChunk][SG * VROWS];
+  threadgroup float g_s[kVerifyChunk];
+  {
+    const int tg_rows = SG * VROWS;
+    const int tg_base = int(group.y) * tg_rows;
+    for (int e = tid; e < rep * D; e += SG * 32) {
+      const int t = e / D;
+      const int d = e % D;
+      const device T* krow = reinterpret_cast<const device T*>(
+          gdn_buffered_row(key_slab, pages, t, page_tokens, page_bytes, key_row_bytes));
+      const device float* srow = reinterpret_cast<const device float*>(
+          gdn_buffered_row(scalar_slab, pages, t, page_tokens, page_bytes, scalar_row_bytes));
+      kn_s[t][d] = float(krow[size_t(hk) * D + size_t(d)]) * srow[vh + size_t(hv)];
+    }
+    for (int e = tid; e < rep * tg_rows; e += SG * 32) {
+      const int t = e / tg_rows;
+      const int c = e % tg_rows;
+      const device float* urow = reinterpret_cast<const device float*>(
+          gdn_buffered_row(u_slab, pages, t, page_tokens, page_bytes, u_row_bytes));
+      u_s[t][c] = urow[size_t(hv) * D + size_t(tg_base + c)];
+    }
+    for (int t = tid; t < rep; t += SG * 32) {
+      const device float* srow = reinterpret_cast<const device float*>(
+          gdn_buffered_row(scalar_slab, pages, t, page_tokens, page_bytes, scalar_row_bytes));
+      g_s[t] = metal::exp(srow[hv]);
     }
   }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
 
   // The own row's normed q and k, every simdgroup its own.
   const size_t row = size_t(begin + t_own) * pitch;
@@ -1588,40 +1614,21 @@ template <typename T, int SG, int VROWS>
   // as its landing stored them), the state written once the rows this fire
   // folds are in; then the own row as the scan step takes it, on the state
   // with every carried row in.
-  auto store = [&]() {
-    for (int v = 0; v < VROWS; ++v) {
-      *reinterpret_cast<device float4*>(cells + size_t(v) * D + size_t(PER * lane)) =
-          float4(st[v][0], st[v][1], st[v][2], st[v][3]);
-    }
-  };
   for (int t = 0; t < rep; ++t) {
     if (t == keep && keep > 0) {
-      store();
+      PIE_GDN_STORE_STATE;
     }
-    float4 kr4 = k0;
-    float rinv = rinv0, glog = glog0;
-    const device float* urow = nullptr;
-    if (t > 0) {
-      const device T* krow = reinterpret_cast<const device T*>(
-          gdn_buffered_row(key_slab, pages, t, page_tokens, page_bytes, key_row_bytes));
-      const device float* srow = reinterpret_cast<const device float*>(
-          gdn_buffered_row(scalar_slab, pages, t, page_tokens, page_bytes, scalar_row_bytes));
-      urow = reinterpret_cast<const device float*>(
-          gdn_buffered_row(u_slab, pages, t, page_tokens, page_bytes, u_row_bytes));
-      kr4 = float4(*reinterpret_cast<const device vec<T, 4>*>(krow + size_t(hk) * D + size_t(PER * lane)));
-      rinv = srow[vh + size_t(hv)];
-      glog = srow[hv];
-    }
-    const float g = metal::exp(glog);
+    const float g = g_s[t];
+    const int sv = sg * VROWS;
     for (int v = 0; v < VROWS; ++v) {
-      const float u = (t == 0) ? u0[v] : urow[size_t(hv) * D + size_t(dv_base + v)];
+      const float u = u_s[t][sv + v];
       for (int i = 0; i < PER; ++i) {
-        st[v][i] = g * st[v][i] + (kr4[i] * rinv) * u;
+        st[v][i] = g * st[v][i] + kn_s[t][PER * lane + i] * u;
       }
     }
   }
   if (keep == rep && rep > 0) {
-    store();
+    PIE_GDN_STORE_STATE;
   }
 
   // The own row: its corrected value, readout and landing.
@@ -1656,7 +1663,7 @@ template <typename T, int SG, int VROWS>
     }
   }
   if (keep == rep + 1) {
-    store();
+    PIE_GDN_STORE_STATE;
   }
 }
 
