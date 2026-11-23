@@ -74,12 +74,40 @@ impl Deployment {
     }
 
     /// What the compiler decides of this deployment's weights that its
-    /// import stores so: nothing where it does not trace.
+    /// import stores so: nothing where it does not trace. It costs a trace
+    /// and follows from the deployment's description alone, so each is
+    /// lowered once a process, keyed by its package's content.
     pub fn lowering(&self, platform: Platform) -> poem::Lowering {
-        self.package
+        type Key = (String, String, Deploy, Platform);
+        static LOWERED: LazyLock<std::sync::Mutex<std::collections::HashMap<Key, poem::Lowering>>> =
+            LazyLock::new(Default::default);
+        let key = (
+            self.package.digest(),
+            self.model.id.clone(),
+            self.deploy.clone(),
+            platform,
+        );
+        if let Some(lowering) = LOWERED.lock().ok().and_then(|held| held.get(&key).cloned()) {
+            return lowering;
+        }
+        let lowering = self
+            .package
             .trace(&self.model.id, &self.deploy, &self.name, platform)
             .map(|trace| lowering_of(&trace, self.deploy.tp))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if let Ok(mut held) = LOWERED.lock() {
+            held.insert(key, lowering.clone());
+        }
+        lowering
+    }
+
+    /// Whether this deployment may read `src`: false only where
+    /// [`Deployment::contract`] refuses it, for no format of its package
+    /// takes the checkpoint by its header facts (`Package::may_read`).
+    #[must_use]
+    pub fn may_read(&self, src: &ztensor::Source, platform: Platform) -> bool {
+        self.package
+            .may_read(&self.model.id, &self.deploy, src, platform)
     }
 
     pub fn try_generative(&self) -> Result<Option<Generative>, Refused> {
@@ -134,6 +162,15 @@ impl Deployment {
     #[must_use]
     pub fn markers(&self) -> Vec<Vec<String>> {
         self.model.tokenizer.markers_for(&self.deploy.parts)
+    }
+}
+
+/// The refusal of a deployment no format of which takes a checkpoint by
+/// its header facts, which its contract is then not asked for.
+fn untaken(deployment: &Deployment) -> poem::import::Error {
+    poem::import::Error::Illegible {
+        name: deployment.model.id.clone(),
+        detail: "no format of it takes this checkpoint by its header facts".to_string(),
     }
 }
 
@@ -415,7 +452,10 @@ impl Catalog {
         platform: Platform,
     ) -> impl Iterator<Item = (Deployment, Result<ModelContract, poem::import::Error>)> + 'a {
         self.candidates_of(src, platform).into_iter().map(move |d| {
-            let read = d.contract(src, platform);
+            let read = match d.may_read(src, platform) {
+                true => d.contract(src, platform),
+                false => Err(untaken(&d)),
+            };
             (d, read)
         })
     }
@@ -424,7 +464,11 @@ impl Catalog {
     pub fn identify(&self, src: &ztensor::Source, platform: Platform) -> Result<&str, Unmatched> {
         let mut misses: Vec<(String, String)> = Vec::new();
         for deployment in self.candidates() {
-            match deployment.contract(src, platform) {
+            let read = match deployment.may_read(src, platform) {
+                true => deployment.contract(src, platform),
+                false => Err(untaken(deployment)),
+            };
+            match read {
                 Ok(contract) => match requantizes(&contract) {
                     None => return Ok(&deployment.name),
                     Some(plane) => misses.push((

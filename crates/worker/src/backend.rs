@@ -248,7 +248,11 @@ fn load_request(
         frames_in_flight,
     )?;
     if request.residency.disk_kv_budget != Some(0) && request.residency.disk_kv_dir.is_none() {
-        let dir = crate::disk::kv_dir(cache_dir, snapshot_dir)?;
+        let dir = crate::disk::kv_dir(
+            cache_dir,
+            snapshot_dir,
+            request.residency.disk_kv_persistent,
+        )?;
         // Each rank of an expert-parallel group keeps its own requests' kv.
         request.residency.disk_kv_dir = Some(match overrides.ep {
             Some(_) => dir.join(format!("rank{}", overrides.rank.unwrap_or(0))),
