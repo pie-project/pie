@@ -226,6 +226,9 @@ pub struct Shell {
     /// Whether the load times the decode products' kernels no layer states
     /// (`[engine] measure`).
     routes_measuring: engine::rates::Measuring,
+    /// What this load timed, each by name (the device's rates where no
+    /// layer stated them, the decode products' times): its last line's.
+    pub(crate) measured: std::cell::RefCell<Vec<String>>,
     segments: std::collections::HashMap<record::BodyKey, Segmented>,
     windows_memo: Vec<prepare::WindowsMemo>,
     cache: GraphCache,
@@ -284,6 +287,14 @@ pub(crate) struct KvReport {
     /// One past the last slot the lane's rows landed at, in the set's own
     /// slot numbering, for a lane whose rows land where the device says.
     pub(crate) end: Option<u32>,
+}
+
+impl Shell {
+    /// What this load timed, each by name: empty where it measured nothing.
+    #[must_use]
+    pub fn measured_at_load(&self) -> Vec<String> {
+        self.measured.borrow().clone()
+    }
 }
 
 impl Shell {

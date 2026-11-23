@@ -3629,6 +3629,13 @@ mod tests {
             &[]
         }
 
+        fn measured_at_load(&self) -> Vec<String> {
+
+            Vec::new()
+
+        }
+
+
         fn skips_measuring(&self) -> bool {
             false
         }
@@ -4327,6 +4334,13 @@ mod tests {
             &[]
         }
 
+        fn measured_at_load(&self) -> Vec<String> {
+
+            Vec::new()
+
+        }
+
+
         fn skips_measuring(&self) -> bool {
             false
         }
@@ -4448,6 +4462,13 @@ mod tests {
         fn committed_covers(&self) -> &'static [&'static str] {
             &[]
         }
+
+        fn measured_at_load(&self) -> Vec<String> {
+
+            Vec::new()
+
+        }
+
 
         fn skips_measuring(&self) -> bool {
             false
@@ -4600,6 +4621,13 @@ mod tests {
         fn committed_covers(&self) -> &'static [&'static str] {
             &[]
         }
+
+        fn measured_at_load(&self) -> Vec<String> {
+
+            Vec::new()
+
+        }
+
 
         fn skips_measuring(&self) -> bool {
             false
@@ -4872,6 +4900,13 @@ mod tests {
         fn committed_covers(&self) -> &'static [&'static str] {
             &[]
         }
+
+        fn measured_at_load(&self) -> Vec<String> {
+
+            Vec::new()
+
+        }
+
 
         fn skips_measuring(&self) -> bool {
             false
@@ -5339,6 +5374,13 @@ mod tests {
         fn committed_covers(&self) -> &'static [&'static str] {
             &[]
         }
+
+        fn measured_at_load(&self) -> Vec<String> {
+
+            Vec::new()
+
+        }
+
 
         fn skips_measuring(&self) -> bool {
             false

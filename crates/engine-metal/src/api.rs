@@ -453,6 +453,12 @@ impl Engine for Metal {
         crate::chip::COVERS
     }
 
+    /// Stated by sc/macpro-4c-profiles (its rates and dense crossover);
+    /// until it lands, said as untracked by name.
+    fn measured_at_load(&self) -> Vec<String> {
+        vec!["metal: what it measured is not tracked yet".to_string()]
+    }
+
     fn skips_measuring(&self) -> bool {
         self.boot.measure == engine::rates::Measuring::Skip
     }

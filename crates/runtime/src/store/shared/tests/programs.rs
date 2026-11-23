@@ -1738,6 +1738,13 @@ impl ::engine::Engine for SetEngine {
         &[]
     }
 
+    fn measured_at_load(&self) -> Vec<String> {
+
+        Vec::new()
+
+    }
+
+
     fn skips_measuring(&self) -> bool {
         false
     }

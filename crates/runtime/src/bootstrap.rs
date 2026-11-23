@@ -798,10 +798,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     // load stands: "measured 0" where none was timed.
     let mut measured: Vec<String> = Vec::new();
     for d in &engine_configs {
-        match d.engine_backend.measured_at_load() {
-            Some(timed) => measured.extend(timed),
-            None => measured.push(format!("{}: not tracked", d.engine_backend.kind())),
-        }
+        measured.extend(d.engine_backend.measured_at_load());
     }
     let engines: Vec<usize> = engine_configs
         .into_iter()

@@ -612,6 +612,13 @@ impl Engine for Cuda {
         crate::chip::COVERS
     }
 
+    fn measured_at_load(&self) -> Vec<String> {
+        self.shell
+            .as_ref()
+            .map(crate::serve::Shell::measured_at_load)
+            .unwrap_or_default()
+    }
+
     fn skips_measuring(&self) -> bool {
         self.boot.knobs.measuring == engine::rates::Measuring::Skip
     }

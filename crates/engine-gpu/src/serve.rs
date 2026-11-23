@@ -3164,34 +3164,41 @@ impl<B: Serve> Shell<B> {
             (n, k),
             top,
         )?;
+        // Rounds again, twice more at most, while no kernel separates from
+        // every other by their spreads.
+        let mut samples = samples;
+        for _ in 0..2 {
+            if samples[0].is_empty() || crate::dense::settle_pick(&samples).is_some() {
+                break;
+            }
+            let more = B::time_kernels(
+                &self.device,
+                &self.tuning,
+                self.tier,
+                max_submit,
+                launch,
+                &kernels,
+                &pieces,
+                (n, k),
+                top,
+            )?;
+            for (s, m) in samples.iter_mut().zip(more) {
+                s.extend(m);
+            }
+        }
         for (&t, s) in kernels.iter().zip(&samples) {
             if !s.is_empty() {
                 let (ns, _) = crate::rates::median_spread(s);
                 self.alone.push(((t, n, k), top, ns));
             }
         }
-        let fastest = |s: &[f64]| s.iter().copied().fold(f64::INFINITY, f64::min);
-        let slowest = |s: &[f64]| s.iter().copied().fold(0.0, f64::max);
-        let kept_best = fastest(&samples[0]);
-        let mut taken = 0;
-        let mut best = f64::INFINITY;
-        for (i, s) in samples.iter().enumerate().skip(1) {
-            if s.is_empty() {
-                continue;
-            }
-            let (ns, _) = crate::rates::median_spread(s);
-            if slowest(s) < kept_best && ns < best {
-                taken = i;
-                best = ns;
-            }
-        }
-        let decided = !samples[0].is_empty()
-            && (taken == 0
-                || samples
-                    .iter()
-                    .enumerate()
-                    .filter(|&(i, s)| i != taken && !s.is_empty())
-                    .all(|(_, s)| slowest(&samples[taken]) < fastest(s)));
+        let pick = if samples[0].is_empty() {
+            None
+        } else {
+            crate::dense::settle_pick(&samples)
+        };
+        let taken = pick.unwrap_or(0);
+        let decided = pick.is_some();
         let weighed: Vec<String> = kernels
             .iter()
             .zip(&samples)
@@ -3209,7 +3216,11 @@ impl<B: Serve> Shell<B> {
         tracing::info!(
             "dense matmul in the served step, {bottom}-{top} rows: weighed on its widest plane \
              {n}x{k} alone at {top} rows (no whole step timed): {} ({})",
-            if taken == 0 { "kept" } else { "replaced" },
+            match pick {
+                None => "tied inside the spreads, kept",
+                Some(0) => "kept",
+                Some(_) => "replaced",
+            },
             weighed.join(" vs ")
         );
         if taken != 0 {
@@ -3455,7 +3466,10 @@ impl<B: Serve> Shell<B> {
                     // weighed whatever they pad to: every matmul kernel
                     // guards the rows it is given, so a tile past a fire's
                     // rows reads and writes none of them.
-                    if !kernels.contains(&t) && (tile(t) <= widest || paths.contains(&t)) {
+                    // Every kernel the plane supports is offered at every
+                    // range: what a neighbouring range took removes none.
+                    let _ = widest;
+                    if !kernels.contains(&t) {
                         kernels.push(t);
                     }
                 }
@@ -3598,8 +3612,13 @@ impl<B: Serve> Shell<B> {
                     let host_clock = std::cell::Cell::new(false);
                     // The GPU's clock at the range's first fire.
                     let mut clock: Option<u64> = None;
-                    // A first round warms each option, untimed.
-                    for round in 0..=ROUNDS {
+                    // A first round warms each option, untimed. Rounds go
+                    // on, as many again at most twice, while no option's
+                    // times separate from every other's by their spreads
+                    // (`crate::dense::settle_pick`).
+                    let mut limit = ROUNDS;
+                    let mut round = 0;
+                    while round <= limit {
                         for (i, option) in options.iter().enumerate() {
                             self.dense = option.clone();
                             let fired = (|| -> Result<f64> {
@@ -3680,23 +3699,21 @@ impl<B: Serve> Shell<B> {
                                 }
                             }
                         }
-                    }
-                    // An option replaces the choice where every fire of it ran
-                    // faster than every fire of the choice (their ranges
-                    // apart: no repeat's noise could turn them around); of
-                    // those, the fastest by its median.
-                    let fastest = |s: &[f64]| s.iter().copied().fold(f64::INFINITY, f64::min);
-                    let slowest = |s: &[f64]| s.iter().copied().fold(0.0, f64::max);
-                    let kept_best = fastest(&samples[0]);
-                    let mut taken = 0;
-                    let mut best = f64::INFINITY;
-                    for (i, s) in samples.iter().enumerate().skip(1) {
-                        let (ns, _) = crate::rates::median_spread(s);
-                        if slowest(s) < kept_best && ns < best {
-                            taken = i;
-                            best = ns;
+                        round += 1;
+                        if round > limit
+                            && limit < 3 * ROUNDS
+                            && crate::dense::settle_pick(&samples).is_none()
+                        {
+                            limit += ROUNDS;
                         }
                     }
+                    // The option whose times, widened by their spread, lie
+                    // under every other's widened by theirs replaces the
+                    // choice; where none separates (a tie inside the
+                    // spreads, after the further rounds) the choice stands,
+                    // recorded as tied (`crate::dense::settle_pick`).
+                    let pick = crate::dense::settle_pick(&samples);
+                    let taken = pick.unwrap_or(0);
                     let weighed: Vec<String> = options
                         .iter()
                         .zip(&samples)
@@ -3713,7 +3730,11 @@ impl<B: Serve> Shell<B> {
                     tracing::info!(
                         "dense matmul in the served step, {bottom}-{top} rows: {} ({}; timed by \
                          the {})",
-                        if taken == 0 { "kept" } else { "replaced" },
+                        match pick {
+                            None => "tied inside the spreads, kept",
+                            Some(0) => "kept",
+                            Some(_) => "replaced",
+                        },
                         weighed.join(" vs "),
                         if host_clock.get() {
                             "host's clock (the device stated no span)"
@@ -3725,12 +3746,7 @@ impl<B: Serve> Shell<B> {
                     // it, so the options tie with it or lose), or where the
                     // kernel taken ran apart from every other option too;
                     // undecided where it beat the choice but ties another.
-                    let decided = taken == 0
-                        || samples
-                            .iter()
-                            .enumerate()
-                            .filter(|&(i, _)| i != taken)
-                            .all(|(_, s)| slowest(&samples[taken]) < fastest(s));
+                    let decided = pick.is_some();
                     if let Some(range) = self.settled.last_mut() {
                         range.replaced = taken != 0;
                         range.kernel = taking.get(taken).copied().flatten();

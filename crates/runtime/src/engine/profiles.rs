@@ -538,8 +538,18 @@ fn held(
             None => profile::fire::Rates::default(),
         };
         let theirs = match committed_rates {
-            Some(Ok(file)) => Some(file.tuned.rates),
-            Some(Err(why)) => return Err(format!("the committed profile does not read: {why}")),
+            Some(Ok(file)) => {
+                for line in &file.skipped_rates {
+                    report.push(format!("dropped from the committed profile: {line}"));
+                }
+                Some(file.tuned.rates)
+            }
+            // Not one entry of it reads (each list entry is read alone, so
+            // this is the file as a whole): none carried, said by name.
+            Some(Err(why)) => {
+                report.push(format!("dropped: the committed profile does not read ({why})"));
+                None
+            }
             None => None,
         };
         if mine == profile::fire::Rates::default() && theirs.is_none() {
