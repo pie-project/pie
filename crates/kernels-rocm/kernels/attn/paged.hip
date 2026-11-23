@@ -1138,26 +1138,38 @@ __global__ __launch_bounds__(512) void paged_prefill_selected(const Paged p, con
     paged_prefill_body<D, HND, true, true, false, false>(p, sel, PrefillMask{});
 }
 
+// Whether this block's request, in a causal masked prefill, reads no bit:
+// its word not wide and its boundary at or past its keys. Its keys and cut
+// are then the unmasked causal prefill's. A word table the fire did not
+// bind reads as masked (origin 0, wide), as the masked body reads it.
+__device__ __forceinline__ bool prefill_reads_no_bit(const Paged& p, const PrefillMask& mask) {
+    int bx, kv_head;
+    prefill_item(true, bx, kv_head);
+    if (p.block_valid != nullptr && p.block_valid[bx] == 0) return false;
+    const int req = p.request_indices[bx];
+    const u32 word = mask.origin != nullptr ? mask.origin[req] : 0x80000000u;
+    return (word >> 31) == 0 && static_cast<int>(word & 0x7fffffffu) >= kv_length(p, req);
+}
+
+// A causal masked prefill is two launches over the same grid, each block
+// taken by exactly one: this one runs the requests that read no bit on the
+// unmasked body alone (its registers, so its residency), and
+// `paged_prefill_masked` the rest. Which one runs a request is its word,
+// staged each fire, so a replayed body chooses by the fire it serves.
+template <int D, bool HND>
+__global__ __launch_bounds__(512) void paged_prefill_unmasked_of(const Paged p, const PrefillMask mask) {
+    if (!prefill_reads_no_bit(p, mask)) return;
+    paged_prefill_body<D, HND, true, false, false, false>(p, PrefillSel{}, PrefillMask{});
+}
+
 // `CAUSAL`: the plan's (as the unmasked prefill's): its block order, the
 // causal tiles' longest first. Each request is still cut at its rows'
-// positions, or not, by its mask word's wide bit.
+// positions, or not, by its mask word's wide bit. A causal one leaves the
+// requests that read no bit to `paged_prefill_unmasked_of`.
 template <int D, bool HND, bool CAUSAL>
 __global__ __launch_bounds__(512) void paged_prefill_masked(const Paged p, const PrefillMask mask) {
-    // A request stating no mask (its word not wide, its boundary at or past
-    // its keys: no bit is read) is the unmasked causal prefill's: the same
-    // keys, cut at the same positions. Its block runs that body, the mask
-    // and the cut compile-time, as the unmasked prefill does; any other
-    // request runs the masked body. One body serves both kinds of lane.
     if constexpr (CAUSAL) {
-        int bx, kv_head;
-        prefill_item(CAUSAL, bx, kv_head);
-        if (p.block_valid != nullptr && p.block_valid[bx] == 0) return;
-        const int req = p.request_indices[bx];
-        const u32 word = mask.origin != nullptr ? mask.origin[req] : 0x80000000u;
-        if ((word >> 31) == 0 && static_cast<int>(word & 0x7fffffffu) >= kv_length(p, req)) {
-            paged_prefill_body<D, HND, true, false, false, false>(p, PrefillSel{}, PrefillMask{});
-            return;
-        }
+        if (prefill_reads_no_bit(p, mask)) return;
     }
     paged_prefill_body<D, HND, CAUSAL, false, true, false>(p, PrefillSel{}, mask);
 }

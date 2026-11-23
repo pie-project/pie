@@ -61,6 +61,10 @@ pub struct Metal {
     /// Where a tier copy still landing is told landed
     /// (`Engine::copy_slots_landing`).
     landed: Option<engine::LandingSink>,
+    /// Test builds: the slots the runtime gave back, poisoned before the
+    /// next verb (`Engine::poison_queue`).
+    #[cfg(feature = "test-slot-fill")]
+    poison: Option<engine::chunk::PoisonQueue>,
 }
 
 impl Metal {
@@ -93,6 +97,8 @@ impl Metal {
             adapters: BTreeMap::new(),
             live: engine::live::Live::armed(),
             landed: None,
+            #[cfg(feature = "test-slot-fill")]
+            poison: None,
         }
     }
 
@@ -126,9 +132,21 @@ impl Metal {
     }
 
     fn loaded_mut(&mut self) -> EngineResult<&mut Shell> {
-        self.shell
+        let shell = self
+            .shell
             .as_mut()
-            .ok_or_else(|| Error::Load("the metal engine has no model loaded".into()))
+            .ok_or_else(|| Error::Load("the metal engine has no model loaded".into()))?;
+        // Test builds: what the runtime gave back since the last verb is
+        // poisoned before this one touches the pool.
+        #[cfg(feature = "test-slot-fill")]
+        if let Some(queue) = &self.poison {
+            let due = std::mem::take(&mut *queue.lock().expect("the poison queue's lock"));
+            if !due.is_empty() {
+                let poisoned = shell.poison_given_back(&due);
+                tracing::trace!(target: "engine_metal::poison", due = due.len(), poisoned, "given-back slots poisoned");
+            }
+        }
+        Ok(shell)
     }
 }
 
@@ -902,6 +920,11 @@ impl Engine for Metal {
                 step.validate_captures(|word| facts.holds(word, poem_ir::Builtin::Scores))?;
             }
         }
+        // Test builds: what was given back is poisoned before any step.
+        #[cfg(feature = "test-slot-fill")]
+        if self.shell.is_some() {
+            self.loaded_mut()?;
+        }
         let id = FrameId(self.next_frame);
         self.next_frame = self.next_frame.wrapping_add(1);
         // A frame's rows are held while it is the open one: the steps of one
@@ -1129,6 +1152,11 @@ impl Engine for Metal {
         self.loaded()?
             .guest_state(program, &extents(at))
             .map_err(fault)
+    }
+
+    #[cfg(feature = "test-slot-fill")]
+    fn poison_queue(&mut self, queue: engine::chunk::PoisonQueue) {
+        self.poison = Some(queue);
     }
 
     fn rebind_slots(&mut self, rebind: engine::Rebind) -> EngineResult<()> {

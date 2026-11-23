@@ -1366,7 +1366,7 @@ fn processes_cycling_through_park_restore_and_finish_all_finish_and_give_back_al
             program: ProgramId(program),
             ..InstanceBinding::default()
         };
-        let taken = take_bind(Some(roles), engine, &binding, |_| false, Some(holder(by)), |_| true)?;
+        let taken = take_bind(Some(roles), engine, &binding, |_| false, Some(holder(by)), |_| true, |_, _| false)?;
         registrations.set(registrations.get() + 1);
         bind_taken(Some(roles), engine, &binding, Some(holder(by)), taken)
             .map(|bound| bound.id)
@@ -3537,7 +3537,7 @@ fn a_pair_a_bind_has_taken_stays_while_its_last_member_parks() {
         program: PROGRAM,
         ..InstanceBinding::default()
     };
-    let taken = take_bind(Some(&roles), &mut engine, &binding, |_| false, Some(holder(2)), |_| true)
+    let taken = take_bind(Some(&roles), &mut engine, &binding, |_| false, Some(holder(2)), |_| true, |_, _| false)
         .unwrap()
         .expect("slots taken");
     // The only member parks while the bind is on its way.
@@ -3580,7 +3580,7 @@ fn a_bind_of_a_process_not_resident_waits_for_its_restore() {
         program: PROGRAM,
         ..InstanceBinding::default()
     };
-    let error = take_bind(Some(&roles), &mut engine, &binding, |_| false, Some(holder(4)), |_| false)
+    let error = take_bind(Some(&roles), &mut engine, &binding, |_| false, Some(holder(4)), |_| false, |_, _| false)
         .expect_err("not resident: no take");
     assert!(
         matches!(short_of_wait(&error), Some(RolesError::HolderParked(by)) if *by == holder(4)),
@@ -3607,7 +3607,7 @@ fn a_bind_on_its_way_holds_its_process_s_park_until_it_lands() {
         program: PROGRAM,
         ..InstanceBinding::default()
     };
-    let taken = take_bind(Some(&roles), &mut engine, &binding, |_| false, Some(holder(2)), |_| true)
+    let taken = take_bind(Some(&roles), &mut engine, &binding, |_| false, Some(holder(2)), |_| true, |_, _| false)
         .unwrap()
         .expect("slots taken");
     assert!(roles.lock().unwrap().binds_on_way(holder(2)), "on its way");
@@ -3619,7 +3619,7 @@ fn a_bind_on_its_way_holds_its_process_s_park_until_it_lands() {
     let error = take_bind(Some(&roles), &mut engine, &binding, |_| false, Some(holder(3)), |_| {
         reads.set(reads.get() + 1);
         reads.get() == 1
-    })
+    }, |_, _| false)
     .expect_err("parked past the take");
     assert!(
         matches!(short_of_wait(&error), Some(RolesError::HolderParked(by)) if *by == holder(3)),

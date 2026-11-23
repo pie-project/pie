@@ -262,14 +262,11 @@ fn export(engine: &str, device: Option<u32>, out: &std::path::Path) -> Result<St
         .find(|b| b.name == engine)
         .ok_or_else(|| anyhow!("this build hosts no `{engine}` engine; it hosts {names:?}"))?;
     std::fs::create_dir_all(out)?;
+    let cache = crate::paths::pie_home().join("cache");
     // The bodies records first: a home whose rates all came from a committed
     // profile stores none of its own, and still records its bodies.
-    let bodies = runtime::engine::profiles::export_bodies(
-        backend,
-        &crate::paths::pie_home().join("cache"),
-        out,
-    )
-    .map_err(|e| anyhow!(e))?;
+    let bodies =
+        runtime::engine::profiles::export_bodies(backend, &cache, out).map_err(|e| anyhow!(e))?;
     let bodies = if bodies.is_empty() {
         String::new()
     } else {
@@ -281,7 +278,6 @@ fn export(engine: &str, device: Option<u32>, out: &std::path::Path) -> Result<St
         )
     };
     let dir = crate::paths::pie_home().join("profiles");
-    let cache = crate::paths::pie_home().join("cache");
     let exported = runtime::engine::profiles::export(backend, &dir, &cache, device.unwrap_or(0))
         .map_err(|e| anyhow!(e))?;
     let named = match &exported.unprobed {

@@ -2397,6 +2397,19 @@ impl RsStore {
         held
     }
 
+    /// The units every working set holds on every tier, each slot once:
+    /// one figure wherever a slot lies, so a move changes no count (what
+    /// the capacity gate counts state by, `planner::PoolPort::capacity_census`).
+    #[must_use]
+    pub fn census_units(&self) -> RsUnits {
+        let held: BTreeSet<RsSlotId> = self
+            .working_sets
+            .iter()
+            .flat_map(|(_, entry)| Self::slots(entry))
+            .collect();
+        self.units(held)
+    }
+
     fn held_within(&self, scope: &HashSet<RsWorkingSetId>) -> BTreeMap<RsSlotId, u32> {
         let mut held = BTreeMap::new();
         for entry in scope.iter().filter_map(|&ws| self.working_sets.get(ws)) {

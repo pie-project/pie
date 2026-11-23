@@ -375,6 +375,14 @@ pub trait Engine: Send {
         Ok(None)
     }
 
+    /// Test builds (`test-slot-fill`): the queue the runtime pushes the
+    /// pool's given-back byte ranges to ([`crate::chunk::PoisonQueue`]). An
+    /// engine that takes it fills them before its next verb; the default
+    /// leaves them as they are.
+    fn poison_queue(&mut self, queue: crate::chunk::PoisonQueue) {
+        let _ = queue;
+    }
+
     /// An instance's or a channel's pool slots moved: the runtime parked
     /// them on another tier and copied them back into the fresh refs
     /// `rebind` names, each shape apart. Called before the next fire that

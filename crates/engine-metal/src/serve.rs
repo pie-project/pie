@@ -2080,16 +2080,64 @@ impl Shell {
             return Ok(());
         }
         self.drain()?;
+        let before = self.pools.chunk_table();
         let mut frame = self.device.frame()?;
         self.pools.evacuate(&mut frame, evacuation)?;
         frame.commit()?;
         // Guest tables, rings and landed adapters in moved chunks: the refs
         // stand, their addresses do not.
+        let Err(refused) = self.repoint_after_move() else {
+            return Ok(());
+        };
+        // Refused past the copies (a holder whose refs this table cannot
+        // resolve): the evacuation is taken back whole, so the refusal
+        // means nothing moved (`Engine::evacuate`), the runtime takes its
+        // raise back too, and the two keep one map. Answered as half done,
+        // the runtime's map and this one parted: a later hand-out landed on
+        // bytes the engine had moved a holder onto (beamx40 on d821e8d1c, a
+        // rescore's bind over a pair; a NaN where no claim stood guard).
+        tracing::warn!(
+            %refused,
+            moves = evacuation.moves.len(),
+            "metal: an evacuation's rebind was refused; its moves are taken back"
+        );
+        let mut frame = self.device.frame()?;
+        self.pools.evacuate_back(&mut frame, evacuation, before)?;
+        frame.commit()?;
+        self.repoint_after_move().map_err(|again| {
+            Fault::program(
+                "serve::evacuate",
+                format!(
+                    "an evacuation refused ({refused}) and taken back could not repoint where its \
+                     holders lay before it ({again}): a bug"
+                ),
+            )
+        })?;
+        Err(refused)
+    }
+
+    /// Every landing, guest table, ring and lay pointed where the chunk
+    /// table puts their refs now ([`Self::evacuate`]).
+    fn repoint_after_move(&mut self) -> Result<()> {
         let landings: Vec<Landing> = self.landings.values().cloned().collect();
         for landing in &landings {
             self.point_landing(landing)?;
         }
-        self.programs.rebind(&self.pools)
+        self.programs.rebind(&self.pools)?;
+        #[cfg(feature = "fault-injection")]
+        if FAIL_NEXT_REPOINT.with(|next| next.replace(false)) {
+            return Err(Fault::program(
+                "serve::evacuate",
+                "a refusal injected by `fail_next_repoint`, past the copies and the rebind",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The logical-to-physical chunk table as the engine holds it now.
+    #[must_use]
+    pub fn chunk_table(&self) -> engine::chunk::ChunkTable {
+        self.pools.chunk_table()
     }
 
     /// Whole-slot copies a fire states (`Lane::slot_copies`), each
@@ -2212,6 +2260,17 @@ impl Shell {
     #[must_use]
     pub fn disk_chunk_bytes(&self) -> u64 {
         self.pools.disk_chunk_bytes()
+    }
+
+    /// Test builds (`test-slot-fill`): the runtime's given-back slots
+    /// poisoned before this engine's next verb ([`engine::chunk::PoisonQueue`]):
+    /// a slot is given back only once every fire that touched it retired
+    /// and every copy reading it landed, and its next owner writes nothing
+    /// before a verb of its own, so a host fill here races neither. The
+    /// ranges poisoned.
+    #[cfg(feature = "test-slot-fill")]
+    pub fn poison_given_back(&self, ranges: &[(u64, u64)]) -> usize {
+        self.pools.poison_ranges(ranges)
     }
 
     /// See `Engine::settle_copies`: the last copy's command buffer retires.
@@ -6782,4 +6841,19 @@ fn pooled<T>(f: impl FnOnce() -> T) -> T {
 #[cfg(not(target_vendor = "apple"))]
 fn pooled<T>(f: impl FnOnce() -> T) -> T {
     f()
+}
+
+#[cfg(feature = "fault-injection")]
+thread_local! {
+    static FAIL_NEXT_REPOINT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The next evacuation on this thread is refused past its copies and its
+/// rebind, as a holder whose refs the moved table cannot resolve refuses
+/// it: what `Shell::evacuate` must take back whole. A test seam only,
+/// compiled under the `fault-injection` feature, as
+/// [`crate::device::ctx::fail_next_frame`].
+#[cfg(feature = "fault-injection")]
+pub fn fail_next_repoint() {
+    FAIL_NEXT_REPOINT.with(|next| next.set(true));
 }

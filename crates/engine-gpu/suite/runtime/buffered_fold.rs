@@ -15,6 +15,19 @@
 //! and CUDA's bar): a fold that took rows it should not have moves the state
 //! by about that distance, rounding carried through the layers by a small
 //! fraction of it. Integer planes (the id window) are exact.
+//!
+//! A lane's logits answer what the fold's answer, its rows fired as the
+//! lane fired them, within one bf16 gap of each logit (the rounding of a
+//! value the head reads) and what the fold's own logits move by when the
+//! same rows are fired in another composition (the claim's: a fold of the
+//! window in one fire, a lane alone): a reference computed both ways. A
+//! fire's dense kernel is its rung's (`engine_gpu::dense`: a vector kernel
+//! to a few rows, a tiled one past them, picked by measured rates), and
+//! kernels of other rungs accumulate in other orders, so the same rows
+//! folded in one fire of nine and in fires of six, one and two answer apart
+//! by what those orders carry through the layers (a few hundredths of a
+//! logit on qwen35-tiny), however the junk row is handled. A claim whose
+//! fold fires its rows one way only states no such spread.
 
 use engine::fire::{FoldLen, RsReset, RsVerb};
 use engine_gpu::store::layout::FIXED;
@@ -26,9 +39,6 @@ const WINDOW: usize = 6;
 
 /// The discard rounds of claim 9.
 const ROUNDS: u32 = 8;
-
-/// Two lanes' logits within this of each other answer the same.
-const LOGIT_FLOOR: f32 = 0.05;
 
 /// A state row as the record lays it: its name, its bytes, and whether it
 /// holds integers (the n-gram id window) rather than f32 (this shell keeps
@@ -264,6 +274,50 @@ fn spread(a: &[f32], b: &[f32]) -> f32 {
         .fold(0.0f32, f32::max)
 }
 
+/// The gap between `x` and the next bf16 away from zero: what one rounding
+/// of a bf16 value moves it by.
+fn bf16_gap(x: f32) -> f32 {
+    let exponent = ((x.abs().to_bits() >> 23) & 0xff) as i32 - 127;
+    2f32.powi(exponent.max(-126) - 7)
+}
+
+/// `got` answers what the fold answers, `want`: each logit within one bf16
+/// gap of the larger of the two, and the spread of the fold's own logits
+/// between `want` and `other`, the same rows folded in another composition
+/// (`want` itself where the lane and the fold fire their rows alike).
+fn assert_answers(got: &[f32], want: &[f32], other: &[f32], what: &str) {
+    assert_eq!(got.len(), want.len(), "{what}: one vocabulary");
+    assert_eq!(other.len(), want.len(), "{what}: one vocabulary");
+    // The logit nearest its room: (index, apart, room).
+    let mut nearest = (0usize, 0f32, f32::INFINITY);
+    for (at, ((&g, &w), &o)) in got.iter().zip(want).zip(other).enumerate() {
+        assert!(g.is_finite() && w.is_finite() && o.is_finite(), "{what}: logit {at} is not finite");
+        let room = bf16_gap(g.abs().max(w.abs())) + (w - o).abs();
+        let apart = (g - w).abs();
+        if apart > 0.0 && apart / room > nearest.1 / nearest.2 {
+            nearest = (at, apart, room);
+        }
+    }
+    let (at, apart, room) = nearest;
+    eprintln!(
+        "{what}: logit spread {:.4}, the fold's own two ways {:.4}; nearest its room: logit {at} \
+         {apart:.4} apart of {room:.4} ({:.2} of it); argmax {} vs {}",
+        spread(got, want),
+        spread(want, other),
+        apart / room,
+        argmax(got),
+        argmax(want)
+    );
+    assert!(
+        apart <= room,
+        "{what}: logit {at} answers {apart} apart ({} against {}), past its room {room}: one bf16 \
+         gap of the two and the fold's own {} between its two compositions",
+        got[at],
+        want[at],
+        (want[at] - other[at]).abs()
+    );
+}
+
 /// qwen38-flash-next-micro has a projection of one column, which WGSL does
 /// not land (`crate::gpu::lands`: an output pair is one bf16 word), so on
 /// wgpu the miniature does not serve and the contract is SPIR-V's here.
@@ -317,9 +371,12 @@ fn holds_the_contract(mut m: Model, name: &str) {
         &zeroed,
         &format!("{name} claim 1: a `RsVerb::Buffer` fire perturbed the state"),
     );
-    let d = spread(&reference, &buffered);
-    eprintln!("{name} claim 1: buffered window vs folding window, logit spread {d:.4}");
-    assert!(d <= LOGIT_FLOOR, "a buffered fire answers other logits than its fold: {d}");
+    assert_answers(
+        &buffered,
+        &reference,
+        &reference,
+        &format!("{name} claim 1: a buffered window against the folding window"),
+    );
 
     // Claim 3: a replay truncated at j is a fold of j.
     let second = window(101);
@@ -354,9 +411,12 @@ fn holds_the_contract(mut m: Model, name: &str) {
         &format!("{name} claim 4: the mixed row against a fold of {j}"),
         scale,
     );
-    let d = spread(&reference, &mixed);
-    eprintln!("{name} claim 4: mixed row vs folding window, logit spread {d:.4}");
-    assert!(d <= LOGIT_FLOOR, "the mixed row answers other logits than the fold: {d}");
+    assert_answers(
+        &mixed,
+        &reference,
+        &reference,
+        &format!("{name} claim 4: the mixed row against the folding window"),
+    );
 
     // Claim 5: a replay of A ahead of B is Fold(A), and B reads as after it.
     m.open(2);
@@ -373,19 +433,24 @@ fn holds_the_contract(mut m: Model, name: &str) {
     m.open(3);
     m.one(3, &tokens, &fold, fresh, 0);
     let plain = m.one(3, &second, &fold, held, k);
-    let d = spread(&plain, &round);
-    eprintln!(
-        "{name} claim 5: B after replay(A) vs B after fold(A), logit spread {d:.4}; argmax {} vs {}",
-        argmax(&round),
-        argmax(&plain)
+    assert_answers(
+        &round,
+        &plain,
+        &plain,
+        &format!("{name} claim 5: B after replay(A) against B after Fold(A)"),
     );
-    assert!(d <= LOGIT_FLOOR, "B after the replay answers other logits: {d}");
 
-    // Claim 6: a folding lane beside a buffering one answers as alone.
+    // Claim 6: a folding lane beside a buffering one answers as beside a
+    // folding one, and as alone: its rows fired beside a peer's are a fire
+    // of twice the rows, which a rung's kernel past the alone fire's may
+    // serve, so alone is the fold's other way.
     let third = window(203);
     m.open(3);
     let alone = m.one(3, &third, &fold, fresh, 0);
     let alone_state = m.state(3);
+    m.open(3);
+    m.open(1);
+    let paired = m.fire(&[(3, &third, &fold, fresh, 0), (1, &tokens, &fold, fresh, 0)]);
     m.open(3);
     m.open(1);
     let beside = m.fire(&[(3, &third, &fold, fresh, 0), (1, &tokens, &a, fresh, 0)]);
@@ -398,9 +463,12 @@ fn holds_the_contract(mut m: Model, name: &str) {
     );
     let state = m.state(1);
     m.assert_untouched(&state, &zeroed, &format!("{name} claim 6: the buffering peer folded"));
-    let d = spread(&alone, &beside[0]);
-    eprintln!("{name} claim 6: folding lane beside a buffering peer, logit spread {d:.4}");
-    assert!(d <= LOGIT_FLOOR, "a folding lane answers differently beside a buffer: {d}");
+    assert_answers(
+        &beside[0],
+        &paired[0],
+        &alone,
+        &format!("{name} claim 6: a folding lane beside a buffering peer against a folding one"),
+    );
 
     // Claim 9: rounds of a two-row window whose second row is rejected: each
     // round's fold keeps the survivor of the round before, and the state is
@@ -420,18 +488,27 @@ fn holds_the_contract(mut m: Model, name: &str) {
             m.buffer_over(reach, k + r - 1, 1)
         };
         let win = m.one(0, &rows, &verb, held, k + r);
+        // The fold two ways: fired as the window's lane fired its rows (the
+        // window, each survivor before this round's in a fire of its own,
+        // then the round's two rows); and the window and the survivors
+        // folded in one fire, the junk row alone after them.
         let mut prefix = tokens.clone();
         prefix.extend_from_slice(&steps[..=r as usize]);
         m.open(3);
         m.one(3, &prefix, &fold, fresh, 0);
         let ref1 = m.one(3, &[junk], &fold, held, prefix.len() as u32);
-        let d = spread(&win, &ref1);
-        eprintln!(
-            "{name} claim 9: round {r} junk-row logits vs a one-row fold {d:.4} (argmax {} vs {})",
-            argmax(&win),
-            argmax(&ref1)
+        m.open(3);
+        m.one(3, &tokens, &fold, fresh, 0);
+        for i in 0..r {
+            m.one(3, &steps[i as usize..=i as usize], &fold, held, k + i);
+        }
+        let ref2 = m.one(3, &rows, &fold, held, k + r);
+        assert_answers(
+            &win,
+            &ref2,
+            &ref1,
+            &format!("{name} claim 9: round {r}, the window's junk row against its fold"),
         );
-        assert!(d <= LOGIT_FLOOR, "round {r}: the window's junk row answers {d} apart");
         if r > 0 {
             m.one(2, &steps[r as usize - 1..r as usize], &fold, held, k + r - 1);
             let (got, want) = (m.state(0), m.state(2));

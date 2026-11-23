@@ -24,6 +24,13 @@ struct Seating {
     open: Option<(u32, u32)>,
 }
 
+/// An evacuation prepared ([`Chunks::prepare_evacuation`]): its copies and
+/// the table after.
+pub struct Evacuated {
+    table: ChunkTable,
+    spans: Vec<(u64, u64, usize)>,
+}
+
 #[derive(Debug)]
 pub struct Chunks {
     range: Range,
@@ -897,15 +904,11 @@ impl Chunks {
         Ok(())
     }
 
-    /// Moves each logical chunk of `evacuation` onto its new physical chunk:
-    /// the bytes in one batched copy on `stream`, then the table, so every
-    /// fire enqueued after reads the chunk where it now lies. The runtime
-    /// names only free physical chunks as destinations.
-    pub fn evacuate(
-        &mut self,
-        stream: *mut core::ffi::c_void,
-        evacuation: &Evacuation,
-    ) -> Result<()> {
+    /// What moving each logical chunk of `evacuation` onto its new physical
+    /// chunk takes: the copies, and the table as it stands after. Nothing
+    /// moves; every check an evacuation makes of the pool is made here.
+    /// The runtime names only free physical chunks as destinations.
+    pub fn prepare_evacuation(&self, evacuation: &Evacuation) -> Result<Evacuated> {
         let chunk = self.layout.chunk_bytes;
         let mut spans = Vec::with_capacity(evacuation.moves.len());
         for &(logical, to) in &evacuation.moves {
@@ -927,8 +930,26 @@ impl Chunks {
         table
             .apply(evacuation)
             .map_err(|why| Fault::program("store::chunks", why.to_string()))?;
-        crate::device::copy_batch_d2d(stream, &spans)?;
-        self.table = table;
+        Ok(Evacuated { table, spans })
+    }
+
+    /// Swaps the table for the one `evacuated` leaves: twice, a dry run of
+    /// what reads it ([`crate::store::Pools::as_if`]).
+    pub fn swap_table(&mut self, evacuated: &mut Evacuated) {
+        std::mem::swap(&mut self.table, &mut evacuated.table);
+    }
+
+    /// Moves the chunks `evacuated` names: the bytes in one batched copy on
+    /// `stream`, then the table, so every fire enqueued after reads each
+    /// chunk where it now lies. A copy that cannot be enqueued leaves the
+    /// table as it was (what it wrote lies in free chunks).
+    pub fn evacuate(
+        &mut self,
+        stream: *mut core::ffi::c_void,
+        evacuated: Evacuated,
+    ) -> Result<()> {
+        crate::device::copy_batch_d2d(stream, &evacuated.spans)?;
+        self.table = evacuated.table;
         Ok(())
     }
 

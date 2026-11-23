@@ -193,9 +193,44 @@ impl Shell {
     /// See `Engine::evacuate`: the copy and the table change are ordered on
     /// the stream behind every fire enqueued so far and before the next.
     pub fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> crate::Result<()> {
-        self.pools.evacuate(self.device.stream(), evacuation)?;
-        // A guest's rings bind their slots' chunks by place.
-        self.rebase_programs()
+        self.evacuate_with(evacuation, &[]).map(drop)
+    }
+
+    /// [`Self::evacuate`], all or nothing: every check it makes (the table
+    /// it leaves, each guest's state where it then lies and its claims
+    /// there, each channel span of `channels`, `(slots, bytes)`) is made
+    /// before anything moves, and an `Err` leaves the pool, the claims and
+    /// every ring as they were. Past the copy's enqueue nothing fails but
+    /// the device. Answers each channel's address after.
+    pub fn evacuate_with(
+        &mut self,
+        evacuation: &engine::chunk::Evacuation,
+        channels: &[(Vec<u32>, u64)],
+    ) -> crate::Result<Vec<u64>> {
+        let stream = self.device.stream();
+        self.pools.fence_all_swaps(stream)?;
+        let mut evacuated = self.pools.prepare_evacuation(evacuation)?;
+        let programs = &self.programs;
+        let (rebase, at) = self.pools.as_if(&mut evacuated, |pools| {
+            // A guest's rings bind their slots' chunks by place.
+            let rebase = programs.plan_rebase(&|item, bytes| pools.guest_item(item, bytes))?;
+            let at = channels
+                .iter()
+                .map(|(slots, bytes)| {
+                    pools.guest_span(engine::chunk::SlotRole::Channel, slots, *bytes)
+                })
+                .collect::<crate::Result<Vec<u64>>>()?;
+            crate::Result::Ok((rebase, at))
+        })?;
+        let before = self.programs.claim_rebase(&rebase)?;
+        if let Err(fault) = self.pools.move_chunks(stream, evacuated) {
+            self.programs.unclaim_rebase(before);
+            return Err(fault);
+        }
+        drop(before);
+        self.programs.apply_rebase(rebase);
+        self.pools.restage_after_move(stream)?;
+        Ok(at)
     }
 
     /// The state pool as the runtime counts it

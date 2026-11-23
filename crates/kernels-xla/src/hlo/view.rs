@@ -1221,14 +1221,88 @@ impl Func {
             let s = self.clamp_to(s, od[a] - sizes[a])?;
             starts.push((a, s));
         }
-        let Some(pool) = self.write_block(view, &od, &starts, valid, ups, batch, len, unique)?
-        else {
+        if let Some(pool) = self.write_block(view, &od, &starts, valid, ups, batch, len, unique)? {
+            return Ok(Some(
+                self.pool_view_ordered(pool, view.elem, &od, view.order)?,
+            ));
+        }
+        // One update that lies in part of a view's rows (a 128-wide bf16
+        // row of a 256-wide view): the whole rows it lies in read, the
+        // update spliced into them, and the rows written back, each an
+        // aligned block of the view. Else a copy of the pool a write (v6e
+        // GLM-5 next miniature: 20 GiB of views a fire).
+        // Several updates land one after another, a loop over them (one
+        // splice in the program whatever their count; a scatter's repeated
+        // index is unordered, so in order is one of its answers).
+        if od.len() < 2 {
             return Ok(None);
-        };
-        let dims = od;
-        Ok(Some(
-            self.pool_view_ordered(pool, view.elem, &dims, view.order)?,
-        ))
+        }
+        let last = od.len() - 1;
+        let mut whole = sizes.clone();
+        whole[last] = od[last];
+        // each axis's start a vector over the updates (0 where it is not
+        // scattered)
+        let mut axis_starts = Vec::with_capacity(od.len());
+        for a in 0..od.len() {
+            axis_starts.push(starts.iter().find(|(axis, _)| *axis == a).map(|&(_, s)| s));
+        }
+        let n = self.const_i(Elem::I32, batch, &[]);
+        let i0 = self.const_i(Elem::I32, 0, &[]);
+        let declined = std::cell::Cell::new(false);
+        let out = self.while_loop(
+            &[i0, operand],
+            |f, a| f.compare(Cmp::Lt, a[0], n),
+            |f, a| {
+                let (i, cur) = (a[0], a[1]);
+                let zero = f.const_i(Elem::I32, 0, &[]);
+                let pick = |f: &mut Self, v: Val| -> Built<Val> {
+                    let one = f.dynamic_slice(v, &[i], &[1])?;
+                    f.reshape(one, &[])
+                };
+                let mut rows_at = Vec::with_capacity(od.len());
+                let mut col = zero;
+                for (ax, s) in axis_starts.iter().enumerate() {
+                    let s = match s {
+                        Some(s) => pick(f, *s)?,
+                        None => zero,
+                    };
+                    if ax == last {
+                        col = s;
+                        rows_at.push(zero);
+                    } else {
+                        rows_at.push(s);
+                    }
+                }
+                let one = f.const_i(Elem::I32, 1, &[]);
+                let next_i = f.add(i, one)?;
+                let Some(rows) = f.view_slice_at(cur, &rows_at, &whole)? else {
+                    declined.set(true);
+                    return Ok(vec![next_i, cur]);
+                };
+                let block = f.dynamic_slice(ups, &[i, zero], &[1, len])?;
+                let block = f.reshape(block, &sizes)?;
+                let mut splice_at = vec![zero; od.len()];
+                splice_at[last] = col;
+                let spliced = f.dynamic_update_slice(rows, block, &splice_at)?;
+                let spliced = match valid {
+                    Some(ok) => {
+                        let ok = pick(f, ok)?;
+                        let ok = f.broadcast(ok, &whole, &[])?;
+                        f.select(ok, spliced, rows)?
+                    }
+                    None => spliced,
+                };
+                let Some(next) = f.view_update_at(cur, spliced, &rows_at)? else {
+                    declined.set(true);
+                    return Ok(vec![next_i, cur]);
+                };
+                Ok(vec![next_i, next])
+            },
+        )?;
+        if declined.get() {
+            return Ok(None);
+        }
+        Ok(Some(out[1]))
     }
 
     /// `dynamic_update_slice` onto a view. `None` where it has no rewrite.

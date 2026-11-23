@@ -672,6 +672,20 @@ impl ResidencyPlanner {
                  {placement:?}, plan {plan}"
             );
         }
+        // A victim whose move found the tier below full waits for the pool
+        // to move, and with nothing in flight nothing moves it: it goes
+        // again in the forced pass (the simulation's seed 431: the one
+        // resident with pages to move, its move refused while the disk tier
+        // stood full a step, kept out with nothing else moving and the
+        // finisher's one page unserved). Lifted once a stall, as the stall
+        // is said. One whose move found nothing to move finds nothing again
+        // on the same pool: it stays out.
+        self.with_inner(|inner| {
+            inner.host_swap_blocked.clear();
+            if inner.prepare_blocked.is_empty() {
+                inner.blocked_at = None;
+            }
+        });
         self.force_moves.store(true, Ordering::Release);
         self.events.fetch_add(1, Ordering::AcqRel);
         if let Some(notify) = self.returns.drain.get() {
@@ -742,6 +756,14 @@ impl ResidencyPlanner {
                 return None;
             };
             let pid = waiter.pid;
+            // The capacity gate's finisher is never passed over: the heads
+            // behind it (others' restores) took the room its moves made,
+            // kept something in flight, and two of them went round, each
+            // restored and evicted for the other 125 times while its bind
+            // waited (the field mix, seed 178).
+            if inner.is_finisher(pid) {
+                return None;
+            }
             (inner.nothing_in_flight()
                 && inner.parked_moving.is_empty()
                 && !inner.queue.values().any(Waiter::rise_untaken)
@@ -765,6 +787,10 @@ impl ResidencyPlanner {
         // pass: what it asks past its kv stands.
         let mut room_stood: Option<EntryKey> = None;
         loop {
+            // The capacity gate as this step reads it: a waiter it holds is
+            // no head ([`super::inner::CapacityGate`]).
+            let order = self.capacity_order();
+            self.with_inner(|inner| inner.set_capacity(order));
             // Each step reads the head's need afresh (the cache spans one
             // step's reads: its own, the map's, the eviction's).
             *self.need_cache.lock() = None;
@@ -778,6 +804,13 @@ impl ResidencyPlanner {
                 // again.
                 if inner.queue.values().any(Waiter::rise_untaken) {
                     return Step::Done("a rung raise served and not yet taken holds the queue");
+                }
+                // A list compaction moves pages of the processes it names,
+                // running and parked: nothing is served or moved until it
+                // lands (a restore of one, a move of its parked state), and
+                // its landing plans again.
+                if inner.relocating.is_some() {
+                    return Step::Done("a list compaction is on its way");
                 }
                 let Some((key, waiter)) = inner.unmet_head() else {
                     if inner.accum.len() > 0 && inner.queue.is_empty() {
@@ -829,7 +862,9 @@ impl ResidencyPlanner {
                 if missing > 0 {
                     return Step::Absorb {
                         count: missing,
-                        fund_by_eviction: !is_restore || inner.nothing_in_flight(),
+                        fund_by_eviction: !is_restore
+                            || inner.nothing_in_flight()
+                            || inner.is_finisher(pid),
                     };
                 }
                 // rs slots are taken whole when the head is served; a short
@@ -840,7 +875,9 @@ impl ResidencyPlanner {
                     return Step::ShortRs {
                         need: seated.sub(rs_free),
                         ask: seated,
-                        fund_by_eviction: !is_restore || inner.nothing_in_flight(),
+                        fund_by_eviction: !is_restore
+                            || inner.nothing_in_flight()
+                            || inner.is_finisher(pid),
                         surplus: (inner.accum.len() as u32).saturating_sub(waiter.kv_need()),
                     };
                 }

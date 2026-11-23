@@ -1058,13 +1058,6 @@ impl Shell {
         self.pools.guest_footprint(role, bytes)
     }
 
-    /// Points every instance's rings at where their pool slots lie now.
-    pub fn rebase_programs(&mut self) -> Result<()> {
-        let pools = &self.pools;
-        self.programs
-            .rebase(&|item, bytes| pools.guest_item(item, bytes))
-    }
-
     /// Instance `id`'s process parked (`engine::Rebind::Parked`).
     pub fn park_program(&mut self, id: engine::InstanceId, kept: bool) -> Result<()> {
         let pools = &self.pools;

@@ -474,6 +474,133 @@ impl Device {
         Ok(program)
     }
 
+    /// The disk cache's name for the program compiled from `text` (its
+    /// file under the cache dir), if the device keeps a disk cache.
+    pub fn cached_name(&self, text: &str) -> Option<String> {
+        let client = self.client().ok()?;
+        let file = self.cache_file(client, text)?;
+        file.file_name()?.to_str().map(str::to_string)
+    }
+
+    /// Whether the disk cache holds the program `code` names.
+    pub fn code_on_disk(&self, code: &Code) -> bool {
+        match code {
+            Code::Text(text) => self.on_disk(text),
+            Code::Cached { name, .. } => self
+                .disk
+                .as_ref()
+                .is_some_and(|dir| dir.join(name).exists()),
+        }
+    }
+
+    /// [`Device::prepare`] of `code`: a cached one loads by its name, never
+    /// compiled; `None` where its file is gone.
+    pub fn prepare_code(&self, code: &Code, sig: Signature) -> Result<Option<Arc<Program>>> {
+        match code {
+            Code::Text(text) => self.prepare(text, sig).map(Some),
+            Code::Cached { hash, name, len } => self.load_named(hash, name, *len, sig, false),
+        }
+    }
+
+    /// [`Device::load_parked`] of `code`.
+    pub fn load_parked_code(&self, code: &Code, sig: Signature) -> Result<Option<Arc<Program>>> {
+        match code {
+            Code::Text(text) => self.load_parked(text, sig),
+            Code::Cached { hash, name, len } => self.load_named(hash, name, *len, sig, true),
+        }
+    }
+
+    /// [`Device::forget`] of `code`.
+    pub fn forget_code(&self, code: &Code) {
+        self.forget_key(&code.hash());
+    }
+
+    /// The program the disk cache holds under `name` (its text `hash`,
+    /// `len` bytes long), loaded and held in memory; `None` where the file
+    /// is gone or unreadable. `parked`: the first fire of its shape loads it.
+    fn load_named(
+        &self,
+        hash: &[u8; 32],
+        name: &str,
+        len: usize,
+        sig: Signature,
+        parked: bool,
+    ) -> Result<Option<Arc<Program>>> {
+        if let Some(hit) = self.cache.lock().expect("cache lock poisoned").get(hash) {
+            return Ok(Some(Arc::clone(hit)));
+        }
+        let Some(dir) = self.disk.as_ref() else {
+            return Ok(None);
+        };
+        let client = self.client()?;
+        let started = std::time::Instant::now();
+        let file = dir.join(name);
+        let Some(exe) = std::fs::read(&file)
+            .ok()
+            .and_then(unpacked)
+            .and_then(|bytes| client.deserialize(&bytes).ok())
+        else {
+            return Ok(None);
+        };
+        touch(&file);
+        self.keep(&file);
+        if parked && let Some(live) = self.live.get() {
+            live.tally(engine::live::Tally::LoadedInFire, 1);
+        }
+        tracing::debug!(
+            bytes = len,
+            ms = started.elapsed().as_millis() as u64,
+            "xla loaded a cached program by its traced key"
+        );
+        let memory = exe.compiled_memory().unwrap_or_default();
+        self.temp_max
+            .fetch_max(memory.temp, std::sync::atomic::Ordering::Relaxed);
+        let program = Arc::new(Program {
+            exe: Some(exe),
+            sig,
+            text_bytes: len,
+            memory,
+        });
+        self.cache
+            .lock()
+            .expect("cache lock poisoned")
+            .insert(*hash, Arc::clone(&program));
+        Ok(Some(program))
+    }
+
+    /// Where the traced fires' records of a load whose tracing inputs hash
+    /// to `scope` lie: under the disk cache, a folder a scope.
+    fn traces_dir(&self, scope: &str) -> Option<PathBuf> {
+        Some(self.disk.as_ref()?.join("traces").join(scope))
+    }
+
+    /// The folder `scope`'s records lie in, if the device keeps a disk cache.
+    #[must_use]
+    pub fn trace_records_dir(&self, scope: &str) -> Option<PathBuf> {
+        self.traces_dir(scope)
+    }
+
+    /// The record kept under fire `key` in `scope`, if one was kept.
+    pub fn trace_record(&self, scope: &str, key: &[u8; 32]) -> Option<Vec<u8>> {
+        let dir = self.traces_dir(scope)?;
+        std::fs::read(dir.join(hex(key))).ok()
+    }
+
+    /// Keeps `record` under fire `key` in `scope` for later loads.
+    pub fn keep_trace_record(&self, scope: &str, key: &[u8; 32], record: &[u8]) {
+        let Some(dir) = self.traces_dir(scope) else {
+            return;
+        };
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let file = dir.join(hex(key));
+        let tmp = file.with_extension(format!("tmp.{}", std::process::id()));
+        if std::fs::write(&tmp, record).is_ok() {
+            let _ = std::fs::rename(&tmp, &file);
+        }
+    }
+
     /// Where the disk cache keeps the program compiled from `text` for this
     /// client's PJRT plugin and chip, if it keeps one.
     fn cache_file(&self, client: &Client, text: &str) -> Option<PathBuf> {
@@ -1021,10 +1148,11 @@ impl HostRoom {
         resident_bytes().map_or(0, |r| r.saturating_sub(self.base))
     }
 
-    /// Admits a load of `text`, waiting while those under way leave it no
-    /// room; `None` when it does not fit with none under way.
-    pub(crate) fn take(&self, text: &str) -> Option<Reserved> {
-        let len = text.len() as u64;
+    /// Admits a load of a program of `text_len` bytes of text, waiting
+    /// while those under way leave it no room; `None` when it does not fit
+    /// with none under way.
+    pub(crate) fn take(&self, text_len: usize) -> Option<Reserved> {
+        let len = text_len as u64;
         let mut st = self.state.lock().expect("the host room's lock poisoned");
         loop {
             let hold = (st.per_kib > 0).then(|| st.per_kib.saturating_mul(len) / 1024);
@@ -1152,4 +1280,49 @@ impl Drop for Admitted<'_> {
         *self.by.running.lock().expect("the compile admission lock poisoned") -= self.need;
         self.by.ended.notify_all();
     }
+}
+
+/// A program's source: its text, or the disk cache's copy of it named by
+/// a traced fire's record (the text never built).
+#[derive(Clone, Debug)]
+pub enum Code {
+    Text(String),
+    Cached {
+        /// blake3 of the text (the in-memory cache's key).
+        hash: [u8; 32],
+        /// The disk cache's file name.
+        name: String,
+        /// The text's length.
+        len: usize,
+    },
+}
+
+impl Code {
+    #[must_use]
+    pub fn hash(&self) -> [u8; 32] {
+        match self {
+            Code::Text(text) => *blake3::hash(text.as_bytes()).as_bytes(),
+            Code::Cached { hash, .. } => *hash,
+        }
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            Code::Text(text) => text.len(),
+            Code::Cached { len, .. } => *len,
+        }
+    }
+
+    #[must_use]
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Code::Text(text) => Some(text),
+            Code::Cached { .. } => None,
+        }
+    }
+}
+
+fn hex(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

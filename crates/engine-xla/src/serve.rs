@@ -253,7 +253,7 @@ fn no_disk() -> Fault {
 /// A warm program the load compiled and parked in the disk cache (the host
 /// held no more in memory): what the first fire of its shape loads it from.
 pub(crate) struct Parked {
-    text: String,
+    code: crate::device::Code,
     sig: crate::trace::Signature,
     probed: Vec<ValueId>,
 }
@@ -261,7 +261,20 @@ pub(crate) struct Parked {
 pub(crate) struct Deferred {
     key: [u8; 32],
     shape_key: Option<[u8; 32]>,
-    text: String,
+    code: crate::device::Code,
+    sig: crate::trace::Signature,
+    probed: Vec<ValueId>,
+}
+
+/// What a ladder fire's key traced to, kept for this build's later loads
+/// (`Device::trace_record`): its program's text hash, disk cache name and
+/// length, signature and probed values. A load whose fire finds its record
+/// and its program on disk builds no text.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TraceRecord {
+    hash: [u8; 32],
+    name: String,
+    len: usize,
     sig: crate::trace::Signature,
     probed: Vec<ValueId>,
 }
@@ -339,6 +352,16 @@ pub struct Shell {
     /// program which of them its trailing outputs hold.
     probes: Vec<ValueId>,
     probed: std::collections::HashMap<[u8; 32], Vec<ValueId>>,
+    /// The scope this load's traced fires' records lie in (`trace_scope`),
+    /// set as the warm ladder starts; `None`: none kept or read.
+    trace_scope: Option<String>,
+    /// Whether this load's first record was checked against its trace (a
+    /// record traced again and its text's hash compared), and whether the
+    /// records still hold: a parted one stops their use for the load.
+    record_checked: bool,
+    records_hold: bool,
+    /// The fires this load took from records, building no text.
+    records_used: u64,
     /// Programs by the fire shape that traced them: a fire whose shape was
     /// seen skips the walk and runs what the first one compiled.
     traced: std::collections::HashMap<[u8; 32], std::sync::Arc<crate::device::Program>>,
@@ -1183,6 +1206,10 @@ impl Shell {
             token_feeds: Vec::new(),
             probes: Vec::new(),
             probed: std::collections::HashMap::new(),
+            trace_scope: None,
+            record_checked: false,
+            records_hold: true,
+            records_used: 0,
             traced: std::collections::HashMap::new(),
             shaped: std::collections::HashMap::new(),
             parked: std::collections::HashMap::new(),
@@ -1774,7 +1801,7 @@ impl Shell {
         let Some(parked) = self.parked.remove(&at) else {
             return Ok(None);
         };
-        let Some(program) = self.device.load_parked(&parked.text, parked.sig)? else {
+        let Some(program) = self.device.load_parked_code(&parked.code, parked.sig)? else {
             return Err(Fault::Program {
                 at: "serve::ladder",
                 why: "a program the warm ladder parked in the disk cache is gone from it: the \
@@ -3134,25 +3161,87 @@ impl Shell {
         // a miss, which every path below that reads it is, keyed it
         let missed = |key: Option<[u8; 32]>| key.expect("a missed fire's key");
         if found.is_none() && self.deferred.is_some() {
-            let (text, sig, probed) = self.trace_text(
-                &slots,
-                &caches,
-                bindings,
-                &windows,
-                &descriptor,
-                readout_t,
-                readout_rows.len() as i64,
-                &planes,
-                rs_seat,
-                self.pools.stage_at(inputs.rows()),
-                &lands,
-                pixels_seat.as_ref(),
-            )?;
+            // A fire this build traced before, its program on disk: the
+            // record names it, and no text is built (a warm load's tracing
+            // was most of its time: dense Qwen3-0.6B, 67 of 105 s).
+            let full = missed(key);
+            // Records are read while they hold, and kept whatever: a load
+            // whose record parted rewrites the scope's records as it traces.
+            let scope = self.trace_scope.clone();
+            let recorded = scope
+                .as_deref()
+                .filter(|_| self.records_hold)
+                .and_then(|scope| self.device.trace_record(scope, &full))
+                .and_then(|bytes| serde_json::from_slice::<TraceRecord>(&bytes).ok())
+                .map(|r| {
+                    let code = crate::device::Code::Cached {
+                        hash: r.hash,
+                        name: r.name,
+                        len: r.len,
+                    };
+                    (code, r.sig, r.probed)
+                })
+                .filter(|(code, ..)| self.device.code_on_disk(code));
+            // The load's first record is traced again and checked: the
+            // scope's hash must cover all a program's text depends on, and a
+            // record its text parts from stops the records for this load.
+            let check = recorded.is_some() && !self.record_checked;
+            let recorded_hash = recorded.as_ref().map(|(code, ..)| code.hash());
+            let (code, sig, probed) = match recorded.filter(|_| !check) {
+                Some(found) => {
+                    self.records_used += 1;
+                    found
+                }
+                None => {
+                    let (text, sig, probed) = self.trace_text(
+                        &slots,
+                        &caches,
+                        bindings,
+                        &windows,
+                        &descriptor,
+                        readout_t,
+                        readout_rows.len() as i64,
+                        &planes,
+                        rs_seat,
+                        self.pools.stage_at(inputs.rows()),
+                        &lands,
+                        pixels_seat.as_ref(),
+                    )?;
+                    if check {
+                        self.record_checked = true;
+                        let hash = *blake3::hash(text.as_bytes()).as_bytes();
+                        if recorded_hash.is_some_and(|h| h != hash) {
+                            self.records_hold = false;
+                            tracing::warn!(
+                                scope = scope.as_deref().unwrap_or_default(),
+                                "xla traced-fire record parts from its fire's trace: this load \
+                                 traces every fire in full and rewrites the scope's records (the \
+                                 scope misses an input of the tracer, or a record is stale)"
+                            );
+                        }
+                    }
+                    if let (Some(scope), Some(name)) =
+                        (scope.as_deref(), self.device.cached_name(&text))
+                    {
+                        let record = TraceRecord {
+                            hash: *blake3::hash(text.as_bytes()).as_bytes(),
+                            name,
+                            len: text.len(),
+                            sig: sig.clone(),
+                            probed: probed.clone(),
+                        };
+                        if let Ok(bytes) = serde_json::to_vec(&record) {
+                            self.device.keep_trace_record(scope, &full, &bytes);
+                        }
+                    }
+                    (crate::device::Code::Text(text), sig, probed)
+                }
+            };
             if let Some(deferred) = self.deferred.as_mut() {
                 deferred.push(Deferred {
-                    key: missed(key),
+                    key: full,
                     shape_key,
-                    text,
+                    code,
                     sig,
                     probed,
                 });
@@ -4748,5 +4837,75 @@ impl Shell {
             fnv(format!("{:?}|{:?}", self.tpu, self.pad).as_bytes()),
             fnv(flags.as_bytes()),
         )
+    }
+}
+
+/// The version of the traced-fire records' method: a change to what a
+/// record holds or how its scope is made bumps it.
+const TRACE_RECORDS: &str = "xla-traced-fires-1";
+
+impl Shell {
+    /// The scope a load's traced fires' records lie in: a hash of all a
+    /// fire's program text depends on beside the fire's own key, namely
+    /// the records' method, the code that emits programs (this crate's and
+    /// kernels-xla's sources), the model's trace, the budgets, tuning and
+    /// chip, the pool's and the streamed weights' layouts, the staging and
+    /// the compiler's flags. Not the pie version: an upgrade that changes
+    /// none of these reuses every record.
+    /// This load's traced-fire records: the fires taken from them, and
+    /// whether they held (`false`: one parted from its trace, and the load
+    /// traced every fire).
+    #[must_use]
+    pub fn trace_records(&self) -> (u64, bool) {
+        (self.records_used, self.records_hold)
+    }
+
+    /// The folder this load's traced-fire records lie in, if it keeps any.
+    #[must_use]
+    pub fn trace_records_dir(&self) -> Option<std::path::PathBuf> {
+        self.device.trace_records_dir(self.trace_scope.as_deref()?)
+    }
+
+    pub(crate) fn trace_scope(&self) -> String {
+        let mut h = blake3::Hasher::new();
+        h.update(TRACE_RECORDS.as_bytes());
+        h.update(env!("XLA_LOWERING_FINGERPRINT").as_bytes());
+        h.update(format!("{:?}", self.trace).as_bytes());
+        h.update(format!("{:?}", self.budgets).as_bytes());
+        h.update(
+            format!(
+                "{:?}|{:?}|{:?}|{:?}",
+                self.tuning, self.pad, self.seats, self.tpu
+            )
+            .as_bytes(),
+        );
+        h.update(format!("{:?}", self.pools.layout()).as_bytes());
+        h.update(format!("{:?}", self.streamed).as_bytes());
+        // the staging's layout (its facts' times differ run to run)
+        let st = &self.staging_facts;
+        h.update(
+            format!(
+                "{}|{}|{}|{}|{:?}|{}",
+                st.slab_rows, st.slab_bytes, st.ring_slots, st.ring_bytes, st.rungs, st.bulk_bytes
+            )
+            .as_bytes(),
+        );
+        h.update(format!("{:?}", self.rs_layout).as_bytes());
+        h.update(
+            format!(
+                "{}|{}|{}|{:?}|{:?}",
+                self.gathers_readout,
+                self.states_mrope,
+                self.drops_patch_rows,
+                self.adapter_fact,
+                self.patch_seat
+            )
+            .as_bytes(),
+        );
+        for var in crate::device::COMPILER_ENV {
+            h.update(b"|");
+            h.update(std::env::var_os(var).unwrap_or_default().as_encoded_bytes());
+        }
+        h.finalize().to_hex().to_string()
     }
 }
