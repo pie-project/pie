@@ -67,6 +67,11 @@ pub struct Composed {
     /// The snapshots' row copies, before the fold: (snapshot ring page
     /// address, source address, first row in the page, rows).
     pub snaps: Vec<(u64, u64, u32, u32)>,
+    /// Row copies before the fire onto buffer slots from the ring: the
+    /// folded rows `[base, folded)` a buffer's first slot holds, which an
+    /// earlier fire folded without a slot (its own rows past its ring): (slot
+    /// address, ring page address, first row in the page, rows).
+    pub refills: Vec<(u64, u64, u32, u32)>,
 }
 
 /// The widest window's rows below `row` the fire's first row reads from:
@@ -93,7 +98,9 @@ pub fn compose(
             "a windowed lane whose record holds no ring",
         ));
     }
-    if lane.base % page != 0 || lane.base > lane.folded {
+    // The buffer starts at or below the fold the fire leaves (CONTRACT-BC
+    // 21: past the rows a fire folds itself where it buffers none earlier).
+    if lane.base % page != 0 || lane.base > lane.folded + lane.fold {
         return Err(Fault::program(
             "serve::ring",
             format!(
@@ -130,8 +137,41 @@ pub fn compose(
         ..Composed::default()
     };
     let mut sources: Vec<Source> = Vec::with_capacity(pages as usize);
+    // Rows of the fire's own below its buffer's base take no slot (the
+    // runtime starts the buffer past the rows a fire folds itself): they
+    // must fold here, as the rows past the buffer must.
+    if lane.base > lane.have && lane.folded + lane.fold < lane.base.min(end) {
+        return Err(Fault::program(
+            "serve::ring",
+            format!(
+                "rows [{}, {}) below the lane's window buffer, which its fire folds only to {}",
+                lane.have,
+                lane.base.min(end),
+                lane.folded + lane.fold
+            ),
+        ));
+    }
     for n in 0..pages {
         let ring = lane.ring[(n % ring_pages) as usize];
+        // A page of the fire's own rows with no buffer slot: on the ring
+        // where the lane writes it alone, else an own-row page, filled
+        // first with the folded rows below the fire it holds.
+        let mut own_page = |out: &mut Composed, sources: &mut Vec<Source>| {
+            if direct {
+                out.direct += 1;
+                out.table.push(ring.0);
+                sources.push(Source::Ring);
+                return Ok(());
+            }
+            let (id, at) = own()?;
+            out.own += 1;
+            if n * page < lane.have {
+                out.fills.push((at, ring.1));
+            }
+            out.table.push(id);
+            sources.push(Source::At(at));
+            Ok::<(), crate::error::Fault>(())
+        };
         // A page wholly behind the window of the fire's first row reads the
         // null page, wherever its rows lie (an attention that reads every
         // key a page holds, a masked one, reads none of them), and its rows
@@ -143,28 +183,34 @@ pub fn compose(
         } else if n < first.min(base_page) {
             out.table.push(null);
             sources.push(Source::Ring);
-        } else if n < base_page {
+        } else if n < base_page && (n + 1) * page <= lane.have {
             out.table.push(ring.0);
             sources.push(Source::Ring);
+        } else if n < base_page {
+            own_page(&mut out, &mut sources)?;
         } else if n < buffered_end {
             let slot = lane.buffer[(n - base_page) as usize];
             out.table.push(slot.0);
             sources.push(Source::At(slot.1));
-        } else if direct {
-            out.direct += 1;
-            out.table.push(ring.0);
-            sources.push(Source::Ring);
         } else {
-            let (id, at) = own()?;
-            out.own += 1;
-            // The page's rows below the fire are folded: the ring holds
-            // them; the page starts as the ring's.
-            if n * page < lane.have {
-                out.fills.push((at, ring.1));
-            }
-            out.table.push(id);
-            sources.push(Source::At(at));
+            own_page(&mut out, &mut sources)?;
         }
+    }
+    // The buffer's slots hold rows from `base`; those below `folded` are
+    // folded, and the ring holds them, but an earlier fire that folded them
+    // itself wrote them to no slot. They land on their slots from the ring
+    // before the fire reads them there.
+    let mut row = lane.base.max(first * page);
+    let held = lane.folded.min(lane.have).min(buffered_end * page);
+    while row < held {
+        let n = row / page;
+        let stop = ((n + 1) * page).min(held);
+        if n >= base_page {
+            let slot = lane.buffer[(n - base_page) as usize];
+            out.refills
+                .push((slot.1, lane.ring[(n % ring_pages) as usize].1, row % page, stop - row));
+        }
+        row = stop;
     }
     // Each snapshot: the last ring's worth of the rows before its row, each
     // page's from where it lies now (the ring as the fire found it, a
@@ -220,6 +266,8 @@ pub fn compose(
 pub struct Work {
     pub page_bytes: u64,
     pub fills: Vec<(u64, u64)>,
+    /// Row runs onto buffer slots from the ring, before the fire.
+    pub refills: Vec<(u64, u64, u64)>,
     /// The snapshots' row runs, landed after the forward and before the
     /// fold (which may write the ring pages they read).
     pub snaps: Vec<(u64, u64, u64)>,
@@ -232,6 +280,12 @@ impl Work {
     /// row) — a row's key plane and its value plane.
     pub fn add(&mut self, composed: &Composed, planes: &[(u64, u64)]) {
         self.fills.extend_from_slice(&composed.fills);
+        for &(dst, from, first, rows) in &composed.refills {
+            for &(offset, row_bytes) in planes {
+                let at = offset + u64::from(first) * row_bytes;
+                self.refills.push((dst + at, from + at, u64::from(rows) * row_bytes));
+            }
+        }
         for &(dst, from, first, rows) in &composed.snaps {
             for &(offset, row_bytes) in planes {
                 let at = offset + u64::from(first) * row_bytes;
@@ -399,6 +453,60 @@ mod tests {
         let c = compose(&lane, 16, 20, 0, &mut own).unwrap();
         // Rows [81, 101) are read: pages 0..=4 lie wholly behind them.
         assert_eq!(c.table, vec![0, 0, 0, 0, 0, 15, 16]);
+    }
+
+    #[test]
+    fn a_prefill_whose_buffer_starts_past_its_folded_rows_keeps_them_off_its_ring() {
+        // The runtime starts the buffer at the fold after the fire (rows
+        // [0, 192) folded, [192, 200) buffered): the fire's 12 pages below
+        // the buffer, past a ring of 3, go to own-row pages.
+        let ring = ring(3);
+        let buffer = [(7, 70u64)];
+        let lane = RingLane {
+            ring: &ring,
+            buffer: &buffer,
+            base: 192,
+            have: 0,
+            rows: 200,
+            folded: 0,
+            fold: 192,
+            alone: true,
+            snapshots: &[],
+        };
+        let mut next = 0u32;
+        let mut own = || {
+            next += 1;
+            Ok((500 + next as i32, 5000 + u64::from(next)))
+        };
+        let c = compose(&lane, 16, 20, 0, &mut own).unwrap();
+        assert_eq!(c.own, 12);
+        assert_eq!(c.direct, 0);
+        assert_eq!(c.table[12], 7);
+        // The fold lands the last ring's worth of [0, 192) from own pages.
+        let rows: u32 = c.folds.iter().map(|f| f.3).sum();
+        assert_eq!(rows, 48);
+    }
+
+    #[test]
+    fn a_buffer_slot_takes_its_folded_rows_from_the_ring() {
+        // Folded to 200 by a fire that took no slot; the buffer from 192.
+        let ring = ring(3);
+        let buffer = [(7, 70u64)];
+        let lane = RingLane {
+            ring: &ring,
+            buffer: &buffer,
+            base: 192,
+            have: 200,
+            rows: 1,
+            folded: 200,
+            fold: 0,
+            alone: true,
+            snapshots: &[],
+        };
+        let mut own = || panic!("no own page");
+        let c = compose(&lane, 16, 20, 0, &mut own).unwrap();
+        // Rows [192, 200) onto the slot from ring page 12 mod 3.
+        assert_eq!(c.refills, vec![(70, 1000, 0, 8)]);
     }
 
     #[test]

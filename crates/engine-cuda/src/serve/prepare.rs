@@ -1645,18 +1645,6 @@ impl Shell {
                     )
                 })
                 .collect();
-            // Interim: a lane that reads its windowed rows through a mask of
-            // its own under ring + buffer is refused by name until its
-            // masked reads answer what the window lists' do served.
-            if let Some(lane) = pooled.iter().position(|&(_, _, masked)| masked) {
-                return Err(Fault::Unbound {
-                    what: format!(
-                        "lane {} reads its windowed rows through a mask of its own, which this \
-                         engine's windowed state serves only unmasked for now",
-                        seat_sources[lane]
-                    ),
-                });
-            }
             if let Some((one, other)) = super::ring::shared_pool(&pooled) {
                 return Err(Fault::Unbound {
                     what: format!(

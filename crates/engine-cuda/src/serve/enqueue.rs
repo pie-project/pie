@@ -163,6 +163,7 @@ impl Shell {
             .fills
             .iter()
             .map(|&(to, from)| (to, from, p.ring_work.page_bytes))
+            .chain(p.ring_work.refills.iter().copied())
             .collect();
         self.copy_ring_runs(&fills)?;
         let mut fire = FireCtx {
