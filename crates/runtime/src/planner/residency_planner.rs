@@ -119,6 +119,21 @@ pub struct ResidencyPlanner {
     weight_shed: Option<WeightShed>,
 }
 
+// How far short the safe order stood at its last read (for tests,
+// `ResidencyPlanner::order_least`).
+#[cfg(test)]
+thread_local! {
+    static ORDER_LEAST: std::cell::Cell<Option<i128>> = const { std::cell::Cell::new(None) };
+}
+
+/// The first's room in the order: what it has free less its need.
+#[cfg(test)]
+fn free_first(order: &[(u64, u64, super::inner::CapacityRead)]) -> i128 {
+    order
+        .first()
+        .map_or(i128::MAX, |&(need, _, read)| read.free() as i128 - need as i128)
+}
+
 /// How long a process waits at admission before it says why, and again
 /// after each such span: what a stall at the gates is read from.
 pub(super) const ADMIT_SAYS_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
@@ -481,7 +496,18 @@ impl ResidencyPlanner {
         // The first's place is the finisher's: it never waits. One not in
         // the order goes after the last.
         places.remove(0);
+        #[cfg(test)]
+        ORDER_LEAST.with(|cell| cell.set(Some(least.min(free_first(&order)))));
         Some((first, places, u64::try_from(least.max(0)).unwrap_or(u64::MAX)))
+    }
+
+    /// How far short the safe order stood when last read: negative where
+    /// some process in it (the first included) cannot finish in turn
+    /// (for tests).
+    #[cfg(test)]
+    pub(super) fn order_least(&self) -> Option<i128> {
+        let _ = self.capacity_reads();
+        ORDER_LEAST.with(std::cell::Cell::get)
     }
 
     /// Whether an allocation of `pages` for `pid` waits on the capacity

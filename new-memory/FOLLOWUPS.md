@@ -1146,3 +1146,23 @@ finisher whose spare was 0 left every tier full (free 72 -> 39 in one step, slac
 class of the mover's held parts in the margin passes 589 and 645 but breaks main seed 134 (a thrash) and leaves 401
 failing: the margin must be the exact granularity a park opens (the classes whose chunks on the tier below have no
 room for its parts), not a bound.
+
+## F57. The safe order turns short with no ask past it: a gate accounting gap, not admission (planner sim, found 2026-11-23)
+
+The field mix's seed 401 (45 processes arriving at once on a 15-chunk device) and the 401 family (589, 645;
+the Metal w17 mix's thrash and liveness seeds, 31 of its first 200: 18, 43, 47, 54, 67, 70, 74, 76, 77, 84,
+88, ...) end with every process short in the banker's order. `PIE_SIM_SHORT=1` says each step the order turns
+short (`ResidencyPlanner::order_least`, the raw least room in the order, negative when some process cannot
+finish in turn) with the gate's read. On 401 it turns short at step 7 already (least -6, free 99, `moving` 9,
+unit 29), again at 10 (-6) and 17 (-21, `moving` 21): before any process grew far, while moves were under way.
+
+Admission at the last place does not explain it: a newcomer appended last needs its end with every other
+process's holdings given back, which fits whenever its end fits the pool, so a banker's check there refuses
+nothing. The order goes short because a step's reads move under the gate: the second slots of moves under way
+(`moving`) and the margin (`unit`, the largest other resident's move) grow with grants the gate let through as
+safe at their own read. A grant's cost (`CapacityGate::cost`) charges the margin for the asker's own move only;
+the read after the grant also counts the moving copies the grant's own eviction or restore opened. The fix is
+in the gate's accounting (charge what a grant will put in flight, or read the order after the moves it starts),
+then admission priced by the same order. Repro: `PIE_SIM_SHORT=1 PIE_SIM_FIELD=1 PIE_SIM_SEED=401` on
+`replay_one_simulated_seed`, and `PIE_SIM_METAL=1` sweeps.
+

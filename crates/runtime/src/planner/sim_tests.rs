@@ -1891,6 +1891,8 @@ struct Log {
     bind_suspends: u64,
     idles: u64,
     rescores: u64,
+    /// The safe order stood short at the last settled step.
+    short: bool,
     /// Bytes found not as written: (process, what).
     corrupt: Vec<(ProcessId, String)>,
     checks: u64,
@@ -2786,6 +2788,21 @@ fn check(ctx: &Ctx, step: u32, moving: bool) -> Result<Vec<Failure>, Failure> {
         // scratch (a parked one's kept tables and rings). A slot named past
         // its release is read and written as another's (the M1's fires on
         // free logical chunks swapped onto a released segment).
+        // `PIE_SIM_SHORT`: each step the safe order turns short, said with
+        // the gate's read and what the last step granted.
+        if std::env::var_os("PIE_SIM_SHORT").is_some() {
+            let least = ctx.planner.order_least();
+            let was = ctx.log.lock().unwrap().short;
+            let now = least.is_some_and(|least| least < 0);
+            if now && !was {
+                eprintln!(
+                    "SIMSHORT step {step}: least {least:?} read {:?} gate {:?}",
+                    ctx.planner.capacity_read(),
+                    ctx.planner.capacity_gate()
+                );
+            }
+            ctx.log.lock().unwrap().short = now;
+        }
         if let Some(why) = stray_holders(ctx, shared) {
             return Err(fail("stale ref", why));
         }
