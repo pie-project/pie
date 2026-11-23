@@ -299,6 +299,19 @@ pub fn assemble(
     let profile = registry
         .overlay(base, tuned, target, Source::User(path.clone()))
         .map_err(|e| e.to_string())?;
+    // A tuned file is a decision profile: the keyed measurements a stored
+    // or committed layer gave `base` (`measured_on`, `measured_by`, the
+    // dense kernels' curves and settles) are a device's own, never written
+    // into it; a load of the device takes them from their own layers.
+    let profile = {
+        let mut tuned = profile.tuned().clone();
+        tuned.rates.measured_on = None;
+        tuned.rates.measured_by = None;
+        tuned.rates.kernel_tflops_by_shape = None;
+        tuned.rates.dense_settled = Vec::new();
+        tuned.committed_settle = Vec::new();
+        profile.with_tuned(tuned)
+    };
     let text = crate::render::dump_with(&profile, provenance);
     registry
         .parse(&text, &path, Strict::CheckedIn)
