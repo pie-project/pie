@@ -340,7 +340,8 @@ pub enum RingPlacement {
     /// row), at a multiple of this many bytes into its slot.
     Aligned(u64),
     /// Its own pieces, each starting at a chunk boundary: a fixed shape of
-    /// one slot a chunk ([`WindowedRecipe::ring_shape`]). The record names
+    /// one slot a chunk ([`WindowedRecipe::ring_shape`]), which the engine
+    /// states as `SlotRole::Ring` before its state shapes. The record names
     /// the ring's pieces first and its state pieces after them.
     ChunkStart,
 }
@@ -636,7 +637,10 @@ impl ChunkRecipe {
                 }
                 SlotLayout::Fixed { rows, .. } => {
                     let (used, runs) = self.rank_runs(rows, tp);
-                    fixed = runs;
+                    // The ring shape's run is not the state record's.
+                    if fixed.is_empty() || rows.iter().any(|r| r.row != RowId::Ring) {
+                        fixed = runs;
+                    }
                     align_up(used.max(FIXED_SLOT_FLOOR), align)
                 }
             };
@@ -1324,18 +1328,9 @@ fn plan_with(
         });
         slots.push(buffer);
     }
-    if let Some(pick) = pick {
-        let (pieces_per_ws, rows) =
-            fixed::pack(&fixed_rows, pick.packing(fixed_align), true).unwrap_or((0, Vec::new()));
-        slots.push(SlotLayout::Fixed {
-            bytes: pick.slot,
-            record,
-            pieces_per_ws,
-            rows,
-        });
-    }
     // A ring at chunk starts: a fixed shape of one slot a chunk, its pieces
-    // whole atoms, equal, the last padded.
+    // whole atoms, equal, the last padded; before the state record's shape,
+    // as the engine states them (`SlotRole::Ring` first).
     if let Some(windowed) = windowed_recipe.as_mut()
         && windowed.region.placement == RingPlacement::ChunkStart
         && let Some(atom) = ring_atom
@@ -1357,6 +1352,16 @@ fn plan_with(
                 offset: 0,
                 slots: (0..pieces).collect(),
             }],
+        });
+    }
+    if let Some(pick) = pick {
+        let (pieces_per_ws, rows) =
+            fixed::pack(&fixed_rows, pick.packing(fixed_align), true).unwrap_or((0, Vec::new()));
+        slots.push(SlotLayout::Fixed {
+            bytes: pick.slot,
+            record,
+            pieces_per_ws,
+            rows,
         });
     }
     Ok(ChunkRecipe {

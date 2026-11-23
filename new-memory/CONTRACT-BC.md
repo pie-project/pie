@@ -165,6 +165,18 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
     `ChunkStart`. The window buffer is `ChunkRecipe.windowed.buffer` (a `SlotLayout::List { tokens: T, window: None
     }` of the kv page's T rows of every windowed layer, layer-major, each layer's runs in its rows); `recipe.list()`
     never returns it, `recipe.fixed()` never returns the ring shape. A kv-only window model gets a record.
+    **A ring at chunk starts in the facts and the record.** The ring is its own `SlotShape`: `SlotKind::Fixed {
+    pieces }`, `slots_per_chunk = 1` (so every piece starts a chunk), `role: SlotRole::Ring`, stated before the
+    record's state shapes (`ChunkFacts::validate` refuses another kind, more than one slot a chunk, a second ring
+    shape, one after a state fixed shape, and one in a load with no windowed layer). The record spans every fixed
+    shape the load states, as 16 already allows: `LaneRecord::Pieces` names each shape's pieces in its own list,
+    `(ring shape, its pieces)` first, then `(state shape, its pieces)`; a shape the load does not state is absent,
+    and every stated shape is named with all its pieces (no shape implied by position). A kv-only windowed model
+    (Gemma) states the ring shape and no state shape, so its record is the ring's pieces alone; nothing is
+    special-cased. The record is one unit across its shapes: a fork's copy, tier copies (22: one `copy_slots` a
+    fixed shape, pieces paired in order), park, restore and copy-on-first-fold move it whole as opaque bytes, and
+    `[run, cow]` covers the ring pieces as the state pieces (a snapshot's `RsSnapshot.fixed` names both). A ring
+    placed `Aligned` lies inside the state fixed shape, its first row, and no ring shape is stated.
 22. **Host and disk tiers of shared shapes (fills in the tiers part of 12).** `ChunkFacts.host_chunks`: host chunks
     of `chunk_bytes`, ids from 0, none reserved, no ChunkTable (a host ref names its own place); any state shape
     (weights excepted) may open any host chunk; a host ref of shape s is `chunk * s.slots_per_chunk + index` at

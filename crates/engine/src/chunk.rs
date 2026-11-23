@@ -345,6 +345,14 @@ pub enum SlotRole {
     /// hybrid the rs rows keep the rs list; this list holds window K/V
     /// only.
     WindowBuffer,
+    /// The windowed layers' ring region where it lies at chunk starts (a
+    /// fixed shape of one slot a chunk; CONTRACT-BC 21): a piece of the
+    /// lane's record beside its state shapes, stated before them, so the
+    /// record names its ring pieces first. The record is one unit across
+    /// every fixed shape it spans: it parks, restores and copies (its
+    /// `[run, cow]`) whole. A kv-only windowed model states the ring shape
+    /// and no state shape.
+    Ring,
     /// One guest instance's bind-time launch tables (a fixed shape): an
     /// instance of `n` slots holds bytes `[k * slot_bytes, (k + 1) *
     /// slot_bytes)` of its tables in slot `k` of
@@ -370,7 +378,7 @@ impl SlotRole {
     #[must_use]
     pub fn replayable(self) -> bool {
         match self {
-            SlotRole::State | SlotRole::RsBuffer | SlotRole::WindowBuffer => true,
+            SlotRole::State | SlotRole::RsBuffer | SlotRole::WindowBuffer | SlotRole::Ring => true,
             SlotRole::Instance | SlotRole::Channel | SlotRole::Adapter => false,
         }
     }
@@ -798,6 +806,25 @@ impl ChunkFacts {
                     ));
                 }
             }
+            if shape.role == SlotRole::Ring {
+                if !matches!(shape.kind, SlotKind::Fixed { .. }) || shape.slots_per_chunk != 1 {
+                    return invalid(format!(
+                        "shape {} lays the ring as {:?}, {} a chunk; the ring shape is a fixed \
+                         shape of one slot a chunk",
+                        shape.id, shape.kind, shape.slots_per_chunk
+                    ));
+                }
+                if let Some(other) = self.shapes[..at].iter().find(|s| {
+                    s.role == SlotRole::Ring
+                        || (s.role == SlotRole::State && matches!(s.kind, SlotKind::Fixed { .. }))
+                }) {
+                    return invalid(format!(
+                        "shape {} is the ring shape after shape {}: one ring shape, stated before \
+                         the record's state shapes",
+                        shape.id, other.id
+                    ));
+                }
+            }
             if let Some(window) = shape.kind.window()
                 && let Some(other) = self.shapes[..at]
                     .iter()
@@ -922,6 +949,14 @@ impl ChunkFacts {
                 "the windowed layers' rings take {} bytes, past the record's {}",
                 self.ring_bytes(),
                 self.record_bytes
+            ));
+        }
+        if self.windowed.is_empty()
+            && let Some(ring) = self.shapes.iter().find(|s| s.role == SlotRole::Ring)
+        {
+            return invalid(format!(
+                "shape {} is the ring shape of a load that states no windowed layer",
+                ring.id
             ));
         }
         match (self.windowed.is_empty(), self.window_buffer()) {
@@ -1155,6 +1190,7 @@ mod role_tests {
         assert!(SlotRole::State.replayable());
         assert!(SlotRole::RsBuffer.replayable());
         assert!(SlotRole::WindowBuffer.replayable());
+        assert!(SlotRole::Ring.replayable());
         assert!(!SlotRole::Instance.replayable());
         assert!(!SlotRole::Channel.replayable());
     }
@@ -1267,6 +1303,31 @@ mod tests {
             *window = Some(64);
         }
         refused(both, "window list beside windowed layers");
+    }
+
+    #[test]
+    fn a_ring_at_chunk_starts_is_one_fixed_shape_of_one_slot_a_chunk() {
+        let ring = |slots_per_chunk| SlotShape {
+            id: ShapeId(10),
+            kind: SlotKind::Fixed { pieces: 2 },
+            slot_bytes: 4096 / u64::from(slots_per_chunk),
+            slots_per_chunk,
+            sets_per_working_set: 1,
+            rows: Vec::new(),
+            pinned: None,
+            role: SlotRole::Ring,
+        };
+        let mut kv_only = windowed();
+        kv_only.shapes.push(ring(1));
+        assert!(kv_only.validate().is_ok(), "{:?}", kv_only.validate());
+        let mut two_a_chunk = windowed();
+        two_a_chunk.shapes.push(ring(2));
+        let why = two_a_chunk.validate().unwrap_err().to_string();
+        assert!(why.contains("one slot a chunk"), "{why}");
+        let mut unwindowed = facts();
+        unwindowed.shapes.push(ring(1));
+        let why = unwindowed.validate().unwrap_err().to_string();
+        assert!(why.contains("states no windowed layer"), "{why}");
     }
 
     #[test]
