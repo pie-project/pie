@@ -1241,6 +1241,16 @@ if engine::guest_claims::saying() {
             .bind_output(name, lane, base, storage, width, row_stride, row_offset, rows)
     }
 
+    /// Instance `id`'s fire seats `lanes` lanes ([`Session::seat_lanes`]).
+    pub fn seat_lanes(&mut self, id: InstanceId, lanes: u32) -> Result<()> {
+        self.instances
+            .get_mut(&id)
+            .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?
+            .session
+            .seat_lanes(lanes);
+        Ok(())
+    }
+
     /// The outputs instance `id`'s program reads, by name and lane.
     pub fn reads(&self, id: InstanceId) -> Result<Vec<(String, u32)>> {
         let bound = self
@@ -1439,6 +1449,9 @@ if engine::guest_claims::saying() {
                 bound.session.fly_in(wave);
             }
         }
+        // One stream per group, and groups distinct by (program, extents)
+        // (`staged_groups`): no batch's lane tables are written by two
+        // streams at once, and every side stream joins main below.
         let streams = fan.fork(&meet, main)?;
         let flown = groups.into_iter().zip(streams).zip(places).try_for_each(
             |(((program_id, extents, members), stream), (base, lanes, fresh))| {
@@ -1491,6 +1504,24 @@ if engine::guest_claims::saying() {
         arenas: launch::Arenas,
         stream: *mut core::ffi::c_void,
     ) -> Result<()> {
+        // A batch's lane tables (`Prepared::stage_lane`, `bind_rows`,
+        // `bind_intrinsic`) are one per (program, extents), shared by every
+        // flight and fire of it, and rewritten from the host each flight:
+        // they are safe only because each flight's restage, launches and
+        // reads run in order on one stream that `Fan::join` orders before
+        // main's next wave. A flight captured into a graph would replay
+        // against whatever the tables hold at replay, a later flight's rows.
+        // Refused by name rather than raced.
+        if crate::device::alloc::is_capturing(stream) {
+            return Err(Fault::program(
+                "program::plane",
+                format!(
+                    "a guest flight of program {program_id} on a capturing stream: its lane \
+                     tables are shared per (program, extents) and rewritten each flight, so a \
+                     captured replay would read another flight's rows"
+                ),
+            ));
+        }
         {
             let program = programs.get_mut(&program_id).ok_or_else(|| {
                 Fault::program(
