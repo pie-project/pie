@@ -1,7 +1,7 @@
 //! A warm load takes each fire's program from its traced-fire record,
 //! checking the first against a fresh trace: a record that parts from its
 //! fire's trace (here every record made stale, each naming another fire's
-//! program) is caught, the load traces every fire in full, serving the
+//! program, its file as kept) is caught, the load traces every fire in full, serving the
 //! logits a traced load gives, and rewrites the records, which the next
 //! load takes again. Skipped without a PJRT plugin or a disk cache.
 
@@ -58,7 +58,14 @@ fn make_stale(dir: &std::path::Path) -> usize {
                 .expect("a record parses")
         })
         .collect();
-    let program = |r: &serde_json::Value| (r["hash"].clone(), r["name"].clone(), r["len"].clone());
+    let program = |r: &serde_json::Value| {
+        (
+            r["hash"].clone(),
+            r["name"].clone(),
+            r["len"].clone(),
+            r["file_len"].clone(),
+        )
+    };
     let mut distinct: Vec<_> = records.iter().map(program).collect();
     distinct.sort_by_key(|p| p.1.to_string());
     distinct.dedup();
@@ -68,10 +75,11 @@ fn make_stale(dir: &std::path::Path) -> usize {
             .iter()
             .position(|p| *p == program(r))
             .expect("its own program");
-        let (hash, name, len) = distinct[(at + 1) % distinct.len()].clone();
+        let (hash, name, len, file_len) = distinct[(at + 1) % distinct.len()].clone();
         r["hash"] = hash;
         r["name"] = name;
         r["len"] = len;
+        r["file_len"] = file_len;
     }
     for (f, r) in files.iter().zip(&records) {
         std::fs::write(f, serde_json::to_vec(r).expect("a record writes"))

@@ -410,6 +410,14 @@ impl Shell {
                 let before = self.deferred.as_ref().map_or(0, Vec::len);
                 let fired_part = warm_part(&parts, at);
                 let r = self.warm_fire(shape);
+                // each program it traced, in the order serving meets them:
+                // decode first, by lanes, then drafts, mixed and prompts
+                let use_order = (use_rank(fired_part), shape.len() as u32);
+                if let Some(deferred) = self.deferred.as_mut() {
+                    for d in deferred.iter_mut().skip(before) {
+                        d.order = (use_order.0, use_order.1, d.rows);
+                    }
+                }
                 if pass == 0 {
                     let new = self.deferred.as_ref().map_or(0, Vec::len) - before;
                     *added.entry(fired_part).or_insert(0) += new;
@@ -454,8 +462,8 @@ impl Shell {
         Ok(fired)
     }
 
-    /// Loads the parked programs from the disk cache behind serving, the
-    /// smallest fires' first, as many at once as the load rate's knee (the
+    /// Loads the parked programs from the disk cache behind serving, in the
+    /// order serving meets them (`use_rank`: decode by lanes first), as many at once as the load rate's knee (the
     /// width past which it stops rising), each admitted by the host's room
     /// as the ladder's are ([`HostRoom`]). A fire of a shape not yet loaded
     /// loads it itself, ahead of the loader (which starts none while a fire
@@ -467,7 +475,7 @@ impl Shell {
         let mut queue: Vec<_> = self
             .parked
             .iter()
-            .map(|(key, p)| (*key, p.code.clone(), p.sig.clone(), p.rows))
+            .map(|(key, p)| (*key, p.code.clone(), p.sig.clone(), p.order))
             .collect();
         queue.sort_by_key(|q| (q.3, q.0));
         let mut seen = std::collections::HashSet::new();
@@ -610,6 +618,34 @@ impl Shell {
             Err(why) => {
                 tracing::warn!(%why, "xla programs not loaded behind serving: each loads in its first fire")
             }
+        }
+    }
+
+    /// Keeps traced fire `d`'s record (`Device::trace_record`) for later
+    /// loads, its program built and kept in the disk cache: the record names
+    /// the file and its length as kept, all before ready.
+    fn keep_record(&self, d: &super::Deferred) {
+        let (Some(scope), crate::device::Code::Text(text)) = (self.trace_scope.as_deref(), &d.code)
+        else {
+            return;
+        };
+        let Some(name) = self.device.cached_name(text) else {
+            return;
+        };
+        let Some(file_len) = self.device.cached_len(&name) else {
+            return;
+        };
+        let record = super::TraceRecord {
+            hash: d.code.hash(),
+            name,
+            len: text.len(),
+            file_len,
+            need: crate::device::compile_need(text),
+            sig: d.sig.clone(),
+            probed: d.probed.clone(),
+        };
+        if let Ok(bytes) = serde_json::to_vec(&record) {
+            self.device.keep_trace_record(scope, &d.key, &bytes);
         }
     }
 
@@ -849,6 +885,10 @@ impl Shell {
         );
         let mut left_out = std::collections::HashSet::new();
         for (d, at) in deferred.into_iter().zip(index) {
+            // a traced fire's record, once its program is built and kept
+            if !matches!(programs[at], Some(Err(_))) {
+                self.keep_record(&d);
+            }
             let program = match programs[at].as_ref() {
                 Some(Ok(program)) => std::sync::Arc::clone(program),
                 Some(Err(fault)) => {
@@ -876,7 +916,7 @@ impl Shell {
                             code: d.code,
                             sig: d.sig,
                             probed: d.probed,
-                            rows: d.rows,
+                            order: d.order,
                         },
                     );
                     continue;
@@ -964,6 +1004,20 @@ fn held_of(want: &Want, page_size: u32) -> u32 {
 }
 
 /// The ladder part shape `at` belongs to: the last that starts at or before it.
+/// Where a ladder part's programs stand in the order they load behind
+/// serving: what every request's steps take first (decode, and the drafts
+/// a speculative decode fires beside it), then mixed fires, then prompts.
+fn use_rank(part: &str) -> u8 {
+    match part {
+        "decode" => 0,
+        "draft windows" => 1,
+        "draft prompts" => 2,
+        "mixed" => 3,
+        "prefill" => 4,
+        _ => 5,
+    }
+}
+
 fn warm_part<'a>(parts: &[(&'a str, usize)], at: usize) -> &'a str {
     parts
         .iter()
