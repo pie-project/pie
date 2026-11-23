@@ -146,7 +146,7 @@ pub(crate) fn permute_act(f: &mut Func, x: Val, groups: i64, per: i64) -> Result
 /// over the bf16 biases with the in-place update of the logits it lands in,
 /// the head's rows come out wrong (up to 0.7 at rms 0.3), while the same
 /// program returning the offset's operands computes them right. Repro and
-/// status: FOLLOWUPS F61.
+/// status: FOLLOWUPS F65.
 pub(crate) fn grouped_dot(
     f: &mut Func,
     xp: Val,

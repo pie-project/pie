@@ -3,7 +3,7 @@
 //! u4g64 deployments, whose projections carry an affine offset. libtpu
 //! miscompiled that offset as a dot in gpt-oss's multi-lane decode, and the
 //! batched head answered other tokens than the lone one at every step
-//! (FOLLOWUPS F61). Skipped without a PJRT plugin.
+//! (FOLLOWUPS F65). Skipped without a PJRT plugin.
 
 use crate::common_llm::{Model, Refs, Seq, tokens};
 

@@ -1202,7 +1202,7 @@ row; `carried_max` / `total_max` as laid) and check by `rung_holds` too, so noth
 chose is refused after. Predates that branch (the runtime never counted decode lanes' replay for
 XLA); after the beam-line merge.
 
-## F61. libtpu miscompiles the affine offset as a dot in gpt-oss's multi-lane decode (found 2026-11-23)
+## F65. libtpu miscompiles the affine offset as a dot in gpt-oss's multi-lane decode (found 2026-11-23)
 
 Served gptoss-20b-u4g64 answered garbage to concurrent requests and sense to one at a time. The
 u4g64 head's affine offset (`Σ_g bias[n, g] · Σ_{k∈g} x[m, k]`, a `dot_general` f32 [m, 45] ·
