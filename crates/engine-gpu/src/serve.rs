@@ -1305,7 +1305,17 @@ impl<B: Serve> Shell<B> {
         let mut boot = boot;
         let weights_held = boot.residency.weights_held;
         let kv_budget = boot.residency.device_kv_budget;
-        let host_kv_budget = boot.residency.host_kv_budget;
+        // On a device whose memory is the host's no host tier is seated:
+        // suspended kv goes to the disk, and a stated one is refused here,
+        // by the naming load, before the device holds a byte of the model.
+        let host_kv_budget = match device
+            .memory()
+            .host_tier(boot.residency.host_kv_budget)
+            .map_err(Fault::Residency)?
+        {
+            engine::HostTier::Absent => None,
+            engine::HostTier::Seated(stated) => stated,
+        };
 
         let facts = kv::probe(&boot.trace)?;
 

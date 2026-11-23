@@ -58,7 +58,10 @@ pub use fire::{
     LaneReadout, LaneRecord, ListKind, Mask, Masking, MediaEncode, Readout, RsReset, RsSnapshot,
     RsVerb, Serves, Step,
 };
-pub use load::{Allowance, Budgets, Checkpoint, LoadFacts, LoadRequest, Loaded, Residency};
+pub use load::{
+    Allowance, Budgets, Checkpoint, DeviceMemory, HostTier, LoadFacts, LoadRequest, Loaded,
+    Residency,
+};
 pub use memory::SAFETY_FLOOR_BYTES;
 pub use program::{
     BindExtents, BoundInstance, FireFacts, FirePair, Footprint, GuestState, GuestTerm,

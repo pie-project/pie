@@ -1039,13 +1039,22 @@ where
 
         let pools = shell.pool_facts().map_err(fault)?;
         let chunks = shell.chunk_facts().map_err(fault)?;
+        let memory = crate::backend::Context::memory(shell.device());
+        if memory.unified() {
+            tracing::info!(
+                device = crate::backend::Context::name(shell.device()),
+                disk_chunks = chunks.disk_chunks,
+                "{}",
+                engine::DeviceMemory::NO_HOST_TIER
+            );
+        }
 
         let caps = Capabilities {
             device: DeviceFacts {
                 backend: B::KIND.to_string(),
                 domain: B::domain(&self.boot),
                 sms: shell.cores(),
-                unified_memory: false,
+                unified_memory: memory.unified(),
 
                 fp8_native: false,
                 native_mxfp4_moe: false,

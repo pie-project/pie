@@ -61,6 +61,7 @@ pub struct Facts {
     cores: u32,
     capacity: u64,
     outside: u64,
+    memory: engine::DeviceMemory,
     table_align: u64,
     tier: kernels_slang::Tier,
     books: Arc<Books>,
@@ -76,6 +77,7 @@ impl Facts {
             cores: device.cores(),
             capacity: device.capacity(),
             outside: device.outside().saturating_add(device.books().device()),
+            memory: device.memory(),
             table_align: B::table_align(device),
             tier: B::tier(device),
             books: Arc::new(Books::apart()),
@@ -115,6 +117,10 @@ impl<B: Serve> Context<Named<B>> for Facts {
 
     fn outside(&self) -> u64 {
         self.outside
+    }
+
+    fn memory(&self) -> engine::DeviceMemory {
+        self.memory
     }
 
     fn books(&self) -> &Books {

@@ -703,7 +703,24 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                  pool's ceiling take the difference"
             );
         }
-        if kv_swap_capable && crate::store::shared::SharedPool::states_shared(&d.chunks) {
+        let unified = d
+            .engine_backend
+            .device_facts()
+            .is_some_and(|facts| facts.unified_memory);
+        if kv_swap_capable && unified && d.chunks.host_chunks == 0 {
+            // No host tier: on a device whose memory is the host's a move to
+            // the host frees nothing, so the engine states none.
+            tracing::info!(
+                device_pages = d.chunks.kv_device_pages(),
+                planner_pages,
+                lent_chunks,
+                host = "none",
+                disk_chunks = d.chunks.disk_chunks,
+                chunk_bytes = d.chunks.chunk_bytes,
+                "kv tiers: no host tier (the device's memory is the host's); suspended kv \
+                 goes to the disk"
+            );
+        } else if kv_swap_capable && crate::store::shared::SharedPool::states_shared(&d.chunks) {
             // A shared pool states its tiers in chunks, not in the page
             // fields its engine leaves at 0.
             tracing::info!(

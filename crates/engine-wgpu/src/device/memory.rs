@@ -70,6 +70,73 @@ pub fn shares_host(device: wgpu::DeviceType, mapped: bool) -> bool {
     }
 }
 
+/// Whose memory a device's is: the host's where it shares it
+/// ([`shares_host`]) and on every Android device, as the native engine
+/// states it. Metal states an adapter with unified memory, and DX12 one
+/// with UMA, as integrated. Where it is the host's, the load states no host
+/// tier.
+#[must_use]
+pub fn device_memory(device: wgpu::DeviceType, mapped: bool) -> engine::DeviceMemory {
+    if cfg!(target_os = "android") || shares_host(device, mapped) {
+        engine::DeviceMemory::Hosts
+    } else {
+        engine::DeviceMemory::Own
+    }
+}
+
+/// Whose memory `adapter`'s is ([`device_memory`]), read at load: under
+/// Vulkan, whether the host maps its largest device-local heap counts for
+/// a device that states neither integrated nor discrete.
+///
+/// # Errors
+///
+/// A Vulkan adapter without its native handle, refused by name.
+pub fn whose(adapter: &wgpu::Adapter) -> Result<engine::DeviceMemory> {
+    let info = adapter.get_info();
+    let mapped = match info.backend {
+        #[cfg(not(any(target_arch = "wasm32", target_vendor = "apple")))]
+        wgpu::Backend::Vulkan => vulkan_mapped(adapter).map_err(|why| {
+            Fault::Residency(format!("wgpu: whose memory the device's is: {why}"))
+        })?,
+        _ => false,
+    };
+    Ok(device_memory(info.device_type, mapped))
+}
+
+#[cfg(not(any(target_arch = "wasm32", target_vendor = "apple")))]
+fn vulkan_mapped(adapter: &wgpu::Adapter) -> std::result::Result<bool, String> {
+    // SAFETY: the native adapter is only read, and the guard is dropped
+    // before `adapter` is.
+    let hal = unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }
+        .ok_or("the Vulkan adapter has no native handle")?;
+    // SAFETY: the physical device belongs to the live instance.
+    let memory = unsafe {
+        hal.shared_instance()
+            .raw_instance()
+            .get_physical_device_memory_properties(hal.raw_physical_device())
+    };
+    Ok(largest_mapped(&memory))
+}
+
+/// Whether the host maps the largest device-local heap of `memory`: a
+/// memory type on it both `DEVICE_LOCAL` and `HOST_VISIBLE`.
+#[cfg(not(any(target_arch = "wasm32", target_vendor = "apple")))]
+fn largest_mapped(memory: &ash::vk::PhysicalDeviceMemoryProperties) -> bool {
+    use ash::vk;
+    let heaps = &memory.memory_heaps[..memory.memory_heap_count as usize];
+    let largest = (0..heaps.len())
+        .filter(|&at| heaps[at].flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+        .max_by_key(|&at| heaps[at].size);
+    memory.memory_types[..memory.memory_type_count as usize]
+        .iter()
+        .any(|t| {
+            Some(t.heap_index as usize) == largest
+                && t.property_flags.contains(
+                    vk::MemoryPropertyFlags::DEVICE_LOCAL | vk::MemoryPropertyFlags::HOST_VISIBLE,
+                )
+        })
+}
+
 /// Of Vulkan's memory heaps, `(size, device-local)` each, the largest
 /// device-local one, which device reservations take: its budget where
 /// `VK_EXT_memory_budget` states `budgets`; else, on a device that shares
@@ -257,17 +324,7 @@ fn vulkan(adapter: &wgpu::Adapter) -> std::result::Result<Reading, String> {
         .iter()
         .map(|h| (h.size, h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL)))
         .collect();
-    let largest = (0..count)
-        .filter(|&at| heaps[at].1)
-        .max_by_key(|&at| heaps[at].0);
-    let mapped = memory.memory_types[..memory.memory_type_count as usize]
-        .iter()
-        .any(|t| {
-            Some(t.heap_index as usize) == largest
-                && t.property_flags.contains(
-                    vk::MemoryPropertyFlags::DEVICE_LOCAL | vk::MemoryPropertyFlags::HOST_VISIBLE,
-                )
-        });
+    let mapped = largest_mapped(&memory);
     vulkan_heaps(
         &heaps,
         budgeted.then_some(&budget.heap_budget[..count]),
@@ -356,6 +413,27 @@ mod tests {
         assert!(!shares_host(DiscreteGpu, true));
         assert!(shares_host(Other, true));
         assert!(!shares_host(VirtualGpu, false));
+    }
+
+    /// The Adreno 840 and the Spark under Vulkan, Apple under Metal: no host
+    /// tier, a stated one refused by name. A discrete card is unchanged.
+    #[test]
+    fn a_device_whose_memory_is_the_hosts_states_no_host_tier() {
+        use wgpu::DeviceType::{DiscreteGpu, IntegratedGpu};
+        let unified = device_memory(IntegratedGpu, false);
+        assert_eq!(unified, engine::DeviceMemory::Hosts);
+        assert_eq!(unified.host_tier(None), Ok(engine::HostTier::Absent));
+        let refused = unified.host_tier(Some(1 << 30)).unwrap_err();
+        assert!(refused.contains("`[engine.memory] budget_host`"), "{refused}");
+        if !cfg!(target_os = "android") {
+            let discrete = device_memory(DiscreteGpu, true);
+            assert_eq!(discrete, engine::DeviceMemory::Own);
+            assert_eq!(
+                discrete.host_tier(Some(1 << 30)),
+                Ok(engine::HostTier::Seated(Some(1 << 30)))
+            );
+            assert_eq!(discrete.host_tier(None), Ok(engine::HostTier::Seated(None)));
+        }
     }
 
     #[test]

@@ -213,6 +213,9 @@ pub(crate) struct Core {
     /// the device shares the host's memory, so what the host can still give
     /// is read afresh while serving.
     pub(crate) shares_host: bool,
+    /// Whose memory the device's is ([`super::memory::whose`]): where it is
+    /// the host's, the load states no host tier.
+    pub(crate) whose_memory: engine::DeviceMemory,
     /// The most bytes one reservation takes on this device
     /// ([`super::memory::reservation_bound`]): every buffer made is no
     /// larger, and one past it is refused by name, never made invalid.
@@ -660,6 +663,7 @@ impl Context {
         } = handed;
         let info = adapter.get_info();
         let reading = super::memory::at_load(&adapter, allowance)?;
+        let whose_memory = super::memory::whose(&adapter)?;
         tracing::info!(device = %info.name, "{reading}");
         let budget = reading.bytes;
         let features = device.features();
@@ -723,6 +727,7 @@ impl Context {
             subgroup_min,
             budget,
             shares_host: reading.source == super::memory::Source::HostAvailable,
+            whose_memory,
             bound,
         });
         let dummy = Raw::new(
@@ -772,6 +777,11 @@ impl Context {
         self.core
             .shares_host
             .then(engine_gpu::host_memory::room_reader)
+    }
+
+    #[must_use]
+    pub fn whose_memory(&self) -> engine::DeviceMemory {
+        self.core.whose_memory
     }
 
     /// What the driver holds for this process beside every reservation:
