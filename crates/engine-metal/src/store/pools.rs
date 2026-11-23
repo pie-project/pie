@@ -1466,20 +1466,50 @@ impl Pools {
         refs.iter().map(|&r| unit(r)).collect()
     }
 
+    /// Where window table `k`'s slot ref `slot` lies, in bytes of the range.
+    pub fn window_slot_offset(&self, k: usize, slot: u32) -> Result<u64> {
+        self.slot_offset(WINDOWS[k.min(MAX_WINDOWS - 1)], slot)
+    }
+
+    /// Where window slot `index` of physical chunk `chunk` lies (a page the
+    /// range's own-row chunks hold, no slot ref of its own), and its page id.
+    pub fn window_slot_at(&self, k: usize, chunk: u32, index: u32) -> Result<(u64, u32)> {
+        let window = *self.shape(WINDOWS[k.min(MAX_WINDOWS - 1)])?;
+        let per = window.per_chunk.max(1);
+        Ok((
+            u64::from(chunk) * self.layout.chunk_bytes + u64::from(index) * window.slot_bytes,
+            self.pool.slot_page(chunk * per + index, per),
+        ))
+    }
+
+    /// Window table `k`'s slots a chunk.
+    pub fn window_slots_a_chunk(&self, k: usize) -> Result<u32> {
+        Ok(self.shape(WINDOWS[k.min(MAX_WINDOWS - 1)])?.per_chunk.max(1))
+    }
+
+    /// Copies whole window slots of table `k`, `(from, to)` byte offsets, in
+    /// `frame`: a boundary own-row page filled from its ring page.
+    pub fn copy_window_slots(&self, frame: &mut Frame, k: usize, copies: &[(u64, u64)]) -> Result<()> {
+        let bytes = self.shape(WINDOWS[k.min(MAX_WINDOWS - 1)])?.slot_bytes;
+        for &(from, to) in copies {
+            self.pool.copy(frame, from, to, bytes)?;
+        }
+        Ok(())
+    }
+
     /// A windowed fold's copies in `frame` (CONTRACT-BC 19; `store::windowed`):
-    /// each `(source ref, ring ref, first row, rows)` of window table `k`'s
-    /// slot shape copies those rows of every windowed layer's keys and values
-    /// from the source slot to the ring slot, at the same rows of the slot.
+    /// each `(source slot's byte, ring slot's byte, first row, rows)` of window
+    /// table `k`'s slot shape copies those rows of every windowed layer's keys
+    /// and values from the source slot to the ring slot, at the same rows.
     pub fn fold_window_rows(
         &self,
         frame: &mut Frame,
         k: usize,
-        copies: &[(u32, u32, u32, u32)],
+        copies: &[(u64, u64, u32, u32)],
     ) -> Result<()> {
         if copies.is_empty() {
             return Ok(());
         }
-        let id = WINDOWS[k.min(MAX_WINDOWS - 1)];
         let paging = TablePaging::Window(u8::try_from(k).unwrap_or(u8::MAX));
         let runs: Vec<(u64, u64, u64, u64)> = self
             .rows
@@ -1496,9 +1526,7 @@ impl Pools {
                 _ => None,
             })
             .collect();
-        for &(source, ring, first, rows) in copies {
-            let from = self.slot_offset(id, source)?;
-            let to = self.slot_offset(id, ring)?;
+        for &(from, to, first, rows) in copies {
             for &(keys, keys_cell, values, values_cell) in &runs {
                 let at = u64::from(first);
                 let len = u64::from(rows);

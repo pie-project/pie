@@ -353,7 +353,12 @@ pub struct Shell {
     /// The windowed folds this fire's lanes make, `(window table, copies)`
     /// ([`Pools::fold_window_rows`]): planned as the fire is prepared,
     /// encoded after its forward in its own frame.
-    window_folds: Vec<(usize, Vec<(u32, u32, u32, u32)>)>,
+    window_folds: Vec<(usize, Vec<(u64, u64, u32, u32)>)>,
+    /// The boundary own-row pages' fills from their ring pages, `(window
+    /// table, (from, to) bytes)`: encoded before this fire's forward.
+    window_fills: Vec<(usize, Vec<(u64, u64)>)>,
+    /// Own-row pages this fire's lanes took of `Shell::own_top`.
+    own_used: u32,
     /// The own-row pages' chunks at the range's top, `(first, count)`: a
     /// windowed lane's rows past what its ring keeps for its queries, read
     /// as pages of the window slot each fire from these chunks.
@@ -1747,6 +1752,8 @@ impl PreparedLoad<'_> {
             inflight: VecDeque::new(),
             grafted: None,
             window_folds: Vec::new(),
+            window_fills: Vec::new(),
+            own_used: 0,
             own_top,
             landed: BTreeMap::new(),
             forgotten: std::collections::BTreeSet::new(),
@@ -3577,10 +3584,15 @@ impl Shell {
     }
 
     #[must_use]
-/// A windowed lane's window table for this fire (CONTRACT-BC 19, 21;
+    /// A windowed lane's window table for this fire (CONTRACT-BC 19, 21;
     /// `store::windowed`): its ring's pages below the buffer's base, its
-    /// window-buffer slots from it, and the fire's own rows past them in
-    /// their ring rows, as page ids at the window slot's stride.
+    /// window-buffer slots from it, and the fire's own rows past them: in
+    /// their ring rows where none of them overwrites a row a query of the
+    /// fire reads ([`crate::store::windowed::direct_allowed`]), else in pages
+    /// of the range's own-row chunks (`Shell::own_top`, the cursor
+    /// `Shell::own_used`), the one holding rows folded before the fire
+    /// filled from its ring page first. The fold the fire makes is planned
+    /// here and encoded after its forward.
     fn windowed_pages(
         &mut self,
         k: usize,
@@ -3592,7 +3604,7 @@ impl Shell {
         let refuse = |why: String| Fault::program("serve::windowed", why);
         let page = self.pools.window_paging(k).page_size.max(1);
         let window = self.pools.layout().window(k).map_or(0, |list| list.rows);
-        let per_chunk = self.pools.layout().window(k).map_or(0, |list| list.slots.per_chunk).max(1);
+        let per_chunk = self.pools.window_slots_a_chunk(k)?;
         let ring_rows = crate::chunks::MetalRing::rows(window, page);
         let pieces = seated
             .ring
@@ -3622,27 +3634,76 @@ impl Shell {
             })
             .collect::<Result<_>>()?;
         let ring = self.pools.window_pages(k, &ring_refs, None)?;
+        let ring_at: Vec<u64> = ring_refs
+            .iter()
+            .map(|&slot| self.pools.window_slot_offset(k, slot))
+            .collect::<Result<_>>()?;
         let buffer_refs = seated.windows.get(k).map_or(&[][..], Vec::as_slice);
         let buffer = self.pools.window_pages(k, buffer_refs, None)?;
+        let buffer_at: Vec<u64> = buffer_refs
+            .iter()
+            .map(|&slot| self.pools.window_slot_offset(k, slot))
+            .collect::<Result<_>>()?;
+        let end = have + rows;
+        let held = u64::from(fold.base) + buffer.len() as u64 * u64::from(page);
+        // The fire's own rows past the buffer: their ring rows, or own pages.
         let shared = false;
-        if !crate::store::windowed::direct_allowed(shared, rows, ring_rows, window) {
-            return Err(refuse(format!(
-                "a fire of {rows} rows writes past what its ring keeps for its own queries \
-                 (R {ring_rows}, W {window}); its rows past R - W + 1 go to activation pages, \
-                 which this engine does not yet lay"
-            )));
-        }
+        let direct = crate::store::windowed::direct_allowed(shared, rows, ring_rows, window);
+        let (own, own_at, own_page) = if direct || u64::from(end) <= held {
+            (Vec::new(), Vec::new(), 0)
+        } else {
+            let own_page = u32::try_from(held.max(u64::from(have)) / u64::from(page)).unwrap_or(u32::MAX);
+            let count = end.div_ceil(page).saturating_sub(own_page);
+            let (first, chunks) = self.own_top;
+            let mut ids = Vec::with_capacity(count as usize);
+            let mut at = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                let slot = self.own_used;
+                if slot >= chunks.saturating_mul(per_chunk) {
+                    return Err(refuse(format!(
+                        "a fire's windowed rows take more own-row pages than the {chunks} chunk(s) \
+                         the load reserved hold ({} pages)",
+                        chunks * per_chunk
+                    )));
+                }
+                self.own_used += 1;
+                let (byte, id) = self.pools.window_slot_at(k, first + slot / per_chunk, slot % per_chunk)?;
+                ids.push(id);
+                at.push(byte);
+            }
+            (ids, at, own_page)
+        };
         let lane = crate::store::windowed::WindowedLane {
             page,
             ring: &ring,
             base: fold.base,
             buffer: &buffer,
-            own: &[],
-            own_page: 0,
+            own: &own,
+            own_page,
         };
-        let pages = lane.pages(have + rows)?;
-        // The fold this fire makes, over refs (byte offsets come from refs):
-        // the buffered rows it advances over into their ring rows.
+        let pages = lane.pages(end)?;
+        // The same lane over indices into `bytes`, for the fills and the fold.
+        let (r, b, o) = (ring_at.len() as u32, buffer_at.len() as u32, own_at.len() as u32);
+        let ring_ix: Vec<u32> = (0..r).collect();
+        let buffer_ix: Vec<u32> = (r..r + b).collect();
+        let own_ix: Vec<u32> = (r + b..r + b + o).collect();
+        let bytes: Vec<u64> = ring_at.iter().chain(&buffer_at).chain(&own_at).copied().collect();
+        let by_index = crate::store::windowed::WindowedLane {
+            page,
+            ring: &ring_ix,
+            base: fold.base,
+            buffer: &buffer_ix,
+            own: &own_ix,
+            own_page,
+        };
+        let fills: Vec<(u64, u64)> = by_index
+            .own_fills(seated.folded)
+            .into_iter()
+            .map(|(ring, own)| (bytes[ring as usize], bytes[own as usize]))
+            .collect();
+        if !fills.is_empty() {
+            self.window_fills.push((k, fills));
+        }
         let advance = match fold.fold {
             engine::fire::FoldLen::Host(rows) => rows,
             engine::fire::FoldLen::Device => {
@@ -3654,15 +3715,11 @@ impl Shell {
             }
         };
         if advance > 0 {
-            let by_ref = crate::store::windowed::WindowedLane {
-                page,
-                ring: &ring_refs,
-                base: fold.base,
-                buffer: buffer_refs,
-                own: &[],
-                own_page: 0,
-            };
-            let copies = by_ref.fold_copies(seated.folded, seated.folded + advance)?;
+            let copies: Vec<(u64, u64, u32, u32)> = by_index
+                .fold_copies(seated.folded, seated.folded + advance)?
+                .into_iter()
+                .map(|(source, ring, first, rows)| (bytes[source as usize], bytes[ring as usize], first, rows))
+                .collect();
             if !copies.is_empty() {
                 self.window_folds.push((k, copies));
             }
@@ -3670,7 +3727,8 @@ impl Shell {
         Ok(pages)
     }
 
-        pub fn pool_ring(&self) -> Option<&crate::store::RingRows> {
+    #[must_use]
+    pub fn pool_ring(&self) -> Option<&crate::store::RingRows> {
         self.pools.ring()
     }
 
@@ -4715,6 +4773,10 @@ impl Shell {
         let mut tables: Vec<std::borrow::Cow<'_, [u32]>> = Vec::with_capacity(lanes.len());
         // Per window list, per lane: its pages.
         let window_lists = self.pools.layout().window_lists().count();
+        // A fire's windowed own-row pages, fills and folds start afresh.
+        self.own_used = 0;
+        self.window_fills.clear();
+        self.window_folds.clear();
         let mut window_tables: Vec<Vec<Vec<u32>>> =
             vec![Vec::with_capacity(lanes.len()); window_lists];
         let mut tokens: Vec<i32> = Vec::with_capacity(rows as usize);
@@ -6254,6 +6316,13 @@ impl Shell {
             }
             #[cfg(target_vendor = "apple")]
             frame.next_pass()?;
+        }
+        // The windowed boundary pages' fills, before anything reads them (a
+        // dry walk encodes for no fire; a fill again is the same bytes).
+        if !dry {
+            for (k, fills) in &self.window_fills {
+                self.pools.copy_window_slots(&mut frame, *k, fills)?;
+            }
         }
         self.feed_inputs(&mut frame, p)?;
         self.feed_tokens(&mut frame, p)?;
