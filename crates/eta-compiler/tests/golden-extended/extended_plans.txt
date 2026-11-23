@@ -69,3 +69,9 @@ plan: lines=34 fnv1a64=0x63cb8fdc44bfe1dc
 fused#0: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
 fused#1: library=0 library_op=0 schedule=2 nodes=12 inputs=1 outputs=1 sinks=0
 fused#2: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+=== extended_split_argmax#0
+stage_tag: 0x03
+signature: 515b8f0662f390a7
+plan: lines=31 fnv1a64=0x40fd8ad0bc81fa16
+fused#0: library=0 library_op=0 schedule=2 nodes=11 inputs=0 outputs=2 sinks=0
+fused#1: library=0 library_op=0 schedule=0 nodes=2 inputs=2 outputs=0 sinks=2

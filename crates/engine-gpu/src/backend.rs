@@ -129,6 +129,13 @@ pub trait Context<B: Backend> {
 
     fn cores(&self) -> u32;
 
+    /// The workgroups the device holds at once, as the load laid them
+    /// (measured, stored, committed or estimated): what a guest step's grid
+    /// strides over. `None` before the load has.
+    fn resident(&self) -> Option<u32> {
+        None
+    }
+
     /// What the device has for this load, measured now: what it holds for
     /// the load (every reservation and what the driver holds beside them)
     /// and what it has free, capped by the operator's `budget_device`.

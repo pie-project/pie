@@ -44,6 +44,7 @@ fn the_score_rows_are_the_oracles() {
         residency: engine_metal::ResidencyPlan::default(),
         profiles: None,
         top: engine_metal::Top::EveryRung,
+        measure: engine::rates::Measuring::Time,
     })
     .and_then(|mut shell| shell.raise_whole().map(|()| shell))
     .unwrap_or_else(|why| panic!("the shell loads: {why}"));

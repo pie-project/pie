@@ -7,6 +7,15 @@ pub(crate) mod landing;
 mod lanes;
 mod load;
 mod measured;
+
+/// The bodies records under `cache_dir` this build made, copied into
+/// `out`'s `bodies/` for a build to carry (`pie tune export --engine cuda`).
+pub fn export_bodies(
+    cache_dir: &std::path::Path,
+    out: &std::path::Path,
+) -> std::io::Result<Vec<String>> {
+    measured::export(cache_dir, out)
+}
 pub use load::Staged;
 mod prepare;
 mod segments;
@@ -209,6 +218,14 @@ pub struct Shell {
     /// residency (`filed`, `copied`; `Shell::preseat_weights`), for a
     /// measuring load that seats them again in a range reserved anew.
     preseated_as: Option<(bool, bool)>,
+    /// What this load's stored measurements are keyed by.
+    keys: crate::stored::Keys,
+    /// The decode products' times the profile states under a matching key:
+    /// a load's measurement joins them before it is saved.
+    products: Vec<profile::fire::ProductTime>,
+    /// Whether the load times the decode products' kernels no layer states
+    /// (`[engine] measure`).
+    routes_measuring: engine::rates::Measuring,
     segments: std::collections::HashMap<record::BodyKey, Segmented>,
     windows_memo: Vec<prepare::WindowsMemo>,
     cache: GraphCache,
@@ -1039,13 +1056,6 @@ impl Shell {
         bytes: u64,
     ) -> engine::program::Footprint {
         self.pools.guest_footprint(role, bytes)
-    }
-
-    /// Points every instance's rings at where their pool slots lie now.
-    pub fn rebase_programs(&mut self) -> Result<()> {
-        let pools = &self.pools;
-        self.programs
-            .rebase(&|item, bytes| pools.guest_item(item, bytes))
     }
 
     /// Instance `id`'s process parked (`engine::Rebind::Parked`).

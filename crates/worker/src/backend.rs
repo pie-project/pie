@@ -178,9 +178,11 @@ fn device_boot(
     home: &Path,
     cache_dir: &Path,
     adapter_dir: Option<&Path>,
+    measure: bool,
 ) -> Result<DeviceBoot> {
     let mut knobs = Knobs {
         profiles: Some(home.join("profiles")),
+        measuring: engine::rates::Measuring::of(measure),
         ..Knobs::default()
     };
     if let Some(words) = opts.diagnostics.as_deref() {
@@ -383,7 +385,7 @@ pub(crate) fn create_engine_backend_group(
         let EngineOptions::Cuda(opts) = rank_options else {
             return Err(anyhow!("cuda group creation requires cuda rank options"));
         };
-        let boot = device_boot(opts, home, cache_dir, adapter_dir)?;
+        let boot = device_boot(opts, home, cache_dir, adapter_dir, true)?;
         if opts.verbose {
             dump_device_boot(home, &boot, group_id, Some(rank));
         }
@@ -456,7 +458,7 @@ pub(crate) fn create_engine_lockstep(
                 "an expert-parallel group requires cuda rank options"
             ));
         };
-        let boot = device_boot(opts, home, cache_dir, adapter_dir)?;
+        let boot = device_boot(opts, home, cache_dir, adapter_dir, true)?;
         if opts.verbose {
             dump_device_boot(home, &boot, rank, Some(rank));
         }
@@ -536,6 +538,7 @@ pub(crate) fn create_engine_backend(
     adapters: &crate::config::AdapterConfig,
     residency: engine::Residency,
     max_context: Option<u32>,
+    measure: bool,
     overrides: &runtime::engine::load::Overrides,
     opened: Option<runtime::engine::EngineBox>,
 ) -> Result<GroupEngine> {
@@ -559,7 +562,7 @@ pub(crate) fn create_engine_backend(
         _ => unreachable!("`EngineOptions` has no variants in this build"),
         #[cfg(feature = "engine-cuda")]
         EngineOptions::Cuda(opts) => {
-            let boot = device_boot(opts, home, cache_dir, adapter_dir)?;
+            let boot = device_boot(opts, home, cache_dir, adapter_dir, measure)?;
             if opts.verbose {
                 dump_device_boot(home, &boot, group_id, None);
             }
@@ -587,6 +590,7 @@ pub(crate) fn create_engine_backend(
                 "profiles = {}\n",
                 toml::Value::String(home.join("profiles").display().to_string())
             ));
+            boot_doc.push_str(&format!("measure = {measure}\n"));
             if let Some(mount) = adapter_dir {
                 boot_doc.push_str(&format!(
                     "\n[model]\nadapter_dir = {}\n",
@@ -632,7 +636,7 @@ pub(crate) fn create_engine_backend(
                 .clone()
                 .unwrap_or_else(|| cache_dir.join("vulkan-pipelines.bin"));
             boot_doc.push_str(&format!(
-                "pipeline_cache = {}\nprofiles = {}\n",
+                "pipeline_cache = {}\nprofiles = {}\nmeasure = {measure}\n",
                 toml::Value::String(cache.display().to_string()),
                 toml::Value::String(home.join("profiles").display().to_string())
             ));
@@ -675,7 +679,7 @@ pub(crate) fn create_engine_backend(
                 ));
             }
             boot_doc.push_str(&format!(
-                "profiles = {}\n",
+                "profiles = {}\nmeasure = {measure}\n",
                 toml::Value::String(home.join("profiles").display().to_string())
             ));
             let backend = opened.map_or_else(
