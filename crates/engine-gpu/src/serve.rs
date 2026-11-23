@@ -5896,24 +5896,18 @@ impl<B: Serve> Shell<B> {
                 });
             } else if self.pools.rings().is_some() {
                 let tokens = self.pools.paging().page_size.max(1);
-                let window = match (seated.window, seated.refs) {
-                    (Some(window), _) => window,
-                    (None, true) => {
-                        return Err(program(
-                            "serve::stage",
-                            format!(
-                                "lane {source} names its slots by ref and states no window \
-                                 fold on a load with windowed layers"
-                            ),
-                        ));
-                    }
-                    (None, false) => engine::fire::WindowFold {
+                // A lane stating no fold (a seat-addressed one, or one of the
+                // engine's own bind walks; the runtime's are refused at the
+                // fire's validation) folds every row it brings.
+                let window = match seated.window {
+                    Some(window) => window,
+                    None => engine::fire::WindowFold {
                         base: (have + row.rows) / tokens * tokens,
                         fold: engine::fire::FoldLen::Host(row.rows),
                         lineage: engine::fire::Lineage::Set,
                     },
                 };
-                let folded = if seated.refs { seated.folded } else { have };
+                let folded = if seated.window.is_some() { seated.folded } else { have };
                 // A fold the device counts: the count its program's `fold`
                 // port holds at the fire, as the recurrent scans take it.
                 let fold = match window.fold {
@@ -5932,7 +5926,7 @@ impl<B: Serve> Shell<B> {
                 // The buffered rows its lineage reads, as its recurrent
                 // layers replay them.
                 let reads = engine::fire::buffered_reads(
-                    seated.mask.filter(|_| seated.refs),
+                    seated.mask.filter(|_| seated.window.is_some()),
                     folded,
                     have,
                     window.lineage,
