@@ -713,7 +713,7 @@ impl RoleShapes {
             SlotRole::Instance => self.instance,
             SlotRole::Channel => self.channel,
             SlotRole::Adapter => self.adapter,
-            SlotRole::State | SlotRole::RsBuffer => None,
+            SlotRole::State | SlotRole::RsBuffer | SlotRole::WindowBuffer => None,
         }
     }
 
@@ -1068,7 +1068,7 @@ impl SharedPool {
                         SlotRole::Instance => &mut instances,
                         SlotRole::Channel => &mut channels,
                         SlotRole::Adapter => &mut adapters,
-                        SlotRole::State | SlotRole::RsBuffer => &mut fixed,
+                        SlotRole::State | SlotRole::RsBuffer | SlotRole::WindowBuffer => &mut fixed,
                     };
                     found.push(FixedShape {
                         id: shape.id,

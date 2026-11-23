@@ -53,7 +53,9 @@ pub struct PoolFacts {
     pub adapter_banks: u32,
     /// The window the model's sliding rows are read through, a fact of the
     /// model: an engine that pages its sliding rows in full states no window
-    /// list for it. Zero when the model declares no windowed row.
+    /// list for it. Zero when the model declares no windowed row. Removed
+    /// by the windowed-state change; do not use in new code (each windowed
+    /// layer's window is [`crate::chunk::WindowedLayer::window`]).
     #[serde(default)]
     pub window_tokens: u32,
     /// The engine would rather a lane already decoding claim its next pages
@@ -89,6 +91,16 @@ pub struct Capabilities {
 
     #[serde(default)]
     pub rs_verbs: bool,
+
+    /// The engine serves windowed (sliding-window attention) layers as
+    /// state + buffer, as a recurrent layer is (CONTRACT-BC 19, 21): each
+    /// windowed layer's ring of its last W folded rows in the lane's record
+    /// ([`ChunkFacts::windowed`]), rows from the lane's folded index on in
+    /// the window buffer ([`crate::SlotRole::WindowBuffer`]), and
+    /// [`crate::Lane::window`] read on every lane. False: no lane states a
+    /// window fold to it.
+    #[serde(default)]
+    pub windowed_state: bool,
 
     /// The rows inside one lane whose recurrent state a fire lands in slots
     /// of their own as it runs (`Lane::rs_snapshots`); 0 where it lands only
