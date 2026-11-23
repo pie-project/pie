@@ -41,7 +41,7 @@ PIE_POOL_WRITE(uint, params.seg_words)
 #define PIE_PAGES_COPY_BOUNDS 4u
 #define PIE_PAGES_PARENT 5u
 #define PIE_PAGES_EXHAUSTED 6u
-#define PIE_PAGES_GROUP 7u
+#define PIE_PAGES_TOO_WIDE 7u
 #define PIE_BEAM_HEADER 4u
 // The beams one group's step holds: its six per-beam tables (24 bytes a
 // beam) beside the rest of its workgroup storage, within the 16 KiB every
@@ -458,7 +458,7 @@ void main(uint3 local : SV_GroupThreadID, uint3 group : SV_GroupID) {
         // lane, never a silent skip: the host refuses such a group at its
         // bind, so this is a bug named once the fire lands.
         for (uint b = t; b < B; b += T) {
-            store[faults + b] = PIE_PAGES_GROUP;
+            store[faults + b] = PIE_PAGES_TOO_WIDE;
         }
     }
 }

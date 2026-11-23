@@ -238,6 +238,7 @@ adopts `b* = parent[l]`, whose pages hold every row of that hypothesis.
 | 4    | COPY_BOUNDS       | a copy past the pool, longer than a page, or into frozen slots |
 | 5    | PARENT            | `parent[b] >= B` |
 | 6    | RESERVE_EXHAUSTED | fewer free pages than the fire hands out: unreachable with the exact sizing of §3, so a bug, logged loudly; it still faults only that lane |
+| 7    | TOO_WIDE          | the group has more beams than its step's tables were laid for (`PAGES_TOO_WIDE` on every engine): its width is admitted at its bind, so a bug; every lane of the group faults it |
 
 The fault words are a `[B]` array per group the head kernel writes and the
 settle reads, **one set per fire in flight**: the next fire's head kernel

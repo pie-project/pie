@@ -291,7 +291,7 @@ pub fn fault_reason(code: u32, lane: usize) -> String {
              slots"
         }
         kb::PAGES_PARENT => "continues a parent past its beams",
-        kb::PAGES_GROUP => {
+        kb::PAGES_TOO_WIDE => {
             tracing::error!(
                 lane,
                 "engine-gpu: BUG: a beam group's step record passes the step's bounds; its \

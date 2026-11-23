@@ -477,7 +477,7 @@ fn a_record_past_the_steps_bounds_faults_every_lane() {
     });
     let got = gpu.down_u32(store_h, lay.words as usize);
     let faults = &got[lay.faults as usize..(lay.faults + lanes) as usize];
-    assert_eq!(faults, [kb::PAGES_GROUP; 4], "every lane faults the group's code");
+    assert_eq!(faults, [kb::PAGES_TOO_WIDE; 4], "every lane faults the group's code");
     let pool = gpu.down_u32(pool_h, state_words as usize);
     assert!(pool.iter().all(|&w| w == 0), "nothing was stepped");
 }
