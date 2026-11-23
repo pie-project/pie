@@ -139,6 +139,11 @@ pub(crate) struct StepGroup {
     /// no more than `prefill_lanes`.
     lanes: usize,
     decoding: bool,
+    /// Every member's rs scratch compact, and the widest rung any asked
+    /// ([`crate::engine::FireRequest::replay_rung`]): the step's members
+    /// together fit that rung's replay scratch.
+    incompact: bool,
+    replay_rung: Option<::engine::RungReplay>,
 }
 
 /// Whether `request` has a lane decoding (a row of its own, or none the
@@ -207,6 +212,15 @@ impl StepGroup {
         {
             return false;
         }
+        // Its members' replay together fits the widest rung any asked: a
+        // fire whose rs scratch a step would pass goes in a later step.
+        if self.forward_requests > 0
+            && request.request.replay_rung.is_some()
+            && let Some((rung, rows)) = self.replay_with(request)
+            && ::engine::fire::rung_holds(&rung, rows).is_err()
+        {
+            return false;
+        }
         self.forward_requests.saturating_add(usage.forward_requests) <= limits.max_forward_requests
             && self.forward_tokens.saturating_add(usage.forward_tokens) <= limits.max_forward_tokens
             && self.carried_rows.saturating_add(usage.carried_rows) <= limits.max_forward_tokens
@@ -220,6 +234,28 @@ impl StepGroup {
             && self.page_refs.saturating_add(usage.page_refs) <= limits.max_page_refs
             && (limits.max_readouts == 0
                 || self.readouts.saturating_add(usage.readouts) <= limits.max_readouts)
+    }
+
+    /// The rung a step holding `request` too runs at least at, and the
+    /// rows of its members together ([`::engine::fire::rung_holds`]).
+    fn replay_with(&self, request: &PendingRequest) -> Option<(::engine::RungReplay, ::engine::ReplayRows)> {
+        let wider = |a: &::engine::RungReplay, b: &::engine::RungReplay| {
+            a.own_max.unwrap_or(u32::MAX) >= b.own_max.unwrap_or(u32::MAX)
+        };
+        let rung = match (&self.replay_rung, &request.request.replay_rung) {
+            (Some(a), Some(b)) => Some(if wider(a, b) { a.clone() } else { b.clone() }),
+            (a, b) => a.clone().or_else(|| b.clone()),
+        }?;
+        let usage = request_capacity_usage(request, 0);
+        let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        let rows = ::engine::ReplayRows::of_sums(
+            count(self.forward_tokens.saturating_add(usage.forward_tokens)),
+            count(self.carried_rows.saturating_add(usage.carried_rows)),
+            count(self.replayed_rows.saturating_add(usage.replayed_rows)),
+            count(self.lanes.saturating_add(request.request.lanes.len())),
+            !self.incompact && request.request.scratch_compact,
+        );
+        Some((rung, rows))
     }
 
     pub(crate) fn push(
@@ -243,6 +279,10 @@ impl StepGroup {
         self.replayed_rows = self.replayed_rows.saturating_add(usage.replayed_rows);
         self.page_refs = self.page_refs.saturating_add(usage.page_refs);
         self.readouts = self.readouts.saturating_add(usage.readouts);
+        if let Some((rung, _)) = self.replay_with(request) {
+            self.replay_rung = Some(rung);
+        }
+        self.incompact |= !request.request.scratch_compact;
         self.lanes = self.lanes.saturating_add(request.request.lanes.len());
         self.decoding |= decodes(request);
         (limits.prefill_lanes > 0 && !self.decoding && self.lanes >= limits.prefill_lanes)
@@ -598,6 +638,66 @@ mod tests {
             readout_store: 0,
             max_replayed_rows: 0,
         }
+    }
+
+    /// Qwen3.5-0.8B's rs scratch on Metal at rung 256 (Mac's measurements):
+    /// eight scratch slots of 45,376 bytes a row together, 1 MiB a lane,
+    /// 291,667,968 bytes reserved.
+    fn qwen3_5_rung_256() -> ::engine::RungReplay {
+        ::engine::RungReplay {
+            own_max: Some(256),
+            carried_max: Some(256),
+            scratch: ::engine::ScratchBytes {
+                slot_bytes: vec![12288, 64, 4096, 12288, 128, 128, 8192, 8192],
+                lane_bytes: 262_144 * 4,
+                room_bytes: 291_667_968,
+                pad: 256,
+            },
+        }
+    }
+
+    /// w10: sixteen processes' replay fires of ten decode lanes each, every
+    /// lane replaying 37 rows, laid non-compact, each asking rung 256 alone
+    /// (380 scratch rows over 10 lanes fit it). Composed into one step of
+    /// 160 lanes they would take 443,658,240 bytes, past the rung's
+    /// 291,667,968: the step takes no more of them than the rung holds
+    /// together, the rest going in later steps.
+    #[test]
+    fn a_step_takes_no_more_replay_than_its_rung_s_scratch_holds() {
+        let rung = qwen3_5_rung_256();
+        assert_eq!(rung.scratch.bytes(6080, 160), 443_658_240, "Mac's 160-lane fire");
+        let fire = |instance: u64| {
+            let mut request = FireRequest {
+                lanes: (0..10)
+                    .map(|lane| crate::engine::fire::lane_of(lane, vec![9], 0, vec![lane]))
+                    .collect(),
+                ..FireRequest::default()
+            };
+            request.replayed = 370;
+            request.scratch_compact = false;
+            request.replay_rung = Some(rung.clone());
+            pending(request, InstanceId(instance))
+        };
+        let wave: Vec<Box<PendingRequest>> = (1..=16).map(fire).collect();
+        let limits = SchedulerLimits {
+            max_forward_requests: 1024,
+            max_forward_tokens: 4096,
+            max_page_refs: 4096,
+            ..limits()
+        };
+        let (frame, _) = build_frame_submission(vec![wave], limits, 16, &SchedulerStats::default());
+        assert!(frame.steps.len() > 1, "one step would pass the rung's scratch");
+        for step in &frame.steps {
+            let lanes = u32::try_from(step.submission.lanes.len()).unwrap();
+            let rows = lanes + lanes * 37;
+            assert!(
+                rung.scratch.bytes(rows, lanes) <= rung.scratch.room_bytes,
+                "a step of {lanes} lanes takes {} bytes",
+                rung.scratch.bytes(rows, lanes)
+            );
+        }
+        let lanes: usize = frame.steps.iter().map(|step| step.submission.lanes.len()).sum();
+        assert_eq!(lanes, 160, "every lane served");
     }
 
     #[test]

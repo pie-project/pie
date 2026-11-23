@@ -23,6 +23,13 @@ pub struct FireRequest {
     /// summed over every lane, a decode lane's included: what the engine's
     /// stated [`::engine::FireLimits::replayed_rows`] bounds a step by.
     pub replayed: u32,
+    /// Its rs scratch is compact ([`::engine::fire::scratch_compact`], as
+    /// the runtime evaluated it from what it puts in the fire).
+    pub scratch_compact: bool,
+    /// What the rung the fire asked holds of its replay
+    /// ([`::engine::RungReplay`]): a step of several fires runs at a rung at
+    /// least that wide, and takes no more fires than it holds together.
+    pub replay_rung: Option<::engine::RungReplay>,
     /// The ring ends this fire moves. Two fires moving one end never share
     /// a step; the engine picks each move's cell from its ring's cursor.
     pub ring_moves: Vec<RingMove>,

@@ -171,6 +171,10 @@ pub struct Lane<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct Seated<'a> {
     pub lane: Lane<'a>,
+    /// The lane's replay as the runtime stated it (`Lane::replay_stated`):
+    /// what the submit check's debug cross-check compares with
+    /// (`engine::fire::replay_agrees`).
+    pub replay_stated: Option<engine::fire::LaneReplay>,
     pub group: Option<u32>,
     pub inputs: &'a [engine::fire::InputFeed],
     pub pages: &'a [u32],
@@ -220,7 +224,8 @@ impl<'a> Seated<'a> {
     pub fn of(lane: Lane<'a>) -> Seated<'a> {
         const FOLD: engine::fire::RsVerb = engine::fire::RsVerb::Fold;
         Seated {
-            lane,
+            replay_stated: None,
+                        lane,
             group: None,
             inputs: &[],
             pages: &[],
@@ -248,7 +253,8 @@ impl<'a> Seated<'a> {
     #[must_use]
     pub fn adapted(lane: Lane<'a>, id: u32) -> Seated<'a> {
         Seated {
-            adapter: Some(id),
+            replay_stated: None,
+                        adapter: Some(id),
             ..Seated::of(lane)
         }
     }
@@ -2685,6 +2691,7 @@ impl Shell {
                             let prompt_tokens = vec![0u32; prompt as usize];
                             let one = [0u32];
                             let prefill = [Seated {
+                                replay_stated: None,
                                 held: Some(*held),
                                 rs: verb,
                                 refs: true,
@@ -2699,6 +2706,7 @@ impl Shell {
                             }];
                             let decode: Vec<Seated<'_>> = (0..lanes)
                                 .map(|slot| Seated {
+                                    replay_stated: None,
                                     held: Some(*held),
                                     rs: verb,
                                     refs: true,
@@ -5747,6 +5755,18 @@ impl Shell {
                 rs_plans.iter().zip(&rs_own).map(|(plan, &own)| (own, plan.replay)),
                 fire_compact,
             );
+            if engine::fire::replay_check_on() {
+                engine::fire::replay_agrees(
+                    lanes.iter().zip(&rs_own).map(|(seated, &own)| (own, seated.replay_stated)),
+                    &rung,
+                    held,
+                    fire_compact,
+                    load_compact,
+                    true,
+                    !rs_snaps.is_empty(),
+                )
+                .map_err(|why| Fault::program("serve::rs", why))?;
+            }
             if let Err(past) = engine::fire::rung_holds(&rung, held) {
                 return Err(Fault::program(
                     "serve::rs",

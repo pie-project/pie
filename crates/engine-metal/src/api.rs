@@ -1527,6 +1527,7 @@ impl Metal {
             .enumerate()
             .map(|(at, lane)| {
                 Ok(Seated {
+                    replay_stated: lane.replay_stated,
                     lane: Lane {
                         slot: lane.slot,
                         word: words[at],

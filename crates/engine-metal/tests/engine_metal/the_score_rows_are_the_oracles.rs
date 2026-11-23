@@ -63,6 +63,7 @@ fn the_score_rows_are_the_oracles() {
         .map(|slot| {
             let tokens: &[u32] = if slot == 0 { &prompt } else { &one[slot as usize - 1] };
             Seated {
+                replay_stated: None,
                 held: Some(0),
                 ..Seated::of(Lane {
                     slot,
@@ -91,6 +92,7 @@ fn the_score_rows_are_the_oracles() {
                 word(&fixture.trace, tokens.len() as u32)
             };
             Seated {
+                replay_stated: None,
                 held: Some(0),
                 ..Seated::of(Lane { slot, word, tokens })
             }

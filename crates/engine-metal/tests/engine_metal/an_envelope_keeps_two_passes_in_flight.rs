@@ -166,6 +166,7 @@ pub(super) fn submit(
         let _ = tx.lock().unwrap().send((at, outcome));
     });
     let lanes = [Seated {
+        replay_stated: None,
         held: Some(0),
         ..Seated::of(Lane {
             slot: 0,
@@ -222,6 +223,7 @@ fn an_envelope_keeps_two_passes_in_flight() {
     shell.open(3).expect("slot 3 opens");
     let vocab = shell
         .fire_seated(&[Seated {
+            replay_stated: None,
             held: Some(0),
             ..Seated::of(Lane {
                 slot: 3,

@@ -35,6 +35,7 @@ fn a_cold_registration_compiles_while_lanes_fire() {
     shell.open(0).expect("the slot opens");
     shell
         .fire_seated(&[Seated {
+            replay_stated: None,
             held: Some(0),
             ..Seated::of(Lane {
                 slot: 0,
@@ -48,6 +49,7 @@ fn a_cold_registration_compiles_while_lanes_fire() {
         let began = Instant::now();
         shell
             .fire_seated(&[Seated {
+                replay_stated: None,
                 held: Some(*held),
                 ..Seated::of(Lane {
                     slot: 0,
@@ -116,6 +118,7 @@ fn a_cold_registration_compiles_while_lanes_fire() {
     shell
         .fire_attached(
             &[Seated {
+                replay_stated: None,
                 held: Some(held),
                 ..Seated::of(Lane {
                     slot: 0,

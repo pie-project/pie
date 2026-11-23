@@ -157,6 +157,7 @@ fn fire_attached_at(lanes: u32, owned: u32, fold: &[u32]) -> Option<String> {
     shell.open(spare).expect("the spare slot opens");
     let vocab = shell
         .fire_seated(&[Seated {
+            replay_stated: None,
             held: Some(0),
             ..Seated::of(Lane {
                 slot: spare,
@@ -234,6 +235,7 @@ fn fire_attached_at(lanes: u32, owned: u32, fold: &[u32]) -> Option<String> {
         .iter()
         .zip(0u32..)
         .map(|(verb, slot)| Seated {
+            replay_stated: None,
             held: Some(0),
             rs: verb,
             reports: 1 + u64::from(slot),
@@ -313,6 +315,7 @@ fn a_device_fold_lane_without_a_program_is_refused() {
     let tokens: Vec<u32> = (0..ROWS).map(|at| (7 + at * 37) % 256).collect();
     let verb = buffering(&shell);
     let lane = Seated {
+        replay_stated: None,
         held: Some(0),
         rs: &verb,
         reports: 1,

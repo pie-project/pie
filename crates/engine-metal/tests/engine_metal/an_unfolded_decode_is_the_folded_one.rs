@@ -38,6 +38,7 @@ fn an_unfolded_decode_is_the_folded_one() {
     let fire = |shell: &mut engine_metal::Shell, slot: u32, held: u32, toks: &[u32], rs: &RsVerb, reset: RsReset| {
         shell
             .fire_seated(&[Seated {
+                replay_stated: None,
                 held: Some(held),
                 rs,
                 rs_reset: reset,

@@ -18,6 +18,7 @@ const STEPS: u32 = 10;
 fn step(shell: &mut Shell, fixture: &Fixture, slot: u32, token: u32, held: u32) -> engine_metal::serve::Landed {
     let tokens = [token];
     let lanes = [Seated {
+        replay_stated: None,
         held: Some(held),
         ..Seated::of(Lane {
             slot,

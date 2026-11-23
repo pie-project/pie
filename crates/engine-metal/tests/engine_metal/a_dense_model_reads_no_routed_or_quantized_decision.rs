@@ -27,6 +27,7 @@ fn read_by(fixture: &Fixture) -> Vec<&'static str> {
     shell.open(0).expect("the slot opens");
     shell
         .fire_seated(&[Seated {
+            replay_stated: None,
             held: Some(0),
             ..Seated::of(Lane {
                 slot: 0,
@@ -37,6 +38,7 @@ fn read_by(fixture: &Fixture) -> Vec<&'static str> {
         .expect("the prompt serves");
     shell
         .fire_seated(&[Seated {
+            replay_stated: None,
             held: Some(prompt.len() as u32),
             ..Seated::of(Lane {
                 slot: 0,

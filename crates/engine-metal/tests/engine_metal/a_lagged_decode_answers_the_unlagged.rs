@@ -53,6 +53,7 @@ fn a_lagged_decode_answers_the_unlagged() {
                 reset: RsReset| {
         shell
             .fire_seated(&[Seated {
+                replay_stated: None,
                 held: Some(held),
                 rs,
                 rs_reset: reset,

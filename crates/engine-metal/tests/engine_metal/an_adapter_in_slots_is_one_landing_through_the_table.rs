@@ -54,6 +54,7 @@ fn logits(shell: &mut Shell, fixture: &Fixture, slot: u32, adapter: Option<u32>)
             .expect("the model has an adapted arm");
     }
     let seated = Seated {
+        replay_stated: None,
         held: Some(0),
         adapter,
         ..Seated::of(Lane {

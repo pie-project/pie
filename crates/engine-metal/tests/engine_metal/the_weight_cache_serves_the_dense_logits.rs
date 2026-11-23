@@ -258,6 +258,7 @@ fn serve(fixture: &Fixture, mode: Mode) -> (Vec<Vec<f32>>, u64) {
                 .expect("the evacuation lands");
         }
         let seated = Seated {
+            replay_stated: None,
             held: Some(held),
             ..Seated::of(Lane {
                 slot: 0,
@@ -336,6 +337,7 @@ fn serve(fixture: &Fixture, mode: Mode) -> (Vec<Vec<f32>>, u64) {
             })
             .expect("the residency lands");
         let seated = Seated {
+            replay_stated: None,
             held: Some(held),
             ..Seated::of(Lane {
                 slot: 0,
@@ -552,6 +554,7 @@ fn a_held_warm_load_probe() {
     let mut last = Vec::new();
     for _ in 0..8 {
         let seated = Seated {
+            replay_stated: None,
             held: Some(seen),
             ..Seated::of(Lane {
                 slot: 0,
