@@ -19,6 +19,13 @@ struct Input {
     /// its place, so a run split into turns draws what it would in one.
     #[serde(default)]
     drawn: u32,
+    /// Take each row's largest logit instead of a seeded draw.
+    #[serde(default)]
+    greedy: bool,
+    /// Stop after this many tokens, short of `max_tokens`: the set then
+    /// holds every token but the last drawn, which the next turn writes.
+    #[serde(default)]
+    stop_after: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -27,7 +34,14 @@ struct Output {
 }
 
 /// Writes `tokens` to `ws` and draws the token after them.
-async fn draw(ws: &WorkingSet, pipe: &Pipeline, tokens: &[i32], seed: u32, at: u32) -> Result<i32> {
+async fn draw(
+    ws: &WorkingSet,
+    pipe: &Pipeline,
+    tokens: &[i32],
+    seed: u32,
+    at: u32,
+    greedy: bool,
+) -> Result<i32> {
     let toks = Channel::from(tokens);
     let indptr = Channel::from([0u32, tokens.len() as u32]);
     let rng = Channel::from([seed, at]);
@@ -38,7 +52,12 @@ async fn draw(ws: &WorkingSet, pipe: &Pipeline, tokens: &[i32], seed: u32, at: u
     let sampled = out.clone();
     fwd.epilogue(move || {
         let r = rng.take();
-        sampled.put(&gumbel_max(intrinsics::output(0, "logits"), &r));
+        let logits = intrinsics::output(0, "logits");
+        if greedy {
+            sampled.put(reshape(reduce_argmax(&logits), [1]));
+        } else {
+            sampled.put(&gumbel_max(logits, &r));
+        }
     });
     fwd.submit(pipe).context("submit")?;
     Ok(out.take_host::<i32>().await.context("drain")?)
@@ -49,9 +68,20 @@ async fn main(input: Input) -> Result<Output> {
     let ws = input.ws;
     let pipe = Pipeline::new();
     let mut tokens: Vec<i32> = input.tokens.iter().map(|&t| t as i32).collect();
-    let mut generated = Vec::with_capacity(input.max_tokens);
-    for i in 0..input.max_tokens as u32 {
-        let next = draw(&ws, &pipe, &tokens, input.seed, input.drawn + i).await?;
+    let n = input
+        .stop_after
+        .map_or(input.max_tokens, |k| k.min(input.max_tokens));
+    let mut generated = Vec::with_capacity(n);
+    for i in 0..n as u32 {
+        let next = draw(
+            &ws,
+            &pipe,
+            &tokens,
+            input.seed,
+            input.drawn + i,
+            input.greedy,
+        )
+        .await?;
         generated.push(next as u32);
         tokens = vec![next];
     }
