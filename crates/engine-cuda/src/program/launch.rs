@@ -1897,6 +1897,35 @@ pub fn state_queue_masks(masks: &crate::serve::QueueMasks) {
     let _ = QUEUE_MASKS.set(masks.clone());
 }
 
+/// Of device `ordinal`'s `units` compute units, those this process's queues
+/// run on under the CU masks the load stated ([`state_queue_masks`]), and
+/// named at load where a mask keeps any off.
+#[cfg(feature = "rocm")]
+#[must_use]
+pub fn masked_units(units: u32, ordinal: u32) -> u32 {
+    let masks = QUEUE_MASKS.get().cloned().unwrap_or_default();
+    // The HSA agent HIP's ordinal names: the ordinal's entry of a
+    // visible-devices list, where one is set.
+    let agent = masks
+        .visible_devices
+        .as_deref()
+        .and_then(|list| list.split(',').nth(ordinal as usize)?.trim().parse().ok())
+        .unwrap_or(ordinal);
+    let held = queue_units(
+        units,
+        agent,
+        masks.hsa_cu_mask.as_deref(),
+        masks.global_cu_mask.as_deref(),
+    );
+    if held != units {
+        eprintln!(
+            "engine-cuda: {held} of the device's {units} compute units are this process's \
+             queues' (a CU mask); every grid, arena and sampler is laid over those"
+        );
+    }
+    held
+}
+
 #[must_use]
 pub fn device_units() -> u32 {
     static UNITS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
@@ -1919,31 +1948,12 @@ pub fn device_units() -> u32 {
                 }
             }
             let units = u32::try_from(count).unwrap_or(1).max(1);
+            // On ROCm the count is the one the device context stated from the
+            // process's CU masks (`masked_units`), as every launcher reads it.
             #[cfg(feature = "rocm")]
             {
-                let masks = QUEUE_MASKS.get().cloned().unwrap_or_default();
-                let ordinal = u32::try_from(device).unwrap_or(0);
-                // The HSA agent HIP's ordinal names: the ordinal's entry of a
-                // visible-devices list, where one is set.
-                let agent = masks
-                    .visible_devices
-                    .as_deref()
-                    .and_then(|list| list.split(',').nth(ordinal as usize)?.trim().parse().ok())
-                    .unwrap_or(ordinal);
-                let held = queue_units(
-                    units,
-                    agent,
-                    masks.hsa_cu_mask.as_deref(),
-                    masks.global_cu_mask.as_deref(),
-                );
-                if held != units {
-                    eprintln!(
-                        "engine-cuda: {held} of the device's {units} compute units are this \
-                         process's queues' (a CU mask); its samplers' blocks are laid over \
-                         those"
-                    );
-                }
-                held
+                let _ = units;
+                kernels_cuda::hip::multiprocessors(device.unsigned_abs()).unwrap_or(1).max(1)
             }
             #[cfg(not(feature = "rocm"))]
             units
