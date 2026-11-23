@@ -1298,7 +1298,14 @@ mod tests {
             .expect("both settles read back");
         assert_eq!(read.rates().dense_settled, both.dense_settled);
         let twice = "api = 1\n[rates]\ndense_settled_keyed = [[1, 7, 6, []], [1, 7, 6, []]]\n";
-        assert!(registry.load_user(twice, "twice").is_err(), "a key stated twice is refused");
+        // A key stated twice: the entry is skipped in a user's file (the rest
+        // read), refused whole in a committed one.
+        let read = registry.load_user(twice, "twice").expect("the rest reads");
+        assert!(read.rates().dense_settled.is_empty(), "the entry is skipped");
+        assert!(
+            registry.parse(twice, "c.measured.toml", crate::Strict::Measured).is_err(),
+            "a committed profile stating a key twice is refused"
+        );
     }
 
     /// A user file one entry of which another pie wrote in another form
