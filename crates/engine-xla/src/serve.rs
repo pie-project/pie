@@ -2284,6 +2284,9 @@ impl Shell {
         // Each lane's own rows and the buffered rows it replays ahead of them
         // (a decode lane's included).
         let mut replays: Vec<(u32, u32)> = Vec::with_capacity(lanes.len());
+        // Whether any lane holds rows before the fire: only such a lane may
+        // carry buffered rows into it.
+        let mut any_held = false;
         let mut lane_pages: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
         let mut lane_windows: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
         // The windowed state (CONTRACT-BC 19, 21): each windowed lane's
@@ -2400,6 +2403,7 @@ impl Shell {
                     .copied()
                     .unwrap_or(0),
             };
+            any_held |= have > 0;
             let is_fresh = match seated.rs_reset {
                 engine::fire::RsReset::Inferred => have == 0,
                 engine::fire::RsReset::Fresh => true,
@@ -3120,10 +3124,16 @@ impl Shell {
             (Some(layout), true) => {
                 let replay: Vec<i32> = rs_plans.iter().map(|p| p.replay as i32).collect();
                 let commit: Vec<i32> = rs_plans.iter().map(|p| p.commit as i32).collect();
-                // A fire that replays lays each window's scratch for the
-                // rung's own rows and its carried room; one that replays
-                // nothing, for its own rows alone.
-                let replays = replays.iter().any(|&(_, replayed)| replayed > 0);
+                // A fire that may carry buffered rows (a lane of it holds rows
+                // already, on a load that buffers them: under the runtime's
+                // lagged fold a decode carries what its run-ahead left) lays
+                // each window's scratch for the rung's own rows and its stated
+                // carried room (`crate::rs::rung_replay`), whether it carries
+                // any this time or not: one program a shape, the one the warm
+                // ladder lays with the same held rows. A fire of fresh lanes
+                // alone (a first prefill) carries nothing and lays its own rows.
+                debug_assert!(any_held || replays.iter().all(|&(_, replayed)| replayed == 0));
+                let replays = any_held && self.pools.buffers_rs();
                 let mut maps = std::collections::HashMap::new();
                 for window in windows.all() {
                     if window.indptr_host.is_empty() {

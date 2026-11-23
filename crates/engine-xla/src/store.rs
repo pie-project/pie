@@ -1665,6 +1665,12 @@ impl Pools {
         self.rs_buffers.clone()
     }
 
+    /// Whether the load buffers recurrent rows (an rs list's buffer planes).
+    #[must_use]
+    pub fn buffers_rs(&self) -> bool {
+        !self.rs_buffers.is_empty()
+    }
+
     /// Every cache row's compressor planes, for a walk.
     #[must_use]
     pub fn compressors(&self) -> Vec<(u32, [Tensor; 2], [Map; 2])> {
