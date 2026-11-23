@@ -1048,6 +1048,13 @@ impl Pools {
             self.pool.committed_segments(),
             &self.shape_rows,
         );
+        // A windowed load's rings: the layers they hold, and their bytes in
+        // the record (CONTRACT-BC 21); the record's state bytes are the
+        // shell's to add (`Shell::chunk_facts`).
+        if let Some(ring) = &self.ring {
+            facts.windowed.clone_from(&ring.layers);
+            facts.record_bytes = ring.layers.iter().map(|layer| layer.bytes).sum();
+        }
         facts.host_chunks = self.tier.as_ref().map_or(0, |tier| {
             u32::try_from(tier.chunks.len()).unwrap_or(u32::MAX)
         });
