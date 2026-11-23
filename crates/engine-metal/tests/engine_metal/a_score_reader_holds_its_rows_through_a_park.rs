@@ -165,7 +165,7 @@ type Decodes = Vec<(Vec<f32>, Vec<f32>, Vec<f32>)>;
 fn ready(fixture: &Fixture) -> Shell {
     let mut shell = load_with(fixture, CONTEXT);
     shell.warm_pipelines().expect("the walk runs");
-    shell.seal_pipelines();
+    shell.seal_pipelines().expect("the fixed pipelines build");
     shell
 }
 

@@ -30,7 +30,7 @@ fn a_cold_registration_compiles_while_lanes_fire() {
     let fixture = fixture_of("qwen3-micro-text", None);
     let mut shell = load_with(&fixture, CONTEXT);
     shell.warm_pipelines().expect("the walk runs");
-    shell.seal_pipelines();
+    shell.seal_pipelines().expect("the fixed pipelines build");
     let prompt: Vec<u32> = (0..12u32).map(|t| (t * 7 + 11) % 256).collect();
     shell.open(0).expect("the slot opens");
     shell

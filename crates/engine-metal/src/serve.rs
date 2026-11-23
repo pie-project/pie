@@ -2335,25 +2335,26 @@ impl Shell {
         self.pipelines.save_archive(path)
     }
 
-    /// Seals the pipelines built ([`Shell::warm_pipelines`]), the beam
-    /// head step's with them: any decode envelope may state parents
-    /// (BEAM-PAGE-LISTS), and no fire builds a pipeline after ready.
-    pub fn seal_pipelines(&self) {
-        for fire in kernels_metal::runtime::beam::pipelines() {
-            if let Err(fault) = self.pipelines.warm(&self.device, fire) {
-                tracing::warn!(%fault, "metal: the beam head step's pipeline did not build");
-            }
-        }
-        // A load that buffers recurrent rows: the carried scan's forms, a
-        // long carry (a beam's) being one the warm walk does not reach.
-        if self.rs_layout.is_some() {
-            for fire in kernels_metal::ssm::carried_pipelines() {
-                if let Err(fault) = self.pipelines.warm(&self.device, fire) {
-                    tracing::warn!(%fault, "metal: a carried scan's pipeline did not build");
-                }
-            }
+    /// Seals the pipelines built ([`Shell::warm_pipelines`]), with every
+    /// fixed pipeline beside them (`kernels_metal::runtime::fixed_pipelines`:
+    /// a beam group's head step and copies, and on a load buffering
+    /// recurrent rows its row copies and carried scans), which a fire names
+    /// by its lanes' shape and no walked rung keys. Refuses the load by name
+    /// where one does not build, so a pipeline a fire can name is built
+    /// before ready or the load fails: no fire builds one after ready, and
+    /// none meets one the load lacks.
+    pub fn seal_pipelines(&self) -> Result<()> {
+        for fire in kernels_metal::runtime::fixed_pipelines(self.rs_layout.is_some()) {
+            self.pipelines.warm(&self.device, fire).map_err(|fault| Fault::Device {
+                call: "building a fixed pipeline before ready",
+                why: format!(
+                    "`{}` of `{}`, a pipeline this load's fires can name, did not build: {fault}",
+                    fire.entrypoint, fire.file
+                ),
+            })?;
         }
         self.pipelines.seal();
+        Ok(())
     }
 
     /// Fires refused for an unbuilt pipeline since the last call.

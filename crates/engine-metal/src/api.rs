@@ -756,7 +756,7 @@ impl Engine for Metal {
                 walked
             }
         };
-        shell.seal_pipelines();
+        shell.seal_pipelines().map_err(fault)?;
         tracing::info!(
             fires,
             built,

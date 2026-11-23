@@ -22,7 +22,7 @@ use super::a_scattered_pool_serves_the_same_logits::{
 fn read_by(fixture: &Fixture) -> Vec<&'static str> {
     let mut shell = load_with(fixture, 256);
     shell.warm_pipelines().expect("the walk runs");
-    shell.seal_pipelines();
+    shell.seal_pipelines().expect("the fixed pipelines build");
     let prompt: Vec<u32> = (0..12u32).map(|t| (t * 7 + 11) % 256).collect();
     shell.open(0).expect("the slot opens");
     shell

@@ -53,7 +53,7 @@ fn step(
 ) -> (engine::StepOutcome, Vec<engine::InstanceId>, Vec<(String, Vec<f32>)>) {
     let mut shell: Shell = load_with(fixture, CONTEXT);
     shell.warm_pipelines().expect("the walk runs");
-    shell.seal_pipelines();
+    shell.seal_pipelines().expect("the fixed pipelines build");
     let prompts: Vec<Vec<u32>> = (0..2u32)
         .map(|lane| (0..PROMPT).map(|t| (t * 7 + 11 + lane * 3) % 256).collect())
         .collect();
