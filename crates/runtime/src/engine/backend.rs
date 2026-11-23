@@ -166,7 +166,7 @@ pub mod open {
 #[cfg(feature = "engine-cuda")]
 pub use engine_cuda::comm::Transport;
 #[cfg(feature = "engine-cuda")]
-pub use engine_cuda::{DeviceBoot, Diagnostics, Knobs, World, ordinal_of};
+pub use engine_cuda::{DeviceBoot, Diagnostics, Knobs, QueueMasks, World, ordinal_of};
 
 struct EngineRegistration {
     spec: EngineSpec,

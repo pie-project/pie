@@ -1885,6 +1885,18 @@ impl Prepared {
 /// CUDA's MPS the share it is limited to), less those a CU mask keeps its
 /// queues off on ROCm ([`queue_units`]). A sampler's blocks meet at a
 /// barrier, so it never runs on more than these hold at once.
+/// The queue masks the load states ([`crate::serve::Knobs::queue_masks`]),
+/// held for [`device_units`]: the process's, so the first load's.
+static QUEUE_MASKS: std::sync::OnceLock<crate::serve::QueueMasks> =
+    std::sync::OnceLock::new();
+
+/// States the process's queue masks, ahead of any sampler laid
+/// ([`device_units`]). They are the process's start's, so a later load's
+/// are the same words and keep the first's.
+pub fn state_queue_masks(masks: &crate::serve::QueueMasks) {
+    let _ = QUEUE_MASKS.set(masks.clone());
+}
+
 #[must_use]
 pub fn device_units() -> u32 {
     static UNITS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
@@ -1909,19 +1921,20 @@ pub fn device_units() -> u32 {
             let units = u32::try_from(count).unwrap_or(1).max(1);
             #[cfg(feature = "rocm")]
             {
-                let var = |name: &str| std::env::var(name).ok();
+                let masks = QUEUE_MASKS.get().cloned().unwrap_or_default();
                 let ordinal = u32::try_from(device).unwrap_or(0);
                 // The HSA agent HIP's ordinal names: the ordinal's entry of a
                 // visible-devices list, where one is set.
-                let agent = var("HIP_VISIBLE_DEVICES")
-                    .or_else(|| var("CUDA_VISIBLE_DEVICES"))
+                let agent = masks
+                    .visible_devices
+                    .as_deref()
                     .and_then(|list| list.split(',').nth(ordinal as usize)?.trim().parse().ok())
                     .unwrap_or(ordinal);
                 let held = queue_units(
                     units,
                     agent,
-                    var("HSA_CU_MASK").as_deref(),
-                    var("ROC_GLOBAL_CU_MASK").as_deref(),
+                    masks.hsa_cu_mask.as_deref(),
+                    masks.global_cu_mask.as_deref(),
                 );
                 if held != units {
                     eprintln!(
