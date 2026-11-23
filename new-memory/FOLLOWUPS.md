@@ -1305,3 +1305,67 @@ in the gate's accounting (charge what a grant will put in flight, or read the or
 then admission priced by the same order. Repro: `PIE_SIM_SHORT=1 PIE_SIM_FIELD=1 PIE_SIM_SEED=401` on
 `replay_one_simulated_seed`, and `PIE_SIM_METAL=1` sweeps.
 
+
+## F66. XLA states a replay bound its prepare does not hold to (found 2026-11-24)
+
+sc/rt-rung-carried (6fd1ea355) has each engine state per rung what its replay scratch holds
+(`engine::RungReplay { own_max, carried_max, total_max }` in `ChunkFacts::act_replay`) and the
+runtime picks a rung by `fire::rung_holds` against it. XLA's is stated as own T / carried T / no
+total, but its prepare check counts every lane's carried rows, decode lanes included: stricter
+than the stated floor, so a rung the runtime picks may be refused at prepare. engine-xla should
+state the bound its static scratch shape holds (`rs_compact = false` where it lays every carried
+row; `carried_max` / `total_max` as laid) and check by `rung_holds` too, so nothing the runtime
+chose is refused after. Predates that branch (the runtime never counted decode lanes' replay for
+XLA); after the beam-line merge.
+
+## F65. libtpu miscompiles the affine offset as a dot in gpt-oss's multi-lane decode (found 2026-11-23)
+
+Served gptoss-20b-u4g64 answered garbage to concurrent requests and sense to one at a time. The
+u4g64 head's affine offset (`Σ_g bias[n, g] · Σ_{k∈g} x[m, k]`, a `dot_general` f32 [m, 45] ·
+[201088, 45]ᵀ at HIGHEST) came out wrong in every decode of 2+ lanes: XLA fuses it as a
+convolution over the bf16 biases with the add, the bf16 round trip and the in-place
+dynamic-update-slice into the aliased f32 [32, 201088] logits output. The same op is right
+standalone, in the 1-lane decode (where XLA makes it a reduce) and in the 2-lane prefill; the
+same program returning the offset's operands as extra outputs computes it right. kernels-xla
+`linear::quant::grouped_dot` now adds each group's offset in the partials' own per-group sum, with
+no dot of its own (a workaround, named there; as fast as the dot it replaces, ABBA); the engine test `a_batched_decode_answers_what_each_lane_answers_alone` holds every
+u4g64 mini's multi-lane decode to its single-lane runs. Repro (StableHLO only, two programs one op
+apart, a JAX runner; libtpu 0.0.48, jax 0.11.2): v6e host `/workspace/tpu-tools/repro`. Filing
+upstream is the user's call. Drop the workaround once a libtpu computes `decode2_dot.mlir` as it
+computes `decode2_reduce.mlir`.
+
+
+## F67. An XLA program is the decoder's per-layer code repeated: lower the layer stack as a loop (v6e, found 2026-11-23)
+
+A hybrid Qwen3.5-0.8B ladder's executables are 4–65 MB packed (median prefill 34 MB, 168 MB raw;
+the ladder 8.6 GB packed, 40.4 GB raw over 266 programs). No weights or tables are folded in
+(every plane a parameter; 2 dense literals, 1.5 KB). The HLO text (median 8.9 MB) is 76% Mosaic
+kernel bodies: 102 `tpu_custom_call`s carry 6.8 MB of `backend_config`, 12 of them distinct
+(conv_step, gdn_step, gdn_chunks, pool_gather, pool_scatter 18 times each, a layer each). The
+compiled form repeats at long range: zstd with a 128 MB window takes the 168 MB to 4.4 MB (38x;
+the cache's level 1 34 MB), 57% of its 512-byte blocks duplicates. Loading it is deserializing
+it: 856 thread-s of a record boot's loads against 78 s of reads and 56 s of unpacking. Lowering
+the decoder's layers as one `stablehlo.while` over stacked per-layer weights would hold one
+layer's code a program: an order of magnitude off each executable, its compile, its load and
+the cache. A big lowering change with a steady-state risk on the critical path: after the PR, a
+prototype on one dense model with steady-state numbers against main.
+
+## F68. The XLA loader's width is measured each boot, not kept in the device's profile (v6e, found 2026-11-23)
+
+Loading behind serving grows its width while the fastest of three samples of its load rate
+rises (v6e: 4 or 5 of 40 cores, a first request at 9.4–9.9 s, all 266 of Qwen3.5's programs
+at 74–84 s). The width is a property of the device and its PJRT plugin and belongs in the
+device profile's keyed `[rates]` (device, plugin, method), measured once and committed with the
+v6e profile, not found again each boot; it waits on the keyed profile path (`profile::fire::
+Rates`, `measured_by`) landing with the committed profiles. Beside it: a parked program (the
+host held no room for it) whose disk file is corrupt is built by its first fire, a build on the
+serving path counted as `BuiltInFire`.
+
+## F69. A fresh host cover is timed while programs load behind serving (v6e, found 2026-11-23)
+
+The runtime times the host cover with warm runs as the load becomes ready, while XLA loads its
+cached programs behind serving. With 44 loads at once the cover's frame read 21 ms against 3.7
+ms quiet; at the loader's measured width (4–5) and with fires' loads ahead of it, it reads 3.7
+ms. A cover the cache or a committed file holds is not timed at all. A fresh one should wait for
+the loader (an engine hook the runtime calls before it times the cover); not built, as the
+measured width leaves it unpolluted on v6e.

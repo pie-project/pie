@@ -315,6 +315,30 @@ pub fn carried_room(rung: u32) -> u32 {
     rung
 }
 
+/// What a `rung`-token rung holds of a fire's replay, as the load states it
+/// (`ChunkFacts::act_replay`) and prepare checks it, both by
+/// `engine::fire::rung_holds`: its own rows at most the rung's tokens, and
+/// its window scratch, one row each of every lane's replayed rows (a decode
+/// lane's included: the scratch lays them, so the load is not compact) and
+/// of its own, at most the rung's own rows and its carried room
+/// ([`carried_room`]), the room [`WindowMap::of`] lays. The scratch is
+/// stated as one byte a row, so the bytes bound is that row bound.
+#[must_use]
+pub fn rung_replay(rung: u32) -> engine::RungReplay {
+    let mut scratch = engine::ScratchBytes {
+        slot_bytes: vec![1],
+        lane_bytes: 0,
+        room_bytes: 0,
+        pad: 1,
+    };
+    scratch.room_bytes = scratch.bytes(rung.saturating_add(carried_room(rung)), 1);
+    engine::RungReplay {
+        own_max: Some(rung),
+        carried_max: None,
+        scratch,
+    }
+}
+
 impl WindowMap {
     /// The map of the window covering lanes `lane0..lane0 + lanes` whose own
     /// rows are cut by `indptr` (window-local), for rs list slots of

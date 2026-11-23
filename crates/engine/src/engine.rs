@@ -724,7 +724,8 @@ pub trait Engine: Send {
 
     /// The bytes of host rs rows: `slots`' state, then `pages`' buffers, one
     /// after another, once every copy into them has landed. For a model whose
-    /// state is a window, `pages` are host windowed pages and `slots` empty.
+    /// state is a window, `pages` are host windowed pages and `slots` empty
+    /// (removed by the windowed-state change; do not use in new code).
     fn read_host_state(&mut self, slots: &[u32], pages: &[u32]) -> Result<Vec<u8>> {
         let _ = (slots, pages);
         Err(self.unsupported("read_host_state"))
@@ -742,8 +743,9 @@ pub trait Engine: Send {
     /// as the device slot (what [`Engine::copy_slots`] moves whole), one
     /// slot after another; once every copy into them has landed (the
     /// runtime waits on that copy's completion first). What a shared pool's
-    /// snapshot reads of a set's state: its record's pieces and its rs list
-    /// or window slots, parked on the host.
+    /// snapshot reads of a set's state: its record's pieces (the windowed
+    /// layers' rings among them) and its rs list or window buffer slots,
+    /// parked on the host.
     fn read_tier_slots(&mut self, slots: &[(crate::chunk::ShapeId, Vec<u32>)]) -> Result<Vec<u8>> {
         let _ = slots;
         Err(self.unsupported("read_tier_slots"))

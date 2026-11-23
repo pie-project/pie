@@ -149,6 +149,7 @@ fn build_model(
             runtime::bootstrap::EngineConfig {
                 chunks: g.caps.chunks.clone(),
                 window_tokens: g.caps.pools.window_tokens,
+                windowed_state: g.caps.windowed_state,
                 disk_kept,
                 seated_first: g.caps.pools.seated_first,
                 seat_to_end: g.caps.pools.seat_to_end,

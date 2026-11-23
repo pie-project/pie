@@ -1,6 +1,8 @@
 //! engine-xla's integration tests, one binary: each module was a test file.
 
 mod a_beam_step_matches_the_host_replay;
+mod a_batched_decode_answers_what_each_lane_answers_alone;
+mod an_output_less_run_fences_the_slot_it_read;
 mod common;
 mod common_dit;
 mod common_llm;
@@ -18,9 +20,12 @@ mod a_maintenance_write_is_timed;
 mod a_fire_the_load_did_not_prepare_is_counted;
 mod a_padded_decode_leaves_another_lanes_state;
 mod a_parked_ladder_program_loads_on_its_first_fire;
+mod a_corrupt_recorded_program_is_built_again;
+mod a_device_open_keeps_the_process_signal_handlers;
 mod a_stale_trace_record_is_traced_again;
 mod a_masked_beam_beside_plain_decodes_answers_as_each_alone;
 mod a_mixed_fire_the_load_states_laid_finds_its_program;
+mod a_lagged_window_fold_reads_what_folding_reads;
 mod a_pool_answers_what_the_base_build_answered;
 mod a_mask_reads_from_the_committed_boundary;
 mod a_pool_view_reads_the_packed_rows_order;

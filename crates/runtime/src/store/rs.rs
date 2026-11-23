@@ -49,6 +49,9 @@ pub const MAX_WINDOW_LISTS: usize = 4;
 /// (CONTRACT-BC 19, 21): its rows retain `window` tokens, a slot holds
 /// `tokens` (`T_w`) of them, slot `i` of a set's table rows
 /// `[i * T_w, (i + 1) * T_w)`.
+///
+/// Window-list path: removed by the windowed-state change (the integration
+/// commit deletes it once every engine states `Capabilities::windowed_state`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowGeometry {
     pub window: u32,
@@ -58,6 +61,9 @@ pub struct WindowGeometry {
 /// A set's windows: `committed` is the position they are anchored at and
 /// `head` the position written up to, in tokens; `retired[l]` counts the
 /// leading slots of list `l`'s table already given back.
+///
+/// Window-list path: removed by the windowed-state change (the integration
+/// commit deletes it once every engine states `Capabilities::windowed_state`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WindowState {
     retired: [u32; MAX_WINDOW_LISTS],
@@ -74,6 +80,9 @@ pub struct WindowState {
 /// lies below the committed position less its window retire. A
 /// device-positioned fire retires behind `reach`, the first token it may
 /// write, as no row's window reaches back past it.
+///
+/// Window-list path: removed by the windowed-state change (the integration
+/// commit deletes it once every engine states `Capabilities::windowed_state`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WindowAdvance {
     pub(crate) positioned: bool,
@@ -137,6 +146,11 @@ pub struct RsUnits {
     pub slots: u32,
     pub pages: u32,
     pub windows: [u32; MAX_WINDOW_LISTS],
+    /// Of `pages`, the window buffer's slots, where a hybrid's window
+    /// buffer is a pool beside its rs list (CONTRACT-BC 19, 21): the rest
+    /// of `pages` is the rs list's. 0 elsewhere (a store of windowed layers
+    /// alone keeps its window buffer as its pages).
+    pub wbuf: u32,
 }
 
 impl std::fmt::Display for RsUnits {
@@ -148,6 +162,9 @@ impl std::fmt::Display for RsUnits {
         )?;
         if self.windows.iter().any(|&n| n > 0) {
             write!(f, " (window lists {:?})", self.windows)?;
+        }
+        if self.wbuf > 0 {
+            write!(f, " ({} of them window-buffer slots)", self.wbuf)?;
         }
         Ok(())
     }
@@ -161,6 +178,7 @@ impl RsUnits {
             slots,
             pages,
             windows: [0; MAX_WINDOW_LISTS],
+            wbuf: 0,
         }
     }
 
@@ -171,6 +189,7 @@ impl RsUnits {
             slots: 0,
             pages: windows.iter().fold(0u32, |sum, &n| sum.saturating_add(n)),
             windows,
+            wbuf: 0,
         }
     }
 
@@ -183,6 +202,8 @@ impl RsUnits {
     pub fn covers(self, need: RsUnits) -> bool {
         self.slots >= need.slots
             && self.pages >= need.pages
+            && self.wbuf >= need.wbuf
+            && self.pages.saturating_sub(self.wbuf) >= need.pages.saturating_sub(need.wbuf)
             && self
                 .windows
                 .iter()
@@ -200,6 +221,7 @@ impl RsUnits {
             slots: self.slots.saturating_add(other.slots),
             pages: self.pages.saturating_add(other.pages),
             windows,
+            wbuf: self.wbuf.saturating_add(other.wbuf),
         }
     }
 
@@ -213,6 +235,7 @@ impl RsUnits {
             slots: self.slots.saturating_sub(other.slots),
             pages: self.pages.saturating_sub(other.pages),
             windows,
+            wbuf: self.wbuf.saturating_sub(other.wbuf),
         }
     }
 }
@@ -223,6 +246,8 @@ pub struct RsGrant {
     pub slots: Vec<RsSlotId>,
     pub pages: Vec<RsSlotId>,
     pub windows: Vec<Vec<RsSlotId>>,
+    /// A hybrid's window-buffer slots ([`RsUnits::wbuf`]).
+    pub wpages: Vec<RsSlotId>,
 }
 
 impl RsGrant {
@@ -235,13 +260,17 @@ impl RsGrant {
         let window_slots: usize = self.windows.iter().map(Vec::len).sum();
         RsUnits {
             slots: self.slots.len() as u32,
-            pages: (self.pages.len() + window_slots) as u32,
+            pages: (self.pages.len() + self.wpages.len() + window_slots) as u32,
             windows,
+            wbuf: self.wpages.len() as u32,
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.slots.is_empty() && self.pages.is_empty() && self.windows.iter().all(Vec::is_empty)
+        self.slots.is_empty()
+            && self.pages.is_empty()
+            && self.wpages.is_empty()
+            && self.windows.iter().all(Vec::is_empty)
     }
 }
 
@@ -279,6 +308,8 @@ struct RsDisk {
     /// list's, or window list 0's); window lists 1..'s.
     records: Vec<(::engine::chunk::ShapeId, u32)>,
     lists: Vec<::engine::chunk::ShapeId>,
+    /// A hybrid's window buffer's shape.
+    wshape: Option<::engine::chunk::ShapeId>,
 }
 
 /// A device slot parked on disk: what it was (a window list's slot, a
@@ -286,6 +317,8 @@ struct RsDisk {
 struct DiskRow {
     list: Option<usize>,
     page: bool,
+    /// A hybrid's window-buffer slot.
+    wpage: bool,
     refs: Vec<(::engine::chunk::ShapeId, Vec<u32>)>,
 }
 
@@ -357,6 +390,9 @@ pub struct RsExport {
     pub windows: Vec<Vec<Option<RsSlotId>>>,
     /// The windows' position, when the state is windows.
     pub window: Option<WindowState>,
+    /// A hybrid's window-buffer table and its base.
+    pub wbuffer: Vec<Option<RsSlotId>>,
+    pub wbase: u32,
 }
 
 /// Token `t` of page `p` holds slot `base + p * page + t`. A windowed set
@@ -371,6 +407,10 @@ struct RsEntry {
     frozen: u32,
     windows: Vec<Vec<Option<RsSlotId>>>,
     window: Option<WindowState>,
+    /// A hybrid's window-buffer table and the row its entry 0 holds
+    /// (CONTRACT-BC 19, 21), beside the rs list's `buffer`; empty elsewhere.
+    wbuffer: Vec<Option<RsSlotId>>,
+    wbase: u32,
     /// Fires on their way that fold the state by a count the device
     /// computes ([`RsStore::begin_device_fold`]). Until the last settles the
     /// engine's record stands ahead of `frozen` by slots only the engine
@@ -448,6 +488,16 @@ pub struct RsStore {
     /// The disk tier state parks on where no host row is free
     /// ([`Self::set_disk`]).
     disk: Option<RsDisk>,
+    /// The buffer pages are the window buffer's slots (CONTRACT-BC 19,
+    /// 21): an empty buffer starts where a fire's rows first stay unfolded
+    /// ([`Self::own_folds_unbuffered`]), not where the set is folded.
+    window_buffer: bool,
+    /// A hybrid's window buffer (an rs list beside it, CONTRACT-BC 19, 21):
+    /// its device slots numbered past the pages, its host rows past the host
+    /// pages', and its slot's rows. Empty pools and `None` elsewhere.
+    wpages: ShapePool<RsSlotId>,
+    host_wpages: ShapePool<RsSlotId>,
+    w_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -498,16 +548,30 @@ impl RsStore {
     /// records', an engine id the slot ref; CONTRACT-BC 18). A pool with no
     /// rs list buffers nothing.
     ///
+    /// A load whose engine serves windowed layers as ring + buffer
+    /// (CONTRACT-BC 19, 21) is a store of the second kind: each windowed
+    /// layer's ring is record bytes, so a record is the set's folded window,
+    /// and the window buffer's slot refs are the buffer pages, as the rs
+    /// list's are. Its sets fold, fork, share, park and snapshot as an rs
+    /// set does; the lanes name the pages in `Lane::tables` and the fold in
+    /// `Lane::window` ([`crate::pipeline::fire::rs::apply_shared`]).
+    ///
+    /// The window-list store (the first kind, `windows` non-empty) is
+    /// removed by the windowed-state change: the integration commit deletes
+    /// it, once every engine states `Capabilities::windowed_state`.
+    ///
     /// `host`, the engine's host tier (CONTRACT-BC 22), backs the host rows
     /// a suspend parks state in: records, rs list slots and every window
     /// list's slots, each of its own shape, past the device's ids.
     pub fn shared(shared: &Shared, host: Option<&Shared>) -> Self {
-        let (windows, fixed, rs_list) = {
+        let (windows, fixed, rs_list, hybrid) = {
             let pool = shared.lock().unwrap();
+            let hybrid = pool.rs_list().and(pool.window_buffer());
             (
                 pool.windows().to_vec(),
                 !pool.fixed().is_empty(),
-                pool.rs_list(),
+                pool.buffer_list(),
+                hybrid,
             )
         };
         if let Some((first, rest)) = windows.split_first() {
@@ -562,7 +626,13 @@ impl RsStore {
             || ShapePool::new(ShapeKind::List, 0, records, 0),
             |list| ShapePool::shared_from(shared, list, records),
         );
-        let base = pages.ids_end();
+        // A hybrid's window buffer: device slots past the pages, host rows
+        // past the host pages'.
+        let wpages = hybrid.map_or_else(
+            || ShapePool::new(ShapeKind::List, 0, pages.ids_end(), 0),
+            |list| ShapePool::shared_from(shared, list, pages.ids_end()),
+        );
+        let base = wpages.ids_end();
         let host_slots = match host {
             Some(host) if fixed => ShapePool::records(host, base),
             _ => ShapePool::new(ShapeKind::Fixed, 0, base, 0),
@@ -571,6 +641,10 @@ impl RsStore {
         let host_pages = match (host, rs_list) {
             (Some(host), Some(list)) => ShapePool::shared_from(host, list, at),
             _ => ShapePool::new(ShapeKind::List, 0, at, 0),
+        };
+        let host_wpages = match (host, hybrid) {
+            (Some(host), Some(list)) => ShapePool::shared_from(host, list, host_pages.ids_end()),
+            _ => ShapePool::new(ShapeKind::List, 0, host_pages.ids_end(), 0),
         };
         let mut store = Self::build(
             slots,
@@ -582,7 +656,113 @@ impl RsStore {
             Vec::new(),
         );
         store.rs_tokens = rs_list.map(|list| list.tokens.max(1));
+        store.window_buffer = shared.lock().unwrap().window_buffer().is_some();
+        store.wpages = wpages;
+        store.host_wpages = host_wpages;
+        store.w_tokens = hybrid.map(|list| list.tokens.max(1));
         store
+    }
+
+    /// The rows of `writes` a fire on `ws` buffers, `(rs, window)`: the
+    /// rs list's and the window buffer's (CONTRACT-BC 19, 21). A store of
+    /// recurrent layers alone buffers every row in its rs list; one of
+    /// windowed layers alone keeps its window buffer as its pages (the
+    /// first of the pair); a hybrid buffers every row in its rs list and
+    /// the window rows in its window buffer (the second).
+    ///
+    /// The window buffer holds no row a lone lane folds itself: a lane
+    /// carrying no row earlier fires buffered there (that buffer empty, its
+    /// rows from where the set is folded) takes no slot for the rows it
+    /// folds by a count the host knows, their K/V living in the fire; only
+    /// the rows past them are buffered, the window buffer then starting at
+    /// the folded index after the fire, rounded down to a slot. Otherwise
+    /// (a carrying lane, a group, a device-counted fold) every row is
+    /// buffered, from the folded index before the fire.
+    pub fn split_writes(
+        &self,
+        ws: RsWorkingSetId,
+        alone: bool,
+        fold: Option<u32>,
+        writes: Option<std::ops::Range<u32>>,
+    ) -> Result<(Option<std::ops::Range<u32>>, Option<std::ops::Range<u32>>), RsError> {
+        let entry = self.entry(ws)?;
+        if !self.window_buffer {
+            return Ok((writes, None));
+        }
+        let table = if self.hybrid() {
+            &entry.wbuffer
+        } else {
+            &entry.buffer
+        };
+        let window = match (writes.clone(), fold) {
+            (Some(writes), Some(fold))
+                if alone
+                    && table.iter().all(Option::is_none)
+                    && writes.start == entry.frozen =>
+            {
+                let start = writes.start.saturating_add(fold).min(writes.end);
+                (start < writes.end).then_some(start..writes.end)
+            }
+            _ => writes.clone(),
+        };
+        Ok(if self.hybrid() {
+            (writes, window)
+        } else {
+            (window, None)
+        })
+    }
+
+    /// A hybrid's window buffer is a pool beside its rs list.
+    fn hybrid(&self) -> bool {
+        self.w_tokens.is_some()
+    }
+
+    /// [`Self::hybrid`], for the fire's lowering: its window buffer's slots
+    /// are not the pages.
+    #[must_use]
+    pub fn window_buffer_apart(&self) -> bool {
+        self.hybrid()
+    }
+
+    /// Whether `id` is a hybrid's window-buffer slot or row.
+    fn is_wpage(&self, id: RsSlotId) -> bool {
+        if let Some(row) = self.disk_row(id) {
+            return row.wpage;
+        }
+        self.hybrid() && (self.wpages.owns(id) || self.host_wpages.contains(id))
+    }
+
+    /// Whether `id` holds windowed layers' rows: a hybrid's window-buffer
+    /// slot, or a page of a store of windowed layers alone.
+    #[must_use]
+    pub fn is_window_page(&self, id: RsSlotId) -> bool {
+        self.window_buffer && if self.hybrid() { self.is_wpage(id) } else { self.is_page(id) }
+    }
+
+    /// The id of the hybrid's window-buffer slot the engine numbers `slot`.
+    #[must_use]
+    pub fn wpage_id(&self, slot: u32) -> RsSlotId {
+        RsSlotId(slot + self.wpages.base())
+    }
+
+    /// The window buffer's table of `ws` (engine numbering) and the row its
+    /// entry 0 holds, where the store buffers windowed layers' rows: a
+    /// hybrid's window buffer, or the pages of a store of windowed layers
+    /// alone. `None` elsewhere.
+    pub fn window_table(&self, ws: RsWorkingSetId) -> Result<Option<(u32, Vec<u32>)>, RsError> {
+        if !self.window_buffer {
+            return Ok(None);
+        }
+        if !self.hybrid() {
+            return Ok(Some((self.base(ws)?, self.buffer_translation(ws)?)));
+        }
+        let entry = self.entry(ws)?;
+        let table = entry
+            .wbuffer
+            .iter()
+            .map(|slot| slot.map_or(RS_TRANSLATION_UNMAPPED, |id| self.engine_id(id)))
+            .collect();
+        Ok(Some((self.wbuffer_base(entry), table)))
     }
 
     /// Whether the state slots are a shared pool's records.
@@ -620,6 +800,10 @@ impl RsStore {
             device_folded: std::sync::Arc::new(tokio::sync::Notify::new()),
             rs_tokens: None,
             disk: None,
+            window_buffer: false,
+            wpages: ShapePool::new(ShapeKind::List, 0, 0, 0),
+            host_wpages: ShapePool::new(ShapeKind::List, 0, 0, 0),
+            w_tokens: None,
         }
     }
 
@@ -632,12 +816,16 @@ impl RsStore {
         if !self.is_shared() && self.window.is_empty() {
             return;
         }
-        let (per_chunk, records, lists) = {
+        let (per_chunk, records, lists, wshape) = {
             let pool = shared.lock().unwrap();
+            let wshape = pool
+                .rs_list()
+                .and(pool.window_buffer())
+                .map(|list| list.id);
             let records: Vec<(::engine::chunk::ShapeId, u32)> =
                 pool.fixed().iter().map(|shape| (shape.id, shape.pieces)).collect();
             let lists: Vec<::engine::chunk::ShapeId> = pool
-                .rs_list()
+                .buffer_list()
                 .map(|list| list.id)
                 .into_iter()
                 .chain(pool.windows().iter().map(|list| list.id))
@@ -646,7 +834,8 @@ impl RsStore {
                 .fixed()
                 .iter()
                 .map(|shape| shape.id)
-                .chain(pool.rs_list().map(|list| list.id))
+                .chain(pool.buffer_list().map(|list| list.id))
+                .chain(wshape)
                 .chain(pool.windows().iter().map(|list| list.id))
                 .collect();
             let per_chunk = engines
@@ -657,11 +846,11 @@ impl RsStore {
                     (per_chunk > 0).then_some((engine, per_chunk))
                 })
                 .collect();
-            (per_chunk, records, lists)
+            (per_chunk, records, lists, wshape)
         };
         debug_assert!(
             std::iter::once(&self.host_slots)
-                .chain([&self.host_pages])
+                .chain([&self.host_pages, &self.host_wpages])
                 .chain(&self.host_windows)
                 .all(|pool| pool.ids_end() < DISK_ROWS),
             "host ids reach the disk rows'"
@@ -675,6 +864,7 @@ impl RsStore {
             next: 0,
             records,
             lists,
+            wshape,
         });
     }
 
@@ -719,7 +909,11 @@ impl RsStore {
             return RsUnits::of_windows(windows);
         }
         let pages = disk.lists.first().map_or(0, |&shape| clamp(room(shape)));
-        RsUnits::of(slots, pages)
+        let wbuf = disk.wshape.map_or(0, |shape| clamp(room(shape)));
+        RsUnits {
+            wbuf,
+            ..RsUnits::of(slots, pages.saturating_add(wbuf))
+        }
     }
 
     /// Whether `id` is a disk row.
@@ -737,14 +931,22 @@ impl RsStore {
     /// all fit.
     fn take_disk_rows(&mut self, ids: &[RsSlotId]) -> Option<Vec<RsSlotId>> {
         self.disk.as_ref()?;
-        let rows: Vec<(Option<usize>, bool, Vec<(::engine::chunk::ShapeId, Vec<u32>)>)> = ids
+        type Row = (Option<usize>, bool, bool, Vec<(::engine::chunk::ShapeId, Vec<u32>)>);
+        let rows: Vec<Row> = ids
             .iter()
-            .map(|&id| (self.list_of(id), self.is_page(id), self.pool_of(id).slot_refs(id)))
+            .map(|&id| {
+                (
+                    self.list_of(id),
+                    self.is_page(id),
+                    self.is_wpage(id),
+                    self.pool_of(id).slot_refs(id),
+                )
+            })
             .collect();
         let disk = self.disk.as_mut()?;
         let mut taken: Vec<RsSlotId> = Vec::with_capacity(ids.len());
         let mut failed = false;
-        'rows: for (list, page, device) in rows {
+        'rows: for (list, page, wpage, device) in rows {
             let mut refs = Vec::with_capacity(device.len());
             for (shape, slots) in &device {
                 match disk.take(*shape, slots.len()) {
@@ -763,7 +965,15 @@ impl RsStore {
                 disk.next - 1
             });
             let id = RsSlotId(DISK_ROWS + index);
-            disk.rows.insert(id, DiskRow { list, page, refs });
+            disk.rows.insert(
+                id,
+                DiskRow {
+                    list,
+                    page,
+                    wpage,
+                    refs,
+                },
+            );
             taken.push(id);
         }
         if failed {
@@ -830,7 +1040,8 @@ impl RsStore {
                 pool.wait(u64::from(need.windows.get(at + 1).copied().unwrap_or(0)));
             }
         } else {
-            self.pages.wait(u64::from(need.pages));
+            self.pages.wait(u64::from(need.pages.saturating_sub(need.wbuf)));
+            self.wpages.wait(u64::from(need.wbuf));
         }
     }
 
@@ -843,10 +1054,16 @@ impl RsStore {
     /// keep: as far as the highest number out, so that holding it cuts
     /// nothing off, and a waiter's on top.
     pub fn demand(&self) -> (u32, u32) {
-        let reach = self.slots.high_end().max(self.pages.high_end());
+        let reach = self
+            .slots
+            .high_end()
+            .max(self.pages.high_end())
+            .max(self.wpages.high_end());
         let out =
             |pool: &ShapePool<RsSlotId>| pool.capacity().saturating_sub(pool.available() as u32);
-        let wanted = out(&self.slots).max(out(&self.pages));
+        let wanted = out(&self.slots)
+            .max(out(&self.pages))
+            .max(out(&self.wpages));
         let kept: HashSet<RsSlotId> = self
             .checkpoints
             .values()
@@ -881,7 +1098,7 @@ impl RsStore {
     /// window) pages, in bytes.
     pub fn device_demand(&self) -> Demand {
         let mut demand = Demand::default();
-        for pool in [&self.slots, &self.pages]
+        for pool in [&self.slots, &self.pages, &self.wpages]
             .into_iter()
             .chain(&self.window_pools)
         {
@@ -904,6 +1121,7 @@ impl RsStore {
         };
         self.slots.retire_through(completed);
         self.pages.retire_through(completed);
+        self.wpages.retire_through(completed);
         for pool in &mut self.window_pools {
             pool.retire_through(completed);
         }
@@ -942,7 +1160,11 @@ impl RsStore {
 
     #[must_use]
     pub fn engine_id(&self, id: RsSlotId) -> u32 {
-        if self.host_pages.contains(id) {
+        if self.host_wpages.contains(id) {
+            id.0 - self.host_wpages.base()
+        } else if self.wpages.owns(id) {
+            id.0 - self.wpages.base()
+        } else if self.host_pages.contains(id) {
             id.0 - self.host_pages.base()
         } else if let Some(pool) = self.host_window(id) {
             id.0 - pool.base()
@@ -977,6 +1199,7 @@ impl RsStore {
         }
         (id.0 >= self.pages_at && id.0 < self.host_slots.base())
             || self.host_pages.contains(id)
+            || self.host_wpages.contains(id)
             || self.host_window(id).is_some()
     }
 
@@ -985,6 +1208,9 @@ impl RsStore {
         for id in ids {
             if self.is_page(id) {
                 units.pages += 1;
+                if self.is_wpage(id) {
+                    units.wbuf += 1;
+                }
                 if let Some(list) = self.list_of(id) {
                     units.windows[list] += 1;
                 }
@@ -996,7 +1222,9 @@ impl RsStore {
     }
 
     fn device_pool(&mut self, id: RsSlotId) -> &mut ShapePool<RsSlotId> {
-        if let Some(list) = self.list_of(id).filter(|&list| list > 0) {
+        if self.is_wpage(id) {
+            &mut self.wpages
+        } else if let Some(list) = self.list_of(id).filter(|&list| list > 0) {
             &mut self.window_pools[list - 1]
         } else if self.is_page(id) {
             &mut self.pages
@@ -1008,6 +1236,8 @@ impl RsStore {
     fn host_pool(&mut self, id: RsSlotId) -> &mut ShapePool<RsSlotId> {
         if let Some(at) = self.host_windows.iter().position(|pool| pool.contains(id)) {
             &mut self.host_windows[at]
+        } else if self.host_wpages.contains(id) {
+            &mut self.host_wpages
         } else if self.is_page(id) {
             &mut self.host_pages
         } else {
@@ -1020,6 +1250,7 @@ impl RsStore {
     fn host_pool_for(&mut self, id: RsSlotId) -> &mut ShapePool<RsSlotId> {
         match self.list_of(id) {
             Some(list) if list > 0 => &mut self.host_windows[list - 1],
+            _ if self.is_wpage(id) => &mut self.host_wpages,
             _ if self.is_page(id) => &mut self.host_pages,
             _ => &mut self.host_slots,
         }
@@ -1079,6 +1310,8 @@ impl RsStore {
             frozen: 0,
             windows: vec![Vec::new(); self.window.len()],
             window: windowed.then(WindowState::default),
+            wbuffer: Vec::new(),
+            wbase: 0,
             device_folds: 0,
             device_fold_failed: None,
         })
@@ -1098,6 +1331,8 @@ impl RsStore {
             frozen: entry.frozen,
             windows: entry.windows.clone(),
             window: entry.window,
+            wbuffer: entry.wbuffer.clone(),
+            wbase: entry.wbase,
         })
     }
 
@@ -1116,12 +1351,30 @@ impl RsStore {
     /// ([`Self::tier_refs`], `Engine::read_tier_slots`).
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn take_host(&mut self, slots: usize, pages: usize) -> Option<Vec<RsSlotId>> {
+        self.take_host_of(slots, pages, 0)
+    }
+
+    /// [`Self::take_host`], and `wpages` of a hybrid's window-buffer rows
+    /// after the pages.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub fn take_host_of(
+        &mut self,
+        slots: usize,
+        pages: usize,
+        wpages: usize,
+    ) -> Option<Vec<RsSlotId>> {
         let mut rows = self.host_slots.try_alloc_n(slots)?;
         let Some(buffer) = self.host_pages.try_alloc_n(pages) else {
             self.host_slots.release_reserved(rows);
             return None;
         };
+        let Some(window) = self.host_wpages.try_alloc_n(wpages) else {
+            self.host_slots.release_reserved(rows);
+            self.host_pages.release_reserved(buffer);
+            return None;
+        };
         rows.extend(buffer);
+        rows.extend(window);
         Some(rows)
     }
 
@@ -1185,6 +1438,8 @@ impl RsStore {
             frozen: set.frozen,
             windows: set.windows,
             window: set.window,
+            wbuffer: set.wbuffer,
+            wbase: set.wbase,
             device_folds: 0,
             device_fold_failed: None,
         })
@@ -1309,6 +1564,7 @@ impl RsStore {
             .folded
             .into_iter()
             .chain(entry.buffer.iter().flatten().copied())
+            .chain(entry.wbuffer.iter().flatten().copied())
             .chain(entry.windows.iter().flatten().flatten().copied())
     }
 
@@ -1476,6 +1732,9 @@ impl RsStore {
     /// first (the tail rule of [`Self::prepare_window`]). None when a slot it
     /// needs has retired, or as [`Self::checkpoint`]; at the windows' own
     /// position, [`Self::checkpoint`]. Another state checkpoints only there.
+    ///
+    /// Window-list path: removed by the windowed-state change (the integration
+    /// commit deletes it once every engine states `Capabilities::windowed_state`).
     pub fn checkpoint_at(
         &mut self,
         ws: RsWorkingSetId,
@@ -1560,6 +1819,7 @@ impl RsStore {
         for id in ids {
             let at = match self.list_of(id) {
                 Some(list) => list + 1,
+                None if self.is_wpage(id) => usize::MAX,
                 None => usize::from(self.is_page(id)),
             };
             by_pool.entry(at).or_default().push(id);
@@ -1568,6 +1828,7 @@ impl RsStore {
         for (at, ids) in by_pool {
             let pool = match at {
                 0 => &mut self.slots,
+                usize::MAX => &mut self.wpages,
                 at => self.list_pool(at - 1),
             };
             if hold {
@@ -1582,6 +1843,8 @@ impl RsStore {
     fn host_pool_of(&self, id: RsSlotId) -> &ShapePool<RsSlotId> {
         if let Some(pool) = self.host_window(id) {
             pool
+        } else if self.host_wpages.contains(id) {
+            &self.host_wpages
         } else if self.host_pages.contains(id) {
             &self.host_pages
         } else {
@@ -1591,6 +1854,9 @@ impl RsStore {
 
     /// The device pool `id` is one of.
     fn pool_of(&self, id: RsSlotId) -> &ShapePool<RsSlotId> {
+        if self.is_wpage(id) {
+            return &self.wpages;
+        }
         match self.list_of(id) {
             Some(0) => &self.pages,
             Some(list) => &self.window_pools[list - 1],
@@ -1636,6 +1902,7 @@ impl RsStore {
             let entry = self.entry(ws)?;
             entry.folded.is_none()
                 && entry.buffer.iter().all(Option::is_none)
+                && entry.wbuffer.iter().all(Option::is_none)
                 && entry.windows.iter().flatten().all(Option::is_none)
                 && entry.window.is_none_or(|window| window.committed == 0)
         };
@@ -1658,6 +1925,8 @@ impl RsStore {
         entry.frozen = from.frozen;
         entry.windows = from.windows;
         entry.window = from.window;
+        entry.wbuffer = from.wbuffer;
+        entry.wbase = from.wbase;
         if let Some(entry) = self.checkpoints.get_mut(key) {
             entry.last_use = Instant::now();
         }
@@ -1665,9 +1934,10 @@ impl RsStore {
     }
 
     pub fn forget_state(&mut self, ws: RsWorkingSetId) -> Result<(), RsError> {
-        let (folded, buffer, windows) = {
+        let (folded, buffer, windows, wbuffer) = {
             let entry = self.entry_mut(ws)?;
             entry.base = 0;
+            entry.wbase = 0;
             entry.frozen = 0;
             // No record is left for a frozen length to be behind.
             entry.device_fold_failed = None;
@@ -1677,12 +1947,14 @@ impl RsStore {
                 entry.folded.take(),
                 std::mem::take(&mut entry.buffer),
                 std::mem::replace(&mut entry.windows, vec![Vec::new(); lists]),
+                std::mem::take(&mut entry.wbuffer),
             )
         };
         let windows = windows.into_iter().flatten();
         for id in folded
             .into_iter()
             .chain(buffer.into_iter().flatten())
+            .chain(wbuffer.into_iter().flatten())
             .chain(windows.flatten())
         {
             self.decref(id);
@@ -1734,6 +2006,9 @@ impl RsStore {
     }
 
     /// The window slots a fire landing rows `rows` of `ws` takes.
+    ///
+    /// Window-list path: removed by the windowed-state change (the integration
+    /// commit deletes it once every engine states `Capabilities::windowed_state`).
     pub fn window_demand(
         &self,
         ws: RsWorkingSetId,
@@ -1748,6 +2023,9 @@ impl RsStore {
     /// a shared one copies it first: [`RsPreparedWrite::buffer_copy_plan`]),
     /// from `granted` or the pools; [`Self::window_advance`] moves the
     /// windows once the fire's tables have been read.
+    ///
+    /// Window-list path: removed by the windowed-state change (the integration
+    /// commit deletes it once every engine states `Capabilities::windowed_state`).
     pub fn prepare_window(
         &mut self,
         ws: RsWorkingSetId,
@@ -1824,6 +2102,9 @@ impl RsStore {
     /// Each window list's table of `ws` as a fire reading rows up to `end`
     /// reads it, in the engine's numbering: slot `i` its rows
     /// `[i * T_w, (i + 1) * T_w)`, 0 where trimmed or not written.
+    ///
+    /// Window-list path: removed by the windowed-state change (the integration
+    /// commit deletes it once every engine states `Capabilities::windowed_state`).
     pub fn window_tables(&self, ws: RsWorkingSetId, end: u32) -> Result<Vec<Vec<u32>>, RsError> {
         let entry = self.entry(ws)?;
         if self.live_window(entry).is_none() {
@@ -1859,6 +2140,9 @@ impl RsStore {
     /// Moves `ws`'s windows by what its published fire commits: each list's
     /// slots whose last row lies below the committed position less the
     /// list's own window retire, once no fire still reads them.
+    ///
+    /// Window-list path: removed by the windowed-state change (the integration
+    /// commit deletes it once every engine states `Capabilities::windowed_state`).
     pub fn window_advance(&mut self, ws: RsWorkingSetId, advance: WindowAdvance) {
         let lists = self.window.clone();
         let entry = self.entry_mut(ws).expect("batch prevalidated");
@@ -1905,6 +2189,7 @@ impl RsStore {
 
     /// To a fresh slot when `fresh`: other lanes of the fire read the one it
     /// holds.
+    #[cfg(test)]
     pub fn group_demand(
         &self,
         ws: RsWorkingSetId,
@@ -1912,14 +2197,82 @@ impl RsStore {
         fresh: bool,
         writes: Option<std::ops::Range<u32>>,
     ) -> Result<RsUnits, RsError> {
+        self.group_demand_split(ws, write_state, fresh, writes, None)
+    }
+
+    /// [`Self::group_demand`] of a fire buffering `writes` in the rs list
+    /// (or a store's one buffer) and `wwrites` in a hybrid's window buffer
+    /// ([`Self::split_writes`]).
+    pub fn group_demand_split(
+        &self,
+        ws: RsWorkingSetId,
+        write_state: bool,
+        fresh: bool,
+        writes: Option<std::ops::Range<u32>>,
+        wwrites: Option<std::ops::Range<u32>>,
+    ) -> Result<RsUnits, RsError> {
         let entry = self.entry(ws)?;
         let targets = self.buffer_targets(entry, writes)?;
+        let wtargets = self.wbuffer_targets(entry, wwrites)?;
         let state = write_state && (fresh || entry.folded.is_none_or(|id| self.ref_count(id) > 1));
+        let wbuf = self.targets_demand(&wtargets);
         Ok(RsUnits {
             slots: u32::from(state),
-            pages: self.targets_demand(&targets),
+            pages: self.targets_demand(&targets) + wbuf,
+            wbuf,
             ..RsUnits::default()
         })
+    }
+
+    /// The rows a hybrid's window-buffer slot holds.
+    fn wpage_tokens(&self) -> u32 {
+        self.w_tokens.unwrap_or(1).max(1)
+    }
+
+    /// The row a hybrid's window buffer's entry 0 holds: where it stands,
+    /// or, empty, the folded index rounded down to its slot.
+    fn wbuffer_base(&self, entry: &RsEntry) -> u32 {
+        if entry.wbuffer.is_empty() {
+            entry.frozen - entry.frozen % self.wpage_tokens()
+        } else {
+            entry.wbase
+        }
+    }
+
+    /// Where a fire writing `writes` finds a hybrid's window buffer's entry
+    /// 0: empty, at the fire's first buffered row rounded down
+    /// ([`Self::split_writes`]); else where it stands.
+    fn wwrite_base(&self, entry: &RsEntry, writes: &std::ops::Range<u32>) -> u32 {
+        if entry.wbuffer.iter().all(Option::is_none) {
+            let at = writes.start.max(entry.frozen);
+            at - at % self.wpage_tokens()
+        } else {
+            entry.wbase
+        }
+    }
+
+    /// The window-buffer slots of a hybrid a fire writing `writes` lands in.
+    fn wbuffer_targets(
+        &self,
+        entry: &RsEntry,
+        writes: Option<std::ops::Range<u32>>,
+    ) -> Result<Vec<(u32, Option<RsSlotId>)>, RsError> {
+        let Some(writes) = writes.filter(|writes| !writes.is_empty() && self.hybrid()) else {
+            return Ok(Vec::new());
+        };
+        if writes.start < entry.frozen {
+            return Err(RsError::BelowFrozen {
+                slot: writes.start,
+                frozen: entry.frozen,
+            });
+        }
+        let page = self.wpage_tokens();
+        let base = self.wwrite_base(entry, &writes);
+        let first = (writes.start - base) / page;
+        let last = (writes.end - 1 - base) / page;
+        Ok((first..=last)
+            .map(|index| (index, entry.wbuffer.get(index as usize).copied().flatten()))
+            .collect())
     }
 
     /// The rows a buffer page holds: an rs list slot's tokens in a shared
@@ -1950,6 +2303,17 @@ impl RsStore {
         }
     }
 
+    /// Where a fire writing `writes` finds the buffer's page 0: an empty
+    /// window buffer starts at the fire's first buffered row, rounded down
+    /// ([`Self::split_writes`]); any other buffer where it stands.
+    fn write_base(&self, entry: &RsEntry, writes: &std::ops::Range<u32>) -> u32 {
+        if self.window_buffer && !self.hybrid() && entry.buffer.iter().all(Option::is_none) {
+            self.empty_base(writes.start.max(entry.frozen))
+        } else {
+            self.buffer_base(entry)
+        }
+    }
+
     fn buffer_targets(
         &self,
         entry: &RsEntry,
@@ -1965,7 +2329,7 @@ impl RsStore {
             });
         }
         let page = self.page_tokens(entry);
-        let base = self.buffer_base(entry);
+        let base = self.write_base(entry, &writes);
         let first = (writes.start - base) / page;
         let last = (writes.end - 1 - base) / page;
         Ok((first..=last)
@@ -1973,6 +2337,7 @@ impl RsStore {
             .collect())
     }
 
+    #[cfg(test)]
     pub fn prepare_group(
         &mut self,
         ws: RsWorkingSetId,
@@ -1982,12 +2347,48 @@ impl RsStore {
         writes: Option<std::ops::Range<u32>>,
         reserved: Option<&mut RsGrant>,
     ) -> Result<RsPreparedWrite, RsError> {
+        self.prepare_group_split(ws, write_state, fresh, fold, writes, None, reserved)
+    }
+
+    /// [`Self::prepare_group`] of a fire buffering `writes` in the rs list
+    /// (or a store's one buffer) and `wwrites` in a hybrid's window buffer
+    /// ([`Self::split_writes`]).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the state's write, the fold, and each buffer's rows"
+    )]
+    pub fn prepare_group_split(
+        &mut self,
+        ws: RsWorkingSetId,
+        write_state: bool,
+        fresh: bool,
+        fold: Option<u32>,
+        writes: Option<std::ops::Range<u32>>,
+        wwrites: Option<std::ops::Range<u32>>,
+        reserved: Option<&mut RsGrant>,
+    ) -> Result<RsPreparedWrite, RsError> {
         // Refused (below the state) before the buffer grows.
         self.buffer_targets(self.entry(ws)?, writes.clone())?;
+        self.wbuffer_targets(self.entry(ws)?, wwrites.clone())?;
+        if let Some(writes) = wwrites
+            .as_ref()
+            .filter(|writes| !writes.is_empty() && self.hybrid())
+        {
+            let (base, page) = {
+                let entry = self.entry(ws)?;
+                (self.wwrite_base(entry, writes), self.wpage_tokens())
+            };
+            let entry = self.entry_mut(ws)?;
+            entry.wbase = base;
+            let pages = writes.end.saturating_sub(base).div_ceil(page) as usize;
+            if entry.wbuffer.len() < pages {
+                entry.wbuffer.resize(pages, None);
+            }
+        }
         if let Some(writes) = writes.as_ref().filter(|writes| !writes.is_empty()) {
             let (base, page) = {
                 let entry = self.entry(ws)?;
-                (self.buffer_base(entry), self.page_tokens(entry))
+                (self.write_base(entry, writes), self.page_tokens(entry))
             };
             let entry = self.entry_mut(ws)?;
             entry.base = base;
@@ -1997,7 +2398,8 @@ impl RsStore {
             }
         }
         let targets = self.buffer_targets(self.entry(ws)?, writes)?;
-        self.prepare_targets(ws, write_state, fresh, fold, targets, reserved)
+        let wtargets = self.wbuffer_targets(self.entry(ws)?, wwrites)?;
+        self.prepare_targets(ws, write_state, fresh, fold, targets, wtargets, reserved)
     }
 
     /// Prepares a write of the state (when `write_state`) and of the buffer
@@ -2010,6 +2412,7 @@ impl RsStore {
         fresh: bool,
         fold_tokens: Option<u32>,
         buffer_targets_src: Vec<(u32, Option<RsSlotId>)>,
+        wbuffer_targets_src: Vec<(u32, Option<RsSlotId>)>,
         reserved: Option<&mut RsGrant>,
     ) -> Result<RsPreparedWrite, RsError> {
         let folded = {
@@ -2025,10 +2428,12 @@ impl RsStore {
             slots: u32::from(
                 write_state && (fresh || folded.is_none_or(|id| self.ref_count(id) > 1)),
             ),
-            pages: self.targets_demand(&buffer_targets_src),
+            pages: self.targets_demand(&buffer_targets_src)
+                + self.targets_demand(&wbuffer_targets_src),
+            wbuf: self.targets_demand(&wbuffer_targets_src),
             ..RsUnits::default()
         };
-        let (slots, pages) = match reserved {
+        let (slots, pages, wpages) = match reserved {
             Some(granted) => {
                 if !granted.units().covers(need) {
                     return Err(RsError::GrantMismatch {
@@ -2038,7 +2443,11 @@ impl RsStore {
                 }
                 (
                     granted.slots.drain(..need.slots as usize).collect(),
-                    granted.pages.drain(..need.pages as usize).collect(),
+                    granted
+                        .pages
+                        .drain(..(need.pages - need.wbuf) as usize)
+                        .collect(),
+                    granted.wpages.drain(..need.wbuf as usize).collect(),
                 )
             }
             None => self.alloc(need).ok_or(RsError::OutOfSlots {
@@ -2048,7 +2457,13 @@ impl RsStore {
         };
         let mut fresh_slots = slots.iter().copied();
         let mut fresh_ids = pages.iter().copied();
-        let allocated: Vec<RsSlotId> = slots.iter().chain(&pages).copied().collect();
+        let mut fresh_wids = wpages.iter().copied();
+        let allocated: Vec<RsSlotId> = slots
+            .iter()
+            .chain(&pages)
+            .chain(&wpages)
+            .copied()
+            .collect();
 
         let state = if write_state {
             Some(match folded {
@@ -2075,7 +2490,7 @@ impl RsStore {
             None
         };
 
-        let buffers: Vec<RsBufferTarget> = buffer_targets_src
+        let mut buffers: Vec<RsBufferTarget> = buffer_targets_src
             .into_iter()
             .map(|(index, slot)| match slot {
                 None => RsBufferTarget::Fresh {
@@ -2090,6 +2505,23 @@ impl RsStore {
                 Some(src) => RsBufferTarget::InPlace { index, dst: src },
             })
             .collect();
+        let wbuffers = wbuffer_targets_src
+            .into_iter()
+            .map(|(index, slot)| match slot {
+                None => RsBufferTarget::Fresh {
+                    index,
+                    dst: fresh_wids.next().expect("allocated covers materialize"),
+                },
+                Some(src) if self.ref_count(src) > 1 => RsBufferTarget::Cow {
+                    index,
+                    src,
+                    dst: fresh_wids.next().expect("allocated covers cow"),
+                },
+                Some(src) => RsBufferTarget::InPlace { index, dst: src },
+            })
+            .collect::<Vec<_>>();
+        // A target names its table by its slot's pool (`set_buffer_page`).
+        buffers.extend(wbuffers);
 
         self.seq += 1;
         let touch = Touch {
@@ -2240,6 +2672,8 @@ impl RsStore {
                 frozen: frozen + row,
                 windows: Vec::new(),
                 window: None,
+                wbuffer: Vec::new(),
+                wbase: frozen + row,
                 device_folds: 0,
                 device_fold_failed: None,
             });
@@ -2285,9 +2719,11 @@ impl RsStore {
     /// a slot of); a slot buffer was sized by the guest.
     fn set_buffer_page(&mut self, ws: RsWorkingSetId, index: u32, dst: RsSlotId) {
         let list = self.list_of(dst);
+        let wpage = self.is_wpage(dst);
         let entry = self.entry_mut(ws).expect("batch prevalidated");
         let table = match list {
             Some(list) => &mut entry.windows[list],
+            None if wpage => &mut entry.wbuffer,
             None => &mut entry.buffer,
         };
         let index = index as usize;
@@ -2322,6 +2758,7 @@ impl RsStore {
             return;
         };
         let rs_tokens = self.rs_tokens;
+        let wpage = self.wpage_tokens();
         let Ok(entry) = self.entry_mut(ws) else {
             return;
         };
@@ -2329,12 +2766,20 @@ impl RsStore {
         let below = (entry.frozen.saturating_sub(entry.base) / page) as usize;
         let drop = below.min(entry.buffer.len());
         entry.base += drop as u32 * page;
-        let dropped: Vec<RsSlotId> = entry.buffer.drain(..drop).flatten().collect();
+        let mut dropped: Vec<RsSlotId> = entry.buffer.drain(..drop).flatten().collect();
         if entry.buffer.is_empty() {
             entry.base = match rs_tokens {
                 Some(tokens) => entry.frozen - entry.frozen % tokens,
                 None => entry.frozen,
             };
+        }
+        // A hybrid's window buffer: every slot whose rows are all folded.
+        let below = (entry.frozen.saturating_sub(entry.wbase) / wpage) as usize;
+        let drop = below.min(entry.wbuffer.len());
+        entry.wbase += drop as u32 * wpage;
+        dropped.extend(entry.wbuffer.drain(..drop).flatten());
+        if entry.wbuffer.is_empty() {
+            entry.wbase = entry.frozen - entry.frozen % wpage;
         }
         for id in dropped {
             self.decref(id);
@@ -2424,14 +2869,22 @@ impl RsStore {
         if self.is_window() {
             return self.per_list(|pool| pool.available() as u32);
         }
-        RsUnits::of(self.slots.available() as u32, self.pages.available() as u32)
+        let wbuf = self.wpages.available() as u32;
+        RsUnits {
+            wbuf,
+            ..RsUnits::of(self.slots.available() as u32, self.pages.available() as u32 + wbuf)
+        }
     }
 
     pub fn capacity(&self) -> RsUnits {
         if self.is_window() {
             return self.per_list(ShapePool::capacity);
         }
-        RsUnits::of(self.slots.capacity(), self.pages.capacity())
+        let wbuf = self.wpages.capacity();
+        RsUnits {
+            wbuf,
+            ..RsUnits::of(self.slots.capacity(), self.pages.capacity() + wbuf)
+        }
     }
 
     /// One shared by forks counted once.
@@ -2463,6 +2916,7 @@ impl RsStore {
                     .folded
                     .iter_mut()
                     .chain(entry.buffer.iter_mut().flatten())
+                    .chain(entry.wbuffer.iter_mut().flatten())
                     .chain(entry.windows.iter_mut().flatten().flatten())
                 {
                     if *id == from {
@@ -2580,7 +3034,11 @@ impl RsStore {
             }
             return RsUnits::of_windows(windows);
         }
-        RsUnits::of(count(&self.host_slots), count(&self.host_pages))
+        let wbuf = count(&self.host_wpages);
+        RsUnits {
+            wbuf,
+            ..RsUnits::of(count(&self.host_slots), count(&self.host_pages) + wbuf)
+        }
     }
 
     /// Host rows for each of `ids`, in order, each of its own pool; none
@@ -2760,10 +3218,15 @@ impl RsStore {
         } else {
             granted
                 .pages
-                .drain(..need.pages as usize)
+                .drain(..need.pages.saturating_sub(need.wbuf) as usize)
                 .collect::<Vec<_>>()
                 .into_iter()
         };
+        let mut wpages: std::vec::IntoIter<RsSlotId> = granted
+            .wpages
+            .drain(..need.wbuf as usize)
+            .collect::<Vec<_>>()
+            .into_iter();
         let mut lists: Vec<std::vec::IntoIter<RsSlotId>> = granted
             .windows
             .iter_mut()
@@ -2774,6 +3237,7 @@ impl RsStore {
         for &host in &swapped {
             let device = match self.list_of(host) {
                 Some(list) if windowed => lists.get_mut(list).and_then(Iterator::next),
+                _ if self.is_wpage(host) => wpages.next(),
                 _ if self.is_page(host) => pages.next(),
                 _ => slots.next(),
             };
@@ -2822,13 +3286,23 @@ impl RsStore {
         self.release_device(txn.moves.into_iter().map(|(_, device)| device));
     }
 
-    fn alloc(&mut self, need: RsUnits) -> Option<(Vec<RsSlotId>, Vec<RsSlotId>)> {
+    /// `need`'s state slots, rs pages and (a hybrid's) window-buffer
+    /// slots; none unless all fit.
+    fn alloc(&mut self, need: RsUnits) -> Option<(Vec<RsSlotId>, Vec<RsSlotId>, Vec<RsSlotId>)> {
         let slots = self.slots.try_alloc_n(need.slots as usize)?;
-        let Some(pages) = self.pages.try_alloc_n(need.pages as usize) else {
+        let Some(pages) = self
+            .pages
+            .try_alloc_n(need.pages.saturating_sub(need.wbuf) as usize)
+        else {
             self.slots.release_reserved(slots);
             return None;
         };
-        Some((slots, pages))
+        let Some(wpages) = self.wpages.try_alloc_n(need.wbuf as usize) else {
+            self.slots.release_reserved(slots);
+            self.pages.release_reserved(pages);
+            return None;
+        };
+        Some((slots, pages, wpages))
     }
 
     /// `need[l]` fresh slots of each window list `l`; none unless all fit.
@@ -2855,16 +3329,18 @@ impl RsStore {
                 ..RsGrant::default()
             });
         }
-        self.alloc(need).map(|(slots, pages)| RsGrant {
+        self.alloc(need).map(|(slots, pages, wpages)| RsGrant {
             slots,
             pages,
             windows: Vec::new(),
+            wpages,
         })
     }
 
     pub fn release_reservation(&mut self, grant: RsGrant) {
         self.slots.release_reserved(grant.slots);
         self.pages.release_reserved(grant.pages);
+        self.wpages.release_reserved(grant.wpages);
         for (list, ids) in grant.windows.into_iter().enumerate() {
             self.list_pool(list).release_reserved(ids);
         }

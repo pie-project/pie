@@ -263,6 +263,7 @@ impl Engine for Spatial {
             kv_handle: None,
             media_encode: false,
             rs_verbs: false,
+            windowed_state: false,
             rs_snapshots: 0,
             bidirectional_attention: false,
             adapter_attachments: false,

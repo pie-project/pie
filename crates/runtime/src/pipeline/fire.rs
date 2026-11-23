@@ -699,6 +699,9 @@ fn bound_rs_working_sets<C: FireContext>(
 /// sequence precedes, and reads its tables through them.
 /// `keep`: the position a checkpoint inside the fire lands at, whose slots
 /// stay past it.
+///
+/// Window-list path: removed by the windowed-state change (the integration
+/// commit deletes it once every engine states `Capabilities::windowed_state`).
 fn host_window_plan(
     req: &crate::engine::FireRequest,
     fold: &geometry::Fold,
@@ -953,16 +956,18 @@ fn device_lane_rows(
 
 /// The frozen length of each lane's recurrent state, by the lane's group
 /// (`None` a lane where the pass binds none, or on a model with window
-/// lists, whose rows trim behind their windows and are never replayed).
+/// lists, whose rows trim behind their windows and are never replayed, or
+/// whose windowed layers are ring + buffer, `replays_none`: their buffered
+/// rows' K/V are read from the window buffer, never replayed).
 fn lanes_frozen(
     stores: &crate::store::registry::Stores,
     ids: &[crate::store::rs::RsWorkingSetId],
     groups: &LaneGroups,
     lanes: usize,
-    windowed: bool,
+    replays_none: bool,
 ) -> Result<Vec<Option<u32>>, String> {
     let mut frozen = vec![None; lanes];
-    if ids.is_empty() || windowed {
+    if ids.is_empty() || replays_none {
         return Ok(frozen);
     }
     let store = stores.rs.lock().unwrap();
@@ -975,6 +980,34 @@ fn lanes_frozen(
         }
     }
     Ok(frozen)
+}
+
+/// Whether a pass of a load whose windowed layers are ring + buffer
+/// (`window_state`) keeps a checkpoint at its last page boundary unasked (a
+/// snapshot of its record, the rings, which kv alone cannot rebuild): only
+/// where it costs no fire of its own, the engine landing it inside the
+/// fire (`rs_snapshots`) or the pass ending on the boundary (`reach`, a
+/// page multiple). Elsewhere the checkpoint would cut the prompt's last
+/// rows into a fire of their own (a 2065-row prompt as 2064 rows and 1),
+/// so none is kept, as an rs load keeps none unasked.
+fn window_auto_checkpoint(window_state: bool, rs_snapshots: u32, reach: u64, page: u32) -> bool {
+    window_state && (rs_snapshots > 0 || reach.is_multiple_of(u64::from(page.max(1))))
+}
+
+/// Whether the load's only state is windowed layers served as ring +
+/// buffer (`window_state`, its record the rings alone: no recurrent layer,
+/// whatever buffer lists the engine states): its lanes, a beam group's
+/// sharing one record among them, replay nothing, their unfolded rows going
+/// to window-buffer slots on demand, so a pass of several lanes is cut as
+/// one of kv lanes is (CONTRACT-BC 19: a fire too wide is cut like chunked
+/// prefill, never refused). A hybrid's recurrent layers replay the rows its
+/// lanes carry: its lanes are cut as an rs load's.
+pub(crate) fn window_only(stores: &crate::store::registry::Stores, window_state: bool) -> bool {
+    window_state
+        && stores
+            .shared
+            .as_ref()
+            .is_some_and(|shared| !shared.lock().unwrap().recurrent())
 }
 
 /// The rows of one piece of a host pass: each lane's cut of `full`, over a
@@ -1792,7 +1825,7 @@ fn rows_of_lanes(
 
 /// Several lanes are cut alike and aligned at their ends, so the last piece
 /// holds every lane's read-out rows.
-fn pass_pieces(
+pub(crate) fn pass_pieces(
     req: &crate::engine::FireRequest,
     cuttable: bool,
     lanes_cuttable: bool,
@@ -3539,6 +3572,9 @@ fn stamp_lane_translation(
 /// it writes and commit nothing; what each list retires is behind the first
 /// page it writes, where every row lands past, so a decode loop that never
 /// states its positions still holds its windows and not its whole sequence.
+///
+/// Window-list path: removed by the windowed-state change (the integration
+/// commit deletes it once every engine states `Capabilities::windowed_state`).
 fn device_window_plan(
     stores: &crate::store::registry::Stores,
     ws: crate::store::kv::page_table::WorkingSetId,
@@ -4529,9 +4565,14 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 fold
             }
         };
+        let window_state = crate::model::model().rs_caps().window_state;
+        let window_only = window_only(&stores, window_state);
         // A long host pass runs as several fires; all but the last run the
         // model's forward alone. A recurrent state folding all its rows, or
-        // none, folds each fire's rows in turn.
+        // none, folds each fire's rows in turn; a windowed-only load's
+        // other folds (a beam group's lagged common-ancestor fold) land with
+        // the pass's last piece, its earlier pieces' rows buffered
+        // (`piece_fold`).
         let folds_all = rs_ws_ids.is_empty()
             || [0, u32::MAX]
                 .into_iter()
@@ -4556,7 +4597,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             && !prologue_moves
             && (!adapted || crate::model::model().eta_caps().adapter_attachments)
             && !fire_wide_mask
-            && folds_all;
+            && (folds_all || window_only);
         let mut full = req;
         let keyed = if keyable { keyed_rows(&full) } else { 0 };
         let mut pass_slots = (keyed > 0)
@@ -4710,7 +4751,17 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // before windows were trimmed. A recurrent state's would hold its
         // record, which the pass's next write copies whole: it keeps one
         // only where the inferlet asks.
-        let auto = windowed && state.is_some() && stores.rs.lock().unwrap().is_window();
+        // A model whose windowed layers are ring + buffer (CONTRACT-BC 19)
+        // keeps one too, where it costs no fire ([`window_auto_checkpoint`]).
+        // (The window-list arm: removed by the windowed-state change.)
+        let auto = state.is_some()
+            && ((windowed && stores.rs.lock().unwrap().is_window())
+                || window_auto_checkpoint(
+                    window_state,
+                    crate::model::model().eta_caps().rs_snapshots,
+                    reach,
+                    page_size,
+                ));
         let checkpoints: Vec<u64> = match state {
             Some(_) => checkpoint_rows(
                 &ctx.resources().get(&fwd)?.bindings.checkpoints,
@@ -4756,7 +4807,13 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // A fire asks for the recurrent rows it carries in unfolded too,
         // where they are more than its own: a rung's replay scratch holds
         // its tokens of them. The pass carries these into its first fire.
-        let frozen = match lanes_frozen(&stores, &rs_ws_ids, &groups, full.lanes.len(), windowed) {
+        let frozen = match lanes_frozen(
+            &stores,
+            &rs_ws_ids,
+            &groups,
+            full.lanes.len(),
+            windowed || window_state,
+        ) {
             Ok(frozen) => frozen,
             Err(error) => return Ok(Err(error)),
         };
@@ -4805,7 +4862,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
         let mut cuts = pass_pieces(
             &full,
             cuttable,
-            rs_ws_ids.is_empty(),
+            rs_ws_ids.is_empty() || window_only,
             mask_share(&full, prefill_share(page_size, engine), &stores, engine),
             page_size,
             &forced,
@@ -4879,11 +4936,14 @@ pub async fn submit_pass_stamped<C: FireContext>(
             if switched.rows_read {
                 why.push("it reads out an output of rows a cut fire would not hold");
             }
-            if !folds_all {
+            if !folds_all && !window_only {
                 why.push("it states where its recurrent state folds");
             }
-            if full.lanes.len() > 1 && !rs_ws_ids.is_empty() {
-                why.push("its lanes carry recurrent state");
+            if full.lanes.len() > 1 && !rs_ws_ids.is_empty() && !window_only {
+                why.push(
+                    "its lanes carry rows its recurrent layers replay, which several lanes do \
+                     not take in pieces",
+                );
             }
             if why.is_empty() {
                 why.push("its rows read one another (attention both ways, a block draft, an attention group, inputs or voxels)");
@@ -5121,25 +5181,55 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     (&group_sets[group], written)
                 })
                 .collect();
+            // The piece's lanes' recurrent states, in the piece's lane
+            // order: a cut of several lanes (a windowed-only load's) keeps
+            // only those with rows in it.
+            // What the piece folds: the pass's fold where it folds all it
+            // writes or nothing, else (a windowed-only load's cut of other
+            // folds) nothing before its last piece, which folds as the pass
+            // states, every lane in it.
+            let piece_fold = if folds_all || last {
+                fold.clone()
+            } else {
+                geometry::Fold::None
+            };
+            let piece_rs_ids: Vec<crate::store::rs::RsWorkingSetId> = if rs_ws_ids.is_empty() {
+                Vec::new()
+            } else {
+                kept_lanes.iter().map(|&lane| rs_ws_ids[lane]).collect()
+            };
+            let piece_rs_groups: LaneGroups = piece_groups
+                .iter()
+                .filter(|(_, lanes)| !lanes.is_empty())
+                .cloned()
+                .collect();
+            // Each beam group's pool end and common slot, for the groups the
+            // piece keeps (in `piece_rs_groups`' order).
+            let (piece_beam_ends, piece_beam_commons): (Vec<u32>, Vec<u32>) = piece_groups
+                .iter()
+                .zip(beam_ends.iter().zip(&beam_commons))
+                .filter(|((_, lanes), _)| !lanes.is_empty())
+                .map(|(_, (&end, &common))| (end, common))
+                .unzip();
             // The lanes each set carries, for what their state asks alone.
             let set_lanes: Vec<Vec<usize>> = if rs_ws_ids.is_empty() {
                 Vec::new()
             } else {
-                present.iter().map(|&group| groups[group].1.clone()).collect()
+                present.iter().map(|&group| piece_groups[group].1.clone()).collect()
             };
             let rs_plan = || {
                 if windowed {
-                    host_window_plan(&req, &fold, &rs_ws_ids, keep)
+                    host_window_plan(&req, &piece_fold, &piece_rs_ids, keep)
                 } else {
                     host_rs_plan(
                         &stores,
-                        &rs_ws_ids,
-                        &groups,
+                        &piece_rs_ids,
+                        &piece_rs_groups,
                         &req,
-                        &fold,
+                        &piece_fold,
                         &inside,
-                        (!beam_ends.is_empty()).then_some(beam_ends.as_slice()),
-                        (!beam_ends.is_empty()).then_some(beam_commons.as_slice()),
+                        (!piece_beam_ends.is_empty()).then_some(piece_beam_ends.as_slice()),
+                        (!piece_beam_ends.is_empty()).then_some(piece_beam_commons.as_slice()),
                     )
                 }
             };
@@ -5151,7 +5241,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 &pipeline_failure,
                 &sets,
                 &set_lanes,
-                &rs_ws_ids,
+                &piece_rs_ids,
                 rs_plan,
                 windowed,
             )
@@ -5186,7 +5276,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     &pass_lanes,
                     lanes,
                     &landings,
-                    &fold,
+                    &piece_fold,
                     slots.end,
                     last,
                     rs,
@@ -6552,7 +6642,7 @@ async fn fire_device_geometry<C: FireContext>(
         &rs_ws_ids,
         &groups,
         pass_lanes.places.len(),
-        windowed,
+        windowed || crate::model::model().rs_caps().window_state,
     ) {
         Ok(frozen) => frozen,
         Err(error) => return Ok(Err(error)),
@@ -8391,6 +8481,33 @@ mod cut_tests {
         a_pass_with_media_is_cut_before_its_first_span();
         a_pass_with_media_keys_the_rows_before_it();
         the_rest_of_a_pass_is_cut_again_wider();
+        a_windowed_prompt_is_one_fire_its_last_row_never_held_back();
+    }
+
+    /// A windowed-state prompt of 2065 rows on an engine landing no
+    /// snapshot inside a fire is one 2065-row fire: no unasked checkpoint
+    /// at row 2064 cuts its last row into a fire of its own. One landing
+    /// snapshots in the fire, or a prompt ending on a page, keeps the
+    /// checkpoint at no cost; a load of no windowed layer (an rs load, a
+    /// hybrid's rs rule) keeps none unasked, as before.
+    fn a_windowed_prompt_is_one_fire_its_last_row_never_held_back() {
+        let (rows, page) = (2065u32, 16u32);
+        let req = prefill_lane(0, rows, page);
+        let pieces = |auto: bool| {
+            let at = checkpoint_rows(&[], 0..u64::from(rows), page, 1 << 20, auto);
+            let forced: Vec<u32> = at.iter().map(|&row| row as u32).collect();
+            host_cuts(&req, true, 4096, page, &forced, 0)
+        };
+        assert!(!window_auto_checkpoint(true, 0, u64::from(rows), page));
+        assert_eq!(pieces(false), [(0, rows)], "one fire of every row");
+        assert_eq!(
+            pieces(true),
+            [(0, 2064), (2064, rows)],
+            "what an unasked checkpoint at 2064 cost"
+        );
+        assert!(window_auto_checkpoint(true, 1, u64::from(rows), page), "landed in the fire");
+        assert!(window_auto_checkpoint(true, 0, 2064, page), "at the pass's end");
+        assert!(!window_auto_checkpoint(false, 4, 2064, page), "an rs load keeps none");
     }
 
     /// A raise landing mid-pass: what is left from the last cut is cut at

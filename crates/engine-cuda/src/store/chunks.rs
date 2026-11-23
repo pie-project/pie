@@ -1125,6 +1125,7 @@ impl Chunks {
                 )
                 .collect(),
             record_bytes: 0,
+            windowed: Vec::new(),
         }
     }
 }

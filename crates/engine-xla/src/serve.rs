@@ -10,6 +10,7 @@
 //! too; one lane holding the rest otherwise). A padding lane reads and writes
 //! only the sink page and the sink slot.
 
+pub(crate) mod ring;
 mod size;
 mod stream;
 mod warm;
@@ -195,10 +196,13 @@ pub struct Seated<'a> {
 
     pub first: Option<u32>,
 
-    /// The lane's slot refs of the window list, in its token order (its
-    /// slots hold the kv page's tokens), 0 where trimmed; empty for a lane
-    /// handed none.
+    /// The lane's window-buffer table (CONTRACT-BC 21): its slot refs in
+    /// token order from [`Seated::window_fold`]'s `base`, every one a real
+    /// slot; empty for a lane buffering none.
     pub window: &'a [u32],
+    /// The lane's windowed layers as state + buffer: its buffer's base and
+    /// how far the fire folds.
+    pub window_fold: Option<engine::fire::WindowFold>,
 
     /// The lane's record: one `[run, cow]` slot ref a piece of each fixed
     /// shape (`engine::fire::Lane::fixed`).
@@ -207,6 +211,11 @@ pub struct Seated<'a> {
     /// Whole-slot copies `[src, dst]` of list shapes made before the fire
     /// (`engine::fire::Lane::slot_copies`).
     pub copies: &'a [(engine::chunk::ShapeId, Vec<[u32; 2]>)],
+
+    /// The lane's replay as the runtime counted it
+    /// (`engine::fire::Lane::replay_stated`), held against this shell's own
+    /// count at prepare (`engine::fire::replay_agrees`).
+    pub replay_stated: Option<engine::fire::LaneReplay>,
 }
 
 const FOLD: engine::fire::RsVerb = engine::fire::RsVerb::Fold;
@@ -234,8 +243,10 @@ impl<'a> Seated<'a> {
             beam: None,
             first: None,
             window: &[],
+            window_fold: None,
             fixed: &[],
             copies: &[],
+            replay_stated: None,
         }
     }
 }
@@ -261,6 +272,9 @@ pub(crate) struct Parked {
     code: crate::device::Code,
     sig: crate::trace::Signature,
     probed: Vec<ValueId>,
+    /// Where it loads behind serving: (its ladder part's rank, the fire's
+    /// lanes, its rows), ascending (`warm::use_rank`).
+    order: (u8, u32, u32),
 }
 
 pub(crate) struct Deferred {
@@ -269,6 +283,26 @@ pub(crate) struct Deferred {
     code: crate::device::Code,
     sig: crate::trace::Signature,
     probed: Vec<ValueId>,
+    rows: u32,
+    /// Set by the ladder as it traces the fire (`Parked::order`).
+    order: (u8, u32, u32),
+}
+
+/// The cached programs loading behind serving (`Shell::load_behind`): the
+/// loader's thread, stopped and joined before the shell's other fields drop.
+#[derive(Default)]
+pub(crate) struct Behind {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Behind {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 /// What a ladder fire's key traced to, kept for this build's later loads
@@ -276,17 +310,25 @@ pub(crate) struct Deferred {
 /// length, signature and probed values. A load whose fire finds its record
 /// and its program on disk builds no text.
 #[derive(serde::Serialize, serde::Deserialize)]
-struct TraceRecord {
-    hash: [u8; 32],
-    name: String,
-    len: usize,
-    sig: crate::trace::Signature,
-    probed: Vec<ValueId>,
+pub(crate) struct TraceRecord {
+    pub(crate) hash: [u8; 32],
+    pub(crate) name: String,
+    pub(crate) len: usize,
+    /// The program file's length in the disk cache as it was kept: a file
+    /// of another length (or none) is no record's, and its fire is traced
+    /// and built again before ready.
+    pub(crate) file_len: u64,
+    /// What compiling the text takes of the host (`device::compile_need`).
+    pub(crate) need: u64,
+    pub(crate) sig: crate::trace::Signature,
+    pub(crate) probed: Vec<ValueId>,
 }
 
 /// Fields drop in order: every buffer (weights, pools) goes before the
 /// device whose client made it.
 pub struct Shell {
+    /// First, so it stops before anything it loads into drops.
+    behind: Behind,
     tuning: kernels_xla::tuning::Tuning,
     pad: crate::chip::Pad,
     /// `chip::Engine::seats`.
@@ -733,17 +775,24 @@ impl Shell {
         let rs_layout = crate::rs::Layout::read(&boot.trace)?.map(std::sync::Arc::new);
         // The chunk the compiler picks for this trace on a TPU, where it
         // packs one; the store lays its own runs around it.
-        let target = poem_compiler::chunk::plan(
+        // Windowed layers as ring + buffer (CONTRACT-BC 19, 21): the recipe
+        // asks the store's ring hook where the rings lie.
+        let recipe = poem_compiler::chunk::plan_windowed(
             &boot.trace,
             &budgets,
             &poem_compiler::DeviceProfile {
                 chunk: poem_compiler::chunk::ChunkProfile::TPU.paged(boot.page_size, boot.context),
                 ..poem_compiler::DeviceProfile::default()
             },
+            &crate::store::Rings,
         )
-        .map_or(crate::store::layout::TARGET_CHUNK, |recipe| {
-            recipe.chunk_bytes
-        });
+        .ok();
+        let target = recipe
+            .as_ref()
+            .map_or(crate::store::layout::TARGET_CHUNK, |recipe| {
+                recipe.chunk_bytes
+            });
+        let windowed_recipe = recipe.and_then(|recipe| recipe.windowed);
         // The null and sink chunks the pool lays past its pages, which a
         // budget of kv pages and state slots does not pay for: off the room.
         let reserved = crate::store::reserved_bytes(
@@ -980,6 +1029,9 @@ impl Shell {
             &staging,
         )?;
         let mut pools = pools;
+        if let Some(windowed) = &windowed_recipe {
+            pools.set_windowed(windowed);
+        }
         let mut staging_facts = staging_facts;
         staging_facts.bulk_bytes = pools.bulk_ring().1;
         streamed.renumber(narrow(pools.layout().shapes.len() as u64) as u32);
@@ -1215,6 +1267,7 @@ impl Shell {
             record_checked: false,
             records_hold: true,
             records_used: 0,
+            behind: Behind::default(),
             traced: std::collections::HashMap::new(),
             shaped: std::collections::HashMap::new(),
             parked: std::collections::HashMap::new(),
@@ -1284,6 +1337,14 @@ impl Shell {
     #[must_use]
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    /// Whether this load serves its windowed layers as ring + buffer
+    /// (`engine::Capabilities::windowed_state`, CONTRACT-BC 19, 21): it does
+    /// wherever it holds windowed layers.
+    #[must_use]
+    pub fn serves_windowed_state(&self) -> bool {
+        self.pools.layout().ring().is_some()
     }
 
     /// The device, shared: what a registration's compile, off the engine
@@ -1807,11 +1868,29 @@ impl Shell {
             return Ok(None);
         };
         let Some(program) = self.device.load_parked_code(&parked.code, parked.sig)? else {
+            // Not loading from the disk cache though its file stood as it
+            // was kept at the ladder (corrupt within its length): nothing is
+            // built after ready, so the fire is refused; its record is
+            // dropped with the file, and the next load builds it before ready.
+            let file = match &parked.code {
+                crate::device::Code::Cached { name, .. } => {
+                    if let Some(scope) = self.trace_scope.as_deref() {
+                        self.device.mend_record(scope, &at, name);
+                    }
+                    name.clone()
+                }
+                crate::device::Code::Text(text) => {
+                    self.device.cached_name(text).unwrap_or_default()
+                }
+            };
             return Err(Fault::Program {
                 at: "serve::ladder",
-                why: "a program the warm ladder parked in the disk cache is gone from it: the \
-                      cache was cleared under the load"
-                    .to_string(),
+                why: format!(
+                    "the program record {} names does not load from the disk cache (file {file}): \
+                     nothing is built after ready, so this fire is refused; the record is \
+                     dropped and the next load builds the program before ready",
+                    crate::device::hex(&at)
+                ),
             });
         };
         self.probed.insert(at, parked.probed);
@@ -2257,27 +2336,113 @@ impl Shell {
         // record piece, its rs verb's pages.
         let mut lane_records: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
         let mut lane_verbs: Vec<engine::fire::RsVerb> = Vec::with_capacity(lanes.len());
-        // Carried rows the fire's lanes replay, summed over them.
-        let mut carried: u32 = 0;
+        // Each lane's own rows and the buffered rows it replays ahead of them
+        // (a decode lane's included).
+        let mut replays: Vec<(u32, u32)> = Vec::with_capacity(lanes.len());
+        // Whether any lane holds rows before the fire: only such a lane may
+        // carry buffered rows into it.
+        let mut any_held = false;
         let mut lane_pages: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
         let mut lane_windows: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
+        // The windowed state (CONTRACT-BC 19, 21): each windowed lane's
+        // table composed of its ring, buffer and own-row pages, the pages
+        // filled before the fire and folded into the rings after it.
+        let ring_shape = self.pools.layout().ring().map(|s| s.id);
+        let ring_of = |seated: &Seated<'_>| -> Option<Vec<u32>> {
+            let id = ring_shape?;
+            let (_, pairs) = seated.fixed.iter().find(|(held, _)| *held == id)?;
+            Some(pairs.iter().map(|&[_, cow]| cow).collect())
+        };
+        let rings_named: Vec<Option<Vec<u32>>> = lanes.iter().map(ring_of).collect();
+        let own_grains = self.pools.own_grains();
+        let mut own_taken = 0usize;
+        let mut ring_fills: Vec<(u32, u32)> = Vec::new();
+        let mut ring_folds: Vec<(u32, u32)> = Vec::new();
+        let widest = paging.window.map_or(0, |w| w.tokens);
         for (at, seated) in lanes.iter().enumerate() {
             let pages = match kv_shape {
                 Some(id) if !seated.kv_less => self.pools.grains(id, seated.pages)?,
                 _ => seated.pages.to_vec(),
             };
-            let window = match window_shape {
-                Some(id) if !seated.kv_less && !seated.window.is_empty() => {
-                    self.pools.grains(id, seated.window)?
-                }
-                Some(_) if !seated.kv_less && !seated.pages.is_empty() => {
-                    return Err(Fault::Program {
+            let window = match (window_shape, ring_shape) {
+                (Some(buffer_id), Some(ring_id)) if !seated.kv_less => {
+                    let refuse = |why: String| Fault::Program {
                         at: "serve::prepare",
-                        why: format!(
-                            "lane {at} names kv slots and no window list table, which this \
-                             load's windowed rows read"
+                        why: format!("lane {at}: {why}"),
+                    };
+                    let have = match seated.held {
+                        Some(held) => held,
+                        None => self
+                            .held
+                            .get(seated.lane.slot as usize)
+                            .copied()
+                            .unwrap_or(0),
+                    };
+                    let rows = seated.lane.tokens.len() as u32;
+                    // A lane the engine fires for itself (the staging pass,
+                    // a ladder fire) folds every row it computes; one the
+                    // runtime fires states its fold (`api`, refused there
+                    // without one).
+                    let (fold, folded) = match seated.window_fold {
+                        Some(fold) => (fold, seated.folded),
+                        None => (
+                            engine::fire::WindowFold {
+                                base: (have + rows) / paging.page_size.max(1)
+                                    * paging.page_size.max(1),
+                                fold: engine::fire::FoldLen::Host(rows),
+                                lineage: engine::fire::Lineage::Set,
+                            },
+                            have,
                         ),
-                    });
+                    };
+                    let fold_rows = match fold.fold {
+                        engine::fire::FoldLen::Host(rows) => rows,
+                        engine::fire::FoldLen::Device => {
+                            return Err(refuse(
+                                "folds by a device count, which this engine's rings do not take yet".into(),
+                            ));
+                        }
+                    };
+                    let ring_refs = rings_named[at].clone().ok_or_else(|| {
+                        refuse(format!(
+                            "names no ring piece of shape {ring_id} in its record"
+                        ))
+                    })?;
+                    let ring = self.pools.grains(ring_id, &ring_refs)?;
+                    let buffer = self.pools.grains(buffer_id, seated.window)?;
+                    let alone = rings_named
+                        .iter()
+                        .filter(|r| r.as_ref() == Some(&ring_refs))
+                        .count()
+                        == 1;
+                    let mut own = || -> Result<u32> {
+                        let page = own_grains.get(own_taken).copied().ok_or(Fault::Ceiling {
+                            what: "own-row pages of a windowed fire",
+                            need: own_taken as u64 + 1,
+                            have: own_grains.len() as u64,
+                        })?;
+                        own_taken += 1;
+                        Ok(page)
+                    };
+                    let composed = ring::compose(
+                        &ring::RingLane {
+                            ring: &ring,
+                            buffer: &buffer,
+                            base: fold.base,
+                            have,
+                            rows,
+                            folded,
+                            fold: fold_rows,
+                            alone,
+                        },
+                        paging.page_size,
+                        widest,
+                        0,
+                        &mut own,
+                    )?;
+                    ring_fills.extend(composed.fills);
+                    ring_folds.extend(composed.folds);
+                    composed.table
                 }
                 _ => Vec::new(),
             };
@@ -2293,6 +2458,7 @@ impl Shell {
                     .copied()
                     .unwrap_or(0),
             };
+            any_held |= have > 0;
             let is_fresh = match seated.rs_reset {
                 engine::fire::RsReset::Inferred => have == 0,
                 engine::fire::RsReset::Fresh => true,
@@ -2345,7 +2511,7 @@ impl Shell {
                 }
                 engine::fire::RsVerb::Fold => engine::fire::RsVerb::Fold,
             });
-            if let engine::fire::RsVerb::Buffer {
+            let replayed = if let engine::fire::RsVerb::Buffer {
                 folded, lineage, ..
             } = seated.rs
             {
@@ -2355,37 +2521,52 @@ impl Shell {
                         at: "serve::rs",
                         why: format!("lane {at}: {e}"),
                     })?;
-                carried += reads.iter().map(|r| r.len() as u32).sum::<u32>();
-            }
+                reads.iter().map(|r| r.len() as u32).sum::<u32>()
+            } else {
+                0
+            };
+            replays.push((seated.lane.tokens.len() as u32, replayed));
         }
-        // A fire carries at most its rung's tokens of carried rows, summed
-        // over its lanes (its rung's `carried_max`, `ChunkFacts::act_replay`,
-        // checked by `engine::fire::rung_holds` as the runtime chose the
-        // rung by): one past it is refused here, before the fire writes
-        // anything.
-        let holds = engine::RungReplay {
-            carried_max: Some(crate::rs::carried_room(descriptor.bucket)),
-            own_max: None,
-            scratch: engine::ScratchBytes {
-                slot_bytes: Vec::new(),
-                lane_bytes: 0,
-                room_bytes: 0,
-                pad: 1,
-            },
-        };
-        let count = engine::ReplayRows {
-            carried,
-            ..engine::ReplayRows::default()
-        };
-        if let Err(past) = engine::fire::rung_holds(&holds, count) {
+        // The fire's replay against its rung's, as the load stated it and the
+        // runtime chose the rung by (`crate::rs::rung_replay`,
+        // `engine::fire::rung_holds`): every lane's replayed rows lie in the
+        // window scratch, so it is never compact. One past it is refused
+        // here, before the fire writes anything.
+        let rung = crate::rs::rung_replay(descriptor.bucket);
+        let count = engine::ReplayRows::of_lanes(replays.iter().copied(), false);
+        if engine::fire::replay_check_on() {
+            engine::fire::replay_agrees(
+                lanes
+                    .iter()
+                    .zip(&replays)
+                    .map(|(seated, &(own, _))| (own, seated.replay_stated)),
+                &rung,
+                count,
+                false,
+                false,
+                false,
+                false,
+            )
+            .map_err(|why| Fault::Program {
+                at: "serve::rs",
+                why,
+            })?;
+        }
+        if let Err(past) = engine::fire::rung_holds(&rung, count) {
             return Err(Fault::Ceiling {
-                what: "carried rows a fire's lanes replay (the tokens of the rung it runs at)",
-                need: u64::from(past.rows),
-                have: u64::from(past.max),
+                what: "rows a fire's lanes own and replay (its rung's own rows and carried room)",
+                need: past.rows,
+                have: past.max,
             });
         }
         if !copies.is_empty() {
             self.pools.copy(&self.device, &self.handles, &copies)?;
+        }
+        // own-row pages holding folded rows below the fire: the ring's,
+        // after any record's copy-on-first-fold above
+        if !ring_fills.is_empty() {
+            self.pools
+                .copy_pages(&self.device, &self.handles, &ring_fills)?;
         }
         if !fresh.is_empty() {
             self.pools.zero(&self.device, &self.handles, &fresh)?;
@@ -3044,14 +3225,26 @@ impl Shell {
         }
         let caches = self.pools.table(&table_seats, &record_rows_t)?;
 
+        // A fire that may carry buffered rows takes the buffered path whatever
+        // verbs its lanes send this time (a folding lane's plan replays
+        // nothing and commits its rows): whether a lane buffers is the
+        // runtime's fold timing (its lagged fold), so the program is the one
+        // the warm ladder lays for the same held rows.
+        let rs_active = rs_active || (any_held && self.pools.buffers_rs());
         let rs_seat = match (&self.rs_layout, rs_active) {
             (Some(layout), true) => {
                 let replay: Vec<i32> = rs_plans.iter().map(|p| p.replay as i32).collect();
                 let commit: Vec<i32> = rs_plans.iter().map(|p| p.commit as i32).collect();
-                // A fire that replays lays each window's scratch for the
-                // rung's own rows and its carried room; one that replays
-                // nothing, for its own rows alone.
-                let replays = carried > 0;
+                // A fire that may carry buffered rows (a lane of it holds rows
+                // already, on a load that buffers them: under the runtime's
+                // lagged fold a decode carries what its run-ahead left) lays
+                // each window's scratch for the rung's own rows and its stated
+                // carried room (`crate::rs::rung_replay`), whether it carries
+                // any this time or not: one program a shape, the one the warm
+                // ladder lays with the same held rows. A fire of fresh lanes
+                // alone (a first prefill) carries nothing and lays its own rows.
+                debug_assert!(any_held || replays.iter().all(|&(_, replayed)| replayed == 0));
+                let replays = any_held;
                 let mut maps = std::collections::HashMap::new();
                 for window in windows.all() {
                     if window.indptr_host.is_empty() {
@@ -3249,10 +3442,26 @@ impl Shell {
                         hash: r.hash,
                         name: r.name,
                         len: r.len,
+                        need: r.need,
+                        file_len: r.file_len,
                     };
                     (code, r.sig, r.probed)
                 })
-                .filter(|(code, ..)| self.device.code_on_disk(code));
+                // a record whose file is gone or of another length: its fire
+                // is traced and built here, before ready
+                .filter(|(code, ..)| {
+                    let kept = self.device.code_on_disk(code);
+                    if !kept && let crate::device::Code::Cached { name, .. } = code {
+                        self.device.note_mended();
+                        tracing::warn!(
+                            record = %crate::device::hex(&full),
+                            file = %name,
+                            "xla traced-fire record's program file is gone from the disk cache or \
+                             not as it was kept: its fire is traced and built again before ready"
+                        );
+                    }
+                    kept
+                });
             // The load's first record is traced again and checked: the
             // scope's hash must cover all a program's text depends on, and a
             // record its text parts from stops the records for this load.
@@ -3291,20 +3500,6 @@ impl Shell {
                             );
                         }
                     }
-                    if let (Some(scope), Some(name)) =
-                        (scope.as_deref(), self.device.cached_name(&text))
-                    {
-                        let record = TraceRecord {
-                            hash: *blake3::hash(text.as_bytes()).as_bytes(),
-                            name,
-                            len: text.len(),
-                            sig: sig.clone(),
-                            probed: probed.clone(),
-                        };
-                        if let Ok(bytes) = serde_json::to_vec(&record) {
-                            self.device.keep_trace_record(scope, &full, &bytes);
-                        }
-                    }
                     (crate::device::Code::Text(text), sig, probed)
                 }
             };
@@ -3315,6 +3510,8 @@ impl Shell {
                     code,
                     sig,
                     probed,
+                    rows: descriptor.rows,
+                    order: (u8::MAX, 0, descriptor.rows),
                 });
             }
             // A fire returning the readout entries: its row count's readout
@@ -3408,6 +3605,12 @@ impl Shell {
             &inputs,
             timing(),
         )?;
+        // The fold: each page the next window reads, from its buffer or
+        // own-row page into its ring page, on the stream behind the fire.
+        if !ring_folds.is_empty() {
+            self.pools
+                .copy_pages(&self.device, &self.handles, &ring_folds)?;
+        }
         let t3 = std::time::Instant::now();
         // The program's outputs: a plane per output the fire's classes
         // write, then a decoder's pixel plane and its grid, then the probes.
@@ -4933,7 +5136,7 @@ fn normal_exports(trace: &poem_ir::Trace, exports: &[poem_exec::feeds::ClassOutp
 
 /// The version of the traced-fire records' method: a change to what a
 /// record holds or how its scope is made bumps it.
-const TRACE_RECORDS: &str = "xla-traced-fires-1";
+const TRACE_RECORDS: &str = "xla-traced-fires-3";
 
 impl Shell {
     /// The scope a load's traced fires' records lie in: a hash of all a
@@ -4943,12 +5146,17 @@ impl Shell {
     /// chip, the pool's and the streamed weights' layouts, the staging and
     /// the compiler's flags. Not the pie version: an upgrade that changes
     /// none of these reuses every record.
-    /// This load's traced-fire records: the fires taken from them, and
-    /// whether they held (`false`: one parted from its trace, and the load
-    /// traced every fire).
+    /// This load's traced-fire records: the fires taken from them, whether
+    /// they held (`false`: one parted from its trace, and the load traced
+    /// every fire), and how many named a program that would not load (each
+    /// traced and built again).
     #[must_use]
-    pub fn trace_records(&self) -> (u64, bool) {
-        (self.records_used, self.records_hold)
+    pub fn trace_records(&self) -> (u64, bool, u64) {
+        (
+            self.records_used,
+            self.records_hold,
+            self.device.records_mended(),
+        )
     }
 
     /// The folder this load's traced-fire records lie in, if it keeps any.

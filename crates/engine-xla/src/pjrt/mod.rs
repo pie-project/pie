@@ -216,10 +216,51 @@ macro_rules! args {
     }};
 }
 
+/// The process's own handling of SIGTERM and SIGINT, put back when dropped.
+/// libtpu installs handlers for them as its plugin loads and its client is
+/// made: they dump every thread's stack and re-raise, so pie's own shutdown
+/// (stop loading, drain, exit) never ran, and one that landed while
+/// programs deserialized hung the process for good (v6e, twice in six kills
+/// during loading behind serving). Its handlers for faults (SIGSEGV, SIGBUS,
+/// ...) stay.
+pub(crate) struct KeptSignals {
+    kept: Vec<(libc::c_int, libc::sigaction)>,
+}
+
+impl KeptSignals {
+    pub(crate) fn now() -> KeptSignals {
+        let kept = [libc::SIGTERM, libc::SIGINT]
+            .into_iter()
+            .filter_map(|sig| {
+                // SAFETY: `sigaction` is plain data, zeroed a valid value; the
+                // call only reads `sig`'s action into it.
+                let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+                // SAFETY: as above.
+                let read = unsafe { libc::sigaction(sig, std::ptr::null(), &mut action) };
+                (read == 0).then_some((sig, action))
+            })
+            .collect();
+        KeptSignals { kept }
+    }
+}
+
+impl Drop for KeptSignals {
+    fn drop(&mut self) {
+        for (sig, action) in &self.kept {
+            // SAFETY: restores an action `sigaction` itself returned.
+            unsafe {
+                libc::sigaction(*sig, action, std::ptr::null_mut());
+            }
+        }
+    }
+}
+
 impl Api {
     /// dlopens `path` and asks it for its `PJRT_Api`, then runs
-    /// `PJRT_Plugin_Initialize`.
+    /// `PJRT_Plugin_Initialize`, the process's SIGTERM and SIGINT handling
+    /// kept ([`KeptSignals`]).
     pub fn load(path: &Path) -> Result<Arc<Self>> {
+        let _kept = KeptSignals::now();
         // SAFETY: loading a PJRT plugin runs its static initializers; that is
         // the documented way to use one.
         let lib = unsafe { libloading::Library::new(path) }
@@ -391,6 +432,8 @@ impl fmt::Debug for Client {
 
 impl Client {
     pub fn create(api: Arc<Api>) -> Result<Self> {
+        // the process's SIGTERM and SIGINT handling kept as the client is made
+        let _kept = KeptSignals::now();
         let mut a = args!(PJRT_Client_Create_Args {});
         call!(&api, PJRT_Client_Create, &mut a)?;
         let mut client = Self {
