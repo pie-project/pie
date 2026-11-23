@@ -194,6 +194,19 @@ impl Serve for Api {
         boot.chunk_bytes
     }
 
+    /// Beside the pipeline cache, in the engine's cache.
+    fn records_dir(boot: &crate::api::DeviceBoot) -> Option<std::path::PathBuf> {
+        crate::armed::dir(boot)
+    }
+
+    fn armed_build() -> u64 {
+        crate::armed::BUILD
+    }
+
+    fn committed_armed() -> &'static [(&'static str, &'static str)] {
+        crate::armed::COMMITTED
+    }
+
     fn committed_covers() -> &'static [&'static str] {
         crate::chip::COVERS
     }
@@ -388,12 +401,21 @@ impl Serve for Api {
     }
 
     fn plan(shell: &mut Shell<Api>, prepared: &mut Prepared<'_, Api>) -> Result<Plan<Api>> {
-        // The custom-mask buffer grows: a recording would keep the one it outgrew.
-        // A fire landing snapshots binds a table of its own: not recorded.
+        // The kinds no recording holds, which the load states eager
+        // (by name, `engine_gpu::api`): the custom-mask buffer grows (a recording
+        // would keep the one it outgrew); a fire landing snapshots binds a
+        // table of its own; a token table streamed with no ring lays its
+        // misses in a stage of its own; a split step submits a layer at a
+        // time (a recording replays as one submit: a step past the
+        // platform's bound on one submission walks a layer at a time by the
+        // shell's own admission, `engine_gpu::submit`; whole, a 512x512 VAE
+        // decode outlasts one Adreno submission and loses the device).
+        let split = prepared.bindings.voxels.is_some();
         let key = (shell.shelf.recorder.records()
             && prepared.bindings.group_masks.is_empty()
             && prepared.bindings.rs_snaps.is_none()
-            && (prepared.bindings.row_ring.is_some() || shell.row_caches.whole()))
+            && (prepared.bindings.row_ring.is_some() || shell.row_caches.whole())
+            && !split)
         .then(|| record_key(shell, prepared));
 
         // A shape no fill names, of a fixed body the load recorded, fills
@@ -485,18 +507,37 @@ impl Serve for Api {
             });
         }
 
-        // A split step is not recorded: a recording replays as one submit.
-        // A step past the platform's bound on one submission walks a layer
-        // at a time by the shell's own admission (`engine_gpu::submit`);
-        // whole, a 512x512 VAE decode outlasts one Adreno submission and
-        // loses the device, and nothing estimates it.
-        let split = prepared.bindings.voxels.is_some();
-        let keep = key.filter(|_| !split && shell.shelf.recorder.has_room());
-        // A shape whose family varies where its recording does not walks with
-        // those dispatches indirect, to record its family again.
-        shell
-            .device
-            .indirect_next(varying.filter(|_| keep.is_some()));
+        // Only the load's arming walk records: a fire of a kind its bodies
+        // cover fills one from a walk that records nothing, and every other
+        // walks eagerly, as the load stated.
+        let rows: u32 = prepared.seats.iter().map(|seat| seat.rows).sum();
+        let plan = match key {
+            None => {
+                shell.eager_next = true;
+                Plan::Walk { keep: None, split }
+            }
+            Some(shape) if shell.arming => {
+                // A shape whose family varies where its recording does not
+                // walks with those dispatches indirect, to record its family
+                // again.
+                shell.device.indirect_next(varying);
+                Plan::Walk {
+                    keep: Some(shape).filter(|_| shell.shelf.recorder.has_room()),
+                    split: false,
+                }
+            }
+            Some(_) if shell.eager_by_rows(rows) => {
+                shell.eager_next = true;
+                Plan::Walk { keep: None, split }
+            }
+            // Before the load armed its bodies (its settle, its probes) a
+            // fire walks as it is, the load's own.
+            Some(_) if !shell.armed => Plan::Walk { keep: None, split },
+            Some(_) => {
+                shell.device.indirect_next(None);
+                Plan::Fill
+            }
+        };
         // The walk lays in its arm's fire block.
         shell
             .device
@@ -508,10 +549,76 @@ impl Serve for Api {
         let tile = *kernels_slang::linear::gemm::VECTOR_ROWS
             .last()
             .expect("the vector GEMM states its row tiles");
-        let rows: u32 = prepared.seats.iter().map(|seat| seat.rows).sum();
         let decode = prepared.seats.iter().all(|seat| seat.rows == 1);
         shell.device.fixed_next(decode || rows <= tile);
-        Ok(Plan::Walk { keep, split })
+        Ok(plan)
+    }
+
+    fn fill_frame(device: &Context, _arm: usize) -> Result<Frame> {
+        device.frame_dry()
+    }
+
+    /// The fill walk's commands, hashed, name the family the load armed for
+    /// the fire's kind; its block image, group counts and readout copies
+    /// are the fire's fill, kept under its shape for its replays. A walk
+    /// whose commands match no armed family, or whose counts its family's
+    /// recording carries differently, fills none.
+    fn fill(
+        shell: &mut Shell<Api>,
+        frame: Frame,
+        prepared: &mut Prepared<'_, Api>,
+        layout: &[ReadSpan],
+        launches: u32,
+    ) -> Result<bool> {
+        let fill = frame.into_fill();
+        let shape = record_key(shell, prepared);
+        let family = family_key(fill.baked, prepared.arm, (fill.cuts > 0).then_some(shape));
+        let Some(held) = shell.shelf.recorder.family(family) else {
+            tracing::debug!(
+                arm = prepared.arm,
+                rung = prepared.rung,
+                classes = ?prepared.descriptor.classes,
+                baked = fill.baked,
+                "a fill walk's commands are no armed family's"
+            );
+            return Ok(false);
+        };
+        if held.recording.cuts.len() != fill.cuts || !held.recording.serves(&fill.groups) {
+            return Ok(false);
+        }
+        shell.shelf.recorder.insert_fill(
+            shape,
+            crate::record::Fill::new(
+                family,
+                std::sync::Arc::new(fill.groups),
+                std::sync::Arc::new(fill.image),
+                layout.to_vec(),
+                launches,
+            ),
+        );
+        Ok(true)
+    }
+
+    /// A recording binds the pool's segments by place: each is rebound to
+    /// what stands there now. A recording that binds a segment where no
+    /// rebind writes it stands no longer, and is named. A device that cannot
+    /// rebind lays its pool whole, so no segment changes under one.
+    fn rebind(shell: &mut Shell<Api>) -> Result<()> {
+        if !shell.device().rebinds_segments() {
+            shell.shelf.recorder.forget();
+            return Ok(());
+        }
+        let placed = shell.placed_segments();
+        let written = shell.device().rebind_segments(&placed)?;
+        let dropped = shell.shelf.recorder.forget_pinned();
+        if !dropped.is_empty() {
+            tracing::warn!(
+                written,
+                dropped = ?dropped,
+                "recordings that bind a pool segment where no rebind writes it stand no longer"
+            );
+        }
+        Ok(())
     }
 
     fn submit(
@@ -560,15 +667,11 @@ impl Serve for Api {
                 // block and the group counts its recording reads from there
                 // fills that recording; its own frame goes unsubmitted. A walk
                 // whose segments ran with it replays its own last segment.
-                let family = {
-                    let mut key = crate::record::KeyBuilder::new();
-                    key.hashed(&kept.baked());
-                    key.shown(&prepared.arm);
-                    if !cuts.is_empty() {
-                        key.hashed(&shape);
-                    }
-                    key.finish()
-                };
+                let family = family_key(
+                    kept.baked(),
+                    prepared.arm,
+                    (!cuts.is_empty()).then_some(shape),
+                );
                 let groups = std::sync::Arc::new(kept.groups().to_vec());
                 let fixed = kept.fixed() && launch_pixels_empty;
                 enum Act {
@@ -792,6 +895,23 @@ fn fill_body(
         crate::record::Fill::new(family, groups, image, layout, launches),
     );
     Ok(())
+}
+
+/// A family's key: what its walk's commands carry, hashed
+/// ([`crate::device::Frame::bake`]), on its arm; where an expert stage cut
+/// it, its shape too (the host steps between its segments are the shape's).
+fn family_key(
+    baked: u64,
+    arm: usize,
+    cut_shape: Option<crate::record::Key>,
+) -> crate::record::Key {
+    let mut key = crate::record::KeyBuilder::new();
+    key.hashed(&baked);
+    key.shown(&arm);
+    if let Some(shape) = cut_shape {
+        key.hashed(&shape);
+    }
+    key.finish()
 }
 
 fn record_key(shell: &Shell<Api>, p: &Prepared<'_, Api>) -> crate::record::Key {

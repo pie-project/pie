@@ -207,6 +207,19 @@ pub(crate) struct Core {
     /// The largest device-local heap, which device reservations take.
     heap: usize,
     pub(crate) vendor_id: u32,
+    /// The device writes storage-buffer descriptors after a recording binds
+    /// them (descriptorBindingStorageBufferUpdateAfterBind): a recording's
+    /// pool segments are rebound as they are backed and given back.
+    pub(crate) update_after_bind: bool,
+    /// The pool's segment buffers and their stand-ins, by raw handle, each
+    /// to its segment ([`Context::rebind_segments`]): a kept frame notes each
+    /// descriptor that binds one, to write it when the segment changes.
+    pub(crate) segments: Mutex<std::collections::HashMap<u64, u32>>,
+    /// What each segment's descriptors bind now, by raw handle: a rebind
+    /// writes only the segments whose buffer changed.
+    pub(crate) segments_bound: Mutex<Vec<u64>>,
+    /// Every kept frame that binds a pool segment, which a rebind writes.
+    pub(crate) rebound: Mutex<Vec<std::sync::Weak<Inner>>>,
     /// The device's PCI id and its driver's version, as the physical
     /// device states them: with the vendor, what a stored measurement is
     /// keyed by ([`Context::measured_on`]).
@@ -509,10 +522,18 @@ impl Core {
                 .ty(vk::DescriptorType::UNIFORM_BUFFER)
                 .descriptor_count(SETS_PER_POOL),
         ];
+        // A recording's pool segments are written after it binds them: its
+        // sets are allocated from pools that allow it.
+        let flags = if self.update_after_bind {
+            vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND
+        } else {
+            vk::DescriptorPoolCreateFlags::empty()
+        };
         // SAFETY: `device` is live and the create info is complete.
         unsafe {
             self.device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
+                    .flags(flags)
                     .max_sets(SETS_PER_POOL)
                     .pool_sizes(&sizes),
                 None,
@@ -1073,6 +1094,14 @@ impl Context {
                 && f12.vulkan_memory_model == vk::TRUE
                 && (pinned == Some(32) || subgroup.subgroup_size == 32),
         };
+        // A recording's pool segment bindings are written as the segments
+        // are backed and given back, while it stands: update-after-bind
+        // storage buffers. A device without them lays its pool whole
+        // (`Context::resizes_pool`). `PIE_VULKAN_WHOLE_POOL` takes that path
+        // on one that has them, to test it.
+        let update_after_bind = f12.descriptor_binding_storage_buffer_update_after_bind
+            == vk::TRUE
+            && std::env::var_os("PIE_VULKAN_WHOLE_POOL").is_none();
         if !enabled.shader_int16 || !enabled.storage_16bit {
             bail!(Fault::NoDevice {
                 detail: format!(
@@ -1093,7 +1122,8 @@ impl Context {
                 f12.uniform_and_storage_buffer8_bit_access == vk::TRUE,
             )
             .vulkan_memory_model(f12.vulkan_memory_model == vk::TRUE)
-            .vulkan_memory_model_device_scope(f12.vulkan_memory_model_device_scope == vk::TRUE);
+            .vulkan_memory_model_device_scope(f12.vulkan_memory_model_device_scope == vk::TRUE)
+            .descriptor_binding_storage_buffer_update_after_bind(update_after_bind);
         let mut e13 = vk::PhysicalDeviceVulkan13Features::default()
             .subgroup_size_control(enabled.subgroup_size_control)
             .synchronization2(f13.synchronization2 == vk::TRUE);
@@ -1232,6 +1262,10 @@ impl Context {
             ceiling,
             heap,
             vendor_id: props.vendor_id,
+            update_after_bind,
+            segments: Mutex::new(std::collections::HashMap::new()),
+            segments_bound: Mutex::new(Vec::new()),
+            rebound: Mutex::new(Vec::new()),
             device_id: props.device_id,
             driver_version: props.driver_version,
             discrete: props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU,
@@ -1526,6 +1560,114 @@ impl Context {
         self.core.staging(&mut transfer).map(|_| ())
     }
 
+    /// States the pool's segments below the span's: for each, the buffer
+    /// backing it (or `None`) and its stand-in. Each kept frame's descriptor
+    /// of a segment is written to bind the segment's buffer, or its stand-in
+    /// where it is not backed; a segment whose buffer stands as it was is
+    /// not written. Called with every frame that reads them landed (a
+    /// release drains first; a segment just backed is read by no fire yet),
+    /// and before a released segment's buffer goes. The descriptors written.
+    pub fn rebind_segments(&self, segments: &[(Option<&Buffer>, &Buffer)]) -> Result<u64> {
+        use ash::vk::Handle;
+        let bound: Vec<&Buffer> = segments
+            .iter()
+            .map(|(backed, stand_in)| backed.unwrap_or(stand_in))
+            .collect();
+        {
+            let mut held = self.core.segments.lock().expect("segments lock poisoned");
+            held.clear();
+            for (at, (backed, stand_in)) in segments.iter().enumerate() {
+                held.insert(stand_in.slab().buffer.as_raw(), at as u32);
+                if let Some(backed) = backed {
+                    held.insert(backed.slab().buffer.as_raw(), at as u32);
+                }
+            }
+        }
+        let now: Vec<u64> = bound.iter().map(|b| b.slab().buffer.as_raw()).collect();
+        let changed: Vec<bool> = {
+            let mut before = self
+                .core
+                .segments_bound
+                .lock()
+                .expect("segments lock poisoned");
+            let changed = (0..now.len())
+                .map(|at| before.get(at) != Some(&now[at]))
+                .collect();
+            *before = now;
+            changed
+        };
+        if !changed.iter().any(|&c| c) {
+            return Ok(0);
+        }
+        let kept: Vec<Arc<Inner>> = {
+            let mut rebound = self.core.rebound.lock().expect("rebound lock poisoned");
+            rebound.retain(|held| held.strong_count() > 0);
+            rebound.iter().filter_map(std::sync::Weak::upgrade).collect()
+        };
+        let range = u64::from(self.core.limits.max_storage_buffer_range);
+        let mut infos: Vec<vk::DescriptorBufferInfo> = Vec::new();
+        let mut places: Vec<(vk::DescriptorSet, u32)> = Vec::new();
+        for inner in &kept {
+            for &(set, binding, segment, offset, bytes) in
+                inner.rebinds.lock().expect("rebinds lock poisoned").iter()
+            {
+                if !changed.get(segment as usize).copied().unwrap_or(false) {
+                    continue;
+                }
+                let buffer = bound.get(segment as usize).ok_or_else(|| Fault::Unbound {
+                    what: format!("pool segment {segment}, past the {} stated", bound.len()),
+                })?;
+                // A whole binding (`u64::MAX` bytes) binds the buffer whole;
+                // a view past a stand-in's few bytes binds the stand-in whole,
+                // which no fire reads while the segment is not backed.
+                let (offset, view) = if bytes != u64::MAX && offset + bytes <= buffer.bytes() {
+                    (offset, bytes)
+                } else {
+                    (0, buffer.bytes())
+                };
+                infos.push(
+                    vk::DescriptorBufferInfo::default()
+                        .buffer(buffer.slab().buffer)
+                        .offset(offset)
+                        .range(view.min(range)),
+                );
+                places.push((set, binding));
+            }
+        }
+        let writes: Vec<vk::WriteDescriptorSet<'_>> = places
+            .iter()
+            .zip(&infos)
+            .map(|(&(set, binding), info)| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(binding)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(std::slice::from_ref(info))
+            })
+            .collect();
+        if !writes.is_empty() {
+            // SAFETY: every set named is a live kept frame's (its `Inner`
+            // upgraded above), its binding laid update-after-bind (only those
+            // are noted, `Frame::rebinds`), and no submission in flight
+            // reads it (the caller's contract); each buffer is a live slab.
+            unsafe { self.core.device.update_descriptor_sets(&writes, &[]) };
+        }
+        tracing::debug!(
+            segments = ?changed,
+            descriptors = writes.len(),
+            recordings = kept.len(),
+            "the recordings' descriptors of the pool segments that changed are rebound"
+        );
+        Ok(writes.len() as u64)
+    }
+
+    /// Whether a recording's pool segments are rebound as they change
+    /// (update-after-bind storage buffers), else the pool is laid whole.
+    #[must_use]
+    pub fn rebinds_segments(&self) -> bool {
+        self.core.update_after_bind
+    }
+
     /// Serving starts: the spares are stocked to `frames` free pools (the
     /// frames serving holds at once, each one pool: the load's kept frames
     /// hold their own beside them), and from here no frame makes one
@@ -1721,6 +1863,16 @@ impl Context {
         Ok(frame)
     }
 
+    /// A frame a fire walks to fill an armed body ([`Frame::dry`]): what the
+    /// walk lays in the fire block and what its commands would carry,
+    /// hashed, with no command recorded and no descriptor set taken. It is
+    /// dropped unsubmitted ([`Frame::into_fill`]).
+    pub fn frame_dry(&self) -> Result<Frame> {
+        let mut frame = self.frame_with(true)?;
+        frame.dry = true;
+        Ok(frame)
+    }
+
     fn frame_with(&self, one_time: bool) -> Result<Frame> {
         let core = &self.core;
         let d = &core.device;
@@ -1813,8 +1965,11 @@ impl Context {
                 landed: std::sync::atomic::AtomicU64::new(0),
                 waiters: std::sync::atomic::AtomicU32::new(0),
                 most_waiters: std::sync::atomic::AtomicU32::new(0),
+                rebinds: Mutex::new(Vec::new()),
+                pinned: Mutex::new(None),
             }),
             open: true,
+            dry: false,
             kept: !one_time,
             hazards: std::cell::RefCell::new(Hazards::default()),
             retained: std::cell::RefCell::new(std::collections::HashSet::new()),
@@ -1911,6 +2066,16 @@ pub(crate) struct Inner {
     /// Threads blocked on `fence` now, and the most at once.
     waiters: std::sync::atomic::AtomicU32,
     most_waiters: std::sync::atomic::AtomicU32,
+
+    /// A kept frame's descriptors that bind a pool segment: the set, the
+    /// binding, the segment, and the view's offset and bytes in it
+    /// ([`Context::rebind_segments`]).
+    pub(crate) rebinds: Mutex<Vec<(vk::DescriptorSet, u32, u32, u64, u64)>>,
+    /// A kept frame binds a pool segment where no rebind can write it (a
+    /// binding its layout does not lay update-after-bind, or a copy's
+    /// command): it stands only while the segments do, the name of what
+    /// pinned it beside.
+    pub(crate) pinned: Mutex<Option<String>>,
 }
 
 impl Inner {
@@ -2113,6 +2278,10 @@ impl Hazards {
 pub struct Frame {
     pub(crate) inner: Arc<Inner>,
     open: bool,
+    /// A fill walk's frame ([`Context::frame_dry`]): it lays what a fire
+    /// writes in its block and hashes what its commands carry, and records
+    /// no command; it is never submitted.
+    pub(crate) dry: bool,
     /// The fire's rows are constants of its commands ([`Context::fixed_next`]).
     fixed_rows: bool,
     /// Opened by `frame_kept`: a flush cuts a segment rather than reusing
@@ -2144,6 +2313,11 @@ pub struct Frame {
 }
 
 impl Frame {
+    /// Opened to be kept and replayed (a recording).
+    pub(crate) fn kept(&self) -> bool {
+        self.kept
+    }
+
     pub(crate) fn fixed_rows(&self) -> bool {
         self.fixed_rows
     }
@@ -2276,6 +2450,63 @@ impl Frame {
             arm.stage(self.block.borrow().image())?;
         }
         self.head(true)
+    }
+
+    /// The pool segment (below the span's, which stands for good) `buffer`
+    /// is, or stands in for ([`Context::rebind_segments`]).
+    pub(crate) fn segment_of(&self, buffer: vk::Buffer) -> Option<u32> {
+        use ash::vk::Handle;
+        self.inner
+            .core
+            .segments
+            .lock()
+            .expect("segments lock poisoned")
+            .get(&buffer.as_raw())
+            .copied()
+    }
+
+    /// A kept frame whose command names a pool segment directly (`what`)
+    /// stands only while the segments do: no rebind writes a command.
+    fn pin_copied(&self, buffers: &[vk::Buffer], what: &str) {
+        if self.kept && buffers.iter().any(|&buffer| self.segment_of(buffer).is_some()) {
+            self.pin(what.to_string());
+        }
+    }
+
+    /// Notes that the kept frame binds a pool segment where a rebind cannot
+    /// write it, `what` naming where.
+    pub(crate) fn pin(&self, what: String) {
+        self.inner
+            .pinned
+            .lock()
+            .expect("pinned lock poisoned")
+            .get_or_insert(what);
+    }
+
+    /// Notes descriptor `binding` of `set`, a kept frame's, as binding pool
+    /// segment `segment` at `offset` for `bytes` (`u64::MAX`: the buffer
+    /// whole): a rebind writes it.
+    pub(crate) fn rebinds(&self, set: vk::DescriptorSet, binding: u32, segment: u32, offset: u64, bytes: u64) {
+        self.inner
+            .rebinds
+            .lock()
+            .expect("rebinds lock poisoned")
+            .push((set, binding, segment, offset, bytes));
+    }
+
+    /// What a dry walk laid ([`Context::frame_dry`]): the hash of what its
+    /// commands would carry, each dispatch's group counts, each readout
+    /// copy's regions hashed, the block's image, and the cuts it made.
+    #[must_use]
+    pub fn into_fill(self) -> Fill {
+        use std::hash::Hasher;
+        Fill {
+            baked: self.baked.borrow().finish(),
+            groups: std::mem::take(&mut *self.groups.borrow_mut()),
+            copies: std::mem::take(&mut *self.copies.borrow_mut()),
+            image: self.block.borrow().image().sealed(),
+            cuts: self.cuts(),
+        }
     }
 
     /// Folds `what`, a command the frame records, into its hash.
@@ -2429,6 +2660,10 @@ impl Frame {
                 .collect();
             self.bake(&("copy", source.buffer.as_raw(), into.buffer.as_raw(), spans));
         }
+        self.pin_copied(&[source.buffer, into.buffer], "a buffer copy");
+        if self.dry {
+            return Ok(());
+        }
         let d = &self.inner.core.device;
         let cmd = self.inner.cmd();
         // SAFETY: `&mut self` is the only recorder of this open frame's `cmd`.
@@ -2563,6 +2798,10 @@ impl Frame {
         if !indirect {
             return self.copy_regions_baked(source, into, regions, false);
         }
+        self.pin_copied(&[src.buffer, dst.buffer], "a readout copier's binding");
+        if self.dry {
+            return Ok(());
+        }
         let set = self.descriptor_set(self.copier.set_layout)?;
         let infos = [
             vk::DescriptorBufferInfo::default()
@@ -2678,6 +2917,10 @@ impl Frame {
         into.span(at, len)?;
         let into = into.slab();
         self.bake(&("zero", ash::vk::Handle::as_raw(into.buffer), at, len));
+        self.pin_copied(&[into.buffer], "a buffer fill");
+        if self.dry {
+            return Ok(());
+        }
         let d = &self.inner.core.device;
         let cmd = self.inner.cmd();
         // SAFETY: `&mut self` is the only recorder of this open frame's `cmd`;
@@ -2749,7 +2992,7 @@ impl Frame {
     /// them. A kept frame's segment is a cut its replays wait on
     /// ([`Frame::flush`]).
     pub fn submit_segment(&self) -> Result<()> {
-        if self.kept {
+        if self.kept || self.dry {
             return self.flush();
         }
         let core = &self.inner.core;
@@ -2817,6 +3060,15 @@ impl Frame {
 
     pub fn flush(&self) -> Result<()> {
         self.bake(&"flush");
+        if self.dry {
+            // A cut the fill's body was recorded with: counted, nothing run.
+            self.inner
+                .cuts
+                .lock()
+                .expect("cuts lock poisoned")
+                .push(vk::CommandBuffer::null());
+            return Ok(());
+        }
         let core = &self.inner.core;
         let d = &core.device;
         let cmd = self.inner.cmd();
@@ -2999,6 +3251,18 @@ impl Frame {
         self.stamp_end();
         self.end()?;
         let head = self.head(false)?;
+        // A rebind writes the pool segments it binds, as they change.
+        if !self
+            .inner
+            .rebinds
+            .lock()
+            .expect("rebinds lock poisoned")
+            .is_empty()
+        {
+            let mut rebound = self.inner.core.rebound.lock().expect("rebound lock poisoned");
+            rebound.retain(|held| held.strong_count() > 0);
+            rebound.push(Arc::downgrade(&self.inner));
+        }
         Ok(Kept {
             head,
             copy: std::sync::atomic::AtomicBool::new(true),
@@ -3039,6 +3303,16 @@ impl Drop for Frame {
     }
 }
 
+/// What a fill walk laid ([`Frame::into_fill`]).
+#[derive(Debug)]
+pub struct Fill {
+    pub baked: u64,
+    pub groups: Vec<[u32; 3]>,
+    pub copies: Vec<[u32; 3]>,
+    pub image: super::block::Image,
+    pub cuts: usize,
+}
+
 pub struct Kept {
     inner: Arc<Inner>,
 
@@ -3072,6 +3346,13 @@ impl std::fmt::Debug for Kept {
 }
 
 impl Kept {
+    /// What binds a pool segment in it where no rebind writes it, if any: it
+    /// stands only while the segments do.
+    #[must_use]
+    pub fn pinned(&self) -> Option<String> {
+        self.inner.pinned.lock().expect("pinned lock poisoned").clone()
+    }
+
     /// What its commands carry, hashed ([`Frame::bake`]).
     #[must_use]
     pub fn baked(&self) -> u64 {

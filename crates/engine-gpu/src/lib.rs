@@ -6,6 +6,7 @@ pub mod adapter;
 pub mod host_memory;
 pub mod api;
 pub mod arena;
+pub mod armed;
 pub mod backend;
 pub mod beam;
 pub mod blob;

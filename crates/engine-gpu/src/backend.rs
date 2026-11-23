@@ -129,6 +129,14 @@ pub trait Context<B: Backend> {
 
     fn cores(&self) -> u32;
 
+    /// Whether the state pool may commit and release segments while serving
+    /// on this device, where its backend's pool resizes
+    /// ([`Backend::RESIZES_POOL`]): a device that cannot rebind what a
+    /// recording binds of the pool lays it whole, as it states at load.
+    fn resizes_pool(&self) -> bool {
+        true
+    }
+
     /// The workgroups the device holds at once, as the load laid them
     /// (measured, stored, committed or estimated): what a guest step's grid
     /// strides over. `None` before the load has.

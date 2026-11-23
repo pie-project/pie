@@ -456,6 +456,9 @@ pub fn export_bodies(backend: &Backend, cache_dir: &Path, out: &Path) -> Result<
         #[cfg(feature = "engine-cuda")]
         "cuda" => engine_cuda::serve::export_bodies(cache_dir, out)
             .map_err(|e| format!("{}: {e}", out.display())),
+        #[cfg(feature = "vulkan")]
+        "vulkan" => engine_vulkan::armed::export(cache_dir, out)
+            .map_err(|e| format!("{}: {e}", out.display())),
         _ => {
             let _ = (cache_dir, out);
             Ok(Vec::new())

@@ -1016,23 +1016,6 @@ where
                 "every fire shape the load serves walked bind-only: what a dispatch binds is built"
             );
         }
-        let started = std::time::Instant::now();
-        let bodies = shell.record_bodies().map_err(fault)?;
-        if bodies > 0 {
-            tracing::info!(
-                engine = B::KIND,
-                bodies,
-                recorded = shell.recorded_serving(),
-                ms = started.elapsed().as_millis() as u64,
-                "every decode bucket and prefill row class the load serves recorded at load, on every arm, smallest first"
-            );
-        }
-        // What the load itself walked is the load's: serving counts from here.
-        shell.recorded_serving();
-        shell.eager_serving();
-        shell.unkept_serving();
-        shell.bound_serving();
-        <B as crate::serve::Serve>::serving(&mut shell).map_err(fault)?;
         // The fire the shell took, which a binding may have bounded below
         // the one asked.
         let (max_lanes, max_tokens) = (shell.budget().max_lanes, shell.budget().max_tokens);
@@ -1063,8 +1046,42 @@ where
             }
         }
         shell.walk_binds().map_err(fault)?;
+        // The bodies are armed last, once every kernel a fire takes is
+        // settled: a body records the kernels its fires walk.
+        let started = std::time::Instant::now();
+        let records = <B as crate::serve::Serve>::records_dir(&self.boot);
+        let bodies = shell.record_bodies(records.as_deref()).map_err(fault)?;
+        if bodies > 0 {
+            tracing::info!(
+                engine = B::KIND,
+                bodies,
+                recorded = shell.recorded_serving(),
+                ms = started.elapsed().as_millis() as u64,
+                "the load's bodies armed before ready, on every arm, smallest first"
+            );
+        }
+        if B::RECORDS {
+            tracing::info!(
+                engine = B::KIND,
+                "stated eager at load, each fire walked and never recorded: a fire past the \
+                 bodies' allowance (named above where one is), one with a group mask, one \
+                 landing a recurrent snapshot, one whose token table streams with no ring, a \
+                 split step"
+            );
+        } else {
+            tracing::info!(
+                engine = B::KIND,
+                "this backend keeps no recording: every fire is encoded as it is served, \
+                 stated eager at load, and nothing is recorded or armed while serving"
+            );
+        }
+        // What the load itself walked is the load's: serving counts from here.
+        shell.recorded_serving();
+        shell.eager_serving();
         shell.unkept_serving();
         shell.bound_serving();
+        shell.serving = true;
+        <B as crate::serve::Serve>::serving(&mut shell).map_err(fault)?;
 
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, arena_bytes, pool_bytes, input_bytes) = shell.footprint();

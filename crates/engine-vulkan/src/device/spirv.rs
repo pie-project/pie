@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 const MAGIC: u32 = 0x0723_0203;
 
+const OP_NAME: u32 = 5;
 const OP_EXECUTION_MODE: u32 = 16;
 const OP_TYPE_BOOL: u32 = 20;
 const OP_TYPE_INT: u32 = 21;
@@ -46,6 +47,26 @@ pub struct Declared {
     /// The fire block's uniform (`PIE_PARAMS_FIRED`), where the module reads
     /// some of its scalars.
     pub fire: Option<Fire>,
+
+    /// The bindings a pool segment sits at (`PIE_POOL_SEGMENTS`, its
+    /// variables named `pie_seg0`..`pie_seg3`): bit `i` binding `i`. Only
+    /// these are written after a recording binds them (a segment backed or
+    /// given back), so only these are laid update-after-bind.
+    pub segments: u64,
+}
+
+/// Whether a variable of `name` is a pool segment's (`kernels/prim/pool.slang`).
+fn is_segment(name: &str) -> bool {
+    name.strip_prefix("pie_seg")
+        .and_then(|rest| rest.chars().next())
+        .is_some_and(|c| c.is_ascii_digit())
+}
+
+/// The literal string of an `OpName`'s words: UTF-8, nul-terminated.
+fn literal(words: &[u32]) -> String {
+    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
 /// The scalars a module reads from the fire block: the uniform's binding,
@@ -134,6 +155,8 @@ pub fn declared(words: &[u32]) -> Result<Declared, Malformed> {
     let mut offsets: HashMap<u32, Vec<(u32, u32)>> = HashMap::new();
     let mut types: HashMap<u32, (u32, Vec<u32>)> = HashMap::new();
     let mut strides: HashMap<u32, (Option<u32>, Option<u32>)> = HashMap::new();
+    // The ids named as a pool segment's variable.
+    let mut segment_names: Vec<u32> = Vec::new();
 
     let mut i = 5;
     while i < words.len() {
@@ -148,6 +171,9 @@ pub fn declared(words: &[u32]) -> Result<Declared, Malformed> {
         }
         let w = &words[i..end];
         match op {
+            OP_NAME if count >= 3 && is_segment(&literal(&w[2..])) => {
+                segment_names.push(w[1]);
+            }
             OP_EXECUTION_MODE if count >= 6 && w[2] == MODE_LOCAL_SIZE => {
                 local = Some([w[3], w[4], w[5]]);
             }
@@ -218,6 +244,10 @@ pub fn declared(words: &[u32]) -> Result<Declared, Malformed> {
     let mut used = vec![false; bindings as usize];
     let mut writable = vec![false; bindings as usize];
     let mut fire_at: Option<(u32, u32, u32)> = None;
+    let segments = bound
+        .iter()
+        .filter(|&&(variable, binding)| binding < 64 && segment_names.contains(&variable))
+        .fold(0u64, |mask, &(_, binding)| mask | 1 << binding);
     for &(variable, binding) in &bound {
         let var = variables.get(&variable).copied();
         let storage = var.is_none_or(|(pointer, class)| {
@@ -321,6 +351,7 @@ pub fn declared(words: &[u32]) -> Result<Declared, Malformed> {
         writable,
         push_bytes,
         fire,
+        segments,
     })
 }
 

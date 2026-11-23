@@ -183,6 +183,19 @@ impl Context {
         match self.never {}
     }
 
+    pub fn frame_dry(&self) -> Result<Frame> {
+        match self.never {}
+    }
+
+    pub fn rebind_segments(&self, _segments: &[(Option<&Buffer>, &Buffer)]) -> Result<u64> {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn rebinds_segments(&self) -> bool {
+        match self.never {}
+    }
+
     pub fn indirect_next(&self, _at: Option<std::sync::Arc<Vec<bool>>>) {
         match self.never {}
     }
@@ -213,7 +226,22 @@ pub struct Frame {
 #[derive(Clone, Debug)]
 pub enum Stamps {}
 
+/// What a fill walk laid: none, with no device.
+#[derive(Debug)]
+pub struct Fill {
+    pub baked: u64,
+    pub groups: Vec<[u32; 3]>,
+    pub copies: Vec<[u32; 3]>,
+    pub image: Image,
+    pub cuts: usize,
+}
+
 impl Frame {
+    #[must_use]
+    pub fn into_fill(self) -> Fill {
+        match self.never {}
+    }
+
     pub fn flush_settled(&self) -> Result<()> {
         self.flush()
     }
@@ -328,6 +356,11 @@ impl ArmBlock {
 }
 
 impl Kept {
+    #[must_use]
+    pub fn pinned(&self) -> Option<String> {
+        match self.never {}
+    }
+
     #[must_use]
     pub fn cuts(&self) -> usize {
         match self.never {}

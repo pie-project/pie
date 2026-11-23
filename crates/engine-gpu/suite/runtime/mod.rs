@@ -25,4 +25,5 @@ mod swapped_pick;
 mod unplaced;
 mod rs_layout;
 mod buffered_fold;
+mod churn;
 mod lagged;

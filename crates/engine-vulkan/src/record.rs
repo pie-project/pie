@@ -303,6 +303,27 @@ impl Recorder {
         self.bodies.clear();
     }
 
+    /// Drops every family whose recording binds a pool segment where no
+    /// rebind writes it ([`crate::device::Kept::pinned`]), and the fills and
+    /// bodies naming it: the segments it binds changed. What pinned each.
+    pub(crate) fn forget_pinned(&mut self) -> Vec<String> {
+        let pinned: Vec<(Key, String)> = self
+            .families
+            .by_key
+            .iter()
+            .filter_map(|(key, family)| family.recording.kept.pinned().map(|why| (*key, why)))
+            .collect();
+        for (key, _) in &pinned {
+            self.families.by_key.remove(key);
+        }
+        if !pinned.is_empty() {
+            let gone = |family: &Key| pinned.iter().any(|(key, _)| key == family);
+            self.fills.by_key.retain(|_, fill| !gone(&fill.family));
+            self.bodies.retain(|_, body| !gone(&body.family));
+        }
+        pinned.into_iter().map(|(_, why)| why).collect()
+    }
+
     /// Makes `recording` its family's, varying in `varying`.
     pub(crate) fn insert(&mut self, key: Key, recording: Recording, varying: Arc<Vec<bool>>) {
         self.recorded.set(self.recorded.get() + 1);

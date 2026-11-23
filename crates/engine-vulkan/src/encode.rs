@@ -151,7 +151,15 @@ struct Scratch {
     writes: Vec<crate::device::ctx::Span>,
     sets: Vec<ash::vk::WriteDescriptorSet<'static>>,
     baked: Vec<(u64, u64, u64)>,
+    /// Each binding's pool segment, where it binds one (below the span's),
+    /// and whether it binds the buffer whole.
+    segments: Vec<Option<(u32, bool)>>,
 }
+
+/// What stands for a pool segment's buffer in a frame's hash: its place,
+/// never the buffer, which a commit or a release changes under a recording
+/// that is rebound ([`crate::device::Context::rebind_segments`]).
+const SEGMENT_TAG: u64 = 0xffff_ffff_0000_0000;
 
 #[cfg(feature = "vulkan")]
 pub struct Sink<'a> {
@@ -165,6 +173,10 @@ pub struct Sink<'a> {
     comm: Option<&'a crate::comm::Comm>,
 
     outer: engine_gpu::probe::Recording,
+
+    /// The pool's segments below the span's, by raw buffer, as the walk
+    /// found them placed.
+    segments: std::collections::HashMap<u64, u32>,
 }
 
 #[cfg(feature = "vulkan")]
@@ -179,6 +191,12 @@ impl<'a> Sink<'a> {
         let outer = engine_gpu::probe::set_frame(frame);
 
         LAST_FIRE.with(|cell| cell.set(None));
+        let segments = device
+            .core
+            .segments
+            .lock()
+            .expect("segments lock poisoned")
+            .clone();
         Sink {
             device,
             frame,
@@ -187,6 +205,7 @@ impl<'a> Sink<'a> {
             scratch: std::cell::RefCell::new(Scratch::default()),
             comm: None,
             outer,
+            segments,
         }
     }
 
@@ -321,11 +340,13 @@ impl Sink<'_> {
         scratch.push.clear();
         scratch.reads.clear();
         scratch.writes.clear();
-        let (infos, writes_at, extents, push) = (
+        scratch.segments.clear();
+        let (infos, writes_at, extents, push, segments) = (
             &mut scratch.infos,
             &mut scratch.writes_at,
             &mut scratch.extents,
             &mut scratch.push,
+            &mut scratch.segments,
         );
         for arg in args {
             match *arg {
@@ -340,6 +361,7 @@ impl Sink<'_> {
                         );
                         writes_at.push(false);
                         extents.push(0);
+                        segments.push(None);
                         continue;
                     }
                     let binding = self.handles.get(handle).ok_or_else(|| {
@@ -371,7 +393,18 @@ impl Sink<'_> {
                     );
                     writes_at.push(mutable);
                     extents.push(binding.extent());
-                    self.frame.retain(binding.buffer().slab());
+                    let slab = binding.buffer().slab();
+                    let segment = self.segments.get(&ash::vk::Handle::as_raw(slab.buffer)).map(|&at| {
+                        (at, binding.offset() == 0 && binding.extent() == binding.buffer().bytes())
+                    });
+                    segments.push(segment);
+                    // A recording does not hold a pool segment's buffer: its
+                    // release gives the memory back, and the recording is
+                    // rebound to the segment's stand-in first. A walk run
+                    // once holds it until it lands.
+                    if segment.is_none() || !self.frame.kept() {
+                        self.frame.retain(slab);
+                    }
                 }
                 ArgValue::I32(v) => push.extend_from_slice(&v.to_le_bytes()),
                 ArgValue::U32(v) => push.extend_from_slice(&v.to_le_bytes()),
@@ -446,6 +479,7 @@ impl Sink<'_> {
                 );
                 writes_at.resize(at, false);
                 extents.resize(at, 0);
+                segments.resize(at, None);
                 infos.push(
                     vk::DescriptorBufferInfo::default()
                         .buffer(buffer)
@@ -454,6 +488,7 @@ impl Sink<'_> {
                 );
                 writes_at.push(false);
                 extents.push(0);
+                segments.push(None);
                 Some((place, &block.words))
             }
             None => None,
@@ -505,7 +540,13 @@ impl Sink<'_> {
                     .enumerate()
                     .take(declared)
                     .filter(|&(at, _)| pipeline.used[at] && Some(at) != params_at)
-                    .map(|(_, info)| (info.buffer.as_raw(), info.offset, info.range)),
+                    .map(|(at, info)| match scratch.segments.get(at).copied().flatten() {
+                        Some((segment, true)) => (SEGMENT_TAG | u64::from(segment), 0, u64::MAX),
+                        Some((segment, false)) => {
+                            (SEGMENT_TAG | u64::from(segment), info.offset, info.range)
+                        }
+                        None => (info.buffer.as_raw(), info.offset, info.range),
+                    }),
             );
             let mut pushed = push.clone();
             if let Some((_, words)) = fired {
@@ -535,6 +576,11 @@ impl Sink<'_> {
             ));
         }
 
+        // A fill walk records nothing: what it laid and hashed is its fill.
+        if self.frame.dry {
+            self.frame.dispatches.set(self.frame.dispatches.get() + 1);
+            return Ok(());
+        }
         let core = self.frame.core();
         let d = &core.device;
         let cmd = self.frame.cmd();
@@ -542,6 +588,28 @@ impl Sink<'_> {
             .frame
             .descriptor_set(pipeline.set_layout)
             .map_err(|fault| Sink::refuse(fire, fault))?;
+        // A recording's pool segments are rebound as they are backed and
+        // given back: where its layout lays the binding update-after-bind;
+        // elsewhere it stands only while the segments do.
+        if self.frame.kept() {
+            for (at, info) in infos.iter().enumerate().take(declared) {
+                let Some((segment, whole)) = scratch.segments.get(at).copied().flatten() else {
+                    continue;
+                };
+                if !pipeline.used[at] {
+                    continue;
+                }
+                if at < 64 && pipeline.segments & (1 << at) != 0 {
+                    let bytes = if whole { u64::MAX } else { info.range };
+                    self.frame.rebinds(set, at as u32, segment, info.offset, bytes);
+                } else {
+                    self.frame.pin(format!(
+                        "kernel {key} binds pool segment {segment} at binding {at}, which its \
+                         layout does not lay update-after-bind"
+                    ));
+                }
+            }
+        }
         scratch.sets.clear();
         for (at, info) in infos.iter().enumerate().take(declared) {
             if !pipeline.used[at] {

@@ -177,6 +177,26 @@ pub trait Serve: Backend {
     /// The chunk size the pool's recipe aims at in place of the profile's.
     fn chunk_bytes(boot: &Self::DeviceBoot) -> Option<u64>;
 
+    /// Where a load keeps what it armed before ready, for a later load of
+    /// the same build, device and model ([`crate::armed`]): the user's
+    /// profiles. `None` keeps nothing.
+    fn records_dir(_boot: &Self::DeviceBoot) -> Option<std::path::PathBuf> {
+        None
+    }
+
+    /// The hash of the code a walk of this backend records (its own, the
+    /// shared shell's, its kernels'), which keys what a load armed
+    /// ([`crate::armed`]).
+    fn armed_build() -> u64 {
+        0
+    }
+
+    /// The armed records the build carries (`profiles/bodies/<key>`), by
+    /// key: a load that keeps none of its own of that key takes one.
+    fn committed_armed() -> &'static [(&'static str, &'static str)] {
+        &[]
+    }
+
     /// The host covers committed for this backend's devices (each a
     /// `<device>.covers.json`'s text, `engine::Engine::committed_covers`):
     /// none where the backend carries none.
@@ -293,6 +313,32 @@ pub trait Serve: Backend {
     /// Called only where [`Self::BINDS_AT_LOAD`] holds.
     fn bind_frame(device: &Self::Context) -> Result<Self::Frame>;
 
+    /// The frame a fill walk walks into ([`Plan::Fill`]): what the walk lays
+    /// for the device to read (its fire block) and what its commands would
+    /// carry, hashed, with no command recorded; it is never submitted, and
+    /// [`Serve::fill`] takes what it laid. Asked only of a backend whose
+    /// plan answers [`Plan::Fill`].
+    fn fill_frame(_device: &Self::Context, _arm: usize) -> Result<Self::Frame> {
+        Err(Fault::Unbound {
+            what: "a fill walk's frame, on a backend that fills no armed body".to_string(),
+        })
+    }
+
+    /// Takes what the fill walk of `prepared` laid in `frame` (its readout
+    /// `layout` and `launches` beside): where an armed body's commands are
+    /// the walk's, its fill for the fire's shape, which the next
+    /// [`Serve::plan`] replays. Whether one was: a fire whose walk matches
+    /// no armed body is one the load neither armed nor stated eager.
+    fn fill(
+        _shell: &mut Shell<Self>,
+        _frame: Self::Frame,
+        _prepared: &mut Prepared<'_, Self>,
+        _layout: &[ReadSpan],
+        _launches: u32,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
     /// What a dispatch binds the backend has built and kept so far (its bind
     /// groups): read at ready and after, those built since are a fire's
     /// ([`engine::live::Tally::BoundInFire`]). 0 where it keeps none.
@@ -311,8 +357,17 @@ pub trait Serve: Backend {
         guest: GuestRoom,
     ) -> Result<Self::Shelf>;
 
-    /// What a kept step binds moved: the segments, or a layer's stage.
+    /// What a kept step binds moved: a layer's stage.
     fn forget(shelf: &mut Self::Shelf);
+
+    /// The pool's segments were backed or given back: a backend whose kept
+    /// steps bind them by place rebinds each to what stands there now; one
+    /// whose kept steps hold the segments' buffers forgets them. Called with
+    /// every frame landed.
+    fn rebind(shell: &mut Shell<Self>) -> Result<()> {
+        Self::forget(&mut shell.shelf);
+        Ok(())
+    }
 
     /// Arm `arm`'s readout seat grew to `bytes`.
     fn grown(shell: &mut Shell<Self>, arm: usize, bytes: u64) -> Result<()>;
@@ -374,6 +429,13 @@ pub enum Plan<B: Serve> {
     /// The step walks; `keep` keeps it under its key, `split` submits it a
     /// layer at a time.
     Walk { keep: Option<B::Keep>, split: bool },
+
+    /// An armed body serves the step's kind but holds no fill for its shape:
+    /// the step is walked into a fill frame, recording nothing, and
+    /// [`Serve::fill`] fills the body from it ([`Serve::fill_frame`]); then
+    /// it replays. A walk that matches no armed body is a fire the load
+    /// neither armed nor stated eager.
+    Fill,
 }
 
 /// A walked step as [`Serve::submit`] takes it.
@@ -961,6 +1023,18 @@ pub struct Shell<B: Serve> {
     pub arming: bool,
     /// The fires since the last count that ran eager as stated.
     eager: u64,
+    /// The load armed its bodies ([`Shell::record_bodies`]): a fire of an
+    /// armed kind fills a body, never records one.
+    pub armed: bool,
+    /// The load is done and serving: a fire the load neither armed nor
+    /// stated eager is a bug from here ([`Shell::unarmed`]).
+    pub serving: bool,
+    /// The step the backend's plan just walked eagerly is one the load
+    /// stated eager by its kind (no recording can hold it): counted so.
+    pub eager_next: bool,
+    /// Serving fires whose walk matched no armed body, by what they were:
+    /// each named once ([`Plan::Fill`]).
+    unarmed_named: std::collections::BTreeSet<String>,
     /// The tier moves through the host since the last count that found
     /// frames in flight and waited for them ([`Shell::drained_serving`]).
     drained: u64,
@@ -2745,6 +2819,14 @@ impl<B: Serve> Shell<B> {
             host_kv_budget.map_or(0, |bytes| u32::try_from(bytes / chunk).unwrap_or(u32::MAX));
         let rs_at = rows.rs.clone();
         let mut pools = Pools::reserve(&device, rows, layout, paging, host_chunks, act_chunks)?;
+        if B::RESIZES_POOL && !device.resizes_pool() {
+            tracing::warn!(
+                device = device.name(),
+                "this device lays its pool whole: no storage-buffer update-after-bind, so a \
+                 recording cannot be rebound as segments come and go; yield gives nothing back"
+            );
+            pools.lay_whole();
+        }
         // The null chunk's segment and the span's stand from the load on;
         // a pool laid whole stands whole.
         let segments = pools.load_segments();
@@ -2781,6 +2863,10 @@ impl<B: Serve> Shell<B> {
             eager_rows: None,
             arming: false,
             eager: 0,
+            eager_next: false,
+            armed: false,
+            serving: false,
+            unarmed_named: std::collections::BTreeSet::new(),
             drained: 0,
             walked: (0, 0),
             walk_only: false,
@@ -4200,21 +4286,31 @@ impl<B: Serve> Shell<B> {
         if segments <= self.pools.chunk_facts().segments.committed {
             return Ok(());
         }
-        // The frames kept to replay bind the segments as they stood.
+        // The frames kept to replay bind the segments by place: each is
+        // rebound to the segment backed now ([`Serve::rebind`]).
         self.drain()?;
         self.handles.rewind();
-        B::forget(&mut self.shelf);
-        self.pools.commit_segments(&self.device, segments)
+        self.pools.commit_segments(&self.device, segments)?;
+        B::rebind(self)
     }
 
     /// Gives back every segment at and past `segments`, once every frame
-    /// that might read them has landed.
+    /// that might read them has landed: the frames kept to replay are
+    /// rebound to the segments' stand-ins before their buffers go.
     pub fn release_segments(&mut self, segments: u32) -> Result<()> {
         self.drain()?;
         self.handles.rewind();
-        B::forget(&mut self.shelf);
-        self.pools.release_segments(segments);
-        Ok(())
+        let gone = self.pools.release_segments(segments);
+        let rebound = B::rebind(self);
+        drop(gone);
+        rebound
+    }
+
+    /// Each pool segment below the span's: its buffer where it is backed,
+    /// beside its stand-in ([`Serve::rebind`]).
+    #[must_use]
+    pub fn placed_segments(&self) -> Vec<(Option<&B::Buffer>, &B::Buffer)> {
+        self.pools.placed_segments()
     }
 
     /// Copies each evacuated chunk onto its new physical chunk, on the queue
@@ -4428,6 +4524,13 @@ impl<B: Serve> Shell<B> {
     /// served with no recording, which no later fire replays either.
     pub fn unkept_serving(&mut self) -> u64 {
         std::mem::take(&mut self.unkept)
+    }
+
+    /// Whether a fire of `rows` token rows is one the load stated eager: past
+    /// the bodies' allowance, which it armed smallest first.
+    #[must_use]
+    pub fn eager_by_rows(&self, rows: u32) -> bool {
+        self.eager_rows.is_some_and(|eager| rows >= eager)
     }
 
     /// The fires since the last count that ran eager, as the load stated.
@@ -7540,6 +7643,75 @@ impl<B: Serve> Shell<B> {
         self.walk_with(p, keep, split, false, &place, &mut Cursor::new(&place))
     }
 
+    /// A walk of `p` into a fill frame ([`Serve::fill_frame`]): what it lays
+    /// and what its commands would carry, nothing recorded.
+    fn walk_fill(&self, p: &Prepared<'_, B>) -> Result<Walked<B>> {
+        let place = At::new();
+        let frame = B::fill_frame(&self.device, p.arm)?;
+        self.walk_into(frame, p, false, false, &place, &mut Cursor::new(&place))
+    }
+
+    /// Fills an armed body for `prepared`'s shape from a walk that records
+    /// nothing ([`Plan::Fill`]): the walk, the fire's readout copies and its
+    /// pixels laid in a fill frame, and the backend's fill from what they
+    /// laid. Whether an armed body took it.
+    fn fill_once(&mut self, prepared: &mut Prepared<'_, B>) -> Result<bool> {
+        let walked = self.walk_fill(prepared);
+        let walked = match walked {
+            Ok(walked) => walked,
+            Err(fault) => {
+                self.handles.rewind();
+                return Err(fault);
+            }
+        };
+        let mut frame = walked.frame.expect("the walk opened a frame");
+        let laid = self.readout_copies(prepared).and_then(|(layout, regions)| {
+            for (from, list, most) in &regions {
+                frame.copy_rows(from, &self.readout[prepared.arm], list, *most)?;
+            }
+            self.copy_pixels(&mut frame, prepared)?;
+            Ok(layout)
+        });
+        self.handles.rewind();
+        let layout = laid?;
+        B::fill(self, frame, prepared, &layout, walked.launches)
+    }
+
+    /// A serving fire whose walk matched no armed body and which the load
+    /// did not state eager (`why`): a bug under the capture rule. Named
+    /// once a kind; refused by name in a debug build; walked eagerly, never
+    /// recorded, in a release one, and counted ([`engine::live::Tally::Unrecorded`]).
+    fn unarmed(&mut self, prepared: &Prepared<'_, B>, why: &str) -> Result<Plan<B>> {
+        let rows: Vec<u32> = prepared.seats.iter().map(|seat| seat.rows).collect();
+        let what = format!(
+            "a serving fire of {} lane(s), rows {:?}, classes {:?}, rung {}, on arm {}: {why}",
+            rows.len(),
+            rows,
+            prepared.descriptor.classes,
+            prepared.rung,
+            prepared.arm,
+        );
+        if cfg!(debug_assertions) && self.serving {
+            return Err(Fault::Unbound {
+                what: format!(
+                    "{what}; the load armed no body for it and stated it no eager fire (the \
+                     capture rule: no recording while serving)"
+                ),
+            });
+        }
+        let kind = format!("{:?} {}", prepared.descriptor.classes, prepared.rung);
+        if self.unarmed_named.insert(kind) {
+            tracing::warn!(
+                "{what}: the load armed no body for it and stated it no eager fire; walked \
+                 eagerly, never recorded"
+            );
+        }
+        Ok(Plan::Walk {
+            keep: None,
+            split: false,
+        })
+    }
+
     /// [`Shell::walk_once`] with the walk's sink the caller's: `cursor` moves
     /// `place`, which the walk's dispatches read.
     fn walk_with<S: poem_exec::fire::Sink>(
@@ -7551,11 +7723,25 @@ impl<B: Serve> Shell<B> {
         place: &At,
         cursor: &mut S,
     ) -> Result<Walked<B>> {
-        let mut frame = Some(if bind_only {
+        let frame = if bind_only {
             B::bind_frame(&self.device)?
         } else {
             B::walk_frame(&self.device, keep, self.stamps.get(p.arm))?
-        });
+        };
+        self.walk_into(frame, p, split, bind_only, place, cursor)
+    }
+
+    /// [`Shell::walk_with`] into `frame`, opened by the caller.
+    fn walk_into<S: poem_exec::fire::Sink>(
+        &self,
+        frame: B::Frame,
+        p: &Prepared<'_, B>,
+        split: bool,
+        bind_only: bool,
+        place: &At,
+        cursor: &mut S,
+    ) -> Result<Walked<B>> {
+        let mut frame = Some(frame);
         self.land_merges(frame.as_mut().expect("just opened"), p)?;
         if !B::RECORDS
             && !bind_only
@@ -8149,6 +8335,21 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
         } else {
             B::plan(self, &mut prepared)?
         };
+        // An armed body with no fill for the step's shape fills from a walk
+        // that records nothing, then replays.
+        let plan = match plan {
+            Plan::Fill => {
+                if self.fill_once(&mut prepared)? {
+                    match B::plan(self, &mut prepared)? {
+                        Plan::Fill => self.unarmed(&prepared, "its fill replays no body")?,
+                        plan => plan,
+                    }
+                } else {
+                    self.unarmed(&prepared, "its walk matches no armed body")?
+                }
+            }
+            plan => plan,
+        };
         // How each step went to the device, where a bound is stated: the
         // recording it replayed, or the walk it took (kept to replay, eager,
         // or split in runs of `layers_a_piece` layers).
@@ -8161,6 +8362,7 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
                     Plan::Walk { split: true, .. } => "walked split",
                     Plan::Walk { keep: Some(_), .. } => "walked, kept to replay",
                     Plan::Walk { keep: None, .. } => "walked eagerly",
+                    Plan::Fill => "filled",
                 },
                 layers_a_piece = self.split_layers,
                 "submit bound: a step goes to the device"
@@ -8188,11 +8390,15 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
                 });
             }
             Plan::Walk { keep, split } => (keep, split),
+            Plan::Fill => unreachable!("a fill was walked or answered a walk above"),
         };
-        // A fire the load stated eager walks unrecorded, and is counted so.
-        let stated_eager = self.eager_rows.is_some_and(|eager| {
-            prepared.seats.iter().map(|seat| seat.rows).sum::<u32>() >= eager
-        });
+        // A fire the load stated eager walks unrecorded, and is counted so:
+        // by its rows (past the bodies' allowance), or by its kind (one no
+        // recording can hold, as its backend's plan said).
+        let stated_eager = std::mem::take(&mut self.eager_next)
+            || self.eager_rows.is_some_and(|eager| {
+                prepared.seats.iter().map(|seat| seat.rows).sum::<u32>() >= eager
+            });
         let keep = keep.filter(|_| !stated_eager);
         self.recorded += u64::from(keep.is_some());
         self.eager += u64::from(stated_eager);
@@ -9106,10 +9312,20 @@ impl<B: Serve> Shell<B> {
     /// every arm. Their lanes pad (they read the pool's walk
     /// refs and write nothing), so a fire runs as a serving one of its shape
     /// does and is recorded. The bodies recorded.
-    pub fn record_bodies(&mut self) -> Result<u64> {
+    ///
+    /// `records`, where given, is the directory a load keeps what it armed
+    /// in ([`crate::armed`]): the shapes whose walks recorded a family, and
+    /// the rows its allowance stated eager from. A later load of the same
+    /// build, device, model and lattice records only those shapes, measures
+    /// no allowance, and states the same rows eager; every other shape of
+    /// the lattice fills a body those recorded, at its first fire.
+    pub fn record_bodies(&mut self, records: Option<&std::path::Path>) -> Result<u64> {
         if !B::RECORDS {
             return Ok(0);
         }
+        // A body binds the pool's segments by place: their places stated
+        // before the first is recorded.
+        B::rebind(self)?;
         let facts = &self.trace.facts;
         let table = &self.compiled.classes;
         let mut decoding = vec![false; table.classes.len()];
@@ -9238,6 +9454,37 @@ impl<B: Serve> Shell<B> {
         let page = self.pools.paging().page_size.max(1);
         let depth = self.arms.depth();
         let mut recorded = 0u64;
+        // What a load of this build, device, model and lattice armed before.
+        let build = B::armed_build();
+        let record = records.map(|dir| {
+            crate::armed::path(
+                dir,
+                &format!(
+                    "{} {} {:?} {:?} {:?} {depth}",
+                    crate::backend::Context::name(&self.device),
+                    self.trace.name,
+                    shapes,
+                    self.span.rungs().iter().map(|rung| rung.tokens).collect::<Vec<_>>(),
+                    self.dense,
+                ),
+                build,
+            )
+        });
+        let known = record
+            .as_deref()
+            .and_then(|path| crate::armed::read(path, build, B::committed_armed()));
+        if let (Some(known), Some(path)) = (&known, &record) {
+            tracing::info!(
+                path = %path.display(),
+                shapes = known.shapes.len(),
+                of = shapes.len(),
+                eager_from_rows = ?known.eager_rows,
+                "the load arms the bodies a load of this build, device, model and lattice \
+                 recorded, and measures no allowance"
+            );
+        }
+        // The shapes whose walks recorded a family, for the record.
+        let mut armed_shapes: Vec<usize> = Vec::new();
         // Bodies are recorded, not run: a recording's commands need no
         // execution, and the widest prefills would take the load seconds.
         self.arming = true;
@@ -9277,9 +9524,17 @@ impl<B: Serve> Shell<B> {
         };
         let before = rss();
         let mut dearest = 0u64;
+        if let Some(known) = &known {
+            self.eager_rows = known.eager_rows;
+        }
         for (at, (lanes, fed, carried)) in shapes.iter().enumerate() {
+            // A known lattice arms the shapes that recorded a family, and
+            // states eager what its allowance did.
+            if known.as_ref().is_some_and(|known| !known.shapes.contains(&at)) {
+                continue;
+            }
             let used = rss().saturating_sub(before);
-            if used.saturating_add(dearest.saturating_mul(depth as u64)) > allowance {
+            if known.is_none() && used.saturating_add(dearest.saturating_mul(depth as u64)) > allowance {
                 let from = lanes.iter().map(|&(_, rows)| rows).sum::<u32>();
                 let eager: Vec<String> = shapes[at..]
                     .iter()
@@ -9302,6 +9557,7 @@ impl<B: Serve> Shell<B> {
                 self.eager_rows = Some(from);
                 break;
             }
+            let families = self.recorded;
             for arm in 0..depth {
                 let ahead = rss();
                 let owned = lanes
@@ -9339,8 +9595,33 @@ impl<B: Serve> Shell<B> {
                 dearest = dearest.max(rss().saturating_sub(ahead));
                 recorded += 1;
             }
+            if self.recorded > families {
+                armed_shapes.push(at);
+            }
         }
         self.arming = false;
+        self.armed = true;
+        if known.is_none()
+            && let Some(path) = &record
+        {
+            let written = crate::armed::write(
+                path,
+                &crate::armed::Armed {
+                    shapes: armed_shapes.clone(),
+                    eager_rows: self.eager_rows,
+                },
+                build,
+            );
+            match written {
+                Ok(()) => tracing::info!(
+                    path = %path.display(),
+                    shapes = armed_shapes.len(),
+                    of = shapes.len(),
+                    "the shapes that recorded a family kept for a later load"
+                ),
+                Err(why) => tracing::warn!(%why, "what the load armed was not kept"),
+            }
+        }
         tracing::info!(
             allowance,
             bodies = recorded,
