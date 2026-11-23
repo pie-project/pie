@@ -92,6 +92,20 @@ pub(crate) fn kv_working_set_ids(
     })
 }
 
+/// [`kv_working_set_ids`] by id: for a walk whose order decides what moves
+/// (a sweep or spill that takes sets in turn until it has what it wants).
+/// Read off the hash set, the order changed run to run and a different
+/// beam's pages went each time (the simulation's Metal seed 103).
+pub(crate) fn kv_working_set_ids_in_order(
+    pid: uuid::Uuid,
+    model: usize,
+    engine: usize,
+) -> Vec<WorkingSetId> {
+    let mut sets: Vec<WorkingSetId> = kv_working_set_ids(pid, model, engine).into_iter().collect();
+    sets.sort_unstable();
+    sets
+}
+
 pub(crate) fn rs_working_set_ids(
     pid: uuid::Uuid,
     model: usize,

@@ -1770,7 +1770,7 @@ impl PoolPort for RegistryPool {
         let kv_sets: Vec<(crate::store::kv::page_table::WorkingSetId, u64)> = pids
             .iter()
             .flat_map(|&pid| {
-                crate::inferlet::process::residency::kv_working_set_ids(pid, self.model, self.engine)
+                crate::inferlet::process::residency::kv_working_set_ids_in_order(pid, self.model, self.engine)
             })
             .map(|ws| (ws, 0))
             .collect();
@@ -1848,7 +1848,7 @@ impl PoolPort for RegistryPool {
             let sets: Vec<crate::store::kv::page_table::WorkingSetId> = order
                 .iter()
                 .flat_map(|&pid| {
-                    crate::inferlet::process::residency::kv_working_set_ids(
+                    crate::inferlet::process::residency::kv_working_set_ids_in_order(
                         pid,
                         self.model,
                         self.engine,

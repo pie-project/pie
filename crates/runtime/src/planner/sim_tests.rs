@@ -1882,7 +1882,7 @@ struct Log {
     /// Bumped on every act of a task: the run is settled once it stops.
     acts: u64,
     /// Where each running process is, for a liveness failure.
-    stages: std::collections::HashMap<ProcessId, &'static str>,
+    stages: BTreeMap<ProcessId, &'static str>,
     fires: u64,
     forks: u64,
     shared_pages: u64,
@@ -4026,6 +4026,17 @@ fn unreproduced(seeds: std::ops::Range<u64>) -> Vec<u64> {
 fn a_simulated_seed_reproduces_exactly() {
     let differ = unreproduced(0..24);
     assert!(differ.is_empty(), "seeds that ran differently: {differ:?}");
+}
+
+/// The Metal mix's seed 103 runs the same twice: a sweep and a parked
+/// move down that take a process's sets in turn until they have what they
+/// want walked them in a hash set's order, which differs between runs, and
+/// moved another beam's pages each time.
+#[test]
+fn a_metal_seed_whose_sweeps_take_sets_in_turn_reproduces_exactly() {
+    let workload = Workload::metal(103);
+    let (first, second) = (fingerprint(&workload), fingerprint(&workload));
+    assert_eq!(first, second, "Metal seed 103 ran differently");
 }
 
 /// [`a_simulated_seed_reproduces_exactly`] over `PIE_SIM_SEEDS` seeds (500).

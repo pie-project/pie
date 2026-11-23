@@ -1605,7 +1605,7 @@ impl ResidencyPlanner {
             .into_iter()
             .flat_map(|(_, pid)| {
                 let head = holder_head(pid);
-                crate::inferlet::process::residency::kv_working_set_ids(pid, model, engine)
+                crate::inferlet::process::residency::kv_working_set_ids_in_order(pid, model, engine)
                     .into_iter()
                     .map(move |ws| (ws, head))
             })
