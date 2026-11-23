@@ -96,6 +96,8 @@ pub(crate) fn kv_working_set_ids(
 /// (a sweep or spill that takes sets in turn until it has what it wants).
 /// Read off the hash set, the order changed run to run and a different
 /// beam's pages went each time (the simulation's Metal seed 103).
+/// By id is deterministic but arbitrary: with the policy out (landing 5)
+/// these walks take PLEX's retention order (priority, LRU tie) instead.
 pub(crate) fn kv_working_set_ids_in_order(
     pid: uuid::Uuid,
     model: usize,
