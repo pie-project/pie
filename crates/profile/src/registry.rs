@@ -1197,6 +1197,33 @@ impl<'a> Walk<'a> {
                     rates.product_ns = self.product_times(v);
                     continue;
                 }
+                crate::fire::LANDING => {
+                    let values: Option<Vec<f64>> = match v.get_ref() {
+                        DeValue::Array(items) => items
+                            .iter()
+                            .map(|item| match item.get_ref() {
+                                DeValue::Float(f) => f.to_string().parse::<f64>().ok(),
+                                DeValue::Integer(i) => i.to_string().parse::<f64>().ok(),
+                                _ => None,
+                            })
+                            .collect(),
+                        _ => None,
+                    };
+                    match values
+                        .filter(|values| values.iter().all(|v| v.is_finite() && *v > 0.0))
+                        .and_then(|values| <[f64; 7]>::try_from(values).ok())
+                    {
+                        Some(values) => rates.landing = Some(crate::fire::Landing::of(values)),
+                        None => self.err(
+                            v.span().start,
+                            "`rates.landing` is a list of seven positive numbers: [copy_latency_ns, \
+                             copy_gbps, copy_full_bytes, fill_gbps, read_spawn_ns, read_thread_gbps, \
+                             read_whole_gbps]"
+                                .to_string(),
+                        ),
+                    }
+                    continue;
+                }
                 crate::fire::KERNEL_CURVES => {
                     rates.kernel_tflops_by_shape = self.kernel_curves(v);
                     continue;

@@ -1460,6 +1460,7 @@ mod tests {
 
     fn all() -> profile::fire::Rates {
         profile::fire::Rates {
+            landing: None,
             launch_ns: Some(900),
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 100.0), (8192, 200.0)])]),
             attn_tflops_by_keys: Some(vec![(512, 50.0), (8192, 150.0)]),
@@ -2838,6 +2839,7 @@ mod tests {
     #[test]
     fn the_writer_writes_what_the_profile_reads() {
         let rates = profile::fire::Rates {
+            landing: None,
             launch_ns: Some(3500),
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 90.0), (8192, 181.5)])]),
             attn_tflops_by_keys: Some(vec![(512, 60.0), (8192, 120.0)]),

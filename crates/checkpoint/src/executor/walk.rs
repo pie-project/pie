@@ -66,6 +66,7 @@ pub(super) fn run(
     sink: &mut dyn TensorSink,
     progress: &mut dyn FnMut(Progress<'_>),
     consume: Option<&SourceLedger>,
+    reads: Option<&mut super::ReadRates>,
 ) -> Result<(), Error> {
     if plan.target.tile_map_mask & !CONVERT_TILE_MAP_MASK != 0 {
         return Err(invalid(
@@ -126,10 +127,13 @@ pub(super) fn run(
         read_bytes: 0,
         arena_runs_kernels,
         consume,
-        split: Split::default(),
+        split: Split::of(reads.as_deref().copied().unwrap_or_default()),
     };
     executor.execute()?;
     executor.arena.finish()?;
+    if let Some(reads) = reads {
+        *reads = executor.split.rates();
+    }
     Ok(())
 }
 
@@ -180,19 +184,41 @@ fn last_uses(plan: &LoadPlan) -> Result<HashMap<BufferId, usize>, Error> {
     Ok(last)
 }
 
-/// How a read is split across threads, learned from the walk's own reads.
-/// `k` threads take about `k * spawn + len / (k * rate)`: each costs a
-/// spawn on the reading thread, and the bytes divide among them. That is
-/// least at `k = sqrt(len / (rate * spawn))`, rounded, at most the
-/// machine's threads. `spawn` is timed once; `rate` is the fastest a
-/// thread has read so far (a first read is one thread's, to learn it).
+/// How a read is split across threads, learned from the walk's own reads
+/// (or an earlier walk's, [`super::ReadRates`]). `k` threads take about
+/// `k * spawn + len / (k * rate)`: each costs a spawn on the reading
+/// thread, and the bytes divide among them. That is least at `k =
+/// sqrt(len / (rate * spawn))`, rounded. The threads share one memory: past
+/// `whole / rate` of them (the most they have read at together over one
+/// thread's rate) another adds nothing, so a split takes one past that, to
+/// see whether more read faster still; at most the machine's threads.
+/// `spawn` is timed once; `rate` is the fastest one thread has read (a
+/// first read is one thread's, to learn it), `whole` the fastest a split
+/// read has.
 #[derive(Default)]
 struct Split {
     spawn: std::cell::Cell<Option<f64>>,
     rate: std::cell::Cell<f64>,
+    whole: std::cell::Cell<f64>,
 }
 
 impl Split {
+    fn of(rates: super::ReadRates) -> Split {
+        Split {
+            spawn: std::cell::Cell::new((rates.spawn_s > 0.0).then_some(rates.spawn_s)),
+            rate: std::cell::Cell::new(rates.thread_bytes_per_s),
+            whole: std::cell::Cell::new(rates.whole_bytes_per_s),
+        }
+    }
+
+    fn rates(&self) -> super::ReadRates {
+        super::ReadRates {
+            spawn_s: self.spawn.get().unwrap_or(0.0),
+            thread_bytes_per_s: self.rate.get(),
+            whole_bytes_per_s: self.whole.get(),
+        }
+    }
+
     fn workers(&self, len: usize) -> usize {
         let rate = self.rate.get();
         if rate <= 0.0 {
@@ -200,16 +226,27 @@ impl Split {
         }
         let threads = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
         let spawn = self.spawn();
-        let best = (len as f64 / (rate * spawn)).sqrt().round();
-        (best as usize).clamp(1, threads)
+        let best = (len as f64 / (rate * spawn)).sqrt().round() as usize;
+        let whole = self.whole.get();
+        let shared = if whole > 0.0 {
+            (whole / rate).ceil() as usize + 1
+        } else {
+            threads
+        };
+        best.min(shared).clamp(1, threads)
     }
 
     /// A read of `len` bytes by `workers` threads took `took`.
     fn observe(&self, len: usize, workers: usize, took: std::time::Duration) {
         let seconds = took.as_secs_f64();
-        if seconds > 0.0 && len > 0 {
-            let per_thread = len as f64 / workers.max(1) as f64 / seconds;
-            self.rate.set(self.rate.get().max(per_thread));
+        if seconds <= 0.0 || len == 0 {
+            return;
+        }
+        let rate = len as f64 / seconds;
+        if workers <= 1 {
+            self.rate.set(self.rate.get().max(rate));
+        } else {
+            self.whole.set(self.whole.get().max(rate));
         }
     }
 

@@ -44,13 +44,17 @@ pub struct Ring {
 }
 
 impl Ring {
-    /// A ring for tensors of at most `largest` bytes, sized by the rates it
-    /// measures as it opens.
-    pub fn open(largest: usize) -> Result<Ring> {
+    /// A ring for tensors of at most `largest` bytes, sized by `known` (the
+    /// rates an earlier load measured on this device, its profile's) or, with
+    /// none, by the rates it measures as it opens.
+    pub fn open(largest: usize, known: Option<Rates>) -> Result<Ring> {
         let stream = crate::staged_h2d::new_stream()?;
         let opened = (|| {
             let page = page_bytes();
-            let rates = measure(stream, largest.max(page))?;
+            let rates = match known {
+                Some(rates) => rates,
+                None => measure(stream, largest.max(page))?,
+            };
             let overlap = 1.0 / rates.fill - 1.0 / rates.copy;
             let covered = if overlap > 0.0 {
                 (rates.latency / overlap) as usize

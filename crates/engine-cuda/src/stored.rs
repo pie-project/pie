@@ -23,6 +23,10 @@ pub const RATES_METHOD: u32 = 1;
 /// (`Shell::routes_by_body`): `[rates] product_ns`.
 pub const PRODUCT_METHOD: u32 = 1;
 
+/// The version of the method a load measures how it lands its weights by
+/// (`landing_ring::measure`, the checkpoint walk's split): `[rates] landing`.
+pub const LANDING_METHOD: u32 = 1;
+
 /// The `[rates]` key of the decode products' times.
 pub const PRODUCT_NS: &str = "product_ns";
 
@@ -95,6 +99,8 @@ fn method(what: &str) -> Option<u32> {
         Some(RATES_METHOD)
     } else if what == PRODUCT_NS {
         Some(PRODUCT_METHOD)
+    } else if what == profile::fire::LANDING {
+        Some(LANDING_METHOD)
     } else {
         None
     }
@@ -124,7 +130,7 @@ mod backend {
     pub(super) fn fired(what: &str) -> &'static [&'static str] {
         match what {
             "gemm_tflops_by_rows" => &[BLASLT],
-            "hbm_gbps" => &[],
+            "hbm_gbps" | profile::fire::LANDING => &[],
             super::PRODUCT_NS => &[LIBRARY_KERNELS, BLASLT],
             _ => &[LIBRARY_KERNELS],
         }
@@ -156,7 +162,7 @@ mod backend {
     pub(super) fn fired(what: &str) -> &'static [&'static str] {
         match what {
             "gemm_tflops_by_rows" => &[BLASLT],
-            "hbm_gbps" => &[],
+            "hbm_gbps" | profile::fire::LANDING => &[],
             super::PRODUCT_NS => &[LIBRARY_KERNELS, BLASLT],
             _ => &[LIBRARY_KERNELS],
         }

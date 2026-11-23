@@ -39,6 +39,9 @@ pub struct Weights {
     experts: Option<crate::experts::Tier>,
     from_cache: bool,
     decoded: Vec<Buffer>,
+    /// How this load landed its weights, where it measured it: for the
+    /// device's profile, so a later load measures nothing.
+    landing: Option<profile::fire::Landing>,
 }
 
 pub(crate) fn decodes_at_load(param: &poem_ir::Param) -> bool {
@@ -523,6 +526,7 @@ impl Weights {
         target: StorageTarget,
         decode_dense: bool,
         held: bool,
+        known: Option<profile::fire::Landing>,
     ) -> Result<Weights> {
         let (metadata, snapshot) = if path.is_dir() {
             (parse_metadata(path)?, path)
@@ -608,6 +612,7 @@ impl Weights {
             false
         };
 
+        let mut measured_landing = None;
         let landed = if from_cache {
             vec![true; places.len()]
         } else {
@@ -624,17 +629,26 @@ impl Weights {
             let opening = std::time::Instant::now();
             let ring = match largest {
                 0 => None,
-                _ => match crate::landing_ring::Ring::open(largest) {
+                _ => match crate::landing_ring::Ring::open(
+                    largest,
+                    known.map(|known| crate::landing_ring::Rates {
+                        latency: known.copy_latency_ns / 1e9,
+                        copy: known.copy_gbps * 1e9,
+                        saturated: known.copy_full_bytes as usize,
+                        fill: known.fill_gbps * 1e9,
+                    }),
+                ) {
                     Ok(ring) => {
                         eprintln!(
                             "engine-cuda: the weights cross by a pinned ring of 2 x {} KiB: the \
                              link moves {:.1} GB/s from {} KiB copies past a {:.1} us latency; \
-                             a slot fills at {:.1} GB/s (measured in {} ms)",
+                             a slot fills at {:.1} GB/s ({} in {} ms)",
                             ring.slot_bytes() >> 10,
                             ring.rates.copy / 1e9,
                             ring.rates.saturated >> 10,
                             ring.rates.latency * 1e6,
                             ring.rates.fill / 1e9,
+                            if known.is_some() { "from the device's profile" } else { "measured" },
                             opening.elapsed().as_millis(),
                         );
                         Some(ring)
@@ -664,8 +678,16 @@ impl Weights {
             // the whole model.
             let streaming = compile_streaming(&metadata, contract, target)?;
             let landing_started = std::time::Instant::now();
+            let mut reads = known.map_or_else(checkpoint::executor::ReadRates::default, |known| {
+                checkpoint::executor::ReadRates {
+                    spawn_s: known.read_spawn_ns / 1e9,
+                    thread_bytes_per_s: known.read_thread_gbps * 1e9,
+                    whole_bytes_per_s: known.read_whole_gbps * 1e9,
+                }
+            });
             Execution::new(&streaming, snapshot)
                 .streaming()
+                .read_rates(&mut reads)
                 .sink(&mut sink)
                 .run()?;
             if let Some(ring) = &sink.ring {
@@ -675,6 +697,23 @@ impl Weights {
                 "engine-cuda: the weights landed in {} ms",
                 landing_started.elapsed().as_millis()
             );
+            // What this machine's landing measured, where it measured it
+            // (every rate stated, none from the profile).
+            let all = [reads.spawn_s, reads.thread_bytes_per_s, reads.whole_bytes_per_s];
+            measured_landing = match (&sink.ring, known) {
+                (Some(ring), None) if all.iter().all(|v| *v > 0.0) => {
+                    Some(profile::fire::Landing {
+                        copy_latency_ns: ring.rates.latency * 1e9,
+                        copy_gbps: ring.rates.copy / 1e9,
+                        copy_full_bytes: ring.rates.saturated as f64,
+                        fill_gbps: ring.rates.fill / 1e9,
+                        read_spawn_ns: reads.spawn_s * 1e9,
+                        read_thread_gbps: reads.thread_bytes_per_s / 1e9,
+                        read_whole_gbps: reads.whole_bytes_per_s / 1e9,
+                    })
+                }
+                _ => None,
+            };
             sink.landed
         };
 
@@ -792,6 +831,7 @@ impl Weights {
             experts,
             from_cache,
             decoded,
+            landing: measured_landing,
         })
     }
 
@@ -1376,6 +1416,11 @@ impl Weights {
     #[must_use]
     pub fn all_resident(&self) -> bool {
         self.experts.is_none()
+    }
+
+    #[must_use]
+    pub fn landing(&self) -> Option<profile::fire::Landing> {
+        self.landing
     }
 
     #[must_use]

@@ -945,6 +945,7 @@ fn a_device_file_states_its_rates_and_a_layer_above_replaces_them() {
     assert_eq!(
         p.rates(),
         profile::fire::Rates {
+            landing: None,
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 20.0), (4096, 50.0)])]),
             attn_tflops_by_keys: Some(vec![(2048, 20.0)]),
             scan_gelems: Some(3000.0),
@@ -1216,4 +1217,27 @@ fn product_times_read_back_and_accumulate() {
     );
     let twice = "api = 1\n[rates]\nproduct_ns = [[3, 6144, 1024, 4, 0, 1.0, 0.0], [3, 6144, 1024, 4, 0, 2.0, 0.0]]\n";
     assert!(refusal(twice).contains("each shape once"));
+}
+
+/// How a machine lands weights (`[rates] landing`) is written and read
+/// back as stored, and a list of the wrong length, or a value not past
+/// nothing, is refused by name.
+#[test]
+fn a_landing_reads_back_as_written() {
+    let r = registry();
+    let landing = profile::fire::Landing::of([7411.0, 24.25, 2097152.0, 56.25, 217133.0, 1.81, 53.5]);
+    let rates = profile::fire::Rates {
+        landing: Some(landing),
+        ..profile::fire::Rates::default()
+    };
+    let text = format!("api = 1\n{}", rates.toml());
+    let file = r.parse(&text, "landing.toml", Strict::User).unwrap();
+    assert_eq!(file.tuned.rates.landing, Some(landing), "{text}");
+    for bad in ["landing = [1.0, 2.0]\n", "landing = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.0]\n"] {
+        let why = r
+            .parse(&format!("api = 1\n[rates]\n{bad}"), "bad.toml", Strict::User)
+            .expect_err("refused")
+            .to_string();
+        assert!(why.contains("rates.landing"), "{why}");
+    }
 }

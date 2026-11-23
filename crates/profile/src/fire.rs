@@ -152,6 +152,10 @@ pub struct Rates {
     /// without walking a fire. A new model's settle joins the others, never
     /// replaces them. Measured; empty where none is stored.
     pub dense_settled: Vec<DenseSettled>,
+    /// How this machine lands a checkpoint's weights on the device
+    /// ([`LANDING`], [`Landing`]): its link's and its reader's rates, as a
+    /// load first measures them. Measured; not one of [`KEYS`].
+    pub landing: Option<Landing>,
     /// The device a user's file's measurements were taken on
     /// ([`MEASURED_ON`]): its vendor, device id and driver, as the backend
     /// states them ([`Now::on`]). A file measured on another device (or
@@ -386,7 +390,7 @@ pub const MEASURED_BY: &str = "measured_by";
 /// The rates a stored key covers ([`Rates::measured_by`]): every `[rates]`
 /// key of one value a load measures. The curves and the settle carry their
 /// own keys.
-pub const KEYED: [&str; 13] = [
+pub const KEYED: [&str; 14] = [
     "launch_ns",
     "gemm_tflops_by_rows",
     "attn_tflops_by_keys",
@@ -400,7 +404,67 @@ pub const KEYED: [&str; 13] = [
     RESIDENT_WORKGROUPS,
     ATTN_BY_ROWS_KEYS,
     "product_ns",
+    LANDING,
 ];
+
+/// The `[rates]` key of [`Rates::landing`]: `[copy_latency_ns, copy_gbps,
+/// copy_full_bytes, fill_gbps, read_spawn_ns, read_thread_gbps,
+/// read_whole_gbps]`.
+pub const LANDING: &str = "landing";
+
+/// How this machine lands weights ([`Rates::landing`]): a copy to the
+/// device's fixed cost, its rate, and the smallest copy that reaches it; the
+/// rate a pinned slot is filled at; one reading thread's spawn and join, one
+/// thread's read rate, and the most the threads read at together.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Landing {
+    pub copy_latency_ns: f64,
+    pub copy_gbps: f64,
+    pub copy_full_bytes: f64,
+    pub fill_gbps: f64,
+    pub read_spawn_ns: f64,
+    pub read_thread_gbps: f64,
+    pub read_whole_gbps: f64,
+}
+
+impl Landing {
+    /// The values in [`LANDING`]'s order.
+    #[must_use]
+    pub fn values(&self) -> [f64; 7] {
+        [
+            self.copy_latency_ns,
+            self.copy_gbps,
+            self.copy_full_bytes,
+            self.fill_gbps,
+            self.read_spawn_ns,
+            self.read_thread_gbps,
+            self.read_whole_gbps,
+        ]
+    }
+
+    /// The landing of `values` in [`LANDING`]'s order.
+    #[must_use]
+    pub fn of(values: [f64; 7]) -> Landing {
+        let [
+            copy_latency_ns,
+            copy_gbps,
+            copy_full_bytes,
+            fill_gbps,
+            read_spawn_ns,
+            read_thread_gbps,
+            read_whole_gbps,
+        ] = values;
+        Landing {
+            copy_latency_ns,
+            copy_gbps,
+            copy_full_bytes,
+            fill_gbps,
+            read_spawn_ns,
+            read_thread_gbps,
+            read_whole_gbps,
+        }
+    }
+}
 
 /// The `[rates]` key of [`Rates::submit_worst_ratio`]: what a load on a
 /// platform that states a bound on one submission measures beside the
@@ -467,6 +531,7 @@ impl Rates {
             },
             // Entry by entry, by its key: a load's settle joins the others
             // (another model's), its own replacing one of the same key.
+            landing: self.landing.or(below.landing),
             dense_settled: {
                 let mut all: Vec<DenseSettled> = below
                     .dense_settled
@@ -515,6 +580,7 @@ impl Rates {
             RESIDENT_WORKGROUPS => self.resident_workgroups.is_none(),
             ATTN_BY_ROWS_KEYS => self.attn_tflops_by_rows_keys.is_none(),
             "product_ns" => self.product_ns.is_none(),
+            LANDING => self.landing.is_none(),
             KERNEL_CURVES => self.kernel_tflops_by_shape.is_none(),
             DENSE_SETTLED => self.dense_settled.is_empty(),
             _ => true,
@@ -537,6 +603,7 @@ impl Rates {
             RESIDENT_WORKGROUPS => self.resident_workgroups = None,
             ATTN_BY_ROWS_KEYS => self.attn_tflops_by_rows_keys = None,
             "product_ns" => self.product_ns = None,
+            LANDING => self.landing = None,
             _ => {}
         }
         if let Some(by) = &mut self.measured_by {
@@ -759,6 +826,7 @@ impl Rates {
                 .kernel_tflops_by_shape
                 .clone()
                 .filter(|_| has(KERNEL_CURVES)),
+            landing: self.landing.filter(|_| has(LANDING)),
             dense_settled: if has(DENSE_SETTLED) {
                 self.dense_settled.clone()
             } else {
@@ -844,6 +912,10 @@ impl Rates {
                 })
                 .collect();
             let _ = writeln!(out, "product_ns = [\n{}]", rows.concat());
+        }
+        if let Some(landing) = &self.landing {
+            let values: Vec<String> = landing.values().iter().map(|v| format!("{v:?}")).collect();
+            let _ = writeln!(out, "{LANDING} = [{}]", values.join(", "));
         }
         keyed(&mut out, ATTN_BY_ROWS_KEYS, &self.attn_tflops_by_rows_keys);
         if let Some(curves) = &self.kernel_tflops_by_shape {
@@ -1096,6 +1168,7 @@ mod tests {
     #[test]
     fn the_block_is_a_few_lines() {
         let rates = Rates {
+            landing: None,
             launch_ns: Some(904),
             gemm_tflops_by_rows: Some(vec![
                 (1024, vec![(256, 40.0), (8192, 150.0)]),
