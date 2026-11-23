@@ -2653,7 +2653,9 @@ impl<B: Serve> Shell<B> {
         .with_rs(rs_bytes, rs_tokens, asked.pages_per_slot)?
         .with_guests(B::CHANNEL_CELLS)?;
         let layout = match rows.buffer {
-            Some(buffer) => layout.with_buffer(buffer.bytes, asked.pages_per_slot)?,
+            // No seat-addressed lane names a window-buffer slot (it folds
+            // every row it brings): the shape keeps no seat run.
+            Some(buffer) => layout.with_buffer(buffer.bytes, 0)?,
             None => layout,
         };
         layout.seats_within(total.saturating_sub(act_chunks.last().map_or(0, |&(_, c)| c)))?;
@@ -5932,31 +5934,18 @@ impl<B: Serve> Shell<B> {
                     window.lineage,
                 )
                 .map_err(|why| program("serve::stage", format!("lane {source}: {why}")))?;
-                let end = have + row.rows;
-                let to = folded.saturating_add(fold);
-                // The slots a seat's table names: of the rows read from it
-                // and of the fire's rows left unfolded.
-                let high = end.max(to);
-                let pages = if high > window.base {
-                    (high - window.base).div_ceil(tokens)
-                } else {
-                    0
-                };
-                let named = seated
+                // A lane stating no fold folds all it brings: it reads and
+                // leaves no buffered row, so it names no buffer slot.
+                let buffer = match seated
                     .windows
                     .iter()
                     .find(|(id, _)| *id == crate::store::layout::WINDOW)
-                    .map(|(_, refs)| refs.as_slice());
-                let buffer = match named {
-                    Some(refs) if seated.refs => {
+                    .map(|(_, refs)| refs.as_slice())
+                {
+                    Some(refs) if seated.refs && seated.window.is_some() => {
                         self.pools.list_pages(crate::store::Paged::Buffer, refs, None)?
                     }
-                    _ if seated.refs => Vec::new(),
-                    _ => self.pools.list_pages(
-                        crate::store::Paged::Buffer,
-                        &[],
-                        Some((lane.slot, window.base / tokens, pages)),
-                    )?,
+                    _ => Vec::new(),
                 };
                 ring_lanes.push(crate::ring::Seat {
                     folded,
