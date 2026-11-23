@@ -219,10 +219,19 @@ impl CapacityRead {
     /// Every tier's room past what is held: the room the state leaves,
     /// slack not counted.
     fn free_of_state(&self) -> u64 {
+        // A move under way holds two slots for one item; exactly one comes
+        // back whichever way it ends (a landed move gives back its source,
+        // a refused or aborted one its destination). The order is read after
+        // the moves under way: counted taken, every grant's own eviction or
+        // restore left the next read short by what it put in flight, and the
+        // order turned short before anyone grew (F57: the field mix's seed
+        // 401, least -6 at step 7 with 9 moving). Asks still wait for room on
+        // the tiers themselves until the moves land.
         let taken = self
             .held
             .saturating_sub(self.idle)
-            .saturating_sub(self.gathered);
+            .saturating_sub(self.gathered)
+            .saturating_sub(self.moving);
         self.whole.saturating_sub(taken)
     }
 

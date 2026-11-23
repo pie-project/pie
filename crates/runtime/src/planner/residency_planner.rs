@@ -39,6 +39,10 @@ pub struct ResidencyPlanner {
     /// the head and the pages gathered: the step, the map, the wants and
     /// the stall line read it once a pass, not once each.
     pub(super) need_cache: parking_lot::Mutex<Option<(u64, EntryKey, u32, Option<RunNeed>)>>,
+    /// The capacity gate's last place gained room: a newcomer held at a
+    /// gate before its first ask looks again ([`Self::admits`]). Fired on
+    /// every read that raises it and on every departure, never on a clock.
+    pub(super) allowance_rose: Notify,
     /// Events that can change a pass's answer the pool's own counts do not
     /// show: an arrival, a departure, a landing, a policy answer, each a
     /// poke ([`Self::poke`]). Part of [`Self::generation`].
@@ -167,6 +171,7 @@ impl ResidencyPlanner {
         Self {
             inner: parking_lot::Mutex::new(Inner::default()),
             need_cache: parking_lot::Mutex::new(None),
+            allowance_rose: Notify::new(),
             events: AtomicU64::new(0),
             force_moves: AtomicBool::new(false),
             pass_landed: AtomicU64::new(0),
@@ -348,6 +353,63 @@ impl ResidencyPlanner {
         })
     }
 
+    /// The gate and its order as a pass reads them, set for the pass's
+    /// asks; a read that gives the last place more than the one before
+    /// wakes the newcomers held for it ([`Self::admits`]).
+    pub(super) fn read_capacity(&self) {
+        let order = self.capacity_order();
+        let rose = self.with_inner(|inner| {
+            let was = inner.capacity.map(|gate| gate.allowance(None));
+            inner.set_capacity(order);
+            let now = inner.capacity.map(|gate| gate.allowance(None));
+            match (was, now) {
+                (Some(was), Some(now)) => now > was,
+                (_, None) => true,
+                (None, Some(_)) => false,
+            }
+        });
+        if rose {
+            self.allowance_rose.notify_waiters();
+        }
+    }
+
+    /// Whether a newcomer may go on to its first ask: what it holds at its
+    /// first step is priced there, by the capacity gate at the order's last
+    /// place with the finisher's headroom and margin
+    /// ([`Self::capacity_holds`]), never at the declared context. Held here
+    /// while the last place has no room for any ask, it takes nothing it
+    /// would hold against the order while it waits. One already in the
+    /// order, or with no gate to read (nothing admitted: it alone may
+    /// finish), goes on.
+    pub fn admits(&self, pid: ProcessId) -> bool {
+        if self.with_inner(|inner| inner.procs.get(&pid).is_some_and(|proc| proc.admitted)) {
+            return true;
+        }
+        self.capacity_order()
+            .is_none_or(|(gate, places)| places.contains_key(&pid) || gate.allowance(None) > 0)
+    }
+
+    /// Waits until [`Self::admits`] lets `pid` on: woken by a read that
+    /// raises the last place (a retire, a grant given back, a move landed,
+    /// a segment committed: each plans a pass) or a departure.
+    pub async fn admitted_to_ask(&self, pid: ProcessId) {
+        let mut counted = false;
+        loop {
+            let rose = self.allowance_rose.notified();
+            tokio::pin!(rose);
+            rose.as_mut().enable();
+            if self.admits(pid) {
+                return;
+            }
+            if !std::mem::replace(&mut counted, true) {
+                self.stats.admission_waits.fetch_add(1, Ordering::Relaxed);
+                // Said once a newcomer: how many the gate held, and when.
+                tracing::info!(%pid, "planner: a newcomer waits for room at the capacity gate's last place");
+            }
+            rose.await;
+        }
+    }
+
     /// The figures the capacity gate is read from ([`Self::capacity_gate`]).
     #[cfg(test)]
     pub(super) fn capacity_read(&self) -> Option<super::inner::CapacityRead> {
@@ -520,12 +582,7 @@ impl ResidencyPlanner {
     pub(super) fn capacity_holds(&self, pid: ProcessId, pages: u32) -> bool {
         // No pass has read it yet: read now, before the first grant.
         if self.with_counts(|inner| inner.capacity.is_none()) {
-            let order = self.capacity_order();
-            self.with_counts(|inner| {
-                if inner.capacity.is_none() {
-                    inner.set_capacity(order);
-                }
-            });
+            self.read_capacity();
         }
         let Some((gate, holds)) = self.with_counts(|inner| {
             let place = inner.capacity_allow.get(&pid).copied();
@@ -2399,6 +2456,8 @@ impl ResidencyPlanner {
             self.re_arm_idle_reclaim();
             self.poke();
         }
+        // What it held is back: the last place may hold a newcomer's ask.
+        self.allowance_rose.notify_waiters();
     }
 
     /// `pid` leaves: its client has heard, its seat and asks go now. What
@@ -2408,6 +2467,8 @@ impl ResidencyPlanner {
     /// wedged for pages no one registered holds.
     pub fn unregister(self: &Arc<Self>, pid: ProcessId) {
         crate::store::shared::forget_process(pid);
+        // Out of the order: the newcomers held at its last place look again.
+        let _woken = ScopeNotify(&self.allowance_rose);
         // What was held for its restore goes back with it.
         self.port.release_restore(pid);
         let (model, engine) = self.port.locus();
@@ -2602,4 +2663,14 @@ fn holder_head(pid: ProcessId) -> u64 {
         .filter(|&upto| upto > 0 && Installed.key_at(Some(pid), upto - 1) > whole)
         .max()
         .unwrap_or(0)
+}
+
+/// Wakes every waiter of a [`Notify`] as it drops: at the end of the scope
+/// it guards, whichever way that ends.
+struct ScopeNotify<'a>(&'a Notify);
+
+impl Drop for ScopeNotify<'_> {
+    fn drop(&mut self) {
+        self.0.notify_waiters();
+    }
 }

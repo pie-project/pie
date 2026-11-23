@@ -1630,6 +1630,9 @@ impl Workload {
 #[derive(Clone, Debug, Default)]
 struct Coverage {
     seeds: u64,
+    /// Newcomers held for room at the gate's last place before their first
+    /// ask.
+    admission_waits: u64,
     steps: u64,
     processes: u64,
     fires: u64,
@@ -1692,6 +1695,7 @@ impl Coverage {
         self.quiet_waits += other.quiet_waits;
         self.lost_wakes += other.lost_wakes;
         self.restores += other.restores;
+        self.admission_waits += other.admission_waits;
         self.eviction_tier_full += other.eviction_tier_full;
         self.tier_full_refused += other.tier_full_refused;
         self.host_swap_full += other.host_swap_full;
@@ -1900,6 +1904,9 @@ struct Log {
     idles: u64,
     rescores: u64,
     /// The safe order stood short at the last settled step.
+    /// The first admission that turned the safe order short: the gate let
+    /// a newcomer in that left someone unable to finish in turn.
+    admitted_short: Option<String>,
     short: bool,
     /// Bytes found not as written: (process, what).
     corrupt: Vec<(ProcessId, String)>,
@@ -2561,7 +2568,18 @@ async fn run_process(ctx: Arc<Ctx>, pid: ProcessId, script: Script) {
     let planner = ctx.planner.clone();
     ctx.at(pid, "admit");
     planner.admit(pid).await;
+    // As the runtime's gates hold a newcomer
+    // (`inferlet::process::wait_for_room`): until the capacity gate's last
+    // place has room for its first ask.
+    planner.admitted_to_ask(pid).await;
+    let before = planner.order_least();
     planner.note_admitted(pid);
+    let after = planner.order_least();
+    if before.is_none_or(|least| least >= 0) && after.is_some_and(|least| least < 0) {
+        ctx.log.lock().unwrap().admitted_short.get_or_insert_with(|| {
+            format!("admitting {} turned the safe order short: least {before:?} -> {after:?}", &pid.to_string()[..8])
+        });
+    }
     let residency = Arc::new(Mutex::new(ProcessResidency::default()));
     register_residency(pid, Arc::downgrade(&residency));
     let departure = planner.departure(pid);
@@ -3433,6 +3451,7 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
     coverage.quiet_waits = stats.quiet_waits.load(Ordering::Relaxed);
     coverage.lost_wakes = stats.lost_wakes.load(Ordering::Relaxed);
     coverage.restores = stats.restores.load(Ordering::Relaxed);
+    coverage.admission_waits = stats.admission_waits.load(Ordering::Relaxed);
     coverage.eviction_tier_full = stats.eviction_tier_full.load(Ordering::Relaxed);
     coverage.host_swap_full = stats.host_swap_exhaustions.load(Ordering::Relaxed);
     {
@@ -3460,6 +3479,13 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
         // (the M1 at beamx40: bind suspensions 1,996 over 201 processes,
         // some suspended 58 to 68 times, unfinished in 45 minutes).
         coverage.most_suspended = u64::from(log.most_suspended);
+        if let Some(line) = log.admitted_short.clone() {
+            failures.push(Failure {
+                step,
+                kind: "admission".to_string(),
+                line,
+            });
+        }
         for &(pid, program, suspended) in &log.bind_thrash {
             progress.again += u64::from(suspended - 1);
             progress.first.get_or_insert_with(|| {
@@ -4001,6 +4027,24 @@ fn sim_field_seed_3_a_lane_is_evicted_once_for_a_head_s_request() {
 fn sim_field_seeds_863_and_178_end() {
     field_regression(863);
     field_regression(178);
+}
+
+/// The Metal w17 mix's seeds 2 and 6: newcomers arrive while the safe
+/// order has no room at its last place, wait there holding nothing
+/// (`ResidencyPlanner::admitted_to_ask`), and are let in as admitted
+/// processes finish; no admission turns the order short (the run's
+/// `admission` check), and every process ends: admitting never starves one
+/// admitted.
+#[test]
+fn sim_metal_seeds_2_and_6_newcomers_wait_at_the_last_place_and_every_process_ends() {
+    for seed in [2, 6] {
+        let (failures, coverage) = run(&Workload::metal(seed), None);
+        for failure in &failures {
+            eprintln!("SIM metal seed {seed} step {} [{}]: {}", failure.step, shape_of(failure), failure.line);
+        }
+        assert!(failures.is_empty(), "metal seed {seed}: {} failures", failures.len());
+        assert!(coverage.admission_waits > 0, "metal seed {seed}: no newcomer waited at the gate");
+    }
 }
 
 /// What a run did, as a string two runs of one seed must agree on.
