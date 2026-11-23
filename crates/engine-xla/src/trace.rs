@@ -23,7 +23,9 @@ use dtype::Dtype;
 use kernels_xla::hlo::{Elem, Func, Ty, Val};
 
 /// Where a root's value comes from when the program first reads it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum Source {
     /// A weight plane, landed at load; `plane` numbers the planes of one
     /// param (0 codes/dense, 1 scales, 2 biases). A `transposed` plane
@@ -265,7 +267,7 @@ impl Handles {
 /// What a traced fire needs bound to run: its parameters (roots, in order)
 /// and results (roots written, then extra outputs), and which parameter each
 /// pool result aliases.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Signature {
     pub params: Vec<Source>,
     /// For each result: the pool it updates (and the parameter it aliases),

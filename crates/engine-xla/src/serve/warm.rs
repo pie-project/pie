@@ -23,7 +23,7 @@
 use poem_ir::Request;
 
 use super::{Lane, Seated, Shell};
-use crate::device::{Admission, HostRoom, available_memory, compile_need};
+use crate::device::{Admission, HostRoom, available_memory};
 use crate::error::Result;
 
 /// One synthetic lane: its word, its rows, and the pages it holds before
@@ -397,6 +397,7 @@ impl Shell {
         let started = std::time::Instant::now();
         // Trace every shape (nothing runs), then compile the new programs
         // side by side: a compile is host work, one core each.
+        self.trace_scope = Some(self.trace_scope());
         self.deferred = Some(Vec::new());
         let mut fired = 0;
         let mut failed = None;
@@ -449,11 +450,148 @@ impl Shell {
             "xla warm ladder compiled"
         );
         self.laddered = fired > 0;
+        self.load_behind();
         Ok(fired)
+    }
+
+    /// Loads the parked programs from the disk cache behind serving, the
+    /// smallest fires' first, as many at once as the load rate's knee (the
+    /// width past which it stops rising), each admitted by the host's room
+    /// as the ladder's are ([`HostRoom`]). A fire of a shape not yet loaded
+    /// loads it itself, ahead of the loader (which starts none while a fire
+    /// waits on one, `Device::wait_demand`), or waits on the loader's load
+    /// of it where one is under way (`Device::load_named`); never building
+    /// it. What the host holds no room for stays parked, its first fire
+    /// loading it.
+    fn load_behind(&mut self) {
+        let mut queue: Vec<_> = self
+            .parked
+            .iter()
+            .map(|(key, p)| (*key, p.code.clone(), p.sig.clone(), p.rows))
+            .collect();
+        queue.sort_by_key(|q| (q.3, q.0));
+        let mut seen = std::collections::HashSet::new();
+        queue.retain(|q| seen.insert(q.1.hash()));
+        if queue.is_empty() {
+            return;
+        }
+        let device = std::sync::Arc::clone(&self.device);
+        let stated = self.host_programs;
+        // two compiles' room kept free beside them, as at the ladder
+        let floor = 2 * queue.iter().map(|q| q.1.need()).max().unwrap_or(0);
+        let scope = self.trace_scope.clone();
+        let stop = std::sync::Arc::clone(&self.behind.stop);
+        let started = std::time::Instant::now();
+        let spawned = std::thread::Builder::new()
+            .name("xla-load-behind".into())
+            .spawn(move || {
+                use std::sync::atomic::Ordering::SeqCst;
+                let room = HostRoom::new(stated, floor);
+                let next = std::sync::atomic::AtomicUsize::new(0);
+                let loaded = std::sync::atomic::AtomicUsize::new(0);
+                let full = std::sync::atomic::AtomicBool::new(false);
+                // One program's load: its text's bytes, `None` past the queue's
+                // end or with the host full or the loader stopped.
+                let one = || -> Option<u64> {
+                    if stop.load(SeqCst) || full.load(SeqCst) {
+                        return None;
+                    }
+                    let (key, code, sig, _) = queue.get(next.fetch_add(1, SeqCst))?;
+                    let Some(reserved) = room.take(code.len()) else {
+                        full.store(true, SeqCst);
+                        return None;
+                    };
+                    let program = device.load_behind(code, sig.clone());
+                    room.done(reserved, matches!(program, Ok(Some(_))));
+                    match program {
+                        Ok(Some(_)) => {
+                            loaded.fetch_add(1, SeqCst);
+                        }
+                        Ok(None) => {
+                            if let (Some(scope), crate::device::Code::Cached { name, .. }) =
+                                (scope.as_deref(), code)
+                            {
+                                device.mend_record(scope, key, name);
+                            }
+                        }
+                        Err(fault) => {
+                            tracing::warn!(%fault, "xla program loading behind serving failed: its first fire loads it");
+                        }
+                    }
+                    #[cfg(target_os = "linux")]
+                    // SAFETY: `malloc_trim` only releases free heap pages.
+                    unsafe {
+                        libc::malloc_trim(0);
+                    }
+                    Some(code.len() as u64)
+                };
+                // `width` loads at once, after any a fire waits on: their
+                // text's bytes a second, `None` once nothing is left to load.
+                let batch = |width: usize| -> Option<f64> {
+                    device.wait_demand();
+                    let started = std::time::Instant::now();
+                    let bytes: Vec<Option<u64>> = std::thread::scope(|s| {
+                        let loads: Vec<_> = (0..width).map(|_| s.spawn(one)).collect();
+                        loads.into_iter().map(|l| l.join().ok().flatten()).collect()
+                    });
+                    let done: u64 = bytes.iter().flatten().sum();
+                    (bytes.iter().all(Option::is_some) && done > 0)
+                        .then(|| done as f64 / started.elapsed().as_secs_f64())
+                };
+                // The width: grown by one while the fastest of a width's
+                // samples beats the last width's (the knee of the curve, as
+                // the rates' curves find theirs); deserializes under way are
+                // not preempted, so a wider loader only delays a fire's load
+                // past it (v6e Qwen3.5: 44 at once put a first request at
+                // 13.9-33.3 s, 2-4 at 9.95 s).
+                let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+                let (mut width, mut last) = (1usize, 0f64);
+                let knee = 'grow: loop {
+                    let mut fastest = 0f64;
+                    for _ in 0..LOAD_SAMPLES {
+                        match batch(width) {
+                            Some(rate) => fastest = fastest.max(rate),
+                            None => break 'grow width,
+                        }
+                    }
+                    if fastest <= last || width == cores {
+                        break 'grow width.saturating_sub(usize::from(fastest <= last)).max(1);
+                    }
+                    last = fastest;
+                    width += 1;
+                };
+                tracing::info!(width = knee, cores, "xla loading behind serving: the width the load rate stops rising at");
+                while batch(knee).is_some() {}
+                let loaded = loaded.load(SeqCst);
+                tracing::info!(
+                    loaded,
+                    of = queue.len(),
+                    s = started.elapsed().as_secs_f64(),
+                    stopped = stop.load(SeqCst),
+                    host_full = full.load(SeqCst),
+                    "xla warm programs loaded behind serving"
+                );
+            });
+        match spawned {
+            Ok(handle) => self.behind.handle = Some(handle),
+            Err(why) => {
+                tracing::warn!(%why, "xla programs not loaded behind serving: each loads in its first fire")
+            }
+        }
+    }
+
+    /// Waits for the programs loading behind serving: every parked program
+    /// the host holds room for is loaded once it returns.
+    pub fn wait_loaded(&mut self) {
+        if let Some(handle) = self.behind.handle.take() {
+            let _ = handle.join();
+        }
     }
 
     /// Compiles what the ladder traced, a thread a core up to 8, and seats
     /// each program under its keys; answers how many programs it left out.
+    /// A program a record names is parked, loaded behind serving
+    /// (`Shell::load_behind`).
     ///
     /// A program whose temporaries do not fit the chip's HBM beside the pool
     /// (PJRT's `RESOURCE_EXHAUSTED`) is left out, not the load: the ladder
@@ -462,13 +600,12 @@ impl Shell {
     /// Next's mini on a v5e refused its whole load over one, "Ran out of
     /// memory on HBM" at m=9772). Any other compile failure fails the load.
     fn compile_deferred(&mut self, deferred: Vec<super::Deferred>) -> Result<usize> {
-        let mut texts: Vec<(&str, &crate::trace::Signature)> = Vec::new();
+        let mut texts: Vec<(&crate::device::Code, &crate::trace::Signature)> = Vec::new();
         let mut index: Vec<usize> = Vec::with_capacity(deferred.len());
         let mut seen: std::collections::HashMap<[u8; 32], usize> = std::collections::HashMap::new();
         for d in &deferred {
-            let hash = *blake3::hash(d.text.as_bytes()).as_bytes();
-            let at = *seen.entry(hash).or_insert_with(|| {
-                texts.push((d.text.as_str(), &d.sig));
+            let at = *seen.entry(d.code.hash()).or_insert_with(|| {
+                texts.push((&d.code, &d.sig));
                 texts.len() - 1
             });
             index.push(at);
@@ -482,8 +619,18 @@ impl Shell {
         // 168-program ladder one compile at a time, 73 compile-minutes past
         // the hour a round has). A v5e host's 47 GB stopped answering at four
         // started together.
-        let need = texts.iter().map(|(t, _)| compile_need(t)).max().unwrap_or(0);
-        let least = texts.iter().map(|(t, _)| compile_need(t)).min().unwrap_or(0);
+        let need = texts
+            .iter()
+            .filter(|(c, _)| c.text().is_some())
+            .map(|(c, _)| c.need())
+            .max()
+            .unwrap_or(0);
+        let least = texts
+            .iter()
+            .filter(|(c, _)| c.text().is_some())
+            .map(|(c, _)| c.need())
+            .min()
+            .unwrap_or(0);
         // A compiled program held in host memory takes what its load is
         // measured to take ([`HostRoom`]), and libtpu's allocator keeps what
         // a dropped one freed for its own next use, giving the host none
@@ -533,32 +680,46 @@ impl Shell {
                         let Some((text, sig)) = texts.get(at) else {
                             break;
                         };
-                        let reserved = if !parks || device.on_disk(text) {
-                            host_room.take(text)
+                        // A program a record names is loaded behind serving
+                        // (`Shell::load_behind`), not before ready.
+                        if text.text().is_none() {
+                            parked.fetch_add(1, SeqCst);
+                            continue;
+                        }
+                        let reserved = if !parks || device.code_on_disk(text) {
+                            host_room.take(text.len())
                         } else {
                             None
                         };
                         let kept = reserved.is_some();
                         if !kept {
                             parked.fetch_add(1, SeqCst);
-                            if device.on_disk(text) {
+                            if device.code_on_disk(text) {
                                 continue;
                             }
                         }
                         let program = {
-                            let _admitted = admission.admit(text);
-                            device.prepare(text, (*sig).clone())
+                            // a cached program loads, never compiled
+                            let _admitted = text.text().map(|t| admission.admit(t));
+                            device.prepare_code(text, (*sig).clone())
                         };
                         if let Some(r) = reserved {
-                            host_room.done(r, program.is_ok());
+                            host_room.done(r, matches!(program, Ok(Some(_))));
                         }
+                        // a text's program is built, never missing
+                        let program = program.and_then(|p| {
+                            p.ok_or_else(|| crate::error::Fault::Program {
+                                at: "serve::warm",
+                                why: "a traced program was neither built nor loaded".to_string(),
+                            })
+                        });
                         if kept || program.is_err() {
                             if let Ok(mut slot) = slots[at].lock() {
                                 *slot = Some(program);
                             }
                         } else {
                             drop(program);
-                            device.forget(text);
+                            device.forget_code(text);
                         }
                         #[cfg(target_os = "linux")]
                         // SAFETY: `malloc_trim` only releases free heap pages.
@@ -600,15 +761,26 @@ impl Shell {
                             if full.load(SeqCst) {
                                 break;
                             }
-                            if held[at].is_some() || !device.on_disk(text) {
+                            // a record's program loads behind serving
+                            if held[at].is_some()
+                                || text.text().is_none()
+                                || !device.code_on_disk(text)
+                            {
                                 continue;
                             }
-                            let Some(reserved) = host_room.take(text) else {
+                            let Some(reserved) = host_room.take(text.len()) else {
                                 full.store(true, SeqCst);
                                 break;
                             };
-                            let program = device.prepare(text, (*sig).clone());
-                            host_room.done(reserved, program.is_ok());
+                            let program = device.prepare_code(text, (*sig).clone());
+                            host_room.done(reserved, matches!(program, Ok(Some(_))));
+                            // gone since: it stays parked, its first fire loads
+                            // or builds it
+                            let program = match program {
+                                Ok(Some(program)) => Ok(program),
+                                Ok(None) => continue,
+                                Err(fault) => Err(fault),
+                            };
                             if let Ok(mut slot) = loads[at].lock() {
                                 *slot = Some(program);
                             }
@@ -668,9 +840,10 @@ impl Shell {
                     self.parked.insert(
                         d.key,
                         super::Parked {
-                            text: d.text,
+                            code: d.code,
                             sig: d.sig,
                             probed: d.probed,
+                            rows: d.rows,
                         },
                     );
                     continue;
@@ -776,3 +949,8 @@ fn lane_counts(p: u32) -> Vec<u32> {
     ns.dedup();
     ns
 }
+
+/// The samples a width of loading behind serving takes, the fastest its
+/// rate: as many as the rates' curves time a point (engine-gpu
+/// `rates::REPEATS`).
+const LOAD_SAMPLES: usize = 3;

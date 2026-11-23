@@ -1941,6 +1941,7 @@ dependencies = [
  "pie-poem-ir",
  "pie-profile",
  "prost",
+ "serde",
  "serde_json",
  "toml",
  "tracing",

@@ -1186,3 +1186,38 @@ What each still times at load or boot, for its owner (paths under `crates/`):
   (`engine_gpu::dense::by_shape`; by the roofline where one is stated); with curves but no roofline, the curves
   weigh it (`dense::choose_unrated`). Still open: the Adreno 840's committed profile (`adreno-tm-840`, a
   commented slot in each backend's `SEEDED`) awaits the phone's export.
+
+## F57. An XLA program is the decoder's per-layer code repeated: lower the layer stack as a loop (v6e, found 2026-11-23)
+
+A hybrid Qwen3.5-0.8B ladder's executables are 4–65 MB packed (median prefill 34 MB, 168 MB raw;
+the ladder 8.6 GB packed, 40.4 GB raw over 266 programs). No weights or tables are folded in
+(every plane a parameter; 2 dense literals, 1.5 KB). The HLO text (median 8.9 MB) is 76% Mosaic
+kernel bodies: 102 `tpu_custom_call`s carry 6.8 MB of `backend_config`, 12 of them distinct
+(conv_step, gdn_step, gdn_chunks, pool_gather, pool_scatter 18 times each, a layer each). The
+compiled form repeats at long range: zstd with a 128 MB window takes the 168 MB to 4.4 MB (38x;
+the cache's level 1 34 MB), 57% of its 512-byte blocks duplicates. Loading it is deserializing
+it: 856 thread-s of a record boot's loads against 78 s of reads and 56 s of unpacking. Lowering
+the decoder's layers as one `stablehlo.while` over stacked per-layer weights would hold one
+layer's code a program: an order of magnitude off each executable, its compile, its load and
+the cache. A big lowering change with a steady-state risk on the critical path: after the PR, a
+prototype on one dense model with steady-state numbers against main.
+
+## F58. The XLA loader's width is measured each boot, not kept in the device's profile (v6e, found 2026-11-23)
+
+Loading behind serving grows its width while the fastest of three samples of its load rate
+rises (v6e: 4 or 5 of 40 cores, a first request at 9.4–9.9 s, all 266 of Qwen3.5's programs
+at 74–84 s). The width is a property of the device and its PJRT plugin and belongs in the
+device profile's keyed `[rates]` (device, plugin, method), measured once and committed with the
+v6e profile, not found again each boot; it waits on the keyed profile path (`profile::fire::
+Rates`, `measured_by`) landing with the committed profiles. Beside it: a parked program (the
+host held no room for it) whose disk file is corrupt is built by its first fire, a build on the
+serving path counted as `BuiltInFire`.
+
+## F59. A fresh host cover is timed while programs load behind serving (v6e, found 2026-11-23)
+
+The runtime times the host cover with warm runs as the load becomes ready, while XLA loads its
+cached programs behind serving. With 44 loads at once the cover's frame read 21 ms against 3.7
+ms quiet; at the loader's measured width (4–5) and with fires' loads ahead of it, it reads 3.7
+ms. A cover the cache or a committed file holds is not timed at all. A fresh one should wait for
+the loader (an engine hook the runtime calls before it times the cover); not built, as the
+measured width leaves it unpolluted on v6e.
