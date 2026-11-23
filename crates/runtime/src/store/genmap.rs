@@ -33,6 +33,18 @@ impl<M> PartialEq for GenKey<M> {
     }
 }
 impl<M> Eq for GenKey<M> {}
+/// By slot, then generation: a stable order where a set of keys is walked
+/// in an order that decides what happens.
+impl<M> PartialOrd for GenKey<M> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl<M> Ord for GenKey<M> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.index, self.generation).cmp(&(other.index, other.generation))
+    }
+}
 impl<M> std::hash::Hash for GenKey<M> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.index.hash(state);

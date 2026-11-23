@@ -543,6 +543,16 @@ impl ResidencyPlanner {
             if self.port.compaction_under_way() {
                 return None;
             }
+            // A frame held for a raise the walk has since taken (the cap up
+            // to it): its fire goes on the scheduler's next turn, and lands.
+            // Read as nothing in flight, the pass between the raise and that
+            // fire was a stall (the simulation: a raise beside a restore
+            // waiting on the raiser's room).
+            let (_, engine) = self.port.locus();
+            let owed = crate::store::shared::owed_cut_rows(engine);
+            if owed > 0 && crate::store::shared::fire_cap(engine) >= owed {
+                return None;
+            }
             // Found again: counted each time, said once a head and room.
             self.stats.stuck_settles.fetch_add(1, Ordering::Relaxed);
             if let Some((at, seen, said)) = inner.stall_dumped
@@ -1013,7 +1023,10 @@ impl ResidencyPlanner {
                     // takes the raise or refuses it by name.
                     let (run, pieces) = match rise {
                         None => (run, pieces),
-                        Some(rung) => match self.port.rise_room(rung) {
+                        Some(rung) => match self
+                            .with_inner(|inner| inner.queue.get(&key).map(|waiter| waiter.pid))
+                            .map_or(super::pool::RiseRoom::Fits, |pid| self.port.rise_room(pid, rung))
+                        {
                             super::pool::RiseRoom::Short { pieces } => {
                                 let pages = self.port.chunks_as_pages(pieces);
                                 self.with_inner(|inner| {
@@ -1547,7 +1560,33 @@ impl ResidencyPlanner {
                                 inner.procs.get(&pid).and_then(|proc| proc.bind_room).map(|need| need.entries())
                             });
                             let held = self.port.reserve_restore(pid, bind.as_deref().unwrap_or_default());
-                            tracing::debug!(%pid, ?bind, held, "planner: a restore sent, its placement held for it");
+                            // What held it for the head it was moved for, as
+                            // that head stood when it went (the hold's terms,
+                            // [`super::inner::Inner::unmet_head`]).
+                            let held_for = tracing::enabled!(tracing::Level::DEBUG)
+                                .then(|| {
+                                    self.with_inner(|inner| {
+                                        let head = inner.procs.get(&pid)?.evicted_for?;
+                                        let queued = inner.queue.values().any(|waiter| waiter.pid == head);
+                                        let state = inner.procs.get(&head).map(|proc| {
+                                            format!(
+                                                "{:?} unfired={} idle={} bind_waiting={} in_request={}",
+                                                proc.state,
+                                                proc.unfired,
+                                                proc.idle,
+                                                proc.bind_waiting,
+                                                super::inner::Inner::in_request(proc)
+                                            )
+                                        });
+                                        Some(format!(
+                                            "head {head} queued={queued} passed={} finisher={} {state:?}",
+                                            inner.passed.iter().any(|&(_, passed)| passed == head),
+                                            inner.is_finisher(pid)
+                                        ))
+                                    })
+                                })
+                                .flatten();
+                            tracing::debug!(%pid, ?bind, held, ?held_for, "planner: a restore sent, its placement held for it");
                             // Said as the pass's end for this head: a restore
                             // refused and queued again showed "ended=none".
                             self.plan_ended(key, "restore sent", false, &[]);

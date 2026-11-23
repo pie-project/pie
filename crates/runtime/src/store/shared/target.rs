@@ -539,6 +539,13 @@ impl SharedGrow {
                 // Its process is being evicted: its frames go with it, and
                 // room freed brings the walk back.
                 Ok(None) => return,
+                // Never fits beside its owner's own state: the frames held
+                // for it are failed by name, never held for good.
+                Err(error @ crate::planner::PlannerError::PastRung { .. }) => {
+                    tracing::warn!(engine, rung, %owner, %error, "a raise to held frames is refused");
+                    super::refuse_owed(engine, owner, error.to_string());
+                    return;
+                }
                 Err(error) => {
                     tracing::warn!(engine, rung, %owner, %error, "a raise to held frames is refused");
                     return;

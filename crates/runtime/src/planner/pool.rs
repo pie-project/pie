@@ -546,9 +546,11 @@ pub enum RiseRoom {
     /// Short of room: `pieces` free chunks are what it takes, those free
     /// now and those to empty, as a bind's runs of one chunk.
     Short { pieces: u32 },
-    /// The rung's span and the reserved chunks, `need` chunks, past the
-    /// pool's `total`: no move of state ever makes the room.
-    Past { need: u32, total: u32 },
+    /// The rung's span, the reserved chunks and the `own` chunks its
+    /// owner's state takes at that rung, `need` chunks, past the pool's
+    /// `total`: with every other process moved off it, no move of state
+    /// ever makes the room.
+    Past { need: u32, own: u32, total: u32 },
 }
 
 /// Every tier's room and what is held in it, in one unit, kv pages
@@ -772,12 +774,13 @@ pub trait PoolPort: Send + Sync + 'static {
         let _ = state;
         Vec::new()
     }
-    /// Where a raise of the activation to `rung` (tokens) stands now: what
-    /// a rung raise short of room waits on
-    /// ([`super::ResidencyPlanner::fund_rise`]). `Fits` where the pool has
+    /// Where `pid`'s raise of the activation to `rung` (tokens) stands now:
+    /// what a rung raise short of room waits on
+    /// ([`super::ResidencyPlanner::fund_rise`]), past the pool where the
+    /// rung beside `pid`'s own state never fits. `Fits` where the pool has
     /// no rungs.
-    fn rise_room(&self, rung: u32) -> RiseRoom {
-        let _ = rung;
+    fn rise_room(&self, pid: ProcessId, rung: u32) -> RiseRoom {
+        let _ = (pid, rung);
         RiseRoom::Fits
     }
     /// Whether `pieces` free runs of `run` adjacent chunks stand beside
@@ -1043,6 +1046,60 @@ pub struct RegistryPool {
 const RECLAIMABLE_FRESH: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl RegistryPool {
+    /// The fewest chunks `pid`'s own state takes on the device, wherever
+    /// it lies: per shape, the slots of its kv pages that leave with it,
+    /// its state's (records, lists, windows) and its guest state's, packed
+    /// whole. No arrangement of the pool lays them in fewer, so a need
+    /// counted beside them is one no move under it ever meets.
+    fn own_chunks(
+        &self,
+        stores: &crate::store::registry::Stores,
+        shared: &crate::store::shared::Shared,
+        pid: ProcessId,
+    ) -> u32 {
+        let sets = crate::inferlet::process::residency::kv_working_sets_for(&[pid], self.model, self.engine);
+        // Read before the pools' locks, as `chunk_occupants` does: the
+        // roles and the state store take the shared pool's lock themselves.
+        let guest = stores
+            .roles
+            .as_ref()
+            .map(|roles| roles.lock().unwrap().guest_chunk_slots(&[pid]))
+            .unwrap_or_default();
+        let state_sets = crate::inferlet::process::residency::rs_working_set_ids(pid, self.model, self.engine);
+        let state = if state_sets.is_empty() {
+            Vec::new()
+        } else {
+            stores.rs.lock().unwrap().private_slot_refs(&state_sets)
+        };
+        crate::store::registry::with_kv_lock(&stores.kv, "planner-own", |kv| {
+            let pool = shared.lock().unwrap();
+            let mut slots: std::collections::BTreeMap<crate::store::slots::ShapeId, u64> = Default::default();
+            if let Some(list) = pool.list() {
+                let groups: Vec<HashSet<_>> = sets.into_iter().flatten().collect();
+                let pages: usize = kv.movable_resident_pages_each(&groups).iter().map(Vec::len).sum();
+                *slots.entry(list.pool).or_default() += pages as u64;
+            }
+            for (engine, refs) in &state {
+                if let Some(shape) = pool.pool_shape(*engine) {
+                    *slots.entry(shape).or_default() += refs.len() as u64;
+                }
+            }
+            for (logical, _, count) in guest {
+                if let Some(shape) = pool.pool().chunk_shape(logical) {
+                    *slots.entry(shape).or_default() += u64::from(count);
+                }
+            }
+            let chunks: u64 = slots
+                .into_iter()
+                .map(|(shape, slots)| {
+                    let per = pool.pool().shape(shape).map_or(1, |shape| shape.slots_per_chunk.max(1));
+                    slots.div_ceil(u64::from(per))
+                })
+                .sum();
+            u32::try_from(chunks).unwrap_or(u32::MAX)
+        })
+    }
+
     pub fn new(model: usize, engine: usize, suspend_capable: bool) -> Self {
         Self {
             model,
@@ -1270,10 +1327,15 @@ impl PoolPort for RegistryPool {
             .unwrap_or_default()
     }
 
-    fn rise_room(&self, rung: u32) -> RiseRoom {
-        crate::store::registry::try_get(self.model, self.engine)
-            .and_then(|stores| stores.shared)
-            .map_or(RiseRoom::Fits, |shared| shared.lock().unwrap().rise_room(rung))
+    fn rise_room(&self, pid: ProcessId, rung: u32) -> RiseRoom {
+        let Some(stores) = crate::store::registry::try_get(self.model, self.engine) else {
+            return RiseRoom::Fits;
+        };
+        let Some(shared) = stores.shared.clone() else {
+            return RiseRoom::Fits;
+        };
+        let own = self.own_chunks(&stores, &shared, pid);
+        shared.lock().unwrap().rise_room(rung, own)
     }
 
     fn guest_free_runs(&self, run: u32) -> u32 {
@@ -1708,7 +1770,7 @@ impl PoolPort for RegistryPool {
         let kv_sets: Vec<(crate::store::kv::page_table::WorkingSetId, u64)> = pids
             .iter()
             .flat_map(|&pid| {
-                crate::inferlet::process::residency::kv_working_set_ids(pid, self.model, self.engine)
+                crate::inferlet::process::residency::kv_working_set_ids_in_order(pid, self.model, self.engine)
             })
             .map(|ws| (ws, 0))
             .collect();
@@ -1786,7 +1848,7 @@ impl PoolPort for RegistryPool {
             let sets: Vec<crate::store::kv::page_table::WorkingSetId> = order
                 .iter()
                 .flat_map(|&pid| {
-                    crate::inferlet::process::residency::kv_working_set_ids(
+                    crate::inferlet::process::residency::kv_working_set_ids_in_order(
                         pid,
                         self.model,
                         self.engine,
