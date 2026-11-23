@@ -49,7 +49,15 @@ enum Root {
     Owned(BufferId),
 }
 
+/// What a debug or test build lays over every byte a plan has not written
+/// yet, so a read of one shows as this pattern, not as plausible zeros. A
+/// release build lays nothing: a plan's fill order is validated
+/// (`validate-fill-order`), and laying it is a pass over every byte of the
+/// arena before the first read (most of a large model's landing).
 const POISON: u8 = 0xAB;
+
+/// Whether this build lays [`POISON`].
+const POISONS: bool = cfg!(debug_assertions);
 
 pub(super) fn run(
     plan: &LoadPlan,
@@ -96,7 +104,9 @@ pub(super) fn run(
             ArenaBacking::len(arena)
         )));
     }
-    arena.fill(0, arena_len, POISON)?;
+    if POISONS {
+        arena.fill(0, arena_len, POISON)?;
+    }
     let last_use = if stream {
         last_uses(plan)?
     } else {
@@ -742,8 +752,10 @@ impl Walk<'_, '_> {
                 StorageInstr::Allocate { buffer, .. } => self.allocate(buffer)?,
                 StorageInstr::Fill { buffer, .. } => self.fill(buffer)?,
                 StorageInstr::ExtentWrite { source, dest, .. } => {
-                    let bytes = self.read_extent(&source)?;
-                    self.write_extent(&dest, &bytes, &source.stride)?;
+                    if !self.read_extent_into(&source, &dest)? {
+                        let bytes = self.read_extent(&source)?;
+                        self.write_extent(&dest, &bytes, &source.stride)?;
+                    }
                 }
                 StorageInstr::BulkExtentWrite {
                     source,
@@ -786,13 +798,7 @@ impl Walk<'_, '_> {
                     self.buffers
                         .insert(output, BufferLoc::View { input, offset, len });
                 }
-                StorageInstr::Finalize { tensor, name, .. } => {
-                    let bytes = self.buffer_bytes(tensor)?.to_vec();
-                    if !self.finalized.insert(name.clone()) {
-                        return Err(invalid(format!("tensor '{name}' was finalized twice")));
-                    }
-                    self.sink.publish(&name, &bytes)?;
-                }
+                StorageInstr::Finalize { tensor, name, .. } => self.finalize(tensor, &name)?,
             }
             if self.stream {
                 self.buffers
@@ -823,7 +829,7 @@ impl Walk<'_, '_> {
             }
             BufferLoc::Arena { offset, len }
         } else {
-            BufferLoc::Owned(vec![POISON; len])
+            BufferLoc::Owned(vec![if POISONS { POISON } else { 0 }; len])
         };
         if self.buffers.insert(id, loc).is_some() {
             return Err(invalid(format!("buffer {} was allocated twice", id.0)));
@@ -867,22 +873,34 @@ impl Walk<'_, '_> {
         len: u64,
         tile_bound: u64,
     ) -> Result<Vec<u8>, Error> {
+        let mut out = vec![0u8; checked_usize(len)?];
+        self.read_file_into(file_id, offset, &mut out, tile_bound)?;
+        Ok(out)
+    }
+
+    /// Reads `out.len()` bytes of file `file_id` at `offset` into `out`.
+    fn read_file_into(
+        &self,
+        file_id: u32,
+        offset: u64,
+        out: &mut [u8],
+        tile_bound: u64,
+    ) -> Result<(), Error> {
         let path = self
             .files
             .get(&file_id)
             .ok_or_else(|| invalid(format!("plan references unknown file id {file_id}")))?;
-        let span = len;
-        let len = checked_usize(len)?;
-        let mut out = vec![0u8; len];
+        let len = out.len();
+        let span = len as u64;
         if let Some(mounted) = ztensor::memfs::len(path) {
-            ztensor::memfs::read(path, offset, &mut out).ok_or_else(|| {
+            ztensor::memfs::read(path, offset, out).ok_or_else(|| {
                 invalid(format!(
                     "read {}: {offset}+{span} is outside its {mounted} mounted bytes{}",
                     path.display(),
                     ztensor::memfs::read_failure(path)
                 ))
             })?;
-            return Ok(out);
+            return Ok(());
         }
         let mut file = File::options()
             .read(true)
@@ -892,11 +910,15 @@ impl Walk<'_, '_> {
 
         #[cfg(unix)]
         {
-            const PARALLEL_READ_MIN: usize = 64 << 20;
+            // A read is split across threads in pieces of at least this:
+            // one thread copies out of the page cache at a few GB/s, below
+            // what the file system serves several at once.
+            const PARALLEL_READ_PIECE: usize = 4 << 20;
             let workers = std::thread::available_parallelism()
                 .map_or(1, std::num::NonZero::get)
-                .min(16);
-            if len >= PARALLEL_READ_MIN && workers > 1 {
+                .min(16)
+                .min(len / PARALLEL_READ_PIECE);
+            if workers > 1 {
                 use std::os::unix::fs::FileExt;
                 let chunk = len.div_ceil(workers);
                 let failures: Vec<std::io::Result<()>> = std::thread::scope(|scope| {
@@ -917,7 +939,7 @@ impl Walk<'_, '_> {
                     failure.map_err(|err| invalid(format!("read {}: {err}", path.display())))?;
                 }
                 self.release_if_spent(&file, path, offset, span);
-                return Ok(out);
+                return Ok(());
             }
         }
 
@@ -933,7 +955,7 @@ impl Walk<'_, '_> {
                 .map_err(|err| invalid(format!("read {}: {err}", path.display())))?;
         }
         self.release_if_spent(&file, path, offset, span);
-        Ok(out)
+        Ok(())
     }
 
     fn release_if_spent(&self, file: &File, path: &Path, offset: u64, len: u64) {
@@ -941,6 +963,70 @@ impl Walk<'_, '_> {
         if ledger.last_read(path, offset, len) {
             crate::consume::release(file, offset, len);
         }
+    }
+
+    /// Publishes tensor `tensor` as `name`. A tensor in a buffer this walk
+    /// owns is handed to the sink where it lies, not copied first.
+    fn finalize(&mut self, tensor: BufferId, name: &str) -> Result<(), Error> {
+        if !self.finalized.insert(name.to_string()) {
+            return Err(invalid(format!("tensor '{name}' was finalized twice")));
+        }
+        let (root, offset, len) = self.resolve(tensor, 0, usize::MAX)?;
+        let Root::Owned(root) = root else {
+            let bytes = self.buffer_bytes(tensor)?.to_vec();
+            self.sink.publish(name, &bytes)?;
+            return Ok(());
+        };
+        let Some(BufferLoc::Owned(bytes)) = self.buffers.remove(&root) else {
+            return Err(invalid("resolved owned buffer is missing"));
+        };
+        let published = match bytes.get(offset..offset + len) {
+            Some(slice) => self.sink.publish(name, slice).map_err(Error::from),
+            None => Err(invalid("owned buffer range is out of bounds")),
+        };
+        self.buffers.insert(root, BufferLoc::Owned(bytes));
+        published
+    }
+
+    /// Reads `source` straight into the bytes of `dest`, where both are
+    /// dense runs and `dest` lies in a buffer this walk owns: no copy of
+    /// the read is made first. False (nothing read) where they are not.
+    fn read_extent_into(&mut self, source: &SourceExtent, dest: &DestExtent) -> Result<bool, Error> {
+        if !source.stride.is_dense() || !dest.stride.has_dense_destination() {
+            return Ok(false);
+        }
+        let mut normalized = source.stride.clone();
+        let base_offset = normalized.base_offset;
+        normalized.base_offset = 0;
+        let physical = physical_source_bytes(&normalized)?;
+        let len = extent_bytes(&dest.stride)?;
+        if physical != len as u64 || extent_bytes(&source.stride)? != len {
+            return Ok(false);
+        }
+        let base = checked_usize(dest.offset)?
+            .checked_add(checked_usize(dest.stride.base_offset)?)
+            .ok_or_else(|| invalid("destination offset overflow"))?;
+        let (root, at, _) = self.resolve(dest.buffer, base, len)?;
+        let Root::Owned(root) = root else {
+            return Ok(false);
+        };
+        let Some(BufferLoc::Owned(mut bytes)) = self.buffers.remove(&root) else {
+            return Err(invalid("resolved owned buffer is missing"));
+        };
+        let read = match bytes.get_mut(at..at + len) {
+            Some(into) => self.read_file_into(
+                source.file_id.0,
+                source
+                    .file_offset
+                    .checked_add(base_offset)
+                    .ok_or_else(|| invalid("source base offset overflow"))?,
+                into,
+                self.plan.target.max_tile_bytes,
+            ),
+            None => Err(invalid("owned buffer write is out of bounds")),
+        };
+        self.buffers.insert(root, BufferLoc::Owned(bytes));
+        read.map(|()| true)
     }
 
     fn write_extent(

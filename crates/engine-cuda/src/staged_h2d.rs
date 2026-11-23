@@ -200,7 +200,7 @@ fn current_device() -> Result<i32> {
 }
 
 #[cfg(feature = "device")]
-fn new_stream() -> Result<*mut c_void> {
+pub(crate) fn new_stream() -> Result<*mut c_void> {
     use crate::device::rt;
 
     let mut stream: rt::cudaStream_t = core::ptr::null_mut();
@@ -210,6 +210,11 @@ fn new_stream() -> Result<*mut c_void> {
         crate::device::ctx::check("cudaStreamCreate", rt::cudaStreamCreate(&raw mut stream))?
     };
     Ok(stream.cast())
+}
+
+#[cfg(not(feature = "device"))]
+pub(crate) fn new_stream() -> Result<*mut c_void> {
+    Err(Fault::Runtimeless)
 }
 
 impl Drop for Lanes {
