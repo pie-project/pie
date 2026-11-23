@@ -17,6 +17,13 @@ fn served(parked: bool) -> (Vec<Vec<f32>>, u64, u64, u64) {
     }
     let mut model = Model::load_with("qwen3-micro-text", None, 256, 7, None);
     clear_knob("HOST_PROGRAMS_MIB");
+    // what the host holds loaded behind serving before the first fire, so
+    // a fire loading a program is one the host held no room for
+    model
+        .engine
+        .shell_mut()
+        .expect("a loaded model has its shell")
+        .wait_loaded();
     let live = model.engine.live();
     let vocab = model.vocab;
     let mut refs = Refs::of(&model);

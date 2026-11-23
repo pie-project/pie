@@ -1,9 +1,11 @@
 //! A traced-fire record whose program file in the disk cache does not load
 //! (here overwritten with bytes no program deserializes from) is not the
-//! load's failure: the record is dropped with the file, its fire traced
-//! again, and its program built and kept again, the load serving the logits
-//! a sound cache gives; the load after takes every record again. Skipped
-//! without a PJRT plugin or a disk cache.
+//! load's failure: loading behind serving finds it and drops the record
+//! with the file, and a fire of its shape traces and builds the program;
+//! the load serves the logits a sound cache gives. The next load traces
+//! that fire, builds and keeps its program and records it, and the load
+//! after takes every record again. Skipped without a PJRT plugin or a disk
+//! cache.
 
 use crate::a_stale_trace_record_is_traced_again::{argmax, served};
 
@@ -51,10 +53,10 @@ fn a_corrupt_recorded_program_is_built_again() {
         mended > 0,
         "the record whose program does not load is mended"
     );
-    let kept = std::fs::read(&file).expect("the program is kept again");
     assert_ne!(
-        kept, corrupt,
-        "the corrupt file is replaced by the built program"
+        std::fs::read(&file).ok(),
+        Some(corrupt.clone()),
+        "the corrupt file is dropped"
     );
     assert_eq!(got.len(), want.len());
     for (step, (g, w)) in got.iter().zip(&want).enumerate() {
@@ -62,10 +64,23 @@ fn a_corrupt_recorded_program_is_built_again() {
         assert_eq!(g, w, "step {step}: a sound cache's logits");
     }
 
-    let (again, (used, hold, mended), _) = served(CONTEXT);
-    assert!(hold && used > 0, "the mended records are taken");
+    // the dropped record's fire traced again: its program built and kept
+    let (again, (_, hold, mended), _) = served(CONTEXT);
+    assert!(hold, "the records hold");
     assert_eq!(mended, 0, "nothing left to mend");
+    let kept = std::fs::read(&file).expect("the program is built and kept again");
+    assert_ne!(
+        kept, corrupt,
+        "the corrupt file is replaced by the built program"
+    );
     for (step, (g, w)) in again.iter().zip(&want).enumerate() {
+        assert_eq!(g, w, "step {step}: a mended cache's logits");
+    }
+
+    let (last, (used, hold, mended), _) = served(CONTEXT);
+    assert!(hold && used > 0, "every record is taken again");
+    assert_eq!(mended, 0, "nothing left to mend");
+    for (step, (g, w)) in last.iter().zip(&want).enumerate() {
         assert_eq!(g, w, "step {step}: a mended cache's logits");
     }
 }

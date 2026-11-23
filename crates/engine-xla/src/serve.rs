@@ -256,6 +256,8 @@ pub(crate) struct Parked {
     code: crate::device::Code,
     sig: crate::trace::Signature,
     probed: Vec<ValueId>,
+    /// The fire's rows: the order programs load behind serving in.
+    rows: u32,
 }
 
 pub(crate) struct Deferred {
@@ -264,6 +266,24 @@ pub(crate) struct Deferred {
     code: crate::device::Code,
     sig: crate::trace::Signature,
     probed: Vec<ValueId>,
+    rows: u32,
+}
+
+/// The cached programs loading behind serving (`Shell::load_behind`): the
+/// loader's thread, stopped and joined before the shell's other fields drop.
+#[derive(Default)]
+pub(crate) struct Behind {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Behind {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 /// What a ladder fire's key traced to, kept for this build's later loads
@@ -275,6 +295,8 @@ struct TraceRecord {
     hash: [u8; 32],
     name: String,
     len: usize,
+    /// What compiling the text takes of the host (`device::compile_need`).
+    need: u64,
     sig: crate::trace::Signature,
     probed: Vec<ValueId>,
 }
@@ -282,6 +304,8 @@ struct TraceRecord {
 /// Fields drop in order: every buffer (weights, pools) goes before the
 /// device whose client made it.
 pub struct Shell {
+    /// First, so it stops before anything it loads into drops.
+    behind: Behind,
     tuning: kernels_xla::tuning::Tuning,
     pad: crate::chip::Pad,
     /// `chip::Engine::seats`.
@@ -362,9 +386,10 @@ pub struct Shell {
     records_hold: bool,
     /// The fires this load took from records, building no text.
     records_used: u64,
-    /// The records whose program would not load from the disk cache: each
-    /// dropped, its fire traced and its program built and kept again.
-    records_mended: u64,
+    /// A fire whose parked program would not load from the disk cache: it
+    /// is traced and built (`Shell::load_parked`), not refused as off the
+    /// ladder.
+    mending: bool,
     /// Programs by the fire shape that traced them: a fire whose shape was
     /// seen skips the walk and runs what the first one compiled.
     traced: std::collections::HashMap<[u8; 32], std::sync::Arc<crate::device::Program>>,
@@ -1213,7 +1238,8 @@ impl Shell {
             record_checked: false,
             records_hold: true,
             records_used: 0,
-            records_mended: 0,
+            mending: false,
+            behind: Behind::default(),
             traced: std::collections::HashMap::new(),
             shaped: std::collections::HashMap::new(),
             parked: std::collections::HashMap::new(),
@@ -1806,12 +1832,21 @@ impl Shell {
             return Ok(None);
         };
         let Some(program) = self.device.load_parked_code(&parked.code, parked.sig)? else {
-            return Err(Fault::Program {
-                at: "serve::ladder",
-                why: "a program the warm ladder parked in the disk cache is gone from it: the \
-                      cache was cleared under the load"
-                    .to_string(),
-            });
+            // Gone from the disk cache, or not loading there: its record
+            // (where one names it) is dropped with the file, and this fire
+            // traces and builds it.
+            if let (Some(scope), crate::device::Code::Cached { name, .. }) =
+                (self.trace_scope.as_deref(), &parked.code)
+            {
+                self.device.mend_record(scope, &at, name);
+            }
+            tracing::warn!(
+                record = %crate::device::hex(&at),
+                "xla parked program does not load from the disk cache: this fire traces and \
+                 builds it"
+            );
+            self.mending = true;
+            return Ok(None);
         };
         self.probed.insert(at, parked.probed);
         self.traced.insert(at, std::sync::Arc::clone(&program));
@@ -3164,18 +3199,6 @@ impl Shell {
         };
         // a miss, which every path below that reads it is, keyed it
         let missed = |key: Option<[u8; 32]>| key.expect("a missed fire's key");
-        // The ladder tracing again after a record's program would not load:
-        // a fire whose program is seated, or parked, is done (nothing runs).
-        if self.deferred.is_some()
-            && (found.is_some()
-                || shape_key.is_some_and(|k| self.parked_shapes.contains_key(&k))
-                || key.is_some_and(|k| self.parked.contains_key(&k)))
-        {
-            return Ok(Fired {
-                rows: vec![Vec::new(); real],
-                ..Fired::default()
-            });
-        }
         if found.is_none() && self.deferred.is_some() {
             // A fire this build traced before, its program on disk: the
             // record names it, and no text is built (a warm load's tracing
@@ -3194,6 +3217,7 @@ impl Shell {
                         hash: r.hash,
                         name: r.name,
                         len: r.len,
+                        need: r.need,
                     };
                     (code, r.sig, r.probed)
                 })
@@ -3243,6 +3267,7 @@ impl Shell {
                             hash: *blake3::hash(text.as_bytes()).as_bytes(),
                             name,
                             len: text.len(),
+                            need: crate::device::compile_need(&text),
                             sig: sig.clone(),
                             probed: probed.clone(),
                         };
@@ -3260,6 +3285,7 @@ impl Shell {
                     code,
                     sig,
                     probed,
+                    rows: descriptor.rows,
                 });
             }
             // A fire returning the readout entries: its row count's readout
@@ -3288,7 +3314,11 @@ impl Shell {
                 // ladder missed, refused by name rather than compiled on the
                 // serving path. (A masked, adapted or media lane's fire is
                 // built and counted.)
-                if self.laddered && self.device.is_sealed() && self.ladder_lays(lanes) {
+                if self.laddered
+                    && self.device.is_sealed()
+                    && self.ladder_lays(lanes)
+                    && !std::mem::take(&mut self.mending)
+                {
                     let lane_rows: Vec<u32> = descriptor.lanes.iter().map(|l| l.rows).collect();
                     return Err(Fault::Program {
                         at: "serve::ladder",
@@ -4828,7 +4858,7 @@ fn normal_exports(trace: &poem_ir::Trace, exports: &[poem_exec::feeds::ClassOutp
 
 /// The version of the traced-fire records' method: a change to what a
 /// record holds or how its scope is made bumps it.
-const TRACE_RECORDS: &str = "xla-traced-fires-1";
+const TRACE_RECORDS: &str = "xla-traced-fires-2";
 
 impl Shell {
     /// The scope a load's traced fires' records lie in: a hash of all a
@@ -4844,7 +4874,11 @@ impl Shell {
     /// traced and built again).
     #[must_use]
     pub fn trace_records(&self) -> (u64, bool, u64) {
-        (self.records_used, self.records_hold, self.records_mended)
+        (
+            self.records_used,
+            self.records_hold,
+            self.device.records_mended(),
+        )
     }
 
     /// The folder this load's traced-fire records lie in, if it keeps any.

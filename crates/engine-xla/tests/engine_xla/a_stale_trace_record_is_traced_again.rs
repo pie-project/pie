@@ -18,6 +18,13 @@ pub(crate) fn served(
     // a context no other test loads at: a scope of the test's own, whose
     // records no other test's load reads while this one makes them stale
     let mut model = Model::load_with("qwen3-micro-text", None, context, 7, None);
+    // the programs loading behind serving, all loaded (a record's that
+    // does not load mended) before the first fire
+    model
+        .engine
+        .shell_mut()
+        .expect("a loaded model has its shell")
+        .wait_loaded();
     let vocab = model.vocab;
     let mut refs = Refs::of(&model);
     let mut seq = Seq::new(0);
