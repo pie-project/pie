@@ -1190,7 +1190,7 @@ What each still times at load or boot, for its owner (paths under `crates/`):
   weigh it (`dense::choose_unrated`). Still open: the Adreno 840's committed profile (`adreno-tm-840`, a
   commented slot in each backend's `SEEDED`) awaits the phone's export.
 
-## F56. The capacity gate does not charge the room a park to disk opens (planner sim, found 2026-11-23)
+## F61. The capacity gate does not charge the room a park to disk opens (planner sim, found 2026-11-23)
 The field mix as it now runs (beam pools bound beside the prefill's instance, frames owing rung raises, two-ended
 pools with the span backed on demand) fails 4 of the 751 seeds without the wide shape: 401 and 645 (liveness: every
 tier full, the finisher a page short), 589 (a victim evicted twice for one head) and 603 (a raise owed to its
