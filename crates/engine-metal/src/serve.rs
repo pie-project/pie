@@ -3692,10 +3692,15 @@ impl Shell {
         // The fire's own rows past the buffer: their ring rows, or own pages.
         let shared = pieces.first().is_some_and(|&[_, cow]| self.ring_shared.contains(&cow));
         let direct = crate::store::windowed::direct_allowed(shared, rows, ring_rows, window);
-        let (own, own_at, own_page) = if direct || u64::from(end) <= held {
+        // Rows of the fire no buffer slot holds: below the buffer's base (the
+        // rows it folds itself) or past its last slot.
+        let outside = have < fold.base || u64::from(end) > held;
+        let (own, own_at, own_page) = if direct || !outside {
             (Vec::new(), Vec::new(), 0)
         } else {
-            let own_page = u32::try_from(held.max(u64::from(have)) / u64::from(page)).unwrap_or(u32::MAX);
+            // From the fire's first row's page: a buffer slot's page reads
+            // the slot first ([`WindowedLane::page_of`]).
+            let own_page = have / page;
             let count = end.div_ceil(page).saturating_sub(own_page);
             let (first, chunks) = self.own_top;
             // This fire's part of the region: one arm's share.
@@ -3761,6 +3766,30 @@ impl Shell {
             })?,
         }
         .min(end.saturating_sub(seated.folded));
+        if std::env::var_os("PIE_WINDOW_TRACE").is_some() {
+            eprintln!(
+                "wtrace slot {} have {have} rows {rows} folded {} advance {advance} base {} \
+                 buffer {:?} own {} at page {own_page} direct {direct} ring {:?} refs {:?} fills {}",
+                seated.lane.slot,
+                seated.folded,
+                fold.base,
+                buffer_refs,
+                own.len(),
+                pieces,
+                ring_refs,
+                by_index.own_fills(seated.folded).len()
+            );
+        }
+        if u64::from(end) > held && u64::from(seated.folded) + u64::from(advance) < u64::from(end) {
+            eprintln!(
+                "windowed: lane in slot {} keeps rows past its buffer unfolded: have {have} rows \
+                 {rows} folded {} advance {advance} base {} buffer {} pages of {page}",
+                seated.lane.slot,
+                seated.folded,
+                fold.base,
+                buffer.len()
+            );
+        }
         if advance > 0 {
             let copies: Vec<(u64, u64, u32, u32)> = by_index
                 .fold_copies(seated.folded, seated.folded + advance)?
@@ -4970,6 +4999,15 @@ impl Shell {
                             "a ring + buffer load with no own-row region for a fold-less lane"
                                 .to_string(),
                         ));
+                    }
+                    if seated.refs {
+                        eprintln!(
+                            "windowed: runtime lane in slot {} (have {have}, rows {}, record {:?}) \
+                             states no fold and no ring: the scratch page",
+                            lane.slot,
+                            row.rows,
+                            seated.record.map(|r| r.len())
+                        );
                     }
                     let (_, id) = self.pools.window_slot_at(k, first + chunks - 1, 0)?;
                     let after = have.saturating_add(row.rows);

@@ -125,7 +125,14 @@ impl WindowedLane<'_> {
             (u64::from(self.own_page) + self.own.len() as u64) * u64::from(page)
         };
         let mut out = Vec::new();
-        let mut row = u64::from(from.max(self.base));
+        // Rows below the buffer's base lie in the ring already, unless the
+        // fire's own pages hold them.
+        let first = if self.own.is_empty() {
+            from.max(self.base)
+        } else {
+            from.max(self.base.min(self.own_page.saturating_mul(page)))
+        };
+        let mut row = u64::from(first);
         let end = u64::from(to).min(held);
         while row < end {
             let n = u32::try_from(row / u64::from(page)).unwrap_or(u32::MAX);
@@ -134,7 +141,9 @@ impl WindowedLane<'_> {
             let rows = u32::try_from(page_end.min(end) - row).unwrap_or(0);
             let source = self.page_of(n)?;
             let ring = self.ring[n as usize % self.ring.len()];
-            out.push((source, ring, in_page, rows));
+            if source != ring {
+                out.push((source, ring, in_page, rows));
+            }
             row += u64::from(rows);
         }
         Ok(out)
@@ -244,6 +253,23 @@ mod tests {
         assert_eq!(
             lane.fold_copies(37, 67).expect("a fold"),
             vec![(900, 102, 5, 11), (901, 103, 0, 16), (902, 100, 0, 3)]
+        );
+    }
+
+    /// A long fire past `R - W + 1` rows whose base is the folded index
+    /// after it: its own pages hold every row it writes below the base too,
+    /// and the fold copies them all into the ring.
+    #[test]
+    fn a_long_fire_folds_its_own_rows_below_the_base() {
+        let ring: Vec<u32> = (100..104).collect();
+        let own = [900u32, 901, 902, 903];
+        // have 2, 62 rows, base 64: own pages for logical pages 0..4.
+        let lane = WindowedLane { page: P, ring: &ring, base: 64, buffer: &[], own: &own, own_page: 0 };
+        assert_eq!(lane.page_of(1).expect("page 1"), 901);
+        assert_eq!(lane.own_fills(2), vec![(100, 900)], "page 0 holds rows folded before the fire");
+        assert_eq!(
+            lane.fold_copies(2, 64).expect("a fold"),
+            vec![(900, 100, 2, 14), (901, 101, 0, 16), (902, 102, 0, 16), (903, 103, 0, 16)]
         );
     }
 
