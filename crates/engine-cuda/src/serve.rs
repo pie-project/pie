@@ -18,6 +18,7 @@ pub fn export_bodies(
 }
 pub use load::Staged;
 mod prepare;
+mod ring;
 mod segments;
 mod settle;
 mod stats;

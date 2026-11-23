@@ -584,6 +584,19 @@ pub fn device_memory() -> Result<(u64, u64)> {
     crate::device::card::memory()
 }
 
+/// A fire's own-row pages (`Pools::own`): `pages` pages laid as
+/// window-buffer slots from `start` bytes past the pool's base, a page id of
+/// the buffer's grain each. Above every carve of the activation's span: the
+/// load's carves are laid `bytes` lower.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnRows {
+    pub start: u64,
+    pub pages: u32,
+    pub page_bytes: u64,
+    pub grain: u64,
+    pub bytes: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Shape {
     Kv {
@@ -676,6 +689,10 @@ impl Seats {
 
 #[derive(Debug)]
 pub struct Pools {
+    /// The pages of a fire's own rows its lane folds past its ring, at the
+    /// activation's top (CONTRACT-BC 19: rows a fire folds itself take no
+    /// window-buffer slot).
+    own: Option<OwnRows>,
     pool: PhysicalPool,
     /// The state pool: the kv rows' pages and the working sets' recurrent
     /// records, a slot each.
@@ -1051,6 +1068,7 @@ impl Pools {
         rows: bool,
         one_window: bool,
         windowed_state: bool,
+        own_rows_tokens: u32,
     ) -> Result<Pools> {
         let pool = PhysicalPool::open(device, ceiling)?;
         let mut layout = lay(
@@ -1065,6 +1083,18 @@ impl Pools {
         if windowed_state {
             ring_record(&mut layout, trace)?;
         }
+        // The pages a fire's own rows take where its lane folds them past
+        // what its ring holds (`OwnRows`): at the activation's top, above
+        // every carve.
+        let own_pages = layout
+            .fixed
+            .as_ref()
+            .and_then(|fixed| fixed.ring.as_ref())
+            .map(|ring| (2 * own_rows_tokens.div_ceil(ring.page_rows) + 1, ring.page_bytes));
+        let grain = layout.windows.first().map_or(1, |window| window.grain.max(1));
+        let own_bytes = own_pages.map_or(0, |(pages, bytes)| u64::from(pages) * bytes + grain);
+        let carved = activation;
+        let activation = activation + own_bytes;
         let mut shapes = Vec::with_capacity(trace.caches.len());
         let mut windows_of: Vec<(u32, u8)> = Vec::new();
 
@@ -1255,7 +1285,16 @@ impl Pools {
             (None, _) => asked,
         };
         let chunks = chunks::Chunks::reserve(&pool, layout, total, activation)?;
+        let own = own_pages.map(|(pages, page_bytes)| OwnRows {
+            start: u64::from(chunks.total()) * chunks.layout().chunk_bytes
+                + carved.next_multiple_of(grain),
+            pages,
+            page_bytes,
+            grain,
+            bytes: own_bytes,
+        });
         Ok(Pools {
+            own,
             pool,
             chunks,
             row_caches: Vec::new(),
@@ -2070,6 +2109,80 @@ impl Pools {
     pub fn ring(&self) -> Option<(&layout::FixedShape, &layout::Ring)> {
         let fixed = self.chunks.layout().fixed.as_ref()?;
         Some((fixed, fixed.ring.as_ref()?))
+    }
+
+    /// The bytes the own-row pages take at the activation's top (none
+    /// where the load keeps no ring): every carve is laid this much lower.
+    #[must_use]
+    pub fn own_rows_bytes(&self) -> u64 {
+        self.own.map_or(0, |own| own.bytes)
+    }
+
+    /// Own-row page `page`'s id, as a window-buffer page.
+    pub fn own_page_id(&self, page: u32) -> Result<i32> {
+        let own = self.own.ok_or_else(|| {
+            Fault::program("store::ring", "an own-row page of a load that keeps no ring")
+        })?;
+        if page >= own.pages {
+            return Err(Fault::Ceiling {
+                what: "own-row pages of a fire that folds its rows past its ring",
+                need: u64::from(page) + 1,
+                have: u64::from(own.pages),
+            });
+        }
+        let q = (own.start + u64::from(page) * own.page_bytes) / own.grain;
+        i32::try_from(q).map_err(|_| Fault::Ceiling {
+            what: "page ids of the state pool",
+            need: q,
+            have: i32::MAX as u64,
+        })
+    }
+
+    /// Own-row page `page`'s address.
+    pub fn own_page_at(&self, page: u32) -> Result<u64> {
+        let own = self.own.ok_or_else(|| {
+            Fault::program("store::ring", "an own-row page of a load that keeps no ring")
+        })?;
+        Ok(self.chunks.base() + own.start + u64::from(page) * own.page_bytes)
+    }
+
+    /// The ring pages of the record `key` names, in ring order, by the ids
+    /// a kernel reads a window-buffer page by, and their addresses; the
+    /// record seated and backed.
+    pub fn ring_pages(&mut self, key: u32) -> Result<Vec<(i32, u64)>> {
+        let slots = self.ensure_record(key)?;
+        let (fixed, ring) = self.ring().ok_or_else(|| {
+            Fault::program("store::ring", "ring pages of a load that keeps no ring")
+        })?;
+        let fixed_grain = fixed.slot.grain.max(1);
+        let (pages, page_bytes) = (ring.pages, ring.page_bytes);
+        let places: Vec<(u32, u32)> = (0..pages).map(|page| ring.place(page)).collect();
+        let grain = self
+            .chunks
+            .layout()
+            .windows
+            .first()
+            .map_or(1, |window| window.grain.max(1));
+        let mut out = Vec::with_capacity(pages as usize);
+        for (piece, within) in places {
+            let slot = *slots.get(piece as usize).ok_or_else(|| {
+                Fault::program("store::ring", "a ring page past its record's pieces")
+            })?;
+            let offset = u64::try_from(self.chunks.page_id(Kind::Fixed, slot)?)
+                .unwrap_or(0)
+                * fixed_grain
+                + u64::from(within) * page_bytes;
+            let q = offset / grain;
+            out.push((
+                i32::try_from(q).map_err(|_| Fault::Ceiling {
+                    what: "page ids of the state pool",
+                    need: q,
+                    have: i32::MAX as u64,
+                })?,
+                self.chunks.base() + offset,
+            ));
+        }
+        Ok(out)
     }
 
     /// The bytes a record takes: its recurrent rows' and its rings'.
@@ -5667,6 +5780,7 @@ mod tests {
                     pieces: 2,
                     rows: Vec::new(),
                     tables: Vec::new(),
+                    ring: None,
                 }),
                 rs: None,
                 instance: shape(layout::INSTANCE, 0, layout::INSTANCE_SLOT),

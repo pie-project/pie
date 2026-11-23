@@ -24,6 +24,10 @@ pub struct Arena {
     /// (`window::lane_capacity`), so its carve is the smallest rung's that
     /// holds that many lanes. 0 where fires carve for their own lanes.
     lane_reach: u32,
+    /// The bytes kept at the reservation's end above every carve: a load
+    /// that keeps rings lays its fires' own-row pages there
+    /// (`store::OwnRows`).
+    top: u64,
 }
 
 impl Arena {
@@ -36,7 +40,15 @@ impl Arena {
             reserved: bytes,
             rungs: Vec::new(),
             lane_reach: 0,
+            top: 0,
         }
+    }
+
+    /// With `bytes` of the reservation's end kept above every carve.
+    #[must_use]
+    pub fn keeping_top(mut self, bytes: u64) -> Arena {
+        self.top = bytes;
+        self
     }
 
     /// Every fire of this load carves for `lanes` lanes at least: what the
@@ -50,7 +62,7 @@ impl Arena {
     /// reservation's end ([`Arena::fire_slots`]).
     #[must_use]
     pub fn with_rungs(mut self, mut rungs: Vec<(u32, ArenaMap)>) -> Arena {
-        rungs.retain(|(_, map)| map.bytes <= self.reserved);
+        rungs.retain(|(_, map)| map.bytes + self.top <= self.reserved);
         rungs.sort_by_key(|&(tokens, _)| tokens);
         self.rungs = rungs;
         self
@@ -80,8 +92,8 @@ impl Arena {
                     .rungs
                     .iter()
                     .find(|(rung, _)| rung >= tokens && *rung >= self.lane_reach)
-                    .map_or(self.reserved, |(_, map)| map.bytes);
-                let bytes = carve.max(forked.map_or(0, |forked| forked.bytes));
+                    .map_or(self.reserved - self.top, |(_, map)| map.bytes);
+                let bytes = carve.max(forked.map_or(0, |forked| forked.bytes)) + self.top;
                 (
                     *tokens,
                     self.reserved.saturating_sub(bytes).min(self.committed),
@@ -128,8 +140,8 @@ impl Arena {
             .find(|(rung, _)| {
                 u64::from(*rung) >= tokens && u64::from(*rung) >= lanes && *rung >= self.lane_reach
             })
-            .map_or(self.reserved, |(_, map)| map.bytes);
-        carve.max(forked.map_or(0, |forked| forked.bytes))
+            .map_or(self.reserved - self.top, |(_, map)| map.bytes);
+        carve.max(forked.map_or(0, |forked| forked.bytes)) + self.top
     }
 
     /// No smaller rung: every fire's arena at the span's start.
@@ -194,7 +206,8 @@ impl Arena {
                 })
                 .map_or(map, |(_, rung)| rung)
         };
-        let base = pools.activation_base() + self.reserved.saturating_sub(chosen.bytes);
+        let base =
+            pools.activation_base() + self.reserved.saturating_sub(self.top + chosen.bytes);
         carve(base, chosen, rows)
     }
 
