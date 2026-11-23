@@ -1529,29 +1529,35 @@ template <typename T, int SG, int VROWS>
   threadgroup float kn_s[kVerifyChunk][D];
   threadgroup float u_s[kVerifyChunk][SG * VROWS];
   threadgroup float g_s[kVerifyChunk];
+  threadgroup float rinv_s[kVerifyChunk];
+  threadgroup ulong k_at_s[kVerifyChunk];
+  threadgroup ulong u_at_s[kVerifyChunk];
+  // Each row's place first, once a row (its page's word, its token in
+  // the page): the elements then load from it, with no page walk an element.
+  for (int t = tid; t < rep; t += SG * 32) {
+    device uchar* krow = gdn_buffered_row(key_slab, pages, t, page_tokens, page_bytes, key_row_bytes);
+    const device float* srow = reinterpret_cast<const device float*>(
+        gdn_buffered_row(scalar_slab, pages, t, page_tokens, page_bytes, scalar_row_bytes));
+    k_at_s[t] = ulong(krow - key_slab);
+    u_at_s[t] = ulong(gdn_buffered_row(u_slab, pages, t, page_tokens, page_bytes, u_row_bytes) - u_slab);
+    rinv_s[t] = srow[vh + size_t(hv)];
+    g_s[t] = metal::exp(srow[hv]);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
   {
     const int tg_rows = SG * VROWS;
     const int tg_base = int(group.y) * tg_rows;
     for (int e = tid; e < rep * D; e += SG * 32) {
       const int t = e / D;
       const int d = e % D;
-      const device T* krow = reinterpret_cast<const device T*>(
-          gdn_buffered_row(key_slab, pages, t, page_tokens, page_bytes, key_row_bytes));
-      const device float* srow = reinterpret_cast<const device float*>(
-          gdn_buffered_row(scalar_slab, pages, t, page_tokens, page_bytes, scalar_row_bytes));
-      kn_s[t][d] = float(krow[size_t(hk) * D + size_t(d)]) * srow[vh + size_t(hv)];
+      const device T* krow = reinterpret_cast<const device T*>(key_slab + k_at_s[t]);
+      kn_s[t][d] = float(krow[size_t(hk) * D + size_t(d)]) * rinv_s[t];
     }
     for (int e = tid; e < rep * tg_rows; e += SG * 32) {
       const int t = e / tg_rows;
       const int c = e % tg_rows;
-      const device float* urow = reinterpret_cast<const device float*>(
-          gdn_buffered_row(u_slab, pages, t, page_tokens, page_bytes, u_row_bytes));
+      const device float* urow = reinterpret_cast<const device float*>(u_slab + u_at_s[t]);
       u_s[t][c] = urow[size_t(hv) * D + size_t(tg_base + c)];
-    }
-    for (int t = tid; t < rep; t += SG * 32) {
-      const device float* srow = reinterpret_cast<const device float*>(
-          gdn_buffered_row(scalar_slab, pages, t, page_tokens, page_bytes, scalar_row_bytes));
-      g_s[t] = metal::exp(srow[hv]);
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
