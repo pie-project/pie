@@ -618,15 +618,6 @@ pub enum SharedError {
         kind: &'static str,
         shapes: Vec<u32>,
     },
-    /// A load buffering both recurrent rows (an rs list) and windowed
-    /// layers' rows (a window buffer): the rs store keeps one buffer a set
-    /// today, so such a hybrid is refused by name.
-    #[error(
-        "shapes {rs_list} (the rs list) and {window_buffer} (the window buffer): a load whose \
-         recurrent and windowed layers both buffer unfolded rows is not served yet; the rs store \
-         keeps one buffer a working set"
-    )]
-    TwoBuffers { rs_list: u32, window_buffer: u32 },
 }
 
 /// A shared pool's chunks as they divide for good ([`SharedPool::room`]).
@@ -1127,12 +1118,6 @@ impl SharedPool {
                 });
             }
         }
-        if let (Some(rs), Some(window)) = (rs_lists.first(), window_buffers.first()) {
-            return Err(SharedError::TwoBuffers {
-                rs_list: rs.id.0,
-                window_buffer: window.id.0,
-            });
-        }
         windows.sort_by_key(|shape: &TokenShape| shape.window);
         if windows.len() > crate::store::rs::MAX_WINDOW_LISTS {
             return Err(SharedError::Shapes {
@@ -1253,9 +1238,10 @@ impl SharedPool {
         self.window_buffer
     }
 
-    /// The list a working set's unfolded rows are buffered in, the rs
-    /// store's buffer pages: the rs list, or the window buffer (a load
-    /// states one of them at most).
+    /// The list the rs store's buffer pages are slots of: the rs list, or,
+    /// on a load of windowed layers and no recurrent ones, the window
+    /// buffer. A hybrid's window buffer is a pool of its own beside it
+    /// ([`crate::store::rs::RsUnits::wbuf`]).
     #[must_use]
     pub fn buffer_list(&self) -> Option<TokenShape> {
         self.rs_list.or(self.window_buffer)
@@ -1317,7 +1303,10 @@ impl SharedPool {
                 takes.push((window.pool, u64::from(n)));
             }
         } else if let Some(rs_list) = self.buffer_list() {
-            takes.push((rs_list.pool, u64::from(rs.pages)));
+            takes.push((rs_list.pool, u64::from(rs.pages.saturating_sub(rs.wbuf))));
+            if let Some(window) = self.rs_list.and(self.window_buffer) {
+                takes.push((window.pool, u64::from(rs.wbuf)));
+            }
         }
         for shape in &self.fixed {
             takes.push((shape.pool, u64::from(rs.slots) * u64::from(shape.pieces)));
@@ -1349,7 +1338,10 @@ impl SharedPool {
                 wanted += chunks(window.pool, u64::from(n));
             }
         } else if let Some(rs_list) = self.buffer_list() {
-            wanted += chunks(rs_list.pool, u64::from(rs.pages));
+            wanted += chunks(rs_list.pool, u64::from(rs.pages.saturating_sub(rs.wbuf)));
+            if let Some(window) = self.rs_list.and(self.window_buffer) {
+                wanted += chunks(window.pool, u64::from(rs.wbuf));
+            }
         }
         for shape in &self.fixed {
             wanted += chunks(shape.pool, u64::from(rs.slots) * u64::from(shape.pieces));
@@ -1520,7 +1512,7 @@ impl SharedPool {
             .sum();
         // The rs list's or the window buffer's slot of rows a fire leaves
         // unfolded; a windowed layer's ring rides in the record.
-        let rs = u64::from(self.buffer_list().is_some());
+        let rs = u64::from(self.rs_list.is_some()) + u64::from(self.window_buffer.is_some());
         u32::try_from(list + windows + rs + self.record_chunks(1)).unwrap_or(u32::MAX)
     }
 

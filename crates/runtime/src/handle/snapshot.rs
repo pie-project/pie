@@ -194,6 +194,12 @@ struct SavedState {
     /// unfolded slots, saved as a recurrent state's are; no window table.
     #[serde(default)]
     window_state: bool,
+    /// A hybrid's window-buffer table (CONTRACT-BC 19, 21), beside the rs
+    /// list's `buffer`, its slots' bytes after the buffer's, and its base.
+    #[serde(default)]
+    window_buffer: Vec<bool>,
+    #[serde(default)]
+    window_base: u32,
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -446,7 +452,12 @@ async fn read_state(
     // removed by the windowed-state change). A ring + buffer set's buffer is
     // its window buffer's unfolded slots, its rings in its record.
     let table = set.windows.first().unwrap_or(&set.buffer);
-    let pages: Vec<RsSlotId> = table.iter().flatten().copied().collect();
+    let pages: Vec<RsSlotId> = table
+        .iter()
+        .chain(&set.wbuffer)
+        .flatten()
+        .copied()
+        .collect();
     let shared = stores.rs.lock().unwrap().is_shared();
     let bytes = if shared {
         read_tier_state(engine, &stores, &held, &pages).await?
@@ -483,6 +494,8 @@ async fn read_state(
             window: set.window,
             window_tokens: crate::model::model().rs_caps().window_tokens,
             window_state: crate::model::model().rs_caps().window_state,
+            window_buffer: set.wbuffer.iter().map(Option::is_some).collect(),
+            window_base: set.wbase,
         },
         bytes,
     ))
@@ -1077,10 +1090,11 @@ async fn load_state(
     }
     let slots = usize::from(saved.folded);
     let pages = saved.buffer.iter().filter(|&&page| page).count();
+    let wpages = saved.window_buffer.iter().filter(|&&page| page).count();
     let (rows, ids) = {
         let mut store = stores.rs.lock().unwrap();
         let rows = store
-            .take_host(slots, pages)
+            .take_host_of(slots, pages, wpages)
             .ok_or_else(|| HandleError::quota("the host has no room for this recurrent state"))?;
         let ids: Vec<u32> = rows.iter().map(|&id| store.engine_id(id)).collect();
         (rows, ids)
@@ -1114,6 +1128,11 @@ async fn load_state(
         .iter()
         .map(|&page| page.then(|| buffered.next().expect("counted above")))
         .collect();
+    let wbuffer: Vec<Option<RsSlotId>> = saved
+        .window_buffer
+        .iter()
+        .map(|&page| page.then(|| buffered.next().expect("counted above")))
+        .collect();
     let windowed = saved.window.is_some();
     let set = RsExport {
         folded: saved.folded.then(|| rows[0]),
@@ -1122,6 +1141,8 @@ async fn load_state(
         frozen: saved.frozen,
         windows: if windowed { vec![table] } else { Vec::new() },
         window: saved.window,
+        wbuffer,
+        wbase: saved.window_base,
     };
     let id = store.import(geom, set);
     Ok(RsWorkingSet::new(0, engine, id, geom))

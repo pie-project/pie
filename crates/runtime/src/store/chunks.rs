@@ -786,14 +786,19 @@ impl StorePools {
                 // the rs store's, not the kv page size.
                 // The window buffer (CONTRACT-BC 21) is the rs store's
                 // buffer as the rs list is: a load states one of them.
-                SlotKind::List { .. }
-                    if matches!(
-                        shape.role,
-                        ::engine::chunk::SlotRole::RsBuffer
-                            | ::engine::chunk::SlotRole::WindowBuffer
-                    ) =>
-                {
+                SlotKind::List { .. } if shape.role == ::engine::chunk::SlotRole::RsBuffer => {
                     pools.buffer = run;
+                }
+                // A hybrid's window buffer is a pool beside its rs list,
+                // which stays the buffer here.
+                SlotKind::List { .. } if shape.role == ::engine::chunk::SlotRole::WindowBuffer => {
+                    if !facts
+                        .shapes
+                        .iter()
+                        .any(|s| s.role == ::engine::chunk::SlotRole::RsBuffer)
+                    {
+                        pools.buffer = run;
+                    }
                 }
                 SlotKind::List {
                     tokens,

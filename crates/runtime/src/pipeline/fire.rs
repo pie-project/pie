@@ -801,6 +801,20 @@ fn lanes_frozen(
     Ok(frozen)
 }
 
+/// Whether the load's only state is windowed layers served as ring +
+/// buffer (`window_state`, no recurrent layer): its lanes replay nothing,
+/// their unfolded rows going to window-buffer slots on demand, so a pass
+/// of several lanes is cut as one of kv lanes is (CONTRACT-BC 19: a fire
+/// too wide is cut like chunked prefill, never refused). A hybrid's
+/// recurrent layers keep their bound: its lanes are cut as an rs load's.
+pub(crate) fn window_only(stores: &crate::store::registry::Stores, window_state: bool) -> bool {
+    window_state
+        && stores
+            .shared
+            .as_ref()
+            .is_some_and(|shared| shared.lock().unwrap().rs_list().is_none())
+}
+
 /// The rows of one piece of a host pass: each lane's cut of `full`, over a
 /// state folded through `frozen` when the pass began. A pass that folds
 /// all it writes folds piece by piece (a fold lands as its fire is
@@ -1419,7 +1433,7 @@ fn rows_of_lanes(
 
 /// Several lanes are cut alike and aligned at their ends, so the last piece
 /// holds every lane's read-out rows.
-fn pass_pieces(
+pub(crate) fn pass_pieces(
     req: &crate::engine::FireRequest,
     cuttable: bool,
     lanes_cuttable: bool,
@@ -4116,6 +4130,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
         let window_state = crate::model::model().rs_caps().window_state;
         let auto = state.is_some()
             && (window_state || (windowed && stores.rs.lock().unwrap().is_window()));
+        let window_only = window_only(&stores, window_state);
         let checkpoints: Vec<u64> = match state {
             Some(_) => checkpoint_rows(
                 &ctx.resources().get(&fwd)?.bindings.checkpoints,
@@ -4194,7 +4209,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
         let mut cuts = pass_pieces(
             &full,
             cuttable,
-            rs_ws_ids.is_empty(),
+            rs_ws_ids.is_empty() || window_only,
             mask_share(&full, prefill_share(page_size, engine), &stores, engine),
             page_size,
             &forced,
@@ -4272,7 +4287,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             if !folds_all {
                 why.push("it states where its recurrent state folds");
             }
-            if full.lanes.len() > 1 && !rs_ws_ids.is_empty() {
+            if full.lanes.len() > 1 && !rs_ws_ids.is_empty() && !window_only {
                 why.push("its lanes carry recurrent state");
             }
             if why.is_empty() {
@@ -4481,17 +4496,30 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 .iter()
                 .map(|&group| (&group_sets[group], Written::Span(spans[group].1.clone())))
                 .collect();
+            // The piece's lanes' recurrent states, in the piece's lane
+            // order: a cut of several lanes (a windowed-only load's) keeps
+            // only those with rows in it.
+            let piece_rs_ids: Vec<crate::store::rs::RsWorkingSetId> = if rs_ws_ids.is_empty() {
+                Vec::new()
+            } else {
+                kept_lanes.iter().map(|&lane| rs_ws_ids[lane]).collect()
+            };
+            let piece_rs_groups: LaneGroups = piece_groups
+                .iter()
+                .filter(|(_, lanes)| !lanes.is_empty())
+                .cloned()
+                .collect();
             // The lanes each set carries, for what their state asks alone.
             let set_lanes: Vec<Vec<usize>> = if rs_ws_ids.is_empty() {
                 Vec::new()
             } else {
-                present.iter().map(|&group| groups[group].1.clone()).collect()
+                present.iter().map(|&group| piece_groups[group].1.clone()).collect()
             };
             let rs_plan = || {
                 if windowed {
-                    host_window_plan(&req, &fold, &rs_ws_ids, keep)
+                    host_window_plan(&req, &fold, &piece_rs_ids, keep)
                 } else {
-                    host_rs_plan(&stores, &rs_ws_ids, &groups, &req, &fold, &inside)
+                    host_rs_plan(&stores, &piece_rs_ids, &piece_rs_groups, &req, &fold, &inside)
                 }
             };
             let reserved = reserve(
@@ -4502,7 +4530,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 &pipeline_failure,
                 &sets,
                 &set_lanes,
-                &rs_ws_ids,
+                &piece_rs_ids,
                 rs_plan,
                 windowed,
             )
