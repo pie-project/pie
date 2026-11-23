@@ -906,6 +906,12 @@ pub trait PoolPort: Send + Sync + 'static {
     fn state_chunks_most(&self) -> u32 {
         u32::MAX
     }
+    /// The longest run of adjacent chunks any arrangement of the pool lays
+    /// for state ([`crate::store::slots::SlotPool::longest_run_most`]);
+    /// `u32::MAX` where the pool keeps no chunks.
+    fn longest_run_most(&self) -> u32 {
+        u32::MAX
+    }
     /// Every tier's room and what is held in it, in one unit, kv pages,
     /// read now ([`CapacityCensus`]): what the capacity gate is read from
     /// ([`super::inner::CapacityGate`]). `None` where the pool keeps no
@@ -1418,6 +1424,12 @@ impl PoolPort for RegistryPool {
         crate::store::registry::try_get(self.model, self.engine)
             .and_then(|stores| stores.shared)
             .map_or(u32::MAX, |shared| shared.lock().unwrap().state_chunks_most())
+    }
+
+    fn longest_run_most(&self) -> u32 {
+        crate::store::registry::try_get(self.model, self.engine)
+            .and_then(|stores| stores.shared)
+            .map_or(u32::MAX, |shared| shared.lock().unwrap().pool().longest_run_most())
     }
 
     fn capacity_census(&self) -> Option<CapacityCensus> {

@@ -3781,3 +3781,114 @@ fn replay_one_simulated_seed() {
         failures.len()
     );
 }
+
+/// A pool of `total` chunks in segments of `segment`, a bind of `run`
+/// adjacent chunks arriving once the decoders around it have scattered
+/// their pages over the pool ([`a_run_the_pool_can_open_is_opened`]).
+fn run_need_workload(seed: u64, total: u32, segment: u32, run: u32, governed: bool) -> Workload {
+    let mut rng = Rng(seed ^ 0x52_4e_ed);
+    let pool = PoolShape {
+        total,
+        segment,
+        host_chunks: 0,
+        disk_chunks: 64,
+        programs: vec![
+            Program {
+                run: 1,
+                scratch: 393_216,
+                resident: 0,
+                per_pair: 0,
+            },
+            Program {
+                run,
+                scratch: u64::from(run) * MIB,
+                resident: 0,
+                per_pair: 0,
+            },
+        ],
+        governed,
+        span_on_demand: false,
+    };
+    let most = pool.most_pages();
+    // Decoders of every length, each ending at its own step: the chunks
+    // they give back lie scattered among those still held.
+    let mut scripts: Vec<Script> = (0..14)
+        .map(|_| Script {
+            at: rng.range(0, 6),
+            prompt: rng.range(1, 3),
+            decode: rng.range(6, 80),
+            grow_every: rng.range(1, 2),
+            beams: 1,
+            bind: Vec::new(),
+            idle: None,
+            rescore: None,
+            raise: None,
+        })
+        .collect();
+    for script in &mut scripts {
+        while script.pages() > most && script.decode > 0 {
+            script.decode -= 1;
+        }
+    }
+    scripts.push(Script {
+        at: rng.range(10, 30),
+        prompt: 1,
+        decode: 4,
+        grow_every: 4,
+        beams: 1,
+        bind: vec![(1, false)],
+        idle: None,
+        rescore: None,
+        raise: None,
+    });
+    Workload {
+        seed,
+        pool,
+        scripts,
+        tier_full: Vec::new(),
+        late: 0,
+        target: Vec::new(),
+        ring: None,
+        landing_fails: None,
+    }
+}
+
+/// A bind of a run of five adjacent chunks, the pool's free chunks enough
+/// for it but scattered under decoders' pages (the M5 at beam w32: a
+/// restore of three runs of 57 with 99 chunks free and no run of 57, the
+/// planner finding no step 0.5 M times): the run is opened, by moves the
+/// pool makes, and every process ends.
+#[test]
+fn a_run_the_pool_can_open_is_opened() {
+    let mut waited = 0;
+    for seed in 0..40 {
+        for governed in [false, true] {
+            let (failures, coverage) = run(&run_need_workload(seed, 18, 6, 5, governed), None);
+            for failure in &failures {
+                eprintln!(
+                    "SIM run need seed {seed} (governed {governed}) step {}: [{}] {}",
+                    failure.step, failure.kind, failure.line
+                );
+            }
+            assert!(failures.is_empty(), "seed {seed} governed {governed}: {} failures", failures.len());
+            waited += coverage.bind_waits;
+        }
+    }
+    assert!(waited > 0, "no run waited for room: the shape scatters nothing");
+}
+
+/// A bind of a run of seven adjacent chunks in a pool of segments of six:
+/// a run lies inside one segment, so no arrangement of the pool ever
+/// opens it. It is refused by name, at once, and nothing waits on it.
+#[test]
+fn a_run_no_arrangement_opens_is_refused_by_name() {
+    let (failures, _) = run(&run_need_workload(0, 18, 6, 7, false), None);
+    for failure in &failures {
+        eprintln!("SIM run past a segment step {}: [{}] {}", failure.step, failure.kind, failure.line);
+    }
+    assert!(
+        failures.iter().all(|failure| failure.kind == "refused" && failure.line.contains("never")),
+        "only its refusal, by name: {failures:?}"
+    );
+    assert!(failures.iter().any(|failure| failure.kind == "refused"), "refused");
+}

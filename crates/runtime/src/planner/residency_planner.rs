@@ -654,6 +654,17 @@ impl ResidencyPlanner {
                 runs: room.longest(),
             });
         }
+        // A run longer than any segment lays for state is never laid,
+        // whatever moves: refused by name, never waited on (the M5 at beam
+        // w32: a restore of runs of 57 chunks, the planner finding no step
+        // 0.5 M times).
+        let longest = self.port.longest_run_most();
+        if longest != u32::MAX
+            && let Some(room) = self.head_room_within(key, false)
+            && let Some(&(run, _)) = room.entries().iter().find(|&&(run, _)| run > longest)
+        {
+            return Some(super::PlannerError::RunPastPool { run, longest });
+        }
         let (need, runs) = self.with_inner(|inner| {
             let waiter = inner.queue.get(&key)?;
             let runs = match waiter.kind {

@@ -577,10 +577,20 @@ impl ResidencyPlanner {
             let kv_missing = waiter.kv_need().saturating_sub(inner.accum.len() as u32);
             let again = inner.stall_dumped.is_some_and(|(at, seen, _)| (at, seen) == (key, gives));
             inner.stall_dumped = Some((key, gives, crate::rt::Instant::now()));
+            // Said once a stall episode (the head stuck, whatever room moves
+            // meanwhile), and again only as a stall that goes on: said on
+            // each change of room, the M5 at beam w32 said it 0.5 M times
+            // in 13 minutes as gathered pages came and went.
+            let say = !inner
+                .stall_said
+                .is_some_and(|(at, said)| at == key && said.elapsed() < STALL_SAYS_AGAIN);
+            if say {
+                inner.stall_said = Some((key, crate::rt::Instant::now()));
+            }
             let (plan, blocked) = inner.plan_fields(key);
-            Some((key, pid, kind, pids, again, refusal, kv_missing, plan, blocked, refused_run))
+            Some((key, pid, kind, pids, again, refusal, kv_missing, plan, blocked, refused_run, say))
         });
-        let Some((key, pid, kind, pids, again, refusal, kv_missing, plan, blocked, refused_run)) =
+        let Some((key, pid, kind, pids, again, refusal, kv_missing, plan, blocked, refused_run, say)) =
             stalled
         else {
             return;
@@ -626,6 +636,7 @@ impl ResidencyPlanner {
         // Every head queued fits the pool alone (one past it is refused at
         // its ask): unserved with nothing in flight, the planner found no
         // step for room that is there, which is its bug, never a wait.
+        if say {
         tracing::error!(
             ?key,
             %pid,
@@ -661,6 +672,16 @@ impl ResidencyPlanner {
             pool = %census,
             "planner: the queue's head fits the pool alone and is unserved with nothing in \
              flight (a planner bug: no step found)"
+        );
+        }
+        // A planner bug, never the head's: it waits on the next room, rung
+        // or arrival event, never refused (only a need past the pool alone
+        // is), and a debug build stops on it by name. The simulation's
+        // progress invariant fails a run on it instead.
+        assert!(
+            !cfg!(all(debug_assertions, not(test))),
+            "planner bug: the queue's head {pid} ({kind}) fits the pool alone and is unserved \
+             with nothing in flight, no step found: {plan}"
         );
         // The progress invariant: a settled pass leaves every waiting head
         // served or something in flight that moves the generation. Broken,

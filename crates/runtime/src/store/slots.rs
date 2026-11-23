@@ -1204,6 +1204,22 @@ impl SlotPool {
         self.act_max
     }
 
+    /// The longest run of adjacent chunks any arrangement of the pool lays
+    /// for state: inside one segment, past the reserved chunks, below the
+    /// narrowest rung's activation. A run longer is never laid, whatever
+    /// moves.
+    #[must_use]
+    pub fn longest_run_most(&self) -> u32 {
+        let limit = self.total.saturating_sub(self.act_chunks(0));
+        (0..self.segments.count())
+            .map(|segment| {
+                let range = self.segments.range(segment);
+                range.end.min(limit).saturating_sub(range.start.max(self.reserved))
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Held state chunks lying where the engine's state pool does not
     /// hold them under the rung in force, `(logical, physical)`: at or past
     /// the current rung's activation (the carve the activation writes), or
@@ -1493,14 +1509,19 @@ impl SlotPool {
         }
         let kept: HashSet<u32> = standing.iter().flat_map(|&first| first..first + run).collect();
         let free_here = |chunk: u32| self.open.get(chunk) && !kept.contains(&chunk);
-        let in_runs: HashSet<u32> = self
-            .runs
-            .iter()
-            .flat_map(|(&first, &len)| {
-                let at = self.logical_to_physical[first as usize];
-                at..at + len
-            })
-            .collect();
+        // Each run's chunks by physical chunk, its first and its length: a
+        // run moves whole, to a free run of its length outside the window
+        // ([`Self::moves_keeping_runs`]). Held as unmovable, a pool of runs
+        // laid side by side opened no window for another: a restore of
+        // three runs of 57 chunks with 99 chunks free waited for good (the
+        // M5 at beam w32, its planner finding no step 0.5 M times).
+        let mut member_of: HashMap<u32, (u32, u32)> = HashMap::new();
+        for (&head, &len) in &self.runs {
+            let at = self.logical_to_physical[head as usize];
+            for k in 0..len {
+                member_of.insert(at + k, (at, len));
+            }
+        }
         // Never a chunk a residency move's copy still reads (an eviction's,
         // parked state's moving down): moved under it, the copy read a chunk
         // handed on. Reserved chunks are free and closed: neither a source
@@ -1508,13 +1529,14 @@ impl SlotPool {
         let movable = |chunk: u32| {
             chunk >= self.reserved
                 && !self.free.get(chunk)
-                && !in_runs.contains(&chunk)
                 && !self.moving_out.contains_key(&chunk)
                 && self.chunks[self.physical_to_logical[chunk as usize] as usize].shape != NO_SHAPE
+                && member_of.get(&chunk).is_none_or(|&(at, len)| {
+                    (at..at + len).all(|member| !self.moving_out.contains_key(&member))
+                })
         };
         let limit = self.state_limit().min(self.ceiling);
-        let open = self.open.iter_in(0, limit).filter(|&chunk| free_here(chunk)).count() as u32;
-        let mut best: Option<(u32, u32)> = None;
+        let mut windows: Vec<(u32, u32)> = Vec::new();
         for segment in 0..self.segments.count() {
             if self.segments.state(segment) != SegmentState::Committed {
                 continue;
@@ -1544,31 +1566,32 @@ impl SlotPool {
                     start = chunk + 1;
                     continue;
                 }
-                let outside = open - (run - held);
-                if outside >= held && best.is_none_or(|(fewest, _)| held < fewest) {
-                    best = Some((held, start));
-                }
+                windows.push((held, start));
                 start += 1;
             }
         }
-        let (_, start) = best?;
-        let window = start..start + run;
-        let mut targets = self
-            .open
-            .iter_in(0, limit)
-            .filter(|&chunk| free_here(chunk) && !window.contains(&chunk));
-        let moves = window
-            .clone()
-            .filter(|&chunk| !self.open.get(chunk))
-            .map(|from| {
-                targets.next().map(|to| ChunkMove {
-                    logical: self.physical_to_logical[from as usize],
-                    from,
-                    to,
-                })
-            })
-            .collect::<Option<Vec<_>>>()?;
-        Some(moves)
+        // The window that moves fewest first, each tried in turn: the first
+        // whose holders (each run among them whole) find room outside it.
+        windows.sort_unstable();
+        windows.into_iter().find_map(|(_, start)| {
+            let window = start..start + run;
+            let mut sources: BTreeSet<u32> = BTreeSet::new();
+            for chunk in window.clone().filter(|&chunk| !self.open.get(chunk)) {
+                match member_of.get(&chunk) {
+                    Some(&(at, len)) => sources.extend(at..at + len),
+                    None => {
+                        sources.insert(chunk);
+                    }
+                }
+            }
+            let targets: BTreeSet<u32> = self
+                .open
+                .iter_in(0, limit)
+                .filter(|&chunk| free_here(chunk) && !window.contains(&chunk))
+                .collect();
+            let sources: Vec<u32> = sources.into_iter().collect();
+            self.moves_keeping_runs(&sources, targets, false)
+        })
     }
 
     /// Carries out `moves` ([`Self::plan_compaction`]'s), which the fire at

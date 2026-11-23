@@ -50,6 +50,9 @@ pub(super) struct Inner {
     /// dump per head and room change, and again each
     /// [`super::plan::STALL_SAYS_AGAIN`] while it stays unserved.
     pub(super) stall_dumped: Option<(super::wait::EntryKey, u64, crate::rt::Instant)>,
+    /// The head whose stall was last said, and when: said once a stall
+    /// episode, whatever room moves meanwhile.
+    pub(super) stall_said: Option<(super::wait::EntryKey, crate::rt::Instant)>,
     /// The room a pass last planned a quiet head on (nothing in flight):
     /// the head and the pool's counts ([`super::ResidencyPlanner::tick`]).
     pub(super) quiet_planned: Option<(super::wait::EntryKey, [u64; 4])>,

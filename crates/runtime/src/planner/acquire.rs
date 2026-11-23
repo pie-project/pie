@@ -346,7 +346,10 @@ impl ResidencyPlanner {
                         Collect::Yield => Ok(Acquired::Yield),
                         Collect::Requote => Ok(Acquired::Requote),
                     };
-                    if !matches!(acquired, Err(PlannerError::PastDevice { .. })) {
+                    if !matches!(
+                        acquired,
+                        Err(PlannerError::PastDevice { .. } | PlannerError::RunPastPool { .. })
+                    ) {
                         registration.disarm();
                     }
                     self.poke();
@@ -654,6 +657,14 @@ impl ResidencyPlanner {
                 need: pages,
                 total,
                 runs: Some((run.max(1), pieces)),
+            });
+        }
+        // A run longer than any segment lays for state: never laid.
+        let longest = self.port.longest_run_most();
+        if pieces > 0 && run.max(1) > longest {
+            return Err(PlannerError::RunPastPool {
+                run: run.max(1),
+                longest,
             });
         }
         self.wait_room(pid, (run, pieces, singles), pages, None)
