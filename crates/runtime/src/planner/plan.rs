@@ -1547,7 +1547,33 @@ impl ResidencyPlanner {
                                 inner.procs.get(&pid).and_then(|proc| proc.bind_room).map(|need| need.entries())
                             });
                             let held = self.port.reserve_restore(pid, bind.as_deref().unwrap_or_default());
-                            tracing::debug!(%pid, ?bind, held, "planner: a restore sent, its placement held for it");
+                            // What held it for the head it was moved for, as
+                            // that head stood when it went (the hold's terms,
+                            // [`super::inner::Inner::unmet_head`]).
+                            let held_for = tracing::enabled!(tracing::Level::DEBUG)
+                                .then(|| {
+                                    self.with_inner(|inner| {
+                                        let head = inner.procs.get(&pid)?.evicted_for?;
+                                        let queued = inner.queue.values().any(|waiter| waiter.pid == head);
+                                        let state = inner.procs.get(&head).map(|proc| {
+                                            format!(
+                                                "{:?} unfired={} idle={} bind_waiting={} in_request={}",
+                                                proc.state,
+                                                proc.unfired,
+                                                proc.idle,
+                                                proc.bind_waiting,
+                                                super::inner::Inner::in_request(proc)
+                                            )
+                                        });
+                                        Some(format!(
+                                            "head {head} queued={queued} passed={} finisher={} {state:?}",
+                                            inner.passed.iter().any(|&(_, passed)| passed == head),
+                                            inner.is_finisher(pid)
+                                        ))
+                                    })
+                                })
+                                .flatten();
+                            tracing::debug!(%pid, ?bind, held, ?held_for, "planner: a restore sent, its placement held for it");
                             // Said as the pass's end for this head: a restore
                             // refused and queued again showed "ended=none".
                             self.plan_ended(key, "restore sent", false, &[]);

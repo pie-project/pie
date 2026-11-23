@@ -840,7 +840,21 @@ impl ResidencyPlanner {
                 host_short,
                 &unhostable,
             );
-            self.note_short(victims.head, deficit, host);
+            // Asked once for a head and room: asked again on the same room,
+            // the ask's answer (none) planned at once, a pass that spun
+            // (the simulation's Metal mix, seed 183: the policy asked
+            // hundreds of thousands of times a minute, nothing moving). The
+            // rest of the pass still reads the fleet (a hog, a starvation:
+            // what changes beside the room); only the ask is not sent again.
+            let gives = self.port.room_gives();
+            let asked_again = self.with_inner(|inner| {
+                let again = inner.policy_asked == Some((victims.head, gives));
+                inner.policy_asked = Some((victims.head, gives));
+                again
+            });
+            if !asked_again {
+                self.note_short(victims.head, deficit, host);
+            }
             // The policy asked with nothing in flight while the map of every
             // process names moves for the head: a quiet wait too, said with
             // who those moves name and why this pass moved none of them

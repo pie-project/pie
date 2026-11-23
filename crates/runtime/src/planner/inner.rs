@@ -50,6 +50,9 @@ pub(super) struct Inner {
     /// dump per head and room change, and again each
     /// [`super::plan::STALL_SAYS_AGAIN`] while it stays unserved.
     pub(super) stall_dumped: Option<(super::wait::EntryKey, u64, crate::rt::Instant)>,
+    /// The head and room the policy was last asked for with no pick
+    /// ([`super::eviction`]): asked once a head and room.
+    pub(super) policy_asked: Option<(super::wait::EntryKey, u64)>,
     /// The head whose stall was last said, and when: said once a stall
     /// episode, whatever room moves meanwhile.
     pub(super) stall_said: Option<(super::wait::EntryKey, crate::rt::Instant)>,
@@ -767,7 +770,39 @@ impl Inner {
                 if served_untaken || !self.nothing_in_flight() {
                     return None;
                 }
-                held
+                // The evictor's restore before its victims': where the head a
+                // held restore waits for is itself a restore waiting, that
+                // one goes (and so on up the chain), never the victim ahead
+                // of the head it was moved for. The oldest held restore
+                // went, took the room its evictor's restore needed, and was
+                // evicted again for it (the simulation's Metal mix, seed 43:
+                // a victim restored past an evicted head, moved for it again
+                // at its restore, 3 times over).
+                let mut key = held;
+                let mut seen = HashSet::new();
+                while seen.insert(key) {
+                    let Some(head) = self
+                        .queue
+                        .get(&key)
+                        .and_then(|waiter| self.procs.get(&waiter.pid))
+                        .and_then(|proc| proc.evicted_for)
+                    else {
+                        break;
+                    };
+                    // One passed over is no head: chosen again, the pass
+                    // over every stuck head chose it for good, a core
+                    // burned (the simulation's seed 4656).
+                    let Some((&up, _)) = self.queue.iter().find(|&(&at, waiter)| {
+                        waiter.pid == head
+                            && waiter.is_unmet()
+                            && matches!(waiter.kind, WaitKind::Restore { .. })
+                            && !self.passed.iter().any(|&(passed, _)| passed == at)
+                    }) else {
+                        break;
+                    };
+                    key = up;
+                }
+                key
             }
         };
         self.queue

@@ -4266,6 +4266,38 @@ fn binds_of_two_runs_beside_singles_restore_and_end() {
     assert_eq!(failed, 0);
 }
 
+/// A pool that holds a bind beside the pair it joins in place (one run of
+/// five for its scratch, the pair's run already laid) but not beside a
+/// fresh pair as well: the bind is served, never refused as never fitting
+/// (the simulation's seed 213).
+#[test]
+fn a_bind_beside_a_pair_in_place_is_served_where_a_fresh_pair_would_not_fit() {
+    for seed in 0..20 {
+        let mut workload = run_pieces_workload(seed, 14, 6, 5, 1, seed % 2 == 0);
+        if let Some(program) = workload.pool.programs.last_mut() {
+            program.per_pair = program.scratch;
+        }
+        // Two binds of the program, the second joining the first's pair.
+        let bind = workload.scripts.last().cloned().expect("a bind");
+        let mut second = bind.clone();
+        second.at += 1;
+        workload.scripts.push(second);
+        let (failures, _) = run(&workload, None);
+        for failure in &failures {
+            eprintln!(
+                "SIM pair in place seed {seed} step {}: [{}] {}",
+                failure.step, failure.kind, failure.line
+            );
+        }
+        assert!(
+            failures
+                .iter()
+                .all(|failure| !failure.line.contains("never")),
+            "seed {seed}: a bind refused as never fitting: {failures:?}"
+        );
+    }
+}
+
 /// A bind of a run of seven adjacent chunks in a pool of segments of six:
 /// a run lies inside one segment, so no arrangement of the pool ever
 /// opens it. It is refused by name, at once, and nothing waits on it.
