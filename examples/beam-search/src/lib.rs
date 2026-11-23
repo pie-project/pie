@@ -62,7 +62,9 @@ struct Input {
     /// has each lane's mask inherit the next lane's ancestry (`(parent + 1)
     /// % beams`) while its hypothesis keeps its own, so its rows read
     /// another beam's cells; `score` moves lane 0's last step by 4.0 on the
-    /// host. Either must fail `verify`. The finish's check has its own:
+    /// host; `uniform` moves every lane's every candidate by the same 0.75,
+    /// in its scores, its record and the beam-shaped replay alike (a fault
+    /// every composition reproduces). Each must fail `verify`. The finish's check has its own:
     /// `finish` adopts another beam than the one checked; `finish-other` has
     /// the finish fire read another sequence's set (the prompt's tokens
     /// shifted, decoded as deep); `finish-stale` has it read only the set's
@@ -536,11 +538,31 @@ async fn main(input: Input) -> Result<String> {
             .and_then(|fires| fires.checked_mul(b))
             .and_then(|cells| cells.checked_add(n))
             .ok_or("beams * max_tokens exceeds the u32 range")?;
-        let shaped = replay_beam(&prompt, &first, &trail, b, pool_len).await?;
+        let mut shaped = replay_beam(&prompt, &first, &trail, b, pool_len).await?;
+        // `--corrupt uniform`: every lane's every candidate computed the same
+        // wrong amount off, as a kernel fault every composition of the
+        // search's shape reproduces would: its scores, its own record and the
+        // beam-shaped replay all moved alike, so the bookkeeping holds and a
+        // spread-scaled room would absorb it. The absolute room must not.
+        if input.corrupt.as_deref() == Some("uniform") {
+            const OFF: f32 = 0.75;
+            for lane in 0..hypotheses.len() {
+                for (at, step) in record[0][lane].iter_mut().enumerate() {
+                    *step += OFF;
+                    scored[lane][at] += OFF * (at + 1) as f32;
+                    shaped[lane][at].0 += OFF;
+                }
+                final_scores[lane] += OFF * record[0][lane].len() as f32;
+            }
+        }
+        // The hypothesis's summed rescore against its final score, within
+        // the sum of its steps' rooms and roundings: the worst ratio.
+        let mut worst_total = 0f32;
         for (lane, hypothesis) in hypotheses.iter().enumerate() {
             let alone = rescore(&prompt, hypothesis, b, Some(&shaped[lane])).await?;
             let own = &record[0][lane];
             let mut before = 0f32;
+            let mut bound = 0f32;
             for (at, &after) in scored[lane].iter().enumerate() {
                 // Bookkeeping, exact: the step a lane's score took is the
                 // candidate its own fire computed, within that candidate's
@@ -574,16 +596,15 @@ async fn main(input: Input) -> Result<String> {
                     ));
                 }
                 // Numerics: the beam's own candidate against its hypothesis
-                // rescored alone, within one bf16 gap of each value the
-                // log-probability is read from and the hypothesis's own
-                // spread across compositions ([`rescore`]). A recurrence or
-                // attention that read another beam's cells moves the beam's
-                // candidate, not the hypothesis's rescores.
+                // rescored alone as one row, within an absolute room of bf16
+                // gaps at the step's logit scale ([`Rescored::room`]),
+                // whatever the compositions' measured spread (reported, never
+                // a room). A recurrence or attention that read another beam's
+                // cells, or a kernel fault every composition reproduces, moves
+                // the beam's candidate off the one-row rescore.
                 let r = &alone[at];
-                let room = ulp_bf16(mine.abs().max(r.step.abs()))
-                    + ulp_bf16(r.picked)
-                    + ulp_bf16(r.largest)
-                    + r.spread;
+                let room = r.room(mine);
+                bound += room + rounding;
                 if r.spread > widest {
                     widest = r.spread;
                     widest_by = r.by;
@@ -594,19 +615,32 @@ async fn main(input: Input) -> Result<String> {
                 if apart > room {
                     return Err(format!(
                         "beam {lane}'s fire took {mine:.4} at step {at}, and its hypothesis alone \
-                         {:.4} there: {apart:.4} apart, past {room:.3} (composition spread \
-                         {:.4}, widest from the {}, {:.4} without the beam-shaped replay); its \
-                         recurrence or attention read another beam's cells",
-                        r.step, r.spread, r.by, r.unshaped,
+                         {:.4} there: {apart:.4} apart, past {room:.4} ({STEP_ULPS} bf16 gaps at \
+                         its logits' scale; composition spread {:.4}, widest from the {}); its \
+                         fire computed another value than the hypothesis's own",
+                        r.step, r.spread, r.by,
                     ));
                 }
                 before = after;
             }
+            // The whole hypothesis: its rescored sum against its final score,
+            // within its steps' rooms and roundings summed (each step's error
+            // bound, accumulated over its length).
             let total: f32 = alone.iter().map(|s| s.step).sum();
-            worst = worst.max((total - final_scores[lane]).abs());
+            let apart = (total - final_scores[lane]).abs();
+            worst = worst.max(apart);
+            worst_total = worst_total.max(apart / bound.max(f32::MIN_POSITIVE));
+            if !(apart <= bound) {
+                return Err(format!(
+                    "beam {lane}'s final score {:.4} and its hypothesis rescored alone {total:.4}: \
+                     {apart:.4} apart, past {bound:.4}, its {} steps' rooms summed",
+                    final_scores[lane],
+                    alone.len()
+                ));
+            }
         }
         format!(
-            " greedy_mismatches={greedy_mismatches} verified={} worst_apart={worst:.4} worst_own={closest_own:.3} worst_step={closest:.3} max_spread={widest:.4} spread_by={widest_by} unshaped_spread={unshaped:.4}",
+            " greedy_mismatches={greedy_mismatches} verified={} worst_apart={worst:.4} worst_total={worst_total:.3} worst_own={closest_own:.3} worst_step={closest:.3} max_spread={widest:.4} spread_by={widest_by} unshaped_spread={unshaped:.4}",
             hypotheses.len()
         )
     } else {
@@ -710,17 +744,18 @@ async fn finish_check(
     // fires do, and takes no candidate: a step's room with nothing carried.
     let room = want.room(got);
     let apart = (got - want.step).abs();
-    if apart > room.total() {
+    if apart > room {
         return Err(format!(
             "after its finish the set scored the next token {got:.4} and an unbranched decode \
-             {:.4}: {apart:.4} apart, room {room}: {:.2} times its room; its pages are not its \
+             {:.4}: {apart:.4} apart, room {room:.4} ({STEP_ULPS} bf16 gaps at its logits' scale): \
+             {:.2} times its room; its pages are not its \
              beam's",
             want.step,
-            apart / room.total()
+            apart / room
         )
         .into());
     }
-    Ok((apart, room.total(), got))
+    Ok((apart, room, got))
 }
 
 /// A value the verifier compares, refused by name where it is not finite: a
@@ -781,51 +816,27 @@ struct Rescored {
     unshaped: f32,
 }
 
+/// The bf16 gaps one honest log-probability may sit from another of the
+/// same token at the same context: each side rounds the target logit, the
+/// log-sum-exp's leading (largest) logit and the log-probability once to
+/// bf16, half a gap each (1.5 a side, 3 for the two), and one gap more for
+/// the logits' own drift between compositions (no batch invariance).
+const STEP_ULPS: f32 = 4.0;
+
 impl Rescored {
-    /// The room a fire's log-probability `took` has from this rescore, each
-    /// part a bf16 gap at the magnitude of the value it rounds:
-    ///
-    /// - the log-probability and the logits are rounded to bf16 by both
-    ///   fires. Two roundings of values a spread apart land at most that
-    ///   spread and one gap apart: one gap at the larger log-probability, and
-    ///   one each at the target logit and the largest logit (which leads the
-    ///   log-sum-exp);
-    /// - the spread across compositions ([`rescore`]): the fire runs other
-    ///   kernels than a 1-row fire folding every step, which the user allows
-    ///   (no batch invariance). Both sides may carry one: twice the spread.
-    fn room(&self, took: f32) -> Room {
-        Room {
-            log_prob: ulp_bf16(took.abs().max(self.step.abs())),
-            logits: ulp_bf16(self.picked) + ulp_bf16(self.largest),
-            spread: 2.0 * self.spread,
-        }
-    }
-}
-
-/// A step's room, by part ([`Rescored::room`]).
-#[derive(Clone, Copy, Default)]
-struct Room {
-    log_prob: f32,
-    logits: f32,
-    spread: f32,
-}
-
-impl Room {
-    fn total(&self) -> f32 {
-        self.log_prob + self.logits + self.spread
-    }
-}
-
-impl std::fmt::Display for Room {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{:.3} (log-probability {:.4}, logits {:.4}, twice the spread {:.4})",
-            self.total(),
-            self.log_prob,
-            self.logits,
-            self.spread
-        )
+    /// The absolute room a fire's log-probability `took` has from this
+    /// rescore: [`STEP_ULPS`] bf16 gaps at the step's logit scale, the
+    /// largest magnitude among its target logit, its largest logit and the
+    /// two log-probabilities. It holds no measured composition spread, so a
+    /// fault every composition reproduces alike widens nothing.
+    fn room(&self, took: f32) -> f32 {
+        let scale = self
+            .picked
+            .abs()
+            .max(self.largest.abs())
+            .max(self.step.abs())
+            .max(took.abs());
+        STEP_ULPS * ulp_bf16(scale)
     }
 }
 
