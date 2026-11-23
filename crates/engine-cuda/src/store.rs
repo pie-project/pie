@@ -1071,18 +1071,16 @@ impl Pools {
         own_rows_tokens: u32,
     ) -> Result<Pools> {
         let pool = PhysicalPool::open(device, ceiling)?;
-        let mut layout = lay(
+        let layout = lay(
             trace,
             &paging,
             budgets,
             chunk_bytes,
             experts,
             rows,
-            one_window || windowed_state,
+            one_window,
+            windowed_state,
         )?;
-        if windowed_state {
-            ring_record(&mut layout, trace)?;
-        }
         // The pages a fire's own rows take where its lane folds them past
         // what its ring holds (`OwnRows`): at the activation's top, above
         // every carve.
@@ -2073,34 +2071,18 @@ impl Pools {
     /// last row's share padded to the pieces the record takes.
     #[must_use]
     pub fn windowed_layers(&self) -> Vec<engine::chunk::WindowedLayer> {
-        let Some((fixed, ring)) = self.ring() else {
+        let Some((_, ring)) = self.ring() else {
             return Vec::new();
         };
-        let rows = u64::from(ring.rows());
-        let mut layers: Vec<engine::chunk::WindowedLayer> = ring
-            .windows
+        ring.layers
             .iter()
-            .filter_map(|&(row, window)| match self.shapes.get(row as usize) {
-                Some(&Shape::Kv {
-                    dtype,
-                    keys_width,
-                    values_width,
-                    ..
-                }) => Some(engine::chunk::WindowedLayer {
-                    layer: row,
-                    window,
-                    sinks: 0,
-                    bytes: rows * (keys_width + values_width) * u64::from(elem_size(dtype)),
-                }),
-                _ => None,
+            .map(|&(layer, window, bytes)| engine::chunk::WindowedLayer {
+                layer,
+                window,
+                sinks: 0,
+                bytes,
             })
-            .collect();
-        let laid: u64 = layers.iter().map(|layer| layer.bytes).sum();
-        let held = fixed.slot.slot_bytes * u64::from(fixed.pieces);
-        if let Some(last) = layers.last_mut() {
-            last.bytes += held.saturating_sub(laid);
-        }
-        layers
+            .collect()
     }
 
     /// The record's rings, where the load serves its windowed rows as ring
@@ -2155,7 +2137,7 @@ impl Pools {
             Fault::program("store::ring", "ring pages of a load that keeps no ring")
         })?;
         let fixed_grain = fixed.slot.grain.max(1);
-        let (pages, page_bytes) = (ring.pages, ring.page_bytes);
+        let (pages, page_bytes, ring_offset) = (ring.pages, ring.page_bytes, ring.offset);
         let places: Vec<(u32, u32)> = (0..pages).map(|page| ring.place(page)).collect();
         let grain = self
             .chunks
@@ -2171,6 +2153,7 @@ impl Pools {
             let offset = u64::try_from(self.chunks.page_id(Kind::Fixed, slot)?)
                 .unwrap_or(0)
                 * fixed_grain
+                + ring_offset
                 + u64::from(within) * page_bytes;
             let q = offset / grain;
             out.push((
@@ -5344,48 +5327,51 @@ impl Pools {
     }
 }
 
-/// Lays the windowed rows' rings as the record of a load served as ring +
-/// buffer (CONTRACT-BC 19, 21): its one window list (every windowed row,
-/// merged) is the window buffer, and the record holds the rings, pages laid
-/// as the buffer's slots. A load whose record holds recurrent state too is
-/// not served so yet.
-fn ring_record(layout: &mut layout::Layout, trace: &Trace) -> Result<()> {
-    let windows: Vec<(u32, u32)> = trace
-        .caches
-        .iter()
-        .enumerate()
-        .filter_map(|(row, cache)| match cache {
-            CacheRow::Kv {
-                window: Some(window),
-                ..
-            } => Some((row as u32, *window)),
-            _ => None,
-        })
-        .collect();
-    if windows.is_empty() {
-        return Ok(());
+/// The ring hook this engine answers the windowed recipe with
+/// (`poem_compiler::chunk::RingLayout`): its kernels read a window's rows by
+/// one page table of window-buffer slots, so its ring is `ceil(W / P) + 1`
+/// pages of the widest window `W`, each laid exactly as a buffer slot, every
+/// piece at a chunk's start (a page then has an id of the buffer's grain).
+/// A layer's share is its rows of every page, the last padded to the whole.
+struct CudaRings;
+
+impl poem_compiler::chunk::RingLayout for CudaRings {
+    fn ring_region(
+        &self,
+        layers: &[poem_compiler::chunk::WindowedRow],
+        buffer: &poem_compiler::chunk::WindowBufferSlot<'_>,
+    ) -> poem_compiler::chunk::RingRegion {
+        let p = u64::from(buffer.tokens.max(1));
+        let widest = layers
+            .iter()
+            .map(|layer| u64::from(layer.window))
+            .max()
+            .unwrap_or(0);
+        let pages = widest.div_ceil(p) + 1;
+        let bytes = pages * buffer.bytes;
+        let mut layer_bytes: Vec<u64> = layers
+            .iter()
+            .map(|layer| {
+                pages
+                    * buffer
+                        .rows
+                        .iter()
+                        .filter(|run| layer.rows.contains(&run.row))
+                        .map(|run| p * run.per_token)
+                        .sum::<u64>()
+            })
+            .collect();
+        let laid: u64 = layer_bytes.iter().sum();
+        if let Some(last) = layer_bytes.last_mut() {
+            *last += bytes.saturating_sub(laid);
+        }
+        poem_compiler::chunk::RingRegion {
+            bytes,
+            atom: buffer.bytes,
+            placement: poem_compiler::chunk::RingPlacement::ChunkStart,
+            layer_bytes,
+        }
     }
-    let [buffer] = layout.windows.as_slice() else {
-        return Err(Fault::Unbound {
-            what: format!(
-                "windowed rows in {} window lists, where ring + buffer lays them in one",
-                layout.windows.len()
-            ),
-        });
-    };
-    if layout.fixed.is_some() {
-        return Err(Fault::Unbound {
-            what: "windowed rows as ring + buffer beside recurrent state in one record, which \
-                   this engine does not lay yet"
-                .into(),
-        });
-    }
-    layout.fixed = Some(layout::FixedShape::ring_only(
-        buffer,
-        layout.chunk_bytes,
-        windows,
-    )?);
-    Ok(())
 }
 
 /// How `trace`'s kv rows sit in the state pool's chunks: the compiler's
@@ -5400,6 +5386,7 @@ fn lay(
     experts: &[usize],
     rows: bool,
     one_window: bool,
+    windowed: bool,
 ) -> Result<layout::Layout> {
     let context = if paging.window.is_some() {
         paging.context()
@@ -5421,10 +5408,14 @@ fn lay(
     };
     // Each plane at the bytes its slot holds: laid scales as their atoms.
     let view = crate::weights::laid_view(trace);
-    let recipe =
-        poem_compiler::chunk::plan(&view, budgets, &profile).map_err(|why| Fault::Unbound {
-            what: format!("a chunk recipe for this load's cache rows: {why}"),
-        })?;
+    let recipe = if windowed {
+        poem_compiler::chunk::plan_windowed(&view, budgets, &profile, &CudaRings)
+    } else {
+        poem_compiler::chunk::plan(&view, budgets, &profile)
+    }
+    .map_err(|why| Fault::Unbound {
+        what: format!("a chunk recipe for this load's cache rows: {why}"),
+    })?;
     let banks: Vec<(usize, u64, u64)> = if experts.is_empty() {
         Vec::new()
     } else {
