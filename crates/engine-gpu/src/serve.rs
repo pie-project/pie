@@ -3618,6 +3618,20 @@ impl<B: Serve> Shell<B> {
                     // (`crate::dense::settle_pick`).
                     let mut limit = ROUNDS;
                     let mut round = 0;
+                    let mut last_spread = f64::INFINITY;
+                    let widest_spread = |samples: &[Vec<f64>]| {
+                        samples
+                            .iter()
+                            .filter(|s| !s.is_empty())
+                            .map(|s| crate::rates::median_spread(s).1)
+                            .fold(0.0, f64::max)
+                    };
+                    // What else is in flight as the trial times: the
+                    // pipelines built meanwhile and whether the device sat
+                    // idle at its start (a trial timed beside other work
+                    // reads that work's noise).
+                    let built_before = B::compiled(&self.pipelines);
+                    let idle_before = crate::backend::Context::idle(&self.device);
                     while round <= limit {
                         for (i, option) in options.iter().enumerate() {
                             self.dense = option.clone();
@@ -3700,11 +3714,15 @@ impl<B: Serve> Shell<B> {
                             }
                         }
                         round += 1;
-                        if round > limit
-                            && limit < 3 * ROUNDS
-                            && crate::dense::settle_pick(&samples).is_none()
-                        {
-                            limit += ROUNDS;
+                        // Tied: rounds go on while each further set of them
+                        // still narrows the widest spread (the noise is
+                        // averaging out), stopping once one does not.
+                        if round > limit && crate::dense::settle_pick(&samples).is_none() {
+                            let spread = widest_spread(&samples);
+                            if spread < last_spread {
+                                last_spread = spread;
+                                limit += ROUNDS;
+                            }
                         }
                     }
                     // The option whose times, widened by their spread, lie
@@ -3728,6 +3746,9 @@ impl<B: Serve> Shell<B> {
                         })
                         .collect();
                     tracing::info!(
+                        rounds = round.saturating_sub(1),
+                        built_during = B::compiled(&self.pipelines).saturating_sub(built_before),
+                        idle_at_start = idle_before,
                         "dense matmul in the served step, {bottom}-{top} rows: {} ({}; timed by \
                          the {})",
                         match pick {
