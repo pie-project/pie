@@ -215,7 +215,7 @@ impl PageWork {
 pub fn fault_reason(code: u32, lane: usize) -> String {
     use kernels_cuda::runtime::channel::{
         PAGES_BELOW_FLOOR, PAGES_COPY_BOUNDS, PAGES_EXHAUSTED, PAGES_PARENT, PAGES_PAST_RESERVE,
-        PAGES_SHORT,
+        PAGES_SHORT, PAGES_TOO_WIDE,
     };
     let why = match code {
         PAGES_PAST_RESERVE => "names a page past its working set's pool",
@@ -226,6 +226,7 @@ pub fn fault_reason(code: u32, lane: usize) -> String {
              slots"
         }
         PAGES_PARENT => "continues a parent past its beams",
+        PAGES_TOO_WIDE => "belongs to a group wider than its step was laid for",
         PAGES_EXHAUSTED => {
             eprintln!(
                 "engine-cuda: BUG: lane {lane}'s beam group found fewer free pages than it hands \

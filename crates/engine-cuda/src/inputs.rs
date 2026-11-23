@@ -872,7 +872,8 @@ fn stage_pages(
     store.stage(stream, at.trans, &image)?;
     // The fire's lanes' fault words, zero before its kernels write them.
     crate::device::zero_span_on(stream, base + faults, work.faults.len() * 4)?;
-    kernels_cuda::runtime::channel::beam_step(device.ctx(), groups_at, groups.len() as u32)?;
+    let width = groups.iter().map(|group| group.lanes).max().unwrap_or(1);
+    kernels_cuda::runtime::channel::beam_step(device.ctx(), groups_at, groups.len() as u32, width)?;
     kernels_cuda::runtime::channel::copy_pages(
         device.ctx(),
         copies_at,
@@ -977,9 +978,6 @@ struct PagesAt {
     end: u64,
 }
 
-/// The kv planes a page holds that one copy run may span.
-const PAGE_PLANES_CAP: u64 = 64;
-
 /// The slab's group-mask stretches: stretch `i` (the load's `i`th ragged
 /// attention) holds its byte offsets a group from `at + i * stride`, then
 /// its bits from `indptr_bytes` further on.
@@ -1023,6 +1021,7 @@ impl Inputs {
         schedule_streams: &[Option<u32>],
         state_ids: u32,
         rs_page_tokens: Option<u32>,
+        kv_planes: usize,
         rs_planes: usize,
         group_mask_feeds: usize,
     ) -> Result<Inputs> {
@@ -1076,7 +1075,9 @@ impl Inputs {
                     / u64::from(tokens.max(1))
                     + 1
             });
-            let planes_cap = PAGE_PLANES_CAP + rs_planes as u64;
+            // A copy run spans every kv plane a page holds
+            // (`Pools::page_planes`), then the rs planes beside them.
+            let planes_cap = (kv_planes + rs_planes) as u64;
             // A group's pool spans at most a sequence's pages, a lane's.
             let reserve = lanes * u64::from(paging.pages_per_slot);
             let lists_cap = lanes * page_tables as u64;
