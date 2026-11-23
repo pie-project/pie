@@ -570,6 +570,9 @@ fn bound_rs_working_sets<C: FireContext>(
 /// sequence precedes, and reads its tables through them.
 /// `keep`: the position a checkpoint inside the fire lands at, whose slots
 /// stay past it.
+///
+/// Window-list path: removed by the windowed-state change (the integration
+/// commit deletes it once every engine states `Capabilities::windowed_state`).
 fn host_window_plan(
     req: &crate::engine::FireRequest,
     fold: &geometry::Fold,
@@ -772,16 +775,18 @@ fn device_lane_rows(
 
 /// The frozen length of each lane's recurrent state, by the lane's group
 /// (`None` a lane where the pass binds none, or on a model with window
-/// lists, whose rows trim behind their windows and are never replayed).
+/// lists, whose rows trim behind their windows and are never replayed, or
+/// whose windowed layers are ring + buffer, `replays_none`: their buffered
+/// rows' K/V are read from the window buffer, never replayed).
 fn lanes_frozen(
     stores: &crate::store::registry::Stores,
     ids: &[crate::store::rs::RsWorkingSetId],
     groups: &LaneGroups,
     lanes: usize,
-    windowed: bool,
+    replays_none: bool,
 ) -> Result<Vec<Option<u32>>, String> {
     let mut frozen = vec![None; lanes];
-    if ids.is_empty() || windowed {
+    if ids.is_empty() || replays_none {
         return Ok(frozen);
     }
     let store = stores.rs.lock().unwrap();
@@ -3091,6 +3096,9 @@ fn stamp_lane_translation(
 /// it writes and commit nothing; what each list retires is behind the first
 /// page it writes, where every row lands past, so a decode loop that never
 /// states its positions still holds its windows and not its whole sequence.
+///
+/// Window-list path: removed by the windowed-state change (the integration
+/// commit deletes it once every engine states `Capabilities::windowed_state`).
 fn device_window_plan(
     stores: &crate::store::registry::Stores,
     ws: crate::store::kv::page_table::WorkingSetId,
@@ -4101,7 +4109,13 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // before windows were trimmed. A recurrent state's would hold its
         // record, which the pass's next write copies whole: it keeps one
         // only where the inferlet asks.
-        let auto = windowed && state.is_some() && stores.rs.lock().unwrap().is_window();
+        // A model whose windowed layers are ring + buffer (CONTRACT-BC 19)
+        // keeps one too: a snapshot of its record, the rings, which kv alone
+        // cannot rebuild either. (The window-list arm: removed by the
+        // windowed-state change.)
+        let window_state = crate::model::model().rs_caps().window_state;
+        let auto = state.is_some()
+            && (window_state || (windowed && stores.rs.lock().unwrap().is_window()));
         let checkpoints: Vec<u64> = match state {
             Some(_) => checkpoint_rows(
                 &ctx.resources().get(&fwd)?.bindings.checkpoints,
@@ -4147,7 +4161,13 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // A fire asks for the recurrent rows it carries in unfolded too,
         // where they are more than its own: a rung's replay scratch holds
         // its tokens of them. The pass carries these into its first fire.
-        let frozen = match lanes_frozen(&stores, &rs_ws_ids, &groups, full.lanes.len(), windowed) {
+        let frozen = match lanes_frozen(
+            &stores,
+            &rs_ws_ids,
+            &groups,
+            full.lanes.len(),
+            windowed || window_state,
+        ) {
             Ok(frozen) => frozen,
             Err(error) => return Ok(Err(error)),
         };
@@ -5657,7 +5677,7 @@ async fn fire_device_geometry<C: FireContext>(
         &rs_ws_ids,
         &groups,
         pass_lanes.places.len(),
-        windowed,
+        windowed || crate::model::model().rs_caps().window_state,
     ) {
         Ok(frozen) => frozen,
         Err(error) => return Ok(Err(error)),

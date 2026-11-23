@@ -49,6 +49,9 @@ pub const MAX_WINDOW_LISTS: usize = 4;
 /// (CONTRACT-BC 19, 21): its rows retain `window` tokens, a slot holds
 /// `tokens` (`T_w`) of them, slot `i` of a set's table rows
 /// `[i * T_w, (i + 1) * T_w)`.
+///
+/// Window-list path: removed by the windowed-state change (the integration
+/// commit deletes it once every engine states `Capabilities::windowed_state`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowGeometry {
     pub window: u32,
@@ -58,6 +61,9 @@ pub struct WindowGeometry {
 /// A set's windows: `committed` is the position they are anchored at and
 /// `head` the position written up to, in tokens; `retired[l]` counts the
 /// leading slots of list `l`'s table already given back.
+///
+/// Window-list path: removed by the windowed-state change (the integration
+/// commit deletes it once every engine states `Capabilities::windowed_state`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WindowState {
     retired: [u32; MAX_WINDOW_LISTS],
@@ -74,6 +80,9 @@ pub struct WindowState {
 /// lies below the committed position less its window retire. A
 /// device-positioned fire retires behind `reach`, the first token it may
 /// write, as no row's window reaches back past it.
+///
+/// Window-list path: removed by the windowed-state change (the integration
+/// commit deletes it once every engine states `Capabilities::windowed_state`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WindowAdvance {
     pub(crate) positioned: bool,
@@ -436,6 +445,10 @@ pub struct RsStore {
     /// The disk tier state parks on where no host row is free
     /// ([`Self::set_disk`]).
     disk: Option<RsDisk>,
+    /// The buffer pages are the window buffer's slots (CONTRACT-BC 19,
+    /// 21): an empty buffer starts where a fire's rows first stay unfolded
+    /// ([`Self::own_folds_unbuffered`]), not where the set is folded.
+    window_buffer: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -486,6 +499,18 @@ impl RsStore {
     /// records', an engine id the slot ref; CONTRACT-BC 18). A pool with no
     /// rs list buffers nothing.
     ///
+    /// A load whose engine serves windowed layers as ring + buffer
+    /// (CONTRACT-BC 19, 21) is a store of the second kind: each windowed
+    /// layer's ring is record bytes, so a record is the set's folded window,
+    /// and the window buffer's slot refs are the buffer pages, as the rs
+    /// list's are. Its sets fold, fork, share, park and snapshot as an rs
+    /// set does; the lanes name the pages in `Lane::tables` and the fold in
+    /// `Lane::window` ([`crate::pipeline::fire::rs::apply_shared`]).
+    ///
+    /// The window-list store (the first kind, `windows` non-empty) is
+    /// removed by the windowed-state change: the integration commit deletes
+    /// it, once every engine states `Capabilities::windowed_state`.
+    ///
     /// `host`, the engine's host tier (CONTRACT-BC 22), backs the host rows
     /// a suspend parks state in: records, rs list slots and every window
     /// list's slots, each of its own shape, past the device's ids.
@@ -495,7 +520,7 @@ impl RsStore {
             (
                 pool.windows().to_vec(),
                 !pool.fixed().is_empty(),
-                pool.rs_list(),
+                pool.buffer_list(),
             )
         };
         if let Some((first, rest)) = windows.split_first() {
@@ -570,7 +595,39 @@ impl RsStore {
             Vec::new(),
         );
         store.rs_tokens = rs_list.map(|list| list.tokens.max(1));
+        store.window_buffer = shared.lock().unwrap().window_buffer().is_some();
         store
+    }
+
+    /// The rows of `writes` a fire on `ws` buffers, where the buffer pages
+    /// are the window buffer's (CONTRACT-BC 19, 21): a lone lane carrying
+    /// no row earlier fires buffered (its buffer empty, its rows from where
+    /// the set is folded) takes no slot for the rows it folds itself by a
+    /// count the host knows, their K/V living in the fire; only the rows
+    /// past them are buffered, the buffer then starting at the folded index
+    /// after the fire, rounded down to a slot. Otherwise (a carrying lane,
+    /// a group, a device-counted fold, an rs list) every row is buffered,
+    /// from the folded index before the fire.
+    pub fn own_folds_unbuffered(
+        &self,
+        ws: RsWorkingSetId,
+        alone: bool,
+        fold: Option<u32>,
+        writes: Option<std::ops::Range<u32>>,
+    ) -> Result<Option<std::ops::Range<u32>>, RsError> {
+        let entry = self.entry(ws)?;
+        let (Some(writes), Some(fold)) = (writes.clone(), fold) else {
+            return Ok(writes);
+        };
+        if !self.window_buffer
+            || !alone
+            || !entry.buffer.iter().all(Option::is_none)
+            || writes.start != entry.frozen
+        {
+            return Ok(Some(writes));
+        }
+        let start = writes.start.saturating_add(fold).min(writes.end);
+        Ok((start < writes.end).then_some(start..writes.end))
     }
 
     /// Whether the state slots are a shared pool's records.
@@ -608,6 +665,7 @@ impl RsStore {
             device_folded: std::sync::Arc::new(tokio::sync::Notify::new()),
             rs_tokens: None,
             disk: None,
+            window_buffer: false,
         }
     }
 
@@ -625,7 +683,7 @@ impl RsStore {
             let records: Vec<(::engine::chunk::ShapeId, u32)> =
                 pool.fixed().iter().map(|shape| (shape.id, shape.pieces)).collect();
             let lists: Vec<::engine::chunk::ShapeId> = pool
-                .rs_list()
+                .buffer_list()
                 .map(|list| list.id)
                 .into_iter()
                 .chain(pool.windows().iter().map(|list| list.id))
@@ -634,7 +692,7 @@ impl RsStore {
                 .fixed()
                 .iter()
                 .map(|shape| shape.id)
-                .chain(pool.rs_list().map(|list| list.id))
+                .chain(pool.buffer_list().map(|list| list.id))
                 .chain(pool.windows().iter().map(|list| list.id))
                 .collect();
             let per_chunk = engines
@@ -1456,6 +1514,9 @@ impl RsStore {
     /// first (the tail rule of [`Self::prepare_window`]). None when a slot it
     /// needs has retired, or as [`Self::checkpoint`]; at the windows' own
     /// position, [`Self::checkpoint`]. Another state checkpoints only there.
+    ///
+    /// Window-list path: removed by the windowed-state change (the integration
+    /// commit deletes it once every engine states `Capabilities::windowed_state`).
     pub fn checkpoint_at(
         &mut self,
         ws: RsWorkingSetId,
@@ -1714,6 +1775,9 @@ impl RsStore {
     }
 
     /// The window slots a fire landing rows `rows` of `ws` takes.
+    ///
+    /// Window-list path: removed by the windowed-state change (the integration
+    /// commit deletes it once every engine states `Capabilities::windowed_state`).
     pub fn window_demand(
         &self,
         ws: RsWorkingSetId,
@@ -1728,6 +1792,9 @@ impl RsStore {
     /// a shared one copies it first: [`RsPreparedWrite::buffer_copy_plan`]),
     /// from `granted` or the pools; [`Self::window_advance`] moves the
     /// windows once the fire's tables have been read.
+    ///
+    /// Window-list path: removed by the windowed-state change (the integration
+    /// commit deletes it once every engine states `Capabilities::windowed_state`).
     pub fn prepare_window(
         &mut self,
         ws: RsWorkingSetId,
@@ -1804,6 +1871,9 @@ impl RsStore {
     /// Each window list's table of `ws` as a fire reading rows up to `end`
     /// reads it, in the engine's numbering: slot `i` its rows
     /// `[i * T_w, (i + 1) * T_w)`, 0 where trimmed or not written.
+    ///
+    /// Window-list path: removed by the windowed-state change (the integration
+    /// commit deletes it once every engine states `Capabilities::windowed_state`).
     pub fn window_tables(&self, ws: RsWorkingSetId, end: u32) -> Result<Vec<Vec<u32>>, RsError> {
         let entry = self.entry(ws)?;
         if self.live_window(entry).is_none() {
@@ -1839,6 +1909,9 @@ impl RsStore {
     /// Moves `ws`'s windows by what its published fire commits: each list's
     /// slots whose last row lies below the committed position less the
     /// list's own window retire, once no fire still reads them.
+    ///
+    /// Window-list path: removed by the windowed-state change (the integration
+    /// commit deletes it once every engine states `Capabilities::windowed_state`).
     pub fn window_advance(&mut self, ws: RsWorkingSetId, advance: WindowAdvance) {
         let lists = self.window.clone();
         let entry = self.entry_mut(ws).expect("batch prevalidated");
@@ -1926,6 +1999,17 @@ impl RsStore {
         }
     }
 
+    /// Where a fire writing `writes` finds the buffer's page 0: an empty
+    /// window buffer starts at the fire's first buffered row, rounded down
+    /// ([`Self::own_folds_unbuffered`]); any other buffer where it stands.
+    fn write_base(&self, entry: &RsEntry, writes: &std::ops::Range<u32>) -> u32 {
+        if self.window_buffer && entry.buffer.iter().all(Option::is_none) {
+            self.empty_base(writes.start.max(entry.frozen))
+        } else {
+            self.buffer_base(entry)
+        }
+    }
+
     fn buffer_targets(
         &self,
         entry: &RsEntry,
@@ -1941,7 +2025,7 @@ impl RsStore {
             });
         }
         let page = self.page_tokens(entry);
-        let base = self.buffer_base(entry);
+        let base = self.write_base(entry, &writes);
         let first = (writes.start - base) / page;
         let last = (writes.end - 1 - base) / page;
         Ok((first..=last)
@@ -1963,7 +2047,7 @@ impl RsStore {
         if let Some(writes) = writes.as_ref().filter(|writes| !writes.is_empty()) {
             let (base, page) = {
                 let entry = self.entry(ws)?;
-                (self.buffer_base(entry), self.page_tokens(entry))
+                (self.write_base(entry, writes), self.page_tokens(entry))
             };
             let entry = self.entry_mut(ws)?;
             entry.base = base;

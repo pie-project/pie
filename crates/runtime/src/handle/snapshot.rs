@@ -185,9 +185,15 @@ struct SavedState {
     frozen: u32,
     bytes: u64,
     /// The windows' position, for a model whose state is one window list:
-    /// `buffer` is then its table, and `window_tokens` the window.
+    /// `buffer` is then its table, and `window_tokens` the window. The
+    /// window-list path: removed by the windowed-state change.
     window: Option<WindowState>,
     window_tokens: u32,
+    /// The model's windowed layers are ring + buffer (CONTRACT-BC 19, 21):
+    /// the record holds the rings and `buffer` is the window buffer's
+    /// unfolded slots, saved as a recurrent state's are; no window table.
+    #[serde(default)]
+    window_state: bool,
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -436,7 +442,9 @@ async fn read_state(
             "a state of several window lists is not saved to the host",
         ));
     }
-    // A window list's table rides as the buffer.
+    // A window list's table rides as the buffer (the window-list path:
+    // removed by the windowed-state change). A ring + buffer set's buffer is
+    // its window buffer's unfolded slots, its rings in its record.
     let table = set.windows.first().unwrap_or(&set.buffer);
     let pages: Vec<RsSlotId> = table.iter().flatten().copied().collect();
     let shared = stores.rs.lock().unwrap().is_shared();
@@ -474,6 +482,7 @@ async fn read_state(
             bytes: bytes.len() as u64,
             window: set.window,
             window_tokens: crate::model::model().rs_caps().window_tokens,
+            window_state: crate::model::model().rs_caps().window_state,
         },
         bytes,
     ))
@@ -1060,6 +1069,7 @@ async fn load_state(
         || caps.buffer_page_size != geom.buffer_page_tokens
         || caps.window_tokens != saved.window_tokens
         || (caps.window_tokens > 0) != saved.window.is_some()
+        || caps.window_state != saved.window_state
     {
         return Err(HandleError::invalid(
             "its recurrent state is not this model's",

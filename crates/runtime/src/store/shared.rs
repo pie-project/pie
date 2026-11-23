@@ -618,6 +618,15 @@ pub enum SharedError {
         kind: &'static str,
         shapes: Vec<u32>,
     },
+    /// A load buffering both recurrent rows (an rs list) and windowed
+    /// layers' rows (a window buffer): the rs store keeps one buffer a set
+    /// today, so such a hybrid is refused by name.
+    #[error(
+        "shapes {rs_list} (the rs list) and {window_buffer} (the window buffer): a load whose \
+         recurrent and windowed layers both buffer unfolded rows is not served yet; the rs store \
+         keeps one buffer a working set"
+    )]
+    TwoBuffers { rs_list: u32, window_buffer: u32 },
 }
 
 /// A shared pool's chunks as they divide for good ([`SharedPool::room`]).
@@ -843,6 +852,11 @@ pub struct SharedPool {
     list: Option<TokenShape>,
     /// The rs buffer's list shape (CONTRACT-BC 18).
     rs_list: Option<TokenShape>,
+    /// The window buffer's list shape, where the engine serves windowed
+    /// layers as ring + buffer (CONTRACT-BC 19, 21): the rs store's buffer
+    /// pages, each lane's slots of it named in its tables and its fold in
+    /// `Lane::window`; the rings ride in the record's fixed shapes.
+    window_buffer: Option<TokenShape>,
     /// The window lists, narrowest window first (CONTRACT-BC 19).
     windows: Vec<TokenShape>,
     /// The fixed shapes of role [`SlotRole::State`]: a record's.
@@ -1043,14 +1057,17 @@ impl SharedPool {
         let mut shapes = Vec::with_capacity(facts.shapes.len() + facts.weights.len());
         let (mut lists, mut rs_lists, mut windows, mut fixed) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut window_buffers = Vec::new();
         let (mut instances, mut channels, mut adapters) = (Vec::new(), Vec::new(), Vec::new());
         for shape in &facts.shapes {
             let pool = ShapeId::try_from(shapes.len()).expect("shapes fit a shape id");
             let kind = match shape.kind {
                 SlotKind::List { tokens, window, .. } => {
                     let found = match window {
+                        // Window lists: removed by the windowed-state change.
                         Some(_) => &mut windows,
                         None if shape.role == SlotRole::RsBuffer => &mut rs_lists,
+                        None if shape.role == SlotRole::WindowBuffer => &mut window_buffers,
                         None => &mut lists,
                     };
                     found.push(TokenShape {
@@ -1090,7 +1107,11 @@ impl SharedPool {
                 slots_per_chunk: shape.slots_per_chunk,
             });
         }
-        for (kind, found) in [("kv list", &lists), ("rs list", &rs_lists)] {
+        for (kind, found) in [
+            ("kv list", &lists),
+            ("rs list", &rs_lists),
+            ("window buffer", &window_buffers),
+        ] {
             if found.len() > 1 {
                 return Err(SharedError::Shapes {
                     kind,
@@ -1105,6 +1126,12 @@ impl SharedPool {
                     shapes: found.iter().map(|shape| shape.id.0).collect(),
                 });
             }
+        }
+        if let (Some(rs), Some(window)) = (rs_lists.first(), window_buffers.first()) {
+            return Err(SharedError::TwoBuffers {
+                rs_list: rs.id.0,
+                window_buffer: window.id.0,
+            });
         }
         windows.sort_by_key(|shape: &TokenShape| shape.window);
         if windows.len() > crate::store::rs::MAX_WINDOW_LISTS {
@@ -1146,6 +1173,7 @@ impl SharedPool {
             growth: facts.segments.growth,
             list: lists.first().copied(),
             rs_list: rs_lists.first().copied(),
+            window_buffer: window_buffers.first().copied(),
             windows,
             fixed,
             roles: RoleShapes {
@@ -1218,7 +1246,24 @@ impl SharedPool {
         self.rs_list
     }
 
-    /// The window lists, narrowest window first.
+    /// The window buffer's list shape, where the engine serves windowed
+    /// layers as ring + buffer (CONTRACT-BC 19, 21).
+    #[must_use]
+    pub fn window_buffer(&self) -> Option<TokenShape> {
+        self.window_buffer
+    }
+
+    /// The list a working set's unfolded rows are buffered in, the rs
+    /// store's buffer pages: the rs list, or the window buffer (a load
+    /// states one of them at most).
+    #[must_use]
+    pub fn buffer_list(&self) -> Option<TokenShape> {
+        self.rs_list.or(self.window_buffer)
+    }
+
+    /// The window lists, narrowest window first. Removed by the
+    /// windowed-state change (the integration commit deletes the window
+    /// lists everywhere); do not use in new code.
     #[must_use]
     pub fn windows(&self) -> &[TokenShape] {
         &self.windows
@@ -1271,7 +1316,7 @@ impl SharedPool {
             for (window, &n) in self.windows.iter().zip(&rs.windows) {
                 takes.push((window.pool, u64::from(n)));
             }
-        } else if let Some(rs_list) = self.rs_list {
+        } else if let Some(rs_list) = self.buffer_list() {
             takes.push((rs_list.pool, u64::from(rs.pages)));
         }
         for shape in &self.fixed {
@@ -1303,7 +1348,7 @@ impl SharedPool {
             for (window, &n) in self.windows.iter().zip(&rs.windows) {
                 wanted += chunks(window.pool, u64::from(n));
             }
-        } else if let Some(rs_list) = self.rs_list {
+        } else if let Some(rs_list) = self.buffer_list() {
             wanted += chunks(rs_list.pool, u64::from(rs.pages));
         }
         for shape in &self.fixed {
@@ -1318,6 +1363,7 @@ impl SharedPool {
         self.list
             .iter()
             .chain(&self.rs_list)
+            .chain(&self.window_buffer)
             .chain(&self.windows)
             .find(|shape| shape.pool == pool)
             .map(|shape| shape.id)
@@ -1472,7 +1518,9 @@ impl SharedPool {
                 per_chunk(u64::from(slots), list.slots_per_chunk)
             })
             .sum();
-        let rs = u64::from(self.rs_list.is_some());
+        // The rs list's or the window buffer's slot of rows a fire leaves
+        // unfolded; a windowed layer's ring rides in the record.
+        let rs = u64::from(self.buffer_list().is_some());
         u32::try_from(list + windows + rs + self.record_chunks(1)).unwrap_or(u32::MAX)
     }
 
@@ -2150,6 +2198,7 @@ impl SharedPool {
         self.list
             .iter()
             .chain(&self.rs_list)
+            .chain(&self.window_buffer)
             .chain(&self.windows)
             .find(|shape| shape.id == engine)
             .map(|shape| shape.pool)
