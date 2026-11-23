@@ -22,5 +22,6 @@ mod settle_bound;
 mod submit_bound;
 mod swapped_pick;
 mod unplaced;
+mod two_widens;
 mod rs_layout;
 mod buffered_fold;
