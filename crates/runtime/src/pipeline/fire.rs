@@ -1412,6 +1412,33 @@ fn rows_of_lanes(
     req
 }
 
+/// A windowed pass's piece over slots `slots`: the window checkpoint it
+/// takes (the furthest of the pass's `checkpoints` inside it, its own end
+/// included), and the row its advance retires no slot behind (`keep`): the
+/// pass's earliest checkpoint past `held` (where the pass starts) at or
+/// before the piece's end, its own end included and one an earlier piece
+/// takes (its next pieces may be on their way before it settles and takes
+/// it). Its windows reach back from there.
+fn piece_window_rows(
+    checkpoints: &[u64],
+    windowed: bool,
+    held: u64,
+    slots: &std::ops::Range<u64>,
+) -> (Option<u64>, Option<u32>) {
+    let window_at = checkpoints
+        .iter()
+        .copied()
+        .filter(|&row| windowed && slots.start < row && row <= slots.end)
+        .max();
+    let keep = checkpoints
+        .iter()
+        .copied()
+        .filter(|&row| windowed && held < row && row <= slots.end)
+        .min()
+        .and_then(|row| u32::try_from(row).ok());
+    (window_at, keep)
+}
+
 /// Several lanes are cut alike and aligned at their ends, so the last piece
 /// holds every lane's read-out rows.
 fn pass_pieces(
@@ -1499,20 +1526,19 @@ fn keyed_rows(req: &crate::engine::FireRequest) -> u32 {
 }
 
 /// The rows a pass over `rows` keeps its state at: those the inferlet asks
-/// for (`asked`), and with `auto` the pass's end, each floored to whole pages
-/// and within the `keyed` pages the pass keys.
+/// for (`asked`), each floored to whole pages and within the `keyed` pages
+/// the pass keys. The runtime keeps none unasked: where a state is kept is
+/// the inferlet's (and its policy's) to say.
 pub(crate) fn checkpoint_rows(
     asked: &[u32],
     rows: std::ops::Range<u64>,
     page_size: u32,
     keyed: usize,
-    auto: bool,
 ) -> Vec<u64> {
     let page = u64::from(page_size.max(1));
     let mut at: Vec<u64> = asked
         .iter()
         .map(|&row| u64::from(row) / page * page)
-        .chain(auto.then_some(rows.end / page * page))
         .filter(|&row| rows.start < row && row <= rows.end && row / page <= keyed as u64)
         .collect();
     at.sort_unstable();
@@ -4095,20 +4121,12 @@ pub async fn submit_pass_stamped<C: FireContext>(
             failure: pipeline_failure.clone(),
         });
         let reach = held + full.lanes[0].tokens.len() as u64;
-        // A model whose only state beside its kv is window lists keeps one at
-        // the pass's last page boundary unasked: the refs to its lists' last slots are all a
-        // later prompt sharing the prefix needs, where kv alone resumed it
-        // before windows were trimmed. A recurrent state's would hold its
-        // record, which the pass's next write copies whole: it keeps one
-        // only where the inferlet asks.
-        let auto = windowed && state.is_some() && stores.rs.lock().unwrap().is_window();
         let checkpoints: Vec<u64> = match state {
             Some(_) => checkpoint_rows(
                 &ctx.resources().get(&fwd)?.bindings.checkpoints,
                 held..reach,
                 page_size,
                 keys.len(),
-                auto,
             ),
             None => Vec::new(),
         };
@@ -4428,14 +4446,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     window_at: None,
                 }
             };
-            // A window's piece keeps the furthest of its rows, which its
-            // windows stand at once it lands, or reach back to from its end
-            // (the slots that window touches retire no earlier).
-            let window_at = checkpoints
-                .iter()
-                .copied()
-                .filter(|&row| windowed && slots.start < row && row <= slots.end)
-                .max();
+            let (window_at, keep) = piece_window_rows(&checkpoints, windowed, held, &slots);
             let mut checkpoints_here: Vec<TakeCheckpoint> = match (state, window_at) {
                 (Some(rs), Some(row)) => vec![TakeCheckpoint {
                     window_at: u32::try_from(row).ok(),
@@ -4446,9 +4457,6 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 }
                 _ => Vec::new(),
             };
-            let keep = window_at
-                .filter(|&row| row < slots.end)
-                .and_then(|row| u32::try_from(row).ok());
             // The furthest the engine lands of those inside the fire.
             let mut inside: Vec<u32> = checkpoints
                 .iter()
@@ -7052,6 +7060,57 @@ mod cut_tests {
         a_pass_with_media_is_cut_before_its_first_span();
         a_pass_with_media_keys_the_rows_before_it();
         the_rest_of_a_pass_is_cut_again_wider();
+        a_windowed_cut_on_its_checkpoint_row_keeps_it_through_the_next_piece();
+    }
+
+    /// Each piece of `req` cut as `pass_pieces` cuts a single lane, as slots,
+    /// with the window checkpoint it takes and its keep.
+    fn window_pieces(
+        req: &crate::engine::FireRequest,
+        share: u32,
+        forced: &[u32],
+        checkpoints: &[u64],
+    ) -> Vec<((u64, u64), Option<u64>, Option<u32>)> {
+        let held = u64::from(req.lanes[0].kv.held);
+        pass_pieces(req, true, true, share, 16, forced, &[])
+            .into_iter()
+            .map(|piece| {
+                let (from, to) = piece[0].expect("one lane, in every piece");
+                let slots = held + u64::from(from)..held + u64::from(to);
+                let (at, keep) = piece_window_rows(checkpoints, true, held, &slots);
+                ((slots.start, slots.end), at, keep)
+            })
+            .collect()
+    }
+
+    /// 2050 rows cut at 1024, a checkpoint asked at 2048: it is the second
+    /// piece's own end. That piece takes it and keeps it, and so does the
+    /// last piece, on its way before the second settles; the first keeps
+    /// nothing. Cut a row past it instead, the piece it lies inside takes it
+    /// and every piece from there keeps it.
+    fn a_windowed_cut_on_its_checkpoint_row_keeps_it_through_the_next_piece() {
+        let req = prefill_lane(0, 2050, 16);
+        assert_eq!(
+            window_pieces(&req, 1024, &[], &[2048]),
+            [
+                ((0, 1024), None, None),
+                ((1024, 2048), Some(2048), Some(2048)),
+                ((2048, 2050), None, Some(2048)),
+            ],
+            "cut on the checkpoint row"
+        );
+        assert_eq!(
+            window_pieces(&req, 0, &[2049], &[2048]),
+            [((0, 2049), Some(2048), Some(2048)), ((2049, 2050), None, Some(2048))],
+            "cut a row past it"
+        );
+        // Not windowed: nothing kept, nothing taken here.
+        assert_eq!(
+            piece_window_rows(&[2048], false, 0, &(1024..2048)),
+            (None, None)
+        );
+        // A pass that starts past the checkpoint keeps none of it.
+        assert_eq!(piece_window_rows(&[2048], true, 2048, &(2048..2050)), (None, None));
     }
 
     /// A raise landing mid-pass: what is left from the last cut is cut at
