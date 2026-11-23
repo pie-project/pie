@@ -652,6 +652,12 @@ fn stray_holders(ctx: &Ctx, shared: &Arc<Mutex<crate::store::shared::SharedPool>
                 for slot in place_slots(&places.scratch, &bytes) {
                     named.push((format!("instance {id}'s scratch"), shared.slot(instance, slot)));
                 }
+                for slot in place_slots(&places.pair, &bytes) {
+                    named.push((
+                        format!("instance {id}'s pair (program {})", places.program),
+                        shared.slot(instance, slot),
+                    ));
+                }
             }
         }
     }
@@ -1159,6 +1165,10 @@ struct Script {
     /// moves state out of the wider span, parked state kept in place
     /// among it, while its owner and the rest park and come back.
     raise: Option<u32>,
+    /// A verifier's rescore per hypothesis, every `.1` steps: an instance
+    /// of program `.0` bound beside the beam group's (its pair shared),
+    /// fired once and closed (the M1's beam w17 verify groups).
+    verify: Option<(u32, u32)>,
 }
 
 impl Script {
@@ -1233,6 +1243,7 @@ impl Workload {
                 idle: None,
                 rescore: None,
                 raise: None,
+                verify: None,
             };
             match kind {
                 // A plain decode: a short prompt, long growth.
@@ -1308,6 +1319,7 @@ impl Workload {
                     idle: None,
                     rescore: None,
                     raise: None,
+                    verify: None,
                 };
                 while script.pages() > most && script.decode > 0 {
                     script.decode -= 1;
@@ -1412,6 +1424,7 @@ impl Workload {
                     beam_programs[rng.below(beam_programs.len() as u64) as usize],
                 )),
                 raise: raise_rng.chance(1, 2).then(|| raise_rng.range(0, decode - 1)),
+                verify: None,
             };
             while script.pages() > most && script.decode > 1 {
                 script.decode -= 1;
@@ -1439,6 +1452,7 @@ impl Workload {
                 idle: None,
                 rescore: None,
                 raise: None,
+                verify: None,
             };
             while script.pages() > most && script.decode > 0 {
                 script.decode -= 1;
@@ -1529,6 +1543,9 @@ impl Workload {
                 script.at = rng.range(0, 4);
                 if let Some(slot) = script.bind.last_mut() {
                     slot.0 = rng.below(u64::from(programs)) as u32;
+                    if let Some(verify) = &mut script.verify {
+                        verify.0 = slot.0;
+                    }
                 }
                 scripts.push(script);
             }
@@ -1540,9 +1557,18 @@ impl Workload {
         }
         workload.scripts = scripts;
         let segments = pool.segments();
+        // Small disks for some: a park finding no room below keeps its
+        // tables and rings in place on the device.
+        if rng.chance(1, 2) {
+            pool.disk_chunks = rng.range(6, 16);
+        }
         for script in &mut workload.scripts {
             if script.beams > 1 {
-                script.beams = rng.range(4, 17);
+                script.beams = 17;
+                // Its verifier: the beam pool's program, a hypothesis
+                // rescored every step or few.
+                let beam_pool = script.bind.last().map_or(0, |&(program, _)| program);
+                script.verify = Some((beam_pool, rng.range(1, 3)));
             }
             while script.pages() > most && script.beams > 2 {
                 script.beams -= 1;
@@ -2562,6 +2588,19 @@ async fn run_process(ctx: Arc<Ctx>, pid: ProcessId, script: Script) {
                     close(&ctx, id);
                 }
                 instances.push(bind(&ctx, pid, program).await?);
+            }
+            if let Some((program, every)) = script.verify
+                && (at + 1) % every.max(1) == 0
+            {
+                // A hypothesis rescored: its verifier bound beside the
+                // group (the pair shared), fired once, closed.
+                ctx.log.lock().unwrap().rescores += 1;
+                let verifier = bind(&ctx, pid, program).await?;
+                let mut with = instances.clone();
+                with.push(verifier);
+                let fired = fire(&ctx, pid, &mut sets, &with, 0).await;
+                close(&ctx, verifier);
+                fired?;
             }
             let pages = u64::from((at + 1) % script.grow_every == 0);
             if script.raise == Some(at) {
@@ -4085,6 +4124,7 @@ fn run_need_workload(seed: u64, total: u32, segment: u32, run: u32, governed: bo
             idle: None,
             rescore: None,
             raise: None,
+            verify: None,
         })
         .collect();
     for script in &mut scripts {
@@ -4102,6 +4142,7 @@ fn run_need_workload(seed: u64, total: u32, segment: u32, run: u32, governed: bo
         idle: None,
         rescore: None,
         raise: None,
+        verify: None,
     });
     Workload {
         seed,
