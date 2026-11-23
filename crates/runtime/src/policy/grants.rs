@@ -7,7 +7,8 @@
 //! it links. A worker holds the newest version it was sent while some gateway
 //! link stands. The KV hash domain of a `share(group(g))` ask is the model's
 //! identity, "group", `g` and the grant's id where [`granted`] says the
-//! asker's tenant is in, and is tenant-local otherwise.
+//! asker's tenant is in, and is tenant-local otherwise: `policy::share`'s
+//! `GrantLookup` seam answers from [`granted`].
 //!
 //! It fails closed: no table yet, a table withdrawn (every gateway link gone),
 //! or a policy's rows withdrawn by its lease, is no grant.
@@ -16,22 +17,19 @@ use std::collections::{HashMap, HashSet};
 
 use parking_lot::RwLock;
 
-/// A grant's id: KV keyed under one never matches under another, so a
-/// revoke or a re-grant leaves the old pages unmatched.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct GrantId(pub u64);
-
 struct Table {
     version: u64,
-    groups: HashMap<String, (HashSet<String>, GrantId)>,
-    default: Option<(HashSet<String>, GrantId)>,
+    groups: HashMap<String, (HashSet<String>, u64)>,
+    default: Option<(HashSet<String>, u64)>,
 }
 
 static CURRENT: RwLock<Option<Table>> = RwLock::new(None);
 
-/// The grant `tenant` holds for `group`, if any: the group's row, else the
-/// column's default. `None` with no table, which is no grant.
-pub fn granted(group: &str, tenant: &str) -> Option<GrantId> {
+/// The id of the grant `tenant` holds for `group`, if any: the group's row,
+/// else the column's default. `None` with no table, which is no grant. An id
+/// changes with every change to its row, so KV keyed under one never
+/// matches under the next. One read lock and two hash lookups: O(1).
+pub fn granted(group: &str, tenant: &str) -> Option<u64> {
     let current = CURRENT.read();
     let table = current.as_ref()?;
     let (tenants, id) = table.groups.get(group).or(table.default.as_ref())?;
@@ -54,9 +52,9 @@ pub fn install(version: u64, groups: Vec<Grant>, default: Option<(Vec<String>, u
         version,
         groups: groups
             .into_iter()
-            .map(|(group, tenants, id)| (group, (set(tenants), GrantId(id))))
+            .map(|(group, tenants, id)| (group, (set(tenants), id)))
             .collect(),
-        default: default.map(|(tenants, id)| (set(tenants), GrantId(id))),
+        default: default.map(|(tenants, id)| (set(tenants), id)),
     });
     tracing::debug!(version, "share grants installed");
 }
@@ -91,21 +89,21 @@ mod tests {
         withdraw();
         assert_eq!(granted("g", "acme"), None, "no table: no grant");
         grants(3, &[("g", &["acme", "beta"], 7)], None);
-        assert_eq!(granted("g", "acme"), Some(GrantId(7)));
-        assert_eq!(granted("g", "beta"), Some(GrantId(7)));
+        assert_eq!(granted("g", "acme"), Some(7));
+        assert_eq!(granted("g", "beta"), Some(7));
         assert_eq!(granted("g", "gamma"), None, "not named");
         assert_eq!(granted("h", "acme"), None, "no row, no default");
         grants(2, &[("g", &["gamma"], 5)], None);
         assert_eq!(granted("g", "gamma"), None, "an older version is ignored");
         grants(4, &[("g", &["acme"], 8)], Some((&["gamma"], 9)));
-        assert_eq!(granted("g", "acme"), Some(GrantId(8)), "a re-grant is a new id");
+        assert_eq!(granted("g", "acme"), Some(8), "a re-grant is a new id");
         assert_eq!(granted("g", "beta"), None, "revoked");
-        assert_eq!(granted("h", "gamma"), Some(GrantId(9)), "the default");
+        assert_eq!(granted("h", "gamma"), Some(9), "the default");
         assert_eq!(granted("g", "gamma"), None, "a row stands over the default");
         withdraw();
         assert_eq!(granted("g", "acme"), None, "withdrawn: fails closed");
         grants(1, &[("g", &["acme"], 1)], None);
-        assert_eq!(granted("g", "acme"), Some(GrantId(1)), "after a withdrawal any version installs");
+        assert_eq!(granted("g", "acme"), Some(1), "after a withdrawal any version installs");
         withdraw();
     }
 }

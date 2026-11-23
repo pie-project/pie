@@ -96,9 +96,13 @@ Nothing already cached is lost: the pages stay, unmatched.
 - **Gateway** (`gateway/src/policy/service.rs`): sends the table whole
   (`worker-api share_groups`) to each linked worker, on a change and as a
   worker links.
-- **Worker** (`runtime/src/policy/share.rs`): `granted(group, tenant) ->
-  Option<GrantId>`, one hash lookup; a newer version replaces the table, an
-  older is ignored. The keying sites call it per pass.
+- **Worker** (`runtime/src/policy/grants.rs`): `granted(group, tenant) ->
+  Option<u64>` (the grant's id), one read lock and two hash lookups, behind
+  `policy::share`'s `GrantLookup` seam, which the keying sites call at each
+  keyed pass under the kv lock. A newer version replaces the table, an older
+  is ignored. A set already holding rows keyed under a grant stops sharing
+  when the grant changes (a chain cannot change domain midway); a set with
+  none takes the new domain at its next pass.
 - **SDK**: `plex::ext::share_groups`.
 - **Probe**: the builtin `test-share`.
 
