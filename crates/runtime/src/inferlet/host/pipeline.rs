@@ -33,6 +33,15 @@ impl pie::inferlet::pipeline::HostPipeline for ProcessCtx {
         crate::pipeline::fire::pipeline_close(self, this).await
     }
 
+    async fn retract(
+        &mut self,
+        this: Resource<Pipeline>,
+        fires: u32,
+    ) -> anyhow::Result<Result<(), String>> {
+        crate::inferlet::process::gate::residency_gate(self).await?;
+        crate::pipeline::fire::pipeline_retract(self, this, fires).await
+    }
+
     async fn drop(&mut self, this: Resource<Pipeline>) -> anyhow::Result<()> {
         crate::inferlet::process::gate::residency_gate(self).await?;
         crate::pipeline::fire::pipeline_drop(self, this).await

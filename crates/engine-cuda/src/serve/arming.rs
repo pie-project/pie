@@ -1326,12 +1326,17 @@ impl Shell {
         // A load that buffers recurrent rows serves a spec-decoding fire
         // from a body too: each one-class composition (a verify's lanes, the
         // prompts beside them) at the rs rungs is recorded once more for
-        // lanes that buffer rows, and once more for lanes that replay them
-        // (`record::RsBody`), right after its folding body. Every class takes
+        // lanes that buffer rows, and, a class that is not decoding's, once
+        // more for lanes that replay them (`record::RsBody`), right after its
+        // folding body. Every class takes
         // them, not only a drafter's: a guest that drafts for itself (MTP,
         // with no drafts output the load can see) verifies on the plain
         // classes, and it registers after the load arms.
         let buffering = self.buffers.is_some();
+        let splits = self
+            .buffers
+            .as_ref()
+            .is_some_and(|buffers| buffers.split_room() != 0);
         let rungs = self.rs_rungs();
         let targets: Vec<(u32, BodySynth, Treatment)> = targets
             .into_iter()
@@ -1343,14 +1348,24 @@ impl Shell {
                     _ => None,
                 };
                 let buffers = buffering && rungs.contains(&bucket) && class.is_some();
-                let treatments: &[record::RsBody] = if buffers {
-                    &[
+                // A decoding class replays its carried rows in the body that
+                // buffers (`dispatch::ssm`): it records no replaying body.
+                let decodes = class.is_some_and(|class| self.decoding.contains(class as usize));
+                // One that can split a long carry records the splitting
+                // body too: a beam lane's carry runs past a chunk.
+                let treatments: &[record::RsBody] = match (buffers, decodes) {
+                    (true, true) if splits => &[
+                        record::RsBody::Folds,
+                        record::RsBody::Buffers,
+                        record::RsBody::Splits,
+                    ],
+                    (true, true) => &[record::RsBody::Folds, record::RsBody::Buffers],
+                    (true, false) => &[
                         record::RsBody::Folds,
                         record::RsBody::Buffers,
                         record::RsBody::Replays,
-                    ]
-                } else {
-                    &[record::RsBody::Folds]
+                    ],
+                    (false, _) => &[record::RsBody::Folds],
                 };
                 treatments
                     .iter()

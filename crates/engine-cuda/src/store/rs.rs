@@ -19,7 +19,34 @@ pub struct Plane {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct Planes(HashMap<u32, Plane>, std::collections::HashSet<u32>);
+pub struct Planes(
+    HashMap<u32, Plane>,
+    std::collections::HashSet<u32>,
+    HashMap<u32, StepGates>,
+    HashMap<u32, Corrected>,
+    HashMap<u32, (Plane, u32, u32)>,
+);
+
+/// A decode step's gate prep, by its output: the step's `q k v` (whose keys
+/// and queries its buffered rows' attention weights are dotted against) and
+/// its key heads' count and width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StepGates {
+    pub qkv: ValueId,
+    pub k_heads: u32,
+    pub k_dim: u32,
+}
+
+/// A gated-delta or KDA layer's corrected planes
+/// (`ChunkProfile::rs_corrected`): each buffered row's keys (the conv
+/// output's key heads, bf16) and its corrected values (`u = beta (v - g
+/// S^T k)`, the value its delta rule writes, f32: `width` counts bf16
+/// elements, two a value).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Corrected {
+    pub k: Plane,
+    pub u: Plane,
+}
 
 impl Planes {
     #[must_use]
@@ -27,10 +54,52 @@ impl Planes {
         self.0.get(&id.0).copied()
     }
 
+    /// Every buffered plane once, by layer and place: the read values', a
+    /// gated-delta or KDA layer's keys and corrected values, and a Mamba-2
+    /// layer's `x | B`.
+    #[must_use]
+    pub fn all(&self) -> Vec<Plane> {
+        let mut planes: Vec<Plane> = self
+            .0
+            .values()
+            .copied()
+            .chain(self.3.values().flat_map(|c| [c.k, c.u]))
+            .chain(self.4.values().map(|(k, ..)| *k))
+            .collect();
+        planes.sort_by_key(|plane| (plane.layer, plane.at, plane.width));
+        planes.dedup_by_key(|plane| (plane.layer, plane.at, plane.width));
+        planes
+    }
+
     /// Whether `id` is a lone conv's rows, a layer of its own.
     #[must_use]
     pub fn lone(&self, id: ValueId) -> bool {
         self.1.contains(&id.0)
+    }
+
+    /// Whether `gates` is a decode step's gate prep output: its recurrence
+    /// lands the step's `[b | a]` in the buffer itself (`dispatch::ssm`).
+    /// (A plane's value may be read by both forms of a layer, the two arms
+    /// of one branch; the gates are each form's own.)
+    #[must_use]
+    pub fn step_gates(&self, gates: ValueId) -> Option<StepGates> {
+        self.2.get(&gates.0).copied()
+    }
+
+    /// The corrected planes of the gated-delta or KDA recurrence landing
+    /// `y`.
+    #[must_use]
+    pub fn corrected(&self, y: ValueId) -> Option<Corrected> {
+        self.3.get(&y.0).copied()
+    }
+
+    /// Where a decode conv landing `y` (a recurrence's convolved rows) lands
+    /// the channels of its row the recurrence reads a buffered row by (a
+    /// gated-delta or KDA layer's keys, a Mamba-2 layer's `x | B`): their
+    /// plane, the channel of `y` they start at, and their count.
+    #[must_use]
+    pub fn keys_of(&self, y: ValueId) -> Option<(Plane, u32, u32)> {
+        self.4.get(&y.0).copied()
     }
 
     #[must_use]
@@ -72,6 +141,10 @@ pub struct Buffers {
     /// Where each buffered layer's run starts in a page's slot.
     rows: Vec<u64>,
     ext_row_bytes: u64,
+    /// The room a gated-delta decode step splits a lane's carried rows in
+    /// (`kernels_cuda::ssm::carry_split_bytes`), zeroed at the load: its
+    /// counters return to zero after each step.
+    split: Option<crate::device::Buffer>,
 }
 
 impl Buffers {
@@ -116,8 +189,35 @@ impl Buffers {
             .take(widths.len())
             .map(|&(offset, _)| offset)
             .collect();
+        // A beam's fork copies a page's rows plane by plane
+        // (`Buffers::page_planes`, BEAM-PAGE-LISTS.md §11.2): the planes must
+        // tile each buffered layer's row, or a fork leaves a plane's rows
+        // stale.
+        for (layer, &width) in widths.iter().enumerate() {
+            let spanned: u64 = planes
+                .all()
+                .iter()
+                .filter(|plane| plane.layer as usize == layer)
+                .map(|plane| plane.width)
+                .sum();
+            if spanned != width {
+                return Err(Fault::program(
+                    "store::rs",
+                    format!(
+                        "recurrent layer {layer} buffers {width} elements a token and its \
+                         planes span {spanned}: a beam's fork would copy only those"
+                    ),
+                ));
+            }
+        }
         let ext_row_bytes = ext_row_bytes(trace)?;
         let reach = RsScratch::need(Self::rows_ext(max_rows), ext_row_bytes);
+        #[cfg(feature = "cuda")]
+        let split = kernels_cuda::linear::gemm::multiprocessors()
+            .map(|sms| crate::device::Buffer::zeroed(kernels_cuda::ssm::carry_split_bytes(sms) as usize))
+            .transpose()?;
+        #[cfg(not(feature = "cuda"))]
+        let split = None;
         Ok(Some(Buffers {
             scratch: Scratch {
                 at: 0,
@@ -128,6 +228,7 @@ impl Buffers {
             tokens,
             rows,
             ext_row_bytes,
+            split,
         }))
     }
 }
@@ -172,8 +273,10 @@ fn ext_row_bytes(trace: &Trace) -> Result<u64> {
                 widest_lone = widest_lone.max(row_bytes(*x)? + row_bytes(*y)?);
                 continue;
             }
-            // A one-token class's recurrences run extended too, when a lane
-            // of its fire replays (`dispatch::ssm`).
+            // A one-token class's recurrence pairs a chunked one at its
+            // widths; its decode step reads its carried rows itself
+            // (`dispatch::ssm`), its conv's carried outputs a plane of the
+            // run.
             Operation::Ssm(
                 Ssm::GatedDeltaChunked {
                     qkv, z, gates, y, ..
@@ -239,15 +342,27 @@ enum Reads {
     Mamba2 {
         xbc: ValueId,
         dt: ValueId,
+        /// The elements of its `x | B`: its `xbc` but the `C`.
+        xb: u64,
     },
     GatedDelta {
         qkv: ValueId,
         gates: ValueId,
+        /// Its output, which names its corrected planes, and the elements
+        /// a row of its keys and of its values.
+        y: ValueId,
+        keys: u64,
+        values: u64,
+        key_head: u32,
     },
     Kda {
         mixed: ValueId,
         f: ValueId,
         b: ValueId,
+        /// Its output, which names its corrected planes, and the elements
+        /// a row of its keys (and of its values).
+        y: ValueId,
+        width: u64,
     },
 }
 
@@ -270,6 +385,9 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, Vec<u64>)
         }
 
         let mut planes: HashMap<u32, Plane> = HashMap::new();
+        let mut step_gates = HashMap::new();
+        let mut corrected = HashMap::new();
+        let mut keys_of = HashMap::new();
         // The elements a token of each layer, prompt forms and step forms.
         let mut widths: Vec<u64> = Vec::new();
         let mut decode_widths: Vec<u64> = Vec::new();
@@ -303,9 +421,21 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, Vec<u64>)
                 continue;
             }
             // The fused decode step reads the planes its primitives would:
-            // the conv's rows (the split it lands) and the gate prep's
-            // `[b | a]`.
-            if let Operation::Fused(poem_ir::Fused::GdnStep { qkv, ba, .. }) = &node.op {
+            // the conv's rows (the split it lands), the gate prep's
+            // `[b | a]`, and the recurrence's keys and corrected values.
+            if let Operation::Fused(poem_ir::Fused::GdnStep {
+                qkv,
+                ba,
+                conv,
+                gates,
+                y,
+                k_heads,
+                k_dim,
+                v_heads,
+                v_dim,
+                ..
+            }) = &node.op
+            {
                 let page = u64::from(paging);
                 let mut here = 0u64;
                 for (what, id) in [
@@ -323,46 +453,132 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, Vec<u64>)
                     );
                     here += width;
                 }
+                let keys = u64::from(k_heads * k_dim);
+                let values = u64::from(v_heads * v_dim);
+                let k = Plane {
+                    layer: decode_layers,
+                    at: page * here,
+                    width: keys,
+                };
+                here += keys;
+                let u = Plane {
+                    layer: decode_layers,
+                    at: page * here,
+                    width: 2 * values,
+                };
+                here += 2 * values;
+                corrected.insert(y.0, Corrected { k, u });
+                let count = u32::try_from(keys).unwrap_or(u32::MAX);
+                keys_of.insert(conv.0, (k, count, count));
+                step_gates.insert(
+                    gates.0,
+                    StepGates {
+                        qkv: *conv,
+                        k_heads: *k_heads,
+                        k_dim: *k_dim,
+                    },
+                );
                 decode_widths.push(here);
                 decode_layers += 1;
                 continue;
             }
             let (reads, chunked) = match &node.op {
-                Operation::Ssm(Ssm::GatedDeltaChunked { qkv, gates, .. }) => (
+                Operation::Ssm(Ssm::GatedDeltaChunked {
+                    qkv,
+                    gates,
+                    y,
+                    k_heads,
+                    k_dim,
+                    v_heads,
+                    v_dim,
+                    ..
+                }) => (
                     Reads::GatedDelta {
                         qkv: *qkv,
                         gates: *gates,
+                        y: *y,
+                        keys: u64::from(k_heads * k_dim),
+                        values: u64::from(v_heads * v_dim),
+                        key_head: *k_dim,
                     },
                     true,
                 ),
-                Operation::Ssm(Ssm::GatedDelta { qkv, gates, .. }) => (
+                Operation::Ssm(Ssm::GatedDelta {
+                    qkv,
+                    gates,
+                    y,
+                    k_heads,
+                    k_dim,
+                    v_heads,
+                    v_dim,
+                    ..
+                }) => (
                     Reads::GatedDelta {
                         qkv: *qkv,
                         gates: *gates,
+                        y: *y,
+                        keys: u64::from(k_heads * k_dim),
+                        values: u64::from(v_heads * v_dim),
+                        key_head: *k_dim,
                     },
                     false,
                 ),
-                Operation::Ssm(Ssm::KdaChunked { mixed, f, b, .. }) => (
+                Operation::Ssm(
+                    Ssm::KdaChunked {
+                        mixed,
+                        f,
+                        b,
+                        y,
+                        heads,
+                        head_dim,
+                        ..
+                    }
+                    | Ssm::Kda {
+                        mixed,
+                        f,
+                        b,
+                        y,
+                        heads,
+                        head_dim,
+                        ..
+                    },
+                ) => (
                     Reads::Kda {
                         mixed: *mixed,
                         f: *f,
                         b: *b,
+                        y: *y,
+                        width: u64::from(heads * head_dim),
                     },
-                    true,
+                    matches!(node.op, Operation::Ssm(Ssm::KdaChunked { .. })),
                 ),
-                Operation::Ssm(Ssm::Kda { mixed, f, b, .. }) => (
-                    Reads::Kda {
-                        mixed: *mixed,
-                        f: *f,
-                        b: *b,
+                Operation::Ssm(
+                    Ssm::Mamba2Chunked {
+                        xbc,
+                        dt,
+                        groups,
+                        state_dim,
+                        ..
+                    }
+                    | Ssm::Mamba2 {
+                        xbc,
+                        dt,
+                        groups,
+                        state_dim,
+                        ..
                     },
-                    false,
-                ),
-                Operation::Ssm(Ssm::Mamba2Chunked { xbc, dt, .. }) => {
-                    (Reads::Mamba2 { xbc: *xbc, dt: *dt }, true)
-                }
-                Operation::Ssm(Ssm::Mamba2 { xbc, dt, .. }) => {
-                    (Reads::Mamba2 { xbc: *xbc, dt: *dt }, false)
+                ) => {
+                    let xb = width_of(trace, *xbc)
+                        .ok_or_else(|| unsized_plane("a Mamba-2 layer's `xbc`", *xbc))?
+                        .saturating_sub(u64::from(groups * state_dim));
+                    (
+                        Reads::Mamba2 {
+                            xbc: *xbc,
+                            dt: *dt,
+                            xb,
+                        },
+                        matches!(node.op, Operation::Ssm(Ssm::Mamba2Chunked { .. })),
+                    )
                 }
                 _ => continue,
             };
@@ -431,6 +647,26 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, Vec<u64>)
                     ),
                 });
             }
+            if let (
+                Reads::GatedDelta {
+                    gates,
+                    qkv,
+                    keys,
+                    key_head,
+                    ..
+                },
+                false,
+            ) = (reads, chunked)
+            {
+                step_gates.insert(
+                    gates.0,
+                    StepGates {
+                        qkv,
+                        k_heads: u32::try_from(keys).unwrap_or(0) / key_head.max(1),
+                        k_dim: key_head,
+                    },
+                );
+            }
             let page = u64::from(paging);
             let layer = if chunked { layers } else { decode_layers };
             let mut here = 0u64;
@@ -445,6 +681,40 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, Vec<u64>)
                     },
                 );
                 here += width;
+            }
+            // The keys and corrected values after them (a Mamba-2 layer's
+            // `x | B`), as the recipe's rs row lays them (`rs_corrected`):
+            // with the conv output they are read from, the channel they
+            // start at in it, and their count.
+            let narrow = |n: u64| u32::try_from(n).unwrap_or(u32::MAX);
+            let (conv_y, keys, values, k_off) = match reads {
+                Reads::GatedDelta {
+                    qkv,
+                    keys,
+                    values,
+                    y,
+                    ..
+                } => (qkv, keys, Some((y, values)), keys),
+                Reads::Kda {
+                    mixed, width, y, ..
+                } => (mixed, width, Some((y, width)), width),
+                Reads::Mamba2 { xbc, xb, .. } => (xbc, xb, None, 0),
+            };
+            let k = Plane {
+                layer,
+                at: page * here,
+                width: keys,
+            };
+            here += keys;
+            keys_of.insert(conv_y.0, (k, narrow(k_off), narrow(keys)));
+            if let Some((y, values)) = values {
+                let u = Plane {
+                    layer,
+                    at: page * here,
+                    width: 2 * values,
+                };
+                here += 2 * values;
+                corrected.insert(y.0, Corrected { k, u });
             }
             if chunked {
                 widths.push(here);
@@ -467,7 +737,7 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, Vec<u64>)
             return Ok(None);
         }
         let lone_rows = lone.values().map(|(x, _)| x.0).collect();
-        Ok(Some((Planes(planes, lone_rows), widths)))
+        Ok(Some((Planes(planes, lone_rows, step_gates, corrected, keys_of), widths)))
     }
 }
 
@@ -546,6 +816,28 @@ impl Buffers {
         self.ext_row_bytes
     }
 
+    /// Where a decode step splits a lane's carried rows (0: it splits none).
+    #[must_use]
+    pub fn split_room(&self) -> u64 {
+        self.split.as_ref().map_or(0, crate::device::Buffer::ptr)
+    }
+
+    /// Whether a decode step carrying `carried` rows splits them over the
+    /// spare blocks: it spans more than one of the carried step's chunks,
+    /// on a load with room to split (CUDA's; elsewhere none splits).
+    #[must_use]
+    pub fn splits(&self, carried: u32) -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            self.split.is_some() && carried > kernels_cuda::ssm::CARRY_CHUNK
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = carried;
+            false
+        }
+    }
+
     /// The rows an rs buffer page holds.
     #[must_use]
     pub fn page_tokens(&self) -> u32 {
@@ -567,6 +859,23 @@ impl Buffers {
             off: run + plane.at * ELEMENT,
             stride: plane.width * ELEMENT,
         })
+    }
+
+    /// Every buffered plane as a page copy spans it: its rows' place in a
+    /// page's slot and the bytes a token's row takes (a beam's fork copies a
+    /// page's first rows of each, `BEAM-PAGE-LISTS.md` §11).
+    pub fn page_planes(&self) -> Result<Vec<kernels_cuda::runtime::channel::PagePlane>> {
+        self.planes
+            .all()
+            .into_iter()
+            .map(|plane| {
+                let place = self.place(plane)?;
+                Ok(kernels_cuda::runtime::channel::PagePlane {
+                    offset: place.off,
+                    cell: place.stride,
+                })
+            })
+            .collect()
     }
 
     /// The address of rs buffer page `page`'s slot: a page's rows of a
@@ -958,9 +1267,11 @@ mod tests {
         }
     }
 
-    /// A KDA layer buffers three planes a token — the conv's rows, then the
-    /// forget and beta projections — laid page by page behind one another,
-    /// and its extended run stages those beside `mixed` and `y`.
+    /// A KDA layer buffers the conv's rows, then the forget and beta
+    /// projections, laid page by page behind one another, and after them its
+    /// keys and corrected values (`rs_corrected`: the rows its decode reads
+    /// as a linear attention); its extended run stages the first three
+    /// beside `mixed` and `y`.
     #[test]
     fn a_kda_recurrence_buffers_its_conv_rows_beside_its_two_projections() {
         let wide = HEADS * HEAD_DIM;
@@ -982,7 +1293,7 @@ mod tests {
         let (planes, widths) = read(&trace, PAGE)
             .expect("the KDA pair reads clean")
             .expect("the KDA pair reserves buffered planes");
-        assert_eq!(widths, vec![3 * wide + wide + HEADS]);
+        assert_eq!(widths, vec![3 * wide + wide + HEADS + wide + 2 * wide]);
         assert_eq!(planes.len(), 3);
         let page = u64::from(PAGE);
         let plane = |at: u64, width: u64| {
@@ -1042,7 +1353,7 @@ mod tests {
         let (planes, widths) = read(&trace, PAGE)
             .expect("a KDA layer and a lone conv read clean")
             .expect("both buffer planes");
-        assert_eq!(widths, vec![3 * wide + wide + HEADS, 2 * wide]);
+        assert_eq!(widths, vec![3 * wide + wide + HEADS + wide + 2 * wide, 2 * wide]);
         assert_eq!(
             planes.of(ValueId(lone)),
             Some(Plane {

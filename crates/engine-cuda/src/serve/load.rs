@@ -1576,6 +1576,16 @@ impl Shell {
             &schedule_streams(&boot.trace, &compiled),
             pools.ids_a_lane(),
             buffers.as_ref().map(crate::store::rs::Buffers::page_tokens),
+            // A beam's fork copies a page's rows of every kv plane the pool
+            // holds (`Pools::page_planes`).
+            pools.page_planes().len(),
+            // A hybrid beam's fork copies a page's first rows of each
+            // buffered plane (`BEAM-PAGE-LISTS.md` §11).
+            buffers
+                .as_ref()
+                .map(crate::store::rs::Buffers::page_planes)
+                .transpose()?
+                .map_or(0, |planes| planes.len()),
             // A stretch a packing an attention stating a mask reads.
             stated_feeds.len(),
         )?;
@@ -1592,6 +1602,16 @@ impl Shell {
         if let Some(layout) = &capture {
             programs.set_score_bytes(layout.row_bytes());
         }
+        // A beam group's page lists count in kv pages to its bind's depth,
+        // and a page it frees waits out the frames in flight.
+        // A beam group's width is bound by the shared memory its step lays
+        // its tables in (`channel::beam_max_lanes`): a wider bind is refused
+        // by name.
+        programs.set_beam_bounds(
+            boot.page_size,
+            u32::from(boot.runahead.frames_in_flight),
+            kernels_cuda::runtime::channel::beam_max_lanes(&device.ctx()),
+        );
 
         let airborne = crate::settle::Airborne::new();
         let mut pools = pools;

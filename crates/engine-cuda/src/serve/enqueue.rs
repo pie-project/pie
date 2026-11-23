@@ -457,7 +457,9 @@ impl FireCtx<'_> {
             &p.lengths,
             &p.token_injects,
             &p.mask_injects,
+            &p.page_work,
         )?;
+        p.page_faults = handles.page_faults;
         p.windows.bind(handles.windows);
         p.windows.bind_live(handles.live_rows);
         p.windows.bind_qo_absolute(handles.qo_absolute);
@@ -928,12 +930,22 @@ impl FireCtx<'_> {
                 tables: kernels_cuda::runtime::channel::RsTables {
                     lanes: tables.lanes,
                     pages: tables.pages,
-                    replay_tok: tables.replay_tok,
+                    lane_rows: tables.lane_rows,
+                    replay_spans: tables.replay_spans,
                     page_tokens: buffers.page_tokens(),
                 },
                 extended: p.rs.body == record::RsBody::Replays,
+                splits: p.rs.body == record::RsBody::Splits,
                 scratch: rs_scratch.as_ref(),
+                folds: p.rs.group_folds.then_some((tables.folds, tables.fold_entries)),
             });
+        }
+        // The fire's beam group folds, every layer's, on its stream ahead of
+        // its body (§11.3): no step of the fire reads a state before its
+        // fold.
+        if p.rs.group_folds {
+            run.fold_groups_ahead()
+                .map_err(|error| Fault::from(crate::error::kernel(error)))?;
         }
         super::btrace::mark("run_new");
         let records = self.graphs.records();

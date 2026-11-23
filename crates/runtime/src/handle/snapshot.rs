@@ -1040,6 +1040,7 @@ pub(super) async fn load(holder: ProcessId, tenant: &str, name: &str) -> Result<
         untold: false,
         staged: Vec::new(),
         spans: cursor.spans,
+        ..Cursor::default()
     };
     Ok(Held::park(holder, kv, rs, cursor))
 }

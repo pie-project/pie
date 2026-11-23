@@ -27,6 +27,9 @@ pub(crate) struct RequestCapacityUsage {
     /// step carries no more than its rung's tokens of them, as of its own
     /// rows ([`::engine::fire::rung_rows`]).
     pub(crate) carried_rows: usize,
+    /// The buffered recurrent rows its lanes replay, a decode lane's
+    /// included ([`crate::engine::FireRequest::replayed`]).
+    pub(crate) replayed_rows: usize,
     pub(crate) page_refs: usize,
     /// The rows the request's sequence lanes read out
     /// ([`crate::engine::FireRequest::sequence_readouts`]): a step reads out
@@ -44,6 +47,7 @@ pub(crate) fn request_capacity_usage(req: &PendingRequest, page_size: u32) -> Re
         forward_requests,
         forward_tokens: req.request.tokens(),
         carried_rows: req.request.carried as usize,
+        replayed_rows: req.request.replayed as usize,
         page_refs: req.request.pages().count(),
         readouts: req.request.sequence_readouts(),
     }
@@ -125,6 +129,7 @@ pub(crate) struct StepGroup {
     forward_requests: usize,
     forward_tokens: usize,
     carried_rows: usize,
+    replayed_rows: usize,
     page_refs: usize,
     /// The rows its members read out: no more than the engine's
     /// `max_readouts`, its fixed readout store's rows under its ceiling
@@ -205,6 +210,13 @@ impl StepGroup {
         self.forward_requests.saturating_add(usage.forward_requests) <= limits.max_forward_requests
             && self.forward_tokens.saturating_add(usage.forward_tokens) <= limits.max_forward_tokens
             && self.carried_rows.saturating_add(usage.carried_rows) <= limits.max_forward_tokens
+            // What the engine's replay table holds a step: a fire that
+            // would carry more goes in a step after (never alone: a step's
+            // first request is admitted whatever it replays).
+            && (limits.max_replayed_rows == 0
+                || self.forward_requests == 0
+                || self.replayed_rows.saturating_add(usage.replayed_rows)
+                    <= limits.max_replayed_rows)
             && self.page_refs.saturating_add(usage.page_refs) <= limits.max_page_refs
             && (limits.max_readouts == 0
                 || self.readouts.saturating_add(usage.readouts) <= limits.max_readouts)
@@ -228,6 +240,7 @@ impl StepGroup {
         self.forward_requests = self.forward_requests.saturating_add(usage.forward_requests);
         self.forward_tokens = self.forward_tokens.saturating_add(usage.forward_tokens);
         self.carried_rows = self.carried_rows.saturating_add(usage.carried_rows);
+        self.replayed_rows = self.replayed_rows.saturating_add(usage.replayed_rows);
         self.page_refs = self.page_refs.saturating_add(usage.page_refs);
         self.readouts = self.readouts.saturating_add(usage.readouts);
         self.lanes = self.lanes.saturating_add(request.request.lanes.len());
@@ -236,6 +249,7 @@ impl StepGroup {
             || self.forward_requests >= limits.max_forward_requests
             || self.forward_tokens >= limits.max_forward_tokens
             || self.carried_rows >= limits.max_forward_tokens
+            || (limits.max_replayed_rows > 0 && self.replayed_rows >= limits.max_replayed_rows)
             || self.page_refs >= limits.max_page_refs
             || (limits.max_readouts > 0 && self.readouts >= limits.max_readouts)
     }
@@ -571,6 +585,7 @@ mod tests {
             prefill_lanes: 0,
             max_readouts: 0,
             readout_store: 0,
+            max_replayed_rows: 0,
         }
     }
 
@@ -589,6 +604,7 @@ mod tests {
         fires_moving_one_ring_end_go_a_step_apart_in_the_order_they_stand();
         a_seal_that_dispatches_the_later_putter_first_gives_it_the_earlier_cell();
         a_step_carries_no_more_than_its_rungs_tokens();
+        a_step_replays_no_more_rows_than_the_engine_states();
         a_wave_of_prompts_past_one_fire_is_cut_and_its_decode_wave_is_one_fire();
     }
 
@@ -1007,6 +1023,50 @@ mod tests {
             assert!(plain.accepts(&carrying(at, 0), limits(), 16));
             assert!(!plain.push(&carrying(at, 0), limits(), 16));
         }
+    }
+
+    /// Restored decode lanes catching up replay rows their rung counts
+    /// none of (`lane_carried`): where the engine states the rows its
+    /// replay table holds a step, a step takes no more replayed rows than
+    /// that, every lane's summed, and a fire that would pass it goes in a
+    /// later step, served, never sent whole; one past it alone still goes,
+    /// a step's first. An engine stating no bound steps them by its rung.
+    fn a_step_replays_no_more_rows_than_the_engine_states() {
+        let stated = SchedulerLimits {
+            max_replayed_rows: 1024,
+            ..limits()
+        };
+        let replaying = |instance: u64, replayed: u32| {
+            let mut request = decode(9, 1);
+            request.replayed = replayed;
+            pending(request, InstanceId(instance))
+        };
+        // Four lanes of 257 rows each: three fit a step, the fourth waits.
+        let mut group = StepGroup::default();
+        for at in 1..=3 {
+            assert!(group.accepts(&replaying(at, 257), stated, 16), "lane {at} fits");
+            assert!(!group.push(&replaying(at, 257), stated, 16));
+        }
+        assert!(
+            !group.accepts(&replaying(4, 257), stated, 16),
+            "1028 replayed rows pass the 1024 the engine states"
+        );
+        assert!(group.accepts(&replaying(4, 253), stated, 16), "up to the bound");
+        // A lane past the bound alone is a step's first and goes.
+        let alone = StepGroup::default();
+        assert!(alone.accepts(&replaying(5, 2000), stated, 16));
+        // With no bound stated, replayed rows step nothing.
+        let mut free = StepGroup::default();
+        for at in 1..=4 {
+            assert!(free.accepts(&replaying(at, 257), limits(), 16));
+            assert!(!free.push(&replaying(at, 257), limits(), 16));
+        }
+        // A frame of the four is cut into two steps, no member dropped.
+        let requests: Vec<Box<PendingRequest>> = (1..=4).map(|at| replaying(at, 257)).collect();
+        let (frame, flattened) =
+            build_frame_submission(vec![requests], stated, 16, &SchedulerStats::default());
+        assert_eq!(flattened.len(), 4, "no member is dropped");
+        assert_eq!(frame.steps.len(), 2, "split to the stated bound");
     }
 
     /// A frame's wave of prompts past what one fire carries is cut into

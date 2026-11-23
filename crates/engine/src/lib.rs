@@ -9,6 +9,7 @@
 // sysctl, allowed there by name.
 #![deny(unsafe_code)]
 
+pub mod beam;
 pub mod adapter;
 pub mod caps;
 pub mod channel;

@@ -419,12 +419,16 @@ pub struct Tiers {
 /// buffer rows past their state but replay none, and one where a lane
 /// replays buffered rows ahead of its own (every recurrence then runs over
 /// the extended rows). Where a lane's rows land and which it replays are
-/// data the body reads (`inputs::RsHandles`), not part of the key.
+/// data the body reads (`inputs::RsHandles`), not part of the key. A
+/// buffering fire where a decoding lane carries more than one chunk of rows
+/// splits each carried read over the device's spare blocks
+/// (`kernels_cuda::ssm::Carry::split`), a grid only such a fire launches.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum RsBody {
     #[default]
     Folds,
     Buffers,
+    Splits,
     Replays,
 }
 
@@ -616,6 +620,7 @@ impl core::fmt::Display for BodyKey {
         match self.rs {
             RsBody::Folds => {}
             RsBody::Buffers => f.write_str("~rs")?,
+            RsBody::Splits => f.write_str("~rss")?,
             RsBody::Replays => f.write_str("~rsx")?,
         }
         Ok(())

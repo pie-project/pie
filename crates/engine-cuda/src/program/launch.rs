@@ -308,6 +308,22 @@ pub struct Held {
     /// Where a reader of captured scores keeps a capturing lane's rows in
     /// the instance's item (`crate::scores`); `None` for any other program.
     pub score_at: Option<u64>,
+    /// Where a beam group keeps its page lists in the instance's item
+    /// (`new-memory/designs/BEAM-PAGE-LISTS.md` §4): zeroed with the item at
+    /// bind, so the group's first fire primes it. `None` for any other.
+    pub beam: Option<BeamLayout>,
+}
+
+/// A beam group's resident state in its instance's item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BeamLayout {
+    /// Where it starts in the item.
+    pub at: u64,
+    pub lanes: u32,
+    /// The list width and pool pages it is laid for.
+    pub cap: u32,
+    /// Its ring of pending pages.
+    pub frames: u32,
 }
 
 /// What every cell span in an item starts a whole number of.
@@ -336,7 +352,24 @@ impl Held {
             native_at,
             ring_bytes,
             score_at: None,
+            beam: None,
         }
+    }
+
+    /// The same item with a beam group of `lanes` beams' state past it,
+    /// laid for `cap` pages a list and pool and `frames` pending rings.
+    #[must_use]
+    pub fn with_beam(mut self, lanes: u32, cap: u32, frames: u32) -> Held {
+        let at = self.instance_bytes.next_multiple_of(CELL_ALIGN);
+        let words = kernels_cuda::runtime::channel::beam_state_words(lanes, cap, frames);
+        self.beam = Some(BeamLayout {
+            at,
+            lanes,
+            cap,
+            frames,
+        });
+        self.instance_bytes = at + words * 4;
+        self
     }
 
     /// The same item with a capturing lane's rows of `bytes` past it.
@@ -491,6 +524,12 @@ impl Rings {
             place.instance + 2 * words,
             u32::try_from(slots).unwrap_or(u32::MAX),
         );
+    }
+
+    /// Where the instance's item lies now.
+    #[must_use]
+    pub const fn instance_base(&self) -> u64 {
+        self.registry
     }
 
     #[must_use]
@@ -926,9 +965,27 @@ fn block_temporary(
         .max(1);
     match region.kind {
         // A generated region's block keeps its reductions' levels here and
-        // nothing else.
+        // nothing else, laid from the rows its reductions stream (each
+        // reduction's input's row, `stream_width`), not the stage's widest
+        // value: a beam step's flattened candidates are a value of the
+        // stage no reduction of its log-softmax streams.
         RegionKind::Generated => {
-            eta_compiler::codegen::launch::generated_temporary_bytes(plan, region, widest)
+            let streamed = region
+                .nodes
+                .iter()
+                .filter_map(|&node| plan.ops.get(node as usize))
+                .filter(|op| {
+                    matches!(
+                        op.tag,
+                        tags::REDUCE_SUM | tags::REDUCE_MAX | tags::REDUCE_MIN
+                    )
+                })
+                .filter_map(|op| descriptors.get(*op.args.first()? as usize))
+                .map(|d| u64::from(d.last))
+                .max()
+                .unwrap_or(1)
+                .max(1);
+            eta_compiler::codegen::launch::generated_temporary_bytes(plan, region, streamed)
         }
         // A sampler's blocks meet in the engine's lane arenas, not here.
         kind if lane_sampler(kind) => 0,

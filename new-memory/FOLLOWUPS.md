@@ -963,6 +963,22 @@ by name). engine-cuda nets the page cache in its own reader (`weights.rs` ~372-4
 inactive only (what the kernel reclaims first, before a charge fails: the conservative room) or
 inactive + active (all file cache, which reclaim reaches under pressure).
 
+## F45. Beam page lists: per-group reserve terms against a pool-wide reserve by fires in flight
+
+A beam group's pool (`new-memory/designs/BEAM-PAGE-LISTS.md` §3) grows a
+column at a time to `B (c + 2) + B F + 1` pages: each live column's pages,
+plus `B` pages one fire may hand out and `B F` pages freed in the `F`
+frames in flight, terms every group carries whatever its length. At short
+lengths they are most of the reserve: 64 tokens, B = 4, F = 2 reserves up
+to 33 pages against the earlier shared pool's 18, and the 9 GiB-capped
+200-beam + 300-decode gate on MI300X ran 25-28 s against the tip's 21-22 s
+(uncapped 16 s both: speed parity, a capacity cost). Measure whether the
+`B` handed and `B F` pending terms can come from one pool-wide reserve
+sized by the fires in flight across groups (a fire hands out at most `B`
+pages per group it runs, and frees wait `F` fires whichever group freed
+them) without weakening the per-step guarantee that a fire never opens a
+column it cannot back: the capped gate's walls against the tip, the pages
+the planner counts per group, and the refusals under over-demand.
 ## F47. General per-lane split of a pass whose whole demand exceeds the device
 
 A pass whose whole demand (every lane's kv and state) is past the device while each lane fits

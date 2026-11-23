@@ -122,6 +122,25 @@ impl Shell {
         } else {
             Vec::new()
         };
+        // Each beam group's common slot (§11.3), read after the fault words.
+        let commons: Vec<(u64, engine::InstanceId)> =
+            if done.is_some() && prepared.page_faults.is_some() {
+                prepared.page_work.commons.clone()
+            } else {
+                Vec::new()
+            };
+        // The lanes whose own page lists the device resolved: a fault word
+        // each, read with the commit words.
+        let page_faults: Vec<(u64, usize, engine::InstanceId)> = match prepared.page_faults {
+            Some(words) if done.is_some() => prepared
+                .page_work
+                .faults
+                .iter()
+                .enumerate()
+                .map(|(index, &(lane, instance))| (words + index as u64 * 4, lane, instance))
+                .collect(),
+            _ => Vec::new(),
+        };
         let lanes = u32::try_from(prepared.lanes.len()).unwrap_or(u32::MAX);
         // Its staging slot comes back as the step lands.
         let slot = prepared.slot.take().map(crate::inputs::SlotGuard::landing);
@@ -166,7 +185,12 @@ impl Shell {
             }
         };
 
-        let commits: Vec<u64> = flying.iter().map(|flying| flying.commit).collect();
+        let commits: Vec<u64> = flying
+            .iter()
+            .map(|flying| flying.commit)
+            .chain(page_faults.iter().map(|&(word, _, _)| word))
+            .chain(commons.iter().map(|&(word, _)| word))
+            .collect();
         let event = self.settlement.claim()?;
         let at = event.at();
         let tap = match self.tap_tokens(at, &reports, &commits) {
@@ -224,6 +248,27 @@ impl Shell {
                             super::enqueue::fault_of(Fired::Declined, flying.instance, flying.at)
                                 .expect("a declined pass faults");
                         outcome.fault_lanes(flying.lanes.clone(), Some(flying.instance), &reason);
+                    }
+                }
+                for (index, &(_, instance)) in commons.iter().enumerate() {
+                    // SAFETY: as above; the common slot words follow the
+                    // fault words.
+                    let word = unsafe {
+                        *host.add(commits_from + flying.len() + page_faults.len() + index)
+                    };
+                    outcome.beam_common.push((instance, word));
+                }
+                for (index, &(_, lane, instance)) in page_faults.iter().enumerate() {
+                    // SAFETY: as above; the page-list fault words follow the
+                    // commit words.
+                    let word = unsafe { *host.add(commits_from + flying.len() + index) };
+                    if word != 0 {
+                        let lane32 = lane as u32;
+                        outcome.fault_lanes(
+                            lane32..lane32 + 1,
+                            Some(instance),
+                            &super::pages::fault_reason(word, lane),
+                        );
                     }
                 }
             }

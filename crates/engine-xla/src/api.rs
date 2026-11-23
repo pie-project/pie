@@ -589,6 +589,8 @@ impl Engine for Xla {
                     &budgets,
                 )))
                 .unwrap_or(u32::MAX),
+                // Each lane's rung bounds what it replays.
+                replayed_rows: 0,
             },
             has_lora: true,
             has_attn_page_mask: false,

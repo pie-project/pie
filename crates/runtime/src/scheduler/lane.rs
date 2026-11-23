@@ -839,6 +839,9 @@ impl Lane {
                         if !writes.is_empty() {
                             crate::pipeline::fire::record_kv_writes(writes);
                         }
+                        crate::pipeline::fire::record_beam_common(std::mem::take(
+                            &mut outcome.beam_common,
+                        ));
                         let _ = landed_tx.send(LaneRequest::Landed {
                             frame: at.frame,
                             step: at.step,
@@ -854,6 +857,7 @@ impl Lane {
                 let faulted = Arc::clone(&inline_faults);
                 engine.on_complete(std::sync::Arc::new(
                     move |at: engine::StepDone, outcome: engine::StepOutcome| {
+                        crate::pipeline::fire::record_beam_common(outcome.beam_common);
                         if !outcome.wrote.is_empty() {
                             crate::pipeline::fire::record_kv_writes(outcome.wrote);
                         }
@@ -1686,6 +1690,10 @@ impl Lane {
                     HostKvOp::WeightUses => engine
                         .weight_uses()
                         .map(|uses| serde_json::to_vec(&uses).unwrap_or_default())
+                        .map_err(Into::into),
+                    HostKvOp::BeamList(instance, beam) => engine
+                        .beam_list(instance, beam)
+                        .map(|list| list.iter().flat_map(|page| page.to_le_bytes()).collect())
                         .map_err(Into::into),
                     HostKvOp::Layout => Ok(engine
                         .host_kv_layout()

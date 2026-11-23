@@ -19,6 +19,10 @@ pub struct FireRequest {
     /// ([`engine::fire::rung_rows`]): their count where the host places
     /// its rows, a bound on it where the device does.
     pub carried: u32,
+    /// The buffered recurrent rows its lanes replay ahead of their own,
+    /// summed over every lane, a decode lane's included: what the engine's
+    /// stated [`::engine::FireLimits::replayed_rows`] bounds a step by.
+    pub replayed: u32,
     /// The ring ends this fire moves. Two fires moving one end never share
     /// a step; the engine picks each move's cell from its ring's cursor.
     pub ring_moves: Vec<RingMove>,

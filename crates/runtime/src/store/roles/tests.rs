@@ -1591,10 +1591,10 @@ fn a_park_gives_an_instance_s_slots_back_at_once_to_the_next_owner() {
 /// The disk tier's slot file as a fake: whole free chunks taken and given
 /// back.
 #[derive(Default)]
-struct FakeDisk(Mutex<Vec<u32>>, std::sync::atomic::AtomicUsize);
+pub(super) struct FakeDisk(Mutex<Vec<u32>>, std::sync::atomic::AtomicUsize);
 
 impl FakeDisk {
-    fn with(chunks: u32) -> Arc<Self> {
+    pub(super) fn with(chunks: u32) -> Arc<Self> {
         Arc::new(Self(Mutex::new((0..chunks).collect()), Default::default()))
     }
 

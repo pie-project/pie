@@ -385,6 +385,7 @@ fn beam_lanes_leave_their_rows_unfolded_in_rs_list_slots() {
         writes: Some(5..41),
         fold: GroupFold::None,
         snapshots: Vec::new(),
+        beams: false,
     }]);
     assert_eq!(
         demand(&rs, &[ws; 3], &plan),
@@ -426,6 +427,7 @@ fn beam_lanes_leave_their_rows_unfolded_in_rs_list_slots() {
         writes: Some(41..42),
         fold: GroupFold::Host(30),
         snapshots: Vec::new(),
+        beams: false,
     }]);
     let out = prepare_many(&mut rs, &[ws], &fold, None).unwrap();
     settle(&mut rs, out.txn);
@@ -1475,6 +1477,7 @@ fn every_lane_of_a_state_holding_load_states_its_record() {
         writes: None,
         fold: GroupFold::Host(3),
         snapshots: Vec::new(),
+        beams: false,
     }]);
     let out = prepare_many(&mut rs, &[bound, unbound], &plan, None).unwrap();
     let lanes = shared_lanes(&out, &shared, 2);
