@@ -366,6 +366,11 @@ pub struct Shell {
     /// windowed lane's rows past what its ring keeps for its queries, read
     /// as pages of the window slot each fire from these chunks.
     own_top: (u32, u32),
+    /// The frames in flight the own-row region is split between, and the
+    /// part the next fire takes: a fire's own pages stay untouched until its
+    /// fold, after its forward, has read them, while the next fire stages.
+    own_arms: u32,
+    own_arm: u32,
     landed: BTreeMap<u64, Vec<(String, Vec<f32>)>>,
     /// Steps let go before they landed ([`Shell::forget`]): their rows are
     /// dropped as they land rather than held.
@@ -1273,7 +1278,9 @@ impl PreparedLoad<'_> {
                 let past = u64::from(ring.saturating_sub(window.rows)) + 2;
                 let lanes = (widest / past).min(u64::from(boot.budget.max_lanes));
                 let pages = (widest.div_ceil(u64::from(page)) + 2 * lanes) * arms as u64;
-                u32::try_from(pages.div_ceil(per_chunk)).unwrap_or(u32::MAX)
+                // Every arm's share, and a chunk past them for the scratch page
+                // a fold-less lane names.
+                u32::try_from(pages.div_ceil(per_chunk) + 1).unwrap_or(u32::MAX)
             }
             _ => 0,
         };
@@ -1766,6 +1773,8 @@ impl PreparedLoad<'_> {
             own_used: 0,
             ring_shared: std::collections::HashSet::new(),
             own_top,
+            own_arms: u32::try_from(arms).unwrap_or(1).max(1),
+            own_arm: 0,
             landed: BTreeMap::new(),
             forgotten: std::collections::BTreeSet::new(),
             host_rows: crate::diag::on().host_rows,
@@ -3689,17 +3698,18 @@ impl Shell {
             let own_page = u32::try_from(held.max(u64::from(have)) / u64::from(page)).unwrap_or(u32::MAX);
             let count = end.div_ceil(page).saturating_sub(own_page);
             let (first, chunks) = self.own_top;
+            // This fire's part of the region: one arm's share.
+            let per_arm = chunks.saturating_sub(1).saturating_mul(per_chunk) / self.own_arms;
             let mut ids = Vec::with_capacity(count as usize);
             let mut at = Vec::with_capacity(count as usize);
             for _ in 0..count {
-                let slot = self.own_used;
-                if slot >= chunks.saturating_mul(per_chunk) {
+                if self.own_used >= per_arm {
                     return Err(refuse(format!(
-                        "a fire's windowed rows take more own-row pages than the {chunks} chunk(s) \
-                         the load reserved hold ({} pages)",
-                        chunks * per_chunk
+                        "a fire's windowed rows take more own-row pages than an arm's share of \
+                         the {chunks} chunk(s) the load reserved holds ({per_arm} pages)"
                     )));
                 }
+                let slot = self.own_arm * per_arm + self.own_used;
                 self.own_used += 1;
                 let (byte, id) = self.pools.window_slot_at(k, first + slot / per_chunk, slot % per_chunk)?;
                 ids.push(id);
@@ -4950,7 +4960,8 @@ impl Shell {
                     // (arming, the load's own fires, the pipeline walk): no
                     // seat holds a run of window slots, and nothing reads what
                     // such a fire computes, so every page it names is one
-                    // scratch page, the own-row region's first.
+                    // scratch page, in the own-row region's last chunk (past
+                    // every arm's share).
                     let page_size = self.pools.window_paging(k).page_size.max(1);
                     let (first, chunks) = self.own_top;
                     if chunks == 0 {
@@ -4960,7 +4971,7 @@ impl Shell {
                                 .to_string(),
                         ));
                     }
-                    let (_, id) = self.pools.window_slot_at(k, first, 0)?;
+                    let (_, id) = self.pools.window_slot_at(k, first + chunks - 1, 0)?;
                     let after = have.saturating_add(row.rows);
                     vec![id; after.div_ceil(page_size).max(1) as usize]
                 } else {
@@ -6816,6 +6827,9 @@ impl engine::frame::Shell for Shell {
         // queue order lands them before any later fire reads the rings.
         for (k, copies) in std::mem::take(&mut self.window_folds) {
             self.pools.fold_window_rows(&mut frame, k, &copies)?;
+        }
+        if self.own_used > 0 {
+            self.own_arm = (self.own_arm + 1) % self.own_arms;
         }
         let pending = frame.commit_async(Some(Box::new(move |refused: Option<String>| {
             counts.leave();
