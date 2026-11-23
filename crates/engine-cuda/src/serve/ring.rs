@@ -132,7 +132,15 @@ pub fn compose(
     let mut sources: Vec<Source> = Vec::with_capacity(pages as usize);
     for n in 0..pages {
         let ring = lane.ring[(n % ring_pages) as usize];
-        if n < first.min(base_page) {
+        // A page wholly behind the window of the fire's first row reads the
+        // null page, wherever its rows lie (an attention that reads every
+        // key a page holds, a masked one, reads none of them), and its rows
+        // stay where they lie for the fold and the snapshots.
+        if n < first && n >= base_page && n < buffered_end {
+            let slot = lane.buffer[(n - base_page) as usize];
+            out.table.push(null);
+            sources.push(Source::At(slot.1));
+        } else if n < first.min(base_page) {
             out.table.push(null);
             sources.push(Source::Ring);
         } else if n < base_page {
@@ -369,6 +377,28 @@ mod tests {
         assert_eq!(rows, 45);
         assert_eq!(c.snaps[0], (9000, 1000, 0, 16));
         assert_eq!(c.snaps[2], (9002, 5001, 0, 13));
+    }
+
+    #[test]
+    fn a_buffered_page_behind_the_window_reads_the_null_page() {
+        let ring = ring(3);
+        let buffer: Vec<(i32, u64)> = (0..7).map(|p| (10 + p, 100 + p as u64)).collect();
+        // Nothing folded: the whole context in the buffer, past the window.
+        let lane = RingLane {
+            ring: &ring,
+            buffer: &buffer,
+            base: 0,
+            have: 100,
+            rows: 1,
+            folded: 0,
+            fold: 0,
+            alone: true,
+            snapshots: &[],
+        };
+        let mut own = || panic!("no own page");
+        let c = compose(&lane, 16, 20, 0, &mut own).unwrap();
+        // Rows [81, 101) are read: pages 0..=4 lie wholly behind them.
+        assert_eq!(c.table, vec![0, 0, 0, 0, 0, 15, 16]);
     }
 
     #[test]

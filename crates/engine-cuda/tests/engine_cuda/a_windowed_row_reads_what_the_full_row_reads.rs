@@ -200,3 +200,90 @@ fn a_ring_fold_lands_after_every_read_of_its_fire() {
     }
     assert!(forked > 0, "a load whose fires fork regions onto side streams");
 }
+
+/// `served`, its decodes reading a mask (every key but a stretch of the
+/// prompt) through the masked arms.
+fn served_masked(trace: Trace, path: &Path, prompt: &[u32], decodes: u32, ringed: bool) -> Vec<Vec<f32>> {
+    use engine::fire::{Mask, Masking, Readout};
+    let deployment = poem_compiler::catalog::deployment(DEPLOYMENT).expect("the mini");
+    let contract = contract_for(&trace, path).expect("the random planes fit the trace");
+    let mut shell = Shell::load(Boot {
+        voxels: None,
+        residency: engine_cuda::experts::Plan::default(),
+        trace,
+        contract: &contract,
+        checkpoint: path,
+        budget: Budget::new(1, CHUNK),
+        patches: None,
+        page_size: 16,
+        context: 1024,
+        slots: 1,
+        kv_budget: Some(engine_cuda::store::KvSize::Bytes(crate::POOL)),
+        allowance: engine::Allowance::WHOLE,
+        context_declared: false,
+        ordinal: 0,
+        knobs: engine_cuda::Knobs {
+            pin: Some((engine_cuda::Graphs::Off, None)),
+            diagnostics: engine_cuda::serve::diag::Diagnostics {
+                windowed_state: ringed,
+                ..engine_cuda::serve::diag::Diagnostics::default()
+            },
+            ..engine_cuda::Knobs::default()
+        },
+        cache_dir: None,
+        runahead: engine::runahead::Runahead::F1,
+        world: engine_cuda::World::default(),
+        expert: engine_cuda::World::default(),
+        comm: core::ptr::null_mut(),
+    })
+    .expect("the shell loads");
+    shell.open(0).expect("the slot opens");
+    let facts = deployment.trace(poem::Platform::Cuda).facts;
+    let mut out = Vec::new();
+    for chunk in prompt.chunks(CHUNK as usize) {
+        let word = facts.word(&Request::new(chunk.len() as u32, false));
+        let rows = shell
+            .fire(&[Lane { slot: 0, word, tokens: chunk }])
+            .expect("the fire runs");
+        out.push(rows.into_iter().next().expect("one readout"));
+    }
+    for step in 0..decodes {
+        let held = prompt.len() as u32 + step;
+        let columns = held + 1;
+        let mask = Masking::Extent(Mask::new(vec![0, 8, 8, columns - 16], u64::from(columns)));
+        let token = [(step * 7919) % 4096];
+        let word = facts.word(&Request::new(1, false));
+        let seated = engine_cuda::serve::Seated::masked(Lane { slot: 0, word, tokens: &token }, &mask);
+        let rows = shell
+            .fire_rows(&[seated], &[Readout::Last])
+            .expect("the masked fire runs");
+        out.push(rows.into_iter().next().expect("one readout"));
+    }
+    out
+}
+
+// CONTRACT-BC 19: a lane reading a mask of its own through the masked arms
+// reads its windowed rows from ring + buffer as from the window lists.
+#[test]
+fn a_masked_lane_reads_its_ring_as_its_window_list() {
+    if !engine_cuda::device::present() {
+        eprintln!("no CUDA device: skipping");
+        return;
+    }
+    let trace = poem_compiler::catalog::deployment(DEPLOYMENT)
+        .expect("the mini gemma")
+        .trace(Platform::Cuda);
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let path = Weights::random(&trace, 703).write(dir.path());
+    let prompt: Vec<u32> = (0..3 * CHUNK).map(|at| (at * 31 + 5) % 4096).collect();
+    let want = served_masked(trace.clone(), &path, &prompt, 48, false);
+    let got = served_masked(trace, &path, &prompt, 48, true);
+    for (step, (got, want)) in got.iter().zip(&want).enumerate() {
+        let apart = got
+            .iter()
+            .zip(want)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(apart, 0, "fire {step}: {apart} logits apart from the window list's");
+    }
+}
