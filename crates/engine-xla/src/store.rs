@@ -140,6 +140,9 @@ enum Seat {
 }
 
 pub struct Pools {
+    /// The windowed layers whose rings the record holds (CONTRACT-BC 21),
+    /// as the load states them ([`Pools::set_windowed`]).
+    windowed: Vec<engine::chunk::WindowedLayer>,
     /// The pool; `None` while a program holds it (or on a dry device).
     buffer: Option<Buffer>,
     root: Tensor,
@@ -432,6 +435,7 @@ fn layout_rows<'a>(
             state,
             compressor,
             rs,
+            rings: true,
         },
         heads,
     ))
@@ -680,6 +684,7 @@ impl Pools {
             "xla state pool laid"
         );
         Ok(Pools {
+            windowed: Vec::new(),
             buffer,
             root,
             table: ChunkTable::identity(chunks),
@@ -961,22 +966,23 @@ impl Pools {
                         rate: 1,
                         window: None,
                     },
-                    Kind::Window { window } => SlotKind::List {
+                    // the window buffer (CONTRACT-BC 19, 21)
+                    Kind::Window { .. } => SlotKind::List {
                         tokens: shape.tokens,
                         rate: 1,
-                        window: Some(window),
+                        window: None,
                     },
-                    Kind::Fixed { pieces } => SlotKind::Fixed { pieces },
+                    Kind::Fixed { pieces } | Kind::Ring { pieces } => SlotKind::Fixed { pieces },
                 },
                 slot_bytes: shape.slot_bytes,
                 slots_per_chunk: self.layout.slots_per_chunk(shape),
                 sets_per_working_set: 1,
                 rows: shape.rows.clone(),
                 pinned: None,
-                role: if shape.kind == Kind::Rs {
-                    SlotRole::RsBuffer
-                } else {
-                    SlotRole::State
+                role: match shape.kind {
+                    Kind::Rs => SlotRole::RsBuffer,
+                    Kind::Window { .. } => SlotRole::WindowBuffer,
+                    _ => SlotRole::State,
                 },
             })
             .chain(std::iter::once(SlotShape {
@@ -1027,8 +1033,13 @@ impl Pools {
             disk_persistent: false,
             disk_kept: false,
             weights: Vec::new(),
-            record_bytes: 0,
-            windowed: Vec::new(),
+            // the record's bytes where it holds the rings
+            record_bytes: if self.windowed.is_empty() {
+                0
+            } else {
+                self.state_slot_bytes()
+            },
+            windowed: self.windowed.clone(),
         }
     }
 
@@ -1325,6 +1336,29 @@ impl Pools {
     #[must_use]
     pub fn has_state(&self) -> bool {
         !self.records.is_empty()
+    }
+
+    /// States the windowed layers of `recipe` (`poem_compiler::chunk::
+    /// plan_windowed`'s), each its ring's bytes in the record as the ring
+    /// hook shared them out ([`Rings`]).
+    pub fn set_windowed(&mut self, recipe: &poem_compiler::chunk::WindowedRecipe) {
+        let Some(ring) = self.layout.ring() else {
+            self.windowed = Vec::new();
+            return;
+        };
+        let _ = ring;
+        self.windowed = recipe
+            .layers
+            .iter()
+            .zip(&recipe.region.layer_bytes)
+            .filter_map(|(l, &bytes)| {
+                Some(engine::chunk::WindowedLayer {
+                    layer: l.layer?,
+                    window: l.window,
+                    bytes,
+                })
+            })
+            .collect();
     }
 
     /// A working set's record: every fixed shape's pieces.
@@ -2228,4 +2262,39 @@ fn state_block(slab: &[u64], elem: u64) -> (u64, u64) {
 
 fn narrow(n: u64) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// XLA's ring hook (`poem_compiler::chunk::RingLayout`): the rings are the
+/// record's ring pages ([`layout::Kind::Ring`]), each laid exactly as a
+/// window-buffer slot, so a kernel reads a ring page by a page id of the
+/// window buffer's grain; the widest window in pages and one page more,
+/// placed in the record at a page's bytes. Each layer's share is its rows
+/// of those pages, the slot's padding the last layer's.
+pub struct Rings;
+
+impl poem_compiler::chunk::RingLayout for Rings {
+    fn ring_region(
+        &self,
+        layers: &[poem_compiler::chunk::WindowedRow],
+        buffer: &poem_compiler::chunk::WindowBufferSlot<'_>,
+    ) -> poem_compiler::chunk::RingRegion {
+        let tokens = buffer.tokens.max(1);
+        let widest = layers.iter().map(|l| l.window).max().unwrap_or(0);
+        let pages = u64::from(widest.div_ceil(tokens) + 1);
+        let bytes = pages * buffer.bytes;
+        let mut layer_bytes: Vec<u64> = layers
+            .iter()
+            .map(|l| pages * u64::from(tokens) * l.per_token)
+            .collect();
+        let shared: u64 = layer_bytes.iter().sum();
+        if let Some(last) = layer_bytes.last_mut() {
+            *last += bytes.saturating_sub(shared);
+        }
+        poem_compiler::chunk::RingRegion {
+            bytes,
+            atom: buffer.bytes,
+            placement: poem_compiler::chunk::RingPlacement::Aligned(buffer.bytes),
+            layer_bytes,
+        }
+    }
 }

@@ -728,17 +728,24 @@ impl Shell {
         let rs_layout = crate::rs::Layout::read(&boot.trace)?.map(std::sync::Arc::new);
         // The chunk the compiler picks for this trace on a TPU, where it
         // packs one; the store lays its own runs around it.
-        let target = poem_compiler::chunk::plan(
+        // Windowed layers as ring + buffer (CONTRACT-BC 19, 21): the recipe
+        // asks the store's ring hook where the rings lie.
+        let recipe = poem_compiler::chunk::plan_windowed(
             &boot.trace,
             &budgets,
             &poem_compiler::DeviceProfile {
                 chunk: poem_compiler::chunk::ChunkProfile::TPU.paged(boot.page_size, boot.context),
                 ..poem_compiler::DeviceProfile::default()
             },
+            &crate::store::Rings,
         )
-        .map_or(crate::store::layout::TARGET_CHUNK, |recipe| {
-            recipe.chunk_bytes
-        });
+        .ok();
+        let target = recipe
+            .as_ref()
+            .map_or(crate::store::layout::TARGET_CHUNK, |recipe| {
+                recipe.chunk_bytes
+            });
+        let windowed_recipe = recipe.and_then(|recipe| recipe.windowed);
         // The null and sink chunks the pool lays past its pages, which a
         // budget of kv pages and state slots does not pay for: off the room.
         let reserved = crate::store::reserved_bytes(
@@ -975,6 +982,9 @@ impl Shell {
             &staging,
         )?;
         let mut pools = pools;
+        if let Some(windowed) = &windowed_recipe {
+            pools.set_windowed(windowed);
+        }
         let mut staging_facts = staging_facts;
         staging_facts.bulk_bytes = pools.bulk_ring().1;
         streamed.renumber(narrow(pools.layout().shapes.len() as u64) as u32);

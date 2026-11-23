@@ -110,8 +110,18 @@ pub const ADAPTER: engine::chunk::ShapeId = engine::chunk::ShapeId((1 << 17) + 2
 pub enum Kind {
     /// The kv list.
     Kv,
-    /// The window list, its rows retaining `window` tokens.
+    /// The window list, its rows retaining `window` tokens: under the
+    /// windowed state (CONTRACT-BC 19, 21) the window buffer, its slots the
+    /// lane's unfolded windowed rows.
     Window { window: u32 },
+    /// The windowed layers' rings, the lane's record (`SlotRole::State`,
+    /// `RingPlacement::Aligned`): `pieces` slots each laid exactly as a
+    /// window-buffer slot (every windowed row's page of rows, layer-major;
+    /// it reads by the window list's planes), so a ring page is named by a
+    /// grain index of the window buffer's grain. Folded row `r` lies on
+    /// ring page `(r / page) mod pieces`; `pieces` is the widest window in
+    /// pages and one page more.
+    Ring { pieces: u32 },
     /// A fixed shape: state blocks of one size, a record `pieces` slots.
     Fixed { pieces: u32 },
     /// The rs list.
@@ -134,7 +144,7 @@ impl Shape {
     #[must_use]
     pub fn pieces(&self) -> u32 {
         match self.kind {
-            Kind::Fixed { pieces } => pieces,
+            Kind::Fixed { pieces } | Kind::Ring { pieces } => pieces,
             _ => 1,
         }
     }
@@ -203,6 +213,10 @@ pub struct Rows<'a> {
     pub compressor: Vec<(u32, u32)>,
     /// The rs layout's planes `(width, dtype)`.
     pub rs: Vec<(u32, Dtype)>,
+    /// Windowed rows served as ring + buffer (CONTRACT-BC 19, 21): the
+    /// window list is the window buffer and the record holds the rings
+    /// ([`Kind::Ring`]).
+    pub rings: bool,
 }
 
 impl Layout {
@@ -255,13 +269,26 @@ impl Layout {
             let window = rows.window.ok_or_else(|| Fault::Unbound {
                 what: "windowed kv rows with no window to keep them by".to_string(),
             })?;
-            shapes.push(list(
-                id(),
-                Kind::Window { window },
-                page,
-                &window_rows,
-                rows.trace,
-            )?);
+            if rows.rings && (rows.state.iter().any(Option::is_some) || !rows.rs.is_empty()) {
+                return Err(Fault::Unbound {
+                    what: "a model with recurrent state beside windowed layers: its record would \
+                           hold the rings beside the state, which this engine does not lay yet"
+                        .to_string(),
+                });
+            }
+            let buffer = list(id(), Kind::Window { window }, page, &window_rows, rows.trace)?;
+            let ring = rows.rings.then(|| Shape {
+                id: id(),
+                kind: Kind::Ring {
+                    pieces: window.div_ceil(page) + 1,
+                },
+                tokens: 0,
+                slot_bytes: buffer.slot_bytes,
+                planes: Vec::new(),
+                rows: buffer.rows.clone(),
+            });
+            shapes.push(buffer);
+            shapes.extend(ring);
         }
         // One fixed shape a distinct state block size, in row order of its
         // first row.
@@ -429,7 +456,14 @@ impl Layout {
     }
 
     #[must_use]
-    pub fn window(&self) -> Option<&Shape> {
+    /// The rings' shape, where the record holds them ([`Kind::Ring`]).
+    pub fn ring(&self) -> Option<&Shape> {
+        self.shapes
+            .iter()
+            .find(|s| matches!(s.kind, Kind::Ring { .. }))
+    }
+
+        pub fn window(&self) -> Option<&Shape> {
         self.shapes
             .iter()
             .find(|s| matches!(s.kind, Kind::Window { .. }))
@@ -443,7 +477,7 @@ impl Layout {
     pub fn fixed(&self) -> impl Iterator<Item = &Shape> {
         self.shapes
             .iter()
-            .filter(|s| matches!(s.kind, Kind::Fixed { .. }))
+            .filter(|s| matches!(s.kind, Kind::Fixed { .. } | Kind::Ring { .. }))
     }
 
     /// The shape and plane `what` lies in.
