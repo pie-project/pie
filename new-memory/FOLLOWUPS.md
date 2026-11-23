@@ -1189,3 +1189,30 @@ What each still times at load or boot, for its owner (paths under `crates/`):
   (`engine_gpu::dense::by_shape`; by the roofline where one is stated); with curves but no roofline, the curves
   weigh it (`dense::choose_unrated`). Still open: the Adreno 840's committed profile (`adreno-tm-840`, a
   commented slot in each backend's `SEEDED`) awaits the phone's export.
+
+## F60. gemma-4-E4B's logits move with how a prompt is cut into fires (pre-existing on main; explained, no bug; MI300X, 2026-11-23)
+A row's logits on gemma-4-E4B move up to about 2.5 at top-1 (logits 15-25) with how the prompt
+before it is cut into fires: a prefix hit (the cached run re-prefills the prompt's last row in a
+1-row fire), a client splitting the prompt into turns (59 + 1, 30 + 30), or a chunked prefill alike.
+Fresh vs cached on a 60-token prompt, 600 steps: top-1 |diff| up to 2.56 (main ecfd6ed57: 2.16),
+14-19/600 steps bit-identical; one prompt in two parts at row 61-64. A cached run against another
+cached run is bit-identical, and the gap is already at the first cached row (row 59: 15.0000 vs
+14.5625, 1.0859 vs 0.8945, the same on main and 8ed8f8679). It does not grow (per-50-step max 2.16
+to 0.375 by row 600). Qwen3-0.6B moves 0.125-0.25 under the same cuts; gpt-oss-20b 1-2 bf16 ulps.
+- Cause, from row 59's activations at every node (one 60-row fire against the 59 + 1 split's 1-row
+  fire, 946 nodes, full-vector relative L2): bf16 rounding accumulating over 42 layers, each op
+  adding about one rounding (2^-8). The residual stream parts by 0.08% at layer 0, 0.4-1.1% from
+  layer 8 on; no layer steps. The per-layer embeddings are bit-identical in every layer; the
+  KV-sharing layers (norm_rope, no K/V write) add nothing past their inputs; the one jump (0.52% to
+  1.54%) is the final norm at |x| 122, amplifying what it is handed. The final hidden state's 1.5%
+  becomes 0.19-0.44 at row 59's logits through the 262144-wide head and softcap. Prefill-shaped and
+  decode-shaped kernels (attn.prefill vs attn.decode, matmul tiling) round differently, so any
+  re-chunking moves a row; gemma's depth, activations (to |x| 662) and logit scale make it visible.
+- Gate criterion: fresh vs cached (and any cut vs uncut) is judged per model, within that model's own
+  re-chunking spread, measured as one fire against a client split of the same prompt on servers with
+  no prefix cache; not a fixed 2 ulps. A pass has no step at the window W and no growth past it.
+  Reference spreads (top-1 |diff|, 60-token prompt): gemma-4-E4B up to 2.5; Qwen3-0.6B 0.125-0.25;
+  gpt-oss-20b 1-2 ulps (0.03-0.125).
+- Not compared directly: attn.prefill against attn.decode (their outputs take other value ids; the
+  projections after them agree to 0.8-1.5%) and the final matmul_softcap (the one-fire run reads it
+  out through gather.rows).
