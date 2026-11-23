@@ -2870,7 +2870,22 @@ impl Shell {
         let mut frame = self.device.frame()?;
         self.pools.copy_state(&mut frame, state)?;
         if !rings.is_empty() {
-            self.pools.copy_shape(&mut frame, crate::store::layout::RING, rings)?;
+            // A ring piece is one chunk's run of window slots (the slot refs
+            // `windowed_pages` reads it by): copied slot by slot, of the
+            // load's one window table (the buffer's).
+            for k in 0..1usize {
+                let per = self.pools.window_slots_a_chunk(k)?;
+                let mut copies = Vec::with_capacity(rings.len() * per as usize);
+                for &(run, cow) in rings {
+                    for j in 0..per {
+                        copies.push((
+                            self.pools.window_slot_offset(k, run * per + j)?,
+                            self.pools.window_slot_offset(k, cow * per + j)?,
+                        ));
+                    }
+                }
+                self.pools.copy_window_slots(&mut frame, k, &copies)?;
+            }
         }
         self.grafted = Some(frame.commit_async(None)?);
         Ok(())
