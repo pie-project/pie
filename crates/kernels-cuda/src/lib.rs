@@ -14,6 +14,7 @@ pub mod sampling;
 pub mod seat;
 pub mod sizing;
 pub mod source;
+pub mod stored;
 pub mod ssm;
 pub mod synth;
 pub mod tally;

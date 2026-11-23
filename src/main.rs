@@ -25,7 +25,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    Serve,
+    Serve(ServeArgs),
 
     Run(ops::run::RunArgs),
 
@@ -63,6 +63,16 @@ enum Command {
     Tune(ops::tune::TuneArgs),
 
     Doctor,
+}
+
+#[derive(clap::Args, Debug)]
+struct ServeArgs {
+    /// Time no device measurement at load (`[engine] measure = false`):
+    /// each rate, curve and settle no stored or committed profile states is
+    /// served by the engine's estimate, named in the load log, and nothing
+    /// is stored. Vulkan, wgpu, and a one-device cuda engine (CUDA or ROCm).
+    #[arg(long)]
+    no_measure: bool,
 }
 
 #[cfg(unix)]
@@ -122,14 +132,14 @@ async fn main() -> ExitCode {
 async fn run() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
 
-    if let Command::Serve = cli.command {
-        return serve(cli.global, cli.diag.as_deref()).await;
+    if let Command::Serve(args) = &cli.command {
+        return serve(cli.global, cli.diag.as_deref(), args.no_measure).await;
     }
 
     pie::daemon::init_command(&cli.global);
 
     let answer = match cli.command {
-        Command::Serve => unreachable!("serve returns before the op dispatch"),
+        Command::Serve(_) => unreachable!("serve returns before the op dispatch"),
 
         Command::Model { cmd } => {
             let global = cli.global.clone();
@@ -161,7 +171,11 @@ async fn run() -> anyhow::Result<ExitCode> {
     Ok(code)
 }
 
-async fn serve(global: pie::args::GlobalArgs, diag: Option<&str>) -> anyhow::Result<ExitCode> {
+async fn serve(
+    global: pie::args::GlobalArgs,
+    diag: Option<&str>,
+    no_measure: bool,
+) -> anyhow::Result<ExitCode> {
     let ctx = pie::daemon::init(
         pie::daemon::BootSpec::pie().version(env!("CARGO_PKG_VERSION")),
         global,
@@ -170,6 +184,9 @@ async fn serve(global: pie::args::GlobalArgs, diag: Option<&str>) -> anyhow::Res
         worker::standalone::derive_standalone(ctx.config_str(), Some(ctx.config_path()))?;
     if let Some(words) = diag {
         worker.state_diagnostics(words)?;
+    }
+    if no_measure {
+        worker.skip_measuring()?;
     }
     let handle =
         worker::standalone::run_standalone(controller, gateway, worker, &pie::paths::pie_home())

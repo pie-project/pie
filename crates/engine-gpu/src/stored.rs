@@ -80,6 +80,11 @@ pub fn by<'k>(
                 })
         })
         .collect::<Result<Vec<_>>>()?;
+    // Sorted by name, once each: the key is its content whatever order the
+    // measurement fired its kernels in.
+    let mut kernels = kernels;
+    kernels.sort();
+    kernels.dedup();
     Ok(MeasuredBy { method, kernels })
 }
 
@@ -99,13 +104,18 @@ pub fn code(target: Target, kernel: &str) -> Option<u32> {
 /// settle) is keyed by. A kernel the build does not carry is refused by
 /// name.
 pub fn code_of_all(target: Target, kernels: &BTreeSet<Kernel>) -> Result<u32> {
+    // By name, once each: the key is the kernels' content, whatever order
+    // their set is kept in.
+    let mut keys: Vec<&str> = kernels.iter().map(|kernel| kernel.key).collect();
+    keys.sort_unstable();
+    keys.dedup();
     let mut bytes = Vec::new();
-    for kernel in kernels {
-        let code = code(target, kernel.key).ok_or_else(|| Fault::Device {
+    for key in keys {
+        let code = code(target, key).ok_or_else(|| Fault::Device {
             call: "stored key",
-            why: format!("kernel `{}` is not in this build", kernel.key),
+            why: format!("kernel `{key}` is not in this build"),
         })?;
-        bytes.extend_from_slice(kernel.key.as_bytes());
+        bytes.extend_from_slice(key.as_bytes());
         bytes.push(0);
         bytes.extend_from_slice(&code.to_le_bytes());
     }

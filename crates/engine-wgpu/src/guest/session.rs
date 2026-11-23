@@ -1,11 +1,9 @@
 use std::sync::Arc;
 
-use std::cell::Cell;
-use std::sync::atomic::{AtomicU32, Ordering};
-
 use eta_compiler::codegen::launch::LaunchPackage;
 use eta_exec::{Extents, ValueDesc};
 
+use super::outbox::{Outbox, Pool};
 use crate::device::Context;
 use crate::device::alloc::Buffer;
 use crate::device::ctx::{Core, Frame};
@@ -174,12 +172,6 @@ fn values_in_heap(
     Ok(())
 }
 
-thread_local! {
-    /// The readback buffer this thread collects its stages through, taken on
-    /// its first collect.
-    static OUTBOX: Cell<Option<u32>> = const { Cell::new(None) };
-}
-
 /// Every guest pipeline: one a call of the closed set
 /// ([`engine_gpu::guest::step_calls`]), each from a module of its own, all
 /// on one layout. Built at load, before the engine serves, and shared by
@@ -201,12 +193,9 @@ pub struct Library {
     pipelines: std::sync::Mutex<Vec<std::result::Result<wgpu::ComputePipeline, String>>>,
     /// Pipelines built after the load, at a bind.
     serving: std::sync::atomic::AtomicU64,
-    /// One readback buffer for each thread that runs guest passes, made at
-    /// load: a stage's collect copies its status and puts there and maps it
-    /// on the thread that ran it (a mapped buffer takes no part in a
-    /// submission, so the threads share none).
-    outboxes: Vec<Buffer>,
-    taken: AtomicU32,
+    /// The readback buffers made at load: a frame's passes copy their
+    /// status and puts into the one it takes ([`super::outbox`]).
+    outboxes: Arc<Pool>,
 }
 
 impl std::fmt::Debug for Library {
@@ -219,16 +208,10 @@ impl std::fmt::Debug for Library {
 }
 
 impl Library {
-    /// Where every live instance's slots and heap lie.
-    #[must_use]
-    pub fn claims(&self) -> &Claims {
-        &self.claims
-    }
-
-    /// The guest pipelines, reading back through `outboxes` (one a thread
-    /// that runs guest passes, which the load's shelf reserved), and a bind
-    /// group for each pair of the pool's `segments`.
-    pub fn build(device: &Context, outboxes: Vec<Buffer>, segments: &[&Buffer]) -> Result<Library> {
+    /// The guest pipelines, reading back through `outboxes` (which the
+    /// load's shelf reserved), and a bind group for each pair of the pool's
+    /// `segments`.
+    pub fn build(device: &Context, outboxes: Arc<Pool>, segments: &[&Buffer]) -> Result<Library> {
         let core = device.core().clone();
         let binds = bind_layout(&core);
         let layout = core
@@ -260,7 +243,6 @@ impl Library {
             pipelines: std::sync::Mutex::new(pipelines),
             serving: std::sync::atomic::AtomicU64::new(0),
             outboxes,
-            taken: AtomicU32::new(0),
         };
         for (call, why) in library
             .pipelines
@@ -301,28 +283,11 @@ impl Library {
         pipelines.iter().filter(|built| built.is_ok()).count()
     }
 
-    /// The bytes one stage's collect reads back at most: each thread's
-    /// readback buffer.
+    /// The bytes one frame's passes read back at most: each readback
+    /// buffer's.
     #[must_use]
     pub fn outbox_bytes(&self) -> u64 {
-        self.outboxes.first().map_or(0, Buffer::bytes)
-    }
-
-    /// This thread's readback buffer, taken on its first collect.
-    fn outbox(&self) -> Result<&Buffer> {
-        let at = match OUTBOX.get() {
-            Some(at) => at,
-            None => {
-                let at = self.taken.fetch_add(1, Ordering::Relaxed);
-                OUTBOX.set(Some(at));
-                at
-            }
-        };
-        self.outboxes.get(at as usize).ok_or(Fault::Ceiling {
-            what: "threads collecting a guest stage (the readback buffers made at load)",
-            need: u64::from(at) + 1,
-            have: self.outboxes.len() as u64,
-        })
+        self.outboxes.bytes()
     }
 
     /// Why call `call` has no pipeline built, or `None` where it has one.
@@ -337,6 +302,14 @@ impl Library {
                 pipelines.len()
             )),
         }
+    }
+
+    /// Claims every holder's runs where an evacuation left them, in one
+    /// step ([`Claims::claim_all`]): refused by name, every claim as it
+    /// stood, where one lands on another's.
+    pub fn claim_moved(&self, moved: &[(Holder, Vec<Run>)]) -> Result<()> {
+        self.claims.claim_all(moved)?;
+        Ok(())
     }
 
     /// The pipelines built after the load, each at a bind that found its
@@ -412,13 +385,66 @@ struct Stage {
     /// Its heap ([`engine_gpu::guest::state`]): the side whose state it
     /// lies in, its first byte there and its bytes.
     heap: (Side, u64, u64),
+}
 
-    /// The readback buffer its last read-back went to (its thread's).
-    outbox: Option<Buffer>,
+/// What a pass read back: its span of its frame's readback buffer (its
+/// status, then each value the host reads), collected once the frame lands.
+#[derive(Debug, Clone)]
+pub struct Pass {
+    outbox: Arc<Outbox>,
+    at: u64,
+    /// (value, byte from `at`, bytes) each value read back.
+    layout: Vec<(u32, u64, u64)>,
+}
 
-    outbox_layout: Vec<(u32, u64, u64)>,
+impl Pass {
+    /// The frame's readback buffer this pass read back into.
+    #[must_use]
+    pub fn outbox(&self) -> &Arc<Outbox> {
+        &self.outbox
+    }
 
-    collected: Vec<u8>,
+    /// Its stage's fault code, if it faulted, the frame collected: the
+    /// runtimes' status layout ([`eta_exec::Status`]), a fault the state
+    /// `Fault` with its code in the word after. A stage that ran clean
+    /// leaves its status unset; any other state is a status something else
+    /// overwrote, refused by name rather than read as a code.
+    pub fn status(&self) -> Result<Option<u32>> {
+        let raw = self
+            .outbox
+            .collected(self.at, STATUS_SPAN)
+            .ok_or_else(|| Fault::Program {
+                at: "guest::session",
+                why: "a pass's status was read before its frame was collected".into(),
+            })?;
+        let status = eta_exec::Status::read(raw).ok_or_else(|| Fault::Program {
+            at: "guest::session",
+            why: "a pass's status is short".into(),
+        })?;
+        read_status(status).map_err(|why| Fault::Program {
+            at: "guest::session",
+            why: format!("a pass's {why}"),
+        })
+    }
+
+    /// Value `value`'s bytes, `held` of them, the frame collected.
+    pub fn value(&self, value: u32, held: u64) -> Result<Vec<u8>> {
+        let &(_, into, len) = self
+            .layout
+            .iter()
+            .find(|&&(seated, _, _)| seated == value)
+            .ok_or_else(|| Fault::Program {
+                at: "guest::session",
+                why: format!("value {value} was not read back by its pass"),
+            })?;
+        self.outbox
+            .collected(self.at + into, len.min(held))
+            .map(<[u8]>::to_vec)
+            .ok_or_else(|| Fault::Program {
+                at: "guest::session",
+                why: format!("value {value} was read before its frame was collected"),
+            })
+    }
 }
 
 /// Where an evacuation leaves a session ([`Session::resolve`]), to put it
@@ -428,8 +454,9 @@ pub struct Rebound {
     stages: Vec<([Held; 4], Held)>,
     instance: Pair,
     pair: Pair,
-    /// Each stage's step records as they name the session there.
-    records: Vec<Vec<u8>>,
+    /// Each stage's step records as they name the session there; none for
+    /// a parked session, whose unpark writes them.
+    records: Option<Vec<Vec<u8>>>,
     /// The runs its own state takes there, by its claims' name.
     pub own: (Holder, Vec<Run>),
     /// Its pair group's there, where it is bound on one.
@@ -458,6 +485,11 @@ pub struct Session {
     scores: Option<(u64, u64)>,
 
     library: Arc<Library>,
+
+    /// The cells its channels keep on the device, by the program's index.
+    cells: engine_gpu::guest::defer::Cells<crate::device::Api>,
+    /// Passes submitted and not yet waited on, oldest first.
+    airborne: std::collections::VecDeque<crate::device::Pending>,
 }
 
 impl std::fmt::Debug for Session {
@@ -471,6 +503,8 @@ impl std::fmt::Debug for Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        // Its passes on the queue land before its slots go back.
+        let _ = self.settle();
         self.library.claims.release(self.claim);
     }
 }
@@ -500,6 +534,7 @@ impl Session {
         tables: &Tables<'_>,
         [instance, pair]: [Pair; 2],
         layout: &GuestLayout,
+        cells: engine_gpu::guest::defer::Cells<crate::device::Api>,
     ) -> Result<Session> {
         let plans = &package.plans;
         if code.len() != plans.len() {
@@ -604,14 +639,15 @@ impl Session {
             pair,
             scores: layout.scores,
             library,
+            cells,
+            airborne: std::collections::VecDeque::new(),
         };
         session.locate()?;
         Ok(session)
     }
 
-    /// Writes each stage's step records with where the instance lies now,
-    /// each base checked ([`bases`]), and claims its slots and heap
-    /// ([`Claims`]): at the bind, and again where they moved.
+    /// Claims its slots and heap ([`Claims`]), then writes its step
+    /// records there ([`Self::write_records`]): at the bind and a rebind.
     fn locate(&self) -> Result<()> {
         // Claimed before a record is written there.
         self.claim_runs()?;
@@ -743,13 +779,16 @@ impl Session {
         heap_span([&self.instance, &self.pair], stage.heap)
     }
 
-    /// Where the stages' tables and records, the status and the guest's
-    /// state lie under `pools`' chunk table, an evacuation's not yet
+    /// Where the stages' tables and records, the status and, bound, the
+    /// guest's state lie under `pools`' chunk table, an evacuation's not yet
     /// committed, each checked as [`Self::locate`] checks it, with the runs
-    /// the session and its pair would hold there; nothing changed. The
-    /// caller claims the runs of every session it moves as one, then
-    /// installs each ([`Self::install`]).
-    pub fn resolve(&mut self, pools: &Pools<crate::device::Api>) -> Result<Rebound> {
+    /// the session and its pair would hold there; nothing changed. A park
+    /// that kept its tables in place (`parked`) holds their run alone, as
+    /// its park claimed: its state and its share of its pair went back at
+    /// its park, and its unpark writes its records. The caller claims every
+    /// holder's runs in one step ([`Library::claim_moved`]), then installs
+    /// each ([`Self::install`]).
+    pub fn resolve(&mut self, pools: &Pools<crate::device::Api>, parked: bool) -> Result<Rebound> {
         let mut rebound = Rebound {
             status: self.status.clone(),
             stages: self
@@ -759,7 +798,7 @@ impl Session {
                 .collect(),
             instance: self.instance.clone(),
             pair: self.pair.clone(),
-            records: Vec::new(),
+            records: None,
             own: (Holder::Instance(self.claim), Vec::new()),
             pair_runs: None,
         };
@@ -770,28 +809,36 @@ impl Session {
             args.rebind(pools)?;
         }
         rebound.status.rebind(pools)?;
-        rebound.instance.rebind(pools)?;
-        rebound.pair.rebind(pools)?;
+        if !parked {
+            rebound.instance.rebind(pools)?;
+            rebound.pair.rebind(pools)?;
+        }
         // Checked as the session would lie there, then put back.
         self.swap(&mut rebound);
-        let records = self.records();
+        let records = (!parked).then(|| self.records()).transpose();
         let own = self.own_runs();
         let pair = self.pair_runs();
         self.swap(&mut rebound);
         rebound.records = records?;
-        rebound.own.1 = own;
-        // The evacuation moved the pair's state for every instance on it:
-        // the group's move, claimed with the members' own.
-        rebound.pair_runs = self.pair_group.map(|(group, _)| (Holder::Pair(group), pair));
+        if parked {
+            rebound.own.1 = own.into_iter().take(1).collect();
+        } else {
+            rebound.own.1 = own;
+            // The pair's state moved for every instance on it: the group's.
+            rebound.pair_runs = self.pair_group.map(|(group, _)| (Holder::Pair(group), pair));
+        }
         Ok(rebound)
     }
 
     /// Puts the session where [`Self::resolve`] resolved it, the
     /// evacuation's copies committed and its runs claimed: the step records
-    /// name it there.
+    /// name it there, where it is bound.
     pub fn install(&mut self, mut rebound: Rebound) -> Result<()> {
         self.swap(&mut rebound);
-        self.write_records(&rebound.records)
+        match &rebound.records {
+            Some(records) => self.write_records(records),
+            None => Ok(()),
+        }
     }
 
     /// The session's places and `rebound`'s, each the other's.
@@ -951,7 +998,10 @@ impl Session {
         Ok(())
     }
 
-    pub fn read_back(&mut self, frame: &mut Frame, stage: usize, values: &[u32]) -> Result<()> {
+    /// Copies the stage's status and `values` into the frame's readback
+    /// buffer, each from a word: what the pass reads back once its frame
+    /// lands, which it holds until it drops.
+    pub fn read_back(&mut self, frame: &mut Frame, stage: usize, values: &[u32]) -> Result<Pass> {
         let mut layout = Vec::with_capacity(values.len());
         let mut cursor = STATUS_SPAN;
         for &value in values {
@@ -966,93 +1016,110 @@ impl Session {
         }
         let (heap, base, _) = self.heap_at(stage)?;
         let heap = heap.clone();
-        let outbox = self.library.outbox()?.clone();
-        if outbox.bytes() < cursor {
-            return Err(Fault::Ceiling {
-                what: "bytes one guest stage reads back (a thread's readback buffer)",
-                need: cursor,
-                have: outbox.bytes(),
-            });
+        let outbox = frame.guest_outbox(&self.library.outboxes);
+        let into = outbox.reserve(cursor)?;
+        let status = &self.status;
+        frame.copy(
+            status.buffer(),
+            status.offset(),
+            outbox.buffer(),
+            into,
+            STATUS_SPAN,
+        )?;
+        for &(_, at, from, len) in &layout {
+            frame.copy(&heap, base + at, outbox.buffer(), into + from, len)?;
         }
-        let Session { status, stages, .. } = self;
-        let seat = &mut stages[stage];
-        frame.copy(status.buffer(), status.offset(), &outbox, 0, STATUS_SPAN)?;
-        for &(_, at, into, len) in &layout {
-            frame.copy(&heap, base + at, &outbox, into, len)?;
-        }
-        seat.outbox = Some(outbox);
-        seat.outbox_layout = layout
-            .into_iter()
-            .map(|(value, _, into, len)| (value, into, len))
-            .collect();
-        seat.collected.clear();
-        Ok(())
+        Ok(Pass {
+            outbox,
+            at: into,
+            layout: layout
+                .into_iter()
+                .map(|(value, _, from, len)| (value, from, len))
+                .collect(),
+        })
     }
 
-    pub fn collect(&mut self, stage: usize) -> Result<()> {
-        let stages = self.stages.len();
-        let seat = self.stages.get_mut(stage).ok_or_else(|| Fault::Program {
-            at: "guest::session",
-            why: format!("stage {stage} is past this package's {stages}"),
-        })?;
-        let span = seat
-            .outbox_layout
-            .last()
-            .map_or(STATUS_SPAN, |&(_, into, len)| into + len);
-        let mut out = vec![0u8; span as usize];
-        seat.outbox
-            .as_ref()
-            .ok_or_else(|| Fault::Program {
-                at: "guest::session",
-                why: format!("stage {stage} was collected before it was read back"),
-            })?
-            .read(0, &mut out)?;
-        seat.collected = out;
-        Ok(())
-    }
-
-    pub fn taken(&self, stage: usize, value: u32) -> Result<Vec<u8>> {
-        let (_, held) = self.span(stage, value).ok_or_else(|| Fault::Program {
+    /// Copies `value` into the device's cell for `channel`, in place of a
+    /// read back: the next fire's take of the channel restores it.
+    pub fn keep(
+        &mut self,
+        frame: &mut Frame,
+        stage: usize,
+        value: u32,
+        channel: u32,
+    ) -> Result<()> {
+        let (at, len) = self.span(stage, value).ok_or_else(|| Fault::Program {
             at: "guest::session",
             why: format!("value {value} is not stage {stage}'s"),
         })?;
-        let seat = &self.stages[stage];
-        let &(_, into, len) = seat
-            .outbox_layout
-            .iter()
-            .find(|&&(seated, _, _)| seated == value)
-            .ok_or_else(|| Fault::Program {
-                at: "guest::session",
-                why: format!("value {value} of stage {stage} was not read back"),
-            })?;
-        let (into, end) = (into as usize, (into + len.min(held)) as usize);
-        seat.collected
-            .get(into..end)
-            .map(<[u8]>::to_vec)
-            .ok_or_else(|| Fault::Program {
-                at: "guest::session",
-                why: format!("value {value} of stage {stage} was not collected"),
-            })
+        let (heap, base, _) = self.heap_at(stage)?;
+        self.cells.keep(frame, heap, base + at, len, channel)
     }
 
-    /// Stage `stage`'s fault code, if it faulted: the runtimes' status
-    /// layout ([`eta_exec::Status`]), a fault the state `Fault` with its code
-    /// in the word after. A stage that ran clean leaves its status unset;
-    /// any other state is a status something else overwrote, refused by name
-    /// rather than read as a code.
-    pub fn status(&self, stage: usize) -> Result<Option<u32>> {
-        let status = self
-            .stages
-            .get(stage)
-            .and_then(|seat| eta_exec::Status::read(&seat.collected))
-            .ok_or_else(|| Fault::Program {
-                at: "guest::session",
-                why: format!("stage {stage}'s status was not collected"),
-            })?;
-        read_status(status).map_err(|why| Fault::Program {
+    /// Copies `channel`'s kept cell into `value`; false when the device keeps
+    /// no cell for it.
+    pub fn restore(
+        &mut self,
+        frame: &mut Frame,
+        stage: usize,
+        value: u32,
+        channel: u32,
+    ) -> Result<bool> {
+        if !self.cells.keeps(channel) {
+            return Ok(false);
+        }
+        let (at, len) = self.span(stage, value).ok_or_else(|| Fault::Program {
             at: "guest::session",
-            why: format!("stage {stage}'s {why}"),
-        })
+            why: format!("value {value} is not stage {stage}'s"),
+        })?;
+        let (heap, base, _) = self.heap_at(stage)?;
+        self.cells.restore(frame, heap, base + at, len, channel)
+    }
+
+    /// Drops the device's cell for `channel`, so the next take reads the
+    /// ring, which the host has written.
+    pub fn forget(&mut self, channel: u32) {
+        self.cells.forget(channel);
+    }
+
+    /// The device cell a kept channel holds.
+    #[must_use]
+    pub fn kept_cell(
+        &self,
+        channel: u32,
+    ) -> Option<engine_gpu::serve::DeviceCell<crate::device::Api>> {
+        self.cells.kept_cell(channel)
+    }
+
+    #[must_use]
+    pub fn keeps(&self, channel: u32) -> bool {
+        self.cells.keeps(channel)
+    }
+
+    /// The cells its channels keep on the device.
+    #[must_use]
+    pub fn cells(&self) -> &engine_gpu::guest::defer::Cells<crate::device::Api> {
+        &self.cells
+    }
+
+    /// Holds a submitted pass until it lands or the session settles.
+    pub fn depart(&mut self, pending: crate::device::Pending) {
+        while self
+            .airborne
+            .front()
+            .is_some_and(|pending| pending.landed())
+        {
+            self.airborne.pop_front();
+        }
+        self.airborne.push_back(pending);
+    }
+
+    /// Waits for every pass this session has on the queue.
+    pub fn settle(&mut self) -> Result<()> {
+        while let Some(pending) = self.airborne.pop_front() {
+            pending.wait()?;
+        }
+        Ok(())
     }
 
     pub fn clear_status(&mut self) -> Result<()> {
@@ -1235,9 +1302,6 @@ fn build_stage(
         descriptors,
         tables,
         heap,
-        outbox: None,
-        outbox_layout: Vec::new(),
-        collected: Vec::new(),
     })
 }
 
@@ -1452,7 +1516,7 @@ mod tests {
         )
         .unwrap();
         let mut segment = Buffer::zeroed(&device, 8192, owner).unwrap();
-        let library = Library::build(&device, vec![outbox], &[&segment]).unwrap();
+        let library = Library::build(&device, super::Pool::new(vec![outbox]), &[&segment]).unwrap();
         let call = eta_compiler::codegen::wgsl::step_calls()
             .iter()
             .position(|text| text.contains("op_copy("))
