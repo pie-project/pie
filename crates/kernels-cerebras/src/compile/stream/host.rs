@@ -792,22 +792,27 @@ pub fn gather(p: &Program, a: &HostArray) -> R<Option<Gather>> {
     Ok(Some(g))
 }
 
-/// Whether `v` is made from the step's inputs (so the host writes it each step), not from the
-/// weights alone.
-fn of_step(trace: &poem_ir::Trace, v: ValueId, memo: &mut BTreeMap<u32, bool>) -> bool {
+/// Whether `v` is made from the step's inputs `hit` picks (any: the host writes it each step),
+/// not from the weights alone.
+fn of_step(
+    trace: &poem_ir::Trace,
+    v: ValueId,
+    hit: fn(&poem_ir::RuntimeInput) -> bool,
+    memo: &mut BTreeMap<u32, bool>,
+) -> bool {
     use poem_ir::{Def, Operands};
     if let Some(&m) = memo.get(&v.0) {
         return m;
     }
     memo.insert(v.0, false);
     let r = match &trace.values[v.0 as usize].def {
-        Def::Input(_) => true,
+        Def::Input(i) => hit(i),
         Def::Weight(_) | Def::Cache(_) => false,
-        Def::Merge(arms) => arms.iter().any(|&(a, _)| of_step(trace, a, memo)),
+        Def::Merge(arms) => arms.iter().any(|&(a, _)| of_step(trace, a, hit, memo)),
         Def::Op(n) => {
             let mut ins = Vec::new();
             trace.nodes[*n as usize].op.inputs(&mut ins);
-            ins.into_iter().any(|i| of_step(trace, i, memo))
+            ins.into_iter().any(|i| of_step(trace, i, hit, memo))
         }
     };
     memo.insert(v.0, r);
@@ -877,7 +882,7 @@ pub fn write(p: &Program, arrays: &[HostArray], gold: Option<&Path>, out: &Path)
             )
         })
         .collect();
-    let mut memo = BTreeMap::new();
+    let (mut memo, mut other) = (BTreeMap::new(), BTreeMap::new());
     let mut h2d = Vec::new();
     for (k, (x, y, w, h, members)) in rects(&ins).into_iter().enumerate() {
         let a0 = ins[members[0]];
@@ -894,13 +899,15 @@ pub fn write(p: &Program, arrays: &[HostArray], gold: Option<&Path>, out: &Path)
         }
         // an entry: its words gathered from the step's values, a step at a time
         let mut words: Vec<u32> = Vec::new();
-        let mut step = false;
+        let (mut step, mut early) = (false, true);
         for &m in &members {
             match gather(p, ins[m])? {
                 Some(g) => {
-                    step |= g
-                        .iter()
-                        .any(|w| w[0] != NONE && of_step(&p.trace, ValueId(w[0]), &mut memo));
+                    for w in g.iter().filter(|w| w[0] != NONE) {
+                        step |= of_step(&p.trace, ValueId(w[0]), |_| true, &mut memo);
+                        let past = |i: &_| !matches!(i, poem_ir::RuntimeInput::Positions);
+                        early &= !of_step(&p.trace, ValueId(w[0]), past, &mut other);
+                    }
                     words.extend(g.iter().flatten());
                 }
                 None => words.clear(),
@@ -946,6 +953,10 @@ pub fn write(p: &Program, arrays: &[HostArray], gold: Option<&Path>, out: &Path)
                 &words,
             )?;
             item["entry"] = json!(gfile);
+            // (of the positions alone: the host writes the next step's during this one)
+            if early {
+                item["early"] = json!(true);
+            }
         } else if let (Some(r), false) = (&runs, constant) {
             let sfile = format!("statics/{k}.npy");
             let flat: Vec<u32> = r.iter().flatten().copied().collect();

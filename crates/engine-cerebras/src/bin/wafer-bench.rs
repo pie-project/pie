@@ -351,6 +351,7 @@ fn decode(get: &HashMap<String, String>) -> Result<bool, String> {
         let t1 = std::time::Instant::now();
         let (got, cycles) = reading.launch(&mut rt, &entries)?;
         let wall_ms = t1.elapsed().as_secs_f64() * 1e3;
+        reading.write_ahead(&mut rt, &mut host, &trace, &toks, &pos)?;
         // (`--stamps <dir>`: each step's stamps too, as `--reading` saves them; `--stamps 1` the
         // cycles alone)
         if let Some(dir) = get.get("stamps").filter(|d| d.as_str() != "1") {

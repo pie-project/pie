@@ -48,6 +48,9 @@ pub struct Array {
     /// The program never writes it: a write after the load's first sends each PE's words up to its
     /// last changed one alone.
     pub kept: bool,
+    /// An entry of the step's positions alone (`early`): kept, the next step's written after a
+    /// decode step's launch ([`Reading::write_ahead`]).
+    pub early: bool,
 }
 
 impl Array {
@@ -350,7 +353,8 @@ impl Reading {
                 statics,
                 group: a["group"].as_u64().map(|g| g as usize),
                 rowbcast: a["rowbcast"].as_bool().unwrap_or(false),
-                kept: a["kept"].as_bool().unwrap_or(false),
+                kept: a["kept"].as_bool().unwrap_or(false) || a["early"].as_bool() == Some(true),
+                early: a["early"].as_bool().unwrap_or(false),
             });
         }
         let backs = |key: &str| -> R<Vec<Back>> {
@@ -1018,6 +1022,29 @@ impl Reading {
         Ok((step, entries))
     }
 
+    /// After a decode step's launch at `positions`: the early arrays of the step after (each row
+    /// one on), so that step's own write sends only what differs.
+    pub fn write_ahead(
+        &self,
+        rt: &mut dyn Fabric,
+        host: &mut Forward,
+        trace: &Trace,
+        tokens: &[u32],
+        positions: &[u32],
+    ) -> R<()> {
+        if !self.h2d.iter().any(|a| a.early) {
+            return Ok(());
+        }
+        let next: Vec<u32> = positions.iter().map(|p| p.wrapping_add(1)).collect();
+        let (_, entries) = self.decode_step(host, trace, tokens, &next)?;
+        for (a, words) in self.h2d.iter().zip(entries) {
+            if let (true, Some(w)) = (a.early, words) {
+                rt.write(a, &w.iter().map(|x| x.to_bits()).collect::<Vec<u32>>())?;
+            }
+        }
+        Ok(())
+    }
+
     /// The K / V PEs told a decode step's first position ([`Reading::pos`]).
     pub fn write_pos(&self, rt: &mut dyn Fabric, at: u32) -> R<()> {
         self.position_held(at)?;
@@ -1516,6 +1543,7 @@ fn write_all(rt: &mut dyn Fabric, rects: &[Rect], sym: &str, words: &[u32]) -> R
             group: None,
             rowbcast: false,
             kept: false,
+            early: false,
         };
         let n = (r.w * r.h) as usize;
         let all: Vec<u32> = (0..n).flat_map(|_| words.iter().copied()).collect();

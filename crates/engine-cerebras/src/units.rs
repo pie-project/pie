@@ -133,12 +133,21 @@ impl UnitModel {
                 // the argmax off the wafer: two words a head root a row, not the vocabulary
                 self.reading.write_entries(self.rt.as_mut(), &entries)?;
                 self.rt.launch(&self.reading)?;
+                self.reading.write_ahead(
+                    self.rt.as_mut(),
+                    &mut self.host,
+                    &self.trace,
+                    &toks,
+                    &pos,
+                )?;
                 if let Some(a) = self.rt.argmax(&self.reading)? {
                     out.extend(a.into_iter().take(chunk.len()).map(|k| (k, None)));
                     continue;
                 }
             }
             let (got, _) = self.reading.launch_on(self.rt.as_mut(), &step, &entries)?;
+            self.reading
+                .write_ahead(self.rt.as_mut(), &mut self.host, &self.trace, &toks, &pos)?;
             let back = self.reading.rows_back(&got)?;
             let logits = back
                 .into_iter()
