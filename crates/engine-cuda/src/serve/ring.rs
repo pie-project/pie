@@ -161,6 +161,32 @@ pub fn compose(
     Ok(out)
 }
 
+/// A fire's ring work: whole pages filled before it, row runs folded
+/// after it, (to, from, bytes) each.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Work {
+    pub page_bytes: u64,
+    pub fills: Vec<(u64, u64)>,
+    pub folds: Vec<(u64, u64, u64)>,
+}
+
+impl Work {
+    /// Adds `composed`'s work: its fills, and its folds as row runs of each
+    /// windowed row's planes, `planes` each (offset into a page, bytes a
+    /// row) — a row's key plane and its value plane.
+    pub fn add(&mut self, composed: &Composed, planes: &[(u64, u64)]) {
+        self.fills.extend_from_slice(&composed.fills);
+        for &(ring, source, first, rows) in &composed.folds {
+            let Source::At(from) = source else { continue };
+            for &(offset, row_bytes) in planes {
+                let at = offset + u64::from(first) * row_bytes;
+                self.folds
+                    .push((ring + at, from + at, u64::from(rows) * row_bytes));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

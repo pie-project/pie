@@ -156,6 +156,15 @@ impl Shell {
             .as_ref()
             .map(|buffers| buffers.scratch(&self.pools));
         let tapping = self.tapping(p.lanes)?;
+        // A windowed fire's own-row pages start as their ring pages.
+        for &(to, from) in &p.ring_work.fills {
+            crate::device::alloc::copy_any(
+                self.device.stream(),
+                to,
+                from,
+                p.ring_work.page_bytes as usize,
+            )?;
+        }
         let mut fire = FireCtx {
             live: &self.live,
             tapping: tapping.as_ref(),
@@ -206,6 +215,7 @@ impl Shell {
         super::btrace::mark("route");
         let readback = fire.readback(p, &staged)?;
         super::btrace::mark("readback");
+        self.fold_rings(&p.ring_work)?;
         if tapping.is_some() {
             // The read-outs hold the tapped pages and the host slots they
             // fill until they land: a later fire that writes a page waits for
@@ -219,6 +229,38 @@ impl Shell {
         }
         super::btrace::flush(seq);
         Ok((p.windows.launches(), readback))
+    }
+}
+
+impl Shell {
+    /// A windowed fire's fold (CONTRACT-BC 19): the rows it folds, from
+    /// their buffer or own-row pages onto their ring pages, after its
+    /// forward on its stream.
+    fn fold_rings(&mut self, work: &super::ring::Work) -> Result<()> {
+        if work.folds.is_empty() {
+            return Ok(());
+        }
+        // `kernels_cuda::runtime::channel::CopyRun`s: three words a run.
+        let raw: Vec<u8> = work
+            .folds
+            .iter()
+            .flat_map(|&(dst, src, bytes)| [dst, src, bytes])
+            .flat_map(u64::to_le_bytes)
+            .collect();
+        let bytes = raw.len();
+        if self.ring_runs.as_ref().is_none_or(|held| held.bytes() < bytes) {
+            self.ring_runs = Some(crate::device::alloc::Buffer::zeroed(
+                bytes.next_power_of_two(),
+            )?);
+        }
+        let held = self.ring_runs.as_ref().map_or(0, |held| held.ptr());
+        crate::device::alloc::stage_raw(self.device.stream(), held, &raw)?;
+        kernels_cuda::runtime::channel::copy_runs(
+            &self.device.ctx(),
+            held,
+            u32::try_from(work.folds.len()).unwrap_or(u32::MAX),
+        )
+        .map_err(Fault::from)
     }
 }
 

@@ -689,6 +689,7 @@ impl Shell {
                 translation: &[],
                 write_end: 0,
                 window: &lane.window,
+                window_fold: None,
                 more_windows: &[],
                 mask: lane.mask.as_ref(),
                 adapter: lane.adapter,

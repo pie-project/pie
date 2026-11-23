@@ -569,4 +569,30 @@ __global__ void rs_ext_land(
     }
 }
 
+
+// A windowed fire's ring fold (CONTRACT-BC 19): each run copies `bytes` of
+// a row run from a window-buffer or own-row page onto its ring page, a
+// block a run.
+struct CopyRun {
+    u64 dst;
+    u64 src;
+    u64 bytes;
+};
+
+__global__ void copy_runs(const CopyRun* __restrict__ runs, u32 count)
+{
+    const u32 r = blockIdx.x;
+    if (r >= count) return;
+    const CopyRun run = runs[r];
+    u8* dst = reinterpret_cast<u8*>(run.dst);
+    const u8* src = reinterpret_cast<const u8*>(run.src);
+    if (((run.dst | run.src | run.bytes) & 15ull) == 0ull) {
+        const uint4* s = reinterpret_cast<const uint4*>(src);
+        uint4* d = reinterpret_cast<uint4*>(dst);
+        for (u64 w = threadIdx.x; w < (run.bytes >> 4); w += blockDim.x) d[w] = s[w];
+        return;
+    }
+    for (u64 b = threadIdx.x; b < run.bytes; b += blockDim.x) dst[b] = src[b];
+}
+
 }  // namespace pie::channel

@@ -2185,6 +2185,61 @@ impl Pools {
         Ok(out)
     }
 
+    /// Window-buffer slot `slot` (a slot ref): the page id a kernel reads it
+    /// by and its address, seated and backed.
+    pub fn window_slot(&mut self, slot: u32) -> Result<(i32, u64)> {
+        self.seat_pages(Kind::Window(0), std::iter::once(u64::from(slot)))?;
+        let bytes = self
+            .chunks
+            .layout()
+            .windows
+            .first()
+            .map_or(0, |window| window.slot_bytes);
+        Ok((
+            self.chunks.page_id(Kind::Window(0), slot)?,
+            self.chunks.span(Kind::Window(0), slot, 0, bytes)?,
+        ))
+    }
+
+    /// Each windowed row's planes in a window-buffer page (and so in a ring
+    /// page): (offset, bytes a row), its key plane's then its value plane's.
+    #[must_use]
+    pub fn ring_planes(&self) -> Vec<(u64, u64)> {
+        let Some((_, ring)) = self.ring() else {
+            return Vec::new();
+        };
+        ring.windows
+            .iter()
+            .filter_map(|&(row, _)| match self.shapes.get(row as usize) {
+                Some(&Shape::Kv {
+                    dtype,
+                    keys_width,
+                    values_width,
+                    offsets,
+                    ..
+                }) => {
+                    let elem = u64::from(elem_size(dtype));
+                    Some([
+                        (offsets[0], keys_width * elem),
+                        (offsets[1], values_width * elem),
+                    ])
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// The widest window a ring holds the rows of, and the rows a page.
+    #[must_use]
+    pub fn ring_window(&self) -> Option<(u32, u32)> {
+        let (_, ring) = self.ring()?;
+        Some((
+            ring.windows.iter().map(|&(_, w)| w).max().unwrap_or(0),
+            ring.page_rows,
+        ))
+    }
+
     /// The bytes a record takes: its recurrent rows' and its rings'.
     #[must_use]
     pub fn record_bytes(&self) -> u64 {

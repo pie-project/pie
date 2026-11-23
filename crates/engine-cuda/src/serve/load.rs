@@ -1654,6 +1654,7 @@ impl Shell {
             .then(|| crate::tap::row_layers(&boot.trace).and_then(|rows| pools.tap_groups(&rows)))
             .flatten();
         let mut shell = Shell {
+            ring_runs: None,
             weighed,
             device,
             accounting,

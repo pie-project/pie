@@ -1836,6 +1836,7 @@ impl Cuda {
                     },
                     write_end: lane.kv.write_end,
                     window: table(lane, WINDOW).unwrap_or(&[]),
+                    window_fold: lane.window.clone(),
                     more_windows: &more_windows[at],
                     mask: lane.mask.as_ref(),
                     adapter: lane_adapters[at].or(lane.adapter),

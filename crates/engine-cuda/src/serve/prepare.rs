@@ -1575,7 +1575,87 @@ impl Shell {
             0
         };
         let mut window_tables: Vec<Vec<Vec<u32>>> = Vec::with_capacity(window_lists);
-        for window in 0..window_lists {
+        // A load serving its windowed rows as ring + buffer composes each
+        // lane's one windowed table (`super::ring`): its entries are page
+        // ids already, and its window pages the buffer slots it names.
+        let mut ring_work = super::ring::Work::default();
+        let mut ring_buffers: Vec<u64> = Vec::new();
+        let ringed = self.pools.ring_window();
+        if let Some((window, page)) = ringed {
+            ring_work.page_bytes = self
+                .pools
+                .ring()
+                .map_or(0, |(_, ring)| ring.page_bytes);
+            let planes = self.pools.ring_planes();
+            let keys: Vec<u32> = lanes
+                .iter()
+                .map(|seated| seated.rs_slot.unwrap_or(seated.lane.slot))
+                .collect();
+            let mut null = [0i32];
+            self.pools.page_ids(1, &mut null)?;
+            let null = null[0];
+            let mut own_next = 0u32;
+            let mut composed_tables: Vec<Vec<u32>> = Vec::with_capacity(seats.len());
+            for (lane, seat) in seats.iter().enumerate() {
+                let seated = &lanes[lane];
+                if kv_less_seats[lane] {
+                    composed_tables.push(tables[lane].to_vec());
+                    continue;
+                }
+                let (base, folded, fold) = match &seated.window_fold {
+                    Some(stated) => {
+                        let engine::fire::FoldLen::Host(fold) = stated.fold else {
+                            return Err(Fault::Unbound {
+                                what: "a windowed lane's fold counted on the device, which \
+                                       this engine's rings do not fold yet"
+                                    .into(),
+                            });
+                        };
+                        (stated.base, seated.folded, fold)
+                    }
+                    // A runtimeless lane folds every row it writes.
+                    None => {
+                        let base = seat.have / page * page;
+                        (base, seat.have, seat.rows)
+                    }
+                };
+                let ring = self.pools.ring_pages(keys[lane])?;
+                let buffer = window_ids[lane]
+                    .iter()
+                    .map(|&slot| {
+                        ring_buffers.push(u64::from(slot));
+                        self.pools.window_slot(slot)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let alone = keys.iter().filter(|&&key| key == keys[lane]).count() == 1;
+                let pools = &self.pools;
+                let mut own = || {
+                    let at = own_next;
+                    own_next += 1;
+                    Ok((pools.own_page_id(at)?, pools.own_page_at(at)?))
+                };
+                let composed = super::ring::compose(
+                    &super::ring::RingLane {
+                        ring: &ring,
+                        buffer: &buffer,
+                        base,
+                        have: seat.have,
+                        rows: seat.rows,
+                        folded,
+                        fold,
+                        alone,
+                    },
+                    page,
+                    window,
+                    null,
+                    &mut own,
+                )?;
+                ring_work.add(&composed, &planes);
+                composed_tables.push(composed.table.iter().map(|&id| id as u32).collect());
+            }
+            window_tables.push(composed_tables);
+        }
+        for window in (0..window_lists).filter(|_| ringed.is_none()) {
             let retained = self.pools.window_tokens(window);
             window_tables.push(
                 seats
@@ -1600,8 +1680,11 @@ impl Shell {
         }
         // The windowed pages this fire's tables name, a list's apart, backed
         // as they are first used.
-        let window_pages: Vec<Vec<u64>> = window_tables
-            .iter()
+        let window_pages: Vec<Vec<u64>> = if ringed.is_some() {
+            vec![std::mem::take(&mut ring_buffers)]
+        } else {
+            window_tables
+                .iter()
             .map(|tables| {
                 tables
                     .iter()
@@ -1610,7 +1693,8 @@ impl Shell {
                     .flat_map(|(table, _)| table.iter().map(|&page| u64::from(page)))
                     .collect()
             })
-            .collect();
+            .collect()
+        };
         // A fire's extended run holds the widest bucket's tokens of
         // replayed rows (`store::rs::Buffers::rows_ext`), the most the
         // runtime lets one carry (`engine::fire::rung_rows`): one that
@@ -1772,6 +1856,10 @@ impl Shell {
                 .pools
                 .geometry_window(table)
                 .map_or(0, |window| window as u8 + 1);
+            // A composed windowed table names page ids already.
+            if list > 0 && ringed.is_some() {
+                continue;
+            }
             self.pools.page_ids(list, &mut geometry.indices)?;
             self.pools.page_ids(list, &mut geometry.write_page)?;
         }
@@ -2141,6 +2229,7 @@ impl Shell {
             })
             .collect();
         Ok(Prepared {
+            ring_work,
             slot: Some(slot),
             lengths: staged_lens,
             token_injects,

@@ -72,6 +72,9 @@ pub struct Shell {
     /// The rungs the load weighed its top by and the estimate it weighed
     /// them with (`None` where the profile states no rates).
     weighed: Option<crate::top::Weighed>,
+    /// A windowed fire's ring-fold runs as the device reads them, grown to
+    /// the most a fire has folded (`serve::ring`).
+    ring_runs: Option<crate::device::alloc::Buffer>,
     device: Context,
     accounting: crate::store::Accounting,
     trace: Trace,
@@ -1429,6 +1432,9 @@ pub(crate) struct MergeLand {
 }
 
 pub struct Prepared<'a> {
+    /// The ring work of a fire of windowed lanes: the pages filled before
+    /// it, the rows folded after.
+    ring_work: ring::Work,
     lanes: &'a [Seated<'a>],
     attachments: &'a [Attached],
     composition: Composition,
