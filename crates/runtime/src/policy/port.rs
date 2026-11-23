@@ -210,7 +210,7 @@ struct Cache {
 const STORES: Cache = Cache {
     owns: |owner| {
         store_registry::all_for_model(0).iter().any(|stores| {
-            store_registry::with_kv_lock(&stores.kv, "plex-cache", |kv| kv.owns_cache(owner))
+            store_registry::with_kv_lock(&stores.kv, "plex-cache", |kv| kv.holds_kv_of(owner))
         })
     },
     list: || {
@@ -227,6 +227,8 @@ const STORES: Cache = Cache {
                         merged.entries += set.entries;
                         merged.pages = merged.pages.max(set.pages);
                         merged.last_use = merged.last_use.max(set.last_use);
+                        merged.on_device |= set.on_device;
+                        merged.on_host |= set.on_host;
                     })
                     .or_insert(set);
             }
@@ -557,7 +559,9 @@ impl Port {
                     count(proc.generated_tokens).unwrap_or(u32::MAX),
                 );
                 self.offloaded.remove(&id);
-                if (self.cache.owns)(id) {
+                let held = (self.cache.owns)(id);
+                tracing::debug!(target: "pie::plex", %id, held, "exited");
+                if held {
                     // What it left in the cache outlives it.
                     self.retained.insert(id, proc.session);
                     self.put_working_sets();
@@ -796,12 +800,18 @@ impl Port {
             );
             now.insert(*id);
         }
+        // A set its exited owner's stores still hold (its last fire not
+        // settled, so what it leaves is not cached yet) is not gone: its
+        // rows stay for the cache it becomes.
         for gone in self.put.difference(&now).copied().collect::<Vec<_>>() {
-            if !self.procs.contains_key(&gone) {
-                self.retained.remove(&gone);
-                self.host
-                    .evicted(&gone.to_string(), WORKER, by_name(By::Host), true);
+            if self.procs.contains_key(&gone) || (self.cache.owns)(gone) {
+                now.insert(gone);
+                continue;
             }
+            tracing::debug!(target: "pie::plex", id = %gone, "working set gone");
+            self.retained.remove(&gone);
+            self.host
+                .evicted(&gone.to_string(), WORKER, by_name(By::Host), true);
         }
         self.put = now;
     }
@@ -979,10 +989,13 @@ impl Port {
             }
             let (kv, _) = self.held_bytes(owner, Some(set.pages), page);
             let ago = set.last_use.elapsed().as_millis() as u64;
-            // Cached kv may sit on either tier: how much on the host is not
-            // told.
+            // Discarding cache frees room only on the tiers it sits on: one
+            // held below the device frees none there. How much on the host
+            // is not told.
             let bytes = match tier {
+                Tier::Device if !set.on_device => Some(0),
                 Tier::Device => kv,
+                Tier::Host if !set.on_host => Some(0),
                 Tier::Host => None,
             };
             out.push(pressure::Candidate {

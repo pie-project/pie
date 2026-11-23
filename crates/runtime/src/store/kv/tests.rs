@@ -88,6 +88,8 @@ fn tests_every_case() {
     what_decode_wrote_is_reclaimed_before_the_prompt();
     a_sweep_suspends_only_the_readers_of_what_it_moves();
     idle_cache_goes_to_the_host_and_comes_back_on_a_hit();
+    a_set_moved_down_says_it_is_off_the_device();
+    an_exited_owner_holds_its_kv_until_its_working_set_is_released();
     a_suspend_short_of_host_room_drops_host_cache_first();
     a_tail_past_its_step_goes_before_another_head();
     a_demote_leaves_what_a_higher_key_covers();
@@ -1212,6 +1214,43 @@ fn idle_cache_goes_to_the_host_and_comes_back_on_a_hit() {
     store.retire_idle();
     assert_eq!(store.reclaim_cache(store.current_epoch(), |_| 0), 3);
     assert_eq!(store.available_pages(), 8);
+}
+
+/// What a set holds where: device pressure has nothing to gain from
+/// discarding a set wholly below the device.
+fn a_set_moved_down_says_it_is_off_the_device() {
+    let mut store = KvStore::new_with_swap(8, 8, 0, h(33));
+    let owner = ProcessId::from_u128(23);
+    kept_and_gone(&mut store, 14, 3, owner);
+    let set = |store: &KvStore| store.cached_working_sets()[0];
+    assert!(set(&store).on_device && !set(&store).on_host);
+    let txn = store.prepare_demote(8, |_| 1).unwrap().expect("three cache-only pages");
+    store.commit_suspend(txn).unwrap();
+    store.retire_idle();
+    assert!(!set(&store).on_device && set(&store).on_host);
+}
+
+/// A process's last fire settles after it exits, and only then is what it
+/// leaves cached: until its working set is released the store still holds
+/// its KV, so its rows are not reaped as a gone set's (a keep the policy
+/// stated would be lost, and the cache it becomes keyed by default).
+fn an_exited_owner_holds_its_kv_until_its_working_set_is_released() {
+    let mut store = KvStore::new(8, h(35));
+    store.set_keeps(true);
+    let (owner, other) = (ProcessId::from_u128(25), ProcessId::from_u128(26));
+    let tokens: Vec<u32> = (0..32).map(|t| 500 + t).collect();
+    let ws = store.create_working_set();
+    store.set_owner(ws, owner).unwrap();
+    commit_opaque(&mut store, ws, 2);
+    seal(&mut store, ws, 0, &tokens);
+    assert!(!store.owns_cache(owner), "nothing cached yet");
+    assert!(store.holds_kv_of(owner), "its working set is still here");
+    assert!(!store.holds_kv_of(other));
+    store.release_working_set(ws, store.current_epoch());
+    store.retire_idle();
+    assert!(store.owns_cache(owner) && store.holds_kv_of(owner), "now cached");
+    assert_eq!(store.discard_cache(owner, crate::policy::By::Policy), 2, "both pages");
+    assert!(!store.holds_kv_of(owner), "gone");
 }
 
 fn a_suspend_short_of_host_room_drops_host_cache_first() {

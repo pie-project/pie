@@ -885,6 +885,11 @@ impl KvPageTable {
         Ok(self.entry(ws)?.owner)
     }
 
+    /// The owners of the live working sets.
+    pub fn working_set_owners(&self) -> impl Iterator<Item = ProcessId> + '_ {
+        self.working_sets.iter().filter_map(|(_, entry)| entry.owner)
+    }
+
     pub fn page_hash_at(
         &self,
         ws: WorkingSetId,

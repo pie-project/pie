@@ -447,6 +447,10 @@ pub struct CachedWorkingSet {
     pub entries: usize,
     pub pages: u64,
     pub last_use: Instant,
+    /// Whether any of its pages sits on the device, or on the host: what
+    /// discarding it can free there.
+    pub on_device: bool,
+    pub on_host: bool,
 }
 
 impl KvStore {
@@ -831,17 +835,23 @@ impl KvStore {
                 continue;
             };
             let pages = entry.path.pages;
+            let on_device = self.table.holds_resident(entry.path.terminal);
+            let on_host = self.table.holds_on_host(entry.path.terminal);
             sets.entry(owner)
                 .and_modify(|set| {
                     set.entries += 1;
                     set.pages = set.pages.max(pages);
                     set.last_use = set.last_use.max(entry.last_use);
+                    set.on_device |= on_device;
+                    set.on_host |= on_host;
                 })
                 .or_insert(CachedWorkingSet {
                     owner,
                     entries: 1,
                     pages,
                     last_use: entry.last_use,
+                    on_device,
+                    on_host,
                 });
         }
         sets.into_values().collect()
@@ -850,6 +860,19 @@ impl KvStore {
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn owns_cache(&self, owner: ProcessId) -> bool {
         self.owners.contains_key(&owner)
+    }
+
+    /// Whether `owner` (a PLEX id) has KV here: cached, or in a working set
+    /// not yet released. A process's last fire settles after it exits, and
+    /// only then is what it leaves cached: until then its working set is
+    /// still here, not gone.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub fn holds_kv_of(&self, owner: ProcessId) -> bool {
+        self.owns_cache(owner)
+            || self
+                .table
+                .working_set_owners()
+                .any(|of| crate::policy::schedule::plex_id(of) == owner)
     }
 
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
@@ -922,6 +945,7 @@ impl KvStore {
                         .into_iter()
                         .filter(|id| !self.cache.get(id).is_some_and(|e| self.persisted_whole(e)))
                         .collect();
+                    tracing::debug!(target: "pie::kv", key, entries = ids.len(), "reclaim drops");
                     freed += self.drop_entries(ids, By::Host, epoch);
                 }
                 if freed >= want {
@@ -3535,16 +3559,16 @@ impl KvStore {
             .filter(|&(key, _, _)| below.is_none_or(|below| key < below))
             .collect();
         entries.sort_unstable();
-        let mut dropped = 0;
-        for (_, _, id) in entries {
+        let mut dropped = Vec::new();
+        for (key, _, id) in entries {
             if self.host_pool.available() >= wanted {
                 break;
             }
             self.drop_entries(vec![id], By::Host, self.current_epoch());
-            dropped += 1;
+            dropped.push(key);
         }
-        tracing::debug!(target: "pie::kv", entries = dropped, wanted, ?below, "dropped off device");
-        dropped
+        tracing::debug!(target: "pie::kv", entries = dropped.len(), keys = ?dropped, wanted, ?below, "dropped off device");
+        dropped.len()
     }
 
     pub fn mark_suspended(&mut self, working_sets: &HashSet<WorkingSetId>) {

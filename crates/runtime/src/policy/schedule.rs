@@ -116,6 +116,7 @@ pub(crate) fn apply(change: Change) {
     if change.is_empty() {
         return;
     }
+    tracing::debug!(target: "pie::schedule", keys = ?change.keys, holds = ?change.holds, "rows enacted");
     let all = change.key_default.is_some() || change.hold_default.is_some();
     let touched: HashSet<ProcessId> = change
         .keys
