@@ -1096,6 +1096,7 @@ impl Shell {
         // folds them (`super::ring`), a seat each.
         let mut seat_sources: Vec<usize> = Vec::with_capacity(lanes.len());
         let mut window_folds: Vec<Option<(u32, u32)>> = Vec::with_capacity(lanes.len());
+        let mut seat_masked: Vec<bool> = Vec::with_capacity(lanes.len());
         let ringed_load = self.pools.ring().is_some();
         let mut snapshots = crate::store::rs::SnapTable {
             indptr: vec![0],
@@ -1265,6 +1266,10 @@ impl Shell {
                     word: lane.word,
                 });
             }
+            // Whether the lane tells its rows apart by a mask of its own,
+            // however it came (stated, carried, or resolved on the device),
+            // or a group's (`super::ring::shared_pool`).
+            seat_masked.push(masking.is_some() || seated.group.is_some());
             masks.push(crate::mask::LaneMask {
                 // A mask a group's rows read only is staged with the group
                 // masks (`group_masks`), not over the lane's keys.
@@ -1635,7 +1640,8 @@ impl Shell {
                     (
                         seated.set,
                         keys[lane],
-                        seated.window_fold.is_some() && seated.mask.is_some(),
+                        seated.window_fold.is_some()
+                            && seat_masked.get(lane).copied().unwrap_or(false),
                     )
                 })
                 .collect();
