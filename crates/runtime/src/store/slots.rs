@@ -394,6 +394,17 @@ struct ChunkMeta {
     class: u32,
 }
 
+/// A chunk of a shape's single slots, as [`SlotPool::single_chunks`] reads
+/// it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SingleChunk {
+    pub logical: u32,
+    /// The slots it holds or keeps for an epoch.
+    pub used: u32,
+    /// No chunk move or residency copy holds it.
+    pub settled: bool,
+}
+
 /// The class of a chunk of single slots ([`SlotPool::acquire`]): a run of
 /// one is a single slot too.
 pub const SINGLE: u32 = 1;
@@ -553,9 +564,35 @@ impl ShapeState {
     }
 }
 
+/// Test builds: the queue a pool's given-back slots go to
+/// ([`SlotPool::poison_into`]). A clone of the pool (a planner's or a test's
+/// copy to try a placement on) taps nothing: what it gives back it gives
+/// back in its copy alone, and the slots are still the live pool's.
+#[cfg(feature = "test-slot-fill")]
+#[derive(Default)]
+struct PoisonTap(Option<::engine::chunk::PoisonQueue>);
+
+#[cfg(feature = "test-slot-fill")]
+impl Clone for PoisonTap {
+    fn clone(&self) -> Self {
+        PoisonTap(None)
+    }
+}
+
+#[cfg(feature = "test-slot-fill")]
+impl std::fmt::Debug for PoisonTap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() { "PoisonTap(tapped)" } else { "PoisonTap(none)" })
+    }
+}
+
 /// See the module docs.
 #[derive(Clone, Debug)]
 pub struct SlotPool {
+    /// Test builds: where a slot given back goes to be poisoned
+    /// ([`PoisonTap`]).
+    #[cfg(feature = "test-slot-fill")]
+    poison: PoisonTap,
     chunk_bytes: u64,
     total: u32,
     reserved: u32,
@@ -800,6 +837,8 @@ impl SlotPool {
             changes: 0,
             held_for: BTreeMap::new(),
             next_ticket: 0,
+            #[cfg(feature = "test-slot-fill")]
+            poison: PoisonTap::default(),
         };
         pool.act = pool.act_chunks(0);
         assert!(
@@ -1977,6 +2016,20 @@ impl SlotPool {
         Some(self.chunks[chunk as usize].shape).filter(|&shape| shape != NO_SHAPE)
     }
 
+    /// The bytes the chunks opened now for any of `shapes` hold free: their
+    /// unused slots, room no other shape takes until a chunk empties.
+    #[must_use]
+    pub fn slack_of(&self, shapes: &[ShapeId]) -> u64 {
+        self.chunks
+            .iter()
+            .filter(|meta| meta.shape != NO_SHAPE && shapes.contains(&meta.shape))
+            .map(|meta| {
+                let shape = &self.shapes[meta.shape as usize].shape;
+                u64::from(shape.slots_per_chunk.saturating_sub(meta.used)) * shape.slot_bytes
+            })
+            .sum()
+    }
+
     /// Slots `holder` holds references on.
     pub fn held_by(&self, holder: &Holder) -> u64 {
         self.holders.get(holder).copied().unwrap_or(0)
@@ -2215,6 +2268,71 @@ impl SlotPool {
             *self.holders.entry(holder).or_default() += n;
         }
         Ok(taken)
+    }
+
+    /// The chunks of `shape`'s single slots ([`SINGLE`]), each with the
+    /// slots it holds or keeps for an epoch: what a list compaction reads
+    /// its sources and destinations from. `settled` is false for one a
+    /// chunk move or a residency copy holds (fenced, or moving out): its
+    /// slots stay where they lie meanwhile, neither a source nor a
+    /// destination.
+    #[must_use]
+    pub fn single_chunks(&self, shape: ShapeId) -> Vec<SingleChunk> {
+        self.chunks
+            .iter()
+            .enumerate()
+            .filter(|(_, meta)| meta.shape == shape && meta.class == SINGLE)
+            .map(|(logical, meta)| {
+                let physical = self.logical_to_physical[logical];
+                SingleChunk {
+                    logical: logical as u32,
+                    used: meta.used,
+                    settled: !self.fenced.get(physical)
+                        && !self.moving_out.contains_key(&physical),
+                }
+            })
+            .collect()
+    }
+
+    /// `n` fresh slots of `shape` for `holder` from the partly filled
+    /// chunks of its single slots outside `outside` (logical), fullest
+    /// first, opening none: a list compaction's destinations. All or
+    /// nothing.
+    pub fn acquire_outside(
+        &mut self,
+        holder: Holder,
+        shape: ShapeId,
+        n: u64,
+        outside: &BTreeSet<u32>,
+    ) -> Option<Vec<Slot>> {
+        let state = self.shapes.get(shape as usize)?;
+        let order: Vec<u32> = state
+            .partial
+            .get(&SINGLE)
+            .into_iter()
+            .flatten()
+            .map(|&(_, _, logical)| logical)
+            .filter(|logical| !outside.contains(logical))
+            .collect();
+        let spc = u64::from(state.spc());
+        let room: u64 = order
+            .iter()
+            .map(|&logical| spc - u64::from(self.chunks[logical as usize].used))
+            .sum();
+        if room < n {
+            return None;
+        }
+        let mut taken = Vec::with_capacity(n as usize);
+        for logical in order {
+            if taken.len() as u64 == n {
+                break;
+            }
+            self.fill(logical, holder.is_live(), n - taken.len() as u64, &mut taken);
+        }
+        if n > 0 {
+            *self.holders.entry(holder).or_default() += n;
+        }
+        Some(taken)
     }
 
     /// `n` adjacent slots of `shape` for `holder`, in index order, in one
@@ -2502,6 +2620,9 @@ impl SlotPool {
             changes: 0,
             held_for: self.held_for.clone(),
             next_ticket: self.next_ticket,
+            // A placement's scratch gives nothing back for real.
+            #[cfg(feature = "test-slot-fill")]
+            poison: PoisonTap::default(),
         }
     }
 
@@ -2824,6 +2945,14 @@ impl SlotPool {
         let _ = self.given.signal.set((signal, tier, counts));
     }
 
+    /// Test builds: each slot given back from here on is pushed to `queue`
+    /// as its physical byte range, for the engine that backs this pool to
+    /// poison before its next verb ([`::engine::chunk::PoisonQueue`]).
+    #[cfg(feature = "test-slot-fill")]
+    pub fn poison_into(&mut self, queue: ::engine::chunk::PoisonQueue) {
+        self.poison = PoisonTap(Some(queue));
+    }
+
     fn slots_freed(&self) {
         if let Some((signal, tier, counts)) = self.given.signal.get() {
             (signal.0)(RoomCount {
@@ -2995,6 +3124,15 @@ impl SlotPool {
         self.changes += 1;
         let meta = self.chunks[slot.chunk as usize];
         let physical = self.logical_to_physical[slot.chunk as usize];
+        #[cfg(feature = "test-slot-fill")]
+        if let Some(queue) = &self.poison.0 {
+            let bytes = self.shapes[meta.shape as usize].shape.slot_bytes;
+            let offset = u64::from(physical) * self.chunk_bytes + u64::from(slot.index) * bytes;
+            queue
+                .lock()
+                .expect("the poison queue's lock is never poisoned")
+                .push((offset, bytes));
+        }
         let state = &mut self.shapes[meta.shape as usize];
         let (word, bit) = Bits::locate(slot.index);
         let at = meta.frame as usize * state.words + word;
@@ -3847,6 +3985,40 @@ mod tests {
                 ],
             );
         }
+    }
+
+    /// Test builds: a slot given back reaches the poison queue as its
+    /// physical byte range once its epoch retires, not before; a clone of
+    /// the pool (a placement tried on a copy) taps nothing.
+    #[cfg(feature = "test-slot-fill")]
+    #[test]
+    fn a_slot_given_back_is_queued_for_poison_by_its_physical_bytes() {
+        let fixed = [(ShapeKind::Fixed, 4)];
+        let mut pool = SlotPool::new(facts_with(16, 4, 4, &fixed, &[(16, 2)]));
+        let queue = ::engine::chunk::PoisonQueue::default();
+        pool.poison_into(queue.clone());
+        let holder = Holder::WorkingSet(1);
+        let slots = pool.acquire(holder, 0, 2).unwrap();
+        let physical = pool.chunk_table()[slots[0].chunk as usize];
+        let slot_bytes = (1u64 << 20) / 4;
+        let mut copy = pool.clone();
+        copy.release(holder, &slots, 0);
+        copy.retire_through(u64::MAX);
+        assert!(queue.lock().unwrap().is_empty(), "a clone's give-back is its own");
+        pool.touch(&slots, 5);
+        pool.release(holder, &slots, 0);
+        assert!(queue.lock().unwrap().is_empty(), "held for the fire that touched them");
+        pool.retire_through(5);
+        let mut due = std::mem::take(&mut *queue.lock().unwrap());
+        due.sort_unstable();
+        let mut want: Vec<(u64, u64)> = slots
+            .iter()
+            .map(|slot| {
+                (u64::from(physical) * (1 << 20) + u64::from(slot.index) * slot_bytes, slot_bytes)
+            })
+            .collect();
+        want.sort_unstable();
+        assert_eq!(due, want);
     }
 
     /// The L40S at 3 GiB on ca5c710a7: "a guest item ... lies in a run of

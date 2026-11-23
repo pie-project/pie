@@ -973,6 +973,40 @@ fn bf16_draw(rows: u32, truncated: bool) -> Suite {
     }
 }
 
+/// A bare argmax, and a log-softmax's sum and max, over `rows` bf16 rows of
+/// Qwen3's vocabulary in one region: past `LANE_SAMPLER_BLOCKS` rows the
+/// launch does not split them, and each row's region still runs every phase
+/// its reductions fold in.
+fn split_rows(rows: u32) -> Suite {
+    let vocab = QWEN_VOCAB;
+    let greedy = named("greedy", Channel::new([rows], dtype::i32).capacity(4));
+    let scored = named("scored", Channel::new([rows], dtype::i32).capacity(4));
+    let mut builder = builder(vocab, rows);
+    builder.stage(Stage::Epilogue, move || {
+        let logits = cast(
+            reshape(intrinsics::output(0, "logits"), [rows, vocab]),
+            dtype::bf16,
+        );
+        greedy.put(reshape(cast(reduce_argmax(&logits), dtype::i32), [rows]));
+        scored.put(reshape(cast(reduce_argmax(log_softmax(&logits)), dtype::i32), [rows]));
+    });
+    for channel in [greedy, scored] {
+        channel.note_host_take();
+    }
+    Suite {
+        names: take_names(),
+        name: format!("split rows ({rows} row(s))"),
+        traced: builder.build().expect("the split rows trace"),
+        rows,
+        vocab,
+        seeds: port_seeds(rows),
+        outputs: vec![
+            ("greedy", Dtype::I32, Check::Exact),
+            ("scored", Dtype::I32, Check::Exact),
+        ],
+    }
+}
+
 /// Every suite whose vocabulary-sized values are bf16.
 fn bf16_suites() -> Vec<Suite> {
     let penalized = eta_dsl::sampler::Shape {
@@ -998,9 +1032,9 @@ fn bf16_suites() -> Vec<Suite> {
             .map(|(name, shape)| standard(name, shape)),
     );
     suites.push(standard("penalized min-p + top-p", &penalized));
-    // Seventeen beams: more rows than a split row's launch splits
+    // Seventeen rows: more than a split row's launch splits
     // (`LANE_SAMPLER_BLOCKS`), each row on one block through every phase.
-    suites.extend([beam_bf16(1), beam_bf16(4), beam_bf16(17)]);
+    suites.extend([beam_bf16(1), beam_bf16(4), beam_bf16(17), split_rows(16), split_rows(17)]);
     suites
 }
 

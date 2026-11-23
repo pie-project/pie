@@ -207,6 +207,23 @@ pub trait Engine: Send {
         None
     }
 
+    /// The host covers committed for this engine's device
+    /// (`<device>.covers.json` beside its committed measured profile,
+    /// written by `pie tune export`): each file's text, a JSON list of the
+    /// cover cache's own entries (`key`, `cover`, `frame_us`,
+    /// `turnaround_us`). A boot whose cover key matches one takes it where
+    /// the home's own cache holds none. None, the default.
+    fn committed_covers(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Whether this engine's load skips measuring (`[engine] measure =
+    /// false`): the runtime then takes its own estimates in place of its
+    /// load-time measurements too, by name. `false`, the default.
+    fn skips_measuring(&self) -> bool {
+        false
+    }
+
     /// The reader of what the host can still give this process, where the
     /// device shares the host's memory and no budget of the device's says
     /// what it has: the runtime's governor reads it on its tick and holds
@@ -366,6 +383,14 @@ pub trait Engine: Send {
     fn ring_facts(&self, registration: &ChannelRegistration) -> Result<Option<RingFacts>> {
         let _ = registration;
         Ok(None)
+    }
+
+    /// Test builds (`test-slot-fill`): the queue the runtime pushes the
+    /// pool's given-back byte ranges to ([`crate::chunk::PoisonQueue`]). An
+    /// engine that takes it fills them before its next verb; the default
+    /// leaves them as they are.
+    fn poison_queue(&mut self, queue: crate::chunk::PoisonQueue) {
+        let _ = queue;
     }
 
     /// An instance's or a channel's pool slots moved: the runtime parked

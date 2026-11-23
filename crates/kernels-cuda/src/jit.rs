@@ -28,6 +28,7 @@ mod launches;
 #[cfg(feature = "cuda")]
 pub mod nvrtc;
 mod root;
+pub(crate) use root::FLOAT_CONTRACT;
 
 pub use abi::{Arg, ArgValue};
 pub use ctx::{

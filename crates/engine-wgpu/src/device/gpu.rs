@@ -82,6 +82,10 @@ impl engine_gpu::backend::Context<Api> for Context {
         Context::resident(self).unwrap_or(1)
     }
 
+    fn resident(&self) -> Option<u32> {
+        Context::resident(self)
+    }
+
     fn capacity(&self) -> u64 {
         Context::capacity(self)
     }

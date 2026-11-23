@@ -11,6 +11,7 @@ pub fn open(config_bytes: &[u8], contract_for: ContractFor) -> Result<Metal, Str
         DeviceBoot {
             adapter_dir: adapter_dir(&doc),
             profiles,
+            measure: measure(&doc)?,
         },
         contract_for,
     ))
@@ -40,6 +41,20 @@ fn diagnostics(doc: &toml::Table) -> Result<crate::diag::Diagnostics, String> {
     words
         .parse::<crate::diag::Diagnostics>()
         .map_err(|error| format!("[metal] diagnostics: {error}"))
+}
+
+/// `[metal] measure`: `false` skips every measurement a load would take
+/// (`engine::rates::Measuring::Skip`); unstated, a load measures.
+fn measure(doc: &toml::Table) -> Result<engine::rates::Measuring, String> {
+    match doc
+        .get("metal")
+        .and_then(toml::Value::as_table)
+        .and_then(|metal| metal.get("measure"))
+    {
+        None => Ok(engine::rates::Measuring::Time),
+        Some(toml::Value::Boolean(measure)) => Ok(engine::rates::Measuring::of(*measure)),
+        Some(other) => Err(format!("[metal] measure is true or false, not {other}")),
+    }
 }
 
 fn profiles(doc: &toml::Table) -> Result<Option<std::path::PathBuf>, String> {

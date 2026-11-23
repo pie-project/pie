@@ -13,6 +13,7 @@ pub fn open(config_bytes: &[u8], contract_for: ContractFor) -> Result<Vulkan, St
             validation: validation(&doc),
             pipeline_cache: pipeline_cache(&doc),
             profiles,
+            measure: measure(&doc)?,
             chunk_bytes: None,
             #[cfg(feature = "test-limits")]
             max_buffer: None,
@@ -62,5 +63,15 @@ fn profiles(doc: &toml::Table) -> Result<Option<std::path::PathBuf>, String> {
         Some(other) => Err(format!(
             "[vulkan] profiles is a directory path, not {other}"
         )),
+    }
+}
+
+/// `[vulkan] measure`: `false` skips every measurement a load would take
+/// (`engine::rates::Measuring::Skip`); unstated, a load measures.
+fn measure(doc: &toml::Table) -> Result<engine::rates::Measuring, String> {
+    match table(doc).and_then(|t| t.get("measure")) {
+        None => Ok(engine::rates::Measuring::Time),
+        Some(toml::Value::Boolean(measure)) => Ok(engine::rates::Measuring::of(*measure)),
+        Some(other) => Err(format!("[vulkan] measure is true or false, not {other}")),
     }
 }

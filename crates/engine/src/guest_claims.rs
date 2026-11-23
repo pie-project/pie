@@ -39,6 +39,34 @@ use std::fmt;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// The tracing target every claim, release, park and evacuation's claim is
+/// said on at debug, with the holder, its runs before and after, and the
+/// outcome: `RUST_LOG=engine::claims=debug` names whose claim stayed where.
+pub const TARGET: &str = "engine::claims";
+
+/// Whether claims lines are said ([`TARGET`] at debug): an engine reads it
+/// before it builds a line of its own for [`say`].
+#[must_use]
+pub fn saying() -> bool {
+    tracing::enabled!(target: TARGET, tracing::Level::DEBUG)
+}
+
+/// An engine's own claims line, on [`TARGET`] at debug: why it claims,
+/// releases or parks (a bind, a rebind, an evacuation, a park, a close),
+/// beside the claims' own lines. For an engine with no tracing of its own.
+pub fn say(why: &str, fields: fmt::Arguments<'_>) {
+    tracing::debug!(target: TARGET, %fields, "{why}");
+}
+
+/// `runs` as `segment:start..end` pieces, for a claims line.
+fn show(runs: &[Run]) -> String {
+    let pieces: Vec<String> = runs
+        .iter()
+        .map(|run| format!("{}:{}..{}", run.segment, run.start, run.end))
+        .collect();
+    format!("[{}]", pieces.join(", "))
+}
+
 /// Bytes `[start, end)` of segment `segment`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Run {
@@ -361,6 +389,10 @@ impl Held {
     }
 }
 
+/// What the holders a [`Claims::claim_all_undoable`] listed held before it.
+#[must_use = "a claim undone puts back what it took the place of"]
+pub struct Before(Vec<(Holder, Vec<Run>)>);
+
 /// Every live holder's runs.
 #[derive(Debug, Default)]
 pub struct Claims {
@@ -385,7 +417,18 @@ impl Claims {
     /// runs may overlap each other, and what it held: they are merged.
     /// Empty runs claim nothing.
     pub fn claim(&self, instance: u64, runs: &[Run]) -> Result<(), Overlap> {
-        self.lock().lay(Holder::Instance(instance), runs)
+        let mut held = self.lock();
+        let before = held.held(Holder::Instance(instance));
+        let laid = held.lay(Holder::Instance(instance), runs);
+        tracing::debug!(
+            target: TARGET,
+            instance,
+            before = %show(&before),
+            runs = %show(runs),
+            refused = ?laid.as_ref().err().map(ToString::to_string),
+            "claim"
+        );
+        laid
     }
 
     /// [`Claims::claim`], and `instance` joins the pair `pair` names, in one
@@ -404,12 +447,31 @@ impl Claims {
         let mut held = self.lock();
         let own = Holder::Instance(instance);
         let before = held.held(own);
-        held.lay(own, runs)?;
-        let joined = held.join(instance, pair);
-        if joined.is_err() {
-            held.remove(own);
-            held.insert(own, before);
-        }
+        let pair_before = held.held(Holder::Pair(pair.pair));
+        let joined = match held.lay(own, runs) {
+            Err(overlap) => Err(overlap.into()),
+            Ok(()) => {
+                let joined = held.join(instance, pair);
+                if joined.is_err() {
+                    held.remove(own);
+                    held.insert(own, before.clone());
+                }
+                joined
+            }
+        };
+        tracing::debug!(
+            target: TARGET,
+            instance,
+            before = %show(&before),
+            runs = %show(runs),
+            pair = pair.pair,
+            taking = pair.taking,
+            pair_before = %show(&pair_before),
+            pair_runs = %show(&pair.runs),
+            joined = ?joined.as_ref().ok(),
+            refused = ?joined.as_ref().err().map(ToString::to_string),
+            "claim with pair"
+        );
         joined
     }
 
@@ -419,33 +481,84 @@ impl Claims {
     /// members. Refused by name, and nothing changed, where a run overlaps
     /// one an unlisted holder holds or another listed holder's new one.
     pub fn claim_all(&self, claims: &[(Holder, Vec<Run>)]) -> Result<(), Overlap> {
+        self.claim_all_undoable(claims).map(drop)
+    }
+
+    /// [`Claims::claim_all`], answering what each listed holder held
+    /// before: what [`Claims::restore`] puts back, where a step after the
+    /// claim fails and the whole is undone.
+    pub fn claim_all_undoable(&self, claims: &[(Holder, Vec<Run>)]) -> Result<Before, Overlap> {
         let mut held = self.lock();
         let before: Vec<(Holder, Vec<Run>)> = claims
             .iter()
             .map(|&(holder, _)| (holder, held.remove(holder)))
             .collect();
-        let mut laid = Vec::with_capacity(claims.len());
-        for (holder, runs) in claims {
+        let mut refused = None;
+        for (at, (holder, runs)) in claims.iter().enumerate() {
             if let Err(overlap) = held.lay(*holder, runs) {
-                for &holder in &laid {
+                for &(holder, _) in &claims[..at] {
                     held.remove(holder);
                 }
-                for (holder, runs) in before {
-                    held.insert(holder, runs);
+                for (holder, runs) in &before {
+                    held.insert(*holder, runs.clone());
                 }
-                return Err(overlap);
+                refused = Some(overlap);
+                break;
             }
-            laid.push(*holder);
         }
-        Ok(())
+        // Each listed holder's runs before and after, and every holder the
+        // evacuation left unlisted where it was: a claim a move left
+        // behind is seen beside the moves.
+        if saying() {
+            for ((holder, runs), (_, was)) in claims.iter().zip(&before) {
+                tracing::debug!(
+                    target: TARGET,
+                    %holder,
+                    before = %show(was),
+                    runs = %show(runs),
+                    "evacuation claim"
+                );
+            }
+            let listed: std::collections::HashSet<Holder> =
+                claims.iter().map(|&(holder, _)| holder).collect();
+            for (holder, runs) in held.by_holder.iter().filter(|(holder, _)| !listed.contains(holder)) {
+                tracing::debug!(target: TARGET, %holder, runs = %show(runs), "evacuation leaves unlisted");
+            }
+            tracing::debug!(
+                target: TARGET,
+                listed = claims.len(),
+                refused = ?refused.as_ref().map(ToString::to_string),
+                "evacuation claims"
+            );
+        }
+        refused.map_or(Ok(Before(before)), Err)
+    }
+
+    /// Puts back what [`Claims::claim_all_undoable`] took the place of: each
+    /// listed holder holds what it held before the claim.
+    pub fn restore(&self, before: Before) {
+        let mut held = self.lock();
+        for (holder, runs) in before.0 {
+            held.remove(holder);
+            held.insert(holder, runs);
+        }
     }
 
     /// Releases what `instance` holds, at its close, and leaves its pair:
     /// the pair's runs go with its last member.
     pub fn release(&self, instance: u64) {
         let mut held = self.lock();
-        held.remove(Holder::Instance(instance));
+        let was = held.remove(Holder::Instance(instance));
+        let pair = held.member_of.get(&instance).copied();
         held.leave(instance);
+        tracing::debug!(
+            target: TARGET,
+            instance,
+            released = %show(&was),
+            left_pair = ?pair,
+            pair_runs_now = %pair.map_or_else(String::new, |pair| show(&held.held(Holder::Pair(pair)))),
+            "release"
+        );
     }
 
     /// `instance`'s process parked (`crate::Rebind::Parked`): it keeps
@@ -454,6 +567,7 @@ impl Claims {
     /// leaves its pair, whose runs go with its last member. Its rebind
     /// claims where it lies again.
     pub fn park(&self, instance: u64, kept: &[Run]) {
+        let asked = kept;
         let mut held = self.lock();
         let own = Holder::Instance(instance);
         let was = held.remove(own);
@@ -465,6 +579,15 @@ impl Claims {
                 })
             })
             .collect();
+        tracing::debug!(
+            target: TARGET,
+            instance,
+            held = %show(&was),
+            kept = %show(&kept),
+            asked = %show(asked),
+            pair = ?held.member_of.get(&instance),
+            "park"
+        );
         held.insert(own, kept);
         held.leave(instance);
     }
