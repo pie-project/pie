@@ -785,3 +785,65 @@ mod cover_tests {
         assert!(text.contains(&key), "{text}");
     }
 }
+
+#[cfg(test)]
+mod committed_tests {
+    use super::*;
+
+    /// Every committed measured profile this build carries reads whole, as
+    /// committed (`Strict::Measured`): an entry another pie's form left (a
+    /// format change landed without the device files re-exported) fails the
+    /// build here, where a load would skip it and measure it again.
+    #[test]
+    fn every_committed_profile_reads_whole() {
+        for backend in backends() {
+            for (name, text) in backend.shelf.seeded {
+                if !name.ends_with(profile::MEASURED_SUFFIX) {
+                    continue;
+                }
+                let file = (backend.registry)()
+                    .parse(text, name, profile::Strict::Measured)
+                    .unwrap_or_else(|e| panic!("{}: {name}: {e}", backend.name));
+                assert!(
+                    file.skipped_rates.is_empty(),
+                    "{}: {name} carries entries this build skips (re-export it): {:?}",
+                    backend.name,
+                    file.skipped_rates
+                );
+            }
+        }
+    }
+
+    /// Every committed host covers file in the tree is a list of the cover
+    /// cache's entries, each with its key and figures.
+    #[test]
+    fn every_committed_covers_file_reads() {
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut read = 0;
+        for engine in std::fs::read_dir(&crates).unwrap().flatten() {
+            let profiles = engine.path().join("profiles");
+            for file in std::fs::read_dir(&profiles).into_iter().flatten().flatten() {
+                let path = file.path();
+                if !path.to_string_lossy().ends_with(".covers.json") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap();
+                let all: Vec<serde_json::Value> = serde_json::from_str(&text)
+                    .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+                for entry in &all {
+                    let key = entry
+                        .get("key")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_else(|| panic!("{}: an entry with no key", path.display()));
+                    assert!(
+                        crate::bootstrap::committed_cover(&text, key).is_some(),
+                        "{}: `{key}` does not read as a cover",
+                        path.display()
+                    );
+                }
+                read += 1;
+            }
+        }
+        assert!(read > 0, "no committed covers file found under {}", crates.display());
+    }
+}

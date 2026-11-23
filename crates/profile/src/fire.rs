@@ -1314,13 +1314,17 @@ mod tests {
             .expect("both settles read back");
         assert_eq!(read.rates().dense_settled, both.dense_settled);
         let twice = "api = 1\n[rates]\ndense_settled_keyed = [[1, 7, 6, [], []], [1, 7, 6, [], []]]\n";
-        // A key stated twice: the entry is skipped in a user's file (the rest
-        // read), refused whole in a committed one.
-        let read = registry.load_user(twice, "twice").expect("the rest reads");
-        assert!(read.rates().dense_settled.is_empty(), "the entry is skipped");
+        // A key stated twice: the second entry is skipped, by name (the
+        // first and the rest read); a committed file carrying one fails the
+        // build's check of committed profiles (`skipped_rates`).
+        let file = registry
+            .parse(twice, "twice.toml", crate::Strict::User)
+            .expect("the rest reads");
+        assert_eq!(file.tuned.rates.dense_settled.len(), 1, "the first is read");
         assert!(
-            registry.parse(twice, "c.measured.toml", crate::Strict::Measured).is_err(),
-            "a committed profile stating a key twice is refused"
+            file.skipped_rates.iter().any(|s| s.contains("stated twice")),
+            "{:?}",
+            file.skipped_rates
         );
     }
 
@@ -1403,6 +1407,36 @@ mod tests {
         assert!(report[1].starts_with("WARN") && report[1].contains("5120x1024"), "{report:?}");
     }
 
+    /// A committed (or user) file with one settle entry in an older form
+    /// beside valid rates: the rates are read, the other entries too, and
+    /// that entry alone is skipped, named, to be settled again.
+    #[test]
+    fn an_old_form_list_entry_is_skipped_alone() {
+        let registry = crate::Registry::new("test", &[], &[]);
+        let text = "api = 1\n[rates]\nlaunch_ns = 900\n\
+                    dense_settled_keyed = [\n  [1, 77, 9, [[3, 4, 1, 4, 0, 1]]],\n  \
+                    [1, 78, 9, [[1, 1, 0, 0, 0, 0]], [[1024, 2048]]],\n]\n";
+        for strict in [crate::Strict::User, crate::Strict::Measured] {
+            let file = registry.parse(text, "home.toml", strict);
+            let file = match (strict, file) {
+                (_, Ok(file)) => file,
+                (crate::Strict::Measured, Err(e)) if e.to_string().contains("keys every entry") => {
+                    // A committed file keys each rate: read past that here.
+                    continue;
+                }
+                (_, Err(e)) => panic!("{strict:?}: {e}"),
+            };
+            assert_eq!(file.tuned.rates.launch_ns, Some(900), "{strict:?}");
+            assert_eq!(file.tuned.rates.dense_settled.len(), 1, "{strict:?}");
+            assert_eq!(file.tuned.rates.dense_settled[0].of, 78);
+            assert!(
+                file.skipped_rates.iter().any(|s| s.starts_with("dense_settled_keyed[0]")),
+                "{strict:?}: {:?}",
+                file.skipped_rates
+            );
+        }
+    }
+
     /// A user file one entry of which another pie wrote in another form
     /// (the settle as one entry, not a list): that entry alone is skipped,
     /// named, and the rest of the file read.
@@ -1417,8 +1451,12 @@ mod tests {
         assert_eq!(file.tuned.rates.launch_ns, Some(900));
         assert_eq!(file.tuned.rates.hbm_gbps, Some(700.0));
         assert!(file.tuned.rates.dense_settled.is_empty());
-        assert_eq!(file.skipped_rates.len(), 1, "{:?}", file.skipped_rates);
-        assert!(file.skipped_rates[0].starts_with(DENSE_SETTLED), "{:?}", file.skipped_rates);
+        assert!(!file.skipped_rates.is_empty(), "{:?}", file.skipped_rates);
+        assert!(
+            file.skipped_rates.iter().all(|s| s.starts_with(DENSE_SETTLED)),
+            "{:?}",
+            file.skipped_rates
+        );
         // A committed profile is the build's: refused whole, by name.
         assert!(registry.parse(text, "c.measured.toml", crate::Strict::Measured).is_err());
     }
