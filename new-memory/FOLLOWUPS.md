@@ -1189,3 +1189,15 @@ What each still times at load or boot, for its owner (paths under `crates/`):
   (`engine_gpu::dense::by_shape`; by the roofline where one is stated); with curves but no roofline, the curves
   weigh it (`dense::choose_unrated`). Still open: the Adreno 840's committed profile (`adreno-tm-840`, a
   commented slot in each backend's `SEEDED`) awaits the phone's export.
+
+## F60. XLA states a replay bound its prepare does not hold to (found 2026-11-24)
+
+sc/rt-rung-carried (6fd1ea355) has each engine state per rung what its replay scratch holds
+(`engine::RungReplay { own_max, carried_max, total_max }` in `ChunkFacts::act_replay`) and the
+runtime picks a rung by `fire::rung_holds` against it. XLA's is stated as own T / carried T / no
+total, but its prepare check counts every lane's carried rows, decode lanes included: stricter
+than the stated floor, so a rung the runtime picks may be refused at prepare. engine-xla should
+state the bound its static scratch shape holds (`rs_compact = false` where it lays every carried
+row; `carried_max` / `total_max` as laid) and check by `rung_holds` too, so nothing the runtime
+chose is refused after. Predates that branch (the runtime never counted decode lanes' replay for
+XLA); after the beam-line merge.

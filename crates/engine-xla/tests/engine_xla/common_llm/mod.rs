@@ -337,6 +337,9 @@ impl Model {
         let facts = trace.facts.clone();
         let boot = DeviceBoot {
             pool_extra_chunks: extra,
+            // `PIE_XLA_TEST_PROFILES=<dir>`: a user's profiles over the
+            // device's (a decision turned off to isolate it)
+            profiles: std::env::var_os("PIE_XLA_TEST_PROFILES").map(std::path::PathBuf::from),
             ..DeviceBoot::default()
         };
         let mut engine = Xla::new(boot, contract_for);
