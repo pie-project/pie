@@ -18,6 +18,7 @@ mod roles;
 mod scores;
 mod shared;
 mod slots;
+mod split_rows;
 mod settle_bound;
 mod submit_bound;
 mod swapped_pick;
