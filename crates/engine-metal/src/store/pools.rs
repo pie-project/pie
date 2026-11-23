@@ -253,6 +253,20 @@ impl Rows {
     ) -> Result<Rows> {
         let mut windows: Vec<WindowRows> = Vec::new();
         let mut window_runs: Vec<&[poem_compiler::chunk::TokenRun]> = Vec::new();
+        // A windowed recipe (CONTRACT-BC 19, `chunks::MetalRing`): the window
+        // buffer is the one window table's slot, its rows the window the
+        // kernels bound (the widest layer's), its pages composed each fire
+        // over the ring, the buffer and the fire's own rows.
+        if let Some(windowed) = recipe.windowed.as_ref()
+            && let Some(SlotLayout::List { tokens, bytes, rows, .. }) = windowed.buffer(recipe)
+        {
+            windows.push(WindowRows {
+                bytes: *bytes,
+                rows: windowed.layers.iter().map(|layer| layer.window).max().unwrap_or(0),
+                tokens: *tokens,
+            });
+            window_runs.push(rows.as_slice());
+        }
         for layout in recipe.windows() {
             if let SlotLayout::List {
                 tokens,
