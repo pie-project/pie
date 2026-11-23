@@ -441,11 +441,6 @@ impl<'c, B: Backend> Run<'c, B> {
         split.layer = Some(layer);
     }
 
-    /// The runs this fire cuts the current region into.
-    pub fn region_runs(&self) -> u32 {
-        self.windows.runs(self.place.region.get()).max(1)
-    }
-
     pub fn window(&self) -> &'c Window {
         self.windows
             .at(self.place.region.get(), self.place.run.get())

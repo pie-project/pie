@@ -6915,6 +6915,7 @@ impl<B: Serve> Shell<B> {
                 cursor,
                 Filter::default(),
             )?;
+            run.fold_rings()?;
             (run.take_cuts(), run.take_picks())
         };
         let (cuts, picks) = cuts;
