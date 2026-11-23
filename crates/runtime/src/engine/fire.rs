@@ -26,10 +26,12 @@ pub struct FireRequest {
     /// Its rs scratch is compact ([`::engine::fire::scratch_compact`], as
     /// the runtime evaluated it from what it puts in the fire).
     pub scratch_compact: bool,
-    /// What the rung the fire asked holds of its replay
-    /// ([`::engine::RungReplay`]): a step of several fires runs at a rung at
-    /// least that wide, and takes no more fires than it holds together.
-    pub replay_rung: Option<::engine::RungReplay>,
+    /// The load's stated rungs ([`::engine::RungReplay`], by tokens), on a
+    /// fire carrying recurrent state: a step of several such fires runs at
+    /// the rung its members' rows together pick, and takes no more of them
+    /// than that rung's replay scratch holds together. `None` on a fire
+    /// carrying none.
+    pub replay_rungs: Option<crate::store::shared::Replays>,
     /// The ring ends this fire moves. Two fires moving one end never share
     /// a step; the engine picks each move's cell from its ring's cursor.
     pub ring_moves: Vec<RingMove>,

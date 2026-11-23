@@ -143,7 +143,7 @@ pub(crate) struct StepGroup {
     /// ([`crate::engine::FireRequest::replay_rung`]): the step's members
     /// together fit that rung's replay scratch.
     incompact: bool,
-    replay_rung: Option<::engine::RungReplay>,
+    replay_rungs: Option<crate::store::shared::Replays>,
 }
 
 /// Whether `request` has a lane decoding (a row of its own, or none the
@@ -212,13 +212,10 @@ impl StepGroup {
         {
             return false;
         }
-        // Its members' replay together fits the widest rung any asked: a
-        // fire whose rs scratch a step would pass goes in a later step.
-        if self.forward_requests > 0
-            && request.request.replay_rung.is_some()
-            && let Some((rung, rows)) = self.replay_with(request)
-            && ::engine::fire::rung_holds(&rung, rows).is_err()
-        {
+        // Its members' replay together fits the rung their rows together
+        // pick (the step's own rung, by width as ever): a fire whose rs
+        // scratch that rung would not hold goes in a later step.
+        if self.forward_requests > 0 && !self.replay_holds(request) {
             return false;
         }
         self.forward_requests.saturating_add(usage.forward_requests) <= limits.max_forward_requests
@@ -236,26 +233,36 @@ impl StepGroup {
                 || self.readouts.saturating_add(usage.readouts) <= limits.max_readouts)
     }
 
-    /// The rung a step holding `request` too runs at least at, and the
-    /// rows of its members together ([`::engine::fire::rung_holds`]).
-    fn replay_with(&self, request: &PendingRequest) -> Option<(::engine::RungReplay, ::engine::ReplayRows)> {
-        let wider = |a: &::engine::RungReplay, b: &::engine::RungReplay| {
-            a.own_max.unwrap_or(u32::MAX) >= b.own_max.unwrap_or(u32::MAX)
+    /// Whether a step holding `request` too keeps its members' replay
+    /// within the rung their rows together pick ([`::engine::fire::rung_holds`]'s
+    /// carried and scratch bounds; its own rows are what picked it). A step
+    /// none of whose members carries recurrent state holds any.
+    fn replay_holds(&self, request: &PendingRequest) -> bool {
+        let Some(rungs) = self
+            .replay_rungs
+            .as_ref()
+            .or(request.request.replay_rungs.as_ref())
+        else {
+            return true;
         };
-        let rung = match (&self.replay_rung, &request.request.replay_rung) {
-            (Some(a), Some(b)) => Some(if wider(a, b) { a.clone() } else { b.clone() }),
-            (a, b) => a.clone().or_else(|| b.clone()),
-        }?;
         let usage = request_capacity_usage(request, 0);
         let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        let own = count(self.forward_tokens.saturating_add(usage.forward_tokens));
+        let Some((_, rung)) = rungs.iter().find(|&&(tokens, _)| tokens >= own) else {
+            // Past every rung: the step's other bounds hold it.
+            return true;
+        };
         let rows = ::engine::ReplayRows::of_sums(
-            count(self.forward_tokens.saturating_add(usage.forward_tokens)),
+            own,
             count(self.carried_rows.saturating_add(usage.carried_rows)),
             count(self.replayed_rows.saturating_add(usage.replayed_rows)),
             count(self.lanes.saturating_add(request.request.lanes.len())),
             !self.incompact && request.request.scratch_compact,
         );
-        Some((rung, rows))
+        !matches!(
+            ::engine::fire::rung_holds(rung, rows),
+            Err(past) if past.bound != ::engine::ReplayBound::Own
+        )
     }
 
     pub(crate) fn push(
@@ -279,10 +286,12 @@ impl StepGroup {
         self.replayed_rows = self.replayed_rows.saturating_add(usage.replayed_rows);
         self.page_refs = self.page_refs.saturating_add(usage.page_refs);
         self.readouts = self.readouts.saturating_add(usage.readouts);
-        if let Some((rung, _)) = self.replay_with(request) {
-            self.replay_rung = Some(rung);
+        if self.replay_rungs.is_none() {
+            self.replay_rungs.clone_from(&request.request.replay_rungs);
         }
-        self.incompact |= !request.request.scratch_compact;
+        if request.request.replay_rungs.is_some() {
+            self.incompact |= !request.request.scratch_compact;
+        }
         self.lanes = self.lanes.saturating_add(request.request.lanes.len());
         self.decoding |= decodes(request);
         (limits.prefill_lanes > 0 && !self.decoding && self.lanes >= limits.prefill_lanes)
@@ -675,7 +684,7 @@ mod tests {
             };
             request.replayed = 370;
             request.scratch_compact = false;
-            request.replay_rung = Some(rung.clone());
+            request.replay_rungs = Some(std::sync::Arc::new(vec![(256, rung.clone())]));
             pending(request, InstanceId(instance))
         };
         let wave: Vec<Box<PendingRequest>> = (1..=16).map(fire).collect();
@@ -698,6 +707,62 @@ mod tests {
         }
         let lanes: usize = frame.steps.iter().map(|step| step.submission.lanes.len()).sum();
         assert_eq!(lanes, 160, "every lane served");
+    }
+
+    /// Plain decodes step together as ever: N single-row lanes form one
+    /// step at N = 8 and 64, on a model with no recurrent state (Qwen3) and
+    /// on one with it (Qwen3.5, each decode folding its row, replaying
+    /// nothing): the step's own rung is the one its rows together pick, not
+    /// the narrow one each decode alone asked.
+    #[test]
+    fn plain_decodes_form_one_step_whatever_their_rungs() {
+        let rung = |tokens: u32| {
+            let pad = |bytes: u64| bytes.div_ceil(256) * 256;
+            let slots = [12288u64, 64, 4096, 12288, 128, 128, 8192, 8192];
+            let room = slots
+                .iter()
+                .map(|&slot| pad(2 * u64::from(tokens) * slot))
+                .sum::<u64>()
+                + pad(u64::from(tokens) * 262_144 * 4);
+            (
+                tokens,
+                ::engine::RungReplay {
+                    own_max: Some(tokens),
+                    carried_max: Some(tokens),
+                    scratch: ::engine::ScratchBytes {
+                        slot_bytes: slots.to_vec(),
+                        lane_bytes: 262_144 * 4,
+                        room_bytes: room,
+                        pad: 256,
+                    },
+                },
+            )
+        };
+        let rungs = std::sync::Arc::new(vec![rung(1), rung(8), rung(64), rung(256)]);
+        let limits = SchedulerLimits {
+            max_forward_requests: 256,
+            max_forward_tokens: 4096,
+            max_page_refs: 4096,
+            ..limits()
+        };
+        for n in [8u64, 64] {
+            for carrying in [false, true] {
+                let wave: Vec<Box<PendingRequest>> = (1..=n)
+                    .map(|instance| {
+                        let mut request = decode(9, u32::try_from(instance).unwrap());
+                        if carrying {
+                            request.replay_rungs = Some(rungs.clone());
+                            request.scratch_compact = false;
+                        }
+                        pending(request, InstanceId(instance))
+                    })
+                    .collect();
+                let (frame, _) =
+                    build_frame_submission(vec![wave], limits, 16, &SchedulerStats::default());
+                assert_eq!(frame.steps.len(), 1, "{n} decodes (rs {carrying}) are one step");
+                assert_eq!(frame.steps[0].submission.lanes.len(), n as usize);
+            }
+        }
     }
 
     #[test]
