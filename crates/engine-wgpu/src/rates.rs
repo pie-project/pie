@@ -40,6 +40,7 @@ pub fn at_load(
     tuning: crate::tuning::Tuning,
     profiles: Option<&std::path::Path>,
     max_submit: Option<std::time::Duration>,
+    measuring: engine::rates::Measuring,
 ) -> Result<crate::tuning::Tuning> {
     let chip = tuning.profile().clone();
     // What the profile states stands; a load times only what it lacks.
@@ -59,17 +60,22 @@ pub fn at_load(
         );
     } else {
         tracing::info!(
-            "rates: measuring {}: no layer states them, or the user's file stored them under no \
-             matching key (its stored measurements' lines say which)",
+            "rates: {} {}: no layer states them, or the user's file and the committed profile \
+             store them under no matching key (the stored measurements' lines say which)",
+            match measuring {
+                engine::rates::Measuring::Time => "measuring",
+                engine::rates::Measuring::Skip => "skipping (`[engine] measure = false`)",
+            },
             lacked.join(", ")
         );
     }
-    let chip = engine::rates::rates_at_load(
+    let chip = engine::rates::resolve_at_load(
         chip,
         &keys,
         save,
         Some(device.left()),
         max_submit,
+        measuring,
         |max_submit| measure(device, &tuning, max_submit, &stated).map_err(|e| e.to_string()),
     )
     .map_err(|why| engine_gpu::error::Fault::Device {
@@ -77,18 +83,53 @@ pub fn at_load(
         why,
     })?;
     let tuning = crate::tuning::Tuning::new(chip).with_workgroup_bytes(device.workgroup_bytes());
-    let resident = tuning
-        .resident()
-        .ok_or_else(|| engine_gpu::error::Fault::Device {
-            call: "rates at load",
-            why: "the profile states no [rates] resident_workgroups after the rates step".into(),
-        })?;
+    let resident = match (tuning.resident(), measuring) {
+        (Some(resident), _) => {
+            tracing::info!(
+                resident,
+                "the workgroups the device holds at once, as its profile states them"
+            );
+            resident
+        }
+        (None, engine::rates::Measuring::Skip) => {
+            // A device fact no driver states as such: timed (milliseconds,
+            // stored nowhere), never defaulted.
+            let (resident, ms) = resident_for_skip(device, &tuning, max_submit)?;
+            let resident = resident.round().clamp(1.0, f64::from(u32::MAX)) as u32;
+            tracing::info!(
+                resident,
+                ms,
+                "rates: `[rates] {}` timed despite measure = false (no layer states it, and the \
+                 device states no count a guest step's grid can stride over): a {}-cubed matmul \
+                 against one workgroup of it, single fires; stored nowhere",
+                profile::fire::RESIDENT_WORKGROUPS,
+                engine_gpu::rates::RESIDENT_SHAPE
+            );
+            resident
+        }
+        (None, engine::rates::Measuring::Time) => {
+            return Err(engine_gpu::error::Fault::Device {
+                call: "rates at load",
+                why: "the profile states no [rates] resident_workgroups after the rates step"
+                    .into(),
+            });
+        }
+    };
     device.hold_resident(resident);
-    tracing::info!(
-        resident,
-        "the workgroups the device holds at once, as its profile states them"
-    );
     Ok(tuning)
+}
+
+/// `[rates] resident_workgroups` timed where a load skips measuring and no
+/// layer states it (`engine_gpu::rates::resident_for_skip`): the
+/// workgroups, and the ms it took.
+fn resident_for_skip(
+    device: &Context,
+    tuning: &crate::tuning::Tuning,
+    max_submit: Option<std::time::Duration>,
+) -> Result<(f64, u128)> {
+    let tier = <Api as engine_gpu::serve::Serve>::tier(device);
+    let timer = timer();
+    engine_gpu::rates::resident_for_skip::<Api, _>(device, tuning, tier, &timer, max_submit)
 }
 
 /// The rates of `device` that `stated` lacks (every one where it states
@@ -160,6 +201,7 @@ pub fn shapes_at_load(
     shapes: &[(u32, u32)],
     model_bytes: u64,
     top_rows: u32,
+    measuring: engine::rates::Measuring,
 ) -> Result<crate::tuning::Tuning> {
     let tier = <Api as engine_gpu::serve::Serve>::tier(device);
     // Each point timed by the device's two timestamps around its frame (a
@@ -192,6 +234,7 @@ pub fn shapes_at_load(
         shapes,
         Some(model_bytes),
         top_rows,
+        measuring,
     );
     Ok(crate::tuning::Tuning::new(chip?).with_workgroup_bytes(device.workgroup_bytes()))
 }

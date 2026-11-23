@@ -1,0 +1,25 @@
+api = 1
+
+# The stored measurements of AMD Instinct MI300X VF, each under its key: what a load of this device
+# takes where the user's own file stores none under a matching key. Written by
+# `pie tune export`; not edited by hand.
+[rates]
+cached_gbps = 32937.1
+product_ns = [
+  [0, 5120, 2048, 4, 0, 5107548.2, 2421.800000000745],
+  [0, 5120, 2048, 4, 1, 5247854.9, 2110.9500000001863],
+  [0, 151936, 2048, 4, 0, 5103741.85, 5316.799999999814],
+  [0, 151936, 2048, 4, 1, 5074494.65, 1904.5999999996275],
+  [2, 128, 2048, 4, 0, 5116815.4, 27791.85000000056],
+  [2, 128, 2048, 4, 1, 5286621.1, 2569.350000000559],
+  [2, 128, 2048, 8, 0, 5653591.65, 3171.5499999998137],
+  [2, 128, 2048, 8, 1, 5664033.1, 3276.0499999998137],
+]
+measured_on = "AMD Instinct MI300X VF gfx942 hip driver 71526333 runtime 71526333"
+measured_by = [
+  ["cached_gbps", 1, [["kernels-rocm", 1305943038]]],
+  ["product_ns", 1, [["kernels-rocm", 1305943038], ["hipblaslt", 3435363834]]],
+]
+
+[provenance]
+rates = "pie tune export: AMD Instinct MI300X VF's stored measurements, each under its key"

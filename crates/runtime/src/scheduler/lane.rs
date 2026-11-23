@@ -1,7 +1,6 @@
 use crate::rt::Instant;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use ::engine::ChannelRegistration;
 
@@ -574,10 +573,39 @@ fn fail_request(request: LaneRequest, why: &str) {
     }
 }
 
+/// The times an engine lane found nothing queued, nothing of its own in
+/// flight and its scheduler parked since it last settled fires, and slept
+/// on its queues until something came.
+pub(crate) static LANE_SLEEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The times an engine lane found nothing queued and stayed awake: a fire
+/// of its own owed its landing, or fires it settled that its scheduler has
+/// not parked since.
+pub(crate) static LANE_AWAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub(super) struct Lane {
     launch_tx: crate::rt::channel::Sender<LaneRequest>,
     control_tx: crate::rt::channel::Sender<LaneRequest>,
     thread: Option<crate::rt::thread::JoinHandle<()>>,
+    parks: Arc<SchedulerParks>,
+}
+
+/// How many times the lane's scheduler has parked (waited for its mailbox,
+/// a reply or a settlement): told by the scheduler as it parks, read by the
+/// lane to tell a scheduler still acting on fires the lane settled from
+/// one done with them.
+#[derive(Default)]
+pub(super) struct SchedulerParks(std::sync::atomic::AtomicU64);
+
+impl SchedulerParks {
+    /// The scheduler is about to park.
+    pub(super) fn parking(&self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    fn count(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 #[derive(Default)]
@@ -622,15 +650,33 @@ impl Lane {
         let (launch_tx, launch_rx) = crate::rt::channel::unbounded::<LaneRequest>();
         let (control_tx, control_rx) = crate::rt::channel::unbounded::<LaneRequest>();
         let landed_tx = control_tx.clone();
+        let parks = Arc::new(SchedulerParks::default());
+        let lane_parks = Arc::clone(&parks);
         let thread = crate::rt::thread::Builder::new()
             .name(format!("pie-engine-{engine_idx}"))
-            .spawn(move || Self::run(engine_idx, engine, launch_rx, control_rx, landed_tx, stats))
+            .spawn(move || {
+                Self::run(
+                    engine_idx,
+                    engine,
+                    launch_rx,
+                    control_rx,
+                    landed_tx,
+                    &lane_parks,
+                    stats,
+                )
+            })
             .expect("spawn pie-engine lane thread");
         Self {
             launch_tx,
             control_tx,
             thread: Some(thread),
+            parks,
         }
+    }
+
+    /// What the scheduler tells as it parks.
+    pub(super) fn parks(&self) -> &SchedulerParks {
+        &self.parks
     }
 
     fn post(&self, request: LaneRequest) {
@@ -678,18 +724,23 @@ impl Lane {
         state
     }
 
+    /// The lane's next request, in the turn's order. With both queues
+    /// empty the lane waits as its state says, never on a timer. It stays
+    /// awake on the queues while it is `awake`: a fire of its own is owed
+    /// its landing (which comes to it on the control queue), or fires it
+    /// settled have not yet been acted on by its scheduler (which has not
+    /// parked since), whose next launch follows from them. Either way the
+    /// request that comes is taken with no wake. With neither, it sleeps in
+    /// the select over both queues until one has a request.
     fn next_request(
         launch_rx: &crate::rt::channel::Receiver<LaneRequest>,
         control_rx: &crate::rt::channel::Receiver<LaneRequest>,
         turn: &mut LaneTurn,
+        awake: impl Fn() -> bool,
     ) -> std::result::Result<LaneRequest, ()> {
         use crate::rt::channel::TryRecvError;
-        #[cfg(target_arch = "wasm32")]
-        const ENGINE_LANE_HOT_US: u64 = 0;
-        #[cfg(not(target_arch = "wasm32"))]
-        const ENGINE_LANE_HOT_US: u64 = 1_000_000;
-        let hot_window = Duration::from_micros(ENGINE_LANE_HOT_US);
-        let mut spin_until = Instant::now() + hot_window;
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut awaited = false;
         loop {
             if turn.control_due() {
                 match control_rx.try_recv() {
@@ -723,15 +774,21 @@ impl Lane {
                 }
                 Err(TryRecvError::Empty) => {}
             }
-            if Instant::now() < spin_until {
+            // A browser's lane is a worker whose landings reach it through
+            // the page's event loop: it never holds itself awake.
+            if cfg!(not(target_arch = "wasm32")) && awake() {
+                if !awaited {
+                    awaited = true;
+                    LANE_AWAITS.fetch_add(1, Relaxed);
+                }
                 std::hint::spin_loop();
                 continue;
             }
+            LANE_SLEEPS.fetch_add(1, Relaxed);
             let mut select = crate::rt::channel::Select::new();
             select.recv(launch_rx);
             select.recv(control_rx);
             select.ready();
-            spin_until = Instant::now() + hot_window;
         }
     }
 
@@ -741,6 +798,7 @@ impl Lane {
         launch_rx: crate::rt::channel::Receiver<LaneRequest>,
         control_rx: crate::rt::channel::Receiver<LaneRequest>,
         landed_tx: crate::rt::channel::Sender<LaneRequest>,
+        parks: &SchedulerParks,
         stats: Arc<SchedulerStats>,
     ) {
         let mut channels = ChannelJoin::new();
@@ -811,17 +869,28 @@ impl Lane {
         }
         let mut stash: Option<LaneRequest> = None;
         let mut lane_turn = LaneTurn::default();
+        // The scheduler's parks when the lane last settled fires (a launch
+        // settled inside the submit, or a step landed): until it parks
+        // again it is acting on them.
+        let mut settled_at: Option<u64> = None;
         loop {
             let request = match stash.take() {
                 Some(stashed) => {
                     lane_turn.took_launch();
                     stashed
                 }
-                None => match Self::next_request(&launch_rx, &control_rx, &mut lane_turn) {
-                    Ok(request) => request,
-                    Err(()) => break,
-                },
+                None => {
+                    let owed = !landed_instances.is_empty();
+                    let awake = || owed || settled_at == Some(parks.count());
+                    match Self::next_request(&launch_rx, &control_rx, &mut lane_turn, awake) {
+                        Ok(request) => request,
+                        Err(()) => break,
+                    }
+                }
             };
+            if matches!(request, LaneRequest::Launch { .. } | LaneRequest::Landed { .. }) {
+                settled_at = Some(parks.count());
+            }
             let work = match &request {
                 LaneRequest::Control { .. } => Some(LaneWork::Control),
                 LaneRequest::Launch { prefill: true, .. } => Some(LaneWork::Prefill),
@@ -1027,7 +1096,7 @@ impl Lane {
         std::mem::forget(engine);
         drop(channels);
         let mut turn = LaneTurn::default();
-        while let Ok(request) = Self::next_request(launch_rx, control_rx, &mut turn) {
+        while let Ok(request) = Self::next_request(launch_rx, control_rx, &mut turn, || false) {
             if let LaneRequest::Shutdown { response } = request {
                 let _ = response.send((None, ChannelJoin::new()));
                 return;

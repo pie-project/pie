@@ -389,6 +389,10 @@ impl Held {
     }
 }
 
+/// What the holders a [`Claims::claim_all_undoable`] listed held before it.
+#[must_use = "a claim undone puts back what it took the place of"]
+pub struct Before(Vec<(Holder, Vec<Run>)>);
+
 /// Every live holder's runs.
 #[derive(Debug, Default)]
 pub struct Claims {
@@ -477,16 +481,22 @@ impl Claims {
     /// members. Refused by name, and nothing changed, where a run overlaps
     /// one an unlisted holder holds or another listed holder's new one.
     pub fn claim_all(&self, claims: &[(Holder, Vec<Run>)]) -> Result<(), Overlap> {
+        self.claim_all_undoable(claims).map(drop)
+    }
+
+    /// [`Claims::claim_all`], answering what each listed holder held
+    /// before: what [`Claims::restore`] puts back, where a step after the
+    /// claim fails and the whole is undone.
+    pub fn claim_all_undoable(&self, claims: &[(Holder, Vec<Run>)]) -> Result<Before, Overlap> {
         let mut held = self.lock();
         let before: Vec<(Holder, Vec<Run>)> = claims
             .iter()
             .map(|&(holder, _)| (holder, held.remove(holder)))
             .collect();
-        let mut laid = Vec::with_capacity(claims.len());
         let mut refused = None;
-        for (holder, runs) in claims {
+        for (at, (holder, runs)) in claims.iter().enumerate() {
             if let Err(overlap) = held.lay(*holder, runs) {
-                for &holder in &laid {
+                for &(holder, _) in &claims[..at] {
                     held.remove(holder);
                 }
                 for (holder, runs) in &before {
@@ -495,7 +505,6 @@ impl Claims {
                 refused = Some(overlap);
                 break;
             }
-            laid.push(*holder);
         }
         // Each listed holder's runs before and after, and every holder the
         // evacuation left unlisted where it was: a claim a move left
@@ -522,7 +531,17 @@ impl Claims {
                 "evacuation claims"
             );
         }
-        refused.map_or(Ok(()), Err)
+        refused.map_or(Ok(Before(before)), Err)
+    }
+
+    /// Puts back what [`Claims::claim_all_undoable`] took the place of: each
+    /// listed holder holds what it held before the claim.
+    pub fn restore(&self, before: Before) {
+        let mut held = self.lock();
+        for (holder, runs) in before.0 {
+            held.remove(holder);
+            held.insert(holder, runs);
+        }
     }
 
     /// Releases what `instance` holds, at its close, and leaves its pair:

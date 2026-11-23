@@ -578,6 +578,7 @@ fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<
         profiles: Some(dir.clone()),
         residency: crate::ResidencyPlan::default(),
         top: crate::Top::EveryRung,
+        measure: engine::rates::Measuring::Time,
     })
     .map_err(|e| e.to_string())?;
     // No runtime raises the rung here: the widest carve is backed.
@@ -1296,6 +1297,21 @@ fn time(
     live: &[usize],
     launch: impl Fn(&dyn Encode, usize, usize) -> Result<(), Error>,
 ) -> Result<Vec<f64>, String> {
+    Ok(time_spread(device, pipelines, handles, live, launch)?
+        .into_iter()
+        .map(|(median, ..)| median)
+        .collect())
+}
+
+/// [`time`]'s medians with the fastest and slowest of each candidate's
+/// rounds: what a dense curve states as its spread.
+fn time_spread(
+    device: &Context,
+    pipelines: &Pipelines,
+    handles: &Handles,
+    live: &[usize],
+    launch: impl Fn(&dyn Encode, usize, usize) -> Result<(), Error>,
+) -> Result<Vec<(f64, f64, f64)>, String> {
     const ROUNDS: usize = 7;
     const FRAME_S: f64 = 0.002;
     const SLOWER: f64 = 3.0;
@@ -1334,7 +1350,7 @@ fn time(
         .into_iter()
         .map(|mut s| {
             s.sort_by(f64::total_cmp);
-            s[s.len() / 2]
+            (s[s.len() / 2], s[0], s[s.len() - 1])
         })
         .collect())
 }
@@ -1433,6 +1449,7 @@ impl engine::load::check::Bench for CheckBench<'_> {
             profiles: self.profiles.map(Path::to_path_buf),
             residency: crate::ResidencyPlan::default(),
             top: crate::Top::EveryRung,
+            measure: engine::rates::Measuring::Time,
         })
         .map_err(|e| e.to_string())?;
         if shell.is_some() {
