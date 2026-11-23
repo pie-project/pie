@@ -46,7 +46,7 @@ impl RingLayout for Paged {
         let p = u64::from(buffer.tokens);
         let w = layers
             .iter()
-            .map(|l| u64::from(l.window + l.sinks))
+            .map(|l| u64::from(l.window))
             .max()
             .unwrap_or(0);
         let pages = w.div_ceil(p) + 1;
@@ -111,7 +111,7 @@ fn facts_hold(recipe: &ChunkRecipe) {
     assert!(layers.windows(2).all(|p| p[0] < p[1]), "{layers:?}");
     for (layer, bytes) in windowed.layers.iter().zip(&windowed.region.layer_bytes) {
         assert!(layer.window > 0 && *bytes > 0, "{layer:?}: {bytes}");
-        assert!(*bytes >= u64::from(layer.window + layer.sinks) * layer.per_token);
+        assert!(*bytes >= u64::from(layer.window) * layer.per_token);
     }
     let rings: u64 = windowed.region.layer_bytes.iter().sum();
     assert_eq!(
@@ -281,4 +281,61 @@ fn a_hybrid_record_holds_its_rings_and_its_state_together() {
     let paged = plan(&trace, &Paged);
     facts_hold(&paged);
     assert!(paged.windowed.as_ref().unwrap().ring_shape.is_some());
+}
+
+#[test]
+fn each_rank_holds_each_layer_ring_at_its_own_layers_cut() {
+    let trace = trace("gptoss-20b-mini-bf16-mxfp4-kv-bf16");
+    let recipe = plan(&trace, &Plain(256));
+    let windowed = recipe.windowed.as_ref().unwrap();
+    let whole = windowed.rank_layer_bytes(&recipe, 1);
+    assert_eq!(
+        whole, windowed.region.layer_bytes,
+        "one rank holds the region"
+    );
+    let halves = windowed.rank_layer_bytes(&recipe, 2);
+    for (whole, half) in whole.iter().zip(&halves) {
+        assert!(
+            *half < *whole && *half >= whole.div_ceil(2),
+            "{half} of {whole}"
+        );
+    }
+    // The ranks' recipe sizes the ring from the layers' shares.
+    let rank = recipe.per_rank(2);
+    let run = windowed.ring_run(&recipe).unwrap();
+    let ring = rank
+        .fixed
+        .iter()
+        .find(|r| r.row == RowId::Ring)
+        .expect("the ring on a rank");
+    let held = ring.piece_bytes * u64::from(run.pieces);
+    assert!(held >= halves.iter().sum::<u64>() && held < whole.iter().sum::<u64>());
+
+    // A layer whose rows the ranks do not cut keeps its share whole on
+    // each rank; the others still halve.
+    let mut kept = trace.clone();
+    let first = kept
+        .caches
+        .iter()
+        .position(|row| {
+            matches!(
+                row,
+                CacheRow::Kv {
+                    window: Some(_),
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    if let CacheRow::Kv { shard, .. } = &mut kept.caches[first] {
+        *shard = poem_ir::Shard::Replicated;
+    }
+    let recipe = plan(&kept, &Plain(256));
+    let windowed = recipe.windowed.as_ref().unwrap();
+    let halves = windowed.rank_layer_bytes(&recipe, 2);
+    assert_eq!(
+        halves[0], windowed.region.layer_bytes[0],
+        "its own cut: none"
+    );
+    assert!(halves[1] < windowed.region.layer_bytes[1]);
 }

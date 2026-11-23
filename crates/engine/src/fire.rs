@@ -830,9 +830,8 @@ pub enum RsVerb {
 /// and window read one field, and until then [`Lane::validate`] holds the
 /// two equal):
 ///
-/// - The ring: rows below `folded`, the last W of each windowed layer (and
-///   its S sink rows, folded once and never dropped), in the lane's record
-///   ([`Lane::record`], [`crate::ChunkFacts::windowed`]).
+/// - The ring: rows below `folded`, the last W of each windowed layer, in
+///   the lane's record ([`Lane::record`], [`crate::ChunkFacts::windowed`]).
 /// - The buffer: the rows still unfolded after the fire, in the window
 ///   buffer's slots the lane's table names ([`crate::SlotRole::WindowBuffer`],
 ///   [`Lane::tables`]), entry `i` rows `[base + i * T, base + (i + 1) * T)`,
@@ -843,24 +842,25 @@ pub enum RsVerb {
 ///   activation for it; the runtime cuts a fire whose activation cannot, as
 ///   chunked prefill), so a long prefill holds at most about one fire's
 ///   tail of slots.
-/// - Attention: row `p` of a windowed layer of window W and S sinks reads
-///   keys `[0, S)` and `[max(S, p - W + 1), p]` (`[max(0, p - W + 1), p]`
-///   for S = 0): those below `folded` from the ring and sinks, those
+/// - Attention: row `p` of a windowed layer of window W reads keys
+///   `[max(0, p - W + 1), p]`: those below `folded` from the ring, those
 ///   from `folded` on from the buffer rows its lineage names
 ///   ([`buffered_reads`]) and its own rows, under one mask, one softmax over
 ///   the union.
-/// - The fold: advancing `folded` from f to f' writes buffer rows `[f, f')`
-///   into the ring at `row mod W`, past rows dropping out, in the fold step
+/// - The fold: advancing `folded` from f to f' writes rows `[f, f')`
+///   (buffered, or the fire's own) into the ring at `row mod W`, past rows dropping out, in the fold step
 ///   the recurrent layers fold in. Lanes of a group naming one record fold
 ///   it once (CONTRACT-BC 12, 15).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowFold {
     /// The row entry 0 of the lane's window-buffer table holds, on a slot's
-    /// first row: the lane's folded index after the fire, rounded down to
-    /// `T` (for a device-counted fold, the index as the runtime knows it,
-    /// `folded`). Where the lane carries rows earlier fires buffered (its
-    /// first row past `folded`), those keep their slots while the fire
-    /// reads and folds them: `base` is `folded` rounded down to `T`.
+    /// first row. A lane carrying rows earlier fires buffered (its first row
+    /// past `folded`): `folded`, the index before the fire, rounded down to
+    /// `T`; those rows stay named for this fire's reads, and the fold frees
+    /// their slots after. A lane carrying none: the folded index after the
+    /// fire (`folded` plus a host-counted fold; `folded` for a
+    /// device-counted one), rounded down to `T`, since rows the fire
+    /// computes and folds itself take no slot.
     pub base: u32,
     /// How far this fire advances `folded`, the rows it folds into the
     /// rings: [`FoldLen`] as [`RsVerb::Buffer`]'s `fold` reads it (a
