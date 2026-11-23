@@ -11,6 +11,21 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
+/// Chosen pages a beam's finish copied because something else read them
+/// too ([`KvStore::relist_beam_with`]).
+pub static RELIST_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What a beam search's finish needs first ([`KvStore::relist_beam_needs`]).
+#[derive(Debug)]
+pub enum RelistNeeds {
+    /// The set is in a move: its end, told here.
+    MoveEnd(Arc<tokio::sync::Notify>),
+    /// The chosen pages something else reads too: each copied first onto
+    /// a page the planner grants, as any shared page a write changes
+    /// (none: go).
+    Copies(Vec<PhysicalKvPageId>),
+}
+
 use ::engine::transfer::MemoryDomain;
 use hash::Hash256;
 use page_table::{
@@ -981,6 +996,11 @@ impl KvStore {
             moves.iter().for_each(|&(_, _, slot)| persisted.back(slot));
         }
         let freed = moves.len();
+        tracing::debug!(
+            target: "runtime::store::kv",
+            pages = ?moves.iter().map(|&(_, gpu, slot)| (gpu.0, slot.0)).collect::<Vec<_>>(),
+            "cache-only device pages settled on their disk copies"
+        );
         self.pool
             .recycle_after_epoch(moves.into_iter().map(|(_, gpu, _)| gpu).collect(), epoch);
         // With no fire in flight the epoch has retired already: the pages
@@ -1939,6 +1959,7 @@ impl KvStore {
                 KvPageBacking::OnDisk(slot) => disk.push(slot),
             }
         }
+        self.check_given_back(&device, "reserved backings given back");
         self.pool.release_reserved(device);
         self.host_pool.release_reserved(host);
         self.release_disk(disk);
@@ -2238,6 +2259,7 @@ impl KvStore {
             self.hints.remove(&owner);
         }
         let freed = self.table.release_working_set_backings(ws);
+        tracing::debug!(target: "runtime::store::kv", ?ws, ?freed, "a set released");
         self.recycle_backings(freed, epoch);
         // What no fire in flight reads is free now, not at a next fire.
         self.retire_idle();
@@ -2425,8 +2447,15 @@ impl KvStore {
     /// that ran ahead of its stop takes back once its fires have landed.
     /// Every fire of the set has settled, so what this frees waits on no
     /// fire in flight.
+    /// Refused with [`KvStoreError::MoveInFlight`] while the set is in a
+    /// move: its pages pinned for the move, what this freed went back again
+    /// as the move committed.
     pub fn truncate(&mut self, ws: WorkingSetId, rows: u64) -> Result<(), KvStoreError> {
+        if self.table.in_move(&HashSet::from([ws]))? {
+            return Err(KvStoreError::MoveInFlight);
+        }
         let freed = self.table.truncate(ws, rows, self.page_size)?;
+        tracing::debug!(target: "runtime::store::kv", ?ws, rows, ?freed, "a set cut");
         let epoch = self.retired_through();
         self.recycle_backings(freed, epoch);
         self.refresh_flat(ws);
@@ -2551,6 +2580,17 @@ impl KvStore {
     }
 
     fn recycle_backings(&mut self, backings: Vec<KvPageBacking>, epoch: u64) {
+        if !backings.is_empty() {
+            tracing::debug!(target: "runtime::store::kv", epoch, ?backings, "backings let go");
+        }
+        let resident: Vec<PhysicalKvPageId> = backings
+            .iter()
+            .filter_map(|backing| match backing {
+                KvPageBacking::Resident(id) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        self.check_given_back(&resident, "backings let go");
         let mut resident = Vec::new();
         let mut swapped = Vec::new();
         for backing in backings {
@@ -2949,34 +2989,141 @@ impl KvStore {
         self.retire_idle();
     }
 
-    /// A beam search's finish (`BEAM-PAGE-LISTS.md` §6.6): the set's pages
-    /// from `f0` become its chosen beam's, page `f0 + j` the pool page
-    /// `order[j]` (pool page `q` is the set's page `f0 + q` now), for each
-    /// column `j` the search wrote; every other page past `f0` is let go
-    /// once the fires that may read it retire. The pages move, nothing is
-    /// copied.
-    pub fn relist_beam(
-        &mut self,
+    /// The chosen pool pages of a beam search's finish
+    /// ([`Self::relist_beam_with`]), each checked: past the set's backed pages,
+    /// or named twice, is a bad list.
+    fn chosen_pages(
+        &self,
         ws: WorkingSetId,
         f0: u64,
         order: &[u32],
-    ) -> Result<(), KvStoreError> {
+    ) -> Result<Vec<(u64, PhysicalKvPageId)>, KvStoreError> {
         let flat = self.table.flatten(ws)?;
-        let mut chosen = Vec::with_capacity(order.len());
+        let mut chosen: Vec<(u64, PhysicalKvPageId)> = Vec::with_capacity(order.len());
         for &q in order {
             let index = f0 + u64::from(q);
             let page = *flat.get(index as usize).ok_or(KvStoreError::BadWriteSet {
                 reason: "a chosen beam names a pool page past its set's backed pages",
             })?;
-            if chosen.contains(&page) {
+            if chosen.iter().any(|&(_, seen)| seen == page) {
                 return Err(KvStoreError::BadWriteSet {
                     reason: "a chosen beam names one pool page twice",
                 });
             }
-            chosen.push(page);
+            chosen.push((index, page));
+        }
+        Ok(chosen)
+    }
+
+    /// What a beam search's finish of `ws` from `f0` by `order`
+    /// ([`Self::relist_beam_with`]) needs before it can run: nothing, the end of
+    /// a move the set is in (a suspend or a sweep pins its old tail, and a
+    /// relist then would leave its pages named twice), or copies of the
+    /// chosen pages something else still reads.
+    pub fn relist_beam_needs(
+        &mut self,
+        ws: WorkingSetId,
+        f0: u64,
+        order: &[u32],
+    ) -> Result<RelistNeeds, KvStoreError> {
+        if self.table.in_move(&HashSet::from([ws]))? {
+            return Ok(RelistNeeds::MoveEnd(Arc::clone(&self.moved)));
+        }
+        let chosen = self.chosen_pages(ws, f0, order)?;
+        let mut shared = Vec::new();
+        for &(index, page) in &chosen {
+            if !self.table.privately_writable(ws, index)? {
+                shared.push(page);
+            }
+        }
+        Ok(RelistNeeds::Copies(shared))
+    }
+
+    /// Device pages given back must be in no live set's table: one still
+    /// named reads or writes a page another may take (the M1's runs 11 and
+    /// 12: a set's own table named a page whose segment was released). Said
+    /// at ERROR naming the set and the page, in a debug build or with
+    /// PIE_CHECK_SLOT_REFS (a walk of every set's table a give-back).
+    fn check_given_back(&self, ids: &[PhysicalKvPageId], what: &str) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if ids.is_empty()
+            || !*ON.get_or_init(|| {
+                cfg!(debug_assertions) || std::env::var_os("PIE_CHECK_SLOT_REFS").is_some()
+            })
+        {
+            return;
+        }
+        let given: std::collections::HashSet<u32> = ids.iter().map(|id| id.0).collect();
+        for (ws, pages) in self.table.every_resident_table() {
+            if let Some(page) = pages.iter().find(|page| given.contains(page)) {
+                tracing::error!(
+                    target: "runtime::store::kv",
+                    ?ws,
+                    page,
+                    what,
+                    "kv: a page given back is still named by a live set's table"
+                );
+            }
+        }
+    }
+
+    /// The slot refs of `ws`'s pages on the device as its table stands now
+    /// (each page id less the pool's base), `None` where its table does not
+    /// resolve (a page below the device): what a lane of its names must lie
+    /// among, for a check at the engine's door.
+    pub fn device_refs_of(&mut self, ws: WorkingSetId) -> Option<std::collections::HashSet<u32>> {
+        let base = self.pool.base();
+        let table = self.flat_table(ws).ok()?;
+        Some(table.iter().map(|page| page.0.saturating_sub(base)).collect())
+    }
+
+    /// The shared pool's kv list shape its pages are slots of, if any.
+    pub fn list_shape(&self) -> Option<::engine::chunk::ShapeId> {
+        self.shape
+    }
+
+    /// Whether `ws` is in a move now.
+    pub fn set_in_move(&self, ws: WorkingSetId) -> bool {
+        self.table.in_move(&HashSet::from([ws])).unwrap_or(false)
+    }
+
+    /// A beam search's finish (`BEAM-PAGE-LISTS.md` §6.6): the set's pages
+    /// from `f0` become its chosen beam's, page `f0 + j` the pool page
+    /// `order[j]` (pool page `q` is the set's page `f0 + q` now), for each
+    /// column `j` the search wrote; every other page past `f0` is let go
+    /// once the fires that may read it retire. A chosen page only this set
+    /// reads moves, nothing copied; one something else reads too (a cache
+    /// entry or another set's path through the old tail) is named by its
+    /// copy in `copies`, `(page, copy)`, made on the device before this:
+    /// moved, both would name it, and it went back twice (the M1's beam
+    /// line: a suspend committed under a relist gave back the chosen pages
+    /// the new tail still named). `false`, nothing done, where the set is
+    /// in a move or `copies` no longer covers what is shared: the caller
+    /// asks [`Self::relist_beam_needs`] again.
+    pub fn relist_beam_with(
+        &mut self,
+        ws: WorkingSetId,
+        f0: u64,
+        order: &[u32],
+        copies: &[(PhysicalKvPageId, PhysicalKvPageId)],
+    ) -> Result<bool, KvStoreError> {
+        if self.table.in_move(&HashSet::from([ws]))? {
+            return Ok(false);
+        }
+        let chosen = self.chosen_pages(ws, f0, order)?;
+        let mut listed = Vec::with_capacity(chosen.len());
+        for &(index, page) in &chosen {
+            if self.table.privately_writable(ws, index)? {
+                listed.push(page);
+                continue;
+            }
+            match copies.iter().find(|&&(from, _)| from == page) {
+                Some(&(_, copy)) => listed.push(copy),
+                None => return Ok(false),
+            }
         }
         let page_size = self.page_size as usize;
-        let pages = chosen
+        let pages = listed
             .iter()
             .map(|&id| crate::store::kv::page_table::PublishedPage {
                 id,
@@ -2985,23 +3132,58 @@ impl KvStore {
             })
             .collect();
         let mut freed = self.table.replace_tail(ws, f0, pages)?;
-        freed.retain(|backing| !matches!(backing, KvPageBacking::Resident(id) if chosen.contains(id)));
+        freed.retain(|backing| !matches!(backing, KvPageBacking::Resident(id) if listed.contains(id)));
+        tracing::debug!(
+            target: "runtime::store::kv",
+            ?ws,
+            f0,
+            listed = ?listed.iter().map(|page| page.0).collect::<Vec<_>>(),
+            ?freed,
+            copies = ?copies.iter().map(|&(from, to)| (from.0, to.0)).collect::<Vec<_>>(),
+            "a beam's finish relisted its set's tail"
+        );
+        // Copies made and not named (their page turned private meanwhile)
+        // go back at once: no fire read them.
+        let unused: Vec<PhysicalKvPageId> = copies
+            .iter()
+            .map(|&(_, copy)| copy)
+            .filter(|copy| !listed.contains(copy))
+            .collect();
+        let named = copies.len() - unused.len();
+        if named > 0 {
+            RELIST_COPIES.fetch_add(named as u64, std::sync::atomic::Ordering::Relaxed);
+            tracing::debug!(target: "pie::kv", copies = named, "a beam's finish copied the chosen pages another reads");
+        }
+        self.pool.release_reserved(unused);
         let epoch = self.current_epoch();
         self.recycle_backings(freed, epoch);
         self.refresh_flat(ws);
-        Ok(())
+        Ok(true)
     }
 
     pub fn flat_table(&mut self, ws: WorkingSetId) -> Result<&[PhysicalKvPageId], KvStoreError> {
         if !self.flat.get(&ws).is_some_and(Option::is_some) {
             let flat = self.table.flatten(ws)?;
+            tracing::debug!(
+                target: "runtime::store::kv",
+                ?ws,
+                pages = ?flat.iter().map(|page| page.0).collect::<Vec<_>>(),
+                "a set's flat table rebuilt"
+            );
             self.flat.insert(ws, Some(flat));
         }
         Ok(self.flat[&ws].as_deref().expect("just populated"))
     }
 
     fn refresh_flat(&mut self, ws: WorkingSetId) {
-        self.flat.insert(ws, self.table.flatten(ws).ok());
+        let flat = self.table.flatten(ws).ok();
+        tracing::debug!(
+            target: "runtime::store::kv",
+            ?ws,
+            pages = ?flat.as_ref().map(|flat| flat.iter().map(|page| page.0).collect::<Vec<_>>()),
+            "a set's flat table refreshed"
+        );
+        self.flat.insert(ws, flat);
     }
 
     pub fn page_hash_at(
@@ -3580,6 +3762,13 @@ impl KvStore {
             self.keep_demoted(landed, records);
         }
         let count = txn.pages.len();
+        tracing::debug!(
+            target: "runtime::store::kv",
+            sets = ?txn.working_sets,
+            moved = ?txn.pages.iter().map(|page| page.gpu_id.0).collect::<Vec<_>>(),
+            left_resident = ?self.table.resident_ids(&txn.working_sets),
+            "a suspend committed: its device pages go back, those left resident another reads"
+        );
         // No fire still in flight can read these pages: the suspend waited
         // for every fire of the process to settle (its fence is up and its
         // leases quiesced), the pages are its own (a shared page does not
@@ -3588,8 +3777,9 @@ impl KvStore {
         // newest fire's epoch: held there, they stood as deficit while
         // unrelated fires ran, and each suspend that landed so was followed
         // by as many more (Qwen3-8B c256: 841 suspends where main moves 338).
-        self.pool
-            .release_reserved(txn.pages.into_iter().map(|page| page.gpu_id).collect());
+        let given: Vec<PhysicalKvPageId> = txn.pages.iter().map(|page| page.gpu_id).collect();
+        self.check_given_back(&given, "a suspend's commit");
+        self.pool.release_reserved(given);
         self.end_move(freed);
         Ok(count)
     }
@@ -3672,6 +3862,13 @@ impl KvStore {
         for &ws in &txn.working_sets {
             self.refresh_flat(ws);
         }
+        tracing::debug!(
+            target: "runtime::store::kv",
+            sets = ?txn.working_sets,
+            placed = ?txn.pages.iter().map(|page| page.gpu_id.0).collect::<Vec<_>>(),
+            resident = ?self.table.resident_ids(&txn.working_sets),
+            "a restore committed"
+        );
         let count = txn.pages.len();
         self.release_swapped(txn.pages.into_iter().map(|page| page.swapped));
         self.end_move(freed);

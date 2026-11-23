@@ -494,6 +494,11 @@ pub(crate) fn build_frame_submission(
             let kv_len_max = lanes().map(|lane| lane.pages.len()).max().unwrap_or(0);
             (tokens, page_refs, prefill_lanes, kv_len_max)
         });
+        // Each lane's kv set, before the build moves the lanes out.
+        let lane_sets: Vec<_> = group
+            .iter()
+            .flat_map(|req| req.request.lanes.iter().map(|lane| lane.ws))
+            .collect();
         let build = build_batch_request(&mut group, page_size, stats);
         if let Some((tokens, page_refs, prefill_lanes, kv_len_max)) = traced {
             super::worker::wave_trace_emit(format!(
@@ -529,6 +534,11 @@ pub(crate) fn build_frame_submission(
             });
         }
         steps.push(StepFire {
+            fire_stamps: group
+                .iter()
+                .map(|request| (request.logical_fire_id, request.queued))
+                .collect(),
+            lane_sets,
             submission: ::engine::Step {
                 lanes,
                 attachments,
@@ -555,6 +565,7 @@ mod tests {
 
     fn pending(request: FireRequest, instance_id: InstanceId) -> Box<PendingRequest> {
         Box::new(PendingRequest {
+            queued: std::time::Instant::now(),
             lora_program: false,
             logical_fire_id: 1,
             request,

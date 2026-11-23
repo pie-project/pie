@@ -146,6 +146,11 @@ pub struct StepFire {
     /// its own fire alone.
     pub member_lanes: Vec<u32>,
     pub instances: Vec<::engine::InstanceId>,
+    /// Each fire's logical id and when its request was handed to the
+    /// scheduler, where known (a debug check names a stale request by them).
+    pub fire_stamps: Vec<(u64, std::time::Instant)>,
+    /// Each lane's kv set, in lane order, where known.
+    pub lane_sets: Vec<Option<crate::store::kv::page_table::WorkingSetId>>,
 }
 
 #[derive(Default)]
@@ -222,6 +227,10 @@ mod lane {
         /// Where stated, the slot each of `pages` stands in (a shared
         /// prefix's), in its place.
         pub translation: Vec<u32>,
+        /// The kv set its pages, translation and reserve were read from, as
+        /// they were stamped: a debug check at the engine reads them against
+        /// that set's table as it stands then.
+        pub ws: Option<crate::store::kv::page_table::WorkingSetId>,
     }
 
     impl From<Lane> for FireLane {

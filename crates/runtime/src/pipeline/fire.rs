@@ -463,6 +463,135 @@ async fn acquire_grant<C: FireContext>(
     }
 }
 
+/// A beam search's finish of kv set `ws` from page `f0` by `order`
+/// (`KvStore::relist_beam_with`): once the set is out of any move (a
+/// suspend or a sweep in flight pins its old tail: waited on, never a
+/// refusal), and with each chosen page something else still reads copied
+/// first onto a page the planner grants (copy-on-write, the rule every
+/// shared page a set changes keeps), so no page ends up named twice.
+pub(crate) async fn relist_beam<C: FireContext>(
+    ctx: &mut C,
+    model: usize,
+    engine: usize,
+    ws: crate::store::kv::page_table::WorkingSetId,
+    leases: Option<crate::store::kv::working_set::KvSuspendHandle>,
+    f0: u64,
+    order: &[u32],
+) -> Result<(), String> {
+    let stores = crate::store::registry::get(model, engine);
+    // Every fire the process submitted lands first, a frame the scheduler
+    // holds out under the rung's cap among them: built before the finish,
+    // its lanes name the set's tail as it stood (each lane's reserve is the
+    // set's whole table at its submit), and fired after it, it read the
+    // pages the finish let go (the M1, race5 run 6: a fire 79 s after the
+    // finish named a freed page of the old tail, the swap since putting it
+    // on a released segment).
+    ctx.settle_pipeline_tail()
+        .await
+        .map_err(|error| format!("a beam's finish waiting for its fires to land: {error:#}"))?;
+    // And every fire the set itself has submitted, on any pipeline (a closed
+    // one's run-ahead fires included, which the process's tail no longer
+    // lists): each holds a lease on the set until it lands (the M1's run 12:
+    // a fire 4 s after the finish carried the set's pre-relist reserve).
+    if let Some(leases) = &leases {
+        leases.quiesce().await;
+    }
+    loop {
+        let needs = match crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
+            kv.relist_beam_needs(ws, f0, order)
+        }) {
+            Ok(needs) => needs,
+            // Its pages went below with its process (evicted since its
+            // last fire): the finish waits for its restore, as a fire does,
+            // and goes then.
+            Err(crate::store::kv::KvStoreError::Table(
+                crate::store::kv::page_table::KvTableError::NonResident { .. },
+            )) => {
+                settle_and_wait_resident(ctx).await?;
+                continue;
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        let shared = match needs {
+            crate::store::kv::RelistNeeds::MoveEnd(ended) => {
+                let notified = ended.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
+                    kv.set_in_move(ws)
+                }) {
+                    notified.await;
+                }
+                continue;
+            }
+            crate::store::kv::RelistNeeds::Copies(shared) => shared,
+        };
+        let mut copies = Vec::new();
+        let mut grant = None;
+        if !shared.is_empty() {
+            let demand = crate::planner::Demand {
+                kv_pages: u32::try_from(shared.len()).unwrap_or(u32::MAX),
+                rs: crate::store::rs::RsUnits::default(),
+            };
+            let pid = ctx.process_id();
+            let Some(mut granted) = acquire_grant(ctx, pid, demand, false, || Ok(vec![demand])).await? else {
+                continue;
+            };
+            let pages: Vec<crate::store::kv::page_table::PhysicalKvPageId> =
+                granted.lend_kv().drain(..shared.len()).collect();
+            grant = Some(granted);
+            let shape = crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| kv.list_shape());
+            let copy = crate::scheduler::TierMove {
+                kind: crate::scheduler::TierKind::kv(shape),
+                tier: crate::scheduler::device_domain(engine),
+                out: true,
+                device: shared.iter().map(|page| page.0).collect(),
+                slots: pages.iter().map(|page| page.0).collect(),
+                source: None,
+            };
+            let copied = match crate::scheduler::copy_tier_tracked(engine, &copy) {
+                Ok(completion) => completion.wait().await.map_err(|error| error.to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+            if let Err(error) = copied {
+                crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
+                    kv.release_device_reservation(pages);
+                });
+                return Err(format!("a beam's finish copying the chosen pages another reads: {error}"));
+            }
+            copies = shared.into_iter().zip(pages).collect::<Vec<_>>();
+        }
+        let done = crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
+            kv.relist_beam_with(ws, f0, order, &copies)
+        });
+        drop(grant);
+        match done {
+            Ok(true) => return Ok(()),
+            // Evicted while the copies ran: they go back, and the finish
+            // waits for its restore.
+            Err(crate::store::kv::KvStoreError::Table(
+                crate::store::kv::page_table::KvTableError::NonResident { .. },
+            )) => {
+                crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
+                    kv.release_device_reservation(copies.into_iter().map(|(_, copy)| copy).collect());
+                });
+                settle_and_wait_resident(ctx).await?;
+            }
+            // A move began while the copies ran: they go back, and the
+            // finish waits for its end.
+            Ok(false) => crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
+                kv.release_device_reservation(copies.into_iter().map(|(_, copy)| copy).collect());
+            }),
+            Err(error) => {
+                crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
+                    kv.release_device_reservation(copies.into_iter().map(|(_, copy)| copy).collect());
+                });
+                return Err(error.to_string());
+            }
+        }
+    }
+}
+
 /// Awaits `ask` (a windowed planner ask) while finalizing the process's
 /// pending fires as each lands, `drained` told when any did (their window
 /// slots are back): never waits on the tail whole before the ask, since the
@@ -3110,6 +3239,7 @@ pub(crate) fn map_lane_pages(
                 continue;
             };
             map_pages(&mut lane.pages, &table)?;
+            lane.ws = Some(*ws);
         }
     }
     Ok(())
@@ -3154,6 +3284,7 @@ fn stamp_lane_reserve(
         for &lane in lanes {
             if let Some(lane) = req.lanes.get_mut(lane) {
                 lane.lane.reserve.clone_from(&table);
+                lane.ws = Some(*ws);
             }
         }
     }
@@ -3220,6 +3351,7 @@ fn stamp_lane_translation(
         for &lane in lanes {
             if let Some(lane) = req.lanes.get_mut(lane) {
                 lane.translation.clone_from(&table);
+                lane.ws = Some(*ws);
             }
         }
     }
@@ -5545,16 +5677,20 @@ pub async fn pipeline_retract<C: FireContext>(
     }
     let refused = match ends {
         Err(why) => Some(why),
-        Ok(ends) => ends.iter().find_map(|end| {
-            let stores = crate::store::registry::get(end.model, end.engine);
-            match take_back(&stores, end) {
-                Ok(()) => {
-                    retract_cursor(&end.cursor, end.start);
-                    None
+        Ok(ends) => {
+            let mut refused = None;
+            for end in &ends {
+                let stores = crate::store::registry::get(end.model, end.engine);
+                match take_back(&stores, end).await {
+                    Ok(()) => retract_cursor(&end.cursor, end.start),
+                    Err(why) => {
+                        refused = Some(why);
+                        break;
+                    }
                 }
-                Err(why) => Some(why),
             }
-        }),
+            refused
+        }
     };
     if let Some(why) = refused {
         let mut failure = failure.lock().unwrap();
@@ -5567,12 +5703,26 @@ pub async fn pipeline_retract<C: FireContext>(
     Ok(Ok(()))
 }
 
+/// Returns once kv set `ws` is in no move, waiting on each move's end.
+async fn kv_out_of_move(stores: &crate::store::registry::Stores, ws: crate::store::kv::page_table::WorkingSetId) {
+    loop {
+        let ended = crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| kv.moves_ended());
+        let notified = ended.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| kv.set_in_move(ws)) {
+            return;
+        }
+        notified.await;
+    }
+}
+
 /// Takes `end`'s set back to where the retracted fires began writing it:
 /// its unaccepted run-ahead rows first (refused where the run-ahead bound
 /// accepted rows past the cut), then its recurrent state's buffer or its
 /// windows' head (refused where a fold reached past the cut), then its KV.
 /// Under the lagged fold none of these touches a folded row.
-fn take_back(stores: &crate::store::registry::Stores, end: &SetStart) -> Result<(), String> {
+async fn take_back(stores: &crate::store::registry::Stores, end: &SetStart) -> Result<(), String> {
     let cut = u32::try_from(end.start).unwrap_or(u32::MAX);
     end.cursor.lock().unwrap().take_back(cut)?;
     if let Some(rs) = end.rs {
@@ -5582,14 +5732,21 @@ fn take_back(stores: &crate::store::registry::Stores, end: &SetStart) -> Result<
             Err(error) => return Err(error.to_string()),
         }
     }
-    match crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
-        kv.truncate(end.kv, end.start)
-    }) {
-        Ok(())
-        | Err(crate::store::kv::KvStoreError::Table(
-            crate::store::kv::page_table::KvTableError::UnknownWorkingSet,
-        )) => Ok(()),
-        Err(error) => Err(error.to_string()),
+    // A set in a move (a suspend or a sweep pins its pages) is cut once
+    // the move ends: cut under it, the pages it freed went back again as
+    // the move committed (the M1's beam line: a kv page released twice).
+    loop {
+        kv_out_of_move(stores, end.kv).await;
+        match crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
+            kv.truncate(end.kv, end.start)
+        }) {
+            Ok(())
+            | Err(crate::store::kv::KvStoreError::Table(
+                crate::store::kv::page_table::KvTableError::UnknownWorkingSet,
+            )) => return Ok(()),
+            Err(crate::store::kv::KvStoreError::MoveInFlight) => {}
+            Err(error) => return Err(error.to_string()),
+        }
     }
 }
 
@@ -6685,6 +6842,81 @@ pub(crate) mod lifecycle_tests {
         }
     }
 
+    /// A beam's finish while a frame the process submitted is held unsealed
+    /// under the rung's cap (the M1, race5 run 6: a 17-row frame of the set
+    /// staged before its finish, fired 79 s later after a raise, its lanes'
+    /// reserve naming the old tail the finish let go). The finish lets
+    /// nothing go until that frame lands: the set's table stands as the
+    /// frame named it, and once it lands the finish relists.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_beams_finish_waits_for_a_frame_held_under_the_cap() -> anyhow::Result<()> {
+        struct HeldFrame {
+            id: uuid::Uuid,
+            resources: ResourceTable,
+            landed: Option<tokio::sync::oneshot::Receiver<()>>,
+        }
+        impl FireContext for HeldFrame {
+            fn resources(&mut self) -> &mut ResourceTable {
+                &mut self.resources
+            }
+            fn process_id(&self) -> uuid::Uuid {
+                self.id
+            }
+            async fn settle_pipeline_tail(&mut self) -> anyhow::Result<()> {
+                if let Some(landed) = self.landed.take() {
+                    let _ = landed.await;
+                }
+                Ok(())
+            }
+        }
+        let model = crate::store::registry::register_model(32, &[8], &[4]);
+        let stores = crate::store::registry::get(model, 0);
+        let ws = {
+            let mut store = stores.kv.lock();
+            let ws = store.create_working_set();
+            store.reserve(ws, 4).expect("reserve four pages");
+            let mut granted = store.reserve_device_pages(4).expect("four free pages");
+            let (_, txn) = kv::prepare_explicit_reserved(&mut store, ws, &[0, 1, 2, 3], &mut granted)
+                .expect("write four pages");
+            kv::settle(&mut store, txn);
+            ws
+        };
+        let table = |stores: &crate::store::registry::Stores| {
+            crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
+                kv.flat_table(ws).map(<[_]>::to_vec).unwrap_or_default()
+            })
+        };
+        let before = table(&stores);
+        assert_eq!(before.len(), 4);
+        let (land, landed) = tokio::sync::oneshot::channel();
+        let mut context = HeldFrame {
+            id: uuid::Uuid::new_v4(),
+            resources: ResourceTable::new(),
+            landed: Some(landed),
+        };
+        let finish = relist_beam(&mut context, model, 0, ws, None, 1, &[2, 0]);
+        tokio::pin!(finish);
+        for _ in 0..20 {
+            tokio::select! {
+                biased;
+                _ = &mut finish => panic!("the finish ran before the held frame landed"),
+                () = tokio::task::yield_now() => {}
+            }
+        }
+        assert_eq!(table(&stores), before, "nothing let go while the frame is held");
+        let _ = land.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(5), finish)
+            .await
+            .expect("the finish goes once the frame landed")
+            .expect("relisted");
+        assert_eq!(table(&stores), vec![before[0], before[3], before[1]]);
+        // The next fire's translation and reserve are stamped from this
+        // table: they name the listed pages alone.
+        let stamped = working_set_flat_table(&stores, ws).expect("the set's table");
+        assert_eq!(stamped, [before[0].0, before[3].0, before[1].0]);
+        Ok(())
+    }
+
     /// Mac's gemma-4-e4b c64 stall: a windowed ask that settled its tail
     /// whole first waited on its pass's earlier piece, whose frame only the
     /// piece asking completes. The ask now returns once the planner grants
@@ -7540,6 +7772,7 @@ mod static_admission_tests {
                     "the fire carries the end it moves and no place"
                 );
                 Box::new(PendingRequest {
+                    queued: std::time::Instant::now(),
                     lora_program: false,
                     logical_fire_id: instance,
                     request,

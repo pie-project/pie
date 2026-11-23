@@ -152,6 +152,10 @@ static NEXT_LOGICAL_FIRE_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) struct PendingRequest {
     pub(crate) logical_fire_id: u64,
+    /// When it was handed to the scheduler: a request's lanes name the
+    /// slots its stores held then (a debug check at the engine says how
+    /// long ago).
+    pub(crate) queued: std::time::Instant,
     pub(crate) request: crate::engine::FireRequest,
     pub(crate) instance_id: ::engine::InstanceId,
     pub(crate) completion: WorkItemCompletion,
@@ -185,6 +189,7 @@ impl PendingRequest {
         let logical_fire_id = NEXT_LOGICAL_FIRE_ID.fetch_add(1, Ordering::Relaxed);
         Self {
             logical_fire_id,
+            queued: std::time::Instant::now(),
             request,
             instance_id,
             completion,
@@ -3835,6 +3840,7 @@ mod tests {
     fn refused_request(fire: u64) -> Box<PendingRequest> {
         let slot = u32::try_from(fire).expect("a test fire id");
         Box::new(PendingRequest {
+            queued: std::time::Instant::now(),
             lora_program: false,
             logical_fire_id: fire,
             request: crate::engine::FireRequest::one(crate::engine::fire::lane_of(
@@ -4102,6 +4108,8 @@ mod tests {
         );
         let frame = |lanes: u32| crate::engine::FrameFire {
             steps: vec![crate::engine::StepFire {
+                fire_stamps: Vec::new(),
+            lane_sets: Vec::new(),
                 submission: ::engine::Step {
                     lanes: (0..lanes)
                         .map(|lane| ::engine::Lane::decode(lane, 0, 1, 0))
@@ -4151,6 +4159,7 @@ mod tests {
         });
         pending.push_back(QueuedItem::Launch(QueuedLaunch::new(Box::new(
             PendingRequest {
+                queued: std::time::Instant::now(),
                 lora_program: false,
                 logical_fire_id: 9,
                 request: crate::engine::FireRequest::default(),
@@ -4203,6 +4212,7 @@ mod tests {
     fn a_launch_waits_for_the_copy_queued_ahead_of_it() {
         let pipeline = ProcessId::from_u128(5);
         let request = PendingRequest {
+            queued: std::time::Instant::now(),
             lora_program: false,
             logical_fire_id: 9,
             request: crate::engine::FireRequest::default(),
@@ -4234,6 +4244,7 @@ mod tests {
     fn an_unframed_piece_waits_for_its_pipelines_framed_fire_queued_ahead() {
         let (pipeline, other) = (ProcessId::from_u128(5), ProcessId::from_u128(6));
         let launch = |fire: u64, pipeline: ProcessId, framed: bool| PendingRequest {
+            queued: std::time::Instant::now(),
             lora_program: false,
             logical_fire_id: fire,
             request: crate::engine::FireRequest::default(),
@@ -4277,6 +4288,8 @@ mod tests {
             let answer_rx = lane.fire(
                 crate::engine::FrameFire {
                     steps: vec![crate::engine::StepFire {
+                        fire_stamps: Vec::new(),
+            lane_sets: Vec::new(),
                         submission: ::engine::Step {
                             lanes: vec![::engine::Lane::decode(0, 0, 1, 0)],
                             attachments: Vec::new(),
@@ -4388,6 +4401,8 @@ mod tests {
         let answer_rx = lane.fire(
             crate::engine::FrameFire {
                 steps: vec![crate::engine::StepFire {
+                    fire_stamps: Vec::new(),
+            lane_sets: Vec::new(),
                     submission: ::engine::Step {
                         lanes: vec![::engine::Lane::decode(0, 0, 1, 0)],
                         attachments: Vec::new(),
@@ -4529,6 +4544,8 @@ mod tests {
         let answer_rx = lane.fire(
             crate::engine::FrameFire {
                 steps: vec![crate::engine::StepFire {
+                    fire_stamps: Vec::new(),
+            lane_sets: Vec::new(),
                     submission: ::engine::Step {
                         lanes: vec![::engine::Lane {
                             reports: TAG,
@@ -4682,6 +4699,8 @@ mod tests {
         let instance = |lane: u32| ::engine::InstanceId(instances[lane as usize]);
         let fire = crate::engine::FrameFire {
             steps: vec![crate::engine::StepFire {
+                fire_stamps: Vec::new(),
+            lane_sets: Vec::new(),
                 submission: ::engine::Step {
                     lanes: (0..lanes)
                         .map(|lane| ::engine::Lane::decode(lane, 0, 1, 0))
@@ -5005,6 +5024,8 @@ mod tests {
                 .map(|_| crate::engine::WorkItemCompletion::deferred_with_guard(None))
                 .collect();
             fire.steps.push(crate::engine::StepFire {
+                fire_stamps: Vec::new(),
+            lane_sets: Vec::new(),
                 submission: ::engine::Step {
                     lanes: fires.iter().map(|(_, lane)| lane.clone()).collect(),
                     attachments: (0..lanes)

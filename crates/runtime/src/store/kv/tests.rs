@@ -98,6 +98,95 @@ fn tests_every_case() {
     idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight();
     an_answer_goes_before_an_older_prompt();
     pages_another_worker_sealed_are_found_in_the_host_tier();
+    a_beams_finish_waits_out_a_suspend_and_names_each_page_once();
+    a_beams_finish_copies_the_chosen_pages_another_reads();
+    a_cut_waits_out_a_move();
+}
+
+/// A beam search's finish while its set is suspending waits for the move
+/// to end, and never names a page the move gives back (the M1's beam line:
+/// a relist under a suspend left the chosen pages named by the new tail and
+/// the suspend's pinned old one, and the suspend's commit gave them back
+/// while the set still read them).
+fn a_beams_finish_waits_out_a_suspend_and_names_each_page_once() {
+    let mut store = KvStore::new_with_swap(16, 16, 0, h(61));
+    let total = store.free_committed();
+    let ws = store.create_working_set();
+    commit_fresh(&mut store, ws, 4, 1);
+    let sets = HashSet::from([ws]);
+    let txn = store.prepare_suspend(&sets).unwrap().expect("private pages suspend");
+    assert!(matches!(
+        store.relist_beam_needs(ws, 1, &[2, 0]).unwrap(),
+        super::RelistNeeds::MoveEnd(_)
+    ));
+    assert!(!store.relist_beam_with(ws, 1, &[2, 0], &[]).unwrap(), "nothing while it moves");
+    assert_eq!(store.commit_suspend(txn).unwrap(), 4);
+    store.retire_idle();
+    let mut granted = store.reserve_device_pages(4).unwrap();
+    let txn = store.prepare_restore(&sets, &mut granted).unwrap();
+    assert_eq!(store.commit_restore(txn).unwrap(), 4);
+    let before: Vec<PhysicalKvPageId> = (0..4).map(|i| store.lookup(ws, i).unwrap()).collect();
+    assert!(matches!(
+        store.relist_beam_needs(ws, 1, &[2, 0]).unwrap(),
+        super::RelistNeeds::Copies(ref shared) if shared.is_empty()
+    ));
+    assert!(store.relist_beam_with(ws, 1, &[2, 0], &[]).unwrap());
+    assert_eq!(store.mapped_len(ws).unwrap(), 3);
+    let after: Vec<PhysicalKvPageId> = (0..3).map(|i| store.lookup(ws, i).unwrap()).collect();
+    assert_eq!(after, [before[0], before[3], before[1]]);
+    store.release_working_set(ws, store.current_epoch());
+    store.retire_idle();
+    assert_eq!(store.free_committed(), total, "every page back once");
+}
+
+/// A beam search's finish whose chosen pages another set still reads (a
+/// fork's path through the old tail) names copies of them: the other set
+/// reads the pages it read, and every page goes back once.
+fn a_beams_finish_copies_the_chosen_pages_another_reads() {
+    let mut store = KvStore::new_with_swap(16, 16, 0, h(62));
+    let total = store.free_committed();
+    let ws = store.create_working_set();
+    commit_fresh(&mut store, ws, 4, 1);
+    let other = store.fork(ws).unwrap();
+    let read: Vec<PhysicalKvPageId> = (0..4).map(|i| store.lookup(other, i).unwrap()).collect();
+    let super::RelistNeeds::Copies(shared) = store.relist_beam_needs(ws, 1, &[2, 0]).unwrap() else {
+        panic!("out of any move");
+    };
+    assert_eq!(shared, [read[3], read[1]], "both chosen pages are the fork's too");
+    // The engine copies them onto pages the planner granted.
+    let copies = store.reserve_device_pages(shared.len()).unwrap();
+    let pairs: Vec<_> = shared.iter().copied().zip(copies.iter().copied()).collect();
+    let counted = super::RELIST_COPIES.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(store.relist_beam_with(ws, 1, &[2, 0], &pairs).unwrap());
+    assert!(super::RELIST_COPIES.load(std::sync::atomic::Ordering::Relaxed) >= counted + 2);
+    let after: Vec<PhysicalKvPageId> = (0..3).map(|i| store.lookup(ws, i).unwrap()).collect();
+    assert_eq!(after, [read[0], copies[0], copies[1]], "the copies, named once");
+    let still: Vec<PhysicalKvPageId> = (0..4).map(|i| store.lookup(other, i).unwrap()).collect();
+    assert_eq!(still, read, "the fork reads what it read");
+    store.release_working_set(ws, store.current_epoch());
+    store.release_working_set(other, store.current_epoch());
+    store.drop_entries_off_device();
+    store.retire_idle();
+    let cached = total - store.free_committed();
+    assert!(
+        cached <= 4,
+        "what stays is cache alone, the copies and the originals each back once: {cached}"
+    );
+}
+
+/// A cut of a set in a move is refused until the move ends: cut under it,
+/// what the cut freed went back again as the move committed.
+fn a_cut_waits_out_a_move() {
+    let mut store = KvStore::new_with_swap(16, 16, 0, h(63));
+    let ws = store.create_working_set();
+    commit_fresh(&mut store, ws, 4, 1);
+    let sets = HashSet::from([ws]);
+    let txn = store.prepare_suspend(&sets).unwrap().expect("private pages suspend");
+    assert!(matches!(store.truncate(ws, 0), Err(super::KvStoreError::MoveInFlight)));
+    assert_eq!(store.mapped_len(ws).unwrap(), 4, "nothing cut while it moves");
+    store.abort_suspend(txn);
+    store.truncate(ws, 0).unwrap();
+    assert_eq!(store.mapped_len(ws).unwrap(), 0);
 }
 
 /// Pages that came from another worker, whose keys this worker computes from

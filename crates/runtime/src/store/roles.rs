@@ -1197,6 +1197,46 @@ impl Roles {
         }
     }
 
+    /// The device slots instance `id` names as its fires read them: its
+    /// tables, rings and scratch, its pair's state and the channels' rings
+    /// and adapter it is bound to, each part with what it is, where the item
+    /// lies on the device. What a fire's check at the engine reads.
+    pub(crate) fn fire_slots_of(
+        &self,
+        id: InstanceId,
+    ) -> Vec<(String, super::slots::ShapeId, super::slots::Slot)> {
+        let device = self.device.lock().unwrap();
+        let mut out = Vec::new();
+        let Some(instance) = self.items.get(&Owner::Instance(id)) else {
+            return out;
+        };
+        let mut owners = vec![Owner::Instance(id)];
+        owners.extend(instance.pair.map(Owner::Pair));
+        owners.extend(instance.channels.iter().map(|&channel| Owner::Channel(channel)));
+        owners.extend(instance.adapter.map(Owner::Adapter));
+        for owner in owners {
+            let Some(item) = self.items.get(&owner) else {
+                continue;
+            };
+            if item.tier != Tier::Device {
+                continue;
+            }
+            for part in item.parts.iter().filter(|part| !part.dead()) {
+                let Some(shape) = self.shapes.of(part.role) else {
+                    continue;
+                };
+                for &slot_ref in &part.refs {
+                    out.push((
+                        format!("{owner:?}'s {:?} slot ref {slot_ref}", part.role),
+                        shape.pool,
+                        device.slot(shape.pool, slot_ref),
+                    ));
+                }
+            }
+        }
+        out
+    }
+
     /// Every item `holder` moves with, for a quiet wait's census: its owner,
     /// tier, whether shed, and each part's role, live or dead, and the
     /// physical chunks its refs lie in where it is on the device.
